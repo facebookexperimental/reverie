@@ -1,0 +1,9 @@
+[workspace]
+members = [
+    "reverie",
+    "reverie-examples",
+    "reverie-process",
+    "reverie-ptrace",
+    "reverie-syscalls",
+    "reverie-util",
+]
