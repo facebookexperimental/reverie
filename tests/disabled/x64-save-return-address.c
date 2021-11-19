@@ -1,3 +1,12 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 /* must be compiled with -O */
 /* demo how we can save return address from previous `callq xxx`
  * the byte code could be useful for us to generate temp trampoline

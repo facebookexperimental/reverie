@@ -1,5 +1,10 @@
 #!/bin/bash
-# (c) Facebook, Inc. and its affiliates. Confidential and proprietary.
+# Copyright (c) Facebook, Inc. and its affiliates.
+#
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
 
 # fbmake will pass --install-dir and --fbcode--dir while
 # buck won't pass it. So drop all arguments except for the last two

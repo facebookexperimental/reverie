@@ -99,3 +99,7 @@ where all tracer code is in the same address space.)
    the guest with close to regular functional call overhead. Global state and its
    methods will still be centralized, but the RPC/IPC mechanism between guest &
    the centralized tool process will become much more efficient.
+
+## License
+
+Reverie is BSD 2-Clause licensed as found in the [LICENSE](LICENSE) file.

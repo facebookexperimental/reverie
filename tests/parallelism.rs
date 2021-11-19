@@ -3,9 +3,9 @@
  *
  * All rights reserved.
  *
-I * This source code is licensed under the BSD-style license found in the
+ * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
-*/
+ */
 
 //! Tests for parallelism and concurrency
 

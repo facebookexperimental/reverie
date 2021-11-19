@@ -1,3 +1,12 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 /**
  * clobbered.S: used by reverie *only*
  * to test inject/tail_inject wouldn't clobber any
@@ -47,7 +56,7 @@ _start:
 	movq $0x1234abab, %r10
 	movq $0x12123434, %r8
 	movq $0x78781212, %r9
-	
+
 	mov $39, %eax // getpid
 	syscall
 
@@ -97,4 +106,3 @@ panic: 	add $18, %rsp
 	mov $1, %rdi
 	mov $0xe7, %eax
 	syscall
-	
