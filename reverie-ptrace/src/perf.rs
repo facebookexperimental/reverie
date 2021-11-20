@@ -522,6 +522,7 @@ fn test_perf_pmu_support() -> bool {
         }
         Err(Errno::ENOENT) => info!("Perf feature check failed due to ENOENT"),
         Err(Errno::EPERM) => info!("Perf feature check failed due to EPERM"),
+        Err(Errno::EACCES) => info!("Perf feature check failed due to EACCES"),
         Err(e) => panic!("Unexpected error during perf feature check: {}", e),
     }
     false
