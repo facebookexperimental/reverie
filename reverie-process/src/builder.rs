@@ -47,7 +47,7 @@ impl Command {
     /// Basic usage:
     ///
     /// ```no_run
-    /// use reverie::process::Command;
+    /// use reverie_process::Command;
     /// let command = Command::new("sh");
     /// ```
     pub fn new<S: AsRef<OsStr>>(program: S) -> Self {
@@ -93,14 +93,14 @@ impl Command {
     /// Only one argument can be passed per use. So instead of:
     ///
     /// ```no_run
-    /// reverie::process::Command::new("sh")
+    /// reverie_process::Command::new("sh")
     ///   .arg("-C /path/to/repo");
     /// ```
     ///
     /// usage would be:
     ///
     /// ```no_run
-    /// reverie::process::Command::new("sh")
+    /// reverie_process::Command::new("sh")
     ///   .arg("-C")
     ///   .arg("/path/to/repo");
     /// ```
@@ -114,7 +114,7 @@ impl Command {
     /// Basic usage:
     ///
     /// ```no_run
-    /// use reverie::process::Command;
+    /// use reverie_process::Command;
     ///
     /// let command = Command::new("ls")
     ///         .arg("-l")
@@ -136,7 +136,7 @@ impl Command {
     /// Basic usage:
     ///
     /// ```no_run
-    /// use reverie::process::Command;
+    /// use reverie_process::Command;
     ///
     /// let command = Command::new("ls")
     ///         .args(&["-l", "-a"]);
@@ -173,7 +173,7 @@ impl Command {
     /// Basic usage:
     ///
     /// ```no_run
-    /// use reverie::process::Command;
+    /// use reverie_process::Command;
     ///
     /// let command = Command::new("ls")
     ///         .env("PATH", "/bin");
@@ -194,7 +194,7 @@ impl Command {
     /// Basic usage:
     ///
     /// ```no_run
-    /// use reverie::process::{Command, Stdio};
+    /// use reverie_process::{Command, Stdio};
     /// use std::env;
     /// use std::collections::HashMap;
     ///
@@ -226,7 +226,7 @@ impl Command {
     /// Basic usage:
     ///
     /// ```no_run
-    /// use reverie::process::Command;
+    /// use reverie_process::Command;
     ///
     /// let command = Command::new("ls")
     ///         .env_remove("PATH");
@@ -243,7 +243,7 @@ impl Command {
     /// Basic usage:
     ///
     /// ```no_run
-    /// use reverie::process::Command;
+    /// use reverie_process::Command;
     ///
     /// let command = Command::new("ls")
     ///         .env_clear();
@@ -278,7 +278,7 @@ impl Command {
     /// Basic usage:
     ///
     /// ```no_run
-    /// use reverie::process::Command;
+    /// use reverie_process::Command;
     ///
     /// let command = Command::new("ls")
     ///         .current_dir("/bin");
@@ -298,7 +298,7 @@ impl Command {
     /// Basic usage:
     ///
     /// ```no_run
-    /// use reverie::process::{Command, Stdio};
+    /// use reverie_process::{Command, Stdio};
     ///
     /// let command = Command::new("ls")
     ///         .stdin(Stdio::null());
@@ -319,7 +319,7 @@ impl Command {
     /// Basic usage:
     ///
     /// ```no_run
-    /// use reverie::process::{Command, Stdio};
+    /// use reverie_process::{Command, Stdio};
     ///
     /// let command = Command::new("ls")
     ///         .stdout(Stdio::null());
@@ -340,7 +340,7 @@ impl Command {
     /// Basic usage:
     ///
     /// ```no_run
-    /// use reverie::process::{Command, Stdio};
+    /// use reverie_process::{Command, Stdio};
     ///
     /// let command = Command::new("ls")
     ///         .stderr(Stdio::null());
@@ -410,7 +410,7 @@ impl Command {
     /// # Examples
     ///
     /// ```
-    /// use reverie::process::Command;
+    /// use reverie_process::Command;
     ///
     /// let cmd = Command::new("echo");
     /// assert_eq!(cmd.get_program(), "echo");
@@ -457,7 +457,7 @@ impl Command {
     /// user outside of the container.
     ///
     /// ```no_run
-    /// use reverie::process::Command;
+    /// use reverie_process::Command;
     ///
     /// let command = Command::new("ls")
     ///     .map_uid(1, unsafe { libc::getuid() });
@@ -505,7 +505,7 @@ impl Command {
     ///
     /// This is the same as:
     /// ```no_run
-    /// use reverie::process::Command;
+    /// use reverie_process::Command;
     ///
     /// let command = Command::new("ls")
     ///     .map_uid(0, unsafe { libc::geteuid() })
@@ -558,7 +558,7 @@ impl Command {
     /// Implies `Namespace::UTS`, which requires `CAP_SYS_ADMIN`.
     ///
     /// ```no_run
-    /// use reverie::process::Command;
+    /// use reverie_process::Command;
     ///
     /// let command = Command::new("cat")
     ///     .arg("/proc/sys/kernel/hostname")
@@ -577,7 +577,7 @@ impl Command {
     /// # Example
     ///
     /// ```no_run
-    /// use reverie::process::Command;
+    /// use reverie_process::Command;
     ///
     /// let command = Command::new("cat")
     ///     .arg("/proc/sys/kernel/domainname")

@@ -102,7 +102,7 @@ impl Container {
     /// Basic usage:
     ///
     /// ```no_run
-    /// use reverie::process::Container;
+    /// use reverie_process::Container;
     ///
     /// let container = Container::new()
     ///         .env("PATH", "/bin");
@@ -123,7 +123,7 @@ impl Container {
     /// Basic usage:
     ///
     /// ```no_run
-    /// use reverie::process::{Container, Stdio};
+    /// use reverie_process::{Container, Stdio};
     /// use std::env;
     /// use std::collections::HashMap;
     ///
@@ -157,7 +157,7 @@ impl Container {
     /// Basic usage:
     ///
     /// ```no_run
-    /// use reverie::process::Container;
+    /// use reverie_process::Container;
     ///
     /// let container = Container::new()
     ///         .env_remove("PATH");
@@ -174,7 +174,7 @@ impl Container {
     /// Basic usage:
     ///
     /// ```no_run
-    /// use reverie::process::Container;
+    /// use reverie_process::Container;
     ///
     /// let container = Container::new()
     ///         .env_clear();
@@ -209,7 +209,7 @@ impl Container {
     /// Basic usage:
     ///
     /// ```no_run
-    /// use reverie::process::Container;
+    /// use reverie_process::Container;
     ///
     /// let container = Container::new()
     ///         .current_dir("/bin");
@@ -229,7 +229,7 @@ impl Container {
     /// Basic usage:
     ///
     /// ```no_run
-    /// use reverie::process::{Container, Stdio};
+    /// use reverie_process::{Container, Stdio};
     ///
     /// let container = Container::new()
     ///         .stdin(Stdio::null());
@@ -250,7 +250,7 @@ impl Container {
     /// Basic usage:
     ///
     /// ```no_run
-    /// use reverie::process::{Container, Stdio};
+    /// use reverie_process::{Container, Stdio};
     ///
     /// let container = Container::new()
     ///         .stdout(Stdio::null());
@@ -271,9 +271,9 @@ impl Container {
     /// Basic usage:
     ///
     /// ```no_run
-    /// use reverie::process::{Container, Stdio};
+    /// use reverie_process::{Container, Stdio};
     ///
-    /// let container = Container::new("ls")
+    /// let container = Container::new()
     ///         .stderr(Stdio::null());
     /// ```
     pub fn stderr<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Self {
@@ -342,7 +342,7 @@ impl Container {
     /// user outside of the container.
     ///
     /// ```no_run
-    /// use reverie::process::Container;
+    /// use reverie_process::Container;
     ///
     /// let container = Container::new()
     ///     .map_uid(1, unsafe { libc::getuid() });
@@ -390,7 +390,7 @@ impl Container {
     ///
     /// This is the same as:
     /// ```no_run
-    /// use reverie::process::Container;
+    /// use reverie_process::Container;
     ///
     /// let container = Container::new()
     ///     .map_uid(0, unsafe { libc::geteuid() })
@@ -443,10 +443,9 @@ impl Container {
     /// Implies `Namespace::UTS`, which requires `CAP_SYS_ADMIN`.
     ///
     /// ```no_run
-    /// use reverie::process::Container;
+    /// use reverie_process::Container;
     ///
     /// let container = Container::new()
-    ///     .arg("/proc/sys/kernel/hostname")
     ///     .map_root()
     ///     .hostname("foobar.local");
     /// ```
@@ -463,10 +462,9 @@ impl Container {
     /// # Example
     ///
     /// ```no_run
-    /// use reverie::process::Container;
+    /// use reverie_process::Container;
     ///
-    /// let container = Contianer::new()
-    ///     .arg("/proc/sys/kernel/domainname")
+    /// let container = Container::new()
     ///     .map_root()
     ///     .domainname("foobar");
     /// ```
