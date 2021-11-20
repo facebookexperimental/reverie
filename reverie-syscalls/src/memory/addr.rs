@@ -63,8 +63,11 @@ impl<'a, T> Addr<'a, T> {
         }
     }
 
-    /// Casts this point to a mutable pointer. This is unsafe for numerous
-    /// reasons.
+    /// Casts this pointer to a mutable pointer.
+    ///
+    /// # Safety
+    ///
+    /// This method is unsafe for numerous reasons.
     pub unsafe fn into_mut(self) -> AddrMut<'a, T> {
         AddrMut {
             inner: self.inner,
@@ -100,6 +103,11 @@ impl<'a, T> Addr<'a, T> {
 
     /// Returns a new address relative to the current address + `count *
     /// size_of::<T>()`.
+    ///
+    /// # Safety
+    ///
+    /// This method is unsafe because the new address may not point to valid
+    /// memory.
     pub unsafe fn offset(self, count: isize) -> Self {
         Self {
             inner: NonNull::new_unchecked(self.inner.as_ptr().offset(count)),
@@ -108,6 +116,11 @@ impl<'a, T> Addr<'a, T> {
     }
 
     /// Returns a new address plus `count * size_of::<T>()`.
+    ///
+    /// # Safety
+    ///
+    /// This method is unsafe because the new address may not point to valid
+    /// memory.
     #[allow(clippy::should_implement_trait)]
     pub unsafe fn add(self, count: usize) -> Self {
         self.offset(count as isize)
@@ -218,6 +231,11 @@ impl<'a, T> AddrMut<'a, T> {
 
     /// Returns a new address relative to the current address + `count *
     /// size_of::<T>()`.
+    ///
+    /// # Safety
+    ///
+    /// This method is unsafe because the new address may not point to valid
+    /// memory.
     pub unsafe fn offset(self, count: isize) -> Self {
         Self {
             inner: NonNull::new_unchecked(self.inner.as_ptr().offset(count)),
@@ -226,6 +244,11 @@ impl<'a, T> AddrMut<'a, T> {
     }
 
     /// Returns a new address plus `count * size_of::<T>()`.
+    ///
+    /// # Safety
+    ///
+    /// This method is unsafe because the new address may not point to valid
+    /// memory.
     #[allow(clippy::should_implement_trait)]
     pub unsafe fn add(self, count: usize) -> Self {
         self.offset(count as isize)
@@ -286,6 +309,11 @@ pub struct AddrSlice<'a, T> {
 
 impl<'a, T> AddrSlice<'a, T> {
     /// Creates the slice from its raw parts.
+    ///
+    /// # Safety
+    ///
+    /// This method is unsafe for the same reasons that
+    /// [`std::slice::from_raw_parts`] is unsafe.
     pub unsafe fn from_raw_parts(addr: Addr<'a, T>, len: usize) -> Self {
         Self {
             inner: ::core::slice::from_raw_parts(addr.as_ptr(), len),
@@ -345,6 +373,11 @@ pub struct AddrSliceMut<'a, T> {
 
 impl<'a, T> AddrSliceMut<'a, T> {
     /// Creates the slice from its raw parts.
+    ///
+    /// # Safety
+    ///
+    /// This method is unsafe for the same reasons that
+    /// [`std::slice::from_raw_parts`] is unsafe.
     pub unsafe fn from_raw_parts(addr: AddrMut<'a, T>, len: usize) -> Self {
         Self {
             inner: ::core::slice::from_raw_parts_mut(addr.as_mut_ptr(), len),

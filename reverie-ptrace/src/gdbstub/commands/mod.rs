@@ -54,6 +54,7 @@ impl IdKind {
         }
     }
 
+    #[allow(clippy::wrong_self_convention)]
     pub fn into_raw(&self) -> i32 {
         match self {
             IdKind::All => -1,
@@ -409,6 +410,8 @@ impl StopReason {
         })
     }
 
+    // FIXME: Reduce number of arguments.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_task(
         pid: Pid,
         tgid: Pid,

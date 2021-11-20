@@ -24,17 +24,17 @@ impl std::str::FromStr for Filter {
 
     // Must parse this: [!][?]value1[,[?]value2]...
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (inverse, s) = match s.strip_prefix("!") {
+        let (inverse, s) = match s.strip_prefix('!') {
             Some(s) => (true, s),
             None => (false, s),
         };
 
         let mut syscalls = Vec::new();
 
-        for value in s.split(",") {
+        for value in s.split(',') {
             // FIXME: Handle syscall sets, so we can use '%stat` to trace all
             // stat calls, for example.
-            if let Some(_) = value.strip_prefix("%") {
+            if value.strip_prefix('%').is_some() {
                 return Err("filtering sets of syscall is not yet supported".into());
             }
 

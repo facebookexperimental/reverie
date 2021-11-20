@@ -13,19 +13,10 @@ use std::ffi::{CString, OsStr, OsString};
 use super::util::CStringArray;
 
 /// A mapping of environment variables.
-#[derive(Clone, Debug)]
+#[derive(Default, Clone, Debug)]
 pub struct Env {
     clear: bool,
     vars: BTreeMap<OsString, Option<OsString>>,
-}
-
-impl Default for Env {
-    fn default() -> Self {
-        Self {
-            clear: false,
-            vars: Default::default(),
-        }
-    }
 }
 
 impl Env {

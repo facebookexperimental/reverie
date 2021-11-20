@@ -152,15 +152,15 @@ impl<'a> Request<'a> {
     pub fn write_output<M: MemoryAccess>(&self, m: &mut M, output: &Output) -> Result<(), Errno> {
         match (self, output) {
             (Self::TCGETS(p), Output::TCGETS(output)) => {
-                m.write_value(p.ok_or(Errno::EFAULT)?, &output)
+                m.write_value(p.ok_or(Errno::EFAULT)?, output)
             }
             (Self::TCSETS(_), _) => Ok(()),
             (Self::TIOCGWINSZ(p), Output::TIOCGWINSZ(output)) => {
-                m.write_value(p.ok_or(Errno::EFAULT)?, &output)
+                m.write_value(p.ok_or(Errno::EFAULT)?, output)
             }
             (Self::TIOCSWINSZ(_), _) => Ok(()),
             (Self::TIOCGPGRP(p), Output::TIOCGPGRP(output)) => {
-                m.write_value(p.ok_or(Errno::EFAULT)?, &output)
+                m.write_value(p.ok_or(Errno::EFAULT)?, output)
             }
             (Self::TIOCSPGRP(_), _) => Ok(()),
             (Self::FIONREAD(p), Output::FIONREAD(output)) => {

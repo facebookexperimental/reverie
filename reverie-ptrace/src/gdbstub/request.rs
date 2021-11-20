@@ -13,6 +13,7 @@ use tokio::sync::oneshot;
 
 /// gdb request send to reverie.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum GdbRequest {
     /// Set a breakpoint.
     SetBreakpoint(Breakpoint, oneshot::Sender<Result<(), TraceError>>),

@@ -428,7 +428,7 @@ impl<T: Tool + 'static> TracerBuilder<T> {
     /// Spawns the tracer.
     pub async fn spawn(self) -> Result<Tracer<T::GlobalState>, Error> {
         let mut command = self.command;
-        let config = self.config.unwrap_or_else(Default::default);
+        let config = self.config.unwrap_or_default();
 
         // Because this ptrace backend is CENTRALIZED, it can keep all the
         // tool's state here in a single address space.

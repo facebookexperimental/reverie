@@ -79,7 +79,7 @@ impl Inferior {
 
     pub fn matches(&self, threadid: &ThreadId) -> bool {
         let this_threadid: ThreadId = self.id.into();
-        this_threadid.matches(&threadid)
+        this_threadid.matches(threadid)
     }
 
     /// Notify target to resume given `Inferior`.

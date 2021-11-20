@@ -120,7 +120,7 @@ fn vdso_get_symbols_info() -> HashMap<String, (u64, usize)> {
                     let strtab = elf.dynstrtab;
                     elf.dynsyms.iter().for_each(|sym| {
                         let sym_name = &strtab[sym.st_name];
-                        if VDSO_SYMBOLS.contains(&&sym_name) {
+                        if VDSO_SYMBOLS.contains(&sym_name) {
                             debug_assert!(sym.is_function());
                             res.insert(
                                 String::from(sym_name),
@@ -193,13 +193,11 @@ mod tests {
 
     #[test]
     fn can_find_vdso() {
-        assert!(
-            procfs::process::Process::new(unistd::getpid().as_raw())
-                .and_then(|p| p.maps())
-                .unwrap_or_else(|_| Vec::new())
-                .iter()
-                .any(|e| e.pathname == procfs::process::MMapPath::Vdso)
-        );
+        assert!(procfs::process::Process::new(unistd::getpid().as_raw())
+            .and_then(|p| p.maps())
+            .unwrap_or_else(|_| Vec::new())
+            .iter()
+            .any(|e| e.pathname == procfs::process::MMapPath::Vdso));
     }
 
     #[test]

@@ -372,11 +372,10 @@ impl Session {
                             ResponseOk.write_response(writer);
                         } else {
                             h.id.try_into()
-                                .and_then(|id| {
+                                .map(|id| {
                                     self.current = Some(id);
-                                    Ok(())
+                                    ResponseOk
                                 })
-                                .map(|_| ResponseOk)
                                 .write_response(writer)
                         }
                     }
@@ -389,7 +388,7 @@ impl Session {
             Base::g(_) => self
                 .read_registers()
                 .await
-                .map(|regs| ResponseAsHex(regs))
+                .map(ResponseAsHex)
                 .write_response(writer),
             Base::G(regs) => self
                 .write_registers(regs.vals)
@@ -416,7 +415,7 @@ impl Session {
             Base::D(pid) => {
                 let pid = pid.pid;
                 let threadid =
-                    pid.map_or_else(|| ThreadId::all(), |pid| ThreadId::pid(pid.as_raw()));
+                    pid.map_or_else(ThreadId::all, |pid| ThreadId::pid(pid.as_raw()));
                 self.detach_or_kill(threadid, false)
                     .await
                     .map(|_| ResponseOk)
@@ -464,7 +463,7 @@ impl Session {
                 vCont::Actions(actions) => {
                     // `vCont` can encode multiple actions, but we should
                     // resume only one matching ptid only (left-most).
-                    while let Some((action, threadid)) = actions.iter().next() {
+                    while let Some((action, threadid)) = actions.first() {
                         let resume = match action {
                             ResumeAction::Step(step) => ResumeInferior {
                                 action: ResumeAction::Step(*step),

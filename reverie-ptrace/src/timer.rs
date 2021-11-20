@@ -32,7 +32,6 @@
 
 use crate::perf::*;
 use crate::trace::{Error as TraceError, Event as TraceEvent, Stopped, Wait};
-use libc;
 use raw_cpuid::{CpuId, FeatureInfo};
 use reverie::{Errno, Pid, Signal, Tid};
 use thiserror::Error;
@@ -197,7 +196,9 @@ impl Timer {
     /// ensures proper cancellation semantics are observed. See the internal
     /// `timer::EventStatus` type for details.
     pub fn observe_event(&mut self) {
-        self.inner_mut_noinit().map(|t| t.observe_event());
+        if let Some(t) = self.inner_mut_noinit() {
+            t.observe_event();
+        }
     }
 
     /// Cancel pending timer notifications. This is idempotent.
@@ -217,7 +218,9 @@ impl Timer {
     /// signal.
     #[allow(dead_code)]
     pub fn schedule_cancellation(&mut self) {
-        self.inner_mut_noinit().map(|t| t.schedule_cancellation());
+        if let Some(t) = self.inner_mut_noinit() {
+            t.schedule_cancellation();
+        }
     }
 
     /// Cancel pending timer notifications. This is idempotent.
@@ -243,7 +246,9 @@ impl Timer {
     /// Currently, this will, if necessary, `tgkill` a timer signal to the guest
     /// thread.
     pub fn finalize_requests(&self) {
-        self.inner_noinit().map(|t| t.finalize_requests());
+        if let Some(t) = self.inner_noinit() {
+            t.finalize_requests();
+        }
     }
 
     /// When a signal is received, this method drives the timer event to
@@ -398,11 +403,11 @@ impl TimerImpl {
     pub fn request_event(&mut self, evt: TimerEventRequest) -> Result<(), Errno> {
         let (delivery, notification) = match evt {
             TimerEventRequest::Precise(ticks) => {
-                (ticks, ticks.checked_sub(SKID_MARGIN_RCBS).unwrap_or(0))
+                (ticks, ticks.saturating_sub(SKID_MARGIN_RCBS))
             }
             TimerEventRequest::Imprecise(ticks) => (ticks, ticks),
         };
-        if delivery <= 0 {
+        if delivery == 0 {
             return Err(Errno::EINVAL); // bail before setting timer
         }
         self.send_artificial_signal = if notification <= SINGLESTEP_TIMEOUT_RCBS {

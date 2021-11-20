@@ -134,7 +134,7 @@ impl MemoryAccess for Stopped {
             // PTRACE_PEEKDATA is faster than `process_vm_readv` for small
             // reads.
             let value = self.read_u64(addr.cast::<u64>())?;
-            let bytes: [u8; mem::size_of::<u64>()] = unsafe { mem::transmute(value) };
+            let bytes = value.to_ne_bytes();
             buf.copy_from_slice(&bytes[0..size]);
             return Ok(size);
         }

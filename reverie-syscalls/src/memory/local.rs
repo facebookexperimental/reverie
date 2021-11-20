@@ -13,7 +13,7 @@ use std::io;
 use super::{Addr, AddrMut, Errno, MemoryAccess};
 
 /// A local address space.
-#[derive(Debug)]
+#[derive(Default, Debug)]
 pub struct LocalMemory {}
 
 impl LocalMemory {
@@ -30,7 +30,7 @@ impl LocalMemory {
         // TODO: Make LocalMemory just act as a `&mut [u8]`. Then, the "address
         // space" will simply be pointers within that range. This would enable
         // restriction of the accessible address space on a per-syscall basis.
-        LocalMemory {}
+        Self::default()
     }
 }
 
