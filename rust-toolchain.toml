@@ -1,2 +1,3 @@
 [toolchain]
-channel = "nightly"
+# @fb-only: path = "../../third-party-buck/platform009/build/rust"
+channel = "nightly" # @oss-only
