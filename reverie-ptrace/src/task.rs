@@ -611,8 +611,8 @@ impl<L: Tool + 'static> TracedTask<L> {
             regs.rsi = cp::PRIVATE_PAGE_SIZE as u64;
             regs.rdx = (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as u64;
             regs.r10 = (libc::MAP_PRIVATE | libc::MAP_FIXED | libc::MAP_ANONYMOUS) as u64;
-            regs.r8 = -1 as i64 as u64;
-            regs.r9 = 0 as u64;
+            regs.r8 = -1i64 as u64;
+            regs.r9 = 0u64;
 
             task.setregs(regs)?;
             // Execute the injected mmap call.
@@ -672,7 +672,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             let rip = AddrMut::from_raw(regs.rip as usize).unwrap();
             let saved: u64 = task.read_value(rip)?;
             // Patch the tracee at the current instruction pointer.
-            task.write_value(rip, &((saved & !(0xffffffff as u64)) | bp_syscall_bp))?;
+            task.write_value(rip, &((saved & !(0xffffffff_u64)) | bp_syscall_bp))?;
 
             // When resumed, the tracee will hit the first breakpoint. Then we
             // wait for it to reach that breakpoint and trap/stop.

@@ -38,7 +38,7 @@ impl Tool for Strace {
         };
 
         for filter in &cfg.filters {
-            let syscalls = filter.syscalls.iter().map(|sysno| *sysno);
+            let syscalls = filter.syscalls.iter().copied();
             if filter.inverse {
                 subs.disable_syscalls(syscalls);
             } else {

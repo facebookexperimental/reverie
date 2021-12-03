@@ -74,6 +74,14 @@ macro_rules! typed_syscall {
             raw: ::syscalls::SyscallArgs,
         }
 
+        impl Default for $Name {
+            fn default() -> Self {
+                Self {
+                    raw: ::syscalls::SyscallArgs::new(0, 0, 0, 0, 0, 0),
+                }
+            }
+        }
+
         impl $crate::SyscallInfo for $Name {
             type Return = Result<$ret, $crate::Errno>;
 
@@ -104,15 +112,14 @@ macro_rules! typed_syscall {
             /// Creates the syscall. Use the `with_*` functions to build up the
             /// arguments to this syscall.
             pub fn new() -> Self {
-                $Name {
-                    raw: ::syscalls::SyscallArgs::new(0, 0, 0, 0, 0, 0),
-                }
+                Self::default()
             }
 
             // Generate getter functions.
             $(
                 /// Gets this argument's value.
                 $(#[$req_get_meta])*
+                #[allow(clippy::len_without_is_empty)]
                 pub fn $req($($req_get_args)*) -> $req_type {
                     $($req_get_impl)*
                 }

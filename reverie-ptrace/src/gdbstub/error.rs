@@ -19,6 +19,7 @@ use reverie::Pid;
 use std::io;
 
 #[derive(Error, Debug)]
+#[allow(clippy::enum_variant_names)]
 pub enum Error {
     #[error("gdb server not started yet")]
     GdbServerNotStarted,

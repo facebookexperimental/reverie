@@ -25,7 +25,6 @@
 
 use core::ptr::NonNull;
 use lazy_static::lazy_static;
-use libc;
 use nix::{
     sys::signal::Signal,
     unistd::{sysconf, SysconfVar},

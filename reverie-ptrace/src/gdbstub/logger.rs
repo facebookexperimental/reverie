@@ -65,7 +65,7 @@ impl<'a> Debug for PacketLogger<'a> {
             } else if b == b'\0' {
                 write!(f, "\\0")?;
             // ASCII printable
-            } else if b >= 0x20 && b < 0x7f {
+            } else if (0x20..0x7f).contains(&b) {
                 write!(f, "{}", b as char)?;
             } else {
                 write!(f, "\\x{:02x}", b)?;

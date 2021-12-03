@@ -117,11 +117,11 @@ pub trait MemoryAccess {
         let addr = addr.into();
         let mut value = mem::MaybeUninit::uninit();
 
-        let mut value_buf = unsafe {
+        let value_buf = unsafe {
             ::core::slice::from_raw_parts_mut(value.as_mut_ptr() as *mut u8, mem::size_of::<T>())
         };
 
-        self.read_exact(addr.cast::<u8>(), &mut value_buf)?;
+        self.read_exact(addr.cast::<u8>(), value_buf)?;
 
         Ok(unsafe { value.assume_init() })
     }
@@ -207,10 +207,10 @@ pub trait MemoryAccess {
     /// at one time. Increasing the buffer size can be more efficient when
     /// reading a remote C string because it reduces the number of syscalls that
     /// are made.
-    fn read_cstring_with_buf(&self, addr: Addr<u8>, mut buf: &mut [u8]) -> Result<CString, Errno> {
+    fn read_cstring_with_buf(&self, addr: Addr<u8>, buf: &mut [u8]) -> Result<CString, Errno> {
         let mut accumulator = Vec::new();
 
-        self.read_while(addr, &mut buf, |slice| {
+        self.read_while(addr, buf, |slice| {
             if let Some(nul) = slice.iter().position(|&b| b == 0) {
                 // Stop once we find a NUL terminator.
                 accumulator.extend(&slice[..nul]);

@@ -29,8 +29,8 @@ impl ParseCommand for qXfer {
             let offset = iter.next()?;
             let len = iter.next()?;
             Some(qXfer::FeaturesRead {
-                offset: decode_hex(&offset).ok()?,
-                len: decode_hex(&len).ok()?,
+                offset: decode_hex(offset).ok()?,
+                len: decode_hex(len).ok()?,
             })
         } else if bytes.starts_with(b":auxv:read:") {
             let mut iter = bytes[b":auxv:read:".len()..].split_mut(|c| *c == b':' || *c == b',');
@@ -41,8 +41,8 @@ impl ParseCommand for qXfer {
             let offset = iter.next()?;
             let len = iter.next()?;
             Some(qXfer::AuxvRead {
-                offset: decode_hex(&offset).ok()?,
-                len: decode_hex(&len).ok()?,
+                offset: decode_hex(offset).ok()?,
+                len: decode_hex(len).ok()?,
             })
         } else {
             None
