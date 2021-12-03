@@ -29,8 +29,8 @@ serde = { version = "1.0.126", features = ["derive", "rc"] }
 thiserror = "1.0.29"
 tokio = { version = "1.10", features = ["full", "test-util", "tracing"] }
 tokio-stream = { version = "0.1.4", features = ["fs", "io-util", "net", "signal", "sync", "time"] }
-tracing = "0.1.27"
-tracing-subscriber = { version = "0.3.1", features = ["ansi", "env-filter", "fmt", "json", "parking_lot", "registry"] }
+tracing = "0.1.29"
+tracing-subscriber = { version = "0.3.3", features = ["ansi", "env-filter", "fmt", "json", "parking_lot", "registry"] }
 
 [dev-dependencies]
 quickcheck = "1.0"
