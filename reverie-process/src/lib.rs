@@ -502,7 +502,7 @@ mod tests {
 
         let mut command = Command::new("nc");
         command
-            .arg("--listen")
+            .arg("-l")
             .arg("127.0.0.1")
             // Can bind to a low port without real root inside the namespace.
             .arg("80")
