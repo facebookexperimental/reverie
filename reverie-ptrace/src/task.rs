@@ -29,8 +29,8 @@ use reverie::{
         Addr, AddrMut, ArchPrctl, ArchPrctlCmd, MemoryAccess, Mprotect, Syscall, SyscallArgs,
         SyscallInfo, Sysno,
     },
-    Errno, ExitStatus, GlobalRPC, GlobalTool, Guest, Pid, Rdtsc, Subscription, Tid, TimerSchedule,
-    Tool,
+    Errno, ExitStatus, Frame, GlobalRPC, GlobalTool, Guest, Pid, Rdtsc, Subscription, Tid,
+    TimerSchedule, Tool,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -2042,6 +2042,18 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
 
     fn read_clock(&mut self) -> Result<u64, reverie::Error> {
         Ok(self.timer.read_clock())
+    }
+
+    fn backtrace(&mut self) -> Option<Vec<Frame>> {
+        // FIXME: This is a really dumb implementation that just gives the
+        // current instruction pointer location as a single stack frame.
+        let task = self.assume_stopped();
+        let rip = task.getregs().ok()?.rip;
+        let frame = Frame {
+            ip: rip,
+            symbol: None,
+        };
+        Some(vec![frame])
     }
 }
 

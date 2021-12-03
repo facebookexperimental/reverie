@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use reverie_syscalls::{Errno, MemoryAccess, SyscallInfo};
 
 use crate::auxv::Auxv;
+use crate::backtrace::Frame;
 use crate::error::Error;
 use crate::stack::Stack;
 use crate::timer::TimerSchedule;
@@ -202,6 +203,12 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     /// value, resolution, and semantics of the ticks are
     /// implementation-specific.
     fn read_clock(&mut self) -> Result<u64, Error>;
+
+    /// Returns a stack trace starting at the current location of the guest
+    /// thread. If a backtrace is not available, returns `None`.
+    fn backtrace(&mut self) -> Option<Vec<Frame>> {
+        None
+    }
 }
 
 /// Wraps a `Guest<T>` such that it implements `Guest<U>`.
@@ -317,5 +324,9 @@ where
 
     fn read_clock(&mut self) -> Result<u64, Error> {
         self.inner.read_clock()
+    }
+
+    fn backtrace(&mut self) -> Option<Vec<Frame>> {
+        self.inner.backtrace()
     }
 }

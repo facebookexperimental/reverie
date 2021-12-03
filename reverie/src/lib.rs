@@ -18,6 +18,7 @@
 #![feature(never_type)]
 
 mod auxv;
+mod backtrace;
 mod error;
 mod guest;
 mod rdtsc;
@@ -27,6 +28,7 @@ mod timer;
 mod tool;
 
 pub use auxv::*;
+pub use backtrace::*;
 pub use error::*;
 pub use guest::*;
 pub use rdtsc::*;
