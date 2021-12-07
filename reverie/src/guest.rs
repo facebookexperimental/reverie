@@ -206,6 +206,38 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
 
     /// Returns a stack trace starting at the current location of the guest
     /// thread. If a backtrace is not available, returns `None`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use reverie::*;
+    /// use reverie::syscalls::*;
+    /// use serde::{Deserialize, Serialize};
+    ///
+    /// #[derive(Debug, Serialize, Deserialize, Default, Clone)]
+    /// struct MyTool;
+    ///
+    /// #[reverie::tool]
+    /// impl Tool for MyTool {
+    ///     async fn handle_syscall_event<T: Guest<Self>>(
+    ///         &self,
+    ///         guest: &mut T,
+    ///         syscall: Syscall,
+    ///     ) -> Result<i64, Error> {
+    ///         // Generate a backtrace whenever we receive a call to getpid().
+    ///         if let Syscall::Getpid(_) = &syscall {
+    ///             if let Some(frames) = guest.backtrace() {
+    ///                 println!("Backtrace for getpid():");
+    ///                 for frame in frames {
+    ///                     println!("  {}", frame);
+    ///                 }
+    ///             }
+    ///         }
+    ///
+    ///         Ok(guest.inject(syscall).await?)
+    ///     }
+    /// }
+    /// ```
     fn backtrace(&mut self) -> Option<Vec<Frame>> {
         None
     }

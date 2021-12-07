@@ -29,7 +29,7 @@ use reverie::{
         Addr, AddrMut, ArchPrctl, ArchPrctlCmd, MemoryAccess, Mprotect, Syscall, SyscallArgs,
         SyscallInfo, Sysno,
     },
-    Errno, ExitStatus, Frame, GlobalRPC, GlobalTool, Guest, Pid, Rdtsc, Subscription, Tid,
+    Errno, ExitStatus, Frame, GlobalRPC, GlobalTool, Guest, Pid, Rdtsc, Subscription, Symbol, Tid,
     TimerSchedule, Tool,
 };
 use std::{
@@ -2045,15 +2045,45 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
     }
 
     fn backtrace(&mut self) -> Option<Vec<Frame>> {
-        // FIXME: This is a really dumb implementation that just gives the
-        // current instruction pointer location as a single stack frame.
-        let task = self.assume_stopped();
-        let rip = task.getregs().ok()?.rip;
-        let frame = Frame {
-            ip: rip,
-            symbol: None,
-        };
-        Some(vec![frame])
+        use unwind::{Accessors, AddressSpace, Byteorder, Cursor, PTraceState, RegNum};
+
+        let mut frames = Vec::new();
+
+        let space = AddressSpace::new(Accessors::ptrace(), Byteorder::DEFAULT).ok()?;
+        let state = PTraceState::new(self.tid.as_raw() as u32).ok()?;
+        let mut cursor = Cursor::remote(&space, &state).ok()?;
+
+        loop {
+            let ip = cursor.register(RegNum::IP).ok()?;
+            let is_signal = cursor.is_signal_frame().ok()?;
+
+            // Try to resolve the symbol.
+            let mut symbol = None;
+            if let Ok(name) = cursor.procedure_name() {
+                if let Ok(info) = cursor.procedure_info() {
+                    if info.start_ip() + name.offset() == ip {
+                        symbol = Some(Symbol {
+                            name: name.name().to_string(),
+                            offset: name.offset(),
+                            address: info.start_ip(),
+                            size: info.end_ip() - info.start_ip(),
+                        });
+                    }
+                }
+            }
+
+            frames.push(Frame {
+                ip,
+                is_signal,
+                symbol,
+            });
+
+            if !cursor.step().ok()? {
+                break;
+            }
+        }
+
+        Some(frames)
     }
 }
 
