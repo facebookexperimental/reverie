@@ -6,6 +6,10 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
+
+//! This tool will chunk together printed output from each thread, over fixed
+//! time intervals.
+
 use reverie::{
     syscalls::{Addr, MemoryAccess, Syscall},
     Error, GlobalTool, Guest, Tid, Tool,
@@ -24,8 +28,6 @@ use std::{
 };
 use structopt::StructOpt;
 use tracing::{debug, info, trace};
-
-/// This tool will chunk together printed output from each thread, over fixed time intervals.
 
 /// How many system calls (in each thread) define an epoch?
 const EPOCH: u64 = 10;

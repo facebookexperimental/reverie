@@ -7,8 +7,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! This instrumentation tool intercepts events but does nothing with them,
-//! except acting as a gdbserver.
+//! This instrumentation tool does nothing except acting as a gdbserver.
 
 use reverie::{Error, Subscription, Tool};
 use reverie_util::CommonToolArguments;
@@ -23,8 +22,9 @@ impl Tool for DebugTool {
     }
 }
 
-/// A tool to introduce inject "chaos" into a running process. A pathological
-/// kernel is simulated by forcing reads to only return one byte a time.
+/// A tool that acts as a GDB server. The process will start in a stopped state,
+/// waiting for a GDB client to connect. Once the connection is complete,
+/// execution of the guest process will continue.
 #[derive(Debug, StructOpt)]
 struct Args {
     #[structopt(flatten)]
