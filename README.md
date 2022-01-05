@@ -72,7 +72,9 @@ This separation of process-, thread-, and global-state is meant to provide an
 abstraction that allows future Reverie backends to be used without requiring the
 tool to be rewritten.
 
-![architecture](./assets/architecture-diagram.svg "Architecture Diagram")
+<p align="center">
+   <img src="./assets/architecture-diagram.svg" alt="Architecture Diagram">
+</p>
 
 ### Process State
 
