@@ -401,7 +401,7 @@ impl<'a> Displayable for Option<StatxPtr<'a>> {
     }
 }
 
-bitflags! {
+bitflags::bitflags! {
     /// stx_mask from statx, see linux/stat.h
     #[derive(Serialize, Deserialize)]
     pub struct StatxMask: u32 {

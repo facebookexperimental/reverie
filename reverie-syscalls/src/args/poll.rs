@@ -55,7 +55,7 @@ impl Displayable for PollFd {
     }
 }
 
-bitflags! {
+bitflags::bitflags! {
     /// Flags for [`PollFd`].
     #[derive(Default, Serialize, Deserialize)]
     pub struct PollFlags: libc::c_short {

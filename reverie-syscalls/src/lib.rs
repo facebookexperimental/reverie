@@ -21,9 +21,6 @@
 #[macro_use]
 mod macros;
 
-#[macro_use]
-extern crate bitflags;
-
 mod args;
 mod display;
 mod memory;

@@ -60,6 +60,3 @@ pub use tracer::spawn_fn_with_config;
 pub use tracer::GdbConnection;
 pub use tracer::Tracer;
 pub use tracer::TracerBuilder;
-
-#[macro_use]
-extern crate bitflags;

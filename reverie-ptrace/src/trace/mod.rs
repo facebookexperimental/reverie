@@ -507,7 +507,7 @@ struct ptrace_peeksiginfo_args {
     nr: u32,
 }
 
-bitflags! {
+bitflags::bitflags! {
     /// Flags for ptrace peeksiginfo
     pub struct PeekSigInfoFlags: u32 {
         /// dumping signals from the process-wide signal queue. signals are
