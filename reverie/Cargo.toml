@@ -8,7 +8,7 @@ edition = "2021"
 license = "BSD-2-Clause"
 
 [dependencies]
-addr2line = "0.14"
+addr2line = "0.17"
 anyhow = "1.0.51"
 async-trait = "0.1.51"
 bitflags = "1.3"
