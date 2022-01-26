@@ -38,6 +38,7 @@
 #![feature(never_type)]
 #![feature(llvm_asm)]
 #![feature(map_first_last)]
+#![feature(bench_black_box)]
 
 mod children;
 mod cp;
@@ -52,6 +53,7 @@ pub mod testing;
 mod timer;
 pub mod trace;
 mod tracer;
+mod validation;
 mod vdso;
 
 pub use perf::is_perf_supported;

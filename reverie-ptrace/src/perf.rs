@@ -23,6 +23,7 @@
 //! [`PerfCounter::DISABLE_SAMPLE_PERIOD`] can be used to avoid this for sampling.
 //! events.
 
+use crate::validation::{check_for_pmu_bugs, PmuValidationError};
 use core::ptr::NonNull;
 use lazy_static::lazy_static;
 use nix::{
@@ -32,12 +33,16 @@ use nix::{
 use perf_event_open_sys::{bindings as perf, ioctls};
 use reverie::Errno;
 use reverie::Tid;
-use tracing::info;
+use tracing::{info, warn};
 
 #[allow(unused_imports)] // only used if we have an error
 use std::compile_error;
 
 pub use perf::perf_event_header;
+
+lazy_static! {
+    static ref PMU_BUG: Result<(), PmuValidationError> = check_for_pmu_bugs();
+}
 
 // Not available in the libc crate
 const F_SETOWN_EX: libc::c_int = 15;
@@ -243,6 +248,13 @@ impl Builder {
         };
 
         Ok(PerfCounter { fd, mmap })
+    }
+
+    pub(crate) fn check_for_pmu_bugs(&mut self) -> &mut Self {
+        if let Err(pmu_error) = &*PMU_BUG {
+            warn!("Pmu bugs detected: {:?}", pmu_error);
+        }
+        self
     }
 }
 
