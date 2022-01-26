@@ -46,7 +46,7 @@ impl Tool for TestTool {
                     }
                 }),
                 "guest backtrace did not contain our expected function:\n{}",
-                backtrace
+                backtrace.pretty().unwrap()
             );
         }
 
