@@ -40,8 +40,8 @@ use tracing::{debug, warn};
 // This signal is unused, in that the kernel will never send it to a process.
 const MARKER_SIGNAL: Signal = reverie::PERF_EVENT_SIGNAL;
 
-const AMD_VENDOR: &str = "AuthenticAMD";
-const INTEL_VENDOR: &str = "GenuineIntel";
+pub(crate) const AMD_VENDOR: &str = "AuthenticAMD";
+pub(crate) const INTEL_VENDOR: &str = "GenuineIntel";
 
 // This done in .(model|family)_id() directly in raw_cpuid v10. This can
 // then be replaced with those calls, but that means this will also break!
@@ -71,7 +71,7 @@ fn full_family_model(vendor: &str, fi: &FeatureInfo) -> (u8, u8) {
     (family_id, model_id)
 }
 
-fn get_rcb_perf_config() -> u64 {
+pub(crate) fn get_rcb_perf_config() -> u64 {
     let c = CpuId::new();
     let vendor = c.get_vendor_info().unwrap();
     let vendor_str = vendor.as_string();
@@ -376,7 +376,7 @@ impl TimerImpl {
             builder.precise_ip(1);
         }
 
-        let timer = builder.create()?;
+        let timer = builder.check_for_pmu_bugs().create()?;
         timer.set_signal_delivery(guest_tid, MARKER_SIGNAL)?;
         timer.reset()?;
         // measure the target tid irrespective of CPU
