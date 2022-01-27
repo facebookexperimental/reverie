@@ -64,8 +64,8 @@ impl Mount {
     ///
     /// By default, none of the mounts in the `source` directory are visible in
     /// `destination`. To make all mounts recursively visible, combine this with
-    /// [`Self::recursive`]. Can also be used with [`Self::readonly`] to make the
-    /// contents of `destination` read-only.
+    /// [`Mount::recursive`]. Can also be used with [`Mount::readonly`] to make
+    /// the contents of `destination` read-only.
     pub fn bind<S: AsRef<OsStr>, D: AsRef<OsStr>>(source: S, destination: D) -> Self {
         Self::new(destination)
             .source(source)
@@ -226,13 +226,13 @@ impl Mount {
         self
     }
 
-    /// Same as specifying both [`recursive`] and [`private`].
+    /// Same as specifying both [`Mount::recursive`] and [`Mount::private`].
     pub fn rprivate(mut self) -> Self {
         self.flags |= MountFlags::MS_REC | MountFlags::MS_PRIVATE;
         self
     }
 
-    /// Same as specifying both [`recursive`] and [`shared`].
+    /// Same as specifying both [`Mount::recursive`] and [`Mount::shared`].
     pub fn rshared(mut self) -> Self {
         self.flags |= MountFlags::MS_REC | MountFlags::MS_SHARED;
         self
@@ -396,7 +396,7 @@ impl FromStr for Mount {
     /// Parses a [`Mount`]. This accepts the same syntax as Docker mounts where
     /// each mount consists of a comma-separated key-value list.
     ///
-    /// See https://docs.docker.com/storage/bind-mounts/ for more information.
+    /// See <https://docs.docker.com/storage/bind-mounts/> for more information.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut map: HashMap<&str, Option<&str>> = HashMap::new();
 
