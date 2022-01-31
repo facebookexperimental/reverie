@@ -18,6 +18,7 @@ use std::{
     path::PathBuf,
 };
 
+mod clone;
 mod fcntl;
 pub mod ioctl;
 mod poll;
@@ -31,6 +32,7 @@ use nix::{
 
 use serde::{Deserialize, Serialize};
 
+pub use clone::*;
 pub use fcntl::FcntlCmd;
 pub use poll::*;
 pub use stat::*;

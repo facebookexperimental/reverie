@@ -10,19 +10,21 @@
 pub mod family;
 
 use crate::args::{
-    ioctl, ArchPrctlCmd, CArrayPtr, CStrPtr, ClockId, FcntlCmd, PathPtr, PollFd, StatPtr,
-    StatxMask, StatxPtr, Timespec, Timeval, Timezone, Whence,
+    ioctl, ArchPrctlCmd, CArrayPtr, CStrPtr, ClockId, CloneArgs, FcntlCmd, PathPtr, PollFd,
+    StatPtr, StatxMask, StatxPtr, Timespec, Timeval, Timezone, Whence,
 };
 use crate::display::Displayable;
 use crate::memory::{Addr, AddrMut};
 use crate::raw::FromToRaw;
 use ::syscalls::{SyscallArgs, Sysno};
 
+// FIXME: Switch everything over to `crate::args::CloneFlags`.
+use nix::sched::CloneFlags;
+
 // Re-export flags that used by syscalls from the `nix` crate so downstream
 // projects don't need to add another dependency on it.
 pub use nix::{
     fcntl::{AtFlags, OFlag},
-    sched::CloneFlags,
     sys::{
         epoll::EpollCreateFlags,
         eventfd::EfdFlags,
@@ -394,6 +396,31 @@ syscall_list! {
         SYS_pkey_alloc => PkeyAlloc,
         SYS_pkey_free => PkeyFree,
         SYS_statx => Statx,
+        // Missing: SYS_io_pgetevents => IoPgetevents,
+        // Missing: SYS_rseq => Rseq,
+        // Missing: SYS_pidfd_send_signal => PidfdSendSignal,
+        // Missing: SYS_io_uring_setup => IoUringSetup,
+        // Missing: SYS_io_uring_enter => IoUringEnter,
+        // Missing: SYS_io_uring_register => IoUringRegister,
+        // Missing: SYS_open_tree => OpenTree,
+        // Missing: SYS_move_mount => MoveMount,
+        // Missing: SYS_fsopen => Fsopen,
+        // Missing: SYS_fsconfig => Fsconfig,
+        // Missing: SYS_fsmount => Fsmount,
+        // Missing: SYS_fspick => Fspick,
+        // Missing: SYS_pidfd_open => PidfdOpen,
+        SYS_clone3 => Clone3,
+        // Missing: SYS_close_range => CloseRange,
+        // Missing: SYS_openat2 => Openat2,
+        // Missing: SYS_pidfd_getfd => PidfdGetfd,
+        // Missing: SYS_faccessat2 => Faccessat2,
+        // Missing: SYS_process_madvise => ProcessMadvise,
+        // Missing: SYS_epoll_pwait2 => EpollPwait2,
+        // Missing: SYS_mount_setattr => MountSetattr,
+        // Missing: SYS_quotactl_path => QuotactlPath,
+        // Missing: SYS_landlock_create_ruleset => LandlockCreateRuleset,
+        // Missing: SYS_landlock_add_rule => LandlockAddRule,
+        // Missing: SYS_landlock_restrict_self => LandlockRestrictSelf,
     }
 }
 
@@ -3233,6 +3260,13 @@ typed_syscall! {
         flags: AtFlags,
         mask: StatxMask,
         statx: Option<StatxPtr>,
+    }
+}
+
+typed_syscall! {
+    pub struct Clone3 {
+        args: Option<AddrMut<CloneArgs>>,
+        size: usize,
     }
 }
 

@@ -13,8 +13,10 @@
 
 use super::Syscall;
 
+use crate::args::CloneFlags;
 use crate::args::StatPtr;
 use crate::memory::AddrMut;
+use crate::memory::MemoryAccess;
 
 use derive_more::From;
 
@@ -128,6 +130,52 @@ impl From<SockOptFamily> for Syscall {
             SockOptFamily::Getsockopt(syscall) => Syscall::Getsockopt(syscall),
             SockOptFamily::Getpeername(syscall) => Syscall::Getpeername(syscall),
             SockOptFamily::Getsockname(syscall) => Syscall::Getsockname(syscall),
+        }
+    }
+}
+
+/// Represents the clone family of syscalls. All of these create a new process.
+/// Generally, we only care about the flags used.
+#[derive(From, Debug, Copy, Clone, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub enum CloneFamily {
+    Fork(super::Fork),
+    Vfork(super::Vfork),
+    Clone(super::Clone),
+    Clone3(super::Clone3),
+}
+
+impl CloneFamily {
+    /// Returns the clone flags for the syscall. For `fork` and `vfork`, the
+    /// flags are deduced based on the semantics of those syscalls. For the
+    /// `clone` syscall, we simply return the flags passed as an argument to the
+    /// syscall. For `clone3`, we have to read the flags from the pointer passed
+    /// to the syscall. Thus, the `memory` parameter is not read unless this is
+    /// a `clone3` syscall. If reading from memory fails for any reason, we
+    /// return an empty set of clone flags (i.e., 0).
+    pub fn flags<M: MemoryAccess>(&self, memory: &M) -> CloneFlags {
+        match self {
+            Self::Fork(_) => CloneFlags::SIGCHLD,
+            Self::Vfork(_) => CloneFlags::CLONE_VFORK | CloneFlags::CLONE_VM | CloneFlags::SIGCHLD,
+            Self::Clone(clone) => clone.flags().into(),
+            Self::Clone3(clone) => {
+                // sys_clone3 reads everything from a pointer.
+                clone
+                    .args()
+                    .and_then(|ptr| memory.read_value(ptr).ok())
+                    .map_or_else(CloneFlags::empty, |args| args.flags)
+            }
+        }
+    }
+}
+
+impl From<CloneFamily> for Syscall {
+    fn from(family: CloneFamily) -> Syscall {
+        match family {
+            CloneFamily::Fork(syscall) => Syscall::Fork(syscall),
+            CloneFamily::Vfork(syscall) => Syscall::Vfork(syscall),
+            CloneFamily::Clone(syscall) => Syscall::Clone(syscall),
+            CloneFamily::Clone3(syscall) => Syscall::Clone3(syscall),
         }
     }
 }
