@@ -93,6 +93,7 @@ command_enum! {
         // Disabled because `libc::tty_struct` isn't defined.
         #[cfg(none)]
         TIOCTTYGSTRUCT(Option<AddrMut<'a, libc::tty_struct>>) = 0x00005426,
+        TIOCGPTPEER(libc::c_int) = 0x00005441,
         FIONCLEX = 0x00005450,
         FIOCLEX = 0x00005451,
         FIOASYNC(Option<Addr<'a, libc::c_int>>) = 0x00005452,
