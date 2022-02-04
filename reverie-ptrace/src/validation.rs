@@ -7,7 +7,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use crate::perf::do_branches;
+use crate::perf::{do_branches, PerfCounter};
 use crate::timer::{get_rcb_perf_config, AMD_VENDOR, INTEL_VENDOR};
 use core::mem;
 use perf_event_open_sys::bindings as perf;
@@ -72,7 +72,11 @@ pub(crate) enum PmuValidationError {
     IntelXenPmiBugDetected,
 }
 
-fn init_perf_event_attr(perf_attr_type: u32, config: u64) -> perf::perf_event_attr {
+fn init_perf_event_attr(
+    perf_attr_type: u32,
+    config: u64,
+    precise_ip: bool,
+) -> perf::perf_event_attr {
     let mut result = perf::perf_event_attr {
         type_: perf_attr_type,
         config,
@@ -82,19 +86,39 @@ fn init_perf_event_attr(perf_attr_type: u32, config: u64) -> perf::perf_event_at
     result.set_exclude_guest(1);
     result.set_exclude_kernel(1);
 
+    if precise_ip
+        && CpuId::new()
+            .get_feature_info()
+            .map_or(false, |info| info.has_ds())
+    {
+        result.set_precise_ip(1);
+
+        // This prevents EINVAL when creating a counter with precise_ip enabled
+        result.__bindgen_anon_1.sample_period = PerfCounter::DISABLE_SAMPLE_PERIOD;
+    } else {
+        // This is the value used for the bug checks which are not originally designed to
+        // work with precise_ip
+        result.__bindgen_anon_1.sample_period = 0;
+    }
+
     result
 }
 
 /// Create a template perf_event_attr for ticks
-fn ticks_attr() -> perf::perf_event_attr {
-    init_perf_event_attr(perf::perf_type_id_PERF_TYPE_RAW, get_rcb_perf_config())
+fn ticks_attr(precise_ip: bool) -> perf::perf_event_attr {
+    init_perf_event_attr(
+        perf::perf_type_id_PERF_TYPE_RAW,
+        get_rcb_perf_config(),
+        precise_ip,
+    )
 }
 
 /// Create a template perf_event_attr for cycles
-fn cycles_attr() -> perf::perf_event_attr {
+fn cycles_attr(precise_ip: bool) -> perf::perf_event_attr {
     init_perf_event_attr(
         perf::perf_type_id_PERF_TYPE_HARDWARE,
         perf::perf_hw_id_PERF_COUNT_HW_CPU_CYCLES.into(),
+        precise_ip,
     )
 }
 
@@ -120,18 +144,21 @@ impl Drop for ScopedFd {
 /// It checks for a collection of processor features that ensure that the pmu features
 /// required from Reverie to function correctly are available and trustworthy
 pub(crate) fn check_for_pmu_bugs() -> Result<(), PmuValidationError> {
-    check_for_ioc_period_bug()
-        .and(check_working_counters())
-        .and(check_for_arch_bugs())
+    check_for_ioc_period_bug(false)?;
+    check_working_counters(false)?;
+    check_for_arch_bugs(false)?;
+    check_for_ioc_period_bug(true)?;
+    check_working_counters(true)?;
+    check_for_arch_bugs(true)
 }
 
 /// This function is transcribed from the function with the same name in
 /// [Mozilla-RR](https://github.com/rr-debugger/rr/blob/master/src/PerfCounters.cc#L227)
 /// Checks for a bug in (supposedly) Linux Kernel < 3.7 where period changes
 /// do not happen until after the _next_ rollover.
-fn check_for_ioc_period_bug() -> Result<(), PmuValidationError> {
+fn check_for_ioc_period_bug(precise_ip: bool) -> Result<(), PmuValidationError> {
     // Start a cycles counter
-    let mut attr = ticks_attr();
+    let mut attr = ticks_attr(precise_ip);
     attr.__bindgen_anon_1.sample_period = 0xffffffff;
     attr.set_exclude_callchain_kernel(1);
     let bug_fd = start_counter(0, -1, &mut attr, None)?;
@@ -272,11 +299,9 @@ fn read_counter(fd: &ScopedFd) -> Result<i64, PmuValidationError> {
 /// Transcription of the function with the same name in mozilla-rr to check
 /// for the bug where hardware counters simply don't work or only one hardware
 /// counter works
-fn check_working_counters() -> Result<(), PmuValidationError> {
-    let mut attr = ticks_attr();
-    attr.__bindgen_anon_1.sample_period = 0;
-    let mut attr2 = cycles_attr();
-    attr2.__bindgen_anon_1.sample_period = 0;
+fn check_working_counters(precise_ip: bool) -> Result<(), PmuValidationError> {
+    let mut attr = ticks_attr(precise_ip);
+    let mut attr2 = cycles_attr(precise_ip);
 
     let fd = start_counter(0, -1, &mut attr, None)?;
     let fd2 = start_counter(0, -1, &mut attr2, None)?;
@@ -336,7 +361,7 @@ fn is_amd_zen(cpu_feature: FeatureInfo) -> bool {
 
 /// This is a transcription of the function with the same name in Mozilla-RR it will
 /// check for bugs specific to cpu architectures
-fn check_for_arch_bugs() -> Result<(), PmuValidationError> {
+fn check_for_arch_bugs(precise_ip: bool) -> Result<(), PmuValidationError> {
     let c = CpuId::new();
     let vendor = c.get_vendor_info().unwrap();
     let feature_info = c
@@ -346,7 +371,7 @@ fn check_for_arch_bugs() -> Result<(), PmuValidationError> {
 
     match vendor_str {
         AMD_VENDOR if is_amd_zen(feature_info) => check_for_zen_speclockmap(),
-        INTEL_VENDOR => check_for_kvm_in_txcp_bug().and(check_for_xen_pmi_bug()),
+        INTEL_VENDOR => check_for_kvm_in_txcp_bug().and(check_for_xen_pmi_bug(precise_ip)),
         s => panic!("Unknown CPU vendor: {}", s),
     }
 }
@@ -361,7 +386,7 @@ fn check_for_zen_speclockmap() -> Result<(), PmuValidationError> {
 
     // 0x25 == RETIRED_LOCK_INSTRUCTIONS - Counts the number of retired locked instructions
     // + 0x08 == SPECLOCKMAPCOMMIT
-    let mut attr = init_perf_event_attr(perf::perf_type_id_PERF_TYPE_RAW, 0x510825);
+    let mut attr = init_perf_event_attr(perf::perf_type_id_PERF_TYPE_RAW, 0x510825, false);
 
     let fd = start_counter(0, -1, &mut attr, None)?;
 
@@ -389,7 +414,7 @@ fn check_for_zen_speclockmap() -> Result<(), PmuValidationError> {
 
 fn check_for_kvm_in_txcp_bug() -> Result<(), PmuValidationError> {
     let mut count: i64 = 0;
-    let mut attr = ticks_attr();
+    let mut attr = ticks_attr(false);
     attr.config |= IN_TXCP;
     attr.__bindgen_anon_1.sample_period = 0;
     let mut disabled_txcp = false;
@@ -412,9 +437,9 @@ fn check_for_kvm_in_txcp_bug() -> Result<(), PmuValidationError> {
     }
 }
 
-fn check_for_xen_pmi_bug() -> Result<(), PmuValidationError> {
+fn check_for_xen_pmi_bug(precise_ip: bool) -> Result<(), PmuValidationError> {
     let mut count: i32;
-    let mut attr = ticks_attr();
+    let mut attr = ticks_attr(precise_ip);
     attr.__bindgen_anon_1.sample_period = NUM_BRANCHES - 1;
     let fd = start_counter(0, -1, &mut attr, None)?;
 
@@ -539,7 +564,7 @@ mod test {
     #[test]
     fn test_check_for_ioc_period_bug() {
         // This assumes the machine running the test will not have this bug
-        if let Err(pmu_err) = check_for_ioc_period_bug() {
+        if let Err(pmu_err) = check_for_ioc_period_bug(false) {
             panic!("Ioc period bug check failed - {}", pmu_err);
         }
     }
@@ -547,7 +572,7 @@ mod test {
     #[test]
     fn test_check_working_counters() {
         // This assumes the machine running the test will have working counters
-        if let Err(pmu_err) = check_working_counters() {
+        if let Err(pmu_err) = check_working_counters(false) {
             panic!("Working counters check failed - {}", pmu_err);
         }
     }
@@ -555,8 +580,59 @@ mod test {
     #[test]
     fn test_check_for_arch_bugs() {
         // This assumes the machine running the test will not have arch bugs
-        if let Err(pmu_err) = check_for_arch_bugs() {
+        if let Err(pmu_err) = check_for_arch_bugs(false) {
             panic!("Architecture-specific bug check failed - {}", pmu_err);
+        }
+    }
+
+    #[test]
+    fn test_check_for_ioc_period_bug_precise_ip() {
+        // This assumes the machine running the test will not have this bug and only runs
+        // if precise_ip will be enabled
+        if CpuId::new()
+            .get_feature_info()
+            .map_or(false, |info| info.has_ds())
+        {
+            if let Err(pmu_err) = check_for_ioc_period_bug(true) {
+                panic!(
+                    "Ioc period bug check failed when precise_ip was enabled - {}",
+                    pmu_err
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_check_working_counters_precise_ip() {
+        // This assumes the machine running the test will have working counters and only runs
+        // if precise_ip will be enabled
+        if CpuId::new()
+            .get_feature_info()
+            .map_or(false, |info| info.has_ds())
+        {
+            if let Err(pmu_err) = check_working_counters(true) {
+                panic!(
+                    "Working counters check failed when precise_ip was enabled - {}",
+                    pmu_err
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_check_for_arch_bugs_precise_ip() {
+        // This assumes the machine running the test will not have arch bugs and only runs
+        // if precise_ip will be enabled
+        if CpuId::new()
+            .get_feature_info()
+            .map_or(false, |info| info.has_ds())
+        {
+            if let Err(pmu_err) = check_for_arch_bugs(true) {
+                panic!(
+                    "Architecture-specific bug check failed when precise_ip was enabled - {}",
+                    pmu_err
+                );
+            }
         }
     }
 }

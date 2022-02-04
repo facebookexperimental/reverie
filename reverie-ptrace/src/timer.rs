@@ -323,6 +323,20 @@ enum ActiveEvent {
     },
 }
 
+impl ActiveEvent {
+    /// Given the current clock, determine if another event is required to get the
+    /// clock to its expected state
+    fn reschedule_if_spurious_wakeup(&self, curr_clock: u64) -> Option<TimerEventRequest> {
+        match self {
+            ActiveEvent::Precise { clock_target } => (clock_target.saturating_sub(curr_clock)
+                > MAX_SINGLE_STEP_COUNT)
+                .then(|| TimerEventRequest::Precise(*clock_target - curr_clock)),
+            ActiveEvent::Imprecise { clock_min } => (*clock_min > curr_clock)
+                .then(|| TimerEventRequest::Imprecise(*clock_min - curr_clock)),
+        }
+    }
+}
+
 impl EventStatus {
     pub fn next(self) -> Self {
         match self {
@@ -356,11 +370,14 @@ const SKID_MARGIN_RCBS: u64 = 50;
 /// about perf event throttling, which isn't well-documented.
 const SINGLESTEP_TIMEOUT_RCBS: u64 = 5;
 
+/// The maximum single step count we expect can occur when a precise timer event
+/// is requested that leaves less than the minimum perf timeout remaining.
+const MAX_SINGLE_STEP_COUNT: u64 = SKID_MARGIN_RCBS + SINGLESTEP_TIMEOUT_RCBS;
+
 impl TimerImpl {
     pub fn new(guest_pid: Pid, guest_tid: Tid) -> Result<Self, Errno> {
-        let has_debug_store = CpuId::new()
-            .get_feature_info()
-            .map_or(false, |info| info.has_ds());
+        let cpu = CpuId::new();
+        let has_debug_store = cpu.get_feature_info().map_or(false, |info| info.has_ds());
 
         let evt = Event::Raw(get_rcb_perf_config());
 
@@ -371,6 +388,10 @@ impl TimerImpl {
             .event(evt);
 
         // Check if we can set precise_ip = 1 by checking if debug store is enabled.
+        debug!(
+            "Setting precise_ip to {} for cpu {:?}",
+            has_debug_store, cpu
+        );
         if has_debug_store {
             // set precise_ip to lowest value to enable PEBS (TODO: AMD?)
             builder.precise_ip(1);
@@ -470,6 +491,8 @@ impl TimerImpl {
 
     pub fn finalize_requests(&self) {
         if self.send_artificial_signal {
+            debug!("Sending artificial timer signal");
+
             // Give the guest a kick via an "artificial signal".  This gives us something
             // to handle in `handle_signal` and thus drives single-stepping.
             Errno::result(unsafe {
@@ -509,15 +532,30 @@ impl TimerImpl {
 
         // At this point, we've decided that a timer event is to be delivered.
 
+        // Ensure any new timer signals don't mess with us while single-stepping
+        self.disable_timer_before_stepping();
+
+        // Last check to see if this an unexpected wakeup (a signal before the minimum expected)
+        let ctr = self.read_clock();
+
+        if let Some(additional_timer_request) = self.event.reschedule_if_spurious_wakeup(ctr) {
+            warn!("Spurious wakeup - rescheduling new timer event");
+            if let Err(errno) = self.request_event(additional_timer_request) {
+                warn!(
+                    "Attempted to reschedule a timer signal after an early wakeup, but failed with - {:?}. A panic will likely follow",
+                    errno
+                );
+            } else {
+                return Err(HandleFailure::Cancelled(task));
+            };
+        }
+
         // Before we drive the event to completion, clear `send_artificial_signal` flag so that:
         // - another signal isn't generated anytime Timer::finalize_requests() is called
         // - spurious SIGSTKFLTs aren't let errantly let through
         // Cancellations should prevent spurious timer events in any case.
         self.send_artificial_signal = false;
-        // Ensure any new timer signals don't mess with us while single-stepping
-        self.disable_timer_before_stepping();
 
-        let ctr = self.read_clock();
         match self.event {
             ActiveEvent::Precise { clock_target } => {
                 self.attempt_single_step(task, ctr, clock_target).await
@@ -527,7 +565,7 @@ impl TimerImpl {
                     "Imprecise timer event delivered. Ctr val: {}, min val: {}",
                     ctr, clock_min
                 );
-                assert!(ctr >= clock_min);
+                assert!(ctr >= clock_min, "ctr = {}, clock_min = {}", ctr, clock_min);
                 Ok(task)
             }
         }
@@ -546,6 +584,15 @@ impl TimerImpl {
                 {} > {}. Consider increasing SKID_MARGIN_RCBS.",
             ctr,
             target
+        );
+        assert!(
+            target - ctr <= MAX_SINGLE_STEP_COUNT,
+            "Single steps from {} to {} requested ({} steps), but that exceeds the skid margin + minimum perf timer steps ({}). \
+                This probably indicates a bug",
+            ctr,
+            target,
+            (target - ctr),
+            MAX_SINGLE_STEP_COUNT
         );
         debug!("Timer will single-step from ctr {} to {}", ctr, target);
         let mut task = task;
