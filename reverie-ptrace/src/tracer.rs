@@ -412,6 +412,11 @@ impl<T: Tool + 'static> TracerBuilder<T> {
         }
     }
 
+    /// Returns a reference to the command to be traced.
+    pub fn command(&self) -> &Command {
+        &self.command
+    }
+
     /// Sets the static configuration that will be made available to the tool.
     pub fn config(mut self, config: <T::GlobalState as GlobalTool>::Config) -> Self {
         self.config = Some(config);
