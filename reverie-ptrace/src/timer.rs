@@ -539,7 +539,7 @@ impl TimerImpl {
         let ctr = self.read_clock();
 
         if let Some(additional_timer_request) = self.event.reschedule_if_spurious_wakeup(ctr) {
-            warn!("Spurious wakeup - rescheduling new timer event");
+            debug!("Spurious wakeup - rescheduling new timer event");
             if let Err(errno) = self.request_event(additional_timer_request) {
                 warn!(
                     "Attempted to reschedule a timer signal after an early wakeup, but failed with - {:?}. A panic will likely follow",
