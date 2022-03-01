@@ -438,7 +438,8 @@ fn check_for_kvm_in_txcp_bug() -> Result<(), PmuValidationError> {
 }
 
 fn check_for_xen_pmi_bug(precise_ip: bool) -> Result<(), PmuValidationError> {
-    let mut count: i32;
+    #[allow(unused_assignments)]
+    let mut count: i32 = -1;
     let mut attr = ticks_attr(precise_ip);
     attr.__bindgen_anon_1.sample_period = NUM_BRANCHES - 1;
     let fd = start_counter(0, -1, &mut attr, None)?;
@@ -468,6 +469,31 @@ fn check_for_xen_pmi_bug(precise_ip: bool) -> Result<(), PmuValidationError> {
 
     #[allow(deprecated)]
     unsafe {
+        // The following asm block does this:
+        // ```
+        // let ret = syscall!(sys_ioctl, raw_fd, _PERF_EVENT_IOC_ENABLE, 0);
+        // if ret >= -4095 as u64 { return; }
+        // let ret = syscall!(SYS_ioctl, raw_fd, _PERF_EVENT_IOC_RESET, 0);
+        // // From this point on, all conditional branches count!
+        // if ret >= -4095 as u64 { return; }
+        // // Reset the counter period to the desired value.
+        // let ret = syscall!(SYS_ioctl, raw_fd, _PERF_EVENT_IOC_PERIOD, attr.sample_period);
+        // if ret >= -4095 as u64 { return; }
+        // let mut iterations = NUM_BRANCHES - 2;
+        // loop {
+        //     iterations -= 1;
+        //     accumulator *= 7;
+        //     accumulator += 2;
+        //     accumulator &= 0xffffff;
+        //     if iterations == 0 {
+        //         break;
+        //     }
+        // }
+        //
+        // let ret = syscall!(SYS_ioctl, raw_fd, _PERF_EVENT_IOC_DISABLE, 0);
+        // if ret >= -4095 as u64 { return; }
+        // count = 0;
+        // ```
         llvm_asm!(
             "
             mov $2, %rax;
@@ -548,7 +574,7 @@ fn check_for_xen_pmi_bug(precise_ip: bool) -> Result<(), PmuValidationError> {
         )));
     }
 
-    let has_xen_pmi_bug = (count > 0 && count as u64 > NUM_BRANCHES) || count == -1;
+    let has_xen_pmi_bug = count as u64 > NUM_BRANCHES || count == -1;
 
     if has_xen_pmi_bug {
         Err(PmuValidationError::IntelXenPmiBugDetected)
