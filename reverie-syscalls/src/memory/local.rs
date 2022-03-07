@@ -7,7 +7,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::io;
 
 use super::{Addr, AddrMut, Errno, MemoryAccess};
@@ -37,11 +37,19 @@ impl LocalMemory {
 impl MemoryAccess for LocalMemory {
     fn read_vectored(
         &self,
-        _read_from: &[io::IoSlice],
-        _write_to: &mut [io::IoSliceMut],
+        read_from: &[io::IoSlice],
+        write_to: &mut [io::IoSliceMut],
     ) -> Result<usize, Errno> {
-        // TODO: Just write to the first non-empty buffer
-        todo!("Implement local memory access")
+        // Just read from the first non-empty slice.
+        if let Some(from) = read_from.iter().find(|slice| !slice.is_empty()) {
+            // Write to the first non-empty slice.
+            if let Some(to) = write_to.iter_mut().find(|slice| !slice.is_empty()) {
+                let count = to.len().min(from.len());
+                to[0..count].copy_from_slice(&from[0..count]);
+                return Ok(count);
+            }
+        }
+        Ok(0)
     }
 
     fn write_vectored(
@@ -77,12 +85,42 @@ impl MemoryAccess for LocalMemory {
     }
 
     fn read_cstring(&self, addr: Addr<u8>) -> Result<CString, Errno> {
-        let ptr = unsafe { addr.as_ptr() };
-        let len = unsafe { libc::strlen(ptr as *const libc::c_char) };
-        let slice = unsafe { ::core::slice::from_raw_parts(ptr, len) };
+        Ok(unsafe { CStr::from_ptr(addr.as_ptr() as *const _) }.into())
+    }
+}
 
-        let buf = Vec::from(slice);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        Ok(unsafe { CString::from_vec_unchecked(buf) })
+    #[test]
+    fn read_value() {
+        let m = LocalMemory::new();
+        let x = [1u32, 2, 3, 4];
+        let addr = Addr::from_ptr(x.as_ptr()).unwrap();
+        let v: u32 = m.read_value(addr).unwrap();
+        assert_eq!(v, 1);
+    }
+
+    #[test]
+    fn read() {
+        let m = LocalMemory::new();
+        let x = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let addr = Addr::from_ptr(x.as_ptr()).unwrap();
+        let mut buf = [0u8; 8];
+        assert_eq!(m.read(addr, &mut buf).unwrap(), 8);
+        assert_eq!(buf, x);
+    }
+
+    #[test]
+    fn read_cstring() {
+        use std::ffi::CStr;
+
+        let m = LocalMemory::new();
+        let x = "hello world\0";
+        let addr = Addr::from_ptr(x.as_ptr() as *const u8).unwrap();
+        assert_eq!(m.read_cstring(addr).unwrap().as_c_str(), unsafe {
+            CStr::from_ptr(x.as_ptr() as *const _)
+        });
     }
 }
