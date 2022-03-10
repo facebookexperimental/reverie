@@ -569,10 +569,30 @@ macro_rules! ret_without_perf {
 /// Perform exactly `count+1` conditional branch instructions. Useful for
 /// testing timer-related code.
 #[cfg(target_arch = "x86_64")]
+#[cfg(not(feature = "llvm_asm"))]
+#[inline(never)]
+pub fn do_branches(mut count: u64) {
+    // Anything but assembly is unreliable between debug and release
+    unsafe {
+        // Loop until carry flag is set, indicating underflow
+        core::arch::asm!(
+            "2:",
+            "sub {0}, 1",
+            "jnc 2b",
+            inout(reg) count,
+        )
+    }
+
+    assert_eq!(count, u64::MAX);
+}
+
+/// Perform exactly `count+1` conditional branch instructions. Useful for
+/// testing timer-related code.
+#[cfg(target_arch = "x86_64")]
+#[cfg(feature = "llvm_asm")]
 #[inline(never)]
 pub fn do_branches(count: u64) {
     // Anything but assembly is unreliable between debug and release
-    // TODO: Switch to `asm!()` when our LLVM version supports it.
     #[allow(deprecated)]
     unsafe {
         // Loop until carry flag is set, indicating underflow

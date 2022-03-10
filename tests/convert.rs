@@ -6,7 +6,7 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
-#![feature(llvm_asm)]
+#![cfg_attr(feature = "llvm_asm", feature(llvm_asm))]
 
 // when we convert syscall, such as open -> openat, the old syscall
 // args should not be clobbered, even with the conversion.
@@ -61,7 +61,64 @@ mod tests {
     use reverie_ptrace::testing::check_fn;
 
     #[cfg(target_arch = "x86_64")]
+    #[cfg(not(feature = "llvm_asm"))]
     #[allow(unused_mut)]
+    unsafe fn open_syscall_sanity_check() -> i32 {
+        let path = b"/dev/null\0".as_ptr() as usize;
+        let flags: usize = 0x8000; // O_LARGEFILE
+        let mode: usize = 0o644;
+
+        let mut ret: usize;
+
+        // // The following asm block does this:
+        // let ret = open("/dev/null", 0x8000, 0644);
+        // if ret >= -4095 as u64 { exit_group(1) }
+        // // Sanity check input registers to ensure they didn't change.
+        // if %rsi != 0x8000 { exit_group(1) }
+        // if %rdx != 0644 { exit_roup(1) }
+        // return fd
+        core::arch::asm!(
+            "mov r8, {arg1}",
+            "syscall",
+            // if (ret >= -4095 as u64) goto 1
+            "cmp 0xfffffffffffff001"
+            "jae 2f",
+            // if (rax != r8) goto label1;
+            "cmp rdi, r8",
+            "jne 2f",
+            // if (rsi != 0x8000) goto label1;
+            "cmp rsi, 0x8000",
+            "jne 2f",
+            // if (rdx != 0644) goto label1;
+            "cmp rdx, 0x1a4",
+            "jne 2f",
+            // Otherwise, we're successful.
+            "jmp 3f",
+            "2:",
+            // Set syscall arg1 to label1
+            "mov rdi, 0x1",
+            // Set syscall to exit_group
+            "mov rax, {sys_exit_group}",
+            // Do the syscall
+            "syscall",
+            "3:",
+            lateout("rax") ret,
+            in("rax") n,
+            arg1 = inlateout("rdi") path, // Reused for the exit_group syscall.
+            in("rsi") flags,
+            in("rdx") mode,
+            out("r8") _, // Clobbered
+            out("rcx") _, // rcx is used to store old rip
+            out("r11") _, // r11 is used to store old rflags
+        );
+
+        ret
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[cfg(feature = "llvm_asm")]
+    #[allow(unused_mut)]
+    #[allow(deprecated)]
     unsafe fn open_syscall_sanity_check() -> i32 {
         let mut ret;
         let path = b"/dev/null\0";

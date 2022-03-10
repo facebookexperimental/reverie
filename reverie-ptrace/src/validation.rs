@@ -13,7 +13,6 @@ use core::mem;
 use perf_event_open_sys::bindings as perf;
 use raw_cpuid::{CpuId, FeatureInfo};
 use reverie::Errno;
-use std::hint::black_box;
 use thiserror::Error;
 use tracing::{error, warn};
 
@@ -68,6 +67,7 @@ pub(crate) enum PmuValidationError {
     #[error("Intel Kvm-In-Txcp bug found")]
     IntelKvmInTxcpBugDetected,
 
+    #[cfg(feature = "llvm_asm")]
     #[error("Overcount triggered by PMU interrupts detected due to Xen PMU virtualization bug")]
     IntelXenPmiBugDetected,
 }
@@ -361,7 +361,7 @@ fn is_amd_zen(cpu_feature: FeatureInfo) -> bool {
 
 /// This is a transcription of the function with the same name in Mozilla-RR it will
 /// check for bugs specific to cpu architectures
-fn check_for_arch_bugs(precise_ip: bool) -> Result<(), PmuValidationError> {
+fn check_for_arch_bugs(_precise_ip: bool) -> Result<(), PmuValidationError> {
     let c = CpuId::new();
     let vendor = c.get_vendor_info().unwrap();
     let feature_info = c
@@ -371,7 +371,12 @@ fn check_for_arch_bugs(precise_ip: bool) -> Result<(), PmuValidationError> {
 
     match vendor_str {
         AMD_VENDOR if is_amd_zen(feature_info) => check_for_zen_speclockmap(),
-        INTEL_VENDOR => check_for_kvm_in_txcp_bug().and(check_for_xen_pmi_bug(precise_ip)),
+        INTEL_VENDOR => {
+            check_for_kvm_in_txcp_bug()?;
+            #[cfg(feature = "llvm_asm")]
+            check_for_xen_pmi_bug(_precise_ip)?;
+            Ok(())
+        }
         s => panic!("Unknown CPU vendor: {}", s),
     }
 }
@@ -395,6 +400,18 @@ fn check_for_zen_speclockmap() -> Result<(), PmuValidationError> {
     let count = read_counter(&fd)?;
 
     // A lock add is known to increase the perf counter we're looking at.
+    #[cfg(not(feature = "llvm_asm"))]
+    unsafe {
+        let _prev: usize;
+        core::arch::asm!(
+            "lock",
+            "xadd [{}], {}",
+            in(reg) val,
+            inout(reg) to_add => _prev,
+        )
+    }
+
+    #[cfg(feature = "llvm_asm")]
     #[allow(deprecated)]
     unsafe {
         let _prev: usize;
@@ -437,6 +454,8 @@ fn check_for_kvm_in_txcp_bug() -> Result<(), PmuValidationError> {
     }
 }
 
+// FIXME: Convert this big block of llvm_asm over to the new asm syntax.
+#[cfg(feature = "llvm_asm")]
 fn check_for_xen_pmi_bug(precise_ip: bool) -> Result<(), PmuValidationError> {
     #[allow(unused_assignments)]
     let mut count: i32 = -1;
@@ -451,7 +470,7 @@ fn check_for_xen_pmi_bug(precise_ip: bool) -> Result<(), PmuValidationError> {
         20764791
     }
 
-    let mut accumulator = black_box(make_accumulator_seed());
+    let mut accumulator = core::hint::black_box(make_accumulator_seed());
     let mut expected_accumulator = accumulator;
 
     // reproduce the assembly here to calculate what the final accumulator value should be

@@ -12,8 +12,7 @@
 //! Syscalls are abused to communicate from the guest to the tool instructions
 //! necessary to carry out the test, such as setting timers or reading clocks.
 
-#![feature(llvm_asm)]
-
+#![cfg_attr(feature = "llvm_asm", feature(llvm_asm))]
 use core::arch::x86_64::{__cpuid, __rdtscp, _rdtsc};
 use libc;
 use reverie::{
@@ -189,7 +188,25 @@ async fn raise_sigwinch<T: Guest<LocalState>>(guest: &mut T) -> Tgkill {
         .with_sig(libc::SIGWINCH)
 }
 
+// FIXME: Use the syscalls crate for doing this when it switches to using the
+// `asm!()` macro instead of asm inside of a C file.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(not(feature = "llvm_asm"))]
+unsafe fn syscall_no_branches(no: libc::c_long, arg1: libc::c_long) {
+    let mut ret: u64;
+    core::arch::asm!(
+        "syscall",
+        lateout("rax") ret,
+        in("rax") no,
+        in("rdi") arg1,
+        out("rcx") _, // rcx is used to store old rip
+        out("r11") _, // r11 is used to store old rflags
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(feature = "llvm_asm")]
+#[allow(deprecated)]
 unsafe fn syscall_no_branches(no: libc::c_long, arg1: libc::c_long) {
     llvm_asm!("
         mov $0, %rax

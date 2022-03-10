@@ -6,7 +6,7 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
-#![feature(llvm_asm)]
+#![cfg_attr(feature = "llvm_asm", feature(llvm_asm))]
 
 //! Basic tests that don't fall into some other category.
 
@@ -221,12 +221,27 @@ fn i_should_segfault() {
 fn i_should_segfault_2() {
     use nix::sys::signal::Signal::SIGSEGV;
     use reverie_ptrace::testing::test_fn;
-    let (output, _) = test_fn::<NoopTool, _>(|| unsafe {
+
+    #[inline]
+    #[cfg(not(feature = "llvm_asm"))]
+    unsafe fn do_segfault() {
+        let null_ptr: *const usize = core::ptr::null();
+        asm!(
+            "jmp {0}",
+            in(reg) null_ptr,
+        )
+    }
+
+    #[inline]
+    #[cfg(feature = "llvm_asm")]
+    #[allow(deprecated)]
+    unsafe fn do_segfault() {
         llvm_asm!(r#"mov $$0, %rax
-            jmpq *%rax
-            "#:::"rax")
-    })
-    .unwrap();
+                jmpq *%rax
+                "#:::"rax")
+    }
+
+    let (output, _) = test_fn::<NoopTool, _>(|| unsafe { do_segfault() }).unwrap();
     assert_eq!(output.status, ExitStatus::Signaled(SIGSEGV, true),);
 }
 
