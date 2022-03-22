@@ -50,7 +50,7 @@ path = "strace_minimal.rs"
 
 [dependencies]
 anyhow = "1.0.51"
-nix = "0.22"
+nix = "0.23"
 reverie = { version = "0.1.0", path = "../reverie" }
 reverie-ptrace = { version = "0.1.0", path = "../reverie-ptrace" }
 reverie-util = { version = "0.1.0", path = "../reverie-util" }
