@@ -105,9 +105,7 @@ mod tests {
 
             assert!(signal::raise(Signal::SIGVTALRM).is_ok());
 
-            unsafe {
-                libc::syscall(libc::SYS_exit_group, 0)
-            };
+            unsafe { libc::syscall(libc::SYS_exit_group, 0) };
         });
     }
 }

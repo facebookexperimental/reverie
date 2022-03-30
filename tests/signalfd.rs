@@ -109,9 +109,7 @@ mod tests {
             let mut file = unsafe { File::from_raw_fd(fd) };
             let mut siginfo = [0; mem::size_of::<libc::signalfd_siginfo>()];
 
-            unsafe {
-                libc::alarm(1)
-            };
+            unsafe { libc::alarm(1) };
 
             assert!(file.read_exact(&mut siginfo).is_ok());
 
@@ -119,9 +117,7 @@ mod tests {
 
             assert_eq!(siginfo.ssi_signo, libc::SIGALRM as u32);
 
-            unsafe {
-                libc::syscall(libc::SYS_exit_group, 0)
-            };
+            unsafe { libc::syscall(libc::SYS_exit_group, 0) };
         });
     }
 }

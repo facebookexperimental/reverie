@@ -293,9 +293,7 @@ mod tests {
         check_fn::<LocalState, _>(|| {
             assert!(unsafe { restore_sig_handlers(&[Signal::SIGVTALRM]) }.is_ok());
             assert!(unsafe { unblock_signals(&[Signal::SIGVTALRM]) }.is_ok());
-            unsafe {
-                libc::signal(libc::SIGVTALRM, libc::SIG_IGN)
-            };
+            unsafe { libc::signal(libc::SIGVTALRM, libc::SIG_IGN) };
             let now = time::Instant::now();
             thread::sleep(time::Duration::from_millis(10));
             assert!(signal::raise(Signal::SIGVTALRM).is_ok());
@@ -322,9 +320,7 @@ mod tests {
             let (sender, receiver) = mpsc::channel();
             let handle = thread::spawn(move || {
                 assert!(sender.send(nix::unistd::gettid()).is_ok());
-                unsafe {
-                    libc::signal(libc::SIGBUS, libc::SIG_DFL)
-                };
+                unsafe { libc::signal(libc::SIGBUS, libc::SIG_DFL) };
                 assert_eq!(
                     unsafe { sigtimedwait(&[Signal::SIGBUS], 1000000000000u64) }.unwrap(),
                     Signal::SIGBUS,
@@ -349,9 +345,7 @@ mod tests {
             let (sender, receiver) = mpsc::channel();
             let handle = thread::spawn(move || {
                 assert!(sender.send(nix::unistd::gettid()).is_ok());
-                unsafe {
-                    libc::signal(libc::SIGBUS, libc::SIG_DFL)
-                };
+                unsafe { libc::signal(libc::SIGBUS, libc::SIG_DFL) };
                 assert_eq!(
                     unsafe { sigsuspend(&[]) }
                         .err()
@@ -398,9 +392,7 @@ mod tests {
             let (sender, receiver) = mpsc::channel();
             let _handle = thread::spawn(move || {
                 assert!(sender.send(nix::unistd::gettid()).is_ok());
-                unsafe {
-                    libc::signal(libc::SIGSYS, libc::SIG_DFL)
-                };
+                unsafe { libc::signal(libc::SIGSYS, libc::SIG_DFL) };
 
                 assert_eq!(
                     unsafe { sigsuspend(&[Signal::SIGPROF, Signal::SIGVTALRM]) }

@@ -168,9 +168,7 @@ mod tests {
     fn stack_allocator_should_work() {
         check_fn::<LocalState, _>(|| {
             assert_ne!(nix::sys::utsname::uname().sysname(), "");
-            unsafe {
-                libc::syscall(libc::SYS_exit_group, 0)
-            };
+            unsafe { libc::syscall(libc::SYS_exit_group, 0) };
         });
     }
 
@@ -180,9 +178,7 @@ mod tests {
     #[should_panic]
     fn stack_two_allocs_bad() {
         check_fn::<LocalState2, _>(|| {
-            unsafe {
-                libc::syscall(libc::SYS_exit_group, 0)
-            };
+            unsafe { libc::syscall(libc::SYS_exit_group, 0) };
         });
     }
 
@@ -190,9 +186,7 @@ mod tests {
     #[test]
     fn stack_two_allocs_good() {
         check_fn::<LocalState3, _>(|| {
-            unsafe {
-                libc::syscall(libc::SYS_exit_group, 0)
-            };
+            unsafe { libc::syscall(libc::SYS_exit_group, 0) };
         });
     }
 }

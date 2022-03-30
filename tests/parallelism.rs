@@ -126,9 +126,7 @@ fn kill_blocked_child() {
         let barrier = barrier.clone();
         std::thread::spawn(move || {
             barrier.wait();
-            unsafe {
-                libc::syscall(libc::SYS_gettid, 0)
-            };
+            unsafe { libc::syscall(libc::SYS_gettid, 0) };
         })
     };
 
@@ -137,9 +135,7 @@ fn kill_blocked_child() {
 
     // This should cause the handler future for the thread to get dropped the
     // next time it is polled.
-    unsafe {
-        libc::syscall(libc::SYS_exit_group, 0)
-    };
+    unsafe { libc::syscall(libc::SYS_exit_group, 0) };
 
     unreachable!()
 }

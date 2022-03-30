@@ -89,9 +89,7 @@ impl ExitStatus {
                         rlim_cur: 0,
                         rlim_max: 0,
                     };
-                    unsafe {
-                        libc::setrlimit(libc::RLIMIT_CORE, &limit)
-                    };
+                    unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) };
                 }
 
                 // Raise the same signal, which may or may not be fatal.
@@ -203,9 +201,7 @@ mod tests_non_sanitized {
                 // Note: We also can't use the normal exit function here because we
                 // don't want to call atexit handlers since `execve` was never
                 // called.
-                unsafe {
-                    ::libc::_exit(code)
-                };
+                unsafe { ::libc::_exit(code) };
             }
         }
     }
@@ -213,25 +209,19 @@ mod tests_non_sanitized {
     #[test]
     fn normal_exit() {
         assert_eq!(
-            run_forked(|| {
-                unsafe { libc::_exit(0) }
-            }),
+            run_forked(|| { unsafe { libc::_exit(0) } }),
             Ok(ExitStatus::Exited(0))
         );
 
         assert_eq!(
-            run_forked(|| {
-                unsafe { libc::_exit(42) }
-            }),
+            run_forked(|| { unsafe { libc::_exit(42) } }),
             Ok(ExitStatus::Exited(42))
         );
 
         // Thread exit
         assert_eq!(
             run_forked(|| {
-                unsafe {
-                    libc::syscall(libc::SYS_exit, 42)
-                };
+                unsafe { libc::syscall(libc::SYS_exit, 42) };
                 unreachable!();
             }),
             Ok(ExitStatus::Exited(42))
@@ -240,9 +230,7 @@ mod tests_non_sanitized {
         // exit_group. Should be identical to `libc::_exit`.
         assert_eq!(
             run_forked(|| {
-                unsafe {
-                    libc::syscall(libc::SYS_exit_group, 42)
-                };
+                unsafe { libc::syscall(libc::SYS_exit_group, 42) };
                 unreachable!();
             }),
             Ok(ExitStatus::Exited(42))

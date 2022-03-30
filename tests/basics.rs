@@ -258,17 +258,13 @@ fn child_should_inherit_fds() {
                 assert_eq!(unistd::read(fdread, &mut buf), Ok(8));
                 assert_eq!(buf, msg);
                 assert_eq!(wait::waitpid(child, None), Ok(WaitStatus::Exited(child, 0)));
-                unsafe {
-                    libc::syscall(libc::SYS_exit_group, 0)
-                };
+                unsafe { libc::syscall(libc::SYS_exit_group, 0) };
                 unreachable!();
             }
             Ok(ForkResult::Child) => {
                 assert!(unistd::close(fdread).is_ok());
                 assert_eq!(unistd::write(fdwrite, &msg), Ok(8));
-                unsafe {
-                    libc::syscall(libc::SYS_exit_group, 0)
-                };
+                unsafe { libc::syscall(libc::SYS_exit_group, 0) };
                 unreachable!();
             }
             Err(err) => {

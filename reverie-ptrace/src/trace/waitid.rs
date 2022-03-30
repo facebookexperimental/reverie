@@ -168,9 +168,7 @@ mod tests {
             ForkResult::Child => {
                 let hundred_millies = std::time::Duration::from_millis(100);
                 std::thread::sleep(hundred_millies);
-                unsafe {
-                    libc::syscall(libc::SYS_exit_group, 0)
-                };
+                unsafe { libc::syscall(libc::SYS_exit_group, 0) };
             }
         }
     }
@@ -189,9 +187,7 @@ mod tests {
             ForkResult::Child => {
                 let hundred_millies = std::time::Duration::from_millis(100);
                 std::thread::sleep(hundred_millies);
-                unsafe {
-                    libc::syscall(libc::SYS_exit_group, 1)
-                };
+                unsafe { libc::syscall(libc::SYS_exit_group, 1) };
             }
         }
     }
@@ -238,9 +234,7 @@ mod tests {
             ForkResult::Child => {
                 let hundred_millies = std::time::Duration::from_millis(100);
                 std::thread::sleep(hundred_millies);
-                unsafe {
-                    libc::syscall(libc::SYS_exit_group, 0)
-                };
+                unsafe { libc::syscall(libc::SYS_exit_group, 0) };
             }
         }
     }
@@ -263,9 +257,7 @@ mod tests {
             ForkResult::Child => {
                 let hundred_millies = std::time::Duration::from_millis(100);
                 std::thread::sleep(hundred_millies);
-                unsafe {
-                    libc::syscall(libc::SYS_exit_group, 0)
-                };
+                unsafe { libc::syscall(libc::SYS_exit_group, 0) };
             }
         }
     }
