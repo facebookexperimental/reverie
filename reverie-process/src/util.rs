@@ -135,9 +135,7 @@ impl<T> SharedValue<T> {
 
 impl<T> Drop for SharedValue<T> {
     fn drop(&mut self) {
-        unsafe {
-            libc::munmap(self.map as *mut _, core::mem::size_of::<T>())
-        };
+        unsafe { libc::munmap(self.map as *mut _, core::mem::size_of::<T>()) };
     }
 }
 
