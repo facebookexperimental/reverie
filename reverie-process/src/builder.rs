@@ -141,7 +141,7 @@ impl Command {
     /// let command = Command::new("ls")
     ///         .args(&["-l", "-a"]);
     /// ```
-    pub fn args<I, S>(&mut self, args: I) -> &mut Command
+    pub fn args<I, S>(&mut self, args: I) -> &mut Self
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
@@ -161,6 +161,32 @@ impl Command {
             .iter()
             .skip(1)
             .map(|arg| OsStr::from_bytes(arg.to_bytes()))
+    }
+
+    /// Prepends arguments to the beginning of the command. Note that arguments
+    /// are prepended *after* arg0, but before the rest of the arguments.
+    pub fn prepend_args<I, S>(&mut self, args: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let new_args = CStringArray::with_capacity(self.args.len() + 1);
+        let mut old_args = core::mem::replace(&mut self.args, new_args).into_iter();
+
+        // Add arg0 first
+        if let Some(arg0) = old_args.next() {
+            self.args.push(arg0);
+        }
+
+        // Add the new arguments
+        self.args(args);
+
+        // Add the rest of the old arguments
+        for arg in old_args {
+            self.args.push(arg);
+        }
+
+        self
     }
 
     /// Inserts or updates an environment variable mapping.
@@ -764,7 +790,28 @@ mod tests {
                 .arg("c")
                 .get_args()
                 .collect::<Vec<_>>(),
-            vec![OsStr::new("a"), OsStr::new("b"), OsStr::new("c")]
+            &[OsStr::new("a"), OsStr::new("b"), OsStr::new("c")]
+        );
+    }
+
+    #[test]
+    fn prepend_args() {
+        let mut command = Command::new("echo");
+        command.args(["1", "2", "3"]);
+        command.prepend_args(["a", "b", "c"]);
+        assert_eq!(command.get_arg0(), "echo");
+
+        let args = command.get_args().collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            &[
+                OsStr::new("a"),
+                "b".as_ref(),
+                "c".as_ref(),
+                "1".as_ref(),
+                "2".as_ref(),
+                "3".as_ref()
+            ]
         );
     }
 }

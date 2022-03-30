@@ -15,6 +15,7 @@ pub fn to_cstring<S: AsRef<OsStr>>(s: S) -> CString {
     CString::new(s.as_ref().as_bytes()).unwrap()
 }
 
+#[derive(Clone)]
 pub struct CStringArray {
     items: Vec<CString>,
     ptrs: Vec<*const libc::c_char>,
@@ -46,12 +47,36 @@ impl CStringArray {
         self.items[i] = item;
     }
 
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
     pub fn get(&self, i: usize) -> &CStr {
         self.items[i].as_ref()
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &CStr> {
         self.items.iter().map(|x| x.as_ref())
+    }
+}
+
+impl IntoIterator for CStringArray {
+    type Item = CString;
+    type IntoIter = std::vec::IntoIter<Self::Item>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.into_iter()
+    }
+}
+
+impl Extend<CString> for CStringArray {
+    fn extend<I>(&mut self, iter: I)
+    where
+        I: IntoIterator<Item = CString>,
+    {
+        for item in iter {
+            self.push(item);
+        }
     }
 }
 
