@@ -9,6 +9,7 @@
 
 #![allow(non_snake_case)]
 
+use crate::fd::Fd;
 use syscalls::Errno;
 use syscalls::Sysno;
 
@@ -84,6 +85,17 @@ pub const AUDIT_ARCH_MIPS: u32 = EM_MIPS;
 pub const AUDIT_ARCH_PPC: u32 = EM_PPC;
 pub const AUDIT_ARCH_PPC64: u32 = EM_PPC64 | __AUDIT_ARCH_64BIT;
 
+bitflags::bitflags! {
+    #[derive(Default)]
+    struct FilterFlags: u32 {
+        const TSYNC = 1 << 0;
+        const LOG = 1 << 1;
+        const SPEC_ALLOW = 1 << 2;
+        const NEW_LISTENER = 1 << 3;
+        const TSYNC_ESRCH = 1 << 4;
+    }
+}
+
 /// Seccomp-BPF program byte code.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Filter {
@@ -118,19 +130,7 @@ impl Filter {
         self.filter.is_empty()
     }
 
-    /// Loads the program via seccomp into the current process.
-    ///
-    /// Once loaded, the seccomp filter can never be removed. Additional seccomp
-    /// filters can be loaded, however, and they will chain together and be
-    /// executed in reverse order.
-    ///
-    /// NOTE: The maximum size of any single seccomp-bpf filter is 4096
-    /// instructions. The overall limit is 32768 instructions across all loaded
-    /// filters.
-    ///
-    /// See [`seccomp(2)`](https://man7.org/linux/man-pages/man2/seccomp.2.html)
-    /// for more details.
-    pub fn load(&self) -> Result<(), Errno> {
+    fn install(&self, flags: FilterFlags) -> Result<i32, Errno> {
         let len = self.filter.len();
 
         if len == 0 || len > BPF_MAXINSNS {
@@ -146,11 +146,41 @@ impl Filter {
 
         let ptr = &prog as *const libc::sock_fprog;
 
-        Errno::result(unsafe {
-            libc::syscall(libc::SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, ptr)
+        let value = Errno::result(unsafe {
+            libc::syscall(
+                libc::SYS_seccomp,
+                SECCOMP_SET_MODE_FILTER,
+                flags.bits(),
+                ptr,
+            )
         })?;
 
+        Ok(value as i32)
+    }
+
+    /// Loads the program via seccomp into the current process.
+    ///
+    /// Once loaded, the seccomp filter can never be removed. Additional seccomp
+    /// filters can be loaded, however, and they will chain together and be
+    /// executed in reverse order.
+    ///
+    /// NOTE: The maximum size of any single seccomp-bpf filter is 4096
+    /// instructions. The overall limit is 32768 instructions across all loaded
+    /// filters.
+    ///
+    /// See [`seccomp(2)`](https://man7.org/linux/man-pages/man2/seccomp.2.html)
+    /// for more details.
+    pub fn load(&self) -> Result<(), Errno> {
+        self.install(FilterFlags::empty())?;
         Ok(())
+    }
+
+    /// This is the same as [`Filter::load`] except that it returns a file
+    /// descriptor. This is meant to be used with
+    /// [`seccomp_unotify(2)`](https://man7.org/linux/man-pages/man2/seccomp_unotify.2.html).
+    pub fn load_and_listen(&self) -> Result<Fd, Errno> {
+        let fd = self.install(FilterFlags::NEW_LISTENER)?;
+        Ok(Fd::new(fd))
     }
 }
 

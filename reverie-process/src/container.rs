@@ -55,7 +55,8 @@ pub struct Container {
     local_networking_only: bool,
     hostname: Option<OsString>,
     domainname: Option<OsString>,
-    seccomp: Option<seccomp::Filter>,
+    pub(super) seccomp: Option<seccomp::Filter>,
+    pub(super) seccomp_notify: bool,
     pub(super) pty: Option<PtyChild>,
     /// The core number to which the new process, and descendents, will be
     /// pinned.
@@ -79,6 +80,7 @@ impl Default for Container {
             hostname: None,
             domainname: None,
             seccomp: None,
+            seccomp_notify: false,
             pty: None,
             affinity: None,
         }
@@ -530,6 +532,16 @@ impl Container {
         self
     }
 
+    /// Indicates that we want to listen for seccomp events using
+    /// [seccomp_unotify(2)](https://man7.org/linux/man-pages/man2/seccomp_unotify.2.html).
+    ///
+    /// If this is set, the seccomp listener file descriptor will be accessible
+    /// via the `Child`.
+    pub fn seccomp_notify(&mut self) -> &mut Self {
+        self.seccomp_notify = true;
+        self
+    }
+
     /// Sets the controlling pseudoterminal for the child process).
     ///
     /// In the child process, this has the effect of:
@@ -668,7 +680,51 @@ impl Container {
 
         // Set up the seccomp filter, if any.
         if let Some(filter) = &self.seccomp {
-            filter.load().context(Context::Seccomp)?;
+            use core::sync::atomic::Ordering;
+
+            // no_new_privs must be set or seccomp will not work.
+            Error::result(
+                unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
+                Context::Seccomp,
+            )?;
+
+            // NOTE: If the supervisor (parent process) wants to listen for
+            // seccomp notifications, we need to be able to pass the file
+            // descriptor to the parent. The most common way to do this is to
+            // set up a socket connection and send the file descriptor. However,
+            // since we just set up a seccomp filter, the filter could apply to
+            // any syscalls we make from here on out. This is especially
+            // troublesome if we're also ptracing this child because our syscall
+            // could result in a premature seccomp stop and cause a deadlock.
+            // Thus, instead, we should pass the file descriptor to the parent
+            // process without making any syscalls. The only way to do that is
+            // to create some shared memory and atomically set an integer.
+            if let Some(shared_fd) = context.seccomp_fd {
+                use std::os::unix::io::IntoRawFd;
+
+                let fd = filter
+                    .load_and_listen()
+                    .context(Context::Seccomp)?
+                    .into_raw_fd();
+
+                shared_fd.store(fd, Ordering::Relaxed);
+
+                // Wait until the parent changes the value back. The parent only
+                // does this after it calls pidfd_getfd to copy the file
+                // descriptor into its own file descriptor table. After this,
+                // the file descriptor can be safely closed, but we won't do
+                // that in order to avoid doing a syscall. The fd will be closed
+                // automatically when execve happens anyway.
+                //
+                // NOTE: Again, we must not perform any syscalls after the
+                // seccomp filter has been installed (except for execve of
+                // course).
+                while shared_fd.load(Ordering::Relaxed) == fd {
+                    // Spin spin spin
+                }
+            } else {
+                filter.load().context(Context::Seccomp)?;
+            }
         }
 
         Ok(())
@@ -703,6 +759,7 @@ impl Container {
             stderr: None,
             uid_map,
             gid_map,
+            seccomp_fd: None,
         };
 
         // Use a pipe for getting the result of the function out of the child
@@ -787,6 +844,7 @@ pub(super) struct ChildContext<'a> {
     pub stderr: Option<&'a Fd>,
     pub uid_map: &'a [u8],
     pub gid_map: &'a [u8],
+    pub seccomp_fd: Option<&'a core::sync::atomic::AtomicI32>,
 }
 
 impl<'a> ChildContext<'a> {

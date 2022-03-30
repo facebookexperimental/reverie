@@ -10,8 +10,10 @@ use super::clone::clone;
 use super::error::{Context, Error};
 use super::fd::{pipe, Fd};
 use super::id_map::make_id_map;
+use super::seccomp::SeccompNotif;
 use super::stdio::{ChildStderr, ChildStdin, ChildStdout};
 use super::util::CStringArray;
+use super::util::SharedValue;
 use super::Child;
 use super::Command;
 
@@ -63,12 +65,19 @@ impl Command {
         let uid_map = &make_id_map(&self.container.uid_map);
         let gid_map = &make_id_map(&self.container.gid_map);
 
+        let seccomp_fd = if self.container.seccomp_notify {
+            Some(SharedValue::new(core::sync::atomic::AtomicI32::new(0))?)
+        } else {
+            None
+        };
+
         let context = ChildContext {
             stdin: child_stdin.as_ref(),
             stdout: child_stdout.as_ref(),
             stderr: child_stderr.as_ref(),
             uid_map,
             gid_map,
+            seccomp_fd: seccomp_fd.as_ref().map(|x| x.as_ref()),
         };
 
         let pid = clone(
@@ -84,6 +93,30 @@ impl Command {
         drop(child_stderr);
         drop(self.container.pty.take());
 
+        let seccomp_notif = match seccomp_fd {
+            Some(shared_fd) => {
+                use core::sync::atomic::Ordering;
+
+                // Spin until the value changes in the child.
+                let mut targetfd = 0;
+                while targetfd == 0 {
+                    targetfd = shared_fd.as_ref().load(Ordering::Relaxed);
+                    std::thread::yield_now();
+                }
+
+                // Use pidfd_getfd to copy the file descriptor
+                let pidfd = Fd::pidfd_open(pid.into(), 0)?;
+                let fd = pidfd.pidfd_getfd(targetfd, 0)?;
+
+                // We've successfully duplicated the file descriptor. Let the
+                // child continue on to execve.
+                shared_fd.as_ref().store(0, Ordering::Relaxed);
+
+                Some(SeccompNotif::new(fd)?)
+            }
+            None => None,
+        };
+
         let stdin = stdin.map(ChildStdin::new).transpose()?;
         let stdout = stdout.map(ChildStdout::new).transpose()?;
         let stderr = stderr.map(ChildStderr::new).transpose()?;
@@ -91,6 +124,7 @@ impl Command {
         Ok(Child {
             pid,
             exit_status: None,
+            seccomp_notif,
             stdin,
             stdout,
             stderr,

@@ -639,6 +639,16 @@ impl Command {
         self
     }
 
+    /// Indicates that we want to listen for seccomp events using
+    /// [seccomp_unotify(2)](https://man7.org/linux/man-pages/man2/seccomp_unotify.2.html).
+    ///
+    /// If this is set, the seccomp listener file descriptor will be accessible
+    /// via the `Child`.
+    pub fn seccomp_notify(&mut self) -> &mut Self {
+        self.container.seccomp_notify();
+        self
+    }
+
     /// Sets the controlling pseudoterminal for the child process).
     ///
     /// In the child process, this has the effect of:

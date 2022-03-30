@@ -9,6 +9,7 @@
 use super::ExitStatus;
 use super::Pid;
 
+use super::seccomp::SeccompNotif;
 use super::stdio::{ChildStderr, ChildStdin, ChildStdout, Stdio};
 use super::Command;
 
@@ -36,6 +37,10 @@ pub struct Child {
     /// The child's exit status. `Some` if the child has exited already, `None`
     /// otherwise.
     pub(super) exit_status: Option<ExitStatus>,
+
+    /// A handle to the seccomp notifier, if requested. This *must* be consumed
+    /// or dropped for the child to be able to exit.
+    pub seccomp_notif: Option<SeccompNotif>,
 
     /// The handle for writing to the child's standard input (stdin), if it has
     /// been captured.

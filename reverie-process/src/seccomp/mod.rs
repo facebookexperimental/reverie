@@ -71,12 +71,16 @@
 #[macro_use]
 mod bpf;
 
+#[allow(unused)]
+mod notif;
+
 use bpf::*;
 
 use syscalls::Errno;
 use syscalls::Sysno;
 
 pub use bpf::Filter;
+pub use notif::*;
 
 use std::collections::BTreeMap;
 
@@ -138,6 +142,9 @@ pub enum Action {
 
     /// Disallow and raise a SIGSYS in the calling process.
     Trap,
+
+    /// Notifies userspace.
+    Notify,
 }
 
 impl From<Action> for u32 {
@@ -152,6 +159,7 @@ impl From<Action> for u32 {
             Action::Log => libc::SECCOMP_RET_LOG,
             Action::Trace(x) => libc::SECCOMP_RET_TRACE | (x as u32 & libc::SECCOMP_RET_DATA),
             Action::Trap => libc::SECCOMP_RET_TRAP,
+            Action::Notify => 0x7fc00000u32,
         }
     }
 }

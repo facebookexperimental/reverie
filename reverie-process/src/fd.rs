@@ -80,7 +80,52 @@ impl Fd {
         Errno::result(unsafe { libc::socket(domain, ty, protocol) }).map(Self::new)
     }
 
-    fn set_nonblocking(&self) -> Result<(), Errno> {
+    /// The `pidfd_open()` system call creates a file descriptor that refers to
+    /// the process whose PID is specified in pid. The file descriptor is
+    /// returned as the function result; the close-on-exec flag is set on the
+    /// file descriptor.
+    pub fn pidfd_open(pid: libc::pid_t, flags: u32) -> Result<Self, Errno> {
+        // TODO: Move this into its own PidFd type?
+        unsafe { syscalls::syscall2(syscalls::Sysno::pidfd_open, pid as u64, flags as u64) }
+            .map(|fd| Self::new(fd as i32))
+    }
+
+    /// The `pidfd_getfd()` system call allocates a new file descriptor in the
+    /// calling process. This new file descriptor is a duplicate of an existing
+    /// file descriptor, `targetfd`, in the process referred to by the PID file
+    /// descriptor in `&self`.
+    ///
+    /// The duplicate file descriptor refers to the same open file description
+    /// as the original file descriptor in the process referred to by `&self`.
+    /// The two file descriptors thus share file status flags and file offset.
+    /// Furthermore, operations on the underlying file object (for example,
+    /// assigning an address to a socket object using `bind(2)`) can equally be
+    /// performed via the duplicate file descriptor.
+    ///
+    /// The close-on-exec flag (`FD_CLOEXEC`) is set on the file descriptor
+    /// returned by `pidfd_getfd()`.
+    ///
+    /// The `flags` argument is reserved for future use. Currently, it must be
+    /// specified as 0.
+    ///
+    /// Permission to duplicate another process's file descriptor is
+    /// governed by a ptrace access mode `PTRACE_MODE_ATTACH_REALCREDS` check
+    /// (see ptrace(2)).
+    pub fn pidfd_getfd(&self, targetfd: i32, flags: u32) -> Result<Self, Errno> {
+        // TODO: Move this into its own PidFd type?
+        unsafe {
+            syscalls::syscall3(
+                syscalls::Sysno::pidfd_getfd,
+                self.as_raw_fd() as u64,
+                targetfd as u64,
+                flags as u64,
+            )
+        }
+        .map(|fd| Self::new(fd as i32))
+    }
+
+    /// Changes the file descriptor to be non-blocking.
+    pub fn set_nonblocking(&self) -> Result<(), Errno> {
         let fd = self.as_raw_fd();
         let flags = Errno::result(unsafe { libc::fcntl(fd, libc::F_GETFL) })?;
         Errno::result(unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) })?;

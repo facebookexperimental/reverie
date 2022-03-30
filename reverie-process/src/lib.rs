@@ -607,4 +607,95 @@ mod tests {
 
         assert_eq!(envs, [("BAR", Some("2")), ("FOO", Some("1"))]);
     }
+
+    #[tokio::test]
+    async fn seccomp() {
+        use super::seccomp::*;
+        use syscalls::Sysno;
+
+        let filter = FilterBuilder::new()
+            .default_action(Action::Allow)
+            .syscalls([(Sysno::brk, Action::KillProcess)])
+            .build();
+
+        let output = Command::new("cat")
+            .arg("/proc/self/status")
+            .seccomp(filter)
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(
+            output.status,
+            ExitStatus::Signaled(Signal::SIGSYS, true),
+            "{:?}",
+            output
+        );
+    }
+
+    #[tokio::test]
+    async fn seccomp_notify() {
+        use super::seccomp::*;
+        use futures::future::select;
+        use futures::future::Either;
+        use futures::stream::TryStreamExt;
+        use std::collections::HashMap;
+        use syscalls::Sysno;
+
+        let filter = FilterBuilder::new()
+            .default_action(Action::Notify)
+            .syscalls([
+                // FIXME: Because the first execve happens when the child is
+                // spawned, we must allow this through. Otherwise, the
+                // `.spawn()` below will deadlock because we can't process
+                // seccomp notifications until after it returns.
+                (Sysno::execve, Action::Allow),
+            ])
+            .build();
+
+        let mut child = Command::new("cat")
+            .arg("/proc/self/status")
+            .seccomp(filter)
+            .seccomp_notify()
+            .spawn()
+            .unwrap();
+
+        let mut summary = HashMap::new();
+
+        let exit_status = {
+            let seccomp_notif = child.seccomp_notif.take();
+
+            let notifier = async {
+                if let Some(mut notifier) = seccomp_notif {
+                    while let Some(notif) = notifier.try_next().await.unwrap() {
+                        *summary.entry(Sysno::from(notif.data.nr)).or_insert(0u64) += 1;
+
+                        // Simply let the syscall through.
+                        let resp = seccomp_notif_resp {
+                            id: notif.id,
+                            val: 0,
+                            error: 0,
+                            flags: SECCOMP_USER_NOTIF_FLAG_CONTINUE,
+                        };
+                        notifier.send(&resp).unwrap();
+                    }
+                }
+            };
+
+            let exit_status = child.wait();
+
+            futures::pin_mut!(notifier);
+            futures::pin_mut!(exit_status);
+
+            match select(notifier, exit_status).await {
+                Either::Left((_, _)) => unreachable!(),
+                Either::Right((exit_status, _)) => exit_status.unwrap(),
+            }
+        };
+
+        assert_eq!(exit_status, ExitStatus::SUCCESS);
+
+        assert!(summary[&Sysno::read] > 0);
+        assert!(summary[&Sysno::write] > 0);
+        assert!(summary[&Sysno::close] > 0);
+    }
 }

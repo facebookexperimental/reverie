@@ -79,3 +79,65 @@ pub unsafe fn reset_signal_handling() -> Result<(), Errno> {
 
     Ok(())
 }
+
+/// This is a value that can be shared between a parent and child process. This
+/// is useful for communicating and synchronizing state across process
+/// boundaries.
+pub struct SharedValue<T> {
+    map: *mut T,
+}
+
+impl<T> SharedValue<T> {
+    pub fn new(value: T) -> Result<Self, Errno> {
+        let map = syscalls::Errno::result(unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                core::mem::size_of::<T>(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        })? as *mut T;
+
+        // Initialize the inner value
+        let inner = unsafe { &mut *map };
+        *inner = value;
+
+        Ok(Self { map })
+    }
+}
+
+impl<T> Drop for SharedValue<T> {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.map as *mut _, core::mem::size_of::<T>())
+        };
+    }
+}
+
+impl<T> core::ops::Deref for SharedValue<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        unsafe { &*self.map }
+    }
+}
+
+impl<T> core::ops::DerefMut for SharedValue<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.map }
+    }
+}
+
+impl<T> AsRef<T> for SharedValue<T> {
+    fn as_ref(&self) -> &T {
+        unsafe { &*self.map }
+    }
+}
+
+impl<T> AsMut<T> for SharedValue<T> {
+    fn as_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.map }
+    }
+}
