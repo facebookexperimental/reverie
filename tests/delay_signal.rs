@@ -538,7 +538,6 @@ mod tests {
 
             assert_eq!(unsafe { install_sigprof_handler() }, 0);
 
-
             assert!(unsafe { unblock_signals(&[Signal::SIGPROF, Signal::SIGVTALRM]) }.is_ok());
             assert!(unsafe { settimer(500000) }.is_ok());
 
