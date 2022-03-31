@@ -26,7 +26,7 @@ procfs = "0.9"
 raw-cpuid = "9.0"
 reverie = { version = "0.1.0", path = "../reverie" }
 serde = { version = "1.0.126", features = ["derive", "rc"] }
-thiserror = "1.0.29"
+thiserror = "1.0.30"
 tokio = { version = "1.15", features = ["full", "test-util", "tracing"] }
 tokio-stream = { version = "0.1.4", features = ["fs", "io-util", "net", "signal", "sync", "time"] }
 tracing = "0.1.32"
