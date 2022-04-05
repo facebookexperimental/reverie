@@ -167,6 +167,27 @@ impl CloneFamily {
             }
         }
     }
+
+    /// Returns the child tid for the syscall. For `fork` and `vfork`, this is
+    /// always 0. For the `clone` syscall, we simply return the child tid
+    /// passed as an argument to the syscall. For `clone3`, we have to read the
+    /// child tid from the pointer passed to the syscall. Thus, the `memory`
+    /// parameter is not read unless this is a `clone3` syscall. If reading
+    /// from memory fails for any reason, we return 0.
+    pub fn child_tid<M: MemoryAccess>(&self, memory: &M) -> usize {
+        match self {
+            Self::Fork(_) => 0,
+            Self::Vfork(_) => 0,
+            Self::Clone(clone) => clone.ctid().map_or(0, |ctid| ctid.as_raw()),
+            Self::Clone3(clone) => {
+                // sys_clone3 reads everything from a pointer.
+                clone
+                    .args()
+                    .and_then(|ptr| memory.read_value(ptr).ok())
+                    .map_or(0, |args| args.child_tid.try_into().unwrap())
+            }
+        }
+    }
 }
 
 impl From<CloneFamily> for Syscall {
