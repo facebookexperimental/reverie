@@ -25,6 +25,6 @@ procfs = "0.9"
 raw-cpuid = "9.0"
 reverie-process = { version = "0.1.0", path = "../reverie-process" }
 reverie-syscalls = { version = "0.1.0", path = "../reverie-syscalls" }
-serde = { version = "1.0.126", features = ["derive", "rc"] }
+serde = { version = "1.0.136", features = ["derive", "rc"] }
 thiserror = "1.0.30"
 typed-arena = "2"

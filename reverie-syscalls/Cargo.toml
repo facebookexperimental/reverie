@@ -13,5 +13,5 @@ derive_more = "0.99.3"
 libc = "0.2.121"
 nix = "0.23"
 paste = "1.0"
-serde = { version = "1.0.126", features = ["derive", "rc"] }
+serde = { version = "1.0.136", features = ["derive", "rc"] }
 syscalls = { version = "0.4.2", features = ["with-serde"] }
