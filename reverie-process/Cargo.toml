@@ -23,4 +23,4 @@ tokio = { version = "1.15", features = ["full", "test-util", "tracing"] }
 const-cstr = "0.3.0"
 num_cpus = "1.11"
 raw-cpuid = "9.0"
-tempfile = "3.2"
+tempfile = "3.3"
