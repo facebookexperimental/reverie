@@ -78,13 +78,15 @@ mod tests {
         // if %rdx != 0644 { exit_roup(1) }
         // return fd
         core::arch::asm!(
-            "mov r8, {arg1}",
+            "mov r8, rdi",
+            // Set syscall to `SYS_open`
+            "mov rax, 2",
             "syscall",
             // if (ret >= -4095 as u64) goto 1
-            "cmp 0xfffffffffffff001"
+            "cmp rax, 0xfffffffffffff001",
             "jae 2f",
             // if (rax != r8) goto label1;
-            "cmp rdi, r8",
+            "cmp r8, rdi",
             "jne 2f",
             // if (rsi != 0x8000) goto label1;
             "cmp rsi, 0x8000",
@@ -97,14 +99,13 @@ mod tests {
             "2:",
             // Set syscall arg1 to label1
             "mov rdi, 0x1",
-            // Set syscall to exit_group
-            "mov rax, {sys_exit_group}",
+            // Set syscall to SYS_exit_group
+            "mov rax, 231",
             // Do the syscall
             "syscall",
             "3:",
             lateout("rax") ret,
-            in("rax") n,
-            arg1 = inlateout("rdi") path, // Reused for the exit_group syscall.
+            in("rdi") path,
             in("rsi") flags,
             in("rdx") mode,
             out("r8") _, // Clobbered
@@ -112,7 +113,7 @@ mod tests {
             out("r11") _, // r11 is used to store old rflags
         );
 
-        ret
+        ret as i32
     }
 
     #[cfg(target_arch = "x86_64")]

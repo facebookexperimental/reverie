@@ -578,12 +578,12 @@ pub fn do_branches(mut count: u64) {
         core::arch::asm!(
             "2:",
             "sub {0}, 1",
-            "jnc 2b",
+            "jnz 2b",
             inout(reg) count,
         )
     }
 
-    assert_eq!(count, u64::MAX);
+    assert_eq!(count, 0);
 }
 
 /// Perform exactly `count+1` conditional branch instructions. Useful for
@@ -658,7 +658,7 @@ mod test {
         handle.join().unwrap();
         let ctr = pc.ctr_value().unwrap();
         assert!(ctr >= ITERS);
-        assert!(ctr <= ITERS + 5000, "{}", ctr); // overhead from channel operations
+        assert!(ctr <= ITERS + 6000, "{}", ctr); // overhead from channel operations
     }
 
     #[test]

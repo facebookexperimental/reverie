@@ -226,7 +226,7 @@ fn i_should_segfault_2() {
     #[cfg(not(feature = "llvm_asm"))]
     unsafe fn do_segfault() {
         let null_ptr: *const usize = core::ptr::null();
-        asm!(
+        core::arch::asm!(
             "jmp {0}",
             in(reg) null_ptr,
         )
