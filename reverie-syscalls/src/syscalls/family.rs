@@ -13,8 +13,11 @@
 
 use super::Syscall;
 
+use crate::args::ClockId;
 use crate::args::CloneFlags;
 use crate::args::StatPtr;
+use crate::args::Timespec;
+use crate::memory::Addr;
 use crate::memory::AddrMut;
 use crate::memory::MemoryAccess;
 
@@ -197,6 +200,64 @@ impl From<CloneFamily> for Syscall {
             CloneFamily::Vfork(syscall) => Syscall::Vfork(syscall),
             CloneFamily::Clone(syscall) => Syscall::Clone(syscall),
             CloneFamily::Clone3(syscall) => Syscall::Clone3(syscall),
+        }
+    }
+}
+
+/// Represents the nanosleep family of syscalls. These allow a thread to sleep
+/// with nanosecond precision.
+#[derive(From, Debug, Copy, Clone, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub enum NanosleepFamily {
+    Nanosleep(super::Nanosleep),
+    ClockNanosleep(super::ClockNanosleep),
+}
+
+impl NanosleepFamily {
+    /// Returns the clockid for the syscall. For `clock_nanosleep` this is
+    /// the clockid passed as an argument to the syscall. For `nanosleep` the
+    /// clockid is not specified as an argument, so return CLOCK_REALTIME which
+    /// is semantically equivalent.
+    pub fn clockid(&self) -> ClockId {
+        match self {
+            Self::Nanosleep(_) => ClockId::CLOCK_REALTIME,
+            Self::ClockNanosleep(s) => s.clockid(),
+        }
+    }
+
+    /// Returns the flags for the syscall. For `clock_nanosleep` these are
+    /// the flags passed as an argument to the syscall. For `nanosleep`, the
+    /// flags are not specified as an argument, so return 0 which is
+    /// semantically equivalent (0 means relative time, i.e. *not* TIMER_ABSTIME).
+    pub fn flags(&self) -> i32 {
+        match self {
+            Self::Nanosleep(_) => 0,
+            Self::ClockNanosleep(s) => s.flags(),
+        }
+    }
+
+    /// Get the request timespec pointer.
+    pub fn req(&self) -> Option<Addr<Timespec>> {
+        match self {
+            Self::Nanosleep(s) => s.req(),
+            Self::ClockNanosleep(s) => s.req(),
+        }
+    }
+
+    /// Get the remain timespec pointer.
+    pub fn rem(&self) -> Option<AddrMut<Timespec>> {
+        match self {
+            Self::Nanosleep(s) => s.rem(),
+            Self::ClockNanosleep(s) => s.rem(),
+        }
+    }
+}
+
+impl From<NanosleepFamily> for Syscall {
+    fn from(family: NanosleepFamily) -> Syscall {
+        match family {
+            NanosleepFamily::Nanosleep(syscall) => Syscall::Nanosleep(syscall),
+            NanosleepFamily::ClockNanosleep(syscall) => Syscall::ClockNanosleep(syscall),
         }
     }
 }
