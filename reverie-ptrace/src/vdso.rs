@@ -70,30 +70,35 @@ const __vdso_gettimeofday: &[u8] = &[
     0x00,
 ];
 
-const VDSO_SYMBOLS: &[&str] = &[
-    "__vdso_time",
-    "__vdso_clock_gettime",
-    "__vdso_getcpu",
-    "__vdso_gettimeofday",
+#[allow(non_upper_case_globals)]
+const __vdso_clock_getres: &[u8] = &[
+    0xb8, 0xe5, 0x00, 0x00, 0x00, // mov SYS_clock_getres, %eax
+    0x0f, 0x05, // syscall
+    0xc3, // retq
+    0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, // nopl 0x0(%rax, %rax, 1)
+    0x00,
+];
+
+const VDSO_SYMBOLS: &[(&str, &[u8])] = &[
+    ("__vdso_time", __vdso_time),
+    ("__vdso_clock_gettime", __vdso_clock_gettime),
+    ("__vdso_getcpu", __vdso_getcpu),
+    ("__vdso_gettimeofday", __vdso_gettimeofday),
+    ("__vdso_clock_getres", __vdso_clock_getres),
 ];
 
 lazy_static! {
     static ref VDSO_PATCH_INFO: HashMap<String, (u64, usize, &'static [u8])> = {
         let info = vdso_get_symbols_info();
         let mut res: HashMap<String, (u64, usize, &'static [u8])> = HashMap::new();
-        let funcs = &[
-            __vdso_time,
-            __vdso_clock_gettime,
-            __vdso_getcpu,
-            __vdso_gettimeofday,
-        ];
-        VDSO_SYMBOLS.iter().zip(funcs).for_each(|(k, v)| {
+
+        for (k, v) in VDSO_SYMBOLS {
             let name = String::from(*k);
             if let Some(&(base, size)) = info.get(&name) {
                 assert!(v.len() <= size);
                 res.insert(String::from(*k), (base, size, v));
             }
-        });
+        }
         res
     };
 }
@@ -120,7 +125,7 @@ fn vdso_get_symbols_info() -> HashMap<String, (u64, usize)> {
                     let strtab = elf.dynstrtab;
                     elf.dynsyms.iter().for_each(|sym| {
                         let sym_name = &strtab[sym.st_name];
-                        if VDSO_SYMBOLS.contains(&sym_name) {
+                        if VDSO_SYMBOLS.iter().any(|&(name, _)| name == sym_name) {
                             debug_assert!(sym.is_function());
                             res.insert(
                                 String::from(sym_name),

@@ -8,7 +8,7 @@
  */
 
 use reverie::{
-    syscalls::{Errno, MemoryAccess, Syscall},
+    syscalls::{Errno, MemoryAccess, Syscall, Timespec},
     Error, Guest, Tool,
 };
 use serde::{Deserialize, Serialize};
@@ -39,6 +39,19 @@ impl Tool for LocalState {
                 if let Some(cpu) = getcpu.cpu() {
                     guest.memory().write_value(cpu, &0)?;
                 }
+                Ok(0)
+            }
+            Syscall::ClockGetres(clock_getres) => {
+                if let Some(ts) = clock_getres.res() {
+                    guest.memory().write_value(
+                        ts,
+                        &Timespec {
+                            tv_sec: 0,
+                            tv_nsec: 42,
+                        },
+                    )?;
+                }
+
                 Ok(0)
             }
             otherwise => guest.tail_inject(otherwise).await,
@@ -83,6 +96,23 @@ mod tests {
             );
             let tod = unsafe { tod.assume_init() };
             assert_eq!(tod.tv_usec % 1000, 345);
+        });
+    }
+
+    #[test]
+    fn run_guest_vdso_clock_getres_test() {
+        check_fn::<LocalState, _>(|| {
+            let mut res = libc::timespec {
+                tv_sec: 1,
+                tv_nsec: 0,
+            };
+
+            let ret = unsafe { libc::clock_getres(libc::CLOCK_MONOTONIC, &mut res as *mut _) };
+
+            assert_eq!(ret, 0);
+
+            assert_eq!(res.tv_sec, 0);
+            assert_eq!(res.tv_nsec, 42);
         });
     }
 }
