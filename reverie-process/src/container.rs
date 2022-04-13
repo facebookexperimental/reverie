@@ -827,7 +827,7 @@ impl Container {
             }
             Ok(n) => {
                 // FIXME: Handle errors
-                let value: Result<T, ()> = bincode::deserialize(&buf[0..n]).unwrap();
+                let value: Result<T, Error> = bincode::deserialize(&buf[0..n]).unwrap();
                 Ok(value.unwrap())
             }
             Err(err) => {
