@@ -36,7 +36,3 @@ unwind = { version = "0.4", features = ["ptrace"] }
 [dev-dependencies]
 quickcheck = "1.0"
 quickcheck_macros = "1.0"
-
-[features]
-default = ["llvm_asm", "llvm_asm"]
-llvm_asm = []
