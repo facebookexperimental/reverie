@@ -193,10 +193,10 @@ async fn raise_sigwinch<T: Guest<LocalState>>(guest: &mut T) -> Tgkill {
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[cfg(not(feature = "llvm_asm"))]
 unsafe fn syscall_no_branches(no: libc::c_long, arg1: libc::c_long) {
-    let mut ret: u64;
+    let mut _ret: u64;
     core::arch::asm!(
         "syscall",
-        lateout("rax") ret,
+        lateout("rax") _ret,
         in("rax") no,
         in("rdi") arg1,
         out("rcx") _, // rcx is used to store old rip
