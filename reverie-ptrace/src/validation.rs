@@ -605,9 +605,14 @@ fn check_for_xen_pmi_bug(precise_ip: bool) -> Result<(), PmuValidationError> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::perf::is_perf_supported;
 
     #[test]
     fn test_check_for_ioc_period_bug() {
+        if !is_perf_supported() {
+            return;
+        }
+
         // This assumes the machine running the test will not have this bug
         if let Err(pmu_err) = check_for_ioc_period_bug(false) {
             panic!("Ioc period bug check failed - {}", pmu_err);
@@ -616,6 +621,10 @@ mod test {
 
     #[test]
     fn test_check_working_counters() {
+        if !is_perf_supported() {
+            return;
+        }
+
         // This assumes the machine running the test will have working counters
         if let Err(pmu_err) = check_working_counters(false) {
             panic!("Working counters check failed - {}", pmu_err);
@@ -624,6 +633,10 @@ mod test {
 
     #[test]
     fn test_check_for_arch_bugs() {
+        if !is_perf_supported() {
+            return;
+        }
+
         // This assumes the machine running the test will not have arch bugs
         if let Err(pmu_err) = check_for_arch_bugs(false) {
             panic!("Architecture-specific bug check failed - {}", pmu_err);
