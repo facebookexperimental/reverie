@@ -1561,10 +1561,11 @@ impl<L: Tool + 'static> TracedTask<L> {
     ) -> Result<Result<i64, Errno>, TraceError> {
         let task = self.assume_stopped();
 
-        info!(
-            "[tool] (tid {}) beginning inject of syscall: {}",
+        debug!(
+            "[tool] (tid {}) beginning inject of syscall: {}, args {:?}",
             self.tid(),
             nr,
+            args,
         );
 
         if self.pending_syscall.take() == Some((nr, args)) {
