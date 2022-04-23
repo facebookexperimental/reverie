@@ -22,7 +22,7 @@ memmap = "0.7"
 nix = "0.23"
 object = { version = "0.28", features = ["write"] }
 procfs = "0.9"
-raw-cpuid = "9.0"
+raw-cpuid = "10.0"
 reverie-process = { version = "0.1.0", path = "../reverie-process" }
 reverie-syscalls = { version = "0.1.0", path = "../reverie-syscalls" }
 serde = { version = "1.0.136", features = ["derive", "rc"] }
