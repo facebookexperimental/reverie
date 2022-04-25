@@ -74,7 +74,7 @@ fn full_family_model(vendor: &str, fi: &FeatureInfo) -> (u8, u8) {
 pub(crate) fn get_rcb_perf_config() -> u64 {
     let c = CpuId::new();
     let vendor = c.get_vendor_info().unwrap();
-    let vendor_str = vendor.as_string();
+    let vendor_str = vendor.as_str();
     match vendor_str {
         AMD_VENDOR | INTEL_VENDOR => {}
         s => panic!("Unknown CPU vendor: {}", s),
