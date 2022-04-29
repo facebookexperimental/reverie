@@ -367,7 +367,7 @@ fn check_for_arch_bugs(_precise_ip: bool) -> Result<(), PmuValidationError> {
     let feature_info = c
         .get_feature_info()
         .ok_or(PmuValidationError::CouldNotReadCpuInfo)?;
-    let vendor_str = vendor.as_string();
+    let vendor_str = vendor.as_str();
 
     match vendor_str {
         AMD_VENDOR if is_amd_zen(feature_info) => check_for_zen_speclockmap(),
