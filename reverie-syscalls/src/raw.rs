@@ -32,96 +32,96 @@ use crate::{Addr, AddrMut, Errno};
 /// information and conversions should never fail. This ensures that adding type
 /// information to a value will always be forward compatible.
 ///
-/// This trait is very similar to `From<u64>` and `Into<u64>`. Instead of reusing
-/// those existing traits, this separate trait is necessary such that it can be
-/// implemented for foreign types.
+/// This trait is very similar to `From<usize>` and `Into<usize>`. Instead of
+/// reusing those existing traits, this separate trait is necessary such that it
+/// can be implemented for foreign types.
 pub trait FromToRaw: Sized {
     /// Converts a raw value into this type.
-    fn from_raw(value: u64) -> Self;
+    fn from_raw(value: usize) -> Self;
 
     /// Converts this type into a raw value.
-    fn into_raw(self) -> u64;
+    fn into_raw(self) -> usize;
 }
 
 impl FromToRaw for u32 {
-    fn from_raw(raw: u64) -> Self {
+    fn from_raw(raw: usize) -> Self {
         raw as Self
     }
 
-    fn into_raw(self) -> u64 {
-        self as u64
+    fn into_raw(self) -> usize {
+        self as usize
     }
 }
 
 impl FromToRaw for i32 {
-    fn from_raw(raw: u64) -> Self {
+    fn from_raw(raw: usize) -> Self {
         raw as Self
     }
 
-    fn into_raw(self) -> u64 {
-        self as u64
-    }
-}
-
-impl FromToRaw for u64 {
-    fn from_raw(raw: u64) -> Self {
-        raw
-    }
-
-    fn into_raw(self) -> u64 {
-        self
+    fn into_raw(self) -> usize {
+        self as usize
     }
 }
 
 impl FromToRaw for usize {
-    fn from_raw(raw: u64) -> Self {
+    fn from_raw(raw: usize) -> Self {
+        raw
+    }
+
+    fn into_raw(self) -> usize {
+        self
+    }
+}
+
+impl FromToRaw for u64 {
+    fn from_raw(raw: usize) -> Self {
         raw as Self
     }
 
-    fn into_raw(self) -> u64 {
-        self as u64
+    fn into_raw(self) -> usize {
+        self as usize
     }
 }
 
 impl FromToRaw for i64 {
-    fn from_raw(raw: u64) -> Self {
+    fn from_raw(raw: usize) -> Self {
         raw as Self
     }
 
-    fn into_raw(self) -> u64 {
-        self as u64
+    fn into_raw(self) -> usize {
+        self as usize
     }
 }
 
 impl<'a, T> FromToRaw for Option<Addr<'a, T>> {
-    fn from_raw(raw: u64) -> Self {
+    fn from_raw(raw: usize) -> Self {
         Addr::from_raw(raw as usize)
     }
 
-    fn into_raw(self) -> u64 {
-        self.map_or(0, |addr| addr.as_raw() as u64)
+    fn into_raw(self) -> usize {
+        self.map_or(0, |addr| addr.as_raw() as usize)
     }
 }
 
 impl<'a, T> FromToRaw for Option<AddrMut<'a, T>> {
-    fn from_raw(raw: u64) -> Self {
+    fn from_raw(raw: usize) -> Self {
         AddrMut::from_raw(raw as usize)
     }
 
-    fn into_raw(self) -> u64 {
-        self.map_or(0, |addr| addr.as_raw() as u64)
+    fn into_raw(self) -> usize {
+        self.map_or(0, |addr| addr.as_raw() as usize)
     }
 }
 
 macro_rules! impl_raw_bits {
     ($t:ty : $inner:ty) => {
         impl $crate::FromToRaw for $t {
-            fn from_raw(raw: u64) -> Self {
+            fn from_raw(raw: usize) -> Self {
                 unsafe { Self::from_bits_unchecked(raw as $inner) }
             }
 
-            fn into_raw(self) -> u64 {
-                self.bits() as u64
+            fn into_raw(self) -> usize {
+                self.bits() as usize
             }
         }
     };
@@ -146,7 +146,7 @@ impl_raw_bits!(SfdFlags);
 impl_raw_bits!(TimerFlags);
 
 impl FromToRaw for Option<Mode> {
-    fn from_raw(raw: u64) -> Self {
+    fn from_raw(raw: usize) -> Self {
         if raw == 0 {
             None
         } else {
@@ -154,7 +154,7 @@ impl FromToRaw for Option<Mode> {
         }
     }
 
-    fn into_raw(self) -> u64 {
+    fn into_raw(self) -> usize {
         match self {
             None => 0,
             Some(mode) => mode.into_raw(),
@@ -163,12 +163,12 @@ impl FromToRaw for Option<Mode> {
 }
 
 impl FromToRaw for Pid {
-    fn from_raw(raw: u64) -> Self {
+    fn from_raw(raw: usize) -> Self {
         Pid::from_raw(raw as i32)
     }
 
-    fn into_raw(self) -> u64 {
-        self.as_raw() as u64
+    fn into_raw(self) -> usize {
+        self.as_raw() as usize
     }
 }
 
@@ -176,14 +176,14 @@ impl<T> FromToRaw for Result<T, Errno>
 where
     T: FromToRaw,
 {
-    fn from_raw(raw: u64) -> Self {
-        Errno::from_ret(raw as i64).map(|x| T::from_raw(x as u64))
+    fn from_raw(raw: usize) -> Self {
+        Errno::from_ret(raw).map(|x| T::from_raw(x as usize))
     }
 
-    fn into_raw(self) -> u64 {
+    fn into_raw(self) -> usize {
         match self {
             Ok(x) => x.into_raw(),
-            Err(err) => -err.into_raw() as u64,
+            Err(err) => -err.into_raw() as usize,
         }
     }
 }
@@ -196,7 +196,7 @@ mod test {
     #[test]
     fn test_results() {
         assert_eq!(
-            Result::<Pid, Errno>::from_raw(-2i64 as u64),
+            Result::<Pid, Errno>::from_raw(-2isize as usize),
             Err(Errno::ENOENT)
         );
 

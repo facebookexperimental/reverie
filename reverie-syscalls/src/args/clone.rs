@@ -86,12 +86,12 @@ impl Displayable for CloneFlags {
 }
 
 impl FromToRaw for CloneFlags {
-    fn from_raw(raw: u64) -> Self {
-        unsafe { Self::from_bits_unchecked(raw) }
+    fn from_raw(raw: usize) -> Self {
+        unsafe { Self::from_bits_unchecked(raw as u64) }
     }
 
-    fn into_raw(self) -> u64 {
-        self.bits() as u64
+    fn into_raw(self) -> usize {
+        self.bits() as usize
     }
 }
 

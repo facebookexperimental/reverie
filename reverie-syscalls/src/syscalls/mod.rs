@@ -444,7 +444,7 @@ typed_syscall! {
     }
 }
 
-fn get_mode(flags: OFlag, mode: u64) -> Option<Mode> {
+fn get_mode(flags: OFlag, mode: usize) -> Option<Mode> {
     if flags.intersects(OFlag::O_CREAT | OFlag::O_TMPFILE) {
         Some(FromToRaw::from_raw(mode))
     } else {
@@ -478,7 +478,7 @@ impl From<Creat> for Open {
     fn from(creat: Creat) -> Self {
         let Creat { mut raw } = creat;
         raw.arg2 = raw.arg1;
-        raw.arg1 = (libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC) as u64;
+        raw.arg1 = (libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC) as usize;
         Open { raw }
     }
 }
@@ -940,7 +940,7 @@ impl From<Vfork> for Clone {
     /// See kernel/fork.c for more details.
     fn from(_: Vfork) -> Self {
         let raw = SyscallArgs {
-            arg0: (libc::CLONE_VFORK | libc::CLONE_VM | libc::SIGCHLD) as u64,
+            arg0: (libc::CLONE_VFORK | libc::CLONE_VM | libc::SIGCHLD) as usize,
             arg1: 0,
             arg2: 0,
             arg3: 0,
@@ -958,7 +958,7 @@ impl From<Fork> for Clone {
     /// See kernel/fork.c for more details.
     fn from(_: Fork) -> Self {
         let raw = SyscallArgs {
-            arg0: libc::SIGCHLD as u64,
+            arg0: libc::SIGCHLD as usize,
             arg1: 0,
             arg2: 0,
             arg3: 0,
@@ -1092,7 +1092,7 @@ typed_syscall! {
 
             fn set(mut self, v: FcntlCmd) -> Self {
                 let (cmd, arg) = v.into_raw();
-                self.raw.arg1 = cmd as u64;
+                self.raw.arg1 = cmd as usize;
                 self.raw.arg2 = arg;
                 self
             }
@@ -1483,8 +1483,8 @@ typed_syscall! {
 typed_syscall! {
     pub struct Sysfs {
         option: i32,
-        arg1: u64,
-        arg2: u64,
+        arg1: usize,
+        arg2: usize,
     }
 }
 
@@ -1578,7 +1578,7 @@ typed_syscall! {
     pub struct ModifyLdt {
         func: i32,
         ptr: Option<AddrMut<libc::c_void>>,
-        bytecount: u64,
+        bytecount: usize,
     }
 }
 
@@ -1616,7 +1616,7 @@ typed_syscall! {
 
             fn set(mut self, v: ArchPrctlCmd) -> Self {
                 let (cmd, arg) = v.into_raw();
-                self.raw.arg0 = cmd as u64;
+                self.raw.arg0 = cmd as usize;
                 self.raw.arg1 = arg;
                 self
             }
@@ -2395,7 +2395,7 @@ impl From<Open> for Openat {
         raw.arg3 = raw.arg2;
         raw.arg2 = raw.arg1;
         raw.arg1 = raw.arg0;
-        raw.arg0 = libc::AT_FDCWD as u64;
+        raw.arg0 = libc::AT_FDCWD as usize;
         Openat { raw }
     }
 }
@@ -2406,9 +2406,9 @@ impl From<Creat> for Openat {
     fn from(creat: Creat) -> Self {
         let Creat { mut raw } = creat;
         raw.arg3 = raw.arg1;
-        raw.arg2 = (libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC) as u64;
+        raw.arg2 = (libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC) as usize;
         raw.arg1 = raw.arg0;
-        raw.arg0 = libc::AT_FDCWD as u64;
+        raw.arg0 = libc::AT_FDCWD as usize;
         Openat { raw }
     }
 }
@@ -2429,7 +2429,7 @@ impl From<Mkdir> for Mkdirat {
         let Mkdir { mut raw } = syscall;
         raw.arg2 = raw.arg1;
         raw.arg1 = raw.arg0;
-        raw.arg0 = libc::AT_FDCWD as u64;
+        raw.arg0 = libc::AT_FDCWD as usize;
         Mkdirat { raw }
     }
 }
@@ -2452,7 +2452,7 @@ impl From<Mknod> for Mknodat {
         raw.arg3 = raw.arg2;
         raw.arg2 = raw.arg1;
         raw.arg1 = raw.arg0;
-        raw.arg0 = libc::AT_FDCWD as u64;
+        raw.arg0 = libc::AT_FDCWD as usize;
         Mknodat { raw }
     }
 }
@@ -2490,7 +2490,7 @@ impl From<Stat> for Newfstatat {
         raw.arg3 = 0;
         raw.arg2 = raw.arg1;
         raw.arg1 = raw.arg0;
-        raw.arg0 = libc::AT_FDCWD as u64;
+        raw.arg0 = libc::AT_FDCWD as usize;
         Newfstatat { raw }
     }
 }
@@ -2498,10 +2498,10 @@ impl From<Stat> for Newfstatat {
 impl From<Lstat> for Newfstatat {
     fn from(lstat: Lstat) -> Self {
         let Lstat { mut raw } = lstat;
-        raw.arg3 = AtFlags::AT_SYMLINK_NOFOLLOW.bits() as u64;
+        raw.arg3 = AtFlags::AT_SYMLINK_NOFOLLOW.bits() as usize;
         raw.arg2 = raw.arg1;
         raw.arg1 = raw.arg0;
-        raw.arg0 = libc::AT_FDCWD as u64;
+        raw.arg0 = libc::AT_FDCWD as usize;
         Newfstatat { raw }
     }
 }
@@ -2519,7 +2519,7 @@ impl From<Unlink> for Unlinkat {
         let Unlink { mut raw } = unlink;
         raw.arg2 = 0;
         raw.arg1 = raw.arg0;
-        raw.arg0 = libc::AT_FDCWD as u64;
+        raw.arg0 = libc::AT_FDCWD as usize;
         Unlinkat { raw }
     }
 }
@@ -2527,9 +2527,9 @@ impl From<Unlink> for Unlinkat {
 impl From<Rmdir> for Unlinkat {
     fn from(rmdir: Rmdir) -> Self {
         let Rmdir { mut raw } = rmdir;
-        raw.arg2 = libc::AT_REMOVEDIR as u64;
+        raw.arg2 = libc::AT_REMOVEDIR as usize;
         raw.arg1 = raw.arg0;
-        raw.arg0 = libc::AT_FDCWD as u64;
+        raw.arg0 = libc::AT_FDCWD as usize;
         Unlinkat { raw }
     }
 }
@@ -2563,8 +2563,8 @@ impl From<Link> for Linkat {
         let Link { mut raw } = link;
         raw.arg3 = raw.arg1;
         raw.arg1 = raw.arg0;
-        raw.arg0 = libc::AT_FDCWD as u64;
-        raw.arg2 = libc::AT_FDCWD as u64;
+        raw.arg0 = libc::AT_FDCWD as usize;
+        raw.arg2 = libc::AT_FDCWD as usize;
         raw.arg4 = 0;
         Linkat { raw }
     }
@@ -3094,9 +3094,9 @@ impl From<Rename> for Renameat2 {
         let Rename { mut raw } = rename;
         raw.arg4 = 0;
         raw.arg3 = raw.arg1;
-        raw.arg2 = libc::AT_FDCWD as u64;
+        raw.arg2 = libc::AT_FDCWD as usize;
         raw.arg1 = raw.arg0;
-        raw.arg0 = libc::AT_FDCWD as u64;
+        raw.arg0 = libc::AT_FDCWD as usize;
         Renameat2 { raw }
     }
 }
@@ -3172,7 +3172,7 @@ impl From<Execve> for Execveat {
         raw.arg3 = raw.arg2;
         raw.arg2 = raw.arg1;
         raw.arg1 = raw.arg0;
-        raw.arg0 = libc::AT_FDCWD as u64;
+        raw.arg0 = libc::AT_FDCWD as usize;
         Execveat { raw }
     }
 }

@@ -36,7 +36,7 @@ command_enum! {
     /// See [`ioctl_list(2)`][ioctl_list] for a more complete list.
     ///
     /// [ioctl_list]: http://man7.org/linux/man-pages/man2/ioctl_list.2.html
-    pub enum Request<'a>: libc::c_ulong {
+    pub enum Request<'a>: usize {
         // <include/asm-i386/socket.h>
         FIOSETOWN(Option<Addr<'a, libc::c_int>>) = 0x00008901,
         SIOCSPGRP(Option<Addr<'a, libc::c_int>>) = 0x00008902,

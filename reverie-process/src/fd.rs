@@ -86,7 +86,7 @@ impl Fd {
     /// file descriptor.
     pub fn pidfd_open(pid: libc::pid_t, flags: u32) -> Result<Self, Errno> {
         // TODO: Move this into its own PidFd type?
-        unsafe { syscalls::syscall2(syscalls::Sysno::pidfd_open, pid as u64, flags as u64) }
+        unsafe { syscalls::syscall2(syscalls::Sysno::pidfd_open, pid as usize, flags as usize) }
             .map(|fd| Self::new(fd as i32))
     }
 
@@ -116,9 +116,9 @@ impl Fd {
         unsafe {
             syscalls::syscall3(
                 syscalls::Sysno::pidfd_getfd,
-                self.as_raw_fd() as u64,
-                targetfd as u64,
-                flags as u64,
+                self.as_raw_fd() as usize,
+                targetfd as usize,
+                flags as usize,
             )
         }
         .map(|fd| Self::new(fd as i32))

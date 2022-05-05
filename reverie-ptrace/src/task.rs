@@ -474,7 +474,14 @@ impl<L: Tool> TracedTask<L> {
     fn get_syscall(&self, task: &Stopped) -> Result<Syscall, TraceError> {
         let regs = task.getregs()?;
         let nr = Sysno::from(regs.orig_rax as i32);
-        let args = SyscallArgs::from(&[regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9]);
+        let args = SyscallArgs::new(
+            regs.rdi as usize,
+            regs.rsi as usize,
+            regs.rdx as usize,
+            regs.r10 as usize,
+            regs.r8 as usize,
+            regs.r9 as usize,
+        );
         trace!(
             "[retrieve_task_state] translating ptrace event SECCOMP into syscall {}",
             nr
@@ -645,7 +652,7 @@ impl<L: Tool + 'static> TracedTask<L> {
 
             // Make sure we got our desired address.
             assert_eq!(
-                Errno::from_ret(task.getregs()?.rax as i64)? as u64,
+                Errno::from_ret(task.getregs()?.rax as usize)? as u64,
                 page_addr,
                 "Could not mmap address {}",
                 page_addr
@@ -1461,12 +1468,12 @@ impl<L: Tool + 'static> TracedTask<L> {
         let no = nr as u64;
         regs.orig_rax = no;
         regs.rax = no;
-        regs.rdi = args.arg0;
-        regs.rsi = args.arg1;
-        regs.rdx = args.arg2;
-        regs.r10 = args.arg3;
-        regs.r8 = args.arg4;
-        regs.r9 = args.arg5;
+        regs.rdi = args.arg0 as u64;
+        regs.rsi = args.arg1 as u64;
+        regs.rdx = args.arg2 as u64;
+        regs.r10 = args.arg3 as u64;
+        regs.r8 = args.arg4 as u64;
+        regs.r9 = args.arg5 as u64;
 
         // instruction at PRIVATE_PAGE_OFFSET, see `populate_mmap_page`.
         // 7000_0000:         0f 05     syscall
@@ -1525,7 +1532,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                         // it back.
                         restore_context(&stopped, context, None)?;
                     }
-                    Ok(Errno::from_ret(regs.rax as i64))
+                    Ok(Errno::from_ret(regs.rax as usize).map(|x| x as i64))
                 }
                 Event::NewChild(op, child) => {
                     let ret = child.pid().as_raw() as i64;
@@ -1539,7 +1546,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                 }
                 Event::Syscall => {
                     let regs = stopped.getregs()?;
-                    Ok(Errno::from_ret(regs.rax as i64))
+                    Ok(Errno::from_ret(regs.rax as usize).map(|x| x as i64))
                 }
                 st => panic!("untraced_syscall returned unknown state: {:?}", st),
             },

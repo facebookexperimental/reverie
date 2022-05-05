@@ -57,7 +57,7 @@ impl Tool for LocalStateVforkClone {
                 // vfork is very tricky because child/parent share the same stack. see P153347946 for
                 // a bit more context.
                 let raw: SyscallArgs = SyscallArgs {
-                    arg0: (libc::CLONE_VFORK | libc::CLONE_VM | libc::SIGCHLD) as u64,
+                    arg0: (libc::CLONE_VFORK | libc::CLONE_VM | libc::SIGCHLD) as usize,
                     arg1: 0,
                     arg2: 0,
                     arg3: 0,

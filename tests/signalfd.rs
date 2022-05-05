@@ -37,7 +37,7 @@ impl Tool for LocalState {
             Syscall::Signalfd4(_) => {
                 let (_, args) = syscall.into_parts();
                 assert_eq!(args.arg2, 8);
-                assert_eq!(args.arg3, libc::SFD_CLOEXEC as u64);
+                assert_eq!(args.arg3, libc::SFD_CLOEXEC as usize);
                 guest.tail_inject(syscall).await
             }
             _ => guest.tail_inject(syscall).await,

@@ -149,11 +149,11 @@ impl Tool for LocalState {
                 let clock_value = guest.read_clock().unwrap();
                 let ts = guest.thread_state_mut();
                 ts.last_tick = clock_value;
-                ts.timer_assertion = Some(args.arg0);
+                ts.timer_assertion = Some(args.arg0 as u64);
             }
             Sysno::clock_adjtime => assert_eq!(
                 guest.read_clock().unwrap(),
-                guest.thread_state_mut().last_tick + args.arg0
+                guest.thread_state_mut().last_tick + args.arg0 as u64
             ),
             _ => guest.tail_inject(syscall).await,
         };

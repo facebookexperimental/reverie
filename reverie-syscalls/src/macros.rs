@@ -480,7 +480,7 @@ macro_rules! typed_syscall {
     ) => {
         typed_syscall! {
             $(#[$attrs])*
-            $vis struct $Name -> u64 {
+            $vis struct $Name -> usize {
                 $($vals)*
             }
         }
@@ -522,7 +522,7 @@ macro_rules! syscall_list {
         }
 
         impl $crate::SyscallInfo for $name {
-            type Return = Result<u64, $crate::Errno>;
+            type Return = Result<usize, $crate::Errno>;
 
             fn name(&self) -> &'static str {
                 match self {
@@ -621,7 +621,7 @@ macro_rules! command_enum {
             )*
 
             /// Catch-all case when we don't know the command and its argument.
-            Other($type, u64),
+            Other($type, usize),
         }
 
         impl<$($lt,)*> ::core::fmt::Display for $name<$($lt,)*> {
@@ -657,7 +657,7 @@ macro_rules! command_enum {
 
         impl<$($lt,)*> $name<$($lt,)*> {
             /// Creates the enum from raw arguments.
-            pub fn from_raw(cmd: $type, arg: u64) -> Self {
+            pub fn from_raw(cmd: $type, arg: usize) -> Self {
                 match cmd {
                     $(
                         $(#[$meta])*
@@ -668,7 +668,7 @@ macro_rules! command_enum {
             }
 
             /// Converts the enum into raw arguments.
-            pub fn into_raw(self) -> ($type, u64) {
+            pub fn into_raw(self) -> ($type, usize) {
                 match self {
                     $(
                         $(#[$meta])*
@@ -793,12 +793,12 @@ macro_rules! const_enum {
         }
 
         impl $crate::FromToRaw for $Name {
-            fn from_raw(raw: u64) -> Self {
+            fn from_raw(raw: usize) -> Self {
                 Self(raw as $inner)
             }
 
-            fn into_raw(self) -> u64 {
-                self.0 as u64
+            fn into_raw(self) -> usize {
+                self.0 as usize
             }
         }
 

@@ -83,12 +83,12 @@ bitflags::bitflags! {
 }
 
 impl FromToRaw for PollFlags {
-    fn from_raw(raw: u64) -> Self {
+    fn from_raw(raw: usize) -> Self {
         Self::from_bits_truncate(raw as libc::c_short)
     }
 
-    fn into_raw(self) -> u64 {
-        self.bits() as u64
+    fn into_raw(self) -> usize {
+        self.bits() as usize
     }
 }
 

@@ -101,11 +101,11 @@ where
 }
 
 impl<'a, T> FromToRaw for Option<CArrayPtr<'a, T>> {
-    fn from_raw(raw: u64) -> Self {
+    fn from_raw(raw: usize) -> Self {
         Option::<Addr<'a, Option<T>>>::from_raw(raw).map(CArrayPtr)
     }
 
-    fn into_raw(self) -> u64 {
+    fn into_raw(self) -> usize {
         self.map(|p| p.0).into_raw()
     }
 }
@@ -178,11 +178,11 @@ impl<'a> ReadAddr for CStrPtr<'a> {
 }
 
 impl<'a> FromToRaw for Option<CStrPtr<'a>> {
-    fn from_raw(raw: u64) -> Self {
+    fn from_raw(raw: usize) -> Self {
         Option::<Addr<'a, u8>>::from_raw(raw).map(CStrPtr)
     }
 
-    fn into_raw(self) -> u64 {
+    fn into_raw(self) -> usize {
         self.map(|p| p.0).into_raw()
     }
 }
@@ -249,11 +249,11 @@ impl<'a> ReadAddr for PathPtr<'a> {
 }
 
 impl<'a> FromToRaw for Option<PathPtr<'a>> {
-    fn from_raw(raw: u64) -> Self {
+    fn from_raw(raw: usize) -> Self {
         Option::<CStrPtr<'a>>::from_raw(raw).map(PathPtr)
     }
 
-    fn into_raw(self) -> u64 {
+    fn into_raw(self) -> usize {
         self.map(|p| p.0).into_raw()
     }
 }
@@ -297,11 +297,11 @@ impl<'a> ReadAddr for StatPtr<'a> {
 }
 
 impl<'a> FromToRaw for Option<StatPtr<'a>> {
-    fn from_raw(raw: u64) -> Self {
+    fn from_raw(raw: usize) -> Self {
         Option::<AddrMut<'a, libc::stat>>::from_raw(raw).map(StatPtr)
     }
 
-    fn into_raw(self) -> u64 {
+    fn into_raw(self) -> usize {
         self.map(|p| p.0).into_raw()
     }
 }
@@ -361,11 +361,11 @@ impl<'a> ReadAddr for StatxPtr<'a> {
 }
 
 impl<'a> FromToRaw for Option<StatxPtr<'a>> {
-    fn from_raw(raw: u64) -> Self {
+    fn from_raw(raw: usize) -> Self {
         Option::<AddrMut<'a, libc::statx>>::from_raw(raw).map(StatxPtr)
     }
 
-    fn into_raw(self) -> u64 {
+    fn into_raw(self) -> usize {
         self.map(|p| p.0).into_raw()
     }
 }
@@ -447,12 +447,12 @@ impl Default for StatxMask {
 }
 
 impl FromToRaw for StatxMask {
-    fn from_raw(raw: u64) -> Self {
+    fn from_raw(raw: usize) -> Self {
         StatxMask::from_bits_truncate(raw as u32)
     }
 
-    fn into_raw(self) -> u64 {
-        self.bits() as u64
+    fn into_raw(self) -> usize {
+        self.bits() as usize
     }
 }
 
