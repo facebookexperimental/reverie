@@ -78,6 +78,9 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     /// Returns an immutable reference to thread state.
     fn thread_state(&self) -> &T::ThreadState;
 
+    /// Returns the current register values of the guest thread.
+    async fn regs(&mut self) -> libc::user_regs_struct;
+
     /// Returns the current stack pointer with this guest thread.
     async fn stack(&mut self) -> Self::Stack;
 
@@ -327,6 +330,10 @@ where
 
     fn thread_state(&self) -> &L::ThreadState {
         self.inner.thread_state().as_ref()
+    }
+
+    async fn regs(&mut self) -> libc::user_regs_struct {
+        self.inner.regs().await
     }
 
     async fn stack(&mut self) -> Self::Stack {

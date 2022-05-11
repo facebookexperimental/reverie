@@ -2005,6 +2005,15 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
         self.assume_stopped()
     }
 
+    async fn regs(&mut self) -> user_regs_struct {
+        let task = self.assume_stopped();
+
+        match task.getregs() {
+            Ok(ret) => ret,
+            Err(err) => self.abort(Err(err)).await,
+        }
+    }
+
     async fn stack(&mut self) -> Self::Stack {
         match GuestStack::new(self.tid, self.stack_checked_out.clone()) {
             Ok(ret) => ret,
