@@ -106,7 +106,7 @@ macro_rules! typed_syscall {
                 pub const NAME: &'static str = stringify!([<$Name:snake>]);
 
                 /// The syscall number.
-                pub const NUMBER: ::syscalls::Sysno = ::syscalls::[<SYS_ $Name:snake>];
+                pub const NUMBER: ::syscalls::Sysno = ::syscalls::Sysno::[<$Name:snake>];
             }
 
             /// Creates the syscall. Use the `with_*` functions to build up the
@@ -514,7 +514,7 @@ macro_rules! syscall_list {
             pub fn from_raw(syscall: ::syscalls::Sysno, args: ::syscalls::SyscallArgs) -> Self {
                 match syscall {
                     $(
-                        ::syscalls::$num => $name::$item(args.into()),
+                        ::syscalls::Sysno::$num => $name::$item(args.into()),
                     )*
                     num => Syscall::Other(num, args),
                 }
@@ -536,7 +536,7 @@ macro_rules! syscall_list {
             fn number(&self) -> ::syscalls::Sysno {
                 match self {
                     $(
-                        $name::$item(_) => ::syscalls::$num,
+                        $name::$item(_) => ::syscalls::Sysno::$num,
                     )*
                     $name::Other(num, _) => *num,
                 }
@@ -545,7 +545,7 @@ macro_rules! syscall_list {
             fn into_parts(self) -> (::syscalls::Sysno, ::syscalls::SyscallArgs) {
                 match self {
                     $(
-                        $name::$item(x) => (::syscalls::$num, x.into()),
+                        $name::$item(x) => (::syscalls::Sysno::$num, x.into()),
                     )*
                     $name::Other(num, args) => (num, args),
                 }
