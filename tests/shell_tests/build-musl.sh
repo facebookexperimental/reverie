@@ -1,5 +1,5 @@
 #!/bin/bash
-# Copyright (c) Meta Platforms, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # All rights reserved.
 #

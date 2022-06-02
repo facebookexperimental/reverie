@@ -3,7 +3,7 @@
  *     ("University Works" via Baojun Wang)
  * Copyright (c) 2018-2019, Ryan Newton
  *     ("Traditional Works of Scholarship")
- * Copyright (c) 2020-, Meta Platforms, Inc. and its affiliates.
+ * Copyright (c) 2020-, Meta Platforms, Inc. and affiliates.
  *
  * All rights reserved.
  *
