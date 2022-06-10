@@ -41,7 +41,7 @@ pub fn print_tracee_output(output: &Output) {
 /// Configure tokio and tracing in the way that we like, and run the future.
 pub fn run_tokio_test<F: Future>(fut: F) -> F::Output {
     let collector = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
+        .with_env_filter("reverie=trace")
         .finish();
 
     // For reentrancy during testing we need to set up logging early because mio
