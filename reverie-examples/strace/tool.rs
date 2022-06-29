@@ -11,7 +11,7 @@ use crate::config::Config;
 use crate::global_state::GlobalState;
 
 use reverie::syscalls::{Displayable, Errno, Syscall, SyscallInfo};
-use reverie::{Error, Guest, Signal, Subscription, Tool};
+use reverie::{Error, ExitStatus, GlobalRPC, Guest, Pid, Signal, Subscription, Tid, Tool};
 
 use serde::{Deserialize, Serialize};
 
@@ -111,5 +111,34 @@ impl Tool for Strace {
             signal
         );
         Ok(Some(signal))
+    }
+
+    async fn on_exit_thread<G: GlobalRPC<Self::GlobalState>>(
+        &self,
+        tid: Tid,
+        _global_state: &G,
+        _thread_state: Self::ThreadState,
+        exit_status: ExitStatus,
+    ) -> Result<(), Error> {
+        eprintln!(
+            "Thread {} exited with status {:?}",
+            tid.colored(),
+            exit_status
+        );
+        Ok(())
+    }
+
+    async fn on_exit_process<G: GlobalRPC<Self::GlobalState>>(
+        self,
+        pid: Pid,
+        _global_state: &G,
+        exit_status: ExitStatus,
+    ) -> Result<(), Error> {
+        eprintln!(
+            "Process {} exited with status {:?}",
+            pid.colored(),
+            exit_status
+        );
+        Ok(())
     }
 }
