@@ -7,9 +7,18 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use reverie::{Errno, GlobalTool, Guest, Rdtsc, RdtscResult, Subscription, Tid, Tool};
-use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use reverie::Errno;
+use reverie::GlobalTool;
+use reverie::Guest;
+use reverie::Rdtsc;
+use reverie::RdtscResult;
+use reverie::Subscription;
+use reverie::Tid;
+use reverie::Tool;
+use serde::Deserialize;
+use serde::Serialize;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct GlobalState {

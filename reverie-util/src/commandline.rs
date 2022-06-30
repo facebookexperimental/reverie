@@ -12,8 +12,13 @@
 //! needs its own CLI.
 
 use chrono::Local;
+use std::error::Error;
+use std::ffi::OsStr;
+use std::fmt::Display;
+use std::io;
 use std::path::Path;
-use std::{error::Error, ffi::OsStr, fmt::Display, io, path::PathBuf, str::FromStr};
+use std::path::PathBuf;
+use std::str::FromStr;
 use structopt::StructOpt;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::fmt::MakeWriter;

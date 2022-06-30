@@ -6,15 +6,22 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
-use super::fd::{pipe, AsyncFd, Fd};
+use super::fd::pipe;
+use super::fd::AsyncFd;
+use super::fd::Fd;
 
 use core::pin::Pin;
-use core::task::{Context, Poll};
+use core::task::Context;
+use core::task::Poll;
 use std::io;
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
+use std::os::unix::io::AsRawFd;
+use std::os::unix::io::FromRawFd;
+use std::os::unix::io::IntoRawFd;
 
 use syscalls::Errno;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::AsyncRead;
+use tokio::io::AsyncWrite;
+use tokio::io::ReadBuf;
 
 /// Describes what to do with a standard I/O stream for a child process when
 /// passed to the [`stdin`], [`stdout`], and [`stderr`] methods of [`Command`].

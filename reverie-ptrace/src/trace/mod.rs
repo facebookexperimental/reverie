@@ -14,16 +14,20 @@ mod memory;
 mod notifier;
 mod waitid;
 
-use std::{fmt, mem, ptr};
+use std::fmt;
+use std::mem;
+use std::ptr;
 
-use nix::sys::{
-    ptrace,
-    wait::{WaitPidFlag, WaitStatus},
-};
+use nix::sys::ptrace;
+use nix::sys::wait::WaitPidFlag;
+use nix::sys::wait::WaitStatus;
 use thiserror::Error;
 
-pub use reverie::{Errno, ExitStatus, Pid};
-use waitid::{waitid, IdType};
+pub use reverie::Errno;
+pub use reverie::ExitStatus;
+pub use reverie::Pid;
+use waitid::waitid;
+use waitid::IdType;
 
 // Re-exports so that nothing else needs to depend on `nix`.
 pub use nix::sys::ptrace::Options;
@@ -965,12 +969,14 @@ pub fn traceme_and_stop() -> Result<(), Errno> {
 mod test {
     use super::*;
 
-    use nix::{
-        sys::signal::{self, Signal},
-        unistd::{fork, ForkResult},
-    };
+    use nix::sys::signal::Signal;
+    use nix::sys::signal::{self};
+    use nix::unistd::fork;
+    use nix::unistd::ForkResult;
 
-    use std::{io, mem, thread};
+    use std::io;
+    use std::mem;
+    use std::thread;
 
     // Traces a closure in a forked process. The forked process starts in a
     // stopped state so that ptrace options may be set.
@@ -1127,10 +1133,9 @@ mod test {
 
     #[cfg(not(sanitized))]
     fn group_exit(thread_count: usize) -> Result<(), Box<dyn std::error::Error + 'static>> {
-        use std::sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc,
-        };
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
         use std::time::Duration;
 
         let (parent_pid, tracee) = trace(

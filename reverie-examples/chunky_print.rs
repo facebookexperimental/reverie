@@ -10,24 +10,28 @@
 //! This tool will chunk together printed output from each thread, over fixed
 //! time intervals.
 
-use reverie::{
-    syscalls::{Addr, MemoryAccess, Syscall},
-    Error, GlobalTool, Guest, Tid, Tool,
-};
+use reverie::syscalls::Addr;
+use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::Syscall;
+use reverie::Error;
+use reverie::GlobalTool;
+use reverie::Guest;
+use reverie::Tid;
+use reverie::Tool;
 use reverie_util::CommonToolArguments;
-use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashMap,
-    fmt::Write,
-    io,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Mutex,
-    },
-    vec::Vec,
-};
+use serde::Deserialize;
+use serde::Serialize;
+use std::collections::HashMap;
+use std::fmt::Write;
+use std::io;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::sync::Mutex;
+use std::vec::Vec;
 use structopt::StructOpt;
-use tracing::{debug, info, trace};
+use tracing::debug;
+use tracing::info;
+use tracing::trace;
 
 /// How many system calls (in each thread) define an epoch?
 const EPOCH: u64 = 10;

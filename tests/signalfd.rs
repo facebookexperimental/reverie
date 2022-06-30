@@ -9,11 +9,14 @@
 
 // signal handling related tests.
 
-use reverie::{
-    syscalls::{ExitGroup, Syscall, SyscallInfo},
-    Error, Guest, Tool,
-};
-use serde::{Deserialize, Serialize};
+use reverie::syscalls::ExitGroup;
+use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallInfo;
+use reverie::Error;
+use reverie::Guest;
+use reverie::Tool;
+use serde::Deserialize;
+use serde::Serialize;
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 struct LocalState;
@@ -50,12 +53,12 @@ mod tests {
     use super::*;
     use nix::sys::signal::Signal;
     use reverie_ptrace::testing::check_fn;
-    use std::{
-        fs::File,
-        io::{self, Read},
-        mem::{self, MaybeUninit},
-        os::unix::io::FromRawFd,
-    };
+    use std::fs::File;
+    use std::io::Read;
+    use std::io::{self};
+    use std::mem::MaybeUninit;
+    use std::mem::{self};
+    use std::os::unix::io::FromRawFd;
 
     // kernel_sigset_t used by naked syscall
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]

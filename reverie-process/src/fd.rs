@@ -10,16 +10,26 @@
 use super::util;
 
 use core::pin::Pin;
-use core::task::{Context, Poll};
+use core::task::Context;
+use core::task::Poll;
 
-use std::ffi::{CStr, CString};
-use std::io::{self, Read, Write};
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::ffi::CStr;
+use std::ffi::CString;
+use std::io::Read;
+use std::io::Write;
+use std::io::{self};
+use std::os::unix::io::AsRawFd;
+use std::os::unix::io::FromRawFd;
+use std::os::unix::io::IntoRawFd;
+use std::os::unix::io::RawFd;
 use std::path::Path;
 
 use syscalls::Errno;
 use tokio::io::unix::AsyncFd as TokioAsyncFd;
-use tokio::io::{AsyncRead, AsyncWrite, Interest, ReadBuf};
+use tokio::io::AsyncRead;
+use tokio::io::AsyncWrite;
+use tokio::io::Interest;
+use tokio::io::ReadBuf;
 
 #[derive(Debug)]
 // From `std/src/sys/unix/fd.rs`. Mark `-1` as an invalid file descriptor so it

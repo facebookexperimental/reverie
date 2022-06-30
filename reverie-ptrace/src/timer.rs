@@ -31,11 +31,19 @@
 //! which _usually_ means immediately after the tool callback returns.
 
 use crate::perf::*;
-use crate::trace::{Error as TraceError, Event as TraceEvent, Stopped, Wait};
-use raw_cpuid::{CpuId, FeatureInfo};
-use reverie::{Errno, Pid, Signal, Tid};
+use crate::trace::Error as TraceError;
+use crate::trace::Event as TraceEvent;
+use crate::trace::Stopped;
+use crate::trace::Wait;
+use raw_cpuid::CpuId;
+use raw_cpuid::FeatureInfo;
+use reverie::Errno;
+use reverie::Pid;
+use reverie::Signal;
+use reverie::Tid;
 use thiserror::Error;
-use tracing::{debug, warn};
+use tracing::debug;
+use tracing::warn;
 
 // This signal is unused, in that the kernel will never send it to a process.
 const MARKER_SIGNAL: Signal = reverie::PERF_EVENT_SIGNAL;

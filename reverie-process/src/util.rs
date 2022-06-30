@@ -6,7 +6,9 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
-use std::ffi::{CStr, CString, OsStr};
+use std::ffi::CStr;
+use std::ffi::CString;
+use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 
 use syscalls::Errno;

@@ -13,14 +13,29 @@
 //! necessary to carry out the test, such as setting timers or reading clocks.
 
 #![cfg_attr(feature = "llvm_asm", feature(llvm_asm))]
-use core::arch::x86_64::{__cpuid, __rdtscp, _rdtsc};
+use core::arch::x86_64::__cpuid;
+use core::arch::x86_64::__rdtscp;
+use core::arch::x86_64::_rdtsc;
 use libc;
-use reverie::{
-    syscalls::{Getpid, Gettid, Syscall, SyscallInfo, Sysno, Tgkill},
-    Errno, Error, GlobalTool, Guest, Pid, Signal, Subscription, TimerSchedule, Tool,
-};
-use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
+use reverie::syscalls::Getpid;
+use reverie::syscalls::Gettid;
+use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallInfo;
+use reverie::syscalls::Sysno;
+use reverie::syscalls::Tgkill;
+use reverie::Errno;
+use reverie::Error;
+use reverie::GlobalTool;
+use reverie::Guest;
+use reverie::Pid;
+use reverie::Signal;
+use reverie::Subscription;
+use reverie::TimerSchedule;
+use reverie::Tool;
+use serde::Deserialize;
+use serde::Serialize;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct GlobalState {
@@ -317,7 +332,8 @@ mod timer_tests {
 
     use super::*;
     use reverie_ptrace::ret_without_perf;
-    use reverie_ptrace::testing::{check_fn_with_config, do_branches};
+    use reverie_ptrace::testing::check_fn_with_config;
+    use reverie_ptrace::testing::do_branches;
     use test_case::test_case;
 
     #[test_case(MANY_RCBS, sched_precise)]
@@ -631,7 +647,8 @@ mod timer_tests {
 mod clock_tests {
     use super::*;
     use reverie_ptrace::ret_without_perf;
-    use reverie_ptrace::testing::{check_fn, do_branches};
+    use reverie_ptrace::testing::check_fn;
+    use reverie_ptrace::testing::do_branches;
     use test_case::test_case;
 
     #[test]

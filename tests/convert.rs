@@ -11,8 +11,12 @@
 // when we convert syscall, such as open -> openat, the old syscall
 // args should not be clobbered, even with the conversion.
 
-use reverie::{syscalls::Syscall, Error, Guest, Tool};
-use serde::{Deserialize, Serialize};
+use reverie::syscalls::Syscall;
+use reverie::Error;
+use reverie::Guest;
+use reverie::Tool;
+use serde::Deserialize;
+use serde::Serialize;
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 struct LocalStateTailInject;

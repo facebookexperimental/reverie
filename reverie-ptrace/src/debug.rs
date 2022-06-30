@@ -15,8 +15,10 @@
 
 use core::fmt;
 
-use nix::sys::{ptrace, signal};
-use reverie::syscalls::{Addr, MemoryAccess};
+use nix::sys::ptrace;
+use nix::sys::signal;
+use reverie::syscalls::Addr;
+use reverie::syscalls::MemoryAccess;
 use reverie::Pid;
 use tracing::debug;
 

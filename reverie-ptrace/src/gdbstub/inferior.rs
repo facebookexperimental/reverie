@@ -7,7 +7,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use super::{commands::*, Error, GdbRequest};
+use super::commands::*;
+use super::Error;
+use super::GdbRequest;
 
 use reverie::Pid;
 use tokio::sync::mpsc;

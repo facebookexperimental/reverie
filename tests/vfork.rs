@@ -9,11 +9,14 @@
 
 // signal handling related tests.
 
-use reverie::{
-    syscalls::{Syscall, SyscallArgs, SyscallInfo},
-    Error, Guest, Tool,
-};
-use serde::{Deserialize, Serialize};
+use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallArgs;
+use reverie::syscalls::SyscallInfo;
+use reverie::Error;
+use reverie::Guest;
+use reverie::Tool;
+use serde::Deserialize;
+use serde::Serialize;
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 struct LocalStateVfork;
@@ -80,10 +83,9 @@ impl Tool for LocalStateVforkClone {
 #[cfg(all(not(sanitized), test))]
 mod tests {
     use super::*;
-    use nix::{
-        sys::wait::{self, WaitStatus},
-        unistd::Pid,
-    };
+    use nix::sys::wait::WaitStatus;
+    use nix::sys::wait::{self};
+    use nix::unistd::Pid;
     use reverie_ptrace::testing::check_fn;
     use std::ffi::CString;
 

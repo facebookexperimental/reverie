@@ -11,7 +11,8 @@ mod library;
 mod symbols;
 
 use core::fmt;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 use std::borrow::Cow;
 use std::fs::File;
 use std::io;

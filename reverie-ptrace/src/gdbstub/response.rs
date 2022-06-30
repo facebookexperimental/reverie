@@ -31,12 +31,16 @@
  * SOFTWARE.
  */
 
-use bytes::{BufMut, Bytes, BytesMut};
-use num_traits::{AsPrimitive, PrimInt};
+use bytes::BufMut;
+use bytes::Bytes;
+use bytes::BytesMut;
+use num_traits::AsPrimitive;
+use num_traits::PrimInt;
 
 use reverie::Errno;
 
-use super::{Error, PacketLogger};
+use super::Error;
+use super::PacketLogger;
 use crate::trace::Error as TraceError;
 
 /// Trait to write gdb reply. This is different than `Fmt` for `Display`,

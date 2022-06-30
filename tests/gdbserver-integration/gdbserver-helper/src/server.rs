@@ -8,7 +8,11 @@
  */
 
 use anyhow::Error;
-use reverie::process::{Command, Mount, Namespace, Output, Stdio};
+use reverie::process::Command;
+use reverie::process::Mount;
+use reverie::process::Namespace;
+use reverie::process::Output;
+use reverie::process::Stdio;
 use reverie::Subscription;
 use reverie::Tool;
 use reverie_ptrace::GdbConnection;

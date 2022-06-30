@@ -15,11 +15,14 @@
 use goblin::elf::Elf;
 
 use lazy_static::lazy_static;
-use nix::{sys::mman::ProtFlags, unistd};
-use reverie::{
-    syscalls::{AddrMut, MemoryAccess, Mprotect},
-    Error, Guest, Tool,
-};
+use nix::sys::mman::ProtFlags;
+use nix::unistd;
+use reverie::syscalls::AddrMut;
+use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::Mprotect;
+use reverie::Error;
+use reverie::Guest;
+use reverie::Tool;
 use std::collections::HashMap;
 use tracing::debug;
 

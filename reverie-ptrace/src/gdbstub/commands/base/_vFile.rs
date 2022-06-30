@@ -8,14 +8,16 @@
  */
 
 use bytes::BytesMut;
+use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
-use std::{ffi::OsString, path::PathBuf};
+use std::path::PathBuf;
 
 use nix::sys::stat::FileStat;
 
 use reverie::Pid;
 
-use crate::gdbstub::{commands::*, hex::*};
+use crate::gdbstub::commands::*;
+use crate::gdbstub::hex::*;
 
 /// struct stat defined by gdb host i/o packet. This is *not* the same as
 /// libc::stat or nix's FileStat (which is just libc::stat).

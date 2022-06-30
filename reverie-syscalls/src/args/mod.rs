@@ -12,11 +12,10 @@
 
 use core::fmt;
 
-use std::{
-    ffi::{CString, OsString},
-    os::unix::ffi::OsStringExt,
-    path::PathBuf,
-};
+use std::ffi::CString;
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
+use std::path::PathBuf;
 
 mod clone;
 mod fcntl;
@@ -25,12 +24,12 @@ mod poll;
 mod stat;
 mod time;
 
-use nix::{
-    sys::stat::{Mode, SFlag},
-    unistd::Pid,
-};
+use nix::sys::stat::Mode;
+use nix::sys::stat::SFlag;
+use nix::unistd::Pid;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 pub use clone::*;
 pub use fcntl::FcntlCmd;
@@ -38,7 +37,12 @@ pub use poll::*;
 pub use stat::*;
 pub use time::*;
 
-use crate::{Addr, AddrMut, Displayable, Errno, FromToRaw, MemoryAccess};
+use crate::Addr;
+use crate::AddrMut;
+use crate::Displayable;
+use crate::Errno;
+use crate::FromToRaw;
+use crate::MemoryAccess;
 
 /// Helper trait for reading a specific value from an address.
 pub trait ReadAddr {

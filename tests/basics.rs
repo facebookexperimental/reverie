@@ -11,22 +11,36 @@
 //! Basic tests that don't fall into some other category.
 
 #[allow(unused_imports)]
-use nix::{
-    sys::wait::{self, WaitStatus},
-    unistd::{self, ForkResult},
-};
-use reverie::{
-    syscalls::{Syscall, SyscallInfo, Sysno},
-    Error, ExitStatus, GlobalTool, Guest, Pid, Tool,
-};
+use nix::sys::wait::WaitStatus;
 #[allow(unused_imports)]
-use reverie_ptrace::testing::{check_fn, test_cmd, test_fn};
-use serde::{Deserialize, Serialize};
+use nix::sys::wait::{self};
+#[allow(unused_imports)]
+use nix::unistd::ForkResult;
+#[allow(unused_imports)]
+use nix::unistd::{self};
+use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallInfo;
+use reverie::syscalls::Sysno;
+use reverie::Error;
+use reverie::ExitStatus;
+use reverie::GlobalTool;
+use reverie::Guest;
+use reverie::Pid;
+use reverie::Tool;
+#[allow(unused_imports)]
+use reverie_ptrace::testing::check_fn;
+#[allow(unused_imports)]
+use reverie_ptrace::testing::test_cmd;
+#[allow(unused_imports)]
+use reverie_ptrace::testing::test_fn;
+use serde::Deserialize;
+use serde::Serialize;
 #[allow(unused_imports)]
 use std::ffi::CString;
 #[allow(unused_imports)]
 use std::io::Write;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Default)]
 struct NoopTool;
@@ -168,8 +182,10 @@ fn run_guest_func_print_test() {
 #[cfg(not(sanitized))]
 #[test]
 fn orphans() {
-    use nix::unistd::{fork, ForkResult};
-    use std::{thread, time::Duration};
+    use nix::unistd::fork;
+    use nix::unistd::ForkResult;
+    use std::thread;
+    use std::time::Duration;
 
     let (output, _state) = test_fn::<CounterLocal, _>(|| {
         // Spawn a child process and make sure the parent exits before the child

@@ -16,13 +16,28 @@
 
 use libc;
 use raw_cpuid::cpuid;
-use reverie::{
-    syscalls::Syscall, CpuIdResult, Errno, Error, ExitStatus, GlobalRPC, GlobalTool, Guest, Pid,
-    Rdtsc, RdtscResult, Signal, Tid, TimerSchedule, Tool,
-};
-use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use reverie::syscalls::Syscall;
+use reverie::CpuIdResult;
+use reverie::Errno;
+use reverie::Error;
+use reverie::ExitStatus;
+use reverie::GlobalRPC;
+use reverie::GlobalTool;
+use reverie::Guest;
+use reverie::Pid;
+use reverie::Rdtsc;
+use reverie::RdtscResult;
+use reverie::Signal;
+use reverie::Tid;
+use reverie::TimerSchedule;
+use reverie::Tool;
+use serde::Deserialize;
+use serde::Serialize;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::Instant;
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct GlobalState {
@@ -177,7 +192,8 @@ fn do_marker_syscall() {
 #[cfg(all(not(sanitized), test))]
 mod tests {
     use super::*;
-    use reverie_ptrace::testing::{check_fn_with_config, do_branches};
+    use reverie_ptrace::testing::check_fn_with_config;
+    use reverie_ptrace::testing::do_branches;
 
     #[test]
     fn guest_busywait_no_timer() {

@@ -9,9 +9,16 @@
 
 //! Tests for parallelism and concurrency
 
-use reverie::{syscalls::Syscall, Error, GlobalTool, Guest, Tid, Tool};
-use serde::{Deserialize, Serialize};
-use tokio::time::{sleep, Duration};
+use reverie::syscalls::Syscall;
+use reverie::Error;
+use reverie::GlobalTool;
+use reverie::Guest;
+use reverie::Tid;
+use reverie::Tool;
+use serde::Deserialize;
+use serde::Serialize;
+use tokio::time::sleep;
+use tokio::time::Duration;
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct GlobalState {}
@@ -71,7 +78,8 @@ impl Tool for TestTool {
 #[cfg(not(sanitized))]
 pub fn delay_childprint_test() {
     use reverie::ExitStatus;
-    use reverie_ptrace::testing::{print_tracee_output, test_fn};
+    use reverie_ptrace::testing::print_tracee_output;
+    use reverie_ptrace::testing::test_fn;
 
     let (output, _state) = test_fn::<TestTool, _>(|| {
         let child = std::thread::spawn(move || {
@@ -118,7 +126,8 @@ impl Tool for TestTool2 {
 
 #[cfg(not(sanitized))]
 fn kill_blocked_child() {
-    use std::sync::{Arc, Barrier};
+    use std::sync::Arc;
+    use std::sync::Barrier;
 
     let barrier = Arc::new(Barrier::new(2));
 

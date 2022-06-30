@@ -8,8 +8,13 @@
  */
 #![cfg(not(sanitized))]
 
-use reverie::{syscalls, Error, Guest, Pid, Tool};
-use serde::{Deserialize, Serialize};
+use reverie::syscalls;
+use reverie::Error;
+use reverie::Guest;
+use reverie::Pid;
+use reverie::Tool;
+use serde::Deserialize;
+use serde::Serialize;
 
 #[test]
 fn thread_start_inject() {

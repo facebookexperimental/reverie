@@ -31,13 +31,20 @@
  * SOFTWARE.
  */
 
-use bytes::{Bytes, BytesMut};
-use num_traits::{CheckedAdd, CheckedMul, FromPrimitive, Zero};
-use serde::{
-    de::{self, Visitor},
-    ser::{self, SerializeSeq},
-    Deserialize, Deserializer, Serialize, Serializer,
-};
+use bytes::Bytes;
+use bytes::BytesMut;
+use num_traits::CheckedAdd;
+use num_traits::CheckedMul;
+use num_traits::FromPrimitive;
+use num_traits::Zero;
+use serde::de::Visitor;
+use serde::de::{self};
+use serde::ser::SerializeSeq;
+use serde::ser::{self};
+use serde::Deserialize;
+use serde::Deserializer;
+use serde::Serialize;
+use serde::Serializer;
 use thiserror::Error;
 
 /// Decode gdb hex error code

@@ -9,11 +9,15 @@
 
 //! An example that tracks thread pedigree using local state.
 
-use bitvec::{bitvec, order::Msb0, vec::BitVec};
+use bitvec::bitvec;
+use bitvec::order::Msb0;
+use bitvec::vec::BitVec;
 use libc::pid_t;
 use nix::unistd::Pid;
-use serde::{Deserialize, Serialize};
-use std::{io, mem};
+use serde::Deserialize;
+use serde::Serialize;
+use std::io;
+use std::mem;
 
 /// Helper function that finds the longest run of repeating bits in a bitvec
 fn longest_run(sequence: &BitVec) -> (usize, usize) {

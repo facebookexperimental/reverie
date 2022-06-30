@@ -9,11 +9,14 @@
 
 // reinject stat* as fstatat unittest
 
-use reverie::{
-    syscalls::{self, Displayable, Syscall},
-    Error, Guest, Tool,
-};
-use serde::{Deserialize, Serialize};
+use reverie::syscalls::Displayable;
+use reverie::syscalls::Syscall;
+use reverie::syscalls::{self};
+use reverie::Error;
+use reverie::Guest;
+use reverie::Tool;
+use serde::Deserialize;
+use serde::Serialize;
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 struct LocalState;

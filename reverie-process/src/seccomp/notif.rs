@@ -14,7 +14,8 @@ use syscalls::Errno;
 use crate::fd::Fd;
 
 use core::pin::Pin;
-use core::task::{Context, Poll};
+use core::task::Context;
+use core::task::Poll;
 use std::io;
 use std::os::unix::io::AsRawFd;
 use tokio::io::unix::AsyncFd;

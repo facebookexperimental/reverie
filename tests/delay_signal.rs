@@ -15,13 +15,20 @@
 //! NB: restarted syscalls should not count, as syscall
 //! returning ERESTARTSYS could be automatically restarted
 
-use nix::sys::signal::{self, Signal};
-use reverie::{
-    syscalls::{Errno, Syscall, SyscallInfo, Sysno, Tgkill},
-    Error, Guest, Tool,
-};
-use serde::{Deserialize, Serialize};
-use tokio::time::{sleep, Duration};
+use nix::sys::signal::Signal;
+use nix::sys::signal::{self};
+use reverie::syscalls::Errno;
+use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallInfo;
+use reverie::syscalls::Sysno;
+use reverie::syscalls::Tgkill;
+use reverie::Error;
+use reverie::Guest;
+use reverie::Tool;
+use serde::Deserialize;
+use serde::Serialize;
+use tokio::time::sleep;
+use tokio::time::Duration;
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 struct LocalState;
@@ -134,8 +141,13 @@ impl Tool for LocalState {
 mod tests {
     use super::*;
     use reverie::ExitStatus;
-    use reverie_ptrace::testing::{check_fn, test_fn};
-    use std::{io, mem::MaybeUninit, sync::mpsc, thread, time};
+    use reverie_ptrace::testing::check_fn;
+    use reverie_ptrace::testing::test_fn;
+    use std::io;
+    use std::mem::MaybeUninit;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time;
 
     // kernel_sigset_t used by naked syscall
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]

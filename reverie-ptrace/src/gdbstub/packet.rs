@@ -31,11 +31,10 @@
  * SOFTWARE.
  */
 
-use super::{
-    commands::{Command, CommandParseError},
-    hex::*,
-    PacketLogger,
-};
+use super::commands::Command;
+use super::commands::CommandParseError;
+use super::hex::*;
+use super::PacketLogger;
 use bytes::BytesMut;
 use thiserror::Error;
 

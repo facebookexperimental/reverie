@@ -7,8 +7,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use crate::gdbstub::{commands::*, hex::*};
-use bytes::{Bytes, BytesMut};
+use crate::gdbstub::commands::*;
+use crate::gdbstub::hex::*;
+use bytes::Bytes;
+use bytes::BytesMut;
 
 #[derive(PartialEq, Debug)]
 pub struct qSupported {

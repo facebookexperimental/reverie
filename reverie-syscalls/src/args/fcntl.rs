@@ -9,7 +9,8 @@
 
 use std::os::unix::io::RawFd;
 
-use super::{Addr, Pid};
+use super::Addr;
+use super::Pid;
 use crate::FromToRaw;
 
 // TODO: Upstream this struct to libc crate.

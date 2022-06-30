@@ -25,11 +25,18 @@ use packet::Packet;
 
 pub mod response;
 
-pub use breakpoint::{Breakpoint, BreakpointType};
-pub use commands::{ResumeAction, StopEvent, StopReason};
+pub use breakpoint::Breakpoint;
+pub use breakpoint::BreakpointType;
+pub use commands::ResumeAction;
+pub use commands::StopEvent;
+pub use commands::StopReason;
 pub use error::Error;
-pub use inferior::{Inferior, InferiorThreadId, ResumeInferior, StoppedInferior};
-pub use regs::{Amd64CoreRegs, Amd64ExtraRegs};
+pub use inferior::Inferior;
+pub use inferior::InferiorThreadId;
+pub use inferior::ResumeInferior;
+pub use inferior::StoppedInferior;
+pub use regs::Amd64CoreRegs;
+pub use regs::Amd64ExtraRegs;
 pub use request::GdbRequest;
 pub use server::GdbServer;
 pub use session::Session;

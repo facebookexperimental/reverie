@@ -8,7 +8,11 @@
  */
 use std::os::unix::process::ExitStatusExt;
 
-use nix::sys::signal::{self, SigHandler, SigSet, SigmaskHow, Signal};
+use nix::sys::signal::SigHandler;
+use nix::sys::signal::SigSet;
+use nix::sys::signal::SigmaskHow;
+use nix::sys::signal::Signal;
+use nix::sys::signal::{self};
 
 /// Describes the result of a process after it has exited.
 ///
@@ -147,13 +151,12 @@ impl<'de> serde::Deserialize<'de> for ExitStatus {
 #[cfg(all(test, not(sanitized)))]
 mod tests_non_sanitized {
     use super::*;
-    use nix::{
-        sys::{
-            signal::{self, Signal},
-            wait::{waitpid, WaitStatus},
-        },
-        unistd::{fork, ForkResult},
-    };
+    use nix::sys::signal::Signal;
+    use nix::sys::signal::{self};
+    use nix::sys::wait::waitpid;
+    use nix::sys::wait::WaitStatus;
+    use nix::unistd::fork;
+    use nix::unistd::ForkResult;
 
     // Runs a closure in a forked process and reports the exit status.
     fn run_forked<F>(f: F) -> nix::Result<ExitStatus>

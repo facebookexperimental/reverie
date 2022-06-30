@@ -8,7 +8,8 @@
  */
 
 use reverie::Tool;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 struct LocalState;
@@ -20,13 +21,11 @@ impl Tool for LocalState {}
 mod tests {
     use super::*;
     use reverie_ptrace::testing::check_fn;
-    use std::{
-        sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc,
-        },
-        thread, time,
-    };
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time;
 
     #[test]
     fn run_guest_spinlock_test() {

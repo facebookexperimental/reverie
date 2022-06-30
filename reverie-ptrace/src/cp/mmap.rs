@@ -8,10 +8,10 @@
  */
 
 use super::consts::*;
-use nix::{
-    sys::uio::{self, IoVec, RemoteIoVec},
-    unistd::Pid,
-};
+use nix::sys::uio::IoVec;
+use nix::sys::uio::RemoteIoVec;
+use nix::sys::uio::{self};
+use nix::unistd::Pid;
 
 /// generate syscall instructions at injected page
 /// the page address should be 0x7000_0000 (PRIVATE_PAGE_OFFSET)

@@ -9,7 +9,8 @@
 
 //! Serialization support for timespec structs.
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 /// A serializable version of `libc::timespec`.
 #[derive(Serialize, Deserialize, Copy, Clone, Eq, PartialEq, Debug, Hash)]

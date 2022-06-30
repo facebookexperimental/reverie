@@ -8,25 +8,28 @@
  */
 use core::fmt;
 
-use crate::memory::{Addr, AddrMut, MemoryAccess};
+use crate::memory::Addr;
+use crate::memory::AddrMut;
+use crate::memory::MemoryAccess;
 use crate::Errno;
 
-use nix::{
-    fcntl::{AtFlags, OFlag},
-    sched::CloneFlags,
-    sys::{
-        epoll::EpollCreateFlags,
-        eventfd::EfdFlags,
-        inotify::InitFlags,
-        mman::{MapFlags, ProtFlags},
-        signalfd::SfdFlags,
-        socket::{AddressFamily, SockFlag, SockProtocol},
-        stat::{Mode, SFlag},
-        timerfd::TimerFlags,
-        wait::WaitPidFlag,
-    },
-    unistd::Pid,
-};
+use nix::fcntl::AtFlags;
+use nix::fcntl::OFlag;
+use nix::sched::CloneFlags;
+use nix::sys::epoll::EpollCreateFlags;
+use nix::sys::eventfd::EfdFlags;
+use nix::sys::inotify::InitFlags;
+use nix::sys::mman::MapFlags;
+use nix::sys::mman::ProtFlags;
+use nix::sys::signalfd::SfdFlags;
+use nix::sys::socket::AddressFamily;
+use nix::sys::socket::SockFlag;
+use nix::sys::socket::SockProtocol;
+use nix::sys::stat::Mode;
+use nix::sys::stat::SFlag;
+use nix::sys::timerfd::TimerFlags;
+use nix::sys::wait::WaitPidFlag;
+use nix::unistd::Pid;
 
 /// A wrapper that combines an address space and a syscall. This is useful for
 /// displaying the contents of syscall pointer inputs.

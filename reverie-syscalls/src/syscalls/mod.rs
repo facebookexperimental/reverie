@@ -9,34 +9,46 @@
 
 pub mod family;
 
-use crate::args::{
-    ioctl, ArchPrctlCmd, CArrayPtr, CStrPtr, ClockId, CloneArgs, FcntlCmd, PathPtr, PollFd,
-    StatPtr, StatxMask, StatxPtr, Timespec, Timeval, Timezone, Whence,
-};
+use crate::args::ioctl;
+use crate::args::ArchPrctlCmd;
+use crate::args::CArrayPtr;
+use crate::args::CStrPtr;
+use crate::args::ClockId;
+use crate::args::CloneArgs;
+use crate::args::FcntlCmd;
+use crate::args::PathPtr;
+use crate::args::PollFd;
+use crate::args::StatPtr;
+use crate::args::StatxMask;
+use crate::args::StatxPtr;
+use crate::args::Timespec;
+use crate::args::Timeval;
+use crate::args::Timezone;
+use crate::args::Whence;
 use crate::display::Displayable;
-use crate::memory::{Addr, AddrMut};
+use crate::memory::Addr;
+use crate::memory::AddrMut;
 use crate::raw::FromToRaw;
-use ::syscalls::{SyscallArgs, Sysno};
+use ::syscalls::SyscallArgs;
+use ::syscalls::Sysno;
 
 // FIXME: Switch everything over to `crate::args::CloneFlags`.
 use nix::sched::CloneFlags;
 
 // Re-export flags that used by syscalls from the `nix` crate so downstream
 // projects don't need to add another dependency on it.
-pub use nix::{
-    fcntl::{AtFlags, OFlag},
-    sys::{
-        epoll::EpollCreateFlags,
-        eventfd::EfdFlags,
-        inotify::InitFlags,
-        mman::{MapFlags, ProtFlags},
-        signalfd::SfdFlags,
-        socket::SockFlag,
-        stat::Mode,
-        timerfd::TimerFlags,
-        wait::WaitPidFlag,
-    },
-};
+pub use nix::fcntl::AtFlags;
+pub use nix::fcntl::OFlag;
+pub use nix::sys::epoll::EpollCreateFlags;
+pub use nix::sys::eventfd::EfdFlags;
+pub use nix::sys::inotify::InitFlags;
+pub use nix::sys::mman::MapFlags;
+pub use nix::sys::mman::ProtFlags;
+pub use nix::sys::signalfd::SfdFlags;
+pub use nix::sys::socket::SockFlag;
+pub use nix::sys::stat::Mode;
+pub use nix::sys::timerfd::TimerFlags;
+pub use nix::sys::wait::WaitPidFlag;
 
 /// A trait that all syscalls implement.
 pub trait SyscallInfo: Displayable + Copy + Send {
@@ -3273,11 +3285,15 @@ typed_syscall! {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::{Displayable, LocalMemory, ReadAddr};
+    use crate::Displayable;
+    use crate::LocalMemory;
+    use crate::ReadAddr;
 
-    use std::{ffi::CString, path::Path};
+    use std::ffi::CString;
+    use std::path::Path;
 
-    use syscalls::{SyscallArgs, Sysno};
+    use syscalls::SyscallArgs;
+    use syscalls::Sysno;
 
     #[test]
     fn test_syscall_open() {

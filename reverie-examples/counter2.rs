@@ -9,15 +9,23 @@
 
 //! An example that counts system calls using a simple, global state.
 
-use reverie::{
-    syscalls::{Syscall, SyscallInfo},
-    Error, ExitStatus, GlobalRPC, GlobalTool, Guest, Pid, Tid, Tool,
-};
+use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallInfo;
+use reverie::Error;
+use reverie::ExitStatus;
+use reverie::GlobalRPC;
+use reverie::GlobalTool;
+use reverie::Guest;
+use reverie::Pid;
+use reverie::Tid;
+use reverie::Tool;
 use reverie_util::CommonToolArguments;
 use structopt::StructOpt;
 
-use core::sync::atomic::{AtomicU64, Ordering};
-use serde::{Deserialize, Serialize};
+use core::sync::atomic::AtomicU64;
+use core::sync::atomic::Ordering;
+use serde::Deserialize;
+use serde::Serialize;
 use std::sync::Mutex;
 use tracing::debug;
 

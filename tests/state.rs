@@ -9,14 +9,21 @@
 
 //! Tests for process and thread state.
 
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Mutex,
-};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::sync::Mutex;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
-use reverie::{syscalls::Syscall, Error, ExitStatus, GlobalRPC, GlobalTool, Guest, Pid, Tool};
+use reverie::syscalls::Syscall;
+use reverie::Error;
+use reverie::ExitStatus;
+use reverie::GlobalRPC;
+use reverie::GlobalTool;
+use reverie::Guest;
+use reverie::Pid;
+use reverie::Tool;
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct GlobalState {

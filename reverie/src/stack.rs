@@ -12,7 +12,9 @@
 //! Allocation is done on stack, all allocated memory will (1) become usable after
 //! `commit`, and (2) be released when `StackGuard' is subsequently dropped.
 
-use reverie_syscalls::{Addr, AddrMut, Errno};
+use reverie_syscalls::Addr;
+use reverie_syscalls::AddrMut;
+use reverie_syscalls::Errno;
 
 /// A low-level stack which stores untyped (but Sized) values
 pub trait Stack {

@@ -9,15 +9,23 @@
 
 //! Tests for process and thread state.
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
-use reverie::{
-    syscalls::{
-        Addr, AddrMut, ExitGroup, MemoryAccess, Nanosleep, Syscall, SyscallInfo, Sysno, Timespec,
-        Uname,
-    },
-    Error, Guest, Stack, Tool,
-};
+use reverie::syscalls::Addr;
+use reverie::syscalls::AddrMut;
+use reverie::syscalls::ExitGroup;
+use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::Nanosleep;
+use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallInfo;
+use reverie::syscalls::Sysno;
+use reverie::syscalls::Timespec;
+use reverie::syscalls::Uname;
+use reverie::Error;
+use reverie::Guest;
+use reverie::Stack;
+use reverie::Tool;
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 struct LocalState;

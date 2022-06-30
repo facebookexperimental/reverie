@@ -13,16 +13,22 @@
 //! thread) instrumentation, though in some backends these will execute in the
 //! same process.
 
-use crate::{
-    error::{Errno, Error},
-    guest::Guest,
-    rdtsc::{Rdtsc, RdtscResult},
-    ExitStatus, Pid, Signal, Subscription, Tid,
-};
+use crate::error::Errno;
+use crate::error::Error;
+use crate::guest::Guest;
+use crate::rdtsc::Rdtsc;
+use crate::rdtsc::RdtscResult;
+use crate::ExitStatus;
+use crate::Pid;
+use crate::Signal;
+use crate::Subscription;
+use crate::Tid;
 use async_trait::async_trait;
-use raw_cpuid::{cpuid, CpuIdResult};
+use raw_cpuid::cpuid;
+use raw_cpuid::CpuIdResult;
 use reverie_syscalls::Syscall;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 
 /// The global half of a complete Reverie tool.
 ///

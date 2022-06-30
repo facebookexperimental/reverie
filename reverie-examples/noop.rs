@@ -10,9 +10,12 @@
 //! This instrumentation tool intercepts events but does nothing with them. It is
 //! useful for observing the overhead of interception, and as a starting point.
 
-use reverie::{Error, Subscription, Tool};
+use reverie::Error;
+use reverie::Subscription;
+use reverie::Tool;
 use reverie_util::CommonToolArguments;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 use structopt::StructOpt;
 
 #[derive(Debug, Default, Serialize, Deserialize)]

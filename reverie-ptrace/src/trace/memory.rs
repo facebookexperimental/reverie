@@ -13,7 +13,12 @@ use nix::sys::ptrace;
 use std::io;
 
 use super::Stopped;
-use reverie::syscalls::{Addr, AddrMut, AddrSlice, AddrSliceMut, Errno, MemoryAccess};
+use reverie::syscalls::Addr;
+use reverie::syscalls::AddrMut;
+use reverie::syscalls::AddrSlice;
+use reverie::syscalls::AddrSliceMut;
+use reverie::syscalls::Errno;
+use reverie::syscalls::MemoryAccess;
 
 impl Stopped {
     /// Does a read that is already page-aligned.
@@ -197,14 +202,13 @@ mod test {
 
     use std::ffi::CString;
 
-    use nix::{
-        sys::{
-            ptrace,
-            signal::{raise, Signal},
-            wait::{waitpid, WaitStatus},
-        },
-        unistd::{fork, ForkResult},
-    };
+    use nix::sys::ptrace;
+    use nix::sys::signal::raise;
+    use nix::sys::signal::Signal;
+    use nix::sys::wait::waitpid;
+    use nix::sys::wait::WaitStatus;
+    use nix::unistd::fork;
+    use nix::unistd::ForkResult;
     use quickcheck::QuickCheck;
     use quickcheck_macros::quickcheck;
 

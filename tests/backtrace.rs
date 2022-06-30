@@ -17,7 +17,8 @@ use reverie::ExitStatus;
 use reverie::Guest;
 use reverie::Tool;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 struct TestTool;

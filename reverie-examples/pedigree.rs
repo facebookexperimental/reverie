@@ -7,11 +7,18 @@
  * LICENSE file in the root directory of this source tree.
  */
 //! An example that tracks thread pedigree using local state
-use reverie::{syscalls::Syscall, Error, Guest, Pid, Tool};
-use reverie_util::{pedigree::Pedigree, CommonToolArguments};
-use serde::{Deserialize, Serialize};
+use reverie::syscalls::Syscall;
+use reverie::Error;
+use reverie::Guest;
+use reverie::Pid;
+use reverie::Tool;
+use reverie_util::pedigree::Pedigree;
+use reverie_util::CommonToolArguments;
+use serde::Deserialize;
+use serde::Serialize;
 use structopt::StructOpt;
-use tracing::{debug, trace};
+use tracing::debug;
+use tracing::trace;
 
 // TODO: Add handle pedigree forking, initialization, etc. to tool.
 // This tool is NOT FUNCTIONAL in its current state.

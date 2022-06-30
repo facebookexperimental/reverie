@@ -10,16 +10,21 @@ use super::ExitStatus;
 use super::Pid;
 
 use super::seccomp::SeccompNotif;
-use super::stdio::{ChildStderr, ChildStdin, ChildStdout, Stdio};
+use super::stdio::ChildStderr;
+use super::stdio::ChildStdin;
+use super::stdio::ChildStdout;
+use super::stdio::Stdio;
 use super::Command;
 
 use core::fmt;
 use core::future::Future;
 use core::pin::Pin;
-use core::task::{Context, Poll};
+use core::task::Context;
+use core::task::Poll;
 
 use nix::sys::signal::Signal;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 use std::io;
 use syscalls::Errno;
 
@@ -164,7 +169,8 @@ impl Child {
     /// or `stderr(Stdio::piped())`, respectively.
     pub async fn wait_with_output(mut self) -> io::Result<Output> {
         use futures::future::try_join3;
-        use tokio::io::{AsyncRead, AsyncReadExt};
+        use tokio::io::AsyncRead;
+        use tokio::io::AsyncReadExt;
 
         async fn read_to_end<A: AsyncRead + Unpin>(io: Option<A>) -> io::Result<Vec<u8>> {
             let mut vec = Vec::new();
@@ -232,7 +238,8 @@ struct WaitForChild<'a> {
 
 impl<'a> WaitForChild<'a> {
     fn new(child: &'a mut Child) -> io::Result<Self> {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::signal;
+        use tokio::signal::unix::SignalKind;
 
         Ok(Self {
             signal: signal(SignalKind::child())?,

@@ -64,22 +64,36 @@
 //! `AtomicWaker` can be used instead.) The downside of this approach is that we
 //! can end up spawning a lot of guest threads.
 
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::AtomicI32;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::task::{Context, Poll, Waker};
-use std::thread::{self, JoinHandle};
+use std::task::Context;
+use std::task::Poll;
+use std::task::Waker;
+use std::thread::JoinHandle;
+use std::thread::{self};
 
 use futures::task::AtomicWaker;
 use lazy_static::lazy_static;
-use nix::sys::wait::{WaitPidFlag, WaitStatus};
+use nix::sys::wait::WaitPidFlag;
+use nix::sys::wait::WaitStatus;
 use parking_lot::Mutex;
 
 use super::waitid;
-use crate::trace::{self, peek_all, Errno, Error, Pid, Running, Stopped, TryWait, Wait};
+use crate::trace::peek_all;
+use crate::trace::Errno;
+use crate::trace::Error;
+use crate::trace::Pid;
+use crate::trace::Running;
+use crate::trace::Stopped;
+use crate::trace::TryWait;
+use crate::trace::Wait;
+use crate::trace::{self};
 
 lazy_static! {
     static ref NOTIFIER: Notifier = Notifier::new();

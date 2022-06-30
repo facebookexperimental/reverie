@@ -7,24 +7,24 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use nix::{
-    fcntl::{AtFlags, OFlag},
-    sched::CloneFlags,
-    sys::{
-        epoll::EpollCreateFlags,
-        eventfd::EfdFlags,
-        inotify::InitFlags,
-        mman::{MapFlags, ProtFlags},
-        signalfd::SfdFlags,
-        socket::SockFlag,
-        stat::Mode,
-        timerfd::TimerFlags,
-        wait::WaitPidFlag,
-    },
-    unistd::Pid,
-};
+use nix::fcntl::AtFlags;
+use nix::fcntl::OFlag;
+use nix::sched::CloneFlags;
+use nix::sys::epoll::EpollCreateFlags;
+use nix::sys::eventfd::EfdFlags;
+use nix::sys::inotify::InitFlags;
+use nix::sys::mman::MapFlags;
+use nix::sys::mman::ProtFlags;
+use nix::sys::signalfd::SfdFlags;
+use nix::sys::socket::SockFlag;
+use nix::sys::stat::Mode;
+use nix::sys::timerfd::TimerFlags;
+use nix::sys::wait::WaitPidFlag;
+use nix::unistd::Pid;
 
-use crate::{Addr, AddrMut, Errno};
+use crate::Addr;
+use crate::AddrMut;
+use crate::Errno;
 
 /// Trait representing a raw value. Note that the assertion
 /// `assert_eq!(T::from_raw(x).into_raw(), x)` should hold true for every

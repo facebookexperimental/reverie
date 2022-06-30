@@ -9,7 +9,8 @@
 
 //! Serialization support for stat structs.
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 /// A serializable version of `libc::stat`.
 #[derive(Serialize, Deserialize, Copy, Clone, Eq, PartialEq, Debug)]

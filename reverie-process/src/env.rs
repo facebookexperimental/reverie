@@ -8,7 +8,9 @@
  */
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::ffi::{CString, OsStr, OsString};
+use std::ffi::CString;
+use std::ffi::OsStr;
+use std::ffi::OsString;
 
 use super::util::CStringArray;
 

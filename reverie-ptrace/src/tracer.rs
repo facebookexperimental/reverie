@@ -11,28 +11,41 @@
 
 use crate::cp;
 use crate::gdbstub::GdbServer;
-use crate::task::{Child, TracedTask};
-use crate::trace::{self, Error as TraceError, Event, Running, Stopped};
+use crate::task::Child;
+use crate::task::TracedTask;
+use crate::trace::Error as TraceError;
+use crate::trace::Event;
+use crate::trace::Running;
+use crate::trace::Stopped;
+use crate::trace::{self};
 
 use anyhow::Context;
-use futures::{
-    future::{self, BoxFuture, Either},
-    stream::StreamExt,
-};
-use nix::{
-    sys::{
-        ptrace,
-        signal::{self, Signal},
-    },
-    unistd::{self, ForkResult},
-};
-use tokio::sync::{broadcast, mpsc};
+use futures::future::BoxFuture;
+use futures::future::Either;
+use futures::future::{self};
+use futures::stream::StreamExt;
+use nix::sys::ptrace;
+use nix::sys::signal::Signal;
+use nix::sys::signal::{self};
+use nix::unistd::ForkResult;
+use nix::unistd::{self};
+use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 
 use reverie::process::seccomp;
-use reverie::process::{ChildStderr, ChildStdin, ChildStdout, Command, Output};
+use reverie::process::ChildStderr;
+use reverie::process::ChildStdin;
+use reverie::process::ChildStdout;
+use reverie::process::Command;
+use reverie::process::Output;
 use reverie::syscalls::Sysno;
+use reverie::Errno;
+use reverie::Error;
+use reverie::ExitStatus;
+use reverie::GlobalTool;
 use reverie::Pid;
-use reverie::{Errno, Error, ExitStatus, GlobalTool, Subscription, Tool};
+use reverie::Subscription;
+use reverie::Tool;
 
 use std::io::Write;
 use std::net::SocketAddr;
@@ -82,7 +95,8 @@ impl<G: Default> Tracer<G> {
     /// parent and child. Use `stdout(Stdio::piped())` or
     /// `stderr(Stdio::piped())`, respectively.
     pub async fn wait_with_output(mut self) -> Result<(Output, G), Error> {
-        use tokio::io::{AsyncRead, AsyncReadExt};
+        use tokio::io::AsyncRead;
+        use tokio::io::AsyncReadExt;
 
         async fn read_to_end<A: AsyncRead + Unpin>(io: Option<A>) -> Result<Vec<u8>, Error> {
             let mut vec = Vec::new();

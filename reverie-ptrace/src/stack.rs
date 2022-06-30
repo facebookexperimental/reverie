@@ -9,12 +9,14 @@
 use crate::trace::Error as TraceError;
 use crate::trace::Stopped;
 
+use reverie::syscalls::Addr;
+use reverie::syscalls::AddrMut;
 use reverie::syscalls::MemoryAccess;
-use reverie::syscalls::{Addr, AddrMut};
 use reverie::Errno;
 use reverie::Pid;
 use reverie::Stack;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 // NB: leaf function can use redzone without explicit stack allocation, as

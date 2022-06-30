@@ -9,7 +9,8 @@
 use crate::syscalls::Addr;
 use crate::Pid;
 
-use byteorder::{NativeEndian, ReadBytesExt};
+use byteorder::NativeEndian;
+use byteorder::ReadBytesExt;
 
 use std::collections::BTreeMap;
 use std::fs;

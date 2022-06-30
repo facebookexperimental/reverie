@@ -9,10 +9,13 @@
 
 //! Serialization support for poll-related enums and structs.
 
-use crate::{Displayable, FromToRaw, MemoryAccess};
+use crate::Displayable;
+use crate::FromToRaw;
+use crate::MemoryAccess;
 
 use core::fmt;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 /// A serializable version of `libc::pollfd`.
 #[derive(Serialize, Deserialize, Copy, Clone, Eq, PartialEq, Debug, Default)]

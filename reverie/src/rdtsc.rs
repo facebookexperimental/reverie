@@ -12,7 +12,8 @@
 use core::arch::x86_64::__rdtscp;
 use core::arch::x86_64::_rdtsc;
 use core::mem::MaybeUninit;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 /// Rdtsc/Rdtscp request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

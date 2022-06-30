@@ -439,7 +439,8 @@ fn next_page(addr: usize) -> usize {
 #[cfg(test)]
 mod test {
     use super::*;
-    use core::mem::{align_of, size_of};
+    use core::mem::align_of;
+    use core::mem::size_of;
 
     #[test]
     fn test_next_page() {

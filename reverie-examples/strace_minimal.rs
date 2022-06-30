@@ -6,12 +6,14 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
-use reverie::{
-    syscalls::{Displayable, Syscall},
-    Error, Guest, Tool,
-};
+use reverie::syscalls::Displayable;
+use reverie::syscalls::Syscall;
+use reverie::Error;
+use reverie::Guest;
+use reverie::Tool;
 use reverie_util::CommonToolArguments;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 use structopt::StructOpt;
 
 #[derive(Serialize, Deserialize, Default)]

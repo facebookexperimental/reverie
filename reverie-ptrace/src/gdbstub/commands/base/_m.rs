@@ -9,7 +9,8 @@
 
 use bytes::BytesMut;
 
-use crate::gdbstub::{commands::*, hex::*};
+use crate::gdbstub::commands::*;
+use crate::gdbstub::hex::*;
 
 #[derive(PartialEq, Debug)]
 pub struct m {

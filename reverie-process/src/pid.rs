@@ -8,7 +8,8 @@
  */
 use core::fmt;
 use core::hash::Hash;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 /// A process ID (PID).
 #[derive(

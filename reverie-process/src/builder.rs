@@ -8,11 +8,13 @@
  */
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 
 use syscalls::Errno;
 

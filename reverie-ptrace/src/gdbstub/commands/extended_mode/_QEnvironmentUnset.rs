@@ -7,7 +7,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use crate::gdbstub::{commands::*, hex::*};
+use crate::gdbstub::commands::*;
+use crate::gdbstub::hex::*;
 use bytes::Bytes;
 
 pub struct QEnvironmentUnset {

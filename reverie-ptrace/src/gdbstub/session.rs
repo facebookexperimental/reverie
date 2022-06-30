@@ -7,13 +7,16 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
+use bytes::BytesMut;
 use futures::future::Future;
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::stream::FuturesUnordered;
+use futures::stream::StreamExt;
 use nix::fcntl;
 use nix::fcntl::OFlag;
 use nix::sys::signal::Signal;
-use nix::sys::stat::{self, Mode};
+use nix::sys::stat::Mode;
+use nix::sys::stat::{self};
 use nix::sys::uio;
 use nix::unistd;
 use reverie::Pid;
@@ -28,7 +31,8 @@ use tokio::sync::MutexGuard;
 
 use crate::trace::ChildOp;
 
-use super::commands::{self, *};
+use super::commands::*;
+use super::commands::{self};
 use super::regs::Amd64CoreRegs;
 use super::response::*;
 use super::Breakpoint;

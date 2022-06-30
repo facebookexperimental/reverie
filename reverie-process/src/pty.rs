@@ -6,14 +6,18 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
-use super::fd::{AsyncFd, Fd};
+use super::fd::AsyncFd;
+use super::fd::Fd;
 
 use syscalls::Errno;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::AsyncRead;
+use tokio::io::AsyncWrite;
+use tokio::io::ReadBuf;
 
 use core::mem::MaybeUninit;
 use core::pin::Pin;
-use core::task::{Context, Poll};
+use core::task::Context;
+use core::task::Poll;
 
 use std::io;
 use std::os::unix::io::AsRawFd;

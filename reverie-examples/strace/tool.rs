@@ -10,10 +10,22 @@
 use crate::config::Config;
 use crate::global_state::GlobalState;
 
-use reverie::syscalls::{Displayable, Errno, Syscall, SyscallInfo};
-use reverie::{Error, ExitStatus, GlobalRPC, Guest, Pid, Signal, Subscription, Tid, Tool};
+use reverie::syscalls::Displayable;
+use reverie::syscalls::Errno;
+use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallInfo;
+use reverie::Error;
+use reverie::ExitStatus;
+use reverie::GlobalRPC;
+use reverie::Guest;
+use reverie::Pid;
+use reverie::Signal;
+use reverie::Subscription;
+use reverie::Tid;
+use reverie::Tool;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 // Strace has no need for process-level state, so this is a unit struct.
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]

@@ -8,9 +8,13 @@
  */
 use super::clone::clone_with_stack;
 use super::env::Env;
-use super::error::{AddContext, Context, Error};
+use super::error::AddContext;
+use super::error::Context;
+use super::error::Error;
 use super::exit_status::ExitStatus;
-use super::fd::{pipe, write_bytes, Fd};
+use super::fd::pipe;
+use super::fd::write_bytes;
+use super::fd::Fd;
 use super::id_map::make_id_map;
 use super::mount::Mount;
 use super::namespace::Namespace;
@@ -22,7 +26,8 @@ use super::stdio::Stdio;
 use super::util::reset_signal_handling;
 use super::util::to_cstring;
 
-use nix::sched::{sched_setaffinity, CpuSet};
+use nix::sched::sched_setaffinity;
+use nix::sched::CpuSet;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use syscalls::Errno;

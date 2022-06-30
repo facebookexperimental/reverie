@@ -9,13 +9,19 @@
 
 //! An example that counts system calls using a simple, global state.
 
-use reverie::{
-    syscalls::{Syscall, SyscallInfo, Sysno},
-    Error, GlobalTool, Guest, Pid, Tool,
-};
+use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallInfo;
+use reverie::syscalls::Sysno;
+use reverie::Error;
+use reverie::GlobalTool;
+use reverie::Guest;
+use reverie::Pid;
+use reverie::Tool;
 use reverie_util::CommonToolArguments;
-use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
+use serde::Deserialize;
+use serde::Serialize;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use structopt::StructOpt;
 
 #[derive(Debug, Serialize, Deserialize, Default)]

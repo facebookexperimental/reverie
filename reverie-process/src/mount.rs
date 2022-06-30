@@ -6,7 +6,9 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
-use super::fd::{create_dir_all, touch_path, FileType};
+use super::fd::create_dir_all;
+use super::fd::touch_path;
+use super::fd::FileType;
 use super::util;
 
 use core::convert::Infallible;
@@ -15,7 +17,8 @@ use core::ptr;
 use core::str::FromStr;
 
 use std::collections::HashMap;
-use std::ffi::{CString, OsStr};
+use std::ffi::CString;
+use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 

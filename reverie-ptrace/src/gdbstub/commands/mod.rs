@@ -33,18 +33,29 @@
 
 #![allow(non_snake_case, non_camel_case_types, dead_code, unused_imports)]
 
-use crate::gdbstub::{
-    hex::*, request::*, response::*, BreakpointType, Inferior, InferiorThreadId, ResumeInferior,
-    StoppedInferior,
-};
-use crate::trace::{ChildOp, Stopped};
-use bytes::{Bytes, BytesMut};
+use crate::gdbstub::hex::*;
+use crate::gdbstub::request::*;
+use crate::gdbstub::response::*;
+use crate::gdbstub::BreakpointType;
+use crate::gdbstub::Inferior;
+use crate::gdbstub::InferiorThreadId;
+use crate::gdbstub::ResumeInferior;
+use crate::gdbstub::StoppedInferior;
+use crate::trace::ChildOp;
+use crate::trace::Stopped;
+use bytes::Bytes;
+use bytes::BytesMut;
 use paste::paste;
-use std::{collections::BTreeMap, path::PathBuf};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use thiserror::Error;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::broadcast;
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 
-use reverie::{ExitStatus, Pid, Signal};
+use reverie::ExitStatus;
+use reverie::Pid;
+use reverie::Signal;
 
 mod base;
 mod extended_mode;

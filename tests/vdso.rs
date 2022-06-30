@@ -7,11 +7,15 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use reverie::{
-    syscalls::{Errno, MemoryAccess, Syscall, Timespec},
-    Error, Guest, Tool,
-};
-use serde::{Deserialize, Serialize};
+use reverie::syscalls::Errno;
+use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::Syscall;
+use reverie::syscalls::Timespec;
+use reverie::Error;
+use reverie::Guest;
+use reverie::Tool;
+use serde::Deserialize;
+use serde::Serialize;
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 struct LocalState;
@@ -63,7 +67,8 @@ impl Tool for LocalState {
 mod tests {
     use super::*;
     use reverie_ptrace::testing::check_fn;
-    use std::{mem::MaybeUninit, time};
+    use std::mem::MaybeUninit;
+    use std::time;
 
     #[test]
     #[should_panic]

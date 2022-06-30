@@ -9,9 +9,12 @@
 
 //! This instrumentation tool does nothing except acting as a gdbserver.
 
-use reverie::{Error, Subscription, Tool};
+use reverie::Error;
+use reverie::Subscription;
+use reverie::Tool;
 use reverie_util::CommonToolArguments;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 use structopt::StructOpt;
 
 #[derive(Debug, Default, Serialize, Deserialize)]

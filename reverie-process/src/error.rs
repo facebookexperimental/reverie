@@ -8,7 +8,8 @@
  */
 use core::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 use syscalls::Errno;
 
 /// Context associated with [`Error`]. Useful for knowing which particular part

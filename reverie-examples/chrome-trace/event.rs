@@ -14,7 +14,8 @@ use reverie::Errno;
 use reverie::ExitStatus;
 use reverie::Pid;
 use reverie::Tid;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 use serde_json::json;
 
 /// A message sent to the global state whenever a thread shuts down.

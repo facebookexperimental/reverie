@@ -12,44 +12,83 @@
 use crate::children;
 use crate::cp;
 use crate::error::Error;
-use crate::gdbstub::{
-    Amd64CoreRegs, BreakpointType, GdbRequest, GdbServer, ResumeAction, ResumeInferior, StopEvent,
-    StopReason, StoppedInferior,
-};
+use crate::gdbstub::Amd64CoreRegs;
+use crate::gdbstub::BreakpointType;
+use crate::gdbstub::GdbRequest;
+use crate::gdbstub::GdbServer;
+use crate::gdbstub::ResumeAction;
+use crate::gdbstub::ResumeInferior;
+use crate::gdbstub::StopEvent;
+use crate::gdbstub::StopReason;
+use crate::gdbstub::StoppedInferior;
 use crate::stack::GuestStack;
-use crate::timer::{HandleFailure, Timer, TimerEventRequest};
-use crate::trace::{ChildOp, Error as TraceError, Event, Running, Stopped, Wait};
+use crate::timer::HandleFailure;
+use crate::timer::Timer;
+use crate::timer::TimerEventRequest;
+use crate::trace::ChildOp;
+use crate::trace::Error as TraceError;
+use crate::trace::Event;
+use crate::trace::Running;
+use crate::trace::Stopped;
+use crate::trace::Wait;
 use crate::vdso;
 
 use async_trait::async_trait;
-use futures::future::{self, Either, Future, FutureExt, TryFutureExt};
-use nix::sys::{mman::ProtFlags, signal::Signal};
-use reverie::{
-    syscalls::{
-        Addr, AddrMut, ArchPrctl, ArchPrctlCmd, MemoryAccess, Mprotect, Syscall, SyscallArgs,
-        SyscallInfo, Sysno,
-    },
-    Backtrace, Errno, ExitStatus, Frame, GlobalRPC, GlobalTool, Guest, Pid, Rdtsc, Subscription,
-    Symbol, Tid, TimerSchedule, Tool,
-};
-use std::{
-    collections::{BTreeMap, HashMap},
-    fmt,
-    ops::DerefMut,
-    pin::Pin,
-    sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
-    },
-    task::{Context, Poll},
-};
-use tracing::{debug, info, trace, warn};
+use futures::future::Either;
+use futures::future::Future;
+use futures::future::FutureExt;
+use futures::future::TryFutureExt;
+use futures::future::{self};
+use nix::sys::mman::ProtFlags;
+use nix::sys::signal::Signal;
+use reverie::syscalls::Addr;
+use reverie::syscalls::AddrMut;
+use reverie::syscalls::ArchPrctl;
+use reverie::syscalls::ArchPrctlCmd;
+use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::Mprotect;
+use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallArgs;
+use reverie::syscalls::SyscallInfo;
+use reverie::syscalls::Sysno;
+use reverie::Backtrace;
+use reverie::Errno;
+use reverie::ExitStatus;
+use reverie::Frame;
+use reverie::GlobalRPC;
+use reverie::GlobalTool;
+use reverie::Guest;
+use reverie::Pid;
+use reverie::Rdtsc;
+use reverie::Subscription;
+use reverie::Symbol;
+use reverie::Tid;
+use reverie::TimerSchedule;
+use reverie::Tool;
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::fmt;
+use std::ops::DerefMut;
+use std::pin::Pin;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::task::Context;
+use std::task::Poll;
+use tracing::debug;
+use tracing::info;
+use tracing::trace;
+use tracing::warn;
 
 use libc::user_regs_struct;
-use tokio::{
-    sync::{broadcast, mpsc, oneshot, Mutex, Notify},
-    task::{JoinError, JoinHandle},
-};
+use tokio::sync::broadcast;
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+use tokio::sync::Mutex;
+use tokio::sync::Notify;
+use tokio::task::JoinError;
+use tokio::task::JoinHandle;
 
 #[derive(Debug)]
 struct Suspended {
@@ -2082,7 +2121,12 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
     }
 
     fn backtrace(&mut self) -> Option<Backtrace> {
-        use unwind::{Accessors, AddressSpace, Byteorder, Cursor, PTraceState, RegNum};
+        use unwind::Accessors;
+        use unwind::AddressSpace;
+        use unwind::Byteorder;
+        use unwind::Cursor;
+        use unwind::PTraceState;
+        use unwind::RegNum;
 
         let mut frames = Vec::new();
 

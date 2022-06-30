@@ -8,8 +8,10 @@
  */
 #![feature(get_mut_unchecked)]
 #![feature(thread_id_value)]
-use reverie::{Error, Tool};
-use serde::{Deserialize, Serialize};
+use reverie::Error;
+use reverie::Tool;
+use serde::Deserialize;
+use serde::Serialize;
 use std::env;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;

@@ -6,8 +6,14 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
-use reverie::{syscalls::MemoryAccess, Errno, Error, ExitStatus, Guest, Tool};
-use serde::{Deserialize, Serialize};
+use reverie::syscalls::MemoryAccess;
+use reverie::Errno;
+use reverie::Error;
+use reverie::ExitStatus;
+use reverie::Guest;
+use reverie::Tool;
+use serde::Deserialize;
+use serde::Serialize;
 use std::env;
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]

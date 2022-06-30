@@ -9,9 +9,14 @@
 
 //! Everything related to ioctl arguments.
 
-use crate::{Addr, AddrMut, Errno, FromToRaw, MemoryAccess};
+use crate::Addr;
+use crate::AddrMut;
+use crate::Errno;
+use crate::FromToRaw;
+use crate::MemoryAccess;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 /// The type of ioctl from the perspective of userspace. That is, whether
 /// userspace is reading, writing, or doing nothing.

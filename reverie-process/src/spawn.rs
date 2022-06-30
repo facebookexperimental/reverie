@@ -7,11 +7,15 @@
  * LICENSE file in the root directory of this source tree.
  */
 use super::clone::clone;
-use super::error::{Context, Error};
-use super::fd::{pipe, Fd};
+use super::error::Context;
+use super::error::Error;
+use super::fd::pipe;
+use super::fd::Fd;
 use super::id_map::make_id_map;
 use super::seccomp::SeccompNotif;
-use super::stdio::{ChildStderr, ChildStdin, ChildStdout};
+use super::stdio::ChildStderr;
+use super::stdio::ChildStdin;
+use super::stdio::ChildStdout;
 use super::util::CStringArray;
 use super::util::SharedValue;
 use super::Child;

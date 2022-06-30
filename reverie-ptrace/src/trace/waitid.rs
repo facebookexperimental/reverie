@@ -15,10 +15,9 @@
 //! NB: `waitid` here provide a similar interface as `nix`'s `waitpid`.
 
 use super::Errno;
-use nix::sys::{
-    signal::Signal,
-    wait::{WaitPidFlag, WaitStatus},
-};
+use nix::sys::signal::Signal;
+use nix::sys::wait::WaitPidFlag;
+use nix::sys::wait::WaitStatus;
 use nix::unistd::Pid;
 
 use std::mem::MaybeUninit;
@@ -148,11 +147,10 @@ pub fn waitid(waitid_type: IdType, flags: WaitPidFlag) -> Result<WaitStatus, Err
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nix::{
-        sys::signal::Signal,
-        sys::wait::WaitPidFlag,
-        unistd::{self, ForkResult},
-    };
+    use nix::sys::signal::Signal;
+    use nix::sys::wait::WaitPidFlag;
+    use nix::unistd::ForkResult;
+    use nix::unistd::{self};
 
     #[test]
     fn waitid_w_exited_0() {

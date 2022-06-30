@@ -6,10 +6,13 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
-use crate::{Displayable, FromToRaw, MemoryAccess};
+use crate::Displayable;
+use crate::FromToRaw;
+use crate::MemoryAccess;
 
 use core::fmt;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 bitflags::bitflags! {
     /// Flags used with the `clone`, `clone3`, or `unshare` syscalls.

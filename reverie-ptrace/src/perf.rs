@@ -23,17 +23,19 @@
 //! [`PerfCounter::DISABLE_SAMPLE_PERIOD`] can be used to avoid this for sampling.
 //! events.
 
-use crate::validation::{check_for_pmu_bugs, PmuValidationError};
+use crate::validation::check_for_pmu_bugs;
+use crate::validation::PmuValidationError;
 use core::ptr::NonNull;
 use lazy_static::lazy_static;
-use nix::{
-    sys::signal::Signal,
-    unistd::{sysconf, SysconfVar},
-};
-use perf_event_open_sys::{bindings as perf, ioctls};
+use nix::sys::signal::Signal;
+use nix::unistd::sysconf;
+use nix::unistd::SysconfVar;
+use perf_event_open_sys::bindings as perf;
+use perf_event_open_sys::ioctls;
 use reverie::Errno;
 use reverie::Tid;
-use tracing::{info, warn};
+use tracing::info;
+use tracing::warn;
 
 #[allow(unused_imports)] // only used if we have an error
 use std::compile_error;
@@ -492,7 +494,8 @@ fn get_mmap_size() -> usize {
 #[inline(always)]
 #[deny(unsafe_op_in_unsafe_fn)]
 unsafe fn read_once(v: *mut u32) -> u32 {
-    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::Ordering::Relaxed;
     // SAFETY: AtomicU32 is guaranteed to have the same in-memory representation
     // SAFETY: The UnsafeCell inside AtomicU32 allows aliasing with *mut
     // SAFETY: The reference doesn't escape this function, so any lifetime is ok
@@ -503,7 +506,8 @@ unsafe fn read_once(v: *mut u32) -> u32 {
 #[inline(always)]
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn smp_rmb() {
-    use std::sync::atomic::{compiler_fence, Ordering::SeqCst};
+    use std::sync::atomic::compiler_fence;
+    use std::sync::atomic::Ordering::SeqCst;
     compiler_fence(SeqCst);
 }
 

@@ -11,7 +11,8 @@ use std::marker::Unpin;
 use std::mem;
 use std::pin::Pin;
 use std::slice;
-use std::task::{Context, Poll};
+use std::task::Context;
+use std::task::Poll;
 
 use futures::future::FutureExt;
 

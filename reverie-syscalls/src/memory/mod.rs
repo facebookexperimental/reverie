@@ -14,7 +14,10 @@ use core::mem;
 use std::ffi::CString;
 use std::io;
 
-pub use addr::{Addr, AddrMut, AddrSlice, AddrSliceMut};
+pub use addr::Addr;
+pub use addr::AddrMut;
+pub use addr::AddrSlice;
+pub use addr::AddrSliceMut;
 pub use local::LocalMemory;
 
 use crate::Errno;

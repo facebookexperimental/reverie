@@ -9,11 +9,19 @@
 
 //! Tests surrounding exit logic.
 
-use reverie::{
-    syscalls::{self, Syscall, SyscallInfo, Sysno},
-    Error, ExitStatus, GlobalRPC, GlobalTool, Guest, Pid, Tool,
-};
-use serde::{Deserialize, Serialize};
+use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallInfo;
+use reverie::syscalls::Sysno;
+use reverie::syscalls::{self};
+use reverie::Error;
+use reverie::ExitStatus;
+use reverie::GlobalRPC;
+use reverie::GlobalTool;
+use reverie::Guest;
+use reverie::Pid;
+use reverie::Tool;
+use serde::Deserialize;
+use serde::Serialize;
 use std::sync::Mutex;
 
 #[derive(Debug, Serialize, Deserialize, Default)]

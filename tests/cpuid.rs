@@ -11,9 +11,15 @@
 
 use raw_cpuid::CpuIdResult;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
-use reverie::{Errno, GlobalTool, Guest, Pid, Subscription, Tool};
+use reverie::Errno;
+use reverie::GlobalTool;
+use reverie::Guest;
+use reverie::Pid;
+use reverie::Subscription;
+use reverie::Tool;
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 struct GlobalState {

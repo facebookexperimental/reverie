@@ -34,4 +34,6 @@ pub use crate::raw::*;
 pub use crate::syscalls::*;
 
 // Re-export the only things that might be needed from the syscalls crate
-pub use ::syscalls::{Errno, SyscallArgs, Sysno};
+pub use ::syscalls::Errno;
+pub use ::syscalls::SyscallArgs;
+pub use ::syscalls::Sysno;

@@ -7,7 +7,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use anyhow::{bail, Error};
+use anyhow::bail;
+use anyhow::Error;
 use futures::future;
 use structopt::StructOpt;
 use tempfile::TempDir;

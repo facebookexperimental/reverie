@@ -7,14 +7,19 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use crate::perf::{do_branches, PerfCounter};
-use crate::timer::{get_rcb_perf_config, AMD_VENDOR, INTEL_VENDOR};
+use crate::perf::do_branches;
+use crate::perf::PerfCounter;
+use crate::timer::get_rcb_perf_config;
+use crate::timer::AMD_VENDOR;
+use crate::timer::INTEL_VENDOR;
 use core::mem;
 use perf_event_open_sys::bindings as perf;
-use raw_cpuid::{CpuId, FeatureInfo};
+use raw_cpuid::CpuId;
+use raw_cpuid::FeatureInfo;
 use reverie::Errno;
 use thiserror::Error;
-use tracing::{error, warn};
+use tracing::error;
+use tracing::warn;
 
 const IN_TXCP: u64 = 1 << 33;
 const NUM_BRANCHES: u64 = 500;

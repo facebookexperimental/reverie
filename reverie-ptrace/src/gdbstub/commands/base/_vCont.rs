@@ -11,7 +11,8 @@ use bytes::BytesMut;
 
 use nix::sys::signal::Signal;
 
-use crate::gdbstub::{commands::*, hex::*};
+use crate::gdbstub::commands::*;
+use crate::gdbstub::hex::*;
 
 #[derive(PartialEq, Debug)]
 pub enum vCont {

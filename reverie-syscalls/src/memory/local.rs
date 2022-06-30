@@ -7,10 +7,14 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
+use std::ffi::CString;
 use std::io;
 
-use super::{Addr, AddrMut, Errno, MemoryAccess};
+use super::Addr;
+use super::AddrMut;
+use super::Errno;
+use super::MemoryAccess;
 
 /// A local address space.
 #[derive(Default, Debug)]
