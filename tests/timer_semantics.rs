@@ -176,7 +176,7 @@ impl Tool for LocalState {
     }
 
     async fn handle_timer_event<T: Guest<Self>>(&self, guest: &mut T) {
-        guest.send_rpc(IncrMsg::Timer).await.unwrap();
+        guest.send_rpc(IncrMsg::Timer).await;
         let clock_value = guest.read_clock().unwrap();
         let ts = guest.thread_state();
         if let Some(val) = ts.timer_assertion {
@@ -189,7 +189,7 @@ impl Tool for LocalState {
         guest: &mut T,
         signal: Signal,
     ) -> Result<Option<Signal>, Errno> {
-        guest.send_rpc(IncrMsg::Signal).await.unwrap();
+        guest.send_rpc(IncrMsg::Signal).await;
         Ok(Some(signal))
     }
 }

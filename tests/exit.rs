@@ -57,7 +57,7 @@ impl Tool for InjectExitTool {
         global_state: &G,
         exit_status: ExitStatus,
     ) -> Result<(), Error> {
-        global_state.send_rpc(exit_status).await?;
+        global_state.send_rpc(exit_status).await;
         Ok(())
     }
 

@@ -84,7 +84,7 @@ impl Tool for TestTool {
     ) -> Result<(), Error> {
         global_state
             .send_rpc(self.threads.into_inner().unwrap())
-            .await?;
+            .await;
         Ok(())
     }
 

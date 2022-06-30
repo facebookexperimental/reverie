@@ -70,7 +70,7 @@ impl Tool for LocalState {
         guest: &mut T,
         request: Rdtsc,
     ) -> Result<RdtscResult, Errno> {
-        let tsc = guest.send_rpc(request).await.unwrap();
+        let tsc = guest.send_rpc(request).await;
         println!("handle_rdtsc: returned {:?}", tsc);
         Ok(tsc)
     }

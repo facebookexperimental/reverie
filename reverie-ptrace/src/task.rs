@@ -2173,7 +2173,7 @@ impl<L: Tool + 'static> GlobalRPC<L::GlobalState> for TracedTask<L> {
     async fn send_rpc<'a>(
         &'a self,
         args: <L::GlobalState as GlobalTool>::Request,
-    ) -> Result<<L::GlobalState as GlobalTool>::Response, reverie::Error> {
+    ) -> <L::GlobalState as GlobalTool>::Response {
         let wrapped = WrappedFrom(self.tid(), &self.global_state);
         wrapped.send_rpc(args).await
     }
@@ -2189,7 +2189,7 @@ struct WrappedFrom<'a, G: GlobalTool>(Tid, &'a GlobalState<G>);
 
 #[async_trait]
 impl<'a, G: GlobalTool> GlobalRPC<G> for WrappedFrom<'a, G> {
-    async fn send_rpc(&self, args: G::Request) -> Result<G::Response, reverie::Error> {
+    async fn send_rpc(&self, args: G::Request) -> G::Response {
         // In debugging mode we round-trip through a serialized representation
         // to make sure it works.
         let deserial = if cfg!(debug_assertions) {
@@ -2198,8 +2198,7 @@ impl<'a, G: GlobalTool> GlobalRPC<G> for WrappedFrom<'a, G> {
         } else {
             args
         };
-        let x = self.1.gs_ref.receive_rpc(self.0, deserial).await;
-        Ok(x)
+        self.1.gs_ref.receive_rpc(self.0, deserial).await
     }
     fn config(&self) -> &G::Config {
         &self.1.cfg

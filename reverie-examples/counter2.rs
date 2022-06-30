@@ -142,7 +142,7 @@ impl Tool for CounterLocal {
             "At ExitProc (pid {}), contributing {} to global count.",
             pid, count
         );
-        let _ = global_state.send_rpc(IncrMsg(count, threads)).await?;
+        let _ = global_state.send_rpc(IncrMsg(count, threads)).await;
         Ok(())
     }
 }

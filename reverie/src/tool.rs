@@ -323,7 +323,7 @@ impl Tool for () {
 pub trait GlobalRPC<G: GlobalTool>: Sync {
     /// Send an RPC message to wherever the global state is stored, synchronously
     /// blocks the current thread until a response is received.
-    async fn send_rpc(&self, message: G::Request) -> Result<G::Response, Error>;
+    async fn send_rpc(&self, message: G::Request) -> G::Response;
 
     /// Return the read-only tool configuration
     fn config(&self) -> &G::Config;

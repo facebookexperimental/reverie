@@ -101,12 +101,12 @@ impl Tool for LocalState {
     type GlobalState = GlobalState;
 
     async fn handle_thread_start<T: Guest<Self>>(&self, guest: &mut T) -> Result<(), Error> {
-        guest.send_rpc(IncrMsg::Increment).await.unwrap();
+        guest.send_rpc(IncrMsg::Increment).await;
         Ok(())
     }
 
     async fn handle_post_exec<T: Guest<Self>>(&self, guest: &mut T) -> Result<(), Errno> {
-        guest.send_rpc(IncrMsg::Increment).await.unwrap();
+        guest.send_rpc(IncrMsg::Increment).await;
         Ok(())
     }
 
@@ -117,12 +117,12 @@ impl Tool for LocalState {
     ) -> Result<i64, Error> {
         if let Syscall::ClockGetres(_) = syscall {
             // clock_getres denotes the start/end of the busywait
-            guest.send_rpc(IncrMsg::ToggleCollection).await?;
+            guest.send_rpc(IncrMsg::ToggleCollection).await;
             if guest.config().set_timer {
                 guest.set_timer_precise(TIMEOUT).unwrap();
             }
         } else {
-            guest.send_rpc(IncrMsg::Increment).await?;
+            guest.send_rpc(IncrMsg::Increment).await;
         }
         guest.tail_inject(syscall).await
     }
@@ -133,7 +133,7 @@ impl Tool for LocalState {
         eax: u32,
         ecx: u32,
     ) -> Result<CpuIdResult, Errno> {
-        guest.send_rpc(IncrMsg::Increment).await.unwrap();
+        guest.send_rpc(IncrMsg::Increment).await;
         Ok(cpuid!(eax, ecx))
     }
 
@@ -142,7 +142,7 @@ impl Tool for LocalState {
         guest: &mut T,
         request: Rdtsc,
     ) -> Result<RdtscResult, Errno> {
-        guest.send_rpc(IncrMsg::Increment).await.unwrap();
+        guest.send_rpc(IncrMsg::Increment).await;
         Ok(RdtscResult::new(request))
     }
 
@@ -151,12 +151,12 @@ impl Tool for LocalState {
         guest: &mut T,
         signal: Signal,
     ) -> Result<Option<Signal>, Errno> {
-        guest.send_rpc(IncrMsg::Increment).await.unwrap();
+        guest.send_rpc(IncrMsg::Increment).await;
         Ok(Some(signal))
     }
 
     async fn handle_timer_event<T: Guest<Self>>(&self, guest: &mut T) {
-        guest.send_rpc(IncrMsg::TimerEvent).await.unwrap();
+        guest.send_rpc(IncrMsg::TimerEvent).await;
         guest.set_timer_precise(TIMEOUT).unwrap();
     }
 
@@ -167,7 +167,7 @@ impl Tool for LocalState {
         _thread_state: Self::ThreadState,
         _exit_status: ExitStatus,
     ) -> Result<(), Error> {
-        global_state.send_rpc(IncrMsg::Increment).await?;
+        global_state.send_rpc(IncrMsg::Increment).await;
         Ok(())
     }
 
@@ -177,7 +177,7 @@ impl Tool for LocalState {
         global_state: &G,
         _exit_status: ExitStatus,
     ) -> Result<(), Error> {
-        global_state.send_rpc(IncrMsg::Increment).await?;
+        global_state.send_rpc(IncrMsg::Increment).await;
         Ok(())
     }
 }

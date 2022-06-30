@@ -280,7 +280,7 @@ where
     async fn send_rpc(
         &self,
         message: <U::GlobalState as GlobalTool>::Request,
-    ) -> Result<<U::GlobalState as GlobalTool>::Response, Error> {
+    ) -> <U::GlobalState as GlobalTool>::Response {
         self.inner.send_rpc(message).await
     }
 

@@ -66,7 +66,7 @@ impl Tool for TestTool {
             eprintln!("Root thread starting...");
         } else {
             eprintln!("Delaying child thread!");
-            guest.send_rpc(()).await.unwrap();
+            guest.send_rpc(()).await;
             eprintln!("Done delaying child thread!");
         }
         Ok(())

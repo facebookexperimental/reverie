@@ -86,7 +86,7 @@ impl Tool for CounterLocal {
         syscall: Syscall,
     ) -> Result<i64, Error> {
         let sysno = syscall.number();
-        let _ = guest.send_rpc(IncrMsg(sysno)).await?;
+        let _ = guest.send_rpc(IncrMsg(sysno)).await;
         guest.tail_inject(syscall).await
     }
 }

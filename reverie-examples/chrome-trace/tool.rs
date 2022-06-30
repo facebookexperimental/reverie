@@ -156,7 +156,7 @@ impl Tool for ChromeTrace {
                 events: thread_state.events,
                 exit_status,
             })
-            .await?;
+            .await;
 
         Ok(())
     }
