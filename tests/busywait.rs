@@ -36,8 +36,6 @@ use serde::Serialize;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
-use std::time::Instant;
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct GlobalState {
@@ -194,6 +192,9 @@ mod tests {
     use super::*;
     use reverie_ptrace::testing::check_fn_with_config;
     use reverie_ptrace::testing::do_branches;
+
+    use std::time::Duration;
+    use std::time::Instant;
 
     #[test]
     fn guest_busywait_no_timer() {
