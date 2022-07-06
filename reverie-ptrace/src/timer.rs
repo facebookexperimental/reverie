@@ -36,7 +36,6 @@ use crate::trace::Event as TraceEvent;
 use crate::trace::Stopped;
 use crate::trace::Wait;
 use raw_cpuid::CpuId;
-use raw_cpuid::FeatureInfo;
 use reverie::Errno;
 use reverie::Pid;
 use reverie::Signal;
@@ -51,45 +50,11 @@ const MARKER_SIGNAL: Signal = reverie::PERF_EVENT_SIGNAL;
 pub(crate) const AMD_VENDOR: &str = "AuthenticAMD";
 pub(crate) const INTEL_VENDOR: &str = "GenuineIntel";
 
-// This done in .(model|family)_id() directly in raw_cpuid v10. This can
-// then be replaced with those calls, but that means this will also break!
-fn full_family_model(vendor: &str, fi: &FeatureInfo) -> (u8, u8) {
-    let base_family_id = fi.family_id();
-    let base_model_id = fi.model_id();
-    let extended_model_id = fi.extended_model_id();
-    let extended_family_id = fi.extended_family_id();
-    let family_id = {
-        let just_use_base = (vendor == AMD_VENDOR && base_family_id < 0xf)
-            || (vendor == INTEL_VENDOR && base_family_id != 0xf);
-        if just_use_base {
-            base_family_id
-        } else {
-            base_family_id + extended_family_id
-        }
-    };
-    let model_id = {
-        let just_use_base = (vendor == AMD_VENDOR && base_family_id < 0xf)
-            || (vendor == INTEL_VENDOR && base_family_id != 0xf && base_family_id != 0x6);
-        if just_use_base {
-            base_model_id
-        } else {
-            (extended_model_id << 4) | base_model_id
-        }
-    };
-    (family_id, model_id)
-}
-
 pub(crate) fn get_rcb_perf_config() -> u64 {
     let c = CpuId::new();
-    let vendor = c.get_vendor_info().unwrap();
-    let vendor_str = vendor.as_str();
-    match vendor_str {
-        AMD_VENDOR | INTEL_VENDOR => {}
-        s => panic!("Unknown CPU vendor: {}", s),
-    };
     let fi = c.get_feature_info().unwrap();
     // based on rr's PerfCounters_x86.h and PerfCounters.cc
-    match full_family_model(vendor_str, &fi) {
+    match (fi.family_id(), fi.model_id()) {
         (0x06, 0x1A) | (0x06, 0x1E) | (0x06, 0x2E) => 0x5101c4, // Intel Nehalem
         (0x06, 0x25) | (0x06, 0x2C) | (0x06, 0x2F) => 0x5101c4, // Intel Westmere
         (0x06, 0x2A) | (0x06, 0x2D) | (0x06, 0x3E) => 0x5101c4, // Intel SanyBridge
@@ -99,7 +64,10 @@ pub(crate) fn get_rcb_perf_config() -> u64 {
         (0x06, 0x4E) | (0x06, 0x55) | (0x06, 0x5E) => 0x5101c4, // Intel Skylake
         (0x06, 0x8E) | (0x06, 0x9E) => 0x5101c4,                // Intel Kabylake
         (0x06, 0xA5) | (0x06, 0xA6) => 0x5101c4,                // Intel Cometlake
-        (0x06, 141) => 0x5101c4, // Intel Alder Lake (e.g. i7-11800H laptop)
+        (0x06, 141) => 0x5101c4,  // Intel Alder Lake (e.g. i7-11800H laptop)
+        (0x17, 0x8) => 0x5100d1,  // AMD Zen, Pinnacle Ridge
+        (0x17, 0x31) => 0x5100d1, // AMD Zen, Castle Peak
+        (0x19, 0x50) => 0x5100d1, // AMD Zen, Cezanne
         oth => panic!(
             "Unsupported processor with feature info: {:?}\n Full family_model: {:?}",
             fi, oth
