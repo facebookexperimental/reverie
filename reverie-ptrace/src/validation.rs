@@ -332,14 +332,14 @@ fn check_working_counters(precise_ip: bool) -> Result<(), PmuValidationError> {
 /// check the cpu feature id to determine if it is a AMD-Zen vs AmdF15R30
 /// This is much simpler in c++ because eax is available directly
 fn is_amd_zen(cpu_feature: FeatureInfo) -> bool {
-    let family_id = cpu_feature.family_id(); // 4 bits
-    let model_id = cpu_feature.model_id(); // 4 bits
+    let family_id = cpu_feature.base_family_id(); // 4 bits
+    let model_id = cpu_feature.base_model_id(); // 4 bits
     let ext_model_id = cpu_feature.extended_model_id(); // 4 bits
     let ext_family_id = cpu_feature.extended_family_id(); // 8 bits
 
     // This is reconstructing cpu_info.eax & 0xf0ff0
     let cpu_type: u32 =
-        ((model_id as u32) << 4) + ((family_id as u32) << 8) + ((ext_model_id as u32) << 16);
+        ((model_id as u32) << 4) | ((family_id as u32) << 8) | ((ext_model_id as u32) << 16);
 
     // There are lots of magic numbers here. They come  directly from
     // https://github.com/rr-debugger/rr/blob/master/src/PerfCounters_x86.h
@@ -407,12 +407,12 @@ fn check_for_zen_speclockmap() -> Result<(), PmuValidationError> {
     // A lock add is known to increase the perf counter we're looking at.
     #[cfg(not(feature = "llvm_asm"))]
     unsafe {
-        let _prev: usize;
+        let mut _prev: *mut usize;
         core::arch::asm!(
             "lock",
             "xadd [{}], {}",
+            inout(reg) &to_add => _prev,
             in(reg) val,
-            inout(reg) to_add => _prev,
         )
     }
 
