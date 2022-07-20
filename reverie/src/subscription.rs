@@ -9,13 +9,7 @@
 use reverie_syscalls::Sysno;
 
 use bitflags::bitflags;
-use bitvec::bitvec;
-use bitvec::vec::BitVec;
-
-// The maximum number of syscalls to hold in our bitvec.
-//
-// FIXME: This should come from the `syscall` crate instead.
-const MAX_SYSCALLS: usize = 512;
+use syscalls::SysnoSet;
 
 bitflags! {
     #[derive(Default)]
@@ -29,8 +23,7 @@ bitflags! {
 #[derive(Default, Clone, Eq, PartialEq)]
 pub struct Subscription {
     instructions: Instructions,
-    // TODO: Use a BitArray with bitvec >=0.18
-    syscalls: BitVec,
+    syscalls: SysnoSet,
 }
 
 impl Subscription {
@@ -38,7 +31,7 @@ impl Subscription {
     pub fn none() -> Self {
         Subscription {
             instructions: Instructions::empty(),
-            syscalls: bitvec![0; MAX_SYSCALLS],
+            syscalls: SysnoSet::empty(),
         }
     }
 
@@ -46,7 +39,7 @@ impl Subscription {
     pub fn all() -> Self {
         Subscription {
             instructions: Instructions::CPUID | Instructions::RDTSC,
-            syscalls: bitvec![1; MAX_SYSCALLS],
+            syscalls: SysnoSet::all(),
         }
     }
 
@@ -54,7 +47,7 @@ impl Subscription {
     pub fn all_syscalls() -> Self {
         Subscription {
             instructions: Instructions::empty(),
-            syscalls: bitvec![1; MAX_SYSCALLS],
+            syscalls: SysnoSet::all(),
         }
     }
 
@@ -87,14 +80,19 @@ impl Subscription {
     /// Enables or disables a single syscall.
     #[inline]
     pub fn set(&mut self, syscall: Sysno, enabled: bool) -> &mut Self {
-        self.syscalls.set(syscall as i32 as usize, enabled);
+        if enabled {
+            self.syscalls.insert(syscall);
+        } else {
+            self.syscalls.remove(syscall);
+        }
         self
     }
 
     /// Enables a single syscall.
     #[inline]
     pub fn syscall(&mut self, syscall: Sysno) -> &mut Self {
-        self.set(syscall, true)
+        self.syscalls.insert(syscall);
+        self
     }
 
     /// Enables multiple syscalls.
@@ -112,7 +110,8 @@ impl Subscription {
     /// Disables a single syscall.
     #[inline]
     pub fn disable_syscall(&mut self, syscall: Sysno) -> &mut Self {
-        self.set(syscall, false)
+        self.syscalls.remove(syscall);
+        self
     }
 
     /// Disables multiple syscalls.
@@ -129,26 +128,7 @@ impl Subscription {
 
     /// Iterates over the set of syscalls that are enabled.
     pub fn iter_syscalls(&self) -> impl Iterator<Item = Sysno> + '_ {
-        // With bitvec >=0.20, this becomes a lot simpler:
-        //self.syscalls.iter_ones().filter_map(Sysno::new)
-
-        self.syscalls.iter().enumerate().filter_map(
-            |(i, is_set)| {
-                if *is_set { Sysno::new(i) } else { None }
-            },
-        )
-    }
-
-    /// Iterates over the set of syscalls that are disabled.
-    pub fn iter_disabled_syscalls(&self) -> impl Iterator<Item = Sysno> + '_ {
-        // With bitvec >=0.20, this becomes a lot simpler:
-        //self.syscalls.iter_zeros().filter_map(Sysno::new)
-
-        self.syscalls.iter().enumerate().filter_map(
-            |(i, is_set)| {
-                if !*is_set { Sysno::new(i) } else { None }
-            },
-        )
+        self.syscalls.iter()
     }
 }
 
@@ -170,7 +150,7 @@ impl core::ops::BitOrAssign for Subscription {
 
 impl core::ops::BitOrAssign<Sysno> for Subscription {
     fn bitor_assign(&mut self, syscall: Sysno) {
-        self.syscalls.set(syscall as i32 as usize, true);
+        self.syscalls.insert(syscall);
     }
 }
 
@@ -225,21 +205,6 @@ mod tests {
         assert_eq!(
             s2.iter_syscalls().collect::<Vec<_>>(),
             [Sysno::read, Sysno::write, Sysno::open,]
-        );
-    }
-
-    #[test]
-    fn disabled_syscalls() {
-        let mut sub = Subscription::all();
-
-        assert!(sub.iter_disabled_syscalls().next().is_none());
-
-        sub.set(Sysno::open, false);
-        sub.set(Sysno::read, false);
-
-        assert_eq!(
-            sub.iter_disabled_syscalls().collect::<Vec<_>>(),
-            [Sysno::read, Sysno::open]
         );
     }
 
