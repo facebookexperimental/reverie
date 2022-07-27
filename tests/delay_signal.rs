@@ -15,8 +15,8 @@
 //! NB: restarted syscalls should not count, as syscall
 //! returning ERESTARTSYS could be automatically restarted
 
+use nix::sys::signal;
 use nix::sys::signal::Signal;
-use nix::sys::signal::{self};
 use reverie::syscalls::Errno;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;

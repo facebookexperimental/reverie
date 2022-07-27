@@ -8,9 +8,9 @@
  */
 
 use super::consts::*;
+use nix::sys::uio;
 use nix::sys::uio::IoVec;
 use nix::sys::uio::RemoteIoVec;
-use nix::sys::uio::{self};
 use nix::unistd::Pid;
 
 /// generate syscall instructions at injected page

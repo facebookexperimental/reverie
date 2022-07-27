@@ -13,22 +13,22 @@ use crate::cp;
 use crate::gdbstub::GdbServer;
 use crate::task::Child;
 use crate::task::TracedTask;
+use crate::trace;
 use crate::trace::Error as TraceError;
 use crate::trace::Event;
 use crate::trace::Running;
 use crate::trace::Stopped;
-use crate::trace::{self};
 
 use anyhow::Context;
+use futures::future;
 use futures::future::BoxFuture;
 use futures::future::Either;
-use futures::future::{self};
 use futures::stream::StreamExt;
 use nix::sys::ptrace;
+use nix::sys::signal;
 use nix::sys::signal::Signal;
-use nix::sys::signal::{self};
+use nix::unistd;
 use nix::unistd::ForkResult;
-use nix::unistd::{self};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 

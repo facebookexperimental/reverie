@@ -11,13 +11,13 @@
 //! Basic tests that don't fall into some other category.
 
 #[allow(unused_imports)]
+use nix::sys::wait;
+#[allow(unused_imports)]
 use nix::sys::wait::WaitStatus;
 #[allow(unused_imports)]
-use nix::sys::wait::{self};
+use nix::unistd;
 #[allow(unused_imports)]
 use nix::unistd::ForkResult;
-#[allow(unused_imports)]
-use nix::unistd::{self};
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;

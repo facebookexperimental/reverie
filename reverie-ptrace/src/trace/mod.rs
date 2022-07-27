@@ -969,8 +969,8 @@ pub fn traceme_and_stop() -> Result<(), Errno> {
 mod test {
     use super::*;
 
+    use nix::sys::signal;
     use nix::sys::signal::Signal;
-    use nix::sys::signal::{self};
     use nix::unistd::fork;
     use nix::unistd::ForkResult;
 

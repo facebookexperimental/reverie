@@ -54,10 +54,10 @@ mod tests {
     use nix::sys::signal::Signal;
     use reverie_ptrace::testing::check_fn;
     use std::fs::File;
+    use std::io;
     use std::io::Read;
-    use std::io::{self};
+    use std::mem;
     use std::mem::MaybeUninit;
-    use std::mem::{self};
     use std::os::unix::io::FromRawFd;
 
     // kernel_sigset_t used by naked syscall

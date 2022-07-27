@@ -75,8 +75,8 @@ use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
+use std::thread;
 use std::thread::JoinHandle;
-use std::thread::{self};
 
 use futures::task::AtomicWaker;
 use lazy_static::lazy_static;
@@ -85,6 +85,7 @@ use nix::sys::wait::WaitStatus;
 use parking_lot::Mutex;
 
 use super::waitid;
+use crate::trace;
 use crate::trace::peek_all;
 use crate::trace::Errno;
 use crate::trace::Error;
@@ -93,7 +94,6 @@ use crate::trace::Running;
 use crate::trace::Stopped;
 use crate::trace::TryWait;
 use crate::trace::Wait;
-use crate::trace::{self};
 
 lazy_static! {
     static ref NOTIFIER: Notifier = Notifier::new();

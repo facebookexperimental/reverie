@@ -34,11 +34,11 @@ use crate::trace::Wait;
 use crate::vdso;
 
 use async_trait::async_trait;
+use futures::future;
 use futures::future::Either;
 use futures::future::Future;
 use futures::future::FutureExt;
 use futures::future::TryFutureExt;
-use futures::future::{self};
 use nix::sys::mman::ProtFlags;
 use nix::sys::signal::Signal;
 use reverie::syscalls::Addr;

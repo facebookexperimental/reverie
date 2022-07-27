@@ -9,10 +9,10 @@
 
 //! Tests surrounding exit logic.
 
+use reverie::syscalls;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
-use reverie::syscalls::{self};
 use reverie::Error;
 use reverie::ExitStatus;
 use reverie::GlobalRPC;

@@ -15,8 +15,8 @@ use futures::stream::StreamExt;
 use nix::fcntl;
 use nix::fcntl::OFlag;
 use nix::sys::signal::Signal;
+use nix::sys::stat;
 use nix::sys::stat::Mode;
-use nix::sys::stat::{self};
 use nix::sys::uio;
 use nix::unistd;
 use reverie::Pid;
@@ -31,8 +31,8 @@ use tokio::sync::MutexGuard;
 
 use crate::trace::ChildOp;
 
+use super::commands;
 use super::commands::*;
-use super::commands::{self};
 use super::regs::Amd64CoreRegs;
 use super::response::*;
 use super::Breakpoint;

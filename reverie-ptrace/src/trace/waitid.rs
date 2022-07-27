@@ -149,8 +149,8 @@ mod tests {
     use super::*;
     use nix::sys::signal::Signal;
     use nix::sys::wait::WaitPidFlag;
+    use nix::unistd;
     use nix::unistd::ForkResult;
-    use nix::unistd::{self};
 
     #[test]
     fn waitid_w_exited_0() {

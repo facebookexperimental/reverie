@@ -7,8 +7,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::fmt;
 use std::fmt::Debug;
-use std::fmt::{self};
 
 enum Direction {
     In,

@@ -9,9 +9,9 @@
 
 // reinject stat* as fstatat unittest
 
+use reverie::syscalls;
 use reverie::syscalls::Displayable;
 use reverie::syscalls::Syscall;
-use reverie::syscalls::{self};
 use reverie::Error;
 use reverie::Guest;
 use reverie::Tool;

@@ -15,9 +15,9 @@ use core::task::Poll;
 
 use std::ffi::CStr;
 use std::ffi::CString;
+use std::io;
 use std::io::Read;
 use std::io::Write;
-use std::io::{self};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::io::FromRawFd;
 use std::os::unix::io::IntoRawFd;
