@@ -27,7 +27,6 @@ use std::io;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
-use std::vec::Vec;
 use structopt::StructOpt;
 use tracing::debug;
 use tracing::info;

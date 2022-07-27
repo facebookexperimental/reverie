@@ -7,7 +7,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 use std::future::Future;
-use std::marker::Unpin;
 use std::mem;
 use std::pin::Pin;
 use std::slice;
