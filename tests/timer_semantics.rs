@@ -16,7 +16,6 @@
 use core::arch::x86_64::__cpuid;
 use core::arch::x86_64::__rdtscp;
 use core::arch::x86_64::_rdtsc;
-use libc;
 use reverie::syscalls::Getpid;
 use reverie::syscalls::Gettid;
 use reverie::syscalls::Syscall;

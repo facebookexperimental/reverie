@@ -14,7 +14,6 @@
 //! This verifies that timer events, if requested, are delivered during busywaits and are not delivered
 //! if not requested.
 
-use libc;
 use raw_cpuid::cpuid;
 use reverie::syscalls::Syscall;
 use reverie::CpuIdResult;
