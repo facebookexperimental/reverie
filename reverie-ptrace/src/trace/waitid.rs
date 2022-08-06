@@ -14,14 +14,15 @@
 //! `WCONTINUED`, `WNOHANG` and `WNOWAIT`. see `waitid(2)` for more details.
 //! NB: `waitid` here provide a similar interface as `nix`'s `waitpid`.
 
-use super::Errno;
+use std::mem::MaybeUninit;
+use std::os::unix::io::RawFd;
+
 use nix::sys::signal::Signal;
 use nix::sys::wait::WaitPidFlag;
 use nix::sys::wait::WaitStatus;
 use nix::unistd::Pid;
 
-use std::mem::MaybeUninit;
-use std::os::unix::io::RawFd;
+use super::Errno;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum IdType {
@@ -146,11 +147,12 @@ pub fn waitid(waitid_type: IdType, flags: WaitPidFlag) -> Result<WaitStatus, Err
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use nix::sys::signal::Signal;
     use nix::sys::wait::WaitPidFlag;
     use nix::unistd;
     use nix::unistd::ForkResult;
+
+    use super::*;
 
     #[test]
     fn waitid_w_exited_0() {

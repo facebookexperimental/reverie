@@ -82,12 +82,14 @@ impl Tool for LocalStateVforkClone {
 
 #[cfg(all(not(sanitized), test))]
 mod tests {
-    use super::*;
+    use std::ffi::CString;
+
     use nix::sys::wait;
     use nix::sys::wait::WaitStatus;
     use nix::unistd::Pid;
     use reverie_ptrace::testing::check_fn;
-    use std::ffi::CString;
+
+    use super::*;
 
     #[derive(Clone, Copy)]
     enum VforkTestFlag {

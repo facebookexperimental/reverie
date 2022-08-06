@@ -7,6 +7,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::path::PathBuf;
+
 use anyhow::Error;
 use reverie::process::Command;
 use reverie::process::Mount;
@@ -18,7 +20,6 @@ use reverie::Tool;
 use reverie_ptrace::GdbConnection;
 use serde::Deserialize;
 use serde::Serialize;
-use std::path::PathBuf;
 
 pub struct GdbServerCommand {
     // NB: ideally we could also attach to a existing pid, but this is not

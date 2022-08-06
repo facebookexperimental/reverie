@@ -74,15 +74,13 @@ mod bpf;
 #[allow(unused)]
 mod notif;
 
-use bpf::*;
-
-use syscalls::Errno;
-use syscalls::Sysno;
+use std::collections::BTreeMap;
 
 pub use bpf::Filter;
+use bpf::*;
 pub use notif::*;
-
-use std::collections::BTreeMap;
+use syscalls::Errno;
+use syscalls::Sysno;
 
 /// Builder for creating seccomp filters.
 #[derive(Clone)]

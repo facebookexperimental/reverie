@@ -7,10 +7,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use crate::filter::Filter;
-
 use serde::Deserialize;
 use serde::Serialize;
+
+use crate::filter::Filter;
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Config {

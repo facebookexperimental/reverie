@@ -49,9 +49,11 @@ impl Tool for LocalState {
 
 #[cfg(all(not(sanitized), test))]
 mod tests {
-    use super::*;
-    use reverie_ptrace::testing::check_fn;
     use std::mem::MaybeUninit;
+
+    use reverie_ptrace::testing::check_fn;
+
+    use super::*;
 
     #[test]
     fn stat_can_be_reinjected() {

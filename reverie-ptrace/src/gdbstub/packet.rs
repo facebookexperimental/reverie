@@ -31,12 +31,13 @@
  * SOFTWARE.
  */
 
+use bytes::BytesMut;
+use thiserror::Error;
+
 use super::commands::Command;
 use super::commands::CommandParseError;
 use super::hex::*;
 use super::PacketLogger;
-use bytes::BytesMut;
-use thiserror::Error;
 
 /// Packet parse error.
 #[derive(PartialEq, Debug, Error)]

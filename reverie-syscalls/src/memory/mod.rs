@@ -10,7 +10,6 @@ mod addr;
 mod local;
 
 use core::mem;
-
 use std::ffi::CString;
 use std::io;
 

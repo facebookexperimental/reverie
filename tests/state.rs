@@ -13,9 +13,6 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 
-use serde::Deserialize;
-use serde::Serialize;
-
 use reverie::syscalls::Syscall;
 use reverie::Error;
 use reverie::ExitStatus;
@@ -24,6 +21,8 @@ use reverie::GlobalTool;
 use reverie::Guest;
 use reverie::Pid;
 use reverie::Tool;
+use serde::Deserialize;
+use serde::Serialize;
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct GlobalState {

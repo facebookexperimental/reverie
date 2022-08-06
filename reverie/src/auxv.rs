@@ -6,15 +6,15 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
-use crate::syscalls::Addr;
-use crate::Pid;
+use std::collections::BTreeMap;
+use std::fs;
+use std::io;
 
 use byteorder::NativeEndian;
 use byteorder::ReadBytesExt;
 
-use std::collections::BTreeMap;
-use std::fs;
-use std::io;
+use crate::syscalls::Addr;
+use crate::Pid;
 
 /// Represents the auxv table of a process.
 ///

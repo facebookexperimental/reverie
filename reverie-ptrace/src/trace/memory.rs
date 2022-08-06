@@ -7,18 +7,17 @@
  * LICENSE file in the root directory of this source tree.
  */
 use core::mem;
-
-use nix::sys::ptrace;
-
 use std::io;
 
-use super::Stopped;
+use nix::sys::ptrace;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::AddrSlice;
 use reverie::syscalls::AddrSliceMut;
 use reverie::syscalls::Errno;
 use reverie::syscalls::MemoryAccess;
+
+use super::Stopped;
 
 impl Stopped {
     /// Does a read that is already page-aligned.
@@ -196,10 +195,6 @@ impl MemoryAccess for Stopped {
 
 #[cfg(test)]
 mod test {
-    use super::*;
-
-    use reverie::Pid;
-
     use std::ffi::CString;
 
     use nix::sys::ptrace;
@@ -211,6 +206,9 @@ mod test {
     use nix::unistd::ForkResult;
     use quickcheck::QuickCheck;
     use quickcheck_macros::quickcheck;
+    use reverie::Pid;
+
+    use super::*;
 
     // Helper function for spawning a child process in a stopped state. The
     // value `T` will be in the child's address space allowing us to read or

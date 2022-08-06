@@ -6,25 +6,23 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
-use super::fd::create_dir_all;
-use super::fd::touch_path;
-use super::fd::FileType;
-use super::util;
-
 use core::convert::Infallible;
 use core::fmt;
 use core::ptr;
 use core::str::FromStr;
-
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
+pub use nix::mount::MsFlags as MountFlags;
 use syscalls::Errno;
 
-pub use nix::mount::MsFlags as MountFlags;
+use super::fd::create_dir_all;
+use super::fd::touch_path;
+use super::fd::FileType;
+use super::util;
 
 /// A mount.
 #[derive(Clone, Debug, Eq, PartialEq)]

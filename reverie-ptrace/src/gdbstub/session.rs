@@ -7,6 +7,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
 use bytes::Bytes;
 use bytes::BytesMut;
 use futures::future::Future;
@@ -20,7 +23,6 @@ use nix::sys::stat::Mode;
 use nix::sys::uio;
 use nix::unistd;
 use reverie::Pid;
-use std::sync::Arc;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
@@ -28,8 +30,6 @@ use tokio::sync::oneshot;
 use tokio::sync::MappedMutexGuard;
 use tokio::sync::Mutex;
 use tokio::sync::MutexGuard;
-
-use crate::trace::ChildOp;
 
 use super::commands;
 use super::commands::*;
@@ -44,8 +44,7 @@ use super::InferiorThreadId;
 use super::Packet;
 use super::ResumeInferior;
 use super::StoppedInferior;
-
-use std::collections::BTreeMap;
+use crate::trace::ChildOp;
 
 type BoxWriter = Box<dyn AsyncWrite + Unpin + Send + Sync + 'static>;
 

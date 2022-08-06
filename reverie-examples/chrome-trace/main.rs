@@ -14,17 +14,15 @@ mod event;
 mod global_state;
 mod tool;
 
-use tool::ChromeTrace;
-
-use structopt::StructOpt;
+use std::fs;
+use std::io;
+use std::path::PathBuf;
 
 use anyhow::Context;
 use reverie::Error;
 use reverie_util::CommonToolArguments;
-
-use std::fs;
-use std::io;
-use std::path::PathBuf;
+use structopt::StructOpt;
+use tool::ChromeTrace;
 
 /// A tool to render a summary of the process tree.
 #[derive(Debug, StructOpt)]

@@ -6,8 +6,9 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
-use crate::trace::Error as TraceError;
-use crate::trace::Stopped;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
@@ -15,9 +16,9 @@ use reverie::syscalls::MemoryAccess;
 use reverie::Errno;
 use reverie::Pid;
 use reverie::Stack;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
+
+use crate::trace::Error as TraceError;
+use crate::trace::Stopped;
 
 // NB: leaf function can use redzone without explicit stack allocation, as
 // a result it is not safe to just adjust stack pointer. 128B of stack

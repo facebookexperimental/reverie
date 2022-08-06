@@ -9,15 +9,10 @@
 
 //! `Tracer` type, plus ways to spawn it and retrieve its output.
 
-use crate::cp;
-use crate::gdbstub::GdbServer;
-use crate::task::Child;
-use crate::task::TracedTask;
-use crate::trace;
-use crate::trace::Error as TraceError;
-use crate::trace::Event;
-use crate::trace::Running;
-use crate::trace::Stopped;
+use std::io::Write;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Context;
 use futures::future;
@@ -29,9 +24,6 @@ use nix::sys::signal;
 use nix::sys::signal::Signal;
 use nix::unistd;
 use nix::unistd::ForkResult;
-use tokio::sync::broadcast;
-use tokio::sync::mpsc;
-
 use reverie::process::seccomp;
 use reverie::process::ChildStderr;
 use reverie::process::ChildStdin;
@@ -46,11 +38,18 @@ use reverie::GlobalTool;
 use reverie::Pid;
 use reverie::Subscription;
 use reverie::Tool;
+use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 
-use std::io::Write;
-use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::Arc;
+use crate::cp;
+use crate::gdbstub::GdbServer;
+use crate::task::Child;
+use crate::task::TracedTask;
+use crate::trace;
+use crate::trace::Error as TraceError;
+use crate::trace::Event;
+use crate::trace::Running;
+use crate::trace::Stopped;
 
 /// Represents the tracer.
 ///

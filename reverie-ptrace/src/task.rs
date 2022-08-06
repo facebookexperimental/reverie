@@ -9,29 +9,17 @@
 
 //! `TracedTask` and its methods.
 
-use crate::children;
-use crate::cp;
-use crate::error::Error;
-use crate::gdbstub::Amd64CoreRegs;
-use crate::gdbstub::BreakpointType;
-use crate::gdbstub::GdbRequest;
-use crate::gdbstub::GdbServer;
-use crate::gdbstub::ResumeAction;
-use crate::gdbstub::ResumeInferior;
-use crate::gdbstub::StopEvent;
-use crate::gdbstub::StopReason;
-use crate::gdbstub::StoppedInferior;
-use crate::stack::GuestStack;
-use crate::timer::HandleFailure;
-use crate::timer::Timer;
-use crate::timer::TimerEventRequest;
-use crate::trace::ChildOp;
-use crate::trace::Error as TraceError;
-use crate::trace::Event;
-use crate::trace::Running;
-use crate::trace::Stopped;
-use crate::trace::Wait;
-use crate::vdso;
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::fmt;
+use std::ops::DerefMut;
+use std::pin::Pin;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::task::Context;
+use std::task::Poll;
 
 use async_trait::async_trait;
 use futures::future;
@@ -39,6 +27,7 @@ use futures::future::Either;
 use futures::future::Future;
 use futures::future::FutureExt;
 use futures::future::TryFutureExt;
+use libc::user_regs_struct;
 use nix::sys::mman::ProtFlags;
 use nix::sys::signal::Signal;
 use reverie::syscalls::Addr;
@@ -65,23 +54,6 @@ use reverie::Symbol;
 use reverie::Tid;
 use reverie::TimerSchedule;
 use reverie::Tool;
-use std::collections::BTreeMap;
-use std::collections::HashMap;
-use std::fmt;
-use std::ops::DerefMut;
-use std::pin::Pin;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
-use std::task::Context;
-use std::task::Poll;
-use tracing::debug;
-use tracing::info;
-use tracing::trace;
-use tracing::warn;
-
-use libc::user_regs_struct;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -89,6 +61,34 @@ use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio::task::JoinError;
 use tokio::task::JoinHandle;
+use tracing::debug;
+use tracing::info;
+use tracing::trace;
+use tracing::warn;
+
+use crate::children;
+use crate::cp;
+use crate::error::Error;
+use crate::gdbstub::Amd64CoreRegs;
+use crate::gdbstub::BreakpointType;
+use crate::gdbstub::GdbRequest;
+use crate::gdbstub::GdbServer;
+use crate::gdbstub::ResumeAction;
+use crate::gdbstub::ResumeInferior;
+use crate::gdbstub::StopEvent;
+use crate::gdbstub::StopReason;
+use crate::gdbstub::StoppedInferior;
+use crate::stack::GuestStack;
+use crate::timer::HandleFailure;
+use crate::timer::Timer;
+use crate::timer::TimerEventRequest;
+use crate::trace::ChildOp;
+use crate::trace::Error as TraceError;
+use crate::trace::Event;
+use crate::trace::Running;
+use crate::trace::Stopped;
+use crate::trace::Wait;
+use crate::vdso;
 
 #[derive(Debug)]
 struct Suspended {

@@ -139,15 +139,17 @@ impl Tool for LocalState {
 
 #[cfg(all(not(sanitized), test))]
 mod tests {
-    use super::*;
-    use reverie::ExitStatus;
-    use reverie_ptrace::testing::check_fn;
-    use reverie_ptrace::testing::test_fn;
     use std::io;
     use std::mem::MaybeUninit;
     use std::sync::mpsc;
     use std::thread;
     use std::time;
+
+    use reverie::ExitStatus;
+    use reverie_ptrace::testing::check_fn;
+    use reverie_ptrace::testing::test_fn;
+
+    use super::*;
 
     // kernel_sigset_t used by naked syscall
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]

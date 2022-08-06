@@ -150,13 +150,14 @@ impl<'de> serde::Deserialize<'de> for ExitStatus {
 
 #[cfg(all(test, not(sanitized)))]
 mod tests_non_sanitized {
-    use super::*;
     use nix::sys::signal;
     use nix::sys::signal::Signal;
     use nix::sys::wait::waitpid;
     use nix::sys::wait::WaitStatus;
     use nix::unistd::fork;
     use nix::unistd::ForkResult;
+
+    use super::*;
 
     // Runs a closure in a forked process and reports the exit status.
     fn run_forked<F>(f: F) -> nix::Result<ExitStatus>

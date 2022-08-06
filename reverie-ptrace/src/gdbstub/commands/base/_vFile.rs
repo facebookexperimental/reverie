@@ -7,13 +7,12 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use bytes::BytesMut;
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 
+use bytes::BytesMut;
 use nix::sys::stat::FileStat;
-
 use reverie::Pid;
 
 use crate::gdbstub::commands::*;
@@ -120,8 +119,9 @@ impl ParseCommand for vFile {
 
 #[cfg(test)]
 mod test {
-    use super::*;
     use std::mem;
+
+    use super::*;
 
     #[test]
     fn hostio_stat_size_check() {

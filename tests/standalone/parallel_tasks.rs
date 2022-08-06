@@ -8,15 +8,16 @@
  */
 #![feature(get_mut_unchecked)]
 #![feature(thread_id_value)]
-use reverie::Error;
-use reverie::Tool;
-use serde::Deserialize;
-use serde::Serialize;
 use std::env;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread;
+
+use reverie::Error;
+use reverie::Tool;
+use serde::Deserialize;
+use serde::Serialize;
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 struct TestTool {}

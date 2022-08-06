@@ -11,7 +11,6 @@
 //! potentially many syscalls.
 
 use core::fmt;
-
 use std::ffi::CString;
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
@@ -24,16 +23,14 @@ mod poll;
 mod stat;
 mod time;
 
+pub use clone::*;
+pub use fcntl::FcntlCmd;
 use nix::sys::stat::Mode;
 use nix::sys::stat::SFlag;
 use nix::unistd::Pid;
-
+pub use poll::*;
 use serde::Deserialize;
 use serde::Serialize;
-
-pub use clone::*;
-pub use fcntl::FcntlCmd;
-pub use poll::*;
 pub use stat::*;
 pub use time::*;
 

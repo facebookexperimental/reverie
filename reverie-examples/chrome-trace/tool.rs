@@ -7,10 +7,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use crate::event::Event;
-use crate::event::Program;
-use crate::event::ThreadExit;
-use crate::global_state::GlobalState;
+use std::borrow::Cow;
+use std::fs;
+use std::str;
+use std::time::SystemTime;
 
 use reverie::syscalls::Displayable;
 use reverie::syscalls::Syscall;
@@ -28,10 +28,10 @@ use reverie::Tool;
 use serde::Deserialize;
 use serde::Serialize;
 
-use std::borrow::Cow;
-use std::fs;
-use std::str;
-use std::time::SystemTime;
+use crate::event::Event;
+use crate::event::Program;
+use crate::event::ThreadExit;
+use crate::global_state::GlobalState;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ChromeTrace(Pid);

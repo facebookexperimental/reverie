@@ -130,9 +130,10 @@ impl From<libc::statx> for StatxBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use core::mem::align_of;
     use core::mem::size_of;
+
+    use super::*;
 
     #[test]
     fn sizes() {

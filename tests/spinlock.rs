@@ -19,13 +19,15 @@ impl Tool for LocalState {}
 
 #[cfg(all(not(sanitized), test))]
 mod tests {
-    use super::*;
-    use reverie_ptrace::testing::check_fn;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::thread;
     use std::time;
+
+    use reverie_ptrace::testing::check_fn;
+
+    use super::*;
 
     #[test]
     fn run_guest_spinlock_test() {

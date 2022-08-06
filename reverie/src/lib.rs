@@ -31,16 +31,14 @@ pub use auxv::*;
 pub use backtrace::*;
 pub use error::*;
 pub use guest::*;
+pub use process::ExitStatus;
+pub use process::Pid;
 pub use rdtsc::*;
+pub use reverie_process as process;
 pub use stack::*;
 pub use subscription::*;
 pub use timer::*;
 pub use tool::*;
-
-pub use reverie_process as process;
-
-pub use process::ExitStatus;
-pub use process::Pid;
 
 /// The identifier for a specific thread, corresponding to the output of gettid.
 /// In many cases, Linux blurs the Pid/Tid distinction, but Reverie should
@@ -51,24 +49,20 @@ pub use process::Pid;
 /// is deprecated. `Tid` may be a distinct newtype in the future.
 pub type Tid = Pid;
 
-/// typed syscalls.
-pub use reverie_syscalls as syscalls;
-
-/// CPUID result.
-pub use raw_cpuid::CpuIdResult;
-
-// Reexport nix Signal type.
-pub use nix::sys::signal::Signal;
-
 /// Required for `impl Tool for MyTool` blocks.
 ///
 /// NOTE: This is just an alias for `async_trait` for now, but may be extended in
 /// the future to do more things (like derive syscall subscriptions).
 pub use async_trait::async_trait as tool;
-
 /// Required for `impl GlobalTool for MyGlobalTool` blocks.
 ///
 /// NOTE: This is just an alias for `async_trait` for now, but may be extended in
 /// the future to do more things (like deriving Request/Response types from
 /// method names).
 pub use async_trait::async_trait as global_tool;
+// Reexport nix Signal type.
+pub use nix::sys::signal::Signal;
+/// CPUID result.
+pub use raw_cpuid::CpuIdResult;
+/// typed syscalls.
+pub use reverie_syscalls as syscalls;

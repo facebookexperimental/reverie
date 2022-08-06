@@ -16,7 +16,6 @@ use reverie::Error;
 use reverie::ExitStatus;
 use reverie::Guest;
 use reverie::Tool;
-
 use serde::Deserialize;
 use serde::Serialize;
 

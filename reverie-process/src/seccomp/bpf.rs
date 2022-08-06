@@ -9,11 +9,11 @@
 
 #![allow(non_snake_case)]
 
-use crate::fd::Fd;
+pub use libc::sock_filter;
 use syscalls::Errno;
 use syscalls::Sysno;
 
-pub use libc::sock_filter;
+use crate::fd::Fd;
 
 // See: /include/uapi/linux/bpf_common.h
 

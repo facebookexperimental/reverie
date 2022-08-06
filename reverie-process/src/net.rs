@@ -7,14 +7,14 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use super::fd::Fd;
-
 use std::ffi::CStr;
 use std::ffi::OsStr;
 use std::mem::MaybeUninit;
 use std::os::unix::io::AsRawFd;
 
 use syscalls::Errno;
+
+use super::fd::Fd;
 
 /// Interface name.
 #[derive(Default, Debug, Copy, Clone, Eq, PartialEq)]
@@ -193,8 +193,9 @@ impl<T> IfReq<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use nix::net::if_::InterfaceFlags;
+
+    use super::*;
 
     #[test]
     fn ifname() {

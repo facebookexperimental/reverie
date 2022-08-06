@@ -7,9 +7,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use crate::config::Config;
-use crate::global_state::GlobalState;
-
 use reverie::syscalls::Displayable;
 use reverie::syscalls::Errno;
 use reverie::syscalls::Syscall;
@@ -23,9 +20,11 @@ use reverie::Signal;
 use reverie::Subscription;
 use reverie::Tid;
 use reverie::Tool;
-
 use serde::Deserialize;
 use serde::Serialize;
+
+use crate::config::Config;
+use crate::global_state::GlobalState;
 
 // Strace has no need for process-level state, so this is a unit struct.
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]

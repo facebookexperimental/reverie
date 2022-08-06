@@ -11,8 +11,9 @@
 //! "families"). These are useful when needing to handle families in very similar
 //! ways.
 
-use super::Syscall;
+use derive_more::From;
 
+use super::Syscall;
 use crate::args::ClockId;
 use crate::args::CloneFlags;
 use crate::args::StatPtr;
@@ -20,8 +21,6 @@ use crate::args::Timespec;
 use crate::memory::Addr;
 use crate::memory::AddrMut;
 use crate::memory::MemoryAccess;
-
-use derive_more::From;
 
 /// Represents the `[p]write{64,v,v2}` family of syscalls. All of these syscalls
 /// have an associated file descriptor.

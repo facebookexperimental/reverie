@@ -7,16 +7,15 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::io;
+
+use reverie::Pid;
 use thiserror::Error;
 
 use super::commands::CommandParseError;
 use super::hex::GdbHexError;
 use super::packet::PacketParseError;
-
 use crate::trace::Error as TraceError;
-
-use reverie::Pid;
-use std::io;
 
 #[derive(Error, Debug)]
 #[allow(clippy::enum_variant_names)]

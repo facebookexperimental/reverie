@@ -7,8 +7,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use crate::gdbstub::commands::*;
 use bytes::BytesMut;
+
+use crate::gdbstub::commands::*;
 
 #[derive(PartialEq, Debug)]
 pub struct qC {}

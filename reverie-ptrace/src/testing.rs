@@ -9,8 +9,6 @@
 
 //! Utilities that support constructing tests for Reverie Tools.
 
-use crate::spawn_fn_with_config;
-use crate::TracerBuilder;
 use futures::Future;
 use reverie::process::Command;
 use reverie::process::Output;
@@ -21,6 +19,8 @@ use reverie::GlobalTool;
 use reverie::Tool;
 
 pub use crate::perf::do_branches;
+use crate::spawn_fn_with_config;
+use crate::TracerBuilder;
 
 /// For some tests, its nice to show what was printed.
 pub fn print_tracee_output(output: &Output) {

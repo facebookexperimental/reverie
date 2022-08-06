@@ -7,10 +7,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use crate::gdbstub::commands::*;
-use crate::gdbstub::hex::*;
 use bytes::BytesMut;
 use reverie::Pid;
+
+use crate::gdbstub::commands::*;
+use crate::gdbstub::hex::*;
 
 pub struct vAttach {
     pub pid: Pid,

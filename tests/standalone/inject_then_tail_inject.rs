@@ -6,6 +6,10 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
+use std::alloc;
+use std::env;
+use std::mem;
+
 use nix::unistd;
 use reverie::syscalls::Displayable;
 use reverie::syscalls::MemoryAccess;
@@ -18,9 +22,6 @@ use reverie::Pid;
 use reverie::Tool;
 use serde::Deserialize;
 use serde::Serialize;
-use std::alloc;
-use std::env;
-use std::mem;
 use tracing::warn;
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]

@@ -18,12 +18,10 @@ mod tool;
 
 use config::Config;
 use filter::Filter;
-use tool::Strace;
-
-use structopt::StructOpt;
-
 use reverie::Error;
 use reverie_util::CommonToolArguments;
+use structopt::StructOpt;
+use tool::Strace;
 
 /// A tool to trace system calls.
 #[derive(StructOpt, Debug)]

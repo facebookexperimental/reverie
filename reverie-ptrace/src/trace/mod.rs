@@ -19,19 +19,17 @@ use std::mem;
 use std::ptr;
 
 use nix::sys::ptrace;
-use nix::sys::wait::WaitPidFlag;
-use nix::sys::wait::WaitStatus;
-use thiserror::Error;
-
-pub use reverie::Errno;
-pub use reverie::ExitStatus;
-pub use reverie::Pid;
-use waitid::waitid;
-use waitid::IdType;
-
 // Re-exports so that nothing else needs to depend on `nix`.
 pub use nix::sys::ptrace::Options;
 pub use nix::sys::signal::Signal;
+use nix::sys::wait::WaitPidFlag;
+use nix::sys::wait::WaitStatus;
+pub use reverie::Errno;
+pub use reverie::ExitStatus;
+pub use reverie::Pid;
+use thiserror::Error;
+use waitid::waitid;
+use waitid::IdType;
 
 /// An error that occurred during tracing.
 #[derive(Error, Debug, Eq, PartialEq)]
@@ -967,16 +965,16 @@ pub fn traceme_and_stop() -> Result<(), Errno> {
 /// These tests are meant to test this API but also to show how ptrace works.
 #[cfg(test)]
 mod test {
-    use super::*;
+    use std::io;
+    use std::mem;
+    use std::thread;
 
     use nix::sys::signal;
     use nix::sys::signal::Signal;
     use nix::unistd::fork;
     use nix::unistd::ForkResult;
 
-    use std::io;
-    use std::mem;
-    use std::thread;
+    use super::*;
 
     // Traces a closure in a forked process. The forked process starts in a
     // stopped state so that ptrace options may be set.

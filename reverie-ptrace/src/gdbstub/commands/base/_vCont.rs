@@ -8,7 +8,6 @@
  */
 
 use bytes::BytesMut;
-
 use nix::sys::signal::Signal;
 
 use crate::gdbstub::commands::*;

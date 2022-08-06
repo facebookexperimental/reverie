@@ -14,6 +14,10 @@
 //! This verifies that timer events, if requested, are delivered during busywaits and are not delivered
 //! if not requested.
 
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+
 use raw_cpuid::cpuid;
 use reverie::syscalls::Syscall;
 use reverie::CpuIdResult;
@@ -32,9 +36,6 @@ use reverie::TimerSchedule;
 use reverie::Tool;
 use serde::Deserialize;
 use serde::Serialize;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct GlobalState {
@@ -188,12 +189,13 @@ fn do_marker_syscall() {
 
 #[cfg(all(not(sanitized), test))]
 mod tests {
-    use super::*;
+    use std::time::Duration;
+    use std::time::Instant;
+
     use reverie_ptrace::testing::check_fn_with_config;
     use reverie_ptrace::testing::do_branches;
 
-    use std::time::Duration;
-    use std::time::Instant;
+    use super::*;
 
     #[test]
     fn guest_busywait_no_timer() {

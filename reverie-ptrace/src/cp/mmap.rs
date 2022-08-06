@@ -7,11 +7,12 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use super::consts::*;
 use nix::sys::uio;
 use nix::sys::uio::IoVec;
 use nix::sys::uio::RemoteIoVec;
 use nix::unistd::Pid;
+
+use super::consts::*;
 
 /// generate syscall instructions at injected page
 /// the page address should be 0x7000_0000 (PRIVATE_PAGE_OFFSET)

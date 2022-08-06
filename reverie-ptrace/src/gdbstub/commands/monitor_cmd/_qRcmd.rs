@@ -7,10 +7,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use crate::gdbstub::commands::*;
-use crate::gdbstub::hex::*;
 use bytes::Bytes;
 use bytes::BytesMut;
+
+use crate::gdbstub::commands::*;
+use crate::gdbstub::hex::*;
 
 #[derive(PartialEq, Debug)]
 pub struct qRcmd {

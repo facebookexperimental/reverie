@@ -60,9 +60,10 @@ impl Tool for LocalStateInject {
 
 #[cfg(all(not(sanitized), test))]
 mod tests {
-    use super::*;
     use nix::unistd;
     use reverie_ptrace::testing::check_fn;
+
+    use super::*;
 
     #[cfg(target_arch = "x86_64")]
     #[cfg(not(feature = "llvm_asm"))]

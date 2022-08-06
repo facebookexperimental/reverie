@@ -7,6 +7,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+
 use reverie::Errno;
 use reverie::GlobalTool;
 use reverie::Guest;
@@ -17,8 +20,6 @@ use reverie::Tid;
 use reverie::Tool;
 use serde::Deserialize;
 use serde::Serialize;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct GlobalState {
@@ -78,8 +79,9 @@ impl Tool for LocalState {
 
 #[cfg(all(not(sanitized), test))]
 mod tests {
-    use super::*;
     use reverie_ptrace::testing::check_fn;
+
+    use super::*;
 
     #[allow(unused_mut)]
     #[inline(never)]

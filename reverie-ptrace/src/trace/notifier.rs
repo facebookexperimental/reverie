@@ -357,10 +357,11 @@ impl Future for ExitFuture {
 
 #[cfg(test)]
 mod test {
-    use super::*;
     use nix::sys::signal::Signal;
     use nix::sys::wait::WaitStatus;
     use nix::unistd::Pid;
+
+    use super::*;
 
     #[test]
     fn exit_event_code() {

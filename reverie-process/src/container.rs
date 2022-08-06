@@ -6,6 +6,22 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
+use std::borrow::Cow;
+use std::collections::BTreeMap;
+use std::ffi::CString;
+use std::ffi::OsStr;
+use std::ffi::OsString;
+use std::io::Read;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::io::AsRawFd;
+use std::path::Path;
+
+use nix::sched::sched_setaffinity;
+use nix::sched::CpuSet;
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+use syscalls::Errno;
+
 use super::clone::clone_with_stack;
 use super::env::Env;
 use super::error::AddContext;
@@ -25,22 +41,6 @@ use super::seccomp;
 use super::stdio::Stdio;
 use super::util::reset_signal_handling;
 use super::util::to_cstring;
-
-use nix::sched::sched_setaffinity;
-use nix::sched::CpuSet;
-use serde::de::DeserializeOwned;
-use serde::Serialize;
-use syscalls::Errno;
-
-use std::borrow::Cow;
-use std::collections::BTreeMap;
-use std::ffi::CString;
-use std::ffi::OsStr;
-use std::ffi::OsString;
-use std::io::Read;
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::io::AsRawFd;
-use std::path::Path;
 
 /// A `Container` is a configuration of how a process shall be spawned. It can,
 /// but doesn't have to, include Linux namespace configuration.
@@ -923,8 +923,9 @@ impl Drop for WaitGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use nix::sys::signal::Signal;
+
+    use super::*;
 
     #[test]
     fn can_panic() {
@@ -1009,8 +1010,9 @@ mod tests {
 
     #[test]
     pub fn pin_affinity_to_all_cores() -> Result<(), Error> {
-        use raw_cpuid::CpuId;
         use std::collections::HashMap;
+
+        use raw_cpuid::CpuId;
 
         let cpus = num_cpus::get();
         println!("Total cpus {}", cpus);

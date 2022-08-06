@@ -9,7 +9,6 @@
 use core::fmt;
 use core::marker::PhantomData;
 use core::ptr::NonNull;
-
 // Only used for `IoSlice`. To be fully no_std, this should get replaced with a
 // custom `IoSlice` type.
 use std::io;
@@ -438,9 +437,10 @@ fn next_page(addr: usize) -> usize {
 
 #[cfg(test)]
 mod test {
-    use super::*;
     use core::mem::align_of;
     use core::mem::size_of;
+
+    use super::*;
 
     #[test]
     fn test_next_page() {

@@ -7,9 +7,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::fmt;
+
 use serde::Deserialize;
 use serde::Serialize;
-use std::fmt;
 
 use super::response::*;
 
@@ -392,8 +393,9 @@ pub struct Amd64ExtraRegs {
 
 #[cfg(test)]
 mod test {
-    use super::*;
     use std::mem;
+
+    use super::*;
 
     #[test]
     fn fp80_sanity() {

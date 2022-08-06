@@ -23,13 +23,15 @@
 //! [`PerfCounter::DISABLE_SAMPLE_PERIOD`] can be used to avoid this for sampling.
 //! events.
 
-use crate::validation::check_for_pmu_bugs;
-use crate::validation::PmuValidationError;
 use core::ptr::NonNull;
+#[allow(unused_imports)] // only used if we have an error
+use std::compile_error;
+
 use lazy_static::lazy_static;
 use nix::sys::signal::Signal;
 use nix::unistd::sysconf;
 use nix::unistd::SysconfVar;
+pub use perf::perf_event_header;
 use perf_event_open_sys::bindings as perf;
 use perf_event_open_sys::ioctls;
 use reverie::Errno;
@@ -37,10 +39,8 @@ use reverie::Tid;
 use tracing::info;
 use tracing::warn;
 
-#[allow(unused_imports)] // only used if we have an error
-use std::compile_error;
-
-pub use perf::perf_event_header;
+use crate::validation::check_for_pmu_bugs;
+use crate::validation::PmuValidationError;
 
 lazy_static! {
     static ref PMU_BUG: Result<(), PmuValidationError> = check_for_pmu_bugs();
@@ -615,8 +615,9 @@ pub fn do_branches(count: u64) {
 
 #[cfg(test)]
 mod test {
-    use super::*;
     use nix::unistd::gettid;
+
+    use super::*;
 
     #[test]
     fn trace_self() {

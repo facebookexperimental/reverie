@@ -7,14 +7,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use anyhow::bail;
-use anyhow::Error;
-use futures::future;
-use structopt::StructOpt;
-use tempfile::TempDir;
-
-use reverie::process::Output;
-
 use std::fs;
 use std::io;
 use std::io::BufRead;
@@ -22,6 +14,13 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitStatus;
+
+use anyhow::bail;
+use anyhow::Error;
+use futures::future;
+use reverie::process::Output;
+use structopt::StructOpt;
+use tempfile::TempDir;
 
 mod client;
 mod server;

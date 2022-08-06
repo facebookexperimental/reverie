@@ -36,7 +36,6 @@ use bytes::Bytes;
 use bytes::BytesMut;
 use num_traits::AsPrimitive;
 use num_traits::PrimInt;
-
 use reverie::Errno;
 
 use super::Error;

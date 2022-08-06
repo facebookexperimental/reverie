@@ -7,8 +7,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use bytes::BytesMut;
+
 use crate::gdbstub::commands::*;
 use crate::gdbstub::hex::*;
-use bytes::BytesMut;
 
 pub struct R;

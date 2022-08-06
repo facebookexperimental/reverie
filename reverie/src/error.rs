@@ -9,9 +9,8 @@
 
 //! Error handling.
 
-use thiserror::Error;
-
 pub use reverie_syscalls::Errno;
+use thiserror::Error;
 
 /// A general error.
 #[derive(Error, Debug)]

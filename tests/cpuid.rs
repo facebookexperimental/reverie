@@ -10,16 +10,14 @@
 //! Tests cpuid interception
 
 use raw_cpuid::CpuIdResult;
-
-use serde::Deserialize;
-use serde::Serialize;
-
 use reverie::Errno;
 use reverie::GlobalTool;
 use reverie::Guest;
 use reverie::Pid;
 use reverie::Subscription;
 use reverie::Tool;
+use serde::Deserialize;
+use serde::Serialize;
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 struct GlobalState {
@@ -137,9 +135,9 @@ fn cpuid_leaf_count() {
 #[cfg(not(sanitized))]
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use reverie_ptrace::testing::check_fn;
+
+    use super::*;
 
     #[test]
     fn run_guest_func_cpuid_intercepted_test() {

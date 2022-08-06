@@ -7,7 +7,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 use reverie::syscalls::Sysno;
-
 use serde::Deserialize;
 use serde::Serialize;
 

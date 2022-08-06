@@ -6,11 +6,8 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
-use serde::Deserialize;
-use serde::Serialize;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use structopt::StructOpt;
 
 use reverie::syscalls::Displayable;
 use reverie::syscalls::Errno;
@@ -21,6 +18,9 @@ use reverie::Guest;
 use reverie::Pid;
 use reverie::Tool;
 use reverie_util::CommonToolArguments;
+use serde::Deserialize;
+use serde::Serialize;
+use structopt::StructOpt;
 
 /// A tool to introduce inject "chaos" into a running process. A pathological
 /// kernel is simulated by forcing reads to only return one byte a time.

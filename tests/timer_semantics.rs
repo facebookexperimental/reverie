@@ -16,6 +16,9 @@
 use core::arch::x86_64::__cpuid;
 use core::arch::x86_64::__rdtscp;
 use core::arch::x86_64::_rdtsc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+
 use reverie::syscalls::Getpid;
 use reverie::syscalls::Gettid;
 use reverie::syscalls::Syscall;
@@ -33,8 +36,6 @@ use reverie::TimerSchedule;
 use reverie::Tool;
 use serde::Deserialize;
 use serde::Serialize;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct GlobalState {
@@ -329,11 +330,12 @@ mod timer_tests {
     //! into the tracee, otherwise underflow or overflow checks will break the
     //! tests.
 
-    use super::*;
     use reverie_ptrace::ret_without_perf;
     use reverie_ptrace::testing::check_fn_with_config;
     use reverie_ptrace::testing::do_branches;
     use test_case::test_case;
+
+    use super::*;
 
     #[test_case(MANY_RCBS, sched_precise)]
     #[test_case(MANY_RCBS, sched_imprecise)]
@@ -644,11 +646,12 @@ mod timer_tests {
 
 #[cfg(all(not(sanitized), test))]
 mod clock_tests {
-    use super::*;
     use reverie_ptrace::ret_without_perf;
     use reverie_ptrace::testing::check_fn;
     use reverie_ptrace::testing::do_branches;
     use test_case::test_case;
+
+    use super::*;
 
     #[test]
     fn clock_accuracy() {
@@ -724,9 +727,10 @@ mod clock_tests {
 
 #[cfg(all(not(sanitized), test))]
 mod general {
-    use super::*;
     use reverie_ptrace::ret_without_perf;
     use reverie_ptrace::testing::check_fn_with_config;
+
+    use super::*;
 
     #[test]
     fn basic() {

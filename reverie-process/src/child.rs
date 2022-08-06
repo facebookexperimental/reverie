@@ -6,8 +6,17 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
-use super::ExitStatus;
-use super::Pid;
+use core::fmt;
+use core::future::Future;
+use core::pin::Pin;
+use core::task::Context;
+use core::task::Poll;
+use std::io;
+
+use nix::sys::signal::Signal;
+use serde::Deserialize;
+use serde::Serialize;
+use syscalls::Errno;
 
 use super::seccomp::SeccompNotif;
 use super::stdio::ChildStderr;
@@ -15,18 +24,8 @@ use super::stdio::ChildStdin;
 use super::stdio::ChildStdout;
 use super::stdio::Stdio;
 use super::Command;
-
-use core::fmt;
-use core::future::Future;
-use core::pin::Pin;
-use core::task::Context;
-use core::task::Poll;
-
-use nix::sys::signal::Signal;
-use serde::Deserialize;
-use serde::Serialize;
-use std::io;
-use syscalls::Errno;
+use super::ExitStatus;
+use super::Pid;
 
 /// Represents a child process.
 ///

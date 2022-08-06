@@ -9,9 +9,6 @@
 
 //! Tests for process and thread state.
 
-use serde::Deserialize;
-use serde::Serialize;
-
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::ExitGroup;
@@ -26,6 +23,8 @@ use reverie::Error;
 use reverie::Guest;
 use reverie::Stack;
 use reverie::Tool;
+use serde::Deserialize;
+use serde::Serialize;
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 struct LocalState;
@@ -169,8 +168,9 @@ impl Tool for LocalState3 {
 
 #[cfg(all(not(sanitized), test))]
 mod tests {
-    use super::*;
     use reverie_ptrace::testing::check_fn;
+
+    use super::*;
 
     #[test]
     fn stack_allocator_should_work() {

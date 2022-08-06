@@ -6,9 +6,9 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
-use super::Pid;
-
 use std::path::PathBuf;
+
+use super::Pid;
 
 /// A segment of a memory map for a loaded library.
 #[derive(Debug, Copy, Clone)]
@@ -59,8 +59,9 @@ pub struct Libraries {
 impl Libraries {
     /// Loads the list of libraries that have been mapped by the given process.
     pub fn new(pid: Pid) -> Result<Self, procfs::ProcError> {
-        use procfs::process::MMapPath;
         use std::collections::BTreeMap;
+
+        use procfs::process::MMapPath;
 
         let process = procfs::process::Process::new(pid.as_raw())?;
         let maps = process.maps()?;

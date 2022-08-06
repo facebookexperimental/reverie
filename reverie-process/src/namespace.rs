@@ -7,9 +7,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::str::FromStr;
+
 use serde::Deserialize;
 use serde::Serialize;
-use std::str::FromStr;
 
 bitflags::bitflags! {
     /// A namespace that may be unshared with [`Command::unshare`].

@@ -7,12 +7,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use super::util;
-
 use core::pin::Pin;
 use core::task::Context;
 use core::task::Poll;
-
 use std::ffi::CStr;
 use std::ffi::CString;
 use std::io;
@@ -30,6 +27,8 @@ use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::io::Interest;
 use tokio::io::ReadBuf;
+
+use super::util;
 
 #[derive(Debug)]
 // From `std/src/sys/unix/fd.rs`. Mark `-1` as an invalid file descriptor so it
@@ -498,9 +497,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use const_cstr::const_cstr;
     use std::os::unix::ffi::OsStrExt;
+
+    use const_cstr::const_cstr;
+
+    use super::*;
 
     #[test]
     fn test_is_dir() {

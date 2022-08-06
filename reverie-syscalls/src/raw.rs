@@ -190,8 +190,9 @@ where
 
 #[cfg(test)]
 mod test {
-    use super::*;
     use nix::unistd::Pid;
+
+    use super::*;
 
     #[test]
     fn test_results() {

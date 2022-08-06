@@ -65,11 +65,13 @@ impl Tool for LocalState {
 
 #[cfg(all(not(sanitized), test))]
 mod tests {
-    use super::*;
-    use nix::sys::signal;
-    use reverie_ptrace::testing::check_fn;
     use std::io;
     use std::mem::MaybeUninit;
+
+    use nix::sys::signal;
+    use reverie_ptrace::testing::check_fn;
+
+    use super::*;
 
     // kernel_sigset_t used by naked syscall
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]

@@ -7,12 +7,12 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use reverie::Pid;
+use tokio::sync::mpsc;
+
 use super::commands::*;
 use super::Error;
 use super::GdbRequest;
-
-use reverie::Pid;
-use tokio::sync::mpsc;
 
 /// Thread id and Pid use to uniquely indentify an inferior.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

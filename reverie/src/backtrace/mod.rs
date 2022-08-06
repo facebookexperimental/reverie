@@ -11,18 +11,18 @@ mod library;
 mod symbols;
 
 use core::fmt;
-use serde::Deserialize;
-use serde::Serialize;
 use std::borrow::Cow;
 use std::fs::File;
 use std::io;
 use std::io::Read;
 use std::path::PathBuf;
 
-use super::Pid;
+use serde::Deserialize;
+use serde::Serialize;
 
 use self::cache::cache;
 use self::library::Libraries;
+use super::Pid;
 
 /// A backtrace is a list of stack frames. These stack frames may have originated
 /// from a remote process.

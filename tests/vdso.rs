@@ -65,10 +65,12 @@ impl Tool for LocalState {
 
 #[cfg(all(not(sanitized), test))]
 mod tests {
-    use super::*;
-    use reverie_ptrace::testing::check_fn;
     use std::mem::MaybeUninit;
     use std::time;
+
+    use reverie_ptrace::testing::check_fn;
+
+    use super::*;
 
     #[test]
     #[should_panic]

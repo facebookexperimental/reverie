@@ -9,6 +9,25 @@
 
 pub mod family;
 
+use ::syscalls::SyscallArgs;
+use ::syscalls::Sysno;
+// Re-export flags that used by syscalls from the `nix` crate so downstream
+// projects don't need to add another dependency on it.
+pub use nix::fcntl::AtFlags;
+pub use nix::fcntl::OFlag;
+// FIXME: Switch everything over to `crate::args::CloneFlags`.
+use nix::sched::CloneFlags;
+pub use nix::sys::epoll::EpollCreateFlags;
+pub use nix::sys::eventfd::EfdFlags;
+pub use nix::sys::inotify::InitFlags;
+pub use nix::sys::mman::MapFlags;
+pub use nix::sys::mman::ProtFlags;
+pub use nix::sys::signalfd::SfdFlags;
+pub use nix::sys::socket::SockFlag;
+pub use nix::sys::stat::Mode;
+pub use nix::sys::timerfd::TimerFlags;
+pub use nix::sys::wait::WaitPidFlag;
+
 use crate::args::ioctl;
 use crate::args::ArchPrctlCmd;
 use crate::args::CArrayPtr;
@@ -29,26 +48,6 @@ use crate::display::Displayable;
 use crate::memory::Addr;
 use crate::memory::AddrMut;
 use crate::raw::FromToRaw;
-use ::syscalls::SyscallArgs;
-use ::syscalls::Sysno;
-
-// FIXME: Switch everything over to `crate::args::CloneFlags`.
-use nix::sched::CloneFlags;
-
-// Re-export flags that used by syscalls from the `nix` crate so downstream
-// projects don't need to add another dependency on it.
-pub use nix::fcntl::AtFlags;
-pub use nix::fcntl::OFlag;
-pub use nix::sys::epoll::EpollCreateFlags;
-pub use nix::sys::eventfd::EfdFlags;
-pub use nix::sys::inotify::InitFlags;
-pub use nix::sys::mman::MapFlags;
-pub use nix::sys::mman::ProtFlags;
-pub use nix::sys::signalfd::SfdFlags;
-pub use nix::sys::socket::SockFlag;
-pub use nix::sys::stat::Mode;
-pub use nix::sys::timerfd::TimerFlags;
-pub use nix::sys::wait::WaitPidFlag;
 
 /// A trait that all syscalls implement.
 pub trait SyscallInfo: Displayable + Copy + Send {
@@ -3284,16 +3283,16 @@ typed_syscall! {
 
 #[cfg(test)]
 mod test {
-    use super::*;
-    use crate::Displayable;
-    use crate::LocalMemory;
-    use crate::ReadAddr;
-
     use std::ffi::CString;
     use std::path::Path;
 
     use syscalls::SyscallArgs;
     use syscalls::Sysno;
+
+    use super::*;
+    use crate::Displayable;
+    use crate::LocalMemory;
+    use crate::ReadAddr;
 
     #[test]
     fn test_syscall_open() {

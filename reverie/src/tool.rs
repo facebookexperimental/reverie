@@ -13,6 +13,13 @@
 //! thread) instrumentation, though in some backends these will execute in the
 //! same process.
 
+use async_trait::async_trait;
+use raw_cpuid::cpuid;
+use raw_cpuid::CpuIdResult;
+use reverie_syscalls::Syscall;
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+
 use crate::error::Errno;
 use crate::error::Error;
 use crate::guest::Guest;
@@ -23,12 +30,6 @@ use crate::Pid;
 use crate::Signal;
 use crate::Subscription;
 use crate::Tid;
-use async_trait::async_trait;
-use raw_cpuid::cpuid;
-use raw_cpuid::CpuIdResult;
-use reverie_syscalls::Syscall;
-use serde::de::DeserializeOwned;
-use serde::Serialize;
 
 /// The global half of a complete Reverie tool.
 ///

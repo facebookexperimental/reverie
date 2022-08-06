@@ -6,7 +6,11 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
+use std::io;
+use std::io::Write;
+
 use super::clone::clone;
+use super::container::ChildContext;
 use super::error::Context;
 use super::error::Error;
 use super::fd::pipe;
@@ -20,11 +24,6 @@ use super::util::CStringArray;
 use super::util::SharedValue;
 use super::Child;
 use super::Command;
-
-use super::container::ChildContext;
-
-use std::io;
-use std::io::Write;
 
 impl Command {
     /// Executes the command as a child process, returning a handle to it.

@@ -35,6 +35,8 @@ mod spawn;
 mod stdio;
 mod util;
 
+use std::ffi::CString;
+
 pub use child::Child;
 pub use child::Output;
 pub use container::Container;
@@ -47,6 +49,8 @@ pub use mount::Mount;
 pub use mount::MountFlags;
 pub use mount::MountParseError;
 pub use namespace::Namespace;
+// Re-export Signal since it is used by `Child::signal`.
+pub use nix::sys::signal::Signal;
 pub use pid::Pid;
 pub use pty::Pty;
 pub use pty::PtyChild;
@@ -54,12 +58,6 @@ pub use stdio::ChildStderr;
 pub use stdio::ChildStdin;
 pub use stdio::ChildStdout;
 pub use stdio::Stdio;
-
-// Re-export Signal since it is used by `Child::signal`.
-pub use nix::sys::signal::Signal;
-
-use std::ffi::CString;
-
 use syscalls::Errno;
 
 /// A builder for spawning a process.
@@ -155,13 +153,13 @@ impl Command {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::ExitStatus;
-
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::Path;
     use std::str::from_utf8;
+
+    use super::*;
+    use crate::ExitStatus;
 
     #[tokio::test]
     async fn spawn() {
@@ -610,8 +608,9 @@ mod tests {
 
     #[tokio::test]
     async fn seccomp() {
-        use super::seccomp::*;
         use syscalls::Sysno;
+
+        use super::seccomp::*;
 
         let filter = FilterBuilder::new()
             .default_action(Action::Allow)
@@ -634,12 +633,14 @@ mod tests {
 
     #[tokio::test]
     async fn seccomp_notify() {
-        use super::seccomp::*;
+        use std::collections::HashMap;
+
         use futures::future::select;
         use futures::future::Either;
         use futures::stream::TryStreamExt;
-        use std::collections::HashMap;
         use syscalls::Sysno;
+
+        use super::seccomp::*;
 
         let filter = FilterBuilder::new()
             .default_action(Action::Notify)

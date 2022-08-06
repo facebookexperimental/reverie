@@ -11,6 +11,13 @@
 //! Basic tests that don't fall into some other category.
 
 #[allow(unused_imports)]
+use std::ffi::CString;
+#[allow(unused_imports)]
+use std::io::Write;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+
+#[allow(unused_imports)]
 use nix::sys::wait;
 #[allow(unused_imports)]
 use nix::sys::wait::WaitStatus;
@@ -35,12 +42,6 @@ use reverie_ptrace::testing::test_cmd;
 use reverie_ptrace::testing::test_fn;
 use serde::Deserialize;
 use serde::Serialize;
-#[allow(unused_imports)]
-use std::ffi::CString;
-#[allow(unused_imports)]
-use std::io::Write;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Default)]
 struct NoopTool;
@@ -182,10 +183,11 @@ fn run_guest_func_print_test() {
 #[cfg(not(sanitized))]
 #[test]
 fn orphans() {
-    use nix::unistd::fork;
-    use nix::unistd::ForkResult;
     use std::thread;
     use std::time::Duration;
+
+    use nix::unistd::fork;
+    use nix::unistd::ForkResult;
 
     let (output, _state) = test_fn::<CounterLocal, _>(|| {
         // Spawn a child process and make sure the parent exits before the child

@@ -6,10 +6,6 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
-use super::fd::pipe;
-use super::fd::AsyncFd;
-use super::fd::Fd;
-
 use core::pin::Pin;
 use core::task::Context;
 use core::task::Poll;
@@ -22,6 +18,10 @@ use syscalls::Errno;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::io::ReadBuf;
+
+use super::fd::pipe;
+use super::fd::AsyncFd;
+use super::fd::Fd;
 
 /// Describes what to do with a standard I/O stream for a child process when
 /// passed to the [`stdin`], [`stdout`], and [`stderr`] methods of [`Command`].

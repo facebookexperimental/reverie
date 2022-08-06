@@ -8,10 +8,10 @@
  */
 
 use bytes::BytesMut;
+use reverie::Pid;
 
 use crate::gdbstub::commands::*;
 use crate::gdbstub::hex::*;
-use reverie::Pid;
 
 #[derive(PartialEq, Debug)]
 pub struct vKill {

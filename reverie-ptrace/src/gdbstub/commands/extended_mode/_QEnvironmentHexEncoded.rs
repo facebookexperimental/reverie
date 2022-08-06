@@ -7,9 +7,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use bytes::Bytes;
+
 use crate::gdbstub::commands::*;
 use crate::gdbstub::hex::*;
-use bytes::Bytes;
 
 pub struct QEnvironmentHexEncoded {
     pub key: Bytes,

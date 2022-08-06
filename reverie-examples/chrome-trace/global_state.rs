@@ -6,18 +6,17 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
-use reverie::GlobalTool;
-use reverie::Pid;
-
-use serde::Deserialize;
-use serde::Serialize;
-
-use crate::event::ThreadExit;
-
 use std::io;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::SystemTime;
+
+use reverie::GlobalTool;
+use reverie::Pid;
+use serde::Deserialize;
+use serde::Serialize;
+
+use crate::event::ThreadExit;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Program {

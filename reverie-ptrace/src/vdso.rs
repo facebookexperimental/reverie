@@ -12,8 +12,9 @@
  */
 
 //! provide APIs to disable VDSOs at runtime.
-use goblin::elf::Elf;
+use std::collections::HashMap;
 
+use goblin::elf::Elf;
 use lazy_static::lazy_static;
 use nix::sys::mman::ProtFlags;
 use nix::unistd;
@@ -23,7 +24,6 @@ use reverie::syscalls::Mprotect;
 use reverie::Error;
 use reverie::Guest;
 use reverie::Tool;
-use std::collections::HashMap;
 use tracing::debug;
 
 /*
