@@ -84,16 +84,15 @@ use nix::sys::wait::WaitPidFlag;
 use nix::sys::wait::WaitStatus;
 use parking_lot::Mutex;
 
+use super::peek_all;
 use super::waitid;
-use crate::trace;
-use crate::trace::peek_all;
-use crate::trace::Errno;
-use crate::trace::Error;
-use crate::trace::Pid;
-use crate::trace::Running;
-use crate::trace::Stopped;
-use crate::trace::TryWait;
-use crate::trace::Wait;
+use super::Errno;
+use super::Error;
+use super::Pid;
+use super::Running;
+use super::Stopped;
+use super::TryWait;
+use super::Wait;
 
 lazy_static! {
     static ref NOTIFIER: Notifier = Notifier::new();

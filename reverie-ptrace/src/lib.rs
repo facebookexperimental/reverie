@@ -51,7 +51,6 @@ mod stack;
 mod task;
 pub mod testing;
 mod timer;
-pub mod trace;
 mod tracer;
 mod validation;
 mod vdso;

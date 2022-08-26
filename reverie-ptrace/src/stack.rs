@@ -16,9 +16,8 @@ use reverie::syscalls::MemoryAccess;
 use reverie::Errno;
 use reverie::Pid;
 use reverie::Stack;
-
-use crate::trace::Error as TraceError;
-use crate::trace::Stopped;
+use safeptrace::Error as TraceError;
+use safeptrace::Stopped;
 
 // NB: leaf function can use redzone without explicit stack allocation, as
 // a result it is not safe to just adjust stack pointer. 128B of stack

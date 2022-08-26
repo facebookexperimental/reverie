@@ -7,6 +7,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#![deny(missing_docs)]
+#![deny(rustdoc::broken_intra_doc_links)]
+
 //! A safe ptrace API. This API forces correct usage of ptrace in that it is
 //! not possible to call ptrace on a process not in a stopped state.
 mod memory;
@@ -24,9 +27,9 @@ pub use nix::sys::ptrace::Options;
 pub use nix::sys::signal::Signal;
 use nix::sys::wait::WaitPidFlag;
 use nix::sys::wait::WaitStatus;
-pub use reverie::Errno;
-pub use reverie::ExitStatus;
-pub use reverie::Pid;
+pub use reverie_process::ExitStatus;
+pub use reverie_process::Pid;
+pub use syscalls::Errno;
 use thiserror::Error;
 use waitid::waitid;
 use waitid::IdType;
@@ -982,7 +985,7 @@ mod test {
     where
         F: FnOnce() -> i32,
     {
-        match unsafe { fork() }.map_err(|err| err)? {
+        match unsafe { fork() }? {
             ForkResult::Parent { child, .. } => {
                 let mut running = Running::seize(child.into(), options)?;
 

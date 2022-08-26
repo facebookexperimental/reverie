@@ -20,9 +20,8 @@ use nix::sys::signal;
 use reverie::syscalls::Addr;
 use reverie::syscalls::MemoryAccess;
 use reverie::Pid;
+use safeptrace::Stopped;
 use tracing::debug;
-
-use crate::trace::Stopped;
 
 // TODO: could check whether or not stack is valid
 fn show_stackframe(tid: Pid, stack: u64, top_size: usize, bot_size: usize) -> String {

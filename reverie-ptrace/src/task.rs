@@ -54,6 +54,12 @@ use reverie::Symbol;
 use reverie::Tid;
 use reverie::TimerSchedule;
 use reverie::Tool;
+use safeptrace::ChildOp;
+use safeptrace::Error as TraceError;
+use safeptrace::Event;
+use safeptrace::Running;
+use safeptrace::Stopped;
+use safeptrace::Wait;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -82,12 +88,6 @@ use crate::stack::GuestStack;
 use crate::timer::HandleFailure;
 use crate::timer::Timer;
 use crate::timer::TimerEventRequest;
-use crate::trace::ChildOp;
-use crate::trace::Error as TraceError;
-use crate::trace::Event;
-use crate::trace::Running;
-use crate::trace::Stopped;
-use crate::trace::Wait;
 use crate::vdso;
 
 #[derive(Debug)]

@@ -9,8 +9,6 @@
 
 use thiserror::Error;
 
-use crate::trace;
-
 /// A reverie-ptrace error. This error type isn't meant to be exposed to the
 /// user.
 #[derive(Error, Debug)]
@@ -19,7 +17,7 @@ pub enum Error {
     /// implementation detail. None of these errors should make it through to the
     /// user.
     #[error(transparent)]
-    Internal(#[from] trace::Error),
+    Internal(#[from] safeptrace::Error),
 
     /// A public error.
     #[error(transparent)]

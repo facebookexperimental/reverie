@@ -42,6 +42,8 @@ use paste::paste;
 use reverie::ExitStatus;
 use reverie::Pid;
 use reverie::Signal;
+use safeptrace::ChildOp;
+use safeptrace::Stopped;
 use thiserror::Error;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
@@ -55,8 +57,6 @@ use crate::gdbstub::Inferior;
 use crate::gdbstub::InferiorThreadId;
 use crate::gdbstub::ResumeInferior;
 use crate::gdbstub::StoppedInferior;
-use crate::trace::ChildOp;
-use crate::trace::Stopped;
 
 mod base;
 mod extended_mode;

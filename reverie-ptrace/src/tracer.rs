@@ -38,6 +38,10 @@ use reverie::GlobalTool;
 use reverie::Pid;
 use reverie::Subscription;
 use reverie::Tool;
+use safeptrace::Error as TraceError;
+use safeptrace::Event;
+use safeptrace::Running;
+use safeptrace::Stopped;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 
@@ -45,11 +49,6 @@ use crate::cp;
 use crate::gdbstub::GdbServer;
 use crate::task::Child;
 use crate::task::TracedTask;
-use crate::trace;
-use crate::trace::Error as TraceError;
-use crate::trace::Event;
-use crate::trace::Running;
-use crate::trace::Stopped;
 
 /// Represents the tracer.
 ///
@@ -194,7 +193,7 @@ fn init_tracee(intercept_rdtsc: bool) -> Result<(), Errno> {
         }
     }
 
-    trace::traceme_and_stop()?;
+    safeptrace::traceme_and_stop()?;
 
     unsafe {
         signal::sigaction(

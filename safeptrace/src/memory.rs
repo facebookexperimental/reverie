@@ -10,12 +10,12 @@ use core::mem;
 use std::io;
 
 use nix::sys::ptrace;
-use reverie::syscalls::Addr;
-use reverie::syscalls::AddrMut;
-use reverie::syscalls::AddrSlice;
-use reverie::syscalls::AddrSliceMut;
-use reverie::syscalls::Errno;
-use reverie::syscalls::MemoryAccess;
+use reverie_syscalls::Addr;
+use reverie_syscalls::AddrMut;
+use reverie_syscalls::AddrSlice;
+use reverie_syscalls::AddrSliceMut;
+use reverie_syscalls::Errno;
+use reverie_syscalls::MemoryAccess;
 
 use super::Stopped;
 
@@ -206,7 +206,7 @@ mod test {
     use nix::unistd::ForkResult;
     use quickcheck::QuickCheck;
     use quickcheck_macros::quickcheck;
-    use reverie::Pid;
+    use reverie_process::Pid;
 
     use super::*;
 

@@ -7,11 +7,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use safeptrace::Error as TraceError;
 use tokio::sync::oneshot;
 
 use super::Amd64CoreRegs;
 use super::Breakpoint;
-use crate::trace::Error as TraceError;
 
 /// gdb request send to reverie.
 #[derive(Debug)]

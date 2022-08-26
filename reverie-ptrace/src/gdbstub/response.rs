@@ -37,10 +37,10 @@ use bytes::BytesMut;
 use num_traits::AsPrimitive;
 use num_traits::PrimInt;
 use reverie::Errno;
+use safeptrace::Error as TraceError;
 
 use super::Error;
 use super::PacketLogger;
-use crate::trace::Error as TraceError;
 
 /// Trait to write gdb reply. This is different than `Fmt` for `Display`,
 /// As the response must be a valid gdb packet reply, which does not

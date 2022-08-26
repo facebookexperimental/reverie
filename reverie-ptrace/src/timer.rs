@@ -35,15 +35,15 @@ use reverie::Errno;
 use reverie::Pid;
 use reverie::Signal;
 use reverie::Tid;
+use safeptrace::Error as TraceError;
+use safeptrace::Event as TraceEvent;
+use safeptrace::Stopped;
+use safeptrace::Wait;
 use thiserror::Error;
 use tracing::debug;
 use tracing::warn;
 
 use crate::perf::*;
-use crate::trace::Error as TraceError;
-use crate::trace::Event as TraceEvent;
-use crate::trace::Stopped;
-use crate::trace::Wait;
 
 // This signal is unused, in that the kernel will never send it to a process.
 const MARKER_SIGNAL: Signal = reverie::PERF_EVENT_SIGNAL;

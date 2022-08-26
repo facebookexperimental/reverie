@@ -10,12 +10,12 @@
 use std::io;
 
 use reverie::Pid;
+use safeptrace::Error as TraceError;
 use thiserror::Error;
 
 use super::commands::CommandParseError;
 use super::hex::GdbHexError;
 use super::packet::PacketParseError;
-use crate::trace::Error as TraceError;
 
 #[derive(Error, Debug)]
 #[allow(clippy::enum_variant_names)]
