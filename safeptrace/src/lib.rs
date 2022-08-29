@@ -431,68 +431,6 @@ impl TryFrom<WaitStatus> for Wait {
     }
 }
 
-/// Temporary conversion back to a `WaitStatus`. Used for refactoring
-/// scaffolding.
-impl From<Wait> for WaitStatus {
-    fn from(wait: Wait) -> WaitStatus {
-        match wait {
-            Wait::Stopped(stopped, event) => {
-                let pid = stopped.pid();
-                match event {
-                    Event::NewChild(op, _child) => match op {
-                        ChildOp::Fork => WaitStatus::PtraceEvent(
-                            pid.into(),
-                            Signal::SIGTRAP,
-                            libc::PTRACE_EVENT_FORK,
-                        ),
-                        ChildOp::Vfork => WaitStatus::PtraceEvent(
-                            pid.into(),
-                            Signal::SIGTRAP,
-                            libc::PTRACE_EVENT_VFORK,
-                        ),
-                        ChildOp::Clone => WaitStatus::PtraceEvent(
-                            pid.into(),
-                            Signal::SIGTRAP,
-                            libc::PTRACE_EVENT_CLONE,
-                        ),
-                    },
-                    Event::Exec(_) => WaitStatus::PtraceEvent(
-                        pid.into(),
-                        Signal::SIGTRAP,
-                        libc::PTRACE_EVENT_EXEC,
-                    ),
-                    Event::VforkDone => WaitStatus::PtraceEvent(
-                        pid.into(),
-                        Signal::SIGTRAP,
-                        libc::PTRACE_EVENT_VFORK_DONE,
-                    ),
-                    Event::Exit => WaitStatus::PtraceEvent(
-                        pid.into(),
-                        Signal::SIGTRAP,
-                        libc::PTRACE_EVENT_EXIT,
-                    ),
-                    Event::Seccomp => WaitStatus::PtraceEvent(
-                        pid.into(),
-                        Signal::SIGTRAP,
-                        libc::PTRACE_EVENT_SECCOMP,
-                    ),
-                    Event::Stop => WaitStatus::PtraceEvent(
-                        pid.into(),
-                        Signal::SIGSTOP,
-                        libc::PTRACE_EVENT_STOP,
-                    ),
-                    Event::Syscall => WaitStatus::PtraceSyscall(pid.into()),
-                    Event::Signal(sig) => WaitStatus::Stopped(pid.into(), sig),
-                }
-            }
-            Wait::Exited(pid, ExitStatus::Exited(code)) => WaitStatus::Exited(pid.into(), code),
-            Wait::Exited(pid, ExitStatus::Signaled(signal, core_dump)) => {
-                WaitStatus::Signaled(pid.into(), signal, core_dump)
-            }
-        }
-    }
-}
-
 impl fmt::Display for Wait {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
