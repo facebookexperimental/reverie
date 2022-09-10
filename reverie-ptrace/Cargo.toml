@@ -25,7 +25,7 @@ raw-cpuid = "10.0"
 reverie = { version = "0.1.0", path = "../reverie" }
 safeptrace = { version = "0.1.0", path = "../safeptrace" }
 serde = { version = "1.0.136", features = ["derive", "rc"] }
-thiserror = "1.0.30"
+thiserror = "=1.0.30"
 tokio = { version = "1.15", features = ["full", "test-util", "tracing"] }
 tokio-stream = { version = "0.1.4", features = ["fs", "io-util", "net", "signal", "sync", "time"] }
 tracing = "0.1.35"
