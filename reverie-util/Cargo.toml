@@ -10,7 +10,7 @@ license = "BSD-2-Clause"
 [dependencies]
 bitvec = { version = "0.17", features = ["serde"] }
 chrono = { version = "0.4", features = ["clock", "serde", "std"], default-features = false }
-libc = "0.2.121"
+libc = "=0.2.125"
 nix = "0.23"
 reverie = { version = "0.1.0", path = "../reverie" }
 serde = { version = "1.0.136", features = ["derive", "rc"] }
