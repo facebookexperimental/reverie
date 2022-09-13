@@ -16,7 +16,7 @@ libc = "=0.2.125"
 nix = "0.23"
 serde = { version = "1.0.136", features = ["derive", "rc"] }
 syscalls = { version = "0.6.6", features = ["serde"] }
-thiserror = "=1.0.30"
+thiserror = "1.0.34"
 tokio = { version = "1.15", features = ["full", "test-util", "tracing"] }
 
 [dev-dependencies]
