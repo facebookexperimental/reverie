@@ -21,6 +21,7 @@ mod fcntl;
 pub mod ioctl;
 mod poll;
 mod stat;
+mod sysinfo;
 mod time;
 
 pub use clone::*;
@@ -32,6 +33,7 @@ pub use poll::*;
 use serde::Deserialize;
 use serde::Serialize;
 pub use stat::*;
+pub use sysinfo::*;
 pub use time::*;
 
 use crate::Addr;
