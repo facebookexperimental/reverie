@@ -478,7 +478,7 @@ where
     if let Some(parent_index) = path
         .iter()
         .rev()
-        .position(|c| *c == b'/' as i8)
+        .position(|c| *c == b'/' as libc::c_char)
         .map(|i| path.len() - i)
     {
         // NB: the index is guaranteed to be >0.
@@ -487,7 +487,7 @@ where
         let result = f(Some(&mut path[..parent_index]));
 
         // Restore the path to its former glory.
-        path[parent_index - 1] = b'/' as i8;
+        path[parent_index - 1] = b'/' as libc::c_char;
 
         result
     } else {
