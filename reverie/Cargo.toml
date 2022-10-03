@@ -18,7 +18,7 @@ lazy_static = "1.4"
 libc = "0.2.132"
 linked-hash-map = { version = "0.5", features = ["serde_impl"] }
 memmap = "0.7"
-nix = "0.23"
+nix = "0.25"
 object = { version = "0.28", features = ["write"] }
 procfs = "0.9"
 raw-cpuid = "10.6.0"

@@ -175,7 +175,12 @@ mod tests {
     #[test]
     fn stack_allocator_should_work() {
         check_fn::<LocalState, _>(|| {
-            assert_ne!(nix::sys::utsname::uname().sysname(), "");
+            assert_ne!(
+                nix::sys::utsname::uname()
+                    .expect("Failed getting uname.")
+                    .sysname(),
+                ""
+            );
             unsafe { libc::syscall(libc::SYS_exit_group, 0) };
         });
     }

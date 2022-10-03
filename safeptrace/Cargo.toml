@@ -12,7 +12,7 @@ bitflags = "1.3"
 futures = { version = "0.3.22", features = ["async-await", "compat"] }
 lazy_static = "1.4"
 libc = "0.2.132"
-nix = "0.23"
+nix = "0.25"
 parking_lot = { version = "0.11.2", features = ["send_guard"] }
 reverie-process = { version = "0.1.0", path = "../reverie-process" }
 reverie-syscalls = { version = "0.1.0", path = "../reverie-syscalls" }

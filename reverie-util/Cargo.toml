@@ -8,11 +8,12 @@ edition = "2021"
 license = "BSD-2-Clause"
 
 [dependencies]
+anyhow = "1.0.65"
 bitvec = { version = "0.17", features = ["serde"] }
 chrono = { version = "0.4", features = ["clock", "serde", "std"], default-features = false }
 clap = { version = "3.2.17", features = ["derive", "regex", "unicode", "wrap_help"] }
 libc = "0.2.132"
-nix = "0.23"
+nix = "0.25"
 reverie = { version = "0.1.0", path = "../reverie" }
 serde = { version = "1.0.136", features = ["derive", "rc"] }
 tracing = "0.1.35"

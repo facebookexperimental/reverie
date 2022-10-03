@@ -7,8 +7,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::io::IoSlice;
+
 use nix::sys::uio;
-use nix::sys::uio::IoVec;
 use nix::sys::uio::RemoteIoVec;
 use nix::unistd::Pid;
 
@@ -45,7 +46,7 @@ pub fn populate_mmap_page(pid: Pid, page_address: u64) -> nix::Result<()> {
     #[cfg(target_arch = "aarch64")]
     const SOFTWARE_INTERUPT: u8 = 0x00; // For aarch64, we should use BRK 1 but as it is not a single-byte instruction, we'll use a sequence of 0x00 (same as a sequence of udf #0x0 instructions)
     syscall_stubs.resize_with(TRAMPOLINE_SIZE, || SOFTWARE_INTERUPT);
-    let local_iov = &[IoVec::from_slice(syscall_stubs.as_slice())];
+    let local_iov = &[IoSlice::new(syscall_stubs.as_slice())];
     let remote_iov = &[RemoteIoVec {
         base: page_address as usize,
         len: TRAMPOLINE_SIZE,
