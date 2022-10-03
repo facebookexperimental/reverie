@@ -10,11 +10,11 @@ license = "BSD-2-Clause"
 [dependencies]
 bitvec = { version = "0.17", features = ["serde"] }
 chrono = { version = "0.4", features = ["clock", "serde", "std"], default-features = false }
+clap = { version = "3.2.17", features = ["derive", "regex", "unicode", "wrap_help"] }
 libc = "0.2.132"
 nix = "0.23"
 reverie = { version = "0.1.0", path = "../reverie" }
 serde = { version = "1.0.136", features = ["derive", "rc"] }
-structopt = "0.3.23"
 tracing = "0.1.35"
 tracing-appender = "0.2.2"
 tracing-subscriber = { version = "0.3.14", features = ["ansi", "env-filter", "fmt", "json", "local-time", "parking_lot", "registry"] }

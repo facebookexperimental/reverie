@@ -19,20 +19,20 @@ use std::io;
 use std::path::PathBuf;
 
 use anyhow::Context;
+use clap::Parser;
 use reverie::Error;
 use reverie_util::CommonToolArguments;
-use structopt::StructOpt;
 use tool::ChromeTrace;
 
 /// A tool to render a summary of the process tree.
-#[derive(Debug, StructOpt)]
+#[derive(Debug, Parser)]
 struct Args {
-    #[structopt(flatten)]
+    #[clap(flatten)]
     common: CommonToolArguments,
 
     /// The path to write out Chrome trace file. This can be loaded with
     /// `chrome://tracing`.
-    #[structopt(long)]
+    #[clap(long)]
     out: Option<PathBuf>,
 }
 

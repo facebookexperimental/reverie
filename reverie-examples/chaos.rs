@@ -9,6 +9,7 @@
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
+use clap::Parser;
 use reverie::syscalls::Displayable;
 use reverie::syscalls::Errno;
 use reverie::syscalls::Syscall;
@@ -20,36 +21,35 @@ use reverie::Tool;
 use reverie_util::CommonToolArguments;
 use serde::Deserialize;
 use serde::Serialize;
-use structopt::StructOpt;
 
 /// A tool to introduce inject "chaos" into a running process. A pathological
 /// kernel is simulated by forcing reads to only return one byte a time.
-#[derive(Debug, StructOpt)]
+#[derive(Debug, Parser)]
 struct Args {
-    #[structopt(flatten)]
+    #[clap(flatten)]
     common_opts: CommonToolArguments,
 
-    #[structopt(flatten)]
+    #[clap(flatten)]
     chaos_opts: ChaosOpts,
 }
 
-#[derive(StructOpt, Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Parser, Debug, Serialize, Deserialize, Clone, Default)]
 struct ChaosOpts {
     /// Skips the first N syscalls of a process before doing any intervention.
     /// This is useful when you need to skip past an error caused by the tool.
-    #[structopt(long, value_name = "N", default_value = "0")]
+    #[clap(long, value_name = "N", default_value = "0")]
     skip: u64,
 
     /// If set, does not intercept `read`-like system calls and modify them.
-    #[structopt(long)]
+    #[clap(long)]
     no_read: bool,
 
     /// If set, does not intercept `recv`-like system calls and modify them.
-    #[structopt(long)]
+    #[clap(long)]
     no_recv: bool,
 
     /// If set, does not inject random `EINTR` errors.
-    #[structopt(long)]
+    #[clap(long)]
     no_interrupt: bool,
 }
 

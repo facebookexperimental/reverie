@@ -17,6 +17,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 
+use clap::Parser;
 use reverie::syscalls::Addr;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
@@ -28,7 +29,6 @@ use reverie::Tool;
 use reverie_util::CommonToolArguments;
 use serde::Deserialize;
 use serde::Serialize;
-use structopt::StructOpt;
 use tracing::debug;
 use tracing::info;
 use tracing::trace;

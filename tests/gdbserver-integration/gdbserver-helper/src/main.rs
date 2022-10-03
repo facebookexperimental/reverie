@@ -17,9 +17,9 @@ use std::process::ExitStatus;
 
 use anyhow::bail;
 use anyhow::Error;
+use clap::Parser;
 use futures::future;
 use reverie::process::Output;
-use structopt::StructOpt;
 use tempfile::TempDir;
 
 mod client;
@@ -128,39 +128,39 @@ impl RemoteGdbSession {
     }
 }
 
-#[derive(StructOpt, Debug, Clone)]
+#[derive(Parser, Debug, Clone)]
 struct GdbServerHelperArgs {
     /// The binary to run.
-    #[structopt()]
+    #[clap()]
     test_binary: PathBuf,
 
     /// The arguments to pass to the binary.
-    #[structopt()]
+    #[clap()]
     test_binary_args: Vec<String>,
 
     /// Path to the GDB binary.
-    #[structopt(long, default_value = "gdb")]
+    #[clap(long, default_value = "gdb")]
     gdb: PathBuf,
 
     /// Path to a file containing GDB commands to execute before loading the
     /// inferior.
-    #[structopt(long)]
+    #[clap(long)]
     iex: Option<PathBuf>,
 
     /// Path to a file containing GDB commands to execute.
-    #[structopt(long)]
+    #[clap(long)]
     ex: Option<PathBuf>,
 
     /// The expected exit code.
-    #[structopt(long)]
+    #[clap(long)]
     exit_code: i32,
 
     /// Path to the expected stderr.
-    #[structopt(long)]
+    #[clap(long)]
     stderr: Option<PathBuf>,
 
     /// Path to the expected stdout.
-    #[structopt(long)]
+    #[clap(long)]
     stdout: Option<PathBuf>,
 }
 

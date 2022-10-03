@@ -7,6 +7,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 //! An example that tracks thread pedigree using local state
+use clap::Parser;
 use reverie::syscalls::Syscall;
 use reverie::Error;
 use reverie::Guest;
@@ -16,7 +17,6 @@ use reverie_util::pedigree::Pedigree;
 use reverie_util::CommonToolArguments;
 use serde::Deserialize;
 use serde::Serialize;
-use structopt::StructOpt;
 use tracing::debug;
 use tracing::trace;
 

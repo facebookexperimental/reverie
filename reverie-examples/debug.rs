@@ -8,14 +8,13 @@
  */
 
 //! This instrumentation tool does nothing except acting as a gdbserver.
-
+use clap::Parser;
 use reverie::Error;
 use reverie::Subscription;
 use reverie::Tool;
 use reverie_util::CommonToolArguments;
 use serde::Deserialize;
 use serde::Serialize;
-use structopt::StructOpt;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct DebugTool;
@@ -28,12 +27,12 @@ impl Tool for DebugTool {
 /// A tool that acts as a GDB server. The process will start in a stopped state,
 /// waiting for a GDB client to connect. Once the connection is complete,
 /// execution of the guest process will continue.
-#[derive(Debug, StructOpt)]
+#[derive(Debug, Parser)]
 struct Args {
-    #[structopt(flatten)]
+    #[clap(flatten)]
     common_opts: CommonToolArguments,
 
-    #[structopt(long, default_value = "1234", help = "launch gdbserver on given port")]
+    #[clap(long, default_value = "1234", help = "launch gdbserver on given port")]
     port: u16,
 }
 

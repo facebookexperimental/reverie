@@ -16,23 +16,23 @@ mod filter;
 mod global_state;
 mod tool;
 
+use clap::Parser;
 use config::Config;
 use filter::Filter;
 use reverie::Error;
 use reverie_util::CommonToolArguments;
-use structopt::StructOpt;
 use tool::Strace;
 
 /// A tool to trace system calls.
-#[derive(StructOpt, Debug)]
+#[derive(Parser, Debug)]
 struct Opts {
-    #[structopt(flatten)]
+    #[clap(flatten)]
     common: CommonToolArguments,
 
     /// The set of syscalls to trace. By default, all syscalls are traced. If
     /// this is used, then only the specified syscalls are traced. By limiting
     /// the set of traced syscalls, we can reduce the overhead of the tracer.
-    #[structopt(long)]
+    #[clap(long)]
     trace: Vec<Filter>,
 }
 

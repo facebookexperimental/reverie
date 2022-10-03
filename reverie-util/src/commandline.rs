@@ -11,65 +11,61 @@
 //! Each tool with this backend is a standalone executable, and thus
 //! needs its own CLI.
 
-use std::error::Error;
 use std::ffi::OsStr;
 use std::fmt::Display;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
-use std::str::FromStr;
 
 use chrono::Local;
+use clap::Parser;
 use reverie::process::Command;
-use structopt::StructOpt;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::EnvFilter;
 
 /// Parses an environment variable command-line argument.
-pub fn parse_env<T, U>(s: &str) -> Result<(T, U), Box<dyn Error>>
-where
-    T: FromStr,
-    T::Err: Error + 'static,
-    U: FromStr,
-    U::Err: Error + 'static,
-{
+pub fn parse_env(s: &str) -> anyhow::Result<(String, String)> {
     let mut iter = s.splitn(2, '=');
 
-    let key = iter.next().ok_or("Invalid KEY=VALUE: string is empty")?;
+    let key = iter
+        .next()
+        .ok_or("Invalid KEY=VALUE: string is empty")
+        .map(String::from)
+        .map_err(anyhow::Error::msg)?;
 
     let value = match iter.next() {
-        Some(value) => value.parse()?,
-        None => std::env::var(key)?.parse()?,
+        Some(value) => value.to_owned(),
+        None => std::env::var(&key).map_err(anyhow::Error::msg)?,
     };
 
-    Ok((key.parse()?, value))
+    Ok((key, value))
 }
 
 // Arguments that are shared by most Reverie tools, including which program to
-// run and how to run it. Using StructOpt, this is designed to be set from CLI
+// run and how to run it. Using Clap, this is designed to be set from CLI
 // args, or to be extended by the tool to form CLI args.
 //
 // NOTE: Do not change this to a doc comment due to this bug:
 // https://github.com/TeXitoi/structopt/issues/333
 #[allow(missing_docs)]
-#[derive(Debug, Clone, StructOpt)]
+#[derive(Debug, Clone, Parser)]
 pub struct CommonToolArguments {
     /// Direct logging to a file.  This can also be set with the RUST_LOG_FILE environment
     /// variable, but the CLI flag takes precedence.
-    #[structopt(long = "log-file", value_name = "PATH", env = "RUST_LOG_FILE")]
+    #[clap(long = "log-file", value_name = "PATH", env = "RUST_LOG_FILE")]
     pub log_file: Option<PathBuf>,
 
     /// Do not pass-through host's environment variables, instead providing a
     /// minimal PATH only (/bin:/usr/bin). The default is to pass through the
     /// host environment.
-    #[structopt(long = "no-host-envs")]
+    #[clap(long = "no-host-envs")]
     pub no_host_envs: bool,
 
     /// Sets an environment variable. Can be used multiple times.
-    #[structopt(
+    #[clap(
         long = "env",
-        short = "e",
+        short = 'e',
         value_name = "ENV[=VALUE]",
         parse(try_from_str = parse_env),
         number_of_values = 1
@@ -77,11 +73,11 @@ pub struct CommonToolArguments {
     pub envs: Vec<(String, String)>,
 
     /// Path of the program to trace.
-    #[structopt(value_name = "PROGRAM")]
+    #[clap(value_name = "PROGRAM")]
     pub program: String,
 
     /// Arguments to the program to trace.
-    #[structopt(value_name = "ARGS")]
+    #[clap(value_name = "ARGS")]
     pub program_args: Vec<String>,
 }
 

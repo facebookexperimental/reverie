@@ -12,6 +12,7 @@
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
+use clap::Parser;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
@@ -23,7 +24,6 @@ use reverie::Tool;
 use reverie_util::CommonToolArguments;
 use serde::Deserialize;
 use serde::Serialize;
-use structopt::StructOpt;
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct CounterGlobal {

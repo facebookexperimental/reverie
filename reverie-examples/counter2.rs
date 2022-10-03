@@ -13,6 +13,7 @@ use core::sync::atomic::AtomicU64;
 use core::sync::atomic::Ordering;
 use std::sync::Mutex;
 
+use clap::Parser;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::Error;
@@ -26,7 +27,6 @@ use reverie::Tool;
 use reverie_util::CommonToolArguments;
 use serde::Deserialize;
 use serde::Serialize;
-use structopt::StructOpt;
 use tracing::debug;
 
 /// Global state for the tool.
