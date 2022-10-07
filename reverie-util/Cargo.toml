@@ -11,7 +11,7 @@ license = "BSD-2-Clause"
 anyhow = "1.0.65"
 bitvec = { version = "0.17", features = ["serde"] }
 chrono = { version = "0.4", features = ["clock", "serde", "std"], default-features = false }
-clap = { version = "3.2.17", features = ["derive", "regex", "unicode", "wrap_help"] }
+clap = { version = "3.2.17", features = ["derive", "env", "regex", "unicode", "wrap_help"] }
 libc = "0.2.132"
 nix = "0.25"
 reverie = { version = "0.1.0", path = "../reverie" }
