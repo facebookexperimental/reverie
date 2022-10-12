@@ -514,6 +514,7 @@ macro_rules! syscall_list {
             pub fn from_raw(syscall: ::syscalls::Sysno, args: ::syscalls::SyscallArgs) -> Self {
                 match syscall {
                     $(
+                        $(#[$inner])*
                         ::syscalls::Sysno::$num => $name::$item(args.into()),
                     )*
                     num => Syscall::Other(num, args),
@@ -527,6 +528,7 @@ macro_rules! syscall_list {
             fn name(&self) -> &'static str {
                 match self {
                     $(
+                        $(#[$inner])*
                         $name::$item(_) => $item::NAME,
                     )*
                     $name::Other(syscall, _) => syscall.name(),
@@ -536,6 +538,7 @@ macro_rules! syscall_list {
             fn number(&self) -> ::syscalls::Sysno {
                 match self {
                     $(
+                        $(#[$inner])*
                         $name::$item(_) => ::syscalls::Sysno::$num,
                     )*
                     $name::Other(num, _) => *num,
@@ -545,6 +548,7 @@ macro_rules! syscall_list {
             fn into_parts(self) -> (::syscalls::Sysno, ::syscalls::SyscallArgs) {
                 match self {
                     $(
+                        $(#[$inner])*
                         $name::$item(x) => (::syscalls::Sysno::$num, x.into()),
                     )*
                     $name::Other(num, args) => (num, args),
@@ -553,6 +557,7 @@ macro_rules! syscall_list {
         }
 
         $(
+            $(#[$inner])*
             impl From<$item> for $name {
                 fn from(x: $item) -> Self {
                     $name::$item(x)
@@ -569,6 +574,7 @@ macro_rules! syscall_list {
             ) -> ::core::fmt::Result {
                 match self {
                     $(
+                        $(#[$inner])*
                         $name::$item(x) => $crate::Displayable::fmt(x, memory, outputs, f),
                     )*
                     $name::Other(num, args) => {
