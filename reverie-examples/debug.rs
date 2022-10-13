@@ -32,7 +32,8 @@ struct Args {
     #[clap(flatten)]
     common_opts: CommonToolArguments,
 
-    #[clap(long, default_value = "1234", help = "launch gdbserver on given port")]
+    /// Launch gdbserver on a given port
+    #[clap(long, default_value = "1234")]
     port: u16,
 }
 
