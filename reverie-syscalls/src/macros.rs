@@ -74,6 +74,7 @@ macro_rules! typed_syscall {
             raw: ::syscalls::SyscallArgs,
         }
 
+        $(#[$attrs])*
         impl Default for $Name {
             fn default() -> Self {
                 Self {
@@ -82,6 +83,7 @@ macro_rules! typed_syscall {
             }
         }
 
+        $(#[$attrs])*
         impl $crate::SyscallInfo for $Name {
             type Return = Result<$ret, $crate::Errno>;
 
@@ -100,6 +102,7 @@ macro_rules! typed_syscall {
             }
         }
 
+        $(#[$attrs])*
         impl $Name {
             ::paste::paste! {
                 /// The name of the syscall.
@@ -153,12 +156,14 @@ macro_rules! typed_syscall {
             }
         }
 
+        $(#[$attrs])*
         impl From<::syscalls::SyscallArgs> for $Name {
             fn from(raw: ::syscalls::SyscallArgs) -> Self {
                 $Name { raw }
             }
         }
 
+        $(#[$attrs])*
         impl From<$Name> for ::syscalls::SyscallArgs {
             fn from(syscall: $Name) -> Self {
                 syscall.raw
@@ -170,6 +175,7 @@ macro_rules! typed_syscall {
             $Name,
             [$($req,)*],
             [$($opt,)*],
+            attrs: [$(#[$attrs])*],
         }
     };
 
@@ -178,7 +184,9 @@ macro_rules! typed_syscall {
         $Name:ident,
         [],
         [],
+        attrs: [$(#[$attrs:meta])*],
     ) => {
+        $(#[$attrs])*
         impl $crate::Displayable for $Name {
             fn fmt<M: $crate::MemoryAccess>(
                 &self,
@@ -196,7 +204,9 @@ macro_rules! typed_syscall {
         $Name:ident,
         [],
         [$optional:ident, $($optional_tail:ident,)*],
+        attrs: [$(#[$attrs:meta])*],
     ) => {
+        $(#[$attrs])*
         impl $crate::Displayable for $Name {
             fn fmt<M: $crate::MemoryAccess>(
                 &self,
@@ -225,7 +235,9 @@ macro_rules! typed_syscall {
         $Name:ident,
         [$req:ident, $($req_tail:ident,)*],
         [$($optional_tail:ident,)*],
+        attrs: [$(#[$attrs:meta])*],
     ) => {
+        $(#[$attrs])*
         impl $crate::Displayable for $Name {
             fn fmt<M: $crate::MemoryAccess>(
                 &self,
