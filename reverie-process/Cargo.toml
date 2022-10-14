@@ -17,7 +17,7 @@ nix = "0.25"
 serde = { version = "1.0.136", features = ["derive", "rc"] }
 syscalls = { version = "0.6.7", features = ["serde"] }
 thiserror = "1.0.36"
-tokio = { version = "1.15", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.21.2", features = ["full", "test-util", "tracing"] }
 
 [dev-dependencies]
 const-cstr = "0.3.0"
