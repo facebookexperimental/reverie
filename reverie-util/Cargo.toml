@@ -18,4 +18,4 @@ reverie = { version = "0.1.0", path = "../reverie" }
 serde = { version = "1.0.136", features = ["derive", "rc"] }
 tracing = "0.1.35"
 tracing-appender = "0.2.2"
-tracing-subscriber = { version = "0.3.14", features = ["ansi", "env-filter", "fmt", "json", "local-time", "parking_lot", "registry"] }
+tracing-subscriber = { version = "0.3.16", features = ["ansi", "env-filter", "fmt", "json", "local-time", "parking_lot", "registry"] }
