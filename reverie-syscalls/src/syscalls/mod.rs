@@ -75,12 +75,18 @@ syscall_list! {
     pub enum Syscall {
         read => Read,
         write => Write,
+        #[cfg(not(target_arch = "aarch64"))]
         open => Open,
         close => Close,
+        #[cfg(not(target_arch = "aarch64"))]
         stat => Stat,
+        #[cfg(not(target_arch = "aarch64"))]
         fstat => Fstat,
+        #[cfg(not(target_arch = "aarch64"))]
         lstat => Lstat,
+        #[cfg(not(target_arch = "aarch64"))]
         poll => Poll,
+        #[cfg(not(target_arch = "aarch64"))]
         lseek => Lseek,
         mmap => Mmap,
         mprotect => Mprotect,
@@ -94,8 +100,11 @@ syscall_list! {
         pwrite64 => Pwrite64,
         readv => Readv,
         writev => Writev,
+        #[cfg(not(target_arch = "aarch64"))]
         access => Access,
+        #[cfg(not(target_arch = "aarch64"))]
         pipe => Pipe,
+        #[cfg(not(target_arch = "aarch64"))]
         select => Select,
         sched_yield => SchedYield,
         mremap => Mremap,
@@ -106,13 +115,17 @@ syscall_list! {
         shmat => Shmat,
         shmctl => Shmctl,
         dup => Dup,
+        #[cfg(not(target_arch = "aarch64"))]
         dup2 => Dup2,
+        #[cfg(not(target_arch = "aarch64"))]
         pause => Pause,
         nanosleep => Nanosleep,
         getitimer => Getitimer,
+        #[cfg(not(target_arch = "aarch64"))]
         alarm => Alarm,
         setitimer => Setitimer,
         getpid => Getpid,
+        #[cfg(not(target_arch = "aarch64"))]
         sendfile => Sendfile,
         socket => Socket,
         connect => Connect,
@@ -130,7 +143,9 @@ syscall_list! {
         setsockopt => Setsockopt,
         getsockopt => Getsockopt,
         clone => Clone,
+        #[cfg(not(target_arch = "aarch64"))]
         fork => Fork,
+        #[cfg(not(target_arch = "aarch64"))]
         vfork => Vfork,
         execve => Execve,
         exit => Exit,
@@ -151,22 +166,34 @@ syscall_list! {
         fdatasync => Fdatasync,
         truncate => Truncate,
         ftruncate => Ftruncate,
+        #[cfg(not(target_arch = "aarch64"))]
         getdents => Getdents,
         getcwd => Getcwd,
         chdir => Chdir,
         fchdir => Fchdir,
+        #[cfg(not(target_arch = "aarch64"))]
         rename => Rename,
+        #[cfg(not(target_arch = "aarch64"))]
         mkdir => Mkdir,
+        #[cfg(not(target_arch = "aarch64"))]
         rmdir => Rmdir,
+        #[cfg(not(target_arch = "aarch64"))]
         creat => Creat,
+        #[cfg(not(target_arch = "aarch64"))]
         link => Link,
+        #[cfg(not(target_arch = "aarch64"))]
         unlink => Unlink,
+        #[cfg(not(target_arch = "aarch64"))]
         symlink => Symlink,
+        #[cfg(not(target_arch = "aarch64"))]
         readlink => Readlink,
+        #[cfg(not(target_arch = "aarch64"))]
         chmod => Chmod,
         fchmod => Fchmod,
+        #[cfg(not(target_arch = "aarch64"))]
         chown => Chown,
         fchown => Fchown,
+        #[cfg(not(target_arch = "aarch64"))]
         lchown => Lchown,
         umask => Umask,
         gettimeofday => Gettimeofday,
@@ -184,6 +211,7 @@ syscall_list! {
         getegid => Getegid,
         setpgid => Setpgid,
         getppid => Getppid,
+        #[cfg(not(target_arch = "aarch64"))]
         getpgrp => Getpgrp,
         setsid => Setsid,
         setreuid => Setreuid,
@@ -205,13 +233,18 @@ syscall_list! {
         rt_sigqueueinfo => RtSigqueueinfo,
         rt_sigsuspend => RtSigsuspend,
         sigaltstack => Sigaltstack,
+        #[cfg(not(target_arch = "aarch64"))]
         utime => Utime,
+        #[cfg(not(target_arch = "aarch64"))]
         mknod => Mknod,
+        #[cfg(not(target_arch = "aarch64"))]
         uselib => Uselib,
         personality => Personality,
+        #[cfg(not(target_arch = "aarch64"))]
         ustat => Ustat,
         statfs => Statfs,
         fstatfs => Fstatfs,
+        #[cfg(not(target_arch = "aarch64"))]
         sysfs => Sysfs,
         getpriority => Getpriority,
         setpriority => Setpriority,
@@ -227,11 +260,14 @@ syscall_list! {
         mlockall => Mlockall,
         munlockall => Munlockall,
         vhangup => Vhangup,
+        #[cfg(not(target_arch = "aarch64"))]
         modify_ldt => ModifyLdt,
         pivot_root => PivotRoot,
         #[allow(non_camel_case_types)]
+        #[cfg(not(target_arch = "aarch64"))]
         _sysctl => _sysctl,
         prctl => Prctl,
+        #[cfg(not(target_arch = "aarch64"))]
         arch_prctl => ArchPrctl,
         adjtimex => Adjtimex,
         setrlimit => Setrlimit,
@@ -246,19 +282,29 @@ syscall_list! {
         reboot => Reboot,
         sethostname => Sethostname,
         setdomainname => Setdomainname,
+        #[cfg(not(target_arch = "aarch64"))]
         iopl => Iopl,
+        #[cfg(not(target_arch = "aarch64"))]
         ioperm => Ioperm,
+        #[cfg(not(target_arch = "aarch64"))]
         create_module => CreateModule,
         init_module => InitModule,
         delete_module => DeleteModule,
+        #[cfg(not(target_arch = "aarch64"))]
         get_kernel_syms => GetKernelSyms,
+        #[cfg(not(target_arch = "aarch64"))]
         query_module => QueryModule,
         quotactl => Quotactl,
         nfsservctl => Nfsservctl,
+        #[cfg(not(target_arch = "aarch64"))]
         getpmsg => Getpmsg,
+        #[cfg(not(target_arch = "aarch64"))]
         putpmsg => Putpmsg,
+        #[cfg(not(target_arch = "aarch64"))]
         afs_syscall => AfsSyscall,
+        #[cfg(not(target_arch = "aarch64"))]
         tuxcall => Tuxcall,
+        #[cfg(not(target_arch = "aarch64"))]
         security => Security,
         gettid => Gettid,
         readahead => Readahead,
@@ -275,20 +321,26 @@ syscall_list! {
         lremovexattr => Lremovexattr,
         fremovexattr => Fremovexattr,
         tkill => Tkill,
+        #[cfg(not(target_arch = "aarch64"))]
         time => Time,
         futex => Futex,
         sched_setaffinity => SchedSetaffinity,
         sched_getaffinity => SchedGetaffinity,
+        #[cfg(not(target_arch = "aarch64"))]
         set_thread_area => SetThreadArea,
         io_setup => IoSetup,
         io_destroy => IoDestroy,
         io_getevents => IoGetevents,
         io_submit => IoSubmit,
         io_cancel => IoCancel,
+        #[cfg(not(target_arch = "aarch64"))]
         get_thread_area => GetThreadArea,
         lookup_dcookie => LookupDcookie,
+        #[cfg(not(target_arch = "aarch64"))]
         epoll_create => EpollCreate,
+        #[cfg(not(target_arch = "aarch64"))]
         epoll_ctl_old => EpollCtlOld,
+        #[cfg(not(target_arch = "aarch64"))]
         epoll_wait_old => EpollWaitOld,
         remap_file_pages => RemapFilePages,
         getdents64 => Getdents64,
@@ -306,10 +358,13 @@ syscall_list! {
         clock_getres => ClockGetres,
         clock_nanosleep => ClockNanosleep,
         exit_group => ExitGroup,
+        #[cfg(not(target_arch = "aarch64"))]
         epoll_wait => EpollWait,
         epoll_ctl => EpollCtl,
         tgkill => Tgkill,
+        #[cfg(not(target_arch = "aarch64"))]
         utimes => Utimes,
+        #[cfg(not(target_arch = "aarch64"))]
         vserver => Vserver,
         mbind => Mbind,
         set_mempolicy => SetMempolicy,
@@ -327,6 +382,7 @@ syscall_list! {
         keyctl => Keyctl,
         ioprio_set => IoprioSet,
         ioprio_get => IoprioGet,
+        #[cfg(not(target_arch = "aarch64"))]
         inotify_init => InotifyInit,
         inotify_add_watch => InotifyAddWatch,
         inotify_rm_watch => InotifyRmWatch,
@@ -335,7 +391,9 @@ syscall_list! {
         mkdirat => Mkdirat,
         mknodat => Mknodat,
         fchownat => Fchownat,
+        #[cfg(not(target_arch = "aarch64"))]
         futimesat => Futimesat,
+        #[cfg(not(target_arch = "aarch64"))]
         newfstatat => Newfstatat,
         unlinkat => Unlinkat,
         renameat => Renameat,
@@ -351,13 +409,16 @@ syscall_list! {
         get_robust_list => GetRobustList,
         splice => Splice,
         tee => Tee,
+        #[cfg(not(target_arch = "aarch64"))]
         sync_file_range => SyncFileRange,
         vmsplice => Vmsplice,
         move_pages => MovePages,
         utimensat => Utimensat,
         epoll_pwait => EpollPwait,
+        #[cfg(not(target_arch = "aarch64"))]
         signalfd => Signalfd,
         timerfd_create => TimerfdCreate,
+        #[cfg(not(target_arch = "aarch64"))]
         eventfd => Eventfd,
         fallocate => Fallocate,
         timerfd_settime => TimerfdSettime,
@@ -463,6 +524,8 @@ fn get_mode(flags: OFlag, mode: usize) -> Option<Mode> {
     }
 }
 
+// Open not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Open -> i32 {
         path: Option<PathPtr>,
@@ -483,6 +546,8 @@ typed_syscall! {
     }
 }
 
+// Open not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 impl From<Creat> for Open {
     /// A call to creat() is equivalent to calling open() with flags equal to
     /// O_CREAT|O_WRONLY|O_TRUNC
@@ -500,6 +565,8 @@ typed_syscall! {
     }
 }
 
+// Stat not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Stat {
         path: Option<PathPtr>,
@@ -507,6 +574,8 @@ typed_syscall! {
     }
 }
 
+// Fstat not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Fstat {
         fd: i32,
@@ -514,6 +583,8 @@ typed_syscall! {
     }
 }
 
+// Lstat not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Lstat {
         path: Option<PathPtr>,
@@ -521,6 +592,8 @@ typed_syscall! {
     }
 }
 
+// Poll not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Poll {
         fds: Option<AddrMut<PollFd>>,
@@ -540,6 +613,8 @@ typed_syscall! {
     }
 }
 
+// Lseek not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Lseek {
         fd: i32,
@@ -650,6 +725,8 @@ typed_syscall! {
     }
 }
 
+// Access not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Access {
         path: Option<PathPtr>,
@@ -657,12 +734,16 @@ typed_syscall! {
     }
 }
 
+// Pipe not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Pipe {
         pipefd: Option<AddrMut<[i32; 2]>>,
     }
 }
 
+// Select not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Select {
         nfds: i32,
@@ -741,6 +822,8 @@ typed_syscall! {
     }
 }
 
+// Dup2 not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Dup2 {
         oldfd: i32,
@@ -748,6 +831,8 @@ typed_syscall! {
     }
 }
 
+// Pause not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! { pub struct Pause {} }
 
 typed_syscall! {
@@ -764,6 +849,8 @@ typed_syscall! {
     }
 }
 
+// Alarm not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Alarm {
         seconds: u32,
@@ -944,6 +1031,8 @@ typed_syscall! {
     }
 }
 
+// Vfork not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 impl From<Vfork> for Clone {
     /// Since `clone` offers a superset of functionality over `vfork`, a `vfork`
     /// syscall can be transformed into a `clone` syscall by passing in the
@@ -962,6 +1051,8 @@ impl From<Vfork> for Clone {
     }
 }
 
+// Fork not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 impl From<Fork> for Clone {
     /// Since `clone` offers a superset of functionality over `fork`, a `fork`
     /// syscall can be transformed into a `clone` syscall by passing in the
@@ -979,11 +1070,13 @@ impl From<Fork> for Clone {
         Self { raw }
     }
 }
-
+// Fork not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Fork {}
 }
-
+// Vfork not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Vfork {}
 }
@@ -1144,7 +1237,8 @@ typed_syscall! {
         length: libc::off_t,
     }
 }
-
+// Getdents not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Getdents {
         fd: u32,
@@ -1172,47 +1266,54 @@ typed_syscall! {
         fd: i32,
     }
 }
-
+// Rename not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Rename {
         oldpath: Option<PathPtr>,
         newpath: Option<PathPtr>,
     }
 }
-
+// Mkdir not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Mkdir {
         path: Option<PathPtr>,
         mode: Mode,
     }
 }
-
+// Rmdir not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Rmdir {
         path: Option<PathPtr>,
     }
 }
-
+// Creat not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Creat {
         path: Option<PathPtr>,
         mode: Mode,
     }
 }
-
+// Link not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Link {
         oldpath: Option<PathPtr>,
         newpath: Option<PathPtr>,
     }
 }
-
+// Unlink not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Unlink {
         path: Option<PathPtr>,
     }
 }
-
+// Symlink not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Symlink {
         target: Option<PathPtr>,
@@ -1220,6 +1321,8 @@ typed_syscall! {
     }
 }
 
+// Readlink not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Readlink {
         path: Option<PathPtr>,
@@ -1229,6 +1332,8 @@ typed_syscall! {
     }
 }
 
+// Chmod not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Chmod {
         path: Option<PathPtr>,
@@ -1242,7 +1347,8 @@ typed_syscall! {
         mode: Mode,
     }
 }
-
+// Chown not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Chown {
         path: Option<PathPtr>,
@@ -1258,7 +1364,8 @@ typed_syscall! {
         group: libc::gid_t,
     }
 }
-
+// Lchown not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Lchown {
         path: Option<PathPtr>,
@@ -1332,6 +1439,9 @@ typed_syscall! { pub struct Geteuid {} }
 typed_syscall! { pub struct Getegid {} }
 typed_syscall! { pub struct Setpgid { pid: libc::pid_t, pgid: libc::pid_t, } }
 typed_syscall! { pub struct Getppid {} }
+
+// Getpgrp not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! { pub struct Getpgrp {} }
 
 typed_syscall! { pub struct Setsid {} }
@@ -1442,6 +1552,8 @@ typed_syscall! {
     }
 }
 
+// utime not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Utime {
         path: Option<PathPtr>,
@@ -1449,6 +1561,8 @@ typed_syscall! {
     }
 }
 
+// Mknod not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Mknod {
         path: Option<PathPtr>,
@@ -1457,6 +1571,8 @@ typed_syscall! {
     }
 }
 
+// Uselib not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Uselib {
         library: Option<PathPtr>,
@@ -1469,6 +1585,8 @@ typed_syscall! {
     }
 }
 
+// Ustat not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Ustat {
         dev: libc::dev_t,
@@ -1491,6 +1609,8 @@ typed_syscall! {
     }
 }
 
+// Sysfs not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Sysfs {
         option: i32,
@@ -1585,6 +1705,8 @@ typed_syscall! { pub struct Munlockall {} }
 
 typed_syscall! { pub struct Vhangup {} }
 
+// ModifyLdt not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct ModifyLdt {
         func: i32,
@@ -1600,6 +1722,8 @@ typed_syscall! {
     }
 }
 
+// _sysctl not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     #[allow(non_camel_case_types)]
     pub struct _sysctl {
@@ -1618,6 +1742,8 @@ typed_syscall! {
     }
 }
 
+// ArchPrctl not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct ArchPrctl {
         cmd: {
@@ -1722,12 +1848,16 @@ typed_syscall! {
     }
 }
 
+// Iopl not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Iopl {
         level: u32,
     }
 }
 
+// Ioperm not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Ioperm {
         from: u64,
@@ -1736,6 +1866,8 @@ typed_syscall! {
     }
 }
 
+// CreateModule not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     /// Note: This system call is present only in kernels before Linux 2.6.
     pub struct CreateModule {
@@ -1759,6 +1891,8 @@ typed_syscall! {
     }
 }
 
+// GetKernelSyms not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     /// Note: This system call is present only in kernels before Linux 2.6.
     pub struct GetKernelSyms {
@@ -1766,6 +1900,8 @@ typed_syscall! {
     }
 }
 
+// QueryModule not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct QueryModule {
         name: Option<CStrPtr>,
@@ -1795,26 +1931,36 @@ typed_syscall! {
     }
 }
 
+// Getpmsg not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     /// Unimplemented in the kernel.
     pub struct Getpmsg {}
 }
 
+// Putmsp not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     /// Unimplemented in the kernel.
     pub struct Putpmsg {}
 }
 
+// AfsSyscall not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     /// Unimplemented in the kernel.
     pub struct AfsSyscall {}
 }
 
+// Tuxcall not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     /// Unimplemented in the kernel.
     pub struct Tuxcall {}
 }
 
+// Security not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     /// Unimplemented in the kernel.
     pub struct Security {}
@@ -1939,6 +2085,8 @@ typed_syscall! {
     }
 }
 
+// Time not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Time {
         tloc: Option<AddrMut<libc::time_t>>,
@@ -1973,6 +2121,8 @@ typed_syscall! {
     }
 }
 
+// SetThreadArea not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct SetThreadArea {
         addr: Option<Addr<libc::c_void>>,
@@ -2021,6 +2171,8 @@ typed_syscall! {
     }
 }
 
+// GetThreadArea not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct GetThreadArea {
         addr: Option<AddrMut<libc::c_void>>,
@@ -2035,6 +2187,8 @@ typed_syscall! {
     }
 }
 
+// EpollCreate not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct EpollCreate {
         /// The kernel doesn't actually use this parameter, but it must be
@@ -2043,11 +2197,15 @@ typed_syscall! {
     }
 }
 
+// EpollCtlOld not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     /// Undocumented.
     pub struct EpollCtlOld {}
 }
 
+// EpollWaitOld not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     /// Undocumented.
     pub struct EpollWaitOld {}
@@ -2169,6 +2327,8 @@ typed_syscall! {
     }
 }
 
+// EpollWait not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct EpollWait {
         epfd: i32,
@@ -2195,6 +2355,8 @@ typed_syscall! {
     }
 }
 
+// Utimes not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Utimes {
         filename: Option<PathPtr>,
@@ -2202,6 +2364,8 @@ typed_syscall! {
     }
 }
 
+// Vserver not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     /// Unimplemented in the kernel.
     pub struct Vserver { }
@@ -2350,6 +2514,8 @@ typed_syscall! {
     }
 }
 
+// InotifyInit not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! { pub struct InotifyInit {} }
 
 typed_syscall! {
@@ -2397,6 +2563,8 @@ typed_syscall! {
     }
 }
 
+// Open not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 impl From<Open> for Openat {
     /// An `open` syscall can be trivially transformed into an `openat`
     /// syscall by shifting all the arguments to the right and setting the first
@@ -2411,6 +2579,8 @@ impl From<Open> for Openat {
     }
 }
 
+// Creat not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 impl From<Creat> for Openat {
     /// A call to creat() is equivalent to calling open() with flags equal to
     /// O_CREAT|O_WRONLY|O_TRUNC
@@ -2432,6 +2602,8 @@ typed_syscall! {
     }
 }
 
+// Mkdir not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 impl From<Mkdir> for Mkdirat {
     /// An `mkdir` syscall can be trivially transformed into a `mkdirat` syscall
     /// by shifting all the arguments to the right and setting the first argument
@@ -2454,6 +2626,8 @@ typed_syscall! {
     }
 }
 
+// Mknod not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 impl From<Mknod> for Mknodat {
     /// An `mknod` syscall can be trivially transformed into an `mknodat` syscall
     /// by shifting all the arguments to the right and setting the first argument
@@ -2478,6 +2652,8 @@ typed_syscall! {
     }
 }
 
+// Futimesat not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Futimesat {
         dirfd: i32,
@@ -2486,6 +2662,8 @@ typed_syscall! {
     }
 }
 
+// Newfstatat not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Newfstatat {
         dirfd: i32,
@@ -2494,7 +2672,8 @@ typed_syscall! {
         flags: AtFlags,
     }
 }
-
+// Stat not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 impl From<Stat> for Newfstatat {
     fn from(stat: Stat) -> Self {
         let Stat { mut raw } = stat;
@@ -2506,6 +2685,8 @@ impl From<Stat> for Newfstatat {
     }
 }
 
+// Lstat not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 impl From<Lstat> for Newfstatat {
     fn from(lstat: Lstat) -> Self {
         let Lstat { mut raw } = lstat;
@@ -2524,7 +2705,8 @@ typed_syscall! {
         flags: AtFlags,
     }
 }
-
+// Unlink not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 impl From<Unlink> for Unlinkat {
     fn from(unlink: Unlink) -> Self {
         let Unlink { mut raw } = unlink;
@@ -2535,6 +2717,8 @@ impl From<Unlink> for Unlinkat {
     }
 }
 
+// Rmdir not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 impl From<Rmdir> for Unlinkat {
     fn from(rmdir: Rmdir) -> Self {
         let Rmdir { mut raw } = rmdir;
@@ -2564,6 +2748,8 @@ typed_syscall! {
     }
 }
 
+// Link not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 impl From<Link> for Linkat {
     /// A `link` syscall can be trivially transformed into a `linkat` syscall
     /// by rearranging the `oldpath` and `newpath` arguments,
@@ -2680,6 +2866,8 @@ typed_syscall! {
     }
 }
 
+// SyncFileRange not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct SyncFileRange {
         fd: i32,
@@ -2729,6 +2917,8 @@ typed_syscall! {
     }
 }
 
+// Signalfd not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     /// Naked signalfd(2) is not the same as glibc wrapper.
     /// see kernel fs/signalfd.c for more details.
@@ -2750,6 +2940,8 @@ typed_syscall! {
     }
 }
 
+// Eventfd not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Eventfd {
         count: u32,
@@ -2812,6 +3004,8 @@ typed_syscall! {
     }
 }
 
+// Signalfd not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 impl From<Signalfd> for Signalfd4 {
     fn from(signalfd: Signalfd) -> Self {
         let Signalfd { mut raw } = signalfd;
@@ -2827,6 +3021,8 @@ typed_syscall! {
     }
 }
 
+// Eventfd not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 impl From<Eventfd> for Eventfd2 {
     /// eventfd2 provide an extra `flags' argument, it's safe
     /// to convert eventfd(2) to eventfd2(2), as a result.
@@ -2844,6 +3040,8 @@ typed_syscall! {
     }
 }
 
+// EpollCreate not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 impl From<EpollCreate> for EpollCreate1 {
     /// `size' in epoll_create(2) is ignored but must be >= 0 since 2.6.9
     /// We still allows convert `epoll_create` to `epoll_create1` by forcing
@@ -2871,6 +3069,8 @@ typed_syscall! {
     }
 }
 
+// Pipe not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 impl From<Pipe> for Pipe2 {
     /// If flags is 0, then pipe2() is the same as pipe().
     fn from(pipe: Pipe) -> Self {
@@ -2886,6 +3086,8 @@ typed_syscall! {
     }
 }
 
+// InotifyInit1 not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 impl From<InotifyInit> for InotifyInit1 {
     /// If flags is 0, then inotify_init1 is the same as inotify_init.
     /// Note that inotify_init was introduced in 2.6.13 and inotify_init1
@@ -3100,6 +3302,8 @@ typed_syscall! {
     }
 }
 
+// Rename not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 impl From<Rename> for Renameat2 {
     fn from(rename: Rename) -> Self {
         let Rename { mut raw } = rename;

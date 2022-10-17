@@ -45,10 +45,17 @@ fn unused<T: Default>(_stat: &libc::stat) -> T {
 }
 
 impl From<StatBuf> for libc::stat {
+    #[cfg(not(target_arch = "aarch64"))]
     fn from(buf: StatBuf) -> libc::stat {
         // The layout and size is exactly the same, so this transmute is safe to
         // do.
         unsafe { core::mem::transmute(buf) }
+    }
+
+    // aarch64 cannot transmute
+    #[cfg(target_arch = "aarch64")]
+    fn from(buf: StatBuf) -> libc::stat {
+        todo!("aarch64 implementation is incomplete");
     }
 }
 

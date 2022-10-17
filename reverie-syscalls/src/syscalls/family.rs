@@ -61,6 +61,8 @@ impl From<WriteFamily> for Syscall {
 
 /// Represents the stat family of syscalls. All of these have an associated stat
 /// buffer.
+// Stat not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 #[derive(From, Debug, Copy, Clone, Eq, PartialEq)]
 #[allow(missing_docs)]
 pub enum StatFamily {
@@ -70,6 +72,8 @@ pub enum StatFamily {
     Newfstatat(super::Newfstatat),
 }
 
+// Stat not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 impl StatFamily {
     /// Get address of the stat buffer. Returns `None` if a NULL pointer was
     /// specified.
@@ -83,6 +87,8 @@ impl StatFamily {
     }
 }
 
+// Stat not available in aarch64
+#[cfg(not(target_arch = "aarch64"))]
 impl From<StatFamily> for Syscall {
     fn from(family: StatFamily) -> Syscall {
         match family {
@@ -141,7 +147,11 @@ impl From<SockOptFamily> for Syscall {
 #[derive(From, Debug, Copy, Clone, Eq, PartialEq)]
 #[allow(missing_docs)]
 pub enum CloneFamily {
+    // Fork not available in aarch64
+    #[cfg(not(target_arch = "aarch64"))]
     Fork(super::Fork),
+    // Vfork not available in aarch64
+    #[cfg(not(target_arch = "aarch64"))]
     Vfork(super::Vfork),
     Clone(super::Clone),
     Clone3(super::Clone3),
@@ -157,7 +167,9 @@ impl CloneFamily {
     /// return an empty set of clone flags (i.e., 0).
     pub fn flags<M: MemoryAccess>(&self, memory: &M) -> CloneFlags {
         match self {
+            #[cfg(not(target_arch = "aarch64"))]
             Self::Fork(_) => CloneFlags::SIGCHLD,
+            #[cfg(not(target_arch = "aarch64"))]
             Self::Vfork(_) => CloneFlags::CLONE_VFORK | CloneFlags::CLONE_VM | CloneFlags::SIGCHLD,
             Self::Clone(clone) => clone.flags().into(),
             Self::Clone3(clone) => {
@@ -178,7 +190,9 @@ impl CloneFamily {
     /// from memory fails for any reason, we return 0.
     pub fn child_tid<M: MemoryAccess>(&self, memory: &M) -> usize {
         match self {
+            #[cfg(not(target_arch = "aarch64"))]
             Self::Fork(_) => 0,
+            #[cfg(not(target_arch = "aarch64"))]
             Self::Vfork(_) => 0,
             Self::Clone(clone) => clone.ctid().map_or(0, |ctid| ctid.as_raw()),
             Self::Clone3(clone) => {
@@ -195,7 +209,9 @@ impl CloneFamily {
 impl From<CloneFamily> for Syscall {
     fn from(family: CloneFamily) -> Syscall {
         match family {
+            #[cfg(not(target_arch = "aarch64"))]
             CloneFamily::Fork(syscall) => Syscall::Fork(syscall),
+            #[cfg(not(target_arch = "aarch64"))]
             CloneFamily::Vfork(syscall) => Syscall::Vfork(syscall),
             CloneFamily::Clone(syscall) => Syscall::Clone(syscall),
             CloneFamily::Clone3(syscall) => Syscall::Clone3(syscall),
