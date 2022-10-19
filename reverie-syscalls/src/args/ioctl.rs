@@ -111,6 +111,9 @@ command_enum! {
         #[cfg(none)]
         TIOCSERGSTRUCT(Option<AddrMut<'a, libc::async_struct>>) = 0x00005458,
         TIOCSERGETLSR(Option<AddrMut<'a, libc::c_int>>) = 0x00005459,
+
+        FICLONE(libc::c_int) = 0x40049409,
+        FICLONERANGE(Option<Addr<'a, libc::file_clone_range>>) = 0x4020940D,
     }
 }
 
