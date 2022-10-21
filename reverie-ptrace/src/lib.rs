@@ -47,6 +47,7 @@ mod debug;
 mod error;
 mod gdbstub;
 mod perf;
+mod regs;
 mod stack;
 mod task;
 pub mod testing;
