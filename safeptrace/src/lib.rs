@@ -15,11 +15,11 @@
 mod memory;
 #[allow(unused)]
 mod notifier;
+mod regs;
 mod waitid;
 
+use core::mem::MaybeUninit;
 use std::fmt;
-use std::mem;
-use std::ptr;
 
 use nix::sys::ptrace;
 // Re-exports so that nothing else needs to depend on `nix`.
@@ -30,9 +30,12 @@ use nix::sys::wait::WaitStatus;
 pub use reverie_process::ExitStatus;
 pub use reverie_process::Pid;
 pub use syscalls::Errno;
+use syscalls::Sysno;
 use thiserror::Error;
-use waitid::waitid;
-use waitid::IdType;
+
+pub use crate::regs::*;
+use crate::waitid::waitid;
+use crate::waitid::IdType;
 
 /// An error that occurred during tracing.
 #[derive(Error, Debug, Eq, PartialEq)]
@@ -50,33 +53,6 @@ pub enum Error {
 impl From<nix::errno::Errno> for Error {
     fn from(err: nix::errno::Errno) -> Self {
         Self::Errno(Errno::new(err as i32))
-    }
-}
-
-// Helper function for removing the nix::Error type.
-fn from_nix_err(pid: Pid, err: nix::Error) -> Error {
-    // The `nix` ptrace API only constructs `nix::Error::Sys(Errno)`
-    // errors, thus this `unwrap` is safe to do.
-    let err = Errno::new(err as i32);
-
-    // According to ptrace(2), any ptrace operation may return ESRCH
-    // ("No such process") for one of three reasons:
-    //  1. The process was observed to be in a stopped state and died
-    //     unexpectedly.
-    //  2. The process is not currently being traced by the caller.
-    //  3. The process is not in a stopped state.
-    //
-    // Since we know that reasons (2) and (3) only occur due to
-    // programmer errors that this API is designed to prevent, we can
-    // safely assume that this ESRCH means the tracee has died
-    // unexpectedly while in a stopped state.
-    //
-    // For more information, please see the "Death under ptrace" section
-    // in `man 2 ptrace`.
-    if err == Errno::ESRCH {
-        Error::Died(Zombie::new(pid))
-    } else {
-        Error::Errno(err)
     }
 }
 
@@ -465,9 +441,38 @@ bitflags::bitflags! {
 #[derive(Debug, Hash, Eq, PartialEq)]
 pub struct Stopped(Pid);
 
-// TODO: Since we can guarantee that a process is in a stopped state, we should
-// impl `MemoryAccess` *only* for the `Stopped` type.
 impl Stopped {
+    /// Helper for converting from the Errno type.
+    ///
+    /// # Why is this needed?
+    ///
+    /// According to ptrace(2), any ptrace operation may return ESRCH
+    /// ("No such process") for one of three reasons:
+    ///  1. The process was observed to be in a stopped state and died
+    ///     unexpectedly.
+    ///  2. The process is not currently being traced by the caller.
+    ///  3. The process is not in a stopped state.
+    ///
+    /// Since we know that reasons (2) and (3) only occur due to
+    /// programmer errors that this API is designed to prevent, we can
+    /// safely assume that this ESRCH means the tracee has died
+    /// unexpectedly while in a stopped state.
+    ///
+    /// For more information, please see the "Death under ptrace" section
+    /// in `man 2 ptrace`.
+    fn map_err(&self, err: Errno) -> Error {
+        if err == Errno::ESRCH {
+            Error::Died(Zombie::new(self.0))
+        } else {
+            Error::Errno(err)
+        }
+    }
+
+    // Helper for converting from the nix::Error type.
+    fn map_nix_err(&self, err: nix::Error) -> Error {
+        self.map_err(Errno::new(err as i32))
+    }
+
     /// Waits for the next exit stop to occur. This is received asynchronously
     /// regardless of what the process was doing at the time. This is useful for
     /// canceling futures when a process enters a `PTRACE_EVENT_EXIT` (such as
@@ -495,76 +500,115 @@ impl Stopped {
 
     /// Sets the ptracer options.
     pub fn setoptions(&self, options: ptrace::Options) -> Result<(), Error> {
-        ptrace::setoptions(self.0.into(), options).map_err(|err| from_nix_err(self.0, err))
+        ptrace::setoptions(self.0.into(), options).map_err(|err| self.map_nix_err(err))
     }
 
-    /// Gets the state of the registers.
-    pub fn getregs(&self) -> Result<libc::user_regs_struct, Error> {
-        ptrace::getregs(self.0.into()).map_err(|err| from_nix_err(self.0, err))
-    }
+    /// Gets a set of registers.
+    ///
+    /// `which` corresponds to one of:
+    ///  * `libc::NT_PRSTATUS` for the general registers.
+    ///  * `libc::NT_PRFPREG` for the floating point registers.
+    ///
+    /// There are others, but we don't use them.
+    fn getregset<T>(&self, which: i32) -> Result<T, Error> {
+        let mut regs = MaybeUninit::<T>::uninit();
 
-    /// Sets the registers.
-    pub fn setregs(&self, regs: libc::user_regs_struct) -> Result<(), Error> {
-        ptrace::setregs(self.0.into(), regs).map_err(|err| from_nix_err(self.0, err))
-    }
+        let mut iov = libc::iovec {
+            iov_base: regs.as_mut_ptr() as *mut libc::c_void,
+            iov_len: core::mem::size_of_val(&regs),
+        };
 
-    /// Gets the state of the registers.
-    pub fn getfpregs(&self) -> Result<libc::user_fpregs_struct, Error> {
-        let mut data = mem::MaybeUninit::<libc::user_fpregs_struct>::uninit();
-        nix::errno::Errno::result(unsafe {
-            libc::ptrace(
-                libc::PTRACE_GETFPREGS,
+        unsafe {
+            syscalls::syscall!(
+                Sysno::ptrace,
+                // PTRACE_GETREGS isn't available on aarch64, so we must use
+                // PTRACE_GETREGSET instead.
+                libc::PTRACE_GETREGSET,
                 self.0.as_raw(),
-                ptr::null() as *const libc::c_void,
-                data.as_mut_ptr() as *const _ as *const libc::c_void,
+                which,
+                &mut iov as *mut _
             )
-        })
-        .map_err(|err| from_nix_err(self.0, err))?;
-        Ok(unsafe { data.assume_init() })
+        }
+        .map_err(|err| self.map_err(err))?;
+
+        // PTRACE_GETREGSET modifies the length to the real length of the
+        // registers, but we should already know the exact number of registers
+        // for this architecture.
+        debug_assert_eq!(iov.iov_len, core::mem::size_of_val(&regs));
+
+        Ok(unsafe { regs.assume_init() })
     }
 
-    /// Sets the registers.
-    pub fn setfpregs(&self, regs: libc::user_fpregs_struct) -> Result<(), Error> {
-        nix::errno::Errno::result(unsafe {
-            libc::ptrace(
-                libc::PTRACE_SETFPREGS,
+    fn setregset<T>(&self, which: i32, regs: T) -> Result<(), Error> {
+        let iov = libc::iovec {
+            iov_base: &regs as *const _ as *mut _,
+            iov_len: core::mem::size_of_val(&regs),
+        };
+
+        unsafe {
+            syscalls::syscall!(
+                Sysno::ptrace,
+                // PTRACE_SETREGS isn't available on aarch64, so we must use
+                // PTRACE_SETREGSET instead.
+                libc::PTRACE_SETREGSET,
                 self.0.as_raw(),
-                ptr::null() as *const libc::c_void,
-                &regs as *const _ as *const libc::c_void,
+                which,
+                &iov as *const _
             )
-        })
-        .map_err(|err| from_nix_err(self.0, err))?;
+        }
+        .map_err(|err| self.map_err(err))?;
+
         Ok(())
+    }
+
+    /// Gets the current state of the general purpose registers.
+    pub fn getregs(&self) -> Result<Regs, Error> {
+        self.getregset(libc::NT_PRSTATUS)
+    }
+
+    /// Sets the general purpose registers.
+    pub fn setregs(&self, regs: Regs) -> Result<(), Error> {
+        self.setregset(libc::NT_PRSTATUS, regs)
+    }
+
+    /// Gets the floating point registers.
+    pub fn getfpregs(&self) -> Result<FpRegs, Error> {
+        self.getregset(libc::NT_PRFPREG)
+    }
+
+    /// Sets the floating point registers.
+    pub fn setfpregs(&self, regs: FpRegs) -> Result<(), Error> {
+        self.setregset(libc::NT_PRFPREG, regs)
     }
 
     /// Resumes the process and transitions it back to a running state.
     pub fn resume<T: Into<Option<Signal>>>(self, sig: T) -> Result<Running, Error> {
-        ptrace::cont(self.0.into(), sig).map_err(|err| from_nix_err(self.0, err))?;
+        ptrace::cont(self.0.into(), sig).map_err(|err| self.map_nix_err(err))?;
         Ok(Running::new(self.0))
     }
 
     /// Advances the execution of the process by a single step optionally
     /// delivering a signal specified by `sig`.
     pub fn step<T: Into<Option<Signal>>>(self, sig: T) -> Result<Running, Error> {
-        ptrace::step(self.0.into(), sig).map_err(|err| from_nix_err(self.0, err))?;
+        ptrace::step(self.0.into(), sig).map_err(|err| self.map_nix_err(err))?;
         Ok(Running::new(self.0))
     }
 
     /// Like `step`, but arranges for the tracee to be stopped at the next
     /// entry to or exit from a system call.
     pub fn syscall<T: Into<Option<Signal>>>(self, sig: T) -> Result<Running, Error> {
-        ptrace::syscall(self.0.into(), sig).map_err(|err| from_nix_err(self.0, err))?;
+        ptrace::syscall(self.0.into(), sig).map_err(|err| self.map_nix_err(err))?;
         Ok(Running::new(self.0))
     }
 
     /// Gets info about the signal that caused the process to be stopped.
     pub fn getsiginfo(&self) -> Result<libc::siginfo_t, Error> {
-        ptrace::getsiginfo(self.0.into()).map_err(|err| from_nix_err(self.0, err))
+        ptrace::getsiginfo(self.0.into()).map_err(|err| self.map_nix_err(err))
     }
 
     /// Sets info about the singal that caused the process to be stopped.
     pub fn setsiginfo(&self, siginfo: &libc::siginfo_t) -> Result<(), Error> {
-        ptrace::setsiginfo(self.0.into(), siginfo).map_err(|err| from_nix_err(self.0, err))
+        ptrace::setsiginfo(self.0.into(), siginfo).map_err(|err| self.map_nix_err(err))
     }
 
     /// Like `getsiginfo`, but do not remove the signal info from an internal
@@ -573,14 +617,14 @@ impl Stopped {
         &self,
         flags: T,
     ) -> Result<Vec<libc::siginfo_t>, Error> {
-        const SIGNAL_MAX: usize = 8 * std::mem::size_of::<u64>();
-        let mut data = core::mem::MaybeUninit::<[libc::siginfo_t; SIGNAL_MAX]>::zeroed();
+        const SIGNAL_MAX: usize = 8 * core::mem::size_of::<u64>();
+        let mut data = MaybeUninit::<[libc::siginfo_t; SIGNAL_MAX]>::zeroed();
         let mut siginfo_args = ptrace_peeksiginfo_args {
             off: 0,
             flags: flags.into().map_or(0, |x| x.bits()),
             nr: SIGNAL_MAX as u32,
         };
-        let count = nix::errno::Errno::result(unsafe {
+        let count = Errno::result(unsafe {
             libc::ptrace(
                 libc::PTRACE_PEEKSIGINFO,
                 self.0.as_raw(),
@@ -588,7 +632,7 @@ impl Stopped {
                 data.as_mut_ptr() as *const _ as *const libc::c_void,
             )
         })
-        .map_err(|err| from_nix_err(self.0, err))?;
+        .map_err(|err| self.map_err(err))?;
         Ok(unsafe { data.assume_init() }[0..count as usize].to_vec())
     }
 
@@ -597,12 +641,12 @@ impl Stopped {
     /// It shouldn't be necessary to call this in most cases because `Event`
     /// provides the necessary context for certain ptrace events.
     pub fn getevent(&self) -> Result<i64, Error> {
-        ptrace::getevent(self.0.into()).map_err(|err| from_nix_err(self.0, err))
+        ptrace::getevent(self.0.into()).map_err(|err| self.map_nix_err(err))
     }
 
     /// Detaches from and then resumes the stopped tracee.
     pub fn detach<T: Into<Option<Signal>>>(self, sig: T) -> Result<Running, Error> {
-        ptrace::detach(self.0.into(), sig).map_err(|err| from_nix_err(self.0, err))?;
+        ptrace::detach(self.0.into(), sig).map_err(|err| self.map_nix_err(err))?;
         Ok(Running::new(self.0))
     }
 }
@@ -907,7 +951,6 @@ pub fn traceme_and_stop() -> Result<(), Errno> {
 #[cfg(test)]
 mod test {
     use std::io;
-    use std::mem;
     use std::thread;
 
     use nix::sys::signal;
@@ -1235,7 +1278,7 @@ mod test {
 
     #[allow(dead_code)]
     unsafe fn install_sigalrm_handler() -> i32 {
-        let mut sa: libc::sigaction = mem::MaybeUninit::zeroed().assume_init();
+        let mut sa: libc::sigaction = MaybeUninit::zeroed().assume_init();
         sa.sa_flags = libc::SA_RESTART | libc::SA_SIGINFO | libc::SA_NODEFER;
         sa.sa_sigaction = sigalrm_handler as _;
 
@@ -1246,7 +1289,7 @@ mod test {
     // unblock signal(s) and set its handler to SIG_DFL
     unsafe fn unblock_signals(signals: &[Signal]) -> io::Result<KernelSigset> {
         let set = KernelSigset::from(signals);
-        let mut oldset: mem::MaybeUninit<u64> = mem::MaybeUninit::uninit();
+        let mut oldset = MaybeUninit::<u64>::uninit();
 
         if libc::syscall(
             libc::SYS_rt_sigprocmask,
@@ -1265,7 +1308,7 @@ mod test {
     #[allow(dead_code)]
     unsafe fn block_signals(signals: &[Signal]) -> io::Result<KernelSigset> {
         let set = KernelSigset::from(signals);
-        let mut oldset: mem::MaybeUninit<u64> = mem::MaybeUninit::uninit();
+        let mut oldset = MaybeUninit::<u64>::uninit();
 
         if libc::syscall(
             libc::SYS_rt_sigprocmask,
