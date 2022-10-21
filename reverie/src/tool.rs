@@ -14,8 +14,6 @@
 //! same process.
 
 use async_trait::async_trait;
-use raw_cpuid::cpuid;
-use raw_cpuid::CpuIdResult;
 use reverie_syscalls::Syscall;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -23,7 +21,9 @@ use serde::Serialize;
 use crate::error::Errno;
 use crate::error::Error;
 use crate::guest::Guest;
+#[cfg(target_arch = "x86_64")]
 use crate::rdtsc::Rdtsc;
+#[cfg(target_arch = "x86_64")]
 use crate::rdtsc::RdtscResult;
 use crate::ExitStatus;
 use crate::Pid;
@@ -238,25 +238,31 @@ pub trait Tool: Serialize + DeserializeOwned + Send + Sync + Default {
         guest.tail_inject(c).await
     }
 
-    /// CPUID is trapped, the tool should implement this function to return [eax,
-    /// ebx, ecx, edx]
+    /// CPUID is trapped, the tool should implement this function to return
+    /// `[eax, ebx, ecx, edx]`.
     ///
-    /// NOTE: This is never called by default unless cpuid events are subscribed
-    /// to.
+    /// NOTE:
+    ///  * This is never called by default unless cpuid events are subscribed
+    ///    to.
+    ///  * This is only available on x86_64.
+    #[cfg(target_arch = "x86_64")]
     async fn handle_cpuid_event<T: Guest<Self>>(
         &self,
         _guest: &mut T,
         eax: u32,
         ecx: u32,
-    ) -> Result<CpuIdResult, Errno> {
-        Ok(cpuid!(eax, ecx))
+    ) -> Result<raw_cpuid::CpuIdResult, Errno> {
+        Ok(raw_cpuid::cpuid!(eax, ecx))
     }
 
     /// rdtsc/rdtscp is trapped, the tool should implement this function to
     /// return the counter.
     ///
-    /// NOTE: This is never called by default unless rdtsc events are subscribed
-    /// to.
+    /// NOTE:
+    ///  * This is never called by default unless rdtsc events are subscribed
+    ///    to.
+    ///  * This is only available on x86_64.
+    #[cfg(target_arch = "x86_64")]
     async fn handle_rdtsc_event<T: Guest<Self>>(
         &self,
         _guest: &mut T,

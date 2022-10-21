@@ -7,7 +7,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! rdtsc/rdtscp helpers
+//! rdtsc/rdtscp helpers. This only makes sense on x86_64 as it is the only
+//! architecture where we can intercept these instructions.
 
 use core::arch::x86_64::__rdtscp;
 use core::arch::x86_64::_rdtsc;

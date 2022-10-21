@@ -21,6 +21,7 @@ mod auxv;
 mod backtrace;
 mod error;
 mod guest;
+#[cfg(target_arch = "x86_64")]
 mod rdtsc;
 mod stack;
 mod subscription;
@@ -33,6 +34,7 @@ pub use error::*;
 pub use guest::*;
 pub use process::ExitStatus;
 pub use process::Pid;
+#[cfg(target_arch = "x86_64")]
 pub use rdtsc::*;
 pub use reverie_process as process;
 pub use stack::*;
