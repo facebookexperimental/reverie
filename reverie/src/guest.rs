@@ -1,14 +1,9 @@
 /*
- * Copyright (c) 2018-2019, Trustees of Indiana University
- *     ("University Works" via Baojun Wang)
- * Copyright (c) 2018-2019, Ryan Newton
- *     ("Traditional Works of Scholarship")
- * Copyright (c) 2020-, Meta Platforms, Inc. and affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
  *
- *  All rights reserved.
- *
- *  This source code is licensed under the BSD-style license found in the
- *  LICENSE file in the root directory of this source tree.
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 //! Guest (i.e. thread) structure and traits

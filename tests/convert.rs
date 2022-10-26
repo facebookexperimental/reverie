@@ -1,11 +1,11 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
- *
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
+
 #![cfg_attr(feature = "llvm_asm", feature(llvm_asm))]
 
 // when we convert syscall, such as open -> openat, the old syscall
