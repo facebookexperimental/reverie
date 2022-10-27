@@ -2023,7 +2023,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         let task = self.assume_stopped();
         let regs = task.getregs()?;
         let fpregs = task.getfpregs()?;
-        let core_regs = Amd64CoreRegs::from(regs, fpregs);
+        let core_regs = Amd64CoreRegs::from_parts(regs, fpregs);
         Ok(core_regs)
     }
 

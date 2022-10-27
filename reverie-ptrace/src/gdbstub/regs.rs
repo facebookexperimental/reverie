@@ -6,17 +6,80 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use std::fmt;
-
 use serde::Deserialize;
 use serde::Serialize;
 
 use super::response::*;
 
-#[repr(transparent)]
-#[derive(Debug, Default, PartialEq, Clone, Deserialize, Serialize)]
 /// 80-bit FPU register, see gdb/64bit-core.xml
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 pub struct Fp80([u8; 10]);
+
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[repr(transparent)]
+pub struct St([Fp80; 8]);
+
+/// Xmm registers.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[repr(transparent)]
+pub struct Xmm([u128; 16]);
+
+/// i387 regs, gdb layout.
+#[derive(Debug, Default, PartialEq, Clone, Deserialize, Serialize)]
+pub struct X87Regs {
+    /// fctrl
+    pub fctrl: u32,
+    /// fstat
+    pub fstat: u32,
+    /// ftag
+    pub ftag: u32,
+    /// fiseg
+    pub fiseg: u32,
+    /// fioff
+    pub fioff: u32,
+    /// foseg
+    pub foseg: u32,
+    /// fooff
+    pub fooff: u32,
+    /// fop
+    pub fop: u32,
+}
+
+/// AMD64 core/sse regs, see gdb/64bit-{core,sse}-linux.xml.
+/// This is the same as: 64bit-core+64bit-sse+64bit-linux.
+#[derive(Debug, Default, PartialEq, Clone, Deserialize, Serialize)]
+pub struct Amd64CoreRegs {
+    /// general purpose regsiters
+    /// rax/rbx/rcx/rdx/rsi/rdi/rbp/rsp/r8..r15
+    pub regs: [u64; 16],
+    /// rip aka instruction pointer
+    pub rip: u64,
+    /// eflags
+    pub eflags: u32,
+    /// cs, ss, ds, es, fs, gs
+    pub segments: [u32; 6],
+    /// 80-bit fpu regs
+    pub st: St,
+    /// fpu control regs
+    pub x87: X87Regs,
+    /// SSE registers
+    pub xmm: Xmm,
+    /// Sse status/control
+    pub mxcsr: u32,
+    pub orig_rax: u64,
+    pub fs_base: u64,
+    pub gs_base: u64,
+}
+
+/// amd64 avx regs
+#[derive(Debug, Default, PartialEq, Clone, Deserialize, Serialize)]
+pub struct Amd64ExtraRegs {
+    /// avx registers
+    pub ymm: [u128; 32],
+    /// avx512 registers
+    pub ymmh: [u128; 32],
+}
 
 // NB: st from `libc::user_fpregs_struct' has a different representation.
 fn from_u32s(st: &[u32]) -> Fp80 {
@@ -57,12 +120,9 @@ impl From<Fp80> for [u32; 4] {
     }
 }
 
-#[repr(transparent)]
-struct St([Fp80; 8]);
-
 impl From<[u32; 32]> for St {
     fn from(st: [u32; 32]) -> Self {
-        St([
+        Self([
             from_u32s(&st[0..]),
             from_u32s(&st[4..]),
             from_u32s(&st[8..]),
@@ -90,85 +150,40 @@ impl From<St> for [u32; 32] {
     }
 }
 
-#[repr(transparent)]
-struct Xmm([u128; 16]);
-
-impl From<[u32; 64]> for Xmm {
-    fn from(xmm: [u32; 64]) -> Self {
-        Xmm([
-            (xmm[3] as u128) << 96
-                | (xmm[2] as u128) << 64
-                | (xmm[1] as u128) << 32
-                | (xmm[0] as u128),
-            (xmm[7] as u128) << 96
-                | (xmm[6] as u128) << 64
-                | (xmm[5] as u128) << 32
-                | (xmm[4] as u128),
-            (xmm[11] as u128) << 96
-                | (xmm[10] as u128) << 64
-                | (xmm[9] as u128) << 32
-                | (xmm[8] as u128),
-            (xmm[15] as u128) << 96
-                | (xmm[14] as u128) << 64
-                | (xmm[13] as u128) << 32
-                | (xmm[12] as u128),
-            (xmm[19] as u128) << 96
-                | (xmm[18] as u128) << 64
-                | (xmm[17] as u128) << 32
-                | (xmm[16] as u128),
-            (xmm[23] as u128) << 96
-                | (xmm[22] as u128) << 64
-                | (xmm[21] as u128) << 32
-                | (xmm[20] as u128),
-            (xmm[27] as u128) << 96
-                | (xmm[26] as u128) << 64
-                | (xmm[25] as u128) << 32
-                | (xmm[24] as u128),
-            (xmm[31] as u128) << 96
-                | (xmm[30] as u128) << 64
-                | (xmm[29] as u128) << 32
-                | (xmm[28] as u128),
-            (xmm[35] as u128) << 96
-                | (xmm[34] as u128) << 64
-                | (xmm[33] as u128) << 32
-                | (xmm[32] as u128),
-            (xmm[39] as u128) << 96
-                | (xmm[38] as u128) << 64
-                | (xmm[37] as u128) << 32
-                | (xmm[36] as u128),
-            (xmm[43] as u128) << 96
-                | (xmm[42] as u128) << 64
-                | (xmm[41] as u128) << 32
-                | (xmm[40] as u128),
-            (xmm[47] as u128) << 96
-                | (xmm[46] as u128) << 64
-                | (xmm[45] as u128) << 32
-                | (xmm[44] as u128),
-            (xmm[51] as u128) << 96
-                | (xmm[50] as u128) << 64
-                | (xmm[49] as u128) << 32
-                | (xmm[48] as u128),
-            (xmm[55] as u128) << 96
-                | (xmm[54] as u128) << 64
-                | (xmm[53] as u128) << 32
-                | (xmm[52] as u128),
-            (xmm[59] as u128) << 96
-                | (xmm[58] as u128) << 64
-                | (xmm[57] as u128) << 32
-                | (xmm[56] as u128),
-            (xmm[63] as u128) << 96
-                | (xmm[62] as u128) << 64
-                | (xmm[61] as u128) << 32
-                | (xmm[60] as u128),
-        ])
-    }
+#[inline]
+fn u32s_to_u128(xs: &[u32]) -> u128 {
+    (xs[3] as u128) << 96 | (xs[2] as u128) << 64 | (xs[1] as u128) << 32 | (xs[0] as u128)
 }
 
+#[inline]
 fn u128_to_u32s(u: u128, u32s: &mut [u32]) {
     u32s[0] = u as u32;
     u32s[1] = (u >> 32) as u32;
     u32s[2] = (u >> 64) as u32;
     u32s[3] = (u >> 96) as u32;
+}
+
+impl From<[u32; 64]> for Xmm {
+    fn from(xmm: [u32; 64]) -> Self {
+        Self([
+            u32s_to_u128(&xmm[0..4]),
+            u32s_to_u128(&xmm[4..8]),
+            u32s_to_u128(&xmm[8..12]),
+            u32s_to_u128(&xmm[12..16]),
+            u32s_to_u128(&xmm[16..20]),
+            u32s_to_u128(&xmm[20..24]),
+            u32s_to_u128(&xmm[24..28]),
+            u32s_to_u128(&xmm[28..32]),
+            u32s_to_u128(&xmm[32..36]),
+            u32s_to_u128(&xmm[36..40]),
+            u32s_to_u128(&xmm[40..44]),
+            u32s_to_u128(&xmm[44..48]),
+            u32s_to_u128(&xmm[48..52]),
+            u32s_to_u128(&xmm[52..56]),
+            u32s_to_u128(&xmm[56..60]),
+            u32s_to_u128(&xmm[60..64]),
+        ])
+    }
 }
 
 impl From<Xmm> for [u32; 64] {
@@ -194,95 +209,10 @@ impl From<Xmm> for [u32; 64] {
     }
 }
 
-/// i387 regs, gdb layout.
-#[derive(Debug, Default, PartialEq, Clone, Deserialize, Serialize)]
-pub struct X87Regs {
-    /// fctrl
-    pub fctrl: u32,
-    /// fstat
-    pub fstat: u32,
-    /// ftag
-    pub ftag: u32,
-    /// fiseg
-    pub fiseg: u32,
-    /// fioff
-    pub fioff: u32,
-    /// foseg
-    pub foseg: u32,
-    /// fooff
-    pub fooff: u32,
-    /// fop
-    pub fop: u32,
-}
-
-/// arm64 core/sse regs, see gdb/64bit-{core,sse}-linux.xml.
-/// This is the same as: 64bit-core+64bit-sse+64bit-linux.
-#[derive(Default, PartialEq, Clone, Deserialize, Serialize)]
-pub struct Amd64CoreRegs {
-    /// general purpose regsiters
-    /// rax/rbx/rcx/rdx/rsi/rdi/rbp/rsp/r8..r15
-    pub regs: [u64; 16],
-    /// rip aka instruction pointer
-    pub rip: u64,
-    /// eflags
-    pub eflags: u32,
-    /// cs, ss, ds, es, fs, gs
-    pub segments: [u32; 6],
-    /// 80-bit fpu regs
-    pub st: [Fp80; 8],
-    /// fpu control regs
-    pub x87: X87Regs,
-    /// SSE registers
-    pub xmm: [u128; 16],
-    /// Sse status/control
-    pub mxcsr: u32,
-    pub orig_rax: u64,
-    pub fs_base: u64,
-    pub gs_base: u64,
-}
-
-impl fmt::Debug for Amd64CoreRegs {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Amd64CoreRegs")
-            .field("rax", &self.regs[0])
-            .field("rbx", &self.regs[1])
-            .field("rcx", &self.regs[2])
-            .field("rdx", &self.regs[3])
-            .field("rsi", &self.regs[4])
-            .field("rdi", &self.regs[5])
-            .field("rbp", &self.regs[6])
-            .field("rsp", &self.regs[7])
-            .field("r8", &self.regs[8])
-            .field("r9", &self.regs[9])
-            .field("r10", &self.regs[10])
-            .field("r11", &self.regs[11])
-            .field("r12", &self.regs[12])
-            .field("r13", &self.regs[13])
-            .field("r14", &self.regs[14])
-            .field("r15", &self.regs[15])
-            .field("rip", &self.rip)
-            .field("eflags", &self.eflags)
-            .field("cs", &self.segments[0])
-            .field("ss", &self.segments[1])
-            .field("ds", &self.segments[2])
-            .field("es", &self.segments[3])
-            .field("fs", &self.segments[4])
-            .field("gs", &self.segments[5])
-            .field("st", &self.st)
-            .field("x87", &self.x87)
-            .field("xmm", &self.xmm)
-            .field("mxcsr", &self.mxcsr)
-            .field("orig_rax", &self.orig_rax)
-            .field("fs_base", &self.fs_base)
-            .field("gs_base", &self.gs_base)
-            .finish()
-    }
-}
-
 impl Amd64CoreRegs {
     /// create `Amd64CoreRegs` from user and fp regs.
-    pub fn from(regs: libc::user_regs_struct, i387: libc::user_fpregs_struct) -> Self {
-        Amd64CoreRegs {
+    pub fn from_parts(regs: libc::user_regs_struct, i387: libc::user_fpregs_struct) -> Self {
+        Self {
             regs: [
                 regs.rax, regs.rbx, regs.rcx, regs.rdx, regs.rsi, regs.rdi, regs.rbp, regs.rsp,
                 regs.r8, regs.r9, regs.r10, regs.r11, regs.r12, regs.r13, regs.r14, regs.r15,
@@ -297,7 +227,7 @@ impl Amd64CoreRegs {
                 regs.fs as u32,
                 regs.fs as u32,
             ],
-            st: St::from(i387.st_space).0,
+            st: St::from(i387.st_space),
             // NB: fpu/fxsave layout, see https://github.com/rr-debugger/rr/blob/master/src/ExtraRegisters.cc and
             // https://elixir.bootlin.com/linux/latest/source/arch/x86/include/asm/user_64.h#L51
             x87: X87Regs {
@@ -310,7 +240,7 @@ impl Amd64CoreRegs {
                 fooff: (i387.rdp & 0xffffffff) as u32, // 16,
                 fop: i387.fop as u32,                  // 6, short
             },
-            xmm: Xmm::from(i387.xmm_space).0,
+            xmm: Xmm::from(i387.xmm_space),
             mxcsr: i387.mxcsr,
             orig_rax: regs.orig_rax,
             fs_base: regs.fs_base,
@@ -330,8 +260,8 @@ impl Amd64CoreRegs {
         fpregs_intializer.rdp = self.x87.fooff as u64 | ((self.x87.foseg as u64) << 32);
         fpregs_intializer.mxcsr = self.mxcsr;
         fpregs_intializer.mxcr_mask = 0xffff; // only bit 0-15 are valid.
-        fpregs_intializer.st_space = St(self.st).into();
-        fpregs_intializer.xmm_space = Xmm(self.xmm).into();
+        fpregs_intializer.st_space = self.st.into();
+        fpregs_intializer.xmm_space = self.xmm.into();
         (
             libc::user_regs_struct {
                 rax: self.regs[0],
@@ -379,15 +309,6 @@ impl WriteResponse for ResponseAsBinary<Amd64CoreRegs> {
         let encoded: Vec<u8> = bincode::serialize(&self.0).unwrap();
         ResponseAsBinary(encoded.as_slice()).write_response(f)
     }
-}
-
-/// amd64 avx regs
-#[derive(Debug, Default, PartialEq, Clone, Deserialize, Serialize)]
-pub struct Amd64ExtraRegs {
-    /// avx registers
-    pub ymm: [u128; 32],
-    /// avx512 registers
-    pub ymmh: [u128; 32],
 }
 
 #[cfg(test)]
@@ -470,7 +391,7 @@ mod test {
             rip: 0x401040,
             eflags: 0x206,
             segments: [0x33, 0x2b, 0, 0, 0, 0],
-            st: [
+            st: St([
                 Fp80([0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
                 Fp80([0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
                 Fp80([0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
@@ -479,7 +400,7 @@ mod test {
                 Fp80([0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
                 Fp80([0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
                 Fp80([0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
-            ],
+            ]),
             x87: X87Regs {
                 fctrl: 0x37f,
                 fstat: 0,
@@ -490,7 +411,7 @@ mod test {
                 fooff: 0,
                 fop: 0,
             },
-            xmm: [
+            xmm: Xmm([
                 0xff000000,
                 0x2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f,
                 0xff000000000000,
@@ -507,7 +428,7 @@ mod test {
                 0,
                 0,
                 0,
-            ],
+            ]),
             mxcsr: 0x1f80,
             orig_rax: 0xffffffffffffffff,
             fs_base: 0x7ffff7fcd540,
