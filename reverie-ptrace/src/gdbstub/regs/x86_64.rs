@@ -9,7 +9,7 @@
 use serde::Deserialize;
 use serde::Serialize;
 
-use super::response::*;
+use super::super::response::*;
 
 /// 80-bit FPU register, see gdb/64bit-core.xml
 #[repr(transparent)]
