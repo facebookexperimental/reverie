@@ -38,6 +38,7 @@
 mod children;
 mod cp;
 #[allow(unused)]
+#[cfg(target_arch = "x86_64")]
 mod debug;
 mod error;
 mod gdbstub;

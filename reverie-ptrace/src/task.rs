@@ -31,8 +31,6 @@ use nix::sys::mman::ProtFlags;
 use nix::sys::signal::Signal;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
-use reverie::syscalls::ArchPrctl;
-use reverie::syscalls::ArchPrctlCmd;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Mprotect;
 use reverie::syscalls::Syscall;
@@ -47,6 +45,7 @@ use reverie::GlobalRPC;
 use reverie::GlobalTool;
 use reverie::Guest;
 use reverie::Pid;
+#[cfg(target_arch = "x86_64")]
 use reverie::Rdtsc;
 use reverie::Subscription;
 use reverie::Symbol;
@@ -66,10 +65,6 @@ use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio::task::JoinError;
 use tokio::task::JoinHandle;
-use tracing::debug;
-use tracing::info;
-use tracing::trace;
-use tracing::warn;
 
 use super::regs::Reg;
 use super::regs::RegAccess;
@@ -559,22 +554,26 @@ where
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 enum SegfaultTrapInfo {
     Cpuid,
     Rdtscs(Rdtsc),
 }
 
-// check if segfault is called by cpuid/rdtsc trap
-fn decode_segfault(insn_at_rip: u64) -> Option<SegfaultTrapInfo> {
-    if insn_at_rip & 0xffffu64 == 0xa20fu64 {
-        Some(SegfaultTrapInfo::Cpuid)
-    } else if insn_at_rip & 0xffffu64 == 0x310fu64 {
-        Some(SegfaultTrapInfo::Rdtscs(Rdtsc::Tsc))
-    } else if insn_at_rip & 0xffffffu64 == 0xf9010fu64 {
-        Some(SegfaultTrapInfo::Rdtscs(Rdtsc::Tscp))
-    } else {
-        None
+#[cfg(target_arch = "x86_64")]
+impl SegfaultTrapInfo {
+    /// Check if segfault is called by cpuid/rdtsc trap
+    pub fn decode_segfault(insn_at_rip: u64) -> Option<SegfaultTrapInfo> {
+        if insn_at_rip & 0xffffu64 == 0xa20fu64 {
+            Some(SegfaultTrapInfo::Cpuid)
+        } else if insn_at_rip & 0xffffu64 == 0x310fu64 {
+            Some(SegfaultTrapInfo::Rdtscs(Rdtsc::Tsc))
+        } else if insn_at_rip & 0xffffffu64 == 0xf9010fu64 {
+            Some(SegfaultTrapInfo::Rdtscs(Rdtsc::Tscp))
+        } else {
+            None
+        }
     }
 }
 
@@ -611,8 +610,11 @@ fn restore_context(
 }
 
 impl<L: Tool + 'static> TracedTask<L> {
+    #[cfg(target_arch = "x86_64")]
     async fn intercept_cpuid(&mut self) -> bool {
-        // FIXME: This is almost certainly broken!
+        use reverie::syscalls::ArchPrctl;
+        use reverie::syscalls::ArchPrctlCmd;
+
         let ret = self
             .inject(ArchPrctl::new().with_cmd(ArchPrctlCmd::ARCH_SET_CPUID(0)))
             .await;
@@ -673,7 +675,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                     Event::Signal(sig) => {
                         // We can catch spurious signals here, such as SIGWINCH.
                         // All we can do is skip over them.
-                        debug!(
+                        tracing::debug!(
                             "[{}] Skipping {:?} during initialization",
                             task.pid(),
                             event
@@ -705,9 +707,10 @@ impl<L: Tool + 'static> TracedTask<L> {
             Ok(task)
         }
 
-        /// Put the guest into the weird state where it has an "INT3;SYSCALL;INT3" patched into the
-        /// code wherever RIP happens to be pointing.  It leaves RIP pointing at the syscall
-        /// instruction.  This allows forcible injection of syscalls into the guest.
+        /// Put the guest into the weird state where it has an
+        /// "INT3;SYSCALL;INT3" patched into the code wherever RIP happens to be
+        /// pointing.  It leaves RIP pointing at the syscall instruction.  This
+        /// allows forcible injection of syscalls into the guest.
         async fn establish_injection_state(
             mut task: Stopped,
         ) -> Result<(Stopped, user_regs_struct, u64), TraceError> {
@@ -732,8 +735,8 @@ impl<L: Tool + 'static> TracedTask<L> {
             Ok((task, regs, saved))
         }
 
-        /// Undo the effects of `establish_injection_state` and put the program code memory back to
-        /// normal.
+        /// Undo the effects of `establish_injection_state` and put the program
+        /// code memory back to normal.
         fn remove_injection_state(
             mut task: Stopped,
             regs: user_regs_struct,
@@ -756,14 +759,17 @@ impl<L: Tool + 'static> TracedTask<L> {
             .with_protection(ProtFlags::PROT_READ | ProtFlags::PROT_EXEC);
         self.inject(mprotect).await?;
 
+        // Try to intercept cpuid instructions on x86_64
+        #[cfg(target_arch = "x86_64")]
         if self.global_state.subscriptions.has_cpuid() && !self.intercept_cpuid().await {
-            warn!("unable to intercept cpuid");
+            tracing::warn!("unable to intercept cpuid");
         }
 
         // Registers are restored from establish_injection_state.
         remove_injection_state(task, regs, saved)
     }
 
+    #[cfg(target_arch = "x86_64")]
     async fn handle_cpuid(
         &mut self,
         mut regs: libc::user_regs_struct,
@@ -784,6 +790,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         Ok(regs)
     }
 
+    #[cfg(target_arch = "x86_64")]
     async fn handle_rdtscs(
         &mut self,
         mut regs: libc::user_regs_struct,
@@ -915,11 +922,12 @@ impl<L: Tool + 'static> TracedTask<L> {
         ))
     }
 
+    #[cfg(target_arch = "x86_64")]
     async fn handle_sigsegv(&mut self, task: Stopped) -> Result<HandleSignalResult, TraceError> {
         let regs = task.getregs()?;
         let trap_info = Addr::from_raw(regs.rip as usize)
             .and_then(|addr| task.read_value(addr).ok())
-            .and_then(decode_segfault);
+            .and_then(SegfaultTrapInfo::decode_segfault);
         Ok(match trap_info {
             Some(SegfaultTrapInfo::Cpuid) => {
                 let regs = self.handle_cpuid(regs).await?;
@@ -935,9 +943,14 @@ impl<L: Tool + 'static> TracedTask<L> {
         })
     }
 
+    #[cfg(not(target_arch = "x86_64"))]
+    async fn handle_sigsegv(&mut self, task: Stopped) -> Result<HandleSignalResult, TraceError> {
+        Ok(HandleSignalResult::SignalToDeliver(task, Signal::SIGSEGV))
+    }
+
     // handle ptrace signal delivery stop
     async fn handle_signal(&mut self, task: Stopped, sig: Signal) -> Result<Wait, TraceError> {
-        debug!("[{}] handle_signal: received signal {}", task.pid(), sig);
+        tracing::debug!("[{}] handle_signal: received signal {}", task.pid(), sig);
         let result = match sig {
             Signal::SIGSEGV => self.handle_sigsegv(task).await?,
             Signal::SIGSTOP => self.handle_sigstop(task).await?,
@@ -1059,7 +1072,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         child: Running,
         context: Option<libc::user_regs_struct>,
     ) -> Result<Wait, TraceError> {
-        debug!(
+        tracing::debug!(
             "[scheduler] handling fork from parent {} to child {}: {:?}",
             parent.pid(),
             child.pid(),
@@ -1496,7 +1509,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         nr: Sysno,
         args: SyscallArgs,
     ) -> Result<Result<i64, Errno>, TraceError> {
-        trace!(
+        tracing::trace!(
             "[scheduler/tool] (pid = {}) untraced syscall: {:?}",
             task.pid(),
             nr
@@ -1609,7 +1622,7 @@ impl<L: Tool + 'static> TracedTask<L> {
     ) -> Result<Result<i64, Errno>, TraceError> {
         let task = self.assume_stopped();
 
-        debug!(
+        tracing::debug!(
             "[tool] (tid {}) beginning inject of syscall: {}, args {:?}",
             self.tid(),
             nr,
@@ -1644,9 +1657,10 @@ impl<L: Tool + 'static> TracedTask<L> {
     ) -> Result<Result<i64, Errno>, TraceError> {
         let tid = self.tid();
 
-        info!(
+        tracing::info!(
             "[tool] (tid {}) beginning tail_inject of syscall: {}",
-            &tid, nr,
+            &tid,
+            nr,
         );
 
         let task = self.assume_stopped();
@@ -2075,7 +2089,7 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
         self.ndaemons.fetch_add(1, Ordering::SeqCst);
         self.is_a_daemon = true;
 
-        info!("[reverie] daemonizing pid {} ..", pid);
+        tracing::info!("[reverie] daemonizing pid {} ..", pid);
         self.daemonizer
             .send(self.daemon_kill_switch.subscribe())
             .await

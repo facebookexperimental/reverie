@@ -158,6 +158,8 @@ fn init_tracee(intercept_rdtsc: bool) -> Result<(), Errno> {
     const ADDR_NO_RANDOMIZE: u64 = 0x0004_0000;
 
     if intercept_rdtsc {
+        // Intercepting rdtsc is only possible on x86
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             assert_eq!(
                 libc::prctl(libc::PR_SET_TSC, libc::PR_TSC_SIGSEGV, 0, 0, 0),
