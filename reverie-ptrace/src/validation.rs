@@ -9,8 +9,6 @@
 use core::mem;
 
 use perf_event_open_sys::bindings as perf;
-use raw_cpuid::CpuId;
-use raw_cpuid::FeatureInfo;
 use reverie::Errno;
 use thiserror::Error;
 use tracing::error;
@@ -19,8 +17,7 @@ use tracing::warn;
 use crate::perf::do_branches;
 use crate::perf::PerfCounter;
 use crate::timer::get_rcb_perf_config;
-use crate::timer::AMD_VENDOR;
-use crate::timer::INTEL_VENDOR;
+use crate::timer::has_precise_ip;
 
 const IN_TXCP: u64 = 1 << 33;
 const NUM_BRANCHES: u64 = 500;
@@ -92,11 +89,7 @@ fn init_perf_event_attr(
     result.set_exclude_guest(1);
     result.set_exclude_kernel(1);
 
-    if precise_ip
-        && CpuId::new()
-            .get_feature_info()
-            .map_or(false, |info| info.has_ds())
-    {
+    if precise_ip && has_precise_ip() {
         result.set_precise_ip(1);
 
         // This prevents EINVAL when creating a counter with precise_ip enabled
@@ -332,7 +325,8 @@ fn check_working_counters(precise_ip: bool) -> Result<(), PmuValidationError> {
 
 /// check the cpu feature id to determine if it is a AMD-Zen vs AmdF15R30
 /// This is much simpler in c++ because eax is available directly
-fn is_amd_zen(cpu_feature: FeatureInfo) -> bool {
+#[cfg(target_arch = "x86_64")]
+fn is_amd_zen(cpu_feature: raw_cpuid::FeatureInfo) -> bool {
     let family_id = cpu_feature.base_family_id(); // 4 bits
     let model_id = cpu_feature.base_model_id(); // 4 bits
     let ext_model_id = cpu_feature.extended_model_id(); // 4 bits
@@ -342,7 +336,7 @@ fn is_amd_zen(cpu_feature: FeatureInfo) -> bool {
     let cpu_type: u32 =
         ((model_id as u32) << 4) | ((family_id as u32) << 8) | ((ext_model_id as u32) << 16);
 
-    // There are lots of magic numbers here. They come  directly from
+    // There are lots of magic numbers here. They come directly from
     // https://github.com/rr-debugger/rr/blob/master/src/PerfCounters_x86.h
     matches!(
         (cpu_type, ext_family_id),
@@ -367,8 +361,9 @@ fn is_amd_zen(cpu_feature: FeatureInfo) -> bool {
 
 /// This is a transcription of the function with the same name in Mozilla-RR it will
 /// check for bugs specific to cpu architectures
+#[cfg(target_arch = "x86_64")]
 fn check_for_arch_bugs(_precise_ip: bool) -> Result<(), PmuValidationError> {
-    let c = CpuId::new();
+    let c = raw_cpuid::CpuId::new();
     let vendor = c.get_vendor_info().unwrap();
     let feature_info = c
         .get_feature_info()
@@ -376,8 +371,8 @@ fn check_for_arch_bugs(_precise_ip: bool) -> Result<(), PmuValidationError> {
     let vendor_str = vendor.as_str();
 
     match vendor_str {
-        AMD_VENDOR if is_amd_zen(feature_info) => check_for_zen_speclockmap(),
-        INTEL_VENDOR => {
+        "AuthenticAMD" if is_amd_zen(feature_info) => check_for_zen_speclockmap(),
+        "GenuineIntel" => {
             check_for_kvm_in_txcp_bug()?;
             #[cfg(feature = "llvm_asm")]
             check_for_xen_pmi_bug(_precise_ip)?;
@@ -385,6 +380,12 @@ fn check_for_arch_bugs(_precise_ip: bool) -> Result<(), PmuValidationError> {
         }
         s => panic!("Unknown CPU vendor: {}", s),
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn check_for_arch_bugs(_precise_ip: bool) -> Result<(), PmuValidationError> {
+    // TODO: Do some aarch64-specific testing?
+    Ok(())
 }
 
 fn check_for_zen_speclockmap() -> Result<(), PmuValidationError> {
@@ -653,10 +654,7 @@ mod test {
     fn test_check_for_ioc_period_bug_precise_ip() {
         // This assumes the machine running the test will not have this bug and only runs
         // if precise_ip will be enabled
-        if CpuId::new()
-            .get_feature_info()
-            .map_or(false, |info| info.has_ds())
-        {
+        if has_precise_ip() {
             if let Err(pmu_err) = check_for_ioc_period_bug(true) {
                 panic!(
                     "Ioc period bug check failed when precise_ip was enabled - {}",
@@ -670,10 +668,7 @@ mod test {
     fn test_check_working_counters_precise_ip() {
         // This assumes the machine running the test will have working counters and only runs
         // if precise_ip will be enabled
-        if CpuId::new()
-            .get_feature_info()
-            .map_or(false, |info| info.has_ds())
-        {
+        if has_precise_ip() {
             if let Err(pmu_err) = check_working_counters(true) {
                 panic!(
                     "Working counters check failed when precise_ip was enabled - {}",
@@ -687,10 +682,7 @@ mod test {
     fn test_check_for_arch_bugs_precise_ip() {
         // This assumes the machine running the test will not have arch bugs and only runs
         // if precise_ip will be enabled
-        if CpuId::new()
-            .get_feature_info()
-            .map_or(false, |info| info.has_ds())
-        {
+        if has_precise_ip() {
             if let Err(pmu_err) = check_for_arch_bugs(true) {
                 panic!(
                     "Architecture-specific bug check failed when precise_ip was enabled - {}",

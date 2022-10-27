@@ -503,10 +503,9 @@ unsafe fn read_once(v: *mut u32) -> u32 {
 }
 
 #[inline(always)]
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn smp_rmb() {
-    use std::sync::atomic::compiler_fence;
-    use std::sync::atomic::Ordering::SeqCst;
+    use core::sync::atomic::compiler_fence;
+    use core::sync::atomic::Ordering::SeqCst;
     compiler_fence(SeqCst);
 }
 
@@ -589,6 +588,21 @@ pub fn do_branches(mut count: u64) {
     assert_eq!(count, 0);
 }
 
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+pub fn do_branches(mut count: u64) {
+    unsafe {
+        core::arch::asm!(
+            "2:",
+            "sub {0}, {0}, #0x1",
+            "b.ne 2b",
+            inout(reg) count,
+        )
+    }
+
+    assert_eq!(count, 0);
+}
+
 /// Perform exactly `count+1` conditional branch instructions. Useful for
 /// testing timer-related code.
 #[cfg(target_arch = "x86_64")]
@@ -617,6 +631,11 @@ mod test {
     use nix::unistd::gettid;
 
     use super::*;
+
+    #[test]
+    fn test_do_branches() {
+        do_branches(1000);
+    }
 
     #[test]
     fn trace_self() {

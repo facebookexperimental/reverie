@@ -29,7 +29,6 @@
 //!  - before resumption of the guest,
 //! which _usually_ means immediately after the tool callback returns.
 
-use raw_cpuid::CpuId;
 use reverie::Errno;
 use reverie::Pid;
 use reverie::Signal;
@@ -47,11 +46,9 @@ use crate::perf::*;
 // This signal is unused, in that the kernel will never send it to a process.
 const MARKER_SIGNAL: Signal = reverie::PERF_EVENT_SIGNAL;
 
-pub(crate) const AMD_VENDOR: &str = "AuthenticAMD";
-pub(crate) const INTEL_VENDOR: &str = "GenuineIntel";
-
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn get_rcb_perf_config() -> u64 {
-    let c = CpuId::new();
+    let c = raw_cpuid::CpuId::new();
     let fi = c.get_feature_info().unwrap();
     // based on rr's PerfCounters_x86.h and PerfCounters.cc
     match (fi.family_id(), fi.model_id()) {
@@ -73,6 +70,41 @@ pub(crate) fn get_rcb_perf_config() -> u64 {
             fi, oth
         ),
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn get_rcb_perf_config() -> u64 {
+    // TODO:
+    //  1. Compute the microarchitecture from
+    //     `/sys/devices/system/cpu/cpu*/regs/identification/midr_el1`
+    //  2. Look up the microarchitecture in a table to determine what features
+    //     we can enable.
+    // References:
+    //  - https://github.com/rr-debugger/rr/blob/master/src/PerfCounters.cc#L156
+    const BR_RETIRED: u64 = 0x21;
+
+    // For now, always assume that we can get retired branch events.
+    BR_RETIRED
+}
+
+/// Returns true if the current CPU supports precise_ip.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn has_precise_ip() -> bool {
+    let cpu = raw_cpuid::CpuId::new();
+    let has_debug_store = cpu.get_feature_info().map_or(false, |info| info.has_ds());
+
+    debug!(
+        "Setting precise_ip to {} for cpu {:?}",
+        has_debug_store, cpu
+    );
+
+    has_debug_store
+}
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn has_precise_ip() -> bool {
+    // Assume, for now, that aarch64 can use precise_ip.
+    true
 }
 
 /// A timer monitoring a single thread. The underlying implementation is eagerly
@@ -356,9 +388,6 @@ const MAX_SINGLE_STEP_COUNT: u64 = SKID_MARGIN_RCBS + SINGLESTEP_TIMEOUT_RCBS;
 
 impl TimerImpl {
     pub fn new(guest_pid: Pid, guest_tid: Tid) -> Result<Self, Errno> {
-        let cpu = CpuId::new();
-        let has_debug_store = cpu.get_feature_info().map_or(false, |info| info.has_ds());
-
         let evt = Event::Raw(get_rcb_perf_config());
 
         // measure the target tid irrespective of CPU
@@ -367,12 +396,7 @@ impl TimerImpl {
             .sample_period(PerfCounter::DISABLE_SAMPLE_PERIOD)
             .event(evt);
 
-        // Check if we can set precise_ip = 1 by checking if debug store is enabled.
-        debug!(
-            "Setting precise_ip to {} for cpu {:?}",
-            has_debug_store, cpu
-        );
-        if has_debug_store {
+        if has_precise_ip() {
             // set precise_ip to lowest value to enable PEBS (TODO: AMD?)
             builder.precise_ip(1);
         }
