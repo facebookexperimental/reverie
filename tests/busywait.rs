@@ -17,7 +17,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
-use raw_cpuid::cpuid;
 use reverie::syscalls::Syscall;
 use reverie::CpuIdResult;
 use reverie::Errno;
@@ -27,8 +26,6 @@ use reverie::GlobalRPC;
 use reverie::GlobalTool;
 use reverie::Guest;
 use reverie::Pid;
-use reverie::Rdtsc;
-use reverie::RdtscResult;
 use reverie::Signal;
 use reverie::Tid;
 use reverie::TimerSchedule;
@@ -124,6 +121,7 @@ impl Tool for LocalState {
         guest.tail_inject(syscall).await
     }
 
+    #[cfg(target_arch = "x86_64")]
     async fn handle_cpuid_event<T: Guest<Self>>(
         &self,
         guest: &mut T,
@@ -131,16 +129,17 @@ impl Tool for LocalState {
         ecx: u32,
     ) -> Result<CpuIdResult, Errno> {
         guest.send_rpc(IncrMsg::Increment).await;
-        Ok(cpuid!(eax, ecx))
+        Ok(raw_cpuid::cpuid!(eax, ecx))
     }
 
+    #[cfg(target_arch = "x86_64")]
     async fn handle_rdtsc_event<T: Guest<Self>>(
         &self,
         guest: &mut T,
-        request: Rdtsc,
-    ) -> Result<RdtscResult, Errno> {
+        request: reverie::Rdtsc,
+    ) -> Result<reverie::RdtscResult, Errno> {
         guest.send_rpc(IncrMsg::Increment).await;
-        Ok(RdtscResult::new(request))
+        Ok(reverie::RdtscResult::new(request))
     }
 
     async fn handle_signal_event<T: Guest<Self>>(
@@ -179,13 +178,6 @@ impl Tool for LocalState {
     }
 }
 
-/// Inform the Tool to begin counting events via a specific syscall
-fn do_marker_syscall() {
-    unsafe {
-        libc::clock_getres(libc::CLOCK_MONOTONIC, std::ptr::null_mut());
-    }
-}
-
 #[cfg(all(not(sanitized), test))]
 mod tests {
     use std::time::Duration;
@@ -195,6 +187,13 @@ mod tests {
     use reverie_ptrace::testing::do_branches;
 
     use super::*;
+
+    /// Inform the Tool to begin counting events via a specific syscall
+    fn do_marker_syscall() {
+        unsafe {
+            libc::clock_getres(libc::CLOCK_MONOTONIC, std::ptr::null_mut());
+        }
+    }
 
     #[test]
     fn guest_busywait_no_timer() {

@@ -79,7 +79,6 @@ syscall_list! {
         close => Close,
         #[cfg(not(target_arch = "aarch64"))]
         stat => Stat,
-        #[cfg(not(target_arch = "aarch64"))]
         fstat => Fstat,
         #[cfg(not(target_arch = "aarch64"))]
         lstat => Lstat,
@@ -392,6 +391,7 @@ syscall_list! {
         fchownat => Fchownat,
         #[cfg(not(target_arch = "aarch64"))]
         futimesat => Futimesat,
+        // TODO: Rename this to Fstatat.
         #[cfg(not(target_arch = "aarch64"))]
         newfstatat => Newfstatat,
         unlinkat => Unlinkat,
@@ -573,8 +573,6 @@ typed_syscall! {
     }
 }
 
-// Fstat not available in aarch64
-#[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Fstat {
         fd: i32,
@@ -2671,7 +2669,8 @@ typed_syscall! {
         flags: AtFlags,
     }
 }
-// Stat not available in aarch64
+
+// Newfstatat not available in aarch64
 #[cfg(not(target_arch = "aarch64"))]
 impl From<Stat> for Newfstatat {
     fn from(stat: Stat) -> Self {
@@ -2704,6 +2703,7 @@ typed_syscall! {
         flags: AtFlags,
     }
 }
+
 // Unlink not available in aarch64
 #[cfg(not(target_arch = "aarch64"))]
 impl From<Unlink> for Unlinkat {

@@ -11,10 +11,6 @@
 //! Syscalls are abused to communicate from the guest to the tool instructions
 //! necessary to carry out the test, such as setting timers or reading clocks.
 
-#![cfg_attr(feature = "llvm_asm", feature(llvm_asm))]
-use core::arch::x86_64::__cpuid;
-use core::arch::x86_64::__rdtscp;
-use core::arch::x86_64::_rdtsc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
@@ -202,126 +198,8 @@ async fn raise_sigwinch<T: Guest<LocalState>>(guest: &mut T) -> Tgkill {
         .with_sig(libc::SIGWINCH)
 }
 
-// FIXME: Use the syscalls crate for doing this when it switches to using the
-// `asm!()` macro instead of asm inside of a C file.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-#[cfg(not(feature = "llvm_asm"))]
-unsafe fn syscall_no_branches(no: libc::c_long, arg1: libc::c_long) {
-    let mut _ret: u64;
-    core::arch::asm!(
-        "syscall",
-        lateout("rax") _ret,
-        in("rax") no,
-        in("rdi") arg1,
-        out("rcx") _, // rcx is used to store old rip
-        out("r11") _, // r11 is used to store old rflags
-    );
-}
-
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-#[cfg(feature = "llvm_asm")]
-#[allow(deprecated)]
-unsafe fn syscall_no_branches(no: libc::c_long, arg1: libc::c_long) {
-    llvm_asm!("
-        mov $0, %rax
-        mov $1, %rdi
-        xor %rsi, %rsi
-        xor %rdx, %rdx
-        xor %r10, %r10
-        xor %r8, %r8
-        xor %r9, %r9
-        syscall
-        "
-    : /* no output */
-    : "r"(no), "r"(arg1)
-    : "cc", "rax", "rdi", "rsi", "rdx", "r10", "r8", "r9", /* from syscall: */ "rcx", "r11"
-    );
-}
-
-fn sched_precise() {
-    unsafe { syscall_no_branches(libc::SYS_clock_getres, 0) }
-}
-
-fn sched_precise_alternate_rcb_count() {
-    unsafe { syscall_no_branches(libc::SYS_msgrcv, 0) }
-}
-
-fn sched_imprecise() {
-    unsafe { syscall_no_branches(libc::SYS_timer_getoverrun, 0) }
-}
-
-fn mark_clock() {
-    unsafe { syscall_no_branches(libc::SYS_clock_settime, 0) }
-}
-
-fn assert_clock(delta: u64) {
-    unsafe { syscall_no_branches(libc::SYS_clock_adjtime, delta as i64) }
-}
-
-fn assert_clock_at_next_timer(value: u64) {
-    unsafe { syscall_no_branches(libc::SYS_timer_gettime, value as i64) }
-}
-
-fn do_syscall() {
-    unsafe { syscall_no_branches(libc::SYS_clock_gettime, 0) }
-}
-
-fn immediate_exit() {
-    unsafe { syscall_no_branches(libc::SYS_exit, 0) }
-}
-
-fn sched_precise_and_raise() {
-    unsafe { syscall_no_branches(libc::SYS_fanotify_init, 0) }
-}
-
-fn sched_imprecise_and_raise() {
-    unsafe { syscall_no_branches(libc::SYS_fanotify_mark, 0) }
-}
-
-fn sched_precise_and_inject() {
-    unsafe { syscall_no_branches(libc::SYS_msgctl, 0) }
-}
-
-fn sched_imprecise_and_inject() {
-    unsafe { syscall_no_branches(libc::SYS_msgget, 0) }
-}
-
-fn cpuid() {
-    unsafe {
-        __cpuid(0);
-    }
-}
-
-fn rdtsc() {
-    unsafe {
-        _rdtsc();
-    }
-}
-
-fn rdtscp() {
-    unsafe {
-        let mut x = 0u32;
-        __rdtscp(&mut x as *mut _);
-    }
-}
-
-fn ts_check_fn(rcbs: u64, f: impl FnOnce()) -> GlobalState {
-    use reverie_ptrace::testing::check_fn_with_config;
-    check_fn_with_config::<LocalState, _>(
-        f,
-        Config {
-            timeout_rcbs: rcbs,
-            ..Default::default()
-        },
-        true,
-    )
-}
-
-const MANY_RCBS: u64 = 10000; // Normal perf signaling
-const LESS_RCBS: u64 = 15; // Low enough to use artificial signaling
-
 #[cfg(all(not(sanitized), test))]
-mod timer_tests {
+mod tests {
     //! These tests are highly sensitive to the number of branches executed
     //! in the guest, and this must remain consistent between opt and debug
     //! mode. If you pass non-constant values into do_branches and need them to
@@ -330,11 +208,102 @@ mod timer_tests {
     //! tests.
 
     use reverie_ptrace::ret_without_perf;
+    use reverie_ptrace::testing::check_fn;
     use reverie_ptrace::testing::check_fn_with_config;
     use reverie_ptrace::testing::do_branches;
     use test_case::test_case;
 
     use super::*;
+
+    #[inline(always)]
+    unsafe fn syscall_no_branches(no: Sysno, arg1: libc::c_long) {
+        syscalls::syscall!(no, arg1, 0, 0, 0, 0, 0);
+    }
+
+    fn sched_precise() {
+        unsafe { syscall_no_branches(Sysno::clock_getres, 0) }
+    }
+
+    fn sched_precise_alternate_rcb_count() {
+        unsafe { syscall_no_branches(Sysno::msgrcv, 0) }
+    }
+
+    fn sched_imprecise() {
+        unsafe { syscall_no_branches(Sysno::timer_getoverrun, 0) }
+    }
+
+    fn mark_clock() {
+        unsafe { syscall_no_branches(Sysno::clock_settime, 0) }
+    }
+
+    fn assert_clock(delta: u64) {
+        unsafe { syscall_no_branches(Sysno::clock_adjtime, delta as i64) }
+    }
+
+    fn assert_clock_at_next_timer(value: u64) {
+        unsafe { syscall_no_branches(Sysno::timer_gettime, value as i64) }
+    }
+
+    fn do_syscall() {
+        unsafe { syscall_no_branches(Sysno::clock_gettime, 0) }
+    }
+
+    fn immediate_exit() {
+        unsafe { syscall_no_branches(Sysno::exit, 0) }
+    }
+
+    fn sched_precise_and_raise() {
+        unsafe { syscall_no_branches(Sysno::fanotify_init, 0) }
+    }
+
+    fn sched_imprecise_and_raise() {
+        unsafe { syscall_no_branches(Sysno::fanotify_mark, 0) }
+    }
+
+    fn sched_precise_and_inject() {
+        unsafe { syscall_no_branches(Sysno::msgctl, 0) }
+    }
+
+    fn sched_imprecise_and_inject() {
+        unsafe { syscall_no_branches(Sysno::msgget, 0) }
+    }
+
+    fn cpuid() {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            core::arch::x86_64::__cpuid(0);
+        }
+    }
+
+    fn rdtsc() {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            core::arch::x86_64::_rdtsc();
+        }
+    }
+
+    fn rdtscp() {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            let mut x = 0u32;
+            core::arch::x86_64::__rdtscp(&mut x as *mut _);
+        }
+    }
+
+    fn ts_check_fn(rcbs: u64, f: impl FnOnce()) -> GlobalState {
+        use reverie_ptrace::testing::check_fn_with_config;
+        check_fn_with_config::<LocalState, _>(
+            f,
+            Config {
+                timeout_rcbs: rcbs,
+                ..Default::default()
+            },
+            true,
+        )
+    }
+
+    const MANY_RCBS: u64 = 10000; // Normal perf signaling
+    const LESS_RCBS: u64 = 15; // Low enough to use artificial signaling
 
     #[test_case(MANY_RCBS, sched_precise)]
     #[test_case(MANY_RCBS, sched_imprecise)]
@@ -641,16 +610,6 @@ mod timer_tests {
             }
         }
     }
-}
-
-#[cfg(all(not(sanitized), test))]
-mod clock_tests {
-    use reverie_ptrace::ret_without_perf;
-    use reverie_ptrace::testing::check_fn;
-    use reverie_ptrace::testing::do_branches;
-    use test_case::test_case;
-
-    use super::*;
 
     #[test]
     fn clock_accuracy() {
@@ -722,14 +681,6 @@ mod clock_tests {
         });
         assert_eq!(gs.num_timer_evts.into_inner(), 1);
     }
-}
-
-#[cfg(all(not(sanitized), test))]
-mod general {
-    use reverie_ptrace::ret_without_perf;
-    use reverie_ptrace::testing::check_fn_with_config;
-
-    use super::*;
 
     #[test]
     fn basic() {

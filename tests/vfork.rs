@@ -6,6 +6,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+// FIXME: aarch64 doesn't have a `vfork` syscall. Instead, it uses the `clone`
+// syscall. This test should work with both methods of doing a `vfork`.
+#![cfg(target_arch = "x86_64")]
+
 // signal handling related tests.
 
 use reverie::syscalls::Syscall;

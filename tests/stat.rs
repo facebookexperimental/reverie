@@ -8,11 +8,6 @@
 
 // reinject stat* as fstatat unittest
 
-use reverie::syscalls;
-use reverie::syscalls::Displayable;
-use reverie::syscalls::Syscall;
-use reverie::Error;
-use reverie::Guest;
 use reverie::Tool;
 use serde::Deserialize;
 use serde::Serialize;
@@ -20,31 +15,8 @@ use serde::Serialize;
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 struct LocalState;
 
-async fn handle_newfstatat<T: Guest<LocalState>>(
-    guest: &mut T,
-    call: syscalls::Newfstatat,
-) -> Result<i64, Error> {
-    let res = guest.inject(call).await;
-
-    println!("{} = {:?}", call.display(&guest.memory()), res);
-
-    Ok(res?)
-}
-
 #[reverie::tool]
-impl Tool for LocalState {
-    async fn handle_syscall_event<T: Guest<Self>>(
-        &self,
-        guest: &mut T,
-        syscall: Syscall,
-    ) -> Result<i64, Error> {
-        match syscall {
-            Syscall::Stat(stat) => handle_newfstatat(guest, stat.into()).await,
-            Syscall::Lstat(lstat) => handle_newfstatat(guest, lstat.into()).await,
-            _ => guest.tail_inject(syscall).await,
-        }
-    }
-}
+impl Tool for LocalState {}
 
 #[cfg(all(not(sanitized), test))]
 mod tests {
@@ -79,7 +51,7 @@ mod tests {
     // glibc doesn't provide wrapper for statx
     unsafe fn statx(
         dirfd: i32,
-        path: *const i8,
+        path: *const libc::c_char,
         flags: i32,
         mask: u32,
         statxbuf: *mut libc::statx,

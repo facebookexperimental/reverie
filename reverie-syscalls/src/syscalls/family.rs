@@ -61,39 +61,43 @@ impl From<WriteFamily> for Syscall {
 /// Represents the stat family of syscalls. All of these have an associated stat
 /// buffer.
 // Stat not available in aarch64
-#[cfg(not(target_arch = "aarch64"))]
 #[derive(From, Debug, Copy, Clone, Eq, PartialEq)]
 #[allow(missing_docs)]
 pub enum StatFamily {
+    #[cfg(not(target_arch = "aarch64"))]
     Stat(super::Stat),
     Fstat(super::Fstat),
+    #[cfg(not(target_arch = "aarch64"))]
     Lstat(super::Lstat),
+    #[cfg(not(target_arch = "aarch64"))]
     Newfstatat(super::Newfstatat),
 }
 
-// Stat not available in aarch64
-#[cfg(not(target_arch = "aarch64"))]
 impl StatFamily {
     /// Get address of the stat buffer. Returns `None` if a NULL pointer was
     /// specified.
     pub fn stat(&self) -> Option<StatPtr> {
         match self {
+            #[cfg(not(target_arch = "aarch64"))]
             Self::Stat(s) => s.stat(),
             Self::Fstat(s) => s.stat(),
+            #[cfg(not(target_arch = "aarch64"))]
             Self::Lstat(s) => s.stat(),
+            #[cfg(not(target_arch = "aarch64"))]
             Self::Newfstatat(s) => s.stat(),
         }
     }
 }
 
-// Stat not available in aarch64
-#[cfg(not(target_arch = "aarch64"))]
 impl From<StatFamily> for Syscall {
     fn from(family: StatFamily) -> Syscall {
         match family {
+            #[cfg(not(target_arch = "aarch64"))]
             StatFamily::Stat(syscall) => Syscall::Stat(syscall),
             StatFamily::Fstat(syscall) => Syscall::Fstat(syscall),
+            #[cfg(not(target_arch = "aarch64"))]
             StatFamily::Lstat(syscall) => Syscall::Lstat(syscall),
+            #[cfg(not(target_arch = "aarch64"))]
             StatFamily::Newfstatat(syscall) => Syscall::Newfstatat(syscall),
         }
     }

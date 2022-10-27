@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+// rdtsc interception is only available on x86_64
+#![cfg(target_arch = "x86_64")]
+
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 

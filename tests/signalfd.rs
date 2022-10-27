@@ -35,6 +35,7 @@ impl Tool for LocalState {
         let exit_failure = ExitGroup::new().with_status(1);
         match syscall {
             // glibc should wrap signalfd -> signalfd4(2).
+            #[cfg(target_arch = "x86_64")]
             Syscall::Signalfd(_) => guest.tail_inject(exit_failure).await,
             Syscall::Signalfd4(_) => {
                 let (_, args) = syscall.into_parts();

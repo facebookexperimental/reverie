@@ -226,8 +226,8 @@ fn i_should_segfault() {
     use reverie_ptrace::testing::test_fn;
     let (output, _) = test_fn::<NoopTool, _>(|| {
         unsafe {
-            let invalid_pointer = 0x5u64 as *mut u64;
-            std::ptr::write(invalid_pointer, 0xdeadbeefu64);
+            let invalid_ptr = 0x5u64 as *mut u64;
+            invalid_ptr.write(0xdeadbeefu64);
         };
     })
     .unwrap();
@@ -240,26 +240,15 @@ fn i_should_segfault_2() {
     use nix::sys::signal::Signal::SIGSEGV;
     use reverie_ptrace::testing::test_fn;
 
-    #[inline]
-    #[cfg(not(feature = "llvm_asm"))]
-    unsafe fn do_segfault() {
-        let null_ptr: *const usize = core::ptr::null();
-        core::arch::asm!(
-            "jmp {0}",
-            in(reg) null_ptr,
-        )
+    pub fn do_segfault() {
+        let invalid_ptr = 0x1234 as *const usize;
+        let result = unsafe { invalid_ptr.read() };
+        // Print so the above doesn't get optimized out. We will never get here
+        // because the above segfaults.
+        println!("{}", result);
     }
 
-    #[inline]
-    #[cfg(feature = "llvm_asm")]
-    #[allow(deprecated)]
-    unsafe fn do_segfault() {
-        llvm_asm!(r#"mov $$0, %rax
-                jmpq *%rax
-                "#:::"rax")
-    }
-
-    let (output, _) = test_fn::<NoopTool, _>(|| unsafe { do_segfault() }).unwrap();
+    let (output, _) = test_fn::<NoopTool, _>(|| do_segfault()).unwrap();
     assert_eq!(output.status, ExitStatus::Signaled(SIGSEGV, true),);
 }
 

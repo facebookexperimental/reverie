@@ -8,6 +8,9 @@
 
 //! Tests cpuid interception
 
+// cpuid interception is only available on x86_64
+#![cfg(target_arch = "x86_64")]
+
 use raw_cpuid::CpuIdResult;
 use reverie::Errno;
 use reverie::GlobalTool;

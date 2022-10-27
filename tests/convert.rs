@@ -7,6 +7,8 @@
  */
 
 #![cfg_attr(feature = "llvm_asm", feature(llvm_asm))]
+// FIXME: This test does some very x86_64-specific things.
+#![cfg(target_arch = "x86_64")]
 
 // when we convert syscall, such as open -> openat, the old syscall
 // args should not be clobbered, even with the conversion.

@@ -56,21 +56,10 @@ impl Tool for PedigreeLocal {
         syscall: Syscall,
     ) -> Result<i64, Error> {
         match syscall {
-            Syscall::Fork(_) | Syscall::Vfork(_) | Syscall::Clone(_) => {
-                let retval = guest.inject(syscall).await?;
-                let pedigree = guest.thread_state_mut().0.fork_mut();
-                trace!(
-                    "got new pedigree: {:?} => {:x?}",
-                    pedigree,
-                    nix::unistd::Pid::try_from(&pedigree)
-                );
-                Ok(retval)
-            }
-            Syscall::Getpid(_)
-            | Syscall::Getppid(_)
-            | Syscall::Gettid(_)
-            | Syscall::Getpgid(_)
-            | Syscall::Getpgrp(_) => {
+            #[cfg(target_arch = "x86_64")]
+            Syscall::Fork(_) | Syscall::Vfork(_) => self.handle_fork(syscall, guest).await,
+            Syscall::Clone(_) => self.handle_fork(syscall, guest).await,
+            Syscall::Getpid(_) | Syscall::Getppid(_) | Syscall::Gettid(_) | Syscall::Getpgid(_) => {
                 let pid = guest.inject(syscall).await?;
                 let vpid = nix::unistd::Pid::try_from(&self.0).unwrap();
                 trace!("getpid returned {:?} vpid: {:?}", pid, vpid);
@@ -81,6 +70,23 @@ impl Tool for PedigreeLocal {
             }
             _ => guest.tail_inject(syscall).await,
         }
+    }
+}
+
+impl PedigreeLocal {
+    async fn handle_fork(
+        &self,
+        syscall: Syscall,
+        guest: &mut impl Guest<Self>,
+    ) -> Result<i64, Error> {
+        let retval = guest.inject(syscall).await?;
+        let pedigree = guest.thread_state_mut().0.fork_mut();
+        trace!(
+            "got new pedigree: {:?} => {:x?}",
+            pedigree,
+            nix::unistd::Pid::try_from(&pedigree)
+        );
+        Ok(retval)
     }
 }
 

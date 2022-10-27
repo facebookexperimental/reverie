@@ -21,6 +21,7 @@
  * 748:   0f 1f 84 00 00 00 00    nopl   0x0(%rax,%rax,1)
  * 74f:   00
  */
+#if defined(__x86_64__)
 __attribute__((noinline)) static int sys_getpid(void) {
   int ret;
   asm volatile(
@@ -29,6 +30,14 @@ __attribute__((noinline)) static int sys_getpid(void) {
       : "=r"(ret));
   return ret;
 }
+#elif defined(__aarch64__)
+__attribute__((noinline)) static int sys_getpid(void) {
+  register long x8 __asm__("x8") = 172;
+  register long x0 __asm__("x0");
+  asm volatile("svc 0" : "=r"(x0) : "r"(x8) : "memory", "cc");
+  return (int)x0;
+}
+#endif
 
 int main(int argc, char* argv[]) {
   int pid0 = getpid();

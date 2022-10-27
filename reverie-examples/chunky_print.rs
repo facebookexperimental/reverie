@@ -196,13 +196,22 @@ impl Tool for ChunkyPrintLocal {
         let _ = guest.send_rpc(Msg::Tick).await;
         match call {
             // Here we make some attempt to catch redirections:
+            // FIXME: De-dup the dup
+            #[cfg(target_arch = "x86_64")]
             Syscall::Dup2(d) => {
-                let newfd = d.newfd();
-                if newfd == 1 {
-                    self.stdout_disconnected.store(true, Ordering::SeqCst);
+                match d.newfd() {
+                    1 => self.stdout_disconnected.store(true, Ordering::SeqCst),
+                    2 => self.stderr_disconnected.store(true, Ordering::SeqCst),
+                    _ => {}
                 }
-                if newfd == 2 {
-                    self.stderr_disconnected.store(true, Ordering::SeqCst);
+
+                guest.tail_inject(call).await
+            }
+            Syscall::Dup3(d) => {
+                match d.newfd() {
+                    1 => self.stdout_disconnected.store(true, Ordering::SeqCst),
+                    2 => self.stderr_disconnected.store(true, Ordering::SeqCst),
+                    _ => {}
                 }
 
                 guest.tail_inject(call).await
