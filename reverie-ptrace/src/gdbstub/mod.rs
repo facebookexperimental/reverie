@@ -35,7 +35,6 @@ pub use inferior::InferiorThreadId;
 pub use inferior::ResumeInferior;
 pub use inferior::StoppedInferior;
 pub use regs::CoreRegs;
-pub use regs::ExtraRegs;
 pub use request::GdbRequest;
 pub use server::GdbServer;
 pub use session::Session;
