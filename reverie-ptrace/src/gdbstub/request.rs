@@ -9,8 +9,8 @@
 use safeptrace::Error as TraceError;
 use tokio::sync::oneshot;
 
-use super::Amd64CoreRegs;
 use super::Breakpoint;
+use super::CoreRegs;
 
 /// gdb request send to reverie.
 #[derive(Debug)]
@@ -27,7 +27,7 @@ pub enum GdbRequest {
     /// Write inferior memory
     WriteInferiorMemory(u64, usize, Vec<u8>, oneshot::Sender<Result<(), TraceError>>),
     /// Read registers
-    ReadRegisters(oneshot::Sender<Result<Amd64CoreRegs, TraceError>>),
+    ReadRegisters(oneshot::Sender<Result<CoreRegs, TraceError>>),
     /// Write registers
-    WriteRegisters(Amd64CoreRegs, oneshot::Sender<Result<(), TraceError>>),
+    WriteRegisters(CoreRegs, oneshot::Sender<Result<(), TraceError>>),
 }

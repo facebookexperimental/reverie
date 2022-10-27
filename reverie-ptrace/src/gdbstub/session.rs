@@ -33,7 +33,7 @@ use tokio::sync::MutexGuard;
 
 use super::commands;
 use super::commands::*;
-use super::regs::Amd64CoreRegs;
+use super::regs::CoreRegs;
 use super::response::*;
 use super::Breakpoint;
 use super::BreakpointType;
@@ -811,7 +811,7 @@ impl Session {
         .await
     }
 
-    async fn read_registers(&self) -> Result<Amd64CoreRegs, Error> {
+    async fn read_registers(&self) -> Result<CoreRegs, Error> {
         self.with_current_inferior(async move |inferior| {
             let request_tx = inferior
                 .request_tx
@@ -837,7 +837,7 @@ impl Session {
                 .as_ref()
                 .ok_or(Error::SessionNotStarted)?;
             let (reply_tx, reply_rx) = oneshot::channel();
-            let core_regs: Amd64CoreRegs =
+            let core_regs: CoreRegs =
                 bincode::deserialize(regs).map_err(|_| CommandParseError::MalformedRegisters)?;
             let request = GdbRequest::WriteRegisters(core_regs, reply_tx);
             let _ = request_tx

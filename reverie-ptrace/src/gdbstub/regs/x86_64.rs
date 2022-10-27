@@ -49,7 +49,7 @@ pub struct X87Regs {
 /// AMD64 core/sse regs, see gdb/64bit-{core,sse}-linux.xml.
 /// This is the same as: 64bit-core+64bit-sse+64bit-linux.
 #[derive(Debug, Default, PartialEq, Clone, Deserialize, Serialize)]
-pub struct Amd64CoreRegs {
+pub struct CoreRegs {
     /// general purpose regsiters
     /// rax/rbx/rcx/rdx/rsi/rdi/rbp/rsp/r8..r15
     pub regs: [u64; 16],
@@ -74,7 +74,7 @@ pub struct Amd64CoreRegs {
 
 /// amd64 avx regs
 #[derive(Debug, Default, PartialEq, Clone, Deserialize, Serialize)]
-pub struct Amd64ExtraRegs {
+pub struct ExtraRegs {
     /// avx registers
     pub ymm: [u128; 32],
     /// avx512 registers
@@ -209,8 +209,8 @@ impl From<Xmm> for [u32; 64] {
     }
 }
 
-impl Amd64CoreRegs {
-    /// create `Amd64CoreRegs` from user and fp regs.
+impl CoreRegs {
+    /// create `CoreRegs` from user and fp regs.
     pub fn from_parts(regs: libc::user_regs_struct, i387: libc::user_fpregs_struct) -> Self {
         Self {
             regs: [
@@ -297,14 +297,14 @@ impl Amd64CoreRegs {
     }
 }
 
-impl WriteResponse for ResponseAsHex<Amd64CoreRegs> {
+impl WriteResponse for ResponseAsHex<CoreRegs> {
     fn write_response(&self, f: &mut ResponseWriter) {
         let encoded: Vec<u8> = bincode::serialize(&self.0).unwrap();
         ResponseAsHex(encoded.as_slice()).write_response(f)
     }
 }
 
-impl WriteResponse for ResponseAsBinary<Amd64CoreRegs> {
+impl WriteResponse for ResponseAsBinary<CoreRegs> {
     fn write_response(&self, f: &mut ResponseWriter) {
         let encoded: Vec<u8> = bincode::serialize(&self.0).unwrap();
         ResponseAsBinary(encoded.as_slice()).write_response(f)
@@ -361,15 +361,15 @@ mod test {
     #[test]
     fn amd64_core_regs_sanity() {
         const EXPECTED_SIZE: usize = 16 * 8 + 8 + 4 + 4 * 6 + 10 * 8 + 8 * 4 + 16 * 16 + 4 + 8 * 3; // 560.
-        assert_eq!(mem::size_of::<Amd64CoreRegs>(), EXPECTED_SIZE);
-        let core_regs: Amd64CoreRegs = Default::default();
+        assert_eq!(mem::size_of::<CoreRegs>(), EXPECTED_SIZE);
+        let core_regs: CoreRegs = Default::default();
         let encoded: Vec<u8> = bincode::serialize(&core_regs).unwrap();
         assert_eq!(encoded.len(), EXPECTED_SIZE);
     }
 
     #[test]
     fn amd64_core_regs_serde() {
-        let core_regs: Amd64CoreRegs = Amd64CoreRegs {
+        let core_regs: CoreRegs = CoreRegs {
             regs: [
                 0x1c,
                 0,

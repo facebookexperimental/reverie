@@ -71,8 +71,8 @@ use super::regs::RegAccess;
 use crate::children;
 use crate::cp;
 use crate::error::Error;
-use crate::gdbstub::Amd64CoreRegs;
 use crate::gdbstub::BreakpointType;
+use crate::gdbstub::CoreRegs;
 use crate::gdbstub::GdbRequest;
 use crate::gdbstub::GdbServer;
 use crate::gdbstub::ResumeAction;
@@ -2019,15 +2019,15 @@ impl<L: Tool + 'static> TracedTask<L> {
         Ok(())
     }
 
-    fn read_registers(&self) -> Result<Amd64CoreRegs, TraceError> {
+    fn read_registers(&self) -> Result<CoreRegs, TraceError> {
         let task = self.assume_stopped();
         let regs = task.getregs()?;
         let fpregs = task.getfpregs()?;
-        let core_regs = Amd64CoreRegs::from_parts(regs, fpregs);
+        let core_regs = CoreRegs::from_parts(regs, fpregs);
         Ok(core_regs)
     }
 
-    fn write_registers(&self, core_regs: Amd64CoreRegs) -> Result<(), TraceError> {
+    fn write_registers(&self, core_regs: CoreRegs) -> Result<(), TraceError> {
         let task = self.assume_stopped();
         let (regs, fpregs) = core_regs.into_parts();
         task.setregs(regs)?;
