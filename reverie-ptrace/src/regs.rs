@@ -26,6 +26,22 @@ pub trait RegAccess {
     /// Mutable access to the instruction pointer (aka the program counter).
     fn ip_mut(&mut self) -> &mut Reg;
 
+    /// Returns the value of the stack pointer.
+    fn stack_ptr(&self) -> Reg;
+
+    /// Mutable access to the stack pointer.
+    fn stack_ptr_mut(&mut self) -> &mut Reg;
+
+    /// Returns the value of the stack frame pointer.
+    ///
+    /// NOTE: The frame pointer is not guaranteed to be available. For example,
+    /// if `-fomit-frame-pointer` was used (often the default), this will not
+    /// return the correct address.
+    fn frame_ptr(&self) -> Reg;
+
+    /// Mutable access to the stack frame pointer.
+    fn frame_ptr_mut(&mut self) -> &mut Reg;
+
     /// Returns the value of the register where the syscall number is stored.
     ///
     /// NOTE: Depending on the context, this may not actually be a syscall
@@ -76,6 +92,22 @@ impl RegAccess for libc::user_regs_struct {
         &mut self.rip
     }
 
+    fn stack_ptr(&self) -> Reg {
+        self.rsp
+    }
+
+    fn stack_ptr_mut(&mut self) -> &mut Reg {
+        &mut self.rsp
+    }
+
+    fn frame_ptr(&self) -> Reg {
+        self.rbp
+    }
+
+    fn frame_ptr_mut(&mut self) -> &mut Reg {
+        &mut self.rbp
+    }
+
     fn syscall(&self) -> Reg {
         self.rax
     }
@@ -124,6 +156,24 @@ impl RegAccess for libc::user_regs_struct {
 
     fn ip_mut(&mut self) -> &mut Reg {
         &mut self.pc
+    }
+
+    fn stack_ptr(&self) -> Reg {
+        self.sp
+    }
+
+    fn stack_ptr_mut(&mut self) -> &mut Reg {
+        &mut self.sp
+    }
+
+    fn frame_ptr(&self) -> Reg {
+        // aarch64 uses x29 for the frame pointer (unless `-fomit-frame-pointer`
+        // is used).
+        self.regs[29]
+    }
+
+    fn frame_ptr_mut(&mut self) -> &mut Reg {
+        &mut self.regs[29]
     }
 
     fn syscall(&self) -> Reg {

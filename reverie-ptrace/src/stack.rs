@@ -19,6 +19,8 @@ use reverie::Stack;
 use safeptrace::Error as TraceError;
 use safeptrace::Stopped;
 
+use super::regs::RegAccess;
+
 // NB: leaf function can use redzone without explicit stack allocation, as
 // a result it is not safe to just adjust stack pointer. 128B of stack
 // space is mostly wasted -- to avoid the corner case when redzone is used.
@@ -49,7 +51,7 @@ impl GuestStack {
             );
         }
         let task = Stopped::new_unchecked(pid);
-        let rsp = task.getregs()?.rsp as usize;
+        let rsp = task.getregs()?.stack_ptr() as usize;
         let top = rsp - REDZONE_SIZE as usize;
         Ok(GuestStack {
             top,

@@ -49,6 +49,7 @@ use crate::gdbstub::Inferior;
 use crate::gdbstub::InferiorThreadId;
 use crate::gdbstub::ResumeInferior;
 use crate::gdbstub::StoppedInferior;
+use crate::regs::RegAccess;
 
 mod base;
 mod extended_mode;
@@ -363,9 +364,9 @@ pub struct ExpediatedRegs(BTreeMap<usize, u64>);
 impl From<libc::user_regs_struct> for ExpediatedRegs {
     fn from(regs: libc::user_regs_struct) -> Self {
         let mut exp_regs = BTreeMap::new();
-        exp_regs.insert(6, regs.rbp);
-        exp_regs.insert(7, regs.rsp);
-        exp_regs.insert(0x10, regs.rip);
+        exp_regs.insert(6, regs.frame_ptr());
+        exp_regs.insert(7, regs.stack_ptr());
+        exp_regs.insert(0x10, regs.ip());
         ExpediatedRegs(exp_regs)
     }
 }
