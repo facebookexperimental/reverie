@@ -13,6 +13,7 @@ pub use libc::user_regs_struct as Regs;
 /// Floating point registers.
 #[cfg(target_arch = "aarch64")]
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+#[allow(missing_docs)]
 pub struct FpRegs {
     pub vregs: [u128; 32],
     pub fpsr: u32,

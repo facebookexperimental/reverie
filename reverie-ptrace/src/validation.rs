@@ -37,6 +37,7 @@ pub(crate) enum PmuValidationError {
     #[error("The ioc-period bug was detected")]
     IocPeriodBugDetected,
 
+    #[cfg(target_arch = "x86_64")]
     #[error("Could not read cpu info")]
     CouldNotReadCpuInfo,
 
@@ -60,6 +61,7 @@ pub(crate) enum PmuValidationError {
     #[error("Your CPU only supports one performance counter in its current configuration")]
     OnlyOnePerformanceCounter,
 
+    #[cfg(target_arch = "x86_64")]
     #[error(
         "On AMD Zen CPUs, reverie timers will not work reliably unless you disable the \
         hardware SpecLockMap optimization. For instructions on how to \
@@ -67,6 +69,7 @@ pub(crate) enum PmuValidationError {
     )]
     AmdSpecLockMapShouldBeDisabled,
 
+    #[cfg(target_arch = "x86_64")]
     #[error("Intel Kvm-In-Txcp bug found")]
     IntelKvmInTxcpBugDetected,
 
@@ -388,6 +391,7 @@ fn check_for_arch_bugs(_precise_ip: bool) -> Result<(), PmuValidationError> {
     Ok(())
 }
 
+#[cfg(target_arch = "x86_64")]
 fn check_for_zen_speclockmap() -> Result<(), PmuValidationError> {
     // When the SpecLockMap optimization is not disabled, rr will not work
     // reliably (e.g. it would work fine on a single process with a single
@@ -436,6 +440,7 @@ fn check_for_zen_speclockmap() -> Result<(), PmuValidationError> {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn check_for_kvm_in_txcp_bug() -> Result<(), PmuValidationError> {
     let mut count: i64 = 0;
     let mut attr = ticks_attr(false);

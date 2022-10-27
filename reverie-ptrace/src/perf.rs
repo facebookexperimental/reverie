@@ -588,6 +588,8 @@ pub fn do_branches(mut count: u64) {
     assert_eq!(count, 0);
 }
 
+/// Perform exactly `count+1` conditional branch instructions. Useful for
+/// testing timer-related code.
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
 pub fn do_branches(mut count: u64) {
