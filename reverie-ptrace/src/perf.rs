@@ -628,7 +628,11 @@ pub fn do_branches(count: u64) {
     }
 }
 
-#[cfg(test)]
+// NOTE: aarch64 doesn't work with
+// `Event::Hardware(HardwareEvent::BranchInstructions)`, so these tests are
+// disabled for that architecture. Most likely, we need to use `Event::Raw`
+// instead to enable these tests.
+#[cfg(all(test, target_arch = "x86_64"))]
 mod test {
     use nix::unistd::gettid;
 
