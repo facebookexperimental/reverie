@@ -315,6 +315,7 @@ impl FilterBuilder {
 mod tests {
     use super::*;
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn smoke() {
         assert_eq!(
@@ -322,6 +323,8 @@ mod tests {
                 .default_action(Action::Allow)
                 .target_arch(TargetArch::x86_64)
                 .syscalls([
+                    // NOTE: Different architectures will have a different order
+                    // to the syscalls.
                     (Sysno::read, Action::KillThread),
                     (Sysno::write, Action::KillThread),
                     (Sysno::open, Action::KillThread),
@@ -336,6 +339,35 @@ mod tests {
                 SYSCALL(Sysno::write, DENY),
                 SYSCALL(Sysno::open, DENY),
                 SYSCALL(Sysno::close, DENY),
+                ALLOW,
+            ]
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn smoke() {
+        assert_eq!(
+            FilterBuilder::new()
+                .default_action(Action::Allow)
+                .target_arch(TargetArch::aarch64)
+                .syscalls([
+                    // NOTE: Different architectures will have a different order
+                    // to the syscalls.
+                    (Sysno::read, Action::KillThread),
+                    (Sysno::write, Action::KillThread),
+                    (Sysno::openat, Action::KillThread),
+                    (Sysno::close, Action::KillThread),
+                    (Sysno::write, Action::KillThread),
+                ])
+                .build(),
+            seccomp_bpf![
+                VALIDATE_ARCH(AUDIT_ARCH_AARCH64),
+                LOAD_SYSCALL_NR,
+                SYSCALL(Sysno::openat, DENY),
+                SYSCALL(Sysno::close, DENY),
+                SYSCALL(Sysno::read, DENY),
+                SYSCALL(Sysno::write, DENY),
                 ALLOW,
             ]
         );

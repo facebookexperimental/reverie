@@ -457,7 +457,7 @@ mod tests {
         let filter = seccomp_bpf![
             VALIDATE_ARCH(AUDIT_ARCH_X86_64),
             LOAD_SYSCALL_NR,
-            SYSCALL(Sysno::open, DENY),
+            SYSCALL(Sysno::openat, DENY),
             SYSCALL(Sysno::close, DENY),
             SYSCALL(Sysno::write, DENY),
             SYSCALL(Sysno::read, DENY),

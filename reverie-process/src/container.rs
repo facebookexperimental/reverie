@@ -1008,6 +1008,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     pub fn pin_affinity_to_all_cores() -> Result<(), Error> {
         use std::collections::HashMap;
