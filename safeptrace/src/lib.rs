@@ -600,6 +600,23 @@ impl Stopped {
         Ok(Running::new(self.0))
     }
 
+    /// Sets the syscall to be executed. Only available on `aarch64`.
+    ///
+    /// Normally, on x86_64, the register `orig_rax` should be set instead to
+    /// modify the syscall number, which typically involves 3 ptrace calls:
+    ///  1. getregs to get the current registers.
+    ///  2. setregs to change `orig_rax` to set the syscall number.
+    ///  3. setregs again to restore the original registers after the syscall
+    ///     has been executed.
+    ///
+    /// `set_syscall` on `aarch64` has the advantage of only requiring a single
+    /// ptrace call.
+    #[cfg(target_arch = "aarch64")]
+    pub fn set_syscall(&self, nr: i32) -> Result<(), Error> {
+        const NT_ARM_SYSTEM_CALL: i32 = 0x404;
+        self.setregset(NT_ARM_SYSTEM_CALL, nr)
+    }
+
     /// Gets info about the signal that caused the process to be stopped.
     pub fn getsiginfo(&self) -> Result<libc::siginfo_t, Error> {
         ptrace::getsiginfo(self.0.into()).map_err(|err| self.map_nix_err(err))

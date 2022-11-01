@@ -1485,16 +1485,24 @@ impl<L: Tool + 'static> TracedTask<L> {
     ///  Set tracee state to Stopped/SIGTRP.
     ///  Restore the registers to the state specified by the regs arg.
     async fn skip_seccomp_syscall(&mut self, task: Stopped) -> Result<Stopped, TraceError> {
-        let regs = task.getregs()?;
-
         // So here we are, at ptrace seccomp stop, if we simply resume, the kernel
         // would do the syscall, without our patch. we change to syscall number to
         // -1, so that kernel would simply skip the syscall, so that we can jump to
         // our patched syscall on the first run. Please note after calling this
         // function, the task state will no longer be in ptrace event seccomp.
-        let mut new_regs = regs;
-        *new_regs.orig_syscall_mut() = -1i64 as u64;
-        task.setregs(new_regs)?;
+        #[cfg(target_arch = "x86_64")]
+        let regs = task.getregs()?;
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut new_regs = regs;
+            *new_regs.orig_syscall_mut() = -1i64 as u64;
+            task.setregs(new_regs)?;
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        task.set_syscall(-1)?;
+
         let mut running = task.step(None)?;
 
         // After the step, wait for the next transition. Note that this can return
@@ -1503,6 +1511,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         loop {
             match running.next_state().await? {
                 Wait::Stopped(task, Event::Signal(Signal::SIGTRAP)) => {
+                    #[cfg(target_arch = "x86_64")]
                     task.setregs(regs)?;
                     break Ok(task);
                 }
