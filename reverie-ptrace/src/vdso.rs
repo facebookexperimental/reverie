@@ -153,9 +153,9 @@ const VDSO_SYMBOLS: &[(&str, &[u8])] = &[
 ];
 
 lazy_static! {
-    static ref VDSO_PATCH_INFO: HashMap<String, (u64, usize, &'static [u8])> = {
+    static ref VDSO_PATCH_INFO: HashMap<&'static str, (u64, usize, &'static [u8])> = {
         let info = vdso_get_symbols_info();
-        let mut res: HashMap<String, (u64, usize, &'static [u8])> = HashMap::new();
+        let mut res = HashMap::new();
 
         for (k, v) in VDSO_SYMBOLS {
             if let Some(&(base, size)) = info.get(*k) {
@@ -166,9 +166,10 @@ lazy_static! {
                     size,
                     v.len()
                 );
-                res.insert(k.to_string(), (base, size, v));
+                res.insert(*k, (base, size, *v));
             }
         }
+
         res
     };
 }
@@ -176,8 +177,8 @@ lazy_static! {
 // get vdso symbols offset/size from current process
 // assuming vdso binary is the same for all processes
 // so that we don't have to decode vdso for each process
-fn vdso_get_symbols_info() -> HashMap<String, (u64, usize)> {
-    let mut res: HashMap<String, (u64, usize)> = HashMap::new();
+fn vdso_get_symbols_info() -> HashMap<&'static str, (u64, usize)> {
+    let mut res = HashMap::new();
     procfs::process::Process::new(unistd::getpid().as_raw())
         .and_then(|p| p.maps())
         .unwrap_or_else(|_| Vec::new())
@@ -195,12 +196,11 @@ fn vdso_get_symbols_info() -> HashMap<String, (u64, usize)> {
                     let strtab = elf.dynstrtab;
                     elf.dynsyms.iter().for_each(|sym| {
                         let sym_name = &strtab[sym.st_name];
-                        if VDSO_SYMBOLS.iter().any(|&(name, _)| name == sym_name) {
+                        if let Some((name, _)) =
+                            VDSO_SYMBOLS.iter().find(|&(name, _)| name == &sym_name)
+                        {
                             debug_assert!(sym.is_function());
-                            res.insert(
-                                String::from(sym_name),
-                                (sym.st_value, sym.st_size as usize),
-                            );
+                            res.insert(*name, (sym.st_value, sym.st_size as usize));
                         }
                     });
                 })
