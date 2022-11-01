@@ -596,7 +596,7 @@ pub fn do_branches(mut count: u64) {
     unsafe {
         core::arch::asm!(
             "2:",
-            "sub {0}, {0}, #0x1",
+            "subs {0}, {0}, #0x1",
             "b.ne 2b",
             inout(reg) count,
         )
