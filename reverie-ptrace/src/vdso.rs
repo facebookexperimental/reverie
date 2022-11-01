@@ -6,7 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! provide APIs to disable VDSOs at runtime.
+//! Provides APIs to disable VDSOs at runtime.
 use std::collections::HashMap;
 
 use goblin::elf::Elf;
@@ -21,68 +21,135 @@ use reverie::Guest;
 use reverie::Tool;
 use tracing::debug;
 
-/*
- * byte code for the new psudo vdso functions
- * which do the actual syscalls.
- * NB: the byte code must be 8 bytes
- * aligned
- */
+// Byte code for the new pseudo vdso functions which do the actual syscalls.
+// Note: the byte code must be 8 bytes aligned
+#[cfg(target_arch = "x86_64")]
+mod vdso_syms {
+    #![allow(non_upper_case_globals)]
 
-#[allow(non_upper_case_globals)]
-const __vdso_time: &[u8] = &[
-    0xb8, 0xc9, 0x0, 0x0, 0x0, // mov %SYS_time, %eax
-    0x0f, 0x05, // syscall
-    0xc3, // retq
-    0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, // nopl 0x0(%rax, %rax, 1)
-    0x00,
-];
+    pub const time: &[u8] = &[
+        0xb8, 0xc9, 0x0, 0x0, 0x0, // mov %SYS_time, %eax
+        0x0f, 0x05, // syscall
+        0xc3, // retq
+        0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, // nopl 0x0(%rax, %rax, 1)
+        0x00,
+    ];
 
-#[allow(non_upper_case_globals)]
-const __vdso_clock_gettime: &[u8] = &[
-    0xb8, 0xe4, 0x00, 0x00, 0x00, // mov SYS_clock_gettime, %eax
-    0x0f, 0x05, // syscall
-    0xc3, // retq
-    0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, // nopl 0x0(%rax, %rax, 1)
-    0x00,
-];
+    pub const clock_gettime: &[u8] = &[
+        0xb8, 0xe4, 0x00, 0x00, 0x00, // mov SYS_clock_gettime, %eax
+        0x0f, 0x05, // syscall
+        0xc3, // retq
+        0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, // nopl 0x0(%rax, %rax, 1)
+        0x00,
+    ];
 
-#[allow(non_upper_case_globals)]
-const __vdso_getcpu: &[u8] = &[
-    0x48, 0x85, 0xff, // test %rdi, %rdi
-    0x74, 0x06, // je ..
-    0xc7, 0x07, 0x00, 0x00, 0x00, 0x00, // movl $0x0, (%rdi)
-    0x48, 0x85, 0xf6, // test %rsi, %rsi
-    0x74, 0x06, // je ..
-    0xc7, 0x06, 0x00, 0x00, 0x00, 0x00, // movl $0x0, (%rsi)
-    0x31, 0xc0, // xor %eax, %eax
-    0xc3, // retq
-    0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00,
-]; // nopl 0x0(%rax)
+    pub const getcpu: &[u8] = &[
+        0x48, 0x85, 0xff, // test %rdi, %rdi
+        0x74, 0x06, // je ..
+        0xc7, 0x07, 0x00, 0x00, 0x00, 0x00, // movl $0x0, (%rdi)
+        0x48, 0x85, 0xf6, // test %rsi, %rsi
+        0x74, 0x06, // je ..
+        0xc7, 0x06, 0x00, 0x00, 0x00, 0x00, // movl $0x0, (%rsi)
+        0x31, 0xc0, // xor %eax, %eax
+        0xc3, // retq
+        0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00, // nopl 0x0(%rax)
+    ];
 
-#[allow(non_upper_case_globals)]
-const __vdso_gettimeofday: &[u8] = &[
-    0xb8, 0x60, 0x00, 0x00, 0x00, // mov SYS_gettimeofday, %eax
-    0x0f, 0x05, // syscall
-    0xc3, // retq
-    0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, // nopl 0x0(%rax, %rax, 1)
-    0x00,
-];
+    pub const gettimeofday: &[u8] = &[
+        0xb8, 0x60, 0x00, 0x00, 0x00, // mov SYS_gettimeofday, %eax
+        0x0f, 0x05, // syscall
+        0xc3, // retq
+        0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, // nopl 0x0(%rax, %rax, 1)
+        0x00,
+    ];
 
-#[allow(non_upper_case_globals)]
-const __vdso_clock_getres: &[u8] = &[
-    0xb8, 0xe5, 0x00, 0x00, 0x00, // mov SYS_clock_getres, %eax
-    0x0f, 0x05, // syscall
-    0xc3, // retq
-    0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, // nopl 0x0(%rax, %rax, 1)
-    0x00,
-];
+    pub const clock_getres: &[u8] = &[
+        0xb8, 0xe5, 0x00, 0x00, 0x00, // mov SYS_clock_getres, %eax
+        0x0f, 0x05, // syscall
+        0xc3, // retq
+        0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, // nopl 0x0(%rax, %rax, 1)
+        0x00,
+    ];
+}
 
+#[cfg(target_arch = "aarch64")]
+mod vdso_syms {
+    #![allow(non_upper_case_globals)]
+
+    // See this example for how to generate the byte code: https://godbolt.org/z/hbzK7Ydc3
+    //
+    // Example below:
+    // ```
+    // __attribute__((noinline)) static int sys_gettimeofday(void) {
+    //     register long x0 __asm__("x0");
+    //     asm volatile("bti c; mov x8, 169; svc 0" : "=r"(x0) : : "memory", "cc");
+    //     return (int)x0;
+    // }
+    // ```
+    //
+    // Notes:
+    //  * The byte order below may be different from what the disassembler will
+    //    show. aarch64 is little-endian by default whereas the 4-byte
+    //    instructions are usually displayed in big-endian.
+    //  * The aarch64 calling convention matches syscall arguments, so no need
+    //    to adjust registers x0-x5 or the stack pointer before calling the
+    //    syscall.
+    //  * The `bti c` instruction is the "Branch Target Identification"
+    //    instruction. This is here because this is the first instruction of the
+    //    vdso function and will be the branch target. This also effectively
+    //    serves as a NOP instruction to pad out the size of the thunk.
+    //    See also
+    //    https://developer.arm.com/documentation/ddi0596/2021-06/Base-Instructions/BTI--Branch-Target-Identification-
+
+    pub const clock_getres: &[u8; 16] = &[
+        0x5f, 0x24, 0x03, 0xd5, // bti c
+        0x48, 0x0e, 0x80, 0xd2, // mov x8, 114 (#__NR_clock_getres)
+        0x01, 0x00, 0x00, 0xd4, // svc 0
+        0xc0, 0x03, 0x5f, 0xd6, // ret
+    ];
+
+    pub const clock_gettime: &[u8; 16] = &[
+        0x5f, 0x24, 0x03, 0xd5, // bti c
+        0x28, 0x0e, 0x80, 0xd2, // mov x8, 113 (#__NR_clock_gettime)
+        0x01, 0x00, 0x00, 0xd4, // svc 0
+        0xc0, 0x03, 0x5f, 0xd6, // ret
+    ];
+
+    pub const gettimeofday: &[u8; 16] = &[
+        0x5f, 0x24, 0x03, 0xd5, // bti c
+        0x28, 0x15, 0x80, 0xd2, // mov x8, 169 (#__NR_gettimeofday)
+        0x01, 0x00, 0x00, 0xd4, // svc 0
+        0xc0, 0x03, 0x5f, 0xd6, // ret
+    ];
+
+    // On aarch64, the vdso version of rt_sigreturn is only 8 bytes, so our
+    // patch can't exceed that size. However, since this syscall doesn't return,
+    // we can just call it without the `ret` instruction.
+    //
+    // NOTE: This is currently *exactly* how the kernel implements the
+    // rt_sigreturn vdso, so we could probably get away with not even patching
+    // it. See also `linux/arch/arm64/kernel/vdso/sigreturn.S`.
+    pub const rt_sigreturn: &[u8; 8] = &[
+        0x68, 0x11, 0x80, 0xd2, // mov x8, 139 (#__NR_rt_sigreturn)
+        0x01, 0x00, 0x00, 0xd4, // svc 0
+    ];
+}
+
+#[cfg(target_arch = "x86_64")]
 const VDSO_SYMBOLS: &[(&str, &[u8])] = &[
-    ("__vdso_time", __vdso_time),
-    ("__vdso_clock_gettime", __vdso_clock_gettime),
-    ("__vdso_getcpu", __vdso_getcpu),
-    ("__vdso_gettimeofday", __vdso_gettimeofday),
-    ("__vdso_clock_getres", __vdso_clock_getres),
+    ("__vdso_time", vdso_syms::time),
+    ("__vdso_clock_gettime", vdso_syms::clock_gettime),
+    ("__vdso_getcpu", vdso_syms::getcpu),
+    ("__vdso_gettimeofday", vdso_syms::gettimeofday),
+    ("__vdso_clock_getres", vdso_syms::clock_getres),
+];
+
+#[cfg(target_arch = "aarch64")]
+const VDSO_SYMBOLS: &[(&str, &[u8])] = &[
+    ("__kernel_clock_getres", vdso_syms::clock_getres),
+    ("__kernel_clock_gettime", vdso_syms::clock_gettime),
+    ("__kernel_gettimeofday", vdso_syms::gettimeofday),
+    ("__kernel_rt_sigreturn", vdso_syms::rt_sigreturn),
 ];
 
 lazy_static! {
@@ -91,10 +158,15 @@ lazy_static! {
         let mut res: HashMap<String, (u64, usize, &'static [u8])> = HashMap::new();
 
         for (k, v) in VDSO_SYMBOLS {
-            let name = String::from(*k);
-            if let Some(&(base, size)) = info.get(&name) {
-                assert!(v.len() <= size);
-                res.insert(String::from(*k), (base, size, v));
+            if let Some(&(base, size)) = info.get(*k) {
+                assert!(
+                    v.len() <= size,
+                    "vdso symbol {}'s real size is {} bytes, but trying to replace it with {} bytes",
+                    k,
+                    size,
+                    v.len()
+                );
+                res.insert(k.to_string(), (base, size, v));
             }
         }
         res
