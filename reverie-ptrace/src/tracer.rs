@@ -360,11 +360,9 @@ fn seccomp_filter(events: &Subscription) -> seccomp::Filter {
         .syscall(Sysno::restart_syscall, Action::Allow)
         .syscall(Sysno::rt_sigreturn, Action::Allow)
         // Allow untraced syscalls through without tracing them.
-        // NOTE: 2 is the length of a syscall instruction (0x0f 0x05) and we
-        // want to allow the ud2 instruction immediately following it.
         .ip_range(
-            cp::TRAMPOLINE_BASE + 2,
-            cp::TRAMPOLINE_BASE + 3,
+            (cp::TRAMPOLINE_BASE + cp::SYSCALL_INSTR_SIZE) as u64,
+            (cp::TRAMPOLINE_BASE + cp::SYSCALL_INSTR_SIZE + cp::UD_INSTR_SIZE) as u64,
             Action::Allow,
         )
         .build()

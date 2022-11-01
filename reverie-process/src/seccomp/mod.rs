@@ -82,7 +82,7 @@ use syscalls::Errno;
 use syscalls::Sysno;
 
 /// Builder for creating seccomp filters.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct FilterBuilder {
     /// The target architecture.
     target_arch: TargetArch,

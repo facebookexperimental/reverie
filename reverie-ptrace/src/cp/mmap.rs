@@ -19,40 +19,47 @@ use super::consts::*;
 /// the byte code can be confirmed by running objcopy
 /// x86_64-linux-gnu-objcopy -I binary /tmp/1.bin -O elf64-x86-64 -B i386:x86-64 /tmp/1.elf
 /// then objdump -d 1.elf must match the instructions listed below.
-pub fn populate_mmap_page(pid: Pid, page_address: u64) -> nix::Result<()> {
-    /* For x86_64 architecture, we use the following syscall sequences:
-     * 0:   0f 05                   syscall                  // untraced syscall
-     * 2:   0f 0b                   ud2
-     * 4:   0f 05                   syscall                  // traced syscall
-     * 6:   0f 0b                   ud2
-     */
+pub fn populate_mmap_page(pid: Pid, page_address: usize) -> nix::Result<()> {
     #[cfg(target_arch = "x86_64")]
-    let mut syscall_stubs: Vec<u8> = vec![0x0f, 0x05, 0x0f, 0x0b, 0x0f, 0x05, 0x0f, 0x0b];
-    /* For aarch64 architecture, we use the following syscall sequences:
-     * 0:   d4 00 00 01                svc 0                  // Equivalent to the syscall instruction
-     * 2:   00 00 de ad                udf #0xdead            // Equivalent to the ud2 instruction
-     * 4:   d4 00 00 01                svc 0
-     * 6:   00 00 de ad                udf #0xdead
-     */
+    let mut syscall_stubs: Vec<u8> = vec![
+        0x0f, 0x05, // syscall (untraced)
+        0x0f, 0x0b, // udf2
+        0x0f, 0x05, // syscall (traced)
+        0x0f, 0x0b, // ud2
+    ];
+
     #[cfg(target_arch = "aarch64")]
     let mut syscall_stubs: Vec<u8> = vec![
-        0xd4, 0x00, 0x00, 0x01, 0x00, 0x00, 0xde, 0xad, 0xd4, 0x00, 0x00, 0x01, 0x00, 0x00, 0xde,
-        0xad,
+        0x01, 0x00, 0x00, 0xd4, // svc 0 (untraced syscall)
+        0xad, 0xde, 0x00, 0x00, // udf 0xdead
+        0x01, 0x00, 0x00, 0xd4, // svc 0 (traced syscall)
+        0xad, 0xde, 0x00, 0x00, // udf 0xdead
     ];
-    // Fill syscall_stubs with a software interrupt (or debug breakpoint) instruction until it reaches the trampoline size
+
+    // Fill syscall_stubs with a software interrupt (or debug breakpoint)
+    // instruction until it reaches the trampoline size. If things are working
+    // correctly, we will never execute beyond our syscall stub, so this is more
+    // of a safeguard to make debugging easier if things go horribly wrong.
+
+    // On x86_64, the opcode for the int3 (breakpoint) instruction is 0xcc.
     #[cfg(target_arch = "x86_64")]
-    const SOFTWARE_INTERUPT: u8 = 0xcc; // int3 instruction opcode for x86_64
+    const SOFTWARE_INTERUPT: u8 = 0xcc;
+
+    // For aarch64, we should use BRK 1 but as it is not a single-byte
+    // instruction, we'll use a sequence of 0x00 (same as a sequence of udf #0x0
+    // instructions)
     #[cfg(target_arch = "aarch64")]
-    const SOFTWARE_INTERUPT: u8 = 0x00; // For aarch64, we should use BRK 1 but as it is not a single-byte instruction, we'll use a sequence of 0x00 (same as a sequence of udf #0x0 instructions)
+    const SOFTWARE_INTERUPT: u8 = 0x00;
+
     syscall_stubs.resize_with(TRAMPOLINE_SIZE, || SOFTWARE_INTERUPT);
     let local_iov = &[IoSlice::new(syscall_stubs.as_slice())];
     let remote_iov = &[RemoteIoVec {
-        base: page_address as usize,
+        base: page_address,
         len: TRAMPOLINE_SIZE,
     }];
 
-    // initialize the whole page with int3 to prevent unintended
-    // execution in our injected page.
+    // Initialize the whole page with int3 to prevent unintended execution in
+    // our injected page.
     uio::process_vm_writev(pid, local_iov, remote_iov)?;
     Ok(())
 }

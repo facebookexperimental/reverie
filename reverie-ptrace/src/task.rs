@@ -26,7 +26,6 @@ use futures::future::Either;
 use futures::future::Future;
 use futures::future::FutureExt;
 use futures::future::TryFutureExt;
-use libc::user_regs_struct;
 use nix::sys::mman::ProtFlags;
 use nix::sys::signal::Signal;
 use reverie::syscalls::Addr;
@@ -642,20 +641,24 @@ impl<L: Tool + 'static> TracedTask<L> {
     /// Postcondition: the guest registers and code memory are restored to their original state,
     /// including RIP, but the vdso page and special shared page are modified accordingly.
     pub async fn tracee_preinit(&mut self, task: Stopped) -> Result<Stopped, TraceError> {
+        type SavedInstructions = [u8; 8];
+
         /// Helper function for tracee_preinit that does the core work.
-        async fn setup_special_mmap_page(task: Stopped) -> Result<Stopped, TraceError> {
-            // NB: This point in the code assumes that a specific instruction sequence "INT3;
-            // SYSCALL; INT3", has been patched into the guest, and that RIP points to the syscall.
-            // (I.e.  we're already past the first breakpoint.)
-            let mut regs = task.getregs()?;
-            let mut saved_regs = regs;
+        async fn setup_special_mmap_page(
+            task: Stopped,
+            saved_regs: &libc::user_regs_struct,
+        ) -> Result<Stopped, TraceError> {
+            // NOTE: This point in the code assumes that a specific instruction
+            // sequence "SYSCALL; INT3", has been patched into the guest, and
+            // that RIP points to the syscall.
+            let mut regs = saved_regs.clone();
 
             let page_addr = cp::PRIVATE_PAGE_OFFSET;
 
             *regs.syscall_mut() = Sysno::mmap as Reg;
             *regs.orig_syscall_mut() = regs.syscall();
             regs.set_args((
-                page_addr,
+                page_addr as Reg,
                 cp::PRIVATE_PAGE_SIZE as Reg,
                 (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as Reg,
                 (libc::MAP_PRIVATE | libc::MAP_FIXED | libc::MAP_ANONYMOUS) as Reg,
@@ -683,7 +686,9 @@ impl<L: Tool + 'static> TracedTask<L> {
                         running = task.resume(sig)?;
                     }
                     Event::Seccomp => {
-                        // Injected mmap trapped.
+                        // Injected mmap trapped. We may not necessarily
+                        // intercept a seccomp event here if the tool hasn't
+                        // subscribed to the mmap syscall.
                         running = task.resume(None)?;
                     }
                     unknown => {
@@ -694,7 +699,7 @@ impl<L: Tool + 'static> TracedTask<L> {
 
             // Make sure we got our desired address.
             assert_eq!(
-                Errno::from_ret(task.getregs()?.ret() as usize)? as u64,
+                Errno::from_ret(task.getregs()?.ret() as usize)?,
                 page_addr,
                 "Could not mmap address {}",
                 page_addr
@@ -702,59 +707,75 @@ impl<L: Tool + 'static> TracedTask<L> {
 
             cp::populate_mmap_page(task.pid().into(), page_addr).map_err(|err| err)?;
 
-            *saved_regs.ip_mut() -= cp::BREAKPOINT_SIZE as Reg;
-            task.setregs(saved_regs)?;
+            // Restore our saved registers, including our instruction pointer.
+            task.setregs(*saved_regs)?;
             Ok(task)
         }
 
         /// Put the guest into the weird state where it has an
         /// "INT3;SYSCALL;INT3" patched into the code wherever RIP happens to be
-        /// pointing.  It leaves RIP pointing at the syscall instruction.  This
+        /// pointing. It leaves RIP pointing at the syscall instruction. This
         /// allows forcible injection of syscalls into the guest.
         async fn establish_injection_state(
             mut task: Stopped,
-        ) -> Result<(Stopped, user_regs_struct, u64), TraceError> {
-            // A syscall instruction flanked by INT3 breakpoints (1+2+1 bytes):
-            let bp_syscall_bp: u64 = 0xcc050fcc;
+        ) -> Result<(Stopped, libc::user_regs_struct, SavedInstructions), TraceError> {
+            #[cfg(target_arch = "x86_64")]
+            const SYSCALL_BP: SavedInstructions = [
+                0x0f, 0x05, // syscall
+                0xcc, // int3
+                0xcc, 0xcc, 0xcc, 0xcc, 0xcc, // padding
+            ];
+
+            #[cfg(target_arch = "aarch64")]
+            const SYSCALL_BP: SavedInstructions = [
+                0x01, 0x00, 0x00, 0xd4, // svc 0
+                0x20, 0x00, 0x20, 0xd4, // brk 1
+            ];
+
+            // Save the original registers so we can restore them later.
             let regs = task.getregs()?;
 
             // Saved instruction memory
             let ip = AddrMut::from_raw(regs.ip() as usize).unwrap();
-            let saved: u64 = task.read_value(ip)?;
-            // Patch the tracee at the current instruction pointer.
-            task.write_value(ip, &((saved & !(0xffffffff_u64)) | bp_syscall_bp))?;
+            let saved: SavedInstructions = task.read_value(ip)?;
 
-            // When resumed, the tracee will hit the first breakpoint. Then we
-            // wait for it to reach that breakpoint and trap/stop.
-            let (task, event) = task
-                .resume(None)?
-                .wait_for_signal(Signal::SIGTRAP)
-                .await?
-                .assume_stopped();
-            assert_eq!(event, Event::Signal(Signal::SIGTRAP));
+            // Patch the tracee at the current instruction pointer.
+            //
+            // NOTE: `process_vm_writev` cannot write to write-protected pages,
+            // but `PTRACE_POKEDATA` can! Thus, we need to make sure we only
+            // write one word-sized chunk at a time. Luckily, the instructions
+            // we want to inject fit inside of just one 64-bit word.
+            task.write_value(ip.cast(), &SYSCALL_BP)?;
+
             Ok((task, regs, saved))
         }
 
         /// Undo the effects of `establish_injection_state` and put the program
-        /// code memory back to normal.
+        /// code memory and instruction pointer back to normal.
         fn remove_injection_state(
-            mut task: Stopped,
-            regs: user_regs_struct,
-            saved: u64,
-        ) -> Result<Stopped, TraceError> {
-            // Restore what we dirtied:
-            task.write_value(AddrMut::from_raw(regs.ip() as usize).unwrap(), &saved)?;
+            task: &mut Stopped,
+            regs: libc::user_regs_struct,
+            saved: SavedInstructions,
+        ) -> Result<(), TraceError> {
+            // NOTE: Again, because `process_vm_writev` cannot write to
+            // write-protected pages, we must write in word-sized chunks with
+            // PTRACE_POKEDATA.
+            let ip = AddrMut::from_raw(regs.ip() as usize).unwrap();
+            task.write_value(ip, &saved)?;
             task.setregs(regs)?;
-            Ok(task)
+            Ok(())
         }
 
-        let (task, regs, saved) = establish_injection_state(task).await?;
-        let task = setup_special_mmap_page(task).await?;
+        let (task, regs, prev_state) = establish_injection_state(task).await?;
+        let mut task = setup_special_mmap_page(task, &regs).await?;
+
+        // Restore registers after adding our temporary injection state.
+        remove_injection_state(&mut task, regs, prev_state)?;
 
         vdso::vdso_patch(self).await.expect("unable to patch vdso");
 
         let mprotect = Mprotect::new()
-            .with_addr(AddrMut::from_raw(cp::TRAMPOLINE_BASE as usize))
+            .with_addr(AddrMut::from_raw(cp::TRAMPOLINE_BASE))
             .with_len(cp::TRAMPOLINE_SIZE)
             .with_protection(ProtFlags::PROT_READ | ProtFlags::PROT_EXEC);
         self.inject(mprotect).await?;
@@ -765,8 +786,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             tracing::warn!("unable to intercept cpuid");
         }
 
-        // Registers are restored from establish_injection_state.
-        remove_injection_state(task, regs, saved)
+        Ok(task)
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -987,7 +1007,18 @@ impl<L: Tool + 'static> TracedTask<L> {
         // inject or tail inject after execve succeeded.
         self.pending_syscall = None;
 
-        // TODO: Update thread ID? Need to write a test checking this.
+        // TODO: Update PID? Need to write a test checking this.
+
+        // Step the tracee to get the SIGTRAP that immediately follows the
+        // PTRACE_EVENT_EXEC. We can't call `tracee_preinit` until after this
+        // because when it tries to step the tracee, it'll get this SIGTRAP
+        // signal instead.
+        let (task, event) = task
+            .step(None)?
+            .wait_for_signal(Signal::SIGTRAP)
+            .await?
+            .assume_stopped();
+        assert_eq!(event, Event::Signal(Signal::SIGTRAP));
 
         let task = self.tracee_preinit(task).await?;
 
@@ -1529,15 +1560,16 @@ impl<L: Tool + 'static> TracedTask<L> {
             args.arg5 as Reg,
         ));
 
-        // instruction at PRIVATE_PAGE_OFFSET, see `populate_mmap_page`.
-        // 7000_0000:         0f 05     syscall
-        // 7000_0002:         0f 0b     ud2
-        *regs.ip_mut() = cp::PRIVATE_PAGE_OFFSET;
+        // Jump to our private page to run the syscall instruction there. See
+        // `populate_mmap_page` for details.
+        *regs.ip_mut() = cp::PRIVATE_PAGE_OFFSET as Reg;
 
         task.setregs(regs)?;
 
+        // Step to run the syscall instruction.
         let wait = task.step(None)?.next_state().await?;
 
+        // Get the result of the syscall to return to the caller.
         self.from_task_state(wait, Some(oldregs)).await
     }
 
@@ -1570,8 +1602,8 @@ impl<L: Tool + 'static> TracedTask<L> {
                     // SIGCHLD) before single step finishes (in that case rip ==
                     // 0x7000_0000u64).
                     debug_assert!(
-                        regs.ip() == cp::PRIVATE_PAGE_OFFSET + 0x2
-                            || regs.ip() == cp::PRIVATE_PAGE_OFFSET
+                        regs.ip() as usize == cp::PRIVATE_PAGE_OFFSET + cp::SYSCALL_INSTR_SIZE
+                            || regs.ip() as usize == cp::PRIVATE_PAGE_OFFSET
                     );
                     // interrupted by signal, return -ERESTARTSYS so that tracee can do a
                     // restart_syscall.
@@ -2060,7 +2092,7 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
         self.assume_stopped()
     }
 
-    async fn regs(&mut self) -> user_regs_struct {
+    async fn regs(&mut self) -> libc::user_regs_struct {
         let task = self.assume_stopped();
 
         match task.getregs() {
