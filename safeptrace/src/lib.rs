@@ -956,6 +956,8 @@ mod test {
     use nix::sys::signal::Signal;
     use nix::unistd::fork;
     use nix::unistd::ForkResult;
+    // Make sure tokio is referenced in all configurations.
+    use tokio as _;
 
     use super::*;
 
