@@ -113,7 +113,7 @@ impl GlobalTool for () {
 /// }
 /// ```
 #[async_trait]
-pub trait Tool: Serialize + DeserializeOwned + Send + Sync + Default {
+pub trait Tool: Send + Sync + Default {
     /// The type of the global half that goes along with this Local tool. By
     /// including this type, the Tool is actually a complete specification for an
     /// instrumentation tool.
