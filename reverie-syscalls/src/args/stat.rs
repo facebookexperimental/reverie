@@ -12,6 +12,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 /// A serializable version of `libc::stat`.
+#[cfg(target_arch = "x86_64")]
 #[derive(Serialize, Deserialize, Copy, Clone, Eq, PartialEq, Debug)]
 #[serde(remote = "libc::stat")]
 #[repr(C)]
@@ -37,6 +38,39 @@ pub struct StatBuf {
     pub st_ctime_nsec: i64,
     #[serde(getter = "unused")]
     __unused: [i64; 3],
+}
+
+/// A serializable version of `libc::stat`.
+#[cfg(target_arch = "aarch64")]
+#[derive(Serialize, Deserialize, Copy, Clone, Eq, PartialEq, Debug)]
+#[serde(remote = "libc::stat")]
+#[repr(C)]
+#[allow(missing_docs)]
+pub struct StatBuf {
+    pub st_dev: libc::dev_t,
+    pub st_ino: libc::ino_t,
+    pub st_mode: libc::c_uint,
+    pub st_nlink: libc::nlink_t,
+    pub st_uid: libc::uid_t,
+    pub st_gid: libc::gid_t,
+    pub st_rdev: libc::dev_t,
+    #[serde(getter = "unused")]
+    __pad1: libc::c_ulong,
+    pub st_size: libc::off64_t,
+    pub st_blksize: libc::c_int,
+    #[serde(getter = "unused")]
+    __pad2: libc::c_int,
+    pub st_blocks: libc::c_long,
+    pub st_atime: libc::time_t,
+    pub st_atime_nsec: libc::c_long,
+    pub st_mtime: libc::time_t,
+    pub st_mtime_nsec: libc::c_long,
+    pub st_ctime: libc::time_t,
+    pub st_ctime_nsec: libc::c_long,
+    #[serde(getter = "unused")]
+    __unused4: libc::c_uint,
+    #[serde(getter = "unused")]
+    __unused5: libc::c_uint,
 }
 
 fn unused<T: Default>(_stat: &libc::stat) -> T {

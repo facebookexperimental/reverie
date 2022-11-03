@@ -27,22 +27,20 @@ pub use nix::sys::stat::Mode;
 pub use nix::sys::timerfd::TimerFlags;
 pub use nix::sys::wait::WaitPidFlag;
 
+use crate::args;
 use crate::args::ioctl;
-use crate::args::ArchPrctlCmd;
 use crate::args::CArrayPtr;
 use crate::args::CStrPtr;
 use crate::args::ClockId;
 use crate::args::CloneArgs;
 use crate::args::FcntlCmd;
 use crate::args::PathPtr;
-use crate::args::PollFd;
 use crate::args::StatPtr;
 use crate::args::StatxMask;
 use crate::args::StatxPtr;
 use crate::args::Timespec;
 use crate::args::Timeval;
 use crate::args::Timezone;
-use crate::args::Whence;
 use crate::display::Displayable;
 use crate::memory::Addr;
 use crate::memory::AddrMut;
@@ -594,7 +592,7 @@ typed_syscall! {
 #[cfg(not(target_arch = "aarch64"))]
 typed_syscall! {
     pub struct Poll {
-        fds: Option<AddrMut<PollFd>>,
+        fds: Option<AddrMut<args::PollFd>>,
         nfds: libc::nfds_t,
         timeout: libc::c_int,
     }
@@ -617,7 +615,7 @@ typed_syscall! {
     pub struct Lseek {
         fd: i32,
         offset: libc::off_t,
-        whence: Whence,
+        whence: args::Whence,
     }
 }
 
@@ -1745,11 +1743,11 @@ typed_syscall! {
 typed_syscall! {
     pub struct ArchPrctl {
         cmd: {
-            fn get(&self) -> ArchPrctlCmd {
-                ArchPrctlCmd::from_raw(self.raw.arg0 as i32, self.raw.arg1)
+            fn get(&self) -> args::ArchPrctlCmd {
+                args::ArchPrctlCmd::from_raw(self.raw.arg0 as i32, self.raw.arg1)
             }
 
-            fn set(mut self, v: ArchPrctlCmd) -> Self {
+            fn set(mut self, v: args::ArchPrctlCmd) -> Self {
                 let (cmd, arg) = v.into_raw();
                 self.raw.arg0 = cmd as usize;
                 self.raw.arg1 = arg;
@@ -2553,7 +2551,7 @@ typed_syscall! {
                 get_mode(self.flags(), self.raw.arg3)
             }
 
-            fn set(mut self, v: Mode) -> Self {
+            fn set(mut self, v: Option<Mode>) -> Self {
                 self.raw.arg3 = v.into_raw();
                 self
             }
@@ -3514,18 +3512,19 @@ mod test {
     use crate::ReadAddr;
 
     #[test]
-    fn test_syscall_open() {
-        assert_eq!(Open::NAME, "open");
-        assert_eq!(Open::NUMBER, Sysno::open);
+    fn test_syscall_openat_path() {
+        assert_eq!(Openat::NAME, "openat");
+        assert_eq!(Openat::NUMBER, Sysno::openat);
 
         let name = CString::new("/some/file/path").unwrap();
 
-        let syscall = Open::new()
+        let syscall = Openat::new()
+            .with_dirfd(-100)
             .with_path(PathPtr::from_ptr(name.as_ptr()))
             .with_flags(OFlag::O_RDONLY | OFlag::O_APPEND)
             .with_mode(Some(Mode::from_bits_truncate(0o644)));
 
-        assert_eq!(Open::from(SyscallArgs::from(syscall)), syscall);
+        assert_eq!(Openat::from(SyscallArgs::from(syscall)), syscall);
 
         let memory = LocalMemory::new();
 
@@ -3536,12 +3535,15 @@ mod test {
 
         assert_eq!(
             format!("{}", syscall.display(&memory)),
-            format!("open({:p} -> \"/some/file/path\", O_APPEND)", name.as_ptr())
+            format!(
+                "openat(-100, {:p} -> \"/some/file/path\", O_APPEND)",
+                name.as_ptr()
+            )
         );
     }
 
     #[test]
-    fn test_syscall_openat() {
+    fn test_syscall_openat_display() {
         assert_eq!(Openat::NAME, "openat");
         assert_eq!(Openat::NUMBER, Sysno::openat);
 
@@ -3566,7 +3568,7 @@ mod test {
                     .with_dirfd(-100)
                     .with_path(None)
                     .with_flags(OFlag::O_CREAT)
-                    .with_mode(Mode::from_bits_truncate(0o644))
+                    .with_mode(Some(Mode::from_bits_truncate(0o644)))
                     .display(&memory)
             ),
             "openat(-100, NULL, O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)"
@@ -3579,18 +3581,19 @@ mod test {
                     .with_dirfd(-100)
                     .with_path(None)
                     .with_flags(OFlag::O_TMPFILE)
-                    .with_mode(Mode::from_bits_truncate(0o600))
+                    .with_mode(Some(Mode::from_bits_truncate(0o600)))
                     .display(&memory)
             ),
             "openat(-100, NULL, O_DIRECTORY | O_TMPFILE, S_IRUSR | S_IWUSR)"
         );
 
+        #[cfg(target_arch = "x86_64")]
         assert_eq!(
             Openat::new()
                 .with_dirfd(libc::AT_FDCWD)
                 .with_path(None)
                 .with_flags(OFlag::O_CREAT | OFlag::O_WRONLY | OFlag::O_TRUNC)
-                .with_mode(Mode::from_bits_truncate(0o600)),
+                .with_mode(Some(Mode::from_bits_truncate(0o600))),
             Creat::new()
                 .with_path(None)
                 .with_mode(Mode::from_bits_truncate(0o600))
@@ -3598,6 +3601,7 @@ mod test {
         );
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_syscall_stat() {
         let name = CString::new("/dev/null").unwrap();
@@ -3636,10 +3640,12 @@ mod test {
         );
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_syscall_pipe2() {
         let memory: Option<AddrMut<[i32; 2]>> = AddrMut::from_raw(0x1245);
 
+        // NOTE: `pipe` is not available on aarch64.
         assert_eq!(
             Pipe2::new().with_pipefd(memory),
             Pipe::new().with_pipefd(memory).into()
@@ -3653,11 +3659,13 @@ mod test {
         );
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_syscall_linkat() {
         let foo = CString::new("foo").unwrap();
         let bar = CString::new("bar").unwrap();
 
+        // NOTE: `link` is not available on aarch64.
         assert_eq!(
             Linkat::new()
                 .with_olddirfd(libc::AT_FDCWD)
