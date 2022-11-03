@@ -69,8 +69,7 @@ pub enum StatFamily {
     Fstat(super::Fstat),
     #[cfg(not(target_arch = "aarch64"))]
     Lstat(super::Lstat),
-    #[cfg(not(target_arch = "aarch64"))]
-    Newfstatat(super::Newfstatat),
+    Fstatat(super::Fstatat),
 }
 
 impl StatFamily {
@@ -83,8 +82,7 @@ impl StatFamily {
             Self::Fstat(s) => s.stat(),
             #[cfg(not(target_arch = "aarch64"))]
             Self::Lstat(s) => s.stat(),
-            #[cfg(not(target_arch = "aarch64"))]
-            Self::Newfstatat(s) => s.stat(),
+            Self::Fstatat(s) => s.stat(),
         }
     }
 }
@@ -97,8 +95,10 @@ impl From<StatFamily> for Syscall {
             StatFamily::Fstat(syscall) => Syscall::Fstat(syscall),
             #[cfg(not(target_arch = "aarch64"))]
             StatFamily::Lstat(syscall) => Syscall::Lstat(syscall),
-            #[cfg(not(target_arch = "aarch64"))]
-            StatFamily::Newfstatat(syscall) => Syscall::Newfstatat(syscall),
+            #[cfg(target_arch = "aarch64")]
+            StatFamily::Fstatat(syscall) => Syscall::Fstatat(syscall),
+            #[cfg(target_arch = "x86_64")]
+            StatFamily::Fstatat(syscall) => Syscall::Newfstatat(syscall),
         }
     }
 }

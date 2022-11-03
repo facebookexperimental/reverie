@@ -391,9 +391,10 @@ syscall_list! {
         fchownat => Fchownat,
         #[cfg(not(target_arch = "aarch64"))]
         futimesat => Futimesat,
-        // TODO: Rename this to Fstatat.
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(target_arch = "x86_64")]
         newfstatat => Newfstatat,
+        #[cfg(target_arch = "aarch64")]
+        fstatat => Fstatat,
         unlinkat => Unlinkat,
         renameat => Renameat,
         linkat => Linkat,
@@ -2660,7 +2661,7 @@ typed_syscall! {
 }
 
 // Newfstatat not available in aarch64
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(target_arch = "x86_64")]
 typed_syscall! {
     pub struct Newfstatat {
         dirfd: i32,
@@ -2670,29 +2671,44 @@ typed_syscall! {
     }
 }
 
-// Newfstatat not available in aarch64
-#[cfg(not(target_arch = "aarch64"))]
-impl From<Stat> for Newfstatat {
+/// Alias for Newfstatat. Architectures other than x86-64 usually name this
+/// syscall `fstatat`.
+#[cfg(target_arch = "x86_64")]
+pub type Fstatat = Newfstatat;
+
+#[cfg(target_arch = "aarch64")]
+typed_syscall! {
+    pub struct Fstatat {
+        dirfd: i32,
+        path: Option<PathPtr>,
+        stat: Option<StatPtr>,
+        flags: AtFlags,
+    }
+}
+
+// `Stat` is not available in aarch64
+#[cfg(target_arch = "x86_64")]
+impl From<Stat> for Fstatat {
     fn from(stat: Stat) -> Self {
         let Stat { mut raw } = stat;
         raw.arg3 = 0;
         raw.arg2 = raw.arg1;
         raw.arg1 = raw.arg0;
         raw.arg0 = libc::AT_FDCWD as usize;
-        Newfstatat { raw }
+        Self { raw }
     }
 }
 
-// Lstat not available in aarch64
-#[cfg(not(target_arch = "aarch64"))]
-impl From<Lstat> for Newfstatat {
+// Lstat is not available in aarch64
+#[cfg(target_arch = "x86_64")]
+impl From<Lstat> for Fstatat {
     fn from(lstat: Lstat) -> Self {
         let Lstat { mut raw } = lstat;
         raw.arg3 = AtFlags::AT_SYMLINK_NOFOLLOW.bits() as usize;
         raw.arg2 = raw.arg1;
         raw.arg1 = raw.arg0;
         raw.arg0 = libc::AT_FDCWD as usize;
-        Newfstatat { raw }
+        Self { raw }
     }
 }
 
