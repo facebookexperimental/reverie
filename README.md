@@ -1,9 +1,9 @@
 # Reverie
 
-Reverie is a user space system-call interception framework for x86-64 Linux.
-It can be used to intercept, modify, or elide a syscall before the kernel
-executes it. In essence, Reverie sits at the boundary between user space and
-kernel space.
+Reverie is a user space system-call interception framework for Linux. It can
+be used to intercept, modify, or elide a syscall before the kernel executes
+it. In essence, Reverie sits at the boundary between user space and kernel
+space.
 
 Some potential use cases include:
 
@@ -94,6 +94,17 @@ may use in-guest syscall interception, the syscall handler code may not be
 running in the same address space. Thus, all shared state is communicated via
 RPC messages. (There is, however, currently only a single ptrace-based backend
 where all tracer code is in the same address space.)
+
+## Platform and Architecture Support
+
+Reverie currently only supports the following platforms and architectures:
+
+| Platform | Architecture | Notes                                     |
+|:--------:|:------------:|:------------------------------------------|
+| Linux    | x86-64       | Full support                              |
+| Linux    | aarch64      | Missing timers & cpuid/rdtsc interception |
+
+Other platforms and architectures are currently unplanned.
 
 ## Future Plans
 
