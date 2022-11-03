@@ -56,15 +56,15 @@ mod tests {
     #[test]
     fn parse_filter() {
         assert_eq!(
-            "open,mmap".parse(),
+            "openat,mmap".parse(),
             Ok(Filter {
                 inverse: false,
-                syscalls: vec![Sysno::open, Sysno::mmap]
+                syscalls: vec![Sysno::openat, Sysno::mmap]
             })
         );
 
         assert_eq!(
-            "open,foobar".parse::<Filter>(),
+            "openat,foobar".parse::<Filter>(),
             Err("invalid syscall name 'foobar'".into())
         );
 
