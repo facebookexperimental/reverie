@@ -31,7 +31,6 @@
 #![feature(async_closure)]
 #![feature(internal_output_capture)]
 #![feature(never_type)]
-#![cfg_attr(feature = "llvm_asm", feature(llvm_asm))]
 #![feature(map_first_last)]
 #![feature(bench_black_box)]
 

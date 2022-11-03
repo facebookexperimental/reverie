@@ -72,10 +72,6 @@ pub(crate) enum PmuValidationError {
     #[cfg(target_arch = "x86_64")]
     #[error("Intel Kvm-In-Txcp bug found")]
     IntelKvmInTxcpBugDetected,
-
-    #[cfg(feature = "llvm_asm")]
-    #[error("Overcount triggered by PMU interrupts detected due to Xen PMU virtualization bug")]
-    IntelXenPmiBugDetected,
 }
 
 fn init_perf_event_attr(
@@ -377,8 +373,6 @@ fn check_for_arch_bugs(_precise_ip: bool) -> Result<(), PmuValidationError> {
         "AuthenticAMD" if is_amd_zen(feature_info) => check_for_zen_speclockmap(),
         "GenuineIntel" => {
             check_for_kvm_in_txcp_bug()?;
-            #[cfg(feature = "llvm_asm")]
-            check_for_xen_pmi_bug(_precise_ip)?;
             Ok(())
         }
         s => panic!("Unknown CPU vendor: {}", s),
@@ -411,7 +405,6 @@ fn check_for_zen_speclockmap() -> Result<(), PmuValidationError> {
     let count = read_counter(&fd)?;
 
     // A lock add is known to increase the perf counter we're looking at.
-    #[cfg(not(feature = "llvm_asm"))]
     unsafe {
         let mut _prev: *mut usize;
         core::arch::asm!(
@@ -420,17 +413,6 @@ fn check_for_zen_speclockmap() -> Result<(), PmuValidationError> {
             inout(reg) &to_add => _prev,
             in(reg) val,
         )
-    }
-
-    #[cfg(feature = "llvm_asm")]
-    #[allow(deprecated)]
-    unsafe {
-        let _prev: usize;
-        llvm_asm!("lock; xaddq $2, $1"
-            : "=r" (_prev), "+*m" (&val)
-            : "0" (to_add)
-            : "memory"
-            : "volatile");
     }
 
     if read_counter(&fd)? != count {
@@ -461,154 +443,6 @@ fn check_for_kvm_in_txcp_bug() -> Result<(), PmuValidationError> {
     let supports_txcp = count > 0;
     if supports_txcp && count < NUM_BRANCHES as i64 {
         Err(PmuValidationError::IntelKvmInTxcpBugDetected)
-    } else {
-        Ok(())
-    }
-}
-
-// FIXME: Convert this big block of llvm_asm over to the new asm syntax.
-#[cfg(feature = "llvm_asm")]
-fn check_for_xen_pmi_bug(precise_ip: bool) -> Result<(), PmuValidationError> {
-    #[allow(unused_assignments)]
-    let mut count: i32 = -1;
-    let mut attr = ticks_attr(precise_ip);
-    attr.__bindgen_anon_1.sample_period = NUM_BRANCHES - 1;
-    let fd = start_counter(0, -1, &mut attr, None)?;
-
-    // The original C++ uses `rand()` to make sure this isn't optimized around.
-    // We will use black_box to do the same thing without introducing variability
-
-    fn make_accumulator_seed() -> u32 {
-        20764791
-    }
-
-    let mut accumulator = core::hint::black_box(make_accumulator_seed());
-    let mut expected_accumulator = accumulator;
-
-    // reproduce the assembly here to calculate what the final accumulator value should be
-    for _ in 0..(NUM_BRANCHES - 2) {
-        let temp_exp_accumulator = expected_accumulator.overflowing_shl(3).0;
-        expected_accumulator = temp_exp_accumulator
-            .overflowing_sub(expected_accumulator)
-            .0
-            .overflowing_add(2)
-            .0
-            & 0xffffff;
-    }
-
-    let raw_fd = fd.0;
-
-    #[allow(deprecated)]
-    unsafe {
-        // The following asm block does this:
-        // ```
-        // let ret = syscall!(sys_ioctl, raw_fd, _PERF_EVENT_IOC_ENABLE, 0);
-        // if ret >= -4095 as u64 { return; }
-        // let ret = syscall!(SYS_ioctl, raw_fd, _PERF_EVENT_IOC_RESET, 0);
-        // // From this point on, all conditional branches count!
-        // if ret >= -4095 as u64 { return; }
-        // // Reset the counter period to the desired value.
-        // let ret = syscall!(SYS_ioctl, raw_fd, _PERF_EVENT_IOC_PERIOD, attr.sample_period);
-        // if ret >= -4095 as u64 { return; }
-        // let mut iterations = NUM_BRANCHES - 2;
-        // loop {
-        //     iterations -= 1;
-        //     accumulator *= 7;
-        //     accumulator += 2;
-        //     accumulator &= 0xffffff;
-        //     if iterations == 0 {
-        //         break;
-        //     }
-        // }
-        //
-        // let ret = syscall!(SYS_ioctl, raw_fd, _PERF_EVENT_IOC_DISABLE, 0);
-        // if ret >= -4095 as u64 { return; }
-        // count = 0;
-        // ```
-        llvm_asm!(
-            "
-            mov $2, %rax;
-            mov $9, %edi;
-            xor %rdx, %rdx;
-            mov $4, %rsi;
-            syscall;
-            cmp $$-4095, %rax;
-            jae 2f;
-            mov $2, %rax;
-            mov $6, %rsi;
-            syscall;
-            /* From this point on all conditional branches count! */
-            cmp $$-4095, %rax;
-            jae 2f;
-            /* Reset the counter period to the desired value. */
-            mov $2, %rax;
-            mov $5, %rsi;
-            mov $8, %rdx;
-            syscall;
-            cmp $$-4095, %rax;
-            jae 2f;
-            mov $7, %rax;
-            1: dec %rax;
-            /* Multiply by 7. */
-            mov $0, %edx;
-            shl $$3, $0;
-            sub %edx, $0;
-            /* Add 2. */
-            add $$2, $0;
-            /* Mask off bits. */
-            and $$0xffffff, $0;
-            /* And loop. */
-            test %rax, %rax;
-            jnz 1b;
-            mov $3, %rsi;
-            mov $2, %rax;
-            xor %rdx, %rdx;
-            /* We didn't touch rdi. */
-            syscall;
-            cmp $$-4095, %rax;
-            jae 2f;
-            movl $$0, $1;
-            2: nop;"
-            :
-            "+r"(accumulator),
-            "=r"(count)
-            :
-            "i"(libc::SYS_ioctl)
-            ,
-            "i"(perf::perf_event_ioctls_DISABLE),
-            "i"(perf::perf_event_ioctls_ENABLE),
-            "i"(perf::perf_event_ioctls_PERIOD),
-            "i"(perf::perf_event_ioctls_RESET),
-            // The check for the failure of some of our ioctls is in
-            // the measured region, so account for that when looping.
-            "i"(NUM_BRANCHES - 2),
-            "rm"(&attr.__bindgen_anon_1.sample_period), "rm"(raw_fd)
-            :
-            "rax", "rdx", "rdi", "rsi"
-            /* `syscall` clobbers rcx and r11. */
-            ,
-            "rcx", "r11"
-            : "volatile"
-        );
-    }
-
-    // If things worked above, `count` should have been set to 0.
-    if count == 0 {
-        count = read_counter(&fd)? as i32;
-    }
-
-    // Use 'accumulator' so it can't be optimized out.
-    if accumulator != expected_accumulator {
-        return Err(PmuValidationError::UnexpectedTestingError(format!(
-            "Unexpected accumulator value in xen pmi bug check. Expected {}, but was {}",
-            expected_accumulator, accumulator
-        )));
-    }
-
-    let has_xen_pmi_bug = count as u64 > NUM_BRANCHES || count == -1;
-
-    if has_xen_pmi_bug {
-        Err(PmuValidationError::IntelXenPmiBugDetected)
     } else {
         Ok(())
     }

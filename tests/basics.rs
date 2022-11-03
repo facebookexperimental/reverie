@@ -6,8 +6,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#![cfg_attr(feature = "llvm_asm", feature(llvm_asm))]
-
 //! Basic tests that don't fall into some other category.
 
 #[allow(unused_imports)]

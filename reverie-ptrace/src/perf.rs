@@ -571,7 +571,6 @@ macro_rules! ret_without_perf {
 /// Perform exactly `count+1` conditional branch instructions. Useful for
 /// testing timer-related code.
 #[cfg(target_arch = "x86_64")]
-#[cfg(not(feature = "llvm_asm"))]
 #[inline(never)]
 pub fn do_branches(mut count: u64) {
     // Anything but assembly is unreliable between debug and release
@@ -603,29 +602,6 @@ pub fn do_branches(mut count: u64) {
     }
 
     assert_eq!(count, 0);
-}
-
-/// Perform exactly `count+1` conditional branch instructions. Useful for
-/// testing timer-related code.
-#[cfg(target_arch = "x86_64")]
-#[cfg(feature = "llvm_asm")]
-#[inline(never)]
-pub fn do_branches(count: u64) {
-    // Anything but assembly is unreliable between debug and release
-    #[allow(deprecated)]
-    unsafe {
-        // Loop until carry flag is set, indicating underflow
-        llvm_asm!("
-                mov $0, %rax
-            perf_test_branch_loop:
-                subq $$1, %rax
-                jnc perf_test_branch_loop
-                "
-            : /* no output */
-            : "r"(count)
-            : "cc", "rax"
-        );
-    }
 }
 
 // NOTE: aarch64 doesn't work with

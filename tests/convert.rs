@@ -6,7 +6,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#![cfg_attr(feature = "llvm_asm", feature(llvm_asm))]
 // FIXME: This test does some very x86_64-specific things.
 #![cfg(target_arch = "x86_64")]
 
@@ -68,7 +67,6 @@ mod tests {
     use super::*;
 
     #[cfg(target_arch = "x86_64")]
-    #[cfg(not(feature = "llvm_asm"))]
     #[allow(unused_mut)]
     unsafe fn open_syscall_sanity_check() -> i32 {
         let path = b"/dev/null\0".as_ptr() as usize;
@@ -121,38 +119,6 @@ mod tests {
         );
 
         ret as i32
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[cfg(feature = "llvm_asm")]
-    #[allow(unused_mut)]
-    #[allow(deprecated)]
-    unsafe fn open_syscall_sanity_check() -> i32 {
-        let mut ret;
-        let path = b"/dev/null\0";
-        llvm_asm!(r#"movq %rdi, %r8
-                    movq $$0x8000, %rsi # O_LARGEFILE
-                    movq $$0x1a4, %rdx  # 0644
-                    mov $$2, %eax
-                    syscall
-                    cmp $$0xfffffffffffff001,%rax
-                    jae 1f
-                    cmp %rdi, %r8
-                    jne 1f
-                    cmp $$0x8000, %rsi
-                    jne 1f
-                    cmp $$0x1a4, %rdx
-                    jne 1f
-                    jmp 2f
-                1:mov $$1, %rdi
-                    mov $$231, %rax # call exit_group(1)
-                    syscall
-                2:
-                "#
-                :"={rax}"(ret)
-                :"{rdi}"(path.as_ptr() as u64)
-                :"rcx", "r11", "memory");
-        ret
     }
 
     #[cfg(not(target_arch = "x86_64"))]
