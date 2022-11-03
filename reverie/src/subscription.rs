@@ -186,36 +186,41 @@ mod tests {
 
     #[test]
     fn smoke() {
-        let mut s1: Subscription = [Sysno::open, Sysno::read, Sysno::write]
+        let mut s1: Subscription = [Sysno::openat, Sysno::read, Sysno::write]
             .iter()
             .copied()
             .collect();
-        s1 |= Sysno::open;
+        s1 |= Sysno::openat;
+
+        // NOTE: Different architectures may order syscalls differently.
+        let union: Vec<_> = s1.iter_syscalls().collect();
+        assert_eq!(union.len(), 3);
+        assert!(union.contains(&Sysno::read));
+        assert!(union.contains(&Sysno::write));
+        assert!(union.contains(&Sysno::openat));
 
         let mut s2 = Subscription::none();
         s2 |= s1.clone();
-        s2 |= Sysno::open;
+        s2 |= Sysno::openat;
 
-        assert_eq!(
-            s1.iter_syscalls().collect::<Vec<_>>(),
-            [Sysno::read, Sysno::write, Sysno::open,]
-        );
-
-        assert_eq!(
-            s2.iter_syscalls().collect::<Vec<_>>(),
-            [Sysno::read, Sysno::write, Sysno::open,]
-        );
+        let union: Vec<_> = s2.iter_syscalls().collect();
+        assert_eq!(union.len(), 3);
+        assert!(union.contains(&Sysno::read));
+        assert!(union.contains(&Sysno::write));
+        assert!(union.contains(&Sysno::openat));
     }
 
     #[test]
     fn compose() {
-        let a = Subscription::from_iter([Sysno::open, Sysno::read]);
+        let a = Subscription::from_iter([Sysno::openat, Sysno::read]);
         let b = Subscription::from_iter([Sysno::read, Sysno::close]);
         let c = a | b;
 
-        assert_eq!(
-            c.iter_syscalls().collect::<Vec<_>>(),
-            [Sysno::read, Sysno::open, Sysno::close]
-        );
+        let union: Vec<_> = c.iter_syscalls().collect();
+
+        assert_eq!(union.len(), 3);
+        assert!(union.contains(&Sysno::read));
+        assert!(union.contains(&Sysno::openat));
+        assert!(union.contains(&Sysno::close));
     }
 }
