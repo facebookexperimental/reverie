@@ -13,10 +13,8 @@ use reverie::Error;
 use reverie::Guest;
 use reverie::Tool;
 use reverie_util::CommonToolArguments;
-use serde::Deserialize;
-use serde::Serialize;
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Default)]
 struct StraceTool {}
 
 #[reverie::tool]

@@ -16,10 +16,8 @@ use std::thread;
 
 use reverie::Error;
 use reverie::Tool;
-use serde::Deserialize;
-use serde::Serialize;
 
-#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[derive(Debug, Default, Clone)]
 struct TestTool {}
 
 #[reverie::tool]

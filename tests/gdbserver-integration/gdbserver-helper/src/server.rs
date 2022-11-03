@@ -17,8 +17,6 @@ use reverie::process::Stdio;
 use reverie::Subscription;
 use reverie::Tool;
 use reverie_ptrace::GdbConnection;
-use serde::Deserialize;
-use serde::Serialize;
 
 pub struct GdbServerCommand {
     // NB: ideally we could also attach to a existing pid, but this is not
@@ -28,7 +26,7 @@ pub struct GdbServerCommand {
     connection: GdbConnection,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Default)]
 struct TestTool;
 
 impl Tool for TestTool {

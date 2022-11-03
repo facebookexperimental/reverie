@@ -53,7 +53,7 @@ struct ChaosOpts {
     no_interrupt: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Default)]
 struct ChaosTool {
     count: AtomicU64,
 }
@@ -66,7 +66,7 @@ impl Clone for ChaosTool {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[derive(Debug, Default, Clone)]
 struct ChaosToolGlobal {}
 
 #[reverie::global_tool]

@@ -20,11 +20,9 @@ use reverie::GlobalTool;
 use reverie::Guest;
 use reverie::Pid;
 use reverie::Tool;
-use serde::Deserialize;
-use serde::Serialize;
 use tracing::warn;
 
-#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[derive(Debug, Default, Clone)]
 struct TestTool {}
 
 type Dupcount = u64;

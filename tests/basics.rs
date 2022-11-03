@@ -41,7 +41,7 @@ use reverie_ptrace::testing::test_fn;
 use serde::Deserialize;
 use serde::Serialize;
 
-#[derive(Debug, serde::Serialize, serde::Deserialize, Default)]
+#[derive(Debug, Default)]
 struct NoopTool;
 impl Tool for NoopTool {}
 
@@ -54,12 +54,12 @@ fn noop_tool_test() {
     assert!(output.stderr.is_empty());
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Default)]
 struct CounterGlobal {
     num_syscalls: AtomicU64,
 }
 
-#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[derive(Debug, Default, Clone)]
 struct CounterLocal {}
 
 /// The message sent to the global state method.

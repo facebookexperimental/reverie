@@ -22,10 +22,8 @@ use reverie::Error;
 use reverie::Guest;
 use reverie::Stack;
 use reverie::Tool;
-use serde::Deserialize;
-use serde::Serialize;
 
-#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[derive(Debug, Default, Clone)]
 struct LocalState;
 
 #[reverie::tool]
@@ -93,7 +91,7 @@ impl Tool for LocalState {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[derive(Debug, Default, Clone)]
 struct LocalState2;
 
 #[reverie::tool]
@@ -127,7 +125,7 @@ impl Tool for LocalState2 {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[derive(Debug, Default, Clone)]
 struct LocalState3;
 
 #[reverie::tool]

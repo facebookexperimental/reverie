@@ -86,10 +86,9 @@ impl GlobalTool for () {
 /// ```
 /// use reverie::syscalls::*;
 /// use reverie::*;
-/// use serde::{Deserialize, Serialize};
 ///
 /// /// Our process-level state.
-/// #[derive(Debug, Serialize, Deserialize, Default, Clone)]
+/// #[derive(Debug, Default, Clone)]
 /// struct MyTool;
 ///
 /// #[reverie::tool]

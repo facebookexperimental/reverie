@@ -19,14 +19,12 @@ use reverie::Signal;
 use reverie::Subscription;
 use reverie::Tid;
 use reverie::Tool;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::config::Config;
 use crate::global_state::GlobalState;
 
 // Strace has no need for process-level state, so this is a unit struct.
-#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct Strace;
 
 /// Here we use the same dummy type for both our local and global trait

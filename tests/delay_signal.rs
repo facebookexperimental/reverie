@@ -29,7 +29,7 @@ use serde::Serialize;
 use tokio::time::sleep;
 use tokio::time::Duration;
 
-#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[derive(Debug, Default, Clone)]
 struct LocalState;
 
 const GAP_MS: u64 = 500;

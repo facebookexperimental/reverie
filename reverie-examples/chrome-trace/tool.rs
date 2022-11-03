@@ -32,7 +32,7 @@ use crate::event::Program;
 use crate::event::ThreadExit;
 use crate::global_state::GlobalState;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Clone)]
 pub struct ChromeTrace(Pid);
 
 impl Default for ChromeTrace {

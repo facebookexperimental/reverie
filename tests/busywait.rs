@@ -40,7 +40,7 @@ struct GlobalState {
     collect: AtomicBool,
 }
 
-#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[derive(Debug, Default, Clone)]
 struct LocalState;
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]

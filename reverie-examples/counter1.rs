@@ -24,12 +24,12 @@ use reverie_util::CommonToolArguments;
 use serde::Deserialize;
 use serde::Serialize;
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Default)]
 struct CounterGlobal {
     num_syscalls: AtomicU64,
 }
 
-#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[derive(Debug, Default, Clone)]
 struct CounterLocal {}
 
 /// The message sent to the global state method.

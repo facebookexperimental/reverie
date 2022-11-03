@@ -14,10 +14,8 @@ use reverie::Error;
 use reverie::Subscription;
 use reverie::Tool;
 use reverie_util::CommonToolArguments;
-use serde::Deserialize;
-use serde::Serialize;
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default)]
 struct NoopTool;
 
 #[reverie::tool]

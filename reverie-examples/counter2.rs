@@ -29,20 +29,20 @@ use serde::Serialize;
 use tracing::debug;
 
 /// Global state for the tool.
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Default)]
 pub struct GlobalInner {
     pub total_syscalls: u64,
     pub exited_procs: u64,
     pub exited_threads: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Default)]
 pub struct CounterGlobal {
     pub inner: Mutex<GlobalInner>,
 }
 
 /// Local, per-process state for the tool.
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Default)]
 pub struct CounterLocal {
     proc_syscalls: AtomicU64,
     exited_threads: AtomicU64,

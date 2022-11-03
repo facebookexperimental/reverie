@@ -14,15 +14,13 @@ use reverie::GlobalTool;
 use reverie::Guest;
 use reverie::Tid;
 use reverie::Tool;
-use serde::Deserialize;
-use serde::Serialize;
 use tokio::time::sleep;
 use tokio::time::Duration;
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Default)]
 struct GlobalState {}
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Default)]
 struct TestTool {}
 
 #[reverie::global_tool]
@@ -103,7 +101,7 @@ pub fn delay_childprint_test() {
 }
 
 // A test tool that blocks a handler indefinitely.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default)]
 struct TestTool2 {}
 
 #[reverie::tool]

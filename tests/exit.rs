@@ -21,10 +21,8 @@ use reverie::GlobalTool;
 use reverie::Guest;
 use reverie::Pid;
 use reverie::Tool;
-use serde::Deserialize;
-use serde::Serialize;
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Default)]
 struct GlobalState {
     // FIXME: Can't use (Pid, ExitStatus) types here since they don't implement
     // Serialize/Deserialize.
@@ -44,7 +42,7 @@ impl GlobalTool for GlobalState {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[derive(Debug, Default, Clone)]
 struct InjectExitTool {}
 
 #[reverie::tool]

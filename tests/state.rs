@@ -23,7 +23,7 @@ use reverie::Tool;
 use serde::Deserialize;
 use serde::Serialize;
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Default)]
 struct GlobalState {
     // Map of pids to parent pids and syscall counts. This is only updated when
     // a process exits.
@@ -50,7 +50,7 @@ impl GlobalTool for GlobalState {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Default)]
 struct TestTool {
     // Vec of thread ids and their syscall counts and children. This is only
     // updated when a thread exits.

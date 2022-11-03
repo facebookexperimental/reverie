@@ -124,9 +124,8 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     /// ```no_run
     /// use reverie::*;
     /// use reverie::syscalls::*;
-    /// use serde::{Deserialize, Serialize};
     ///
-    /// #[derive(Debug, Serialize, Deserialize, Default, Clone)]
+    /// #[derive(Debug, Default, Clone)]
     /// struct MyTool;
     ///
     /// #[reverie::tool]
@@ -214,9 +213,8 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     /// ```
     /// use reverie::*;
     /// use reverie::syscalls::*;
-    /// use serde::{Deserialize, Serialize};
     ///
-    /// #[derive(Debug, Serialize, Deserialize, Default, Clone)]
+    /// #[derive(Debug, Default, Clone)]
     /// struct MyTool;
     ///
     /// #[reverie::tool]

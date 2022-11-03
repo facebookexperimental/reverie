@@ -32,13 +32,13 @@ use reverie::Tool;
 use serde::Deserialize;
 use serde::Serialize;
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Default)]
 struct GlobalState {
     num_timer_evts: AtomicU64,
     num_signals: AtomicU64,
 }
 
-#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[derive(Debug, Default, Clone)]
 struct LocalState;
 
 #[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize)]

@@ -18,10 +18,8 @@ use reverie::Guest;
 use reverie::Pid;
 use reverie::Subscription;
 use reverie::Tool;
-use serde::Deserialize;
-use serde::Serialize;
 
-#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[derive(Debug, Default, Clone)]
 struct GlobalState {
     clock: u64,
 }
@@ -38,7 +36,7 @@ impl GlobalTool for GlobalState {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[derive(Debug, Default, Clone)]
 struct LocalState {}
 
 #[reverie::tool]

@@ -20,10 +20,8 @@ use reverie::RdtscResult;
 use reverie::Subscription;
 use reverie::Tid;
 use reverie::Tool;
-use serde::Deserialize;
-use serde::Serialize;
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Default)]
 struct GlobalState {
     tsc: AtomicUsize,
 }
@@ -55,7 +53,7 @@ impl GlobalTool for GlobalState {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[derive(Debug, Default, Clone)]
 struct LocalState {}
 
 #[reverie::tool]

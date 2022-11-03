@@ -13,12 +13,10 @@ use reverie::Error;
 use reverie::Guest;
 use reverie::Pid;
 use reverie::Tool;
-use serde::Deserialize;
-use serde::Serialize;
 
 #[test]
 fn thread_start_inject() {
-    #[derive(Debug, Serialize, Deserialize, Default)]
+    #[derive(Debug, Default)]
     struct TestTool;
 
     #[reverie::tool]
@@ -38,7 +36,7 @@ fn thread_start_inject() {
 
 #[test]
 fn thread_start_tail_inject() {
-    #[derive(Debug, Serialize, Deserialize, Default)]
+    #[derive(Debug, Default)]
     struct TestTool;
 
     #[reverie::tool]
