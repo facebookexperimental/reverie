@@ -76,6 +76,16 @@ impl From<Timespec> for libc::timeval {
     }
 }
 
+impl std::fmt::Display for Timespec {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ tv_sec: {}, tv_nsec: {} }}",
+            self.tv_sec, self.tv_nsec
+        )
+    }
+}
+
 /// A serializable version of `libc::timeval`.
 #[derive(Serialize, Deserialize)]
 #[derive(Default, Copy, Clone, Eq, PartialEq, Debug, Hash)]
@@ -107,5 +117,7 @@ pub struct Timezone {
 }
 
 crate::impl_displayable!(Display Timeval);
+crate::impl_displayable!(Display Timespec);
 
 crate::displayable_ptr!(TimevalMutPtr, AddrMut<Timeval>);
+crate::displayable_ptr!(TimespecMutPtr, AddrMut<Timespec>);

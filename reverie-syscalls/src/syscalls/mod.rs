@@ -39,6 +39,7 @@ use crate::args::StatPtr;
 use crate::args::StatxMask;
 use crate::args::StatxPtr;
 use crate::args::Timespec;
+use crate::args::TimespecMutPtr;
 use crate::args::TimevalMutPtr;
 use crate::args::Timezone;
 use crate::display::Displayable;
@@ -2297,7 +2298,7 @@ typed_syscall! {
 typed_syscall! {
     pub struct ClockGettime {
         clockid: ClockId,
-        tp: Option<AddrMut<Timespec>>,
+        tp: Option<TimespecMutPtr>,
     }
 }
 
