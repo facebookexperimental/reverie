@@ -39,6 +39,8 @@ mod cp;
 #[allow(unused)]
 #[cfg(target_arch = "x86_64")]
 mod debug;
+#[cfg(target_arch = "x86_64")]
+pub mod decoder;
 mod error;
 mod gdbstub;
 mod perf;

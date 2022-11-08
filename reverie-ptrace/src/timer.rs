@@ -31,6 +31,8 @@
 
 use reverie::Errno;
 use reverie::Pid;
+use reverie::RegDisplay;
+use reverie::RegDisplayOptions;
 use reverie::Signal;
 use reverie::Tid;
 use safeptrace::Error as TraceError;
@@ -39,6 +41,7 @@ use safeptrace::Stopped;
 use safeptrace::Wait;
 use thiserror::Error;
 use tracing::debug;
+use tracing::trace;
 use tracing::warn;
 
 use crate::perf::*;
@@ -604,6 +607,13 @@ impl TimerImpl {
             if ctr >= target {
                 break;
             }
+            #[cfg(target_arch = "x86_64")]
+            trace!(
+                "[instruction]\n{}\n{}",
+                crate::decoder::decode_instruction(&task)?,
+                task.getregs()?
+                    .display_with_options(RegDisplayOptions { multiline: true })
+            );
             task = match task.step(None)?.next_state().await? {
                 // a successful single step results in SIGTRAP stop
                 Wait::Stopped(new_task, TraceEvent::Signal(Signal::SIGTRAP)) => new_task,
