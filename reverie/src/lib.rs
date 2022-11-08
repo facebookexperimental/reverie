@@ -18,6 +18,7 @@ mod error;
 mod guest;
 #[cfg(target_arch = "x86_64")]
 mod rdtsc;
+mod regs;
 mod stack;
 mod subscription;
 mod timer;
@@ -31,6 +32,8 @@ pub use process::ExitStatus;
 pub use process::Pid;
 #[cfg(target_arch = "x86_64")]
 pub use rdtsc::*;
+pub use regs::RegDisplay;
+pub use regs::RegDisplayOptions;
 pub use reverie_process as process;
 pub use stack::*;
 pub use subscription::*;

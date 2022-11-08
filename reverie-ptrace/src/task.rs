@@ -65,8 +65,6 @@ use tokio::sync::Notify;
 use tokio::task::JoinError;
 use tokio::task::JoinHandle;
 
-use super::regs::Reg;
-use super::regs::RegAccess;
 use crate::children;
 use crate::cp;
 use crate::error::Error;
@@ -79,6 +77,8 @@ use crate::gdbstub::ResumeInferior;
 use crate::gdbstub::StopEvent;
 use crate::gdbstub::StopReason;
 use crate::gdbstub::StoppedInferior;
+use crate::regs::Reg;
+use crate::regs::RegAccess;
 use crate::stack::GuestStack;
 use crate::timer::HandleFailure;
 use crate::timer::Timer;
