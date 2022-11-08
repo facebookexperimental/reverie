@@ -30,6 +30,7 @@ use crate::memory::Addr;
 use crate::memory::AddrMut;
 use crate::memory::MemoryAccess;
 use crate::Errno;
+use crate::Timeval;
 
 /// A wrapper that combines an address space and a syscall. This is useful for
 /// displaying the contents of syscall pointer inputs.
@@ -201,3 +202,4 @@ impl_displayable!(Display i64);
 impl_displayable!(Display u64);
 impl_displayable!(Display isize);
 impl_displayable!(Display usize);
+impl_displayable!(Display Timeval);

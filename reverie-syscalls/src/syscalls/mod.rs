@@ -39,7 +39,7 @@ use crate::args::StatPtr;
 use crate::args::StatxMask;
 use crate::args::StatxPtr;
 use crate::args::Timespec;
-use crate::args::Timeval;
+use crate::args::TimevalPtr;
 use crate::args::Timezone;
 use crate::display::Displayable;
 use crate::memory::Addr;
@@ -1378,7 +1378,7 @@ typed_syscall! {
 
 typed_syscall! {
     pub struct Gettimeofday {
-        tv: Option<AddrMut<Timeval>>,
+        tv: Option<TimevalPtr>,
         tz: Option<AddrMut<Timezone>>,
     }
 }

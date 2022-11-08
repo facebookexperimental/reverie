@@ -469,6 +469,59 @@ impl Displayable for StatxMask {
     }
 }
 
+/// A pointer to a `timeval` buffer.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct TimevalPtr<'a>(AddrMut<'a, Timeval>);
+
+impl<'a> FromToRaw for Option<TimevalPtr<'a>> {
+    fn from_raw(raw: usize) -> Self {
+        AddrMut::from_ptr(raw as *const Timeval).map(TimevalPtr)
+    }
+
+    fn into_raw(self) -> usize {
+        self.map(|p| p.0).into_raw()
+    }
+}
+
+impl<'a> ReadAddr for TimevalPtr<'a> {
+    type Target = Timeval;
+    type Error = Errno;
+
+    fn read<M: MemoryAccess>(&self, memory: &M) -> Result<Self::Target, Self::Error> {
+        memory.read_value(self.0)
+    }
+}
+
+impl<'a> From<TimevalPtr<'a>> for AddrMut<'a, Timeval> {
+    fn from(time_ptr: TimevalPtr<'a>) -> Self {
+        time_ptr.0
+    }
+}
+
+impl<'a> From<TimevalPtr<'a>> for Addr<'a, Timeval> {
+    fn from(time_ptr: TimevalPtr<'a>) -> Self {
+        time_ptr.0.into()
+    }
+}
+
+impl<'a> Displayable for Option<TimevalPtr<'a>> {
+    fn fmt<M: MemoryAccess>(
+        &self,
+        memory: &M,
+        outputs: bool,
+        f: &mut fmt::Formatter,
+    ) -> fmt::Result {
+        match (self, outputs) {
+            (None, _) => f.write_str("NULL"),
+            (Some(addr), false) => write!(f, "{:?}", addr.0),
+            (Some(addr), true) => match addr.read(memory) {
+                Ok(s) => write!(f, "{} -> {}", addr.0, s.display_with_outputs(memory)),
+                Err(e) => write!(f, "{} -> <{}>", addr.0, e),
+            },
+        }
+    }
+}
+
 command_enum! {
     /// The argument pairs of `arch_prctl(2)`.
     #[allow(missing_docs)]

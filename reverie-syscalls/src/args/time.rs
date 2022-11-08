@@ -86,6 +86,16 @@ pub struct Timeval {
     pub tv_usec: libc::suseconds_t,
 }
 
+impl std::fmt::Display for Timeval {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ tv_sec: {}, tv_usec: {} }}",
+            self.tv_sec, self.tv_usec
+        )
+    }
+}
+
 /// A serializable version of `libc::timezone`.
 #[derive(Serialize, Deserialize)]
 #[derive(Default, Copy, Clone, Eq, PartialEq, Debug, Hash)]
