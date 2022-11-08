@@ -105,3 +105,7 @@ pub struct Timezone {
     tz_minuteswest: libc::c_int,
     tz_dsttime: libc::c_int,
 }
+
+crate::impl_displayable!(Display Timeval);
+
+crate::displayable_ptr!(TimevalMutPtr, AddrMut<Timeval>);

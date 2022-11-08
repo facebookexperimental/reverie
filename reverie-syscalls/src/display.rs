@@ -30,7 +30,6 @@ use crate::memory::Addr;
 use crate::memory::AddrMut;
 use crate::memory::MemoryAccess;
 use crate::Errno;
-use crate::Timeval;
 
 /// A wrapper that combines an address space and a syscall. This is useful for
 /// displaying the contents of syscall pointer inputs.
@@ -163,6 +162,9 @@ where
     }
 }
 
+/// Macro that implements ['Displayable'] trait for a given type based on
+/// another trait implementation e.g. ['Debug'] or ['Display'], etc
+#[macro_export]
 macro_rules! impl_displayable {
     ($fmt:ident $t:ty) => {
         impl $crate::Displayable for $t {
@@ -173,6 +175,63 @@ macro_rules! impl_displayable {
                 f: &mut ::core::fmt::Formatter,
             ) -> ::core::fmt::Result {
                 ::core::fmt::$fmt::fmt(self, f)
+            }
+        }
+    };
+}
+
+/// Macro that implements a wrapper for a pointer e.g. ['AddrMut']
+/// or ['Addr] with custom ['Displayable'] implementation
+#[macro_export]
+macro_rules! displayable_ptr {
+    ($type:ident, $pointer:ident<$value:ident>) => {
+        /// A pointer to a `timeval` buffer.
+        #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+        #[allow(missing_docs)]
+        pub struct $type<'a>(pub $crate::$pointer<'a, $value>);
+
+        impl<'a> $crate::FromToRaw for std::option::Option<$type<'a>> {
+            fn from_raw(raw: usize) -> Self {
+                $crate::$pointer::from_ptr(raw as *const $value).map($type)
+            }
+
+            fn into_raw(self) -> usize {
+                self.map(|p| p.0).into_raw()
+            }
+        }
+
+        impl<'a> $crate::ReadAddr for $type<'a> {
+            type Target = $value;
+            type Error = $crate::Errno;
+
+            fn read<M: $crate::MemoryAccess>(
+                &self,
+                memory: &M,
+            ) -> Result<Self::Target, Self::Error> {
+                memory.read_value(self.0)
+            }
+        }
+
+        impl<'a> $crate::Displayable for std::option::Option<$type<'a>> {
+            fn fmt<M: $crate::MemoryAccess>(
+                &self,
+                memory: &M,
+                outputs: bool,
+                f: &mut std::fmt::Formatter,
+            ) -> std::fmt::Result {
+                $crate::fmt_nullable_ptr(f, &self.map(|x| x.0), memory, outputs)
+            }
+        }
+
+        impl<'a> From<$type<'a>> for $crate::AddrMut<'a, $value> {
+            fn from(time_ptr: $type<'a>) -> Self {
+                time_ptr.0
+            }
+        }
+
+        impl<'a> From<$type<'a>> for $crate::Addr<'a, $value> {
+            fn from(time_ptr: $type<'a>) -> Self {
+                time_ptr.0.into()
             }
         }
     };
@@ -202,4 +261,3 @@ impl_displayable!(Display i64);
 impl_displayable!(Display u64);
 impl_displayable!(Display isize);
 impl_displayable!(Display usize);
-impl_displayable!(Display Timeval);
