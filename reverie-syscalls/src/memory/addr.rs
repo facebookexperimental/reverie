@@ -135,12 +135,6 @@ impl<'a, T> From<&'a T> for Addr<'a, T> {
     }
 }
 
-impl<'a, T> AsRef<T> for Addr<'a, T> {
-    fn as_ref(&self) -> &T {
-        unsafe { self.inner.as_ref() }
-    }
-}
-
 impl<'a, T> fmt::Debug for Addr<'a, T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         fmt::Pointer::fmt(&self.inner, f)
@@ -269,12 +263,6 @@ impl<'a, T> From<&'a T> for AddrMut<'a, T> {
             inner: NonNull::from(inner),
             _p: PhantomData,
         }
-    }
-}
-
-impl<'a, T> AsRef<T> for AddrMut<'a, T> {
-    fn as_ref(&self) -> &T {
-        unsafe { self.inner.as_ref() }
     }
 }
 
