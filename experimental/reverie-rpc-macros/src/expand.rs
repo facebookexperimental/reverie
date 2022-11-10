@@ -136,7 +136,7 @@ impl Service {
             where
                 S: #ident + Send,
             {
-                type Request<'r> = #request_ident #request_lifetime;
+                type Request<'r> where S: 'r = #request_ident #request_lifetime;
                 type Response = #response_ident;
                 type Future<'a> where S: 'a = ::reverie_rpc::BoxFuture<'a, Option<Self::Response>>;
 

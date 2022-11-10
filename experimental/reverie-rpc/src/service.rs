@@ -16,7 +16,9 @@ use serde::Serialize;
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 pub trait Service {
-    type Request<'r>: Deserialize<'r> + Unpin + Send;
+    type Request<'r>: Deserialize<'r> + Unpin + Send
+    where
+        Self: 'r;
     type Response: Serialize + Send + Unpin;
     type Future<'a>: Future<Output = Option<Self::Response>> + Send + 'a
     where
@@ -31,12 +33,10 @@ impl<S> Service for Arc<S>
 where
     S: Service,
 {
-    type Request<'r> = S::Request<'r>;
+    type Request<'r> = S::Request<'r> where S: 'r;
     type Response = S::Response;
     type Future<'a>
-    where
-        S: 'a,
-    = S::Future<'a>;
+    = S::Future<'a> where S: 'a;
 
     fn call<'a>(&'a self, req: Self::Request<'a>) -> Self::Future<'a> {
         self.as_ref().call(req)

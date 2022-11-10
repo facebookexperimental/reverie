@@ -6,9 +6,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-// reverie_rpc::service requires GATs.
-#![feature(generic_associated_types)]
-
 //! This contains the RPC protocol for the guest and host. That is, how the host
 //! and guest should talk to each other.
 

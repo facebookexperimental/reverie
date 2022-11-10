@@ -6,8 +6,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#![feature(generic_associated_types)]
-
 //! This crate provides the protocol that is to be used when communicating with
 //! global state. This crate is meant to be shared between the guest and host
 //! processes.
