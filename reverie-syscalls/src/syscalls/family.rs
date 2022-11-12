@@ -21,6 +21,43 @@ use crate::memory::Addr;
 use crate::memory::AddrMut;
 use crate::memory::MemoryAccess;
 
+/// Represents the `[p]read{64,v,v2}` family of syscalls. All of these syscalls
+/// have an associated file descriptor.
+#[derive(From, Debug, Copy, Clone, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub enum ReadFamily {
+    Read(super::Read),
+    Pread64(super::Pread64),
+    Readv(super::Readv),
+    Preadv(super::Preadv),
+    Preadv2(super::Preadv2),
+}
+
+impl ReadFamily {
+    /// Get the file descriptor associated with the read.
+    pub fn fd(&self) -> i32 {
+        match self {
+            Self::Read(s) => s.fd(),
+            Self::Pread64(s) => s.fd(),
+            Self::Readv(s) => s.fd(),
+            Self::Preadv(s) => s.fd(),
+            Self::Preadv2(s) => s.fd(),
+        }
+    }
+}
+
+impl From<ReadFamily> for Syscall {
+    fn from(family: ReadFamily) -> Syscall {
+        match family {
+            ReadFamily::Read(syscall) => Syscall::Read(syscall),
+            ReadFamily::Pread64(syscall) => Syscall::Pread64(syscall),
+            ReadFamily::Readv(syscall) => Syscall::Readv(syscall),
+            ReadFamily::Preadv(syscall) => Syscall::Preadv(syscall),
+            ReadFamily::Preadv2(syscall) => Syscall::Preadv2(syscall),
+        }
+    }
+}
+
 /// Represents the `[p]write{64,v,v2}` family of syscalls. All of these syscalls
 /// have an associated file descriptor.
 #[derive(From, Debug, Copy, Clone, Eq, PartialEq)]
