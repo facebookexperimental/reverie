@@ -13,14 +13,14 @@ artifacts = dotslash.DotSlashMultiFileArtifact(
     entries={
         "traceviz": dotslash.BuckBuild(
             cwd="fbcode",
-            target="//hermetic_infra/reverie/fb-only/traceviz:main",
+            target="//hermetic_infra/reverie/experimental/traceviz:main",
             flags=["@//mode/opt"],
             strip=False,
             buck_cmd=dotslash.BuckCommand.BUCK2,
         ),
         "traceviz_plugin.so": dotslash.BuckBuild(
             cwd="fbcode",
-            target="//hermetic_infra/reverie/fb-only/traceviz:traceviz-tool[shared]",
+            target="//hermetic_infra/reverie/experimental/traceviz:traceviz-tool[shared]",
             flags=["@//mode/opt"],
             strip=False,
             buck_cmd=dotslash.BuckCommand.BUCK2,
