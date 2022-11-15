@@ -50,8 +50,6 @@ pub struct Frame {
     pub ip: u64,
     /// True if this frame is inside of a signal handler.
     pub is_signal: bool,
-    /// The symbol associated with this frame (if known).
-    pub symbol: Option<Symbol>,
 }
 
 /// A stack frame with debugging information.
@@ -59,6 +57,8 @@ pub struct Frame {
 pub struct PrettyFrame {
     /// The raw stack frame information.
     frame: Frame,
+    /// The symbol as found in the symbol table.
+    symbol: Option<Symbol>,
     /// The source file and line where the instruction pointer is located.
     locations: Vec<Location>,
 }
@@ -68,12 +68,10 @@ pub struct PrettyFrame {
 pub struct Symbol {
     /// Name of the (mangled) symbol.
     pub name: String,
-    /// Offset of the symbol.
-    pub offset: u64,
     /// Address of the symbol.
     pub address: u64,
-    /// Size of the symbol.
-    pub size: u64,
+    /// The offset of the instruction pointer from `address`.
+    pub offset: u64,
 }
 
 /// The location of a symbol.
@@ -98,10 +96,7 @@ impl Symbol {
 
 impl fmt::Display for Frame {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match &self.symbol {
-            Some(symbol) => write!(f, "{:#016x}: {:#}", self.ip, symbol)?,
-            None => write!(f, "{:#016x}: ???", self.ip)?,
-        }
+        write!(f, "{:#016x}: ???", self.ip)?;
 
         if self.is_signal {
             write!(f, " (in signal handler)")?;
@@ -147,7 +142,8 @@ impl Backtrace {
         Self { thread_id, frames }
     }
 
-    /// Generates a pretty backtrace that includes file and line information for each frame.
+    /// Generates a pretty backtrace that includes file and line information for
+    /// each frame.
     pub fn pretty(&self) -> Result<PrettyBacktrace, anyhow::Error> {
         let libraries = Libraries::new(self.thread_id)?;
 
@@ -157,10 +153,19 @@ impl Backtrace {
         for frame in &self.frames {
             let ip = frame.ip;
             let mut locations = Vec::new();
+            let mut symbol = None;
 
             if let Some((library, addr)) = libraries.ip_to_vaddr(ip) {
                 let symbols = cache.load(library)?;
 
+                // Find symbol using the symbol table.
+                symbol = symbols.find_symbol(addr).map(|sym| Symbol {
+                    name: sym.name().to_string(),
+                    address: sym.address(),
+                    offset: addr - sym.address(),
+                });
+
+                // Find the file + line number of the instruction pointer.
                 let mut source_frames = symbols.find_frames(addr)?;
                 while let Some(f) = source_frames.next()? {
                     if let Some(loc) = f.location {
@@ -175,6 +180,7 @@ impl Backtrace {
 
             frames.push(PrettyFrame {
                 frame: frame.clone(),
+                symbol,
                 locations,
             });
         }
@@ -204,6 +210,11 @@ impl Backtrace {
 }
 
 impl PrettyBacktrace {
+    /// Returns an iterator over the frames in the backtrace.
+    pub fn iter(&self) -> impl Iterator<Item = &PrettyFrame> {
+        self.frames.iter()
+    }
+
     /// Retrieves the name of the thread for this backtrace. This will fail if
     /// the thread has already exited since the thread ID is used to look up the
     /// thread name.
@@ -212,8 +223,24 @@ impl PrettyBacktrace {
     }
 }
 
+impl PrettyFrame {
+    /// The symbol for this frame, if any.
+    pub fn symbol(&self) -> Option<&Symbol> {
+        self.symbol.as_ref()
+    }
+}
+
 impl IntoIterator for Backtrace {
     type Item = Frame;
+    type IntoIter = std::vec::IntoIter<Self::Item>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.frames.into_iter()
+    }
+}
+
+impl IntoIterator for PrettyBacktrace {
+    type Item = PrettyFrame;
     type IntoIter = std::vec::IntoIter<Self::Item>;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -259,10 +286,16 @@ impl fmt::Display for PrettyBacktrace {
         )?;
 
         for (i, frame) in self.frames.iter().enumerate() {
+            // Frame number
+            write!(f, "{:>4}: ", i)?;
+
             if frame.locations.is_empty() {
-                writeln!(f, "{:>4}: {}", i, frame)?;
+                match &frame.symbol {
+                    Some(symbol) => writeln!(f, "{:#016x}: {:#}", frame.frame.ip, symbol)?,
+                    None => writeln!(f, "{}", frame.frame)?,
+                }
             } else {
-                writeln!(f, "{:>4}: {:#}", i, frame.frame)?;
+                writeln!(f, "{:#}", frame.frame)?;
                 for location in &frame.locations {
                     writeln!(f, "             at {}", location)?;
                 }

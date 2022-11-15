@@ -47,7 +47,6 @@ use reverie::Pid;
 #[cfg(target_arch = "x86_64")]
 use reverie::Rdtsc;
 use reverie::Subscription;
-use reverie::Symbol;
 use reverie::Tid;
 use reverie::TimerSchedule;
 use reverie::Tool;
@@ -2195,31 +2194,15 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
             let ip = cursor.register(RegNum::IP).ok()?;
             let is_signal = cursor.is_signal_frame().ok()?;
 
-            // Try to resolve the symbol.
-            let mut symbol = None;
-            if let Ok(name) = cursor.procedure_name() {
-                if let Ok(info) = cursor.procedure_info() {
-                    if info.start_ip() + name.offset() == ip {
-                        symbol = Some(Symbol {
-                            name: name.name().to_string(),
-                            offset: name.offset(),
-                            address: info.start_ip(),
-                            size: info.end_ip() - info.start_ip(),
-                        });
-                    }
-                }
-            }
-
-            frames.push(Frame {
-                ip,
-                is_signal,
-                symbol,
-            });
+            frames.push(Frame { ip, is_signal });
 
             if !cursor.step().ok()? {
                 break;
             }
         }
+
+        // TODO: Take a snapshot of `/proc/self/maps` so the backtrace can be
+        // processed offline?
 
         Some(Backtrace::new(self.tid(), frames))
     }

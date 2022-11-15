@@ -13,10 +13,12 @@ use std::path::Path;
 use gimli::EndianSlice;
 use gimli::RunTimeEndian as Endian;
 use object::Object as _;
+use object::SymbolMapName;
 use typed_arena::Arena;
 
 struct Context<'mmap> {
     dwarf: addr2line::Context<EndianSlice<'mmap, Endian>>,
+    symbol_map: object::SymbolMap<SymbolMapName<'mmap>>,
     _object: object::File<'mmap>,
 }
 
@@ -63,6 +65,7 @@ impl Symbols {
 
         let context = Context {
             dwarf: addr2line::Context::from_dwarf(dwarf)?,
+            symbol_map: object.symbol_map(),
             _object: object,
         };
 
@@ -89,6 +92,18 @@ impl Symbols {
         probe: u64,
     ) -> Result<addr2line::FrameIter<EndianSlice<'static, Endian>>, gimli::read::Error> {
         self.context.dwarf.find_frames(probe)
+    }
+
+    /// Finds a symbol in the symbol table using the given address. If the
+    /// symbol does not exist, returns `None`. Note that this purely uses the
+    /// symbol table to find the symbol name and does not depend on the debug
+    /// info at all. This should be used as a fallback if `find_frames` is
+    /// unable to locate the symbol name using the debug info.
+    ///
+    /// Symbol lookup uses binary search, so it lookup happens in `O(log n)`
+    /// amortized time.
+    pub fn find_symbol(&self, probe: u64) -> Option<SymbolMapName> {
+        self.context.symbol_map.get(probe).copied()
     }
 
     /// Returns the number of bytes used to store the debug information. This is

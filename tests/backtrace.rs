@@ -29,26 +29,23 @@ impl Tool for TestTool {
         if let Syscall::Getpid(_) = &syscall {
             let backtrace = guest
                 .backtrace()
-                .expect("failed to get backtrace from guest");
+                .expect("failed to get backtrace from guest")
+                .pretty()
+                .expect("failed to get pretty backtrace from guest");
 
             // There's no guarantee our function is at the top of the stack, so
             // we simply assert that it is *somewhere* in the stack.
             assert!(
                 backtrace.iter().any(|frame| {
-                    if let Some(symbol) = &frame.symbol {
+                    if let Some(symbol) = frame.symbol() {
                         // Due to name mangling, there won't be an exact match.
                         symbol.name.contains("funky_function")
                     } else {
-                        // FIXME: The unwind library is currently broken on
-                        // platform010. It is not able to find symbols for any
-                        // stack frames. Change this back to `false` when that
-                        // is fixed. For now, file and line numbers still work.
-                        true
-                        //false
+                        false
                     }
                 }),
                 "guest backtrace did not contain our expected function:\n{}",
-                backtrace.pretty().unwrap()
+                backtrace
             );
         }
 
