@@ -44,7 +44,7 @@ pub mod decoder;
 mod error;
 mod gdbstub;
 mod perf;
-mod regs;
+pub mod regs;
 mod stack;
 mod task;
 pub mod testing;

@@ -13,6 +13,7 @@
 
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::sync::Mutex;
 
 use reverie::syscalls::Getpid;
 use reverie::syscalls::Gettid;
@@ -29,6 +30,7 @@ use reverie::Signal;
 use reverie::Subscription;
 use reverie::TimerSchedule;
 use reverie::Tool;
+use reverie_ptrace::regs::RegAccess;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -198,6 +200,75 @@ async fn raise_sigwinch<T: Guest<LocalState>>(guest: &mut T) -> Tgkill {
         .with_sig(libc::SIGWINCH)
 }
 
+#[derive(Default)]
+struct InstructionTracingGlobal {
+    timer_events: Mutex<Vec<TimerEvent>>,
+}
+
+#[derive(PartialEq, Default, Debug, Eq, Clone, Copy, Serialize, Deserialize)]
+struct TimerEvent {
+    rcbs: u64,
+    rip: reverie_ptrace::regs::Reg,
+}
+
+#[derive(Default, Clone, Serialize, Deserialize)]
+struct InstructionTracingConfig {
+    set_timer_after_syscall: Option<(u64, Option<u64>)>,
+}
+
+#[derive(Serialize, Deserialize)]
+enum InstructionTracingRequest {
+    Timer(TimerEvent),
+}
+
+#[reverie::global_tool]
+impl GlobalTool for InstructionTracingGlobal {
+    type Request = InstructionTracingRequest;
+    type Response = ();
+    type Config = InstructionTracingConfig;
+
+    async fn receive_rpc(&self, _from: reverie::Tid, message: Self::Request) -> Self::Response {
+        match message {
+            InstructionTracingRequest::Timer(ev) => self.timer_events.lock().unwrap().push(ev),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct InstructionTracing;
+
+#[reverie::tool]
+impl Tool for InstructionTracing {
+    type GlobalState = InstructionTracingGlobal;
+    type ThreadState = ThreadClockState;
+
+    async fn handle_syscall_event<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+        c: Syscall,
+    ) -> Result<i64, Error> {
+        match guest.config().set_timer_after_syscall {
+            Some((rcb, Some(instr))) => {
+                guest.set_timer_precise(reverie::TimerSchedule::RcbsAndInstructions(rcb, instr))?;
+            }
+
+            Some((rcb, None)) => {
+                guest.set_timer_precise(reverie::TimerSchedule::Rcbs(rcb))?;
+            }
+            _ => {}
+        }
+        guest.tail_inject(c).await
+    }
+
+    async fn handle_timer_event<T: Guest<Self>>(&self, guest: &mut T) {
+        let rcbs = guest.read_clock().expect("clock available");
+        let rip = guest.regs().await.ip();
+        guest
+            .send_rpc(InstructionTracingRequest::Timer(TimerEvent { rcbs, rip }))
+            .await;
+    }
+}
+
 #[cfg(all(not(sanitized), test))]
 mod tests {
     //! These tests are highly sensitive to the number of branches executed
@@ -207,6 +278,7 @@ mod tests {
     //! into the tracee, otherwise underflow or overflow checks will break the
     //! tests.
 
+    use reverie_ptrace::regs::RegAccess;
     use reverie_ptrace::ret_without_perf;
     use reverie_ptrace::testing::check_fn;
     use reverie_ptrace::testing::check_fn_with_config;
@@ -695,5 +767,45 @@ mod tests {
             },
             true,
         );
+    }
+
+    #[test_case(1000, None, 1000, Some(1))]
+    #[test_case(1000, Some(1), 1000, Some(2))]
+    #[test_case(1000, Some(100), 1000, Some(101))]
+    #[test_case(10, None, 10, Some(1))]
+    #[test_case(10, Some(1), 10, Some(2))]
+    #[test_case(10, Some(100), 10, Some(101))]
+    fn test_set_precice_with_instructions_after_syscall(
+        rcb_1: u64,
+        instr_1: Option<u64>,
+        rcb_2: u64,
+        instr_2: Option<u64>,
+    ) {
+        ret_without_perf!();
+        let gs_1 = check_fn_with_config::<InstructionTracing, _>(
+            move || {
+                do_syscall();
+                do_branches(MANY_RCBS);
+            },
+            InstructionTracingConfig {
+                set_timer_after_syscall: Some((rcb_1, instr_1)),
+                ..Default::default()
+            },
+            true,
+        );
+
+        let gs_2 = check_fn_with_config::<InstructionTracing, _>(
+            move || {
+                do_syscall();
+                do_branches(MANY_RCBS);
+            },
+            InstructionTracingConfig {
+                set_timer_after_syscall: Some((rcb_2, instr_2)),
+                ..Default::default()
+            },
+            true,
+        );
+        let rips = [&gs_1, &gs_2].map(|s| s.timer_events.lock().unwrap()[0].rip);
+        assert_ne!(rips[0], rips[1]);
     }
 }

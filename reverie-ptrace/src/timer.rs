@@ -29,6 +29,10 @@
 //!  - before resumption of the guest,
 //! which _usually_ means immediately after the tool callback returns.
 
+use std::cmp::Ordering::Equal;
+use std::cmp::Ordering::Greater;
+use std::cmp::Ordering::Less;
+
 use reverie::Errno;
 use reverie::Pid;
 use reverie::RegDisplay;
@@ -126,6 +130,9 @@ pub enum TimerEventRequest {
 
     /// Event should fire after at least this many RCBs.
     Imprecise(u64),
+
+    /// Event should fire after precisely this many RCBS and this many instructions
+    PreciseInstruction(u64, u64),
 }
 
 /// The possible results of handling a timer signal.
@@ -331,6 +338,8 @@ enum ActiveEvent {
     Precise {
         /// Expected clock value when event fires.
         clock_target: u64,
+        /// Instruction offset from clock target
+        offset: u64,
     },
     Imprecise {
         /// Expected minimum clock value when event fires.
@@ -343,8 +352,10 @@ impl ActiveEvent {
     /// clock to its expected state
     fn reschedule_if_spurious_wakeup(&self, curr_clock: u64) -> Option<TimerEventRequest> {
         match self {
-            ActiveEvent::Precise { clock_target } => (clock_target.saturating_sub(curr_clock)
-                > MAX_SINGLE_STEP_COUNT)
+            ActiveEvent::Precise {
+                clock_target,
+                offset: _,
+            } => (clock_target.saturating_sub(curr_clock) > MAX_SINGLE_STEP_COUNT)
                 .then(|| TimerEventRequest::Precise(*clock_target - curr_clock)),
             ActiveEvent::Imprecise { clock_min } => (*clock_min > curr_clock)
                 .then(|| TimerEventRequest::Imprecise(*clock_min - curr_clock)),
@@ -389,6 +400,79 @@ const SINGLESTEP_TIMEOUT_RCBS: u64 = 5;
 /// is requested that leaves less than the minimum perf timeout remaining.
 const MAX_SINGLE_STEP_COUNT: u64 = SKID_MARGIN_RCBS + SINGLESTEP_TIMEOUT_RCBS;
 
+/// This ClockCounter represents a pair in a form of (rcb, instr) that gets increased
+/// while single-stepping to reach target (target_rcb, target_instr)
+#[derive(Debug, Eq, PartialEq)]
+struct ClockCounter {
+    rcbs: u64,
+    instr: u64,
+    target_rcb: u64,
+}
+
+impl std::fmt::Display for ClockCounter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "rcb: {}, instr: {}", self.rcbs, self.instr)
+    }
+}
+
+impl ClockCounter {
+    pub fn new(rcb: u64, instr: u64, target_rcb: u64) -> Self {
+        Self {
+            rcbs: rcb,
+            instr,
+            target_rcb,
+        }
+    }
+
+    /// This method counts instructions & rcbs together in an attempt to reach target_rcb
+    ///
+    /// With each attempt we either increment rcb or instruction counter based on the read clock value.
+    /// If we reach target_rcb we no longer increase rcb counter and allow to meet at the target instruction counter
+    pub fn single_step_with_clock(&mut self, rcbs: u64) {
+        match (self.rcbs.cmp(&self.target_rcb), self.rcbs.cmp(&rcbs)) {
+            (Less, Less) => {
+                self.instr = 0;
+                self.rcbs = rcbs;
+            }
+
+            (Less | Equal, Equal) => {
+                self.instr += 1;
+            }
+
+            (Equal, Less) => {
+                self.instr += 1;
+            }
+
+            (_, Greater) => panic!(
+                "current counter rcb value {} is greater than privided rcb value {}",
+                self.rcbs, rcbs
+            ),
+            (Greater, _) => panic!(
+                "current counter rcb value {} is greater than target rcb value {}",
+                self.rcbs, self.target_rcb
+            ),
+        }
+    }
+
+    /// If a counter behind a given (rcb, instr) pair.
+    ///
+    /// Note: this is not always comparable. [None] will be returned in this case
+    fn is_behind(&self, rcbs: u64, instr: u64) -> Option<bool> {
+        match self.target_rcb.cmp(&rcbs) {
+            Less => None,
+            Greater | Equal => match self.rcbs.cmp(&rcbs) {
+                Less => Some(true),
+                Equal => Some(self.instr < instr),
+                Greater => Some(false),
+            },
+        }
+    }
+
+    fn rcbs(&self) -> u64 {
+        self.rcbs
+    }
+}
+
 impl TimerImpl {
     pub fn new(guest_pid: Pid, guest_tid: Tid) -> Result<Self, Errno> {
         let evt = Event::Raw(get_rcb_perf_config());
@@ -420,7 +504,10 @@ impl TimerImpl {
         Ok(Self {
             timer,
             clock,
-            event: ActiveEvent::Precise { clock_target: 0 },
+            event: ActiveEvent::Precise {
+                clock_target: 0,
+                offset: 0,
+            },
             timer_status: EventStatus::Cancelled,
             send_artificial_signal: false,
             guest_pid,
@@ -430,7 +517,9 @@ impl TimerImpl {
 
     pub fn request_event(&mut self, evt: TimerEventRequest) -> Result<(), Errno> {
         let (delivery, notification) = match evt {
-            TimerEventRequest::Precise(ticks) => (ticks, ticks.saturating_sub(SKID_MARGIN_RCBS)),
+            TimerEventRequest::Precise(ticks) | TimerEventRequest::PreciseInstruction(ticks, _) => {
+                (ticks, ticks.saturating_sub(SKID_MARGIN_RCBS))
+            }
             TimerEventRequest::Imprecise(ticks) => (ticks, ticks),
         };
         if delivery == 0 {
@@ -452,6 +541,11 @@ impl TimerImpl {
         self.event = match evt {
             TimerEventRequest::Precise(_) => ActiveEvent::Precise {
                 clock_target: clock,
+                offset: 0,
+            },
+            TimerEventRequest::PreciseInstruction(_, instr_offset) => ActiveEvent::Precise {
+                clock_target: clock,
+                offset: instr_offset,
             },
             TimerEventRequest::Imprecise(_) => ActiveEvent::Imprecise { clock_min: clock },
         };
@@ -564,8 +658,12 @@ impl TimerImpl {
         self.send_artificial_signal = false;
 
         match self.event {
-            ActiveEvent::Precise { clock_target } => {
-                self.attempt_single_step(task, ctr, clock_target).await
+            ActiveEvent::Precise {
+                clock_target,
+                offset,
+            } => {
+                self.attempt_single_step(task, ctr, clock_target, offset)
+                    .await
             }
             ActiveEvent::Imprecise { clock_min } => {
                 debug!(
@@ -582,29 +680,36 @@ impl TimerImpl {
         &self,
         task: Stopped,
         ctr_initial: u64,
-        target: u64,
+        target_rcb: u64,
+        target_instr: u64,
     ) -> Result<Stopped, HandleFailure> {
-        let mut ctr = ctr_initial;
         assert!(
-            ctr <= target,
+            ctr_initial <= target_rcb,
             "Clock perf counter exceeds target value at start of attempted single-step: \
                 {} > {}. Consider increasing SKID_MARGIN_RCBS.",
-            ctr,
-            target
+            ctr_initial,
+            target_rcb
         );
+        let mut current = ClockCounter::new(ctr_initial, 0, target_rcb);
         assert!(
-            target - ctr <= MAX_SINGLE_STEP_COUNT,
+            target_rcb - current.rcbs() <= MAX_SINGLE_STEP_COUNT,
             "Single steps from {} to {} requested ({} steps), but that exceeds the skid margin + minimum perf timer steps ({}). \
                 This probably indicates a bug",
-            ctr,
-            target,
-            (target - ctr),
+            current.rcbs(),
+            target_rcb,
+            (target_rcb - current.rcbs()),
             MAX_SINGLE_STEP_COUNT
         );
-        debug!("Timer will single-step from ctr {} to {}", ctr, target);
+        debug!(
+            "Timer will single-step from ctr {} to {}",
+            current, target_rcb
+        );
         let mut task = task;
         loop {
-            if ctr >= target {
+            if !current
+                .is_behind(target_rcb, target_instr)
+                .expect("counter should increase monotonically and stay at target_rcb until equal. This is most likely a BUG with counter tracking")
+            {
                 break;
             }
             #[cfg(target_arch = "x86_64")]
@@ -619,7 +724,7 @@ impl TimerImpl {
                 Wait::Stopped(new_task, TraceEvent::Signal(Signal::SIGTRAP)) => new_task,
                 wait => return Err(HandleFailure::Event(wait)),
             };
-            ctr = self.read_clock();
+            current.single_step_with_clock(self.read_clock());
         }
         Ok(task)
     }
@@ -681,5 +786,48 @@ fn get_si_fd(signal: &libc::siginfo_t) -> libc::c_int {
             .sifields
             .sigpoll
             .si_fd
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use test_case::test_case;
+
+    use super::ClockCounter;
+
+    #[test_case(ClockCounter::new(0, 0, 10), 0, 1, Some(true))]
+    #[test_case(ClockCounter::new(2, 100, 200), 3, 0, Some(true))]
+    #[test_case(ClockCounter::new(1, 10, 200), 1, 11, Some(true))]
+    #[test_case(ClockCounter::new(2, 100, 2), 3, 0, None)]
+    #[test_case(ClockCounter::new(4, 4, 4), 4, 5, Some(true))]
+    #[test_case(ClockCounter::new(4, 4, 4), 4, 3, Some(false))]
+    #[test_case(ClockCounter::new(4, 4, 4), 4, 4, Some(false))]
+    fn test_clock_counter_is_behind(
+        counter: ClockCounter,
+        target_rcb: u64,
+        target_instr: u64,
+        expected: Option<bool>,
+    ) {
+        assert_eq!(counter.is_behind(target_rcb, target_instr), expected);
+    }
+
+    #[test_case(ClockCounter::new(0, 0, 0), 0, (0, 1))]
+    #[test_case(ClockCounter::new(0, 1, 0), 1, (0, 2))]
+    #[test_case(ClockCounter::new(0, 1, 0), 2, (0, 2))]
+    #[test_case(ClockCounter::new(0, 1, 1), 0, (0, 2))]
+    #[test_case(ClockCounter::new(0, 1, 1), 1, (1, 0))]
+    #[test_case(ClockCounter::new(0, 1, 1), 2, (2, 0))]
+    #[test_case(ClockCounter::new(0, 1, 1), 3, (3, 0))]
+    #[test_case(ClockCounter::new(10, 0, 11), 10, (10, 1))]
+    #[test_case(ClockCounter::new(10, 1, 11), 10, (10, 2))]
+    #[test_case(ClockCounter::new(10, 1, 11), 11, (11, 0))]
+    #[test_case(ClockCounter::new(10, 1, 11), 12, (12, 0))]
+    fn test_increment_counter_with_clock(
+        mut counter: ClockCounter,
+        new_clock: u64,
+        expected: (u64, u64),
+    ) {
+        counter.single_step_with_clock(new_clock);
+        assert_eq!((counter.rcbs, counter.instr), expected);
     }
 }

@@ -6,6 +6,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+//! Module provides cross platform access to common registers.
+//!
+//! Currently supports aarch64 and x86_64 architectures.
+
 /// A single register.
 #[cfg(target_pointer_width = "64")]
 pub type Reg = u64;

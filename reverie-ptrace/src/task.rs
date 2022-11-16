@@ -2157,6 +2157,8 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
         let rcbs = match sched {
             TimerSchedule::Rcbs(r) => r,
             TimerSchedule::Time(dur) => Timer::as_ticks(dur),
+            //if timer is imprecise there is no really a point in trying to single step any further than r
+            TimerSchedule::RcbsAndInstructions(r, _) => r,
         };
         self.timer
             .request_event(TimerEventRequest::Imprecise(rcbs))?;
@@ -2164,11 +2166,15 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
     }
 
     fn set_timer_precise(&mut self, sched: TimerSchedule) -> Result<(), reverie::Error> {
-        let rcbs = match sched {
-            TimerSchedule::Rcbs(r) => r,
-            TimerSchedule::Time(dur) => Timer::as_ticks(dur),
+        match sched {
+            TimerSchedule::Rcbs(r) => self.timer.request_event(TimerEventRequest::Precise(r))?,
+            TimerSchedule::Time(dur) => self
+                .timer
+                .request_event(TimerEventRequest::Precise(Timer::as_ticks(dur)))?,
+            TimerSchedule::RcbsAndInstructions(r, i) => self
+                .timer
+                .request_event(TimerEventRequest::PreciseInstruction(r, i))?,
         };
-        self.timer.request_event(TimerEventRequest::Precise(rcbs))?;
         Ok(())
     }
 

@@ -16,6 +16,9 @@ pub enum TimerSchedule {
     /// Request that a timer event occur after exactly this many retired
     /// conditional branches (RCBs).
     Rcbs(u64),
+    /// Request that a timer event occur after exactly this many retired
+    /// conditional branches (RCBs) and this many instructions
+    RcbsAndInstructions(u64, u64),
 }
 
 /// signal used by reverie perf counter timer.
