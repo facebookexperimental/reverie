@@ -40,11 +40,11 @@ pub struct Mount {
 pub struct Bind {
     /// The source path of the bind mount. This path must exist. It can be either
     /// a file or directory.
-    source: CString,
+    pub source: CString,
 
     /// The target of the bind mount. This does not need to exist and can be
     /// created when performing the bind mount.
-    target: CString,
+    pub target: CString,
 }
 
 impl Mount {
