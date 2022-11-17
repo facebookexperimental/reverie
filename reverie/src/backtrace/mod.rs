@@ -158,23 +158,26 @@ impl Backtrace {
             if let Some((library, addr)) = libraries.ip_to_vaddr(ip) {
                 let symbols = cache.load(library)?;
 
-                // Find symbol using the symbol table.
-                symbol = symbols.find_symbol(addr).map(|sym| Symbol {
-                    name: sym.name().to_string(),
-                    address: sym.address(),
-                    offset: addr - sym.address(),
-                });
-
                 // Find the file + line number of the instruction pointer.
-                let mut source_frames = symbols.find_frames(addr)?;
-                while let Some(f) = source_frames.next()? {
-                    if let Some(loc) = f.location {
-                        locations.push(Location {
-                            file: loc.file.unwrap().into(),
-                            line: loc.line.unwrap_or(0),
-                            column: loc.column.unwrap_or(0),
-                        });
+                if let Ok(mut source_frames) = symbols.find_frames(addr) {
+                    while let Ok(Some(f)) = source_frames.next() {
+                        if let Some(loc) = f.location {
+                            locations.push(Location {
+                                file: loc.file.unwrap().into(),
+                                line: loc.line.unwrap_or(0),
+                                column: loc.column.unwrap_or(0),
+                            });
+                        }
                     }
+                }
+
+                if symbol.is_none() {
+                    // Find symbol using the symbol table.
+                    symbol = symbols.find_symbol(addr).map(|sym| Symbol {
+                        name: sym.name().to_string(),
+                        address: sym.address(),
+                        offset: addr + symbols.base_addr() - sym.address(),
+                    });
                 }
             }
 
@@ -289,16 +292,13 @@ impl fmt::Display for PrettyBacktrace {
             // Frame number
             write!(f, "{:>4}: ", i)?;
 
-            if frame.locations.is_empty() {
-                match &frame.symbol {
-                    Some(symbol) => writeln!(f, "{:#016x}: {:#}", frame.frame.ip, symbol)?,
-                    None => writeln!(f, "{}", frame.frame)?,
-                }
-            } else {
-                writeln!(f, "{:#}", frame.frame)?;
-                for location in &frame.locations {
-                    writeln!(f, "             at {}", location)?;
-                }
+            match &frame.symbol {
+                Some(symbol) => writeln!(f, "{:#016x}: {:#}", frame.frame.ip, symbol)?,
+                None => writeln!(f, "{:#}", frame.frame)?,
+            }
+
+            for location in &frame.locations {
+                writeln!(f, "             at {}", location)?;
             }
         }
 
