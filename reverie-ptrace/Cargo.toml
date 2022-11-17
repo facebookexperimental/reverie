@@ -32,3 +32,6 @@ tokio-stream = { version = "0.1.4", features = ["fs", "io-util", "net", "signal"
 tracing = "0.1.35"
 tracing-subscriber = { version = "0.3.16", features = ["ansi", "env-filter", "fmt", "json", "local-time", "parking_lot", "registry"] }
 unwind = { version = "0.4", features = ["ptrace"] }
+
+[dev-dependencies]
+test-case = "1.2"
