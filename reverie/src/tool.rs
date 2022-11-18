@@ -38,14 +38,14 @@ use crate::Tid;
 #[async_trait]
 pub trait GlobalTool: Send + Sync + Default {
     /// The message to send to the global tool.
-    type Request: Serialize + DeserializeOwned + Send = ();
+    type Request: Serialize + DeserializeOwned + Send;
 
     /// The result of sending the message.
-    type Response: Serialize + DeserializeOwned + Send = ();
+    type Response: Serialize + DeserializeOwned + Send;
 
     /// Static, read-only configuration data that is available everywhere the
     /// tool runs code.
-    type Config: Serialize + DeserializeOwned + Send + Sync + Clone + Default = ();
+    type Config: Serialize + DeserializeOwned + Send + Sync + Clone + Default;
 
     /// Initialize the tool, allocating the global state.
     async fn init_global_state(_cfg: &Self::Config) -> Self {
@@ -66,6 +66,7 @@ pub trait GlobalTool: Send + Sync + Default {
 impl GlobalTool for () {
     type Request = ();
     type Response = ();
+    type Config = ();
 
     async fn receive_rpc(&self, _from: Tid, _message: ()) {}
 }
@@ -116,7 +117,7 @@ pub trait Tool: Send + Sync + Default {
     /// The type of the global half that goes along with this Local tool. By
     /// including this type, the Tool is actually a complete specification for an
     /// instrumentation tool.
-    type GlobalState: GlobalTool = ();
+    type GlobalState: GlobalTool;
 
     /// Tool-state specific to each guest thread. If unset, this defaults to the
     /// unit type `()`, indicating that the tool does not have thread-level
@@ -131,7 +132,7 @@ pub trait Tool: Send + Sync + Default {
     ///
     /// [`Serialize`]: serde::Serialize
     /// [`DeserializeOwned`]: serde::de::DeserializeOwned
-    type ThreadState: Serialize + DeserializeOwned + Default + Send + Sync = ();
+    type ThreadState: Serialize + DeserializeOwned + Default + Send + Sync;
 
     /// A common constructor that initializes state when a process is created,
     /// including the guest's initial, root process. Of course, every process
@@ -317,6 +318,9 @@ pub trait Tool: Send + Sync + Default {
 
 /// A "noop" tool that doesn't do anything.
 impl Tool for () {
+    type GlobalState = ();
+    type ThreadState = ();
+
     fn subscriptions(_cfg: &()) -> Subscription {
         Subscription::none()
     }

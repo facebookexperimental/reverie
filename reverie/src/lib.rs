@@ -9,7 +9,6 @@
 #![doc = include_str!("../../README.md")]
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
-#![feature(associated_type_defaults)]
 #![feature(never_type)]
 
 mod auxv;
