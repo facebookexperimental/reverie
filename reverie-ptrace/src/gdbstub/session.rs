@@ -719,7 +719,7 @@ impl Session {
 
     /// Set a breakpoint. must have an active inferior.
     async fn set_breakpoint(&self, bkpt: Breakpoint) -> Result<(), Error> {
-        self.with_current_inferior(async move |inferior| {
+        self.with_current_inferior(move |inferior| async move {
             let request_tx = inferior
                 .request_tx
                 .as_ref()
@@ -744,7 +744,7 @@ impl Session {
     }
 
     async fn remove_breakpoint(&self, bkpt: Breakpoint) -> Result<(), Error> {
-        self.with_current_inferior(async move |inferior| {
+        self.with_current_inferior(move |inferior| async move {
             let request_tx = inferior
                 .request_tx
                 .as_ref()
@@ -770,7 +770,7 @@ impl Session {
     }
 
     async fn read_inferior_memory(&self, addr: u64, size: usize) -> Result<Vec<u8>, Error> {
-        self.with_current_inferior(async move |inferior| {
+        self.with_current_inferior(move |inferior| async move {
             let request_tx = inferior
                 .request_tx
                 .as_ref()
@@ -794,7 +794,7 @@ impl Session {
         data: Vec<u8>,
     ) -> Result<(), Error> {
         let data = data.clone();
-        self.with_current_inferior(async move |inferior| {
+        self.with_current_inferior(move |inferior| async move {
             let request_tx = inferior
                 .request_tx
                 .as_ref()
@@ -812,7 +812,7 @@ impl Session {
     }
 
     async fn read_registers(&self) -> Result<CoreRegs, Error> {
-        self.with_current_inferior(async move |inferior| {
+        self.with_current_inferior(move |inferior| async move {
             let request_tx = inferior
                 .request_tx
                 .as_ref()
@@ -830,7 +830,7 @@ impl Session {
     }
 
     async fn write_registers(&self, regs: Vec<u8>) -> Result<(), Error> {
-        self.with_current_inferior(async move |inferior| {
+        self.with_current_inferior(move |inferior| async move {
             let regs = regs.as_slice();
             let request_tx = inferior
                 .request_tx

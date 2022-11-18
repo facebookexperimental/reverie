@@ -28,7 +28,6 @@
 //!
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
-#![feature(async_closure)]
 #![feature(internal_output_capture)]
 #![feature(never_type)]
 #![feature(map_first_last)]
