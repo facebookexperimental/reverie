@@ -28,6 +28,7 @@ struct PedigreeLocal(Pedigree);
 
 #[reverie::tool]
 impl Tool for PedigreeLocal {
+    type GlobalState = ();
     type ThreadState = PedigreeLocal;
 
     fn new(pid: Pid, _cfg: &()) -> Self {

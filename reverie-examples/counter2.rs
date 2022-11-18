@@ -65,6 +65,8 @@ pub struct IncrMsg(u64, u64);
 impl GlobalTool for CounterGlobal {
     type Request = IncrMsg;
     type Response = ();
+    type Config = ();
+
     async fn init_global_state(_: &Self::Config) -> Self {
         CounterGlobal {
             inner: Mutex::new(GlobalInner {
@@ -74,6 +76,7 @@ impl GlobalTool for CounterGlobal {
             }),
         }
     }
+
     async fn receive_rpc(&self, _from: Pid, IncrMsg(n, t): IncrMsg) -> Self::Response {
         let mut mg = self.inner.lock().unwrap();
         mg.total_syscalls += n;

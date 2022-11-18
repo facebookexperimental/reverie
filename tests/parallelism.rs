@@ -27,6 +27,7 @@ struct TestTool {}
 impl GlobalTool for GlobalState {
     type Request = ();
     type Response = ();
+    type Config = ();
 
     async fn receive_rpc(&self, _from: Tid, _threads: Self::Request) -> Self::Response {
         // TODO: replace this with an ivar read:
@@ -106,6 +107,9 @@ struct TestTool2 {}
 
 #[reverie::tool]
 impl Tool for TestTool2 {
+    type GlobalState = ();
+    type ThreadState = ();
+
     async fn handle_syscall_event<T: Guest<Self>>(
         &self,
         guest: &mut T,

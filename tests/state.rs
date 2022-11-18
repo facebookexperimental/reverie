@@ -43,6 +43,7 @@ struct ThreadState {
 impl GlobalTool for GlobalState {
     type Request = Vec<(i32, usize, usize)>;
     type Response = ();
+    type Config = ();
 
     async fn receive_rpc(&self, from: Pid, threads: Self::Request) -> Self::Response {
         // Merge with global state.

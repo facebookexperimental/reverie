@@ -53,7 +53,9 @@ fn is_syscall_restarted(errno: Errno) -> bool {
 
 #[reverie::tool]
 impl Tool for LocalState {
+    type GlobalState = ();
     type ThreadState = ThreadState;
+
     async fn handle_signal_event<T: Guest<Self>>(
         &self,
         guest: &mut T,

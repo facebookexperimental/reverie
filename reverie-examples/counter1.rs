@@ -41,6 +41,8 @@ pub struct IncrMsg(Sysno);
 impl GlobalTool for CounterGlobal {
     type Request = IncrMsg;
     type Response = ();
+    type Config = ();
+
     async fn init_global_state(_: &Self::Config) -> Self {
         CounterGlobal {
             num_syscalls: AtomicU64::new(0),
@@ -55,6 +57,7 @@ impl GlobalTool for CounterGlobal {
 #[reverie::tool]
 impl Tool for CounterLocal {
     type GlobalState = CounterGlobal;
+    type ThreadState = ();
 
     async fn handle_syscall_event<T: Guest<Self>>(
         &self,

@@ -23,6 +23,7 @@ struct TestTool {}
 #[reverie::tool]
 impl Tool for TestTool {
     type GlobalState = ();
+    type ThreadState = ();
 }
 
 const NUM_ELEMENTS: usize = 1_000_000;

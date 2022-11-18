@@ -68,6 +68,8 @@ struct Inner {
 impl GlobalTool for ChunkyPrintGlobal {
     type Request = Msg;
     type Response = ();
+    type Config = ();
+
     async fn receive_rpc(&self, from: Tid, m: Msg) {
         let mut mg = self.0.lock().unwrap();
         match m {

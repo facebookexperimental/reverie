@@ -27,6 +27,9 @@ struct LocalStateVforkClone;
 
 #[reverie::tool]
 impl Tool for LocalStateVfork {
+    type GlobalState = ();
+    type ThreadState = ();
+
     async fn handle_syscall_event<T: Guest<Self>>(
         &self,
         guest: &mut T,
@@ -49,6 +52,9 @@ impl Tool for LocalStateVfork {
 
 #[reverie::tool]
 impl Tool for LocalStateVforkClone {
+    type GlobalState = ();
+    type ThreadState = ();
+
     async fn handle_syscall_event<T: Guest<Self>>(
         &self,
         guest: &mut T,

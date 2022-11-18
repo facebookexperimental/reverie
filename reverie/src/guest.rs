@@ -130,6 +130,8 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     ///
     /// #[reverie::tool]
     /// impl Tool for MyTool {
+    ///     /// Global state is unused
+    ///     type GlobalState = ();
     ///     /// Count of successful syscalls.
     ///     type ThreadState = u64;
     ///
@@ -219,6 +221,9 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     ///
     /// #[reverie::tool]
     /// impl Tool for MyTool {
+    ///     type GlobalState = ();
+    ///     type ThreadState = ();
+    ///
     ///     async fn handle_syscall_event<T: Guest<Self>>(
     ///         &self,
     ///         guest: &mut T,

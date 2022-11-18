@@ -93,6 +93,7 @@ const TIMEOUT: TimerSchedule = TimerSchedule::Rcbs(120_000_000);
 #[reverie::tool]
 impl Tool for LocalState {
     type GlobalState = GlobalState;
+    type ThreadState = ();
 
     async fn handle_thread_start<T: Guest<Self>>(&self, guest: &mut T) -> Result<(), Error> {
         guest.send_rpc(IncrMsg::Increment).await;

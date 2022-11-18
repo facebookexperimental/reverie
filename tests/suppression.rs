@@ -19,6 +19,9 @@ struct TestTool;
 
 #[reverie::tool]
 impl Tool for TestTool {
+    type GlobalState = ();
+    type ThreadState = ();
+
     async fn handle_syscall_event<T: Guest<Self>>(
         &self,
         guest: &mut T,

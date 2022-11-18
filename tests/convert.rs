@@ -25,6 +25,9 @@ struct LocalStateInject;
 
 #[reverie::tool]
 impl Tool for LocalStateTailInject {
+    type GlobalState = ();
+    type ThreadState = ();
+
     async fn handle_syscall_event<T: Guest<Self>>(
         &self,
         guest: &mut T,
@@ -43,6 +46,9 @@ impl Tool for LocalStateTailInject {
 
 #[reverie::tool]
 impl Tool for LocalStateInject {
+    type GlobalState = ();
+    type ThreadState = ();
+
     async fn handle_syscall_event<T: Guest<Self>>(
         &self,
         guest: &mut T,

@@ -20,6 +20,9 @@ struct NoopTool;
 
 #[reverie::tool]
 impl Tool for NoopTool {
+    type GlobalState = ();
+    type ThreadState = ();
+
     fn subscriptions(_cfg: &()) -> Subscription {
         Subscription::none()
     }

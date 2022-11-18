@@ -24,6 +24,9 @@ const PRNG_SEED: [u8; 16] = [
 
 #[reverie::tool]
 impl Tool for TestTool {
+    type GlobalState = ();
+    type ThreadState = ();
+
     async fn handle_post_exec<T: Guest<Self>>(&self, guest: &mut T) -> Result<(), Errno> {
         if let Some(ptr) = guest.auxv().at_random() {
             // It is safe to mutate this address since libc has not yet had a

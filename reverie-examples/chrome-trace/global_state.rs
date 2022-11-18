@@ -46,6 +46,7 @@ impl Default for GlobalState {
 impl GlobalTool for GlobalState {
     type Request = ThreadExit;
     type Response = ();
+    type Config = ();
 
     async fn receive_rpc(&self, _pid: Pid, event: ThreadExit) {
         let mut events = self.events.lock().unwrap();

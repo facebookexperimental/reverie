@@ -71,6 +71,8 @@ struct ChaosToolGlobal {}
 
 #[reverie::global_tool]
 impl GlobalTool for ChaosToolGlobal {
+    type Request = ();
+    type Response = ();
     type Config = ChaosOpts;
 
     async fn receive_rpc(&self, _from: Pid, _request: ()) {}
@@ -78,8 +80,8 @@ impl GlobalTool for ChaosToolGlobal {
 
 #[reverie::tool]
 impl Tool for ChaosTool {
-    type ThreadState = bool;
     type GlobalState = ChaosToolGlobal;
+    type ThreadState = bool;
 
     fn new(_pid: Pid, _cfg: &ChaosOpts) -> Self {
         Self {

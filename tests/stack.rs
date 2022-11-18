@@ -28,6 +28,9 @@ struct LocalState;
 
 #[reverie::tool]
 impl Tool for LocalState {
+    type GlobalState = ();
+    type ThreadState = ();
+
     async fn handle_syscall_event<T: Guest<Self>>(
         &self,
         guest: &mut T,
@@ -96,6 +99,9 @@ struct LocalState2;
 
 #[reverie::tool]
 impl Tool for LocalState2 {
+    type GlobalState = ();
+    type ThreadState = ();
+
     async fn handle_syscall_event<T: Guest<Self>>(
         &self,
         guest: &mut T,
@@ -130,6 +136,9 @@ struct LocalState3;
 
 #[reverie::tool]
 impl Tool for LocalState3 {
+    type GlobalState = ();
+    type ThreadState = ();
+
     async fn handle_syscall_event<T: Guest<Self>>(
         &self,
         guest: &mut T,

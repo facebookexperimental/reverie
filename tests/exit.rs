@@ -33,6 +33,7 @@ struct GlobalState {
 impl GlobalTool for GlobalState {
     type Request = ExitStatus;
     type Response = ();
+    type Config = ();
 
     async fn receive_rpc(&self, from: Pid, exit_status: ExitStatus) -> Self::Response {
         self.exited
@@ -48,6 +49,7 @@ struct InjectExitTool {}
 #[reverie::tool]
 impl Tool for InjectExitTool {
     type GlobalState = GlobalState;
+    type ThreadState = ();
 
     async fn on_exit_process<G: GlobalRPC<Self::GlobalState>>(
         self,

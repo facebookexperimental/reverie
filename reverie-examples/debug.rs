@@ -16,6 +16,9 @@ use reverie_util::CommonToolArguments;
 #[derive(Debug, Default)]
 struct DebugTool;
 impl Tool for DebugTool {
+    type GlobalState = ();
+    type ThreadState = ();
+
     fn subscriptions(_cfg: &()) -> Subscription {
         Subscription::none()
     }

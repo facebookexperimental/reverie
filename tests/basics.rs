@@ -43,7 +43,10 @@ use serde::Serialize;
 
 #[derive(Debug, Default)]
 struct NoopTool;
-impl Tool for NoopTool {}
+impl Tool for NoopTool {
+    type GlobalState = ();
+    type ThreadState = ();
+}
 
 #[test]
 fn noop_tool_test() {
@@ -71,6 +74,8 @@ pub struct IncrMsg(Sysno);
 impl GlobalTool for CounterGlobal {
     type Request = IncrMsg;
     type Response = ();
+    type Config = ();
+
     async fn receive_rpc(&self, _from: Pid, _: IncrMsg) -> Self::Response {
         AtomicU64::fetch_add(&self.num_syscalls, 1, Ordering::SeqCst);
     }
@@ -79,6 +84,8 @@ impl GlobalTool for CounterGlobal {
 #[reverie::tool]
 impl Tool for CounterLocal {
     type GlobalState = CounterGlobal;
+    type ThreadState = ();
+
     async fn handle_syscall_event<T: Guest<Self>>(
         &self,
         guest: &mut T,

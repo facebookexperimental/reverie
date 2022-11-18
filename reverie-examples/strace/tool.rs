@@ -32,6 +32,7 @@ pub struct Strace;
 #[reverie::tool]
 impl Tool for Strace {
     type GlobalState = GlobalState;
+    type ThreadState = ();
 
     fn subscriptions(cfg: &Config) -> Subscription {
         // Check if we're only excluding things.

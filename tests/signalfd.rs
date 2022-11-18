@@ -25,6 +25,7 @@ struct ThreadState;
 
 #[reverie::tool]
 impl Tool for LocalState {
+    type GlobalState = ();
     type ThreadState = ThreadState;
 
     async fn handle_syscall_event<T: Guest<Self>>(

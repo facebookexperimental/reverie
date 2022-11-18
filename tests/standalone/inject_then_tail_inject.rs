@@ -29,6 +29,8 @@ type Dupcount = u64;
 
 #[reverie::global_tool]
 impl GlobalTool for TestTool {
+    type Request = ();
+    type Response = ();
     type Config = Dupcount;
 
     async fn receive_rpc(&self, _from: Pid, _message: ()) {}
@@ -43,6 +45,7 @@ const NUM_REPS: Dupcount = 3;
 #[reverie::tool]
 impl Tool for TestTool {
     type GlobalState = TestTool;
+    type ThreadState = ();
 
     async fn handle_syscall_event<T: Guest<Self>>(
         &self,

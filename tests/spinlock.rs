@@ -12,7 +12,10 @@ use reverie::Tool;
 struct LocalState;
 
 #[reverie::tool]
-impl Tool for LocalState {}
+impl Tool for LocalState {
+    type GlobalState = ();
+    type ThreadState = ();
+}
 
 #[cfg(all(not(sanitized), test))]
 mod tests {

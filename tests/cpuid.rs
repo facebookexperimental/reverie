@@ -28,6 +28,7 @@ struct GlobalState {
 impl GlobalTool for GlobalState {
     type Request = ();
     type Response = u64;
+    type Config = ();
 
     // Just get the current time.
     async fn receive_rpc(&self, _from: Pid, _request: ()) -> u64 {
@@ -42,6 +43,7 @@ struct LocalState {}
 #[reverie::tool]
 impl Tool for LocalState {
     type GlobalState = GlobalState;
+    type ThreadState = ();
 
     fn subscriptions(_cfg: &()) -> Subscription {
         let mut s = Subscription::none();

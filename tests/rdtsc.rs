@@ -30,6 +30,7 @@ struct GlobalState {
 impl GlobalTool for GlobalState {
     type Request = Rdtsc;
     type Response = RdtscResult;
+    type Config = ();
 
     async fn init_global_state(_: &Self::Config) -> Self {
         GlobalState {
@@ -59,6 +60,7 @@ struct LocalState {}
 #[reverie::tool]
 impl Tool for LocalState {
     type GlobalState = GlobalState;
+    type ThreadState = ();
 
     fn subscriptions(_cfg: &()) -> Subscription {
         let mut s = Subscription::none();

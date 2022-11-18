@@ -30,6 +30,9 @@ pub struct GdbServerCommand {
 struct TestTool;
 
 impl Tool for TestTool {
+    type GlobalState = ();
+    type ThreadState = ();
+
     fn subscriptions(_cfg: &()) -> Subscription {
         Subscription::all()
     }
