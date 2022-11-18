@@ -30,7 +30,6 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 #![feature(internal_output_capture)]
 #![feature(never_type)]
-#![feature(map_first_last)]
 #![feature(bench_black_box)]
 
 mod children;

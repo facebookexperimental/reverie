@@ -1971,7 +1971,7 @@ impl<L: Tool + 'static> TracedTask<L> {
 
     /// thaw all threads.
     async fn thaw_all(&mut self) -> Result<(), TraceError> {
-        while let Some((_pid, suspended_task)) = self.suspended_tasks.pop_first() {
+        for (_pid, suspended_task) in core::mem::take(&mut self.suspended_tasks) {
             if let Some(tx) = suspended_task.waker.as_ref() {
                 suspended_task.suspended.store(false, Ordering::SeqCst);
                 let _sent = tx.try_send(self.tid());
