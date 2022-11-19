@@ -94,6 +94,8 @@ impl GlobalTool for () {
 ///
 /// #[reverie::tool]
 /// impl Tool for MyTool {
+///     /// The global state type.
+///     type GlobalState = ();
 ///     /// Count of syscalls.
 ///     type ThreadState = u64;
 ///
