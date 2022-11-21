@@ -13,7 +13,7 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 #![feature(internal_output_capture)]
 #![feature(never_type)]
-#![feature(rustc_attrs)]
+#![cfg_attr(feature = "nightly", feature(rustc_attrs))]
 
 mod builder;
 mod child;

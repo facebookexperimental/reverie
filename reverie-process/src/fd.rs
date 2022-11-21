@@ -32,8 +32,11 @@ use super::util;
 #[derive(Debug)]
 // From `std/src/sys/unix/fd.rs`. Mark `-1` as an invalid file descriptor so it
 // can be reused to in `Option<Fd>`.
-#[rustc_layout_scalar_valid_range_start(0)]
-#[rustc_layout_scalar_valid_range_end(0xFF_FF_FF_FE)]
+#[cfg_attr(feature = "nightly", rustc_layout_scalar_valid_range_start(0))]
+#[cfg_attr(
+    feature = "nightly",
+    rustc_layout_scalar_valid_range_end(0xFF_FF_FF_FE)
+)]
 pub struct Fd(i32);
 
 /// An asynchronous file descriptor. The file descriptor is guaranteed to be in
