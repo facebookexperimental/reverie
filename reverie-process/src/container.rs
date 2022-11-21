@@ -782,6 +782,11 @@ impl Container {
         // be able to call `println!()` and have that output go to stdout.
         //
         // See: https://github.com/rust-lang/rust/issues/35136
+        //
+        // Another way around this weirdness is to not use the default
+        // `print!()` and `println!()` macros so that we can completely bypass
+        // this output capturing.
+        #[cfg(feature = "nightly")]
         let output_capture = std::io::set_output_capture(None);
 
         let result = clone_with_stack(
@@ -802,6 +807,7 @@ impl Container {
             &mut stack,
         );
 
+        #[cfg(feature = "nightly")]
         std::io::set_output_capture(output_capture);
 
         let child = WaitGuard::new(result?);
