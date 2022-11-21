@@ -85,7 +85,7 @@ impl Command {
 
         let pid = clone(
             || {
-                let code = onfail(self.do_exec(&context, &env).unwrap_err());
+                let code = onfail(self.do_exec(&context, &env));
                 unsafe { libc::_exit(code) }
             },
             clone_flags,
@@ -136,16 +136,19 @@ impl Command {
 
     /// Note: This function MUST NOT allocate or deallocate any memory. Doing so
     /// can cause deadlocks.
-    fn do_exec(&mut self, context: &ChildContext, env: &CStringArray) -> Result<!, Error> {
-        self.container.setup(context, &mut self.pre_exec)?;
+    ///
+    /// Only returns if an error occurs, thus it is only possible for it to
+    /// return an error.
+    fn do_exec(&mut self, context: &ChildContext, env: &CStringArray) -> Error {
+        if let Err(err) = self.container.setup(context, &mut self.pre_exec) {
+            return err;
+        }
 
-        let err = Error::result(
+        Error::result(
             unsafe { libc::execvpe(self.program.as_ptr(), self.args.as_ptr(), env.as_ptr()) },
             Context::Exec,
         )
-        .unwrap_err();
-
-        Err(err)
+        .unwrap_err()
     }
 }
 

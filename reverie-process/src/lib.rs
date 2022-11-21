@@ -12,7 +12,6 @@
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 #![feature(internal_output_capture)]
-#![feature(never_type)]
 #![cfg_attr(feature = "nightly", feature(rustc_attrs))]
 
 mod builder;
