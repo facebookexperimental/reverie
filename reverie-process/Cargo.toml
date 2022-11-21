@@ -24,3 +24,7 @@ const-cstr = "0.3.0"
 num_cpus = "1.11"
 raw-cpuid = "10.6.0"
 tempfile = "3.3"
+
+[features]
+default = []
+nightly = []
