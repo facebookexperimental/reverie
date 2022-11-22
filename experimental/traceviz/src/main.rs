@@ -113,8 +113,6 @@ impl Args {
 
                 {
                     let _trace_guard = {
-                        let _init = tracer::trace_start_init(fb);
-
                         let mut tracer = Tracer::new(fb, &tracing_policy);
                         match tracer.start_managed_trace(&TraceStartParams::new()) {
                             Ok(guard) => {
