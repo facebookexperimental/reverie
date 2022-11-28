@@ -29,14 +29,8 @@ use tokio::io::ReadBuf;
 
 use super::util;
 
+/// A file descriptor.
 #[derive(Debug)]
-// From `std/src/sys/unix/fd.rs`. Mark `-1` as an invalid file descriptor so it
-// can be reused to in `Option<Fd>`.
-#[cfg_attr(feature = "nightly", rustc_layout_scalar_valid_range_start(0))]
-#[cfg_attr(
-    feature = "nightly",
-    rustc_layout_scalar_valid_range_end(0xFF_FF_FF_FE)
-)]
 pub struct Fd(i32);
 
 /// An asynchronous file descriptor. The file descriptor is guaranteed to be in
@@ -47,7 +41,7 @@ pub struct AsyncFd(TokioAsyncFd<Fd>);
 impl Fd {
     pub fn new(fd: i32) -> Self {
         assert_ne!(fd, -1);
-        unsafe { Self(fd) }
+        Self(fd)
     }
 
     #[allow(dead_code)]
@@ -70,7 +64,7 @@ impl Fd {
         mode: libc::mode_t,
     ) -> Result<Self, Errno> {
         let fd = Errno::result(unsafe { libc::open(path, flags | libc::O_CREAT, mode) })?;
-        Ok(unsafe { Self(fd) })
+        Ok(Self(fd))
     }
 
     pub fn null(readable: bool) -> Result<Self, Errno> {
@@ -153,12 +147,12 @@ impl Fd {
 
     pub fn dup(&self) -> Result<Fd, Errno> {
         let fd = Errno::result(unsafe { libc::dup(self.0) })?;
-        Ok(unsafe { Fd(fd) })
+        Ok(Self(fd))
     }
 
     pub fn dup2(&self, newfd: RawFd) -> Result<Fd, Errno> {
         let fd = Errno::result(unsafe { libc::dup2(self.0, newfd) })?;
-        Ok(unsafe { Fd(fd) })
+        Ok(Self(fd))
     }
 
     #[allow(unused)]
