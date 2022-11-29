@@ -43,18 +43,18 @@ invocations.
 ## Building and Testing
 
 Reverie needs the following system-level dependencies:
-```
+```text
 sudo apt install pkg-config libunwind-devel
 ```
 (These are required to get backtraces from the guest process.)
 
 To test, run:
-```
+```text
 cargo test -- --test-threads=1
 ```
 
 To run the `strace` example:
-```
+```text
 cd reverie-examples
 cargo run --bin strace -- ls
 ```
