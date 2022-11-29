@@ -613,7 +613,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         use reverie::syscalls::ArchPrctl;
         use reverie::syscalls::ArchPrctlCmd;
 
-        self.inject(ArchPrctl::new().with_cmd(ArchPrctlCmd::ARCH_SET_CPUID(0)))
+        self.inject_with_retry(ArchPrctl::new().with_cmd(ArchPrctlCmd::ARCH_SET_CPUID(0)))
             .await
             .map(|_| ())
     }
@@ -772,11 +772,15 @@ impl<L: Tool + 'static> TracedTask<L> {
 
         vdso::vdso_patch(self).await.expect("unable to patch vdso");
 
-        let mprotect = Mprotect::new()
-            .with_addr(AddrMut::from_raw(cp::TRAMPOLINE_BASE))
-            .with_len(cp::TRAMPOLINE_SIZE)
-            .with_protection(ProtFlags::PROT_READ | ProtFlags::PROT_EXEC);
-        self.inject(mprotect).await?;
+        // Protect our trampoline page from being written to. We won't need to
+        // change this again for the lifetime of the guest process.
+        self.inject_with_retry(
+            Mprotect::new()
+                .with_addr(AddrMut::from_raw(cp::TRAMPOLINE_BASE))
+                .with_len(cp::TRAMPOLINE_SIZE)
+                .with_protection(ProtFlags::PROT_READ | ProtFlags::PROT_EXEC),
+        )
+        .await?;
 
         // Try to intercept cpuid instructions on x86_64
         #[cfg(target_arch = "x86_64")]
