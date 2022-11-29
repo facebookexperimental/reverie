@@ -609,14 +609,13 @@ fn restore_context(
 
 impl<L: Tool + 'static> TracedTask<L> {
     #[cfg(target_arch = "x86_64")]
-    async fn intercept_cpuid(&mut self) -> bool {
+    async fn intercept_cpuid(&mut self) -> Result<(), Errno> {
         use reverie::syscalls::ArchPrctl;
         use reverie::syscalls::ArchPrctlCmd;
 
-        let ret = self
-            .inject(ArchPrctl::new().with_cmd(ArchPrctlCmd::ARCH_SET_CPUID(0)))
-            .await;
-        ret == Ok(0)
+        self.inject(ArchPrctl::new().with_cmd(ArchPrctlCmd::ARCH_SET_CPUID(0)))
+            .await
+            .map(|_| ())
     }
 
     /// Perform the very first setup of a fresh tracee process:
@@ -781,9 +780,20 @@ impl<L: Tool + 'static> TracedTask<L> {
 
         // Try to intercept cpuid instructions on x86_64
         #[cfg(target_arch = "x86_64")]
-        if self.global_state.subscriptions.has_cpuid() && !self.intercept_cpuid().await {
-            tracing::warn!("unable to intercept cpuid");
+        if self.global_state.subscriptions.has_cpuid() {
+            if let Err(err) = self.intercept_cpuid().await {
+                match err {
+                    Errno::ENODEV => tracing::warn!(
+                        "Unable to intercept CPUID: Underlying hardware does not support CPUID faulting"
+                    ),
+                    err => tracing::warn!("Unable to intercept CPUID: {}", err),
+                }
+            }
         }
+
+        // Restore registers again after we've injected syscalls so that we
+        // don't leave the return value register (%rax) in a dirty state.
+        task.setregs(regs)?;
 
         Ok(task)
     }
