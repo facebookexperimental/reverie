@@ -54,7 +54,7 @@ impl Fd {
     /// allocate.
     pub fn open_c(path: *const libc::c_char, flags: i32) -> Result<Self, Errno> {
         let fd = Errno::result(unsafe { libc::open(path, flags) })?;
-        Ok(unsafe { Self(fd) })
+        Ok(Self(fd))
     }
 
     /// Creates a file from a NUL terminated string. This function does not allocate.
@@ -320,7 +320,7 @@ pub fn pipe() -> Result<(Fd, Fd), Errno> {
     // descriptor won't be closed upon exec.
     Errno::result(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) })?;
 
-    Ok((unsafe { Fd(fds[0]) }, unsafe { Fd(fds[1]) }))
+    Ok((Fd(fds[0]), Fd(fds[1])))
 }
 
 /// Writes bytes to a file. The file path must be null terminated.
