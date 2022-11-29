@@ -81,10 +81,9 @@ pub const SECCOMP_USER_NOTIF_FLAG_CONTINUE: u32 = 1u32 << 0;
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 #[repr(C)]
 pub struct seccomp_notif_resp {
-    /// This is a cookie value that was obtained using the [`SeccompNotif::recv`]
-    /// operation. This cookie value allows the kernel to correctly associate
-    /// this response with the system call that triggered the user-space
-    /// notification.
+    /// This is a cookie value associated with this response. This cookie value
+    /// allows the kernel to correctly associate this response with the system
+    /// call that triggered the user-space notification.
     pub id: u64,
 
     /// This is the value that will be used for a spoofed success return for the
@@ -108,7 +107,7 @@ pub const SECCOMP_ADDFD_FLAG_SEND: u32 = 1u32 << 1;
 #[repr(C)]
 pub struct seccomp_notif_addfd {
     /// This field should be set to the notification ID (cookie value) that was
-    /// obtained via [`SeccompNotif::recv`].
+    /// obtained via [`seccomp_notif_resp`].
     pub id: u64,
 
     /// This field is a bit mask of flags tha tmodify the behavior of the
@@ -202,13 +201,14 @@ impl SeccompNotif {
     }
 
     /// This is used to check that a notification ID returned by an earlier
-    /// [`SeccompNotif::recv`] operation is still valid (i.e., that the target still
-    /// exists and its system call is still blocked waiting for a response).
+    /// [`SeccompNotif::poll_recv`] operation is still valid (i.e., that the
+    /// target still exists and its system call is still blocked waiting for a
+    /// response).
     ///
     /// This operation is necessary to avoid race conditions that can occur when the
-    /// `pid` returned by [`SeccompNotif::recv`] operation terminates, and that
-    /// process ID is reused by another process. An example of this kind of race is
-    /// the following:
+    /// `pid` returned by [`SeccompNotif::poll_recv`] operation terminates, and
+    /// that process ID is reused by another process. An example of this kind of
+    /// race is the following:
     ///
     ///  1. A notification is generated on the listening file descriptor. The
     ///     returned `seccomp_notif` contains the TID of the target thread (in the

@@ -139,4 +139,4 @@ file for guidance.
 
 ## License
 
-Reverie is BSD 2-Clause licensed as found in the [LICENSE](LICENSE) file.
+Reverie is BSD 2-Clause licensed as found in the [LICENSE](./LICENSE) file.

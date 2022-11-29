@@ -29,15 +29,17 @@ impl RegDisplay for libc::user_regs_struct {
     }
 }
 
-/// Options how [libc:user_regs_struct] can be formatted for [std::fmt::Display] implementation
+/// Options for how [`libc::user_regs_struct`] can be formatted for the
+/// [`std::fmt::Display`] implementation.
 #[derive(Default)]
 pub struct RegDisplayOptions {
     /// whether to display registers in a single line or format on multiple lines
     pub multiline: bool,
 }
 
-/// A wrapper defers and implements [std::fmt::Display] for [libc::user_regs_struct]
-/// according to the options represented by [RegDisplayOptions]
+/// A wrapper defers and implements [`std::fmt::Display`] for
+/// [`libc::user_regs_struct`] according to the options represented by
+/// [`RegDisplayOptions`].
 pub struct Display<'a> {
     options: RegDisplayOptions,
     regs: &'a libc::user_regs_struct,
