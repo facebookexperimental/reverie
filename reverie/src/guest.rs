@@ -21,6 +21,7 @@ use crate::timer::TimerSchedule;
 use crate::tool::GlobalRPC;
 use crate::tool::GlobalTool;
 use crate::tool::Tool;
+use crate::Never;
 use crate::Pid;
 
 /// A representation of a guest task (thread).
@@ -152,7 +153,7 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     ///     }
     /// }
     /// ```
-    async fn tail_inject<S: SyscallInfo>(&mut self, syscall: S) -> !;
+    async fn tail_inject<S: SyscallInfo>(&mut self, syscall: S) -> Never;
 
     /// Like [`Guest::inject`], but will retry the syscall if `EINTR` or
     /// `ERESTARTSYS` are returned.
@@ -350,7 +351,7 @@ where
         self.inner.inject(syscall).await
     }
 
-    async fn tail_inject<S: SyscallInfo>(&mut self, syscall: S) -> ! {
+    async fn tail_inject<S: SyscallInfo>(&mut self, syscall: S) -> Never {
         #![allow(unreachable_code)]
         self.inner.tail_inject(syscall).await
     }

@@ -29,7 +29,6 @@
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 #![feature(internal_output_capture)]
-#![feature(never_type)]
 
 mod children;
 mod cp;

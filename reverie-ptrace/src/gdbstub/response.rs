@@ -66,12 +66,6 @@ impl WriteResponse for ResponseOk {
     }
 }
 
-impl WriteResponse for ! {
-    fn write_response(&self, f: &mut ResponseWriter) {
-        ResponseNone.write_response(f)
-    }
-}
-
 impl<T> WriteResponse for ResponseAsPlain<T>
 where
     T: AsRef<[u8]>,

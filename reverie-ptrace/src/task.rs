@@ -43,6 +43,7 @@ use reverie::Frame;
 use reverie::GlobalRPC;
 use reverie::GlobalTool;
 use reverie::Guest;
+use reverie::Never;
 use reverie::Pid;
 #[cfg(target_arch = "x86_64")]
 use reverie::Rdtsc;
@@ -1275,7 +1276,7 @@ impl<L: Tool + 'static> TracedTask<L> {
 
         // Wait on a future that will never complete. This pending future will
         // be dropped when the channel receives the event just sent.
-        future::pending::<!>().await
+        future::pending().await
     }
 
     /// Marks the current task as exited via a channel. The receiver end of the
@@ -1698,7 +1699,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             Ok(_) => {
                 // Drop the handle_syscall_event future.
                 self.notifier.notify_one();
-                future::pending::<!>().await
+                future::pending().await
             }
             Err(err) => self.abort(Err(err)).await,
         }
@@ -2161,7 +2162,7 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
     }
 
     #[allow(unreachable_code)]
-    async fn tail_inject<S: SyscallInfo>(&mut self, syscall: S) -> ! {
+    async fn tail_inject<S: SyscallInfo>(&mut self, syscall: S) -> Never {
         // Call a non-templatized function to reduce code bloat.
         let (nr, args) = syscall.into_parts();
         self.do_tail_inject(nr, args).await

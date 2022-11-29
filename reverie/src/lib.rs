@@ -9,7 +9,6 @@
 #![doc = include_str!("../../README.md")]
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
-#![feature(never_type)]
 
 mod auxv;
 mod backtrace;
@@ -65,3 +64,6 @@ pub use nix::sys::signal::Signal;
 pub use raw_cpuid::CpuIdResult;
 /// typed syscalls.
 pub use reverie_syscalls as syscalls;
+
+/// `Never` type is a stopgap for the unstable `!` type (i.e., the never type).
+pub type Never = never_say_never::Never;
