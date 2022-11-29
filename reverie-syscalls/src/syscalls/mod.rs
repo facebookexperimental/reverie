@@ -122,7 +122,6 @@ syscall_list! {
         alarm => Alarm,
         setitimer => Setitimer,
         getpid => Getpid,
-        #[cfg(not(target_arch = "aarch64"))]
         sendfile => Sendfile,
         socket => Socket,
         connect => Connect,
