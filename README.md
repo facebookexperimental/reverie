@@ -40,6 +40,25 @@ The tool can stipulate exactly which events streams it ***subscribes*** to.
 The tool itself is stateful, maintaining state between consecutive
 invocations.
 
+## Building and Testing
+
+Reverie needs the following system-level dependencies:
+```
+sudo apt install pkg-config libunwind-devel
+```
+(These are required to get backtraces from the guest process.)
+
+To test, run:
+```
+cargo test -- --test-threads=1
+```
+
+To run the `strace` example:
+```
+cd reverie-examples
+cargo run --bin strace -- ls
+```
+
 ## Usage
 
 Currently, there is only the `reverie-ptrace` backend which uses `ptrace` to
