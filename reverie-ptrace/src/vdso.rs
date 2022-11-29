@@ -138,6 +138,11 @@ const VDSO_SYMBOLS: &[(&str, &[u8])] = &[
     ("__kernel_rt_sigreturn", vdso_syms::rt_sigreturn),
 ];
 
+/// Rounds up `value` so that it is a multiple of `alignment`.
+fn align_up(value: usize, alignment: usize) -> usize {
+    (value + alignment - 1) & alignment.wrapping_neg()
+}
+
 lazy_static! {
     static ref VDSO_PATCH_INFO: HashMap<&'static str, (u64, usize, &'static [u8])> = {
         let info = vdso_get_symbols_info();
@@ -145,14 +150,20 @@ lazy_static! {
 
         for (k, v) in VDSO_SYMBOLS {
             if let Some(&(base, size)) = info.get(*k) {
+                // NOTE: There is padding at the end of every VDSO entry to
+                // bring it up to a 16-byte size alignment. The dynamic symbol
+                // table doesn't report the aligned size, so we must do the same
+                // alignment here. For example, some VDSO entries might only be
+                // 5 bytes, but they have padding to align them up to 16 bytes.
+                let aligned_size = align_up(size, 16);
                 assert!(
-                    v.len() <= size,
+                    v.len() <= aligned_size,
                     "vdso symbol {}'s real size is {} bytes, but trying to replace it with {} bytes",
                     k,
                     size,
                     v.len()
                 );
-                res.insert(*k, (base, size, *v));
+                res.insert(*k, (base, aligned_size, *v));
             }
         }
 
@@ -251,6 +262,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_align_up() {
+        assert_eq!(align_up(0, 16), 0);
+        assert_eq!(align_up(1, 16), 16);
+        assert_eq!(align_up(15, 16), 16);
+        assert_eq!(align_up(16, 16), 16);
+        assert_eq!(align_up(17, 16), 32);
+    }
 
     #[test]
     fn can_find_vdso() {
