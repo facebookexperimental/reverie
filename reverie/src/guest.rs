@@ -247,6 +247,17 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     fn backtrace(&mut self) -> Option<Backtrace> {
         None
     }
+
+    /// Returns true if all of the following conditions are true:
+    ///  1. [`Tool::subscriptions`] returns an interest in intercepting CPUID.
+    ///  2. We're able to trap and intercept the CPUID instruction. We may not
+    ///     be able to do this for virtual machines as this functionality is
+    ///     often disabled for VMs.
+    ///  3. We're running on x86-64. Other architectures don't have the CPUID
+    ///     instruction.
+    fn has_cpuid_interception(&self) -> bool {
+        false
+    }
 }
 
 /// Wraps a `Guest<T>` such that it implements `Guest<U>`.
@@ -370,5 +381,9 @@ where
 
     fn backtrace(&mut self) -> Option<Backtrace> {
         self.inner.backtrace()
+    }
+
+    fn has_cpuid_interception(&self) -> bool {
+        self.inner.has_cpuid_interception()
     }
 }

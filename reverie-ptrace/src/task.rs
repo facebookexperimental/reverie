@@ -204,6 +204,9 @@ pub struct TracedTask<L: Tool> {
     /// Global state. This is shared among all threads in a process tree.
     global_state: GlobalState<L::GlobalState>,
 
+    /// True if we can intercept CPUID, false otherwise.
+    has_cpuid_interception: bool,
+
     /// Set to `Some` if the syscall has not been injected yet. `None` if it has.
     pending_syscall: Option<(Sysno, SyscallArgs)>,
 
@@ -366,6 +369,7 @@ impl<L: Tool> TracedTask<L> {
             thread_state,
             process_state,
             global_state,
+            has_cpuid_interception: false,
             pending_syscall: None,
             next_state,
             next_state_rx: Some(next_state_rx),
@@ -420,6 +424,7 @@ impl<L: Tool> TracedTask<L> {
             thread_state,
             process_state,
             global_state,
+            has_cpuid_interception: self.has_cpuid_interception,
             pending_syscall: None,
             next_state,
             next_state_rx: Some(next_state_rx),
@@ -471,6 +476,7 @@ impl<L: Tool> TracedTask<L> {
             thread_state,
             process_state,
             global_state: self.global_state.clone(),
+            has_cpuid_interception: self.has_cpuid_interception,
             pending_syscall: None,
             next_state,
             next_state_rx: Some(next_state_rx),
@@ -786,14 +792,16 @@ impl<L: Tool + 'static> TracedTask<L> {
         // Try to intercept cpuid instructions on x86_64
         #[cfg(target_arch = "x86_64")]
         if self.global_state.subscriptions.has_cpuid() {
-            if let Err(err) = self.intercept_cpuid().await {
+            self.has_cpuid_interception = self.intercept_cpuid().await.map_err(|err| {
                 match err {
                     Errno::ENODEV => tracing::warn!(
                         "Unable to intercept CPUID: Underlying hardware does not support CPUID faulting"
                     ),
                     err => tracing::warn!("Unable to intercept CPUID: {}", err),
                 }
-            }
+
+                err
+            }).is_ok();
         }
 
         // Restore registers again after we've injected syscalls so that we
@@ -2226,6 +2234,10 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
         // processed offline?
 
         Some(Backtrace::new(self.tid(), frames))
+    }
+
+    fn has_cpuid_interception(&self) -> bool {
+        self.has_cpuid_interception
     }
 }
 
