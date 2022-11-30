@@ -29,8 +29,12 @@ use super::Pid;
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Hash)]
 pub struct Backtrace {
     /// Thread ID where the backtrace originated. This can be used to get the
-    /// name of the thread and the process it came from.
+    /// process it came from.
     thread_id: Pid,
+
+    // Name of the thread where the backtrace originated, or none of the name
+    // could not be derived (e.g. because the thread had exited).
+    thread_name: Option<String>,
 
     /// The stack frames in the backtrace.
     frames: Vec<Frame>,
@@ -38,8 +42,10 @@ pub struct Backtrace {
 
 /// A backtrace with file and line information. This is more heavy-weight than a
 /// normal backtrace.
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Hash)]
 pub struct PrettyBacktrace {
     thread_id: Pid,
+    thread_name: Option<String>,
     frames: Vec<PrettyFrame>,
 }
 
@@ -139,7 +145,11 @@ impl fmt::Display for Symbol {
 impl Backtrace {
     /// Creates a backtrace from a thread ID and frames.
     pub fn new(thread_id: Pid, frames: Vec<Frame>) -> Self {
-        Self { thread_id, frames }
+        Self {
+            thread_id,
+            thread_name: thread_name(thread_id).ok(),
+            frames,
+        }
     }
 
     /// Generates a pretty backtrace that includes file and line information for
@@ -190,8 +200,34 @@ impl Backtrace {
 
         Ok(PrettyBacktrace {
             thread_id: self.thread_id,
+            thread_name: self.thread_name.clone(),
             frames,
         })
+    }
+
+    /// Generates a pretty backtrace that may includes file and line information
+    /// for each frame, if available.
+    pub fn force_pretty(&self) -> PrettyBacktrace {
+        if let Ok(pretty) = self.pretty() {
+            return pretty;
+        }
+
+        // Convert to the structure of a pretty backtrace, but without any
+        // enrichment
+        let frames = self
+            .frames
+            .iter()
+            .map(|frame| PrettyFrame {
+                frame: frame.clone(),
+                symbol: None,
+                locations: Vec::new(),
+            })
+            .collect();
+        PrettyBacktrace {
+            thread_id: self.thread_id,
+            thread_name: self.thread_name.clone(),
+            frames,
+        }
     }
 
     /// Returns an iterator over the frames in the backtrace.
@@ -204,11 +240,9 @@ impl Backtrace {
         self.thread_id
     }
 
-    /// Retreives the name of the thread for this backtrace. This will fail if
-    /// the thread has already exited since the thread ID is used to look up the
-    /// thread name.
-    pub fn thread_name(&self) -> io::Result<String> {
-        thread_name(self.thread_id)
+    /// Returns the name of the thread for this backtrace.
+    pub fn thread_name(&self) -> Option<String> {
+        self.thread_name.clone()
     }
 }
 
@@ -218,11 +252,9 @@ impl PrettyBacktrace {
         self.frames.iter()
     }
 
-    /// Retrieves the name of the thread for this backtrace. This will fail if
-    /// the thread has already exited since the thread ID is used to look up the
-    /// thread name.
-    pub fn thread_name(&self) -> io::Result<String> {
-        thread_name(self.thread_id)
+    /// Returns the name of the thread for this backtrace.
+    pub fn thread_name(&self) -> Option<String> {
+        self.thread_name.clone()
     }
 }
 
