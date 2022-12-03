@@ -17,6 +17,7 @@ use std::path::PathBuf;
 
 mod clone;
 mod fcntl;
+mod io_uring;
 pub mod ioctl;
 mod poll;
 mod stat;
@@ -25,6 +26,7 @@ mod time;
 
 pub use clone::*;
 pub use fcntl::FcntlCmd;
+pub use io_uring::*;
 use nix::sys::stat::Mode;
 use nix::sys::stat::SFlag;
 use nix::unistd::Pid;

@@ -469,9 +469,9 @@ syscall_list! {
         // Missing: io_pgetevents => IoPgetevents,
         // Missing: rseq => Rseq,
         // Missing: pidfd_send_signal => PidfdSendSignal,
-        // Missing: io_uring_setup => IoUringSetup,
-        // Missing: io_uring_enter => IoUringEnter,
-        // Missing: io_uring_register => IoUringRegister,
+        io_uring_setup => IoUringSetup,
+        io_uring_enter => IoUringEnter,
+        io_uring_register => IoUringRegister,
         // Missing: open_tree => OpenTree,
         // Missing: move_mount => MoveMount,
         // Missing: fsopen => Fsopen,
@@ -3488,6 +3488,33 @@ typed_syscall! {
         flags: AtFlags,
         mask: StatxMask,
         statx: Option<StatxPtr>,
+    }
+}
+
+typed_syscall! {
+    pub struct IoUringSetup {
+        entries: u32,
+        params: Option<AddrMut<args::IoUringParams>>,
+    }
+}
+
+typed_syscall! {
+    pub struct IoUringEnter {
+        fd: u32,
+        to_submit: u32,
+        min_complete: u32,
+        flags: u32,
+        sig: Option<Addr<libc::sigset_t>>,
+        sigsz: usize,
+    }
+}
+
+typed_syscall! {
+    pub struct IoUringRegister {
+        fd: u32,
+        opcode: u32,
+        arg: Option<AddrMut<libc::c_void>>,
+        nr_args: u32,
     }
 }
 
