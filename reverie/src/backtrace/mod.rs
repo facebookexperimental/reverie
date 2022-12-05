@@ -72,7 +72,7 @@ pub struct PrettyFrame {
 /// A symbol from a frame.
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Hash)]
 pub struct Symbol {
-    /// Name of the (mangled) symbol.
+    /// Name of the (potentially demangled) symbol.
     pub name: String,
     /// Address of the symbol.
     pub address: u64,
@@ -89,15 +89,6 @@ pub struct Location {
     line: u32,
     /// The column in the file. 0 if unknown.
     column: u32,
-}
-
-impl Symbol {
-    /// Returns the demangled name of the symbol. This makes a best-effort guess
-    /// about demangling. If the symbol could not be demangled, returns the raw,
-    /// original name of the symbol.
-    pub fn demangled(&self) -> Cow<str> {
-        addr2line::demangle_auto(Cow::from(&self.name), None)
-    }
 }
 
 impl fmt::Display for Frame {
@@ -134,11 +125,7 @@ impl fmt::Display for PrettyFrame {
 
 impl fmt::Display for Symbol {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        if f.alternate() {
-            write!(f, "{} + {:#x}", self.demangled(), self.offset)
-        } else {
-            write!(f, "{} + {:#x}", self.name, self.offset)
-        }
+        write!(f, "{} + {:#x}", self.name, self.offset)
     }
 }
 
@@ -184,7 +171,7 @@ impl Backtrace {
                 if symbol.is_none() {
                     // Find symbol using the symbol table.
                     symbol = symbols.find_symbol(addr).map(|sym| Symbol {
-                        name: sym.name().to_string(),
+                        name: addr2line::demangle_auto(sym.name().into(), None).into(),
                         address: sym.address(),
                         offset: addr + symbols.base_addr() - sym.address(),
                     });
