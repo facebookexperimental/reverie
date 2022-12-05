@@ -37,17 +37,6 @@ This example tool intercepts write events on stdout and stderr and
 manipulates either when those outputs are released, or the scheduling order
 that determines the order of printed output.
 
-# pedigree: Deterministic virtual process IDs
-
-This tool monitors the spawning of new processes and maps each new PID to a
-deterministic virtual PID. The new virtual PID is reported after each
-process-spawning syscall.
-
-This tool is a work-in-progress and is not yet functioning.
-
-`pedigree.rs` is an implementation of pedigree / virtual PID generation using local state.
-`virtual_process_tree.rs` is an implementation which uses global state.
-
 # strace: Reverie Echo Tool
 
 This instrumentation tool simply echos intercepted events, like strace.

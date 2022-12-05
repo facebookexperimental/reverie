@@ -37,10 +37,6 @@ name = "noop"
 path = "noop.rs"
 
 [[bin]]
-name = "pedigree"
-path = "pedigree.rs"
-
-[[bin]]
 name = "strace"
 path = "strace/main.rs"
 
@@ -51,7 +47,6 @@ path = "strace_minimal.rs"
 [dependencies]
 anyhow = "1.0.65"
 clap = { version = "3.2.17", features = ["derive", "env", "regex", "unicode", "wrap_help"] }
-nix = "0.25"
 reverie = { version = "0.1.0", path = "../reverie" }
 reverie-ptrace = { version = "0.1.0", path = "../reverie-ptrace" }
 reverie-util = { version = "0.1.0", path = "../reverie-util" }
