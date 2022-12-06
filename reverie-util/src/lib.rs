@@ -7,6 +7,5 @@
  */
 
 mod commandline;
-pub mod pedigree;
 
 pub use commandline::CommonToolArguments;

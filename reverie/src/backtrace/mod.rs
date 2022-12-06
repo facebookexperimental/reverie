@@ -11,7 +11,6 @@ mod library;
 mod symbols;
 
 use core::fmt;
-use std::borrow::Cow;
 use std::fs::File;
 use std::io;
 use std::io::Read;
