@@ -535,7 +535,7 @@ fn set_ret(task: &Stopped, ret: Reg) -> Result<Reg, TraceError> {
     let mut regs = task.getregs()?;
     let old = regs.ret();
     *regs.ret_mut() = ret;
-    task.setregs(regs)?;
+    task.setregs(&regs)?;
     Ok(old)
 }
 
@@ -611,7 +611,7 @@ fn restore_context(
     // them, because the syscall is finished and they're supposed to change.
     // TL&DR: do not restore %rcx/%r11 here.
 
-    task.setregs(regs)
+    task.setregs(&regs)
 }
 
 impl<L: Tool + 'static> TracedTask<L> {
@@ -671,7 +671,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                 0,
             ));
 
-            task.setregs(regs)?;
+            task.setregs(&regs)?;
             // Execute the injected mmap call.
             let mut running = task.step(None)?;
 
@@ -713,7 +713,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             cp::populate_mmap_page(task.pid().into(), page_addr).map_err(|err| err)?;
 
             // Restore our saved registers, including our instruction pointer.
-            task.setregs(*saved_regs)?;
+            task.setregs(saved_regs)?;
             Ok(task)
         }
 
@@ -767,7 +767,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             // PTRACE_POKEDATA.
             let ip = AddrMut::from_raw(regs.ip() as usize).unwrap();
             task.write_value(ip, &saved)?;
-            task.setregs(regs)?;
+            task.setregs(&regs)?;
             Ok(())
         }
 
@@ -806,7 +806,7 @@ impl<L: Tool + 'static> TracedTask<L> {
 
         // Restore registers again after we've injected syscalls so that we
         // don't leave the return value register (%rax) in a dirty state.
-        task.setregs(regs)?;
+        task.setregs(&regs)?;
 
         Ok(task)
     }
@@ -973,12 +973,12 @@ impl<L: Tool + 'static> TracedTask<L> {
         Ok(match trap_info {
             Some(SegfaultTrapInfo::Cpuid) => {
                 let regs = self.handle_cpuid(regs).await?;
-                task.setregs(regs)?;
+                task.setregs(&regs)?;
                 HandleSignalResult::SignalSuppressed(task.resume(None)?.next_state().await?)
             }
             Some(SegfaultTrapInfo::Rdtscs(req)) => {
                 let regs = self.handle_rdtscs(regs, req).await?;
-                task.setregs(regs)?;
+                task.setregs(&regs)?;
                 HandleSignalResult::SignalSuppressed(task.resume(None)?.next_state().await?)
             }
             None => HandleSignalResult::SignalToDeliver(task, Signal::SIGSEGV),
@@ -1519,7 +1519,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         {
             let mut new_regs = regs;
             *new_regs.orig_syscall_mut() = -1i64 as u64;
-            task.setregs(new_regs)?;
+            task.setregs(&new_regs)?;
         }
 
         #[cfg(target_arch = "aarch64")]
@@ -1534,7 +1534,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             match running.next_state().await? {
                 Wait::Stopped(task, Event::Signal(Signal::SIGTRAP)) => {
                     #[cfg(target_arch = "x86_64")]
-                    task.setregs(regs)?;
+                    task.setregs(&regs)?;
                     break Ok(task);
                 }
                 Wait::Stopped(task, Event::Signal(sig)) => {
@@ -1595,7 +1595,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         // `populate_mmap_page` for details.
         *regs.ip_mut() = cp::PRIVATE_PAGE_OFFSET as Reg;
 
-        task.setregs(regs)?;
+        task.setregs(&regs)?;
 
         // Step to run the syscall instruction.
         let wait = task.step(None)?.next_state().await?;
@@ -1878,7 +1878,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         task: Stopped,
         regs: libc::user_regs_struct,
     ) -> Result<Wait, TraceError> {
-        task.setregs(regs)?;
+        task.setregs(&regs)?;
 
         // Task could be hitting a breakpoint, after previously suspended by
         // a different task, need to notify this task is fully stopped.
@@ -2093,8 +2093,8 @@ impl<L: Tool + 'static> TracedTask<L> {
     fn write_registers(&self, core_regs: CoreRegs) -> Result<(), TraceError> {
         let task = self.assume_stopped();
         let (regs, fpregs) = core_regs.into_parts();
-        task.setregs(regs)?;
-        task.setfpregs(fpregs)?;
+        task.setregs(&regs)?;
+        task.setfpregs(&fpregs)?;
         Ok(())
     }
 }

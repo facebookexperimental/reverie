@@ -538,10 +538,10 @@ impl Stopped {
         Ok(unsafe { regs.assume_init() })
     }
 
-    fn setregset<T>(&self, which: i32, regs: T) -> Result<(), Error> {
+    fn setregset<T>(&self, which: i32, regs: &T) -> Result<(), Error> {
         let iov = libc::iovec {
-            iov_base: &regs as *const _ as *mut _,
-            iov_len: core::mem::size_of_val(&regs),
+            iov_base: regs as *const _ as *mut _,
+            iov_len: core::mem::size_of::<T>(),
         };
 
         unsafe {
@@ -566,7 +566,7 @@ impl Stopped {
     }
 
     /// Sets the general purpose registers.
-    pub fn setregs(&self, regs: Regs) -> Result<(), Error> {
+    pub fn setregs(&self, regs: &Regs) -> Result<(), Error> {
         self.setregset(libc::NT_PRSTATUS, regs)
     }
 
@@ -576,7 +576,7 @@ impl Stopped {
     }
 
     /// Sets the floating point registers.
-    pub fn setfpregs(&self, regs: FpRegs) -> Result<(), Error> {
+    pub fn setfpregs(&self, regs: &FpRegs) -> Result<(), Error> {
         self.setregset(libc::NT_PRFPREG, regs)
     }
 
@@ -614,7 +614,7 @@ impl Stopped {
     #[cfg(target_arch = "aarch64")]
     pub fn set_syscall(&self, nr: i32) -> Result<(), Error> {
         const NT_ARM_SYSTEM_CALL: i32 = 0x404;
-        self.setregset(NT_ARM_SYSTEM_CALL, nr)
+        self.setregset(NT_ARM_SYSTEM_CALL, &nr)
     }
 
     /// Gets info about the signal that caused the process to be stopped.
