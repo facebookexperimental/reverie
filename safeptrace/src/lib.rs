@@ -8,6 +8,7 @@
 
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
+#![cfg(target_os = "linux")]
 
 //! A safe ptrace API. This API forces correct usage of ptrace in that it is
 //! not possible to call ptrace on a process not in a stopped state.

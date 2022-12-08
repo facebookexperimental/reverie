@@ -16,6 +16,7 @@
 
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
+#![cfg(target_os = "linux")]
 
 #[macro_use]
 mod macros;

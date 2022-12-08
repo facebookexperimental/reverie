@@ -11,6 +11,7 @@
 
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
+#![cfg(target_os = "linux")]
 #![cfg_attr(feature = "nightly", feature(internal_output_capture))]
 
 mod builder;
