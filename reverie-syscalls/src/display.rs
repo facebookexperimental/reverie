@@ -26,10 +26,10 @@ use nix::sys::timerfd::TimerFlags;
 use nix::sys::wait::WaitPidFlag;
 use nix::unistd::Pid;
 
-use crate::memory::Addr;
-use crate::memory::AddrMut;
-use crate::memory::MemoryAccess;
+use crate::Addr;
+use crate::AddrMut;
 use crate::Errno;
+use crate::MemoryAccess;
 
 /// A wrapper that combines an address space and a syscall. This is useful for
 /// displaying the contents of syscall pointer inputs.

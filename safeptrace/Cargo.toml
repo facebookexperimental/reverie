@@ -14,8 +14,8 @@ lazy_static = "1.4"
 libc = "0.2.137"
 nix = "0.25"
 parking_lot = { version = "0.11.2", features = ["send_guard"] }
+reverie-memory = { version = "0.1.0", path = "../reverie-memory" }
 reverie-process = { version = "0.1.0", path = "../reverie-process" }
-reverie-syscalls = { version = "0.1.0", path = "../reverie-syscalls" }
 syscalls = { version = "0.6.7", features = ["serde"] }
 thiserror = "1.0.36"
 

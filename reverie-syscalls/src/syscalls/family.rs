@@ -17,9 +17,9 @@ use crate::args::ClockId;
 use crate::args::CloneFlags;
 use crate::args::StatPtr;
 use crate::args::Timespec;
-use crate::memory::Addr;
-use crate::memory::AddrMut;
-use crate::memory::MemoryAccess;
+use crate::Addr;
+use crate::AddrMut;
+use crate::MemoryAccess;
 
 /// Represents the `[p]read{64,v,v2}` family of syscalls. All of these syscalls
 /// have an associated file descriptor.

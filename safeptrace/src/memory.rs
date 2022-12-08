@@ -10,12 +10,12 @@ use core::mem;
 use std::io;
 
 use nix::sys::ptrace;
-use reverie_syscalls::Addr;
-use reverie_syscalls::AddrMut;
-use reverie_syscalls::AddrSlice;
-use reverie_syscalls::AddrSliceMut;
-use reverie_syscalls::Errno;
-use reverie_syscalls::MemoryAccess;
+use reverie_memory::Addr;
+use reverie_memory::AddrMut;
+use reverie_memory::AddrSlice;
+use reverie_memory::AddrSliceMut;
+use reverie_memory::MemoryAccess;
+use syscalls::Errno;
 
 use super::Stopped;
 

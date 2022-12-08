@@ -23,17 +23,16 @@ mod macros;
 
 mod args;
 mod display;
-mod memory;
 mod raw;
 mod syscalls;
 
 // Re-export the only things that might be needed from the syscalls crate
+pub use ::reverie_memory::*;
 pub use ::syscalls::Errno;
 pub use ::syscalls::SyscallArgs;
 pub use ::syscalls::Sysno;
 
 pub use crate::args::*;
 pub use crate::display::*;
-pub use crate::memory::*;
 pub use crate::raw::*;
 pub use crate::syscalls::*;

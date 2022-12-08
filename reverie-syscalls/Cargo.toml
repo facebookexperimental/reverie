@@ -13,5 +13,6 @@ derive_more = "0.99.17"
 libc = "0.2.137"
 nix = "0.25"
 paste = "1.0"
+reverie-memory = { version = "0.1.0", path = "../reverie-memory" }
 serde = { version = "1.0.136", features = ["derive", "rc"] }
 syscalls = { version = "0.6.7", features = ["serde"] }

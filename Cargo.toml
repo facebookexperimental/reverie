@@ -2,8 +2,10 @@
 members = [
     "reverie",
     "reverie-examples",
+    "reverie-memory",
     "reverie-process",
     "reverie-ptrace",
     "reverie-syscalls",
     "reverie-util",
+    "safeptrace",
 ]

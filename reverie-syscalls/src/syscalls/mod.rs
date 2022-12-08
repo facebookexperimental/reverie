@@ -43,9 +43,9 @@ use crate::args::TimespecMutPtr;
 use crate::args::TimevalMutPtr;
 use crate::args::Timezone;
 use crate::display::Displayable;
-use crate::memory::Addr;
-use crate::memory::AddrMut;
 use crate::raw::FromToRaw;
+use crate::Addr;
+use crate::AddrMut;
 
 /// A trait that all syscalls implement.
 pub trait SyscallInfo: Displayable + Copy + Send {

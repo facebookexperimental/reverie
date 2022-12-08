@@ -18,8 +18,7 @@ pub use addr::AddrMut;
 pub use addr::AddrSlice;
 pub use addr::AddrSliceMut;
 pub use local::LocalMemory;
-
-use crate::Errno;
+use syscalls::Errno;
 
 /// Trait for accessing potentially remote memory.
 pub trait MemoryAccess {
