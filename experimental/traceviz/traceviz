@@ -1,5 +1,0 @@
-#!/usr/bin/env dotslash
-// @generated SignedSource<<ac6267e8e50955942a1b56c36f9cb0fa>>
-// PackageFBID:6061728443859438
-// CommitHash:b28575c96c38cb29d8f516b756619ad1061d8a5e
-{"name":"traceviz","oncall":"oncall+hermit@xmail.facebook.com","signatures":{"msdk":"<<crypto.managed_sdk.mac:AeXgEdb7hy97owspW_c5yPTKAK_vvjU79pvePTYssLgEuheV>>"},"platforms":{"linux":{"scheme":"everstore","handle":"GICWmAB3aZF97NwCADQGms2YdUgMblMqAAAA","extract":{"path":"./traceviz","decompress":"tar.gz"}}}}
