@@ -26,7 +26,7 @@ impl LocalMemory {
     ///
     /// # Example
     /// ```
-    /// # use reverie_syscalls::LocalMemory;
+    /// # use reverie_memory::LocalMemory;
     /// let memory = LocalMemory::new();
     /// ```
     pub fn new() -> Self {
