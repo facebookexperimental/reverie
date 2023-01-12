@@ -27,7 +27,6 @@ static _Atomic unsigned long* counter;
 int main(int argc, char* argv[]) {
   sigset_t oldset, set;
   pid_t pid;
-  unsigned long c;
   int status;
 
   counter = mmap(
@@ -45,10 +44,10 @@ int main(int argc, char* argv[]) {
     pid = fork();
     // Child
     if (pid == 0) {
-      c = atomic_fetch_add(counter, 1);
+      atomic_fetch_add(counter, 1);
       exit(0);
     } else if (pid > 0) {
-      c = atomic_fetch_add(counter, 1);
+      atomic_fetch_add(counter, 1);
     } else {
       perror("fork: ");
       exit(1);
