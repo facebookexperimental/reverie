@@ -6,7 +6,30 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#![doc = include_str!("../../README.md")]
+//! Reverie is a user space system-call interception framework for Linux. It can
+//! be used to intercept, modify, or elide a syscall before the kernel executes
+//! it.
+//!
+//! Reverie consists of a family of crates:
+//!  - `reverie` (this one): Primarily provides the [`Tool`] trait interface
+//!     that Reverie tools must implement to intercept syscalls.
+//!  - `reverie-ptrace`: The backend that uses ptrace to intercept syscalls.
+//!     This is currently the only non-experimental backend. In the future, we
+//!     may have a backend that uses binary rewriting to intercept syscalls with
+//!     in the guest process.
+//!  - `reverie-syscalls`: Provides typed syscalls, which provide safer and more
+//!     ergonomic access to the arguments of a syscall. Also provides pretty
+//!     printing of syscalls and their arguments.
+//!
+//! The rest of the `reverie-*` crates are used in service to the above crates.
+//!
+//! For examples of usage, please see the [`reverie-examples`][] folder.
+//!
+//! See also [`README.md`][] for a high-level overview of Reverie.
+//!
+//! [`reverie-examples`]: https://github.com/facebookexperimental/reverie/tree/main/reverie-examples
+//! [`README.md`]: https://github.com/facebookexperimental/reverie
+
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 #![cfg(target_os = "linux")]
