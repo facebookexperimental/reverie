@@ -10,7 +10,7 @@ license = "BSD-2-Clause"
 [dependencies]
 anyhow = "1.0.65"
 chrono = { version = "0.4", features = ["clock", "serde", "std"], default-features = false }
-clap = { version = "3.2.17", features = ["derive", "env", "regex", "unicode", "wrap_help"] }
+clap = { version = "3.2.23", features = ["derive", "env", "regex", "unicode", "wrap_help"] }
 reverie = { version = "0.1.0", path = "../reverie" }
 tracing = "0.1.35"
 tracing-appender = "0.2.2"
