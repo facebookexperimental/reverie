@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 use gimli::EndianSlice;
 use gimli::RunTimeEndian as Endian;
-use memmap::Mmap;
+use memmap2::Mmap;
 use object::Object as _;
 use object::ObjectSegment;
 use object::SymbolMapName;
