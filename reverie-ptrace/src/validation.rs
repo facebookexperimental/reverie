@@ -104,18 +104,14 @@ fn init_perf_event_attr(
 
 /// Create a template perf_event_attr for ticks
 fn ticks_attr(precise_ip: bool) -> perf::perf_event_attr {
-    init_perf_event_attr(
-        perf::perf_type_id_PERF_TYPE_RAW,
-        get_rcb_perf_config(),
-        precise_ip,
-    )
+    init_perf_event_attr(perf::PERF_TYPE_RAW, get_rcb_perf_config(), precise_ip)
 }
 
 /// Create a template perf_event_attr for cycles
 fn cycles_attr(precise_ip: bool) -> perf::perf_event_attr {
     init_perf_event_attr(
-        perf::perf_type_id_PERF_TYPE_HARDWARE,
-        perf::perf_hw_id_PERF_COUNT_HW_CPU_CYCLES.into(),
+        perf::PERF_TYPE_HARDWARE,
+        perf::PERF_COUNT_HW_CPU_CYCLES.into(),
         precise_ip,
     )
 }
@@ -163,11 +159,7 @@ fn check_for_ioc_period_bug(precise_ip: bool) -> Result<(), PmuValidationError> 
 
     let mut new_period = 1_u64;
 
-    let _ioctl = ioctl(
-        &bug_fd,
-        perf::perf_event_ioctls_PERIOD.into(),
-        &mut new_period,
-    )?;
+    let _ioctl = ioctl(&bug_fd, perf::PERIOD.into(), &mut new_period)?;
 
     let mut poll_bug_fd = libc::pollfd {
         fd: bug_fd.0,
@@ -396,7 +388,7 @@ fn check_for_zen_speclockmap() -> Result<(), PmuValidationError> {
 
     // 0x25 == RETIRED_LOCK_INSTRUCTIONS - Counts the number of retired locked instructions
     // + 0x08 == SPECLOCKMAPCOMMIT
-    let mut attr = init_perf_event_attr(perf::perf_type_id_PERF_TYPE_RAW, 0x510825, false);
+    let mut attr = init_perf_event_attr(perf::PERF_TYPE_RAW, 0x510825, false);
 
     let fd = start_counter(0, -1, &mut attr, None)?;
 
@@ -434,8 +426,8 @@ fn check_for_kvm_in_txcp_bug() -> Result<(), PmuValidationError> {
     let mut arg = 0_u64;
 
     if !disabled_txcp {
-        ioctl(&fd, perf::perf_event_ioctls_DISABLE.into(), &mut arg)?;
-        ioctl(&fd, perf::perf_event_ioctls_ENABLE.into(), &mut arg)?;
+        ioctl(&fd, perf::DISABLE.into(), &mut arg)?;
+        ioctl(&fd, perf::ENABLE.into(), &mut arg)?;
         do_branches(NUM_BRANCHES);
         count = read_counter(&fd)?;
     }

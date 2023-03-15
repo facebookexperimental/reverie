@@ -95,22 +95,20 @@ pub struct PerfCounter {
 impl Event {
     fn attr_type(self) -> u32 {
         match self {
-            Event::Hardware(_) => perf::perf_type_id_PERF_TYPE_HARDWARE,
-            Event::Software(_) => perf::perf_type_id_PERF_TYPE_SOFTWARE,
-            Event::Raw(_) => perf::perf_type_id_PERF_TYPE_RAW,
+            Event::Hardware(_) => perf::PERF_TYPE_HARDWARE,
+            Event::Software(_) => perf::PERF_TYPE_SOFTWARE,
+            Event::Raw(_) => perf::PERF_TYPE_RAW,
         }
     }
 
     fn attr_config(self) -> u64 {
         match self {
             Event::Raw(x) => x,
-            Event::Hardware(HardwareEvent::Instructions) => {
-                perf::perf_hw_id_PERF_COUNT_HW_INSTRUCTIONS.into()
-            }
+            Event::Hardware(HardwareEvent::Instructions) => perf::PERF_COUNT_HW_INSTRUCTIONS.into(),
             Event::Hardware(HardwareEvent::BranchInstructions) => {
-                perf::perf_hw_id_PERF_COUNT_HW_BRANCH_INSTRUCTIONS.into()
+                perf::PERF_COUNT_HW_BRANCH_INSTRUCTIONS.into()
             }
-            Event::Software(SoftwareEvent::Dummy) => perf::perf_sw_ids_PERF_COUNT_SW_DUMMY.into(),
+            Event::Software(SoftwareEvent::Dummy) => perf::PERF_COUNT_SW_DUMMY.into(),
         }
     }
 }
@@ -301,14 +299,8 @@ impl PerfCounter {
         // This ioctl shouldn't mutate it's argument per its API. But in case it
         // does, create a mutable copy to avoid Rust UB.
         let mut ticks = ticks;
-        Errno::result(unsafe {
-            libc::ioctl(
-                self.fd,
-                perf::perf_event_ioctls_PERIOD as _,
-                &mut ticks as *mut u64,
-            )
-        })
-        .and(Ok(()))
+        Errno::result(unsafe { libc::ioctl(self.fd, perf::PERIOD as _, &mut ticks as *mut u64) })
+            .and(Ok(()))
     }
 
     /// Call the `PERF_EVENT_IOC_ID` ioctl. Returns a unique identifier for this

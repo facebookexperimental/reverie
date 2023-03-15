@@ -20,7 +20,7 @@ libc = "0.2.139"
 nix = "0.25"
 num-traits = "0.2"
 paste = "1.0"
-perf-event-open-sys = "1.0"
+perf-event-open-sys = "4.0"
 procfs = "0.9"
 raw-cpuid = "10.6.0"
 reverie = { version = "0.1.0", path = "../reverie" }
