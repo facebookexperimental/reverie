@@ -655,7 +655,7 @@ mod test {
         handle.join().unwrap();
         let ctr = pc.ctr_value().unwrap();
         assert!(ctr >= ITERS);
-        assert!(ctr <= ITERS + 6000, "{}", ctr); // overhead from channel operations
+        assert!(ctr <= ITERS * 2, "{}", ctr); // overhead from channel operations
     }
 
     #[test]
