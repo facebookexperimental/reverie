@@ -12,8 +12,9 @@
 
 //! A safe ptrace API. This API forces correct usage of ptrace in that it is
 //! not possible to call ptrace on a process not in a stopped state.
+#[cfg(feature = "memory")]
 mod memory;
-#[allow(unused)]
+#[cfg(feature = "notifier")]
 mod notifier;
 mod regs;
 mod waitid;
@@ -473,11 +474,12 @@ impl Stopped {
         self.map_err(Errno::new(err as i32))
     }
 
-    /// Waits for the next exit stop to occur. This is received asynchronously
-    /// regardless of what the process was doing at the time. This is useful for
-    /// canceling futures when a process enters a `PTRACE_EVENT_EXIT` (such as
-    /// when one thread calls `exit_group` and causes all other threads to
-    /// suddenly exit).
+    /// Returns a future that is notified when the next exit stop occurs. This
+    /// is received asynchronously regardless of what the process was doing at
+    /// the time. This is useful for canceling futures when a process enters a
+    /// `PTRACE_EVENT_EXIT` (such as when one thread calls `exit_group` and
+    /// causes all other threads to suddenly exit).
+    #[cfg(feature = "notifier")]
     pub fn exit_event(&self) -> notifier::ExitFuture {
         notifier::ExitFuture(self.0)
     }
@@ -489,7 +491,6 @@ impl Stopped {
     /// pid really is in a stopped state. It is better to arrive at a stopped
     /// state via other methods such as `Running::wait`.
     pub fn new_unchecked(pid: Pid) -> Self {
-        // FIXME: Remove this method.
         Stopped(pid)
     }
 
@@ -860,6 +861,7 @@ impl Running {
     /// Like `wait`, but filters out events we don't care about by resuming the
     /// tracee when encountering them. This is useful for skipping past spurious
     /// events until a point we know the tracee must stop.
+    #[cfg(feature = "notifier")]
     pub async fn wait_until<F>(mut self, mut pred: F) -> Result<Wait, Error>
     where
         F: FnMut(&Event) -> bool,
@@ -882,6 +884,7 @@ impl Running {
 
     /// Waits until we receive a specific stop signal. Useful for skipping past
     /// spurious signals.
+    #[cfg(feature = "notifier")]
     pub async fn wait_for_signal(self, sig: Signal) -> Result<Wait, Error> {
         self.wait_until(|event| event == &Event::Signal(sig)).await
     }
@@ -891,11 +894,18 @@ impl Running {
     /// canceling futures when a process enters a `PTRACE_EVENT_EXIT` (such as
     /// when one thread calls `exit_group` and causes all other threads to
     /// suddenly exit).
+    #[cfg(feature = "notifier")]
     pub fn exit_event(&self) -> notifier::ExitFuture {
         notifier::ExitFuture(self.0)
     }
 
     /// Like `wait`, but wait asynchronously for the next state change.
+    ///
+    /// NOTE: This call should not be mixed with [`Running::wait`]!! Once
+    /// [`Running::next_state`] is called once, [`Running::wait`] should never
+    /// be called again for that PID. This is because a notifier thread takes
+    /// over and calls `wait` in a continuous loop.
+    #[cfg(feature = "notifier")]
     pub async fn next_state(self) -> Result<Wait, Error> {
         notifier::WaitFuture(self).await
     }
@@ -918,6 +928,7 @@ impl Zombie {
     }
 
     /// Reaps the zombie by waiting for it to fully exit.
+    #[cfg(feature = "notifier")]
     pub async fn reap(self) -> ExitStatus {
         // The tracee may not be fully dead yet. It is still possible for it to
         // still enter an `Event::Exit` state by waiting on it. For more info,
@@ -1260,6 +1271,7 @@ mod test {
         Ok(())
     }
 
+    #[cfg(feature = "notifier")]
     #[cfg(not(sanitized))]
     #[tokio::test]
     async fn notifier_basic() -> Result<(), Box<dyn std::error::Error + 'static>> {
