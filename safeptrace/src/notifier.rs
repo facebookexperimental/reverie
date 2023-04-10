@@ -65,7 +65,6 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::AtomicI32;
@@ -83,14 +82,12 @@ use nix::sys::wait::WaitPidFlag;
 use nix::sys::wait::WaitStatus;
 use parking_lot::Mutex;
 
-use super::peek_all;
 use super::waitid;
 use super::Errno;
 use super::Error;
 use super::Pid;
 use super::Running;
 use super::Stopped;
-use super::TryWait;
 use super::Wait;
 
 lazy_static! {
