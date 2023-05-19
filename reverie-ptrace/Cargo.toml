@@ -34,4 +34,4 @@ tracing-subscriber = { version = "0.3.17", features = ["ansi", "env-filter", "fm
 unwind = { version = "0.4", features = ["ptrace"] }
 
 [dev-dependencies]
-test-case = "1.2"
+test-case = "3.1"
