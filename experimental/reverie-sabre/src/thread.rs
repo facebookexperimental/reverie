@@ -603,11 +603,11 @@ mod tests {
 
     use super::*;
 
-    lazy_static! {
-        /// Each of these unit tests is mutating the global slotmap, so they
-        /// can't interfere with each other
-        static ref UNIT_TEST_LOCK: Mutex<()> = Mutex::new(());
+    /// Each of these unit tests is mutating the global slotmap, so they
+    /// can't interfere with each other
+    static UNIT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    lazy_static! {
         /// Keep track of the process and thread ids raised in start and exit
         /// events
         static ref THREADS_STARTED: Mutex<HashSet<PidTid>> = Mutex::new(HashSet::default());
