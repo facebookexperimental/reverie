@@ -8,7 +8,7 @@ edition = "2021"
 license = "BSD-2-Clause"
 
 [dependencies]
-async-trait = "0.1.58"
+async-trait = "0.1.71"
 bincode = "1.3.3"
 reverie-rpc-macros = { version = "0.1.0", path = "../reverie-rpc-macros" }
 serde = { version = "1.0.167", features = ["derive", "rc"] }
