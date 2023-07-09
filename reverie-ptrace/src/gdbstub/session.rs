@@ -733,12 +733,12 @@ impl Session {
                 },
                 reply_tx,
             );
-            let _ = request_tx
+            request_tx
                 .send(request)
                 .await
                 .map_err(|_| Error::GdbRequestSendError)?;
-            let reply = reply_rx.await.map_err(|_| Error::GdbRequestRecvError)??;
-            Ok(reply)
+            reply_rx.await.map_err(|_| Error::GdbRequestRecvError)??;
+            Ok(())
         })
         .await
     }
@@ -762,9 +762,9 @@ impl Session {
                 .send(request)
                 .await
                 .map_err(|_| Error::GdbRequestSendError)?;
-            let reply = reply_rx.await.map_err(|_| Error::GdbRequestRecvError)??;
+            reply_rx.await.map_err(|_| Error::GdbRequestRecvError)??;
 
-            Ok(reply)
+            Ok(())
         })
         .await
     }
@@ -777,7 +777,7 @@ impl Session {
                 .ok_or(Error::SessionNotStarted)?;
             let (reply_tx, reply_rx) = oneshot::channel();
             let request = GdbRequest::ReadInferiorMemory(addr, size, reply_tx);
-            let _ = request_tx
+            request_tx
                 .send(request)
                 .await
                 .map_err(|_| Error::GdbRequestSendError)?;
@@ -801,12 +801,12 @@ impl Session {
                 .ok_or(Error::SessionNotStarted)?;
             let (reply_tx, reply_rx) = oneshot::channel();
             let request = GdbRequest::WriteInferiorMemory(addr, size, data, reply_tx);
-            let _ = request_tx
+            request_tx
                 .send(request)
                 .await
                 .map_err(|_| Error::GdbRequestSendError)?;
-            let reply = reply_rx.await.map_err(|_| Error::GdbRequestRecvError)??;
-            Ok(reply)
+            reply_rx.await.map_err(|_| Error::GdbRequestRecvError)??;
+            Ok(())
         })
         .await
     }
@@ -819,7 +819,7 @@ impl Session {
                 .ok_or(Error::SessionNotStarted)?;
             let (reply_tx, reply_rx) = oneshot::channel();
             let request = GdbRequest::ReadRegisters(reply_tx);
-            let _ = request_tx
+            request_tx
                 .send(request)
                 .await
                 .map_err(|_| Error::GdbRequestSendError)?;
@@ -840,12 +840,12 @@ impl Session {
             let core_regs: CoreRegs =
                 bincode::deserialize(regs).map_err(|_| CommandParseError::MalformedRegisters)?;
             let request = GdbRequest::WriteRegisters(core_regs, reply_tx);
-            let _ = request_tx
+            request_tx
                 .send(request)
                 .await
                 .map_err(|_| Error::GdbRequestSendError)?;
-            let reply = reply_rx.await.map_err(|_| Error::GdbRequestRecvError)??;
-            Ok(reply)
+            reply_rx.await.map_err(|_| Error::GdbRequestRecvError)??;
+            Ok(())
         })
         .await
     }

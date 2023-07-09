@@ -254,7 +254,7 @@ impl GdbServerImpl {
         // could get timeout. Some requests such as `g' needs IPC with a
         // gdb session, which only becomes ready later.
         if let Some(server_rx) = self.server_rx.take() {
-            let _ = server_rx.await.map_err(|_| Error::GdbServerNotStarted)?;
+            server_rx.await.map_err(|_| Error::GdbServerNotStarted)?;
             let mut session = self.session.take().ok_or(Error::SessionNotStarted)?;
             let run_session = session.run();
             let run_loop = self.relay_gdb_packets();

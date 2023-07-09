@@ -94,21 +94,21 @@ impl FromToRaw for i64 {
 
 impl<'a, T> FromToRaw for Option<Addr<'a, T>> {
     fn from_raw(raw: usize) -> Self {
-        Addr::from_raw(raw as usize)
+        Addr::from_raw(raw)
     }
 
     fn into_raw(self) -> usize {
-        self.map_or(0, |addr| addr.as_raw() as usize)
+        self.map_or(0, |addr| addr.as_raw())
     }
 }
 
 impl<'a, T> FromToRaw for Option<AddrMut<'a, T>> {
     fn from_raw(raw: usize) -> Self {
-        AddrMut::from_raw(raw as usize)
+        AddrMut::from_raw(raw)
     }
 
     fn into_raw(self) -> usize {
-        self.map_or(0, |addr| addr.as_raw() as usize)
+        self.map_or(0, |addr| addr.as_raw())
     }
 }
 
@@ -176,7 +176,7 @@ where
     T: FromToRaw,
 {
     fn from_raw(raw: usize) -> Self {
-        Errno::from_ret(raw).map(|x| T::from_raw(x as usize))
+        Errno::from_ret(raw).map(|x| T::from_raw(x))
     }
 
     fn into_raw(self) -> usize {

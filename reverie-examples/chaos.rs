@@ -123,17 +123,17 @@ impl Tool for ChaosTool {
                     *guest.thread_state_mut() = true;
 
                     // XXX: inject a signal like SIGINT?
-                    let ret = Err(Errno::ERESTARTSYS);
+                    let err = Errno::ERESTARTSYS;
 
                     eprintln!(
                         "[pid={}, n={}] {} = {}",
                         guest.pid(),
                         count,
                         syscall.display(&memory),
-                        ret.unwrap_or_else(|errno| -errno.into_raw() as i64)
+                        -err.into_raw() as i64
                     );
 
-                    return Ok(ret?);
+                    return Ok(Err(err)?);
                 } else if !config.no_read {
                     // Reduce read length to 1 byte at most.
                     Syscall::Read(read.with_len(1.min(read.len())))

@@ -139,7 +139,6 @@ impl Tool for CounterLocal {
     ) -> Result<(), Error> {
         let count = self.proc_syscalls.load(Ordering::SeqCst);
         let threads = self.exited_threads.load(Ordering::SeqCst);
-        drop(self);
         debug!(
             "At ExitProc (pid {}), contributing {} to global count.",
             pid, count

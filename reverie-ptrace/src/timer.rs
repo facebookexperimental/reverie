@@ -355,10 +355,20 @@ impl ActiveEvent {
             ActiveEvent::Precise {
                 clock_target,
                 offset: _,
-            } => (clock_target.saturating_sub(curr_clock) > MAX_SINGLE_STEP_COUNT)
-                .then(|| TimerEventRequest::Precise(*clock_target - curr_clock)),
-            ActiveEvent::Imprecise { clock_min } => (*clock_min > curr_clock)
-                .then(|| TimerEventRequest::Imprecise(*clock_min - curr_clock)),
+            } => {
+                if clock_target.saturating_sub(curr_clock) > MAX_SINGLE_STEP_COUNT {
+                    Some(TimerEventRequest::Precise(*clock_target - curr_clock))
+                } else {
+                    None
+                }
+            }
+            ActiveEvent::Imprecise { clock_min } => {
+                if *clock_min > curr_clock {
+                    Some(TimerEventRequest::Imprecise(*clock_min - curr_clock))
+                } else {
+                    None
+                }
+            }
         }
     }
 }

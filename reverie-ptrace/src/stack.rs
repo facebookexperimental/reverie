@@ -52,7 +52,7 @@ impl GuestStack {
         }
         let task = Stopped::new_unchecked(pid);
         let rsp = task.getregs()?.stack_ptr() as usize;
-        let top = rsp - REDZONE_SIZE as usize;
+        let top = rsp - REDZONE_SIZE;
         Ok(GuestStack {
             top,
             sp: top,
@@ -106,7 +106,7 @@ impl Stack for GuestStack {
     type StackGuard = StackGuard;
 
     fn size(&self) -> usize {
-        (self.top - self.sp) as usize
+        self.top - self.sp
     }
     fn capacity(&self) -> usize {
         self.capacity
