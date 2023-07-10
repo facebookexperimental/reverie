@@ -1005,7 +1005,7 @@ typed_syscall! {
     }
 }
 
-#[cfg(any(target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 typed_syscall! {
     pub struct Clone {
         flags: CloneFlags,

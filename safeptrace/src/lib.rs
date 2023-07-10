@@ -242,7 +242,7 @@ impl TryWait {
     pub fn assume_stopped(self) -> (Stopped, Event) {
         match self {
             Self::Wait(Wait::Stopped(stopped, event)) => (stopped, event),
-            status => Err(InvalidState(status)).unwrap(),
+            status => panic!("{:?}", InvalidState(status)),
         }
     }
 
@@ -250,7 +250,7 @@ impl TryWait {
     pub fn assume_running(self) -> Running {
         match self {
             Self::Running(running) => running,
-            status => Err(InvalidState(status)).unwrap(),
+            status => panic!("{:?}", InvalidState(status)),
         }
     }
 
@@ -258,7 +258,7 @@ impl TryWait {
     pub fn assume_exited(self) -> (Pid, ExitStatus) {
         match self {
             Self::Wait(Wait::Exited(pid, exit_status)) => (pid, exit_status),
-            status => Err(InvalidState(status)).unwrap(),
+            status => panic!("{:?}", InvalidState(status)),
         }
     }
 }
@@ -314,7 +314,7 @@ impl Wait {
     pub fn assume_stopped(self) -> (Stopped, Event) {
         match self {
             Self::Stopped(stopped, event) => (stopped, event),
-            state => Err(InvalidState(state.into())).unwrap(),
+            state => panic!("{:?}", InvalidState(state.into())),
         }
     }
 
@@ -322,7 +322,7 @@ impl Wait {
     pub fn assume_exited(self) -> (Pid, ExitStatus) {
         match self {
             Self::Exited(pid, exit_status) => (pid, exit_status),
-            state => Err(InvalidState(state.into())).unwrap(),
+            state => panic!("{:?}", InvalidState(state.into())),
         }
     }
 

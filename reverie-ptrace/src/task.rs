@@ -656,7 +656,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             // NOTE: This point in the code assumes that a specific instruction
             // sequence "SYSCALL; INT3", has been patched into the guest, and
             // that RIP points to the syscall.
-            let mut regs = saved_regs.clone();
+            let mut regs = *saved_regs;
 
             let page_addr = cp::PRIVATE_PAGE_OFFSET;
 
@@ -710,7 +710,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                 page_addr
             );
 
-            cp::populate_mmap_page(task.pid().into(), page_addr).map_err(|err| err)?;
+            cp::populate_mmap_page(task.pid().into(), page_addr)?;
 
             // Restore our saved registers, including our instruction pointer.
             task.setregs(saved_regs)?;
@@ -1070,7 +1070,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             // loaded (due to execve). Otherwise gdb may try to manipulate
             // old process' address space.
             if let Some(attach_tx) = self.gdb_stop_tx.as_ref() {
-                let _ = attach_tx.send(stopped).await.unwrap();
+                attach_tx.send(stopped).await.unwrap();
             }
             let running = self
                 .await_gdb_resume(task, ExpectedGdbResume::Resume)
@@ -1252,9 +1252,8 @@ impl<L: Tool + 'static> TracedTask<L> {
             // NB: We could potentially hit a breakpoint after above resume,
             // make sure we don't miss the breakpoint and await for gdb
             // resume (once again). This is possible because result of
-            // handle_new_task in from_task_state is ignored, while it could
-            // be a valid state like SIGTRAP, which could be a breakpoint is
-            // hit.
+            // handle_new_task in status_to_result is ignored, while it could be
+            // a valid state like SIGTRAP, which could be a breakpoint is hit.
             running
                 .next_state()
                 .and_then(|wait| self.check_swbreak(wait))
@@ -1265,7 +1264,7 @@ impl<L: Tool + 'static> TracedTask<L> {
     }
 
     async fn handle_vfork_done_event(&mut self, stopped: Stopped) -> Result<Wait, TraceError> {
-        Ok(stopped.resume(None)?.next_state().await?)
+        stopped.resume(None)?.next_state().await
     }
 
     async fn handle_exit_event(task: Stopped) -> Result<ExitStatus, TraceError> {
@@ -1601,7 +1600,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         let wait = task.step(None)?.next_state().await?;
 
         // Get the result of the syscall to return to the caller.
-        self.from_task_state(wait, Some(oldregs)).await
+        self.status_to_result(wait, Some(oldregs)).await
     }
 
     // Helper function
@@ -1616,7 +1615,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         self.untraced_syscall(task, nr, args).await
     }
 
-    async fn from_task_state(
+    async fn status_to_result(
         &mut self,
         wait_status: Wait,
         context: Option<libc::user_regs_struct>,
@@ -1696,7 +1695,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             // If we're reinjecting the same syscall with the same arguments,
             // then we can just let the tracee continue and stop at sysexit.
             let wait = task.syscall(None)?.next_state().await?;
-            self.from_task_state(wait, None).await
+            self.status_to_result(wait, None).await
         } else {
             self.private_inject(task, nr, args).await
         }
@@ -1760,7 +1759,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                 request_tx: request_tx.unwrap(),
                 resume_tx: resume_tx.unwrap(),
             };
-            let _ = stop_tx.send(stop).await.unwrap();
+            stop_tx.send(stop).await.unwrap();
         }
         Ok(())
     }
@@ -1884,7 +1883,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         // a different task, need to notify this task is fully stopped.
         self.suspended.store(true, Ordering::SeqCst);
         if let Some((suspended_flag, stop_tx)) = self.get_stop_tx().await {
-            let _ = stop_tx
+            stop_tx
                 .send((
                     self.tid(),
                     Suspended {

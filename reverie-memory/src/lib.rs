@@ -151,10 +151,7 @@ pub trait MemoryAccess {
         T: Sized,
     {
         let buf = unsafe {
-            ::core::slice::from_raw_parts_mut(
-                buf.as_mut_ptr() as *mut u8,
-                buf.len() * mem::size_of::<T>(),
-            )
+            ::core::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, mem::size_of_val(buf))
         };
 
         self.read_exact(addr.cast::<u8>(), buf)
@@ -167,10 +164,7 @@ pub trait MemoryAccess {
         T: Sized,
     {
         let buf = unsafe {
-            ::core::slice::from_raw_parts(
-                buf.as_ptr() as *const u8,
-                buf.len() * mem::size_of::<T>(),
-            )
+            ::core::slice::from_raw_parts(buf.as_ptr() as *const u8, mem::size_of_val(buf))
         };
 
         self.write_exact(addr.cast::<u8>(), buf)

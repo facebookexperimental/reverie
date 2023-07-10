@@ -278,7 +278,7 @@ impl From<Backtrace> for Vec<Frame> {
 impl fmt::Display for Backtrace {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let thread_name = self.thread_name();
-        let thread_name = thread_name.as_ref().map(String::as_str);
+        let thread_name = thread_name.as_deref();
         let thread_name = thread_name.unwrap_or("<unknown name>");
         writeln!(
             f,
@@ -298,7 +298,7 @@ impl fmt::Display for Backtrace {
 impl fmt::Display for PrettyBacktrace {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let thread_name = self.thread_name();
-        let thread_name = thread_name.as_ref().map(String::as_str);
+        let thread_name = thread_name.as_deref();
         let thread_name = thread_name.unwrap_or("<unknown name>");
         writeln!(
             f,

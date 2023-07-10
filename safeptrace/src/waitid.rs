@@ -42,7 +42,7 @@ fn si_status_signal(info: &libc::siginfo_t) -> Signal {
 
 #[inline]
 fn si_status_event(info: &libc::siginfo_t) -> i32 {
-    (unsafe { info.si_status() } >> 8) as i32
+    (unsafe { info.si_status() }) >> 8
 }
 
 /// Returns the raw siginfo from a waitid call.
@@ -70,6 +70,7 @@ fn waitid_si(waitid_type: IdType, flags: WaitPidFlag) -> Result<libc::siginfo_t,
 }
 
 /// `waitpid` implemented with `waitid`. `waitid` has fewer limitations than `waitpid`.
+#[cfg(feature = "notifier")]
 pub fn waitpid(pid: Pid, flags: WaitPidFlag) -> Result<Option<i32>, Errno> {
     let si = waitid_si(IdType::Pid(pid), flags)?;
 
@@ -82,6 +83,7 @@ pub fn waitpid(pid: Pid, flags: WaitPidFlag) -> Result<Option<i32>, Errno> {
 }
 
 // Converts a siginfo to a more compact status code.
+#[cfg(feature = "notifier")]
 fn siginfo_to_status(si: libc::siginfo_t) -> i32 {
     let si_status = unsafe { si.si_status() };
 

@@ -44,7 +44,7 @@ impl From<FileStat> for HostioStat {
             st_dev: stat.st_dev as u32,
             st_ino: stat.st_ino as u32,
             st_nlink: stat.st_nlink as u32,
-            st_mode: stat.st_mode as u32,
+            st_mode: stat.st_mode,
             st_uid: stat.st_uid,
             st_gid: stat.st_gid,
             st_rdev: stat.st_rdev as u32,

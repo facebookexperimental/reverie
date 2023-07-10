@@ -11,17 +11,17 @@
 /// Trait providing reusable display formatting for registers
 pub trait RegDisplay {
     /// Returns a display object associated with a trait implementor
-    fn display<'a>(&'a self) -> Display<'a> {
+    fn display(&self) -> Display<'_> {
         self.display_with_options(Default::default())
     }
 
     /// Return a display object associated with a trait implementor.
     /// Additionally specifis ['RegDisplayOptions'] structure to adjust formatting
-    fn display_with_options<'a>(&'a self, options: RegDisplayOptions) -> Display<'a>;
+    fn display_with_options(&self, options: RegDisplayOptions) -> Display<'_>;
 }
 
 impl RegDisplay for libc::user_regs_struct {
-    fn display_with_options<'a>(&'a self, options: RegDisplayOptions) -> Display<'a> {
+    fn display_with_options(&self, options: RegDisplayOptions) -> Display<'_> {
         Display {
             options,
             regs: self,

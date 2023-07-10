@@ -287,7 +287,7 @@ impl<'a> StatPtr<'a> {
     /// Creates the `StatPtr` from a raw pointer. Returns `None` if the given
     /// pointer is NULL.
     pub fn from_ptr(r: *const libc::stat) -> Option<Self> {
-        AddrMut::from_ptr(r as *const libc::stat).map(StatPtr)
+        AddrMut::from_ptr(r).map(StatPtr)
     }
 }
 
@@ -351,7 +351,7 @@ impl<'a> StatxPtr<'a> {
     /// Creates the `StatxPtr` from a raw pointer. Returns `None` if the given
     /// pointer is NULL.
     pub fn from_ptr(r: *const libc::statx) -> Option<Self> {
-        AddrMut::from_ptr(r as *const libc::statx).map(StatxPtr)
+        AddrMut::from_ptr(r).map(StatxPtr)
     }
 }
 
