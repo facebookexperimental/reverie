@@ -20,5 +20,5 @@ parking_lot = { version = "0.12.1", features = ["send_guard"] }
 reverie-rpc = { version = "0.1.0", path = "../reverie-rpc" }
 reverie-sabre-macros = { version = "0.1.0", path = "../reverie-sabre-macros" }
 reverie-syscalls = { version = "0.1.0", path = "../../reverie-syscalls" }
-serde = { version = "1.0.167", features = ["derive", "rc"] }
+serde = { version = "1.0.176", features = ["derive", "rc"] }
 syscalls = { version = "0.6.7", features = ["serde"] }
