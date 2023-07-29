@@ -289,7 +289,7 @@ mod tests {
 
     #[inline(always)]
     unsafe fn syscall_no_branches(no: Sysno, arg1: libc::c_long) {
-        syscalls::syscall!(no, arg1, 0, 0, 0, 0, 0);
+        syscalls::raw_syscall!(no, arg1, 0, 0, 0, 0, 0);
     }
 
     fn sched_precise() {
