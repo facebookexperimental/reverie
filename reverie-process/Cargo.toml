@@ -14,7 +14,7 @@ colored = "1.9"
 futures = { version = "0.3.28", features = ["async-await", "compat"] }
 libc = "0.2.139"
 nix = "0.25"
-serde = { version = "1.0.176", features = ["derive", "rc"] }
+serde = { version = "1.0.185", features = ["derive", "rc"] }
 syscalls = { version = "0.6.7", features = ["serde"] }
 thiserror = "1.0.43"
 tokio = { version = "1.29.1", features = ["full", "test-util", "tracing"] }
