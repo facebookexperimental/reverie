@@ -292,9 +292,9 @@ impl Mount {
             // a different tmpfs.
             if let Some(src) = &self.source {
                 if FileType::new(src.as_ptr())?.is_dir() {
-                    create_dir_all(&mut self.target, 0o777)?;
+                    create_dir_all(&self.target, 0o777)?;
                 } else {
-                    touch_path(&mut self.target, 0o666, 0o777)?;
+                    touch_path(&self.target, 0o666, 0o777)?;
                 }
             }
         }
