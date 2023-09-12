@@ -21,41 +21,56 @@ use reverie::Guest;
 use reverie::Tool;
 use tracing::debug;
 
+#[repr(align(64))]
+struct BufferAligned<const N: usize>([u8; N]);
+
 // Byte code for the new pseudo vdso functions which do the actual syscalls.
 // Note: the byte code must be 8 bytes aligned
 #[cfg(target_arch = "x86_64")]
 mod vdso_syms {
     #![allow(non_upper_case_globals)]
 
-    pub const time: &[u8; 8] = &[
+    use crate::vdso::BufferAligned;
+
+    const time_code: BufferAligned<8> = BufferAligned::<8>([
         0xb8, 0xc9, 0x00, 0x00, 0x00, // mov %SYS_time, %eax
         0x0f, 0x05, // syscall
         0xc3, // retq
-    ];
+    ]);
 
-    pub const clock_gettime: &[u8; 8] = &[
+    pub const time: &[u8; 8] = &time_code.0;
+
+    const clock_gettime_code: BufferAligned<8> = BufferAligned::<8>([
         0xb8, 0xe4, 0x00, 0x00, 0x00, // mov SYS_clock_gettime, %eax
         0x0f, 0x05, // syscall
         0xc3, // retq
-    ];
+    ]);
 
-    pub const getcpu: &[u8; 8] = &[
+    pub const clock_gettime: &[u8; 8] = &clock_gettime_code.0;
+
+    const getcpu_code: BufferAligned<8> = BufferAligned::<8>([
         0xb8, 0x35, 0x01, 0x00, 0x00, // mov SYS_getcpu, %eax
         0x0f, 0x05, // syscall
         0xc3, // retq
-    ];
+    ]);
 
-    pub const gettimeofday: &[u8; 8] = &[
+    pub const getcpu: &[u8; 8] = &getcpu_code.0;
+
+    const gettimeofday_code: BufferAligned<8> = BufferAligned::<8>([
         0xb8, 0x60, 0x00, 0x00, 0x00, // mov SYS_gettimeofday, %eax
         0x0f, 0x05, // syscall
         0xc3, // retq
-    ];
+    ]);
 
-    pub const clock_getres: &[u8; 8] = &[
+    pub const gettimeofday: &[u8; 8] = &gettimeofday_code.0;
+
+    const clock_getres_code: BufferAligned<8> = BufferAligned::<8>([
         0xb8, 0xe5, 0x00, 0x00, 0x00, // mov SYS_clock_getres, %eax
         0x0f, 0x05, // syscall
         0xc3, // retq
-    ];
+    ]);
+
+    pub const clock_getres: &[u8; 8] = &clock_getres_code.0;
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -87,26 +102,34 @@ mod vdso_syms {
     //    See also
     //    https://developer.arm.com/documentation/ddi0596/2021-06/Base-Instructions/BTI--Branch-Target-Identification-
 
-    pub const clock_getres: &[u8; 16] = &[
+    use crate::vdso::BufferAligned;
+
+    const clock_getres_code: BufferAligned<16> = BufferAligned::<16>([
         0x5f, 0x24, 0x03, 0xd5, // bti c
         0x48, 0x0e, 0x80, 0xd2, // mov x8, 114 (#__NR_clock_getres)
         0x01, 0x00, 0x00, 0xd4, // svc 0
         0xc0, 0x03, 0x5f, 0xd6, // ret
-    ];
+    ]);
 
-    pub const clock_gettime: &[u8; 16] = &[
+    pub const clock_getres: &[u8; 16] = &clock_getres_code.0;
+
+    const clock_gettime_code: BufferAligned<16> = BufferAligned::<16>([
         0x5f, 0x24, 0x03, 0xd5, // bti c
         0x28, 0x0e, 0x80, 0xd2, // mov x8, 113 (#__NR_clock_gettime)
         0x01, 0x00, 0x00, 0xd4, // svc 0
         0xc0, 0x03, 0x5f, 0xd6, // ret
-    ];
+    ]);
 
-    pub const gettimeofday: &[u8; 16] = &[
+    pub const clock_gettime: &[u8; 16] = &clock_gettime_code.0;
+
+    const gettimeofday_code: BufferAligned<16> = BufferAligned::<16>([
         0x5f, 0x24, 0x03, 0xd5, // bti c
         0x28, 0x15, 0x80, 0xd2, // mov x8, 169 (#__NR_gettimeofday)
         0x01, 0x00, 0x00, 0xd4, // svc 0
         0xc0, 0x03, 0x5f, 0xd6, // ret
-    ];
+    ]);
+
+    pub const gettimeofday: &[u8; 16] = &gettimeofday_code.0;
 
     // On aarch64, the vdso version of rt_sigreturn is only 8 bytes, so our
     // patch can't exceed that size. However, since this syscall doesn't return,
@@ -115,10 +138,12 @@ mod vdso_syms {
     // NOTE: This is currently *exactly* how the kernel implements the
     // rt_sigreturn vdso, so we could probably get away with not even patching
     // it. See also `linux/arch/arm64/kernel/vdso/sigreturn.S`.
-    pub const rt_sigreturn: &[u8; 8] = &[
+    const rt_sigreturn_code: BufferAligned<8> = BufferAligned::<8>([
         0x68, 0x11, 0x80, 0xd2, // mov x8, 139 (#__NR_rt_sigreturn)
         0x01, 0x00, 0x00, 0xd4, // svc 0
-    ];
+    ]);
+
+    pub const rt_sigreturn: &[u8; 8] = &rt_sigreturn_code.0;
 }
 
 #[cfg(target_arch = "x86_64")]
