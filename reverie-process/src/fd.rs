@@ -10,7 +10,6 @@ use core::pin::Pin;
 use core::task::Context;
 use core::task::Poll;
 use std::ffi::CStr;
-use std::ffi::CString;
 use std::io;
 use std::io::Read;
 use std::io::Write;
@@ -378,20 +377,37 @@ pub fn is_dir(path: *const libc::c_char) -> bool {
     }
 }
 
-fn cstring_as_slice(s: &mut CString) -> &mut [libc::c_char] {
-    let bytes = s.as_bytes_with_nul();
-    unsafe {
-        // This is safe because we are already provided a mutable `CString` and
-        // we don't alias the two mutable references.
-        core::slice::from_raw_parts_mut(bytes.as_ptr() as *mut libc::c_char, bytes.len())
+/// Copies the bytes of a `CStr` to a buffer. Helpful to avoid allocations when
+/// performing path operations in a child process that hasn't called `execve`
+/// yet.
+fn copy_cstr_to_slice<'a>(
+    s: &CStr,
+    buf: &'a mut [libc::c_char],
+) -> Result<&'a mut [libc::c_char], Errno> {
+    let bytes = s.to_bytes_with_nul();
+
+    if bytes.len() > buf.len() {
+        return Err(Errno::ENAMETOOLONG);
     }
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            bytes.as_ptr() as *const libc::c_char,
+            buf.as_mut_ptr(),
+            bytes.len(),
+        )
+    };
+
+    Ok(&mut buf[0..bytes.len()])
 }
 
 /// Creates every path component in `path` without allocating. This is done by
-/// replacing each `/` with a NUL terminator as needed (and then changing the
-/// `\0` back to `/` afterwards).
-pub fn create_dir_all(path: &mut CString, mode: libc::mode_t) -> Result<(), Errno> {
-    create_dir_all_(cstring_as_slice(path), mode)
+/// copying the path to a static buffer and replacing each `/` with a NUL
+/// terminator as needed (and then changing the `\0` back to `/` afterwards).
+pub fn create_dir_all(path: &CStr, mode: libc::mode_t) -> Result<(), Errno> {
+    let mut buf = ['\0' as libc::c_char; libc::PATH_MAX as usize];
+    let path = copy_cstr_to_slice(path, &mut buf)?;
+    create_dir_all_(path, mode)
 }
 
 /// Helper function. The last character in the path is always `\0`.
@@ -431,11 +447,13 @@ fn create_dir_all_(path: &mut [libc::c_char], mode: libc::mode_t) -> Result<(), 
 
 /// Creates an empty file at `path` without allocating.
 pub fn touch_path(
-    path: &mut CString,
+    path: &CStr,
     file_mode: libc::mode_t,
     dir_mode: libc::mode_t,
 ) -> Result<(), Errno> {
-    touch_path_(cstring_as_slice(path), file_mode, dir_mode)
+    let mut buf = ['\0' as libc::c_char; libc::PATH_MAX as usize];
+    let path = copy_cstr_to_slice(path, &mut buf)?;
+    touch_path_(path, file_mode, dir_mode)
 }
 
 /// Helper function. The last character in the path is always `\0`.
@@ -493,11 +511,29 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
     use const_cstr::const_cstr;
 
     use super::*;
+
+    #[test]
+    fn test_copy_cstr_to_slice() {
+        const BYTES: &[u8] = b"/foo/bar\0";
+        let s = CStr::from_bytes_with_nul(BYTES).unwrap();
+
+        // Buffer exactly the right size.
+        let mut buf = [0; BYTES.len()];
+        assert_eq!(
+            copy_cstr_to_slice(s, &mut buf).unwrap().len(),
+            s.to_bytes_with_nul().len()
+        );
+
+        // Buffer too small to hold last NUL byte.
+        let mut buf = [0; BYTES.len() - 1];
+        assert_eq!(copy_cstr_to_slice(s, &mut buf), Err(Errno::ENAMETOOLONG));
+    }
 
     #[test]
     fn test_is_dir() {
@@ -524,7 +560,7 @@ mod tests {
     #[test]
     fn test_create_dir_all() {
         let tempdir = tempfile::TempDir::new().unwrap();
-        let mut path = CString::new(
+        let path = CString::new(
             tempdir
                 .path()
                 .join("some/path/to/a/dir")
@@ -532,11 +568,8 @@ mod tests {
                 .as_bytes(),
         )
         .unwrap();
-        let path2 = path.clone();
 
-        create_dir_all(&mut path, 0o777).unwrap();
-
-        assert_eq!(path, path2);
+        create_dir_all(&path, 0o777).unwrap();
 
         assert!(is_dir(path.as_ptr()));
     }
@@ -544,7 +577,7 @@ mod tests {
     #[test]
     fn test_touch_path() {
         let tempdir = tempfile::TempDir::new().unwrap();
-        let mut path = CString::new(
+        let path = CString::new(
             tempdir
                 .path()
                 .join("some/path/to/a/file")
@@ -552,11 +585,8 @@ mod tests {
                 .as_bytes(),
         )
         .unwrap();
-        let path2 = path.clone();
 
-        touch_path(&mut path, 0o666, 0o777).unwrap();
-
-        assert_eq!(path, path2);
+        touch_path(&path, 0o666, 0o777).unwrap();
 
         assert!(FileType::new(path.as_ptr()).unwrap().is_file());
     }

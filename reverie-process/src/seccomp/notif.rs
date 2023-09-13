@@ -283,7 +283,7 @@ impl futures::stream::Stream for SeccompNotif {
 /// currently pending, the operation blocks until an event occurs.
 ///
 /// NOTE: This is only available since Linux 5.0.
-fn seccomp_notif_recv(fd: &mut Fd) -> io::Result<seccomp_notif> {
+fn seccomp_notif_recv(fd: &Fd) -> io::Result<seccomp_notif> {
     // According to the docs, this struct must be zeroed out first.
     let mut response = core::mem::MaybeUninit::<seccomp_notif>::zeroed();
 

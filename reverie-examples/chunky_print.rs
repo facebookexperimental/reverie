@@ -74,7 +74,7 @@ impl GlobalTool for ChunkyPrintGlobal {
         let mut mg = self.0.lock().unwrap();
         match m {
             Msg::Print(w, s) => {
-                let v = mg.printbuf.entry(from).or_insert_with(Vec::new);
+                let v = mg.printbuf.entry(from).or_default();
                 v.push((w, s));
             }
             Msg::Tick => {

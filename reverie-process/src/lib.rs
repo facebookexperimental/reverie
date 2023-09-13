@@ -227,9 +227,7 @@ mod tests {
             .trim_end()
             .split('\n')
             .map(|line| {
-                let mut items = line.splitn(2, ':');
-                let first = items.next().unwrap();
-                let second = items.next().unwrap();
+                let (first, second) = line.split_once(':').unwrap();
                 (first, second.trim())
             })
             .collect()
@@ -655,6 +653,7 @@ mod tests {
             .arg("/proc/self/status")
             .seccomp(filter)
             .seccomp_notify()
+            .stdout(Stdio::null())
             .spawn()
             .unwrap();
 
