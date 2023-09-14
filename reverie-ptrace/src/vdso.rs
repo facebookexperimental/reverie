@@ -221,7 +221,9 @@ fn vdso_get_symbols_info() -> HashMap<&'static str, (u64, usize)> {
                         if let Some((name, _)) =
                             VDSO_SYMBOLS.iter().find(|&(name, _)| name == &sym_name)
                         {
-                            debug_assert!(sym.is_function());
+                            /* __kernel_rt_sigreturn on ARM64 unfortunately is not marked as
+                             * a funtion in VDSO, but as STT_NONE. */
+                            debug_assert!(sym.is_function() || name == &"__kernel_rt_sigreturn");
                             res.insert(*name, (sym.st_value, sym.st_size as usize));
                         }
                     });
