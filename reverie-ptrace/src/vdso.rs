@@ -202,8 +202,13 @@ lazy_static! {
 fn vdso_get_symbols_info() -> HashMap<&'static str, (u64, usize)> {
     let mut res = HashMap::new();
     procfs::process::Process::new(unistd::getpid().as_raw())
-        .and_then(|p| p.maps())
-        .unwrap_or_else(|_| Vec::new())
+        .map_or_else(
+            |_| Vec::new(),
+            |p| match p.maps() {
+                Ok(maps) => maps.memory_maps,
+                Err(_) => Vec::new(),
+            },
+        )
         .iter()
         .find(|e| e.pathname == procfs::process::MMapPath::Vdso)
         .and_then(|vdso| {
@@ -243,8 +248,13 @@ where
     T: Tool,
 {
     if let Some(vdso) = procfs::process::Process::new(guest.pid().as_raw())
-        .and_then(|p| p.maps())
-        .unwrap_or_else(|_| Vec::new())
+        .map_or_else(
+            |_| Vec::new(),
+            |p| match p.maps() {
+                Ok(maps) => maps.memory_maps,
+                Err(_) => Vec::new(),
+            },
+        )
         .iter()
         .find(|e| e.pathname == procfs::process::MMapPath::Vdso)
     {
@@ -304,8 +314,13 @@ mod tests {
     fn can_find_vdso() {
         assert!(
             procfs::process::Process::new(unistd::getpid().as_raw())
-                .and_then(|p| p.maps())
-                .unwrap_or_else(|_| Vec::new())
+                .map_or_else(
+                    |_| Vec::new(),
+                    |p| match p.maps() {
+                        Ok(maps) => maps.memory_maps,
+                        Err(_) => Vec::new(),
+                    },
+                )
                 .iter()
                 .any(|e| e.pathname == procfs::process::MMapPath::Vdso)
         );

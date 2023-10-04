@@ -84,7 +84,7 @@ fn show_proc_maps(maps: &procfs::process::MemoryMap) -> String {
         _ => String::from(""),
     };
     let s = format!(
-        "{:x}-{:x} {} {:08x} {:02x}:{:02x} {}",
+        "{:x}-{:x} {:?} {:08x} {:02x}:{:02x} {}",
         maps.address.0, maps.address.1, maps.perms, maps.offset, maps.dev.0, maps.dev.1, maps.inode
     );
     res.push_str(&s);
@@ -98,7 +98,11 @@ fn task_rip_is_valid(pid: Pid, rip: u64) -> bool {
     if let Ok(mapping) = procfs::process::Process::new(pid.as_raw()).and_then(|p| p.maps()) {
         has_valid_rip = mapping
             .iter()
-            .find(|e| e.perms.contains('x') && e.address.0 <= rip && e.address.1 > rip + 0x10)
+            .find(|e| {
+                e.perms.contains(procfs::process::MMPermissions::EXECUTE)
+                    && e.address.0 <= rip
+                    && e.address.1 > rip + 0x10
+            })
             .cloned();
     }
     has_valid_rip.is_some()
@@ -136,8 +140,13 @@ pub fn show_fault_context(task: &Stopped, sig: signal::Signal) {
     }
 
     procfs::process::Process::new(task.pid().as_raw())
-        .and_then(|p| p.maps())
-        .unwrap_or_else(|_| Vec::new())
+        .map_or_else(
+            |_| Vec::new(),
+            |p| match p.maps() {
+                Ok(maps) => maps.memory_maps,
+                Err(_) => Vec::new(),
+            },
+        )
         .iter()
         .for_each(|e| {
             debug!("{}", show_proc_maps(e));
