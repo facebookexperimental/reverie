@@ -7,7 +7,6 @@
  */
 
 #![feature(ffi_returns_twice)]
-#![cfg_attr(test, feature(bench_black_box))]
 
 //! This library provides an ergonomic interface writing SaBRe plugins with
 //! Rust.
