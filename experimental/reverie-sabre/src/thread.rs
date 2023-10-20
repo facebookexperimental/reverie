@@ -595,6 +595,7 @@ impl<E: EventSink> Thread<E> {
 mod tests {
     use std::collections::HashSet;
     use std::mem;
+    use std::ptr;
     use std::sync::atomic::fence;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
@@ -638,7 +639,6 @@ mod tests {
         Thread::<TestEventSink>::current()
     }
 
-    #[allow(clippy::cast_ref_to_mut)]
     pub fn run_test_in_new_thread<T>(t: T)
     where
         T: 'static + Send + FnOnce(),
@@ -649,7 +649,8 @@ mod tests {
         // test run. This is safe because each test is running inside a single
         // mutex, so only one test will be accessing the static variable at once
         unsafe {
-            let slot_map_mut = &mut *((&*SLOT_MAP as *const _) as *mut _);
+            // FIXME(JakobDegen): This is UB
+            let slot_map_mut = ptr::addr_of!(*SLOT_MAP).cast_mut();
 
             *slot_map_mut = SlotMap::<ThreadRepr>::new();
         }
