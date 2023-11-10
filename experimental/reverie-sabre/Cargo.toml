@@ -12,7 +12,7 @@ array-macro = "1.0.5"
 atomic = "0.5.1"
 heapless = "0.7.15"
 lazy_static = "1.4"
-libc = "0.2.139"
+libc = "0.2.149"
 mimalloc = { version = "0.1", default-features = false }
 nostd-print = { version = "0.1.0", path = "../nostd-print" }
 once_cell = "1.12"
