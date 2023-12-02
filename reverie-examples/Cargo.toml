@@ -45,7 +45,7 @@ name = "strace_minimal"
 path = "strace_minimal.rs"
 
 [dependencies]
-anyhow = "=1.0.72"
+anyhow = "1.0.75"
 clap = { version = "3.2.25", features = ["derive", "env", "regex", "unicode", "wrap_help"] }
 reverie = { version = "0.1.0", path = "../reverie" }
 reverie-ptrace = { version = "0.1.0", path = "../reverie-ptrace" }

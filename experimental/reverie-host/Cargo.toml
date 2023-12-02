@@ -8,7 +8,7 @@ edition = "2021"
 license = "BSD-2-Clause"
 
 [dependencies]
-anyhow = "=1.0.72"
+anyhow = "1.0.75"
 dirs = "2.0"
 reverie-process = { version = "0.1.0", path = "../../reverie-process" }
 reverie-rpc = { version = "0.1.0", path = "../reverie-rpc" }
