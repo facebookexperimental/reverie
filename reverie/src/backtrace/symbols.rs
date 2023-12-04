@@ -14,8 +14,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::path::PathBuf;
 
-use gimli::EndianSlice;
-use gimli::RunTimeEndian as Endian;
+use addr2line::gimli;
+use addr2line::gimli::EndianSlice;
+use addr2line::gimli::RunTimeEndian as Endian;
 use memmap2::Mmap;
 use object::Object as _;
 use object::ObjectSegment;
@@ -173,7 +174,11 @@ impl Symbols {
     pub fn find_frames(
         &self,
         probe: u64,
-    ) -> Result<addr2line::FrameIter<EndianSlice<'static, Endian>>, gimli::read::Error> {
+    ) -> addr2line::LookupResult<
+        impl addr2line::LookupContinuation<
+            Output = Result<addr2line::FrameIter<EndianSlice<'static, Endian>>, gimli::read::Error>,
+        >,
+    > {
         self.context.dwarf.find_frames(probe + self.base_addr())
     }
 

@@ -16,6 +16,8 @@ use std::io;
 use std::io::Read;
 use std::path::PathBuf;
 
+use addr2line::LookupContinuation;
+use addr2line::LookupResult;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -155,7 +157,20 @@ impl Backtrace {
                 let symbols = cache.load(library)?;
 
                 // Find the file + line number of the instruction pointer.
-                if let Ok(mut source_frames) = symbols.find_frames(addr) {
+                let mut lookup_result = symbols.find_frames(addr);
+                if let Ok(mut source_frames) = loop {
+                    match lookup_result {
+                        LookupResult::Output(result) => break result,
+                        LookupResult::Load {
+                            load: _,
+                            continuation,
+                        } => {
+                            // FIXME support Split DWARF
+                            // let dwo = do_split_dwarf_load(load);
+                            lookup_result = continuation.resume(None);
+                        }
+                    }
+                } {
                     while let Ok(Some(f)) = source_frames.next() {
                         if let Some(loc) = f.location {
                             locations.push(Location {
