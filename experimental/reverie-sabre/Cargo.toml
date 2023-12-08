@@ -10,7 +10,7 @@ license = "BSD-2-Clause"
 [dependencies]
 array-macro = "1.0.5"
 atomic = "0.5.1"
-heapless = "0.7.15"
+heapless = "0.8.0"
 lazy_static = "1.4"
 libc = "0.2.139"
 mimalloc = { version = "0.1", default-features = false }
