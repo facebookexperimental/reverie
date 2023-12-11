@@ -5,6 +5,7 @@ name = "reverie"
 version = "0.1.0"
 authors = ["Meta Platforms"]
 edition = "2021"
+repository = "https://github.com/facebookexperimental/reverie"
 license = "BSD-2-Clause"
 
 [dependencies]
