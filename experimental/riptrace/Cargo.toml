@@ -12,7 +12,7 @@ license = "BSD-2-Clause"
 anyhow = "1.0.75"
 async-trait = "0.1.71"
 clap = { version = "3.2.25", features = ["derive", "env", "regex", "unicode", "wrap_help"] }
-colored = "1.9"
+colored = "2.1.0"
 reverie-host = { version = "0.1.0", path = "../reverie-host" }
 reverie-process = { version = "0.1.0", path = "../../reverie-process" }
 riptrace-rpc = { version = "0.1.0", path = "rpc" }
