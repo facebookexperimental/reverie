@@ -123,8 +123,8 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     /// `tail_inject` will never be executed:
     ///
     /// ```no_run
-    /// use reverie::*;
     /// use reverie::syscalls::*;
+    /// use reverie::*;
     ///
     /// #[derive(Debug, Default, Clone)]
     /// struct MyTool;
@@ -214,8 +214,8 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     /// # Example
     ///
     /// ```
-    /// use reverie::*;
     /// use reverie::syscalls::*;
+    /// use reverie::*;
     ///
     /// #[derive(Debug, Default, Clone)]
     /// struct MyTool;

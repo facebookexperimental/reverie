@@ -881,7 +881,6 @@ impl<L: Tool + 'static> TracedTask<L> {
     ///
     /// Postconditions:
     ///  * guest thread may or may not be stopped, depending on value of GuestNext
-    ///
     async fn handle_stop_event(&mut self, stopped: Stopped, event: Event) -> Result<Wait, Error> {
         self.timer.observe_event();
         // A task is processed by this loop on any state change, so we must

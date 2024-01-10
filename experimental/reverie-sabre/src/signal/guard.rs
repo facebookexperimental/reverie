@@ -24,7 +24,6 @@ use heapless::mpmc::Q64;
 ///
 /// |<---------------------- 64 Bits ---------------------->|
 /// |<-= 32 Bits Queued Count ->|<-- 32 Bits Guard Count -->|
-///
 const GUARD_COUNT_BITS: u8 = 32;
 const GUARD_COUNT_UNIT: u64 = 1;
 const GUARD_COUNT_MASK: u64 = (1 << GUARD_COUNT_BITS) - 1;

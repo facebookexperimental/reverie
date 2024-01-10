@@ -95,16 +95,15 @@ impl Command {
     /// Only one argument can be passed per use. So instead of:
     ///
     /// ```no_run
-    /// reverie_process::Command::new("sh")
-    ///   .arg("-C /path/to/repo");
+    /// reverie_process::Command::new("sh").arg("-C /path/to/repo");
     /// ```
     ///
     /// usage would be:
     ///
     /// ```no_run
     /// reverie_process::Command::new("sh")
-    ///   .arg("-C")
-    ///   .arg("/path/to/repo");
+    ///     .arg("-C")
+    ///     .arg("/path/to/repo");
     /// ```
     ///
     /// To pass multiple arguments see [`args`].
@@ -118,9 +117,7 @@ impl Command {
     /// ```no_run
     /// use reverie_process::Command;
     ///
-    /// let command = Command::new("ls")
-    ///         .arg("-l")
-    ///         .arg("-a");
+    /// let command = Command::new("ls").arg("-l").arg("-a");
     /// ```
     pub fn arg<S: AsRef<OsStr>>(&mut self, arg: S) -> &mut Self {
         self.args.push(to_cstring(arg));
@@ -140,8 +137,7 @@ impl Command {
     /// ```no_run
     /// use reverie_process::Command;
     ///
-    /// let command = Command::new("ls")
-    ///         .args(&["-l", "-a"]);
+    /// let command = Command::new("ls").args(&["-l", "-a"]);
     /// ```
     pub fn args<I, S>(&mut self, args: I) -> &mut Self
     where
@@ -203,8 +199,7 @@ impl Command {
     /// ```no_run
     /// use reverie_process::Command;
     ///
-    /// let command = Command::new("ls")
-    ///         .env("PATH", "/bin");
+    /// let command = Command::new("ls").env("PATH", "/bin");
     /// ```
     pub fn env<K, V>(&mut self, key: K, val: V) -> &mut Self
     where
@@ -222,20 +217,21 @@ impl Command {
     /// Basic usage:
     ///
     /// ```no_run
-    /// use reverie_process::{Command, Stdio};
-    /// use std::env;
     /// use std::collections::HashMap;
+    /// use std::env;
     ///
-    /// let filtered_env : HashMap<String, String> =
-    ///     env::vars().filter(|&(ref k, _)|
-    ///         k == "TERM" || k == "TZ" || k == "LANG" || k == "PATH"
-    ///     ).collect();
+    /// use reverie_process::Command;
+    /// use reverie_process::Stdio;
+    ///
+    /// let filtered_env: HashMap<String, String> = env::vars()
+    ///     .filter(|&(ref k, _)| k == "TERM" || k == "TZ" || k == "LANG" || k == "PATH")
+    ///     .collect();
     ///
     /// let command = Command::new("printenv")
-    ///         .stdin(Stdio::null())
-    ///         .stdout(Stdio::inherit())
-    ///         .env_clear()
-    ///         .envs(&filtered_env);
+    ///     .stdin(Stdio::null())
+    ///     .stdout(Stdio::inherit())
+    ///     .env_clear()
+    ///     .envs(&filtered_env);
     /// ```
     pub fn envs<I, K, V>(&mut self, vars: I) -> &mut Self
     where
@@ -256,8 +252,7 @@ impl Command {
     /// ```no_run
     /// use reverie_process::Command;
     ///
-    /// let command = Command::new("ls")
-    ///         .env_remove("PATH");
+    /// let command = Command::new("ls").env_remove("PATH");
     /// ```
     pub fn env_remove<K: AsRef<OsStr>>(&mut self, key: K) -> &mut Self {
         self.container.env_remove(key);
@@ -273,8 +268,7 @@ impl Command {
     /// ```no_run
     /// use reverie_process::Command;
     ///
-    /// let command = Command::new("ls")
-    ///         .env_clear();
+    /// let command = Command::new("ls").env_clear();
     /// ```
     pub fn env_clear(&mut self) -> &mut Self {
         self.container.env_clear();
@@ -308,8 +302,7 @@ impl Command {
     /// ```no_run
     /// use reverie_process::Command;
     ///
-    /// let command = Command::new("ls")
-    ///         .current_dir("/bin");
+    /// let command = Command::new("ls").current_dir("/bin");
     /// ```
     pub fn current_dir<P: AsRef<Path>>(&mut self, dir: P) -> &mut Self {
         self.container.current_dir(dir);
@@ -326,10 +319,10 @@ impl Command {
     /// Basic usage:
     ///
     /// ```no_run
-    /// use reverie_process::{Command, Stdio};
+    /// use reverie_process::Command;
+    /// use reverie_process::Stdio;
     ///
-    /// let command = Command::new("ls")
-    ///         .stdin(Stdio::null());
+    /// let command = Command::new("ls").stdin(Stdio::null());
     /// ```
     pub fn stdin<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Self {
         self.container.stdin(cfg);
@@ -347,10 +340,10 @@ impl Command {
     /// Basic usage:
     ///
     /// ```no_run
-    /// use reverie_process::{Command, Stdio};
+    /// use reverie_process::Command;
+    /// use reverie_process::Stdio;
     ///
-    /// let command = Command::new("ls")
-    ///         .stdout(Stdio::null());
+    /// let command = Command::new("ls").stdout(Stdio::null());
     /// ```
     pub fn stdout<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Self {
         self.container.stdout(cfg);
@@ -368,10 +361,10 @@ impl Command {
     /// Basic usage:
     ///
     /// ```no_run
-    /// use reverie_process::{Command, Stdio};
+    /// use reverie_process::Command;
+    /// use reverie_process::Stdio;
     ///
-    /// let command = Command::new("ls")
-    ///         .stderr(Stdio::null());
+    /// let command = Command::new("ls").stderr(Stdio::null());
     /// ```
     pub fn stderr<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Self {
         self.container.stderr(cfg);
@@ -487,8 +480,7 @@ impl Command {
     /// ```no_run
     /// use reverie_process::Command;
     ///
-    /// let command = Command::new("ls")
-    ///     .map_uid(1, unsafe { libc::getuid() });
+    /// let command = Command::new("ls").map_uid(1, unsafe { libc::getuid() });
     /// ```
     ///
     /// # Implementation

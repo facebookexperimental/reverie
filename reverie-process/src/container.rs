@@ -111,8 +111,7 @@ impl Container {
     /// ```no_run
     /// use reverie_process::Container;
     ///
-    /// let container = Container::new()
-    ///         .env("PATH", "/bin");
+    /// let container = Container::new().env("PATH", "/bin");
     /// ```
     pub fn env<K, V>(&mut self, key: K, val: V) -> &mut Self
     where
@@ -130,20 +129,21 @@ impl Container {
     /// Basic usage:
     ///
     /// ```no_run
-    /// use reverie_process::{Container, Stdio};
-    /// use std::env;
     /// use std::collections::HashMap;
+    /// use std::env;
     ///
-    /// let filtered_env : HashMap<String, String> =
-    ///     env::vars().filter(|&(ref k, _)|
-    ///         k == "TERM" || k == "TZ" || k == "LANG" || k == "PATH"
-    ///     ).collect();
+    /// use reverie_process::Container;
+    /// use reverie_process::Stdio;
+    ///
+    /// let filtered_env: HashMap<String, String> = env::vars()
+    ///     .filter(|&(ref k, _)| k == "TERM" || k == "TZ" || k == "LANG" || k == "PATH")
+    ///     .collect();
     ///
     /// let container = Container::new()
-    ///         .stdin(Stdio::null())
-    ///         .stdout(Stdio::inherit())
-    ///         .env_clear()
-    ///         .envs(&filtered_env);
+    ///     .stdin(Stdio::null())
+    ///     .stdout(Stdio::inherit())
+    ///     .env_clear()
+    ///     .envs(&filtered_env);
     /// ```
     pub fn envs<I, K, V>(&mut self, vars: I) -> &mut Self
     where
@@ -166,8 +166,7 @@ impl Container {
     /// ```no_run
     /// use reverie_process::Container;
     ///
-    /// let container = Container::new()
-    ///         .env_remove("PATH");
+    /// let container = Container::new().env_remove("PATH");
     /// ```
     pub fn env_remove<K: AsRef<OsStr>>(&mut self, key: K) -> &mut Self {
         self.env.remove(key.as_ref());
@@ -183,8 +182,7 @@ impl Container {
     /// ```no_run
     /// use reverie_process::Container;
     ///
-    /// let container = Container::new()
-    ///         .env_clear();
+    /// let container = Container::new().env_clear();
     /// ```
     pub fn env_clear(&mut self) -> &mut Self {
         self.env.clear();
@@ -218,8 +216,7 @@ impl Container {
     /// ```no_run
     /// use reverie_process::Container;
     ///
-    /// let container = Container::new()
-    ///         .current_dir("/bin");
+    /// let container = Container::new().current_dir("/bin");
     /// ```
     pub fn current_dir<P: AsRef<Path>>(&mut self, dir: P) -> &mut Self {
         self.current_dir = Some(to_cstring(dir.as_ref()));
@@ -236,10 +233,10 @@ impl Container {
     /// Basic usage:
     ///
     /// ```no_run
-    /// use reverie_process::{Container, Stdio};
+    /// use reverie_process::Container;
+    /// use reverie_process::Stdio;
     ///
-    /// let container = Container::new()
-    ///         .stdin(Stdio::null());
+    /// let container = Container::new().stdin(Stdio::null());
     /// ```
     pub fn stdin<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Self {
         self.stdin = cfg.into();
@@ -257,10 +254,10 @@ impl Container {
     /// Basic usage:
     ///
     /// ```no_run
-    /// use reverie_process::{Container, Stdio};
+    /// use reverie_process::Container;
+    /// use reverie_process::Stdio;
     ///
-    /// let container = Container::new()
-    ///         .stdout(Stdio::null());
+    /// let container = Container::new().stdout(Stdio::null());
     /// ```
     pub fn stdout<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Self {
         self.stdout = cfg.into();
@@ -278,10 +275,10 @@ impl Container {
     /// Basic usage:
     ///
     /// ```no_run
-    /// use reverie_process::{Container, Stdio};
+    /// use reverie_process::Container;
+    /// use reverie_process::Stdio;
     ///
-    /// let container = Container::new()
-    ///         .stderr(Stdio::null());
+    /// let container = Container::new().stderr(Stdio::null());
     /// ```
     pub fn stderr<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Self {
         self.stderr = cfg.into();
@@ -351,8 +348,7 @@ impl Container {
     /// ```no_run
     /// use reverie_process::Container;
     ///
-    /// let container = Container::new()
-    ///     .map_uid(1, unsafe { libc::getuid() });
+    /// let container = Container::new().map_uid(1, unsafe { libc::getuid() });
     /// ```
     ///
     /// # Implementation
@@ -452,9 +448,7 @@ impl Container {
     /// ```no_run
     /// use reverie_process::Container;
     ///
-    /// let container = Container::new()
-    ///     .map_root()
-    ///     .hostname("foobar.local");
+    /// let container = Container::new().map_root().hostname("foobar.local");
     /// ```
     pub fn hostname<S: Into<OsString>>(&mut self, hostname: S) -> &mut Self {
         self.namespace |= Namespace::UTS;
@@ -471,9 +465,7 @@ impl Container {
     /// ```no_run
     /// use reverie_process::Container;
     ///
-    /// let container = Container::new()
-    ///     .map_root()
-    ///     .domainname("foobar");
+    /// let container = Container::new().map_root().domainname("foobar");
     /// ```
     pub fn domainname<S: Into<OsString>>(&mut self, domainname: S) -> &mut Self {
         self.namespace |= Namespace::UTS;

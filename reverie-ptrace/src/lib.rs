@@ -25,7 +25,6 @@
 //! `PTRACE_EVENT_EXIT`: process is about to exit
 //!
 //! signals: tracee's pending signal stop.
-//!
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 #![cfg(target_os = "linux")]
