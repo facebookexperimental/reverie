@@ -409,7 +409,7 @@ impl<'a> Displayable for Option<StatxPtr<'a>> {
 
 bitflags::bitflags! {
     /// stx_mask from statx, see linux/stat.h
-    #[derive(Serialize, Deserialize)]
+    #[derive(Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy)]
     pub struct StatxMask: u32 {
         /// has stx_type
         const STATX_TYPE = 0x1;

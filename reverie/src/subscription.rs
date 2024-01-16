@@ -11,7 +11,7 @@ use reverie_syscalls::Sysno;
 use syscalls::SysnoSet;
 
 bitflags! {
-    #[derive(Default)]
+    #[derive(Default, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy)]
     struct Instructions: u32 {
         const CPUID = 1;
         const RDTSC = 2;

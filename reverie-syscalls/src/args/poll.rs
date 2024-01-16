@@ -41,8 +41,8 @@ impl From<libc::pollfd> for PollFd {
     fn from(pollfd: libc::pollfd) -> Self {
         Self {
             fd: pollfd.fd,
-            events: unsafe { PollFlags::from_bits_unchecked(pollfd.events) },
-            revents: unsafe { PollFlags::from_bits_unchecked(pollfd.revents) },
+            events: PollFlags::from_bits_retain(pollfd.events),
+            revents: PollFlags::from_bits_retain(pollfd.revents),
         }
     }
 }
@@ -60,7 +60,7 @@ impl Displayable for PollFd {
 
 bitflags::bitflags! {
     /// Flags for [`PollFd`].
-    #[derive(Default, Serialize, Deserialize)]
+    #[derive(Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy)]
     pub struct PollFlags: libc::c_short {
         /// There is data to read.
         const POLLIN = libc::POLLIN;

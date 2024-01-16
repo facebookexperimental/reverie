@@ -15,7 +15,7 @@ bitflags::bitflags! {
     /// A namespace that may be unshared with [`Command::unshare`].
     ///
     /// [`Command::unshare`]: super::Command::unshare
-    #[derive(Deserialize, Serialize)]
+    #[derive(Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy)]
     pub struct Namespace: i32 {
         /// Cgroup namespace.
         const CGROUP = libc::CLONE_NEWCGROUP;

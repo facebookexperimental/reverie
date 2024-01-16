@@ -85,7 +85,7 @@ pub const AUDIT_ARCH_PPC: u32 = EM_PPC;
 pub const AUDIT_ARCH_PPC64: u32 = EM_PPC64 | __AUDIT_ARCH_64BIT;
 
 bitflags::bitflags! {
-    #[derive(Default)]
+    #[derive(Default, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy)]
     struct FilterFlags: u32 {
         const TSYNC = 1 << 0;
         const LOG = 1 << 1;

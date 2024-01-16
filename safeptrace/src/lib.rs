@@ -429,6 +429,7 @@ struct ptrace_peeksiginfo_args {
 
 bitflags::bitflags! {
     /// Flags for ptrace peeksiginfo
+    #[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy)]
     pub struct PeekSigInfoFlags: u32 {
         /// dumping signals from the process-wide signal queue. signals are
         /// read from the per-thread queue of the specified thread if this

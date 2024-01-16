@@ -17,7 +17,7 @@ use crate::MemoryAccess;
 
 bitflags::bitflags! {
     /// Flags used with the `clone`, `clone3`, or `unshare` syscalls.
-    #[derive(Serialize, Deserialize)]
+    #[derive(Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy)]
     pub struct CloneFlags: u64 {
         /// set if VM shared between processes
         const CLONE_VM = libc::CLONE_VM as u64;
@@ -91,7 +91,7 @@ impl Displayable for CloneFlags {
 
 impl FromToRaw for CloneFlags {
     fn from_raw(raw: usize) -> Self {
-        unsafe { Self::from_bits_unchecked(raw as u64) }
+        Self::from_bits_retain(raw as u64)
     }
 
     fn into_raw(self) -> usize {
@@ -101,7 +101,7 @@ impl FromToRaw for CloneFlags {
 
 impl From<nix::sched::CloneFlags> for CloneFlags {
     fn from(flags: nix::sched::CloneFlags) -> Self {
-        unsafe { CloneFlags::from_bits_unchecked(flags.bits() as u64) }
+        CloneFlags::from_bits_retain(flags.bits() as u64)
     }
 }
 
