@@ -70,6 +70,7 @@ pub(crate) fn get_rcb_perf_config() -> u64 {
         (0x06, 0xA5) | (0x06, 0xA6) => 0x5101c4,                // Intel Cometlake
         (0x06, 0x8D) => 0x5101c4, // Intel Alder Lake (e.g. i7-11800H laptop)
         (0x06, 0x8F) => 0x5101c4, // Intel Sapphire Rapids
+        (0x06, 0x86) => 0x5101c4, // Intel Icelake
         (0x17, 0x8) => 0x5100d1,  // AMD Zen, Pinnacle Ridge
         (0x17, 0x31) => 0x5100d1, // AMD Zen, Castle Peak
         (0x19, 0x01) => 0x5100d1, // AMD Zen, Milan
