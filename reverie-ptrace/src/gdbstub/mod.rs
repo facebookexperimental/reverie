@@ -37,4 +37,3 @@ pub use inferior::StoppedInferior;
 pub use regs::CoreRegs;
 pub use request::GdbRequest;
 pub use server::GdbServer;
-pub use session::Session;

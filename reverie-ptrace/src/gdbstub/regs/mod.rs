@@ -15,5 +15,3 @@ mod x86_64;
 pub use aarch64::CoreRegs;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::CoreRegs;
-#[cfg(target_arch = "x86_64")]
-pub use x86_64::ExtraRegs;

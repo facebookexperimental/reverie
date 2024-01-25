@@ -30,7 +30,6 @@ use lazy_static::lazy_static;
 use nix::sys::signal::Signal;
 use nix::unistd::sysconf;
 use nix::unistd::SysconfVar;
-pub use perf::perf_event_header;
 use perf_event_open_sys::bindings as perf;
 use perf_event_open_sys::ioctls;
 use reverie::Errno;
