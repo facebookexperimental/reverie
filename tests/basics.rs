@@ -231,8 +231,8 @@ fn i_should_segfault() {
     use reverie_ptrace::testing::test_fn;
     let (output, _) = test_fn::<NoopTool, _>(|| {
         unsafe {
-            let invalid_ptr = 0x5u64 as *mut u64;
-            invalid_ptr.write(0xdeadbeefu64);
+            let invalid_ptr = 0x8u64 as *mut u64;
+            invalid_ptr.write_volatile(0xdeadbeefu64);
         };
     })
     .unwrap();
@@ -246,8 +246,8 @@ fn i_should_segfault_2() {
     use reverie_ptrace::testing::test_fn;
 
     pub fn do_segfault() {
-        let invalid_ptr = 0x1234 as *const usize;
-        let result = unsafe { invalid_ptr.read() };
+        let invalid_ptr = 0x8u64 as *const usize;
+        let result = unsafe { invalid_ptr.read_volatile() };
         // Print so the above doesn't get optimized out. We will never get here
         // because the above segfaults.
         println!("{}", result);
