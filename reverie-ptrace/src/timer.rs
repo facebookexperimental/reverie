@@ -73,6 +73,7 @@ pub(crate) fn get_rcb_perf_config() -> u64 {
         (0x06, 0x86) => 0x5101c4, // Intel Icelake
         (0x17, 0x8) => 0x5100d1,  // AMD Zen, Pinnacle Ridge
         (0x17, 0x31) => 0x5100d1, // AMD Zen, Castle Peak
+        (0x17, 0x71) => 0x5100d1, // AMD Zen 2, Matisse
         (0x19, 0x01) => 0x5100d1, // AMD Zen, Milan
         (0x19, 0x50) => 0x5100d1, // AMD Zen, Cezanne
         oth => panic!(
