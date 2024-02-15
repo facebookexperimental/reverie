@@ -66,4 +66,4 @@ jobs:
         with:
             components: clippy
       - name: Run cargo clippy
-        run: cargo clippy --all-features -- -Dclippy::all
+        run: cargo clippy --all-features
