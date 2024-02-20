@@ -6,6 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#![allow(invalid_reference_casting)]
+
 use core::iter::repeat;
 use core::mem::MaybeUninit;
 use core::sync::atomic::AtomicU32;
@@ -219,6 +221,9 @@ where
                 //     before dereferencing.
                 //  3. We are inside a spin lock that ensures each entry in the
                 //     chunks array will only be written to once.
+                //
+                // TODO: remove #![allow(invalid_reference_casting)] and replace with
+                //       UnsafeCell
                 unsafe {
                     let chunk_pointer_pointer =
                         self.chunks.get_unchecked(chunk_count as usize) as *const ChunkPointer<T>;
