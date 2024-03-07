@@ -68,7 +68,7 @@ pub(crate) fn get_rcb_perf_config() -> u64 {
         (0x06, 0x4E) | (0x06, 0x55) | (0x06, 0x5E) => 0x5101c4, // Intel Skylake
         (0x06, 0x8E) | (0x06, 0x9E) => 0x5101c4,                // Intel Kabylake
         (0x06, 0xA5) | (0x06, 0xA6) => 0x5101c4,                // Intel Cometlake
-        (0x06, 0x8D) => 0x5101c4, // Intel Alder Lake (e.g. i7-11800H laptop)
+        (0x06, 0x8D) => 0x5101c4, // Intel Tiger Lake (e.g. i7-11800H laptop)
         (0x06, 0x9A) => 0x5101c4, // Intel Alder Lake (e.g. i7-12700H laptop)
         (0x06, 0x8F) => 0x5101c4, // Intel Sapphire Rapids
         (0x06, 0x86) => 0x5101c4, // Intel Icelake
