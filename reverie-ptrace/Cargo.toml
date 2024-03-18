@@ -28,7 +28,7 @@ reverie = { version = "0.1.0", path = "../reverie" }
 safeptrace = { version = "0.1.0", path = "../safeptrace", features = ["memory", "notifier"] }
 serde = { version = "1.0.185", features = ["derive", "rc"] }
 thiserror = "1.0.49"
-tokio = { version = "1.29.1", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.36.0", features = ["full", "test-util", "tracing"] }
 tokio-stream = { version = "0.1.14", features = ["fs", "io-util", "net", "signal", "sync", "time"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["ansi", "chrono", "env-filter", "fmt", "json", "local-time", "parking_lot", "registry"] }
