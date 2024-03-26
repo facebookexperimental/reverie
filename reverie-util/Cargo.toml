@@ -13,6 +13,6 @@ anyhow = "1.0.75"
 chrono = { version = "0.4", features = ["clock", "serde", "std"], default-features = false }
 clap = { version = "3.2.25", features = ["derive", "env", "regex", "unicode", "wrap_help"] }
 reverie = { version = "0.1.0", path = "../reverie" }
-tracing = "0.1.40"
+tracing = { version = "0.1.40", features = ["attributes"] }
 tracing-appender = "0.2.2"
-tracing-subscriber = { version = "0.3.18", features = ["ansi", "chrono", "env-filter", "fmt", "json", "local-time", "parking_lot", "registry"] }
+tracing-subscriber = { version = "0.3.18", features = ["chrono", "env-filter", "json", "local-time", "parking_lot", "registry"] }
