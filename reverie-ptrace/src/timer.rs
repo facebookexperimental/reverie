@@ -403,8 +403,8 @@ impl EventStatus {
 /// `rr` uses a value of 100 for almost all platforms, but with precise_ip = 0.
 /// Enabling Intel PEBS via precise_ip > 0 seems to reduce observed skid by 1/2,
 /// in synthetic benchmarks, though it makes counter _values_ incorrect. As a
-/// result, we choose 60.
-const SKID_MARGIN_RCBS: u64 = 60;
+/// result, we choose 70.
+const SKID_MARGIN_RCBS: u64 = 70;
 
 /// We refuse to schedule a "perf timeout" for this or fewer RCBs, instead
 /// choosing to directly single step. This is because I am somewhat paranoid
