@@ -6,8 +6,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#![feature(ffi_returns_twice)]
-
 //! This library provides an ergonomic interface writing SaBRe plugins with
 //! Rust.
 

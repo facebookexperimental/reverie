@@ -16,7 +16,6 @@ extern "C" {
     // compiler optimizations. Because of this, vfork *must* be implemented in
     // raw assembly. It can't be safely implemented in Rust inline asm. For more
     // information, see: https://github.com/rust-lang/libc/issues/1596
-    #[ffi_returns_twice]
     pub fn vfork_syscall() -> usize;
 }
 
