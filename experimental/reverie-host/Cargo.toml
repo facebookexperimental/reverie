@@ -15,4 +15,4 @@ reverie-process = { version = "0.1.0", path = "../../reverie-process" }
 reverie-rpc = { version = "0.1.0", path = "../reverie-rpc" }
 serde = { version = "1.0.185", features = ["derive", "rc"] }
 tempfile = "3.8"
-tokio = { version = "1.36.0", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.37.0", features = ["full", "test-util", "tracing"] }

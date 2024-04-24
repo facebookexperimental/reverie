@@ -17,4 +17,4 @@ reverie-host = { version = "0.1.0", path = "../reverie-host" }
 reverie-process = { version = "0.1.0", path = "../../reverie-process" }
 riptrace-rpc = { version = "0.1.0", path = "rpc" }
 syscalls = { version = "0.6.7", features = ["serde"] }
-tokio = { version = "1.36.0", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.37.0", features = ["full", "test-util", "tracing"] }
