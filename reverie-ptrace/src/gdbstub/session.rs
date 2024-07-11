@@ -60,6 +60,7 @@ pub struct Session {
     pub stream_tx: BoxWriter,
 
     /// buffer use to send data over to tcp stream
+    #[allow(dead_code)]
     pub tx_buf: BytesMut,
 
     /// Gdb remote protocol command notifier.
