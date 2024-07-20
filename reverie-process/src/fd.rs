@@ -514,8 +514,6 @@ mod tests {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
-    use const_cstr::const_cstr;
-
     use super::*;
 
     #[test]
@@ -537,24 +535,16 @@ mod tests {
 
     #[test]
     fn test_is_dir() {
-        assert!(is_dir(const_cstr!("/").as_ptr()));
-        assert!(is_dir(const_cstr!("/dev").as_ptr()));
-        assert!(!is_dir(const_cstr!("/dev/null").as_ptr()));
+        assert!(is_dir(c"/".as_ptr()));
+        assert!(is_dir(c"/dev".as_ptr()));
+        assert!(!is_dir(c"/dev/null".as_ptr()));
     }
 
     #[test]
     fn test_file_type() {
-        assert!(FileType::new(const_cstr!("/").as_ptr()).unwrap().is_dir());
-        assert!(
-            FileType::new(const_cstr!("/dev").as_ptr())
-                .unwrap()
-                .is_dir()
-        );
-        assert!(
-            !FileType::new(const_cstr!("/dev/null").as_ptr())
-                .unwrap()
-                .is_file()
-        );
+        assert!(FileType::new(c"/".as_ptr()).unwrap().is_dir());
+        assert!(FileType::new(c"/dev".as_ptr()).unwrap().is_dir());
+        assert!(!FileType::new(c"/dev/null".as_ptr()).unwrap().is_file());
     }
 
     #[test]
