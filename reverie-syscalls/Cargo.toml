@@ -10,7 +10,7 @@ license = "BSD-2-Clause"
 
 [dependencies]
 bitflags = { version = "2.4", features = ["serde"] }
-derive_more = "0.99.17"
+derive_more = { version = "1.0.0", features = ["full"] }
 libc = "0.2.139"
 nix = "0.25"
 paste = "1.0.14"
