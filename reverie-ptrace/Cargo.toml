@@ -19,7 +19,7 @@ iced-x86 = "1.17.0"
 lazy_static = "1.4"
 libc = "0.2.139"
 nix = "0.25"
-num-traits = "0.2.18"
+num-traits = { version = "0.2.18", default-features = false }
 paste = "1.0.14"
 perf-event-open-sys = "4.0"
 procfs = "0.15.1"
