@@ -1548,7 +1548,6 @@ impl<L: Tool + 'static> TracedTask<L> {
                     );
                 }
                 Wait::Exited(_pid, exit_status) => {
-                    #[allow(unreachable_code)]
                     break self.exit(exit_status).await;
                 }
             }

@@ -111,7 +111,6 @@ impl Tool for ChaosTool {
                 syscall.display(&memory),
             );
 
-            #[allow(unreachable_code)]
             return guest.tail_inject(syscall).await;
         }
 
@@ -154,7 +153,6 @@ impl Tool for ChaosTool {
                     count,
                     syscall.display(&memory),
                 );
-                #[allow(unreachable_code)]
                 return guest.tail_inject(x).await;
             }
         };

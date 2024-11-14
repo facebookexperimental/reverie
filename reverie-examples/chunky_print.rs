@@ -227,7 +227,6 @@ impl Tool for ChunkyPrintLocal {
                                     " [chunky_print] letting through write on redirected stdout, {} bytes.",
                                     w.len()
                                 );
-                                #[allow(unreachable_code)]
                                 return guest.tail_inject(call).await;
                             }
                             Which::Stdout
@@ -237,7 +236,6 @@ impl Tool for ChunkyPrintLocal {
                                     " [chunky_print] letting through write on redirected stderr, {} bytes.",
                                     w.len()
                                 );
-                                #[allow(unreachable_code)]
                                 return guest.tail_inject(call).await;
                             }
                             Which::Stderr
