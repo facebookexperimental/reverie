@@ -9,7 +9,7 @@ repository = "https://github.com/facebookexperimental/reverie"
 license = "BSD-2-Clause"
 
 [dependencies]
-addr2line = "0.21"
+addr2line = "0.24.2"
 anyhow = "1.0.86"
 async-trait = "0.1.71"
 bitflags = { version = "2.6", features = ["serde"] }
