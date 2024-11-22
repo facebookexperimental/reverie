@@ -14,7 +14,7 @@ bitflags = { version = "2.6", features = ["serde"] }
 colored = "2.1.0"
 futures = { version = "0.3.30", features = ["async-await", "compat"] }
 libc = "0.2.139"
-nix = "0.25"
+nix = "0.26.4"
 serde = { version = "1.0.185", features = ["derive", "rc"] }
 syscalls = { version = "0.6.7", features = ["serde"] }
 thiserror = "1.0.64"
