@@ -10,6 +10,7 @@ use core::pin::Pin;
 use core::task::Context;
 use core::task::Poll;
 use std::io;
+use std::os::fd::OwnedFd;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::io::FromRawFd;
 use std::os::unix::io::IntoRawFd;
@@ -207,15 +208,33 @@ impl FromRawFd for ChildStdin {
     }
 }
 
+impl From<OwnedFd> for ChildStdin {
+    fn from(fd: OwnedFd) -> Self {
+        Self::new(fd.into()).unwrap()
+    }
+}
+
 impl FromRawFd for ChildStdout {
     unsafe fn from_raw_fd(fd: i32) -> Self {
         Self::new(Fd::new(fd)).unwrap()
     }
 }
 
+impl From<OwnedFd> for ChildStdout {
+    fn from(fd: OwnedFd) -> Self {
+        Self::new(fd.into()).unwrap()
+    }
+}
+
 impl FromRawFd for ChildStderr {
     unsafe fn from_raw_fd(fd: i32) -> Self {
         Self::new(Fd::new(fd)).unwrap()
+    }
+}
+
+impl From<OwnedFd> for ChildStderr {
+    fn from(fd: OwnedFd) -> Self {
+        Self::new(fd.into()).unwrap()
     }
 }
 

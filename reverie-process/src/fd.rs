@@ -13,6 +13,7 @@ use std::ffi::CStr;
 use std::io;
 use std::io::Read;
 use std::io::Write;
+use std::os::fd::OwnedFd;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::io::FromRawFd;
 use std::os::unix::io::IntoRawFd;
@@ -229,6 +230,12 @@ impl FromRawFd for Fd {
 impl From<Fd> for std::fs::File {
     fn from(fd: Fd) -> Self {
         unsafe { std::fs::File::from_raw_fd(fd.into_raw_fd()) }
+    }
+}
+
+impl From<OwnedFd> for Fd {
+    fn from(fd: OwnedFd) -> Self {
+        Self(fd.into_raw_fd())
     }
 }
 

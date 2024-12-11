@@ -10,6 +10,8 @@
 
 use std::io::Write;
 use std::net::SocketAddr;
+use std::os::fd::AsRawFd;
+use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -582,6 +584,11 @@ where
     let (read1, write1) = unistd::pipe().map_err(from_nix_error)?;
     let (read2, write2) = unistd::pipe().map_err(from_nix_error)?;
 
+    let read1 = unsafe { OwnedFd::from_raw_fd(read1) };
+    let write1 = unsafe { OwnedFd::from_raw_fd(write1) };
+    let read2 = unsafe { OwnedFd::from_raw_fd(read2) };
+    let write2 = unsafe { OwnedFd::from_raw_fd(write2) };
+
     // Disable io redirection just before forking. We want the child process to
     // be able to call `println!()` and have that output go to stdout.
     //
@@ -592,15 +599,13 @@ where
     // panicking, etc).  We make a best-effort attempt to solve some of these issues.
     match unsafe { unistd::fork() }.expect("unistd::fork failed") {
         ForkResult::Child => {
-            unistd::close(read1)
-                .and_then(|_| unistd::close(read2))
-                .map_err(from_nix_error)?;
+            drop(read1);
+            drop(read2);
             if capture_output {
-                unistd::dup2(write1, 1)
-                    .and_then(|_| unistd::dup2(write2, 2))
-                    .and_then(|_| unistd::close(write1))
-                    .and_then(|_| unistd::close(write2))
-                    .map_err(from_nix_error)?;
+                unistd::dup2(write1.as_raw_fd(), 1).map_err(from_nix_error)?;
+                unistd::dup2(write2.as_raw_fd(), 2).map_err(from_nix_error)?;
+                drop(write1);
+                drop(write2);
             }
 
             init_tracee(events.has_rdtsc()).expect("init_tracee failed");
@@ -627,13 +632,11 @@ where
 
             let guest_pid = Pid::from(child);
             let child = Running::new(guest_pid);
-            unistd::close(write1)
-                .and_then(|_| unistd::close(write2))
-                .map_err(from_nix_error)
-                .unwrap();
+            drop(write1);
+            drop(write2);
 
-            let stdout = unsafe { ChildStdout::from_raw_fd(read1) };
-            let stderr = unsafe { ChildStderr::from_raw_fd(read2) };
+            let stdout = read1.into();
+            let stderr = read2.into();
             let tracer = match postspawn::<L>(child, gref.clone(), config, &events, None).await {
                 Ok(tracer) => tracer,
                 Err(TraceError::Errno(err)) => return Err(Error::Errno(err)),
