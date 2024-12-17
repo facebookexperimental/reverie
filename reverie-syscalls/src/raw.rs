@@ -116,7 +116,7 @@ macro_rules! impl_raw_bits {
     ($t:ty : $inner:ty) => {
         impl $crate::FromToRaw for $t {
             fn from_raw(raw: usize) -> Self {
-                unsafe { Self::from_bits_unchecked(raw as $inner) }
+                Self::from_bits_retain(raw as $inner)
             }
 
             fn into_raw(self) -> usize {

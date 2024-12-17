@@ -7,7 +7,6 @@
  */
 
 //! Tests for parallelism and concurrency
-
 use reverie::syscalls::Syscall;
 use reverie::Error;
 use reverie::GlobalTool;
@@ -75,21 +74,25 @@ impl Tool for TestTool {
 #[test]
 #[cfg(not(sanitized))]
 pub fn delay_childprint_test() {
+    use std::os::fd::BorrowedFd;
+
     use reverie::ExitStatus;
     use reverie_ptrace::testing::print_tracee_output;
     use reverie_ptrace::testing::test_fn;
 
+    let fd1 = unsafe { BorrowedFd::borrow_raw(1) };
+
     let (output, _state) = test_fn::<TestTool, _>(|| {
         let child = std::thread::spawn(move || {
             for _ in 0..2 {
-                nix::unistd::write(1, b"a").unwrap();
+                nix::unistd::write(fd1, b"a").unwrap();
             }
         });
         for _ in 0..100 {
-            nix::unistd::write(1, b"b").unwrap();
+            nix::unistd::write(fd1, b"b").unwrap();
         }
         child.join().unwrap();
-        nix::unistd::write(1, b"\n").unwrap();
+        nix::unistd::write(fd1, b"\n").unwrap();
     })
     .unwrap();
 

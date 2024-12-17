@@ -980,6 +980,7 @@ pub fn traceme_and_stop() -> Result<(), Errno> {
 #[cfg(test)]
 mod test {
     use std::io;
+    use std::os::fd::BorrowedFd;
     use std::thread;
 
     use nix::sys::signal;
@@ -1305,7 +1306,7 @@ mod test {
         _siginfo: *mut libc::siginfo_t,
         _ucontext: *const libc::c_void,
     ) {
-        nix::unistd::write(2, b"caught SIGALRM!").unwrap();
+        nix::unistd::write(unsafe { BorrowedFd::borrow_raw(2) }, b"caught SIGALRM!").unwrap();
     }
 
     #[allow(dead_code)]

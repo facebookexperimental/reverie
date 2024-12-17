@@ -7,6 +7,7 @@
  */
 
 use std::collections::BTreeMap;
+use std::os::fd::BorrowedFd;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -327,7 +328,11 @@ impl Session {
                             Mode::from_bits_truncate(0o644),
                         )
                         .and_then(|fd| {
-                            let nb = uio::pread(fd, &mut auxv, offset as libc::off_t)?;
+                            let nb = uio::pread(
+                                unsafe { BorrowedFd::borrow_raw(fd) },
+                                &mut auxv,
+                                offset as libc::off_t,
+                            )?;
                             let _ = unistd::close(fd);
                             Ok(nb)
                         }) {
@@ -535,6 +540,7 @@ impl Session {
                     writer.put_str(unistd::close(fd).map_or("F-1", |_| "F0"));
                 }
                 vFile::Pread(fd, count, offset) => {
+                    let fd = unsafe { BorrowedFd::borrow_raw(fd) };
                     let count = std::cmp::min(count as usize, self.bufsiz);
                     let mut buf: Vec<u8> = vec![0; count];
                     match uio::pread(fd, &mut buf, offset as i64) {
@@ -549,15 +555,18 @@ impl Session {
                         }
                     }
                 }
-                vFile::Pwrite(fd, offset, data) => match uio::pwrite(fd, &data, offset as i64) {
-                    Ok(nb) => {
-                        writer.put_str("F");
-                        writer.put_num(nb);
+                vFile::Pwrite(fd, offset, data) => {
+                    let fd = unsafe { BorrowedFd::borrow_raw(fd) };
+                    match uio::pwrite(fd, &data, offset as i64) {
+                        Ok(nb) => {
+                            writer.put_str("F");
+                            writer.put_num(nb);
+                        }
+                        Err(_) => {
+                            writer.put_str("F-1");
+                        }
                     }
-                    Err(_) => {
-                        writer.put_str("F-1");
-                    }
-                },
+                }
                 vFile::Unlink(fname) => {
                     writer.put_str(unistd::unlink(&fname).map_or("F-1", |_| "F0"));
                 }

@@ -7,6 +7,7 @@
  */
 
 use core::mem;
+use std::ffi::c_long;
 use std::io;
 
 use nix::sys::ptrace;
@@ -51,7 +52,7 @@ impl Stopped {
             ptrace::write(
                 self.0.into(),
                 addr.as_mut_ptr() as *mut ::core::ffi::c_void,
-                value as *mut ::core::ffi::c_void,
+                value as c_long,
             )
         }
         .map_err(|err| Errno::new(err as i32))

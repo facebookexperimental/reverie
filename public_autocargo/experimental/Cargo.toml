@@ -17,5 +17,5 @@ edition = "2018"
 clap = { version = "3.2.25", features = ["derive", "env", "regex", "unicode", "wrap_help"] }
 goblin = "0.5.2"
 libc = "0.2.139"
-nix = "0.26.4"
+nix = { version = "0.29.0", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "term", "time", "user", "zerocopy"] }
 scroll = { version = "0.10", features = ["derive"] }

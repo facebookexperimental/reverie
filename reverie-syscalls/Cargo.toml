@@ -12,7 +12,7 @@ license = "BSD-2-Clause"
 bitflags = { version = "2.6", features = ["serde"] }
 derive_more = { version = "1.0.0", features = ["full"] }
 libc = "0.2.139"
-nix = "0.26.4"
+nix = { version = "0.29.0", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "term", "time", "user", "zerocopy"] }
 paste = "1.0.14"
 reverie-memory = { version = "0.1.0", path = "../reverie-memory" }
 serde = { version = "1.0.185", features = ["derive", "rc"] }

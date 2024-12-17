@@ -11,7 +11,7 @@
 use std::io::Write;
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
-use std::os::fd::OwnedFd;
+use std::os::fd::BorrowedFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -571,8 +571,6 @@ where
     L: Tool + 'static,
     F: FnOnce(),
 {
-    use std::os::unix::io::FromRawFd;
-
     // Because this ptrace backend is CENTRALIZED, it can keep all the
     // tool's state here in a single address space.
     let global_state = <L::GlobalState as GlobalTool>::init_global_state(&config).await;
@@ -583,11 +581,6 @@ where
 
     let (read1, write1) = unistd::pipe().map_err(from_nix_error)?;
     let (read2, write2) = unistd::pipe().map_err(from_nix_error)?;
-
-    let read1 = unsafe { OwnedFd::from_raw_fd(read1) };
-    let write1 = unsafe { OwnedFd::from_raw_fd(write1) };
-    let read2 = unsafe { OwnedFd::from_raw_fd(read2) };
-    let write2 = unsafe { OwnedFd::from_raw_fd(write2) };
 
     // Disable io redirection just before forking. We want the child process to
     // be able to call `println!()` and have that output go to stdout.
@@ -620,7 +613,7 @@ where
                 Err(e) => {
                     std::io::stdout().flush()?;
                     let _ = nix::unistd::write(
-                        2,
+                        unsafe { BorrowedFd::borrow_raw(2) },
                         format!("Forked Rust process panicked, cause: {:?}", e).as_ref(),
                     );
                     std::process::exit(1);

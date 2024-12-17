@@ -12,6 +12,8 @@
 use std::ffi::CString;
 #[allow(unused_imports)]
 use std::io::Write;
+#[allow(unused_imports)]
+use std::os::fd::AsRawFd;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
@@ -265,17 +267,17 @@ fn child_should_inherit_fds() {
         let msg: [u8; 8] = [0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8];
         match unsafe { unistd::fork() } {
             Ok(ForkResult::Parent { child, .. }) => {
-                assert!(unistd::close(fdwrite).is_ok());
+                drop(fdwrite);
                 let mut buf: [u8; 8] = [0; 8];
-                assert_eq!(unistd::read(fdread, &mut buf), Ok(8));
+                assert_eq!(unistd::read(fdread.as_raw_fd(), &mut buf), Ok(8));
                 assert_eq!(buf, msg);
                 assert_eq!(wait::waitpid(child, None), Ok(WaitStatus::Exited(child, 0)));
                 unsafe { libc::syscall(libc::SYS_exit_group, 0) };
                 unreachable!();
             }
             Ok(ForkResult::Child) => {
-                assert!(unistd::close(fdread).is_ok());
-                assert_eq!(unistd::write(fdwrite, &msg), Ok(8));
+                drop(fdread);
+                assert_eq!(unistd::write(&fdwrite, &msg), Ok(8));
                 unsafe { libc::syscall(libc::SYS_exit_group, 0) };
                 unreachable!();
             }

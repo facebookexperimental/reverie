@@ -142,6 +142,7 @@ impl Tool for LocalState {
 mod tests {
     use std::io;
     use std::mem::MaybeUninit;
+    use std::os::fd::BorrowedFd;
     use std::sync::mpsc;
     use std::thread;
     use std::time;
@@ -217,7 +218,7 @@ mod tests {
         _siginfo: *mut libc::siginfo_t,
         _ucontext: *const libc::c_void,
     ) {
-        nix::unistd::write(2, b"caught SIGPROF!").unwrap();
+        nix::unistd::write(unsafe { BorrowedFd::borrow_raw(2) }, b"caught SIGPROF!").unwrap();
         unsafe {
             libc::syscall(libc::SYS_exit_group, 0);
         }

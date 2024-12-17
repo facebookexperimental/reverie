@@ -3563,7 +3563,7 @@ mod test {
         assert_eq!(
             format!("{}", syscall.display(&memory)),
             format!(
-                "openat(-100, {:p} -> \"/some/file/path\", O_APPEND)",
+                "openat(-100, {:p} -> \"/some/file/path\", OFlag(O_APPEND))",
                 name.as_ptr()
             )
         );
@@ -3585,7 +3585,7 @@ mod test {
                     .with_flags(OFlag::O_APPEND)
                     .display(&memory)
             ),
-            "openat(-100, NULL, O_APPEND)"
+            "openat(-100, NULL, OFlag(O_APPEND))"
         );
 
         assert_eq!(
@@ -3598,7 +3598,7 @@ mod test {
                     .with_mode(Some(Mode::from_bits_truncate(0o644)))
                     .display(&memory)
             ),
-            "openat(-100, NULL, O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)"
+            "openat(-100, NULL, OFlag(O_CREAT), Mode(S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH))"
         );
 
         assert_eq!(
@@ -3611,7 +3611,7 @@ mod test {
                     .with_mode(Some(Mode::from_bits_truncate(0o600)))
                     .display(&memory)
             ),
-            "openat(-100, NULL, O_DIRECTORY | O_TMPFILE, S_IRUSR | S_IWUSR)"
+            "openat(-100, NULL, OFlag(O_DIRECTORY | O_TMPFILE), Mode(S_IRUSR | S_IWUSR))"
         );
 
         #[cfg(target_arch = "x86_64")]
@@ -3644,7 +3644,7 @@ mod test {
         assert_eq!(
             format!("{}", syscall.display_with_outputs(&memory)),
             format!(
-                "stat({:p} -> \"/dev/null\", {:p} -> {{st_mode=S_IFCHR | 0666, st_size=0, ...}})",
+                "stat({:p} -> \"/dev/null\", {:p} -> {{st_mode=SFlag(S_IFCHR) | 0666, st_size=0, ...}})",
                 name.as_ptr(),
                 &stat as *const _
             )
