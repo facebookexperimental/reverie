@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
+use close_err::Closable;
 use futures::future;
 use futures::future::BoxFuture;
 use futures::future::Either;
@@ -592,13 +593,13 @@ where
     // panicking, etc).  We make a best-effort attempt to solve some of these issues.
     match unsafe { unistd::fork() }.expect("unistd::fork failed") {
         ForkResult::Child => {
-            drop(read1);
-            drop(read2);
+            read1.close()?;
+            read2.close()?;
             if capture_output {
                 unistd::dup2(write1.as_raw_fd(), 1).map_err(from_nix_error)?;
                 unistd::dup2(write2.as_raw_fd(), 2).map_err(from_nix_error)?;
-                drop(write1);
-                drop(write2);
+                write1.close()?;
+                write2.close()?;
             }
 
             init_tracee(events.has_rdtsc()).expect("init_tracee failed");
@@ -625,8 +626,8 @@ where
 
             let guest_pid = Pid::from(child);
             let child = Running::new(guest_pid);
-            drop(write1);
-            drop(write2);
+            write1.close()?;
+            write2.close()?;
 
             let stdout = read1.into();
             let stderr = read2.into();

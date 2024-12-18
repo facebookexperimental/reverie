@@ -17,6 +17,7 @@ use std::os::fd::AsRawFd;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
+use close_err::Closable;
 #[allow(unused_imports)]
 use nix::sys::wait;
 #[allow(unused_imports)]
@@ -267,7 +268,7 @@ fn child_should_inherit_fds() {
         let msg: [u8; 8] = [0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8];
         match unsafe { unistd::fork() } {
             Ok(ForkResult::Parent { child, .. }) => {
-                drop(fdwrite);
+                fdwrite.close().expect("close failed");
                 let mut buf: [u8; 8] = [0; 8];
                 assert_eq!(unistd::read(fdread.as_raw_fd(), &mut buf), Ok(8));
                 assert_eq!(buf, msg);
@@ -276,7 +277,7 @@ fn child_should_inherit_fds() {
                 unreachable!();
             }
             Ok(ForkResult::Child) => {
-                drop(fdread);
+                fdread.close().expect("close failed");
                 assert_eq!(unistd::write(&fdwrite, &msg), Ok(8));
                 unsafe { libc::syscall(libc::SYS_exit_group, 0) };
                 unreachable!();
