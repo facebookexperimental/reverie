@@ -12,7 +12,7 @@ license = "BSD-2-Clause"
 anyhow = "1.0.95"
 async-trait = "0.1.71"
 bincode = "1.3.3"
-bytes = { version = "1.6.0", features = ["serde"] }
+bytes = { version = "1.9.0", features = ["serde"] }
 close-err = "1.0.2"
 futures = { version = "0.3.30", features = ["async-await", "compat"] }
 goblin = "0.5.2"
