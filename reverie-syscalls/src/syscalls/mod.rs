@@ -478,7 +478,7 @@ syscall_list! {
         // Missing: fsconfig => Fsconfig,
         // Missing: fsmount => Fsmount,
         // Missing: fspick => Fspick,
-        // Missing: pidfd_open => PidfdOpen,
+        pidfd_open => PidfdOpen,
         clone3 => Clone3,
         // Missing: close_range => CloseRange,
         // Missing: openat2 => Openat2,
@@ -3358,6 +3358,13 @@ typed_syscall! {
 typed_syscall! {
     pub struct MemfdCreate {
         name: Option<PathPtr>,
+        flags: u32,
+    }
+}
+
+typed_syscall! {
+    pub struct PidfdOpen {
+        pid: u32,
         flags: u32,
     }
 }
