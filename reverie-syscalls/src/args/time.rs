@@ -48,6 +48,16 @@ impl From<libc::statx_timestamp> for Timespec {
     }
 }
 
+impl From<Timespec> for libc::statx_timestamp {
+    fn from(tp: Timespec) -> Self {
+        libc::statx_timestamp {
+            tv_sec: tp.tv_sec as _,
+            tv_nsec: tp.tv_nsec as _,
+            __statx_timestamp_pad1: [0],
+        }
+    }
+}
+
 impl From<libc::timeval> for Timespec {
     fn from(tv: libc::timeval) -> Self {
         Timespec {
