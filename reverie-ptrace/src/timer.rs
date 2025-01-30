@@ -75,8 +75,8 @@ pub(crate) fn get_rcb_perf_config() -> u64 {
         (0x17, 0x8) => 0x5100d1,  // AMD Zen, Pinnacle Ridge
         (0x17, 0x31) => 0x5100d1, // AMD Zen, Castle Peak
         (0x17, 0x71) => 0x5100d1, // AMD Zen 2, Matisse
-        (0x19, 0x01) => 0x5100d1, // AMD Zen, Milan
-        (0x19, 0x50) => 0x5100d1, // AMD Zen, Cezanne
+        (0x19, _) => 0x5100d1,    // AMD Zen 3 / Zen 4
+        (0x1A, _) => 0x5100d1,    // AMD Zen 5
         oth => panic!(
             "Unsupported processor with feature info: {:?}\n Full family_model: {:?}",
             fi, oth
@@ -404,7 +404,7 @@ impl EventStatus {
 /// Enabling Intel PEBS via precise_ip > 0 seems to reduce observed skid by 1/2,
 /// in synthetic benchmarks, though it makes counter _values_ incorrect. As a
 /// result, we choose 70.
-const SKID_MARGIN_RCBS: u64 = 70;
+const SKID_MARGIN_RCBS: u64 = 10_000;
 
 /// We refuse to schedule a "perf timeout" for this or fewer RCBs, instead
 /// choosing to directly single step. This is because I am somewhat paranoid

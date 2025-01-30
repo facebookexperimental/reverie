@@ -315,39 +315,14 @@ fn check_working_counters(precise_ip: bool) -> Result<(), PmuValidationError> {
 }
 
 /// check the cpu feature id to determine if it is a AMD-Zen vs AmdF15R30
-/// This is much simpler in c++ because eax is available directly
 #[cfg(target_arch = "x86_64")]
-fn is_amd_zen(cpu_feature: raw_cpuid::FeatureInfo) -> bool {
-    let family_id = cpu_feature.base_family_id(); // 4 bits
-    let model_id = cpu_feature.base_model_id(); // 4 bits
-    let ext_model_id = cpu_feature.extended_model_id(); // 4 bits
-    let ext_family_id = cpu_feature.extended_family_id(); // 8 bits
-
-    // This is reconstructing cpu_info.eax & 0xf0ff0
-    let cpu_type: u32 =
-        ((model_id as u32) << 4) | ((family_id as u32) << 8) | ((ext_model_id as u32) << 16);
-
-    // There are lots of magic numbers here. They come directly from
-    // https://github.com/rr-debugger/rr/blob/master/src/PerfCounters_x86.h
-    matches!(
-        (cpu_type, ext_family_id),
-        (
-            0x00f10 // Naples, Whitehaven, Summit Ridge, Snowy Owl (Zen), Milan (Zen 3) (UNTESTED)
-            | 0x10f10 // Raven Ridge, Great Horned Owl (Zen) (UNTESTED)
-            | 0x10f80 // Banded Kestrel (Zen), Picasso (Zen+) (UNTESTED)
-            | 0x20f00 // Dali (Zen) (UNTESTED)
-            | 0x00f80 // Colfax, Pinnacle Ridge (Zen+) (UNTESTED)
-            | 0x30f10 // Rome, Castle Peak (Zen 2)
-            | 0x60f00 // Renoir (Zen 2) (UNTESTED)
-            | 0x70f10 // Matisse (Zen 2) (UNTESTED)
-            | 0x60f80, // Lucienne
-            0x8 | 0xa
-        ) | (
-            0x20f10 // Vermeer (Zen 3)
-            | 0x50f00, // Cezanne (Zen 3)
-            0xa
-        )
-    )
+fn is_amd_zen(fi: raw_cpuid::FeatureInfo) -> bool {
+    match fi.family_id() {
+        0x17 => true, // Zen 1 / Zen 2
+        0x19 => true, // Zen 3 / Zen 4
+        0x1A => true, // Zen 5
+        _ => false,
+    }
 }
 
 /// This is a transcription of the function with the same name in Mozilla-RR it will
