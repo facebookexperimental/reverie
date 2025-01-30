@@ -16,7 +16,7 @@ use tracing::warn;
 
 use crate::perf::do_branches;
 use crate::perf::PerfCounter;
-use crate::timer::get_rcb_perf_config;
+use crate::timer::get_pmu_config;
 use crate::timer::has_precise_ip;
 
 const IN_TXCP: u64 = 1 << 33;
@@ -104,7 +104,11 @@ fn init_perf_event_attr(
 
 /// Create a template perf_event_attr for ticks
 fn ticks_attr(precise_ip: bool) -> perf::perf_event_attr {
-    init_perf_event_attr(perf::PERF_TYPE_RAW, get_rcb_perf_config(), precise_ip)
+    init_perf_event_attr(
+        perf::PERF_TYPE_RAW,
+        get_pmu_config().raw_rcb_event(),
+        precise_ip,
+    )
 }
 
 /// Create a template perf_event_attr for cycles

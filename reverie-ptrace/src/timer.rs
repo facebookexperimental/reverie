@@ -32,6 +32,7 @@
 use std::cmp::Ordering::Equal;
 use std::cmp::Ordering::Greater;
 use std::cmp::Ordering::Less;
+use std::sync::LazyLock;
 
 use reverie::Errno;
 use reverie::Pid;
@@ -53,50 +54,110 @@ use crate::perf::*;
 // This signal is unused, in that the kernel will never send it to a process.
 const MARKER_SIGNAL: Signal = reverie::PERF_EVENT_SIGNAL;
 
-#[cfg(target_arch = "x86_64")]
-pub(crate) fn get_rcb_perf_config() -> u64 {
-    let c = raw_cpuid::CpuId::new();
-    let fi = c.get_feature_info().unwrap();
-    // based on rr's PerfCounters_x86.h and PerfCounters.cc
-    match (fi.family_id(), fi.model_id()) {
-        (0x06, 0x1A) | (0x06, 0x1E) | (0x06, 0x2E) => 0x5101c4, // Intel Nehalem
-        (0x06, 0x25) | (0x06, 0x2C) | (0x06, 0x2F) => 0x5101c4, // Intel Westmere
-        (0x06, 0x2A) | (0x06, 0x2D) | (0x06, 0x3E) => 0x5101c4, // Intel SanyBridge
-        (0x06, 0x3A) => 0x5101c4,                               // Intel IvyBridge
-        (0x06, 0x3C) | (0x06, 0x3F) | (0x06, 0x45) | (0x06, 0x46) => 0x5101c4, // Intel Haswell
-        (0x06, 0x3D) | (0x06, 0x47) | (0x06, 0x4F) | (0x06, 0x56) => 0x5101c4, // Intel Broadwell
-        (0x06, 0x4E) | (0x06, 0x55) | (0x06, 0x5E) => 0x5101c4, // Intel Skylake
-        (0x06, 0x8E) | (0x06, 0x9E) => 0x5101c4,                // Intel Kabylake
-        (0x06, 0xA5) | (0x06, 0xA6) => 0x5101c4,                // Intel Cometlake
-        (0x06, 0x8D) => 0x5101c4, // Intel Tiger Lake (e.g. i7-11800H laptop)
-        (0x06, 0x9A) => 0x5101c4, // Intel Alder Lake (e.g. i7-12700H laptop)
-        (0x06, 0x8F) => 0x5101c4, // Intel Sapphire Rapids
-        (0x06, 0x86) => 0x5101c4, // Intel Icelake
-        (0x17, 0x8) => 0x5100d1,  // AMD Zen, Pinnacle Ridge
-        (0x17, 0x31) => 0x5100d1, // AMD Zen, Castle Peak
-        (0x17, 0x71) => 0x5100d1, // AMD Zen 2, Matisse
-        (0x19, _) => 0x5100d1,    // AMD Zen 3 / Zen 4
-        (0x1A, _) => 0x5100d1,    // AMD Zen 5
-        oth => panic!(
-            "Unsupported processor with feature info: {:?}\n Full family_model: {:?}",
-            fi, oth
-        ),
-    }
+/// We refuse to schedule a "perf timeout" for this or fewer RCBs, instead
+/// choosing to directly single step. This is because I am somewhat paranoid
+/// about perf event throttling, which isn't well-documented.
+const SINGLESTEP_TIMEOUT_RCBS: u64 = 5;
+
+pub fn get_pmu_config() -> &'static PmuConfig {
+    static PMU_CONFIG: LazyLock<PmuConfig> = LazyLock::new(PmuConfig::new);
+    &PMU_CONFIG
 }
 
-#[cfg(target_arch = "aarch64")]
-pub(crate) fn get_rcb_perf_config() -> u64 {
-    // TODO:
-    //  1. Compute the microarchitecture from
-    //     `/sys/devices/system/cpu/cpu*/regs/identification/midr_el1`
-    //  2. Look up the microarchitecture in a table to determine what features
-    //     we can enable.
-    // References:
-    //  - https://github.com/rr-debugger/rr/blob/master/src/PerfCounters.cc#L156
-    const BR_RETIRED: u64 = 0x21;
+pub struct PmuConfig {
+    rcb_event: u64,
+    skid_margin: u64,
+}
 
-    // For now, always assume that we can get retired branch events.
-    BR_RETIRED
+impl PmuConfig {
+    /// Creates / initializes the PMU config.
+    #[cfg(target_arch = "x86_64")]
+    pub fn new() -> Self {
+        let c = raw_cpuid::CpuId::new();
+        let fi = c.get_feature_info().unwrap();
+        Self::from_cpuid_features(fi)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn new() -> Self {
+        // TODO:
+        //  1. Compute the microarchitecture from
+        //     `/sys/devices/system/cpu/cpu*/regs/identification/midr_el1`
+        //  2. Look up the microarchitecture in a table to determine what features
+        //     we can enable.
+        // References:
+        //  - https://github.com/rr-debugger/rr/blob/master/src/PerfCounters.cc#L156
+        const BR_RETIRED: u64 = 0x21;
+
+        // For now, always assume that we can get retired branch events.
+        Self {
+            rcb_event: BR_RETIRED,
+            skid_margin: 1000,
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn from_cpuid_features(fi: raw_cpuid::FeatureInfo) -> Self {
+        // based on rr's PerfCounters_x86.h and PerfCounters.cc
+        let (rcb_event, skid_margin) = match fi.family_id() {
+            // Intel
+            0x06 => match fi.model_id() {
+                0x1A | 0x1E | 0x2E => (0x5101c4, 100),        // Intel Nehalem
+                0x25 | 0x2C | 0x2F => (0x5101c4, 100),        // Intel Westmere
+                0x2A | 0x2D | 0x3E => (0x5101c4, 100),        // Intel Sandy Bridge
+                0x3A => (0x5101c4, 100),                      // Intel Ivy Bridge
+                0x3C | 0x3F | 0x45 | 0x46 => (0x5101c4, 100), // Intel Haswell
+                0x3D | 0x47 | 0x4F | 0x56 => (0x5101c4, 100), // Intel Broadwell
+                0x4E | 0x55 | 0x5E => (0x5101c4, 100),        // Intel Skylake
+                0x8E | 0x9E => (0x5101c4, 100),               // Intel Kabylake
+                0xA5 | 0xA6 => (0x5101c4, 100),               // Intel Cometlake
+                0x8D => (0x5101c4, 100),                      // Intel Tiger Lake
+                0x9A => (0x5101c4, 125),                      // Intel Alder Lake
+                0x8F => (0x5101c4, 125),                      // Intel Sapphire Rapids
+                0x86 => (0x5101c4, 100),                      // Intel Icelake
+                model => panic!("Unsupported Intel processor model: {:#x}", model),
+            },
+            // AMD Zen 1-5
+            0x17 | 0x19 | 0x1A => (0x5100d1, 10000),
+            family => panic!(
+                "Unsupported processor family, model: ({:#x},{:#x})",
+                family,
+                fi.model_id()
+            ),
+        };
+
+        Self {
+            rcb_event,
+            skid_margin,
+        }
+    }
+
+    /// This is the experimentally determined maximum number of RCBs an overflow
+    /// interrupt is delivered after the originating RCB.
+    ///
+    /// If this is number is too small, timer event delivery will be delayed and
+    /// non-deterministic, which, if observed, will result in a panic. If this
+    /// number is too big, we degrade performance from excessive single
+    /// stepping.
+    pub fn skid_margin(&self) -> u64 {
+        self.skid_margin
+    }
+
+    /// The maximum single step count we expect can occur when a precise timer
+    /// event is requested that leaves less than the minimum perf timeout
+    /// remaining.
+    pub fn max_single_step_count(&self) -> u64 {
+        self.skid_margin + SINGLESTEP_TIMEOUT_RCBS
+    }
+
+    /// The event needed to configure the PMU and observe RCBs.
+    pub fn rcb_event(&self) -> Event {
+        Event::Raw(self.rcb_event)
+    }
+
+    pub fn raw_rcb_event(&self) -> u64 {
+        self.rcb_event
+    }
 }
 
 /// Returns true if the current CPU supports precise_ip.
@@ -361,7 +422,9 @@ impl ActiveEvent {
                 clock_target,
                 offset: _,
             } => {
-                if clock_target.saturating_sub(curr_clock) > MAX_SINGLE_STEP_COUNT {
+                if clock_target.saturating_sub(curr_clock)
+                    > get_pmu_config().max_single_step_count()
+                {
                     Some(TimerEventRequest::Precise(*clock_target - curr_clock))
                 } else {
                     None
@@ -391,29 +454,6 @@ impl EventStatus {
         *self = self.next()
     }
 }
-
-/// This is the experimentally determined maximum number of RCBs an overflow
-/// interrupt is delivered after the originating RCB.
-///
-/// If this is number is too small, timer event delivery will be delayed and
-/// non-deterministic, which, if observed, will result in a panic.
-/// If this number is too big, we degrade performance from excessive single
-/// stepping.
-///
-/// `rr` uses a value of 100 for almost all platforms, but with precise_ip = 0.
-/// Enabling Intel PEBS via precise_ip > 0 seems to reduce observed skid by 1/2,
-/// in synthetic benchmarks, though it makes counter _values_ incorrect. As a
-/// result, we choose 70.
-const SKID_MARGIN_RCBS: u64 = 10_000;
-
-/// We refuse to schedule a "perf timeout" for this or fewer RCBs, instead
-/// choosing to directly single step. This is because I am somewhat paranoid
-/// about perf event throttling, which isn't well-documented.
-const SINGLESTEP_TIMEOUT_RCBS: u64 = 5;
-
-/// The maximum single step count we expect can occur when a precise timer event
-/// is requested that leaves less than the minimum perf timeout remaining.
-const MAX_SINGLE_STEP_COUNT: u64 = SKID_MARGIN_RCBS + SINGLESTEP_TIMEOUT_RCBS;
 
 /// This ClockCounter represents a pair in a form of (rcb, instr) that gets increased
 /// while single-stepping to reach target (target_rcb, target_instr)
@@ -490,7 +530,7 @@ impl ClockCounter {
 
 impl TimerImpl {
     pub fn new(guest_pid: Pid, guest_tid: Tid) -> Result<Self, Errno> {
-        let evt = Event::Raw(get_rcb_perf_config());
+        let evt = get_pmu_config().rcb_event();
 
         // measure the target tid irrespective of CPU
         let mut builder = Builder::new(guest_tid.as_raw(), -1);
@@ -533,7 +573,7 @@ impl TimerImpl {
     pub fn request_event(&mut self, evt: TimerEventRequest) -> Result<(), Errno> {
         let (delivery, notification) = match evt {
             TimerEventRequest::Precise(ticks) | TimerEventRequest::PreciseInstruction(ticks, _) => {
-                (ticks, ticks.saturating_sub(SKID_MARGIN_RCBS))
+                (ticks, ticks.saturating_sub(get_pmu_config().skid_margin()))
             }
             TimerEventRequest::Imprecise(ticks) => (ticks, ticks),
         };
@@ -701,19 +741,20 @@ impl TimerImpl {
         assert!(
             ctr_initial <= target_rcb,
             "Clock perf counter exceeds target value at start of attempted single-step: \
-                {} > {}. Consider increasing SKID_MARGIN_RCBS.",
+                {} > {}. Consider increasing skid margin for this CPU.",
             ctr_initial,
             target_rcb
         );
         let mut current = ClockCounter::new(ctr_initial, 0, target_rcb);
+        let max_single_step_count = get_pmu_config().max_single_step_count();
         assert!(
-            target_rcb - current.rcbs() <= MAX_SINGLE_STEP_COUNT,
+            target_rcb - current.rcbs() <= max_single_step_count,
             "Single steps from {} to {} requested ({} steps), but that exceeds the skid margin + minimum perf timer steps ({}). \
                 This probably indicates a bug",
             current.rcbs(),
             target_rcb,
             (target_rcb - current.rcbs()),
-            MAX_SINGLE_STEP_COUNT
+            max_single_step_count
         );
         debug!(
             "Timer will single-step from ctr {} to {}",
