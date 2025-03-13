@@ -9,4 +9,4 @@ repository = "https://github.com/facebookexperimental/reverie"
 license = "BSD-2-Clause"
 
 [dependencies]
-syscalls = { version = "0.6.7", features = ["serde"] }
+syscalls = { version = "0.6.18", features = ["serde"] }
