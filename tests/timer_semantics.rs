@@ -11,16 +11,10 @@
 //! Syscalls are abused to communicate from the guest to the tool instructions
 //! necessary to carry out the test, such as setting timers or reading clocks.
 
+use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::sync::Mutex;
 
-use reverie::syscalls::Getpid;
-use reverie::syscalls::Gettid;
-use reverie::syscalls::Syscall;
-use reverie::syscalls::SyscallInfo;
-use reverie::syscalls::Sysno;
-use reverie::syscalls::Tgkill;
 use reverie::Errno;
 use reverie::Error;
 use reverie::GlobalTool;
@@ -30,6 +24,12 @@ use reverie::Signal;
 use reverie::Subscription;
 use reverie::TimerSchedule;
 use reverie::Tool;
+use reverie::syscalls::Getpid;
+use reverie::syscalls::Gettid;
+use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallInfo;
+use reverie::syscalls::Sysno;
+use reverie::syscalls::Tgkill;
 use reverie_ptrace::regs::RegAccess;
 use serde::Deserialize;
 use serde::Serialize;

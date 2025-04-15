@@ -18,14 +18,14 @@ use serde::Deserialize;
 use serde::Serialize;
 use syscalls::Errno;
 
+use super::Command;
+use super::ExitStatus;
+use super::Pid;
 use super::seccomp::SeccompNotif;
 use super::stdio::ChildStderr;
 use super::stdio::ChildStdin;
 use super::stdio::ChildStdout;
 use super::stdio::Stdio;
-use super::Command;
-use super::ExitStatus;
-use super::Pid;
 
 /// Represents a child process.
 ///
@@ -237,8 +237,8 @@ struct WaitForChild<'a> {
 
 impl<'a> WaitForChild<'a> {
     fn new(child: &'a mut Child) -> io::Result<Self> {
-        use tokio::signal::unix::signal;
         use tokio::signal::unix::SignalKind;
+        use tokio::signal::unix::signal;
 
         Ok(Self {
             signal: signal(SignalKind::child())?,

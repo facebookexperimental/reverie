@@ -28,8 +28,8 @@ use std::compile_error;
 
 use lazy_static::lazy_static;
 use nix::sys::signal::Signal;
-use nix::unistd::sysconf;
 use nix::unistd::SysconfVar;
+use nix::unistd::sysconf;
 use perf_event_open_sys::bindings as perf;
 use perf_event_open_sys::ioctls;
 use reverie::Errno;
@@ -37,8 +37,8 @@ use reverie::Tid;
 use tracing::info;
 use tracing::warn;
 
-use crate::validation::check_for_pmu_bugs;
 use crate::validation::PmuValidationError;
+use crate::validation::check_for_pmu_bugs;
 
 lazy_static! {
     static ref PMU_BUG: Result<(), PmuValidationError> = check_for_pmu_bugs();
@@ -495,8 +495,8 @@ unsafe fn read_once(v: *mut u32) -> u32 {
 
 #[inline(always)]
 fn smp_rmb() {
-    use core::sync::atomic::compiler_fence;
     use core::sync::atomic::Ordering::SeqCst;
+    use core::sync::atomic::compiler_fence;
     compiler_fence(SeqCst);
 }
 

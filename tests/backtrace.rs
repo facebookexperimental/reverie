@@ -10,11 +10,11 @@
 
 #![cfg(not(sanitized))]
 
-use reverie::syscalls::Syscall;
 use reverie::Error;
 use reverie::ExitStatus;
 use reverie::Guest;
 use reverie::Tool;
+use reverie::syscalls::Syscall;
 
 #[derive(Debug, Default, Clone)]
 struct TestTool;

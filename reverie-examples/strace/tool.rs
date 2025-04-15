@@ -6,10 +6,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use reverie::syscalls::Displayable;
-use reverie::syscalls::Errno;
-use reverie::syscalls::Syscall;
-use reverie::syscalls::SyscallInfo;
 use reverie::Error;
 use reverie::ExitStatus;
 use reverie::GlobalRPC;
@@ -19,6 +15,10 @@ use reverie::Signal;
 use reverie::Subscription;
 use reverie::Tid;
 use reverie::Tool;
+use reverie::syscalls::Displayable;
+use reverie::syscalls::Errno;
+use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallInfo;
 
 use crate::config::Config;
 use crate::global_state::GlobalState;

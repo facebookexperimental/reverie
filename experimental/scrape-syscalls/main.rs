@@ -20,9 +20,9 @@ use std::process::Stdio;
 use std::slice;
 
 use clap::Parser;
+use goblin::elf::Elf;
 use goblin::elf::section_header::SectionHeader;
 use goblin::elf::sym::Sym;
-use goblin::elf::Elf;
 use scroll::Pread;
 
 use self::syscall_info::*;

@@ -27,8 +27,9 @@ pub use nix::sys::stat::Mode;
 pub use nix::sys::timerfd::TimerFlags;
 pub use nix::sys::wait::WaitPidFlag;
 
+use crate::Addr;
+use crate::AddrMut;
 use crate::args;
-use crate::args::ioctl;
 use crate::args::CArrayPtr;
 use crate::args::CStrPtr;
 use crate::args::ClockId;
@@ -42,10 +43,9 @@ use crate::args::Timespec;
 use crate::args::TimespecMutPtr;
 use crate::args::TimevalMutPtr;
 use crate::args::Timezone;
+use crate::args::ioctl;
 use crate::display::Displayable;
 use crate::raw::FromToRaw;
-use crate::Addr;
-use crate::AddrMut;
 
 /// A trait that all syscalls implement.
 pub trait SyscallInfo: Displayable + Copy + Send {

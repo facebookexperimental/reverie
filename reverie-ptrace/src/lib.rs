@@ -50,8 +50,8 @@ mod validation;
 mod vdso;
 
 pub use perf::is_perf_supported;
-pub use tracer::spawn_fn;
-pub use tracer::spawn_fn_with_config;
 pub use tracer::GdbConnection;
 pub use tracer::Tracer;
 pub use tracer::TracerBuilder;
+pub use tracer::spawn_fn;
+pub use tracer::spawn_fn_with_config;

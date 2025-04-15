@@ -631,8 +631,8 @@ mod tests {
     async fn seccomp_notify() {
         use std::collections::HashMap;
 
-        use futures::future::select;
         use futures::future::Either;
+        use futures::future::select;
         use futures::stream::TryStreamExt;
         use syscalls::Sysno;
 

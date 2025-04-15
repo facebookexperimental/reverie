@@ -20,9 +20,9 @@ use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::io::ReadBuf;
 
-use super::fd::pipe;
 use super::fd::AsyncFd;
 use super::fd::Fd;
+use super::fd::pipe;
 
 /// Describes what to do with a standard I/O stream for a child process when
 /// passed to the [`stdin`], [`stdout`], and [`stderr`] methods of [`Command`].

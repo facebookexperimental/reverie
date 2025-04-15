@@ -7,11 +7,11 @@
  */
 
 use clap::Parser;
-use reverie::syscalls::Displayable;
-use reverie::syscalls::Syscall;
 use reverie::Error;
 use reverie::Guest;
 use reverie::Tool;
+use reverie::syscalls::Displayable;
+use reverie::syscalls::Syscall;
 use reverie_util::CommonToolArguments;
 
 #[derive(Default)]

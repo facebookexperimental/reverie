@@ -9,6 +9,9 @@
 // signal handling related tests.
 
 use nix::sys::signal::Signal;
+use reverie::Error;
+use reverie::Guest;
+use reverie::Tool;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::ExitGroup;
 use reverie::syscalls::MemoryAccess;
@@ -16,9 +19,6 @@ use reverie::syscalls::RtSigpending;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
-use reverie::Error;
-use reverie::Guest;
-use reverie::Tool;
 
 #[derive(Debug, Default, Clone)]
 struct LocalState;

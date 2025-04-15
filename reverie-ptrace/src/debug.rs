@@ -12,9 +12,9 @@ use core::fmt;
 
 use nix::sys::ptrace;
 use nix::sys::signal;
+use reverie::Pid;
 use reverie::syscalls::Addr;
 use reverie::syscalls::MemoryAccess;
-use reverie::Pid;
 use safeptrace::Stopped;
 use tracing::debug;
 

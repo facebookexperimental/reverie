@@ -16,18 +16,18 @@
 
 use nix::sys::signal;
 use nix::sys::signal::Signal;
+use reverie::Error;
+use reverie::Guest;
+use reverie::Tool;
 use reverie::syscalls::Errno;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
 use reverie::syscalls::Tgkill;
-use reverie::Error;
-use reverie::Guest;
-use reverie::Tool;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::time::sleep;
 use tokio::time::Duration;
+use tokio::time::sleep;
 
 #[derive(Debug, Default, Clone)]
 struct LocalState;

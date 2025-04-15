@@ -13,8 +13,8 @@ use std::io;
 use byteorder::NativeEndian;
 use byteorder::ReadBytesExt;
 
-use crate::syscalls::Addr;
 use crate::Pid;
+use crate::syscalls::Addr;
 
 /// Represents the auxv table of a process.
 ///

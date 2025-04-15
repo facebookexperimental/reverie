@@ -41,14 +41,14 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
-use crate::gdbstub::hex::*;
-use crate::gdbstub::request::*;
-use crate::gdbstub::response::*;
 use crate::gdbstub::BreakpointType;
 use crate::gdbstub::Inferior;
 use crate::gdbstub::InferiorThreadId;
 use crate::gdbstub::ResumeInferior;
 use crate::gdbstub::StoppedInferior;
+use crate::gdbstub::hex::*;
+use crate::gdbstub::request::*;
+use crate::gdbstub::response::*;
 use crate::regs::RegAccess;
 
 mod base;

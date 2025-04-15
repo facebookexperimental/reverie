@@ -15,8 +15,8 @@ use std::io;
 use std::os::unix::io::AsRawFd;
 
 use syscalls::Errno;
-use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
+use tokio::io::unix::AsyncFd;
 
 use crate::fd::Fd;
 

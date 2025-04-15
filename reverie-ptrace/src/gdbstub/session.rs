@@ -26,16 +26,12 @@ use reverie::Pid;
 use safeptrace::ChildOp;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc;
-use tokio::sync::oneshot;
 use tokio::sync::MappedMutexGuard;
 use tokio::sync::Mutex;
 use tokio::sync::MutexGuard;
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 
-use super::commands;
-use super::commands::*;
-use super::regs::CoreRegs;
-use super::response::*;
 use super::Breakpoint;
 use super::BreakpointType;
 use super::Error;
@@ -45,6 +41,10 @@ use super::InferiorThreadId;
 use super::Packet;
 use super::ResumeInferior;
 use super::StoppedInferior;
+use super::commands;
+use super::commands::*;
+use super::regs::CoreRegs;
+use super::response::*;
 
 type BoxWriter = Box<dyn AsyncWrite + Unpin + Send + Sync + 'static>;
 

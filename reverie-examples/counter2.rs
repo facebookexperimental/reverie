@@ -13,8 +13,6 @@ use core::sync::atomic::Ordering;
 use std::sync::Mutex;
 
 use clap::Parser;
-use reverie::syscalls::Syscall;
-use reverie::syscalls::SyscallInfo;
 use reverie::Error;
 use reverie::ExitStatus;
 use reverie::GlobalRPC;
@@ -23,6 +21,8 @@ use reverie::Guest;
 use reverie::Pid;
 use reverie::Tid;
 use reverie::Tool;
+use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallInfo;
 use reverie_util::CommonToolArguments;
 use serde::Deserialize;
 use serde::Serialize;

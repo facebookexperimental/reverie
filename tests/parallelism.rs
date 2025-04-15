@@ -7,14 +7,14 @@
  */
 
 //! Tests for parallelism and concurrency
-use reverie::syscalls::Syscall;
 use reverie::Error;
 use reverie::GlobalTool;
 use reverie::Guest;
 use reverie::Tid;
 use reverie::Tool;
-use tokio::time::sleep;
+use reverie::syscalls::Syscall;
 use tokio::time::Duration;
+use tokio::time::sleep;
 
 #[derive(Debug, Default)]
 struct GlobalState {}

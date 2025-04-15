@@ -9,10 +9,10 @@
 //! Tests that syscall suppression works. That is, when we intercept a syscall,
 //! we should not run the real syscall.
 
-use reverie::syscalls::Syscall;
 use reverie::Error;
 use reverie::Guest;
 use reverie::Tool;
+use reverie::syscalls::Syscall;
 
 #[derive(Debug, Default, Clone)]
 struct TestTool;
@@ -40,8 +40,8 @@ impl Tool for TestTool {
 #[cfg(all(not(sanitized), test))]
 mod tests {
     use reverie_ptrace::testing::check_fn;
-    use syscalls::syscall;
     use syscalls::Sysno;
+    use syscalls::syscall;
 
     use super::*;
 

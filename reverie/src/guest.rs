@@ -13,6 +13,8 @@ use reverie_syscalls::Errno;
 use reverie_syscalls::MemoryAccess;
 use reverie_syscalls::SyscallInfo;
 
+use crate::Never;
+use crate::Pid;
 use crate::auxv::Auxv;
 use crate::backtrace::Backtrace;
 use crate::error::Error;
@@ -21,8 +23,6 @@ use crate::timer::TimerSchedule;
 use crate::tool::GlobalRPC;
 use crate::tool::GlobalTool;
 use crate::tool::Tool;
-use crate::Never;
-use crate::Pid;
 
 /// A representation of a guest task (thread).
 #[async_trait]

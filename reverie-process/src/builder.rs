@@ -18,15 +18,15 @@ use std::path::PathBuf;
 
 use syscalls::Errno;
 
-use super::seccomp;
-use super::util::to_cstring;
-use super::util::CStringArray;
 use super::Command;
 use super::Container;
 use super::Mount;
 use super::Namespace;
 use super::PtyChild;
 use super::Stdio;
+use super::seccomp;
+use super::util::CStringArray;
+use super::util::to_cstring;
 
 impl Command {
     /// Constructs a new `Command` for launching the program at path `program`,

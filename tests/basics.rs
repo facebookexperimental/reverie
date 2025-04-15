@@ -26,15 +26,15 @@ use nix::sys::wait::WaitStatus;
 use nix::unistd;
 #[allow(unused_imports)]
 use nix::unistd::ForkResult;
-use reverie::syscalls::Syscall;
-use reverie::syscalls::SyscallInfo;
-use reverie::syscalls::Sysno;
 use reverie::Error;
 use reverie::ExitStatus;
 use reverie::GlobalTool;
 use reverie::Guest;
 use reverie::Pid;
 use reverie::Tool;
+use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallInfo;
+use reverie::syscalls::Sysno;
 #[allow(unused_imports)]
 use reverie_ptrace::testing::check_fn;
 #[allow(unused_imports)]
@@ -194,8 +194,8 @@ fn orphans() {
     use std::thread;
     use std::time::Duration;
 
-    use nix::unistd::fork;
     use nix::unistd::ForkResult;
+    use nix::unistd::fork;
 
     let (output, _state) = test_fn::<CounterLocal, _>(|| {
         // Spawn a child process and make sure the parent exits before the child

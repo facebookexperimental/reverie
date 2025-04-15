@@ -9,12 +9,14 @@
 use std::io;
 use std::io::Write;
 
+use super::Child;
+use super::Command;
 use super::clone::clone;
 use super::container::ChildContext;
 use super::error::Context;
 use super::error::Error;
-use super::fd::pipe;
 use super::fd::Fd;
+use super::fd::pipe;
 use super::id_map::make_id_map;
 use super::seccomp::SeccompNotif;
 use super::stdio::ChildStderr;
@@ -22,8 +24,6 @@ use super::stdio::ChildStdin;
 use super::stdio::ChildStdout;
 use super::util::CStringArray;
 use super::util::SharedValue;
-use super::Child;
-use super::Command;
 
 impl Command {
     /// Executes the command as a child process, returning a handle to it.

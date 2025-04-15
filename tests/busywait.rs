@@ -17,7 +17,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
-use reverie::syscalls::Syscall;
 use reverie::CpuIdResult;
 use reverie::Errno;
 use reverie::Error;
@@ -30,6 +29,7 @@ use reverie::Signal;
 use reverie::Tid;
 use reverie::TimerSchedule;
 use reverie::Tool;
+use reverie::syscalls::Syscall;
 use serde::Deserialize;
 use serde::Serialize;
 

@@ -14,9 +14,14 @@
 
 use async_trait::async_trait;
 use reverie_syscalls::Syscall;
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
+use crate::ExitStatus;
+use crate::Pid;
+use crate::Signal;
+use crate::Subscription;
+use crate::Tid;
 use crate::error::Errno;
 use crate::error::Error;
 use crate::guest::Guest;
@@ -24,11 +29,6 @@ use crate::guest::Guest;
 use crate::rdtsc::Rdtsc;
 #[cfg(target_arch = "x86_64")]
 use crate::rdtsc::RdtscResult;
-use crate::ExitStatus;
-use crate::Pid;
-use crate::Signal;
-use crate::Subscription;
-use crate::Tid;
 
 /// The global half of a complete Reverie tool.
 ///

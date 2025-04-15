@@ -21,11 +21,11 @@ use std::os::unix::io::RawFd;
 use std::path::Path;
 
 use syscalls::Errno;
-use tokio::io::unix::AsyncFd as TokioAsyncFd;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::io::Interest;
 use tokio::io::ReadBuf;
+use tokio::io::unix::AsyncFd as TokioAsyncFd;
 
 use super::util;
 

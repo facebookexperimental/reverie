@@ -12,19 +12,19 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::io;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
-use std::sync::Mutex;
 
 use clap::Parser;
-use reverie::syscalls::Addr;
-use reverie::syscalls::MemoryAccess;
-use reverie::syscalls::Syscall;
 use reverie::Error;
 use reverie::GlobalTool;
 use reverie::Guest;
 use reverie::Tid;
 use reverie::Tool;
+use reverie::syscalls::Addr;
+use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::Syscall;
 use reverie_util::CommonToolArguments;
 use serde::Deserialize;
 use serde::Serialize;

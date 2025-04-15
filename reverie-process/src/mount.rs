@@ -19,9 +19,9 @@ use std::path::Path;
 pub use nix::mount::MsFlags as MountFlags;
 use syscalls::Errno;
 
+use super::fd::FileType;
 use super::fd::create_dir_all;
 use super::fd::touch_path;
-use super::fd::FileType;
 use super::util;
 
 /// A mount.

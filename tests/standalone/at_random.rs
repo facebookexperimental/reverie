@@ -8,12 +8,12 @@
 
 use std::env;
 
-use reverie::syscalls::MemoryAccess;
 use reverie::Errno;
 use reverie::Error;
 use reverie::ExitStatus;
 use reverie::Guest;
 use reverie::Tool;
+use reverie::syscalls::MemoryAccess;
 
 #[derive(Debug, Default, Clone)]
 struct TestTool {}

@@ -6,16 +6,16 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 
-use reverie::syscalls::Addr;
-use reverie::syscalls::AddrMut;
-use reverie::syscalls::MemoryAccess;
 use reverie::Errno;
 use reverie::Pid;
 use reverie::Stack;
+use reverie::syscalls::Addr;
+use reverie::syscalls::AddrMut;
+use reverie::syscalls::MemoryAccess;
 use safeptrace::Error as TraceError;
 use safeptrace::Stopped;
 

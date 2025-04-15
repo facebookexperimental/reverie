@@ -8,12 +8,12 @@
 
 // signal handling related tests.
 
-use reverie::syscalls::ExitGroup;
-use reverie::syscalls::Syscall;
-use reverie::syscalls::SyscallInfo;
 use reverie::Error;
 use reverie::Guest;
 use reverie::Tool;
+use reverie::syscalls::ExitGroup;
+use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallInfo;
 use serde::Deserialize;
 use serde::Serialize;
 

@@ -9,13 +9,13 @@
 use std::path::PathBuf;
 
 use anyhow::Error;
+use reverie::Subscription;
+use reverie::Tool;
 use reverie::process::Command;
 use reverie::process::Mount;
 use reverie::process::Namespace;
 use reverie::process::Output;
 use reverie::process::Stdio;
-use reverie::Subscription;
-use reverie::Tool;
 use reverie_ptrace::GdbConnection;
 
 pub struct GdbServerCommand {

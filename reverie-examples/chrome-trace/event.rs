@@ -9,11 +9,11 @@
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-use reverie::syscalls::Sysno;
 use reverie::Errno;
 use reverie::ExitStatus;
 use reverie::Pid;
 use reverie::Tid;
+use reverie::syscalls::Sysno;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;

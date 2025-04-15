@@ -11,9 +11,6 @@ use std::fs;
 use std::str;
 use std::time::SystemTime;
 
-use reverie::syscalls::Displayable;
-use reverie::syscalls::Syscall;
-use reverie::syscalls::SyscallInfo;
 use reverie::Errno;
 use reverie::Error;
 use reverie::ExitStatus;
@@ -24,6 +21,9 @@ use reverie::Pid;
 use reverie::Subscription;
 use reverie::Tid;
 use reverie::Tool;
+use reverie::syscalls::Displayable;
+use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallInfo;
 use serde::Deserialize;
 use serde::Serialize;
 

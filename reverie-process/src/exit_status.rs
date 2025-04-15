@@ -152,10 +152,10 @@ impl<'de> serde::Deserialize<'de> for ExitStatus {
 mod tests_non_sanitized {
     use nix::sys::signal;
     use nix::sys::signal::Signal;
-    use nix::sys::wait::waitpid;
     use nix::sys::wait::WaitStatus;
-    use nix::unistd::fork;
+    use nix::sys::wait::waitpid;
     use nix::unistd::ForkResult;
+    use nix::unistd::fork;
 
     use super::*;
 

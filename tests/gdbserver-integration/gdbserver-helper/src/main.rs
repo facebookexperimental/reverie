@@ -14,8 +14,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 
-use anyhow::bail;
 use anyhow::Error;
+use anyhow::bail;
 use clap::Parser;
 use futures::future;
 use reverie::process::Output;

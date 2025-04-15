@@ -6,13 +6,13 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use reverie::Error;
+use reverie::Guest;
+use reverie::Tool;
 use reverie::syscalls::Errno;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::Timespec;
-use reverie::Error;
-use reverie::Guest;
-use reverie::Tool;
 
 #[derive(Debug, Default, Clone)]
 struct LocalState;

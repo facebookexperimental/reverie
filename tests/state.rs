@@ -8,11 +8,10 @@
 
 //! Tests for process and thread state.
 
+use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::sync::Mutex;
 
-use reverie::syscalls::Syscall;
 use reverie::Error;
 use reverie::ExitStatus;
 use reverie::GlobalRPC;
@@ -20,6 +19,7 @@ use reverie::GlobalTool;
 use reverie::Guest;
 use reverie::Pid;
 use reverie::Tool;
+use reverie::syscalls::Syscall;
 use serde::Deserialize;
 use serde::Serialize;
 

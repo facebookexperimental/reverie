@@ -29,14 +29,14 @@ use num_traits::CheckedAdd;
 use num_traits::CheckedMul;
 use num_traits::FromPrimitive;
 use num_traits::Zero;
-use serde::de;
-use serde::de::Visitor;
-use serde::ser;
-use serde::ser::SerializeSeq;
 use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
 use serde::Serializer;
+use serde::de;
+use serde::de::Visitor;
+use serde::ser;
+use serde::ser::SerializeSeq;
 use thiserror::Error;
 
 /// Decode gdb hex error code

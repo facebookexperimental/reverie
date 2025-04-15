@@ -12,12 +12,12 @@
 
 // signal handling related tests.
 
-use reverie::syscalls::Syscall;
-use reverie::syscalls::SyscallArgs;
-use reverie::syscalls::SyscallInfo;
 use reverie::Error;
 use reverie::Guest;
 use reverie::Tool;
+use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallArgs;
+use reverie::syscalls::SyscallInfo;
 
 #[derive(Debug, Default, Clone)]
 struct LocalStateVfork;

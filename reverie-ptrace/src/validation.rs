@@ -14,8 +14,8 @@ use thiserror::Error;
 use tracing::error;
 use tracing::warn;
 
-use crate::perf::do_branches;
 use crate::perf::PerfCounter;
+use crate::perf::do_branches;
 use crate::timer::get_pmu_config;
 use crate::timer::has_precise_ip;
 

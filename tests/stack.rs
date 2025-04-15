@@ -8,6 +8,10 @@
 
 //! Tests for process and thread state.
 
+use reverie::Error;
+use reverie::Guest;
+use reverie::Stack;
+use reverie::Tool;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::ExitGroup;
@@ -18,10 +22,6 @@ use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::Uname;
-use reverie::Error;
-use reverie::Guest;
-use reverie::Stack;
-use reverie::Tool;
 
 #[derive(Debug, Default, Clone)]
 struct LocalState;

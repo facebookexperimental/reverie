@@ -9,9 +9,9 @@
 use reverie::Pid;
 use tokio::sync::mpsc;
 
-use super::commands::*;
 use super::Error;
 use super::GdbRequest;
+use super::commands::*;
 
 /// Thread id and Pid use to uniquely indentify an inferior.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

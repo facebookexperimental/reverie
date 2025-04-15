@@ -8,11 +8,11 @@
 
 #![cfg(not(sanitized))]
 
-use reverie::syscalls;
 use reverie::Error;
 use reverie::Guest;
 use reverie::Pid;
 use reverie::Tool;
+use reverie::syscalls;
 
 #[test]
 fn thread_start_inject() {

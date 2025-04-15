@@ -11,15 +11,15 @@ use std::env;
 use std::mem;
 
 use nix::unistd;
-use reverie::syscalls::Displayable;
-use reverie::syscalls::MemoryAccess;
-use reverie::syscalls::Syscall;
-use reverie::syscalls::Sysno;
 use reverie::Error;
 use reverie::GlobalTool;
 use reverie::Guest;
 use reverie::Pid;
 use reverie::Tool;
+use reverie::syscalls::Displayable;
+use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::Syscall;
+use reverie::syscalls::Sysno;
 use tracing::warn;
 
 #[derive(Debug, Default, Clone)]

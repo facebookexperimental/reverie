@@ -199,12 +199,12 @@ mod test {
     use std::ffi::CString;
 
     use nix::sys::ptrace;
-    use nix::sys::signal::raise;
     use nix::sys::signal::Signal;
-    use nix::sys::wait::waitpid;
+    use nix::sys::signal::raise;
     use nix::sys::wait::WaitStatus;
-    use nix::unistd::fork;
+    use nix::sys::wait::waitpid;
     use nix::unistd::ForkResult;
+    use nix::unistd::fork;
     use quickcheck::QuickCheck;
     use quickcheck_macros::quickcheck;
     use reverie_process::Pid;

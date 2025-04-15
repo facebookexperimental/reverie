@@ -35,8 +35,8 @@ use syscalls::Sysno;
 use thiserror::Error;
 
 pub use crate::regs::*;
-use crate::waitid::waitid;
 use crate::waitid::IdType;
+use crate::waitid::waitid;
 
 /// An error that occurred during tracing.
 #[derive(Error, Debug, Eq, PartialEq)]
@@ -985,8 +985,8 @@ mod test {
 
     use nix::sys::signal;
     use nix::sys::signal::Signal;
-    use nix::unistd::fork;
     use nix::unistd::ForkResult;
+    use nix::unistd::fork;
     // Make sure tokio is referenced in all configurations.
     use tokio as _;
 
@@ -1147,9 +1147,9 @@ mod test {
 
     #[cfg(not(sanitized))]
     fn group_exit(thread_count: usize) -> Result<(), Box<dyn std::error::Error + 'static>> {
+        use std::sync::Arc;
         use std::sync::atomic::AtomicUsize;
         use std::sync::atomic::Ordering;
-        use std::sync::Arc;
         use std::time::Duration;
 
         let (parent_pid, tracee) = trace(

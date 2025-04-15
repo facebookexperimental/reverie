@@ -13,12 +13,12 @@ use goblin::elf::Elf;
 use lazy_static::lazy_static;
 use nix::sys::mman::ProtFlags;
 use nix::unistd;
-use reverie::syscalls::AddrMut;
-use reverie::syscalls::MemoryAccess;
-use reverie::syscalls::Mprotect;
 use reverie::Error;
 use reverie::Guest;
 use reverie::Tool;
+use reverie::syscalls::AddrMut;
+use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::Mprotect;
 use tracing::debug;
 
 #[repr(align(64))]

@@ -16,10 +16,10 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
-use nix::sched::sched_setaffinity;
 use nix::sched::CpuSet;
-use serde::de::DeserializeOwned;
+use nix::sched::sched_setaffinity;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use syscalls::Errno;
 
 use super::clone::clone_with_stack;
@@ -28,9 +28,9 @@ use super::error::AddContext;
 use super::error::Context;
 use super::error::Error;
 use super::exit_status::ExitStatus;
+use super::fd::Fd;
 use super::fd::pipe;
 use super::fd::write_bytes;
-use super::fd::Fd;
 use super::id_map::make_id_map;
 use super::mount::Mount;
 use super::namespace::Namespace;

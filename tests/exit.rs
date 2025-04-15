@@ -10,10 +10,6 @@
 
 use std::sync::Mutex;
 
-use reverie::syscalls;
-use reverie::syscalls::Syscall;
-use reverie::syscalls::SyscallInfo;
-use reverie::syscalls::Sysno;
 use reverie::Error;
 use reverie::ExitStatus;
 use reverie::GlobalRPC;
@@ -21,6 +17,10 @@ use reverie::GlobalTool;
 use reverie::Guest;
 use reverie::Pid;
 use reverie::Tool;
+use reverie::syscalls;
+use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallInfo;
+use reverie::syscalls::Sysno;
 
 #[derive(Debug, Default)]
 struct GlobalState {

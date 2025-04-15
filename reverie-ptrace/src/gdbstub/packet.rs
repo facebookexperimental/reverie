@@ -26,10 +26,10 @@
 use bytes::BytesMut;
 use thiserror::Error;
 
+use super::PacketLogger;
 use super::commands::Command;
 use super::commands::CommandParseError;
 use super::hex::*;
-use super::PacketLogger;
 
 /// Packet parse error.
 #[derive(PartialEq, Debug, Error)]

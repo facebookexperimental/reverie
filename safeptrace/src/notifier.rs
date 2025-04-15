@@ -63,13 +63,13 @@
 //! `AtomicWaker` can be used instead.) The downside of this approach is that we
 //! can end up spawning a lot of guest threads.
 
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
@@ -82,13 +82,13 @@ use nix::sys::wait::WaitPidFlag;
 use nix::sys::wait::WaitStatus;
 use parking_lot::Mutex;
 
-use super::waitid;
 use super::Errno;
 use super::Error;
 use super::Pid;
 use super::Running;
 use super::Stopped;
 use super::Wait;
+use super::waitid;
 
 lazy_static! {
     static ref NOTIFIER: Notifier = Notifier::new();

@@ -20,8 +20,8 @@ use chrono::Local;
 use clap::Parser;
 use reverie::process::Command;
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::MakeWriter;
 
 /// Parses an environment variable command-line argument.
 pub fn parse_env(s: &str) -> anyhow::Result<(String, String)> {
