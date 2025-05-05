@@ -212,7 +212,7 @@ mod tests {
         Ok(())
     }
 
-    #[no_mangle]
+    #[unsafe(no_mangle)]
     extern "C" fn sigprof_handler(
         _sig: i32,
         _siginfo: *mut libc::siginfo_t,
