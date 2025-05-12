@@ -75,7 +75,7 @@ impl Env {
         };
 
         for (k, v) in &self.vars {
-            if let Some(ref v) = v {
+            if let Some(v) = v {
                 env.insert(k.clone(), v.clone());
             } else {
                 env.remove(k);

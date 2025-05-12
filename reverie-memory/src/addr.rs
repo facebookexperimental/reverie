@@ -56,9 +56,11 @@ impl<'a, T> Addr<'a, T> {
     ///
     /// `raw` must be non-zero.
     pub unsafe fn from_raw_unchecked(raw: usize) -> Self {
-        Self {
-            inner: NonNull::new_unchecked(raw as *mut T),
-            _p: PhantomData,
+        unsafe {
+            Self {
+                inner: NonNull::new_unchecked(raw as *mut T),
+                _p: PhantomData,
+            }
         }
     }
 
@@ -108,9 +110,11 @@ impl<'a, T> Addr<'a, T> {
     /// This method is unsafe because the new address may not point to valid
     /// memory.
     pub unsafe fn offset(self, count: isize) -> Self {
-        Self {
-            inner: NonNull::new_unchecked(self.inner.as_ptr().offset(count)),
-            _p: PhantomData,
+        unsafe {
+            Self {
+                inner: NonNull::new_unchecked(self.inner.as_ptr().offset(count)),
+                _p: PhantomData,
+            }
         }
     }
 
@@ -122,7 +126,7 @@ impl<'a, T> Addr<'a, T> {
     /// memory.
     #[allow(clippy::should_implement_trait)]
     pub unsafe fn add(self, count: usize) -> Self {
-        self.offset(count as isize)
+        unsafe { self.offset(count as isize) }
     }
 }
 
@@ -190,9 +194,11 @@ impl<'a, T> AddrMut<'a, T> {
     ///
     /// `raw` must be non-zero.
     pub unsafe fn from_raw_unchecked(raw: usize) -> Self {
-        Self {
-            inner: NonNull::new_unchecked(raw as *mut T),
-            _p: PhantomData,
+        unsafe {
+            Self {
+                inner: NonNull::new_unchecked(raw as *mut T),
+                _p: PhantomData,
+            }
         }
     }
 
@@ -230,9 +236,11 @@ impl<'a, T> AddrMut<'a, T> {
     /// This method is unsafe because the new address may not point to valid
     /// memory.
     pub unsafe fn offset(self, count: isize) -> Self {
-        Self {
-            inner: NonNull::new_unchecked(self.inner.as_ptr().offset(count)),
-            _p: PhantomData,
+        unsafe {
+            Self {
+                inner: NonNull::new_unchecked(self.inner.as_ptr().offset(count)),
+                _p: PhantomData,
+            }
         }
     }
 
@@ -244,7 +252,7 @@ impl<'a, T> AddrMut<'a, T> {
     /// memory.
     #[allow(clippy::should_implement_trait)]
     pub unsafe fn add(self, count: usize) -> Self {
-        self.offset(count as isize)
+        unsafe { self.offset(count as isize) }
     }
 }
 
@@ -302,8 +310,10 @@ impl<'a, T> AddrSlice<'a, T> {
     /// This method is unsafe for the same reasons that
     /// [`std::slice::from_raw_parts`] is unsafe.
     pub unsafe fn from_raw_parts(addr: Addr<'a, T>, len: usize) -> Self {
-        Self {
-            inner: ::core::slice::from_raw_parts(addr.as_ptr(), len),
+        unsafe {
+            Self {
+                inner: ::core::slice::from_raw_parts(addr.as_ptr(), len),
+            }
         }
     }
 
@@ -366,8 +376,10 @@ impl<'a, T> AddrSliceMut<'a, T> {
     /// This method is unsafe for the same reasons that
     /// [`std::slice::from_raw_parts`] is unsafe.
     pub unsafe fn from_raw_parts(addr: AddrMut<'a, T>, len: usize) -> Self {
-        Self {
-            inner: ::core::slice::from_raw_parts_mut(addr.as_mut_ptr(), len),
+        unsafe {
+            Self {
+                inner: ::core::slice::from_raw_parts_mut(addr.as_mut_ptr(), len),
+            }
         }
     }
 

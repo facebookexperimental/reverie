@@ -148,29 +148,31 @@ impl MemoryAccess for GuestStack {
 
 #[inline]
 pub unsafe fn transmute_u64s<T: Sized>(value: T) -> Vec<u64> {
-    let value_ptr = &value as *const T as *const u8;
-    let size = core::mem::size_of::<T>();
-    let mut result: Vec<u64> = Vec::new();
+    unsafe {
+        let value_ptr = &value as *const T as *const u8;
+        let size = core::mem::size_of::<T>();
+        let mut result: Vec<u64> = Vec::new();
 
-    let mut k = 0;
-    let mut n = size;
+        let mut k = 0;
+        let mut n = size;
 
-    // use copy_nonloverlapping?
-    while n >= 8 {
-        let ptr: *const u64 = value_ptr.offset(k).cast();
-        result.push(ptr.read());
-        n -= 8;
-        k += 8;
+        // use copy_nonloverlapping?
+        while n >= 8 {
+            let ptr: *const u64 = value_ptr.offset(k).cast();
+            result.push(ptr.read());
+            n -= 8;
+            k += 8;
+        }
+
+        if n != 0 {
+            let mut val: u64 = 0;
+            let src = value_ptr.offset(k);
+            let dst = &mut val as *mut u64 as *mut u8;
+            core::ptr::copy_nonoverlapping(src, dst, n);
+            result.push(val);
+        }
+        result
     }
-
-    if n != 0 {
-        let mut val: u64 = 0;
-        let src = value_ptr.offset(k);
-        let dst = &mut val as *mut u64 as *mut u8;
-        core::ptr::copy_nonoverlapping(src, dst, n);
-        result.push(val);
-    }
-    result
 }
 
 #[cfg(test)]

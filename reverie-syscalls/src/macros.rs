@@ -31,7 +31,7 @@ macro_rules! typed_syscall {
             name: $Name:ident,
             attrs: [$(#[$attrs:meta])*],
             ret: $ret:ty,
-            doc: $doc:expr,
+            doc: $doc:expr_2021,
             // Required arguments
             required: [$({
                 $req:ident,
@@ -621,9 +621,9 @@ macro_rules! command_enum {
             type: $type:ty,
             entries: [$({
                 meta: [$(#[$meta:meta])*],
-                id: $id:expr,
+                id: $id:expr_2021,
                 flag: $flag:ident,
-                into: $(($arg:ident: $t:ty))? => $raw:expr,
+                into: $(($arg:ident: $t:ty))? => $raw:expr_2021,
             },)*],
         }
     ) => {
@@ -718,7 +718,7 @@ macro_rules! command_enum {
         $prefix:tt,
         [$($entries:tt)*],
         $(#[$meta:meta])*
-        $flag:ident($t:ty) = $id:expr,
+        $flag:ident($t:ty) = $id:expr_2021,
         $($tail:tt)*
     ) => {
         command_enum! {
@@ -742,7 +742,7 @@ macro_rules! command_enum {
         $prefix:tt,
         [$($entries:tt)*],
         $(#[$meta:meta])*
-        $flag:ident = $id:expr,
+        $flag:ident = $id:expr_2021,
         $($tail:tt)*
     ) => {
         command_enum! {

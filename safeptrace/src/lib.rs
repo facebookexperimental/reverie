@@ -1311,49 +1311,55 @@ mod test {
 
     #[allow(dead_code)]
     unsafe fn install_sigalrm_handler() -> i32 {
-        let mut sa: libc::sigaction = MaybeUninit::zeroed().assume_init();
-        sa.sa_flags = libc::SA_RESTART | libc::SA_SIGINFO | libc::SA_NODEFER;
-        sa.sa_sigaction = sigalrm_handler as _;
+        unsafe {
+            let mut sa: libc::sigaction = MaybeUninit::zeroed().assume_init();
+            sa.sa_flags = libc::SA_RESTART | libc::SA_SIGINFO | libc::SA_NODEFER;
+            sa.sa_sigaction = sigalrm_handler as _;
 
-        libc::sigaction(libc::SIGALRM, &sa as *const _, std::ptr::null_mut())
+            libc::sigaction(libc::SIGALRM, &sa as *const _, std::ptr::null_mut())
+        }
     }
 
     #[allow(dead_code)]
     // unblock signal(s) and set its handler to SIG_DFL
     unsafe fn unblock_signals(signals: &[Signal]) -> io::Result<KernelSigset> {
-        let set = KernelSigset::from(signals);
-        let mut oldset = MaybeUninit::<u64>::uninit();
+        unsafe {
+            let set = KernelSigset::from(signals);
+            let mut oldset = MaybeUninit::<u64>::uninit();
 
-        if libc::syscall(
-            libc::SYS_rt_sigprocmask,
-            libc::SIG_UNBLOCK,
-            &set as *const _,
-            oldset.as_mut_ptr(),
-            8,
-        ) != 0
-        {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(KernelSigset(oldset.assume_init()))
+            if libc::syscall(
+                libc::SYS_rt_sigprocmask,
+                libc::SIG_UNBLOCK,
+                &set as *const _,
+                oldset.as_mut_ptr(),
+                8,
+            ) != 0
+            {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(KernelSigset(oldset.assume_init()))
+            }
         }
     }
 
     #[allow(dead_code)]
     unsafe fn block_signals(signals: &[Signal]) -> io::Result<KernelSigset> {
-        let set = KernelSigset::from(signals);
-        let mut oldset = MaybeUninit::<u64>::uninit();
+        unsafe {
+            let set = KernelSigset::from(signals);
+            let mut oldset = MaybeUninit::<u64>::uninit();
 
-        if libc::syscall(
-            libc::SYS_rt_sigprocmask,
-            libc::SIG_BLOCK,
-            &set as *const _,
-            oldset.as_mut_ptr(),
-            8,
-        ) != 0
-        {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(KernelSigset(oldset.assume_init()))
+            if libc::syscall(
+                libc::SYS_rt_sigprocmask,
+                libc::SIG_BLOCK,
+                &set as *const _,
+                oldset.as_mut_ptr(),
+                8,
+            ) != 0
+            {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(KernelSigset(oldset.assume_init()))
+            }
         }
     }
 

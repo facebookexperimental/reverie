@@ -83,28 +83,30 @@ impl Extend<CString> for CStringArray {
 }
 
 pub unsafe fn reset_signal_handling() -> Result<(), Errno> {
-    use core::mem::MaybeUninit;
+    unsafe {
+        use core::mem::MaybeUninit;
 
-    // Reset signal handling so the child process starts in a standardized
-    // state. libstd ignores SIGPIPE, and signal-handling libraries often set a
-    // mask. Child processes inherit ignored signals and the signal mask from
-    // their parent, but most UNIX programs do not reset these things on their
-    // own, so we need to clean things up now to avoid confusing the program
-    // we're about to run.
-    let mut set = MaybeUninit::<libc::sigset_t>::uninit();
-    Errno::result(libc::sigemptyset(set.as_mut_ptr()))?;
-    Errno::result(libc::pthread_sigmask(
-        libc::SIG_SETMASK,
-        set.as_ptr(),
-        core::ptr::null_mut(),
-    ))?;
+        // Reset signal handling so the child process starts in a standardized
+        // state. libstd ignores SIGPIPE, and signal-handling libraries often set a
+        // mask. Child processes inherit ignored signals and the signal mask from
+        // their parent, but most UNIX programs do not reset these things on their
+        // own, so we need to clean things up now to avoid confusing the program
+        // we're about to run.
+        let mut set = MaybeUninit::<libc::sigset_t>::uninit();
+        Errno::result(libc::sigemptyset(set.as_mut_ptr()))?;
+        Errno::result(libc::pthread_sigmask(
+            libc::SIG_SETMASK,
+            set.as_ptr(),
+            core::ptr::null_mut(),
+        ))?;
 
-    let ret = libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    if ret == libc::SIG_ERR {
-        return Err(Errno::last());
+        let ret = libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        if ret == libc::SIG_ERR {
+            return Err(Errno::last());
+        }
+
+        Ok(())
     }
-
-    Ok(())
 }
 
 /// This is a value that can be shared between a parent and child process. This
