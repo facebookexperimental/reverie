@@ -27,5 +27,5 @@ reverie-process = { version = "0.1.0", path = "../reverie-process" }
 reverie-syscalls = { version = "0.1.0", path = "../reverie-syscalls" }
 serde = { version = "1.0.185", features = ["derive", "rc"] }
 syscalls = { version = "0.6.18", features = ["serde"] }
-thiserror = "2"
+thiserror = "2.0.12"
 typed-arena = "2"
