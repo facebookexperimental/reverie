@@ -23,8 +23,6 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
-#include <sys/time.h>
-#include <sys/types.h>
 #include <unistd.h>
 
 #define NTHREADS 8

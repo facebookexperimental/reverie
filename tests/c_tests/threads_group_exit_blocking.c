@@ -12,17 +12,12 @@
 // threads can exit gracefully under `SYS_exit_group`.
 
 #include <errno.h>
-#include <limits.h>
-#include <linux/futex.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <sys/syscall.h>
-#include <sys/time.h>
-#include <sys/types.h>
 #include <unistd.h>
 
 #define NTHREADS 8

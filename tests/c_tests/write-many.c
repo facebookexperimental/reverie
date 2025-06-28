@@ -6,7 +6,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include <sys/types.h>
 #include <unistd.h>
 
 int main(int argc, char* argv[]) {

@@ -6,11 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <sys/types.h>
 #include <time.h>
 
 #define NITERATIONS 1000
