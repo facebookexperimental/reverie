@@ -10,7 +10,7 @@ license = "BSD-2-Clause"
 
 [dependencies]
 bincode = "1.3.3"
-bitflags = { version = "2.6", features = ["serde"], default-features = false }
+bitflags = { version = "2.9", features = ["serde"], default-features = false }
 colored = "2.1.0"
 futures = { version = "0.3.30", features = ["async-await", "compat"] }
 libc = "0.2.139"
