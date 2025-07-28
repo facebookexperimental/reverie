@@ -55,8 +55,9 @@ int main(int argc, char* argv[]) {
     pthread_create(&ids[i], NULL, thread_entry, (void*)i);
   }
 
-  while (atomic_load(&threads_started) != NR_THREADS)
+  while (atomic_load(&threads_started) != NR_THREADS) {
     ;
+  }
 
   nanosleep(&tp, NULL);
 

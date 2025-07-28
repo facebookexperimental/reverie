@@ -57,8 +57,9 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  while ((pid = wait(&status)) > 0)
+  while ((pid = wait(&status)) > 0) {
     ;
+  }
 
   unsigned long expected = 2 * TESTS_NLOOPS;
   unsigned long got = atomic_load(counter);

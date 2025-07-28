@@ -61,8 +61,9 @@ int main(int argc, char* argv[]) {
 
   alarm(1);
 
-  while (!quit)
+  while (!quit) {
     ;
+  }
 
   return 0;
 }

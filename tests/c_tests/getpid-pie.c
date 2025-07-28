@@ -42,8 +42,9 @@ int main(int argc, char* argv[]) {
   int pid0 = getpid();
   int pid = sys_getpid();
   printf("pid = %d\n", pid);
-  if (pid0 != pid)
+  if (pid0 != pid) {
     abort();
+  }
 
   return 0;
 }
