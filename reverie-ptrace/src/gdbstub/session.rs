@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::os::fd::BorrowedFd;
+use std::os::fd::IntoRawFd;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -328,11 +329,7 @@ impl Session {
                             Mode::from_bits_truncate(0o644),
                         )
                         .and_then(|fd| {
-                            let nb = uio::pread(
-                                unsafe { BorrowedFd::borrow_raw(fd) },
-                                &mut auxv,
-                                offset as libc::off_t,
-                            )?;
+                            let nb = uio::pread(&fd, &mut auxv, offset as libc::off_t)?;
                             let _ = unistd::close(fd);
                             Ok(nb)
                         }) {
@@ -532,7 +529,7 @@ impl Session {
                     let mode = Mode::from_bits_truncate(mode);
                     writer.put_str("F");
                     match fcntl::open(&fname, oflag, mode) {
-                        Ok(fd) => writer.put_num(fd),
+                        Ok(fd) => writer.put_num(fd.into_raw_fd()),
                         Err(_) => writer.put_str("-1"),
                     }
                 }
@@ -589,11 +586,14 @@ impl Session {
                 vFile::Fstat(fd) => {
                     // NB: HostioStat is not the same as FileStat.
                     const STAT_SIZE: usize = std::mem::size_of::<HostioStat>();
-                    match stat::fstat(fd).ok().map(|st| {
-                        let st: HostioStat = st.into();
-                        let bytes: [u8; STAT_SIZE] = unsafe { std::mem::transmute(st) };
-                        bytes
-                    }) {
+                    // SAFETY: FIXME(JakobDegen): Please explain
+                    match stat::fstat(unsafe { BorrowedFd::borrow_raw(fd) })
+                        .ok()
+                        .map(|st| {
+                            let st: HostioStat = st.into();
+                            let bytes: [u8; STAT_SIZE] = unsafe { std::mem::transmute(st) };
+                            bytes
+                        }) {
                         Some(bytes) => {
                             writer.put_str("F");
                             writer.put_num(STAT_SIZE);

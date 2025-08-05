@@ -10,7 +10,6 @@
 
 use std::io::Write;
 use std::net::SocketAddr;
-use std::os::fd::AsRawFd;
 use std::os::fd::BorrowedFd;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -596,8 +595,8 @@ where
             read1.close()?;
             read2.close()?;
             if capture_output {
-                unistd::dup2(write1.as_raw_fd(), 1).map_err(from_nix_error)?;
-                unistd::dup2(write2.as_raw_fd(), 2).map_err(from_nix_error)?;
+                unistd::dup2_stdout(&write1).map_err(from_nix_error)?;
+                unistd::dup2_stderr(&write2).map_err(from_nix_error)?;
                 write1.close()?;
                 write2.close()?;
             }

@@ -270,7 +270,7 @@ fn child_should_inherit_fds() {
             Ok(ForkResult::Parent { child, .. }) => {
                 fdwrite.close().expect("close failed");
                 let mut buf: [u8; 8] = [0; 8];
-                assert_eq!(unistd::read(fdread.as_raw_fd(), &mut buf), Ok(8));
+                assert_eq!(unistd::read(&fdread, &mut buf), Ok(8));
                 assert_eq!(buf, msg);
                 assert_eq!(wait::waitpid(child, None), Ok(WaitStatus::Exited(child, 0)));
                 unsafe { libc::syscall(libc::SYS_exit_group, 0) };
