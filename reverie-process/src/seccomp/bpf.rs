@@ -255,7 +255,7 @@ impl ByteCode for sock_filter {
 /// ```
 #[cfg(test)]
 macro_rules! seccomp_bpf {
-    ($($inst:expr_2021),+ $(,)?) => {
+    ($($inst:expr),+ $(,)?) => {
         {
             let mut filter = Filter::new();
             $(
@@ -342,7 +342,7 @@ macro_rules! instruction {
         $(
             $(#[$attrs:meta])*
             $vis:vis fn $name:ident($($args:tt)*) {
-                $($instruction:expr_2021;)*
+                $($instruction:expr;)*
             }
         )*
     ) => {
