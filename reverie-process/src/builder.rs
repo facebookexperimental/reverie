@@ -13,6 +13,7 @@ use std::ffi::OsString;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
+use std::path;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -708,13 +709,8 @@ impl Command {
                 .map(|bytes| Path::new(OsStr::from_bytes(bytes)));
 
             find_program_in_paths(program, paths)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("Could not find {:?} in $PATH", program),
-                    )
-                })?
-                .canonicalize()
+                .ok_or_else(|| io::Error::other(format!("Could not find {:?} in $PATH", program)))
+                .map(path::absolute)?
         } else {
             // Assume it's in the current directory
             let mut path = match self.get_current_dir() {
