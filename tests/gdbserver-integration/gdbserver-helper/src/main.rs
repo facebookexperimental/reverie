@@ -73,7 +73,7 @@ impl RemoteGdbSession {
             path.into(),
         );
         let output =
-            tokio::time::timeout(tokio::time::Duration::from_secs(60), server.output()).await??;
+            tokio::time::timeout(tokio::time::Duration::from_mins(1), server.output()).await??;
         Ok(output)
     }
 
@@ -96,7 +96,7 @@ impl RemoteGdbSession {
         client.command("q");
 
         let client_status = tokio::time::timeout(
-            tokio::time::Duration::from_secs(60),
+            tokio::time::Duration::from_mins(1),
             tokio::task::spawn_blocking(move || client.status()),
         )
         .await???; // Nani???

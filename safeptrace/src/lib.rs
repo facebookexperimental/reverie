@@ -1163,7 +1163,7 @@ mod test {
 
                         thread::spawn(move || {
                             counter.fetch_add(1, Ordering::Relaxed);
-                            thread::sleep(Duration::from_secs(60));
+                            thread::sleep(Duration::from_mins(1));
                         })
                     })
                     .collect::<Vec<_>>();
