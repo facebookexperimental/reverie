@@ -910,7 +910,7 @@ impl<L: Tool + 'static> TracedTask<L> {
     async fn handle_sigtrap(&mut self, task: Stopped) -> Result<HandleSignalResult, TraceError> {
         let resumed_by_gdb_step = self
             .resumed_by_gdb
-            .map_or(false, |action| matches!(action, ResumeAction::Step(_)));
+            .is_some_and(|action| matches!(action, ResumeAction::Step(_)));
         let mut regs = task.getregs()?;
         let rip_minus_one = regs.ip() - 1;
 
@@ -939,7 +939,7 @@ impl<L: Tool + 'static> TracedTask<L> {
     async fn handle_sigstop(&mut self, task: Stopped) -> Result<HandleSignalResult, TraceError> {
         let resumed_by_gdb_step = self
             .resumed_by_gdb
-            .map_or(false, |action| matches!(action, ResumeAction::Step(_)));
+            .is_some_and(|action| matches!(action, ResumeAction::Step(_)));
         debug_assert!(!resumed_by_gdb_step);
         if let Some((suspended_flag, stop_tx)) = self.get_stop_tx().await {
             let notify_stop_tx = stop_tx

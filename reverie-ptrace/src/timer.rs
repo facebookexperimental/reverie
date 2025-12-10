@@ -164,7 +164,7 @@ impl PmuConfig {
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn has_precise_ip() -> bool {
     let cpu = raw_cpuid::CpuId::new();
-    let has_debug_store = cpu.get_feature_info().map_or(false, |info| info.has_ds());
+    let has_debug_store = cpu.get_feature_info().is_some_and(|info| info.has_ds());
 
     debug!(
         "Setting precise_ip to {} for cpu {:?}",
