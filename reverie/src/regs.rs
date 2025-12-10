@@ -172,6 +172,6 @@ mod tests {
             " fs              0x0 gs              0x0",
         ];
 
-        assert_eq!(result.lines().into_iter().collect::<Vec<&str>>(), lines);
+        assert_eq!(result.lines().collect::<Vec<&str>>(), lines);
     }
 }
