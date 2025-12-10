@@ -112,7 +112,7 @@ mod tests {
     #[test]
     fn smoke() {
         let map = Auxv::new(Pid::this()).unwrap();
-        assert_eq!(map.is_empty(), false);
+        assert!(!map.is_empty());
         assert_eq!(map.at_uid(), Some(unsafe { libc::getuid() }));
         assert_eq!(map.at_gid(), Some(unsafe { libc::getgid() }));
         assert!(map.at_random().is_some());
