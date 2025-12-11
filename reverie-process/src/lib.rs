@@ -420,7 +420,7 @@ mod tests {
             .map_root()
             .mount(Mount::tmpfs(tmpfs.path()))
             // Bind-mount a directory from our upper /tmp to our new /tmp.
-            .mount(Mount::bind(persistent.path(), &tmpfs.path().join("my-dir")).touch_target())
+            .mount(Mount::bind(persistent.path(), tmpfs.path().join("my-dir")).touch_target())
             // Move our newly-created tmpfs to hide the upper /tmp folder.
             .mount(Mount::rename(tmpfs.path(), Path::new("/tmp")))
             .output()
