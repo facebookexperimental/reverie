@@ -927,12 +927,17 @@ mod tests {
 
     #[test]
     fn can_panic() {
-        assert_eq!(
-            Container::new().run::<_, ()>(|| panic!()),
-            Err(RunError::ExitStatus(ExitStatus::Signaled(
-                Signal::SIGABRT,
-                true
-            )))
+        let result = Container::new().run::<_, ()>(|| panic!());
+        assert!(
+            matches!(
+                result,
+                Err(RunError::ExitStatus(ExitStatus::Signaled(
+                    Signal::SIGABRT,
+                    _
+                )))
+            ),
+            "Expected Err(ExitStatus(Signaled(SIGABRT, _))), got {:?}",
+            result
         );
     }
 

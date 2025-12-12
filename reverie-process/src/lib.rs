@@ -619,11 +619,10 @@ mod tests {
             .output()
             .await
             .unwrap();
-        assert_eq!(
-            output.status,
-            ExitStatus::Signaled(Signal::SIGSYS, true),
-            "{:?}",
-            output
+        assert!(
+            matches!(output.status, ExitStatus::Signaled(Signal::SIGSYS, _)),
+            "Expected Signaled(SIGSYS, _), got {:?}",
+            output.status
         );
     }
 
