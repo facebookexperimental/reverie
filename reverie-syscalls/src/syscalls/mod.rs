@@ -481,7 +481,7 @@ syscall_list! {
         pidfd_open => PidfdOpen,
         clone3 => Clone3,
         // Missing: close_range => CloseRange,
-        // Missing: openat2 => Openat2,
+        openat2 => Openat2,
         // Missing: pidfd_getfd => PidfdGetfd,
         // Missing: faccessat2 => Faccessat2,
         // Missing: process_madvise => ProcessMadvise,
@@ -2559,6 +2559,41 @@ typed_syscall! {
     }
 }
 
+/// Represents the `struct open_how` used by the `openat2` syscall.
+/// This struct contains the flags, mode, and resolve parameters.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OpenHow {
+    /// O_* flags for opening the file.
+    pub flags: u64,
+    /// File mode for O_CREAT/O_TMPFILE (ignored otherwise).
+    pub mode: u64,
+    /// RESOLVE_* flags for pathname resolution.
+    pub resolve: u64,
+}
+
+typed_syscall! {
+    /// The `openat2` syscall provides extended file opening functionality
+    /// with additional control over pathname resolution.
+    ///
+    /// int openat2(int dirfd, const char *pathname, struct open_how *how, size_t size);
+    ///
+    /// The `how` argument is a pointer to a `struct open_how` which contains:
+    /// - flags: O_* flags
+    /// - mode: O_CREAT/O_TMPFILE file mode
+    /// - resolve: RESOLVE_* flags for pathname resolution
+    pub struct Openat2 {
+        /// Directory file descriptor for relative path resolution.
+        dirfd: i32,
+        /// Path to the file to open.
+        path: Option<PathPtr>,
+        /// Pointer to `struct open_how` in guest memory.
+        how: Option<Addr<OpenHow>>,
+        /// Size of the `open_how` structure (for versioning).
+        size: usize,
+    }
+}
+
 // Open not available in aarch64
 #[cfg(not(target_arch = "aarch64"))]
 impl From<Open> for Openat {
@@ -3711,6 +3746,63 @@ mod test {
                 .with_oldpath(PathPtr::from_ptr(foo.as_ptr()))
                 .with_newpath(PathPtr::from_ptr(bar.as_ptr()))
                 .into(),
+        );
+    }
+
+    #[test]
+    fn test_syscall_openat2() {
+        let name = CString::new("/some/file/path").unwrap();
+
+        // Create an OpenHow struct on the stack for testing
+        let open_how = OpenHow {
+            flags: libc::O_RDONLY as u64,
+            mode: 0o644,
+            resolve: 0,
+        };
+
+        let syscall = Openat2::new()
+            .with_dirfd(libc::AT_FDCWD)
+            .with_path(PathPtr::from_ptr(name.as_ptr()))
+            .with_how(Addr::from_ptr(&open_how))
+            .with_size(core::mem::size_of::<OpenHow>());
+
+        // Verify round-trip conversion works
+        assert_eq!(Openat2::from(SyscallArgs::from(syscall)), syscall);
+
+        let memory = LocalMemory::new();
+
+        assert_eq!(
+            syscall.path().unwrap().read(&memory).unwrap(),
+            Path::new("/some/file/path")
+        );
+
+        // Verify display format
+        assert_eq!(
+            format!("{}", syscall.display(&memory)),
+            format!(
+                "openat2(-100, {:p} -> \"/some/file/path\", {:p}, 24)",
+                name.as_ptr(),
+                &open_how as *const _
+            )
+        );
+    }
+
+    #[test]
+    fn test_syscall_openat2_display() {
+        let memory = LocalMemory::new();
+
+        // Test with NULL path
+        assert_eq!(
+            format!(
+                "{}",
+                Openat2::new()
+                    .with_dirfd(libc::AT_FDCWD)
+                    .with_path(None)
+                    .with_how(None)
+                    .with_size(24)
+                    .display(&memory)
+            ),
+            "openat2(-100, NULL, NULL, 24)"
         );
     }
 }
