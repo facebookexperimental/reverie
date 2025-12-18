@@ -56,7 +56,7 @@ impl Tool for LocalState {
                 let memory = guest.memory();
 
                 let unamebuf: Addr<libc::utsname> =
-                    Addr::from_raw(syscall.into_parts().1.arg0 as usize).unwrap();
+                    Addr::from_raw(syscall.into_parts().1.arg0).unwrap();
                 let uname1 = memory.read_value(unamebuf)?;
                 let uname2 = memory.read_value(uname_on_stack)?;
 
