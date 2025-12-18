@@ -104,7 +104,7 @@ impl Serialize for GdbHexString {
     where
         S: Serializer,
     {
-        if self.bytes.is_empty() || self.bytes.len() % 2 != 0 {
+        if self.bytes.is_empty() || !self.bytes.len().is_multiple_of(2) {
             return Err(ser::Error::custom(GdbHexError::InvalidGdbHex));
         }
         let mut seq = serializer.serialize_seq(Some(self.bytes.len() / 2))?;
@@ -318,7 +318,7 @@ pub fn decode_hex_string(buf: &[u8]) -> Result<Vec<u8>, GdbHexError> {
     let mut res = Vec::new();
     let mut i = 0;
 
-    if buf.len() % 2 != 0 {
+    if !buf.len().is_multiple_of(2) {
         return Err(GdbHexError::InvalidGdbHex);
     }
 
