@@ -792,15 +792,13 @@ impl<L: Tool + 'static> TracedTask<L> {
         // Try to intercept cpuid instructions on x86_64
         #[cfg(target_arch = "x86_64")]
         if self.global_state.subscriptions.has_cpuid() {
-            self.has_cpuid_interception = self.intercept_cpuid().await.map_err(|err| {
+            self.has_cpuid_interception = self.intercept_cpuid().await.inspect_err(|&err| {
                 match err {
                     Errno::ENODEV => tracing::warn!(
                         "Unable to intercept CPUID: Underlying hardware does not support CPUID faulting"
                     ),
                     err => tracing::warn!("Unable to intercept CPUID: {}", err),
                 }
-
-                err
             }).is_ok();
         }
 
