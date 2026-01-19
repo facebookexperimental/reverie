@@ -72,11 +72,11 @@ impl GdbClientCommand {
         command.arg("set remote hostio-open-packet 0");
         self.init_command_to_queue.iter().for_each(|iex| {
             command.arg("-iex");
-            command.arg(iex.to_string());
+            command.arg(iex);
         });
         self.command_to_queue.iter().for_each(|ex| {
             command.arg("-ex");
-            command.arg(ex.to_string());
+            command.arg(ex);
         });
         command.status()
     }
