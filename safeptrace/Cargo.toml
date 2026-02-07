@@ -18,7 +18,7 @@ parking_lot = { version = "0.12.1", features = ["send_guard"] }
 reverie-memory = { version = "0.1.0", path = "../reverie-memory", optional = true }
 reverie-process = { version = "0.1.0", path = "../reverie-process" }
 syscalls = { version = "0.6.18", features = ["serde"] }
-thiserror = "2.0.12"
+thiserror = "2.0.18"
 
 [dev-dependencies]
 quickcheck = "1.0"
