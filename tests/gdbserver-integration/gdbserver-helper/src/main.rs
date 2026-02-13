@@ -165,7 +165,7 @@ struct GdbServerHelperArgs {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Error> {
-    let args = GdbServerHelperArgs::from_args();
+    let args = GdbServerHelperArgs::parse();
 
     let session = RemoteGdbSession::new(args.gdb, args.test_binary, args.test_binary_args);
 

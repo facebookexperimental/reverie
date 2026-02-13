@@ -66,8 +66,8 @@ pub struct CommonToolArguments {
         long = "env",
         short = 'e',
         value_name = "ENV[=VALUE]",
-        parse(try_from_str = parse_env),
-        number_of_values = 1
+        value_parser = parse_env,
+        num_args = 1
     )]
     pub envs: Vec<(String, String)>,
 
@@ -84,7 +84,7 @@ impl CommonToolArguments {
     /// Create a new configuration to run the given program.
     pub fn new<S: AsRef<OsStr> + Clone>(prog: S) -> CommonToolArguments {
         // Dirty, dirty hack.  The first argument is ignored in this process:
-        CommonToolArguments::from_iter_safe(&[prog.clone(), prog])
+        CommonToolArguments::try_parse_from(&[prog.clone(), prog])
             .expect("CommonToolArguments::new has an internal error that prevented it from constructing an instance.")
     }
 

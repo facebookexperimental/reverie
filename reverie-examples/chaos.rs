@@ -177,7 +177,7 @@ impl Tool for ChaosTool {
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    let args = Args::from_args();
+    let args = Args::parse();
     let log_guard = args.common_opts.init_tracing();
     let tracer = reverie_ptrace::TracerBuilder::<ChaosTool>::new(args.common_opts.into())
         .config(args.chaos_opts)

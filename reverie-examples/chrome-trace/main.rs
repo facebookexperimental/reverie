@@ -37,7 +37,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    let args = Args::from_args();
+    let args = Args::parse();
 
     let log_guard = args.common.init_tracing();
     let tracer = reverie_ptrace::TracerBuilder::<ChromeTrace>::new(args.common.into())

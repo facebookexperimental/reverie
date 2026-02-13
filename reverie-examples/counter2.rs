@@ -150,7 +150,7 @@ impl Tool for CounterLocal {
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    let args = CommonToolArguments::from_args();
+    let args = CommonToolArguments::parse();
     let log_guard = args.init_tracing();
     let tracer = reverie_ptrace::TracerBuilder::<CounterLocal>::new(args.into())
         .spawn()

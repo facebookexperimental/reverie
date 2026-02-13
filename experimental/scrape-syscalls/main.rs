@@ -223,7 +223,7 @@ fn syscall_list(path: &Path) -> Result<Vec<SyscallInfo>, Box<dyn std::error::Err
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Opts::from_args();
+    let args = Opts::parse();
 
     let vmlinux = match args.vmlinux {
         Some(vmlinux) => vmlinux,

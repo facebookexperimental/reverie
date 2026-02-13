@@ -92,7 +92,7 @@ impl GlobalTool for ChunkyPrintGlobal {
 impl Inner {
     /// Check if the epoch has expired and flush the buffer.
     fn check_epoch(&mut self) {
-        if self.times.iter().all(|(_p, t)| (*t > EPOCH)) {
+        if self.times.iter().all(|(_p, t)| *t > EPOCH) {
             let _ = self.flush_messages();
             self.times.iter_mut().for_each(|(_, t)| *t -= EPOCH);
             self.epoch_num += 1;
@@ -263,7 +263,7 @@ impl Tool for ChunkyPrintLocal {
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    let args = CommonToolArguments::from_args();
+    let args = CommonToolArguments::parse();
     let log_guard = args.init_tracing();
     let tracer = reverie_ptrace::TracerBuilder::<ChunkyPrintLocal>::new(args.into())
         .spawn()

@@ -33,7 +33,7 @@ struct Opts {
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    let args = Opts::from_args();
+    let args = Opts::parse();
 
     let config = Config {
         filters: args.trace,

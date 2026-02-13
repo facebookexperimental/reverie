@@ -14,7 +14,7 @@ path = "scrape-syscalls/main.rs"
 edition = "2018"
 
 [dependencies]
-clap = { version = "3.2.25", features = ["derive", "env", "regex", "unicode", "wrap_help"] }
+clap = { version = "4.5.42", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 goblin = { version = "0.10.5", features = ["elf32", "elf64", "endian_fd"] }
 libc = "0.2.139"
 nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }

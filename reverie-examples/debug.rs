@@ -39,7 +39,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    let args = Args::from_args();
+    let args = Args::parse();
     let port = args.port;
     let log_guard = args.common_opts.init_tracing();
     eprintln!("Listening on port {}", port);
