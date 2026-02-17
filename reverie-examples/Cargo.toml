@@ -46,12 +46,12 @@ name = "strace_minimal"
 path = "strace_minimal.rs"
 
 [dependencies]
-anyhow = "1.0.98"
+anyhow = "1.0.100"
 clap = { version = "4.5.42", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 reverie = { version = "0.1.0", path = "../reverie" }
 reverie-ptrace = { version = "0.1.0", path = "../reverie-ptrace" }
 reverie-util = { version = "0.1.0", path = "../reverie-util" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
-serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
+serde_json = { version = "1.0.145", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 tokio = { version = "1.47.1", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
