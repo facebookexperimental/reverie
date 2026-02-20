@@ -10,7 +10,7 @@ license = "BSD-2-Clause"
 
 [dependencies]
 addr2line = "0.24.2"
-anyhow = "1.0.98"
+anyhow = "1.0.101"
 async-trait = "0.1.86"
 bitflags = { version = "2.9", features = ["serde", "std"], default-features = false }
 byteorder = "1.5"
