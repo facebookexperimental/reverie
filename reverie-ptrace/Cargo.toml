@@ -24,7 +24,7 @@ num-traits = { version = "0.2.19", default-features = false }
 paste = "1.0.14"
 perf-event-open-sys = "5.0"
 procfs = "0.15.1"
-raw-cpuid = "10.6.0"
+raw-cpuid = "10.7.0"
 reverie = { version = "0.1.0", path = "../reverie" }
 safeptrace = { version = "0.1.0", path = "../safeptrace", features = ["memory", "notifier"] }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
