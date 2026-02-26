@@ -21,7 +21,7 @@ memmap2 = "0.9.5"
 never-say-never = "6"
 nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
 object = { version = "0.36.7", features = ["read", "write"] }
-procfs = "0.15.1"
+procfs = "0.16.0"
 raw-cpuid = "10.7.0"
 reverie-process = { version = "0.1.0", path = "../reverie-process" }
 reverie-syscalls = { version = "0.1.0", path = "../reverie-syscalls" }

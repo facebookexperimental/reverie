@@ -143,7 +143,7 @@ pub fn show_fault_context(task: &Stopped, sig: signal::Signal) {
         .map_or_else(
             |_| Vec::new(),
             |p| match p.maps() {
-                Ok(maps) => maps.memory_maps,
+                Ok(maps) => maps.0,
                 Err(_) => Vec::new(),
             },
         )

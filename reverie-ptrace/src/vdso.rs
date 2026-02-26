@@ -205,7 +205,7 @@ fn vdso_get_symbols_info() -> HashMap<&'static str, (u64, usize)> {
         .map_or_else(
             |_| Vec::new(),
             |p| match p.maps() {
-                Ok(maps) => maps.memory_maps,
+                Ok(maps) => maps.0,
                 Err(_) => Vec::new(),
             },
         )
@@ -251,7 +251,7 @@ where
         .map_or_else(
             |_| Vec::new(),
             |p| match p.maps() {
-                Ok(maps) => maps.memory_maps,
+                Ok(maps) => maps.0,
                 Err(_) => Vec::new(),
             },
         )
@@ -317,7 +317,7 @@ mod tests {
                 .map_or_else(
                     |_| Vec::new(),
                     |p| match p.maps() {
-                        Ok(maps) => maps.memory_maps,
+                        Ok(maps) => maps.0,
                         Err(_) => Vec::new(),
                     },
                 )
