@@ -17,7 +17,7 @@ byteorder = "1.5"
 lazy_static = "1.5"
 libc = "0.2.139"
 linked-hash-map = { version = "0.5", features = ["serde_impl"] }
-memmap2 = "0.9.5"
+memmap2 = "0.9.10"
 never-say-never = "6"
 nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
 object = { version = "0.36.7", features = ["read", "write"] }
