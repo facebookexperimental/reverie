@@ -1314,7 +1314,7 @@ mod test {
         unsafe {
             let mut sa: libc::sigaction = MaybeUninit::zeroed().assume_init();
             sa.sa_flags = libc::SA_RESTART | libc::SA_SIGINFO | libc::SA_NODEFER;
-            sa.sa_sigaction = sigalrm_handler as _;
+            sa.sa_sigaction = sigalrm_handler as *const () as _;
 
             libc::sigaction(libc::SIGALRM, &sa as *const _, std::ptr::null_mut())
         }
