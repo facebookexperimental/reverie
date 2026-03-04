@@ -68,9 +68,8 @@ impl Fd {
     }
 
     pub fn null(readable: bool) -> Result<Self, Errno> {
-        let path = unsafe { CStr::from_bytes_with_nul_unchecked(b"/dev/null\0") };
         Self::open_c(
-            path.as_ptr(),
+            c"/dev/null".as_ptr(),
             if readable {
                 libc::O_RDONLY
             } else {
