@@ -279,7 +279,7 @@ where
             memory.write_exact(rptr, bytes)?;
             assert!(*size >= bytes.len());
             if *size > bytes.len() {
-                let fill: Vec<u8> = std::iter::repeat(0x90u8).take(size - bytes.len()).collect();
+                let fill: Vec<u8> = std::iter::repeat_n(0x90u8, size - bytes.len()).collect();
                 memory.write_exact(unsafe { rptr.add(bytes.len()) }, &fill)?;
             }
             debug!("{} patched {}@{:x}", guest.pid(), name, start);
