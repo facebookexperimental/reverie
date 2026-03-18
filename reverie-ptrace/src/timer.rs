@@ -27,7 +27,7 @@
 //!  - after any reverie-critical single-stepping occurs (e.g. in syscall
 //!    injections),
 //!  - before resumption of the guest,
-//! which _usually_ means immediately after the tool callback returns.
+//!    which _usually_ means immediately after the tool callback returns.
 
 use std::cmp::Ordering::Equal;
 use std::cmp::Ordering::Greater;
