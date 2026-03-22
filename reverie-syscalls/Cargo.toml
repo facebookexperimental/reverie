@@ -11,7 +11,7 @@ license = "BSD-2-Clause"
 [dependencies]
 bitflags = { version = "2.9", features = ["serde"], default-features = false }
 derive_more = { version = "1.0.0", features = ["full"] }
-libc = "0.2.139"
+libc = "0.2.183"
 nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
 paste = "1.0.14"
 reverie-memory = { version = "0.1.0", path = "../reverie-memory" }
