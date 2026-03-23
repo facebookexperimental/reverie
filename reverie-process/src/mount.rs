@@ -125,12 +125,12 @@ impl Mount {
     /// # Arguments
     ///
     /// * `lowerdir` - The lower directory of the overlay. Can be any filesystem
-    ///                and does not need to be writable. This directory is never
-    ///                modified by writes to `merged`.
+    ///   and does not need to be writable. This directory is never
+    ///   modified by writes to `merged`.
     /// * `upperdir` - The upper directory of the overlay. This is where all
-    ///                changes to `merged` are collected. Does not need to be
-    ///                empty, but should be when starting a new overlay from
-    ///                scratch.
+    ///   changes to `merged` are collected. Does not need to be
+    ///   empty, but should be when starting a new overlay from
+    ///   scratch.
     /// * `workdir`  - The work directory. This should always be empty.
     /// * `merged`   - The combination of `lowerdir` and `upperdir`.
     pub fn overlay(lowerdir: &Path, upperdir: &Path, workdir: &Path, merged: &Path) -> Self {
