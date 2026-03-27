@@ -15,4 +15,4 @@ clap = { version = "4.5.42", features = ["derive", "env", "string", "unicode", "
 reverie = { version = "0.1.0", path = "../reverie" }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 tracing-appender = "0.2.4"
-tracing-subscriber = { version = "0.3.20", features = ["chrono", "env-filter", "json", "local-time", "parking_lot", "registry"] }
+tracing-subscriber = { version = "0.3.23", features = ["chrono", "env-filter", "json", "local-time", "parking_lot", "registry"] }
