@@ -70,9 +70,7 @@ impl MemoryAccess for LocalMemory {
         let addr = addr.into();
         // Simply copy the memory starting at the address into the buffer. This
         // is very unsafe. We need a better way to do this.
-        unsafe {
-            ::core::intrinsics::copy_nonoverlapping(addr.as_ptr(), buf.as_mut_ptr(), buf.len())
-        };
+        unsafe { ::core::ptr::copy_nonoverlapping(addr.as_ptr(), buf.as_mut_ptr(), buf.len()) };
 
         Ok(buf.len())
     }
@@ -80,9 +78,7 @@ impl MemoryAccess for LocalMemory {
     fn write(&mut self, addr: AddrMut<u8>, buf: &[u8]) -> Result<usize, Errno> {
         // Simply copy the memory starting at the address into the buffer. This
         // is very unsafe. We need a better way to do this.
-        unsafe {
-            ::core::intrinsics::copy_nonoverlapping(buf.as_ptr(), addr.as_mut_ptr(), buf.len())
-        };
+        unsafe { ::core::ptr::copy_nonoverlapping(buf.as_ptr(), addr.as_mut_ptr(), buf.len()) };
 
         Ok(buf.len())
     }
