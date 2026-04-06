@@ -308,11 +308,10 @@ mod test {
         // 100 which is far too small. Here, we use 4 pages in size.
         //
         // FIXME: Because of the issue [1], u8::arbitrary() only ever generates
-        // zeros when size % u8::max_value() == 0.
+        // zeros when size % u8::MAX == 0.
         //
         // [1] https://github.com/BurntSushi/quickcheck/issues/119
-        let mut qc =
-            QuickCheck::new().r#gen(quickcheck::Gen::new(0x4000 + u8::max_value() as usize));
+        let mut qc = QuickCheck::new().r#gen(quickcheck::Gen::new(0x4000 + u8::MAX as usize));
 
         qc.quickcheck(prop_remote_read_exact as fn(Vec<u8>) -> bool);
 
