@@ -848,7 +848,9 @@ impl Session {
                 .ok_or(Error::SessionNotStarted)?;
             let (reply_tx, reply_rx) = oneshot::channel();
             let core_regs: CoreRegs =
-                bincode::deserialize(regs).map_err(|_| CommandParseError::MalformedRegisters)?;
+                bincode::serde::decode_from_slice(regs, bincode::config::legacy())
+                    .map(|(v, _)| v)
+                    .map_err(|_| CommandParseError::MalformedRegisters)?;
             let request = GdbRequest::WriteRegisters(core_regs, reply_tx);
             request_tx
                 .send(request)

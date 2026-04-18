@@ -2263,8 +2263,10 @@ impl<'a, G: GlobalTool> GlobalRPC<G> for WrappedFrom<'a, G> {
         // In debugging mode we round-trip through a serialized representation
         // to make sure it works.
         let deserial = if cfg!(debug_assertions) {
-            let serial = bincode::serialize(&args).unwrap();
-            bincode::deserialize(&serial).unwrap()
+            let serial = bincode::serde::encode_to_vec(&args, bincode::config::legacy()).unwrap();
+            bincode::serde::decode_from_slice(&serial, bincode::config::legacy())
+                .unwrap()
+                .0
         } else {
             args
         };

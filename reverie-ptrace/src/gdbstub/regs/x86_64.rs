@@ -299,14 +299,16 @@ impl CoreRegs {
 
 impl WriteResponse for ResponseAsHex<CoreRegs> {
     fn write_response(&self, f: &mut ResponseWriter) {
-        let encoded: Vec<u8> = bincode::serialize(&self.0).unwrap();
+        let encoded: Vec<u8> =
+            bincode::serde::encode_to_vec(&self.0, bincode::config::legacy()).unwrap();
         ResponseAsHex(encoded.as_slice()).write_response(f)
     }
 }
 
 impl WriteResponse for ResponseAsBinary<CoreRegs> {
     fn write_response(&self, f: &mut ResponseWriter) {
-        let encoded: Vec<u8> = bincode::serialize(&self.0).unwrap();
+        let encoded: Vec<u8> =
+            bincode::serde::encode_to_vec(&self.0, bincode::config::legacy()).unwrap();
         ResponseAsBinary(encoded.as_slice()).write_response(f)
     }
 }
@@ -363,7 +365,8 @@ mod test {
         const EXPECTED_SIZE: usize = 16 * 8 + 8 + 4 + 4 * 6 + 10 * 8 + 8 * 4 + 16 * 16 + 4 + 8 * 3; // 560.
         assert_eq!(mem::size_of::<CoreRegs>(), EXPECTED_SIZE);
         let core_regs: CoreRegs = Default::default();
-        let encoded: Vec<u8> = bincode::serialize(&core_regs).unwrap();
+        let encoded: Vec<u8> =
+            bincode::serde::encode_to_vec(&core_regs, bincode::config::legacy()).unwrap();
         assert_eq!(encoded.len(), EXPECTED_SIZE);
     }
 
@@ -434,7 +437,8 @@ mod test {
             fs_base: 0x7ffff7fcd540,
             gs_base: 0,
         };
-        let encoded: Vec<u8> = bincode::serialize(&core_regs).unwrap();
+        let encoded: Vec<u8> =
+            bincode::serde::encode_to_vec(&core_regs, bincode::config::legacy()).unwrap();
         // NB: keep this so that we can *visualize* how core regs are
         // serialized.
         let expected: Vec<u8> = vec![
@@ -474,7 +478,10 @@ mod test {
             0x7f, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
         ];
         assert_eq!(encoded, expected);
-        let core_regs2 = bincode::deserialize(&encoded).unwrap();
+        let core_regs2: CoreRegs =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::legacy())
+                .unwrap()
+                .0;
         assert_eq!(core_regs, core_regs2);
     }
 }

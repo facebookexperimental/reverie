@@ -11,7 +11,7 @@ license = "BSD-2-Clause"
 [dependencies]
 anyhow = "1.0.102"
 async-trait = "0.1.86"
-bincode = "1.3.3"
+bincode = { version = "2", features = ["serde"] }
 bytes = { version = "1.11.1", features = ["serde"] }
 close-err = "1.0.2"
 futures = { version = "0.3.31", features = ["async-await", "compat"] }

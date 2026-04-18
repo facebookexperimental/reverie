@@ -785,13 +785,18 @@ impl Container {
             || {
                 let value = self.setup(&context, &mut []).map(|()| f());
 
-                let writer = std::io::BufWriter::new(Fd::new(writer_fd));
+                let mut writer = std::io::BufWriter::new(Fd::new(writer_fd));
 
                 // Serialize this result with bincode and send it to the parent
                 // process via a pipe.
                 //
                 // TODO: Handle serialization errors(?)
-                bincode::serialize_into(writer, &value).expect("Failed to serialize return value");
+                bincode::serde::encode_into_std_write(
+                    &value,
+                    &mut writer,
+                    bincode::config::legacy(),
+                )
+                .expect("Failed to serialize return value");
 
                 0
             },
@@ -830,7 +835,10 @@ impl Container {
             }
             Ok(n) => {
                 // FIXME: Handle errors
-                let value: Result<T, Error> = bincode::deserialize(&buf[0..n]).unwrap();
+                let value: Result<T, Error> =
+                    bincode::serde::decode_from_slice(&buf[0..n], bincode::config::legacy())
+                        .unwrap()
+                        .0;
                 Ok(value.unwrap())
             }
             Err(err) => {

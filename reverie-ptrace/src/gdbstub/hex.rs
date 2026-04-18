@@ -85,17 +85,21 @@ impl GdbHexString {
     /// decode gdb hex encoded binary data into a slice.
     #[cfg(test)]
     pub fn decode(&self) -> Result<Vec<u8>, GdbHexError> {
-        let serialized: Vec<u8> =
-            bincode::serialize(self).map_err(|_| GdbHexError::InvalidGdbHex)?;
-        bincode::deserialize(&serialized).map_err(|_| GdbHexError::InvalidGdbHex)
+        let serialized: Vec<u8> = bincode::serde::encode_to_vec(self, bincode::config::legacy())
+            .map_err(|_| GdbHexError::InvalidGdbHex)?;
+        bincode::serde::decode_from_slice(&serialized, bincode::config::legacy())
+            .map(|(v, _)| v)
+            .map_err(|_| GdbHexError::InvalidGdbHex)
     }
 
     /// encode slice into gdb hex encoded data
     #[cfg(test)]
     pub fn encode(bytes: &[u8]) -> Result<Self, GdbHexError> {
-        let serialized: Vec<u8> =
-            bincode::serialize(bytes).map_err(|_| GdbHexError::InvalidGdbHex)?;
-        bincode::deserialize(&serialized).map_err(|_| GdbHexError::InvalidGdbHex)
+        let serialized: Vec<u8> = bincode::serde::encode_to_vec(bytes, bincode::config::legacy())
+            .map_err(|_| GdbHexError::InvalidGdbHex)?;
+        bincode::serde::decode_from_slice(&serialized, bincode::config::legacy())
+            .map(|(v, _)| v)
+            .map_err(|_| GdbHexError::InvalidGdbHex)
     }
 }
 
@@ -181,17 +185,21 @@ impl GdbBinaryString {
     /// decode gdb binary encoded binary data into a slice.
     #[cfg(test)]
     pub fn decode(&self) -> Result<Vec<u8>, GdbHexError> {
-        let serialized: Vec<u8> =
-            bincode::serialize(self).map_err(|_| GdbHexError::InvalidGdbHex)?;
-        bincode::deserialize(&serialized).map_err(|_| GdbHexError::InvalidGdbHex)
+        let serialized: Vec<u8> = bincode::serde::encode_to_vec(self, bincode::config::legacy())
+            .map_err(|_| GdbHexError::InvalidGdbHex)?;
+        bincode::serde::decode_from_slice(&serialized, bincode::config::legacy())
+            .map(|(v, _)| v)
+            .map_err(|_| GdbHexError::InvalidGdbHex)
     }
 
     /// encode slice into gdb binary encoded data
     #[cfg(test)]
     pub fn encode(bytes: &[u8]) -> Result<Self, GdbHexError> {
-        let serialized: Vec<u8> =
-            bincode::serialize(bytes).map_err(|_| GdbHexError::InvalidGdbHex)?;
-        bincode::deserialize(&serialized).map_err(|_| GdbHexError::InvalidGdbHex)
+        let serialized: Vec<u8> = bincode::serde::encode_to_vec(bytes, bincode::config::legacy())
+            .map_err(|_| GdbHexError::InvalidGdbHex)?;
+        bincode::serde::decode_from_slice(&serialized, bincode::config::legacy())
+            .map(|(v, _)| v)
+            .map_err(|_| GdbHexError::InvalidGdbHex)
     }
 }
 
@@ -368,12 +376,18 @@ mod test {
         let test2 = GdbHexString {
             bytes: Bytes::from("01020304"),
         };
-        let bytes: Vec<u8> = bincode::serialize(&test2).unwrap();
+        let bytes: Vec<u8> =
+            bincode::serde::encode_to_vec(&test2, bincode::config::legacy()).unwrap();
         assert_eq!(bytes, test1);
-        let encoded: GdbHexString = bincode::deserialize(&bytes).unwrap();
+        let encoded: GdbHexString =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::legacy())
+                .map(|(v, _)| v)
+                .unwrap();
         assert_eq!(encoded, test2);
 
-        let bytes: Vec<u8> = bincode::deserialize(&bytes).unwrap();
+        let bytes: Vec<u8> = bincode::serde::decode_from_slice(&bytes, bincode::config::legacy())
+            .map(|(v, _)| v)
+            .unwrap();
         assert_eq!(bytes, vec![1, 2, 3, 4]);
     }
 
