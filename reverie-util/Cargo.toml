@@ -14,5 +14,5 @@ chrono = { version = "0.4.44", features = ["clock", "serde", "std"], default-fea
 clap = { version = "4.6.0", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 reverie = { version = "0.1.0", path = "../reverie" }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
-tracing-appender = "0.2.4"
+tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["chrono", "env-filter", "json", "local-time", "parking_lot", "registry"] }
