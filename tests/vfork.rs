@@ -10,83 +10,6 @@
 // syscall. This test should work with both methods of doing a `vfork`.
 #![cfg(target_arch = "x86_64")]
 
-// signal handling related tests.
-
-use reverie::Error;
-use reverie::Guest;
-use reverie::Tool;
-use reverie::syscalls::Syscall;
-use reverie::syscalls::SyscallArgs;
-use reverie::syscalls::SyscallInfo;
-
-#[derive(Debug, Default, Clone)]
-struct LocalStateVfork;
-
-#[derive(Debug, Default, Clone)]
-struct LocalStateVforkClone;
-
-#[reverie::tool]
-impl Tool for LocalStateVfork {
-    type GlobalState = ();
-    type ThreadState = ();
-
-    async fn handle_syscall_event<T: Guest<Self>>(
-        &self,
-        guest: &mut T,
-        syscall: Syscall,
-    ) -> Result<i64, Error> {
-        match syscall {
-            Syscall::Vfork(_) => {
-                let (_, args) = syscall.into_parts();
-                eprintln!(
-                    "[pid = {}] tail_inject vfork (unchanged), args: {:x?}",
-                    guest.tid(),
-                    args
-                );
-                guest.tail_inject(syscall).await
-            }
-            _ => guest.tail_inject(syscall).await,
-        }
-    }
-}
-
-#[reverie::tool]
-impl Tool for LocalStateVforkClone {
-    type GlobalState = ();
-    type ThreadState = ();
-
-    async fn handle_syscall_event<T: Guest<Self>>(
-        &self,
-        guest: &mut T,
-        syscall: Syscall,
-    ) -> Result<i64, Error> {
-        match syscall {
-            Syscall::Vfork(_) => {
-                let (_, args) = syscall.into_parts();
-                // NB: glibc's vfork is a assembly function, it uses %%rdi as return address (on stack)
-                // vfork is very tricky because child/parent share the same stack. see P153347946 for
-                // a bit more context.
-                let raw: SyscallArgs = SyscallArgs {
-                    arg0: (libc::CLONE_VFORK | libc::CLONE_VM | libc::SIGCHLD) as usize,
-                    arg1: 0,
-                    arg2: 0,
-                    arg3: 0,
-                    arg4: 0,
-                    arg5: 0,
-                };
-                eprintln!(
-                    "[pid = {}] inject vfork as clone, old arg: {:x?}, injected arg: {:x?}",
-                    guest.tid(),
-                    args,
-                    raw
-                );
-                guest.tail_inject(reverie::syscalls::Clone::from(raw)).await
-            }
-            _ => guest.tail_inject(syscall).await,
-        }
-    }
-}
-
 #[cfg(all(not(sanitized), test))]
 mod tests {
     use std::ffi::CString;
@@ -94,9 +17,81 @@ mod tests {
     use nix::sys::wait;
     use nix::sys::wait::WaitStatus;
     use nix::unistd::Pid;
+    use reverie::Error;
+    use reverie::Guest;
+    use reverie::Tool;
+    use reverie::syscalls::Syscall;
+    use reverie::syscalls::SyscallArgs;
+    use reverie::syscalls::SyscallInfo;
     use reverie_ptrace::testing::check_fn;
 
-    use super::*;
+    #[derive(Debug, Default, Clone)]
+    struct LocalStateVfork;
+
+    #[derive(Debug, Default, Clone)]
+    struct LocalStateVforkClone;
+
+    #[reverie::tool]
+    impl Tool for LocalStateVfork {
+        type GlobalState = ();
+        type ThreadState = ();
+
+        async fn handle_syscall_event<T: Guest<Self>>(
+            &self,
+            guest: &mut T,
+            syscall: Syscall,
+        ) -> Result<i64, Error> {
+            match syscall {
+                Syscall::Vfork(_) => {
+                    let (_, args) = syscall.into_parts();
+                    eprintln!(
+                        "[pid = {}] tail_inject vfork (unchanged), args: {:x?}",
+                        guest.tid(),
+                        args
+                    );
+                    guest.tail_inject(syscall).await
+                }
+                _ => guest.tail_inject(syscall).await,
+            }
+        }
+    }
+
+    #[reverie::tool]
+    impl Tool for LocalStateVforkClone {
+        type GlobalState = ();
+        type ThreadState = ();
+
+        async fn handle_syscall_event<T: Guest<Self>>(
+            &self,
+            guest: &mut T,
+            syscall: Syscall,
+        ) -> Result<i64, Error> {
+            match syscall {
+                Syscall::Vfork(_) => {
+                    let (_, args) = syscall.into_parts();
+                    // NB: glibc's vfork is a assembly function, it uses %%rdi as return address (on stack)
+                    // vfork is very tricky because child/parent share the same stack. see P153347946 for
+                    // a bit more context.
+                    let raw: SyscallArgs = SyscallArgs {
+                        arg0: (libc::CLONE_VFORK | libc::CLONE_VM | libc::SIGCHLD) as usize,
+                        arg1: 0,
+                        arg2: 0,
+                        arg3: 0,
+                        arg4: 0,
+                        arg5: 0,
+                    };
+                    eprintln!(
+                        "[pid = {}] inject vfork as clone, old arg: {:x?}, injected arg: {:x?}",
+                        guest.tid(),
+                        args,
+                        raw
+                    );
+                    guest.tail_inject(reverie::syscalls::Clone::from(raw)).await
+                }
+                _ => guest.tail_inject(syscall).await,
+            }
+        }
+    }
 
     #[derive(Clone, Copy)]
     enum VforkTestFlag {
