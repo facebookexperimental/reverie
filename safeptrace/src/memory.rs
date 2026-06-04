@@ -311,7 +311,7 @@ mod test {
         // zeros when size % u8::MAX == 0.
         //
         // [1] https://github.com/BurntSushi/quickcheck/issues/119
-        let mut qc = QuickCheck::new().r#gen(quickcheck::Gen::new(0x4000 + u8::MAX as usize));
+        let mut qc = QuickCheck::new().rng(quickcheck::Gen::new(0x4000 + u8::MAX as usize));
 
         qc.quickcheck(prop_remote_read_exact as fn(Vec<u8>) -> bool);
 
