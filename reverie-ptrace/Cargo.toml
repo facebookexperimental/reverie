@@ -15,7 +15,7 @@ bincode = { version = "2", features = ["serde"] }
 bytes = { version = "1.11.1", features = ["serde"] }
 close-err = "1.0.2"
 futures = { version = "0.3.31", features = ["async-await", "compat"] }
-goblin = { version = "0.10.5", features = ["elf32", "elf64", "endian_fd"] }
+goblin = { version = "0.10.7", features = ["elf32", "elf64", "endian_fd"] }
 iced-x86 = "1.21.0"
 lazy_static = "1.5"
 libc = "0.2.186"
