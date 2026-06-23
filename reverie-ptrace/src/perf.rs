@@ -25,8 +25,8 @@
 use core::ptr::NonNull;
 #[allow(unused_imports)] // only used if we have an error
 use std::compile_error;
+use std::sync::LazyLock;
 
-use lazy_static::lazy_static;
 use nix::sys::signal::Signal;
 use nix::unistd::SysconfVar;
 use nix::unistd::sysconf;
@@ -40,9 +40,7 @@ use tracing::warn;
 use crate::validation::PmuValidationError;
 use crate::validation::check_for_pmu_bugs;
 
-lazy_static! {
-    static ref PMU_BUG: Result<(), PmuValidationError> = check_for_pmu_bugs();
-}
+static PMU_BUG: LazyLock<Result<(), PmuValidationError>> = LazyLock::new(check_for_pmu_bugs);
 
 // Not available in the libc crate
 const F_SETOWN_EX: libc::c_int = 15;
@@ -533,9 +531,7 @@ fn test_perf_pmu_support() -> bool {
     false
 }
 
-lazy_static! {
-    static ref IS_PERF_SUPPORTED: bool = test_perf_pmu_support();
-}
+static IS_PERF_SUPPORTED: LazyLock<bool> = LazyLock::new(test_perf_pmu_support);
 
 /// Returns true if the current system configuration supports use of perf for
 /// hardware events.

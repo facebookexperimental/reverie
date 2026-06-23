@@ -68,6 +68,7 @@ use std::collections::hash_map::Entry;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::Ordering;
 use std::task::Context;
@@ -77,7 +78,6 @@ use std::thread;
 use std::thread::JoinHandle;
 
 use futures::task::AtomicWaker;
-use lazy_static::lazy_static;
 use nix::sys::wait::WaitPidFlag;
 use nix::sys::wait::WaitStatus;
 use parking_lot::Mutex;
@@ -90,9 +90,7 @@ use super::Stopped;
 use super::Wait;
 use super::waitid;
 
-lazy_static! {
-    static ref NOTIFIER: Notifier = Notifier::new();
-}
+static NOTIFIER: LazyLock<Notifier> = LazyLock::new(Notifier::new);
 
 /// A place-holder status used to indicate that no status has been set.
 const INVALID_STATUS: i32 = -1;

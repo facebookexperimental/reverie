@@ -8,9 +8,9 @@
 
 //! Provides APIs to disable VDSOs at runtime.
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use goblin::elf::Elf;
-use lazy_static::lazy_static;
 use nix::sys::mman::ProtFlags;
 use nix::unistd;
 use reverie::Error;
@@ -168,33 +168,31 @@ fn align_up(value: usize, alignment: usize) -> usize {
     (value + alignment - 1) & alignment.wrapping_neg()
 }
 
-lazy_static! {
-    static ref VDSO_PATCH_INFO: HashMap<&'static str, (u64, usize, &'static [u8])> = {
-        let info = vdso_get_symbols_info();
-        let mut res = HashMap::new();
+static VDSO_PATCH_INFO: LazyLock<HashMap<&str, (u64, usize, &[u8])>> = LazyLock::new(|| {
+    let info = vdso_get_symbols_info();
+    let mut res = HashMap::new();
 
-        for (k, v) in VDSO_SYMBOLS {
-            if let Some(&(base, size)) = info.get(*k) {
-                // NOTE: There is padding at the end of every VDSO entry to
-                // bring it up to a 16-byte size alignment. The dynamic symbol
-                // table doesn't report the aligned size, so we must do the same
-                // alignment here. For example, some VDSO entries might only be
-                // 5 bytes, but they have padding to align them up to 16 bytes.
-                let aligned_size = align_up(size, 16);
-                assert!(
-                    v.len() <= aligned_size,
-                    "vdso symbol {}'s real size is {} bytes, but trying to replace it with {} bytes",
-                    k,
-                    size,
-                    v.len()
-                );
-                res.insert(*k, (base, aligned_size, *v));
-            }
+    for (k, v) in VDSO_SYMBOLS {
+        if let Some(&(base, size)) = info.get(*k) {
+            // NOTE: There is padding at the end of every VDSO entry to
+            // bring it up to a 16-byte size alignment. The dynamic symbol
+            // table doesn't report the aligned size, so we must do the same
+            // alignment here. For example, some VDSO entries might only be
+            // 5 bytes, but they have padding to align them up to 16 bytes.
+            let aligned_size = align_up(size, 16);
+            assert!(
+                v.len() <= aligned_size,
+                "vdso symbol {}'s real size is {} bytes, but trying to replace it with {} bytes",
+                k,
+                size,
+                v.len()
+            );
+            res.insert(*k, (base, aligned_size, *v));
         }
+    }
 
-        res
-    };
-}
+    res
+});
 
 // get vdso symbols offset/size from current process
 // assuming vdso binary is the same for all processes

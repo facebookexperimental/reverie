@@ -7,6 +7,7 @@
  */
 
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 
@@ -22,9 +23,7 @@ use super::symbols::Symbols;
 /// symbols will be removed.
 const DEFAULT_MAX_CACHE_SIZE: usize = 1 << 30; // 1 GiB
 
-lazy_static::lazy_static! {
-    static ref CACHE: Mutex<DebugInfoCache> = Mutex::new(DebugInfoCache::new());
-}
+static CACHE: LazyLock<Mutex<DebugInfoCache>> = LazyLock::new(|| Mutex::new(DebugInfoCache::new()));
 
 /// An LRU cache of loaded symbols. This is shared by all processes since we
 /// only need to load symbols once for a particular inode. However, each process

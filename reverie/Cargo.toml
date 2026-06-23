@@ -14,7 +14,6 @@ anyhow = "1.0.102"
 async-trait = "0.1.86"
 bitflags = { version = "2.11.1", features = ["serde", "std"], default-features = false }
 byteorder = "1.5"
-lazy_static = "1.5"
 libc = "0.2.186"
 linked-hash-map = { version = "0.5", features = ["serde_impl"] }
 memmap2 = "0.9.10"
