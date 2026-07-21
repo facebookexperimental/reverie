@@ -1,69 +1,57 @@
-name: ci
+name: Rust
 
 on:
   push:
+    branches: [ "main" ]
   pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  check:
-    name: Check
+  regular:
+    name: Regular tests (GitHub-hosted)
     runs-on: ubuntu-latest
+
     steps:
-      - name: Install libunwind-dev
-        run: sudo apt-get install -y libunwind-dev
+    - uses: actions/checkout@v4
+    - name: Dependencies
+      run: sudo apt-get install -y libunwind-dev
+    - name: Rust toolchain
+      uses: dtolnay/rust-toolchain@nightly
+      with:
+        components: clippy, rustfmt
+    - name: Build
+      run: cargo build --workspace --all-features
+    - name: Test regular workspace cases
+      run: >-
+        cargo test --workspace --all-features --
+        --test-threads=1
+        --skip container::tests::pin_affinity_to_all_cores
+        --skip tests::seccomp_notify
+    - name: Documentation tests
+      run: cargo test --workspace --doc
+    - name: Clippy
+      run: cargo clippy --workspace --all-targets --all-features
+    - name: Format
+      run: cargo fmt --all -- --check
 
-      - name: Checkout sources
-        uses: actions/checkout@v2
+  hardware:
+    name: Host-dependent tests (self-hosted)
+    if: ${{ vars.REVERIE_SELF_HOSTED == 'true' }}
+    runs-on: [self-hosted, Linux, X64, reverie]
 
-      - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
-
-      - name: Run cargo check
-        run: cargo check --all-features
-
-  test:
-    name: Test Suite
-    runs-on: ubuntu-latest
     steps:
-      - name: Install libunwind-dev
-        run: sudo apt-get install -y libunwind-dev
-
-      - name: Checkout sources
-        uses: actions/checkout@v2
-
-      - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
-
-      - name: Run cargo test
-        run: cargo test --all-features -- --test-threads=1
-
-## Currently disabled because internal version of rustfmt produces different
-## formatting.
-#  rustfmt:
-#    name: Check format
-#    runs-on: ubuntu-latest
-#    steps:
-#      - name: Checkout sources
-#        uses: actions/checkout@v2
-#
-#      - name: Install nightly toolchain
-#        uses: dtolnay/rust-toolchain@nightly
-#        with:
-#          components: rustfmt
-#
-#      - name: Run cargo fmt
-#        run: cargo fmt --all -- --check
-
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    steps:
-      - name: Install libunwind-dev
-        run: sudo apt-get install -y libunwind-dev
-
-      - uses: actions/checkout@v2
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-            components: clippy
-      - name: Run cargo clippy
-        run: cargo clippy --all-features
+    - uses: actions/checkout@v4
+    - name: Dependencies
+      run: |
+        if command -v apt-get >/dev/null; then
+          sudo apt-get install -y libunwind-dev
+        else
+          sudo dnf install -y libunwind-devel
+        fi
+    - name: Rust toolchain
+      uses: dtolnay/rust-toolchain@nightly
+    - name: Host-dependent workspace tests
+      run: cargo test --workspace --all-features -- --test-threads=1
