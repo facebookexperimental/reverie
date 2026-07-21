@@ -1,0 +1,13 @@
+[package]
+name = "reverie-kvm"
+version = "0.1.0"
+authors = ["Meta Platforms"]
+edition = "2024"
+repository = "https://github.com/facebookexperimental/reverie"
+license = "BSD-2-Clause"
+
+[dependencies]
+kvm-bindings = "0.14.1"
+kvm-ioctls = "0.25.0"
+libc = "0.2.186"
+thiserror = "2.0.18"

@@ -2,6 +2,7 @@
 members = [
     "reverie",
     "reverie-examples",
+    "reverie-kvm",
     "reverie-memory",
     "reverie-process",
     "reverie-ptrace",
