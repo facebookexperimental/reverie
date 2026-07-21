@@ -56,7 +56,21 @@ jobs:
 
   hardware:
     name: Host-dependent tests (self-hosted)
-    if: ${{ vars.REVERIE_SELF_HOSTED == 'true' }}
+    if: >-
+      ${{
+        vars.REVERIE_SELF_HOSTED == 'true' &&
+        (
+          github.event_name == 'push' ||
+          (
+            github.event_name == 'workflow_dispatch' &&
+            github.actor == 'rrnewton'
+          ) ||
+          (
+            github.event_name == 'pull_request' &&
+            github.event.pull_request.user.login == 'rrnewton'
+          )
+        )
+      }}
     runs-on: [self-hosted, Linux, X64, reverie]
 
     steps:
