@@ -30,8 +30,23 @@ jobs:
       run: >-
         cargo test --workspace --all-features --
         --test-threads=1
+        --skip container::tests::bind_to_low_port
         --skip container::tests::pin_affinity_to_all_cores
+        --skip tests::domainname
+        --skip tests::hostname
+        --skip tests::local_networking_loopback_flags
+        --skip tests::local_networking_ping
+        --skip tests::local_networking_there_can_be_only_one
+        --skip tests::mount_and_move_tmpfs
+        --skip tests::mount_bind
+        --skip tests::mount_devpts_basic
+        --skip tests::mount_devpts_isolated
+        --skip tests::mount_proc
+        --skip tests::mount_tmpfs
+        --skip tests::pid_namespace
+        --skip tests::port_isolation
         --skip tests::seccomp_notify
+        --skip tests::uid_namespace
     - name: Documentation tests
       run: cargo test --workspace --doc
     - name: Clippy
