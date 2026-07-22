@@ -8,9 +8,17 @@ native DynamoRIO client:
 - replaces application `CPUID` instructions with Hermit's deterministic CPU
   identity, masking RDRAND, RDSEED, TSX, and AVX-512 features;
 - receives all application syscall entry events without ptrace;
+- rewrites `uname` release and zero-port `bind` calls with Hermit's deterministic
+  values;
+- disables guest ASLR so non-fixed mappings remain stable;
+- substitutes minimal stable snapshots for volatile `/proc` views;
+- derives `getrandom` and random-device bytes from Hermit's configured RNG seed;
+- virtualizes `getrusage` and `sysinfo` process metadata;
 - forwards `write` to a Rust `PrototypeTool`, which executes it through
-  `Guest::inject`, returns its result, and suppresses the original syscall; and
-- reports process totals when the application exits.
+  `Guest::inject`, returns its result, and suppresses the original syscall;
+- launches shebang programs through their interpreter while preserving the exact
+  guest environment; and
+- optionally reports process totals when the application exits.
 
 Build DynamoRIO first:
 
@@ -29,6 +37,10 @@ DYNAMORIO_HOME=$PWD/dynamorio reverie-dbi/scripts/test-echo.sh
 DYNAMORIO_HOME=$PWD/dynamorio reverie-dbi/scripts/test-cpuid.sh
 ```
 
+Set `REVERIE_DBI_SUMMARY=1` when using `DbiRunner` to print branch and syscall
+totals. The summary is opt-in because its branch count is diagnostic and can
+vary between otherwise equivalent runs.
+
 The native client is intentionally separate from Cargo because DynamoRIO's
 CMake package supplies required client linker flags. The script first builds
 `libreverie_dbi.so`, then links the native client against that Rust runtime.
@@ -44,5 +56,7 @@ dynamic Rust TLS inside DynamoRIO's private loader.
   exact post-branch threshold traps remain production-backend work.
 - The process-wide branch counter is sampled at syscall boundaries, so the
   displayed total may omit branches after the process's final syscall.
+- The synthetic `/proc` snapshots expose only the stable fields needed by the
+  current deterministic policy; they are not complete Linux procfs emulation.
 - Restartable sequences are disabled in the smoke test so libc selects its
   supported fallback path.

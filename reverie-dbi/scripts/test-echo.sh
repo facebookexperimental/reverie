@@ -17,7 +17,7 @@ tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT
 
 expected="hello from reverie-dbi"
-"$drrun" -disable_rseq -c "$client" -- \
+"$drrun" -disable_rseq -c "$client" -summary -- \
   /bin/echo "$expected" >"$tmpdir/stdout" 2>"$tmpdir/stderr"
 
 [[ $(cat "$tmpdir/stdout") == "$expected" ]]

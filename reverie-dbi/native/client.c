@@ -91,6 +91,7 @@ extern void reverie_dbi_runtime_totals(uint64_t *branches, uint64_t *syscalls,
 static _Atomic uint64_t branch_count __attribute__((aligned(64)));
 static int thread_state_index;
 static ptr_uint_t cpuid_marker_note;
+static bool report_summary;
 
 static cpuid_result_t deterministic_cpuid(uint32_t leaf, uint32_t subleaf) {
   cpuid_result_t result = {0};
@@ -263,10 +264,13 @@ static void event_exit(void) {
   uint64_t syscalls;
   uint64_t rewritten;
 
-  reverie_dbi_runtime_totals(&branches, &syscalls, &rewritten);
-  dr_fprintf(STDERR,
-             "reverie-dbi: branches=%llu syscalls=%llu rewritten_writes=%llu\n",
-             branches, syscalls, rewritten);
+  if (report_summary) {
+    reverie_dbi_runtime_totals(&branches, &syscalls, &rewritten);
+    dr_fprintf(
+        STDERR,
+        "reverie-dbi: branches=%llu syscalls=%llu rewritten_writes=%llu\n",
+        branches, syscalls, rewritten);
+  }
   drx_exit();
   drmgr_unregister_tls_field(thread_state_index);
   drreg_exit();
@@ -275,6 +279,10 @@ static void event_exit(void) {
 
 DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[]) {
   drreg_options_t register_options = {sizeof(register_options), 1, false};
+
+  for (int i = 1; i < argc; ++i)
+    if (strcmp(argv[i], "-summary") == 0)
+      report_summary = true;
 
   dr_set_client_name("Reverie DynamoRIO backend prototype",
                      "https://github.com/rrnewton/reverie");
