@@ -60,3 +60,11 @@ DynamoRIO's private loader.
   displayed total may omit branches after the process's final syscall.
 - Restartable sequences are disabled in the smoke test so libc selects its
   supported fallback path.
+
+## Third-party licenses
+
+Building this crate compiles DynamoRIO and the projects it vendors (elfutils,
+libipt, zlib). DynamoRIO is BSD-3-Clause but its extensions/tools include
+LGPL-licensed components (and elfutils is LGPL/GPL). See the [`NOTICE`](../NOTICE)
+file at the repository root for attribution and the distribution obligations
+that apply to binaries produced from this build.
