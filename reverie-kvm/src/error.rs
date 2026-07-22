@@ -47,6 +47,14 @@ pub enum Error {
         guest_end: u64,
     },
 
+    /// The transport frame named a number outside the architecture syscall table.
+    #[error("invalid x86-64 syscall number {0}")]
+    InvalidSyscallNumber(u64),
+
+    /// Syscall frames must use addresses accepted by KVM's hypercall ABI.
+    #[error("invalid syscall frame address {0:#x}")]
+    InvalidSyscallFrameAddress(u64),
+
     /// The host kernel cannot forward the selected hypercall to userspace.
     #[error("KVM userspace hypercall exits are not supported")]
     HypercallExitUnsupported,

@@ -23,7 +23,9 @@ use reverie::Tool;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
 use reverie_kvm::KvmBackend;
+use reverie_kvm::SyscallInfo;
 use reverie_kvm::SyscallRequest;
+use reverie_kvm::Sysno;
 
 const MEMORY_SIZE: usize = 0x10_000;
 const ENTRY_POINT: u64 = 0x1000;
@@ -72,18 +74,55 @@ fn guest_write_syscall_is_intercepted_via_vmcall() {
 
     let mut intercepted = None;
     backend
-        .run(|request, memory| {
-            let mut message = vec![0; request.args()[2] as usize];
-            memory.read(request.args()[1], &mut message).unwrap();
-            intercepted = Some((request.number(), request.args()[0], message));
-            request.args()[2] as i64
+        .run(|syscall, memory| {
+            let (number, args) = syscall.into_parts();
+            let mut message = vec![0; args.arg2];
+            memory.read(args.arg1 as u64, &mut message).unwrap();
+            intercepted = Some((number, args.arg0, message));
+            args.arg2 as i64
         })
         .unwrap();
 
-    assert_eq!(
-        intercepted,
-        Some((libc::SYS_write as u64, 1, b"hello".to_vec()))
-    );
+    assert_eq!(intercepted, Some((Sysno::write, 1, b"hello".to_vec())));
+}
+
+#[test]
+fn guest_program_routes_required_syscalls_via_vmcall() {
+    match Kvm::new() {
+        Ok(_) => {}
+        Err(error) if kvm_is_unavailable(&error) => {
+            eprintln!("skipping KVM vmcall test: cannot open /dev/kvm: {error}");
+            return;
+        }
+        Err(error) => panic!("failed to probe /dev/kvm: {error}"),
+    }
+
+    let expected = [
+        Sysno::read,
+        Sysno::write,
+        Sysno::open,
+        Sysno::close,
+        Sysno::mmap,
+        Sysno::munmap,
+        Sysno::brk,
+        Sysno::ioctl,
+    ];
+    let requests = expected.map(|number| SyscallRequest::new(number.id() as u64, [0; 6]));
+
+    let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+    backend
+        .install_syscalls(ENTRY_POINT, FRAME_ADDRESS, &requests)
+        .unwrap();
+
+    let mut intercepted = Vec::new();
+    backend
+        .run(|syscall, _memory| {
+            intercepted.push(syscall.number());
+            0
+        })
+        .unwrap();
+
+    assert_eq!(intercepted, expected);
 }
 
 #[test]
@@ -220,7 +259,10 @@ impl Tool for RecordingTool {
         assert_eq!(write.fd(), 1);
         let registers = guest.regs().await;
         assert_eq!(registers.orig_rax, libc::SYS_write as u64);
-        assert_eq!(registers.rip, ENTRY_POINT);
+        // The guest program loads the transport number and frame address with
+        // two 0x66-prefixed movs (6 bytes each) before the hypercall, so rip
+        // reports the transport instruction 12 bytes into the program.
+        assert_eq!(registers.rip, ENTRY_POINT + 12);
 
         let mut message = vec![0; write.len()];
         guest.memory().read_exact(

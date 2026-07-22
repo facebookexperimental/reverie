@@ -13,6 +13,14 @@ thread state, global RPC, syscall injection, and tail injection. Until a guest
 kernel supplies Linux syscall semantics, callers provide a `SyscallExecutor`
 for injected and unsubscribed syscalls.
 
+## Typed syscall decoding
+
+Every valid x86-64 syscall number is decoded through Reverie's complete typed
+syscall table before it reaches the host handler; a number outside that table
+is rejected instead of being forwarded as an untyped request. `install_syscalls`
+builds a small guest program containing consecutive hypercalls, with one
+page-aligned frame per request, so a single KVM run can route several syscalls.
+
 ## CPUID policy
 
 Every vCPU receives an explicit CPUID table through `KVM_SET_CPUID2` before
@@ -45,10 +53,11 @@ personality.
 This crate is not yet a Linux execution backend for arbitrary ELF programs. It
 has one real-mode vCPU and no process lifecycle, virtual memory, signals,
 filesystem, or timer implementation beyond the shared single-thread lifecycle
-used by the test guest. The `/dev/kvm` integration tests run a minimal
-`vmcall; hlt` guest program and a CPUID probe. They verify direct tool
-interception, the default Tool handler's ptrace-compatible `tail_inject`
-behavior, and the installed CPUID feature policy.
+used by the test guest. The `/dev/kvm` integration tests run a multi-vmcall
+guest program and a CPUID probe. They route read, write, open, close, mmap,
+munmap, brk, and ioctl in one KVM run, and verify direct tool interception, the
+default Tool handler's ptrace-compatible `tail_inject` behavior, and the
+installed CPUID feature policy.
 
 Running `/bin/true` requires a Linux ABI implementation in the VM. In
 particular, the host binary is a dynamically linked PIE that needs an ELF
