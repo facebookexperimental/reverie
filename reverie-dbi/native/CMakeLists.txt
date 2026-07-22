@@ -20,6 +20,7 @@ configure_DynamoRIO_client(reverie_dbi_client)
 use_DynamoRIO_extension(reverie_dbi_client drmgr)
 use_DynamoRIO_extension(reverie_dbi_client drreg)
 use_DynamoRIO_extension(reverie_dbi_client drx)
+use_DynamoRIO_extension(reverie_dbi_client drwrap)
 target_link_libraries(reverie_dbi_client "${REVERIE_DBI_RUNTIME}")
 
 get_filename_component(runtime_dir "${REVERIE_DBI_RUNTIME}" DIRECTORY)
