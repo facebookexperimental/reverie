@@ -9,19 +9,17 @@
 use bytes::BytesMut;
 
 use crate::gdbstub::commands::*;
-use crate::gdbstub::hex::*;
 
+/// LLDB `QThreadSuffixSupported` query. If the stub supports a `;thread:<id>;`
+/// suffix on register-access packets (`g`/`G`/`p`/`P`), it replies `OK` and
+/// LLDB will subsequently append that suffix to those packets.
 #[derive(PartialEq, Debug)]
-pub struct g {
-    /// Optional thread selected by an LLDB `;thread:<id>;` suffix.
-    pub thread: Option<ThreadId>,
-}
+pub struct QThreadSuffixSupported;
 
-impl ParseCommand for g {
+impl ParseCommand for QThreadSuffixSupported {
     fn parse(bytes: BytesMut) -> Option<Self> {
-        let (rest, thread) = split_thread_suffix(bytes);
-        if rest.is_empty() {
-            Some(g { thread })
+        if bytes.is_empty() {
+            Some(QThreadSuffixSupported)
         } else {
             None
         }
