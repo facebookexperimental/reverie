@@ -11,6 +11,7 @@ use reverie::syscalls::SyscallArgs;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
 
+use crate::Error;
 use crate::GuestMemory;
 use crate::Result;
 
@@ -47,21 +48,6 @@ impl SyscallRequest {
         )
     }
 
-    /// Converts this transport request into the shared Reverie syscall model.
-    pub fn into_syscall(self) -> Syscall {
-        Syscall::from_raw(
-            Sysno::from(self.number as i32),
-            SyscallArgs::new(
-                self.args[0] as usize,
-                self.args[1] as usize,
-                self.args[2] as usize,
-                self.args[3] as usize,
-                self.args[4] as usize,
-                self.args[5] as usize,
-            ),
-        )
-    }
-
     /// Returns the Linux syscall number.
     pub const fn number(&self) -> u64 {
         self.number
@@ -70,6 +56,22 @@ impl SyscallRequest {
     /// Returns the six Linux syscall arguments.
     pub const fn args(&self) -> &[u64; 6] {
         &self.args
+    }
+
+    /// Decodes this raw transport frame through Reverie's complete syscall table.
+    ///
+    /// A number outside the architecture syscall table is rejected instead of
+    /// being forwarded as an untyped request.
+    pub fn into_syscall(self) -> Result<Syscall> {
+        let number = usize::try_from(self.number)
+            .ok()
+            .and_then(Sysno::new)
+            .ok_or(Error::InvalidSyscallNumber(self.number))?;
+        let args = self.args.map(|argument| argument as usize);
+        Ok(Syscall::from_raw(
+            number,
+            SyscallArgs::new(args[0], args[1], args[2], args[3], args[4], args[5]),
+        ))
     }
 
     /// Encodes the request at a guest-physical address.
@@ -119,7 +121,7 @@ mod tests {
         let request = SyscallRequest::from_syscall(typed);
 
         assert_eq!(request.number(), libc::SYS_write as u64);
-        assert_eq!(request.into_syscall(), typed.into());
+        assert_eq!(request.into_syscall().unwrap(), typed.into());
     }
 
     #[test]
@@ -130,5 +132,41 @@ mod tests {
         request.write_to(&mut memory, 0x100).unwrap();
 
         assert_eq!(SyscallRequest::read_from(&memory, 0x100).unwrap(), request);
+    }
+
+    #[test]
+    fn decodes_every_x86_64_syscall_number() {
+        for number in Sysno::iter().chain(std::iter::once(Sysno::last())) {
+            let syscall = SyscallRequest::new(number.id() as u64, [0; 6])
+                .into_syscall()
+                .unwrap();
+            assert_eq!(syscall.number(), number);
+        }
+    }
+
+    #[test]
+    fn decodes_required_syscall_variants() {
+        let decode = |number: Sysno| {
+            SyscallRequest::new(number.id() as u64, [0; 6])
+                .into_syscall()
+                .unwrap()
+        };
+
+        assert!(matches!(decode(Sysno::read), Syscall::Read(_)));
+        assert!(matches!(decode(Sysno::write), Syscall::Write(_)));
+        assert!(matches!(decode(Sysno::open), Syscall::Open(_)));
+        assert!(matches!(decode(Sysno::close), Syscall::Close(_)));
+        assert!(matches!(decode(Sysno::mmap), Syscall::Mmap(_)));
+        assert!(matches!(decode(Sysno::munmap), Syscall::Munmap(_)));
+        assert!(matches!(decode(Sysno::brk), Syscall::Brk(_)));
+        assert!(matches!(decode(Sysno::ioctl), Syscall::Ioctl(_)));
+    }
+
+    #[test]
+    fn rejects_unknown_syscall_number() {
+        let error = SyscallRequest::new(u64::MAX, [0; 6])
+            .into_syscall()
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidSyscallNumber(u64::MAX)));
     }
 }
