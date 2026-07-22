@@ -6,6 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use kvm_bindings::CpuId;
 use kvm_bindings::KVM_MAX_CPUID_ENTRIES;
 use kvm_bindings::kvm_enable_cap;
 use kvm_bindings::kvm_userspace_memory_region;
@@ -15,6 +16,7 @@ use kvm_ioctls::VcpuExit;
 use kvm_ioctls::VcpuFd;
 use kvm_ioctls::VmFd;
 
+use crate::CpuidPolicy;
 use crate::Error;
 use crate::GuestMemory;
 use crate::Result;
@@ -42,13 +44,20 @@ pub struct KvmBackend {
 impl KvmBackend {
     /// Creates a VM with one real-mode vCPU and a memory slot starting at GPA 0x1000.
     pub fn new(memory_size: usize) -> Result<Self> {
+        Self::new_with_cpuid_policy(memory_size, CpuidPolicy::default())
+    }
+
+    /// Creates a VM with a caller-selected CPUID feature policy.
+    pub fn new_with_cpuid_policy(memory_size: usize, cpuid_policy: CpuidPolicy) -> Result<Self> {
         let kvm = Kvm::new()?;
         let vm = kvm.create_vm()?;
         if !vm.check_extension(Cap::ExitHypercall) {
             return Err(Error::HypercallExitUnsupported);
         }
 
-        let hypercall_instruction = supported_hypercall_instruction(&kvm)?;
+        let mut cpuid = kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)?;
+        cpuid_policy.apply(&mut cpuid);
+        let hypercall_instruction = supported_hypercall_instruction(&cpuid)?;
         let cap = kvm_enable_cap {
             cap: Cap::ExitHypercall as u32,
             args: [1_u64 << VMCALL_SYSCALL_TRANSPORT, 0, 0, 0],
@@ -71,6 +80,7 @@ impl KvmBackend {
         }
 
         let vcpu = vm.create_vcpu(0)?;
+        vcpu.set_cpuid2(&cpuid)?;
         Ok(Self {
             vcpu,
             vm,
@@ -78,6 +88,24 @@ impl KvmBackend {
             _kvm: kvm,
             hypercall_instruction,
         })
+    }
+
+    /// Installs an arbitrary real-mode program and selects it as the vCPU entry point.
+    pub fn install_real_mode_program(&mut self, entry_point: u64, code: &[u8]) -> Result<()> {
+        self.memory.write(entry_point, code)?;
+
+        let mut sregs = self.vcpu.get_sregs()?;
+        sregs.cs.base = 0;
+        sregs.cs.selector = 0;
+        sregs.ds.base = 0;
+        sregs.ds.selector = 0;
+        self.vcpu.set_sregs(&sregs)?;
+
+        let mut regs = self.vcpu.get_regs()?;
+        regs.rip = entry_point;
+        regs.rflags = 2;
+        self.vcpu.set_regs(&regs)?;
+        Ok(())
     }
 
     /// Returns the VM's guest memory.
@@ -103,17 +131,10 @@ impl KvmBackend {
             self.hypercall_instruction[2],
             HLT,
         ];
-        self.memory.write(entry_point, &code)?;
+        self.install_real_mode_program(entry_point, &code)?;
         request.write_to(&mut self.memory, frame_address)?;
 
-        let mut sregs = self.vcpu.get_sregs()?;
-        sregs.cs.base = 0;
-        sregs.cs.selector = 0;
-        self.vcpu.set_sregs(&sregs)?;
-
         let mut regs = self.vcpu.get_regs()?;
-        regs.rip = entry_point;
-        regs.rflags = 2;
         regs.rax = VMCALL_SYSCALL_TRANSPORT;
         regs.rbx = frame_address;
         // KVM validates the MAP_GPA_RANGE argument shape before forwarding
@@ -150,8 +171,7 @@ impl KvmBackend {
     }
 }
 
-fn supported_hypercall_instruction(kvm: &Kvm) -> Result<[u8; 3]> {
-    let cpuid = kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)?;
+fn supported_hypercall_instruction(cpuid: &CpuId) -> Result<[u8; 3]> {
     let supports_vmcall = cpuid
         .as_slice()
         .iter()

@@ -14,12 +14,14 @@
 
 #![cfg(target_arch = "x86_64")]
 
+mod cpuid;
 mod error;
 mod memory;
 mod runtime;
 mod syscall;
 mod vm;
 
+pub use cpuid::CpuidPolicy;
 pub use error::Error;
 pub use memory::GuestMemory;
 pub use runtime::KvmStack;

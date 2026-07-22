@@ -29,6 +29,7 @@ const MEMORY_SIZE: usize = 0x10_000;
 const ENTRY_POINT: u64 = 0x1000;
 const FRAME_ADDRESS: u64 = 0x2000;
 const MESSAGE_ADDRESS: u64 = 0x3000;
+const CPUID_RESULT_ADDRESS: u16 = 0x4000;
 
 fn kvm_is_unavailable(error: &kvm_ioctls::Error) -> bool {
     matches!(error.errno(), libc::ENOENT | libc::EACCES | libc::EPERM)
@@ -83,6 +84,96 @@ fn guest_write_syscall_is_intercepted_via_vmcall() {
         intercepted,
         Some((libc::SYS_write as u64, 1, b"hello".to_vec()))
     );
+}
+
+#[test]
+fn deterministic_cpuid_policy_is_visible_inside_vm() {
+    match Kvm::new() {
+        Ok(_) => {}
+        Err(error) if kvm_is_unavailable(&error) => {
+            eprintln!("skipping KVM CPUID test: cannot open /dev/kvm: {error}");
+            return;
+        }
+        Err(error) => panic!("failed to probe /dev/kvm: {error}"),
+    }
+
+    let mut program = Vec::new();
+    append_cpuid_probe(&mut program, 0, 0, CPUID_RESULT_ADDRESS);
+    append_cpuid_probe(&mut program, 1, 0, CPUID_RESULT_ADDRESS + 16);
+    append_cpuid_probe(&mut program, 7, 0, CPUID_RESULT_ADDRESS + 32);
+    append_cpuid_probe(&mut program, 7, 1, CPUID_RESULT_ADDRESS + 48);
+    append_cpuid_probe(&mut program, 0xd, 0, CPUID_RESULT_ADDRESS + 64);
+    program.push(0xf4); // hlt
+
+    let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+    backend
+        .install_real_mode_program(ENTRY_POINT, &program)
+        .unwrap();
+    backend
+        .run(|_, _| panic!("CPUID program must not issue a syscall"))
+        .unwrap();
+
+    let vendor = read_cpuid_result(&backend, CPUID_RESULT_ADDRESS);
+    assert_ne!([vendor[1], vendor[2], vendor[3]], [0; 3]);
+
+    let leaf1 = read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 16);
+    assert_eq!(leaf1[2] & bit(30), 0, "RDRAND must be hidden");
+
+    let leaf7 = read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 32);
+    assert_eq!(leaf7[1] & bit(18), 0, "RDSEED must be hidden");
+    assert_eq!(leaf7[1] & (bit(4) | bit(11)), 0, "TSX must be hidden");
+    assert_eq!(
+        leaf7[1] & (bit(16) | bit(17) | bit(21) | bit(26) | bit(27) | bit(28) | bit(30) | bit(31)),
+        0,
+        "AVX-512 EBX features must be hidden",
+    );
+    assert_eq!(
+        leaf7[2] & (bit(1) | bit(6) | bit(11) | bit(12) | bit(14)),
+        0,
+        "AVX-512 ECX features must be hidden",
+    );
+    assert_eq!(
+        leaf7[3] & (bit(2) | bit(3) | bit(8) | bit(23)),
+        0,
+        "AVX-512 EDX features must be hidden",
+    );
+
+    let leaf7_subleaf1 = read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 48);
+    assert_eq!(leaf7_subleaf1[0] & bit(5), 0, "AVX512_BF16 must be hidden");
+
+    let xstate = read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 64);
+    assert_eq!(
+        xstate[0] & (bit(5) | bit(6) | bit(7)),
+        0,
+        "AVX-512 xstate must be hidden",
+    );
+}
+
+fn append_cpuid_probe(program: &mut Vec<u8>, leaf: u32, subleaf: u32, output: u16) {
+    program.extend_from_slice(&[0x66, 0xb8]); // mov eax, leaf
+    program.extend_from_slice(&leaf.to_le_bytes());
+    program.extend_from_slice(&[0x66, 0xb9]); // mov ecx, subleaf
+    program.extend_from_slice(&subleaf.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0xa2]); // cpuid
+
+    program.extend_from_slice(&[0x66, 0xa3]); // mov [output], eax
+    program.extend_from_slice(&output.to_le_bytes());
+    for (register, offset) in [(0x1e, 4), (0x0e, 8), (0x16, 12)] {
+        program.extend_from_slice(&[0x66, 0x89, register]);
+        program.extend_from_slice(&(output + offset).to_le_bytes());
+    }
+}
+
+fn read_cpuid_result(backend: &KvmBackend, address: u16) -> [u32; 4] {
+    let mut bytes = [0; 16];
+    backend.memory().read(address.into(), &mut bytes).unwrap();
+    std::array::from_fn(|index| {
+        u32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap())
+    })
+}
+
+const fn bit(index: u32) -> u32 {
+    1 << index
 }
 
 #[derive(Default)]
