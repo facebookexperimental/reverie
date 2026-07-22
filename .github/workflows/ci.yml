@@ -78,9 +78,9 @@ jobs:
     - name: Dependencies
       run: |
         if command -v apt-get >/dev/null; then
-          sudo apt-get install -y libunwind-dev liblzma-dev
+          sudo apt-get install -y libunwind-dev liblzma-dev iputils-ping
         else
-          sudo dnf install -y libunwind-devel xz-devel
+          sudo dnf install -y libunwind-devel xz-devel iputils
         fi
     - name: Rust toolchain
       uses: dtolnay/rust-toolchain@nightly
