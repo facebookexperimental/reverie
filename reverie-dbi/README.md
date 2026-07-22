@@ -8,11 +8,14 @@ native DynamoRIO client:
 - replaces application `CPUID` instructions with Hermit's deterministic CPU
   identity, masking RDRAND, RDSEED, TSX, and AVX-512 features;
 - receives all application syscall entry events without ptrace;
-- rewrites `uname` release and zero-port `bind` calls with Hermit's deterministic
-  values;
+- rewrites every host-derived `uname` field (including `nodename` and `version`)
+  and zero-port `bind` calls with Hermit's deterministic values;
 - disables guest ASLR so non-fixed mappings remain stable;
 - substitutes minimal stable snapshots for volatile `/proc` views;
-- derives `getrandom` and random-device bytes from Hermit's configured RNG seed;
+- derives `getrandom` and random-device bytes from Hermit's configured RNG seed
+  using a layout-independent stream (indexed by seed and position, not by the
+  destination address), and follows random descriptors across the `read`/`pread`/
+  `readv`/`preadv` family and `dup`/`fcntl(F_DUPFD)` duplication;
 - virtualizes `getrusage` and `sysinfo` process metadata;
 - forwards `write` to a Rust `PrototypeTool`, which executes it through
   `Guest::inject`, returns its result, and suppresses the original syscall;
