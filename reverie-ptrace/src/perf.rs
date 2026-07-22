@@ -233,7 +233,13 @@ impl Builder {
                 )
             });
             match res {
-                Ok(ptr) => Some(NonNull::new(ptr as *mut _).unwrap()),
+                Ok(ptr) => match NonNull::new(ptr as *mut _) {
+                    Some(ptr) => Some(ptr),
+                    None => {
+                        close_perf_fd(fd);
+                        return Err(Errno::ENOMEM);
+                    }
+                },
                 Err(e) => {
                     close_perf_fd(fd);
                     return Err(e);
@@ -471,10 +477,10 @@ unsafe impl std::marker::Sync for PerfCounter {}
 fn get_mmap_size() -> usize {
     // Use a single page; we only want the perf metadata
     sysconf(SysconfVar::PAGE_SIZE)
-        .unwrap()
-        .unwrap()
+        .expect("failed to query the system page size")
+        .expect("the system did not report a page size")
         .try_into()
-        .unwrap()
+        .expect("the system page size must fit in usize")
 }
 
 /// Force a relaxed atomic load. Like Linux's READ_ONCE.
@@ -640,13 +646,13 @@ mod test {
             .sample_period(PerfCounter::DISABLE_SAMPLE_PERIOD)
             .event(Event::Hardware(HardwareEvent::BranchInstructions))
             .create()
-            .unwrap();
-        pc.reset().unwrap();
-        pc.enable().unwrap();
+            .expect("perf test operation should succeed");
+        pc.reset().expect("perf test operation should succeed");
+        pc.enable().expect("perf test operation should succeed");
         const ITERS: u64 = 10000;
         do_branches(ITERS);
-        pc.disable().unwrap();
-        let ctr = pc.ctr_value().unwrap();
+        pc.disable().expect("perf test operation should succeed");
+        let ctr = pc.ctr_value().expect("perf test operation should succeed");
         assert!(ctr >= ITERS);
         assert!(ctr <= ITERS + 100); // `.disable()` overhead
     }
@@ -661,21 +667,27 @@ mod test {
         const ITERS: u64 = 100000;
 
         let handle = std::thread::spawn(move || {
-            tx1.send(gettid()).unwrap();
-            rx2.recv().unwrap();
+            tx1.send(gettid())
+                .expect("perf test operation should succeed");
+            rx2.recv().expect("perf test operation should succeed");
             do_branches(ITERS);
         });
 
-        let pc = Builder::new(rx1.recv().unwrap().as_raw(), -1)
-            .sample_period(PerfCounter::DISABLE_SAMPLE_PERIOD)
-            .event(Event::Hardware(HardwareEvent::BranchInstructions))
-            .create()
-            .unwrap();
+        let pc = Builder::new(
+            rx1.recv()
+                .expect("perf test operation should succeed")
+                .as_raw(),
+            -1,
+        )
+        .sample_period(PerfCounter::DISABLE_SAMPLE_PERIOD)
+        .event(Event::Hardware(HardwareEvent::BranchInstructions))
+        .create()
+        .expect("perf test operation should succeed");
 
-        pc.enable().unwrap();
-        tx2.send(()).unwrap(); // tell thread to start
-        handle.join().unwrap();
-        let ctr = pc.ctr_value().unwrap();
+        pc.enable().expect("perf test operation should succeed");
+        tx2.send(()).expect("perf test operation should succeed"); // tell thread to start
+        handle.join().expect("perf test operation should succeed");
+        let ctr = pc.ctr_value().expect("perf test operation should succeed");
         assert!(ctr >= ITERS);
         assert!(ctr <= ITERS * 2, "{}", ctr); // overhead from channel operations
     }
@@ -712,8 +724,9 @@ mod test {
                 libc::sigprocmask(libc::SIG_BLOCK, mask.as_ptr(), std::ptr::null_mut());
             }
 
-            tx1.send(gettid()).unwrap();
-            rx2.recv().unwrap();
+            tx1.send(gettid())
+                .expect("perf test operation should succeed");
+            rx2.recv().expect("perf test operation should succeed");
 
             let mut count = 0;
             loop {
@@ -726,16 +739,17 @@ mod test {
             assert_eq!(count, SPINS_PER_EVENT);
         });
 
-        let tid = rx1.recv().unwrap();
+        let tid = rx1.recv().expect("perf test operation should succeed");
         let pc = Builder::new(tid.as_raw(), -1)
             .sample_period(SAMPLE_PERIOD)
             .event(Event::Hardware(HardwareEvent::BranchInstructions))
             .create()
-            .unwrap();
-        pc.set_signal_delivery(tid.into(), MARKER_SIGNAL).unwrap();
-        pc.enable().unwrap();
+            .expect("perf test operation should succeed");
+        pc.set_signal_delivery(tid.into(), MARKER_SIGNAL)
+            .expect("perf test operation should succeed");
+        pc.enable().expect("perf test operation should succeed");
 
-        tx2.send(()).unwrap(); // tell thread to start
-        handle.join().unwrap(); // propagate panics
+        tx2.send(()).expect("perf test operation should succeed"); // tell thread to start
+        handle.join().expect("perf test operation should succeed"); // propagate panics
     }
 }

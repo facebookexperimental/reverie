@@ -81,7 +81,9 @@ impl PmuConfig {
     #[cfg(target_arch = "x86_64")]
     pub fn new() -> Self {
         let c = raw_cpuid::CpuId::new();
-        let fi = c.get_feature_info().unwrap();
+        let fi = c
+            .get_feature_info()
+            .expect("CPUID feature information is required to configure the PMU");
         Self::from_cpuid_features(fi)
     }
 
@@ -244,7 +246,12 @@ impl Timer {
         // meaningfully handle the error anyway.
         Self {
             inner: if is_perf_supported() {
-                Some(TimerImpl::new(guest_pid, guest_tid).unwrap())
+                Some(TimerImpl::new(guest_pid, guest_tid).unwrap_or_else(|err| {
+                    panic!(
+                        "failed to initialize perf timer for tracee {guest_tid} \
+                         in process {guest_pid}: {err}"
+                    )
+                }))
             } else {
                 None
             },

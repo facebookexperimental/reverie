@@ -32,13 +32,15 @@ pub fn print_tracee_output(output: &Output) {
     if !output.stdout.is_empty() {
         println!(
             " >>> stdout:\n{}",
-            &std::str::from_utf8(&output.stdout).unwrap()
+            &std::str::from_utf8(&output.stdout)
+                .expect("Reverie test helper operation should succeed")
         );
     }
     if !output.stderr.is_empty() {
         println!(
             " >>> stderr:\n{}",
-            &std::str::from_utf8(&output.stderr).unwrap()
+            &std::str::from_utf8(&output.stderr)
+                .expect("Reverie test helper operation should succeed")
         );
     }
 }
@@ -59,7 +61,7 @@ pub fn run_tokio_test<F: Future>(fut: F) -> F::Output {
         .enable_time()
         .worker_threads(2)
         .build()
-        .unwrap();
+        .expect("Reverie test helper operation should succeed");
     rt.block_on(async move {
         let local_set = tokio::task::LocalSet::new();
         local_set.run_until(fut).await
@@ -127,7 +129,8 @@ where
     T: Tool + 'static,
     F: FnOnce(),
 {
-    let (output, state) = test_fn_with_config::<T, F>(f, config, capture_output).unwrap();
+    let (output, state) = test_fn_with_config::<T, F>(f, config, capture_output)
+        .expect("Reverie test helper operation should succeed");
 
     if output.status != ExitStatus::Exited(0) {
         print_tracee_output(&output);

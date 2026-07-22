@@ -601,7 +601,10 @@ mod test {
         let mut packet = BytesMut::from("just,an,unknown,command#3b");
         let cmd = Command::try_parse(packet.split());
         assert!(cmd.is_ok());
-        assert!(matches!(cmd.unwrap(), Command::Unknown(_)));
+        assert!(matches!(
+            cmd.expect("GDB command test parsing should succeed"),
+            Command::Unknown(_)
+        ));
     }
 
     #[test]

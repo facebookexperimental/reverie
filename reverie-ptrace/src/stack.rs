@@ -76,7 +76,8 @@ impl GuestStack {
             self.sp -= buf_size;
             buf.reverse();
             self.buf.extend_from_slice(buf.as_slice());
-            AddrMut::from_raw(self.sp).unwrap()
+            AddrMut::from_raw(self.sp)
+                .expect("guest stack allocation produced a null remote stack pointer")
         }
     }
 }
@@ -119,7 +120,7 @@ impl Stack for GuestStack {
         self.allocate(value)
     }
     fn commit(mut self) -> Result<Self::StackGuard, Errno> {
-        let remote_sp: AddrMut<u8> = AddrMut::from_raw(self.sp).unwrap();
+        let remote_sp: AddrMut<u8> = AddrMut::from_raw(self.sp).ok_or(Errno::EFAULT)?;
         self.buf.reverse();
         let from =
             unsafe { core::slice::from_raw_parts(self.buf.as_ptr() as *const u8, self.size()) };

@@ -299,16 +299,16 @@ impl CoreRegs {
 
 impl WriteResponse for ResponseAsHex<CoreRegs> {
     fn write_response(&self, f: &mut ResponseWriter) {
-        let encoded: Vec<u8> =
-            bincode::serde::encode_to_vec(&self.0, bincode::config::legacy()).unwrap();
+        let encoded: Vec<u8> = bincode::serde::encode_to_vec(&self.0, bincode::config::legacy())
+            .expect("x86_64 GDB register state must serialize");
         ResponseAsHex(encoded.as_slice()).write_response(f)
     }
 }
 
 impl WriteResponse for ResponseAsBinary<CoreRegs> {
     fn write_response(&self, f: &mut ResponseWriter) {
-        let encoded: Vec<u8> =
-            bincode::serde::encode_to_vec(&self.0, bincode::config::legacy()).unwrap();
+        let encoded: Vec<u8> = bincode::serde::encode_to_vec(&self.0, bincode::config::legacy())
+            .expect("x86_64 GDB register state must serialize");
         ResponseAsBinary(encoded.as_slice()).write_response(f)
     }
 }
@@ -365,8 +365,8 @@ mod test {
         const EXPECTED_SIZE: usize = 16 * 8 + 8 + 4 + 4 * 6 + 10 * 8 + 8 * 4 + 16 * 16 + 4 + 8 * 3; // 560.
         assert_eq!(mem::size_of::<CoreRegs>(), EXPECTED_SIZE);
         let core_regs: CoreRegs = Default::default();
-        let encoded: Vec<u8> =
-            bincode::serde::encode_to_vec(&core_regs, bincode::config::legacy()).unwrap();
+        let encoded: Vec<u8> = bincode::serde::encode_to_vec(&core_regs, bincode::config::legacy())
+            .expect("x86_64 GDB register test operation should succeed");
         assert_eq!(encoded.len(), EXPECTED_SIZE);
     }
 
@@ -437,8 +437,8 @@ mod test {
             fs_base: 0x7ffff7fcd540,
             gs_base: 0,
         };
-        let encoded: Vec<u8> =
-            bincode::serde::encode_to_vec(&core_regs, bincode::config::legacy()).unwrap();
+        let encoded: Vec<u8> = bincode::serde::encode_to_vec(&core_regs, bincode::config::legacy())
+            .expect("x86_64 GDB register test operation should succeed");
         // NB: keep this so that we can *visualize* how core regs are
         // serialized.
         let expected: Vec<u8> = vec![
@@ -480,7 +480,7 @@ mod test {
         assert_eq!(encoded, expected);
         let core_regs2: CoreRegs =
             bincode::serde::decode_from_slice(&encoded, bincode::config::legacy())
-                .unwrap()
+                .expect("x86_64 GDB register test operation should succeed")
                 .0;
         assert_eq!(core_regs, core_regs2);
     }

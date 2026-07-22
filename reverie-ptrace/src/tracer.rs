@@ -149,6 +149,25 @@ fn from_nix_error(err: nix::Error) -> Errno {
     Errno::new(err as i32)
 }
 
+async fn initialization_error(pid: Pid, err: TraceError) -> Error {
+    match err {
+        TraceError::Errno(errno) => {
+            anyhow::anyhow!("failed to initialize ptrace for tracee {pid}: {errno}").into()
+        }
+        TraceError::Died(zombie) => {
+            let exit_status = zombie.reap().await;
+            tracing::error!(
+                target: "reverie_ptrace::lifecycle",
+                %pid,
+                ?exit_status,
+                "guest exited during ptrace initialization"
+            );
+            anyhow::anyhow!("tracee {pid} exited during ptrace initialization with {exit_status:?}")
+                .into()
+        }
+    }
+}
+
 /// Sets up the child process for ptracing right before execve is called.
 fn init_tracee(intercept_rdtsc: bool) -> Result<(), Errno> {
     // NOTE: There should be *NO* allocations along the happy path here.
@@ -227,7 +246,15 @@ async fn run_orphaned(orphans: mpsc::Receiver<Child>) {
     tokio_stream::wrappers::ReceiverStream::new(orphans)
         .for_each_concurrent(None, |orphan| async {
             let pid = orphan.id();
-            let mut daemonizer = orphan.daemonizer_rx.unwrap();
+            let Some(mut daemonizer) = orphan.daemonizer_rx else {
+                tracing::error!(
+                    %pid,
+                    "orphan is missing its daemonization channel; waiting for exit"
+                );
+                let status = orphan.handle.await;
+                tracing::debug!(%pid, ?status, "orphan exited");
+                return;
+            };
 
             let daemonizer = daemonizer.recv();
             futures::pin_mut!(daemonizer);
@@ -291,6 +318,13 @@ async fn run_task_tree<T: Tool + 'static>(
 }
 
 /// Helper function for everything after the child is spawned.
+#[tracing::instrument(
+    target = "reverie_ptrace::lifecycle",
+    name = "tracee.attach",
+    level = "debug",
+    skip_all,
+    fields(pid = %child.pid())
+)]
 async fn postspawn<L: Tool + 'static>(
     child: Running,
     gref: Arc<L::GlobalState>,
@@ -499,8 +533,9 @@ impl<T: Tool + 'static> TracerBuilder<T> {
                     GdbConnection::Path(path) => GdbServer::from_path(&path).await,
                 };
 
-                // FIXME: Don't panic. Return an error here instead.
-                let mut server = server.unwrap();
+                let mut server = server.with_context(|| {
+                    format!("failed to start GDB server for tracee {guest_pid}")
+                })?;
 
                 if self.sequentialized_guest {
                     server.sequentialized_guest();
@@ -513,11 +548,7 @@ impl<T: Tool + 'static> TracerBuilder<T> {
         let tracer =
             match postspawn::<T>(running_child, gref.clone(), config, &events, gdbserver).await {
                 Ok(tracer) => tracer,
-                Err(TraceError::Errno(err)) => return Err(Error::Errno(err)),
-                Err(TraceError::Died(zombie)) => panic!(
-                    "tracee {} died unexpectedly during initialization",
-                    zombie.pid()
-                ),
+                Err(err) => return Err(initialization_error(guest_pid, err).await),
             };
 
         let stdin = child.stdin.take();
@@ -632,11 +663,7 @@ where
             let stderr = read2.into();
             let tracer = match postspawn::<L>(child, gref.clone(), config, &events, None).await {
                 Ok(tracer) => tracer,
-                Err(TraceError::Errno(err)) => return Err(Error::Errno(err)),
-                Err(TraceError::Died(zombie)) => panic!(
-                    "tracee {} died unexpectedly during initialization",
-                    zombie.pid()
-                ),
+                Err(err) => return Err(initialization_error(guest_pid, err).await),
             };
 
             Ok(Tracer {

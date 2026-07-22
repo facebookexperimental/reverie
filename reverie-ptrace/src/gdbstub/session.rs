@@ -159,11 +159,17 @@ impl Session {
         F: FnOnce(MappedMutexGuard<'a, Inferior>) -> Fut + 'a,
         Fut: Future + 'a,
     {
-        let tid = threadid
-            .gettid()
-            .unwrap_or_else(|| threadid.getpid().unwrap());
+        let tid = threadid.gettid().unwrap_or_else(|| {
+            threadid
+                .getpid()
+                .expect("GDB thread identifier must contain a pid or tid")
+        });
         let inferiors = self.inferiors.lock().await;
-        let inferior = MutexGuard::map(inferiors, |inferiors| inferiors.get_mut(&tid).unwrap());
+        let inferior = MutexGuard::map(inferiors, |inferiors| {
+            inferiors
+                .get_mut(&tid)
+                .expect("selected GDB inferior must exist in the session map")
+        });
         f(inferior).await
     }
 
@@ -173,7 +179,10 @@ impl Session {
         F: FnOnce(MappedMutexGuard<'a, Inferior>) -> Fut + 'a,
         Fut: Future + 'a,
     {
-        let threadid: ThreadId = self.current.unwrap().into();
+        let threadid: ThreadId = self
+            .current
+            .expect("GDB current inferior must be set before handling requests")
+            .into();
         self.with_inferior(threadid, f).await
     }
 
@@ -294,7 +303,7 @@ impl Session {
             break;
         }
         Ok(HandleVcontResume::Handled(VcontResumeResult {
-            reason: reason.unwrap(),
+            reason: reason.expect("GDB resume loop must produce a stop reason"),
             new_inferior,
             ptid_to_remove,
             switch_to,
@@ -681,7 +690,7 @@ impl Session {
 
     /// Handle incoming request sent over tcp stream
     pub async fn run(&mut self) -> Result<(), Error> {
-        let cmd_rx = self.pkt_rx.take().unwrap();
+        let cmd_rx = self.pkt_rx.take().ok_or(Error::SessionNotStarted)?;
 
         let mut gdb_stop_rx = self.gdb_stop_rx.take().ok_or(Error::Detached)?;
         let stop_reason = gdb_stop_rx.recv().await.ok_or(Error::Detached)?;
@@ -720,7 +729,10 @@ impl Session {
                 Packet::Command(cmd) => {
                     tx_buf.clear();
                     let resp = self.handle_command(cmd, tx_buf.clone()).await?;
-                    self.stream_tx.write_all(&resp).await.unwrap();
+                    self.stream_tx
+                        .write_all(&resp)
+                        .await
+                        .map_err(|_| Error::GdbServerSendPacketError)?;
                 }
             }
         }

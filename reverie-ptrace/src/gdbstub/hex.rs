@@ -141,8 +141,10 @@ impl<'de> Visitor<'de> for HexStringVisitor {
         let mut res: Vec<u8> = Vec::new();
 
         for ch in v {
-            let hi = to_hex(*ch >> 4).unwrap();
-            let lo = to_hex(*ch & 0xf).unwrap();
+            let hi = to_hex(*ch >> 4)
+                .expect("the high nibble of a byte must have a hexadecimal encoding");
+            let lo = to_hex(*ch & 0xf)
+                .expect("the low nibble of a byte must have a hexadecimal encoding");
             res.push(hi);
             res.push(lo);
         }
@@ -376,18 +378,18 @@ mod test {
         let test2 = GdbHexString {
             bytes: Bytes::from("01020304"),
         };
-        let bytes: Vec<u8> =
-            bincode::serde::encode_to_vec(&test2, bincode::config::legacy()).unwrap();
+        let bytes: Vec<u8> = bincode::serde::encode_to_vec(&test2, bincode::config::legacy())
+            .expect("GDB encoding test operation should succeed");
         assert_eq!(bytes, test1);
         let encoded: GdbHexString =
             bincode::serde::decode_from_slice(&bytes, bincode::config::legacy())
                 .map(|(v, _)| v)
-                .unwrap();
+                .expect("GDB encoding test operation should succeed");
         assert_eq!(encoded, test2);
 
         let bytes: Vec<u8> = bincode::serde::decode_from_slice(&bytes, bincode::config::legacy())
             .map(|(v, _)| v)
-            .unwrap();
+            .expect("GDB encoding test operation should succeed");
         assert_eq!(bytes, vec![1, 2, 3, 4]);
     }
 
@@ -401,11 +403,23 @@ mod test {
         let bin = GdbBinaryString {
             bytes: Bytes::from(&b"12}\x04{"[..]),
         };
-        assert_eq!(GdbHexString::encode(&test1).unwrap(), hex);
-        assert_eq!(GdbHexString::decode(&hex).unwrap(), test1);
+        assert_eq!(
+            GdbHexString::encode(&test1).expect("GDB encoding test operation should succeed"),
+            hex
+        );
+        assert_eq!(
+            GdbHexString::decode(&hex).expect("GDB encoding test operation should succeed"),
+            test1
+        );
 
-        assert_eq!(GdbBinaryString::encode(&test2).unwrap(), bin);
-        assert_eq!(GdbBinaryString::decode(&bin).unwrap(), test2);
+        assert_eq!(
+            GdbBinaryString::encode(&test2).expect("GDB encoding test operation should succeed"),
+            bin
+        );
+        assert_eq!(
+            GdbBinaryString::decode(&bin).expect("GDB encoding test operation should succeed"),
+            test2
+        );
     }
 
     #[test]

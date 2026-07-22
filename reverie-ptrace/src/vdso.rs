@@ -13,6 +13,7 @@ use std::sync::LazyLock;
 use goblin::elf::Elf;
 use nix::sys::mman::ProtFlags;
 use nix::unistd;
+use reverie::Errno;
 use reverie::Error;
 use reverie::Guest;
 use reverie::Tool;
@@ -273,7 +274,7 @@ where
         for (name, (offset, size, bytes)) in VDSO_PATCH_INFO.iter() {
             let start = vdso.address.0 + offset;
             assert!(bytes.len() <= *size);
-            let rptr = AddrMut::from_raw(start as usize).unwrap();
+            let rptr = AddrMut::from_raw(start as usize).ok_or(Errno::EFAULT)?;
             memory.write_exact(rptr, bytes)?;
             assert!(*size >= bytes.len());
             if *size > bytes.len() {

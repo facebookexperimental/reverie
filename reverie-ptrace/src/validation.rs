@@ -11,7 +11,6 @@ use core::mem;
 use perf_event_open_sys::bindings as perf;
 use reverie::Errno;
 use thiserror::Error;
-use tracing::error;
 use tracing::warn;
 
 use crate::perf::PerfCounter;
@@ -334,7 +333,9 @@ fn is_amd_zen(fi: raw_cpuid::FeatureInfo) -> bool {
 #[cfg(target_arch = "x86_64")]
 fn check_for_arch_bugs(_precise_ip: bool) -> Result<(), PmuValidationError> {
     let c = raw_cpuid::CpuId::new();
-    let vendor = c.get_vendor_info().unwrap();
+    let vendor = c
+        .get_vendor_info()
+        .ok_or(PmuValidationError::CouldNotReadCpuInfo)?;
     let feature_info = c
         .get_feature_info()
         .ok_or(PmuValidationError::CouldNotReadCpuInfo)?;

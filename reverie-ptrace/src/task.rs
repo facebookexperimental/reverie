@@ -63,10 +63,12 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task::JoinError;
 use tokio::task::JoinHandle;
+use tracing::Instrument;
 
 use crate::children;
 use crate::cp;
 use crate::error::Error;
+use crate::error::TraceResultExt;
 use crate::gdbstub::BreakpointType;
 use crate::gdbstub::CoreRegs;
 use crate::gdbstub::GdbRequest;
@@ -537,11 +539,38 @@ fn set_ret(task: &Stopped, ret: Reg) -> Result<Reg, TraceError> {
     Ok(old)
 }
 
+fn log_guest_exit(tid: Pid, pid: Pid, exit_status: ExitStatus) {
+    if let ExitStatus::Signaled(signal, core_dumped) = exit_status {
+        tracing::error!(
+            target: "reverie_ptrace::lifecycle",
+            %tid,
+            %pid,
+            %signal,
+            core_dumped,
+            "guest terminated by signal"
+        );
+    }
+}
+
 /// Handles a potentially internal error, converting it to an exit status.
 async fn handle_internal_error(err: Error) -> Result<ExitStatus, reverie::Error> {
     match err {
-        Error::Internal(TraceError::Died(zombie)) => Ok(zombie.reap().await),
+        Error::Internal(TraceError::Died(zombie))
+        | Error::Tracee {
+            source: TraceError::Died(zombie),
+            ..
+        } => Ok(zombie.reap().await),
         Error::Internal(TraceError::Errno(errno)) => Err(errno.into()),
+        Error::Tracee {
+            operation,
+            pid,
+            source: TraceError::Errno(errno),
+        } => Err(anyhow::anyhow!("{operation} failed for tracee {pid}: {errno}").into()),
+        Error::Runtime {
+            operation,
+            pid,
+            message,
+        } => Err(anyhow::anyhow!("{operation} failed for tracee {pid}: {message}").into()),
         Error::External(err) => Err(err),
     }
 }
@@ -653,6 +682,13 @@ impl<L: Tool + 'static> TracedTask<L> {
     ///
     /// Postcondition: the guest registers and code memory are restored to their original state,
     /// including RIP, but the vdso page and special shared page are modified accordingly.
+    #[tracing::instrument(
+        target = "reverie_ptrace::lifecycle",
+        name = "tracee.initialize",
+        level = "debug",
+        skip_all,
+        fields(pid = %task.pid())
+    )]
     pub async fn tracee_preinit(&mut self, task: Stopped) -> Result<Stopped, TraceError> {
         type SavedInstructions = [u8; 8];
 
@@ -749,7 +785,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             let regs = task.getregs()?;
 
             // Saved instruction memory
-            let ip = AddrMut::from_raw(regs.ip() as usize).unwrap();
+            let ip = AddrMut::from_raw(regs.ip() as usize).ok_or(Errno::EFAULT)?;
             let saved: SavedInstructions = task.read_value(ip)?;
 
             // Patch the tracee at the current instruction pointer.
@@ -773,7 +809,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             // NOTE: Again, because `process_vm_writev` cannot write to
             // write-protected pages, we must write in word-sized chunks with
             // PTRACE_POKEDATA.
-            let ip = AddrMut::from_raw(regs.ip() as usize).unwrap();
+            let ip = AddrMut::from_raw(regs.ip() as usize).ok_or(Errno::EFAULT)?;
             task.write_value(ip, &saved)?;
             task.setregs(&regs)?;
             Ok(())
@@ -889,19 +925,28 @@ impl<L: Tool + 'static> TracedTask<L> {
     ///  * guest thread may or may not be stopped, depending on value of GuestNext
     async fn handle_stop_event(&mut self, stopped: Stopped, event: Event) -> Result<Wait, Error> {
         self.timer.observe_event();
-        // A task is processed by this loop on any state change, so we must
-        // handle all possibilities here:
-        Ok(match event {
-            Event::Signal(sig) => self.handle_signal(stopped, sig).await?,
-            // A state we reach in the middle, between the prehook (before exec
-            // syscall) and the exec completing (posthook).
-            Event::Exec(_new_pid) => self.handle_exec_event(stopped).await?,
-            // A regular old system call.
-            Event::Seccomp => self.handle_seccomp(stopped).await?,
-            Event::NewChild(op, child) => self.handle_new_task(op, stopped, child, None).await?,
-            Event::VforkDone => self.handle_vfork_done_event(stopped).await?,
-            task_state => panic!("unknown task state: {:?}", task_state),
-        })
+        let tid = self.tid();
+
+        match event {
+            Event::Signal(sig) => self
+                .handle_signal(stopped, sig)
+                .await
+                .tracee_context(tid, "handle signal-delivery stop"),
+            Event::Exec(_new_pid) => self
+                .handle_exec_event(stopped)
+                .await
+                .tracee_context(tid, "handle exec stop"),
+            Event::Seccomp => self.handle_seccomp(stopped).await,
+            Event::NewChild(op, child) => self
+                .handle_new_task(op, stopped, child, None)
+                .await
+                .tracee_context(tid, "handle new tracee stop"),
+            Event::VforkDone => self
+                .handle_vfork_done_event(stopped)
+                .await
+                .tracee_context(tid, "handle vfork completion stop"),
+            task_state => panic!("unknown task state for tracee {}: {:?}", tid, task_state),
+        }
     }
 
     async fn get_stop_tx(&self) -> Option<(Arc<AtomicBool>, mpsc::Sender<(Pid, Suspended)>)> {
@@ -958,10 +1003,14 @@ impl<L: Tool + 'static> TracedTask<L> {
                 ))
                 .await;
             drop(stop_tx);
-            if notify_stop_tx.is_ok() {
-                if let Some(rx) = self.exit_suspend_rx.as_mut() {
-                    let _resumed_by = rx.recv().await.unwrap();
-                }
+            if notify_stop_tx.is_ok()
+                && let Some(rx) = self.exit_suspend_rx.as_mut()
+                && rx.recv().await.is_none()
+            {
+                tracing::warn!(
+                    tid = %self.tid(),
+                    "tracee suspension channel closed before resume"
+                );
             }
         }
         Ok(HandleSignalResult::SignalSuppressed(
@@ -1057,7 +1106,15 @@ impl<L: Tool + 'static> TracedTask<L> {
             let resume_tx = self.gdb_resume_tx.clone();
 
             let proc_exe = format!("/proc/{}/exe", task.pid());
-            let exe = std::fs::read_link(&proc_exe[..]).unwrap();
+            let exe = std::fs::read_link(&proc_exe).unwrap_or_else(|err| {
+                tracing::warn!(
+                    tid = %self.tid(),
+                    path = %proc_exe,
+                    error = %err,
+                    "failed to resolve executable after exec; reporting procfs path to GDB"
+                );
+                proc_exe.clone().into()
+            });
 
             let stopped = StoppedInferior {
                 reason: StopReason::stopped(
@@ -1066,16 +1123,23 @@ impl<L: Tool + 'static> TracedTask<L> {
                     StopEvent::Exec(exe),
                     task.getregs()?.into(),
                 ),
-                request_tx: request_tx.unwrap(),
-                resume_tx: resume_tx.unwrap(),
+                request_tx: request_tx.ok_or(Errno::EIO)?,
+                resume_tx: resume_tx.ok_or(Errno::EIO)?,
             };
 
             // NB: notify initial gdb stop, this is the first time we can
             // tell gdb tracee is ready, because a new memory map has been
             // loaded (due to execve). Otherwise gdb may try to manipulate
             // old process' address space.
-            if let Some(attach_tx) = self.gdb_stop_tx.as_ref() {
-                attach_tx.send(stopped).await.unwrap();
+            if let Some(attach_tx) = self.gdb_stop_tx.as_ref()
+                && attach_tx.send(stopped).await.is_err()
+            {
+                tracing::warn!(
+                    tid = %self.tid(),
+                    "GDB stop channel closed while reporting exec"
+                );
+                self.attached_by_gdb = false;
+                return task.step(None)?.next_state().await;
             }
             let running = self
                 .await_gdb_resume(task, ExpectedGdbResume::Resume)
@@ -1087,40 +1151,68 @@ impl<L: Tool + 'static> TracedTask<L> {
     }
 
     async fn handle_seccomp(&mut self, mut task: Stopped) -> Result<Wait, Error> {
-        let syscall = self.get_syscall(&task)?;
+        let tid = self.tid();
+        let syscall = self
+            .get_syscall(&task)
+            .tracee_context(tid, "read registers at seccomp stop")?;
         let (nr, args) = syscall.into_parts();
+        let span = tracing::trace_span!(
+            target: "reverie_ptrace::syscall",
+            "syscall.intercept",
+            tid = %tid,
+            syscall = %nr,
+            args = ?args,
+        );
 
-        self.pending_syscall = Some((nr, args));
+        async {
+            tracing::trace!(
+                target: "reverie_ptrace::syscall",
+                "intercepting guest syscall"
+            );
+            self.pending_syscall = Some((nr, args));
 
-        let retval = cancellable(self.cancel_handler.clone(), async {
-            self.process_state
-                .clone()
-                .handle_syscall_event(self, syscall)
+            let retval = cancellable(self.cancel_handler.clone(), async {
+                self.process_state
+                    .clone()
+                    .handle_syscall_event(self, syscall)
+                    .await
+            })
+            .await;
+
+            if self.pending_syscall.is_some() {
+                task = self
+                    .skip_seccomp_syscall(task)
+                    .await
+                    .tracee_context(tid, "skip intercepted syscall")?;
+            }
+
+            self.timer.finalize_requests();
+
+            if let Some(retval) = retval {
+                let ret = match retval {
+                    Ok(x) => x as u64,
+                    Err(err) => (-(err.into_errno()?.into_raw() as i64)) as u64,
+                };
+
+                set_ret(&task, ret).tracee_context(tid, "set intercepted syscall result")?;
+            }
+
+            let sig = self.pending_signal.take();
+            let running = task
+                .resume(sig)
+                .tracee_context(tid, "resume after seccomp stop")?;
+            let wait = running
+                .next_state()
                 .await
-        })
-        .await;
-
-        // If no syscall was injected, then we need to suppress the implicit
-        // syscall.
-        if self.pending_syscall.is_some() {
-            task = self.skip_seccomp_syscall(task).await?;
+                .tracee_context(tid, "wait after seccomp resume")?;
+            tracing::trace!(
+                target: "reverie_ptrace::syscall",
+                "completed guest syscall interception"
+            );
+            Ok(wait)
         }
-
-        // Finalize timer requests after `skip_seccomp_syscall`, which may step
-        self.timer.finalize_requests();
-
-        if let Some(retval) = retval {
-            let ret = match retval {
-                Ok(x) => x as u64,
-                Err(err) => (-(err.into_errno()?.into_raw() as i64)) as u64,
-            };
-
-            set_ret(&task, ret)?;
-        }
-
-        // Finally, resume the guest.
-        let sig = self.pending_signal.take();
-        Ok(task.resume(sig)?.next_state().await?)
+        .instrument(span)
+        .await
     }
 
     async fn handle_new_task(
@@ -1166,7 +1258,28 @@ impl<L: Tool + 'static> TracedTask<L> {
             //
             // NOTE: It is okay to call `wait` instead of the async `next_state`
             // here because the notifier is not yet aware of the new process.
-            let (child, event) = child.wait().unwrap().assume_stopped();
+            let (child, event) = match child.wait() {
+                Ok(wait) => wait.assume_stopped(),
+                Err(TraceError::Died(zombie)) => {
+                    let exit_status = zombie.reap().await;
+                    tracing::error!(
+                        target: "reverie_ptrace::lifecycle",
+                        tid = %id,
+                        ?exit_status,
+                        "new tracee exited before its initial stop"
+                    );
+                    return exit_status;
+                }
+                Err(TraceError::Errno(errno)) => {
+                    tracing::error!(
+                        target: "reverie_ptrace::lifecycle",
+                        tid = %id,
+                        %errno,
+                        "failed waiting for new tracee initial stop"
+                    );
+                    return ExitStatus::Exited(1);
+                }
+            };
 
             assert!(
                 event == Event::Signal(Signal::SIGSTOP) || event == Event::Exit,
@@ -1177,8 +1290,15 @@ impl<L: Tool + 'static> TracedTask<L> {
             if let Some(context) = context {
                 // Restore context, but only if the child hasn't arrived at
                 // `Event::Exit`.
-                if event == Event::Signal(Signal::SIGSTOP) {
-                    restore_context(&child, context, None).unwrap();
+                if event == Event::Signal(Signal::SIGSTOP)
+                    && let Err(err) = restore_context(&child, context, None)
+                {
+                    tracing::error!(
+                        tid = %child.pid(),
+                        error = %err,
+                        "failed to restore new tracee register context"
+                    );
+                    return ExitStatus::Exited(1);
                 }
             }
 
@@ -1195,6 +1315,13 @@ impl<L: Tool + 'static> TracedTask<L> {
                     // originated from the tool itself when the tracee is
                     // already stopped. If the tracee is not in a stopped state,
                     // that's fine too and ignore the detach error.
+                    let detach_span = tracing::debug_span!(
+                        target: "reverie_ptrace::lifecycle",
+                        "tracee.detach",
+                        %tid,
+                        reason = "handler error"
+                    );
+                    let detach_guard = detach_span.enter();
                     let running = match Stopped::new_unchecked(tid).detach(None) {
                         Err(err) => {
                             // If we get an error here, the child process may
@@ -1204,10 +1331,20 @@ impl<L: Tool + 'static> TracedTask<L> {
                         }
                         Ok(running) => running,
                     };
+                    drop(detach_guard);
 
-                    // Reap the process and get its exit status.
-                    let (_pid, exit_status) = running.next_state().await.unwrap().assume_exited();
-                    exit_status
+                    match running.next_state().await {
+                        Ok(wait) => wait.assume_exited().1,
+                        Err(TraceError::Died(zombie)) => zombie.reap().await,
+                        Err(TraceError::Errno(errno)) => {
+                            tracing::error!(
+                                %tid,
+                                %errno,
+                                "failed waiting for detached tracee exit"
+                            );
+                            ExitStatus::Exited(1)
+                        }
+                    }
                 }
                 Ok(exit_status) => exit_status,
             }
@@ -1284,7 +1421,12 @@ impl<L: Tool + 'static> TracedTask<L> {
     /// canceled. Thus, this function will never return so that execution of the
     /// current future doesn't proceed any further.
     async fn abort(&mut self, result: Result<Wait, TraceError>) -> ! {
-        self.next_state.send(result).await.unwrap();
+        if self.next_state.send(result).await.is_err() {
+            panic!(
+                "failed to abort tracee {}: run-loop next-state channel is closed",
+                self.tid()
+            );
+        }
 
         // Wait on a future that will never complete. This pending future will
         // be dropped when the channel receives the event just sent.
@@ -1330,7 +1472,14 @@ impl<L: Tool + 'static> TracedTask<L> {
 
             for orphan in orphans.into_inner() {
                 // Bon voyage.
-                self.orphanage.send(orphan).await.unwrap();
+                if let Err(err) = self.orphanage.send(orphan).await {
+                    let orphan = err.0;
+                    tracing::warn!(
+                        pid = %orphan.id(),
+                        "orphan reaper closed; waiting for child inline"
+                    );
+                    let _ = orphan.await;
+                }
             }
 
             let _ = self
@@ -1432,16 +1581,29 @@ impl<L: Tool + 'static> TracedTask<L> {
         // NB: await_gdb_resume == resume if not attached_by_gdb.
         let running = self
             .await_gdb_resume(task, ExpectedGdbResume::Resume)
-            .await?;
+            .await
+            .tracee_context(self.tid(), "initial tracee resume")?;
 
         // Notify gdb server (if any) that tracee is ready.
         if let Some(server_tx) = self.gdbserver_start_tx.take() {
             self.attached_by_gdb = true;
-            server_tx.send(()).unwrap();
+            if server_tx.send(()).is_err() {
+                tracing::warn!(tid = %self.tid(), "GDB server closed before tracee attach");
+                self.attached_by_gdb = false;
+            }
         }
 
-        let mut task_state = running.next_state().await?;
-        let mut next_state_rx = self.next_state_rx.take().unwrap();
+        let mut task_state = running
+            .next_state()
+            .await
+            .tracee_context(self.tid(), "wait after initial tracee resume")?;
+        let mut next_state_rx = self.next_state_rx.take().ok_or_else(|| {
+            Error::runtime(
+                self.tid(),
+                "initialize run loop",
+                "next-state receiver was already taken",
+            )
+        })?;
 
         loop {
             match task_state {
@@ -1449,6 +1611,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                     // Allow short-circuiting of the event stream. This makes it
                     // easier to send exit and execve events directly to the run
                     // loop from within `inject` or `tail_inject`.
+                    let tid = self.tid();
                     let fut1 = next_state_rx.recv().fuse();
                     let fut2 = self.handle_stop_event(stopped, event).fuse();
 
@@ -1459,7 +1622,11 @@ impl<L: Tool + 'static> TracedTask<L> {
                             if let Some(next_state) = next_state {
                                 next_state.map_err(Error::Internal)
                             } else {
-                                panic!()
+                                Err(Error::runtime(
+                                    tid,
+                                    "receive injected tracee state",
+                                    "next-state channel closed unexpectedly",
+                                ))
                             }
                         }
                         next_state = fut2 => next_state,
@@ -1491,6 +1658,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             }
         };
 
+        log_guest_exit(self.tid(), self.pid(), exit_status);
         self.tool_exit(exit_status).await?;
 
         Ok(exit_status)
@@ -1762,10 +1930,15 @@ impl<L: Tool + 'static> TracedTask<L> {
             let resume_tx = self.gdb_resume_tx.clone();
             let stop = StoppedInferior {
                 reason,
-                request_tx: request_tx.unwrap(),
-                resume_tx: resume_tx.unwrap(),
+                request_tx: request_tx.ok_or(Errno::EIO)?,
+                resume_tx: resume_tx.ok_or(Errno::EIO)?,
             };
-            stop_tx.send(stop).await.unwrap();
+            if stop_tx.send(stop).await.is_err() {
+                tracing::warn!(
+                    tid = %self.tid(),
+                    "GDB stop channel closed while reporting tracee stop"
+                );
+            }
         }
         Ok(())
     }
@@ -1776,30 +1949,30 @@ impl<L: Tool + 'static> TracedTask<L> {
                 GdbRequest::SetBreakpoint(bkpt, reply_tx) => {
                     if bkpt.ty == BreakpointType::Software {
                         let result = self.add_breakpoint(bkpt.addr).await;
-                        reply_tx.send(result).unwrap();
+                        let _ = reply_tx.send(result);
                     }
                 }
                 GdbRequest::RemoveBreakpoint(bkpt, reply_tx) => {
                     if bkpt.ty == BreakpointType::Software {
                         let result = self.remove_breakpoint(bkpt.addr).await;
-                        reply_tx.send(result).unwrap();
+                        let _ = reply_tx.send(result);
                     }
                 }
                 GdbRequest::ReadInferiorMemory(addr, length, reply_tx) => {
                     let result = self.read_inferior_memory(addr, length);
-                    reply_tx.send(result).unwrap();
+                    let _ = reply_tx.send(result);
                 }
                 GdbRequest::WriteInferiorMemory(addr, length, data, reply_tx) => {
                     let result = self.write_inferior_memory(addr, length, data);
-                    reply_tx.send(result).unwrap();
+                    let _ = reply_tx.send(result);
                 }
                 GdbRequest::ReadRegisters(reply_tx) => {
                     let result = self.read_registers();
-                    reply_tx.send(result).unwrap();
+                    let _ = reply_tx.send(result);
                 }
                 GdbRequest::WriteRegisters(core_regs, reply_tx) => {
                     let result = self.write_registers(core_regs);
-                    reply_tx.send(result).unwrap();
+                    let _ = reply_tx.send(result);
                 }
             }
         }
@@ -1840,8 +2013,8 @@ impl<L: Tool + 'static> TracedTask<L> {
             return task.resume(None);
         }
 
-        let mut resume_rx = self.gdb_resume_rx.take().unwrap();
-        let mut gdb_request_rx = self.gdb_request_rx.take().unwrap();
+        let mut resume_rx = self.gdb_resume_rx.take().ok_or(Errno::EIO)?;
+        let mut gdb_request_rx = self.gdb_request_rx.take().ok_or(Errno::EIO)?;
 
         let mut resume_future = Box::pin(resume_rx.recv());
 
@@ -1864,6 +2037,16 @@ impl<L: Tool + 'static> TracedTask<L> {
 
         if let Some(resumed) = resumed {
             if resumed.detach {
+                tracing::debug!(
+                    target: "reverie_ptrace::lifecycle",
+                    parent: &tracing::debug_span!(
+                        target: "reverie_ptrace::lifecycle",
+                        "tracee.detach",
+                        tid = %self.tid(),
+                        reason = "GDB detach"
+                    ),
+                    "GDB detached from tracee"
+                );
                 // no longer report stop event to gdb
                 // self.gdb_stop_tx = None;
                 self.attached_by_gdb = false;
@@ -1888,8 +2071,8 @@ impl<L: Tool + 'static> TracedTask<L> {
         // Task could be hitting a breakpoint, after previously suspended by
         // a different task, need to notify this task is fully stopped.
         self.suspended.store(true, Ordering::SeqCst);
-        if let Some((suspended_flag, stop_tx)) = self.get_stop_tx().await {
-            stop_tx
+        if let Some((suspended_flag, stop_tx)) = self.get_stop_tx().await
+            && stop_tx
                 .send((
                     self.tid(),
                     Suspended {
@@ -1898,7 +2081,12 @@ impl<L: Tool + 'static> TracedTask<L> {
                     },
                 ))
                 .await
-                .unwrap();
+                .is_err()
+        {
+            tracing::warn!(
+                    tid = %self.tid(),
+                    "tracee freeze channel closed during GDB breakpoint handling"
+            );
         }
 
         // When resuming from breakpoint, gdb (client) needs to remove the
@@ -2158,13 +2346,20 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
         self.is_a_daemon = true;
 
         tracing::info!("[reverie] daemonizing pid {} ..", pid);
-        self.daemonizer
+        if self
+            .daemonizer
             .send(self.daemon_kill_switch.subscribe())
             .await
-            .unwrap();
+            .is_err()
+        {
+            tracing::error!(%pid, "failed to notify orphan reaper while daemonizing tracee");
+            self.ndaemons.fetch_sub(1, Ordering::SeqCst);
+            self.is_a_daemon = false;
+            return;
+        }
 
         if self.ndaemons.load(Ordering::SeqCst) == self.ntasks.load(Ordering::SeqCst) {
-            self.daemon_kill_switch.send(()).unwrap();
+            let _ = self.daemon_kill_switch.send(());
         }
     }
 
@@ -2271,9 +2466,10 @@ impl<'a, G: GlobalTool> GlobalRPC<G> for WrappedFrom<'a, G> {
         // In debugging mode we round-trip through a serialized representation
         // to make sure it works.
         let deserial = if cfg!(debug_assertions) {
-            let serial = bincode::serde::encode_to_vec(&args, bincode::config::legacy()).unwrap();
+            let serial = bincode::serde::encode_to_vec(&args, bincode::config::legacy())
+                .expect("GlobalRPC request must serialize in debug validation mode");
             bincode::serde::decode_from_slice(&serial, bincode::config::legacy())
-                .unwrap()
+                .expect("serialized GlobalRPC request must deserialize in debug validation mode")
                 .0
         } else {
             args
