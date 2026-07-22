@@ -1,14 +1,9 @@
 cmake_minimum_required(VERSION 3.14)
 project(reverie_dbi_client C)
 
-if(NOT DEFINED DynamoRIO_DIR AND DEFINED ENV{DYNAMORIO_HOME})
-  if(EXISTS "$ENV{DYNAMORIO_HOME}/install/cmake/DynamoRIOConfig.cmake")
-    set(DynamoRIO_DIR "$ENV{DYNAMORIO_HOME}/install/cmake")
-  else()
-    set(DynamoRIO_DIR "$ENV{DYNAMORIO_HOME}/build/cmake")
-  endif()
+if(NOT DEFINED DynamoRIO_DIR)
+  message(FATAL_ERROR "DynamoRIO_DIR must point to Cargo's vendored install")
 endif()
-
 find_package(DynamoRIO REQUIRED)
 
 if(NOT DEFINED REVERIE_DBI_RUNTIME)

@@ -18,12 +18,29 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+      with:
+        submodules: recursive
     - name: Dependencies
-      run: sudo apt-get install -y libunwind-dev liblzma-dev
+      run: sudo apt-get install -y libunwind-dev liblzma-dev cmake zlib1g-dev
     - name: Rust toolchain
       uses: dtolnay/rust-toolchain@nightly
       with:
         components: clippy, rustfmt
+    # reverie-dbi/build.rs compiles DynamoRIO (Release) from the pinned submodule
+    # on first build, which is expensive on GitHub-hosted runners. Cache the
+    # install tree keyed on the DynamoRIO revision and build.rs: build.rs skips
+    # the CMake build when the revision stamp, drrun, and DynamoRIOConfig.cmake
+    # are already present, so restoring the install short-circuits the build.
+    - name: DynamoRIO revision
+      id: dynamorio
+      run: echo "rev=$(git -C third-party/dynamorio rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+    - name: Cache DynamoRIO build
+      uses: actions/cache@v4
+      with:
+        path: |
+          target/*/build/reverie-dbi-*/out/dynamorio-install
+          target/*/build/reverie-dbi-*/out/dynamorio-revision
+        key: dynamorio-${{ runner.os }}-${{ steps.dynamorio.outputs.rev }}-${{ hashFiles('reverie-dbi/build.rs') }}
     - name: Build
       run: cargo build --workspace --all-features
     - name: Test regular workspace cases
@@ -75,12 +92,14 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+      with:
+        submodules: recursive
     - name: Dependencies
       run: |
         if command -v apt-get >/dev/null; then
-          sudo apt-get install -y libunwind-dev liblzma-dev
+          sudo apt-get install -y libunwind-dev liblzma-dev cmake zlib1g-dev
         else
-          sudo dnf install -y libunwind-devel xz-devel
+          sudo dnf install -y libunwind-devel xz-devel cmake zlib-devel
         fi
     - name: Rust toolchain
       uses: dtolnay/rust-toolchain@nightly

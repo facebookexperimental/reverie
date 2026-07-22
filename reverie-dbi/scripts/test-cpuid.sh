@@ -1,19 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ -z "${DYNAMORIO_HOME:-}" ]]; then
-  echo "DYNAMORIO_HOME must point to a built DynamoRIO source tree" >&2
-  exit 2
-fi
-
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 crate_dir=$(cd -- "$script_dir/.." && pwd)
+workspace_dir=$(cd -- "$crate_dir/.." && pwd)
+profile=${PROFILE:-debug}
+target_dir=${CARGO_TARGET_DIR:-"$workspace_dir/target"}
 client=$("$script_dir/build-client.sh" | tail -n 1)
-if [[ -x "$DYNAMORIO_HOME/build/bin64/drrun" ]]; then
-  drrun="$DYNAMORIO_HOME/build/bin64/drrun"
-else
-  drrun="$DYNAMORIO_HOME/install/bin64/drrun"
-fi
+path_helper="$target_dir/$profile/reverie-dbi-dynamorio-path"
+drrun=$("$path_helper" drrun)
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT
 

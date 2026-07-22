@@ -23,33 +23,47 @@ native DynamoRIO client:
   guest environment; and
 - optionally reports process totals when the application exits.
 
-Build DynamoRIO first:
+## Build
+
+DynamoRIO is pinned as a recursive git submodule. Clone Reverie with submodules,
+or initialize them in an existing checkout:
 
 ```bash
-with-proxy git clone --recursive https://github.com/DynamoRIO/dynamorio.git
-cmake -S dynamorio -B dynamorio/build \
-  -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF -DBUILD_SAMPLES=ON
-cmake --build dynamorio/build --parallel
-cmake --install dynamorio/build --prefix dynamorio/install
+git clone --recurse-submodules https://github.com/rrnewton/reverie.git
+# Existing checkout:
+git submodule update --init --recursive
 ```
 
-Then build and test the client:
+A normal package build configures, builds, and installs the pinned DynamoRIO
+source automatically. No external SDK or `DYNAMORIO_HOME` is used:
 
 ```bash
-DYNAMORIO_HOME=$PWD/dynamorio reverie-dbi/scripts/test-echo.sh
-DYNAMORIO_HOME=$PWD/dynamorio reverie-dbi/scripts/test-cpuid.sh
+cargo build -p reverie-dbi
+```
+
+The first build compiles DynamoRIO in Cargo's package `OUT_DIR` with its tests,
+samples, and documentation disabled. Cargo reuses that install until the build
+script or pinned submodule revision changes.
+
+Run the native client smoke tests directly:
+
+```bash
+reverie-dbi/scripts/test-echo.sh
+reverie-dbi/scripts/test-cpuid.sh
 ```
 
 Set `REVERIE_DBI_SUMMARY=1` when using `DbiRunner` to print branch and syscall
 totals. The summary is opt-in because its branch count is diagnostic and can
 vary between otherwise equivalent runs.
 
-The native client is intentionally separate from Cargo because DynamoRIO's
-CMake package supplies required client linker flags. The script first builds
-`libreverie_dbi.so`, then links the native client against that Rust runtime.
-Per-thread tool state is allocated by DynamoRIO and stored in `drmgr` TLS. The
-Rust runtime receives that state through an explicit C ABI pointer, avoiding
-dynamic Rust TLS inside DynamoRIO's private loader.
+The Rust runtime and native client still have two link phases. Cargo first
+builds DynamoRIO and `libreverie_dbi.so`; `build-client.sh` then asks the
+Cargo-built path helper for `DynamoRIOConfig.cmake` and links the native client
+against that Rust runtime. This ordering is required because Cargo build scripts
+run before their package's Rust library exists. Per-thread tool state is
+allocated by DynamoRIO and stored in `drmgr` TLS. The Rust runtime receives
+that state through an explicit C ABI pointer, avoiding dynamic Rust TLS inside
+DynamoRIO's private loader.
 
 ## Prototype Boundaries
 
@@ -63,3 +77,11 @@ dynamic Rust TLS inside DynamoRIO's private loader.
   current deterministic policy; they are not complete Linux procfs emulation.
 - Restartable sequences are disabled in the smoke test so libc selects its
   supported fallback path.
+
+## Third-party licenses
+
+Building this crate compiles DynamoRIO and the projects it vendors (elfutils,
+libipt, zlib). DynamoRIO is BSD-3-Clause but its extensions/tools include
+LGPL-licensed components (and elfutils is LGPL/GPL). See the [`NOTICE`](../NOTICE)
+file at the repository root for attribution and the distribution obligations
+that apply to binaries produced from this build.
