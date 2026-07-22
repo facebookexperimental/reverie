@@ -21,7 +21,7 @@ jobs:
       with:
         submodules: recursive
     - name: Dependencies
-      run: sudo apt-get install -y libunwind-dev liblzma-dev
+      run: sudo apt-get install -y libunwind-dev liblzma-dev cmake
     - name: Rust toolchain
       uses: dtolnay/rust-toolchain@nightly
       with:
@@ -97,9 +97,9 @@ jobs:
     - name: Dependencies
       run: |
         if command -v apt-get >/dev/null; then
-          sudo apt-get install -y libunwind-dev liblzma-dev
+          sudo apt-get install -y libunwind-dev liblzma-dev cmake
         else
-          sudo dnf install -y libunwind-devel xz-devel
+          sudo dnf install -y libunwind-devel xz-devel cmake
         fi
     - name: Rust toolchain
       uses: dtolnay/rust-toolchain@nightly
