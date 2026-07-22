@@ -653,6 +653,15 @@ fn restore_context(
 
 impl<L: Tool + 'static> TracedTask<L> {
     #[cfg(target_arch = "x86_64")]
+    async fn cpuid_state(&mut self) -> Result<i64, Errno> {
+        use reverie::syscalls::ArchPrctl;
+        use reverie::syscalls::ArchPrctlCmd;
+
+        self.inject_with_retry(ArchPrctl::new().with_cmd(ArchPrctlCmd::ARCH_GET_CPUID(None)))
+            .await
+    }
+
+    #[cfg(target_arch = "x86_64")]
     async fn intercept_cpuid(&mut self) -> Result<(), Errno> {
         use reverie::syscalls::ArchPrctl;
         use reverie::syscalls::ArchPrctlCmd;
@@ -836,14 +845,61 @@ impl<L: Tool + 'static> TracedTask<L> {
         // Try to intercept cpuid instructions on x86_64
         #[cfg(target_arch = "x86_64")]
         if self.global_state.subscriptions.has_cpuid() {
-            self.has_cpuid_interception = self.intercept_cpuid().await.inspect_err(|&err| {
-                match err {
-                    Errno::ENODEV => tracing::warn!(
-                        "Unable to intercept CPUID: Underlying hardware does not support CPUID faulting"
-                    ),
-                    err => tracing::warn!("Unable to intercept CPUID: {}", err),
+            self.has_cpuid_interception = match self.cpuid_state().await {
+                Ok(initial_state @ (0 | 1)) => match self.intercept_cpuid().await {
+                    Ok(()) => match self.cpuid_state().await {
+                        Ok(0) => true,
+                        Ok(state) => {
+                            tracing::warn!(
+                                state,
+                                "ARCH_SET_CPUID succeeded but ARCH_GET_CPUID did not report the disabled state; continuing without CPUID interception"
+                            );
+                            false
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                "Unable to verify ARCH_SET_CPUID with ARCH_GET_CPUID: {}; continuing without CPUID interception",
+                                err
+                            );
+                            false
+                        }
+                    },
+                    Err(Errno::ENODEV) => {
+                        tracing::warn!(
+                            initial_state,
+                            "ARCH_GET_CPUID reported a valid state, but ARCH_SET_CPUID returned ENODEV. The kernel exposes CPUID state without hardware faulting support. On AMD hosts, use Linux 6.17+ upstream or a kernel with CPUID faulting backported; continuing without CPUID interception"
+                        );
+                        false
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "Unable to disable CPUID after ARCH_GET_CPUID reported a valid state: {}; continuing without CPUID interception",
+                            err
+                        );
+                        false
+                    }
+                },
+                Ok(state) => {
+                    tracing::warn!(
+                        state,
+                        "ARCH_GET_CPUID returned an unexpected state; continuing without CPUID interception"
+                    );
+                    false
                 }
-            }).is_ok();
+                Err(Errno::ENODEV) => {
+                    tracing::warn!(
+                        "CPUID faulting is unavailable: arch_prctl(ARCH_GET_CPUID) returned ENODEV. On AMD hosts, use Linux 6.17+ upstream or a kernel with CPUID faulting backported; continuing without CPUID interception"
+                    );
+                    false
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "Unable to query CPUID faulting with arch_prctl(ARCH_GET_CPUID): {}; continuing without CPUID interception",
+                        err
+                    );
+                    false
+                }
+            };
         }
 
         // Restore registers again after we've injected syscalls so that we
