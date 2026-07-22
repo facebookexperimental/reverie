@@ -45,9 +45,17 @@ use super::StoppedInferior;
 use super::commands;
 use super::commands::*;
 use super::regs::CoreRegs;
+#[cfg(target_arch = "x86_64")]
+use super::regs::REGISTER_INFOS;
 use super::response::*;
 
 type BoxWriter = Box<dyn AsyncWrite + Unpin + Send + Sync + 'static>;
+
+/// Target triple reported to LLDB via `qHostInfo`/`qProcessInfo`.
+#[cfg(target_arch = "x86_64")]
+const HOST_TRIPLE: &str = "x86_64-unknown-linux-gnu";
+#[cfg(target_arch = "aarch64")]
+const HOST_TRIPLE: &str = "aarch64-unknown-linux-gnu";
 
 /// Gdb session manager.
 /// recv commands over tcp stream
@@ -323,6 +331,24 @@ impl Session {
             Base::qSupported(_) => {
                 writer.put_str("PacketSize=8000;vContSupported+;multiprocess+;exec-events+;fork-events+;vfork-events+;QThreadEvents+;QStartNoAckMode+;swbreak+;qXfer:features:read+;qXfer:auxv:read+;");
             }
+            // LLDB extensions. See
+            // https://github.com/llvm/llvm-project/blob/main/lldb/docs/resources/lldbgdbremote.md
+            Base::qHostInfo(_) => {
+                self.write_host_info(writer);
+            }
+            Base::qProcessInfo(_) => {
+                self.write_process_info(writer);
+            }
+            Base::qRegisterInfo(reg) => {
+                Self::write_register_info(reg.reg, writer);
+            }
+            Base::jThreadsInfo(_) => {
+                self.write_threads_info(writer).await;
+            }
+            Base::QThreadSuffixSupported(_) => {
+                // We honor a `;thread:<id>;` suffix on `g`/`G` packets.
+                writer.put_str("OK");
+            }
             Base::qXfer(request) => match request {
                 qXfer::FeaturesRead { offset: _, len: _ } => {
                     // gdb/64bit-sse.xml
@@ -399,16 +425,20 @@ impl Session {
                     }
                 }
             }
-            Base::g(_) => self
-                .read_registers()
-                .await
-                .map(ResponseAsHex)
-                .write_response(writer),
-            Base::G(regs) => self
-                .write_registers(regs.vals)
-                .await
-                .map(|_| ResponseOk)
-                .write_response(writer),
+            Base::g(g) => {
+                self.select_thread(g.thread).await;
+                self.read_registers()
+                    .await
+                    .map(ResponseAsHex)
+                    .write_response(writer)
+            }
+            Base::G(regs) => {
+                self.select_thread(regs.thread).await;
+                self.write_registers(regs.vals)
+                    .await
+                    .map(|_| ResponseOk)
+                    .write_response(writer)
+            }
             Base::m(m) => self
                 .read_inferior_memory(m.addr, m.length)
                 .await
@@ -831,6 +861,90 @@ impl Session {
             Ok(())
         })
         .await
+    }
+
+    /// Write the response to an LLDB `qHostInfo` query.
+    fn write_host_info(&self, writer: &mut ResponseWriter) {
+        writer.put_str("triple:");
+        writer.put_hex_encoded(HOST_TRIPLE.as_bytes());
+        writer.put_str(";endian:little;ptrsize:8;ostype:linux;");
+    }
+
+    /// Write the response to an LLDB `qProcessInfo` query.
+    fn write_process_info(&self, writer: &mut ResponseWriter) {
+        if let Some(id) = self.current {
+            // NB: the `pid` field is expected in hexadecimal.
+            writer.put_str("pid:");
+            writer.put_num(id.pid.as_raw());
+            writer.put_str(";ptrsize:8;endian:little;ostype:linux;triple:");
+            writer.put_hex_encoded(HOST_TRIPLE.as_bytes());
+            writer.put_str(";");
+        }
+    }
+
+    /// Write the response to an LLDB `qRegisterInfo<n>` query. Replies `E45`
+    /// once `index` runs past the end of the register table, which is LLDB's
+    /// signal to stop probing.
+    #[cfg(target_arch = "x86_64")]
+    fn write_register_info(index: usize, writer: &mut ResponseWriter) {
+        match REGISTER_INFOS.get(index) {
+            None => writer.put_str("E45"),
+            Some(info) => {
+                let mut resp = format!(
+                    "name:{};bitsize:{};offset:{};encoding:{};format:{};set:{};",
+                    info.name, info.bitsize, info.offset, info.encoding, info.format, info.set,
+                );
+                if let Some(ehframe) = info.ehframe {
+                    resp.push_str(&format!("ehframe:{};", ehframe));
+                }
+                if let Some(dwarf) = info.dwarf {
+                    resp.push_str(&format!("dwarf:{};", dwarf));
+                }
+                if let Some(generic) = info.generic {
+                    resp.push_str(&format!("generic:{};", generic));
+                }
+                writer.put_str(&resp);
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn write_register_info(_index: usize, writer: &mut ResponseWriter) {
+        writer.put_str("E45");
+    }
+
+    /// Write the response to an LLDB `jThreadsInfo` query: a JSON array with one
+    /// object per thread. The JSON is binary-escaped because it contains `}`,
+    /// which is a reserved character in the remote protocol.
+    async fn write_threads_info(&self, writer: &mut ResponseWriter) {
+        let mut json = String::from("[");
+        for (i, inferior) in self.inferiors.lock().await.values().enumerate() {
+            if i > 0 {
+                json.push(',');
+            }
+            json.push_str(&format!("{{\"tid\":{}}}", inferior.gettid().as_raw()));
+        }
+        json.push(']');
+        writer.put_binary_encoded(json.as_bytes());
+    }
+
+    /// Select the current thread from an optional LLDB `;thread:<id>;` suffix.
+    /// A missing suffix leaves the current thread unchanged.
+    async fn select_thread(&mut self, thread: Option<ThreadId>) {
+        let Some(threadid) = thread else {
+            return;
+        };
+        // Full `pPID.TID` form.
+        if let Ok(id) = InferiorThreadId::try_from(threadid) {
+            self.current = Some(id);
+            return;
+        }
+        // Bare thread id: resolve against the known inferiors by tid.
+        if let Some(tid) = threadid.gettid()
+            && let Some(inferior) = self.inferiors.lock().await.get(&tid)
+        {
+            self.current = Some(inferior.id);
+        }
     }
 
     async fn read_registers(&self) -> Result<CoreRegs, Error> {

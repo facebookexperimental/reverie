@@ -9,19 +9,16 @@
 use bytes::BytesMut;
 
 use crate::gdbstub::commands::*;
-use crate::gdbstub::hex::*;
 
+/// LLDB `jThreadsInfo` query. Requests a JSON description of all threads and
+/// their stop reasons in a single packet.
 #[derive(PartialEq, Debug)]
-pub struct g {
-    /// Optional thread selected by an LLDB `;thread:<id>;` suffix.
-    pub thread: Option<ThreadId>,
-}
+pub struct jThreadsInfo;
 
-impl ParseCommand for g {
+impl ParseCommand for jThreadsInfo {
     fn parse(bytes: BytesMut) -> Option<Self> {
-        let (rest, thread) = split_thread_suffix(bytes);
-        if rest.is_empty() {
-            Some(g { thread })
+        if bytes.is_empty() {
+            Some(jThreadsInfo)
         } else {
             None
         }

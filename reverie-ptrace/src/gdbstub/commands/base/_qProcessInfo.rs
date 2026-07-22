@@ -9,19 +9,16 @@
 use bytes::BytesMut;
 
 use crate::gdbstub::commands::*;
-use crate::gdbstub::hex::*;
 
+/// LLDB `qProcessInfo` query. Requests information about the process currently
+/// being debugged (pid, architecture triple, pointer size, endianness, ...).
 #[derive(PartialEq, Debug)]
-pub struct g {
-    /// Optional thread selected by an LLDB `;thread:<id>;` suffix.
-    pub thread: Option<ThreadId>,
-}
+pub struct qProcessInfo;
 
-impl ParseCommand for g {
+impl ParseCommand for qProcessInfo {
     fn parse(bytes: BytesMut) -> Option<Self> {
-        let (rest, thread) = split_thread_suffix(bytes);
-        if rest.is_empty() {
-            Some(g { thread })
+        if bytes.is_empty() {
+            Some(qProcessInfo)
         } else {
             None
         }

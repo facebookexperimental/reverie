@@ -9,19 +9,16 @@
 use bytes::BytesMut;
 
 use crate::gdbstub::commands::*;
-use crate::gdbstub::hex::*;
 
+/// LLDB `qHostInfo` query. Requests information about the host the gdbserver is
+/// running on (architecture triple, pointer size, endianness, ...).
 #[derive(PartialEq, Debug)]
-pub struct g {
-    /// Optional thread selected by an LLDB `;thread:<id>;` suffix.
-    pub thread: Option<ThreadId>,
-}
+pub struct qHostInfo;
 
-impl ParseCommand for g {
+impl ParseCommand for qHostInfo {
     fn parse(bytes: BytesMut) -> Option<Self> {
-        let (rest, thread) = split_thread_suffix(bytes);
-        if rest.is_empty() {
-            Some(g { thread })
+        if bytes.is_empty() {
+            Some(qHostInfo)
         } else {
             None
         }

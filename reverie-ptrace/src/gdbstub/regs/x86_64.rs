@@ -313,11 +313,224 @@ impl WriteResponse for ResponseAsBinary<CoreRegs> {
     }
 }
 
+/// Description of a single register, as reported to LLDB via the
+/// `qRegisterInfo<n>` packet.
+///
+/// The `offset` field is the byte offset of the register within the `g`/`G`
+/// packet payload, i.e. within the bincode-serialized [`CoreRegs`]. It MUST
+/// stay in sync with the field layout of [`CoreRegs`], otherwise LLDB will read
+/// registers from the wrong location.
+pub struct RegisterInfo {
+    /// Register name (e.g. "rax").
+    pub name: &'static str,
+    /// Size of the register in bits.
+    pub bitsize: u16,
+    /// Byte offset within the `g` packet payload.
+    pub offset: u16,
+    /// LLDB encoding: "uint", "sint", "ieee754", "vector", ...
+    pub encoding: &'static str,
+    /// LLDB format: "hex", "float", "vector-uint8", ...
+    pub format: &'static str,
+    /// Register set name shown by LLDB.
+    pub set: &'static str,
+    /// eh_frame register number (equal to the DWARF number on x86_64).
+    pub ehframe: Option<u16>,
+    /// DWARF register number.
+    pub dwarf: Option<u16>,
+    /// Generic role, if any: "pc", "sp", "fp", "flags", "arg1".."arg6".
+    pub generic: Option<&'static str>,
+}
+
+const GP: &str = "General Purpose Registers";
+const FP: &str = "Floating Point Registers";
+
+const fn gpr(
+    name: &'static str,
+    offset: u16,
+    dwarf: u16,
+    generic: Option<&'static str>,
+) -> RegisterInfo {
+    RegisterInfo {
+        name,
+        bitsize: 64,
+        offset,
+        encoding: "uint",
+        format: "hex",
+        set: GP,
+        ehframe: Some(dwarf),
+        dwarf: Some(dwarf),
+        generic,
+    }
+}
+
+const fn seg(name: &'static str, offset: u16, dwarf: u16) -> RegisterInfo {
+    RegisterInfo {
+        name,
+        bitsize: 32,
+        offset,
+        encoding: "uint",
+        format: "hex",
+        set: GP,
+        ehframe: Some(dwarf),
+        dwarf: Some(dwarf),
+        generic: None,
+    }
+}
+
+const fn st(name: &'static str, offset: u16, dwarf: u16) -> RegisterInfo {
+    RegisterInfo {
+        name,
+        bitsize: 80,
+        offset,
+        encoding: "ieee754",
+        format: "float",
+        set: FP,
+        ehframe: Some(dwarf),
+        dwarf: Some(dwarf),
+        generic: None,
+    }
+}
+
+const fn fpctrl(name: &'static str, offset: u16) -> RegisterInfo {
+    RegisterInfo {
+        name,
+        bitsize: 32,
+        offset,
+        encoding: "uint",
+        format: "hex",
+        set: FP,
+        ehframe: None,
+        dwarf: None,
+        generic: None,
+    }
+}
+
+const fn xmm(name: &'static str, offset: u16, dwarf: u16) -> RegisterInfo {
+    RegisterInfo {
+        name,
+        bitsize: 128,
+        offset,
+        encoding: "vector",
+        format: "vector-uint8",
+        set: FP,
+        ehframe: Some(dwarf),
+        dwarf: Some(dwarf),
+        generic: None,
+    }
+}
+
+/// Register table exposed to LLDB via `qRegisterInfo`. The offsets match the
+/// bincode layout of [`CoreRegs`] returned by the `g` packet.
+pub const REGISTER_INFOS: &[RegisterInfo] = &[
+    // General purpose registers. offsets: rax@0 .. r15@120 (u64 each).
+    gpr("rax", 0, 0, None),
+    gpr("rbx", 8, 3, None),
+    gpr("rcx", 16, 2, Some("arg4")),
+    gpr("rdx", 24, 1, Some("arg3")),
+    gpr("rsi", 32, 4, Some("arg2")),
+    gpr("rdi", 40, 5, Some("arg1")),
+    gpr("rbp", 48, 6, Some("fp")),
+    gpr("rsp", 56, 7, Some("sp")),
+    gpr("r8", 64, 8, Some("arg5")),
+    gpr("r9", 72, 9, Some("arg6")),
+    gpr("r10", 80, 10, None),
+    gpr("r11", 88, 11, None),
+    gpr("r12", 96, 12, None),
+    gpr("r13", 104, 13, None),
+    gpr("r14", 112, 14, None),
+    gpr("r15", 120, 15, None),
+    gpr("rip", 128, 16, Some("pc")),
+    // eflags: u32 @136.
+    RegisterInfo {
+        name: "rflags",
+        bitsize: 32,
+        offset: 136,
+        encoding: "uint",
+        format: "hex",
+        set: GP,
+        ehframe: Some(49),
+        dwarf: Some(49),
+        generic: Some("flags"),
+    },
+    // segments: cs,ss,ds,es,fs,gs u32 each @140..
+    seg("cs", 140, 51),
+    seg("ss", 144, 52),
+    seg("ds", 148, 53),
+    seg("es", 152, 50),
+    seg("fs", 156, 54),
+    seg("gs", 160, 55),
+    // x87 st(0)..st(7): 80-bit each @164..
+    st("st0", 164, 33),
+    st("st1", 174, 34),
+    st("st2", 184, 35),
+    st("st3", 194, 36),
+    st("st4", 204, 37),
+    st("st5", 214, 38),
+    st("st6", 224, 39),
+    st("st7", 234, 40),
+    // x87 control/status registers: u32 each @244..
+    fpctrl("fctrl", 244),
+    fpctrl("fstat", 248),
+    fpctrl("ftag", 252),
+    fpctrl("fiseg", 256),
+    fpctrl("fioff", 260),
+    fpctrl("foseg", 264),
+    fpctrl("fooff", 268),
+    fpctrl("fop", 272),
+    // SSE xmm0..xmm15: 128-bit each @276..
+    xmm("xmm0", 276, 17),
+    xmm("xmm1", 292, 18),
+    xmm("xmm2", 308, 19),
+    xmm("xmm3", 324, 20),
+    xmm("xmm4", 340, 21),
+    xmm("xmm5", 356, 22),
+    xmm("xmm6", 372, 23),
+    xmm("xmm7", 388, 24),
+    xmm("xmm8", 404, 25),
+    xmm("xmm9", 420, 26),
+    xmm("xmm10", 436, 27),
+    xmm("xmm11", 452, 28),
+    xmm("xmm12", 468, 29),
+    xmm("xmm13", 484, 30),
+    xmm("xmm14", 500, 31),
+    xmm("xmm15", 516, 32),
+    // mxcsr: u32 @532.
+    fpctrl("mxcsr", 532),
+    // orig_rax @536 is intentionally omitted (not a real machine register).
+    // fs_base/gs_base: u64 each @544/@552.
+    gpr("fs_base", 544, 58, None),
+    gpr("gs_base", 552, 59, None),
+];
+
 #[cfg(test)]
 mod test {
     use std::mem;
 
     use super::*;
+
+    #[test]
+    fn register_infos_match_coreregs_layout() {
+        // The last register must end exactly at the size of the `g` packet
+        // payload, and every register must fit within it. This keeps
+        // `REGISTER_INFOS` in sync with `CoreRegs`.
+        let g_packet_size = mem::size_of::<CoreRegs>();
+        let mut max_end = 0usize;
+        for reg in REGISTER_INFOS {
+            let end = reg.offset as usize + reg.bitsize.div_ceil(8) as usize;
+            assert!(
+                end <= g_packet_size,
+                "register {} ends at {} which exceeds g packet size {}",
+                reg.name,
+                end,
+                g_packet_size
+            );
+            max_end = max_end.max(end);
+        }
+        assert_eq!(
+            max_end, g_packet_size,
+            "register table does not cover the full g packet payload"
+        );
+    }
 
     #[test]
     fn fp80_sanity() {

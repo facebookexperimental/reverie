@@ -212,6 +212,40 @@ impl WriteResponse for ThreadId {
     }
 }
 
+/// Parse an LLDB register-packet thread suffix.
+///
+/// When the stub answers `QThreadSuffixSupported` with `OK`, LLDB appends a
+/// `;thread:<id>;` suffix to its `g`/`G`/`p`/`P` packets to indicate which
+/// thread the operation applies to. This splits such a suffix off the tail of
+/// `bytes`, returning the remaining payload and the parsed [`ThreadId`], if a
+/// suffix was present.
+///
+/// The `<id>` can be either the multiprocess form (`pPID.TID`) or a bare hex
+/// thread id, matching how LLDB encodes it.
+pub fn split_thread_suffix(mut bytes: BytesMut) -> (BytesMut, Option<ThreadId>) {
+    const PAT: &[u8] = b";thread:";
+    let Some(pos) = bytes.windows(PAT.len()).position(|w| w == PAT) else {
+        return (bytes, None);
+    };
+
+    let suffix = bytes.split_off(pos);
+    let id_bytes: &[u8] = suffix[PAT.len()..]
+        .split(|c| *c == b';')
+        .next()
+        .unwrap_or(&[]);
+
+    let thread = if id_bytes.starts_with(b"p") {
+        ThreadId::decode(id_bytes)
+    } else {
+        // Bare hex thread id (no process component).
+        decode_hex::<i32>(id_bytes)
+            .ok()
+            .map(|tid| ThreadId::pid_tid(-1, tid))
+    };
+
+    (bytes, thread)
+}
+
 macro_rules! commands {
     (
         $(#[$attrs:meta])*
@@ -309,6 +343,12 @@ commands! {
             "qsThreadInfo" => qsThreadInfo,
             "qSupported" => qSupported,
             "qXfer" => qXfer,
+            /* LLDB extensions */
+            "qHostInfo" => qHostInfo,
+            "qProcessInfo" => qProcessInfo,
+            "qRegisterInfo" => qRegisterInfo,
+            "jThreadsInfo" => jThreadsInfo,
+            "QThreadSuffixSupported" => QThreadSuffixSupported,
             "vCont" => vCont,
             "vKill" => vKill,
             "z" => z,
@@ -617,5 +657,96 @@ mod test {
                 "vCont"
             )))
         );
+    }
+
+    #[test]
+    fn parse_lldb_query_packets() {
+        assert!(matches!(
+            Command::try_parse(BytesMut::from("qHostInfo")),
+            Ok(Command::Base(Base::qHostInfo(_)))
+        ));
+        assert!(matches!(
+            Command::try_parse(BytesMut::from("qProcessInfo")),
+            Ok(Command::Base(Base::qProcessInfo(_)))
+        ));
+        assert!(matches!(
+            Command::try_parse(BytesMut::from("jThreadsInfo")),
+            Ok(Command::Base(Base::jThreadsInfo(_)))
+        ));
+        assert!(matches!(
+            Command::try_parse(BytesMut::from("QThreadSuffixSupported")),
+            Ok(Command::Base(Base::QThreadSuffixSupported(_)))
+        ));
+    }
+
+    #[test]
+    fn parse_qregisterinfo_hex_index() {
+        match Command::try_parse(BytesMut::from("qRegisterInfo0")) {
+            Ok(Command::Base(Base::qRegisterInfo(q))) => assert_eq!(q.reg, 0),
+            other => panic!("unexpected parse result: {:?}", other),
+        }
+        // The index is hex-encoded by LLDB.
+        match Command::try_parse(BytesMut::from("qRegisterInfo1a")) {
+            Ok(Command::Base(Base::qRegisterInfo(q))) => assert_eq!(q.reg, 0x1a),
+            other => panic!("unexpected parse result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn qthreadsuffix_not_shadowed_by_qthreadevents() {
+        // "QThreadEvents" and "QThreadSuffixSupported" share a prefix; ensure
+        // dispatch does not confuse the two.
+        assert!(matches!(
+            Command::try_parse(BytesMut::from("QThreadEvents:1")),
+            Ok(Command::Base(Base::QThreadEvents(_)))
+        ));
+        assert!(matches!(
+            Command::try_parse(BytesMut::from("QThreadSuffixSupported")),
+            Ok(Command::Base(Base::QThreadSuffixSupported(_)))
+        ));
+    }
+
+    #[test]
+    fn split_thread_suffix_forms() {
+        // multiprocess form: pPID.TID
+        let (rest, thread) = split_thread_suffix(BytesMut::from("deadbeef;thread:p1.2;"));
+        assert_eq!(&rest[..], b"deadbeef");
+        assert_eq!(thread, Some(ThreadId::pid_tid(1, 2)));
+
+        // bare hex tid form
+        let (rest, thread) = split_thread_suffix(BytesMut::from(";thread:a;"));
+        assert!(rest.is_empty());
+        assert_eq!(thread, Some(ThreadId::pid_tid(-1, 0xa)));
+
+        // no suffix
+        let (rest, thread) = split_thread_suffix(BytesMut::from("cafe"));
+        assert_eq!(&rest[..], b"cafe");
+        assert_eq!(thread, None);
+    }
+
+    #[test]
+    fn parse_g_with_thread_suffix() {
+        match Command::try_parse(BytesMut::from("g;thread:p2.3;")) {
+            Ok(Command::Base(Base::g(inner))) => {
+                assert_eq!(inner.thread, Some(ThreadId::pid_tid(2, 3)));
+            }
+            other => panic!("unexpected parse result: {:?}", other),
+        }
+        // Plain g (as sent by gdb) still parses, with no thread selected.
+        match Command::try_parse(BytesMut::from("g")) {
+            Ok(Command::Base(Base::g(inner))) => assert_eq!(inner.thread, None),
+            other => panic!("unexpected parse result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_g_upper_with_thread_suffix() {
+        match Command::try_parse(BytesMut::from("G0011223344;thread:p1.2;")) {
+            Ok(Command::Base(Base::G(inner))) => {
+                assert_eq!(inner.vals, vec![0x00, 0x11, 0x22, 0x33, 0x44]);
+                assert_eq!(inner.thread, Some(ThreadId::pid_tid(1, 2)));
+            }
+            other => panic!("unexpected parse result: {:?}", other),
+        }
     }
 }
