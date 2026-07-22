@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "reverie",
+    "reverie-dbi",
     "reverie-examples",
     "reverie-kvm",
     "reverie-memory",
