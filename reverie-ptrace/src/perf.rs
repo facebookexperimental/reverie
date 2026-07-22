@@ -498,6 +498,19 @@ fn smp_rmb() {
     compiler_fence(SeqCst);
 }
 
+fn handle_perf_pmu_error(errno: Errno) -> bool {
+    match errno {
+        Errno::ENOENT | Errno::EPERM | Errno::EACCES | Errno::ENOSYS => {
+            info!("Perf feature check failed due to {errno}");
+        }
+        _ => {
+            warn!("Perf feature check failed unexpectedly due to {errno}; assuming unsupported");
+        }
+    }
+
+    false
+}
+
 // Test if we have PMU access by doing a check for a basic hardware event.
 fn test_perf_pmu_support() -> bool {
     // Do a raw perf_event_open because our default configuration has flags that
@@ -521,14 +534,10 @@ fn test_perf_pmu_support() -> bool {
         Ok(fd) => {
             Errno::result(unsafe { libc::close(fd as libc::c_int) })
                 .expect("perf feature check: close(fd) failed");
-            return true;
+            true
         }
-        Err(Errno::ENOENT) => info!("Perf feature check failed due to ENOENT"),
-        Err(Errno::EPERM) => info!("Perf feature check failed due to EPERM"),
-        Err(Errno::EACCES) => info!("Perf feature check failed due to EACCES"),
-        Err(e) => panic!("Unexpected error during perf feature check: {}", e),
+        Err(errno) => handle_perf_pmu_error(errno),
     }
-    false
 }
 
 static IS_PERF_SUPPORTED: LazyLock<bool> = LazyLock::new(test_perf_pmu_support);
@@ -589,6 +598,24 @@ pub fn do_branches(mut count: u64) {
     }
 
     assert_eq!(count, 0);
+}
+
+#[cfg(test)]
+mod support_test {
+    use super::*;
+
+    #[test]
+    fn perf_event_open_errors_mean_pmu_is_unsupported() {
+        for errno in [
+            Errno::ENOENT,
+            Errno::EPERM,
+            Errno::EACCES,
+            Errno::ENOSYS,
+            Errno::EINVAL,
+        ] {
+            assert!(!handle_perf_pmu_error(errno));
+        }
+    }
 }
 
 // NOTE: aarch64 doesn't work with
