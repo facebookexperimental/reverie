@@ -5,6 +5,8 @@ native DynamoRIO client:
 
 - inserts an atomic 64-bit counter update before every application branch via
   DynamoRIO's `drx` instruction-rewriting helper;
+- replaces application `CPUID` instructions with Hermit's deterministic CPU
+  identity, masking RDRAND, RDSEED, TSX, and AVX-512 features;
 - receives all application syscall entry events without ptrace;
 - forwards `write` to a Rust `PrototypeTool`, which executes it through
   `Guest::inject`, returns its result, and suppresses the original syscall; and
@@ -24,6 +26,7 @@ Then build and test the client:
 
 ```bash
 DYNAMORIO_HOME=$PWD/dynamorio reverie-dbi/scripts/test-echo.sh
+DYNAMORIO_HOME=$PWD/dynamorio reverie-dbi/scripts/test-cpuid.sh
 ```
 
 The native client is intentionally separate from Cargo because DynamoRIO's
