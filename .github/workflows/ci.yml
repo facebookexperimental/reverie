@@ -18,6 +18,8 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+      with:
+        submodules: recursive
     - name: Dependencies
       run: sudo apt-get install -y libunwind-dev liblzma-dev
     - name: Rust toolchain
@@ -75,6 +77,8 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+      with:
+        submodules: recursive
     - name: Dependencies
       run: |
         if command -v apt-get >/dev/null; then

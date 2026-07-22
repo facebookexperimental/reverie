@@ -12,29 +12,43 @@ native DynamoRIO client:
   `Guest::inject`, returns its result, and suppresses the original syscall; and
 - reports process totals when the application exits.
 
-Build DynamoRIO first:
+## Build
+
+DynamoRIO is pinned as a recursive git submodule. Clone Reverie with submodules,
+or initialize them in an existing checkout:
 
 ```bash
-with-proxy git clone --recursive https://github.com/DynamoRIO/dynamorio.git
-cmake -S dynamorio -B dynamorio/build \
-  -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF -DBUILD_SAMPLES=ON
-cmake --build dynamorio/build --parallel
-cmake --install dynamorio/build --prefix dynamorio/install
+git clone --recurse-submodules https://github.com/rrnewton/reverie.git
+# Existing checkout:
+git submodule update --init --recursive
 ```
 
-Then build and test the client:
+A normal package build configures, builds, and installs the pinned DynamoRIO
+source automatically. No external SDK or `DYNAMORIO_HOME` is used:
 
 ```bash
-DYNAMORIO_HOME=$PWD/dynamorio reverie-dbi/scripts/test-echo.sh
-DYNAMORIO_HOME=$PWD/dynamorio reverie-dbi/scripts/test-cpuid.sh
+cargo build -p reverie-dbi
 ```
 
-The native client is intentionally separate from Cargo because DynamoRIO's
-CMake package supplies required client linker flags. The script first builds
-`libreverie_dbi.so`, then links the native client against that Rust runtime.
-Per-thread tool state is allocated by DynamoRIO and stored in `drmgr` TLS. The
-Rust runtime receives that state through an explicit C ABI pointer, avoiding
-dynamic Rust TLS inside DynamoRIO's private loader.
+The first build compiles DynamoRIO in Cargo's package `OUT_DIR` with its tests,
+samples, and documentation disabled. Cargo reuses that install until the build
+script or pinned submodule revision changes.
+
+Run the native client smoke tests directly:
+
+```bash
+reverie-dbi/scripts/test-echo.sh
+reverie-dbi/scripts/test-cpuid.sh
+```
+
+The Rust runtime and native client still have two link phases. Cargo first
+builds DynamoRIO and `libreverie_dbi.so`; `build-client.sh` then asks the
+Cargo-built path helper for `DynamoRIOConfig.cmake` and links the native client
+against that Rust runtime. This ordering is required because Cargo build scripts
+run before their package's Rust library exists. Per-thread tool state is
+allocated by DynamoRIO and stored in `drmgr` TLS. The Rust runtime receives
+that state through an explicit C ABI pointer, avoiding dynamic Rust TLS inside
+DynamoRIO's private loader.
 
 ## Prototype Boundaries
 
