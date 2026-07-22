@@ -294,7 +294,9 @@ fn seccomp_notif_recv(fd: &Fd) -> io::Result<seccomp_notif> {
             &mut response as *mut _,
         )
     }) {
-        Err(Errno::EINTR) => Err(Errno::EAGAIN),
+        // A notification can disappear if its target exits before the receive
+        // ioctl completes. Neither that race nor a signal ends the stream.
+        Err(Errno::EINTR) | Err(Errno::ENOENT) => Err(Errno::EAGAIN),
         result => result,
     }?;
 

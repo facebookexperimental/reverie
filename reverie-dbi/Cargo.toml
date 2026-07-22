@@ -15,3 +15,6 @@ libc = "0.2.186"
 reverie = { version = "0.1.0", path = "../reverie" }
 reverie-memory = { version = "0.1.0", path = "../reverie-memory" }
 serde = { version = "1.0.219", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
