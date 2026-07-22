@@ -59,6 +59,13 @@ const MARKER_SIGNAL: Signal = reverie::PERF_EVENT_SIGNAL;
 /// about perf event throttling, which isn't well-documented.
 const SINGLESTEP_TIMEOUT_RCBS: u64 = 5;
 
+#[cfg(target_arch = "x86_64")]
+const AMD_RCB_EVENT: u64 = 0x5100d1;
+#[cfg(target_arch = "x86_64")]
+const AMD_DEFAULT_SKID_MARGIN: u64 = 10_000;
+#[cfg(target_arch = "x86_64")]
+const AMD_EPYC_9D85_SKID_MARGIN: u64 = 1_000;
+
 pub fn get_pmu_config() -> &'static PmuConfig {
     static PMU_CONFIG: LazyLock<PmuConfig> = LazyLock::new(PmuConfig::new);
     &PMU_CONFIG
@@ -98,10 +105,15 @@ impl PmuConfig {
 
     #[cfg(target_arch = "x86_64")]
     fn from_cpuid_features(fi: raw_cpuid::FeatureInfo) -> Self {
+        Self::from_family_model(fi.family_id(), fi.model_id())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn from_family_model(family_id: u8, model_id: u8) -> Self {
         // based on rr's PerfCounters_x86.h and PerfCounters.cc
-        let (rcb_event, skid_margin) = match fi.family_id() {
+        let (rcb_event, skid_margin) = match family_id {
             // Intel
-            0x06 => match fi.model_id() {
+            0x06 => match model_id {
                 0x1A | 0x1E | 0x2E => (0x5101c4, 100),        // Intel Nehalem
                 0x25 | 0x2C | 0x2F => (0x5101c4, 100),        // Intel Westmere
                 0x2A | 0x2D | 0x3E => (0x5101c4, 100),        // Intel Sandy Bridge
@@ -117,12 +129,15 @@ impl PmuConfig {
                 0x86 => (0x5101c4, 100),                      // Intel Icelake
                 model => panic!("Unsupported Intel processor model: {:#x}", model),
             },
-            // AMD Zen 1-5
-            0x17 | 0x19 | 0x1A => (0x5100d1, 10000),
+            // Turin EPYC family 1Ah model 11h has p99 skid of 384 RCBs. A 1K
+            // performance margin accepts rare larger overshoots because the
+            // existing single-step path completes them without losing correctness.
+            0x1A if model_id == 0x11 => (AMD_RCB_EVENT, AMD_EPYC_9D85_SKID_MARGIN),
+            // Other Zen CPUs keep rr's 10K guard because they have exhibited rare large skid.
+            0x17 | 0x19 | 0x1A => (AMD_RCB_EVENT, AMD_DEFAULT_SKID_MARGIN),
             family => panic!(
                 "Unsupported processor family, model: ({:#x},{:#x})",
-                family,
-                fi.model_id()
+                family, model_id
             ),
         };
 
@@ -850,6 +865,26 @@ mod tests {
     use test_case::test_case;
 
     use super::ClockCounter;
+    #[cfg(target_arch = "x86_64")]
+    use super::PmuConfig;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn amd_epyc_9d85_uses_reduced_skid_margin() {
+        let config = PmuConfig::from_family_model(0x1A, 0x11);
+        assert_eq!(config.raw_rcb_event(), 0x5100d1);
+        assert_eq!(config.skid_margin(), 1_000);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn other_amd_cpus_keep_default_skid_margin() {
+        for (family, model) in [(0x17, 0x71), (0x19, 0x61), (0x1A, 0x20)] {
+            let config = PmuConfig::from_family_model(family, model);
+            assert_eq!(config.raw_rcb_event(), 0x5100d1);
+            assert_eq!(config.skid_margin(), 10_000);
+        }
+    }
 
     #[test_case(ClockCounter::new(0, 0, 10), 0, 1, Some(true))]
     #[test_case(ClockCounter::new(2, 100, 200), 3, 0, Some(true))]
