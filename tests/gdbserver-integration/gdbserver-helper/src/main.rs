@@ -263,6 +263,32 @@ mod test {
         );
     }
 
+    /// Regression test for a panic in the GDB resume state machine.
+    ///
+    /// `finish` is implemented by GDB with a temporary breakpoint at the return
+    /// address which GDB deletes as soon as it is hit. When the user then
+    /// resumes with `continue`, there is no longer a breakpoint to step over at
+    /// the current PC, so GDB issues a plain `vCont;c` rather than the usual
+    /// step-over single-step. The resume handler used to only accept a
+    /// single-step while in the `StepOver` state and panicked with
+    /// "unexpected resume action Continue(..), expecting: StepOver".
+    ///
+    /// Here we break in the libc `uname` function (called by the `uname`
+    /// coreutil), `finish` back out to its caller, and then `continue` to exit.
+    /// The session must complete cleanly and still produce the expected output.
+    #[tokio::test(flavor = "current_thread")]
+    async fn debug_uname_finish_then_continue() {
+        let session = RemoteGdbSession::new("gdb", "/bin/uname", vec!["-s"]);
+        assert_eq!(
+            session
+                .run([], &["b uname", "c", "finish", "c"])
+                .await
+                .unwrap()
+                .stdout,
+            b"Linux\n",
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn debug_file_does_not_exist_with_b_main_continue() {
         let session = RemoteGdbSession::new("gdb", "/this_file/does/not/exist!", NO_ARGS);
