@@ -32,9 +32,9 @@ const HLT: u8 = 0xf4;
 /// A single-vCPU KVM backend used to exercise the syscall transport.
 pub struct KvmBackend {
     // Field order ensures the vCPU and VM are dropped before registered memory.
-    vcpu: VcpuFd,
+    pub(crate) vcpu: VcpuFd,
     vm: VmFd,
-    memory: GuestMemory,
+    pub(crate) memory: GuestMemory,
     _kvm: Kvm,
     hypercall_instruction: [u8; 3],
 }

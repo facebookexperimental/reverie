@@ -6,6 +6,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallArgs;
+use reverie::syscalls::SyscallInfo;
+use reverie::syscalls::Sysno;
+
 use crate::GuestMemory;
 use crate::Result;
 
@@ -24,6 +29,37 @@ impl SyscallRequest {
     /// Creates a request from a Linux syscall number and its six ABI arguments.
     pub const fn new(number: u64, args: [u64; 6]) -> Self {
         Self { number, args }
+    }
+
+    /// Creates a transport request from a shared Reverie syscall.
+    pub fn from_syscall<S: SyscallInfo>(syscall: S) -> Self {
+        let (number, args) = syscall.into_parts();
+        Self::new(
+            number as u64,
+            [
+                args.arg0 as u64,
+                args.arg1 as u64,
+                args.arg2 as u64,
+                args.arg3 as u64,
+                args.arg4 as u64,
+                args.arg5 as u64,
+            ],
+        )
+    }
+
+    /// Converts this transport request into the shared Reverie syscall model.
+    pub fn into_syscall(self) -> Syscall {
+        Syscall::from_raw(
+            Sysno::from(self.number as i32),
+            SyscallArgs::new(
+                self.args[0] as usize,
+                self.args[1] as usize,
+                self.args[2] as usize,
+                self.args[3] as usize,
+                self.args[4] as usize,
+                self.args[5] as usize,
+            ),
+        )
     }
 
     /// Returns the Linux syscall number.
@@ -73,6 +109,18 @@ impl SyscallRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_syscall_round_trips_through_transport() {
+        let typed = reverie::syscalls::Write::new()
+            .with_fd(1)
+            .with_buf(Some(reverie::syscalls::Addr::from_raw(0x3000).unwrap()))
+            .with_len(5);
+        let request = SyscallRequest::from_syscall(typed);
+
+        assert_eq!(request.number(), libc::SYS_write as u64);
+        assert_eq!(request.into_syscall(), typed.into());
+    }
 
     #[test]
     fn syscall_frame_round_trips_through_guest_memory() {

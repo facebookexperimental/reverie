@@ -11,6 +11,10 @@ use thiserror::Error;
 /// Errors produced by the KVM backend prototype.
 #[derive(Debug, Error)]
 pub enum Error {
+    /// A shared Reverie tool callback failed.
+    #[error("Reverie tool failed: {0}")]
+    Reverie(#[source] reverie::Error),
+
     /// A KVM ioctl or vCPU operation failed.
     #[error("KVM operation failed: {0}")]
     Kvm(#[from] kvm_ioctls::Error),

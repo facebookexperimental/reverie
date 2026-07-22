@@ -16,11 +16,15 @@
 
 mod error;
 mod memory;
+mod runtime;
 mod syscall;
 mod vm;
 
 pub use error::Error;
 pub use memory::GuestMemory;
+pub use runtime::KvmStack;
+pub use runtime::KvmStackGuard;
+pub use runtime::SyscallExecutor;
 pub use syscall::SyscallRequest;
 pub use vm::KvmBackend;
 pub use vm::VMCALL_SYSCALL_TRANSPORT;

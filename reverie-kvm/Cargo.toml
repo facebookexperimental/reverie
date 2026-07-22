@@ -10,4 +10,8 @@ license = "BSD-2-Clause"
 kvm-bindings = "0.14.1"
 kvm-ioctls = "0.25.0"
 libc = "0.2.186"
+reverie = { version = "0.1.0", path = "../reverie" }
 thiserror = "2.0.18"
+
+[dev-dependencies]
+futures = { version = "0.3.31", features = ["async-await"] }
