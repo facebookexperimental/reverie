@@ -482,7 +482,7 @@ impl Stopped {
     /// causes all other threads to suddenly exit).
     #[cfg(feature = "notifier")]
     pub fn exit_event(&self) -> notifier::ExitFuture {
-        notifier::ExitFuture(self.0)
+        notifier::ExitFuture::new(self.0)
     }
 
     /// Creates a new stopped state. This is useful when we know the process is
@@ -897,7 +897,7 @@ impl Running {
     /// suddenly exit).
     #[cfg(feature = "notifier")]
     pub fn exit_event(&self) -> notifier::ExitFuture {
-        notifier::ExitFuture(self.0)
+        notifier::ExitFuture::new(self.0)
     }
 
     /// Like `wait`, but wait asynchronously for the next state change.
@@ -908,7 +908,7 @@ impl Running {
     /// over and calls `wait` in a continuous loop.
     #[cfg(feature = "notifier")]
     pub async fn next_state(self) -> Result<Wait, Error> {
-        notifier::WaitFuture(self).await
+        notifier::WaitFuture::new(self).await
     }
 }
 

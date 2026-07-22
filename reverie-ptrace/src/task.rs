@@ -58,7 +58,6 @@ use safeptrace::Running;
 use safeptrace::Stopped;
 use safeptrace::Wait;
 use tokio::sync::Mutex;
-use tokio::sync::Notify;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -225,9 +224,8 @@ pub struct TracedTask<L: Tool> {
     /// The timer tracking this task. Used to trigger RCB-based `timeouts`.
     timer: Timer,
 
-    /// A notifier used to cancel `handle_syscall_event` futures. For example,
-    /// `tail_inject` should never return to the handler.
-    notifier: Arc<Notify>,
+    /// Set when `tail_inject` needs to cancel the current tool handler.
+    cancel_handler: Arc<AtomicBool>,
 
     /// Child processes to wait on. When one of the children exits, it should be
     /// removed from this list.
@@ -374,7 +372,7 @@ impl<L: Tool> TracedTask<L> {
             next_state,
             next_state_rx: Some(next_state_rx),
             timer: Timer::new(tid, tid),
-            notifier: Arc::new(Notify::new()),
+            cancel_handler: Arc::new(AtomicBool::new(false)),
             pending_signal: None,
             child_procs: Arc::new(Mutex::new(Children::new())),
             child_threads: Arc::new(Mutex::new(Children::new())),
@@ -429,7 +427,7 @@ impl<L: Tool> TracedTask<L> {
             next_state,
             next_state_rx: Some(next_state_rx),
             timer: Timer::new(self.pid, child),
-            notifier: Arc::new(Notify::new()),
+            cancel_handler: Arc::new(AtomicBool::new(false)),
             pending_signal: None,
             child_procs: self.child_procs.clone(),
             child_threads: self.child_threads.clone(),
@@ -481,7 +479,7 @@ impl<L: Tool> TracedTask<L> {
             next_state,
             next_state_rx: Some(next_state_rx),
             timer: Timer::new(child, child),
-            notifier: Arc::new(Notify::new()),
+            cancel_handler: Arc::new(AtomicBool::new(false)),
             pending_signal: None,
             child_procs: Arc::new(Mutex::new(Children::new())),
             child_threads: Arc::new(Mutex::new(Children::new())),
@@ -549,14 +547,24 @@ async fn handle_internal_error(err: Error) -> Result<ExitStatus, reverie::Error>
 }
 
 /// Helper for canceling handlers.
-async fn cancellable<F>(notifier: Arc<Notify>, f: F) -> Option<F::Output>
+async fn cancellable<F>(cancel_handler: Arc<AtomicBool>, f: F) -> Option<F::Output>
 where
     F: Future,
 {
-    futures::select! {
-        () = notifier.notified().fuse() => None,
-        result = f.fuse() => Some(result),
-    }
+    futures::pin_mut!(f);
+    future::poll_fn(|cx| {
+        let result = f.as_mut().poll(cx);
+
+        // `tail_inject` sets this while polling `f`, then remains pending. We
+        // can cancel the handler in the same poll instead of waking the Tokio
+        // task solely to make this future observe its own notification.
+        if cancel_handler.swap(false, Ordering::SeqCst) {
+            Poll::Ready(None)
+        } else {
+            result.map(Some)
+        }
+    })
+    .await
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1084,7 +1092,7 @@ impl<L: Tool + 'static> TracedTask<L> {
 
         self.pending_syscall = Some((nr, args));
 
-        let retval = cancellable(self.notifier.clone(), async {
+        let retval = cancellable(self.cancel_handler.clone(), async {
             self.process_state
                 .clone()
                 .handle_syscall_event(self, syscall)
@@ -1405,7 +1413,7 @@ impl<L: Tool + 'static> TracedTask<L> {
     async fn run_loop_internal(&mut self, task: Stopped) -> Result<ExitStatus, Error> {
         // This is the beginning of the life of the guest. Allow the tool to
         // inject syscalls as soon as the thread starts.
-        if let Some(Err(err)) = cancellable(self.notifier.clone(), async {
+        if let Some(Err(err)) = cancellable(self.cancel_handler.clone(), async {
             self.process_state.clone().handle_thread_start(self).await
         })
         .await
@@ -1703,7 +1711,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         match self.inner_tail_inject(nr, args).await {
             Ok(_) => {
                 // Drop the handle_syscall_event future.
-                self.notifier.notify_one();
+                self.cancel_handler.store(true, Ordering::SeqCst);
                 future::pending().await
             }
             Err(err) => self.abort(Err(err)).await,
@@ -2274,5 +2282,36 @@ impl<'a, G: GlobalTool> GlobalRPC<G> for WrappedFrom<'a, G> {
     }
     fn config(&self) -> &G::Config {
         &self.1.cfg
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancellable_returns_a_completed_result() {
+        let cancel_handler = Arc::new(AtomicBool::new(false));
+
+        assert_eq!(
+            futures::executor::block_on(cancellable(cancel_handler, async { 42 })),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn cancellable_observes_cancellation_in_the_same_poll() {
+        let cancel_handler = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&cancel_handler);
+        let pending = future::poll_fn(move |_| {
+            signal.store(true, Ordering::SeqCst);
+            Poll::<()>::Pending
+        });
+
+        assert_eq!(
+            futures::executor::block_on(cancellable(Arc::clone(&cancel_handler), pending)),
+            None
+        );
+        assert!(!cancel_handler.load(Ordering::SeqCst));
     }
 }

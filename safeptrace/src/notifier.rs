@@ -58,9 +58,9 @@
 //! loop on an individual thread/process ID. The nice thing about this is that we
 //! can receive `PTRACE_EVENT_EXIT` events "out-of-band" and use that to cancel
 //! any futures that may be pending in a tool's `handle_syscall_event`. This
-//! approach also avoids the overhead of `tokio::task::spawn_blocking` by not
-//! locking a `Mutex` each time an event is received. (An `AtomicI32` plus an
-//! `AtomicWaker` can be used instead.) The downside of this approach is that we
+//! approach also avoids the overhead of shuffling events through Tokio's
+//! blocking thread pool. (An `AtomicI32` plus a small persistent waker slot can
+//! be used instead.) The downside of this approach is that we
 //! can end up spawning a lot of guest threads.
 
 use std::collections::HashMap;
@@ -70,14 +70,15 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::AtomicI32;
+use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
+use std::task::RawWakerVTable;
 use std::task::Waker;
 use std::thread;
 use std::thread::JoinHandle;
 
-use futures::task::AtomicWaker;
 use nix::sys::wait::WaitPidFlag;
 use nix::sys::wait::WaitStatus;
 use parking_lot::Mutex;
@@ -98,13 +99,57 @@ const INVALID_STATUS: i32 = -1;
 /// The number we get when in a PTRACE_EVENT_EXIT stop.
 const PTRACE_EVENT_EXIT_STOP: i32 = (libc::PTRACE_EVENT_EXIT << 16) | (libc::SIGTRAP << 8) | 0x7f;
 
+#[derive(Debug, Default)]
+struct WakerSlot {
+    waker: Mutex<Option<Waker>>,
+    data: AtomicPtr<()>,
+    vtable: AtomicPtr<RawWakerVTable>,
+}
+
+impl WakerSlot {
+    /// Keeps one task registered across all status events for a PID.
+    fn register(&self, waker: &Waker) -> bool {
+        let data = waker.data().cast_mut();
+        let vtable = std::ptr::from_ref(waker.vtable()).cast_mut();
+        // The stored waker keeps its data identity live, so this pair cannot
+        // be reused for a different task while it remains in the slot.
+
+        if self.data.load(Ordering::Acquire) == data
+            && self.vtable.load(Ordering::Relaxed) == vtable
+        {
+            return false;
+        }
+
+        let mut slot = self.waker.lock();
+        if slot
+            .as_ref()
+            .is_some_and(|registered| registered.will_wake(waker))
+        {
+            return false;
+        }
+
+        *slot = Some(waker.clone());
+        self.vtable.store(vtable, Ordering::Relaxed);
+        // Publish data last so an Acquire match also observes the vtable.
+        self.data.store(data, Ordering::Release);
+        true
+    }
+
+    fn wake(&self) {
+        let waker = self.waker.lock().as_ref().cloned();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Event {
     /// Waker for exit events.
-    exit_waker: AtomicWaker,
+    exit_waker: WakerSlot,
 
     /// Waker for regular status events.
-    status_waker: AtomicWaker,
+    status_waker: WakerSlot,
 
     /// The raw status. A status of `-1` indicates that no status has been set
     /// yet.
@@ -114,22 +159,10 @@ struct Event {
 impl Event {
     pub fn new() -> Self {
         Self {
-            exit_waker: AtomicWaker::new(),
-            status_waker: AtomicWaker::new(),
+            exit_waker: WakerSlot::default(),
+            status_waker: WakerSlot::default(),
             status: AtomicI32::new(INVALID_STATUS),
         }
-    }
-
-    pub fn from_exit_waker(waker: &Waker) -> Self {
-        let me = Self::new();
-        me.exit_waker.register(waker);
-        me
-    }
-
-    pub fn from_status_waker(waker: &Waker) -> Self {
-        let me = Self::new();
-        me.status_waker.register(waker);
-        me
     }
 
     /// Replaces the status and notifies the notifier of the change. Returns the
@@ -260,51 +293,30 @@ impl Notifier {
         Notifier { pids }
     }
 
-    /// Polls for a state change on the given PID.
-    pub fn poll_status(&self, pid: Pid, cx: &mut Context) -> Poll<Result<Wait, Error>> {
+    /// Gets the event state for a PID, creating its notifier thread if needed.
+    fn event(&self, pid: Pid) -> Arc<Event> {
         // Check if there is a worker thread associated with this PID and create
         // one if there isn't.
         let mut pids = self.pids.lock();
         match pids.entry(pid) {
-            Entry::Occupied(mut occupied) => {
-                let status = futures::ready!(occupied.get_mut().poll_status(cx.waker()));
-
-                // This should be the last event. We need to remove the PID from
-                // the map so the thread can be spawned again if the PID is ever
-                // reused.
-                if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
-                    occupied.remove();
-                }
-
-                Poll::Ready(Wait::from_raw(pid, status))
-            }
+            Entry::Occupied(occupied) => Arc::clone(occupied.get()),
             Entry::Vacant(vacant) => {
-                // No thread exists for this yet. Create it.
-                // TODO: A potential optimization here is that we could call
-                // `try_wait` instead of spawning a new thread.
-                let event = Arc::new(Event::from_status_waker(cx.waker()));
+                let event = Arc::new(Event::new());
                 vacant.insert(event.clone());
-                spawn_worker(pid, event);
-                Poll::Pending
+                spawn_worker(pid, Arc::clone(&event));
+                event
             }
         }
     }
 
-    /// Polls for an exit event on the given PID.
-    pub fn poll_exit(&self, pid: Pid, cx: &mut Context) -> Poll<Stopped> {
+    /// Removes a completed PID without disturbing a reused PID's event.
+    fn remove(&self, pid: Pid, event: &Arc<Event>) {
         let mut pids = self.pids.lock();
-        match pids.entry(pid) {
-            Entry::Occupied(mut occupied) => {
-                futures::ready!(occupied.get_mut().poll_exit(cx.waker()));
-                Poll::Ready(Stopped::new_unchecked(pid))
-            }
-            Entry::Vacant(vacant) => {
-                // No thread exists for this yet. Create it.
-                let event = Arc::new(Event::from_exit_waker(cx.waker()));
-                vacant.insert(event.clone());
-                spawn_worker(pid, event);
-                Poll::Pending
-            }
+        if pids
+            .get(&pid)
+            .is_some_and(|current| Arc::ptr_eq(current, event))
+        {
+            pids.remove(&pid);
         }
     }
 }
@@ -323,13 +335,36 @@ impl Drop for Notifier {
 }
 
 /// A future representing a process state change.
-pub struct WaitFuture(pub(super) Running);
+pub struct WaitFuture {
+    running: Running,
+    event: Option<Arc<Event>>,
+}
+
+impl WaitFuture {
+    pub(super) fn new(running: Running) -> Self {
+        Self {
+            running,
+            event: None,
+        }
+    }
+}
 
 impl Future for WaitFuture {
     type Output = Result<Wait, Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        NOTIFIER.poll_status(self.0.pid(), cx)
+        let this = self.get_mut();
+        let pid = this.running.pid();
+        let event = this.event.get_or_insert_with(|| NOTIFIER.event(pid));
+        let status = futures::ready!(event.poll_status(cx.waker()));
+
+        // This should be the last event. Remove the PID so a future reuse can
+        // create a fresh notifier thread.
+        if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+            NOTIFIER.remove(pid, event);
+        }
+
+        Poll::Ready(Wait::from_raw(pid, status))
     }
 }
 
@@ -338,23 +373,81 @@ impl Future for WaitFuture {
 /// even when in another ptrace stop state.
 ///
 /// The next state after this should be the final exit status.
-pub struct ExitFuture(pub(super) Pid);
+pub struct ExitFuture {
+    pid: Pid,
+    event: Option<Arc<Event>>,
+}
+
+impl ExitFuture {
+    pub(super) fn new(pid: Pid) -> Self {
+        Self { pid, event: None }
+    }
+}
 
 impl Future for ExitFuture {
     type Output = Stopped;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        NOTIFIER.poll_exit(self.0, cx)
+        let this = self.get_mut();
+        let event = this.event.get_or_insert_with(|| NOTIFIER.event(this.pid));
+        futures::ready!(event.poll_exit(cx.waker()));
+        Poll::Ready(Stopped::new_unchecked(this.pid))
     }
 }
 
 #[cfg(test)]
 mod test {
+    use std::sync::atomic::AtomicUsize;
+    use std::task::Wake;
+
     use nix::sys::signal::Signal;
     use nix::sys::wait::WaitStatus;
     use nix::unistd::Pid;
 
     use super::*;
+
+    #[derive(Default)]
+    struct WakeCounter(AtomicUsize);
+
+    impl Wake for WakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn registration_is_reused_across_status_events() {
+        let counter = Arc::new(WakeCounter::default());
+        let waker = Waker::from(Arc::clone(&counter));
+        let event = Event::new();
+
+        assert_eq!(event.poll_status(&waker), Poll::Pending);
+        assert_eq!(event.poll_status(&waker), Poll::Pending);
+
+        let stopped = (libc::SIGSTOP << 8) | 0x7f;
+        assert_eq!(event.update(stopped), None);
+        assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+        assert_eq!(event.poll_status(&waker), Poll::Ready(stopped));
+        assert!(!event.status_waker.register(&waker));
+    }
+
+    #[test]
+    fn registration_updates_when_the_executor_changes_wakers() {
+        let slot = WakerSlot::default();
+        let first = Waker::from(Arc::new(WakeCounter::default()));
+        let second_counter = Arc::new(WakeCounter::default());
+        let second = Waker::from(Arc::clone(&second_counter));
+
+        assert!(slot.register(&first));
+        assert!(!slot.register(&first));
+        assert!(slot.register(&second));
+        slot.wake();
+        assert_eq!(second_counter.0.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn exit_event_code() {
