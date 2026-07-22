@@ -168,8 +168,7 @@ impl MemoryAccess for Stopped {
         if size == 0 {
             return Ok(0);
         } else if size == mem::size_of::<u64>() {
-            #[allow(clippy::cast_ptr_alignment)]
-            let value = unsafe { *(buf.as_ptr() as *const u64) };
+            let value = u64::from_ne_bytes(buf.try_into().unwrap());
             self.write_u64(addr.cast::<u64>(), value)?;
             return Ok(size);
         }
@@ -299,6 +298,29 @@ mod test {
                 }
             },
         )
+    }
+
+    #[test]
+    fn remote_write_exact_accepts_unaligned_eight_byte_source() {
+        #[repr(align(8))]
+        struct Aligned([u8; 9]);
+
+        assert!(fork_helper(
+            vec![0; 8],
+            move |child, mut remote_buf| {
+                let source = Aligned([0, 1, 2, 3, 4, 5, 6, 7, 8]);
+                let source = &source.0[1..];
+                assert_ne!(source.as_ptr() as usize % mem::align_of::<u64>(), 0);
+
+                let mut memory = Stopped::new_unchecked(child);
+                let addr = AddrMut::from_ptr(remote_buf.as_ptr()).unwrap();
+                memory.write_exact(addr, source).unwrap();
+                memory.read_exact(addr, &mut remote_buf).unwrap();
+
+                remote_buf == source
+            },
+            |_| {},
+        ));
     }
 
     #[test]
