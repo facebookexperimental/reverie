@@ -86,11 +86,21 @@ static const cpuid_result_t extended_cpuid[] = {
   (BIT32(1) | BIT32(6) | BIT32(11) | BIT32(12) | BIT32(14))
 #define LEAF7_EDX_AVX512 (BIT32(2) | BIT32(3) | BIT32(8) | BIT32(23))
 
+// Emits a pre-formatted line of tool output through DynamoRIO's own I/O. The
+// simple observation tools (syscall histogram, strace) call back through this
+// rather than writing to fd 2 directly: the guest can close its stderr before
+// exit, and app-level writes re-enter the syscall interception path.
+typedef void (*reverie_emit_fn_t)(const char *buf, size_t len);
+static void reverie_dbi_emit(const char *buf, size_t len) {
+  dr_write_file(STDERR, buf, len);
+}
+
 extern void reverie_dbi_runtime_thread_init(prototype_counters_t *counters);
 extern int32_t reverie_dbi_runtime_pre_syscall(
     void *context, prototype_counters_t *counters, int32_t tid, int32_t pid,
     int64_t sysnum, const uint64_t *args, uint64_t branches, int64_t *result,
-    syscall_invoker_t invoke_syscall, register_reader_t read_registers);
+    syscall_invoker_t invoke_syscall, register_reader_t read_registers,
+    reverie_emit_fn_t emit);
 extern void reverie_dbi_runtime_totals(uint64_t *branches, uint64_t *syscalls,
                                        uint64_t *rewritten);
 
@@ -620,7 +630,7 @@ static bool pre_syscall(void *drcontext, int sysnum) {
           drcontext, counters, (int32_t)dr_get_thread_id(drcontext),
           (int32_t)dr_get_process_id(), (int64_t)sysnum, args,
           atomic_load_explicit(&branch_count, memory_order_relaxed), &result,
-          invoke_syscall, read_registers)) {
+          invoke_syscall, read_registers, reverie_dbi_emit)) {
     dr_syscall_set_result(drcontext, (reg_t)result);
     return false;
   }

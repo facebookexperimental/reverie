@@ -17,6 +17,7 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 mod launcher;
+mod tools;
 
 use std::collections::HashSet;
 use std::ffi::c_void;
@@ -85,7 +86,7 @@ where
     T: Tool,
 {
     #[allow(clippy::too_many_arguments)]
-    fn new(
+    pub(crate) fn new(
         context: usize,
         tid: Pid,
         pid: Pid,
@@ -135,7 +136,7 @@ where
     T: Tool,
 {
     type Memory = LocalMemory;
-    type Stack = UnsupportedStack;
+    type Stack = DbiStack;
 
     fn tid(&self) -> Pid {
         self.tid
@@ -146,6 +147,13 @@ where
     }
 
     fn ppid(&self) -> Option<Pid> {
+        // The DynamoRIO backend currently instruments a single process, whose
+        // main thread is the root of the traced tree, so `None` is correct for
+        // it (see `is_root_process`). Reporting a real in-tree parent for
+        // forked children requires the native client to track the process tree
+        // across `clone`/`fork`, which it does not yet surface.
+        // TODO-STUB(#31): track the process tree so children report their
+        // in-tree parent instead of always `None`.
         self.ppid
     }
 
@@ -169,7 +177,7 @@ where
     }
 
     async fn stack(&mut self) -> Self::Stack {
-        UnsupportedStack
+        DbiStack::new()
     }
 
     async fn daemonize(&mut self) {}
@@ -189,55 +197,148 @@ where
         Errno::from_ret(result as usize).map(|value| value as i64)
     }
 
-    async fn tail_inject<S: SyscallInfo>(&mut self, _syscall: S) -> Never {
-        panic!("tail injection is not implemented by the DynamoRIO prototype")
+    async fn tail_inject<S: SyscallInfo>(&mut self, syscall: S) -> Never {
+        // Perform the syscall in-process now, record its result, then suspend
+        // forever. The driver polls each handler exactly once; on `Poll::Pending`
+        // it installs the recorded result and drops this future. This mirrors the
+        // ptrace backend, which tail-injects by cancelling the handler and
+        // awaiting `future::pending()`.
+        //
+        // We must NOT diverge by panicking: unwinding a panic out of a handler
+        // aborts the process under the DynamoRIO client (its callback runs on a
+        // C frame the Rust unwinder cannot cross, so `catch_unwind` in the driver
+        // does not contain it). Suspend-and-drop avoids unwinding entirely.
+        let value = match self.inject(syscall).await {
+            Ok(value) => value,
+            Err(errno) => -(errno.into_raw() as i64),
+        };
+        TAIL_INJECT_RESULT.with(|slot| slot.set(Some(value)));
+        std::future::pending().await
     }
 
     fn set_timer(&mut self, _sched: TimerSchedule) -> Result<(), Error> {
+        // A working timer needs a retired-conditional-branch threshold trap
+        // installed in the native DynamoRIO client; the branch counter is
+        // currently only sampled at syscall boundaries, never armed.
+        // TODO-STUB(#31): arm an RCB threshold in the native client and
+        // dispatch `Tool::handle_timer_event`.
         Err(Errno::ENOSYS.into())
     }
 
     fn set_timer_precise(&mut self, _sched: TimerSchedule) -> Result<(), Error> {
+        // Precise timers additionally require single-stepping to the exact
+        // instruction, which the native client does not implement.
+        // TODO-STUB(#31): add RCB + single-step delivery in the native client.
         Err(Errno::ENOSYS.into())
     }
 
     fn read_clock(&mut self) -> Result<u64, Error> {
+        // Coarse: this is the retired-conditional-branch count sampled by the
+        // native client at the most recent syscall entry, not a continuously
+        // updated clock. Adequate for ordering at syscall boundaries only.
+        // TODO-STUB(#31): expose a continuously updated RCB read from the
+        // native client for sub-syscall resolution.
         Ok(self.branch_count)
     }
 }
 
-/// Placeholder stack implementation for the initial backend prototype.
-pub struct UnsupportedStack;
+/// Capacity, in bytes, of the in-process scratch arena handed out by
+/// [`DbiGuest::stack`]. The ptrace backend uses a comparably small window on
+/// the tracee's real stack; a page is generous for argument marshalling.
+const DBI_STACK_CAPACITY: usize = 4096;
 
-/// Guard returned by [`UnsupportedStack`].
-pub struct UnsupportedStackGuard;
+/// In-process guest scratch stack for the DynamoRIO backend.
+///
+/// The ptrace backend's `GuestStack` allocates on the tracee's real stack and
+/// defers writes until `commit`, because the tracer lives in a different
+/// address space. The DynamoRIO backend instead shares the guest's address
+/// space, so allocations are written immediately into a heap-backed arena and
+/// their addresses are valid for injected syscalls as soon as they are made.
+/// `commit` transfers ownership of the arena to the returned guard, which keeps
+/// the memory alive until it is dropped (mirroring how a `StackGuard` bounds the
+/// lifetime of the allocations).
+pub struct DbiStack {
+    arena: Box<[u8]>,
+    offset: usize,
+}
 
-impl Drop for UnsupportedStackGuard {
+impl DbiStack {
+    fn new() -> Self {
+        Self {
+            arena: vec![0u8; DBI_STACK_CAPACITY].into_boxed_slice(),
+            offset: 0,
+        }
+    }
+
+    fn allocate<'stack, T>(&mut self, value: T) -> AddrMut<'stack, T> {
+        let size = core::mem::size_of::<T>();
+        let align = core::mem::align_of::<T>();
+        let base = self.arena.as_ptr() as usize;
+        // Align the absolute address (not just the offset) so `T` reads/writes
+        // are always aligned regardless of the arena's base alignment.
+        let start = align_up(base + self.offset, align) - base;
+        let end = start + size;
+        assert!(
+            end <= self.arena.len(),
+            "DBI guest stack overflow: need {end} bytes, capacity {}",
+            self.arena.len()
+        );
+        // In-process: write directly. The pointer is stable across the later
+        // move of `arena` into the guard, so the returned address stays valid.
+        let ptr = unsafe { self.arena.as_mut_ptr().add(start) } as *mut T;
+        unsafe { ptr.write(value) };
+        self.offset = end;
+        AddrMut::from_raw(ptr as usize).expect("DBI guest stack produced a null scratch pointer")
+    }
+}
+
+/// Guard that keeps a committed [`DbiStack`] arena alive. Dropping it releases
+/// the scratch memory, at which point any addresses handed out become invalid.
+pub struct DbiStackGuard {
+    _arena: Box<[u8]>,
+}
+
+impl Drop for DbiStackGuard {
     fn drop(&mut self) {}
 }
 
-impl Stack for UnsupportedStack {
-    type StackGuard = UnsupportedStackGuard;
+impl Stack for DbiStack {
+    type StackGuard = DbiStackGuard;
 
     fn size(&self) -> usize {
-        0
+        self.offset
     }
 
     fn capacity(&self) -> usize {
-        0
+        self.arena.len()
     }
 
-    fn push<'stack, T>(&mut self, _value: T) -> Addr<'stack, T> {
-        panic!("guest stack allocation is not implemented by the DynamoRIO prototype")
+    fn push<'stack, T>(&mut self, value: T) -> Addr<'stack, T> {
+        self.allocate(value).into()
     }
 
     fn reserve<'stack, T>(&mut self) -> AddrMut<'stack, T> {
-        panic!("guest stack allocation is not implemented by the DynamoRIO prototype")
+        let value: T = unsafe { core::mem::MaybeUninit::zeroed().assume_init() };
+        self.allocate(value)
     }
 
     fn commit(self) -> Result<Self::StackGuard, Errno> {
-        Err(Errno::ENOSYS)
+        Ok(DbiStackGuard { _arena: self.arena })
     }
+}
+
+/// Rounds `value` up to the next multiple of `align` (a power of two).
+fn align_up(value: usize, align: usize) -> usize {
+    debug_assert!(align.is_power_of_two());
+    (value + align - 1) & !(align - 1)
+}
+
+thread_local! {
+    /// Result recorded by [`Guest::tail_inject`] on this thread before it
+    /// suspends. The driver takes it when a handler poll returns `Poll::Pending`
+    /// and installs it as the syscall's result. See [`Guest::tail_inject`].
+    static TAIL_INJECT_RESULT: std::cell::Cell<Option<i64>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Per-thread state used by the prototype tool.
@@ -645,13 +746,20 @@ fn rewrite_bind_port<G: Guest<PrototypeTool>>(
     Ok(())
 }
 
-fn run_ready<F: Future>(future: F) -> F::Output {
+/// Polls a handler future exactly once. Returns `Some` if it resolved
+/// immediately (the common case: `inject`/`memory`/`regs` are synchronous), or
+/// `None` if it suspended. The only expected suspension is [`Guest::tail_inject`],
+/// which records its result in [`TAIL_INJECT_RESULT`] before suspending; the
+/// driver handles `None` by installing that result and dropping the future. We
+/// return `None` rather than panicking because a panic aborts under the
+/// DynamoRIO client (see [`Guest::tail_inject`]).
+fn run_ready<F: Future>(future: F) -> Option<F::Output> {
     let mut future = pin!(future);
     let waker = Waker::noop();
     let mut context = Context::from_waker(waker);
     match future.as_mut().poll(&mut context) {
-        Poll::Ready(value) => value,
-        Poll::Pending => panic!("the prototype tool handler must not suspend"),
+        Poll::Ready(value) => Some(value),
+        Poll::Pending => None,
     }
 }
 
@@ -694,19 +802,45 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     result: *mut i64,
     invoke_syscall: SyscallInvoker,
     read_registers: RegisterReader,
+    emit: tools::Emitter,
 ) -> i32 {
+    // NB: `catch_unwind` cannot actually contain a panic here — unwinding out of
+    // a handler aborts under the DynamoRIO client (see `Guest::tail_inject`). It
+    // is retained only so the same code path is exercised off-DR (unit tests).
+    // Handlers therefore must not panic; divergence (tail_inject) suspends
+    // instead, which this driver handles explicitly below.
     let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let counters = unsafe { &mut *counters };
         counters.branches = branches;
         counters.observed_syscalls += 1;
         TOTAL_BRANCHES.store(branches, Ordering::Relaxed);
         TOTAL_SYSCALLS.fetch_add(1, Ordering::Relaxed);
+        tools::set_emitter(emit);
+
+        let raw_args = unsafe { std::slice::from_raw_parts(args, 6) };
+
+        // If an env-selected observation tool (syscall counter / strace) is
+        // active, it handles every syscall via the standard `Tool` trait and
+        // supersedes the built-in determinism policy.
+        if let Some(value) = tools::run_active_tool(
+            context as usize,
+            tid,
+            pid,
+            sysnum,
+            raw_args,
+            branches,
+            invoke_syscall,
+            read_registers,
+        ) {
+            unsafe { result.write(value) };
+            TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
 
         if !should_rewrite_syscall(sysnum) {
             return false;
         }
 
-        let raw_args = unsafe { std::slice::from_raw_parts(args, 6) };
         let syscall = Syscall::from_raw(
             Sysno::from(sysnum as i32),
             SyscallArgs::new(
@@ -730,10 +864,23 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
             invoke_syscall,
             read_registers,
         );
+        // Clear any stale tail-inject result before polling; `tail_inject`
+        // records a fresh one just before it suspends.
+        TAIL_INJECT_RESULT.with(|slot| slot.set(None));
         let value = match run_ready(PROTOTYPE_TOOL.handle_syscall_event(&mut guest, syscall)) {
-            Ok(value) => value,
-            Err(Error::Errno(errno)) => -(errno.into_raw() as i64),
-            Err(_) => -(Errno::EIO.into_raw() as i64),
+            Some(Ok(value)) => value,
+            Some(Err(Error::Errno(errno))) => -(errno.into_raw() as i64),
+            Some(Err(_)) => -(Errno::EIO.into_raw() as i64),
+            None => match TAIL_INJECT_RESULT.with(|slot| slot.take()) {
+                // The handler suspended after `tail_inject`: install its result
+                // and let the suspended future drop when this scope ends.
+                Some(value) => value,
+                // Unexpected suspension (a tool awaited something other than
+                // `tail_inject`). The single-poll driver cannot resume it, so
+                // leave the syscall unchanged rather than installing a bogus
+                // result.
+                None => return false,
+            },
         };
         unsafe { result.write(value) };
         TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
@@ -742,6 +889,8 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
 
     match handled {
         Ok(true) => 1,
+        // `catch_unwind` cannot actually catch under DR; a genuine panic aborts
+        // before reaching here. `Ok(false)` means "leave the syscall unchanged".
         Ok(false) | Err(_) => 0,
     }
 }
@@ -762,6 +911,9 @@ pub unsafe extern "C" fn reverie_dbi_runtime_totals(
         syscalls.write(TOTAL_SYSCALLS.load(Ordering::Relaxed));
         rewritten.write(TOTAL_REWRITTEN.load(Ordering::Relaxed));
     }
+    // NB: the syscall-counter tool prints its histogram from the guest's own
+    // exit_group syscall (see `tools`), not here — this callback runs on the
+    // DynamoRIO client's tiny stack, which overflows while formatting.
 }
 
 #[cfg(test)]
@@ -804,12 +956,14 @@ mod tests {
         );
 
         assert_eq!(
-            run_ready(PROTOTYPE_TOOL.handle_syscall_event(&mut guest, syscall)).unwrap(),
+            run_ready(PROTOTYPE_TOOL.handle_syscall_event(&mut guest, syscall))
+                .unwrap()
+                .unwrap(),
             7
         );
         assert_eq!(guest.thread_state().rewritten_syscalls, 1);
         assert_eq!(guest.read_clock().unwrap(), 99);
-        assert_eq!(run_ready(guest.regs()).rip, 0x1234);
+        assert_eq!(run_ready(guest.regs()).unwrap().rip, 0x1234);
     }
 
     #[test]
@@ -834,7 +988,9 @@ mod tests {
         );
 
         assert_eq!(
-            run_ready(PROTOTYPE_TOOL.handle_syscall_event(&mut guest, syscall)).unwrap(),
+            run_ready(PROTOTYPE_TOOL.handle_syscall_event(&mut guest, syscall))
+                .unwrap()
+                .unwrap(),
             0
         );
         let field = |bytes: &[libc::c_char]| {
@@ -946,6 +1102,70 @@ mod tests {
             assert!(should_rewrite_syscall(syscall));
         }
         assert!(!should_rewrite_syscall(libc::SYS_prlimit64));
+    }
+
+    #[test]
+    fn dbi_stack_allocations_are_valid_in_process_and_aligned() {
+        let mut stack = DbiStack::new();
+        assert_eq!(stack.size(), 0);
+        assert_eq!(stack.capacity(), DBI_STACK_CAPACITY);
+
+        // A one-byte allocation followed by a u64 must not misalign the u64.
+        let flag = stack.push(0x99u8);
+        let word = stack.push(0x1122_3344_5566_7788u64);
+        assert_eq!(word.as_raw() % core::mem::align_of::<u64>(), 0);
+
+        // `reserve` hands out zeroed, writable scratch.
+        let slot = stack.reserve::<u32>();
+        assert_eq!(unsafe { (slot.as_raw() as *const u32).read() }, 0);
+        unsafe { (slot.as_raw() as *mut u32).write(0xdead_beef) };
+
+        assert!(stack.size() >= 1 + 8 + 4);
+
+        // Addresses stay valid after `commit` moves the arena into the guard.
+        let guard = stack.commit().unwrap();
+        unsafe {
+            assert_eq!((flag.as_raw() as *const u8).read(), 0x99);
+            assert_eq!((word.as_raw() as *const u64).read(), 0x1122_3344_5566_7788);
+            assert_eq!((slot.as_raw() as *const u32).read(), 0xdead_beef);
+        }
+        drop(guard);
+    }
+
+    #[test]
+    fn tail_inject_records_result_and_suspends() {
+        TAIL_INJECT_RESULT.with(|slot| slot.set(None));
+
+        let mut counters = PrototypeCounters::default();
+        let syscall = Syscall::from_raw(Sysno::write, SyscallArgs::new(1, 0x1000, 7, 0, 0, 0));
+        let mut guest: DbiGuest<'_, PrototypeTool> = DbiGuest::new(
+            0,
+            Pid::from_raw(10),
+            Pid::from_raw(10),
+            None,
+            0,
+            &mut counters,
+            &GLOBAL_STATE,
+            &CONFIG,
+            invoke,
+            read_regs,
+        );
+
+        // `tail_inject` performs the syscall, records its result, then suspends
+        // forever, so a single poll returns `Poll::Pending` (`None` here).
+        let polled = run_ready(guest.tail_inject(syscall));
+        assert!(polled.is_none(), "tail_inject must suspend, not resolve");
+        // The injected `write` returns its length argument (see `invoke`).
+        assert_eq!(TAIL_INJECT_RESULT.with(|slot| slot.take()), Some(7));
+    }
+
+    #[test]
+    fn align_up_rounds_to_power_of_two() {
+        assert_eq!(align_up(0, 8), 0);
+        assert_eq!(align_up(1, 8), 8);
+        assert_eq!(align_up(8, 8), 8);
+        assert_eq!(align_up(9, 8), 16);
+        assert_eq!(align_up(13, 1), 13);
     }
 
     #[test]
