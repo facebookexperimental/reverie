@@ -81,6 +81,25 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     /// Returns the current register values of the guest thread.
     async fn regs(&mut self) -> libc::user_regs_struct;
 
+    /// Overwrites the register values of the guest thread. This is the write
+    /// counterpart to [`Guest::regs`].
+    ///
+    /// This is a generic, determinism-agnostic mechanism: it lets a tool control
+    /// the guest's register file at a stop, and the tool decides what values to
+    /// write. For example, a determinism tool can use it to canonicalize
+    /// registers that the syscall instruction clobbers (`%rcx`/`%r11` on
+    /// x86-64) so that even a misbehaving guest observes deterministic state.
+    ///
+    /// Preconditions: the guest is in a stopped state and Reverie is currently
+    /// running a handler on that guest thread's behalf.
+    ///
+    /// The default implementation returns [`Errno::ENOSYS`] for backends that
+    /// cannot write guest registers.
+    async fn set_regs(&mut self, regs: libc::user_regs_struct) -> Result<(), Error> {
+        let _ = regs;
+        Err(Errno::ENOSYS.into())
+    }
+
     /// Returns the current stack pointer with this guest thread.
     async fn stack(&mut self) -> Self::Stack;
 
@@ -348,6 +367,10 @@ where
 
     async fn regs(&mut self) -> libc::user_regs_struct {
         self.inner.regs().await
+    }
+
+    async fn set_regs(&mut self, regs: libc::user_regs_struct) -> Result<(), Error> {
+        self.inner.set_regs(regs).await
     }
 
     async fn stack(&mut self) -> Self::Stack {

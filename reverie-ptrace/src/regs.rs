@@ -84,6 +84,21 @@ pub trait RegAccess {
 
     /// Mutable access to the appropriate registers for the syscall arguments.
     fn set_args(&mut self, args: ArgRegs);
+
+    /// Restore the registers that the syscall instruction architecturally
+    /// clobbers (and that the kernel does not otherwise restore) by copying them
+    /// from `saved`, a snapshot taken before the syscall executed.
+    ///
+    /// On x86-64 the `syscall` instruction clobbers `%rcx` (which holds the
+    /// return instruction pointer) and `%r11` (which holds the saved `RFLAGS`).
+    /// When Reverie injects a syscall from its private trampoline page, these
+    /// end up holding the trampoline's `RIP`/`RFLAGS`; restoring them from the
+    /// guest's own pre-syscall snapshot keeps the injection transparent and
+    /// prevents a tracer-internal address from leaking into the guest.
+    ///
+    /// On aarch64 the `svc` instruction has no equivalent clobber, so this is a
+    /// no-op.
+    fn restore_syscall_clobbers(&mut self, saved: &Self);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -149,6 +164,12 @@ impl RegAccess for libc::user_regs_struct {
         self.r10 = args.3;
         self.r8 = args.4;
         self.r9 = args.5;
+    }
+
+    fn restore_syscall_clobbers(&mut self, saved: &Self) {
+        // The `syscall` instruction clobbers %rcx (return RIP) and %r11 (RFLAGS).
+        self.rcx = saved.rcx;
+        self.r11 = saved.r11;
     }
 }
 
@@ -223,6 +244,10 @@ impl RegAccess for libc::user_regs_struct {
         self.regs[4] = args.4;
         self.regs[5] = args.5;
     }
+
+    fn restore_syscall_clobbers(&mut self, _saved: &Self) {
+        // The aarch64 `svc` instruction has no rcx/r11-style clobber to restore.
+    }
 }
 
 #[cfg(test)]
@@ -240,5 +265,27 @@ mod tests {
         *regs.ip_mut() = 42;
 
         assert_eq!(regs.ip(), 42);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn restore_syscall_clobbers_copies_rcx_r11() {
+        // `current` simulates registers just after an injected trampoline
+        // syscall: %rcx/%r11 hold the trampoline's RIP/RFLAGS.
+        let mut current = unsafe { MaybeUninit::<libc::user_regs_struct>::zeroed().assume_init() };
+        current.rcx = 0xdead_beef; // e.g. a tracer-internal trampoline address
+        current.r11 = 0x0202;
+        current.rax = 0x1234; // an unrelated register must be left untouched
+
+        // `saved` is the guest's own pre-syscall snapshot.
+        let mut saved = unsafe { MaybeUninit::<libc::user_regs_struct>::zeroed().assume_init() };
+        saved.rcx = 0x4000_1000; // guest's own return RIP
+        saved.r11 = 0x0246; // guest's own RFLAGS
+
+        current.restore_syscall_clobbers(&saved);
+
+        assert_eq!(current.rcx, 0x4000_1000, "rcx must be restored from guest");
+        assert_eq!(current.r11, 0x0246, "r11 must be restored from guest");
+        assert_eq!(current.rax, 0x1234, "other registers must be untouched");
     }
 }

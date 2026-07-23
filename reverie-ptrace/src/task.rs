@@ -644,9 +644,15 @@ fn restore_context(
     // clone, which accepts different arguments.
     *regs.orig_syscall_mut() = context.orig_syscall();
 
-    // NB: syscall also clobbers %rcx/%r11, but we're not required to restore
-    // them, because the syscall is finished and they're supposed to change.
-    // TL&DR: do not restore %rcx/%r11 here.
+    // The `syscall` instruction clobbers %rcx/%r11. When we injected a syscall
+    // (or a different syscall variant) from the private trampoline page, %rcx
+    // and %r11 now hold the *trampoline's* return RIP / RFLAGS rather than the
+    // guest's. Although the ABI leaves these "undefined" after a syscall, an
+    // injection should be transparent, and leaving Reverie's private trampoline
+    // address in %rcx would leak a tracer-internal (and potentially
+    // nondeterministic) pointer to the guest. Restore them from the guest's own
+    // pre-syscall snapshot. (No-op on aarch64.)
+    regs.restore_syscall_clobbers(&context);
 
     task.setregs(&regs)
 }
@@ -2405,6 +2411,16 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
             Ok(ret) => ret,
             Err(err) => self.abort(Err(err)).await,
         }
+    }
+
+    async fn set_regs(&mut self, regs: libc::user_regs_struct) -> Result<(), reverie::Error> {
+        let task = self.assume_stopped();
+
+        if let Err(err) = task.setregs(&regs) {
+            // Mirror `regs()`: a ptrace register access failure aborts the task.
+            self.abort(Err(err)).await;
+        }
+        Ok(())
     }
 
     async fn stack(&mut self) -> Self::Stack {
