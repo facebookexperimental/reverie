@@ -24,6 +24,7 @@ use std::ffi::c_void;
 use std::future::Future;
 use std::path::Path;
 use std::pin::pin;
+use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU16;
@@ -31,7 +32,9 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
+use std::task::Wake;
 use std::task::Waker;
+use std::thread;
 
 pub use launcher::DbiRunner;
 use reverie::Error;
@@ -746,20 +749,67 @@ fn rewrite_bind_port<G: Guest<PrototypeTool>>(
     Ok(())
 }
 
-/// Polls a handler future exactly once. Returns `Some` if it resolved
-/// immediately (the common case: `inject`/`memory`/`regs` are synchronous), or
-/// `None` if it suspended. The only expected suspension is [`Guest::tail_inject`],
-/// which records its result in [`TAIL_INJECT_RESULT`] before suspending; the
-/// driver handles `None` by installing that result and dropping the future. We
-/// return `None` rather than panicking because a panic aborts under the
-/// DynamoRIO client (see [`Guest::tail_inject`]).
+/// Drives an async tool handler on the calling guest thread, returning `Some`
+/// when it resolves and `None` when it suspends via [`Guest::tail_inject`].
+///
+/// The DynamoRIO client invokes each handler synchronously on the guest thread
+/// that made the syscall, but Reverie handlers are `async` and may suspend for
+/// two distinct reasons that this driver must tell apart:
+///
+/// 1. **A genuine cross-thread wait.** Detcore's `send_rpc` awaits the global
+///    scheduler and returns [`Poll::Pending`] until another thread grants this
+///    thread its turn. This is a *resumable* suspension: we park the OS thread
+///    with a real waker and re-poll when unparked. Because each guest thread
+///    runs this on its own OS thread, N guest threads block independently and a
+///    wake from any thread (e.g. the scheduler granting a turn) resumes exactly
+///    the parked thread it targets. This is what unblocks async handlers at the
+///    FFI boundary (PR #40).
+///
+/// 2. **`tail_inject`.** It performs the syscall, records its result in
+///    [`TAIL_INJECT_RESULT`], then suspends *forever* (it resolves to `Never`).
+///    A blocking executor must NOT park on this — it would deadlock, since no
+///    wake is ever coming. We detect this specific suspension by observing that
+///    `TAIL_INJECT_RESULT` was populated during the poll, and return `None` so
+///    the driver installs the recorded result and drops the future (PR #32).
+///    We return `None` rather than panicking because a panic aborts under the
+///    DynamoRIO client (see [`Guest::tail_inject`]).
+///
+/// Handlers that complete on the first poll (such as the prototype tool) never
+/// park and never touch `TAIL_INJECT_RESULT`; they return `Some` immediately.
 fn run_ready<F: Future>(future: F) -> Option<F::Output> {
+    /// Waker that unparks the OS thread blocked inside [`run_ready`].
+    struct ThreadWaker(thread::Thread);
+
+    impl Wake for ThreadWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
     let mut future = pin!(future);
-    let waker = Waker::noop();
-    let mut context = Context::from_waker(waker);
-    match future.as_mut().poll(&mut context) {
-        Poll::Ready(value) => Some(value),
-        Poll::Pending => None,
+    let waker = Waker::from(Arc::new(ThreadWaker(thread::current())));
+    let mut context = Context::from_waker(&waker);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(value) => return Some(value),
+            // A `tail_inject` records its result just before suspending forever;
+            // parking here would deadlock, so surface `None` and let the driver
+            // install the recorded result. Any other pending state is a genuine
+            // resumable wait (e.g. the scheduler): park until a waker unparks
+            // us, then re-poll. `park` may return spuriously and the loop simply
+            // re-polls; an unpark token stored by `wake` before we reach `park`
+            // makes `park` return immediately, so wakeups are never lost.
+            Poll::Pending => {
+                if TAIL_INJECT_RESULT.with(|slot| slot.get()).is_some() {
+                    return None;
+                }
+                thread::park();
+            }
+        }
     }
 }
 
@@ -936,6 +986,58 @@ mod tests {
     unsafe extern "C" fn read_regs(_context: usize, regs: *mut libc::user_regs_struct) -> i32 {
         unsafe { (*regs).rip = 0x1234 };
         1
+    }
+
+    /// A suspending handler (one that returns `Poll::Pending` until another
+    /// thread completes it) must resume rather than panic. This mirrors
+    /// Detcore's `send_rpc` awaiting the global scheduler: the handler parks
+    /// until the scheduler, running on another thread, grants this thread its
+    /// turn and wakes it. Under the old single-poll `run_ready` this panicked.
+    #[test]
+    fn run_ready_resumes_a_cross_thread_woken_future() {
+        use std::sync::Arc;
+        use std::sync::Mutex;
+        use std::task::Waker;
+        use std::time::Duration;
+
+        struct Shared {
+            ready: bool,
+            waker: Option<Waker>,
+        }
+
+        let shared = Arc::new(Mutex::new(Shared {
+            ready: false,
+            waker: None,
+        }));
+        let completer = Arc::clone(&shared);
+
+        // Another thread completes the future after the handler has parked,
+        // then wakes the stored waker (as the scheduler would).
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            let mut state = completer.lock().unwrap();
+            state.ready = true;
+            if let Some(waker) = state.waker.take() {
+                waker.wake();
+            }
+        });
+
+        let future = std::future::poll_fn(move |cx| {
+            let mut state = shared.lock().unwrap();
+            if state.ready {
+                Poll::Ready(1234)
+            } else {
+                state.waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        });
+
+        // `run_ready` now returns `Option` (`None` is reserved for a
+        // `tail_inject` suspend); a genuine cross-thread wake resolves to
+        // `Some`. The future never touches `TAIL_INJECT_RESULT`, so the park
+        // path is exercised and the result comes back wrapped in `Some`.
+        assert_eq!(run_ready(future), Some(1234));
+        handle.join().unwrap();
     }
 
     #[test]
