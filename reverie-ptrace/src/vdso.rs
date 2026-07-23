@@ -169,7 +169,10 @@ fn align_up(value: usize, alignment: usize) -> usize {
     (value + alignment - 1) & alignment.wrapping_neg()
 }
 
-static VDSO_PATCH_INFO: LazyLock<HashMap<&str, (u64, usize, &[u8])>> = LazyLock::new(|| {
+/// Per-symbol VDSO patch info: `symbol name -> (base offset, size, replacement bytes)`.
+type VdsoPatchInfo = HashMap<&'static str, (u64, usize, &'static [u8])>;
+
+static VDSO_PATCH_INFO: LazyLock<VdsoPatchInfo> = LazyLock::new(|| {
     let info = vdso_get_symbols_info();
     let mut res = HashMap::new();
 

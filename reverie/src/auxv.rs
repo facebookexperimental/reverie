@@ -70,7 +70,7 @@ impl Auxv {
     ///
     /// Returns `None` if the address is NULL or if `AT_RANDOM` does not exist in
     /// the auxv table.
-    pub fn at_random(&self) -> Option<Addr<[u8; 16]>> {
+    pub fn at_random(&self) -> Option<Addr<'_, [u8; 16]>> {
         self.map
             .get(&libc::AT_RANDOM)
             .and_then(|val| Addr::from_raw(*val as usize))

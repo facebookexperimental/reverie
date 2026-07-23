@@ -112,7 +112,7 @@ pub enum StatFamily {
 impl StatFamily {
     /// Get address of the stat buffer. Returns `None` if a NULL pointer was
     /// specified.
-    pub fn stat(&self) -> Option<StatPtr> {
+    pub fn stat(&self) -> Option<StatPtr<'_>> {
         match self {
             #[cfg(not(target_arch = "aarch64"))]
             Self::Stat(s) => s.stat(),
@@ -153,7 +153,7 @@ pub enum SockOptFamily {
 impl SockOptFamily {
     /// Get address of the value. Returns `None` if a NULL pointer was
     /// specified.
-    pub fn value(&self) -> Option<AddrMut<u8>> {
+    pub fn value(&self) -> Option<AddrMut<'_, u8>> {
         match self {
             Self::Getsockopt(s) => s.optval().map(AddrMut::cast),
             Self::Getpeername(s) => s.usockaddr().map(AddrMut::cast),
@@ -163,7 +163,7 @@ impl SockOptFamily {
 
     /// Get address of the buffer length. Returns `None` if a NULL pointer was
     /// specified.
-    pub fn value_len(&self) -> Option<AddrMut<libc::socklen_t>> {
+    pub fn value_len(&self) -> Option<AddrMut<'_, libc::socklen_t>> {
         match self {
             Self::Getsockopt(s) => s.optlen(),
             Self::Getpeername(s) => s.usockaddr_len(),
@@ -292,7 +292,7 @@ impl NanosleepFamily {
     }
 
     /// Get the request timespec pointer.
-    pub fn req(&self) -> Option<Addr<Timespec>> {
+    pub fn req(&self) -> Option<Addr<'_, Timespec>> {
         match self {
             Self::Nanosleep(s) => s.req(),
             Self::ClockNanosleep(s) => s.req(),
@@ -300,7 +300,7 @@ impl NanosleepFamily {
     }
 
     /// Get the remain timespec pointer.
-    pub fn rem(&self) -> Option<AddrMut<Timespec>> {
+    pub fn rem(&self) -> Option<AddrMut<'_, Timespec>> {
         match self {
             Self::Nanosleep(s) => s.rem(),
             Self::ClockNanosleep(s) => s.rem(),

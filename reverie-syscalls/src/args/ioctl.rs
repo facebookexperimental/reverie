@@ -78,15 +78,15 @@ command_enum! {
         TIOCSSOFTCAR(Option<Addr<'a, libc::c_int>>) = 0x0000541A,
         FIONREAD(Option<AddrMut<'a, libc::c_int>>) = 0x0000541B,
         // Duplicate of FIONREAD; can't properly match the ID.
-        #[cfg(none)]
+        #[cfg(any())]
         TIOCINQ(Option<AddrMut<'a, libc::c_int>>) = 0x0000541B,
         TIOCLINUX(Option<Addr<'a, libc::c_char>>) = 0x0000541C,
         TIOCCONS = 0x0000541D,
         // Disabled because `libc::serial_struct` isn't defined.
-        #[cfg(none)]
+        #[cfg(any())]
         TIOCGSERIAL(Option<AddrMut<'a, libc::serial_struct>>) = 0x0000541E,
         // Disabled because `libc::serial_struct` isn't defined.
-        #[cfg(none)]
+        #[cfg(any())]
         TIOCSSERIAL(Option<Addr<'a, libc::serial_struct>>) = 0x0000541F,
         TIOCPKT(Option<Addr<'a, libc::c_int>>) = 0x00005420,
         FIONBIO(Option<Addr<'a, libc::c_int>>) = 0x00005421,
@@ -95,7 +95,7 @@ command_enum! {
         TIOCGETD(Option<AddrMut<'a, libc::c_int>>) = 0x00005424,
         TCSBRKP(libc::c_int) = 0x00005425,
         // Disabled because `libc::tty_struct` isn't defined.
-        #[cfg(none)]
+        #[cfg(any())]
         TIOCTTYGSTRUCT(Option<AddrMut<'a, libc::tty_struct>>) = 0x00005426,
         TIOCGPTPEER(libc::c_int) = 0x00005441,
         FIONCLEX = 0x00005450,
@@ -107,7 +107,7 @@ command_enum! {
         TIOCGLCKTRMIOS(Option<AddrMut<'a, Termios>>) = 0x00005456,
         TIOCSLCKTRMIOS(Option<Addr<'a, Termios>>) = 0x00005457,
         // Disabled because `libc::async_struct` isn't defined.
-        #[cfg(none)]
+        #[cfg(any())]
         TIOCSERGSTRUCT(Option<AddrMut<'a, libc::async_struct>>) = 0x00005458,
         TIOCSERGETLSR(Option<AddrMut<'a, libc::c_int>>) = 0x00005459,
 

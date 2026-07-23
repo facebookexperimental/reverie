@@ -122,6 +122,11 @@ macro_rules! typed_syscall {
                 /// Gets this argument's value.
                 $(#[$req_get_meta])*
                 #[allow(clippy::len_without_is_empty)]
+                // The returned type (e.g. `AddrMut<u8>`) elides a lifetime that
+                // is tied to `&self`; the generic macro cannot spell it as `'_`
+                // for an arbitrary `$req_type`, so the new-in-edition-2024
+                // stylistic lint is allowed for these generated getters.
+                #[allow(mismatched_lifetime_syntaxes)]
                 pub fn $req($($req_get_args)*) -> $req_type {
                     $($req_get_impl)*
                 }
@@ -130,6 +135,9 @@ macro_rules! typed_syscall {
             $(
                 /// Gets this optional argument's value. Returns `None` if it is not set.
                 $(#[$opt_get_meta])*
+                // See the note on the required getter above: the elided lifetime
+                // in `$opt_type` cannot be spelled generically.
+                #[allow(mismatched_lifetime_syntaxes)]
                 pub fn $opt($($opt_get_args)*) -> $opt_type {
                     $($opt_get_impl)*
                 }

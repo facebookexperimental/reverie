@@ -21,7 +21,7 @@ use crate::gdbstub::hex::*;
 /// libc::stat or nix's FileStat (which is just libc::stat).
 // NB: packed is needed to force size_of::<HostioStat> == 0x40. Otherwise
 // gdb (client) would complain.
-#[repr(packed(4))]
+#[repr(C, packed(4))]
 pub struct HostioStat {
     st_dev: u32,
     st_ino: u32,

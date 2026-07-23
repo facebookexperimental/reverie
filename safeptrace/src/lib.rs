@@ -1041,8 +1041,8 @@ mod test {
 
                 // Note: We can't use the normal exit function here because we
                 // don't want to call atexit handlers since `execve` was never
-                // called.
-                let _ = unsafe { ::libc::_exit(exit_code) };
+                // called. `_exit` diverges (`-> !`), so there is nothing to bind.
+                unsafe { ::libc::_exit(exit_code) };
             }
         }
     }

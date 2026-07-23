@@ -50,35 +50,35 @@ impl<'a> Display<'a> {
     fn fmt_single_line_x86(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "rax {:#01x} rbx {:#01x} rcx {:#01x} rdx {:#01x}",
+            "rax {:#x} rbx {:#x} rcx {:#x} rdx {:#x}",
             self.regs.rax, self.regs.rbx, self.regs.rcx, self.regs.rdx
         )?;
         write!(
             f,
-            " rsi {:#01x} rdi {:#01x} rbp {:#01x} rsp {:#01x}",
+            " rsi {:#x} rdi {:#x} rbp {:#x} rsp {:#x}",
             self.regs.rsi, self.regs.rdi, self.regs.rbp, self.regs.rsp
         )?;
         write!(
             f,
-            " r8 {:#01x}  r9 {:#01x} r10 {:#01x} r11 {:#01x}",
+            " r8 {:#x}  r9 {:#x} r10 {:#x} r11 {:#x}",
             self.regs.r8, self.regs.r9, self.regs.r10, self.regs.r11
         )?;
         write!(
             f,
-            " r12 {:#01x} r13 {:#01x} r14 {:#01x} r15 {:#01x}",
+            " r12 {:#x} r13 {:#x} r14 {:#x} r15 {:#x}",
             self.regs.r12, self.regs.r13, self.regs.r14, self.regs.r15
         )?;
         write!(
             f,
-            " rip {:#01x} eflags {:#01x}",
+            " rip {:#x} eflags {:#x}",
             self.regs.rip, self.regs.eflags
         )?;
         write!(
             f,
-            " cs {:#01x} ss {:#01x} ds {:#01x} es {:#01x}",
+            " cs {:#x} ss {:#x} ds {:#x} es {:#x}",
             self.regs.cs, self.regs.ss, self.regs.ds, self.regs.es,
         )?;
-        write!(f, " fs {:#01x} gs {:#01x}", self.regs.fs, self.regs.gs)
+        write!(f, " fs {:#x} gs {:#x}", self.regs.fs, self.regs.gs)
     }
     #[cfg(target_arch = "x86_64")]
     fn fmt_multi_line_x86(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -157,10 +157,7 @@ mod tests {
         regs.rax = 255;
         let result = format!(
             "{}",
-            regs.display_with_options(RegDisplayOptions {
-                multiline: true,
-                ..Default::default()
-            })
+            regs.display_with_options(RegDisplayOptions { multiline: true })
         );
         let lines = vec![
             " rax             0xff rbx              0x0 rcx              0x0 rdx              0x0",

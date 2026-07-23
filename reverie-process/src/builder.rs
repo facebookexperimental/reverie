@@ -464,7 +464,7 @@ impl Command {
     /// Gets an environment variable. If the child process is to inherit this
     /// environment variable from the current process, then this returns the
     /// current process's environment variable unless it is to be overridden.
-    pub fn get_env<K: AsRef<OsStr>>(&self, env: K) -> Option<Cow<OsStr>> {
+    pub fn get_env<K: AsRef<OsStr>>(&self, env: K) -> Option<Cow<'_, OsStr>> {
         self.container.get_env(env)
     }
 
@@ -730,17 +730,17 @@ where
 {
     for path in iter.into_iter() {
         let path = path.as_ref().join(program);
-        if let Ok(metadata) = path.metadata() {
-            if metadata.is_file() {
-                if metadata.permissions().mode() & 0o111 != 0 {
-                    return Some(path);
-                } else {
-                    continue;
-                }
-
-                #[cfg(not(unix))]
+        if let Ok(metadata) = path.metadata()
+            && metadata.is_file()
+        {
+            if metadata.permissions().mode() & 0o111 != 0 {
                 return Some(path);
+            } else {
+                continue;
             }
+
+            #[cfg(not(unix))]
+            return Some(path);
         }
     }
 

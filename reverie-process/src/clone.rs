@@ -36,7 +36,10 @@ where
         let stack = stack.sub(stack as usize % 16);
 
         libc::clone(
-            core::mem::transmute(callback as extern "C" fn(*mut Box<dyn FnMut() -> i32>) -> i32),
+            core::mem::transmute::<
+                extern "C" fn(*mut Box<dyn FnMut() -> i32>) -> i32,
+                extern "C" fn(*mut libc::c_void) -> libc::c_int,
+            >(callback as extern "C" fn(*mut Box<dyn FnMut() -> i32>) -> i32),
             stack as *mut libc::c_void,
             flags,
             &mut cb as *mut _ as *mut libc::c_void,

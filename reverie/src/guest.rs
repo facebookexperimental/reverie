@@ -194,7 +194,7 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     /// Converts this `Guest<T>` such that it implements `Guest<U>`. This is
     /// useful when forwarding callbacks to a "child" tool.
     #[allow(clippy::wrong_self_convention)]
-    fn into_guest(&mut self) -> IntoGuest<Self, T> {
+    fn into_guest(&mut self) -> IntoGuest<'_, Self, T> {
         IntoGuest::new(self)
     }
 

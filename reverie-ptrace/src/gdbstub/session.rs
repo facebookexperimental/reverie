@@ -210,7 +210,7 @@ impl Session {
             },
             detach: true,
         };
-        for (_, inferior) in inferiors.iter_mut() {
+        for inferior in inferiors.values_mut() {
             if inferior.matches(&threadid) {
                 inferior.notify_resume(resume).await?;
             }
@@ -241,7 +241,7 @@ impl Session {
             // vCont all threads, such as $vCont;c:p2.-1#10
             IdKind::All => match threadid.pid {
                 IdKind::Id(pid) => {
-                    for (_, inferior) in inferiors.iter_mut() {
+                    for inferior in inferiors.values_mut() {
                         if inferior.getpid() == pid {
                             inferiors_to_resume.push(inferior);
                         }

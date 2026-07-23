@@ -477,13 +477,13 @@ mod test {
     fn test_check_for_ioc_period_bug_precise_ip() {
         // This assumes the machine running the test will not have this bug and only runs
         // if precise_ip will be enabled
-        if has_precise_ip() {
-            if let Err(pmu_err) = check_for_ioc_period_bug(true) {
-                panic!(
-                    "Ioc period bug check failed when precise_ip was enabled - {}",
-                    pmu_err
-                );
-            }
+        if has_precise_ip()
+            && let Err(pmu_err) = check_for_ioc_period_bug(true)
+        {
+            panic!(
+                "Ioc period bug check failed when precise_ip was enabled - {}",
+                pmu_err
+            );
         }
     }
 
@@ -491,13 +491,13 @@ mod test {
     fn test_check_working_counters_precise_ip() {
         // This assumes the machine running the test will have working counters and only runs
         // if precise_ip will be enabled
-        if has_precise_ip() {
-            if let Err(pmu_err) = check_working_counters(true) {
-                panic!(
-                    "Working counters check failed when precise_ip was enabled - {}",
-                    pmu_err
-                );
-            }
+        if has_precise_ip()
+            && let Err(pmu_err) = check_working_counters(true)
+        {
+            panic!(
+                "Working counters check failed when precise_ip was enabled - {}",
+                pmu_err
+            );
         }
     }
 

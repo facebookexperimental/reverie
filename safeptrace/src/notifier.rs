@@ -192,7 +192,7 @@ impl Event {
         // TODO: Think really hard and relax the ordering.
         let status = self
             .status
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |prev| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |prev| {
                 if prev == INVALID_STATUS || prev == PTRACE_EVENT_EXIT_STOP {
                     // Don't update if we're exiting or if there is no status to
                     // be consumed.
@@ -263,14 +263,15 @@ fn wait(pid: Pid) -> Option<i32> {
 /// A worker thread that simply wakes a future when a process changes state.
 fn worker_thread(pid: Pid, event: Arc<Event>) {
     while let Some(status) = wait(pid) {
-        if let Some(old_status) = event.update(status) {
-            if status != PTRACE_EVENT_EXIT_STOP && !libc::WIFEXITED(status) {
-                panic!(
-                    "Got unexpected event: Event {:?} replaced {:?}",
-                    WaitStatus::from_raw(pid.into(), status),
-                    WaitStatus::from_raw(pid.into(), old_status),
-                );
-            }
+        if let Some(old_status) = event.update(status)
+            && status != PTRACE_EVENT_EXIT_STOP
+            && !libc::WIFEXITED(status)
+        {
+            panic!(
+                "Got unexpected event: Event {:?} replaced {:?}",
+                WaitStatus::from_raw(pid.into(), status),
+                WaitStatus::from_raw(pid.into(), old_status),
+            );
         }
 
         // Try to avoid reaching an ECHILD error by terminating the loop on the
