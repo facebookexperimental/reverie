@@ -19,6 +19,7 @@ mod error;
 mod memory;
 mod runtime;
 mod syscall;
+mod tools;
 mod vm;
 
 pub use cpuid::CpuidPolicy;
@@ -31,6 +32,8 @@ pub use runtime::KvmStack;
 pub use runtime::KvmStackGuard;
 pub use runtime::SyscallExecutor;
 pub use syscall::SyscallRequest;
+pub use tools::StraceLog;
+pub use tools::StraceTool;
 pub use vm::KvmBackend;
 pub use vm::VMCALL_SYSCALL_TRANSPORT;
 
