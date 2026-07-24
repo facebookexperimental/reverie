@@ -1,0 +1,34 @@
+[package]
+name = "reverie-liteinst"
+version = "0.1.0"
+authors = ["Meta Platforms"]
+edition = "2024"
+repository = "https://github.com/facebookexperimental/reverie"
+license = "BSD-2-Clause"
+description = "Experimental in-process syscall instrumentation for Reverie"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["preload-constructor"]
+preload-constructor = []
+
+[[bin]]
+name = "reverie-liteinst-strace"
+path = "src/bin/strace.rs"
+
+[[bin]]
+name = "reverie-liteinst-fork-guest"
+path = "src/bin/fork_guest.rs"
+
+[dependencies]
+libc = "0.2.186"
+
+[[test]]
+name = "strace"
+path = "tests/strace.rs"
+
+[[bin]]
+name = "reverie-liteinst-exec-guest"
+path = "src/bin/exec_guest.rs"

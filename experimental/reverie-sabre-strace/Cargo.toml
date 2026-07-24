@@ -1,0 +1,28 @@
+[package]
+name = "reverie-sabre-strace"
+version = "0.1.0"
+authors = ["Meta Platforms"]
+edition = "2021"
+repository = "https://github.com/facebookexperimental/reverie"
+license = "BSD-2-Clause"
+
+[lib]
+name = "reverie_sabre_strace_plugin"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "reverie-sabre-strace"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.75"
+clap = { version = "3.2.25", features = ["derive", "env"] }
+libc = "0.2.139"
+nostd-print = { version = "0.1.0", path = "../nostd-print" }
+reverie = { version = "0.1.0", path = "../../reverie" }
+reverie-host = { version = "0.1.0", path = "../reverie-host" }
+reverie-process = { version = "0.1.0", path = "../../reverie-process" }
+reverie-sabre = { version = "0.1.0", path = "../reverie-sabre" }
+reverie-syscalls = { version = "0.1.0", path = "../../reverie-syscalls" }
+syscalls = { version = "0.6.7", features = ["serde"] }
+tokio = { version = "1.37.0", features = ["rt", "macros"] }

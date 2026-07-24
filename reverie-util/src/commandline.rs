@@ -71,6 +71,10 @@ pub struct CommonToolArguments {
     )]
     pub envs: Vec<(String, String)>,
 
+    /// Emit trace diagnostics for every syscall intercepted by the ptrace backend.
+    #[clap(long = "trace-syscalls")]
+    pub trace_syscalls: bool,
+
     /// Path of the program to trace.
     #[clap(value_name = "PROGRAM")]
     pub program: String,
@@ -78,6 +82,19 @@ pub struct CommonToolArguments {
     /// Arguments to the program to trace.
     #[clap(value_name = "ARGS")]
     pub program_args: Vec<String>,
+}
+
+fn tracing_filter(trace_syscalls: bool) -> EnvFilter {
+    let filter = EnvFilter::from_default_env();
+    if trace_syscalls {
+        filter.add_directive(
+            "reverie_ptrace::syscall=trace"
+                .parse()
+                .expect("the syscall tracing filter directive must be valid"),
+        )
+    } else {
+        filter
+    }
 }
 
 impl CommonToolArguments {
@@ -100,10 +117,11 @@ impl CommonToolArguments {
             T: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
         >(
             writer: T,
+            trace_syscalls: bool,
         ) {
             // TODO: There is currently no support for async tracing.
             let subscriber = tracing_subscriber::fmt()
-                .with_env_filter(EnvFilter::from_default_env())
+                .with_env_filter(tracing_filter(trace_syscalls))
                 .with_writer(writer)
                 .finish();
             tracing::subscriber::set_global_default(subscriber)
@@ -137,12 +155,12 @@ impl CommonToolArguments {
                     let (file_writer, guard) = tracing_appender::non_blocking(file_writer);
 
                     eprintln!(" [reverie] Logging to file at {:?}", parent.join(&filename));
-                    set_subscriber_with_writer(file_writer);
+                    set_subscriber_with_writer(file_writer, self.trace_syscalls);
                     Some(guard)
                 }
             })
             .or_else(|| {
-                set_subscriber_with_writer(io::stderr);
+                set_subscriber_with_writer(io::stderr, self.trace_syscalls);
                 None
             })
     }
@@ -160,5 +178,24 @@ impl From<CommonToolArguments> for Command {
 
         cmd.envs(args.envs);
         cmd
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_trace_syscalls_flag() {
+        let args =
+            CommonToolArguments::try_parse_from(["reverie-tool", "--trace-syscalls", "/bin/true"])
+                .expect("diagnostic CLI arguments should parse");
+
+        assert!(args.trace_syscalls);
+        assert!(
+            tracing_filter(true)
+                .to_string()
+                .contains("reverie_ptrace::syscall=trace")
+        );
     }
 }

@@ -8,6 +8,12 @@ edition = "2024"
 repository = "https://github.com/facebookexperimental/reverie"
 license = "BSD-2-Clause"
 
+# `sanitized` is a Meta-internal cfg (set for sanitizer builds to skip
+# fork-based tests); declare it as a known cfg name so the open-source build
+# does not warn under `unexpected_cfgs`. Reflect this in the autocargo source.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(sanitized)'] }
+
 [dependencies]
 bitflags = { version = "2.13.1", features = ["serde", "std"], default-features = false }
 futures = { version = "0.3.31", features = ["async-await", "compat"] }

@@ -14,15 +14,18 @@ use crate::gdbstub::hex::*;
 #[derive(PartialEq, Debug)]
 pub struct G {
     pub vals: Vec<u8>,
+    /// Optional thread selected by an LLDB `;thread:<id>;` suffix.
+    pub thread: Option<ThreadId>,
 }
 
 impl ParseCommand for G {
     fn parse(bytes: BytesMut) -> Option<Self> {
-        if bytes.is_empty() {
+        let (rest, thread) = split_thread_suffix(bytes);
+        if rest.is_empty() {
             None
         } else {
-            let vals = decode_hex_string(&bytes).ok()?;
-            Some(G { vals })
+            let vals = decode_hex_string(&rest).ok()?;
+            Some(G { vals, thread })
         }
     }
 }

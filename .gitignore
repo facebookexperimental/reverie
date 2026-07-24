@@ -1,2 +1,7 @@
 target/
 Cargo.lock
+
+# Local backup and Python cache files.
+*.orig
+**/__pycache__/
+**/.mypy_cache/

@@ -148,6 +148,9 @@ impl<'de> serde::Deserialize<'de> for ExitStatus {
     }
 }
 
+// `sanitized` is a Meta-internal cfg (set for sanitizer builds to skip these
+// fork-based tests); it is never set in the open-source build. It is declared
+// via `check-cfg` in this crate's Cargo.toml so it is a known cfg name.
 #[cfg(all(test, not(sanitized)))]
 mod tests_non_sanitized {
     use nix::sys::signal;

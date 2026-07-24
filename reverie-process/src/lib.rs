@@ -460,9 +460,24 @@ mod tests {
 
     #[tokio::test]
     async fn local_networking_ping() {
-        let output = Command::new("ping")
-            .arg("-c1")
-            .arg("::1")
+        const CHILD_ENV: &str = "REVERIE_PROCESS_LOOPBACK_TEST_CHILD";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let socket = std::net::UdpSocket::bind("[::1]:0").unwrap();
+            let address = socket.local_addr().unwrap();
+            assert_eq!(socket.send_to(b"ping", address).unwrap(), 4);
+
+            let mut buffer = [0; 4];
+            let (length, source) = socket.recv_from(&mut buffer).unwrap();
+            assert_eq!(source, address);
+            assert_eq!(&buffer[..length], b"ping");
+            return;
+        }
+
+        let output = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("tests::local_networking_ping")
+            .env(CHILD_ENV, "1")
             .map_root()
             .local_networking_only()
             .output()

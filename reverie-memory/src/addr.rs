@@ -357,7 +357,7 @@ impl<'a> AddrSlice<'a, u8> {
     /// # Safety
     /// This function is unsafe because it gives access to raw pointers, which
     /// may not be valid for the current address space.
-    pub unsafe fn as_ioslice(&self) -> io::IoSlice {
+    pub unsafe fn as_ioslice(&self) -> io::IoSlice<'_> {
         io::IoSlice::new(self.inner)
     }
 }
@@ -423,7 +423,7 @@ impl<'a> AddrSliceMut<'a, u8> {
     /// # Safety
     /// This function is unsafe because it gives access to raw pointers, which
     /// may not be valid for the current address space.
-    pub unsafe fn as_ioslice_mut(&mut self) -> io::IoSliceMut {
+    pub unsafe fn as_ioslice_mut(&mut self) -> io::IoSliceMut<'_> {
         io::IoSliceMut::new(self.inner)
     }
 }

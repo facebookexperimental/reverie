@@ -1,7 +1,21 @@
 [workspace]
+resolver = "2"
 members = [
+    "experimental/nostd-print",
+    "experimental/reverie-host",
+    "experimental/reverie-rpc-macros",
+    "experimental/reverie-rpc",
+    "experimental/reverie-sabre-macros",
+    "experimental/reverie-sabre-strace",
+    "experimental/reverie-sabre",
+    "experimental/riptrace",
+    "experimental/riptrace/rpc",
+    "experimental/riptrace/tool",
     "reverie",
+    "reverie-dbi",
     "reverie-examples",
+    "reverie-kvm",
+    "reverie-liteinst",
     "reverie-memory",
     "reverie-process",
     "reverie-ptrace",

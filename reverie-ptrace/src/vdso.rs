@@ -13,6 +13,7 @@ use std::sync::LazyLock;
 use goblin::elf::Elf;
 use nix::sys::mman::ProtFlags;
 use nix::unistd;
+use reverie::Errno;
 use reverie::Error;
 use reverie::Guest;
 use reverie::Tool;
@@ -168,7 +169,10 @@ fn align_up(value: usize, alignment: usize) -> usize {
     (value + alignment - 1) & alignment.wrapping_neg()
 }
 
-static VDSO_PATCH_INFO: LazyLock<HashMap<&str, (u64, usize, &[u8])>> = LazyLock::new(|| {
+/// Per-symbol VDSO patch info: `symbol name -> (base offset, size, replacement bytes)`.
+type VdsoPatchInfo = HashMap<&'static str, (u64, usize, &'static [u8])>;
+
+static VDSO_PATCH_INFO: LazyLock<VdsoPatchInfo> = LazyLock::new(|| {
     let info = vdso_get_symbols_info();
     let mut res = HashMap::new();
 
@@ -273,7 +277,7 @@ where
         for (name, (offset, size, bytes)) in VDSO_PATCH_INFO.iter() {
             let start = vdso.address.0 + offset;
             assert!(bytes.len() <= *size);
-            let rptr = AddrMut::from_raw(start as usize).unwrap();
+            let rptr = AddrMut::from_raw(start as usize).ok_or(Errno::EFAULT)?;
             memory.write_exact(rptr, bytes)?;
             assert!(*size >= bytes.len());
             if *size > bytes.len() {

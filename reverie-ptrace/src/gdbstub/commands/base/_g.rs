@@ -12,10 +12,18 @@ use crate::gdbstub::commands::*;
 use crate::gdbstub::hex::*;
 
 #[derive(PartialEq, Debug)]
-pub struct g;
+pub struct g {
+    /// Optional thread selected by an LLDB `;thread:<id>;` suffix.
+    pub thread: Option<ThreadId>,
+}
 
 impl ParseCommand for g {
     fn parse(bytes: BytesMut) -> Option<Self> {
-        if bytes.is_empty() { Some(g) } else { None }
+        let (rest, thread) = split_thread_suffix(bytes);
+        if rest.is_empty() {
+            Some(g { thread })
+        } else {
+            None
+        }
     }
 }

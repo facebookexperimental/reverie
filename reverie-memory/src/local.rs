@@ -117,7 +117,7 @@ mod tests {
 
         let m = LocalMemory::new();
         let x = "hello world\0";
-        let addr = Addr::from_ptr(x.as_ptr() as *const u8).unwrap();
+        let addr = Addr::from_ptr(x.as_ptr()).unwrap();
         assert_eq!(m.read_cstring(addr).unwrap().as_c_str(), unsafe {
             CStr::from_ptr(x.as_ptr() as *const _)
         });
