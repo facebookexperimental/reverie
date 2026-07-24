@@ -108,6 +108,9 @@ fn execute_basic_syscall_with_output(
         read(memory, state, args)
     } else if number == libc::SYS_pread64 as u64 {
         pread64(memory, state, args)
+    } else if number == libc::SYS_fcntl as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        fcntl(state, args)
     } else if number == libc::SYS_open as u64 {
         open(memory, state, args)
     } else if number == libc::SYS_openat as u64 {
@@ -257,14 +260,18 @@ impl SyscallExecutor for ElfExecutor {
     }
 }
 
-fn file_status_flags(file: &std::fs::File) -> Result<libc::c_int, i64> {
-    // SAFETY: file owns a live descriptor and F_GETFL takes no third argument.
-    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+fn fd_status_flags(fd: RawFd) -> Result<libc::c_int, i64> {
+    // SAFETY: fd names a live descriptor and F_GETFL takes no third argument.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 {
         Err(io_error(std::io::Error::last_os_error()))
     } else {
         Ok(flags)
     }
+}
+
+fn file_status_flags(file: &std::fs::File) -> Result<libc::c_int, i64> {
+    fd_status_flags(file.as_raw_fd())
 }
 
 fn file_mode(file: &std::fs::File) -> Result<libc::mode_t, i64> {
@@ -910,6 +917,25 @@ fn host_fd(state: &LoadedStaticElf, guest_fd: libc::c_int) -> Option<RawFd> {
         })
 }
 
+// TODO-HUMAN-REVIEW(PR-52): Review KVM guest fcntl compatibility boundaries.
+fn fcntl(state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    let Ok(guest_fd) = i32::try_from(args[0]) else {
+        return negative_errno(libc::EBADF);
+    };
+    let Some(host_fd) = host_fd(state, guest_fd) else {
+        return negative_errno(libc::EBADF);
+    };
+
+    if args[1] != libc::F_GETFL as u64 {
+        return negative_errno(libc::ENOSYS);
+    }
+
+    match fd_status_flags(host_fd) {
+        Ok(flags) => flags as i64,
+        Err(error) => error,
+    }
+}
+
 fn host_dirfd_and_path(
     state: &LoadedStaticElf,
     guest_dirfd: libc::c_int,
@@ -1365,6 +1391,58 @@ mod tests {
         memory.read(address, bytes).unwrap();
         // SAFETY: zeroed storage was fully initialized by memory.read.
         unsafe { value.assume_init() }
+    }
+
+    #[test]
+    fn fcntl_getfl_translates_guest_descriptors() {
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+
+        let stdin = state.stdin.as_ref().unwrap();
+        let host_flags = fd_status_flags(stdin.as_raw_fd()).unwrap();
+        // SAFETY: stdin owns a live descriptor and F_SETFL consumes an integer flag word.
+        assert_eq!(
+            unsafe {
+                libc::fcntl(
+                    stdin.as_raw_fd(),
+                    libc::F_SETFL,
+                    host_flags | libc::O_NONBLOCK,
+                )
+            },
+            0
+        );
+
+        let flags = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_fcntl,
+            [0, libc::F_GETFL as u64, 0, 0, 0, 0],
+        );
+        assert!(flags >= 0);
+        assert_eq!(flags as libc::c_int & libc::O_ACCMODE, libc::O_RDONLY);
+        assert_ne!(flags as libc::c_int & libc::O_NONBLOCK, 0);
+
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_fcntl,
+                [99, libc::F_GETFL as u64, 0, 0, 0, 0],
+            ),
+            negative_errno(libc::EBADF)
+        );
+
+        state.closed_standard_fds.insert(libc::STDIN_FILENO);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_fcntl,
+                [0, libc::F_GETFL as u64, 0, 0, 0, 0],
+            ),
+            negative_errno(libc::EBADF)
+        );
     }
 
     #[test]
