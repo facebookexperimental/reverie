@@ -46,6 +46,7 @@ pub struct DbiRunner {
     drrun: PathBuf,
     client: PathBuf,
     summary: bool,
+    isolated_process_group: bool,
 }
 
 impl DbiRunner {
@@ -78,12 +79,22 @@ impl DbiRunner {
             drrun,
             client,
             summary: false,
+            isolated_process_group: false,
         })
     }
 
     /// Enables or disables the instrumentation summary written at process exit.
     pub fn summary(mut self, enabled: bool) -> Self {
         self.summary = enabled;
+        self
+    }
+
+    /// Runs the DynamoRIO launcher in a new process group when enabled.
+    ///
+    /// This lets a Tool terminate the complete instrumented process tree without signaling
+    /// the launcher's caller.
+    pub fn isolated_process_group(mut self, enabled: bool) -> Self {
+        self.isolated_process_group = enabled;
         self
     }
 
@@ -203,6 +214,10 @@ impl DbiRunner {
                 }
             }
         }
+        if self.isolated_process_group {
+            command.process_group(0);
+        }
+
         // SAFETY: personality(2) is async-signal-safe and the closure captures no
         // process state. The flag survives both the drrun and guest execs.
         unsafe {
@@ -371,6 +386,7 @@ mod tests {
             drrun: PathBuf::from("/opt/dynamorio/bin64/drrun"),
             client: PathBuf::from("/opt/reverie/libreverie_dbi_client.so"),
             summary: false,
+            isolated_process_group: false,
         }
     }
 
@@ -381,6 +397,13 @@ mod tests {
         let mut permissions = std::fs::metadata(path).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[test]
+    fn process_group_isolation_is_opt_in() {
+        let runner = runner();
+        assert!(!runner.isolated_process_group);
+        assert!(runner.isolated_process_group(true).isolated_process_group);
     }
 
     #[test]
