@@ -17,6 +17,7 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 mod launcher;
+#[cfg(feature = "prototype-runtime")]
 mod tools;
 
 use std::collections::HashSet;
@@ -27,17 +28,18 @@ use std::pin::pin;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicI64;
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicU16;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
-use std::task::Wake;
 use std::task::Waker;
-use std::thread;
 
 pub use launcher::DbiRunner;
 use reverie::Error;
+use reverie::ExitStatus;
 use reverie::GlobalRPC;
 use reverie::GlobalTool;
 use reverie::Guest;
@@ -53,6 +55,7 @@ use reverie::syscalls::FcntlCmd;
 use reverie::syscalls::PathPtr;
 use reverie::syscalls::ReadAddr;
 use reverie::syscalls::Syscall;
+#[cfg(any(feature = "prototype-runtime", test))]
 use reverie::syscalls::SyscallArgs;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
@@ -66,6 +69,18 @@ pub type SyscallInvoker = unsafe extern "C" fn(usize, i64, *const u64) -> i64;
 
 /// Native callback used to translate DynamoRIO's machine context.
 pub type RegisterReader = unsafe extern "C" fn(usize, *mut libc::user_regs_struct) -> i32;
+
+/// Native callback used to copy application memory with DynamoRIO fault handling.
+pub type MemoryReader = unsafe extern "C" fn(usize, *mut u8, usize) -> i32;
+
+/// Result of dispatching a syscall through an external DBI Tool.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DbiSyscallOutcome {
+    /// Suppress the original syscall and install this return value.
+    Suppress(i64),
+    /// Let DynamoRIO execute the original syscall after the Rust callback returns.
+    AllowOriginal,
+}
 
 /// In-process guest state passed to a Reverie tool handler.
 pub struct DbiGuest<'a, T>
@@ -82,14 +97,16 @@ where
     config: &'a <T::GlobalState as GlobalTool>::Config,
     invoke_syscall: SyscallInvoker,
     read_registers: RegisterReader,
+    tail_inject_result: Arc<TailInjectResult>,
 }
 
 impl<'a, T> DbiGuest<'a, T>
 where
     T: Tool,
 {
+    /// Creates a DBI guest adapter for an external Reverie tool runtime.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    pub fn new(
         context: usize,
         tid: Pid,
         pid: Pid,
@@ -112,7 +129,34 @@ where
             config,
             invoke_syscall,
             read_registers,
+            tail_inject_result: Arc::new(TailInjectResult::default()),
         }
+    }
+}
+
+struct DbiGlobal<'a, T>
+where
+    T: Tool,
+{
+    tid: Pid,
+    global_state: &'a T::GlobalState,
+    config: &'a <T::GlobalState as GlobalTool>::Config,
+}
+
+#[reverie::tool]
+impl<T> GlobalRPC<T::GlobalState> for DbiGlobal<'_, T>
+where
+    T: Tool,
+{
+    async fn send_rpc(
+        &self,
+        message: <T::GlobalState as GlobalTool>::Request,
+    ) -> <T::GlobalState as GlobalTool>::Response {
+        self.global_state.receive_rpc(self.tid, message).await
+    }
+
+    fn config(&self) -> &<T::GlobalState as GlobalTool>::Config {
+        self.config
     }
 }
 
@@ -201,21 +245,21 @@ where
     }
 
     async fn tail_inject<S: SyscallInfo>(&mut self, syscall: S) -> Never {
-        // Perform the syscall in-process now, record its result, then suspend
-        // forever. The driver polls each handler exactly once; on `Poll::Pending`
-        // it installs the recorded result and drops this future. This mirrors the
-        // ptrace backend, which tail-injects by cancelling the handler and
-        // awaiting `future::pending()`.
-        //
-        // We must NOT diverge by panicking: unwinding a panic out of a handler
-        // aborts the process under the DynamoRIO client (its callback runs on a
-        // C frame the Rust unwinder cannot cross, so `catch_unwind` in the driver
-        // does not contain it). Suspend-and-drop avoids unwinding entirely.
+        // An exiting application thread can invoke DynamoRIO's thread-exit
+        // callback reentrantly from `dr_invoke_syscall_as_app`. Defer those two
+        // syscalls until this Rust callback and all state borrows have returned.
+        let (number, args) = syscall.into_parts();
+        if matches!(number, Sysno::exit | Sysno::exit_group) {
+            self.tail_inject_result.set_allow_original();
+            std::future::pending().await
+        }
+
+        let syscall = Syscall::from_raw(number, args);
         let value = match self.inject(syscall).await {
             Ok(value) => value,
             Err(errno) => -(errno.into_raw() as i64),
         };
-        TAIL_INJECT_RESULT.with(|slot| slot.set(Some(value)));
+        self.tail_inject_result.set_result(value);
         std::future::pending().await
     }
 
@@ -336,12 +380,44 @@ fn align_up(value: usize, align: usize) -> usize {
     (value + align - 1) & !(align - 1)
 }
 
-thread_local! {
-    /// Result recorded by [`Guest::tail_inject`] on this thread before it
-    /// suspends. The driver takes it when a handler poll returns `Poll::Pending`
-    /// and installs it as the syscall's result. See [`Guest::tail_inject`].
-    static TAIL_INJECT_RESULT: std::cell::Cell<Option<i64>> =
-        const { std::cell::Cell::new(None) };
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TailInjectAction {
+    Return(i64),
+    AllowOriginal,
+}
+
+#[derive(Debug, Default)]
+struct TailInjectResult {
+    action: AtomicU8,
+    value: AtomicI64,
+}
+
+impl TailInjectResult {
+    fn clear(&self) {
+        self.action.store(0, Ordering::SeqCst);
+    }
+
+    fn set_result(&self, value: i64) {
+        self.value.store(value, Ordering::SeqCst);
+        self.action.store(1, Ordering::SeqCst);
+    }
+
+    fn set_allow_original(&self) {
+        self.action.store(2, Ordering::SeqCst);
+    }
+
+    fn take(&self) -> Option<TailInjectAction> {
+        match self.action.swap(0, Ordering::SeqCst) {
+            0 => None,
+            1 => Some(TailInjectAction::Return(self.value.load(Ordering::SeqCst))),
+            2 => Some(TailInjectAction::AllowOriginal),
+            value => panic!("invalid tail-inject action {value}"),
+        }
+    }
+
+    fn is_ready(&self) -> bool {
+        self.action.load(Ordering::SeqCst) != 0
+    }
 }
 
 /// Per-thread state used by the prototype tool.
@@ -679,6 +755,7 @@ fn deterministic_sysinfo<G: Guest<PrototypeTool>>(
     Ok(0)
 }
 
+#[cfg(any(feature = "prototype-runtime", test))]
 fn should_rewrite_syscall(sysnum: i64) -> bool {
     [
         libc::SYS_write,
@@ -756,68 +833,182 @@ fn rewrite_bind_port<G: Guest<PrototypeTool>>(
 /// that made the syscall, but Reverie handlers are `async` and may suspend for
 /// two distinct reasons that this driver must tell apart:
 ///
-/// 1. **A genuine cross-thread wait.** Detcore's `send_rpc` awaits the global
-///    scheduler and returns [`Poll::Pending`] until another thread grants this
-///    thread its turn. This is a *resumable* suspension: we park the OS thread
-///    with a real waker and re-poll when unparked. Because each guest thread
-///    runs this on its own OS thread, N guest threads block independently and a
-///    wake from any thread (e.g. the scheduler granting a turn) resumes exactly
-///    the parked thread it targets. This is what unblocks async handlers at the
-///    FFI boundary (PR #40).
+/// 1. A genuine cross-thread wait, such as Detcore awaiting its global
+///    scheduler. The driver cooperatively re-polls until the scheduler makes
+///    the future ready. It deliberately avoids Rust thread-local park APIs,
+///    which are unavailable on DynamoRIO application threads.
 ///
-/// 2. **`tail_inject`.** It performs the syscall, records its result in
-///    [`TAIL_INJECT_RESULT`], then suspends *forever* (it resolves to `Never`).
-///    A blocking executor must NOT park on this — it would deadlock, since no
-///    wake is ever coming. We detect this specific suspension by observing that
-///    `TAIL_INJECT_RESULT` was populated during the poll, and return `None` so
-///    the driver installs the recorded result and drops the future (PR #32).
-///    We return `None` rather than panicking because a panic aborts under the
-///    DynamoRIO client (see [`Guest::tail_inject`]).
+/// 2. [`Guest::tail_inject`], which performs the syscall, stores its result in
+///    the guest-owned [`TailInjectResult`], and then suspends forever. The
+///    driver returns `None` as soon as that result appears so the caller can
+///    install it and drop the suspended future.
 ///
-/// Handlers that complete on the first poll (such as the prototype tool) never
-/// park and never touch `TAIL_INJECT_RESULT`; they return `Some` immediately.
-fn run_ready<F: Future>(future: F) -> Option<F::Output> {
-    /// Waker that unparks the OS thread blocked inside [`run_ready`].
-    struct ThreadWaker(thread::Thread);
-
-    impl Wake for ThreadWaker {
-        fn wake(self: Arc<Self>) {
-            self.0.unpark();
-        }
-
-        fn wake_by_ref(self: &Arc<Self>) {
-            self.0.unpark();
-        }
-    }
-
+/// Handlers that complete on the first poll return `Some` immediately.
+fn run_ready<F: Future>(future: F, tail_result: &TailInjectResult) -> Option<F::Output> {
     let mut future = pin!(future);
-    let waker = Waker::from(Arc::new(ThreadWaker(thread::current())));
-    let mut context = Context::from_waker(&waker);
+    let waker = Waker::noop();
+    let mut context = Context::from_waker(waker);
     loop {
         match future.as_mut().poll(&mut context) {
             Poll::Ready(value) => return Some(value),
-            // A `tail_inject` records its result just before suspending forever;
-            // parking here would deadlock, so surface `None` and let the driver
-            // install the recorded result. Any other pending state is a genuine
-            // resumable wait (e.g. the scheduler): park until a waker unparks
-            // us, then re-poll. `park` may return spuriously and the loop simply
-            // re-polls; an unpark token stored by `wake` before we reach `park`
-            // makes `park` return immediately, so wakeups are never lost.
-            Poll::Pending => {
-                if TAIL_INJECT_RESULT.with(|slot| slot.get()).is_some() {
-                    return None;
-                }
-                thread::park();
-            }
+            Poll::Pending if tail_result.is_ready() => return None,
+            Poll::Pending => std::hint::spin_loop(),
         }
     }
 }
 
+/// Drives an external tool's thread-start lifecycle hook on a DBI guest.
+#[allow(clippy::too_many_arguments)]
+pub fn run_tool_thread_start<T: Tool>(
+    tool: &T,
+    context: usize,
+    tid: Pid,
+    pid: Pid,
+    branch_count: u64,
+    thread_state: &mut T::ThreadState,
+    global_state: &T::GlobalState,
+    config: &<T::GlobalState as GlobalTool>::Config,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
+) -> Result<(), Error> {
+    let mut guest = DbiGuest::new(
+        context,
+        tid,
+        pid,
+        None,
+        branch_count,
+        thread_state,
+        global_state,
+        config,
+        invoke_syscall,
+        read_registers,
+    );
+    let tail_result = Arc::clone(&guest.tail_inject_result);
+    run_ready(tool.handle_thread_start(&mut guest), &tail_result)
+        .expect("thread-start handler unexpectedly tail-injected")
+}
+
+/// Drives an external tool's post-exec lifecycle hook on a DBI guest.
+#[allow(clippy::too_many_arguments)]
+pub fn run_tool_post_exec<T: Tool>(
+    tool: &T,
+    context: usize,
+    tid: Pid,
+    pid: Pid,
+    branch_count: u64,
+    thread_state: &mut T::ThreadState,
+    global_state: &T::GlobalState,
+    config: &<T::GlobalState as GlobalTool>::Config,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
+) -> Result<(), Errno> {
+    let mut guest = DbiGuest::new(
+        context,
+        tid,
+        pid,
+        None,
+        branch_count,
+        thread_state,
+        global_state,
+        config,
+        invoke_syscall,
+        read_registers,
+    );
+    let tail_result = Arc::clone(&guest.tail_inject_result);
+    run_ready(tool.handle_post_exec(&mut guest), &tail_result)
+        .expect("post-exec handler unexpectedly tail-injected")
+}
+
+/// Drives an external tool's thread-exit lifecycle hook.
+pub fn run_tool_thread_exit<T: Tool>(
+    tool: &T,
+    tid: Pid,
+    thread_state: T::ThreadState,
+    global_state: &T::GlobalState,
+    config: &<T::GlobalState as GlobalTool>::Config,
+    exit_status: ExitStatus,
+) -> Result<(), Error> {
+    let global = DbiGlobal::<T> {
+        tid,
+        global_state,
+        config,
+    };
+    let tail_result = TailInjectResult::default();
+    run_ready(
+        tool.on_exit_thread(tid, &global, thread_state, exit_status),
+        &tail_result,
+    )
+    .expect("thread-exit handler unexpectedly tail-injected")
+}
+
+/// Drives one syscall through an external Reverie tool over [`DbiGuest`].
+#[allow(clippy::too_many_arguments)]
+pub fn run_tool_syscall<T: Tool>(
+    tool: &T,
+    context: usize,
+    tid: Pid,
+    pid: Pid,
+    branch_count: u64,
+    thread_state: &mut T::ThreadState,
+    global_state: &T::GlobalState,
+    config: &<T::GlobalState as GlobalTool>::Config,
+    syscall: Syscall,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
+) -> Result<DbiSyscallOutcome, Error> {
+    let mut guest = DbiGuest::new(
+        context,
+        tid,
+        pid,
+        None,
+        branch_count,
+        thread_state,
+        global_state,
+        config,
+        invoke_syscall,
+        read_registers,
+    );
+    let tail_result = Arc::clone(&guest.tail_inject_result);
+    tail_result.clear();
+    match run_ready(tool.handle_syscall_event(&mut guest, syscall), &tail_result) {
+        Some(result) => result.map(DbiSyscallOutcome::Suppress),
+        None => match tail_result
+            .take()
+            .expect("tool handler suspended without a tail-inject result")
+        {
+            TailInjectAction::Return(value) => Errno::from_ret(value as usize)
+                .map(|value| DbiSyscallOutcome::Suppress(value as i64))
+                .map_err(Error::from),
+            TailInjectAction::AllowOriginal => Ok(DbiSyscallOutcome::AllowOriginal),
+        },
+    }
+}
+
+/// Returns the Cargo-vendored DynamoRIO launcher built for this crate.
+pub fn bundled_drrun_path() -> &'static Path {
+    Path::new(env!("REVERIE_DBI_DYNAMORIO_DRRUN"))
+}
+
+/// Returns the Cargo-vendored DynamoRIO CMake package directory.
+pub fn bundled_dynamorio_cmake_dir() -> &'static Path {
+    Path::new(env!("REVERIE_DBI_DYNAMORIO_CMAKE"))
+}
+
+/// Returns the source directory for the native DynamoRIO client.
+pub fn native_client_source_dir() -> &'static Path {
+    Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/native"))
+}
+#[cfg(feature = "prototype-runtime")]
 static PROTOTYPE_TOOL: PrototypeTool = PrototypeTool;
+#[cfg(feature = "prototype-runtime")]
 static GLOBAL_STATE: () = ();
+#[cfg(feature = "prototype-runtime")]
 static CONFIG: () = ();
+#[cfg(feature = "prototype-runtime")]
 static TOTAL_BRANCHES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "prototype-runtime")]
 static TOTAL_SYSCALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "prototype-runtime")]
 static TOTAL_REWRITTEN: AtomicU64 = AtomicU64::new(0);
 
 /// Initializes the prototype state for the current application thread.
@@ -825,10 +1016,20 @@ static TOTAL_REWRITTEN: AtomicU64 = AtomicU64::new(0);
 /// # Safety
 ///
 /// `counters` must point to aligned, writable storage for one counter value.
+#[cfg(feature = "prototype-runtime")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(counters: *mut PrototypeCounters) {
     unsafe { counters.write(PrototypeCounters::default()) };
 }
+
+/// Releases prototype state for an exiting application thread.
+///
+/// # Safety
+///
+/// `counters` must be the pointer previously passed to thread initialization.
+#[cfg(feature = "prototype-runtime")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reverie_dbi_runtime_thread_exit(_counters: *mut PrototypeCounters) {}
 
 /// Handles a DynamoRIO pre-syscall event.
 ///
@@ -840,6 +1041,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(counters: *mut Prototyp
 /// The context and callback pointers must remain valid for the call. `counters`
 /// and `result` must be writable, and `args` must address six syscall arguments.
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "prototype-runtime")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     context: *mut c_void,
@@ -852,6 +1054,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     result: *mut i64,
     invoke_syscall: SyscallInvoker,
     read_registers: RegisterReader,
+    _read_memory: MemoryReader,
     emit: tools::Emitter,
 ) -> i32 {
     // NB: `catch_unwind` cannot actually contain a panic here — unwinding out of
@@ -916,20 +1119,18 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
         );
         // Clear any stale tail-inject result before polling; `tail_inject`
         // records a fresh one just before it suspends.
-        TAIL_INJECT_RESULT.with(|slot| slot.set(None));
-        let value = match run_ready(PROTOTYPE_TOOL.handle_syscall_event(&mut guest, syscall)) {
+        let tail_result = Arc::clone(&guest.tail_inject_result);
+        tail_result.clear();
+        let value = match run_ready(
+            PROTOTYPE_TOOL.handle_syscall_event(&mut guest, syscall),
+            &tail_result,
+        ) {
             Some(Ok(value)) => value,
             Some(Err(Error::Errno(errno))) => -(errno.into_raw() as i64),
             Some(Err(_)) => -(Errno::EIO.into_raw() as i64),
-            None => match TAIL_INJECT_RESULT.with(|slot| slot.take()) {
-                // The handler suspended after `tail_inject`: install its result
-                // and let the suspended future drop when this scope ends.
-                Some(value) => value,
-                // Unexpected suspension (a tool awaited something other than
-                // `tail_inject`). The single-poll driver cannot resume it, so
-                // leave the syscall unchanged rather than installing a bogus
-                // result.
-                None => return false,
+            None => match tail_result.take() {
+                Some(TailInjectAction::Return(value)) => value,
+                Some(TailInjectAction::AllowOriginal) | None => return false,
             },
         };
         unsafe { result.write(value) };
@@ -945,21 +1146,43 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     }
 }
 
+/// Initializes the built-in prototype runtime on a native client thread.
+#[cfg(feature = "prototype-runtime")]
+#[unsafe(no_mangle)]
+pub extern "C" fn reverie_dbi_runtime_background_init(_argument: *mut c_void) {}
+
+/// Reports whether the built-in prototype runtime is ready for callbacks.
+#[cfg(feature = "prototype-runtime")]
+#[unsafe(no_mangle)]
+pub extern "C" fn reverie_dbi_runtime_ready() -> i32 {
+    1
+}
+
+/// Returns the name of the built-in DBI runtime for native summary evidence.
+#[cfg(feature = "prototype-runtime")]
+#[unsafe(no_mangle)]
+pub extern "C" fn reverie_dbi_runtime_name() -> *const libc::c_char {
+    c"PrototypeTool".as_ptr()
+}
+
 /// Returns process-wide prototype counters accumulated at syscall boundaries.
 ///
 /// # Safety
 ///
 /// Each output pointer must be aligned and writable for one `u64`.
+#[cfg(feature = "prototype-runtime")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reverie_dbi_runtime_totals(
     branches: *mut u64,
     syscalls: *mut u64,
     rewritten: *mut u64,
+    memory_hash: *mut u64,
 ) {
     unsafe {
         branches.write(TOTAL_BRANCHES.load(Ordering::Relaxed));
         syscalls.write(TOTAL_SYSCALLS.load(Ordering::Relaxed));
         rewritten.write(TOTAL_REWRITTEN.load(Ordering::Relaxed));
+        memory_hash.write(0);
     }
     // NB: the syscall-counter tool prints its histogram from the guest's own
     // exit_group syscall (see `tools`), not here — this callback runs on the
@@ -1032,11 +1255,10 @@ mod tests {
             }
         });
 
-        // `run_ready` now returns `Option` (`None` is reserved for a
-        // `tail_inject` suspend); a genuine cross-thread wake resolves to
-        // `Some`. The future never touches `TAIL_INJECT_RESULT`, so the park
-        // path is exercised and the result comes back wrapped in `Some`.
-        assert_eq!(run_ready(future), Some(1234));
+        // A cross-thread completion is observed by the TLS-free cooperative
+        // poll loop and returned as `Some`.
+        let tail_result = TailInjectResult::default();
+        assert_eq!(run_ready(future, &tail_result), Some(1234));
         handle.join().unwrap();
     }
 
@@ -1057,15 +1279,20 @@ mod tests {
             read_regs,
         );
 
+        let tail_result = Arc::clone(&guest.tail_inject_result);
         assert_eq!(
-            run_ready(PROTOTYPE_TOOL.handle_syscall_event(&mut guest, syscall))
-                .unwrap()
-                .unwrap(),
+            run_ready(
+                PROTOTYPE_TOOL.handle_syscall_event(&mut guest, syscall),
+                &tail_result,
+            )
+            .unwrap()
+            .unwrap(),
             7
         );
         assert_eq!(guest.thread_state().rewritten_syscalls, 1);
         assert_eq!(guest.read_clock().unwrap(), 99);
-        assert_eq!(run_ready(guest.regs()).unwrap().rip, 0x1234);
+        let tail_result = Arc::clone(&guest.tail_inject_result);
+        assert_eq!(run_ready(guest.regs(), &tail_result).unwrap().rip, 0x1234);
     }
 
     #[test]
@@ -1089,10 +1316,14 @@ mod tests {
             read_regs,
         );
 
+        let tail_result = Arc::clone(&guest.tail_inject_result);
         assert_eq!(
-            run_ready(PROTOTYPE_TOOL.handle_syscall_event(&mut guest, syscall))
-                .unwrap()
-                .unwrap(),
+            run_ready(
+                PROTOTYPE_TOOL.handle_syscall_event(&mut guest, syscall),
+                &tail_result,
+            )
+            .unwrap()
+            .unwrap(),
             0
         );
         let field = |bytes: &[libc::c_char]| {
@@ -1236,8 +1467,6 @@ mod tests {
 
     #[test]
     fn tail_inject_records_result_and_suspends() {
-        TAIL_INJECT_RESULT.with(|slot| slot.set(None));
-
         let mut counters = PrototypeCounters::default();
         let syscall = Syscall::from_raw(Sysno::write, SyscallArgs::new(1, 0x1000, 7, 0, 0, 0));
         let mut guest: DbiGuest<'_, PrototypeTool> = DbiGuest::new(
@@ -1254,11 +1483,23 @@ mod tests {
         );
 
         // `tail_inject` performs the syscall, records its result, then suspends
-        // forever, so a single poll returns `Poll::Pending` (`None` here).
-        let polled = run_ready(guest.tail_inject(syscall));
+        // forever, so the driver returns `None`.
+        let tail_result = Arc::clone(&guest.tail_inject_result);
+        tail_result.clear();
+        let polled = run_ready(guest.tail_inject(syscall), &tail_result);
         assert!(polled.is_none(), "tail_inject must suspend, not resolve");
         // The injected `write` returns its length argument (see `invoke`).
-        assert_eq!(TAIL_INJECT_RESULT.with(|slot| slot.take()), Some(7));
+        assert_eq!(tail_result.take(), Some(TailInjectAction::Return(7)));
+
+        let exit = Syscall::from_raw(Sysno::exit_group, SyscallArgs::new(0, 0, 0, 0, 0, 0));
+        tail_result.clear();
+        let polled = run_ready(guest.tail_inject(exit), &tail_result);
+        assert!(polled.is_none(), "exit tail-inject must suspend");
+        assert_eq!(
+            tail_result.take(),
+            Some(TailInjectAction::AllowOriginal),
+            "exit must run only after Rust callback borrows are released"
+        );
     }
 
     #[test]

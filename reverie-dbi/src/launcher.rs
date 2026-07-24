@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::process::ExitStatus;
 use std::process::Output;
+use std::process::Stdio;
 
 const CLIENT_ENV: &str = "REVERIE_DBI_CLIENT";
 const DYNAMORIO_ENV: &str = "DYNAMORIO_HOME";
@@ -103,6 +104,46 @@ impl DbiRunner {
         self.command(guest, None).output()
     }
 
+    /// Captures guest output while preserving an inherited terminal stdin.
+    pub fn output_with_inherited_stdin(&self, guest: &Command) -> io::Result<Output> {
+        self.command(guest, None).stdin(Stdio::inherit()).output()
+    }
+
+    /// Runs `guest` with captured output and supplies `input` on standard input.
+    pub fn output_with_input(&self, guest: &Command, input: &[u8]) -> io::Result<Output> {
+        self.output_with_reader(guest, io::Cursor::new(input))
+    }
+
+    /// Runs `guest` with captured output while streaming its standard input.
+    pub fn output_with_reader<R>(&self, guest: &Command, mut input: R) -> io::Result<Output>
+    where
+        R: Read + Send,
+    {
+        let mut child = self
+            .command(guest, None)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut stdin = child.stdin.take().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "failed to open DBI guest stdin")
+        })?;
+
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(move || io::copy(&mut input, &mut stdin));
+            let output = child.wait_with_output();
+            let write_result = writer
+                .join()
+                .map_err(|_| io::Error::other("DBI guest stdin writer thread panicked"))?;
+            if let Err(error) = write_result
+                && error.kind() != io::ErrorKind::BrokenPipe
+            {
+                return Err(error);
+            }
+            output
+        })
+    }
+
     /// Captures `guest` output while supplying an exact guest environment.
     pub fn output_with_environment(
         &self,
@@ -118,7 +159,12 @@ impl DbiRunner {
         environment: Option<&BTreeMap<OsString, OsString>>,
     ) -> Command {
         let mut command = Command::new(&self.drrun);
-        command.arg("-disable_rseq").arg("-c").arg(&self.client);
+        command
+            .arg("-quiet")
+            .arg("-disable_rseq")
+            .args(["-stack_size", "2M"])
+            .arg("-c")
+            .arg(&self.client);
         if self.summary {
             command.arg("-summary");
         }
@@ -292,7 +338,10 @@ mod tests {
         assert_eq!(
             wrapped.get_args().collect::<Vec<_>>(),
             [
+                "-quiet",
                 "-disable_rseq",
+                "-stack_size",
+                "2M",
                 "-c",
                 "/opt/reverie/libreverie_dbi_client.so",
                 "--",
@@ -325,7 +374,10 @@ mod tests {
         assert_eq!(
             wrapped.get_args().collect::<Vec<_>>(),
             [
+                OsStr::new("-quiet"),
                 OsStr::new("-disable_rseq"),
+                OsStr::new("-stack_size"),
+                OsStr::new("2M"),
                 OsStr::new("-c"),
                 OsStr::new("/opt/reverie/libreverie_dbi_client.so"),
                 OsStr::new("--"),
@@ -347,6 +399,41 @@ mod tests {
             wrapped.get_envs().collect::<Vec<_>>(),
             [(OsStr::new("ONLY"), Some(OsStr::new("guest")))]
         );
+    }
+
+    #[test]
+    fn supplies_captured_standard_input() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let drrun = root.path().join("drrun");
+        let client = root.path().join("client.so");
+        std::fs::write(
+            &drrun,
+            b"#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&drrun, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(&client, b"placeholder").unwrap();
+
+        let runner = DbiRunner::new(drrun, client).unwrap();
+        let output = runner
+            .output_with_input(&Command::new("/bin/cat"), b"hello from stdin\n")
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"hello from stdin\n");
+
+        let large_input = vec![b'x'; 1024 * 1024];
+        let output = runner
+            .output_with_input(&Command::new("/bin/cat"), &large_input)
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, large_input);
+
+        let output = runner
+            .output_with_input(&Command::new("/bin/true"), &output.stdout)
+            .unwrap();
+        assert!(output.status.success());
     }
 
     #[test]

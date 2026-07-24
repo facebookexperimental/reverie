@@ -10,7 +10,9 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/user.h>
@@ -28,11 +30,13 @@
 
 typedef int64_t (*syscall_invoker_t)(uintptr_t, int64_t, const uint64_t *);
 typedef int32_t (*register_reader_t)(uintptr_t, struct user_regs_struct *);
+typedef int32_t (*memory_reader_t)(uintptr_t, uint8_t *, size_t);
 
 typedef struct {
   uint64_t branches;
   uint64_t observed_syscalls;
   uint64_t rewritten_syscalls;
+  void *runtime_state;
 } prototype_counters_t;
 
 typedef struct {
@@ -96,15 +100,21 @@ static void reverie_dbi_emit(const char *buf, size_t len) {
 }
 
 extern void reverie_dbi_runtime_thread_init(prototype_counters_t *counters);
+extern void reverie_dbi_runtime_thread_exit(prototype_counters_t *counters);
+extern void reverie_dbi_runtime_background_init(void *argument);
+extern int32_t reverie_dbi_runtime_ready(void);
 extern int32_t reverie_dbi_runtime_pre_syscall(
     void *context, prototype_counters_t *counters, int32_t tid, int32_t pid,
     int64_t sysnum, const uint64_t *args, uint64_t branches, int64_t *result,
     syscall_invoker_t invoke_syscall, register_reader_t read_registers,
-    reverie_emit_fn_t emit);
+    memory_reader_t read_memory, reverie_emit_fn_t emit);
+extern const char *reverie_dbi_runtime_name(void);
 extern void reverie_dbi_runtime_totals(uint64_t *branches, uint64_t *syscalls,
-                                       uint64_t *rewritten);
+                                       uint64_t *rewritten,
+                                       uint64_t *memory_hash);
 
 static _Atomic uint64_t branch_count __attribute__((aligned(64)));
+static _Atomic uint64_t stdin_read_count;
 static _Atomic uint64_t virtual_time_ns = UINT64_C(1000000000);
 static int thread_state_index;
 static ptr_uint_t cpuid_marker_note;
@@ -247,6 +257,10 @@ static int32_t read_registers(uintptr_t context, struct user_regs_struct *out) {
   out->eflags = registers.xflags;
   out->rsp = registers.xsp;
   return 1;
+}
+
+static int32_t read_memory(uintptr_t address, uint8_t *out, size_t size) {
+  return read_app((const void *)address, out, size) ? 1 : 0;
 }
 
 static void init_virtual_limits(void) {
@@ -603,9 +617,96 @@ static void module_load(void *drcontext, const module_data_t *module,
 #endif
 }
 
+static bool fd_matches_stdin(void *drcontext, int fd) {
+  if (fd == 0)
+    return true;
+#ifdef SYS_fstat
+  struct stat stdin_stat = {0};
+  struct stat candidate_stat = {0};
+  uint64_t stat_args[6] = {0, (uint64_t)(uintptr_t)&stdin_stat};
+  if (invoke_syscall((uintptr_t)drcontext, SYS_fstat, stat_args) < 0)
+    return false;
+  stat_args[0] = (uint64_t)fd;
+  stat_args[1] = (uint64_t)(uintptr_t)&candidate_stat;
+  if (invoke_syscall((uintptr_t)drcontext, SYS_fstat, stat_args) < 0)
+    return false;
+  if (stdin_stat.st_dev == candidate_stat.st_dev &&
+      stdin_stat.st_ino == candidate_stat.st_ino)
+    return true;
+#if defined(SYS_ioctl) && defined(TIOCGDEV)
+  unsigned int stdin_device = 0;
+  unsigned int candidate_device = 0;
+  uint64_t ioctl_args[6] = {0, TIOCGDEV, (uint64_t)(uintptr_t)&stdin_device};
+  if (invoke_syscall((uintptr_t)drcontext, SYS_ioctl, ioctl_args) < 0)
+    return false;
+  ioctl_args[0] = (uint64_t)fd;
+  ioctl_args[2] = (uint64_t)(uintptr_t)&candidate_device;
+  if (invoke_syscall((uintptr_t)drcontext, SYS_ioctl, ioctl_args) < 0)
+    return false;
+  return stdin_device == candidate_device;
+#else
+  return false;
+#endif
+#else
+  return false;
+#endif
+}
+
+static bool syscall_reads_stdin(void *drcontext, int sysnum,
+                                const uint64_t *args) {
+  int fd;
+  switch (sysnum) {
+#ifdef SYS_read
+  case SYS_read:
+#endif
+#ifdef SYS_readv
+  case SYS_readv:
+#endif
+#ifdef SYS_pread64
+  case SYS_pread64:
+#endif
+#ifdef SYS_preadv
+  case SYS_preadv:
+#endif
+#ifdef SYS_preadv2
+  case SYS_preadv2:
+#endif
+#ifdef SYS_recvfrom
+  case SYS_recvfrom:
+#endif
+#ifdef SYS_recvmsg
+  case SYS_recvmsg:
+#endif
+#ifdef SYS_recvmmsg
+  case SYS_recvmmsg:
+#endif
+#ifdef SYS_splice
+  case SYS_splice:
+#endif
+#ifdef SYS_tee
+  case SYS_tee:
+#endif
+#ifdef SYS_copy_file_range
+  case SYS_copy_file_range:
+#endif
+    fd = (int)args[0];
+    break;
+#ifdef SYS_sendfile
+  case SYS_sendfile:
+    fd = (int)args[1];
+    break;
+#endif
+  default:
+    return false;
+  }
+  return fd_matches_stdin(drcontext, fd);
+}
+
 static bool filter_syscall(void *drcontext, int sysnum) { return true; }
 
 static bool pre_syscall(void *drcontext, int sysnum) {
+  while (!reverie_dbi_runtime_ready())
+    dr_sleep(1);
   uint64_t args[6];
   int64_t result = 0;
   int i;
@@ -615,22 +716,26 @@ static bool pre_syscall(void *drcontext, int sysnum) {
   DR_ASSERT(counters != NULL);
   for (i = 0; i != 6; ++i)
     args[i] = (uint64_t)dr_syscall_get_param(drcontext, i);
+  if (syscall_reads_stdin(drcontext, sysnum, args))
+    atomic_fetch_add_explicit(&stdin_read_count, 1, memory_order_relaxed);
 
+  if (reverie_dbi_runtime_pre_syscall(
+          drcontext, counters, (int32_t)dr_get_thread_id(drcontext),
+          (int32_t)dr_get_process_id(), (int64_t)sysnum, args,
+          atomic_load_explicit(&branch_count, memory_order_relaxed), &result,
+          invoke_syscall, read_registers, read_memory, reverie_dbi_emit)) {
+    dr_syscall_set_result(drcontext, (reg_t)result);
+    return false;
+  }
+
+  /* Prototype runtimes can decline these calls; external Tools such as
+   * Detcore own their complete syscall policy and handle them above. */
   if (handle_virtual_clock((uintptr_t)drcontext, sysnum, args, &result) ||
       handle_virtual_resource(sysnum, args, &result)) {
     counters->branches =
         atomic_load_explicit(&branch_count, memory_order_relaxed);
     counters->observed_syscalls += 1;
     counters->rewritten_syscalls += 1;
-    dr_syscall_set_result(drcontext, (reg_t)result);
-    return false;
-  }
-
-  if (reverie_dbi_runtime_pre_syscall(
-          drcontext, counters, (int32_t)dr_get_thread_id(drcontext),
-          (int32_t)dr_get_process_id(), (int64_t)sysnum, args,
-          atomic_load_explicit(&branch_count, memory_order_relaxed), &result,
-          invoke_syscall, read_registers, reverie_dbi_emit)) {
     dr_syscall_set_result(drcontext, (reg_t)result);
     return false;
   }
@@ -648,21 +753,27 @@ static void thread_init(void *drcontext) {
 static void thread_exit(void *drcontext) {
   prototype_counters_t *counters = (prototype_counters_t *)drmgr_get_tls_field(
       drcontext, thread_state_index);
-  if (counters != NULL)
+  if (counters != NULL) {
+    reverie_dbi_runtime_thread_exit(counters);
     dr_thread_free(drcontext, counters, sizeof(*counters));
+  }
 }
 
 static void event_exit(void) {
   uint64_t branches;
   uint64_t syscalls;
   uint64_t rewritten;
+  uint64_t stdin_reads;
+  uint64_t memory_hash;
 
   if (report_summary) {
-    reverie_dbi_runtime_totals(&branches, &syscalls, &rewritten);
-    dr_fprintf(
-        STDERR,
-        "reverie-dbi: branches=%llu syscalls=%llu rewritten_writes=%llu\n",
-        branches, syscalls, rewritten);
+    reverie_dbi_runtime_totals(&branches, &syscalls, &rewritten, &memory_hash);
+    stdin_reads = atomic_load_explicit(&stdin_read_count, memory_order_relaxed);
+    dr_fprintf(STDERR,
+               "reverie-dbi: tool=%s branches=%llu syscalls=%llu "
+               "rewritten=%llu stdin_reads=%llu memory_hash=%016llx\n",
+               reverie_dbi_runtime_name(), branches, syscalls, rewritten,
+               stdin_reads, memory_hash);
   }
   dr_mutex_destroy(resource_lock);
   drwrap_exit();
@@ -695,6 +806,9 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[]) {
   if (thread_state_index == -1)
     DR_ASSERT(false);
 
+  if (!dr_create_client_thread(reverie_dbi_runtime_background_init,
+                               (void *)reverie_dbi_emit))
+    DR_ASSERT(false);
   drmgr_register_exit_event(event_exit);
   if (!drmgr_register_module_load_event(module_load) ||
       !drmgr_register_thread_init_event(thread_init) ||

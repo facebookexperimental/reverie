@@ -10,6 +10,10 @@ build = "build.rs"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = ["prototype-runtime"]
+prototype-runtime = []
+
 [dependencies]
 libc = "0.2.186"
 reverie = { version = "0.1.0", path = "../reverie" }
