@@ -222,6 +222,22 @@ Commit and push each change immediately; never leave a checkout dirty or claim
 "done" without a pushed commit behind it. A report that work is complete
 implies a clean `git status` and a pushed branch.
 
+## Autonomous Bot Audit Tags
+
+Bot-authored syscall and API changes must leave an explicit audit trail:
+
+- Add the exact marker `// AUTONOMOUS-BOT-IMPLEMENTED` at every syscall
+  match entry added by an autonomous bot. Only a human reviewer removes this
+  marker, and only after reviewing that entry.
+- Add `// TODO-HUMAN-REVIEW(PR-id)` to every bot-added syscall implementation
+  and API change, replacing `PR-id` with the pull request that introduced the
+  change (for example, `// TODO-HUMAN-REVIEW(PR-123)`). Place it on the changed
+  declaration or at the smallest code region it covers; do not use an unscoped
+  file-level marker.
+- A new syscall requires both markers: `// AUTONOMOUS-BOT-IMPLEMENTED` at its
+  dispatch match entry and `// TODO-HUMAN-REVIEW(PR-id)` at its implementation
+  or API surface. Do not remove or rename either marker autonomously.
+
 ## Dirty Checkout Recovery
 
 When a checkout is unexpectedly dirty:
