@@ -7,6 +7,7 @@ repository = "https://github.com/facebookexperimental/reverie"
 license = "BSD-2-Clause"
 
 [dependencies]
+goblin = { version = "0.10.7", features = ["elf32", "elf64", "endian_fd"] }
 kvm-bindings = "0.14.1"
 kvm-ioctls = "0.25.0"
 libc = "0.2.186"

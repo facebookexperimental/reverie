@@ -88,6 +88,11 @@ impl GuestMemory {
         self.mapping.size
     }
 
+    /// Returns the address immediately after this guest-memory region.
+    pub fn guest_end(&self) -> u64 {
+        self.mapping.guest_base + self.mapping.size as u64
+    }
+
     /// Returns whether the mapping is empty.
     pub fn is_empty(&self) -> bool {
         self.mapping.size == 0
@@ -129,6 +134,21 @@ impl GuestMemory {
                 self.mapping.mapping.as_ptr().add(offset),
                 source.len(),
             );
+        }
+        Ok(())
+    }
+    /// Zeros a guest-physical address range.
+    pub fn zero(&mut self, guest_address: u64, length: usize) -> Result<()> {
+        let offset = self.checked_offset(guest_address, length)?;
+        let _guard = self
+            .mapping
+            .host_access
+            .lock()
+            .expect("guest memory lock poisoned");
+        // SAFETY: checked_offset proves that the full range lies within the
+        // live mapping, and host writes are serialized by host_access.
+        unsafe {
+            std::ptr::write_bytes(self.mapping.mapping.as_ptr().add(offset), 0, length);
         }
         Ok(())
     }

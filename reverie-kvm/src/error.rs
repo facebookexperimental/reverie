@@ -11,6 +11,14 @@ use thiserror::Error;
 /// Errors produced by the KVM backend prototype.
 #[derive(Debug, Error)]
 pub enum Error {
+    /// A host filesystem operation failed while preparing the guest.
+    #[error("host filesystem operation failed: {0}")]
+    HostIo(#[from] std::io::Error),
+
+    /// A post-exec tool hook rejected the new guest image.
+    #[error("Reverie post-exec hook failed: {0}")]
+    PostExec(reverie::syscalls::Errno),
+
     /// A shared Reverie tool callback failed.
     #[error("Reverie tool failed: {0}")]
     Reverie(#[source] reverie::Error),
@@ -22,6 +30,14 @@ pub enum Error {
     /// The guest-memory mapping could not be created.
     #[error("failed to allocate guest memory: {0}")]
     MemoryMapping(#[source] std::io::Error),
+
+    /// The ELF image could not be parsed.
+    #[error("failed to parse ELF image: {0}")]
+    ElfParse(#[from] goblin::error::Error),
+
+    /// The ELF image cannot run in the minimal KVM process personality.
+    #[error("unsupported ELF image: {0}")]
+    UnsupportedElf(String),
 
     /// Guest memory must be non-empty and page aligned.
     #[error("invalid guest memory layout: base={guest_base:#x}, size={size:#x}")]
@@ -66,6 +82,23 @@ pub enum Error {
     /// The guest used a hypercall number other than the syscall transport.
     #[error("unexpected guest hypercall number {0}")]
     UnexpectedHypercall(u64),
+
+    /// The fixed long-mode bootstrap layout does not fit in guest memory.
+    #[error("guest memory is too small for the long-mode bootstrap")]
+    LongModeMemoryTooSmall,
+
+    /// No static ELF has been installed on this backend.
+    #[error("no static ELF is installed")]
+    StaticElfNotInstalled,
+
+    /// KVM accepted only part of the long-mode MSR table.
+    #[error("KVM installed {actual} of {expected} long-mode MSRs")]
+    IncompleteMsrSetup {
+        /// Number of MSRs supplied.
+        expected: usize,
+        /// Number of MSRs accepted.
+        actual: usize,
+    },
 
     /// The vCPU stopped for an event this prototype does not handle.
     #[error("unexpected vCPU exit: {0}")]

@@ -16,7 +16,12 @@ use crate::GuestMemory;
 use crate::Result;
 
 const WORD_SIZE: usize = std::mem::size_of::<u64>();
-const FRAME_WORDS: usize = 7;
+const REQUEST_WORDS: usize = 7;
+pub(crate) const RESULT_WORD: usize = 7;
+pub(crate) const RETURN_RIP_WORD: usize = 8;
+pub(crate) const RETURN_FLAGS_WORD: usize = 9;
+pub(crate) const SAVED_RBX_WORD: usize = 10;
+const FRAME_WORDS: usize = 11;
 const FRAME_SIZE: usize = WORD_SIZE * FRAME_WORDS;
 
 /// A Linux syscall request transported from guest to host memory.
@@ -96,7 +101,7 @@ impl SyscallRequest {
     pub(crate) fn read_from(memory: &GuestMemory, guest_address: u64) -> Result<Self> {
         let mut frame = [0; FRAME_SIZE];
         memory.read(guest_address, &mut frame)?;
-        let mut words = [0; FRAME_WORDS];
+        let mut words = [0; REQUEST_WORDS];
         for (index, value) in words.iter_mut().enumerate() {
             let start = index * WORD_SIZE;
             *value = u64::from_le_bytes(frame[start..start + WORD_SIZE].try_into().unwrap());
@@ -105,6 +110,17 @@ impl SyscallRequest {
             words[0],
             [words[1], words[2], words[3], words[4], words[5], words[6]],
         ))
+    }
+
+    pub(crate) fn write_result(
+        memory: &mut GuestMemory,
+        guest_address: u64,
+        result: i64,
+    ) -> Result<()> {
+        memory.write(
+            guest_address + (RESULT_WORD * WORD_SIZE) as u64,
+            &result.to_le_bytes(),
+        )
     }
 }
 

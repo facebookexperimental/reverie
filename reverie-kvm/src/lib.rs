@@ -8,14 +8,18 @@
 
 //! Minimal x86-64 KVM primitives for experimenting with a Reverie backend.
 //!
-//! This crate currently handles a single real-mode vCPU and a version-zero
-//! syscall transport. It intentionally does not claim to provide Linux process
-//! semantics; see the crate README for the remaining execution-runtime work.
+//! The crate supports the original real-mode transport probes and a bare
+//! long-mode process personality for fixed-address static ELF executables. The
+//! latter implements only a bounded, single-process subset of Linux semantics;
+//! see the crate README for its explicit limits.
 
 #![cfg(target_arch = "x86_64")]
 
+mod bootstrap;
 mod cpuid;
+mod elf;
 mod error;
+mod executor;
 mod memory;
 mod runtime;
 mod syscall;

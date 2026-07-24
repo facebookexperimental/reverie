@@ -1,8 +1,9 @@
 # reverie-kvm
 
 `reverie-kvm` is an x86-64 research backend for driving small KVM guests. It
-creates a VM and vCPU, provides bounded guest-physical memory access, and turns
-a guest `vmcall`/`vmmcall` into a typed Reverie syscall event.
+creates a VM and vCPU, provides bounded guest-physical memory access, turns a
+guest `vmcall`/`vmmcall` into a typed Reverie syscall event, and can run
+minimal static ELF executables in a bare long-mode process personality.
 
 The guest places the syscall number and six arguments in a fixed-size frame in
 guest memory. The hypercall passes the frame address to the host. `run` exposes
@@ -13,6 +14,14 @@ thread state, global RPC, syscall injection, and tail injection. Until a guest
 kernel supplies Linux syscall semantics, callers provide a `SyscallExecutor`
 for injected and unsubscribed syscalls.
 
+## ELF execution
+
+`install_static_elf` accepts little-endian x86-64 `ET_EXEC` and `ET_DYN` images. It copies `PT_LOAD` segments, zeros BSS, loads one `PT_INTERP` image when present, creates a Linux-style `argc`/`argv`/`envp`/auxv stack, and installs an identity-mapped long-mode address space. The vCPU starts at CPL3. `EFER.SCE`, `STAR`, `LSTAR`, and
+`SFMASK` direct real `SYSCALL` instructions to a ring-0 trampoline that
+serializes the Linux ABI register frame, exits KVM, then returns with
+`SYSRETQ`.
+
+`run_static_elf` supplies a deliberately small single-process Linux personality. It handles process exit, host-backed filesystem descriptors, stdout/stderr writes, deterministic identity, time and random queries, FS/GS bases, `brk`, anonymous and file-backed `mmap`, and common startup no-ops. Unsupported syscalls return `ENOSYS`.
 ## Typed syscall decoding
 
 Every valid x86-64 syscall number is decoded through Reverie's complete typed
@@ -37,30 +46,18 @@ This is a static vCPU feature policy, not a per-instruction
 `Tool::handle_cpuid_event` callback. The latter still requires the planned
 Linux execution bridge to preserve task-local callback context.
 
-## gVisor model
+## Relationship to gVisor
 
-gVisor's KVM platform keeps syscall policy above the architecture transport:
-`pkg/ring0/entry_amd64.s` saves the user register frame and enters its syscall
-trampoline, while `pkg/sentry/platform/kvm/bluepill_unsafe.go` classifies KVM
-exits before returning control to the sentry. This prototype follows the same
-separation on a smaller scale: the VM-exit layer validates and decodes the
-transport once, and the runtime layer presents backend-neutral Reverie types to
-the tool. Unlike gVisor, the prototype does not yet contain a ring-0 Linux
-personality.
+gVisor routes Linux filesystem syscalls through its Sentry VFS and the filesystem implementations under `pkg/sentry/fsimpl/`. Those layers own mount-namespace traversal, dentries, file descriptions, metadata, and directory iteration without exposing host descriptors directly. The closest syscall-facing paths are `pkg/sentry/syscalls/linux/sys_file.go` and `sys_getdents.go`.
+
+This backend follows the same separation between the architecture transport and syscall policy: the KVM exit path only carries a Linux register frame, while the executor owns guest descriptor allocation, path resolution, and ABI marshalling. The implementation is intentionally much smaller than gVisor: each opened filesystem descriptor owns a host `File`, relative paths resolve against the captured working directory or an owned directory descriptor, and subscribed calls pass through Detcore, whose tail injection invokes this executor before Detcore post-processes returned metadata; unsubscribed calls invoke the executor directly.
+
+No gVisor code is copied. Unlike the gVisor Sentry VFS and `pkg/sentry/fsimpl/` stack, this crate does not provide a virtual mount namespace, dentry cache, or filesystem implementation. Hermit container setup remains the isolation boundary, not this standalone crate, and a changing host-backed filesystem remains outside the determinism guarantee. Host procfs descriptors are rejected because they would identify the Hermit supervisor rather than a separate guest process.
 
 ## Current limits
 
-This crate is not yet a Linux execution backend for arbitrary ELF programs. It
-has one real-mode vCPU and no process lifecycle, virtual memory, signals,
-filesystem, or timer implementation beyond the shared single-thread lifecycle
-used by the test guest. The `/dev/kvm` integration tests run a multi-vmcall
-guest program and a CPUID probe. They route read, write, open, close, mmap,
-munmap, brk, and ioctl in one KVM run, and verify direct tool interception, the
-default Tool handler's ptrace-compatible `tail_inject` behavior, and the
-installed CPUID feature policy.
+This crate is not a complete Linux execution backend. The ELF path has one vCPU, fixed-address identity mappings, no threads or signals, and no page-permission enforcement. Filesystem access forwards into the host namespace with bounded memory copies and a guest-owned descriptor table; it does not isolate or snapshot host filesystem changes. The current hypercall transport also reuses standardized KVM
+hypercall 12 because it is the only hypercall KVM exposes to userspace; that
+prototype ABI must be replaced before running a stock guest kernel.
 
-Running `/bin/true` requires a Linux ABI implementation in the VM. In
-particular, the host binary is a dynamically linked PIE that needs an ELF
-loader, virtual memory, its dynamic interpreter, and Linux syscall semantics.
-Those belong in the planned gVisor Sentry bridge (or a guest kernel), not in
-the raw KVM ioctl layer.
+The ELF loader supports one host interpreter and enough file-backed mapping for small dynamically linked programs. General libc coverage remains bounded by the explicit syscall personality; unsupported operations fail with `ENOSYS` rather than silently bypassing the tool.

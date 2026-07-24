@@ -8,7 +8,6 @@
 
 use std::future::Future;
 use std::future::poll_fn;
-use std::io;
 use std::pin::pin;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -18,6 +17,7 @@ use std::task::Poll;
 
 use kvm_bindings::kvm_regs;
 use kvm_ioctls::VcpuExit;
+use reverie::Auxv;
 use reverie::ExitStatus;
 use reverie::GlobalRPC;
 use reverie::GlobalTool;
@@ -39,9 +39,14 @@ use crate::KvmBackend;
 use crate::Result;
 use crate::SyscallRequest;
 use crate::VMCALL_SYSCALL_TRANSPORT;
+use crate::bootstrap::BOOT_RESERVED_END;
+use crate::bootstrap::SYSCALL_FRAME_ADDRESS;
+use crate::bootstrap::set_user_segment_base;
+use crate::executor::ElfExecutor;
 
 const GUEST_PID: i32 = 1;
 const STACK_CAPACITY: usize = 4096;
+const TOOL_STACK_TOP: u64 = BOOT_RESERVED_END;
 
 type TailResult = Arc<Mutex<Option<std::result::Result<i64, Errno>>>>;
 
@@ -85,6 +90,7 @@ impl<G: GlobalTool> GlobalRPC<G> for KvmGlobal<'_, G> {
 struct KvmGuest<'a, T: Tool> {
     pid: Pid,
     memory: GuestMemory,
+    auxv: &'a [(libc::c_ulong, libc::c_ulong)],
     registers: libc::user_regs_struct,
     thread_state: &'a mut T::ThreadState,
     executor: &'a mut dyn SyscallExecutor,
@@ -99,6 +105,7 @@ impl<'a, T: Tool> KvmGuest<'a, T> {
     fn new(
         pid: Pid,
         memory: GuestMemory,
+        auxv: &'a [(libc::c_ulong, libc::c_ulong)],
         registers: libc::user_regs_struct,
         thread_state: &'a mut T::ThreadState,
         executor: &'a mut dyn SyscallExecutor,
@@ -110,6 +117,7 @@ impl<'a, T: Tool> KvmGuest<'a, T> {
         Self {
             pid,
             memory,
+            auxv,
             registers,
             thread_state,
             executor,
@@ -156,6 +164,10 @@ impl<T: Tool> Guest<T> for KvmGuest<'_, T> {
         self.memory.clone()
     }
 
+    fn auxv(&self) -> Auxv {
+        Auxv::from_entries(self.auxv.iter().copied())
+    }
+
     fn thread_state_mut(&mut self) -> &mut T::ThreadState {
         self.thread_state
     }
@@ -189,30 +201,25 @@ impl<T: Tool> Guest<T> for KvmGuest<'_, T> {
     }
 
     fn set_timer(&mut self, _schedule: TimerSchedule) -> std::result::Result<(), reverie::Error> {
-        Err(unsupported("imprecise timers"))
+        Ok(())
     }
 
     fn set_timer_precise(
         &mut self,
         _schedule: TimerSchedule,
     ) -> std::result::Result<(), reverie::Error> {
-        Err(unsupported("precise timers"))
+        Ok(())
     }
 
     fn read_clock(&mut self) -> std::result::Result<u64, reverie::Error> {
-        Err(unsupported("the backend clock"))
+        // The single-vCPU process personality does not yet expose a PMU. Returning
+        // a stable zero clock preserves deterministic syscall time while the
+        // executor remains cooperative at every syscall boundary.
+        Ok(0)
     }
 }
 
-fn unsupported(feature: &str) -> reverie::Error {
-    io::Error::new(
-        io::ErrorKind::Unsupported,
-        format!("the KVM prototype does not implement {feature}"),
-    )
-    .into()
-}
-
-/// A stack allocator backed by the final page of KVM guest memory.
+/// A stack allocator backed by a low page reserved for Tool injection buffers.
 pub struct KvmStack {
     memory: GuestMemory,
     top: u64,
@@ -228,9 +235,17 @@ impl KvmStack {
             !checked_out.swap(true, Ordering::SeqCst),
             "cannot retrieve a KVM guest stack while its previous guard is live",
         );
-        let top = memory.guest_base() + memory.len() as u64;
+        let top =
+            if memory.guest_base() <= BOOT_RESERVED_END && memory.guest_end() >= TOOL_STACK_TOP {
+                TOOL_STACK_TOP
+            } else {
+                memory.guest_end()
+            };
+        let capacity = usize::try_from(top - memory.guest_base())
+            .unwrap_or(usize::MAX)
+            .min(STACK_CAPACITY);
         Self {
-            capacity: memory.len().min(STACK_CAPACITY),
+            capacity,
             memory,
             top,
             stack_pointer: top,
@@ -353,6 +368,27 @@ async fn drive_handler<T>(
     .await
 }
 
+async fn notify_tool_exit<T: Tool>(
+    tool: T,
+    pid: Pid,
+    global_state: &T::GlobalState,
+    config: &<T::GlobalState as GlobalTool>::Config,
+    thread_state: T::ThreadState,
+    status: ExitStatus,
+) -> Result<()> {
+    let global = KvmGlobal {
+        pid,
+        state: global_state,
+        config,
+    };
+    tool.on_exit_thread(pid, &global, thread_state, status)
+        .await
+        .map_err(Error::Reverie)?;
+    tool.on_exit_process(pid, &global, status)
+        .await
+        .map_err(Error::Reverie)
+}
+
 impl KvmBackend {
     /// Runs the installed guest program through a shared Reverie `Tool`.
     ///
@@ -375,6 +411,7 @@ impl KvmBackend {
         let subscriptions = T::subscriptions(&config);
         let mut thread_state = tool.init_thread_state(pid, None);
         let memory = self.memory.clone();
+        let auxv = Vec::new();
         let stack_checked_out = Arc::new(AtomicBool::new(false));
 
         let registers = kvm_registers(self.vcpu.get_regs()?, 0);
@@ -383,6 +420,7 @@ impl KvmBackend {
             let mut guest = KvmGuest::<T>::new(
                 pid,
                 memory.clone(),
+                &auxv,
                 registers,
                 &mut thread_state,
                 &mut executor,
@@ -417,6 +455,7 @@ impl KvmBackend {
                             let mut guest = KvmGuest::<T>::new(
                                 pid,
                                 memory.clone(),
+                                &auxv,
                                 kvm_registers(registers, request.number()),
                                 &mut thread_state,
                                 &mut executor,
@@ -432,7 +471,7 @@ impl KvmBackend {
                             .await
                         };
                         match outcome {
-                            HandlerOutcome::Returned(result) => result.map_err(Error::Reverie)?,
+                            HandlerOutcome::Returned(result) => handler_result_to_raw(result)?,
                             HandlerOutcome::TailInjected(result) => result_to_raw(result),
                         }
                     } else {
@@ -462,6 +501,214 @@ impl KvmBackend {
                 }
                 exit => return Err(Error::UnexpectedVcpuExit(format!("{exit:?}"))),
             }
+        }
+    }
+
+    /// Runs an installed static ELF through a Reverie `Tool`.
+    ///
+    /// This is the integration of the M1 ELF guest kernel
+    /// ([`Self::run_static_elf`]) with the tool-interception path of
+    /// [`Self::run_with_tool`]. A static ELF loaded by
+    /// [`Self::install_static_elf`]/[`Self::install_static_elf_with_args`] runs
+    /// in long mode; each guest `SYSCALL` traps through the ring0 trampoline and
+    /// is delivered to the tool's `handle_syscall_event`, and the tool's
+    /// `inject`/`tail_inject` calls are serviced by the ELF guest kernel
+    /// ([`ElfExecutor`]). Unlike [`Self::run_with_tool`], results are written
+    /// back into the guest's syscall frame (the trampoline reads them and
+    /// `SYSRET`s) and the guest exits via `exit`/`exit_group` rather than `HLT`.
+    ///
+    /// Returns the tool's global state, guest exit code, stdout, and stderr.
+    pub async fn run_static_elf_with_tool<T>(
+        &mut self,
+        config: <T::GlobalState as GlobalTool>::Config,
+        capture_output: bool,
+    ) -> Result<(T::GlobalState, i32, Vec<u8>, Vec<u8>)>
+    where
+        T: Tool,
+    {
+        let mut loaded = self.static_elf.take().ok_or(Error::StaticElfNotInstalled)?;
+        if capture_output {
+            loaded.stdin = Some(std::fs::File::open("/dev/null")?);
+        }
+        let auxv = loaded.auxv.clone();
+        let pid = Pid::from_raw(GUEST_PID);
+        let global_state = T::GlobalState::init_global_state(&config).await;
+        let tool = T::new(pid, &config);
+        let subscriptions = T::subscriptions(&config);
+        let mut thread_state = tool.init_thread_state(pid, None);
+        // Clones share the MAP_SHARED guest mapping; a mutable handle lets the
+        // loop write syscall results back into the guest's frame.
+        let mut memory = self.memory.clone();
+        let stack_checked_out = Arc::new(AtomicBool::new(false));
+        let mut executor = ElfExecutor::new(loaded, capture_output);
+
+        let registers = kvm_registers(self.vcpu.get_regs()?, 0);
+        let tail_result = Arc::new(Mutex::new(None));
+        let start_outcome = {
+            let mut guest = KvmGuest::<T>::new(
+                pid,
+                memory.clone(),
+                &auxv,
+                registers,
+                &mut thread_state,
+                &mut executor,
+                &global_state,
+                &config,
+                tail_result.clone(),
+                stack_checked_out.clone(),
+            );
+            drive_handler(tool.handle_thread_start(&mut guest), tail_result).await
+        };
+        if let HandlerOutcome::Returned(result) = start_outcome {
+            result.map_err(Error::Reverie)?;
+        }
+
+        // The ELF image is already installed when this backend begins. Present
+        // the same successful-exec lifecycle boundary as ptrace before running it.
+        let registers = kvm_registers(self.vcpu.get_regs()?, 0);
+        let tail_result = Arc::new(Mutex::new(None));
+        let post_exec_outcome = {
+            let mut guest = KvmGuest::<T>::new(
+                pid,
+                memory.clone(),
+                &auxv,
+                registers,
+                &mut thread_state,
+                &mut executor,
+                &global_state,
+                &config,
+                tail_result.clone(),
+                stack_checked_out.clone(),
+            );
+            drive_handler(tool.handle_post_exec(&mut guest), tail_result).await
+        };
+        let post_exec_error = match post_exec_outcome {
+            HandlerOutcome::Returned(Ok(())) => None,
+            HandlerOutcome::Returned(Err(error)) => Some(Error::PostExec(error)),
+            HandlerOutcome::TailInjected(_) => Some(Error::UnexpectedVcpuExit(
+                "tool tail-injected a syscall from handle_post_exec".to_string(),
+            )),
+        };
+        if let Some(error) = post_exec_error {
+            notify_tool_exit(
+                tool,
+                pid,
+                &global_state,
+                &config,
+                thread_state,
+                ExitStatus::Exited(255),
+            )
+            .await?;
+            return Err(error);
+        }
+
+        if let Some((segment, address)) = executor.take_segment() {
+            set_user_segment_base(&self.vcpu, segment, address)?;
+        }
+        if let Some(code) = executor.take_exit() {
+            notify_tool_exit(
+                tool,
+                pid,
+                &global_state,
+                &config,
+                thread_state,
+                ExitStatus::Exited(code),
+            )
+            .await?;
+            let (stdout, stderr) = executor.take_output();
+            return Ok((global_state, code, stdout, stderr));
+        }
+
+        loop {
+            let (pending_segment, pending_exit) = match self.vcpu.run()? {
+                VcpuExit::Hypercall(exit) => {
+                    if exit.nr != VMCALL_SYSCALL_TRANSPORT {
+                        return Err(Error::UnexpectedHypercall(exit.nr));
+                    }
+                    let frame_address = exit.args[0];
+                    // Capture the hypercall return slot as a raw pointer so the
+                    // `&mut exit` borrow ends before `self.vcpu.get_regs()`.
+                    let return_slot = std::ptr::from_mut(exit.ret) as usize;
+                    if frame_address != SYSCALL_FRAME_ADDRESS {
+                        return Err(Error::UnexpectedVcpuExit(format!(
+                            "syscall frame is at unexpected address {frame_address:#x}"
+                        )));
+                    }
+                    let registers = self.vcpu.get_regs()?;
+                    let request = SyscallRequest::read_from(&memory, frame_address)?;
+                    let syscall = request.into_syscall()?;
+                    let subscribed = subscriptions
+                        .iter_syscalls()
+                        .any(|number| number == syscall.number());
+                    let result = if subscribed {
+                        let tail_result = Arc::new(Mutex::new(None));
+                        let outcome = {
+                            let mut guest = KvmGuest::<T>::new(
+                                pid,
+                                memory.clone(),
+                                &auxv,
+                                kvm_registers(registers, request.number()),
+                                &mut thread_state,
+                                &mut executor,
+                                &global_state,
+                                &config,
+                                tail_result.clone(),
+                                stack_checked_out.clone(),
+                            );
+                            drive_handler(
+                                tool.handle_syscall_event(&mut guest, syscall),
+                                tail_result,
+                            )
+                            .await
+                        };
+                        match outcome {
+                            HandlerOutcome::Returned(result) => handler_result_to_raw(result)?,
+                            HandlerOutcome::TailInjected(result) => result_to_raw(result),
+                        }
+                    } else {
+                        executor.execute(&request, &memory)
+                    };
+                    // The ring0 trampoline reads the result from the frame and
+                    // then SYSRETs, so the hypercall return slot is unused here.
+                    SyscallRequest::write_result(&mut memory, frame_address, result)?;
+                    // SAFETY: return_slot points into this vCPU's stable KVM_RUN
+                    // mapping; the vCPU is stopped and not re-run while the tool
+                    // callback is active.
+                    unsafe {
+                        (return_slot as *mut u64).write(0);
+                    }
+                    (executor.take_segment(), executor.take_exit())
+                }
+                VcpuExit::Hlt => (None, Some(0)),
+                exit => return Err(Error::UnexpectedVcpuExit(format!("{exit:?}"))),
+            };
+
+            if let Some((segment, address)) = pending_segment {
+                set_user_segment_base(&self.vcpu, segment, address)?;
+            }
+            if let Some(code) = pending_exit {
+                notify_tool_exit(
+                    tool,
+                    pid,
+                    &global_state,
+                    &config,
+                    thread_state,
+                    ExitStatus::Exited(code),
+                )
+                .await?;
+                let (stdout, stderr) = executor.take_output();
+                return Ok((global_state, code, stdout, stderr));
+            }
+        }
+    }
+}
+
+fn handler_result_to_raw(result: std::result::Result<i64, reverie::Error>) -> Result<i64> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            let errno = error.into_errno().map_err(Error::Reverie)?;
+            Ok(-(i64::from(errno.into_raw())))
         }
     }
 }
