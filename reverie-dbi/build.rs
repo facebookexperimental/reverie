@@ -13,7 +13,9 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
-const DYNAMORIO_REVISION: &str = "cca42665b014ab109b64d98fdc9d3eecd91273b5";
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#53): validate the pinned dr_invoke_syscall_as_app mmap fix.
+const DYNAMORIO_REVISION: &str = "929840ad9190e5086775e8debc0f0b79b4208d59";
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");

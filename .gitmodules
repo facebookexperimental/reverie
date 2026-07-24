@@ -1,3 +1,3 @@
 [submodule "third-party/dynamorio"]
 	path = third-party/dynamorio
-	url = https://github.com/DynamoRIO/dynamorio.git
+	url = https://github.com/rrnewton/dynamorio.git
