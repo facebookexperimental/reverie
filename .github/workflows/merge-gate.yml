@@ -80,8 +80,11 @@ jobs:
       contents: read
       issues: write
       pull-requests: write
+    outputs:
+      invalidated: ${{ steps.invalidate.outputs.invalidated }}
     steps:
       - name: Remove validation inherited from an older PR head
+        id: invalidate
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -89,11 +92,23 @@ jobs:
         run: |
           set -euo pipefail
           labels="$(gh api "repos/${REPO}/issues/${PR_NUMBER}/labels" --jq '.[].name')"
-          if grep -Fxq locally-validated <<< "$labels"; then
-            gh api --method DELETE \
-              "repos/${REPO}/issues/${PR_NUMBER}/labels/locally-validated" \
-              --silent
+          if ! grep -Fxq locally-validated <<< "$labels"; then
+            echo "No locally-validated label to remove on PR #$PR_NUMBER."
+            echo "invalidated=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # pull_request events from forked repositories run with a read-only
+          # GITHUB_TOKEN regardless of the permissions block above, so the label
+          # cannot be deleted here. Report that invalidation did not happen so
+          # the merge gate requires green CI instead of trusting a stale label.
+          if gh api --method DELETE \
+            "repos/${REPO}/issues/${PR_NUMBER}/labels/locally-validated" \
+            --silent; then
             echo "Removed stale locally-validated label from PR #$PR_NUMBER."
+            echo "invalidated=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Could not remove locally-validated label (fork PR read-only token); the merge gate will require green CI instead of trusting the label."
+            echo "invalidated=false" >> "$GITHUB_OUTPUT"
           fi
 
   merge-gate:
@@ -107,6 +122,7 @@ jobs:
         env:
           BASE_REF: ${{ github.event.merge_group.base_ref }}
           EVENT_NAME: ${{ github.event_name }}
+          INVALIDATED: ${{ needs.invalidate-local-validation.outputs.invalidated }}
           INVALIDATION_RESULT: ${{ needs.invalidate-local-validation.result }}
           PR_ACTION: ${{ github.event.action }}
           GH_TOKEN: ${{ github.token }}
@@ -116,10 +132,15 @@ jobs:
         run: |
           set -euo pipefail
 
+          # On synchronize, the previous head's local validation is stale. If the
+          # invalidate job could not remove the locally-validated label (e.g. a
+          # fork PR runs with a read-only token) or otherwise did not succeed, do
+          # not trust the label -- require green CI instead.
+          require_ci_only=false
           if [ "$EVENT_NAME" = pull_request ] && [ "$PR_ACTION" = synchronize ] &&
-             [ "$INVALIDATION_RESULT" != success ]; then
-            echo "::error::Could not invalidate local validation from the previous PR head."
-            exit 1
+             { [ "$INVALIDATION_RESULT" != success ] || [ "$INVALIDATED" != true ]; }; then
+            echo "::notice::Local validation from the previous PR head could not be invalidated; requiring green CI instead of trusting the locally-validated label."
+            require_ci_only=true
           fi
 
           if [ "$EVENT_NAME" = pull_request ] || [ "$EVENT_NAME" = workflow_dispatch ]; then
@@ -184,7 +205,7 @@ jobs:
               failed=1
               continue
             fi
-            if [ "$locally_validated" = true ]; then
+            if [ "$locally_validated" = true ] && [ "$require_ci_only" != true ]; then
               echo "PR #${pr_number} is locally validated at $head_sha."
               continue
             fi
