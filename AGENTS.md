@@ -272,6 +272,16 @@ HTTPS_PROXY=http://fwdproxy:8080 git fetch origin
 HTTPS_PROXY=http://fwdproxy:8080 gh pr view -R rrnewton/reverie <number>
 ```
 
+## Script Convention
+
+- Project scripts use rust-script as `.rs` files with the shebang
+  `#!/usr/bin/env rust-script`.
+- Prefer rust-script over Python for all new scripts.
+- Scripts are usually single files, but may be split into subdirectories when
+  useful.
+- Install rust-script with `cargo install rust-script` if it is not already
+  available.
+
 ## Repository-Specific Change Guidelines
 
 - Preserve the shared `reverie::Tool` and `Guest` contracts across backends.
