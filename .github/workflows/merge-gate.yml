@@ -116,7 +116,7 @@ jobs:
     needs: [invalidate-local-validation]
     if: always() && github.event_name != 'workflow_run'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - name: Require successful CI or local validation
         env:
@@ -210,19 +210,32 @@ jobs:
               continue
             fi
 
-            runs="$(
-              gh api "repos/${REPO}/actions/workflows/ci.yml/runs?head_sha=${head_sha}&per_page=100"
-            )"
-            run="$(jq --arg sha "$head_sha" '
-              [.workflow_runs[] | select(.head_sha == $sha)]
-              | sort_by(.created_at)
-              | last // {}
-            ' <<< "$runs")"
-            status="$(jq -r '.status // "missing"' <<< "$run")"
-            conclusion="$(jq -r '.conclusion // ""' <<< "$run")"
-            url="$(jq -r '.html_url // ""' <<< "$run")"
+            # Wait for the CI (Rust) run on this head to finish, then require
+            # success. Polling here makes the gate self-contained: fork PRs run
+            # with a head branch that does not exist in the base repo, so the
+            # workflow_run re-fire cannot re-dispatch this gate for them. Without
+            # waiting, a synchronize would evaluate before CI completed and fail.
+            status="missing"
+            conclusion=""
+            url=""
+            for _ in $(seq 1 56); do
+              run="$(
+                gh api "repos/${REPO}/actions/workflows/ci.yml/runs?head_sha=${head_sha}&per_page=100" |
+                  jq --arg sha "$head_sha" '
+                    [.workflow_runs[] | select(.head_sha == $sha)]
+                    | sort_by(.created_at)
+                    | last // {}
+                  '
+              )"
+              status="$(jq -r '.status // "missing"' <<< "$run")"
+              conclusion="$(jq -r '.conclusion // ""' <<< "$run")"
+              url="$(jq -r '.html_url // ""' <<< "$run")"
+              [ "$status" = completed ] && break
+              echo "Waiting for CI on PR #${pr_number} at $head_sha (status=${status})..."
+              sleep 15
+            done
 
-            if [ "$status:$conclusion" = completed:success ]; then
+            if [ "$conclusion" = success ]; then
               echo "CI passed for PR #${pr_number} at $head_sha: $url"
             else
               echo "::error::CI for PR #${pr_number} at $head_sha is $status/${conclusion:-none}: ${url:-no run URL}."
