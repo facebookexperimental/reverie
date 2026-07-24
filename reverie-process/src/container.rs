@@ -331,7 +331,7 @@ impl Container {
     /// Gets an environment variable. If the child process is to inherit this
     /// environment variable from the current process, then this returns the
     /// current process's environment variable unless it is to be overridden.
-    pub fn get_env<K: AsRef<OsStr>>(&self, env: K) -> Option<Cow<OsStr>> {
+    pub fn get_env<K: AsRef<OsStr>>(&self, env: K) -> Option<Cow<'_, OsStr>> {
         self.env.get_captured(env)
     }
 

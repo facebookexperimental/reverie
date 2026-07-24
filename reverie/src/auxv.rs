@@ -27,6 +27,16 @@ pub struct Auxv {
 }
 
 impl Auxv {
+    /// Builds an auxiliary vector from backend-provided key/value entries.
+    ///
+    /// Backends without a host process, such as a bare KVM guest, can use this
+    /// to report the auxiliary vector they installed on the guest stack.
+    pub fn from_entries(entries: impl IntoIterator<Item = (libc::c_ulong, libc::c_ulong)>) -> Self {
+        Self {
+            map: entries.into_iter().collect(),
+        }
+    }
+
     /// Reads the auxiliary values from `/proc/{pid}/auxv`.
     pub(crate) fn new(pid: Pid) -> io::Result<Self> {
         let mut map = BTreeMap::new();
@@ -70,7 +80,7 @@ impl Auxv {
     ///
     /// Returns `None` if the address is NULL or if `AT_RANDOM` does not exist in
     /// the auxv table.
-    pub fn at_random(&self) -> Option<Addr<[u8; 16]>> {
+    pub fn at_random(&self) -> Option<Addr<'_, [u8; 16]>> {
         self.map
             .get(&libc::AT_RANDOM)
             .and_then(|val| Addr::from_raw(*val as usize))
@@ -108,6 +118,23 @@ impl Auxv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builds_from_backend_entries() {
+        let map = Auxv::from_entries([
+            (libc::AT_UID, 123),
+            (libc::AT_GID, 456),
+            (libc::AT_RANDOM, 0x1000),
+        ]);
+
+        assert_eq!(map.len(), 3);
+        assert_eq!(map.at_uid(), Some(123));
+        assert_eq!(map.at_gid(), Some(456));
+        assert_eq!(
+            map.at_random().map(|address| address.as_raw()),
+            Some(0x1000),
+        );
+    }
 
     #[test]
     fn smoke() {

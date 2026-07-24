@@ -7,25 +7,13 @@
  */
 
 use std::io;
-use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
 use reverie::GlobalTool;
 use reverie::Pid;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::event::ThreadExit;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Program {
-    /// The path to the program.
-    name: PathBuf,
-
-    /// The program arguments.
-    args: Vec<String>,
-}
 
 #[derive(Debug)]
 pub struct GlobalState {

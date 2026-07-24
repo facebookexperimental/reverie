@@ -190,16 +190,16 @@ impl CoreRegs {
 
 impl WriteResponse for ResponseAsHex<CoreRegs> {
     fn write_response(&self, f: &mut ResponseWriter) {
-        let encoded: Vec<u8> =
-            bincode::serde::encode_to_vec(&self.0, bincode::config::legacy()).unwrap();
+        let encoded: Vec<u8> = bincode::serde::encode_to_vec(&self.0, bincode::config::legacy())
+            .expect("aarch64 GDB register state must serialize");
         ResponseAsHex(encoded.as_slice()).write_response(f)
     }
 }
 
 impl WriteResponse for ResponseAsBinary<CoreRegs> {
     fn write_response(&self, f: &mut ResponseWriter) {
-        let encoded: Vec<u8> =
-            bincode::serde::encode_to_vec(&self.0, bincode::config::legacy()).unwrap();
+        let encoded: Vec<u8> = bincode::serde::encode_to_vec(&self.0, bincode::config::legacy())
+            .expect("aarch64 GDB register state must serialize");
         ResponseAsBinary(encoded.as_slice()).write_response(f)
     }
 }

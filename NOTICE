@@ -1,0 +1,78 @@
+Reverie
+Copyright (c) Meta Platforms, Inc. and affiliates.
+
+Reverie is licensed under the BSD-2-Clause license found in the LICENSE file in
+the root directory of this source tree.
+
+================================================================================
+Third-party components
+================================================================================
+
+Reverie's DynamoRIO-based dynamic binary instrumentation backend (reverie-dbi)
+depends on DynamoRIO. DynamoRIO is referenced as a git submodule at
+`third-party/dynamorio` and is configured, built, and installed on demand by
+`reverie-dbi/build.rs`. No DynamoRIO source or binaries are redistributed in
+this repository; only the submodule commit reference is stored here.
+
+Building reverie-dbi therefore fetches and builds DynamoRIO and, transitively,
+the third-party projects that DynamoRIO itself vendors as submodules. The
+licenses of those components are summarized below. This NOTICE is provided for
+attribution and awareness; the authoritative and complete license texts live in
+each upstream project. Anyone who *distributes* binaries produced from this
+build must comply with all of the licenses listed here, including the copyleft
+(LGPL) obligations noted for elfutils and certain DynamoRIO extensions.
+
+--------------------------------------------------------------------------------
+DynamoRIO
+--------------------------------------------------------------------------------
+Upstream:  https://github.com/DynamoRIO/dynamorio
+Pinned commit: cca42665b014ab109b64d98fdc9d3eecd91273b5
+License:   BSD-3-Clause (primary), with the additional component licenses below.
+           Full text: `third-party/dynamorio/License.txt`.
+
+  Copyright (c) 2010-2024 Google, Inc.   All rights reserved.
+  Copyright (c) 2000-2009 VMware, Inc.   All rights reserved.
+
+DynamoRIO's License.txt calls out the following non-BSD-3 portions. The
+reverie-dbi build enables DynamoRIO extensions and tools
+(`-DBUILD_EXT=ON -DBUILD_TOOLS=ON -DBUILD_CLIENTS=ON`), so the LGPL-licensed
+extensions below are built and linked:
+
+  * libelftc (drsyms extension) .......... BSD-style license
+  * drsyscall, drwrap, drutil extensions,
+    and the Dr. Memory Framework libraries
+    (when packaged) ...................... LGPL 2.1
+  * drsyms extension, linked against
+    elfutils libraries ................... LGPL 3 (see elfutils below)
+  * third_party/valgrind headers
+    (valgrind.h, memcheck.h) ............. BSD-4-Clause
+                                           Copyright (C) 2000-2013 Julian Seward.
+
+--------------------------------------------------------------------------------
+elfutils  (vendored by DynamoRIO at third_party/elfutils)
+--------------------------------------------------------------------------------
+Upstream:  https://sourceware.org/git/elfutils.git
+Fork used: https://github.com/DynamoRIO/elfutils (per DynamoRIO .gitmodules)
+License:   The elfutils libraries linked by DynamoRIO's drsyms extension
+           (libelf, libdw, libdwfl) are dual-licensed GPL-2.0-or-later OR
+           LGPL-3.0-or-later; the standalone elfutils utilities are GPL-3.0
+           -or-later. DynamoRIO links only the libraries, under LGPL-3.0
+           -or-later.
+
+           NOTE: This is a copyleft dependency. Distributing binaries that
+           statically link elfutils requires honoring the LGPL relinking and
+           source-availability obligations.
+
+--------------------------------------------------------------------------------
+libipt  (vendored by DynamoRIO at third_party/libipt)
+--------------------------------------------------------------------------------
+Upstream:  https://github.com/intel/libipt
+License:   BSD-3-Clause
+           Copyright (c) Intel Corporation.
+
+--------------------------------------------------------------------------------
+zlib  (vendored by DynamoRIO at third_party/zlib)
+--------------------------------------------------------------------------------
+Upstream:  https://github.com/madler/zlib
+License:   zlib License
+           Copyright (c) 1995-present Jean-loup Gailly and Mark Adler.
