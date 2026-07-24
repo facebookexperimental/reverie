@@ -18,7 +18,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Child;
 use std::process::Command;
 use std::process::ExitStatus;
 use std::process::Output;
@@ -115,24 +114,12 @@ impl DbiRunner {
 
     /// Runs `guest` and captures its standard output and standard error.
     pub fn output(&self, guest: &Command) -> io::Result<Output> {
-        let child = self
-            .command(guest, None)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        self.wait_with_output(child)
+        self.command(guest, None).output()
     }
 
     /// Captures guest output while preserving an inherited terminal stdin.
     pub fn output_with_inherited_stdin(&self, guest: &Command) -> io::Result<Output> {
-        let child = self
-            .command(guest, None)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        self.wait_with_output(child)
+        self.command(guest, None).stdin(Stdio::inherit()).output()
     }
 
     /// Runs `guest` with captured output and supplies `input` on standard input.
@@ -157,7 +144,7 @@ impl DbiRunner {
 
         std::thread::scope(|scope| {
             let writer = scope.spawn(move || io::copy(&mut input, &mut stdin));
-            let output = self.wait_with_output(child);
+            let output = child.wait_with_output();
             let write_result = writer
                 .join()
                 .map_err(|_| io::Error::other("DBI guest stdin writer thread panicked"))?;
@@ -176,63 +163,7 @@ impl DbiRunner {
         guest: &Command,
         environment: &BTreeMap<OsString, OsString>,
     ) -> io::Result<Output> {
-        let child = self
-            .command(guest, Some(environment))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        self.wait_with_output(child)
-    }
-
-    fn wait_with_output(&self, mut child: Child) -> io::Result<Output> {
-        let process_group = self.isolated_process_group.then_some(child.id() as i32);
-        let mut stdout = child.stdout.take().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "failed to capture DBI guest stdout",
-            )
-        })?;
-        let mut stderr = child.stderr.take().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "failed to capture DBI guest stderr",
-            )
-        })?;
-
-        std::thread::scope(|scope| {
-            let stdout_reader = scope.spawn(move || {
-                let mut bytes = Vec::new();
-                stdout.read_to_end(&mut bytes)?;
-                Ok::<_, io::Error>(bytes)
-            });
-            let stderr_reader = scope.spawn(move || {
-                let mut bytes = Vec::new();
-                stderr.read_to_end(&mut bytes)?;
-                Ok::<_, io::Error>(bytes)
-            });
-            let status = child.wait()?;
-            if let Some(process_group) = process_group {
-                let result = unsafe { libc::kill(-process_group, libc::SIGKILL) };
-                if result == -1 {
-                    let error = io::Error::last_os_error();
-                    if error.raw_os_error() != Some(libc::ESRCH) {
-                        return Err(error);
-                    }
-                }
-            }
-            let stdout = stdout_reader
-                .join()
-                .map_err(|_| io::Error::other("DBI stdout reader thread panicked"))??;
-            let stderr = stderr_reader
-                .join()
-                .map_err(|_| io::Error::other("DBI stderr reader thread panicked"))??;
-            Ok(Output {
-                status,
-                stdout,
-                stderr,
-            })
-        })
+        self.command(guest, Some(environment)).output()
     }
 
     fn command(
