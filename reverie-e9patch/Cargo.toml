@@ -1,0 +1,7 @@
+[package]
+name = "reverie-e9patch"
+version = "0.1.0"
+authors = ["Meta Platforms"]
+edition = "2024"
+repository = "https://github.com/facebookexperimental/reverie"
+license = "BSD-2-Clause"

@@ -13,6 +13,7 @@ members = [
     "experimental/riptrace/tool",
     "reverie",
     "reverie-dbi",
+    "reverie-e9patch",
     "reverie-examples",
     "reverie-kvm",
     "reverie-liteinst",
