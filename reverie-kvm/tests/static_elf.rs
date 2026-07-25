@@ -480,6 +480,33 @@ fn static_elf_clone_tid_side_effects_reach_guest_memory() {
 }
 
 #[test]
+fn real_bash_redirects_builtin_output_through_f_dupfd() {
+    match Kvm::new() {
+        Ok(_) => {}
+        Err(error) if kvm_is_unavailable(&error) => {
+            eprintln!("skipping KVM Bash redirection test: cannot open /dev/kvm: {error}");
+            return;
+        }
+        Err(error) => panic!("failed to probe /dev/kvm: {error}"),
+    }
+
+    let root = TestDirectory::new();
+    let (stdout, stderr) = run_host_program_captured(
+        "/bin/bash",
+        &[
+            "bash",
+            "--norc",
+            "-c",
+            "printf redirected > output; printf visible",
+        ],
+        &root.0,
+    );
+    assert_eq!(stdout, b"visible");
+    assert!(stderr.is_empty());
+    assert_eq!(std::fs::read(root.0.join("output")).unwrap(), b"redirected");
+}
+
+#[test]
 fn real_bash_small_pipeline_uses_legacy_process_clone_tid_flags() {
     match Kvm::new() {
         Ok(_) => {}

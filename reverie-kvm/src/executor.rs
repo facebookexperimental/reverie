@@ -31,7 +31,7 @@ use crate::runtime::SyscallExecutor;
 const MAX_HOST_IO: usize = 16 * 1024 * 1024;
 const MAX_CAPTURED_OUTPUT: usize = 64 * 1024 * 1024;
 const PAGE_SIZE: u64 = 4096;
-const MAX_GUEST_FD: libc::c_int = 1 << 20;
+const GUEST_NOFILE_LIMIT: libc::c_int = 1 << 20;
 const KERNEL_SIGACTION_SIZE: usize = 32;
 const KERNEL_SIGSET_SIZE: usize = 8;
 const MEMBARRIER_SUPPORTED: libc::c_int = 0x1;
@@ -725,6 +725,7 @@ fn write(
     };
     let length = requested_length.min(MAX_HOST_IO);
     let standard = is_open_standard(state, fd);
+    let output_destination = output_alias(state, fd);
     if !standard && !state.files.contains_key(&fd) {
         return negative_errno(libc::EBADF);
     }
@@ -749,12 +750,11 @@ fn write(
         return negative_errno(libc::EFAULT);
     }
 
-    if standard && (fd == libc::STDOUT_FILENO || fd == libc::STDERR_FILENO) {
+    if let Some(output_destination) = output_destination {
         if let Some(output) = output {
-            let destination = if fd == libc::STDOUT_FILENO {
-                &mut output.stdout
-            } else {
-                &mut output.stderr
+            let destination = match output_destination {
+                OutputAlias::Stdout => &mut output.stdout,
+                OutputAlias::Stderr => &mut output.stderr,
             };
             if destination
                 .len()
@@ -766,7 +766,9 @@ fn write(
             destination.extend_from_slice(&bytes);
             return bytes.len() as i64;
         }
-        return host_write(fd, &bytes);
+        if standard {
+            return host_write(fd, &bytes);
+        }
     }
     if standard {
         return state
@@ -1190,7 +1192,7 @@ fn open_file(
             return io_error(std::io::Error::last_os_error());
         }
     }
-    insert_file_with_flags(state, file, guest_cloexec)
+    insert_file_with_flags(state, file, guest_cloexec, None)
 }
 
 fn ensure_not_procfs(file: &std::fs::File) -> Result<(), i64> {
@@ -1298,13 +1300,50 @@ fn ensure_mutation_parent_not_procfs(host_dirfd: RawFd, path: &CStr) -> Result<(
     Ok(())
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED: Preserve captured stdio identity across descriptor duplication.
+// TODO-HUMAN-REVIEW(#91): Review output alias lifecycle across dup, close, fork, and exec.
+#[derive(Clone, Copy)]
+enum OutputAlias {
+    Stdout,
+    Stderr,
+}
+
+fn output_alias(state: &LoadedStaticElf, fd: libc::c_int) -> Option<OutputAlias> {
+    if state.stdout_alias_fds.contains(&fd)
+        || (fd == libc::STDOUT_FILENO && is_open_standard(state, fd))
+    {
+        Some(OutputAlias::Stdout)
+    } else if state.stderr_alias_fds.contains(&fd)
+        || (fd == libc::STDERR_FILENO && is_open_standard(state, fd))
+    {
+        Some(OutputAlias::Stderr)
+    } else {
+        None
+    }
+}
+
+fn set_output_alias(state: &mut LoadedStaticElf, fd: libc::c_int, alias: Option<OutputAlias>) {
+    state.stdout_alias_fds.remove(&fd);
+    state.stderr_alias_fds.remove(&fd);
+    match alias {
+        Some(OutputAlias::Stdout) => {
+            state.stdout_alias_fds.insert(fd);
+        }
+        Some(OutputAlias::Stderr) => {
+            state.stderr_alias_fds.insert(fd);
+        }
+        None => {}
+    }
+}
+
 fn insert_file_with_flags(
     state: &mut LoadedStaticElf,
     file: std::fs::File,
     close_on_exec: bool,
+    output_alias: Option<OutputAlias>,
 ) -> i64 {
-    let Some(fd) =
-        (0..=i32::MAX).find(|fd| !is_open_standard(state, *fd) && !state.files.contains_key(fd))
+    let Some(fd) = (0..GUEST_NOFILE_LIMIT)
+        .find(|fd| !is_open_standard(state, *fd) && !state.files.contains_key(fd))
     else {
         return negative_errno(libc::EMFILE);
     };
@@ -1314,6 +1353,49 @@ fn insert_file_with_flags(
     } else {
         state.cloexec_fds.remove(&fd);
     }
+    set_output_alias(state, fd, output_alias);
+    i64::from(fd)
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED: Model fcntl descriptor duplication in the guest table.
+// TODO-HUMAN-REVIEW(#91): Review minimum/error precedence and standard-fd ownership.
+fn duplicate_fd_at_or_above(
+    state: &mut LoadedStaticElf,
+    old_host_fd: RawFd,
+    raw_minimum: u64,
+    close_on_exec: bool,
+    output_alias: Option<OutputAlias>,
+) -> i64 {
+    let minimum = raw_minimum as libc::c_int;
+    if !(0..GUEST_NOFILE_LIMIT).contains(&minimum) {
+        return negative_errno(libc::EINVAL);
+    }
+    let Some(fd) = (minimum..GUEST_NOFILE_LIMIT)
+        .find(|fd| !is_open_standard(state, *fd) && !state.files.contains_key(fd))
+    else {
+        return negative_errno(libc::EMFILE);
+    };
+
+    // SAFETY: old_host_fd is live. F_DUPFD_CLOEXEC returns an owned
+    // descriptor; guest CLOEXEC is modeled independently in cloexec_fds.
+    let duplicated = unsafe { libc::fcntl(old_host_fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicated < 0 {
+        return io_error(std::io::Error::last_os_error());
+    }
+    // SAFETY: fcntl returned a new owned descriptor.
+    let file = unsafe { std::fs::File::from_raw_fd(duplicated) };
+    state.files.insert(fd, file);
+    if close_on_exec {
+        state.cloexec_fds.insert(fd);
+    } else {
+        state.cloexec_fds.remove(&fd);
+    }
+    if (0..=2).contains(&fd) {
+        state.closed_standard_fds.insert(fd);
+    } else {
+        state.closed_standard_fds.remove(&fd);
+    }
+    set_output_alias(state, fd, output_alias);
     i64::from(fd)
 }
 
@@ -1332,6 +1414,7 @@ fn duplicate_fd(
         return negative_errno(libc::EINVAL);
     }
     let old_fd = raw_old_fd as libc::c_int;
+    let source_alias = output_alias(state, old_fd);
     let Some(old_host_fd) = host_fd(state, old_fd) else {
         return negative_errno(libc::EBADF);
     };
@@ -1340,7 +1423,7 @@ fn duplicate_fd(
     let new_fd = match raw_new_fd {
         Some(raw_new_fd) => {
             let new_fd = raw_new_fd as libc::c_int;
-            if !(0..=MAX_GUEST_FD).contains(&new_fd) {
+            if !(0..GUEST_NOFILE_LIMIT).contains(&new_fd) {
                 return negative_errno(libc::EBADF);
             }
             if new_fd == old_fd {
@@ -1375,9 +1458,10 @@ fn duplicate_fd(
         } else {
             state.closed_standard_fds.remove(&new_fd);
         }
+        set_output_alias(state, new_fd, source_alias);
         i64::from(new_fd)
     } else {
-        insert_file_with_flags(state, file, close_on_exec)
+        insert_file_with_flags(state, file, close_on_exec, source_alias)
     }
 }
 
@@ -1408,11 +1492,11 @@ fn pipe2(
     let write_end = unsafe { std::fs::File::from_raw_fd(host_fds[1]) };
     let close_on_exec = flags & libc::O_CLOEXEC != 0;
 
-    let read_fd = insert_file_with_flags(state, read_end, close_on_exec);
+    let read_fd = insert_file_with_flags(state, read_end, close_on_exec, None);
     if read_fd < 0 {
         return read_fd;
     }
-    let write_fd = insert_file_with_flags(state, write_end, close_on_exec);
+    let write_fd = insert_file_with_flags(state, write_end, close_on_exec, None);
     if write_fd < 0 {
         state.files.remove(&(read_fd as libc::c_int));
         state.cloexec_fds.remove(&(read_fd as libc::c_int));
@@ -2155,13 +2239,16 @@ fn host_fd(state: &LoadedStaticElf, guest_fd: libc::c_int) -> Option<RawFd> {
 
 // TODO-HUMAN-REVIEW(PR-52): Review KVM guest fcntl compatibility boundaries.
 fn fcntl(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
-    let Ok(guest_fd) = i32::try_from(args[0]) else {
-        return negative_errno(libc::EBADF);
-    };
+    let guest_fd = args[0] as libc::c_int;
+    let source_alias = output_alias(state, guest_fd);
     let Some(host_fd) = host_fd(state, guest_fd) else {
         return negative_errno(libc::EBADF);
     };
     match args[1] as libc::c_int {
+        libc::F_DUPFD => duplicate_fd_at_or_above(state, host_fd, args[2], false, source_alias),
+        libc::F_DUPFD_CLOEXEC => {
+            duplicate_fd_at_or_above(state, host_fd, args[2], true, source_alias)
+        }
         libc::F_GETFL => match fd_status_flags(host_fd) {
             Ok(flags) => flags as i64,
             Err(error) => error,
@@ -2214,6 +2301,7 @@ fn close(state: &mut LoadedStaticElf, raw_fd: u64) -> i64 {
     };
     if state.files.remove(&fd).is_some() {
         state.cloexec_fds.remove(&fd);
+        set_output_alias(state, fd, None);
         return 0;
     }
     if is_open_standard(state, fd) {
@@ -2222,6 +2310,7 @@ fn close(state: &mut LoadedStaticElf, raw_fd: u64) -> i64 {
         }
         state.closed_standard_fds.insert(fd);
         state.cloexec_fds.remove(&fd);
+        set_output_alias(state, fd, None);
         return 0;
     }
     negative_errno(libc::EBADF)
@@ -2633,7 +2722,11 @@ fn prlimit64(memory: &mut GuestMemory, args: &[u64; 6]) -> i64 {
     if args[3] == 0 {
         return 0;
     }
-    let limit = STACK_LIMIT;
+    let limit = if args[1] as libc::c_uint == libc::RLIMIT_NOFILE as libc::c_uint {
+        GUEST_NOFILE_LIMIT as u64
+    } else {
+        STACK_LIMIT
+    };
     let mut bytes = [0; 16];
     bytes[..8].copy_from_slice(&limit.to_le_bytes());
     bytes[8..].copy_from_slice(&limit.to_le_bytes());
@@ -3092,6 +3185,8 @@ mod tests {
             signal_mask: [0; KERNEL_SIGSET_SIZE],
             signal_alt_stack: None,
             files: BTreeMap::new(),
+            stdout_alias_fds: BTreeSet::new(),
+            stderr_alias_fds: BTreeSet::new(),
             cloexec_fds: BTreeSet::new(),
             closed_standard_fds: BTreeSet::new(),
             children: BTreeMap::new(),
@@ -5173,6 +5268,98 @@ mod tests {
             ),
             i64::from(libc::FD_CLOEXEC)
         );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_fcntl,
+                [4, libc::F_DUPFD as u64, 10, 0, 0, 0],
+            ),
+            10
+        );
+        assert!(state.files.contains_key(&10));
+        assert!(!state.cloexec_fds.contains(&10));
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_fcntl,
+                [4, libc::F_DUPFD_CLOEXEC as u64, 10, 0, 0, 0],
+            ),
+            11
+        );
+        assert!(state.cloexec_fds.contains(&11));
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_fcntl,
+                [4, libc::F_DUPFD as u64, u64::MAX, 0, 0, 0],
+            ),
+            negative_errno(libc::EINVAL)
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_fcntl,
+                [4, libc::F_DUPFD as u64, GUEST_NOFILE_LIMIT as u64, 0, 0, 0,],
+            ),
+            negative_errno(libc::EINVAL)
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_fcntl,
+                [u64::MAX, libc::F_DUPFD as u64, 0, 0, 0, 0],
+            ),
+            negative_errno(libc::EBADF)
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_fcntl,
+                [(1_u64 << 32) | 4, libc::F_DUPFD as u64, 12, 0, 0, 0],
+            ),
+            12,
+            "fcntl source fds use the low 32-bit Linux ABI"
+        );
+        for resource in [
+            libc::RLIMIT_NOFILE as u64,
+            (1_u64 << 32) | libc::RLIMIT_NOFILE as u64,
+        ] {
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_prlimit64,
+                    [0, resource, 0, 0x200, 0, 0],
+                ),
+                0
+            );
+            let nofile = read_guest_bytes::<16>(&memory, 0x200).unwrap();
+            assert_eq!(
+                u64::from_le_bytes(nofile[..8].try_into().unwrap()),
+                GUEST_NOFILE_LIMIT as u64
+            );
+            assert_eq!(
+                u64::from_le_bytes(nofile[8..].try_into().unwrap()),
+                GUEST_NOFILE_LIMIT as u64
+            );
+        }
+        for fd in [10, 11, 12] {
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_close,
+                    [fd, 0, 0, 0, 0, 0],
+                ),
+                0
+            );
+        }
         assert_eq!(
             syscall_result(&mut memory, &mut state, libc::SYS_close, [0, 0, 0, 0, 0, 0],),
             0
