@@ -102,8 +102,12 @@ typedef struct {
   reverie_emit_fn_t emit;
   reverie_idle_fn_t idle;
 } runtime_callbacks_t;
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#90): Confirm diagnostic fd ownership across exec.
+// Inherited from the launcher so guest stderr redirections cannot capture it.
+static file_t diagnostic_file;
 static void reverie_dbi_emit(const char *buf, size_t len) {
-  dr_write_file(STDERR, buf, len);
+  dr_write_file(diagnostic_file, buf, len);
 }
 
 extern void reverie_dbi_runtime_thread_init(prototype_counters_t *counters);
@@ -920,7 +924,7 @@ static void event_exit(void) {
   if (report_summary && !has_copied_runtime()) {
     reverie_dbi_runtime_totals(&branches, &syscalls, &rewritten, &memory_hash);
     stdin_reads = atomic_load_explicit(&stdin_read_count, memory_order_relaxed);
-    dr_fprintf(STDERR,
+    dr_fprintf(diagnostic_file,
                "reverie-dbi: tool=%s branches=%llu syscalls=%llu "
                "rewritten=%llu stdin_reads=%llu memory_hash=%016llx\n",
                reverie_dbi_runtime_name(), branches, syscalls, rewritten,
@@ -946,6 +950,7 @@ static void runtime_background_init(void *argument) {
 DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[]) {
   drreg_options_t register_options = {sizeof(register_options), 1, false};
 
+  diagnostic_file = STDERR;
   runtime_owner_pid = dr_get_process_id();
   atomic_store_explicit(&image_generation, reverie_dbi_runtime_image_init(),
                         memory_order_release);
@@ -953,9 +958,17 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[]) {
   DR_ASSERT(resource_lock != NULL);
   init_virtual_limits();
 
-  for (int i = 1; i < argc; ++i)
+  for (int i = 1; i < argc; ++i) {
     if (strcmp(argv[i], "-summary") == 0)
       report_summary = true;
+    else if (strcmp(argv[i], "-diagnostic_fd") == 0) {
+      int fd;
+      DR_ASSERT(++i < argc);
+      DR_ASSERT(dr_sscanf(argv[i], "%d", &fd) == 1);
+      DR_ASSERT(fd >= 0);
+      diagnostic_file = (file_t)fd;
+    }
+  }
 
   dr_set_client_name("Reverie DynamoRIO backend prototype",
                      "https://github.com/rrnewton/reverie");

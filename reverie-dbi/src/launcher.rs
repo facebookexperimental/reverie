@@ -29,6 +29,10 @@ const DYNAMORIO_DIR_ENV: &str = "DynamoRIO_DIR";
 const SUMMARY_ENV: &str = "REVERIE_DBI_SUMMARY";
 const PATH_ENV: &str = "PATH";
 const BINPRM_BUF_SIZE: usize = 256;
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#90): Confirm the reserved descriptor across followed execs.
+// Keep client diagnostics on launcher stderr across guest fd 2 redirects and execs.
+const DIAGNOSTIC_FD: libc::c_int = 198;
 
 /// Launches Linux programs under the Reverie DynamoRIO client.
 ///
@@ -177,7 +181,9 @@ impl DbiRunner {
             .arg("-disable_rseq")
             .args(["-stack_size", "2M"])
             .arg("-c")
-            .arg(&self.client);
+            .arg(&self.client)
+            .arg("-diagnostic_fd")
+            .arg(DIAGNOSTIC_FD.to_string());
         if self.summary {
             command.arg("-summary");
         }
@@ -218,10 +224,13 @@ impl DbiRunner {
             command.process_group(0);
         }
 
-        // SAFETY: personality(2) is async-signal-safe and the closure captures no
-        // process state. The flag survives both the drrun and guest execs.
+        // SAFETY: personality(2) and dup2(2) are async-signal-safe and the closure
+        // captures no process state. Both settings survive drrun and guest execs.
         unsafe {
             command.pre_exec(|| {
+                if libc::dup2(libc::STDERR_FILENO, DIAGNOSTIC_FD) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
                 let current = libc::personality(0xffff_ffff);
                 if current == -1 {
                     return Err(io::Error::last_os_error());
@@ -429,6 +438,8 @@ mod tests {
                 "2M",
                 "-c",
                 "/opt/reverie/libreverie_dbi_client.so",
+                "-diagnostic_fd",
+                "198",
                 "--",
                 "/bin/echo",
                 "hello",
@@ -465,6 +476,8 @@ mod tests {
                 OsStr::new("2M"),
                 OsStr::new("-c"),
                 OsStr::new("/opt/reverie/libreverie_dbi_client.so"),
+                OsStr::new("-diagnostic_fd"),
+                OsStr::new("198"),
                 OsStr::new("--"),
                 OsStr::new("/usr/bin/env"),
                 OsStr::new("bash"),
@@ -495,6 +508,8 @@ mod tests {
                 OsStr::new("2M"),
                 OsStr::new("-c"),
                 OsStr::new("/opt/reverie/libreverie_dbi_client.so"),
+                OsStr::new("-diagnostic_fd"),
+                OsStr::new("198"),
                 OsStr::new("--"),
                 OsStr::new("/bin/sh"),
                 script.as_os_str(),
@@ -525,6 +540,8 @@ mod tests {
                 OsStr::new("2M"),
                 OsStr::new("-c"),
                 OsStr::new("/opt/reverie/libreverie_dbi_client.so"),
+                OsStr::new("-diagnostic_fd"),
+                OsStr::new("198"),
                 OsStr::new("--"),
                 OsStr::new("/usr/bin/env"),
                 OsStr::new("bash"),
@@ -547,8 +564,8 @@ mod tests {
 
         let wrapped = runner().command(&guest, None);
         let args = wrapped.get_args().collect::<Vec<_>>();
-        assert_eq!(args[7], OsStr::new("/bin/sh"));
-        assert_eq!(args[8], script.as_os_str());
+        assert_eq!(args[9], OsStr::new("/bin/sh"));
+        assert_eq!(args[10], script.as_os_str());
         assert_eq!(wrapped.get_current_dir(), Some(root.path()));
     }
 
@@ -567,8 +584,8 @@ mod tests {
 
         let wrapped = runner().command(&guest, None);
         let args = wrapped.get_args().collect::<Vec<_>>();
-        assert_eq!(args[7], OsStr::new("/bin/sh"));
-        assert_eq!(args[8], wrapper.as_os_str());
+        assert_eq!(args[9], OsStr::new("/bin/sh"));
+        assert_eq!(args[10], wrapper.as_os_str());
     }
 
     #[test]
@@ -584,8 +601,8 @@ mod tests {
 
         let wrapped = runner().command(&guest, None);
         let args = wrapped.get_args().collect::<Vec<_>>();
-        assert_eq!(args[7], OsStr::new("guest-elf"));
-        assert_eq!(args[8], OsStr::new("argument"));
+        assert_eq!(args[9], OsStr::new("guest-elf"));
+        assert_eq!(args[10], OsStr::new("argument"));
     }
 
     #[test]
@@ -633,6 +650,32 @@ mod tests {
             .output_with_input(&Command::new("/bin/true"), &output.stdout)
             .unwrap();
         assert!(output.status.success());
+    }
+
+    #[test]
+    fn keeps_diagnostics_out_of_guest_stderr_redirections() {
+        let root = tempfile::tempdir().unwrap();
+        let drrun = root.path().join("drrun");
+        let client = root.path().join("client.so");
+        write_executable_script(
+            &drrun,
+            b"#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n",
+        );
+        std::fs::write(&client, b"placeholder").unwrap();
+
+        let script = format!(
+            "output=$(/bin/bash -c 'printf guest-stderr >&2; printf backend-diagnostic >&{DIAGNOSTIC_FD}' 2>&1); printf 'captured=<%s>\\n' \"$output\""
+        );
+        let mut guest = Command::new("/bin/bash");
+        guest.args(["-c", &script]);
+
+        let output = DbiRunner::new(drrun, client)
+            .unwrap()
+            .output(&guest)
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"captured=<guest-stderr>\n");
+        assert_eq!(output.stderr, b"backend-diagnostic");
     }
 
     #[test]
