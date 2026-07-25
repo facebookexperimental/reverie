@@ -13,8 +13,9 @@ Cargo must initialize it when Reverie is consumed as a Git dependency.
 | e9patch | `third-party/e9patch` | `6c2c03c1da74b14daf1788a9f8dccfa354ce04a6` (`v1.0.1`) | GPL-3.0 |
 
 The in-tree `reverie-liteinst` prototype is self-contained and does not depend
-on an external LiteInst checkout. e9patch is pinned for the separate rewriting
-backend work and is not part of a default Rust build.
+on an external LiteInst checkout. The `reverie-e9patch` Rust crate builds
+without initializing the e9patch source, but runtime rewriting requires the
+separately built `e9tool` and `e9patch` executables.
 
 ## Activate one backend
 
@@ -69,5 +70,6 @@ available.
 
 CI starts with submodules disabled and explicitly activates DynamoRIO because
 the workspace includes `reverie-dbi`. SaBRe and e9patch remain absent because
-the Rust workspace does not compile their upstream source trees. A backend job
-that needs either source must activate only that backend first.
+the Rust workspace does not compile their upstream source trees. The
+`reverie-e9patch` tests use a controlled executable fixture by default; its
+opt-in real-tool test must activate and build only e9patch first.

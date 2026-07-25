@@ -78,11 +78,13 @@ for revisions, build commands, and license notes.
 
 ## Usage
 
-Currently, there is only the `reverie-ptrace` backend which uses `ptrace` to
-intercept syscalls. Copy one of the example tools to a new Rust project (e.g.
-`cargo init`). You’ll see that it depends both on the general `reverie` crate
-for the API and on the specific backend implementation crate,
-`reverie_ptrace`.
+Currently, `reverie-ptrace` is the only native event runtime. The optional
+`reverie-e9patch` crate provides validated e9patch preparation and a sealed
+executable artifact, but it does not yet implement `Guest` or `Backend`.
+
+Copy one of the example tools to a new Rust project (e.g. `cargo init`). You’ll
+see that it depends both on the general `reverie` crate for the API and on the
+specific backend implementation crate, `reverie_ptrace`.
 
 Running a tool always follows the same shape: pick a backend, hand it a command
 and the tool's config, and receive the guest's exit status together with the
