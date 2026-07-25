@@ -1,0 +1,39 @@
+[package]
+name = "reverie-preload"
+version = "0.1.0"
+authors = ["Meta Platforms"]
+edition = "2024"
+repository = "https://github.com/facebookexperimental/reverie"
+license = "BSD-2-Clause"
+description = "Shared LD_PRELOAD + seccomp/SIGSYS instrumentation runtime for Reverie ld-preload backends (e9patch, liteinst)"
+
+# Both an rlib (so e9patch/liteinst embed the runtime and register their own
+# dispatcher) and a cdylib (a standalone `LD_PRELOAD=libreverie_preload.so`
+# skeleton usable on its own and by the integration tests).
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["preload-constructor"]
+# Install the runtime from a `.init_array` constructor the moment the dynamic
+# loader maps the cdylib. Disable to embed the runtime and drive it manually
+# (for example from a backend that installs it after its own bootstrap).
+preload-constructor = []
+# Synchronous coordinator RPC client, wire-compatible with the async
+# `reverie-rpc-transport` `RpcServer<G>` (u32-BE length prefix + bincode2
+# `config::legacy`). Opt-in so the default cdylib stays a lean libc-only .so.
+coordinator-rpc = ["dep:serde", "dep:bincode", "dep:reverie"]
+
+[dependencies]
+libc = "0.2.186"
+serde = { version = "1.0.219", features = ["derive"], optional = true }
+bincode = { version = "2", features = ["serde"], optional = true }
+reverie = { version = "0.1.0", path = "../reverie", optional = true }
+
+[[bin]]
+name = "reverie-preload-probe"
+path = "src/bin/preload_probe.rs"
+
+[[test]]
+name = "smoke"
+path = "tests/smoke.rs"
