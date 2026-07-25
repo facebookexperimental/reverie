@@ -49,6 +49,25 @@ Callers can count and compare these markers alongside guest output and exit
 status. Arguments and results are omitted because many otherwise compatible
 calls contain host-selected addresses and identifiers.
 
+Controllers that must keep guest standard error separate from compatibility
+events can set `REVERIE_LITEINST_EVENT_FD` to the writable end of an inherited
+pipe and `REVERIE_LITEINST_EVENT_COOKIE` to a nonzero decimal `u64`. The
+descriptor must have `FD_CLOEXEC` cleared before the guest execs, and the
+controller must continuously drain the read end. The runtime validates and
+makes the pipe nonblocking, removes both variables before guest code starts,
+includes the cookie in each marker, and prevents ordinary descriptor syscalls
+from closing, duplicating, or writing to the reserved descriptor. It terminates
+the compatibility run if the descriptor identity changes or an atomic marker
+write cannot complete. Standalone launchers retain the standard-error default.
+Dedicated-channel records also identify the emitting runtime-visible Linux PID. Compatibility
+mode rejects process-group/session and PID-namespace escape operations so an
+external controller can clean up fork descendants as one process group.
+
+The cookie prevents accidental control-record confusion; it is not an
+authentication boundary against intentionally hostile code in the same address
+space. The entire preload prototype is in-process and must not be used as a
+security sandbox.
+
 The `preload-constructor` default feature installs the runtime through the
 DSO's `.init_array`. Embedders that provide their own cdylib wrapper must
 disable default features and install `reverie_liteinst_initialize` exactly once.

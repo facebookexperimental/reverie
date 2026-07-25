@@ -1,11 +1,15 @@
 use core::arch::global_asm;
+use core::sync::atomic::AtomicI32;
 use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::AtomicU8;
+use core::sync::atomic::AtomicU64;
 use core::sync::atomic::Ordering;
 use std::ffi::OsStr;
 use std::io;
 use std::ptr;
 
+use crate::COMPAT_EVENT_COOKIE_ENV;
+use crate::COMPAT_EVENT_FD_ENV;
 use crate::pun::PunProbe;
 
 const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
@@ -22,9 +26,15 @@ const BPF_RET_K: u16 = 0x06;
 const UNSET_RESULT: i64 = i64::MIN;
 const TOOL_STRACE: u8 = 1;
 const TOOL_COMPAT: u8 = 2;
+const EVENT_CHANNEL_IDENTITY_FAILURE_STATUS: i32 = 120;
+const EVENT_CHANNEL_WRITE_FAILURE_STATUS: i32 = 121;
 
 static PROBE: AtomicPtr<PunProbe> = AtomicPtr::new(ptr::null_mut());
 static TOOL_MODE: AtomicU8 = AtomicU8::new(0);
+static EVENT_FD: AtomicI32 = AtomicI32::new(libc::STDERR_FILENO);
+static EVENT_COOKIE: AtomicU64 = AtomicU64::new(0);
+static EVENT_DEVICE: AtomicU64 = AtomicU64::new(0);
+static EVENT_INODE: AtomicU64 = AtomicU64::new(0);
 
 #[thread_local]
 static mut CURRENT_EVENT: *mut SyscallEvent = ptr::null_mut();
@@ -91,6 +101,25 @@ pub(crate) fn initialize_from_environment() -> io::Result<()> {
         }
     };
     TOOL_MODE.store(mode, Ordering::Release);
+    let event_channel = if mode == TOOL_COMPAT {
+        compatibility_event_channel()?
+    } else {
+        None
+    };
+    let event_fd = event_channel
+        .as_ref()
+        .map_or(libc::STDERR_FILENO, |channel| channel.fd);
+    EVENT_FD.store(event_fd, Ordering::Release);
+    if let Some(channel) = event_channel {
+        EVENT_COOKIE.store(channel.cookie, Ordering::Release);
+        EVENT_DEVICE.store(channel.device, Ordering::Release);
+        EVENT_INODE.store(channel.inode, Ordering::Release);
+        // SAFETY: initialization runs before application threads start.
+        unsafe {
+            std::env::remove_var(COMPAT_EVENT_FD_ENV);
+            std::env::remove_var(COMPAT_EVENT_COOKIE_ENV);
+        }
+    }
 
     let probe = Box::new(PunProbe::new(tool_trampoline)?);
     let probe = Box::into_raw(probe);
@@ -98,6 +127,101 @@ pub(crate) fn initialize_from_environment() -> io::Result<()> {
 
     install_sigsys_handler()?;
     install_seccomp_filter()
+}
+
+struct CompatibilityEventChannel {
+    fd: libc::c_int,
+    cookie: u64,
+    device: u64,
+    inode: u64,
+}
+
+fn compatibility_event_channel() -> io::Result<Option<CompatibilityEventChannel>> {
+    let Some(value) = std::env::var_os(COMPAT_EVENT_FD_ENV) else {
+        if std::env::var_os(COMPAT_EVENT_COOKIE_ENV).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{COMPAT_EVENT_COOKIE_ENV} requires {COMPAT_EVENT_FD_ENV}"),
+            ));
+        }
+        return Ok(None);
+    };
+    let value = value.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{COMPAT_EVENT_FD_ENV} must be valid UTF-8"),
+        )
+    })?;
+    let fd = value.parse::<libc::c_int>().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{COMPAT_EVENT_FD_ENV} must be a non-negative descriptor"),
+        )
+    })?;
+    let flags = if fd < 0 {
+        -1
+    } else {
+        unsafe { libc::fcntl(fd, libc::F_GETFL) }
+    };
+    if flags < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{COMPAT_EVENT_FD_ENV} does not name an open descriptor"),
+        ));
+    }
+    if flags & libc::O_ACCMODE == libc::O_RDONLY {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{COMPAT_EVENT_FD_ENV} must name a writable descriptor"),
+        ));
+    }
+    let cookie = std::env::var(COMPAT_EVENT_COOKIE_ENV)
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{COMPAT_EVENT_COOKIE_ENV} is required with {COMPAT_EVENT_FD_ENV}"),
+            )
+        })?
+        .parse::<u64>()
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{COMPAT_EVENT_COOKIE_ENV} must be a nonzero decimal u64"),
+            )
+        })?;
+    if cookie == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{COMPAT_EVENT_COOKIE_ENV} must be a nonzero decimal u64"),
+        ));
+    }
+
+    let mut metadata: libc::stat = unsafe { core::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut metadata) } != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{COMPAT_EVENT_FD_ENV} metadata could not be read"),
+        ));
+    }
+    if metadata.st_mode & libc::S_IFMT != libc::S_IFIFO {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{COMPAT_EVENT_FD_ENV} must name a pipe"),
+        ));
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{COMPAT_EVENT_FD_ENV} could not be made nonblocking"),
+        ));
+    }
+
+    Ok(Some(CompatibilityEventChannel {
+        fd,
+        cookie,
+        device: metadata.st_dev,
+        inode: metadata.st_ino,
+    }))
 }
 
 unsafe extern "C" fn sigsys_handler(
@@ -166,6 +290,38 @@ unsafe extern "C" fn tool_trampoline() {
 }
 
 unsafe fn process_syscall(event: &mut SyscallEvent) {
+    if TOOL_MODE.load(Ordering::Relaxed) == TOOL_COMPAT
+        && EVENT_COOKIE.load(Ordering::Relaxed) != 0
+        && unsafe { protect_compatibility_event_channel(event) }
+    {
+        return;
+    }
+
+    if TOOL_MODE.load(Ordering::Relaxed) == TOOL_COMPAT
+        && matches!(
+            event.number,
+            libc::SYS_setpgid | libc::SYS_setsid | libc::SYS_setns | libc::SYS_unshare
+        )
+    {
+        event.result = -i64::from(libc::EPERM);
+        unsafe {
+            trace_event(event, Some(event.result));
+        }
+        return;
+    }
+
+    if event.number == libc::SYS_clone && !clone_is_fork_like(event.args[0], event.args[1]) {
+        event.result = if TOOL_MODE.load(Ordering::Relaxed) == TOOL_COMPAT {
+            -i64::from(libc::EPERM)
+        } else {
+            -i64::from(libc::ENOTSUP)
+        };
+        unsafe {
+            trace_event(event, Some(event.result));
+        }
+        return;
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#61): exec cannot safely cross an inherited trap filter.
     if event.number == libc::SYS_execve || event.number == libc::SYS_execveat {
@@ -180,16 +336,6 @@ unsafe fn process_syscall(event: &mut SyscallEvent) {
     // TODO-HUMAN-REVIEW(#61): reserve SIGSYS until disposition virtualization exists.
     if event.number == libc::SYS_rt_sigaction && event.args[0] == libc::SIGSYS as u64 {
         event.result = -i64::from(libc::EPERM);
-        unsafe {
-            trace_event(event, Some(event.result));
-        }
-        return;
-    }
-
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#61): a non-null clone stack cannot resume this signal frame safely.
-    if event.number == libc::SYS_clone && event.args[1] != 0 {
-        event.result = -i64::from(libc::ENOTSUP);
         unsafe {
             trace_event(event, Some(event.result));
         }
@@ -212,22 +358,205 @@ unsafe fn process_syscall(event: &mut SyscallEvent) {
         }
     }
 
+    let compatibility_fork = TOOL_MODE.load(Ordering::Relaxed) == TOOL_COMPAT
+        && matches!(event.number, libc::SYS_clone | libc::SYS_fork);
+    if compatibility_fork {
+        unsafe {
+            trace_event(event, None);
+        }
+    }
     event.result = unsafe { raw_syscall6(event.number, event.args) };
 
-    if event.number != libc::SYS_exit && event.number != libc::SYS_exit_group {
+    if event.number != libc::SYS_exit && event.number != libc::SYS_exit_group && !compatibility_fork
+    {
         unsafe {
             trace_event(event, Some(event.result));
         }
     }
 }
 
+fn clone_is_fork_like(flags: u64, child_stack: u64) -> bool {
+    const SIGNAL_MASK: u64 = 0xff;
+    let allowed_flags =
+        (libc::CLONE_CHILD_CLEARTID | libc::CLONE_CHILD_SETTID | libc::CLONE_PARENT_SETTID) as u64;
+    child_stack == 0
+        && flags & SIGNAL_MASK == libc::SIGCHLD as u64
+        && flags & !(SIGNAL_MASK | allowed_flags) == 0
+}
+
+unsafe fn protect_compatibility_event_channel(event: &mut SyscallEvent) -> bool {
+    let event_fd = EVENT_FD.load(Ordering::Acquire) as u64;
+
+    if event.number == libc::SYS_close && event.args[0] == event_fd {
+        // The descriptor is controller-owned and intentionally invisible to
+        // guest descriptor lifecycle management.
+        event.result = 0;
+    } else if event.number == libc::SYS_close_range
+        && event.args[0] <= event_fd
+        && event_fd <= event.args[1]
+    {
+        event.result = unsafe { close_range_preserving_event_fd(event, event_fd) };
+    } else if syscall_targets_event_fd(event, event_fd) {
+        event.result = -i64::from(libc::EBADF);
+    } else {
+        return false;
+    }
+
+    unsafe {
+        trace_event(event, Some(event.result));
+    }
+    true
+}
+
+unsafe fn close_range_preserving_event_fd(event: &SyscallEvent, event_fd: u64) -> i64 {
+    const CLOSE_RANGE_UNSHARE: u64 = 1 << 1;
+    const CLOSE_RANGE_CLOEXEC: u64 = 1 << 2;
+
+    let first = event.args[0];
+    let last = event.args[1];
+    let mut flags = event.args[2];
+    if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 {
+        return -i64::from(libc::EINVAL);
+    }
+    if flags & CLOSE_RANGE_UNSHARE != 0 {
+        let result =
+            unsafe { raw_syscall6(libc::SYS_unshare, [libc::CLONE_FILES as u64, 0, 0, 0, 0, 0]) };
+        if result < 0 {
+            return result;
+        }
+        flags &= !CLOSE_RANGE_UNSHARE;
+    }
+
+    if first < event_fd {
+        let result =
+            unsafe { raw_syscall6(libc::SYS_close_range, [first, event_fd - 1, flags, 0, 0, 0]) };
+        if result < 0 {
+            return result;
+        }
+    }
+    if event_fd < last {
+        let result =
+            unsafe { raw_syscall6(libc::SYS_close_range, [event_fd + 1, last, flags, 0, 0, 0]) };
+        if result < 0 {
+            return result;
+        }
+    }
+    0
+}
+
+fn syscall_targets_event_fd(event: &SyscallEvent, event_fd: u64) -> bool {
+    match event.number {
+        libc::SYS_read
+        | libc::SYS_readv
+        | libc::SYS_pread64
+        | libc::SYS_preadv
+        | libc::SYS_preadv2
+        | libc::SYS_write
+        | libc::SYS_writev
+        | libc::SYS_pwrite64
+        | libc::SYS_pwritev
+        | libc::SYS_pwritev2
+        | libc::SYS_vmsplice
+        | libc::SYS_sendfile
+        | libc::SYS_fcntl
+        | libc::SYS_ioctl
+        | libc::SYS_dup => event.args[0] == event_fd,
+        libc::SYS_dup2 | libc::SYS_dup3 => event.args[0] == event_fd || event.args[1] == event_fd,
+        libc::SYS_splice | libc::SYS_copy_file_range => {
+            event.args[0] == event_fd || event.args[2] == event_fd
+        }
+        libc::SYS_tee => event.args[0] == event_fd || event.args[1] == event_fd,
+        _ => false,
+    }
+}
+
+unsafe fn compatibility_event_channel_is_intact(output_fd: libc::c_int) -> bool {
+    let mut metadata: libc::stat = unsafe { core::mem::zeroed() };
+    let result = unsafe {
+        raw_syscall6(
+            libc::SYS_fstat,
+            [output_fd as u64, (&raw mut metadata) as u64, 0, 0, 0, 0],
+        )
+    };
+    result == 0
+        && metadata.st_dev == EVENT_DEVICE.load(Ordering::Acquire)
+        && metadata.st_ino == EVENT_INODE.load(Ordering::Acquire)
+}
+
+unsafe fn write_compatibility_event(output_fd: libc::c_int, bytes: &[u8]) {
+    const MAX_BACKPRESSURE_RETRIES: usize = 20;
+    const BACKPRESSURE_POLL_MILLISECONDS: u64 = 100;
+
+    if unsafe { !compatibility_event_channel_is_intact(output_fd) } {
+        unsafe {
+            exit_now(EVENT_CHANNEL_IDENTITY_FAILURE_STATUS);
+        }
+    }
+    for attempt in 0..=MAX_BACKPRESSURE_RETRIES {
+        let written = unsafe {
+            raw_syscall6(
+                libc::SYS_write,
+                [
+                    output_fd as u64,
+                    bytes.as_ptr() as u64,
+                    bytes.len() as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        };
+        if written == bytes.len() as i64 {
+            return;
+        }
+        if written != -i64::from(libc::EAGAIN) && written != -i64::from(libc::EINTR) {
+            break;
+        }
+        if attempt == MAX_BACKPRESSURE_RETRIES {
+            break;
+        }
+        let mut descriptor = libc::pollfd {
+            fd: output_fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let _ = unsafe {
+            raw_syscall6(
+                libc::SYS_poll,
+                [
+                    (&raw mut descriptor) as u64,
+                    1,
+                    BACKPRESSURE_POLL_MILLISECONDS,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        };
+    }
+    unsafe {
+        exit_now(EVENT_CHANNEL_WRITE_FAILURE_STATUS);
+    }
+}
+
 unsafe fn trace_event(event: &SyscallEvent, result: Option<i64>) {
     let mode = TOOL_MODE.load(Ordering::Relaxed);
+    let output_fd;
     let mut line = StackLine::new();
     if mode == TOOL_COMPAT {
-        line.push_bytes(b"reverie-liteinst: tool=compat syscall=");
+        output_fd = EVENT_FD.load(Ordering::Acquire);
+        line.push_bytes(b"reverie-liteinst: tool=compat");
+        let cookie = EVENT_COOKIE.load(Ordering::Acquire);
+        if cookie != 0 {
+            line.push_bytes(b" cookie=");
+            line.push_unsigned(cookie);
+            line.push_bytes(b" pid=");
+            line.push_signed(unsafe { raw_syscall6(libc::SYS_getpid, [0; 6]) });
+        }
+        line.push_bytes(b" syscall=");
         line.push_signed(event.number);
     } else if mode == TOOL_STRACE {
+        output_fd = libc::STDERR_FILENO;
         let pid = unsafe { raw_syscall6(libc::SYS_getpid, [0; 6]) };
         line.push_bytes(b"[liteinst strace pid ");
         line.push_signed(pid);
@@ -245,19 +574,25 @@ unsafe fn trace_event(event: &SyscallEvent, result: Option<i64>) {
     }
     line.push_bytes(b"\n");
 
-    let _ = unsafe {
-        raw_syscall6(
-            libc::SYS_write,
-            [
-                libc::STDERR_FILENO as u64,
-                line.bytes.as_ptr() as u64,
-                line.len as u64,
-                0,
-                0,
-                0,
-            ],
-        )
-    };
+    if mode == TOOL_COMPAT && EVENT_COOKIE.load(Ordering::Relaxed) != 0 {
+        unsafe {
+            write_compatibility_event(output_fd, &line.bytes[..line.len]);
+        }
+    } else {
+        let _ = unsafe {
+            raw_syscall6(
+                libc::SYS_write,
+                [
+                    output_fd as u64,
+                    line.bytes.as_ptr() as u64,
+                    line.len as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        };
+    }
 }
 
 unsafe fn raw_syscall6(number: i64, args: [u64; 6]) -> i64 {
@@ -422,6 +757,7 @@ impl StackLine {
 #[cfg(test)]
 mod tests {
     use super::StackLine;
+    use super::clone_is_fork_like;
 
     #[test]
     fn stack_line_formats_signed_and_hex_values() {
@@ -430,5 +766,40 @@ mod tests {
         line.push_bytes(b" ");
         line.push_hex(0xdead_beef);
         assert_eq!(&line.bytes[..line.len], b"-123 deadbeef");
+    }
+
+    #[test]
+    fn clone_accepts_only_fork_like_flags() {
+        let bookkeeping = (libc::CLONE_CHILD_CLEARTID
+            | libc::CLONE_CHILD_SETTID
+            | libc::CLONE_PARENT_SETTID) as u64;
+        assert!(clone_is_fork_like(libc::SIGCHLD as u64, 0));
+        assert!(clone_is_fork_like(libc::SIGCHLD as u64 | bookkeeping, 0));
+        assert!(!clone_is_fork_like(libc::SIGCHLD as u64, 1));
+        assert!(!clone_is_fork_like(0, 0));
+        assert!(!clone_is_fork_like(libc::SIGUSR1 as u64, 0));
+
+        for rejected in [
+            libc::CLONE_VM,
+            libc::CLONE_VFORK,
+            libc::CLONE_THREAD,
+            libc::CLONE_SETTLS,
+            libc::CLONE_SIGHAND,
+            libc::CLONE_FILES,
+            libc::CLONE_FS,
+            libc::CLONE_PARENT,
+            libc::CLONE_NEWCGROUP,
+            libc::CLONE_NEWIPC,
+            libc::CLONE_NEWNET,
+            libc::CLONE_NEWNS,
+            libc::CLONE_NEWPID,
+            libc::CLONE_NEWUSER,
+            libc::CLONE_NEWUTS,
+        ] {
+            assert!(
+                !clone_is_fork_like(libc::SIGCHLD as u64 | rejected as u64, 0),
+                "accepted unsafe clone flag {rejected:#x}"
+            );
+        }
     }
 }
