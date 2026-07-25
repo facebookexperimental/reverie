@@ -38,6 +38,10 @@ const MAX_PROGRAM_HEADERS_SIZE: usize = PAGE_SIZE as usize;
 const MAX_INTERPRETER_BYTES: u64 = 16 * 1024 * 1024;
 const MAIN_LOAD_BIAS: u64 = 2 * 1024 * 1024;
 const INTERPRETER_LOAD_BIAS: u64 = 16 * 1024 * 1024;
+/// Page-aligned program-break gap reserved between a large main image and a
+/// relocated interpreter base. Only applies when the main image would overrun
+/// the historical fixed [`INTERPRETER_LOAD_BIAS`]; small PIEs are unaffected.
+const INTERPRETER_MIN_BRK_HEADROOM: u64 = 4 * 1024 * 1024;
 
 const AT_NULL: u64 = 0;
 const AT_PHDR: u64 = 3;
@@ -220,11 +224,16 @@ pub(crate) fn load_static_elf(
         .ok_or_else(|| Error::UnsupportedElf("main entry point overflow".to_string()))?;
 
     let (entry_point, at_base, image_end) = if let Some(path) = interpreter_path(image, &elf)? {
-        if main_end > INTERPRETER_LOAD_BIAS {
-            return Err(Error::UnsupportedElf(format!(
-                "main image end {main_end:#x} overlaps interpreter base {INTERPRETER_LOAD_BIAS:#x}",
-            )));
-        }
+        // TODO-HUMAN-REVIEW(reverie-kvm): relocate the interpreter above large
+        // main images instead of failing to load.
+        //
+        // Place the dynamic interpreter (ld.so) above the main image. Small
+        // PIEs keep the historical fixed 16 MiB base, so their memory layout is
+        // byte-identical to before. Large PIEs (e.g. rustc, cargo) whose image
+        // would overrun that base get the interpreter relocated just above the
+        // main image, with a page-aligned program-break gap, instead of the
+        // previous hard "overlaps interpreter base" load failure.
+        let interpreter_load_bias = interpreter_load_bias(main_end)?;
         let interpreter_image = read_interpreter_image(&path)?;
         let interpreter = Elf::parse(&interpreter_image)?;
         validate_elf(&interpreter, false)?;
@@ -237,14 +246,14 @@ pub(crate) fn load_static_elf(
             memory,
             &interpreter_image,
             &interpreter,
-            INTERPRETER_LOAD_BIAS,
+            interpreter_load_bias,
         )?;
-        let interpreter_entry = INTERPRETER_LOAD_BIAS
+        let interpreter_entry = interpreter_load_bias
             .checked_add(interpreter.entry)
             .ok_or_else(|| Error::UnsupportedElf("interpreter entry point overflow".to_string()))?;
         (
             interpreter_entry,
-            INTERPRETER_LOAD_BIAS,
+            interpreter_load_bias,
             main_end.max(interpreter_end),
         )
     } else {
@@ -284,7 +293,11 @@ pub(crate) fn load_static_elf(
     let brk_limit = if at_base == 0 {
         mmap_next
     } else {
-        INTERPRETER_LOAD_BIAS
+        // The interpreter is loaded at `at_base`; the program break grows in the
+        // gap between the main image and the interpreter, so cap it there. For a
+        // relocated (large-PIE) interpreter this equals the dynamic base rather
+        // than the fixed `INTERPRETER_LOAD_BIAS`.
+        at_base
     };
 
     let cwd_fd = OpenOptions::new()
@@ -607,4 +620,86 @@ fn align_up(value: u64, alignment: u64) -> Result<u64> {
         .checked_add(alignment - 1)
         .map(|value| value & !(alignment - 1))
         .ok_or_else(|| Error::UnsupportedElf("address alignment overflow".to_string()))
+}
+
+/// Choose the load base for the dynamic interpreter (`ld.so`) given the end of
+/// the already-loaded main image.
+///
+/// Small position-independent executables keep the historical fixed
+/// [`INTERPRETER_LOAD_BIAS`], so their layout is unchanged. When the main image
+/// would reach into or past that base (large PIEs such as `rustc` or `cargo`),
+/// the interpreter is instead placed just above the main image, page-aligned
+/// and past a reserved [`INTERPRETER_MIN_BRK_HEADROOM`] program-break gap. This
+/// replaces the previous hard "overlaps interpreter base" load failure.
+fn interpreter_load_bias(main_end: u64) -> Result<u64> {
+    if main_end <= INTERPRETER_LOAD_BIAS {
+        Ok(INTERPRETER_LOAD_BIAS)
+    } else {
+        align_up(
+            main_end
+                .checked_add(INTERPRETER_MIN_BRK_HEADROOM)
+                .ok_or_else(|| Error::UnsupportedElf("interpreter base overflow".to_string()))?,
+            PAGE_SIZE,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn small_pie_keeps_fixed_interpreter_base() {
+        // A typical small PIE loads well under 16 MiB; layout must be unchanged.
+        assert_eq!(
+            interpreter_load_bias(MAIN_LOAD_BIAS).unwrap(),
+            INTERPRETER_LOAD_BIAS
+        );
+        assert_eq!(
+            interpreter_load_bias(3 * 1024 * 1024).unwrap(),
+            INTERPRETER_LOAD_BIAS
+        );
+        // Exactly at the fixed base still uses it (boundary is inclusive).
+        assert_eq!(
+            interpreter_load_bias(INTERPRETER_LOAD_BIAS).unwrap(),
+            INTERPRETER_LOAD_BIAS
+        );
+    }
+
+    #[test]
+    fn large_pie_relocates_interpreter_above_main_image() {
+        // rustc/cargo observed main image end that overran the fixed base.
+        let main_end = 0x015b_bb30;
+        let base = interpreter_load_bias(main_end).unwrap();
+        // Interpreter is placed above the main image (no overlap)...
+        assert!(
+            base > main_end,
+            "interpreter base {base:#x} must clear main end {main_end:#x}"
+        );
+        // ...page-aligned...
+        assert_eq!(
+            base % PAGE_SIZE,
+            0,
+            "interpreter base {base:#x} must be page aligned"
+        );
+        // ...past the reserved program-break headroom...
+        assert!(
+            base >= main_end + INTERPRETER_MIN_BRK_HEADROOM,
+            "interpreter base {base:#x} must reserve brk headroom above {main_end:#x}"
+        );
+        // ...and above the historical fixed base since the image overran it.
+        assert!(base > INTERPRETER_LOAD_BIAS);
+        // Exact expected value: align_up(main_end + headroom, PAGE_SIZE).
+        assert_eq!(
+            base,
+            align_up(main_end + INTERPRETER_MIN_BRK_HEADROOM, PAGE_SIZE).unwrap()
+        );
+    }
+
+    #[test]
+    fn interpreter_base_overflow_is_reported() {
+        // A main image ending near u64::MAX cannot reserve headroom; report it
+        // rather than wrapping.
+        assert!(interpreter_load_bias(u64::MAX - 1024).is_err());
+    }
 }
