@@ -31,6 +31,44 @@ const REDZONE_SIZE: usize = 128;
 // guest stack is bigger than that.
 const STACK_CAPACITY: usize = 1024 - REDZONE_SIZE;
 
+/// RAII token recording that a task's single guest stack is currently checked
+/// out. Acquiring flips the per-task flag; dropping the token -- whether from an
+/// uncommitted [`GuestStack`] or from the [`StackGuard`] that [`Stack::commit`]
+/// hands back -- clears the flag so the next `stack()` acquisition can succeed.
+///
+/// Previously the flag was cleared *only* by `StackGuard::drop`, and
+/// `StackGuard` is produced only by a successful `commit`. Because `GuestStack`
+/// had no `Drop`, any acquisition that was dropped without committing leaked the
+/// flag forever: every error path inside `commit` itself (the `EFAULT` and
+/// `write_exact` returns), a failed register read in `new`, and any early return
+/// between `stack()` and `commit()` in a consumer. The next `stack()` on that
+/// task then panicked with "already a StackGuard still alive" even though no
+/// stack was actually live. Making the checkout RAII releases the flag on every
+/// drop path while still catching a genuine *simultaneous* second checkout.
+#[derive(Debug)]
+struct StackToken {
+    flag: Arc<AtomicBool>,
+}
+
+impl StackToken {
+    /// Acquire the checkout. Returns `None` when a stack is already checked out
+    /// for this task, i.e. a real reentrant acquisition while another handle is
+    /// still alive.
+    fn acquire(flag: Arc<AtomicBool>) -> Option<Self> {
+        if flag.swap(true, Ordering::SeqCst) {
+            None
+        } else {
+            Some(StackToken { flag })
+        }
+    }
+}
+
+impl Drop for StackToken {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::SeqCst);
+    }
+}
+
 // keep in mind stack grows towards lower address, at least on major
 // platforms.
 pub struct GuestStack {
@@ -39,18 +77,20 @@ pub struct GuestStack {
     capacity: usize,
     buf: Vec<u64>,
     task: Stopped,
-    flag: Arc<AtomicBool>,
+    token: StackToken,
 }
 
 impl GuestStack {
     pub fn new(pid: Pid, flag: Arc<AtomicBool>) -> Result<Self, TraceError> {
-        let old = flag.swap(true, Ordering::SeqCst);
-        if old {
-            panic!(
+        let token = match StackToken::acquire(flag) {
+            Some(token) => token,
+            None => panic!(
                 "Invariant violation, cannot retrieve handle on guest Stack when there is already a StackGuard still alive."
-            );
-        }
+            ),
+        };
         let task = Stopped::new_unchecked(pid);
+        // If the register read fails, `token` is dropped on this early return and
+        // the flag is released, so a later retry on the same task is not poisoned.
         let rsp = task.getregs()?.stack_ptr() as usize;
         let top = rsp - REDZONE_SIZE;
         Ok(GuestStack {
@@ -59,7 +99,7 @@ impl GuestStack {
             capacity: STACK_CAPACITY,
             buf: Vec::new(),
             task,
-            flag,
+            token,
         })
     }
 
@@ -89,18 +129,16 @@ impl GuestStack {
 // TODO: Ideally we would have some way to connect the actual `Addr` references into the
 // guest heap to the lifetime of the StackGuard (like the ST monad in Haskell).
 pub struct StackGuard {
-    flag: Arc<AtomicBool>,
+    // Holding the checkout token keeps the per-task flag set for as long as the
+    // committed stack data must stay live; dropping the guard releases it.
+    _token: StackToken,
 }
 
+// `reverie::Stack::StackGuard` requires `Drop`. The flag release itself happens
+// in the `StackToken` field's own drop glue, which runs after this; an explicit
+// (empty) impl is only needed to satisfy that trait bound.
 impl Drop for StackGuard {
-    fn drop(&mut self) {
-        let old = self.flag.swap(false, Ordering::SeqCst);
-        if !old {
-            panic!(
-                "Invariant violation, when dropping StackGuard, the internal flag was not set as expected."
-            )
-        }
-    }
+    fn drop(&mut self) {}
 }
 
 impl Stack for GuestStack {
@@ -124,8 +162,12 @@ impl Stack for GuestStack {
         self.buf.reverse();
         let from =
             unsafe { core::slice::from_raw_parts(self.buf.as_ptr() as *const u8, self.size()) };
+        // Any `?` above returns early and drops `self`, releasing the checkout
+        // token so a failed commit does not poison the next acquisition. On
+        // success we transfer the token into the guard, which keeps the flag set
+        // until the caller drops the guard.
         self.task.write_exact(remote_sp, from)?;
-        Ok(StackGuard { flag: self.flag })
+        Ok(StackGuard { _token: self.token })
     }
 }
 
@@ -179,6 +221,60 @@ pub unsafe fn transmute_u64s<T: Sized>(value: T) -> Vec<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Regression test for the "already a StackGuard still alive" panic: a stack
+    // checkout dropped without a successful `commit` must release the per-task
+    // flag so the next acquisition does not spuriously panic. Before the RAII
+    // fix, the flag was only cleared by `StackGuard::drop`, so this sequence left
+    // it stuck set.
+    #[test]
+    fn stack_token_releases_on_drop_without_commit() {
+        let flag = Arc::new(AtomicBool::new(false));
+        {
+            let _token = StackToken::acquire(flag.clone()).expect("first acquire succeeds");
+            assert!(flag.load(Ordering::SeqCst), "flag is set while checked out");
+            // Dropped here WITHOUT transferring into a StackGuard, mirroring an
+            // error path or early return between `stack()` and `commit()`.
+        }
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "flag is cleared once the uncommitted checkout drops"
+        );
+        assert!(
+            StackToken::acquire(flag).is_some(),
+            "a fresh acquisition after a dropped checkout succeeds instead of panicking"
+        );
+    }
+
+    // The genuine reentrancy invariant is preserved: an overlapping second
+    // checkout is still detected while the first token is alive.
+    #[test]
+    fn stack_token_detects_simultaneous_checkout() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let _first = StackToken::acquire(flag.clone()).expect("first acquire succeeds");
+        assert!(
+            StackToken::acquire(flag).is_none(),
+            "an overlapping checkout is refused while the first is still alive"
+        );
+    }
+
+    // Transferring the token into a StackGuard keeps the flag set until the guard
+    // itself drops, matching the committed-stack lifetime.
+    #[test]
+    fn stack_guard_holds_then_releases_flag() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let token = StackToken::acquire(flag.clone()).expect("acquire succeeds");
+        let guard = StackGuard { _token: token };
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "flag stays set while the guard is alive"
+        );
+        drop(guard);
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "flag is cleared after the guard drops"
+        );
+    }
 
     #[test]
     fn transmute_sanity() {
