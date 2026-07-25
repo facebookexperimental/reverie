@@ -357,6 +357,58 @@ fn static_elf_forks_execs_and_waits_for_child() {
 }
 
 #[test]
+fn static_elf_self_abort_terminates_instead_of_faulting() {
+    // Regression: glibc abort() writes its diagnostic, then raises SIGABRT via
+    // tgkill(pid, tid, SIGABRT). Previously SIGABRT was unhandled (ENOSYS), so
+    // abort() fell through to its "unreachable" hlt trap and the VM reported a
+    // spurious #GP (exception vector 13). A self-directed fatal signal must now
+    // terminate the process with the conventional 128 + signo status while
+    // preserving output emitted before the signal.
+    match Kvm::new() {
+        Ok(_) => {}
+        Err(error) if kvm_is_unavailable(&error) => {
+            eprintln!("skipping KVM self-abort test: cannot open /dev/kvm: {error}");
+            return;
+        }
+        Err(error) => panic!("failed to probe /dev/kvm: {error}"),
+    }
+
+    let message = b"before abort\n";
+    // write(1, message, len)
+    let mut code = vec![0xbf, 0x01, 0x00, 0x00, 0x00]; // mov edi, 1
+    let message_operand = code.len() + 2;
+    code.extend_from_slice(&[0x48, 0xbe, 0, 0, 0, 0, 0, 0, 0, 0]); // movabs rsi, message
+    code.push(0xba);
+    code.extend_from_slice(&(message.len() as u32).to_le_bytes()); // mov edx, len
+    code.extend_from_slice(&[0xb8, 0x01, 0x00, 0x00, 0x00, 0x0f, 0x05]); // mov eax, SYS_write; syscall
+    // pid = getpid(); tgkill(pid, pid, SIGABRT)
+    code.extend_from_slice(&[
+        0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax, SYS_getpid
+        0x0f, 0x05, // syscall -> rax = pid
+        0x89, 0xc7, // mov edi, eax  (tgid)
+        0x89, 0xc6, // mov esi, eax  (tid)
+        0xba, 0x06, 0x00, 0x00, 0x00, // mov edx, SIGABRT
+        0xb8, 0xea, 0x00, 0x00, 0x00, // mov eax, SYS_tgkill
+        0x0f, 0x05, // syscall -> must terminate here
+        0x0f, 0x0b, // ud2 (only reached if the signal did not terminate us)
+    ]);
+    let message_address = LOAD_ADDRESS + code.len() as u64;
+    code[message_operand..message_operand + 8].copy_from_slice(&message_address.to_le_bytes());
+    code.extend_from_slice(message);
+
+    let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+    backend
+        .install_static_elf(&static_elf(&code), "/bin/self-abort")
+        .unwrap();
+    let (code_result, stdout, stderr) = backend.run_static_elf_captured().unwrap();
+
+    // 128 + SIGABRT(6) == 134, matching the shell/native convention.
+    assert_eq!(code_result, 128 + libc::SIGABRT);
+    assert_eq!(stdout, message);
+    assert!(stderr.is_empty());
+}
+
+#[test]
 fn static_elf_clone_tid_side_effects_reach_guest_memory() {
     match Kvm::new() {
         Ok(_) => {}

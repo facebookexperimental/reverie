@@ -346,6 +346,12 @@ fn execute_basic_syscall_with_output(
         rt_sigprocmask(memory, state, args)
     } else if number == libc::SYS_sigaltstack as u64 {
         sigaltstack(memory, state, args)
+    } else if number == libc::SYS_kill as u64
+        || number == libc::SYS_tkill as u64
+        || number == libc::SYS_tgkill as u64
+    {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        return kill_signal(state, number, args);
     } else if number == libc::SYS_close as u64 {
         close(state, args[0])
     } else if number == libc::SYS_set_robust_list as u64
@@ -2813,6 +2819,117 @@ fn rt_sigprocmask(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &
         return write_bytes(memory, args[2], &previous);
     }
     0
+}
+
+/// Effective action for a signal after honoring any handler installed through
+/// `rt_sigaction`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SignalDisposition {
+    /// Default action terminates the process.
+    Terminate,
+    /// Signal is ignored (default or `SIG_IGN`).
+    Ignore,
+    /// Default action stops the process.
+    Stop,
+    /// A user handler is installed that this guest kernel cannot deliver.
+    Handled,
+}
+
+/// Emulates `kill`/`tkill`/`tgkill` for the single-process guest model.
+///
+/// This guest kernel does not deliver asynchronous signals or run user handlers.
+/// However, a process that signals itself with a fatal, default-disposition
+/// signal (most importantly glibc `abort()` raising `SIGABRT` via `tgkill`) must
+/// still terminate. Before this handler those syscalls returned `ENOSYS`, so
+/// `abort()` fell through to its "unreachable" `hlt` trap and the VM reported a
+/// spurious `#GP` (exception vector 13) instead of exiting. A self-directed
+/// fatal signal now terminates the process with the conventional `128 + signo`
+/// status; ignored, stopped, blocked, or user-handled signals are reported as
+/// accepted without altering control flow.
+// TODO-HUMAN-REVIEW(#95): Review self-signal termination and the default-disposition table.
+fn kill_signal(state: &LoadedStaticElf, number: u64, args: &[u64; 6]) -> SyscallAction {
+    // tgkill(tgid, tid, sig) carries the signal in its third argument, whereas
+    // kill(pid, sig) and tkill(tid, sig) carry it in the second.
+    let (target, raw_signal) = if number == libc::SYS_tgkill as u64 {
+        (args[1] as i64, args[2])
+    } else {
+        (args[0] as i64, args[1])
+    };
+    let Ok(signal) = libc::c_int::try_from(raw_signal) else {
+        return continue_with(negative_errno(libc::EINVAL));
+    };
+    if !(0..=64).contains(&signal) {
+        return continue_with(negative_errno(libc::EINVAL));
+    }
+
+    // Only self-directed signals are modeled. `kill` accepts the process id, its
+    // own process group (0), or the broadcast set (-1); `tkill`/`tgkill` name
+    // the sole guest thread by its tid.
+    let targets_self = if number == libc::SYS_kill as u64 {
+        target == i64::from(state.pid) || target == 0 || target == -1
+    } else {
+        target == i64::from(state.pid)
+    };
+    if !targets_self {
+        return continue_with(negative_errno(libc::ESRCH));
+    }
+
+    // Signal 0 is a permission/liveness probe that delivers nothing.
+    if signal == 0 {
+        return continue_with(0);
+    }
+
+    // SIGKILL can never be caught, blocked, or ignored.
+    if signal == libc::SIGKILL {
+        return SyscallAction::Exit(128 + signal);
+    }
+
+    // A blocked signal stays pending; this guest kernel does not queue pending
+    // signals, so report success without terminating.
+    if signal_is_blocked(state, signal) {
+        return continue_with(0);
+    }
+
+    match signal_disposition(state, signal) {
+        SignalDisposition::Terminate => SyscallAction::Exit(128 + signal),
+        SignalDisposition::Ignore | SignalDisposition::Stop | SignalDisposition::Handled => {
+            continue_with(0)
+        }
+    }
+}
+
+/// Resolves the effective disposition of `signal`, honoring any installed
+/// handler before falling back to the kernel default action.
+fn signal_disposition(state: &LoadedStaticElf, signal: libc::c_int) -> SignalDisposition {
+    if let Some(action) = state.signal_actions.get(&signal) {
+        let handler = u64::from_le_bytes(action[0..8].try_into().expect("8-byte handler word"));
+        const SIG_DFL: u64 = 0;
+        const SIG_IGN: u64 = 1;
+        match handler {
+            SIG_DFL => {}
+            SIG_IGN => return SignalDisposition::Ignore,
+            _ => return SignalDisposition::Handled,
+        }
+    }
+    default_signal_disposition(signal)
+}
+
+/// The kernel default action for `signal` when no handler is installed.
+fn default_signal_disposition(signal: libc::c_int) -> SignalDisposition {
+    match signal {
+        libc::SIGCHLD | libc::SIGURG | libc::SIGWINCH | libc::SIGCONT => SignalDisposition::Ignore,
+        libc::SIGSTOP | libc::SIGTSTP | libc::SIGTTIN | libc::SIGTTOU => SignalDisposition::Stop,
+        _ => SignalDisposition::Terminate,
+    }
+}
+
+/// Reports whether `signal` is currently blocked by the guest's signal mask.
+fn signal_is_blocked(state: &LoadedStaticElf, signal: libc::c_int) -> bool {
+    let bit = (signal - 1) as usize;
+    state
+        .signal_mask
+        .get(bit / 8)
+        .is_some_and(|mask| mask & (1 << (bit % 8)) != 0)
 }
 
 fn sigaltstack(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
@@ -5928,5 +6045,187 @@ mod tests {
         let mut second = [0; 32];
         memory.read(0x200, &mut second).unwrap();
         assert_eq!(first, second);
+    }
+
+    fn custom_action(handler: u64) -> [u8; KERNEL_SIGACTION_SIZE] {
+        let mut action = [0; KERNEL_SIGACTION_SIZE];
+        action[0..8].copy_from_slice(&handler.to_le_bytes());
+        action
+    }
+
+    #[test]
+    fn self_directed_fatal_signal_terminates_with_conventional_status() {
+        let dir = TestDir::new();
+        let state = test_state(&dir.0);
+
+        // abort() raises SIGABRT via tgkill(pid, tid, SIGABRT).
+        let action = kill_signal(
+            &state,
+            libc::SYS_tgkill as u64,
+            &[
+                state.pid as u64,
+                state.pid as u64,
+                libc::SIGABRT as u64,
+                0,
+                0,
+                0,
+            ],
+        );
+        match action {
+            SyscallAction::Exit(code) => assert_eq!(code, 128 + libc::SIGABRT),
+            _ => panic!("expected Exit for self-directed SIGABRT"),
+        }
+    }
+
+    #[test]
+    fn kill_and_tkill_self_fatal_signals_terminate() {
+        let dir = TestDir::new();
+        let state = test_state(&dir.0);
+
+        for (number, args) in [
+            (
+                libc::SYS_kill,
+                [state.pid as u64, libc::SIGSEGV as u64, 0, 0, 0, 0],
+            ),
+            (
+                libc::SYS_tkill,
+                [state.pid as u64, libc::SIGKILL as u64, 0, 0, 0, 0],
+            ),
+            // kill(-1, SIGTERM) broadcasts to a set that includes ourselves.
+            (
+                libc::SYS_kill,
+                [(-1i64) as u64, libc::SIGTERM as u64, 0, 0, 0, 0],
+            ),
+        ] {
+            match kill_signal(&state, number as u64, &args) {
+                SyscallAction::Exit(_) => {}
+                _ => panic!("expected Exit for syscall {number}"),
+            }
+        }
+    }
+
+    #[test]
+    fn ignored_and_probe_signals_do_not_terminate() {
+        let dir = TestDir::new();
+        let state = test_state(&dir.0);
+
+        // Signal 0 is a liveness probe.
+        assert!(matches!(
+            kill_signal(
+                &state,
+                libc::SYS_kill as u64,
+                &[state.pid as u64, 0, 0, 0, 0, 0],
+            ),
+            SyscallAction::Continue { result: 0, .. }
+        ));
+        // SIGWINCH is ignored by default.
+        assert!(matches!(
+            kill_signal(
+                &state,
+                libc::SYS_kill as u64,
+                &[state.pid as u64, libc::SIGWINCH as u64, 0, 0, 0, 0],
+            ),
+            SyscallAction::Continue { result: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn installed_handler_and_blocked_signal_are_not_terminating() {
+        let dir = TestDir::new();
+        let mut state = test_state(&dir.0);
+
+        // A user handler that we cannot deliver must not terminate the process.
+        state
+            .signal_actions
+            .insert(libc::SIGTERM, custom_action(0x4000));
+        assert!(matches!(
+            kill_signal(
+                &state,
+                libc::SYS_kill as u64,
+                &[state.pid as u64, libc::SIGTERM as u64, 0, 0, 0, 0],
+            ),
+            SyscallAction::Continue { result: 0, .. }
+        ));
+
+        // A blocked fatal signal stays pending rather than terminating.
+        let mut blocked = test_state(&dir.0);
+        let bit = (libc::SIGINT - 1) as usize;
+        blocked.signal_mask[bit / 8] |= 1 << (bit % 8);
+        assert!(matches!(
+            kill_signal(
+                &blocked,
+                libc::SYS_kill as u64,
+                &[blocked.pid as u64, libc::SIGINT as u64, 0, 0, 0, 0],
+            ),
+            SyscallAction::Continue { result: 0, .. }
+        ));
+
+        // SIGKILL ignores both the mask and any installed handler.
+        let mut unkillable = test_state(&dir.0);
+        unkillable
+            .signal_actions
+            .insert(libc::SIGKILL, custom_action(0x1));
+        let bit = (libc::SIGKILL - 1) as usize;
+        unkillable.signal_mask[bit / 8] |= 1 << (bit % 8);
+        assert!(matches!(
+            kill_signal(
+                &unkillable,
+                libc::SYS_kill as u64,
+                &[unkillable.pid as u64, libc::SIGKILL as u64, 0, 0, 0, 0],
+            ),
+            SyscallAction::Exit(_)
+        ));
+    }
+
+    #[test]
+    fn signals_to_other_processes_report_esrch() {
+        let dir = TestDir::new();
+        let state = test_state(&dir.0);
+
+        match kill_signal(
+            &state,
+            libc::SYS_kill as u64,
+            &[(state.pid + 1) as u64, libc::SIGTERM as u64, 0, 0, 0, 0],
+        ) {
+            SyscallAction::Continue {
+                result,
+                segment: None,
+            } => assert_eq!(result, negative_errno(libc::ESRCH)),
+            _ => panic!("expected ESRCH continue for a foreign target"),
+        }
+    }
+
+    #[test]
+    fn signal_disposition_honors_handlers_over_defaults() {
+        let dir = TestDir::new();
+        let mut state = test_state(&dir.0);
+
+        assert_eq!(
+            signal_disposition(&state, libc::SIGABRT),
+            SignalDisposition::Terminate
+        );
+        assert_eq!(
+            signal_disposition(&state, libc::SIGCHLD),
+            SignalDisposition::Ignore
+        );
+        assert_eq!(
+            signal_disposition(&state, libc::SIGTSTP),
+            SignalDisposition::Stop
+        );
+
+        state
+            .signal_actions
+            .insert(libc::SIGABRT, custom_action(0x1)); // SIG_IGN
+        assert_eq!(
+            signal_disposition(&state, libc::SIGABRT),
+            SignalDisposition::Ignore
+        );
+        state
+            .signal_actions
+            .insert(libc::SIGABRT, custom_action(0xdead_beef));
+        assert_eq!(
+            signal_disposition(&state, libc::SIGABRT),
+            SignalDisposition::Handled
+        );
     }
 }
