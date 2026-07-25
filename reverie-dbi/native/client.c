@@ -7,6 +7,7 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -19,6 +20,7 @@
 #include <sys/time.h>
 #include <sys/user.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "dr_api.h"
 #include "drmgr.h"
@@ -51,6 +53,9 @@ typedef struct {
 #define CPUID_RESULT(a, b, c, d) {(a), (b), (c), (d)}
 #define ARRAY_SIZE(array) (sizeof(array) / sizeof((array)[0]))
 #define BIT32(bit) (UINT32_C(1) << (bit))
+#define X32_SYSCALL_BIT UINT32_C(0x40000000)
+#define X86_32_SYS_SETPGID 57
+#define X86_32_SYS_SETSID 66
 
 /* Keep this synthetic CPU identity aligned with Hermit's ptrace backend. */
 static const cpuid_result_t basic_cpuid[] = {
@@ -101,11 +106,15 @@ typedef void (*reverie_idle_fn_t)(void);
 typedef struct {
   reverie_emit_fn_t emit;
   reverie_idle_fn_t idle;
+  int32_t panic_on_unsupported_syscalls;
+  int32_t unsupported_report_fd;
 } runtime_callbacks_t;
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#90): Confirm diagnostic fd ownership across exec.
 // Inherited from the launcher so guest stderr redirections cannot capture it.
 static file_t diagnostic_file;
+static char unsupported_report_path[4096];
+static file_t unsupported_report_file = INVALID_FILE;
 static void reverie_dbi_emit(const char *buf, size_t len) {
   dr_write_file(diagnostic_file, buf, len);
 }
@@ -118,6 +127,7 @@ extern void reverie_dbi_runtime_exec_failed(prototype_counters_t *counters,
 extern void reverie_dbi_runtime_background_init(void *argument);
 extern int32_t reverie_dbi_runtime_ready(uint64_t image_generation);
 extern void reverie_dbi_runtime_process_exit(void);
+extern int32_t reverie_dbi_runtime_copied_syscall(int64_t sysnum);
 extern int32_t reverie_dbi_runtime_pre_syscall(
     void *context, prototype_counters_t *counters, int32_t tid, int32_t pid,
     uint64_t image_generation, int64_t sysnum, const uint64_t *args,
@@ -134,9 +144,22 @@ static _Atomic uint64_t stdin_read_count;
 static _Atomic uint64_t virtual_time_ns = UINT64_C(1000000000);
 static _Atomic uint64_t image_generation;
 static int thread_state_index;
+static int compat_gateway_index;
 static ptr_uint_t cpuid_marker_note;
 static bool report_summary;
 static process_id_t runtime_owner_pid;
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-84): Review isolation-aware process-group termination.
+static process_id_t runtime_process_group;
+static void exit_runtime_tree(int exit_code) {
+  // A copied child cannot kill its own process group and then run DynamoRIO
+  // cleanup. Kill the launch-group leader instead; the out-of-group launcher reaps it and
+  // terminates the remaining isolated group after preserving its exit status.
+  if (runtime_process_group != 0 &&
+      runtime_process_group != dr_get_process_id())
+    kill((pid_t)runtime_process_group, SIGKILL);
+  dr_exit_process(exit_code);
+}
 
 typedef struct {
   uint64_t rlim_cur;
@@ -214,9 +237,35 @@ static dr_emit_flags_t rewrite_cpuid(void *drcontext, void *tag,
   return DR_EMIT_DEFAULT;
 }
 
+static bool is_compat_syscall_instruction(instr_t *instruction) {
+  return instr_is_syscall(instruction) && instr_is_interrupt(instruction) &&
+         instr_get_interrupt_number(instruction) == 0x80;
+}
+
+static void mark_compat_syscall_gateway(void) {
+  void *drcontext = dr_get_current_drcontext();
+  DR_ASSERT(drmgr_set_tls_field(drcontext, compat_gateway_index, (void *)1));
+}
+
 static bool is_counted_branch(instr_t *instruction) {
   return instr_is_cbr(instruction) || instr_is_ubr(instruction) ||
          instr_is_call(instruction) || instr_is_return(instruction);
+}
+
+static dr_emit_flags_t analyze_syscall_gateway(
+    void *drcontext, void *tag, instrlist_t *bb, bool for_trace,
+    bool translating, void **user_data) {
+  instr_t *instruction;
+  *user_data = NULL;
+  for (instruction = instrlist_first(bb); instruction != NULL;
+       instruction = instr_get_next(instruction)) {
+    if (instr_opcode_valid(instruction) &&
+        is_compat_syscall_instruction(instruction)) {
+      *user_data = (void *)1;
+      break;
+    }
+  }
+  return DR_EMIT_DEFAULT;
 }
 
 static dr_emit_flags_t instrument_instruction(void *drcontext, void *tag,
@@ -224,6 +273,10 @@ static dr_emit_flags_t instrument_instruction(void *drcontext, void *tag,
                                               instr_t *instruction,
                                               bool for_trace, bool translating,
                                               void *user_data) {
+  if (user_data != NULL && instruction == instrlist_first(bb)) {
+    dr_insert_clean_call(drcontext, bb, instruction,
+                         (void *)mark_compat_syscall_gateway, false, 0);
+  }
   if (instr_is_app(instruction) &&
       (ptr_uint_t)instr_get_note(instruction) == cpuid_marker_note) {
     dr_insert_clean_call_ex(
@@ -842,8 +895,53 @@ static bool has_copied_runtime(void) {
   return runtime_owner_pid != 0 && dr_get_process_id() != runtime_owner_pid;
 }
 
+static void report_copied_unsupported_syscall(int sysnum) {
+  if (unsupported_report_file != INVALID_FILE)
+    dr_fprintf(unsupported_report_file, "@%d\n", sysnum);
+}
+
 static bool pre_syscall(void *drcontext, int sysnum) {
+  if (((uint32_t)sysnum & X32_SYSCALL_BIT) != 0) {
+    dr_fprintf(diagnostic_file,
+               "reverie-dbi: x32-marked syscalls are unsupported\n");
+    exit_runtime_tree(102);
+    return false;
+  }
+  bool decoded_compat_gateway =
+      drmgr_get_tls_field(drcontext, compat_gateway_index) != NULL;
+  DR_ASSERT(drmgr_set_tls_field(drcontext, compat_gateway_index, NULL));
+  if (decoded_compat_gateway) {
+    dr_fprintf(diagnostic_file,
+               "reverie-dbi: compat int 0x80 syscalls are unsupported\n");
+    exit_runtime_tree(102);
+    return false;
+  }
+  // AUTONOMOUS-BOT-IMPLEMENTED
+  // TODO-HUMAN-REVIEW(PR-84): Review process-group mutation refusal in isolated runtimes.
+  // Group containment does not rely on mutable gateway bytes: copied
+  // runtimes reject the ambiguous i386 raw numbers even if gateway proof races.
+  if (runtime_process_group != 0 &&
+      (sysnum == SYS_setsid || sysnum == SYS_setpgid ||
+       (has_copied_runtime() &&
+        (sysnum == X86_32_SYS_SETPGID || sysnum == X86_32_SYS_SETSID)))) {
+    dr_syscall_set_result(drcontext, (reg_t)-EPERM);
+    return false;
+  }
+
   if (has_copied_runtime()) {
+    int32_t copied_action =
+        reverie_dbi_runtime_copied_syscall((int64_t)sysnum);
+    if (copied_action == 1) {
+      dr_fprintf(diagnostic_file,
+                 "detcore-dbi: unsupported syscall %d in copied child\n", sysnum);
+      exit_runtime_tree(101);
+      return false;
+    }
+    if (copied_action == 2) {
+      report_copied_unsupported_syscall(sysnum);
+      return true;
+    }
+    DR_ASSERT(copied_action == 0);
 #ifdef SYS_execveat
     // TODO-HUMAN-REVIEW(PR-587): Fail closed before copied children bypass the
     // Detcore runtime callback.
@@ -869,13 +967,18 @@ static bool pre_syscall(void *drcontext, int sysnum) {
   if (syscall_reads_stdin(drcontext, sysnum, args))
     atomic_fetch_add_explicit(&stdin_read_count, 1, memory_order_relaxed);
 
-  if (reverie_dbi_runtime_pre_syscall(
-          drcontext, counters, (int32_t)dr_get_thread_id(drcontext),
-          (int32_t)dr_get_process_id(),
-          atomic_load_explicit(&image_generation, memory_order_acquire),
-          (int64_t)sysnum, args,
-          atomic_load_explicit(&branch_count, memory_order_relaxed), &result,
-          invoke_syscall, read_registers, read_memory, reverie_dbi_emit)) {
+  int32_t action = reverie_dbi_runtime_pre_syscall(
+      drcontext, counters, (int32_t)dr_get_thread_id(drcontext),
+      (int32_t)dr_get_process_id(),
+      atomic_load_explicit(&image_generation, memory_order_acquire),
+      (int64_t)sysnum, args,
+      atomic_load_explicit(&branch_count, memory_order_relaxed), &result,
+      invoke_syscall, read_registers, read_memory, reverie_dbi_emit);
+  if (action < 0) {
+    exit_runtime_tree(101);
+    return false;
+  }
+  if (action > 0) {
     retry_pipe_eagain(drcontext, sysnum, args, &result);
     dr_syscall_set_result(drcontext, (reg_t)result);
     return false;
@@ -930,9 +1033,14 @@ static void event_exit(void) {
                reverie_dbi_runtime_name(), branches, syscalls, rewritten,
                stdin_reads, memory_hash);
   }
+  if (unsupported_report_file != INVALID_FILE) {
+    dr_close_file(unsupported_report_file);
+    unsupported_report_file = INVALID_FILE;
+  }
   dr_mutex_destroy(resource_lock);
   drwrap_exit();
   drx_exit();
+  drmgr_unregister_tls_field(compat_gateway_index);
   drmgr_unregister_tls_field(thread_state_index);
   drreg_exit();
   drmgr_exit();
@@ -940,7 +1048,8 @@ static void event_exit(void) {
 
 static void runtime_idle(void) { dr_sleep(1); }
 
-static runtime_callbacks_t runtime_callbacks = {reverie_dbi_emit, runtime_idle};
+static runtime_callbacks_t runtime_callbacks = {reverie_dbi_emit, runtime_idle,
+                                                0};
 
 static void runtime_background_init(void *argument) {
   (void)argument;
@@ -968,7 +1077,26 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[]) {
       DR_ASSERT(fd >= 0);
       diagnostic_file = (file_t)fd;
     }
+    else if (strcmp(argv[i], "-unsupported-report-path") == 0) {
+      DR_ASSERT(++i < argc);
+      DR_ASSERT(strlen(argv[i]) < sizeof(unsupported_report_path));
+      dr_snprintf(unsupported_report_path, sizeof(unsupported_report_path),
+                  "%s", argv[i]);
+    }
+    else if (strcmp(argv[i], "-panic-on-unsupported-syscalls") == 0)
+      runtime_callbacks.panic_on_unsupported_syscalls = 1;
+    else if (strcmp(argv[i], "-isolated-process-group") == 0)
+      runtime_process_group = (process_id_t)getpgrp();
   }
+
+  if (unsupported_report_path[0] != 0) {
+    unsupported_report_file =
+        dr_open_file(unsupported_report_path, DR_FILE_WRITE_ONLY);
+    if (unsupported_report_file == INVALID_FILE)
+      dr_fprintf(diagnostic_file,
+                 "reverie-dbi: failed to open private unsupported-syscall report\n");
+  }
+  runtime_callbacks.unsupported_report_fd = (int32_t)unsupported_report_file;
 
   dr_set_client_name("Reverie DynamoRIO backend prototype",
                      "https://github.com/rrnewton/reverie");
@@ -979,7 +1107,8 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[]) {
   if (cpuid_marker_note == DRMGR_NOTE_NONE)
     DR_ASSERT(false);
   thread_state_index = drmgr_register_tls_field();
-  if (thread_state_index == -1)
+  compat_gateway_index = drmgr_register_tls_field();
+  if (thread_state_index == -1 || compat_gateway_index == -1)
     DR_ASSERT(false);
 
   if (!dr_create_client_thread(runtime_background_init,
@@ -990,8 +1119,8 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[]) {
       !drmgr_register_thread_init_event(thread_init) ||
       !drmgr_register_thread_exit_event(thread_exit) ||
       !drmgr_register_bb_app2app_event(rewrite_cpuid, NULL) ||
-      !drmgr_register_bb_instrumentation_event(NULL, instrument_instruction,
-                                               NULL) ||
+      !drmgr_register_bb_instrumentation_event(analyze_syscall_gateway,
+                                               instrument_instruction, NULL) ||
       !drmgr_register_filter_syscall_event(filter_syscall) ||
       !drmgr_register_pre_syscall_event(pre_syscall) ||
       !drmgr_register_post_syscall_event(post_syscall))

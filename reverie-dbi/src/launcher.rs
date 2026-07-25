@@ -13,15 +13,20 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io;
 use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Child;
 use std::process::Command;
 use std::process::ExitStatus;
 use std::process::Output;
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 const CLIENT_ENV: &str = "REVERIE_DBI_CLIENT";
 const DYNAMORIO_ENV: &str = "DYNAMORIO_HOME";
@@ -49,6 +54,7 @@ const DIAGNOSTIC_FD: libc::c_int = 198;
 pub struct DbiRunner {
     drrun: PathBuf,
     client: PathBuf,
+    client_arguments: Vec<OsString>,
     summary: bool,
     isolated_process_group: bool,
 }
@@ -82,6 +88,7 @@ impl DbiRunner {
         Ok(Self {
             drrun,
             client,
+            client_arguments: Vec::new(),
             summary: false,
             isolated_process_group: false,
         })
@@ -90,6 +97,14 @@ impl DbiRunner {
     /// Enables or disables the instrumentation summary written at process exit.
     pub fn summary(mut self, enabled: bool) -> Self {
         self.summary = enabled;
+        self
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-84): Review persistent DynamoRIO client argument propagation.
+    /// Adds an argument passed to the native client in every instrumented process image.
+    pub fn client_argument(mut self, argument: impl Into<OsString>) -> Self {
+        self.client_arguments.push(argument.into());
         self
     }
 
@@ -104,7 +119,8 @@ impl DbiRunner {
 
     /// Runs `guest` with inherited standard streams and waits for it to exit.
     pub fn status(&self, guest: &Command) -> io::Result<ExitStatus> {
-        self.command(guest, None).status()
+        let child = self.command(guest, None).spawn()?;
+        self.wait_for_status(child)
     }
 
     /// Runs `guest` with an exact environment instead of inheriting the launcher environment.
@@ -113,17 +129,30 @@ impl DbiRunner {
         guest: &Command,
         environment: &BTreeMap<OsString, OsString>,
     ) -> io::Result<ExitStatus> {
-        self.command(guest, Some(environment)).status()
+        let child = self.command(guest, Some(environment)).spawn()?;
+        self.wait_for_status(child)
     }
 
     /// Runs `guest` and captures its standard output and standard error.
     pub fn output(&self, guest: &Command) -> io::Result<Output> {
-        self.command(guest, None).output()
+        let child = self
+            .command(guest, None)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        self.wait_with_output(child)
     }
 
     /// Captures guest output while preserving an inherited terminal stdin.
     pub fn output_with_inherited_stdin(&self, guest: &Command) -> io::Result<Output> {
-        self.command(guest, None).stdin(Stdio::inherit()).output()
+        let child = self
+            .command(guest, None)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        self.wait_with_output(child)
     }
 
     /// Runs `guest` with captured output and supplies `input` on standard input.
@@ -148,7 +177,7 @@ impl DbiRunner {
 
         std::thread::scope(|scope| {
             let writer = scope.spawn(move || io::copy(&mut input, &mut stdin));
-            let output = child.wait_with_output();
+            let output = self.wait_with_output(child);
             let write_result = writer
                 .join()
                 .map_err(|_| io::Error::other("DBI guest stdin writer thread panicked"))?;
@@ -161,13 +190,137 @@ impl DbiRunner {
         })
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-84): Review the owned, detachable input-pump API.
+    /// Streams owned standard input without waiting for a source-blocked pump after child exit.
+    ///
+    /// A pump still blocked on its source is detached until that source unblocks or the caller exits.
+    pub fn output_with_detached_reader<R>(
+        &self,
+        guest: &Command,
+        mut input: R,
+    ) -> io::Result<Output>
+    where
+        R: Read + Send + 'static,
+    {
+        let mut child = self
+            .command(guest, None)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut stdin = child.stdin.take().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "failed to open DBI guest stdin")
+        })?;
+
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-84): Review detaching a source-blocked input pump at child exit.
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = sender.send(io::copy(&mut input, &mut stdin));
+        });
+        let output = self.wait_with_output(child)?;
+        match receiver.try_recv() {
+            Ok(Err(error)) if error.kind() != io::ErrorKind::BrokenPipe => Err(error),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(io::Error::other("DBI guest stdin writer thread panicked"))
+            }
+            Ok(_) | Err(std::sync::mpsc::TryRecvError::Empty) => Ok(output),
+        }
+    }
+
     /// Captures `guest` output while supplying an exact guest environment.
     pub fn output_with_environment(
         &self,
         guest: &Command,
         environment: &BTreeMap<OsString, OsString>,
     ) -> io::Result<Output> {
-        self.command(guest, Some(environment)).output()
+        let child = self
+            .command(guest, Some(environment))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        self.wait_with_output(child)
+    }
+
+    fn wait_for_status(&self, mut child: Child) -> io::Result<ExitStatus> {
+        if !self.isolated_process_group {
+            return child.wait();
+        }
+
+        let process_group = child.id() as i32;
+        let observed = wait_for_exit_without_reaping(child.id());
+        let terminated = match observed {
+            Ok(()) => terminate_process_group(process_group),
+            Err(_) => Ok(()),
+        };
+        let status = child.wait();
+
+        observed?;
+        terminated?;
+        status
+    }
+
+    fn wait_with_output(&self, mut child: Child) -> io::Result<Output> {
+        let mut stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                self.terminate_and_reap(&mut child);
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "failed to capture DBI guest stdout",
+                ));
+            }
+        };
+        let mut stderr = match child.stderr.take() {
+            Some(stderr) => stderr,
+            None => {
+                self.terminate_and_reap(&mut child);
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "failed to capture DBI guest stderr",
+                ));
+            }
+        };
+
+        if let Err(error) = set_nonblocking(&stdout).and_then(|_| set_nonblocking(&stderr)) {
+            self.terminate_and_reap(&mut child);
+            return Err(error);
+        }
+
+        std::thread::scope(|scope| {
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let stdout_cancelled = Arc::clone(&cancelled);
+            let stderr_cancelled = Arc::clone(&cancelled);
+            let stdout_reader =
+                scope.spawn(move || read_cancellable(&mut stdout, &stdout_cancelled));
+            let stderr_reader =
+                scope.spawn(move || read_cancellable(&mut stderr, &stderr_cancelled));
+            let status = self.wait_for_status(child);
+            if status.is_err() {
+                cancelled.store(true, Ordering::Release);
+            }
+            let stdout = stdout_reader
+                .join()
+                .map_err(|_| io::Error::other("DBI stdout reader thread panicked"));
+            let stderr = stderr_reader
+                .join()
+                .map_err(|_| io::Error::other("DBI stderr reader thread panicked"));
+
+            Ok(Output {
+                status: status?,
+                stdout: stdout??,
+                stderr: stderr??,
+            })
+        })
+    }
+
+    fn terminate_and_reap(&self, child: &mut Child) {
+        if self.isolated_process_group {
+            let _ = terminate_process_group(child.id() as i32);
+        }
+        let _ = child.wait();
     }
 
     fn command(
@@ -184,6 +337,10 @@ impl DbiRunner {
             .arg(&self.client)
             .arg("-diagnostic_fd")
             .arg(DIAGNOSTIC_FD.to_string());
+        command.args(&self.client_arguments);
+        if self.isolated_process_group {
+            command.arg("-isolated-process-group");
+        }
         if self.summary {
             command.arg("-summary");
         }
@@ -294,6 +451,86 @@ fn is_executable_file(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
+fn set_nonblocking(stream: &impl AsRawFd) -> io::Result<()> {
+    let fd = stream.as_raw_fd();
+    // SAFETY: fd is owned by the live ChildStdout/ChildStderr value.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: F_SETFL updates status flags on the same live descriptor.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn read_cancellable(reader: &mut impl Read, cancelled: &AtomicBool) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "DBI output capture cancelled after process-group cleanup failed",
+            ));
+        }
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok(bytes),
+            Ok(read) => bytes.extend_from_slice(&buffer[..read]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if cancelled.load(Ordering::Acquire) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "DBI output capture cancelled after process-group cleanup failed",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+// Wait for the group leader to exit without releasing its PID/PGID identity.
+// This prevents a cleanup signal from reaching a newly reused process group.
+fn wait_for_exit_without_reaping(pid: u32) -> io::Result<()> {
+    loop {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: info points to writable siginfo_t storage, and P_PID selects
+        // the child identified by pid. WNOWAIT deliberately leaves it waitable.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn terminate_process_group(process_group: i32) -> io::Result<()> {
+    // SAFETY: the launcher created a distinct process group whose id is the
+    // still-unreaped child pid. The negative id targets only that group.
+    let result = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+    if result == -1 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 fn shebang(program: &OsStr) -> Option<(PathBuf, Vec<OsString>)> {
     let mut bytes = Vec::new();
     File::open(Path::new(program))
@@ -394,6 +631,7 @@ mod tests {
         DbiRunner {
             drrun: PathBuf::from("/opt/dynamorio/bin64/drrun"),
             client: PathBuf::from("/opt/reverie/libreverie_dbi_client.so"),
+            client_arguments: Vec::new(),
             summary: false,
             isolated_process_group: false,
         }
@@ -408,6 +646,15 @@ mod tests {
         std::fs::set_permissions(path, permissions).unwrap();
     }
 
+    struct BlockingReader(std::sync::mpsc::Receiver<()>);
+
+    impl Read for BlockingReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            let _ = self.0.recv();
+            Ok(0)
+        }
+    }
+
     #[test]
     fn process_group_isolation_is_opt_in() {
         let runner = runner();
@@ -415,6 +662,31 @@ mod tests {
         assert!(runner.isolated_process_group(true).isolated_process_group);
     }
 
+    #[test]
+    fn client_arguments_and_isolation_flag_precede_guest_separator() {
+        let wrapped = runner()
+            .client_argument("-panic-on-unsupported-syscalls")
+            .isolated_process_group(true)
+            .command(&Command::new("/bin/true"), None);
+        assert_eq!(
+            wrapped.get_args().collect::<Vec<_>>(),
+            [
+                "-quiet",
+                "-disable_rseq",
+                "-stack_size",
+                "2M",
+                "-c",
+                "/opt/reverie/libreverie_dbi_client.so",
+                "-diagnostic_fd",
+                "198",
+                "-panic-on-unsupported-syscalls",
+                "-isolated-process-group",
+                "--",
+                "/bin/true",
+            ]
+            .map(OsStr::new)
+        );
+    }
     #[test]
     fn wraps_guest_program_arguments_directory_and_environment() {
         let mut guest = Command::new("/bin/echo");
@@ -653,6 +925,26 @@ mod tests {
     }
 
     #[test]
+    fn cancellable_output_reader_stops_with_a_live_writer() {
+        use std::io::Write as _;
+        use std::os::unix::net::UnixStream;
+
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        set_nonblocking(&reader).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(move || while writer.write_all(&[b'x'; 4096]).is_ok() {});
+            let reader_cancelled = Arc::clone(&cancelled);
+            let handle = scope.spawn(move || read_cancellable(&mut reader, &reader_cancelled));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            cancelled.store(true, Ordering::Release);
+            let error = handle.join().unwrap().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+            writer.join().unwrap();
+        });
+    }
+
+    #[test]
     fn keeps_diagnostics_out_of_guest_stderr_redirections() {
         let root = tempfile::tempdir().unwrap();
         let drrun = root.path().join("drrun");
@@ -676,6 +968,51 @@ mod tests {
         assert!(output.status.success());
         assert_eq!(output.stdout, b"captured=<guest-stderr>\n");
         assert_eq!(output.stderr, b"backend-diagnostic");
+    }
+
+    #[test]
+    fn isolated_output_terminates_descendants_after_root_exit() {
+        let root = tempfile::tempdir().unwrap();
+        let drrun = root.path().join("drrun");
+        let client = root.path().join("client.so");
+        write_executable_script(
+            &drrun,
+            b"#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n",
+        );
+        std::fs::write(&client, b"placeholder").unwrap();
+        let runner = DbiRunner::new(drrun, client)
+            .unwrap()
+            .isolated_process_group(true);
+        let mut guest = Command::new("/bin/sh");
+        guest.args(["-c", "sleep 60 & printf descendant-started; exit 7"]);
+        let started = std::time::Instant::now();
+
+        let output = runner.output(&guest).unwrap();
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(output.stdout, b"descendant-started");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn returns_when_child_exits_while_input_source_is_blocked() {
+        let root = tempfile::tempdir().unwrap();
+        let drrun = root.path().join("drrun");
+        let client = root.path().join("client.so");
+        write_executable_script(
+            &drrun,
+            b"#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n",
+        );
+        std::fs::write(&client, b"placeholder").unwrap();
+        let runner = DbiRunner::new(drrun, client).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let started = std::time::Instant::now();
+
+        let output = runner
+            .output_with_detached_reader(&Command::new("/bin/true"), BlockingReader(receiver))
+            .unwrap();
+        assert!(output.status.success());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        drop(sender);
     }
 
     #[test]

@@ -89,6 +89,14 @@ pub struct DbiRuntimeCallbacks {
     pub emit: RuntimeEmitter,
     /// Yields while an async runtime future remains pending.
     pub idle: RuntimeIdler,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-84): Review the persistent fail-closed client policy ABI.
+    /// Nonzero when the persistent client policy requires unsupported syscalls to fail closed.
+    pub panic_on_unsupported_syscalls: i32,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-84): Review the private report descriptor ABI.
+    /// DynamoRIO-owned descriptor for aggregate unsupported-syscall records.
+    pub unsupported_report_fd: i32,
 }
 
 /// Result of dispatching a syscall through an external DBI Tool.
@@ -1083,10 +1091,18 @@ pub unsafe extern "C" fn reverie_dbi_runtime_exec_failed(
 ) {
 }
 
+/// Applies copied-child syscall policy for the built-in prototype runtime.
+#[cfg(feature = "prototype-runtime")]
+#[unsafe(no_mangle)]
+pub extern "C" fn reverie_dbi_runtime_copied_syscall(_sysnum: i64) -> i32 {
+    0
+}
+
 /// Handles a DynamoRIO pre-syscall event.
 ///
 /// Returning one asks the native client to suppress the original syscall and
-/// install `result`; returning zero leaves the syscall unchanged.
+/// install `result`; returning zero leaves the syscall unchanged. A negative
+/// return terminates the isolated runtime with an enforcement failure.
 ///
 /// # Safety
 ///
