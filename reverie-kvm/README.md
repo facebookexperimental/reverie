@@ -5,6 +5,11 @@ creates a VM and vCPU, provides bounded guest-physical memory access, turns a
 guest `vmcall`/`vmmcall` into a typed Reverie syscall event, and can run
 minimal static ELF executables in a bare long-mode process personality.
 
+The host must provide x86-64 KVM, procfs, `openat2` (Linux 5.6 or newer),
+and `utimensat(AT_EMPTY_PATH)` (Linux 5.8 or newer) for full filesystem
+metadata compatibility. Hosts before `fchmodat2` use a held-descriptor procfs
+fallback rather than re-resolving guest paths.
+
 The guest places the syscall number and six arguments in a fixed-size frame in
 guest memory. The hypercall passes the frame address to the host. `run` exposes
 the original raw callback, while `run_with_tool` converts the frame to

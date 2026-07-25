@@ -6,6 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::ffi::CStr;
 use std::ffi::CString;
 use std::io::Read;
 use std::io::Write;
@@ -33,7 +34,7 @@ const PAGE_SIZE: u64 = 4096;
 const MAX_GUEST_FD: libc::c_int = 1 << 20;
 const KERNEL_SIGACTION_SIZE: usize = 32;
 const KERNEL_SIGSET_SIZE: usize = 8;
-const MEMBARRIER_SUPPORTED: libc::c_int = 0x1f;
+const MEMBARRIER_SUPPORTED: libc::c_int = 0x1;
 const ARCH_SET_GS: u64 = 0x1001;
 const ARCH_SET_FS: u64 = 0x1002;
 const ARCH_GET_FS: u64 = 0x1003;
@@ -280,14 +281,8 @@ fn execute_basic_syscall_with_output(
     } else if number == libc::SYS_chmod as u64 {
         fchmodat(memory, state, libc::AT_FDCWD, args[0], args[1], 0)
     } else if number == libc::SYS_fchmodat as u64 {
-        fchmodat(
-            memory,
-            state,
-            args[0] as libc::c_int,
-            args[1],
-            args[2],
-            args[3],
-        )
+        // SYS_fchmodat has three arguments; r10 is unspecified guest state.
+        fchmodat(memory, state, args[0] as libc::c_int, args[1], args[2], 0)
     } else if number == libc::SYS_mknod as u64 {
         mknod_at(memory, state, libc::AT_FDCWD, args[0], args[1], args[2])
     } else if number == libc::SYS_mknodat as u64 {
@@ -320,12 +315,10 @@ fn execute_basic_syscall_with_output(
     } else if number == libc::SYS_sched_getaffinity as u64 {
         sched_getaffinity(memory, state, args)
     } else if number == libc::SYS_membarrier as u64 {
-        if args[0] == 0 {
-            i64::from(MEMBARRIER_SUPPORTED)
-        } else if args[0] & !(MEMBARRIER_SUPPORTED as u64) == 0 {
-            0
-        } else {
-            negative_errno(libc::EINVAL)
+        match (args[0] as libc::c_int, args[1] as libc::c_uint) {
+            (0, 0) => i64::from(MEMBARRIER_SUPPORTED),
+            (1, 0) => 0,
+            _ => negative_errno(libc::EINVAL),
         }
     } else if number == libc::SYS_getrandom as u64 {
         getrandom(memory, args[0], args[1])
@@ -1072,6 +1065,7 @@ fn open_file(
         return negative_errno(libc::EBADF);
     };
     let flags = u64::from(raw_flags as libc::c_int as u32) & LEGACY_OPEN_FLAGS;
+    let guest_cloexec = flags & libc::O_CLOEXEC as u64 != 0;
     let uses_mode = flags & libc::O_CREAT as u64 != 0
         || flags & libc::O_TMPFILE as u64 == libc::O_TMPFILE as u64;
     let mode = if uses_mode {
@@ -1079,31 +1073,67 @@ fn open_file(
     } else {
         0
     };
-    let how = OpenHow {
-        flags,
-        mode,
-        resolve: RESOLVE_NO_MAGICLINKS,
+    let named_create = flags & libc::O_CREAT as u64 != 0
+        && flags & libc::O_TMPFILE as u64 != libc::O_TMPFILE as u64;
+    // Hermit requires a stable external filesystem. This follow-target probe
+    // distinguishes an existing target from a dangling symlink before the
+    // atomic O_EXCL create attempt below.
+    let target_existed = named_create && open_host_metadata_path(host_dirfd, &path, false).is_ok();
+    let open_with_flags = |open_flags| {
+        let how = OpenHow {
+            flags: open_flags,
+            mode,
+            resolve: RESOLVE_NO_MAGICLINKS,
+        };
+        // SAFETY: path and how are live; Linux validates the descriptor and flags.
+        unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                host_dirfd,
+                path.as_ptr(),
+                &how,
+                std::mem::size_of::<OpenHow>(),
+            )
+        }
     };
-    // SAFETY: path and how are live for the call. Linux validates the supplied
-    // descriptor, flags, mode, and openat2 resolve policy.
-    let host_fd = unsafe {
-        libc::syscall(
-            libc::SYS_openat2,
-            host_dirfd,
-            path.as_ptr(),
-            &how,
-            std::mem::size_of::<OpenHow>(),
+    let (host_fd, created) = if named_create {
+        let exclusive_fd = open_with_flags(flags | libc::O_EXCL as u64);
+        if exclusive_fd >= 0 {
+            (exclusive_fd, true)
+        } else {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EEXIST) || flags & libc::O_EXCL as u64 != 0 {
+                return io_error(error);
+            }
+            let host_fd = open_with_flags(flags);
+            if host_fd < 0 {
+                return io_error(std::io::Error::last_os_error());
+            }
+            (host_fd, !target_existed)
+        }
+    } else {
+        let host_fd = open_with_flags(flags);
+        if host_fd < 0 {
+            return io_error(std::io::Error::last_os_error());
+        }
+        (
+            host_fd,
+            flags & libc::O_TMPFILE as u64 == libc::O_TMPFILE as u64,
         )
     };
-    if host_fd < 0 {
-        return io_error(std::io::Error::last_os_error());
-    }
     // SAFETY: openat2 returned a new owned descriptor on success.
     let file = unsafe { std::fs::File::from_raw_fd(host_fd as RawFd) };
     if let Err(error) = ensure_not_procfs(&file) {
         return error;
     }
-    insert_file(state, file)
+    if uses_mode && created {
+        // Override the supervisor umask only for a file created by this call.
+        // SAFETY: file is a live owned descriptor and mode is bounded above.
+        if unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) } != 0 {
+            return io_error(std::io::Error::last_os_error());
+        }
+    }
+    insert_file_with_flags(state, file, guest_cloexec)
 }
 
 fn ensure_not_procfs(file: &std::fs::File) -> Result<(), i64> {
@@ -1158,13 +1188,75 @@ fn open_metadata_path(
     Ok(file)
 }
 
-fn insert_file(state: &mut LoadedStaticElf, file: std::fs::File) -> i64 {
+// AUTONOMOUS-BOT-IMPLEMENTED: Resolve mutation targets without host magic links.
+// TODO-HUMAN-REVIEW(#86): Review procfs isolation and Linux mutation semantics.
+fn open_host_metadata_path(
+    host_dirfd: RawFd,
+    path: &CStr,
+    nofollow: bool,
+) -> Result<std::fs::File, i64> {
+    let mut flags = (libc::O_PATH | libc::O_CLOEXEC) as u64;
+    if nofollow {
+        flags |= libc::O_NOFOLLOW as u64;
+    }
+    let how = OpenHow {
+        flags,
+        mode: 0,
+        resolve: RESOLVE_NO_MAGICLINKS,
+    };
+    // SAFETY: path and how are live for the call and Linux validates host_dirfd.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            host_dirfd,
+            path.as_ptr(),
+            &how,
+            std::mem::size_of::<OpenHow>(),
+        )
+    };
+    if fd < 0 {
+        return Err(io_error(std::io::Error::last_os_error()));
+    }
+    // SAFETY: openat2 returned a new owned descriptor on success.
+    let file = unsafe { std::fs::File::from_raw_fd(fd as RawFd) };
+    ensure_not_procfs(&file)?;
+    Ok(file)
+}
+
+fn ensure_mutation_parent_not_procfs(host_dirfd: RawFd, path: &CStr) -> Result<(), i64> {
+    let bytes = path.to_bytes();
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let parent = match bytes.iter().rposition(|byte| *byte == b'/') {
+        Some(0) => b"/".as_slice(),
+        Some(index) => &bytes[..index],
+        None => b".".as_slice(),
+    };
+    let parent = CString::new(parent).map_err(|_| negative_errno(libc::EINVAL))?;
+    let parent = open_host_metadata_path(host_dirfd, &parent, false)?;
+    if !parent.metadata().map_err(io_error)?.is_dir() {
+        return Err(negative_errno(libc::ENOTDIR));
+    }
+    Ok(())
+}
+
+fn insert_file_with_flags(
+    state: &mut LoadedStaticElf,
+    file: std::fs::File,
+    close_on_exec: bool,
+) -> i64 {
     let Some(fd) =
         (0..=i32::MAX).find(|fd| !is_open_standard(state, *fd) && !state.files.contains_key(fd))
     else {
         return negative_errno(libc::EMFILE);
     };
     state.files.insert(fd, file);
+    if close_on_exec {
+        state.cloexec_fds.insert(fd);
+    } else {
+        state.cloexec_fds.remove(&fd);
+    }
     i64::from(fd)
 }
 
@@ -1175,24 +1267,22 @@ fn duplicate_fd(
     raw_flags: u64,
     is_dup3: bool,
 ) -> i64 {
-    let Ok(old_fd) = libc::c_int::try_from(raw_old_fd) else {
-        return negative_errno(libc::EBADF);
-    };
+    let flags = raw_flags as libc::c_int;
+    if !is_dup3 && flags != 0 {
+        return negative_errno(libc::EINVAL);
+    }
+    if is_dup3 && flags & !libc::O_CLOEXEC != 0 {
+        return negative_errno(libc::EINVAL);
+    }
+    let old_fd = raw_old_fd as libc::c_int;
     let Some(old_host_fd) = host_fd(state, old_fd) else {
         return negative_errno(libc::EBADF);
     };
-    if !is_dup3 && raw_flags != 0 {
-        return negative_errno(libc::EINVAL);
-    }
-    if is_dup3 && raw_flags & !(libc::O_CLOEXEC as u64) != 0 {
-        return negative_errno(libc::EINVAL);
-    }
+    let close_on_exec = is_dup3 && flags & libc::O_CLOEXEC != 0;
 
     let new_fd = match raw_new_fd {
         Some(raw_new_fd) => {
-            let Ok(new_fd) = libc::c_int::try_from(raw_new_fd) else {
-                return negative_errno(libc::EBADF);
-            };
+            let new_fd = raw_new_fd as libc::c_int;
             if !(0..=MAX_GUEST_FD).contains(&new_fd) {
                 return negative_errno(libc::EBADF);
             }
@@ -1218,6 +1308,11 @@ fn duplicate_fd(
     let file = unsafe { std::fs::File::from_raw_fd(duplicated) };
     if let Some(new_fd) = new_fd {
         state.files.insert(new_fd, file);
+        if close_on_exec {
+            state.cloexec_fds.insert(new_fd);
+        } else {
+            state.cloexec_fds.remove(&new_fd);
+        }
         if (0..=2).contains(&new_fd) {
             state.closed_standard_fds.insert(new_fd);
         } else {
@@ -1225,7 +1320,7 @@ fn duplicate_fd(
         }
         i64::from(new_fd)
     } else {
-        insert_file(state, file)
+        insert_file_with_flags(state, file, close_on_exec)
     }
 }
 
@@ -1254,14 +1349,16 @@ fn pipe2(
     let read_end = unsafe { std::fs::File::from_raw_fd(host_fds[0]) };
     // SAFETY: pipe2 returned two new owned descriptors on success.
     let write_end = unsafe { std::fs::File::from_raw_fd(host_fds[1]) };
+    let close_on_exec = flags & libc::O_CLOEXEC != 0;
 
-    let read_fd = insert_file(state, read_end);
+    let read_fd = insert_file_with_flags(state, read_end, close_on_exec);
     if read_fd < 0 {
         return read_fd;
     }
-    let write_fd = insert_file(state, write_end);
+    let write_fd = insert_file_with_flags(state, write_end, close_on_exec);
     if write_fd < 0 {
         state.files.remove(&(read_fd as libc::c_int));
+        state.cloexec_fds.remove(&(read_fd as libc::c_int));
         return write_fd;
     }
 
@@ -1273,6 +1370,8 @@ fn pipe2(
     if memory.write(address, &bytes).is_err() {
         state.files.remove(&read_fd);
         state.files.remove(&write_fd);
+        state.cloexec_fds.remove(&read_fd);
+        state.cloexec_fds.remove(&write_fd);
         return negative_errno(libc::EFAULT);
     }
     0
@@ -1533,7 +1632,9 @@ fn read_path_at(
     if path.is_empty() && !allow_empty {
         return Err(negative_errno(libc::ENOENT));
     }
-    host_dirfd_and_path(state, guest_dirfd, &path)
+    let (host_dirfd, path) = host_dirfd_and_path(state, guest_dirfd, &path)?;
+    ensure_mutation_parent_not_procfs(host_dirfd, &path)?;
+    Ok((host_dirfd, path))
 }
 
 fn mkdir_at(
@@ -1626,7 +1727,8 @@ fn link_at(
     new_path_address: u64,
     raw_flags: u64,
 ) -> i64 {
-    if raw_flags & !(libc::AT_SYMLINK_FOLLOW as u64) != 0 {
+    let flags = raw_flags as libc::c_int;
+    if flags & !libc::AT_SYMLINK_FOLLOW != 0 {
         return negative_errno(libc::EINVAL);
     }
     let (old_host_dirfd, old_path) =
@@ -1639,16 +1741,41 @@ fn link_at(
             Ok(path) => path,
             Err(error) => return error,
         };
-    // SAFETY: both paths are NUL-terminated and flags were validated.
-    zero_or_errno(unsafe {
+    let follows_source = flags & libc::AT_SYMLINK_FOLLOW != 0;
+    let old_file = match open_host_metadata_path(old_host_dirfd, &old_path, !follows_source) {
+        Ok(file) => file,
+        Err(error) => return error,
+    };
+    if follows_source {
+        // Resolve the trusted held descriptor, not the guest pathname, so a
+        // source swap cannot redirect AT_SYMLINK_FOLLOW into supervisor procfs.
+        let proc_path = CString::new(format!("/proc/self/fd/{}", old_file.as_raw_fd()))
+            .expect("supervisor fd path has no NUL");
+        // SAFETY: proc_path names old_file and the destination was translated.
+        return zero_or_errno(unsafe {
+            libc::linkat(
+                libc::AT_FDCWD,
+                proc_path.as_ptr(),
+                new_host_dirfd,
+                new_path.as_ptr(),
+                libc::AT_SYMLINK_FOLLOW,
+            )
+        });
+    }
+    // Without AT_SYMLINK_FOLLOW, a swapped procfs symlink is linked as a
+    // symlink rather than dereferenced into the supervisor descriptor table.
+    // Keep old_file alive to retain the validated source during the operation.
+    let result = unsafe {
         libc::linkat(
             old_host_dirfd,
             old_path.as_ptr(),
             new_host_dirfd,
             new_path.as_ptr(),
-            raw_flags as libc::c_int,
+            0,
         )
-    })
+    };
+    drop(old_file);
+    zero_or_errno(result)
 }
 
 fn symlink_at(
@@ -1701,9 +1828,38 @@ fn fchmodat(
         Ok(path) => path,
         Err(error) => return error,
     };
+    let file = match open_host_metadata_path(host_dirfd, &path, false) {
+        Ok(file) => file,
+        Err(error) => return error,
+    };
     let mode = raw_mode as libc::mode_t & 0o7777;
-    // SAFETY: path is NUL-terminated and host_dirfd was translated.
-    zero_or_errno(unsafe { libc::fchmodat(host_dirfd, path.as_ptr(), mode, 0) })
+    let empty_path = b"\0";
+    // Mutate the checked inode rather than re-resolving the guest pathname.
+    // SAFETY: file owns a live O_PATH descriptor and empty_path is terminated.
+    let mut result = unsafe {
+        libc::syscall(
+            libc::SYS_fchmodat2,
+            file.as_raw_fd(),
+            empty_path.as_ptr(),
+            mode,
+            libc::AT_EMPTY_PATH,
+        )
+    };
+    if result < 0
+        && matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENOSYS | libc::EINVAL)
+        )
+    {
+        // fchmodat2(AT_EMPTY_PATH) was added after openat2. On older kernels,
+        // a supervisor-generated procfs path to our held descriptor preserves
+        // inode identity without re-resolving guest-controlled path components.
+        let proc_path = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
+            .expect("supervisor fd path has no NUL");
+        // SAFETY: proc_path identifies the checked descriptor held by file.
+        result = unsafe { libc::fchmodat(libc::AT_FDCWD, proc_path.as_ptr(), mode, 0) } as _;
+    }
+    zero_or_errno(result as libc::c_int)
 }
 
 fn mknod_at(
@@ -1740,45 +1896,76 @@ fn mknod_at(
 const DETERMINISTIC_UTIME_SECONDS: libc::time_t = 1_640_995_199;
 
 fn utimensat(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
-    let raw_flags = args[3];
-    let allowed_flags = (libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH) as u64;
+    let raw_flags = args[3] as libc::c_int;
+    let allowed_flags = libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH;
     if raw_flags & !allowed_flags != 0 {
         return negative_errno(libc::EINVAL);
     }
-    let (host_dirfd, path) = if args[1] == 0 {
-        let Ok(guest_fd) = libc::c_int::try_from(args[0]) else {
-            return negative_errno(libc::EBADF);
-        };
+    let requested_times = if args[2] == 0 {
+        None
+    } else {
+        match read_guest_struct::<[libc::timespec; 2]>(memory, args[2]) {
+            Ok(times) => Some(times),
+            Err(error) => return error,
+        }
+    };
+    if requested_times
+        .as_ref()
+        .is_some_and(|times| times.iter().all(|time| time.tv_nsec == libc::UTIME_OMIT))
+    {
+        return 0;
+    }
+    if args[1] == 0 && raw_flags != 0 {
+        return negative_errno(libc::EINVAL);
+    }
+
+    let mut opened_path = None;
+    let target_fd = if args[1] == 0 {
+        let guest_fd = args[0] as libc::c_int;
         let Some(host_fd) = host_fd(state, guest_fd) else {
             return negative_errno(libc::EBADF);
         };
-        (host_fd, None)
+        if let Err(error) = ensure_fd_not_procfs(host_fd) {
+            return error;
+        }
+        if fd_status_flags(host_fd).is_ok_and(|flags| flags & libc::O_PATH != 0) {
+            return negative_errno(libc::EBADF);
+        }
+        host_fd
     } else {
-        let allow_empty = raw_flags & libc::AT_EMPTY_PATH as u64 != 0;
-        match read_path_at(memory, state, args[0] as libc::c_int, args[1], allow_empty) {
-            Ok((host_dirfd, path)) => (host_dirfd, Some(path)),
-            Err(error) => return error,
+        let allow_empty = raw_flags & libc::AT_EMPTY_PATH != 0;
+        let (host_dirfd, path) =
+            match read_path_at(memory, state, args[0] as libc::c_int, args[1], allow_empty) {
+                Ok(target) => target,
+                Err(error) => return error,
+            };
+        if path.to_bytes().is_empty() {
+            if let Err(error) = ensure_fd_not_procfs(host_dirfd) {
+                return error;
+            }
+            host_dirfd
+        } else {
+            let nofollow = raw_flags & libc::AT_SYMLINK_NOFOLLOW != 0;
+            let file = match open_host_metadata_path(host_dirfd, &path, nofollow) {
+                Ok(file) => file,
+                Err(error) => return error,
+            };
+            let fd = file.as_raw_fd();
+            opened_path = Some(file);
+            fd
         }
     };
-    let path_pointer = path.as_ref().map_or(std::ptr::null(), |path| path.as_ptr());
 
-    let mut times = if args[2] == 0 {
-        [
-            libc::timespec {
-                tv_sec: DETERMINISTIC_UTIME_SECONDS,
-                tv_nsec: 0,
-            },
-            libc::timespec {
-                tv_sec: DETERMINISTIC_UTIME_SECONDS,
-                tv_nsec: 0,
-            },
-        ]
-    } else {
-        match read_guest_struct::<[libc::timespec; 2]>(memory, args[2]) {
-            Ok(times) => times,
-            Err(error) => return error,
-        }
-    };
+    let mut times = requested_times.unwrap_or([
+        libc::timespec {
+            tv_sec: DETERMINISTIC_UTIME_SECONDS,
+            tv_nsec: 0,
+        },
+        libc::timespec {
+            tv_sec: DETERMINISTIC_UTIME_SECONDS,
+            tv_nsec: 0,
+        },
+    ]);
     for time in &mut times {
         if time.tv_nsec == libc::UTIME_NOW {
             time.tv_sec = DETERMINISTIC_UTIME_SECONDS;
@@ -1787,16 +1974,43 @@ fn utimensat(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> 
             return negative_errno(libc::EINVAL);
         }
     }
-    // SAFETY: path_pointer is either NULL for the Linux fd-based extension or
-    // points into path, and times remains live for the call.
-    zero_or_errno(unsafe {
-        libc::utimensat(
-            host_dirfd,
-            path_pointer,
+
+    // Mutate the already-validated inode instead of re-resolving the guest
+    // pathname. Explicit deterministic timestamps are intentionally stricter
+    // than Linux UTIME_NOW for writable files not owned by the caller; a
+    // virtual metadata overlay is required to emulate that exception without
+    // exposing host wall time.
+    let empty_path = b"\0";
+    let mut target_flags = libc::AT_EMPTY_PATH;
+    if raw_flags & libc::AT_SYMLINK_NOFOLLOW != 0 {
+        target_flags |= libc::AT_SYMLINK_NOFOLLOW;
+    }
+    // SAFETY: target_fd is live through opened_path or guest descriptor state,
+    // empty_path is NUL-terminated, and times is live for the syscall.
+    let mut result = unsafe {
+        libc::syscall(
+            libc::SYS_utimensat,
+            target_fd,
+            empty_path.as_ptr(),
             times.as_ptr(),
-            raw_flags as libc::c_int,
+            target_flags,
         )
-    })
+    };
+    if result < 0
+        && raw_flags & libc::AT_SYMLINK_NOFOLLOW == 0
+        && matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENOSYS | libc::EINVAL)
+        )
+    {
+        let proc_path = CString::new(format!("/proc/self/fd/{target_fd}"))
+            .expect("supervisor fd path has no NUL");
+        // SAFETY: proc_path identifies the checked descriptor kept live above.
+        result =
+            unsafe { libc::utimensat(libc::AT_FDCWD, proc_path.as_ptr(), times.as_ptr(), 0) } as _;
+    }
+    drop(opened_path);
+    zero_or_errno(result as libc::c_int)
 }
 
 fn getcwd(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
@@ -1883,21 +2097,34 @@ fn host_fd(state: &LoadedStaticElf, guest_fd: libc::c_int) -> Option<RawFd> {
 }
 
 // TODO-HUMAN-REVIEW(PR-52): Review KVM guest fcntl compatibility boundaries.
-fn fcntl(state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+fn fcntl(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
     let Ok(guest_fd) = i32::try_from(args[0]) else {
         return negative_errno(libc::EBADF);
     };
     let Some(host_fd) = host_fd(state, guest_fd) else {
         return negative_errno(libc::EBADF);
     };
-
-    if args[1] != libc::F_GETFL as u64 {
-        return negative_errno(libc::ENOSYS);
-    }
-
-    match fd_status_flags(host_fd) {
-        Ok(flags) => flags as i64,
-        Err(error) => error,
+    match args[1] as libc::c_int {
+        libc::F_GETFL => match fd_status_flags(host_fd) {
+            Ok(flags) => flags as i64,
+            Err(error) => error,
+        },
+        libc::F_GETFD => {
+            if state.cloexec_fds.contains(&guest_fd) {
+                i64::from(libc::FD_CLOEXEC)
+            } else {
+                0
+            }
+        }
+        libc::F_SETFD => {
+            if args[2] & libc::FD_CLOEXEC as u64 != 0 {
+                state.cloexec_fds.insert(guest_fd);
+            } else {
+                state.cloexec_fds.remove(&guest_fd);
+            }
+            0
+        }
+        _ => negative_errno(libc::ENOSYS),
     }
 }
 
@@ -1929,6 +2156,7 @@ fn close(state: &mut LoadedStaticElf, raw_fd: u64) -> i64 {
         return negative_errno(libc::EBADF);
     };
     if state.files.remove(&fd).is_some() {
+        state.cloexec_fds.remove(&fd);
         return 0;
     }
     if is_open_standard(state, fd) {
@@ -1936,6 +2164,7 @@ fn close(state: &mut LoadedStaticElf, raw_fd: u64) -> i64 {
             state.stdin.take();
         }
         state.closed_standard_fds.insert(fd);
+        state.cloexec_fds.remove(&fd);
         return 0;
     }
     negative_errno(libc::EBADF)
@@ -2364,7 +2593,7 @@ fn rt_sigaction(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u
     if !(1..=64).contains(&signal) {
         return negative_errno(libc::EINVAL);
     }
-    let action = if args[1] == 0 {
+    let mut action = if args[1] == 0 {
         None
     } else {
         match read_guest_bytes::<KERNEL_SIGACTION_SIZE>(memory, args[1]) {
@@ -2372,22 +2601,27 @@ fn rt_sigaction(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u
             Err(error) => return error,
         }
     };
+    if let Some(action) = &mut action {
+        let mask = &mut action[KERNEL_SIGACTION_SIZE - KERNEL_SIGSET_SIZE..];
+        for signal in [libc::SIGKILL, libc::SIGSTOP] {
+            let bit = (signal - 1) as usize;
+            mask[bit / 8] &= !(1 << (bit % 8));
+        }
+    }
     if action.is_some() && matches!(signal, libc::SIGKILL | libc::SIGSTOP) {
         return negative_errno(libc::EINVAL);
     }
-    if args[2] != 0 {
-        let previous = state
-            .signal_actions
-            .get(&signal)
-            .copied()
-            .unwrap_or([0; KERNEL_SIGACTION_SIZE]);
-        let result = write_bytes(memory, args[2], &previous);
-        if result != 0 {
-            return result;
-        }
-    }
+
+    let previous = state
+        .signal_actions
+        .get(&signal)
+        .copied()
+        .unwrap_or([0; KERNEL_SIGACTION_SIZE]);
     if let Some(action) = action {
         state.signal_actions.insert(signal, action);
+    }
+    if args[2] != 0 {
+        return write_bytes(memory, args[2], &previous);
     }
     0
 }
@@ -2404,12 +2638,7 @@ fn rt_sigprocmask(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &
             Err(error) => return error,
         }
     };
-    if args[2] != 0 {
-        let result = write_bytes(memory, args[2], &state.signal_mask);
-        if result != 0 {
-            return result;
-        }
-    }
+    let previous = state.signal_mask;
     if let Some(requested) = requested {
         match args[0] as libc::c_int {
             libc::SIG_BLOCK => {
@@ -2429,6 +2658,9 @@ fn rt_sigprocmask(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &
             let bit = (signal - 1) as usize;
             state.signal_mask[bit / 8] &= !(1 << (bit % 8));
         }
+    }
+    if args[2] != 0 {
+        return write_bytes(memory, args[2], &previous);
     }
     0
 }
@@ -2453,27 +2685,28 @@ fn sigaltstack(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u6
         }
         Some(stack)
     };
-    if args[1] != 0 {
-        let result = if let Some(previous) = state.signal_alt_stack.as_ref() {
-            write_bytes(memory, args[1], previous)
-        } else {
-            write_struct(
-                memory,
-                args[1],
-                &GuestStack {
-                    sp: 0,
-                    flags: libc::SS_DISABLE,
-                    _padding: 0,
-                    size: 0,
-                },
-            )
-        };
-        if result != 0 {
-            return result;
-        }
-    }
+    let previous = state.signal_alt_stack.clone();
     if let Some(requested) = requested {
-        state.signal_alt_stack = Some(struct_bytes(&requested));
+        state.signal_alt_stack = if requested.flags & libc::SS_DISABLE != 0 {
+            None
+        } else {
+            Some(struct_bytes(&requested))
+        };
+    }
+    if args[1] != 0 {
+        if let Some(previous) = previous.as_ref() {
+            return write_bytes(memory, args[1], previous);
+        }
+        return write_struct(
+            memory,
+            args[1],
+            &GuestStack {
+                sp: 0,
+                flags: libc::SS_DISABLE,
+                _padding: 0,
+                size: 0,
+            },
+        );
     }
     0
 }
@@ -2783,6 +3016,7 @@ mod tests {
             signal_mask: [0; KERNEL_SIGSET_SIZE],
             signal_alt_stack: None,
             files: BTreeMap::new(),
+            cloexec_fds: BTreeSet::new(),
             closed_standard_fds: BTreeSet::new(),
             children: BTreeMap::new(),
         }
@@ -3232,6 +3466,38 @@ mod tests {
             ],
         );
         assert_eq!(fd, 3);
+        const EMPTY_PATH: u64 = 0x580;
+        write_c_string(&mut memory, EMPTY_PATH, "");
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_utimensat,
+                [u64::MAX, 0, 0, libc::AT_EMPTY_PATH as u64, 0, 0,],
+            ),
+            negative_errno(libc::EINVAL),
+            "NULL-path flags are rejected before validating the descriptor"
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_utimensat,
+                [u64::MAX, 0, 0, 1_u64 << 32, 0, 0],
+            ),
+            negative_errno(libc::EBADF),
+            "utimensat flags use the low 32-bit Linux int ABI"
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_utimensat,
+                [fd as u64, EMPTY_PATH, 0, libc::AT_EMPTY_PATH as u64, 0, 0,],
+            ),
+            0,
+            "AT_EMPTY_PATH must update the supplied descriptor"
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -4278,6 +4544,7 @@ mod tests {
         const RENAMED: u64 = 0x300;
         const FIFO: u64 = 0x380;
         const DOT: u64 = 0x400;
+        const FOLLOWED_LINK: u64 = 0x480;
         const STATFS: u64 = 0x500;
 
         let root = TestDir::new();
@@ -4291,6 +4558,7 @@ mod tests {
             (RENAMED, "renamed"),
             (FIFO, "fifo"),
             (DOT, "."),
+            (FOLLOWED_LINK, "followed-link"),
         ] {
             write_c_string(&mut memory, address, value);
         }
@@ -4356,6 +4624,26 @@ mod tests {
             syscall_result(
                 &mut memory,
                 &mut state,
+                libc::SYS_linkat,
+                [
+                    libc::AT_FDCWD as u64,
+                    SYMLINK,
+                    libc::AT_FDCWD as u64,
+                    FOLLOWED_LINK,
+                    libc::AT_SYMLINK_FOLLOW as u64,
+                    0,
+                ],
+            ),
+            0
+        );
+        assert_eq!(
+            std::fs::read(root.0.join("followed-link")).unwrap(),
+            b"payload"
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
                 libc::SYS_renameat,
                 [
                     libc::AT_FDCWD as u64,
@@ -4374,7 +4662,7 @@ mod tests {
                 &mut memory,
                 &mut state,
                 libc::SYS_fchmodat,
-                [libc::AT_FDCWD as u64, RENAMED, 0o600, 0, 0, 0],
+                [libc::AT_FDCWD as u64, RENAMED, 0o600, 0xdead_beef, 0, 0,],
             ),
             0
         );
@@ -4395,6 +4683,204 @@ mod tests {
             std::fs::metadata(root.0.join("renamed")).unwrap().mtime(),
             DETERMINISTIC_UTIME_SECONDS
         );
+        let fd = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_openat,
+            [
+                libc::AT_FDCWD as u64,
+                RENAMED,
+                libc::O_RDONLY as u64,
+                0,
+                0,
+                0,
+            ],
+        );
+        assert_eq!(fd, 3);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_utimensat,
+                [fd as u64, 0, 0, 0, 0, 0],
+            ),
+            0,
+            "fd-based utimensat with a NULL pathname must use futimens"
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_close,
+                [fd as u64, 0, 0, 0, 0, 0],
+            ),
+            0
+        );
+        const EMPTY_OPATH: u64 = 0x580;
+        write_c_string(&mut memory, EMPTY_OPATH, "");
+        let path_fd = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_openat,
+            [libc::AT_FDCWD as u64, RENAMED, libc::O_PATH as u64, 0, 0, 0],
+        );
+        assert_eq!(path_fd, 3);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_utimensat,
+                [path_fd as u64, 0, 0, 0, 0, 0],
+            ),
+            negative_errno(libc::EBADF),
+            "NULL-path timestamp updates reject O_PATH descriptors"
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_utimensat,
+                [
+                    path_fd as u64,
+                    EMPTY_OPATH,
+                    0,
+                    libc::AT_EMPTY_PATH as u64,
+                    0,
+                    0,
+                ],
+            ),
+            0,
+            "AT_EMPTY_PATH accepts O_PATH descriptors"
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_close,
+                [path_fd as u64, 0, 0, 0, 0, 0],
+            ),
+            0
+        );
+
+        const OMIT_TIMES: u64 = 0x600;
+        const CREATED: u64 = 0x700;
+        let omit = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        };
+        assert_eq!(write_struct(&mut memory, OMIT_TIMES, &omit), 0);
+        assert_eq!(
+            write_struct(
+                &mut memory,
+                OMIT_TIMES + std::mem::size_of::<libc::timespec>() as u64,
+                &omit,
+            ),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_utimensat,
+                [libc::AT_FDCWD as u64, u64::MAX, OMIT_TIMES, 0, 0, 0],
+            ),
+            0,
+            "two UTIME_OMIT values must not resolve the pathname"
+        );
+
+        write_c_string(&mut memory, CREATED, "created");
+        state.umask = 0;
+        let created_fd = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_openat,
+            [
+                libc::AT_FDCWD as u64,
+                CREATED,
+                (libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY) as u64,
+                0o666,
+                0,
+                0,
+            ],
+        );
+        assert!(created_fd >= 0);
+        assert_eq!(
+            std::fs::metadata(root.0.join("created")).unwrap().mode() & 0o777,
+            0o666,
+            "the supervisor umask must not be applied after the guest umask"
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_close,
+                [created_fd as u64, 0, 0, 0, 0, 0],
+            ),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_unlinkat,
+                [libc::AT_FDCWD as u64, CREATED, 0, 0, 0, 0],
+            ),
+            0
+        );
+
+        std::os::unix::fs::symlink("created-target", root.0.join("created-link")).unwrap();
+        write_c_string(&mut memory, CREATED, "created-link");
+        let symlink_created_fd = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_openat,
+            [
+                libc::AT_FDCWD as u64,
+                CREATED,
+                (libc::O_CREAT | libc::O_WRONLY) as u64,
+                0o666,
+                0,
+                0,
+            ],
+        );
+        assert!(symlink_created_fd >= 0);
+        assert_eq!(
+            std::fs::metadata(root.0.join("created-target"))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o666,
+            "guest umask must apply when O_CREAT follows a dangling symlink"
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_close,
+                [symlink_created_fd as u64, 0, 0, 0, 0, 0],
+            ),
+            0
+        );
+
+        let protected = root.0.join("protected");
+        std::fs::write(&protected, b"payload").unwrap();
+        std::fs::set_permissions(&protected, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let protected_file = std::fs::File::open(&protected).unwrap();
+        write_c_string(
+            &mut memory,
+            CREATED,
+            &format!("/proc/self/fd/{}", protected_file.as_raw_fd()),
+        );
+        assert!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_fchmodat,
+                [libc::AT_FDCWD as u64, CREATED, 0o777, 0, 0, 0],
+            ) < 0,
+            "guest mutations must not follow supervisor procfs descriptors"
+        );
+        assert_eq!(std::fs::metadata(&protected).unwrap().mode() & 0o777, 0o600);
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -4429,7 +4915,7 @@ mod tests {
         let statfs: libc::statfs = read_struct(&memory, STATFS);
         assert_ne!(statfs.f_type, 0);
 
-        for path in [RENAMED, SYMLINK, FIFO] {
+        for path in [RENAMED, SYMLINK, FIFO, FOLLOWED_LINK] {
             assert_eq!(
                 syscall_result(
                     &mut memory,
@@ -4520,6 +5006,98 @@ mod tests {
             negative_errno(libc::EINVAL)
         );
         assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_dup3,
+                [u64::MAX, 9, u64::MAX, 0, 0, 0],
+            ),
+            negative_errno(libc::EINVAL),
+            "dup3 validates flags before the old descriptor"
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_dup3,
+                [3, 10, 1_u64 << 32, 0, 0, 0],
+            ),
+            10,
+            "dup3 flags use the low 32-bit Linux int ABI"
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_dup3,
+                [u64::MAX, 11, 1_u64 << 32, 0, 0, 0],
+            ),
+            negative_errno(libc::EBADF)
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_close,
+                [10, 0, 0, 0, 0, 0],
+            ),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_dup3,
+                [(1_u64 << 32) | 3, 90, 0, 0, 0, 0],
+            ),
+            90
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_dup3,
+                [3, (1_u64 << 32) | 91, 0, 0, 0, 0],
+            ),
+            91
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_close,
+                [90, 0, 0, 0, 0, 0],
+            ),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_close,
+                [91, 0, 0, 0, 0, 0],
+            ),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_fcntl,
+                [4, libc::F_SETFD as u64, libc::FD_CLOEXEC as u64, 0, 0, 0],
+            ),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_fcntl,
+                [4, libc::F_GETFD as u64, 0, 0, 0, 0],
+            ),
+            i64::from(libc::FD_CLOEXEC)
+        );
+        assert_eq!(
             syscall_result(&mut memory, &mut state, libc::SYS_close, [0, 0, 0, 0, 0, 0],),
             0
         );
@@ -4546,7 +5124,14 @@ mod tests {
         let root = TestDir::new();
         let mut state = test_state(&root.0);
         let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
-        let action = [0x5a; KERNEL_SIGACTION_SIZE];
+        let mut action = [0x5a; KERNEL_SIGACTION_SIZE];
+        action[KERNEL_SIGACTION_SIZE - KERNEL_SIGSET_SIZE..].fill(u8::MAX);
+        let mut expected_action = action;
+        for signal in [libc::SIGKILL, libc::SIGSTOP] {
+            let bit = (signal - 1) as usize;
+            expected_action[KERNEL_SIGACTION_SIZE - KERNEL_SIGSET_SIZE + bit / 8] &=
+                !(1 << (bit % 8));
+        }
         memory.write(ACTION, &action).unwrap();
         assert_eq!(
             syscall_result(
@@ -4586,7 +5171,7 @@ mod tests {
         );
         assert_eq!(
             read_guest_bytes::<KERNEL_SIGACTION_SIZE>(&memory, OLD_ACTION).unwrap(),
-            action
+            expected_action
         );
         assert_eq!(
             syscall_result(
@@ -4604,8 +5189,45 @@ mod tests {
             ),
             negative_errno(libc::EINVAL)
         );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_rt_sigaction,
+                [
+                    libc::SIGUSR2 as u64,
+                    ACTION,
+                    u64::MAX,
+                    KERNEL_SIGSET_SIZE as u64,
+                    0,
+                    0,
+                ],
+            ),
+            negative_errno(libc::EFAULT)
+        );
+        assert_eq!(
+            state.signal_actions.get(&libc::SIGUSR2),
+            Some(&expected_action),
+            "new sigaction remains installed if copying old action fails"
+        );
 
         memory.write(MASK, &[u8::MAX; KERNEL_SIGSET_SIZE]).unwrap();
+        memory.write(OLD_MASK, &[0x33; KERNEL_SIGSET_SIZE]).unwrap();
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_rt_sigprocmask,
+                [99, MASK, OLD_MASK, KERNEL_SIGSET_SIZE as u64, 0, 0],
+            ),
+            negative_errno(libc::EINVAL)
+        );
+        assert_eq!(state.signal_mask, [0; KERNEL_SIGSET_SIZE]);
+        assert_eq!(
+            read_guest_bytes::<KERNEL_SIGSET_SIZE>(&memory, OLD_MASK).unwrap(),
+            [0x33; KERNEL_SIGSET_SIZE],
+            "invalid how must not copy the old mask"
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -4628,6 +5250,27 @@ mod tests {
         );
         assert_eq!(state.signal_mask[1] & 1, 0, "SIGKILL must remain unblocked");
         assert_eq!(state.signal_mask[2] & 4, 0, "SIGSTOP must remain unblocked");
+        memory.write(MASK, &[0; KERNEL_SIGSET_SIZE]).unwrap();
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_rt_sigprocmask,
+                [
+                    libc::SIG_SETMASK as u64,
+                    MASK,
+                    u64::MAX,
+                    KERNEL_SIGSET_SIZE as u64,
+                    0,
+                    0,
+                ],
+            ),
+            negative_errno(libc::EFAULT)
+        );
+        assert_eq!(
+            state.signal_mask, [0; KERNEL_SIGSET_SIZE],
+            "new signal mask remains installed if copying the old mask fails"
+        );
 
         let stack = GuestStack {
             sp: 0x800,
@@ -4647,10 +5290,85 @@ mod tests {
         );
         let previous: GuestStack = read_struct(&memory, OLD_ALT_STACK);
         assert_eq!(previous.flags, libc::SS_DISABLE);
+        let disabled = GuestStack {
+            sp: u64::MAX,
+            flags: libc::SS_DISABLE,
+            _padding: 0,
+            size: u64::MAX,
+        };
+        assert_eq!(write_struct(&mut memory, ALT_STACK, &disabled), 0);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_sigaltstack,
+                [ALT_STACK, u64::MAX, 0, 0, 0, 0],
+            ),
+            negative_errno(libc::EFAULT)
+        );
+        assert!(
+            state.signal_alt_stack.is_none(),
+            "disabled altstack remains applied if copying the old stack fails"
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_sigaltstack,
+                [0, OLD_ALT_STACK, 0, 0, 0, 0],
+            ),
+            0
+        );
+        let disabled_query: GuestStack = read_struct(&memory, OLD_ALT_STACK);
+        assert_eq!(disabled_query.sp, 0);
+        assert_eq!(disabled_query.flags, libc::SS_DISABLE);
+        assert_eq!(disabled_query.size, 0);
         let child = state.try_clone_for_fork(2).unwrap();
-        assert_eq!(child.signal_actions[&libc::SIGUSR1], action);
+        assert_eq!(child.signal_actions[&libc::SIGUSR1], expected_action);
         assert_eq!(child.signal_mask, state.signal_mask);
         assert_eq!(child.signal_alt_stack, state.signal_alt_stack);
+    }
+
+    #[test]
+    fn exec_closes_cloexec_descriptors_and_resets_caught_signals() {
+        let root = TestDir::new();
+        let path = root.0.join("descriptor");
+        std::fs::write(&path, b"payload").unwrap();
+        let mut previous = test_state(&root.0);
+        previous
+            .files
+            .insert(3, std::fs::File::open(&path).unwrap());
+        previous
+            .files
+            .insert(4, std::fs::File::open(&path).unwrap());
+        previous.cloexec_fds.extend([libc::STDIN_FILENO, 4]);
+        previous.signal_alt_stack = Some(vec![1; 16]);
+        let mut ignored = [0x7f; KERNEL_SIGACTION_SIZE];
+        ignored[..std::mem::size_of::<usize>()].copy_from_slice(&libc::SIG_IGN.to_ne_bytes());
+        let mut canonical_ignored = [0; KERNEL_SIGACTION_SIZE];
+        canonical_ignored[..std::mem::size_of::<usize>()]
+            .copy_from_slice(&libc::SIG_IGN.to_ne_bytes());
+        let mut caught = [0; KERNEL_SIGACTION_SIZE];
+        caught[..std::mem::size_of::<usize>()].copy_from_slice(&2usize.to_ne_bytes());
+        previous.signal_actions.insert(libc::SIGUSR1, ignored);
+        previous.signal_actions.insert(libc::SIGUSR2, caught);
+        let mut replacement = test_state(&root.0);
+        replacement.inherit_process_state(previous);
+        assert!(replacement.files.contains_key(&3));
+        assert!(!replacement.files.contains_key(&4));
+        assert!(replacement.stdin.is_none());
+        assert!(
+            replacement
+                .closed_standard_fds
+                .contains(&libc::STDIN_FILENO)
+        );
+        assert!(replacement.cloexec_fds.is_empty());
+        assert_eq!(
+            replacement.signal_actions.get(&libc::SIGUSR1),
+            Some(&canonical_ignored)
+        );
+        assert!(!replacement.signal_actions.contains_key(&libc::SIGUSR2));
+        assert!(replacement.signal_alt_stack.is_none());
     }
 
     #[test]
@@ -4714,6 +5432,69 @@ mod tests {
                 [0, 0, 0, 0, 0, 0],
             ),
             i64::from(MEMBARRIER_SUPPORTED)
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_membarrier,
+                [0, 0, 123, 0, 0, 0],
+            ),
+            i64::from(MEMBARRIER_SUPPORTED)
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_membarrier,
+                [1_u64 << 32, 1_u64 << 32, 123, 0, 0, 0],
+            ),
+            i64::from(MEMBARRIER_SUPPORTED)
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_membarrier,
+                [1, 0, 0, 0, 0, 0],
+            ),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_membarrier,
+                [1, 0, 123, 0, 0, 0],
+            ),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_membarrier,
+                [(1_u64 << 32) | 1, 1_u64 << 32, 123, 0, 0, 0],
+            ),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_membarrier,
+                [3, 0, 0, 0, 0, 0],
+            ),
+            negative_errno(libc::EINVAL)
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_membarrier,
+                [0, 1, 0, 0, 0, 0],
+            ),
+            negative_errno(libc::EINVAL)
         );
         assert_eq!(
             syscall_result(
