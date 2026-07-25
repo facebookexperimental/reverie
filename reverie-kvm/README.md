@@ -45,7 +45,9 @@ topology.
 The process personality implements `fork`, `vfork`, process-only `clone`/`clone3`,
 `execve`/`execveat`, and `wait4`. Forked children receive an independent guest
 RAM snapshot and fresh VM/vCPU, inherit duplicated host file descriptions, and
-run to completion before the parent resumes. The tool runtime keeps the root
+run to completion before the parent resumes. Legacy `clone` process calls support
+`CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID`, and `CLONE_CHILD_CLEARTID`;
+`clone3` TID fields and thread-sharing flags remain unsupported. The tool runtime keeps the root
 tool's `GlobalState`; child syscalls currently execute through the deterministic
 KVM personality without per-child tool lifecycle callbacks.
 

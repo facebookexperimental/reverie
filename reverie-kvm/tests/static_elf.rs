@@ -72,7 +72,11 @@ impl Drop for TestDirectory {
     }
 }
 
-fn run_host_program(program: &str, argv: &[&str], cwd: &std::path::Path) {
+fn run_host_program_captured(
+    program: &str,
+    argv: &[&str],
+    cwd: &std::path::Path,
+) -> (Vec<u8>, Vec<u8>) {
     const REAL_PROGRAM_MEMORY_SIZE: usize = 256 * 1024 * 1024;
 
     let image = std::fs::read(program).unwrap();
@@ -88,6 +92,11 @@ fn run_host_program(program: &str, argv: &[&str], cwd: &std::path::Path) {
         String::from_utf8_lossy(&stdout),
         String::from_utf8_lossy(&stderr),
     );
+    (stdout, stderr)
+}
+
+fn run_host_program(program: &str, argv: &[&str], cwd: &std::path::Path) {
+    let _ = run_host_program_captured(program, argv, cwd);
 }
 
 #[derive(Default)]
@@ -345,6 +354,156 @@ fn static_elf_forks_execs_and_waits_for_child() {
     assert_eq!(code, 0);
     assert_eq!(stdout, message);
     assert!(stderr.is_empty());
+}
+
+#[test]
+fn static_elf_clone_tid_side_effects_reach_guest_memory() {
+    match Kvm::new() {
+        Ok(_) => {}
+        Err(error) if kvm_is_unavailable(&error) => {
+            eprintln!("skipping KVM clone TID test: cannot open /dev/kvm: {error}");
+            return;
+        }
+        Err(error) => panic!("failed to probe /dev/kvm: {error}"),
+    }
+
+    fn append_exit(code: &mut Vec<u8>, status: u32) {
+        code.extend_from_slice(&[0xb8, 0xe7, 0x00, 0x00, 0x00]);
+        code.push(0xbf);
+        code.extend_from_slice(&status.to_le_bytes());
+        code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    }
+
+    fn patch_jump(code: &mut [u8], operand: usize, target: usize) {
+        let displacement = i32::try_from(target as isize - (operand + 4) as isize).unwrap();
+        code[operand..operand + 4].copy_from_slice(&displacement.to_le_bytes());
+    }
+
+    const PARENT_TID: u64 = LOAD_ADDRESS + 0x1800;
+    const CHILD_TID: u64 = LOAD_ADDRESS + 0x1808;
+    const REPLACEMENT_CLEAR_TID: u64 = LOAD_ADDRESS + 0x1810;
+    const INVALID_TID: u64 = MEMORY_SIZE as u64 - 1;
+    let flags = libc::SIGCHLD as u32
+        | libc::CLONE_PARENT_SETTID as u32
+        | libc::CLONE_CHILD_SETTID as u32
+        | libc::CLONE_CHILD_CLEARTID as u32;
+
+    let mut code = Vec::new();
+    code.extend_from_slice(&[0xb8, 0x38, 0x00, 0x00, 0x00]); // mov eax, SYS_clone
+    code.push(0xbf); // mov edi, flags
+    code.extend_from_slice(&flags.to_le_bytes());
+    code.extend_from_slice(&[0x31, 0xf6]); // xor esi, esi
+    code.extend_from_slice(&[0x48, 0xba]); // movabs rdx, parent_tid
+    code.extend_from_slice(&PARENT_TID.to_le_bytes());
+    code.extend_from_slice(&[0x49, 0xba]); // movabs r10, child_tid
+    code.extend_from_slice(&CHILD_TID.to_le_bytes());
+    code.extend_from_slice(&[0x0f, 0x05, 0x85, 0xc0, 0x0f, 0x84, 0x00, 0x00, 0x00, 0x00]); // syscall; jz child
+    let first_child_jump = code.len() - 4;
+
+    code.extend_from_slice(&[0x48, 0xb9]); // movabs rcx, parent_tid
+    code.extend_from_slice(&PARENT_TID.to_le_bytes());
+    code.extend_from_slice(&[0x39, 0x01, 0x74, 0x0e]); // cmp [rcx], eax; je parent_tid_ok
+    append_exit(&mut code, 61);
+    code.extend_from_slice(&[
+        0x89, 0xc7, // mov edi, eax
+        0x48, 0x83, 0xec, 0x10, // sub rsp, 16
+        0x48, 0x89, 0xe6, // mov rsi, rsp
+        0x31, 0xd2, // xor edx, edx
+        0x45, 0x31, 0xd2, // xor r10d, r10d
+        0xb8, 0x3d, 0x00, 0x00, 0x00, // mov eax, SYS_wait4
+        0x0f, 0x05, // syscall
+        0x83, 0x3c, 0x24, 0x00, // cmp dword ptr [rsp], 0
+        0x74, 0x0e, // je first_child_ok
+    ]);
+    append_exit(&mut code, 64);
+
+    // A second clone proves invalid TID stores do not abort child creation.
+    code.extend_from_slice(&[0xb8, 0x38, 0x00, 0x00, 0x00]);
+    code.push(0xbf);
+    code.extend_from_slice(&flags.to_le_bytes());
+    code.extend_from_slice(&[0x31, 0xf6]); // xor esi, esi
+    code.extend_from_slice(&[0x48, 0xba]); // movabs rdx, invalid parent_tid
+    code.extend_from_slice(&INVALID_TID.to_le_bytes());
+    code.extend_from_slice(&[0x49, 0xba]); // movabs r10, invalid child_tid
+    code.extend_from_slice(&INVALID_TID.to_le_bytes());
+    code.extend_from_slice(&[
+        0x0f, 0x05, // syscall
+        0x85, 0xc0, // test eax, eax
+        0x79, 0x0e, // jns clone_returned_pid_or_child
+    ]);
+    append_exit(&mut code, 65);
+    code.extend_from_slice(&[0x0f, 0x84, 0x00, 0x00, 0x00, 0x00]); // jz child
+    let invalid_child_jump = code.len() - 4;
+    code.extend_from_slice(&[
+        0x89, 0xc7, // mov edi, eax
+        0x48, 0x89, 0xe6, // mov rsi, rsp
+        0x31, 0xd2, // xor edx, edx
+        0x45, 0x31, 0xd2, // xor r10d, r10d
+        0xb8, 0x3d, 0x00, 0x00, 0x00, // mov eax, SYS_wait4
+        0x0f, 0x05, // syscall
+        0x39, 0xf8, // cmp eax, edi
+        0x74, 0x0e, // je waited_for_second_child
+    ]);
+    append_exit(&mut code, 66);
+    code.extend_from_slice(&[
+        0x8b, 0x3c, 0x24, // mov edi, dword ptr [rsp]
+        0xc1, 0xef, 0x08, // shr edi, 8
+        0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax, SYS_exit_group
+        0x0f, 0x05, 0x0f, 0x0b, // syscall; ud2
+    ]);
+
+    let first_child = code.len();
+    patch_jump(&mut code, first_child_jump, first_child);
+    code.extend_from_slice(&[0x48, 0xb9]); // movabs rcx, child_tid
+    code.extend_from_slice(&CHILD_TID.to_le_bytes());
+    code.extend_from_slice(&[0x83, 0x39, 0x02, 0x74, 0x0e]); // cmp [rcx], 2; je
+    append_exit(&mut code, 62);
+    code.extend_from_slice(&[0xb8, 0xda, 0x00, 0x00, 0x00]); // set_tid_address
+    code.extend_from_slice(&[0x48, 0xbf]); // movabs rdi, replacement pointer
+    code.extend_from_slice(&REPLACEMENT_CLEAR_TID.to_le_bytes());
+    code.extend_from_slice(&[0x0f, 0x05, 0x83, 0xf8, 0x02, 0x74, 0x0e]); // syscall; cmp eax, 2; je
+    append_exit(&mut code, 63);
+    append_exit(&mut code, 0);
+
+    let invalid_store_child = code.len();
+    patch_jump(&mut code, invalid_child_jump, invalid_store_child);
+    append_exit(&mut code, 0);
+
+    let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+    backend
+        .install_static_elf(&static_elf(&code), "/bin/clone-tid-test")
+        .unwrap();
+    let (code, stdout, stderr) = backend.run_static_elf_captured().unwrap();
+    assert_eq!(code, 0);
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+}
+
+#[test]
+fn real_bash_small_pipeline_uses_legacy_process_clone_tid_flags() {
+    match Kvm::new() {
+        Ok(_) => {}
+        Err(error) if kvm_is_unavailable(&error) => {
+            eprintln!("skipping KVM Bash pipeline test: cannot open /dev/kvm: {error}");
+            return;
+        }
+        Err(error) => panic!("failed to probe /dev/kvm: {error}"),
+    }
+
+    let root = TestDirectory::new();
+    // The child runs to completion before the parent resumes, so this covers a
+    // bounded pipeline without claiming concurrent producer/consumer support.
+    let (stdout, stderr) = run_host_program_captured(
+        "/bin/bash",
+        &["bash", "--norc", "-c", "printf abc | /usr/bin/wc -c"],
+        &root.0,
+    );
+    assert_eq!(stdout, b"3\n");
+    assert!(
+        stderr.is_empty(),
+        "unexpected Bash stderr: {}",
+        String::from_utf8_lossy(&stderr)
+    );
 }
 
 #[test]

@@ -307,8 +307,12 @@ impl KvmBackend {
             ProcessAction::Fork {
                 child_pid,
                 child_stack,
+                parent_tid,
+                child_tid,
+                clear_child_tid,
             } => {
                 let mut child_executor = executor.fork_child(child_pid)?;
+                child_executor.set_clear_child_tid(clear_child_tid);
                 set_syscall_return_park(&mut self.memory, self.hypercall_instruction, true)?;
                 let parked = match self.vcpu.run()? {
                     VcpuExit::Hlt => Ok(()),
@@ -319,13 +323,18 @@ impl KvmBackend {
                 set_syscall_return_park(&mut self.memory, self.hypercall_instruction, false)?;
                 parked?;
                 let child_snapshot = self.snapshot_process()?;
+                write_tid_best_effort(&mut self.memory, parent_tid, child_pid);
 
                 let mut child = Self::from_process_snapshot(child_snapshot)?;
+                write_tid_best_effort(&mut child.memory, child_tid, child_pid);
                 let (fs_base, gs_base) = child_executor.segment_bases();
                 set_user_segment_base(&child.vcpu, SegmentBase::Fs, fs_base)?;
                 set_user_segment_base(&child.vcpu, SegmentBase::Gs, gs_base)?;
                 configure_process_syscall_return(&child.memory, &child.vcpu, 0, child_stack)?;
                 let (code, stdout, stderr) = child.run_static_elf_process(&mut child_executor)?;
+                // A process clone has a private snapshot, so no surviving task can
+                // observe this clear; preserve the child-side ABI.
+                write_tid_best_effort(&mut child.memory, child_executor.take_clear_child_tid(), 0);
                 executor.record_child_exit(child_pid, code);
                 executor.append_output(stdout, stderr);
                 configure_process_syscall_return(
@@ -512,6 +521,13 @@ impl KvmBackend {
     }
 }
 
+fn write_tid_best_effort(memory: &mut GuestMemory, address: Option<u64>, tid: i32) {
+    if let Some(address) = address {
+        // Linux creates the child even if a clone TID store faults.
+        let _ = memory.write(address, &tid.to_le_bytes());
+    }
+}
+
 fn supported_hypercall_instruction(cpuid: &CpuId) -> Result<[u8; 3]> {
     let supports_vmcall = cpuid
         .as_slice()
@@ -531,4 +547,27 @@ fn supported_hypercall_instruction(cpuid: &CpuId) -> Result<[u8; 3]> {
         return Ok(VMMCALL);
     }
     Err(Error::HypercallInstructionUnsupported)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clone_tid_stores_and_clear_are_best_effort() {
+        const TID_ADDRESS: u64 = 0x100;
+
+        let mut memory = GuestMemory::new(0, 4096).unwrap();
+        write_tid_best_effort(&mut memory, Some(TID_ADDRESS), 7);
+        let mut bytes = [0; std::mem::size_of::<i32>()];
+        memory.read(TID_ADDRESS, &mut bytes).unwrap();
+        assert_eq!(i32::from_le_bytes(bytes), 7);
+
+        write_tid_best_effort(&mut memory, Some(TID_ADDRESS), 0);
+        memory.read(TID_ADDRESS, &mut bytes).unwrap();
+        assert_eq!(i32::from_le_bytes(bytes), 0);
+
+        write_tid_best_effort(&mut memory, Some(4095), 9);
+        write_tid_best_effort(&mut memory, None, 9);
+    }
 }
