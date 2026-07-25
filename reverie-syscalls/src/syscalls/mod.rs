@@ -2861,11 +2861,12 @@ typed_syscall! {
     }
 }
 
+// TODO-HUMAN-REVIEW(PR-49)
 typed_syscall! {
     pub struct Ppoll {
         fds: Option<AddrMut<libc::pollfd>>,
         nfds: libc::nfds_t,
-        timeout: Option<Addr<libc::timeval>>,
+        timeout: Option<AddrMut<Timespec>>,
         sigmask: Option<Addr<libc::sigset_t>>,
         sigsetsize: usize,
     }
@@ -3609,6 +3610,20 @@ mod test {
                 name.as_ptr()
             )
         );
+    }
+
+    #[test]
+    fn test_ppoll_timeout_is_timespec() {
+        let timeout = Timespec {
+            tv_sec: 1,
+            tv_nsec: 500_000_000,
+        };
+        let timeout_addr = AddrMut::from_ptr(&timeout).unwrap();
+        let syscall = Ppoll::new().with_timeout(Some(timeout_addr));
+
+        let decoded = Ppoll::from(SyscallArgs::from(syscall));
+        let decoded_timeout: Option<AddrMut<Timespec>> = decoded.timeout();
+        assert_eq!(decoded_timeout, Some(timeout_addr));
     }
 
     #[test]

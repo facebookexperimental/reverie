@@ -331,7 +331,7 @@ impl Container {
     /// Gets an environment variable. If the child process is to inherit this
     /// environment variable from the current process, then this returns the
     /// current process's environment variable unless it is to be overridden.
-    pub fn get_env<K: AsRef<OsStr>>(&self, env: K) -> Option<Cow<OsStr>> {
+    pub fn get_env<K: AsRef<OsStr>>(&self, env: K) -> Option<Cow<'_, OsStr>> {
         self.env.get_captured(env)
     }
 
@@ -1029,8 +1029,8 @@ mod tests {
         let cpus = num_cpus::get();
         println!("Total cpus {}", cpus);
 
-        // Map the apic_id to the number of times we observed it:
-        let mut results: HashMap<u8, usize> = HashMap::new();
+        // Map the APIC ID to the number of times we observed it:
+        let mut results: HashMap<u32, usize> = HashMap::new();
         for core in 0..cpus {
             println!("  Launching guest with affinity set to {}", core);
             let mut container = Container::new();
@@ -1039,9 +1039,23 @@ mod tests {
                 .run(|| {
                     let cpuid = CpuId::new();
                     cpuid
-                        .get_feature_info()
-                        .expect("cpuid failed")
-                        .initial_local_apic_id()
+                        .get_extended_topology_info_v2()
+                        .or_else(|| cpuid.get_extended_topology_info())
+                        .and_then(|mut levels| levels.next())
+                        .map(|level| level.x2apic_id())
+                        .or_else(|| {
+                            cpuid
+                                .get_processor_topology_info()
+                                .map(|info| info.x2apic_id())
+                        })
+                        .unwrap_or_else(|| {
+                            u32::from(
+                                cpuid
+                                    .get_feature_info()
+                                    .expect("cpuid failed")
+                                    .initial_local_apic_id(),
+                            )
+                        })
                 })
                 .unwrap();
             println!("    Guest sees its on APIC id {}", which_core);

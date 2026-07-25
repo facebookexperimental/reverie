@@ -30,6 +30,7 @@
 #![cfg(target_os = "linux")]
 #![feature(internal_output_capture)]
 
+mod backend;
 mod children;
 mod cp;
 #[allow(unused)]
@@ -49,6 +50,7 @@ mod tracer;
 mod validation;
 mod vdso;
 
+pub use backend::PtraceBackend;
 pub use perf::is_perf_supported;
 pub use tracer::GdbConnection;
 pub use tracer::Tracer;

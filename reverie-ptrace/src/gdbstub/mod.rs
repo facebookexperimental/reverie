@@ -6,6 +6,12 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+//! Work-in-progress gdbstub server for `hermit --gdbserver`. Some protocol
+//! helper types and encoders are implemented ahead of being wired into the
+//! command dispatch, so dead-code is allowed across this subsystem rather than
+//! deleting scaffolding that the remaining protocol work will use.
+#![allow(dead_code)]
+
 mod breakpoint;
 mod commands;
 mod error;

@@ -176,7 +176,10 @@ impl Symbols {
         probe: u64,
     ) -> addr2line::LookupResult<
         impl addr2line::LookupContinuation<
-            Output = Result<addr2line::FrameIter<EndianSlice<'static, Endian>>, gimli::read::Error>,
+            Output = Result<
+                addr2line::FrameIter<'_, EndianSlice<'static, Endian>>,
+                gimli::read::Error,
+            >,
         >,
     > {
         self.context.dwarf.find_frames(probe + self.base_addr())
@@ -190,7 +193,7 @@ impl Symbols {
     ///
     /// Symbol lookup uses binary search, so lookup happens in `O(log n)`
     /// amortized time.
-    pub fn find_symbol(&self, probe: u64) -> Option<SymbolMapName> {
+    pub fn find_symbol(&self, probe: u64) -> Option<SymbolMapName<'_>> {
         self.context
             .symbol_map
             .get(probe + self.base_addr())

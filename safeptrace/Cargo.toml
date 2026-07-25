@@ -28,3 +28,6 @@ tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
 default = []
 memory = ["reverie-memory"]
 notifier = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(sanitized)"]}

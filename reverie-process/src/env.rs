@@ -44,13 +44,13 @@ impl Env {
             .and_then(|v| v.as_ref().map(|v| v.as_os_str()))
     }
 
-    pub fn get_captured<K: AsRef<OsStr>>(&self, key: K) -> Option<Cow<OsStr>> {
+    pub fn get_captured<K: AsRef<OsStr>>(&self, key: K) -> Option<Cow<'_, OsStr>> {
         let key = key.as_ref();
 
-        if !self.clear {
-            if let Some(var) = std::env::var_os(key) {
-                return Some(Cow::Owned(var));
-            }
+        if !self.clear
+            && let Some(var) = std::env::var_os(key)
+        {
+            return Some(Cow::Owned(var));
         }
 
         self.get(key).map(Cow::Borrowed)

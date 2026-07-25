@@ -28,3 +28,6 @@ tempfile = "3.27.0"
 [features]
 default = []
 nightly = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(sanitized)"]}

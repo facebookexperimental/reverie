@@ -106,6 +106,12 @@ pub struct Filter {
     filter: Vec<sock_filter>,
 }
 
+impl Default for Filter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Filter {
     /// Creates a new, empty seccomp program. Note that empty BPF programs are not
     /// valid and will fail to load.

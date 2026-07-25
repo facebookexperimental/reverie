@@ -111,8 +111,28 @@ fn task_rip_is_valid(pid: Pid, rip: u64) -> bool {
 // XXX: should limit nb calls to procfs.
 /// show task fault context
 pub fn show_fault_context(task: &Stopped, sig: signal::Signal) {
-    let regs = task.getregs().unwrap();
-    let siginfo = task.getsiginfo().unwrap();
+    let regs = match task.getregs() {
+        Ok(regs) => regs,
+        Err(err) => {
+            debug!(
+                tid = %task.pid(),
+                error = %err,
+                "failed to read registers for guest fault diagnostics"
+            );
+            return;
+        }
+    };
+    let siginfo = match task.getsiginfo() {
+        Ok(siginfo) => siginfo,
+        Err(err) => {
+            debug!(
+                tid = %task.pid(),
+                error = %err,
+                "failed to read signal information for guest fault diagnostics"
+            );
+            return;
+        }
+    };
     debug!(
         "{:?} got {:?} si_errno: {}, si_code: {}, regs\n{}",
         task,
@@ -160,7 +180,13 @@ pub fn log_guest_state(context_msg: &str, tid: Pid, old_regs: &Option<libc::user
     // TODO: could certainly derive this "diffing" functionality as a macro if
     // there is a library for that.
     let hdr = format!("{}: guest state (tid {}) has ...", context_msg, tid);
-    let cur = ptrace::getregs(tid.into()).unwrap();
+    let cur = match ptrace::getregs(tid.into()) {
+        Ok(regs) => regs,
+        Err(err) => {
+            debug!(%tid, error = %err, "failed to read registers for guest state log");
+            return;
+        }
+    };
     match old_regs {
         None => debug!("{} regs = {:?}", hdr, cur),
         Some(old) => {
