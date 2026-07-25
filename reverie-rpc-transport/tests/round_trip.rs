@@ -1,0 +1,180 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+//! End-to-end round-trip tests for the cross-process GlobalTool RPC over a real
+//! Unix-domain socket.
+//!
+//! The key property under test is the one the DBI backend currently lacks:
+//! multiple independent client connections (standing in for the processes of a
+//! `fork` tree) all reach **one shared** `GlobalTool` instance, so their effects
+//! aggregate instead of fragmenting per-process.
+
+use std::sync::Mutex;
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering;
+
+use async_trait::async_trait;
+use reverie::GlobalRPC;
+use reverie::GlobalTool;
+use reverie::Tid;
+use reverie_rpc_transport::RpcClient;
+use reverie_rpc_transport::RpcServer;
+
+/// A minimal global tool: it sums the increments it receives (like a syscall
+/// counter aggregating across a process tree) and echoes back the originating
+/// tid so we can check tid propagation.
+#[derive(Default)]
+struct Counter {
+    total: Mutex<u64>,
+    froms: Mutex<Vec<i32>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Reply {
+    running_total: u64,
+    from: i32,
+}
+
+#[async_trait]
+impl GlobalTool for Counter {
+    type Request = u64;
+    type Response = Reply;
+    type Config = String;
+
+    async fn receive_rpc(&self, from: Tid, increment: u64) -> Reply {
+        self.froms.lock().unwrap().push(from.as_raw());
+        let mut total = self.total.lock().unwrap();
+        *total += increment;
+        Reply {
+            running_total: *total,
+            from: from.as_raw(),
+        }
+    }
+}
+
+/// Allocate a unique, short-lived socket path under the temp dir.
+fn unique_sock_path(tag: &str) -> std::path::PathBuf {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("reverie-rpc-{tag}-{}-{n}.sock", std::process::id()))
+}
+
+#[tokio::test]
+async fn aggregates_across_many_connections() {
+    let global = std::sync::Arc::new(Counter::default());
+    let path = unique_sock_path("aggregate");
+    let server = RpcServer::bind(&path, global.clone(), "cfg-value".to_string()).unwrap();
+    let server_path = server.path().to_path_buf();
+    let handle = tokio::spawn(async move { server.serve().await });
+
+    // Simulate 5 "processes", each performing 100 increments of 1 => 500 total,
+    // all landing in one shared Counter behind the coordinator.
+    let procs = 5;
+    let per_proc = 100u64;
+    for p in 0..procs {
+        let client = RpcClient::<Counter>::connect(&server_path, Tid::from_raw(p))
+            .await
+            .expect("connect");
+        // Config handshake delivered the coordinator's config to this "process".
+        assert_eq!(client.config(), "cfg-value");
+        let mut last = 0;
+        for _ in 0..per_proc {
+            let reply = client.send_rpc(1).await;
+            assert_eq!(reply.from, p);
+            last = reply.running_total;
+        }
+        // Running total is monotonic and reflects prior processes' effects too.
+        assert!(last >= per_proc);
+    }
+
+    let final_total = *global.total.lock().unwrap();
+    assert_eq!(
+        final_total,
+        procs as u64 * per_proc,
+        "all connections must aggregate into one shared global state"
+    );
+    // Every request carried its originating tid.
+    let froms = global.froms.lock().unwrap();
+    assert_eq!(froms.len(), (procs as u64 * per_proc) as usize);
+    for p in 0..procs {
+        assert_eq!(froms.iter().filter(|&&f| f == p).count(), per_proc as usize);
+    }
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn single_connection_round_trip_values() {
+    let global = std::sync::Arc::new(Counter::default());
+    let path = unique_sock_path("single");
+    let server = RpcServer::bind(&path, global.clone(), "hello".to_string()).unwrap();
+    let server_path = server.path().to_path_buf();
+    let handle = tokio::spawn(async move { server.serve().await });
+
+    let client = RpcClient::<Counter>::connect(&server_path, Tid::from_raw(7))
+        .await
+        .expect("connect");
+    assert_eq!(client.config(), "hello");
+
+    assert_eq!(
+        client.send_rpc(10).await,
+        Reply {
+            running_total: 10,
+            from: 7
+        }
+    );
+    assert_eq!(
+        client.send_rpc(5).await,
+        Reply {
+            running_total: 15,
+            from: 7
+        }
+    );
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn serve_one_then_client_disconnect_is_clean() {
+    // `serve_one` serves a single connection until the client closes it, and
+    // reports that clean close as `Ok(())`.
+    let global = std::sync::Arc::new(Counter::default());
+    let path = unique_sock_path("serveone");
+    let server = RpcServer::bind(&path, global.clone(), "x".to_string()).unwrap();
+    let server_path = server.path().to_path_buf();
+
+    let handle = tokio::spawn(async move { server.serve_one().await });
+
+    {
+        let client = RpcClient::<Counter>::connect(&server_path, Tid::from_raw(3))
+            .await
+            .expect("connect");
+        assert_eq!(client.send_rpc(4).await.running_total, 4);
+        assert_eq!(client.send_rpc(6).await.running_total, 10);
+        // Client dropped here -> connection closes -> serve_one returns Ok.
+    }
+
+    let served = handle.await.expect("server task joins");
+    assert!(
+        served.is_ok(),
+        "clean client disconnect => Ok, got {served:?}"
+    );
+    assert_eq!(*global.total.lock().unwrap(), 10);
+}
+
+#[tokio::test]
+async fn connect_to_missing_coordinator_errors() {
+    // Connecting where no coordinator is listening is a transport error, not a
+    // hang or panic.
+    let path = unique_sock_path("missing");
+    match RpcClient::<Counter>::connect(&path, Tid::from_raw(1)).await {
+        Ok(_) => panic!("connect to nonexistent socket must fail"),
+        Err(reverie_rpc_transport::RpcError::Io(_)) => {}
+        Err(other) => panic!("expected an I/O error, got {other:?}"),
+    }
+}

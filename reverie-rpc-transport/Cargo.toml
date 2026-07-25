@@ -1,0 +1,23 @@
+# NOTE: Hand-authored for the OSS/Cargo build. The internal Buck target and
+# autocargo synchronization are a follow-up (this crate did not originate from
+# Meta's internal build metadata).
+
+[package]
+name = "reverie-rpc-transport"
+version = "0.1.0"
+authors = ["Meta Platforms"]
+edition = "2021"
+repository = "https://github.com/facebookexperimental/reverie"
+license = "BSD-2-Clause"
+description = "Cross-process transport for the Reverie GlobalTool RPC (Unix-domain sockets + bincode). Shared by non-ptrace backends (DBI, KVM, ...) that must run GlobalState in a separate coordinator process."
+
+[dependencies]
+async-trait = "0.1.86"
+bincode = { version = "2", features = ["serde"] }
+reverie = { version = "0.1.0", path = "../reverie" }
+serde = { version = "1.0.219", features = ["derive"] }
+thiserror = "2.0.18"
+tokio = { version = "1.52.4", features = ["io-util", "net", "rt", "sync", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1.52.4", features = ["full", "test-util"] }
