@@ -1,15 +1,15 @@
 # reverie-sabre backend assessment
 
-Status as of 2026-07-21: the restored backend builds and runs a syscall-tracing
+Status as of 2026-07-24: the restored backend builds and runs a syscall-tracing
 demo on dynamically linked Linux x86-64 programs. This remains an experimental
-backend with a separate synchronous tool API; it is not interchangeable with
-`reverie-ptrace`.
+backend with a synchronous native API and a first-poll adapter for shared
+`reverie::Tool` implementations; it is not interchangeable with `reverie-ptrace`.
 
 ## Verified functionality
 
 - `recursion_protector.c` and `vfork_syscall.S` are vendored as regular files
   from the MIT-licensed SaBRe plugin API and compiled through Cargo.
-- `reverie-sabre` links on the current Rust toolchain and its 17 library tests
+- `reverie-sabre` links on the current Rust toolchain and its 41 library tests
   pass.
 - `riptrace-tool` builds both an `rlib` and the
   `libriptrace_plugin.so` cdylib expected by SaBRe.
@@ -24,11 +24,23 @@ backend with a separate synchronous tool API; it is not interchangeable with
   propagation have also been exercised through the demo.
 
 The opt-in `third-party/sabre` submodule and `SABRE_UPSTREAM.toml` pin
-`srg-imperial/SaBRe` commit
-`05816ee066a7284bee8afd0e73eeb44455b254b4`. That revision builds with CMake,
-Make, and GCC. Its three smoke tests pass. All 72 supported upstream tests pass
-after test-only portability adjustments for explicit PIE output and current
-`dumpkeys`/`fgconsole` exit codes; three host-dependent tests are unsupported.
+`rrnewton/SaBRe` commit
+`34065e7ddae6f1c90db7e0bf5c22a9aa89f9d605`, proposed upstream in
+`srg-imperial/SaBRe#93`. That revision builds with CMake, Make, and GCC.
+From `third-party/sabre`,
+`PATH=/tmp/sabre-lit-venv/bin:$PATH cmake --build build-default --target tests -j2`
+produced 70 passes, three unsupported tests, and the same three baseline failures:
+`dumpkeys.sh`, `fgconsole.sh`, and `test_sigill.S`. At Hermit
+`7ceec9d5263fb8e0af975f1099d098178db54510`, the L0 SaBRe gate (default log
+level, no relaxations) passed all 147 strict compatibility probes with:
+
+```bash
+cd /home/newton/work/dev-hermit/worktrees/slot126
+env HERMIT_SABRE_RUNNER=/home/newton/work/dev-hermit/worktrees_reverie/slot126/target/release/reverie-sabre-strace \
+  HERMIT_SABRE_BINARY=/home/newton/work/dev-hermit/worktrees_reverie/slot126/third-party/sabre/build-default/sabre \
+  HERMIT_SABRE_PLUGIN=/home/newton/work/dev-hermit/worktrees_reverie/slot126/target/release/libreverie_sabre_strace_plugin.so \
+  VALIDATE_GATE_TIMEOUT_SECONDS=1800 with-proxy ./validate.sh --sabre-compat-only
+```
 
 See `../riptrace/README.md` for build and run commands.
 
@@ -42,12 +54,12 @@ out-of-process ptrace backend.
 
 | Capability | `reverie-ptrace` | `reverie-sabre` |
 | --- | --- | --- |
-| Tool interface | Shared async `reverie::Tool` and `Guest` | Separate synchronous `reverie_sabre::Tool` |
+| Tool interface | Shared async `reverie::Tool` and `Guest` | Synchronous `reverie_sabre::Tool`, plus a first-poll `ReverieAdapter` subset |
 | Syscall execution | Guest injection and tail injection | Direct in-process syscall execution |
 | Guest memory | Remote memory abstraction | Direct `LocalMemory` access |
 | Registers and stack | Read/write APIs | No tool-facing equivalent |
 | Global state | Async typed global tool | Blocking generated RPC client/service |
-| Thread state | Typed tool-defined state | Internal runtime records and lifecycle IDs |
+| Thread state | Typed tool-defined state | Native runtime records; the adapter supplies typed `T::ThreadState` |
 | Signals | Tool can influence delivery | Notification only |
 | Event selection | Subscription filters | No shared subscription contract |
 | CPU and lifecycle events | CPUID, RDTSC, exec, timers, exits | RDTSC, VDSO, function detours, partial lifecycle |
@@ -59,11 +71,11 @@ out-of-process ptrace backend.
   Reverie plugin and host command.
 - Only the pinned loader revision and dynamically linked x86-64 guests are
   validated. Static executables are unsupported by upstream SaBRe.
-- The backend has no adapter for the shared Reverie `Tool`/`Guest`
-  abstractions, so ptrace tools cannot switch backends by recompiling.
-- Exec is deliberately rejected before image replacement because SaBRe cannot
-  yet preserve kernel failure semantics while reinjecting the loader. Signals,
-  clone/vfork, VDSO calls, and detours still need broader end-to-end coverage.
+- `ReverieAdapter` can run a shared `reverie::Tool` only when each handler
+  completes on its first poll. `Guest::tail_inject` is the sole supported
+  suspension; other pending futures fail with `EIO`.
+- `execve` re-enters the pinned loader, but `execveat`, static executables,
+  clone/vfork stress, VDSO calls, and detours need broader coverage.
 - RPC is synchronous and reserves guest file descriptor 100. Trace formatting
   performs allocations and an RPC operation in the injected process.
 - The restored runtime should not yet be treated as a production isolation

@@ -4,7 +4,7 @@
 	shallow = true
 [submodule "third-party/sabre"]
 	path = third-party/sabre
-	url = https://github.com/srg-imperial/SaBRe.git
+	url = https://github.com/rrnewton/SaBRe.git
 	update = none
 	shallow = true
 [submodule "third-party/e9patch"]

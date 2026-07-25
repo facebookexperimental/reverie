@@ -64,8 +64,9 @@ cargo test -p reverie-sabre
 
 ## Known limitations
 
-- The SaBRe backend has a separate synchronous `reverie_sabre::Tool` API.
-  Existing async `reverie::Tool` implementations cannot switch backends.
+- The SaBRe backend has a synchronous `reverie_sabre::Tool` API and a
+  `ReverieAdapter` subset for shared tools whose handlers complete on the first
+  poll. Only `Guest::tail_inject` may suspend; other pending futures fail.
 - Thread observation is callback-driven. A native thread that never reaches an
   intercepted runtime boundary has no backend record. Join itself is kernel
   behavior, not a distinct SaBRe tool event.

@@ -41,6 +41,8 @@ activate() {
     local path
     path="$(backend_path "$backend")" || usage
 
+    git -C "$root" submodule sync -- "$path"
+
     git -C "$root" \
         -c "submodule.${path}.update=checkout" \
         submodule update --init --checkout --depth 1 --recursive -- "$path"
