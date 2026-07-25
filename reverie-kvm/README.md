@@ -28,6 +28,15 @@ to its caller; it does not yet translate them into Linux signals.
 
 `run_static_elf` supplies a deliberately small Linux personality. It handles process exit, host-backed filesystem descriptors, stdout/stderr writes, deterministic identity, time and random queries, FS/GS bases, `brk`, anonymous and file-backed `mmap`, and common startup no-ops. Unsupported syscalls return `ENOSYS`.
 
+The host-backed filesystem layer includes descriptor duplication, file and
+filesystem metadata, permission and timestamp updates, and bounded
+create/link/rename/unlink operations. A virtual umask is applied to creation
+modes before they are forwarded to the host. The executor also persists signal
+actions, masks, and alternate-stack configuration even though asynchronous
+signal delivery remains outside the current process model. `mincore`, `getcpu`,
+`sched_getaffinity`, and `membarrier` report the deterministic single-vCPU
+topology.
+
 The process personality implements `fork`, `vfork`, process-only `clone`/`clone3`,
 `execve`/`execveat`, and `wait4`. Forked children receive an independent guest
 RAM snapshot and fresh VM/vCPU, inherit duplicated host file descriptions, and
@@ -70,9 +79,13 @@ No gVisor code is copied. Unlike the gVisor Sentry VFS and `pkg/sentry/fsimpl/` 
 ## Current limits
 
 This crate is not a complete Linux execution backend. Each process has one vCPU
-and fixed-address identity mappings; thread-clone flags, signals, concurrent
-process scheduling, and page-permission enforcement remain unsupported. Filesystem access forwards into the host namespace with bounded memory copies and a guest-owned descriptor table; it does not isolate or snapshot host filesystem changes. The current hypercall transport also reuses standardized KVM
-hypercall 12 because it is the only hypercall KVM exposes to userspace; that
-prototype ABI must be replaced before running a stock guest kernel.
+and fixed-address identity mappings; thread-clone flags, asynchronous signal
+delivery, concurrent process scheduling, and page-permission enforcement remain
+unsupported. Filesystem access forwards into the host namespace with bounded
+memory copies and a guest-owned descriptor table; it does not isolate or
+snapshot host filesystem changes. The current hypercall transport also reuses
+standardized KVM hypercall 12 because it is the only hypercall KVM exposes to
+userspace; that prototype ABI must be replaced before running a stock guest
+kernel.
 
 The ELF loader supports one host interpreter and enough file-backed mapping for small dynamically linked programs. General libc coverage remains bounded by the explicit syscall personality; unsupported operations fail with `ENOSYS` rather than silently bypassing the tool.

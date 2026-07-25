@@ -71,6 +71,10 @@ pub(crate) struct LoadedStaticElf {
     pub gs_base: u64,
     pub pid: i32,
     pub ppid: i32,
+    pub umask: libc::mode_t,
+    pub signal_actions: std::collections::BTreeMap<i32, [u8; 32]>,
+    pub signal_mask: [u8; 8],
+    pub signal_alt_stack: Option<Vec<u8>>,
     pub files: std::collections::BTreeMap<i32, std::fs::File>,
     pub closed_standard_fds: std::collections::BTreeSet<i32>,
     pub children: std::collections::BTreeMap<i32, i32>,
@@ -103,6 +107,10 @@ impl LoadedStaticElf {
             gs_base: self.gs_base,
             pid: child_pid,
             ppid: self.pid,
+            umask: self.umask,
+            signal_actions: self.signal_actions.clone(),
+            signal_mask: self.signal_mask,
+            signal_alt_stack: self.signal_alt_stack.clone(),
             files,
             closed_standard_fds: self.closed_standard_fds.clone(),
             children: std::collections::BTreeMap::new(),
@@ -115,6 +123,8 @@ impl LoadedStaticElf {
         self.stdin = previous.stdin;
         self.pid = previous.pid;
         self.ppid = previous.ppid;
+        self.umask = previous.umask;
+        self.signal_mask = previous.signal_mask;
         self.files = previous.files;
         self.closed_standard_fds = previous.closed_standard_fds;
         self.children = previous.children;
@@ -241,6 +251,10 @@ pub(crate) fn load_static_elf(
         gs_base: 0,
         pid: 1,
         ppid: 0,
+        umask: 0o022,
+        signal_actions: std::collections::BTreeMap::new(),
+        signal_mask: [0; 8],
+        signal_alt_stack: None,
         files: std::collections::BTreeMap::new(),
         closed_standard_fds: std::collections::BTreeSet::new(),
         children: std::collections::BTreeMap::new(),

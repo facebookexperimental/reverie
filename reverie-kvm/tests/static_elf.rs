@@ -8,6 +8,7 @@
 
 #![cfg(target_arch = "x86_64")]
 
+use std::os::unix::fs::FileTypeExt;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
@@ -51,6 +52,42 @@ impl Drop for TestExecutable {
     fn drop(&mut self) {
         std::fs::remove_file(&self.0).unwrap();
     }
+}
+
+struct TestDirectory(PathBuf);
+
+impl TestDirectory {
+    fn new() -> Self {
+        let id = NEXT_TEST_EXECUTABLE.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("reverie-kvm-coreutils-{}-{id}", std::process::id()));
+        std::fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).unwrap();
+    }
+}
+
+fn run_host_program(program: &str, argv: &[&str], cwd: &std::path::Path) {
+    const REAL_PROGRAM_MEMORY_SIZE: usize = 256 * 1024 * 1024;
+
+    let image = std::fs::read(program).unwrap();
+    let mut backend = KvmBackend::new(REAL_PROGRAM_MEMORY_SIZE).unwrap();
+    backend
+        .install_static_elf_with_context(&image, argv, &[], cwd)
+        .unwrap();
+    let (code, stdout, stderr) = backend.run_static_elf_captured().unwrap();
+    assert_eq!(
+        code,
+        0,
+        "{program} {argv:?} exited {code}; stdout={}; stderr={}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr),
+    );
 }
 
 #[derive(Default)]
@@ -308,6 +345,54 @@ fn static_elf_forks_execs_and_waits_for_child() {
     assert_eq!(code, 0);
     assert_eq!(stdout, message);
     assert!(stderr.is_empty());
+}
+
+#[test]
+fn real_coreutils_complete_file_mutation_workflow() {
+    match Kvm::new() {
+        Ok(_) => {}
+        Err(error) if kvm_is_unavailable(&error) => {
+            eprintln!("skipping KVM coreutils test: cannot open /dev/kvm: {error}");
+            return;
+        }
+        Err(error) => panic!("failed to probe /dev/kvm: {error}"),
+    }
+
+    let root = TestDirectory::new();
+    std::fs::write(root.0.join("source"), b"payload\n").unwrap();
+
+    run_host_program("/bin/mkdir", &["mkdir", "directory"], &root.0);
+    run_host_program("/usr/bin/touch", &["touch", "touched"], &root.0);
+    run_host_program("/bin/chmod", &["chmod", "600", "touched"], &root.0);
+    run_host_program("/bin/ln", &["ln", "source", "hard-link"], &root.0);
+    run_host_program("/bin/ln", &["ln", "-s", "source", "symbolic-link"], &root.0);
+    run_host_program("/bin/mv", &["mv", "hard-link", "renamed"], &root.0);
+    run_host_program("/usr/bin/mkfifo", &["mkfifo", "fifo"], &root.0);
+    run_host_program(
+        "/usr/bin/install",
+        &["install", "-m", "700", "source", "installed"],
+        &root.0,
+    );
+    run_host_program("/bin/rm", &["rm", "renamed"], &root.0);
+
+    assert!(root.0.join("directory").is_dir());
+    assert_eq!(std::fs::read(root.0.join("source")).unwrap(), b"payload\n");
+    assert!(root.0.join("touched").is_file());
+    assert_eq!(
+        std::fs::read_link(root.0.join("symbolic-link")).unwrap(),
+        std::path::Path::new("source")
+    );
+    assert!(
+        std::fs::symlink_metadata(root.0.join("fifo"))
+            .unwrap()
+            .file_type()
+            .is_fifo()
+    );
+    assert_eq!(
+        std::fs::read(root.0.join("installed")).unwrap(),
+        b"payload\n"
+    );
+    assert!(!root.0.join("renamed").exists());
 }
 
 #[test]
