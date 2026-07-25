@@ -40,6 +40,7 @@ mod debug;
 pub mod decoder;
 mod error;
 mod gdbstub;
+mod injected_syscall;
 mod perf;
 pub mod regs;
 mod stack;

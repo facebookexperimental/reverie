@@ -15,7 +15,7 @@ use nix::unistd::Pid;
 use super::consts::*;
 
 /// generate syscall instructions at injected page
-/// the page address should be 0x7000_0000 (PRIVATE_PAGE_OFFSET)
+/// the page address should be `PRIVATE_PAGE_OFFSET`
 /// the byte code can be confirmed by running objcopy
 /// x86_64-linux-gnu-objcopy -I binary /tmp/1.bin -O elf64-x86-64 -B i386:x86-64 /tmp/1.elf
 /// then objdump -d 1.elf must match the instructions listed below.

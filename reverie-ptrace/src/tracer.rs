@@ -50,6 +50,7 @@ use crate::cp;
 use crate::gdbstub::GdbServer;
 use crate::task::Child;
 use crate::task::TracedTask;
+use crate::task::TracedTaskOptions;
 
 /// Represents the tracer.
 ///
@@ -330,6 +331,7 @@ async fn postspawn<L: Tool + 'static>(
     gref: Arc<L::GlobalState>,
     config: <L::GlobalState as GlobalTool>::Config,
     events: &Subscription,
+    injected_syscall_marker: Option<u64>,
     gdbserver: Option<GdbServer>,
 ) -> Result<BoxFuture<'static, Result<ExitStatus, Error>>, TraceError> {
     let pid = child.pid();
@@ -366,7 +368,10 @@ async fn postspawn<L: Tool + 'static>(
         pid,
         config,
         gref,
-        events,
+        TracedTaskOptions {
+            events,
+            injected_syscall_marker,
+        },
         orphan_sender,
         daemon_kill,
         gdbserver,
@@ -446,6 +451,9 @@ pub struct TracerBuilder<T: Tool + 'static> {
     /// Indicates that the guest's scheduling will be serialized by the Reverie
     /// tool. This is only relevant for the GDB server.
     sequentialized_guest: bool,
+
+    /// Magic value placed in RAX by an injected syscall trap, when enabled.
+    injected_syscall_marker: Option<u64>,
 }
 
 impl<T: Tool + 'static> TracerBuilder<T> {
@@ -456,6 +464,7 @@ impl<T: Tool + 'static> TracerBuilder<T> {
             config: None,
             gdbserver: None,
             sequentialized_guest: false,
+            injected_syscall_marker: None,
         }
     }
 
@@ -484,6 +493,17 @@ impl<T: Tool + 'static> TracerBuilder<T> {
     /// sequentializes thread execution. This helps avoid deadlocks.
     pub fn sequentialized_guest(mut self) -> Self {
         self.sequentialized_guest = true;
+        self
+    }
+
+    /// Routes matching `SIGTRAP` stops through `Tool::handle_syscall_event`.
+    ///
+    /// A binary rewriter must place `marker` in RAX, an e9tool-compatible
+    /// writable `state` frame pointer in RDI, and then execute `int3`. All
+    /// other traps retain their normal signal/debugger semantics.
+    // TODO-HUMAN-REVIEW(PR-102): Review the injected syscall event ABI.
+    pub fn injected_syscall_trap(mut self, marker: u64) -> Self {
+        self.injected_syscall_marker = Some(marker);
         self
     }
 
@@ -542,11 +562,19 @@ impl<T: Tool + 'static> TracerBuilder<T> {
             }
         };
 
-        let tracer =
-            match postspawn::<T>(running_child, gref.clone(), config, &events, gdbserver).await {
-                Ok(tracer) => tracer,
-                Err(err) => return Err(initialization_error(guest_pid, err).await),
-            };
+        let tracer = match postspawn::<T>(
+            running_child,
+            gref.clone(),
+            config,
+            &events,
+            self.injected_syscall_marker,
+            gdbserver,
+        )
+        .await
+        {
+            Ok(tracer) => tracer,
+            Err(err) => return Err(initialization_error(guest_pid, err).await),
+        };
 
         let stdin = child.stdin.take();
         let stdout = child.stdout.take();
@@ -667,10 +695,11 @@ where
 
             let stdout = read1.into();
             let stderr = read2.into();
-            let tracer = match postspawn::<L>(child, gref.clone(), config, &events, None).await {
-                Ok(tracer) => tracer,
-                Err(err) => return Err(initialization_error(guest_pid, err).await),
-            };
+            let tracer =
+                match postspawn::<L>(child, gref.clone(), config, &events, None, None).await {
+                    Ok(tracer) => tracer,
+                    Err(err) => return Err(initialization_error(guest_pid, err).await),
+                };
 
             Ok(Tracer {
                 guest_pid,

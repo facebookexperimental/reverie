@@ -78,6 +78,7 @@ use crate::gdbstub::ResumeInferior;
 use crate::gdbstub::StopEvent;
 use crate::gdbstub::StopReason;
 use crate::gdbstub::StoppedInferior;
+use crate::injected_syscall::InjectedSyscallFrame;
 use crate::regs::Reg;
 use crate::regs::RegAccess;
 use crate::stack::GuestStack;
@@ -170,6 +171,9 @@ struct GlobalState<G: GlobalTool> {
     /// guests are sequentialized already (by detcore for example), gdbserver
     /// should avoid sequentialize threads.
     sequentialized_guest: Arc<bool>,
+
+    /// Magic RAX value identifying a binary-rewriter syscall trap.
+    injected_syscall_marker: Option<u64>,
 }
 
 impl<G: GlobalTool> Clone for GlobalState<G> {
@@ -179,8 +183,15 @@ impl<G: GlobalTool> Clone for GlobalState<G> {
             gs_ref: self.gs_ref.clone(),
             subscriptions: self.subscriptions.clone(),
             sequentialized_guest: self.sequentialized_guest.clone(),
+            injected_syscall_marker: self.injected_syscall_marker,
         }
     }
+}
+
+/// Event configuration supplied when a traced task is created.
+pub(crate) struct TracedTaskOptions<'a> {
+    pub(crate) events: &'a Subscription,
+    pub(crate) injected_syscall_marker: Option<u64>,
 }
 
 /// Our runtime representation of what Reverie knows about a guest thread. Its
@@ -210,6 +221,9 @@ pub struct TracedTask<L: Tool> {
 
     /// Set to `Some` if the syscall has not been injected yet. `None` if it has.
     pending_syscall: Option<(Sysno, SyscallArgs)>,
+
+    /// Address of the writable e9tool register frame for the active event.
+    injected_syscall_frame: Option<usize>,
 
     /// pending signal to deliver. This can happen when
     /// syscall got interrupted (by signal)
@@ -335,11 +349,11 @@ impl<L: Tool> fmt::Debug for TracedTask<L> {
 
 impl<L: Tool> TracedTask<L> {
     /// Create a new TracedTask.
-    pub fn new(
+    pub(crate) fn new(
         tid: Pid,
         cfg: <L::GlobalState as GlobalTool>::Config,
         gs_ref: Arc<L::GlobalState>,
-        events: &Subscription,
+        options: TracedTaskOptions<'_>,
         orphanage: mpsc::Sender<Child>,
         daemon_kill_switch: broadcast::Sender<()>,
         mut gdbserver: Option<GdbServer>,
@@ -348,13 +362,14 @@ impl<L: Tool> TracedTask<L> {
         let global_state = GlobalState {
             gs_ref,
             cfg,
-            subscriptions: Arc::new(events.clone()),
+            subscriptions: Arc::new(options.events.clone()),
             sequentialized_guest: Arc::new(
                 gdbserver
                     .as_ref()
                     .map(|s| s.sequentialized_guest)
                     .unwrap_or(false),
             ),
+            injected_syscall_marker: options.injected_syscall_marker,
         };
         let thread_state = process_state.init_thread_state(tid, None);
         let (next_state, next_state_rx) = mpsc::channel(1);
@@ -371,6 +386,7 @@ impl<L: Tool> TracedTask<L> {
             global_state,
             has_cpuid_interception: false,
             pending_syscall: None,
+            injected_syscall_frame: None,
             next_state,
             next_state_rx: Some(next_state_rx),
             timer: Timer::new(tid, tid),
@@ -426,6 +442,7 @@ impl<L: Tool> TracedTask<L> {
             global_state,
             has_cpuid_interception: self.has_cpuid_interception,
             pending_syscall: None,
+            injected_syscall_frame: None,
             next_state,
             next_state_rx: Some(next_state_rx),
             timer: Timer::new(self.pid, child),
@@ -478,6 +495,7 @@ impl<L: Tool> TracedTask<L> {
             global_state: self.global_state.clone(),
             has_cpuid_interception: self.has_cpuid_interception,
             pending_syscall: None,
+            injected_syscall_frame: None,
             next_state,
             next_state_rx: Some(next_state_rx),
             timer: Timer::new(child, child),
@@ -508,6 +526,61 @@ impl<L: Tool> TracedTask<L> {
             needs_step_over: Arc::new(Mutex::new(())),
             suspended_tasks: BTreeMap::new(),
             stack_checked_out: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn read_injected_syscall_frame(
+        &self,
+        task: &Stopped,
+        address: usize,
+    ) -> Result<InjectedSyscallFrame, TraceError> {
+        let address = Addr::from_raw(address).ok_or(Errno::EFAULT)?;
+        Ok(task.read_value(address)?)
+    }
+
+    fn write_injected_syscall_frame(
+        &self,
+        task: &Stopped,
+        address: usize,
+        frame: &InjectedSyscallFrame,
+    ) -> Result<(), TraceError> {
+        let address = AddrMut::from_raw(address).ok_or(Errno::EFAULT)?;
+        let mut task = Stopped::new_unchecked(task.pid());
+        Ok(task.write_value(address, frame)?)
+    }
+
+    fn write_injected_syscall_result(
+        &self,
+        task: &Stopped,
+        result: Result<i64, Errno>,
+    ) -> Result<(), TraceError> {
+        let address = self.injected_syscall_frame.ok_or(Errno::EIO)?;
+        let mut frame = self.read_injected_syscall_frame(task, address)?;
+        let result = result.unwrap_or_else(|errno| -(errno.into_raw() as i64));
+        frame.set_result(result);
+        self.write_injected_syscall_frame(task, address, &frame)
+    }
+
+    fn read_guest_registers(&self, task: &Stopped) -> Result<libc::user_regs_struct, TraceError> {
+        let mut regs = task.getregs()?;
+        if let Some(address) = self.injected_syscall_frame {
+            let frame = self.read_injected_syscall_frame(task, address)?;
+            frame.copy_to_user_regs(&mut regs);
+        }
+        Ok(regs)
+    }
+
+    fn write_guest_registers(
+        &self,
+        task: &Stopped,
+        regs: &libc::user_regs_struct,
+    ) -> Result<(), TraceError> {
+        if let Some(address) = self.injected_syscall_frame {
+            let mut frame = self.read_injected_syscall_frame(task, address)?;
+            frame.copy_from_user_regs(regs);
+            self.write_injected_syscall_frame(task, address, &frame)
+        } else {
+            task.setregs(regs)
         }
     }
 
@@ -1020,11 +1093,89 @@ impl<L: Tool + 'static> TracedTask<L> {
         None
     }
 
+    async fn handle_injected_syscall(
+        &mut self,
+        task: Stopped,
+        frame_address: usize,
+        trap_rflags: u64,
+    ) -> Result<Wait, TraceError> {
+        let mut frame = self.read_injected_syscall_frame(&task, frame_address)?;
+        let syscall = frame.syscall();
+        let (nr, args) = syscall.into_parts();
+        frame.emulate_syscall_entry(trap_rflags);
+        self.write_injected_syscall_frame(&task, frame_address, &frame)?;
+
+        if !self
+            .global_state
+            .subscriptions
+            .iter_syscalls()
+            .any(|subscribed| subscribed == nr)
+        {
+            self.injected_syscall_frame = Some(frame_address);
+            let result = self.untraced_syscall(task, nr, args).await?;
+            let task = self.assume_stopped();
+            self.write_injected_syscall_result(&task, result)?;
+            self.injected_syscall_frame = None;
+            return task.resume(self.pending_signal.take())?.next_state().await;
+        }
+
+        let span = tracing::trace_span!(
+            target: "reverie_ptrace::syscall",
+            "syscall.intercept",
+            tid = %self.tid(),
+            syscall = %nr,
+            args = ?args,
+            source = "injected-trap",
+        );
+
+        async {
+            self.injected_syscall_frame = Some(frame_address);
+            self.pending_syscall = Some((nr, args));
+
+            let retval = cancellable(self.cancel_handler.clone(), async {
+                self.process_state
+                    .clone()
+                    .handle_syscall_event(self, syscall)
+                    .await
+            })
+            .await;
+
+            self.timer.finalize_requests();
+
+            if let Some(retval) = retval {
+                let result = match retval {
+                    Ok(value) => value,
+                    Err(error) => -(error.into_errno().unwrap_or(Errno::EIO).into_raw() as i64),
+                };
+                self.write_injected_syscall_result(&task, Ok(result))?;
+            }
+
+            self.pending_syscall = None;
+            self.injected_syscall_frame = None;
+            let signal = self.pending_signal.take();
+            let wait = task.resume(signal)?.next_state().await?;
+            tracing::trace!(
+                target: "reverie_ptrace::syscall",
+                "completed injected syscall interception"
+            );
+            Ok(wait)
+        }
+        .instrument(span)
+        .await
+    }
+
     async fn handle_sigtrap(&mut self, task: Stopped) -> Result<HandleSignalResult, TraceError> {
         let resumed_by_gdb_step = self
             .resumed_by_gdb
             .is_some_and(|action| matches!(action, ResumeAction::Step(_)));
         let mut regs = task.getregs()?;
+        if self.global_state.injected_syscall_marker == Some(regs.rax) {
+            let next_state = self
+                .handle_injected_syscall(task, regs.rdi as usize, regs.eflags)
+                .await?;
+            return Ok(HandleSignalResult::SignalSuppressed(next_state));
+        }
+
         let rip_minus_one = regs.ip() - 1;
 
         Ok(if self.breakpoints.contains_key(&rip_minus_one) {
@@ -1865,8 +2016,8 @@ impl<L: Tool + 'static> TracedTask<L> {
                 Event::Signal(sig) => {
                     let mut regs = stopped.getregs()?;
                     // NB: it is possible to get interrupted by signal (such as
-                    // SIGCHLD) before single step finishes (in that case rip ==
-                    // 0x7000_0000u64).
+                    // SIGCHLD) before single step finishes, while RIP still
+                    // points at the private page.
                     debug_assert!(
                         regs.ip() as usize == cp::PRIVATE_PAGE_OFFSET + cp::SYSCALL_INSTR_SIZE
                             || regs.ip() as usize == cp::PRIVATE_PAGE_OFFSET
@@ -1927,7 +2078,10 @@ impl<L: Tool + 'static> TracedTask<L> {
             args,
         );
 
-        if self.pending_syscall.take() == Some((nr, args)) {
+        if self.injected_syscall_frame.is_some() {
+            self.pending_syscall = None;
+            self.untraced_syscall(task, nr, args).await
+        } else if self.pending_syscall.take() == Some((nr, args)) {
             // If we're reinjecting the same syscall with the same arguments,
             // then we can just let the tracee continue and stop at sysexit.
             let wait = task.syscall(None)?.next_state().await?;
@@ -1962,6 +2116,14 @@ impl<L: Tool + 'static> TracedTask<L> {
         );
 
         let task = self.assume_stopped();
+
+        if self.injected_syscall_frame.is_some() {
+            self.pending_syscall = None;
+            let result = self.untraced_syscall(task, nr, args).await?;
+            let task = self.assume_stopped();
+            self.write_injected_syscall_result(&task, result)?;
+            return Ok(result);
+        }
 
         if self.pending_syscall.take() == Some((nr, args)) {
             // We're reinjecting the same syscall with the same arguments.
@@ -2407,7 +2569,7 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
     async fn regs(&mut self) -> libc::user_regs_struct {
         let task = self.assume_stopped();
 
-        match task.getregs() {
+        match self.read_guest_registers(&task) {
             Ok(ret) => ret,
             Err(err) => self.abort(Err(err)).await,
         }
@@ -2416,7 +2578,7 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
     async fn set_regs(&mut self, regs: libc::user_regs_struct) -> Result<(), reverie::Error> {
         let task = self.assume_stopped();
 
-        if let Err(err) = task.setregs(&regs) {
+        if let Err(err) = self.write_guest_registers(&task, &regs) {
             // Mirror `regs()`: a ptrace register access failure aborts the task.
             self.abort(Err(err)).await;
         }

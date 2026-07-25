@@ -46,6 +46,8 @@ pub const E9TOOL_ENV: &str = "REVERIE_E9TOOL";
 // TODO-HUMAN-REVIEW(PR-101): Review the public external-tool override.
 pub const E9PATCH_BACKEND_ENV: &str = "REVERIE_E9PATCH_BACKEND";
 
+const SYSCALL_TRAP_PATCH: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/reverie-e9patch-syscall-trap"));
 const E9PATCH_LOADER_BASE: u64 = 0x20e9_e9000;
 
 /// Auditable, digest-bound information about one e9patch preparation.
@@ -195,10 +197,12 @@ impl E9patchRewriter {
         let input_snapshot = temporary.path().join("input.elf");
         let e9tool_snapshot = temporary.path().join("e9tool");
         let e9patch_snapshot = temporary.path().join("e9patch");
+        let syscall_trap_patch = temporary.path().join("syscall-trap");
         let output = temporary.path().join("output.elf");
         write_snapshot(&input_snapshot, &input_bytes, input_mode)?;
         write_snapshot(&e9tool_snapshot, &e9tool_bytes, e9tool_mode)?;
         write_snapshot(&e9patch_snapshot, &e9patch_bytes, e9patch_mode)?;
+        write_snapshot(&syscall_trap_patch, SYSCALL_TRAP_PATCH, 0o644)?;
 
         let mut tool = ProcessCommand::new(&e9tool_snapshot);
         tool.stdin(Stdio::null());
@@ -210,7 +214,10 @@ impl E9patchRewriter {
             .arg("-M")
             .arg("asm=\"syscall\"")
             .arg("-P")
-            .arg("before empty")
+            .arg(format!(
+                "replace reverie_e9patch_syscall(state)@{}",
+                syscall_trap_patch.display()
+            ))
             .arg(&input_snapshot)
             .arg("-o")
             .arg(&output);
