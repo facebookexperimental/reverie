@@ -212,6 +212,7 @@ impl E9patchRewriter {
             .arg("--option=--tactic-B0=false")
             .arg("-O0")
             .arg("-M")
+            // AUTONOMOUS-BOT-IMPLEMENTED
             .arg("asm=\"syscall\"")
             .arg("-P")
             .arg(format!(

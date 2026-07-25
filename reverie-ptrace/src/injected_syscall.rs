@@ -8,6 +8,7 @@
 
 //! Register-frame support for syscall events injected by a binary rewriter.
 
+use reverie::Errno;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallArgs;
 use reverie::syscalls::Sysno;
@@ -16,6 +17,7 @@ use reverie::syscalls::Sysno;
 ///
 /// The frame is private to the ptrace controller. Backends opt into the event
 /// ABI with [`crate::TracerBuilder::injected_syscall_trap`].
+// TODO-HUMAN-REVIEW(PR-102): Review the e9tool state-frame syscall ABI.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(C)]
 pub(crate) struct InjectedSyscallFrame {
@@ -107,6 +109,28 @@ impl InjectedSyscallFrame {
         regs.rsp = self.rsp;
         regs.rip = self.rip + 2;
         regs.eflags = self.native_rflags(regs.eflags);
+    }
+    // TODO-HUMAN-REVIEW(PR-103): Review representable rewritten-register updates.
+    pub(crate) fn validate_user_regs_update(
+        current: &libc::user_regs_struct,
+        requested: &libc::user_regs_struct,
+    ) -> Result<(), Errno> {
+        let unsupported = current.orig_rax != requested.orig_rax
+            || current.rip != requested.rip
+            || current.cs != requested.cs
+            || current.ss != requested.ss
+            || current.ds != requested.ds
+            || current.es != requested.es
+            || current.fs != requested.fs
+            || current.gs != requested.gs
+            || current.fs_base != requested.fs_base
+            || current.gs_base != requested.gs_base
+            || (current.eflags ^ requested.eflags) & !Self::STATUS_RFLAGS != 0;
+        if unsupported {
+            Err(Errno::ENOTSUPP)
+        } else {
+            Ok(())
+        }
     }
 
     pub(crate) fn copy_from_user_regs(&mut self, regs: &libc::user_regs_struct) {
@@ -227,5 +251,19 @@ mod tests {
         assert_eq!(frame.rdi, 42);
         assert_eq!(frame.rip, 0x401000);
         assert_eq!(frame.flags, InjectedSyscallFrame::FLAGS_CF);
+    }
+
+    #[test]
+    fn rejects_register_updates_the_e9_frame_cannot_represent() {
+        let frame = frame();
+        let mut current = unsafe { core::mem::zeroed::<libc::user_regs_struct>() };
+        current.eflags = 0x202;
+        frame.copy_to_user_regs(&mut current);
+        let mut requested = current;
+        requested.rip += 4;
+        assert_eq!(
+            InjectedSyscallFrame::validate_user_regs_update(&current, &requested),
+            Err(Errno::ENOTSUPP)
+        );
     }
 }

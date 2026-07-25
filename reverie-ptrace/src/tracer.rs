@@ -49,6 +49,7 @@ use tokio::sync::mpsc;
 use crate::cp;
 use crate::gdbstub::GdbServer;
 use crate::task::Child;
+use crate::task::InjectedSyscallTrap;
 use crate::task::TracedTask;
 use crate::task::TracedTaskOptions;
 
@@ -331,7 +332,7 @@ async fn postspawn<L: Tool + 'static>(
     gref: Arc<L::GlobalState>,
     config: <L::GlobalState as GlobalTool>::Config,
     events: &Subscription,
-    injected_syscall_marker: Option<u64>,
+    injected_syscall_trap: Option<InjectedSyscallTrap>,
     gdbserver: Option<GdbServer>,
 ) -> Result<BoxFuture<'static, Result<ExitStatus, Error>>, TraceError> {
     let pid = child.pid();
@@ -370,7 +371,7 @@ async fn postspawn<L: Tool + 'static>(
         gref,
         TracedTaskOptions {
             events,
-            injected_syscall_marker,
+            injected_syscall_trap,
         },
         orphan_sender,
         daemon_kill,
@@ -452,8 +453,8 @@ pub struct TracerBuilder<T: Tool + 'static> {
     /// tool. This is only relevant for the GDB server.
     sequentialized_guest: bool,
 
-    /// Magic value placed in RAX by an injected syscall trap, when enabled.
-    injected_syscall_marker: Option<u64>,
+    /// Marker and exact RIP identifying an injected syscall trap, when enabled.
+    injected_syscall_trap: Option<InjectedSyscallTrap>,
 }
 
 impl<T: Tool + 'static> TracerBuilder<T> {
@@ -464,7 +465,7 @@ impl<T: Tool + 'static> TracerBuilder<T> {
             config: None,
             gdbserver: None,
             sequentialized_guest: false,
-            injected_syscall_marker: None,
+            injected_syscall_trap: None,
         }
     }
 
@@ -499,11 +500,11 @@ impl<T: Tool + 'static> TracerBuilder<T> {
     /// Routes matching `SIGTRAP` stops through `Tool::handle_syscall_event`.
     ///
     /// A binary rewriter must place `marker` in RAX, an e9tool-compatible
-    /// writable `state` frame pointer in RDI, and then execute `int3`. All
-    /// other traps retain their normal signal/debugger semantics.
-    // TODO-HUMAN-REVIEW(PR-102): Review the injected syscall event ABI.
-    pub fn injected_syscall_trap(mut self, marker: u64) -> Self {
-        self.injected_syscall_marker = Some(marker);
+    /// writable `state` frame pointer in RDI, and execute `int3` at `rip - 1`.
+    /// All other traps retain their normal signal/debugger semantics.
+    // TODO-HUMAN-REVIEW(PR-103): Review the injected syscall event provenance API.
+    pub fn injected_syscall_trap(mut self, marker: u64, rip: u64) -> Self {
+        self.injected_syscall_trap = Some(InjectedSyscallTrap { marker, rip });
         self
     }
 
@@ -567,7 +568,7 @@ impl<T: Tool + 'static> TracerBuilder<T> {
             gref.clone(),
             config,
             &events,
-            self.injected_syscall_marker,
+            self.injected_syscall_trap,
             gdbserver,
         )
         .await

@@ -11,6 +11,7 @@
  * ptrace lifecycle controller recognizes the magic RAX value at this int3 and
  * handles the original syscall using that frame.
  */
+// TODO-HUMAN-REVIEW(PR-102): Review the rewritten-syscall trap payload.
 __attribute__((naked)) void
 reverie_e9patch_syscall(void *state __attribute__((unused))) {
   __asm__ volatile("movabs $0x7265766539653970, %rax\n\t"

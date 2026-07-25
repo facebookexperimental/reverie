@@ -31,6 +31,10 @@ pub use rewrite::RewriteReport;
 // TODO-HUMAN-REVIEW(PR-102): Review the public injected-event ABI marker.
 pub const E9PATCH_SYSCALL_TRAP_MARKER: u64 = 0x7265_7665_3965_3970;
 
+/// Continuation RIP immediately after the e9patch payload's `int3`.
+// TODO-HUMAN-REVIEW(PR-103): Review the fixed e9patch payload trap address.
+pub const E9PATCH_SYSCALL_TRAP_RIP: u64 = 0x7000_100b;
+
 // TODO-HUMAN-REVIEW(PR-95): Review the public e9patch source identity API.
 /// Git revision of the e9patch source pinned in `third-party/e9patch`.
 pub const E9PATCH_SOURCE_REVISION: &str = "6c2c03c1da74b14daf1788a9f8dccfa354ce04a6";

@@ -156,6 +156,11 @@ enum HandleSignalResult {
     /// signal needs to be delivered.
     SignalToDeliver(Stopped, Signal),
 }
+#[derive(Clone, Copy)]
+pub(crate) struct InjectedSyscallTrap {
+    pub(crate) marker: u64,
+    pub(crate) rip: u64,
+}
 
 /// All the info needed to be able to interact with the global state.
 struct GlobalState<G: GlobalTool> {
@@ -172,8 +177,8 @@ struct GlobalState<G: GlobalTool> {
     /// should avoid sequentialize threads.
     sequentialized_guest: Arc<bool>,
 
-    /// Magic RAX value identifying a binary-rewriter syscall trap.
-    injected_syscall_marker: Option<u64>,
+    /// Marker and exact RIP identifying a binary-rewriter syscall trap.
+    injected_syscall_trap: Option<InjectedSyscallTrap>,
 }
 
 impl<G: GlobalTool> Clone for GlobalState<G> {
@@ -183,7 +188,7 @@ impl<G: GlobalTool> Clone for GlobalState<G> {
             gs_ref: self.gs_ref.clone(),
             subscriptions: self.subscriptions.clone(),
             sequentialized_guest: self.sequentialized_guest.clone(),
-            injected_syscall_marker: self.injected_syscall_marker,
+            injected_syscall_trap: self.injected_syscall_trap,
         }
     }
 }
@@ -191,7 +196,7 @@ impl<G: GlobalTool> Clone for GlobalState<G> {
 /// Event configuration supplied when a traced task is created.
 pub(crate) struct TracedTaskOptions<'a> {
     pub(crate) events: &'a Subscription,
-    pub(crate) injected_syscall_marker: Option<u64>,
+    pub(crate) injected_syscall_trap: Option<InjectedSyscallTrap>,
 }
 
 /// Our runtime representation of what Reverie knows about a guest thread. Its
@@ -369,7 +374,7 @@ impl<L: Tool> TracedTask<L> {
                     .map(|s| s.sequentialized_guest)
                     .unwrap_or(false),
             ),
-            injected_syscall_marker: options.injected_syscall_marker,
+            injected_syscall_trap: options.injected_syscall_trap,
         };
         let thread_state = process_state.init_thread_state(tid, None);
         let (next_state, next_state_rx) = mpsc::channel(1);
@@ -577,6 +582,8 @@ impl<L: Tool> TracedTask<L> {
     ) -> Result<(), TraceError> {
         if let Some(address) = self.injected_syscall_frame {
             let mut frame = self.read_injected_syscall_frame(task, address)?;
+            let current = self.read_guest_registers(task)?;
+            InjectedSyscallFrame::validate_user_regs_update(&current, regs)?;
             frame.copy_from_user_regs(regs);
             self.write_injected_syscall_frame(task, address, &frame)
         } else {
@@ -698,11 +705,16 @@ fn restore_context(
     task: &Stopped,
     context: libc::user_regs_struct,
     retval: Option<Reg>,
+    restore_stack: bool,
 ) -> Result<(), TraceError> {
     let mut regs = task.getregs()?;
 
     if let Some(ret) = retval {
         *regs.ret_mut() = ret;
+    }
+    // TODO-HUMAN-REVIEW(PR-103): Review injected parent-stack restoration.
+    if restore_stack {
+        *regs.stack_ptr_mut() = context.stack_ptr();
     }
 
     // Restore instruction pointer.
@@ -1073,7 +1085,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                 .tracee_context(tid, "handle exec stop"),
             Event::Seccomp => self.handle_seccomp(stopped).await,
             Event::NewChild(op, child) => self
-                .handle_new_task(op, stopped, child, None)
+                .handle_new_task(op, stopped, child, None, None)
                 .await
                 .tracee_context(tid, "handle new tracee stop"),
             Event::VforkDone => self
@@ -1093,6 +1105,26 @@ impl<L: Tool + 'static> TracedTask<L> {
         None
     }
 
+    // TODO-HUMAN-REVIEW(PR-103): Review rewritten rt_sigreturn tail execution.
+    async fn resume_injected_rt_sigreturn(
+        &mut self,
+        task: Stopped,
+        frame: &InjectedSyscallFrame,
+    ) -> Result<Wait, TraceError> {
+        let mut regs = task.getregs()?;
+        frame.copy_to_user_regs(&mut regs);
+        *regs.syscall_mut() = Sysno::rt_sigreturn as Reg;
+        *regs.orig_syscall_mut() = Sysno::rt_sigreturn as Reg;
+
+        // rt_sigreturn consumes the signal frame at the original guest stack
+        // pointer and does not return to its caller. Run it from Reverie's
+        // seccomp-allowed private page, then follow the restored guest state.
+        *regs.ip_mut() = cp::PRIVATE_PAGE_OFFSET as Reg;
+        task.setregs(&regs)?;
+        task.resume(None)?.next_state().await
+    }
+
+    // TODO-HUMAN-REVIEW(PR-102): Review rewritten-syscall dispatch and result handling.
     async fn handle_injected_syscall(
         &mut self,
         task: Stopped,
@@ -1102,6 +1134,11 @@ impl<L: Tool + 'static> TracedTask<L> {
         let mut frame = self.read_injected_syscall_frame(&task, frame_address)?;
         let syscall = frame.syscall();
         let (nr, args) = syscall.into_parts();
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        if nr == Sysno::rt_sigreturn {
+            return self.resume_injected_rt_sigreturn(task, &frame).await;
+        }
+
         frame.emulate_syscall_entry(trap_rflags);
         self.write_injected_syscall_frame(&task, frame_address, &frame)?;
 
@@ -1169,7 +1206,14 @@ impl<L: Tool + 'static> TracedTask<L> {
             .resumed_by_gdb
             .is_some_and(|action| matches!(action, ResumeAction::Step(_)));
         let mut regs = task.getregs()?;
-        if self.global_state.injected_syscall_marker == Some(regs.rax) {
+        // TODO-HUMAN-REVIEW(PR-103): Review rewritten-trap provenance validation.
+        if let Some(trap) = self.global_state.injected_syscall_trap
+            && regs.rax == trap.marker
+            && regs.ip() == trap.rip
+            && self
+                .read_injected_syscall_frame(&task, regs.rdi as usize)
+                .is_ok()
+        {
             let next_state = self
                 .handle_injected_syscall(task, regs.rdi as usize, regs.eflags)
                 .await?;
@@ -1434,6 +1478,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         parent: Stopped,
         child: Running,
         context: Option<libc::user_regs_struct>,
+        child_context: Option<libc::user_regs_struct>,
     ) -> Result<Wait, TraceError> {
         tracing::debug!(
             "[scheduler] handling fork from parent {} to child {}: {:?}",
@@ -1456,9 +1501,16 @@ impl<L: Tool + 'static> TracedTask<L> {
         let child_request_tx = child_task.gdb_request_tx.clone();
         let suspended = child_task.suspended.clone();
 
+        // TODO-HUMAN-REVIEW(PR-103): Review rewritten clone parent/child restoration.
         if let Some(context) = context {
-            restore_context(&parent, context, Some(child.pid().as_raw() as u64))?;
+            restore_context(
+                &parent,
+                context,
+                Some(child.pid().as_raw() as u64),
+                child_context.is_some(),
+            )?;
         }
+        let child_restore_context = child_context.or(context);
 
         let id = child.pid();
 
@@ -1500,11 +1552,11 @@ impl<L: Tool + 'static> TracedTask<L> {
                 event
             );
 
-            if let Some(context) = context {
+            if let Some(context) = child_restore_context {
                 // Restore context, but only if the child hasn't arrived at
                 // `Event::Exit`.
                 if event == Event::Signal(Signal::SIGSTOP)
-                    && let Err(err) = restore_context(&child, context, None)
+                    && let Err(err) = restore_context(&child, context, None, false)
                 {
                     tracing::error!(
                         tid = %child.pid(),
@@ -1962,9 +2014,13 @@ impl<L: Tool + 'static> TracedTask<L> {
             task.pid(),
             nr
         );
-        let mut regs = task.getregs()?;
-
-        let oldregs = regs;
+        // TODO-HUMAN-REVIEW(PR-103): Review original-frame syscall injection.
+        let oldregs = task.getregs()?;
+        let mut regs = if self.injected_syscall_frame.is_some() {
+            self.read_guest_registers(&task)?
+        } else {
+            oldregs
+        };
 
         *regs.syscall_mut() = nr as Reg;
         *regs.orig_syscall_mut() = nr as Reg;
@@ -1976,6 +2032,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             args.arg4 as Reg,
             args.arg5 as Reg,
         ));
+        let child_context = self.injected_syscall_frame.is_some().then_some(regs);
 
         // Jump to our private page to run the syscall instruction there. See
         // `populate_mmap_page` for details.
@@ -1987,7 +2044,8 @@ impl<L: Tool + 'static> TracedTask<L> {
         let wait = task.step(None)?.next_state().await?;
 
         // Get the result of the syscall to return to the caller.
-        self.status_to_result(wait, Some(oldregs)).await
+        self.status_to_result(wait, Some(oldregs), child_context)
+            .await
     }
 
     // Helper function
@@ -2006,6 +2064,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         &mut self,
         wait_status: Wait,
         context: Option<libc::user_regs_struct>,
+        child_context: Option<libc::user_regs_struct>,
     ) -> Result<Result<i64, Errno>, TraceError> {
         match wait_status {
             Wait::Stopped(stopped, event) => match event {
@@ -2033,13 +2092,15 @@ impl<L: Tool + 'static> TracedTask<L> {
                         // needed when we convert syscalls like SYS_open ->
                         // SYS_openat, syscall args are modified need to restore
                         // it back.
-                        restore_context(&stopped, context, None)?;
+                        restore_context(&stopped, context, None, child_context.is_some())?;
                     }
                     Ok(Errno::from_ret(regs.ret() as usize).map(|x| x as i64))
                 }
                 Event::NewChild(op, child) => {
                     let ret = child.pid().as_raw() as i64;
-                    let _ = self.handle_new_task(op, stopped, child, context).await?;
+                    let _ = self
+                        .handle_new_task(op, stopped, child, context, child_context)
+                        .await?;
                     Ok(Ok(ret))
                 }
                 Event::Exec(_new_pid) => {
@@ -2085,7 +2146,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             // If we're reinjecting the same syscall with the same arguments,
             // then we can just let the tracee continue and stop at sysexit.
             let wait = task.syscall(None)?.next_state().await?;
-            self.status_to_result(wait, None).await
+            self.status_to_result(wait, None, None).await
         } else {
             self.private_inject(task, nr, args).await
         }
