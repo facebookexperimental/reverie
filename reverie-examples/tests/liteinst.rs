@@ -167,3 +167,15 @@ fn exact_strace_tool_observes_filtered_write() {
     assert!(stderr.contains("write(1,"), "{stderr}");
     assert!(stderr.contains(" = 6"), "{stderr}");
 }
+
+#[test]
+fn exact_strace_tool_observes_thread_and_process_exit() {
+    let output = run("strace", &["--trace", "write"], &["/bin/true"]);
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("Thread "), "{stderr}");
+    assert!(stderr.contains("Process "), "{stderr}");
+    assert_eq!(stderr.matches("exited with status Exited(0)").count(), 2);
+}

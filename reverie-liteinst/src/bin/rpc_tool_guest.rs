@@ -7,9 +7,15 @@ use std::path::Path;
 use std::sync::Arc;
 
 use reverie::Error;
+use reverie::ExitStatus;
+use reverie::GlobalRPC;
 use reverie::GlobalTool;
 use reverie::Guest;
+use reverie::Pid;
+use reverie::Subscription;
+use reverie::Tid;
 use reverie::Tool;
+use reverie::syscalls::ExitGroup;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
@@ -75,6 +81,81 @@ impl Tool for CounterTool {
         let total = guest.send_rpc(1).await;
         LAST_TOTAL.store(total, Ordering::Relaxed);
         Ok(guest.inject(syscall).await?)
+    }
+}
+
+#[derive(Default)]
+struct UnsubscribedLifecycleTool;
+
+#[reverie::tool]
+impl Tool for UnsubscribedLifecycleTool {
+    type GlobalState = CounterGlobal;
+    type ThreadState = ();
+
+    fn subscriptions(_cfg: &()) -> Subscription {
+        Subscription::none()
+    }
+
+    async fn on_exit_thread<G: GlobalRPC<Self::GlobalState>>(
+        &self,
+        _tid: Tid,
+        _global_state: &G,
+        _thread_state: Self::ThreadState,
+        status: ExitStatus,
+    ) -> Result<(), Error> {
+        eprintln!("unsubscribed-thread={status:?}");
+        Ok(())
+    }
+
+    async fn on_exit_process<G: GlobalRPC<Self::GlobalState>>(
+        self,
+        _pid: Pid,
+        _global_state: &G,
+        status: ExitStatus,
+    ) -> Result<(), Error> {
+        eprintln!("unsubscribed-process={status:?}");
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct InjectExitTool;
+
+#[reverie::tool]
+impl Tool for InjectExitTool {
+    type GlobalState = CounterGlobal;
+    type ThreadState = ();
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        if syscall.number() == Sysno::getpid {
+            return Ok(guest.inject(ExitGroup::new().with_status(0x1234)).await?);
+        }
+        Ok(guest.inject(syscall).await?)
+    }
+
+    async fn on_exit_thread<G: GlobalRPC<Self::GlobalState>>(
+        &self,
+        _tid: Tid,
+        _global_state: &G,
+        _thread_state: Self::ThreadState,
+        status: ExitStatus,
+    ) -> Result<(), Error> {
+        eprintln!("injected-thread={status:?}");
+        Ok(())
+    }
+
+    async fn on_exit_process<G: GlobalRPC<Self::GlobalState>>(
+        self,
+        _pid: Pid,
+        _global_state: &G,
+        status: ExitStatus,
+    ) -> Result<(), Error> {
+        eprintln!("injected-process={status:?}");
+        Ok(())
     }
 }
 
@@ -338,6 +419,26 @@ fn spoof_sigsys_guest(path: &Path) -> ! {
     panic!("guest-generated SIGSYS returned");
 }
 
+fn unsubscribed_lifecycle_guest(path: &Path) -> ! {
+    unsafe { reverie_liteinst::install_tool::<UnsubscribedLifecycleTool>(path) }.unwrap();
+    let flags = libc::CLONE_VM | libc::CLONE_VFORK | libc::SIGCHLD;
+    let result = unsafe { libc::syscall(libc::SYS_clone, flags, 0, 0, 0, 0) };
+    assert_eq!(result, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ENOTSUP)
+    );
+    println!("unsubscribed-clone-rejected");
+    unsafe { libc::syscall(libc::SYS_exit_group, 0x1234) };
+    panic!("exit_group returned");
+}
+
+fn injected_exit_guest(path: &Path) -> ! {
+    unsafe { reverie_liteinst::install_tool::<InjectExitTool>(path) }.unwrap();
+    unsafe { reverie_liteinst_rpc_getpid() };
+    panic!("injected exit returned");
+}
+
 fn main() {
     let mut args = std::env::args_os();
     let _program = args.next();
@@ -350,6 +451,8 @@ fn main() {
         Some("pending-sigsys") => pending_sigsys_guest(Path::new(&path)),
         Some("preblocked-sigsys") => preblocked_sigsys_guest(Path::new(&path)),
         Some("spoof-sigsys") => spoof_sigsys_guest(Path::new(&path)),
+        Some("unsubscribed-lifecycle") => unsubscribed_lifecycle_guest(Path::new(&path)),
+        Some("injected-exit") => injected_exit_guest(Path::new(&path)),
         _ => panic!("expected coordinator or guest"),
     }
 }

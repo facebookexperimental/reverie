@@ -44,14 +44,18 @@ without a coordinator.
 ## Current boundaries
 
 - Dynamically linked, non-`AT_SECURE` Linux x86-64 guests only.
-- One coordinator connection and one process are supported by
-  `LiteinstBackend`. Fork/clone process-tree reconnect and exec rebootstrap are
-  not implemented.
-- Syscalls are hosted. Signal, CPUID, RDTSC/RDTSCP, RDRAND/RDSEED, and tool exit
-- Tool mode resets callable signal dispositions before activation, rejects later callable handlers, and validates that SIGSYS came from seccomp. `SIG_DFL` and `SIG_IGN` remain supported; guest signal handlers remain unsupported.
-  callbacks are not routed yet.
-- Timer arming currently returns success but no RCB timer or preemption event is
-  delivered. This supports the single-thread L0 smoke path; it is not strict
+- One coordinator connection, one process, and one thread are supported by
+  `LiteinstBackend`. Tool-mode clone/fork/vfork injection is rejected, and
+  process-tree reconnect and exec rebootstrap are not implemented.
+- Syscalls are hosted, and intercepted normal exits route thread and process
+  callbacks on the supported single-process path. Signal deaths, CPUID,
+  RDTSC/RDTSCP, and RDRAND/RDSEED events are not routed yet.
+- Tool mode resets callable signal dispositions before activation, rejects
+  later callable handlers, and validates that SIGSYS came from seccomp.
+  `SIG_DFL` and `SIG_IGN` remain supported; guest signal handlers remain
+  unsupported.
+- Timer arming and clock reads return an unsupported error because no RCB timer
+  or preemption event is delivered. The single-thread smoke path is not strict
   scheduling or an L1/L2 determinism claim.
 - Rust tool futures must make progress synchronously. Coordinator RPC and guest
   syscall injection do so; a tool future that depends on an unrelated executor

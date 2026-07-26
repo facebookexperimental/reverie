@@ -62,6 +62,37 @@ fn installed_hook_reentry_bypasses_tool_with_shared_coordinator_rpc() {
         "{spoofed_sigsys:?}"
     );
 
+    let unsubscribed_lifecycle = Command::new(binary)
+        .arg("unsubscribed-lifecycle")
+        .arg(&socket)
+        .output()
+        .unwrap();
+    assert_eq!(
+        unsubscribed_lifecycle.status.code(),
+        Some(0x34),
+        "{unsubscribed_lifecycle:?}"
+    );
+    assert_eq!(
+        unsubscribed_lifecycle.stdout,
+        b"unsubscribed-clone-rejected\n"
+    );
+    assert_eq!(
+        unsubscribed_lifecycle.stderr,
+        b"unsubscribed-thread=Exited(52)\nunsubscribed-process=Exited(52)\n"
+    );
+
+    let injected_exit = Command::new(binary)
+        .arg("injected-exit")
+        .arg(&socket)
+        .output()
+        .unwrap();
+    assert_eq!(injected_exit.status.code(), Some(0x34), "{injected_exit:?}");
+    assert!(injected_exit.stdout.is_empty(), "{injected_exit:?}");
+    assert_eq!(
+        injected_exit.stderr,
+        b"injected-thread=Exited(52)\ninjected-process=Exited(52)\n"
+    );
+
     let guest = Command::new(binary)
         .arg("guest")
         .arg(&socket)
