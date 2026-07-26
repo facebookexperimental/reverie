@@ -60,7 +60,6 @@ use reverie::syscalls::Sysno;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::DbiGuest;
 use crate::DbiSyscallOutcome;
 use crate::RegisterReader;
 use crate::SyscallInvoker;
@@ -115,12 +114,6 @@ fn emit_line(line: &str) {
     unsafe { emit(bytes.as_ptr(), bytes.len()) };
 }
 
-/// True for syscalls that never return on success, so a tracer must log them
-/// *before* injecting (the injected call will not come back).
-fn never_returns(number: Sysno) -> bool {
-    matches!(number, Sysno::exit | Sysno::exit_group | Sysno::execve)
-}
-
 fn record_syscall(number: Sysno) {
     *SYSCALL_HISTOGRAM
         .lock()
@@ -152,8 +145,8 @@ fn print_syscall_histogram() {
 ///
 /// The DBI backend hardwires the global state to `()`, so unlike the upstream
 /// `counter1` example (which routes counts through a `GlobalState` RPC), the
-/// histogram lives in a process-global map. `guest.inject` passes the syscall
-/// through to the kernel, keeping the tool purely observational.
+/// histogram lives in a process-global map. `guest.tail_inject` passes the
+/// syscall through while preserving DynamoRIO's native lifecycle boundaries.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SyscallCounterTool;
 
@@ -162,6 +155,7 @@ impl Tool for SyscallCounterTool {
     type GlobalState = ();
     type ThreadState = ();
 
+    // TODO-HUMAN-REVIEW(PR-154): Review lifecycle-safe histogram tail injection.
     async fn handle_syscall_event<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -174,7 +168,7 @@ impl Tool for SyscallCounterTool {
         if matches!(number, Sysno::exit | Sysno::exit_group) {
             print_syscall_histogram();
         }
-        Ok(guest.inject(syscall).await?)
+        guest.tail_inject(syscall).await
     }
 }
 
@@ -194,6 +188,7 @@ impl Tool for SharedSyscallCounterTool {
     type GlobalState = SyscallCounterGlobal;
     type ThreadState = ();
 
+    // TODO-HUMAN-REVIEW(PR-154): Review lifecycle-safe shared-counter tail injection.
     async fn handle_syscall_event<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -203,7 +198,7 @@ impl Tool for SharedSyscallCounterTool {
         // Record into the shared histogram before injecting; `exit`/`exit_group`
         // never return to us, but the count is already committed above.
         let _ = guest.send_rpc(RecordSyscall(number.id())).await;
-        Ok(guest.inject(syscall).await?)
+        guest.tail_inject(syscall).await
     }
 }
 
@@ -219,6 +214,7 @@ impl Tool for StraceTool {
     type GlobalState = ();
     type ThreadState = ();
 
+    // TODO-HUMAN-REVIEW(PR-154): Review native lifecycle deferral in DBI strace.
     async fn handle_syscall_event<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -233,12 +229,12 @@ impl Tool for StraceTool {
             guest.tid(),
             syscall.display(&guest.memory())
         );
-        if never_returns(syscall.number()) {
+        if crate::lifecycle_syscall_runs_original(syscall.number()) {
             emit_line(&format!("{prefix} = ?"));
             if matches!(syscall.number(), Sysno::exit | Sysno::exit_group) && *HISTOGRAM_ENABLED {
                 print_syscall_histogram();
             }
-            return Ok(guest.inject(syscall).await?);
+            guest.tail_inject(syscall).await
         }
         let result = guest.inject(syscall).await;
         match result {
@@ -253,7 +249,8 @@ impl Tool for StraceTool {
 // TODO-HUMAN-REVIEW(#123): Review the DBI noop/counter1 example-tool ports.
 /// The reverie `noop` example, adapted to DBI: a tool that observes every
 /// syscall but changes nothing, passing each straight through to the kernel.
-/// Exercises the minimal `Guest::inject` path — the floor of DBI Tool support.
+/// Exercises the minimal `Guest::tail_inject` path — the floor of DBI Tool
+/// support.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoopTool;
 
@@ -262,12 +259,13 @@ impl Tool for NoopTool {
     type GlobalState = ();
     type ThreadState = ();
 
+    // TODO-HUMAN-REVIEW(PR-154): Review lifecycle-safe noop tail injection.
     async fn handle_syscall_event<G: Guest<Self>>(
         &self,
         guest: &mut G,
         syscall: Syscall,
     ) -> Result<i64, Error> {
-        Ok(guest.inject(syscall).await?)
+        guest.tail_inject(syscall).await
     }
 }
 
@@ -320,6 +318,7 @@ impl Tool for Counter1Tool {
     type GlobalState = Counter1Global;
     type ThreadState = ();
 
+    // TODO-HUMAN-REVIEW(PR-154): Review lifecycle-safe counter1 tail injection.
     async fn handle_syscall_event<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -333,7 +332,7 @@ impl Tool for Counter1Tool {
                 "reverie-dbi: counter1 total system calls: {total}"
             ));
         }
-        Ok(guest.inject(syscall).await?)
+        guest.tail_inject(syscall).await
     }
 }
 
@@ -662,8 +661,7 @@ pub(crate) fn run_active_tool(
             syscall,
             invoke_syscall,
             read_registers,
-        )
-        .map(DbiSyscallOutcome::Suppress),
+        ),
         ActiveTool::Counter => dispatch(
             &SyscallCounterTool,
             context,
@@ -673,8 +671,7 @@ pub(crate) fn run_active_tool(
             syscall,
             invoke_syscall,
             read_registers,
-        )
-        .map(DbiSyscallOutcome::Suppress),
+        ),
         ActiveTool::SharedCounter => dispatch_shared(
             context,
             tid,
@@ -683,8 +680,7 @@ pub(crate) fn run_active_tool(
             syscall,
             invoke_syscall,
             read_registers,
-        )
-        .map(DbiSyscallOutcome::Suppress),
+        ),
         ActiveTool::Noop => dispatch(
             &NoopTool,
             context,
@@ -694,8 +690,7 @@ pub(crate) fn run_active_tool(
             syscall,
             invoke_syscall,
             read_registers,
-        )
-        .map(DbiSyscallOutcome::Suppress),
+        ),
         ActiveTool::Counter1 => dispatch_counter1(
             context,
             tid,
@@ -704,8 +699,7 @@ pub(crate) fn run_active_tool(
             syscall,
             invoke_syscall,
             read_registers,
-        )
-        .map(DbiSyscallOutcome::Suppress),
+        ),
         ActiveTool::Counter2 => dispatch_counter2(
             context,
             tid,
@@ -737,24 +731,24 @@ fn dispatch<T>(
     syscall: Syscall,
     invoke_syscall: SyscallInvoker,
     read_registers: RegisterReader,
-) -> Result<i64, Error>
+) -> Result<DbiSyscallOutcome, Error>
 where
     T: Tool<GlobalState = (), ThreadState = ()>,
 {
     let mut thread_state = ();
-    let mut guest = DbiGuest::new(
+    crate::run_tool_syscall(
+        tool,
         context,
-        reverie::Pid::from_raw(tid),
-        reverie::Pid::from_raw(pid),
-        None,
+        Pid::from_raw(tid),
+        Pid::from_raw(pid),
         branches,
         &mut thread_state,
         &(),
         &(),
+        syscall,
         invoke_syscall,
         read_registers,
-    );
-    run_ready(tool.handle_syscall_event(&mut guest, syscall))
+    )
 }
 
 /// The process-global `counter1` state. It must persist across syscalls (each
@@ -776,23 +770,23 @@ fn dispatch_shared(
     syscall: Syscall,
     invoke_syscall: SyscallInvoker,
     read_registers: RegisterReader,
-) -> Result<i64, Error> {
+) -> Result<DbiSyscallOutcome, Error> {
     let global = SyscallCounterGlobal::default();
     let config = ();
     let mut thread_state = ();
-    let mut guest = DbiGuest::new(
+    crate::run_tool_syscall(
+        &SharedSyscallCounterTool,
         context,
-        reverie::Pid::from_raw(tid),
-        reverie::Pid::from_raw(pid),
-        None,
+        Pid::from_raw(tid),
+        Pid::from_raw(pid),
         branches,
         &mut thread_state,
         &global,
         &config,
+        syscall,
         invoke_syscall,
         read_registers,
-    );
-    run_ready(SharedSyscallCounterTool.handle_syscall_event(&mut guest, syscall))
+    )
 }
 
 /// Runs one syscall through [`Counter1Tool`], whose non-`()` [`Counter1Global`]
@@ -806,22 +800,22 @@ fn dispatch_counter1(
     syscall: Syscall,
     invoke_syscall: SyscallInvoker,
     read_registers: RegisterReader,
-) -> Result<i64, Error> {
+) -> Result<DbiSyscallOutcome, Error> {
     let mut thread_state = ();
-    let mut guest = DbiGuest::new(
+    crate::run_tool_syscall(
+        &Counter1Tool,
         context,
-        reverie::Pid::from_raw(tid),
-        reverie::Pid::from_raw(pid),
-        None,
+        Pid::from_raw(tid),
+        Pid::from_raw(pid),
         branches,
         &mut thread_state,
         // `&*` forces `LazyLock<Counter1Global>` to deref to `&Counter1Global`.
         &*COUNTER1_GLOBAL,
         &(),
+        syscall,
         invoke_syscall,
         read_registers,
-    );
-    run_ready(Counter1Tool.handle_syscall_event(&mut guest, syscall))
+    )
 }
 
 static COUNTER2_HOST: LazyLock<Mutex<ObservationToolHost<Counter2Tool>>> =

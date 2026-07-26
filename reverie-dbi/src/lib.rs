@@ -164,6 +164,22 @@ where
     }
 }
 
+// TODO-HUMAN-REVIEW(PR-154): Review lifecycle syscalls deferred to DynamoRIO's original path.
+fn lifecycle_syscall_runs_original(number: Sysno) -> bool {
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    matches!(
+        number,
+        Sysno::exit
+            | Sysno::exit_group
+            | Sysno::fork
+            | Sysno::vfork
+            | Sysno::clone
+            | Sysno::clone3
+            | Sysno::execve
+            | Sysno::execveat
+    )
+}
+
 struct DbiGlobal<'a, T>
 where
     T: Tool,
@@ -292,11 +308,12 @@ where
     }
 
     async fn tail_inject<S: SyscallInfo>(&mut self, syscall: S) -> Never {
-        // An exiting application thread can invoke DynamoRIO's thread-exit
-        // callback reentrantly from `dr_invoke_syscall_as_app`. Defer those two
-        // syscalls until this Rust callback and all state borrows have returned.
+        // Process/thread lifecycle syscalls can re-enter DynamoRIO callbacks or
+        // replace the application image. Defer them until this Rust callback
+        // and all state borrows have returned, then execute the native original
+        // path with DynamoRIO's clone/exec bookkeeping intact.
         let (number, args) = syscall.into_parts();
-        if matches!(number, Sysno::exit | Sysno::exit_group) {
+        if lifecycle_syscall_runs_original(number) {
             self.tail_inject_result.set_allow_original();
             std::future::pending().await
         }
@@ -1748,6 +1765,25 @@ mod tests {
             Some(TailInjectAction::AllowOriginal),
             "exit must run only after Rust callback borrows are released"
         );
+
+        for number in [
+            Sysno::fork,
+            Sysno::vfork,
+            Sysno::clone,
+            Sysno::clone3,
+            Sysno::execve,
+            Sysno::execveat,
+        ] {
+            let lifecycle = Syscall::from_raw(number, SyscallArgs::new(0, 0, 0, 0, 0, 0));
+            tail_result.clear();
+            let polled = run_ready(guest.tail_inject(lifecycle), &tail_result);
+            assert!(polled.is_none(), "{number:?} tail-inject must suspend");
+            assert_eq!(
+                tail_result.take(),
+                Some(TailInjectAction::AllowOriginal),
+                "{number:?} must use DynamoRIO's original lifecycle path"
+            );
+        }
     }
 
     #[test]

@@ -27,14 +27,30 @@ drrun=$("$path_helper" drrun)
 
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT
+pthread_guest="$tmpdir/pthread-lifecycle"
+"${CC:-cc}" -O2 -g -std=c11 -Wall -Wextra -Werror -pthread \
+  "$crate_dir/tests/fixtures/pthread_lifecycle.c" -o "$pthread_guest"
 
 # Run the guest under one tool (selected by $1=ENV) and capture stdout/stderr.
 run_tool() {
   local env_var=$1
   shift
+  local -a guest=(/bin/bash -c 'echo GUEST-STDOUT; true')
+  if (($# > 0)); then
+    guest=("$@")
+  fi
   env "$env_var=1" "$drrun" -disable_rseq -stack_size 2M -c "$client" -- \
-    /bin/bash -c 'echo GUEST-STDOUT; true' \
+    "${guest[@]}" \
     >"$tmpdir/out" 2>"$tmpdir/err"
+}
+
+run_pthread_tool() {
+  local env_var=$1
+  local label=$2
+  run_tool "$env_var" "$pthread_guest"
+  grep -q '^threads=4 total=10$' "$tmpdir/out" \
+    || fail "$label: pthread lifecycle guest failed"
+  echo "PASS: $label (pthread clone/join lifecycle)"
 }
 
 fail() {
@@ -74,4 +90,7 @@ grep -Eq 'counter2 total system calls: [1-9][0-9]*, from 1 processes, 1 thread\(
   "$tmpdir/err" || fail "counter2: no lifecycle summary"
 echo "PASS: counter2 (persistent ThreadState + exit lifecycle)"
 
+run_pthread_tool HERMIT_DBI_NOOP noop
+run_pthread_tool HERMIT_DBI_STRACE strace
+run_pthread_tool HERMIT_DBI_COUNTER1 counter1
 echo "All DBI example tools passed."
