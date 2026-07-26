@@ -160,6 +160,14 @@ fn execute_basic_syscall_with_output(
         write(memory, state, args, output)
     } else if number == libc::SYS_read as u64 {
         read(memory, state, args)
+    } else if number == libc::SYS_writev as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#120)
+        writev(memory, state, args, output)
+    } else if number == libc::SYS_readv as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#120)
+        readv(memory, state, args)
     } else if number == libc::SYS_pread64 as u64 {
         pread64(memory, state, args)
     } else if number == libc::SYS_pwrite64 as u64 {
@@ -319,6 +327,27 @@ fn execute_basic_syscall_with_output(
     } else if number == libc::SYS_fchmodat as u64 {
         // SYS_fchmodat has three arguments; r10 is unspecified guest state.
         fchmodat(memory, state, args[0] as libc::c_int, args[1], args[2], 0)
+    } else if number == libc::SYS_flock as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#120)
+        flock_guest(state, args[0], args[1])
+    } else if number == libc::SYS_chown as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#120)
+        chown_path_noop(memory, state, libc::AT_FDCWD, args[0], false)
+    } else if number == libc::SYS_lchown as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#120)
+        chown_path_noop(memory, state, libc::AT_FDCWD, args[0], true)
+    } else if number == libc::SYS_fchown as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#120)
+        fchown_noop(state, args[0])
+    } else if number == libc::SYS_fchownat as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#120)
+        let nofollow = (args[4] & libc::AT_SYMLINK_NOFOLLOW as u64) != 0;
+        chown_path_noop(memory, state, args[0] as libc::c_int, args[1], nofollow)
     } else if number == libc::SYS_mknod as u64 {
         mknod_at(memory, state, libc::AT_FDCWD, args[0], args[1], args[2])
     } else if number == libc::SYS_mknodat as u64 {
@@ -943,6 +972,94 @@ fn signal_is_pending(signal: libc::c_int) -> Result<bool, libc::c_int> {
     } else {
         Ok(member == 1)
     }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#120): guest writev gathers each iovec and reuses
+// the scalar write path, so descriptor routing, captured-output aliasing, and
+// SIGPIPE suppression stay identical to write(2). Programs such as javac/java
+// emit their startup diagnostics with writev and abort (exit 127) when it is
+// ENOSYS.
+fn writev(
+    memory: &GuestMemory,
+    state: &mut LoadedStaticElf,
+    args: &[u64; 6],
+    mut output: Option<&mut CapturedOutput>,
+) -> i64 {
+    let Ok(count) = usize::try_from(args[2]) else {
+        return negative_errno(libc::EINVAL);
+    };
+    if count > libc::UIO_MAXIOV as usize {
+        return negative_errno(libc::EINVAL);
+    }
+    let mut total: i64 = 0;
+    for index in 0..count {
+        let entry = args[1] + (index as u64) * 16;
+        let mut base = [0u8; 8];
+        let mut len = [0u8; 8];
+        if memory.read(entry, &mut base).is_err() || memory.read(entry + 8, &mut len).is_err() {
+            return if total > 0 {
+                total
+            } else {
+                negative_errno(libc::EFAULT)
+            };
+        }
+        let iov_base = u64::from_le_bytes(base);
+        let iov_len = u64::from_le_bytes(len);
+        if iov_len == 0 {
+            continue;
+        }
+        let write_args = [args[0], iov_base, iov_len, 0, 0, 0];
+        let result = write(memory, state, &write_args, output.as_deref_mut());
+        if result < 0 {
+            return if total > 0 { total } else { result };
+        }
+        total = total.saturating_add(result);
+        if (result as u64) < iov_len {
+            break; // a short write ends the gather, matching writev(2)
+        }
+    }
+    total
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#120): guest readv scatters into each iovec via the
+// scalar read path; a short read or EOF stops the scatter, matching readv(2).
+fn readv(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    let Ok(count) = usize::try_from(args[2]) else {
+        return negative_errno(libc::EINVAL);
+    };
+    if count > libc::UIO_MAXIOV as usize {
+        return negative_errno(libc::EINVAL);
+    }
+    let mut total: i64 = 0;
+    for index in 0..count {
+        let entry = args[1] + (index as u64) * 16;
+        let mut base = [0u8; 8];
+        let mut len = [0u8; 8];
+        if memory.read(entry, &mut base).is_err() || memory.read(entry + 8, &mut len).is_err() {
+            return if total > 0 {
+                total
+            } else {
+                negative_errno(libc::EFAULT)
+            };
+        }
+        let iov_base = u64::from_le_bytes(base);
+        let iov_len = u64::from_le_bytes(len);
+        if iov_len == 0 {
+            continue;
+        }
+        let read_args = [args[0], iov_base, iov_len, 0, 0, 0];
+        let result = read(memory, state, &read_args);
+        if result < 0 {
+            return if total > 0 { total } else { result };
+        }
+        total = total.saturating_add(result);
+        if (result as u64) < iov_len {
+            break; // a short read or EOF ends the scatter
+        }
+    }
+    total
 }
 
 fn write_without_sigpipe(fd: RawFd, bytes: &[u8]) -> i64 {
@@ -2160,6 +2277,61 @@ fn symlink_at(
     zero_or_errno(unsafe { libc::symlinkat(target.as_ptr(), new_host_dirfd, new_path.as_ptr()) })
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#120): advisory flock on the guest's backing host
+// descriptor. The deterministic container hosts a single guest, so the lock
+// never contends; forwarding to the host preserves LOCK_SH/LOCK_EX/LOCK_UN and
+// LOCK_NB semantics. Without this, flock(1) reports ENOSYS ("Function not
+// implemented") and aborts.
+fn flock_guest(state: &LoadedStaticElf, guest_fd: u64, operation: u64) -> i64 {
+    let Ok(guest_fd) = libc::c_int::try_from(guest_fd) else {
+        return negative_errno(libc::EBADF);
+    };
+    let Some(host_fd) = host_fd(state, guest_fd) else {
+        return negative_errno(libc::EBADF);
+    };
+    // SAFETY: host_fd names a live descriptor; operation is one int command word.
+    zero_or_errno(unsafe { libc::flock(host_fd, operation as libc::c_int) })
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#120): guest ownership changes are validated then
+// treated as a deterministic no-op. The container virtualizes identity to a
+// single root user and reports deterministic uid/gid from stat, so honoring the
+// request means confirming the target inode exists and leaving the host-owned
+// inode untouched. A real host chown would need privilege we do not hold and
+// would leak host-owner nondeterminism into the guest.
+fn chown_path_noop(
+    memory: &GuestMemory,
+    state: &LoadedStaticElf,
+    guest_dirfd: libc::c_int,
+    path_address: u64,
+    nofollow: bool,
+) -> i64 {
+    let (host_dirfd, path) = match read_path_at(memory, state, guest_dirfd, path_address, false) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    match open_host_metadata_path(host_dirfd, &path, nofollow) {
+        Ok(_) => 0,
+        Err(error) => error,
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#120): fd-referenced ownership change; validated to
+// EBADF-check the descriptor then treated as the same deterministic no-op as
+// chown_path_noop.
+fn fchown_noop(state: &LoadedStaticElf, guest_fd: u64) -> i64 {
+    let Ok(guest_fd) = libc::c_int::try_from(guest_fd) else {
+        return negative_errno(libc::EBADF);
+    };
+    match host_fd(state, guest_fd) {
+        Some(_) => 0,
+        None => negative_errno(libc::EBADF),
+    }
+}
+
 fn fchmod(state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
     let Ok(guest_fd) = libc::c_int::try_from(args[0]) else {
         return negative_errno(libc::EBADF);
@@ -2856,6 +3028,23 @@ fn fcntl(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
                 state.cloexec_fds.remove(&guest_fd);
             }
             0
+        }
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#120): guest F_SETFL applies the
+        // kernel-settable file status flags (O_APPEND/O_ASYNC/O_DIRECT/
+        // O_NOATIME/O_NONBLOCK) to the backing host descriptor. Access mode and
+        // creation flags are silently ignored, matching fcntl(2). Without this,
+        // programs that set O_NONBLOCK on a freshly created pipe (e.g. xz)
+        // observe ENOSYS and abort.
+        libc::F_SETFL => {
+            let settable = libc::O_APPEND
+                | libc::O_ASYNC
+                | libc::O_DIRECT
+                | libc::O_NOATIME
+                | libc::O_NONBLOCK;
+            let flags = args[2] as libc::c_int & settable;
+            // SAFETY: host_fd names a live descriptor; F_SETFL consumes one int flag word.
+            zero_or_errno(unsafe { libc::fcntl(host_fd, libc::F_SETFL, flags) })
         }
         _ => negative_errno(libc::ENOSYS),
     }
@@ -4688,6 +4877,208 @@ mod tests {
                 &mut state,
                 libc::SYS_fcntl,
                 [0, libc::F_GETFL as u64, 0, 0, 0, 0],
+            ),
+            negative_errno(libc::EBADF)
+        );
+    }
+
+    #[test]
+    fn fcntl_setfl_applies_status_flags() {
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+
+        const PIPE_FDS: u64 = 0x100;
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_pipe2,
+                [PIPE_FDS, 0, 0, 0, 0, 0]
+            ),
+            0
+        );
+        let pipe_fds: [libc::c_int; 2] = read_struct(&memory, PIPE_FDS);
+        let write_fd = pipe_fds[1];
+
+        // F_SETFL O_NONBLOCK on the guest write end succeeds (previously ENOSYS).
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_fcntl,
+                [
+                    write_fd as u64,
+                    libc::F_SETFL as u64,
+                    libc::O_NONBLOCK as u64,
+                    0,
+                    0,
+                    0
+                ]
+            ),
+            0
+        );
+        // F_GETFL now reflects the applied status flag.
+        let flags = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_fcntl,
+            [write_fd as u64, libc::F_GETFL as u64, 0, 0, 0, 0],
+        );
+        assert!(flags >= 0);
+        assert_ne!(flags as libc::c_int & libc::O_NONBLOCK, 0);
+    }
+
+    #[test]
+    fn writev_and_readv_gather_scatter_round_trip() {
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, 0x8000).unwrap();
+
+        const PIPE_FDS: u64 = 0x100;
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_pipe2,
+                [PIPE_FDS, 0, 0, 0, 0, 0]
+            ),
+            0
+        );
+        let pipe_fds: [libc::c_int; 2] = read_struct(&memory, PIPE_FDS);
+        let (read_fd, write_fd) = (pipe_fds[0], pipe_fds[1]);
+
+        const BUF_A: u64 = 0x200;
+        const BUF_B: u64 = 0x210;
+        memory.write(BUF_A, b"foo").unwrap();
+        memory.write(BUF_B, b"barbaz").unwrap();
+        const IOV: u64 = 0x300;
+        write_struct(&mut memory, IOV, &[BUF_A, 3u64]);
+        write_struct(&mut memory, IOV + 16, &[BUF_B, 6u64]);
+
+        // writev gathers both iovecs into the pipe.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_writev,
+                [write_fd as u64, IOV, 2, 0, 0, 0]
+            ),
+            9
+        );
+
+        // readv scatters the 9 bytes back into two differently-sized iovecs.
+        const RBUF_A: u64 = 0x400;
+        const RBUF_B: u64 = 0x410;
+        const RIOV: u64 = 0x500;
+        write_struct(&mut memory, RIOV, &[RBUF_A, 4u64]);
+        write_struct(&mut memory, RIOV + 16, &[RBUF_B, 5u64]);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_readv,
+                [read_fd as u64, RIOV, 2, 0, 0, 0]
+            ),
+            9
+        );
+        let mut first = [0u8; 4];
+        let mut second = [0u8; 5];
+        memory.read(RBUF_A, &mut first).unwrap();
+        memory.read(RBUF_B, &mut second).unwrap();
+        assert_eq!(&first, b"foob");
+        assert_eq!(&second, b"arbaz");
+    }
+
+    #[test]
+    fn flock_and_chown_are_deterministic_for_owned_files() {
+        let root = TestDir::new();
+        std::fs::write(root.0.join("f"), b"x").unwrap();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+
+        write_c_string(&mut memory, 0x100, "f");
+        let fd = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_openat,
+            [libc::AT_FDCWD as u64, 0x100, libc::O_RDWR as u64, 0, 0, 0],
+        );
+        assert!(fd >= 0, "open failed: {fd}");
+
+        // flock acquire (non-blocking) and release succeed on an owned descriptor.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_flock,
+                [
+                    fd as u64,
+                    (libc::LOCK_EX | libc::LOCK_NB) as u64,
+                    0,
+                    0,
+                    0,
+                    0
+                ]
+            ),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_flock,
+                [fd as u64, libc::LOCK_UN as u64, 0, 0, 0, 0]
+            ),
+            0
+        );
+        // flock on an unknown descriptor is EBADF.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_flock,
+                [999, libc::LOCK_EX as u64, 0, 0, 0, 0]
+            ),
+            negative_errno(libc::EBADF)
+        );
+
+        // chown/fchown validate the target then no-op to 0 (virtualized identity).
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_fchown,
+                [fd as u64, 0, 0, 0, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_chown,
+                [0x100, 0, 0, 0, 0, 0]
+            ),
+            0
+        );
+        // A missing path still reports ENOENT; a bad fd reports EBADF.
+        write_c_string(&mut memory, 0x200, "missing-file");
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_chown,
+                [0x200, 0, 0, 0, 0, 0]
+            ),
+            negative_errno(libc::ENOENT)
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_fchown,
+                [999, 0, 0, 0, 0, 0]
             ),
             negative_errno(libc::EBADF)
         );
