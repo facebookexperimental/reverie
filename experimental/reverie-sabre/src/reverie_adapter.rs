@@ -11,6 +11,7 @@
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::future::Future;
+use std::io;
 use std::path::Path;
 use std::pin::pin;
 use std::sync::Arc;
@@ -34,7 +35,7 @@ use reverie::Rdtsc;
 use reverie::Stack;
 use reverie::TimerSchedule;
 use reverie::Tool as ReverieTool;
-use reverie_memory::LocalMemory;
+use reverie_memory::MemoryAccess;
 use reverie_rpc_transport::BlockingRpcClient;
 use reverie_rpc_transport::RpcError;
 use reverie_syscalls::Addr;
@@ -44,6 +45,7 @@ use reverie_syscalls::Syscall;
 use reverie_syscalls::SyscallInfo;
 use syscalls::SyscallArgs;
 use syscalls::Sysno;
+use syscalls::syscall;
 
 use crate::SyscallExt;
 
@@ -534,6 +536,121 @@ fn current_tid() -> Pid {
     Pid::from_raw(tid as i32)
 }
 
+/// Kernel-validated access to memory in the SaBRe guest process.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-153): Review SaBRe process memory access semantics.
+#[derive(Clone, Copy, Debug)]
+pub struct SabreMemory {
+    pid: Pid,
+}
+
+impl SabreMemory {
+    fn new(pid: Pid) -> Self {
+        Self { pid }
+    }
+
+    fn transfer_result(result: Result<usize, Errno>) -> Result<usize, Errno> {
+        result.or_else(|error| {
+            if error == Errno::EFAULT {
+                // MemoryAccess treats a fault like an EOF so read_exact and
+                // write_exact can consistently report EFAULT.
+                Ok(0)
+            } else {
+                Err(error)
+            }
+        })
+    }
+}
+
+impl MemoryAccess for SabreMemory {
+    fn read_vectored(
+        &self,
+        remote: &[io::IoSlice],
+        local: &mut [io::IoSliceMut],
+    ) -> Result<usize, Errno> {
+        let result = unsafe {
+            syscall!(
+                Sysno::process_vm_readv,
+                self.pid.as_raw() as usize,
+                local.as_ptr() as usize,
+                local.len(),
+                remote.as_ptr() as usize,
+                remote.len(),
+                0
+            )
+        };
+        Self::transfer_result(result)
+    }
+
+    fn write_vectored(
+        &mut self,
+        local: &[io::IoSlice],
+        remote: &mut [io::IoSliceMut],
+    ) -> Result<usize, Errno> {
+        let result = unsafe {
+            syscall!(
+                Sysno::process_vm_writev,
+                self.pid.as_raw() as usize,
+                local.as_ptr() as usize,
+                local.len(),
+                remote.as_ptr() as usize,
+                remote.len(),
+                0
+            )
+        };
+        Self::transfer_result(result)
+    }
+
+    fn read<'a, A>(&self, addr: A, buf: &mut [u8]) -> Result<usize, Errno>
+    where
+        A: Into<Addr<'a, u8>>,
+    {
+        let remote = libc::iovec {
+            iov_base: unsafe { addr.into().as_ptr() as *mut libc::c_void },
+            iov_len: buf.len(),
+        };
+        let local = libc::iovec {
+            iov_base: buf.as_mut_ptr().cast(),
+            iov_len: buf.len(),
+        };
+        let result = unsafe {
+            syscall!(
+                Sysno::process_vm_readv,
+                self.pid.as_raw() as usize,
+                &local as *const libc::iovec as usize,
+                1,
+                &remote as *const libc::iovec as usize,
+                1,
+                0
+            )
+        };
+        Self::transfer_result(result)
+    }
+
+    fn write(&mut self, addr: AddrMut<u8>, buf: &[u8]) -> Result<usize, Errno> {
+        let local = libc::iovec {
+            iov_base: buf.as_ptr() as *mut libc::c_void,
+            iov_len: buf.len(),
+        };
+        let remote = libc::iovec {
+            iov_base: unsafe { addr.as_mut_ptr().cast() },
+            iov_len: buf.len(),
+        };
+        let result = unsafe {
+            syscall!(
+                Sysno::process_vm_writev,
+                self.pid.as_raw() as usize,
+                &local as *const libc::iovec as usize,
+                1,
+                &remote as *const libc::iovec as usize,
+                1,
+                0
+            )
+        };
+        Self::transfer_result(result)
+    }
+}
+
 fn poll_once<F: Future>(future: F) -> Poll<F::Output> {
     let mut context = Context::from_waker(Waker::noop());
     pin!(future).as_mut().poll(&mut context)
@@ -631,7 +748,7 @@ impl<T> Guest<T> for SabreGuest<'_, '_, T>
 where
     T: ReverieTool,
 {
-    type Memory = LocalMemory;
+    type Memory = SabreMemory;
     type Stack = SabreStack;
 
     fn tid(&self) -> Pid {
@@ -652,7 +769,7 @@ where
     }
 
     fn memory(&self) -> Self::Memory {
-        LocalMemory::new()
+        SabreMemory::new(self.pid)
     }
 
     fn thread_state_mut(&mut self) -> &mut T::ThreadState {
@@ -952,6 +1069,34 @@ mod tests {
 
     static HANDLED: AtomicUsize = AtomicUsize::new(0);
     static RPC_SOCKET_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn sabre_memory_reads_and_writes_valid_memory() {
+        let mut memory = SabreMemory::new(current_pid());
+        let source = *b"sabre";
+        let source_addr = Addr::from_ptr(source.as_ptr()).unwrap();
+        let mut copy = [0; 5];
+        memory.read_exact(source_addr, &mut copy).unwrap();
+        assert_eq!(copy, source);
+
+        let mut destination = [0; 5];
+        let destination_addr = AddrMut::from_ptr(destination.as_mut_ptr()).unwrap();
+        memory.write_exact(destination_addr, b"guest").unwrap();
+        assert_eq!(&destination, b"guest");
+    }
+
+    #[test]
+    fn sabre_memory_reports_invalid_addresses_as_efault() {
+        let mut memory = SabreMemory::new(current_pid());
+        let invalid = Addr::from_raw(1).unwrap();
+        let invalid_mut = AddrMut::from_raw(1).unwrap();
+        let mut byte = [0];
+
+        assert_eq!(memory.read(invalid, &mut byte), Ok(0));
+        assert_eq!(memory.read_exact(invalid, &mut byte), Err(Errno::EFAULT));
+        assert_eq!(memory.write(invalid_mut, &byte), Ok(0));
+        assert_eq!(memory.write_exact(invalid_mut, &byte), Err(Errno::EFAULT));
+    }
 
     #[derive(Default)]
     struct FixedTool;

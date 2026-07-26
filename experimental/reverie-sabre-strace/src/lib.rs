@@ -17,6 +17,7 @@ use reverie::Error;
 use reverie::Guest;
 use reverie::Tool as ReverieTool;
 use reverie_sabre as sabre;
+use reverie_syscalls::Displayable;
 use reverie_syscalls::LocalMemory;
 use reverie_syscalls::Syscall;
 use syscalls::Errno;
@@ -37,27 +38,39 @@ impl ReverieTool for StraceTool {
     type GlobalState = ();
     type ThreadState = ();
 
+    // TODO-HUMAN-REVIEW(PR-153): Review decoded syscall memory access and logging.
     async fn handle_syscall_event<G: Guest<Self>>(
         &self,
         guest: &mut G,
         syscall: Syscall,
     ) -> Result<i64, Error> {
-        let tid = guest.tid();
-        if !self.quiet {
-            // Debug formatting prints typed scalar fields and pointer addresses but
-            // never dereferences guest pointers. This avoids crashing on EFAULT
-            // inputs and prevents execve environment contents from leaking.
-            let pretty = format!("{syscall:?}");
-            nostd_print::eprintln!("[{tid}] {pretty}");
+        if self.quiet {
+            return guest.inject(syscall).await.map_err(Error::from);
         }
-        let result = guest.inject(syscall).await;
-        if !self.quiet {
-            match result {
-                Ok(value) => nostd_print::eprintln!("[{tid}] -> {value}"),
-                Err(errno) => nostd_print::eprintln!("[{tid}] -> {errno}"),
+
+        let tid = guest.tid();
+        match syscall {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            Syscall::Exit(_) | Syscall::ExitGroup(_) => {
+                nostd_print::eprintln!("[{tid}] {}", syscall.display(&guest.memory()));
+                guest.tail_inject(syscall).await
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            Syscall::Execve(_) | Syscall::Execveat(_) => {
+                // A successful exec replaces the address space, so format its
+                // input pointers while the old image is still readable.
+                nostd_print::eprintln!("[{tid}] {}", syscall.display(&guest.memory()));
+                guest.inject(syscall).await.map_err(Error::from)
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            _ => {
+                let result = guest.inject(syscall).await;
+                let memory = guest.memory();
+                let syscall = syscall.display_with_outputs(&memory);
+                nostd_print::eprintln!("[{tid}] {syscall} = {result:?}");
+                result.map_err(Error::from)
             }
         }
-        result.map_err(Error::from)
     }
 }
 
