@@ -211,6 +211,20 @@ fn execute_basic_syscall_with_output(
         mkdir_at(memory, state, args[0] as libc::c_int, args[1], args[2])
     } else if number == libc::SYS_unlink as u64 {
         unlink_at(memory, state, libc::AT_FDCWD, args[0], 0)
+    } else if number == libc::SYS_rmdir as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#111): Review rmdir->unlinkat(AT_REMOVEDIR) mapping.
+        // rmdir(path) is unlinkat(AT_FDCWD, path, AT_REMOVEDIR). Without this
+        // arm the guest's bare rmdir(2) fell through to ENOSYS, so coreutils
+        // `rmdir` (and `mktemp -d` cleanup) failed under the KVM backend even
+        // though `rm -rf`, which uses unlinkat(AT_REMOVEDIR), worked.
+        unlink_at(
+            memory,
+            state,
+            libc::AT_FDCWD,
+            args[0],
+            libc::AT_REMOVEDIR as u64,
+        )
     } else if number == libc::SYS_unlinkat as u64 {
         unlink_at(memory, state, args[0] as libc::c_int, args[1], args[2])
     } else if number == libc::SYS_rename as u64 {
@@ -6298,6 +6312,87 @@ mod tests {
                 [99, DIRECTORY, 0o755, 0, 0, 0],
             ),
             negative_errno(libc::EBADF)
+        );
+    }
+
+    #[test]
+    fn rmdir_removes_empty_directories_like_unlinkat_removedir() {
+        const DIRECTORY: u64 = 0x100;
+        const FILE: u64 = 0x200;
+        const NONEMPTY: u64 = 0x300;
+        const MISSING: u64 = 0x400;
+
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        for (address, value) in [
+            (DIRECTORY, "directory"),
+            (FILE, "file"),
+            (NONEMPTY, "nonempty"),
+            (MISSING, "missing"),
+        ] {
+            write_c_string(&mut memory, address, value);
+        }
+
+        // A bare rmdir(2) removes an empty directory. Regression: this syscall
+        // previously fell through to ENOSYS under the KVM backend, so coreutils
+        // `rmdir` and `mktemp -d` cleanup failed even though `rm -rf` (which
+        // uses unlinkat(AT_REMOVEDIR)) worked.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_mkdir,
+                [DIRECTORY, 0o755, 0, 0, 0, 0],
+            ),
+            0
+        );
+        assert!(root.0.join("directory").is_dir());
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_rmdir,
+                [DIRECTORY, 0, 0, 0, 0, 0],
+            ),
+            0
+        );
+        assert!(!root.0.join("directory").exists());
+
+        // rmdir on a missing path reports ENOENT, not ENOSYS.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_rmdir,
+                [MISSING, 0, 0, 0, 0, 0],
+            ),
+            negative_errno(libc::ENOENT)
+        );
+
+        // rmdir on a regular file reports ENOTDIR.
+        std::fs::write(root.0.join("file"), b"payload").unwrap();
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_rmdir,
+                [FILE, 0, 0, 0, 0, 0],
+            ),
+            negative_errno(libc::ENOTDIR)
+        );
+
+        // rmdir refuses a non-empty directory with ENOTEMPTY.
+        std::fs::create_dir(root.0.join("nonempty")).unwrap();
+        std::fs::write(root.0.join("nonempty/child"), b"payload").unwrap();
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_rmdir,
+                [NONEMPTY, 0, 0, 0, 0, 0],
+            ),
+            negative_errno(libc::ENOTEMPTY)
         );
     }
 
