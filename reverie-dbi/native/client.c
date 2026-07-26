@@ -630,61 +630,72 @@ static bool handle_virtual_clock(uintptr_t context, int sysnum,
   }
 }
 
-static void wrap_vdso_clock_gettime(void *wrapcxt, void **user_data) {
-  uint64_t args[6] = {
-      (uint64_t)(uintptr_t)drwrap_get_arg(wrapcxt, 0),
-      (uint64_t)(uintptr_t)drwrap_get_arg(wrapcxt, 1),
-  };
-  int64_t result = -ENOSYS;
-  DR_ASSERT(handle_virtual_clock(0, SYS_clock_gettime, args, &result));
-  DR_ASSERT(drwrap_skip_call(wrapcxt, (void *)(ptr_int_t)result, 0));
-}
-
-static void wrap_vdso_clock_getres(void *wrapcxt, void **user_data) {
-  uint64_t args[6] = {
-      (uint64_t)(uintptr_t)drwrap_get_arg(wrapcxt, 0),
-      (uint64_t)(uintptr_t)drwrap_get_arg(wrapcxt, 1),
-  };
-  int64_t result = -ENOSYS;
-  DR_ASSERT(handle_virtual_clock(0, SYS_clock_getres, args, &result));
-  DR_ASSERT(drwrap_skip_call(wrapcxt, (void *)(ptr_int_t)result, 0));
-}
-
-static void wrap_vdso_gettimeofday(void *wrapcxt, void **user_data) {
-  uint64_t args[6] = {
-      (uint64_t)(uintptr_t)drwrap_get_arg(wrapcxt, 0),
-      (uint64_t)(uintptr_t)drwrap_get_arg(wrapcxt, 1),
-  };
-  int64_t result = -ENOSYS;
-  DR_ASSERT(handle_virtual_clock(0, SYS_gettimeofday, args, &result));
-  DR_ASSERT(drwrap_skip_call(wrapcxt, (void *)(ptr_int_t)result, 0));
-}
-
-#ifdef SYS_time
-static void wrap_vdso_time(void *wrapcxt, void **user_data) {
-  uint64_t args[6] = {
-      (uint64_t)(uintptr_t)drwrap_get_arg(wrapcxt, 0),
-  };
-  int64_t result = -ENOSYS;
-  DR_ASSERT(handle_virtual_clock(0, SYS_time, args, &result));
-  DR_ASSERT(drwrap_skip_call(wrapcxt, (void *)(ptr_int_t)result, 0));
-}
-#endif
-
-static void wrap_vdso_symbol(const module_data_t *module, const char *name,
-                             void (*callback)(void *, void **)) {
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(hermit#705): Confirm vDSO time neutralization routes guest
+// clock reads through the shared Detcore tool (2021 epoch) rather than the raw
+// host TSC, matching the ptrace backend.
+//
+// Neutralize one guest vDSO time symbol by overwriting its entry point with a
+// tiny `mov $sysnum, %eax; syscall; ret` thunk. glibc's vDSO fast path then
+// issues a real, trapped syscall instead of reading the raw host TSC, so the
+// call flows through pre_syscall() where the external Detcore tool virtualizes
+// it (and the prototype runtime still services it via handle_virtual_clock()).
+// This mirrors reverie-ptrace/src/vdso.rs, whose vDSO neutralization is why the
+// ptrace backend already reports the deterministic epoch; the previous
+// drwrap_skip_call() path answered from the base-zero prototype clock and never
+// reached the real tool, so `date` printed 1970 under Detcore (hermit#705).
+static void neutralize_vdso_symbol(const module_data_t *module, const char *name,
+                                   long sysnum) {
   app_pc address = (app_pc)dr_get_proc_address(module->handle, name);
-  if (address != NULL)
-    DR_ASSERT(drwrap_wrap(address, callback, NULL));
+  if (address == NULL)
+    return;
+
+  /*
+   * mov $sysnum, %eax; syscall; ret  (8 bytes). vDSO entries are padded to a
+   * 16-byte alignment, so overwriting the first 8 bytes stays within the symbol
+   * and the trailing `ret` prevents fall-through into the original body.
+   */
+  const uint8_t thunk[8] = {
+      0xb8,
+      (uint8_t)(sysnum),
+      (uint8_t)(sysnum >> 8),
+      (uint8_t)(sysnum >> 16),
+      (uint8_t)(sysnum >> 24),
+      0x0f,
+      0x05,
+      0xc3,
+  };
+
+  size_t region_size = (size_t)(module->end - module->start);
+  if (!dr_memory_protect((void *)module->start, region_size,
+                         DR_MEMPROT_READ | DR_MEMPROT_WRITE | DR_MEMPROT_EXEC)) {
+    dr_fprintf(diagnostic_file,
+               "reverie-dbi: failed to unprotect vdso to neutralize %s\n", name);
+    return;
+  }
+  memcpy(address, thunk, sizeof(thunk));
+  DR_ASSERT(dr_memory_protect((void *)module->start, region_size,
+                              DR_MEMPROT_READ | DR_MEMPROT_EXEC));
+
+  /*
+   * Discard any cached translation of the vDSO so the patched bytes take
+   * effect. The delayed form is the flush variant permitted from a module-load
+   * callback; it completes before any new code enters the cache, i.e. before the
+   * guest first calls the patched entry.
+   */
+  dr_delay_flush_region(module->start, region_size, 0, NULL);
 }
 
 static void module_load(void *drcontext, const module_data_t *module,
                         bool loaded) {
-  wrap_vdso_symbol(module, "__vdso_clock_gettime", wrap_vdso_clock_gettime);
-  wrap_vdso_symbol(module, "__vdso_clock_getres", wrap_vdso_clock_getres);
-  wrap_vdso_symbol(module, "__vdso_gettimeofday", wrap_vdso_gettimeofday);
+  neutralize_vdso_symbol(module, "__vdso_clock_gettime", SYS_clock_gettime);
+  neutralize_vdso_symbol(module, "__vdso_clock_getres", SYS_clock_getres);
+  neutralize_vdso_symbol(module, "__vdso_gettimeofday", SYS_gettimeofday);
+#ifdef SYS_getcpu
+  neutralize_vdso_symbol(module, "__vdso_getcpu", SYS_getcpu);
+#endif
 #ifdef SYS_time
-  wrap_vdso_symbol(module, "__vdso_time", wrap_vdso_time);
+  neutralize_vdso_symbol(module, "__vdso_time", SYS_time);
 #endif
 }
 
