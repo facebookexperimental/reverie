@@ -35,6 +35,11 @@ const GUEST_NOFILE_LIMIT: libc::c_int = 1 << 20;
 const KERNEL_SIGACTION_SIZE: usize = 32;
 const KERNEL_SIGSET_SIZE: usize = 8;
 const MEMBARRIER_SUPPORTED: libc::c_int = 0x1;
+// prctl(2) PR_CAPBSET_READ option; the deterministic container runs the guest as
+// root with the full capability bounding set up to a fixed CAP_LAST_CAP so the
+// answer is host-independent.
+const PR_CAPBSET_READ: u64 = 23;
+const GUEST_CAP_LAST_CAP: u64 = 40;
 const PROCESS_CLONE_TID_FLAGS: u64 = libc::CLONE_PARENT_SETTID as u64
     | libc::CLONE_CHILD_SETTID as u64
     | libc::CLONE_CHILD_CLEARTID as u64;
@@ -312,6 +317,21 @@ fn execute_basic_syscall_with_output(
         utimensat(memory, state, args)
     } else if number == libc::SYS_arch_prctl as u64 {
         return arch_prctl(memory, state, args);
+    } else if number == libc::SYS_prctl as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        prctl(args)
+    } else if number == libc::SYS_getxattr as u64
+        || number == libc::SYS_lgetxattr as u64
+        || number == libc::SYS_fgetxattr as u64
+    {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // The deterministic container models no extended attributes, so report
+        // every attribute as absent (ENODATA) rather than letting the call fall
+        // through to ENOSYS. This matches what the ptrace backend observes from
+        // the host for files without xattrs and keeps `ls -l` (which probes
+        // security.selinux and system.posix_acl_access) from printing a spurious
+        // "Function not implemented".
+        negative_errno(libc::ENODATA)
     } else if number == libc::SYS_brk as u64 {
         brk(memory, state, args[0])
     } else if number == libc::SYS_mmap as u64 {
@@ -2861,6 +2881,30 @@ fn arch_prctl(
         ARCH_GET_FS => continue_with(write_u64(memory, args[1], state.fs_base)),
         ARCH_GET_GS => continue_with(write_u64(memory, args[1], state.gs_base)),
         _ => continue_with(negative_errno(libc::EINVAL)),
+    }
+}
+
+// TODO-HUMAN-REVIEW(reverie-kvm): prctl(2) subset for the KVM guest.
+//
+// Only PR_CAPBSET_READ is modeled. The deterministic container runs the guest as
+// root with the full capability bounding set, so libcap's cap_get_bound() must
+// report each valid capability as present (1) and out-of-range capabilities as
+// EINVAL, exactly as a root process observes on Linux. Without this, the query
+// fell through to ENOSYS and tools such as `ls -l` printed a spurious
+// "Function not implemented" that neither a native run nor the ptrace backend
+// emits. Answers are fixed constants, so run 1 and run 2 of --verify agree and
+// results do not depend on the host kernel's CAP_LAST_CAP.
+fn prctl(args: &[u64; 6]) -> i64 {
+    match args[0] {
+        PR_CAPBSET_READ => {
+            if args[1] <= GUEST_CAP_LAST_CAP {
+                1
+            } else {
+                negative_errno(libc::EINVAL)
+            }
+        }
+        // Other prctl operations are not modeled yet.
+        _ => negative_errno(libc::ENOSYS),
     }
 }
 
@@ -7191,5 +7235,28 @@ mod tests {
         let err = resolve_exec_shebang(a.clone(), std::fs::read(&a).unwrap(), vec!["a".to_owned()])
             .unwrap_err();
         assert_eq!(err, negative_errno(libc::ELOOP));
+    }
+
+    #[test]
+    fn prctl_capbset_read_reports_full_bounding_set() {
+        // Valid capabilities are present (root holds the full bounding set).
+        for cap in [0, 7, 15, 32, GUEST_CAP_LAST_CAP] {
+            assert_eq!(prctl(&[PR_CAPBSET_READ, cap, 0, 0, 0, 0]), 1);
+        }
+        // Out-of-range capabilities are rejected exactly like Linux.
+        assert_eq!(
+            prctl(&[PR_CAPBSET_READ, GUEST_CAP_LAST_CAP + 1, 0, 0, 0, 0]),
+            negative_errno(libc::EINVAL)
+        );
+        // Deterministic: repeated queries return the same answer.
+        assert_eq!(
+            prctl(&[PR_CAPBSET_READ, 15, 0, 0, 0, 0]),
+            prctl(&[PR_CAPBSET_READ, 15, 0, 0, 0, 0])
+        );
+        // Unmodeled prctl options remain ENOSYS.
+        assert_eq!(
+            prctl(&[libc::PR_GET_NAME as u64, 0, 0, 0, 0, 0]),
+            negative_errno(libc::ENOSYS)
+        );
     }
 }
