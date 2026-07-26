@@ -48,6 +48,7 @@ use crate::executor::is_process_syscall;
 const GUEST_PID: i32 = 1;
 const STACK_CAPACITY: usize = 4096;
 const TOOL_STACK_TOP: u64 = BOOT_RESERVED_END;
+const TOOL_STACK_BOTTOM: u64 = TOOL_STACK_TOP - STACK_CAPACITY as u64;
 
 type TailResult = Arc<Mutex<Option<std::result::Result<i64, Errno>>>>;
 
@@ -315,10 +316,10 @@ impl Stack for KvmStack {
         self.allocate(vec![0; std::mem::size_of::<T>()])
     }
 
-    fn commit(mut self) -> std::result::Result<Self::StackGuard, Errno> {
+    fn commit(self) -> std::result::Result<Self::StackGuard, Errno> {
         for (address, bytes) in self.writes {
             self.memory
-                .write(address, &bytes)
+                .write_raw(address, &bytes)
                 .map_err(|_| Errno::EFAULT)?;
         }
         Ok(KvmStackGuard {
@@ -369,6 +370,14 @@ async fn drive_handler<T>(
     .await
 }
 
+fn expose_tool_scratch(memory: &GuestMemory) -> Result<()> {
+    memory.map_user_range(TOOL_STACK_BOTTOM, STACK_CAPACITY as u64, false)
+}
+
+fn hide_tool_scratch(memory: &GuestMemory) -> Result<()> {
+    memory.unmap_user_range(TOOL_STACK_BOTTOM, STACK_CAPACITY as u64)
+}
+
 async fn notify_tool_exit<T: Tool>(
     tool: T,
     pid: Pid,
@@ -417,6 +426,7 @@ impl KvmBackend {
 
         let registers = kvm_registers(self.vcpu.get_regs()?, 0);
         let tail_result = Arc::new(Mutex::new(None));
+        expose_tool_scratch(&memory)?;
         let start_outcome = {
             let mut guest = KvmGuest::<T>::new(
                 pid,
@@ -432,6 +442,7 @@ impl KvmBackend {
             );
             drive_handler(tool.handle_thread_start(&mut guest), tail_result).await
         };
+        hide_tool_scratch(&memory)?;
         if let HandlerOutcome::Returned(result) = start_outcome {
             result.map_err(Error::Reverie)?;
         }
@@ -452,6 +463,7 @@ impl KvmBackend {
                         .any(|number| number == syscall.number());
                     let result = if subscribed {
                         let tail_result = Arc::new(Mutex::new(None));
+                        expose_tool_scratch(&memory)?;
                         let outcome = {
                             let mut guest = KvmGuest::<T>::new(
                                 pid,
@@ -471,6 +483,7 @@ impl KvmBackend {
                             )
                             .await
                         };
+                        hide_tool_scratch(&memory)?;
                         match outcome {
                             HandlerOutcome::Returned(result) => handler_result_to_raw(result)?,
                             HandlerOutcome::TailInjected(result) => result_to_raw(result),
@@ -511,9 +524,10 @@ impl KvmBackend {
     /// ([`Self::run_static_elf`]) with the tool-interception path of
     /// [`Self::run_with_tool`]. A static ELF loaded by
     /// [`Self::install_static_elf`]/[`Self::install_static_elf_with_args`] runs
-    /// in long mode; each guest `SYSCALL` traps through the ring0 trampoline and
-    /// is delivered to the tool's `handle_syscall_event`, and the tool's
-    /// `inject`/`tail_inject` calls are serviced by the ELF guest kernel
+    /// in long mode. Root-thread non-process syscalls selected by the tool's
+    /// subscriptions are delivered to `Tool::handle_syscall_event`; process
+    /// syscalls and child execution currently use the KVM personality directly.
+    /// Tool `inject`/`tail_inject` calls are serviced by the ELF guest kernel
     /// ([`ElfExecutor`]). Unlike [`Self::run_with_tool`], results are written
     /// back into the guest's syscall frame (the trampoline reads them and
     /// `SYSRET`s) and the guest exits via `exit`/`exit_group` rather than `HLT`.
@@ -545,6 +559,7 @@ impl KvmBackend {
 
         let registers = kvm_registers(self.vcpu.get_regs()?, 0);
         let tail_result = Arc::new(Mutex::new(None));
+        expose_tool_scratch(&memory)?;
         let start_outcome = {
             let mut guest = KvmGuest::<T>::new(
                 pid,
@@ -560,6 +575,7 @@ impl KvmBackend {
             );
             drive_handler(tool.handle_thread_start(&mut guest), tail_result).await
         };
+        hide_tool_scratch(&memory)?;
         if let HandlerOutcome::Returned(result) = start_outcome {
             result.map_err(Error::Reverie)?;
         }
@@ -568,6 +584,7 @@ impl KvmBackend {
         // the same successful-exec lifecycle boundary as ptrace before running it.
         let registers = kvm_registers(self.vcpu.get_regs()?, 0);
         let tail_result = Arc::new(Mutex::new(None));
+        expose_tool_scratch(&memory)?;
         let post_exec_outcome = {
             let mut guest = KvmGuest::<T>::new(
                 pid,
@@ -583,6 +600,7 @@ impl KvmBackend {
             );
             drive_handler(tool.handle_post_exec(&mut guest), tail_result).await
         };
+        hide_tool_scratch(&memory)?;
         let post_exec_error = match post_exec_outcome {
             HandlerOutcome::Returned(Ok(())) => None,
             HandlerOutcome::Returned(Err(error)) => Some(Error::PostExec(error)),
@@ -621,7 +639,7 @@ impl KvmBackend {
         }
 
         loop {
-            let (pending_segment, pending_exit, pending_process) = match self.vcpu.run()? {
+            let (pending_segment, mut pending_exit, pending_process) = match self.vcpu.run()? {
                 VcpuExit::Hypercall(exit) => {
                     if exit.nr != VMCALL_SYSCALL_TRANSPORT {
                         return Err(Error::UnexpectedHypercall(exit.nr));
@@ -645,6 +663,7 @@ impl KvmBackend {
                             .any(|number| number == syscall.number());
                     let result = if subscribed {
                         let tail_result = Arc::new(Mutex::new(None));
+                        expose_tool_scratch(&memory)?;
                         let outcome = {
                             let mut guest = KvmGuest::<T>::new(
                                 pid,
@@ -664,6 +683,7 @@ impl KvmBackend {
                             )
                             .await
                         };
+                        hide_tool_scratch(&memory)?;
                         match outcome {
                             HandlerOutcome::Returned(result) => handler_result_to_raw(result)?,
                             HandlerOutcome::TailInjected(result) => result_to_raw(result),
@@ -696,6 +716,7 @@ impl KvmBackend {
             if let Some(action) = pending_process {
                 self.run_process_action(&mut executor, action)?;
                 auxv = executor.auxv().to_vec();
+                pending_exit = pending_exit.or_else(|| executor.take_exit());
             }
             if let Some(code) = pending_exit {
                 notify_tool_exit(

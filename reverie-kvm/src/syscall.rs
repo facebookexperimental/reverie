@@ -100,7 +100,7 @@ impl SyscallRequest {
 
     pub(crate) fn read_from(memory: &GuestMemory, guest_address: u64) -> Result<Self> {
         let mut frame = [0; FRAME_SIZE];
-        memory.read(guest_address, &mut frame)?;
+        memory.read_raw(guest_address, &mut frame)?;
         let mut words = [0; REQUEST_WORDS];
         for (index, value) in words.iter_mut().enumerate() {
             let start = index * WORD_SIZE;
@@ -117,7 +117,7 @@ impl SyscallRequest {
         guest_address: u64,
         result: i64,
     ) -> Result<()> {
-        memory.write(
+        memory.write_raw(
             guest_address + (RESULT_WORD * WORD_SIZE) as u64,
             &result.to_le_bytes(),
         )

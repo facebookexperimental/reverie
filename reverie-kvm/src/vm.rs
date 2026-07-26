@@ -48,6 +48,7 @@ use crate::runtime::SyscallExecutor;
 pub const VMCALL_SYSCALL_TRANSPORT: u64 = 12;
 
 const SYSCALL_FRAME_STRIDE: u64 = 4096;
+const PAGE_SIZE: u64 = 4096;
 const VMCALL: [u8; 3] = [0x0f, 0x01, 0xc1];
 const VMMCALL: [u8; 3] = [0x0f, 0x01, 0xd9];
 const HLT: u8 = 0xf4;
@@ -240,6 +241,7 @@ impl KvmBackend {
             loaded.stack_pointer,
             self.hypercall_instruction,
         )?;
+        self.memory.enable_user_access();
         self.static_elf = Some(loaded);
         Ok(())
     }
@@ -282,7 +284,7 @@ impl KvmBackend {
     ) -> Result<()> {
         let user_length = usize::try_from(self.memory.guest_end() - BOOT_RESERVED_END)
             .expect("guest memory length must fit usize");
-        self.memory.zero(BOOT_RESERVED_END, user_length)?;
+        self.memory.zero_raw(BOOT_RESERVED_END, user_length)?;
 
         let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
         let envp = envp.iter().map(String::as_str).collect::<Vec<_>>();
@@ -295,6 +297,7 @@ impl KvmBackend {
             loaded.stack_pointer,
             self.hypercall_instruction,
         )?;
+        self.memory.enable_user_access();
         executor.replace_after_exec(loaded);
         Ok(())
     }
@@ -345,6 +348,78 @@ impl KvmBackend {
                     i64::from(child_pid),
                     None,
                 )?;
+            }
+            ProcessAction::Thread {
+                child_tid,
+                child_stack,
+                parent_tid,
+                child_tid_address,
+                clear_child_tid,
+                tls,
+            } => {
+                // TODO-HUMAN-REVIEW(PR-132): Review sequential thread execution and
+                // parent architectural-state restoration on the shared vCPU.
+                let parent_registers = self.vcpu.get_regs()?;
+                let parent_xsave = self.vcpu.get_xsave()?;
+                let parent_thread_id = executor.thread_id();
+                let (parent_fs, parent_gs) = executor.segment_bases();
+                let parent_clear_child_tid = executor.take_clear_child_tid();
+                let mut parent_syscall_frame = vec![0; PAGE_SIZE as usize];
+                self.memory
+                    .read_raw(SYSCALL_FRAME_ADDRESS, &mut parent_syscall_frame)?;
+
+                set_syscall_return_park(&mut self.memory, self.hypercall_instruction, true)?;
+                let parked = match self.vcpu.run()? {
+                    VcpuExit::Hlt => Ok(()),
+                    exit => Err(Error::UnexpectedVcpuExit(format!(
+                        "parent did not park at thread clone: {exit:?}"
+                    ))),
+                };
+                set_syscall_return_park(&mut self.memory, self.hypercall_instruction, false)?;
+                parked?;
+
+                write_tid_best_effort(&mut self.memory, parent_tid, child_tid);
+                write_tid_best_effort(&mut self.memory, child_tid_address, child_tid);
+                let child_fs = tls.unwrap_or(parent_fs);
+                executor.set_thread_context(child_tid, child_fs, parent_gs);
+                executor.set_clear_child_tid(clear_child_tid);
+                set_user_segment_base(&self.vcpu, SegmentBase::Fs, child_fs)?;
+                set_user_segment_base(&self.vcpu, SegmentBase::Gs, parent_gs)?;
+                configure_process_syscall_return(&self.memory, &self.vcpu, 0, Some(child_stack))?;
+
+                let (code, stdout, stderr) = self.run_static_elf_process(executor)?;
+                set_syscall_return_park(&mut self.memory, self.hypercall_instruction, true)?;
+                let child_parked = match self.vcpu.run()? {
+                    VcpuExit::Hlt => Ok(()),
+                    exit => Err(Error::UnexpectedVcpuExit(format!(
+                        "child thread did not park after exit: {exit:?}"
+                    ))),
+                };
+                set_syscall_return_park(&mut self.memory, self.hypercall_instruction, false)?;
+                child_parked?;
+                let exited_group = executor.take_exit_group();
+                write_tid_best_effort(&mut self.memory, executor.take_clear_child_tid(), 0);
+                executor.set_clear_child_tid(parent_clear_child_tid);
+                executor.set_thread_context(parent_thread_id, parent_fs, parent_gs);
+                executor.append_output(stdout, stderr);
+                // SAFETY: this guest setup does not enable dynamically sized XSTATE features.
+                unsafe { self.vcpu.set_xsave(&parent_xsave)? };
+
+                if exited_group {
+                    executor.set_exit(code, true);
+                } else {
+                    self.memory
+                        .write_raw(SYSCALL_FRAME_ADDRESS, &parent_syscall_frame)?;
+                    set_user_segment_base(&self.vcpu, SegmentBase::Fs, parent_fs)?;
+                    set_user_segment_base(&self.vcpu, SegmentBase::Gs, parent_gs)?;
+                    self.vcpu.set_regs(&parent_registers)?;
+                    configure_process_syscall_return(
+                        &self.memory,
+                        &self.vcpu,
+                        i64::from(child_tid),
+                        None,
+                    )?;
+                }
             }
             ProcessAction::Exec { image, argv, envp } => {
                 set_syscall_return_park(&mut self.memory, self.hypercall_instruction, true)?;

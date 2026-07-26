@@ -112,6 +112,8 @@ pub(crate) struct LoadedStaticElf {
     pub fs_base: u64,
     pub gs_base: u64,
     pub pid: i32,
+    // TODO-HUMAN-REVIEW(PR-132): Review single-vCPU thread identity transitions.
+    pub tid: i32,
     pub ppid: i32,
     pub umask: libc::mode_t,
     // TODO-HUMAN-REVIEW(PR-92): Review virtual nice process state.
@@ -179,6 +181,7 @@ impl LoadedStaticElf {
             fs_base: self.fs_base,
             gs_base: self.gs_base,
             pid: child_pid,
+            tid: child_pid,
             ppid: self.pid,
             umask: self.umask,
             nice: self.nice,
@@ -281,6 +284,7 @@ impl LoadedStaticElf {
         self.cwd_fd = previous.cwd_fd;
         self.stdin = stdin;
         self.pid = previous.pid;
+        self.tid = previous.tid;
         self.ppid = previous.ppid;
         self.umask = previous.umask;
         self.nice = previous.nice;
@@ -311,6 +315,8 @@ pub(crate) fn load_static_elf(
     envp: &[&str],
     cwd: &Path,
 ) -> Result<LoadedStaticElf> {
+    // TODO-HUMAN-REVIEW(PR-132): Review ELF user-map construction.
+    memory.clear_user_access();
     load_executable(memory, image, argv, envp, cwd, 0)
 }
 
@@ -424,13 +430,16 @@ fn load_executable(
         (main_entry, 0, main_end)
     };
 
-    copy_program_headers(memory, image, &elf)?;
     let program_headers_address = elf
         .program_headers
         .iter()
         .find(|header| header.p_type == goblin::elf::program_header::PT_PHDR)
         .and_then(|header| main_bias.checked_add(header.p_vaddr))
         .unwrap_or(PROGRAM_HEADERS_ADDRESS);
+    copy_program_headers(memory, image, &elf)?;
+    if program_headers_address == PROGRAM_HEADERS_ADDRESS {
+        memory.map_user_range(PROGRAM_HEADERS_ADDRESS, PAGE_SIZE, false)?;
+    }
     let (stack_pointer, auxv) = build_initial_stack(
         memory,
         &elf,
@@ -440,6 +449,7 @@ fn load_executable(
         at_base,
         main_entry,
     )?;
+    memory.map_user_range(memory.guest_end() - STACK_LIMIT, STACK_LIMIT, false)?;
     let program_break = align_up(main_end, PAGE_SIZE)?;
     let mmap_next = align_up(
         image_end
@@ -488,6 +498,7 @@ fn load_executable(
         fs_base: 0,
         gs_base: 0,
         pid: 1,
+        tid: 1,
         ppid: 0,
         umask: 0o022,
         nice: 0,
@@ -725,7 +736,10 @@ fn load_segments(
         let zero_start = segment_start + header.p_filesz;
         let zero_len = usize::try_from(header.p_memsz - header.p_filesz)
             .map_err(|_| Error::UnsupportedElf("PT_LOAD memsz is too large".to_string()))?;
-        memory.zero(zero_start, zero_len)?;
+        memory.zero_raw(zero_start, zero_len)?;
+        let mapped_start = segment_start & !(PAGE_SIZE - 1);
+        let mapped_end = align_up(segment_end, PAGE_SIZE)?;
+        memory.map_user_range(mapped_start, mapped_end - mapped_start, false)?;
 
         entry_is_executable |=
             header.p_flags & PF_X != 0 && (segment_start..segment_end).contains(&entry);

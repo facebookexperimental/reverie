@@ -238,6 +238,53 @@ fn static_elf_faults_are_reported_by_direct_and_tool_runtimes() {
 }
 
 #[test]
+fn static_elf_cannot_copy_supervisor_bootstrap_memory() {
+    match Kvm::new() {
+        Ok(_) => {}
+        Err(error) if kvm_is_unavailable(&error) => {
+            eprintln!("skipping KVM bootstrap access test: cannot open /dev/kvm: {error}");
+            return;
+        }
+        Err(error) => panic!("failed to probe /dev/kvm: {error}"),
+    }
+
+    let code = [
+        0xbf, 0x01, 0x00, 0x00, 0x00, // mov edi, 1
+        0xbe, 0x00, 0x10, 0x00, 0x00, // mov esi, 0x1000
+        0xba, 0x10, 0x00, 0x00, 0x00, // mov edx, 16
+        0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, SYS_write
+        0x0f, 0x05, // syscall
+        0x48, 0x83, 0xf8, 0xf2, // cmp rax, -EFAULT
+        0x74, 0x0e, // je success
+        0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax, SYS_exit_group
+        0xbf, 0x2a, 0x00, 0x00, 0x00, // mov edi, 42
+        0x0f, 0x05, 0x0f, 0x0b, // syscall; ud2
+        0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax, SYS_exit_group
+        0x31, 0xff, // xor edi, edi
+        0x0f, 0x05, 0x0f, 0x0b, // syscall; ud2
+    ];
+
+    for with_tool in [false, true] {
+        let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+        backend
+            .install_static_elf(&static_elf(&code), "/bin/bootstrap-access-test")
+            .unwrap();
+        let (exit_code, stdout, stderr) = if with_tool {
+            let (_, exit_code, stdout, stderr) = futures::executor::block_on(
+                backend.run_static_elf_with_tool::<StraceTool>((), true),
+            )
+            .unwrap();
+            (exit_code, stdout, stderr)
+        } else {
+            backend.run_static_elf_captured().unwrap()
+        };
+        assert_eq!(exit_code, 0, "with_tool={with_tool}");
+        assert!(stdout.is_empty(), "with_tool={with_tool}");
+        assert!(stderr.is_empty(), "with_tool={with_tool}");
+    }
+}
+
+#[test]
 fn static_elf_forks_execs_and_waits_for_child() {
     match Kvm::new() {
         Ok(_) => {}
@@ -529,6 +576,162 @@ fn static_elf_clone_tid_side_effects_reach_guest_memory() {
     assert_eq!(code, 0);
     assert!(stdout.is_empty());
     assert!(stderr.is_empty());
+}
+
+#[test]
+fn static_elf_runs_glibc_clone3_thread_and_restores_parent_state() {
+    match Kvm::new() {
+        Ok(_) => {}
+        Err(error) if kvm_is_unavailable(&error) => {
+            eprintln!("skipping KVM clone3 thread test: cannot open /dev/kvm: {error}");
+            return;
+        }
+        Err(error) => panic!("failed to probe /dev/kvm: {error}"),
+    }
+
+    fn append_exit(code: &mut Vec<u8>, status: u32) {
+        code.extend_from_slice(&[0xb8, 0xe7, 0x00, 0x00, 0x00]);
+        code.push(0xbf);
+        code.extend_from_slice(&status.to_le_bytes());
+        code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    }
+
+    fn patch_jump(code: &mut [u8], operand: usize, target: usize) {
+        let displacement = i32::try_from(target as isize - (operand + 4) as isize).unwrap();
+        code[operand..operand + 4].copy_from_slice(&displacement.to_le_bytes());
+    }
+
+    const PARENT_TID: u64 = LOAD_ADDRESS + 0x1800;
+    const CHILD_TID: u64 = LOAD_ADDRESS + 0x1808;
+    const CHILD_RESULT: u64 = LOAD_ADDRESS + 0x1810;
+    const CHILD_FS: u64 = LOAD_ADDRESS + 0x1818;
+    const CHILD_RSP: u64 = LOAD_ADDRESS + 0x1820;
+    const TLS: u64 = LOAD_ADDRESS + 0x1880;
+    const CHILD_STACK: u64 = LOAD_ADDRESS + 0x1900;
+    const CHILD_STACK_SIZE: u64 = 0x600;
+    const CHILD_STACK_TOP: u64 = CHILD_STACK + CHILD_STACK_SIZE;
+    let flags = libc::CLONE_VM as u64
+        | libc::CLONE_FS as u64
+        | libc::CLONE_FILES as u64
+        | libc::CLONE_SIGHAND as u64
+        | libc::CLONE_THREAD as u64
+        | libc::CLONE_SYSVSEM as u64
+        | libc::CLONE_SETTLS as u64
+        | libc::CLONE_PARENT_SETTID as u64
+        | libc::CLONE_CHILD_CLEARTID as u64;
+
+    let mut code = vec![
+        0x49, 0x89, 0xe4, // mov r12, rsp
+        0xb8, 0x78, 0x56, 0x34, 0x12, // mov eax, 0x12345678
+        0x66, 0x0f, 0x6e, 0xc0, // movd xmm0, eax
+    ];
+    code.extend_from_slice(&[0x48, 0xb9]); // movabs rcx, child_tid
+    code.extend_from_slice(&CHILD_TID.to_le_bytes());
+    code.extend_from_slice(&[0xc7, 0x01, 0xff, 0xff, 0xff, 0x7f]); // mov [rcx], sentinel
+    code.extend_from_slice(&[0xb8, 0xb3, 0x01, 0x00, 0x00]); // mov eax, SYS_clone3
+    let clone_args_operand = code.len() + 2;
+    code.extend_from_slice(&[0x48, 0xbf, 0, 0, 0, 0, 0, 0, 0, 0]); // movabs rdi, clone_args
+    code.extend_from_slice(&[0xbe, 0x58, 0x00, 0x00, 0x00]); // mov esi, sizeof(clone_args)
+    code.extend_from_slice(&[0x0f, 0x05, 0x85, 0xc0, 0x0f, 0x84, 0, 0, 0, 0]); // syscall; jz child
+    let child_jump = code.len() - 4;
+
+    code.extend_from_slice(&[0x4c, 0x39, 0xe4, 0x74, 0x0e]); // cmp rsp, r12; je
+    append_exit(&mut code, 81);
+    code.extend_from_slice(&[0x48, 0xb9]); // movabs rcx, parent_tid
+    code.extend_from_slice(&PARENT_TID.to_le_bytes());
+    code.extend_from_slice(&[0x39, 0x01, 0x74, 0x0e]); // cmp [rcx], eax; je
+    append_exit(&mut code, 82);
+    code.extend_from_slice(&[0x48, 0xb9]); // movabs rcx, child_result
+    code.extend_from_slice(&CHILD_RESULT.to_le_bytes());
+    code.extend_from_slice(&[0x39, 0x01, 0x74, 0x0e]); // cmp [rcx], eax; je
+    append_exit(&mut code, 83);
+    code.extend_from_slice(&[0x48, 0xb9]); // movabs rcx, child_tid
+    code.extend_from_slice(&CHILD_TID.to_le_bytes());
+    code.extend_from_slice(&[0x83, 0x39, 0x00, 0x74, 0x0e]); // cmp dword ptr [rcx], 0; je
+    append_exit(&mut code, 84);
+    code.extend_from_slice(&[0x48, 0xb9]); // movabs rcx, child_fs
+    code.extend_from_slice(&CHILD_FS.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0xba]); // movabs rdx, tls
+    code.extend_from_slice(&TLS.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0x39, 0x11, 0x74, 0x0e]); // cmp [rcx], rdx; je
+    append_exit(&mut code, 85);
+    code.extend_from_slice(&[0x48, 0xb9]); // movabs rcx, child_rsp
+    code.extend_from_slice(&CHILD_RSP.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0xba]); // movabs rdx, child_stack_top
+    code.extend_from_slice(&CHILD_STACK_TOP.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0x39, 0x11, 0x74, 0x0e]); // cmp [rcx], rdx; je
+    append_exit(&mut code, 86);
+    code.extend_from_slice(&[
+        0x66, 0x0f, 0x7e, 0xc0, // movd eax, xmm0
+        0x3d, 0x78, 0x56, 0x34, 0x12, // cmp eax, 0x12345678
+        0x74, 0x0e, // je
+    ]);
+    append_exit(&mut code, 87);
+    code.extend_from_slice(&[
+        0xb8, 0xba, 0x00, 0x00, 0x00, // mov eax, SYS_gettid
+        0x0f, 0x05, // syscall
+        0x83, 0xf8, 0x01, // cmp eax, 1
+        0x74, 0x0e, // je
+    ]);
+    append_exit(&mut code, 88);
+    append_exit(&mut code, 0);
+
+    let child = code.len();
+    patch_jump(&mut code, child_jump, child);
+    code.extend_from_slice(&[0x48, 0xb9]); // movabs rcx, child_rsp
+    code.extend_from_slice(&CHILD_RSP.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0x89, 0x21]); // mov [rcx], rsp
+    code.extend_from_slice(&[0xb8, 0x9e, 0x00, 0x00, 0x00]); // mov eax, SYS_arch_prctl
+    code.extend_from_slice(&[0xbf, 0x03, 0x10, 0x00, 0x00]); // mov edi, ARCH_GET_FS
+    code.extend_from_slice(&[0x48, 0xbe]); // movabs rsi, child_fs
+    code.extend_from_slice(&CHILD_FS.to_le_bytes());
+    code.extend_from_slice(&[0x0f, 0x05]); // syscall
+    code.extend_from_slice(&[0xb8, 0xba, 0x00, 0x00, 0x00, 0x0f, 0x05]); // gettid
+    code.extend_from_slice(&[0x48, 0xb9]); // movabs rcx, child_result
+    code.extend_from_slice(&CHILD_RESULT.to_le_bytes());
+    code.extend_from_slice(&[0x89, 0x01]); // mov [rcx], eax
+    code.extend_from_slice(&[
+        0xb8, 0x3c, 0x00, 0x00, 0x00, // mov eax, SYS_exit
+        0x31, 0xff, // xor edi, edi
+        0x0f, 0x05, // syscall
+        0x0f, 0x0b, // ud2
+    ]);
+
+    while !code.len().is_multiple_of(8) {
+        code.push(0);
+    }
+    let clone_args_address = LOAD_ADDRESS + code.len() as u64;
+    code[clone_args_operand..clone_args_operand + 8]
+        .copy_from_slice(&clone_args_address.to_le_bytes());
+    let mut clone_args = [0_u8; 88];
+    clone_args[0..8].copy_from_slice(&flags.to_le_bytes());
+    // Linux ignores pidfd without CLONE_PIDFD; glibc aliases this union slot.
+    clone_args[8..16].copy_from_slice(&CHILD_TID.to_le_bytes());
+    clone_args[16..24].copy_from_slice(&CHILD_TID.to_le_bytes());
+    clone_args[24..32].copy_from_slice(&PARENT_TID.to_le_bytes());
+    clone_args[40..48].copy_from_slice(&CHILD_STACK.to_le_bytes());
+    clone_args[48..56].copy_from_slice(&CHILD_STACK_SIZE.to_le_bytes());
+    clone_args[56..64].copy_from_slice(&TLS.to_le_bytes());
+    code.extend_from_slice(&clone_args);
+
+    for with_tool in [false, true] {
+        let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+        backend
+            .install_static_elf(&static_elf(&code), "/bin/clone3-thread-test")
+            .unwrap();
+        let (exit_code, stdout, stderr) = if with_tool {
+            let (_, exit_code, stdout, stderr) = futures::executor::block_on(
+                backend.run_static_elf_with_tool::<StraceTool>((), true),
+            )
+            .unwrap();
+            (exit_code, stdout, stderr)
+        } else {
+            backend.run_static_elf_captured().unwrap()
+        };
+        assert_eq!(exit_code, 0, "with_tool={with_tool}");
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+    }
 }
 
 #[test]

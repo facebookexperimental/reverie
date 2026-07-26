@@ -63,6 +63,16 @@ pub enum Error {
         guest_end: u64,
     },
 
+    /// A host-side user copy crossed an unmapped or `PROT_NONE` guest page.
+    // TODO-HUMAN-REVIEW(PR-132): Review the guest user-access error API.
+    #[error("guest user memory access is denied: address={address:#x}, length={length:#x}")]
+    GuestMemoryAccessDenied {
+        /// First byte requested by the caller.
+        address: u64,
+        /// Requested number of bytes.
+        length: usize,
+    },
+
     /// The transport frame named a number outside the architecture syscall table.
     #[error("invalid x86-64 syscall number {0}")]
     InvalidSyscallNumber(u64),

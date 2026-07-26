@@ -8,7 +8,6 @@
 
 use std::ffi::CStr;
 use std::ffi::CString;
-use std::io::Read;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
@@ -43,6 +42,17 @@ const MEMBARRIER_SUPPORTED: libc::c_int = 0x1;
 const PR_CAPBSET_READ: u64 = 23;
 const GUEST_CAP_LAST_CAP: u64 = 40;
 const PROCESS_CLONE_TID_FLAGS: u64 = libc::CLONE_PARENT_SETTID as u64
+    | libc::CLONE_CHILD_SETTID as u64
+    | libc::CLONE_CHILD_CLEARTID as u64;
+const THREAD_CLONE_REQUIRED_FLAGS: u64 = libc::CLONE_VM as u64
+    | libc::CLONE_FS as u64
+    | libc::CLONE_FILES as u64
+    | libc::CLONE_SIGHAND as u64
+    | libc::CLONE_THREAD as u64;
+const THREAD_CLONE_ALLOWED_FLAGS: u64 = THREAD_CLONE_REQUIRED_FLAGS
+    | libc::CLONE_SYSVSEM as u64
+    | libc::CLONE_SETTLS as u64
+    | libc::CLONE_PARENT_SETTID as u64
     | libc::CLONE_CHILD_SETTID as u64
     | libc::CLONE_CHILD_CLEARTID as u64;
 // TODO-HUMAN-REVIEW(PR-92): Review clone3 signal-disposition reset semantics.
@@ -148,6 +158,15 @@ pub(crate) enum ProcessAction {
         clear_child_tid: Option<u64>,
         // TODO-HUMAN-REVIEW(PR-92): Review CLONE_CLEAR_SIGHAND child state.
         clear_sighand: bool,
+    },
+    // TODO-HUMAN-REVIEW(PR-132): Review cooperative single-vCPU thread cloning.
+    Thread {
+        child_tid: i32,
+        child_stack: u64,
+        parent_tid: Option<u64>,
+        child_tid_address: Option<u64>,
+        clear_child_tid: Option<u64>,
+        tls: Option<u64>,
     },
     Exec {
         image: Vec<u8>,
@@ -378,8 +397,12 @@ fn execute_basic_syscall_with_output(
         fchdir(state, args)
     } else if number == libc::SYS_getdents64 as u64 {
         getdents64(memory, state, args)
-    } else if number == libc::SYS_getpid as u64 || number == libc::SYS_gettid as u64 {
+    } else if number == libc::SYS_getpid as u64 {
         i64::from(state.pid)
+    } else if number == libc::SYS_gettid as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-132): Review distinct KVM thread IDs.
+        i64::from(state.tid)
     } else if number == libc::SYS_getppid as u64 {
         i64::from(state.ppid)
     } else if number == libc::SYS_getpgrp as u64 {
@@ -482,7 +505,10 @@ fn execute_basic_syscall_with_output(
         munmap(memory, args[0], args[1])
     } else if number == libc::SYS_mremap as u64 {
         mremap(memory, state, args)
-    } else if number == libc::SYS_mprotect as u64 || number == libc::SYS_madvise as u64 {
+    } else if number == libc::SYS_mprotect as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        mprotect(memory, args)
+    } else if number == libc::SYS_madvise as u64 {
         validate_range(memory, args[0], args[1])
     } else if number == libc::SYS_munlock as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -593,6 +619,7 @@ pub(crate) struct ElfExecutor {
     process_action: Option<ProcessAction>,
     pending_segment: Option<(SegmentBase, u64)>,
     exit_code: Option<i32>,
+    exit_group: bool,
     clear_child_tid: Option<u64>,
 }
 
@@ -605,6 +632,7 @@ impl ElfExecutor {
             process_action: None,
             pending_segment: None,
             exit_code: None,
+            exit_group: false,
             clear_child_tid: None,
         }
     }
@@ -618,7 +646,7 @@ impl ElfExecutor {
         let args = request.args();
         if number == libc::SYS_set_tid_address as u64 {
             self.clear_child_tid = (args[0] != 0).then_some(args[0]);
-            return Some(i64::from(self.state.pid));
+            return Some(i64::from(self.state.tid));
         }
         if number == libc::SYS_fork as u64 || number == libc::SYS_vfork as u64 {
             return Some(self.prepare_fork(None, None, None, None, false));
@@ -629,15 +657,25 @@ impl ElfExecutor {
                 (args[1] != 0).then_some(args[1]),
                 args[2],
                 args[3],
+                args[4],
             ));
         }
         if number == libc::SYS_clone3 as u64 {
             return Some(match read_clone3(memory, args[0], args[1]) {
+                Ok(request) if request.flags & libc::CLONE_THREAD as u64 != 0 => self
+                    .prepare_thread(
+                        request.flags,
+                        request.child_stack,
+                        request.parent_tid,
+                        request.child_tid,
+                        request.tls,
+                    ),
                 Ok(request) => match validate_process_clone_flags(request.flags) {
                     Err(error) => error,
                     Ok(())
                         if request.flags & PROCESS_CLONE_TID_FLAGS != 0
-                            || request.tid_fields_present =>
+                            || request.parent_tid.is_some()
+                            || request.child_tid.is_some() =>
                     {
                         negative_errno(libc::ENOTSUP)
                     }
@@ -674,7 +712,19 @@ impl ElfExecutor {
         child_stack: Option<u64>,
         parent_tid_address: u64,
         child_tid_address: u64,
+        tls: u64,
     ) -> i64 {
+        if flags & libc::CLONE_THREAD as u64 != 0 {
+            return self.prepare_thread(
+                flags,
+                child_stack,
+                (flags & libc::CLONE_PARENT_SETTID as u64 != 0).then_some(parent_tid_address),
+                (flags & (libc::CLONE_CHILD_SETTID as u64 | libc::CLONE_CHILD_CLEARTID as u64)
+                    != 0)
+                    .then_some(child_tid_address),
+                (flags & libc::CLONE_SETTLS as u64 != 0).then_some(tls),
+            );
+        }
         if let Err(error) = validate_process_clone_flags(flags) {
             return error;
         }
@@ -691,6 +741,42 @@ impl ElfExecutor {
             clear_child_tid,
             flags & CLONE_CLEAR_SIGHAND != 0,
         )
+    }
+
+    fn prepare_thread(
+        &mut self,
+        flags: u64,
+        child_stack: Option<u64>,
+        parent_tid: Option<u64>,
+        child_tid_address: Option<u64>,
+        tls: Option<u64>,
+    ) -> i64 {
+        if let Err(error) = validate_thread_clone_flags(flags) {
+            return error;
+        }
+        let Some(child_stack) = child_stack else {
+            return negative_errno(libc::EINVAL);
+        };
+        if self.process_action.is_some() {
+            return negative_errno(libc::EBUSY);
+        }
+        let child_tid = self.next_pid.fetch_add(1, Ordering::SeqCst);
+        if child_tid <= 0 {
+            return negative_errno(libc::EAGAIN);
+        }
+        self.process_action = Some(ProcessAction::Thread {
+            child_tid,
+            child_stack,
+            parent_tid,
+            child_tid_address: (flags & libc::CLONE_CHILD_SETTID as u64 != 0)
+                .then_some(child_tid_address)
+                .flatten(),
+            clear_child_tid: (flags & libc::CLONE_CHILD_CLEARTID as u64 != 0)
+                .then_some(child_tid_address)
+                .flatten(),
+            tls,
+        });
+        i64::from(child_tid)
     }
 
     fn prepare_fork(
@@ -793,6 +879,7 @@ impl ElfExecutor {
             process_action: None,
             pending_segment: None,
             exit_code: None,
+            exit_group: false,
             clear_child_tid: None,
         })
     }
@@ -814,6 +901,7 @@ impl ElfExecutor {
         self.state.inherit_process_state(previous);
         self.pending_segment = None;
         self.exit_code = None;
+        self.exit_group = false;
         self.clear_child_tid = None;
     }
 
@@ -840,6 +928,18 @@ impl ElfExecutor {
         (self.state.fs_base, self.state.gs_base)
     }
 
+    // TODO-HUMAN-REVIEW(PR-132): Review cooperative KVM thread context access.
+    pub(crate) fn thread_id(&self) -> i32 {
+        self.state.tid
+    }
+
+    // TODO-HUMAN-REVIEW(PR-132): Review cooperative KVM thread context updates.
+    pub(crate) fn set_thread_context(&mut self, tid: i32, fs_base: u64, gs_base: u64) {
+        self.state.tid = tid;
+        self.state.fs_base = fs_base;
+        self.state.gs_base = gs_base;
+    }
+
     /// Returns and clears a pending FS/GS base update requested via `arch_prctl`.
     pub(crate) fn take_segment(&mut self) -> Option<(SegmentBase, u64)> {
         self.pending_segment.take()
@@ -848,6 +948,17 @@ impl ElfExecutor {
     /// Returns and clears the exit code once the guest calls `exit`/`exit_group`.
     pub(crate) fn take_exit(&mut self) -> Option<i32> {
         self.exit_code.take()
+    }
+
+    // TODO-HUMAN-REVIEW(PR-132): Review KVM thread-group exit propagation.
+    pub(crate) fn take_exit_group(&mut self) -> bool {
+        std::mem::take(&mut self.exit_group)
+    }
+
+    // TODO-HUMAN-REVIEW(PR-132): Review KVM thread-group exit propagation.
+    pub(crate) fn set_exit(&mut self, code: i32, group: bool) {
+        self.exit_code = Some(code);
+        self.exit_group = group;
     }
 
     pub(crate) fn take_output(&mut self) -> (Vec<u8>, Vec<u8>) {
@@ -880,6 +991,7 @@ impl SyscallExecutor for ElfExecutor {
             }
             SyscallAction::Exit(code) => {
                 self.exit_code = Some(code);
+                self.exit_group = request.number() != libc::SYS_exit as u64;
                 0
             }
         }
@@ -1307,8 +1419,14 @@ fn host_read(memory: &mut GuestMemory, fd: RawFd, address: u64, length: usize) -
     if !range_is_valid(memory, address, length as u64) {
         return negative_errno(libc::EFAULT);
     }
-    let mut bytes = vec![0; length];
-    // SAFETY: bytes is writable for length bytes and fd is a live host descriptor.
+    let Ok(writable) = memory.user_accessible_prefix(address, length) else {
+        return negative_errno(libc::EFAULT);
+    };
+    if writable == 0 && length != 0 {
+        return negative_errno(libc::EFAULT);
+    }
+    let mut bytes = vec![0; writable];
+    // SAFETY: bytes is writable for its full length and fd is a live host descriptor.
     let count = unsafe { libc::read(fd, bytes.as_mut_ptr().cast::<libc::c_void>(), bytes.len()) };
     if count < 0 {
         return io_error(std::io::Error::last_os_error());
@@ -1361,19 +1479,7 @@ fn read(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) 
     if requested_length == 0 {
         return 0;
     }
-    let mut bytes = vec![0; length];
-    match state
-        .files
-        .get_mut(&fd)
-        .expect("owned descriptor disappeared")
-        .read(&mut bytes)
-    {
-        Ok(count) => match memory.write(args[1], &bytes[..count]) {
-            Ok(()) => count as i64,
-            Err(_) => negative_errno(libc::EFAULT),
-        },
-        Err(error) => io_error(error),
-    }
+    host_read(memory, file.as_raw_fd(), args[1], length)
 }
 
 fn pread64(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
@@ -1396,7 +1502,13 @@ fn pread64(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -
     if !range_is_valid(memory, args[1], length as u64) {
         return negative_errno(libc::EFAULT);
     }
-    let mut bytes = vec![0; length];
+    let Ok(writable) = memory.user_accessible_prefix(args[1], length) else {
+        return negative_errno(libc::EFAULT);
+    };
+    if writable == 0 {
+        return negative_errno(libc::EFAULT);
+    }
+    let mut bytes = vec![0; writable];
     match file.read_at(&mut bytes, args[3]) {
         Ok(count) => match memory.write(args[1], &bytes[..count]) {
             Ok(()) => count as i64,
@@ -4130,7 +4242,7 @@ fn getdents64(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]
     let Ok(requested_length) = usize::try_from(args[2]) else {
         return negative_errno(libc::EINVAL);
     };
-    let length = requested_length.min(MAX_HOST_IO);
+    let mut length = requested_length.min(MAX_HOST_IO);
     let Some(file) = state.files.get(&fd) else {
         return negative_errno(libc::EBADF);
     };
@@ -4139,6 +4251,15 @@ fn getdents64(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]
     }
     if length >= 24 && !range_is_valid(memory, args[1], length as u64) {
         return negative_errno(libc::EFAULT);
+    }
+    if length >= 24 {
+        let Ok(writable) = memory.user_accessible_prefix(args[1], length) else {
+            return negative_errno(libc::EFAULT);
+        };
+        if writable < 24 {
+            return negative_errno(libc::EFAULT);
+        }
+        length = writable;
     }
     let mut bytes = vec![0; length];
     // SAFETY: file owns a live descriptor and bytes is writable for length bytes.
@@ -4416,11 +4537,30 @@ fn brk(memory: &mut GuestMemory, state: &mut LoadedStaticElf, requested: u64) ->
     if requested < BOOT_RESERVED_END || requested >= state.brk_limit {
         return state.program_break as i64;
     }
-    if requested > state.program_break {
-        let Ok(length) = usize::try_from(requested - state.program_break) else {
+    let previous = state.program_break;
+    if requested > previous {
+        let Ok(length) = usize::try_from(requested - previous) else {
             return state.program_break as i64;
         };
-        if memory.zero(state.program_break, length).is_err() {
+        if memory.zero_raw(previous, length).is_err()
+            || memory
+                .map_user_range(previous, requested - previous, false)
+                .is_err()
+        {
+            return state.program_break as i64;
+        }
+    } else if requested < previous {
+        let Some(unmap_start) = align_up(requested, PAGE_SIZE) else {
+            return state.program_break as i64;
+        };
+        let Some(unmap_end) = align_up(previous, PAGE_SIZE) else {
+            return state.program_break as i64;
+        };
+        if unmap_end > unmap_start
+            && memory
+                .unmap_user_range(unmap_start, unmap_end - unmap_start)
+                .is_err()
+        {
             return state.program_break as i64;
         }
     }
@@ -4436,6 +4576,10 @@ fn mmap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) 
     let is_anonymous = flags & libc::MAP_ANONYMOUS as u64 != 0;
     let is_private = flags & libc::MAP_PRIVATE as u64 != 0;
     let is_shared = flags & libc::MAP_SHARED as u64 != 0;
+    let allowed_protection = (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as u64;
+    if args[2] & !allowed_protection != 0 {
+        return negative_errno(libc::EINVAL);
+    }
     if !is_private && !is_shared {
         return negative_errno(libc::EINVAL);
     }
@@ -4485,13 +4629,19 @@ fn mmap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) 
         None
     };
 
-    if memory.zero(address, length).is_err() {
+    if memory.zero_raw(address, length).is_err() {
         return negative_errno(libc::ENOMEM);
     }
     if let Some(bytes) = file_bytes
-        && memory.write(address, &bytes).is_err()
+        && memory.write_raw(address, &bytes).is_err()
     {
         return negative_errno(libc::EFAULT);
+    }
+    if memory
+        .map_user_range(address, length as u64, args[2] == libc::PROT_NONE as u64)
+        .is_err()
+    {
+        return negative_errno(libc::ENOMEM);
     }
 
     if !fixed {
@@ -4514,9 +4664,36 @@ fn munmap(memory: &mut GuestMemory, address: u64, length: u64) -> i64 {
     let Ok(length) = usize::try_from(length) else {
         return negative_errno(libc::EINVAL);
     };
-    match memory.zero(address, length) {
-        Ok(()) => 0,
+    match memory.zero_raw(address, length) {
+        Ok(()) => match memory.unmap_user_range(address, length as u64) {
+            Ok(()) => 0,
+            Err(_) => negative_errno(libc::EINVAL),
+        },
         Err(_) => negative_errno(libc::EINVAL),
+    }
+}
+
+// TODO-HUMAN-REVIEW(PR-132): Review KVM mprotect user-copy enforcement.
+fn mprotect(memory: &GuestMemory, args: &[u64; 6]) -> i64 {
+    let address = args[0];
+    let requested_length = args[1];
+    let protection = args[2];
+    let allowed_protection = (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as u64;
+    if !address.is_multiple_of(PAGE_SIZE) || protection & !allowed_protection != 0 {
+        return negative_errno(libc::EINVAL);
+    }
+    if requested_length == 0 {
+        return 0;
+    }
+    let Some(length) = align_up(requested_length, PAGE_SIZE) else {
+        return negative_errno(libc::ENOMEM);
+    };
+    if !range_is_valid(memory, address, length) || !memory.user_range_is_mapped(address, length) {
+        return negative_errno(libc::ENOMEM);
+    }
+    match memory.map_user_range(address, length, protection == libc::PROT_NONE as u64) {
+        Ok(()) => 0,
+        Err(_) => negative_errno(libc::ENOMEM),
     }
 }
 
@@ -4536,6 +4713,7 @@ fn mremap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]
         || flags & !allowed_flags != 0
         || flags & libc::MREMAP_FIXED as u64 != 0 && flags & libc::MREMAP_MAYMOVE as u64 == 0
         || !range_is_valid(memory, old_address, old_length)
+        || !memory.user_range_is_mapped(old_address, old_length)
     {
         return negative_errno(libc::EINVAL);
     }
@@ -4546,9 +4724,15 @@ fn mremap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]
             let Ok(length) = usize::try_from(old_length - new_length) else {
                 return negative_errno(libc::ENOMEM);
             };
-            if memory.zero(tail, length).is_err() {
+            if memory.zero_raw(tail, length).is_err() {
                 return negative_errno(libc::EFAULT);
             }
+        }
+        if memory
+            .remap_user_range(old_address, old_length, old_address, new_length)
+            .is_err()
+        {
+            return negative_errno(libc::EFAULT);
         }
         return old_address as i64;
     }
@@ -4562,7 +4746,13 @@ fn mremap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]
             let Ok(extension) = usize::try_from(new_length - old_length) else {
                 return negative_errno(libc::ENOMEM);
             };
-            if memory.zero(old_end, extension).is_err() {
+            if memory.zero_raw(old_end, extension).is_err() {
+                return negative_errno(libc::ENOMEM);
+            }
+            if memory
+                .remap_user_range(old_address, old_length, old_address, new_length)
+                .is_err()
+            {
                 return negative_errno(libc::ENOMEM);
             }
             state.mmap_next = new_end;
@@ -4600,10 +4790,13 @@ fn mremap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]
         return negative_errno(libc::ENOMEM);
     };
     let mut bytes = vec![0; copy_length];
-    if memory.read(old_address, &mut bytes).is_err()
-        || memory.zero(destination, new_length_usize).is_err()
-        || memory.write(destination, &bytes).is_err()
-        || memory.zero(old_address, old_length_usize).is_err()
+    if memory.read_raw(old_address, &mut bytes).is_err()
+        || memory.zero_raw(destination, new_length_usize).is_err()
+        || memory.write_raw(destination, &bytes).is_err()
+        || memory.zero_raw(old_address, old_length_usize).is_err()
+        || memory
+            .remap_user_range(old_address, old_length, destination, new_length)
+            .is_err()
     {
         return negative_errno(libc::EFAULT);
     }
@@ -5596,26 +5789,54 @@ fn validate_process_clone_flags(flags: u64) -> Result<(), i64> {
     Ok(())
 }
 
-struct ProcessCloneRequest {
-    flags: u64,
-    child_stack: Option<u64>,
-    tid_fields_present: bool,
+// TODO-HUMAN-REVIEW(PR-132): Review the accepted glibc pthread clone flag profile.
+fn validate_thread_clone_flags(flags: u64) -> Result<(), i64> {
+    if flags & 0xff != 0 {
+        return Err(negative_errno(libc::EINVAL));
+    }
+    if flags & THREAD_CLONE_REQUIRED_FLAGS != THREAD_CLONE_REQUIRED_FLAGS {
+        return Err(negative_errno(libc::EINVAL));
+    }
+    if flags & !THREAD_CLONE_ALLOWED_FLAGS != 0 {
+        return Err(negative_errno(libc::ENOTSUP));
+    }
+    Ok(())
 }
 
-fn read_clone3(memory: &GuestMemory, address: u64, size: u64) -> Result<ProcessCloneRequest, i64> {
+struct CloneRequest {
+    flags: u64,
+    child_stack: Option<u64>,
+    parent_tid: Option<u64>,
+    child_tid: Option<u64>,
+    tls: Option<u64>,
+}
+
+fn read_clone3(memory: &GuestMemory, address: u64, size: u64) -> Result<CloneRequest, i64> {
     const REQUIRED_SIZE: usize = 64;
     const MAX_SIZE: usize = 88;
 
     let Ok(size) = usize::try_from(size) else {
         return Err(negative_errno(libc::E2BIG));
     };
-    if !(REQUIRED_SIZE..=MAX_SIZE).contains(&size) {
+    if size < REQUIRED_SIZE {
         return Err(negative_errno(libc::EINVAL));
+    }
+    if size > PAGE_SIZE as usize {
+        return Err(negative_errno(libc::E2BIG));
     }
     let mut bytes = [0; MAX_SIZE];
     memory
-        .read(address, &mut bytes[..size])
+        .read(address, &mut bytes[..size.min(MAX_SIZE)])
         .map_err(|_| negative_errno(libc::EFAULT))?;
+    if size > MAX_SIZE {
+        let mut extension = vec![0; size - MAX_SIZE];
+        memory
+            .read(address + MAX_SIZE as u64, &mut extension)
+            .map_err(|_| negative_errno(libc::EFAULT))?;
+        if extension.iter().any(|byte| *byte != 0) {
+            return Err(negative_errno(libc::E2BIG));
+        }
+    }
     let field = |offset: usize| {
         u64::from_le_bytes(
             bytes[offset..offset + 8]
@@ -5623,13 +5844,17 @@ fn read_clone3(memory: &GuestMemory, address: u64, size: u64) -> Result<ProcessC
                 .expect("u64 clone3 field"),
         )
     };
-    if field(8) != 0 {
+    // clone3 ignores pidfd unless CLONE_PIDFD is set. glibc leaves that union
+    // slot nonzero for pthread clones even though the flag is absent.
+    if field(64) != 0 || field(72) != 0 || field(80) != 0 {
         return Err(negative_errno(libc::ENOTSUP));
     }
-    let tid_fields_present = field(16) != 0 || field(24) != 0;
     let flags = field(0) | field(32);
     let stack = field(40);
     let stack_size = field(48);
+    if (stack == 0) != (stack_size == 0) {
+        return Err(negative_errno(libc::EINVAL));
+    }
     let child_stack = if stack == 0 {
         None
     } else {
@@ -5638,10 +5863,12 @@ fn read_clone3(memory: &GuestMemory, address: u64, size: u64) -> Result<ProcessC
     if stack != 0 && child_stack.is_none() {
         return Err(negative_errno(libc::EINVAL));
     }
-    Ok(ProcessCloneRequest {
+    Ok(CloneRequest {
         flags,
         child_stack,
-        tid_fields_present,
+        parent_tid: (field(24) != 0).then(|| field(24)),
+        child_tid: (field(16) != 0).then(|| field(16)),
+        tls: (flags & libc::CLONE_SETTLS as u64 != 0).then(|| field(56)),
     })
 }
 
@@ -5719,6 +5946,9 @@ mod tests {
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;
 
+    use reverie::syscalls::AddrMut;
+    use reverie::syscalls::MemoryAccess;
+
     use super::*;
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
@@ -5757,6 +5987,7 @@ mod tests {
             fs_base: 0,
             gs_base: 0,
             pid: 1,
+            tid: 1,
             ppid: 0,
             umask: 0o022,
             nice: 0,
@@ -8353,6 +8584,36 @@ mod tests {
     }
 
     #[test]
+    fn getdents64_does_not_advance_directory_on_guest_fault() {
+        let root = TestDir::new();
+        std::fs::write(root.0.join("entry"), b"x").unwrap();
+        let mut state = test_state(&root.0);
+        state.files.insert(3, std::fs::File::open(&root.0).unwrap());
+        let mut memory = GuestMemory::new(0, 2 * PAGE_SIZE as usize).unwrap();
+        memory.map_user_range(0, PAGE_SIZE, false).unwrap();
+        memory.map_user_range(PAGE_SIZE, PAGE_SIZE, true).unwrap();
+        memory.enable_user_access();
+
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_getdents64,
+                [3, PAGE_SIZE, PAGE_SIZE, 0, 0, 0],
+            ),
+            negative_errno(libc::EFAULT)
+        );
+        assert!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_getdents64,
+                [3, 0, PAGE_SIZE, 0, 0, 0],
+            ) > 0
+        );
+    }
+
+    #[test]
     fn descriptor_lifecycle_and_error_precedence_match_linux() {
         const PATH_ADDRESS: u64 = 0x100;
         const PAYLOAD_ADDRESS: u64 = 0x200;
@@ -8839,6 +9100,67 @@ mod tests {
     }
 
     #[test]
+    fn read_limits_host_consumption_to_the_accessible_guest_prefix() {
+        let root = TestDir::new();
+        let path = root.0.join("input");
+        std::fs::write(&path, b"abcdefgh").unwrap();
+        let mut state = test_state(&root.0);
+        state.files.insert(3, std::fs::File::open(&path).unwrap());
+        state.files.insert(4, std::fs::File::open(&path).unwrap());
+        let mut memory = GuestMemory::new(0, 2 * PAGE_SIZE as usize).unwrap();
+        memory.map_user_range(0, PAGE_SIZE, false).unwrap();
+        memory.map_user_range(PAGE_SIZE, PAGE_SIZE, true).unwrap();
+        memory.enable_user_access();
+
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_read,
+                [3, PAGE_SIZE - 4, 8, 0, 0, 0],
+            ),
+            4
+        );
+        let mut first = [0; 4];
+        memory.read(PAGE_SIZE - 4, &mut first).unwrap();
+        assert_eq!(&first, b"abcd");
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_read,
+                [3, 0x100, 4, 0, 0, 0],
+            ),
+            4
+        );
+        let mut second = [0; 4];
+        memory.read(0x100, &mut second).unwrap();
+        assert_eq!(&second, b"efgh");
+
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_read,
+                [4, PAGE_SIZE, 4, 0, 0, 0],
+            ),
+            negative_errno(libc::EFAULT)
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_read,
+                [4, 0x200, 4, 0, 0, 0],
+            ),
+            4
+        );
+        let mut unconsumed = [0; 4];
+        memory.read(0x200, &mut unconsumed).unwrap();
+        assert_eq!(&unconsumed, b"abcd");
+    }
+
+    #[test]
     fn inherited_special_stdin_matches_linux_read_precedence() {
         let root = TestDir::new();
         let mut state = test_state(&root.0);
@@ -9295,6 +9617,90 @@ mod tests {
                 ],
             ),
             negative_errno(libc::EINVAL)
+        );
+    }
+
+    #[test]
+    fn mprotect_and_munmap_bound_tool_user_copies() {
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let memory_size = BOOT_RESERVED_END + 8 * PAGE_SIZE;
+        let mut memory = GuestMemory::new(0, memory_size as usize).unwrap();
+        state.mmap_next = BOOT_RESERVED_END + PAGE_SIZE;
+        state.mmap_limit = memory_size;
+        let mapping = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_mmap,
+            [
+                0,
+                2 * PAGE_SIZE,
+                (libc::PROT_READ | libc::PROT_WRITE) as u64,
+                (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS) as u64,
+                -1_i32 as u64,
+                0,
+            ],
+        ) as u64;
+        memory.enable_user_access();
+
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_mprotect,
+                [
+                    mapping + PAGE_SIZE,
+                    PAGE_SIZE,
+                    libc::PROT_NONE as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            0
+        );
+        let boundary = AddrMut::from_raw((mapping + PAGE_SIZE - 8) as usize).unwrap();
+        assert_eq!(
+            MemoryAccess::write(&mut memory, boundary, &[0x5a; 16]).unwrap(),
+            8
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_mprotect,
+                [
+                    mapping + PAGE_SIZE,
+                    PAGE_SIZE,
+                    (libc::PROT_READ | libc::PROT_WRITE) as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            0
+        );
+        assert_eq!(
+            MemoryAccess::write(&mut memory, boundary, &[0x33; 16]).unwrap(),
+            16
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_munmap,
+                [mapping, 2 * PAGE_SIZE, 0, 0, 0, 0],
+            ),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_mprotect,
+                [mapping, PAGE_SIZE, libc::PROT_READ as u64, 0, 0, 0],
+            ),
+            negative_errno(libc::ENOMEM)
         );
     }
 
@@ -10419,6 +10825,90 @@ mod tests {
         assert_eq!(
             executor.execute_process_action(&request, &memory),
             Some(negative_errno(libc::ENOTSUP))
+        );
+        assert!(executor.take_process_action().is_none());
+    }
+
+    #[test]
+    fn clone3_accepts_glibc_pthread_profile_with_tls_and_tid_addresses() {
+        const CLONE3_ARGS: u64 = 0x200;
+        const CHILD_TID_ADDRESS: u64 = 0x300;
+        const PARENT_TID_ADDRESS: u64 = 0x308;
+        const CHILD_STACK: u64 = 0x4000;
+        const CHILD_STACK_SIZE: u64 = 0x9000;
+        const TLS: u64 = 0x1_234_000;
+
+        let root = TestDir::new();
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let mut clone3 = [0_u8; 88];
+        let flags = THREAD_CLONE_REQUIRED_FLAGS
+            | libc::CLONE_SYSVSEM as u64
+            | libc::CLONE_SETTLS as u64
+            | libc::CLONE_PARENT_SETTID as u64
+            | libc::CLONE_CHILD_CLEARTID as u64;
+        clone3[0..8].copy_from_slice(&flags.to_le_bytes());
+        // glibc leaves clone_args.pidfd aliased to the thread descriptor even
+        // though CLONE_PIDFD is absent; Linux ignores the slot in that case.
+        clone3[8..16].copy_from_slice(&CHILD_TID_ADDRESS.to_le_bytes());
+        clone3[16..24].copy_from_slice(&CHILD_TID_ADDRESS.to_le_bytes());
+        clone3[24..32].copy_from_slice(&PARENT_TID_ADDRESS.to_le_bytes());
+        clone3[40..48].copy_from_slice(&CHILD_STACK.to_le_bytes());
+        clone3[48..56].copy_from_slice(&CHILD_STACK_SIZE.to_le_bytes());
+        clone3[56..64].copy_from_slice(&TLS.to_le_bytes());
+        memory.write(CLONE3_ARGS, &clone3).unwrap();
+        let mut executor = ElfExecutor::new(test_state(&root.0), false);
+        let request = SyscallRequest::new(
+            libc::SYS_clone3 as u64,
+            [CLONE3_ARGS, clone3.len() as u64, 0, 0, 0, 0],
+        );
+
+        assert_eq!(executor.execute_process_action(&request, &memory), Some(2));
+        match executor.take_process_action() {
+            Some(ProcessAction::Thread {
+                child_tid,
+                child_stack,
+                parent_tid,
+                child_tid_address,
+                clear_child_tid,
+                tls,
+            }) => {
+                assert_eq!(child_tid, 2);
+                assert_eq!(child_stack, CHILD_STACK + CHILD_STACK_SIZE);
+                assert_eq!(parent_tid, Some(PARENT_TID_ADDRESS));
+                assert_eq!(child_tid_address, None);
+                assert_eq!(clear_child_tid, Some(CHILD_TID_ADDRESS));
+                assert_eq!(tls, Some(TLS));
+            }
+            _ => panic!("glibc pthread clone3 did not produce a thread action"),
+        }
+    }
+
+    #[test]
+    fn clone3_validates_nonzero_extensions_and_paired_stack_fields() {
+        const CLONE3_ARGS: u64 = 0x200;
+
+        let root = TestDir::new();
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let mut clone3 = [0_u8; 96];
+        clone3[95] = 1;
+        memory.write(CLONE3_ARGS, &clone3).unwrap();
+        let mut executor = ElfExecutor::new(test_state(&root.0), false);
+        let request = SyscallRequest::new(
+            libc::SYS_clone3 as u64,
+            [CLONE3_ARGS, clone3.len() as u64, 0, 0, 0, 0],
+        );
+        assert_eq!(
+            executor.execute_process_action(&request, &memory),
+            Some(negative_errno(libc::E2BIG))
+        );
+
+        clone3[95] = 0;
+        clone3[40..48].copy_from_slice(&0x1000_u64.to_le_bytes());
+        memory.write(CLONE3_ARGS, &clone3).unwrap();
+        let request = SyscallRequest::new(libc::SYS_clone3 as u64, [CLONE3_ARGS, 88, 0, 0, 0, 0]);
+        assert_eq!(
+            executor.execute_process_action(&request, &memory),
+            Some(negative_errno(libc::EINVAL))
         );
         assert!(executor.take_process_action().is_none());
     }

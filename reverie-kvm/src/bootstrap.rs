@@ -94,7 +94,7 @@ pub(crate) fn configure_long_mode(
     write_descriptor_tables(memory)?;
     write_page_tables(memory)?;
     let trampoline = syscall_trampoline(hypercall_instruction);
-    memory.write(SYSCALL_TRAMPOLINE_ADDRESS, &trampoline)?;
+    memory.write_raw(SYSCALL_TRAMPOLINE_ADDRESS, &trampoline)?;
 
     let mut sregs = vcpu.get_sregs()?;
     sregs.gdt.base = GDT_ADDRESS;
@@ -239,7 +239,7 @@ pub(crate) fn set_syscall_return_park(
     } else {
         trampoline[return_offset]
     };
-    memory.write(SYSCALL_TRAMPOLINE_ADDRESS + return_offset as u64, &[byte])
+    memory.write_raw(SYSCALL_TRAMPOLINE_ADDRESS + return_offset as u64, &[byte])
 }
 
 fn write_descriptor_tables(memory: &mut GuestMemory) -> Result<()> {
@@ -257,24 +257,24 @@ fn write_descriptor_tables(memory: &mut GuestMemory) -> Result<()> {
     for entry in entries {
         bytes.extend_from_slice(&entry.to_le_bytes());
     }
-    memory.write(GDT_ADDRESS, &bytes)?;
+    memory.write_raw(GDT_ADDRESS, &bytes)?;
     write_exception_tables(memory)?;
-    memory.zero(TSS_ADDRESS, 0x68)?;
+    memory.zero_raw(TSS_ADDRESS, 0x68)?;
     write_u64(memory, TSS_ADDRESS + 4, EXCEPTION_STACK_TOP)?;
-    memory.write(TSS_ADDRESS + 0x66, &0x68_u16.to_le_bytes())?;
-    memory.zero(EXCEPTION_STACK_BOTTOM, PAGE_SIZE as usize)
+    memory.write_raw(TSS_ADDRESS + 0x66, &0x68_u16.to_le_bytes())?;
+    memory.zero_raw(EXCEPTION_STACK_BOTTOM, PAGE_SIZE as usize)
 }
 
 fn write_exception_tables(memory: &mut GuestMemory) -> Result<()> {
-    memory.zero(IDT_ADDRESS, PAGE_SIZE as usize)?;
-    memory.zero(EXCEPTION_STUB_ADDRESS, PAGE_SIZE as usize)?;
+    memory.zero_raw(IDT_ADDRESS, PAGE_SIZE as usize)?;
+    memory.zero_raw(EXCEPTION_STUB_ADDRESS, PAGE_SIZE as usize)?;
 
     for vector in 0..EXCEPTION_VECTOR_COUNT {
         let handler = EXCEPTION_STUB_ADDRESS + vector as u64 * EXCEPTION_STUB_STRIDE;
         let gate = idt_gate(handler);
-        memory.write(IDT_ADDRESS + (vector * IDT_ENTRY_SIZE) as u64, &gate)?;
+        memory.write_raw(IDT_ADDRESS + (vector * IDT_ENTRY_SIZE) as u64, &gate)?;
         let stub = exception_stub(vector as u8);
-        memory.write(handler, &stub)?;
+        memory.write_raw(handler, &stub)?;
     }
     Ok(())
 }
@@ -326,9 +326,9 @@ pub(crate) fn exception_from_halt(
 }
 
 fn write_page_tables(memory: &mut GuestMemory) -> Result<()> {
-    memory.zero(PML4_ADDRESS, PAGE_SIZE as usize)?;
-    memory.zero(PDPT_ADDRESS, PAGE_SIZE as usize)?;
-    memory.zero(PDE_ADDRESS, PAGE_SIZE as usize)?;
+    memory.zero_raw(PML4_ADDRESS, PAGE_SIZE as usize)?;
+    memory.zero_raw(PDPT_ADDRESS, PAGE_SIZE as usize)?;
+    memory.zero_raw(PDE_ADDRESS, PAGE_SIZE as usize)?;
 
     write_u64(memory, PML4_ADDRESS, PDPT_ADDRESS | 0x7)?;
     write_u64(memory, PDPT_ADDRESS, PDE_ADDRESS | 0x7)?;
@@ -342,12 +342,12 @@ fn write_page_tables(memory: &mut GuestMemory) -> Result<()> {
 }
 
 fn write_u64(memory: &mut GuestMemory, address: u64, value: u64) -> Result<()> {
-    memory.write(address, &value.to_le_bytes())
+    memory.write_raw(address, &value.to_le_bytes())
 }
 
 fn read_u64(memory: &GuestMemory, address: u64) -> Result<u64> {
     let mut value = [0; std::mem::size_of::<u64>()];
-    memory.read(address, &mut value)?;
+    memory.read_raw(address, &mut value)?;
     Ok(u64::from_le_bytes(value))
 }
 
