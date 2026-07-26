@@ -53,6 +53,8 @@ use reverie::syscalls::Sysno;
 use crate::DbiGuest;
 use crate::RegisterReader;
 use crate::SyscallInvoker;
+use crate::counter::RecordSyscall;
+use crate::counter::SyscallCounterGlobal;
 
 /// Native callback that emits a pre-formatted buffer via DynamoRIO's own I/O.
 pub type Emitter = unsafe extern "C" fn(*const u8, usize);
@@ -159,6 +161,35 @@ impl Tool for SyscallCounterTool {
     }
 }
 
+/// Counts every syscall by number into a **shared, cross-process** histogram.
+///
+/// Unlike [`SyscallCounterTool`] (whose histogram is process-local, so fork
+/// children are counted separately), this tool routes each syscall through
+/// [`reverie::Guest::send_rpc`] to the single [`SyscallCounterGlobal`] owned by
+/// the coordinator process — over a Unix-domain socket (see [`crate::sync_rpc`])
+/// when one is configured. The coordinator prints the aggregate at run end, so
+/// this handler produces no per-process output.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SharedSyscallCounterTool;
+
+#[reverie::tool]
+impl Tool for SharedSyscallCounterTool {
+    type GlobalState = SyscallCounterGlobal;
+    type ThreadState = ();
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        let number = syscall.number();
+        // Record into the shared histogram before injecting; `exit`/`exit_group`
+        // never return to us, but the count is already committed above.
+        let _ = guest.send_rpc(RecordSyscall(number.id())).await;
+        Ok(guest.inject(syscall).await?)
+    }
+}
+
 /// Logs every syscall's name, decoded arguments and return value.
 ///
 /// Mirrors `strace_minimal`, but recovers the real return value via
@@ -205,13 +236,21 @@ impl Tool for StraceTool {
 enum ActiveTool {
     Strace,
     Counter,
+    SharedCounter,
 }
 
 fn active_tool() -> Option<ActiveTool> {
     if *STRACE_ENABLED {
         Some(ActiveTool::Strace)
     } else if *HISTOGRAM_ENABLED {
-        Some(ActiveTool::Counter)
+        // When a coordinator socket is configured, count into the single shared
+        // cross-process GlobalState; otherwise fall back to the process-local
+        // histogram.
+        if crate::sync_rpc::is_active() {
+            Some(ActiveTool::SharedCounter)
+        } else {
+            Some(ActiveTool::Counter)
+        }
     } else {
         None
     }
@@ -278,6 +317,15 @@ pub(crate) fn run_active_tool(
             invoke_syscall,
             read_registers,
         ),
+        ActiveTool::SharedCounter => dispatch_shared(
+            context,
+            tid,
+            pid,
+            branches,
+            syscall,
+            invoke_syscall,
+            read_registers,
+        ),
     };
     Some(match result {
         Ok(value) => value,
@@ -317,4 +365,36 @@ where
         read_registers,
     );
     run_ready(tool.handle_syscall_event(&mut guest, syscall))
+}
+
+/// Runs one syscall through [`SharedSyscallCounterTool`], whose non-`()`
+/// [`SyscallCounterGlobal`] is served out-of-process. `send_rpc` routes to the
+/// coordinator socket, so the local `global` below is a never-touched
+/// placeholder required only by the [`DbiGuest`] constructor.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_shared(
+    context: usize,
+    tid: i32,
+    pid: i32,
+    branches: u64,
+    syscall: Syscall,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
+) -> Result<i64, Error> {
+    let global = SyscallCounterGlobal::default();
+    let config = ();
+    let mut thread_state = ();
+    let mut guest = DbiGuest::new(
+        context,
+        reverie::Pid::from_raw(tid),
+        reverie::Pid::from_raw(pid),
+        None,
+        branches,
+        &mut thread_state,
+        &global,
+        &config,
+        invoke_syscall,
+        read_registers,
+    );
+    run_ready(SharedSyscallCounterTool.handle_syscall_event(&mut guest, syscall))
 }

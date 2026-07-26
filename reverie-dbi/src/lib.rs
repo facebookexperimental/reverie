@@ -16,7 +16,9 @@
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
+pub mod counter;
 mod launcher;
+pub mod sync_rpc;
 #[cfg(feature = "prototype-runtime")]
 mod tools;
 
@@ -178,7 +180,16 @@ where
         &self,
         message: <T::GlobalState as GlobalTool>::Request,
     ) -> <T::GlobalState as GlobalTool>::Response {
-        self.global_state.receive_rpc(self.tid, message).await
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#121): Review cross-process GlobalState RPC routing.
+        // When a coordinator socket is configured, route the RPC to the single
+        // shared GlobalState hosted out-of-process; otherwise fall back to the
+        // in-process (per-process) global state.
+        if crate::sync_rpc::is_active() {
+            crate::sync_rpc::send_rpc(self.tid, message)
+        } else {
+            self.global_state.receive_rpc(self.tid, message).await
+        }
     }
 
     fn config(&self) -> &<T::GlobalState as GlobalTool>::Config {
@@ -195,7 +206,15 @@ where
         &self,
         message: <T::GlobalState as GlobalTool>::Request,
     ) -> <T::GlobalState as GlobalTool>::Response {
-        self.global_state.receive_rpc(self.tid, message).await
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#121): Review cross-process GlobalState RPC routing.
+        // See `DbiGlobal::send_rpc`: prefer the cross-process coordinator when
+        // one is configured, so fork/exec children share one GlobalState.
+        if crate::sync_rpc::is_active() {
+            crate::sync_rpc::send_rpc(self.tid, message)
+        } else {
+            self.global_state.receive_rpc(self.tid, message).await
+        }
     }
 
     fn config(&self) -> &<T::GlobalState as GlobalTool>::Config {
@@ -884,14 +903,37 @@ fn rewrite_bind_port<G: Guest<PrototypeTool>>(
 /// Handlers that complete on the first poll return `Some` immediately.
 fn run_ready<F: Future>(future: F, tail_result: &TailInjectResult) -> Option<F::Output> {
     let mut future = pin!(future);
-    let waker = Waker::noop();
-    let mut context = Context::from_waker(waker);
+    // Park this thread while the handler is Pending instead of busy-spinning at
+    // 100% CPU. A `Wake` that unparks the current thread resumes a genuinely
+    // async handler (e.g. one resumed by a cross-thread wake) promptly, and a
+    // short park timeout re-checks `tail_result` defensively in case a wake is
+    // ever missed. A diverging handler installs its tail-inject result during
+    // the poll that returns Pending, so the `tail_result.is_ready()` arm is
+    // reached before any parking. With the synchronous RPC client, RPC handlers
+    // now resolve on the first poll and never reach the parking path at all.
+    let waker = Waker::from(Arc::new(ThreadUnparkWaker(std::thread::current())));
+    let mut context = Context::from_waker(&waker);
     loop {
         match future.as_mut().poll(&mut context) {
             Poll::Ready(value) => return Some(value),
             Poll::Pending if tail_result.is_ready() => return None,
-            Poll::Pending => std::hint::spin_loop(),
+            Poll::Pending => std::thread::park_timeout(std::time::Duration::from_millis(1)),
         }
+    }
+}
+
+/// A [`Wake`] implementation that unparks a specific thread, so a `Pending`
+/// handler future in [`run_ready`] is re-polled promptly when woken rather than
+/// via a busy spin.
+struct ThreadUnparkWaker(std::thread::Thread);
+
+impl std::task::Wake for ThreadUnparkWaker {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.unpark();
     }
 }
 

@@ -15,10 +15,13 @@ default = ["prototype-runtime"]
 prototype-runtime = []
 
 [dependencies]
+bincode = { version = "2", features = ["serde"] }
 libc = "0.2.186"
 reverie = { version = "0.1.0", path = "../reverie" }
 reverie-memory = { version = "0.1.0", path = "../reverie-memory" }
 serde = { version = "1.0.219", features = ["derive"] }
 
 [dev-dependencies]
+reverie-rpc-transport = { version = "0.1.0", path = "../reverie-rpc-transport" }
 tempfile = "3.27.0"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "time"] }
