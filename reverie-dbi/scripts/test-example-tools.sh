@@ -30,6 +30,7 @@ trap 'rm -rf "$tmpdir"' EXIT
 pthread_guest="$tmpdir/pthread-lifecycle"
 rewrite_exit_guest="$tmpdir/rewrite-exit"
 set_reg_guest="$tmpdir/set-reg-probe"
+ppid_guest="$tmpdir/ppid-probe"
 identity_policy_guest="$tmpdir/identity-policy"
 fork_pthread_guest="$tmpdir/fork-pthread-identity"
 blocked_exit_guest="$tmpdir/blocked-exit-group"
@@ -42,6 +43,8 @@ chaos_data="$tmpdir/chaos-data.txt"
   "$crate_dir/tests/fixtures/rewrite_exit.c" -o "$rewrite_exit_guest"
 "${CC:-cc}" -O2 -g -std=c11 -Wall -Wextra -Werror \
   "$crate_dir/tests/fixtures/set_reg_probe.c" -o "$set_reg_guest"
+"${CC:-cc}" -O2 -g -std=c11 -Wall -Wextra -Werror \
+  "$crate_dir/tests/fixtures/ppid_probe.c" -o "$ppid_guest"
 "${CC:-cc}" -O2 -g -std=c11 -Wall -Wextra -Werror \
   "$crate_dir/tests/fixtures/identity_policy.c" -o "$identity_policy_guest"
 "${CC:-cc}" -O2 -g -std=c11 -Wall -Wextra -Werror -pthread \
@@ -103,6 +106,17 @@ run_tool HERMIT_DBI_TEST_SET_REG "$set_reg_guest"
 grep -q '^r15=0xdeadbeefcafef00d$' "$tmpdir/out" \
   || fail "set_regs: guest did not observe the tool-written r15 sentinel"
 echo "PASS: set_regs (tool overwrites guest r15, guest observes it post-syscall)"
+
+# ppid: the tool reads Guest::ppid()/is_root_process() at getpid. The DBI Tool
+# runtime runs only in the tree root (copied/forked children take the native-only
+# identity path and never dispatch a Rust Tool), so the tool-observable case is
+# the root, which must report no in-tree parent. This drives the full native->Rust
+# surface (in_tree_parent_pid -> thread_init -> PROCESS_PPID -> current_ppid ->
+# Guest::ppid); the real-parent case is covered by the reverie-dbi unit tests.
+run_tool HERMIT_DBI_TEST_PPID "$ppid_guest"
+grep -q '^PPID_ROOT ok=1 pid=[0-9][0-9]* ppid=-1 root=1$' "$tmpdir/err" \
+  || fail "ppid: tree root did not report ppid=None / is_root_process=true"
+echo "PASS: ppid (tree root reports ppid=None and is_root_process=true via the native surface)"
 
 run_tool HERMIT_DBI_NOOP "$identity_policy_guest"
 grep -q '^pid=3 ppid=1 tid=3 identity_fd=open$' "$tmpdir/out" \

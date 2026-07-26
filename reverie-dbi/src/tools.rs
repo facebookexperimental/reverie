@@ -90,6 +90,7 @@ const STRACE_ENV: &str = "HERMIT_DBI_STRACE";
 const NOOP_ENV: &str = "HERMIT_DBI_NOOP";
 const TEST_REWRITE_EXIT_ENV: &str = "HERMIT_DBI_TEST_REWRITE_EXIT";
 const TEST_SET_REG_ENV: &str = "HERMIT_DBI_TEST_SET_REG";
+const TEST_PPID_ENV: &str = "HERMIT_DBI_TEST_PPID";
 const COUNTER1_ENV: &str = "HERMIT_DBI_COUNTER1";
 const COUNTER2_ENV: &str = "HERMIT_DBI_COUNTER2";
 const CHUNKY_PRINT_ENV: &str = "HERMIT_DBI_CHUNKY_PRINT";
@@ -121,6 +122,7 @@ static NOOP_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(NOOP_ENV));
 static TEST_REWRITE_EXIT_ENABLED: LazyLock<bool> =
     LazyLock::new(|| env_flag(TEST_REWRITE_EXIT_ENV));
 static TEST_SET_REG_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(TEST_SET_REG_ENV));
+static TEST_PPID_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(TEST_PPID_ENV));
 static COUNTER1_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(COUNTER1_ENV));
 static COUNTER2_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(COUNTER2_ENV));
 static CHUNKY_PRINT_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(CHUNKY_PRINT_ENV));
@@ -446,6 +448,56 @@ impl Tool for SetRegTool {
             }
             _ => guest.tail_inject(syscall).await,
         }
+    }
+}
+
+/// Regression tool that exercises the DBI `Guest::ppid` path (and the
+/// `is_root_process` default built on it). On the guest's `getpid`, it emits one
+/// line reporting the tool-observed real `pid`, the `Guest::ppid` result, and
+/// `is_root_process`, then lets the syscall run normally. The DBI Tool runtime
+/// runs only in the root of the traced tree — copied/forked children are served
+/// by the native-only identity/policy path (`emulate_identity_getter` /
+/// `reverie_dbi_runtime_copied_syscall`) and never dispatch a Rust `Tool` — so
+/// the emitted line is `PPID_ROOT`, where `ppid` must be `None`. The real
+/// in-tree parent case (a positive `current_ppid`, so `ppid == Some(parent)` and
+/// `is_root_process() == false`) is covered by the crate's unit tests, which
+/// drive `current_ppid`/`Guest::ppid` with a positive parent pid directly.
+#[derive(Clone, Copy, Debug, Default)]
+struct PpidTool;
+
+#[reverie::tool]
+impl Tool for PpidTool {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-ratchet11): Review the DBI ppid regression tool.
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        if syscall.number() == Sysno::getpid {
+            let pid = guest.pid().as_raw();
+            let ppid = guest.ppid();
+            let is_root = guest.is_root_process();
+            // The root observes no in-tree parent; a forked child observes its
+            // real parent (the root) and is not itself a root.
+            let (kind, ok) = if is_root {
+                ("PPID_ROOT", ppid.is_none())
+            } else {
+                ("PPID_CHILD", ppid.is_some_and(|p| p.as_raw() > 0))
+            };
+            emit_line(&format!(
+                "{kind} ok={} pid={} ppid={} root={}",
+                ok as i32,
+                pid,
+                ppid.map_or(-1, |p| p.as_raw()),
+                is_root as i32,
+            ));
+        }
+        // Never suppress: let the guest observe its normal (virtualized) result.
+        guest.tail_inject(syscall).await
     }
 }
 
@@ -1175,6 +1227,7 @@ enum ActiveTool {
     Noop,
     RewriteExit,
     SetReg,
+    Ppid,
     Counter1,
     Counter2,
     ChunkyPrint,
@@ -1187,6 +1240,8 @@ fn active_tool() -> Option<ActiveTool> {
         Some(ActiveTool::RewriteExit)
     } else if *TEST_SET_REG_ENABLED {
         Some(ActiveTool::SetReg)
+    } else if *TEST_PPID_ENABLED {
+        Some(ActiveTool::Ppid)
     } else if *STRACE_ENABLED {
         Some(ActiveTool::Strace)
     } else if *HISTOGRAM_ENABLED {
@@ -1566,6 +1621,17 @@ pub(crate) fn run_active_tool(
         ),
         ActiveTool::SetReg => dispatch(
             &SetRegTool,
+            context,
+            tid,
+            pid,
+            branches,
+            syscall,
+            invoke_syscall,
+            read_registers,
+            write_registers,
+        ),
+        ActiveTool::Ppid => dispatch(
+            &PpidTool,
             context,
             tid,
             pid,

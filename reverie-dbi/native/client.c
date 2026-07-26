@@ -172,8 +172,9 @@ static void reverie_dbi_emit_stdout(const char *buf, size_t len) {
 // TODO-HUMAN-REVIEW(PR-131): Review the native thread lifecycle callback ABI.
 extern int32_t reverie_dbi_runtime_thread_init(
     prototype_counters_t *counters, void *context, int32_t tid, int32_t pid,
-    uint64_t branches, int32_t defer_runtime, syscall_invoker_t invoke_syscall,
-    register_reader_t read_registers, register_writer_t write_registers);
+    int32_t in_tree_ppid, uint64_t branches, int32_t defer_runtime,
+    syscall_invoker_t invoke_syscall, register_reader_t read_registers,
+    register_writer_t write_registers);
 extern int32_t reverie_dbi_runtime_thread_created(
     prototype_counters_t *counters, void *context, int32_t parent_tid,
     int32_t pid, uint64_t branches, int32_t child_tid, uint64_t child_tid_addr,
@@ -500,6 +501,22 @@ static int32_t read_registers(uintptr_t context, struct user_regs_struct *out);
 static int32_t write_registers(uintptr_t context,
                                const struct user_regs_struct *in);
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-ratchet11): Review the in-tree parent-pid surface.
+// The real parent pid of the current process within the traced tree, or -1 when
+// this is the tree root. DynamoRIO follows clone/fork children
+// (-follow_children), so a non-root process's real OS parent is always its
+// in-tree parent; the root's real parent is the out-of-tree launcher, which the
+// `Guest::ppid` contract reports as no parent (`None`). The root is identified
+// by its virtual identity being the root sentinel, assigned in `dr_client_main`
+// when its pid is absent from the shared virtual-identity map.
+// `virtual_process_id` is a per-process constant, so this is stable for every
+// thread of the process.
+static int32_t in_tree_parent_pid(void) {
+  return virtual_process_id == VIRTUAL_ROOT_PID ? -1
+                                                : (int32_t)dr_get_parent_id();
+}
+
 // TODO-HUMAN-REVIEW(PR-131): Review the child entry-block scheduling gate.
 static void start_pending_thread(void) {
   void *drcontext = dr_get_current_drcontext();
@@ -510,7 +527,7 @@ static void start_pending_thread(void) {
 
   int32_t init_result = reverie_dbi_runtime_thread_init(
       counters, drcontext, (int32_t)dr_get_thread_id(drcontext),
-      (int32_t)dr_get_process_id(),
+      (int32_t)dr_get_process_id(), in_tree_parent_pid(),
       atomic_load_explicit(&branch_count, memory_order_relaxed), 0,
       invoke_syscall, read_registers, write_registers);
   // TODO-HUMAN-REVIEW(PR-134): Confirm retryable native child startup.
@@ -1829,7 +1846,7 @@ static void thread_init(void *drcontext) {
           atomic_load_explicit(&image_generation, memory_order_acquire));
   int32_t init_result = reverie_dbi_runtime_thread_init(
       counters, drcontext, (int32_t)dr_get_thread_id(drcontext),
-      (int32_t)dr_get_process_id(),
+      (int32_t)dr_get_process_id(), in_tree_parent_pid(),
       atomic_load_explicit(&branch_count, memory_order_relaxed), 1, invoke_syscall,
       read_registers, write_registers);
   if (init_result < 0) {

@@ -30,6 +30,7 @@ use std::pin::pin;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicI32;
 use std::sync::atomic::AtomicU16;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -253,14 +254,17 @@ where
         self.pid
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-ratchet11): Review the DBI in-tree parent surface.
     fn ppid(&self) -> Option<Pid> {
-        // The DynamoRIO backend currently instruments a single process, whose
-        // main thread is the root of the traced tree, so `None` is correct for
-        // it (see `is_root_process`). Reporting a real in-tree parent for
-        // forked children requires the native client to track the process tree
-        // across `clone`/`fork`, which it does not yet surface.
-        // TODO-STUB(#31): track the process tree so children report their
-        // in-tree parent instead of always `None`.
+        // The real in-tree parent pid, or `None` for the root of the traced
+        // tree, matching `pid()`/`tid()` reporting real host ids. The native
+        // client already tracks the process tree across `clone`/`fork` (it
+        // follows children with `-follow_children`) and supplies this value at
+        // thread initialization via `current_ppid`; the tree root reports `None`
+        // because its real parent is the out-of-tree launcher. This also makes
+        // the `is_root_process` default (`ppid().is_none()`) correct for forked
+        // children, which previously always looked like roots.
         self.ppid
     }
 
@@ -982,7 +986,7 @@ pub fn run_tool_thread_start<T: Tool>(
         context,
         tid,
         pid,
-        None,
+        current_ppid(),
         branch_count,
         thread_state,
         global_state,
@@ -1015,7 +1019,7 @@ pub fn run_tool_post_exec<T: Tool>(
         context,
         tid,
         pid,
-        None,
+        current_ppid(),
         branch_count,
         thread_state,
         global_state,
@@ -1071,7 +1075,7 @@ pub fn run_tool_syscall<T: Tool>(
         context,
         tid,
         pid,
-        None,
+        current_ppid(),
         branch_count,
         thread_state,
         global_state,
@@ -1109,6 +1113,31 @@ pub fn bundled_dynamorio_cmake_dir() -> &'static Path {
 pub fn native_client_source_dir() -> &'static Path {
     Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/native"))
 }
+/// Sentinel stored in [`PROCESS_PPID`] meaning "no in-tree parent" — this
+/// process is the root of the traced tree, so [`Guest::ppid`] reports `None`.
+const PPID_NONE: i32 = -1;
+
+/// The current process's real in-tree parent pid, supplied once by the native
+/// client during thread initialization (see `in_tree_parent_pid` in
+/// `native/client.c`), or [`PPID_NONE`] for the tree root. It is a per-process
+/// constant — every thread of the process shares one parent — so it is written
+/// idempotently by each `reverie_dbi_runtime_thread_init` and read with relaxed
+/// ordering. It starts at [`PPID_NONE`] so a guest constructed before native
+/// initialization (or in a build without the native runtime) preserves the
+/// previous behaviour of reporting no parent rather than a bogus pid.
+static PROCESS_PPID: AtomicI32 = AtomicI32::new(PPID_NONE);
+
+/// The in-tree parent pid recorded for this process, or `None` for the tree
+/// root. Threaded into every [`DbiGuest`] so `Guest::ppid` (and the
+/// `is_root_process` default built on it) reflect the real process tree that the
+/// native client follows across `clone`/`fork`.
+fn current_ppid() -> Option<Pid> {
+    match PROCESS_PPID.load(Ordering::Relaxed) {
+        raw if raw > 0 => Some(Pid::from_raw(raw)),
+        _ => None,
+    }
+}
+
 #[cfg(feature = "prototype-runtime")]
 static PROTOTYPE_TOOL: PrototypeTool = PrototypeTool;
 #[cfg(feature = "prototype-runtime")]
@@ -1146,12 +1175,17 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
     _context: *mut c_void,
     _tid: i32,
     _pid: i32,
+    in_tree_ppid: i32,
     _branches: u64,
     _defer_runtime: i32,
     _invoke_syscall: SyscallInvoker,
     _read_registers: RegisterReader,
     _write_registers: RegisterWriter,
 ) -> i32 {
+    // Record this process's real in-tree parent (or `PPID_NONE` for the tree
+    // root) so every `DbiGuest` built afterwards reports it through
+    // `Guest::ppid`. A per-process constant; each thread writes the same value.
+    PROCESS_PPID.store(in_tree_ppid, Ordering::Relaxed);
     unsafe { counters.write(PrototypeCounters::default()) };
     0
 }
@@ -1321,7 +1355,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
             context as usize,
             Pid::from_raw(tid),
             Pid::from_raw(pid),
-            None,
+            current_ppid(),
             branches,
             counters,
             &GLOBAL_STATE,
@@ -1943,6 +1977,92 @@ mod tests {
             matches!(outcome, Err(Error::Errno(Errno::EIO))),
             "a failing native writer must surface EIO, got {outcome:?}"
         );
+    }
+
+    #[test]
+    fn ppid_reflects_constructed_parent_and_root_status() {
+        let mut counters = PrototypeCounters::default();
+        // A forked child has a real in-tree parent, so it is not a root and its
+        // `is_root_process` (built on `ppid`) must be false.
+        let child: DbiGuest<'_, PrototypeTool> = DbiGuest::new(
+            0,
+            Pid::from_raw(20),
+            Pid::from_raw(20),
+            Some(Pid::from_raw(10)),
+            0,
+            &mut counters,
+            &GLOBAL_STATE,
+            &CONFIG,
+            invoke,
+            read_regs,
+            write_regs_noop,
+        );
+        assert_eq!(child.ppid(), Some(Pid::from_raw(10)));
+        assert!(!child.is_root_process());
+        drop(child);
+
+        // The tree root has no in-tree parent (`ppid == None`), so
+        // `is_root_process` holds.
+        let root: DbiGuest<'_, PrototypeTool> = DbiGuest::new(
+            0,
+            Pid::from_raw(10),
+            Pid::from_raw(10),
+            None,
+            0,
+            &mut counters,
+            &GLOBAL_STATE,
+            &CONFIG,
+            invoke,
+            read_regs,
+            write_regs_noop,
+        );
+        assert_eq!(root.ppid(), None);
+        assert!(root.is_root_process());
+    }
+
+    #[test]
+    fn thread_init_records_process_ppid_for_current_ppid() {
+        // This is the only test that touches the process-global `PROCESS_PPID`
+        // (no other test calls `reverie_dbi_runtime_thread_init` or
+        // `current_ppid`), so the store/load pairs below are not racy under
+        // parallel test execution.
+        let mut counters = PrototypeCounters::default();
+
+        // A positive in-tree parent pid surfaces as a real parent.
+        let init = unsafe {
+            reverie_dbi_runtime_thread_init(
+                &mut counters,
+                std::ptr::null_mut(),
+                20,
+                20,
+                10,
+                0,
+                0,
+                invoke,
+                read_regs,
+                write_regs_noop,
+            )
+        };
+        assert_eq!(init, 0);
+        assert_eq!(current_ppid(), Some(Pid::from_raw(10)));
+
+        // The root sentinel (`PPID_NONE`) surfaces as no parent.
+        let init = unsafe {
+            reverie_dbi_runtime_thread_init(
+                &mut counters,
+                std::ptr::null_mut(),
+                10,
+                10,
+                PPID_NONE,
+                0,
+                0,
+                invoke,
+                read_regs,
+                write_regs_noop,
+            )
+        };
+        assert_eq!(init, 0);
+        assert_eq!(current_ppid(), None);
     }
 
     #[test]
