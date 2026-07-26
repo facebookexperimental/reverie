@@ -12,6 +12,7 @@ mod clone;
 
 pub use clone::clone_syscall;
 pub use clone::clone3_syscall;
+pub use clone::fork_syscall;
 pub use clone::vfork_return_from_child;
 pub use clone::vfork_syscall;
 

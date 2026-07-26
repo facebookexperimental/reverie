@@ -19,6 +19,7 @@ parking_lot = { version = "0.12.1", features = ["send_guard"] }
 reverie = { version = "0.1.0", path = "../../reverie" }
 reverie-memory = { version = "0.1.0", path = "../../reverie-memory" }
 reverie-rpc = { version = "0.1.0", path = "../reverie-rpc" }
+reverie-rpc-transport = { version = "0.1.0", path = "../../reverie-rpc-transport" }
 reverie-sabre-macros = { version = "0.1.0", path = "../reverie-sabre-macros" }
 reverie-syscalls = { version = "0.1.0", path = "../../reverie-syscalls" }
 serde = { version = "1.0.185", features = ["derive", "rc"] }
@@ -26,3 +27,6 @@ syscalls = { version = "0.6.7", features = ["serde"] }
 
 [build-dependencies]
 cc = "1.0"
+
+[dev-dependencies]
+tokio = { version = "1.52.4", features = ["net", "rt"] }

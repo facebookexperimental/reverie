@@ -14,14 +14,21 @@
 //! `fork` tree) all reach **one shared** `GlobalTool` instance, so their effects
 //! aggregate instead of fragmenting per-process.
 
+use std::future::Future;
+use std::pin::pin;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Poll;
+use std::task::Waker;
 
 use async_trait::async_trait;
 use reverie::GlobalRPC;
 use reverie::GlobalTool;
 use reverie::Tid;
+use reverie_rpc_transport::BlockingRpcClient;
 use reverie_rpc_transport::RpcClient;
 use reverie_rpc_transport::RpcServer;
 
@@ -140,6 +147,27 @@ async fn single_connection_round_trip_values() {
 }
 
 #[tokio::test]
+async fn readiness_is_published_on_first_request() {
+    let global = std::sync::Arc::new(Counter::default());
+    let readiness = std::sync::Arc::new(AtomicBool::new(false));
+    let path = unique_sock_path("readiness");
+    let server =
+        RpcServer::bind_with_readiness(&path, global, "ready-cfg".to_string(), readiness.clone())
+            .unwrap();
+    let server_path = server.path().to_path_buf();
+    let handle = tokio::spawn(async move { server.serve().await });
+
+    let client = RpcClient::<Counter>::connect(&server_path, Tid::from_raw(12))
+        .await
+        .expect("connect");
+    assert!(!readiness.load(Ordering::Acquire));
+    assert_eq!(client.send_rpc(1).await.running_total, 1);
+    assert!(readiness.load(Ordering::Acquire));
+
+    handle.abort();
+}
+
+#[tokio::test]
 async fn serve_one_then_client_disconnect_is_clean() {
     // `serve_one` serves a single connection until the client closes it, and
     // reports that clean close as `Ok(())`.
@@ -177,4 +205,48 @@ async fn connect_to_missing_coordinator_errors() {
         Err(reverie_rpc_transport::RpcError::Io(_)) => {}
         Err(other) => panic!("expected an I/O error, got {other:?}"),
     }
+}
+#[test]
+fn blocking_client_rpc_is_ready_on_its_first_poll() {
+    let global = std::sync::Arc::new(Counter::default());
+    let server_global = global.clone();
+    let path = unique_sock_path("blocking");
+    let server_path = path.clone();
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+
+    let server_thread = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let server =
+                    RpcServer::bind(&path, server_global, "blocking-cfg".to_string()).unwrap();
+                ready_tx.send(()).unwrap();
+                server.serve_one().await
+            })
+    });
+    ready_rx.recv().unwrap();
+
+    let client = BlockingRpcClient::<Counter>::connect(&server_path, Tid::from_raw(41)).unwrap();
+    assert_eq!(client.config(), "blocking-cfg");
+
+    {
+        let mut future = pin!(client.send_rpc(9));
+        let mut context = Context::from_waker(Waker::noop());
+        assert_eq!(
+            Future::poll(future.as_mut(), &mut context),
+            Poll::Ready(Reply {
+                running_total: 9,
+                from: 41,
+            })
+        );
+    }
+    drop(client);
+
+    assert!(
+        server_thread.join().unwrap().is_ok(),
+        "server should treat a blocking client disconnect as clean"
+    );
+    assert_eq!(*global.total.lock().unwrap(), 9);
 }

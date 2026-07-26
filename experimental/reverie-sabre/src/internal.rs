@@ -35,6 +35,9 @@ pub fn init_tool<T: Tool>() -> T {
     // connect to the socket), there isn't anything we can do except panic. A
     // client without a connection to the global state isn't very useful.
     paths::cache_tool_env();
+    if let Some(tool) = T::new_without_legacy_rpc() {
+        return tool;
+    }
     let channel = rpc::BaseChannel::new().unwrap();
 
     T::new(MakeClient::make_client(Box::new(channel)))

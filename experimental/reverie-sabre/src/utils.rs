@@ -7,6 +7,7 @@
  */
 
 use std::ffi::CStr;
+use std::ffi::CString;
 use std::mem::MaybeUninit;
 
 use syscalls::Errno;
@@ -144,8 +145,69 @@ pub fn sys_execve(
     }
 }
 
-pub fn sys_execveat() -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+/// `execveat(2)` under SaBRe.
+///
+/// Detcore rewrites every guest `execve` into an
+/// `execveat(AT_FDCWD, path, argv, envp, 0)` before injecting it (see
+/// `From<Execve> for Execveat` and `handle_execveat` in detcore), so this must
+/// re-enter SaBRe exactly like [`sys_execve`] instead of failing with `ENOSYS`.
+/// The directory-relative and `AT_EMPTY_PATH` (`fexecve`) forms are resolved
+/// through `/proc/self/fd` so they keep working after the loader is prepended.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-128): Review execveat re-entry and /proc/self/fd path resolution.
+pub fn sys_execveat(
+    dirfd: libc::c_int,
+    pathname: *const libc::c_char,
+    argv: *const *const libc::c_char,
+    envp: *const *const libc::c_char,
+    flags: libc::c_int,
+) -> Result<usize, Errno> {
+    // Fast path: `AT_FDCWD` with a normal (non-empty) path resolves the program
+    // identically to `execve`. This is the form Detcore always emits.
+    if dirfd == libc::AT_FDCWD && (flags & libc::AT_EMPTY_PATH) == 0 {
+        return sys_execve(pathname, argv, envp);
+    }
+
+    // General case: materialize an absolute path the re-entered loader can open,
+    // then reuse the `execve` re-entry with that path as the program image.
+    let resolved = resolve_execveat_path(dirfd, pathname, flags)?;
+    sys_execve(resolved.as_ptr(), argv, envp)
+}
+
+/// Turn an `execveat` `(dirfd, pathname, flags)` triple into an absolute path
+/// the SaBRe loader can `execve`, honoring the same lookup rules as the kernel.
+fn resolve_execveat_path(
+    dirfd: libc::c_int,
+    pathname: *const libc::c_char,
+    flags: libc::c_int,
+) -> Result<CString, Errno> {
+    let path_bytes: &[u8] = if pathname.is_null() {
+        b""
+    } else {
+        unsafe { CStr::from_ptr(pathname) }.to_bytes()
+    };
+
+    // An absolute pathname ignores `dirfd` entirely.
+    if path_bytes.first() == Some(&b'/') {
+        return CString::new(path_bytes).map_err(|_| Errno::EINVAL);
+    }
+
+    if path_bytes.is_empty() {
+        // Only `AT_EMPTY_PATH` (e.g. `fexecve`) permits an empty pathname; it
+        // execs the file the descriptor itself refers to.
+        if (flags & libc::AT_EMPTY_PATH) == 0 {
+            return Err(Errno::ENOENT);
+        }
+        return CString::new(format!("/proc/self/fd/{}", dirfd)).map_err(|_| Errno::EINVAL);
+    }
+
+    // A relative pathname resolves against `dirfd` (or the cwd for `AT_FDCWD`).
+    if dirfd == libc::AT_FDCWD {
+        return CString::new(path_bytes).map_err(|_| Errno::EINVAL);
+    }
+    let mut combined = format!("/proc/self/fd/{}/", dirfd).into_bytes();
+    combined.extend_from_slice(path_bytes);
+    CString::new(combined).map_err(|_| Errno::EINVAL)
 }
 
 /// glibc defines this to be much larger than what the kernel accepts. Since we
@@ -364,7 +426,60 @@ mod exec_tests {
     }
 
     #[test]
-    fn execveat_remains_explicitly_unsupported() {
-        assert_eq!(sys_execveat(), Err(Errno::ENOSYS));
+    fn execveat_at_fdcwd_matches_execve_validation() {
+        // AT_FDCWD with flags==0 must resolve exactly like execve, including its
+        // pointer validation, rather than returning ENOSYS.
+        assert_eq!(
+            sys_execveat(
+                libc::AT_FDCWD,
+                core::ptr::null(),
+                core::ptr::null(),
+                core::ptr::null(),
+                0,
+            ),
+            Err(Errno::EFAULT)
+        );
+        let missing = c"/definitely/missing/reverie-sabre-execveat-test";
+        assert_eq!(
+            sys_execveat(
+                libc::AT_FDCWD,
+                missing.as_ptr(),
+                core::ptr::null(),
+                core::ptr::null(),
+                0,
+            ),
+            Err(Errno::ENOENT)
+        );
+    }
+
+    #[test]
+    fn execveat_resolves_paths_like_the_kernel() {
+        // Absolute pathnames ignore the directory fd.
+        let absolute = c"/usr/bin/env";
+        assert_eq!(
+            resolve_execveat_path(7, absolute.as_ptr(), 0),
+            Ok(CString::new("/usr/bin/env").unwrap())
+        );
+        // Relative pathnames resolve against the directory fd via /proc/self/fd.
+        let relative = c"child";
+        assert_eq!(
+            resolve_execveat_path(7, relative.as_ptr(), 0),
+            Ok(CString::new("/proc/self/fd/7/child").unwrap())
+        );
+        // AT_FDCWD relative paths stay as-is (cwd-relative).
+        assert_eq!(
+            resolve_execveat_path(libc::AT_FDCWD, relative.as_ptr(), 0),
+            Ok(CString::new("child").unwrap())
+        );
+        // AT_EMPTY_PATH (fexecve) execs the descriptor itself.
+        assert_eq!(
+            resolve_execveat_path(7, c"".as_ptr(), libc::AT_EMPTY_PATH),
+            Ok(CString::new("/proc/self/fd/7").unwrap())
+        );
+        // An empty path without AT_EMPTY_PATH is ENOENT, like the kernel.
+        assert_eq!(
+            resolve_execveat_path(7, c"".as_ptr(), 0),
+            Err(Errno::ENOENT)
+        );
     }
 }

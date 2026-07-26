@@ -19,6 +19,8 @@
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use reverie::GlobalTool;
 use tokio::net::UnixListener;
@@ -39,6 +41,7 @@ pub struct RpcServer<G: GlobalTool> {
     config: G::Config,
     listener: UnixListener,
     path: PathBuf,
+    readiness: Option<Arc<AtomicBool>>,
 }
 
 impl<G> RpcServer<G>
@@ -56,6 +59,27 @@ where
         global: Arc<G>,
         config: G::Config,
     ) -> Result<Self, RpcError> {
+        Self::bind_inner(path, global, config, None)
+    }
+
+    // TODO-HUMAN-REVIEW(PR-128): Review the externally shared fallback-readiness boundary.
+    /// Binds a coordinator and marks `readiness` after the first complete
+    /// guest request arrives.
+    pub fn bind_with_readiness(
+        path: impl AsRef<Path>,
+        global: Arc<G>,
+        config: G::Config,
+        readiness: Arc<AtomicBool>,
+    ) -> Result<Self, RpcError> {
+        Self::bind_inner(path, global, config, Some(readiness))
+    }
+
+    fn bind_inner(
+        path: impl AsRef<Path>,
+        global: Arc<G>,
+        config: G::Config,
+        readiness: Option<Arc<AtomicBool>>,
+    ) -> Result<Self, RpcError> {
         let path = path.as_ref().to_path_buf();
         // Best-effort removal of a stale socket; ignore "not found".
         match std::fs::remove_file(&path) {
@@ -69,6 +93,7 @@ where
             config,
             listener,
             path,
+            readiness,
         })
     }
 
@@ -94,8 +119,9 @@ where
             let (stream, _addr) = self.listener.accept().await?;
             let global = self.global.clone();
             let config = self.config.clone();
+            let readiness = self.readiness.clone();
             tokio::spawn(async move {
-                if let Err(e) = serve_connection(global, config, stream).await {
+                if let Err(e) = serve_connection_inner(global, config, stream, readiness).await {
                     // A clean close is the normal way a guest connection ends.
                     if !matches!(e, RpcError::Closed) {
                         tracing_disconnect(&e);
@@ -109,7 +135,13 @@ where
     /// is primarily useful for tests and for single-guest scenarios.
     pub async fn serve_one(&self) -> Result<(), RpcError> {
         let (stream, _addr) = self.listener.accept().await?;
-        serve_connection(self.global.clone(), self.config.clone(), stream).await
+        serve_connection_inner(
+            self.global.clone(),
+            self.config.clone(),
+            stream,
+            self.readiness.clone(),
+        )
+        .await
     }
 }
 
@@ -125,12 +157,23 @@ impl<G: GlobalTool> Drop for RpcServer<G> {
 pub async fn serve_connection<G>(
     global: Arc<G>,
     config: G::Config,
-    mut stream: UnixStream,
+    stream: UnixStream,
 ) -> Result<(), RpcError>
 where
     G: GlobalTool,
 {
-    // Handshake: the guest process does not have the config in its address
+    serve_connection_inner(global, config, stream, None).await
+}
+
+async fn serve_connection_inner<G>(
+    global: Arc<G>,
+    config: G::Config,
+    mut stream: UnixStream,
+    readiness: Option<Arc<AtomicBool>>,
+) -> Result<(), RpcError>
+where
+    G: GlobalTool,
+{
     // space (it is a separate process), so the coordinator sends it first.
     //
     // NOTE: `G::Request`/`G::Response` are `Send` but not `Sync`, so we always
@@ -149,6 +192,9 @@ where
         };
         let RequestEnvelope { from, request } =
             decode::<RequestEnvelope<G::Request>>(&request_bytes)?;
+        if let Some(readiness) = &readiness {
+            readiness.store(true, Ordering::Release);
+        }
         let response = global.receive_rpc(from, request).await;
         let response_bytes = encode(&response)?;
         write_message(&mut stream, &response_bytes).await?;

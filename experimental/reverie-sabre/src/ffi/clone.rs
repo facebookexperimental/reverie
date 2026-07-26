@@ -85,6 +85,87 @@ pub unsafe fn clone_syscall(
     ret
 }
 
+/// Executes a `fork`-style `clone(2)` (no new child stack) and resumes the
+/// child on the guest's ORIGINAL stack.
+///
+/// [`clone_syscall`] starts a new thread on a caller-supplied `child_stack`, so
+/// the kernel sets the child's `%rsp` to that stack and its `jmp r9` shortcut is
+/// correct. A forked child (`child_stack == NULL`) instead shares the parent's
+/// stack layout, so the kernel leaves the child's `%rsp` pointing deep inside
+/// the plugin's own call frames (SaBRe runs `handle_syscall` on the guest
+/// stack). Jumping straight back to the guest from there resumes guest code on
+/// the wrong stack and later faults on a mismatched `ret`.
+///
+/// This routine instead reproduces SaBRe's normal `handle_syscall` epilogue for
+/// the child: it restores the guest's saved general-purpose registers and its
+/// original `%rsp` (`wrapper_sp + 0x88`) from the syscall frame, then jumps to
+/// the saved return address with `%rax = 0`.
+///
+/// # Safety
+///
+/// `wrapper_sp` must point to the live SaBRe syscall frame for the current guest
+/// thread, and the flag/pointer arguments must satisfy `clone(2)`.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-128): Review the fork-child stack/register restore trampoline.
+pub unsafe fn fork_syscall(
+    clone_flags: usize,      // rdi
+    parent_tidptr: *mut i32, // rdx
+    child_tidptr: *mut i32,  // r10
+    tls: usize,              // r8
+    wrapper_sp: *const syscall_stackframe,
+) -> usize {
+    let mut ret: usize = Sysno::clone as usize;
+
+    core::arch::asm! {
+        "syscall",
+
+        // Both child and parent return here.
+        "test rax, rax",
+        "jnz 2f",
+
+        // ---- Child: never returns through Rust. ----
+        // `wrapper_sp` is preserved across the clone in r12.
+        "call qword ptr [rip + exit_plugin@GOTPCREL]",
+        "mov rdi, r12",                     // rdi = wrapper_sp (frame base)
+        // Restore the guest's saved registers from the frame, mirroring the
+        // pops in SaBRe's handle_syscall.S epilogue. rcx/r11 were clobbered by
+        // the guest's own syscall, and r11 is reused below as the jump target.
+        "mov r15, qword ptr [rdi + 0x8]",
+        "mov r14, qword ptr [rdi + 0x10]",
+        "mov r13, qword ptr [rdi + 0x18]",
+        "mov r10, qword ptr [rdi + 0x30]",
+        "mov r9,  qword ptr [rdi + 0x38]",
+        "mov r8,  qword ptr [rdi + 0x40]",
+        "mov rsi, qword ptr [rdi + 0x50]",
+        "mov rdx, qword ptr [rdi + 0x58]",
+        "mov rcx, qword ptr [rdi + 0x60]",
+        "mov rbx, qword ptr [rdi + 0x68]",
+        "mov rbp, qword ptr [rdi + 0x70]",
+        "mov r12, qword ptr [rdi + 0x20]",  // restore guest r12 (held wrapper_sp)
+        "mov r11, qword ptr [rdi + 0x80]",  // guest return RIP -> jump target
+        "lea rsp, [rdi + 0x88]",            // guest's original %rsp
+        "mov rdi, qword ptr [rdi + 0x48]",  // guest rdi (final use of frame base)
+        "xor eax, eax",                     // fork/clone returns 0 in the child
+        "jmp r11",
+
+        // ---- Parent ----
+        "2:",
+
+        inlateout("rax") ret,
+        in("rdi") clone_flags,
+        in("rsi") 0usize,           // child_stack == NULL selects fork semantics
+        in("rdx") parent_tidptr,
+        in("r10") child_tidptr,
+        in("r8") tls,
+        in("r12") wrapper_sp,
+        // syscall instructions clobber rcx and r11
+        lateout("rcx") _,
+        lateout("r11") _,
+    }
+
+    ret
+}
+
 /// Executes `clone3(2)` while preserving the trampoline return path.
 ///
 /// # Safety

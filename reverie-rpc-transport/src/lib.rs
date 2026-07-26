@@ -63,6 +63,7 @@
 //! [`GlobalRPC`]: reverie::GlobalRPC
 //! [`GlobalRPC::send_rpc`]: reverie::GlobalRPC::send_rpc
 
+mod blocking_client;
 pub mod codec;
 
 mod client;
@@ -70,6 +71,7 @@ mod envelope;
 mod error;
 mod server;
 
+pub use blocking_client::BlockingRpcClient;
 pub use client::RpcClient;
 pub use envelope::RequestEnvelope;
 pub use error::RpcError;

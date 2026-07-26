@@ -139,6 +139,8 @@ fn handle_syscall_with_thread<T: ToolGlobal>(
     let return_address = unsafe { (*wrapper_sp).ret } as usize;
 
     let result = if sys_no == Sysno::clone && arg2 != 0 {
+        // New thread with its own stack: the kernel sets the child's %rsp to
+        // `child_stack`, so clone_syscall's `jmp r9` shortcut is correct.
         thread.maybe_fork_as_guest(|| {
             T::global()
                 .syscall_with_inject(intercepted, &LocalMemory::new(), || unsafe {
@@ -153,12 +155,34 @@ fn handle_syscall_with_thread<T: ToolGlobal>(
                 })
                 .unwrap_or_else(|e| -e.into_raw() as usize)
         })?
-    } else if sys_no == Sysno::clone || sys_no == Sysno::fork {
+    } else if sys_no == Sysno::clone {
+        // clone(2) without a new stack behaves like fork: the child shares the
+        // parent's stack layout and must resume the guest on its ORIGINAL %rsp,
+        // which fork_syscall restores from the SaBRe syscall frame.
         thread.maybe_fork_as_guest(|| {
             T::global()
                 .syscall_with_inject(intercepted, &LocalMemory::new(), || unsafe {
-                    syscall!(sys_no, arg1, arg2, arg3, arg4, arg5, arg6)
-                        .unwrap_or_else(|e| -e.into_raw() as usize)
+                    ffi::fork_syscall(
+                        arg1,
+                        arg3 as *mut i32,
+                        arg4 as *mut i32,
+                        arg5,
+                        wrapper_address as *const ffi::syscall_stackframe,
+                    )
+                })
+                .unwrap_or_else(|e| -e.into_raw() as usize)
+        })?
+    } else if sys_no == Sysno::fork {
+        thread.maybe_fork_as_guest(|| {
+            T::global()
+                .syscall_with_inject(intercepted, &LocalMemory::new(), || unsafe {
+                    ffi::fork_syscall(
+                        libc::SIGCHLD as usize,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        0,
+                        wrapper_address as *const ffi::syscall_stackframe,
+                    )
                 })
                 .unwrap_or_else(|e| -e.into_raw() as usize)
         })?

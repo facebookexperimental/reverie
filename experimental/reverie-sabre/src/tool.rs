@@ -43,6 +43,19 @@ pub trait Tool {
     /// undefined. It may not be called until *after* libc is loaded.
     fn new(client: Self::Client) -> Self;
 
+    /// Constructs a tool that owns a non-legacy RPC transport.
+    ///
+    /// Returning `Some` bypasses creation of the historical
+    /// `experimental/reverie-rpc` channel. The default keeps the existing
+    /// constructor path for all current tools.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-128): Review the alternate transport constructor boundary.
+    fn new_without_legacy_rpc() -> Option<Self>
+    where
+        Self: Sized,
+    {
+        None
+    }
     /// This is called in place of a system call. For example, if the program
     /// called the `open` syscall, this callback would be called instead. By
     /// default, the real syscall is simply called.
@@ -187,7 +200,14 @@ impl SyscallExt for Syscall {
                 args.arg2 as *const *const libc::c_char,
             )
         } else if sysno == Sysno::execveat {
-            utils::sys_execveat()
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            utils::sys_execveat(
+                args.arg0 as libc::c_int,
+                args.arg1 as *const libc::c_char,
+                args.arg2 as *const *const libc::c_char,
+                args.arg3 as *const *const libc::c_char,
+                args.arg4 as libc::c_int,
+            )
         } else if sysno == Sysno::rt_sigaction {
             utils::sys_rt_sigaction(
                 args.arg0 as libc::c_int,
