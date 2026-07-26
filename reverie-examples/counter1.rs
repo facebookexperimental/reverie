@@ -85,3 +85,36 @@ async fn main() -> Result<(), Error> {
     drop(log_guard); // Flush logs before exiting.
     status.raise_or_exit()
 }
+
+#[cfg(all(test, target_arch = "x86_64"))]
+#[path = "kvm_test_support.rs"]
+mod kvm_test_support;
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod kvm_tests {
+    use super::*;
+
+    fn null_executor(
+        _request: &reverie_kvm::SyscallRequest,
+        _memory: &reverie_kvm::GuestMemory,
+    ) -> i64 {
+        0
+    }
+
+    #[tokio::test]
+    async fn exact_counter1_tool_counts_kvm_guest_syscall() {
+        let Some(mut backend) = kvm_test_support::backend_with_syscall(
+            "exact_counter1_tool_counts_kvm_guest_syscall",
+            Sysno::getpid,
+        ) else {
+            return;
+        };
+
+        let counter = backend
+            .run_with_tool::<CounterLocal, _>((), null_executor)
+            .await
+            .unwrap();
+
+        assert_eq!(counter.num_syscalls.load(Ordering::SeqCst), 1);
+    }
+}

@@ -48,3 +48,50 @@ async fn main() -> Result<(), Error> {
     drop(log_guard); // Flush logs before exiting.
     status.raise_or_exit()
 }
+
+#[cfg(all(test, target_arch = "x86_64"))]
+#[path = "../kvm_test_support.rs"]
+mod kvm_test_support;
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod kvm_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    use reverie::syscalls::Sysno;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn exact_strace_tool_forwards_kvm_guest_syscall() {
+        let Some(mut backend) = kvm_test_support::backend_with_syscall(
+            "exact_strace_tool_forwards_kvm_guest_syscall",
+            Sysno::getpid,
+        ) else {
+            return;
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let executor_calls = calls.clone();
+        let config = Config {
+            filters: vec![Filter {
+                inverse: false,
+                syscalls: vec![Sysno::getpid],
+            }],
+        };
+
+        backend
+            .run_with_tool::<Strace, _>(
+                config,
+                move |_request: &reverie_kvm::SyscallRequest,
+                      _memory: &reverie_kvm::GuestMemory| {
+                    executor_calls.fetch_add(1, Ordering::SeqCst);
+                    1234
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+}
