@@ -31,6 +31,7 @@ pthread_guest="$tmpdir/pthread-lifecycle"
 rewrite_exit_guest="$tmpdir/rewrite-exit"
 set_reg_guest="$tmpdir/set-reg-probe"
 ppid_guest="$tmpdir/ppid-probe"
+backtrace_guest="$tmpdir/backtrace-probe"
 identity_policy_guest="$tmpdir/identity-policy"
 fork_pthread_guest="$tmpdir/fork-pthread-identity"
 fork_clock_resource_guest="$tmpdir/fork-clock-resource"
@@ -46,6 +47,11 @@ chaos_data="$tmpdir/chaos-data.txt"
   "$crate_dir/tests/fixtures/set_reg_probe.c" -o "$set_reg_guest"
 "${CC:-cc}" -O2 -g -std=c11 -Wall -Wextra -Werror \
   "$crate_dir/tests/fixtures/ppid_probe.c" -o "$ppid_guest"
+# Frame pointers are required for the saved-rbp walk, so build this fixture at
+# -O0 with -fno-omit-frame-pointer (unlike the -O2 fixtures above) and keep the
+# nested call chain un-inlined.
+"${CC:-cc}" -O0 -g -fno-omit-frame-pointer -std=c11 -Wall -Wextra -Werror \
+  "$crate_dir/tests/fixtures/backtrace_probe.c" -o "$backtrace_guest"
 "${CC:-cc}" -O2 -g -std=c11 -Wall -Wextra -Werror \
   "$crate_dir/tests/fixtures/identity_policy.c" -o "$identity_policy_guest"
 "${CC:-cc}" -O2 -g -std=c11 -Wall -Wextra -Werror -pthread \
@@ -130,6 +136,18 @@ run_tool HERMIT_DBI_TEST_PPID "$ppid_guest"
 grep -q '^PPID_ROOT ok=1 pid=[0-9][0-9]* ppid=-1 root=1$' "$tmpdir/err" \
   || fail "ppid: tree root did not report ppid=None / is_root_process=true"
 echo "PASS: ppid (tree root reports ppid=None and is_root_process=true via the native surface)"
+
+# backtrace: the tool captures Guest::backtrace() at the getpid stop. The DBI
+# Tool runs in-process, so the walk follows the guest's own frame-pointer chain
+# seeded from the guest register file. The fixture issues getpid from a nested
+# call chain (main -> level1 -> level2 -> raw_getpid), so a correct in-process
+# walk recovers several frames (ok=1, frames>=3), not just the top one.
+run_tool HERMIT_DBI_TEST_BACKTRACE "$backtrace_guest"
+grep -q '^BACKTRACE-GUEST pid=[0-9][0-9]*$' "$tmpdir/out" \
+  || fail "backtrace: guest did not run to completion"
+grep -Eq '^BACKTRACE ok=1 frames=[0-9]+ top=0x[0-9a-f]+$' "$tmpdir/err" \
+  || fail "backtrace: no multi-frame guest backtrace captured at getpid"
+echo "PASS: backtrace (in-process frame-pointer walk of the guest stack at getpid)"
 
 run_tool HERMIT_DBI_NOOP "$identity_policy_guest"
 grep -q '^pid=3 ppid=1 tid=3 identity_fd=open$' "$tmpdir/out" \

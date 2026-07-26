@@ -41,8 +41,10 @@ use std::task::Waker;
 // TODO-HUMAN-REVIEW(PR-134): Review the native bootstrap failure ABI export.
 pub use launcher::CLIENT_THREAD_START_FAILURE_EXIT_CODE;
 pub use launcher::DbiRunner;
+use reverie::Backtrace;
 use reverie::Error;
 use reverie::ExitStatus;
+use reverie::Frame;
 use reverie::GlobalRPC;
 use reverie::GlobalTool;
 use reverie::Guest;
@@ -360,6 +362,95 @@ where
         // TODO-STUB(#31): expose a continuously updated RCB read from the
         // native client for sub-syscall resolution.
         Ok(self.branch_count)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-ratchet16): Review the DBI in-process guest backtrace.
+    fn backtrace(&mut self) -> Option<Backtrace> {
+        // The DBI Tool runs *in-process*, in the guest's own address space, so a
+        // backtrace needs no remote unwinder (unlike ptrace, which unwinds the
+        // tracee over `/proc/pid/mem` with libunwind): the guest stack is
+        // directly readable here. Seed the walk with the guest's translated
+        // register file — the same `dr_get_mcontext` source `regs()` uses — and
+        // follow the x86-64 saved-frame-pointer chain. Every stack read goes
+        // through `process_vm_readv` on our own process so a truncated or wild
+        // frame pointer ends the trace instead of raising SIGSEGV, which in a DBI
+        // handler would abort the entire DynamoRIO process. This requires frame
+        // pointers in the guest (`-fno-omit-frame-pointer`); full DWARF-CFI
+        // unwinding (as reverie-ptrace gets from libunwind) would be a strictly
+        // larger, separate increment.
+        let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+        let read = unsafe { (self.read_registers)(self.context, &mut regs) };
+        if read == 0 {
+            return None;
+        }
+
+        let mut frames = Vec::new();
+        // Frame 0 is the current instruction pointer.
+        frames.push(Frame {
+            ip: regs.rip,
+            is_signal: false,
+        });
+
+        // Walk the saved-frame-pointer chain: on x86-64 with frame pointers,
+        // `[rbp]` holds the caller's saved `rbp` and `[rbp + 8]` holds the return
+        // address into the caller.
+        let mut fp = regs.rbp;
+        // Bound the depth so a corrupt or self-referential chain can never spin;
+        // real stacks are far shallower than this.
+        const MAX_FRAMES: usize = 256;
+        while frames.len() < MAX_FRAMES {
+            // A null or unaligned frame pointer is not a valid frame base.
+            if fp == 0 || !fp.is_multiple_of(std::mem::align_of::<u64>() as u64) {
+                break;
+            }
+            let Some(saved_fp) = read_guest_word(fp) else {
+                break;
+            };
+            let Some(return_addr) = read_guest_word(fp.wrapping_add(8)) else {
+                break;
+            };
+            if return_addr == 0 {
+                break;
+            }
+            frames.push(Frame {
+                ip: return_addr,
+                is_signal: false,
+            });
+            // The chain must strictly ascend: the stack grows down, so each
+            // caller frame sits at a higher address. A non-increasing link is a
+            // cycle or garbage, so stop rather than loop or wander.
+            if saved_fp <= fp {
+                break;
+            }
+            fp = saved_fp;
+        }
+
+        Some(Backtrace::new(self.tid(), frames))
+    }
+}
+
+/// Reads one 64-bit word at `addr` from the current process using
+/// `process_vm_readv`, which reports an out-of-bounds address as a short/failed
+/// read rather than raising `SIGSEGV`. Used by the DBI [`Guest::backtrace`]
+/// frame-pointer walk so a bad guest frame pointer ends the trace safely instead
+/// of aborting the whole DynamoRIO process.
+fn read_guest_word(addr: u64) -> Option<u64> {
+    let mut value: u64 = 0;
+    let local = libc::iovec {
+        iov_base: (&mut value as *mut u64).cast::<libc::c_void>(),
+        iov_len: std::mem::size_of::<u64>(),
+    };
+    let remote = libc::iovec {
+        iov_base: addr as *mut libc::c_void,
+        iov_len: std::mem::size_of::<u64>(),
+    };
+    // Reading our own address space is always permitted; `getpid()` names it.
+    let n = unsafe { libc::process_vm_readv(libc::getpid(), &local, 1, &remote, 1, 0) };
+    if n == std::mem::size_of::<u64>() as isize {
+        Some(value)
+    } else {
+        None
     }
 }
 
@@ -1496,6 +1587,30 @@ mod tests {
         1
     }
 
+    /// A register-reader mock for the backtrace walk: seeds `rip` with a fixed
+    /// sentinel and `rbp` with the frame-base address passed as `context`, so a
+    /// test can point the walk at a hand-built frame chain in its own memory.
+    unsafe extern "C" fn read_regs_with_rbp(
+        context: usize,
+        regs: *mut libc::user_regs_struct,
+    ) -> i32 {
+        unsafe {
+            *regs = std::mem::zeroed();
+            (*regs).rip = 0xabc0;
+            (*regs).rbp = context as u64;
+        }
+        1
+    }
+
+    /// A register-reader mock that reports the register file is unavailable, so
+    /// `backtrace` must give up and return `None`.
+    unsafe extern "C" fn read_regs_unavailable(
+        _context: usize,
+        _regs: *mut libc::user_regs_struct,
+    ) -> i32 {
+        0
+    }
+
     /// A register-writer mock that succeeds without recording anything, for
     /// tests that build a guest but never exercise `set_regs`.
     unsafe extern "C" fn write_regs_noop(
@@ -2018,6 +2133,66 @@ mod tests {
         );
         assert_eq!(root.ppid(), None);
         assert!(root.is_root_process());
+    }
+
+    #[test]
+    fn backtrace_walks_the_guest_frame_pointer_chain() {
+        // Build two stacked frames in this test's own memory. `backtrace` reads
+        // them through `process_vm_readv`, exactly as it reads the guest stack
+        // in-process, so a hand-built chain here exercises the real walk. On
+        // x86-64, `[fp]` is the caller's saved frame pointer and `[fp + 8]` is
+        // the return address into the caller.
+        let mut stack = [0u64; 4];
+        let frame1_fp = (&stack[2] as *const u64) as u64;
+        stack[0] = frame1_fp; // frame 0: saved rbp -> frame 1 (a higher address)
+        stack[1] = 0x1111; //    frame 0: return address into its caller
+        stack[2] = 0; //         frame 1: saved rbp -> null, terminating the walk
+        stack[3] = 0x2222; //    frame 1: return address into its caller
+        let frame0_fp = (&stack[0] as *const u64) as u64;
+
+        let mut counters = PrototypeCounters::default();
+        let mut guest: DbiGuest<'_, PrototypeTool> = DbiGuest::new(
+            frame0_fp as usize,
+            Pid::from_raw(7),
+            Pid::from_raw(7),
+            None,
+            0,
+            &mut counters,
+            &GLOBAL_STATE,
+            &CONFIG,
+            invoke,
+            read_regs_with_rbp,
+            write_regs_noop,
+        );
+
+        let backtrace = guest
+            .backtrace()
+            .expect("a seeded walk must produce a backtrace");
+        let ips: Vec<u64> = backtrace.iter().map(|frame| frame.ip).collect();
+        // rip (0xabc0) plus the return address of each walked frame, in order.
+        assert_eq!(ips, vec![0xabc0, 0x1111, 0x2222]);
+    }
+
+    #[test]
+    fn backtrace_returns_none_when_registers_are_unavailable() {
+        let mut counters = PrototypeCounters::default();
+        let mut guest: DbiGuest<'_, PrototypeTool> = DbiGuest::new(
+            0,
+            Pid::from_raw(7),
+            Pid::from_raw(7),
+            None,
+            0,
+            &mut counters,
+            &GLOBAL_STATE,
+            &CONFIG,
+            invoke,
+            read_regs_unavailable,
+            write_regs_noop,
+        );
+        assert!(
+            guest.backtrace().is_none(),
+            "backtrace must be None when the register file cannot be read"
+        );
     }
 
     #[test]

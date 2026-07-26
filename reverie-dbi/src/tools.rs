@@ -91,6 +91,7 @@ const NOOP_ENV: &str = "HERMIT_DBI_NOOP";
 const TEST_REWRITE_EXIT_ENV: &str = "HERMIT_DBI_TEST_REWRITE_EXIT";
 const TEST_SET_REG_ENV: &str = "HERMIT_DBI_TEST_SET_REG";
 const TEST_PPID_ENV: &str = "HERMIT_DBI_TEST_PPID";
+const TEST_BACKTRACE_ENV: &str = "HERMIT_DBI_TEST_BACKTRACE";
 const COUNTER1_ENV: &str = "HERMIT_DBI_COUNTER1";
 const COUNTER2_ENV: &str = "HERMIT_DBI_COUNTER2";
 const CHUNKY_PRINT_ENV: &str = "HERMIT_DBI_CHUNKY_PRINT";
@@ -123,6 +124,7 @@ static TEST_REWRITE_EXIT_ENABLED: LazyLock<bool> =
     LazyLock::new(|| env_flag(TEST_REWRITE_EXIT_ENV));
 static TEST_SET_REG_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(TEST_SET_REG_ENV));
 static TEST_PPID_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(TEST_PPID_ENV));
+static TEST_BACKTRACE_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(TEST_BACKTRACE_ENV));
 static COUNTER1_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(COUNTER1_ENV));
 static COUNTER2_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(COUNTER2_ENV));
 static CHUNKY_PRINT_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(CHUNKY_PRINT_ENV));
@@ -494,6 +496,51 @@ impl Tool for PpidTool {
                 pid,
                 ppid.map_or(-1, |p| p.as_raw()),
                 is_root as i32,
+            ));
+        }
+        // Never suppress: let the guest observe its normal (virtualized) result.
+        guest.tail_inject(syscall).await
+    }
+}
+
+/// Regression tool that exercises the DBI `Guest::backtrace` path. On the
+/// guest's `getpid`, it captures a stack trace and emits one line reporting
+/// whether a backtrace was produced and how many frames it contains, then lets
+/// the syscall run normally. Because the DBI Tool runs in-process in the guest's
+/// own address space, `backtrace` walks the guest's real frame-pointer chain
+/// (seeded from the guest register file), so a guest built with frame pointers
+/// yields several frames (the syscall site plus its callers up to the entry
+/// point). The fixture issues the `getpid` from a deliberately nested call chain
+/// so a correct walk returns more than the single top frame.
+#[derive(Clone, Copy, Debug, Default)]
+struct BacktraceTool;
+
+#[reverie::tool]
+impl Tool for BacktraceTool {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-ratchet16): Review the DBI backtrace regression tool.
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        if syscall.number() == Sysno::getpid {
+            let (ok, frames, top) = match guest.backtrace() {
+                // A real in-process walk must recover at least the syscall site
+                // plus a couple of the fixture's nested callers.
+                Some(bt) => {
+                    let count = bt.iter().count();
+                    let top = bt.iter().next().map_or(0, |frame| frame.ip);
+                    (count >= 3, count, top)
+                }
+                None => (false, 0, 0),
+            };
+            emit_line(&format!(
+                "BACKTRACE ok={} frames={} top={:#x}",
+                ok as i32, frames, top
             ));
         }
         // Never suppress: let the guest observe its normal (virtualized) result.
@@ -1228,6 +1275,7 @@ enum ActiveTool {
     RewriteExit,
     SetReg,
     Ppid,
+    Backtrace,
     Counter1,
     Counter2,
     ChunkyPrint,
@@ -1242,6 +1290,8 @@ fn active_tool() -> Option<ActiveTool> {
         Some(ActiveTool::SetReg)
     } else if *TEST_PPID_ENABLED {
         Some(ActiveTool::Ppid)
+    } else if *TEST_BACKTRACE_ENABLED {
+        Some(ActiveTool::Backtrace)
     } else if *STRACE_ENABLED {
         Some(ActiveTool::Strace)
     } else if *HISTOGRAM_ENABLED {
@@ -1632,6 +1682,17 @@ pub(crate) fn run_active_tool(
         ),
         ActiveTool::Ppid => dispatch(
             &PpidTool,
+            context,
+            tid,
+            pid,
+            branches,
+            syscall,
+            invoke_syscall,
+            read_registers,
+            write_registers,
+        ),
+        ActiveTool::Backtrace => dispatch(
+            &BacktraceTool,
             context,
             tid,
             pid,
