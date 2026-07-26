@@ -136,11 +136,18 @@ static const cpuid_result_t extended_cpuid[] = {
 // exit, and app-level writes re-enter the syscall interception path.
 typedef void (*reverie_emit_fn_t)(const char *buf, size_t len);
 typedef void (*reverie_idle_fn_t)(void);
+// TODO-HUMAN-REVIEW(PR-162): Review the additive stdout-emit runtime callback ABI.
 typedef struct {
   reverie_emit_fn_t emit;
   reverie_idle_fn_t idle;
   int32_t panic_on_unsupported_syscalls;
   int32_t unsupported_report_fd;
+  // AUTONOMOUS-BOT-IMPLEMENTED
+  // Re-entrancy-safe stdout emitter (DynamoRIO I/O on STDOUT), used by tools
+  // such as chunky_print that suppress guest stdout writes and re-emit the
+  // buffered bytes to the real stdout at a flush boundary. Added at the end of
+  // the struct so the existing field layout is unchanged.
+  reverie_emit_fn_t emit_stdout;
 } runtime_callbacks_t;
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#90): Confirm diagnostic fd ownership across exec.
@@ -150,6 +157,15 @@ static char unsupported_report_path[4096];
 static file_t unsupported_report_file = INVALID_FILE;
 static void reverie_dbi_emit(const char *buf, size_t len) {
   dr_write_file(diagnostic_file, buf, len);
+}
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-162): Review the native stdout emit path.
+// Emits pre-formatted bytes to real stdout via DynamoRIO's own I/O. Like
+// `reverie_dbi_emit`, this avoids re-entering the syscall interception path that
+// an app-level `write(1, ...)` would trigger, and works even after the guest has
+// closed its own stdout.
+static void reverie_dbi_emit_stdout(const char *buf, size_t len) {
+  dr_write_file(STDOUT, buf, len);
 }
 
 // TODO-HUMAN-REVIEW(PR-131): Review the native thread lifecycle callback ABI.
@@ -1850,8 +1866,8 @@ static void runtime_idle(void) { dr_sleep(1); }
 
 static _Atomic int32_t runtime_background_state;
 
-static runtime_callbacks_t runtime_callbacks = {reverie_dbi_emit, runtime_idle,
-                                                0};
+static runtime_callbacks_t runtime_callbacks = {
+    reverie_dbi_emit, runtime_idle, 0, 0, reverie_dbi_emit_stdout};
 
 static void runtime_background_init(void *argument) {
   (void)argument;

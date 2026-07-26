@@ -99,6 +99,13 @@ pub struct DbiRuntimeCallbacks {
     // TODO-HUMAN-REVIEW(PR-84): Review the private report descriptor ABI.
     /// DynamoRIO-owned descriptor for aggregate unsupported-syscall records.
     pub unsupported_report_fd: i32,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-162): Review the additive stdout emit callback ABI.
+    /// Re-entrancy-safe emitter for real stdout, used by tools that suppress and
+    /// later re-emit guest stdout bytes (e.g. `chunky_print`). Added at the end
+    /// of the struct so the existing field layout matches the C
+    /// `runtime_callbacks_t`.
+    pub emit_stdout: RuntimeEmitter,
 }
 
 /// Result of dispatching a syscall through an external DBI Tool.
@@ -1319,9 +1326,27 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
 }
 
 /// Initializes the built-in prototype runtime on a native client thread.
+///
+/// The `argument` is a `*const DbiRuntimeCallbacks` (the native
+/// `runtime_callbacks_t`). The only field consumed here is `emit_stdout`, a
+/// re-entrancy-safe DynamoRIO stdout emitter recorded so tools that suppress and
+/// re-emit guest stdout (e.g. `chunky_print`) can flush buffered bytes. This
+/// runs on the background client thread before any flush boundary, so the
+/// emitter is installed well ahead of the first `exit`/epoch flush.
+///
+/// # Safety
+///
+/// `argument` must point to a valid `DbiRuntimeCallbacks` for the call.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-162): Review the stdout-emitter init delivery.
 #[cfg(feature = "prototype-runtime")]
 #[unsafe(no_mangle)]
-pub extern "C" fn reverie_dbi_runtime_background_init(_argument: *mut c_void) {}
+pub unsafe extern "C" fn reverie_dbi_runtime_background_init(argument: *mut c_void) {
+    if !argument.is_null() {
+        let callbacks = unsafe { &*(argument as *const DbiRuntimeCallbacks) };
+        tools::set_stdout_emitter(callbacks.emit_stdout);
+    }
+}
 
 // TODO-HUMAN-REVIEW(PR-66): Confirm process-exit callback ownership semantics.
 /// Handles process exit for the built-in synchronous prototype runtime.

@@ -123,6 +123,20 @@ grep -Eq 'counter2 total system calls: [1-9][0-9]*, from 1 processes, 1 thread\(
   "$tmpdir/err" || fail "counter2: no lifecycle summary"
 echo "PASS: counter2 (admission accounting + process exit lifecycle)"
 
+# chunky_print: suppress guest writes to fd 1, buffer the bytes, and re-emit them
+# to the real stdout at the exit flush (through the native stdout emit path). The
+# guest's stdout must survive the round-trip (unlike a naive suppression), while
+# the suppression + flush diagnostics prove the buffering path actually ran
+# rather than a plain passthrough.
+run_tool HERMIT_DBI_CHUNKY_PRINT
+grep -q '^GUEST-STDOUT$' "$tmpdir/out" \
+  || fail "chunky_print: buffered guest stdout not re-emitted to real stdout"
+grep -q 'chunky_print suppressed write of .* bytes to fd 1' "$tmpdir/err" \
+  || fail "chunky_print: guest stdout write was not suppressed/buffered"
+grep -q 'chunky_print flushed buffered output at exit' "$tmpdir/err" \
+  || fail "chunky_print: buffered output not flushed at exit"
+echo "PASS: chunky_print (suppress guest stdout, re-emit at exit flush)"
+
 run_pthread_tool HERMIT_DBI_NOOP noop
 run_pthread_tool HERMIT_DBI_STRACE strace
 run_pthread_tool HERMIT_DBI_COUNTER1 counter1

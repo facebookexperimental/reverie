@@ -39,6 +39,7 @@ use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::LazyLock;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -53,7 +54,9 @@ use reverie::Guest;
 use reverie::Pid;
 use reverie::Tid;
 use reverie::Tool;
+use reverie::syscalls::Addr;
 use reverie::syscalls::Displayable;
+use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallArgs;
 use reverie::syscalls::SyscallInfo;
@@ -76,6 +79,7 @@ const NOOP_ENV: &str = "HERMIT_DBI_NOOP";
 const TEST_REWRITE_EXIT_ENV: &str = "HERMIT_DBI_TEST_REWRITE_EXIT";
 const COUNTER1_ENV: &str = "HERMIT_DBI_COUNTER1";
 const COUNTER2_ENV: &str = "HERMIT_DBI_COUNTER2";
+const CHUNKY_PRINT_ENV: &str = "HERMIT_DBI_CHUNKY_PRINT";
 
 fn env_flag(name: &str) -> bool {
     std::env::var_os(name).is_some_and(|value| {
@@ -90,18 +94,42 @@ static TEST_REWRITE_EXIT_ENABLED: LazyLock<bool> =
     LazyLock::new(|| env_flag(TEST_REWRITE_EXIT_ENV));
 static COUNTER1_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(COUNTER1_ENV));
 static COUNTER2_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(COUNTER2_ENV));
+static CHUNKY_PRINT_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(CHUNKY_PRINT_ENV));
 
 /// Per-syscall-number invocation counts, keyed by raw syscall number.
 static SYSCALL_HISTOGRAM: LazyLock<Mutex<BTreeMap<i32, u64>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
 /// The DynamoRIO emit callback (a C function pointer stored as a `usize`),
-/// installed on the first syscall event.
+/// installed on the first syscall event. Emits to the diagnostic file (stderr).
 static EMITTER: AtomicUsize = AtomicUsize::new(0);
+
+/// The DynamoRIO **stdout** emit callback, installed once at background init via
+/// [`set_stdout_emitter`]. Distinct from [`EMITTER`] (stderr) so a tool can
+/// re-emit suppressed guest stdout bytes to the real stdout. Zero until set.
+static STDOUT_EMITTER: AtomicUsize = AtomicUsize::new(0);
 
 /// Records the emit callback so the tools can produce output.
 pub fn set_emitter(emit: Emitter) {
     EMITTER.store(emit as usize, Ordering::Relaxed);
+}
+
+/// Records the stdout emit callback (see [`STDOUT_EMITTER`]). Called once from
+/// the native background-init path, before any flush boundary.
+pub fn set_stdout_emitter(emit: Emitter) {
+    STDOUT_EMITTER.store(emit as usize, Ordering::Relaxed);
+}
+
+/// Emits raw bytes (no trailing newline) through a stored emit callback.
+/// Returns `false` when no emitter is installed.
+fn emit_raw(slot: &AtomicUsize, bytes: &[u8]) -> bool {
+    let raw = slot.load(Ordering::Relaxed);
+    if raw == 0 {
+        return false;
+    }
+    let emit: Emitter = unsafe { std::mem::transmute::<usize, Emitter>(raw) };
+    unsafe { emit(bytes.as_ptr(), bytes.len()) };
+    true
 }
 
 /// Writes one line of tool output through the DynamoRIO emit callback. Using
@@ -456,6 +484,196 @@ impl Tool for Counter2Tool {
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-162): Review the DBI chunky_print port and stdout re-emit path.
+/// Number of system calls (per thread) that define one epoch. Mirrors the
+/// upstream `chunky_print` example.
+const CHUNKY_EPOCH: u64 = 10;
+
+/// Which real stream a suppressed guest write should be re-emitted to.
+#[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize)]
+pub enum ChunkyWhich {
+    Stdout,
+    Stderr,
+}
+
+/// RPC to [`ChunkyPrintGlobal`]. Mirrors the upstream example's `Msg`.
+#[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
+pub enum ChunkyMsg {
+    /// Buffer a suppressed write for later re-emission.
+    Print(ChunkyWhich, Vec<u8>),
+    /// Advance the per-thread logical clock and flush at an epoch boundary.
+    Tick,
+    /// Flush all buffered output immediately (used at process exit).
+    Flush,
+}
+
+#[derive(Debug, Default)]
+struct ChunkyInner {
+    /// Per-thread logical time, keyed by raw tid.
+    times: BTreeMap<i32, u64>,
+    /// Per-thread buffered writes awaiting a flush, keyed by raw tid.
+    printbuf: BTreeMap<i32, Vec<(ChunkyWhich, Vec<u8>)>>,
+    epoch_num: u64,
+}
+
+impl ChunkyInner {
+    /// Flushes when every observed thread has advanced past the epoch length.
+    fn check_epoch(&mut self) {
+        if !self.times.is_empty() && self.times.values().all(|t| *t > CHUNKY_EPOCH) {
+            self.flush_messages();
+            self.times.values_mut().for_each(|t| *t -= CHUNKY_EPOCH);
+            self.epoch_num += 1;
+        }
+    }
+
+    /// Re-emits all buffered bytes to their real stream and clears the buffers.
+    /// Stdout bytes route through the dedicated stdout emitter; stderr bytes
+    /// through the diagnostic (stderr) emitter. Both use DynamoRIO's own I/O, so
+    /// re-emission does not re-enter the syscall interception path.
+    fn flush_messages(&mut self) {
+        for buffered in self.printbuf.values_mut() {
+            for (which, bytes) in buffered.iter() {
+                match which {
+                    ChunkyWhich::Stdout => {
+                        emit_raw(&STDOUT_EMITTER, bytes);
+                    }
+                    ChunkyWhich::Stderr => {
+                        emit_raw(&EMITTER, bytes);
+                    }
+                }
+            }
+            buffered.clear();
+        }
+    }
+}
+
+/// The `chunky_print` example's [`GlobalTool`], adapted to DBI. Buffers
+/// suppressed guest stdout/stderr writes and re-emits them at epoch/exit flush
+/// boundaries. Served in-process through [`CHUNKY_PRINT_GLOBAL`] (like
+/// [`COUNTER1_GLOBAL`]); `send_rpc` from the tool dispatches to `receive_rpc`
+/// here.
+#[derive(Debug, Default)]
+pub struct ChunkyPrintGlobal(Mutex<ChunkyInner>);
+
+#[reverie::global_tool]
+impl GlobalTool for ChunkyPrintGlobal {
+    type Request = ChunkyMsg;
+    type Response = ();
+    type Config = ();
+
+    async fn receive_rpc(&self, from: Tid, message: ChunkyMsg) {
+        let mut inner = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match message {
+            ChunkyMsg::Print(which, bytes) => {
+                inner
+                    .printbuf
+                    .entry(from.as_raw())
+                    .or_default()
+                    .push((which, bytes));
+            }
+            ChunkyMsg::Tick => {
+                *inner.times.entry(from.as_raw()).or_insert(0) += 1;
+                inner.check_epoch();
+            }
+            ChunkyMsg::Flush => inner.flush_messages(),
+        }
+    }
+}
+
+/// Tracks whether fd 1/2 have been redirected (`dup2`/`dup3` onto them). Once a
+/// stream is redirected we let its writes through unchanged, matching the
+/// upstream example. The DBI tool is rebuilt per syscall, so these flags live
+/// process-globally rather than in the tool instance.
+static CHUNKY_STDOUT_REDIRECTED: AtomicBool = AtomicBool::new(false);
+static CHUNKY_STDERR_REDIRECTED: AtomicBool = AtomicBool::new(false);
+
+/// The `chunky_print` example [`Tool`], adapted to DBI: suppress guest writes to
+/// fd 1/2, buffer the bytes in the [`ChunkyPrintGlobal`], and flush (re-emit) at
+/// epoch boundaries and at `exit`/`exit_group`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ChunkyPrintTool;
+
+#[reverie::tool]
+impl Tool for ChunkyPrintTool {
+    type GlobalState = ChunkyPrintGlobal;
+    type ThreadState = ();
+
+    // TODO-HUMAN-REVIEW(PR-162): Review lifecycle-safe chunky_print suppression + flush.
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        let _ = guest.send_rpc(ChunkyMsg::Tick).await;
+        match syscall {
+            Syscall::Dup2(dup) => {
+                match dup.newfd() {
+                    1 => CHUNKY_STDOUT_REDIRECTED.store(true, Ordering::SeqCst),
+                    2 => CHUNKY_STDERR_REDIRECTED.store(true, Ordering::SeqCst),
+                    _ => {}
+                }
+                guest.tail_inject(syscall).await
+            }
+            Syscall::Dup3(dup) => {
+                match dup.newfd() {
+                    1 => CHUNKY_STDOUT_REDIRECTED.store(true, Ordering::SeqCst),
+                    2 => CHUNKY_STDERR_REDIRECTED.store(true, Ordering::SeqCst),
+                    _ => {}
+                }
+                guest.tail_inject(syscall).await
+            }
+            Syscall::Write(write) => {
+                let fd = write.fd();
+                let which = match fd {
+                    1 if !CHUNKY_STDOUT_REDIRECTED.load(Ordering::SeqCst) => ChunkyWhich::Stdout,
+                    2 if !CHUNKY_STDERR_REDIRECTED.load(Ordering::SeqCst) => ChunkyWhich::Stderr,
+                    // Redirected fd 1/2, or any other fd: pass through unchanged.
+                    // `tail_inject` diverges (`Never`), so it coerces here.
+                    _ => guest.tail_inject(syscall).await,
+                };
+                let len = write.len();
+                let buf = match write.buf() {
+                    Some(addr) => read_guest_bytes(guest, addr, len)?,
+                    // No buffer pointer (len 0 or NULL): nothing to re-emit; just
+                    // suppress with the byte count the guest expects.
+                    None => Vec::new(),
+                };
+                let _ = guest.send_rpc(ChunkyMsg::Print(which, buf)).await;
+                emit_line(&format!(
+                    "reverie-dbi: chunky_print suppressed write of {len} bytes to fd {fd}"
+                ));
+                // Suppress the original write; report the full length as written.
+                Ok(len as i64)
+            }
+            _ => {
+                if matches!(syscall.number(), Sysno::exit | Sysno::exit_group) {
+                    // Flush before injecting the terminating call, which never
+                    // returns to this handler.
+                    let _ = guest.send_rpc(ChunkyMsg::Flush).await;
+                    emit_line("reverie-dbi: chunky_print flushed buffered output at exit");
+                }
+                guest.tail_inject(syscall).await
+            }
+        }
+    }
+}
+
+/// Reads `len` bytes of guest memory at `addr`. The DBI client is in-process
+/// with the guest, so [`Guest::memory`] reads its own address space directly.
+fn read_guest_bytes<G: Guest<ChunkyPrintTool>>(
+    guest: &G,
+    addr: Addr<u8>,
+    len: usize,
+) -> Result<Vec<u8>, Error> {
+    let mut buf = vec![0u8; len];
+    guest.memory().read_exact(addr, &mut buf)?;
+    Ok(buf)
+}
+
 /// The observation tool selected by the environment, if any.
 enum ActiveTool {
     Strace,
@@ -465,6 +683,7 @@ enum ActiveTool {
     RewriteExit,
     Counter1,
     Counter2,
+    ChunkyPrint,
 }
 
 fn active_tool() -> Option<ActiveTool> {
@@ -485,6 +704,8 @@ fn active_tool() -> Option<ActiveTool> {
         Some(ActiveTool::Counter2)
     } else if *COUNTER1_ENABLED {
         Some(ActiveTool::Counter1)
+    } else if *CHUNKY_PRINT_ENABLED {
+        Some(ActiveTool::ChunkyPrint)
     } else if *NOOP_ENABLED {
         Some(ActiveTool::Noop)
     } else {
@@ -851,6 +1072,15 @@ pub(crate) fn run_active_tool(
             invoke_syscall,
             read_registers,
         ),
+        ActiveTool::ChunkyPrint => dispatch_chunky_print(
+            context,
+            tid,
+            pid,
+            branches,
+            syscall,
+            invoke_syscall,
+            read_registers,
+        ),
     };
     Some(match result {
         Ok(outcome) => outcome,
@@ -952,6 +1182,40 @@ fn dispatch_counter1(
         &mut thread_state,
         // `&*` forces `LazyLock<Counter1Global>` to deref to `&Counter1Global`.
         &*COUNTER1_GLOBAL,
+        &(),
+        syscall,
+        invoke_syscall,
+        read_registers,
+    )
+}
+
+/// The process-global `chunky_print` state, persisting the per-thread print
+/// buffers across syscalls. Like [`COUNTER1_GLOBAL`], `send_rpc` on the DBI
+/// guest dispatches to this instance's `receive_rpc` in-process.
+static CHUNKY_PRINT_GLOBAL: LazyLock<ChunkyPrintGlobal> = LazyLock::new(ChunkyPrintGlobal::default);
+
+/// Runs one syscall through [`ChunkyPrintTool`], whose [`ChunkyPrintGlobal`] is
+/// the shared [`CHUNKY_PRINT_GLOBAL`] so buffered output accumulates across the
+/// run and flushes at epoch/exit boundaries.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_chunky_print(
+    context: usize,
+    tid: i32,
+    pid: i32,
+    branches: u64,
+    syscall: Syscall,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
+) -> Result<DbiSyscallOutcome, Error> {
+    let mut thread_state = ();
+    crate::run_tool_syscall(
+        &ChunkyPrintTool,
+        context,
+        Pid::from_raw(tid),
+        Pid::from_raw(pid),
+        branches,
+        &mut thread_state,
+        &*CHUNKY_PRINT_GLOBAL,
         &(),
         syscall,
         invoke_syscall,
