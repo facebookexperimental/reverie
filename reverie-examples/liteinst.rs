@@ -69,6 +69,11 @@ struct Args {
     #[clap(long = "trace")]
     filters: Vec<String>,
 
+    /// The path to write the Chrome trace artifact.
+    // TODO-HUMAN-REVIEW(PR-159): Review the ChromeTrace artifact option.
+    #[clap(long)]
+    out: Option<PathBuf>,
+
     // TODO-HUMAN-REVIEW(PR-157): Review the production chaos option surface.
     #[clap(flatten)]
     chaos_options: ChaosCliOptions,
@@ -82,6 +87,9 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     if args.tool != example_tools::ToolKind::Strace && !args.filters.is_empty() {
         bail!("--trace is only valid with --tool strace");
+    }
+    if args.tool != example_tools::ToolKind::ChromeTrace && args.out.is_some() {
+        bail!("--out is only valid with --tool chrome-trace");
     }
     if args.tool != example_tools::ToolKind::Chaos && args.chaos_options.was_supplied() {
         bail!("chaos options are only valid with --tool chaos");
@@ -99,6 +107,13 @@ async fn main() -> anyhow::Result<()> {
 
     std::io::stdout().write_all(&result.output.stdout)?;
     std::io::stderr().write_all(&result.output.stderr)?;
+    if let Some(path) = args.out {
+        let trace = result
+            .chrome_trace
+            .as_deref()
+            .expect("ChromeTrace run did not return its trace artifact");
+        std::fs::write(path, trace)?;
+    }
     match result.counter_summary {
         Some(example_tools::CounterSummary::Counter1 { total_syscalls }) => {
             eprintln!(" [counter tool] Total system calls in process tree: {total_syscalls}");

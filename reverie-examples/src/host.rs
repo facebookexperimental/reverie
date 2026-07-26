@@ -27,6 +27,10 @@ mod chaos;
 pub(crate) use chaos::ChaosOpts;
 
 #[allow(dead_code)]
+#[path = "../chrome-trace/main.rs"]
+mod chrome_trace;
+
+#[allow(dead_code)]
 #[path = "../chunky_print.rs"]
 mod chunky_print;
 #[allow(dead_code)]
@@ -55,6 +59,9 @@ pub(crate) enum ToolKind {
     /// Introduce short reads and optional interrupted reads.
     // TODO-HUMAN-REVIEW(PR-157): Review the chaos LiteInst selector extension.
     Chaos,
+    /// Capture process lifecycle and syscall events as a Chrome trace.
+    // TODO-HUMAN-REVIEW(PR-159): Review the ChromeTrace LiteInst selector extension.
+    ChromeTrace,
     /// Count every intercepted syscall through the shared global state.
     Counter1,
     /// Aggregate per-thread and per-process syscall counts in global state.
@@ -74,6 +81,7 @@ impl ToolKind {
         match self {
             Self::Chaos => "chaos",
             Self::Counter1 => "counter1",
+            Self::ChromeTrace => "chrome-trace",
             Self::Counter2 => "counter2",
             Self::Strace => "strace",
             Self::ChunkyPrint => "chunky-print",
@@ -100,6 +108,9 @@ pub(crate) enum CounterSummary {
 pub(crate) struct RunOutput {
     /// Guest process status and captured standard streams.
     pub(crate) output: Output,
+    /// Serialized Chrome trace events; present only for `ChromeTrace`.
+    // TODO-HUMAN-REVIEW(PR-159): Review the ChromeTrace artifact result field.
+    pub(crate) chrome_trace: Option<Vec<u8>>,
     /// Final structured result for counter tools; absent for other tools.
     // TODO-HUMAN-REVIEW(PR-146): Review the typed counter result field.
     pub(crate) counter_summary: Option<CounterSummary>,
@@ -154,6 +165,23 @@ pub(crate) async fn run(
                 .await?;
             Ok(RunOutput {
                 output,
+                chrome_trace: None,
+                counter_summary: None,
+            })
+        }
+        // TODO-HUMAN-REVIEW(PR-159): Review the exact ChromeTrace LiteInst host path.
+        ToolKind::ChromeTrace => {
+            let (output, global) = LiteinstBackend::run_with_output_and_preload_data::<
+                chrome_trace::ChromeTrace,
+            >(command, (), preload, tool_data)
+            .await?;
+            let mut trace = Vec::new();
+            global
+                .chrome_trace(&mut trace)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            Ok(RunOutput {
+                output,
+                chrome_trace: Some(trace),
                 counter_summary: None,
             })
         }
@@ -164,6 +192,7 @@ pub(crate) async fn run(
             .await?;
             Ok(RunOutput {
                 output,
+                chrome_trace: None,
                 counter_summary: Some(CounterSummary::Counter1 {
                     total_syscalls: global.total(),
                 }),
@@ -185,6 +214,7 @@ pub(crate) async fn run(
             };
             Ok(RunOutput {
                 output,
+                chrome_trace: None,
                 counter_summary: Some(counter_summary),
             })
         }
@@ -197,6 +227,7 @@ pub(crate) async fn run(
             let _ = global.flush();
             Ok(RunOutput {
                 output,
+                chrome_trace: None,
                 counter_summary: None,
             })
         }
@@ -210,6 +241,7 @@ pub(crate) async fn run(
             .await?;
             Ok(RunOutput {
                 output,
+                chrome_trace: None,
                 counter_summary: None,
             })
         }
@@ -223,6 +255,7 @@ pub(crate) async fn run(
             .await?;
             Ok(RunOutput {
                 output,
+                chrome_trace: None,
                 counter_summary: None,
             })
         }

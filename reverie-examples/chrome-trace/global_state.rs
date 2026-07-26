@@ -13,7 +13,7 @@ use std::time::SystemTime;
 use reverie::GlobalTool;
 use reverie::Pid;
 
-use crate::event::ThreadExit;
+use super::event::ThreadExit;
 
 #[derive(Debug)]
 pub struct GlobalState {

@@ -21,7 +21,8 @@ use anyhow::Context;
 use clap::Parser;
 use reverie::Error;
 use reverie_util::CommonToolArguments;
-use tool::ChromeTrace;
+// TODO-HUMAN-REVIEW(PR-159): Review crate-local reuse of the production ChromeTrace tool.
+pub(crate) use tool::ChromeTrace;
 
 /// A tool to render a summary of the process tree.
 #[derive(Debug, Parser)]

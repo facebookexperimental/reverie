@@ -333,6 +333,72 @@ fn exact_chunky_print_delays_buffered_write_behind_later_alias_write() {
     }
     assert!(observed_buffering, "output was pure pass-through: {stdout}");
 }
+
+#[test]
+fn chrome_trace_output_requires_the_chrome_trace_tool() {
+    let trace_path = std::env::temp_dir().join(format!(
+        "reverie-liteinst-invalid-chrome-trace-{}.json",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&trace_path);
+    let output = run(
+        "noop",
+        &["--out", trace_path.to_str().unwrap()],
+        &["/bin/true"],
+    );
+
+    assert!(!output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("--out is only valid with --tool chrome-trace"),
+        "{stderr}"
+    );
+    assert!(!trace_path.exists(), "unexpected artifact: {trace_path:?}");
+}
+
+#[test]
+fn exact_chrome_trace_tool_writes_process_and_syscall_events() {
+    let trace_path = std::env::temp_dir().join(format!(
+        "reverie-liteinst-chrome-trace-{}.json",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&trace_path);
+    let output = run(
+        "chrome-trace",
+        &["--out", trace_path.to_str().unwrap()],
+        &["/bin/echo", "hello"],
+    );
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"hello\n");
+    assert!(output.stderr.is_empty(), "{output:?}");
+
+    let trace = std::fs::read(&trace_path).unwrap();
+    std::fs::remove_file(&trace_path).unwrap();
+    let trace: serde_json::Value = serde_json::from_slice(&trace).unwrap();
+    let events = trace
+        .as_array()
+        .expect("chrome trace is not an event array");
+    assert!(
+        events
+            .iter()
+            .any(|event| event["cat"] == "process" && event["ph"] == "B"),
+        "{trace}"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event["cat"] == "syscall"
+                && event["name"] == "write"
+                && event["args"]["pretty"]
+                    .as_str()
+                    .is_some_and(|pretty| pretty.starts_with("write(1,"))
+                && event["args"]["result"] == "Ok(6)"
+        }),
+        "{trace}"
+    );
+}
+
 #[test]
 fn exact_strace_tool_observes_filtered_write() {
     let output = run("strace", &["--trace", "write"], &["/bin/echo", "hello"]);

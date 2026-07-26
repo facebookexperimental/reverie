@@ -27,10 +27,10 @@ use reverie::syscalls::SyscallInfo;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::event::Event;
-use crate::event::Program;
-use crate::event::ThreadExit;
-use crate::global_state::GlobalState;
+use super::event::Event;
+use super::event::Program;
+use super::event::ThreadExit;
+use super::global_state::GlobalState;
 
 #[derive(Debug, Clone)]
 pub struct ChromeTrace(Pid);
