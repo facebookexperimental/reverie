@@ -1652,19 +1652,33 @@ mod tests {
         // getpid's duration is 150-100 and write's is 220-150.
         inner.record_syscall(3, 3, 100, Sysno::getpid.id(), "getpid()".to_string());
         inner.record_syscall(3, 3, 150, Sysno::write.id(), "write(1, ...)".to_string());
-        inner.record_syscall(3, 3, 220, Sysno::exit_group.id(), "exit_group(0)".to_string());
+        inner.record_syscall(
+            3,
+            3,
+            220,
+            Sysno::exit_group.id(),
+            "exit_group(0)".to_string(),
+        );
 
         let thread = &inner.threads[&3];
         assert_eq!(thread.start_us, 100);
         assert_eq!(thread.end_us, 220);
-        assert_eq!(thread.events.len(), 2, "two settled, exit_group still pending");
+        assert_eq!(
+            thread.events.len(),
+            2,
+            "two settled, exit_group still pending"
+        );
         assert_eq!(thread.events[0].dur_us, 50);
         assert_eq!(thread.events[1].dur_us, 70);
 
         inner.flush();
         assert!(inner.flushed);
         let thread = &inner.threads[&3];
-        assert_eq!(thread.events.len(), 3, "flush settles the pending exit_group");
+        assert_eq!(
+            thread.events.len(),
+            3,
+            "flush settles the pending exit_group"
+        );
         assert_eq!(thread.events[2].sysno, Sysno::exit_group.id());
         assert_eq!(thread.events[2].dur_us, 0, "last event ends at thread end");
 
