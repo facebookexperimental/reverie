@@ -36,6 +36,7 @@ const STACK_STRING_HEADROOM: u64 = 4096;
 const MMAP_GAP: u64 = 1024 * 1024;
 const MAX_PROGRAM_HEADERS_SIZE: usize = PAGE_SIZE as usize;
 const MAX_INTERPRETER_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_SCRIPT_INTERPRETERS: usize = 4;
 const MAIN_LOAD_BIAS: u64 = 2 * 1024 * 1024;
 const INTERPRETER_LOAD_BIAS: u64 = 16 * 1024 * 1024;
 const IOPRIO_CLASS_SHIFT: u32 = 13;
@@ -77,6 +78,8 @@ pub(crate) struct LoadedStaticElf {
     pub pid: i32,
     pub ppid: i32,
     pub umask: libc::mode_t,
+    // TODO-HUMAN-REVIEW(PR-92): Review virtual nice process state.
+    pub nice: libc::c_int,
     // TODO-HUMAN-REVIEW(PR-119): Review virtual scheduler/ioprio process state.
     pub sched_policy: libc::c_int,
     pub sched_priority: libc::c_int,
@@ -135,6 +138,7 @@ impl LoadedStaticElf {
             pid: child_pid,
             ppid: self.pid,
             umask: self.umask,
+            nice: self.nice,
             sched_policy: if reset_realtime {
                 libc::SCHED_OTHER
             } else {
@@ -221,6 +225,7 @@ impl LoadedStaticElf {
         self.pid = previous.pid;
         self.ppid = previous.ppid;
         self.umask = previous.umask;
+        self.nice = previous.nice;
         // TODO-HUMAN-REVIEW(PR-119): Review scheduler and ioprio exec inheritance.
         self.sched_policy = previous.sched_policy;
         self.sched_priority = previous.sched_priority;
@@ -238,6 +243,7 @@ impl LoadedStaticElf {
     }
 }
 
+// TODO-HUMAN-REVIEW(PR-92): Review script loading and executable resolution.
 pub(crate) fn load_static_elf(
     memory: &mut GuestMemory,
     image: &[u8],
@@ -245,12 +251,64 @@ pub(crate) fn load_static_elf(
     envp: &[&str],
     cwd: &Path,
 ) -> Result<LoadedStaticElf> {
-    let elf = Elf::parse(image)?;
-    validate_elf(&elf, true)?;
+    load_executable(memory, image, argv, envp, cwd, 0)
+}
 
+// TODO-HUMAN-REVIEW(PR-92): Review recursive script interpreter loading.
+fn load_executable(
+    memory: &mut GuestMemory,
+    image: &[u8],
+    argv: &[&str],
+    envp: &[&str],
+    cwd: &Path,
+    script_depth: usize,
+) -> Result<LoadedStaticElf> {
     let argv0 = *argv
         .first()
         .ok_or_else(|| Error::UnsupportedElf("argv must contain at least argv[0]".to_string()))?;
+    if let Some((interpreter, optional_argument)) = parse_shebang(image)? {
+        if script_depth >= MAX_SCRIPT_INTERPRETERS {
+            return Err(Error::UnsupportedElf(
+                "script interpreter recursion limit exceeded".to_string(),
+            ));
+        }
+        let script_path = resolve_executable_path(argv0, envp, cwd)?;
+        let interpreter_path = resolve_executable_path(&interpreter, envp, cwd)?;
+        let interpreter_image = std::fs::read(&interpreter_path).map_err(|error| {
+            Error::UnsupportedElf(format!(
+                "cannot read script interpreter {interpreter_path:?}: {error}"
+            ))
+        })?;
+        if interpreter_image.len() as u64 > MAX_INTERPRETER_BYTES {
+            return Err(Error::UnsupportedElf(format!(
+                "script interpreter {interpreter_path:?} exceeds {MAX_INTERPRETER_BYTES} bytes"
+            )));
+        }
+
+        let mut interpreter_argv = Vec::with_capacity(argv.len() + 2);
+        interpreter_argv.push(interpreter_path.to_string_lossy().into_owned());
+        if let Some(argument) = optional_argument {
+            interpreter_argv.push(argument);
+        }
+        interpreter_argv.push(script_path.to_string_lossy().into_owned());
+        interpreter_argv.extend(argv.iter().skip(1).map(|argument| (*argument).to_owned()));
+        let interpreter_argv = interpreter_argv
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        return load_executable(
+            memory,
+            &interpreter_image,
+            &interpreter_argv,
+            envp,
+            cwd,
+            script_depth + 1,
+        );
+    }
+
+    let elf = Elf::parse(image)?;
+    validate_elf(&elf, true)?;
+
     for entry in argv.iter().chain(envp.iter()) {
         if entry.as_bytes().contains(&0) {
             return Err(Error::UnsupportedElf(
@@ -358,7 +416,11 @@ pub(crate) fn load_static_elf(
         brk_limit,
         mmap_next,
         mmap_limit,
-        argv0: argv0.as_bytes().to_vec(),
+        argv0: resolve_executable_path(argv0, envp, cwd)
+            .unwrap_or_else(|_| PathBuf::from(argv0))
+            .to_string_lossy()
+            .into_owned()
+            .into_bytes(),
         cwd: cwd.to_owned(),
         cwd_fd,
         stdin: None,
@@ -368,6 +430,7 @@ pub(crate) fn load_static_elf(
         pid: 1,
         ppid: 0,
         umask: 0o022,
+        nice: 0,
         // TODO-HUMAN-REVIEW(PR-119): Review default virtual scheduler and ioprio state.
         sched_policy: libc::SCHED_OTHER,
         sched_priority: 0,
@@ -384,6 +447,66 @@ pub(crate) fn load_static_elf(
         children: std::collections::BTreeMap::new(),
         proc_files: std::collections::BTreeMap::new(),
     })
+}
+
+// TODO-HUMAN-REVIEW(PR-92): Review Linux shebang parsing limits.
+fn parse_shebang(image: &[u8]) -> Result<Option<(String, Option<String>)>> {
+    let Some(rest) = image.strip_prefix(b"#!") else {
+        return Ok(None);
+    };
+    let line = rest.split(|byte| *byte == b'\n').next().unwrap_or(rest);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let line = std::str::from_utf8(line)
+        .map_err(|_| Error::UnsupportedElf("script shebang is not UTF-8".to_string()))?
+        .trim_matches([' ', '\t']);
+    let split = line.find([' ', '\t']).unwrap_or(line.len());
+    let interpreter = line[..split].to_string();
+    if interpreter.is_empty() {
+        return Err(Error::UnsupportedElf(
+            "script shebang has no interpreter".to_string(),
+        ));
+    }
+    let argument = line[split..].trim_matches([' ', '\t']);
+    Ok(Some((
+        interpreter,
+        (!argument.is_empty()).then(|| argument.to_string()),
+    )))
+}
+
+// TODO-HUMAN-REVIEW(PR-92): Review PATH and cwd executable resolution.
+fn resolve_executable_path(argv0: &str, envp: &[&str], cwd: &Path) -> Result<PathBuf> {
+    let path = Path::new(argv0);
+    if path.is_absolute() || path.components().count() > 1 {
+        let candidate = if path.is_absolute() {
+            path.to_owned()
+        } else {
+            cwd.join(path)
+        };
+        return candidate.canonicalize().map_err(|error| {
+            Error::UnsupportedElf(format!("cannot resolve executable {candidate:?}: {error}"))
+        });
+    }
+
+    let search_path = envp
+        .iter()
+        .find_map(|entry| entry.strip_prefix("PATH="))
+        .unwrap_or("/usr/local/bin:/usr/bin:/bin");
+    for directory in std::env::split_paths(search_path) {
+        let directory = if directory.is_absolute() {
+            directory
+        } else {
+            cwd.join(directory)
+        };
+        let candidate = directory.join(path);
+        if candidate.is_file() {
+            return candidate.canonicalize().map_err(|error| {
+                Error::UnsupportedElf(format!("cannot resolve executable {candidate:?}: {error}"))
+            });
+        }
+    }
+    Err(Error::UnsupportedElf(format!(
+        "cannot resolve executable {argv0:?} in PATH"
+    )))
 }
 
 fn validate_elf(elf: &Elf<'_>, allow_interpreter: bool) -> Result<()> {
@@ -753,5 +876,18 @@ mod tests {
         // A main image ending near u64::MAX cannot reserve headroom; report it
         // rather than wrapping.
         assert!(interpreter_load_bias(u64::MAX - 1024).is_err());
+    }
+
+    #[test]
+    fn parses_script_interpreters_and_optional_arguments() {
+        assert_eq!(
+            parse_shebang(b"#!/bin/bash\necho ok\n").unwrap(),
+            Some(("/bin/bash".to_string(), None))
+        );
+        assert_eq!(
+            parse_shebang(b"#!/usr/bin/grep -E\n").unwrap(),
+            Some(("/usr/bin/grep".to_string(), Some("-E".to_string())))
+        );
+        assert_eq!(parse_shebang(b"\x7fELF").unwrap(), None);
     }
 }

@@ -310,8 +310,9 @@ impl KvmBackend {
                 parent_tid,
                 child_tid,
                 clear_child_tid,
+                clear_sighand,
             } => {
-                let mut child_executor = executor.fork_child(child_pid)?;
+                let mut child_executor = executor.fork_child(child_pid, clear_sighand)?;
                 child_executor.set_clear_child_tid(clear_child_tid);
                 set_syscall_return_park(&mut self.memory, self.hypercall_instruction, true)?;
                 let parked = match self.vcpu.run()? {

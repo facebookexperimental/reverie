@@ -82,7 +82,7 @@ fn run_host_program_captured(
     let image = std::fs::read(program).unwrap();
     let mut backend = KvmBackend::new(REAL_PROGRAM_MEMORY_SIZE).unwrap();
     backend
-        .install_static_elf_with_context(&image, argv, &[], cwd)
+        .install_static_elf_with_context(&image, argv, &["PATH=/usr/bin:/bin"], cwd)
         .unwrap();
     let (code, stdout, stderr) = backend.run_static_elf_captured().unwrap();
     assert_eq!(
@@ -599,7 +599,7 @@ fn real_coreutils_complete_file_mutation_workflow() {
     let root = TestDirectory::new();
     std::fs::write(root.0.join("source"), b"payload\n").unwrap();
 
-    run_host_program("/bin/mkdir", &["mkdir", "directory"], &root.0);
+    run_host_program("/bin/mkdir", &["mkdir", "-p", "directory/nested"], &root.0);
     run_host_program("/usr/bin/touch", &["touch", "touched"], &root.0);
     run_host_program("/bin/chmod", &["chmod", "600", "touched"], &root.0);
     run_host_program("/bin/ln", &["ln", "source", "hard-link"], &root.0);
@@ -612,8 +612,10 @@ fn real_coreutils_complete_file_mutation_workflow() {
         &root.0,
     );
     run_host_program("/bin/rm", &["rm", "renamed"], &root.0);
+    run_host_program("/bin/rmdir", &["rmdir", "directory/nested"], &root.0);
 
     assert!(root.0.join("directory").is_dir());
+    assert!(!root.0.join("directory/nested").exists());
     assert_eq!(std::fs::read(root.0.join("source")).unwrap(), b"payload\n");
     assert!(root.0.join("touched").is_file());
     assert_eq!(
@@ -862,6 +864,93 @@ fn strace_tool_logs_syscalls_from_static_elf() {
             "exit_group".to_string(),
         ],
     );
+}
+
+#[test]
+fn real_make_runs_a_shell_recipe_through_clone3_vfork() {
+    match Kvm::new() {
+        Ok(_) => {}
+        Err(error) if kvm_is_unavailable(&error) => {
+            eprintln!("skipping KVM make test: cannot open /dev/kvm: {error}");
+            return;
+        }
+        Err(error) => panic!("failed to probe /dev/kvm: {error}"),
+    }
+    let root = TestDirectory::new();
+    std::fs::write(
+        root.0.join("Makefile"),
+        "all: result.txt\nresult.txt:\n\tprintf 'make:42\\n' > result.txt\n",
+    )
+    .unwrap();
+    run_host_program("/usr/bin/make", &["make", "-s"], &root.0);
+    assert_eq!(
+        std::fs::read(root.0.join("result.txt")).unwrap(),
+        b"make:42\n"
+    );
+}
+
+#[test]
+fn real_gcc_compiles_an_object_through_child_processes() {
+    match Kvm::new() {
+        Ok(_) => {}
+        Err(error) if kvm_is_unavailable(&error) => {
+            eprintln!("skipping KVM gcc test: cannot open /dev/kvm: {error}");
+            return;
+        }
+        Err(error) => panic!("failed to probe /dev/kvm: {error}"),
+    }
+    let root = TestDirectory::new();
+    std::fs::write(
+        root.0.join("fixture.c"),
+        b"int hermit_compat(void) { return 42; }\n",
+    )
+    .unwrap();
+    run_host_program(
+        "/usr/bin/gcc",
+        &[
+            "gcc",
+            "-std=c11",
+            "-O2",
+            "-Wall",
+            "-Wextra",
+            "-fno-ident",
+            "-frandom-seed=hermit-gcc",
+            "-c",
+            "fixture.c",
+            "-o",
+            "fixture.o",
+        ],
+        &root.0,
+    );
+    assert!(root.0.join("fixture.o").is_file());
+}
+
+#[test]
+fn real_patch_applies_exact_hunk_with_absent_xattrs() {
+    match Kvm::new() {
+        Ok(_) => {}
+        Err(error) if kvm_is_unavailable(&error) => {
+            eprintln!("skipping KVM patch test: cannot open /dev/kvm: {error}");
+            return;
+        }
+        Err(error) => panic!("failed to probe /dev/kvm: {error}"),
+    }
+
+    let root = TestDirectory::new();
+    std::fs::write(root.0.join("file"), b"old\n").unwrap();
+    std::fs::write(
+        root.0.join("change.patch"),
+        b"--- file\n+++ file\n@@ -1 +1 @@\n-old\n+new\n",
+    )
+    .unwrap();
+    let (stdout, stderr) = run_host_program_captured(
+        "/usr/bin/patch",
+        &["patch", "--quiet", "--input=change.patch", "file"],
+        &root.0,
+    );
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+    assert_eq!(std::fs::read(root.0.join("file")).unwrap(), b"new\n");
 }
 
 fn static_elf(code: &[u8]) -> Vec<u8> {
