@@ -26,6 +26,7 @@ use crate::COMPAT_EVENT_COOKIE_ENV;
 use crate::COMPAT_EVENT_FD_ENV;
 
 const UNSET_RESULT: i64 = i64::MIN;
+const SYS_IO_PGETEVENTS: i64 = 333;
 const TOOL_STRACE: u8 = 1;
 const TOOL_COMPAT: u8 = 2;
 const TOOL_REVERIE: u8 = 3;
@@ -554,6 +555,194 @@ unsafe fn install_site_hook(address: u64, slot: &'static SiteSlot) -> io::Result
     Ok(())
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-133): Review nested Tool syscall guards and raw forwarding.
+#[repr(C)]
+#[derive(Default)]
+struct KernelSigaction {
+    handler: u64,
+    flags: u64,
+    restorer: u64,
+    mask: u64,
+}
+
+pub(crate) struct SignalInstallGuard {
+    restore_mask: u64,
+}
+
+impl Drop for SignalInstallGuard {
+    fn drop(&mut self) {
+        let result = unsafe {
+            raw_syscall6(
+                libc::SYS_rt_sigprocmask,
+                [
+                    libc::SIG_SETMASK as u64,
+                    (&raw const self.restore_mask) as u64,
+                    0,
+                    core::mem::size_of::<u64>() as u64,
+                    0,
+                    0,
+                ],
+            )
+        };
+        if result < 0 {
+            unsafe { exit_now(126) };
+        }
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-133): Review atomic signal-state preparation.
+pub(crate) fn prepare_guest_signal_state() -> io::Result<SignalInstallGuard> {
+    let sigsys = 1_u64 << (libc::SIGSYS - 1);
+    let install_mask = u64::MAX;
+    let mut previous_mask = 0_u64;
+    let result = unsafe {
+        raw_syscall6(
+            libc::SYS_rt_sigprocmask,
+            [
+                libc::SIG_SETMASK as u64,
+                (&raw const install_mask) as u64,
+                (&raw mut previous_mask) as u64,
+                core::mem::size_of::<u64>() as u64,
+                0,
+                0,
+            ],
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::from_raw_os_error((-result) as i32));
+    }
+    let guard = SignalInstallGuard {
+        restore_mask: previous_mask & !sigsys,
+    };
+
+    for signal in 1..=64 {
+        if matches!(signal, libc::SIGKILL | libc::SIGSTOP) {
+            continue;
+        }
+        let mut action = KernelSigaction::default();
+        let result = unsafe {
+            raw_syscall6(
+                libc::SYS_rt_sigaction,
+                [
+                    signal as u64,
+                    0,
+                    (&raw mut action) as u64,
+                    core::mem::size_of::<u64>() as u64,
+                    0,
+                    0,
+                ],
+            )
+        };
+        if result < 0 {
+            return Err(io::Error::from_raw_os_error((-result) as i32));
+        }
+        if action.handler != libc::SIG_DFL as u64 && action.handler != libc::SIG_IGN as u64 {
+            let default_action = KernelSigaction::default();
+            let result = unsafe {
+                raw_syscall6(
+                    libc::SYS_rt_sigaction,
+                    [
+                        signal as u64,
+                        (&raw const default_action) as u64,
+                        0,
+                        core::mem::size_of::<u64>() as u64,
+                        0,
+                        0,
+                    ],
+                )
+            };
+            if result < 0 {
+                return Err(io::Error::from_raw_os_error((-result) as i32));
+            }
+        }
+    }
+    Ok(guard)
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-133): Review fault-safe guest signal-action decoding.
+pub(crate) fn signal_action_supported(number: i64, args: [u64; 6]) -> bool {
+    if number != libc::SYS_rt_sigaction || args[1] == 0 {
+        return true;
+    }
+    if args[0] == libc::SIGSYS as u64 {
+        return false;
+    }
+
+    let mut handler = 0_u64;
+    let local = libc::iovec {
+        iov_base: (&raw mut handler).cast(),
+        iov_len: core::mem::size_of::<u64>(),
+    };
+    let remote = libc::iovec {
+        iov_base: args[1] as usize as *mut libc::c_void,
+        iov_len: core::mem::size_of::<u64>(),
+    };
+    let pid = unsafe { raw_syscall6(libc::SYS_getpid, [0; 6]) };
+    let read = unsafe {
+        raw_syscall6(
+            libc::SYS_process_vm_readv,
+            [
+                pid as u64,
+                (&raw const local) as u64,
+                1,
+                (&raw const remote) as u64,
+                1,
+                0,
+            ],
+        )
+    };
+    read == core::mem::size_of::<u64>() as i64
+        && matches!(handler, value if value == libc::SIG_DFL as u64 || value == libc::SIG_IGN as u64)
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-133): Review nested Tool syscall guards and raw forwarding.
+fn forward_nested_tool_syscall(event: &mut SyscallEvent) {
+    let unsupported_process =
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        event.number == libc::SYS_clone
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        || event.number == libc::SYS_clone3
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        || event.number == libc::SYS_fork
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        || event.number == libc::SYS_vfork
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        || event.number == libc::SYS_execve
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        || event.number == libc::SYS_execveat;
+    let unsupported_signal_state =
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        event.number == libc::SYS_rt_sigaction
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        || event.number == libc::SYS_rt_sigprocmask
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        || event.number == libc::SYS_sigaltstack
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        || event.number == libc::SYS_rt_sigsuspend
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        || event.number == libc::SYS_pselect6
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        || event.number == libc::SYS_ppoll
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        || event.number == libc::SYS_epoll_pwait
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        || event.number == libc::SYS_epoll_pwait2
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        || event.number == SYS_IO_PGETEVENTS;
+    if unsupported_process {
+        event.result = -i64::from(libc::ENOTSUP);
+    } else if unsupported_signal_state {
+        event.result = -i64::from(libc::EPERM);
+    } else if !(protect_runtime_control(event) || unsafe { protect_coordinator_channel(event) }) {
+        event.result = unsafe { raw_syscall6(event.number, event.args) };
+        observe_mapping_generation(event);
+    }
+}
+
 unsafe extern "C" fn installed_syscall_hook(context: *mut HookContext) {
     if context.is_null() {
         unsafe {
@@ -580,10 +769,14 @@ unsafe extern "C" fn installed_syscall_hook(context: *mut HookContext) {
         result: UNSET_RESULT,
         context: context_pointer,
     };
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-133): Review guarded installed-hook bypass for Tool-internal syscalls.
     if unsafe { !CURRENT_EVENT.is_null() } {
-        unsafe {
-            exit_now(125);
-        }
+        forward_nested_tool_syscall(&mut event);
+        context.rax = event.result as u64;
+        context.rcx = context.instruction_pointer.saturating_add(2);
+        context.r11 = context.rflags;
+        return;
     }
     unsafe {
         CURRENT_EVENT = &mut event;
@@ -621,7 +814,15 @@ struct LiteinstDispatcher;
 impl SyscallDispatcher for LiteinstDispatcher {
     fn dispatch(&self, event: &mut PreloadSyscallEvent) {
         if unsafe { !CURRENT_EVENT.is_null() } {
-            event.set_result(unsafe { raw_syscall6(event.number(), event.args()) });
+            let mut nested = SyscallEvent {
+                number: event.number(),
+                args: event.args(),
+                instruction_pointer: event.instruction_pointer(),
+                result: UNSET_RESULT,
+                context: 0,
+            };
+            forward_nested_tool_syscall(&mut nested);
+            event.set_result(nested.result);
             return;
         }
         let mode = TOOL_MODE.load(Ordering::Relaxed);
@@ -694,7 +895,8 @@ fn protect_runtime_control(event: &mut SyscallEvent) -> bool {
         matches!(event.number, libc::SYS_clone3 | libc::SYS_vfork);
     let protected_signal =
         // AUTONOMOUS-BOT-IMPLEMENTED
-        (event.number == libc::SYS_rt_sigaction && event.args[0] == libc::SIGSYS as u64)
+        // TODO-HUMAN-REVIEW(PR-133): Review fail-closed guest signal-handler policy.
+        !signal_action_supported(event.number, event.args)
         // AUTONOMOUS-BOT-IMPLEMENTED
         || (event.number == libc::SYS_sigaltstack && event.args[0] != 0)
         // AUTONOMOUS-BOT-IMPLEMENTED

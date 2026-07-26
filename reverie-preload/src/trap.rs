@@ -28,6 +28,7 @@ use crate::dispatch::SyscallDispatcher;
 use crate::dispatch::SyscallEvent;
 use crate::seccomp::TrustedGate;
 use crate::signal;
+const SYS_SECCOMP_CODE: libc::c_int = 1;
 
 core::arch::global_asm!(
     r#"
@@ -142,10 +143,16 @@ unsafe fn exit_now(code: i32) -> ! {
 /// Only the kernel calls this, on a real `SIGSYS`.
 pub(crate) unsafe extern "C" fn sigsys_handler(
     signal_number: libc::c_int,
-    _info: *mut libc::siginfo_t,
+    info: *mut libc::siginfo_t,
     context: *mut libc::c_void,
 ) {
-    if signal_number != libc::SIGSYS || context.is_null() {
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-133): Review fail-closed SIGSYS provenance validation.
+    if signal_number != libc::SIGSYS
+        || info.is_null()
+        || context.is_null()
+        || unsafe { (*info).si_code } != SYS_SECCOMP_CODE
+    {
         unsafe { exit_now(126) };
     }
 

@@ -44,6 +44,7 @@ without a coordinator.
   `LiteinstBackend`. Fork/clone process-tree reconnect and exec rebootstrap are
   not implemented.
 - Syscalls are hosted. Signal, CPUID, RDTSC/RDTSCP, RDRAND/RDSEED, and tool exit
+- Tool mode resets callable signal dispositions before activation, rejects later callable handlers, and validates that SIGSYS came from seccomp. `SIG_DFL` and `SIG_IGN` remain supported; guest signal handlers remain unsupported.
   callbacks are not routed yet.
 - Timer arming currently returns success but no RCB timer or preemption event is
   delivered. This supports the single-thread L0 smoke path; it is not strict
