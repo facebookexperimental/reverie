@@ -1104,11 +1104,49 @@ pub extern "C" fn reverie_dbi_runtime_image_init() -> u64 {
 ///
 /// # Safety
 ///
-/// `counters` must point to aligned, writable storage for one counter value.
+/// `counters` must point to aligned, writable storage for one counter value and
+/// the callback pointers must be valid for the lifetime of the application.
+// TODO-HUMAN-REVIEW(PR-131): Review the expanded native thread initialization ABI.
 #[cfg(feature = "prototype-runtime")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(counters: *mut PrototypeCounters) {
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
+    counters: *mut PrototypeCounters,
+    _context: *mut c_void,
+    _tid: i32,
+    _pid: i32,
+    _branches: u64,
+    _defer_runtime: i32,
+    _invoke_syscall: SyscallInvoker,
+    _read_registers: RegisterReader,
+) -> i32 {
     unsafe { counters.write(PrototypeCounters::default()) };
+    0
+}
+
+/// Observes a natively created child thread in the prototype runtime.
+///
+/// # Safety
+///
+/// `counters` must name initialized per-thread storage and the callback pointers
+/// must be valid for the lifetime of the application.
+// TODO-HUMAN-REVIEW(PR-131): Review the native child-registration ABI.
+#[cfg(feature = "prototype-runtime")]
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn reverie_dbi_runtime_thread_created(
+    _counters: *mut PrototypeCounters,
+    _context: *mut c_void,
+    _parent_tid: i32,
+    _pid: i32,
+    _branches: u64,
+    _child_tid: i32,
+    _child_tid_addr: u64,
+    _flags: u64,
+    _invoke_syscall: SyscallInvoker,
+    _read_registers: RegisterReader,
+) -> i32 {
+    0
 }
 
 /// Releases prototype state for an exiting application thread.
