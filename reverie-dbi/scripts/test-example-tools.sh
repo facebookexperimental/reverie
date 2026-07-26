@@ -137,6 +137,26 @@ grep -q 'chunky_print flushed buffered output at exit' "$tmpdir/err" \
   || fail "chunky_print: buffered output not flushed at exit"
 echo "PASS: chunky_print (suppress guest stdout, re-emit at exit flush)"
 
+# chrome_trace: record a per-thread syscall timeline and emit it as a Chrome
+# trace JSON array at exit. The guest's stdout must pass through untouched
+# (chrome_trace only observes), and the emitted JSON must be a well-formed array
+# containing the process (B/E) and syscall (X) trace events.
+run_tool HERMIT_DBI_CHROME_TRACE
+grep -q '^GUEST-STDOUT$' "$tmpdir/out" \
+  || fail "chrome_trace: guest stdout not passed through"
+grep -Eq 'chrome_trace [1-9][0-9]* trace events across [1-9][0-9]* thread\(s\)' "$tmpdir/err" \
+  || fail "chrome_trace: no trace summary"
+chrome_json=$(grep -o 'reverie-dbi: chrome_trace_json=.*' "$tmpdir/err" \
+  | sed 's/^reverie-dbi: chrome_trace_json=//')
+[[ -n "$chrome_json" ]] || fail "chrome_trace: no JSON emitted"
+grep -q '"cat":"process"' <<<"$chrome_json" \
+  || fail "chrome_trace: JSON missing process (B/E) events"
+grep -q '"cat":"syscall"' <<<"$chrome_json" \
+  || fail "chrome_trace: JSON missing syscall events"
+grep -q '"ph":"X"' <<<"$chrome_json" \
+  || fail "chrome_trace: JSON missing complete (X) syscall events"
+echo "PASS: chrome_trace (per-thread timeline -> Chrome trace JSON at exit)"
+
 run_pthread_tool HERMIT_DBI_NOOP noop
 run_pthread_tool HERMIT_DBI_STRACE strace
 run_pthread_tool HERMIT_DBI_COUNTER1 counter1

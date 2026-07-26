@@ -20,6 +20,7 @@ libc = "0.2.186"
 reverie = { version = "0.1.0", path = "../reverie" }
 reverie-memory = { version = "0.1.0", path = "../reverie-memory" }
 serde = { version = "1.0.219", features = ["derive"] }
+serde_json = { version = "1.0.140", features = ["alloc"] }
 
 [dev-dependencies]
 reverie-rpc-transport = { version = "0.1.0", path = "../reverie-rpc-transport" }

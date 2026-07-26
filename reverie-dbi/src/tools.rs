@@ -25,6 +25,11 @@
 //!    state across syscalls, and reports process-wide admission counts after its
 //!    exit hook. In-flight thread state may be discarded by `exit_group`.
 //!  * [`NoopTool`] and [`Counter1Tool`] exercise passthrough and GlobalState RPC.
+//!  * [`ChromeTraceTool`] accumulates a per-thread syscall timeline in its
+//!    [`GlobalState`](ChromeTraceGlobal) and emits it as Chrome trace JSON at
+//!    exit. It records at syscall entry via `tail_inject` (never `inject`s), so
+//!    its per-syscall durations are inter-entry approximations, not true return
+//!    times — an intentional L0 fidelity limit.
 //!
 //! They are selected at run time via environment variables and dispatched by the
 //! native client through [`run_active_tool`]. Output is written through a
@@ -46,6 +51,7 @@ use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
+use std::time::SystemTime;
 
 use reverie::Error;
 use reverie::ExitStatus;
@@ -80,6 +86,7 @@ const TEST_REWRITE_EXIT_ENV: &str = "HERMIT_DBI_TEST_REWRITE_EXIT";
 const COUNTER1_ENV: &str = "HERMIT_DBI_COUNTER1";
 const COUNTER2_ENV: &str = "HERMIT_DBI_COUNTER2";
 const CHUNKY_PRINT_ENV: &str = "HERMIT_DBI_CHUNKY_PRINT";
+const CHROME_TRACE_ENV: &str = "HERMIT_DBI_CHROME_TRACE";
 
 fn env_flag(name: &str) -> bool {
     std::env::var_os(name).is_some_and(|value| {
@@ -95,6 +102,24 @@ static TEST_REWRITE_EXIT_ENABLED: LazyLock<bool> =
 static COUNTER1_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(COUNTER1_ENV));
 static COUNTER2_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(COUNTER2_ENV));
 static CHUNKY_PRINT_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(CHUNKY_PRINT_ENV));
+static CHROME_TRACE_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(CHROME_TRACE_ENV));
+
+/// Process-global epoch for [`ChromeTraceTool`] timestamps. Captured once, on
+/// first access, so every recorded event is expressed as microseconds since a
+/// single origin (mirrors the upstream `chrome_trace` example's `GlobalState`
+/// epoch). `SystemTime::now` here is served by the vDSO, so it issues no real
+/// syscall that could re-enter the DBI interception path.
+static CHROME_EPOCH: LazyLock<SystemTime> = LazyLock::new(SystemTime::now);
+
+/// Microseconds elapsed from [`CHROME_EPOCH`] to now, saturating at zero if the
+/// clock appears to move backwards (never panics — a panic in a DBI handler
+/// aborts the process).
+fn chrome_now_us() -> u64 {
+    SystemTime::now()
+        .duration_since(*CHROME_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64
+}
 
 /// Per-syscall-number invocation counts, keyed by raw syscall number.
 static SYSCALL_HISTOGRAM: LazyLock<Mutex<BTreeMap<i32, u64>>> =
@@ -674,6 +699,223 @@ fn read_guest_bytes<G: Guest<ChunkyPrintTool>>(
     Ok(buf)
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-166): Review the DBI chrome_trace port and JSON emit path.
+/// RPC to [`ChromeTraceGlobal`]. Mirrors the upstream `chrome_trace` example's
+/// `ThreadExit`/`Event` messages, but sends one syscall observation at a time
+/// (the DBI backend rebuilds the tool per syscall and hardwires `ThreadState`
+/// to `()`, so per-thread accumulation lives in the process-global state keyed
+/// by tid rather than in the tool's `ThreadState`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChromeMsg {
+    /// One observed syscall entry: its start time (µs since [`CHROME_EPOCH`]),
+    /// raw number, and pretty-printed form (inputs only).
+    Syscall {
+        tid: i32,
+        pid: i32,
+        at_us: u64,
+        sysno: i32,
+        pretty: String,
+    },
+    /// Finalize any in-flight per-thread event and emit the Chrome trace JSON.
+    Flush,
+}
+
+/// A completed syscall event on one thread: `[start, start + dur)` in µs since
+/// [`CHROME_EPOCH`]. The duration is approximated as the interval until the
+/// thread's *next* observed syscall entry (or the flush time for the last one),
+/// because the DBI tool records at syscall entry via `tail_inject` and never
+/// resumes to observe the true return — an intentional L0 fidelity limit that
+/// avoids injecting (and potentially blocking on) each syscall in-client.
+#[derive(Clone, Debug)]
+struct ChromeSyscall {
+    start_us: u64,
+    dur_us: u64,
+    sysno: i32,
+    pretty: String,
+}
+
+/// Per-thread accumulated timeline, keyed by raw tid in [`ChromeInner`].
+#[derive(Clone, Debug, Default)]
+struct ChromeThread {
+    pid: i32,
+    start_us: u64,
+    end_us: u64,
+    events: Vec<ChromeSyscall>,
+    /// The most recent syscall entry whose end is not yet known (finalized when
+    /// the next entry on this thread arrives, or at flush).
+    pending: Option<(u64, i32, String)>,
+}
+
+impl ChromeThread {
+    /// Closes out the pending syscall (if any) with an end time of `end_us`.
+    fn settle_pending(&mut self, end_us: u64) {
+        if let Some((start_us, sysno, pretty)) = self.pending.take() {
+            self.events.push(ChromeSyscall {
+                start_us,
+                dur_us: end_us.saturating_sub(start_us),
+                sysno,
+                pretty,
+            });
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ChromeInner {
+    /// Per-thread timelines, keyed by raw tid.
+    threads: BTreeMap<i32, ChromeThread>,
+    /// Whether the trace has already been emitted (guards against a second
+    /// flush from a racing exit path).
+    flushed: bool,
+}
+
+impl ChromeInner {
+    fn record_syscall(&mut self, tid: i32, pid: i32, at_us: u64, sysno: i32, pretty: String) {
+        let thread = self.threads.entry(tid).or_insert_with(|| ChromeThread {
+            pid,
+            start_us: at_us,
+            end_us: at_us,
+            events: Vec::new(),
+            pending: None,
+        });
+        thread.pid = pid;
+        thread.end_us = at_us;
+        // The previous syscall on this thread ends where this one begins.
+        thread.settle_pending(at_us);
+        thread.pending = Some((at_us, sysno, pretty));
+    }
+
+    /// Finalizes every thread's pending syscall and emits the Chrome trace JSON
+    /// (a single array of trace events) through the diagnostic emitter. Emitting
+    /// via DynamoRIO's own I/O keeps the trace off the guest's stdout and avoids
+    /// re-entering the syscall hook. Idempotent.
+    fn flush(&mut self) {
+        if self.flushed {
+            return;
+        }
+        self.flushed = true;
+        let mut events: Vec<serde_json::Value> = Vec::new();
+        for (tid, thread) in self.threads.iter_mut() {
+            thread.settle_pending(thread.end_us);
+            events.push(serde_json::json!({
+                "name": format!("TID {tid}"),
+                "cat": "process",
+                "ph": "B",
+                "ts": thread.start_us,
+                "pid": thread.pid,
+                "tid": tid,
+            }));
+            for event in &thread.events {
+                events.push(serde_json::json!({
+                    "name": Sysno::from(event.sysno).name(),
+                    "cat": "syscall",
+                    "ph": "X",
+                    "ts": event.start_us,
+                    "dur": event.dur_us,
+                    "pid": thread.pid,
+                    "tid": tid,
+                    "args": { "pretty": event.pretty, "sysno": event.sysno },
+                }));
+            }
+            events.push(serde_json::json!({
+                "name": format!("TID {tid}"),
+                "cat": "process",
+                "ph": "E",
+                "ts": thread.end_us,
+                "pid": thread.pid,
+                "tid": tid,
+            }));
+        }
+        let count = events.len();
+        let threads = self.threads.len();
+        let json = serde_json::to_string(&serde_json::Value::Array(events))
+            .unwrap_or_else(|_| "[]".to_string());
+        emit_line(&format!(
+            "reverie-dbi: chrome_trace {count} trace events across {threads} thread(s)"
+        ));
+        // The full array on one line, prefixed so a consumer can extract it
+        // (e.g. `sed 's/^reverie-dbi: chrome_trace_json=//'` into a .json file
+        // loadable by chrome://tracing / perfetto).
+        emit_line(&format!("reverie-dbi: chrome_trace_json={json}"));
+    }
+}
+
+/// The `chrome_trace` example's [`GlobalTool`], adapted to DBI. Accumulates a
+/// per-thread syscall timeline and emits it as Chrome trace JSON at exit. Served
+/// in-process through [`CHROME_TRACE_GLOBAL`] (like [`COUNTER1_GLOBAL`]).
+#[derive(Debug, Default)]
+pub struct ChromeTraceGlobal(Mutex<ChromeInner>);
+
+#[reverie::global_tool]
+impl GlobalTool for ChromeTraceGlobal {
+    type Request = ChromeMsg;
+    type Response = ();
+    type Config = ();
+
+    async fn receive_rpc(&self, _from: Tid, message: ChromeMsg) {
+        let mut inner = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match message {
+            ChromeMsg::Syscall {
+                tid,
+                pid,
+                at_us,
+                sysno,
+                pretty,
+            } => inner.record_syscall(tid, pid, at_us, sysno, pretty),
+            ChromeMsg::Flush => inner.flush(),
+        }
+    }
+}
+
+/// The `chrome_trace` example [`Tool`], adapted to DBI: record every syscall's
+/// entry (timestamp + decoded inputs) into the per-thread timeline and, at
+/// `exit`/`exit_group`, emit the whole trace as Chrome trace JSON. Unlike the
+/// upstream tool it does not `inject` each syscall to measure the true return —
+/// see [`ChromeSyscall`] for the resulting L0 fidelity limits.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ChromeTraceTool;
+
+#[reverie::tool]
+impl Tool for ChromeTraceTool {
+    type GlobalState = ChromeTraceGlobal;
+    type ThreadState = ();
+
+    // TODO-HUMAN-REVIEW(PR-166): Review lifecycle-safe chrome_trace recording + JSON emit.
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        let number = syscall.number();
+        // Materialize the decoded syscall into an owned String *before* the
+        // await: the `Display` borrows `guest.memory()`, which is not `Send`, so
+        // it must not live across the `send_rpc` suspension point.
+        let pretty = syscall.display(&guest.memory()).to_string();
+        let tid = guest.tid().as_raw();
+        let pid = guest.pid().as_raw();
+        let at_us = chrome_now_us();
+        let _ = guest
+            .send_rpc(ChromeMsg::Syscall {
+                tid,
+                pid,
+                at_us,
+                sysno: number.id(),
+                pretty,
+            })
+            .await;
+        if matches!(number, Sysno::exit | Sysno::exit_group) {
+            // Flush before injecting the terminating call, which never returns
+            // to this handler.
+            let _ = guest.send_rpc(ChromeMsg::Flush).await;
+        }
+        guest.tail_inject(syscall).await
+    }
+}
+
 /// The observation tool selected by the environment, if any.
 enum ActiveTool {
     Strace,
@@ -684,6 +926,7 @@ enum ActiveTool {
     Counter1,
     Counter2,
     ChunkyPrint,
+    ChromeTrace,
 }
 
 fn active_tool() -> Option<ActiveTool> {
@@ -706,6 +949,8 @@ fn active_tool() -> Option<ActiveTool> {
         Some(ActiveTool::Counter1)
     } else if *CHUNKY_PRINT_ENABLED {
         Some(ActiveTool::ChunkyPrint)
+    } else if *CHROME_TRACE_ENABLED {
+        Some(ActiveTool::ChromeTrace)
     } else if *NOOP_ENABLED {
         Some(ActiveTool::Noop)
     } else {
@@ -1081,6 +1326,15 @@ pub(crate) fn run_active_tool(
             invoke_syscall,
             read_registers,
         ),
+        ActiveTool::ChromeTrace => dispatch_chrome_trace(
+            context,
+            tid,
+            pid,
+            branches,
+            syscall,
+            invoke_syscall,
+            read_registers,
+        ),
     };
     Some(match result {
         Ok(outcome) => outcome,
@@ -1223,6 +1477,41 @@ fn dispatch_chunky_print(
     )
 }
 
+/// The process-global `chrome_trace` state, persisting the per-thread syscall
+/// timelines across syscalls (each `run_active_tool` call builds a fresh
+/// `DbiGuest`). Like [`COUNTER1_GLOBAL`], `send_rpc` on the DBI guest dispatches
+/// to this instance's `receive_rpc` in-process.
+static CHROME_TRACE_GLOBAL: LazyLock<ChromeTraceGlobal> = LazyLock::new(ChromeTraceGlobal::default);
+
+/// Runs one syscall through [`ChromeTraceTool`], whose [`ChromeTraceGlobal`] is
+/// the shared [`CHROME_TRACE_GLOBAL`] so the per-thread timeline accumulates
+/// across the run and is emitted as Chrome trace JSON at `exit`/`exit_group`.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_chrome_trace(
+    context: usize,
+    tid: i32,
+    pid: i32,
+    branches: u64,
+    syscall: Syscall,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
+) -> Result<DbiSyscallOutcome, Error> {
+    let mut thread_state = ();
+    crate::run_tool_syscall(
+        &ChromeTraceTool,
+        context,
+        Pid::from_raw(tid),
+        Pid::from_raw(pid),
+        branches,
+        &mut thread_state,
+        &*CHROME_TRACE_GLOBAL,
+        &(),
+        syscall,
+        invoke_syscall,
+        read_registers,
+    )
+}
+
 static COUNTER2_HOST: LazyLock<Counter2Host> = LazyLock::new(Counter2Host::default);
 
 #[allow(clippy::too_many_arguments)]
@@ -1354,5 +1643,50 @@ mod tests {
         );
         assert!(exited);
         assert_eq!(host.global_state.snapshot(), (5, 1, 2));
+    }
+
+    #[test]
+    fn chrome_trace_settles_pending_and_computes_durations() {
+        let mut inner = ChromeInner::default();
+        // Three syscalls on one thread. Each entry closes out the prior one, so
+        // getpid's duration is 150-100 and write's is 220-150.
+        inner.record_syscall(3, 3, 100, Sysno::getpid.id(), "getpid()".to_string());
+        inner.record_syscall(3, 3, 150, Sysno::write.id(), "write(1, ...)".to_string());
+        inner.record_syscall(3, 3, 220, Sysno::exit_group.id(), "exit_group(0)".to_string());
+
+        let thread = &inner.threads[&3];
+        assert_eq!(thread.start_us, 100);
+        assert_eq!(thread.end_us, 220);
+        assert_eq!(thread.events.len(), 2, "two settled, exit_group still pending");
+        assert_eq!(thread.events[0].dur_us, 50);
+        assert_eq!(thread.events[1].dur_us, 70);
+
+        inner.flush();
+        assert!(inner.flushed);
+        let thread = &inner.threads[&3];
+        assert_eq!(thread.events.len(), 3, "flush settles the pending exit_group");
+        assert_eq!(thread.events[2].sysno, Sysno::exit_group.id());
+        assert_eq!(thread.events[2].dur_us, 0, "last event ends at thread end");
+
+        // A second flush is a no-op (guards a racing exit path).
+        inner.flush();
+        assert_eq!(inner.threads[&3].events.len(), 3);
+    }
+
+    #[test]
+    fn chrome_trace_tracks_multiple_threads_independently() {
+        let mut inner = ChromeInner::default();
+        inner.record_syscall(3, 3, 10, Sysno::getpid.id(), "getpid()".to_string());
+        inner.record_syscall(4, 3, 20, Sysno::gettid.id(), "gettid()".to_string());
+        inner.record_syscall(3, 3, 40, Sysno::write.id(), "write(1, ...)".to_string());
+        inner.flush();
+
+        // Both tids are tracked; the parent's getpid spans 10->40, the worker's
+        // single gettid settles to a zero-length event at flush.
+        assert_eq!(inner.threads.len(), 2);
+        assert_eq!(inner.threads[&3].events.len(), 2);
+        assert_eq!(inner.threads[&3].events[0].dur_us, 30);
+        assert_eq!(inner.threads[&4].events.len(), 1);
+        assert_eq!(inner.threads[&4].pid, 3);
     }
 }
