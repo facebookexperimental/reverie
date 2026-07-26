@@ -39,6 +39,8 @@ use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
 
+// TODO-HUMAN-REVIEW(PR-134): Review the native bootstrap failure ABI export.
+pub use launcher::CLIENT_THREAD_START_FAILURE_EXIT_CODE;
 pub use launcher::DbiRunner;
 use reverie::Error;
 use reverie::ExitStatus;

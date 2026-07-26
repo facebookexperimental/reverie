@@ -39,6 +39,10 @@ const BINPRM_BUF_SIZE: usize = 256;
 // Keep client diagnostics on launcher stderr across guest fd 2 redirects and execs.
 const DIAGNOSTIC_FD: libc::c_int = 198;
 
+// TODO-HUMAN-REVIEW(PR-134): Review the native bootstrap failure ABI.
+/// Exit code used when DynamoRIO cannot start the sideline runtime thread before guest code runs.
+pub const CLIENT_THREAD_START_FAILURE_EXIT_CODE: i32 = 125;
+
 /// Launches Linux programs under the Reverie DynamoRIO client.
 ///
 /// The native client is built separately by
