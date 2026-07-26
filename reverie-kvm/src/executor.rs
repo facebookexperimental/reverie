@@ -216,6 +216,12 @@ fn execute_basic_syscall_with_output(
         fstatfs(memory, state, args)
     } else if number == libc::SYS_access as u64 {
         access(memory, state, args)
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    } else if number == libc::SYS_faccessat as u64 {
+        faccessat(memory, state, args)
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    } else if number == libc::SYS_faccessat2 as u64 {
+        faccessat2(memory, state, args)
     } else if number == libc::SYS_mkdir as u64 {
         mkdir_at(memory, state, libc::AT_FDCWD, args[0], args[1])
     } else if number == libc::SYS_mkdirat as u64 {
@@ -2056,11 +2062,71 @@ fn fstatfs_host(memory: &mut GuestMemory, host_fd: RawFd, output: u64) -> i64 {
 }
 
 fn access(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
-    let mode = args[1] as libc::c_int;
+    // access(2) is faccessat2(AT_FDCWD, path, mode, 0): a real-UID check that
+    // follows symlinks and rejects an empty path with ENOENT.
+    faccessat_impl(
+        memory,
+        state,
+        libc::AT_FDCWD,
+        args[0],
+        args[1] as libc::c_int,
+        0,
+    )
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(reverie#124): faccessat access check so bash
+// `test -r/-w/-x` and program startup probes resolve correctly under the KVM
+// backend instead of falling through to ENOSYS.
+fn faccessat(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    // faccessat(2) has no flags argument, so it behaves like access(2) relative
+    // to the supplied directory descriptor: real-UID check, follow symlinks.
+    faccessat_impl(
+        memory,
+        state,
+        args[0] as libc::c_int,
+        args[1],
+        args[2] as libc::c_int,
+        0,
+    )
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(reverie#124): faccessat2 access check. glibc routes the
+// C `access`/`euidaccess` helpers and the shell `test -r/-w/-x` operators
+// through faccessat2; without this arm every access probe returned ENOSYS.
+fn faccessat2(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    faccessat_impl(
+        memory,
+        state,
+        args[0] as libc::c_int,
+        args[1],
+        args[2] as libc::c_int,
+        args[3] as libc::c_int,
+    )
+}
+
+// Shared access-check implementation for access(2)/faccessat(2)/faccessat2(2).
+// The guest dirfd, cwd, and AT_SYMLINK_NOFOLLOW are resolved locally into an
+// O_PATH descriptor; the permission decision itself is delegated to the host
+// kernel via AT_EMPTY_PATH so the answer matches what the ptrace backend sees.
+fn faccessat_impl(
+    memory: &GuestMemory,
+    state: &LoadedStaticElf,
+    guest_dirfd: libc::c_int,
+    path_address: u64,
+    mode: libc::c_int,
+    flags: libc::c_int,
+) -> i64 {
+    // mode is F_OK or a bitmask of R_OK/W_OK/X_OK; anything else is invalid.
     if mode & !(libc::R_OK | libc::W_OK | libc::X_OK) != 0 {
         return negative_errno(libc::EINVAL);
     }
-    let path = match read_c_string(memory, args[0], 4096) {
+    let allowed_flags = libc::AT_EACCESS | libc::AT_SYMLINK_NOFOLLOW;
+    if flags & !allowed_flags != 0 {
+        return negative_errno(libc::EINVAL);
+    }
+    let path = match read_c_string(memory, path_address, 4096) {
         Ok(path) => path,
         Err(error) => return read_c_string_errno(error),
     };
@@ -2075,11 +2141,19 @@ fn access(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64
         }
         return 0;
     }
-    let file = match open_metadata_path(state, libc::AT_FDCWD, &path, false) {
+    let file = match open_metadata_path(
+        state,
+        guest_dirfd,
+        &path,
+        flags & libc::AT_SYMLINK_NOFOLLOW != 0,
+    ) {
         Ok(file) => file,
         Err(error) => return error,
     };
     let empty_path = b"\0";
+    // Forward AT_EACCESS so an effective-ID probe keeps its meaning; the O_PATH
+    // fd is addressed with AT_EMPTY_PATH.
+    let host_flags = libc::AT_EMPTY_PATH | (flags & libc::AT_EACCESS);
     // SAFETY: empty_path is NUL-terminated and file owns a live O_PATH fd.
     let result = unsafe {
         libc::syscall(
@@ -2087,7 +2161,7 @@ fn access(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64
             file.as_raw_fd(),
             empty_path.as_ptr(),
             mode,
-            libc::AT_EMPTY_PATH,
+            host_flags,
         )
     };
     if result == 0 {
@@ -4077,18 +4151,22 @@ fn sigaltstack(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u6
 }
 
 fn wait4(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
-    let requested = args[0] as i64;
+    // pid_t is a 32-bit signed value; the guest passes wait4(-1) as 0xFFFFFFFF
+    // in a 64-bit register. Truncate to i32 before sign-extending so the common
+    // wait-for-any-child form (-1), process-group forms (0, <-1), and a specific
+    // pid are all interpreted correctly instead of collapsing to ECHILD.
+    let requested = args[0] as i32 as i64;
     if args[2] & !(libc::WNOHANG as u64) != 0 {
         return negative_errno(libc::EINVAL);
     }
-    let child_pid = if requested == -1 {
-        state.children.keys().next().copied()
-    } else if requested > 0 {
+    let child_pid = if requested > 0 {
         i32::try_from(requested)
             .ok()
             .filter(|pid| state.children.contains_key(pid))
     } else {
-        None
+        // -1 (any child), 0 and <-1 (any child in a process group): this guest
+        // models a single process group, so reap any recorded child.
+        state.children.keys().next().copied()
     };
     let Some(child_pid) = child_pid else {
         return negative_errno(libc::ECHILD);
@@ -8742,5 +8820,135 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn faccessat_variants_check_permissions() {
+        let dir = TestDir::new();
+        std::fs::write(dir.0.join("readable"), b"hi").unwrap();
+        std::fs::set_permissions(
+            dir.0.join("readable"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let mut state = test_state(&dir.0);
+        let mut memory = GuestMemory::new(0, 0x2000).unwrap();
+
+        // access(2): an existing readable file resolves to success.
+        write_c_string(&mut memory, 0x100, "readable");
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_access,
+                [0x100, libc::R_OK as u64, 0, 0, 0, 0],
+            ),
+            0
+        );
+        // faccessat2(AT_FDCWD, path, R_OK, AT_EACCESS) is what the shell
+        // `test -r` operator issues; it must succeed rather than ENOSYS.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_faccessat2,
+                [
+                    libc::AT_FDCWD as u64,
+                    0x100,
+                    libc::R_OK as u64,
+                    libc::AT_EACCESS as u64,
+                    0,
+                    0,
+                ],
+            ),
+            0
+        );
+        // faccessat(2) without a flags argument behaves like access(2).
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_faccessat,
+                [libc::AT_FDCWD as u64, 0x100, libc::R_OK as u64, 0, 0, 0],
+            ),
+            0
+        );
+        // A 0o644 file is not executable for any user, including root.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_faccessat2,
+                [libc::AT_FDCWD as u64, 0x100, libc::X_OK as u64, 0, 0, 0],
+            ),
+            negative_errno(libc::EACCES)
+        );
+        // A missing path reports ENOENT.
+        write_c_string(&mut memory, 0x200, "missing");
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_faccessat2,
+                [libc::AT_FDCWD as u64, 0x200, libc::R_OK as u64, 0, 0, 0],
+            ),
+            negative_errno(libc::ENOENT)
+        );
+        // An unsupported flag is rejected with EINVAL.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_faccessat2,
+                [
+                    libc::AT_FDCWD as u64,
+                    0x100,
+                    libc::R_OK as u64,
+                    0x8000,
+                    0,
+                    0
+                ],
+            ),
+            negative_errno(libc::EINVAL)
+        );
+    }
+
+    #[test]
+    fn wait4_sign_extends_negative_pid_and_reaps_child() {
+        let dir = TestDir::new();
+        let mut state = test_state(&dir.0);
+        let mut memory = GuestMemory::new(0, 0x2000).unwrap();
+        // A child (pid 9) has already exited with code 7.
+        state.children.insert(9, 7);
+
+        // wait4(-1) arrives as 0xFFFF_FFFF in a 64-bit register; the handler
+        // must sign-extend it to -1 and reap the recorded child rather than
+        // treating the value as an out-of-range positive pid and returning
+        // ECHILD.
+        let status_addr = 0x100u64;
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_wait4,
+                [0xFFFF_FFFF, status_addr, 0, 0, 0, 0],
+            ),
+            9
+        );
+        // The wait status encodes a normal exit with code 7 (WIFEXITED,
+        // WEXITSTATUS == 7).
+        let raw: i32 = read_struct(&memory, status_addr);
+        assert_eq!(raw & 0x7f, 0);
+        assert_eq!((raw >> 8) & 0xff, 7);
+        // The child is consumed; a subsequent reap reports ECHILD.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_wait4,
+                [0xFFFF_FFFF, 0, 0, 0, 0, 0],
+            ),
+            negative_errno(libc::ECHILD)
+        );
     }
 }
