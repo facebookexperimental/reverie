@@ -44,12 +44,16 @@ const TAIL_EXIT: u8 = 2;
 
 static COMMITTED_STACKS: SpinMutex<Vec<Box<[u8]>>> = SpinMutex::new(Vec::new());
 
-struct DispatchScratchScope;
+struct DispatchScratchScope {
+    _allocation_scope: crate::patch_alloc::DispatchAllocationScope,
+}
 
 impl DispatchScratchScope {
     fn enter() -> Self {
         COMMITTED_STACKS.lock().clear();
-        Self
+        Self {
+            _allocation_scope: crate::patch_alloc::enter_dispatch(),
+        }
     }
 }
 
