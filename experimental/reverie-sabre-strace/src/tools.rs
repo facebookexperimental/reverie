@@ -8,6 +8,8 @@
 
 //! Shared Reverie example tools hosted by the SaBRe plugin.
 
+use std::collections::BTreeSet;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
@@ -37,6 +39,10 @@ pub(super) enum ToolKind {
     Strace,
     /// Count intercepted syscalls in the current plugin process.
     Counter1,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-142): Review the process-local counter2 adaptation.
+    /// Count syscalls and unique process/thread identities in this plugin process.
+    Counter2,
     /// Forward syscalls without tool-specific work.
     Noop,
 }
@@ -48,6 +54,7 @@ impl ToolKind {
 
         match selected.as_deref() {
             Some(value) if value == "counter1" => Self::Counter1,
+            Some(value) if value == "counter2" => Self::Counter2,
             Some(value) if value == "noop" => Self::Noop,
             Some(value) if value == "strace" => Self::Strace,
             None => Self::Strace,
@@ -97,7 +104,89 @@ impl ReverieTool for Counter1Tool {
     ) -> Result<i64, Error> {
         let count = guest.send_rpc(Counter1Request(syscall.number())).await;
         if is_terminal(syscall) {
-            nostd_print::eprintln!(" [counter tool] Total system calls in process tree: {count}");
+            nostd_print::eprintln!(" [counter tool] Total system calls in plugin process: {count}");
+        }
+        guest.tail_inject(syscall).await
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-142): Review counter2 state, RPC, and scope semantics.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub(super) struct Counter2Summary {
+    total_syscalls: u64,
+    processes: u64,
+    threads: u64,
+}
+
+#[derive(Debug, Default)]
+struct Counter2State {
+    total_syscalls: u64,
+    processes: BTreeSet<i32>,
+    threads: BTreeSet<i32>,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct Counter2Global {
+    inner: Mutex<Counter2State>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(super) struct Counter2Request {
+    pid: i32,
+    tid: i32,
+}
+
+#[reverie::global_tool]
+impl GlobalTool for Counter2Global {
+    type Request = Counter2Request;
+    type Response = Counter2Summary;
+    type Config = ();
+
+    async fn init_global_state(_config: &Self::Config) -> Self {
+        Self::default()
+    }
+
+    async fn receive_rpc(&self, _from: Pid, request: Counter2Request) -> Counter2Summary {
+        let mut state = self.inner.lock().unwrap();
+        state.total_syscalls += 1;
+        state.processes.insert(request.pid);
+        state.threads.insert(request.tid);
+        Counter2Summary {
+            total_syscalls: state.total_syscalls,
+            processes: state.processes.len() as u64,
+            threads: state.threads.len() as u64,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub(super) struct Counter2Tool;
+
+#[reverie::tool]
+impl ReverieTool for Counter2Tool {
+    type GlobalState = Counter2Global;
+    type ThreadState = u64;
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        *guest.thread_state_mut() += 1;
+        let summary = guest
+            .send_rpc(Counter2Request {
+                pid: guest.pid().as_raw(),
+                tid: guest.tid().as_raw(),
+            })
+            .await;
+        if is_terminal(syscall) {
+            nostd_print::eprintln!(
+                " [counter2 tool] Total system calls in plugin process: {}, from {} process identity, {} thread(s).",
+                summary.total_syscalls,
+                summary.processes,
+                summary.threads
+            );
         }
         guest.tail_inject(syscall).await
     }
@@ -123,6 +212,7 @@ fn is_terminal(syscall: Syscall) -> bool {
 pub(crate) enum SharedAdapter {
     Strace(ReverieAdapter<StraceTool>),
     Counter1(ReverieAdapter<Counter1Tool>),
+    Counter2(ReverieAdapter<Counter2Tool>),
     Noop(ReverieAdapter<NoopTool>),
 }
 
@@ -135,6 +225,11 @@ impl SharedAdapter {
                 Counter1Global::default(),
                 (),
             )),
+            ToolKind::Counter2 => Self::Counter2(ReverieAdapter::new(
+                Counter2Tool,
+                Counter2Global::default(),
+                (),
+            )),
             ToolKind::Noop => Self::Noop(ReverieAdapter::new(NoopTool, (), ())),
         }
     }
@@ -143,6 +238,7 @@ impl SharedAdapter {
         match self {
             Self::Strace(adapter) => adapter.handle_syscall(syscall),
             Self::Counter1(adapter) => adapter.handle_syscall(syscall),
+            Self::Counter2(adapter) => adapter.handle_syscall(syscall),
             Self::Noop(adapter) => adapter.handle_syscall(syscall),
         }
     }
@@ -158,6 +254,7 @@ impl SharedAdapter {
         match self {
             Self::Strace(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
             Self::Counter1(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
+            Self::Counter2(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
             Self::Noop(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
         }
     }
@@ -166,6 +263,7 @@ impl SharedAdapter {
         match self {
             Self::Strace(adapter) => adapter.handle_thread_start(thread_id),
             Self::Counter1(adapter) => adapter.handle_thread_start(thread_id),
+            Self::Counter2(adapter) => adapter.handle_thread_start(thread_id),
             Self::Noop(adapter) => adapter.handle_thread_start(thread_id),
         }
     }
@@ -174,6 +272,7 @@ impl SharedAdapter {
         match self {
             Self::Strace(adapter) => adapter.handle_thread_exit(thread_id),
             Self::Counter1(adapter) => adapter.handle_thread_exit(thread_id),
+            Self::Counter2(adapter) => adapter.handle_thread_exit(thread_id),
             Self::Noop(adapter) => adapter.handle_thread_exit(thread_id),
         }
     }
@@ -198,6 +297,41 @@ mod tests {
                 .receive_rpc(pid, Counter1Request(Sysno::gettid))
                 .await,
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn counter2_tracks_unique_processes_and_threads() {
+        let global = Counter2Global::default();
+        let from = Pid::from_raw(1);
+        let first = global
+            .receive_rpc(from, Counter2Request { pid: 10, tid: 10 })
+            .await;
+        let second = global
+            .receive_rpc(from, Counter2Request { pid: 10, tid: 11 })
+            .await;
+        let third = global
+            .receive_rpc(from, Counter2Request { pid: 12, tid: 12 })
+            .await;
+
+        assert_eq!(
+            first,
+            Counter2Summary {
+                total_syscalls: 1,
+                processes: 1,
+                threads: 1,
+            }
+        );
+        assert_eq!(second.total_syscalls, 2);
+        assert_eq!(second.processes, 1);
+        assert_eq!(second.threads, 2);
+        assert_eq!(
+            third,
+            Counter2Summary {
+                total_syscalls: 3,
+                processes: 2,
+                threads: 3,
+            }
         );
     }
 }

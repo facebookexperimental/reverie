@@ -8,6 +8,7 @@
 
 //! Adapter from SaBRe callbacks to Reverie's shared tool interface.
 
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
@@ -67,6 +68,9 @@ where
     global_state: T::GlobalState,
     config: <T::GlobalState as GlobalTool>::Config,
     thread_states: Mutex<HashMap<i32, ThreadStateCell<T>>>,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-142): Review local syscall-subscription caching and bypass.
+    syscall_subscriptions: BTreeSet<Sysno>,
 }
 
 impl<T> ReverieAdapter<T>
@@ -80,11 +84,13 @@ where
         config: <T::GlobalState as GlobalTool>::Config,
     ) -> Self {
         let _ = root_process_pid();
+        let syscall_subscriptions = T::subscriptions(&config).iter_syscalls().collect();
         Self {
             tool,
             global_state,
             config,
             thread_states: Mutex::new(HashMap::new()),
+            syscall_subscriptions,
         }
     }
 
@@ -110,6 +116,9 @@ where
         syscall: Syscall,
         special_inject: Option<&mut (dyn FnMut() -> usize + Send + Sync)>,
     ) -> Result<usize, Errno> {
+        if !self.syscall_subscriptions.contains(&syscall.number()) {
+            return bypass_tool(syscall, special_inject);
+        }
         let original = Some(syscall.into_parts());
         let tid = current_tid();
         let pid = current_pid();
@@ -227,6 +236,9 @@ where
     config: <T::GlobalState as GlobalTool>::Config,
     socket_path: std::path::PathBuf,
     thread_states: Mutex<HashMap<i32, Arc<Mutex<RemoteThreadState<T>>>>>,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-142): Review remote syscall-subscription caching and bypass.
+    syscall_subscriptions: BTreeSet<Sysno>,
 }
 
 struct RemoteThreadState<T>
@@ -252,6 +264,7 @@ where
         let config = rpc.config().clone();
         let tool = T::new(current_pid(), &config);
         let thread_state = tool.init_thread_state(tid, None);
+        let syscall_subscriptions = T::subscriptions(&config).iter_syscalls().collect();
         let mut thread_states = HashMap::new();
         thread_states.insert(
             tid.as_raw(),
@@ -266,6 +279,7 @@ where
             config,
             socket_path,
             thread_states: Mutex::new(thread_states),
+            syscall_subscriptions,
         })
     }
 
@@ -298,6 +312,9 @@ where
         syscall: Syscall,
         special_inject: Option<&mut (dyn FnMut() -> usize + Send + Sync)>,
     ) -> Result<usize, Errno> {
+        if !self.syscall_subscriptions.contains(&syscall.number()) {
+            return bypass_tool(syscall, special_inject);
+        }
         let original = Some(syscall.into_parts());
         let tid = current_tid();
         let pid = current_pid();
@@ -439,6 +456,21 @@ fn shared_result(result: Result<i64, Error>) -> Result<usize, Errno> {
             Errno::EIO
         })
     })
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-142): Review direct and process-control bypass semantics.
+fn bypass_tool(
+    syscall: Syscall,
+    special_inject: Option<&mut (dyn FnMut() -> usize + Send + Sync)>,
+) -> Result<usize, Errno> {
+    if let Some(inject) = special_inject {
+        // A process-control injector can resume in a child without unwinding.
+        // Clear the parent callback frame across that potentially diverging call.
+        let _frame_suspended = crate::callbacks::SyscallFrameGuard::suspend();
+        return Errno::from_ret(inject());
+    }
+    unsafe { syscall.call() }
 }
 
 fn current_pid() -> Pid {
@@ -909,6 +941,73 @@ mod tests {
         let syscall = Syscall::from_raw(Sysno::getpid, SyscallArgs::new(0, 0, 0, 0, 0, 0));
         assert_eq!(adapter.handle_syscall(syscall), Ok(123));
         assert_eq!(HANDLED.load(Ordering::Relaxed), 1);
+    }
+
+    #[derive(Default)]
+    struct UnsubscribedTool;
+
+    #[reverie::tool]
+    impl ReverieTool for UnsubscribedTool {
+        type GlobalState = ();
+        type ThreadState = ();
+
+        fn subscriptions(_config: &()) -> reverie::Subscription {
+            reverie::Subscription::none()
+        }
+
+        async fn handle_syscall_event<G: Guest<Self>>(
+            &self,
+            _guest: &mut G,
+            _syscall: Syscall,
+        ) -> Result<i64, Error> {
+            panic!("unsubscribed syscall reached the tool")
+        }
+    }
+
+    #[test]
+    fn local_adapter_bypasses_unsubscribed_syscalls() {
+        let adapter = ReverieAdapter::new(UnsubscribedTool, (), ());
+        let syscall = Syscall::from_raw(Sysno::getpid, SyscallArgs::new(0, 0, 0, 0, 0, 0));
+        assert_eq!(
+            adapter.handle_syscall(syscall),
+            Ok(std::process::id() as usize)
+        );
+    }
+
+    #[test]
+    fn remote_adapter_bypasses_unsubscribed_syscalls() {
+        let path = std::env::temp_dir().join(format!(
+            "reverie-sabre-rpc-{}-{}.sock",
+            std::process::id(),
+            RPC_SOCKET_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let server_path = path.clone();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+
+        let server_thread = thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let server =
+                        reverie_rpc_transport::RpcServer::bind(&server_path, Arc::new(()), ())
+                            .unwrap();
+                    ready_tx.send(()).unwrap();
+                    server.serve_one().await
+                })
+        });
+        ready_rx.recv().unwrap();
+
+        let adapter = RemoteReverieAdapter::<UnsubscribedTool>::connect(&path).unwrap();
+        let syscall = Syscall::from_raw(Sysno::getpid, SyscallArgs::new(0, 0, 0, 0, 0, 0));
+        assert_eq!(
+            adapter.handle_syscall(syscall),
+            Ok(std::process::id() as usize)
+        );
+        drop(adapter);
+
+        assert!(server_thread.join().unwrap().is_ok());
     }
 
     #[derive(Default)]

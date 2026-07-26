@@ -12,6 +12,7 @@ shared example tools, but it is not a drop-in replacement for
 | Syscalls | Intercepts rewritten syscall instructions and invokes the synchronous in-process `Tool::syscall` callback. The default implementation performs the real syscall. |
 | Guest memory | Exposes direct local-process memory through `LocalMemory`; there are no remote-memory operations. |
 | Shared-tool guest context | The `ReverieAdapter` exposes the live SaBRe syscall frame through `Guest::regs`, supports writes to saved GPRs and the return IP through `Guest::set_regs`, and returns the current guest IP from `Guest::backtrace`. The fixed trampoline stack pointer, syscall number/result registers, flags, and segment state are read-only. |
+| Shared-tool event selection | Both local and remote `ReverieAdapter` paths bypass `Tool::handle_syscall_event` for syscalls excluded by `Tool::subscriptions`. The SaBRe loader still rewrites and enters the plugin for those syscalls. |
 | Threads | Creates backend records lazily when an intercepted thread is first observed. Start and exit callbacks are emitted at most once for a tracked thread. Repeated pthread create/return/join waves are covered by the conformance gate. |
 | Process exit | `exit_group` requests orderly exit from tracked threads, then issues a real kernel `exit_group` so threads that never reached an interception boundary cannot survive. Configurable timeout handling is supported. |
 | Signals | Central handlers mediate standard catchable signals. Guest `rt_sigaction` registration and query are virtualized, including `SA_RESTART`. Linux default ignore, continue, stop, and terminate dispositions are preserved. |
@@ -73,7 +74,12 @@ flags.
 | Shared tool | `/bin/true` | `/bin/echo sabre-TOOL` | `/bin/cat /dev/null` | `/bin/sh -c 'exit 7'` |
 | --- | --- | --- | --- | --- |
 | `counter1` | PASS, exit 0 (6 syscalls observed) | PASS, exact guest output and exit 0 (87 syscalls observed) | PASS, exit 0 (93 syscalls observed) | PASS, guest exit 7 propagated (138 syscalls observed) |
+| `counter2` | PASS, exit 0 (21 syscalls observed) | PASS, exact guest output and exit 0 (102 syscalls observed) | PASS, exit 0 (108 syscalls observed) | PASS, guest exit 7 propagated (153 syscalls observed) |
 | `noop` | PASS, exit 0 | PASS, exact guest output and exit 0 | PASS, exit 0 | PASS, guest exit 7 propagated |
+
+The process-local `counter2` mode also observed 1,392 syscalls from 129 unique
+threads while the 128-worker `thread_lifecycle` workload completed. Counter
+state is not aggregated across forked plugin processes.
 
 These are L0 compatibility observations for the synchronous SaBRe adapter.
 The example runner does not implement Reverie's generic `Backend` contract and
@@ -98,8 +104,11 @@ does not load Detcore, so the matrix makes no Hermit L1/L2 determinism claim.
 - Tool callbacks can observe signals but cannot replace, suppress, or redirect
   delivery through a shared backend-neutral contract.
 - Register access is limited to the live syscall callback frame, backtraces
-  contain only the current guest IP, and there is no remote injection,
-  subscription, CPUID, timer, or PMU interface comparable to `reverie-ptrace`.
+  contain only the current guest IP, and there is no remote injection, CPUID,
+  timer, or PMU interface comparable to `reverie-ptrace`.
+- Syscall subscriptions bypass the shared handler after the loader enters the
+  plugin; they do not prevent rewriting or plugin-entry overhead. Instruction
+  subscriptions remain unsupported.
 - `execveat`, static binaries, non-x86-64 guests, loader distribution, and broad
   clone/vfork/exec stress coverage remain unsupported or unverified.
 - `execve` validates the pathname and argv pointer list before replacing the
