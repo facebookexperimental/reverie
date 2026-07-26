@@ -342,13 +342,7 @@ fn execute_basic_syscall_with_output(
         || number == libc::SYS_fgetxattr as u64
     {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // The deterministic container models no extended attributes, so report
-        // every attribute as absent (ENODATA) rather than letting the call fall
-        // through to ENOSYS. This matches what the ptrace backend observes from
-        // the host for files without xattrs and keeps `ls -l` (which probes
-        // security.selinux and system.posix_acl_access) from printing a spurious
-        // "Function not implemented".
-        negative_errno(libc::ENODATA)
+        getxattr(memory, state, number, args)
     } else if number == libc::SYS_brk as u64 {
         brk(memory, state, args[0])
     } else if number == libc::SYS_mmap as u64 {
@@ -2938,7 +2932,7 @@ fn arch_prctl(
     }
 }
 
-// TODO-HUMAN-REVIEW(reverie-kvm): prctl(2) subset for the KVM guest.
+// TODO-HUMAN-REVIEW(PR-108): Review the prctl(2) subset for the KVM guest.
 //
 // Only PR_CAPBSET_READ is modeled. The deterministic container runs the guest as
 // root with the full capability bounding set, so libcap's cap_get_bound() must
@@ -2959,6 +2953,61 @@ fn prctl(args: &[u64; 6]) -> i64 {
         }
         // Other prctl operations are not modeled yet.
         _ => negative_errno(libc::ENOSYS),
+    }
+}
+
+// TODO-HUMAN-REVIEW(PR-116): Review the no-xattr KVM guest model and errors.
+//
+// The deterministic container models no extended attributes, but Linux still
+// validates the target and attribute name before reporting ENODATA. Preserve
+// those observable path/fd/memory errors without exposing host xattr contents.
+fn getxattr(memory: &GuestMemory, state: &LoadedStaticElf, number: u64, args: &[u64; 6]) -> i64 {
+    if number == libc::SYS_fgetxattr as u64 {
+        let Ok(guest_fd) = libc::c_int::try_from(args[0]) else {
+            return negative_errno(libc::EBADF);
+        };
+        if host_fd(state, guest_fd).is_none() {
+            return negative_errno(libc::EBADF);
+        }
+    } else {
+        let path = match read_c_string(memory, args[0], 4096) {
+            Ok(path) => path,
+            Err(error) => return read_c_string_errno(error),
+        };
+        if path.is_empty() {
+            return negative_errno(libc::ENOENT);
+        }
+        if synthetic_proc_content(state, &path).is_none() {
+            let nofollow = number == libc::SYS_lgetxattr as u64;
+            if let Err(error) = open_metadata_path(state, libc::AT_FDCWD, &path, nofollow) {
+                return error;
+            }
+        }
+    }
+
+    match read_c_string(memory, args[1], 256) {
+        Ok(name) if name.is_empty() => negative_errno(libc::ERANGE),
+        Ok(name) => {
+            let empty_namespace =
+                [b"user.".as_slice(), b"trusted.", b"security."].contains(&name.as_slice());
+            if empty_namespace {
+                return negative_errno(libc::EINVAL);
+            }
+            let supported_namespace = [b"user.".as_slice(), b"trusted.", b"security."]
+                .iter()
+                .any(|prefix| name.starts_with(prefix));
+            let supported_system_name = matches!(
+                name.as_slice(),
+                b"system.posix_acl_access" | b"system.posix_acl_default"
+            );
+            if supported_namespace || supported_system_name {
+                negative_errno(libc::ENODATA)
+            } else {
+                negative_errno(libc::EOPNOTSUPP)
+            }
+        }
+        Err(ReadCStringError::Fault) => negative_errno(libc::EFAULT),
+        Err(ReadCStringError::NameTooLong) => negative_errno(libc::ERANGE),
     }
 }
 
@@ -7517,6 +7566,103 @@ mod tests {
         let err = resolve_exec_shebang(a.clone(), std::fs::read(&a).unwrap(), vec!["a".to_owned()])
             .unwrap_err();
         assert_eq!(err, negative_errno(libc::ELOOP));
+    }
+
+    #[test]
+    fn xattr_model_preserves_target_and_name_errors() {
+        let root = TestDir::new();
+        std::fs::write(root.0.join("file"), b"content").unwrap();
+        std::os::unix::fs::symlink("missing", root.0.join("dangling")).unwrap();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, 0x4000).unwrap();
+        write_c_string(&mut memory, 0x100, "file");
+        write_c_string(&mut memory, 0x200, "security.selinux");
+
+        for number in [libc::SYS_getxattr, libc::SYS_lgetxattr] {
+            assert_eq!(
+                syscall_result(&mut memory, &mut state, number, [0x100, 0x200, 0, 0, 0, 0]),
+                negative_errno(libc::ENODATA)
+            );
+        }
+
+        for (name, errno) in [
+            ("", libc::ERANGE),
+            ("foo", libc::EOPNOTSUPP),
+            ("user.reverie_review", libc::ENODATA),
+        ] {
+            write_c_string(&mut memory, 0x200, name);
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_getxattr,
+                    [0x100, 0x200, 0, 0, 0, 0]
+                ),
+                negative_errno(errno),
+                "xattr name {name:?}"
+            );
+        }
+
+        write_c_string(&mut memory, 0x100, "missing");
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_getxattr,
+                [0x100, 0x200, 0, 0, 0, 0]
+            ),
+            negative_errno(libc::ENOENT)
+        );
+
+        write_c_string(&mut memory, 0x100, "dangling");
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_getxattr,
+                [0x100, 0x200, 0, 0, 0, 0]
+            ),
+            negative_errno(libc::ENOENT)
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_lgetxattr,
+                [0x100, 0x200, 0, 0, 0, 0]
+            ),
+            negative_errno(libc::ENODATA)
+        );
+
+        let fd = open_readonly(&mut memory, &mut state, "file");
+        assert!(fd >= 0);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_fgetxattr,
+                [fd as u64, 0x200, 0, 0, 0, 0]
+            ),
+            negative_errno(libc::ENODATA)
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_fgetxattr,
+                [u64::MAX, 0x200, 0, 0, 0, 0]
+            ),
+            negative_errno(libc::EBADF)
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_fgetxattr,
+                [fd as u64, 0x5000, 0, 0, 0, 0]
+            ),
+            negative_errno(libc::EFAULT)
+        );
     }
 
     #[test]
