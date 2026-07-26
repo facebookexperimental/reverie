@@ -537,6 +537,14 @@ impl ElfExecutor {
         } else {
             argv
         };
+        // TODO-HUMAN-REVIEW(reverie-kvm): in-guest execve `#!` interpreter
+        // resolution. The KVM ELF loader only maps ELF images, so a guest that
+        // execs a `#!`-script must have its interpreter resolved here, as the
+        // kernel's binfmt_script loader does.
+        let (image, argv) = match resolve_exec_shebang(path, image, argv) {
+            Ok((_interpreter, image, argv)) => (image, argv),
+            Err(errno) => return errno,
+        };
         self.process_action = Some(ProcessAction::Exec { image, argv, envp });
         0
     }
@@ -703,6 +711,68 @@ fn ensure_directory(file: &std::fs::File) -> Result<(), i64> {
         return Err(negative_errno(libc::ENOTDIR));
     }
     Ok(())
+}
+
+/// Maximum `#!` interpreter indirection levels, matching the Linux kernel's
+/// `BINPRM_MAX_RECURSION` limit for chained script interpreters.
+const MAX_SHEBANG_DEPTH: usize = 4;
+
+/// Resolve `#!` interpreter scripts for in-guest `execve(2)`, mirroring the
+/// kernel's `binfmt_script` loader (`fs/binfmt_script.c`).
+///
+/// The reverie-kvm ELF loader can only map ELF images, so a guest that execs a
+/// `#!`-script (for example a `sh` wrapper that execs another wrapper) must have
+/// its interpreter resolved here. On success the returned image is the
+/// interpreter's file contents and `argv` is rewritten in kernel order:
+/// `[interp, shebang_args.., script_path, <original argv[1..]>]`. Errors are
+/// returned as negative errnos.
+fn resolve_exec_shebang(
+    mut path: std::path::PathBuf,
+    mut image: Vec<u8>,
+    mut argv: Vec<String>,
+) -> Result<(std::path::PathBuf, Vec<u8>, Vec<String>), i64> {
+    let mut depth = 0;
+    while image.starts_with(b"#!") {
+        depth += 1;
+        if depth > MAX_SHEBANG_DEPTH {
+            return Err(negative_errno(libc::ELOOP));
+        }
+        let line_end = image
+            .iter()
+            .position(|&b| b == b'\n')
+            .unwrap_or(image.len());
+        // Skip "#!" and any leading blanks, then take the interpreter token.
+        let mut start = 2;
+        while start < line_end && matches!(image[start], b' ' | b'\t') {
+            start += 1;
+        }
+        let mut end = start;
+        while end < line_end && !matches!(image[end], b' ' | b'\t' | b'\r') {
+            end += 1;
+        }
+        if start == end {
+            return Err(negative_errno(libc::ENOEXEC));
+        }
+        let interpreter = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&image[start..end]));
+        // Remaining tokens on the directive line become interpreter arguments.
+        let mut shebang_args: Vec<String> = String::from_utf8_lossy(&image[end..line_end])
+            .split_ascii_whitespace()
+            .map(str::to_owned)
+            .collect();
+
+        let mut rewritten = Vec::with_capacity(argv.len() + shebang_args.len() + 2);
+        rewritten.push(interpreter.to_string_lossy().into_owned());
+        rewritten.append(&mut shebang_args);
+        rewritten.push(path.to_string_lossy().into_owned());
+        if argv.len() > 1 {
+            rewritten.extend_from_slice(&argv[1..]);
+        }
+        argv = rewritten;
+
+        path = interpreter;
+        image = std::fs::read(&path).map_err(io_error)?;
+    }
+    Ok((path, image, argv))
 }
 
 fn ensure_read_capable(file: &std::fs::File) -> Result<(), i64> {
@@ -6227,5 +6297,66 @@ mod tests {
             signal_disposition(&state, libc::SIGABRT),
             SignalDisposition::Handled
         );
+    }
+
+    // Non-`#!` payload; the resolver only checks that it is not a script.
+    const FAKE_ELF: &[u8] = b"\x7fELF\x02\x01\x01\x00 fake elf body";
+
+    #[test]
+    fn resolve_exec_shebang_plain_elf_is_unchanged() {
+        let dir = TestDir::new();
+        let prog = dir.0.join("prog");
+        std::fs::write(&prog, FAKE_ELF).unwrap();
+
+        let (path, image, argv) = resolve_exec_shebang(
+            prog.clone(),
+            FAKE_ELF.to_vec(),
+            vec!["prog".to_owned(), "-a".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(path, prog);
+        assert_eq!(image, FAKE_ELF);
+        assert_eq!(argv, vec!["prog".to_owned(), "-a".to_owned()]);
+    }
+
+    #[test]
+    fn resolve_exec_shebang_single_level_kernel_order() {
+        let dir = TestDir::new();
+        let interp = dir.0.join("fakebash");
+        std::fs::write(&interp, FAKE_ELF).unwrap();
+        let script = dir.0.join("script");
+        let script_body = format!("#!{} -x\necho hi\n", interp.display());
+
+        let (path, image, argv) = resolve_exec_shebang(
+            script.clone(),
+            script_body.into_bytes(),
+            vec!["script".to_owned(), "arg1".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(path, interp);
+        assert_eq!(image, FAKE_ELF);
+        // Kernel order: [interp, shebang args.., script_path, original args[1..]].
+        assert_eq!(
+            argv,
+            vec![
+                interp.to_string_lossy().into_owned(),
+                "-x".to_owned(),
+                script.to_string_lossy().into_owned(),
+                "arg1".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_exec_shebang_rejects_infinite_recursion() {
+        let dir = TestDir::new();
+        let a = dir.0.join("a");
+        let b = dir.0.join("b");
+        std::fs::write(&a, format!("#!{}\n", b.display())).unwrap();
+        std::fs::write(&b, format!("#!{}\n", a.display())).unwrap();
+
+        let err = resolve_exec_shebang(a.clone(), std::fs::read(&a).unwrap(), vec!["a".to_owned()])
+            .unwrap_err();
+        assert_eq!(err, negative_errno(libc::ELOOP));
     }
 }
