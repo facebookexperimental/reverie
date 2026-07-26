@@ -63,8 +63,10 @@ handlers. A handler must complete on its first poll; `tail_inject` is the only
 supported pending future.
 
 Counter summaries are emitted before the terminal syscall because the legacy
-SaBRe callback API has no process-exit event. Without an external coordinator
-such as `riptrace`, every SaBRe process owns a separate adapter and counter.
+SaBRe callback API has no process-exit event. Fork children retain the selected
+tool when their process-local plugin is rebuilt. Without an external
+coordinator such as `riptrace`, every SaBRe process still owns a separate
+adapter and counter.
 
 `noop` requests `Subscription::none()`, but the legacy SaBRe loader does not
 yet consult subscriptions, so rewritten syscall sites still enter the default

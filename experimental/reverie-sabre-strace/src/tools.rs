@@ -9,7 +9,9 @@
 //! Shared Reverie example tools hosted by the SaBRe plugin.
 
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
@@ -32,6 +34,10 @@ use super::StraceTool;
 /// Environment variable selecting the shared tool hosted by the plugin.
 pub(super) const TOOL_ENV: &str = "REVERIE_SABRE_TOOL";
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-158): Review fork-inherited example-tool selection.
+static SELECTED_TOOL: OnceLock<ToolKind> = OnceLock::new();
+
 /// Shared Reverie tool implementations available through the SaBRe runner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ToolKind {
@@ -49,10 +55,22 @@ pub(super) enum ToolKind {
 
 impl ToolKind {
     pub(crate) fn from_environment() -> Self {
+        if let Some(selected) = SELECTED_TOOL.get() {
+            return *selected;
+        }
+
         // SAFETY: Plugin construction runs before SaBRe starts guest callbacks.
         let selected = unsafe { reverie_sabre::take_private_env(TOOL_ENV) };
 
-        match selected.as_deref() {
+        Self::remember(&SELECTED_TOOL, selected.as_deref())
+    }
+
+    fn remember(slot: &OnceLock<Self>, requested: Option<&OsStr>) -> Self {
+        if let Some(selected) = slot.get() {
+            return *selected;
+        }
+
+        let selected = match requested {
             Some(value) if value == "counter1" => Self::Counter1,
             Some(value) if value == "counter2" => Self::Counter2,
             Some(value) if value == "noop" => Self::Noop,
@@ -62,7 +80,9 @@ impl ToolKind {
                 nostd_print::eprintln!("reverie-sabre: unknown {TOOL_ENV}={other:?}; using strace");
                 Self::Strace
             }
-        }
+        };
+
+        *slot.get_or_init(|| selected)
     }
 }
 
@@ -281,6 +301,21 @@ impl SharedAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_tool_survives_plugin_reinitialization() {
+        let selected = OnceLock::new();
+
+        assert_eq!(
+            ToolKind::remember(&selected, Some(OsStr::new("noop"))),
+            ToolKind::Noop
+        );
+        assert_eq!(ToolKind::remember(&selected, None), ToolKind::Noop);
+        assert_eq!(
+            ToolKind::remember(&selected, Some(OsStr::new("counter1"))),
+            ToolKind::Noop
+        );
+    }
 
     #[tokio::test]
     async fn counter1_returns_the_updated_total() {

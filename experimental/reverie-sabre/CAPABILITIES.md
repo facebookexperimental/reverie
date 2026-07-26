@@ -17,7 +17,7 @@ shared example tools, but it is not a drop-in replacement for
 | Process exit | `exit_group` requests orderly exit from tracked threads, then issues a real kernel `exit_group` so threads that never reached an interception boundary cannot survive. Configurable timeout handling is supported. |
 | Signals | Central handlers mediate standard catchable signals. Guest `rt_sigaction` registration and query are virtualized, including `SA_RESTART`. Linux default ignore, continue, stop, and terminate dispositions are preserved. |
 | Signal exclusion | The kernel handler only enqueues fixed-size events. Tool and guest callbacks drain from normal runtime context; bounded-queue overflow coalesces standard signals. |
-| Fork and exec | Forked children lazily construct a new Tool and RPC transport. `execve` re-enters the pinned SaBRe loader so the plugin remains active across the new image. `execveat` remains unsupported. |
+| Fork and exec | Forked children lazily construct the same selected Tool with new process-local state and RPC transport. `execve` re-enters the pinned SaBRe loader so the plugin remains active across the new image. `execveat` remains unsupported. |
 | Timing and detours | Supports RDTSC callbacks, selected VDSO callbacks, and macro-generated function detours. |
 | Global state | Uses a synchronous generated RPC client to a host-side service. The channel is process-local and recreated after fork. |
 | Loader inputs | Validated with dynamically linked x86-64 guests and the loader revision in `SABRE_UPSTREAM.toml`. |
