@@ -168,6 +168,30 @@ async fn readiness_is_published_on_first_request() {
 }
 
 #[tokio::test]
+async fn connection_readiness_is_published_after_config_handshake() {
+    let global = std::sync::Arc::new(Counter::default());
+    let readiness = std::sync::Arc::new(AtomicBool::new(false));
+    let path = unique_sock_path("connection-readiness");
+    let server = RpcServer::bind_with_connection_readiness(
+        &path,
+        global,
+        "ready-cfg".to_string(),
+        readiness.clone(),
+    )
+    .unwrap();
+    let server_path = server.path().to_path_buf();
+    let handle = tokio::spawn(async move { server.serve().await });
+
+    let client = RpcClient::<Counter>::connect(&server_path, Tid::from_raw(13))
+        .await
+        .expect("connect");
+    assert_eq!(client.config(), "ready-cfg");
+    assert!(readiness.load(Ordering::Acquire));
+
+    handle.abort();
+}
+
+#[tokio::test]
 async fn serve_one_then_client_disconnect_is_clean() {
     // `serve_one` serves a single connection until the client closes it, and
     // reports that clean close as `Ok(())`.

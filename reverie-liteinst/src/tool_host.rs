@@ -79,14 +79,42 @@ pub unsafe fn install_tool<T>(coordinator: impl AsRef<Path>) -> io::Result<()>
 where
     T: Tool + 'static,
 {
+    unsafe { install_tool_inner::<T>(coordinator.as_ref(), true) }
+}
+
+// TODO-HUMAN-REVIEW(PR-139): Review the environment-preserving bootstrap install API.
+/// Installs a concrete tool using a consumed bootstrap coordinator path.
+///
+/// Unlike the legacy install entry point, this does not remove its coordinator
+/// environment variable because the bootstrap path did not introduce one.
+///
+/// # Safety
+///
+/// Installs process-global signal, seccomp, allocator, and instrumentation state.
+pub unsafe fn install_tool_from_bootstrap<T>(coordinator: impl AsRef<Path>) -> io::Result<()>
+where
+    T: Tool + 'static,
+{
+    unsafe { install_tool_inner::<T>(coordinator.as_ref(), false) }
+}
+
+unsafe fn install_tool_inner<T>(
+    coordinator: &Path,
+    remove_legacy_environment: bool,
+) -> io::Result<()>
+where
+    T: Tool + 'static,
+{
     let _signal_state = runtime::prepare_guest_signal_state()?;
     let rpc = CoordinatorRpc::<T::GlobalState>::connect(coordinator)?;
     runtime::reserve_coordinator_fd(rpc.raw_fd())?;
     COMMITTED_STACKS.lock().clear();
     let pid = Pid::from_raw(unsafe { libc::getpid() });
     let subscriptions = T::subscriptions(rpc.config()).iter_syscalls().collect();
-    // SAFETY: tool installation runs before application-created threads.
-    unsafe { std::env::remove_var(crate::backend::COORDINATOR_ENV) };
+    if remove_legacy_environment {
+        // SAFETY: legacy tool installation runs before application-created threads.
+        unsafe { std::env::remove_var(crate::backend::COORDINATOR_ENV) };
+    }
     let tool = T::new(pid, rpc.config());
     HANDLER
         .set(Box::new(ToolHost::<T> {

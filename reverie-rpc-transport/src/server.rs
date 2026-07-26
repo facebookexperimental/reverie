@@ -42,6 +42,7 @@ pub struct RpcServer<G: GlobalTool> {
     listener: UnixListener,
     path: PathBuf,
     readiness: Option<Arc<AtomicBool>>,
+    connection_readiness: Option<Arc<AtomicBool>>,
 }
 
 impl<G> RpcServer<G>
@@ -59,7 +60,7 @@ where
         global: Arc<G>,
         config: G::Config,
     ) -> Result<Self, RpcError> {
-        Self::bind_inner(path, global, config, None)
+        Self::bind_inner(path, global, config, None, None)
     }
 
     // TODO-HUMAN-REVIEW(PR-128): Review the externally shared fallback-readiness boundary.
@@ -71,7 +72,19 @@ where
         config: G::Config,
         readiness: Arc<AtomicBool>,
     ) -> Result<Self, RpcError> {
-        Self::bind_inner(path, global, config, Some(readiness))
+        Self::bind_inner(path, global, config, Some(readiness), None)
+    }
+
+    // TODO-HUMAN-REVIEW(PR-139): Review the public config-handshake readiness boundary.
+    /// Binds a coordinator and marks `readiness` after a guest receives its
+    /// configuration handshake, before that guest sends its first request.
+    pub fn bind_with_connection_readiness(
+        path: impl AsRef<Path>,
+        global: Arc<G>,
+        config: G::Config,
+        readiness: Arc<AtomicBool>,
+    ) -> Result<Self, RpcError> {
+        Self::bind_inner(path, global, config, None, Some(readiness))
     }
 
     fn bind_inner(
@@ -79,6 +92,7 @@ where
         global: Arc<G>,
         config: G::Config,
         readiness: Option<Arc<AtomicBool>>,
+        connection_readiness: Option<Arc<AtomicBool>>,
     ) -> Result<Self, RpcError> {
         let path = path.as_ref().to_path_buf();
         // Best-effort removal of a stale socket; ignore "not found".
@@ -94,6 +108,7 @@ where
             listener,
             path,
             readiness,
+            connection_readiness,
         })
     }
 
@@ -120,8 +135,12 @@ where
             let global = self.global.clone();
             let config = self.config.clone();
             let readiness = self.readiness.clone();
+            let connection_readiness = self.connection_readiness.clone();
             tokio::spawn(async move {
-                if let Err(e) = serve_connection_inner(global, config, stream, readiness).await {
+                if let Err(e) =
+                    serve_connection_inner(global, config, stream, readiness, connection_readiness)
+                        .await
+                {
                     // A clean close is the normal way a guest connection ends.
                     if !matches!(e, RpcError::Closed) {
                         tracing_disconnect(&e);
@@ -140,6 +159,7 @@ where
             self.config.clone(),
             stream,
             self.readiness.clone(),
+            self.connection_readiness.clone(),
         )
         .await
     }
@@ -162,7 +182,7 @@ pub async fn serve_connection<G>(
 where
     G: GlobalTool,
 {
-    serve_connection_inner(global, config, stream, None).await
+    serve_connection_inner(global, config, stream, None, None).await
 }
 
 async fn serve_connection_inner<G>(
@@ -170,6 +190,7 @@ async fn serve_connection_inner<G>(
     config: G::Config,
     mut stream: UnixStream,
     readiness: Option<Arc<AtomicBool>>,
+    connection_readiness: Option<Arc<AtomicBool>>,
 ) -> Result<(), RpcError>
 where
     G: GlobalTool,
@@ -183,6 +204,9 @@ where
     // `tokio::spawn`.
     let config_bytes = encode(&config)?;
     write_message(&mut stream, &config_bytes).await?;
+    if let Some(readiness) = &connection_readiness {
+        readiness.store(true, Ordering::Release);
+    }
 
     loop {
         let request_bytes = match read_message(&mut stream, DEFAULT_MAX_FRAME_LEN).await {

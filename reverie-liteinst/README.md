@@ -28,10 +28,14 @@ Reverie tool RPC for every callback.
 ## Backend launcher
 
 `LiteinstBackend` implements Reverie's `Backend` trait. It owns the single
-`GlobalTool`, starts a UDS coordinator, sets `LD_PRELOAD` and
-`REVERIE_LITEINST_COORDINATOR`, runs the guest, and returns its status and final
-global state. `REVERIE_LITEINST_TOOL_PRELOAD` must name a DSO that embeds the
-same concrete `T` and calls `install_tool::<T>`.
+`GlobalTool`, starts a UDS coordinator, sets `LD_PRELOAD`, runs the guest,
+and returns its status and final global state. Existing preload APIs retain the
+`REVERIE_LITEINST_COORDINATOR` environment contract. The example launcher
+uses `run_with_output_and_preload_data` instead, passing the coordinator
+path and selector in a sealed, dynamically allocated memfd that the preload
+discovers, validates, consumes, and closes before guest `main`.
+`REVERIE_LITEINST_TOOL_PRELOAD` must name a DSO that embeds the same concrete
+`T` and calls `install_tool::<T>`.
 
 Built-in `strace` and compatibility modes remain available through
 `configure_command`. They use the same shared preload and LiteInst hook path

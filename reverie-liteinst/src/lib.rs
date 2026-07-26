@@ -15,12 +15,15 @@ mod patch_alloc;
 
 pub use backend::COORDINATOR_ENV;
 pub use backend::LiteinstBackend;
+pub use backend::PreloadBootstrap;
 pub use backend::TOOL_PRELOAD_ENV;
+pub use backend::take_preload_bootstrap;
 pub mod rpc;
 mod runtime;
 mod tool_host;
 
 pub use tool_host::install_tool;
+pub use tool_host::install_tool_from_bootstrap;
 
 #[global_allocator]
 static PATCH_ALLOCATOR: patch_alloc::PatchAllocator = patch_alloc::PatchAllocator;

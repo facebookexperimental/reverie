@@ -25,12 +25,23 @@ use serde::Deserialize;
 use serde::Serialize;
 
 #[derive(Debug, Default)]
-struct CounterGlobal {
+// TODO-HUMAN-REVIEW(PR-139): Review visibility for the shared LiteInst host.
+pub(crate) struct CounterGlobal {
     num_syscalls: AtomicU64,
 }
 
 #[derive(Debug, Default, Clone)]
-struct CounterLocal {}
+// TODO-HUMAN-REVIEW(PR-139): Review visibility for the shared LiteInst host.
+pub(crate) struct CounterLocal {}
+
+impl CounterGlobal {
+    // Used by the LiteInst host; the standalone ptrace binary does not read it directly.
+    #[allow(dead_code)]
+    // TODO-HUMAN-REVIEW(PR-139): Review the LiteInst counter result accessor.
+    pub(crate) fn total(&self) -> u64 {
+        self.num_syscalls.load(Ordering::SeqCst)
+    }
+}
 
 /// The message sent to the global state method.
 /// This contains the syscall number.

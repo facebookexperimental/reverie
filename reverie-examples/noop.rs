@@ -16,7 +16,8 @@ use reverie::Tool;
 use reverie_util::CommonToolArguments;
 
 #[derive(Debug, Default)]
-struct NoopTool;
+// TODO-HUMAN-REVIEW(PR-139): Review visibility for the shared LiteInst host.
+pub(crate) struct NoopTool;
 
 #[reverie::tool]
 impl Tool for NoopTool {
