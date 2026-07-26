@@ -99,4 +99,9 @@ standardized KVM hypercall 12 because it is the only hypercall KVM exposes to
 userspace; that prototype ABI must be replaced before running a stock guest
 kernel.
 
+The deterministic guest procfs surface is currently limited to explicit
+synthetic files, descriptor reopen aliases, and guest-owned descriptor link
+targets. It does not yet enumerate procfs directories, so proc-inspection tools
+that scan the process table remain unsupported.
+
 The ELF loader supports one host interpreter and enough file-backed mapping for small dynamically linked programs. General libc coverage remains bounded by the explicit syscall personality; unsupported operations fail with `ENOSYS` rather than silently bypassing the tool.

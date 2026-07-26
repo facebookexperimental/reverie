@@ -60,6 +60,42 @@ const AT_SECURE: u64 = 23;
 const AT_RANDOM: u64 = 25;
 const AT_EXECFN: u64 = 31;
 
+// AUTONOMOUS-BOT-IMPLEMENTED: Share deterministic file identities across fork.
+// TODO-HUMAN-REVIEW(PR-136): Review linked and anonymous object identity lifetimes.
+#[derive(Debug)]
+pub(crate) struct GuestFileIdentity {
+    pub inode: u64,
+}
+
+// TODO-HUMAN-REVIEW(PR-136): Review the identity entry lifetime API.
+#[derive(Debug)]
+pub(crate) enum GuestFileIdentityEntry {
+    Persistent(std::sync::Arc<GuestFileIdentity>),
+    Ephemeral(std::sync::Weak<GuestFileIdentity>),
+}
+
+impl GuestFileIdentityEntry {
+    // TODO-HUMAN-REVIEW(PR-136): Review identity entry lifetime accessors.
+    pub(crate) fn identity(&self) -> Option<std::sync::Arc<GuestFileIdentity>> {
+        match self {
+            Self::Persistent(identity) => Some(identity.clone()),
+            Self::Ephemeral(identity) => identity.upgrade(),
+        }
+    }
+
+    // TODO-HUMAN-REVIEW(PR-136): Review identity entry liveness checks.
+    pub(crate) fn is_live(&self) -> bool {
+        self.identity().is_some()
+    }
+}
+
+// TODO-HUMAN-REVIEW(PR-136): Review the shared identity table API.
+#[derive(Debug)]
+pub(crate) struct GuestFileIdentityTable {
+    pub next_inode: u64,
+    pub objects: std::collections::BTreeMap<(libc::dev_t, libc::ino_t), GuestFileIdentityEntry>,
+}
+
 #[derive(Debug)]
 pub(crate) struct LoadedStaticElf {
     pub entry_point: u64,
@@ -105,10 +141,17 @@ pub(crate) struct LoadedStaticElf {
     // this side table only marks which fds must report stable, synthesized
     // metadata instead of the memfd's per-run inode.
     pub proc_files: std::collections::BTreeMap<i32, u64>,
+    // AUTONOMOUS-BOT-IMPLEMENTED: Preserve deterministic file-object identity.
+    // TODO-HUMAN-REVIEW(PR-136): Review descriptor identity and fork inheritance.
+    // Every live descriptor strongly holds its identity; the process-shared
+    // registry contains only weak references keyed by unexposed host identity.
+    pub fd_object_inodes: std::collections::BTreeMap<i32, std::sync::Arc<GuestFileIdentity>>,
+    pub file_identity_table: std::sync::Arc<std::sync::Mutex<GuestFileIdentityTable>>,
 }
 
 impl LoadedStaticElf {
     pub(crate) fn try_clone_for_fork(&self, child_pid: i32) -> Result<Self> {
+        // TODO-HUMAN-REVIEW(PR-136): Review shared file identity inheritance across fork.
         // TODO-HUMAN-REVIEW(PR-119): Review scheduler reset and ioprio fork inheritance.
         let reset_realtime = self.sched_reset_on_fork
             && matches!(self.sched_policy, libc::SCHED_FIFO | libc::SCHED_RR);
@@ -165,9 +208,12 @@ impl LoadedStaticElf {
             closed_standard_fds: self.closed_standard_fds.clone(),
             children: std::collections::BTreeMap::new(),
             proc_files: self.proc_files.clone(),
+            fd_object_inodes: self.fd_object_inodes.clone(),
+            file_identity_table: self.file_identity_table.clone(),
         })
     }
 
+    // TODO-HUMAN-REVIEW(PR-136): Review live identity filtering across exec.
     pub(crate) fn inherit_process_state(&mut self, previous: Self) {
         let cloexec_fds = previous.cloexec_fds;
         let mut stdin = previous.stdin;
@@ -191,6 +237,18 @@ impl LoadedStaticElf {
             .into_iter()
             .filter(|(fd, _)| files.contains_key(fd))
             .collect();
+        let fd_object_inodes: std::collections::BTreeMap<_, _> = previous
+            .fd_object_inodes
+            .into_iter()
+            .filter(|(fd, _)| files.contains_key(fd))
+            .collect();
+        let file_identity_table = previous.file_identity_table.clone();
+        {
+            let mut table = file_identity_table
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            table.objects.retain(|_, entry| entry.is_live());
+        }
         let mut closed_standard_fds = previous.closed_standard_fds;
         if cloexec_fds.contains(&libc::STDIN_FILENO) {
             stdin = None;
@@ -240,6 +298,8 @@ impl LoadedStaticElf {
         self.closed_standard_fds = closed_standard_fds;
         self.children = previous.children;
         self.proc_files = proc_files;
+        self.fd_object_inodes = fd_object_inodes;
+        self.file_identity_table = file_identity_table;
     }
 }
 
@@ -446,6 +506,11 @@ fn load_executable(
         closed_standard_fds: std::collections::BTreeSet::new(),
         children: std::collections::BTreeMap::new(),
         proc_files: std::collections::BTreeMap::new(),
+        fd_object_inodes: std::collections::BTreeMap::new(),
+        file_identity_table: std::sync::Arc::new(std::sync::Mutex::new(GuestFileIdentityTable {
+            next_inode: 0x2100_0000,
+            objects: std::collections::BTreeMap::new(),
+        })),
     })
 }
 
