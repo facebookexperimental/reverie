@@ -71,11 +71,10 @@ impl sabre::Tool for Plugin {
 
     fn new(_client: Self::Client) -> Self {
         let kind = tools::ToolKind::from_environment();
-        let quiet = std::env::var_os(QUIET_ENV).is_some() || QUIET.load(Ordering::Acquire);
+        // SAFETY: Plugin construction runs before SaBRe starts guest callbacks.
+        let quiet = unsafe { reverie_sabre::take_private_env(QUIET_ENV) }.is_some()
+            || QUIET.load(Ordering::Acquire);
         QUIET.store(quiet, Ordering::Release);
-        if quiet {
-            std::env::remove_var(QUIET_ENV);
-        }
 
         Self {
             adapter: tools::SharedAdapter::new(kind, quiet),

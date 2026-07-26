@@ -43,16 +43,15 @@ pub(super) enum ToolKind {
 
 impl ToolKind {
     pub(crate) fn from_environment() -> Self {
-        let selected = std::env::var(TOOL_ENV);
-        // SaBRe caches reserved settings before plugin initialization, so the
-        // plugin can consume this value without losing it across exec.
-        std::env::remove_var(TOOL_ENV);
+        // SAFETY: Plugin construction runs before SaBRe starts guest callbacks.
+        let selected = unsafe { reverie_sabre::take_private_env(TOOL_ENV) };
 
         match selected.as_deref() {
-            Ok("counter1") => Self::Counter1,
-            Ok("noop") => Self::Noop,
-            Ok("strace") | Err(_) => Self::Strace,
-            Ok(other) => {
+            Some(value) if value == "counter1" => Self::Counter1,
+            Some(value) if value == "noop" => Self::Noop,
+            Some(value) if value == "strace" => Self::Strace,
+            None => Self::Strace,
+            Some(other) => {
                 nostd_print::eprintln!("reverie-sabre: unknown {TOOL_ENV}={other:?}; using strace");
                 Self::Strace
             }
