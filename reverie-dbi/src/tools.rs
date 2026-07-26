@@ -77,6 +77,7 @@ use serde::Serialize;
 
 use crate::DbiSyscallOutcome;
 use crate::RegisterReader;
+use crate::RegisterWriter;
 use crate::SyscallInvoker;
 use crate::counter::RecordSyscall;
 use crate::counter::SyscallCounterGlobal;
@@ -88,6 +89,7 @@ const SYSCALL_HISTOGRAM_ENV: &str = "HERMIT_DBI_SYSCALL_HISTOGRAM";
 const STRACE_ENV: &str = "HERMIT_DBI_STRACE";
 const NOOP_ENV: &str = "HERMIT_DBI_NOOP";
 const TEST_REWRITE_EXIT_ENV: &str = "HERMIT_DBI_TEST_REWRITE_EXIT";
+const TEST_SET_REG_ENV: &str = "HERMIT_DBI_TEST_SET_REG";
 const COUNTER1_ENV: &str = "HERMIT_DBI_COUNTER1";
 const COUNTER2_ENV: &str = "HERMIT_DBI_COUNTER2";
 const CHUNKY_PRINT_ENV: &str = "HERMIT_DBI_CHUNKY_PRINT";
@@ -118,6 +120,7 @@ static STRACE_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(STRACE_ENV));
 static NOOP_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(NOOP_ENV));
 static TEST_REWRITE_EXIT_ENABLED: LazyLock<bool> =
     LazyLock::new(|| env_flag(TEST_REWRITE_EXIT_ENV));
+static TEST_SET_REG_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(TEST_SET_REG_ENV));
 static COUNTER1_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(COUNTER1_ENV));
 static COUNTER2_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(COUNTER2_ENV));
 static CHUNKY_PRINT_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(CHUNKY_PRINT_ENV));
@@ -400,6 +403,46 @@ impl Tool for RewriteExitTool {
                 let exit =
                     Syscall::from_raw(Sysno::exit_group, SyscallArgs::new(42, 0, 0, 0, 0, 0));
                 guest.tail_inject(exit).await
+            }
+            _ => guest.tail_inject(syscall).await,
+        }
+    }
+}
+
+/// The sentinel value [`SetRegTool`] writes into the guest's `r15` to prove that
+/// `Guest::set_regs` reaches the application register file (see the
+/// `set_reg_probe` fixture, which loads a different value and reads it back).
+const SET_REG_SENTINEL: u64 = 0xDEAD_BEEF_CAFE_F00D;
+
+/// Regression tool that exercises the DBI `Guest::set_regs` path: on the guest's
+/// `getpid`, overwrite the callee-saved `r15` register with [`SET_REG_SENTINEL`]
+/// via `set_regs`, then suppress the syscall. Because `r15` is preserved across
+/// the syscall boundary, a correct `set_regs` implementation lets the guest read
+/// the sentinel back after the call returns. This is the first DBI tool to write
+/// the guest register file rather than only read it.
+#[derive(Clone, Copy, Debug, Default)]
+struct SetRegTool;
+
+#[reverie::tool]
+impl Tool for SetRegTool {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-167): Review the DBI set_regs regression tool.
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        match syscall.number() {
+            Sysno::getpid => {
+                let mut regs = guest.regs().await;
+                regs.r15 = SET_REG_SENTINEL;
+                guest.set_regs(regs).await?;
+                // Suppress getpid with a fixed value; the guest observes the
+                // rewritten r15 after resuming, not this return value.
+                Ok(4321)
             }
             _ => guest.tail_inject(syscall).await,
         }
@@ -1131,6 +1174,7 @@ enum ActiveTool {
     SharedCounter,
     Noop,
     RewriteExit,
+    SetReg,
     Counter1,
     Counter2,
     ChunkyPrint,
@@ -1141,6 +1185,8 @@ enum ActiveTool {
 fn active_tool() -> Option<ActiveTool> {
     if *TEST_REWRITE_EXIT_ENABLED {
         Some(ActiveTool::RewriteExit)
+    } else if *TEST_SET_REG_ENABLED {
+        Some(ActiveTool::SetReg)
     } else if *STRACE_ENABLED {
         Some(ActiveTool::Strace)
     } else if *HISTOGRAM_ENABLED {
@@ -1210,6 +1256,7 @@ impl Counter2Host {
         exit_code: i32,
         invoke_syscall: SyscallInvoker,
         read_registers: RegisterReader,
+        write_registers: RegisterWriter,
     ) -> Result<(DbiSyscallOutcome, bool), Error> {
         let number = syscall.number();
         let (tool, state_slot, new_thread, mut thread_state) = {
@@ -1274,6 +1321,7 @@ impl Counter2Host {
                 &(),
                 invoke_syscall,
                 read_registers,
+                write_registers,
             )?;
         }
 
@@ -1289,6 +1337,7 @@ impl Counter2Host {
             syscall,
             invoke_syscall,
             read_registers,
+            write_registers,
         );
 
         if !is_exit_syscall(number) {
@@ -1446,6 +1495,7 @@ pub(crate) fn run_active_tool(
     branches: u64,
     invoke_syscall: SyscallInvoker,
     read_registers: RegisterReader,
+    write_registers: RegisterWriter,
 ) -> Option<DbiSyscallOutcome> {
     let tool = active_tool()?;
     let syscall = Syscall::from_raw(
@@ -1469,6 +1519,7 @@ pub(crate) fn run_active_tool(
             syscall,
             invoke_syscall,
             read_registers,
+            write_registers,
         ),
         ActiveTool::Counter => dispatch(
             &SyscallCounterTool,
@@ -1479,6 +1530,7 @@ pub(crate) fn run_active_tool(
             syscall,
             invoke_syscall,
             read_registers,
+            write_registers,
         ),
         ActiveTool::SharedCounter => dispatch_shared(
             context,
@@ -1488,6 +1540,7 @@ pub(crate) fn run_active_tool(
             syscall,
             invoke_syscall,
             read_registers,
+            write_registers,
         ),
         ActiveTool::Noop => dispatch(
             &NoopTool,
@@ -1498,6 +1551,7 @@ pub(crate) fn run_active_tool(
             syscall,
             invoke_syscall,
             read_registers,
+            write_registers,
         ),
         ActiveTool::RewriteExit => dispatch(
             &RewriteExitTool,
@@ -1508,6 +1562,18 @@ pub(crate) fn run_active_tool(
             syscall,
             invoke_syscall,
             read_registers,
+            write_registers,
+        ),
+        ActiveTool::SetReg => dispatch(
+            &SetRegTool,
+            context,
+            tid,
+            pid,
+            branches,
+            syscall,
+            invoke_syscall,
+            read_registers,
+            write_registers,
         ),
         ActiveTool::Counter1 => dispatch_counter1(
             context,
@@ -1517,6 +1583,7 @@ pub(crate) fn run_active_tool(
             syscall,
             invoke_syscall,
             read_registers,
+            write_registers,
         ),
         ActiveTool::Counter2 => dispatch_counter2(
             context,
@@ -1527,6 +1594,7 @@ pub(crate) fn run_active_tool(
             raw_args[0] as i32,
             invoke_syscall,
             read_registers,
+            write_registers,
         ),
         ActiveTool::ChunkyPrint => dispatch_chunky_print(
             context,
@@ -1536,6 +1604,7 @@ pub(crate) fn run_active_tool(
             syscall,
             invoke_syscall,
             read_registers,
+            write_registers,
         ),
         ActiveTool::ChromeTrace => dispatch_chrome_trace(
             context,
@@ -1545,6 +1614,7 @@ pub(crate) fn run_active_tool(
             syscall,
             invoke_syscall,
             read_registers,
+            write_registers,
         ),
         // Chaos carries no global/thread state (its per-thread latch and skip
         // counter are process-global), so it uses the generic dispatch.
@@ -1557,6 +1627,7 @@ pub(crate) fn run_active_tool(
             syscall,
             invoke_syscall,
             read_registers,
+            write_registers,
         ),
     };
     Some(match result {
@@ -1579,6 +1650,7 @@ fn dispatch<T>(
     syscall: Syscall,
     invoke_syscall: SyscallInvoker,
     read_registers: RegisterReader,
+    write_registers: RegisterWriter,
 ) -> Result<DbiSyscallOutcome, Error>
 where
     T: Tool<GlobalState = (), ThreadState = ()>,
@@ -1596,6 +1668,7 @@ where
         syscall,
         invoke_syscall,
         read_registers,
+        write_registers,
     )
 }
 
@@ -1618,6 +1691,7 @@ fn dispatch_shared(
     syscall: Syscall,
     invoke_syscall: SyscallInvoker,
     read_registers: RegisterReader,
+    write_registers: RegisterWriter,
 ) -> Result<DbiSyscallOutcome, Error> {
     let global = SyscallCounterGlobal::default();
     let config = ();
@@ -1634,6 +1708,7 @@ fn dispatch_shared(
         syscall,
         invoke_syscall,
         read_registers,
+        write_registers,
     )
 }
 
@@ -1648,6 +1723,7 @@ fn dispatch_counter1(
     syscall: Syscall,
     invoke_syscall: SyscallInvoker,
     read_registers: RegisterReader,
+    write_registers: RegisterWriter,
 ) -> Result<DbiSyscallOutcome, Error> {
     let mut thread_state = ();
     crate::run_tool_syscall(
@@ -1663,6 +1739,7 @@ fn dispatch_counter1(
         syscall,
         invoke_syscall,
         read_registers,
+        write_registers,
     )
 }
 
@@ -1683,6 +1760,7 @@ fn dispatch_chunky_print(
     syscall: Syscall,
     invoke_syscall: SyscallInvoker,
     read_registers: RegisterReader,
+    write_registers: RegisterWriter,
 ) -> Result<DbiSyscallOutcome, Error> {
     let mut thread_state = ();
     crate::run_tool_syscall(
@@ -1697,6 +1775,7 @@ fn dispatch_chunky_print(
         syscall,
         invoke_syscall,
         read_registers,
+        write_registers,
     )
 }
 
@@ -1718,6 +1797,7 @@ fn dispatch_chrome_trace(
     syscall: Syscall,
     invoke_syscall: SyscallInvoker,
     read_registers: RegisterReader,
+    write_registers: RegisterWriter,
 ) -> Result<DbiSyscallOutcome, Error> {
     let mut thread_state = ();
     crate::run_tool_syscall(
@@ -1732,6 +1812,7 @@ fn dispatch_chrome_trace(
         syscall,
         invoke_syscall,
         read_registers,
+        write_registers,
     )
 }
 
@@ -1747,6 +1828,7 @@ fn dispatch_counter2(
     exit_code: i32,
     invoke_syscall: SyscallInvoker,
     read_registers: RegisterReader,
+    write_registers: RegisterWriter,
 ) -> Result<DbiSyscallOutcome, Error> {
     let (outcome, process_exited) = COUNTER2_HOST.dispatch(
         context,
@@ -1757,6 +1839,7 @@ fn dispatch_counter2(
         exit_code,
         invoke_syscall,
         read_registers,
+        write_registers,
     )?;
     if process_exited {
         let (syscalls, processes, threads) = COUNTER2_HOST.global_state.snapshot();
@@ -1783,6 +1866,13 @@ mod tests {
         1
     }
 
+    unsafe extern "C" fn fake_write_registers(
+        _context: usize,
+        _registers: *const libc::user_regs_struct,
+    ) -> i32 {
+        1
+    }
+
     fn syscall(number: Sysno, arg0: usize) -> Syscall {
         Syscall::from_raw(number, SyscallArgs::new(arg0, 0, 0, 0, 0, 0))
     }
@@ -1803,6 +1893,7 @@ mod tests {
                     0,
                     fake_invoke,
                     fake_read_registers,
+                    fake_write_registers,
                 )
                 .unwrap();
             assert_eq!(
@@ -1822,6 +1913,7 @@ mod tests {
                 0,
                 fake_invoke,
                 fake_read_registers,
+                fake_write_registers,
             )
             .unwrap();
         assert_eq!(
@@ -1840,6 +1932,7 @@ mod tests {
                 0,
                 fake_invoke,
                 fake_read_registers,
+                fake_write_registers,
             )
             .unwrap();
         assert_eq!(
@@ -1858,6 +1951,7 @@ mod tests {
                 7,
                 fake_invoke,
                 fake_read_registers,
+                fake_write_registers,
             )
             .unwrap();
         assert_eq!(

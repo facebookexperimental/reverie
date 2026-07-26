@@ -29,6 +29,7 @@ tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT
 pthread_guest="$tmpdir/pthread-lifecycle"
 rewrite_exit_guest="$tmpdir/rewrite-exit"
+set_reg_guest="$tmpdir/set-reg-probe"
 identity_policy_guest="$tmpdir/identity-policy"
 fork_pthread_guest="$tmpdir/fork-pthread-identity"
 blocked_exit_guest="$tmpdir/blocked-exit-group"
@@ -39,6 +40,8 @@ chaos_data="$tmpdir/chaos-data.txt"
   "$crate_dir/tests/fixtures/pthread_lifecycle.c" -o "$pthread_guest"
 "${CC:-cc}" -O2 -g -std=c11 -Wall -Wextra -Werror \
   "$crate_dir/tests/fixtures/rewrite_exit.c" -o "$rewrite_exit_guest"
+"${CC:-cc}" -O2 -g -std=c11 -Wall -Wextra -Werror \
+  "$crate_dir/tests/fixtures/set_reg_probe.c" -o "$set_reg_guest"
 "${CC:-cc}" -O2 -g -std=c11 -Wall -Wextra -Werror \
   "$crate_dir/tests/fixtures/identity_policy.c" -o "$identity_policy_guest"
 "${CC:-cc}" -O2 -g -std=c11 -Wall -Wextra -Werror -pthread \
@@ -91,6 +94,15 @@ rewrite_status=$?
 set -e
 [[ $rewrite_status -eq 42 ]] || fail "deferred getpid-to-exit_group rewrite returned $rewrite_status"
 echo "PASS: deferred lifecycle syscall preserves replacement number and arguments"
+
+# set_regs: the tool overwrites the guest's callee-saved r15 via Guest::set_regs
+# at the getpid stop; because r15 survives the syscall, the guest reads back the
+# sentinel the tool wrote (not the 0x1111... it loaded). Proves DBI set_regs
+# reaches the application register file — the first register-writing DBI tool.
+run_tool HERMIT_DBI_TEST_SET_REG "$set_reg_guest"
+grep -q '^r15=0xdeadbeefcafef00d$' "$tmpdir/out" \
+  || fail "set_regs: guest did not observe the tool-written r15 sentinel"
+echo "PASS: set_regs (tool overwrites guest r15, guest observes it post-syscall)"
 
 run_tool HERMIT_DBI_NOOP "$identity_policy_guest"
 grep -q '^pid=3 ppid=1 tid=3 identity_fd=open$' "$tmpdir/out" \

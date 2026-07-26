@@ -37,6 +37,7 @@
 
 typedef int64_t (*syscall_invoker_t)(uintptr_t, int64_t, const uint64_t *);
 typedef int32_t (*register_reader_t)(uintptr_t, struct user_regs_struct *);
+typedef int32_t (*register_writer_t)(uintptr_t, const struct user_regs_struct *);
 typedef int32_t (*memory_reader_t)(uintptr_t, uint8_t *, size_t);
 
 typedef struct {
@@ -172,12 +173,12 @@ static void reverie_dbi_emit_stdout(const char *buf, size_t len) {
 extern int32_t reverie_dbi_runtime_thread_init(
     prototype_counters_t *counters, void *context, int32_t tid, int32_t pid,
     uint64_t branches, int32_t defer_runtime, syscall_invoker_t invoke_syscall,
-    register_reader_t read_registers);
+    register_reader_t read_registers, register_writer_t write_registers);
 extern int32_t reverie_dbi_runtime_thread_created(
     prototype_counters_t *counters, void *context, int32_t parent_tid,
     int32_t pid, uint64_t branches, int32_t child_tid, uint64_t child_tid_addr,
     uint64_t flags, syscall_invoker_t invoke_syscall,
-    register_reader_t read_registers);
+    register_reader_t read_registers, register_writer_t write_registers);
 
 extern void reverie_dbi_runtime_thread_exit(prototype_counters_t *counters);
 extern uint64_t reverie_dbi_runtime_image_init(void);
@@ -193,8 +194,8 @@ extern int32_t reverie_dbi_runtime_pre_syscall(
     uint64_t image_generation, int64_t sysnum, const uint64_t *args,
     uint64_t branches, int64_t *result, int64_t *deferred_sysnum,
     uint64_t *deferred_args, syscall_invoker_t invoke_syscall,
-    register_reader_t read_registers, memory_reader_t read_memory,
-    reverie_emit_fn_t emit);
+    register_reader_t read_registers, register_writer_t write_registers,
+    memory_reader_t read_memory, reverie_emit_fn_t emit);
 extern const char *reverie_dbi_runtime_name(void);
 extern void reverie_dbi_runtime_totals(uint64_t *branches, uint64_t *syscalls,
                                        uint64_t *rewritten,
@@ -496,6 +497,8 @@ static void mark_compat_syscall_gateway(void) {
 static int64_t invoke_syscall(uintptr_t context, int64_t sysnum,
                               const uint64_t *args);
 static int32_t read_registers(uintptr_t context, struct user_regs_struct *out);
+static int32_t write_registers(uintptr_t context,
+                               const struct user_regs_struct *in);
 
 // TODO-HUMAN-REVIEW(PR-131): Review the child entry-block scheduling gate.
 static void start_pending_thread(void) {
@@ -509,7 +512,7 @@ static void start_pending_thread(void) {
       counters, drcontext, (int32_t)dr_get_thread_id(drcontext),
       (int32_t)dr_get_process_id(),
       atomic_load_explicit(&branch_count, memory_order_relaxed), 0,
-      invoke_syscall, read_registers);
+      invoke_syscall, read_registers, write_registers);
   // TODO-HUMAN-REVIEW(PR-134): Confirm retryable native child startup.
   if (init_result > 0) {
     counters->pending_thread_start = 2;
@@ -884,6 +887,43 @@ static int32_t read_registers(uintptr_t context, struct user_regs_struct *out) {
   out->rip = (uint64_t)registers.xip;
   out->eflags = registers.xflags;
   out->rsp = registers.xsp;
+  return 1;
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-167): Review the DBI guest register-write callback.
+// The write counterpart to read_registers: overwrite the application's integer
+// register file with the tool-supplied values. DynamoRIO permits dr_set_mcontext
+// from a pre-/post-syscall event, and the modified context is used when the
+// application resumes (the pc/xip field is ignored outside kernel-transfer
+// events, so it is intentionally not written here). Reads the current mcontext
+// first so control/segment fields DynamoRIO manages are preserved.
+static int32_t write_registers(uintptr_t context,
+                               const struct user_regs_struct *in) {
+  dr_mcontext_t registers = {sizeof(registers), DR_MC_ALL};
+  if (!dr_get_mcontext((void *)context, &registers))
+    return 0;
+
+  registers.r15 = in->r15;
+  registers.r14 = in->r14;
+  registers.r13 = in->r13;
+  registers.r12 = in->r12;
+  registers.xbp = in->rbp;
+  registers.xbx = in->rbx;
+  registers.r11 = in->r11;
+  registers.r10 = in->r10;
+  registers.r9 = in->r9;
+  registers.r8 = in->r8;
+  registers.xax = in->rax;
+  registers.xcx = in->rcx;
+  registers.xdx = in->rdx;
+  registers.xsi = in->rsi;
+  registers.xdi = in->rdi;
+  registers.xflags = in->eflags;
+  registers.xsp = in->rsp;
+
+  if (!dr_set_mcontext((void *)context, &registers))
+    return 0;
   return 1;
 }
 
@@ -1547,7 +1587,8 @@ static void post_syscall(void *drcontext, int sysnum) {
           (int32_t)dr_get_process_id(),
           atomic_load_explicit(&branch_count, memory_order_relaxed),
           (int32_t)host_syscall_result, counters->thread_clone_ctid,
-          counters->thread_clone_flags, invoke_syscall, read_registers);
+          counters->thread_clone_flags, invoke_syscall, read_registers,
+          write_registers);
       if (registration < 0) {
         dr_fprintf(diagnostic_file,
                    "reverie-dbi: child thread registration failed\n");
@@ -1710,7 +1751,7 @@ static bool pre_syscall(void *drcontext, int sysnum) {
       (int64_t)sysnum, args,
       atomic_load_explicit(&branch_count, memory_order_relaxed), &result,
       &deferred_sysnum, deferred_args, invoke_syscall, read_registers,
-      read_memory, reverie_dbi_emit);
+      write_registers, read_memory, reverie_dbi_emit);
   if (action != 0 && counters->pending_thread_clone != 0)
     counters->pending_thread_clone = 0;
 
@@ -1790,7 +1831,7 @@ static void thread_init(void *drcontext) {
       counters, drcontext, (int32_t)dr_get_thread_id(drcontext),
       (int32_t)dr_get_process_id(),
       atomic_load_explicit(&branch_count, memory_order_relaxed), 1, invoke_syscall,
-      read_registers);
+      read_registers, write_registers);
   if (init_result < 0) {
     dr_fprintf(diagnostic_file,
                "reverie-dbi: runtime thread initialization failed\n");

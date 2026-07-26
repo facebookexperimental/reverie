@@ -72,6 +72,10 @@ pub type SyscallInvoker = unsafe extern "C" fn(usize, i64, *const u64) -> i64;
 /// Native callback used to translate DynamoRIO's machine context.
 pub type RegisterReader = unsafe extern "C" fn(usize, *mut libc::user_regs_struct) -> i32;
 
+/// Native callback used to overwrite DynamoRIO's machine context. The write
+/// counterpart to [`RegisterReader`]; returns nonzero on success.
+pub type RegisterWriter = unsafe extern "C" fn(usize, *const libc::user_regs_struct) -> i32;
+
 /// Native callback used to copy application memory with DynamoRIO fault handling.
 pub type MemoryReader = unsafe extern "C" fn(usize, *mut u8, usize) -> i32;
 
@@ -133,6 +137,7 @@ where
     config: &'a <T::GlobalState as GlobalTool>::Config,
     invoke_syscall: SyscallInvoker,
     read_registers: RegisterReader,
+    write_registers: RegisterWriter,
     tail_inject_result: Arc<TailInjectResult>,
 }
 
@@ -153,6 +158,7 @@ where
         config: &'a <T::GlobalState as GlobalTool>::Config,
         invoke_syscall: SyscallInvoker,
         read_registers: RegisterReader,
+        write_registers: RegisterWriter,
     ) -> Self {
         Self {
             context,
@@ -165,6 +171,7 @@ where
             config,
             invoke_syscall,
             read_registers,
+            write_registers,
             tail_inject_result: Arc::new(TailInjectResult::default()),
         }
     }
@@ -274,6 +281,22 @@ where
         let read = unsafe { (self.read_registers)(self.context, &mut regs) };
         assert_ne!(read, 0, "DynamoRIO failed to translate the guest registers");
         regs
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-167): Review the DBI guest register-write path.
+    async fn set_regs(&mut self, regs: libc::user_regs_struct) -> Result<(), Error> {
+        // The write counterpart to `regs()`: hand the tool-supplied register
+        // file to the native `dr_set_mcontext` callback. DynamoRIO applies the
+        // modified integer context when the guest resumes from this syscall
+        // stop; the instruction pointer is not written (DynamoRIO ignores it
+        // outside kernel-transfer events), matching `set_regs`'s contract of
+        // controlling the register file at a stop rather than redirecting flow.
+        let wrote = unsafe { (self.write_registers)(self.context, &regs) };
+        if wrote == 0 {
+            return Err(Errno::EIO.into());
+        }
+        Ok(())
     }
 
     async fn stack(&mut self) -> Self::Stack {
@@ -953,6 +976,7 @@ pub fn run_tool_thread_start<T: Tool>(
     config: &<T::GlobalState as GlobalTool>::Config,
     invoke_syscall: SyscallInvoker,
     read_registers: RegisterReader,
+    write_registers: RegisterWriter,
 ) -> Result<(), Error> {
     let mut guest = DbiGuest::new(
         context,
@@ -965,6 +989,7 @@ pub fn run_tool_thread_start<T: Tool>(
         config,
         invoke_syscall,
         read_registers,
+        write_registers,
     );
     let tail_result = Arc::clone(&guest.tail_inject_result);
     run_ready(tool.handle_thread_start(&mut guest), &tail_result)
@@ -984,6 +1009,7 @@ pub fn run_tool_post_exec<T: Tool>(
     config: &<T::GlobalState as GlobalTool>::Config,
     invoke_syscall: SyscallInvoker,
     read_registers: RegisterReader,
+    write_registers: RegisterWriter,
 ) -> Result<(), Errno> {
     let mut guest = DbiGuest::new(
         context,
@@ -996,6 +1022,7 @@ pub fn run_tool_post_exec<T: Tool>(
         config,
         invoke_syscall,
         read_registers,
+        write_registers,
     );
     let tail_result = Arc::clone(&guest.tail_inject_result);
     run_ready(tool.handle_post_exec(&mut guest), &tail_result)
@@ -1038,6 +1065,7 @@ pub fn run_tool_syscall<T: Tool>(
     syscall: Syscall,
     invoke_syscall: SyscallInvoker,
     read_registers: RegisterReader,
+    write_registers: RegisterWriter,
 ) -> Result<DbiSyscallOutcome, Error> {
     let mut guest = DbiGuest::new(
         context,
@@ -1050,6 +1078,7 @@ pub fn run_tool_syscall<T: Tool>(
         config,
         invoke_syscall,
         read_registers,
+        write_registers,
     );
     let tail_result = Arc::clone(&guest.tail_inject_result);
     tail_result.clear();
@@ -1121,6 +1150,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
     _defer_runtime: i32,
     _invoke_syscall: SyscallInvoker,
     _read_registers: RegisterReader,
+    _write_registers: RegisterWriter,
 ) -> i32 {
     unsafe { counters.write(PrototypeCounters::default()) };
     0
@@ -1147,6 +1177,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_created(
     _flags: u64,
     _invoke_syscall: SyscallInvoker,
     _read_registers: RegisterReader,
+    _write_registers: RegisterWriter,
 ) -> i32 {
     0
 }
@@ -1225,6 +1256,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     deferred_args: *mut u64,
     invoke_syscall: SyscallInvoker,
     read_registers: RegisterReader,
+    write_registers: RegisterWriter,
     _read_memory: MemoryReader,
     emit: tools::Emitter,
 ) -> i32 {
@@ -1255,6 +1287,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
             branches,
             invoke_syscall,
             read_registers,
+            write_registers,
         ) {
             return match outcome {
                 DbiSyscallOutcome::Suppress(value) => {
@@ -1295,6 +1328,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
             &CONFIG,
             invoke_syscall,
             read_registers,
+            write_registers,
         );
         // Clear any stale tail-inject result before polling; `tail_inject`
         // records a fresh one just before it suspends.
@@ -1428,6 +1462,35 @@ mod tests {
         1
     }
 
+    /// A register-writer mock that succeeds without recording anything, for
+    /// tests that build a guest but never exercise `set_regs`.
+    unsafe extern "C" fn write_regs_noop(
+        _context: usize,
+        _regs: *const libc::user_regs_struct,
+    ) -> i32 {
+        1
+    }
+
+    /// A register-writer mock that records the exact register file handed to it
+    /// into the `Option<user_regs_struct>` addressed by `context`.
+    unsafe extern "C" fn write_regs_capture(
+        context: usize,
+        regs: *const libc::user_regs_struct,
+    ) -> i32 {
+        let slot = unsafe { &mut *(context as *mut Option<libc::user_regs_struct>) };
+        *slot = Some(unsafe { *regs });
+        1
+    }
+
+    /// A register-writer mock that reports failure, so the guest surfaces the
+    /// backend error path.
+    unsafe extern "C" fn write_regs_fail(
+        _context: usize,
+        _regs: *const libc::user_regs_struct,
+    ) -> i32 {
+        0
+    }
+
     /// A suspending handler (one that returns `Poll::Pending` until another
     /// thread completes it) must resume rather than panic. This mirrors
     /// Detcore's `send_rpc` awaiting the global scheduler: the handler parks
@@ -1494,6 +1557,7 @@ mod tests {
             &CONFIG,
             invoke,
             read_regs,
+            write_regs_noop,
         );
 
         let tail_result = Arc::clone(&guest.tail_inject_result);
@@ -1567,6 +1631,7 @@ mod tests {
                 &CONFIG,
                 invoke_expected,
                 read_regs,
+                write_regs_noop,
             );
             let tail_result = Arc::clone(&guest.tail_inject_result);
             let outcome = run_ready(
@@ -1603,6 +1668,7 @@ mod tests {
             &CONFIG,
             invoke_uname,
             read_regs,
+            write_regs_noop,
         );
 
         let tail_result = Arc::clone(&guest.tail_inject_result);
@@ -1769,6 +1835,7 @@ mod tests {
             &CONFIG,
             invoke,
             read_regs,
+            write_regs_noop,
         );
 
         // `tail_inject` records the exact syscall for native execution after
@@ -1815,6 +1882,67 @@ mod tests {
                 "{number:?} must use DynamoRIO's original lifecycle path"
             );
         }
+    }
+
+    #[test]
+    fn set_regs_forwards_exact_register_file_to_native_writer() {
+        let mut counters = PrototypeCounters::default();
+        let mut captured: Option<libc::user_regs_struct> = None;
+        let context = &mut captured as *mut Option<libc::user_regs_struct> as usize;
+        let mut guest: DbiGuest<'_, PrototypeTool> = DbiGuest::new(
+            context,
+            Pid::from_raw(10),
+            Pid::from_raw(10),
+            None,
+            0,
+            &mut counters,
+            &GLOBAL_STATE,
+            &CONFIG,
+            invoke,
+            read_regs,
+            write_regs_capture,
+        );
+
+        let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+        regs.r15 = 0xDEAD_BEEF_CAFE_F00D;
+        regs.rdi = 0x1111_2222_3333_4444;
+        regs.rip = 0x5555_6666_7777_8888;
+        let tail_result = TailInjectResult::default();
+        let outcome = run_ready(guest.set_regs(regs), &tail_result)
+            .expect("set_regs must resolve without suspending");
+        assert!(outcome.is_ok(), "successful writer must yield Ok");
+
+        let written = captured.expect("native writer must have been invoked");
+        assert_eq!(written.r15, 0xDEAD_BEEF_CAFE_F00D);
+        assert_eq!(written.rdi, 0x1111_2222_3333_4444);
+        assert_eq!(written.rip, 0x5555_6666_7777_8888);
+    }
+
+    #[test]
+    fn set_regs_surfaces_writer_failure_as_errno() {
+        let mut counters = PrototypeCounters::default();
+        let mut guest: DbiGuest<'_, PrototypeTool> = DbiGuest::new(
+            0,
+            Pid::from_raw(10),
+            Pid::from_raw(10),
+            None,
+            0,
+            &mut counters,
+            &GLOBAL_STATE,
+            &CONFIG,
+            invoke,
+            read_regs,
+            write_regs_fail,
+        );
+
+        let regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+        let tail_result = TailInjectResult::default();
+        let outcome = run_ready(guest.set_regs(regs), &tail_result)
+            .expect("set_regs must resolve without suspending");
+        assert!(
+            matches!(outcome, Err(Error::Errno(Errno::EIO))),
+            "a failing native writer must surface EIO, got {outcome:?}"
+        );
     }
 
     #[test]
