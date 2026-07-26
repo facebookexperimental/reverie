@@ -13,6 +13,7 @@ use clap::Parser;
 use clap::ValueEnum;
 use reverie_process::Command;
 use reverie_process::ExitStatus;
+use reverie_sabre_strace_plugin::CounterTool;
 
 const TOOL_ENV: &str = "REVERIE_SABRE_TOOL";
 
@@ -65,6 +66,22 @@ impl Args {
         let mut command = Command::new(&self.command[0]);
         command.args(&self.command[1..]);
         command.env(TOOL_ENV, self.tool.as_str());
+
+        let counter = match self.tool {
+            ToolKind::Counter1 => Some(CounterTool::Counter1),
+            ToolKind::Counter2 => Some(CounterTool::Counter2),
+            ToolKind::Strace | ToolKind::Noop => None,
+        };
+        if let Some(counter) = counter {
+            return reverie_sabre_strace_plugin::run_counter(
+                counter,
+                command,
+                self.sabre,
+                self.plugin,
+            )
+            .await;
+        }
+
         let mut child = reverie_host::TracerBuilder::new(command)
             .sabre(self.sabre)
             .plugin(self.plugin)

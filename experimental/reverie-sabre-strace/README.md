@@ -35,7 +35,9 @@ Supported values are:
 - `strace` (default): decode and print syscalls and results. Exec paths and
   argv are decoded, while envp is redacted because it commonly contains
   credentials.
-- `counter1`: print the number of intercepted syscalls.
+- `counter1`: print one process-tree total of intercepted syscalls.
+- `counter2`: print one process-tree total with observed process and thread
+  identities.
 - `noop`: forward syscalls through the default shared Tool handler.
 
 Hermit uses the same artifacts through `HERMIT_SABRE_RUNNER`,
@@ -62,11 +64,10 @@ It targets dynamically linked Linux x86-64 guests and synchronous Reverie
 handlers. A handler must complete on its first poll; `tail_inject` is the only
 supported pending future.
 
-Counter summaries are emitted before the terminal syscall because the legacy
-SaBRe callback API has no process-exit event. Fork children retain the selected
-tool when their process-local plugin is rebuilt. Without an external
-coordinator such as `riptrace`, every SaBRe process still owns a separate
-adapter and counter.
+The counter host owns one external `GlobalTool` and emits its process-tree
+summary after the root guest exits. Fork and exec children reconnect their
+process-local adapters to that coordinator, so counter state is shared without
+copying process-local plugin state.
 
 `noop` requests `Subscription::none()`, but the legacy SaBRe loader does not
 yet consult subscriptions, so rewritten syscall sites still enter the default

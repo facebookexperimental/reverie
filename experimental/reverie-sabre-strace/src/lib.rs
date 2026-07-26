@@ -10,12 +10,17 @@
 
 mod tools;
 
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
 use reverie::Error;
+use reverie::GlobalTool;
 use reverie::Guest;
 use reverie::Tool as ReverieTool;
+use reverie_process::Command;
+use reverie_process::ExitStatus;
 use reverie_sabre as sabre;
 use reverie_syscalls::Displayable;
 use reverie_syscalls::LocalMemory;
@@ -27,6 +32,106 @@ use syscalls::Errno;
 /// Suppress syscall diagnostics while retaining the same shared Tool path.
 pub const QUIET_ENV: &str = "REVERIE_SABRE_STRACE_QUIET";
 static QUIET: AtomicBool = AtomicBool::new(false);
+
+const COUNTER_RPC_SOCKET_ENV: &str = "REVERIE_SABRE_EXAMPLE_RPC_SOCKET";
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-160): Review the host-side example-counter coordinator API.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CounterTool {
+    Counter1,
+    Counter2,
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-160): Review the host-side example-counter coordinator lifecycle.
+pub async fn run_counter(
+    kind: CounterTool,
+    command: Command,
+    sabre: Option<PathBuf>,
+    plugin: Option<PathBuf>,
+) -> anyhow::Result<ExitStatus> {
+    match kind {
+        CounterTool::Counter1 => {
+            let global = Arc::new(tools::Counter1Global::default());
+            let status = run_coordinated(
+                command,
+                sabre,
+                plugin,
+                global.clone(),
+                tools::CounterConfig::coordinated(),
+            )
+            .await?;
+            eprintln!(
+                " [counter tool] Total system calls in process tree: {}",
+                global.total()
+            );
+            Ok(status)
+        }
+        CounterTool::Counter2 => {
+            let global = Arc::new(tools::Counter2Global::default());
+            let status = run_coordinated(
+                command,
+                sabre,
+                plugin,
+                global.clone(),
+                tools::CounterConfig::coordinated(),
+            )
+            .await?;
+            let summary = global.summary();
+            eprintln!(
+                " [counter tool] Total system calls in process tree: {}, from {} processes, {} thread(s).",
+                summary.total_syscalls, summary.processes, summary.threads
+            );
+            Ok(status)
+        }
+    }
+}
+
+async fn run_coordinated<G>(
+    mut command: Command,
+    sabre: Option<PathBuf>,
+    plugin: Option<PathBuf>,
+    global: Arc<G>,
+    config: G::Config,
+) -> anyhow::Result<ExitStatus>
+where
+    G: GlobalTool + 'static,
+{
+    let socket_dir = tempfile::Builder::new()
+        .prefix("reverie-sabre-counter-")
+        .tempdir()?;
+    let socket_path = socket_dir.path().join("coordinator.sock");
+    let retained_references = Arc::strong_count(&global);
+    let server = reverie_rpc_transport::RpcServer::bind(&socket_path, global.clone(), config)?;
+    let server_task = tokio::spawn(async move { server.serve().await });
+
+    command.env(COUNTER_RPC_SOCKET_ENV, &socket_path);
+    let result: anyhow::Result<ExitStatus> = async {
+        let mut child = reverie_host::TracerBuilder::new(command)
+            .sabre(sabre)
+            .plugin(plugin)
+            .spawn()?;
+        Ok(child.wait().await?)
+    }
+    .await;
+
+    server_task.abort();
+    match server_task.await {
+        Err(error) if error.is_cancelled() => {}
+        Err(error) => return Err(error.into()),
+        Ok(Err(error)) => return Err(error.into()),
+        Ok(Ok(())) => {}
+    }
+
+    // Accepted connection tasks outlive the listener. Keep their runtime alive
+    // until connected descendants finish and release the shared GlobalTool.
+    while Arc::strong_count(&global) > retained_references {
+        tokio::task::yield_now().await;
+    }
+
+    result
+}
 
 /// Minimal shared Reverie tool that prints every intercepted syscall.
 #[derive(Default)]

@@ -17,9 +17,9 @@ shared example tools, but it is not a drop-in replacement for
 | Process exit | `exit_group` requests orderly exit from tracked threads, then issues a real kernel `exit_group` so threads that never reached an interception boundary cannot survive. Configurable timeout handling is supported. |
 | Signals | Central handlers mediate standard catchable signals. Guest `rt_sigaction` registration and query are virtualized, including `SA_RESTART`. Linux default ignore, continue, stop, and terminate dispositions are preserved. |
 | Signal exclusion | The kernel handler only enqueues fixed-size events. Tool and guest callbacks drain from normal runtime context; bounded-queue overflow coalesces standard signals. |
-| Fork and exec | Forked children lazily construct the same selected Tool with new process-local state and RPC transport. `execve` re-enters the pinned SaBRe loader so the plugin remains active across the new image. `execveat` remains unsupported. |
+| Fork and exec | Forked children lazily construct the same selected Tool with new process-local adapter state and RPC transport. Shared example counters reconnect to their host-owned `GlobalTool`. `execve` re-enters the pinned SaBRe loader so the plugin remains active across the new image. `execveat` remains unsupported. |
 | Timing and detours | Supports RDTSC callbacks, selected VDSO callbacks, and macro-generated function detours. |
-| Global state | Uses a synchronous generated RPC client to a host-side service. The channel is process-local and recreated after fork. |
+| Global state | Legacy plugins use a synchronous generated RPC client to a host-side service. Shared example counters use `reverie-rpc-transport` to keep one `GlobalTool` in the host; each guest thread opens a process-local connection and reconnects after fork or exec. |
 | Loader inputs | Validated with dynamically linked x86-64 guests and the loader revision in `SABRE_UPSTREAM.toml`. |
 
 SIGCHLD keeps children waitable when its guest disposition is `SIG_DFL`.
@@ -77,9 +77,10 @@ flags.
 | `counter2` | PASS, exit 0 (21 syscalls observed) | PASS, exact guest output and exit 0 (102 syscalls observed) | PASS, exit 0 (108 syscalls observed) | PASS, guest exit 7 propagated (153 syscalls observed) |
 | `noop` | PASS, exit 0 | PASS, exact guest output and exit 0 | PASS, exit 0 | PASS, guest exit 7 propagated |
 
-The process-local `counter2` mode also observed 1,392 syscalls from 129 unique
-threads while the 128-worker `thread_lifecycle` workload completed. Counter
-state is not aggregated across forked plugin processes.
+The shared `counter2` coordinator also aggregates forked process trees. A
+`/bin/sh` workload that starts `/bin/true` in a child and waits for it
+produces one summary covering two process identities and two thread
+identities.
 
 These are L0 compatibility observations for the synchronous SaBRe adapter.
 The example runner does not implement Reverie's generic `Backend` contract and

@@ -10,6 +10,7 @@
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
@@ -21,6 +22,7 @@ use reverie::Guest;
 use reverie::Pid;
 use reverie::Subscription;
 use reverie::Tool as ReverieTool;
+use reverie_sabre::RemoteReverieAdapter;
 use reverie_sabre::ReverieAdapter;
 use reverie_syscalls::Syscall;
 use reverie_syscalls::SyscallInfo;
@@ -29,6 +31,7 @@ use serde::Serialize;
 use syscalls::Errno;
 use syscalls::Sysno;
 
+use super::COUNTER_RPC_SOCKET_ENV;
 use super::StraceTool;
 
 /// Environment variable selecting the shared tool hosted by the plugin.
@@ -37,6 +40,35 @@ pub(super) const TOOL_ENV: &str = "REVERIE_SABRE_TOOL";
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-158): Review fork-inherited example-tool selection.
 static SELECTED_TOOL: OnceLock<ToolKind> = OnceLock::new();
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-160): Review fork-inherited counter coordinator discovery.
+static COUNTER_RPC_SOCKET: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub(super) struct CounterConfig {
+    print_process_local_summary: bool,
+}
+
+impl Default for CounterConfig {
+    fn default() -> Self {
+        Self::process_local()
+    }
+}
+
+impl CounterConfig {
+    fn process_local() -> Self {
+        Self {
+            print_process_local_summary: true,
+        }
+    }
+
+    pub(super) fn coordinated() -> Self {
+        Self {
+            print_process_local_summary: false,
+        }
+    }
+}
 
 /// Shared Reverie tool implementations available through the SaBRe runner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,6 +118,23 @@ impl ToolKind {
     }
 }
 
+fn coordinator_socket() -> Option<PathBuf> {
+    if let Some(path) = COUNTER_RPC_SOCKET.get() {
+        return path.clone();
+    }
+
+    // SAFETY: Plugin construction runs before SaBRe starts guest callbacks.
+    let requested = unsafe { reverie_sabre::take_private_env(COUNTER_RPC_SOCKET_ENV) };
+    remember_coordinator_socket(&COUNTER_RPC_SOCKET, requested.as_deref())
+}
+
+fn remember_coordinator_socket(
+    slot: &OnceLock<Option<PathBuf>>,
+    requested: Option<&OsStr>,
+) -> Option<PathBuf> {
+    slot.get_or_init(|| requested.map(PathBuf::from)).clone()
+}
+
 #[derive(Debug, Default)]
 pub(super) struct Counter1Global {
     num_syscalls: AtomicU64,
@@ -98,7 +147,7 @@ pub(super) struct Counter1Request(Sysno);
 impl GlobalTool for Counter1Global {
     type Request = Counter1Request;
     type Response = u64;
-    type Config = ();
+    type Config = CounterConfig;
 
     async fn init_global_state(_config: &Self::Config) -> Self {
         Self::default()
@@ -106,6 +155,12 @@ impl GlobalTool for Counter1Global {
 
     async fn receive_rpc(&self, _from: Pid, Counter1Request(_sysno): Counter1Request) -> u64 {
         self.num_syscalls.fetch_add(1, Ordering::SeqCst) + 1
+    }
+}
+
+impl Counter1Global {
+    pub(super) fn total(&self) -> u64 {
+        self.num_syscalls.load(Ordering::SeqCst)
     }
 }
 
@@ -123,7 +178,7 @@ impl ReverieTool for Counter1Tool {
         syscall: Syscall,
     ) -> Result<i64, Error> {
         let count = guest.send_rpc(Counter1Request(syscall.number())).await;
-        if is_terminal(syscall) {
+        if is_terminal(syscall) && guest.config().print_process_local_summary {
             nostd_print::eprintln!(" [counter tool] Total system calls in plugin process: {count}");
         }
         guest.tail_inject(syscall).await
@@ -134,9 +189,9 @@ impl ReverieTool for Counter1Tool {
 // TODO-HUMAN-REVIEW(PR-142): Review counter2 state, RPC, and scope semantics.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub(super) struct Counter2Summary {
-    total_syscalls: u64,
-    processes: u64,
-    threads: u64,
+    pub(super) total_syscalls: u64,
+    pub(super) processes: u64,
+    pub(super) threads: u64,
 }
 
 #[derive(Debug, Default)]
@@ -161,7 +216,7 @@ pub(super) struct Counter2Request {
 impl GlobalTool for Counter2Global {
     type Request = Counter2Request;
     type Response = Counter2Summary;
-    type Config = ();
+    type Config = CounterConfig;
 
     async fn init_global_state(_config: &Self::Config) -> Self {
         Self::default()
@@ -172,6 +227,17 @@ impl GlobalTool for Counter2Global {
         state.total_syscalls += 1;
         state.processes.insert(request.pid);
         state.threads.insert(request.tid);
+        Counter2Summary {
+            total_syscalls: state.total_syscalls,
+            processes: state.processes.len() as u64,
+            threads: state.threads.len() as u64,
+        }
+    }
+}
+
+impl Counter2Global {
+    pub(super) fn summary(&self) -> Counter2Summary {
+        let state = self.inner.lock().unwrap();
         Counter2Summary {
             total_syscalls: state.total_syscalls,
             processes: state.processes.len() as u64,
@@ -200,7 +266,7 @@ impl ReverieTool for Counter2Tool {
                 tid: guest.tid().as_raw(),
             })
             .await;
-        if is_terminal(syscall) {
+        if is_terminal(syscall) && guest.config().print_process_local_summary {
             nostd_print::eprintln!(
                 " [counter2 tool] Total system calls in plugin process: {}, from {} process identity, {} thread(s).",
                 summary.total_syscalls,
@@ -231,8 +297,10 @@ fn is_terminal(syscall: Syscall) -> bool {
 
 pub(crate) enum SharedAdapter {
     Strace(ReverieAdapter<StraceTool>),
-    Counter1(ReverieAdapter<Counter1Tool>),
-    Counter2(ReverieAdapter<Counter2Tool>),
+    Counter1Local(ReverieAdapter<Counter1Tool>),
+    Counter1Remote(RemoteReverieAdapter<Counter1Tool>),
+    Counter2Local(ReverieAdapter<Counter2Tool>),
+    Counter2Remote(RemoteReverieAdapter<Counter2Tool>),
     Noop(ReverieAdapter<NoopTool>),
 }
 
@@ -240,25 +308,59 @@ impl SharedAdapter {
     pub(crate) fn new(kind: ToolKind, quiet: bool) -> Self {
         match kind {
             ToolKind::Strace => Self::Strace(ReverieAdapter::new(StraceTool { quiet }, (), ())),
-            ToolKind::Counter1 => Self::Counter1(ReverieAdapter::new(
-                Counter1Tool,
-                Counter1Global::default(),
-                (),
-            )),
-            ToolKind::Counter2 => Self::Counter2(ReverieAdapter::new(
-                Counter2Tool,
-                Counter2Global::default(),
-                (),
-            )),
+            ToolKind::Counter1 => coordinator_socket().map_or_else(
+                Self::counter1_local,
+                |path| match RemoteReverieAdapter::connect(&path) {
+                    Ok(adapter) => Self::Counter1Remote(adapter),
+                    Err(error) => {
+                        nostd_print::eprintln!(
+                            "reverie-sabre: counter1 coordinator {} unavailable ({error}); using process-local state",
+                            path.display()
+                        );
+                        Self::counter1_local()
+                    }
+                },
+            ),
+            ToolKind::Counter2 => coordinator_socket().map_or_else(
+                Self::counter2_local,
+                |path| match RemoteReverieAdapter::connect(&path) {
+                    Ok(adapter) => Self::Counter2Remote(adapter),
+                    Err(error) => {
+                        nostd_print::eprintln!(
+                            "reverie-sabre: counter2 coordinator {} unavailable ({error}); using process-local state",
+                            path.display()
+                        );
+                        Self::counter2_local()
+                    }
+                },
+            ),
             ToolKind::Noop => Self::Noop(ReverieAdapter::new(NoopTool, (), ())),
         }
+    }
+
+    fn counter1_local() -> Self {
+        Self::Counter1Local(ReverieAdapter::new(
+            Counter1Tool,
+            Counter1Global::default(),
+            CounterConfig::process_local(),
+        ))
+    }
+
+    fn counter2_local() -> Self {
+        Self::Counter2Local(ReverieAdapter::new(
+            Counter2Tool,
+            Counter2Global::default(),
+            CounterConfig::process_local(),
+        ))
     }
 
     pub(crate) fn handle_syscall(&self, syscall: Syscall) -> Result<usize, Errno> {
         match self {
             Self::Strace(adapter) => adapter.handle_syscall(syscall),
-            Self::Counter1(adapter) => adapter.handle_syscall(syscall),
-            Self::Counter2(adapter) => adapter.handle_syscall(syscall),
+            Self::Counter1Local(adapter) => adapter.handle_syscall(syscall),
+            Self::Counter1Remote(adapter) => adapter.handle_syscall(syscall),
+            Self::Counter2Local(adapter) => adapter.handle_syscall(syscall),
+            Self::Counter2Remote(adapter) => adapter.handle_syscall(syscall),
             Self::Noop(adapter) => adapter.handle_syscall(syscall),
         }
     }
@@ -273,8 +375,10 @@ impl SharedAdapter {
     {
         match self {
             Self::Strace(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
-            Self::Counter1(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
-            Self::Counter2(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
+            Self::Counter1Local(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
+            Self::Counter1Remote(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
+            Self::Counter2Local(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
+            Self::Counter2Remote(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
             Self::Noop(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
         }
     }
@@ -282,8 +386,10 @@ impl SharedAdapter {
     pub(crate) fn handle_thread_start(&self, thread_id: u32) {
         match self {
             Self::Strace(adapter) => adapter.handle_thread_start(thread_id),
-            Self::Counter1(adapter) => adapter.handle_thread_start(thread_id),
-            Self::Counter2(adapter) => adapter.handle_thread_start(thread_id),
+            Self::Counter1Local(adapter) => adapter.handle_thread_start(thread_id),
+            Self::Counter1Remote(adapter) => adapter.handle_thread_start(thread_id),
+            Self::Counter2Local(adapter) => adapter.handle_thread_start(thread_id),
+            Self::Counter2Remote(adapter) => adapter.handle_thread_start(thread_id),
             Self::Noop(adapter) => adapter.handle_thread_start(thread_id),
         }
     }
@@ -291,8 +397,10 @@ impl SharedAdapter {
     pub(crate) fn handle_thread_exit(&self, thread_id: u32) {
         match self {
             Self::Strace(adapter) => adapter.handle_thread_exit(thread_id),
-            Self::Counter1(adapter) => adapter.handle_thread_exit(thread_id),
-            Self::Counter2(adapter) => adapter.handle_thread_exit(thread_id),
+            Self::Counter1Local(adapter) => adapter.handle_thread_exit(thread_id),
+            Self::Counter1Remote(adapter) => adapter.handle_thread_exit(thread_id),
+            Self::Counter2Local(adapter) => adapter.handle_thread_exit(thread_id),
+            Self::Counter2Remote(adapter) => adapter.handle_thread_exit(thread_id),
             Self::Noop(adapter) => adapter.handle_thread_exit(thread_id),
         }
     }
@@ -317,6 +425,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn coordinator_socket_survives_plugin_reinitialization() {
+        let selected = OnceLock::new();
+
+        assert_eq!(
+            remember_coordinator_socket(&selected, Some(OsStr::new("/tmp/coordinator.sock"))),
+            Some(PathBuf::from("/tmp/coordinator.sock"))
+        );
+        assert_eq!(
+            remember_coordinator_socket(&selected, None),
+            Some(PathBuf::from("/tmp/coordinator.sock"))
+        );
+    }
+
     #[tokio::test]
     async fn counter1_returns_the_updated_total() {
         let global = Counter1Global::default();
@@ -333,6 +455,7 @@ mod tests {
                 .await,
             2
         );
+        assert_eq!(global.total(), 2);
     }
 
     #[tokio::test]
