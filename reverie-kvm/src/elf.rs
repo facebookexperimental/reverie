@@ -87,6 +87,15 @@ pub(crate) struct LoadedStaticElf {
     pub cloexec_fds: std::collections::BTreeSet<i32>,
     pub closed_standard_fds: std::collections::BTreeSet<i32>,
     pub children: std::collections::BTreeMap<i32, i32>,
+    // AUTONOMOUS-BOT-IMPLEMENTED: Track memfd-backed synthetic /proc descriptors.
+    // TODO-HUMAN-REVIEW(reverie-kvm): Review synthetic /proc determinism.
+    //
+    // Maps a guest fd opened on a synthesized /proc file to the deterministic
+    // inode reported for it. The descriptor itself lives in `files` as an
+    // ordinary memfd, so read/lseek/close/dup/fork reuse the real-file paths;
+    // this side table only marks which fds must report stable, synthesized
+    // metadata instead of the memfd's per-run inode.
+    pub proc_files: std::collections::BTreeMap<i32, u64>,
 }
 
 impl LoadedStaticElf {
@@ -126,6 +135,7 @@ impl LoadedStaticElf {
             cloexec_fds: self.cloexec_fds.clone(),
             closed_standard_fds: self.closed_standard_fds.clone(),
             children: std::collections::BTreeMap::new(),
+            proc_files: self.proc_files.clone(),
         })
     }
 
@@ -146,6 +156,11 @@ impl LoadedStaticElf {
             .stderr_alias_fds
             .into_iter()
             .filter(|fd| !cloexec_fds.contains(fd) && files.contains_key(fd))
+            .collect();
+        let proc_files: std::collections::BTreeMap<_, _> = previous
+            .proc_files
+            .into_iter()
+            .filter(|(fd, _)| files.contains_key(fd))
             .collect();
         let mut closed_standard_fds = previous.closed_standard_fds;
         if cloexec_fds.contains(&libc::STDIN_FILENO) {
@@ -189,6 +204,7 @@ impl LoadedStaticElf {
         self.cloexec_fds = std::collections::BTreeSet::new();
         self.closed_standard_fds = closed_standard_fds;
         self.children = previous.children;
+        self.proc_files = proc_files;
     }
 }
 
@@ -331,6 +347,7 @@ pub(crate) fn load_static_elf(
         cloexec_fds: std::collections::BTreeSet::new(),
         closed_standard_fds: std::collections::BTreeSet::new(),
         children: std::collections::BTreeMap::new(),
+        proc_files: std::collections::BTreeMap::new(),
     })
 }
 
