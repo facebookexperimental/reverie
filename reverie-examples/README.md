@@ -63,6 +63,7 @@ Run the exact example `Tool` implementations through `LiteinstBackend`:
 
 ```sh
 target/debug/reverie-liteinst-examples --tool noop -- /bin/echo hello
+target/debug/reverie-liteinst-examples --tool chaos --skip 200 --no-interrupt -- target/debug/reverie-liteinst-env-guest exercise-chaos-read
 target/debug/reverie-liteinst-examples --tool counter1 -- /bin/echo hello
 target/debug/reverie-liteinst-examples --tool chunky-print -- /bin/echo hello
 target/debug/reverie-liteinst-examples --tool counter2 -- /bin/echo hello

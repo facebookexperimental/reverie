@@ -23,6 +23,40 @@ pub(crate) use example_tools::config;
 pub(crate) use example_tools::filter;
 pub(crate) use example_tools::global_state;
 
+#[derive(Debug, Default, clap::Args)]
+struct ChaosCliOptions {
+    /// Skips the first N syscalls before doing any intervention.
+    #[clap(long, value_name = "N")]
+    skip: Option<u64>,
+
+    /// Does not modify read-like system calls.
+    #[clap(long)]
+    no_read: bool,
+
+    /// Does not modify recv-like system calls.
+    #[clap(long)]
+    no_recv: bool,
+
+    /// Does not inject interrupted-read errors.
+    #[clap(long)]
+    no_interrupt: bool,
+}
+
+impl ChaosCliOptions {
+    fn was_supplied(&self) -> bool {
+        self.skip.is_some() || self.no_read || self.no_recv || self.no_interrupt
+    }
+
+    fn into_config(self) -> example_tools::ChaosOpts {
+        example_tools::ChaosOpts::for_liteinst(
+            self.skip,
+            self.no_read,
+            self.no_recv,
+            self.no_interrupt,
+        )
+    }
+}
+
 #[derive(Debug, Parser)]
 #[clap(trailing_var_arg = true)]
 struct Args {
@@ -35,6 +69,10 @@ struct Args {
     #[clap(long = "trace")]
     filters: Vec<String>,
 
+    // TODO-HUMAN-REVIEW(PR-157): Review the production chaos option surface.
+    #[clap(flatten)]
+    chaos_options: ChaosCliOptions,
+
     #[clap(required = true, num_args = 1.., allow_hyphen_values = true)]
     command: Vec<String>,
 }
@@ -45,6 +83,10 @@ async fn main() -> anyhow::Result<()> {
     if args.tool != example_tools::ToolKind::Strace && !args.filters.is_empty() {
         bail!("--trace is only valid with --tool strace");
     }
+    if args.tool != example_tools::ToolKind::Chaos && args.chaos_options.was_supplied() {
+        bail!("chaos options are only valid with --tool chaos");
+    }
+    let chaos_options = args.chaos_options.into_config();
 
     let preload = match args.preload {
         Some(path) => path,
@@ -52,7 +94,8 @@ async fn main() -> anyhow::Result<()> {
     };
     let mut command = Command::new(&args.command[0]);
     command.args(&args.command[1..]);
-    let result = example_tools::run(args.tool, command, args.filters, preload).await?;
+    let result =
+        example_tools::run(args.tool, command, args.filters, chaos_options, preload).await?;
 
     std::io::stdout().write_all(&result.output.stdout)?;
     std::io::stderr().write_all(&result.output.stderr)?;

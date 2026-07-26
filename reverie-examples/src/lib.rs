@@ -19,6 +19,10 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 #[allow(dead_code)]
+#[path = "../chaos.rs"]
+mod chaos;
+
+#[allow(dead_code)]
 #[path = "../chunky_print.rs"]
 mod chunky_print;
 #[allow(dead_code)]
@@ -95,6 +99,10 @@ unsafe extern "C" fn initialize(
     let socket = bootstrap.coordinator;
 
     let result = match selected.as_str() {
+        // TODO-HUMAN-REVIEW(PR-157): Review chaos preload tool selection.
+        "chaos" => unsafe {
+            reverie_liteinst::install_tool_from_bootstrap::<chaos::ChaosTool>(&socket)
+        },
         "counter1" => unsafe {
             reverie_liteinst::install_tool_from_bootstrap::<counter1::CounterLocal>(&socket)
         },
