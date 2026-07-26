@@ -170,6 +170,14 @@ async fn initialization_error(pid: Pid, err: TraceError) -> Error {
     }
 }
 
+fn report_pre_exec_capability_error(message: &'static [u8]) -> Errno {
+    let errno = Errno::last();
+    // SAFETY: write is async-signal-safe and message has static storage. This
+    // runs after fork, where tracing and allocation are not safe.
+    let _ = unsafe { libc::write(libc::STDERR_FILENO, message.as_ptr().cast(), message.len()) };
+    errno
+}
+
 /// Sets up the child process for ptracing right before execve is called.
 fn init_tracee(intercept_rdtsc: bool) -> Result<(), Errno> {
     // NOTE: There should be *NO* allocations along the happy path here.
@@ -184,16 +192,25 @@ fn init_tracee(intercept_rdtsc: bool) -> Result<(), Errno> {
         // Intercepting rdtsc is only possible on x86
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            assert_eq!(
-                libc::prctl(libc::PR_SET_TSC, libc::PR_TSC_SIGSEGV, 0, 0, 0),
-                0
-            )
+            if libc::prctl(libc::PR_SET_TSC, libc::PR_TSC_SIGSEGV, 0, 0, 0) != 0 {
+                return Err(report_pre_exec_capability_error(
+                    b"ERROR: Reverie could not enable RDTSC interception with prctl(PR_SET_TSC)\n",
+                ));
+            }
         };
     }
 
     unsafe {
-        assert!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0);
-        assert!(libc::personality(PER_LINUX | ADDR_NO_RANDOMIZE) != -1);
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+            return Err(report_pre_exec_capability_error(
+                b"ERROR: Reverie could not enable PR_SET_NO_NEW_PRIVS for seccomp interception\n",
+            ));
+        }
+        if libc::personality(PER_LINUX | ADDR_NO_RANDOMIZE) == -1 {
+            return Err(report_pre_exec_capability_error(
+                b"ERROR: Reverie could not disable address-space randomization with personality(2)\n",
+            ));
+        }
     }
 
     // FIXME: This is a hacky workaround for `std::process::Command::spawn`

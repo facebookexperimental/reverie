@@ -941,14 +941,14 @@ impl<L: Tool + 'static> TracedTask<L> {
                     Ok(()) => match self.cpuid_state().await {
                         Ok(0) => true,
                         Ok(state) => {
-                            tracing::warn!(
+                            tracing::error!(
                                 state,
                                 "ARCH_SET_CPUID succeeded but ARCH_GET_CPUID did not report the disabled state; continuing without CPUID interception"
                             );
                             false
                         }
                         Err(err) => {
-                            tracing::warn!(
+                            tracing::error!(
                                 "Unable to verify ARCH_SET_CPUID with ARCH_GET_CPUID: {}; continuing without CPUID interception",
                                 err
                             );
@@ -956,14 +956,14 @@ impl<L: Tool + 'static> TracedTask<L> {
                         }
                     },
                     Err(Errno::ENODEV) => {
-                        tracing::warn!(
+                        tracing::error!(
                             initial_state,
                             "ARCH_GET_CPUID reported a valid state, but ARCH_SET_CPUID returned ENODEV. The kernel exposes CPUID state without hardware faulting support. On AMD hosts, use Linux 6.17+ upstream or a kernel with CPUID faulting backported; continuing without CPUID interception"
                         );
                         false
                     }
                     Err(err) => {
-                        tracing::warn!(
+                        tracing::error!(
                             "Unable to disable CPUID after ARCH_GET_CPUID reported a valid state: {}; continuing without CPUID interception",
                             err
                         );
@@ -971,20 +971,20 @@ impl<L: Tool + 'static> TracedTask<L> {
                     }
                 },
                 Ok(state) => {
-                    tracing::warn!(
+                    tracing::error!(
                         state,
                         "ARCH_GET_CPUID returned an unexpected state; continuing without CPUID interception"
                     );
                     false
                 }
                 Err(Errno::ENODEV) => {
-                    tracing::warn!(
+                    tracing::error!(
                         "CPUID faulting is unavailable: arch_prctl(ARCH_GET_CPUID) returned ENODEV. On AMD hosts, use Linux 6.17+ upstream or a kernel with CPUID faulting backported; continuing without CPUID interception"
                     );
                     false
                 }
                 Err(err) => {
-                    tracing::warn!(
+                    tracing::error!(
                         "Unable to query CPUID faulting with arch_prctl(ARCH_GET_CPUID): {}; continuing without CPUID interception",
                         err
                     );

@@ -34,7 +34,7 @@ use perf_event_open_sys::bindings as perf;
 use perf_event_open_sys::ioctls;
 use reverie::Errno;
 use reverie::Tid;
-use tracing::info;
+use tracing::error;
 use tracing::warn;
 
 use crate::validation::PmuValidationError;
@@ -254,7 +254,10 @@ impl Builder {
 
     pub(crate) fn check_for_pmu_bugs(&mut self) -> &mut Self {
         if let Err(pmu_error) = &*PMU_BUG {
-            warn!("Pmu bugs detected: {:?}", pmu_error);
+            error!(
+                error = ?pmu_error,
+                "PMU validation failed; RCB timers may be unreliable"
+            );
         }
         self
     }
@@ -507,7 +510,10 @@ fn smp_rmb() {
 fn handle_perf_pmu_error(errno: Errno) -> bool {
     match errno {
         Errno::ENOENT | Errno::EPERM | Errno::EACCES | Errno::ENOSYS => {
-            info!("Perf feature check failed due to {errno}");
+            warn!(
+                %errno,
+                "PMU hardware-event capability probe failed; performance counters are unavailable"
+            );
         }
         _ => {
             warn!("Perf feature check failed unexpectedly due to {errno}; assuming unsupported");
