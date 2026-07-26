@@ -33,6 +33,7 @@ set_reg_guest="$tmpdir/set-reg-probe"
 ppid_guest="$tmpdir/ppid-probe"
 identity_policy_guest="$tmpdir/identity-policy"
 fork_pthread_guest="$tmpdir/fork-pthread-identity"
+fork_clock_resource_guest="$tmpdir/fork-clock-resource"
 blocked_exit_guest="$tmpdir/blocked-exit-group"
 simultaneous_exit_guest="$tmpdir/simultaneous-exit-group"
 chaos_read_guest="$tmpdir/chaos-read-file"
@@ -49,6 +50,8 @@ chaos_data="$tmpdir/chaos-data.txt"
   "$crate_dir/tests/fixtures/identity_policy.c" -o "$identity_policy_guest"
 "${CC:-cc}" -O2 -g -std=c11 -Wall -Wextra -Werror -pthread \
   "$crate_dir/tests/fixtures/fork_pthread_identity.c" -o "$fork_pthread_guest"
+"${CC:-cc}" -O2 -g -std=c11 -Wall -Wextra -Werror \
+  "$crate_dir/tests/fixtures/fork_clock_resource.c" -o "$fork_clock_resource_guest"
 "${CC:-cc}" -O2 -g -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror \
   -Wno-unused-parameter -pthread "$workspace_dir/tests/c_tests/threads_group_exit_blocking.c" \
   -o "$blocked_exit_guest"
@@ -71,6 +74,16 @@ run_tool() {
   fi
   env "$env_var=1" "$drrun" -disable_rseq -stack_size 2M -c "$client" -- \
     "${guest[@]}" \
+    >"$tmpdir/out" 2>"$tmpdir/err"
+}
+
+# Run the guest under the built-in default determinism runtime (no observation
+# tool env), so the native virtual-clock/virtual-resource policy is in force for
+# every process in the traced tree. An observation tool such as NOOP intercepts
+# the root's syscalls and passes them through, which deliberately bypasses that
+# native fallback; the default runtime is the mode where determinism applies.
+run_default_runtime() {
+  "$drrun" -disable_rseq -stack_size 2M -c "$client" -- "$@" \
     >"$tmpdir/out" 2>"$tmpdir/err"
 }
 
@@ -127,6 +140,25 @@ run_tool HERMIT_DBI_NOOP "$fork_pthread_guest"
 grep -q '^fork-pthread-race=64$' "$tmpdir/out" \
   || fail "noop: pthread consumed a concurrent process-clone identity"
 echo "PASS: process-clone identity handoff excludes concurrent pthreads"
+
+# Copied children (forked processes) run no Rust Tool, so the native virtual
+# clock / virtual resource policy is their only determinism layer. Under the
+# default determinism runtime, verify a forked child now sees the SAME
+# virtualized view as the root: virtual CLOCK_MONOTONIC stays a small
+# single-digit tv_sec (real host uptime is orders of magnitude larger), and
+# virtual RLIMIT_NOFILE is 1048576 (distinct from a typical host soft limit).
+# Before this fix the child fell through to real host time and host rlimits
+# while the root stayed virtualized.
+run_default_runtime "$fork_clock_resource_guest"
+grep -Eq '^child_mono_sec=[0-9]$' "$tmpdir/out" \
+  || fail "default runtime: forked child read real host time instead of the virtual clock"
+grep -q '^child_nofile=1048576$' "$tmpdir/out" \
+  || fail "default runtime: forked child read a real host rlimit instead of the virtual limit"
+grep -Eq '^parent_mono_sec=[0-9]$' "$tmpdir/out" \
+  || fail "default runtime: root process clock is not virtualized"
+grep -q '^parent_nofile=1048576$' "$tmpdir/out" \
+  || fail "default runtime: root process rlimit is not virtualized"
+echo "PASS: forked child virtualizes clock and rlimits like the root process (default runtime)"
 
 # noop: pure passthrough — guest output must be intact, no tool output.
 run_tool HERMIT_DBI_NOOP
