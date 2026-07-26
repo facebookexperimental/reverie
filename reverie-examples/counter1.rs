@@ -128,4 +128,23 @@ mod kvm_tests {
 
         assert_eq!(counter.num_syscalls.load(Ordering::SeqCst), 1);
     }
+
+    #[tokio::test]
+    async fn exact_counter1_tool_runs_static_kvm_syscall() {
+        let Some(mut backend) = kvm_test_support::backend_with_static_syscall(
+            "exact_counter1_tool_runs_static_kvm_syscall",
+        ) else {
+            return;
+        };
+
+        let (counter, exit_code, stdout, stderr) = backend
+            .run_static_elf_with_tool::<CounterLocal>((), true)
+            .await
+            .unwrap();
+
+        assert_eq!(exit_code, 0);
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+        assert_eq!(counter.num_syscalls.load(Ordering::SeqCst), 2);
+    }
 }

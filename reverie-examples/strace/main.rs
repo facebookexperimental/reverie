@@ -62,8 +62,11 @@ mod kvm_tests {
     use std::sync::atomic::Ordering;
 
     use reverie::syscalls::Sysno;
+    use tokio::sync::Mutex;
 
     use super::*;
+
+    static TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
     #[tokio::test]
     async fn exact_strace_tool_forwards_kvm_guest_syscall() {
@@ -73,6 +76,8 @@ mod kvm_tests {
         ) else {
             return;
         };
+        let _guard = TEST_LOCK.lock().await;
+        tool::take_handled_syscalls();
         let calls = Arc::new(AtomicUsize::new(0));
         let executor_calls = calls.clone();
         let config = Config {
@@ -95,5 +100,33 @@ mod kvm_tests {
             .unwrap();
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(tool::take_handled_syscalls(), 1);
+    }
+
+    #[tokio::test]
+    async fn exact_strace_tool_runs_static_kvm_syscall() {
+        let Some(mut backend) = kvm_test_support::backend_with_static_syscall(
+            "exact_strace_tool_runs_static_kvm_syscall",
+        ) else {
+            return;
+        };
+        let _guard = TEST_LOCK.lock().await;
+        tool::take_handled_syscalls();
+        let config = Config {
+            filters: vec![Filter {
+                inverse: false,
+                syscalls: vec![Sysno::getpid],
+            }],
+        };
+
+        let (_, exit_code, stdout, stderr) = backend
+            .run_static_elf_with_tool::<Strace>(config, true)
+            .await
+            .unwrap();
+
+        assert_eq!(exit_code, 0);
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+        assert_eq!(tool::take_handled_syscalls(), 1);
     }
 }

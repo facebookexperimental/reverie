@@ -164,3 +164,63 @@ async fn main() -> Result<(), Error> {
     drop(log_guard); // Flush logs before exiting.
     status.raise_or_exit()
 }
+
+#[cfg(all(test, target_arch = "x86_64"))]
+#[path = "kvm_test_support.rs"]
+mod kvm_test_support;
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod kvm_tests {
+    use reverie::syscalls::Sysno;
+
+    use super::*;
+
+    fn null_executor(
+        _request: &reverie_kvm::SyscallRequest,
+        _memory: &reverie_kvm::GuestMemory,
+    ) -> i64 {
+        0
+    }
+
+    #[tokio::test]
+    async fn exact_counter2_tool_aggregates_kvm_guest_lifecycle() {
+        let Some(mut backend) = kvm_test_support::backend_with_syscall(
+            "exact_counter2_tool_aggregates_kvm_guest_lifecycle",
+            Sysno::getpid,
+        ) else {
+            return;
+        };
+
+        let counter = backend
+            .run_with_tool::<CounterLocal, _>((), null_executor)
+            .await
+            .unwrap();
+        let totals = counter.inner.lock().unwrap();
+
+        assert_eq!(totals.total_syscalls, 1);
+        assert_eq!(totals.exited_procs, 1);
+        assert_eq!(totals.exited_threads, 1);
+    }
+
+    #[tokio::test]
+    async fn exact_counter2_tool_runs_static_kvm_syscall() {
+        let Some(mut backend) = kvm_test_support::backend_with_static_syscall(
+            "exact_counter2_tool_runs_static_kvm_syscall",
+        ) else {
+            return;
+        };
+
+        let (counter, exit_code, stdout, stderr) = backend
+            .run_static_elf_with_tool::<CounterLocal>((), true)
+            .await
+            .unwrap();
+        let totals = counter.inner.lock().unwrap();
+
+        assert_eq!(exit_code, 0);
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+        assert_eq!(totals.total_syscalls, 2);
+        assert_eq!(totals.exited_procs, 1);
+        assert_eq!(totals.exited_threads, 1);
+    }
+}

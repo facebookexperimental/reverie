@@ -6,6 +6,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+#[cfg(test)]
+use std::sync::atomic::Ordering;
+
 use reverie::Error;
 use reverie::ExitStatus;
 use reverie::GlobalRPC;
@@ -22,6 +27,14 @@ use reverie::syscalls::SyscallInfo;
 
 use crate::config::Config;
 use crate::global_state::GlobalState;
+
+#[cfg(test)]
+static HANDLED_SYSCALLS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn take_handled_syscalls() -> usize {
+    HANDLED_SYSCALLS.swap(0, Ordering::SeqCst)
+}
 
 // Strace has no need for process-level state, so this is a unit struct.
 #[derive(Debug, Default, Clone)]
@@ -63,6 +76,8 @@ impl Tool for Strace {
         guest: &mut T,
         syscall: Syscall,
     ) -> Result<i64, Error> {
+        #[cfg(test)]
+        HANDLED_SYSCALLS.fetch_add(1, Ordering::SeqCst);
         match syscall {
             Syscall::Exit(_) | Syscall::ExitGroup(_) => {
                 eprintln!(

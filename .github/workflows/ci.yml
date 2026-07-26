@@ -116,4 +116,6 @@ jobs:
     - name: Rust toolchain
       uses: dtolnay/rust-toolchain@nightly
     - name: Host-dependent workspace tests
+      env:
+        REVERIE_REQUIRE_KVM: "1"
       run: cargo test --workspace --all-features -- --test-threads=1
