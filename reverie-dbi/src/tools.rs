@@ -700,7 +700,7 @@ fn read_guest_bytes<G: Guest<ChunkyPrintTool>>(
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-166): Review the DBI chrome_trace port and JSON emit path.
+// TODO-HUMAN-REVIEW(PR-165): Review the DBI chrome_trace port and JSON emit path.
 /// RPC to [`ChromeTraceGlobal`]. Mirrors the upstream `chrome_trace` example's
 /// `ThreadExit`/`Event` messages, but sends one syscall observation at a time
 /// (the DBI backend rebuilds the tool per syscall and hardwires `ThreadState`
@@ -884,7 +884,7 @@ impl Tool for ChromeTraceTool {
     type GlobalState = ChromeTraceGlobal;
     type ThreadState = ();
 
-    // TODO-HUMAN-REVIEW(PR-166): Review lifecycle-safe chrome_trace recording + JSON emit.
+    // TODO-HUMAN-REVIEW(PR-165): Review lifecycle-safe chrome_trace recording + JSON emit.
     async fn handle_syscall_event<G: Guest<Self>>(
         &self,
         guest: &mut G,
