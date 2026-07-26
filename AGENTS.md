@@ -384,6 +384,46 @@ the lower status and say why in a task note.
   capabilities. Include environment details in failure reports.
 - Keep unrelated refactors and generated-manifest churn out of focused fixes.
 
+## Pre-Commit Cleanliness Protocol
+
+`reverie/` is a clean, focused implementation repository: product source, tests,
+build config, and minimal curated documentation only. Experiments, bulk AI
+research notes, binaries, and vendored clones do **not** belong here — they live
+in the `dev-hermit` parent workspace at `~/work/dev-hermit/experiments/` and
+`~/work/dev-hermit/ai_docs/`. The `repo-cleanliness` skill
+(`.claude/skills/repo-cleanliness.md`, also surfaced via `.llms/skills` and
+`.agents/skills`) is the full standing rule; this section is the mandatory
+pre-commit gate.
+
+Before every commit, audit exactly what you are about to stage and fix any
+misplaced file *before* committing — never "commit now, clean up later":
+
+```bash
+git status --short
+git diff --cached --name-only    # exact staged paths
+git diff --cached --numstat      # line counts; a '-' column means a binary file
+```
+
+Verify all of the following; a failure is a defect to fix before committing:
+
+- **Right repo, right path.** Every staged file belongs in *this* repo at a
+  sensible path — product code, tests, build config, or curated docs.
+- **No experiments.** Do not add `reverie/experiments/`; experiments live at
+  `~/work/dev-hermit/experiments/`. Reference external code by URL + commit SHA,
+  never by vendoring a checkout.
+- **No `ai_docs` slop.** Any `ai_docs/` change must be minimal, curated, durable
+  reference, not a scratch dump; bulk research goes in the parent `ai_docs/`.
+- **No binaries or large blobs.** No `.o`/`.a`/`.so`, archives, images, VM
+  images, kernels, core dumps, or `*.perf.data`; no text file over 2 MiB without
+  coordinator approval. Inspect anything suspicious with `file` and `du`.
+- **No nested git repos.** `git diff --cached --name-only | grep -E '/\.git(/|$)'`
+  must be empty.
+- **Only your task's paths.** If the tree is dirty with another agent's work,
+  stage your own paths explicitly; never `git add -A` past your ownership.
+
+To unstage a misplaced file: `git restore --staged <path>`, move it to its
+correct home, then commit.
+
 ## Discipline Verification
 
 The coordinator should periodically run:
