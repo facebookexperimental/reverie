@@ -19,6 +19,7 @@ use reverie::Tool as ReverieTool;
 use reverie_sabre as sabre;
 use reverie_syscalls::Displayable;
 use reverie_syscalls::LocalMemory;
+use reverie_syscalls::MemoryAccess;
 use reverie_syscalls::Syscall;
 use syscalls::Errno;
 
@@ -31,6 +32,36 @@ static QUIET: AtomicBool = AtomicBool::new(false);
 #[derive(Default)]
 pub struct StraceTool {
     quiet: bool,
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-155): Review exec argument decoding and envp redaction.
+fn display_exec_redacted<M: MemoryAccess>(syscall: &Syscall, memory: &M) -> Option<String> {
+    match syscall {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        Syscall::Execve(execve) => {
+            let path = execve.path();
+            let argv = execve.argv();
+            Some(format!(
+                "execve({}, {}, <envp redacted>)",
+                path.display(memory),
+                argv.display(memory)
+            ))
+        }
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        Syscall::Execveat(execveat) => {
+            let path = execveat.path();
+            let argv = execveat.argv();
+            Some(format!(
+                "execveat({}, {}, {}, <envp redacted>, {})",
+                execveat.dirfd(),
+                path.display(memory),
+                argv.display(memory),
+                execveat.flags()
+            ))
+        }
+        _ => None,
+    }
 }
 
 #[reverie::tool]
@@ -58,8 +89,12 @@ impl ReverieTool for StraceTool {
             // AUTONOMOUS-BOT-IMPLEMENTED
             Syscall::Execve(_) | Syscall::Execveat(_) => {
                 // A successful exec replaces the address space, so format its
-                // input pointers while the old image is still readable.
-                nostd_print::eprintln!("[{tid}] {}", syscall.display(&guest.memory()));
+                // input pointers while the old image is still readable. Do not
+                // log envp because it commonly contains credentials.
+                let memory = guest.memory();
+                let pretty = display_exec_redacted(&syscall, &memory)
+                    .expect("exec match arm must contain an exec syscall");
+                nostd_print::eprintln!("[{tid}] {pretty}");
                 guest.inject(syscall).await.map_err(Error::from)
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -115,5 +150,58 @@ impl sabre::Tool for Plugin {
 
     fn on_thread_exit(&self, thread_id: u32) {
         self.adapter.handle_thread_exit(thread_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::CString;
+    use std::ptr;
+
+    use reverie_syscalls::SyscallArgs;
+    use reverie_syscalls::Sysno;
+
+    use super::*;
+
+    #[test]
+    fn exec_displays_path_and_argv_without_environment() {
+        let path = CString::new("/bin/echo").unwrap();
+        let argument = CString::new("visible-argument").unwrap();
+        let secret = CString::new("SECRET_TOKEN=do-not-log").unwrap();
+        let argv = [path.as_ptr(), argument.as_ptr(), ptr::null()];
+        let envp = [secret.as_ptr(), ptr::null()];
+        let memory = LocalMemory::new();
+
+        let execve = Syscall::from_raw(
+            Sysno::execve,
+            SyscallArgs::new(
+                path.as_ptr() as usize,
+                argv.as_ptr() as usize,
+                envp.as_ptr() as usize,
+                0,
+                0,
+                0,
+            ),
+        );
+        let execveat = Syscall::from_raw(
+            Sysno::execveat,
+            SyscallArgs::new(
+                libc::AT_FDCWD as usize,
+                path.as_ptr() as usize,
+                argv.as_ptr() as usize,
+                envp.as_ptr() as usize,
+                0,
+                0,
+            ),
+        );
+
+        for syscall in [execve, execveat] {
+            let display = display_exec_redacted(&syscall, &memory).unwrap();
+            assert!(display.contains("/bin/echo"));
+            assert!(display.contains("visible-argument"));
+            assert!(display.contains("<envp redacted>"));
+            assert!(!display.contains("SECRET_TOKEN"));
+            assert!(!display.contains("do-not-log"));
+        }
     }
 }

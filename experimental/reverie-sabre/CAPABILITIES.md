@@ -10,7 +10,7 @@ shared example tools, but it is not a drop-in replacement for
 | Area | Current behavior |
 | --- | --- |
 | Syscalls | Intercepts rewritten syscall instructions and invokes the synchronous in-process `Tool::syscall` callback. The default implementation performs the real syscall. |
-| Guest memory | Exposes direct local-process memory through `LocalMemory`; there are no remote-memory operations. |
+| Guest memory | Uses `SabreMemory` with kernel-validated `process_vm_readv` and `process_vm_writev` access to the current guest process. Invalid pointers report `EFAULT` instead of faulting the plugin. |
 | Shared-tool guest context | The `ReverieAdapter` exposes the live SaBRe syscall frame through `Guest::regs`, supports writes to saved GPRs and the return IP through `Guest::set_regs`, and returns the current guest IP from `Guest::backtrace`. The fixed trampoline stack pointer, syscall number/result registers, flags, and segment state are read-only. |
 | Shared-tool event selection | Both local and remote `ReverieAdapter` paths bypass `Tool::handle_syscall_event` for syscalls excluded by `Tool::subscriptions`. The SaBRe loader still rewrites and enters the plugin for those syscalls. |
 | Threads | Creates backend records lazily when an intercepted thread is first observed. Start and exit callbacks are emitted at most once for a tracked thread. Repeated pthread create/return/join waves are covered by the conformance gate. |

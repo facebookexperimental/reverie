@@ -32,7 +32,9 @@ target/debug/reverie-sabre-strace \
 
 Supported values are:
 
-- `strace` (default): decode and print syscalls and results.
+- `strace` (default): decode and print syscalls and results. Exec paths and
+  argv are decoded, while envp is redacted because it commonly contains
+  credentials.
 - `counter1`: print the number of intercepted syscalls.
 - `noop`: forward syscalls through the default shared Tool handler.
 
