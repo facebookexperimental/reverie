@@ -8,17 +8,20 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/sched.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/user.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -41,7 +44,32 @@ typedef struct {
   uint64_t observed_syscalls;
   uint64_t rewritten_syscalls;
   void *runtime_state;
+  int32_t virtual_pid;
+  int32_t virtual_ppid;
+  int32_t virtual_tid;
+  int32_t pending_virtual_child;
+  uint64_t pending_clone_flags;
 } prototype_counters_t;
+
+#define VIRTUAL_ROOT_PID INT32_C(3)
+#define VIRTUAL_INIT_PID INT32_C(1)
+#define VIRTUAL_IDENTITY_FD 197
+#define DBI_DIAGNOSTIC_FD 198
+#define VIRTUAL_IDENTITY_MAGIC UINT64_C(0x5245565049443031)
+#define MAX_VIRTUAL_IDENTITIES 8192
+
+typedef struct {
+  int32_t host;
+  int32_t virtual_id;
+} virtual_identity_t;
+
+typedef struct {
+  uint64_t magic;
+  atomic_flag lock;
+  _Atomic int32_t next_virtual_id;
+  size_t count;
+  virtual_identity_t identities[MAX_VIRTUAL_IDENTITIES];
+} virtual_identity_state_t;
 
 typedef struct {
   uint32_t eax;
@@ -159,6 +187,186 @@ static void exit_runtime_tree(int exit_code) {
       runtime_process_group != dr_get_process_id())
     kill((pid_t)runtime_process_group, SIGKILL);
   dr_exit_process(exit_code);
+}
+static int32_t virtual_process_id = VIRTUAL_ROOT_PID;
+static int32_t virtual_parent_process_id = VIRTUAL_INIT_PID;
+static virtual_identity_state_t *virtual_identity_state;
+static _Atomic int32_t pending_clone_virtual_child;
+static _Atomic uint64_t pending_clone_flags;
+
+static bool map_inherited_virtual_identity_state(void) {
+  struct stat status;
+  void *mapping;
+  if (fstat(VIRTUAL_IDENTITY_FD, &status) != 0 ||
+      status.st_size != (off_t)sizeof(*virtual_identity_state))
+    return false;
+  mapping = mmap(NULL, sizeof(*virtual_identity_state), PROT_READ | PROT_WRITE,
+                 MAP_SHARED, VIRTUAL_IDENTITY_FD, 0);
+  if (mapping == MAP_FAILED)
+    return false;
+  virtual_identity_state = (virtual_identity_state_t *)mapping;
+  if (virtual_identity_state->magic == VIRTUAL_IDENTITY_MAGIC)
+    return true;
+  munmap(mapping, sizeof(*virtual_identity_state));
+  virtual_identity_state = NULL;
+  return false;
+}
+
+static void initialize_virtual_identity_state(void) {
+  int descriptor;
+  if (map_inherited_virtual_identity_state())
+    return;
+
+  descriptor = (int)syscall(SYS_memfd_create, "reverie-dbi-pids", 0);
+  DR_ASSERT(descriptor >= 0);
+  DR_ASSERT(ftruncate(descriptor, sizeof(*virtual_identity_state)) == 0);
+  if (descriptor != VIRTUAL_IDENTITY_FD) {
+    DR_ASSERT(dup2(descriptor, VIRTUAL_IDENTITY_FD) == VIRTUAL_IDENTITY_FD);
+    close(descriptor);
+  }
+  DR_ASSERT(fcntl(VIRTUAL_IDENTITY_FD, F_SETFD, 0) == 0);
+  virtual_identity_state = (virtual_identity_state_t *)mmap(
+      NULL, sizeof(*virtual_identity_state), PROT_READ | PROT_WRITE, MAP_SHARED,
+      VIRTUAL_IDENTITY_FD, 0);
+  DR_ASSERT(virtual_identity_state != MAP_FAILED);
+  memset(virtual_identity_state, 0, sizeof(*virtual_identity_state));
+  virtual_identity_state->magic = VIRTUAL_IDENTITY_MAGIC;
+  atomic_flag_clear(&virtual_identity_state->lock);
+  atomic_init(&virtual_identity_state->next_virtual_id, VIRTUAL_ROOT_PID + 1);
+}
+
+static void virtual_identity_lock(void) {
+  while (atomic_flag_test_and_set_explicit(&virtual_identity_state->lock,
+                                           memory_order_acquire))
+    dr_thread_yield();
+}
+
+static void virtual_identity_unlock(void) {
+  atomic_flag_clear_explicit(&virtual_identity_state->lock,
+                             memory_order_release);
+}
+
+static int32_t allocate_virtual_identity(void) {
+  return atomic_fetch_add_explicit(&virtual_identity_state->next_virtual_id, 1,
+                                   memory_order_relaxed);
+}
+
+static int32_t ensure_virtual_identity(int32_t host) {
+  int32_t virtual_id;
+  size_t i;
+  DR_ASSERT(host > 0);
+
+  virtual_identity_lock();
+  for (i = 0; i < virtual_identity_state->count; ++i) {
+    if (virtual_identity_state->identities[i].host == host) {
+      virtual_id = virtual_identity_state->identities[i].virtual_id;
+      virtual_identity_unlock();
+      return virtual_id;
+    }
+  }
+  DR_ASSERT(virtual_identity_state->count < MAX_VIRTUAL_IDENTITIES);
+  virtual_id = atomic_fetch_add_explicit(
+      &virtual_identity_state->next_virtual_id, 1, memory_order_relaxed);
+  virtual_identity_state->identities[virtual_identity_state->count++] =
+      (virtual_identity_t){host, virtual_id};
+  virtual_identity_unlock();
+  return virtual_id;
+}
+
+static void remember_virtual_identity(int32_t host, int32_t virtual_id) {
+  size_t i;
+  if (host <= 0 || virtual_id <= 0)
+    return;
+
+  virtual_identity_lock();
+  for (i = 0; i < virtual_identity_state->count; ++i) {
+    if (virtual_identity_state->identities[i].host == host ||
+        virtual_identity_state->identities[i].virtual_id == virtual_id) {
+      virtual_identity_state->identities[i] =
+          (virtual_identity_t){host, virtual_id};
+      virtual_identity_unlock();
+      return;
+    }
+  }
+  DR_ASSERT(virtual_identity_state->count < MAX_VIRTUAL_IDENTITIES);
+  virtual_identity_state->identities[virtual_identity_state->count++] =
+      (virtual_identity_t){host, virtual_id};
+  virtual_identity_unlock();
+}
+
+static int32_t virtual_identity_for_host(int32_t host) {
+  int32_t result = host;
+  size_t i;
+  if (host <= 0)
+    return host;
+
+  virtual_identity_lock();
+  for (i = 0; i < virtual_identity_state->count; ++i) {
+    if (virtual_identity_state->identities[i].host == host) {
+      result = virtual_identity_state->identities[i].virtual_id;
+      break;
+    }
+  }
+  virtual_identity_unlock();
+  return result;
+}
+
+static bool lookup_virtual_identity(int32_t host, int32_t *virtual_id) {
+  size_t i;
+  bool found = false;
+  if (host <= 0)
+    return false;
+
+  virtual_identity_lock();
+  for (i = 0; i < virtual_identity_state->count; ++i) {
+    if (virtual_identity_state->identities[i].host == host) {
+      *virtual_id = virtual_identity_state->identities[i].virtual_id;
+      found = true;
+      break;
+    }
+  }
+  virtual_identity_unlock();
+  return found;
+}
+
+static int32_t host_identity_for_guest(int32_t identity) {
+  int32_t result = -1;
+  size_t i;
+  if (identity <= 0)
+    return identity;
+
+  virtual_identity_lock();
+  for (i = 0; i < virtual_identity_state->count; ++i) {
+    if (virtual_identity_state->identities[i].virtual_id == identity ||
+        virtual_identity_state->identities[i].host == identity) {
+      result = virtual_identity_state->identities[i].host;
+      break;
+    }
+  }
+  virtual_identity_unlock();
+  return result;
+}
+
+static bool is_known_virtual_identity(int32_t value) {
+  size_t i;
+  bool found = false;
+  if (value <= 0)
+    return false;
+
+  virtual_identity_lock();
+  for (i = 0; i < virtual_identity_state->count; ++i) {
+    if (virtual_identity_state->identities[i].virtual_id == value) {
+      found = true;
+      break;
+    }
+  }
+  virtual_identity_unlock();
+  return found;
+}
+
+static int32_t virtualize_host_identity(int32_t value) {
+  return is_known_virtual_identity(value) ? value
+                                          : virtual_identity_for_host(value);
 }
 
 typedef struct {
@@ -295,11 +503,245 @@ static dr_emit_flags_t instrument_instruction(void *drcontext, void *tag,
   return DR_EMIT_DEFAULT;
 }
 
-static int64_t invoke_syscall(uintptr_t context, int64_t sysnum,
-                              const uint64_t *args) {
+static bool translate_identity_argument(uint64_t *argument) {
+  int32_t identity = (int32_t)*argument;
+  int32_t host;
+  if (identity <= 0)
+    return true;
+  host = host_identity_for_guest(identity);
+  if (host <= 0)
+    return false;
+  *argument = (uint64_t)(uint32_t)host;
+  return true;
+}
+
+static int64_t invoke_raw_syscall(uintptr_t context, int64_t sysnum,
+                                  const uint64_t *args) {
   return (int64_t)dr_invoke_syscall_as_app((void *)context, (int)sysnum, 6,
                                            args[0], args[1], args[2], args[3],
                                            args[4], args[5]);
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-106): keep the identity memfd (fd 197) and diagnostic fd
+// (198) alive across close/fcntl(F_SETFD)/dup2/dup3 in copied children.
+// RESIDUAL: close_range is not intercepted and can still close the memfd.
+static bool preserve_internal_descriptors(uintptr_t context, int sysnum,
+                                          const uint64_t *args,
+                                          int64_t *result) {
+  int fd = (int)args[0];
+  (void)context;
+  if (sysnum == SYS_close &&
+      (fd == VIRTUAL_IDENTITY_FD || fd == DBI_DIAGNOSTIC_FD)) {
+    *result = 0;
+    return true;
+  }
+  if (sysnum == SYS_fcntl &&
+      (fd == VIRTUAL_IDENTITY_FD || fd == DBI_DIAGNOSTIC_FD) &&
+      args[1] == F_SETFD) {
+    *result = 0;
+    return true;
+  }
+  if ((sysnum == SYS_dup2 || sysnum == SYS_dup3) &&
+      ((int)args[1] == VIRTUAL_IDENTITY_FD ||
+       (int)args[1] == DBI_DIAGNOSTIC_FD)) {
+    *result = (int64_t)args[1];
+    return true;
+  }
+  return false;
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-106): map virtual PID/TID args to host IDs for
+// PID-consuming syscalls. RESIDUAL: negative (process-group) targets such as
+// kill(-pgid)/wait4(-pgid) pass through untranslated; pgid/sid not yet modeled.
+static bool translate_identity_arguments(int sysnum, uint64_t *args) {
+  switch (sysnum) {
+  case SYS_kill:
+  case SYS_tkill:
+  case SYS_wait4:
+  case SYS_getpgid:
+  case SYS_getsid:
+  case SYS_sched_getaffinity:
+  case SYS_sched_setaffinity:
+  case SYS_sched_getparam:
+  case SYS_sched_setparam:
+  case SYS_sched_getscheduler:
+  case SYS_sched_setscheduler:
+    return translate_identity_argument(&args[0]);
+  case SYS_tgkill:
+    return translate_identity_argument(&args[0]) &&
+           translate_identity_argument(&args[1]);
+  case SYS_setpgid:
+    return translate_identity_argument(&args[0]) &&
+           translate_identity_argument(&args[1]);
+  case SYS_waitid:
+    return args[0] != P_PID || translate_identity_argument(&args[1]);
+  case SYS_prlimit64:
+    return args[0] == 0 || translate_identity_argument(&args[0]);
+  case SYS_getpriority:
+  case SYS_setpriority:
+    return args[0] != PRIO_PROCESS || args[1] == 0 ||
+           translate_identity_argument(&args[1]);
+  default:
+    return true;
+  }
+}
+
+static int64_t unknown_identity_error(int sysnum) {
+  return sysnum == SYS_wait4 || sysnum == SYS_waitid ? -ECHILD : -ESRCH;
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-106): map host PID/TID results back to virtual IDs.
+// RESIDUAL: getpgid/getsid results absent from the identity table (an untracked
+// host group/session leader) fall through to the raw host value and leak it.
+static int64_t virtualize_identity_result(prototype_counters_t *counters,
+                                          int sysnum, int64_t result) {
+  if (result <= 0)
+    return result;
+  switch (sysnum) {
+  case SYS_getpid:
+    return counters->virtual_pid;
+  case SYS_getppid:
+    return counters->virtual_ppid;
+  case SYS_gettid:
+    return counters->virtual_tid;
+  case SYS_fork:
+  case SYS_vfork:
+  case SYS_clone:
+  case SYS_clone3:
+  case SYS_wait4:
+  case SYS_getpgid:
+  case SYS_getsid:
+  case SYS_set_tid_address:
+    return virtualize_host_identity((int32_t)result);
+  default:
+    return result;
+  }
+}
+
+static void virtualize_waitid_info(const uint64_t *args) {
+  siginfo_t info;
+  void *info_address = (void *)(uintptr_t)args[2];
+  if (info_address != NULL && read_app(info_address, &info, sizeof(info)) &&
+      info.si_pid > 0) {
+    info.si_pid = virtualize_host_identity(info.si_pid);
+    write_app(info_address, &info, sizeof(info));
+  }
+}
+
+static bool clone_identity_flags(int sysnum, const uint64_t *args,
+                                 uint64_t *flags) {
+  switch (sysnum) {
+  case SYS_fork:
+    *flags = 0;
+    return true;
+  case SYS_vfork:
+    *flags = CLONE_VM | CLONE_VFORK;
+    return true;
+  case SYS_clone:
+    *flags = args[0];
+    return true;
+  case SYS_clone3:
+    *flags = 0;
+    return args[0] != 0 && args[1] >= sizeof(*flags) &&
+           read_app((const void *)(uintptr_t)args[0], flags, sizeof(*flags));
+  default:
+    return false;
+  }
+}
+
+static bool is_clone_syscall(int sysnum) {
+  return sysnum == SYS_fork || sysnum == SYS_vfork || sysnum == SYS_clone ||
+         sysnum == SYS_clone3;
+}
+
+static bool prepare_clone_identity(prototype_counters_t *counters, int sysnum,
+                                   const uint64_t *args) {
+  uint64_t flags;
+  if (!clone_identity_flags(sysnum, args, &flags))
+    return false;
+  DR_ASSERT(counters->pending_virtual_child == 0);
+  counters->pending_virtual_child = allocate_virtual_identity();
+  counters->pending_clone_flags = flags;
+  atomic_store_explicit(&pending_clone_flags, flags, memory_order_relaxed);
+  atomic_store_explicit(&pending_clone_virtual_child,
+                        counters->pending_virtual_child, memory_order_release);
+  return true;
+}
+
+static void complete_clone_identity(prototype_counters_t *counters,
+                                    int64_t result) {
+  int32_t virtual_child = counters->pending_virtual_child;
+  uint64_t flags = counters->pending_clone_flags;
+  if (virtual_child == 0)
+    return;
+
+  if (result > 0) {
+    remember_virtual_identity((int32_t)result, virtual_child);
+  } else if (result == 0) {
+    int32_t host_tid = (int32_t)dr_get_thread_id(dr_get_current_drcontext());
+    remember_virtual_identity(host_tid, virtual_child);
+    if ((flags & CLONE_THREAD) != 0) {
+      counters->virtual_tid = virtual_child;
+    } else {
+      int32_t parent = counters->virtual_pid;
+      remember_virtual_identity((int32_t)dr_get_process_id(), virtual_child);
+      if ((flags & CLONE_VM) != 0)
+        return;
+      counters->virtual_pid = virtual_child;
+      counters->virtual_ppid = parent;
+      counters->virtual_tid = virtual_child;
+      virtual_parent_process_id = parent;
+      virtual_process_id = virtual_child;
+    }
+  }
+  counters->pending_virtual_child = 0;
+  counters->pending_clone_flags = 0;
+  atomic_store_explicit(&pending_clone_virtual_child, 0, memory_order_release);
+  atomic_store_explicit(&pending_clone_flags, 0, memory_order_relaxed);
+}
+
+static bool pending_identity_is_process(const prototype_counters_t *counters) {
+  return counters->pending_virtual_child != 0 &&
+         (counters->pending_clone_flags & CLONE_THREAD) == 0;
+}
+
+static int64_t invoke_syscall(uintptr_t context, int64_t sysnum,
+                              const uint64_t *args) {
+  prototype_counters_t *counters = (prototype_counters_t *)drmgr_get_tls_field(
+      (void *)context, thread_state_index);
+  uint64_t translated[6];
+  int64_t result;
+  bool is_clone;
+  DR_ASSERT(counters != NULL);
+  memcpy(translated, args, sizeof(translated));
+  if (!translate_identity_arguments((int)sysnum, translated))
+    return unknown_identity_error((int)sysnum);
+
+  if (sysnum == SYS_getpid)
+    return pending_identity_is_process(counters)
+               ? counters->pending_virtual_child
+               : counters->virtual_pid;
+  if (sysnum == SYS_getppid)
+    return counters->virtual_ppid;
+  if (sysnum == SYS_gettid)
+    return counters->pending_virtual_child != 0
+               ? counters->pending_virtual_child
+               : counters->virtual_tid;
+
+  is_clone = prepare_clone_identity(counters, (int)sysnum, translated);
+  if (preserve_internal_descriptors(context, (int)sysnum, translated, &result))
+    return result;
+  result = invoke_raw_syscall(context, sysnum, translated);
+  if (is_clone) {
+    complete_clone_identity(counters, result);
+    return result;
+  }
+  if (sysnum == SYS_waitid && result >= 0)
+    virtualize_waitid_info(translated);
+  return virtualize_identity_result(counters, (int)sysnum, result);
 }
 
 static int32_t read_registers(uintptr_t context, struct user_regs_struct *out) {
@@ -867,18 +1309,94 @@ static void zero_wait_rusage(void *address) {
   }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-106): emulate getpid/getppid/gettid in copied children
+// from the shared virtual-identity map so forks never observe host PIDs.
+static bool emulate_identity_getter(prototype_counters_t *counters, int sysnum,
+                                    int64_t *result) {
+  int32_t mapped;
+  switch (sysnum) {
+  case SYS_getpid:
+    *result = lookup_virtual_identity((int32_t)dr_get_process_id(), &mapped)
+                  ? mapped
+                  : (pending_identity_is_process(counters)
+                         ? counters->pending_virtual_child
+                         : counters->virtual_pid);
+    return true;
+  case SYS_getppid:
+    *result = lookup_virtual_identity((int32_t)dr_get_parent_id(), &mapped)
+                  ? mapped
+                  : counters->virtual_ppid;
+    return true;
+  case SYS_gettid:
+    *result =
+        lookup_virtual_identity(
+            (int32_t)dr_get_thread_id(dr_get_current_drcontext()), &mapped)
+            ? mapped
+            : (counters->pending_virtual_child != 0
+                   ? counters->pending_virtual_child
+                   : counters->virtual_tid);
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool prepare_original_identity_syscall(void *drcontext,
+                                              prototype_counters_t *counters,
+                                              int sysnum,
+                                              const uint64_t *args) {
+  uint64_t translated[6];
+  int i;
+  memcpy(translated, args, sizeof(translated));
+  if (!translate_identity_arguments(sysnum, translated)) {
+    dr_syscall_set_result(drcontext, (reg_t)unknown_identity_error(sysnum));
+    return false;
+  }
+  for (i = 0; i != 6; ++i) {
+    if (translated[i] != args[i])
+      dr_syscall_set_param(drcontext, i, (reg_t)translated[i]);
+  }
+  (void)prepare_clone_identity(counters, sysnum, translated);
+  return true;
+}
+
 // TODO-HUMAN-REVIEW(PR-66): Confirm wait-result normalization preserves wait
 // semantics.
 static void post_syscall(void *drcontext, int sysnum) {
+  ptr_int_t syscall_result = (ptr_int_t)dr_syscall_get_result(drcontext);
+  prototype_counters_t *counters = (prototype_counters_t *)drmgr_get_tls_field(
+      drcontext, thread_state_index);
+  DR_ASSERT(counters != NULL);
+
+  if (counters->pending_virtual_child != 0 && is_clone_syscall(sysnum)) {
+    int32_t virtual_child = counters->pending_virtual_child;
+    complete_clone_identity(counters, syscall_result);
+    if (syscall_result > 0) {
+      syscall_result = virtual_child;
+      dr_syscall_set_result(drcontext, (reg_t)syscall_result);
+    }
+  }
+
+  if (sysnum == SYS_wait4 && syscall_result > 0) {
+    syscall_result = virtualize_host_identity((int32_t)syscall_result);
+    dr_syscall_set_result(drcontext, (reg_t)syscall_result);
+  }
+
+  if (sysnum == SYS_waitid) {
+    siginfo_t info;
+    void *info_address = (void *)dr_syscall_get_param(drcontext, 2);
+    if (info_address != NULL && read_app(info_address, &info, sizeof(info)) &&
+        info.si_pid > 0) {
+      info.si_pid = virtualize_host_identity(info.si_pid);
+      write_app(info_address, &info, sizeof(info));
+    }
+  }
+
   if (has_copied_runtime())
     return;
 
-  ptr_int_t syscall_result = (ptr_int_t)dr_syscall_get_result(drcontext);
   if (is_exec_syscall(sysnum)) {
-    prototype_counters_t *counters =
-        (prototype_counters_t *)drmgr_get_tls_field(drcontext,
-                                                    thread_state_index);
-    DR_ASSERT(counters != NULL);
     reverie_dbi_runtime_exec_failed(counters, (int32_t)dr_get_process_id());
     return;
   }
@@ -939,7 +1457,26 @@ static bool pre_syscall(void *drcontext, int sysnum) {
     return false;
   }
 
+  uint64_t args[6];
+  int64_t result = 0;
+  int i;
+  prototype_counters_t *counters = (prototype_counters_t *)drmgr_get_tls_field(
+      drcontext, thread_state_index);
+  DR_ASSERT(counters != NULL);
+  for (i = 0; i != 6; ++i)
+    args[i] = (uint64_t)dr_syscall_get_param(drcontext, i);
+
   if (has_copied_runtime()) {
+    // Record this copied child's virtual identity before any refusal so the
+    // shared host<->virtual map stays coherent even when the syscall is later
+    // rejected by the fail-closed unsupported-syscall policy below.
+    if (counters->pending_virtual_child != 0) {
+      remember_virtual_identity((int32_t)dr_get_process_id(),
+                                counters->pending_virtual_child);
+      remember_virtual_identity(
+          (int32_t)dr_get_thread_id(dr_get_current_drcontext()),
+          counters->pending_virtual_child);
+    }
     int32_t copied_action =
         reverie_dbi_runtime_copied_syscall((int64_t)sysnum);
     if (copied_action == 1) {
@@ -961,20 +1498,20 @@ static bool pre_syscall(void *drcontext, int sysnum) {
       return false;
     }
 #endif
-    return true;
+    if (preserve_internal_descriptors((uintptr_t)drcontext, sysnum, args,
+                                      &result)) {
+      dr_syscall_set_result(drcontext, (reg_t)result);
+      return false;
+    }
+    if (emulate_identity_getter(counters, sysnum, &result)) {
+      dr_syscall_set_result(drcontext, (reg_t)result);
+      return false;
+    }
+    return prepare_original_identity_syscall(drcontext, counters, sysnum, args);
   }
   while (!reverie_dbi_runtime_ready(
       atomic_load_explicit(&image_generation, memory_order_acquire)))
     dr_sleep(1);
-  uint64_t args[6];
-  int64_t result = 0;
-  int i;
-  prototype_counters_t *counters = (prototype_counters_t *)drmgr_get_tls_field(
-      drcontext, thread_state_index);
-
-  DR_ASSERT(counters != NULL);
-  for (i = 0; i != 6; ++i)
-    args[i] = (uint64_t)dr_syscall_get_param(drcontext, i);
   if (syscall_reads_stdin(drcontext, sysnum, args))
     atomic_fetch_add_explicit(&stdin_read_count, 1, memory_order_relaxed);
 
@@ -991,6 +1528,7 @@ static bool pre_syscall(void *drcontext, int sysnum) {
   }
   if (action > 0) {
     retry_pipe_eagain(drcontext, sysnum, args, &result);
+    result = virtualize_identity_result(counters, sysnum, result);
     dr_syscall_set_result(drcontext, (reg_t)result);
     return false;
   }
@@ -1006,14 +1544,37 @@ static bool pre_syscall(void *drcontext, int sysnum) {
     dr_syscall_set_result(drcontext, (reg_t)result);
     return false;
   }
-  return true;
+  return prepare_original_identity_syscall(drcontext, counters, sysnum, args);
 }
 
 static void thread_init(void *drcontext) {
   prototype_counters_t *counters =
       (prototype_counters_t *)dr_thread_alloc(drcontext, sizeof(*counters));
+  int32_t host_tid = (int32_t)dr_get_thread_id(drcontext);
+  int32_t pending_child =
+      atomic_load_explicit(&pending_clone_virtual_child, memory_order_acquire);
+  uint64_t clone_flags =
+      pending_child != 0
+          ? atomic_load_explicit(&pending_clone_flags, memory_order_relaxed)
+          : 0;
+  bool is_thread = (clone_flags & CLONE_THREAD) != 0;
   DR_ASSERT(counters != NULL);
   reverie_dbi_runtime_thread_init(counters);
+  counters->runtime_state = NULL;
+  counters->virtual_pid =
+      pending_child != 0 && !is_thread ? pending_child : virtual_process_id;
+  counters->virtual_ppid = pending_child != 0 && !is_thread
+                               ? virtual_process_id
+                               : virtual_parent_process_id;
+  counters->virtual_tid =
+      pending_child != 0 ? pending_child : ensure_virtual_identity(host_tid);
+  counters->pending_virtual_child = 0;
+  counters->pending_clone_flags = 0;
+  if (pending_child != 0) {
+    if (!is_thread)
+      remember_virtual_identity((int32_t)dr_get_process_id(), pending_child);
+    remember_virtual_identity(host_tid, pending_child);
+  }
   DR_ASSERT(drmgr_set_tls_field(drcontext, thread_state_index, counters));
 }
 
@@ -1072,6 +1633,17 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[]) {
 
   diagnostic_file = STDERR;
   runtime_owner_pid = dr_get_process_id();
+  initialize_virtual_identity_state();
+  if (lookup_virtual_identity((int32_t)runtime_owner_pid,
+                              &virtual_process_id)) {
+    int32_t host_parent = (int32_t)getppid();
+    if (!lookup_virtual_identity(host_parent, &virtual_parent_process_id))
+      virtual_parent_process_id = VIRTUAL_INIT_PID;
+  } else {
+    virtual_process_id = VIRTUAL_ROOT_PID;
+    virtual_parent_process_id = VIRTUAL_INIT_PID;
+    remember_virtual_identity((int32_t)runtime_owner_pid, virtual_process_id);
+  }
   atomic_store_explicit(&image_generation, reverie_dbi_runtime_image_init(),
                         memory_order_release);
   resource_lock = dr_mutex_create();
