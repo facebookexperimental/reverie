@@ -189,6 +189,9 @@ fn execute_basic_syscall_with_output(
         open(memory, state, args)
     } else if number == libc::SYS_openat as u64 {
         openat(memory, state, args)
+    } else if number == libc::SYS_creat as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        creat(memory, state, args)
     } else if number == libc::SYS_fstat as u64 {
         fstat(memory, state, args)
     } else if number == libc::SYS_stat as u64 {
@@ -1243,6 +1246,19 @@ fn openat(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) ->
         args[2],
         args[3],
     )
+}
+
+// TODO-HUMAN-REVIEW(PR-110): Review creat delegation to the open path.
+//
+// `creat(path, mode)` is defined by Linux as
+// `open(path, O_CREAT | O_WRONLY | O_TRUNC, mode)`. GNU tar (and other
+// programs) still emit the raw `creat` syscall for their output file, which
+// previously fell through to `ENOSYS`. Delegating to `open_file` reuses the
+// existing create/procfs/umask handling so the behavior matches the equivalent
+// `open`/`openat` call exactly.
+fn creat(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    let flags = (libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC) as u64;
+    open_file(memory, state, libc::AT_FDCWD, args[0], flags, args[1])
 }
 
 fn open_file(
@@ -5502,6 +5518,65 @@ mod tests {
         let mut actual = [0; 8];
         memory.read(READ_ADDRESS, &mut actual).unwrap();
         assert_eq!(&actual, b"original");
+    }
+
+    #[test]
+    fn creat_creates_and_truncates_like_open_o_creat() {
+        const PATH_ADDRESS: u64 = 0x100;
+        const WRITE_ADDRESS: u64 = 0x200;
+
+        let root = TestDir::new();
+        let target = root.0.join("archive");
+        // A pre-existing longer file proves creat applies O_TRUNC.
+        std::fs::write(&target, b"stale-and-longer-than-new").unwrap();
+
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, 0x1000).unwrap();
+        memory.write(PATH_ADDRESS, b"archive\0").unwrap();
+        memory.write(WRITE_ADDRESS, b"tar\n").unwrap();
+
+        // creat(path, 0o644) must open the existing file, not fall through to
+        // ENOSYS as it did before this handler existed.
+        let fd = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_creat,
+            [PATH_ADDRESS, 0o644, 0, 0, 0, 0],
+        );
+        assert_eq!(fd, 3, "creat should return the first free guest fd");
+
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_write,
+                [fd as u64, WRITE_ADDRESS, 4, 0, 0, 0],
+            ),
+            4
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_close,
+                [fd as u64, 0, 0, 0, 0, 0]
+            ),
+            0
+        );
+
+        // O_TRUNC replaced the stale content entirely.
+        assert_eq!(std::fs::read(&target).unwrap(), b"tar\n");
+
+        // creat on a brand-new path creates it.
+        memory.write(PATH_ADDRESS, b"fresh\0").unwrap();
+        let fresh_fd = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_creat,
+            [PATH_ADDRESS, 0o600, 0, 0, 0, 0],
+        );
+        assert!(fresh_fd >= 3, "creat on a new path should succeed");
+        assert!(root.0.join("fresh").exists());
     }
 
     #[test]
