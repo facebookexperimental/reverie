@@ -348,6 +348,30 @@ fn execute_basic_syscall_with_output(
         getcpu(memory, args)
     } else if number == libc::SYS_sched_getaffinity as u64 {
         sched_getaffinity(memory, state, args)
+    } else if number == libc::SYS_sched_getscheduler as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        sched_getscheduler(state, args)
+    } else if number == libc::SYS_sched_setscheduler as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        sched_setscheduler(state, args)
+    } else if number == libc::SYS_sched_getparam as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        sched_getparam(memory, state, args)
+    } else if number == libc::SYS_sched_setparam as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        sched_setparam(state, args)
+    } else if number == libc::SYS_sched_get_priority_min as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        sched_priority_bound(args[0], false)
+    } else if number == libc::SYS_sched_get_priority_max as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        sched_priority_bound(args[0], true)
+    } else if number == libc::SYS_ioprio_get as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        GUEST_IOPRIO_DEFAULT
+    } else if number == libc::SYS_ioprio_set as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        0
     } else if number == libc::SYS_membarrier as u64 {
         match (args[0] as libc::c_int, args[1] as libc::c_uint) {
             (0, 0) => i64::from(MEMBARRIER_SUPPORTED),
@@ -3171,6 +3195,95 @@ fn sched_getaffinity(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[
         Ok(()) => MASK_BYTES as i64,
         Err(_) => negative_errno(libc::EFAULT),
     }
+}
+
+// Fixed I/O priority reported to the guest: best-effort class, level 4 (the
+// Linux default), encoded as IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, 4).
+const GUEST_IOPRIO_DEFAULT: i64 = (2 << 13) | 4;
+
+// SCHED_RESET_ON_FORK may be OR'd into the policy passed to sched_setscheduler.
+const SCHED_RESET_ON_FORK: libc::c_int = 0x4000_0000;
+
+// The deterministic guest runs a single sequential CPU, so scheduling policy and
+// priority never affect execution order. Model a fixed SCHED_OTHER task: report
+// SCHED_OTHER with priority 0 and accept policy/priority changes as no-ops. All
+// answers are constants -- identical across a --verify pair and host-independent
+// -- so tools such as `chrt` and `ionice` run instead of hitting ENOSYS.
+
+fn is_valid_sched_policy(policy: libc::c_int) -> bool {
+    matches!(
+        policy,
+        libc::SCHED_OTHER
+            | libc::SCHED_FIFO
+            | libc::SCHED_RR
+            | libc::SCHED_BATCH
+            | libc::SCHED_IDLE
+    )
+}
+
+// The pid argument must name the guest process (0 or its own pid).
+fn sched_pid_ok(state: &LoadedStaticElf, pid: u64) -> bool {
+    let pid = pid as i64;
+    pid == 0 || pid == i64::from(state.pid)
+}
+
+fn sched_priority_bound(policy: u64, want_max: bool) -> i64 {
+    let Ok(policy) = libc::c_int::try_from(policy) else {
+        return negative_errno(libc::EINVAL);
+    };
+    if !is_valid_sched_policy(policy) {
+        return negative_errno(libc::EINVAL);
+    }
+    // Real-time policies use 1..=99; the fair-class policies use 0..=0.
+    match policy {
+        libc::SCHED_FIFO | libc::SCHED_RR => {
+            if want_max {
+                99
+            } else {
+                1
+            }
+        }
+        _ => 0,
+    }
+}
+
+fn sched_getscheduler(state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    if !sched_pid_ok(state, args[0]) {
+        return negative_errno(libc::ESRCH);
+    }
+    i64::from(libc::SCHED_OTHER)
+}
+
+fn sched_setscheduler(state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    if !sched_pid_ok(state, args[0]) {
+        return negative_errno(libc::ESRCH);
+    }
+    let Ok(policy) = libc::c_int::try_from(args[1]) else {
+        return negative_errno(libc::EINVAL);
+    };
+    if !is_valid_sched_policy(policy & !SCHED_RESET_ON_FORK) {
+        return negative_errno(libc::EINVAL);
+    }
+    // Accepted as a no-op; the sequential scheduler ignores policy.
+    0
+}
+
+fn sched_getparam(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    if !sched_pid_ok(state, args[0]) {
+        return negative_errno(libc::ESRCH);
+    }
+    // struct sched_param { int sched_priority; } -- always 0 for SCHED_OTHER.
+    match memory.write(args[1], &0_i32.to_ne_bytes()) {
+        Ok(()) => 0,
+        Err(_) => negative_errno(libc::EFAULT),
+    }
+}
+
+fn sched_setparam(state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    if !sched_pid_ok(state, args[0]) {
+        return negative_errno(libc::ESRCH);
+    }
+    0
 }
 
 fn getrandom(memory: &mut GuestMemory, address: u64, length: u64) -> i64 {
@@ -7212,7 +7325,6 @@ mod tests {
         .unwrap();
         assert_eq!(path, interp);
         assert_eq!(image, FAKE_ELF);
-        // Kernel order: [interp, shebang args.., script_path, original args[1..]].
         assert_eq!(
             argv,
             vec![
@@ -7258,5 +7370,57 @@ mod tests {
             prctl(&[libc::PR_GET_NAME as u64, 0, 0, 0, 0, 0]),
             negative_errno(libc::ENOSYS)
         );
+    }
+
+    #[test]
+    fn sched_priority_bounds_match_policy_class() {
+        for policy in [libc::SCHED_OTHER, libc::SCHED_BATCH, libc::SCHED_IDLE] {
+            assert_eq!(sched_priority_bound(policy as u64, false), 0);
+            assert_eq!(sched_priority_bound(policy as u64, true), 0);
+        }
+        for policy in [libc::SCHED_FIFO, libc::SCHED_RR] {
+            assert_eq!(sched_priority_bound(policy as u64, false), 1);
+            assert_eq!(sched_priority_bound(policy as u64, true), 99);
+        }
+        assert_eq!(
+            sched_priority_bound(999, true),
+            negative_errno(libc::EINVAL)
+        );
+    }
+
+    #[test]
+    fn sched_scheduler_and_param_model_fixed_sched_other() {
+        let dir = TestDir::new();
+        let state = test_state(&dir.0);
+
+        assert_eq!(
+            sched_getscheduler(&state, &[0, 0, 0, 0, 0, 0]),
+            i64::from(libc::SCHED_OTHER)
+        );
+        assert_eq!(
+            sched_getscheduler(&state, &[999_999, 0, 0, 0, 0, 0]),
+            negative_errno(libc::ESRCH)
+        );
+
+        assert_eq!(
+            sched_setscheduler(
+                &state,
+                &[
+                    0,
+                    (libc::SCHED_FIFO | SCHED_RESET_ON_FORK) as u64,
+                    0,
+                    0,
+                    0,
+                    0
+                ]
+            ),
+            0
+        );
+        assert_eq!(
+            sched_setscheduler(&state, &[0, 12345, 0, 0, 0, 0]),
+            negative_errno(libc::EINVAL)
+        );
+
+        assert_eq!(GUEST_IOPRIO_DEFAULT, 16388);
     }
 }
