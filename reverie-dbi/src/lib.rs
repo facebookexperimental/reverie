@@ -30,8 +30,6 @@ use std::pin::pin;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
-use std::sync::atomic::AtomicI64;
-use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicU16;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -104,12 +102,13 @@ pub struct DbiRuntimeCallbacks {
 }
 
 /// Result of dispatching a syscall through an external DBI Tool.
+// TODO-HUMAN-REVIEW(PR-154): Review the deferred native lifecycle syscall API.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DbiSyscallOutcome {
     /// Suppress the original syscall and install this return value.
     Suppress(i64),
-    /// Let DynamoRIO execute the original syscall after the Rust callback returns.
-    AllowOriginal,
+    /// Execute this syscall through DynamoRIO after the Rust callback returns.
+    ExecuteOriginal(Syscall),
 }
 
 /// In-process guest state passed to a Reverie tool handler.
@@ -162,22 +161,6 @@ where
             tail_inject_result: Arc::new(TailInjectResult::default()),
         }
     }
-}
-
-// TODO-HUMAN-REVIEW(PR-154): Review lifecycle syscalls deferred to DynamoRIO's original path.
-fn lifecycle_syscall_runs_original(number: Sysno) -> bool {
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    matches!(
-        number,
-        Sysno::exit
-            | Sysno::exit_group
-            | Sysno::fork
-            | Sysno::vfork
-            | Sysno::clone
-            | Sysno::clone3
-            | Sysno::execve
-            | Sysno::execveat
-    )
 }
 
 struct DbiGlobal<'a, T>
@@ -307,23 +290,16 @@ where
         Errno::from_ret(result as usize).map(|value| value as i64)
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-154): Review exact syscall deferral for DBI tail injection.
     async fn tail_inject<S: SyscallInfo>(&mut self, syscall: S) -> Never {
-        // Process/thread lifecycle syscalls can re-enter DynamoRIO callbacks or
-        // replace the application image. Defer them until this Rust callback
-        // and all state borrows have returned, then execute the native original
-        // path with DynamoRIO's clone/exec bookkeeping intact.
+        // A tail injection never resumes the handler, so execute it only after
+        // this future and every Rust state borrow have been dropped. Besides
+        // preserving DynamoRIO lifecycle bookkeeping, this keeps blocking calls
+        // such as futex out of `dr_invoke_syscall_as_app`.
         let (number, args) = syscall.into_parts();
-        if lifecycle_syscall_runs_original(number) {
-            self.tail_inject_result.set_allow_original();
-            std::future::pending().await
-        }
-
-        let syscall = Syscall::from_raw(number, args);
-        let value = match self.inject(syscall).await {
-            Ok(value) => value,
-            Err(errno) => -(errno.into_raw() as i64),
-        };
-        self.tail_inject_result.set_result(value);
+        self.tail_inject_result
+            .set_execute_original(Syscall::from_raw(number, args));
         std::future::pending().await
     }
 
@@ -446,41 +422,42 @@ fn align_up(value: usize, align: usize) -> usize {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TailInjectAction {
-    Return(i64),
-    AllowOriginal,
+    ExecuteOriginal(Syscall),
 }
 
 #[derive(Debug, Default)]
 struct TailInjectResult {
-    action: AtomicU8,
-    value: AtomicI64,
+    action: Mutex<Option<TailInjectAction>>,
 }
 
 impl TailInjectResult {
     fn clear(&self) {
-        self.action.store(0, Ordering::SeqCst);
+        *self
+            .action
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
-    fn set_result(&self, value: i64) {
-        self.value.store(value, Ordering::SeqCst);
-        self.action.store(1, Ordering::SeqCst);
-    }
-
-    fn set_allow_original(&self) {
-        self.action.store(2, Ordering::SeqCst);
+    fn set_execute_original(&self, syscall: Syscall) {
+        *self
+            .action
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(TailInjectAction::ExecuteOriginal(syscall));
     }
 
     fn take(&self) -> Option<TailInjectAction> {
-        match self.action.swap(0, Ordering::SeqCst) {
-            0 => None,
-            1 => Some(TailInjectAction::Return(self.value.load(Ordering::SeqCst))),
-            2 => Some(TailInjectAction::AllowOriginal),
-            value => panic!("invalid tail-inject action {value}"),
-        }
+        self.action
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
     }
 
     fn is_ready(&self) -> bool {
-        self.action.load(Ordering::SeqCst) != 0
+        self.action
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
     }
 }
 
@@ -1075,10 +1052,9 @@ pub fn run_tool_syscall<T: Tool>(
             .take()
             .expect("tool handler suspended without a tail-inject result")
         {
-            TailInjectAction::Return(value) => Errno::from_ret(value as usize)
-                .map(|value| DbiSyscallOutcome::Suppress(value as i64))
-                .map_err(Error::from),
-            TailInjectAction::AllowOriginal => Ok(DbiSyscallOutcome::AllowOriginal),
+            TailInjectAction::ExecuteOriginal(syscall) => {
+                Ok(DbiSyscallOutcome::ExecuteOriginal(syscall))
+            }
         },
     }
 }
@@ -1197,16 +1173,34 @@ pub extern "C" fn reverie_dbi_runtime_copied_syscall(_sysnum: i64) -> i32 {
     0
 }
 
+// TODO-HUMAN-REVIEW(PR-154): Review the deferred lifecycle syscall callback ABI.
+unsafe fn write_deferred_syscall(syscall: Syscall, number: *mut i64, args: *mut u64) {
+    let (sysno, syscall_args) = syscall.into_parts();
+    unsafe { number.write(sysno.id() as i64) };
+    let values = [
+        syscall_args.arg0 as u64,
+        syscall_args.arg1 as u64,
+        syscall_args.arg2 as u64,
+        syscall_args.arg3 as u64,
+        syscall_args.arg4 as u64,
+        syscall_args.arg5 as u64,
+    ];
+    unsafe { std::slice::from_raw_parts_mut(args, values.len()) }.copy_from_slice(&values);
+}
+
 /// Handles a DynamoRIO pre-syscall event.
 ///
 /// Returning one asks the native client to suppress the original syscall and
-/// install `result`; returning zero leaves the syscall unchanged. A negative
-/// return terminates the isolated runtime with an enforcement failure.
+/// install `result`; returning two asks it to execute `deferred_sysnum` with
+/// `deferred_args` after the Rust callback returns. Returning zero leaves the
+/// syscall unchanged. A negative return terminates the isolated runtime with an
+/// enforcement failure.
 ///
 /// # Safety
 ///
-/// The context and callback pointers must remain valid for the call. `counters`
-/// and `result` must be writable, and `args` must address six syscall arguments.
+/// The context and callback pointers must remain valid for the call. `counters`,
+/// `result`, and `deferred_sysnum` must be writable; `args` and `deferred_args`
+/// must each address six syscall arguments.
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "prototype-runtime")]
 #[unsafe(no_mangle)]
@@ -1220,6 +1214,8 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     args: *const u64,
     branches: u64,
     result: *mut i64,
+    deferred_sysnum: *mut i64,
+    deferred_args: *mut u64,
     invoke_syscall: SyscallInvoker,
     read_registers: RegisterReader,
     _read_memory: MemoryReader,
@@ -1257,14 +1253,17 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
                 DbiSyscallOutcome::Suppress(value) => {
                     unsafe { result.write(value) };
                     TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
-                    true
+                    1
                 }
-                DbiSyscallOutcome::AllowOriginal => false,
+                DbiSyscallOutcome::ExecuteOriginal(syscall) => {
+                    unsafe { write_deferred_syscall(syscall, deferred_sysnum, deferred_args) };
+                    2
+                }
             };
         }
 
         if !should_rewrite_syscall(sysnum) {
-            return false;
+            return 0;
         }
 
         let syscall = Syscall::from_raw(
@@ -1302,21 +1301,21 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
             Some(Err(Error::Errno(errno))) => -(errno.into_raw() as i64),
             Some(Err(_)) => -(Errno::EIO.into_raw() as i64),
             None => match tail_result.take() {
-                Some(TailInjectAction::Return(value)) => value,
-                Some(TailInjectAction::AllowOriginal) | None => return false,
+                Some(TailInjectAction::ExecuteOriginal(syscall)) => {
+                    unsafe { write_deferred_syscall(syscall, deferred_sysnum, deferred_args) };
+                    return 2;
+                }
+                None => return 0,
             },
         };
         unsafe { result.write(value) };
         TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
-        true
+        1
     }));
 
-    match handled {
-        Ok(true) => 1,
-        // `catch_unwind` cannot actually catch under DR; a genuine panic aborts
-        // before reaching here. `Ok(false)` means "leave the syscall unchanged".
-        Ok(false) | Err(_) => 0,
-    }
+    // `catch_unwind` cannot actually catch under DR; a genuine panic aborts
+    // before reaching here. An error means "leave the syscall unchanged".
+    handled.unwrap_or_default()
 }
 
 /// Initializes the built-in prototype runtime on a native client thread.
@@ -1731,7 +1730,7 @@ mod tests {
     }
 
     #[test]
-    fn tail_inject_records_result_and_suspends() {
+    fn tail_inject_defers_exact_syscall_and_suspends() {
         let mut counters = PrototypeCounters::default();
         let syscall = Syscall::from_raw(Sysno::write, SyscallArgs::new(1, 0x1000, 7, 0, 0, 0));
         let mut guest: DbiGuest<'_, PrototypeTool> = DbiGuest::new(
@@ -1747,24 +1746,31 @@ mod tests {
             read_regs,
         );
 
-        // `tail_inject` performs the syscall, records its result, then suspends
-        // forever, so the driver returns `None`.
+        // `tail_inject` records the exact syscall for native execution after
+        // Rust state is released, then suspends forever.
         let tail_result = Arc::clone(&guest.tail_inject_result);
         tail_result.clear();
         let polled = run_ready(guest.tail_inject(syscall), &tail_result);
         assert!(polled.is_none(), "tail_inject must suspend, not resolve");
-        // The injected `write` returns its length argument (see `invoke`).
-        assert_eq!(tail_result.take(), Some(TailInjectAction::Return(7)));
+        assert_eq!(
+            tail_result.take(),
+            Some(TailInjectAction::ExecuteOriginal(syscall))
+        );
 
-        let exit = Syscall::from_raw(Sysno::exit_group, SyscallArgs::new(0, 0, 0, 0, 0, 0));
+        let exit = Syscall::from_raw(Sysno::exit_group, SyscallArgs::new(42, 0, 0, 0, 0, 0));
         tail_result.clear();
         let polled = run_ready(guest.tail_inject(exit), &tail_result);
         assert!(polled.is_none(), "exit tail-inject must suspend");
         assert_eq!(
             tail_result.take(),
-            Some(TailInjectAction::AllowOriginal),
+            Some(TailInjectAction::ExecuteOriginal(exit)),
             "exit must run only after Rust callback borrows are released"
         );
+        let mut deferred_number = -1;
+        let mut deferred_args = [0; 6];
+        unsafe { write_deferred_syscall(exit, &mut deferred_number, deferred_args.as_mut_ptr()) };
+        assert_eq!(deferred_number, Sysno::exit_group.id() as i64);
+        assert_eq!(deferred_args, [42, 0, 0, 0, 0, 0]);
 
         for number in [
             Sysno::fork,
@@ -1780,7 +1786,7 @@ mod tests {
             assert!(polled.is_none(), "{number:?} tail-inject must suspend");
             assert_eq!(
                 tail_result.take(),
-                Some(TailInjectAction::AllowOriginal),
+                Some(TailInjectAction::ExecuteOriginal(lifecycle)),
                 "{number:?} must use DynamoRIO's original lifecycle path"
             );
         }

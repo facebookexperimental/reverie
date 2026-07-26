@@ -28,8 +28,24 @@ drrun=$("$path_helper" drrun)
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT
 pthread_guest="$tmpdir/pthread-lifecycle"
+rewrite_exit_guest="$tmpdir/rewrite-exit"
+identity_policy_guest="$tmpdir/identity-policy"
+fork_pthread_guest="$tmpdir/fork-pthread-identity"
+blocked_exit_guest="$tmpdir/blocked-exit-group"
+simultaneous_exit_guest="$tmpdir/simultaneous-exit-group"
 "${CC:-cc}" -O2 -g -std=c11 -Wall -Wextra -Werror -pthread \
   "$crate_dir/tests/fixtures/pthread_lifecycle.c" -o "$pthread_guest"
+"${CC:-cc}" -O2 -g -std=c11 -Wall -Wextra -Werror \
+  "$crate_dir/tests/fixtures/rewrite_exit.c" -o "$rewrite_exit_guest"
+"${CC:-cc}" -O2 -g -std=c11 -Wall -Wextra -Werror \
+  "$crate_dir/tests/fixtures/identity_policy.c" -o "$identity_policy_guest"
+"${CC:-cc}" -O2 -g -std=c11 -Wall -Wextra -Werror -pthread \
+  "$crate_dir/tests/fixtures/fork_pthread_identity.c" -o "$fork_pthread_guest"
+"${CC:-cc}" -O2 -g -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror \
+  -Wno-unused-parameter -pthread "$workspace_dir/tests/c_tests/threads_group_exit_blocking.c" \
+  -o "$blocked_exit_guest"
+"${CC:-cc}" -O2 -g -std=c11 -Wall -Wextra -Werror -pthread \
+  "$crate_dir/tests/fixtures/simultaneous_exit_group.c" -o "$simultaneous_exit_guest"
 
 # Run the guest under one tool (selected by $1=ENV) and capture stdout/stderr.
 run_tool() {
@@ -48,9 +64,9 @@ run_pthread_tool() {
   local env_var=$1
   local label=$2
   run_tool "$env_var" "$pthread_guest"
-  grep -q '^threads=4 total=10$' "$tmpdir/out" \
+  grep -q '^threads=8 total=14 unique_tids=8$' "$tmpdir/out" \
     || fail "$label: pthread lifecycle guest failed"
-  echo "PASS: $label (pthread clone/join lifecycle)"
+  echo "PASS: $label (concurrent pthread clone/join lifecycle)"
 }
 
 fail() {
@@ -60,6 +76,23 @@ fail() {
   grep -v '^WARNING' "$tmpdir/err" >&2 || true
   exit 1
 }
+
+set +e
+run_tool HERMIT_DBI_TEST_REWRITE_EXIT "$rewrite_exit_guest"
+rewrite_status=$?
+set -e
+[[ $rewrite_status -eq 42 ]] || fail "deferred getpid-to-exit_group rewrite returned $rewrite_status"
+echo "PASS: deferred lifecycle syscall preserves replacement number and arguments"
+
+run_tool HERMIT_DBI_NOOP "$identity_policy_guest"
+grep -q '^pid=3 ppid=1 tid=3 identity_fd=open$' "$tmpdir/out" \
+  || fail "noop: deferred syscall bypassed virtual identity or private descriptor policy"
+echo "PASS: deferred syscall preserves virtual identity and private descriptors"
+
+run_tool HERMIT_DBI_NOOP "$fork_pthread_guest"
+grep -q '^fork-pthread-race=64$' "$tmpdir/out" \
+  || fail "noop: pthread consumed a concurrent process-clone identity"
+echo "PASS: process-clone identity handoff excludes concurrent pthreads"
 
 # noop: pure passthrough — guest output must be intact, no tool output.
 run_tool HERMIT_DBI_NOOP
@@ -84,13 +117,27 @@ grep -Eq 'counter1 total system calls: [1-9][0-9]*' "$tmpdir/err" \
   || fail "counter1: no RPC total"
 echo "PASS: counter1 (GlobalState RPC total)"
 
-# counter2: must preserve per-thread state, drive tail_inject, and run exit hooks.
+# counter2: drives tail_inject and reports process-wide admission accounting.
 run_tool HERMIT_DBI_COUNTER2
 grep -Eq 'counter2 total system calls: [1-9][0-9]*, from 1 processes, 1 thread\(s\)' \
   "$tmpdir/err" || fail "counter2: no lifecycle summary"
-echo "PASS: counter2 (persistent ThreadState + exit lifecycle)"
+echo "PASS: counter2 (admission accounting + process exit lifecycle)"
 
 run_pthread_tool HERMIT_DBI_NOOP noop
 run_pthread_tool HERMIT_DBI_STRACE strace
 run_pthread_tool HERMIT_DBI_COUNTER1 counter1
+run_pthread_tool HERMIT_DBI_COUNTER2 counter2
+grep -Eq 'counter2 total system calls: [1-9][0-9]*, from 1 processes, 9 thread\(s\)' \
+  "$tmpdir/err" || fail "counter2: incorrect pthread lifecycle summary"
+echo "PASS: counter2 (concurrent admission accounting + exit lifecycle)"
+run_tool HERMIT_DBI_NOOP "$blocked_exit_guest"
+echo "PASS: noop (exit_group interrupts blocked sibling syscalls)"
+run_tool HERMIT_DBI_COUNTER2 "$blocked_exit_guest"
+grep -Eq 'counter2 total system calls: [1-9][0-9]*, from 1 processes, 9 thread\(s\)' \
+  "$tmpdir/err" || fail "counter2: incorrect blocked exit_group summary"
+echo "PASS: counter2 (exit_group interrupts blocked sibling syscalls)"
+run_tool HERMIT_DBI_COUNTER2 "$simultaneous_exit_guest"
+grep -Eq 'counter2 total system calls: [1-9][0-9]*, from 1 processes, 2 thread\(s\)' \
+  "$tmpdir/err" || fail "counter2: concurrent exit_group callers lost lifecycle summary"
+echo "PASS: counter2 (simultaneous exit_group lifecycle election)"
 echo "All DBI example tools passed."

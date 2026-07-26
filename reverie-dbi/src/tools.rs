@@ -19,12 +19,11 @@
 //!    histogram at exit. The upstream example uses a `GlobalState` RPC counter;
 //!    the DBI backend hardwires the global state to `()`, so this uses a
 //!    process-global map instead.
-//!  * [`StraceTool`] — logs every syscall's name, decoded arguments and return
-//!    value. Unlike `strace_minimal` (which uses `tail_inject` and can only
-//!    print `= ?`), this uses [`reverie::Guest::inject`], so it recovers the
-//!    real return value.
-//!  * [`Counter2Tool`] — preserves per-thread counts across syscalls, drives
-//!    `tail_inject`, and folds thread/process exit hooks into a global summary.
+//!  * [`StraceTool`] — logs every syscall's name and decoded arguments, then
+//!    tail-injects it without holding Rust state across a blocking call.
+//!  * [`Counter2Tool`] — drives `tail_inject`, preserves available per-thread
+//!    state across syscalls, and reports process-wide admission counts after its
+//!    exit hook. In-flight thread state may be discarded by `exit_group`.
 //!  * [`NoopTool`] and [`Counter1Tool`] exercise passthrough and GlobalState RPC.
 //!
 //! They are selected at run time via environment variables and dispatched by the
@@ -36,6 +35,8 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::future::Future;
 use std::pin::pin;
+use std::sync::Arc;
+use std::sync::Condvar;
 use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
@@ -72,6 +73,7 @@ pub type Emitter = unsafe extern "C" fn(*const u8, usize);
 const SYSCALL_HISTOGRAM_ENV: &str = "HERMIT_DBI_SYSCALL_HISTOGRAM";
 const STRACE_ENV: &str = "HERMIT_DBI_STRACE";
 const NOOP_ENV: &str = "HERMIT_DBI_NOOP";
+const TEST_REWRITE_EXIT_ENV: &str = "HERMIT_DBI_TEST_REWRITE_EXIT";
 const COUNTER1_ENV: &str = "HERMIT_DBI_COUNTER1";
 const COUNTER2_ENV: &str = "HERMIT_DBI_COUNTER2";
 
@@ -84,6 +86,8 @@ fn env_flag(name: &str) -> bool {
 static HISTOGRAM_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(SYSCALL_HISTOGRAM_ENV));
 static STRACE_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(STRACE_ENV));
 static NOOP_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(NOOP_ENV));
+static TEST_REWRITE_EXIT_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| env_flag(TEST_REWRITE_EXIT_ENV));
 static COUNTER1_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(COUNTER1_ENV));
 static COUNTER2_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(COUNTER2_ENV));
 
@@ -202,10 +206,9 @@ impl Tool for SharedSyscallCounterTool {
     }
 }
 
-/// Logs every syscall's name, decoded arguments and return value.
+/// Logs every syscall's name and decoded arguments.
 ///
-/// Mirrors `strace_minimal`, but recovers the real return value via
-/// `guest.inject` instead of printing `= ?`.
+/// Mirrors `strace_minimal`: the non-returning tail injection is logged as `= ?`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StraceTool;
 
@@ -214,7 +217,7 @@ impl Tool for StraceTool {
     type GlobalState = ();
     type ThreadState = ();
 
-    // TODO-HUMAN-REVIEW(PR-154): Review native lifecycle deferral in DBI strace.
+    // TODO-HUMAN-REVIEW(PR-154): Review nonblocking native deferral in DBI strace.
     async fn handle_syscall_event<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -229,19 +232,11 @@ impl Tool for StraceTool {
             guest.tid(),
             syscall.display(&guest.memory())
         );
-        if crate::lifecycle_syscall_runs_original(syscall.number()) {
-            emit_line(&format!("{prefix} = ?"));
-            if matches!(syscall.number(), Sysno::exit | Sysno::exit_group) && *HISTOGRAM_ENABLED {
-                print_syscall_histogram();
-            }
-            guest.tail_inject(syscall).await
+        emit_line(&format!("{prefix} = ?"));
+        if matches!(syscall.number(), Sysno::exit | Sysno::exit_group) && *HISTOGRAM_ENABLED {
+            print_syscall_histogram();
         }
-        let result = guest.inject(syscall).await;
-        match result {
-            Ok(value) => emit_line(&format!("{prefix} = {value}")),
-            Err(errno) => emit_line(&format!("{prefix} = -1 ({errno:?})")),
-        }
-        Ok(result?)
+        guest.tail_inject(syscall).await
     }
 }
 
@@ -266,6 +261,34 @@ impl Tool for NoopTool {
         syscall: Syscall,
     ) -> Result<i64, Error> {
         guest.tail_inject(syscall).await
+    }
+}
+
+/// Regression tool that replaces `getpid` with `exit_group(42)` to prove that a
+/// deferred lifecycle syscall preserves the Tool-supplied number and arguments.
+#[derive(Clone, Copy, Debug, Default)]
+struct RewriteExitTool;
+
+#[reverie::tool]
+impl Tool for RewriteExitTool {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    // TODO-HUMAN-REVIEW(PR-154): Review deferred lifecycle syscall replacement.
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        match syscall.number() {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            Sysno::getpid => {
+                let exit =
+                    Syscall::from_raw(Sysno::exit_group, SyscallArgs::new(42, 0, 0, 0, 0, 0));
+                guest.tail_inject(exit).await
+            }
+            _ => guest.tail_inject(syscall).await,
+        }
     }
 }
 
@@ -387,16 +410,26 @@ impl Counter2Global {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Counter2Tool {
-    process_syscalls: AtomicU64,
-    exited_threads: AtomicU64,
+    process_syscalls: Arc<AtomicU64>,
+    observed_threads: Arc<AtomicU64>,
+}
+
+impl Counter2Tool {
+    fn observe_syscall(&self) {
+        self.process_syscalls.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 #[reverie::tool]
 impl Tool for Counter2Tool {
     type GlobalState = Counter2Global;
     type ThreadState = u64;
+    fn init_thread_state(&self, _child: Tid, _parent: Option<(Tid, &u64)>) -> u64 {
+        self.observed_threads.fetch_add(1, Ordering::SeqCst);
+        0
+    }
 
     async fn handle_syscall_event<G: Guest<Self>>(
         &self,
@@ -405,19 +438,6 @@ impl Tool for Counter2Tool {
     ) -> Result<i64, Error> {
         *guest.thread_state_mut() += 1;
         guest.tail_inject(syscall).await
-    }
-
-    async fn on_exit_thread<G: reverie::GlobalRPC<Self::GlobalState>>(
-        &self,
-        _tid: Tid,
-        _global_state: &G,
-        thread_syscalls: u64,
-        _exit_status: ExitStatus,
-    ) -> Result<(), Error> {
-        self.process_syscalls
-            .fetch_add(thread_syscalls, Ordering::SeqCst);
-        self.exited_threads.fetch_add(1, Ordering::SeqCst);
-        Ok(())
     }
 
     async fn on_exit_process<G: reverie::GlobalRPC<Self::GlobalState>>(
@@ -429,7 +449,7 @@ impl Tool for Counter2Tool {
         let _ = global_state
             .send_rpc(Counter2Request {
                 syscalls: self.process_syscalls.load(Ordering::SeqCst),
-                threads: self.exited_threads.load(Ordering::SeqCst),
+                threads: self.observed_threads.load(Ordering::SeqCst),
             })
             .await;
         Ok(())
@@ -442,12 +462,15 @@ enum ActiveTool {
     Counter,
     SharedCounter,
     Noop,
+    RewriteExit,
     Counter1,
     Counter2,
 }
 
 fn active_tool() -> Option<ActiveTool> {
-    if *STRACE_ENABLED {
+    if *TEST_REWRITE_EXIT_ENABLED {
+        Some(ActiveTool::RewriteExit)
+    } else if *STRACE_ENABLED {
         Some(ActiveTool::Strace)
     } else if *HISTOGRAM_ENABLED {
         // When a coordinator socket is configured, count into the single shared
@@ -481,39 +504,27 @@ fn run_ready<F: Future>(future: F) -> F::Output {
     }
 }
 
-// TODO-HUMAN-REVIEW(PR-150): Review persistent DBI observation Tool state and exit lifecycle.
-struct ObservationToolHost<T: Tool> {
-    tool: Option<T>,
-    global_state: T::GlobalState,
-    config: <T::GlobalState as GlobalTool>::Config,
-    thread_states: BTreeMap<i32, T::ThreadState>,
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-154): Review nonblocking Counter2 state leases and exit gate.
+#[derive(Default)]
+struct Counter2Registry {
+    process_exiting: bool,
+    exit_ready: bool,
+    tool: Option<Arc<Counter2Tool>>,
+    thread_states: BTreeMap<i32, Arc<Mutex<Option<u64>>>>,
 }
 
-impl<T> Default for ObservationToolHost<T>
-where
-    T: Tool,
-    T::GlobalState: Default,
-    <T::GlobalState as GlobalTool>::Config: Default,
-{
-    fn default() -> Self {
-        Self {
-            tool: None,
-            global_state: T::GlobalState::default(),
-            config: <T::GlobalState as GlobalTool>::Config::default(),
-            thread_states: BTreeMap::new(),
-        }
-    }
+#[derive(Default)]
+struct Counter2Host {
+    registry: Mutex<Counter2Registry>,
+    exit_ready: Condvar,
+    global_state: Counter2Global,
 }
 
-impl<T> ObservationToolHost<T>
-where
-    T: Tool,
-    T::GlobalState: Default,
-    <T::GlobalState as GlobalTool>::Config: Default,
-{
+impl Counter2Host {
     #[allow(clippy::too_many_arguments)]
     fn dispatch(
-        &mut self,
+        &self,
         context: usize,
         tid: Pid,
         pid: Pid,
@@ -524,97 +535,217 @@ where
         read_registers: RegisterReader,
     ) -> Result<(DbiSyscallOutcome, bool), Error> {
         let number = syscall.number();
-        if self.tool.is_none() {
-            self.tool = Some(T::new(pid, &self.config));
-        }
+        let (tool, state_slot, new_thread, mut thread_state) = {
+            let mut registry = self
+                .registry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if registry.process_exiting {
+                if number == Sysno::exit_group {
+                    while !registry.exit_ready {
+                        registry = self
+                            .exit_ready
+                            .wait(registry)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                }
+                return Ok((DbiSyscallOutcome::ExecuteOriginal(syscall), false));
+            }
+            if number == Sysno::exit_group {
+                registry.process_exiting = true;
+            }
 
-        if !self.thread_states.contains_key(&tid.as_raw()) {
-            let state = self
-                .tool
-                .as_ref()
-                .expect("DBI observation Tool disappeared")
-                .init_thread_state(tid, None);
-            self.thread_states.insert(tid.as_raw(), state);
+            let tool = Arc::clone(
+                registry
+                    .tool
+                    .get_or_insert_with(|| Arc::new(Counter2Tool::new(pid, &()))),
+            );
+            let new_thread = !registry.thread_states.contains_key(&tid.as_raw());
+            if new_thread {
+                let state = tool.init_thread_state(tid, None);
+                registry
+                    .thread_states
+                    .insert(tid.as_raw(), Arc::new(Mutex::new(Some(state))));
+            }
+            let state_slot = Arc::clone(
+                registry
+                    .thread_states
+                    .get(&tid.as_raw())
+                    .expect("DBI Counter2 thread state disappeared"),
+            );
+            let thread_state = {
+                let mut stored = state_slot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                stored
+                    .take()
+                    .expect("DBI Counter2 thread state is already leased")
+            };
+            tool.observe_syscall();
+            (tool, state_slot, new_thread, thread_state)
+        };
+
+        if new_thread {
             crate::run_tool_thread_start(
-                self.tool
-                    .as_ref()
-                    .expect("DBI observation Tool disappeared"),
+                tool.as_ref(),
                 context,
                 tid,
                 pid,
                 branches,
-                self.thread_states
-                    .get_mut(&tid.as_raw())
-                    .expect("DBI observation thread state disappeared"),
+                &mut thread_state,
                 &self.global_state,
-                &self.config,
+                &(),
                 invoke_syscall,
                 read_registers,
             )?;
         }
 
         let outcome = crate::run_tool_syscall(
-            self.tool
-                .as_ref()
-                .expect("DBI observation Tool disappeared"),
+            tool.as_ref(),
             context,
             tid,
             pid,
             branches,
-            self.thread_states
-                .get_mut(&tid.as_raw())
-                .expect("DBI observation thread state disappeared"),
+            &mut thread_state,
             &self.global_state,
-            &self.config,
+            &(),
             syscall,
             invoke_syscall,
             read_registers,
-        )?;
+        );
 
         if !is_exit_syscall(number) {
-            return Ok((outcome, false));
+            let registry = self
+                .registry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !registry.process_exiting {
+                let mut stored = state_slot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                debug_assert!(stored.is_none());
+                *stored = Some(thread_state);
+            }
+            return outcome.map(|outcome| (outcome, false));
         }
 
-        let status = ExitStatus::Exited(exit_code & 0xff);
-        let exit_group = number == Sysno::exit_group;
-        let exiting_states = if exit_group {
-            std::mem::take(&mut self.thread_states)
-                .into_iter()
-                .collect::<Vec<_>>()
-        } else {
-            self.thread_states
-                .remove(&tid.as_raw())
-                .map(|state| vec![(tid.as_raw(), state)])
-                .unwrap_or_default()
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if number == Sysno::exit_group {
+                    self.finish_exit_group();
+                }
+                return Err(error);
+            }
         };
-        for (raw_tid, state) in exiting_states {
+        let status = ExitStatus::Exited(exit_code & 0xff);
+        if number == Sysno::exit_group {
+            let (states, process_tool) = {
+                let mut registry = self
+                    .registry
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let states = std::mem::take(&mut registry.thread_states);
+                let process_tool = registry
+                    .tool
+                    .take()
+                    .expect("DBI Counter2 Tool disappeared before process exit");
+                (states, process_tool)
+            };
+
             crate::run_tool_thread_exit(
-                self.tool
-                    .as_ref()
-                    .expect("DBI observation Tool disappeared"),
-                Pid::from_raw(raw_tid),
-                state,
+                tool.as_ref(),
+                tid,
+                thread_state,
                 &self.global_state,
-                &self.config,
+                &(),
                 status,
             )?;
-        }
+            for (raw_tid, state_slot) in states {
+                if raw_tid == tid.as_raw() {
+                    continue;
+                }
+                let state = state_slot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
+                if let Some(state) = state {
+                    crate::run_tool_thread_exit(
+                        tool.as_ref(),
+                        Pid::from_raw(raw_tid),
+                        state,
+                        &self.global_state,
+                        &(),
+                        status,
+                    )?;
+                }
+            }
 
-        let process_exited = exit_group || (tid == pid && self.thread_states.is_empty());
-        if process_exited {
-            let tool = self
-                .tool
-                .take()
-                .expect("DBI observation Tool disappeared before process exit");
-            let global = crate::DbiGlobal::<T> {
+            let global = crate::DbiGlobal::<Counter2Tool> {
                 tid,
                 global_state: &self.global_state,
-                config: &self.config,
+                config: &(),
             };
-            run_ready(tool.on_exit_process(pid, &global, status))?;
+            run_ready(
+                process_tool
+                    .as_ref()
+                    .clone()
+                    .on_exit_process(pid, &global, status),
+            )?;
+            return Ok((outcome, true));
         }
 
+        let (process_exited, process_tool) = {
+            let mut registry = self
+                .registry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            registry.thread_states.remove(&tid.as_raw());
+            let process_exited = tid == pid && registry.thread_states.is_empty();
+            if process_exited {
+                registry.process_exiting = true;
+            }
+            let process_tool = process_exited.then(|| {
+                registry
+                    .tool
+                    .take()
+                    .expect("DBI Counter2 Tool disappeared before process exit")
+            });
+            (process_exited, process_tool)
+        };
+        crate::run_tool_thread_exit(
+            tool.as_ref(),
+            tid,
+            thread_state,
+            &self.global_state,
+            &(),
+            status,
+        )?;
+        if let Some(process_tool) = process_tool {
+            let global = crate::DbiGlobal::<Counter2Tool> {
+                tid,
+                global_state: &self.global_state,
+                config: &(),
+            };
+            run_ready(
+                process_tool
+                    .as_ref()
+                    .clone()
+                    .on_exit_process(pid, &global, status),
+            )?;
+        }
         Ok((outcome, process_exited))
+    }
+
+    fn finish_exit_group(&self) {
+        let mut registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if registry.process_exiting && !registry.exit_ready {
+            registry.exit_ready = true;
+            self.exit_ready.notify_all();
+        }
     }
 }
 
@@ -683,6 +814,16 @@ pub(crate) fn run_active_tool(
         ),
         ActiveTool::Noop => dispatch(
             &NoopTool,
+            context,
+            tid,
+            pid,
+            branches,
+            syscall,
+            invoke_syscall,
+            read_registers,
+        ),
+        ActiveTool::RewriteExit => dispatch(
+            &RewriteExitTool,
             context,
             tid,
             pid,
@@ -818,8 +959,7 @@ fn dispatch_counter1(
     )
 }
 
-static COUNTER2_HOST: LazyLock<Mutex<ObservationToolHost<Counter2Tool>>> =
-    LazyLock::new(|| Mutex::new(ObservationToolHost::default()));
+static COUNTER2_HOST: LazyLock<Counter2Host> = LazyLock::new(Counter2Host::default);
 
 #[allow(clippy::too_many_arguments)]
 fn dispatch_counter2(
@@ -832,10 +972,7 @@ fn dispatch_counter2(
     invoke_syscall: SyscallInvoker,
     read_registers: RegisterReader,
 ) -> Result<DbiSyscallOutcome, Error> {
-    let mut host = COUNTER2_HOST
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let (outcome, process_exited) = host.dispatch(
+    let (outcome, process_exited) = COUNTER2_HOST.dispatch(
         context,
         Pid::from_raw(tid),
         Pid::from_raw(pid),
@@ -846,10 +983,11 @@ fn dispatch_counter2(
         read_registers,
     )?;
     if process_exited {
-        let (syscalls, processes, threads) = host.global_state.snapshot();
+        let (syscalls, processes, threads) = COUNTER2_HOST.global_state.snapshot();
         emit_line(&format!(
             "reverie-dbi: counter2 total system calls: {syscalls}, from {processes} processes, {threads} thread(s)"
         ));
+        COUNTER2_HOST.finish_exit_group();
     }
     Ok(outcome)
 }
@@ -875,7 +1013,7 @@ mod tests {
 
     #[test]
     fn counter2_host_persists_thread_state_and_runs_exit_lifecycle() {
-        let mut host = ObservationToolHost::<Counter2Tool>::default();
+        let host = Counter2Host::default();
         let tid = Pid::from_raw(3);
         let worker_tid = Pid::from_raw(4);
         for _ in 0..2 {
@@ -891,7 +1029,10 @@ mod tests {
                     fake_read_registers,
                 )
                 .unwrap();
-            assert_eq!(outcome, DbiSyscallOutcome::Suppress(0));
+            assert_eq!(
+                outcome,
+                DbiSyscallOutcome::ExecuteOriginal(syscall(Sysno::getpid, 0))
+            );
             assert!(!exited);
         }
 
@@ -907,7 +1048,10 @@ mod tests {
                 fake_read_registers,
             )
             .unwrap();
-        assert_eq!(outcome, DbiSyscallOutcome::Suppress(0));
+        assert_eq!(
+            outcome,
+            DbiSyscallOutcome::ExecuteOriginal(syscall(Sysno::gettid, 0))
+        );
         assert!(!exited);
 
         let (outcome, exited) = host
@@ -922,7 +1066,10 @@ mod tests {
                 fake_read_registers,
             )
             .unwrap();
-        assert_eq!(outcome, DbiSyscallOutcome::AllowOriginal);
+        assert_eq!(
+            outcome,
+            DbiSyscallOutcome::ExecuteOriginal(syscall(Sysno::exit, 0))
+        );
         assert!(!exited);
 
         let (outcome, exited) = host
@@ -937,7 +1084,10 @@ mod tests {
                 fake_read_registers,
             )
             .unwrap();
-        assert_eq!(outcome, DbiSyscallOutcome::AllowOriginal);
+        assert_eq!(
+            outcome,
+            DbiSyscallOutcome::ExecuteOriginal(syscall(Sysno::exit_group, 7))
+        );
         assert!(exited);
         assert_eq!(host.global_state.snapshot(), (5, 1, 2));
     }

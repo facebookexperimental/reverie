@@ -171,10 +171,12 @@ extern void reverie_dbi_runtime_background_init(void *argument);
 extern int32_t reverie_dbi_runtime_ready(uint64_t image_generation);
 extern void reverie_dbi_runtime_process_exit(void);
 extern int32_t reverie_dbi_runtime_copied_syscall(int64_t sysnum);
+// TODO-HUMAN-REVIEW(PR-154): Review the deferred lifecycle syscall callback ABI.
 extern int32_t reverie_dbi_runtime_pre_syscall(
     void *context, prototype_counters_t *counters, int32_t tid, int32_t pid,
     uint64_t image_generation, int64_t sysnum, const uint64_t *args,
-    uint64_t branches, int64_t *result, syscall_invoker_t invoke_syscall,
+    uint64_t branches, int64_t *result, int64_t *deferred_sysnum,
+    uint64_t *deferred_args, syscall_invoker_t invoke_syscall,
     register_reader_t read_registers, memory_reader_t read_memory,
     reverie_emit_fn_t emit);
 extern const char *reverie_dbi_runtime_name(void);
@@ -207,7 +209,11 @@ static void exit_runtime_tree(int exit_code) {
 static int32_t virtual_process_id = VIRTUAL_ROOT_PID;
 static int32_t virtual_parent_process_id = VIRTUAL_INIT_PID;
 static virtual_identity_state_t *virtual_identity_state;
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-154): Review serialized clone identity handoff.
+static atomic_flag pending_clone_lock = ATOMIC_FLAG_INIT;
 static _Atomic int32_t pending_clone_virtual_child;
+static _Atomic int32_t pending_clone_creator_pid;
 static _Atomic uint64_t pending_clone_flags;
 
 static bool map_inherited_virtual_identity_state(void) {
@@ -712,39 +718,73 @@ static bool is_clone_syscall(int sysnum) {
          sysnum == SYS_clone3;
 }
 
+static void acquire_clone_identity_handoff(void) {
+  while (atomic_flag_test_and_set_explicit(&pending_clone_lock,
+                                           memory_order_acquire))
+    dr_sleep(1);
+}
+
+static void release_clone_identity_handoff(int32_t virtual_child) {
+  int32_t expected = virtual_child;
+  if (virtual_child == 0)
+    return;
+  if (atomic_compare_exchange_strong_explicit(
+          &pending_clone_virtual_child, &expected, 0, memory_order_acq_rel,
+          memory_order_acquire)) {
+    atomic_store_explicit(&pending_clone_flags, 0, memory_order_relaxed);
+    atomic_store_explicit(&pending_clone_creator_pid, 0, memory_order_relaxed);
+    atomic_flag_clear_explicit(&pending_clone_lock, memory_order_release);
+  }
+}
+
 static bool prepare_clone_identity(prototype_counters_t *counters, int sysnum,
                                    const uint64_t *args) {
   uint64_t flags;
   if (!clone_identity_flags(sysnum, args, &flags))
     return false;
   DR_ASSERT(counters->pending_virtual_child == 0);
+  if ((flags & CLONE_THREAD) == 0)
+    acquire_clone_identity_handoff();
   counters->pending_virtual_child = allocate_virtual_identity();
   counters->pending_clone_flags = flags;
-  atomic_store_explicit(&pending_clone_flags, flags, memory_order_relaxed);
-  atomic_store_explicit(&pending_clone_virtual_child,
-                        counters->pending_virtual_child, memory_order_release);
+  if ((flags & CLONE_THREAD) == 0) {
+    atomic_store_explicit(&pending_clone_flags, flags, memory_order_relaxed);
+    atomic_store_explicit(&pending_clone_creator_pid,
+                          (int32_t)dr_get_process_id(), memory_order_relaxed);
+    atomic_store_explicit(&pending_clone_virtual_child,
+                          counters->pending_virtual_child, memory_order_release);
+  }
   return true;
 }
 
-static void complete_clone_identity(prototype_counters_t *counters,
-                                    int64_t result) {
+static int32_t complete_clone_identity(prototype_counters_t *counters,
+                                       int64_t result) {
   int32_t virtual_child = counters->pending_virtual_child;
   uint64_t flags = counters->pending_clone_flags;
+  int32_t mapped;
   if (virtual_child == 0)
-    return;
+    return 0;
 
   if (result > 0) {
-    remember_virtual_identity((int32_t)result, virtual_child);
+    if ((flags & CLONE_THREAD) != 0 &&
+        lookup_virtual_identity((int32_t)result, &mapped))
+      virtual_child = mapped;
+    else
+      remember_virtual_identity((int32_t)result, virtual_child);
   } else if (result == 0) {
     int32_t host_tid = (int32_t)dr_get_thread_id(dr_get_current_drcontext());
-    remember_virtual_identity(host_tid, virtual_child);
+    if ((flags & CLONE_THREAD) != 0 &&
+        lookup_virtual_identity(host_tid, &mapped))
+      virtual_child = mapped;
+    else
+      remember_virtual_identity(host_tid, virtual_child);
     if ((flags & CLONE_THREAD) != 0) {
       counters->virtual_tid = virtual_child;
     } else {
       int32_t parent = counters->virtual_pid;
       remember_virtual_identity((int32_t)dr_get_process_id(), virtual_child);
       if ((flags & CLONE_VM) != 0)
-        return;
+        return virtual_child;
       counters->virtual_pid = virtual_child;
       counters->virtual_ppid = parent;
       counters->virtual_tid = virtual_child;
@@ -752,10 +792,12 @@ static void complete_clone_identity(prototype_counters_t *counters,
       virtual_process_id = virtual_child;
     }
   }
+  if ((flags & CLONE_THREAD) == 0 &&
+      (result <= 0 || (flags & CLONE_VM) == 0))
+    release_clone_identity_handoff(virtual_child);
   counters->pending_virtual_child = 0;
   counters->pending_clone_flags = 0;
-  atomic_store_explicit(&pending_clone_virtual_child, 0, memory_order_release);
-  atomic_store_explicit(&pending_clone_flags, 0, memory_order_relaxed);
+  return virtual_child;
 }
 
 static bool pending_identity_is_process(const prototype_counters_t *counters) {
@@ -791,7 +833,9 @@ static int64_t invoke_syscall(uintptr_t context, int64_t sysnum,
     return result;
   result = invoke_raw_syscall(context, sysnum, translated);
   if (is_clone) {
-    complete_clone_identity(counters, result);
+    int32_t virtual_child = complete_clone_identity(counters, result);
+    if (result > 0)
+      return virtual_child;
     return result;
   }
   if (sysnum == SYS_waitid && result >= 0)
@@ -1451,13 +1495,16 @@ static void post_syscall(void *drcontext, int sysnum) {
   DR_ASSERT(counters != NULL);
 
   if (counters->pending_virtual_child != 0 && is_clone_syscall(sysnum)) {
-    int32_t virtual_child = counters->pending_virtual_child;
-    complete_clone_identity(counters, syscall_result);
+    int32_t virtual_child = complete_clone_identity(counters, syscall_result);
     if (syscall_result > 0) {
       syscall_result = virtual_child;
       dr_syscall_set_result(drcontext, (reg_t)syscall_result);
     }
   }
+
+  syscall_result = virtualize_identity_result(counters, sysnum, syscall_result);
+  if (syscall_result != host_syscall_result)
+    dr_syscall_set_result(drcontext, (reg_t)syscall_result);
 
   if (sysnum == SYS_wait4 && syscall_result > 0) {
     syscall_result = virtualize_host_identity((int32_t)syscall_result);
@@ -1638,25 +1685,50 @@ static bool pre_syscall(void *drcontext, int sysnum) {
   if (syscall_reads_stdin(drcontext, sysnum, args))
     atomic_fetch_add_explicit(&stdin_read_count, 1, memory_order_relaxed);
 
+  int64_t deferred_sysnum = sysnum;
+  uint64_t deferred_args[6] = {0};
   int32_t action = reverie_dbi_runtime_pre_syscall(
       drcontext, counters, (int32_t)dr_get_thread_id(drcontext),
       (int32_t)dr_get_process_id(),
       atomic_load_explicit(&image_generation, memory_order_acquire),
       (int64_t)sysnum, args,
       atomic_load_explicit(&branch_count, memory_order_relaxed), &result,
-      invoke_syscall, read_registers, read_memory, reverie_dbi_emit);
+      &deferred_sysnum, deferred_args, invoke_syscall, read_registers,
+      read_memory, reverie_dbi_emit);
   if (action != 0 && counters->pending_thread_clone != 0)
     counters->pending_thread_clone = 0;
 
-  if (action < 0) {
+  if (action < 0 || action > 2) {
     exit_runtime_tree(101);
     return false;
   }
-  if (action > 0) {
+  if (action == 1) {
     retry_pipe_eagain(drcontext, sysnum, args, &result);
     result = virtualize_identity_result(counters, sysnum, result);
     dr_syscall_set_result(drcontext, (reg_t)result);
     return false;
+  }
+  if (action == 2) {
+    uint64_t clone_flags = 0;
+    uint64_t clone_ctid = 0;
+    int i;
+    sysnum = (int)deferred_sysnum;
+    memcpy(args, deferred_args, sizeof(args));
+    dr_syscall_set_sysnum(drcontext, sysnum);
+    for (i = 0; i != 6; ++i)
+      dr_syscall_set_param(drcontext, i, (reg_t)args[i]);
+    if (thread_clone_metadata(drcontext, sysnum, &clone_flags, &clone_ctid)) {
+      counters->pending_thread_clone = 1;
+      counters->thread_clone_flags = clone_flags;
+      counters->thread_clone_ctid = clone_ctid;
+    }
+    if (preserve_internal_descriptors((uintptr_t)drcontext, sysnum, args,
+                                      &result) ||
+        emulate_identity_getter(counters, sysnum, &result)) {
+      dr_syscall_set_result(drcontext, (reg_t)result);
+      return false;
+    }
+    return prepare_original_identity_syscall(drcontext, counters, sysnum, args);
   }
 
   /* Prototype runtimes can decline these calls; external Tools such as
@@ -1679,6 +1751,12 @@ static void thread_init(void *drcontext) {
   int32_t host_tid = (int32_t)dr_get_thread_id(drcontext);
   int32_t pending_child =
       atomic_load_explicit(&pending_clone_virtual_child, memory_order_acquire);
+  int32_t clone_creator =
+      pending_child != 0
+          ? atomic_load_explicit(&pending_clone_creator_pid, memory_order_relaxed)
+          : 0;
+  if ((int32_t)dr_get_process_id() == clone_creator)
+    pending_child = 0;
   uint64_t clone_flags =
       pending_child != 0
           ? atomic_load_explicit(&pending_clone_flags, memory_order_relaxed)
@@ -1716,6 +1794,7 @@ static void thread_init(void *drcontext) {
     if (!is_thread)
       remember_virtual_identity((int32_t)dr_get_process_id(), pending_child);
     remember_virtual_identity(host_tid, pending_child);
+    release_clone_identity_handoff(pending_child);
   }
 
   counters->pending_thread_start = (uint64_t)pending_thread_start;
