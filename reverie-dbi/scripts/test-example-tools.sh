@@ -32,7 +32,7 @@ trap 'rm -rf "$tmpdir"' EXIT
 run_tool() {
   local env_var=$1
   shift
-  env "$env_var=1" "$drrun" -disable_rseq -c "$client" -- \
+  env "$env_var=1" "$drrun" -disable_rseq -stack_size 2M -c "$client" -- \
     /bin/bash -c 'echo GUEST-STDOUT; true' \
     >"$tmpdir/out" 2>"$tmpdir/err"
 }
@@ -67,5 +67,11 @@ run_tool HERMIT_DBI_COUNTER1
 grep -Eq 'counter1 total system calls: [1-9][0-9]*' "$tmpdir/err" \
   || fail "counter1: no RPC total"
 echo "PASS: counter1 (GlobalState RPC total)"
+
+# counter2: must preserve per-thread state, drive tail_inject, and run exit hooks.
+run_tool HERMIT_DBI_COUNTER2
+grep -Eq 'counter2 total system calls: [1-9][0-9]*, from 1 processes, 1 thread\(s\)' \
+  "$tmpdir/err" || fail "counter2: no lifecycle summary"
+echo "PASS: counter2 (persistent ThreadState + exit lifecycle)"
 
 echo "All DBI example tools passed."

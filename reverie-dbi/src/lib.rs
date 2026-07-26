@@ -1226,7 +1226,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
         // If an env-selected observation tool (syscall counter / strace) is
         // active, it handles every syscall via the standard `Tool` trait and
         // supersedes the built-in determinism policy.
-        if let Some(value) = tools::run_active_tool(
+        if let Some(outcome) = tools::run_active_tool(
             context as usize,
             tid,
             pid,
@@ -1236,9 +1236,14 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
             invoke_syscall,
             read_registers,
         ) {
-            unsafe { result.write(value) };
-            TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
-            return true;
+            return match outcome {
+                DbiSyscallOutcome::Suppress(value) => {
+                    unsafe { result.write(value) };
+                    TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+                    true
+                }
+                DbiSyscallOutcome::AllowOriginal => false,
+            };
         }
 
         if !should_rewrite_syscall(sysnum) {
