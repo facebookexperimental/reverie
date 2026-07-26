@@ -20,8 +20,10 @@ use std::task::Poll;
 use std::task::Waker;
 
 use parking_lot::Mutex;
+use reverie::Backtrace;
 use reverie::Error;
 use reverie::ExitStatus;
+use reverie::Frame;
 use reverie::GlobalRPC;
 use reverie::GlobalTool;
 use reverie::Guest;
@@ -596,10 +598,84 @@ where
             .expect("SaBRe thread state already consumed")
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-140): Review mapping from the SaBRe frame to user_regs_struct.
     async fn regs(&mut self) -> libc::user_regs_struct {
-        // The legacy callback omits the trampoline register frame. Syscall
-        // arguments remain available in the typed Syscall passed to the tool.
-        unsafe { std::mem::zeroed() }
+        let mut regs = unsafe { std::mem::zeroed::<libc::user_regs_struct>() };
+        if let Some((number, args)) = self.original {
+            regs.rax = number.id() as u64;
+            regs.orig_rax = number.id() as u64;
+            regs.rdi = args.arg0 as u64;
+            regs.rsi = args.arg1 as u64;
+            regs.rdx = args.arg2 as u64;
+            regs.r10 = args.arg3 as u64;
+            regs.r8 = args.arg4 as u64;
+            regs.r9 = args.arg5 as u64;
+        }
+
+        let Some(frame) = crate::callbacks::current_syscall_frame() else {
+            return regs;
+        };
+        let frame = unsafe { &*frame };
+        regs.r15 = frame.r15 as u64;
+        regs.r14 = frame.r14 as u64;
+        regs.r13 = frame.r13 as u64;
+        regs.r12 = frame.r12 as u64;
+        regs.rbp = frame.rbp_prologue as u64;
+        regs.rbx = frame.rbx as u64;
+        regs.r11 = frame.r11 as u64;
+        regs.r10 = frame.r10 as u64;
+        regs.r9 = frame.r9 as u64;
+        regs.r8 = frame.r8 as u64;
+        regs.rcx = frame.rcx as u64;
+        regs.rdx = frame.rdx as u64;
+        regs.rsi = frame.rsi as u64;
+        regs.rdi = frame.rdi as u64;
+        regs.rip = frame.ret as u64;
+        regs.rsp = unsafe { (frame as *const crate::ffi::syscall_stackframe).add(1) as u64 };
+        regs
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-140): Review writable versus fixed SaBRe trampoline registers.
+    async fn set_regs(&mut self, regs: libc::user_regs_struct) -> Result<(), Error> {
+        let current = self.regs().await;
+        let Some(frame) = crate::callbacks::current_syscall_frame() else {
+            return Err(Errno::ENOSYS.into());
+        };
+        if regs.rax != current.rax
+            || regs.orig_rax != current.orig_rax
+            || regs.rsp != current.rsp
+            || regs.eflags != current.eflags
+            || regs.cs != current.cs
+            || regs.ss != current.ss
+            || regs.ds != current.ds
+            || regs.es != current.es
+            || regs.fs != current.fs
+            || regs.gs != current.gs
+            || regs.fs_base != current.fs_base
+            || regs.gs_base != current.gs_base
+        {
+            return Err(Errno::EOPNOTSUPP.into());
+        }
+
+        let frame = unsafe { &mut *frame };
+        frame.r15 = regs.r15 as *mut libc::c_void;
+        frame.r14 = regs.r14 as *mut libc::c_void;
+        frame.r13 = regs.r13 as *mut libc::c_void;
+        frame.r12 = regs.r12 as *mut libc::c_void;
+        frame.rbp_prologue = regs.rbp as *mut libc::c_void;
+        frame.rbx = regs.rbx as *mut libc::c_void;
+        frame.r11 = regs.r11 as *mut libc::c_void;
+        frame.r10 = regs.r10 as *mut libc::c_void;
+        frame.r9 = regs.r9 as *mut libc::c_void;
+        frame.r8 = regs.r8 as *mut libc::c_void;
+        frame.rcx = regs.rcx as *mut libc::c_void;
+        frame.rdx = regs.rdx as *mut libc::c_void;
+        frame.rsi = regs.rsi as *mut libc::c_void;
+        frame.rdi = regs.rdi as *mut libc::c_void;
+        frame.ret = regs.rip as *mut libc::c_void;
+        Ok(())
     }
 
     async fn stack(&mut self) -> Self::Stack {
@@ -646,6 +722,12 @@ where
         }
         if self.original == Some((number, args)) {
             if let Some(inject) = self.special_inject.take() {
+                // Fork/exit injectors may resume the child or terminate without
+                // unwinding this callback. Do not carry its parent stack pointer
+                // into that execution path.
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-140): Review frame suspension on diverging injectors.
+                let _frame_suspended = crate::callbacks::SyscallFrameGuard::suspend();
                 return Errno::from_ret(inject()).map(|value| value as i64);
             }
         }
@@ -690,6 +772,20 @@ where
         // No branch clock is exposed by SaBRe yet. Zero is stable and prevents
         // fabricated RCB progress while syscall-boundary bring-up is exercised.
         Ok(0)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-140): Review the intentionally single-frame backtrace contract.
+    fn backtrace(&mut self) -> Option<Backtrace> {
+        let frame = crate::callbacks::current_syscall_frame()?;
+        let ip = unsafe { (*frame).ret as u64 };
+        Some(Backtrace::new(
+            self.tid,
+            vec![Frame {
+                ip,
+                is_signal: false,
+            }],
+        ))
     }
 }
 
@@ -814,6 +910,69 @@ mod tests {
         assert_eq!(adapter.handle_syscall(syscall), Ok(123));
         assert_eq!(HANDLED.load(Ordering::Relaxed), 1);
     }
+
+    #[derive(Default)]
+    struct RegisterTool;
+
+    #[reverie::tool]
+    impl ReverieTool for RegisterTool {
+        type GlobalState = ();
+        type ThreadState = ();
+
+        async fn handle_syscall_event<G: Guest<Self>>(
+            &self,
+            guest: &mut G,
+            _syscall: Syscall,
+        ) -> Result<i64, Error> {
+            let mut regs = guest.regs().await;
+            assert_eq!(regs.rax, Sysno::getpid.id() as u64);
+            assert_eq!(regs.orig_rax, Sysno::getpid.id() as u64);
+            assert_eq!(regs.r15, 15);
+            assert_eq!(regs.r10, 40);
+            assert_eq!(regs.r9, 50);
+            assert_eq!(regs.r8, 60);
+            assert_eq!(regs.rdi, 10);
+            assert_eq!(regs.rsi, 20);
+            assert_eq!(regs.rdx, 30);
+            assert_eq!(regs.rip, 0xf00d);
+            assert_eq!(guest.backtrace().unwrap().iter().next().unwrap().ip, 0xf00d);
+
+            let mut unsupported = regs;
+            unsupported.rsp += 8;
+            assert!(guest.set_regs(unsupported).await.is_err());
+
+            regs.r15 = 1515;
+            regs.rip = 0xbeef;
+            guest.set_regs(regs).await?;
+            Ok(123)
+        }
+    }
+
+    #[test]
+    fn exposes_and_updates_the_live_sabre_syscall_frame() {
+        let mut frame = unsafe { std::mem::zeroed::<crate::ffi::syscall_stackframe>() };
+        frame.r15 = 15usize as *mut libc::c_void;
+        frame.r10 = 40usize as *mut libc::c_void;
+        frame.r9 = 50usize as *mut libc::c_void;
+        frame.r8 = 60usize as *mut libc::c_void;
+        frame.rdi = 10usize as *mut libc::c_void;
+        frame.rsi = 20usize as *mut libc::c_void;
+        frame.rdx = 30usize as *mut libc::c_void;
+        frame.ret = 0xf00dusize as *mut libc::c_void;
+
+        assert!(crate::callbacks::current_syscall_frame().is_none());
+        {
+            let _frame_guard = crate::callbacks::SyscallFrameGuard::enter(&mut frame);
+            let adapter = ReverieAdapter::new(RegisterTool, (), ());
+            let syscall =
+                Syscall::from_raw(Sysno::getpid, SyscallArgs::new(10, 20, 30, 40, 60, 50));
+            assert_eq!(adapter.handle_syscall(syscall), Ok(123));
+        }
+        assert!(crate::callbacks::current_syscall_frame().is_none());
+        assert_eq!(frame.r15 as usize, 1515);
+        assert_eq!(frame.ret as usize, 0xbeef);
+    }
+
     #[derive(Default)]
     struct RemoteCounter {
         total: AtomicUsize,

@@ -10,7 +10,8 @@ the riptrace demo, but it is not a drop-in replacement for
 | Area | Current behavior |
 | --- | --- |
 | Syscalls | Intercepts rewritten syscall instructions and invokes the synchronous in-process `Tool::syscall` callback. The default implementation performs the real syscall. |
-| Guest memory | Exposes direct local-process memory through `LocalMemory`; there is no remote memory or register API. |
+| Guest memory | Exposes direct local-process memory through `LocalMemory`; there are no remote-memory operations. |
+| Shared-tool guest context | The `ReverieAdapter` exposes the live SaBRe syscall frame through `Guest::regs`, supports writes to saved GPRs and the return IP through `Guest::set_regs`, and returns the current guest IP from `Guest::backtrace`. The fixed trampoline stack pointer, syscall number/result registers, flags, and segment state are read-only. |
 | Threads | Creates backend records lazily when an intercepted thread is first observed. Start and exit callbacks are emitted at most once for a tracked thread. Repeated pthread create/return/join waves are covered by the conformance gate. |
 | Process exit | `exit_group` requests orderly exit from tracked threads, then issues a real kernel `exit_group` so threads that never reached an interception boundary cannot survive. Configurable timeout handling is supported. |
 | Signals | Central handlers mediate standard catchable signals. Guest `rt_sigaction` registration and query are virtualized, including `SA_RESTART`. Linux default ignore, continue, stop, and terminate dispositions are preserved. |
@@ -80,8 +81,9 @@ cargo test -p reverie-sabre
   as the runtime's controlled-exit signal.
 - Tool callbacks can observe signals but cannot replace, suppress, or redirect
   delivery through a shared backend-neutral contract.
-- There is no tool-facing register, stack, remote injection, subscription,
-  CPUID, timer, or PMU interface comparable to `reverie-ptrace`.
+- Register access is limited to the live syscall callback frame, backtraces
+  contain only the current guest IP, and there is no remote injection,
+  subscription, CPUID, timer, or PMU interface comparable to `reverie-ptrace`.
 - `execveat`, static binaries, non-x86-64 guests, loader distribution, and broad
   clone/vfork/exec stress coverage remain unsupported or unverified.
 - `execve` validates the pathname and argv pointer list before replacing the

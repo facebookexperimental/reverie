@@ -24,6 +24,42 @@ use super::utils;
 use super::vdso;
 use crate::signal::guard;
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-140): Review the loader-owned syscall-frame lifetime boundary.
+thread_local! {
+    static CURRENT_SYSCALL_FRAME: std::cell::Cell<*mut ffi::syscall_stackframe> =
+        const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+/// Keeps the loader's live syscall frame available to the synchronous shared-tool callback.
+pub(crate) struct SyscallFrameGuard {
+    previous: *mut ffi::syscall_stackframe,
+}
+
+impl SyscallFrameGuard {
+    pub(crate) fn enter(frame: *mut ffi::syscall_stackframe) -> Self {
+        let previous = CURRENT_SYSCALL_FRAME.replace(frame);
+        Self { previous }
+    }
+
+    pub(crate) fn suspend() -> Self {
+        Self::enter(std::ptr::null_mut())
+    }
+}
+
+impl Drop for SyscallFrameGuard {
+    fn drop(&mut self) {
+        CURRENT_SYSCALL_FRAME.set(self.previous);
+    }
+}
+
+pub(crate) fn current_syscall_frame() -> Option<*mut ffi::syscall_stackframe> {
+    CURRENT_SYSCALL_FRAME.with(|frame| {
+        let frame = frame.get();
+        (!frame.is_null()).then_some(frame)
+    })
+}
+
 pub const CONTROLLED_EXIT_SIGNAL: libc::c_int = libc::SIGSTKFLT;
 
 /// Read clone3's stack pointer without directly dereferencing guest memory.
@@ -137,6 +173,7 @@ fn handle_syscall_with_thread<T: ToolGlobal>(
     let intercepted = Syscall::from_raw(sys_no, args);
     let wrapper_address = wrapper_sp as usize;
     let return_address = unsafe { (*wrapper_sp).ret } as usize;
+    let _frame_guard = SyscallFrameGuard::enter(wrapper_sp);
 
     let result = if sys_no == Sysno::clone && arg2 != 0 {
         // New thread with its own stack: the kernel sets the child's %rsp to

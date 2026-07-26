@@ -57,7 +57,7 @@ out-of-process ptrace backend.
 | Tool interface | Shared async `reverie::Tool` and `Guest` | Synchronous `reverie_sabre::Tool`, plus a first-poll `ReverieAdapter` subset |
 | Syscall execution | Guest injection and tail injection | Direct in-process syscall execution |
 | Guest memory | Remote memory abstraction | Direct `LocalMemory` access |
-| Registers and stack | Read/write APIs | No tool-facing equivalent |
+| Registers and stack | Read/write APIs | Syscall-frame GPR and return-IP access in `ReverieAdapter`; in-process scratch stack; no out-of-callback register access |
 | Global state | Async typed global tool | Blocking generated RPC client/service |
 | Thread state | Typed tool-defined state | Native runtime records; the adapter supplies typed `T::ThreadState` |
 | Signals | Tool can influence delivery | Notification only |
