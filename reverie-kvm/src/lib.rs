@@ -36,8 +36,13 @@ pub use runtime::KvmStack;
 pub use runtime::KvmStackGuard;
 pub use runtime::SyscallExecutor;
 pub use syscall::SyscallRequest;
+pub use tools::CounterTool;
+pub use tools::HierarchicalCounter;
+pub use tools::HierarchicalCounterTool;
+pub use tools::HierarchicalTotals;
 pub use tools::StraceLog;
 pub use tools::StraceTool;
+pub use tools::SyscallCounter;
 pub use vm::KvmBackend;
 pub use vm::VMCALL_SYSCALL_TRANSPORT;
 
