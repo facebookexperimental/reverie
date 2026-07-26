@@ -38,6 +38,7 @@ const MAX_PROGRAM_HEADERS_SIZE: usize = PAGE_SIZE as usize;
 const MAX_INTERPRETER_BYTES: u64 = 16 * 1024 * 1024;
 const MAIN_LOAD_BIAS: u64 = 2 * 1024 * 1024;
 const INTERPRETER_LOAD_BIAS: u64 = 16 * 1024 * 1024;
+const IOPRIO_CLASS_SHIFT: u32 = 13;
 /// Page-aligned program-break gap reserved between a large main image and a
 /// relocated interpreter base. Only applies when the main image would overrun
 /// the historical fixed [`INTERPRETER_LOAD_BIAS`]; small PIEs are unaffected.
@@ -76,6 +77,11 @@ pub(crate) struct LoadedStaticElf {
     pub pid: i32,
     pub ppid: i32,
     pub umask: libc::mode_t,
+    // TODO-HUMAN-REVIEW(PR-119): Review virtual scheduler/ioprio process state.
+    pub sched_policy: libc::c_int,
+    pub sched_priority: libc::c_int,
+    pub sched_reset_on_fork: bool,
+    pub ioprio: libc::c_int,
     pub signal_actions: std::collections::BTreeMap<i32, [u8; 32]>,
     pub signal_mask: [u8; 8],
     pub signal_alt_stack: Option<Vec<u8>>,
@@ -100,6 +106,9 @@ pub(crate) struct LoadedStaticElf {
 
 impl LoadedStaticElf {
     pub(crate) fn try_clone_for_fork(&self, child_pid: i32) -> Result<Self> {
+        // TODO-HUMAN-REVIEW(PR-119): Review scheduler reset and ioprio fork inheritance.
+        let reset_realtime = self.sched_reset_on_fork
+            && matches!(self.sched_policy, libc::SCHED_FIFO | libc::SCHED_RR);
         let files = self
             .files
             .iter()
@@ -126,6 +135,22 @@ impl LoadedStaticElf {
             pid: child_pid,
             ppid: self.pid,
             umask: self.umask,
+            sched_policy: if reset_realtime {
+                libc::SCHED_OTHER
+            } else {
+                self.sched_policy
+            },
+            sched_priority: if reset_realtime {
+                0
+            } else {
+                self.sched_priority
+            },
+            sched_reset_on_fork: false,
+            ioprio: if self.ioprio >> IOPRIO_CLASS_SHIFT == 0 {
+                0
+            } else {
+                self.ioprio
+            },
             signal_actions: self.signal_actions.clone(),
             signal_mask: self.signal_mask,
             signal_alt_stack: self.signal_alt_stack.clone(),
@@ -196,6 +221,11 @@ impl LoadedStaticElf {
         self.pid = previous.pid;
         self.ppid = previous.ppid;
         self.umask = previous.umask;
+        // TODO-HUMAN-REVIEW(PR-119): Review scheduler and ioprio exec inheritance.
+        self.sched_policy = previous.sched_policy;
+        self.sched_priority = previous.sched_priority;
+        self.sched_reset_on_fork = previous.sched_reset_on_fork;
+        self.ioprio = previous.ioprio;
         self.signal_actions = signal_actions;
         self.signal_mask = previous.signal_mask;
         self.files = files;
@@ -338,6 +368,11 @@ pub(crate) fn load_static_elf(
         pid: 1,
         ppid: 0,
         umask: 0o022,
+        // TODO-HUMAN-REVIEW(PR-119): Review default virtual scheduler and ioprio state.
+        sched_policy: libc::SCHED_OTHER,
+        sched_priority: 0,
+        sched_reset_on_fork: false,
+        ioprio: 0,
         signal_actions: std::collections::BTreeMap::new(),
         signal_mask: [0; 8],
         signal_alt_stack: None,
