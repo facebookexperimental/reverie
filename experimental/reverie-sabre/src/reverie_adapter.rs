@@ -30,6 +30,7 @@ use reverie::GlobalTool;
 use reverie::Guest;
 use reverie::Never;
 use reverie::Pid;
+use reverie::Rdtsc;
 use reverie::Stack;
 use reverie::TimerSchedule;
 use reverie::Tool as ReverieTool;
@@ -292,6 +293,42 @@ where
     /// GlobalTool.
     pub fn handle_syscall(&self, syscall: Syscall) -> Result<usize, Errno> {
         self.dispatch_syscall(syscall, None)
+    }
+
+    /// Forwards an intercepted RDTSC instruction through the shared tool and
+    /// remote GlobalTool.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-144): Review SaBRe RDTSC forwarding.
+    pub fn handle_rdtsc(&self) -> Result<u64, Errno> {
+        let tid = current_tid();
+        let pid = current_pid();
+        let state = self.thread_state(tid).map_err(remote_rpc_error)?;
+        let mut state = state.lock();
+        let RemoteThreadState {
+            thread_state,
+            rpc,
+            exit_handled,
+        } = &mut *state;
+        let mut guest = SabreGuest::new(
+            tid,
+            pid,
+            thread_state,
+            rpc,
+            Some((&self.tool, exit_handled)),
+            None,
+            None,
+        );
+
+        match poll_once(self.tool.handle_rdtsc_event(&mut guest, Rdtsc::Tsc)) {
+            Poll::Ready(Ok(result)) => Ok(result.tsc),
+            Poll::Ready(Err(error)) => Err(error),
+            Poll::Pending => {
+                crate::eprintln!(
+                    "reverie-sabre: remote Tool::handle_rdtsc_event suspended and was dropped"
+                );
+                Err(Errno::EIO)
+            }
+        }
     }
 
     /// Forwards a runtime-bookkept syscall through the shared tool and remote
@@ -1103,6 +1140,15 @@ mod tests {
         ) -> Result<i64, Error> {
             Ok(guest.send_rpc(1).await as i64)
         }
+
+        async fn handle_rdtsc_event<G: Guest<Self>>(
+            &self,
+            guest: &mut G,
+            _request: Rdtsc,
+        ) -> Result<reverie::RdtscResult, Errno> {
+            let tsc = guest.send_rpc(10).await as u64;
+            Ok(reverie::RdtscResult { tsc, aux: None })
+        }
     }
 
     #[test]
@@ -1140,10 +1186,11 @@ mod tests {
         let syscall = Syscall::from_raw(Sysno::getpid, SyscallArgs::new(0, 0, 0, 0, 0, 0));
         assert_eq!(adapter.handle_syscall(syscall), Ok(1));
         assert_eq!(adapter.handle_syscall(syscall), Ok(2));
+        assert_eq!(adapter.handle_rdtsc(), Ok(12));
         drop(adapter);
 
         assert!(server_thread.join().unwrap().is_ok());
-        assert_eq!(global.total.load(Ordering::SeqCst), 2);
+        assert_eq!(global.total.load(Ordering::SeqCst), 12);
     }
 
     #[test]
