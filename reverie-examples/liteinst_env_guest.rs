@@ -15,6 +15,8 @@ fn main() {
         Some("check-coordinator-environment") => check_coordinator_environment(),
         // TODO-HUMAN-REVIEW(PR-148): Review the allocator-reentry test guest mode.
         Some("exercise-allocator") => exercise_allocator(),
+        // TODO-HUMAN-REVIEW(PR-152): Review the chunky_print ordering test guest mode.
+        Some("chunky-alias-order") => exercise_chunky_alias_order(),
         Some(argument) => panic!("unknown argument {argument:?}"),
     }
 }
@@ -77,4 +79,21 @@ fn exercise_allocator() {
     assert_eq!(large[last], 0xa5);
 
     println!("allocator-growth-ok");
+}
+
+// TODO-HUMAN-REVIEW(PR-152): Review deterministic chunky_print ordering coverage.
+fn exercise_chunky_alias_order() {
+    let alias = unsafe { libc::dup(libc::STDOUT_FILENO) };
+    assert!(alias > libc::STDERR_FILENO);
+    for index in 0_u8..16 {
+        let tens = b'0' + index / 10;
+        let ones = b'0' + index % 10;
+        let buffered = [b'B', tens, ones, b';'];
+        let pass_through = [b'P', tens, ones, b';'];
+        let written = unsafe { libc::write(libc::STDOUT_FILENO, buffered.as_ptr().cast(), 4) };
+        assert_eq!(written, 4);
+        let written = unsafe { libc::write(alias, pass_through.as_ptr().cast(), 4) };
+        assert_eq!(written, 4);
+    }
+    assert_eq!(unsafe { libc::close(alias) }, 0);
 }

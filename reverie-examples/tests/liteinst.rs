@@ -239,6 +239,33 @@ fn exact_counter2_tool_reports_process_and_thread_totals() {
 }
 
 #[test]
+fn exact_chunky_print_delays_buffered_write_behind_later_alias_write() {
+    let output = run(
+        "chunky-print",
+        &[],
+        &[
+            env!("CARGO_BIN_EXE_reverie-liteinst-env-guest"),
+            "chunky-alias-order",
+        ],
+    );
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(stdout.len(), 16 * 8, "{stdout}");
+    let mut observed_buffering = false;
+    for index in 0..16 {
+        let buffered = format!("B{index:02};");
+        let pass_through = format!("P{index:02};");
+        assert_eq!(stdout.matches(&buffered).count(), 1, "{stdout}");
+        assert_eq!(stdout.matches(&pass_through).count(), 1, "{stdout}");
+        let buffered_at = stdout.find(&buffered).unwrap();
+        let pass_through_at = stdout.find(&pass_through).unwrap();
+        observed_buffering |= pass_through_at < buffered_at;
+    }
+    assert!(observed_buffering, "output was pure pass-through: {stdout}");
+}
+#[test]
 fn exact_strace_tool_observes_filtered_write() {
     let output = run("strace", &["--trace", "write"], &["/bin/echo", "hello"]);
 

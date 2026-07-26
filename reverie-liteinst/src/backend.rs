@@ -249,6 +249,46 @@ impl LiteinstBackend {
             ChildWait::Status(_) => unreachable!("output run returned only a status"),
         }
     }
+
+    // TODO-HUMAN-REVIEW(PR-152): Review inherited-stdio tool bootstrap support.
+    /// Runs a tool with inherited guest stdio and opaque constructor bootstrap bytes.
+    ///
+    /// The returned [`Output`] contains the guest status and empty byte buffers.
+    /// This is useful for tools that share the launcher's output sink and must
+    /// preserve ordering between intercepted and pass-through guest writes.
+    pub async fn run_with_inherited_stdio_and_preload_data<T>(
+        mut command: Command,
+        config: <T::GlobalState as GlobalTool>::Config,
+        preload: impl Into<PathBuf>,
+        tool_data: impl Into<Vec<u8>>,
+    ) -> Result<(Output, T::GlobalState), Error>
+    where
+        T: Tool + 'static,
+    {
+        inherit_stdio(&mut command);
+        let (wait, global) = launch::<T>(
+            command,
+            config,
+            preload.into(),
+            true,
+            Some(tool_data.into()),
+        )
+        .await?;
+        match wait {
+            ChildWait::Output(output) => {
+                debug_assert!(output.stdout.is_empty());
+                debug_assert!(output.stderr.is_empty());
+                Ok((output, global))
+            }
+            ChildWait::Status(_) => unreachable!("output run returned only a status"),
+        }
+    }
+}
+
+fn inherit_stdio(command: &mut Command) {
+    command.stdin(reverie::process::Stdio::inherit());
+    command.stdout(reverie::process::Stdio::inherit());
+    command.stderr(reverie::process::Stdio::inherit());
 }
 
 #[reverie::backend(?Send)]
@@ -419,5 +459,21 @@ mod tests {
         assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
         assert_eq!(unsafe { libc::fcntl(third, libc::F_GETFD) }, -1);
         assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+    }
+
+    #[test]
+    fn inherited_stdio_replaces_caller_pipes() {
+        let mut command = Command::new("/bin/true");
+        command
+            .stdin(reverie::process::Stdio::piped())
+            .stdout(reverie::process::Stdio::piped())
+            .stderr(reverie::process::Stdio::piped());
+        inherit_stdio(&mut command);
+        let mut child = command.into_std_lossy().spawn().unwrap();
+        assert!(child.stdin.is_none());
+        assert!(child.stdout.is_none());
+        assert!(child.stderr.is_none());
+        let status = child.wait().unwrap();
+        assert!(status.success());
     }
 }

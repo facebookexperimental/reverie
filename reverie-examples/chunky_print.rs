@@ -55,7 +55,8 @@ pub enum Msg {
 type LogicalTime = u64;
 
 #[derive(Debug, Default)]
-struct ChunkyPrintGlobal(Mutex<Inner>);
+// TODO-HUMAN-REVIEW(PR-152): Review crate-local LiteInst hosting visibility.
+pub(crate) struct ChunkyPrintGlobal(Mutex<Inner>);
 
 #[derive(Debug, Default)]
 struct Inner {
@@ -86,6 +87,13 @@ impl GlobalTool for ChunkyPrintGlobal {
                 let _ = mg.flush_messages();
             }
         }
+    }
+}
+
+impl ChunkyPrintGlobal {
+    // TODO-HUMAN-REVIEW(PR-152): Review the shared final-output flush boundary.
+    pub(crate) fn flush(&self) -> io::Result<()> {
+        self.0.lock().unwrap().flush_messages()
     }
 }
 
@@ -161,7 +169,8 @@ impl Inner {
 }
 
 #[derive(Debug, Default)]
-struct ChunkyPrintLocal {
+// TODO-HUMAN-REVIEW(PR-152): Review crate-local LiteInst hosting visibility.
+pub(crate) struct ChunkyPrintLocal {
     stdout_disconnected: AtomicBool,
     stderr_disconnected: AtomicBool,
 }
@@ -270,7 +279,7 @@ async fn main() -> Result<(), Error> {
         .await?;
     let (status, global_state) = tracer.wait().await?;
     trace!(" [chunky_print] global exit, flushing last messages.");
-    let _ = global_state.0.lock().unwrap().flush_messages();
+    let _ = global_state.flush();
     drop(log_guard); // Flush logs before exiting.
     status.raise_or_exit()
 }

@@ -20,8 +20,12 @@ use reverie::process::Command;
 use reverie_liteinst::LiteinstBackend;
 
 #[allow(dead_code)]
+#[path = "../chunky_print.rs"]
+mod chunky_print;
+#[allow(dead_code)]
 #[path = "../counter1.rs"]
 mod counter1;
+
 #[allow(dead_code)]
 #[path = "../counter2.rs"]
 mod counter2;
@@ -46,6 +50,9 @@ pub(crate) enum ToolKind {
     /// Aggregate per-thread and per-process syscall counts in global state.
     // TODO-HUMAN-REVIEW(PR-146): Review the counter2 LiteInst selector extension.
     Counter2,
+    /// Buffer standard output and error writes by logical epochs.
+    // TODO-HUMAN-REVIEW(PR-152): Review the chunky_print LiteInst selector extension.
+    ChunkyPrint,
     /// Decode and print subscribed syscalls.
     Strace,
     /// Preserve guest behavior without subscribing to events.
@@ -58,6 +65,7 @@ impl ToolKind {
             Self::Counter1 => "counter1",
             Self::Counter2 => "counter2",
             Self::Strace => "strace",
+            Self::ChunkyPrint => "chunky-print",
             Self::Noop => "noop",
         }
     }
@@ -143,6 +151,18 @@ pub(crate) async fn run(
             Ok(RunOutput {
                 output,
                 counter_summary: Some(counter_summary),
+            })
+        }
+        // TODO-HUMAN-REVIEW(PR-152): Review the exact chunky_print LiteInst host path.
+        ToolKind::ChunkyPrint => {
+            let (output, global) = LiteinstBackend::run_with_inherited_stdio_and_preload_data::<
+                chunky_print::ChunkyPrintLocal,
+            >(command, (), preload, tool_data)
+            .await?;
+            let _ = global.flush();
+            Ok(RunOutput {
+                output,
+                counter_summary: None,
             })
         }
         ToolKind::Strace => {

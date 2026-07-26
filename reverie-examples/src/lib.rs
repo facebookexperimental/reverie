@@ -19,8 +19,12 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 #[allow(dead_code)]
+#[path = "../chunky_print.rs"]
+mod chunky_print;
+#[allow(dead_code)]
 #[path = "../counter1.rs"]
 mod counter1;
+
 #[allow(dead_code)]
 #[path = "../counter2.rs"]
 mod counter2;
@@ -97,6 +101,10 @@ unsafe extern "C" fn initialize(
         // TODO-HUMAN-REVIEW(PR-146): Review counter2 preload tool selection.
         "counter2" => unsafe {
             reverie_liteinst::install_tool_from_bootstrap::<counter2::CounterLocal>(&socket)
+        },
+        // TODO-HUMAN-REVIEW(PR-152): Review chunky_print preload tool selection.
+        "chunky-print" => unsafe {
+            reverie_liteinst::install_tool_from_bootstrap::<chunky_print::ChunkyPrintLocal>(&socket)
         },
         "strace" => unsafe {
             reverie_liteinst::install_tool_from_bootstrap::<strace::Strace>(&socket)
