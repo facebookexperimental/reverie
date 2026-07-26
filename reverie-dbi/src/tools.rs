@@ -30,6 +30,11 @@
 //!    exit. It records at syscall entry via `tail_inject` (never `inject`s), so
 //!    its per-syscall durations are inter-entry approximations, not true return
 //!    times — an intentional L0 fidelity limit.
+//!  * [`ChaosTool`] is the first execution-*perturbing* DBI tool: it truncates
+//!    `read`/`recvfrom` to one byte and optionally injects `EINTR`, driving each
+//!    intervened syscall through `inject` to observe its real result. Its
+//!    `ERESTARTSYS`→`EINTR` substitution is the one behavioral difference from
+//!    the upstream example (DBI's suppress model has no kernel syscall restart).
 //!
 //! They are selected at run time via environment variables and dispatched by the
 //! native client through [`run_active_tool`]. Output is written through a
@@ -87,11 +92,25 @@ const COUNTER1_ENV: &str = "HERMIT_DBI_COUNTER1";
 const COUNTER2_ENV: &str = "HERMIT_DBI_COUNTER2";
 const CHUNKY_PRINT_ENV: &str = "HERMIT_DBI_CHUNKY_PRINT";
 const CHROME_TRACE_ENV: &str = "HERMIT_DBI_CHROME_TRACE";
+const CHAOS_ENV: &str = "HERMIT_DBI_CHAOS";
+const CHAOS_SKIP_ENV: &str = "HERMIT_DBI_CHAOS_SKIP";
+const CHAOS_NO_READ_ENV: &str = "HERMIT_DBI_CHAOS_NO_READ";
+const CHAOS_NO_RECV_ENV: &str = "HERMIT_DBI_CHAOS_NO_RECV";
+const CHAOS_INTERRUPT_ENV: &str = "HERMIT_DBI_CHAOS_INTERRUPT";
 
 fn env_flag(name: &str) -> bool {
     std::env::var_os(name).is_some_and(|value| {
         !value.is_empty() && value != OsStr::new("0") && value != OsStr::new("false")
     })
+}
+
+/// Parses an unsigned integer environment variable, defaulting to 0 when unset
+/// or unparseable.
+fn env_u64(name: &str) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(0)
 }
 
 static HISTOGRAM_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(SYSCALL_HISTOGRAM_ENV));
@@ -103,6 +122,48 @@ static COUNTER1_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(COUNTER1_ENV
 static COUNTER2_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(COUNTER2_ENV));
 static CHUNKY_PRINT_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(CHUNKY_PRINT_ENV));
 static CHROME_TRACE_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(CHROME_TRACE_ENV));
+static CHAOS_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(CHAOS_ENV));
+
+/// The `chaos` intervention configuration, resolved once from the environment.
+///
+/// Mirrors the `chaos` example's `ChaosOpts`, but sourced from environment
+/// variables (the DBI backend selects and configures tools by env, not by a
+/// CLI). `no_interrupt` defaults to `true` — DBI's suppress model cannot request
+/// the kernel syscall restart that the ptrace example's `ERESTARTSYS` relies on,
+/// so error injection surfaces `EINTR` directly and is opt-in via
+/// [`CHAOS_INTERRUPT_ENV`]. Read/recv truncation is the safe default.
+static CHAOS_CONFIG: LazyLock<ChaosOpts> = LazyLock::new(|| ChaosOpts {
+    skip: env_u64(CHAOS_SKIP_ENV),
+    no_read: env_flag(CHAOS_NO_READ_ENV),
+    no_recv: env_flag(CHAOS_NO_RECV_ENV),
+    no_interrupt: !env_flag(CHAOS_INTERRUPT_ENV),
+});
+
+/// Process-global syscall counter for [`ChaosTool`]'s `skip` window. Each
+/// syscall event builds a fresh `DbiGuest`, so this must persist across calls.
+static CHAOS_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Per-thread "already interrupted once" flags for [`ChaosTool`], keyed by raw
+/// tid. The DBI tool hardwires `ThreadState` to `()`, so the example's
+/// `bool` thread state lives here (the [`ChunkyPrintTool`]/[`ChromeTraceTool`]
+/// process-global-by-tid pattern).
+static CHAOS_INTERRUPTED: LazyLock<Mutex<BTreeMap<i32, bool>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+fn chaos_take_interrupted(tid: i32) -> bool {
+    *CHAOS_INTERRUPTED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(tid)
+        .or_insert(false)
+}
+
+fn chaos_set_interrupted(tid: i32, value: bool) {
+    CHAOS_INTERRUPTED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(tid, value);
+}
 
 /// Process-global epoch for [`ChromeTraceTool`] timestamps. Captured once, on
 /// first access, so every recorded event is expressed as microseconds since a
@@ -916,6 +977,153 @@ impl Tool for ChromeTraceTool {
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-166): Review the DBI chaos intervention port.
+/// The `chaos` example's intervention knobs, adapted to the DBI backend.
+///
+/// Field meanings match `reverie-examples/chaos.rs`: `skip` passes the first N
+/// syscalls through untouched (needed to clear the dynamic linker, which does
+/// not retry short reads); `no_read`/`no_recv` disable read/recv truncation;
+/// `no_interrupt` disables error injection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChaosOpts {
+    skip: u64,
+    no_read: bool,
+    no_recv: bool,
+    no_interrupt: bool,
+}
+
+impl Default for ChaosOpts {
+    fn default() -> Self {
+        // Truncation on, interruption off — see [`CHAOS_CONFIG`].
+        Self {
+            skip: 0,
+            no_read: false,
+            no_recv: false,
+            no_interrupt: true,
+        }
+    }
+}
+
+/// The decision for a chaos-intercepted `read`, factored out so the branch
+/// logic is unit-testable without a live `Guest`.
+#[derive(Debug, PartialEq, Eq)]
+enum ChaosRead {
+    /// Inject an interruption without running the read. DBI's suppress model
+    /// cannot request the kernel syscall restart the ptrace example triggers
+    /// with `ERESTARTSYS`, so the guest sees `EINTR` directly and must retry.
+    Interrupt,
+    /// Run a read truncated to this many bytes and observe the result — the
+    /// "pathological kernel returns one byte at a time" behavior.
+    Truncate(usize),
+    /// Run the read unmodified (only its result is observed).
+    Unmodified,
+}
+
+/// Chooses the chaos action for a `read` of `len` bytes given the config and
+/// whether this thread was already interrupted since its last completed read.
+fn chaos_read_action(
+    len: usize,
+    no_read: bool,
+    no_interrupt: bool,
+    interrupted: bool,
+) -> ChaosRead {
+    if !no_interrupt && !interrupted {
+        ChaosRead::Interrupt
+    } else if !no_read {
+        ChaosRead::Truncate(1.min(len))
+    } else {
+        ChaosRead::Unmodified
+    }
+}
+
+/// The `chaos` example [`Tool`], adapted to DBI: the first **execution-
+/// perturbing** DBI tool rather than a pure observer. It truncates `read`/
+/// `recvfrom` to one byte (a pathological kernel), optionally injecting `EINTR`
+/// first, and observes the real (identity-virtualized) result via
+/// [`Guest::inject`]. Every other syscall is passed straight through with
+/// `tail_inject`, keeping potentially-blocking calls off the
+/// `dr_invoke_syscall_as_app` path.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ChaosTool;
+
+#[reverie::tool]
+impl Tool for ChaosTool {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    // TODO-HUMAN-REVIEW(PR-166): Review lifecycle-safe chaos truncation + injection.
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        let cfg = &*CHAOS_CONFIG;
+        let count = CHAOS_COUNT.fetch_add(1, Ordering::SeqCst);
+        let pid = guest.pid().as_raw();
+        let tid = guest.tid().as_raw();
+
+        // Pass the linker/startup window through untouched.
+        if count < cfg.skip {
+            emit_line(&format!(
+                "chaos SKIPPED [pid {pid} n {count}] {}",
+                syscall.display(&guest.memory())
+            ));
+            // `tail_inject` diverges; the `return` just exits this branch.
+            #[allow(unreachable_code)]
+            return guest.tail_inject(syscall).await;
+        }
+
+        // Decide the transformed syscall, or short-circuit with an injected
+        // interruption / passthrough.
+        let transformed = match syscall {
+            Syscall::Read(read) => {
+                match chaos_read_action(
+                    read.len(),
+                    cfg.no_read,
+                    cfg.no_interrupt,
+                    chaos_take_interrupted(tid),
+                ) {
+                    ChaosRead::Interrupt => {
+                        chaos_set_interrupted(tid, true);
+                        let err = reverie::syscalls::Errno::EINTR;
+                        emit_line(&format!(
+                            "chaos [pid {pid} n {count}] {} = {}",
+                            syscall.display(&guest.memory()),
+                            -err.into_raw() as i64
+                        ));
+                        return Err(err.into());
+                    }
+                    ChaosRead::Truncate(len) => Syscall::Read(read.with_len(len)),
+                    ChaosRead::Unmodified => Syscall::Read(read),
+                }
+            }
+            Syscall::Recvfrom(recv) if !cfg.no_recv => {
+                Syscall::Recvfrom(recv.with_len(1.min(recv.len())))
+            }
+            other => {
+                emit_line(&format!(
+                    "chaos [pid {pid} n {count}] {}",
+                    other.display(&guest.memory())
+                ));
+                #[allow(unreachable_code)]
+                return guest.tail_inject(other).await;
+            }
+        };
+
+        // A completed (truncated) read clears this thread's interrupt latch so
+        // the next read is interrupted again, matching the example's alternation.
+        chaos_set_interrupted(tid, false);
+        let ret = guest.inject(transformed).await;
+        emit_line(&format!(
+            "chaos [pid {pid} n {count}] {} = {}",
+            transformed.display_with_outputs(&guest.memory()),
+            ret.unwrap_or_else(|errno| -errno.into_raw() as i64)
+        ));
+        Ok(ret?)
+    }
+}
+
 /// The observation tool selected by the environment, if any.
 enum ActiveTool {
     Strace,
@@ -927,6 +1135,7 @@ enum ActiveTool {
     Counter2,
     ChunkyPrint,
     ChromeTrace,
+    Chaos,
 }
 
 fn active_tool() -> Option<ActiveTool> {
@@ -951,6 +1160,8 @@ fn active_tool() -> Option<ActiveTool> {
         Some(ActiveTool::ChunkyPrint)
     } else if *CHROME_TRACE_ENABLED {
         Some(ActiveTool::ChromeTrace)
+    } else if *CHAOS_ENABLED {
+        Some(ActiveTool::Chaos)
     } else if *NOOP_ENABLED {
         Some(ActiveTool::Noop)
     } else {
@@ -1335,6 +1546,18 @@ pub(crate) fn run_active_tool(
             invoke_syscall,
             read_registers,
         ),
+        // Chaos carries no global/thread state (its per-thread latch and skip
+        // counter are process-global), so it uses the generic dispatch.
+        ActiveTool::Chaos => dispatch(
+            &ChaosTool,
+            context,
+            tid,
+            pid,
+            branches,
+            syscall,
+            invoke_syscall,
+            read_registers,
+        ),
     };
     Some(match result {
         Ok(outcome) => outcome,
@@ -1702,5 +1925,56 @@ mod tests {
         assert_eq!(inner.threads[&3].events[0].dur_us, 30);
         assert_eq!(inner.threads[&4].events.len(), 1);
         assert_eq!(inner.threads[&4].pid, 3);
+    }
+
+    #[test]
+    fn chaos_read_alternates_interrupt_and_truncation() {
+        // Default config: truncation on, interruption off (DBI-safe default).
+        assert_eq!(
+            chaos_read_action(4096, false, true, false),
+            ChaosRead::Truncate(1)
+        );
+        assert_eq!(
+            chaos_read_action(0, false, true, false),
+            ChaosRead::Truncate(0)
+        );
+
+        // With interruption enabled, an un-interrupted thread is interrupted
+        // first, then its next read is truncated.
+        assert_eq!(
+            chaos_read_action(4096, false, false, false),
+            ChaosRead::Interrupt
+        );
+        assert_eq!(
+            chaos_read_action(4096, false, false, true),
+            ChaosRead::Truncate(1)
+        );
+    }
+
+    #[test]
+    fn chaos_read_respects_no_read_and_disabled_interrupt() {
+        // no_read leaves the read unmodified (still observed, not truncated).
+        assert_eq!(
+            chaos_read_action(4096, true, true, false),
+            ChaosRead::Unmodified
+        );
+        // no_read but interruption enabled still interrupts the first read.
+        assert_eq!(
+            chaos_read_action(4096, true, false, false),
+            ChaosRead::Interrupt
+        );
+        // Both interventions off: pass the read through unmodified.
+        assert_eq!(
+            chaos_read_action(4096, true, true, true),
+            ChaosRead::Unmodified
+        );
+    }
+
+    #[test]
+    fn chaos_default_config_truncates_without_interrupting() {
+        let cfg = ChaosOpts::default();
+        assert!(!cfg.no_read, "truncation on by default");
+        assert!(cfg.no_interrupt, "interruption off by default (DBI-safe)");
+        assert_eq!(cfg.skip, 0);
     }
 }

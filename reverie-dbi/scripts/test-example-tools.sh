@@ -33,6 +33,8 @@ identity_policy_guest="$tmpdir/identity-policy"
 fork_pthread_guest="$tmpdir/fork-pthread-identity"
 blocked_exit_guest="$tmpdir/blocked-exit-group"
 simultaneous_exit_guest="$tmpdir/simultaneous-exit-group"
+chaos_read_guest="$tmpdir/chaos-read-file"
+chaos_data="$tmpdir/chaos-data.txt"
 "${CC:-cc}" -O2 -g -std=c11 -Wall -Wextra -Werror -pthread \
   "$crate_dir/tests/fixtures/pthread_lifecycle.c" -o "$pthread_guest"
 "${CC:-cc}" -O2 -g -std=c11 -Wall -Wextra -Werror \
@@ -46,6 +48,12 @@ simultaneous_exit_guest="$tmpdir/simultaneous-exit-group"
   -o "$blocked_exit_guest"
 "${CC:-cc}" -O2 -g -std=c11 -Wall -Wextra -Werror -pthread \
   "$crate_dir/tests/fixtures/simultaneous_exit_group.c" -o "$simultaneous_exit_guest"
+# Statically linked so the chaos read-truncation does not perturb the dynamic
+# linker (glibc's ld.so does not retry short reads); the only intercepted reads
+# are then the fixture's own post-startup file reads.
+"${CC:-cc}" -O2 -g -std=c11 -Wall -Wextra -Werror -static \
+  "$crate_dir/tests/fixtures/chaos_read_file.c" -o "$chaos_read_guest"
+printf 'CHAOS-ONE-BYTE-AT-A-TIME\n' >"$chaos_data"
 
 # Run the guest under one tool (selected by $1=ENV) and capture stdout/stderr.
 run_tool() {
@@ -156,6 +164,35 @@ grep -q '"cat":"syscall"' <<<"$chrome_json" \
 grep -q '"ph":"X"' <<<"$chrome_json" \
   || fail "chrome_trace: JSON missing complete (X) syscall events"
 echo "PASS: chrome_trace (per-thread timeline -> Chrome trace JSON at exit)"
+
+# chaos (default): truncate every read to one byte. A correct guest must still
+# reconstruct the whole file, so stdout is unchanged, while the tool trace shows
+# the reads being cut to a single byte (`= 1`). This is the first DBI tool that
+# perturbs execution rather than only observing it.
+run_tool HERMIT_DBI_CHAOS "$chaos_read_guest" "$chaos_data"
+grep -q '^CHAOS-ONE-BYTE-AT-A-TIME$' "$tmpdir/out" \
+  || fail "chaos: truncated reads corrupted the reconstructed file contents"
+grep -Eq 'chaos \[pid [0-9]+ n [0-9]+\] read\(.*\) = 1' "$tmpdir/err" \
+  || fail "chaos: no one-byte-truncated read observed"
+# The 24-byte payload forces many single-byte reads, not just one.
+truncated_reads=$(grep -Ec 'chaos \[pid [0-9]+ n [0-9]+\] read\(.*\) = 1' "$tmpdir/err")
+[[ "$truncated_reads" -ge 10 ]] \
+  || fail "chaos: expected many one-byte reads, saw $truncated_reads"
+echo "PASS: chaos (read truncated to one byte, file reconstructed intact)"
+
+# chaos (interrupt opt-in): inject EINTR before each read. DBI cannot request a
+# kernel syscall restart, so the guest sees EINTR directly and must retry; a
+# correct guest still reconstructs the file.
+env HERMIT_DBI_CHAOS=1 HERMIT_DBI_CHAOS_INTERRUPT=1 \
+  "$drrun" -disable_rseq -stack_size 2M -c "$client" -- \
+  "$chaos_read_guest" "$chaos_data" >"$tmpdir/out" 2>"$tmpdir/err" \
+  || fail "chaos: guest failed under EINTR injection"
+grep -q '^CHAOS-ONE-BYTE-AT-A-TIME$' "$tmpdir/out" \
+  || fail "chaos: EINTR injection corrupted the reconstructed file contents"
+eintr_injections=$(grep -Ec 'chaos \[pid [0-9]+ n [0-9]+\] read\(.*\) = -4' "$tmpdir/err")
+[[ "$eintr_injections" -ge 1 ]] \
+  || fail "chaos: no injected EINTR (= -4) observed"
+echo "PASS: chaos (injected EINTR retried, file reconstructed intact)"
 
 run_pthread_tool HERMIT_DBI_NOOP noop
 run_pthread_tool HERMIT_DBI_STRACE strace
