@@ -8,11 +8,15 @@
 
 //! An example that counts system calls using a simple, global state.
 
+#[path = "src/kvm_runner.rs"]
+mod kvm_runner;
+
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use clap::Parser;
 use reverie::Error;
+use reverie::ExitStatus;
 use reverie::GlobalTool;
 use reverie::Guest;
 use reverie::Pid;
@@ -81,18 +85,53 @@ impl Tool for CounterLocal {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Error> {
-    let args = CommonToolArguments::parse();
-    let log_guard = args.init_tracing();
-    let tracer = reverie_ptrace::TracerBuilder::<CounterLocal>::new(args.into())
-        .spawn()
-        .await?;
-    let (status, global_state) = tracer.wait().await?;
-    eprintln!(
-        " [counter tool] Total system calls in process tree: {}",
-        AtomicU64::load(&global_state.num_syscalls, Ordering::SeqCst)
-    );
+#[derive(Debug, Parser)]
+struct Opts {
+    // TODO-HUMAN-REVIEW(PR-151): Review counter1 runner selection.
+    /// Execution runner; KVM selects the prototype KvmGuest host.
+    #[clap(long, value_enum, default_value = "ptrace")]
+    runner: kvm_runner::Runner,
+
+    #[clap(flatten)]
+    common: CommonToolArguments,
+}
+
+fn main() -> anyhow::Result<()> {
+    let args = Opts::parse();
+    let stdin = match args.runner {
+        kvm_runner::Runner::Ptrace => None,
+        kvm_runner::Runner::Kvm => kvm_runner::reserve_stdin()?,
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(run_main(args, stdin))
+}
+
+async fn run_main(args: Opts, stdin: Option<std::fs::File>) -> anyhow::Result<()> {
+    let log_guard = args.common.init_tracing();
+    let (status, global_state) = match args.runner {
+        kvm_runner::Runner::Ptrace => {
+            let tracer =
+                reverie_ptrace::TracerBuilder::<CounterLocal>::new(args.common.clone().into())
+                    .spawn()
+                    .await?;
+            tracer.wait().await?
+        }
+        kvm_runner::Runner::Kvm => {
+            let result = kvm_runner::run::<CounterLocal>(&args.common, (), stdin).await?;
+            (ExitStatus::Exited(result.exit_code), result.global_state)
+        }
+    };
+    let total = global_state.total();
+    match args.runner {
+        kvm_runner::Runner::Ptrace => {
+            eprintln!(" [counter tool] Total system calls in process tree: {total}");
+        }
+        kvm_runner::Runner::Kvm => {
+            eprintln!(" [counter tool] Total system calls observed from root process: {total}");
+        }
+    }
     drop(log_guard); // Flush logs before exiting.
     status.raise_or_exit()
 }
