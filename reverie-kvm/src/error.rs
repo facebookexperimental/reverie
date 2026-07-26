@@ -79,6 +79,11 @@ pub enum Error {
     #[error("the virtual CPU exposes neither vmcall nor vmmcall")]
     HypercallInstructionUnsupported,
 
+    /// The host cannot execute every instruction advertised by the fixed CPU profile.
+    // TODO-HUMAN-REVIEW(PR-129): Review fail-closed CPUID capability validation.
+    #[error("host cannot support deterministic CPUID profile: {0}")]
+    UnsupportedCpuidProfile(String),
+
     /// The guest used a hypercall number other than the syscall transport.
     #[error("unexpected guest hypercall number {0}")]
     UnexpectedHypercall(u64),

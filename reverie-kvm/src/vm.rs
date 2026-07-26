@@ -130,8 +130,9 @@ impl KvmBackend {
         }
 
         let mut cpuid = kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)?;
-        cpuid_policy.apply(&mut cpuid);
+        // TODO-HUMAN-REVIEW(PR-129): Review host-selected private hypercall transport.
         let hypercall_instruction = supported_hypercall_instruction(&cpuid)?;
+        cpuid_policy.apply(&mut cpuid)?;
         let cap = kvm_enable_cap {
             cap: Cap::ExitHypercall as u32,
             args: [1_u64 << VMCALL_SYSCALL_TRANSPORT, 0, 0, 0],

@@ -142,6 +142,11 @@ fn deterministic_cpuid_policy_is_visible_inside_vm() {
     append_cpuid_probe(&mut program, 7, 0, CPUID_RESULT_ADDRESS + 32);
     append_cpuid_probe(&mut program, 7, 1, CPUID_RESULT_ADDRESS + 48);
     append_cpuid_probe(&mut program, 0xd, 0, CPUID_RESULT_ADDRESS + 64);
+    append_cpuid_probe(&mut program, 2, 0, CPUID_RESULT_ADDRESS + 80);
+    append_cpuid_probe(&mut program, 0x8000_0000, 0, CPUID_RESULT_ADDRESS + 96);
+    append_cpuid_probe(&mut program, 0x8000_0001, 0, CPUID_RESULT_ADDRESS + 112);
+    append_cpuid_probe(&mut program, 0x15, 0, CPUID_RESULT_ADDRESS + 128);
+    append_cpuid_probe(&mut program, 0x8000_000b, 0, CPUID_RESULT_ADDRESS + 144);
     program.push(0xf4); // hlt
 
     let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
@@ -153,38 +158,50 @@ fn deterministic_cpuid_policy_is_visible_inside_vm() {
         .unwrap();
 
     let vendor = read_cpuid_result(&backend, CPUID_RESULT_ADDRESS);
-    assert_ne!([vendor[1], vendor[2], vendor[3]], [0; 3]);
+    assert_eq!(vendor[0], 0x0000_000d);
+    assert_eq!(vendor[1], u32::from_le_bytes(*b"Genu"));
+    assert_eq!(vendor[2], u32::from_le_bytes(*b"ntel"));
+    assert_eq!(vendor[3], u32::from_le_bytes(*b"ineI"));
 
     let leaf1 = read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 16);
+    assert_eq!(leaf1[0], 0x0000_0663);
+    assert_eq!(leaf1[1], 0x0000_0800);
+    assert_eq!(
+        leaf1[2],
+        bit(0) | bit(9) | bit(13) | bit(19) | bit(20) | bit(23)
+    );
+    assert_eq!(leaf1[3], 0x078b_fbfd);
     assert_eq!(leaf1[2] & bit(30), 0, "RDRAND must be hidden");
 
     let leaf7 = read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 32);
-    assert_eq!(leaf7[1] & bit(18), 0, "RDSEED must be hidden");
-    assert_eq!(leaf7[1] & (bit(4) | bit(11)), 0, "TSX must be hidden");
-    assert_eq!(
-        leaf7[1] & (bit(16) | bit(17) | bit(21) | bit(26) | bit(27) | bit(28) | bit(30) | bit(31)),
-        0,
-        "AVX-512 EBX features must be hidden",
-    );
-    assert_eq!(
-        leaf7[2] & (bit(1) | bit(6) | bit(11) | bit(12) | bit(14)),
-        0,
-        "AVX-512 ECX features must be hidden",
-    );
-    assert_eq!(
-        leaf7[3] & (bit(2) | bit(3) | bit(8) | bit(23)),
-        0,
-        "AVX-512 EDX features must be hidden",
-    );
+    assert_eq!(leaf7, [0; 4]);
 
     let leaf7_subleaf1 = read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 48);
-    assert_eq!(leaf7_subleaf1[0] & bit(5), 0, "AVX512_BF16 must be hidden");
+    assert_eq!(leaf7_subleaf1, [0; 4]);
 
     let xstate = read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 64);
+    assert_eq!(xstate, [0; 4]);
+
     assert_eq!(
-        xstate[0] & (bit(5) | bit(6) | bit(7)),
-        0,
-        "AVX-512 xstate must be hidden",
+        read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 80),
+        [0x0000_0001, 0x0000_0000, 0x0000_004d, 0x002c_307d],
+    );
+    let extended = read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 96);
+    assert_eq!(extended[0], 0x8000_000a);
+    assert_eq!(extended[1], u32::from_le_bytes(*b"Genu"));
+    assert_eq!(extended[2], u32::from_le_bytes(*b"ntel"));
+    assert_eq!(extended[3], u32::from_le_bytes(*b"ineI"));
+    assert_eq!(
+        read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 112),
+        [0x0000_0663, 0x0000_0000, 0x0000_0001, 0x2010_0800],
+    );
+    assert_eq!(
+        read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 128),
+        [0; 4],
+    );
+    assert_eq!(
+        read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 144),
+        [0; 4],
     );
 }
 
