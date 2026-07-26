@@ -96,6 +96,80 @@ fn strace_tool_records_write_syscall_name() {
 }
 
 #[test]
+fn strace_tool_records_real_decoded_arguments() {
+    if !kvm_available("strace_tool_records_real_decoded_arguments") {
+        return;
+    }
+
+    let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+    backend
+        .memory_mut()
+        .write(MESSAGE_ADDRESS, b"hello")
+        .unwrap();
+    backend
+        .install_syscall(
+            ENTRY_POINT,
+            FRAME_ADDRESS,
+            SyscallRequest::new(libc::SYS_write as u64, [1, MESSAGE_ADDRESS, 5, 0, 0, 0]),
+        )
+        .unwrap();
+
+    let log = futures::executor::block_on(backend.run_with_tool::<StraceTool, _>(
+        (),
+        |request: &SyscallRequest, memory: &GuestMemory| {
+            if request.number() == libc::SYS_write as u64 {
+                let len = request.args()[2] as usize;
+                let mut buffer = vec![0; len];
+                memory.read(request.args()[1], &mut buffer).unwrap();
+                // SAFETY: a plain write(2) to the (already open) guest-selected
+                // fd with a host-owned buffer; no borrowed guest pointers escape.
+                let written = unsafe {
+                    libc::write(
+                        request.args()[0] as i32,
+                        buffer.as_ptr().cast(),
+                        buffer.len(),
+                    )
+                };
+                written as i64
+            } else {
+                0
+            }
+        },
+    ))
+    .unwrap();
+
+    // The bare mnemonic is still recorded (back-compat accessor).
+    assert_eq!(log.syscalls(), vec!["write".to_string()]);
+
+    // The decoded rendering carries the *real* arguments (fd 1, the guest buffer
+    // pointer, length 5), not the zeroed placeholders the previous Debug-only
+    // recording produced. This is the fidelity the ptrace `Strace` tool provides
+    // via `Displayable::display_with_outputs`.
+    let formatted = log.formatted();
+    assert_eq!(formatted.len(), 1);
+    let rendered = &formatted[0];
+    assert_eq!(
+        rendered,
+        &format!("write(1, {MESSAGE_ADDRESS:#x}, 5)"),
+        "decoded write should show real fd/buffer/length, got {rendered:?}",
+    );
+    // Guard against a regression back to zeroed arguments.
+    assert_ne!(
+        rendered, "write(0, NULL, 0)",
+        "syscall arguments must not be zeroed",
+    );
+
+    // The structured entry exposes both views.
+    let entries = log.entries();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].name, "write");
+    assert_eq!(
+        entries[0].formatted,
+        format!("write(1, {MESSAGE_ADDRESS:#x}, 5)")
+    );
+}
+
+#[test]
 fn strace_tool_records_multiple_syscall_names_in_order() {
     if !kvm_available("strace_tool_records_multiple_syscall_names_in_order") {
         return;
@@ -118,7 +192,7 @@ fn strace_tool_records_multiple_syscall_names_in_order() {
         .install_syscalls(ENTRY_POINT, FRAME_ADDRESS, &requests)
         .unwrap();
 
-    // Records what the executor saw, proving StraceTool forwards (tail-injects)
+    // Records what the executor saw, proving StraceTool forwards (injects)
     // every syscall after logging it, rather than swallowing them.
     let executed = Arc::new(Mutex::new(Vec::new()));
     let executor_seen = executed.clone();

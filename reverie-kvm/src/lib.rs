@@ -40,6 +40,7 @@ pub use tools::CounterTool;
 pub use tools::HierarchicalCounter;
 pub use tools::HierarchicalCounterTool;
 pub use tools::HierarchicalTotals;
+pub use tools::StraceEntry;
 pub use tools::StraceLog;
 pub use tools::StraceTool;
 pub use tools::SyscallCounter;
