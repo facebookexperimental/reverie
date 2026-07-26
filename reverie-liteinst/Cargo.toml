@@ -24,6 +24,16 @@ path = "src/bin/fork_guest.rs"
 
 [dependencies]
 libc = "0.2.186"
+liteinst2 = { version = "0.1.0", git = "https://github.com/rrnewton/liteinst2", rev = "cbe7f1116d5840aa00c4d76d1ca45e81d7d28891" }
+reverie = { version = "0.1.0", path = "../reverie" }
+reverie-preload = { version = "0.1.0", path = "../reverie-preload", default-features = false, features = ["coordinator-rpc"] }
+reverie-rpc-transport = { version = "0.1.0", path = "../reverie-rpc-transport" }
+tokio = { version = "1.52.4", features = ["macros", "net", "rt", "time"] }
+tempfile = "3.27.0"
+
+[[bin]]
+name = "reverie-liteinst-trap-count-guest"
+path = "src/bin/trap_count_guest.rs"
 
 [[test]]
 name = "strace"
@@ -32,3 +42,11 @@ path = "tests/strace.rs"
 [[bin]]
 name = "reverie-liteinst-exec-guest"
 path = "src/bin/exec_guest.rs"
+
+[[bin]]
+name = "reverie-liteinst-rpc-tool-guest"
+path = "src/bin/rpc_tool_guest.rs"
+
+[[test]]
+name = "rpc_tool"
+path = "tests/rpc_tool.rs"

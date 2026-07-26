@@ -27,6 +27,7 @@ pub struct SyscallEvent {
     args: [u64; 6],
     instruction_pointer: u64,
     result: Option<i64>,
+    resume_address: Option<u64>,
 }
 
 impl SyscallEvent {
@@ -36,6 +37,7 @@ impl SyscallEvent {
             args,
             instruction_pointer,
             result: None,
+            resume_address: None,
         }
     }
 
@@ -67,6 +69,21 @@ impl SyscallEvent {
     /// Set the result to `-errno`.
     pub fn fail(&mut self, errno: i32) {
         self.result = Some(-i64::from(errno));
+    }
+
+    // TODO-HUMAN-REVIEW(PR-127): Review deferred post-SIGSYS control transfer.
+    /// Resume at `address` after the signal handler returns without changing RAX.
+    ///
+    /// Dynamic instrumentation backends use this to publish a replacement
+    /// trampoline on the SIGSYS slow path and run the tool callback later in
+    /// ordinary guest context.
+    pub fn defer_to(&mut self, address: u64) {
+        self.resume_address = Some(address);
+    }
+
+    /// Returns the deferred resume address selected by the dispatcher.
+    pub fn resume_address(&self) -> Option<u64> {
+        self.resume_address
     }
 
     /// Execute the real syscall through the trusted gate and record its result.
@@ -222,6 +239,15 @@ mod tests {
         assert!(is_fork_like(libc::SYS_clone3));
         assert!(!is_fork_like(libc::SYS_write));
         assert!(!is_fork_like(libc::SYS_getpid));
+    }
+
+    #[test]
+    fn deferred_dispatch_preserves_result_and_records_resume_address() {
+        let mut event = SyscallEvent::new(libc::SYS_getpid, [0; 6], 0x1000);
+        event.defer_to(0x2000);
+
+        assert_eq!(event.result(), None);
+        assert_eq!(event.resume_address(), Some(0x2000));
     }
 
     #[test]

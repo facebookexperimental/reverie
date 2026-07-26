@@ -107,6 +107,19 @@ fn strace_tool_observes_echo_syscalls() {
 }
 
 #[test]
+fn first_sigsys_installs_a_hook_for_later_calls() {
+    let output = run_guest(env!("CARGO_BIN_EXE_reverie-liteinst-trap-count-guest"), &[]);
+    assert!(
+        output.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"calls=32 traps=1 hooks=32\n");
+}
+
+#[test]
 fn compatibility_tool_emits_stable_events() {
     let first = run_compat_guest("/bin/echo", &["hello"]);
     let second = run_compat_guest("/bin/echo", &["hello"]);

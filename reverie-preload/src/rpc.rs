@@ -46,6 +46,8 @@
 use std::io;
 use std::io::Read;
 use std::io::Write;
+use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
@@ -81,12 +83,32 @@ impl CoordinatorClient {
     /// handshake frame.
     pub fn connect<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let mut stream = UnixStream::connect(path)?;
+        let reserved_fd = unsafe {
+            libc::fcntl(
+                stream.as_raw_fd(),
+                libc::F_DUPFD_CLOEXEC,
+                1024 as libc::c_int,
+            )
+        };
+        if reserved_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fcntl returned a new owned descriptor on success.
+        let reserved_stream = unsafe { UnixStream::from_raw_fd(reserved_fd) };
+        drop(stream);
+        stream = reserved_stream;
         let config_bytes = read_frame(&mut stream, DEFAULT_MAX_FRAME_LEN)?;
         Ok(Self {
             stream,
             config_bytes,
             max_frame_len: DEFAULT_MAX_FRAME_LEN,
         })
+    }
+
+    // TODO-HUMAN-REVIEW(PR-127): Review exposure for reserved guest FD protection.
+    /// Returns the coordinator socket descriptor owned by this client.
+    pub fn raw_fd(&self) -> libc::c_int {
+        self.stream.as_raw_fd()
     }
 
     /// The raw bytes of the coordinator's config handshake.
@@ -111,6 +133,38 @@ impl CoordinatorClient {
         let response_bytes = read_frame(&mut self.stream, self.max_frame_len)?;
         decode(&response_bytes)
     }
+
+    // TODO-HUMAN-REVIEW(PR-127): Review trusted-gate coordinator RPC API.
+    /// Send one request using only syscalls issued through the trusted gate.
+    ///
+    /// Use this after the seccomp filter is active; ordinary `Read`/`Write`
+    /// would recursively trap inside the instrumentation callback.
+    pub fn send_trusted<Req, Resp>(&mut self, from: Tid, request: Req) -> io::Result<Resp>
+    where
+        Req: Serialize,
+        Resp: DeserializeOwned,
+    {
+        let envelope = RequestEnvelope { from, request };
+        let payload = encode(&envelope)?;
+        let len = u32::try_from(payload.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "frame too large"))?;
+        let fd = self.stream.as_raw_fd();
+        trusted_write_all(fd, &len.to_be_bytes())?;
+        trusted_write_all(fd, &payload)?;
+
+        let mut len_bytes = [0_u8; 4];
+        trusted_read_exact(fd, &mut len_bytes)?;
+        let response_len = u32::from_be_bytes(len_bytes) as usize;
+        if response_len > self.max_frame_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "frame exceeds maximum length",
+            ));
+        }
+        let mut response = vec![0_u8; response_len];
+        trusted_read_exact(fd, &mut response)?;
+        decode(&response)
+    }
 }
 
 /// Serialize with the shared bincode configuration.
@@ -124,6 +178,69 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> io::Result<T> {
     let (value, _consumed) = bincode::serde::decode_from_slice(bytes, legacy())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok(value)
+}
+
+fn trusted_write_all(fd: libc::c_int, mut bytes: &[u8]) -> io::Result<()> {
+    while !bytes.is_empty() {
+        let result = unsafe {
+            crate::trap::raw_syscall6(
+                libc::SYS_sendto,
+                [
+                    fd as u64,
+                    bytes.as_ptr() as u64,
+                    bytes.len() as u64,
+                    libc::MSG_NOSIGNAL as u64,
+                    0,
+                    0,
+                ],
+            )
+        };
+        if result > 0 {
+            bytes = &bytes[result as usize..];
+        } else if result == -i64::from(libc::EINTR) {
+            continue;
+        } else {
+            let errno = if result < 0 {
+                -result as i32
+            } else {
+                libc::EPIPE
+            };
+            return Err(io::Error::from_raw_os_error(errno));
+        }
+    }
+    Ok(())
+}
+
+fn trusted_read_exact(fd: libc::c_int, mut bytes: &mut [u8]) -> io::Result<()> {
+    while !bytes.is_empty() {
+        let result = unsafe {
+            crate::trap::raw_syscall6(
+                libc::SYS_read,
+                [
+                    fd as u64,
+                    bytes.as_mut_ptr() as u64,
+                    bytes.len() as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        };
+        if result > 0 {
+            let consumed = result as usize;
+            bytes = &mut bytes[consumed..];
+        } else if result == -i64::from(libc::EINTR) {
+            continue;
+        } else if result == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "coordinator closed",
+            ));
+        } else {
+            return Err(io::Error::from_raw_os_error(-result as i32));
+        }
+    }
+    Ok(())
 }
 
 fn write_frame<W: Write>(writer: &mut W, payload: &[u8]) -> io::Result<()> {
@@ -220,15 +337,15 @@ mod tests {
         {
             let mut c1 = CoordinatorClient::connect(&sock).unwrap();
             assert_eq!(c1.config::<u64>().unwrap(), 100);
-            let r1: u64 = c1.send(from, 3_u64).unwrap();
+            let r1: u64 = c1.send_trusted(from, 3_u64).unwrap();
             assert_eq!(r1, 3);
-            let r2: u64 = c1.send(from, 5_u64).unwrap();
+            let r2: u64 = c1.send_trusted(from, 5_u64).unwrap();
             assert_eq!(r2, 8);
         }
         {
             let mut c2 = CoordinatorClient::connect(&sock).unwrap();
             assert_eq!(c2.config::<u64>().unwrap(), 100);
-            let r3: u64 = c2.send(from, 7_u64).unwrap();
+            let r3: u64 = c2.send_trusted(from, 7_u64).unwrap();
             assert_eq!(r3, 15);
         }
 

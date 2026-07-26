@@ -1,4 +1,4 @@
-use core::arch::global_asm;
+use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicI32;
 use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::AtomicU8;
@@ -7,31 +7,41 @@ use core::sync::atomic::Ordering;
 use std::ffi::OsStr;
 use std::io;
 use std::ptr;
+use std::sync::OnceLock;
+
+use liteinst2::patcher::StalenessBudget;
+use liteinst2::patcher::prepare_live_patching;
+use liteinst2::scanner::InstructionScanner;
+use liteinst2::trampoline::HookContext;
+use liteinst2::trampoline::HookSite;
+use liteinst2::trampoline::InstalledHook;
+use liteinst2::trampoline::TrampolineArena;
+use reverie_preload::dispatch::SyscallDispatcher;
+use reverie_preload::dispatch::SyscallEvent as PreloadSyscallEvent;
+use reverie_preload::lifecycle::InProcessSeccomp;
+use reverie_preload::lifecycle::RuntimeConfig;
+use reverie_preload::trap::raw_syscall6;
 
 use crate::COMPAT_EVENT_COOKIE_ENV;
 use crate::COMPAT_EVENT_FD_ENV;
-use crate::pun::PunProbe;
 
-const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
-const SECCOMP_DATA_NR_OFFSET: u32 = 0;
-const SECCOMP_DATA_ARCH_OFFSET: u32 = 4;
-const SECCOMP_DATA_IP_LOW_OFFSET: u32 = 8;
-const SECCOMP_DATA_IP_HIGH_OFFSET: u32 = 12;
-const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
-const SECCOMP_RET_TRAP: u32 = 0x0003_0000;
-const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
-const BPF_LD_W_ABS: u16 = 0x20;
-const BPF_JMP_JEQ_K: u16 = 0x15;
-const BPF_RET_K: u16 = 0x06;
 const UNSET_RESULT: i64 = i64::MIN;
 const TOOL_STRACE: u8 = 1;
 const TOOL_COMPAT: u8 = 2;
+const TOOL_REVERIE: u8 = 3;
 const EVENT_CHANNEL_IDENTITY_FAILURE_STATUS: i32 = 120;
 const EVENT_CHANNEL_WRITE_FAILURE_STATUS: i32 = 121;
+const MAX_PATCH_SITES: usize = 4096;
+const ARENA_SLOTS: usize = 128;
+const PATCH_SNAPSHOT_BYTES: usize = 64;
+const SITE_INSTALLING: u8 = 1;
+const SITE_ACTIVE: u8 = 2;
+const SITE_FALLBACK: u8 = 3;
+const SITE_STALE: u8 = 4;
 
-static PROBE: AtomicPtr<PunProbe> = AtomicPtr::new(ptr::null_mut());
 static TOOL_MODE: AtomicU8 = AtomicU8::new(0);
 static EVENT_FD: AtomicI32 = AtomicI32::new(libc::STDERR_FILENO);
+static COORDINATOR_FD: AtomicI32 = AtomicI32::new(-1);
 static EVENT_COOKIE: AtomicU64 = AtomicU64::new(0);
 static EVENT_DEVICE: AtomicU64 = AtomicU64::new(0);
 static EVENT_INODE: AtomicU64 = AtomicU64::new(0);
@@ -39,53 +49,58 @@ static EVENT_INODE: AtomicU64 = AtomicU64::new(0);
 #[thread_local]
 static mut CURRENT_EVENT: *mut SyscallEvent = ptr::null_mut();
 
-global_asm!(
-    r#"
-    .text
-    .p2align 4
-    .global reverie_liteinst_trusted_syscall
-    .hidden reverie_liteinst_trusted_syscall
-    .type reverie_liteinst_trusted_syscall,@function
-reverie_liteinst_trusted_syscall:
-    mov rax, rdi
-    mov rdi, rsi
-    mov rsi, rdx
-    mov rdx, rcx
-    mov r10, r8
-    mov r8, r9
-    mov r9, [rsp + 8]
-    .global reverie_liteinst_trusted_syscall_ip
-    .hidden reverie_liteinst_trusted_syscall_ip
-reverie_liteinst_trusted_syscall_ip:
-    syscall
-    .global reverie_liteinst_trusted_syscall_return_ip
-    .hidden reverie_liteinst_trusted_syscall_return_ip
-reverie_liteinst_trusted_syscall_return_ip:
-    ret
-    .size reverie_liteinst_trusted_syscall, .-reverie_liteinst_trusted_syscall
-"#
-);
+static ARENAS: OnceLock<Vec<RuntimeArena>> = OnceLock::new();
+static SITES: OnceLock<Box<[SiteSlot]>> = OnceLock::new();
+static PAGE_SIZE: AtomicU64 = AtomicU64::new(0);
+static INSTALL_HELD: AtomicBool = AtomicBool::new(false);
 
-unsafe extern "C" {
-    fn reverie_liteinst_trusted_syscall(
-        number: u64,
-        arg0: u64,
-        arg1: u64,
-        arg2: u64,
-        arg3: u64,
-        arg4: u64,
-        arg5: u64,
-    ) -> i64;
-    static reverie_liteinst_trusted_syscall_ip: u8;
-    static reverie_liteinst_trusted_syscall_return_ip: u8;
+pub(crate) fn reserve_coordinator_fd(fd: libc::c_int) -> io::Result<()> {
+    COORDINATOR_FD
+        .compare_exchange(-1, fd, Ordering::AcqRel, Ordering::Acquire)
+        .map(|_| ())
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "coordinator FD reserved twice",
+            )
+        })
+}
+
+struct RuntimeArena {
+    mapping_start: u64,
+    mapping_end: u64,
+    arena: TrampolineArena,
+}
+
+struct SiteSlot {
+    address: AtomicU64,
+    state: AtomicU8,
+    hook: AtomicPtr<InstalledHook>,
+    mapping_end: AtomicU64,
+    trap_count: AtomicU64,
+    hook_count: AtomicU64,
+}
+
+impl SiteSlot {
+    fn new() -> Self {
+        Self {
+            address: AtomicU64::new(0),
+            state: AtomicU8::new(0),
+            hook: AtomicPtr::new(ptr::null_mut()),
+            mapping_end: AtomicU64::new(0),
+            trap_count: AtomicU64::new(0),
+            hook_count: AtomicU64::new(0),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
-struct SyscallEvent {
-    number: i64,
-    args: [u64; 6],
-    instruction_pointer: u64,
-    result: i64,
+pub(crate) struct SyscallEvent {
+    pub(crate) number: i64,
+    pub(crate) args: [u64; 6],
+    pub(crate) instruction_pointer: u64,
+    pub(crate) result: i64,
+    pub(crate) context: usize,
 }
 
 pub(crate) fn initialize_from_environment() -> io::Result<()> {
@@ -121,12 +136,18 @@ pub(crate) fn initialize_from_environment() -> io::Result<()> {
         }
     }
 
-    let probe = Box::new(PunProbe::new(tool_trampoline)?);
-    let probe = Box::into_raw(probe);
-    PROBE.store(probe, Ordering::Release);
+    install_runtime()
+}
 
-    install_sigsys_handler()?;
-    install_seccomp_filter()
+pub(crate) fn initialize_reverie_tool() -> io::Result<()> {
+    TOOL_MODE.store(TOOL_REVERIE, Ordering::Release);
+    install_runtime()
+}
+
+fn install_runtime() -> io::Result<()> {
+    prepare_instrumentation()?;
+    let config = RuntimeConfig::default();
+    unsafe { reverie_preload::install(Box::new(LiteinstDispatcher), &InProcessSeccomp, &config) }
 }
 
 struct CompatibilityEventChannel {
@@ -224,33 +245,341 @@ fn compatibility_event_channel() -> io::Result<Option<CompatibilityEventChannel>
     }))
 }
 
-unsafe extern "C" fn sigsys_handler(
-    signal: libc::c_int,
-    _info: *mut libc::siginfo_t,
-    context: *mut libc::c_void,
-) {
-    if signal != libc::SIGSYS || context.is_null() {
-        unsafe {
-            exit_now(126);
+fn prepare_instrumentation() -> io::Result<()> {
+    prepare_live_patching().map_err(|error| io::Error::other(error.to_string()))?;
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let page_size = u64::try_from(page_size)
+        .ok()
+        .filter(|size| size.is_power_of_two())
+        .ok_or_else(|| io::Error::other("invalid operating-system page size"))?;
+    PAGE_SIZE.store(page_size, Ordering::Release);
+
+    let sites = (0..MAX_PATCH_SITES)
+        .map(|_| SiteSlot::new())
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    SITES
+        .set(sites)
+        .map_err(|_| io::Error::other("LiteInst site registry initialized twice"))?;
+
+    let maps = std::fs::read_to_string("/proc/self/maps")?;
+    let mut arenas = Vec::new();
+    for line in maps.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(range) = fields.next() else {
+            continue;
+        };
+        let Some(permissions) = fields.next() else {
+            continue;
+        };
+        if !permissions
+            .as_bytes()
+            .get(2)
+            .is_some_and(|byte| *byte == b'x')
+        {
+            continue;
+        }
+        let Some((start, end)) = range.split_once('-') else {
+            continue;
+        };
+        let Ok(mapping_start) = u64::from_str_radix(start, 16) else {
+            continue;
+        };
+        let Ok(mapping_end) = u64::from_str_radix(end, 16) else {
+            continue;
+        };
+        if mapping_start >= mapping_end {
+            continue;
+        }
+        let Ok(arena) = TrampolineArena::allocate_near(mapping_start, ARENA_SLOTS) else {
+            continue;
+        };
+        arenas.push(RuntimeArena {
+            mapping_start,
+            mapping_end,
+            arena,
+        });
+    }
+    if arenas.is_empty() {
+        return Err(io::Error::other(
+            "could not allocate a LiteInst arena near any executable mapping",
+        ));
+    }
+    ARENAS
+        .set(arenas)
+        .map_err(|_| io::Error::other("LiteInst arenas initialized twice"))
+}
+
+fn site_hash(address: u64, len: usize) -> usize {
+    ((address >> 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize) % len
+}
+
+fn find_site(address: u64) -> Option<&'static SiteSlot> {
+    let sites = SITES.get()?;
+    let start = site_hash(address, sites.len());
+    for offset in 0..sites.len() {
+        let slot = &sites[(start + offset) % sites.len()];
+        match slot.address.load(Ordering::Acquire) {
+            observed if observed == address => return Some(slot),
+            0 => return None,
+            _ => {}
         }
     }
+    None
+}
 
-    let context = unsafe { &mut *context.cast::<libc::ucontext_t>() };
-    let registers = &mut context.uc_mcontext.gregs;
-    let mut event = SyscallEvent {
-        number: registers[libc::REG_RAX as usize],
-        args: [
-            registers[libc::REG_RDI as usize] as u64,
-            registers[libc::REG_RSI as usize] as u64,
-            registers[libc::REG_RDX as usize] as u64,
-            registers[libc::REG_R10 as usize] as u64,
-            registers[libc::REG_R8 as usize] as u64,
-            registers[libc::REG_R9 as usize] as u64,
-        ],
-        instruction_pointer: registers[libc::REG_RIP as usize] as u64,
-        result: UNSET_RESULT,
+fn claim_existing_site(slot: &'static SiteSlot) -> (&'static SiteSlot, bool) {
+    loop {
+        let state = slot.state.load(Ordering::Acquire);
+        if state == 0 {
+            core::hint::spin_loop();
+            continue;
+        }
+        if state == SITE_STALE {
+            match slot.state.compare_exchange(
+                SITE_STALE,
+                SITE_INSTALLING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return (slot, true),
+                Err(_) => continue,
+            }
+        }
+        return (slot, false);
+    }
+}
+
+fn claim_site(address: u64) -> Option<(&'static SiteSlot, bool)> {
+    let sites = SITES.get()?;
+    let start = site_hash(address, sites.len());
+    for offset in 0..sites.len() {
+        let slot = &sites[(start + offset) % sites.len()];
+        let observed = slot.address.load(Ordering::Acquire);
+        if observed == address {
+            return Some(claim_existing_site(slot));
+        }
+        if observed == 0 {
+            match slot
+                .address
+                .compare_exchange(0, address, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    slot.state.store(SITE_INSTALLING, Ordering::Release);
+                    return Some((slot, true));
+                }
+                Err(raced) if raced == address => return Some(claim_existing_site(slot)),
+                Err(_) => {}
+            }
+        }
+    }
+    None
+}
+
+fn mark_site_range_stale(start: u64, len: u64, replacement_end: u64) {
+    let Some(end) = start.checked_add(len) else {
+        return;
     };
+    let Some(sites) = SITES.get() else {
+        return;
+    };
+    for site in sites {
+        let address = site.address.load(Ordering::Acquire);
+        if start <= address && address < end {
+            site.mapping_end.store(replacement_end, Ordering::Release);
+            let state = site.state.load(Ordering::Acquire);
+            if matches!(state, SITE_ACTIVE | SITE_FALLBACK) {
+                site.state.store(SITE_STALE, Ordering::Release);
+            }
+        }
+    }
+}
 
+// TODO-HUMAN-REVIEW(PR-127): Review executable mapping-generation tracking.
+fn observe_mapping_generation(event: &SyscallEvent) {
+    if event.result < 0 {
+        return;
+    }
+    match event.number {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        libc::SYS_mmap => {
+            let start = event.result as u64;
+            mark_site_range_stale(start, event.args[1], start.saturating_add(event.args[1]));
+        }
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        libc::SYS_munmap => mark_site_range_stale(event.args[0], event.args[1], 0),
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        libc::SYS_mremap => {
+            mark_site_range_stale(event.args[0], event.args[1], 0);
+            let start = event.result as u64;
+            mark_site_range_stale(start, event.args[2], start.saturating_add(event.args[2]));
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn site_counts(address: u64) -> (u64, u64) {
+    find_site(address).map_or((0, 0), |site| {
+        (
+            site.trap_count.load(Ordering::Acquire),
+            site.hook_count.load(Ordering::Acquire),
+        )
+    })
+}
+
+fn arena_for(address: u64) -> Option<&'static RuntimeArena> {
+    ARENAS.get()?.iter().find(|entry| {
+        entry.mapping_start <= address
+            && address < entry.mapping_end
+            && entry.arena.can_reach(address)
+    })
+}
+
+unsafe fn set_text_protection(address: u64, protection: i32) -> io::Result<()> {
+    let page_size = PAGE_SIZE.load(Ordering::Acquire);
+    if page_size == 0 {
+        return Err(io::Error::other("LiteInst page size is not initialized"));
+    }
+    let page_start = address & !(page_size - 1);
+    let patch_end = address
+        .checked_add(liteinst2::patcher::WORD_PATCH_BYTES as u64)
+        .ok_or_else(|| io::Error::other("patch address overflow"))?;
+    let page_end = patch_end
+        .checked_add(page_size - 1)
+        .map(|value| value & !(page_size - 1))
+        .ok_or_else(|| io::Error::other("patch page range overflow"))?;
+    let result = unsafe {
+        raw_syscall6(
+            libc::SYS_mprotect,
+            [
+                page_start,
+                page_end - page_start,
+                protection as u64,
+                0,
+                0,
+                0,
+            ],
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::from_raw_os_error((-result) as i32));
+    }
+    Ok(())
+}
+
+struct InstallGuard;
+
+impl Drop for InstallGuard {
+    fn drop(&mut self) {
+        INSTALL_HELD.store(false, Ordering::Release);
+    }
+}
+
+fn lock_installation() -> io::Result<InstallGuard> {
+    INSTALL_HELD
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .map(|_| InstallGuard)
+        .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "LiteInst installation is busy"))
+}
+
+unsafe fn install_site_hook(address: u64, slot: &'static SiteSlot) -> io::Result<()> {
+    let _install_guard = lock_installation()?;
+    let _allocation_scope = crate::patch_alloc::enter();
+    let arena = arena_for(address)
+        .ok_or_else(|| io::Error::other("no reachable LiteInst arena for syscall site"))?;
+    let mut mapping_end = slot.mapping_end.load(Ordering::Acquire);
+    if mapping_end <= address {
+        mapping_end = arena.mapping_end;
+        slot.mapping_end.store(mapping_end, Ordering::Release);
+    }
+    let available = usize::try_from(mapping_end - address)
+        .unwrap_or(0)
+        .min(PATCH_SNAPSHOT_BYTES);
+    if available < liteinst2::patcher::WORD_PATCH_BYTES {
+        return Err(io::Error::other(
+            "syscall site is too close to its executable mapping end",
+        ));
+    }
+    // SAFETY: arena_for proved this byte range lies in a live executable VMA.
+    let candidate =
+        unsafe { core::slice::from_raw_parts(address as usize as *const u8, available) };
+    if candidate.get(..2) != Some(&[0x0F, 0x05]) {
+        return Err(io::Error::other("SIGSYS site is not an x86-64 syscall"));
+    }
+    let scanner = InstructionScanner::default();
+    let scan = scanner
+        .scan_prefix(candidate, address, liteinst2::patcher::WORD_PATCH_BYTES)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let code = scan.snapshot();
+
+    unsafe {
+        set_text_protection(
+            address,
+            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+        )?;
+    }
+    let installed = unsafe {
+        InstalledHook::install_replacing_first_in_arena(
+            HookSite::new(
+                &scanner,
+                &scan,
+                code,
+                address,
+                address,
+                address as usize as *mut u8,
+            ),
+            installed_syscall_hook,
+            StalenessBudget::new(3_000).expect("non-zero staleness budget"),
+            &arena.arena,
+        )
+    };
+    let installed = match installed {
+        Ok(installed) => installed,
+        Err(error) => {
+            let _ = unsafe { set_text_protection(address, libc::PROT_READ | libc::PROT_EXEC) };
+            return Err(io::Error::other(error.to_string()));
+        }
+    };
+    if let Err(error) = installed.activate() {
+        let _ = unsafe { set_text_protection(address, libc::PROT_READ | libc::PROT_EXEC) };
+        return Err(io::Error::other(error.to_string()));
+    }
+    unsafe {
+        set_text_protection(address, libc::PROT_READ | libc::PROT_EXEC)?;
+    }
+
+    let installed = Box::into_raw(Box::new(installed));
+    slot.hook.store(installed, Ordering::Release);
+    slot.state.store(SITE_ACTIVE, Ordering::Release);
+    Ok(())
+}
+
+unsafe extern "C" fn installed_syscall_hook(context: *mut HookContext) {
+    if context.is_null() {
+        unsafe {
+            exit_now(122);
+        }
+    }
+    // SAFETY: generated LiteInst code passes a unique mutable saved frame.
+    let context_pointer = context as usize;
+    let context = unsafe { &mut *context };
+    if let Some(site) = find_site(context.instruction_pointer) {
+        site.hook_count.fetch_add(1, Ordering::Relaxed);
+    }
+    let mut event = SyscallEvent {
+        number: context.rax as i64,
+        args: [
+            context.rdi,
+            context.rsi,
+            context.rdx,
+            context.r10,
+            context.r8,
+            context.r9,
+        ],
+        instruction_pointer: context.instruction_pointer,
+        result: UNSET_RESULT,
+        context: context_pointer,
+    };
     if unsafe { !CURRENT_EVENT.is_null() } {
         unsafe {
             exit_now(125);
@@ -258,23 +587,92 @@ unsafe extern "C" fn sigsys_handler(
     }
     unsafe {
         CURRENT_EVENT = &mut event;
-    }
-
-    let probe = PROBE.load(Ordering::Acquire);
-    if probe.is_null() || unsafe { (*probe).enable() }.is_err() {
-        unsafe {
-            exit_now(124);
-        }
-    }
-    unsafe {
-        (*probe).dispatch();
+        tool_trampoline();
         CURRENT_EVENT = ptr::null_mut();
     }
-
     if event.result == UNSET_RESULT {
         event.result = -i64::from(libc::ENOSYS);
     }
-    registers[libc::REG_RAX as usize] = event.result;
+    context.rax = event.result as u64;
+    context.rcx = context.instruction_pointer.saturating_add(2);
+    context.r11 = context.rflags;
+}
+
+unsafe fn locate_syscall_site(resume_address: u64) -> Option<u64> {
+    let candidates = [resume_address.checked_sub(2), Some(resume_address)];
+    for address in candidates.into_iter().flatten() {
+        let Some(arena) = arena_for(address) else {
+            continue;
+        };
+        if address.checked_add(2)? > arena.mapping_end {
+            continue;
+        }
+        // SAFETY: the candidate lies inside a live executable mapping.
+        let bytes = unsafe { core::slice::from_raw_parts(address as usize as *const u8, 2) };
+        if bytes == [0x0F, 0x05] {
+            return Some(address);
+        }
+    }
+    None
+}
+
+struct LiteinstDispatcher;
+
+impl SyscallDispatcher for LiteinstDispatcher {
+    fn dispatch(&self, event: &mut PreloadSyscallEvent) {
+        if unsafe { !CURRENT_EVENT.is_null() } {
+            event.set_result(unsafe { raw_syscall6(event.number(), event.args()) });
+            return;
+        }
+        let mode = TOOL_MODE.load(Ordering::Relaxed);
+        let args = event.args();
+        let compatibility_trap_fallback =
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            (event.number() == libc::SYS_clone && clone_is_fork_like(args[0], args[1]))
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            || event.number() == libc::SYS_wait4;
+        // TODO-HUMAN-REVIEW(PR-127): Review fork and wait libc-wrapper trap fallbacks.
+        if mode != TOOL_REVERIE && compatibility_trap_fallback {
+            let mut trapped = SyscallEvent {
+                number: event.number(),
+                args,
+                instruction_pointer: event.instruction_pointer(),
+                result: UNSET_RESULT,
+                context: 0,
+            };
+            unsafe {
+                process_syscall(&mut trapped);
+            }
+            event.set_result(trapped.result);
+            return;
+        }
+
+        let resume_address = event.instruction_pointer();
+        let instruction_pointer =
+            unsafe { locate_syscall_site(resume_address) }.unwrap_or(resume_address);
+
+        if let Some((site, claimed)) = claim_site(instruction_pointer) {
+            site.trap_count.fetch_add(1, Ordering::Relaxed);
+            if claimed && unsafe { install_site_hook(instruction_pointer, site) }.is_err() {
+                site.state.store(SITE_FALLBACK, Ordering::Release);
+            }
+            while matches!(site.state.load(Ordering::Acquire), 0 | SITE_INSTALLING) {
+                core::hint::spin_loop();
+            }
+            if site.state.load(Ordering::Acquire) == SITE_ACTIVE {
+                let hook = site.hook.load(Ordering::Acquire);
+                if !hook.is_null() {
+                    // SAFETY: active sites retain their InstalledHook for process lifetime.
+                    event.defer_to(unsafe { (*hook).trampoline().address() });
+                    return;
+                }
+            }
+        }
+
+        // Generic Tool execution may allocate, lock, and block on coordinator
+        // I/O, so it cannot run as a fallback inside the SIGSYS handler.
+        event.fail(libc::EOPNOTSUPP);
+    }
 }
 
 unsafe extern "C" fn tool_trampoline() {
@@ -289,7 +687,52 @@ unsafe extern "C" fn tool_trampoline() {
     }
 }
 
+// TODO-HUMAN-REVIEW(PR-127): Review process-global preload safety guards.
+fn protect_runtime_control(event: &mut SyscallEvent) -> bool {
+    let unsupported_control =
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        matches!(event.number, libc::SYS_clone3 | libc::SYS_vfork);
+    let protected_signal =
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        (event.number == libc::SYS_rt_sigaction && event.args[0] == libc::SIGSYS as u64)
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        || (event.number == libc::SYS_sigaltstack && event.args[0] != 0)
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        || (event.number == libc::SYS_rt_sigprocmask && event.args[1] != 0);
+
+    if unsupported_control {
+        event.result = -i64::from(libc::ENOTSUP);
+    } else if protected_signal {
+        event.result = -i64::from(libc::EPERM);
+    } else {
+        return false;
+    }
+    true
+}
+
 unsafe fn process_syscall(event: &mut SyscallEvent) {
+    let tool_mode = TOOL_MODE.load(Ordering::Relaxed);
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    if matches!(event.number, libc::SYS_execve | libc::SYS_execveat) {
+        event.result = -i64::from(libc::ENOTSUP);
+        if tool_mode != TOOL_REVERIE {
+            unsafe {
+                trace_event(event, Some(event.result));
+            }
+        }
+        return;
+    }
+    if tool_mode == TOOL_REVERIE && protect_runtime_control(event) {
+        return;
+    }
+    if tool_mode == TOOL_REVERIE && unsafe { protect_coordinator_channel(event) } {
+        return;
+    }
+    if TOOL_MODE.load(Ordering::Relaxed) == TOOL_REVERIE {
+        crate::tool_host::dispatch(event);
+        observe_mapping_generation(event);
+        return;
+    }
     if TOOL_MODE.load(Ordering::Relaxed) == TOOL_COMPAT
         && EVENT_COOKIE.load(Ordering::Relaxed) != 0
         && unsafe { protect_compatibility_event_channel(event) }
@@ -322,36 +765,6 @@ unsafe fn process_syscall(event: &mut SyscallEvent) {
         return;
     }
 
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#61): exec cannot safely cross an inherited trap filter.
-    if event.number == libc::SYS_execve || event.number == libc::SYS_execveat {
-        event.result = -i64::from(libc::ENOTSUP);
-        unsafe {
-            trace_event(event, Some(event.result));
-        }
-        return;
-    }
-
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#61): reserve SIGSYS until disposition virtualization exists.
-    if event.number == libc::SYS_rt_sigaction && event.args[0] == libc::SIGSYS as u64 {
-        event.result = -i64::from(libc::EPERM);
-        unsafe {
-            trace_event(event, Some(event.result));
-        }
-        return;
-    }
-
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#61): clone3 and vfork need a controller-owned child bootstrap.
-    if event.number == libc::SYS_clone3 || event.number == libc::SYS_vfork {
-        event.result = -i64::from(libc::ENOTSUP);
-        unsafe {
-            trace_event(event, Some(event.result));
-        }
-        return;
-    }
-
     if event.number == libc::SYS_exit || event.number == libc::SYS_exit_group {
         unsafe {
             trace_event(event, None);
@@ -366,6 +779,7 @@ unsafe fn process_syscall(event: &mut SyscallEvent) {
         }
     }
     event.result = unsafe { raw_syscall6(event.number, event.args) };
+    observe_mapping_generation(event);
 
     if event.number != libc::SYS_exit && event.number != libc::SYS_exit_group && !compatibility_fork
     {
@@ -382,6 +796,24 @@ fn clone_is_fork_like(flags: u64, child_stack: u64) -> bool {
     child_stack == 0
         && flags & SIGNAL_MASK == libc::SIGCHLD as u64
         && flags & !(SIGNAL_MASK | allowed_flags) == 0
+}
+
+unsafe fn protect_coordinator_channel(event: &mut SyscallEvent) -> bool {
+    let fd = COORDINATOR_FD.load(Ordering::Acquire);
+    if fd < 0 {
+        return false;
+    }
+    let fd = fd as u64;
+    if event.number == libc::SYS_close && event.args[0] == fd {
+        event.result = 0;
+    } else if event.number == libc::SYS_close_range && event.args[0] <= fd && fd <= event.args[1] {
+        event.result = unsafe { close_range_preserving_event_fd(event, fd) };
+    } else if syscall_targets_event_fd(event, fd) {
+        event.result = -i64::from(libc::EBADF);
+    } else {
+        return false;
+    }
+    true
 }
 
 unsafe fn protect_compatibility_event_channel(event: &mut SyscallEvent) -> bool {
@@ -595,101 +1027,10 @@ unsafe fn trace_event(event: &SyscallEvent, result: Option<i64>) {
     }
 }
 
-unsafe fn raw_syscall6(number: i64, args: [u64; 6]) -> i64 {
-    unsafe {
-        reverie_liteinst_trusted_syscall(
-            number as u64,
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-        )
-    }
-}
-
 unsafe fn exit_now(code: i32) -> ! {
     let _ = unsafe { raw_syscall6(libc::SYS_exit_group, [code as u64, 0, 0, 0, 0, 0]) };
     loop {
         core::hint::spin_loop();
-    }
-}
-
-fn install_sigsys_handler() -> io::Result<()> {
-    let mut action: libc::sigaction = unsafe { core::mem::zeroed() };
-    action.sa_flags = libc::SA_SIGINFO;
-    action.sa_sigaction = sigsys_handler as *const () as usize;
-    if unsafe { libc::sigemptyset(&mut action.sa_mask) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if unsafe { libc::sigaction(libc::SIGSYS, &action, ptr::null_mut()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-fn install_seccomp_filter() -> io::Result<()> {
-    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    let gate_ip = ptr::addr_of!(reverie_liteinst_trusted_syscall_ip) as usize as u64;
-    let return_ip = ptr::addr_of!(reverie_liteinst_trusted_syscall_return_ip) as usize as u64;
-    if gate_ip >> 32 != return_ip >> 32 {
-        return Err(io::Error::other(
-            "trusted syscall gate crosses a 4GiB boundary",
-        ));
-    }
-
-    let mut filter = [
-        stmt(BPF_LD_W_ABS, SECCOMP_DATA_ARCH_OFFSET),
-        jump(BPF_JMP_JEQ_K, AUDIT_ARCH_X86_64, 1, 0),
-        stmt(BPF_RET_K, SECCOMP_RET_KILL_PROCESS),
-        stmt(BPF_LD_W_ABS, SECCOMP_DATA_NR_OFFSET),
-        jump(BPF_JMP_JEQ_K, libc::SYS_rt_sigreturn as u32, 6, 0),
-        stmt(BPF_LD_W_ABS, SECCOMP_DATA_IP_HIGH_OFFSET),
-        jump(BPF_JMP_JEQ_K, (gate_ip >> 32) as u32, 0, 3),
-        stmt(BPF_LD_W_ABS, SECCOMP_DATA_IP_LOW_OFFSET),
-        jump(BPF_JMP_JEQ_K, gate_ip as u32, 2, 0),
-        jump(BPF_JMP_JEQ_K, return_ip as u32, 1, 0),
-        stmt(BPF_RET_K, SECCOMP_RET_TRAP),
-        stmt(BPF_RET_K, SECCOMP_RET_ALLOW),
-    ];
-    let program = libc::sock_fprog {
-        len: u16::try_from(filter.len()).expect("small fixed seccomp filter"),
-        filter: filter.as_mut_ptr(),
-    };
-
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_seccomp,
-            libc::SECCOMP_SET_MODE_FILTER,
-            libc::SECCOMP_FILTER_FLAG_TSYNC,
-            &program,
-        )
-    };
-    if result != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-const fn stmt(code: u16, value: u32) -> libc::sock_filter {
-    libc::sock_filter {
-        code,
-        jt: 0,
-        jf: 0,
-        k: value,
-    }
-}
-
-const fn jump(code: u16, value: u32, jump_true: u8, jump_false: u8) -> libc::sock_filter {
-    libc::sock_filter {
-        code,
-        jt: jump_true,
-        jf: jump_false,
-        k: value,
     }
 }
 
@@ -756,8 +1097,19 @@ impl StackLine {
 
 #[cfg(test)]
 mod tests {
+    use core::sync::atomic::Ordering;
+
+    use super::MAX_PATCH_SITES;
+    use super::SITE_ACTIVE;
+    use super::SITE_FALLBACK;
+    use super::SITE_INSTALLING;
+    use super::SITE_STALE;
+    use super::SITES;
+    use super::SiteSlot;
     use super::StackLine;
+    use super::claim_site;
     use super::clone_is_fork_like;
+    use super::mark_site_range_stale;
 
     #[test]
     fn stack_line_formats_signed_and_hex_values() {
@@ -766,6 +1118,31 @@ mod tests {
         line.push_bytes(b" ");
         line.push_hex(0xdead_beef);
         assert_eq!(&line.bytes[..line.len], b"-123 deadbeef");
+    }
+
+    #[test]
+    fn reused_address_claims_a_new_site_generation() {
+        SITES.get_or_init(|| {
+            (0..MAX_PATCH_SITES)
+                .map(|_| SiteSlot::new())
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+        });
+        let address = 0x1234_5000;
+        let (site, claimed) = claim_site(address).unwrap();
+        assert!(claimed);
+        assert_eq!(site.state.load(Ordering::Acquire), SITE_INSTALLING);
+        site.state.store(SITE_ACTIVE, Ordering::Release);
+
+        mark_site_range_stale(address - 0x100, 0x200, address + 0x100);
+        assert_eq!(site.state.load(Ordering::Acquire), SITE_STALE);
+        assert_eq!(site.mapping_end.load(Ordering::Acquire), address + 0x100);
+
+        let (same_site, claimed) = claim_site(address).unwrap();
+        assert!(core::ptr::eq(site, same_site));
+        assert!(claimed);
+        assert_eq!(site.state.load(Ordering::Acquire), SITE_INSTALLING);
+        site.state.store(SITE_FALLBACK, Ordering::Release);
     }
 
     #[test]

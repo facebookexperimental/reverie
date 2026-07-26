@@ -10,8 +10,20 @@ use std::process::Command;
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 compile_error!("reverie-liteinst requires Linux x86-64");
 
-mod pun;
+mod backend;
+mod patch_alloc;
+
+pub use backend::COORDINATOR_ENV;
+pub use backend::LiteinstBackend;
+pub use backend::TOOL_PRELOAD_ENV;
+pub mod rpc;
 mod runtime;
+mod tool_host;
+
+pub use tool_host::install_tool;
+
+#[global_allocator]
+static PATCH_ALLOCATOR: patch_alloc::PatchAllocator = patch_alloc::PatchAllocator;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-87): Review the inherited compatibility event channel.
@@ -111,6 +123,19 @@ pub unsafe extern "C" fn reverie_liteinst_initialize() {
             libc::_exit(127);
         }
     }
+}
+
+// TODO-HUMAN-REVIEW(PR-127): Review public per-site instrumentation counters.
+/// Returns the number of SIGSYS deliveries observed at one syscall instruction.
+#[unsafe(no_mangle)]
+pub extern "C" fn reverie_liteinst_site_trap_count(address: u64) -> u64 {
+    runtime::site_counts(address).0
+}
+
+/// Returns the number of installed-hook callbacks observed at one syscall instruction.
+#[unsafe(no_mangle)]
+pub extern "C" fn reverie_liteinst_site_hook_count(address: u64) -> u64 {
+    runtime::site_counts(address).1
 }
 
 #[cfg(feature = "preload-constructor")]

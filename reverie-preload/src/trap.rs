@@ -180,7 +180,14 @@ pub(crate) unsafe extern "C" fn sigsys_handler(
         }
     }
 
-    registers[libc::REG_RAX as usize] = event.resolved_result();
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    if let Some(resume_address) = event.resume_address() {
+        // Preserve the syscall-number register so the replacement callback
+        // observes the original entry state after sigreturn.
+        registers[libc::REG_RIP as usize] = resume_address as i64;
+    } else {
+        registers[libc::REG_RAX as usize] = event.resolved_result();
+    }
     unsafe { IN_HANDLER = false };
 }
 

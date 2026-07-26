@@ -1,107 +1,65 @@
-# Reverie LiteInst Preload Prototype
+# Reverie LiteInst
 
-This crate is a deliberately narrow Linux x86-64 proof of concept for
-in-process Reverie instrumentation. It is not an implementation of Reverie's
-`Backend` trait and cannot host an arbitrary asynchronous `Tool`.
+`reverie-liteinst` is an experimental Linux x86-64 Reverie backend built on the
+standalone `liteinst2` patching library, the shared `reverie-preload` runtime,
+and `reverie-rpc-transport`.
 
-The launcher adds `libreverie_liteinst.so` to `LD_PRELOAD`. The preload
-constructor:
+## Event path
 
-1. creates separate writable and executable mappings for a six-byte synthetic
-   dispatch function and an in-page tool trampoline;
-2. installs a `SIGSYS` handler;
-3. installs a seccomp-BPF `SECCOMP_RET_TRAP` filter for application syscalls;
-   and
-4. activates a one-byte `B8` to `E9` instruction pun on the first trapped
-   syscall, routing the event through the in-guest strace trampoline.
+1. A tool-specific DSO calls `install_tool::<T>` from its preload constructor.
+   It connects to the coordinator and receives `T::GlobalState::Config` before
+   seccomp is active.
+2. `reverie-preload` installs the SIGSYS handler, alternate stack, trusted
+   syscall gate, and seccomp filter.
+3. The first syscall at an instruction reaches SIGSYS. The LiteInst dispatcher
+   installs a replace-first hook and changes the saved signal-context RIP to the
+   generated trampoline entry.
+4. After `sigreturn`, the trampoline invokes `T::handle_syscall_event` in normal
+   guest context. The first invocation and later patched invocations therefore
+   use the same tool path; the first site trap is not also a tool execution.
+5. `LiteinstGuest<T>` supplies in-process memory/register access and syscall
+   injection through the trusted gate. `CoordinatorRpc<G>` serializes
+   `GlobalRPC` messages over the same UDS/bincode framing as
+   `reverie-rpc-transport::RpcServer<G>`.
 
-Bytes 1 through 4 of the dispatch instruction are simultaneously the immediate
-of `mov eax, imm32` and the displacement of `jmp rel32`. Only byte 0 changes.
-The executable mapping is never writable and the writable alias is never
-executable. A small assembly syscall gate is exempted by exact instruction
-pointer so the handler can forward the original syscall without recursively
-trapping itself.
+The regression proof reports `calls=32 traps=1 hooks=32` and sends a real
+Reverie tool RPC for every callback.
 
-## Build and run
+## Backend launcher
 
-```bash
-cargo build -p reverie-liteinst
-target/debug/reverie-liteinst-strace /bin/echo hello
-```
+`LiteinstBackend` implements Reverie's `Backend` trait. It owns the single
+`GlobalTool`, starts a UDS coordinator, sets `LD_PRELOAD` and
+`REVERIE_LITEINST_COORDINATOR`, runs the guest, and returns its status and final
+global state. `REVERIE_LITEINST_TOOL_PRELOAD` must name a DSO that embeds the
+same concrete `T` and calls `install_tool::<T>`.
 
-The guest writes its normal output to stdout. The in-process tool writes trace
-records like this to stderr:
+Built-in `strace` and compatibility modes remain available through
+`configure_command`. They use the same shared preload and LiteInst hook path
+without a coordinator.
 
-```text
-[liteinst strace pid 1234] syscall(1) = 6
-```
+## Current boundaries
 
-Embedding launchers can call `configure_command` with
-`PreloadTool::Compatibility`. That mode forwards the same syscall stream but
-emits stable syscall-number markers instead of PID- and ASLR-dependent trace
-lines:
+- Dynamically linked, non-`AT_SECURE` Linux x86-64 guests only.
+- One coordinator connection and one process are supported by
+  `LiteinstBackend`. Fork/clone process-tree reconnect and exec rebootstrap are
+  not implemented.
+- Syscalls are hosted. Signal, CPUID, RDTSC/RDTSCP, RDRAND/RDSEED, and tool exit
+  callbacks are not routed yet.
+- Timer arming currently returns success but no RCB timer or preemption event is
+  delivered. This supports the single-thread L0 smoke path; it is not strict
+  scheduling or an L1/L2 determinism claim.
+- Rust tool futures must make progress synchronously. Coordinator RPC and guest
+  syscall injection do so; a tool future that depends on an unrelated executor
+  can stall.
+- The five-byte patch window and executable mapping must be supported by
+  `liteinst2`. Dynamic executable mappings without a prepared reachable arena
+  retain the trap fallback.
+- `execve` cannot safely cross the inherited filter because the handler and DSO
+  mappings disappear. A future exec bootstrap must be controller-owned.
+- This is in-process instrumentation, not a security sandbox.
 
-```text
-reverie-liteinst: tool=compat syscall=1
-```
-
-Callers can count and compare these markers alongside guest output and exit
-status. Arguments and results are omitted because many otherwise compatible
-calls contain host-selected addresses and identifiers.
-
-Controllers that must keep guest standard error separate from compatibility
-events can set `REVERIE_LITEINST_EVENT_FD` to the writable end of an inherited
-pipe and `REVERIE_LITEINST_EVENT_COOKIE` to a nonzero decimal `u64`. The
-descriptor must have `FD_CLOEXEC` cleared before the guest execs, and the
-controller must continuously drain the read end. The runtime validates and
-makes the pipe nonblocking, removes both variables before guest code starts,
-includes the cookie in each marker, and prevents ordinary descriptor syscalls
-from closing, duplicating, or writing to the reserved descriptor. It terminates
-the compatibility run if the descriptor identity changes or an atomic marker
-write cannot complete. Standalone launchers retain the standard-error default.
-Dedicated-channel records also identify the emitting runtime-visible Linux PID. Compatibility
-mode rejects process-group/session and PID-namespace escape operations so an
-external controller can clean up fork descendants as one process group.
-
-The cookie prevents accidental control-record confusion; it is not an
-authentication boundary against intentionally hostile code in the same address
-space. The entire preload prototype is in-process and must not be used as a
-security sandbox.
-
-The `preload-constructor` default feature installs the runtime through the
-DSO's `.init_array`. Embedders that provide their own cdylib wrapper must
-disable default features and install `reverie_liteinst_initialize` exactly once.
-
-`LD_PRELOAD` and the mapped runtime survive `fork`, so fork children remain
-instrumented. The integration test runs a parent and child that both issue
-trapped syscalls and requires trace records from two PIDs.
-
-## Prototype boundaries
-
-- Linux x86-64 and dynamically linked, non-`AT_SECURE` guests only.
-- The built-in synchronous callbacks run in the guest's signal context.
-  Reverie's async `Tool`, `Guest`, global RPC, timers, signals, register/memory
-  mutation, and destructor contracts are not implemented.
-- This prototype puns a synthetic dispatch instruction. It does not yet find
-  and rewrite arbitrary two-byte `syscall` instructions in ELF text.
-- `fork` and fork-like `clone` with a null child stack inherit instrumentation.
-  Thread-creating `clone`, `clone3`, and `vfork` return `ENOTSUP`.
-- `execve` and `execveat` return `ENOTSUP`. Seccomp filters survive exec while
-  caught signal handlers, preload mappings, and alternate stacks do not; an
-  inherited trap filter would otherwise kill the new image before its preload
-  constructor could run.
-- Applications can still interfere with reserved signals or masks. Replacing
-  the `SIGSYS` disposition is rejected, but complete `rt_sigprocmask` and
-  `sigaltstack` virtualization is outside this prototype.
-- CPUID, RDTSC/RDTSCP, RDRAND/RDSEED, static binaries, secure-execution mode,
-  `dlopen`/JIT executable mappings, and arbitrary signal multiplexing are not
-  covered.
-- The one-byte pun follows the empirical x86 instruction-coherence technique
-  used by LiteInst research. A serializing CPUID follows activation, but this
-  is not a portable architectural guarantee.
-
-These limits are fail-closed where continuing would corrupt execution. Extending
-this into a conforming backend requires an external controller for async tool
-execution, complete process-tree and exec lifecycle control, signal
-virtualization, short-instruction rewriting, and coverage for nondeterministic
-CPU instructions.
+Hermit CLI linkage and a published `liteinst2` revision are separate integration
+steps. The direct Backend harness has run Detcore with `/bin/echo`, `/bin/true`,
+and `/bin/cat /dev/null`; this does not make `hermit --backend liteinst` real
+until that CLI path constructs `LiteinstBackend` and the corresponding Detcore
+preload DSO on the same landed revisions.
