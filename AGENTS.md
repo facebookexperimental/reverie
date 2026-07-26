@@ -288,6 +288,80 @@ HTTPS_PROXY=http://fwdproxy:8080 git fetch origin
 HTTPS_PROXY=http://fwdproxy:8080 gh pr view -R rrnewton/reverie <number>
 ```
 
+## Task Closure Policy
+
+A task is not finished when the code is written; it is finished when the change
+is on `main`. Phantom closures — tasks marked closed while the work never landed
+— are a recurring, expensive failure mode. Do not create one. The rules below
+are mandatory for every implementation and review agent.
+
+1. **Agents MUST NOT close tasks.** Never run `tg update <task> --status
+   closed` (or any equivalent close/complete transition). Closing is reserved
+   for the coordinator, who does it only after confirming the work is on
+   `main`. An agent that closes its own task is asserting a landing it cannot
+   witness.
+2. **When your work is complete, set the task to `IMPLEMENTED` and post the PR
+   link.** "Complete" means the feature branch is pushed and a pull request is
+   open against `rrnewton/reverie:main`. Record the transition and evidence:
+
+   ```bash
+   tg update <task> --status implemented
+   tg note <task> "Implemented: https://github.com/rrnewton/reverie/pull/<n> \
+     | branch <feature-branch> @ <40-hex SHA> | base origin/main <SHA> \
+     | validation: <exact commands + results, assurance level, backend>"
+   ```
+
+   The PR link and the exact tested SHA are required, not optional. A branch
+   name alone is not evidence.
+3. **Adversarial review confirms the work exists in the PR.** Before a task is
+   trusted as `IMPLEMENTED`, a reviewer independently verifies that the claimed
+   change is actually present in the pull request diff, that the cited tests
+   exist and were run at the PR head SHA, and that the reported assurance level
+   (L0–L4), backend, and relaxations match reality. A Reverie-only change is
+   floored at L0 and does not establish a determinism guarantee on its own; a
+   claim that does not survive this check is not `IMPLEMENTED`.
+4. **The task stays `IMPLEMENTED` until the PR lands on `main`.** Open,
+   in-review, CI-red, awaiting-merge, and blocked-on-a-dependency PRs are all
+   still `IMPLEMENTED`, never `closed`. If the branch stops fast-forwarding, or
+   CI goes red, or a required check is not green at the PR head, the task
+   remains `IMPLEMENTED` (or moves back to `in_progress`) — it does not advance.
+5. **Only the coordinator closes tasks, after landing confirmation.** The
+   coordinator closes a task only after verifying the PR is merged into
+   `rrnewton/reverie:main` (the required **Regular tests** job green at the
+   merged head, the commit reachable from `main`), and, when the change is
+   consumed by Hermit, that the Hermit-side reverie pin was bumped to the
+   landed SHA. Landing confirmation is a merge commit on `main`, not a green
+   local run.
+
+### Done vs. Not Done
+
+Use these concrete examples to decide the correct status. When in doubt, choose
+the lower status and say why in a task note.
+
+**Done (coordinator may close):**
+
+- PR #### is merged into `rrnewton/reverie:main`; the merge commit is on `main`
+  and the required **Regular tests** job was green at that head.
+- A coordinated Hermit/Reverie change: the Reverie PR merged first, the Hermit
+  consumer revalidated against the exact landed SHA, and the parent gitlink
+  updated.
+
+**`IMPLEMENTED` (agent's terminal state — do NOT close):**
+
+- Branch pushed, PR open, CI green, awaiting coordinator merge.
+- PR open but CI red, or a required check missing/queued/stale — still
+  `IMPLEMENTED`; report the exact failure, do not close.
+- Reverie change committed and pushed but the Hermit pin bump that consumes it
+  has not landed — `IMPLEMENTED` with the dependent Hermit SHAs named.
+
+**Not done (stays `in_progress`, never `IMPLEMENTED` or `closed`):**
+
+- Code written but uncommitted, stashed, or not pushed.
+- "It builds/tests pass locally" with no pushed branch and no open PR.
+- A green local `cargo test` presented as project completion — a Reverie-only
+  suite pass is floored at L0 and is not an integrated determinism guarantee.
+- Tests marked `#[ignore]`, masked, or deleted to make a checkout look green.
+
 ## Script Convention
 
 - Project scripts use rust-script as `.rs` files with the shebang
