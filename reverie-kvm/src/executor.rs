@@ -1637,10 +1637,12 @@ fn open_virtual_file(
 }
 
 // TODO-HUMAN-REVIEW(PR-92): Review this KVM compatibility implementation.
+// TODO-HUMAN-REVIEW(PR-114): Review /proc/thread-self/fd guest descriptor resolution.
 fn guest_fd_path(path: &[u8]) -> Option<libc::c_int> {
     let suffix = path
         .strip_prefix(b"/dev/fd/")
-        .or_else(|| path.strip_prefix(b"/proc/self/fd/"))?;
+        .or_else(|| path.strip_prefix(b"/proc/self/fd/"))
+        .or_else(|| path.strip_prefix(b"/proc/thread-self/fd/"))?;
     if suffix.is_empty() || !suffix.iter().all(u8::is_ascii_digit) {
         return None;
     }
@@ -1677,6 +1679,7 @@ fn guest_fd_metadata(
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-92): Review guest /dev/fd duplication without supervisor procfs exposure.
+// TODO-HUMAN-REVIEW(PR-114): Review fresh open-file-description semantics.
 fn open_guest_fd_path(
     state: &mut LoadedStaticElf,
     guest_fd: libc::c_int,
@@ -1686,32 +1689,45 @@ fn open_guest_fd_path(
     let Some(source_host_fd) = host_fd(state, guest_fd) else {
         return negative_errno(libc::ENOENT);
     };
-    let unsupported = (libc::O_CREAT
-        | libc::O_DIRECTORY
-        | libc::O_EXCL
-        | libc::O_NOFOLLOW
-        | libc::O_TMPFILE
-        | libc::O_TRUNC) as u64;
-    if flags & unsupported != 0 {
+    if flags & libc::O_TMPFILE as u64 == libc::O_TMPFILE as u64 {
+        // Keep the existing fail-closed behavior until guest mode/umask can be
+        // applied to an anonymous file created through a descriptor path.
         return negative_errno(libc::EINVAL);
     }
-    let source_flags = match fd_status_flags(source_host_fd) {
-        Ok(flags) => flags,
-        Err(error) => return error,
-    };
-    if source_flags & libc::O_ACCMODE != flags as libc::c_int & libc::O_ACCMODE {
-        return negative_errno(libc::EACCES);
+    if flags & (libc::O_PATH | libc::O_NOFOLLOW) as u64 == (libc::O_PATH | libc::O_NOFOLLOW) as u64
+    {
+        // Linux would return an O_PATH handle to the magic link itself. Keeping
+        // that real supervisor procfs descriptor would bypass the synthetic
+        // guest-fd metadata model and expose host-specific procfs identity.
+        return negative_errno(libc::ELOOP);
     }
     let source_alias = output_alias(state, guest_fd);
     let source_proc_inode = state.proc_files.get(&guest_fd).copied();
-    // SAFETY: source_host_fd names a live descriptor and F_DUPFD_CLOEXEC
-    // returns a new owned descriptor.
-    let duplicated = unsafe { libc::fcntl(source_host_fd, libc::F_DUPFD_CLOEXEC, 0) };
-    if duplicated < 0 {
+
+    // Opening a proc-fd magic link creates a fresh open file description. A
+    // descriptor duplication would incorrectly share the source offset and
+    // status flags, and would prevent Linux-supported access-mode changes.
+    // Resolve only the already-mapped host descriptor, so no supervisor-private
+    // descriptor can be named by a guest path.
+    let proc_path =
+        CString::new(format!("/proc/self/fd/{source_host_fd}")).expect("host fd path has no NUL");
+    let host_flags = (flags | libc::O_CLOEXEC as u64) as libc::c_int;
+    // SAFETY: proc_path is NUL-terminated and live for the call. The source fd
+    // remains owned by state, and Linux validates the requested open flags.
+    let reopened = unsafe {
+        libc::syscall(
+            libc::SYS_openat,
+            libc::AT_FDCWD,
+            proc_path.as_ptr(),
+            host_flags,
+            0,
+        )
+    };
+    if reopened < 0 {
         return io_error(std::io::Error::last_os_error());
     }
-    // SAFETY: fcntl returned a new owned descriptor.
-    let file = unsafe { std::fs::File::from_raw_fd(duplicated) };
+    // SAFETY: openat returned a new owned descriptor.
+    let file = unsafe { std::fs::File::from_raw_fd(reopened as RawFd) };
     let new_fd = insert_file_with_flags(state, file, close_on_exec, source_alias);
     if new_fd >= 0
         && let Some(inode) = source_proc_inode
@@ -2694,17 +2710,28 @@ fn sanitize_stat_timestamps(stat: &mut libc::stat) {
     stat.st_ctime_nsec = 0;
 }
 
+// TODO-HUMAN-REVIEW(PR-114): Review guest descriptor path resolution for statfs.
 fn statfs(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
     let path = match read_c_string(memory, args[0], 4096) {
         Ok(path) if !path.is_empty() => path,
         Ok(_) => return negative_errno(libc::ENOENT),
         Err(error) => return read_c_string_errno(error),
     };
-    let file = match open_metadata_path(state, libc::AT_FDCWD, &path, false) {
-        Ok(file) => file,
+    let guest_path = match guest_fd_metadata(state, &path, false) {
+        Ok(metadata) => metadata,
         Err(error) => return error,
     };
-    fstatfs_host(memory, file.as_raw_fd(), args[1])
+    let opened_file;
+    let host_fd = if let Some(metadata) = guest_path {
+        metadata.host_fd
+    } else {
+        opened_file = match open_metadata_path(state, libc::AT_FDCWD, &path, false) {
+            Ok(file) => file,
+            Err(error) => return error,
+        };
+        opened_file.as_raw_fd()
+    };
+    fstatfs_host(memory, host_fd, args[1])
 }
 
 fn fstatfs(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
@@ -2779,6 +2806,7 @@ fn faccessat2(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) ->
 // The guest dirfd, cwd, and AT_SYMLINK_NOFOLLOW are resolved locally into an
 // O_PATH descriptor; the permission decision itself is delegated to the host
 // kernel via AT_EMPTY_PATH so the answer matches what the ptrace backend sees.
+// TODO-HUMAN-REVIEW(PR-114): Review guest descriptor path resolution for access checks.
 fn faccessat_impl(
     memory: &GuestMemory,
     state: &LoadedStaticElf,
@@ -2810,24 +2838,42 @@ fn faccessat_impl(
         }
         return 0;
     }
-    let file = match open_metadata_path(
-        state,
-        guest_dirfd,
-        &path,
-        flags & libc::AT_SYMLINK_NOFOLLOW != 0,
-    ) {
-        Ok(file) => file,
+    let guest_path = match guest_fd_metadata(state, &path, flags & libc::AT_SYMLINK_NOFOLLOW != 0) {
+        Ok(metadata) => metadata,
         Err(error) => return error,
+    };
+    if let Some(metadata) = guest_path
+        && metadata.no_follow
+    {
+        // Linux symlinks are always treated as mode 0777. F_OK and every valid
+        // access bit therefore succeed when faccessat2 checks the magic link
+        // itself rather than its target.
+        return 0;
+    }
+    let opened_file;
+    let host_fd = if let Some(metadata) = guest_path {
+        metadata.host_fd
+    } else {
+        opened_file = match open_metadata_path(
+            state,
+            guest_dirfd,
+            &path,
+            flags & libc::AT_SYMLINK_NOFOLLOW != 0,
+        ) {
+            Ok(file) => file,
+            Err(error) => return error,
+        };
+        opened_file.as_raw_fd()
     };
     let empty_path = b"\0";
     // Forward AT_EACCESS so an effective-ID probe keeps its meaning; the O_PATH
     // fd is addressed with AT_EMPTY_PATH.
     let host_flags = libc::AT_EMPTY_PATH | (flags & libc::AT_EACCESS);
-    // SAFETY: empty_path is NUL-terminated and file owns a live O_PATH fd.
+    // SAFETY: empty_path is NUL-terminated and host_fd is live for the call.
     let result = unsafe {
         libc::syscall(
             libc::SYS_faccessat2,
-            file.as_raw_fd(),
+            host_fd,
             empty_path.as_ptr(),
             mode,
             host_flags,
@@ -6378,12 +6424,13 @@ mod tests {
     }
 
     #[test]
-    fn guest_fd_paths_duplicate_mapped_descriptors() {
+    fn guest_fd_paths_reopen_mapped_descriptors() {
         const PATH: u64 = 0x100;
         const PIPE_FDS: u64 = 0x200;
         const PAYLOAD: u64 = 0x300;
         const READ_BUFFER: u64 = 0x400;
         const STATX: u64 = 0x500;
+        const STATFS: u64 = 0x600;
 
         let root = TestDir::new();
         let mut state = test_state(&root.0);
@@ -6426,6 +6473,24 @@ mod tests {
         );
         let statx: libc::statx = read_struct(&memory, STATX);
         assert_eq!(statx.stx_mode & libc::S_IFMT as u16, libc::S_IFIFO as u16);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_access,
+                [PATH, libc::F_OK as u64, 0, 0, 0, 0],
+            ),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_statfs,
+                [PATH, STATFS, 0, 0, 0, 0],
+            ),
+            0
+        );
         memory.write(PAYLOAD, b"fd-path").unwrap();
         assert_eq!(
             syscall_result(
@@ -6475,8 +6540,148 @@ mod tests {
             ),
             negative_errno(libc::ENOENT)
         );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_access,
+                [PATH, libc::F_OK as u64, 0, 0, 0, 0],
+            ),
+            negative_errno(libc::ENOENT)
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_statfs,
+                [PATH, STATFS, 0, 0, 0, 0],
+            ),
+            negative_errno(libc::ENOENT)
+        );
         assert_eq!(guest_fd_path(b"/proc/self/fd/3"), Some(3));
+        assert_eq!(guest_fd_path(b"/proc/thread-self/fd/3"), Some(3));
         assert_eq!(guest_fd_path(b"/dev/fd/not-a-fd"), None);
+    }
+
+    #[test]
+    fn guest_fd_reopen_uses_fresh_description_and_native_flags() {
+        const PATH: u64 = 0x100;
+        const BUFFER: u64 = 0x200;
+
+        let root = TestDir::new();
+        let path = root.0.join("payload");
+        std::fs::write(&path, b"abc").unwrap();
+        let mut state = test_state(&root.0);
+        state.files.insert(
+            3,
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap(),
+        );
+        set_output_alias(&mut state, 3, Some(OutputAlias::Stdout));
+        state.proc_files.insert(3, 0x1234);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_read,
+                [3, BUFFER, 1, 0, 0, 0],
+            ),
+            1
+        );
+        assert_eq!(read_guest_bytes::<1>(&memory, BUFFER).unwrap(), *b"a");
+
+        write_c_string(&mut memory, PATH, "/proc/thread-self/fd/3");
+        let reopened = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_open,
+            [PATH, (libc::O_RDONLY | libc::O_CLOEXEC) as u64, 0, 0, 0, 0],
+        );
+        assert_eq!(reopened, 4, "O_RDWR source may be reopened O_RDONLY");
+        assert!(state.cloexec_fds.contains(&(reopened as libc::c_int)));
+        assert!(matches!(
+            output_alias(&state, reopened as libc::c_int),
+            Some(OutputAlias::Stdout)
+        ));
+        assert_eq!(
+            state.proc_files.get(&(reopened as libc::c_int)),
+            Some(&0x1234)
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_read,
+                [reopened as u64, BUFFER, 1, 0, 0, 0],
+            ),
+            1
+        );
+        assert_eq!(
+            read_guest_bytes::<1>(&memory, BUFFER).unwrap(),
+            *b"a",
+            "the reopened file description starts at an independent offset"
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_read,
+                [3, BUFFER, 1, 0, 0, 0],
+            ),
+            1
+        );
+        assert_eq!(read_guest_bytes::<1>(&memory, BUFFER).unwrap(), *b"b");
+
+        write_c_string(&mut memory, PATH, "/proc/self/fd/3");
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_open,
+                [PATH, (libc::O_RDONLY | libc::O_NOFOLLOW) as u64, 0, 0, 0, 0,],
+            ),
+            negative_errno(libc::ELOOP),
+            "O_NOFOLLOW applies to the descriptor magic link"
+        );
+        let file_count = state.files.len();
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_open,
+                [PATH, (libc::O_PATH | libc::O_NOFOLLOW) as u64, 0, 0, 0, 0,],
+            ),
+            negative_errno(libc::ELOOP),
+            "the guest must not retain a supervisor procfs magic-link fd"
+        );
+        assert_eq!(state.files.len(), file_count);
+        assert!(
+            state
+                .files
+                .values()
+                .all(|file| ensure_not_procfs(file).is_ok())
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_open,
+                [
+                    PATH,
+                    (libc::O_RDONLY | libc::O_DIRECTORY) as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            negative_errno(libc::ENOTDIR)
+        );
     }
 
     #[test]
@@ -6499,7 +6704,7 @@ mod tests {
             0
         );
 
-        for prefix in ["/dev/fd/", "/proc/self/fd/"] {
+        for prefix in ["/dev/fd/", "/proc/self/fd/", "/proc/thread-self/fd/"] {
             write_c_string(&mut memory, PATH, &format!("{prefix}3"));
             assert_eq!(
                 syscall_result(
