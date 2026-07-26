@@ -158,6 +158,30 @@ fn exact_counter1_tool_reports_a_nonzero_total() {
 }
 
 #[test]
+fn exact_counter2_tool_reports_process_and_thread_totals() {
+    let output = run("counter2", &[], &["/bin/echo", "hello"]);
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"hello\n");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let summary = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix(" [counter tool] Total system calls in process tree: "))
+        .expect("counter2 summary is missing");
+    let total = summary
+        .split_once(',')
+        .expect("counter2 total is not followed by process details")
+        .0
+        .parse::<u64>()
+        .unwrap();
+    assert!(total > 0, "{stderr}");
+    assert!(
+        summary.ends_with("from 1 processes, 1 thread(s)."),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn exact_strace_tool_observes_filtered_write() {
     let output = run("strace", &["--trace", "write"], &["/bin/echo", "hello"]);
 

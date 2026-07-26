@@ -56,8 +56,20 @@ async fn main() -> anyhow::Result<()> {
 
     std::io::stdout().write_all(&result.output.stdout)?;
     std::io::stderr().write_all(&result.output.stderr)?;
-    if let Some(total) = result.counter_total {
-        eprintln!(" [counter tool] Total system calls in process tree: {total}");
+    match result.counter_summary {
+        Some(example_tools::CounterSummary::Counter1 { total_syscalls }) => {
+            eprintln!(" [counter tool] Total system calls in process tree: {total_syscalls}");
+        }
+        Some(example_tools::CounterSummary::Counter2 {
+            total_syscalls,
+            processes,
+            threads,
+        }) => {
+            eprintln!(
+                " [counter tool] Total system calls in process tree: {total_syscalls}, from {processes} processes, {threads} thread(s)."
+            );
+        }
+        None => {}
     }
 
     let status: ExitStatus = result.output.status.into();

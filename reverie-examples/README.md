@@ -64,6 +64,7 @@ Run the exact example `Tool` implementations through `LiteinstBackend`:
 ```sh
 target/debug/reverie-liteinst-examples --tool noop -- /bin/echo hello
 target/debug/reverie-liteinst-examples --tool counter1 -- /bin/echo hello
+target/debug/reverie-liteinst-examples --tool counter2 -- /bin/echo hello
 target/debug/reverie-liteinst-examples --tool strace --trace write -- /bin/echo hello
 ```
 

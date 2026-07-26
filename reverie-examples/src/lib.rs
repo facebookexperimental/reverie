@@ -22,6 +22,9 @@ use std::path::Path;
 #[path = "../counter1.rs"]
 mod counter1;
 #[allow(dead_code)]
+#[path = "../counter2.rs"]
+mod counter2;
+#[allow(dead_code)]
 #[path = "../noop.rs"]
 mod noop;
 #[allow(dead_code)]
@@ -90,6 +93,10 @@ unsafe extern "C" fn initialize(
     let result = match selected.as_str() {
         "counter1" => unsafe {
             reverie_liteinst::install_tool_from_bootstrap::<counter1::CounterLocal>(&socket)
+        },
+        // TODO-HUMAN-REVIEW(PR-146): Review counter2 preload tool selection.
+        "counter2" => unsafe {
+            reverie_liteinst::install_tool_from_bootstrap::<counter2::CounterLocal>(&socket)
         },
         "strace" => unsafe {
             reverie_liteinst::install_tool_from_bootstrap::<strace::Strace>(&socket)

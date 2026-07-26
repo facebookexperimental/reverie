@@ -23,6 +23,9 @@ use reverie_liteinst::LiteinstBackend;
 #[path = "../counter1.rs"]
 mod counter1;
 #[allow(dead_code)]
+#[path = "../counter2.rs"]
+mod counter2;
+#[allow(dead_code)]
 #[path = "../noop.rs"]
 mod noop;
 #[allow(dead_code)]
@@ -40,6 +43,9 @@ pub(crate) use strace::global_state;
 pub(crate) enum ToolKind {
     /// Count every intercepted syscall through the shared global state.
     Counter1,
+    /// Aggregate per-thread and per-process syscall counts in global state.
+    // TODO-HUMAN-REVIEW(PR-146): Review the counter2 LiteInst selector extension.
+    Counter2,
     /// Decode and print subscribed syscalls.
     Strace,
     /// Preserve guest behavior without subscribing to events.
@@ -50,10 +56,23 @@ impl ToolKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::Counter1 => "counter1",
+            Self::Counter2 => "counter2",
             Self::Strace => "strace",
             Self::Noop => "noop",
         }
     }
+}
+
+// TODO-HUMAN-REVIEW(PR-146): Review the shared LiteInst counter result API.
+pub(crate) enum CounterSummary {
+    Counter1 {
+        total_syscalls: u64,
+    },
+    Counter2 {
+        total_syscalls: u64,
+        processes: u64,
+        threads: u64,
+    },
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -62,8 +81,9 @@ impl ToolKind {
 pub(crate) struct RunOutput {
     /// Guest process status and captured standard streams.
     pub(crate) output: Output,
-    /// Final counter value for `counter1`; absent for other tools.
-    pub(crate) counter_total: Option<u64>,
+    /// Final structured result for counter tools; absent for other tools.
+    // TODO-HUMAN-REVIEW(PR-146): Review the typed counter result field.
+    pub(crate) counter_summary: Option<CounterSummary>,
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -101,7 +121,28 @@ pub(crate) async fn run(
             .await?;
             Ok(RunOutput {
                 output,
-                counter_total: Some(global.total()),
+                counter_summary: Some(CounterSummary::Counter1 {
+                    total_syscalls: global.total(),
+                }),
+            })
+        }
+        // TODO-HUMAN-REVIEW(PR-146): Review the exact counter2 LiteInst host path.
+        ToolKind::Counter2 => {
+            let (output, global) = LiteinstBackend::run_with_output_and_preload_data::<
+                counter2::CounterLocal,
+            >(command, (), preload, tool_data)
+            .await?;
+            let counter_summary = {
+                let inner = global.inner.lock().unwrap();
+                CounterSummary::Counter2 {
+                    total_syscalls: inner.total_syscalls,
+                    processes: inner.exited_procs,
+                    threads: inner.exited_threads,
+                }
+            };
+            Ok(RunOutput {
+                output,
+                counter_summary: Some(counter_summary),
             })
         }
         ToolKind::Strace => {
@@ -114,7 +155,7 @@ pub(crate) async fn run(
             .await?;
             Ok(RunOutput {
                 output,
-                counter_total: None,
+                counter_summary: None,
             })
         }
         ToolKind::Noop => {
@@ -127,7 +168,7 @@ pub(crate) async fn run(
             .await?;
             Ok(RunOutput {
                 output,
-                counter_total: None,
+                counter_summary: None,
             })
         }
     }
