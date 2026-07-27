@@ -222,7 +222,6 @@ pub struct KernelSigset(u64);
 
 impl KernelSigset {
     /// Check if the sigset contains a signal.
-    #[allow(unused)]
     pub fn contains(&self, sig: libc::c_int) -> bool {
         let mask = sigmask(sig);
         (self.0 & mask) == mask
@@ -233,6 +232,49 @@ impl KernelSigset {
         let mask = sigmask(sig);
         self.0 &= !mask
     }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-175): Review queued-signal preservation across rt_sigsuspend injection.
+pub fn sys_rt_sigsuspend(
+    sigset_ptr: *const KernelSigset,
+    sigset_size: usize,
+) -> Result<usize, Errno> {
+    if sigset_size != core::mem::size_of::<KernelSigset>() {
+        return unsafe {
+            syscalls::syscall2(Sysno::rt_sigsuspend, sigset_ptr as usize, sigset_size)
+        };
+    }
+
+    let mut sigset = MaybeUninit::<KernelSigset>::uninit();
+    let local = libc::iovec {
+        iov_base: sigset.as_mut_ptr().cast(),
+        iov_len: core::mem::size_of::<KernelSigset>(),
+    };
+    let remote = libc::iovec {
+        iov_base: sigset_ptr.cast_mut().cast(),
+        iov_len: core::mem::size_of::<KernelSigset>(),
+    };
+    let copied = unsafe {
+        syscall!(
+            Sysno::process_vm_readv,
+            std::process::id() as usize,
+            &local as *const libc::iovec as usize,
+            1,
+            &remote as *const libc::iovec as usize,
+            1,
+            0
+        )?
+    };
+    if copied != core::mem::size_of::<KernelSigset>() {
+        return Err(Errno::EFAULT);
+    }
+    let sigset = unsafe { sigset.assume_init() };
+    if signal::pending_unblocked_caught_signal(&sigset) {
+        return Err(Errno::EINTR);
+    }
+
+    unsafe { syscalls::syscall2(Sysno::rt_sigsuspend, sigset_ptr as usize, sigset_size) }
 }
 
 /// The x86_64 kernel ABI representation of `struct sigaction`. libc's

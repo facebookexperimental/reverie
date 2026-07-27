@@ -56,6 +56,33 @@ static void wait_for_child(void)
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
+static void wait_for_blocked_sigchld(void)
+{
+    sigset_t blocked;
+    sigset_t previous;
+    pid_t child;
+    int status;
+    sig_atomic_t previous_count = saw_sigchld;
+
+    assert(sigemptyset(&blocked) == 0);
+    assert(sigaddset(&blocked, SIGCHLD) == 0);
+    assert(sigprocmask(SIG_BLOCK, &blocked, &previous) == 0);
+
+    child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        _exit(0);
+    }
+
+    while (saw_sigchld == previous_count) {
+        assert(sigsuspend(&previous) == -1);
+        assert(errno == EINTR);
+    }
+    assert(sigprocmask(SIG_SETMASK, &previous, NULL) == 0);
+    assert(waitpid(child, &status, 0) == child);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
 int main(void)
 {
     struct sigaction default_action;
@@ -70,6 +97,10 @@ int main(void)
 
     install_handler(SIGCHLD);
     wait_for_child();
+
+    for (unsigned attempt = 0; attempt < 64; ++attempt) {
+        wait_for_blocked_sigchld();
+    }
 
     for (unsigned attempt = 0; saw_sigchld == 0 && attempt < 1000; ++attempt) {
         usleep(1000);

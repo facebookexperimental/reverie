@@ -302,6 +302,11 @@ fn terminate(exit_code: usize) -> ! {
 
 /// Perform and exit group with the current thread
 fn exit_group_with_thread<T: ToolGlobal>(thread: &mut Thread<T>, exit_code: usize) -> usize {
+    prepare_group_exit(thread);
+    terminate_group(exit_code)
+}
+
+fn prepare_group_exit<T: ToolGlobal>(thread: &mut Thread<T>) {
     thread.try_exit();
     if let Some(exiting_pid) = thread::exit_all(|_, process_and_thread_id| unsafe {
         syscalls::syscall3(
@@ -316,7 +321,15 @@ fn exit_group_with_thread<T: ToolGlobal>(thread: &mut Thread<T>, exit_code: usiz
             let _ = T::global().on_exit_timeout();
         }
     }
-    terminate_group(exit_code)
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-175): Review default-fatal-signal lifecycle completion.
+/// Runs thread-exit callbacks before the signal dispatcher restores and re-raises a fatal signal.
+pub(crate) fn prepare_signal_termination<T: ToolGlobal>() {
+    if let Some(mut thread) = Thread::<T>::current() {
+        prepare_group_exit(&mut thread);
+    }
 }
 
 pub fn exit_group<T: ToolGlobal>(exit_code: usize) -> usize {

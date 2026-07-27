@@ -222,6 +222,10 @@ impl SyscallExt for Syscall {
                 args.arg2 as *mut _,
                 args.arg3,
             )
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-175): Review atomic rt_sigsuspend wake preservation.
+        } else if sysno == Sysno::rt_sigsuspend {
+            utils::sys_rt_sigsuspend(args.arg0 as *const _, args.arg1)
         } else if sysno == Sysno::close && args.arg0 == libc::STDERR_FILENO as usize {
             // Prevent stderr from getting closed. We need this for logging
             // purposes.
