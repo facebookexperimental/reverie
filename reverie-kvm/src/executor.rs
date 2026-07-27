@@ -598,7 +598,7 @@ fn execute_basic_syscall_with_output(
             _ => negative_errno(libc::EINVAL),
         }
     } else if number == libc::SYS_getrandom as u64 {
-        getrandom(memory, args[0], args[1])
+        getrandom(memory, state.tid, args[0], args[1])
     } else if number == libc::SYS_clock_gettime as u64 {
         write_bytes(memory, args[1], &[0; 16])
     } else if number == libc::SYS_gettimeofday as u64 {
@@ -2034,9 +2034,8 @@ fn open_file(
         return open_guest_fd_path(state, guest_fd, flags, guest_cloexec);
     }
     if path == b"/dev/random" || path == b"/dev/urandom" {
-        let bytes = (0..64 * 1024)
-            .map(|index| (index as u8).wrapping_mul(73).wrapping_add(41))
-            .collect::<Vec<_>>();
+        // TODO-HUMAN-REVIEW(PR-180): Review virtual-TID random-device streams.
+        let bytes = deterministic_random_bytes(state.tid, 64 * 1024, 73, 41);
         return open_virtual_file(state, &bytes, flags, guest_cloexec);
     }
     if path == b"/proc/uptime" {
@@ -5540,20 +5539,36 @@ fn sched_getattr(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64;
     }
 }
 
-fn getrandom(memory: &mut GuestMemory, address: u64, length: u64) -> i64 {
+// TODO-HUMAN-REVIEW(PR-180): Review virtual-TID random stream separation.
+fn getrandom(memory: &mut GuestMemory, tid: i32, address: u64, length: u64) -> i64 {
     let Ok(length) = usize::try_from(length) else {
         return negative_errno(libc::EINVAL);
     };
     if length > MAX_HOST_IO {
         return negative_errno(libc::E2BIG);
     }
-    let bytes: Vec<u8> = (0..length)
-        .map(|index| (index as u8).wrapping_mul(17).wrapping_add(0x5a))
-        .collect();
+    let bytes = deterministic_random_bytes(tid, length, 17, 0x5a);
     match memory.write(address, &bytes) {
         Ok(()) => length as i64,
         Err(_) => negative_errno(libc::EFAULT),
     }
+}
+
+fn deterministic_random_bytes(tid: i32, length: usize, byte_stride: u8, first_byte: u8) -> Vec<u8> {
+    // Keep TID 1 byte-for-byte compatible; the odd multiplier gives every
+    // other 32-bit virtual TID a distinct eight-byte salt.
+    let thread_stream = u64::from(tid as u32)
+        .wrapping_sub(1)
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    (0..length)
+        .map(|index| {
+            let thread_byte = thread_stream.rotate_right(((index % 8) * 8) as u32) as u8;
+            (index as u8)
+                .wrapping_mul(byte_stride)
+                .wrapping_add(first_byte)
+                ^ thread_byte
+        })
+        .collect()
 }
 
 fn gettimeofday(memory: &mut GuestMemory, args: &[u64; 6]) -> i64 {
@@ -12000,17 +12015,30 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_getrandom_repeats() {
+    fn deterministic_getrandom_repeats_per_thread_and_separates_threads() {
         let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
 
-        assert_eq!(getrandom(&mut memory, 0x100, 32), 32);
+        assert_eq!(getrandom(&mut memory, 1, 0x100, 32), 32);
         let mut first = [0; 32];
         memory.read(0x100, &mut first).unwrap();
 
-        assert_eq!(getrandom(&mut memory, 0x200, 32), 32);
+        assert_eq!(getrandom(&mut memory, 1, 0x200, 32), 32);
         let mut second = [0; 32];
         memory.read(0x200, &mut second).unwrap();
         assert_eq!(first, second);
+
+        assert_eq!(getrandom(&mut memory, 2, 0x300, 32), 32);
+        let mut worker = [0; 32];
+        memory.read(0x300, &mut worker).unwrap();
+        assert_ne!(first, worker);
+    }
+
+    #[test]
+    fn deterministic_random_device_repeats_per_thread_and_separates_threads() {
+        let root = deterministic_random_bytes(1, 32, 73, 41);
+        assert_eq!(root, deterministic_random_bytes(1, 32, 73, 41));
+        assert_eq!(root[0], 41);
+        assert_ne!(root, deterministic_random_bytes(2, 32, 73, 41));
     }
 
     fn custom_action(handler: u64) -> [u8; KERNEL_SIGACTION_SIZE] {
