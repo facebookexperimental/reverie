@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+
 use reverie_syscalls::LocalMemory;
 use reverie_syscalls::Syscall;
 use syscalls::Errno;
@@ -117,6 +120,14 @@ where
     }
 }
 
+static POST_LOAD_PENDING: AtomicBool = AtomicBool::new(false);
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-194): Review the SaBRe loader-to-tool post-load bridge.
+pub extern "C" fn handle_post_load(_is_static: bool) {
+    POST_LOAD_PENDING.store(true, Ordering::Release);
+}
+
 pub extern "C" fn handle_syscall<T: ToolGlobal>(
     syscall: isize,
     arg1: usize,
@@ -132,6 +143,13 @@ pub extern "C" fn handle_syscall<T: ToolGlobal>(
     } else {
         terminate(1);
     };
+
+    // The loader callback runs before libc has published the client's
+    // environment. Defer tool construction and post-exec delivery until the
+    // first rewritten syscall, when private tool selection is available.
+    if POST_LOAD_PENDING.swap(false, Ordering::AcqRel) {
+        T::global().on_post_load();
+    }
 
     match handle_syscall_with_thread::<T>(
         &mut thread,
@@ -303,6 +321,7 @@ fn terminate(exit_code: usize) -> ! {
 /// Perform and exit group with the current thread
 fn exit_group_with_thread<T: ToolGlobal>(thread: &mut Thread<T>, exit_code: usize) -> usize {
     prepare_group_exit(thread);
+    T::global().on_process_exit(exit_code as i32);
     terminate_group(exit_code)
 }
 

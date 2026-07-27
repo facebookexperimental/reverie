@@ -98,6 +98,23 @@ pub trait Tool {
     #[inline]
     fn on_thread_exit(&self, _thread_id: u32) {}
 
+    /// Called after SaBRe has loaded or reloaded the guest image.
+    ///
+    /// The initial load and every successful `execve` reach this callback after
+    /// the client mappings have been rewritten and before guest execution
+    /// resumes.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-194): Review the loader post-load lifecycle callback.
+    #[inline]
+    fn on_post_load(&self) {}
+
+    /// Called after all tracked threads have received their exit callback and
+    /// immediately before an `exit_group` terminates the process.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-194): Review the process-exit lifecycle callback.
+    #[inline]
+    fn on_process_exit(&self, _exit_code: i32) {}
+
     /// Called whenever the `rdtsc` instruction was executed. This should return
     /// the RDTSC timestamp counter.
     ///

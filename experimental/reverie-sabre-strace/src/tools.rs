@@ -8,6 +8,15 @@
 
 //! Shared Reverie example tools hosted by the SaBRe plugin.
 
+#[allow(dead_code)]
+#[path = "../../../reverie-examples/chaos.rs"]
+mod chaos_exact;
+#[allow(dead_code)]
+#[path = "../../../reverie-examples/chrome-trace/main.rs"]
+mod chrome_trace_exact;
+#[allow(dead_code)]
+#[path = "../../../reverie-examples/chunky_print.rs"]
+mod chunky_print_exact;
 #[path = "../../../reverie-examples/counter1_tool.rs"]
 mod counter1_exact;
 #[path = "../../../reverie-examples/counter2_tool.rs"]
@@ -21,9 +30,16 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
+pub(super) use chaos_exact::ChaosOpts as ExactChaosConfig;
+use chaos_exact::ChaosTool as ExactChaosTool;
+pub(super) use chaos_exact::ChaosToolGlobal as ExactChaosGlobal;
+pub(super) use chrome_trace_exact::ChromeTrace as ExactChromeTraceTool;
+pub(super) type ExactChromeTraceGlobal = <ExactChromeTraceTool as ReverieTool>::GlobalState;
+pub(super) use chunky_print_exact::ChunkyPrintGlobal as ExactChunkyPrintGlobal;
+use chunky_print_exact::ChunkyPrintLocal as ExactChunkyPrintTool;
 pub(super) use counter1_exact::CounterGlobal as ExactCounter1Global;
 use counter1_exact::CounterLocal as ExactCounter1Tool;
-use counter2_exact::CounterGlobal as ExactCounter2Global;
+pub(super) use counter2_exact::CounterGlobal as ExactCounter2Global;
 use counter2_exact::CounterLocal as ExactCounter2Tool;
 use reverie::Error;
 use reverie::GlobalTool;
@@ -42,6 +58,15 @@ use syscalls::Sysno;
 
 use super::COUNTER_RPC_SOCKET_ENV;
 use super::StraceTool;
+
+pub(super) fn exact_chaos_config(
+    skip: Option<u64>,
+    no_read: bool,
+    no_recv: bool,
+    no_interrupt: bool,
+) -> ExactChaosConfig {
+    ExactChaosConfig::for_liteinst(skip, no_read, no_recv, no_interrupt)
+}
 
 /// Environment variable selecting the shared tool hosted by the plugin.
 pub(super) const TOOL_ENV: &str = "REVERIE_SABRE_TOOL";
@@ -82,6 +107,12 @@ impl CounterConfig {
 /// Shared Reverie tool implementations available through the SaBRe runner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ToolKind {
+    /// Introduce short reads and interrupted-read errors.
+    Chaos,
+    /// Capture syscall and lifecycle events as Chrome trace data.
+    ChromeTrace,
+    /// Buffer standard output and error writes by logical epochs.
+    ChunkyPrint,
     /// Decode and print every intercepted syscall.
     Strace,
     /// Count intercepted syscalls in the current plugin process.
@@ -115,6 +146,9 @@ impl ToolKind {
         }
 
         let selected = match requested {
+            Some(value) if value == "chaos" => Self::Chaos,
+            Some(value) if value == "chrome-trace" => Self::ChromeTrace,
+            Some(value) if value == "chunky-print" => Self::ChunkyPrint,
             Some(value) if value == "counter1" => Self::Counter1,
             Some(value) if value == "counter1-exact" => Self::Counter1Exact,
             Some(value) if value == "counter2" => Self::Counter2,
@@ -310,6 +344,12 @@ fn is_terminal(syscall: Syscall) -> bool {
 }
 
 pub(crate) enum SharedAdapter {
+    ChaosLocal(ReverieAdapter<ExactChaosTool>),
+    ChaosRemote(RemoteReverieAdapter<ExactChaosTool>),
+    ChromeTraceLocal(ReverieAdapter<ExactChromeTraceTool>),
+    ChromeTraceRemote(RemoteReverieAdapter<ExactChromeTraceTool>),
+    ChunkyPrintLocal(ReverieAdapter<ExactChunkyPrintTool>),
+    ChunkyPrintRemote(RemoteReverieAdapter<ExactChunkyPrintTool>),
     Strace(ReverieAdapter<StraceTool>),
     Counter1Local(ReverieAdapter<Counter1Tool>),
     Counter1Remote(RemoteReverieAdapter<Counter1Tool>),
@@ -317,13 +357,44 @@ pub(crate) enum SharedAdapter {
     Counter1ExactRemote(RemoteReverieAdapter<ExactCounter1Tool>),
     Counter2Local(ReverieAdapter<Counter2Tool>),
     Counter2Remote(RemoteReverieAdapter<Counter2Tool>),
-    Counter2Exact(ReverieAdapter<ExactCounter2Tool>),
+    Counter2ExactLocal(ReverieAdapter<ExactCounter2Tool>),
+    Counter2ExactRemote(RemoteReverieAdapter<ExactCounter2Tool>),
     Noop(ReverieAdapter<NoopTool>),
 }
 
 impl SharedAdapter {
     pub(crate) fn new(kind: ToolKind, quiet: bool) -> Self {
         match kind {
+            ToolKind::Chaos => coordinator_socket().map_or_else(
+                || Self::ChaosLocal(local_adapter(ExactChaosConfig::default())),
+                |path| match RemoteReverieAdapter::connect(&path) {
+                    Ok(adapter) => Self::ChaosRemote(adapter),
+                    Err(error) => {
+                        coordinator_fallback("chaos", &path, &error);
+                        Self::ChaosLocal(local_adapter(ExactChaosConfig::default()))
+                    }
+                },
+            ),
+            ToolKind::ChromeTrace => coordinator_socket().map_or_else(
+                || Self::ChromeTraceLocal(local_adapter(())),
+                |path| match RemoteReverieAdapter::connect(&path) {
+                    Ok(adapter) => Self::ChromeTraceRemote(adapter),
+                    Err(error) => {
+                        coordinator_fallback("chrome-trace", &path, &error);
+                        Self::ChromeTraceLocal(local_adapter(()))
+                    }
+                },
+            ),
+            ToolKind::ChunkyPrint => coordinator_socket().map_or_else(
+                || Self::ChunkyPrintLocal(local_adapter(())),
+                |path| match RemoteReverieAdapter::connect(&path) {
+                    Ok(adapter) => Self::ChunkyPrintRemote(adapter),
+                    Err(error) => {
+                        coordinator_fallback("chunky-print", &path, &error);
+                        Self::ChunkyPrintLocal(local_adapter(()))
+                    }
+                },
+            ),
             ToolKind::Strace => Self::Strace(ReverieAdapter::new(StraceTool { quiet }, (), ())),
             ToolKind::Counter1 => coordinator_socket().map_or_else(
                 Self::counter1_local,
@@ -364,14 +435,16 @@ impl SharedAdapter {
                     }
                 },
             ),
-            ToolKind::Counter2Exact => Self::Counter2Exact(ReverieAdapter::new(
-                <ExactCounter2Tool as ReverieTool>::new(
-                    Pid::from_raw(unsafe { libc::getpid() }),
-                    &(),
-                ),
-                ExactCounter2Global::default(),
-                (),
-            )),
+            ToolKind::Counter2Exact => coordinator_socket().map_or_else(
+                || Self::Counter2ExactLocal(local_adapter(())),
+                |path| match RemoteReverieAdapter::connect(&path) {
+                    Ok(adapter) => Self::Counter2ExactRemote(adapter),
+                    Err(error) => {
+                        coordinator_fallback("counter2-exact", &path, &error);
+                        Self::Counter2ExactLocal(local_adapter(()))
+                    }
+                },
+            ),
             ToolKind::Noop => Self::Noop(ReverieAdapter::new(NoopTool, (), ())),
         }
     }
@@ -402,6 +475,12 @@ impl SharedAdapter {
 
     pub(crate) fn handle_syscall(&self, syscall: Syscall) -> Result<usize, Errno> {
         match self {
+            Self::ChaosLocal(adapter) => adapter.handle_syscall(syscall),
+            Self::ChaosRemote(adapter) => adapter.handle_syscall(syscall),
+            Self::ChromeTraceLocal(adapter) => adapter.handle_syscall(syscall),
+            Self::ChromeTraceRemote(adapter) => adapter.handle_syscall(syscall),
+            Self::ChunkyPrintLocal(adapter) => adapter.handle_syscall(syscall),
+            Self::ChunkyPrintRemote(adapter) => adapter.handle_syscall(syscall),
             Self::Strace(adapter) => adapter.handle_syscall(syscall),
             Self::Counter1Local(adapter) => adapter.handle_syscall(syscall),
             Self::Counter1Remote(adapter) => adapter.handle_syscall(syscall),
@@ -409,7 +488,8 @@ impl SharedAdapter {
             Self::Counter1ExactRemote(adapter) => adapter.handle_syscall(syscall),
             Self::Counter2Local(adapter) => adapter.handle_syscall(syscall),
             Self::Counter2Remote(adapter) => adapter.handle_syscall(syscall),
-            Self::Counter2Exact(adapter) => adapter.handle_syscall(syscall),
+            Self::Counter2ExactLocal(adapter) => adapter.handle_syscall(syscall),
+            Self::Counter2ExactRemote(adapter) => adapter.handle_syscall(syscall),
             Self::Noop(adapter) => adapter.handle_syscall(syscall),
         }
     }
@@ -423,6 +503,12 @@ impl SharedAdapter {
         F: FnMut() -> usize + Send + Sync,
     {
         match self {
+            Self::ChaosLocal(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
+            Self::ChaosRemote(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
+            Self::ChromeTraceLocal(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
+            Self::ChromeTraceRemote(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
+            Self::ChunkyPrintLocal(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
+            Self::ChunkyPrintRemote(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
             Self::Strace(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
             Self::Counter1Local(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
             Self::Counter1Remote(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
@@ -434,13 +520,24 @@ impl SharedAdapter {
             }
             Self::Counter2Local(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
             Self::Counter2Remote(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
-            Self::Counter2Exact(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
+            Self::Counter2ExactLocal(adapter) => {
+                adapter.handle_syscall_with_inject(syscall, inject)
+            }
+            Self::Counter2ExactRemote(adapter) => {
+                adapter.handle_syscall_with_inject(syscall, inject)
+            }
             Self::Noop(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
         }
     }
 
     pub(crate) fn handle_thread_start(&self, thread_id: u32) {
         match self {
+            Self::ChaosLocal(adapter) => adapter.handle_thread_start(thread_id),
+            Self::ChaosRemote(adapter) => adapter.handle_thread_start(thread_id),
+            Self::ChromeTraceLocal(adapter) => adapter.handle_thread_start(thread_id),
+            Self::ChromeTraceRemote(adapter) => adapter.handle_thread_start(thread_id),
+            Self::ChunkyPrintLocal(adapter) => adapter.handle_thread_start(thread_id),
+            Self::ChunkyPrintRemote(adapter) => adapter.handle_thread_start(thread_id),
             Self::Strace(adapter) => adapter.handle_thread_start(thread_id),
             Self::Counter1Local(adapter) => adapter.handle_thread_start(thread_id),
             Self::Counter1Remote(adapter) => adapter.handle_thread_start(thread_id),
@@ -448,13 +545,20 @@ impl SharedAdapter {
             Self::Counter1ExactRemote(adapter) => adapter.handle_thread_start(thread_id),
             Self::Counter2Local(adapter) => adapter.handle_thread_start(thread_id),
             Self::Counter2Remote(adapter) => adapter.handle_thread_start(thread_id),
-            Self::Counter2Exact(adapter) => adapter.handle_thread_start(thread_id),
+            Self::Counter2ExactLocal(adapter) => adapter.handle_thread_start(thread_id),
+            Self::Counter2ExactRemote(adapter) => adapter.handle_thread_start(thread_id),
             Self::Noop(adapter) => adapter.handle_thread_start(thread_id),
         }
     }
 
     pub(crate) fn handle_thread_exit(&self, thread_id: u32) {
         match self {
+            Self::ChaosLocal(adapter) => adapter.handle_thread_exit(thread_id),
+            Self::ChaosRemote(adapter) => adapter.handle_thread_exit(thread_id),
+            Self::ChromeTraceLocal(adapter) => adapter.handle_thread_exit(thread_id),
+            Self::ChromeTraceRemote(adapter) => adapter.handle_thread_exit(thread_id),
+            Self::ChunkyPrintLocal(adapter) => adapter.handle_thread_exit(thread_id),
+            Self::ChunkyPrintRemote(adapter) => adapter.handle_thread_exit(thread_id),
             Self::Strace(adapter) => adapter.handle_thread_exit(thread_id),
             Self::Counter1Local(adapter) => adapter.handle_thread_exit(thread_id),
             Self::Counter1Remote(adapter) => adapter.handle_thread_exit(thread_id),
@@ -465,10 +569,55 @@ impl SharedAdapter {
             Self::Counter1ExactRemote(adapter) => adapter.handle_thread_exit(thread_id),
             Self::Counter2Local(adapter) => adapter.handle_thread_exit(thread_id),
             Self::Counter2Remote(adapter) => adapter.handle_thread_exit(thread_id),
-            Self::Counter2Exact(adapter) => adapter.handle_thread_exit(thread_id),
+            Self::Counter2ExactLocal(adapter) => adapter.handle_thread_exit(thread_id),
+            Self::Counter2ExactRemote(adapter) => adapter.handle_thread_exit(thread_id),
             Self::Noop(adapter) => adapter.handle_thread_exit(thread_id),
         }
     }
+
+    pub(crate) fn handle_post_exec(&self) {
+        match self {
+            Self::ChaosLocal(adapter) => adapter.handle_post_exec(),
+            Self::ChaosRemote(adapter) => adapter.handle_post_exec(),
+            Self::ChromeTraceLocal(adapter) => adapter.handle_post_exec(),
+            Self::ChromeTraceRemote(adapter) => adapter.handle_post_exec(),
+            Self::ChunkyPrintLocal(adapter) => adapter.handle_post_exec(),
+            Self::ChunkyPrintRemote(adapter) => adapter.handle_post_exec(),
+            Self::Strace(adapter) => adapter.handle_post_exec(),
+            Self::Counter1Local(adapter) => adapter.handle_post_exec(),
+            Self::Counter1Remote(adapter) => adapter.handle_post_exec(),
+            Self::Counter1ExactLocal(adapter, _) => adapter.handle_post_exec(),
+            Self::Counter1ExactRemote(adapter) => adapter.handle_post_exec(),
+            Self::Counter2Local(adapter) => adapter.handle_post_exec(),
+            Self::Counter2Remote(adapter) => adapter.handle_post_exec(),
+            Self::Counter2ExactLocal(adapter) => adapter.handle_post_exec(),
+            Self::Counter2ExactRemote(adapter) => adapter.handle_post_exec(),
+            Self::Noop(adapter) => adapter.handle_post_exec(),
+        }
+    }
+
+    pub(crate) fn handle_process_exit(&self, exit_status: reverie::ExitStatus) {
+        match self {
+            Self::Counter2ExactLocal(adapter) => adapter.handle_process_exit(exit_status),
+            Self::Counter2ExactRemote(adapter) => adapter.handle_process_exit(exit_status),
+            _ => {}
+        }
+    }
+}
+
+fn local_adapter<T>(config: <T::GlobalState as GlobalTool>::Config) -> ReverieAdapter<T>
+where
+    T: ReverieTool,
+{
+    let tool = T::new(Pid::from_raw(unsafe { libc::getpid() }), &config);
+    ReverieAdapter::new(tool, T::GlobalState::default(), config)
+}
+
+fn coordinator_fallback(tool: &str, path: &std::path::Path, error: &impl std::fmt::Display) {
+    nostd_print::eprintln!(
+        "reverie-sabre: {tool} coordinator {} unavailable ({error}); using process-local state",
+        path.display()
+    );
 }
 
 #[cfg(test)]

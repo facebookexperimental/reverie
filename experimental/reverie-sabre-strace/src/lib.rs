@@ -10,6 +10,8 @@
 
 mod tools;
 
+use std::fs;
+use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -44,6 +46,17 @@ pub enum CounterTool {
     // TODO-HUMAN-REVIEW(PR-190): Review backend-neutral counter coordinator selection.
     Counter1Exact,
     Counter2,
+    Counter2Exact,
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-194): Review the SaBRe production chaos option surface.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ChaosOptions {
+    pub skip: Option<u64>,
+    pub no_read: bool,
+    pub no_recv: bool,
+    pub no_interrupt: bool,
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -94,7 +107,70 @@ pub async fn run_counter(
             );
             Ok(status)
         }
+        CounterTool::Counter2Exact => {
+            let global = Arc::new(tools::ExactCounter2Global::default());
+            let status = run_coordinated(command, sabre, plugin, global.clone(), ()).await?;
+            let (syscalls, processes, threads) = global.totals();
+            eprintln!(
+                "counter2-global syscalls={syscalls} processes={processes} threads={threads}"
+            );
+            Ok(status)
+        }
     }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-194): Review exact chaos hosting through the SaBRe coordinator.
+pub async fn run_chaos(
+    command: Command,
+    sabre: Option<PathBuf>,
+    plugin: Option<PathBuf>,
+    options: ChaosOptions,
+) -> anyhow::Result<ExitStatus> {
+    let global = Arc::new(tools::ExactChaosGlobal::default());
+    run_coordinated(
+        command,
+        sabre,
+        plugin,
+        global,
+        tools::exact_chaos_config(
+            options.skip,
+            options.no_read,
+            options.no_recv,
+            options.no_interrupt,
+        ),
+    )
+    .await
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-194): Review exact Chrome Trace hosting and artifact publication.
+pub async fn run_chrome_trace(
+    command: Command,
+    sabre: Option<PathBuf>,
+    plugin: Option<PathBuf>,
+    out: Option<PathBuf>,
+) -> anyhow::Result<ExitStatus> {
+    let global = Arc::new(tools::ExactChromeTraceGlobal::default());
+    let status = run_coordinated(command, sabre, plugin, global.clone(), ()).await?;
+    if let Some(path) = out {
+        let mut output = io::BufWriter::new(fs::File::create(path)?);
+        global.chrome_trace(&mut output)?;
+    }
+    Ok(status)
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-194): Review exact chunky-print hosting and final flush.
+pub async fn run_chunky_print(
+    command: Command,
+    sabre: Option<PathBuf>,
+    plugin: Option<PathBuf>,
+) -> anyhow::Result<ExitStatus> {
+    let global = Arc::new(tools::ExactChunkyPrintGlobal::default());
+    let status = run_coordinated(command, sabre, plugin, global.clone(), ()).await?;
+    global.flush()?;
+    Ok(status)
 }
 
 async fn run_coordinated<G>(
@@ -231,6 +307,10 @@ struct Plugin {
 impl sabre::Tool for Plugin {
     type Client = ();
 
+    fn new_without_legacy_rpc() -> Option<Self> {
+        Some(Self::new(()))
+    }
+
     fn new(_client: Self::Client) -> Self {
         let kind = tools::ToolKind::from_environment();
         // SAFETY: Plugin construction runs before SaBRe starts guest callbacks.
@@ -264,6 +344,15 @@ impl sabre::Tool for Plugin {
 
     fn on_thread_exit(&self, thread_id: u32) {
         self.adapter.handle_thread_exit(thread_id);
+    }
+
+    fn on_post_load(&self) {
+        self.adapter.handle_post_exec();
+    }
+
+    fn on_process_exit(&self, exit_code: i32) {
+        self.adapter
+            .handle_process_exit(ExitStatus::Exited(exit_code));
     }
 }
 

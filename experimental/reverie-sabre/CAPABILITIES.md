@@ -14,12 +14,12 @@ shared example tools, but it is not a drop-in replacement for
 | Shared-tool guest context | The `ReverieAdapter` exposes the live SaBRe syscall frame through `Guest::regs`, supports writes to saved GPRs and the return IP through `Guest::set_regs`, and returns the current guest IP from `Guest::backtrace`. The fixed trampoline stack pointer, syscall number/result registers, flags, and segment state are read-only. |
 | Shared-tool event selection | Both local and remote `ReverieAdapter` paths bypass `Tool::handle_syscall_event` for syscalls excluded by `Tool::subscriptions`. The SaBRe loader still rewrites and enters the plugin for those syscalls. |
 | Threads | Creates backend records lazily when an intercepted thread is first observed. Start and exit callbacks are emitted at most once for a tracked thread. Repeated pthread create/return/join waves are covered by the conformance gate. |
-| Process exit | `exit_group` requests orderly exit from tracked threads, then issues a real kernel `exit_group` so threads that never reached an interception boundary cannot survive. Configurable timeout handling is supported. |
+| Process exit | `exit_group` requests orderly exit from tracked threads, delivers one process-exit callback, then issues a real kernel `exit_group` so threads that never reached an interception boundary cannot survive. Configurable timeout handling is supported. |
 | Signals | Central handlers mediate standard catchable signals. Guest `rt_sigaction` registration and query are virtualized, including `SA_RESTART`. Linux default ignore, continue, stop, and terminate dispositions are preserved. |
 | Signal exclusion | The kernel handler only enqueues fixed-size events. Tool and guest callbacks drain from normal runtime context; bounded-queue overflow coalesces standard signals. |
-| Fork and exec | Forked children lazily construct the same selected Tool with new process-local adapter state and RPC transport. Shared example counters reconnect to their host-owned `GlobalTool`. `execve` re-enters the pinned SaBRe loader so the plugin remains active across the new image. `execveat` remains unsupported. |
+| Fork and exec | Forked children lazily construct the same selected Tool with new process-local adapter state and RPC transport. Shared production tools reconnect to their host-owned `GlobalTool`. `execve` re-enters the pinned SaBRe loader so the plugin remains active across the new image, and loader post-load notifications drive `Tool::handle_post_exec` at the first rewritten syscall. `execveat` remains unsupported. |
 | Timing and detours | Supports RDTSC callbacks, selected VDSO callbacks, and macro-generated function detours. |
-| Global state | Legacy plugins use a synchronous generated RPC client to a host-side service. Shared example counters, including the backend-neutral `counter1` tool, use `reverie-rpc-transport` to keep one `GlobalTool` in the host; each guest thread opens a process-local connection and reconnects after fork or exec. |
+| Global state | Legacy plugins use a synchronous generated RPC client to a host-side service. The shared production chaos, Chrome Trace, chunky-print, counter1, and counter2 tools use `reverie-rpc-transport` to keep one `GlobalTool` in the host; each guest thread opens a process-local connection and reconnects after fork or exec. |
 | Loader inputs | Validated with dynamically linked x86-64 guests and the loader revision in `SABRE_UPSTREAM.toml`. |
 
 SIGCHLD keeps children waitable when its guest disposition is `SIG_DFL`.
@@ -114,6 +114,9 @@ does not load Detcore, so the matrix makes no Hermit L1/L2 determinism claim.
   clone/vfork/exec stress coverage remain unsupported or unverified.
 - `execve` validates the pathname and argv pointer list before replacing the
   image, but loader-time failures after SaBRe starts cannot return to the old image.
+- SaBRe begins interception after its loader and plugin are established, so
+  syscall totals intentionally exclude earlier launcher and loader syscalls and
+  are not numerically identical to ptrace totals for the same command.
 - RPC is blocking, reserves guest file descriptor 100, and injected-process
   formatting may allocate.
 

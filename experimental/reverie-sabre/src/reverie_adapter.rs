@@ -207,6 +207,72 @@ where
         }
     }
 
+    /// Delivers the shared tool's post-exec callback after the loader has
+    /// installed the rewritten guest image.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-194): Review local post-exec lifecycle delivery.
+    pub fn handle_post_exec(&self) {
+        let tid = current_tid();
+        let state = self.thread_state(tid);
+        let mut state = state.lock();
+        let LocalThreadState {
+            thread_state,
+            exit_handled,
+        } = &mut *state;
+        let rpc: SabreRpc<'_, T> = SabreRpc {
+            tid,
+            global_state: &self.global_state,
+            config: &self.config,
+        };
+        let mut guest = SabreGuest::new(
+            tid,
+            current_pid(),
+            thread_state,
+            &rpc,
+            Some((&self.tool, exit_handled)),
+            None,
+            None,
+        );
+        match poll_once(self.tool.handle_post_exec(&mut guest)) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => {
+                crate::eprintln!("reverie-sabre: Tool::handle_post_exec failed: {error}");
+            }
+            Poll::Pending => {
+                crate::eprintln!("reverie-sabre: Tool::handle_post_exec suspended and was dropped");
+            }
+        }
+    }
+
+    /// Delivers the consuming process-exit callback using a snapshot of the
+    /// process-local tool state.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-194): Review local process-exit lifecycle delivery.
+    pub fn handle_process_exit(&self, exit_status: ExitStatus)
+    where
+        T: Clone,
+    {
+        let tid = current_tid();
+        let rpc: SabreRpc<'_, T> = SabreRpc {
+            tid,
+            global_state: &self.global_state,
+            config: &self.config,
+        };
+        match poll_once(
+            self.tool
+                .clone()
+                .on_exit_process(current_pid(), &rpc, exit_status),
+        ) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => {
+                crate::eprintln!("reverie-sabre: Tool::on_exit_process failed: {error}");
+            }
+            Poll::Pending => {
+                crate::eprintln!("reverie-sabre: Tool::on_exit_process suspended and was dropped");
+            }
+        }
+    }
+
     /// Delivers the shared tool's thread-exit callback and releases its state.
     pub fn handle_thread_exit(&self, thread_id: u32) {
         let tid = Pid::from_raw(thread_id as i32);
@@ -463,6 +529,75 @@ where
             Poll::Pending => {
                 crate::eprintln!(
                     "reverie-sabre: remote Tool::handle_thread_start suspended and was dropped"
+                );
+            }
+        }
+    }
+
+    /// Delivers the shared tool's post-exec callback through the coordinator.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-194): Review remote post-exec lifecycle delivery.
+    pub fn handle_post_exec(&self) {
+        let tid = current_tid();
+        let state = match self.thread_state(tid) {
+            Ok(state) => state,
+            Err(error) => {
+                remote_rpc_error(error);
+                return;
+            }
+        };
+        let mut state = state.lock();
+        let RemoteThreadState {
+            thread_state,
+            rpc,
+            exit_handled,
+        } = &mut *state;
+        let mut guest = SabreGuest::new(
+            tid,
+            current_pid(),
+            thread_state,
+            rpc,
+            Some((&self.tool, exit_handled)),
+            None,
+            None,
+        );
+        match poll_once(self.tool.handle_post_exec(&mut guest)) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => {
+                crate::eprintln!("reverie-sabre: remote Tool::handle_post_exec failed: {error}");
+            }
+            Poll::Pending => {
+                crate::eprintln!(
+                    "reverie-sabre: remote Tool::handle_post_exec suspended and was dropped"
+                );
+            }
+        }
+    }
+
+    /// Delivers the consuming process-exit callback over a final coordinator
+    /// connection after thread-local RPC connections have begun shutting down.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-194): Review remote process-exit lifecycle delivery.
+    pub fn handle_process_exit(&self, exit_status: ExitStatus)
+    where
+        T: Clone,
+    {
+        let pid = current_pid();
+        let rpc = match BlockingRpcClient::<T::GlobalState>::connect(&self.socket_path, pid) {
+            Ok(rpc) => rpc,
+            Err(error) => {
+                remote_rpc_error(error);
+                return;
+            }
+        };
+        match poll_once(self.tool.clone().on_exit_process(pid, &rpc, exit_status)) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => {
+                crate::eprintln!("reverie-sabre: remote Tool::on_exit_process failed: {error}");
+            }
+            Poll::Pending => {
+                crate::eprintln!(
+                    "reverie-sabre: remote Tool::on_exit_process suspended and was dropped"
                 );
             }
         }
@@ -1107,6 +1242,8 @@ mod tests {
     use super::*;
 
     static HANDLED: AtomicUsize = AtomicUsize::new(0);
+    static POST_EXECS: AtomicUsize = AtomicUsize::new(0);
+    static PROCESS_EXITS: AtomicUsize = AtomicUsize::new(0);
     static RPC_SOCKET_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
@@ -1153,6 +1290,11 @@ mod tests {
             HANDLED.fetch_add(1, Ordering::Relaxed);
             Ok(123)
         }
+
+        async fn handle_post_exec<G: Guest<Self>>(&self, _guest: &mut G) -> Result<(), Errno> {
+            POST_EXECS.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
     }
 
     #[test]
@@ -1162,6 +1304,41 @@ mod tests {
         let syscall = Syscall::from_raw(Sysno::getpid, SyscallArgs::new(0, 0, 0, 0, 0, 0));
         assert_eq!(adapter.handle_syscall(syscall), Ok(123));
         assert_eq!(HANDLED.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn local_adapter_delivers_post_exec() {
+        POST_EXECS.store(0, Ordering::Relaxed);
+        let adapter = ReverieAdapter::new(FixedTool, (), ());
+        adapter.handle_post_exec();
+        assert_eq!(POST_EXECS.load(Ordering::Relaxed), 1);
+    }
+
+    #[derive(Clone, Default)]
+    struct ProcessExitTool;
+
+    #[reverie::tool]
+    impl ReverieTool for ProcessExitTool {
+        type GlobalState = ();
+        type ThreadState = ();
+
+        async fn on_exit_process<G: GlobalRPC<Self::GlobalState>>(
+            self,
+            _pid: Pid,
+            _global_state: &G,
+            _exit_status: ExitStatus,
+        ) -> Result<(), Error> {
+            PROCESS_EXITS.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn local_adapter_delivers_process_exit() {
+        PROCESS_EXITS.store(0, Ordering::Relaxed);
+        let adapter = ReverieAdapter::new(ProcessExitTool, (), ());
+        adapter.handle_process_exit(ExitStatus::Exited(7));
+        assert_eq!(PROCESS_EXITS.load(Ordering::Relaxed), 1);
     }
 
     #[derive(Default)]

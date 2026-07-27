@@ -16,16 +16,19 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.75"
-clap = { version = "3.2.25", features = ["derive", "env"] }
+clap = { version = "4.6.2", features = ["derive", "env"] }
 libc = "0.2.139"
 nostd-print = { version = "0.1.0", path = "../nostd-print" }
 reverie = { version = "0.1.0", path = "../../reverie" }
 reverie-host = { version = "0.1.0", path = "../reverie-host" }
+reverie-ptrace = { version = "0.1.0", path = "../../reverie-ptrace" }
 reverie-process = { version = "0.1.0", path = "../../reverie-process" }
 reverie-rpc-transport = { version = "0.1.0", path = "../../reverie-rpc-transport" }
 reverie-sabre = { version = "0.1.0", path = "../reverie-sabre" }
 reverie-syscalls = { version = "0.1.0", path = "../../reverie-syscalls" }
+reverie-util = { version = "0.1.0", path = "../../reverie-util" }
 serde = { version = "1.0.188", features = ["derive"] }
+serde_json = "1.0.140"
 syscalls = { version = "0.6.7", features = ["serde"] }
 tempfile = "3.27.0"
 tokio = { version = "1.37.0", features = ["rt", "macros"] }
