@@ -21,7 +21,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
-use counter1_exact::CounterGlobal as ExactCounter1Global;
+pub(super) use counter1_exact::CounterGlobal as ExactCounter1Global;
 use counter1_exact::CounterLocal as ExactCounter1Tool;
 use counter2_exact::CounterGlobal as ExactCounter2Global;
 use counter2_exact::CounterLocal as ExactCounter2Tool;
@@ -313,7 +313,8 @@ pub(crate) enum SharedAdapter {
     Strace(ReverieAdapter<StraceTool>),
     Counter1Local(ReverieAdapter<Counter1Tool>),
     Counter1Remote(RemoteReverieAdapter<Counter1Tool>),
-    Counter1Exact(ReverieAdapter<ExactCounter1Tool>, ExactCounter1Global),
+    Counter1ExactLocal(ReverieAdapter<ExactCounter1Tool>, ExactCounter1Global),
+    Counter1ExactRemote(RemoteReverieAdapter<ExactCounter1Tool>),
     Counter2Local(ReverieAdapter<Counter2Tool>),
     Counter2Remote(RemoteReverieAdapter<Counter2Tool>),
     Counter2Exact(ReverieAdapter<ExactCounter2Tool>),
@@ -337,13 +338,19 @@ impl SharedAdapter {
                     }
                 },
             ),
-            ToolKind::Counter1Exact => {
-                let global = ExactCounter1Global::default();
-                Self::Counter1Exact(
-                    ReverieAdapter::new(ExactCounter1Tool::default(), global.clone(), ()),
-                    global,
-                )
-            }
+            ToolKind::Counter1Exact => coordinator_socket().map_or_else(
+                Self::counter1_exact_local,
+                |path| match RemoteReverieAdapter::connect(&path) {
+                    Ok(adapter) => Self::Counter1ExactRemote(adapter),
+                    Err(error) => {
+                        nostd_print::eprintln!(
+                            "reverie-sabre: counter1-exact coordinator {} unavailable ({error}); using process-local state",
+                            path.display()
+                        );
+                        Self::counter1_exact_local()
+                    }
+                },
+            ),
             ToolKind::Counter2 => coordinator_socket().map_or_else(
                 Self::counter2_local,
                 |path| match RemoteReverieAdapter::connect(&path) {
@@ -377,6 +384,14 @@ impl SharedAdapter {
         ))
     }
 
+    fn counter1_exact_local() -> Self {
+        let global = ExactCounter1Global::default();
+        Self::Counter1ExactLocal(
+            ReverieAdapter::new(ExactCounter1Tool::default(), global.clone(), ()),
+            global,
+        )
+    }
+
     fn counter2_local() -> Self {
         Self::Counter2Local(ReverieAdapter::new(
             Counter2Tool,
@@ -390,7 +405,8 @@ impl SharedAdapter {
             Self::Strace(adapter) => adapter.handle_syscall(syscall),
             Self::Counter1Local(adapter) => adapter.handle_syscall(syscall),
             Self::Counter1Remote(adapter) => adapter.handle_syscall(syscall),
-            Self::Counter1Exact(adapter, _) => adapter.handle_syscall(syscall),
+            Self::Counter1ExactLocal(adapter, _) => adapter.handle_syscall(syscall),
+            Self::Counter1ExactRemote(adapter) => adapter.handle_syscall(syscall),
             Self::Counter2Local(adapter) => adapter.handle_syscall(syscall),
             Self::Counter2Remote(adapter) => adapter.handle_syscall(syscall),
             Self::Counter2Exact(adapter) => adapter.handle_syscall(syscall),
@@ -410,7 +426,12 @@ impl SharedAdapter {
             Self::Strace(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
             Self::Counter1Local(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
             Self::Counter1Remote(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
-            Self::Counter1Exact(adapter, _) => adapter.handle_syscall_with_inject(syscall, inject),
+            Self::Counter1ExactLocal(adapter, _) => {
+                adapter.handle_syscall_with_inject(syscall, inject)
+            }
+            Self::Counter1ExactRemote(adapter) => {
+                adapter.handle_syscall_with_inject(syscall, inject)
+            }
             Self::Counter2Local(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
             Self::Counter2Remote(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
             Self::Counter2Exact(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
@@ -423,7 +444,8 @@ impl SharedAdapter {
             Self::Strace(adapter) => adapter.handle_thread_start(thread_id),
             Self::Counter1Local(adapter) => adapter.handle_thread_start(thread_id),
             Self::Counter1Remote(adapter) => adapter.handle_thread_start(thread_id),
-            Self::Counter1Exact(adapter, _) => adapter.handle_thread_start(thread_id),
+            Self::Counter1ExactLocal(adapter, _) => adapter.handle_thread_start(thread_id),
+            Self::Counter1ExactRemote(adapter) => adapter.handle_thread_start(thread_id),
             Self::Counter2Local(adapter) => adapter.handle_thread_start(thread_id),
             Self::Counter2Remote(adapter) => adapter.handle_thread_start(thread_id),
             Self::Counter2Exact(adapter) => adapter.handle_thread_start(thread_id),
@@ -436,10 +458,11 @@ impl SharedAdapter {
             Self::Strace(adapter) => adapter.handle_thread_exit(thread_id),
             Self::Counter1Local(adapter) => adapter.handle_thread_exit(thread_id),
             Self::Counter1Remote(adapter) => adapter.handle_thread_exit(thread_id),
-            Self::Counter1Exact(adapter, global) => {
+            Self::Counter1ExactLocal(adapter, global) => {
                 adapter.handle_thread_exit(thread_id);
                 nostd_print::eprintln!("counter1-global syscalls={}", global.total());
             }
+            Self::Counter1ExactRemote(adapter) => adapter.handle_thread_exit(thread_id),
             Self::Counter2Local(adapter) => adapter.handle_thread_exit(thread_id),
             Self::Counter2Remote(adapter) => adapter.handle_thread_exit(thread_id),
             Self::Counter2Exact(adapter) => adapter.handle_thread_exit(thread_id),

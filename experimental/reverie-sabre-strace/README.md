@@ -36,8 +36,12 @@ Supported values are:
   argv are decoded, while envp is redacted because it commonly contains
   credentials.
 - `counter1`: print one process-tree total of intercepted syscalls.
+- `counter1-exact`: run the backend-neutral `counter1` example unchanged and
+  print its process-tree total through the host coordinator.
 - `counter2`: print one process-tree total with observed process and thread
   identities.
+- `counter2-exact`: run the backend-neutral `counter2` example with
+  process-local state. SaBRe does not yet drive its process-exit callback.
 - `noop`: forward syscalls through the default shared Tool handler.
 
 Hermit uses the same artifacts through `HERMIT_SABRE_RUNNER`,
@@ -67,7 +71,8 @@ supported pending future.
 The counter host owns one external `GlobalTool` and emits its process-tree
 summary after the root guest exits. Fork and exec children reconnect their
 process-local adapters to that coordinator, so counter state is shared without
-copying process-local plugin state.
+copying process-local plugin state. This path supports both the SaBRe-specific
+counters and the backend-neutral `counter1-exact` tool.
 
 `noop` requests `Subscription::none()`, but the legacy SaBRe loader does not
 yet consult subscriptions, so rewritten syscall sites still enter the default

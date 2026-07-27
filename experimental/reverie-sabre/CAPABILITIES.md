@@ -19,7 +19,7 @@ shared example tools, but it is not a drop-in replacement for
 | Signal exclusion | The kernel handler only enqueues fixed-size events. Tool and guest callbacks drain from normal runtime context; bounded-queue overflow coalesces standard signals. |
 | Fork and exec | Forked children lazily construct the same selected Tool with new process-local adapter state and RPC transport. Shared example counters reconnect to their host-owned `GlobalTool`. `execve` re-enters the pinned SaBRe loader so the plugin remains active across the new image. `execveat` remains unsupported. |
 | Timing and detours | Supports RDTSC callbacks, selected VDSO callbacks, and macro-generated function detours. |
-| Global state | Legacy plugins use a synchronous generated RPC client to a host-side service. Shared example counters use `reverie-rpc-transport` to keep one `GlobalTool` in the host; each guest thread opens a process-local connection and reconnects after fork or exec. |
+| Global state | Legacy plugins use a synchronous generated RPC client to a host-side service. Shared example counters, including the backend-neutral `counter1` tool, use `reverie-rpc-transport` to keep one `GlobalTool` in the host; each guest thread opens a process-local connection and reconnects after fork or exec. |
 | Loader inputs | Validated with dynamically linked x86-64 guests and the loader revision in `SABRE_UPSTREAM.toml`. |
 
 SIGCHLD keeps children waitable when its guest disposition is `SIG_DFL`.

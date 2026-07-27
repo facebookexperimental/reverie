@@ -40,6 +40,9 @@ const COUNTER_RPC_SOCKET_ENV: &str = "REVERIE_SABRE_EXAMPLE_RPC_SOCKET";
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CounterTool {
     Counter1,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-190): Review backend-neutral counter coordinator selection.
+    Counter1Exact,
     Counter2,
 }
 
@@ -66,6 +69,12 @@ pub async fn run_counter(
                 " [counter tool] Total system calls in process tree: {}",
                 global.total()
             );
+            Ok(status)
+        }
+        CounterTool::Counter1Exact => {
+            let global = Arc::new(tools::ExactCounter1Global::default());
+            let status = run_coordinated(command, sabre, plugin, global.clone(), ()).await?;
+            eprintln!("counter1-global syscalls={}", global.total());
             Ok(status)
         }
         CounterTool::Counter2 => {
