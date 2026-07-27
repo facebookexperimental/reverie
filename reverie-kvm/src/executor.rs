@@ -201,6 +201,12 @@ pub(crate) enum ProcessAction {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ProcessExit {
+    pub code: i32,
+    pub group: bool,
+}
+
 pub(crate) fn is_process_syscall(number: u64) -> bool {
     number == libc::SYS_fork as u64
         || number == libc::SYS_vfork as u64
@@ -1189,9 +1195,12 @@ impl ElfExecutor {
         self.pending_segment.take()
     }
 
-    /// Returns and clears the exit code once the guest calls `exit`/`exit_group`.
-    pub(crate) fn take_exit(&mut self) -> Option<i32> {
-        self.exit_code.take()
+    /// Returns and clears a pending thread-local or group-wide exit.
+    pub(crate) fn take_exit(&mut self) -> Option<ProcessExit> {
+        self.exit_code.take().map(|code| {
+            let group = std::mem::take(&mut self.exit_group);
+            ProcessExit { code, group }
+        })
     }
 
     pub(crate) fn take_output(&mut self) -> (Vec<u8>, Vec<u8>) {

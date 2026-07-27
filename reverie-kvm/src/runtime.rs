@@ -555,6 +555,7 @@ impl KvmBackend {
     where
         T: Tool,
     {
+        let _registration = self.register_guest_thread()?;
         let mut loaded = self.static_elf.take().ok_or(Error::StaticElfNotInstalled)?;
         if capture_output {
             loaded.stdin = Some(std::fs::File::open("/dev/null")?);
@@ -638,7 +639,10 @@ impl KvmBackend {
         if let Some((segment, address)) = executor.take_segment() {
             set_user_segment_base(&self.vcpu, segment, address)?;
         }
-        if let Some(code) = executor.take_exit() {
+        if let Some(exit) = executor.take_exit() {
+            if exit.group {
+                self.request_guest_thread_group_exit(exit.code);
+            }
             self.cancel_guest_threads();
             notify_tool_exit(
                 tool,
@@ -646,15 +650,34 @@ impl KvmBackend {
                 &global_state,
                 &config,
                 thread_state,
-                ExitStatus::Exited(code),
+                ExitStatus::Exited(exit.code),
             )
             .await?;
             let (stdout, stderr) = executor.take_output();
-            return Ok((global_state, code, stdout, stderr));
+            return Ok((global_state, exit.code, stdout, stderr));
         }
 
         loop {
-            let (pending_segment, mut pending_exit, pending_process) = match self.vcpu.run()? {
+            if let Some(code) = self.guest_thread_group_exit_code() {
+                self.cancel_guest_threads();
+                notify_tool_exit(
+                    tool,
+                    pid,
+                    &global_state,
+                    &config,
+                    thread_state,
+                    ExitStatus::Exited(code),
+                )
+                .await?;
+                let (stdout, stderr) = executor.take_output();
+                return Ok((global_state, code, stdout, stderr));
+            }
+            let vcpu_exit = match self.vcpu.run() {
+                Ok(exit) => exit,
+                Err(error) if error.errno() == libc::EINTR => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let (pending_segment, mut pending_exit, pending_process) = match vcpu_exit {
                 VcpuExit::Hypercall(exit) => {
                     if exit.nr != VMCALL_SYSCALL_TRANSPORT {
                         return Err(Error::UnexpectedHypercall(exit.nr));
@@ -733,7 +756,10 @@ impl KvmBackend {
                 auxv = executor.auxv().to_vec();
                 pending_exit = pending_exit.or_else(|| executor.take_exit());
             }
-            if let Some(code) = pending_exit {
+            if let Some(exit) = pending_exit {
+                if exit.group {
+                    self.request_guest_thread_group_exit(exit.code);
+                }
                 self.cancel_guest_threads();
                 notify_tool_exit(
                     tool,
@@ -741,11 +767,11 @@ impl KvmBackend {
                     &global_state,
                     &config,
                     thread_state,
-                    ExitStatus::Exited(code),
+                    ExitStatus::Exited(exit.code),
                 )
                 .await?;
                 let (stdout, stderr) = executor.take_output();
-                return Ok((global_state, code, stdout, stderr));
+                return Ok((global_state, exit.code, stdout, stderr));
             }
         }
     }

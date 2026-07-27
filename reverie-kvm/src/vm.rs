@@ -97,14 +97,18 @@ fn install_worker_interrupt_handler() -> Result<()> {
     }
 }
 
-fn unblock_worker_interrupt_signal() {
-    // SAFETY: set is initialized before pthread_sigmask reads it. This changes
-    // only the newly-created KVM worker's mask.
+fn set_guest_interrupt_signal_mask(how: libc::c_int) -> Result<bool> {
+    // SAFETY: set and previous are initialized before libc reads or writes them.
     unsafe {
         let mut set = std::mem::zeroed::<libc::sigset_t>();
+        let mut previous = std::mem::zeroed::<libc::sigset_t>();
         libc::sigemptyset(&mut set);
         libc::sigaddset(&mut set, worker_interrupt_signal());
-        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+        let error = libc::pthread_sigmask(how, &set, &mut previous);
+        if error != 0 {
+            return Err(std::io::Error::from_raw_os_error(error).into());
+        }
+        Ok(libc::sigismember(&previous, worker_interrupt_signal()) == 1)
     }
 }
 
@@ -112,11 +116,41 @@ fn unblock_worker_interrupt_signal() {
 // TODO-HUMAN-REVIEW(PR-172): Review process-wide KVM worker cancellation state.
 struct GuestThreadGroup {
     cancelled: AtomicBool,
+    // AUTONOMOUS-BOT-IMPLEMENTED: Propagate worker exit_group to the root vCPU.
+    // TODO-HUMAN-REVIEW(PR-177): Review KVM thread-group exit ordering.
+    exit_code: Mutex<Option<i32>>,
+    root: Mutex<Option<libc::pthread_t>>,
     workers: Mutex<Vec<libc::pthread_t>>,
     transport_slots: Mutex<Vec<bool>>,
 }
 
 impl GuestThreadGroup {
+    fn exit_code(&self) -> Option<i32> {
+        *self.exit_code.lock().expect("KVM exit-group lock poisoned")
+    }
+
+    fn request_exit_group(&self, code: i32) {
+        self.exit_code
+            .lock()
+            .expect("KVM exit-group lock poisoned")
+            .get_or_insert(code);
+        self.cancelled.store(true, Ordering::Release);
+
+        if let Some(root) = *self.root.lock().expect("KVM guest root lock poisoned") {
+            // SAFETY: root is registered for the lifetime of its run loop.
+            unsafe {
+                libc::pthread_kill(root, worker_interrupt_signal());
+            }
+        }
+        let workers = self.workers.lock().expect("KVM guest worker lock poisoned");
+        for &worker in workers.iter() {
+            // SAFETY: the registry lock keeps each pthread ID live for this call.
+            unsafe {
+                libc::pthread_kill(worker, worker_interrupt_signal());
+            }
+        }
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED: Reuse syscall transports after guest threads exit.
     // TODO-HUMAN-REVIEW(PR-176): Review KVM transport slot lifecycle.
     fn reserve_transport_slot(&self, child_tid: i32) -> Result<usize> {
@@ -142,6 +176,37 @@ impl GuestThreadGroup {
             .expect("KVM transport-slot lock poisoned");
         if let Some(in_use) = slots.get_mut(slot) {
             *in_use = false;
+        }
+    }
+}
+
+pub(crate) struct GuestThreadRegistration {
+    group: Arc<GuestThreadGroup>,
+    pthread: libc::pthread_t,
+    root: bool,
+    restore_blocked_signal: bool,
+}
+
+impl Drop for GuestThreadRegistration {
+    fn drop(&mut self) {
+        if self.root {
+            let mut root = self
+                .group
+                .root
+                .lock()
+                .expect("KVM guest root lock poisoned");
+            if *root == Some(self.pthread) {
+                *root = None;
+            }
+        } else {
+            self.group
+                .workers
+                .lock()
+                .expect("KVM guest worker lock poisoned")
+                .retain(|worker| *worker != self.pthread);
+        }
+        if self.restore_blocked_signal {
+            let _ = set_guest_interrupt_signal_mask(libc::SIG_BLOCK);
         }
     }
 }
@@ -588,21 +653,7 @@ impl KvmBackend {
                 let handle = std::thread::Builder::new()
                     .name(format!("reverie-kvm-guest-{child_tid}"))
                     .spawn(move || {
-                        unblock_worker_interrupt_signal();
-                        let pthread = unsafe { libc::pthread_self() };
-                        child
-                            .thread_group
-                            .workers
-                            .lock()
-                            .expect("KVM guest worker lock poisoned")
-                            .push(pthread);
                         let result = child.run_static_elf_process(&mut child_executor);
-                        child
-                            .thread_group
-                            .workers
-                            .lock()
-                            .expect("KVM guest worker lock poisoned")
-                            .retain(|worker| *worker != pthread);
                         clear_tid_and_wake(
                             &mut child.memory,
                             child_executor.take_clear_child_tid(),
@@ -680,11 +731,21 @@ impl KvmBackend {
         &mut self,
         executor: &mut ElfExecutor,
     ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
+        let _registration = self.register_guest_thread()?;
         loop {
+            if let Some(code) = self.guest_thread_group_exit_code() {
+                let (stdout, stderr) = executor.take_output();
+                return Ok((code, stdout, stderr));
+            }
             if self.is_guest_thread && self.thread_group.cancelled.load(Ordering::Acquire) {
                 return Ok((0, Vec::new(), Vec::new()));
             }
-            let (segment_update, process_action) = match self.vcpu.run()? {
+            let vcpu_exit = match self.vcpu.run() {
+                Ok(exit) => exit,
+                Err(error) if error.errno() == libc::EINTR => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let (segment_update, process_action) = match vcpu_exit {
                 VcpuExit::Hypercall(exit) => {
                     if exit.nr != VMCALL_SYSCALL_TRANSPORT {
                         return Err(Error::UnexpectedHypercall(exit.nr));
@@ -717,14 +778,52 @@ impl KvmBackend {
                 self.run_process_action(executor, action)?;
             }
 
-            if let Some(code) = executor.take_exit() {
+            if let Some(exit) = executor.take_exit() {
+                if exit.group {
+                    self.request_guest_thread_group_exit(exit.code);
+                }
                 if !self.is_guest_thread {
                     self.cancel_guest_threads();
                 }
                 let (stdout, stderr) = executor.take_output();
-                return Ok((code, stdout, stderr));
+                return Ok((exit.code, stdout, stderr));
             }
         }
+    }
+
+    pub(crate) fn register_guest_thread(&self) -> Result<GuestThreadRegistration> {
+        let restore_blocked_signal = set_guest_interrupt_signal_mask(libc::SIG_UNBLOCK)?;
+        // SAFETY: pthread_self returns the live calling thread's identifier.
+        let pthread = unsafe { libc::pthread_self() };
+        if self.is_guest_thread {
+            self.thread_group
+                .workers
+                .lock()
+                .expect("KVM guest worker lock poisoned")
+                .push(pthread);
+        } else {
+            let previous = self
+                .thread_group
+                .root
+                .lock()
+                .expect("KVM guest root lock poisoned")
+                .replace(pthread);
+            assert!(previous.is_none(), "KVM guest root already registered");
+        }
+        Ok(GuestThreadRegistration {
+            group: self.thread_group.clone(),
+            pthread,
+            root: !self.is_guest_thread,
+            restore_blocked_signal,
+        })
+    }
+
+    pub(crate) fn guest_thread_group_exit_code(&self) -> Option<i32> {
+        self.thread_group.exit_code()
+    }
+
+    pub(crate) fn request_guest_thread_group_exit(&self, code: i32) {
+        self.thread_group.request_exit_group(code);
     }
 
     // TODO-HUMAN-REVIEW(PR-172): Review signal-driven KVM worker cancellation.

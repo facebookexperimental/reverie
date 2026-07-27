@@ -99,6 +99,23 @@ fn run_host_program(program: &str, argv: &[&str], cwd: &std::path::Path) {
     let _ = run_host_program_captured(program, argv, cwd);
 }
 
+fn set_interrupt_signal_blocked(blocked: bool) -> bool {
+    // SAFETY: set and previous are initialized before libc reads or writes them.
+    unsafe {
+        let mut set = std::mem::zeroed::<libc::sigset_t>();
+        let mut previous = std::mem::zeroed::<libc::sigset_t>();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGURG);
+        let how = if blocked {
+            libc::SIG_BLOCK
+        } else {
+            libc::SIG_UNBLOCK
+        };
+        assert_eq!(libc::pthread_sigmask(how, &set, &mut previous), 0);
+        libc::sigismember(&previous, libc::SIGURG) == 1
+    }
+}
+
 #[derive(Default)]
 struct PostExecLog {
     at_random: Mutex<Option<usize>>,
@@ -744,6 +761,105 @@ fn static_elf_runs_glibc_clone3_thread_and_restores_parent_state() {
         assert_eq!(exit_code, 0, "with_tool={with_tool}");
         assert!(stdout.is_empty());
         assert!(stderr.is_empty());
+    }
+}
+
+#[test]
+fn worker_exit_group_terminates_the_root_with_its_status() {
+    match Kvm::new() {
+        Ok(_) => {}
+        Err(error) if kvm_is_unavailable(&error) => {
+            eprintln!("skipping KVM worker exit_group test: cannot open /dev/kvm: {error}");
+            return;
+        }
+        Err(error) => panic!("failed to probe /dev/kvm: {error}"),
+    }
+
+    fn append_exit_group(code: &mut Vec<u8>, status: u32) {
+        code.extend_from_slice(&[0xb8, 0xe7, 0x00, 0x00, 0x00]);
+        code.push(0xbf);
+        code.extend_from_slice(&status.to_le_bytes());
+        code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    }
+
+    fn patch_jump(code: &mut [u8], operand: usize, target: usize) {
+        let displacement = i32::try_from(target as isize - (operand + 4) as isize).unwrap();
+        code[operand..operand + 4].copy_from_slice(&displacement.to_le_bytes());
+    }
+
+    const CHILD_TID: u64 = LOAD_ADDRESS + 0x1800;
+    const CHILD_STACK: u64 = LOAD_ADDRESS + 0x1900;
+    const CHILD_STACK_SIZE: u64 = 0x600;
+    let flags = libc::CLONE_VM as u64
+        | libc::CLONE_FS as u64
+        | libc::CLONE_FILES as u64
+        | libc::CLONE_SIGHAND as u64
+        | libc::CLONE_THREAD as u64
+        | libc::CLONE_CHILD_SETTID as u64
+        | libc::CLONE_CHILD_CLEARTID as u64;
+
+    let mut code = Vec::new();
+    code.extend_from_slice(&[0xb8, 0xb3, 0x01, 0x00, 0x00]); // mov eax, SYS_clone3
+    let clone_args_operand = code.len() + 2;
+    code.extend_from_slice(&[0x48, 0xbf, 0, 0, 0, 0, 0, 0, 0, 0]); // movabs rdi, clone_args
+    code.extend_from_slice(&[0xbe, 0x58, 0x00, 0x00, 0x00]); // mov esi, sizeof(clone_args)
+    code.extend_from_slice(&[0x0f, 0x05, 0x85, 0xc0, 0x0f, 0x84, 0, 0, 0, 0]); // syscall; jz child
+    let child_jump = code.len() - 4;
+
+    code.extend_from_slice(&[0x41, 0x89, 0xc5]); // mov r13d, eax
+    code.extend_from_slice(&[0x48, 0xbf]); // movabs rdi, child_tid
+    code.extend_from_slice(&CHILD_TID.to_le_bytes());
+    let wait = code.len();
+    code.extend_from_slice(&[
+        0xbe, 0x00, 0x00, 0x00, 0x00, // mov esi, FUTEX_WAIT
+        0x44, 0x89, 0xea, // mov edx, r13d
+        0x45, 0x31, 0xd2, // xor r10d, r10d
+        0xb8, 0xca, 0x00, 0x00, 0x00, // mov eax, SYS_futex
+        0x0f, 0x05, // syscall
+        0x83, 0x3f, 0x00, // cmp dword ptr [rdi], 0
+        0x0f, 0x85, 0, 0, 0, 0, // jne wait
+    ]);
+    let wait_jump = code.len() - 4;
+    patch_jump(&mut code, wait_jump, wait);
+    append_exit_group(&mut code, 0);
+
+    let child = code.len();
+    patch_jump(&mut code, child_jump, child);
+    append_exit_group(&mut code, 37);
+
+    while !code.len().is_multiple_of(8) {
+        code.push(0);
+    }
+    let clone_args_address = LOAD_ADDRESS + code.len() as u64;
+    code[clone_args_operand..clone_args_operand + 8]
+        .copy_from_slice(&clone_args_address.to_le_bytes());
+    let mut clone_args = [0_u8; 88];
+    clone_args[0..8].copy_from_slice(&flags.to_le_bytes());
+    clone_args[16..24].copy_from_slice(&CHILD_TID.to_le_bytes());
+    clone_args[40..48].copy_from_slice(&CHILD_STACK.to_le_bytes());
+    clone_args[48..56].copy_from_slice(&CHILD_STACK_SIZE.to_le_bytes());
+    code.extend_from_slice(&clone_args);
+
+    for with_tool in [false, true] {
+        let was_blocked = set_interrupt_signal_blocked(true);
+        let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+        backend
+            .install_static_elf(&static_elf(&code), "/bin/worker-exit-group-test")
+            .unwrap();
+        let exit_code = if with_tool {
+            let (_, exit_code, stdout, stderr) = futures::executor::block_on(
+                backend.run_static_elf_with_tool::<StraceTool>((), true),
+            )
+            .unwrap();
+            assert!(stdout.is_empty());
+            assert!(stderr.is_empty());
+            exit_code
+        } else {
+            backend.run_static_elf().unwrap()
+        };
+        let remained_blocked = set_interrupt_signal_blocked(was_blocked);
+        assert!(remained_blocked, "with_tool={with_tool}");
+        assert_eq!(exit_code, 37, "with_tool={with_tool}");
     }
 }
 
