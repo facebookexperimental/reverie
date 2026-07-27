@@ -610,6 +610,12 @@ fn execute_basic_syscall_with_output(
         getrandom(memory, state.tid, args[0], args[1])
     } else if number == libc::SYS_clock_gettime as u64 {
         write_bytes(memory, args[1], &[0; 16])
+    } else if number == libc::SYS_nanosleep as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        nanosleep(memory, args)
+    } else if number == libc::SYS_clock_nanosleep as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        clock_nanosleep(memory, args)
     } else if number == libc::SYS_gettimeofday as u64 {
         gettimeofday(memory, args)
     } else if number == libc::SYS_readlink as u64 {
@@ -5744,6 +5750,47 @@ fn deterministic_random_bytes(tid: i32, length: usize, byte_stride: u8, first_by
         .collect()
 }
 
+// Child processes and guest workers bypass Detcore's virtual scheduler. Validate
+// their sleep requests, but do not block the supervisor on host wall time;
+// subscribed root-process sleeps continue to use Detcore's time model.
+// TODO-HUMAN-REVIEW(PR-182): Review nonblocking KVM child sleeps.
+fn nanosleep(memory: &GuestMemory, args: &[u64; 6]) -> i64 {
+    validate_sleep_request(memory, args[0])
+}
+
+fn clock_nanosleep(memory: &GuestMemory, args: &[u64; 6]) -> i64 {
+    let clock_id = args[0] as libc::clockid_t;
+    if clock_id == libc::CLOCK_THREAD_CPUTIME_ID {
+        return negative_errno(libc::EOPNOTSUPP);
+    }
+    if !matches!(
+        clock_id,
+        libc::CLOCK_REALTIME
+            | libc::CLOCK_MONOTONIC
+            | libc::CLOCK_PROCESS_CPUTIME_ID
+            | libc::CLOCK_BOOTTIME
+            | libc::CLOCK_TAI
+    ) {
+        return negative_errno(libc::EINVAL);
+    }
+    validate_sleep_request(memory, args[2])
+}
+
+fn validate_sleep_request(memory: &GuestMemory, address: u64) -> i64 {
+    if address == 0 {
+        return negative_errno(libc::EFAULT);
+    }
+    let request = match read_guest_struct::<libc::timespec>(memory, address) {
+        Ok(request) => request,
+        Err(error) => return error,
+    };
+    if request.tv_sec < 0 || !(0..1_000_000_000).contains(&request.tv_nsec) {
+        negative_errno(libc::EINVAL)
+    } else {
+        0
+    }
+}
+
 fn gettimeofday(memory: &mut GuestMemory, args: &[u64; 6]) -> i64 {
     if args[0] != 0 {
         let timeval = libc::timeval {
@@ -10493,6 +10540,146 @@ mod tests {
                 [u64::MAX, 0, 0, 0, 0, 0],
             ),
             negative_errno(libc::EFAULT)
+        );
+    }
+
+    #[test]
+    fn child_sleep_syscalls_validate_requests_without_host_waiting() {
+        const REQUEST: u64 = 0x100;
+
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        assert_eq!(
+            write_struct(
+                &mut memory,
+                REQUEST,
+                &libc::timespec {
+                    tv_sec: 60,
+                    tv_nsec: 123,
+                },
+            ),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_nanosleep,
+                [REQUEST, u64::MAX, 0, 0, 0, 0],
+            ),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_clock_nanosleep,
+                [libc::CLOCK_REALTIME as u64, 0, REQUEST, u64::MAX, 0, 0,],
+            ),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_clock_nanosleep,
+                [
+                    libc::CLOCK_MONOTONIC as u64,
+                    libc::TIMER_ABSTIME as u64,
+                    REQUEST,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_clock_nanosleep,
+                [libc::CLOCK_PROCESS_CPUTIME_ID as u64, 0, REQUEST, 0, 0, 0,],
+            ),
+            0
+        );
+
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_nanosleep,
+                [0, 0, 0, 0, 0, 0],
+            ),
+            negative_errno(libc::EFAULT)
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_clock_nanosleep,
+                [libc::CLOCK_REALTIME as u64, 0, u64::MAX, 0, 0, 0,],
+            ),
+            negative_errno(libc::EFAULT)
+        );
+        assert_eq!(
+            write_struct(
+                &mut memory,
+                REQUEST,
+                &libc::timespec {
+                    tv_sec: -1,
+                    tv_nsec: 0,
+                },
+            ),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_nanosleep,
+                [REQUEST, 0, 0, 0, 0, 0],
+            ),
+            negative_errno(libc::EINVAL)
+        );
+        assert_eq!(
+            write_struct(
+                &mut memory,
+                REQUEST,
+                &libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 1_000_000_000,
+                },
+            ),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_clock_nanosleep,
+                [libc::CLOCK_REALTIME as u64, 0, REQUEST, 0, 0, 0],
+            ),
+            negative_errno(libc::EINVAL)
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_clock_nanosleep,
+                [u64::MAX, 0, REQUEST, 0, 0, 0],
+            ),
+            negative_errno(libc::EINVAL)
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_clock_nanosleep,
+                [libc::CLOCK_THREAD_CPUTIME_ID as u64, 0, REQUEST, 0, 0, 0,],
+            ),
+            negative_errno(libc::EOPNOTSUPP)
         );
     }
 
