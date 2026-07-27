@@ -11,6 +11,7 @@ use std::env;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs::File;
+use std::future::Future;
 use std::io;
 use std::io::Read;
 use std::os::fd::AsRawFd;
@@ -27,6 +28,9 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+
+use reverie::GlobalTool;
+use reverie_rpc_transport::RpcServer;
 
 const CLIENT_ENV: &str = "REVERIE_DBI_CLIENT";
 const DYNAMORIO_ENV: &str = "DYNAMORIO_HOME";
@@ -248,6 +252,147 @@ impl DbiRunner {
         self.wait_with_output(child)
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(impl-dbi-gap-closure): Review typed DBI coordinator lifecycle.
+    /// Runs `guest` while one coordinator-owned global serves every DBI process.
+    ///
+    /// The coordinator socket is inherited across fork and exec. Each process's
+    /// [`reverie::GlobalRPC`] requests therefore reach the single returned
+    /// global instead of a process-local fallback.
+    pub async fn output_with_global<G>(
+        &self,
+        guest: &Command,
+        config: G::Config,
+    ) -> io::Result<(Output, G)>
+    where
+        G: GlobalTool + 'static,
+    {
+        match self.run_with_global::<G>(guest, None, config, true).await? {
+            CoordinatedWait::Output(output, global) => Ok((output, global)),
+            CoordinatedWait::Status(_, _) => unreachable!("output launch returned only status"),
+        }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(impl-dbi-gap-closure): Review exact-environment DBI coordinator launch.
+    /// Runs `guest` with captured output, one shared global, and an exact environment.
+    pub async fn output_with_environment_and_global<G>(
+        &self,
+        guest: &Command,
+        environment: &BTreeMap<OsString, OsString>,
+        config: G::Config,
+    ) -> io::Result<(Output, G)>
+    where
+        G: GlobalTool + 'static,
+    {
+        match self
+            .run_with_global::<G>(guest, Some(environment), config, true)
+            .await?
+        {
+            CoordinatedWait::Output(output, global) => Ok((output, global)),
+            CoordinatedWait::Status(_, _) => unreachable!("output launch returned only status"),
+        }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(impl-dbi-gap-closure): Review inherited-stdio DBI coordinator launch.
+    /// Runs `guest` with inherited streams while one coordinator owns its global state.
+    pub async fn status_with_global<G>(
+        &self,
+        guest: &Command,
+        config: G::Config,
+    ) -> io::Result<(ExitStatus, G)>
+    where
+        G: GlobalTool + 'static,
+    {
+        match self
+            .run_with_global::<G>(guest, None, config, false)
+            .await?
+        {
+            CoordinatedWait::Status(status, global) => Ok((status, global)),
+            CoordinatedWait::Output(_, _) => unreachable!("status launch captured output"),
+        }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(impl-dbi-gap-closure): Review exact-environment DBI status launch.
+    /// Runs `guest` with one shared global and an exact environment.
+    pub async fn status_with_environment_and_global<G>(
+        &self,
+        guest: &Command,
+        environment: &BTreeMap<OsString, OsString>,
+        config: G::Config,
+    ) -> io::Result<(ExitStatus, G)>
+    where
+        G: GlobalTool + 'static,
+    {
+        match self
+            .run_with_global::<G>(guest, Some(environment), config, false)
+            .await?
+        {
+            CoordinatedWait::Status(status, global) => Ok((status, global)),
+            CoordinatedWait::Output(_, _) => unreachable!("status launch captured output"),
+        }
+    }
+
+    async fn run_with_global<G>(
+        &self,
+        guest: &Command,
+        environment: Option<&BTreeMap<OsString, OsString>>,
+        config: G::Config,
+        capture_output: bool,
+    ) -> io::Result<CoordinatedWait<G>>
+    where
+        G: GlobalTool + 'static,
+    {
+        let directory = tempfile::Builder::new().prefix("reverie-dbi-").tempdir()?;
+        let socket = directory.path().join("coordinator.sock");
+        let global = Arc::new(G::init_global_state(&config).await);
+        let connected = Arc::new(AtomicBool::new(false));
+        let server = RpcServer::bind_with_connection_readiness(
+            &socket,
+            Arc::clone(&global),
+            config,
+            Arc::clone(&connected),
+        )
+        .map_err(|error| io::Error::other(error.to_string()))?;
+
+        let mut command = self.command(guest, environment);
+        command.env(crate::sync_rpc::RPC_SOCKET_ENV, &socket);
+        if capture_output {
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+        }
+        let child = command.spawn()?;
+        let runner = self.clone();
+        let wait = tokio::task::spawn_blocking(move || {
+            if capture_output {
+                runner.wait_with_output(child).map(ChildWait::Output)
+            } else {
+                runner.wait_for_status(child).map(ChildWait::Status)
+            }
+        });
+        let wait = serve_rpc_until(server, async move {
+            wait.await
+                .map_err(|error| io::Error::other(error.to_string()))?
+        })
+        .await?;
+        if !connected.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "DBI guest exited before connecting to the global-state coordinator",
+            ));
+        }
+        let global = Arc::try_unwrap(global)
+            .map_err(|_| io::Error::other("DBI coordinator state still has owners"))?;
+        Ok(match wait {
+            ChildWait::Status(status) => CoordinatedWait::Status(status, global),
+            ChildWait::Output(output) => CoordinatedWait::Output(output, global),
+        })
+    }
+
     fn wait_for_status(&self, mut child: Child) -> io::Result<ExitStatus> {
         if !self.isolated_process_group {
             return child.wait();
@@ -406,6 +551,53 @@ impl DbiRunner {
         }
         command
     }
+}
+
+enum ChildWait {
+    Status(ExitStatus),
+    Output(Output),
+}
+
+enum CoordinatedWait<G> {
+    Status(ExitStatus, G),
+    Output(Output, G),
+}
+
+async fn serve_rpc_until<G, F, T>(server: RpcServer<G>, completion: F) -> io::Result<T>
+where
+    G: GlobalTool + 'static,
+    F: Future<Output = io::Result<T>>,
+{
+    let mut serving = tokio::task::JoinSet::new();
+    serving.spawn(server.serve());
+    tokio::pin!(completion);
+
+    let result = tokio::select! {
+        biased;
+        result = &mut completion => result,
+        result = serving.join_next() => {
+            let message = match result {
+                Some(Ok(Ok(()))) => "DBI coordinator stopped unexpectedly".to_owned(),
+                Some(Ok(Err(error))) => error.to_string(),
+                Some(Err(error)) => error.to_string(),
+                None => "DBI coordinator task disappeared".to_owned(),
+            };
+            return Err(io::Error::other(message));
+        }
+    };
+
+    serving.abort_all();
+    while let Some(server_result) = serving.join_next().await {
+        match server_result {
+            Err(error) if error.is_cancelled() => {}
+            Ok(Ok(())) => {
+                return Err(io::Error::other("DBI coordinator stopped unexpectedly"));
+            }
+            Ok(Err(error)) => return Err(io::Error::other(error.to_string())),
+            Err(error) => return Err(io::Error::other(error.to_string())),
+        }
+    }
+    result
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED

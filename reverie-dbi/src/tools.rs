@@ -85,6 +85,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::DbiSyscallOutcome;
+use crate::MemoryReader;
 use crate::RegisterReader;
 use crate::RegisterWriter;
 use crate::SyscallInvoker;
@@ -691,6 +692,7 @@ struct Counter2Totals {
     exited_threads: u64,
 }
 
+/// Coordinator-owned totals reported by DBI counter2 processes at exit.
 #[derive(Debug, Default)]
 pub struct Counter2Global {
     totals: Mutex<Counter2Totals>,
@@ -720,7 +722,8 @@ impl GlobalTool for Counter2Global {
 }
 
 impl Counter2Global {
-    fn snapshot(&self) -> (u64, u64, u64) {
+    /// Returns aggregate `(syscalls, processes, threads)` totals.
+    pub fn snapshot(&self) -> (u64, u64, u64) {
         let totals = self
             .totals
             .lock()
@@ -742,6 +745,13 @@ pub struct Counter2Tool {
 impl Counter2Tool {
     fn observe_syscall(&self) {
         self.process_syscalls.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn report(&self) -> Counter2Request {
+        Counter2Request {
+            syscalls: self.process_syscalls.load(Ordering::SeqCst),
+            threads: self.observed_threads.load(Ordering::SeqCst),
+        }
     }
 }
 
@@ -769,12 +779,10 @@ impl Tool for Counter2Tool {
         global_state: &G,
         _exit_status: ExitStatus,
     ) -> Result<(), Error> {
-        let _ = global_state
-            .send_rpc(Counter2Request {
-                syscalls: self.process_syscalls.load(Ordering::SeqCst),
-                threads: self.observed_threads.load(Ordering::SeqCst),
-            })
-            .await;
+        if crate::sync_rpc::is_active() {
+            return Ok(());
+        }
+        let _ = global_state.send_rpc(self.report()).await;
         Ok(())
     }
 }
@@ -1429,7 +1437,7 @@ impl Counter2Host {
         invoke_syscall: SyscallInvoker,
         read_registers: RegisterReader,
         write_registers: RegisterWriter,
-    ) -> Result<(DbiSyscallOutcome, bool), Error> {
+    ) -> Result<(DbiSyscallOutcome, Option<Counter2Request>), Error> {
         let number = syscall.number();
         let (tool, state_slot, new_thread, mut thread_state) = {
             let mut registry = self
@@ -1445,7 +1453,7 @@ impl Counter2Host {
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                     }
                 }
-                return Ok((DbiSyscallOutcome::ExecuteOriginal(syscall), false));
+                return Ok((DbiSyscallOutcome::ExecuteOriginal(syscall), None));
             }
             if number == Sysno::exit_group {
                 registry.process_exiting = true;
@@ -1524,7 +1532,7 @@ impl Counter2Host {
                 debug_assert!(stored.is_none());
                 *stored = Some(thread_state);
             }
-            return outcome.map(|outcome| (outcome, false));
+            return outcome.map(|outcome| (outcome, None));
         }
 
         let outcome = match outcome {
@@ -1584,16 +1592,17 @@ impl Counter2Host {
                 global_state: &self.global_state,
                 config: &(),
             };
+            let report = process_tool.report();
             run_ready(
                 process_tool
                     .as_ref()
                     .clone()
                     .on_exit_process(pid, &global, status),
             )?;
-            return Ok((outcome, true));
+            return Ok((outcome, Some(report)));
         }
 
-        let (process_exited, process_tool) = {
+        let process_tool = {
             let mut registry = self
                 .registry
                 .lock()
@@ -1603,13 +1612,12 @@ impl Counter2Host {
             if process_exited {
                 registry.process_exiting = true;
             }
-            let process_tool = process_exited.then(|| {
+            process_exited.then(|| {
                 registry
                     .tool
                     .take()
                     .expect("DBI Counter2 Tool disappeared before process exit")
-            });
-            (process_exited, process_tool)
+            })
         };
         crate::run_tool_thread_exit(
             tool.as_ref(),
@@ -1619,6 +1627,7 @@ impl Counter2Host {
             &(),
             status,
         )?;
+        let report = process_tool.as_ref().map(|tool| tool.report());
         if let Some(process_tool) = process_tool {
             let global = crate::DbiGlobal::<Counter2Tool> {
                 tid,
@@ -1632,7 +1641,7 @@ impl Counter2Host {
                     .on_exit_process(pid, &global, status),
             )?;
         }
-        Ok((outcome, process_exited))
+        Ok((outcome, report))
     }
 
     fn finish_exit_group(&self) {
@@ -1668,6 +1677,7 @@ pub(crate) fn run_active_tool(
     invoke_syscall: SyscallInvoker,
     read_registers: RegisterReader,
     write_registers: RegisterWriter,
+    read_memory: MemoryReader,
 ) -> Option<DbiSyscallOutcome> {
     let tool = active_tool()?;
     let syscall = Syscall::from_raw(
@@ -1758,7 +1768,7 @@ pub(crate) fn run_active_tool(
             read_registers,
             write_registers,
         ),
-        ActiveTool::Backtrace => dispatch(
+        ActiveTool::Backtrace => dispatch_with_memory_reader(
             &BacktraceTool,
             context,
             tid,
@@ -1768,6 +1778,7 @@ pub(crate) fn run_active_tool(
             invoke_syscall,
             read_registers,
             write_registers,
+            read_memory,
         ),
         ActiveTool::Counter1 => dispatch_counter1(
             context,
@@ -1829,6 +1840,40 @@ pub(crate) fn run_active_tool(
         Err(Error::Errno(errno)) => DbiSyscallOutcome::Suppress(-(errno.into_raw() as i64)),
         Err(_) => DbiSyscallOutcome::Suppress(-(reverie::syscalls::Errno::EIO.into_raw() as i64)),
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_with_memory_reader<T>(
+    tool: &T,
+    context: usize,
+    tid: i32,
+    pid: i32,
+    branches: u64,
+    syscall: Syscall,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
+    write_registers: RegisterWriter,
+    read_memory: MemoryReader,
+) -> Result<DbiSyscallOutcome, Error>
+where
+    T: Tool<GlobalState = (), ThreadState = ()>,
+{
+    let mut thread_state = ();
+    crate::run_tool_syscall_with_memory_reader(
+        tool,
+        context,
+        Pid::from_raw(tid),
+        Pid::from_raw(pid),
+        branches,
+        &mut thread_state,
+        &(),
+        &(),
+        syscall,
+        invoke_syscall,
+        read_registers,
+        write_registers,
+        read_memory,
+    )
 }
 
 /// Builds a [`DbiGuest`] specialized for `tool` and runs its syscall handler.
@@ -2024,7 +2069,7 @@ fn dispatch_counter2(
     read_registers: RegisterReader,
     write_registers: RegisterWriter,
 ) -> Result<DbiSyscallOutcome, Error> {
-    let (outcome, process_exited) = COUNTER2_HOST.dispatch(
+    let (outcome, report) = COUNTER2_HOST.dispatch(
         context,
         Pid::from_raw(tid),
         Pid::from_raw(pid),
@@ -2035,12 +2080,21 @@ fn dispatch_counter2(
         read_registers,
         write_registers,
     )?;
-    if process_exited {
-        let (syscalls, processes, threads) = COUNTER2_HOST.global_state.snapshot();
-        emit_line(&format!(
-            "reverie-dbi: counter2 total system calls: {syscalls}, from {processes} processes, {threads} thread(s)"
-        ));
-        COUNTER2_HOST.finish_exit_group();
+    if let Some(report) = report {
+        if crate::sync_rpc::is_active() {
+            crate::sync_rpc::send_rpc_from_guest::<_, ()>(
+                context,
+                invoke_syscall,
+                Pid::from_raw(tid),
+                report,
+            );
+        } else {
+            let (syscalls, processes, threads) = COUNTER2_HOST.global_state.snapshot();
+            emit_line(&format!(
+                "reverie-dbi: counter2 total system calls: {syscalls}, from {processes} processes, {threads} thread(s)"
+            ));
+            COUNTER2_HOST.finish_exit_group();
+        }
     }
     Ok(outcome)
 }
@@ -2094,7 +2148,7 @@ mod tests {
                 outcome,
                 DbiSyscallOutcome::ExecuteOriginal(syscall(Sysno::getpid, 0))
             );
-            assert!(!exited);
+            assert!(exited.is_none());
         }
 
         let (outcome, exited) = host
@@ -2114,7 +2168,7 @@ mod tests {
             outcome,
             DbiSyscallOutcome::ExecuteOriginal(syscall(Sysno::gettid, 0))
         );
-        assert!(!exited);
+        assert!(exited.is_none());
 
         let (outcome, exited) = host
             .dispatch(
@@ -2133,7 +2187,7 @@ mod tests {
             outcome,
             DbiSyscallOutcome::ExecuteOriginal(syscall(Sysno::exit, 0))
         );
-        assert!(!exited);
+        assert!(exited.is_none());
 
         let (outcome, exited) = host
             .dispatch(
@@ -2152,7 +2206,13 @@ mod tests {
             outcome,
             DbiSyscallOutcome::ExecuteOriginal(syscall(Sysno::exit_group, 7))
         );
-        assert!(exited);
+        assert_eq!(
+            exited,
+            Some(Counter2Request {
+                syscalls: 5,
+                threads: 2
+            })
+        );
         assert_eq!(host.global_state.snapshot(), (5, 1, 2));
     }
 

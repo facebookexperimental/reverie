@@ -14,7 +14,7 @@ trap 'rm -rf "$tmpdir"' EXIT
 
 "${CC:-cc}" -std=c11 -O2 -Wall -Wextra -Werror \
   "$crate_dir/tests/cpuid_probe.c" -o "$tmpdir/cpuid-probe"
-"$drrun" -disable_rseq -c "$client" -- "$tmpdir/cpuid-probe" \
+"$drrun" -quiet -disable_rseq -stack_size 2M -c "$client" -- "$tmpdir/cpuid-probe" \
   >"$tmpdir/stdout" 2>"$tmpdir/stderr"
 
 grep -Fx 'CPUID-SUCCESS vendor=GenuineIntel signature=00000663' \

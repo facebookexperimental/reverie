@@ -68,6 +68,8 @@ use reverie_memory::LocalMemory;
 use reverie_memory::MemoryAccess;
 use serde::Deserialize;
 use serde::Serialize;
+#[cfg(feature = "prototype-runtime")]
+pub use tools::Counter2Global;
 
 /// Native callback used to issue a syscall with DynamoRIO bookkeeping.
 pub type SyscallInvoker = unsafe extern "C" fn(usize, i64, *const u64) -> i64;
@@ -141,6 +143,7 @@ where
     invoke_syscall: SyscallInvoker,
     read_registers: RegisterReader,
     write_registers: RegisterWriter,
+    read_memory: Option<MemoryReader>,
     tail_inject_result: Arc<TailInjectResult>,
 }
 
@@ -175,8 +178,17 @@ where
             invoke_syscall,
             read_registers,
             write_registers,
+            read_memory: None,
             tail_inject_result: Arc::new(TailInjectResult::default()),
         }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(impl-dbi-gap-closure): Review fault-safe DBI memory reads.
+    /// Uses DynamoRIO's fault-safe application-memory reader for guest inspection.
+    pub fn with_memory_reader(mut self, read_memory: MemoryReader) -> Self {
+        self.read_memory = Some(read_memory);
+        self
     }
 }
 
@@ -229,7 +241,12 @@ where
         // See `DbiGlobal::send_rpc`: prefer the cross-process coordinator when
         // one is configured, so fork/exec children share one GlobalState.
         if crate::sync_rpc::is_active() {
-            crate::sync_rpc::send_rpc(self.tid, message)
+            crate::sync_rpc::send_rpc_from_guest(
+                self.context,
+                self.invoke_syscall,
+                self.tid,
+                message,
+            )
         } else {
             self.global_state.receive_rpc(self.tid, message).await
         }
@@ -404,10 +421,10 @@ where
             if fp == 0 || !fp.is_multiple_of(std::mem::align_of::<u64>() as u64) {
                 break;
             }
-            let Some(saved_fp) = read_guest_word(fp) else {
+            let Some(saved_fp) = read_guest_word(self.read_memory, fp) else {
                 break;
             };
-            let Some(return_addr) = read_guest_word(fp.wrapping_add(8)) else {
+            let Some(return_addr) = read_guest_word(self.read_memory, fp.wrapping_add(8)) else {
                 break;
             };
             if return_addr == 0 {
@@ -430,12 +447,27 @@ where
     }
 }
 
+fn read_guest_word(read_memory: Option<MemoryReader>, addr: u64) -> Option<u64> {
+    if let Some(read_memory) = read_memory {
+        let mut value = 0_u64;
+        let read = unsafe {
+            read_memory(
+                addr as usize,
+                (&mut value as *mut u64).cast::<u8>(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+        return (read != 0).then_some(value);
+    }
+    read_guest_word_from_process(addr)
+}
+
 /// Reads one 64-bit word at `addr` from the current process using
 /// `process_vm_readv`, which reports an out-of-bounds address as a short/failed
 /// read rather than raising `SIGSEGV`. Used by the DBI [`Guest::backtrace`]
 /// frame-pointer walk so a bad guest frame pointer ends the trace safely instead
 /// of aborting the whole DynamoRIO process.
-fn read_guest_word(addr: u64) -> Option<u64> {
+fn read_guest_word_from_process(addr: u64) -> Option<u64> {
     let mut value: u64 = 0;
     let local = libc::iovec {
         iov_base: (&mut value as *mut u64).cast::<libc::c_void>(),
@@ -1183,6 +1215,75 @@ pub fn run_tool_syscall<T: Tool>(
     read_registers: RegisterReader,
     write_registers: RegisterWriter,
 ) -> Result<DbiSyscallOutcome, Error> {
+    run_tool_syscall_inner(
+        tool,
+        context,
+        tid,
+        pid,
+        branch_count,
+        thread_state,
+        global_state,
+        config,
+        syscall,
+        invoke_syscall,
+        read_registers,
+        write_registers,
+        None,
+    )
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(impl-dbi-gap-closure): Review syscall dispatch with safe guest reads.
+/// Drives one syscall through a tool with DynamoRIO fault-safe guest-memory reads enabled.
+#[allow(clippy::too_many_arguments)]
+pub fn run_tool_syscall_with_memory_reader<T: Tool>(
+    tool: &T,
+    context: usize,
+    tid: Pid,
+    pid: Pid,
+    branch_count: u64,
+    thread_state: &mut T::ThreadState,
+    global_state: &T::GlobalState,
+    config: &<T::GlobalState as GlobalTool>::Config,
+    syscall: Syscall,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
+    write_registers: RegisterWriter,
+    read_memory: MemoryReader,
+) -> Result<DbiSyscallOutcome, Error> {
+    run_tool_syscall_inner(
+        tool,
+        context,
+        tid,
+        pid,
+        branch_count,
+        thread_state,
+        global_state,
+        config,
+        syscall,
+        invoke_syscall,
+        read_registers,
+        write_registers,
+        Some(read_memory),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_tool_syscall_inner<T: Tool>(
+    tool: &T,
+    context: usize,
+    tid: Pid,
+    pid: Pid,
+    branch_count: u64,
+    thread_state: &mut T::ThreadState,
+    global_state: &T::GlobalState,
+    config: &<T::GlobalState as GlobalTool>::Config,
+    syscall: Syscall,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
+    write_registers: RegisterWriter,
+    read_memory: Option<MemoryReader>,
+) -> Result<DbiSyscallOutcome, Error> {
     let mut guest = DbiGuest::new(
         context,
         tid,
@@ -1196,6 +1297,9 @@ pub fn run_tool_syscall<T: Tool>(
         read_registers,
         write_registers,
     );
+    if let Some(read_memory) = read_memory {
+        guest = guest.with_memory_reader(read_memory);
+    }
     let tail_result = Arc::clone(&guest.tail_inject_result);
     tail_result.clear();
     match run_ready(tool.handle_syscall_event(&mut guest, syscall), &tail_result) {
@@ -1418,7 +1522,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     invoke_syscall: SyscallInvoker,
     read_registers: RegisterReader,
     write_registers: RegisterWriter,
-    _read_memory: MemoryReader,
+    read_memory: MemoryReader,
     emit: tools::Emitter,
 ) -> i32 {
     // NB: `catch_unwind` cannot actually contain a panic here — unwinding out of
@@ -1550,6 +1654,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
             invoke_syscall,
             read_registers,
             write_registers,
+            read_memory,
         ) {
             return match outcome {
                 DbiSyscallOutcome::Suppress(value) => {

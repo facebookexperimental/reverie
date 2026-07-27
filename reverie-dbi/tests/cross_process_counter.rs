@@ -66,8 +66,9 @@ impl Tool for CounterTool {
     }
 }
 
-unsafe extern "C" fn unexpected_invoke(_context: usize, _sysnum: i64, _args: *const u64) -> i64 {
-    panic!("counter tool unexpectedly injected a syscall")
+unsafe extern "C" fn invoke_host_syscall(_context: usize, sysnum: i64, args: *const u64) -> i64 {
+    let args = unsafe { std::slice::from_raw_parts(args, 6) };
+    unsafe { libc::syscall(sysnum, args[0], args[1], args[2], args[3], args[4], args[5]) as i64 }
 }
 
 unsafe extern "C" fn registers_unavailable(
@@ -100,7 +101,7 @@ fn record_with_dbi_tool(number: i32) {
         &local_placeholder,
         &(),
         syscall,
-        unexpected_invoke,
+        invoke_host_syscall,
         registers_unavailable,
         reject_register_write,
     )

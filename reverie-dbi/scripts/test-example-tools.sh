@@ -24,6 +24,8 @@ target_dir=${CARGO_TARGET_DIR:-"$workspace_dir/target"}
 client=$("$script_dir/build-client.sh" | tail -n 1)
 path_helper="$target_dir/$profile/reverie-dbi-dynamorio-path"
 drrun=$("$path_helper" drrun)
+dynamorio_home=$("$path_helper" home)
+counter2_runner="$target_dir/$profile/reverie-dbi-counter2"
 
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT
@@ -78,7 +80,7 @@ run_tool() {
   if (($# > 0)); then
     guest=("$@")
   fi
-  env "$env_var=1" "$drrun" -disable_rseq -stack_size 2M -c "$client" -- \
+  env "$env_var=1" "$drrun" -quiet -disable_rseq -stack_size 2M -c "$client" -- \
     "${guest[@]}" \
     >"$tmpdir/out" 2>"$tmpdir/err"
 }
@@ -89,7 +91,7 @@ run_tool() {
 # the root's syscalls and passes them through, which deliberately bypasses that
 # native fallback; the default runtime is the mode where determinism applies.
 run_default_runtime() {
-  "$drrun" -disable_rseq -stack_size 2M -c "$client" -- "$@" \
+  "$drrun" -quiet -disable_rseq -stack_size 2M -c "$client" -- "$@" \
     >"$tmpdir/out" 2>"$tmpdir/err"
 }
 
@@ -207,6 +209,19 @@ grep -Eq 'counter2 total system calls: [1-9][0-9]*, from 1 processes, 1 thread\(
   "$tmpdir/err" || fail "counter2: no lifecycle summary"
 echo "PASS: counter2 (admission accounting + process exit lifecycle)"
 
+# The production runner owns one typed GlobalState outside the instrumented
+# process tree. A fork/exec child reconnects to the inherited UDS path, so both
+# process-exit publications must appear in one coordinator result.
+env DYNAMORIO_HOME="$dynamorio_home" REVERIE_DBI_CLIENT="$client" \
+  "$counter2_runner" -- /bin/bash -c '/bin/true & wait' \
+  >"$tmpdir/out" 2>"$tmpdir/err" \
+  || fail "counter2: coordinator-backed process tree failed"
+grep -Eq 'counter2 global system calls: [1-9][0-9]*, from 2 processes, 2 thread\(s\)' \
+  "$tmpdir/err" || fail "counter2: shared global did not aggregate fork/exec child"
+[[ $(grep -c 'counter2 global system calls:' "$tmpdir/err") -eq 1 ]] \
+  || fail "counter2: coordinator emitted more than one process-tree summary"
+echo "PASS: counter2 (production UDS coordinator aggregates fork/exec process tree)"
+
 # chunky_print: suppress guest writes to fd 1, buffer the bytes, and re-emit them
 # to the real stdout at the exit flush (through the native stdout emit path). The
 # guest's stdout must survive the round-trip (unlike a naive suppression), while
@@ -260,7 +275,7 @@ echo "PASS: chaos (read truncated to one byte, file reconstructed intact)"
 # kernel syscall restart, so the guest sees EINTR directly and must retry; a
 # correct guest still reconstructs the file.
 env HERMIT_DBI_CHAOS=1 HERMIT_DBI_CHAOS_INTERRUPT=1 \
-  "$drrun" -disable_rseq -stack_size 2M -c "$client" -- \
+  "$drrun" -quiet -disable_rseq -stack_size 2M -c "$client" -- \
   "$chaos_read_guest" "$chaos_data" >"$tmpdir/out" 2>"$tmpdir/err" \
   || fail "chaos: guest failed under EINTR injection"
 grep -q '^CHAOS-ONE-BYTE-AT-A-TIME$' "$tmpdir/out" \

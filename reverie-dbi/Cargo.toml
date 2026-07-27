@@ -19,11 +19,9 @@ bincode = { version = "2", features = ["serde"] }
 libc = "0.2.186"
 reverie = { version = "0.1.0", path = "../reverie" }
 reverie-memory = { version = "0.1.0", path = "../reverie-memory" }
+reverie-rpc-transport = { version = "0.1.0", path = "../reverie-rpc-transport" }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = { version = "1.0.140", features = ["alloc"] }
-tracing = "0.1.41"
-
-[dev-dependencies]
-reverie-rpc-transport = { version = "0.1.0", path = "../reverie-rpc-transport" }
 tempfile = "3.27.0"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "time"] }
+tracing = "0.1.41"
