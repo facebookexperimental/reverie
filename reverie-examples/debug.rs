@@ -7,8 +7,12 @@
  */
 
 //! This instrumentation tool does nothing except acting as a gdbserver.
+
+#[path = "src/kvm_runner.rs"]
+mod kvm_runner;
+
 use clap::Parser;
-use reverie::Error;
+use reverie::ExitStatus;
 use reverie::Subscription;
 use reverie::Tool;
 use reverie_util::CommonToolArguments;
@@ -30,25 +34,48 @@ impl Tool for DebugTool {
 /// execution of the guest process will continue.
 #[derive(Debug, Parser)]
 struct Args {
+    // TODO-HUMAN-REVIEW(PR-195): Review debug runner selection.
+    /// Execution runner; KVM executes DebugTool without the ptrace GDB server.
+    #[clap(long, value_enum, default_value = "ptrace")]
+    runner: kvm_runner::Runner,
+
     #[clap(flatten)]
     common_opts: CommonToolArguments,
 
-    /// Launch gdbserver on a given port
+    /// Launch the ptrace gdbserver on a given port.
     #[clap(long, default_value = "1234")]
     port: u16,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Error> {
+fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let port = args.port;
+    let stdin = match args.runner {
+        kvm_runner::Runner::Ptrace => None,
+        kvm_runner::Runner::Kvm => kvm_runner::reserve_stdin()?,
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(run_main(args, stdin))
+}
+
+async fn run_main(args: Args, stdin: Option<std::fs::File>) -> anyhow::Result<()> {
     let log_guard = args.common_opts.init_tracing();
-    eprintln!("Listening on port {}", port);
-    let tracer = reverie_ptrace::TracerBuilder::<DebugTool>::new(args.common_opts.into())
-        .gdbserver(port)
-        .spawn()
-        .await?;
-    let (status, _global_state) = tracer.wait().await?;
+    let (status, _global_state) = match args.runner {
+        kvm_runner::Runner::Ptrace => {
+            eprintln!("Listening on port {}", args.port);
+            let tracer =
+                reverie_ptrace::TracerBuilder::<DebugTool>::new(args.common_opts.clone().into())
+                    .gdbserver(args.port)
+                    .spawn()
+                    .await?;
+            tracer.wait().await?
+        }
+        kvm_runner::Runner::Kvm => {
+            let result = kvm_runner::run::<DebugTool>(&args.common_opts, (), stdin).await?;
+            (ExitStatus::Exited(result.exit_code), result.global_state)
+        }
+    };
     drop(log_guard); // Flush logs before exiting.
     status.raise_or_exit()
 }

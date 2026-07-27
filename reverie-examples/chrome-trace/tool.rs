@@ -117,13 +117,22 @@ impl Tool for ChromeTrace {
     }
 
     async fn handle_post_exec<T: Guest<Self>>(&self, guest: &mut T) -> Result<(), Errno> {
-        let program = fs::read_link(format!("/proc/{}/exe", guest.pid())).unwrap();
+        // KVM uses synthetic guest PIDs that do not identify host /proc entries.
+        // Keep recording syscall and lifecycle events when this optional metadata
+        // is unavailable instead of aborting the tool.
+        let Ok(program) = fs::read_link(format!("/proc/{}/exe", guest.pid())) else {
+            return Ok(());
+        };
 
-        let mut cmdline = fs::read(format!("/proc/{}/cmdline", guest.pid())).unwrap();
+        let Ok(mut cmdline) = fs::read(format!("/proc/{}/cmdline", guest.pid())) else {
+            return Ok(());
+        };
 
         // Shave off the extra NUL terminator at the end so we don't end up with
         // an empty arg at the end.
-        assert_eq!(cmdline.pop(), Some(b'\0'));
+        if cmdline.pop() != Some(b'\0') {
+            return Ok(());
+        }
 
         let args: Vec<_> = cmdline
             .split(|byte| *byte == 0)

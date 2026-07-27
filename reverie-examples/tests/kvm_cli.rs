@@ -159,6 +159,78 @@ fn production_example_clis_run_real_program_with_kvm_guest() {
     assert_success(&strace);
     assert_eq!(strace.stdout, b"strace\n");
     assert!(String::from_utf8_lossy(&strace.stderr).contains("[pid 1] write("));
+
+    let chaos = run(
+        env!("CARGO_BIN_EXE_chaos"),
+        &[
+            "--runner",
+            "kvm",
+            "--no-read",
+            "--no-recv",
+            "--no-interrupt",
+            "--no-host-envs",
+            "/bin/echo",
+            "chaos",
+        ],
+    );
+    assert_success(&chaos);
+    assert_eq!(chaos.stdout, b"chaos\n");
+
+    let trace_path = std::env::temp_dir().join(format!(
+        "reverie-kvm-chrome-trace-{}.json",
+        std::process::id()
+    ));
+    let chrome_trace = run(
+        env!("CARGO_BIN_EXE_chrome_trace"),
+        &[
+            "--runner",
+            "kvm",
+            "--out",
+            trace_path.to_str().unwrap(),
+            "--no-host-envs",
+            "/bin/echo",
+            "chrome-trace",
+        ],
+    );
+    assert_success(&chrome_trace);
+    assert_eq!(chrome_trace.stdout, b"chrome-trace\n");
+    let trace: serde_json::Value = serde_json::from_slice(&fs::read(&trace_path).unwrap()).unwrap();
+    fs::remove_file(trace_path).unwrap();
+    assert!(!trace.as_array().unwrap().is_empty());
+
+    let chunky_print = run(
+        env!("CARGO_BIN_EXE_chunky_print"),
+        &[
+            "--runner",
+            "kvm",
+            "--no-host-envs",
+            "/bin/echo",
+            "chunky-print",
+        ],
+    );
+    assert_success(&chunky_print);
+    assert_eq!(chunky_print.stdout, b"chunky-print\n");
+
+    let debug = run(
+        env!("CARGO_BIN_EXE_debug"),
+        &["--runner", "kvm", "--no-host-envs", "/bin/echo", "debug"],
+    );
+    assert_success(&debug);
+    assert_eq!(debug.stdout, b"debug\n");
+
+    let strace_minimal = run(
+        env!("CARGO_BIN_EXE_strace_minimal"),
+        &[
+            "--runner",
+            "kvm",
+            "--no-host-envs",
+            "/bin/echo",
+            "strace-minimal",
+        ],
+    );
+    assert_success(&strace_minimal);
+    assert_eq!(strace_minimal.stdout, b"strace-minimal\n");
+    assert!(String::from_utf8_lossy(&strace_minimal.stderr).contains("[pid 1] write("));
 }
 
 #[test]
