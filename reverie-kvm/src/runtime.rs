@@ -40,17 +40,32 @@ use crate::Result;
 use crate::SyscallRequest;
 use crate::VMCALL_SYSCALL_TRANSPORT;
 use crate::bootstrap::SYSCALL_FRAME_ADDRESS;
-use crate::bootstrap::THREAD_SYSCALL_AREA_START;
+use crate::bootstrap::TOOL_STACK_TOP;
 use crate::bootstrap::set_user_segment_base;
 use crate::executor::ElfExecutor;
 use crate::executor::is_process_syscall;
 
 const GUEST_PID: i32 = 1;
 const STACK_CAPACITY: usize = 4096;
-const TOOL_STACK_TOP: u64 = THREAD_SYSCALL_AREA_START;
 const TOOL_STACK_BOTTOM: u64 = TOOL_STACK_TOP - STACK_CAPACITY as u64;
 
 type TailResult = Arc<Mutex<Option<std::result::Result<i64, Errno>>>>;
+
+// AUTONOMOUS-BOT-IMPLEMENTED: Keep root syscalls that share worker state in one backend.
+// TODO-HUMAN-REVIEW(PR-173): Review KVM root syscall ownership.
+fn is_backend_owned_syscall(number: u64) -> bool {
+    is_process_syscall(number)
+        // KVM guest workers run outside Detcore's scheduler. Root futexes must
+        // use the same host-backed words as workers, or Detcore deadlocks.
+        || number == libc::SYS_futex as u64
+        // QEMU's root event loop waits on worker eventfds. KVM syscall
+        // injection cannot perform ppoll, so use translated host descriptors.
+        || number == libc::SYS_ppoll as u64
+        // Workers can create descriptors that the root event loop consumes.
+        // Scalar and vectored reads must use that shared descriptor table.
+        || number == libc::SYS_read as u64
+        || number == libc::SYS_readv as u64
+}
 
 /// Executes a syscall on behalf of a KVM guest.
 ///
@@ -656,21 +671,7 @@ impl KvmBackend {
                     let registers = self.vcpu.get_regs()?;
                     let request = SyscallRequest::read_from(&memory, frame_address)?;
                     let syscall = request.into_syscall()?;
-                    // TODO-HUMAN-REVIEW(PR-172): Review concurrent KVM root
-                    // syscall routing that bypasses Detcore tool callbacks.
-                    let backend_owned = is_process_syscall(request.number())
-                        // KVM guest workers run outside Detcore's scheduler. Root
-                        // futexes must use the same host-backed words as workers,
-                        // or Detcore sees no runnable thread and deadlocks.
-                        || request.number() == libc::SYS_futex as u64
-                        // QEMU's root event loop waits on worker eventfds. KVM
-                        // syscall injection cannot perform ppoll, so use the
-                        // personality's translated host descriptors directly.
-                        || request.number() == libc::SYS_ppoll as u64
-                        // ppoll can report standard input ready at EOF. Keep
-                        // the following vectored read in the same translated
-                        // KVM descriptor domain rather than injecting it.
-                        || request.number() == libc::SYS_readv as u64;
+                    let backend_owned = is_backend_owned_syscall(request.number());
                     let subscribed = !backend_owned
                         && subscriptions
                             .iter_syscalls()
@@ -812,6 +813,19 @@ mod tests {
         assert_eq!(raw_to_result(7), Ok(7));
         assert_eq!(raw_to_result(-(libc::EIO as i64)), Err(Errno::EIO));
         assert_eq!(result_to_raw(Err(Errno::EFAULT)), -(libc::EFAULT as i64));
+    }
+
+    #[test]
+    fn worker_shared_syscalls_are_backend_owned() {
+        for number in [
+            libc::SYS_futex,
+            libc::SYS_ppoll,
+            libc::SYS_read,
+            libc::SYS_readv,
+        ] {
+            assert!(is_backend_owned_syscall(number as u64));
+        }
+        assert!(!is_backend_owned_syscall(libc::SYS_clock_gettime as u64));
     }
 
     #[test]

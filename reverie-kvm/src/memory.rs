@@ -216,6 +216,50 @@ impl GuestMemory {
         (first_page..=last_page).all(|page| access.pages.contains_key(&page))
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED: Reuse deterministic holes in the KVM guest arena.
+    // TODO-HUMAN-REVIEW(PR-176): Review mmap hole-selection semantics.
+    pub(crate) fn find_unmapped_user_range(
+        &self,
+        start: u64,
+        end: u64,
+        length: u64,
+    ) -> Option<u64> {
+        let page_size = PAGE_SIZE as u64;
+        if length == 0
+            || !start.is_multiple_of(page_size)
+            || !end.is_multiple_of(page_size)
+            || !length.is_multiple_of(page_size)
+            || start < self.guest_base()
+            || end > self.guest_end()
+            || start >= end
+        {
+            return None;
+        }
+
+        let pages_needed = length / page_size;
+        let end_page = end / page_size;
+        let mut candidate = start / page_size;
+        if candidate.checked_add(pages_needed)? > end_page {
+            return None;
+        }
+
+        let access = self
+            .mapping
+            .user_access
+            .lock()
+            .expect("guest memory access map lock poisoned");
+        for (&occupied, _) in access.pages.range(candidate..end_page) {
+            if candidate.checked_add(pages_needed)? <= occupied {
+                return candidate.checked_mul(page_size);
+            }
+            candidate = occupied.checked_add(1)?;
+            if candidate.checked_add(pages_needed)? > end_page {
+                return None;
+            }
+        }
+        candidate.checked_mul(page_size)
+    }
+
     // TODO-HUMAN-REVIEW(PR-132): Review the host-side KVM user mapping API.
     pub(crate) fn remap_user_range(
         &self,
@@ -677,5 +721,29 @@ mod tests {
         let mut bytes = [0; 6];
         parent.read(PAGE_SIZE as u64, &mut bytes).unwrap();
         assert_eq!(&bytes, b"mapped");
+    }
+
+    #[test]
+    fn finds_first_unmapped_user_range() {
+        let memory = GuestMemory::new(0x1000, PAGE_SIZE * 8).unwrap();
+        memory.map_user_range(0x2000, 0x2000, false).unwrap();
+        memory.map_user_range(0x5000, 0x1000, true).unwrap();
+
+        assert_eq!(
+            memory.find_unmapped_user_range(0x1000, 0x9000, 0x1000),
+            Some(0x1000)
+        );
+        assert_eq!(
+            memory.find_unmapped_user_range(0x2000, 0x9000, 0x2000),
+            Some(0x6000)
+        );
+        assert_eq!(
+            memory.find_unmapped_user_range(0x2000, 0x7000, 0x2000),
+            None
+        );
+        assert_eq!(
+            memory.find_unmapped_user_range(0x1001, 0x9000, 0x1000),
+            None
+        );
     }
 }

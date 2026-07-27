@@ -22,7 +22,7 @@ pub(crate) const RETURN_RIP_WORD: usize = 8;
 pub(crate) const RETURN_FLAGS_WORD: usize = 9;
 pub(crate) const SAVED_RBX_WORD: usize = 10;
 const FRAME_WORDS: usize = 11;
-const FRAME_SIZE: usize = WORD_SIZE * FRAME_WORDS;
+pub(crate) const FRAME_SIZE: usize = WORD_SIZE * FRAME_WORDS;
 
 /// A Linux syscall request transported from guest to host memory.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

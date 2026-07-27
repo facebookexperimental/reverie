@@ -51,6 +51,7 @@ use crate::elf::load_static_elf;
 use crate::executor::ElfExecutor;
 use crate::executor::ProcessAction;
 use crate::runtime::SyscallExecutor;
+use crate::syscall::FRAME_SIZE;
 
 /// KVM currently permits userspace exits for this standardized hypercall.
 /// The prototype uses it as a transport opcode and places the syscall frame
@@ -112,6 +113,37 @@ fn unblock_worker_interrupt_signal() {
 struct GuestThreadGroup {
     cancelled: AtomicBool,
     workers: Mutex<Vec<libc::pthread_t>>,
+    transport_slots: Mutex<Vec<bool>>,
+}
+
+impl GuestThreadGroup {
+    // AUTONOMOUS-BOT-IMPLEMENTED: Reuse syscall transports after guest threads exit.
+    // TODO-HUMAN-REVIEW(PR-176): Review KVM transport slot lifecycle.
+    fn reserve_transport_slot(&self, child_tid: i32) -> Result<usize> {
+        let mut slots = self
+            .transport_slots
+            .lock()
+            .expect("KVM transport-slot lock poisoned");
+        if slots.is_empty() {
+            slots.resize(MAX_GUEST_THREADS as usize, false);
+        }
+        let slot = slots
+            .iter()
+            .position(|in_use| !*in_use)
+            .ok_or(Error::GuestThreadLimitExceeded(child_tid))?;
+        slots[slot] = true;
+        Ok(slot)
+    }
+
+    fn release_transport_slot(&self, slot: usize) {
+        let mut slots = self
+            .transport_slots
+            .lock()
+            .expect("KVM transport-slot lock poisoned");
+        if let Some(in_use) = slots.get_mut(slot) {
+            *in_use = false;
+        }
+    }
 }
 
 fn duplicate_stdin() -> Result<Option<File>> {
@@ -142,6 +174,7 @@ pub struct KvmBackend {
     syscall_trampoline_address: u64,
     syscall_frame_address: u64,
     thread_group: Arc<GuestThreadGroup>,
+    thread_slot: Option<usize>,
     is_guest_thread: bool,
     pub(crate) static_elf: Option<LoadedStaticElf>,
     stdin: Option<File>,
@@ -232,6 +265,7 @@ impl KvmBackend {
             syscall_trampoline_address: SYSCALL_TRAMPOLINE_ADDRESS,
             syscall_frame_address: SYSCALL_FRAME_ADDRESS,
             thread_group: Arc::new(GuestThreadGroup::default()),
+            thread_slot: None,
             is_guest_thread: false,
             static_elf: None,
             stdin,
@@ -355,18 +389,16 @@ impl KvmBackend {
         child_tid: i32,
         thread_group: Arc<GuestThreadGroup>,
     ) -> Result<Self> {
-        let slot = u64::try_from(child_tid - 2)
-            .ok()
-            .filter(|slot| *slot < MAX_GUEST_THREADS)
-            .ok_or(Error::GuestThreadLimitExceeded(child_tid))?;
-        let syscall_trampoline_address =
-            THREAD_SYSCALL_AREA_START + slot * THREAD_SYSCALL_AREA_STRIDE;
-        let syscall_frame_address = syscall_trampoline_address + PAGE_SIZE;
         let mut child = Self::new_with_memory_and_cpuid_policy(memory, cpuid_policy, stdin)?;
-        child.syscall_trampoline_address = syscall_trampoline_address;
-        child.syscall_frame_address = syscall_frame_address;
         child.thread_group = thread_group;
         child.is_guest_thread = true;
+        let slot = child.thread_group.reserve_transport_slot(child_tid)?;
+        child.thread_slot = Some(slot);
+        let syscall_trampoline_address =
+            THREAD_SYSCALL_AREA_START + slot as u64 * THREAD_SYSCALL_AREA_STRIDE;
+        let syscall_frame_address = syscall_trampoline_address + PAGE_SIZE;
+        child.syscall_trampoline_address = syscall_trampoline_address;
+        child.syscall_frame_address = syscall_frame_address;
         configure_long_mode_with_syscall_area(
             &mut child.memory,
             &child.vcpu,
@@ -488,7 +520,7 @@ impl KvmBackend {
                 let parent_registers = self.vcpu.get_regs()?;
                 let parent_xsave = self.vcpu.get_xsave()?;
                 let (parent_fs, parent_gs) = executor.segment_bases();
-                let mut parent_syscall_frame = vec![0; PAGE_SIZE as usize];
+                let mut parent_syscall_frame = vec![0; FRAME_SIZE];
                 self.memory
                     .read_raw(self.syscall_frame_address, &mut parent_syscall_frame)?;
 
@@ -800,6 +832,9 @@ impl KvmBackend {
 
 impl Drop for KvmBackend {
     fn drop(&mut self) {
+        if let Some(slot) = self.thread_slot.take() {
+            self.thread_group.release_transport_slot(slot);
+        }
         if !self.is_guest_thread {
             self.cancel_guest_threads();
         }
@@ -868,6 +903,24 @@ fn supported_hypercall_instruction(cpuid: &CpuId) -> Result<[u8; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guest_thread_transport_slots_are_bounded_and_reusable() {
+        let group = GuestThreadGroup::default();
+        let mut slots = Vec::new();
+        for tid in 2..2 + MAX_GUEST_THREADS as i32 {
+            slots.push(group.reserve_transport_slot(tid).unwrap());
+        }
+        assert_eq!(slots, (0..MAX_GUEST_THREADS as usize).collect::<Vec<_>>());
+        assert!(matches!(
+            group.reserve_transport_slot(10_000),
+            Err(Error::GuestThreadLimitExceeded(10_000))
+        ));
+
+        let released = slots[slots.len() / 2];
+        group.release_transport_slot(released);
+        assert_eq!(group.reserve_transport_slot(10_001).unwrap(), released);
+    }
 
     #[test]
     fn clone_tid_stores_and_clear_are_best_effort() {
