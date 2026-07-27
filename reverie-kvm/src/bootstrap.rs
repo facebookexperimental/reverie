@@ -16,6 +16,7 @@ use crate::Error;
 use crate::GuestMemory;
 use crate::Result;
 use crate::VMCALL_SYSCALL_TRANSPORT;
+use crate::syscall::FRAME_SIZE;
 use crate::syscall::RESULT_WORD;
 use crate::syscall::RETURN_FLAGS_WORD;
 use crate::syscall::RETURN_RIP_WORD;
@@ -48,6 +49,9 @@ pub(crate) const THREAD_SYSCALL_AREA_STRIDE: u64 = 2 * PAGE_SIZE;
 pub(crate) const MAX_GUEST_THREADS: u64 = 160;
 pub(crate) const BOOT_RESERVED_END: u64 =
     THREAD_SYSCALL_AREA_START + THREAD_SYSCALL_AREA_STRIDE * MAX_GUEST_THREADS;
+// AUTONOMOUS-BOT-IMPLEMENTED: Isolate each KVM worker's privilege-transition state.
+// TODO-HUMAN-REVIEW(PR-179): Review the packed per-thread TSS/stack layout.
+const THREAD_TSS_OFFSET: u64 = PAGE_SIZE / 2;
 
 const EXCEPTION_VECTOR_COUNT: usize = 32;
 const IDT_ENTRY_SIZE: usize = 16;
@@ -124,11 +128,22 @@ pub(crate) fn configure_long_mode_with_syscall_area(
         return Err(Error::LongModeMemoryTooSmall);
     }
 
+    let task_state = if initialize_shared_tables {
+        (TSS_ADDRESS, EXCEPTION_STACK_BOTTOM, EXCEPTION_STACK_TOP)
+    } else {
+        worker_task_state_layout(syscall_trampoline_address, syscall_frame_address)
+    };
     if initialize_shared_tables {
         write_descriptor_tables(memory)?;
         write_page_tables(memory)?;
+    } else {
+        write_task_state(memory, task_state.0, task_state.1, task_state.2)?;
     }
     let trampoline = syscall_trampoline(hypercall_instruction, syscall_frame_address);
+    assert!(
+        initialize_shared_tables || trampoline.len() <= THREAD_TSS_OFFSET as usize,
+        "KVM syscall trampoline overlaps its private TSS"
+    );
     memory.write_raw(syscall_trampoline_address, &trampoline)?;
 
     let mut sregs = vcpu.get_sregs()?;
@@ -143,7 +158,9 @@ pub(crate) fn configure_long_mode_with_syscall_area(
     sregs.fs = user_data;
     sregs.gs = user_data;
     sregs.ss = user_data;
-    sregs.tr = tss_segment();
+    // Guest code never reloads TR, so KVM's per-vCPU segment cache can point at
+    // private task state while the shared GDT retains the root descriptor.
+    sregs.tr = tss_segment(task_state.0);
 
     sregs.cr0 |= CR0_PE | CR0_MP | CR0_ET | CR0_NE | CR0_PG;
     sregs.cr0 &= !(CR0_EM | CR0_TS);
@@ -308,10 +325,41 @@ fn write_descriptor_tables(memory: &mut GuestMemory) -> Result<()> {
     }
     memory.write_raw(GDT_ADDRESS, &bytes)?;
     write_exception_tables(memory)?;
-    memory.zero_raw(TSS_ADDRESS, 0x68)?;
-    write_u64(memory, TSS_ADDRESS + 4, EXCEPTION_STACK_TOP)?;
-    memory.write_raw(TSS_ADDRESS + 0x66, &0x68_u16.to_le_bytes())?;
-    memory.zero_raw(EXCEPTION_STACK_BOTTOM, PAGE_SIZE as usize)
+    write_task_state(
+        memory,
+        TSS_ADDRESS,
+        EXCEPTION_STACK_BOTTOM,
+        EXCEPTION_STACK_TOP,
+    )
+}
+
+fn worker_task_state_layout(
+    syscall_trampoline_address: u64,
+    syscall_frame_address: u64,
+) -> (u64, u64, u64) {
+    debug_assert_eq!(
+        syscall_frame_address,
+        syscall_trampoline_address + PAGE_SIZE
+    );
+    (
+        syscall_trampoline_address + THREAD_TSS_OFFSET,
+        syscall_frame_address + FRAME_SIZE as u64,
+        syscall_frame_address + PAGE_SIZE,
+    )
+}
+
+fn write_task_state(
+    memory: &mut GuestMemory,
+    tss_address: u64,
+    exception_stack_bottom: u64,
+    exception_stack_top: u64,
+) -> Result<()> {
+    memory.zero_raw(tss_address, 0x68)?;
+    write_u64(memory, tss_address + 4, exception_stack_top)?;
+    memory.write_raw(tss_address + 0x66, &0x68_u16.to_le_bytes())?;
+    let stack_length = usize::try_from(exception_stack_top - exception_stack_bottom)
+        .expect("KVM exception stack length must fit usize");
+    memory.zero_raw(exception_stack_bottom, stack_length)
 }
 
 fn write_exception_tables(memory: &mut GuestMemory) -> Result<()> {
@@ -452,9 +500,9 @@ fn data_segment(selector: u16, dpl: u8) -> kvm_segment {
     }
 }
 
-fn tss_segment() -> kvm_segment {
+fn tss_segment(base: u64) -> kvm_segment {
     kvm_segment {
-        base: TSS_ADDRESS,
+        base,
         limit: 0x67,
         selector: TSS_SELECTOR,
         type_: 11,
@@ -579,7 +627,7 @@ mod tests {
 
         assert!(code.windows(3).any(|window| window == [0x0f, 0x01, 0xc1]));
         assert_eq!(&code[code.len() - 3..], &[0x48, 0x0f, 0x07]);
-        assert!(code.len() < PAGE_SIZE as usize);
+        assert!(code.len() < THREAD_TSS_OFFSET as usize);
     }
 
     #[test]
@@ -609,6 +657,36 @@ mod tests {
         let mut io_map_base = [0; 2];
         memory.read(TSS_ADDRESS + 0x66, &mut io_map_base).unwrap();
         assert_eq!(u16::from_le_bytes(io_map_base), 0x68);
+    }
+
+    #[test]
+    fn worker_task_state_is_private_within_each_transport() {
+        let first_trampoline = THREAD_SYSCALL_AREA_START;
+        let first_frame = first_trampoline + PAGE_SIZE;
+        let second_trampoline = first_trampoline + THREAD_SYSCALL_AREA_STRIDE;
+        let second_frame = second_trampoline + PAGE_SIZE;
+        let first = worker_task_state_layout(first_trampoline, first_frame);
+        let second = worker_task_state_layout(second_trampoline, second_frame);
+
+        assert_eq!(first.0, first_trampoline + THREAD_TSS_OFFSET);
+        assert_eq!(first.1, first_frame + FRAME_SIZE as u64);
+        assert_eq!(first.2, second_trampoline);
+        assert!(first.2 <= second.0);
+
+        let mut memory = GuestMemory::new(0, 0x20_000).unwrap();
+        memory
+            .write_raw(first.1, &vec![0xff; (first.2 - first.1) as usize])
+            .unwrap();
+        write_task_state(&mut memory, first.0, first.1, first.2).unwrap();
+
+        let mut rsp0 = [0; 8];
+        memory.read(first.0 + 4, &mut rsp0).unwrap();
+        assert_eq!(u64::from_le_bytes(rsp0), first.2);
+        assert_eq!(tss_segment(first.0).base, first.0);
+        let mut stack_edges = [0xff; 2];
+        memory.read(first.1, &mut stack_edges[..1]).unwrap();
+        memory.read(first.2 - 1, &mut stack_edges[1..]).unwrap();
+        assert_eq!(stack_edges, [0, 0]);
     }
 
     #[test]
