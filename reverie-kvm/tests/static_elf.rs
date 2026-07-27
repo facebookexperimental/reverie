@@ -301,6 +301,18 @@ impl Tool for RpcRoundTripTool {
         };
         Ok(guest.send_rpc(ordinal).await as i64)
     }
+
+    async fn on_exit_thread<G: GlobalRPC<Self::GlobalState>>(
+        &self,
+        _tid: Pid,
+        global: &G,
+        thread_state: Self::ThreadState,
+        _status: ExitStatus,
+    ) -> Result<(), reverie::Error> {
+        let ordinal = thread_state + 1;
+        assert_eq!(global.send_rpc(ordinal).await, *global.config() + ordinal);
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1608,8 +1620,9 @@ fn tool_rpc_response_reaches_intercepted_static_elf_syscall() {
 
     // Each getpid is intercepted instead of injected. The local tool advances
     // its ThreadState, sends the ordinal to GlobalState, and returns the typed
-    // RPC response as the guest-visible syscall result. Exit 1 if either half
-    // of the round trip produced an unexpected value.
+    // RPC response as the guest-visible syscall result. The exit hook then
+    // sends a third typed RPC through the lifecycle GlobalRPC handle. Exit 1
+    // if either guest-visible round trip produced an unexpected value.
     let code = [
         0x45, 0x31, 0xe4, // xor r12d, r12d
         0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax, SYS_getpid
@@ -1642,7 +1655,11 @@ fn tool_rpc_response_reaches_intercepted_static_elf_syscall() {
     assert!(stderr.is_empty());
     assert_eq!(
         log.requests(),
-        vec![(Pid::from_raw(1), 1), (Pid::from_raw(1), 2)]
+        vec![
+            (Pid::from_raw(1), 1),
+            (Pid::from_raw(1), 2),
+            (Pid::from_raw(1), 3),
+        ]
     );
 }
 
