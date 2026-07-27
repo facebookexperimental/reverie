@@ -31,11 +31,12 @@
 //! calls it resolves on its first poll, so the DBI driver's `run_ready` never
 //! spins waiting on a cross-thread wake for an RPC.
 
+use std::cell::RefCell;
 use std::io::Read;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
-use std::sync::Mutex;
-use std::sync::OnceLock;
+use std::path::Path;
+use std::path::PathBuf;
 
 use reverie::Tid;
 use serde::Serialize;
@@ -90,33 +91,41 @@ fn read_frame(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// The process-wide client connection, established lazily on first use from
-/// [`RPC_SOCKET_ENV`]. `None` means no coordinator is configured, so callers
-/// fall back to the in-process `GlobalState::receive_rpc`.
-static CLIENT: OnceLock<Option<Mutex<UnixStream>>> = OnceLock::new();
+struct Connection {
+    pid: u32,
+    path: PathBuf,
+    stream: UnixStream,
+}
 
-fn client() -> Option<&'static Mutex<UnixStream>> {
-    CLIENT
-        .get_or_init(|| {
-            let path = std::env::var_os(RPC_SOCKET_ENV)?;
-            let mut stream = UnixStream::connect(&path).unwrap_or_else(|error| {
-                panic!(
-                    "reverie-dbi sync_rpc: failed to connect to coordinator at {path:?}: {error}"
-                )
-            });
-            // Consume the server's one-shot config handshake frame.
-            let _config = read_frame(&mut stream).unwrap_or_else(|error| {
-                panic!("reverie-dbi sync_rpc: failed to read config handshake: {error}")
-            });
-            Some(Mutex::new(stream))
-        })
-        .as_ref()
+impl Connection {
+    fn connect(path: &Path, pid: u32) -> Self {
+        let mut stream = UnixStream::connect(path).unwrap_or_else(|error| {
+            panic!("reverie-dbi sync_rpc: failed to connect to coordinator at {path:?}: {error}")
+        });
+        // Consume the server's one-shot config handshake frame.
+        let _config = read_frame(&mut stream).unwrap_or_else(|error| {
+            panic!("reverie-dbi sync_rpc: failed to read config handshake: {error}")
+        });
+        Self {
+            pid,
+            path: path.to_path_buf(),
+            stream,
+        }
+    }
+}
+
+// A connection is intentionally thread-local. DBI callbacks are synchronous,
+// and independent connections avoid cross-thread head-of-line blocking. More
+// importantly, a fork child inherits only the calling thread's slot: the pid
+// check below drops its inherited parent socket and reconnects before sending.
+thread_local! {
+    static CLIENT: RefCell<Option<Connection>> = const { RefCell::new(None) };
 }
 
 /// True when a coordinator socket is configured, i.e. `send_rpc` should route to
 /// the shared cross-process `GlobalState` instead of the in-process one.
 pub fn is_active() -> bool {
-    client().is_some()
+    std::env::var_os(RPC_SOCKET_ENV).is_some()
 }
 
 /// Perform one blocking request/response round-trip against the coordinator.
@@ -130,14 +139,30 @@ where
     Req: Serialize,
     Resp: DeserializeOwned,
 {
-    let mutex = client().expect("reverie-dbi sync_rpc: no coordinator socket configured");
-    let mut stream = mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let request_bytes = encode(&RequestEnvelope { from, request });
-    write_frame(&mut stream, &request_bytes)
-        .expect("reverie-dbi sync_rpc: failed to write request frame");
-    let response_bytes =
-        read_frame(&mut stream).expect("reverie-dbi sync_rpc: failed to read response frame");
-    decode(&response_bytes)
+    let path = PathBuf::from(
+        std::env::var_os(RPC_SOCKET_ENV)
+            .expect("reverie-dbi sync_rpc: no coordinator socket configured"),
+    );
+    let pid = std::process::id();
+
+    CLIENT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let must_connect = !matches!(
+            slot.as_ref(),
+            Some(connection) if connection.pid == pid && connection.path == path
+        );
+        if must_connect {
+            *slot = Some(Connection::connect(&path, pid));
+        }
+
+        let connection = slot
+            .as_mut()
+            .expect("reverie-dbi sync_rpc: connection initialization failed");
+        let request_bytes = encode(&RequestEnvelope { from, request });
+        write_frame(&mut connection.stream, &request_bytes)
+            .expect("reverie-dbi sync_rpc: failed to write request frame");
+        let response_bytes = read_frame(&mut connection.stream)
+            .expect("reverie-dbi sync_rpc: failed to read response frame");
+        decode(&response_bytes)
+    })
 }
