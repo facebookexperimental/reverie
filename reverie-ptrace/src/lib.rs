@@ -53,6 +53,8 @@ mod vdso;
 
 pub use backend::PtraceBackend;
 pub use perf::is_perf_supported;
+pub use timer::PmuConfig;
+pub use timer::set_pmu_config;
 pub use tracer::GdbConnection;
 pub use tracer::Tracer;
 pub use tracer::TracerBuilder;

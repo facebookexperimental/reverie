@@ -32,7 +32,7 @@
 use std::cmp::Ordering::Equal;
 use std::cmp::Ordering::Greater;
 use std::cmp::Ordering::Less;
-use std::sync::LazyLock;
+use std::sync::OnceLock;
 
 use reverie::Errno;
 use reverie::Pid;
@@ -66,14 +66,19 @@ const AMD_DEFAULT_SKID_MARGIN: u64 = 10_000;
 #[cfg(target_arch = "x86_64")]
 const AMD_EPYC_9D85_SKID_MARGIN: u64 = 1_000;
 
-pub fn get_pmu_config() -> &'static PmuConfig {
-    static PMU_CONFIG: LazyLock<PmuConfig> = LazyLock::new(PmuConfig::new);
-    &PMU_CONFIG
+static PMU_CONFIG: OnceLock<PmuConfig> = OnceLock::new();
+
+pub(crate) fn get_pmu_config() -> &'static PmuConfig {
+    PMU_CONFIG.get_or_init(PmuConfig::new)
 }
 
+/// Processor-specific PMU event settings used by precise ptrace timers.
+// TODO-HUMAN-REVIEW(PR-186): Review the programmatic PMU skid-margin override API.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PmuConfig {
     rcb_event: u64,
     skid_margin: u64,
+    skid_margin_override: Option<u64>,
 }
 
 impl PmuConfig {
@@ -102,6 +107,7 @@ impl PmuConfig {
         Self {
             rcb_event: BR_RETIRED,
             skid_margin: 1000,
+            skid_margin_override: None,
         }
     }
 
@@ -146,7 +152,14 @@ impl PmuConfig {
         Self {
             rcb_event,
             skid_margin,
+            skid_margin_override: None,
         }
+    }
+
+    /// Overrides the processor-specific skid margin while preserving the detected PMU event.
+    pub fn with_skid_margin_override(mut self, skid_margin: u64) -> Self {
+        self.skid_margin_override = Some(skid_margin);
+        self
     }
 
     /// This is the experimentally determined maximum number of RCBs an overflow
@@ -157,14 +170,14 @@ impl PmuConfig {
     /// number is too big, we degrade performance from excessive single
     /// stepping.
     pub fn skid_margin(&self) -> u64 {
-        self.skid_margin
+        self.skid_margin_override.unwrap_or(self.skid_margin)
     }
 
     /// The maximum single step count we expect can occur when a precise timer
     /// event is requested that leaves less than the minimum perf timeout
     /// remaining.
     pub fn max_single_step_count(&self) -> u64 {
-        self.skid_margin + SINGLESTEP_TIMEOUT_RCBS
+        self.skid_margin().saturating_add(SINGLESTEP_TIMEOUT_RCBS)
     }
 
     /// The event needed to configure the PMU and observe RCBs.
@@ -172,9 +185,24 @@ impl PmuConfig {
         Event::Raw(self.rcb_event)
     }
 
+    /// Returns the raw perf event selector for retired conditional branches.
     pub fn raw_rcb_event(&self) -> u64 {
         self.rcb_event
     }
+}
+
+impl Default for PmuConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Installs the PMU configuration used by subsequently created ptrace timers.
+///
+/// Returns the supplied configuration if a timer has already initialized the process-wide
+/// configuration. Callers should install overrides before spawning a [`crate::Tracer`].
+pub fn set_pmu_config(config: PmuConfig) -> Result<(), PmuConfig> {
+    PMU_CONFIG.set(config)
 }
 
 /// Returns true if the current CPU supports precise_ip.
@@ -891,6 +919,16 @@ mod tests {
             assert_eq!(config.raw_rcb_event(), 0x5100d1);
             assert_eq!(config.skid_margin(), 10_000);
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn explicit_skid_margin_overrides_processor_default() {
+        let config = PmuConfig::from_family_model(0x1A, 0x11).with_skid_margin_override(500);
+
+        assert_eq!(config.raw_rcb_event(), 0x5100d1);
+        assert_eq!(config.skid_margin(), 500);
+        assert_eq!(config.max_single_step_count(), 505);
     }
 
     #[test_case(ClockCounter::new(0, 0, 10), 0, 1, Some(true))]
