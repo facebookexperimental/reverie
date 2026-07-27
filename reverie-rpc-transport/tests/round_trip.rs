@@ -116,6 +116,33 @@ async fn aggregates_across_many_connections() {
 }
 
 #[tokio::test]
+async fn aborting_server_drops_live_connection_tasks() {
+    let global = std::sync::Arc::new(Counter::default());
+    let path = unique_sock_path("abort-connections");
+    let server = RpcServer::bind(&path, global.clone(), "cfg".to_string()).unwrap();
+    let server_path = server.path().to_path_buf();
+    let handle = tokio::spawn(async move { server.serve().await });
+
+    let client = RpcClient::<Counter>::connect(&server_path, Tid::from_raw(8))
+        .await
+        .expect("connect");
+    assert_eq!(client.config(), "cfg");
+    assert_eq!(std::sync::Arc::strong_count(&global), 3);
+
+    handle.abort();
+    assert!(handle.await.unwrap_err().is_cancelled());
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while std::sync::Arc::strong_count(&global) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("connection task retained the shared global after server shutdown");
+
+    drop(client);
+}
+
+#[tokio::test]
 async fn single_connection_round_trip_values() {
     let global = std::sync::Arc::new(Counter::default());
     let path = unique_sock_path("single");

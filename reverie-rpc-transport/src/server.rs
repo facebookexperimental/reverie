@@ -130,13 +130,16 @@ where
     /// Per-connection errors are not fatal to the server: a guest that
     /// disconnects (cleanly or otherwise) simply ends its own task.
     pub async fn serve(self) -> Result<(), RpcError> {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-170): Review connection cancellation on server shutdown.
+        let mut connections = tokio::task::JoinSet::new();
         loop {
             let (stream, _addr) = self.listener.accept().await?;
             let global = self.global.clone();
             let config = self.config.clone();
             let readiness = self.readiness.clone();
             let connection_readiness = self.connection_readiness.clone();
-            tokio::spawn(async move {
+            connections.spawn(async move {
                 if let Err(e) =
                     serve_connection_inner(global, config, stream, readiness, connection_readiness)
                         .await
