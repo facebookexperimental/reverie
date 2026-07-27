@@ -121,6 +121,9 @@ struct GuestThreadGroup {
     exit_code: Mutex<Option<i32>>,
     root: Mutex<Option<libc::pthread_t>>,
     workers: Mutex<Vec<libc::pthread_t>>,
+    // AUTONOMOUS-BOT-IMPLEMENTED: Join cancelled KVM workers before root teardown returns.
+    // TODO-HUMAN-REVIEW(PR-178): Review KVM worker join ordering.
+    worker_handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
     transport_slots: Mutex<Vec<bool>>,
 }
 
@@ -147,6 +150,33 @@ impl GuestThreadGroup {
             // SAFETY: the registry lock keeps each pthread ID live for this call.
             unsafe {
                 libc::pthread_kill(worker, worker_interrupt_signal());
+            }
+        }
+    }
+
+    fn add_worker_handle(&self, handle: std::thread::JoinHandle<()>) {
+        self.worker_handles
+            .lock()
+            .expect("KVM guest worker-handle lock poisoned")
+            .push(handle);
+    }
+
+    fn join_workers(&self) {
+        // A worker may register a nested clone while an earlier batch is joining.
+        loop {
+            let handles = std::mem::take(
+                &mut *self
+                    .worker_handles
+                    .lock()
+                    .expect("KVM guest worker-handle lock poisoned"),
+            );
+            if handles.is_empty() {
+                return;
+            }
+            for handle in handles {
+                if handle.join().is_err() {
+                    eprintln!("reverie-kvm guest thread panicked during teardown");
+                }
             }
         }
     }
@@ -665,7 +695,7 @@ impl KvmBackend {
                             eprintln!("reverie-kvm guest thread {child_tid} failed: {error}");
                         }
                     })?;
-                drop(handle);
+                self.thread_group.add_worker_handle(handle);
             }
             ProcessAction::Exec { image, argv, envp } => {
                 set_syscall_return_park(
@@ -734,6 +764,9 @@ impl KvmBackend {
         let _registration = self.register_guest_thread()?;
         loop {
             if let Some(code) = self.guest_thread_group_exit_code() {
+                if !self.is_guest_thread {
+                    self.cancel_guest_threads();
+                }
                 let (stdout, stderr) = executor.take_output();
                 return Ok((code, stdout, stderr));
             }
@@ -829,19 +862,24 @@ impl KvmBackend {
     // TODO-HUMAN-REVIEW(PR-172): Review signal-driven KVM worker cancellation.
     pub(crate) fn cancel_guest_threads(&self) {
         self.thread_group.cancelled.store(true, Ordering::Release);
-        let workers = self
-            .thread_group
-            .workers
-            .lock()
-            .expect("KVM guest worker lock poisoned");
-        for &worker in workers.iter() {
-            // SAFETY: worker was registered by a live guest host thread. The
-            // registry lock prevents it from unregistering and exiting before
-            // pthread_kill consumes the ID. The no-op handler exists only to
-            // interrupt its blocking host syscall.
-            unsafe {
-                libc::pthread_kill(worker, worker_interrupt_signal());
+        {
+            let workers = self
+                .thread_group
+                .workers
+                .lock()
+                .expect("KVM guest worker lock poisoned");
+            for &worker in workers.iter() {
+                // SAFETY: worker was registered by a live guest host thread. The
+                // registry lock prevents it from unregistering and exiting before
+                // pthread_kill consumes the ID. The no-op handler exists only to
+                // interrupt its blocking host syscall.
+                unsafe {
+                    libc::pthread_kill(worker, worker_interrupt_signal());
+                }
             }
+        }
+        if !self.is_guest_thread {
+            self.thread_group.join_workers();
         }
     }
 
@@ -1019,6 +1057,28 @@ mod tests {
         let released = slots[slots.len() / 2];
         group.release_transport_slot(released);
         assert_eq!(group.reserve_transport_slot(10_001).unwrap(), released);
+    }
+
+    #[test]
+    fn guest_thread_group_joins_registered_workers() {
+        let group = Arc::new(GuestThreadGroup::default());
+        let outer_finished = Arc::new(AtomicBool::new(false));
+        let nested_finished = Arc::new(AtomicBool::new(false));
+        let worker_group = group.clone();
+        let worker_finished = outer_finished.clone();
+        let child_finished = nested_finished.clone();
+        group.add_worker_handle(std::thread::spawn(move || {
+            worker_group.add_worker_handle(std::thread::spawn(move || {
+                child_finished.store(true, Ordering::Release);
+            }));
+            worker_finished.store(true, Ordering::Release);
+        }));
+
+        group.join_workers();
+
+        assert!(outer_finished.load(Ordering::Acquire));
+        assert!(nested_finished.load(Ordering::Acquire));
+        assert!(group.worker_handles.lock().unwrap().is_empty());
     }
 
     #[test]

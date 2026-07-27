@@ -857,9 +857,12 @@ fn worker_exit_group_terminates_the_root_with_its_status() {
         } else {
             backend.run_static_elf().unwrap()
         };
+        let mut child_tid = [0; std::mem::size_of::<i32>()];
+        backend.memory().read(CHILD_TID, &mut child_tid).unwrap();
         let remained_blocked = set_interrupt_signal_blocked(was_blocked);
         assert!(remained_blocked, "with_tool={with_tool}");
         assert_eq!(exit_code, 37, "with_tool={with_tool}");
+        assert_eq!(i32::from_le_bytes(child_tid), 0, "with_tool={with_tool}");
     }
 }
 
