@@ -33,7 +33,10 @@ use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::PathPtr;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::Sysno;
+use reverie_kvm::CounterTool;
 use reverie_kvm::Error;
+use reverie_kvm::HierarchicalCounterTool;
+use reverie_kvm::HierarchicalTotals;
 use reverie_kvm::KvmBackend;
 use reverie_kvm::StraceTool;
 
@@ -231,6 +234,72 @@ impl Tool for StartExecTool {
     async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
         guest.send_rpc(()).await;
         Ok(())
+    }
+}
+
+#[derive(Default)]
+struct RpcRoundTripLog {
+    response_base: u64,
+    requests: Mutex<Vec<(Pid, u64)>>,
+}
+
+impl RpcRoundTripLog {
+    fn requests(&self) -> Vec<(Pid, u64)> {
+        self.requests
+            .lock()
+            .expect("RPC round-trip log lock poisoned")
+            .clone()
+    }
+}
+
+#[reverie::global_tool]
+impl GlobalTool for RpcRoundTripLog {
+    type Request = u64;
+    type Response = u64;
+    type Config = u64;
+
+    async fn init_global_state(response_base: &u64) -> Self {
+        Self {
+            response_base: *response_base,
+            requests: Mutex::default(),
+        }
+    }
+
+    async fn receive_rpc(&self, from: Pid, ordinal: u64) -> u64 {
+        self.requests
+            .lock()
+            .expect("RPC round-trip log lock poisoned")
+            .push((from, ordinal));
+        self.response_base + ordinal
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RpcRoundTripTool;
+
+#[reverie::tool]
+impl Tool for RpcRoundTripTool {
+    type GlobalState = RpcRoundTripLog;
+    type ThreadState = u64;
+
+    fn subscriptions(_config: &u64) -> Subscription {
+        let mut subscriptions = Subscription::none();
+        subscriptions.syscall(Sysno::getpid);
+        subscriptions
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, reverie::Error> {
+        assert!(matches!(syscall, Syscall::Getpid(_)));
+        let ordinal = {
+            let ordinal = guest.thread_state_mut();
+            *ordinal += 1;
+            *ordinal
+        };
+        Ok(guest.send_rpc(ordinal).await as i64)
     }
 }
 
@@ -1523,6 +1592,111 @@ fn strace_tool_logs_syscalls_from_static_elf() {
             "write".to_string(),
             "exit_group".to_string(),
         ],
+    );
+}
+
+#[test]
+fn tool_rpc_response_reaches_intercepted_static_elf_syscall() {
+    match Kvm::new() {
+        Ok(_) => {}
+        Err(error) if kvm_is_unavailable(&error) => {
+            eprintln!("skipping KVM RPC round-trip test: cannot open /dev/kvm: {error}");
+            return;
+        }
+        Err(error) => panic!("failed to probe /dev/kvm: {error}"),
+    }
+
+    // Each getpid is intercepted instead of injected. The local tool advances
+    // its ThreadState, sends the ordinal to GlobalState, and returns the typed
+    // RPC response as the guest-visible syscall result. Exit 1 if either half
+    // of the round trip produced an unexpected value.
+    let code = [
+        0x45, 0x31, 0xe4, // xor r12d, r12d
+        0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax, SYS_getpid
+        0x0f, 0x05, // syscall
+        0x3d, 0xe9, 0x03, 0x00, 0x00, // cmp eax, 1001
+        0x41, 0x0f, 0x95, 0xc4, // setne r12b
+        0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax, SYS_getpid
+        0x0f, 0x05, // syscall
+        0x3d, 0xea, 0x03, 0x00, 0x00, // cmp eax, 1002
+        0x0f, 0x95, 0xc0, // setne al
+        0x0f, 0xb6, 0xc0, // movzx eax, al
+        0x41, 0x09, 0xc4, // or r12d, eax
+        0x44, 0x89, 0xe7, // mov edi, r12d
+        0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax, SYS_exit_group
+        0x0f, 0x05, // syscall
+        0x0f, 0x0b, // ud2
+    ];
+    let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+    backend
+        .install_static_elf(&static_elf(&code), "/bin/rpc-round-trip")
+        .unwrap();
+
+    let (log, exit_code, stdout, stderr) = futures::executor::block_on(
+        backend.run_static_elf_with_tool::<RpcRoundTripTool>(1000, true),
+    )
+    .unwrap();
+
+    assert_eq!(exit_code, 0);
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+    assert_eq!(
+        log.requests(),
+        vec![(Pid::from_raw(1), 1), (Pid::from_raw(1), 2)]
+    );
+}
+
+#[test]
+fn counter_tools_aggregate_intercepted_static_elf_syscalls() {
+    match Kvm::new() {
+        Ok(_) => {}
+        Err(error) if kvm_is_unavailable(&error) => {
+            eprintln!("skipping KVM counter-ELF test: cannot open /dev/kvm: {error}");
+            return;
+        }
+        Err(error) => panic!("failed to probe /dev/kvm: {error}"),
+    }
+
+    let code = [
+        0xb8, 0x27, 0x00, 0x00, 0x00, 0x0f, 0x05, // getpid
+        0xb8, 0x27, 0x00, 0x00, 0x00, 0x0f, 0x05, // getpid
+        0xb8, 0xe7, 0x00, 0x00, 0x00, // exit_group
+        0x31, 0xff, 0x0f, 0x05, // status 0; syscall
+        0x0f, 0x0b, // ud2
+    ];
+    let image = static_elf(&code);
+
+    let mut direct_backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+    direct_backend
+        .install_static_elf(&image, "/bin/counter-rpc")
+        .unwrap();
+    let (counter, exit_code, stdout, stderr) = futures::executor::block_on(
+        direct_backend.run_static_elf_with_tool::<CounterTool>((), true),
+    )
+    .unwrap();
+    assert_eq!(exit_code, 0);
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+    assert_eq!(counter.total(), 3);
+
+    let mut hierarchical_backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+    hierarchical_backend
+        .install_static_elf(&image, "/bin/hierarchical-counter-rpc")
+        .unwrap();
+    let (counter, exit_code, stdout, stderr) = futures::executor::block_on(
+        hierarchical_backend.run_static_elf_with_tool::<HierarchicalCounterTool>((), true),
+    )
+    .unwrap();
+    assert_eq!(exit_code, 0);
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+    assert_eq!(
+        counter.totals(),
+        HierarchicalTotals {
+            total_syscalls: 3,
+            exited_procs: 1,
+            exited_threads: 1,
+        }
     );
 }
 
