@@ -49,9 +49,10 @@ run to completion before the parent resumes. Legacy process clones support
 `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID`, and `CLONE_CHILD_CLEARTID`. A
 bounded glibc pthread clone profile can run child threads that complete without
 parent or sibling progress: each child runs to completion on the shared vCPU
-before its parent resumes. The tool runtime keeps the root tool's `GlobalState`;
-child process and thread syscalls currently execute through the KVM personality
-without per-child tool lifecycle callbacks.
+before its parent resumes. Forked processes receive independent process/thread
+tool state, run subscribed syscall and lifecycle callbacks, and contribute to
+the root tool's shared `GlobalState`. `CLONE_THREAD` workers still execute
+through the KVM personality without per-thread tool lifecycle callbacks.
 
 ## Typed syscall decoding
 

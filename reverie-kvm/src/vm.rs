@@ -26,6 +26,8 @@ use kvm_ioctls::Kvm;
 use kvm_ioctls::VcpuExit;
 use kvm_ioctls::VcpuFd;
 use kvm_ioctls::VmFd;
+use reverie::Pid;
+use reverie::Tool;
 
 use crate::CpuidPolicy;
 use crate::Error;
@@ -51,6 +53,7 @@ use crate::elf::load_static_elf;
 use crate::executor::ElfExecutor;
 use crate::executor::ProcessAction;
 use crate::runtime::SyscallExecutor;
+use crate::runtime::ToolContext;
 use crate::syscall::FRAME_SIZE;
 
 /// KVM currently permits userspace exits for this standardized hypercall.
@@ -281,6 +284,12 @@ struct KvmProcessSnapshot {
     xsave: kvm_xsave,
     stdin: Option<File>,
     cpuid_policy: CpuidPolicy,
+}
+
+struct ForkedProcess {
+    pid: i32,
+    backend: KvmBackend,
+    executor: ElfExecutor,
 }
 
 impl KvmBackend {
@@ -538,6 +547,91 @@ impl KvmBackend {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_forked_process(
+        &mut self,
+        executor: &ElfExecutor,
+        child_pid: i32,
+        child_stack: Option<u64>,
+        parent_tid: Option<u64>,
+        child_tid: Option<u64>,
+        clear_child_tid: Option<u64>,
+        clear_sighand: bool,
+        park_syscall_return: bool,
+    ) -> Result<ForkedProcess> {
+        let mut child_executor = executor.fork_child(child_pid, clear_sighand)?;
+        child_executor.set_clear_child_tid(clear_child_tid);
+        if park_syscall_return {
+            set_syscall_return_park(
+                &mut self.memory,
+                self.hypercall_instruction,
+                self.syscall_trampoline_address,
+                self.syscall_frame_address,
+                true,
+            )?;
+            let parked = match self.vcpu.run()? {
+                VcpuExit::Hlt => Ok(()),
+                exit => Err(Error::UnexpectedVcpuExit(format!(
+                    "parent did not park at fork: {exit:?}"
+                ))),
+            };
+            set_syscall_return_park(
+                &mut self.memory,
+                self.hypercall_instruction,
+                self.syscall_trampoline_address,
+                self.syscall_frame_address,
+                false,
+            )?;
+            parked?;
+        }
+        let child_snapshot = self.snapshot_process()?;
+        write_tid_best_effort(&mut self.memory, parent_tid, child_pid);
+
+        let mut child = Self::from_process_snapshot(child_snapshot)?;
+        write_tid_best_effort(&mut child.memory, child_tid, child_pid);
+        let (fs_base, gs_base) = child_executor.segment_bases();
+        set_user_segment_base(&child.vcpu, SegmentBase::Fs, fs_base)?;
+        set_user_segment_base(&child.vcpu, SegmentBase::Gs, gs_base)?;
+        configure_process_syscall_return(
+            &child.memory,
+            &child.vcpu,
+            child.syscall_frame_address,
+            0,
+            child_stack,
+        )?;
+        Ok(ForkedProcess {
+            pid: child_pid,
+            backend: child,
+            executor: child_executor,
+        })
+    }
+
+    fn finish_forked_process(
+        &mut self,
+        executor: &mut ElfExecutor,
+        mut child: ForkedProcess,
+        code: i32,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    ) -> Result<()> {
+        // A process clone has a private snapshot, so no surviving task can
+        // observe this clear; preserve the child-side ABI.
+        write_tid_best_effort(
+            &mut child.backend.memory,
+            child.executor.take_clear_child_tid(),
+            0,
+        );
+        executor.record_child_exit(child.pid, code);
+        executor.append_output(stdout, stderr);
+        configure_process_syscall_return(
+            &self.memory,
+            &self.vcpu,
+            self.syscall_frame_address,
+            i64::from(child.pid),
+            None,
+        )
+    }
+
     // TODO-HUMAN-REVIEW(PR-156): Review process actions completed during Tool injection.
     pub(crate) fn run_process_action(
         &mut self,
@@ -554,59 +648,19 @@ impl KvmBackend {
                 clear_child_tid,
                 clear_sighand,
             } => {
-                let mut child_executor = executor.fork_child(child_pid, clear_sighand)?;
-                child_executor.set_clear_child_tid(clear_child_tid);
-                if park_syscall_return {
-                    set_syscall_return_park(
-                        &mut self.memory,
-                        self.hypercall_instruction,
-                        self.syscall_trampoline_address,
-                        self.syscall_frame_address,
-                        true,
-                    )?;
-                    let parked = match self.vcpu.run()? {
-                        VcpuExit::Hlt => Ok(()),
-                        exit => Err(Error::UnexpectedVcpuExit(format!(
-                            "parent did not park at fork: {exit:?}"
-                        ))),
-                    };
-                    set_syscall_return_park(
-                        &mut self.memory,
-                        self.hypercall_instruction,
-                        self.syscall_trampoline_address,
-                        self.syscall_frame_address,
-                        false,
-                    )?;
-                    parked?;
-                }
-                let child_snapshot = self.snapshot_process()?;
-                write_tid_best_effort(&mut self.memory, parent_tid, child_pid);
-
-                let mut child = Self::from_process_snapshot(child_snapshot)?;
-                write_tid_best_effort(&mut child.memory, child_tid, child_pid);
-                let (fs_base, gs_base) = child_executor.segment_bases();
-                set_user_segment_base(&child.vcpu, SegmentBase::Fs, fs_base)?;
-                set_user_segment_base(&child.vcpu, SegmentBase::Gs, gs_base)?;
-                configure_process_syscall_return(
-                    &child.memory,
-                    &child.vcpu,
-                    child.syscall_frame_address,
-                    0,
+                let mut child = self.prepare_forked_process(
+                    executor,
+                    child_pid,
                     child_stack,
+                    parent_tid,
+                    child_tid,
+                    clear_child_tid,
+                    clear_sighand,
+                    park_syscall_return,
                 )?;
-                let (code, stdout, stderr) = child.run_static_elf_process(&mut child_executor)?;
-                // A process clone has a private snapshot, so no surviving task can
-                // observe this clear; preserve the child-side ABI.
-                write_tid_best_effort(&mut child.memory, child_executor.take_clear_child_tid(), 0);
-                executor.record_child_exit(child_pid, code);
-                executor.append_output(stdout, stderr);
-                configure_process_syscall_return(
-                    &self.memory,
-                    &self.vcpu,
-                    self.syscall_frame_address,
-                    i64::from(child_pid),
-                    None,
-                )?;
+                let (code, stdout, stderr) =
+                    child.backend.run_static_elf_process(&mut child.executor)?;
+                self.finish_forked_process(executor, child, code, stdout, stderr)?;
             }
             // TODO-HUMAN-REVIEW(PR-172): Review concurrent CLONE_THREAD lifecycle semantics.
             ProcessAction::Thread {
@@ -732,6 +786,55 @@ impl KvmBackend {
             }
         }
         Ok(())
+    }
+
+    // TODO-HUMAN-REVIEW(PR-192): Review tool lifecycle for KVM fork children.
+    pub(crate) async fn run_process_action_with_tool<T: Tool>(
+        &mut self,
+        executor: &mut ElfExecutor,
+        action: ProcessAction,
+        park_syscall_return: bool,
+        context: ToolContext<'_, T>,
+    ) -> Result<()> {
+        let ProcessAction::Fork {
+            child_pid,
+            child_stack,
+            parent_tid,
+            child_tid,
+            clear_child_tid,
+            clear_sighand,
+        } = action
+        else {
+            return self.run_process_action(executor, action, park_syscall_return);
+        };
+
+        let mut child = self.prepare_forked_process(
+            executor,
+            child_pid,
+            child_stack,
+            parent_tid,
+            child_tid,
+            clear_child_tid,
+            clear_sighand,
+            park_syscall_return,
+        )?;
+
+        let child_pid = Pid::from_raw(child.pid);
+        let child_tool = T::new(child_pid, context.config);
+        let child_thread_state =
+            child_tool.init_thread_state(child_pid, Some((context.pid, context.thread_state)));
+        let (code, stdout, stderr) = Box::pin(child.backend.run_static_elf_process_with_tool(
+            &mut child.executor,
+            child_pid,
+            child_tool,
+            child_thread_state,
+            context.global_state,
+            context.config,
+            context.subscriptions,
+            false,
+        ))
+        .await?;
+        self.finish_forked_process(executor, child, code, stdout, stderr)
     }
 
     pub(crate) fn static_elf_halt_error(&self) -> Result<Error> {

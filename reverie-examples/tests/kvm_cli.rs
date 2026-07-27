@@ -162,6 +162,63 @@ fn production_example_clis_run_real_program_with_kvm_guest() {
 }
 
 #[test]
+fn counter2_matches_ptrace_fork_process_and_thread_counts() {
+    if !kvm_available() {
+        return;
+    }
+
+    let workload = "for i in 1 2 3 4; do /bin/true; done; printf 'fork-parity\\n'";
+    let ptrace = run(
+        env!("CARGO_BIN_EXE_counter2"),
+        &["--no-host-envs", "--", "/bin/sh", "-c", workload],
+    );
+    let kvm = run(
+        env!("CARGO_BIN_EXE_reverie-kvm-counter2"),
+        &["/bin/sh", "-c", workload],
+    );
+
+    assert_success(&ptrace);
+    assert_success(&kvm);
+    assert_eq!(ptrace.stdout, b"fork-parity\n");
+    assert_eq!(kvm.stdout, ptrace.stdout);
+
+    for output in [&ptrace, &kvm] {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(stderr.matches("counter2-local thread=").count(), 5);
+        assert!(stderr.contains("from 5 processes, 5 thread(s)"), "{stderr}");
+    }
+}
+
+#[test]
+fn strace_observes_syscalls_from_forked_kvm_processes() {
+    if !kvm_available() {
+        return;
+    }
+
+    let output = run(
+        env!("CARGO_BIN_EXE_strace"),
+        &[
+            "--runner",
+            "kvm",
+            "--trace",
+            "execve",
+            "--no-host-envs",
+            "--",
+            "/bin/sh",
+            "-c",
+            "for i in 1 2 3 4; do /bin/true; done",
+        ],
+    );
+
+    assert_success(&output);
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for pid in 2..=5 {
+        assert!(stderr.contains(&format!("[pid {pid}] execve(")), "{stderr}");
+    }
+}
+
+#[test]
 fn strace_observes_root_process_syscalls_with_kvm_guest() {
     if !kvm_available() {
         return;
