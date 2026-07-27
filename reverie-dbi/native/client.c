@@ -181,7 +181,8 @@ extern int32_t reverie_dbi_runtime_thread_created(
     uint64_t flags, syscall_invoker_t invoke_syscall,
     register_reader_t read_registers, register_writer_t write_registers);
 
-extern void reverie_dbi_runtime_thread_exit(prototype_counters_t *counters);
+extern void reverie_dbi_runtime_thread_exit(prototype_counters_t *counters,
+                                            int32_t tid);
 extern uint64_t reverie_dbi_runtime_image_init(void);
 extern void reverie_dbi_runtime_exec_failed(prototype_counters_t *counters,
                                             int32_t pid);
@@ -1899,7 +1900,7 @@ static void thread_exit(void *drcontext) {
   prototype_counters_t *counters = (prototype_counters_t *)drmgr_get_tls_field(
       drcontext, thread_state_index);
   if (counters != NULL && !has_copied_runtime()) {
-    reverie_dbi_runtime_thread_exit(counters);
+    reverie_dbi_runtime_thread_exit(counters, dr_get_thread_id(drcontext));
     dr_thread_free(drcontext, counters, sizeof(*counters));
   }
 }

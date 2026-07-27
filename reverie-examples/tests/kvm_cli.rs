@@ -104,20 +104,20 @@ fn production_example_clis_run_real_program_with_kvm_guest() {
     }
 
     let counter1 = run(
-        env!("CARGO_BIN_EXE_counter1"),
-        &["--runner", "kvm", "--no-host-envs", "echo", "counter1"],
+        env!("CARGO_BIN_EXE_reverie-kvm-counter1"),
+        &["/bin/echo", "counter1"],
     );
     assert_success(&counter1);
     assert_eq!(counter1.stdout, b"counter1\n");
-    assert!(String::from_utf8_lossy(&counter1.stderr).contains("observed from root process"));
+    assert!(String::from_utf8_lossy(&counter1.stderr).contains("counter1-global syscalls="));
 
     let counter2 = run(
-        env!("CARGO_BIN_EXE_counter2"),
-        &["--runner", "kvm", "--no-host-envs", "/bin/echo", "counter2"],
+        env!("CARGO_BIN_EXE_reverie-kvm-counter2"),
+        &["/bin/echo", "counter2"],
     );
     assert_success(&counter2);
     assert_eq!(counter2.stdout, b"counter2\n");
-    assert!(String::from_utf8_lossy(&counter2.stderr).contains("from 1 observed process"));
+    assert!(String::from_utf8_lossy(&counter2.stderr).contains("from 1 processes"));
 
     let noop = run(
         env!("CARGO_BIN_EXE_noop"),

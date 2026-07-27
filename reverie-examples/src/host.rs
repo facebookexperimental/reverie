@@ -34,11 +34,11 @@ mod chrome_trace;
 #[path = "../chunky_print.rs"]
 mod chunky_print;
 #[allow(dead_code)]
-#[path = "../counter1.rs"]
+#[path = "../counter1_tool.rs"]
 mod counter1;
 
 #[allow(dead_code)]
-#[path = "../counter2.rs"]
+#[path = "../counter2_tool.rs"]
 mod counter2;
 #[allow(dead_code)]
 #[path = "../noop.rs"]

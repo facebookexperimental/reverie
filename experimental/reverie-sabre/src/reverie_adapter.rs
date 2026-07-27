@@ -54,7 +54,15 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-type ThreadStateCell<T> = Arc<Mutex<Option<<T as ReverieTool>::ThreadState>>>;
+type ThreadStateCell<T> = Arc<Mutex<LocalThreadState<T>>>;
+
+struct LocalThreadState<T>
+where
+    T: ReverieTool,
+{
+    thread_state: Option<T::ThreadState>,
+    exit_handled: bool,
+}
 
 /// Runs one shared Reverie tool inside a SaBRe plugin process.
 ///
@@ -127,13 +135,24 @@ where
         let pid = current_pid();
         let state = self.thread_state(tid);
         let mut state = state.lock();
+        let LocalThreadState {
+            thread_state,
+            exit_handled,
+        } = &mut *state;
         let rpc: SabreRpc<'_, T> = SabreRpc {
             tid,
             global_state: &self.global_state,
             config: &self.config,
         };
-        let mut guest =
-            SabreGuest::new(tid, pid, &mut *state, &rpc, None, original, special_inject);
+        let mut guest = SabreGuest::new(
+            tid,
+            pid,
+            thread_state,
+            &rpc,
+            Some((&self.tool, exit_handled)),
+            original,
+            special_inject,
+        );
 
         TAIL_INJECT_RESULT.with(|slot| slot.set(None));
         match poll_once(self.tool.handle_syscall_event(&mut guest, syscall)) {
@@ -157,12 +176,24 @@ where
         let tid = Pid::from_raw(thread_id as i32);
         let state = self.thread_state(tid);
         let mut state = state.lock();
+        let LocalThreadState {
+            thread_state,
+            exit_handled,
+        } = &mut *state;
         let rpc: SabreRpc<'_, T> = SabreRpc {
             tid,
             global_state: &self.global_state,
             config: &self.config,
         };
-        let mut guest = SabreGuest::new(tid, current_pid(), &mut *state, &rpc, None, None, None);
+        let mut guest = SabreGuest::new(
+            tid,
+            current_pid(),
+            thread_state,
+            &rpc,
+            Some((&self.tool, exit_handled)),
+            None,
+            None,
+        );
         match poll_once(self.tool.handle_thread_start(&mut guest)) {
             Poll::Ready(Ok(())) => {}
             Poll::Ready(Err(error)) => {
@@ -189,10 +220,13 @@ where
         let Some(mut state_guard) = state.try_lock() else {
             return;
         };
-        let Some(state) = state_guard.take() else {
+        if state_guard.exit_handled {
+            return;
+        }
+        state_guard.exit_handled = true;
+        let Some(state) = state_guard.thread_state.take() else {
             return;
         };
-        drop(state_guard);
 
         let rpc: SabreRpc<'_, T> = SabreRpc {
             tid,
@@ -217,7 +251,12 @@ where
         self.thread_states
             .lock()
             .entry(tid.as_raw())
-            .or_insert_with(|| Arc::new(Mutex::new(Some(self.tool.init_thread_state(tid, None)))))
+            .or_insert_with(|| {
+                Arc::new(Mutex::new(LocalThreadState {
+                    thread_state: Some(self.tool.init_thread_state(tid, None)),
+                    exit_handled: false,
+                }))
+            })
             .clone()
     }
 }

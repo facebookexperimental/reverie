@@ -21,9 +21,11 @@ const TOOL_ENV: &str = "REVERIE_SABRE_TOOL";
 enum ToolKind {
     Strace,
     Counter1,
+    Counter1Exact,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-142): Review counter2 CLI selection.
     Counter2,
+    Counter2Exact,
     Noop,
 }
 
@@ -32,7 +34,9 @@ impl ToolKind {
         match self {
             Self::Strace => "strace",
             Self::Counter1 => "counter1",
+            Self::Counter1Exact => "counter1-exact",
             Self::Counter2 => "counter2",
+            Self::Counter2Exact => "counter2-exact",
             Self::Noop => "noop",
         }
     }
@@ -70,7 +74,10 @@ impl Args {
         let counter = match self.tool {
             ToolKind::Counter1 => Some(CounterTool::Counter1),
             ToolKind::Counter2 => Some(CounterTool::Counter2),
-            ToolKind::Strace | ToolKind::Noop => None,
+            ToolKind::Counter1Exact
+            | ToolKind::Counter2Exact
+            | ToolKind::Strace
+            | ToolKind::Noop => None,
         };
         if let Some(counter) = counter {
             return reverie_sabre_strace_plugin::run_counter(

@@ -1146,6 +1146,27 @@ pub fn run_tool_thread_exit<T: Tool>(
     .expect("thread-exit handler unexpectedly tail-injected")
 }
 
+/// Drives an external tool's process-exit lifecycle hook.
+pub fn run_tool_process_exit<T: Tool>(
+    tool: T,
+    pid: Pid,
+    global_state: &T::GlobalState,
+    config: &<T::GlobalState as GlobalTool>::Config,
+    exit_status: ExitStatus,
+) -> Result<(), Error> {
+    let global = DbiGlobal::<T> {
+        tid: pid,
+        global_state,
+        config,
+    };
+    let tail_result = TailInjectResult::default();
+    run_ready(
+        tool.on_exit_process(pid, &global, exit_status),
+        &tail_result,
+    )
+    .expect("process-exit handler unexpectedly tail-injected")
+}
+
 /// Drives one syscall through an external Reverie tool over [`DbiGuest`].
 #[allow(clippy::too_many_arguments)]
 pub fn run_tool_syscall<T: Tool>(
@@ -1314,7 +1335,22 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_created(
 /// `counters` must be the pointer previously passed to thread initialization.
 #[cfg(feature = "prototype-runtime")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn reverie_dbi_runtime_thread_exit(_counters: *mut PrototypeCounters) {}
+pub unsafe extern "C" fn reverie_dbi_runtime_thread_exit(
+    counters: *mut PrototypeCounters,
+    tid: i32,
+) {
+    if tools::counter2_exact_enabled() {
+        let thread_syscalls = unsafe { (*counters).observed_syscalls };
+        let _ = run_tool_thread_exit(
+            tools::counter2_exact_tool(),
+            Pid::from_raw(tid),
+            thread_syscalls,
+            tools::counter2_exact_global(),
+            &(),
+            ExitStatus::SUCCESS,
+        );
+    }
+}
 
 /// Restores prototype state after an exec syscall returns with an error.
 ///
@@ -1393,12 +1429,113 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let counters = unsafe { &mut *counters };
         counters.branches = branches;
-        counters.observed_syscalls += 1;
+        if !tools::counter2_exact_enabled() {
+            counters.observed_syscalls += 1;
+        }
         TOTAL_BRANCHES.store(branches, Ordering::Relaxed);
         TOTAL_SYSCALLS.fetch_add(1, Ordering::Relaxed);
         tools::set_emitter(emit);
 
         let raw_args = unsafe { std::slice::from_raw_parts(args, 6) };
+
+        if tools::counter1_exact_enabled() {
+            let syscall = Syscall::from_raw(
+                Sysno::from(sysnum as i32),
+                SyscallArgs::new(
+                    raw_args[0] as usize,
+                    raw_args[1] as usize,
+                    raw_args[2] as usize,
+                    raw_args[3] as usize,
+                    raw_args[4] as usize,
+                    raw_args[5] as usize,
+                ),
+            );
+            let mut thread_state = ();
+            let outcome = run_tool_syscall(
+                tools::counter1_exact_tool(),
+                context as usize,
+                Pid::from_raw(tid),
+                Pid::from_raw(pid),
+                branches,
+                &mut thread_state,
+                tools::counter1_exact_global(),
+                &(),
+                syscall,
+                invoke_syscall,
+                read_registers,
+                write_registers,
+            );
+            return match outcome {
+                Ok(DbiSyscallOutcome::ExecuteOriginal(syscall)) => {
+                    unsafe { write_deferred_syscall(syscall, deferred_sysnum, deferred_args) };
+                    2
+                }
+                Ok(DbiSyscallOutcome::Suppress(value)) => {
+                    unsafe { result.write(value) };
+                    TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+                    1
+                }
+                Err(Error::Errno(errno)) => {
+                    unsafe { result.write(-(errno.into_raw() as i64)) };
+                    TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+                    1
+                }
+                Err(_) => {
+                    unsafe { result.write(-(Errno::EIO.into_raw() as i64)) };
+                    TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+                    1
+                }
+            };
+        }
+
+        if tools::counter2_exact_enabled() {
+            let syscall = Syscall::from_raw(
+                Sysno::from(sysnum as i32),
+                SyscallArgs::new(
+                    raw_args[0] as usize,
+                    raw_args[1] as usize,
+                    raw_args[2] as usize,
+                    raw_args[3] as usize,
+                    raw_args[4] as usize,
+                    raw_args[5] as usize,
+                ),
+            );
+            let outcome = run_tool_syscall(
+                tools::counter2_exact_tool(),
+                context as usize,
+                Pid::from_raw(tid),
+                Pid::from_raw(pid),
+                branches,
+                &mut counters.observed_syscalls,
+                tools::counter2_exact_global(),
+                &(),
+                syscall,
+                invoke_syscall,
+                read_registers,
+                write_registers,
+            );
+            return match outcome {
+                Ok(DbiSyscallOutcome::ExecuteOriginal(syscall)) => {
+                    unsafe { write_deferred_syscall(syscall, deferred_sysnum, deferred_args) };
+                    2
+                }
+                Ok(DbiSyscallOutcome::Suppress(value)) => {
+                    unsafe { result.write(value) };
+                    TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+                    1
+                }
+                Err(Error::Errno(errno)) => {
+                    unsafe { result.write(-(errno.into_raw() as i64)) };
+                    TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+                    1
+                }
+                Err(_) => {
+                    unsafe { result.write(-(Errno::EIO.into_raw() as i64)) };
+                    TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+                    1
+                }
+            };
+        }
 
         // If an env-selected observation tool (syscall counter / strace) is
         // active, it handles every syscall via the standard `Tool` trait and
@@ -1511,7 +1648,22 @@ pub unsafe extern "C" fn reverie_dbi_runtime_background_init(argument: *mut c_vo
 /// Handles process exit for the built-in synchronous prototype runtime.
 #[cfg(feature = "prototype-runtime")]
 #[unsafe(no_mangle)]
-pub extern "C" fn reverie_dbi_runtime_process_exit() {}
+pub extern "C" fn reverie_dbi_runtime_process_exit() {
+    if tools::counter1_exact_enabled() {
+        tools::emit_counter1_exact_summary();
+    }
+    if tools::counter2_exact_enabled() {
+        let pid = Pid::from_raw(unsafe { libc::getpid() });
+        let _ = run_tool_process_exit(
+            tools::counter2_exact_tool().clone(),
+            pid,
+            tools::counter2_exact_global(),
+            &(),
+            ExitStatus::SUCCESS,
+        );
+        tools::emit_counter2_exact_summary();
+    }
+}
 
 /// Reports whether the built-in prototype runtime is ready for callbacks.
 #[cfg(feature = "prototype-runtime")]
@@ -1524,7 +1676,13 @@ pub extern "C" fn reverie_dbi_runtime_ready(_image_generation: u64) -> i32 {
 #[cfg(feature = "prototype-runtime")]
 #[unsafe(no_mangle)]
 pub extern "C" fn reverie_dbi_runtime_name() -> *const libc::c_char {
-    c"PrototypeTool".as_ptr()
+    if tools::counter1_exact_enabled() {
+        c"Counter1".as_ptr()
+    } else if tools::counter2_exact_enabled() {
+        c"CounterLocal".as_ptr()
+    } else {
+        c"PrototypeTool".as_ptr()
+    }
 }
 
 /// Returns process-wide prototype counters accumulated at syscall boundaries.

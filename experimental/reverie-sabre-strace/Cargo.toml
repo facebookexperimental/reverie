@@ -29,3 +29,4 @@ serde = { version = "1.0.188", features = ["derive"] }
 syscalls = { version = "0.6.7", features = ["serde"] }
 tempfile = "3.27.0"
 tokio = { version = "1.37.0", features = ["rt", "macros"] }
+tracing = "0.1.41"

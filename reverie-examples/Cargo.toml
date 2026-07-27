@@ -38,6 +38,14 @@ name = "counter2"
 path = "counter2.rs"
 
 [[bin]]
+name = "reverie-kvm-counter1"
+path = "kvm_counter1.rs"
+
+[[bin]]
+name = "reverie-kvm-counter2"
+path = "kvm_counter2.rs"
+
+[[bin]]
 name = "debug"
 path = "debug.rs"
 
