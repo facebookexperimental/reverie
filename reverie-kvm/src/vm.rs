@@ -9,6 +9,11 @@
 use std::fs::File;
 use std::os::fd::FromRawFd;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use kvm_bindings::CpuId;
 use kvm_bindings::KVM_MAX_CPUID_ENTRIES;
@@ -29,9 +34,14 @@ use crate::Result;
 use crate::Syscall;
 use crate::SyscallRequest;
 use crate::bootstrap::BOOT_RESERVED_END;
+use crate::bootstrap::MAX_GUEST_THREADS;
 use crate::bootstrap::SYSCALL_FRAME_ADDRESS;
+use crate::bootstrap::SYSCALL_TRAMPOLINE_ADDRESS;
 use crate::bootstrap::SegmentBase;
+use crate::bootstrap::THREAD_SYSCALL_AREA_START;
+use crate::bootstrap::THREAD_SYSCALL_AREA_STRIDE;
 use crate::bootstrap::configure_long_mode;
+use crate::bootstrap::configure_long_mode_with_syscall_area;
 use crate::bootstrap::configure_process_syscall_return;
 use crate::bootstrap::exception_from_halt;
 use crate::bootstrap::set_syscall_return_park;
@@ -52,6 +62,57 @@ const PAGE_SIZE: u64 = 4096;
 const VMCALL: [u8; 3] = [0x0f, 0x01, 0xc1];
 const VMMCALL: [u8; 3] = [0x0f, 0x01, 0xd9];
 const HLT: u8 = 0xf4;
+
+extern "C" fn interrupt_guest_worker(_signal: libc::c_int) {}
+
+fn worker_interrupt_signal() -> libc::c_int {
+    libc::SIGURG
+}
+
+fn install_worker_interrupt_handler() -> Result<()> {
+    static INSTALL_ERRNO: OnceLock<libc::c_int> = OnceLock::new();
+    let errno = *INSTALL_ERRNO.get_or_init(|| {
+        // SAFETY: action is initialized before sigaction reads it. The handler
+        // performs no operations and exists only to make blocking syscalls
+        // return EINTR during KVM thread-group teardown.
+        unsafe {
+            let mut action = std::mem::zeroed::<libc::sigaction>();
+            action.sa_sigaction = interrupt_guest_worker as *const () as usize;
+            action.sa_flags = 0;
+            libc::sigemptyset(&mut action.sa_mask);
+            if libc::sigaction(worker_interrupt_signal(), &action, std::ptr::null_mut()) == 0 {
+                0
+            } else {
+                std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO)
+            }
+        }
+    });
+    if errno == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::from_raw_os_error(errno).into())
+    }
+}
+
+fn unblock_worker_interrupt_signal() {
+    // SAFETY: set is initialized before pthread_sigmask reads it. This changes
+    // only the newly-created KVM worker's mask.
+    unsafe {
+        let mut set = std::mem::zeroed::<libc::sigset_t>();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, worker_interrupt_signal());
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+    }
+}
+
+#[derive(Default)]
+// TODO-HUMAN-REVIEW(PR-172): Review process-wide KVM worker cancellation state.
+struct GuestThreadGroup {
+    cancelled: AtomicBool,
+    workers: Mutex<Vec<libc::pthread_t>>,
+}
 
 fn duplicate_stdin() -> Result<Option<File>> {
     // Duplicate before opening /dev/kvm so internal descriptors can never alias
@@ -78,6 +139,10 @@ pub struct KvmBackend {
     _kvm: Kvm,
     cpuid_policy: CpuidPolicy,
     hypercall_instruction: [u8; 3],
+    syscall_trampoline_address: u64,
+    syscall_frame_address: u64,
+    thread_group: Arc<GuestThreadGroup>,
+    is_guest_thread: bool,
     pub(crate) static_elf: Option<LoadedStaticElf>,
     stdin: Option<File>,
 }
@@ -124,6 +189,7 @@ impl KvmBackend {
         cpuid_policy: CpuidPolicy,
         stdin: Option<File>,
     ) -> Result<Self> {
+        install_worker_interrupt_handler()?;
         let kvm = Kvm::new()?;
         let vm = kvm.create_vm()?;
         if !vm.check_extension(Cap::ExitHypercall) {
@@ -163,6 +229,10 @@ impl KvmBackend {
             _kvm: kvm,
             cpuid_policy,
             hypercall_instruction,
+            syscall_trampoline_address: SYSCALL_TRAMPOLINE_ADDRESS,
+            syscall_frame_address: SYSCALL_FRAME_ADDRESS,
+            thread_group: Arc::new(GuestThreadGroup::default()),
+            is_guest_thread: false,
             static_elf: None,
             stdin,
         })
@@ -275,6 +345,44 @@ impl KvmBackend {
         Ok(child)
     }
 
+    // TODO-HUMAN-REVIEW(PR-172): Review independent vCPU creation from clone3 state.
+    fn from_thread_state(
+        memory: GuestMemory,
+        registers: kvm_regs,
+        xsave: kvm_xsave,
+        stdin: Option<File>,
+        cpuid_policy: CpuidPolicy,
+        child_tid: i32,
+        thread_group: Arc<GuestThreadGroup>,
+    ) -> Result<Self> {
+        let slot = u64::try_from(child_tid - 2)
+            .ok()
+            .filter(|slot| *slot < MAX_GUEST_THREADS)
+            .ok_or(Error::GuestThreadLimitExceeded(child_tid))?;
+        let syscall_trampoline_address =
+            THREAD_SYSCALL_AREA_START + slot * THREAD_SYSCALL_AREA_STRIDE;
+        let syscall_frame_address = syscall_trampoline_address + PAGE_SIZE;
+        let mut child = Self::new_with_memory_and_cpuid_policy(memory, cpuid_policy, stdin)?;
+        child.syscall_trampoline_address = syscall_trampoline_address;
+        child.syscall_frame_address = syscall_frame_address;
+        child.thread_group = thread_group;
+        child.is_guest_thread = true;
+        configure_long_mode_with_syscall_area(
+            &mut child.memory,
+            &child.vcpu,
+            0,
+            registers.rsp,
+            child.hypercall_instruction,
+            syscall_trampoline_address,
+            syscall_frame_address,
+            false,
+        )?;
+        child.vcpu.set_regs(&registers)?;
+        // SAFETY: this guest setup does not enable dynamically sized XSTATE features.
+        unsafe { child.vcpu.set_xsave(&xsave)? };
+        Ok(child)
+    }
+
     fn exec_process(
         &mut self,
         executor: &mut ElfExecutor,
@@ -318,14 +426,26 @@ impl KvmBackend {
             } => {
                 let mut child_executor = executor.fork_child(child_pid, clear_sighand)?;
                 child_executor.set_clear_child_tid(clear_child_tid);
-                set_syscall_return_park(&mut self.memory, self.hypercall_instruction, true)?;
+                set_syscall_return_park(
+                    &mut self.memory,
+                    self.hypercall_instruction,
+                    self.syscall_trampoline_address,
+                    self.syscall_frame_address,
+                    true,
+                )?;
                 let parked = match self.vcpu.run()? {
                     VcpuExit::Hlt => Ok(()),
                     exit => Err(Error::UnexpectedVcpuExit(format!(
                         "parent did not park at fork: {exit:?}"
                     ))),
                 };
-                set_syscall_return_park(&mut self.memory, self.hypercall_instruction, false)?;
+                set_syscall_return_park(
+                    &mut self.memory,
+                    self.hypercall_instruction,
+                    self.syscall_trampoline_address,
+                    self.syscall_frame_address,
+                    false,
+                )?;
                 parked?;
                 let child_snapshot = self.snapshot_process()?;
                 write_tid_best_effort(&mut self.memory, parent_tid, child_pid);
@@ -335,7 +455,13 @@ impl KvmBackend {
                 let (fs_base, gs_base) = child_executor.segment_bases();
                 set_user_segment_base(&child.vcpu, SegmentBase::Fs, fs_base)?;
                 set_user_segment_base(&child.vcpu, SegmentBase::Gs, gs_base)?;
-                configure_process_syscall_return(&child.memory, &child.vcpu, 0, child_stack)?;
+                configure_process_syscall_return(
+                    &child.memory,
+                    &child.vcpu,
+                    child.syscall_frame_address,
+                    0,
+                    child_stack,
+                )?;
                 let (code, stdout, stderr) = child.run_static_elf_process(&mut child_executor)?;
                 // A process clone has a private snapshot, so no surviving task can
                 // observe this clear; preserve the child-side ABI.
@@ -345,10 +471,12 @@ impl KvmBackend {
                 configure_process_syscall_return(
                     &self.memory,
                     &self.vcpu,
+                    self.syscall_frame_address,
                     i64::from(child_pid),
                     None,
                 )?;
             }
+            // TODO-HUMAN-REVIEW(PR-172): Review concurrent CLONE_THREAD lifecycle semantics.
             ProcessAction::Thread {
                 child_tid,
                 child_stack,
@@ -357,79 +485,126 @@ impl KvmBackend {
                 clear_child_tid,
                 tls,
             } => {
-                // TODO-HUMAN-REVIEW(PR-132): Review sequential thread execution and
-                // parent architectural-state restoration on the shared vCPU.
                 let parent_registers = self.vcpu.get_regs()?;
                 let parent_xsave = self.vcpu.get_xsave()?;
-                let parent_thread_id = executor.thread_id();
                 let (parent_fs, parent_gs) = executor.segment_bases();
-                let parent_clear_child_tid = executor.take_clear_child_tid();
                 let mut parent_syscall_frame = vec![0; PAGE_SIZE as usize];
                 self.memory
-                    .read_raw(SYSCALL_FRAME_ADDRESS, &mut parent_syscall_frame)?;
+                    .read_raw(self.syscall_frame_address, &mut parent_syscall_frame)?;
 
-                set_syscall_return_park(&mut self.memory, self.hypercall_instruction, true)?;
+                set_syscall_return_park(
+                    &mut self.memory,
+                    self.hypercall_instruction,
+                    self.syscall_trampoline_address,
+                    self.syscall_frame_address,
+                    true,
+                )?;
                 let parked = match self.vcpu.run()? {
                     VcpuExit::Hlt => Ok(()),
                     exit => Err(Error::UnexpectedVcpuExit(format!(
                         "parent did not park at thread clone: {exit:?}"
                     ))),
                 };
-                set_syscall_return_park(&mut self.memory, self.hypercall_instruction, false)?;
+                set_syscall_return_park(
+                    &mut self.memory,
+                    self.hypercall_instruction,
+                    self.syscall_trampoline_address,
+                    self.syscall_frame_address,
+                    false,
+                )?;
                 parked?;
+                let child_registers = self.vcpu.get_regs()?;
 
                 write_tid_best_effort(&mut self.memory, parent_tid, child_tid);
                 write_tid_best_effort(&mut self.memory, child_tid_address, child_tid);
                 let child_fs = tls.unwrap_or(parent_fs);
-                executor.set_thread_context(child_tid, child_fs, parent_gs);
-                executor.set_clear_child_tid(clear_child_tid);
-                set_user_segment_base(&self.vcpu, SegmentBase::Fs, child_fs)?;
-                set_user_segment_base(&self.vcpu, SegmentBase::Gs, parent_gs)?;
-                configure_process_syscall_return(&self.memory, &self.vcpu, 0, Some(child_stack))?;
+                let mut child_executor = executor.thread_child(child_tid)?;
+                child_executor.set_thread_context(child_tid, child_fs, parent_gs);
+                child_executor.set_clear_child_tid(clear_child_tid);
+                let child_stdin = self.stdin.as_ref().map(File::try_clone).transpose()?;
+                let mut child = Self::from_thread_state(
+                    self.memory.clone(),
+                    child_registers,
+                    parent_xsave,
+                    child_stdin,
+                    self.cpuid_policy,
+                    child_tid,
+                    self.thread_group.clone(),
+                )?;
+                child
+                    .memory
+                    .write_raw(child.syscall_frame_address, &parent_syscall_frame)?;
+                set_user_segment_base(&child.vcpu, SegmentBase::Fs, child_fs)?;
+                set_user_segment_base(&child.vcpu, SegmentBase::Gs, parent_gs)?;
+                configure_process_syscall_return(
+                    &child.memory,
+                    &child.vcpu,
+                    child.syscall_frame_address,
+                    0,
+                    Some(child_stack),
+                )?;
 
-                let (code, stdout, stderr) = self.run_static_elf_process(executor)?;
-                set_syscall_return_park(&mut self.memory, self.hypercall_instruction, true)?;
-                let child_parked = match self.vcpu.run()? {
-                    VcpuExit::Hlt => Ok(()),
-                    exit => Err(Error::UnexpectedVcpuExit(format!(
-                        "child thread did not park after exit: {exit:?}"
-                    ))),
-                };
-                set_syscall_return_park(&mut self.memory, self.hypercall_instruction, false)?;
-                child_parked?;
-                let exited_group = executor.take_exit_group();
-                write_tid_best_effort(&mut self.memory, executor.take_clear_child_tid(), 0);
-                executor.set_clear_child_tid(parent_clear_child_tid);
-                executor.set_thread_context(parent_thread_id, parent_fs, parent_gs);
-                executor.append_output(stdout, stderr);
-                // SAFETY: this guest setup does not enable dynamically sized XSTATE features.
-                unsafe { self.vcpu.set_xsave(&parent_xsave)? };
+                self.vcpu.set_regs(&parent_registers)?;
+                configure_process_syscall_return(
+                    &self.memory,
+                    &self.vcpu,
+                    self.syscall_frame_address,
+                    i64::from(child_tid),
+                    None,
+                )?;
 
-                if exited_group {
-                    executor.set_exit(code, true);
-                } else {
-                    self.memory
-                        .write_raw(SYSCALL_FRAME_ADDRESS, &parent_syscall_frame)?;
-                    set_user_segment_base(&self.vcpu, SegmentBase::Fs, parent_fs)?;
-                    set_user_segment_base(&self.vcpu, SegmentBase::Gs, parent_gs)?;
-                    self.vcpu.set_regs(&parent_registers)?;
-                    configure_process_syscall_return(
-                        &self.memory,
-                        &self.vcpu,
-                        i64::from(child_tid),
-                        None,
-                    )?;
-                }
+                let handle = std::thread::Builder::new()
+                    .name(format!("reverie-kvm-guest-{child_tid}"))
+                    .spawn(move || {
+                        unblock_worker_interrupt_signal();
+                        let pthread = unsafe { libc::pthread_self() };
+                        child
+                            .thread_group
+                            .workers
+                            .lock()
+                            .expect("KVM guest worker lock poisoned")
+                            .push(pthread);
+                        let result = child.run_static_elf_process(&mut child_executor);
+                        child
+                            .thread_group
+                            .workers
+                            .lock()
+                            .expect("KVM guest worker lock poisoned")
+                            .retain(|worker| *worker != pthread);
+                        clear_tid_and_wake(
+                            &mut child.memory,
+                            child_executor.take_clear_child_tid(),
+                        );
+                        let cancelled = child.thread_group.cancelled.load(Ordering::Acquire);
+                        if let Err(error) = result
+                            && !cancelled
+                        {
+                            eprintln!("reverie-kvm guest thread {child_tid} failed: {error}");
+                        }
+                    })?;
+                drop(handle);
             }
             ProcessAction::Exec { image, argv, envp } => {
-                set_syscall_return_park(&mut self.memory, self.hypercall_instruction, true)?;
+                set_syscall_return_park(
+                    &mut self.memory,
+                    self.hypercall_instruction,
+                    self.syscall_trampoline_address,
+                    self.syscall_frame_address,
+                    true,
+                )?;
                 let parked = match self.vcpu.run()? {
                     VcpuExit::Hlt => Ok(()),
                     exit => Err(Error::UnexpectedVcpuExit(format!(
                         "process did not park before exec: {exit:?}"
                     ))),
                 };
-                set_syscall_return_park(&mut self.memory, self.hypercall_instruction, false)?;
+                set_syscall_return_park(
+                    &mut self.memory,
+                    self.hypercall_instruction,
+                    self.syscall_trampoline_address,
+                    self.syscall_frame_address,
+                    false,
+                )?;
                 parked?;
                 self.exec_process(executor, &image, &argv, &envp)?;
             }
@@ -474,13 +649,16 @@ impl KvmBackend {
         executor: &mut ElfExecutor,
     ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
         loop {
+            if self.is_guest_thread && self.thread_group.cancelled.load(Ordering::Acquire) {
+                return Ok((0, Vec::new(), Vec::new()));
+            }
             let (segment_update, process_action) = match self.vcpu.run()? {
                 VcpuExit::Hypercall(exit) => {
                     if exit.nr != VMCALL_SYSCALL_TRANSPORT {
                         return Err(Error::UnexpectedHypercall(exit.nr));
                     }
                     let frame_address = exit.args[0];
-                    if frame_address != SYSCALL_FRAME_ADDRESS {
+                    if frame_address != self.syscall_frame_address {
                         return Err(Error::UnexpectedVcpuExit(format!(
                             "syscall frame is at unexpected address {frame_address:#x}",
                         )));
@@ -508,8 +686,30 @@ impl KvmBackend {
             }
 
             if let Some(code) = executor.take_exit() {
+                if !self.is_guest_thread {
+                    self.cancel_guest_threads();
+                }
                 let (stdout, stderr) = executor.take_output();
                 return Ok((code, stdout, stderr));
+            }
+        }
+    }
+
+    // TODO-HUMAN-REVIEW(PR-172): Review signal-driven KVM worker cancellation.
+    pub(crate) fn cancel_guest_threads(&self) {
+        self.thread_group.cancelled.store(true, Ordering::Release);
+        let workers = self
+            .thread_group
+            .workers
+            .lock()
+            .expect("KVM guest worker lock poisoned");
+        for &worker in workers.iter() {
+            // SAFETY: worker was registered by a live guest host thread. The
+            // registry lock prevents it from unregistering and exiting before
+            // pthread_kill consumes the ID. The no-op handler exists only to
+            // interrupt its blocking host syscall.
+            unsafe {
+                libc::pthread_kill(worker, worker_interrupt_signal());
             }
         }
     }
@@ -598,10 +798,49 @@ impl KvmBackend {
     }
 }
 
+impl Drop for KvmBackend {
+    fn drop(&mut self) {
+        if !self.is_guest_thread {
+            self.cancel_guest_threads();
+        }
+    }
+}
+
 fn write_tid_best_effort(memory: &mut GuestMemory, address: Option<u64>, tid: i32) {
     if let Some(address) = address {
         // Linux creates the child even if a clone TID store faults.
         let _ = memory.write(address, &tid.to_le_bytes());
+    }
+}
+
+// TODO-HUMAN-REVIEW(PR-172): Review CHILD_CLEARTID store and shared futex wake ordering.
+fn clear_tid_and_wake(memory: &mut GuestMemory, address: Option<u64>) {
+    let Some(address) = address else {
+        return;
+    };
+    // Linux treats a failed CHILD_CLEARTID store as best-effort and skips the
+    // wake when the user address is invalid.
+    if memory.write(address, &0_i32.to_le_bytes()).is_err() {
+        return;
+    }
+    let Some(offset) = address.checked_sub(memory.guest_base()) else {
+        return;
+    };
+    let Some(host_address) = memory.host_address().checked_add(offset) else {
+        return;
+    };
+    // SAFETY: the successful write above validates the complete futex word,
+    // and GuestMemory keeps its shared host mapping alive for this call.
+    unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            host_address,
+            1, // FUTEX_WAKE; the kernel's CHILD_CLEARTID wake is not private.
+            1,
+            0,
+            0,
+            0,
+        );
     }
 }
 

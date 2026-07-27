@@ -637,6 +637,19 @@ fn static_elf_runs_glibc_clone3_thread_and_restores_parent_state() {
 
     code.extend_from_slice(&[0x4c, 0x39, 0xe4, 0x74, 0x0e]); // cmp rsp, r12; je
     append_exit(&mut code, 81);
+    code.extend_from_slice(&[0x41, 0x89, 0xc5]); // mov r13d, eax
+    code.extend_from_slice(&[0x48, 0xbf]); // movabs rdi, child_tid
+    code.extend_from_slice(&CHILD_TID.to_le_bytes());
+    code.extend_from_slice(&[
+        0xbe, 0x00, 0x00, 0x00, 0x00, // mov esi, FUTEX_WAIT
+        0x44, 0x89, 0xea, // mov edx, r13d
+        0x45, 0x31, 0xd2, // xor r10d, r10d
+        0xb8, 0xca, 0x00, 0x00, 0x00, // mov eax, SYS_futex
+        0x0f, 0x05, // syscall
+        0x83, 0x3f, 0x00, // cmp dword ptr [rdi], 0
+        0x75, 0xe9, // jne FUTEX_WAIT
+        0x44, 0x89, 0xe8, // mov eax, r13d
+    ]);
     code.extend_from_slice(&[0x48, 0xb9]); // movabs rcx, parent_tid
     code.extend_from_slice(&PARENT_TID.to_le_bytes());
     code.extend_from_slice(&[0x39, 0x01, 0x74, 0x0e]); // cmp [rcx], eax; je

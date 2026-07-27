@@ -16,6 +16,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::Ordering;
 
@@ -133,17 +134,42 @@ pub(crate) enum SyscallAction {
 }
 
 #[derive(Default)]
-pub(crate) struct CapturedOutput {
+struct CapturedOutputInner {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
 }
 
+#[derive(Clone, Default)]
+// TODO-HUMAN-REVIEW(PR-172): Review cross-thread captured-output ownership.
+pub(crate) struct CapturedOutput {
+    inner: Arc<Mutex<CapturedOutputInner>>,
+}
+
 impl CapturedOutput {
     pub(crate) fn take(&mut self) -> (Vec<u8>, Vec<u8>) {
+        let mut inner = self.inner.lock().expect("captured output lock poisoned");
         (
-            std::mem::take(&mut self.stdout),
-            std::mem::take(&mut self.stderr),
+            std::mem::take(&mut inner.stdout),
+            std::mem::take(&mut inner.stderr),
         )
+    }
+
+    fn append(&self, stderr: bool, bytes: &[u8]) -> bool {
+        let mut inner = self.inner.lock().expect("captured output lock poisoned");
+        let destination = if stderr {
+            &mut inner.stderr
+        } else {
+            &mut inner.stdout
+        };
+        if destination
+            .len()
+            .checked_add(bytes.len())
+            .is_none_or(|length| length > MAX_CAPTURED_OUTPUT)
+        {
+            return false;
+        }
+        destination.extend_from_slice(bytes);
+        true
     }
 }
 
@@ -246,6 +272,9 @@ fn execute_basic_syscall_with_output(
     } else if number == libc::SYS_poll as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         poll(memory, state, args)
+    } else if number == libc::SYS_ppoll as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        ppoll(memory, state, args)
     } else if number == libc::SYS_epoll_create1 as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         epoll_create1(state, args[0])
@@ -591,16 +620,100 @@ fn execute_basic_syscall_with_output(
         return kill_signal(state, number, args);
     } else if number == libc::SYS_close as u64 {
         close(state, args[0])
-    } else if number == libc::SYS_set_robust_list as u64
-        || number == libc::SYS_rseq as u64
-        || number == libc::SYS_futex as u64
-    {
+    } else if number == libc::SYS_futex as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        futex(memory, args)
+    } else if number == libc::SYS_rseq as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-172): Review deterministic rseq feature refusal.
+        negative_errno(libc::ENOSYS)
+    } else if number == libc::SYS_set_robust_list as u64 {
         0
     } else {
         negative_errno(libc::ENOSYS)
     };
 
     continue_with(result)
+}
+
+// TODO-HUMAN-REVIEW(PR-172): Review host-backed futex address and timeout translation.
+fn futex(memory: &GuestMemory, args: &[u64; 6]) -> i64 {
+    const FUTEX_CMD_MASK: libc::c_int = !(128 | 256);
+    const FUTEX_WAIT: libc::c_int = 0;
+    const FUTEX_REQUEUE: libc::c_int = 3;
+    const FUTEX_CMP_REQUEUE: libc::c_int = 4;
+    const FUTEX_WAKE_OP: libc::c_int = 5;
+    const FUTEX_LOCK_PI: libc::c_int = 6;
+    const FUTEX_WAIT_BITSET: libc::c_int = 9;
+    const FUTEX_WAIT_REQUEUE_PI: libc::c_int = 11;
+    const FUTEX_CMP_REQUEUE_PI: libc::c_int = 12;
+    const FUTEX_LOCK_PI2: libc::c_int = 13;
+
+    let Ok(uaddr) = guest_host_address(memory, args[0], std::mem::size_of::<u32>()) else {
+        return negative_errno(libc::EFAULT);
+    };
+    let operation = args[1] as libc::c_int;
+    let command = operation & FUTEX_CMD_MASK;
+    let fourth = if args[3] == 0 {
+        0
+    } else if matches!(
+        command,
+        FUTEX_WAIT | FUTEX_LOCK_PI | FUTEX_WAIT_BITSET | FUTEX_WAIT_REQUEUE_PI | FUTEX_LOCK_PI2
+    ) {
+        match guest_host_address(memory, args[3], std::mem::size_of::<libc::timespec>()) {
+            Ok(address) => address,
+            Err(error) => return error,
+        }
+    } else {
+        args[3] as usize
+    };
+    let uaddr2 = if matches!(
+        command,
+        FUTEX_REQUEUE
+            | FUTEX_CMP_REQUEUE
+            | FUTEX_WAKE_OP
+            | FUTEX_WAIT_REQUEUE_PI
+            | FUTEX_CMP_REQUEUE_PI
+    ) {
+        match guest_host_address(memory, args[4], std::mem::size_of::<u32>()) {
+            Ok(address) => address,
+            Err(error) => return error,
+        }
+    } else {
+        0
+    };
+
+    // SAFETY: translated pointers remain within the shared guest mapping for
+    // the duration of the syscall. The host kernel performs the atomic futex
+    // operation against the same bytes mapped by every guest-thread VM.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            uaddr,
+            operation,
+            args[2] as u32,
+            fourth,
+            uaddr2,
+            args[5] as u32,
+        )
+    };
+    if result < 0 {
+        io_error(std::io::Error::last_os_error())
+    } else {
+        result as i64
+    }
+}
+
+fn guest_host_address(
+    memory: &GuestMemory,
+    guest_address: u64,
+    length: usize,
+) -> Result<usize, i64> {
+    let mut probe = vec![0; length];
+    if memory.read(guest_address, &mut probe).is_err() {
+        return Err(negative_errno(libc::EFAULT));
+    }
+    Ok((memory.host_address() + guest_address - memory.guest_base()) as usize)
 }
 
 /// A [`SyscallExecutor`] that supplies the static-ELF guest-kernel semantics
@@ -614,7 +727,10 @@ fn execute_basic_syscall_with_output(
 /// [`crate::KvmBackend::run_static_elf`] uses directly.
 pub(crate) struct ElfExecutor {
     state: LoadedStaticElf,
+    address_space: Arc<std::sync::Mutex<AddressSpaceState>>,
+    file_table: Arc<std::sync::Mutex<FileTableState>>,
     output: Option<CapturedOutput>,
+    owns_output: bool,
     next_pid: Arc<AtomicI32>,
     process_action: Option<ProcessAction>,
     pending_segment: Option<(SegmentBase, u64)>,
@@ -623,11 +739,108 @@ pub(crate) struct ElfExecutor {
     clear_child_tid: Option<u64>,
 }
 
+struct AddressSpaceState {
+    program_break: u64,
+    mmap_next: u64,
+}
+
+struct FileTableState {
+    stdin: Option<std::fs::File>,
+    files: std::collections::BTreeMap<i32, std::fs::File>,
+    stdout_alias_fds: std::collections::BTreeSet<i32>,
+    stderr_alias_fds: std::collections::BTreeSet<i32>,
+    cloexec_fds: std::collections::BTreeSet<i32>,
+    closed_standard_fds: std::collections::BTreeSet<i32>,
+    proc_files: std::collections::BTreeMap<i32, u64>,
+    fd_object_inodes: std::collections::BTreeMap<i32, Arc<GuestFileIdentity>>,
+}
+
+impl FileTableState {
+    fn try_from_elf(state: &LoadedStaticElf) -> std::io::Result<Self> {
+        Ok(Self {
+            stdin: state
+                .stdin
+                .as_ref()
+                .map(std::fs::File::try_clone)
+                .transpose()?,
+            files: state
+                .files
+                .iter()
+                .map(|(&fd, file)| Ok((fd, file.try_clone()?)))
+                .collect::<std::io::Result<_>>()?,
+            stdout_alias_fds: state.stdout_alias_fds.clone(),
+            stderr_alias_fds: state.stderr_alias_fds.clone(),
+            cloexec_fds: state.cloexec_fds.clone(),
+            closed_standard_fds: state.closed_standard_fds.clone(),
+            proc_files: state.proc_files.clone(),
+            fd_object_inodes: state.fd_object_inodes.clone(),
+        })
+    }
+
+    fn install(&self, state: &mut LoadedStaticElf) -> std::io::Result<()> {
+        state.stdin = self
+            .stdin
+            .as_ref()
+            .map(std::fs::File::try_clone)
+            .transpose()?;
+        state.files = self
+            .files
+            .iter()
+            .map(|(&fd, file)| Ok((fd, file.try_clone()?)))
+            .collect::<std::io::Result<_>>()?;
+        state.stdout_alias_fds.clone_from(&self.stdout_alias_fds);
+        state.stderr_alias_fds.clone_from(&self.stderr_alias_fds);
+        state.cloexec_fds.clone_from(&self.cloexec_fds);
+        state
+            .closed_standard_fds
+            .clone_from(&self.closed_standard_fds);
+        state.proc_files.clone_from(&self.proc_files);
+        state.fd_object_inodes.clone_from(&self.fd_object_inodes);
+        Ok(())
+    }
+}
+
+fn mutates_file_table(number: u64) -> bool {
+    matches!(
+        number,
+        number if number == libc::SYS_pipe as u64
+            || number == libc::SYS_pipe2 as u64
+            || number == libc::SYS_epoll_create1 as u64
+            || number == libc::SYS_eventfd as u64
+            || number == libc::SYS_eventfd2 as u64
+            || number == libc::SYS_socket as u64
+            || number == libc::SYS_dup as u64
+            || number == libc::SYS_dup2 as u64
+            || number == libc::SYS_dup3 as u64
+            || number == libc::SYS_fcntl as u64
+            || number == libc::SYS_open as u64
+            || number == libc::SYS_openat as u64
+            || number == libc::SYS_creat as u64
+            || number == libc::SYS_close as u64
+    )
+}
+
+impl AddressSpaceState {
+    fn from_elf(state: &LoadedStaticElf) -> Self {
+        Self {
+            program_break: state.program_break,
+            mmap_next: state.mmap_next,
+        }
+    }
+}
+
 impl ElfExecutor {
     pub(crate) fn new(state: LoadedStaticElf, capture_output: bool) -> Self {
+        let address_space = Arc::new(std::sync::Mutex::new(AddressSpaceState::from_elf(&state)));
+        let file_table = Arc::new(std::sync::Mutex::new(
+            FileTableState::try_from_elf(&state).expect("clone initial KVM file table"),
+        ));
         Self {
             state,
+            address_space,
+            file_table,
             output: capture_output.then(CapturedOutput::default),
+            owns_output: true,
             next_pid: Arc::new(AtomicI32::new(2)),
             process_action: None,
             pending_segment: None,
@@ -873,8 +1086,31 @@ impl ElfExecutor {
             });
         }
         Ok(Self {
+            address_space: Arc::new(std::sync::Mutex::new(AddressSpaceState::from_elf(&state))),
+            file_table: Arc::new(std::sync::Mutex::new(FileTableState::try_from_elf(&state)?)),
             state,
             output: self.output.is_some().then(CapturedOutput::default),
+            owns_output: true,
+            next_pid: self.next_pid.clone(),
+            process_action: None,
+            pending_segment: None,
+            exit_code: None,
+            exit_group: false,
+            clear_child_tid: None,
+        })
+    }
+
+    // TODO-HUMAN-REVIEW(PR-172): Review shared address-space and output ownership.
+    pub(crate) fn thread_child(&self, child_tid: i32) -> crate::Result<Self> {
+        let mut state = self.state.try_clone_for_fork(child_tid)?;
+        state.pid = self.state.pid;
+        state.ppid = self.state.ppid;
+        Ok(Self {
+            state,
+            address_space: self.address_space.clone(),
+            file_table: self.file_table.clone(),
+            output: self.output.clone(),
+            owns_output: false,
             next_pid: self.next_pid.clone(),
             process_action: None,
             pending_segment: None,
@@ -899,6 +1135,15 @@ impl ElfExecutor {
     pub(crate) fn replace_after_exec(&mut self, state: LoadedStaticElf) {
         let previous = std::mem::replace(&mut self.state, state);
         self.state.inherit_process_state(previous);
+        *self
+            .address_space
+            .lock()
+            .expect("KVM address-space lock poisoned") = AddressSpaceState::from_elf(&self.state);
+        *self
+            .file_table
+            .lock()
+            .expect("KVM file-table lock poisoned") =
+            FileTableState::try_from_elf(&self.state).expect("clone post-exec KVM file table");
         self.pending_segment = None;
         self.exit_code = None;
         self.exit_group = false;
@@ -911,8 +1156,8 @@ impl ElfExecutor {
 
     pub(crate) fn append_output(&mut self, stdout: Vec<u8>, stderr: Vec<u8>) {
         if let Some(output) = self.output.as_mut() {
-            output.stdout.extend(stdout);
-            output.stderr.extend(stderr);
+            let _ = output.append(false, &stdout);
+            let _ = output.append(true, &stderr);
         }
     }
 
@@ -926,11 +1171,6 @@ impl ElfExecutor {
 
     pub(crate) fn segment_bases(&self) -> (u64, u64) {
         (self.state.fs_base, self.state.gs_base)
-    }
-
-    // TODO-HUMAN-REVIEW(PR-132): Review cooperative KVM thread context access.
-    pub(crate) fn thread_id(&self) -> i32 {
-        self.state.tid
     }
 
     // TODO-HUMAN-REVIEW(PR-132): Review cooperative KVM thread context updates.
@@ -950,39 +1190,80 @@ impl ElfExecutor {
         self.exit_code.take()
     }
 
-    // TODO-HUMAN-REVIEW(PR-132): Review KVM thread-group exit propagation.
-    pub(crate) fn take_exit_group(&mut self) -> bool {
-        std::mem::take(&mut self.exit_group)
-    }
-
-    // TODO-HUMAN-REVIEW(PR-132): Review KVM thread-group exit propagation.
-    pub(crate) fn set_exit(&mut self, code: i32, group: bool) {
-        self.exit_code = Some(code);
-        self.exit_group = group;
-    }
-
     pub(crate) fn take_output(&mut self) -> (Vec<u8>, Vec<u8>) {
-        self.output
-            .as_mut()
-            .map(CapturedOutput::take)
-            .unwrap_or_default()
+        if self.owns_output {
+            self.output
+                .as_mut()
+                .map(CapturedOutput::take)
+                .unwrap_or_default()
+        } else {
+            (Vec::new(), Vec::new())
+        }
     }
 }
 
 impl SyscallExecutor for ElfExecutor {
     fn execute(&mut self, request: &SyscallRequest, memory: &GuestMemory) -> i64 {
+        // TODO-HUMAN-REVIEW(PR-172): Review CLONE_FILES descriptor-table sharing.
+        // Thread children retain private executor state, but synchronize their
+        // descriptor mappings through this shared table before every syscall.
+        // Descriptor-creating and descriptor-closing operations hold the lock
+        // through the update; potentially blocking I/O releases it after the
+        // snapshot so QEMU AIO workers can continue to make progress.
+        let file_table = self.file_table.clone();
+        let mut shared_files = Some(file_table.lock().expect("KVM file-table lock poisoned"));
+        if let Err(error) = shared_files
+            .as_ref()
+            .expect("file-table guard disappeared")
+            .install(&mut self.state)
+        {
+            return io_error(error);
+        }
+        let mutating_file_table = mutates_file_table(request.number());
+        if !mutating_file_table {
+            shared_files.take();
+        }
         if let Some(result) = self.execute_process_action(request, memory) {
             return result;
         }
         // Clones share the underlying MAP_SHARED mapping, so writes through this
         // handle reach the guest; `execute_basic_syscall` needs `&mut` access.
         let mut memory = memory.clone();
-        match execute_basic_syscall_with_output(
-            &mut memory,
-            &mut self.state,
-            request,
-            self.output.as_mut(),
-        ) {
+        let address_space_syscall = matches!(
+            request.number(),
+            number if number == libc::SYS_brk as u64
+                || number == libc::SYS_mmap as u64
+                || number == libc::SYS_mremap as u64
+        );
+        let action = if address_space_syscall {
+            let address_space = self.address_space.clone();
+            let mut shared = address_space
+                .lock()
+                .expect("KVM address-space lock poisoned");
+            self.state.program_break = shared.program_break;
+            self.state.mmap_next = shared.mmap_next;
+            let action = execute_basic_syscall_with_output(
+                &mut memory,
+                &mut self.state,
+                request,
+                self.output.as_mut(),
+            );
+            shared.program_break = self.state.program_break;
+            shared.mmap_next = self.state.mmap_next;
+            action
+        } else {
+            execute_basic_syscall_with_output(
+                &mut memory,
+                &mut self.state,
+                request,
+                self.output.as_mut(),
+            )
+        };
+        if let Some(mut shared_files) = shared_files {
+            *shared_files =
+                FileTableState::try_from_elf(&self.state).expect("clone updated KVM file table");
+        }
+        match action {
             SyscallAction::Continue { result, segment } => {
                 if segment.is_some() {
                     self.pending_segment = segment;
@@ -1180,18 +1461,9 @@ fn write(
 
     if let Some(output_destination) = output_destination {
         if let Some(output) = output {
-            let destination = match output_destination {
-                OutputAlias::Stdout => &mut output.stdout,
-                OutputAlias::Stderr => &mut output.stderr,
-            };
-            if destination
-                .len()
-                .checked_add(bytes.len())
-                .is_none_or(|length| length > MAX_CAPTURED_OUTPUT)
-            {
+            if !output.append(matches!(output_destination, OutputAlias::Stderr), &bytes) {
                 return negative_errno(libc::EFBIG);
             }
-            destination.extend_from_slice(&bytes);
             return bytes.len() as i64;
         }
         if standard {
@@ -2473,6 +2745,41 @@ fn pipe2(
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-92): Review guest descriptor translation and deterministic nonblocking poll semantics.
 fn poll(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    poll_with_timeout(memory, state, args, 0)
+}
+
+// TODO-HUMAN-REVIEW(PR-172): Review host-blocking KVM ppoll timeout and signal-mask semantics.
+fn ppoll(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    if args[3] != 0 {
+        if args[4] != KERNEL_SIGSET_SIZE as u64 {
+            return negative_errno(libc::EINVAL);
+        }
+        return negative_errno(libc::ENOSYS);
+    }
+    let timeout = if args[2] == 0 {
+        -1
+    } else {
+        let timeout = match read_guest_struct::<libc::timespec>(memory, args[2]) {
+            Ok(timeout) => timeout,
+            Err(error) => return error,
+        };
+        if timeout.tv_sec < 0 || !(0..1_000_000_000).contains(&timeout.tv_nsec) {
+            return negative_errno(libc::EINVAL);
+        }
+        let milliseconds = (timeout.tv_sec as u128)
+            .saturating_mul(1_000)
+            .saturating_add((timeout.tv_nsec as u128).div_ceil(1_000_000));
+        milliseconds.min(libc::c_int::MAX as u128) as libc::c_int
+    };
+    poll_with_timeout(memory, state, args, timeout)
+}
+
+fn poll_with_timeout(
+    memory: &mut GuestMemory,
+    state: &LoadedStaticElf,
+    args: &[u64; 6],
+    timeout: libc::c_int,
+) -> i64 {
     let Ok(count) = usize::try_from(args[1]) else {
         return negative_errno(libc::EINVAL);
     };
@@ -2524,9 +2831,10 @@ fn poll(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i
         }
     }
 
-    // Host wall time is outside the deterministic guest clock. Preserve
-    // already-ready events while making every backend poll nonblocking.
-    let ready = unsafe { libc::poll(poll_fds.as_mut_ptr(), count as libc::nfds_t, 0) };
+    // SYS_poll remains nonblocking for deterministic personality calls. The
+    // concurrent KVM ppoll path may block in the host so QEMU's root event loop
+    // can wait for worker eventfds without spinning on virtual clock reads.
+    let ready = unsafe { libc::poll(poll_fds.as_mut_ptr(), count as libc::nfds_t, timeout) };
     if ready < 0 {
         return io_error(std::io::Error::last_os_error());
     }
@@ -6764,6 +7072,7 @@ mod tests {
         const PAYLOAD: u64 = 0x200;
         const READ_BUFFER: u64 = 0x300;
         const POLL_FD: u64 = 0x400;
+        const POLL_TIMEOUT: u64 = 0x500;
 
         let root = TestDir::new();
         let mut state = test_state(&root.0);
@@ -6910,6 +7219,26 @@ mod tests {
         let poll_fd: libc::pollfd = read_struct(&memory, POLL_FD);
         assert_eq!(poll_fd.fd, pipe_fds[0]);
         assert_eq!(poll_fd.revents, 0);
+        assert_eq!(
+            write_struct(
+                &mut memory,
+                POLL_TIMEOUT,
+                &libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                },
+            ),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_ppoll,
+                [POLL_FD, 1, POLL_TIMEOUT, 0, KERNEL_SIGSET_SIZE as u64, 0],
+            ),
+            0
+        );
 
         assert_eq!(
             syscall_result(
@@ -6938,6 +7267,16 @@ mod tests {
         let poll_fd: libc::pollfd = read_struct(&memory, POLL_FD);
         assert_eq!(poll_fd.fd, pipe_fds[0]);
         assert_eq!(poll_fd.revents, libc::POLLIN);
+        assert_eq!(write_struct(&mut memory, POLL_FD, &poll_fd), 0);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_ppoll,
+                [POLL_FD, 1, POLL_TIMEOUT, 0, KERNEL_SIGSET_SIZE as u64, 0],
+            ),
+            1
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -9618,6 +9957,81 @@ mod tests {
             ),
             negative_errno(libc::EINVAL)
         );
+    }
+
+    #[test]
+    fn thread_executors_share_mmap_allocation_cursor() {
+        let root = TestDir::new();
+        let memory_size = BOOT_RESERVED_END + 8 * PAGE_SIZE;
+        let mut state = test_state(&root.0);
+        state.mmap_next = BOOT_RESERVED_END + PAGE_SIZE;
+        state.mmap_limit = memory_size;
+        let memory = GuestMemory::new(0, memory_size as usize).unwrap();
+        let mut parent = ElfExecutor::new(state, false);
+        let mut child = parent.thread_child(2).unwrap();
+        let request = SyscallRequest::new(
+            libc::SYS_mmap as u64,
+            [
+                0,
+                PAGE_SIZE,
+                (libc::PROT_READ | libc::PROT_WRITE) as u64,
+                (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS) as u64,
+                -1_i32 as u64,
+                0,
+            ],
+        );
+
+        let first = parent.execute(&request, &memory) as u64;
+        let second = child.execute(&request, &memory) as u64;
+        assert_eq!(first, BOOT_RESERVED_END + PAGE_SIZE);
+        assert_eq!(second, first + PAGE_SIZE);
+    }
+
+    #[test]
+    fn thread_executors_share_descriptor_replacement() {
+        let root = TestDir::new();
+        let old_path = root.0.join("old");
+        let new_path = root.0.join("new");
+        std::fs::write(&old_path, b"old").unwrap();
+        std::fs::write(&new_path, b"new").unwrap();
+
+        let mut state = test_state(&root.0);
+        state
+            .files
+            .insert(3, std::fs::File::open(old_path).unwrap());
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let mut parent = ElfExecutor::new(state, false);
+        let mut child = parent.thread_child(2).unwrap();
+
+        assert_eq!(
+            parent.execute(
+                &SyscallRequest::new(libc::SYS_close as u64, [3, 0, 0, 0, 0, 0]),
+                &memory,
+            ),
+            0
+        );
+        write_c_string(&mut memory, 0x100, new_path.to_str().unwrap());
+        assert_eq!(
+            parent.execute(
+                &SyscallRequest::new(
+                    libc::SYS_openat as u64,
+                    [libc::AT_FDCWD as u64, 0x100, libc::O_RDONLY as u64, 0, 0, 0],
+                ),
+                &memory,
+            ),
+            3
+        );
+
+        assert_eq!(
+            child.execute(
+                &SyscallRequest::new(libc::SYS_read as u64, [3, 0x200, 3, 0, 0, 0]),
+                &memory,
+            ),
+            3
+        );
+        let mut bytes = [0; 3];
+        memory.read(0x200, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"new");
     }
 
     #[test]

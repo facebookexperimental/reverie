@@ -39,15 +39,15 @@ use crate::KvmBackend;
 use crate::Result;
 use crate::SyscallRequest;
 use crate::VMCALL_SYSCALL_TRANSPORT;
-use crate::bootstrap::BOOT_RESERVED_END;
 use crate::bootstrap::SYSCALL_FRAME_ADDRESS;
+use crate::bootstrap::THREAD_SYSCALL_AREA_START;
 use crate::bootstrap::set_user_segment_base;
 use crate::executor::ElfExecutor;
 use crate::executor::is_process_syscall;
 
 const GUEST_PID: i32 = 1;
 const STACK_CAPACITY: usize = 4096;
-const TOOL_STACK_TOP: u64 = BOOT_RESERVED_END;
+const TOOL_STACK_TOP: u64 = THREAD_SYSCALL_AREA_START;
 const TOOL_STACK_BOTTOM: u64 = TOOL_STACK_TOP - STACK_CAPACITY as u64;
 
 type TailResult = Arc<Mutex<Option<std::result::Result<i64, Errno>>>>;
@@ -237,12 +237,11 @@ impl KvmStack {
             !checked_out.swap(true, Ordering::SeqCst),
             "cannot retrieve a KVM guest stack while its previous guard is live",
         );
-        let top =
-            if memory.guest_base() <= BOOT_RESERVED_END && memory.guest_end() >= TOOL_STACK_TOP {
-                TOOL_STACK_TOP
-            } else {
-                memory.guest_end()
-            };
+        let top = if memory.guest_base() <= TOOL_STACK_TOP && memory.guest_end() >= TOOL_STACK_TOP {
+            TOOL_STACK_TOP
+        } else {
+            memory.guest_end()
+        };
         let capacity = usize::try_from(top - memory.guest_base())
             .unwrap_or(usize::MAX)
             .min(STACK_CAPACITY);
@@ -625,6 +624,7 @@ impl KvmBackend {
             set_user_segment_base(&self.vcpu, segment, address)?;
         }
         if let Some(code) = executor.take_exit() {
+            self.cancel_guest_threads();
             notify_tool_exit(
                 tool,
                 pid,
@@ -656,8 +656,22 @@ impl KvmBackend {
                     let registers = self.vcpu.get_regs()?;
                     let request = SyscallRequest::read_from(&memory, frame_address)?;
                     let syscall = request.into_syscall()?;
-                    let process_syscall = is_process_syscall(request.number());
-                    let subscribed = !process_syscall
+                    // TODO-HUMAN-REVIEW(PR-172): Review concurrent KVM root
+                    // syscall routing that bypasses Detcore tool callbacks.
+                    let backend_owned = is_process_syscall(request.number())
+                        // KVM guest workers run outside Detcore's scheduler. Root
+                        // futexes must use the same host-backed words as workers,
+                        // or Detcore sees no runnable thread and deadlocks.
+                        || request.number() == libc::SYS_futex as u64
+                        // QEMU's root event loop waits on worker eventfds. KVM
+                        // syscall injection cannot perform ppoll, so use the
+                        // personality's translated host descriptors directly.
+                        || request.number() == libc::SYS_ppoll as u64
+                        // ppoll can report standard input ready at EOF. Keep
+                        // the following vectored read in the same translated
+                        // KVM descriptor domain rather than injecting it.
+                        || request.number() == libc::SYS_readv as u64;
+                    let subscribed = !backend_owned
                         && subscriptions
                             .iter_syscalls()
                             .any(|number| number == syscall.number());
@@ -719,6 +733,7 @@ impl KvmBackend {
                 pending_exit = pending_exit.or_else(|| executor.take_exit());
             }
             if let Some(code) = pending_exit {
+                self.cancel_guest_threads();
                 notify_tool_exit(
                     tool,
                     pid,

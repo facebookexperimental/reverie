@@ -37,8 +37,14 @@ const IDT_ADDRESS: u64 = 0xa000;
 const EXCEPTION_STUB_ADDRESS: u64 = 0xb000;
 const EXCEPTION_STACK_BOTTOM: u64 = 0xc000;
 const EXCEPTION_STACK_TOP: u64 = 0xd000;
-// Includes the 0xd000..0xe000 Tool injection scratch page.
-pub(crate) const BOOT_RESERVED_END: u64 = 0xe000;
+// Includes the 0xd000..0xe000 Tool injection scratch page and 64 private
+// trampoline/frame pairs used by concurrent KVM guest threads.
+// TODO-HUMAN-REVIEW(PR-172): Review the bounded per-thread syscall transport layout.
+pub(crate) const THREAD_SYSCALL_AREA_START: u64 = 0xe000;
+pub(crate) const THREAD_SYSCALL_AREA_STRIDE: u64 = 2 * PAGE_SIZE;
+pub(crate) const MAX_GUEST_THREADS: u64 = 64;
+pub(crate) const BOOT_RESERVED_END: u64 =
+    THREAD_SYSCALL_AREA_START + THREAD_SYSCALL_AREA_STRIDE * MAX_GUEST_THREADS;
 
 const EXCEPTION_VECTOR_COUNT: usize = 32;
 const IDT_ENTRY_SIZE: usize = 16;
@@ -84,6 +90,30 @@ pub(crate) fn configure_long_mode(
     stack_pointer: u64,
     hypercall_instruction: [u8; 3],
 ) -> Result<()> {
+    configure_long_mode_with_syscall_area(
+        memory,
+        vcpu,
+        entry_point,
+        stack_pointer,
+        hypercall_instruction,
+        SYSCALL_TRAMPOLINE_ADDRESS,
+        SYSCALL_FRAME_ADDRESS,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+// TODO-HUMAN-REVIEW(PR-172): Review per-vCPU syscall transport initialization.
+pub(crate) fn configure_long_mode_with_syscall_area(
+    memory: &mut GuestMemory,
+    vcpu: &VcpuFd,
+    entry_point: u64,
+    stack_pointer: u64,
+    hypercall_instruction: [u8; 3],
+    syscall_trampoline_address: u64,
+    syscall_frame_address: u64,
+    initialize_shared_tables: bool,
+) -> Result<()> {
     if memory.guest_base() != 0
         || memory.guest_end() <= BOOT_RESERVED_END
         || memory.guest_end() > MAX_IDENTITY_MAP
@@ -91,10 +121,12 @@ pub(crate) fn configure_long_mode(
         return Err(Error::LongModeMemoryTooSmall);
     }
 
-    write_descriptor_tables(memory)?;
-    write_page_tables(memory)?;
-    let trampoline = syscall_trampoline(hypercall_instruction);
-    memory.write_raw(SYSCALL_TRAMPOLINE_ADDRESS, &trampoline)?;
+    if initialize_shared_tables {
+        write_descriptor_tables(memory)?;
+        write_page_tables(memory)?;
+    }
+    let trampoline = syscall_trampoline(hypercall_instruction, syscall_frame_address);
+    memory.write_raw(syscall_trampoline_address, &trampoline)?;
 
     let mut sregs = vcpu.get_sregs()?;
     sregs.gdt.base = GDT_ADDRESS;
@@ -133,7 +165,7 @@ pub(crate) fn configure_long_mode(
         },
         kvm_msr_entry {
             index: MSR_LSTAR,
-            data: SYSCALL_TRAMPOLINE_ADDRESS,
+            data: syscall_trampoline_address,
             ..Default::default()
         },
         kvm_msr_entry {
@@ -181,9 +213,11 @@ pub(crate) fn set_user_segment_base(
     Ok(())
 }
 
+// TODO-HUMAN-REVIEW(PR-172): Review syscall-frame selection for concurrent vCPUs.
 pub(crate) fn configure_process_syscall_return(
     memory: &GuestMemory,
     vcpu: &VcpuFd,
+    syscall_frame_address: u64,
     result: i64,
     stack_pointer: Option<u64>,
 ) -> Result<()> {
@@ -201,17 +235,26 @@ pub(crate) fn configure_process_syscall_return(
     sregs.gs.base = gs_base;
     vcpu.set_sregs(&sregs)?;
 
-    let return_rip = read_u64(memory, frame_word_address_u64(RETURN_RIP_WORD))?;
-    let return_flags = read_u64(memory, frame_word_address_u64(RETURN_FLAGS_WORD))?;
+    let return_rip = read_u64(
+        memory,
+        frame_word_address_u64(syscall_frame_address, RETURN_RIP_WORD),
+    )?;
+    let return_flags = read_u64(
+        memory,
+        frame_word_address_u64(syscall_frame_address, RETURN_FLAGS_WORD),
+    )?;
     let mut regs = vcpu.get_regs()?;
     regs.rax = result as u64;
-    regs.rdi = read_u64(memory, frame_word_address_u64(1))?;
-    regs.rsi = read_u64(memory, frame_word_address_u64(2))?;
-    regs.rdx = read_u64(memory, frame_word_address_u64(3))?;
-    regs.r10 = read_u64(memory, frame_word_address_u64(4))?;
-    regs.r8 = read_u64(memory, frame_word_address_u64(5))?;
-    regs.r9 = read_u64(memory, frame_word_address_u64(6))?;
-    regs.rbx = read_u64(memory, frame_word_address_u64(SAVED_RBX_WORD))?;
+    regs.rdi = read_u64(memory, frame_word_address_u64(syscall_frame_address, 1))?;
+    regs.rsi = read_u64(memory, frame_word_address_u64(syscall_frame_address, 2))?;
+    regs.rdx = read_u64(memory, frame_word_address_u64(syscall_frame_address, 3))?;
+    regs.r10 = read_u64(memory, frame_word_address_u64(syscall_frame_address, 4))?;
+    regs.r8 = read_u64(memory, frame_word_address_u64(syscall_frame_address, 5))?;
+    regs.r9 = read_u64(memory, frame_word_address_u64(syscall_frame_address, 6))?;
+    regs.rbx = read_u64(
+        memory,
+        frame_word_address_u64(syscall_frame_address, SAVED_RBX_WORD),
+    )?;
     regs.rcx = return_rip;
     regs.r11 = return_flags;
     regs.rip = return_rip;
@@ -223,12 +266,15 @@ pub(crate) fn configure_process_syscall_return(
     Ok(())
 }
 
+// TODO-HUMAN-REVIEW(PR-172): Review per-thread trampoline park/unpark updates.
 pub(crate) fn set_syscall_return_park(
     memory: &mut GuestMemory,
     hypercall_instruction: [u8; 3],
+    syscall_trampoline_address: u64,
+    syscall_frame_address: u64,
     park: bool,
 ) -> Result<()> {
-    let trampoline = syscall_trampoline(hypercall_instruction);
+    let trampoline = syscall_trampoline(hypercall_instruction, syscall_frame_address);
     let return_offset = trampoline
         .windows(hypercall_instruction.len())
         .position(|window| window == hypercall_instruction)
@@ -239,7 +285,7 @@ pub(crate) fn set_syscall_return_park(
     } else {
         trampoline[return_offset]
     };
-    memory.write_raw(SYSCALL_TRAMPOLINE_ADDRESS + return_offset as u64, &[byte])
+    memory.write_raw(syscall_trampoline_address + return_offset as u64, &[byte])
 }
 
 fn write_descriptor_tables(memory: &mut GuestMemory) -> Result<()> {
@@ -413,59 +459,95 @@ fn gdt_entry(flags: u64, base: u64, limit: u64) -> u64 {
         | (limit & 0x0000_ffff)
 }
 
-fn syscall_trampoline(hypercall_instruction: [u8; 3]) -> Vec<u8> {
+fn syscall_trampoline(hypercall_instruction: [u8; 3], syscall_frame_address: u64) -> Vec<u8> {
     let mut code = Vec::with_capacity(192);
 
-    store_absolute(&mut code, 0x48, 0x04, 0);
-    store_absolute(&mut code, 0x48, 0x3c, 1);
-    store_absolute(&mut code, 0x48, 0x34, 2);
-    store_absolute(&mut code, 0x48, 0x14, 3);
-    store_absolute(&mut code, 0x4c, 0x14, 4);
-    store_absolute(&mut code, 0x4c, 0x04, 5);
-    store_absolute(&mut code, 0x4c, 0x0c, 6);
-    store_absolute(&mut code, 0x48, 0x0c, RETURN_RIP_WORD);
-    store_absolute(&mut code, 0x4c, 0x1c, RETURN_FLAGS_WORD);
-    store_absolute(&mut code, 0x48, 0x1c, SAVED_RBX_WORD);
+    store_absolute(&mut code, syscall_frame_address, 0x48, 0x04, 0);
+    store_absolute(&mut code, syscall_frame_address, 0x48, 0x3c, 1);
+    store_absolute(&mut code, syscall_frame_address, 0x48, 0x34, 2);
+    store_absolute(&mut code, syscall_frame_address, 0x48, 0x14, 3);
+    store_absolute(&mut code, syscall_frame_address, 0x4c, 0x14, 4);
+    store_absolute(&mut code, syscall_frame_address, 0x4c, 0x04, 5);
+    store_absolute(&mut code, syscall_frame_address, 0x4c, 0x0c, 6);
+    store_absolute(
+        &mut code,
+        syscall_frame_address,
+        0x48,
+        0x0c,
+        RETURN_RIP_WORD,
+    );
+    store_absolute(
+        &mut code,
+        syscall_frame_address,
+        0x4c,
+        0x1c,
+        RETURN_FLAGS_WORD,
+    );
+    store_absolute(&mut code, syscall_frame_address, 0x48, 0x1c, SAVED_RBX_WORD);
 
     code.extend_from_slice(&[0x48, 0xc7, 0xc0]);
     code.extend_from_slice(&(VMCALL_SYSCALL_TRANSPORT as u32).to_le_bytes());
     code.extend_from_slice(&[0x48, 0xbb]);
-    code.extend_from_slice(&SYSCALL_FRAME_ADDRESS.to_le_bytes());
+    code.extend_from_slice(&syscall_frame_address.to_le_bytes());
     code.extend_from_slice(&[0x48, 0xc7, 0xc1, 1, 0, 0, 0]);
     code.extend_from_slice(&[0x31, 0xd2, 0x31, 0xf6]);
     code.extend_from_slice(&hypercall_instruction);
 
-    load_absolute(&mut code, 0x48, 0x04, RESULT_WORD);
-    load_absolute(&mut code, 0x48, 0x3c, 1);
-    load_absolute(&mut code, 0x48, 0x34, 2);
-    load_absolute(&mut code, 0x48, 0x14, 3);
-    load_absolute(&mut code, 0x4c, 0x14, 4);
-    load_absolute(&mut code, 0x4c, 0x04, 5);
-    load_absolute(&mut code, 0x4c, 0x0c, 6);
-    load_absolute(&mut code, 0x48, 0x0c, RETURN_RIP_WORD);
-    load_absolute(&mut code, 0x4c, 0x1c, RETURN_FLAGS_WORD);
-    load_absolute(&mut code, 0x48, 0x1c, SAVED_RBX_WORD);
+    load_absolute(&mut code, syscall_frame_address, 0x48, 0x04, RESULT_WORD);
+    load_absolute(&mut code, syscall_frame_address, 0x48, 0x3c, 1);
+    load_absolute(&mut code, syscall_frame_address, 0x48, 0x34, 2);
+    load_absolute(&mut code, syscall_frame_address, 0x48, 0x14, 3);
+    load_absolute(&mut code, syscall_frame_address, 0x4c, 0x14, 4);
+    load_absolute(&mut code, syscall_frame_address, 0x4c, 0x04, 5);
+    load_absolute(&mut code, syscall_frame_address, 0x4c, 0x0c, 6);
+    load_absolute(
+        &mut code,
+        syscall_frame_address,
+        0x48,
+        0x0c,
+        RETURN_RIP_WORD,
+    );
+    load_absolute(
+        &mut code,
+        syscall_frame_address,
+        0x4c,
+        0x1c,
+        RETURN_FLAGS_WORD,
+    );
+    load_absolute(&mut code, syscall_frame_address, 0x48, 0x1c, SAVED_RBX_WORD);
     code.extend_from_slice(&[0x48, 0x0f, 0x07]);
     code
 }
 
-fn store_absolute(code: &mut Vec<u8>, rex: u8, register: u8, word: usize) {
+fn store_absolute(
+    code: &mut Vec<u8>,
+    syscall_frame_address: u64,
+    rex: u8,
+    register: u8,
+    word: usize,
+) {
     code.extend_from_slice(&[rex, 0x89, register, 0x25]);
-    code.extend_from_slice(&frame_word_address(word).to_le_bytes());
+    code.extend_from_slice(&frame_word_address(syscall_frame_address, word).to_le_bytes());
 }
 
-fn load_absolute(code: &mut Vec<u8>, rex: u8, register: u8, word: usize) {
+fn load_absolute(
+    code: &mut Vec<u8>,
+    syscall_frame_address: u64,
+    rex: u8,
+    register: u8,
+    word: usize,
+) {
     code.extend_from_slice(&[rex, 0x8b, register, 0x25]);
-    code.extend_from_slice(&frame_word_address(word).to_le_bytes());
+    code.extend_from_slice(&frame_word_address(syscall_frame_address, word).to_le_bytes());
 }
 
-fn frame_word_address(word: usize) -> u32 {
-    u32::try_from(frame_word_address_u64(word))
+fn frame_word_address(syscall_frame_address: u64, word: usize) -> u32 {
+    u32::try_from(frame_word_address_u64(syscall_frame_address, word))
         .expect("syscall frame must fit in an absolute disp32 address")
 }
 
-fn frame_word_address_u64(word: usize) -> u64 {
-    SYSCALL_FRAME_ADDRESS + (word * std::mem::size_of::<u64>()) as u64
+fn frame_word_address_u64(syscall_frame_address: u64, word: usize) -> u64 {
+    syscall_frame_address + (word * std::mem::size_of::<u64>()) as u64
 }
 
 #[cfg(test)]
@@ -474,7 +556,7 @@ mod tests {
 
     #[test]
     fn trampoline_preserves_syscall_return_state() {
-        let code = syscall_trampoline([0x0f, 0x01, 0xc1]);
+        let code = syscall_trampoline([0x0f, 0x01, 0xc1], SYSCALL_FRAME_ADDRESS);
 
         assert!(code.windows(3).any(|window| window == [0x0f, 0x01, 0xc1]));
         assert_eq!(&code[code.len() - 3..], &[0x48, 0x0f, 0x07]);
