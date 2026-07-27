@@ -3,6 +3,7 @@
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs::File;
+use std::future::Future;
 use std::io;
 use std::io::Write;
 use std::mem::MaybeUninit;
@@ -310,6 +311,48 @@ enum ChildWait {
     Output(Output),
 }
 
+async fn serve_rpc_until<G, F, T>(server: RpcServer<G>, completion: F) -> io::Result<T>
+where
+    G: GlobalTool + 'static,
+    F: Future<Output = io::Result<T>>,
+{
+    // JoinSet aborts the server if this future is cancelled. RpcServer::serve
+    // owns the per-connection JoinSet, so aborting it also releases every
+    // outstanding connection and its GlobalTool Arc.
+    let mut serving = tokio::task::JoinSet::new();
+    serving.spawn(server.serve());
+    tokio::pin!(completion);
+
+    let result = tokio::select! {
+        biased;
+        result = &mut completion => result,
+        result = serving.join_next() => {
+            let message = match result {
+                Some(Ok(Ok(()))) => "LiteInst coordinator stopped unexpectedly".to_owned(),
+                Some(Ok(Err(error))) => error.to_string(),
+                Some(Err(error)) => error.to_string(),
+                None => "LiteInst coordinator task disappeared".to_owned(),
+            };
+            return Err(io::Error::other(message));
+        }
+    };
+
+    serving.abort_all();
+    while let Some(server_result) = serving.join_next().await {
+        match server_result {
+            Err(error) if error.is_cancelled() => {}
+            Ok(Ok(())) => {
+                return Err(io::Error::other(
+                    "LiteInst coordinator stopped unexpectedly",
+                ));
+            }
+            Ok(Err(error)) => return Err(io::Error::other(error.to_string())),
+            Err(error) => return Err(io::Error::other(error.to_string())),
+        }
+    }
+    result
+}
+
 async fn launch<T>(
     mut command: Command,
     config: <T::GlobalState as GlobalTool>::Config,
@@ -383,33 +426,25 @@ where
     };
     let mut child = child_command.spawn()?;
     drop(bootstrap);
-    let mut wait = tokio::task::spawn_blocking(move || {
+    let wait = tokio::task::spawn_blocking(move || {
         if capture_output {
             child.wait_with_output().map(ChildWait::Output)
         } else {
             child.wait().map(ChildWait::Status)
         }
     });
-    let wait = loop {
-        tokio::select! {
-            biased;
-            result = server.serve_one() => {
-                result.map_err(|error| io::Error::other(error.to_string()))?;
-            }
-            result = &mut wait => {
-                let wait = result.map_err(|error| io::Error::other(error.to_string()))??;
-                if !connected.load(Ordering::Acquire) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::ConnectionAborted,
-                        "LiteInst guest exited before connecting to the coordinator; static executables and loader failures are unsupported",
-                    )
-                    .into());
-                }
-                break wait;
-            }
-        }
-    };
-    drop(server);
+    let wait = serve_rpc_until(server, async move {
+        wait.await
+            .map_err(|error| io::Error::other(error.to_string()))?
+    })
+    .await?;
+    if !connected.load(Ordering::Acquire) {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "LiteInst guest exited before connecting to the coordinator; static executables and loader failures are unsupported",
+        )
+        .into());
+    }
     let global = Arc::try_unwrap(global)
         .map_err(|_| io::Error::other("LiteInst coordinator state still has owners"))?;
     Ok((wait, global))
@@ -432,8 +467,66 @@ fn tool_preload_path() -> io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use std::os::fd::IntoRawFd;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicU64;
+    use std::time::Duration;
+
+    use reverie::Tid;
+    use reverie_preload::rpc::CoordinatorClient;
 
     use super::*;
+
+    #[derive(Default)]
+    struct MultiClientGlobal {
+        total: AtomicU64,
+        senders: Mutex<Vec<i32>>,
+    }
+
+    #[reverie::global_tool]
+    impl GlobalTool for MultiClientGlobal {
+        type Request = u64;
+        type Response = u64;
+        type Config = u64;
+
+        async fn receive_rpc(&self, from: Tid, amount: u64) -> u64 {
+            self.senders.lock().unwrap().push(from.as_raw());
+            self.total.fetch_add(amount, Ordering::Relaxed) + amount
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn coordinator_serves_multiple_local_rpc_connections() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("coordinator.sock");
+        let global = Arc::new(MultiClientGlobal::default());
+        let server = RpcServer::bind(&socket, global.clone(), 41).unwrap();
+
+        let clients = tokio::task::spawn_blocking(move || -> io::Result<()> {
+            let mut first = CoordinatorClient::connect(&socket)?;
+            let mut second = CoordinatorClient::connect(&socket)?;
+            assert_eq!(first.config::<u64>()?, 41);
+            assert_eq!(second.config::<u64>()?, 41);
+
+            let first_total: u64 = first.send(Tid::from_raw(101), 2_u64)?;
+            let second_total: u64 = second.send(Tid::from_raw(202), 3_u64)?;
+            assert_eq!(first_total, 2);
+            assert_eq!(second_total, 5);
+            Ok(())
+        });
+        let completion = async move {
+            clients
+                .await
+                .map_err(|error| io::Error::other(error.to_string()))?
+        };
+
+        tokio::time::timeout(Duration::from_secs(5), serve_rpc_until(server, completion))
+            .await
+            .expect("the second local RPC connection blocked at its config handshake")
+            .unwrap();
+
+        assert_eq!(global.total.load(Ordering::Relaxed), 5);
+        assert_eq!(*global.senders.lock().unwrap(), [101, 202]);
+    }
 
     #[test]
     fn rejects_and_closes_multiple_matching_bootstraps() {

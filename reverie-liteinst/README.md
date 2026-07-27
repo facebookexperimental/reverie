@@ -20,7 +20,9 @@ and `reverie-rpc-transport`.
 5. `LiteinstGuest<T>` supplies in-process memory/register access and syscall
    injection through the trusted gate. `CoordinatorRpc<G>` serializes
    `GlobalRPC` messages over the same UDS/bincode framing as
-   `reverie-rpc-transport::RpcServer<G>`.
+   `reverie-rpc-transport::RpcServer<G>`. The launcher accepts concurrent local
+   connections against the one coordinator-owned global state and cancels any
+   outstanding connection tasks when the guest run ends.
 
 The regression proof reports `calls=32 traps=1 hooks=32` and sends a real
 Reverie tool RPC for every callback.
@@ -44,9 +46,10 @@ without a coordinator.
 ## Current boundaries
 
 - Dynamically linked, non-`AT_SECURE` Linux x86-64 guests only.
-- One coordinator connection, one process, and one thread are supported by
-  `LiteinstBackend`. Tool-mode clone/fork/vfork injection is rejected, and
-  process-tree reconnect and exec rebootstrap are not implemented.
+- One process and one thread are supported by `LiteinstBackend`. The
+  coordinator can service multiple simultaneous tool connections, but
+  tool-mode clone/fork/vfork injection is rejected, and process-tree reconnect
+  and exec rebootstrap are not implemented.
 - Syscalls are hosted, and intercepted normal exits route thread and process
   callbacks on the supported single-process path. Signal deaths, CPUID,
   RDTSC/RDTSCP, and RDRAND/RDSEED events are not routed yet.
