@@ -3220,8 +3220,9 @@ fn fstat(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> 
     let mut stat = unsafe { stat.assume_init() };
     if let Some(&inode) = state.proc_files.get(&fd) {
         sanitize_proc_stat(&mut stat, inode);
+    } else {
+        sanitize_stat_timestamps(&mut stat);
     }
-    sanitize_stat_timestamps(&mut stat);
     write_struct(memory, args[1], &stat)
 }
 
@@ -3325,8 +3326,9 @@ fn fstatat_impl(
             .flatten();
         if let Some(inode) = empty_path_proc_inode {
             sanitize_proc_stat(&mut stat, inode);
+        } else {
+            sanitize_stat_timestamps(&mut stat);
         }
-        sanitize_stat_timestamps(&mut stat);
     }
     write_struct(memory, output_address, &stat)
 }
@@ -3431,27 +3433,32 @@ fn statx(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> 
     if let Some(metadata) = guest_path {
         sanitize_guest_fd_statx(state, metadata.guest_fd, &mut stat);
     } else {
-        for timestamp in [
-            &mut stat.stx_atime,
-            &mut stat.stx_btime,
-            &mut stat.stx_ctime,
-            &mut stat.stx_mtime,
-        ] {
-            timestamp.tv_sec = 0;
-            timestamp.tv_nsec = 0;
-        }
+        sanitize_statx_timestamps(&mut stat);
     }
     write_struct(memory, args[4], &stat)
 }
 
 // TODO-HUMAN-REVIEW(PR-92): Review this KVM compatibility implementation.
+// TODO-HUMAN-REVIEW(PR-183): Review fixed host-backed metadata timestamps.
 fn sanitize_stat_timestamps(stat: &mut libc::stat) {
-    stat.st_atime = 0;
+    stat.st_atime = DETERMINISTIC_METADATA_SECONDS;
     stat.st_atime_nsec = 0;
-    stat.st_mtime = 0;
+    stat.st_mtime = DETERMINISTIC_METADATA_SECONDS;
     stat.st_mtime_nsec = 0;
-    stat.st_ctime = 0;
+    stat.st_ctime = DETERMINISTIC_METADATA_SECONDS;
     stat.st_ctime_nsec = 0;
+}
+
+fn sanitize_statx_timestamps(stat: &mut libc::statx) {
+    for timestamp in [
+        &mut stat.stx_atime,
+        &mut stat.stx_btime,
+        &mut stat.stx_ctime,
+        &mut stat.stx_mtime,
+    ] {
+        timestamp.tv_sec = DETERMINISTIC_METADATA_SECONDS;
+        timestamp.tv_nsec = 0;
+    }
 }
 
 // TODO-HUMAN-REVIEW(PR-114): Review guest descriptor path resolution for statfs.
@@ -3948,9 +3955,9 @@ fn mknod_at(
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#80): Confirm the fixed timestamp against supported host filesystems.
-// Keep synthetic "now" inside the timestamp range supported by common host
+// Keep virtual metadata inside the timestamp range supported by common host
 // filesystems while remaining independent of host wall time.
-const DETERMINISTIC_UTIME_SECONDS: libc::time_t = 1_640_995_199;
+const DETERMINISTIC_METADATA_SECONDS: libc::time_t = 1_640_995_199;
 
 fn utimensat(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
     let raw_flags = args[3] as libc::c_int;
@@ -4015,17 +4022,17 @@ fn utimensat(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> 
 
     let mut times = requested_times.unwrap_or([
         libc::timespec {
-            tv_sec: DETERMINISTIC_UTIME_SECONDS,
+            tv_sec: DETERMINISTIC_METADATA_SECONDS,
             tv_nsec: 0,
         },
         libc::timespec {
-            tv_sec: DETERMINISTIC_UTIME_SECONDS,
+            tv_sec: DETERMINISTIC_METADATA_SECONDS,
             tv_nsec: 0,
         },
     ]);
     for time in &mut times {
         if time.tv_nsec == libc::UTIME_NOW {
-            time.tv_sec = DETERMINISTIC_UTIME_SECONDS;
+            time.tv_sec = DETERMINISTIC_METADATA_SECONDS;
             time.tv_nsec = 0;
         } else if time.tv_nsec != libc::UTIME_OMIT && !(0..1_000_000_000).contains(&time.tv_nsec) {
             return negative_errno(libc::EINVAL);
@@ -4532,15 +4539,7 @@ fn sanitize_guest_fd_statx(state: &LoadedStaticElf, guest_fd: libc::c_int, stat:
     stat.stx_ino = synthetic_guest_fd_object_inode(state, guest_fd);
     stat.stx_dev_major = SYNTHETIC_DEV_MAJOR;
     stat.stx_dev_minor = SYNTHETIC_GUEST_FD_DEV_MINOR;
-    for timestamp in [
-        &mut stat.stx_atime,
-        &mut stat.stx_btime,
-        &mut stat.stx_ctime,
-        &mut stat.stx_mtime,
-    ] {
-        timestamp.tv_sec = 0;
-        timestamp.tv_nsec = 0;
-    }
+    sanitize_statx_timestamps(stat);
 }
 
 fn synthetic_guest_fd_symlink_stat(guest_fd: libc::c_int) -> libc::stat {
@@ -8908,6 +8907,9 @@ mod tests {
         assert_eq!(file_stat.st_size, payload.len() as libc::off_t);
         assert_eq!(file_stat.st_mode & libc::S_IFMT, libc::S_IFREG);
         assert_eq!(file_stat.st_mode & 0o777, 0o600);
+        assert_eq!(file_stat.st_atime, DETERMINISTIC_METADATA_SECONDS);
+        assert_eq!(file_stat.st_mtime, DETERMINISTIC_METADATA_SECONDS);
+        assert_eq!(file_stat.st_ctime, DETERMINISTIC_METADATA_SECONDS);
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -9062,6 +9064,10 @@ mod tests {
         );
         let extended: libc::statx = read_struct(&memory, STAT_ADDRESS);
         assert_eq!(extended.stx_size, payload.len() as u64);
+        assert_eq!(extended.stx_atime.tv_sec, DETERMINISTIC_METADATA_SECONDS);
+        assert_eq!(extended.stx_btime.tv_sec, DETERMINISTIC_METADATA_SECONDS);
+        assert_eq!(extended.stx_ctime.tv_sec, DETERMINISTIC_METADATA_SECONDS);
+        assert_eq!(extended.stx_mtime.tv_sec, DETERMINISTIC_METADATA_SECONDS);
         assert_eq!(
             extended.stx_mask & libc::STATX_BASIC_STATS,
             libc::STATX_BASIC_STATS
@@ -10829,7 +10835,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::metadata(root.0.join("renamed")).unwrap().mtime(),
-            DETERMINISTIC_UTIME_SECONDS
+            DETERMINISTIC_METADATA_SECONDS
         );
         let fd = syscall_result(
             &mut memory,
