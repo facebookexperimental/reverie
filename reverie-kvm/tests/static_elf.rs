@@ -21,9 +21,18 @@ use reverie::GlobalRPC;
 use reverie::GlobalTool;
 use reverie::Guest;
 use reverie::Pid;
+use reverie::Subscription;
 use reverie::Tool;
+use reverie::syscalls::CArrayPtr;
+use reverie::syscalls::CStrPtr;
 use reverie::syscalls::Errno;
+use reverie::syscalls::Execve;
+use reverie::syscalls::Fork;
+use reverie::syscalls::FromToRaw;
 use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::PathPtr;
+use reverie::syscalls::Syscall;
+use reverie::syscalls::Sysno;
 use reverie_kvm::Error;
 use reverie_kvm::KvmBackend;
 use reverie_kvm::StraceTool;
@@ -119,11 +128,16 @@ fn set_interrupt_signal_blocked(blocked: bool) -> bool {
 #[derive(Default)]
 struct PostExecLog {
     at_random: Mutex<Option<usize>>,
+    calls: AtomicU64,
 }
 
 impl PostExecLog {
     fn at_random(&self) -> Option<usize> {
         *self.at_random.lock().expect("post-exec log lock poisoned")
+    }
+
+    fn calls(&self) -> u64 {
+        self.calls.load(Ordering::SeqCst)
     }
 }
 
@@ -134,6 +148,7 @@ impl GlobalTool for PostExecLog {
     type Config = ();
 
     async fn receive_rpc(&self, _from: Pid, at_random: usize) {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         *self.at_random.lock().expect("post-exec log lock poisoned") = Some(at_random);
     }
 }
@@ -146,6 +161,20 @@ impl Tool for PostExecTool {
     type GlobalState = PostExecLog;
     type ThreadState = ();
 
+    fn subscriptions(_config: &()) -> Subscription {
+        let mut subscriptions = Subscription::none();
+        subscriptions.syscalls([Sysno::execve]);
+        subscriptions
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, reverie::Error> {
+        guest.tail_inject(syscall).await
+    }
+
     async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
         let auxv = guest.auxv();
         let address = auxv.at_random().ok_or(Errno::EINVAL)?;
@@ -153,6 +182,85 @@ impl Tool for PostExecTool {
         // This lifecycle hook runs before the ELF entry point, matching execve.
         let address = unsafe { address.into_mut() };
         guest.memory().write_value(address, &POST_EXEC_RANDOM)
+    }
+}
+
+#[derive(Default)]
+struct StartExecLog {
+    post_exec_calls: AtomicU64,
+}
+
+impl StartExecLog {
+    fn post_exec_calls(&self) -> u64 {
+        self.post_exec_calls.load(Ordering::SeqCst)
+    }
+}
+
+#[reverie::global_tool]
+impl GlobalTool for StartExecLog {
+    type Request = ();
+    type Response = ();
+    type Config = (usize, usize, usize);
+
+    async fn receive_rpc(&self, _from: Pid, (): ()) {
+        self.post_exec_calls.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct StartExecTool;
+
+#[reverie::tool]
+impl Tool for StartExecTool {
+    type GlobalState = StartExecLog;
+    type ThreadState = ();
+
+    async fn handle_thread_start<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+    ) -> Result<(), reverie::Error> {
+        let (path, argv, envp) = *guest.config();
+        let execve = Execve::new()
+            .with_path(PathPtr::from_ptr(path as *const libc::c_char))
+            .with_argv(Option::<CArrayPtr<CStrPtr>>::from_raw(argv))
+            .with_envp(Option::<CArrayPtr<CStrPtr>>::from_raw(envp));
+        guest.inject(execve).await?;
+        Err(Errno::EINVAL.into())
+    }
+
+    async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
+        guest.send_rpc(()).await;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DoubleForkTool;
+
+#[reverie::tool]
+impl Tool for DoubleForkTool {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    fn subscriptions(_config: &()) -> Subscription {
+        let mut subscriptions = Subscription::none();
+        subscriptions.syscalls([Sysno::fork]);
+        subscriptions
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, reverie::Error> {
+        let Syscall::Fork(fork) = syscall else {
+            panic!("expected fork, got {syscall:?}");
+        };
+        let first = guest.inject(fork).await?;
+        let second = guest.inject(Fork::new()).await?;
+        assert!(first > 0);
+        assert!(second > first);
+        Ok(first)
     }
 }
 
@@ -1109,12 +1217,229 @@ fn tool_receives_post_exec_with_guest_auxv() {
             .unwrap();
 
     assert_eq!(exit_code, 0);
+    assert_eq!(log.calls(), 1);
     let address = log
         .at_random()
         .expect("post-exec hook did not observe AT_RANDOM");
     let mut random = [0; 16];
     backend.memory().read(address as u64, &mut random).unwrap();
     assert_eq!(random, POST_EXEC_RANDOM);
+}
+
+#[test]
+fn tool_receives_post_exec_after_root_execve() {
+    match Kvm::new() {
+        Ok(_) => {}
+        Err(error) if kvm_is_unavailable(&error) => {
+            eprintln!("skipping KVM post-exec replacement test: cannot open /dev/kvm: {error}");
+            return;
+        }
+        Err(error) => panic!("failed to probe /dev/kvm: {error}"),
+    }
+
+    let target = [
+        0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax, SYS_exit_group
+        0x31, 0xff, // xor edi, edi
+        0x0f, 0x05, // syscall
+        0x0f, 0x0b, // ud2
+    ];
+    let executable = TestExecutable::new(&static_elf(&target));
+    let path = executable.0.to_str().unwrap().as_bytes();
+
+    let mut root = Vec::new();
+    let path_operand = root.len() + 2;
+    root.extend_from_slice(&[0x48, 0xbf, 0, 0, 0, 0, 0, 0, 0, 0]); // movabs rdi, path
+    let argv_operand = root.len() + 2;
+    root.extend_from_slice(&[0x48, 0xbe, 0, 0, 0, 0, 0, 0, 0, 0]); // movabs rsi, argv
+    let envp_operand = root.len() + 2;
+    root.extend_from_slice(&[0x48, 0xba, 0, 0, 0, 0, 0, 0, 0, 0]); // movabs rdx, envp
+    root.extend_from_slice(&[
+        0xb8, 0x3b, 0x00, 0x00, 0x00, 0x0f, 0x05, // execve
+        0xb8, 0xe7, 0x00, 0x00, 0x00, 0xbf, 0x2a, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x0f,
+        0x0b, // exit_group(42); ud2
+    ]);
+
+    let path_address = LOAD_ADDRESS + root.len() as u64;
+    root.extend_from_slice(path);
+    root.push(0);
+    while !root.len().is_multiple_of(8) {
+        root.push(0);
+    }
+    let argv_address = LOAD_ADDRESS + root.len() as u64;
+    root.extend_from_slice(&path_address.to_le_bytes());
+    root.extend_from_slice(&0_u64.to_le_bytes());
+    let envp_address = LOAD_ADDRESS + root.len() as u64;
+    root.extend_from_slice(&0_u64.to_le_bytes());
+    root[path_operand..path_operand + 8].copy_from_slice(&path_address.to_le_bytes());
+    root[argv_operand..argv_operand + 8].copy_from_slice(&argv_address.to_le_bytes());
+    root[envp_operand..envp_operand + 8].copy_from_slice(&envp_address.to_le_bytes());
+
+    let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+    backend
+        .install_static_elf(&static_elf(&root), "/bin/root-exec-test")
+        .unwrap();
+
+    let (log, exit_code, stdout, stderr) =
+        futures::executor::block_on(backend.run_static_elf_with_tool::<PostExecTool>((), true))
+            .unwrap();
+
+    assert_eq!(exit_code, 0);
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+    assert_eq!(log.calls(), 2);
+}
+
+#[test]
+fn tool_executes_from_thread_start_before_initial_entry() {
+    match Kvm::new() {
+        Ok(_) => {}
+        Err(error) if kvm_is_unavailable(&error) => {
+            eprintln!("skipping KVM thread-start exec test: cannot open /dev/kvm: {error}");
+            return;
+        }
+        Err(error) => panic!("failed to probe /dev/kvm: {error}"),
+    }
+
+    let target = [
+        0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax, SYS_exit_group
+        0x31, 0xff, // xor edi, edi
+        0x0f, 0x05, // syscall
+        0x0f, 0x0b, // ud2
+    ];
+    let executable = TestExecutable::new(&static_elf(&target));
+    let path = executable.0.to_str().unwrap().as_bytes();
+
+    let mut root = vec![
+        0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax, SYS_exit_group
+        0xbf, 0x2a, 0x00, 0x00, 0x00, // mov edi, 42
+        0x0f, 0x05, // syscall
+        0x0f, 0x0b, // ud2
+    ];
+    let path_address = LOAD_ADDRESS + root.len() as u64;
+    root.extend_from_slice(path);
+    root.push(0);
+    while !root.len().is_multiple_of(8) {
+        root.push(0);
+    }
+    let argv_address = LOAD_ADDRESS + root.len() as u64;
+    root.extend_from_slice(&path_address.to_le_bytes());
+    root.extend_from_slice(&0_u64.to_le_bytes());
+    let envp_address = LOAD_ADDRESS + root.len() as u64;
+    root.extend_from_slice(&0_u64.to_le_bytes());
+
+    let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+    backend
+        .install_static_elf(&static_elf(&root), "/bin/thread-start-exec-test")
+        .unwrap();
+    let config = (
+        path_address as usize,
+        argv_address as usize,
+        envp_address as usize,
+    );
+    let (log, exit_code, stdout, stderr) = futures::executor::block_on(
+        backend.run_static_elf_with_tool::<StartExecTool>(config, true),
+    )
+    .unwrap();
+
+    assert_eq!(exit_code, 0);
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+    assert_eq!(log.post_exec_calls(), 1);
+}
+
+#[test]
+fn regular_injected_forks_complete_before_return() {
+    match Kvm::new() {
+        Ok(_) => {}
+        Err(error) if kvm_is_unavailable(&error) => {
+            eprintln!("skipping KVM regular fork injection test: cannot open /dev/kvm: {error}");
+            return;
+        }
+        Err(error) => panic!("failed to probe /dev/kvm: {error}"),
+    }
+
+    let code = [
+        0xb8, 0x39, 0x00, 0x00, 0x00, // mov eax, SYS_fork
+        0x0f, 0x05, // syscall
+        0x89, 0xc7, // mov edi, eax
+        0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax, SYS_exit_group
+        0x0f, 0x05, // syscall
+        0x0f, 0x0b, // ud2
+    ];
+    let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+    backend
+        .install_static_elf(&static_elf(&code), "/bin/double-injected-fork-test")
+        .unwrap();
+
+    let (_, exit_code, stdout, stderr) =
+        futures::executor::block_on(backend.run_static_elf_with_tool::<DoubleForkTool>((), true))
+            .unwrap();
+
+    assert_eq!(exit_code, 2);
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+}
+
+#[test]
+fn malformed_exec_returns_enoexec_without_replacing_image() {
+    match Kvm::new() {
+        Ok(_) => {}
+        Err(error) if kvm_is_unavailable(&error) => {
+            eprintln!("skipping KVM malformed exec test: cannot open /dev/kvm: {error}");
+            return;
+        }
+        Err(error) => panic!("failed to probe /dev/kvm: {error}"),
+    }
+
+    let executable = TestExecutable::new(b"not an ELF image");
+    let path = executable.0.to_str().unwrap().as_bytes();
+    let mut root = Vec::new();
+    let path_operand = root.len() + 2;
+    root.extend_from_slice(&[0x48, 0xbf, 0, 0, 0, 0, 0, 0, 0, 0]); // movabs rdi, path
+    let argv_operand = root.len() + 2;
+    root.extend_from_slice(&[0x48, 0xbe, 0, 0, 0, 0, 0, 0, 0, 0]); // movabs rsi, argv
+    let envp_operand = root.len() + 2;
+    root.extend_from_slice(&[0x48, 0xba, 0, 0, 0, 0, 0, 0, 0, 0]); // movabs rdx, envp
+    root.extend_from_slice(&[
+        0xb8, 0x3b, 0x00, 0x00, 0x00, 0x0f, 0x05, // execve
+        0xf7, 0xd8, // neg eax
+        0x89, 0xc7, // mov edi, eax
+        0xb8, 0xe7, 0x00, 0x00, 0x00, 0x0f, 0x05, // exit_group(errno)
+        0x0f, 0x0b, // ud2
+    ]);
+    let path_address = LOAD_ADDRESS + root.len() as u64;
+    root.extend_from_slice(path);
+    root.push(0);
+    while !root.len().is_multiple_of(8) {
+        root.push(0);
+    }
+    let argv_address = LOAD_ADDRESS + root.len() as u64;
+    root.extend_from_slice(&path_address.to_le_bytes());
+    root.extend_from_slice(&0_u64.to_le_bytes());
+    let envp_address = LOAD_ADDRESS + root.len() as u64;
+    root.extend_from_slice(&0_u64.to_le_bytes());
+    root[path_operand..path_operand + 8].copy_from_slice(&path_address.to_le_bytes());
+    root[argv_operand..argv_operand + 8].copy_from_slice(&argv_address.to_le_bytes());
+    root[envp_operand..envp_operand + 8].copy_from_slice(&envp_address.to_le_bytes());
+
+    for with_tool in [false, true] {
+        let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+        backend
+            .install_static_elf(&static_elf(&root), "/bin/malformed-exec-test")
+            .unwrap();
+        let (exit_code, stdout, stderr) = if with_tool {
+            let (_, exit_code, stdout, stderr) = futures::executor::block_on(
+                backend.run_static_elf_with_tool::<StraceTool>((), true),
+            )
+            .unwrap();
+            (exit_code, stdout, stderr)
+        } else {
+            backend.run_static_elf_captured().unwrap()
+        };
+        assert_eq!(exit_code, libc::ENOEXEC, "with_tool={with_tool}");
+        assert!(stdout.is_empty(), "with_tool={with_tool}");
+        assert!(stderr.is_empty(), "with_tool={with_tool}");
+    }
 }
 
 #[test]

@@ -41,23 +41,32 @@ use crate::SyscallRequest;
 use crate::VMCALL_SYSCALL_TRANSPORT;
 use crate::bootstrap::SYSCALL_FRAME_ADDRESS;
 use crate::bootstrap::TOOL_STACK_TOP;
+use crate::bootstrap::configure_process_syscall_return;
 use crate::bootstrap::set_user_segment_base;
 use crate::executor::ElfExecutor;
-use crate::executor::is_process_syscall;
+use crate::executor::ProcessAction;
 
 const GUEST_PID: i32 = 1;
 const STACK_CAPACITY: usize = 4096;
 const TOOL_STACK_BOTTOM: u64 = TOOL_STACK_TOP - STACK_CAPACITY as u64;
 
-type TailResult = Arc<Mutex<Option<std::result::Result<i64, Errno>>>>;
+enum HandlerSignal {
+    TailInjected {
+        result: std::result::Result<i64, Errno>,
+        image_replaced: bool,
+        process_exited: bool,
+    },
+    RuntimeError(Error),
+}
+
+type SharedHandlerSignal = Arc<Mutex<Option<HandlerSignal>>>;
 
 // AUTONOMOUS-BOT-IMPLEMENTED: Keep root syscalls that share worker state in one backend.
 // TODO-HUMAN-REVIEW(PR-173): Review KVM root syscall ownership.
 fn is_backend_owned_syscall(number: u64) -> bool {
-    is_process_syscall(number)
-        // KVM guest workers run outside Detcore's scheduler. Root futexes must
-        // use the same host-backed words as workers, or Detcore deadlocks.
-        || number == libc::SYS_futex as u64
+    // KVM guest workers run outside Detcore's scheduler. Root futexes must
+    // use the same host-backed words as workers, or Detcore deadlocks.
+    number == libc::SYS_futex as u64
         // QEMU's root event loop waits on worker eventfds. KVM syscall
         // injection cannot perform ppoll, so use translated host descriptors.
         || number == libc::SYS_ppoll as u64
@@ -87,6 +96,120 @@ where
     }
 }
 
+enum InjectionCompletion {
+    Returns,
+    DoesNotReturn {
+        image_replaced: bool,
+        process_exited: bool,
+    },
+}
+
+trait GuestSyscallExecutor: Send + Sync {
+    fn execute(&mut self, request: &SyscallRequest, memory: &GuestMemory) -> i64;
+
+    fn complete_injection(&mut self) -> Result<InjectionCompletion> {
+        Ok(InjectionCompletion::Returns)
+    }
+}
+
+struct DirectSyscallExecutor<'a> {
+    executor: &'a mut dyn SyscallExecutor,
+}
+
+impl GuestSyscallExecutor for DirectSyscallExecutor<'_> {
+    fn execute(&mut self, request: &SyscallRequest, memory: &GuestMemory) -> i64 {
+        self.executor.execute(request, memory)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ProcessBoundary {
+    frame_address: u64,
+    return_slot: usize,
+}
+
+enum ProcessExecutionContext {
+    Lifecycle,
+    SyscallBoundary(ProcessBoundary),
+    SyscallReturn,
+}
+
+struct StaticElfSyscallExecutor<'a> {
+    backend: &'a mut KvmBackend,
+    executor: &'a mut ElfExecutor,
+    memory: GuestMemory,
+    process_context: ProcessExecutionContext,
+    last_result: Option<i64>,
+    process_completed: &'a mut bool,
+}
+
+impl GuestSyscallExecutor for StaticElfSyscallExecutor<'_> {
+    fn execute(&mut self, request: &SyscallRequest, memory: &GuestMemory) -> i64 {
+        let result = self.executor.execute(request, memory);
+        self.last_result = Some(result);
+        result
+    }
+
+    fn complete_injection(&mut self) -> Result<InjectionCompletion> {
+        let Some(action) = self.executor.take_process_action() else {
+            return Ok(if self.executor.has_pending_exit() {
+                InjectionCompletion::DoesNotReturn {
+                    image_replaced: false,
+                    process_exited: true,
+                }
+            } else {
+                InjectionCompletion::Returns
+            });
+        };
+        let image_replaced = matches!(&action, ProcessAction::Exec { .. });
+        hide_tool_scratch(&self.memory)?;
+        let action_result = (|| match self.process_context {
+            ProcessExecutionContext::SyscallBoundary(boundary) => {
+                let result = self
+                    .last_result
+                    .expect("process action must have an injected syscall result");
+                SyscallRequest::write_result(&mut self.memory, boundary.frame_address, result)?;
+                // SAFETY: return_slot points into this stopped vCPU's stable
+                // KVM_RUN mapping. Publish it before re-entering the vCPU.
+                unsafe {
+                    (boundary.return_slot as *mut u64).write(0);
+                }
+                self.backend
+                    .run_process_action(self.executor, action, true)?;
+                self.process_context = ProcessExecutionContext::SyscallReturn;
+                Ok(())
+            }
+            ProcessExecutionContext::SyscallReturn => {
+                self.backend
+                    .run_process_action(self.executor, action, false)?;
+                Ok(())
+            }
+            ProcessExecutionContext::Lifecycle => match action {
+                ProcessAction::Exec { image, argv, envp } => {
+                    self.backend
+                        .exec_process(self.executor, &image, &argv, &envp)?;
+                    Ok(())
+                }
+                _ => Err(Error::UnexpectedVcpuExit(
+                    "fork/clone injection requires a guest syscall boundary".to_owned(),
+                )),
+            },
+        })();
+        let expose_result = expose_tool_scratch(&self.memory);
+        action_result?;
+        expose_result?;
+        *self.process_completed = true;
+        if image_replaced || self.executor.has_pending_exit() {
+            Ok(InjectionCompletion::DoesNotReturn {
+                image_replaced,
+                process_exited: self.executor.has_pending_exit(),
+            })
+        } else {
+            Ok(InjectionCompletion::Returns)
+        }
+    }
+}
+
 struct KvmGlobal<'a, G: GlobalTool> {
     pid: Pid,
     state: &'a G,
@@ -110,10 +233,10 @@ struct KvmGuest<'a, T: Tool> {
     auxv: &'a [(libc::c_ulong, libc::c_ulong)],
     registers: libc::user_regs_struct,
     thread_state: &'a mut T::ThreadState,
-    executor: &'a mut dyn SyscallExecutor,
+    executor: &'a mut dyn GuestSyscallExecutor,
     global_state: &'a T::GlobalState,
     config: &'a <T::GlobalState as GlobalTool>::Config,
-    tail_result: TailResult,
+    handler_signal: SharedHandlerSignal,
     stack_checked_out: Arc<AtomicBool>,
 }
 
@@ -125,10 +248,10 @@ impl<'a, T: Tool> KvmGuest<'a, T> {
         auxv: &'a [(libc::c_ulong, libc::c_ulong)],
         registers: libc::user_regs_struct,
         thread_state: &'a mut T::ThreadState,
-        executor: &'a mut dyn SyscallExecutor,
+        executor: &'a mut dyn GuestSyscallExecutor,
         global_state: &'a T::GlobalState,
         config: &'a <T::GlobalState as GlobalTool>::Config,
-        tail_result: TailResult,
+        handler_signal: SharedHandlerSignal,
         stack_checked_out: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -140,9 +263,16 @@ impl<'a, T: Tool> KvmGuest<'a, T> {
             executor,
             global_state,
             config,
-            tail_result,
+            handler_signal,
             stack_checked_out,
         }
+    }
+
+    fn signal_handler(&self, signal: HandlerSignal) {
+        *self
+            .handler_signal
+            .lock()
+            .expect("KVM handler signal lock poisoned") = Some(signal);
     }
 }
 
@@ -205,15 +335,40 @@ impl<T: Tool> Guest<T> for KvmGuest<'_, T> {
 
     async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> std::result::Result<i64, Errno> {
         let request = SyscallRequest::from_syscall(syscall);
-        raw_to_result(self.executor.execute(&request, &self.memory))
+        let result = raw_to_result(self.executor.execute(&request, &self.memory));
+        if result.is_ok() {
+            match self.executor.complete_injection() {
+                Ok(InjectionCompletion::DoesNotReturn {
+                    image_replaced,
+                    process_exited,
+                }) => {
+                    // TODO-HUMAN-REVIEW(PR-156): Review non-returning exec/exit injection.
+                    // Successful exec and exit injection cannot resume the old
+                    // handler after their process state transition completes.
+                    self.signal_handler(HandlerSignal::TailInjected {
+                        result,
+                        image_replaced,
+                        process_exited,
+                    });
+                    return std::future::pending().await;
+                }
+                Ok(InjectionCompletion::Returns) => {}
+                Err(error) => {
+                    self.signal_handler(HandlerSignal::RuntimeError(error));
+                    return std::future::pending().await;
+                }
+            }
+        }
+        result
     }
 
     async fn tail_inject<S: SyscallInfo>(&mut self, syscall: S) -> Never {
         let result = self.inject(syscall).await;
-        *self
-            .tail_result
-            .lock()
-            .expect("KVM tail-injection result lock poisoned") = Some(result);
+        self.signal_handler(HandlerSignal::TailInjected {
+            result,
+            image_replaced: false,
+            process_exited: false,
+        });
         std::future::pending().await
     }
 
@@ -362,22 +517,38 @@ impl MemoryAccess for KvmStack {
 
 enum HandlerOutcome<T> {
     Returned(T),
-    TailInjected(std::result::Result<i64, Errno>),
+    TailInjected {
+        result: std::result::Result<i64, Errno>,
+        image_replaced: bool,
+        process_exited: bool,
+    },
+    RuntimeError(Error),
 }
 
 async fn drive_handler<T>(
     future: impl Future<Output = T>,
-    tail_result: TailResult,
+    handler_signal: SharedHandlerSignal,
 ) -> HandlerOutcome<T> {
     let mut future = pin!(future);
     poll_fn(|context| match future.as_mut().poll(context) {
         Poll::Ready(result) => Poll::Ready(HandlerOutcome::Returned(result)),
-        Poll::Pending => match tail_result
+        Poll::Pending => match handler_signal
             .lock()
-            .expect("KVM tail-injection result lock poisoned")
+            .expect("KVM handler signal lock poisoned")
             .take()
         {
-            Some(result) => Poll::Ready(HandlerOutcome::TailInjected(result)),
+            Some(HandlerSignal::TailInjected {
+                result,
+                image_replaced,
+                process_exited,
+            }) => Poll::Ready(HandlerOutcome::TailInjected {
+                result,
+                image_replaced,
+                process_exited,
+            }),
+            Some(HandlerSignal::RuntimeError(error)) => {
+                Poll::Ready(HandlerOutcome::RuntimeError(error))
+            }
             None => Poll::Pending,
         },
     })
@@ -390,6 +561,70 @@ fn expose_tool_scratch(memory: &GuestMemory) -> Result<()> {
 
 fn hide_tool_scratch(memory: &GuestMemory) -> Result<()> {
     memory.unmap_user_range(TOOL_STACK_BOTTOM, STACK_CAPACITY as u64)
+}
+
+// TODO-HUMAN-REVIEW(PR-156): Review repeated post-exec lifecycle delivery.
+#[allow(clippy::too_many_arguments)]
+async fn run_post_exec_handler<T: Tool>(
+    backend: &mut KvmBackend,
+    tool: &T,
+    pid: Pid,
+    memory: &GuestMemory,
+    auxv: &mut Vec<(libc::c_ulong, libc::c_ulong)>,
+    thread_state: &mut T::ThreadState,
+    executor: &mut ElfExecutor,
+    global_state: &T::GlobalState,
+    config: &<T::GlobalState as GlobalTool>::Config,
+    stack_checked_out: &Arc<AtomicBool>,
+) -> Result<()> {
+    loop {
+        let handler_signal = Arc::new(Mutex::new(None));
+        expose_tool_scratch(memory)?;
+        let registers = kvm_registers(backend.vcpu.get_regs()?, 0);
+        let mut _process_completed = false;
+        let outcome = {
+            let mut guest_executor = StaticElfSyscallExecutor {
+                backend,
+                executor,
+                memory: memory.clone(),
+                process_context: ProcessExecutionContext::Lifecycle,
+                last_result: None,
+                process_completed: &mut _process_completed,
+            };
+            let mut guest = KvmGuest::<T>::new(
+                pid,
+                memory.clone(),
+                auxv,
+                registers,
+                thread_state,
+                &mut guest_executor,
+                global_state,
+                config,
+                handler_signal.clone(),
+                stack_checked_out.clone(),
+            );
+            drive_handler(tool.handle_post_exec(&mut guest), handler_signal).await
+        };
+        hide_tool_scratch(memory)?;
+        match outcome {
+            HandlerOutcome::Returned(Ok(())) => return Ok(()),
+            HandlerOutcome::Returned(Err(error)) => return Err(Error::PostExec(error)),
+            HandlerOutcome::RuntimeError(error) => return Err(error),
+            HandlerOutcome::TailInjected {
+                process_exited: true,
+                ..
+            } => return Ok(()),
+            HandlerOutcome::TailInjected {
+                image_replaced: true,
+                ..
+            } => *auxv = executor.auxv().to_vec(),
+            HandlerOutcome::TailInjected { .. } => {
+                return Err(Error::UnexpectedVcpuExit(
+                    "post-exec handler tail-injected a syscall".to_owned(),
+                ));
+            }
+        }
+    }
 }
 
 async fn notify_tool_exit<T: Tool>(
@@ -439,26 +674,31 @@ impl KvmBackend {
         let stack_checked_out = Arc::new(AtomicBool::new(false));
 
         let registers = kvm_registers(self.vcpu.get_regs()?, 0);
-        let tail_result = Arc::new(Mutex::new(None));
+        let handler_signal = Arc::new(Mutex::new(None));
         expose_tool_scratch(&memory)?;
         let start_outcome = {
+            let mut guest_executor = DirectSyscallExecutor {
+                executor: &mut executor,
+            };
             let mut guest = KvmGuest::<T>::new(
                 pid,
                 memory.clone(),
                 &auxv,
                 registers,
                 &mut thread_state,
-                &mut executor,
+                &mut guest_executor,
                 &global_state,
                 &config,
-                tail_result.clone(),
+                handler_signal.clone(),
                 stack_checked_out.clone(),
             );
-            drive_handler(tool.handle_thread_start(&mut guest), tail_result).await
+            drive_handler(tool.handle_thread_start(&mut guest), handler_signal).await
         };
         hide_tool_scratch(&memory)?;
-        if let HandlerOutcome::Returned(result) = start_outcome {
-            result.map_err(Error::Reverie)?;
+        match start_outcome {
+            HandlerOutcome::Returned(result) => result.map_err(Error::Reverie)?,
+            HandlerOutcome::RuntimeError(error) => return Err(error),
+            HandlerOutcome::TailInjected { .. } => {}
         }
 
         loop {
@@ -476,31 +716,35 @@ impl KvmBackend {
                         .iter_syscalls()
                         .any(|number| number == syscall.number());
                     let result = if subscribed {
-                        let tail_result = Arc::new(Mutex::new(None));
+                        let handler_signal = Arc::new(Mutex::new(None));
                         expose_tool_scratch(&memory)?;
                         let outcome = {
+                            let mut guest_executor = DirectSyscallExecutor {
+                                executor: &mut executor,
+                            };
                             let mut guest = KvmGuest::<T>::new(
                                 pid,
                                 memory.clone(),
                                 &auxv,
                                 kvm_registers(registers, request.number()),
                                 &mut thread_state,
-                                &mut executor,
+                                &mut guest_executor,
                                 &global_state,
                                 &config,
-                                tail_result.clone(),
+                                handler_signal.clone(),
                                 stack_checked_out.clone(),
                             );
                             drive_handler(
                                 tool.handle_syscall_event(&mut guest, syscall),
-                                tail_result,
+                                handler_signal,
                             )
                             .await
                         };
                         hide_tool_scratch(&memory)?;
                         match outcome {
                             HandlerOutcome::Returned(result) => handler_result_to_raw(result)?,
-                            HandlerOutcome::TailInjected(result) => result_to_raw(result),
+                            HandlerOutcome::TailInjected { result, .. } => result_to_raw(result),
+                            HandlerOutcome::RuntimeError(error) => return Err(error),
                         }
                     } else {
                         executor.execute(&request, &memory)
@@ -538,9 +782,11 @@ impl KvmBackend {
     /// ([`Self::run_static_elf`]) with the tool-interception path of
     /// [`Self::run_with_tool`]. A static ELF loaded by
     /// [`Self::install_static_elf`]/[`Self::install_static_elf_with_args`] runs
-    /// in long mode. Root-thread non-process syscalls selected by the tool's
-    /// subscriptions are delivered to `Tool::handle_syscall_event`; process
-    /// syscalls and child execution currently use the KVM personality directly.
+    /// in long mode. Root-thread syscalls selected by the tool's subscriptions
+    /// are delivered to `Tool::handle_syscall_event`, including deferred
+    /// fork/clone/exec/wait operations. A successful injected exec replaces the
+    /// image without resuming the old handler. Child execution still uses the
+    /// KVM personality directly and does not dispatch its syscalls through the tool.
     /// Tool `inject`/`tail_inject` calls are serviced by the ELF guest kernel
     /// ([`ElfExecutor`]). Unlike [`Self::run_with_tool`], results are written
     /// back into the guest's syscall frame (the trampoline reads them and
@@ -573,56 +819,73 @@ impl KvmBackend {
         let mut executor = ElfExecutor::new(loaded, capture_output);
 
         let registers = kvm_registers(self.vcpu.get_regs()?, 0);
-        let tail_result = Arc::new(Mutex::new(None));
+        let handler_signal = Arc::new(Mutex::new(None));
         expose_tool_scratch(&memory)?;
+        let mut _process_completed = false;
         let start_outcome = {
+            let mut guest_executor = StaticElfSyscallExecutor {
+                backend: self,
+                executor: &mut executor,
+                memory: memory.clone(),
+                process_context: ProcessExecutionContext::Lifecycle,
+                last_result: None,
+                process_completed: &mut _process_completed,
+            };
             let mut guest = KvmGuest::<T>::new(
                 pid,
                 memory.clone(),
                 &auxv,
                 registers,
                 &mut thread_state,
-                &mut executor,
+                &mut guest_executor,
                 &global_state,
                 &config,
-                tail_result.clone(),
+                handler_signal.clone(),
                 stack_checked_out.clone(),
             );
-            drive_handler(tool.handle_thread_start(&mut guest), tail_result).await
+            drive_handler(tool.handle_thread_start(&mut guest), handler_signal).await
         };
         hide_tool_scratch(&memory)?;
-        if let HandlerOutcome::Returned(result) = start_outcome {
-            result.map_err(Error::Reverie)?;
+        match start_outcome {
+            HandlerOutcome::Returned(result) => result.map_err(Error::Reverie)?,
+            HandlerOutcome::RuntimeError(error) => return Err(error),
+            HandlerOutcome::TailInjected { .. } => {}
+        }
+        auxv = executor.auxv().to_vec();
+        if let Some(exit) = executor.take_exit() {
+            if exit.group {
+                self.request_guest_thread_group_exit(exit.code);
+            }
+            self.cancel_guest_threads();
+            notify_tool_exit(
+                tool,
+                pid,
+                &global_state,
+                &config,
+                thread_state,
+                ExitStatus::Exited(exit.code),
+            )
+            .await?;
+            let (stdout, stderr) = executor.take_output();
+            return Ok((global_state, exit.code, stdout, stderr));
         }
 
         // The ELF image is already installed when this backend begins. Present
         // the same successful-exec lifecycle boundary as ptrace before running it.
-        let registers = kvm_registers(self.vcpu.get_regs()?, 0);
-        let tail_result = Arc::new(Mutex::new(None));
-        expose_tool_scratch(&memory)?;
-        let post_exec_outcome = {
-            let mut guest = KvmGuest::<T>::new(
-                pid,
-                memory.clone(),
-                &auxv,
-                registers,
-                &mut thread_state,
-                &mut executor,
-                &global_state,
-                &config,
-                tail_result.clone(),
-                stack_checked_out.clone(),
-            );
-            drive_handler(tool.handle_post_exec(&mut guest), tail_result).await
-        };
-        hide_tool_scratch(&memory)?;
-        let post_exec_error = match post_exec_outcome {
-            HandlerOutcome::Returned(Ok(())) => None,
-            HandlerOutcome::Returned(Err(error)) => Some(Error::PostExec(error)),
-            HandlerOutcome::TailInjected(_) => Some(Error::UnexpectedVcpuExit(
-                "tool tail-injected a syscall from handle_post_exec".to_string(),
-            )),
-        };
+        let post_exec_error = run_post_exec_handler(
+            self,
+            &tool,
+            pid,
+            &memory,
+            &mut auxv,
+            &mut thread_state,
+            &mut executor,
+            &global_state,
+            &config,
+            &stack_checked_out,
+        )
+        .await
+        .err();
         if let Some(error) = post_exec_error {
             notify_tool_exit(
                 tool,
@@ -677,85 +940,149 @@ impl KvmBackend {
                 Err(error) if error.errno() == libc::EINTR => continue,
                 Err(error) => return Err(error.into()),
             };
-            let (pending_segment, mut pending_exit, pending_process) = match vcpu_exit {
+            let (frame_address, return_slot) = match vcpu_exit {
                 VcpuExit::Hypercall(exit) => {
                     if exit.nr != VMCALL_SYSCALL_TRANSPORT {
                         return Err(Error::UnexpectedHypercall(exit.nr));
                     }
-                    let frame_address = exit.args[0];
-                    // Capture the hypercall return slot as a raw pointer so the
-                    // `&mut exit` borrow ends before `self.vcpu.get_regs()`.
-                    let return_slot = std::ptr::from_mut(exit.ret) as usize;
-                    if frame_address != SYSCALL_FRAME_ADDRESS {
-                        return Err(Error::UnexpectedVcpuExit(format!(
-                            "syscall frame is at unexpected address {frame_address:#x}"
-                        )));
-                    }
-                    let registers = self.vcpu.get_regs()?;
-                    let request = SyscallRequest::read_from(&memory, frame_address)?;
-                    let syscall = request.into_syscall()?;
-                    let backend_owned = is_backend_owned_syscall(request.number());
-                    let subscribed = !backend_owned
-                        && subscriptions
-                            .iter_syscalls()
-                            .any(|number| number == syscall.number());
-                    let result = if subscribed {
-                        let tail_result = Arc::new(Mutex::new(None));
-                        expose_tool_scratch(&memory)?;
-                        let outcome = {
-                            let mut guest = KvmGuest::<T>::new(
-                                pid,
-                                memory.clone(),
-                                &auxv,
-                                kvm_registers(registers, request.number()),
-                                &mut thread_state,
-                                &mut executor,
-                                &global_state,
-                                &config,
-                                tail_result.clone(),
-                                stack_checked_out.clone(),
-                            );
-                            drive_handler(
-                                tool.handle_syscall_event(&mut guest, syscall),
-                                tail_result,
-                            )
-                            .await
-                        };
-                        hide_tool_scratch(&memory)?;
-                        match outcome {
-                            HandlerOutcome::Returned(result) => handler_result_to_raw(result)?,
-                            HandlerOutcome::TailInjected(result) => result_to_raw(result),
-                        }
-                    } else {
-                        executor.execute(&request, &memory)
-                    };
-                    // The ring0 trampoline reads the result from the frame and
-                    // then SYSRETs, so the hypercall return slot is unused here.
-                    SyscallRequest::write_result(&mut memory, frame_address, result)?;
-                    // SAFETY: return_slot points into this vCPU's stable KVM_RUN
-                    // mapping; the vCPU is stopped and not re-run while the tool
-                    // callback is active.
-                    unsafe {
-                        (return_slot as *mut u64).write(0);
-                    }
-                    (
-                        executor.take_segment(),
-                        executor.take_exit(),
-                        executor.take_process_action(),
-                    )
+                    (exit.args[0], std::ptr::from_mut(exit.ret) as usize)
                 }
                 VcpuExit::Hlt => return Err(self.static_elf_halt_error()?),
                 exit => return Err(Error::UnexpectedVcpuExit(format!("{exit:?}"))),
             };
+            if frame_address != SYSCALL_FRAME_ADDRESS {
+                return Err(Error::UnexpectedVcpuExit(format!(
+                    "syscall frame is at unexpected address {frame_address:#x}"
+                )));
+            }
+            let registers = self.vcpu.get_regs()?;
+            let request = SyscallRequest::read_from(&memory, frame_address)?;
+            let syscall = request.into_syscall()?;
+            // TODO-HUMAN-REVIEW(PR-156): Review root process-syscall Tool dispatch.
+            let backend_owned = is_backend_owned_syscall(request.number());
+            let subscribed = !backend_owned
+                && subscriptions
+                    .iter_syscalls()
+                    .any(|number| number == syscall.number());
+            let (result, handler_replaced_image, handler_process_completed) = if subscribed {
+                let handler_signal = Arc::new(Mutex::new(None));
+                let mut handler_process_completed = false;
+                expose_tool_scratch(&memory)?;
+                let outcome = {
+                    let mut guest_executor = StaticElfSyscallExecutor {
+                        backend: self,
+                        executor: &mut executor,
+                        memory: memory.clone(),
+                        process_context: ProcessExecutionContext::SyscallBoundary(
+                            ProcessBoundary {
+                                frame_address,
+                                return_slot,
+                            },
+                        ),
+                        last_result: None,
+                        process_completed: &mut handler_process_completed,
+                    };
+                    let mut guest = KvmGuest::<T>::new(
+                        pid,
+                        memory.clone(),
+                        &auxv,
+                        kvm_registers(registers, request.number()),
+                        &mut thread_state,
+                        &mut guest_executor,
+                        &global_state,
+                        &config,
+                        handler_signal.clone(),
+                        stack_checked_out.clone(),
+                    );
+                    drive_handler(
+                        tool.handle_syscall_event(&mut guest, syscall),
+                        handler_signal,
+                    )
+                    .await
+                };
+                hide_tool_scratch(&memory)?;
+                match outcome {
+                    HandlerOutcome::Returned(result) => (
+                        handler_result_to_raw(result)?,
+                        false,
+                        handler_process_completed,
+                    ),
+                    HandlerOutcome::TailInjected {
+                        result,
+                        image_replaced,
+                        ..
+                    } => (
+                        result_to_raw(result),
+                        image_replaced,
+                        handler_process_completed,
+                    ),
+                    HandlerOutcome::RuntimeError(error) => return Err(error),
+                }
+            } else {
+                (executor.execute(&request, &memory), false, false)
+            };
+            // The ring0 trampoline reads the result from the frame and then
+            // SYSRETs, so the hypercall return slot is unused here.
+            SyscallRequest::write_result(&mut memory, frame_address, result)?;
+            // SAFETY: return_slot points into this vCPU's stable KVM_RUN mapping.
+            // The vCPU is stopped whenever the slot is written.
+            unsafe {
+                (return_slot as *mut u64).write(0);
+            }
+            if handler_process_completed && !handler_replaced_image {
+                configure_process_syscall_return(
+                    &memory,
+                    &self.vcpu,
+                    SYSCALL_FRAME_ADDRESS,
+                    result,
+                    None,
+                )?;
+            }
+            let pending_segment = executor.take_segment();
+            let mut pending_exit = executor.take_exit();
+            let pending_process = executor.take_process_action();
 
             if let Some((segment, address)) = pending_segment {
                 set_user_segment_base(&self.vcpu, segment, address)?;
             }
+            let mut replaced_image = handler_replaced_image;
             if let Some(action) = pending_process {
-                self.run_process_action(&mut executor, action)?;
-                auxv = executor.auxv().to_vec();
-                pending_exit = pending_exit.or_else(|| executor.take_exit());
+                replaced_image |= matches!(&action, ProcessAction::Exec { .. });
+                self.run_process_action(&mut executor, action, true)?;
             }
+            if replaced_image {
+                auxv = executor.auxv().to_vec();
+                let post_exec_error = run_post_exec_handler(
+                    self,
+                    &tool,
+                    pid,
+                    &memory,
+                    &mut auxv,
+                    &mut thread_state,
+                    &mut executor,
+                    &global_state,
+                    &config,
+                    &stack_checked_out,
+                )
+                .await
+                .err();
+                if let Some(error) = post_exec_error {
+                    notify_tool_exit(
+                        tool,
+                        pid,
+                        &global_state,
+                        &config,
+                        thread_state,
+                        ExitStatus::Exited(255),
+                    )
+                    .await?;
+                    return Err(error);
+                }
+            }
+            if let Some((segment, address)) = executor.take_segment() {
+                set_user_segment_base(&self.vcpu, segment, address)?;
+            }
+            pending_exit = pending_exit.or_else(|| executor.take_exit());
             if let Some(exit) = pending_exit {
                 if exit.group {
                     self.request_guest_thread_group_exit(exit.code);

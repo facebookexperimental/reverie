@@ -29,6 +29,7 @@ use crate::elf::GuestFileIdentity;
 use crate::elf::GuestFileIdentityEntry;
 use crate::elf::LoadedStaticElf;
 use crate::elf::STACK_LIMIT;
+use crate::elf::load_static_elf;
 use crate::runtime::SyscallExecutor;
 
 const MAX_HOST_IO: usize = 16 * 1024 * 1024;
@@ -210,6 +211,9 @@ pub(crate) struct ProcessExit {
     pub group: bool,
 }
 
+// Retain the audited process-syscall classification even though the root
+// dispatcher no longer excludes these syscalls from Reverie tools.
+#[allow(dead_code)]
 pub(crate) fn is_process_syscall(number: u64) -> bool {
     number == libc::SYS_fork as u64
         || number == libc::SYS_vfork as u64
@@ -1094,6 +1098,26 @@ impl ElfExecutor {
             Ok((_interpreter, image, argv)) => (image, argv),
             Err(errno) => return errno,
         };
+        // TODO-HUMAN-REVIEW(PR-156): Review preflight validation before exec image replacement.
+        // Loading the live image clears guest memory, so validate against an
+        // isolated mapping before reporting exec success to the Reverie tool.
+        let mut validation_memory = match GuestMemory::new(memory.guest_base(), memory.len()) {
+            Ok(memory) => memory,
+            Err(_) => return negative_errno(libc::ENOMEM),
+        };
+        let argv_refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
+        let envp_refs = envp.iter().map(String::as_str).collect::<Vec<_>>();
+        if load_static_elf(
+            &mut validation_memory,
+            &image,
+            &argv_refs,
+            &envp_refs,
+            &self.state.cwd,
+        )
+        .is_err()
+        {
+            return negative_errno(libc::ENOEXEC);
+        }
         self.process_action = Some(ProcessAction::Exec { image, argv, envp });
         0
     }
@@ -1155,6 +1179,11 @@ impl ElfExecutor {
 
     pub(crate) fn take_process_action(&mut self) -> Option<ProcessAction> {
         self.process_action.take()
+    }
+
+    // TODO-HUMAN-REVIEW(PR-156): Review non-returning exit injection state.
+    pub(crate) fn has_pending_exit(&self) -> bool {
+        self.exit_code.is_some()
     }
 
     pub(crate) fn replace_after_exec(&mut self, state: LoadedStaticElf) {

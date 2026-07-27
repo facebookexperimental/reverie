@@ -162,6 +162,63 @@ fn production_example_clis_run_real_program_with_kvm_guest() {
 }
 
 #[test]
+fn strace_observes_root_process_syscalls_with_kvm_guest() {
+    if !kvm_available() {
+        return;
+    }
+
+    let output = run(
+        env!("CARGO_BIN_EXE_strace"),
+        &[
+            "--runner",
+            "kvm",
+            "--trace",
+            "clone",
+            "--trace",
+            "vfork",
+            "--trace",
+            "wait4",
+            "--trace",
+            "execve",
+            "--no-host-envs",
+            "--",
+            "/bin/sh",
+            "-c",
+            "/bin/true; exec /bin/true",
+        ],
+    );
+    assert_success(&output);
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("[pid 1] clone(") || stderr.contains("[pid 1] vfork("),
+        "{stderr}"
+    );
+    assert!(stderr.contains("[pid 1] wait4("), "{stderr}");
+    assert!(stderr.contains("[pid 1] execve("), "{stderr}");
+
+    let failed_exec = run(
+        env!("CARGO_BIN_EXE_strace"),
+        &[
+            "--runner",
+            "kvm",
+            "--trace",
+            "execve",
+            "--no-host-envs",
+            "--",
+            "/bin/sh",
+            "-c",
+            "exec /definitely-not-a-reverie-executable",
+        ],
+    );
+    assert_eq!(failed_exec.status.code(), Some(127));
+    assert!(failed_exec.stdout.is_empty());
+    let stderr = String::from_utf8(failed_exec.stderr).unwrap();
+    assert!(stderr.contains("[pid 1] execve("), "{stderr}");
+    assert!(stderr.contains("(execve) = ENOENT"), "{stderr}");
+}
+
+#[test]
 fn kvm_runner_preserves_process_boundary_errors() {
     if !kvm_available() {
         return;

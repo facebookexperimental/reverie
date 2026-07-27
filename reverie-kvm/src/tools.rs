@@ -121,6 +121,14 @@ impl Tool for StraceTool {
         syscall: Syscall,
     ) -> Result<i64, reverie::Error> {
         let name = syscall.name().to_owned();
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-156): Review non-returning KVM strace injection.
+        if matches!(syscall, Syscall::Exit(_) | Syscall::ExitGroup(_)) {
+            let formatted = format!("{}", syscall.display_with_outputs(&guest.memory()));
+            eprintln!("[kvm-strace] {formatted} = ?");
+            guest.send_rpc((name, formatted)).await;
+            guest.tail_inject(syscall).await
+        }
         // Execute the syscall through the backend `SyscallExecutor` first (like
         // the ptrace `Strace` tool's `inject`), so output buffers are populated
         // before rendering. Then record the *fully decoded* syscall — arguments
