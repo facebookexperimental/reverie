@@ -24,6 +24,7 @@ use crate::GuestMemory;
 use crate::SyscallRequest;
 use crate::bootstrap::BOOT_RESERVED_END;
 use crate::bootstrap::SegmentBase;
+use crate::elf::GUEST_CAPABILITY_MASK;
 use crate::elf::GuestFileIdentity;
 use crate::elf::GuestFileIdentityEntry;
 use crate::elf::LoadedStaticElf;
@@ -41,7 +42,9 @@ const MEMBARRIER_SUPPORTED: libc::c_int = 0x1;
 // root with the full capability bounding set up to a fixed CAP_LAST_CAP so the
 // answer is host-independent.
 const PR_CAPBSET_READ: u64 = 23;
+const PR_CAPBSET_DROP: u64 = 24;
 const GUEST_CAP_LAST_CAP: u64 = 40;
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 const PROCESS_CLONE_TID_FLAGS: u64 = libc::CLONE_PARENT_SETTID as u64
     | libc::CLONE_CHILD_SETTID as u64
     | libc::CLONE_CHILD_CLEARTID as u64;
@@ -461,6 +464,12 @@ fn execute_basic_syscall_with_output(
         set_fixed_root_ids(&args[..3])
     } else if number == libc::SYS_getgroups as u64 {
         getgroups(memory, args)
+    } else if number == libc::SYS_capget as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        capget(memory, state, args)
+    } else if number == libc::SYS_capset as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        capset(memory, state, args)
     } else if number == libc::SYS_flock as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         flock(state, args)
@@ -525,7 +534,7 @@ fn execute_basic_syscall_with_output(
         return arch_prctl(memory, state, args);
     } else if number == libc::SYS_prctl as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        prctl(args)
+        prctl(state, args)
     } else if number == libc::SYS_getxattr as u64
         || number == libc::SYS_lgetxattr as u64
         || number == libc::SYS_fgetxattr as u64
@@ -4777,26 +4786,190 @@ fn arch_prctl(
 
 // TODO-HUMAN-REVIEW(PR-108): Review the prctl(2) subset for the KVM guest.
 //
-// Only PR_CAPBSET_READ is modeled. The deterministic container runs the guest as
-// root with the full capability bounding set, so libcap's cap_get_bound() must
-// report each valid capability as present (1) and out-of-range capabilities as
-// EINVAL, exactly as a root process observes on Linux. Without this, the query
-// fell through to ENOSYS and tools such as `ls -l` printed a spurious
-// "Function not implemented" that neither a native run nor the ptrace backend
-// emits. Answers are fixed constants, so run 1 and run 2 of --verify agree and
-// results do not depend on the host kernel's CAP_LAST_CAP.
-fn prctl(args: &[u64; 6]) -> i64 {
+// Capability-control prctls use virtual guest state so privilege-dropping
+// launchers can inspect and mutate their persona without touching supervisor
+// credentials.
+// TODO-HUMAN-REVIEW(PR-181): Review deterministic capability prctls.
+fn prctl(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
     match args[0] {
         PR_CAPBSET_READ => {
             if args[1] <= GUEST_CAP_LAST_CAP {
-                1
+                i64::from(state.capability_bounding & (1_u64 << args[1]) != 0)
             } else {
                 negative_errno(libc::EINVAL)
             }
         }
+        PR_CAPBSET_DROP => {
+            if args[1] <= GUEST_CAP_LAST_CAP {
+                state.capability_bounding &= !(1_u64 << args[1]);
+                0
+            } else {
+                negative_errno(libc::EINVAL)
+            }
+        }
+        option if option == libc::PR_SET_KEEPCAPS as u64 => match args[1] {
+            0 => {
+                state.keep_capabilities = false;
+                0
+            }
+            1 => {
+                state.keep_capabilities = true;
+                0
+            }
+            _ => negative_errno(libc::EINVAL),
+        },
+        option if option == libc::PR_GET_KEEPCAPS as u64 => i64::from(state.keep_capabilities),
+        option if option == libc::PR_CAP_AMBIENT as u64 => {
+            prctl_cap_ambient(state, args[1], args[2])
+        }
         // Other prctl operations are not modeled yet.
         _ => negative_errno(libc::ENOSYS),
     }
+}
+
+fn prctl_cap_ambient(state: &mut LoadedStaticElf, operation: u64, capability: u64) -> i64 {
+    if operation == libc::PR_CAP_AMBIENT_CLEAR_ALL as u64 {
+        state.capability_ambient = 0;
+        return 0;
+    }
+    if capability > GUEST_CAP_LAST_CAP {
+        return negative_errno(libc::EINVAL);
+    }
+    let bit = 1_u64 << capability;
+    match operation {
+        option if option == libc::PR_CAP_AMBIENT_IS_SET as u64 => {
+            i64::from(state.capability_ambient & bit != 0)
+        }
+        option if option == libc::PR_CAP_AMBIENT_RAISE as u64 => {
+            if state.capability_permitted & bit == 0 || state.capability_inheritable & bit == 0 {
+                negative_errno(libc::EPERM)
+            } else {
+                state.capability_ambient |= bit;
+                0
+            }
+        }
+        option if option == libc::PR_CAP_AMBIENT_LOWER as u64 => {
+            state.capability_ambient &= !bit;
+            0
+        }
+        _ => negative_errno(libc::EINVAL),
+    }
+}
+
+// TODO-HUMAN-REVIEW(PR-181): Review the virtual capability ABI and masks.
+fn capget(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    if args[0] == 0 {
+        return negative_errno(libc::EFAULT);
+    }
+    let Ok((version, pid)) = read_capability_header(memory, args[0]) else {
+        return negative_errno(libc::EFAULT);
+    };
+    if version != LINUX_CAPABILITY_VERSION_3 {
+        if memory
+            .write(args[0], &LINUX_CAPABILITY_VERSION_3.to_ne_bytes())
+            .is_err()
+        {
+            return negative_errno(libc::EFAULT);
+        }
+        return if version == 0 && args[1] == 0 {
+            0
+        } else {
+            negative_errno(libc::EINVAL)
+        };
+    }
+    if !is_capability_self(pid, state) {
+        return negative_errno(libc::ESRCH);
+    }
+    if args[1] == 0 {
+        return 0;
+    }
+    let bytes = capability_data_bytes(
+        state.capability_effective,
+        state.capability_permitted,
+        state.capability_inheritable,
+    );
+    match memory.write(args[1], &bytes) {
+        Ok(()) => 0,
+        Err(_) => negative_errno(libc::EFAULT),
+    }
+}
+
+// TODO-HUMAN-REVIEW(PR-181): Review deterministic capability mutation.
+fn capset(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    if args[0] == 0 || args[1] == 0 {
+        return negative_errno(libc::EFAULT);
+    }
+    let Ok((version, pid)) = read_capability_header(memory, args[0]) else {
+        return negative_errno(libc::EFAULT);
+    };
+    if version != LINUX_CAPABILITY_VERSION_3 {
+        return negative_errno(libc::EINVAL);
+    }
+    if !is_capability_self(pid, state) {
+        return negative_errno(libc::ESRCH);
+    }
+    let Ok((effective, permitted, inheritable)) = read_capability_data(memory, args[1]) else {
+        return negative_errno(libc::EFAULT);
+    };
+    if effective & !permitted != 0
+        || permitted & !state.capability_permitted != 0
+        || inheritable & !state.capability_bounding != 0
+    {
+        return negative_errno(libc::EPERM);
+    }
+    state.capability_effective = effective & GUEST_CAPABILITY_MASK;
+    state.capability_permitted = permitted & GUEST_CAPABILITY_MASK;
+    state.capability_inheritable = inheritable & GUEST_CAPABILITY_MASK;
+    state.capability_ambient &= state.capability_permitted & state.capability_inheritable;
+    0
+}
+
+fn read_capability_header(memory: &GuestMemory, address: u64) -> Result<(u32, i32), ()> {
+    let mut bytes = [0; 8];
+    memory.read(address, &mut bytes).map_err(|_| ())?;
+    Ok((
+        u32::from_ne_bytes(bytes[..4].try_into().expect("capability version size")),
+        i32::from_ne_bytes(bytes[4..].try_into().expect("capability pid size")),
+    ))
+}
+
+fn is_capability_self(pid: i32, state: &LoadedStaticElf) -> bool {
+    pid == 0 || pid == state.pid || pid == state.tid
+}
+
+fn capability_data_bytes(effective: u64, permitted: u64, inheritable: u64) -> [u8; 24] {
+    let mut bytes = [0; 24];
+    for (index, value) in [
+        effective as u32,
+        permitted as u32,
+        inheritable as u32,
+        (effective >> 32) as u32,
+        (permitted >> 32) as u32,
+        (inheritable >> 32) as u32,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_ne_bytes());
+    }
+    bytes
+}
+
+fn read_capability_data(memory: &GuestMemory, address: u64) -> Result<(u64, u64, u64), ()> {
+    let mut bytes = [0; 24];
+    memory.read(address, &mut bytes).map_err(|_| ())?;
+    let field = |index: usize| {
+        u64::from(u32::from_ne_bytes(
+            bytes[index * 4..index * 4 + 4]
+                .try_into()
+                .expect("capability data field size"),
+        ))
+    };
+    Ok((
+        field(0) | field(3) << 32,
+        field(1) | field(4) << 32,
+        field(2) | field(5) << 32,
+    ))
 }
 
 // TODO-HUMAN-REVIEW(PR-116): Review the no-xattr KVM guest model and errors.
@@ -6351,6 +6524,12 @@ mod tests {
             tid: 1,
             ppid: 0,
             umask: 0o022,
+            keep_capabilities: false,
+            capability_effective: GUEST_CAPABILITY_MASK,
+            capability_permitted: GUEST_CAPABILITY_MASK,
+            capability_inheritable: 0,
+            capability_bounding: GUEST_CAPABILITY_MASK,
+            capability_ambient: 0,
             nice: 0,
             sched_policy: libc::SCHED_OTHER,
             sched_priority: 0,
@@ -12383,25 +12562,127 @@ mod tests {
 
     #[test]
     fn prctl_capbset_read_reports_full_bounding_set() {
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
         // Valid capabilities are present (root holds the full bounding set).
         for cap in [0, 7, 15, 32, GUEST_CAP_LAST_CAP] {
-            assert_eq!(prctl(&[PR_CAPBSET_READ, cap, 0, 0, 0, 0]), 1);
+            assert_eq!(prctl(&mut state, &[PR_CAPBSET_READ, cap, 0, 0, 0, 0]), 1);
         }
         // Out-of-range capabilities are rejected exactly like Linux.
         assert_eq!(
-            prctl(&[PR_CAPBSET_READ, GUEST_CAP_LAST_CAP + 1, 0, 0, 0, 0]),
+            prctl(
+                &mut state,
+                &[PR_CAPBSET_READ, GUEST_CAP_LAST_CAP + 1, 0, 0, 0, 0]
+            ),
             negative_errno(libc::EINVAL)
         );
         // Deterministic: repeated queries return the same answer.
         assert_eq!(
-            prctl(&[PR_CAPBSET_READ, 15, 0, 0, 0, 0]),
-            prctl(&[PR_CAPBSET_READ, 15, 0, 0, 0, 0])
+            prctl(&mut state, &[PR_CAPBSET_READ, 15, 0, 0, 0, 0]),
+            prctl(&mut state, &[PR_CAPBSET_READ, 15, 0, 0, 0, 0])
         );
         // Unmodeled prctl options remain ENOSYS.
         assert_eq!(
-            prctl(&[libc::PR_GET_NAME as u64, 0, 0, 0, 0, 0]),
+            prctl(&mut state, &[libc::PR_GET_NAME as u64, 0, 0, 0, 0, 0]),
             negative_errno(libc::ENOSYS)
         );
+    }
+
+    #[test]
+    fn prctl_keepcaps_round_trips_inherits_on_fork_and_resets_on_exec() {
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let get = [libc::PR_GET_KEEPCAPS as u64, 0, 0, 0, 0, 0];
+        let set = |value| [libc::PR_SET_KEEPCAPS as u64, value, 0, 0, 0, 0];
+
+        assert_eq!(prctl(&mut state, &get), 0);
+        assert_eq!(prctl(&mut state, &set(1)), 0);
+        assert_eq!(prctl(&mut state, &get), 1);
+        assert_eq!(prctl(&mut state, &set(2)), negative_errno(libc::EINVAL));
+        assert_eq!(prctl(&mut state, &get), 1);
+
+        let mut child = state.try_clone_for_fork(2).unwrap();
+        assert_eq!(prctl(&mut child, &get), 1);
+
+        let mut after_exec = test_state(&root.0);
+        after_exec.inherit_process_state(state);
+        assert_eq!(prctl(&mut after_exec, &get), 0);
+    }
+
+    #[test]
+    fn capability_syscalls_round_trip_and_bound_the_exec_persona() {
+        const HEADER: u64 = 0x100;
+        const DATA: u64 = 0x200;
+        const CAP_SYS_TIME: u64 = 25;
+
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let write_header = |memory: &mut GuestMemory, version: u32, pid: i32| {
+            let mut bytes = [0; 8];
+            bytes[..4].copy_from_slice(&version.to_ne_bytes());
+            bytes[4..].copy_from_slice(&pid.to_ne_bytes());
+            memory.write(HEADER, &bytes).unwrap();
+        };
+
+        write_header(&mut memory, 0, 0);
+        assert_eq!(capget(&mut memory, &state, &[HEADER, 0, 0, 0, 0, 0]), 0);
+        let mut version = [0; 4];
+        memory.read(HEADER, &mut version).unwrap();
+        assert_eq!(u32::from_ne_bytes(version), LINUX_CAPABILITY_VERSION_3);
+
+        write_header(&mut memory, LINUX_CAPABILITY_VERSION_3, state.pid);
+        assert_eq!(capget(&mut memory, &state, &[HEADER, DATA, 0, 0, 0, 0]), 0);
+        let reduced = GUEST_CAPABILITY_MASK & !(1_u64 << CAP_SYS_TIME);
+        memory
+            .write(DATA, &capability_data_bytes(reduced, reduced, 1))
+            .unwrap();
+        assert_eq!(capset(&memory, &mut state, &[HEADER, DATA, 0, 0, 0, 0]), 0);
+        assert_eq!(state.capability_effective, reduced);
+        assert_eq!(state.capability_permitted, reduced);
+        assert_eq!(state.capability_inheritable, 1);
+
+        assert_eq!(
+            prctl_cap_ambient(&mut state, libc::PR_CAP_AMBIENT_RAISE as u64, 0),
+            0
+        );
+        assert_eq!(
+            prctl_cap_ambient(&mut state, libc::PR_CAP_AMBIENT_IS_SET as u64, 0),
+            1
+        );
+
+        memory
+            .write(DATA, &capability_data_bytes(reduced, reduced, 0))
+            .unwrap();
+        assert_eq!(capset(&memory, &mut state, &[HEADER, DATA, 0, 0, 0, 0]), 0);
+        assert_eq!(state.capability_ambient, 0);
+        memory
+            .write(DATA, &capability_data_bytes(reduced, reduced, 1))
+            .unwrap();
+        assert_eq!(capset(&memory, &mut state, &[HEADER, DATA, 0, 0, 0, 0]), 0);
+        assert_eq!(
+            prctl_cap_ambient(&mut state, libc::PR_CAP_AMBIENT_RAISE as u64, 0),
+            0
+        );
+
+        assert_eq!(
+            prctl(&mut state, &[PR_CAPBSET_DROP, CAP_SYS_TIME, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            prctl(&mut state, &[PR_CAPBSET_READ, CAP_SYS_TIME, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(prctl(&mut state, &[PR_CAPBSET_READ, 0, 0, 0, 0, 0]), 1);
+
+        let child = state.try_clone_for_fork(2).unwrap();
+        assert_eq!(child.capability_bounding, reduced);
+        let mut after_exec = test_state(&root.0);
+        after_exec.inherit_process_state(state);
+        assert_eq!(after_exec.capability_effective, reduced);
+        assert_eq!(after_exec.capability_permitted, reduced);
+        assert_eq!(after_exec.capability_bounding, reduced);
+        assert_eq!(after_exec.capability_ambient, 1);
     }
 
     #[test]

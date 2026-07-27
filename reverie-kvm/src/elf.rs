@@ -40,6 +40,7 @@ const MAX_SCRIPT_INTERPRETERS: usize = 4;
 const MAIN_LOAD_BIAS: u64 = 2 * 1024 * 1024;
 const INTERPRETER_LOAD_BIAS: u64 = 16 * 1024 * 1024;
 const IOPRIO_CLASS_SHIFT: u32 = 13;
+pub(crate) const GUEST_CAPABILITY_MASK: u64 = (1_u64 << 41) - 1;
 /// Page-aligned program-break gap reserved between a large main image and a
 /// relocated interpreter base. Only applies when the main image would overrun
 /// the historical fixed [`INTERPRETER_LOAD_BIAS`]; small PIEs are unaffected.
@@ -117,6 +118,13 @@ pub(crate) struct LoadedStaticElf {
     pub tid: i32,
     pub ppid: i32,
     pub umask: libc::mode_t,
+    // TODO-HUMAN-REVIEW(PR-181): Review virtual capability lifecycle state.
+    pub keep_capabilities: bool,
+    pub capability_effective: u64,
+    pub capability_permitted: u64,
+    pub capability_inheritable: u64,
+    pub capability_bounding: u64,
+    pub capability_ambient: u64,
     // TODO-HUMAN-REVIEW(PR-92): Review virtual nice process state.
     pub nice: libc::c_int,
     // TODO-HUMAN-REVIEW(PR-119): Review virtual scheduler/ioprio process state.
@@ -186,6 +194,12 @@ impl LoadedStaticElf {
             tid: child_pid,
             ppid: self.pid,
             umask: self.umask,
+            keep_capabilities: self.keep_capabilities,
+            capability_effective: self.capability_effective,
+            capability_permitted: self.capability_permitted,
+            capability_inheritable: self.capability_inheritable,
+            capability_bounding: self.capability_bounding,
+            capability_ambient: self.capability_ambient,
             nice: self.nice,
             sched_policy: if reset_realtime {
                 libc::SCHED_OTHER
@@ -289,6 +303,13 @@ impl LoadedStaticElf {
         self.tid = previous.tid;
         self.ppid = previous.ppid;
         self.umask = previous.umask;
+        self.keep_capabilities = false;
+        self.capability_bounding = previous.capability_bounding;
+        self.capability_effective = previous.capability_bounding;
+        self.capability_permitted = previous.capability_bounding;
+        self.capability_inheritable = previous.capability_inheritable;
+        self.capability_ambient =
+            previous.capability_ambient & self.capability_permitted & self.capability_inheritable;
         self.nice = previous.nice;
         // TODO-HUMAN-REVIEW(PR-119): Review scheduler and ioprio exec inheritance.
         self.sched_policy = previous.sched_policy;
@@ -504,6 +525,12 @@ fn load_executable(
         tid: 1,
         ppid: 0,
         umask: 0o022,
+        keep_capabilities: false,
+        capability_effective: GUEST_CAPABILITY_MASK,
+        capability_permitted: GUEST_CAPABILITY_MASK,
+        capability_inheritable: 0,
+        capability_bounding: GUEST_CAPABILITY_MASK,
+        capability_ambient: 0,
         nice: 0,
         // TODO-HUMAN-REVIEW(PR-119): Review default virtual scheduler and ioprio state.
         sched_policy: libc::SCHED_OTHER,
