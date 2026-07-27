@@ -69,6 +69,10 @@ struct Args {
     #[clap(long = "trace")]
     filters: Vec<String>,
 
+    /// Port for the ptrace-assisted debug selector.
+    #[clap(long)]
+    port: Option<u16>,
+
     /// The path to write the Chrome trace artifact.
     // TODO-HUMAN-REVIEW(PR-159): Review the ChromeTrace artifact option.
     #[clap(long)]
@@ -94,16 +98,27 @@ async fn main() -> anyhow::Result<()> {
     if args.tool != example_tools::ToolKind::Chaos && args.chaos_options.was_supplied() {
         bail!("chaos options are only valid with --tool chaos");
     }
+    if args.tool != example_tools::ToolKind::Debug && args.port.is_some() {
+        bail!("--port is only valid with --tool debug");
+    }
     let chaos_options = args.chaos_options.into_config();
 
-    let preload = match args.preload {
-        Some(path) => path,
-        None => example_tools::default_preload_path()?,
+    let preload = match (args.tool, args.preload) {
+        (_, Some(path)) => path,
+        (example_tools::ToolKind::Debug, None) => PathBuf::new(),
+        (_, None) => example_tools::default_preload_path()?,
     };
     let mut command = Command::new(&args.command[0]);
     command.args(&args.command[1..]);
-    let result =
-        example_tools::run(args.tool, command, args.filters, chaos_options, preload).await?;
+    let result = example_tools::run(
+        args.tool,
+        command,
+        args.filters,
+        chaos_options,
+        args.port.unwrap_or(1234),
+        preload,
+    )
+    .await?;
 
     std::io::stdout().write_all(&result.output.stdout)?;
     std::io::stderr().write_all(&result.output.stderr)?;

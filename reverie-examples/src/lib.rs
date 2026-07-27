@@ -42,6 +42,9 @@ mod noop;
 #[allow(dead_code)]
 #[path = "../strace/main.rs"]
 pub(crate) mod strace;
+#[allow(dead_code)]
+#[path = "../strace_minimal.rs"]
+mod strace_minimal;
 
 pub(crate) use strace::config;
 pub(crate) use strace::filter;
@@ -124,6 +127,10 @@ unsafe extern "C" fn initialize(
         },
         "strace" => unsafe {
             reverie_liteinst::install_tool_from_bootstrap::<strace::Strace>(&socket)
+        },
+        // TODO-HUMAN-REVIEW(PR-193): Review minimal-strace preload selection.
+        "strace-minimal" => unsafe {
+            reverie_liteinst::install_tool_from_bootstrap::<strace_minimal::StraceTool>(&socket)
         },
         "noop" => unsafe {
             reverie_liteinst::install_tool_from_bootstrap::<noop::NoopTool>(&socket)

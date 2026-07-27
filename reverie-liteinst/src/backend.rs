@@ -353,6 +353,22 @@ where
     result
 }
 
+async fn unwrap_global_after_connections<G>(mut global: Arc<G>) -> io::Result<G> {
+    // Aborting RpcServer::serve drops its JoinSet, which aborts every connection
+    // task. Those tasks release their GlobalTool Arc on their next scheduler
+    // turn, so a fast guest can otherwise race Arc::try_unwrap here.
+    for _ in 0..1024 {
+        match Arc::try_unwrap(global) {
+            Ok(global) => return Ok(global),
+            Err(still_shared) => global = still_shared,
+        }
+        tokio::task::yield_now().await;
+    }
+    Err(io::Error::other(
+        "LiteInst coordinator state still has owners after connection shutdown",
+    ))
+}
+
 async fn launch<T>(
     mut command: Command,
     config: <T::GlobalState as GlobalTool>::Config,
@@ -445,8 +461,7 @@ where
         )
         .into());
     }
-    let global = Arc::try_unwrap(global)
-        .map_err(|_| io::Error::other("LiteInst coordinator state still has owners"))?;
+    let global = unwrap_global_after_connections(global).await?;
     Ok((wait, global))
 }
 
@@ -475,6 +490,18 @@ mod tests {
     use reverie_preload::rpc::CoordinatorClient;
 
     use super::*;
+
+    #[tokio::test]
+    async fn coordinator_global_waits_for_cancelled_connection_owners() {
+        let global = Arc::new(17_u64);
+        let connection_owner = global.clone();
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            drop(connection_owner);
+        });
+
+        assert_eq!(unwrap_global_after_connections(global).await.unwrap(), 17);
+    }
 
     #[derive(Default)]
     struct MultiClientGlobal {

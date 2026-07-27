@@ -89,6 +89,29 @@ fn launcher_does_not_activate_the_guest_constructor() {
 }
 
 #[test]
+fn launcher_exposes_the_complete_ptrace_example_surface() {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_reverie-liteinst-examples"));
+    command.arg("--help");
+    let output = output_with_timeout(&mut command);
+
+    assert!(output.status.success(), "{output:?}");
+    let help = String::from_utf8(output.stdout).unwrap();
+    for tool in [
+        "chaos",
+        "chrome-trace",
+        "chunky-print",
+        "counter1",
+        "counter2",
+        "debug",
+        "noop",
+        "strace",
+        "strace-minimal",
+    ] {
+        assert!(help.contains(tool), "missing {tool:?} from help:\n{help}");
+    }
+}
+
+#[test]
 fn exact_noop_tool_preserves_output_and_hides_control_environment() {
     let output = run(
         "noop",
@@ -242,7 +265,7 @@ fn exact_counter2_tool_reports_process_and_thread_totals() {
 fn exact_chaos_tool_limits_reads_after_skip() {
     let output = run(
         "chaos",
-        &["--skip", "200", "--no-interrupt"],
+        &["--skip", "32", "--no-interrupt"],
         &[
             env!("CARGO_BIN_EXE_reverie-liteinst-env-guest"),
             "exercise-chaos-read",
@@ -278,7 +301,7 @@ fn exact_chaos_skip_suppresses_intervention_before_boundary() {
 fn exact_chaos_tool_interrupts_then_limits_retry() {
     let output = run(
         "chaos",
-        &["--skip", "200"],
+        &["--skip", "32"],
         &[
             env!("CARGO_BIN_EXE_reverie-liteinst-env-guest"),
             "exercise-chaos-interrupt",
@@ -408,6 +431,29 @@ fn exact_strace_tool_observes_filtered_write() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("write(1,"), "{stderr}");
     assert!(stderr.contains(" = 6"), "{stderr}");
+}
+
+#[test]
+fn exact_strace_minimal_tool_observes_write() {
+    let output = run("strace-minimal", &[], &["/bin/echo", "hello"]);
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"hello\n");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("write(1,"), "{stderr}");
+    assert!(stderr.contains(" = ?"), "{stderr}");
+}
+
+#[test]
+fn debug_port_requires_debug_selector() {
+    let output = run("noop", &["--port", "0"], &["/bin/true"]);
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("--port is only valid with --tool debug"),
+        "{stderr}"
+    );
 }
 
 #[test]

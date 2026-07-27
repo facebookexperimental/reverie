@@ -41,11 +41,17 @@ mod counter1;
 #[path = "../counter2_tool.rs"]
 mod counter2;
 #[allow(dead_code)]
+#[path = "../debug.rs"]
+mod debug;
+#[allow(dead_code)]
 #[path = "../noop.rs"]
 mod noop;
 #[allow(dead_code)]
 #[path = "../strace/main.rs"]
 pub(crate) mod strace;
+#[allow(dead_code)]
+#[path = "../strace_minimal.rs"]
+mod strace_minimal;
 
 pub(crate) use strace::config;
 pub(crate) use strace::filter;
@@ -70,8 +76,14 @@ pub(crate) enum ToolKind {
     /// Buffer standard output and error writes by logical epochs.
     // TODO-HUMAN-REVIEW(PR-152): Review the chunky_print LiteInst selector extension.
     ChunkyPrint,
+    /// Run the ptrace-assisted GDB server used by the debug example.
+    // TODO-HUMAN-REVIEW(PR-193): Review the explicit ptrace debug fallback.
+    Debug,
     /// Decode and print subscribed syscalls.
     Strace,
+    /// Print every syscall before injecting it.
+    // TODO-HUMAN-REVIEW(PR-193): Review the minimal-strace LiteInst selector.
+    StraceMinimal,
     /// Preserve guest behavior without subscribing to events.
     Noop,
 }
@@ -83,7 +95,9 @@ impl ToolKind {
             Self::Counter1 => "counter1",
             Self::ChromeTrace => "chrome-trace",
             Self::Counter2 => "counter2",
+            Self::Debug => "debug",
             Self::Strace => "strace",
+            Self::StraceMinimal => "strace-minimal",
             Self::ChunkyPrint => "chunky-print",
             Self::Noop => "noop",
         }
@@ -124,9 +138,10 @@ pub(crate) struct RunOutput {
 // TODO-HUMAN-REVIEW(PR-157): Review the chaos config extension to the host API.
 pub(crate) async fn run(
     kind: ToolKind,
-    command: Command,
+    mut command: Command,
     filters: Vec<String>,
     chaos_options: ChaosOpts,
+    debug_port: u16,
     preload: PathBuf,
 ) -> Result<RunOutput, reverie::Error> {
     if kind != ToolKind::Chaos && chaos_options != ChaosOpts::default() {
@@ -231,6 +246,28 @@ pub(crate) async fn run(
                 counter_summary: None,
             })
         }
+        // The GDB remote protocol needs an out-of-process lifecycle and register
+        // controller. Keep this fallback explicit rather than presenting a
+        // no-op in-process Tool as debugger support.
+        ToolKind::Debug => {
+            command.stdout(reverie::process::Stdio::piped());
+            command.stderr(reverie::process::Stdio::piped());
+            eprintln!("Listening on port {debug_port} (ptrace-assisted)");
+            let tracer = reverie_ptrace::TracerBuilder::<debug::DebugTool>::new(command)
+                .gdbserver(debug_port)
+                .spawn()
+                .await?;
+            let (output, _) = tracer.wait_with_output().await?;
+            Ok(RunOutput {
+                output: Output {
+                    status: output.status.into(),
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                },
+                chrome_trace: None,
+                counter_summary: None,
+            })
+        }
         ToolKind::Strace => {
             let (output, _) = LiteinstBackend::run_with_output_and_preload_data::<strace::Strace>(
                 command,
@@ -238,6 +275,17 @@ pub(crate) async fn run(
                 preload,
                 tool_data,
             )
+            .await?;
+            Ok(RunOutput {
+                output,
+                chrome_trace: None,
+                counter_summary: None,
+            })
+        }
+        ToolKind::StraceMinimal => {
+            let (output, _) = LiteinstBackend::run_with_output_and_preload_data::<
+                strace_minimal::StraceTool,
+            >(command, (), preload, tool_data)
             .await?;
             Ok(RunOutput {
                 output,

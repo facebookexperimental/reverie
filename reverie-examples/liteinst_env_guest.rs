@@ -88,7 +88,10 @@ fn exercise_allocator() {
 }
 
 fn prepare_chaos_pipe() -> [libc::c_int; 2] {
-    for _ in 0..256 {
+    // Cross the intervention boundary after loader startup without spending
+    // most of the integration-test timeout formatting deliberately skipped
+    // syscalls.
+    for _ in 0..32 {
         let pid = unsafe { libc::syscall(libc::SYS_getpid) };
         assert!(pid > 0);
     }

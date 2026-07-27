@@ -63,12 +63,19 @@ Run the exact example `Tool` implementations through `LiteinstBackend`:
 
 ```sh
 target/debug/reverie-liteinst-examples --tool noop -- /bin/echo hello
-target/debug/reverie-liteinst-examples --tool chaos --skip 200 --no-interrupt -- target/debug/reverie-liteinst-env-guest exercise-chaos-read
+target/debug/reverie-liteinst-examples --tool chaos --skip 32 --no-interrupt -- target/debug/reverie-liteinst-env-guest exercise-chaos-read
 target/debug/reverie-liteinst-examples --tool counter1 -- /bin/echo hello
 target/debug/reverie-liteinst-examples --tool chunky-print -- /bin/echo hello
 target/debug/reverie-liteinst-examples --tool counter2 -- /bin/echo hello
 target/debug/reverie-liteinst-examples --tool strace --trace write -- /bin/echo hello
+target/debug/reverie-liteinst-examples --tool strace-minimal -- /bin/echo hello
+target/debug/reverie-liteinst-examples --tool debug --port 1234 -- /bin/true
 ```
+
+The `debug` selector is intentionally ptrace-assisted: the GDB remote protocol
+needs an external controller for registers, breakpoints, and lifecycle stops.
+The other eight selectors execute their production `Tool` through LiteInst's
+in-guest preload and patch path.
 
 This path supports dynamically linked Linux x86-64 guests. The LiteInst runtime
 still rejects guest-installed callable signal handlers and clone/fork injection;

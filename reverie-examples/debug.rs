@@ -13,8 +13,9 @@ use reverie::Subscription;
 use reverie::Tool;
 use reverie_util::CommonToolArguments;
 
+// TODO-HUMAN-REVIEW(PR-193): Review reuse of the ptrace GDB tool from the LiteInst parity launcher.
 #[derive(Debug, Default)]
-struct DebugTool;
+pub(crate) struct DebugTool;
 impl Tool for DebugTool {
     type GlobalState = ();
     type ThreadState = ();
