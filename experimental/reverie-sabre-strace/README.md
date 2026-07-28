@@ -38,9 +38,13 @@ Supported values are:
   its JSON artifact after the guest exits.
 - `chunky-print`: run the production chunky-print tool and flush buffered
   output after the guest exits.
+- `debug`: run the production no-subscription debug tool. The SaBRe runner does
+  not provide the ptrace example's GDB remote server.
 - `strace` (default): decode and print syscalls and results. Exec paths and
   argv are decoded, while envp is redacted because it commonly contains
   credentials.
+- `strace-minimal`: run the production minimal-strace tool and print each
+  intercepted syscall before injecting it.
 - `counter1`: print one process-tree total of intercepted syscalls.
 - `counter1-exact`: run the backend-neutral `counter1` example unchanged and
   print its process-tree total through the host coordinator.

@@ -24,7 +24,13 @@ enum ToolKind {
     Chaos,
     ChromeTrace,
     ChunkyPrint,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-200): Review SaBRe production debug-tool selection.
+    Debug,
     Strace,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-200): Review SaBRe minimal-strace selection.
+    StraceMinimal,
     Counter1,
     Counter1Exact,
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -40,7 +46,9 @@ impl ToolKind {
             Self::Chaos => "chaos",
             Self::ChromeTrace => "chrome-trace",
             Self::ChunkyPrint => "chunky-print",
+            Self::Debug => "debug",
             Self::Strace => "strace",
+            Self::StraceMinimal => "strace-minimal",
             Self::Counter1 => "counter1",
             Self::Counter1Exact => "counter1-exact",
             Self::Counter2 => "counter2",

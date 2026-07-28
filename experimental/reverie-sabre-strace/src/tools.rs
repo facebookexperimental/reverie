@@ -8,6 +8,9 @@
 
 //! Shared Reverie example tools hosted by the SaBRe plugin.
 
+// The reused production tool sources each declare the same KVM runner helper.
+#![allow(clippy::duplicate_mod)]
+
 #[allow(dead_code)]
 #[path = "../../../reverie-examples/chaos.rs"]
 mod chaos_exact;
@@ -21,6 +24,12 @@ mod chunky_print_exact;
 mod counter1_exact;
 #[path = "../../../reverie-examples/counter2_tool.rs"]
 mod counter2_exact;
+#[allow(dead_code)]
+#[path = "../../../reverie-examples/debug.rs"]
+mod debug_exact;
+#[allow(dead_code)]
+#[path = "../../../reverie-examples/strace_minimal.rs"]
+mod strace_minimal_exact;
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -41,6 +50,7 @@ pub(super) use counter1_exact::CounterGlobal as ExactCounter1Global;
 use counter1_exact::CounterLocal as ExactCounter1Tool;
 pub(super) use counter2_exact::CounterGlobal as ExactCounter2Global;
 use counter2_exact::CounterLocal as ExactCounter2Tool;
+use debug_exact::DebugTool as ExactDebugTool;
 use reverie::Error;
 use reverie::GlobalTool;
 use reverie::Guest;
@@ -53,6 +63,7 @@ use reverie_syscalls::Syscall;
 use reverie_syscalls::SyscallInfo;
 use serde::Deserialize;
 use serde::Serialize;
+use strace_minimal_exact::StraceTool as ExactStraceMinimalTool;
 use syscalls::Errno;
 use syscalls::Sysno;
 
@@ -113,8 +124,16 @@ pub(super) enum ToolKind {
     ChromeTrace,
     /// Buffer standard output and error writes by logical epochs.
     ChunkyPrint,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-200): Review exact production debug-tool hosting.
+    /// Run the production no-subscription debug tool without a GDB server.
+    Debug,
     /// Decode and print every intercepted syscall.
     Strace,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-200): Review exact production minimal-strace hosting.
+    /// Print every intercepted syscall before injecting it.
+    StraceMinimal,
     /// Count intercepted syscalls in the current plugin process.
     Counter1,
     Counter1Exact,
@@ -149,12 +168,14 @@ impl ToolKind {
             Some(value) if value == "chaos" => Self::Chaos,
             Some(value) if value == "chrome-trace" => Self::ChromeTrace,
             Some(value) if value == "chunky-print" => Self::ChunkyPrint,
+            Some(value) if value == "debug" => Self::Debug,
             Some(value) if value == "counter1" => Self::Counter1,
             Some(value) if value == "counter1-exact" => Self::Counter1Exact,
             Some(value) if value == "counter2" => Self::Counter2,
             Some(value) if value == "counter2-exact" => Self::Counter2Exact,
             Some(value) if value == "noop" => Self::Noop,
             Some(value) if value == "strace" => Self::Strace,
+            Some(value) if value == "strace-minimal" => Self::StraceMinimal,
             None => Self::Strace,
             Some(other) => {
                 nostd_print::eprintln!("reverie-sabre: unknown {TOOL_ENV}={other:?}; using strace");
@@ -350,7 +371,9 @@ pub(crate) enum SharedAdapter {
     ChromeTraceRemote(RemoteReverieAdapter<ExactChromeTraceTool>),
     ChunkyPrintLocal(ReverieAdapter<ExactChunkyPrintTool>),
     ChunkyPrintRemote(RemoteReverieAdapter<ExactChunkyPrintTool>),
+    Debug(ReverieAdapter<ExactDebugTool>),
     Strace(ReverieAdapter<StraceTool>),
+    StraceMinimal(ReverieAdapter<ExactStraceMinimalTool>),
     Counter1Local(ReverieAdapter<Counter1Tool>),
     Counter1Remote(RemoteReverieAdapter<Counter1Tool>),
     Counter1ExactLocal(ReverieAdapter<ExactCounter1Tool>, ExactCounter1Global),
@@ -395,7 +418,11 @@ impl SharedAdapter {
                     }
                 },
             ),
+            ToolKind::Debug => Self::Debug(ReverieAdapter::new(ExactDebugTool, (), ())),
             ToolKind::Strace => Self::Strace(ReverieAdapter::new(StraceTool { quiet }, (), ())),
+            ToolKind::StraceMinimal => {
+                Self::StraceMinimal(ReverieAdapter::new(ExactStraceMinimalTool::default(), (), ()))
+            }
             ToolKind::Counter1 => coordinator_socket().map_or_else(
                 Self::counter1_local,
                 |path| match RemoteReverieAdapter::connect(&path) {
@@ -481,7 +508,9 @@ impl SharedAdapter {
             Self::ChromeTraceRemote(adapter) => adapter.handle_syscall(syscall),
             Self::ChunkyPrintLocal(adapter) => adapter.handle_syscall(syscall),
             Self::ChunkyPrintRemote(adapter) => adapter.handle_syscall(syscall),
+            Self::Debug(adapter) => adapter.handle_syscall(syscall),
             Self::Strace(adapter) => adapter.handle_syscall(syscall),
+            Self::StraceMinimal(adapter) => adapter.handle_syscall(syscall),
             Self::Counter1Local(adapter) => adapter.handle_syscall(syscall),
             Self::Counter1Remote(adapter) => adapter.handle_syscall(syscall),
             Self::Counter1ExactLocal(adapter, _) => adapter.handle_syscall(syscall),
@@ -509,7 +538,9 @@ impl SharedAdapter {
             Self::ChromeTraceRemote(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
             Self::ChunkyPrintLocal(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
             Self::ChunkyPrintRemote(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
+            Self::Debug(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
             Self::Strace(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
+            Self::StraceMinimal(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
             Self::Counter1Local(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
             Self::Counter1Remote(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
             Self::Counter1ExactLocal(adapter, _) => {
@@ -538,7 +569,9 @@ impl SharedAdapter {
             Self::ChromeTraceRemote(adapter) => adapter.handle_thread_start(thread_id),
             Self::ChunkyPrintLocal(adapter) => adapter.handle_thread_start(thread_id),
             Self::ChunkyPrintRemote(adapter) => adapter.handle_thread_start(thread_id),
+            Self::Debug(adapter) => adapter.handle_thread_start(thread_id),
             Self::Strace(adapter) => adapter.handle_thread_start(thread_id),
+            Self::StraceMinimal(adapter) => adapter.handle_thread_start(thread_id),
             Self::Counter1Local(adapter) => adapter.handle_thread_start(thread_id),
             Self::Counter1Remote(adapter) => adapter.handle_thread_start(thread_id),
             Self::Counter1ExactLocal(adapter, _) => adapter.handle_thread_start(thread_id),
@@ -559,7 +592,9 @@ impl SharedAdapter {
             Self::ChromeTraceRemote(adapter) => adapter.handle_thread_exit(thread_id),
             Self::ChunkyPrintLocal(adapter) => adapter.handle_thread_exit(thread_id),
             Self::ChunkyPrintRemote(adapter) => adapter.handle_thread_exit(thread_id),
+            Self::Debug(adapter) => adapter.handle_thread_exit(thread_id),
             Self::Strace(adapter) => adapter.handle_thread_exit(thread_id),
+            Self::StraceMinimal(adapter) => adapter.handle_thread_exit(thread_id),
             Self::Counter1Local(adapter) => adapter.handle_thread_exit(thread_id),
             Self::Counter1Remote(adapter) => adapter.handle_thread_exit(thread_id),
             Self::Counter1ExactLocal(adapter, global) => {
@@ -583,7 +618,9 @@ impl SharedAdapter {
             Self::ChromeTraceRemote(adapter) => adapter.handle_post_exec(),
             Self::ChunkyPrintLocal(adapter) => adapter.handle_post_exec(),
             Self::ChunkyPrintRemote(adapter) => adapter.handle_post_exec(),
+            Self::Debug(adapter) => adapter.handle_post_exec(),
             Self::Strace(adapter) => adapter.handle_post_exec(),
+            Self::StraceMinimal(adapter) => adapter.handle_post_exec(),
             Self::Counter1Local(adapter) => adapter.handle_post_exec(),
             Self::Counter1Remote(adapter) => adapter.handle_post_exec(),
             Self::Counter1ExactLocal(adapter, _) => adapter.handle_post_exec(),
@@ -637,6 +674,27 @@ mod tests {
             ToolKind::remember(&selected, Some(OsStr::new("counter1"))),
             ToolKind::Noop
         );
+    }
+
+    #[test]
+    fn all_production_tools_are_selectable() {
+        for (name, expected) in [
+            ("chaos", ToolKind::Chaos),
+            ("chrome-trace", ToolKind::ChromeTrace),
+            ("chunky-print", ToolKind::ChunkyPrint),
+            ("debug", ToolKind::Debug),
+            ("strace", ToolKind::Strace),
+            ("strace-minimal", ToolKind::StraceMinimal),
+            ("counter1", ToolKind::Counter1),
+            ("counter2", ToolKind::Counter2),
+            ("noop", ToolKind::Noop),
+        ] {
+            assert_eq!(
+                ToolKind::remember(&OnceLock::new(), Some(OsStr::new(name))),
+                expected,
+                "selector {name}"
+            );
+        }
     }
 
     #[test]
