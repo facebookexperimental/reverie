@@ -617,6 +617,10 @@ fn execute_basic_syscall_with_output(
         mmap(memory, state, args)
     } else if number == libc::SYS_munmap as u64 {
         munmap(memory, args[0], args[1])
+    } else if number == libc::SYS_msync as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-227): Review in-memory mapping synchronization semantics.
+        msync(memory, args)
     } else if number == libc::SYS_mremap as u64 {
         mremap(memory, state, args)
     } else if number == libc::SYS_mprotect as u64 {
@@ -6499,6 +6503,35 @@ fn munmap(memory: &mut GuestMemory, address: u64, length: u64) -> i64 {
         },
         Err(_) => negative_errno(libc::EINVAL),
     }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-227): Review in-memory mapping synchronization semantics.
+fn msync(memory: &GuestMemory, args: &[u64; 6]) -> i64 {
+    let address = args[0];
+    let requested_length = args[1];
+    let flags = args[2] as libc::c_int;
+    let allowed_flags = libc::MS_ASYNC | libc::MS_SYNC | libc::MS_INVALIDATE;
+    if !address.is_multiple_of(PAGE_SIZE)
+        || flags & !allowed_flags != 0
+        || flags & libc::MS_ASYNC != 0 && flags & libc::MS_SYNC != 0
+    {
+        return negative_errno(libc::EINVAL);
+    }
+    if requested_length == 0 {
+        return 0;
+    }
+    let Some(length) = align_up(requested_length, PAGE_SIZE) else {
+        return negative_errno(libc::ENOMEM);
+    };
+    if !range_is_valid(memory, address, length) || !memory.user_range_is_mapped(address, length) {
+        return negative_errno(libc::ENOMEM);
+    }
+
+    // File-backed mappings are deterministic snapshots copied into guest
+    // memory by mmap. There is no host page cache to flush, so a valid msync
+    // completes once the mapped-range contract above has been checked.
+    0
 }
 
 // TODO-HUMAN-REVIEW(PR-132): Review KVM mprotect user-copy enforcement.
@@ -12629,6 +12662,80 @@ mod tests {
         assert_eq!(state.mmap_next, state.mmap_limit);
         assert_eq!(
             syscall_result(&mut memory, &mut state, libc::SYS_mmap, mmap_args),
+            negative_errno(libc::ENOMEM)
+        );
+    }
+
+    #[test]
+    fn msync_validates_mapped_ranges_and_flags() {
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let memory_size = BOOT_RESERVED_END + 8 * PAGE_SIZE;
+        let mut memory = GuestMemory::new(0, memory_size as usize).unwrap();
+        state.mmap_next = BOOT_RESERVED_END + PAGE_SIZE;
+        state.mmap_limit = memory_size;
+        let mapping = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_mmap,
+            [
+                0,
+                PAGE_SIZE,
+                (libc::PROT_READ | libc::PROT_WRITE) as u64,
+                (libc::MAP_SHARED | libc::MAP_ANONYMOUS) as u64,
+                -1_i32 as u64,
+                0,
+            ],
+        ) as u64;
+
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_msync,
+                [mapping, PAGE_SIZE, libc::MS_SYNC as u64, 0, 0, 0],
+            ),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_msync,
+                [mapping + 1, PAGE_SIZE, libc::MS_SYNC as u64, 0, 0, 0],
+            ),
+            negative_errno(libc::EINVAL)
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_msync,
+                [
+                    mapping,
+                    PAGE_SIZE,
+                    (libc::MS_ASYNC | libc::MS_SYNC) as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            negative_errno(libc::EINVAL)
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_msync,
+                [
+                    mapping + PAGE_SIZE,
+                    PAGE_SIZE,
+                    libc::MS_SYNC as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
             negative_errno(libc::ENOMEM)
         );
     }
