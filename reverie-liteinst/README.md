@@ -63,6 +63,24 @@ the real PID, while `passthrough` leaves the result unchanged. The
 `passthrough_builtin_preserves_getpid_result` tests in `tests/strace.rs` cover
 both.
 
+### Shared `reverie-preload` runtime configuration
+
+The in-guest runtime's `SIGSYS` handler is installed through the shared
+`reverie-preload` `RuntimeConfig`, whose `use_alt_stack` knob decides whether the
+handler runs on an alternate signal stack. The `RuntimeConfig` and the
+controller that honors it live in `reverie-preload` and are reviewed once; both
+ld-preload backends install through that same seam. The launcher selects the
+knob per guest with `set_guest_alt_stack(&mut Command, bool)`, which sets the
+`REVERIE_LITEINST_ALT_STACK` environment variable (`1`/`0`, `true`/`false`,
+`on`/`off`, `yes`/`no`; unset means the shared default, alt stack **on**). Only
+the env-var spelling is LiteInst's — this is the LiteInst analog of e9patch's
+`REVERIE_E9PATCH_ALT_STACK`, so the same `RuntimeConfig` drives both backends.
+It applies to the LiteInst-dispatcher install path (the `strace`/`compat`/Detcore
+modes); a shared `BuiltinTool` installs through `reverie_preload::install_builtin`
+with the shared default. The `alt_stack_from_env_value` parser and the
+`set_guest_alt_stack` round-trip are unit-tested in `src/runtime.rs` and
+`src/lib.rs`.
+
 ## Current boundaries
 
 - Dynamically linked, non-`AT_SECURE` Linux x86-64 guests only.

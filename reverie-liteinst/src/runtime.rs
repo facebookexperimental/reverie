@@ -149,6 +149,63 @@ pub(crate) unsafe fn install_builtin_runtime(tool: BuiltinTool) -> io::Result<()
     unsafe { reverie_preload::install_builtin(tool) }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-253): Review launcher-selected shared RuntimeConfig alt-stack knob.
+/// Environment variable selecting the shared [`RuntimeConfig::use_alt_stack`]
+/// knob for the in-guest runtime's `SIGSYS` handler.
+///
+/// The [`RuntimeConfig`] and the controller that honors it live in
+/// `reverie-preload` and are reviewed exactly once; both ld-preload backends
+/// install through that same shared seam. Only the env-var spelling is
+/// LiteInst's, exactly as with `REVERIE_LITEINST_TOOL`. This is the LiteInst
+/// analog of e9patch's `REVERIE_E9PATCH_ALT_STACK`.
+///
+/// When unset the shared default applies ([`RuntimeConfig::default`], alt stack
+/// **on**). It applies to the LiteInst-dispatcher install path
+/// ([`install_runtime`], used by the `strace`/`compat`/Detcore modes); a shared
+/// [`BuiltinTool`] runs through `install_builtin`, which uses the shared default.
+pub const ALT_STACK_ENV: &str = "REVERIE_LITEINST_ALT_STACK";
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-253): Review alt-stack env parse/reject contract.
+/// Parses an [`ALT_STACK_ENV`] value into the `use_alt_stack` boolean.
+///
+/// `None` (unset) yields the shared default. Accepts `1`/`0`, `true`/`false`,
+/// `on`/`off`, and `yes`/`no` (case-insensitive, surrounding whitespace
+/// trimmed). Any other value is rejected. Kept pure so the parse/reject contract
+/// is unit-testable without touching process-global state, matching
+/// [`builtin_tool_from_env_value`] and e9patch's `alt_stack_from_env_value`.
+pub fn alt_stack_from_env_value(value: Option<&OsStr>) -> io::Result<bool> {
+    let Some(value) = value else {
+        return Ok(RuntimeConfig::default().use_alt_stack);
+    };
+    let text = value.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{ALT_STACK_ENV} must be valid UTF-8"),
+        )
+    })?;
+    match text.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => Ok(true),
+        "0" | "false" | "off" | "no" => Ok(false),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported {ALT_STACK_ENV} value {value:?}"),
+        )),
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-253): Review launcher-selected RuntimeConfig assembly.
+/// Builds the shared [`RuntimeConfig`] the launcher selected via [`ALT_STACK_ENV`].
+///
+/// Reads the process environment once; the parse itself is delegated to the pure
+/// [`alt_stack_from_env_value`].
+fn runtime_config_from_env() -> io::Result<RuntimeConfig> {
+    let use_alt_stack = alt_stack_from_env_value(std::env::var_os(ALT_STACK_ENV).as_deref())?;
+    Ok(RuntimeConfig { use_alt_stack })
+}
+
 pub(crate) fn initialize_from_environment() -> io::Result<()> {
     let tool_value = std::env::var_os("REVERIE_LITEINST_TOOL");
     // Prefer a shared reverie-preload built-in when the selector names one, so a
@@ -202,7 +259,9 @@ pub(crate) fn initialize_reverie_tool() -> io::Result<()> {
 
 fn install_runtime() -> io::Result<()> {
     prepare_instrumentation()?;
-    let config = RuntimeConfig::default();
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-253): Review launcher-selected RuntimeConfig at the install seam.
+    let config = runtime_config_from_env()?;
     unsafe { reverie_preload::install(Box::new(LiteinstDispatcher), &InProcessSeccomp, &config) }
 }
 
@@ -1430,6 +1489,7 @@ mod tests {
 
     use reverie_preload::BuiltinTool;
 
+    use super::ALT_STACK_ENV;
     use super::MAX_PATCH_SITES;
     use super::SITE_ACTIVE;
     use super::SITE_FALLBACK;
@@ -1440,6 +1500,7 @@ mod tests {
     use super::StackLine;
     use super::TOOL_PASSTHROUGH;
     use super::TOOL_SPOOF_GETPID;
+    use super::alt_stack_from_env_value;
     use super::builtin_tool_from_env_value;
     use super::claim_site;
     use super::clone_is_fork_like;
@@ -1462,6 +1523,51 @@ mod tests {
         assert_eq!(builtin_tool_from_env_value(OsStr::new("strace")), None);
         assert_eq!(builtin_tool_from_env_value(OsStr::new("compat")), None);
         assert_eq!(builtin_tool_from_env_value(OsStr::new("bogus")), None);
+    }
+
+    #[test]
+    fn alt_stack_defaults_to_the_shared_default_when_unset() {
+        // Unset must reproduce the shared reverie-preload default verbatim, so
+        // the launcher-selected knob is a no-op by default (zero behavior change).
+        use reverie_preload::lifecycle::RuntimeConfig;
+        assert_eq!(
+            alt_stack_from_env_value(None).unwrap(),
+            RuntimeConfig::default().use_alt_stack
+        );
+    }
+
+    #[test]
+    fn alt_stack_parses_truthy_and_falsy_spellings() {
+        for on in ["1", "true", "TRUE", "on", "On", "yes", "  yes  "] {
+            assert!(
+                alt_stack_from_env_value(Some(OsStr::new(on))).unwrap(),
+                "{on:?} should parse as alt-stack on"
+            );
+        }
+        for off in ["0", "false", "FALSE", "off", "Off", "no", "  no  "] {
+            assert!(
+                !alt_stack_from_env_value(Some(OsStr::new(off))).unwrap(),
+                "{off:?} should parse as alt-stack off"
+            );
+        }
+    }
+
+    #[test]
+    fn alt_stack_rejects_unknown_values() {
+        for bad in ["maybe", "2", "", "onoff"] {
+            assert!(
+                alt_stack_from_env_value(Some(OsStr::new(bad))).is_err(),
+                "{bad:?} must be rejected, not silently defaulted"
+            );
+        }
+    }
+
+    #[test]
+    fn alt_stack_env_is_distinct_from_the_other_selectors() {
+        // The alt-stack knob is orthogonal to the tool selector; a shared
+        // build-time typo that aliased them would defeat launcher control.
+        assert_eq!(ALT_STACK_ENV, "REVERIE_LITEINST_ALT_STACK");
+        assert_ne!(ALT_STACK_ENV, "REVERIE_LITEINST_TOOL");
     }
 
     #[test]
