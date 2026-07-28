@@ -4064,7 +4064,11 @@ fn socket(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
     let domain = args[0] as libc::c_int;
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-235): Review host-backed AF_INET6 socket creation.
-    if !matches!(domain, libc::AF_UNIX | libc::AF_INET | libc::AF_INET6) {
+    // TODO-HUMAN-REVIEW(PR-PENDING): Review host-backed AF_NETLINK creation.
+    if !matches!(
+        domain,
+        libc::AF_UNIX | libc::AF_INET | libc::AF_INET6 | libc::AF_NETLINK
+    ) {
         return negative_errno(libc::EAFNOSUPPORT);
     }
     let protocol = args[2] as libc::c_int;
@@ -4073,7 +4077,12 @@ fn socket(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
     }
     let socket_type = args[1] as libc::c_int;
     let base_type = socket_type & !(libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK);
-    if base_type != libc::SOCK_DGRAM && base_type != libc::SOCK_STREAM {
+    let supported_type = if domain == libc::AF_NETLINK {
+        matches!(base_type, libc::SOCK_DGRAM | libc::SOCK_RAW)
+    } else {
+        matches!(base_type, libc::SOCK_DGRAM | libc::SOCK_STREAM)
+    };
+    if !supported_type {
         return negative_errno(libc::EPROTONOSUPPORT);
     }
     // SAFETY: domain and type are restricted above; the kernel validates the
@@ -4226,7 +4235,12 @@ fn bind(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
             .try_into()
             .expect("family slice has exact size"),
     );
-    if !matches!(family as libc::c_int, libc::AF_INET | libc::AF_UNIX) {
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-PENDING): Review deterministic AF_NETLINK bind forwarding.
+    if !matches!(
+        family as libc::c_int,
+        libc::AF_INET | libc::AF_UNIX | libc::AF_NETLINK
+    ) {
         return negative_errno(libc::EAFNOSUPPORT);
     }
     // SAFETY: address is readable for length bytes and host_fd belongs to the
@@ -10599,6 +10613,70 @@ mod tests {
             ),
             0
         );
+    }
+
+    #[test]
+    fn netlink_bind_round_trips_deterministic_port_identity() {
+        const BIND_ADDRESS: u64 = 0x100;
+        const RESULT_ADDRESS: u64 = 0x200;
+        const RESULT_LENGTH: u64 = 0x300;
+        const PORT_ID: u32 = 0x4000_8000;
+
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        // SAFETY: the zeroed padding and fields form a valid sockaddr_nl base.
+        let mut address = unsafe { std::mem::zeroed::<libc::sockaddr_nl>() };
+        address.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+        address.nl_pid = PORT_ID;
+        assert_eq!(write_struct(&mut memory, BIND_ADDRESS, &address), 0);
+
+        let socket_fd = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_socket,
+            [
+                libc::AF_NETLINK as u64,
+                libc::SOCK_RAW as u64,
+                libc::NETLINK_USERSOCK as u64,
+                0,
+                0,
+                0,
+            ],
+        );
+        assert_eq!(socket_fd, 3);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_bind,
+                [
+                    socket_fd as u64,
+                    BIND_ADDRESS,
+                    std::mem::size_of::<libc::sockaddr_nl>() as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            0
+        );
+
+        let result_length = std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
+        assert_eq!(write_struct(&mut memory, RESULT_LENGTH, &result_length), 0);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_getsockname,
+                [socket_fd as u64, RESULT_ADDRESS, RESULT_LENGTH, 0, 0, 0,],
+            ),
+            0
+        );
+        let returned: libc::sockaddr_nl = read_struct(&memory, RESULT_ADDRESS);
+        assert_eq!(returned.nl_family, libc::AF_NETLINK as libc::sa_family_t);
+        assert_eq!(returned.nl_pid, PORT_ID);
+        assert_eq!(returned.nl_groups, 0);
     }
 
     #[test]
