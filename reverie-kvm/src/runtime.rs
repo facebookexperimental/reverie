@@ -781,8 +781,9 @@ fn initial_exec_request(memory: &GuestMemory, stack_pointer: u64) -> Result<Sysc
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-233): Review synthetic initial exec Tool delivery.
+// TODO-HUMAN-REVIEW(PR-235): Review shared Tool state during initial exec.
 #[allow(clippy::too_many_arguments)]
-async fn run_initial_exec_handler<T: Tool>(
+async fn run_initial_exec_handler<T>(
     backend: &mut KvmBackend,
     tool: &T,
     pid: Pid,
@@ -790,11 +791,17 @@ async fn run_initial_exec_handler<T: Tool>(
     auxv: &[(libc::c_ulong, libc::c_ulong)],
     thread_state: &mut T::ThreadState,
     executor: &mut ElfExecutor,
-    global_state: &T::GlobalState,
+    global_state: &Arc<T::GlobalState>,
     config: &<T::GlobalState as GlobalTool>::Config,
     subscriptions: &Subscription,
     stack_checked_out: &Arc<AtomicBool>,
-) -> Result<()> {
+) -> Result<()>
+where
+    T: Tool + 'static,
+    T::ThreadState: 'static,
+    T::GlobalState: 'static,
+    <T::GlobalState as GlobalTool>::Config: 'static,
+{
     let request = initial_exec_request(memory, executor.initial_stack_pointer())?;
     let syscall = request.into_syscall()?;
     let mut registers = kvm_registers(backend.vcpu.get_regs()?, request.number());
@@ -803,6 +810,7 @@ async fn run_initial_exec_handler<T: Tool>(
     registers.rdx = request.args()[2];
 
     let handler_signal = Arc::new(Mutex::new(None));
+    let pending_child_starts = Arc::new(Mutex::new(Vec::new()));
     expose_tool_scratch(memory)?;
     let mut _process_completed = false;
     let outcome = {
@@ -821,15 +829,18 @@ async fn run_initial_exec_handler<T: Tool>(
             registers,
             thread_state,
             &mut guest_executor,
-            global_state,
+            global_state.as_ref(),
+            Some(global_state.clone()),
             config,
             subscriptions,
             handler_signal.clone(),
+            pending_child_starts.clone(),
             stack_checked_out.clone(),
         );
         drive_handler(
             tool.handle_syscall_event(&mut guest, syscall),
             handler_signal,
+            pending_child_starts,
         )
         .await
     };
@@ -1182,7 +1193,7 @@ impl KvmBackend {
                     &auxv,
                     &mut thread_state,
                     executor,
-                    global_state,
+                    &global_state,
                     config,
                     subscriptions,
                     &stack_checked_out,
@@ -1197,7 +1208,7 @@ impl KvmBackend {
                     notify_tool_exit(
                         tool,
                         pid,
-                        global_state,
+                        global_state.as_ref(),
                         config,
                         thread_state,
                         ExitStatus::Exited(exit.code),
