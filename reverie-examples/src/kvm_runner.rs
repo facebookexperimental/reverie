@@ -64,6 +64,7 @@ pub(crate) struct KvmRun<G> {
 }
 
 // TODO-HUMAN-REVIEW(PR-151): Review the production example KVM launch path.
+// TODO-HUMAN-REVIEW(PR-235): Review static lifetime requirements for KVM Tool workers.
 #[cfg(target_arch = "x86_64")]
 pub(crate) async fn run<T>(
     args: &CommonToolArguments,
@@ -71,7 +72,10 @@ pub(crate) async fn run<T>(
     stdin: Option<File>,
 ) -> anyhow::Result<KvmRun<T::GlobalState>>
 where
-    T: Tool,
+    T: Tool + 'static,
+    T::ThreadState: 'static,
+    T::GlobalState: 'static,
+    <T::GlobalState as GlobalTool>::Config: 'static,
 {
     let cwd = std::env::current_dir()?;
     let environment = guest_environment(args)?;
@@ -104,13 +108,17 @@ where
 
 #[cfg(not(target_arch = "x86_64"))]
 // TODO-HUMAN-REVIEW(PR-151): Review the unsupported-architecture runner error.
+// TODO-HUMAN-REVIEW(PR-235): Review cross-architecture KVM runner bound parity.
 pub(crate) async fn run<T>(
     args: &CommonToolArguments,
     config: <T::GlobalState as GlobalTool>::Config,
     stdin: Option<File>,
 ) -> anyhow::Result<KvmRun<T::GlobalState>>
 where
-    T: Tool,
+    T: Tool + 'static,
+    T::ThreadState: 'static,
+    T::GlobalState: 'static,
+    <T::GlobalState as GlobalTool>::Config: 'static,
 {
     let _ = (args, config, stdin);
     anyhow::bail!("the KVM example runner requires x86-64")
