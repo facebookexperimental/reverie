@@ -420,7 +420,7 @@ impl KvmBackend {
     /// The default is PID 1. Call this before running a tool when its process
     /// model reserves a different deterministic root identity.
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Review configurable KVM root process identity.
+    // TODO-HUMAN-REVIEW(PR-238): Review configurable KVM root process identity.
     pub fn set_root_pid(&mut self, pid: i32) -> Result<()> {
         let pid = validate_root_pid(pid)?;
         self.root_pid = pid;
