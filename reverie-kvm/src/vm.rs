@@ -483,6 +483,18 @@ impl KvmBackend {
         Ok(())
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TBD): Review the KVM random-seed configuration API.
+    /// Configure the deterministic seed used by virtual random devices.
+    pub fn set_random_seed(&mut self, seed: u64) -> Result<()> {
+        let loaded = self
+            .static_elf
+            .as_mut()
+            .ok_or(Error::StaticElfNotInstalled)?;
+        loaded.random_seed = seed;
+        Ok(())
+    }
+
     fn snapshot_process(&self) -> Result<KvmProcessSnapshot> {
         Ok(KvmProcessSnapshot {
             memory: self.memory.snapshot()?,

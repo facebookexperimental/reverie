@@ -118,6 +118,9 @@ pub(crate) struct LoadedStaticElf {
     pub tid: i32,
     pub ppid: i32,
     pub umask: libc::mode_t,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TBD): Review caller-provided deterministic random seed state.
+    pub random_seed: u64,
     // TODO-HUMAN-REVIEW(PR-181): Review virtual capability lifecycle state.
     pub keep_capabilities: bool,
     pub capability_effective: u64,
@@ -194,6 +197,7 @@ impl LoadedStaticElf {
             tid: child_pid,
             ppid: self.pid,
             umask: self.umask,
+            random_seed: self.random_seed,
             keep_capabilities: self.keep_capabilities,
             capability_effective: self.capability_effective,
             capability_permitted: self.capability_permitted,
@@ -303,6 +307,7 @@ impl LoadedStaticElf {
         self.tid = previous.tid;
         self.ppid = previous.ppid;
         self.umask = previous.umask;
+        self.random_seed = previous.random_seed;
         self.keep_capabilities = false;
         self.capability_bounding = previous.capability_bounding;
         self.capability_effective = previous.capability_bounding;
@@ -525,6 +530,7 @@ fn load_executable(
         tid: 1,
         ppid: 0,
         umask: 0o022,
+        random_seed: 0,
         keep_capabilities: false,
         capability_effective: GUEST_CAPABILITY_MASK,
         capability_permitted: GUEST_CAPABILITY_MASK,

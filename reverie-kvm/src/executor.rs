@@ -2282,8 +2282,9 @@ fn open_file(
         return open_guest_fd_path(state, guest_fd, flags, guest_cloexec);
     }
     if path == b"/dev/random" || path == b"/dev/urandom" {
-        // TODO-HUMAN-REVIEW(PR-180): Review virtual-TID random-device streams.
-        let bytes = deterministic_random_bytes(state.tid, 64 * 1024, 73, 41);
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-TBD): Review cross-backend random-device stream parity.
+        let bytes = deterministic_random_device_bytes(state.random_seed, 64 * 1024);
         return open_virtual_file(state, &bytes, flags, guest_cloexec);
     }
     if path == b"/proc/uptime" {
@@ -7160,6 +7161,24 @@ fn deterministic_random_bytes(tid: i32, length: usize, byte_stride: u8, first_by
         .collect()
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-TBD): Review cross-backend random-device stream parity.
+fn deterministic_random_device_bytes(seed: u64, length: usize) -> Vec<u8> {
+    const BYTE_STRIDE: u8 = 73;
+    const FIRST_BYTE: u8 = 41;
+
+    (0..length)
+        .map(|index| {
+            let index = index as u64;
+            let seed_byte = seed.rotate_right(((index % 8) * 8) as u32) as u8;
+            (index as u8)
+                .wrapping_mul(BYTE_STRIDE)
+                .wrapping_add(FIRST_BYTE)
+                ^ seed_byte
+        })
+        .collect()
+}
+
 // Child processes and guest workers bypass Detcore's virtual scheduler. Validate
 // their sleep requests, but do not block the supervisor on host wall time;
 // subscribed root-process sleeps continue to use Detcore's time model.
@@ -8052,6 +8071,7 @@ mod tests {
             tid: 1,
             ppid: 0,
             umask: 0o022,
+            random_seed: 0,
             keep_capabilities: false,
             capability_effective: GUEST_CAPABILITY_MASK,
             capability_permitted: GUEST_CAPABILITY_MASK,
@@ -15061,11 +15081,11 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_random_device_repeats_per_thread_and_separates_threads() {
-        let root = deterministic_random_bytes(1, 32, 73, 41);
-        assert_eq!(root, deterministic_random_bytes(1, 32, 73, 41));
+    fn deterministic_random_device_repeats_and_changes_with_seed() {
+        let root = deterministic_random_device_bytes(0, 32);
+        assert_eq!(root, deterministic_random_device_bytes(0, 32));
         assert_eq!(root[0], 41);
-        assert_ne!(root, deterministic_random_bytes(2, 32, 73, 41));
+        assert_ne!(root, deterministic_random_device_bytes(17, 32));
     }
 
     fn custom_action(handler: u64) -> [u8; KERNEL_SIGACTION_SIZE] {
