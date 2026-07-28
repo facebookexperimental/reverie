@@ -104,6 +104,60 @@ pub fn builtin_tool_from_env_value(value: &OsStr) -> Option<BuiltinTool> {
     }
 }
 
+/// Environment variable selecting the shared [`RuntimeConfig::use_alt_stack`]
+/// knob for the in-guest runtime's `SIGSYS` handler.
+///
+/// The [`RuntimeConfig`] and the controller that honors it live in
+/// `reverie-preload` and are reviewed exactly once; both ld-preload backends
+/// install through that same shared seam. Only the env-var spelling is
+/// e9patch's, exactly as with [`TOOL_ENV`] and [`RUNTIME_ENV`].
+///
+/// When unset the shared default applies ([`RuntimeConfig::default`], alt stack
+/// **on**). It applies to the controller-mode install paths
+/// ([`install_runtime`]/[`install_hybrid_runtime`]); a [`TOOL_ENV`] built-in
+/// runs through the shared `install_builtin`, which uses the shared default.
+// TODO-HUMAN-REVIEW(PR-250): Review launcher-selected shared RuntimeConfig alt-stack knob.
+pub const ALT_STACK_ENV: &str = "REVERIE_E9PATCH_ALT_STACK";
+
+/// Parse an [`ALT_STACK_ENV`] value into the `use_alt_stack` boolean.
+///
+/// `None` (unset) yields the shared default. Accepts `1`/`0`, `true`/`false`,
+/// `on`/`off`, and `yes`/`no` (case-insensitive, surrounding whitespace
+/// trimmed). Any other value is rejected. Kept pure so the parse/reject contract
+/// is unit-testable without touching process-global state, matching
+/// [`builtin_tool_from_env_value`].
+// TODO-HUMAN-REVIEW(PR-250): Review alt-stack env parse/reject contract.
+pub fn alt_stack_from_env_value(value: Option<&OsStr>) -> io::Result<bool> {
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    let Some(value) = value else {
+        return Ok(RuntimeConfig::default().use_alt_stack);
+    };
+    let text = value.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{ALT_STACK_ENV} must be valid UTF-8"),
+        )
+    })?;
+    match text.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => Ok(true),
+        "0" | "false" | "off" | "no" => Ok(false),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported {ALT_STACK_ENV} value {value:?}"),
+        )),
+    }
+}
+
+/// Build the shared [`RuntimeConfig`] the launcher selected via [`ALT_STACK_ENV`].
+///
+/// Reads the process environment once; the parse itself is delegated to the pure
+/// [`alt_stack_from_env_value`].
+fn runtime_config_from_env() -> io::Result<RuntimeConfig> {
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    let use_alt_stack = alt_stack_from_env_value(env::var_os(ALT_STACK_ENV).as_deref())?;
+    Ok(RuntimeConfig { use_alt_stack })
+}
+
 /// Which shared `reverie-preload` lifecycle controller the in-guest runtime
 /// installs.
 ///
@@ -232,7 +286,11 @@ pub unsafe fn install_builtin_runtime(tool: BuiltinTool) -> io::Result<()> {
 ///
 /// See [`install_runtime`].
 unsafe fn install_with_controller(controller: &dyn LifecycleController) -> io::Result<()> {
-    let config = RuntimeConfig::default();
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // Honor the launcher-selected shared config (ALT_STACK_ENV) instead of an
+    // unconditional default, so the same shared RuntimeConfig knob reverie-preload
+    // exposes is reachable from the e9patch launcher. Unset => shared default.
+    let config = runtime_config_from_env()?;
     // SAFETY: the dispatcher is registered before the controller installs the
     // SIGSYS handler + filter; forwarded to the caller's contract above.
     unsafe { reverie_preload::install(Box::new(E9patchDispatcher::new()), controller, &config) }
@@ -353,6 +411,52 @@ mod tests {
         // separate knobs; TOOL_ENV takes precedence in initialize_from_environment.
         assert_eq!(TOOL_ENV, "REVERIE_E9PATCH_TOOL");
         assert_ne!(TOOL_ENV, RUNTIME_ENV);
+    }
+
+    #[test]
+    fn alt_stack_defaults_to_the_shared_default_when_unset() {
+        // Unset must reproduce reverie-preload's shared default exactly, so an
+        // e9patch launcher that never sets the knob behaves identically to the
+        // shared crate.
+        assert_eq!(
+            alt_stack_from_env_value(None).unwrap(),
+            RuntimeConfig::default().use_alt_stack
+        );
+    }
+
+    #[test]
+    fn alt_stack_parses_truthy_and_falsy_spellings() {
+        for truthy in ["1", "true", "TRUE", "on", "Yes", " yes ", "\tON\n"] {
+            assert!(
+                alt_stack_from_env_value(Some(OsStr::new(truthy))).unwrap(),
+                "{truthy:?} should parse as alt-stack on"
+            );
+        }
+        for falsy in ["0", "false", "FALSE", "off", "No", " no ", "\toff\n"] {
+            assert!(
+                !alt_stack_from_env_value(Some(OsStr::new(falsy))).unwrap(),
+                "{falsy:?} should parse as alt-stack off"
+            );
+        }
+    }
+
+    #[test]
+    fn alt_stack_rejects_unknown_values() {
+        for bogus in ["", "maybe", "2", "enable"] {
+            assert!(
+                alt_stack_from_env_value(Some(OsStr::new(bogus))).is_err(),
+                "{bogus:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn alt_stack_env_is_distinct_from_the_other_selectors() {
+        // The config knob is a separate axis from tool selection and controller
+        // selection; all three env vars must be distinct.
+        assert_eq!(ALT_STACK_ENV, "REVERIE_E9PATCH_ALT_STACK");
+        assert_ne!(ALT_STACK_ENV, TOOL_ENV);
+        assert_ne!(ALT_STACK_ENV, RUNTIME_ENV);
     }
 
     #[test]

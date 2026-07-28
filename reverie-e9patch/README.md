@@ -65,6 +65,14 @@ it.
 - **The same lifecycle-controller seam.** Both backends install their runtime
   through reverie-preload's `LifecycleController` seam. Selecting a controller is
   a *config choice on one shared seam*, not a mechanism fork (see `RuntimeMode`).
+- **The same shared `RuntimeConfig`.** The in-guest runtime installs through
+  reverie-preload's shared `RuntimeConfig` (today the `use_alt_stack` knob that
+  governs whether the `SIGSYS` handler runs on an alternate signal stack). The
+  config struct and the controller that honors it are shared-crate code reviewed
+  once; the e9patch launcher selects a non-default value with `set_guest_alt_stack`
+  / `REVERIE_E9PATCH_ALT_STACK`, and unset reproduces the shared default exactly.
+  Only the env-var spelling is e9patch's — the same shared-vs-local split as tool
+  and controller selection.
 - **The same shared built-in tools.** e9patch's in-guest runtime can install
   reverie-preload's shared `BuiltinTool`s (`passthrough`, `spoof-getpid`)
   **verbatim** via the shared `reverie_preload::install_builtin`, selected by

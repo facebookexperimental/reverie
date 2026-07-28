@@ -65,6 +65,7 @@ pub use rewrite::E9TOOL_ENV;
 pub use rewrite::E9patchRewriter;
 pub use rewrite::PreparedBinary;
 pub use rewrite::RewriteReport;
+pub use runtime::ALT_STACK_ENV;
 pub use runtime::RUNTIME_ENV;
 pub use runtime::RUNTIME_FALLBACK;
 pub use runtime::RUNTIME_HYBRID;
@@ -72,6 +73,7 @@ pub use runtime::RuntimeMode;
 pub use runtime::TOOL_ENV;
 pub use runtime::TOOL_PASSTHROUGH;
 pub use runtime::TOOL_SPOOF_GETPID;
+pub use runtime::alt_stack_from_env_value;
 pub use runtime::builtin_tool_from_env_value;
 
 /// Environment variable overriding the located e9patch preload library path.
@@ -198,6 +200,21 @@ pub fn configure_guest_builtin(
     Ok(())
 }
 
+/// Selects the shared [`RuntimeConfig`](reverie_preload::lifecycle::RuntimeConfig)
+/// `use_alt_stack` knob on a guest command via [`ALT_STACK_ENV`].
+///
+/// Additive to [`configure_guest_command`]/[`configure_guest_builtin`]: those arm
+/// the runtime, while this tunes the shared config the controller-mode install
+/// paths honor. The value is spelled so the in-guest [`alt_stack_from_env_value`]
+/// parser round-trips it. The config struct and the controller that honors it are
+/// shared reverie-preload code, reviewed once; only this env spelling is
+/// e9patch's — the same shared-vs-local split as tool and controller selection.
+// TODO-HUMAN-REVIEW(PR-250): Review launcher-side alt-stack config setter.
+pub fn set_guest_alt_stack(command: &mut reverie::process::Command, use_alt_stack: bool) {
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    command.env(ALT_STACK_ENV, if use_alt_stack { "1" } else { "0" });
+}
+
 /// The canonical [`TOOL_ENV`] string for a shared [`BuiltinTool`].
 ///
 /// Kept beside [`configure_guest_builtin`] so the launcher and the in-guest
@@ -280,11 +297,14 @@ mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
 
+    use super::ALT_STACK_ENV;
     use super::BuiltinTool;
     use super::E9PATCH_SOURCE_REVISION;
+    use super::alt_stack_from_env_value;
     use super::builtin_tool_env_value;
     use super::builtin_tool_from_env_value;
     use super::compose_ld_preload;
+    use super::set_guest_alt_stack;
 
     #[test]
     fn pinned_revision_is_a_full_git_object_id() {
@@ -332,6 +352,25 @@ mod tests {
                 builtin_tool_from_env_value(std::ffi::OsStr::new(spelling)),
                 Some(tool),
                 "round-trip failed for {tool:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn alt_stack_setter_round_trips_through_the_parser() {
+        // The launcher-side setter and the in-guest parser must agree, so a guest
+        // armed by `set_guest_alt_stack` installs exactly the config selected.
+        for value in [true, false] {
+            let mut command = reverie::process::Command::new("/bin/true");
+            set_guest_alt_stack(&mut command, value);
+            let raw = command
+                .get_env(ALT_STACK_ENV)
+                .expect("alt-stack env should be set")
+                .into_owned();
+            assert_eq!(
+                alt_stack_from_env_value(Some(raw.as_os_str())).unwrap(),
+                value,
+                "round-trip failed for use_alt_stack={value}"
             );
         }
     }
