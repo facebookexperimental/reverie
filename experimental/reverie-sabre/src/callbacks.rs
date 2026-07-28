@@ -168,20 +168,6 @@ pub extern "C" fn handle_syscall<T: ToolGlobal>(
     }
 }
 
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-214): Review eager child registration before guest resume.
-extern "C" fn handle_clone_child_start<T: ToolGlobal>() {
-    // CLONE_SETTLS installs the guest's fresh TLS before this callback runs,
-    // resetting SaBRe's recursion guard. Restore plugin context before Rust
-    // touches thread-local state or locks, both of which may issue syscalls.
-    // TODO-HUMAN-REVIEW(PR-226): Review clone-child recursion guard restoration.
-    unsafe { ffi::enter_plugin() };
-
-    if Thread::<T>::current().is_none() {
-        terminate(1);
-    }
-}
-
 /// Handle the critical section for the given system call on the given thread
 // The arguments intentionally mirror SaBRe's raw syscall callback ABI.
 #[allow(clippy::if_same_then_else, clippy::too_many_arguments)]
@@ -207,6 +193,12 @@ fn handle_syscall_with_thread<T: ToolGlobal>(
     let return_address = unsafe { (*wrapper_sp).ret } as usize;
     let _frame_guard = SyscallFrameGuard::enter(wrapper_sp);
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-214): Review eager child registration before guest resume.
+    // Register clone children lazily at their first intercepted syscall. Rust
+    // bookkeeping at the raw clone return can allocate before pthread startup
+    // completes, deadlocking the in-guest allocator under concurrent clones.
+    // TODO-HUMAN-REVIEW(PR-226): Review deferred clone-child registration.
     let result = if sys_no == Sysno::clone && arg2 != 0 {
         // New thread with its own stack: the kernel sets the child's %rsp to
         // `child_stack`, so clone_syscall's `jmp r9` shortcut is correct.
@@ -220,7 +212,6 @@ fn handle_syscall_with_thread<T: ToolGlobal>(
                         arg4 as *mut i32,
                         arg5,
                         return_address as *const libc::c_void,
-                        handle_clone_child_start::<T>,
                     )
                 })
                 .unwrap_or_else(|e| -e.into_raw() as usize)
@@ -291,7 +282,6 @@ fn handle_syscall_with_thread<T: ToolGlobal>(
                             0,
                             arg5,
                             return_address as *mut libc::c_void,
-                            handle_clone_child_start::<T>,
                         )
                     },
                 })
