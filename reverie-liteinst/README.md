@@ -75,3 +75,38 @@ steps. The direct Backend harness has run Detcore with `/bin/echo`, `/bin/true`,
 and `/bin/cat /dev/null`; this does not make `hermit --backend liteinst` real
 until that CLI path constructs `LiteinstBackend` and the corresponding Detcore
 preload DSO on the same landed revisions.
+
+## Corpus sweep scorecard
+
+A 20-program C corpus was run through `hermit --backend liteinst run --strict
+--verify` and compared against native and the ptrace backend (full harness,
+CSV, and per-program logs live in the `dev-hermit` parent workspace under
+`experiments/liteinst_corpus_sweep_20260728/`, not in this repo). The result
+characterizes the supported frontier and each boundary mode:
+
+- **Single-process / single-thread C: 16/16 L2.** Every non-boundary program
+  (arithmetic, heap, file I/O, env, libm, clocks, libc `rand`, `argv`,
+  recursion, buffered stdio, `getrandom`, anonymous `mmap`, `gmtime`)
+  determinized to a bitwise-identical repeat run, matching the ptrace baseline.
+  Where a source is non-reproducible, LiteInst determinizes it *correctly*:
+  `getpid` (spoofed PID) and `getrandom` (deterministic bytes) both diverge from
+  native by design and still verify L2.
+- **Boundary programs fail in the four documented modes** listed under *Current
+  boundaries*, all shared with e9patch because both ld-preload backends route
+  clone/fork through the same `reverie-preload` dispatcher and share this
+  crate's signal/timer policy: thread `clone` and `fork` are rejected, a
+  callable guest signal handler is rejected (fail-closed, nonzero exit), and an
+  armed timer never fires (the guest spins to timeout).
+
+### Caution: `--verify` cannot detect an ignored clone/fork rejection
+
+`--verify` proves run₁ == run₂, **not** run == native. A guest that ignores the
+errno from a rejected `clone`/`fork` and keeps running reaches a wrong but
+perfectly reproducible result, which `--verify` then reports as "Determinism
+verified" with `rc = 0`. In the sweep, the threaded and `fork` programs produced
+degraded single-process output that was nonetheless blessed L2. This is a
+property of the shared clone/fork policy plus `--verify` semantics, not a
+LiteInst-only defect; treat an L2 pass on a program that legitimately uses
+threads or child processes as suspect until multi-process support lands. The
+rejection itself is covered by `unsafe_clone_is_rejected_in_compatibility_and_strace_modes`
+and the compatibility-fork tests in `tests/strace.rs`.
