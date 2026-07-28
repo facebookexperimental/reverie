@@ -247,6 +247,9 @@ static atomic_flag pending_clone_lock = ATOMIC_FLAG_INIT;
 static _Atomic int32_t pending_clone_virtual_child;
 static _Atomic int32_t pending_clone_creator_pid;
 static _Atomic uint64_t pending_clone_flags;
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-262): Review copied-vfork native-gate lifetime.
+static _Atomic int32_t copied_vfork_pid;
 /* A copied child initializes its inherited Rust runtime on its first syscall.
  * Track the process that completed that handoff rather than a boolean: nested
  * fork children inherit the parent's globals and must rebase again. */
@@ -1497,6 +1500,7 @@ static bool syscall_reads_stdin(void *drcontext, int sysnum,
 static bool filter_syscall(void *drcontext, int sysnum) { return true; }
 
 static bool has_copied_runtime(void);
+static bool is_copied_vfork_process(void);
 static void ensure_runtime_background(void);
 static void runtime_background_init(void *argument);
 
@@ -1627,7 +1631,8 @@ static void post_syscall(void *drcontext, int sysnum) {
     }
   }
 
-  if (has_copied_runtime() && !runtime_uses_external_global())
+  if (has_copied_runtime() &&
+      (!runtime_uses_external_global() || is_copied_vfork_process()))
     return;
 
   if (counters->pending_thread_clone != 0) {
@@ -1674,6 +1679,12 @@ static void post_syscall(void *drcontext, int sysnum) {
 
 static bool has_copied_runtime(void) {
   return runtime_owner_pid != 0 && dr_get_process_id() != runtime_owner_pid;
+}
+
+static bool is_copied_vfork_process(void) {
+  return has_copied_runtime() &&
+         atomic_load_explicit(&copied_vfork_pid, memory_order_acquire) ==
+             (int32_t)dr_get_process_id();
 }
 
 static void report_copied_unsupported_syscall(int sysnum) {
@@ -1737,6 +1748,7 @@ static bool pre_syscall(void *drcontext, int sysnum) {
   // AUTONOMOUS-BOT-IMPLEMENTED
   // TODO-HUMAN-REVIEW(PR-255): Review copied-process Detcore state rebasing.
   if (has_copied_runtime() && runtime_uses_external_global() &&
+      !is_copied_vfork_process() &&
       copied_process_runtime_pid != dr_get_process_id()) {
     int32_t initialized = reverie_dbi_runtime_thread_init(
         counters, drcontext, (int32_t)dr_get_thread_id(drcontext),
@@ -1752,7 +1764,8 @@ static bool pre_syscall(void *drcontext, int sysnum) {
     copied_process_runtime_pid = dr_get_process_id();
   }
 
-  if (has_copied_runtime() && !runtime_uses_external_global()) {
+  if (has_copied_runtime() &&
+      (!runtime_uses_external_global() || is_copied_vfork_process())) {
     // Record this copied child's virtual identity before any refusal so the
     // shared host<->virtual map stays coherent even when the syscall is later
     // rejected by the fail-closed unsupported-syscall policy below.
@@ -1942,8 +1955,12 @@ static void thread_init(void *drcontext) {
   counters->virtual_tid =
       pending_child != 0 ? pending_child : ensure_virtual_identity(host_tid);
   counters->pending_virtual_child = 0;
-  counters->pending_clone_flags = 0;
+  counters->pending_clone_flags = pending_child != 0 ? clone_flags : 0;
   if (pending_child != 0) {
+    if (!is_thread && (clone_flags & CLONE_VFORK) != 0)
+      atomic_store_explicit(&copied_vfork_pid,
+                            (int32_t)dr_get_process_id(),
+                            memory_order_release);
     if (!is_thread)
       remember_virtual_identity((int32_t)dr_get_process_id(), pending_child);
     remember_virtual_identity(host_tid, pending_child);
@@ -1963,7 +1980,8 @@ static void thread_exit(void *drcontext) {
   prototype_counters_t *counters = (prototype_counters_t *)drmgr_get_tls_field(
       drcontext, thread_state_index);
   if (counters != NULL &&
-      (!has_copied_runtime() || runtime_uses_external_global())) {
+      (!has_copied_runtime() ||
+       (runtime_uses_external_global() && !is_copied_vfork_process()))) {
     reverie_dbi_runtime_thread_exit(counters, drcontext,
                                     dr_get_thread_id(drcontext),
                                     invoke_syscall);
@@ -1972,7 +1990,8 @@ static void thread_exit(void *drcontext) {
 }
 
 static void event_exit(void) {
-  if (!has_copied_runtime() || runtime_uses_external_global())
+  if (!has_copied_runtime() ||
+      (runtime_uses_external_global() && !is_copied_vfork_process()))
     reverie_dbi_runtime_process_exit();
   uint64_t branches;
   uint64_t syscalls;
