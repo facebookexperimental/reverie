@@ -1051,6 +1051,7 @@ where
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-140): Review mapping from the SaBRe frame to user_regs_struct.
+    // TODO-HUMAN-REVIEW(PR-242): Review the corrected architectural RIP mapping.
     async fn regs(&mut self) -> libc::user_regs_struct {
         let mut regs = unsafe { std::mem::zeroed::<libc::user_regs_struct>() };
         if let Some((number, args)) = self.original {
@@ -1089,6 +1090,7 @@ where
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-140): Review writable versus fixed SaBRe trampoline registers.
+    // TODO-HUMAN-REVIEW(PR-242): Review rejection of unsupported RIP rewrites.
     async fn set_regs(&mut self, regs: libc::user_regs_struct) -> Result<(), Error> {
         let current = self.regs().await;
         let Some(frame) = crate::callbacks::current_syscall_frame() else {
@@ -1236,6 +1238,7 @@ where
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-140): Review the intentionally single-frame backtrace contract.
+    // TODO-HUMAN-REVIEW(PR-242): Review the corrected architectural frame IP.
     fn backtrace(&mut self) -> Option<Backtrace> {
         let frame = crate::callbacks::current_syscall_frame()?;
         let ip = unsafe { (*frame).fake_ret as u64 };

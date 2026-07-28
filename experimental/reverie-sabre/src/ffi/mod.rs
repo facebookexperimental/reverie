@@ -69,6 +69,7 @@ pub type icept_reg_fn = extern "C" fn(*const fn_icept);
 
 unsafe impl Send for fn_icept {}
 unsafe impl Sync for fn_icept {}
+// TODO-HUMAN-REVIEW(PR-242): Review the architectural versus trampoline return slots.
 #[repr(C)]
 pub struct syscall_stackframe {
     pub rbp_stackalign: *mut libc::c_void,
