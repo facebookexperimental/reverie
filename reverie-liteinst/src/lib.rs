@@ -32,7 +32,7 @@ mod tool_host;
 pub use reverie_preload::BuiltinTool;
 pub use reverie_preload::SPOOF_PID;
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-253): Review shared RuntimeConfig alt-stack re-exports.
+// TODO-HUMAN-REVIEW(PR-254): Review shared RuntimeConfig alt-stack re-exports.
 /// `REVERIE_LITEINST_ALT_STACK` selector and parser for the shared
 /// `reverie-preload` `RuntimeConfig` alt-stack knob.
 pub use runtime::ALT_STACK_ENV;
@@ -160,7 +160,7 @@ pub fn configure_command_builtin(command: &mut Command, tool: BuiltinTool) -> io
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-253): Review launcher-side shared RuntimeConfig alt-stack selector.
+// TODO-HUMAN-REVIEW(PR-254): Review launcher-side shared RuntimeConfig alt-stack selector.
 /// Selects the shared `reverie-preload` `RuntimeConfig` alt-stack knob for a guest.
 ///
 /// Sets [`ALT_STACK_ENV`] so the in-guest runtime installs its `SIGSYS` handler

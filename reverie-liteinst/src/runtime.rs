@@ -150,7 +150,7 @@ pub(crate) unsafe fn install_builtin_runtime(tool: BuiltinTool) -> io::Result<()
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-253): Review launcher-selected shared RuntimeConfig alt-stack knob.
+// TODO-HUMAN-REVIEW(PR-254): Review launcher-selected shared RuntimeConfig alt-stack knob.
 /// Environment variable selecting the shared [`RuntimeConfig::use_alt_stack`]
 /// knob for the in-guest runtime's `SIGSYS` handler.
 ///
@@ -167,7 +167,7 @@ pub(crate) unsafe fn install_builtin_runtime(tool: BuiltinTool) -> io::Result<()
 pub const ALT_STACK_ENV: &str = "REVERIE_LITEINST_ALT_STACK";
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-253): Review alt-stack env parse/reject contract.
+// TODO-HUMAN-REVIEW(PR-254): Review alt-stack env parse/reject contract.
 /// Parses an [`ALT_STACK_ENV`] value into the `use_alt_stack` boolean.
 ///
 /// `None` (unset) yields the shared default. Accepts `1`/`0`, `true`/`false`,
@@ -196,7 +196,7 @@ pub fn alt_stack_from_env_value(value: Option<&OsStr>) -> io::Result<bool> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-253): Review launcher-selected RuntimeConfig assembly.
+// TODO-HUMAN-REVIEW(PR-254): Review launcher-selected RuntimeConfig assembly.
 /// Builds the shared [`RuntimeConfig`] the launcher selected via [`ALT_STACK_ENV`].
 ///
 /// Reads the process environment once; the parse itself is delegated to the pure
@@ -260,7 +260,7 @@ pub(crate) fn initialize_reverie_tool() -> io::Result<()> {
 fn install_runtime() -> io::Result<()> {
     prepare_instrumentation()?;
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-253): Review launcher-selected RuntimeConfig at the install seam.
+    // TODO-HUMAN-REVIEW(PR-254): Review launcher-selected RuntimeConfig at the install seam.
     let config = runtime_config_from_env()?;
     unsafe { reverie_preload::install(Box::new(LiteinstDispatcher), &InProcessSeccomp, &config) }
 }
