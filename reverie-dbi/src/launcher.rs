@@ -357,7 +357,13 @@ impl DbiRunner {
         )
         .map_err(|error| io::Error::other(error.to_string()))?;
 
-        let mut command = self.command(guest, environment);
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-TBD): Review native external-global capability propagation.
+        // The root records this explicit capability in shared state before any
+        // fork. Copied DynamoRIO runtimes cannot reliably re-read Rust's
+        // process environment after fork.
+        let runner = self.clone().client_argument("-external-global");
+        let mut command = runner.command(guest, environment);
         command.env(crate::sync_rpc::RPC_SOCKET_ENV, &socket);
         if capture_output {
             command
@@ -366,7 +372,6 @@ impl DbiRunner {
                 .stderr(Stdio::piped());
         }
         let child = command.spawn()?;
-        let runner = self.clone();
         let wait = tokio::task::spawn_blocking(move || {
             if capture_output {
                 runner.wait_with_output(child).map(ChildWait::Output)

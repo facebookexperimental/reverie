@@ -1381,16 +1381,6 @@ pub extern "C" fn reverie_dbi_runtime_image_init() -> u64 {
     IMAGE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
 }
 
-/// Reports whether this runtime routes [`GlobalRPC`] through an external
-/// coordinator shared by the whole instrumented process tree.
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Review the copied-child external-global ABI.
-#[cfg(feature = "prototype-runtime")]
-#[unsafe(no_mangle)]
-pub extern "C" fn reverie_dbi_runtime_uses_external_global() -> i32 {
-    i32::from(sync_rpc::is_active())
-}
-
 /// Initializes the prototype state for the current application thread.
 ///
 /// # Safety

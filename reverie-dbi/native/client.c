@@ -62,7 +62,7 @@ typedef struct {
 #define VIRTUAL_IDENTITY_FD 197
 #define CLIENT_THREAD_START_FAILURE_EXIT_CODE 125
 #define DBI_DIAGNOSTIC_FD 198
-#define VIRTUAL_IDENTITY_MAGIC UINT64_C(0x5245565049443032)
+#define VIRTUAL_IDENTITY_MAGIC UINT64_C(0x5245565049443033)
 #define MAX_VIRTUAL_IDENTITIES 8192
 
 typedef struct {
@@ -77,6 +77,10 @@ typedef struct {
   /* The launch-time descriptor identity survives exec, unlike numeric fd 0. */
   bool initial_stdin_valid;
   struct stat initial_stdin;
+  /* The root resolves the coordinator environment before any fork. Copied
+   * runtimes inherit this shared flag instead of consulting Rust's post-fork
+   * environment state. */
+  bool external_global;
   size_t count;
   virtual_identity_t identities[MAX_VIRTUAL_IDENTITIES];
 } virtual_identity_state_t;
@@ -194,9 +198,6 @@ extern void reverie_dbi_runtime_background_init(void *argument);
 extern int32_t reverie_dbi_runtime_ready(uint64_t image_generation);
 extern void reverie_dbi_runtime_process_exit(void);
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Review copied-child Tool dispatch through the external global.
-extern int32_t reverie_dbi_runtime_uses_external_global(void);
-// AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-219): Review copied-child argument and errno policy ABI.
 extern int32_t reverie_dbi_runtime_copied_syscall(int64_t sysnum,
                                                   const uint64_t *args);
@@ -264,7 +265,7 @@ static bool map_inherited_virtual_identity_state(void) {
   return false;
 }
 
-static void initialize_virtual_identity_state(void) {
+static void initialize_virtual_identity_state(bool external_global) {
   int descriptor;
   if (map_inherited_virtual_identity_state())
     return;
@@ -287,6 +288,12 @@ static void initialize_virtual_identity_state(void) {
   atomic_init(&virtual_identity_state->next_virtual_id, VIRTUAL_ROOT_PID + 1);
   virtual_identity_state->initial_stdin_valid =
       fstat(STDIN_FILENO, &virtual_identity_state->initial_stdin) == 0;
+  virtual_identity_state->external_global = external_global;
+}
+
+static bool runtime_uses_external_global(void) {
+  return virtual_identity_state != NULL &&
+         virtual_identity_state->external_global;
 }
 
 static void virtual_identity_lock(void) {
@@ -1609,8 +1616,7 @@ static void post_syscall(void *drcontext, int sysnum) {
     }
   }
 
-  if (has_copied_runtime() &&
-      reverie_dbi_runtime_uses_external_global() == 0)
+  if (has_copied_runtime() && !runtime_uses_external_global())
     return;
 
   if (counters->pending_thread_clone != 0) {
@@ -1717,8 +1723,7 @@ static bool pre_syscall(void *drcontext, int sysnum) {
   for (i = 0; i != 6; ++i)
     args[i] = (uint64_t)dr_syscall_get_param(drcontext, i);
 
-  if (has_copied_runtime() &&
-      reverie_dbi_runtime_uses_external_global() == 0) {
+  if (has_copied_runtime() && !runtime_uses_external_global()) {
     // Record this copied child's virtual identity before any refusal so the
     // shared host<->virtual map stays coherent even when the syscall is later
     // rejected by the fail-closed unsupported-syscall policy below.
@@ -1923,16 +1928,14 @@ static void thread_exit(void *drcontext) {
   prototype_counters_t *counters = (prototype_counters_t *)drmgr_get_tls_field(
       drcontext, thread_state_index);
   if (counters != NULL &&
-      (!has_copied_runtime() ||
-       reverie_dbi_runtime_uses_external_global() != 0)) {
+      (!has_copied_runtime() || runtime_uses_external_global())) {
     reverie_dbi_runtime_thread_exit(counters, dr_get_thread_id(drcontext));
     dr_thread_free(drcontext, counters, sizeof(*counters));
   }
 }
 
 static void event_exit(void) {
-  if (!has_copied_runtime() ||
-      reverie_dbi_runtime_uses_external_global() != 0)
+  if (!has_copied_runtime() || runtime_uses_external_global())
     reverie_dbi_runtime_process_exit();
   uint64_t branches;
   uint64_t syscalls;
@@ -1994,11 +1997,17 @@ static void ensure_runtime_background(void) {
 
 DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[]) {
   drreg_options_t register_options = {sizeof(register_options), 1, false};
+  bool external_global = false;
+
+  for (int i = 1; i < argc; ++i) {
+    if (strcmp(argv[i], "-external-global") == 0)
+      external_global = true;
+  }
 
   diagnostic_file = STDERR;
   atomic_store_explicit(&runtime_background_state, 0, memory_order_release);
   runtime_owner_pid = dr_get_process_id();
-  initialize_virtual_identity_state();
+  initialize_virtual_identity_state(external_global);
   if (lookup_virtual_identity((int32_t)runtime_owner_pid,
                               &virtual_process_id)) {
     int32_t host_parent = (int32_t)getppid();
