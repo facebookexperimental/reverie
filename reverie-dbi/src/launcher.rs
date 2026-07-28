@@ -65,6 +65,7 @@ pub struct DbiRunner {
     client_arguments: Vec<OsString>,
     summary: bool,
     isolated_process_group: bool,
+    terminate_process_group_on_exit: bool,
 }
 
 impl DbiRunner {
@@ -99,6 +100,7 @@ impl DbiRunner {
             client_arguments: Vec::new(),
             summary: false,
             isolated_process_group: false,
+            terminate_process_group_on_exit: false,
         })
     }
 
@@ -122,6 +124,18 @@ impl DbiRunner {
     /// the launcher's caller.
     pub fn isolated_process_group(mut self, enabled: bool) -> Self {
         self.isolated_process_group = enabled;
+        self
+    }
+
+    /// Places the launcher in a new process group and terminates any residual
+    /// descendants after the root process exits.
+    ///
+    /// Unlike [`Self::isolated_process_group`], this does not ask the DBI client
+    /// to reject guest process-group mutations. It is intended for backends that
+    /// must drain followed DynamoRIO children without changing non-strict guest
+    /// syscall behavior.
+    pub fn terminate_process_group_on_exit(mut self, enabled: bool) -> Self {
+        self.terminate_process_group_on_exit = enabled;
         self
     }
 
@@ -473,7 +487,7 @@ impl DbiRunner {
     }
 
     fn wait_for_status(&self, mut child: Child) -> io::Result<ExitStatus> {
-        if !self.isolated_process_group {
+        if !self.manages_process_group() {
             return child.wait();
         }
 
@@ -573,10 +587,14 @@ impl DbiRunner {
     }
 
     fn terminate_and_reap(&self, child: &mut Child) {
-        if self.isolated_process_group {
+        if self.manages_process_group() {
             let _ = terminate_process_group(child.id() as i32);
         }
         let _ = child.wait();
+    }
+
+    fn manages_process_group(&self) -> bool {
+        self.isolated_process_group || self.terminate_process_group_on_exit
     }
 
     fn command(
@@ -633,7 +651,7 @@ impl DbiRunner {
                 }
             }
         }
-        if self.isolated_process_group {
+        if self.manages_process_group() {
             command.process_group(0);
         }
 
@@ -943,6 +961,7 @@ mod tests {
             client_arguments: Vec::new(),
             summary: false,
             isolated_process_group: false,
+            terminate_process_group_on_exit: false,
         }
     }
 
@@ -965,10 +984,29 @@ mod tests {
     }
 
     #[test]
-    fn process_group_isolation_is_opt_in() {
-        let runner = runner();
-        assert!(!runner.isolated_process_group);
-        assert!(runner.isolated_process_group(true).isolated_process_group);
+    fn process_group_modes_are_opt_in() {
+        let default_runner = runner();
+        assert!(!default_runner.isolated_process_group);
+        assert!(!default_runner.terminate_process_group_on_exit);
+        assert!(
+            default_runner
+                .isolated_process_group(true)
+                .isolated_process_group
+        );
+        assert!(
+            runner()
+                .terminate_process_group_on_exit(true)
+                .terminate_process_group_on_exit
+        );
+
+        let cleanup_only = runner()
+            .terminate_process_group_on_exit(true)
+            .command(&Command::new("/bin/true"), None);
+        assert!(
+            !cleanup_only
+                .get_args()
+                .any(|argument| argument == OsStr::new("-isolated-process-group"))
+        );
     }
 
     #[test]
@@ -1280,7 +1318,7 @@ mod tests {
     }
 
     #[test]
-    fn isolated_output_terminates_descendants_after_root_exit() {
+    fn process_group_cleanup_terminates_descendants_after_root_exit() {
         let root = tempfile::tempdir().unwrap();
         let drrun = root.path().join("drrun");
         let client = root.path().join("client.so");
@@ -1291,7 +1329,7 @@ mod tests {
         std::fs::write(&client, b"placeholder").unwrap();
         let runner = DbiRunner::new(drrun, client)
             .unwrap()
-            .isolated_process_group(true);
+            .terminate_process_group_on_exit(true);
         let mut guest = Command::new("/bin/sh");
         guest.args(["-c", "sleep 60 & printf descendant-started; exit 7"]);
         let started = std::time::Instant::now();
