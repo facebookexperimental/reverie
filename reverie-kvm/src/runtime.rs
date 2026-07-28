@@ -123,6 +123,11 @@ pub(crate) struct ToolContext<'a, T: Tool> {
 trait GuestSyscallExecutor<T: Tool>: Send + Sync {
     fn execute(&mut self, request: &SyscallRequest, memory: &GuestMemory) -> i64;
 
+    // TODO-HUMAN-REVIEW(PR-235): Review virtual process ancestry exposed to Tool handlers.
+    fn parent_pid(&self) -> Option<Pid> {
+        None
+    }
+
     fn complete_injection<'a>(
         &'a mut self,
         _context: ToolContext<'a, T>,
@@ -188,6 +193,10 @@ where
         let result = self.executor.execute(request, memory);
         self.last_result = Some(result);
         result
+    }
+
+    fn parent_pid(&self) -> Option<Pid> {
+        self.executor.parent_pid()
     }
 
     fn complete_injection<'a>(
@@ -384,7 +393,7 @@ impl<T: Tool> Guest<T> for KvmGuest<'_, T> {
     }
 
     fn ppid(&self) -> Option<Pid> {
-        None
+        self.executor.parent_pid()
     }
 
     fn memory(&self) -> Self::Memory {

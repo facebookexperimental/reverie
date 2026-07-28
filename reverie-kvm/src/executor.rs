@@ -1507,6 +1507,11 @@ impl ElfExecutor {
             .contains(&(request.args()[0] as libc::c_int))
     }
 
+    // TODO-HUMAN-REVIEW(PR-235): Review virtual parent identity for KVM Tool callbacks.
+    pub(crate) fn parent_pid(&self) -> Option<reverie::Pid> {
+        (self.state.ppid != 0).then(|| reverie::Pid::from_raw(self.state.ppid))
+    }
+
     // TODO-HUMAN-REVIEW(PR-132): Review cooperative KVM thread context updates.
     pub(crate) fn set_thread_context(&mut self, tid: i32, fs_base: u64, gs_base: u64) {
         self.state.tid = tid;
@@ -15616,6 +15621,9 @@ mod tests {
         memory.write(0x101, b"b").unwrap();
         let mut parent = ElfExecutor::new(state, true);
         let mut child = parent.fork_child(2, false).unwrap();
+
+        assert_eq!(parent.parent_pid(), None);
+        assert_eq!(child.parent_pid(), Some(reverie::Pid::from_raw(1)));
 
         assert_eq!(
             child.execute(
