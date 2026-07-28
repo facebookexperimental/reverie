@@ -6645,6 +6645,7 @@ fn synthetic_proc_path_for_inode(inode: u64) -> Option<&'static [u8]> {
         // their descriptors resolve to the same stable synthetic inode.
         b"/proc/vmstat",
         b"/proc/sys/kernel/osrelease",
+        b"/proc/self/maps",
     ];
     PATHS
         .iter()
@@ -6801,6 +6802,7 @@ fn synthetic_proc_content(state: &LoadedStaticElf, path: &[u8]) -> Option<Vec<u8
         // synthetically. The value matches the KVM `uname(2)` release field
         // ("6.0.0", see fn uname) and /proc/version above.
         b"/proc/sys/kernel/osrelease" => b"6.0.0\n".to_vec(),
+        b"/proc/self/maps" => proc_self_maps_content(state),
         _ => return None,
     };
     Some(content)
@@ -6856,6 +6858,14 @@ fn proc_self_cmdline_content(state: &LoadedStaticElf) -> Vec<u8> {
     let mut content = state.argv0.clone();
     content.push(0);
     content
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED: Expose only the deterministic guest stack map.
+// TODO-HUMAN-REVIEW(PR-TBD): Review the minimal synthetic process map surface.
+fn proc_self_maps_content(state: &LoadedStaticElf) -> Vec<u8> {
+    let stack_start = state.mmap_limit;
+    let stack_end = stack_start.saturating_add(STACK_LIMIT);
+    format!("{stack_start:012x}-{stack_end:012x} rw-p 00000000 00:00 0 [stack]\n").into_bytes()
 }
 
 fn proc_self_stat_content(state: &LoadedStaticElf) -> Vec<u8> {
@@ -10251,19 +10261,28 @@ mod tests {
             String::from_utf8_lossy(&content)
         );
 
-        for path in ["self/maps", "../etc/passwd"] {
-            write_c_string(&mut memory, 0x100, path);
-            assert_eq!(
-                syscall_result(
-                    &mut memory,
-                    &mut state,
-                    libc::SYS_openat,
-                    [proc_fd as u64, 0x100, libc::O_RDONLY as u64, 0, 0, 0],
-                ),
-                negative_errno(libc::ENOENT),
-                "unlisted relative proc path leaked through: {path}"
-            );
-        }
+        write_c_string(&mut memory, 0x100, "self/maps");
+        let maps_fd = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_openat,
+            [proc_fd as u64, 0x100, libc::O_RDONLY as u64, 0, 0, 0],
+        );
+        assert!(maps_fd >= 0, "openat self/maps failed: {maps_fd}");
+        let maps = read_fd_to_end(&mut memory, &mut state, maps_fd);
+        assert!(maps.ends_with(b"[stack]\n"));
+
+        write_c_string(&mut memory, 0x100, "../etc/passwd");
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_openat,
+                [proc_fd as u64, 0x100, libc::O_RDONLY as u64, 0, 0, 0],
+            ),
+            negative_errno(libc::ENOENT),
+            "unlisted relative proc path leaked through"
+        );
 
         assert_eq!(
             syscall_result(
@@ -10463,7 +10482,7 @@ mod tests {
         );
 
         // An unlisted /proc path is not part of the synthesized surface.
-        assert!(synthetic_proc_content(&state, b"/proc/self/maps").is_none());
+        assert!(synthetic_proc_content(&state, b"/proc/self/smaps").is_none());
         assert!(synthetic_proc_content(&state, b"/etc/passwd").is_none());
 
         let fd = open_readonly(&mut memory, &mut state, "/proc/uptime");

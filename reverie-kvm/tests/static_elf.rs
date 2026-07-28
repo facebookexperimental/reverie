@@ -1995,6 +1995,25 @@ fn real_patch_applies_exact_hunk_with_absent_xattrs() {
     assert_eq!(std::fs::read(root.0.join("file")).unwrap(), b"new\n");
 }
 
+#[test]
+fn real_grep_uses_synthetic_process_maps_for_stack_discovery() {
+    match Kvm::new() {
+        Ok(_) => {}
+        Err(error) if kvm_is_unavailable(&error) => {
+            eprintln!("skipping KVM grep test: cannot open /dev/kvm: {error}");
+            return;
+        }
+        Err(error) => panic!("failed to probe /dev/kvm: {error}"),
+    }
+
+    let root = TestDirectory::new();
+    std::fs::write(root.0.join("payload"), b"gamma\nbeta\nalpha\nbeta\n").unwrap();
+    let (stdout, stderr) =
+        run_host_program_captured("/usr/bin/grep", &["grep", "beta", "payload"], &root.0);
+    assert_eq!(stdout, b"beta\nbeta\n");
+    assert!(stderr.is_empty());
+}
+
 fn static_elf(code: &[u8]) -> Vec<u8> {
     let mut image = vec![0; CODE_OFFSET + code.len()];
 
