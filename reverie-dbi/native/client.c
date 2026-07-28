@@ -2003,7 +2003,6 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[]) {
     if (strcmp(argv[i], "-external-global") == 0)
       external_global = true;
   }
-
   diagnostic_file = STDERR;
   atomic_store_explicit(&runtime_background_state, 0, memory_order_release);
   runtime_owner_pid = dr_get_process_id();

@@ -203,38 +203,17 @@ impl DbiRunner {
     /// Streams owned standard input without waiting for a source-blocked pump after child exit.
     ///
     /// A pump still blocked on its source is detached until that source unblocks or the caller exits.
-    pub fn output_with_detached_reader<R>(
-        &self,
-        guest: &Command,
-        mut input: R,
-    ) -> io::Result<Output>
+    pub fn output_with_detached_reader<R>(&self, guest: &Command, input: R) -> io::Result<Output>
     where
         R: Read + Send + 'static,
     {
-        let mut child = self
+        let child = self
             .command(guest, None)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
-        let mut stdin = child.stdin.take().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::BrokenPipe, "failed to open DBI guest stdin")
-        })?;
-
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-84): Review detaching a source-blocked input pump at child exit.
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        std::thread::spawn(move || {
-            let _ = sender.send(io::copy(&mut input, &mut stdin));
-        });
-        let output = self.wait_with_output(child)?;
-        match receiver.try_recv() {
-            Ok(Err(error)) if error.kind() != io::ErrorKind::BrokenPipe => Err(error),
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                Err(io::Error::other("DBI guest stdin writer thread panicked"))
-            }
-            Ok(_) | Err(std::sync::mpsc::TryRecvError::Empty) => Ok(output),
-        }
+        self.wait_with_output_and_detached_reader(child, input)
     }
 
     /// Captures `guest` output while supplying an exact guest environment.
@@ -267,7 +246,10 @@ impl DbiRunner {
     where
         G: GlobalTool + 'static,
     {
-        match self.run_with_global::<G>(guest, None, config, true).await? {
+        match self
+            .run_with_global::<G>(guest, None, config, true, CoordinatedInput::Null)
+            .await?
+        {
             CoordinatedWait::Output(output, global) => Ok((output, global)),
             CoordinatedWait::Status(_, _) => unreachable!("output launch returned only status"),
         }
@@ -286,7 +268,61 @@ impl DbiRunner {
         G: GlobalTool + 'static,
     {
         match self
-            .run_with_global::<G>(guest, Some(environment), config, true)
+            .run_with_global::<G>(
+                guest,
+                Some(environment),
+                config,
+                true,
+                CoordinatedInput::Null,
+            )
+            .await?
+        {
+            CoordinatedWait::Output(output, global) => Ok((output, global)),
+            CoordinatedWait::Status(_, _) => unreachable!("output launch returned only status"),
+        }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TBD): Review coordinated owned-input pumping.
+    /// Runs `guest` with captured output, replayable input, and one shared global.
+    pub async fn output_with_detached_reader_and_global<G, R>(
+        &self,
+        guest: &Command,
+        input: R,
+        config: G::Config,
+    ) -> io::Result<(Output, G)>
+    where
+        G: GlobalTool + 'static,
+        R: Read + Send + 'static,
+    {
+        match self
+            .run_with_global::<G>(
+                guest,
+                None,
+                config,
+                true,
+                CoordinatedInput::Reader(Box::new(input)),
+            )
+            .await?
+        {
+            CoordinatedWait::Output(output, global) => Ok((output, global)),
+            CoordinatedWait::Status(_, _) => unreachable!("output launch returned only status"),
+        }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TBD): Review coordinated inherited-stdin capture.
+    /// Runs `guest` with captured output, inherited stdin, and one shared global.
+    pub async fn output_with_inherited_stdin_and_global<G>(
+        &self,
+        guest: &Command,
+        config: G::Config,
+    ) -> io::Result<(Output, G)>
+    where
+        G: GlobalTool + 'static,
+    {
+        match self
+            .run_with_global::<G>(guest, None, config, true, CoordinatedInput::Inherit)
             .await?
         {
             CoordinatedWait::Output(output, global) => Ok((output, global)),
@@ -306,7 +342,7 @@ impl DbiRunner {
         G: GlobalTool + 'static,
     {
         match self
-            .run_with_global::<G>(guest, None, config, false)
+            .run_with_global::<G>(guest, None, config, false, CoordinatedInput::Inherit)
             .await?
         {
             CoordinatedWait::Status(status, global) => Ok((status, global)),
@@ -327,7 +363,13 @@ impl DbiRunner {
         G: GlobalTool + 'static,
     {
         match self
-            .run_with_global::<G>(guest, Some(environment), config, false)
+            .run_with_global::<G>(
+                guest,
+                Some(environment),
+                config,
+                false,
+                CoordinatedInput::Inherit,
+            )
             .await?
         {
             CoordinatedWait::Status(status, global) => Ok((status, global)),
@@ -341,6 +383,7 @@ impl DbiRunner {
         environment: Option<&BTreeMap<OsString, OsString>>,
         config: G::Config,
         capture_output: bool,
+        input: CoordinatedInput,
     ) -> io::Result<CoordinatedWait<G>>
     where
         G: GlobalTool + 'static,
@@ -365,17 +408,29 @@ impl DbiRunner {
         let runner = self.clone().client_argument("-external-global");
         let mut command = runner.command(guest, environment);
         command.env(crate::sync_rpc::RPC_SOCKET_ENV, &socket);
+        match &input {
+            CoordinatedInput::Null => {
+                command.stdin(Stdio::null());
+            }
+            CoordinatedInput::Inherit => {
+                command.stdin(Stdio::inherit());
+            }
+            CoordinatedInput::Reader(_) => {
+                command.stdin(Stdio::piped());
+            }
+        }
         if capture_output {
-            command
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
         }
         let child = command.spawn()?;
-        let wait = tokio::task::spawn_blocking(move || {
-            if capture_output {
+        let wait = tokio::task::spawn_blocking(move || match input {
+            CoordinatedInput::Reader(input) => runner
+                .wait_with_output_and_detached_reader(child, input)
+                .map(ChildWait::Output),
+            CoordinatedInput::Null | CoordinatedInput::Inherit if capture_output => {
                 runner.wait_with_output(child).map(ChildWait::Output)
-            } else {
+            }
+            CoordinatedInput::Null | CoordinatedInput::Inherit => {
                 runner.wait_for_status(child).map(ChildWait::Status)
             }
         });
@@ -470,6 +525,34 @@ impl DbiRunner {
         })
     }
 
+    fn wait_with_output_and_detached_reader<R>(
+        &self,
+        mut child: Child,
+        mut input: R,
+    ) -> io::Result<Output>
+    where
+        R: Read + Send + 'static,
+    {
+        let mut stdin = child.stdin.take().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "failed to open DBI guest stdin")
+        })?;
+
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-84): Review detaching a source-blocked input pump at child exit.
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = sender.send(io::copy(&mut input, &mut stdin));
+        });
+        let output = self.wait_with_output(child)?;
+        match receiver.try_recv() {
+            Ok(Err(error)) if error.kind() != io::ErrorKind::BrokenPipe => Err(error),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(io::Error::other("DBI guest stdin writer thread panicked"))
+            }
+            Ok(_) | Err(std::sync::mpsc::TryRecvError::Empty) => Ok(output),
+        }
+    }
+
     fn terminate_and_reap(&self, child: &mut Child) {
         if self.isolated_process_group {
             let _ = terminate_process_group(child.id() as i32);
@@ -561,6 +644,12 @@ impl DbiRunner {
 enum ChildWait {
     Status(ExitStatus),
     Output(Output),
+}
+
+enum CoordinatedInput {
+    Null,
+    Inherit,
+    Reader(Box<dyn Read + Send>),
 }
 
 enum CoordinatedWait<G> {
