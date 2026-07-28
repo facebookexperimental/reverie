@@ -4144,13 +4144,13 @@ fn ioctl(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
     }
     match args[1] as libc::c_ulong {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TBD): Review virtual FIOCLEX/FIONCLEX descriptor flags.
+        // TODO-HUMAN-REVIEW(PR-229): Review virtual FIOCLEX/FIONCLEX descriptor flags.
         libc::FIOCLEX => {
             state.cloexec_fds.insert(guest_fd);
             0
         }
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TBD): Review virtual FIOCLEX/FIONCLEX descriptor flags.
+        // TODO-HUMAN-REVIEW(PR-229): Review virtual FIOCLEX/FIONCLEX descriptor flags.
         libc::FIONCLEX => {
             state.cloexec_fds.remove(&guest_fd);
             0
@@ -8457,7 +8457,7 @@ mod tests {
         let stat: libc::stat = read_struct(&memory, stat_address);
         assert_eq!(stat.st_ino, synthetic_proc_inode(b"/proc/self/mountinfo"));
         assert_eq!(
-            synthetic_proc_path_for_inode(stat.st_ino as u64),
+            synthetic_proc_path_for_inode(stat.st_ino),
             Some(b"/proc/self/mountinfo".as_slice())
         );
         assert_eq!(stat.st_size, EXPECTED.len() as libc::off_t);
