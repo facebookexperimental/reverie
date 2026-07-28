@@ -237,6 +237,32 @@ pub unsafe extern "C" fn reverie_e9patch_initialize() {
 #[unsafe(link_section = ".init_array")]
 static REVERIE_E9PATCH_INIT: unsafe extern "C" fn() = reverie_e9patch_initialize;
 
+// TODO-HUMAN-REVIEW(PR-246): Review public fallback-surface observability counters.
+/// Total syscalls serviced by e9patch's shared `SIGSYS` fallback dispatcher.
+///
+/// This is the e9patch analog of LiteInst's `reverie_liteinst_site_trap_count`:
+/// a C-ABI counter that makes the instrumentation surface observable from the
+/// guest. Because AOT-rewritten sites never trap, this counts exactly the
+/// residual, un-rewritten fallback surface (loader/startup, vDSO, uncovered or
+/// JIT-emitted sites). A value near zero confirms e9tool's ahead-of-time
+/// coverage is carrying the syscall load.
+#[unsafe(no_mangle)]
+pub extern "C" fn reverie_e9patch_fallback_dispatch_count() -> u64 {
+    dispatch::fallback_dispatch_count()
+}
+
+// TODO-HUMAN-REVIEW(PR-246): Review public fallback-surface observability counters.
+/// Number of times syscall `number` reached the shared fallback dispatcher.
+///
+/// The per-number analog of the LiteInst per-site counters, keyed by syscall
+/// number because e9patch has no runtime sites to key on. Returns `0` for a
+/// negative number or one outside the tracked range; such syscalls are still
+/// reflected in [`reverie_e9patch_fallback_dispatch_count`].
+#[unsafe(no_mangle)]
+pub extern "C" fn reverie_e9patch_fallback_syscall_count(number: i64) -> u64 {
+    dispatch::fallback_syscall_count(number)
+}
+
 /// Magic RAX value identifying an e9patch replacement-syscall trap.
 // TODO-HUMAN-REVIEW(PR-102): Review the public injected-event ABI marker.
 pub const E9PATCH_SYSCALL_TRAP_MARKER: u64 = 0x7265_7665_3965_3970;

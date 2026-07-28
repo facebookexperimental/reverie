@@ -45,9 +45,68 @@
 //! [`crate::E9patchBackend`]) remains the correctness-first fallback owner for
 //! the full `Guest` semantics an arbitrary tool needs.
 
+use core::sync::atomic::AtomicU64;
+use core::sync::atomic::Ordering;
+
 use reverie_preload::dispatch::PassthroughDispatcher;
 use reverie_preload::dispatch::SyscallDispatcher;
 use reverie_preload::dispatch::SyscallEvent;
+
+/// Distinct syscall numbers broken out individually by the fallback counters.
+///
+/// x86-64 syscall numbers currently top out well under this bound; a number at
+/// or above it (or negative) is still counted in the process-wide total but is
+/// not tracked per-number. Sized to cover the whole current table with headroom.
+const TRACKED_SYSCALLS: usize = 512;
+
+// TODO-HUMAN-REVIEW(PR-246): Review public fallback-surface observability counters.
+/// Total number of syscalls serviced by the shared `SIGSYS` fallback dispatcher.
+static FALLBACK_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+// TODO-HUMAN-REVIEW(PR-246): Review public fallback-surface observability counters.
+/// Per-syscall-number fallback service counts, indexed by syscall number.
+static FALLBACK_BY_NUMBER: [AtomicU64; TRACKED_SYSCALLS] =
+    [const { AtomicU64::new(0) }; TRACKED_SYSCALLS];
+
+/// Record that the shared fallback dispatcher serviced one syscall.
+///
+/// Anything reaching the fallback dispatcher is, by construction, a residual
+/// un-rewritten site (see [`E9patchDispatcher`]), so this counts the size of
+/// e9patch's residual fallback surface. It is the e9patch analog of LiteInst's
+/// per-site `trap`/`hook` counters — but keyed by syscall number rather than
+/// site address, because e9patch has no runtime sites to key on.
+///
+/// Async-signal-safe: only relaxed atomic increments, so it is safe to call
+/// from inside the `SIGSYS` handler.
+pub(crate) fn record_fallback_dispatch(number: i64) {
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    FALLBACK_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if let Ok(index) = usize::try_from(number)
+        && index < TRACKED_SYSCALLS
+    {
+        FALLBACK_BY_NUMBER[index].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Total syscalls e9patch has serviced through the shared fallback dispatcher.
+///
+/// A large value relative to the guest's total syscall count indicates a large
+/// residual (un-rewritten) surface, i.e. e9tool's ahead-of-time coverage missed
+/// many sites; a small value confirms the AOT fast path handles the bulk.
+pub(crate) fn fallback_dispatch_count() -> u64 {
+    FALLBACK_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Number of times syscall `number` reached the shared fallback dispatcher.
+///
+/// Returns `0` for a negative number or one at or above [`TRACKED_SYSCALLS`],
+/// which are only ever reflected in [`fallback_dispatch_count`].
+pub(crate) fn fallback_syscall_count(number: i64) -> u64 {
+    match usize::try_from(number) {
+        Ok(index) if index < TRACKED_SYSCALLS => FALLBACK_BY_NUMBER[index].load(Ordering::Relaxed),
+        _ => 0,
+    }
+}
 
 /// e9patch's `SIGSYS` dispatcher for sites that were **not** rewritten ahead of
 /// time by `e9tool`.
@@ -80,10 +139,12 @@ impl SyscallDispatcher for E9patchDispatcher {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // e9patch's fast path is the AOT trampoline, which never enters this
         // handler. Anything that *does* trap here is an un-rewritten fallback
-        // site, so defer entirely to the shared, reviewed-once policy that
-        // LiteInst also uses. This keeps the SIGSYS path identical across the
-        // two ld-preload backends; only patch timing and trampoline placement
-        // differ.
+        // site, so record it for observability, then defer entirely to the
+        // shared, reviewed-once policy that LiteInst also uses. Counting does
+        // not change the forwarding decision, so the SIGSYS path stays identical
+        // across the two ld-preload backends; only patch timing and trampoline
+        // placement differ.
+        record_fallback_dispatch(event.number());
         self.passthrough.dispatch(event);
     }
 }
@@ -104,5 +165,38 @@ mod tests {
     #[test]
     fn dispatcher_is_constructible_in_const_context() {
         static _DISPATCHER: E9patchDispatcher = E9patchDispatcher::new();
+    }
+
+    #[test]
+    fn recording_a_fallback_bumps_total_and_the_matching_syscall() {
+        // A syscall number unique to this test, so the per-number assertion is
+        // exact even if the process-global counters are touched concurrently.
+        let number: i64 = 401;
+        let per_before = fallback_syscall_count(number);
+        let total_before = fallback_dispatch_count();
+
+        record_fallback_dispatch(number);
+
+        assert_eq!(fallback_syscall_count(number), per_before + 1);
+        assert!(
+            fallback_dispatch_count() > total_before,
+            "total must advance by at least this recording"
+        );
+    }
+
+    #[test]
+    fn out_of_range_syscall_numbers_count_in_the_total_only() {
+        // Above the tracked bound: total advances, per-number stays zero.
+        let huge = i64::from(i32::MAX);
+        let total_before = fallback_dispatch_count();
+        record_fallback_dispatch(huge);
+        assert_eq!(fallback_syscall_count(huge), 0);
+        assert!(fallback_dispatch_count() > total_before);
+
+        // Negative numbers are never used to index the per-number table.
+        let total_before = fallback_dispatch_count();
+        record_fallback_dispatch(-1);
+        assert_eq!(fallback_syscall_count(-1), 0);
+        assert!(fallback_dispatch_count() > total_before);
     }
 }

@@ -100,6 +100,26 @@ reached by the residual sites e9patch cannot rewrite ahead of time (the dynamic
 loader and startup code, the vDSO, and any uncovered or JIT-emitted site). For
 those the shared fail-closed passthrough policy is exactly correct.
 
+### Fallback-Surface Observability
+
+`E9patchDispatcher::dispatch` records every syscall it services before
+forwarding it, so the size of that residual fallback surface is observable from
+the guest through two C-ABI counters:
+
+- `reverie_e9patch_fallback_dispatch_count()` — total syscalls that reached the
+  shared fallback dispatcher.
+- `reverie_e9patch_fallback_syscall_count(number)` — the per-syscall-number
+  breakdown.
+
+This is the e9patch analog of LiteInst's `reverie_liteinst_site_trap_count` /
+`reverie_liteinst_site_hook_count` exports, keyed by **syscall number** rather
+than by **site address** — the one difference that follows from e9patch having
+no runtime sites to key on (its trampolines are materialized ahead of time).
+Counting is relaxed-atomic and async-signal-safe, does not change the shared
+forwarding decision, and directly answers the coverage question above: a count
+near zero confirms e9tool's ahead-of-time rewriting is carrying the syscall
+load, while a large count localizes the un-rewritten surface by syscall.
+
 ## Preload And RPC Boundary
 
 The shared `reverie-preload` runtime and `reverie-rpc-transport` transport are
