@@ -190,7 +190,8 @@ extern int32_t reverie_dbi_runtime_thread_created(
     register_reader_t read_registers, register_writer_t write_registers);
 
 extern void reverie_dbi_runtime_thread_exit(prototype_counters_t *counters,
-                                            int32_t tid);
+                                            void *context, int32_t tid,
+                                            syscall_invoker_t invoke_syscall);
 extern uint64_t reverie_dbi_runtime_image_init(void);
 extern void reverie_dbi_runtime_exec_failed(prototype_counters_t *counters,
                                             int32_t pid);
@@ -246,6 +247,7 @@ static atomic_flag pending_clone_lock = ATOMIC_FLAG_INIT;
 static _Atomic int32_t pending_clone_virtual_child;
 static _Atomic int32_t pending_clone_creator_pid;
 static _Atomic uint64_t pending_clone_flags;
+static bool copied_process_runtime_initialized;
 
 static bool map_inherited_virtual_identity_state(void) {
   struct stat status;
@@ -675,6 +677,9 @@ static bool preserve_internal_descriptors(uintptr_t context, int sysnum,
 // kill(-pgid)/wait4(-pgid) pass through untranslated; pgid/sid not yet modeled.
 static bool translate_identity_arguments(int sysnum, uint64_t *args) {
   switch (sysnum) {
+  // AUTONOMOUS-BOT-IMPLEMENTED
+  // TODO-HUMAN-REVIEW(PR-259): Review virtual get_robust_list target translation.
+  case SYS_get_robust_list:
   case SYS_kill:
   case SYS_tkill:
   case SYS_wait4:
@@ -853,7 +858,10 @@ static int32_t complete_clone_identity(prototype_counters_t *counters,
       (result <= 0 || (flags & CLONE_VM) == 0))
     release_clone_identity_handoff(virtual_child);
   counters->pending_virtual_child = 0;
-  counters->pending_clone_flags = 0;
+  if (!(result == 0 && (flags & CLONE_THREAD) == 0 &&
+        runtime_owner_pid != 0 && dr_get_process_id() != runtime_owner_pid &&
+        runtime_uses_external_global()))
+    counters->pending_clone_flags = 0;
   return virtual_child;
 }
 
@@ -1723,6 +1731,24 @@ static bool pre_syscall(void *drcontext, int sysnum) {
   for (i = 0; i != 6; ++i)
     args[i] = (uint64_t)dr_syscall_get_param(drcontext, i);
 
+  // AUTONOMOUS-BOT-IMPLEMENTED
+  // TODO-HUMAN-REVIEW(PR-255): Review copied-process Detcore state rebasing.
+  if (has_copied_runtime() && runtime_uses_external_global() &&
+      !copied_process_runtime_initialized) {
+    int32_t initialized = reverie_dbi_runtime_thread_init(
+        counters, drcontext, (int32_t)dr_get_thread_id(drcontext),
+        (int32_t)dr_get_process_id(), in_tree_parent_pid(),
+        atomic_load_explicit(&branch_count, memory_order_relaxed), 0,
+        invoke_syscall, read_registers, write_registers);
+    if (initialized != 0) {
+      dr_fprintf(diagnostic_file,
+                 "reverie-dbi: copied process state initialization failed\n");
+      exit_runtime_tree(101);
+      return false;
+    }
+    copied_process_runtime_initialized = true;
+  }
+
   if (has_copied_runtime() && !runtime_uses_external_global()) {
     // Record this copied child's virtual identity before any refusal so the
     // shared host<->virtual map stays coherent even when the syscall is later
@@ -1846,6 +1872,12 @@ static bool pre_syscall(void *drcontext, int sysnum) {
       dr_syscall_set_result(drcontext, (reg_t)result);
       return false;
     }
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-255): Review pre-exit guest-transport deregistration.
+    if (runtime_uses_external_global() && sysnum == SYS_exit_group)
+      reverie_dbi_runtime_thread_exit(
+          counters, drcontext, (int32_t)dr_get_thread_id(drcontext),
+          invoke_syscall);
     return prepare_original_identity_syscall(drcontext, counters, sysnum, args);
   }
 
@@ -1929,7 +1961,9 @@ static void thread_exit(void *drcontext) {
       drcontext, thread_state_index);
   if (counters != NULL &&
       (!has_copied_runtime() || runtime_uses_external_global())) {
-    reverie_dbi_runtime_thread_exit(counters, dr_get_thread_id(drcontext));
+    reverie_dbi_runtime_thread_exit(counters, drcontext,
+                                    dr_get_thread_id(drcontext),
+                                    invoke_syscall);
     dr_thread_free(drcontext, counters, sizeof(*counters));
   }
 }

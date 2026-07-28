@@ -204,6 +204,7 @@ where
     tid: Pid,
     global_state: &'a T::GlobalState,
     config: &'a <T::GlobalState as GlobalTool>::Config,
+    guest_rpc: Option<(usize, SyscallInvoker)>,
 }
 
 #[reverie::tool]
@@ -221,7 +222,12 @@ where
         // shared GlobalState hosted out-of-process; otherwise fall back to the
         // in-process (per-process) global state.
         if crate::sync_rpc::is_active() {
-            crate::sync_rpc::send_rpc(self.tid, message)
+            match self.guest_rpc {
+                Some((context, invoke_syscall)) => {
+                    crate::sync_rpc::send_rpc_from_guest(context, invoke_syscall, self.tid, message)
+                }
+                None => crate::sync_rpc::send_rpc(self.tid, message),
+            }
         } else {
             self.global_state.receive_rpc(self.tid, message).await
         }
@@ -1174,6 +1180,39 @@ pub fn run_tool_thread_exit<T: Tool>(
         tid,
         global_state,
         config,
+        guest_rpc: None,
+    };
+    let tail_result = TailInjectResult::default();
+    run_ready(
+        tool.on_exit_thread(tid, &global, thread_state, exit_status),
+        &tail_result,
+    )
+    .expect("thread-exit handler unexpectedly tail-injected")
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-255): Review guest-transport thread-exit RPC.
+/// Drives an external tool's thread-exit hook from a DynamoRIO application callback.
+///
+/// Unlike [`run_tool_thread_exit`], coordinator RPC uses injected guest
+/// syscalls and does not enter Rust's host `UnixStream` implementation inside
+/// DynamoRIO's private loader.
+#[allow(clippy::too_many_arguments)]
+pub fn run_tool_thread_exit_from_guest<T: Tool>(
+    tool: &T,
+    context: usize,
+    invoke_syscall: SyscallInvoker,
+    tid: Pid,
+    thread_state: T::ThreadState,
+    global_state: &T::GlobalState,
+    config: &<T::GlobalState as GlobalTool>::Config,
+    exit_status: ExitStatus,
+) -> Result<(), Error> {
+    let global = DbiGlobal::<T> {
+        tid,
+        global_state,
+        config,
+        guest_rpc: Some((context, invoke_syscall)),
     };
     let tail_result = TailInjectResult::default();
     run_ready(
@@ -1195,6 +1234,7 @@ pub fn run_tool_process_exit<T: Tool>(
         tid: pid,
         global_state,
         config,
+        guest_rpc: None,
     };
     let tail_result = TailInjectResult::default();
     run_ready(
@@ -1446,7 +1486,9 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_created(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reverie_dbi_runtime_thread_exit(
     counters: *mut PrototypeCounters,
+    _context: *mut c_void,
     tid: i32,
+    _invoke_syscall: SyscallInvoker,
 ) {
     if tools::counter2_exact_enabled() {
         let thread_syscalls = unsafe { (*counters).observed_syscalls };

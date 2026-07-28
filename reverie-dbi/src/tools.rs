@@ -1591,6 +1591,7 @@ impl Counter2Host {
                 tid,
                 global_state: &self.global_state,
                 config: &(),
+                guest_rpc: None,
             };
             let report = process_tool.report();
             run_ready(
@@ -1633,6 +1634,7 @@ impl Counter2Host {
                 tid,
                 global_state: &self.global_state,
                 config: &(),
+                guest_rpc: None,
             };
             run_ready(
                 process_tool
