@@ -136,6 +136,8 @@ pub(crate) struct LoadedStaticElf {
     pub capability_inheritable: u64,
     pub capability_bounding: u64,
     pub capability_ambient: u64,
+    // TODO-HUMAN-REVIEW(PR-235): Review virtual dumpability lifecycle semantics.
+    pub dumpable: bool,
     // TODO-HUMAN-REVIEW(PR-92): Review virtual nice process state.
     pub nice: libc::c_int,
     // TODO-HUMAN-REVIEW(PR-119): Review virtual scheduler/ioprio process state.
@@ -226,6 +228,7 @@ impl LoadedStaticElf {
             capability_inheritable: self.capability_inheritable,
             capability_bounding: self.capability_bounding,
             capability_ambient: self.capability_ambient,
+            dumpable: self.dumpable,
             nice: self.nice,
             sched_policy: if reset_realtime {
                 libc::SCHED_OTHER
@@ -362,6 +365,7 @@ impl LoadedStaticElf {
         self.capability_inheritable = previous.capability_inheritable;
         self.capability_ambient =
             previous.capability_ambient & self.capability_permitted & self.capability_inheritable;
+        self.dumpable = true;
         self.nice = previous.nice;
         // TODO-HUMAN-REVIEW(PR-119): Review scheduler and ioprio exec inheritance.
         self.sched_policy = previous.sched_policy;
@@ -588,6 +592,7 @@ fn load_executable(
         capability_inheritable: 0,
         capability_bounding: GUEST_CAPABILITY_MASK,
         capability_ambient: 0,
+        dumpable: true,
         nice: 0,
         // TODO-HUMAN-REVIEW(PR-119): Review default virtual scheduler and ioprio state.
         sched_policy: libc::SCHED_OTHER,

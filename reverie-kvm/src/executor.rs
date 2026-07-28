@@ -6834,6 +6834,22 @@ fn prctl(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
             _ => negative_errno(libc::EINVAL),
         },
         option if option == libc::PR_GET_KEEPCAPS as u64 => i64::from(state.keep_capabilities),
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        option if option == libc::PR_SET_DUMPABLE as u64 => match args[1] {
+            0 => {
+                // TODO-HUMAN-REVIEW(PR-235): Review virtual dumpability mutation.
+                state.dumpable = false;
+                0
+            }
+            1 => {
+                state.dumpable = true;
+                0
+            }
+            _ => negative_errno(libc::EINVAL),
+        },
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-235): Review virtual dumpability queries.
+        option if option == libc::PR_GET_DUMPABLE as u64 => i64::from(state.dumpable),
         option if option == libc::PR_CAP_AMBIENT as u64 => {
             prctl_cap_ambient(state, args[1], args[2])
         }
@@ -8764,6 +8780,7 @@ mod tests {
             capability_inheritable: 0,
             capability_bounding: GUEST_CAPABILITY_MASK,
             capability_ambient: 0,
+            dumpable: true,
             nice: 0,
             sched_policy: libc::SCHED_OTHER,
             sched_priority: 0,
@@ -16925,6 +16942,27 @@ mod tests {
         let mut after_exec = test_state(&root.0);
         after_exec.inherit_process_state(state);
         assert_eq!(prctl(&mut after_exec, &get), 0);
+    }
+
+    #[test]
+    fn prctl_dumpable_round_trips_inherits_on_fork_and_resets_on_exec() {
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let get = [libc::PR_GET_DUMPABLE as u64, 0, 0, 0, 0, 0];
+        let set = |value| [libc::PR_SET_DUMPABLE as u64, value, 0, 0, 0, 0];
+
+        assert_eq!(prctl(&mut state, &get), 1);
+        assert_eq!(prctl(&mut state, &set(0)), 0);
+        assert_eq!(prctl(&mut state, &get), 0);
+        assert_eq!(prctl(&mut state, &set(2)), negative_errno(libc::EINVAL));
+        assert_eq!(prctl(&mut state, &get), 0);
+
+        let mut child = state.try_clone_for_fork(2).unwrap();
+        assert_eq!(prctl(&mut child, &get), 0);
+
+        let mut after_exec = test_state(&root.0);
+        after_exec.inherit_process_state(state);
+        assert_eq!(prctl(&mut after_exec, &get), 1);
     }
 
     #[test]
