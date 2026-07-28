@@ -65,6 +65,16 @@ it.
 - **The same lifecycle-controller seam.** Both backends install their runtime
   through reverie-preload's `LifecycleController` seam. Selecting a controller is
   a *config choice on one shared seam*, not a mechanism fork (see `RuntimeMode`).
+- **The same shared built-in tools.** e9patch's in-guest runtime can install
+  reverie-preload's shared `BuiltinTool`s (`passthrough`, `spoof-getpid`)
+  **verbatim** via the shared `reverie_preload::install_builtin`, selected by
+  `REVERIE_E9PATCH_TOOL`. This is the analog of LiteInst's built-in
+  `strace`/`compat` selection (`configure_command(cmd, PreloadTool)`), except the
+  tool — including the *mutating* `spoof-getpid` demo that returns
+  `reverie_preload::SPOOF_PID` from `getpid` — is shared-crate code reviewed
+  once, not backend-private. Only the env-var spelling is e9patch's. This proves
+  the e9patch fallback trap path can *mutate* a syscall result, not merely
+  forward it.
 
 **Different (the only intended differences):**
 
@@ -106,6 +116,17 @@ until the in-guest runtime is exercised against a real GPL-toolchain guest; the
 `HybridPtrace` controller is still a documented skeleton in `reverie-preload`, so
 `install_hybrid_runtime` returns `Unsupported` today — correct, because ptrace
 still performs all event handling.
+
+The in-guest runtime also exposes reverie-preload's shared **built-in tools**.
+`configure_guest_builtin(command, tool)` prepends the cdylib and sets
+`REVERIE_E9PATCH_TOOL` (which the constructor reads with priority over
+`REVERIE_E9PATCH_RUNTIME`); the constructor then calls the shared
+`reverie_preload::install_builtin`, so the dispatcher is shared-crate code. The
+`spoof-getpid` built-in returns `reverie_preload::SPOOF_PID` from `getpid`,
+demonstrating end to end that the fallback trap path can *mutate* a result.
+Built-in tools run under the shared isolated in-process controller (the
+demo/testing path, matching reverie-preload's standalone cdylib), not the
+ptrace-hosted production controller.
 
 What remains **not yet on the active backend path** is arbitrary-tool in-guest
 dispatch — the same constraint LiteInst faces:

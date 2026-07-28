@@ -24,6 +24,7 @@ use std::env;
 use std::ffi::OsStr;
 use std::io;
 
+use reverie_preload::BuiltinTool;
 use reverie_preload::lifecycle::HybridPtrace;
 use reverie_preload::lifecycle::InProcessSeccomp;
 use reverie_preload::lifecycle::LifecycleController;
@@ -53,6 +54,55 @@ pub const RUNTIME_FALLBACK: &str = "fallback";
 /// process lifecycle while the in-process `SIGSYS` trap covers residual
 /// un-rewritten sites. See [`RuntimeMode::HybridPtrace`].
 pub const RUNTIME_HYBRID: &str = "hybrid";
+
+/// Environment variable selecting a **shared** built-in tool for the in-guest
+/// runtime.
+///
+/// This is the direct analog of LiteInst's `REVERIE_LITEINST_TOOL` and
+/// reverie-preload's [`TOOL_ENV`](reverie_preload::TOOL_ENV). The difference is
+/// where the tool lives: LiteInst's built-ins (`strace`/`compat`) are
+/// LiteInst-private, whereas e9patch selects reverie-preload's
+/// [`BuiltinTool`]s **verbatim** — so the dispatcher code (including the
+/// *mutating* `SpoofGetpid` demo) is written and reviewed exactly once in the
+/// shared crate. Only the env-var spelling is e9patch's.
+///
+/// When set, this takes precedence over [`RUNTIME_ENV`]: a built-in tool runs
+/// under the shared isolated in-process controller (exactly like
+/// reverie-preload's standalone cdylib), which is the demo/testing path. The
+/// arbitrary-`Tool` production path remains ptrace-hosted; see
+/// [`crate::E9patchBackend`].
+pub const TOOL_ENV: &str = "REVERIE_E9PATCH_TOOL";
+
+/// [`TOOL_ENV`] value selecting the shared fail-closed pass-through tool.
+///
+/// Matches [`BuiltinTool::Passthrough`]: forward every syscall through the
+/// trusted gate with the shared guards, altering no guest behavior. Proves the
+/// e9patch fallback trap path end to end.
+pub const TOOL_PASSTHROUGH: &str = "passthrough";
+
+/// [`TOOL_ENV`] value selecting the shared `getpid`-spoofing demo tool.
+///
+/// Matches [`BuiltinTool::SpoofGetpid`]: forward everything except `getpid`,
+/// which returns [`reverie_preload::SPOOF_PID`]. Proves the e9patch fallback
+/// trap path can *mutate* a syscall result, not merely forward it — the
+/// capability the shared crate demonstrates via `install_builtin`.
+pub const TOOL_SPOOF_GETPID: &str = "spoof-getpid";
+
+/// Parse a [`TOOL_ENV`] value into a shared [`BuiltinTool`], or `None` when the
+/// value is unrecognized.
+///
+/// The variants map to reverie-preload's public enum so the selected dispatcher
+/// is shared-crate code, not an e9patch reimplementation. Kept pure so the
+/// parse contract is unit-testable without touching process-global state.
+pub fn builtin_tool_from_env_value(value: &OsStr) -> Option<BuiltinTool> {
+    if value == OsStr::new(TOOL_PASSTHROUGH) {
+        Some(BuiltinTool::Passthrough)
+    } else if value == OsStr::new(TOOL_SPOOF_GETPID) {
+        Some(BuiltinTool::SpoofGetpid)
+    } else {
+        None
+    }
+}
 
 /// Which shared `reverie-preload` lifecycle controller the in-guest runtime
 /// installs.
@@ -152,6 +202,30 @@ pub unsafe fn install_hybrid_runtime() -> io::Result<()> {
     unsafe { install_with_controller(&HybridPtrace) }
 }
 
+/// Install one of reverie-preload's **shared** [`BuiltinTool`]s under the shared
+/// isolated in-process controller.
+///
+/// This forwards directly to [`reverie_preload::install_builtin`], so the
+/// dispatcher (including the *mutating* [`BuiltinTool::SpoofGetpid`]), the
+/// seccomp filter, the `SIGSYS` handler, and the trusted gate are the exact
+/// shared code both ld-preload backends rely on. It is the e9patch analog of
+/// LiteInst's built-in `strace`/`compat` selection, differing only in that the
+/// tool itself is shared rather than backend-private.
+///
+/// Built-in tools run under [`InProcessSeccomp`] (the isolated demo/testing
+/// path, matching reverie-preload's standalone cdylib), not the ptrace-hosted
+/// production controller. e9patch's arbitrary-`Tool` production events still go
+/// through ptrace; see [`crate::E9patchBackend`].
+///
+/// # Safety
+///
+/// See [`install_runtime`].
+pub unsafe fn install_builtin_runtime(tool: BuiltinTool) -> io::Result<()> {
+    // SAFETY: forwarded to the caller's once-before-threads contract; the shared
+    // installer registers the dispatcher before installing the filter/handler.
+    unsafe { reverie_preload::install_builtin(tool) }
+}
+
 /// Register the shared dispatcher and install the given shared controller.
 ///
 /// # Safety
@@ -164,16 +238,36 @@ unsafe fn install_with_controller(controller: &dyn LifecycleController) -> io::R
     unsafe { reverie_preload::install(Box::new(E9patchDispatcher::new()), controller, &config) }
 }
 
-/// Read [`RUNTIME_ENV`] and install the runtime when it selects a known mode.
+/// Read the launcher environment and install the in-guest runtime it selects.
 ///
-/// Absent env var → inert (`Ok(())`), matching the shared preload contract.
+/// Precedence:
+///
+/// 1. [`TOOL_ENV`] (a shared [`BuiltinTool`]) takes priority. It installs the
+///    shared built-in dispatcher under the isolated in-process controller — the
+///    demo/testing path, matching reverie-preload's standalone cdylib.
+/// 2. Otherwise [`RUNTIME_ENV`] selects the controller the e9patch fail-closed
+///    dispatcher runs under (see [`RuntimeMode`]).
+/// 3. With neither set the preload is inert (`Ok(())`), matching the shared
+///    preload contract, so an unrelated process that merely has the `.so` on
+///    `LD_PRELOAD` is unaffected.
 ///
 /// # Safety
 ///
-/// See [`install_runtime`]. When the env var arms the runtime, this installs
+/// See [`install_runtime`]. When an env var arms the runtime, this installs
 /// process-global irreversible state and must run exactly once before
 /// application threads start.
 pub unsafe fn initialize_from_environment() -> io::Result<()> {
+    if let Some(value) = env::var_os(TOOL_ENV) {
+        let tool = builtin_tool_from_env_value(&value).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unsupported {TOOL_ENV} value {value:?}"),
+            )
+        })?;
+        // SAFETY: forwarded to the caller's once-before-threads contract.
+        return unsafe { install_builtin_runtime(tool) };
+    }
+
     let Some(value) = env::var_os(RUNTIME_ENV) else {
         return Ok(());
     };
@@ -232,6 +326,33 @@ mod tests {
             RuntimeMode::from_env_value(OsStr::new(RUNTIME_HYBRID)),
             Some(RuntimeMode::HybridPtrace)
         );
+    }
+
+    #[test]
+    fn builtin_tool_env_values_map_to_the_shared_enum() {
+        // e9patch selects reverie-preload's built-in tools *verbatim*; only the
+        // env-var spelling is local. Assert the mapping and reject unknowns
+        // without installing anything.
+        assert_eq!(
+            builtin_tool_from_env_value(OsStr::new(TOOL_PASSTHROUGH)),
+            Some(BuiltinTool::Passthrough)
+        );
+        assert_eq!(
+            builtin_tool_from_env_value(OsStr::new(TOOL_SPOOF_GETPID)),
+            Some(BuiltinTool::SpoofGetpid)
+        );
+        assert_eq!(TOOL_PASSTHROUGH, "passthrough");
+        assert_eq!(TOOL_SPOOF_GETPID, "spoof-getpid");
+        assert!(builtin_tool_from_env_value(OsStr::new("bogus")).is_none());
+        assert!(builtin_tool_from_env_value(OsStr::new("")).is_none());
+    }
+
+    #[test]
+    fn tool_env_is_distinct_from_controller_env() {
+        // The built-in-tool selector and the controller-mode selector are
+        // separate knobs; TOOL_ENV takes precedence in initialize_from_environment.
+        assert_eq!(TOOL_ENV, "REVERIE_E9PATCH_TOOL");
+        assert_ne!(TOOL_ENV, RUNTIME_ENV);
     }
 
     #[test]

@@ -55,6 +55,11 @@ pub mod runtime;
 
 pub use backend::E9patchBackend;
 pub use dispatch::E9patchDispatcher;
+// Re-exported from the shared crate so a consumer selecting an e9patch built-in
+// tool imports the *same* enum both ld-preload backends use. The tool is shared,
+// not e9patch-private (only the env-var spelling differs).
+pub use reverie_preload::BuiltinTool;
+pub use reverie_preload::SPOOF_PID;
 pub use rewrite::E9PATCH_BACKEND_ENV;
 pub use rewrite::E9TOOL_ENV;
 pub use rewrite::E9patchRewriter;
@@ -64,6 +69,10 @@ pub use runtime::RUNTIME_ENV;
 pub use runtime::RUNTIME_FALLBACK;
 pub use runtime::RUNTIME_HYBRID;
 pub use runtime::RuntimeMode;
+pub use runtime::TOOL_ENV;
+pub use runtime::TOOL_PASSTHROUGH;
+pub use runtime::TOOL_SPOOF_GETPID;
+pub use runtime::builtin_tool_from_env_value;
 
 /// Environment variable overriding the located e9patch preload library path.
 ///
@@ -163,6 +172,45 @@ pub fn configure_guest_command(
     Ok(())
 }
 
+/// Arms a `reverie::process::Command` guest with a **shared** [`BuiltinTool`].
+///
+/// This is the launcher-side half of built-in-tool selection — the direct analog
+/// of LiteInst's `configure_command(command, PreloadTool)`, differing only in
+/// that the tool is one of reverie-preload's shared built-ins (installed via the
+/// shared `install_builtin`) rather than a backend-private one. It prepends the
+/// located cdylib to any inherited `LD_PRELOAD` and sets [`TOOL_ENV`], which the
+/// in-guest constructor reads with priority over the controller-mode
+/// [`RUNTIME_ENV`]. Built-in tools run under the shared isolated in-process
+/// controller (the demo/testing path); the arbitrary-`Tool` production path
+/// remains ptrace-hosted.
+pub fn configure_guest_builtin(
+    command: &mut reverie::process::Command,
+    tool: BuiltinTool,
+) -> io::Result<()> {
+    let inherited = command
+        .get_env("LD_PRELOAD")
+        .map(|value| value.into_owned())
+        .or_else(|| env::var_os("LD_PRELOAD"));
+    let value = compose_ld_preload(preload_library_path()?, inherited);
+    command
+        .env("LD_PRELOAD", value)
+        .env(TOOL_ENV, builtin_tool_env_value(tool));
+    Ok(())
+}
+
+/// The canonical [`TOOL_ENV`] string for a shared [`BuiltinTool`].
+///
+/// Kept beside [`configure_guest_builtin`] so the launcher and the in-guest
+/// [`builtin_tool_from_env_value`] parser agree on the exact spelling.
+fn builtin_tool_env_value(tool: BuiltinTool) -> &'static str {
+    // Exhaustive on purpose: if reverie-preload adds a built-in, e9patch must map
+    // it here rather than silently arming an unintended tool.
+    match tool {
+        BuiltinTool::Passthrough => TOOL_PASSTHROUGH,
+        BuiltinTool::SpoofGetpid => TOOL_SPOOF_GETPID,
+    }
+}
+
 // TODO-HUMAN-REVIEW(PR-104): Review the e9patch preload constructor that installs
 // process-wide signal and seccomp state.
 /// Initializes the e9patch preload runtime when armed by the launcher
@@ -206,7 +254,10 @@ mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
 
+    use super::BuiltinTool;
     use super::E9PATCH_SOURCE_REVISION;
+    use super::builtin_tool_env_value;
+    use super::builtin_tool_from_env_value;
     use super::compose_ld_preload;
 
     #[test]
@@ -242,5 +293,20 @@ mod tests {
             compose_ld_preload(PathBuf::from("/opt/x.so"), Some(OsString::new())),
             OsString::from("/opt/x.so")
         );
+    }
+
+    #[test]
+    fn builtin_tool_env_value_round_trips_through_the_parser() {
+        // The launcher-side spelling and the in-guest parser must agree for every
+        // shared built-in, so a guest armed by `configure_guest_builtin` installs
+        // exactly the tool the launcher selected.
+        for tool in [BuiltinTool::Passthrough, BuiltinTool::SpoofGetpid] {
+            let spelling = builtin_tool_env_value(tool);
+            assert_eq!(
+                builtin_tool_from_env_value(std::ffi::OsStr::new(spelling)),
+                Some(tool),
+                "round-trip failed for {tool:?}"
+            );
+        }
     }
 }
