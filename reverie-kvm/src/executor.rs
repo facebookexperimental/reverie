@@ -225,7 +225,7 @@ pub(crate) fn is_process_syscall(number: u64) -> bool {
         // TODO-HUMAN-REVIEW(PR-92): Review wait4 process-action classification.
         || number == libc::SYS_wait4 as u64
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TBD): Review waitid process-action classification.
+        // TODO-HUMAN-REVIEW(PR-227): Review waitid process-action classification.
         || number == libc::SYS_waitid as u64
 }
 
@@ -504,7 +504,7 @@ fn execute_basic_syscall_with_output(
         wait4(memory, state, args)
     } else if number == libc::SYS_waitid as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TBD): Review serialized-child waitid emulation.
+        // TODO-HUMAN-REVIEW(PR-227): Review serialized-child waitid emulation.
         waitid(memory, state, args)
     } else if number == libc::SYS_getuid as u64
         || number == libc::SYS_geteuid as u64
@@ -602,14 +602,14 @@ fn execute_basic_syscall_with_output(
         || number == libc::SYS_fsetxattr as u64
     {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic xattr mutation refusal.
+        // TODO-HUMAN-REVIEW(PR-227): Review deterministic xattr mutation refusal.
         setxattr(memory, state, number, args)
     } else if number == libc::SYS_removexattr as u64
         || number == libc::SYS_lremovexattr as u64
         || number == libc::SYS_fremovexattr as u64
     {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic xattr removal result.
+        // TODO-HUMAN-REVIEW(PR-227): Review deterministic xattr removal result.
         removexattr(memory, state, number, args)
     } else if number == libc::SYS_brk as u64 {
         brk(memory, state, args[0])
@@ -6309,7 +6309,7 @@ fn getxattr(memory: &GuestMemory, state: &LoadedStaticElf, number: u64, args: &[
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Review no-xattr mutation validation and refusal.
+// TODO-HUMAN-REVIEW(PR-227): Review no-xattr mutation validation and refusal.
 fn setxattr(memory: &GuestMemory, state: &LoadedStaticElf, number: u64, args: &[u64; 6]) -> i64 {
     if let Err(error) = validate_xattr_target_and_name(memory, state, number, args) {
         return error;
@@ -6336,7 +6336,7 @@ fn setxattr(memory: &GuestMemory, state: &LoadedStaticElf, number: u64, args: &[
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Review no-xattr removal validation and result.
+// TODO-HUMAN-REVIEW(PR-227): Review no-xattr removal validation and result.
 fn removexattr(memory: &GuestMemory, state: &LoadedStaticElf, number: u64, args: &[u64; 6]) -> i64 {
     match validate_xattr_target_and_name(memory, state, number, args) {
         Ok(()) => negative_errno(libc::ENODATA),
@@ -7572,7 +7572,7 @@ struct GuestWaitidSiginfo {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Review serialized-child waitid ABI emulation.
+// TODO-HUMAN-REVIEW(PR-227): Review serialized-child waitid ABI emulation.
 fn waitid(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
     const EVENT_OPTIONS: u64 = libc::WEXITED as u64;
     const ALLOWED_OPTIONS: u64 = EVENT_OPTIONS | libc::WNOHANG as u64 | libc::WNOWAIT as u64;
