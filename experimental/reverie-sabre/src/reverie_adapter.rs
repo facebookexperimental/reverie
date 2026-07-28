@@ -15,6 +15,7 @@ use std::io;
 use std::path::Path;
 use std::pin::pin;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::Ordering;
 use std::task::Context;
@@ -149,7 +150,7 @@ where
             pid,
             thread_state,
             &rpc,
-            Some((&self.tool, exit_handled)),
+            Some((&self.tool, exit_handled, None)),
             original,
             special_inject,
         );
@@ -190,7 +191,7 @@ where
             current_pid(),
             thread_state,
             &rpc,
-            Some((&self.tool, exit_handled)),
+            Some((&self.tool, exit_handled, None)),
             None,
             None,
         );
@@ -229,7 +230,7 @@ where
             current_pid(),
             thread_state,
             &rpc,
-            Some((&self.tool, exit_handled)),
+            Some((&self.tool, exit_handled, None)),
             None,
             None,
         );
@@ -345,6 +346,9 @@ where
     socket_path: std::path::PathBuf,
     thread_states: Mutex<HashMap<i32, Arc<Mutex<RemoteThreadState<T>>>>>,
     // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-209): Review parent-state handoff for SaBRe thread clones.
+    thread_clone_pending: AtomicBool,
+    // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-142): Review remote syscall-subscription caching and bypass.
     syscall_subscriptions: BTreeSet<Sysno>,
 }
@@ -356,6 +360,22 @@ where
     thread_state: Option<T::ThreadState>,
     rpc: BlockingRpcClient<T::GlobalState>,
     exit_handled: bool,
+}
+
+struct PendingThreadClone<'a>(&'a AtomicBool);
+
+impl Drop for PendingThreadClone<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+struct ChildThreadRegistry<'a, T>
+where
+    T: ReverieTool,
+{
+    states: &'a Mutex<HashMap<i32, Arc<Mutex<RemoteThreadState<T>>>>>,
+    socket_path: &'a Path,
 }
 
 impl<T> RemoteReverieAdapter<T>
@@ -387,6 +407,7 @@ where
             config,
             socket_path,
             thread_states: Mutex::new(thread_states),
+            thread_clone_pending: AtomicBool::new(false),
             syscall_subscriptions,
         })
     }
@@ -421,7 +442,7 @@ where
             pid,
             thread_state,
             rpc,
-            Some((&self.tool, exit_handled)),
+            Some((&self.tool, exit_handled, None)),
             None,
             None,
         );
@@ -474,10 +495,27 @@ where
             pid,
             thread_state,
             rpc,
-            Some((&self.tool, exit_handled)),
+            Some((
+                &self.tool,
+                exit_handled,
+                Some(ChildThreadRegistry {
+                    states: &self.thread_states,
+                    socket_path: &self.socket_path,
+                }),
+            )),
             original,
             special_inject,
         );
+
+        let _pending_thread_clone = original
+            .filter(|(number, args)| is_thread_clone(*number, *args))
+            .map(|_| {
+                assert!(
+                    !self.thread_clone_pending.swap(true, Ordering::AcqRel),
+                    "nested SaBRe thread clones are unsupported"
+                );
+                PendingThreadClone(&self.thread_clone_pending)
+            });
 
         TAIL_INJECT_RESULT.with(|slot| slot.set(None));
         match poll_once(self.tool.handle_syscall_event(&mut guest, syscall)) {
@@ -517,7 +555,7 @@ where
             current_pid(),
             thread_state,
             rpc,
-            Some((&self.tool, exit_handled)),
+            Some((&self.tool, exit_handled, None)),
             None,
             None,
         );
@@ -557,7 +595,7 @@ where
             current_pid(),
             thread_state,
             rpc,
-            Some((&self.tool, exit_handled)),
+            Some((&self.tool, exit_handled, None)),
             None,
             None,
         );
@@ -639,8 +677,14 @@ where
     }
 
     fn thread_state(&self, tid: Pid) -> Result<Arc<Mutex<RemoteThreadState<T>>>, RpcError> {
-        if let Some(state) = self.thread_states.lock().get(&tid.as_raw()).cloned() {
-            return Ok(state);
+        loop {
+            if let Some(state) = self.thread_states.lock().get(&tid.as_raw()).cloned() {
+                return Ok(state);
+            }
+            if !self.thread_clone_pending.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::yield_now();
         }
 
         let rpc = BlockingRpcClient::connect(&self.socket_path, tid)?;
@@ -869,6 +913,7 @@ where
     exit_handled: Option<&'state mut bool>,
     original: Option<(Sysno, SyscallArgs)>,
     special_inject: Option<&'inject mut (dyn FnMut() -> usize + Send + Sync)>,
+    child_threads: Option<ChildThreadRegistry<'state, T>>,
 }
 
 impl<'state, 'inject, T> SabreGuest<'state, 'inject, T>
@@ -880,12 +925,18 @@ where
         pid: Pid,
         thread_state: &'state mut Option<T::ThreadState>,
         rpc: &'state dyn GlobalRPC<T::GlobalState>,
-        remote: Option<(&'state T, &'state mut bool)>,
+        remote: Option<(
+            &'state T,
+            &'state mut bool,
+            Option<ChildThreadRegistry<'state, T>>,
+        )>,
         original: Option<(Sysno, SyscallArgs)>,
         special_inject: Option<&'inject mut (dyn FnMut() -> usize + Send + Sync)>,
     ) -> Self {
-        let (tool, exit_handled) =
-            remote.map_or((None, None), |(tool, handled)| (Some(tool), Some(handled)));
+        let (tool, exit_handled, child_threads) = remote
+            .map_or((None, None, None), |(tool, handled, child_threads)| {
+                (Some(tool), Some(handled), child_threads)
+            });
 
         Self {
             tid,
@@ -896,7 +947,37 @@ where
             exit_handled,
             original,
             special_inject,
+            child_threads,
         }
+    }
+
+    fn initialize_child_thread(&mut self, child: Pid) -> Result<(), Errno> {
+        let Some(registry) = self.child_threads.as_ref() else {
+            return Ok(());
+        };
+        let Some(tool) = self.tool else {
+            return Err(Errno::EIO);
+        };
+        let Some(parent_state) = self.thread_state.as_ref() else {
+            return Err(Errno::EIO);
+        };
+
+        let mut states = registry.states.lock();
+        if states.contains_key(&child.as_raw()) {
+            return Ok(());
+        }
+        let rpc =
+            BlockingRpcClient::connect(registry.socket_path, child).map_err(remote_rpc_error)?;
+        let thread_state = tool.init_thread_state(child, Some((self.tid, parent_state)));
+        states.insert(
+            child.as_raw(),
+            Arc::new(Mutex::new(RemoteThreadState {
+                thread_state: Some(thread_state),
+                rpc,
+                exit_handled: false,
+            })),
+        );
+        Ok(())
     }
 }
 
@@ -1088,7 +1169,13 @@ where
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(PR-140): Review frame suspension on diverging injectors.
                 let _frame_suspended = crate::callbacks::SyscallFrameGuard::suspend();
-                return Errno::from_ret(inject()).map(|value| value as i64);
+                let result = Errno::from_ret(inject()).map(|value| value as i64);
+                if is_thread_clone(number, args) {
+                    if let Ok(child) = result {
+                        self.initialize_child_thread(Pid::from_raw(child as i32))?;
+                    }
+                }
+                return result;
             }
         }
         if matches!(
@@ -1147,6 +1234,10 @@ where
             }],
         ))
     }
+}
+
+fn is_thread_clone(number: Sysno, args: SyscallArgs) -> bool {
+    number == Sysno::clone && args.arg0 & libc::CLONE_THREAD as usize != 0
 }
 
 const STACK_CAPACITY: usize = 4096;
@@ -1245,6 +1336,16 @@ mod tests {
     static POST_EXECS: AtomicUsize = AtomicUsize::new(0);
     static PROCESS_EXITS: AtomicUsize = AtomicUsize::new(0);
     static RPC_SOCKET_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn identifies_only_thread_clones_for_parent_state_handoff() {
+        let thread_args = SyscallArgs::new(libc::CLONE_THREAD as usize, 0, 0, 0, 0, 0);
+        let process_args = SyscallArgs::new(libc::SIGCHLD as usize, 0, 0, 0, 0, 0);
+
+        assert!(is_thread_clone(Sysno::clone, thread_args));
+        assert!(!is_thread_clone(Sysno::clone, process_args));
+        assert!(!is_thread_clone(Sysno::fork, thread_args));
+    }
 
     #[test]
     fn sabre_memory_reads_and_writes_valid_memory() {
