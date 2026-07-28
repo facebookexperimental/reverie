@@ -338,6 +338,12 @@ fn execute_basic_syscall_with_output(
     } else if number == libc::SYS_eventfd2 as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         eventfd2(state, args[0], args[1])
+    } else if number == libc::SYS_signalfd as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        signalfd(memory, state, args, 0)
+    } else if number == libc::SYS_signalfd4 as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        signalfd(memory, state, args, args[3])
     } else if number == libc::SYS_timerfd_create as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         timerfd_create(state, args[0], args[1])
@@ -992,6 +998,10 @@ fn mutates_file_table(number: u64) -> bool {
             || number == libc::SYS_eventfd as u64
             || number == libc::SYS_eventfd2 as u64
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-235): Review signalfd descriptor-table serialization.
+            || number == libc::SYS_signalfd as u64
+            || number == libc::SYS_signalfd4 as u64
+            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-235): Review timerfd descriptor-table serialization.
             || number == libc::SYS_timerfd_create as u64
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1372,6 +1382,7 @@ impl ElfExecutor {
         let mut state = self.state.try_clone_for_fork(child_tid)?;
         state.pid = self.state.pid;
         state.ppid = self.state.ppid;
+        state.signalfd_state = self.state.signalfd_state.clone();
         Ok(Self {
             state,
             address_space: self.address_space.clone(),
@@ -2140,10 +2151,14 @@ fn read(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) 
     if let Err(error) = ensure_readable(file) {
         return error;
     }
+    let host_fd = file.as_raw_fd();
+    if let Some(result) = signalfd_read(memory, state, fd, args[1], requested_length) {
+        return result;
+    }
     if requested_length == 0 {
         return 0;
     }
-    host_read(memory, file.as_raw_fd(), args[1], length)
+    host_read(memory, host_fd, args[1], length)
 }
 
 fn pread64(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
@@ -3061,6 +3076,33 @@ struct DuplicateFdSource {
     proc_inode: Option<u64>,
     object_inode: Arc<GuestFileIdentity>,
     is_random: bool,
+    signalfd_mask: Option<[u8; KERNEL_SIGSET_SIZE]>,
+}
+
+fn signalfd_mask(state: &LoadedStaticElf, fd: libc::c_int) -> Option<[u8; KERNEL_SIGSET_SIZE]> {
+    state
+        .signalfd_state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .masks
+        .get(&fd)
+        .copied()
+}
+
+fn replace_signalfd_mask(
+    state: &LoadedStaticElf,
+    fd: libc::c_int,
+    mask: Option<[u8; KERNEL_SIGSET_SIZE]>,
+) {
+    let mut signalfd_state = state
+        .signalfd_state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(mask) = mask {
+        signalfd_state.masks.insert(fd, mask);
+    } else {
+        signalfd_state.masks.remove(&fd);
+    }
 }
 
 fn duplicate_fd_at_or_above(
@@ -3093,6 +3135,7 @@ fn duplicate_fd_at_or_above(
     if source.is_random {
         state.random_device_fds.insert(fd);
     }
+    replace_signalfd_mask(state, fd, source.signalfd_mask);
     if close_on_exec {
         state.cloexec_fds.insert(fd);
     } else {
@@ -3129,6 +3172,7 @@ fn duplicate_fd(
     let source_alias = output_alias(state, old_fd);
     let source_proc_inode = state.proc_files.get(&old_fd).copied();
     let source_is_random = state.random_device_fds.contains(&old_fd);
+    let source_signalfd_mask = signalfd_mask(state, old_fd);
     let Some(old_host_fd) = host_fd(state, old_fd) else {
         return negative_errno(libc::EBADF);
     };
@@ -3169,6 +3213,7 @@ fn duplicate_fd(
         } else {
             state.random_device_fds.remove(&new_fd);
         }
+        replace_signalfd_mask(state, new_fd, source_signalfd_mask);
         cleanup_fd_object_inodes(state);
         if close_on_exec {
             state.cloexec_fds.insert(new_fd);
@@ -3196,6 +3241,7 @@ fn duplicate_fd(
             if source_is_random {
                 state.random_device_fds.insert(new_fd as libc::c_int);
             }
+            replace_signalfd_mask(state, new_fd as libc::c_int, source_signalfd_mask);
         }
         if new_fd >= 0
             && let Some(inode) = source_proc_inode
@@ -3640,6 +3686,233 @@ fn eventfd2(state: &mut LoadedStaticElf, initial: u64, raw_flags: u64) -> i64 {
     // SAFETY: eventfd returned a new owned descriptor.
     let file = unsafe { std::fs::File::from_raw_fd(host_fd) };
     insert_file_with_flags(state, file, flags & libc::EFD_CLOEXEC != 0, None)
+}
+
+fn signal_mask_contains(mask: &[u8; KERNEL_SIGSET_SIZE], signal: libc::c_int) -> bool {
+    if !(1..=64).contains(&signal) {
+        return false;
+    }
+    let bit = (signal - 1) as usize;
+    mask[bit / 8] & (1 << (bit % 8)) != 0
+}
+
+fn set_signalfd_ready(file: &std::fs::File, ready: bool) -> Result<(), i64> {
+    let mut poll_fd = libc::pollfd {
+        fd: file.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: poll_fd points to one initialized descriptor and timeout zero
+    // never blocks the supervisor.
+    let poll_result = unsafe { libc::poll(&mut poll_fd, 1, 0) };
+    if poll_result < 0 {
+        return Err(io_error(std::io::Error::last_os_error()));
+    }
+    if poll_result > 0 && poll_fd.revents & libc::POLLIN != 0 {
+        let mut counter = 0u64;
+        // SAFETY: counter is writable and eventfd reads exactly one u64.
+        if unsafe {
+            libc::read(
+                file.as_raw_fd(),
+                std::ptr::from_mut(&mut counter).cast::<libc::c_void>(),
+                std::mem::size_of::<u64>(),
+            )
+        } < 0
+        {
+            return Err(io_error(std::io::Error::last_os_error()));
+        }
+    }
+    if ready {
+        let counter = 1u64;
+        // SAFETY: counter is readable and eventfd writes exactly one u64.
+        if unsafe {
+            libc::write(
+                file.as_raw_fd(),
+                std::ptr::from_ref(&counter).cast::<libc::c_void>(),
+                std::mem::size_of::<u64>(),
+            )
+        } < 0
+        {
+            return Err(io_error(std::io::Error::last_os_error()));
+        }
+    }
+    Ok(())
+}
+
+// TODO-HUMAN-REVIEW(PR-235): Review virtual signalfd creation and mask updates.
+fn signalfd(
+    memory: &GuestMemory,
+    state: &mut LoadedStaticElf,
+    args: &[u64; 6],
+    raw_flags: u64,
+) -> i64 {
+    if args[2] != KERNEL_SIGSET_SIZE as u64 {
+        return negative_errno(libc::EINVAL);
+    }
+    let mut mask = match read_guest_bytes::<KERNEL_SIGSET_SIZE>(memory, args[1]) {
+        Ok(mask) => mask,
+        Err(error) => return error,
+    };
+    for signal in [libc::SIGKILL, libc::SIGSTOP] {
+        let bit = (signal - 1) as usize;
+        mask[bit / 8] &= !(1 << (bit % 8));
+    }
+    let Ok(flags) = libc::c_int::try_from(raw_flags) else {
+        return negative_errno(libc::EINVAL);
+    };
+    let allowed = libc::SFD_CLOEXEC | libc::SFD_NONBLOCK;
+    if flags & !allowed != 0 {
+        return negative_errno(libc::EINVAL);
+    }
+
+    let requested_fd = args[0] as libc::c_int;
+    let guest_fd = if requested_fd == -1 {
+        let event_flags = libc::EFD_CLOEXEC
+            | if flags & libc::SFD_NONBLOCK != 0 {
+                libc::EFD_NONBLOCK
+            } else {
+                0
+            };
+        // SAFETY: eventfd validates its bounded flags and returns a new owned fd.
+        let host_fd = unsafe { libc::eventfd(0, event_flags) };
+        if host_fd < 0 {
+            return io_error(std::io::Error::last_os_error());
+        }
+        // SAFETY: eventfd returned a new owned descriptor.
+        let file = unsafe { std::fs::File::from_raw_fd(host_fd) };
+        let guest_fd = insert_file_with_flags(state, file, flags & libc::SFD_CLOEXEC != 0, None);
+        if guest_fd < 0 {
+            return guest_fd;
+        }
+        guest_fd as libc::c_int
+    } else {
+        if flags != 0 {
+            return negative_errno(libc::EINVAL);
+        }
+        let state_lock = state
+            .signalfd_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state_lock.masks.contains_key(&requested_fd) {
+            return negative_errno(libc::EINVAL);
+        }
+        drop(state_lock);
+        requested_fd
+    };
+
+    let ready = {
+        let mut signalfd_state = state
+            .signalfd_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        signalfd_state.masks.insert(guest_fd, mask);
+        signalfd_state
+            .pending
+            .iter()
+            .any(|signal| signal_mask_contains(&mask, *signal))
+    };
+    let file = state
+        .files
+        .get(&guest_fd)
+        .expect("virtual signalfd disappeared after insertion");
+    match set_signalfd_ready(file, ready) {
+        Ok(()) => i64::from(guest_fd),
+        Err(error) => error,
+    }
+}
+
+fn queue_blocked_signal(state: &mut LoadedStaticElf, signal: libc::c_int) -> Result<(), i64> {
+    let matching_fds = {
+        let mut signalfd_state = state
+            .signalfd_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !signalfd_state.pending.insert(signal) {
+            return Ok(());
+        }
+        signalfd_state
+            .masks
+            .iter()
+            .filter_map(|(&fd, mask)| signal_mask_contains(mask, signal).then_some(fd))
+            .collect::<Vec<_>>()
+    };
+    for fd in matching_fds {
+        let Some(file) = state.files.get(&fd) else {
+            continue;
+        };
+        set_signalfd_ready(file, true)?;
+    }
+    Ok(())
+}
+
+// TODO-HUMAN-REVIEW(PR-235): Review virtual signalfd dequeue semantics.
+fn signalfd_read(
+    memory: &mut GuestMemory,
+    state: &mut LoadedStaticElf,
+    fd: libc::c_int,
+    address: u64,
+    length: usize,
+) -> Option<i64> {
+    let mask = state
+        .signalfd_state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .masks
+        .get(&fd)
+        .copied()?;
+    if length < std::mem::size_of::<libc::signalfd_siginfo>() {
+        return Some(negative_errno(libc::EINVAL));
+    }
+    if !range_is_valid(
+        memory,
+        address,
+        std::mem::size_of::<libc::signalfd_siginfo>() as u64,
+    ) {
+        return Some(negative_errno(libc::EFAULT));
+    }
+
+    let (signal, still_ready) = {
+        let mut signalfd_state = state
+            .signalfd_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let signal = signalfd_state
+            .pending
+            .iter()
+            .copied()
+            .find(|signal| signal_mask_contains(&mask, *signal));
+        if let Some(signal) = signal {
+            signalfd_state.pending.remove(&signal);
+        }
+        let still_ready = signalfd_state
+            .pending
+            .iter()
+            .any(|signal| signal_mask_contains(&mask, *signal));
+        (signal, still_ready)
+    };
+    let file = state
+        .files
+        .get(&fd)
+        .expect("virtual signalfd mask exists without a descriptor");
+    if let Err(error) = set_signalfd_ready(file, still_ready) {
+        return Some(error);
+    }
+    let Some(signal) = signal else {
+        return Some(negative_errno(libc::EAGAIN));
+    };
+
+    // SAFETY: signalfd_siginfo is a plain Linux ABI structure and zero is a
+    // valid value for every field not populated by this process-local model.
+    let mut info = unsafe { std::mem::zeroed::<libc::signalfd_siginfo>() };
+    info.ssi_signo = signal as u32;
+    info.ssi_pid = state.pid as u32;
+    info.ssi_uid = 0;
+    let written = write_struct(memory, address, &info);
+    Some(if written < 0 {
+        written
+    } else {
+        std::mem::size_of::<libc::signalfd_siginfo>() as i64
+    })
 }
 
 // TODO-HUMAN-REVIEW(PR-235): Review host-backed KVM timerfd creation semantics.
@@ -6350,6 +6623,7 @@ fn fcntl(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> 
     let source_alias = output_alias(state, guest_fd);
     let source_proc_inode = state.proc_files.get(&guest_fd).copied();
     let source_is_random = state.random_device_fds.contains(&guest_fd);
+    let source_signalfd_mask = signalfd_mask(state, guest_fd);
     let Some(host_fd) = host_fd(state, guest_fd) else {
         return negative_errno(libc::EBADF);
     };
@@ -6365,6 +6639,7 @@ fn fcntl(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> 
                 proc_inode: source_proc_inode,
                 object_inode: source_object_inode,
                 is_random: source_is_random,
+                signalfd_mask: source_signalfd_mask,
             },
         ),
         libc::F_DUPFD_CLOEXEC => duplicate_fd_at_or_above(
@@ -6377,6 +6652,7 @@ fn fcntl(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> 
                 proc_inode: source_proc_inode,
                 object_inode: source_object_inode,
                 is_random: source_is_random,
+                signalfd_mask: source_signalfd_mask,
             },
         ),
         libc::F_GETFL => match fd_status_flags(host_fd) {
@@ -6474,6 +6750,7 @@ fn close(state: &mut LoadedStaticElf, raw_fd: u64) -> i64 {
     if state.files.remove(&fd).is_some() {
         state.cloexec_fds.remove(&fd);
         state.random_device_fds.remove(&fd);
+        replace_signalfd_mask(state, fd, None);
         state.proc_files.remove(&fd);
         state.fd_object_inodes.remove(&fd);
         cleanup_fd_object_inodes(state);
@@ -6487,6 +6764,7 @@ fn close(state: &mut LoadedStaticElf, raw_fd: u64) -> i64 {
         state.closed_standard_fds.insert(fd);
         state.cloexec_fds.remove(&fd);
         state.random_device_fds.remove(&fd);
+        replace_signalfd_mask(state, fd, None);
         state.fd_object_inodes.remove(&fd);
         cleanup_fd_object_inodes(state);
         set_output_alias(state, fd, None);
@@ -7909,7 +8187,7 @@ enum SignalDisposition {
 /// status; ignored, stopped, blocked, or user-handled signals are reported as
 /// accepted without altering control flow.
 // TODO-HUMAN-REVIEW(#95): Review self-signal termination and the default-disposition table.
-fn kill_signal(state: &LoadedStaticElf, number: u64, args: &[u64; 6]) -> SyscallAction {
+fn kill_signal(state: &mut LoadedStaticElf, number: u64, args: &[u64; 6]) -> SyscallAction {
     // tgkill(tgid, tid, sig) carries the signal in its third argument, whereas
     // kill(pid, sig) and tkill(tid, sig) carry it in the second.
     let (target, raw_signal) = if number == libc::SYS_tgkill as u64 {
@@ -7946,9 +8224,12 @@ fn kill_signal(state: &LoadedStaticElf, number: u64, args: &[u64; 6]) -> Syscall
         return SyscallAction::Exit(128 + signal);
     }
 
-    // A blocked signal stays pending; this guest kernel does not queue pending
-    // signals, so report success without terminating.
+    // A blocked signal becomes process-pending and wakes any matching virtual
+    // signalfd without entering the supervisor's host signal machinery.
     if signal_is_blocked(state, signal) {
+        if let Err(error) = queue_blocked_signal(state, signal) {
+            return continue_with(error);
+        }
         return continue_with(0);
     }
 
@@ -8491,6 +8772,7 @@ mod tests {
             signal_actions: BTreeMap::new(),
             signal_mask: [0; KERNEL_SIGSET_SIZE],
             signal_alt_stack: None,
+            signalfd_state: Arc::new(std::sync::Mutex::new(crate::elf::SignalFdState::default())),
             robust_list_head: 0,
             robust_list_len: 0,
             files: BTreeMap::new(),
@@ -13048,6 +13330,126 @@ mod tests {
     }
 
     #[test]
+    fn signalfd_queues_blocked_self_signal_and_reports_readiness() {
+        const MASK: u64 = 0x100;
+        const POLL_FD: u64 = 0x140;
+        const INFO: u64 = 0x180;
+
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let pid = state.pid;
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let mut mask = [0u8; KERNEL_SIGSET_SIZE];
+        let bit = (libc::SIGUSR1 - 1) as usize;
+        mask[bit / 8] |= 1 << (bit % 8);
+        memory.write(MASK, &mask).unwrap();
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_rt_sigprocmask,
+                [
+                    libc::SIG_BLOCK as u64,
+                    MASK,
+                    0,
+                    KERNEL_SIGSET_SIZE as u64,
+                    0,
+                    0,
+                ],
+            ),
+            0
+        );
+
+        let signal_fd = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_signalfd4,
+            [
+                u64::MAX,
+                MASK,
+                KERNEL_SIGSET_SIZE as u64,
+                (libc::SFD_CLOEXEC | libc::SFD_NONBLOCK) as u64,
+                0,
+                0,
+            ],
+        );
+        assert_eq!(signal_fd, 3);
+        let mut poll_fd = libc::pollfd {
+            fd: signal_fd as libc::c_int,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(write_struct(&mut memory, POLL_FD, &poll_fd), 0);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_poll,
+                [POLL_FD, 1, 0, 0, 0, 0],
+            ),
+            0
+        );
+
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_kill,
+                [pid as u64, libc::SIGUSR1 as u64, 0, 0, 0, 0],
+            ),
+            0
+        );
+        assert_eq!(write_struct(&mut memory, POLL_FD, &poll_fd), 0);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_poll,
+                [POLL_FD, 1, 0, 0, 0, 0],
+            ),
+            1
+        );
+        poll_fd = read_struct(&memory, POLL_FD);
+        assert_eq!(poll_fd.revents, libc::POLLIN);
+
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_read,
+                [
+                    signal_fd as u64,
+                    INFO,
+                    std::mem::size_of::<libc::signalfd_siginfo>() as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            std::mem::size_of::<libc::signalfd_siginfo>() as i64
+        );
+        let info: libc::signalfd_siginfo = read_struct(&memory, INFO);
+        assert_eq!(info.ssi_signo, libc::SIGUSR1 as u32);
+        assert_eq!(info.ssi_pid, pid as u32);
+
+        let poll_fd = libc::pollfd {
+            fd: signal_fd as libc::c_int,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(write_struct(&mut memory, POLL_FD, &poll_fd), 0);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_poll,
+                [POLL_FD, 1, 0, 0, 0, 0],
+            ),
+            0
+        );
+    }
+
+    #[test]
     fn standard_input_access_checks_precede_memory_validation() {
         const PAYLOAD: u64 = 0x100;
 
@@ -16081,20 +16483,14 @@ mod tests {
     #[test]
     fn self_directed_fatal_signal_terminates_with_conventional_status() {
         let dir = TestDir::new();
-        let state = test_state(&dir.0);
+        let mut state = test_state(&dir.0);
+        let pid = state.pid;
 
         // abort() raises SIGABRT via tgkill(pid, tid, SIGABRT).
         let action = kill_signal(
-            &state,
+            &mut state,
             libc::SYS_tgkill as u64,
-            &[
-                state.pid as u64,
-                state.pid as u64,
-                libc::SIGABRT as u64,
-                0,
-                0,
-                0,
-            ],
+            &[pid as u64, pid as u64, libc::SIGABRT as u64, 0, 0, 0],
         );
         match action {
             SyscallAction::Exit(code) => assert_eq!(code, 128 + libc::SIGABRT),
@@ -16105,16 +16501,17 @@ mod tests {
     #[test]
     fn kill_and_tkill_self_fatal_signals_terminate() {
         let dir = TestDir::new();
-        let state = test_state(&dir.0);
+        let mut state = test_state(&dir.0);
+        let pid = state.pid;
 
         for (number, args) in [
             (
                 libc::SYS_kill,
-                [state.pid as u64, libc::SIGSEGV as u64, 0, 0, 0, 0],
+                [pid as u64, libc::SIGSEGV as u64, 0, 0, 0, 0],
             ),
             (
                 libc::SYS_tkill,
-                [state.pid as u64, libc::SIGKILL as u64, 0, 0, 0, 0],
+                [pid as u64, libc::SIGKILL as u64, 0, 0, 0, 0],
             ),
             // kill(-1, SIGTERM) broadcasts to a set that includes ourselves.
             (
@@ -16122,7 +16519,7 @@ mod tests {
                 [(-1i64) as u64, libc::SIGTERM as u64, 0, 0, 0, 0],
             ),
         ] {
-            match kill_signal(&state, number as u64, &args) {
+            match kill_signal(&mut state, number as u64, &args) {
                 SyscallAction::Exit(_) => {}
                 _ => panic!("expected Exit for syscall {number}"),
             }
@@ -16132,23 +16529,24 @@ mod tests {
     #[test]
     fn ignored_and_probe_signals_do_not_terminate() {
         let dir = TestDir::new();
-        let state = test_state(&dir.0);
+        let mut state = test_state(&dir.0);
+        let pid = state.pid;
 
         // Signal 0 is a liveness probe.
         assert!(matches!(
             kill_signal(
-                &state,
+                &mut state,
                 libc::SYS_kill as u64,
-                &[state.pid as u64, 0, 0, 0, 0, 0],
+                &[pid as u64, 0, 0, 0, 0, 0],
             ),
             SyscallAction::Continue { result: 0, .. }
         ));
         // SIGWINCH is ignored by default.
         assert!(matches!(
             kill_signal(
-                &state,
+                &mut state,
                 libc::SYS_kill as u64,
-                &[state.pid as u64, libc::SIGWINCH as u64, 0, 0, 0, 0],
+                &[pid as u64, libc::SIGWINCH as u64, 0, 0, 0, 0],
             ),
             SyscallAction::Continue { result: 0, .. }
         ));
@@ -16158,6 +16556,7 @@ mod tests {
     fn installed_handler_and_blocked_signal_are_not_terminating() {
         let dir = TestDir::new();
         let mut state = test_state(&dir.0);
+        let pid = state.pid;
 
         // A user handler that we cannot deliver must not terminate the process.
         state
@@ -16165,28 +16564,30 @@ mod tests {
             .insert(libc::SIGTERM, custom_action(0x4000));
         assert!(matches!(
             kill_signal(
-                &state,
+                &mut state,
                 libc::SYS_kill as u64,
-                &[state.pid as u64, libc::SIGTERM as u64, 0, 0, 0, 0],
+                &[pid as u64, libc::SIGTERM as u64, 0, 0, 0, 0],
             ),
             SyscallAction::Continue { result: 0, .. }
         ));
 
         // A blocked fatal signal stays pending rather than terminating.
         let mut blocked = test_state(&dir.0);
+        let blocked_pid = blocked.pid;
         let bit = (libc::SIGINT - 1) as usize;
         blocked.signal_mask[bit / 8] |= 1 << (bit % 8);
         assert!(matches!(
             kill_signal(
-                &blocked,
+                &mut blocked,
                 libc::SYS_kill as u64,
-                &[blocked.pid as u64, libc::SIGINT as u64, 0, 0, 0, 0],
+                &[blocked_pid as u64, libc::SIGINT as u64, 0, 0, 0, 0],
             ),
             SyscallAction::Continue { result: 0, .. }
         ));
 
         // SIGKILL ignores both the mask and any installed handler.
         let mut unkillable = test_state(&dir.0);
+        let unkillable_pid = unkillable.pid;
         unkillable
             .signal_actions
             .insert(libc::SIGKILL, custom_action(0x1));
@@ -16194,9 +16595,9 @@ mod tests {
         unkillable.signal_mask[bit / 8] |= 1 << (bit % 8);
         assert!(matches!(
             kill_signal(
-                &unkillable,
+                &mut unkillable,
                 libc::SYS_kill as u64,
-                &[unkillable.pid as u64, libc::SIGKILL as u64, 0, 0, 0, 0],
+                &[unkillable_pid as u64, libc::SIGKILL as u64, 0, 0, 0, 0],
             ),
             SyscallAction::Exit(_)
         ));
@@ -16205,12 +16606,13 @@ mod tests {
     #[test]
     fn signals_to_other_processes_report_esrch() {
         let dir = TestDir::new();
-        let state = test_state(&dir.0);
+        let mut state = test_state(&dir.0);
+        let foreign_pid = state.pid + 1;
 
         match kill_signal(
-            &state,
+            &mut state,
             libc::SYS_kill as u64,
-            &[(state.pid + 1) as u64, libc::SIGTERM as u64, 0, 0, 0, 0],
+            &[foreign_pid as u64, libc::SIGTERM as u64, 0, 0, 0, 0],
         ) {
             SyscallAction::Continue {
                 result,

@@ -97,6 +97,14 @@ pub(crate) struct GuestFileIdentityTable {
     pub objects: std::collections::BTreeMap<(libc::dev_t, libc::ino_t), GuestFileIdentityEntry>,
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-235): Review process-local virtual signalfd state.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SignalFdState {
+    pub masks: std::collections::BTreeMap<i32, [u8; 8]>,
+    pub pending: std::collections::BTreeSet<i32>,
+}
+
 #[derive(Debug)]
 pub(crate) struct LoadedStaticElf {
     pub entry_point: u64,
@@ -138,6 +146,7 @@ pub(crate) struct LoadedStaticElf {
     pub signal_actions: std::collections::BTreeMap<i32, [u8; 32]>,
     pub signal_mask: [u8; 8],
     pub signal_alt_stack: Option<Vec<u8>>,
+    pub signalfd_state: std::sync::Arc<std::sync::Mutex<SignalFdState>>,
     // AUTONOMOUS-BOT-IMPLEMENTED: Track the task-local robust futex registration.
     // TODO-HUMAN-REVIEW(PR-232): Review robust-list fork and exec lifecycle semantics.
     pub robust_list_head: u64,
@@ -181,6 +190,12 @@ impl LoadedStaticElf {
             .iter()
             .map(|(&fd, file)| Ok((fd, file.try_clone()?)))
             .collect::<Result<_>>()?;
+        let signalfd_masks = self
+            .signalfd_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .masks
+            .clone();
         Ok(Self {
             entry_point: self.entry_point,
             stack_pointer: self.stack_pointer,
@@ -231,6 +246,10 @@ impl LoadedStaticElf {
             signal_actions: self.signal_actions.clone(),
             signal_mask: self.signal_mask,
             signal_alt_stack: self.signal_alt_stack.clone(),
+            signalfd_state: std::sync::Arc::new(std::sync::Mutex::new(SignalFdState {
+                masks: signalfd_masks,
+                pending: std::collections::BTreeSet::new(),
+            })),
             robust_list_head: 0,
             robust_list_len: 0,
             files,
@@ -249,6 +268,11 @@ impl LoadedStaticElf {
     // TODO-HUMAN-REVIEW(PR-136): Review live identity filtering across exec.
     pub(crate) fn inherit_process_state(&mut self, previous: Self) {
         let cloexec_fds = previous.cloexec_fds;
+        let previous_signalfd_state = previous
+            .signalfd_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         let mut stdin = previous.stdin;
         let files: std::collections::BTreeMap<_, _> = previous
             .files
@@ -280,6 +304,14 @@ impl LoadedStaticElf {
             .into_iter()
             .filter(|(fd, _)| files.contains_key(fd))
             .collect();
+        let signalfd_state = SignalFdState {
+            masks: previous_signalfd_state
+                .masks
+                .into_iter()
+                .filter(|(fd, _)| files.contains_key(fd))
+                .collect(),
+            pending: previous_signalfd_state.pending,
+        };
         let file_identity_table = previous.file_identity_table.clone();
         {
             let mut table = file_identity_table
@@ -338,6 +370,7 @@ impl LoadedStaticElf {
         self.ioprio = previous.ioprio;
         self.signal_actions = signal_actions;
         self.signal_mask = previous.signal_mask;
+        self.signalfd_state = std::sync::Arc::new(std::sync::Mutex::new(signalfd_state));
         self.robust_list_head = 0;
         self.robust_list_len = 0;
         self.files = files;
@@ -564,6 +597,7 @@ fn load_executable(
         signal_actions: std::collections::BTreeMap::new(),
         signal_mask: [0; 8],
         signal_alt_stack: None,
+        signalfd_state: std::sync::Arc::new(std::sync::Mutex::new(SignalFdState::default())),
         robust_list_head: 0,
         robust_list_len: 0,
         files: std::collections::BTreeMap::new(),
