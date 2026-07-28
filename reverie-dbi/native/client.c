@@ -955,11 +955,22 @@ static int32_t read_memory(uintptr_t address, uint8_t *out, size_t size) {
 }
 
 // TODO-HUMAN-REVIEW(PR-234): Review the fault-safe DBI memory-write callback ABI.
+// TODO-HUMAN-REVIEW(PR-PENDING): Review page-bounded partial-write semantics.
 static size_t write_memory(uintptr_t address, const uint8_t *value, size_t size) {
-  size_t bytes_written = 0;
-  if (address != 0)
-    dr_safe_write((void *)address, size, value, &bytes_written);
-  return bytes_written;
+  size_t total = 0;
+  const size_t page_size = dr_page_size();
+  while (address != 0 && total < size && address <= UINTPTR_MAX - total) {
+    const uintptr_t current = address + total;
+    const size_t page_remaining = page_size - current % page_size;
+    const size_t segment = size - total < page_remaining ? size - total
+                                                         : page_remaining;
+    size_t bytes_written = 0;
+    dr_safe_write((void *)current, segment, value + total, &bytes_written);
+    total += bytes_written;
+    if (bytes_written != segment)
+      break;
+  }
+  return total;
 }
 
 static void init_virtual_limits(void) {
