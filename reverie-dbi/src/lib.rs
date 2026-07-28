@@ -84,7 +84,7 @@ pub type RegisterWriter = unsafe extern "C" fn(usize, *const libc::user_regs_str
 /// Native callback used to copy application memory with DynamoRIO fault handling.
 pub type MemoryReader = unsafe extern "C" fn(usize, *mut u8, usize) -> i32;
 
-// TODO-HUMAN-REVIEW(PR-PENDING): Review the fault-safe DBI memory-write callback ABI.
+// TODO-HUMAN-REVIEW(PR-234): Review the fault-safe DBI memory-write callback ABI.
 /// Native callback used to write application memory with DynamoRIO fault handling.
 /// Returns the number of bytes written before the first guest-memory fault.
 pub type MemoryWriter = unsafe extern "C" fn(usize, *const u8, usize) -> usize;

@@ -954,7 +954,7 @@ static int32_t read_memory(uintptr_t address, uint8_t *out, size_t size) {
   return read_app((const void *)address, out, size) ? 1 : 0;
 }
 
-// TODO-HUMAN-REVIEW(PR-PENDING): Review the fault-safe DBI memory-write callback ABI.
+// TODO-HUMAN-REVIEW(PR-234): Review the fault-safe DBI memory-write callback ABI.
 static size_t write_memory(uintptr_t address, const uint8_t *value, size_t size) {
   size_t bytes_written = 0;
   if (address != 0)
