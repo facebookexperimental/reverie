@@ -338,6 +338,15 @@ fn execute_basic_syscall_with_output(
     } else if number == libc::SYS_eventfd2 as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         eventfd2(state, args[0], args[1])
+    } else if number == libc::SYS_timerfd_create as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        timerfd_create(state, args[0], args[1])
+    } else if number == libc::SYS_timerfd_settime as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        timerfd_settime(memory, state, args)
+    } else if number == libc::SYS_timerfd_gettime as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        timerfd_gettime(memory, state, args)
     } else if number == libc::SYS_pidfd_open as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-235): Review self-only virtual pidfd translation.
@@ -967,6 +976,9 @@ fn mutates_file_table(number: u64) -> bool {
             || number == libc::SYS_epoll_create1 as u64
             || number == libc::SYS_eventfd as u64
             || number == libc::SYS_eventfd2 as u64
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-235): Review timerfd descriptor-table serialization.
+            || number == libc::SYS_timerfd_create as u64
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-235): Review pidfd descriptor-table serialization.
             || number == libc::SYS_pidfd_open as u64
@@ -3613,6 +3625,90 @@ fn eventfd2(state: &mut LoadedStaticElf, initial: u64, raw_flags: u64) -> i64 {
     // SAFETY: eventfd returned a new owned descriptor.
     let file = unsafe { std::fs::File::from_raw_fd(host_fd) };
     insert_file_with_flags(state, file, flags & libc::EFD_CLOEXEC != 0, None)
+}
+
+// TODO-HUMAN-REVIEW(PR-235): Review host-backed KVM timerfd creation semantics.
+fn timerfd_create(state: &mut LoadedStaticElf, raw_clock_id: u64, raw_flags: u64) -> i64 {
+    let Ok(clock_id) = libc::c_int::try_from(raw_clock_id) else {
+        return negative_errno(libc::EINVAL);
+    };
+    let Ok(flags) = libc::c_int::try_from(raw_flags) else {
+        return negative_errno(libc::EINVAL);
+    };
+    let allowed = libc::TFD_CLOEXEC | libc::TFD_NONBLOCK;
+    if flags & !allowed != 0 {
+        return negative_errno(libc::EINVAL);
+    }
+
+    // Keep the supervisor descriptor private even if the guest did not request
+    // CLOEXEC; guest descriptor flags are modeled separately.
+    let host_fd = unsafe { libc::timerfd_create(clock_id, flags | libc::TFD_CLOEXEC) };
+    if host_fd < 0 {
+        return io_error(std::io::Error::last_os_error());
+    }
+    // SAFETY: timerfd_create returned a new owned descriptor.
+    let file = unsafe { std::fs::File::from_raw_fd(host_fd) };
+    insert_file_with_flags(state, file, flags & libc::TFD_CLOEXEC != 0, None)
+}
+
+// TODO-HUMAN-REVIEW(PR-235): Review host-backed KVM timerfd control semantics.
+fn timerfd_settime(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    let Some(host_fd) = host_fd(state, args[0] as libc::c_int) else {
+        return negative_errno(libc::EBADF);
+    };
+    let Ok(flags) = libc::c_int::try_from(args[1]) else {
+        return negative_errno(libc::EINVAL);
+    };
+    let new_value = match read_guest_struct::<libc::itimerspec>(memory, args[2]) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let mut old_value = libc::itimerspec {
+        it_interval: libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+        it_value: libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+    };
+    let old_value_ptr = if args[3] == 0 {
+        std::ptr::null_mut()
+    } else {
+        &mut old_value
+    };
+    // SAFETY: host_fd is live, new_value is initialized, and old_value_ptr is
+    // either null or points to writable local storage.
+    if unsafe { libc::timerfd_settime(host_fd, flags, &new_value, old_value_ptr) } != 0 {
+        return io_error(std::io::Error::last_os_error());
+    }
+    if args[3] != 0 {
+        return write_struct(memory, args[3], &old_value);
+    }
+    0
+}
+
+// TODO-HUMAN-REVIEW(PR-235): Review host-backed KVM timerfd query semantics.
+fn timerfd_gettime(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    let Some(host_fd) = host_fd(state, args[0] as libc::c_int) else {
+        return negative_errno(libc::EBADF);
+    };
+    let mut current = libc::itimerspec {
+        it_interval: libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+        it_value: libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+    };
+    // SAFETY: host_fd is live and current points to writable local storage.
+    if unsafe { libc::timerfd_gettime(host_fd, &mut current) } != 0 {
+        return io_error(std::io::Error::last_os_error());
+    }
+    write_struct(memory, args[1], &current)
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -12775,6 +12871,129 @@ mod tests {
             ),
             negative_errno(libc::ESRCH)
         );
+    }
+
+    #[test]
+    fn timerfd_round_trips_flags_and_expiration() {
+        const TIMER: u64 = 0x100;
+        const CURRENT: u64 = 0x140;
+        const POLL_FD: u64 = 0x180;
+        const EXPIRATIONS: u64 = 0x1c0;
+
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let timerfd = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_timerfd_create,
+            [
+                libc::CLOCK_MONOTONIC as u64,
+                (libc::TFD_CLOEXEC | libc::TFD_NONBLOCK) as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+        assert_eq!(timerfd, 3);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_fcntl,
+                [timerfd as u64, libc::F_GETFD as u64, 0, 0, 0, 0],
+            ),
+            i64::from(libc::FD_CLOEXEC)
+        );
+        assert_ne!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_fcntl,
+                [timerfd as u64, libc::F_GETFL as u64, 0, 0, 0, 0],
+            ) & i64::from(libc::O_NONBLOCK),
+            0
+        );
+
+        let timer = libc::itimerspec {
+            it_interval: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            // One nanosecond after boot is always in the past for the host
+            // monotonic clock, so an absolute one-shot becomes ready now.
+            it_value: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 1,
+            },
+        };
+        assert_eq!(write_struct(&mut memory, TIMER, &timer), 0);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_timerfd_settime,
+                [
+                    timerfd as u64,
+                    libc::TFD_TIMER_ABSTIME as u64,
+                    TIMER,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            0
+        );
+
+        let poll_fd = libc::pollfd {
+            fd: timerfd as libc::c_int,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(write_struct(&mut memory, POLL_FD, &poll_fd), 0);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_poll,
+                [POLL_FD, 1, 0, 0, 0, 0],
+            ),
+            1
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_read,
+                [
+                    timerfd as u64,
+                    EXPIRATIONS,
+                    std::mem::size_of::<u64>() as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            std::mem::size_of::<u64>() as i64
+        );
+        let expirations: u64 = read_struct(&memory, EXPIRATIONS);
+        assert!(expirations >= 1);
+
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_timerfd_gettime,
+                [timerfd as u64, CURRENT, 0, 0, 0, 0],
+            ),
+            0
+        );
+        let current: libc::itimerspec = read_struct(&memory, CURRENT);
+        assert_eq!(current.it_interval.tv_sec, 0);
+        assert_eq!(current.it_interval.tv_nsec, 0);
+        assert_eq!(current.it_value.tv_sec, 0);
+        assert_eq!(current.it_value.tv_nsec, 0);
     }
 
     #[test]
