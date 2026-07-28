@@ -7,6 +7,21 @@ repository = "https://github.com/facebookexperimental/reverie"
 license = "BSD-2-Clause"
 build = "build.rs"
 
+# Mirrors reverie-liteinst: the crate is both an rlib (for the ptrace-hosted
+# backend and tests) and a cdylib (the ld-preload runtime injected into the
+# guest). Only patch timing and trampoline placement differ between the two
+# ld-preload backends; the injection substrate is identical.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# `preload-constructor` gates the `.init_array` entry that arms the in-guest
+# runtime, exactly as in reverie-liteinst. Default-on so the cdylib self-installs
+# when the loader maps it; disable it for pure-rlib consumers (e.g. the ptrace
+# host and unit tests) that call `install_runtime` explicitly.
+[features]
+default = ["preload-constructor"]
+preload-constructor = []
+
 [dependencies]
 anyhow = "1.0.103"
 goblin = { version = "0.10.7", features = ["elf64"] }
