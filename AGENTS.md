@@ -118,7 +118,7 @@ BRANCH=impl-example
 
 git -C "$PRIMARY" status --short --branch
 git -C "$SLOT" status --short --branch
-HTTPS_PROXY=http://fwdproxy:8080 git -C "$SLOT" fetch origin
+git -C "$SLOT" fetch origin
 git -C "$SLOT" switch --detach origin/main
 git -C "$SLOT" switch -c "$BRANCH"
 ```
@@ -327,11 +327,11 @@ feature branches -> rrnewton/reverie main -> periodic upstream pull request
   use a reviewed pull request or an explicitly authorized fast-forward.
 - Never force-push `main`, rewrite shared branches, or merge around failing CI.
 
-Use the required proxy for networked Git and GitHub CLI commands:
+In Meta environments, use appropriate proxies for accessing the web.
 
 ```bash
-HTTPS_PROXY=http://fwdproxy:8080 git fetch origin
-HTTPS_PROXY=http://fwdproxy:8080 gh pr view -R rrnewton/reverie <number>
+git fetch origin
+gh pr view -R rrnewton/reverie <number>
 ```
 
 ## Task Closure Policy

@@ -35,10 +35,11 @@ produced 70 passes, three unsupported tests, and the same three baseline failure
 level, no relaxations) passed all 147 strict compatibility probes with:
 
 ```bash
-cd /home/newton/work/dev-hermit/worktrees/slot126
-env HERMIT_SABRE_RUNNER=/home/newton/work/dev-hermit/worktrees_reverie/slot126/target/release/reverie-sabre-strace \
-  HERMIT_SABRE_BINARY=/home/newton/work/dev-hermit/worktrees_reverie/slot126/third-party/sabre/build-default/sabre \
-  HERMIT_SABRE_PLUGIN=/home/newton/work/dev-hermit/worktrees_reverie/slot126/target/release/libreverie_sabre_strace_plugin.so \
+SLOT="$HOME/<repo>/worktrees/<slot>"
+cd "$SLOT/hermit"
+env HERMIT_SABRE_RUNNER="$SLOT/reverie/target/release/reverie-sabre-strace" \
+  HERMIT_SABRE_BINARY="$SLOT/reverie/third-party/sabre/build-default/sabre" \
+  HERMIT_SABRE_PLUGIN="$SLOT/reverie/target/release/libreverie_sabre_strace_plugin.so" \
   VALIDATE_GATE_TIMEOUT_SECONDS=1800 with-proxy ./validate.sh --sabre-compat-only
 ```
 
