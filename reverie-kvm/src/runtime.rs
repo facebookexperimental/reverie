@@ -47,6 +47,7 @@ use crate::bootstrap::configure_process_syscall_return;
 use crate::bootstrap::set_user_segment_base;
 use crate::executor::ElfExecutor;
 use crate::executor::ProcessAction;
+use crate::executor::is_thread_clone_request;
 
 const GUEST_PID: i32 = 1;
 const STACK_CAPACITY: usize = 4096;
@@ -1047,7 +1048,12 @@ impl KvmBackend {
             let request = SyscallRequest::read_from(&memory, frame_address)?;
             let syscall = request.into_syscall()?;
             // TODO-HUMAN-REVIEW(PR-156): Review root process-syscall Tool dispatch.
-            let backend_owned = is_backend_owned_syscall(request.number());
+            // KVM CLONE_THREAD workers currently execute directly through the
+            // backend personality. Sending only the parent through Detcore's
+            // clone handler waits forever for a child Tool start that this
+            // direct-worker path cannot issue.
+            let backend_owned = is_backend_owned_syscall(request.number())
+                || is_thread_clone_request(&request, &memory);
             let subscribed = !backend_owned
                 && subscriptions
                     .iter_syscalls()

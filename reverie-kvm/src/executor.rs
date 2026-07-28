@@ -226,6 +226,20 @@ pub(crate) fn is_process_syscall(number: u64) -> bool {
         || number == libc::SYS_wait4 as u64
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-216): Review direct-worker classification for CLONE_THREAD.
+pub(crate) fn is_thread_clone_request(request: &SyscallRequest, memory: &GuestMemory) -> bool {
+    if request.number() == libc::SYS_clone as u64 {
+        return request.args()[0] & libc::CLONE_THREAD as u64 != 0;
+    }
+    if request.number() == libc::SYS_clone3 as u64 {
+        let args = request.args();
+        return read_clone3(memory, args[0], args[1])
+            .is_ok_and(|clone| clone.flags & libc::CLONE_THREAD as u64 != 0);
+    }
+    false
+}
+
 #[cfg(test)]
 pub(crate) fn execute_basic_syscall(
     memory: &mut GuestMemory,
@@ -13149,6 +13163,18 @@ mod tests {
             [CLONE3_ARGS, clone3.len() as u64, 0, 0, 0, 0],
         );
 
+        assert!(is_thread_clone_request(&request, &memory));
+        let legacy_thread = SyscallRequest::new(
+            libc::SYS_clone as u64,
+            [THREAD_CLONE_REQUIRED_FLAGS, CHILD_STACK, 0, 0, TLS, 0],
+        );
+        assert!(is_thread_clone_request(&legacy_thread, &memory));
+        let process_clone = SyscallRequest::new(
+            libc::SYS_clone as u64,
+            [libc::SIGCHLD as u64, 0, 0, 0, 0, 0],
+        );
+        assert!(!is_thread_clone_request(&process_clone, &memory));
+
         assert_eq!(executor.execute_process_action(&request, &memory), Some(2));
         match executor.take_process_action() {
             Some(ProcessAction::Thread {
@@ -13282,6 +13308,7 @@ mod tests {
             libc::SYS_clone3 as u64,
             [CLONE3_ARGS, clone3.len() as u64, 0, 0, 0, 0],
         );
+        assert!(!is_thread_clone_request(&request, &memory));
         assert_eq!(executor.execute_process_action(&request, &memory), Some(2));
         match executor.take_process_action() {
             Some(ProcessAction::Fork {
