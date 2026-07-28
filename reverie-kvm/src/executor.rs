@@ -642,10 +642,6 @@ fn execute_basic_syscall_with_output(
         mprotect(memory, args)
     } else if number == libc::SYS_madvise as u64 {
         validate_range(memory, args[0], args[1])
-    } else if number == libc::SYS_msync as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-231): Review deterministic mapped-range msync semantics.
-        msync(memory, args)
     } else if number == libc::SYS_munlock as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         munlock_guest_range(memory, args[0], args[1])
@@ -6824,34 +6820,6 @@ fn validate_range(memory: &GuestMemory, address: u64, length: u64) -> i64 {
     } else {
         0
     }
-}
-
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-231): Review deterministic mapped-range msync semantics.
-fn msync(memory: &GuestMemory, args: &[u64; 6]) -> i64 {
-    let address = args[0];
-    let requested_length = args[1];
-    let flags = args[2] as libc::c_int;
-    let allowed_flags = libc::MS_ASYNC | libc::MS_INVALIDATE | libc::MS_SYNC;
-    if !address.is_multiple_of(PAGE_SIZE)
-        || flags & !allowed_flags != 0
-        || flags & libc::MS_ASYNC != 0 && flags & libc::MS_SYNC != 0
-    {
-        return negative_errno(libc::EINVAL);
-    }
-    if requested_length == 0 {
-        return 0;
-    }
-    let Some(length) = align_up(requested_length, PAGE_SIZE) else {
-        return negative_errno(libc::ENOMEM);
-    };
-    if !range_is_valid(memory, address, length) || !memory.user_range_is_mapped(address, length) {
-        return negative_errno(libc::ENOMEM);
-    }
-
-    // KVM's flat guest-memory model has no host page-cache association. A
-    // validated mapping is already coherent with the only guest-visible copy.
-    0
 }
 
 // TODO-HUMAN-REVIEW(PR-145): Review flat guest-memory munlock validation semantics.
@@ -13208,73 +13176,6 @@ mod tests {
         let mut bytes = [0; 3];
         memory.read(0x200, &mut bytes).unwrap();
         assert_eq!(&bytes, b"new");
-    }
-
-    #[test]
-    fn msync_validates_flags_alignment_and_mapped_ranges() {
-        let root = TestDir::new();
-        let mut state = test_state(&root.0);
-        let memory_size = BOOT_RESERVED_END + 4 * PAGE_SIZE;
-        let mut memory = GuestMemory::new(0, memory_size as usize).unwrap();
-        state.mmap_next = BOOT_RESERVED_END + PAGE_SIZE;
-        state.mmap_limit = memory_size;
-        let mapping = syscall_result(
-            &mut memory,
-            &mut state,
-            libc::SYS_mmap,
-            [
-                0,
-                PAGE_SIZE,
-                (libc::PROT_READ | libc::PROT_WRITE) as u64,
-                (libc::MAP_SHARED | libc::MAP_ANONYMOUS) as u64,
-                -1_i32 as u64,
-                0,
-            ],
-        ) as u64;
-
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_msync,
-                [mapping, PAGE_SIZE, libc::MS_SYNC as u64, 0, 0, 0],
-            ),
-            0
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_msync,
-                [mapping + 1, PAGE_SIZE, libc::MS_SYNC as u64, 0, 0, 0],
-            ),
-            negative_errno(libc::EINVAL)
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_msync,
-                [
-                    mapping,
-                    PAGE_SIZE,
-                    (libc::MS_ASYNC | libc::MS_SYNC) as u64,
-                    0,
-                    0,
-                    0,
-                ],
-            ),
-            negative_errno(libc::EINVAL)
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_msync,
-                [mapping, 2 * PAGE_SIZE, libc::MS_SYNC as u64, 0, 0, 0],
-            ),
-            negative_errno(libc::ENOMEM)
-        );
     }
 
     #[test]
