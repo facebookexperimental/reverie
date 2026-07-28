@@ -955,7 +955,7 @@ static int32_t read_memory(uintptr_t address, uint8_t *out, size_t size) {
 }
 
 // TODO-HUMAN-REVIEW(PR-234): Review the fault-safe DBI memory-write callback ABI.
-// TODO-HUMAN-REVIEW(PR-PENDING): Review page-bounded partial-write semantics.
+// TODO-HUMAN-REVIEW(PR-237): Review page-bounded partial-write semantics.
 static size_t write_memory(uintptr_t address, const uint8_t *value, size_t size) {
   size_t total = 0;
   const size_t page_size = dr_page_size();
