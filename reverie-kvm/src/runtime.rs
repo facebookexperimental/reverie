@@ -166,7 +166,7 @@ struct StaticElfSyscallExecutor<'a> {
 impl<T: Tool> GuestSyscallExecutor<T> for StaticElfSyscallExecutor<'_> {
     fn execute(&mut self, request: &SyscallRequest, memory: &GuestMemory) -> i64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TBD): Review synthetic initial exec completion.
+        // TODO-HUMAN-REVIEW(PR-233): Review synthetic initial exec completion.
         if matches!(
             &self.process_context,
             ProcessExecutionContext::InitialExec(expected) if expected == request
@@ -725,7 +725,7 @@ fn initial_exec_request(memory: &GuestMemory, stack_pointer: u64) -> Result<Sysc
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Review synthetic initial exec Tool delivery.
+// TODO-HUMAN-REVIEW(PR-233): Review synthetic initial exec Tool delivery.
 #[allow(clippy::too_many_arguments)]
 async fn run_initial_exec_handler<T: Tool>(
     backend: &mut KvmBackend,

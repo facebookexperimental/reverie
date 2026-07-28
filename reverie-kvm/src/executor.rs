@@ -1395,7 +1395,7 @@ impl ElfExecutor {
         &self.state.auxv
     }
 
-    // TODO-HUMAN-REVIEW(PR-TBD): Review exposing the initial stack for synthetic exec delivery.
+    // TODO-HUMAN-REVIEW(PR-233): Review exposing the initial stack for synthetic exec delivery.
     pub(crate) fn initial_stack_pointer(&self) -> u64 {
         self.state.stack_pointer
     }
