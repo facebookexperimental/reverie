@@ -289,6 +289,14 @@ fn duplicate_stdin() -> Result<Option<File>> {
     }
 }
 
+fn validate_root_pid(pid: i32) -> Result<i32> {
+    if pid > 0 {
+        Ok(pid)
+    } else {
+        Err(Error::InvalidGuestPid(pid))
+    }
+}
+
 /// A single-vCPU KVM backend used to exercise the syscall transport.
 pub struct KvmBackend {
     // Field order ensures the vCPU and VM are dropped before registered memory.
@@ -305,6 +313,7 @@ pub struct KvmBackend {
     is_guest_thread: bool,
     pub(crate) static_elf: Option<LoadedStaticElf>,
     stdin: Option<File>,
+    pub(crate) root_pid: i32,
 }
 
 struct KvmProcessSnapshot {
@@ -402,7 +411,24 @@ impl KvmBackend {
             is_guest_thread: false,
             static_elf: None,
             stdin,
+            root_pid: 1,
         })
+    }
+
+    /// Selects the root process identity exposed to the guest and Reverie tool.
+    ///
+    /// The default is PID 1. Call this before running a tool when its process
+    /// model reserves a different deterministic root identity.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TBD): Review configurable KVM root process identity.
+    pub fn set_root_pid(&mut self, pid: i32) -> Result<()> {
+        let pid = validate_root_pid(pid)?;
+        self.root_pid = pid;
+        if let Some(loaded) = self.static_elf.as_mut() {
+            loaded.pid = pid;
+            loaded.tid = pid;
+        }
+        Ok(())
     }
 
     /// Installs an arbitrary real-mode program and selects it as the vCPU entry point.
@@ -470,6 +496,8 @@ impl KvmBackend {
         cwd: &Path,
     ) -> Result<()> {
         let mut loaded = load_static_elf(&mut self.memory, image, argv, envp, cwd)?;
+        loaded.pid = self.root_pid;
+        loaded.tid = self.root_pid;
         loaded.stdin = self.stdin.as_ref().map(File::try_clone).transpose()?;
         configure_long_mode(
             &mut self.memory,
@@ -1244,6 +1272,20 @@ fn supported_hypercall_instruction(cpuid: &CpuId) -> Result<[u8; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_guest_pid_must_be_positive() {
+        assert_eq!(validate_root_pid(1).unwrap(), 1);
+        assert_eq!(validate_root_pid(3).unwrap(), 3);
+        assert!(matches!(
+            validate_root_pid(0),
+            Err(Error::InvalidGuestPid(0))
+        ));
+        assert!(matches!(
+            validate_root_pid(-1),
+            Err(Error::InvalidGuestPid(-1))
+        ));
+    }
 
     #[test]
     fn guest_thread_transport_slots_are_bounded_and_reusable() {

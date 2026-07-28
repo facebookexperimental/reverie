@@ -48,6 +48,10 @@ pub enum Error {
         size: usize,
     },
 
+    /// Linux process identifiers must be positive.
+    #[error("invalid KVM root guest PID {0}")]
+    InvalidGuestPid(i32),
+
     /// A guest-memory access fell outside the registered mapping.
     #[error(
         "guest memory access is out of bounds: address={address:#x}, length={length:#x}, mapping={guest_base:#x}..{guest_end:#x}"

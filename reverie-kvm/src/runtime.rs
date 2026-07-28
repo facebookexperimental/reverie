@@ -49,7 +49,6 @@ use crate::executor::ElfExecutor;
 use crate::executor::ProcessAction;
 use crate::executor::is_thread_clone_request;
 
-const GUEST_PID: i32 = 1;
 const STACK_CAPACITY: usize = 4096;
 const TOOL_STACK_BOTTOM: u64 = TOOL_STACK_TOP - STACK_CAPACITY as u64;
 
@@ -712,7 +711,7 @@ impl KvmBackend {
         T: Tool,
         E: SyscallExecutor,
     {
-        let pid = Pid::from_raw(GUEST_PID);
+        let pid = Pid::from_raw(self.root_pid);
         let global_state = T::GlobalState::init_global_state(&config).await;
         let tool = T::new(pid, &config);
         let subscriptions = T::subscriptions(&config);
@@ -857,7 +856,7 @@ impl KvmBackend {
         if capture_output {
             loaded.stdin = Some(std::fs::File::open("/dev/null")?);
         }
-        let pid = Pid::from_raw(GUEST_PID);
+        let pid = Pid::from_raw(self.root_pid);
         let global_state = T::GlobalState::init_global_state(&config).await;
         let tool = T::new(pid, &config);
         let subscriptions = T::subscriptions(&config);

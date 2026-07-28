@@ -994,6 +994,7 @@ impl AddressSpaceState {
 
 impl ElfExecutor {
     pub(crate) fn new(state: LoadedStaticElf, capture_output: bool) -> Self {
+        let next_pid = state.pid.saturating_add(1);
         let address_space = Arc::new(std::sync::Mutex::new(AddressSpaceState::from_elf(&state)));
         let file_table = Arc::new(std::sync::Mutex::new(
             FileTableState::try_from_elf(&state).expect("clone initial KVM file table"),
@@ -1004,7 +1005,7 @@ impl ElfExecutor {
             file_table,
             output: capture_output.then(CapturedOutput::default),
             owns_output: true,
-            next_pid: Arc::new(AtomicI32::new(2)),
+            next_pid: Arc::new(AtomicI32::new(next_pid)),
             process_action: None,
             pending_segment: None,
             exit_code: None,
