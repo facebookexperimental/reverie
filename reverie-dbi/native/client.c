@@ -62,7 +62,7 @@ typedef struct {
 #define VIRTUAL_IDENTITY_FD 197
 #define CLIENT_THREAD_START_FAILURE_EXIT_CODE 125
 #define DBI_DIAGNOSTIC_FD 198
-#define VIRTUAL_IDENTITY_MAGIC UINT64_C(0x5245565049443031)
+#define VIRTUAL_IDENTITY_MAGIC UINT64_C(0x5245565049443032)
 #define MAX_VIRTUAL_IDENTITIES 8192
 
 typedef struct {
@@ -74,6 +74,9 @@ typedef struct {
   uint64_t magic;
   atomic_flag lock;
   _Atomic int32_t next_virtual_id;
+  /* The launch-time descriptor identity survives exec, unlike numeric fd 0. */
+  bool initial_stdin_valid;
+  struct stat initial_stdin;
   size_t count;
   virtual_identity_t identities[MAX_VIRTUAL_IDENTITIES];
 } virtual_identity_state_t;
@@ -279,6 +282,8 @@ static void initialize_virtual_identity_state(void) {
   virtual_identity_state->magic = VIRTUAL_IDENTITY_MAGIC;
   atomic_flag_clear(&virtual_identity_state->lock);
   atomic_init(&virtual_identity_state->next_virtual_id, VIRTUAL_ROOT_PID + 1);
+  virtual_identity_state->initial_stdin_valid =
+      fstat(STDIN_FILENO, &virtual_identity_state->initial_stdin) == 0;
 }
 
 static void virtual_identity_lock(void) {
@@ -1339,35 +1344,17 @@ static void module_load(void *drcontext, const module_data_t *module,
 }
 
 static bool fd_matches_stdin(void *drcontext, int fd) {
-  if (fd == 0)
-    return true;
 #ifdef SYS_fstat
-  struct stat stdin_stat = {0};
   struct stat candidate_stat = {0};
-  uint64_t stat_args[6] = {0, (uint64_t)(uintptr_t)&stdin_stat};
+  uint64_t stat_args[6] = {(uint64_t)fd,
+                           (uint64_t)(uintptr_t)&candidate_stat};
+  if (!virtual_identity_state->initial_stdin_valid)
+    return false;
   if (invoke_syscall((uintptr_t)drcontext, SYS_fstat, stat_args) < 0)
     return false;
-  stat_args[0] = (uint64_t)fd;
-  stat_args[1] = (uint64_t)(uintptr_t)&candidate_stat;
-  if (invoke_syscall((uintptr_t)drcontext, SYS_fstat, stat_args) < 0)
-    return false;
-  if (stdin_stat.st_dev == candidate_stat.st_dev &&
-      stdin_stat.st_ino == candidate_stat.st_ino)
-    return true;
-#if defined(SYS_ioctl) && defined(TIOCGDEV)
-  unsigned int stdin_device = 0;
-  unsigned int candidate_device = 0;
-  uint64_t ioctl_args[6] = {0, TIOCGDEV, (uint64_t)(uintptr_t)&stdin_device};
-  if (invoke_syscall((uintptr_t)drcontext, SYS_ioctl, ioctl_args) < 0)
-    return false;
-  ioctl_args[0] = (uint64_t)fd;
-  ioctl_args[2] = (uint64_t)(uintptr_t)&candidate_device;
-  if (invoke_syscall((uintptr_t)drcontext, SYS_ioctl, ioctl_args) < 0)
-    return false;
-  return stdin_device == candidate_device;
-#else
-  return false;
-#endif
+  return virtual_identity_state->initial_stdin.st_dev == candidate_stat.st_dev &&
+         virtual_identity_state->initial_stdin.st_ino == candidate_stat.st_ino &&
+         virtual_identity_state->initial_stdin.st_rdev == candidate_stat.st_rdev;
 #else
   return false;
 #endif
