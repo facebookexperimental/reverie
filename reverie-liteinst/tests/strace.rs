@@ -13,10 +13,13 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
+use reverie_liteinst::BuiltinTool;
 use reverie_liteinst::COMPAT_EVENT_COOKIE_ENV;
 use reverie_liteinst::COMPAT_EVENT_FD_ENV;
 use reverie_liteinst::PreloadTool;
+use reverie_liteinst::SPOOF_PID;
 use reverie_liteinst::configure_command;
+use reverie_liteinst::configure_command_builtin;
 
 const TEST_EVENT_COOKIE: u64 = 7_915_913_731_959_187_131;
 const TEST_EVENT_FD_ENV: &str = "REVERIE_LITEINST_TEST_EVENT_FD";
@@ -34,6 +37,15 @@ fn run_compat_guest(program: &str, arguments: &[&str]) -> Output {
     let mut command = Command::new(program);
     command.args(arguments);
     configure_command(&mut command, PreloadTool::Compatibility).unwrap();
+    command.output().unwrap()
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-252): Review shared built-in guest harness.
+fn run_builtin_guest(tool: BuiltinTool, program: &str, arguments: &[&str]) -> Output {
+    let mut command = Command::new(program);
+    command.args(arguments);
+    configure_command_builtin(&mut command, tool).unwrap();
     command.output().unwrap()
 }
 
@@ -492,4 +504,53 @@ fn exec_fails_closed_before_runtime_is_replaced() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("syscall(59,"));
     assert!(stderr.contains("= -95"));
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-252): Review shared spoof-getpid built-in behavior test.
+#[test]
+fn spoof_getpid_builtin_mutates_getpid_result() {
+    let output = run_builtin_guest(
+        BuiltinTool::SpoofGetpid,
+        env!("CARGO_BIN_EXE_reverie-liteinst-spoof-guest"),
+        &[],
+    );
+    assert!(
+        output.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The shared built-in installs via reverie_preload::install_builtin and
+    // rewrites the trapped getpid result: the LiteInst trap path MUTATED a
+    // syscall return value, not merely observed it.
+    assert_eq!(output.stdout, format!("getpid={SPOOF_PID}\n").as_bytes());
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-252): Review shared passthrough built-in behavior test.
+#[test]
+fn passthrough_builtin_preserves_getpid_result() {
+    let output = run_builtin_guest(
+        BuiltinTool::Passthrough,
+        env!("CARGO_BIN_EXE_reverie-liteinst-spoof-guest"),
+        &[],
+    );
+    assert!(
+        output.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let pid: i64 = stdout
+        .strip_prefix("getpid=")
+        .and_then(|value| value.trim_end().parse().ok())
+        .unwrap_or_else(|| panic!("unexpected guest output: {stdout:?}"));
+    // The passthrough built-in leaves the real result intact; a real PID is a
+    // small positive value and never the spoof sentinel.
+    assert!(pid > 0, "expected a real pid, got {pid}");
+    assert_ne!(pid, SPOOF_PID, "passthrough must not spoof getpid");
 }

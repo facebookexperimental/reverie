@@ -22,6 +22,19 @@ pub mod rpc;
 mod runtime;
 mod tool_host;
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-252): Review shared reverie-preload built-in re-exports.
+/// Shared `reverie-preload` built-in tool enum and getpid spoof constant.
+///
+/// These are re-exported verbatim so LiteInst and e9patch present the same
+/// built-in surface; the same [`BuiltinTool`] value installs the same dispatcher
+/// in both backends via `reverie_preload::install_builtin`.
+pub use reverie_preload::BuiltinTool;
+pub use reverie_preload::SPOOF_PID;
+/// `REVERIE_LITEINST_TOOL` values and parser for shared built-in selection.
+pub use runtime::TOOL_PASSTHROUGH;
+pub use runtime::TOOL_SPOOF_GETPID;
+pub use runtime::builtin_tool_from_env_value;
 pub use tool_host::install_tool;
 pub use tool_host::install_tool_from_bootstrap;
 
@@ -108,6 +121,35 @@ pub fn configure_command(command: &mut Command, tool: PreloadTool) -> io::Result
     command
         .env("LD_PRELOAD", preload)
         .env("REVERIE_LITEINST_TOOL", tool.as_str());
+    Ok(())
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-252): Review shared built-in command configuration.
+/// Maps a shared [`BuiltinTool`] to its `REVERIE_LITEINST_TOOL` selector value.
+fn builtin_tool_env_value(tool: BuiltinTool) -> &'static str {
+    match tool {
+        BuiltinTool::Passthrough => TOOL_PASSTHROUGH,
+        BuiltinTool::SpoofGetpid => TOOL_SPOOF_GETPID,
+    }
+}
+
+/// Configures a guest command to load the runtime and select a shared built-in.
+///
+/// This is the built-in analog of [`configure_command`]: it sets `LD_PRELOAD`
+/// and `REVERIE_LITEINST_TOOL` to a shared `reverie-preload` [`BuiltinTool`]
+/// selector, so the runtime installs the built-in verbatim through
+/// `reverie_preload::install_builtin` (no LiteInst patching). It mirrors
+/// e9patch's launcher-side built-in configuration.
+pub fn configure_command_builtin(command: &mut Command, tool: BuiltinTool) -> io::Result<()> {
+    let mut preload = preload_library_path()?.into_os_string();
+    if let Some(existing) = env::var_os("LD_PRELOAD").filter(|value| !value.is_empty()) {
+        preload.push(OsStr::new(":"));
+        preload.push(existing);
+    }
+    command
+        .env("LD_PRELOAD", preload)
+        .env("REVERIE_LITEINST_TOOL", builtin_tool_env_value(tool));
     Ok(())
 }
 

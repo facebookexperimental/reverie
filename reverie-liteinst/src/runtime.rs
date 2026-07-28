@@ -16,6 +16,7 @@ use liteinst2::trampoline::HookContext;
 use liteinst2::trampoline::HookSite;
 use liteinst2::trampoline::InstalledHook;
 use liteinst2::trampoline::TrampolineArena;
+use reverie_preload::BuiltinTool;
 use reverie_preload::dispatch::SyscallDispatcher;
 use reverie_preload::dispatch::SyscallEvent as PreloadSyscallEvent;
 use reverie_preload::lifecycle::InProcessSeccomp;
@@ -30,6 +31,13 @@ const SYS_IO_PGETEVENTS: i64 = 333;
 const TOOL_STRACE: u8 = 1;
 const TOOL_COMPAT: u8 = 2;
 const TOOL_REVERIE: u8 = 3;
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-252): Review shared reverie-preload built-in tool selection.
+/// `REVERIE_LITEINST_TOOL` value selecting the shared passthrough built-in.
+pub const TOOL_PASSTHROUGH: &str = "passthrough";
+/// `REVERIE_LITEINST_TOOL` value selecting the shared getpid-spoofing built-in.
+pub const TOOL_SPOOF_GETPID: &str = "spoof-getpid";
 const EVENT_CHANNEL_IDENTITY_FAILURE_STATUS: i32 = 120;
 const EVENT_CHANNEL_WRITE_FAILURE_STATUS: i32 = 121;
 const MAX_PATCH_SITES: usize = 4096;
@@ -104,8 +112,55 @@ pub(crate) struct SyscallEvent {
     pub(crate) context: usize,
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-252): Review shared reverie-preload built-in tool parser.
+/// Parses a shared `reverie-preload` [`BuiltinTool`] from a `REVERIE_LITEINST_TOOL`
+/// value, returning `None` for the LiteInst-native `strace`/`compat` modes and
+/// any other value.
+///
+/// This is the LiteInst analog of e9patch's `builtin_tool_from_env_value`: it
+/// lets the single `REVERIE_LITEINST_TOOL` selector name a shared built-in
+/// installed verbatim through [`reverie_preload::install_builtin`], bypassing the
+/// LiteInst patching dispatcher.
+pub fn builtin_tool_from_env_value(value: &OsStr) -> Option<BuiltinTool> {
+    match value.to_str()? {
+        TOOL_PASSTHROUGH => Some(BuiltinTool::Passthrough),
+        TOOL_SPOOF_GETPID => Some(BuiltinTool::SpoofGetpid),
+        _ => None,
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-252): Review shared built-in installation entry point.
+/// Installs a shared `reverie-preload` built-in tool verbatim.
+///
+/// Unlike [`install_runtime`], this does NOT prepare LiteInst instrumentation:
+/// the shared built-ins install their own SIGSYS handler and seccomp filter via
+/// [`reverie_preload::install_builtin`] and do not patch syscall sites. This
+/// proves the LiteInst fallback/trap path can service and MUTATE a syscall
+/// result (for example `getpid` -> `SPOOF_PID`), matching e9patch's
+/// `install_builtin_runtime`.
+///
+/// # Safety
+///
+/// The dynamic loader must call this exactly once before application threads
+/// start; it installs process-wide, irreversible seccomp state.
+pub(crate) unsafe fn install_builtin_runtime(tool: BuiltinTool) -> io::Result<()> {
+    unsafe { reverie_preload::install_builtin(tool) }
+}
+
 pub(crate) fn initialize_from_environment() -> io::Result<()> {
-    let mode = match std::env::var_os("REVERIE_LITEINST_TOOL").as_deref() {
+    let tool_value = std::env::var_os("REVERIE_LITEINST_TOOL");
+    // Prefer a shared reverie-preload built-in when the selector names one, so a
+    // single env var is a superset of the LiteInst-native strace/compat modes
+    // (matches e9patch's single TOOL_ENV selecting shared built-ins).
+    if let Some(value) = tool_value.as_deref()
+        && let Some(tool) = builtin_tool_from_env_value(value)
+    {
+        // SAFETY: the loader calls this once before application threads start.
+        return unsafe { install_builtin_runtime(tool) };
+    }
+    let mode = match tool_value.as_deref() {
         None => return Ok(()),
         Some(value) if value == OsStr::new("strace") => TOOL_STRACE,
         Some(value) if value == OsStr::new("compat") => TOOL_COMPAT,
@@ -1371,6 +1426,9 @@ impl StackLine {
 #[cfg(test)]
 mod tests {
     use core::sync::atomic::Ordering;
+    use std::ffi::OsStr;
+
+    use reverie_preload::BuiltinTool;
 
     use super::MAX_PATCH_SITES;
     use super::SITE_ACTIVE;
@@ -1380,12 +1438,31 @@ mod tests {
     use super::SITES;
     use super::SiteSlot;
     use super::StackLine;
+    use super::TOOL_PASSTHROUGH;
+    use super::TOOL_SPOOF_GETPID;
+    use super::builtin_tool_from_env_value;
     use super::claim_site;
     use super::clone_is_fork_like;
     use super::fallback_dispatch_count;
     use super::fallback_syscall_count;
     use super::mark_site_range_stale;
     use super::record_fallback_dispatch;
+
+    #[test]
+    fn builtin_tool_selector_maps_shared_values_only() {
+        assert_eq!(
+            builtin_tool_from_env_value(OsStr::new(TOOL_PASSTHROUGH)),
+            Some(BuiltinTool::Passthrough)
+        );
+        assert_eq!(
+            builtin_tool_from_env_value(OsStr::new(TOOL_SPOOF_GETPID)),
+            Some(BuiltinTool::SpoofGetpid)
+        );
+        // LiteInst-native modes and unknown values are not shared built-ins.
+        assert_eq!(builtin_tool_from_env_value(OsStr::new("strace")), None);
+        assert_eq!(builtin_tool_from_env_value(OsStr::new("compat")), None);
+        assert_eq!(builtin_tool_from_env_value(OsStr::new("bogus")), None);
+    }
 
     #[test]
     fn recording_a_fallback_bumps_total_and_the_matching_syscall() {

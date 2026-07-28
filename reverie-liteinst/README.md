@@ -43,6 +43,26 @@ Built-in `strace` and compatibility modes remain available through
 `configure_command`. They use the same shared preload and LiteInst hook path
 without a coordinator.
 
+### Shared `reverie-preload` built-in tools
+
+The single `REVERIE_LITEINST_TOOL` selector is a superset of the
+LiteInst-native `strace`/`compat` modes: it also accepts the shared
+`reverie-preload` built-ins `passthrough` and `spoof-getpid`, selected through
+`configure_command_builtin(&mut Command, BuiltinTool)`. When one of these values
+is set, the runtime installs the built-in verbatim through
+`reverie_preload::install_builtin` — it does **not** run the LiteInst patching
+dispatcher or prepare instrumentation. This is the LiteInst analog of the
+e9patch built-in selector, so the same `BuiltinTool` value installs the same
+shared dispatcher in both backends.
+
+`spoof-getpid` proves the fallback/trap path can service **and mutate** a
+syscall result: a raw `getpid` returns `reverie_preload::SPOOF_PID` instead of
+the real PID, while `passthrough` leaves the result unchanged. The
+`reverie-liteinst-spoof-guest` fixture and the
+`spoof_getpid_builtin_mutates_getpid_result` /
+`passthrough_builtin_preserves_getpid_result` tests in `tests/strace.rs` cover
+both.
+
 ## Current boundaries
 
 - Dynamically linked, non-`AT_SECURE` Linux x86-64 guests only.
