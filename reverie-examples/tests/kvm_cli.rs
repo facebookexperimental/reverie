@@ -168,6 +168,20 @@ fn production_example_clis_run_real_program_with_kvm_guest() {
     assert!(false_status.stdout.is_empty());
     assert!(false_status.stderr.is_empty());
 
+    let awk = run(
+        env!("CARGO_BIN_EXE_noop"),
+        &[
+            "--runner",
+            "kvm",
+            "--no-host-envs",
+            "/usr/bin/awk",
+            "BEGIN { print 42 }",
+        ],
+    );
+    assert_success(&awk);
+    assert_eq!(awk.stdout, b"42\n");
+    assert!(awk.stderr.is_empty());
+
     let cat = run_with_stdin(
         env!("CARGO_BIN_EXE_noop"),
         &["--runner", "kvm", "--no-host-envs", "/bin/cat"],

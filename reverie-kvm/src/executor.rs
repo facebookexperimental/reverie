@@ -5388,6 +5388,9 @@ fn mincore(memory: &mut GuestMemory, args: &[u64; 6]) -> i64 {
     {
         return negative_errno(libc::EINVAL);
     }
+    if !memory.user_range_is_mapped(address, length) {
+        return negative_errno(libc::ENOMEM);
+    }
     let Some(page_count) = length.checked_add(PAGE_SIZE - 1).map(|n| n / PAGE_SIZE) else {
         return negative_errno(libc::ENOMEM);
     };
@@ -12182,6 +12185,10 @@ mod tests {
         let root = TestDir::new();
         let mut state = test_state(&root.0);
         let mut memory = GuestMemory::new(0, (5 * PAGE_SIZE) as usize).unwrap();
+        memory
+            .map_user_range(PAGE_SIZE, 2 * PAGE_SIZE, false)
+            .unwrap();
+        memory.map_user_range(VECTOR, PAGE_SIZE, false).unwrap();
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -12277,6 +12284,15 @@ mod tests {
             0
         );
         assert_eq!(read_guest_bytes::<2>(&memory, VECTOR).unwrap(), [1, 1]);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_mincore,
+                [3 * PAGE_SIZE, PAGE_SIZE, VECTOR, 0, 0, 0],
+            ),
+            negative_errno(libc::ENOMEM)
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
