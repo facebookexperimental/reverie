@@ -644,7 +644,7 @@ fn execute_basic_syscall_with_output(
         validate_range(memory, args[0], args[1])
     } else if number == libc::SYS_msync as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(reverie-kvm): Review deterministic mapped-range msync semantics.
+        // TODO-HUMAN-REVIEW(PR-231): Review deterministic mapped-range msync semantics.
         msync(memory, args)
     } else if number == libc::SYS_munlock as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -5575,7 +5575,7 @@ fn synthetic_proc_content(state: &LoadedStaticElf, path: &[u8]) -> Option<Vec<u8
         .as_bytes()
         .to_vec(),
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(reverie-kvm): Review parity with Hermit's configured memory persona.
+        // TODO-HUMAN-REVIEW(PR-231): Review parity with Hermit's configured memory persona.
         b"/proc/meminfo" => concat!(
             "MemTotal:         976562 kB\n",
             "MemFree:          976562 kB\n",
@@ -6827,7 +6827,7 @@ fn validate_range(memory: &GuestMemory, address: u64, length: u64) -> i64 {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(reverie-kvm): Review deterministic mapped-range msync semantics.
+// TODO-HUMAN-REVIEW(PR-231): Review deterministic mapped-range msync semantics.
 fn msync(memory: &GuestMemory, args: &[u64; 6]) -> i64 {
     let address = args[0];
     let requested_length = args[1];
