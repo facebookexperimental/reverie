@@ -283,7 +283,7 @@ impl DbiRunner {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Review coordinated owned-input pumping.
+    // TODO-HUMAN-REVIEW(PR-247): Review coordinated owned-input pumping.
     /// Runs `guest` with captured output, replayable input, and one shared global.
     pub async fn output_with_detached_reader_and_global<G, R>(
         &self,
@@ -311,7 +311,7 @@ impl DbiRunner {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Review coordinated inherited-stdin capture.
+    // TODO-HUMAN-REVIEW(PR-247): Review coordinated inherited-stdin capture.
     /// Runs `guest` with captured output, inherited stdin, and one shared global.
     pub async fn output_with_inherited_stdin_and_global<G>(
         &self,
@@ -401,7 +401,7 @@ impl DbiRunner {
         .map_err(|error| io::Error::other(error.to_string()))?;
 
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TBD): Review native external-global capability propagation.
+        // TODO-HUMAN-REVIEW(PR-247): Review native external-global capability propagation.
         // The root records this explicit capability in shared state before any
         // fork. Copied DynamoRIO runtimes cannot reliably re-read Rust's
         // process environment after fork.
