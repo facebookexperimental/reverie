@@ -2060,21 +2060,30 @@ fn open_file(
     if path.is_empty() {
         return negative_errno(libc::ENOENT);
     }
+    let relative_proc_path = synthetic_proc_relative_path(state, guest_dirfd, &path);
+    let path = relative_proc_path.as_deref().unwrap_or(&path);
+    let flags = u64::from(raw_flags as libc::c_int as u32) & LEGACY_OPEN_FLAGS;
+    let close_on_exec = flags & libc::O_CLOEXEC as u64 != 0;
+    if is_synthetic_proc_directory(state, path) {
+        return open_synthetic_proc_directory(state, flags, close_on_exec);
+    }
     // Serve the synthetic /proc surface before touching the host filesystem, so
     // deterministic content replaces the deliberately-refused real procfs.
-    if let Some(content) = synthetic_proc_content(state, &path) {
-        let flags = u64::from(raw_flags as libc::c_int as u32) & LEGACY_OPEN_FLAGS;
+    if let Some(content) = synthetic_proc_content(state, path) {
         if flags & libc::O_ACCMODE as u64 != libc::O_RDONLY as u64 {
             return negative_errno(libc::EACCES);
         }
         let normalized =
-            normalize_proc_path(state, &path).expect("a synthesized /proc path always normalizes");
-        let close_on_exec = flags & libc::O_CLOEXEC as u64 != 0;
+            normalize_proc_path(state, path).expect("a synthesized /proc path always normalizes");
         return open_synthetic_proc(state, &normalized, &content, close_on_exec);
     }
-    let flags = u64::from(raw_flags as libc::c_int as u32) & LEGACY_OPEN_FLAGS;
-    let guest_cloexec = flags & libc::O_CLOEXEC as u64 != 0;
-    if let Some(guest_fd) = guest_fd_path(state, &path) {
+    // A relative lookup beneath the synthetic directory must never fall
+    // through to the harmless host directory that backs the descriptor.
+    if relative_proc_path.is_some() {
+        return negative_errno(libc::ENOENT);
+    }
+    let guest_cloexec = close_on_exec;
+    if let Some(guest_fd) = guest_fd_path(state, path) {
         return open_guest_fd_path(state, guest_fd, flags, guest_cloexec);
     }
     if path == b"/dev/random" || path == b"/dev/urandom" {
@@ -2088,7 +2097,7 @@ fn open_file(
     if path == b"/proc/self/loginuid" {
         return open_virtual_file(state, b"0", flags, guest_cloexec);
     }
-    let Ok((host_dirfd, path)) = host_dirfd_and_path(state, guest_dirfd, &path) else {
+    let Ok((host_dirfd, path)) = host_dirfd_and_path(state, guest_dirfd, path) else {
         return negative_errno(libc::EBADF);
     };
     let uses_mode = flags & libc::O_CREAT as u64 != 0
@@ -4278,6 +4287,7 @@ fn synthetic_proc_inode(path: &[u8]) -> u64 {
 // TODO-HUMAN-REVIEW(PR-136): Review synthetic procfd link reconstruction.
 fn synthetic_proc_path_for_inode(inode: u64) -> Option<&'static [u8]> {
     const PATHS: &[&[u8]] = &[
+        b"/proc",
         b"/proc/uptime",
         b"/proc/loadavg",
         b"/proc/version",
@@ -4295,6 +4305,33 @@ fn synthetic_proc_path_for_inode(inode: u64) -> Option<&'static [u8]> {
         .iter()
         .copied()
         .find(|path| synthetic_proc_inode(path) == inode)
+}
+
+fn is_synthetic_proc_directory_inode(inode: u64) -> bool {
+    inode == synthetic_proc_inode(b"/proc")
+}
+
+fn is_synthetic_proc_directory(state: &LoadedStaticElf, path: &[u8]) -> bool {
+    normalize_proc_path(state, path).is_some_and(|path| path == b"/proc")
+}
+
+// TODO-HUMAN-REVIEW(PR-202): Review descriptor-relative synthetic procfs
+// resolution and its fail-closed handling of unlisted children.
+fn synthetic_proc_relative_path(
+    state: &LoadedStaticElf,
+    guest_dirfd: libc::c_int,
+    path: &[u8],
+) -> Option<Vec<u8>> {
+    if path.starts_with(b"/") {
+        return None;
+    }
+    let inode = state.proc_files.get(&guest_dirfd).copied()?;
+    if !is_synthetic_proc_directory_inode(inode) {
+        return None;
+    }
+    let mut resolved = b"/proc/".to_vec();
+    resolved.extend_from_slice(path);
+    Some(resolved)
 }
 
 /// Rewrite a `/proc/<pid>` path (for this guest's own pid) to the canonical
@@ -4469,17 +4506,53 @@ fn open_synthetic_proc(
     guest_fd
 }
 
+// TODO-HUMAN-REVIEW(PR-202): Review the empty synthetic /proc directory used
+// solely as an openat anchor for allowlisted deterministic children.
+fn open_synthetic_proc_directory(
+    state: &mut LoadedStaticElf,
+    flags: u64,
+    close_on_exec: bool,
+) -> i64 {
+    let unsupported =
+        (libc::O_CREAT | libc::O_EXCL | libc::O_PATH | libc::O_TMPFILE | libc::O_TRUNC) as u64;
+    if flags & unsupported != 0 {
+        return negative_errno(libc::EINVAL);
+    }
+    if flags & libc::O_ACCMODE as u64 != libc::O_RDONLY as u64 {
+        return negative_errno(libc::EISDIR);
+    }
+    let file = match std::fs::File::open("/") {
+        Ok(file) => file,
+        Err(error) => return io_error(error),
+    };
+    let guest_fd = insert_file_with_flags(state, file, close_on_exec, None);
+    if guest_fd >= 0 {
+        state
+            .proc_files
+            .insert(guest_fd as libc::c_int, synthetic_proc_inode(b"/proc"));
+    }
+    guest_fd
+}
+
 /// Overwrite the nondeterministic fields of a memfd `stat` with the stable
 /// synthetic identity of a /proc file, keeping the (deterministic) size.
 fn sanitize_proc_stat(stat: &mut libc::stat, inode: u64) {
+    let is_directory = is_synthetic_proc_directory_inode(inode);
     stat.st_dev = synthetic_dev(SYNTHETIC_PROC_DEV_MINOR);
     stat.st_ino = inode;
-    stat.st_mode = libc::S_IFREG | 0o444;
-    stat.st_nlink = 1;
+    stat.st_mode = if is_directory {
+        libc::S_IFDIR | 0o555
+    } else {
+        libc::S_IFREG | 0o444
+    };
+    stat.st_nlink = if is_directory { 2 } else { 1 };
     stat.st_uid = 0;
     stat.st_gid = 0;
     stat.st_rdev = 0;
     stat.st_blksize = PAGE_SIZE as libc::blksize_t;
+    if is_directory {
+        stat.st_size = 0;
+    }
     // 512-byte blocks, rounded up. A shift avoids the still-unstable
     // int_roundings `div_ceil` on the pinned toolchain (512 == 1 << 9).
     stat.st_blocks = (stat.st_size + 511) >> 9;
@@ -4513,13 +4586,18 @@ fn synthetic_proc_statx(inode: u64, size: u64) -> libc::statx {
         | libc::STATX_SIZE
         | libc::STATX_BLOCKS;
     stx.stx_blksize = PAGE_SIZE as u32;
-    stx.stx_nlink = 1;
+    let is_directory = is_synthetic_proc_directory_inode(inode);
+    stx.stx_nlink = if is_directory { 2 } else { 1 };
     stx.stx_uid = 0;
     stx.stx_gid = 0;
-    stx.stx_mode = (libc::S_IFREG | 0o444) as u16;
+    stx.stx_mode = if is_directory {
+        (libc::S_IFDIR | 0o555) as u16
+    } else {
+        (libc::S_IFREG | 0o444) as u16
+    };
     stx.stx_ino = inode;
-    stx.stx_size = size;
-    stx.stx_blocks = (size + 511) >> 9;
+    stx.stx_size = if is_directory { 0 } else { size };
+    stx.stx_blocks = (stx.stx_size + 511) >> 9;
     stx.stx_dev_major = SYNTHETIC_DEV_MAJOR;
     stx.stx_dev_minor = SYNTHETIC_PROC_DEV_MINOR;
     stx
@@ -4615,6 +4693,13 @@ fn getdents64(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]
     };
     if let Err(error) = ensure_directory(file) {
         return error;
+    }
+    if state
+        .proc_files
+        .get(&fd)
+        .is_some_and(|inode| is_synthetic_proc_directory_inode(*inode))
+    {
+        return 0;
     }
     if length >= 24 && !range_is_valid(memory, args[1], length as u64) {
         return negative_errno(libc::EFAULT);
@@ -6933,6 +7018,69 @@ mod tests {
             content.starts_with(b"MemTotal:"),
             "{}",
             String::from_utf8_lossy(&content)
+        );
+    }
+
+    #[test]
+    fn synthetic_proc_directory_resolves_relative_allowlisted_files() {
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, 0x4000).unwrap();
+
+        let proc_fd = open_readonly(&mut memory, &mut state, "/proc");
+        assert!(proc_fd >= 0, "open /proc failed: {proc_fd}");
+
+        let stat_address = 0x1000;
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_fstat,
+                [proc_fd as u64, stat_address, 0, 0, 0, 0]
+            ),
+            0
+        );
+        let stat: libc::stat = read_struct(&memory, stat_address);
+        assert_eq!(stat.st_mode, libc::S_IFDIR | 0o555);
+
+        write_c_string(&mut memory, 0x100, "cpuinfo");
+        let cpuinfo_fd = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_openat,
+            [proc_fd as u64, 0x100, libc::O_RDONLY as u64, 0, 0, 0],
+        );
+        assert!(cpuinfo_fd >= 0, "openat cpuinfo failed: {cpuinfo_fd}");
+        let content = read_fd_to_end(&mut memory, &mut state, cpuinfo_fd);
+        assert!(
+            content.starts_with(b"processor\t: 0\n"),
+            "{}",
+            String::from_utf8_lossy(&content)
+        );
+
+        for path in ["self/maps", "../etc/passwd"] {
+            write_c_string(&mut memory, 0x100, path);
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_openat,
+                    [proc_fd as u64, 0x100, libc::O_RDONLY as u64, 0, 0, 0],
+                ),
+                negative_errno(libc::ENOENT),
+                "unlisted relative proc path leaked through: {path}"
+            );
+        }
+
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_getdents64,
+                [proc_fd as u64, 0x2000, 0x400, 0, 0, 0]
+            ),
+            0,
+            "the intentionally unenumerable synthetic directory must appear empty"
         );
     }
 
