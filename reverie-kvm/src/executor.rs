@@ -944,17 +944,32 @@ impl FileTableState {
         })
     }
 
+    // TODO-HUMAN-REVIEW(PR-235): Review stable host-fd preservation during table sync.
     fn install(&self, state: &mut LoadedStaticElf) -> std::io::Result<()> {
         state.stdin = self
             .stdin
             .as_ref()
             .map(std::fs::File::try_clone)
             .transpose()?;
-        state.files = self
-            .files
-            .iter()
-            .map(|(&fd, file)| Ok((fd, file.try_clone()?)))
-            .collect::<std::io::Result<_>>()?;
+        let mut previous_files = std::mem::take(&mut state.files);
+        let mut installed_files = std::collections::BTreeMap::new();
+        for (&fd, shared_file) in &self.files {
+            let same_object = state
+                .fd_object_inodes
+                .get(&fd)
+                .zip(self.fd_object_inodes.get(&fd))
+                .is_some_and(|(previous, shared)| Arc::ptr_eq(previous, shared));
+            let file = if same_object {
+                match previous_files.remove(&fd) {
+                    Some(file) => file,
+                    None => shared_file.try_clone()?,
+                }
+            } else {
+                shared_file.try_clone()?
+            };
+            installed_files.insert(fd, file);
+        }
+        state.files = installed_files;
         state.random_device_fds.clone_from(&self.random_device_fds);
         state.stdout_alias_fds.clone_from(&self.stdout_alias_fds);
         state.stderr_alias_fds.clone_from(&self.stderr_alias_fds);
@@ -10652,6 +10667,42 @@ mod tests {
             ),
             0
         );
+
+        let event_host_fd = state.files.get(&(event_fd as i32)).unwrap().as_raw_fd();
+        let epoll_host_fd = state.files.get(&(epoll_fd as i32)).unwrap().as_raw_fd();
+        let shared_files = FileTableState::try_from_elf(&state).unwrap();
+        shared_files.install(&mut state).unwrap();
+        assert_eq!(
+            state.files.get(&(event_fd as i32)).unwrap().as_raw_fd(),
+            event_host_fd
+        );
+        assert_eq!(
+            state.files.get(&(epoll_fd as i32)).unwrap().as_raw_fd(),
+            epoll_host_fd
+        );
+
+        let modified = libc::epoll_event {
+            events: (libc::EPOLLIN | libc::EPOLLONESHOT) as u32,
+            u64: 99,
+        };
+        assert_eq!(write_struct(&mut memory, EVENTS, &modified), 0);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_epoll_ctl,
+                [
+                    epoll_fd as u64,
+                    libc::EPOLL_CTL_MOD as u64,
+                    event_fd as u64,
+                    EVENTS,
+                    0,
+                    0,
+                ]
+            ),
+            0
+        );
+        drop(shared_files);
         assert_eq!(
             syscall_result(
                 &mut memory,
