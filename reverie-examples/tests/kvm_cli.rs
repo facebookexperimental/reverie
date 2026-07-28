@@ -19,6 +19,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::process::Output;
 use std::process::Stdio;
+use std::time::Duration;
+use std::time::Instant;
 
 fn kvm_available() -> bool {
     match OpenOptions::new().read(true).write(true).open("/dev/kvm") {
@@ -94,6 +96,37 @@ fn assert_success(output: &Output) {
         output.status,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+fn median_runtime(binary: &str, arguments: &[&str]) -> Duration {
+    const SAMPLES: usize = 3;
+
+    let mut samples = Vec::with_capacity(SAMPLES);
+    for _ in 0..SAMPLES {
+        let started = Instant::now();
+        let output = run(binary, arguments);
+        let elapsed = started.elapsed();
+        assert_success(&output);
+        samples.push(elapsed);
+    }
+    samples.sort_unstable();
+    samples[SAMPLES / 2]
+}
+
+fn benchmark_pair(
+    tool: &str,
+    ptrace_binary: &str,
+    ptrace_arguments: &[&str],
+    kvm_binary: &str,
+    kvm_arguments: &[&str],
+) {
+    let ptrace = median_runtime(ptrace_binary, ptrace_arguments);
+    let kvm = median_runtime(kvm_binary, kvm_arguments);
+    eprintln!(
+        "reverie-tool-microbenchmark tool={tool} samples=3 ptrace_us={} kvm_us={}",
+        ptrace.as_micros(),
+        kvm.as_micros(),
     );
 }
 
@@ -231,6 +264,128 @@ fn production_example_clis_run_real_program_with_kvm_guest() {
     assert_success(&strace_minimal);
     assert_eq!(strace_minimal.stdout, b"strace-minimal\n");
     assert!(String::from_utf8_lossy(&strace_minimal.stderr).contains("[pid 1] write("));
+}
+
+#[test]
+fn cross_backend_tool_startup_microbenchmark() {
+    if !kvm_available() {
+        return;
+    }
+
+    benchmark_pair(
+        "counter1",
+        env!("CARGO_BIN_EXE_counter1"),
+        &["--no-host-envs", "--", "/bin/true"],
+        env!("CARGO_BIN_EXE_reverie-kvm-counter1"),
+        &["/bin/true"],
+    );
+    benchmark_pair(
+        "counter2",
+        env!("CARGO_BIN_EXE_counter2"),
+        &["--no-host-envs", "--", "/bin/true"],
+        env!("CARGO_BIN_EXE_reverie-kvm-counter2"),
+        &["/bin/true"],
+    );
+    benchmark_pair(
+        "noop",
+        env!("CARGO_BIN_EXE_noop"),
+        &["--runner", "ptrace", "--no-host-envs", "--", "/bin/true"],
+        env!("CARGO_BIN_EXE_noop"),
+        &["--runner", "kvm", "--no-host-envs", "--", "/bin/true"],
+    );
+    benchmark_pair(
+        "strace",
+        env!("CARGO_BIN_EXE_strace"),
+        &[
+            "--runner",
+            "ptrace",
+            "--trace",
+            "exit_group",
+            "--no-host-envs",
+            "--",
+            "/bin/true",
+        ],
+        env!("CARGO_BIN_EXE_strace"),
+        &[
+            "--runner",
+            "kvm",
+            "--trace",
+            "exit_group",
+            "--no-host-envs",
+            "--",
+            "/bin/true",
+        ],
+    );
+    benchmark_pair(
+        "chaos",
+        env!("CARGO_BIN_EXE_chaos"),
+        &[
+            "--runner",
+            "ptrace",
+            "--no-read",
+            "--no-recv",
+            "--no-interrupt",
+            "--no-host-envs",
+            "--",
+            "/bin/true",
+        ],
+        env!("CARGO_BIN_EXE_chaos"),
+        &[
+            "--runner",
+            "kvm",
+            "--no-read",
+            "--no-recv",
+            "--no-interrupt",
+            "--no-host-envs",
+            "--",
+            "/bin/true",
+        ],
+    );
+
+    let trace_path = std::env::temp_dir().join(format!(
+        "reverie-cross-backend-benchmark-{}.json",
+        std::process::id()
+    ));
+    let trace_path = trace_path.to_str().unwrap();
+    benchmark_pair(
+        "chrome_trace",
+        env!("CARGO_BIN_EXE_chrome_trace"),
+        &[
+            "--runner",
+            "ptrace",
+            "--out",
+            trace_path,
+            "--no-host-envs",
+            "--",
+            "/bin/true",
+        ],
+        env!("CARGO_BIN_EXE_chrome_trace"),
+        &[
+            "--runner",
+            "kvm",
+            "--out",
+            trace_path,
+            "--no-host-envs",
+            "--",
+            "/bin/true",
+        ],
+    );
+    fs::remove_file(trace_path).unwrap();
+
+    benchmark_pair(
+        "chunky_print",
+        env!("CARGO_BIN_EXE_chunky_print"),
+        &["--runner", "ptrace", "--no-host-envs", "--", "/bin/true"],
+        env!("CARGO_BIN_EXE_chunky_print"),
+        &["--runner", "kvm", "--no-host-envs", "--", "/bin/true"],
+    );
+    benchmark_pair(
+        "strace_minimal",
+        env!("CARGO_BIN_EXE_strace_minimal"),
+        &["--runner", "ptrace", "--no-host-envs", "--", "/bin/true"],
+        env!("CARGO_BIN_EXE_strace_minimal"),
+        &["--runner", "kvm", "--no-host-envs", "--", "/bin/true"],
+    );
 }
 
 #[test]

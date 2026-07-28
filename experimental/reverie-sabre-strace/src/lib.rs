@@ -8,6 +8,9 @@
 
 //! SaBRe plugin that runs shared Reverie example tools.
 
+// The reused production tool sources each declare the shared KVM runner.
+#![allow(clippy::duplicate_mod)]
+
 mod tools;
 
 use std::fs;
