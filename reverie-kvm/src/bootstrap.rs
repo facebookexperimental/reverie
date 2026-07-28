@@ -233,14 +233,7 @@ pub(crate) fn set_user_segment_base(
     Ok(())
 }
 
-// TODO-HUMAN-REVIEW(PR-172): Review syscall-frame selection for concurrent vCPUs.
-pub(crate) fn configure_process_syscall_return(
-    memory: &GuestMemory,
-    vcpu: &VcpuFd,
-    syscall_frame_address: u64,
-    result: i64,
-    stack_pointer: Option<u64>,
-) -> Result<()> {
+pub(crate) fn configure_user_segments(vcpu: &VcpuFd) -> Result<()> {
     let mut sregs = vcpu.get_sregs()?;
     let fs_base = sregs.fs.base;
     let gs_base = sregs.gs.base;
@@ -254,6 +247,18 @@ pub(crate) fn configure_process_syscall_return(
     sregs.gs = user_data;
     sregs.gs.base = gs_base;
     vcpu.set_sregs(&sregs)?;
+    Ok(())
+}
+
+// TODO-HUMAN-REVIEW(PR-172): Review syscall-frame selection for concurrent vCPUs.
+pub(crate) fn configure_process_syscall_return(
+    memory: &GuestMemory,
+    vcpu: &VcpuFd,
+    syscall_frame_address: u64,
+    result: i64,
+    stack_pointer: Option<u64>,
+) -> Result<()> {
+    configure_user_segments(vcpu)?;
 
     let return_rip = read_u64(
         memory,
@@ -370,7 +375,7 @@ fn write_exception_tables(memory: &mut GuestMemory) -> Result<()> {
         let handler = EXCEPTION_STUB_ADDRESS + vector as u64 * EXCEPTION_STUB_STRIDE;
         let gate = idt_gate(handler);
         memory.write_raw(IDT_ADDRESS + (vector * IDT_ENTRY_SIZE) as u64, &gate)?;
-        let stub = exception_stub(vector as u8);
+        let stub = exception_stub();
         memory.write_raw(handler, &stub)?;
     }
     Ok(())
@@ -386,40 +391,21 @@ fn idt_gate(handler: u64) -> [u8; IDT_ENTRY_SIZE] {
     gate
 }
 
-fn exception_stub(vector: u8) -> Vec<u8> {
-    let mut code = Vec::with_capacity(EXCEPTION_STUB_STRIDE as usize);
-    code.push(0xb8);
-    code.extend_from_slice(&u32::from(vector).to_le_bytes());
-    if exception_pushes_error_code(vector) {
-        code.extend_from_slice(&[0x48, 0x8b, 0x5c, 0x24, 0x08]);
-    } else {
-        code.extend_from_slice(&[0x48, 0x8b, 0x1c, 0x24]);
-    }
-    code.push(0xf4);
-    code
+fn exception_stub() -> [u8; 1] {
+    [0xf4]
 }
 
-fn exception_pushes_error_code(vector: u8) -> bool {
+pub(crate) fn exception_pushes_error_code(vector: u8) -> bool {
     matches!(vector, 8 | 10 | 11 | 12 | 13 | 14 | 17 | 21 | 29 | 30)
 }
 
-pub(crate) fn exception_from_halt(
-    rip: u64,
-    vector_register: u64,
-    faulting_instruction_pointer: u64,
-) -> Option<(u8, u64)> {
-    let vector = u8::try_from(vector_register).ok()?;
-    if usize::from(vector) >= EXCEPTION_VECTOR_COUNT {
+pub(crate) fn exception_from_halt(rip: u64) -> Option<u8> {
+    let offset = rip.checked_sub(EXCEPTION_STUB_ADDRESS + 1)?;
+    if !offset.is_multiple_of(EXCEPTION_STUB_STRIDE) {
         return None;
     }
-    let stub_length = if exception_pushes_error_code(vector) {
-        11
-    } else {
-        10
-    };
-    let expected_rip =
-        EXCEPTION_STUB_ADDRESS + u64::from(vector) * EXCEPTION_STUB_STRIDE + stub_length;
-    (rip == expected_rip).then_some((vector, faulting_instruction_pointer))
+    let vector = u8::try_from(offset / EXCEPTION_STUB_STRIDE).ok()?;
+    (usize::from(vector) < EXCEPTION_VECTOR_COUNT).then_some(vector)
 }
 
 fn write_page_tables(memory: &mut GuestMemory) -> Result<()> {
@@ -715,18 +701,13 @@ mod tests {
     }
 
     #[test]
-    fn exception_halt_identifies_fault_vector_and_original_rip() {
-        let invalid_opcode_rip = EXCEPTION_STUB_ADDRESS + 6 * EXCEPTION_STUB_STRIDE + 10;
-        assert_eq!(
-            exception_from_halt(invalid_opcode_rip, 6, 0x20_0042),
-            Some((6, 0x20_0042))
-        );
+    fn exception_halt_identifies_fault_vector_without_clobbering_registers() {
+        let invalid_opcode_rip = EXCEPTION_STUB_ADDRESS + 6 * EXCEPTION_STUB_STRIDE + 1;
+        assert_eq!(exception_from_halt(invalid_opcode_rip), Some(6));
 
-        let page_fault_rip = EXCEPTION_STUB_ADDRESS + 14 * EXCEPTION_STUB_STRIDE + 11;
-        assert_eq!(
-            exception_from_halt(page_fault_rip, 14, 0x20_0080),
-            Some((14, 0x20_0080))
-        );
-        assert_eq!(exception_from_halt(0x1234, 6, 0x20_0042), None);
+        let page_fault_rip = EXCEPTION_STUB_ADDRESS + 14 * EXCEPTION_STUB_STRIDE + 1;
+        assert_eq!(exception_from_halt(page_fault_rip), Some(14));
+        assert_eq!(exception_from_halt(0x1234), None);
+        assert_eq!(exception_stub(), [0xf4]);
     }
 }

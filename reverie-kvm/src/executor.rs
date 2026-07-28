@@ -282,6 +282,9 @@ fn execute_basic_syscall_with_output(
         pipe2(memory, state, args[0], 0)
     } else if number == libc::SYS_pipe2 as u64 {
         pipe2(memory, state, args[0], args[1])
+    } else if number == libc::SYS_select as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        select(memory, state, args)
     } else if number == libc::SYS_poll as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         poll(memory, state, args)
@@ -309,9 +312,15 @@ fn execute_basic_syscall_with_output(
     } else if number == libc::SYS_socket as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         socket(state, args)
+    } else if number == libc::SYS_socketpair as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        socketpair(memory, state, args)
     } else if number == libc::SYS_connect as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         connect(memory, state, args)
+    } else if number == libc::SYS_shutdown as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        shutdown(state, args)
     } else if number == libc::SYS_ioctl as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         ioctl(state, args)
@@ -836,6 +845,7 @@ fn mutates_file_table(number: u64) -> bool {
             || number == libc::SYS_eventfd as u64
             || number == libc::SYS_eventfd2 as u64
             || number == libc::SYS_socket as u64
+            || number == libc::SYS_socketpair as u64
             || number == libc::SYS_dup as u64
             || number == libc::SYS_dup2 as u64
             || number == libc::SYS_dup3 as u64
@@ -2777,38 +2787,182 @@ fn pipe2(
     let read_end = unsafe { std::fs::File::from_raw_fd(host_fds[0]) };
     // SAFETY: pipe2 returned two new owned descriptors on success.
     let write_end = unsafe { std::fs::File::from_raw_fd(host_fds[1]) };
-    let close_on_exec = flags & libc::O_CLOEXEC != 0;
+    insert_file_pair(
+        memory,
+        state,
+        address,
+        [read_end, write_end],
+        flags & libc::O_CLOEXEC != 0,
+    )
+}
 
-    let read_fd = insert_file_with_flags(state, read_end, close_on_exec, None);
-    if read_fd < 0 {
-        return read_fd;
+// TODO-HUMAN-REVIEW(PR-205): Review paired guest-descriptor rollback and identity cleanup.
+fn insert_file_pair(
+    memory: &mut GuestMemory,
+    state: &mut LoadedStaticElf,
+    address: u64,
+    files: [std::fs::File; 2],
+    close_on_exec: bool,
+) -> i64 {
+    let [first_file, second_file] = files;
+    let first_fd = insert_file_with_flags(state, first_file, close_on_exec, None);
+    if first_fd < 0 {
+        return first_fd;
     }
-    let write_fd = insert_file_with_flags(state, write_end, close_on_exec, None);
-    if write_fd < 0 {
-        state.files.remove(&(read_fd as libc::c_int));
-        state.fd_object_inodes.remove(&(read_fd as libc::c_int));
-        cleanup_fd_object_inodes(state);
-        state.cloexec_fds.remove(&(read_fd as libc::c_int));
-        return write_fd;
+    let second_fd = insert_file_with_flags(state, second_file, close_on_exec, None);
+    if second_fd < 0 {
+        remove_inserted_file(state, first_fd as libc::c_int);
+        return second_fd;
     }
 
-    let read_fd = read_fd as libc::c_int;
-    let write_fd = write_fd as libc::c_int;
-
+    let fds = [first_fd as libc::c_int, second_fd as libc::c_int];
     let mut bytes = [0; std::mem::size_of::<[libc::c_int; 2]>()];
-    bytes[..std::mem::size_of::<libc::c_int>()].copy_from_slice(&read_fd.to_ne_bytes());
-    bytes[std::mem::size_of::<libc::c_int>()..].copy_from_slice(&write_fd.to_ne_bytes());
+    bytes[..std::mem::size_of::<libc::c_int>()].copy_from_slice(&fds[0].to_ne_bytes());
+    bytes[std::mem::size_of::<libc::c_int>()..].copy_from_slice(&fds[1].to_ne_bytes());
     if memory.write(address, &bytes).is_err() {
-        state.files.remove(&read_fd);
-        state.files.remove(&write_fd);
-        state.fd_object_inodes.remove(&read_fd);
-        state.fd_object_inodes.remove(&write_fd);
-        cleanup_fd_object_inodes(state);
-        state.cloexec_fds.remove(&read_fd);
-        state.cloexec_fds.remove(&write_fd);
+        for fd in fds {
+            remove_inserted_file(state, fd);
+        }
         return negative_errno(libc::EFAULT);
     }
     0
+}
+
+fn remove_inserted_file(state: &mut LoadedStaticElf, fd: libc::c_int) {
+    state.files.remove(&fd);
+    state.fd_object_inodes.remove(&fd);
+    state.cloexec_fds.remove(&fd);
+    cleanup_fd_object_inodes(state);
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-205): Review deterministic select readiness and timeout semantics.
+fn select(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    let Ok(nfds) = libc::c_int::try_from(args[0]) else {
+        return negative_errno(libc::EINVAL);
+    };
+    if !(0..=GUEST_NOFILE_LIMIT).contains(&nfds) {
+        return negative_errno(libc::EINVAL);
+    }
+    let word_count = (nfds as usize).div_ceil(u64::BITS as usize);
+    let byte_length = word_count * std::mem::size_of::<u64>();
+    if byte_length > MAX_HOST_IO {
+        return negative_errno(libc::EINVAL);
+    }
+
+    let mut sets = [Vec::new(), Vec::new(), Vec::new()];
+    for (set, address) in sets.iter_mut().zip(&args[1..4]) {
+        *set = vec![0_u64; word_count];
+        if *address != 0 && byte_length != 0 {
+            // SAFETY: the vector contains initialized u64 words and the byte
+            // view is exactly bounded to its allocation.
+            let bytes = unsafe {
+                std::slice::from_raw_parts_mut(set.as_mut_ptr().cast::<u8>(), byte_length)
+            };
+            if memory.read(*address, bytes).is_err() {
+                return negative_errno(libc::EFAULT);
+            }
+        }
+    }
+
+    if args[4] != 0 {
+        let timeout = match read_guest_struct::<libc::timeval>(memory, args[4]) {
+            Ok(timeout) => timeout,
+            Err(error) => return error,
+        };
+        if timeout.tv_sec < 0 || !(0..1_000_000).contains(&timeout.tv_usec) {
+            return negative_errno(libc::EINVAL);
+        }
+    }
+
+    let mut poll_fds = Vec::new();
+    let mut requested = Vec::new();
+    for guest_fd in 0..nfds {
+        let membership = sets.each_ref().map(|set| fd_set_contains(set, guest_fd));
+        if !membership.into_iter().any(|present| present) {
+            continue;
+        }
+        let Some(host_fd) = host_fd(state, guest_fd) else {
+            return negative_errno(libc::EBADF);
+        };
+        let mut events = 0;
+        if membership[0] {
+            events |= libc::POLLIN;
+        }
+        if membership[1] {
+            events |= libc::POLLOUT;
+        }
+        if membership[2] {
+            events |= libc::POLLPRI;
+        }
+        poll_fds.push(libc::pollfd {
+            fd: host_fd,
+            events,
+            revents: 0,
+        });
+        requested.push((guest_fd, membership));
+    }
+
+    // Detcore owns guest time. Preserve readiness that exists now without
+    // blocking the supervisor on host wall time for a guest timeout.
+    let ready = unsafe { libc::poll(poll_fds.as_mut_ptr(), poll_fds.len() as libc::nfds_t, 0) };
+    if ready < 0 {
+        return io_error(std::io::Error::last_os_error());
+    }
+
+    let mut ready_sets = [
+        vec![0_u64; word_count],
+        vec![0_u64; word_count],
+        vec![0_u64; word_count],
+    ];
+    let mut ready_count = 0_i64;
+    for (poll_fd, (guest_fd, membership)) in poll_fds.iter().zip(requested) {
+        let ready = [
+            poll_fd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0,
+            poll_fd.revents & (libc::POLLOUT | libc::POLLERR) != 0,
+            poll_fd.revents & libc::POLLPRI != 0,
+        ];
+        for index in 0..ready_sets.len() {
+            if membership[index] && ready[index] {
+                fd_set_insert(&mut ready_sets[index], guest_fd);
+                ready_count += 1;
+            }
+        }
+    }
+
+    for (address, ready_set) in args[1..4].iter().zip(&ready_sets) {
+        if *address == 0 || byte_length == 0 {
+            continue;
+        }
+        // SAFETY: the vector contains initialized u64 words and the byte view
+        // is exactly bounded to its allocation.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(ready_set.as_ptr().cast::<u8>(), byte_length) };
+        if memory.write(*address, bytes).is_err() {
+            return negative_errno(libc::EFAULT);
+        }
+    }
+    if args[4] != 0 {
+        let timeout = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        };
+        if write_struct(memory, args[4], &timeout) != 0 {
+            return negative_errno(libc::EFAULT);
+        }
+    }
+    ready_count
+}
+
+fn fd_set_contains(set: &[u64], fd: libc::c_int) -> bool {
+    let fd = fd as usize;
+    set.get(fd / u64::BITS as usize)
+        .is_some_and(|word| word & (1_u64 << (fd % u64::BITS as usize)) != 0)
+}
+
+fn fd_set_insert(set: &mut [u64], fd: libc::c_int) {
+    let fd = fd as usize;
+    set[fd / u64::BITS as usize] |= 1_u64 << (fd % u64::BITS as usize);
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -3062,6 +3216,49 @@ fn socket(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
     insert_file_with_flags(state, file, socket_type & libc::SOCK_CLOEXEC != 0, None)
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-205): Review AF_UNIX socketpair descriptor ownership.
+fn socketpair(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    let domain = args[0] as libc::c_int;
+    let socket_type = args[1] as libc::c_int;
+    let protocol = args[2] as libc::c_int;
+    if domain != libc::AF_UNIX {
+        return negative_errno(libc::EAFNOSUPPORT);
+    }
+    if protocol != 0 {
+        return negative_errno(libc::EPROTONOSUPPORT);
+    }
+    let base_type = socket_type & !(libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK);
+    if !matches!(base_type, libc::SOCK_DGRAM | libc::SOCK_STREAM) {
+        return negative_errno(libc::EPROTONOSUPPORT);
+    }
+    let mut host_fds = [-1; 2];
+    // SAFETY: host_fds has room for both descriptors and the socket arguments
+    // were validated above.
+    if unsafe {
+        libc::socketpair(
+            domain,
+            socket_type | libc::SOCK_CLOEXEC,
+            protocol,
+            host_fds.as_mut_ptr(),
+        )
+    } != 0
+    {
+        return io_error(std::io::Error::last_os_error());
+    }
+    // SAFETY: socketpair initialized both owned descriptors on success.
+    let first = unsafe { std::fs::File::from_raw_fd(host_fds[0]) };
+    // SAFETY: socketpair initialized both owned descriptors on success.
+    let second = unsafe { std::fs::File::from_raw_fd(host_fds[1]) };
+    insert_file_pair(
+        memory,
+        state,
+        args[3],
+        [first, second],
+        socket_type & libc::SOCK_CLOEXEC != 0,
+    )
+}
+
 // TODO-HUMAN-REVIEW(PR-92): Review this KVM compatibility implementation.
 fn connect(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
     if host_fd(state, args[0] as libc::c_int).is_none() {
@@ -3093,6 +3290,21 @@ fn connect(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i6
         return 0;
     }
     negative_errno(libc::ECONNREFUSED)
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-205): Review host-backed AF_UNIX shutdown semantics.
+fn shutdown(state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    let Some(host_fd) = host_fd(state, args[0] as libc::c_int) else {
+        return negative_errno(libc::EBADF);
+    };
+    let how = args[1] as libc::c_int;
+    if !matches!(how, libc::SHUT_RD | libc::SHUT_WR | libc::SHUT_RDWR) {
+        return negative_errno(libc::EINVAL);
+    }
+    // SAFETY: host_fd is a live guest-owned descriptor; shutdown validates
+    // whether it refers to a socket.
+    zero_or_errno(unsafe { libc::shutdown(host_fd, how) })
 }
 
 // TODO-HUMAN-REVIEW(PR-92): Review this KVM compatibility implementation.
@@ -7823,6 +8035,198 @@ mod tests {
                 .objects
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn select_socketpair_and_shutdown_cover_ready_and_half_close_paths() {
+        const PAIR_FDS: u64 = 0x100;
+        const PAYLOAD: u64 = 0x200;
+        const READ_BUFFER: u64 = 0x300;
+        const READ_SET: u64 = 0x400;
+        const TIMEOUT: u64 = 0x500;
+
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        memory.write(PAYLOAD, b"ping").unwrap();
+
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_socketpair,
+                [
+                    libc::AF_UNIX as u64,
+                    libc::SOCK_STREAM as u64,
+                    0,
+                    u64::MAX,
+                    0,
+                    0,
+                ],
+            ),
+            negative_errno(libc::EFAULT)
+        );
+        assert!(state.files.is_empty());
+
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_socketpair,
+                [
+                    libc::AF_UNIX as u64,
+                    (libc::SOCK_STREAM | libc::SOCK_CLOEXEC) as u64,
+                    0,
+                    PAIR_FDS,
+                    0,
+                    0,
+                ],
+            ),
+            0
+        );
+        let socket_fds: [libc::c_int; 2] = read_struct(&memory, PAIR_FDS);
+        assert_eq!(socket_fds, [3, 4]);
+        assert!(socket_fds.iter().all(|fd| state.cloexec_fds.contains(fd)));
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_write,
+                [socket_fds[0] as u64, PAYLOAD, 4, 0, 0, 0],
+            ),
+            4
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_read,
+                [socket_fds[1] as u64, READ_BUFFER, 4, 0, 0, 0],
+            ),
+            4
+        );
+        let mut payload = [0; 4];
+        memory.read(READ_BUFFER, &mut payload).unwrap();
+        assert_eq!(&payload, b"ping");
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_shutdown,
+                [socket_fds[0] as u64, libc::SHUT_WR as u64, 0, 0, 0, 0],
+            ),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_read,
+                [socket_fds[1] as u64, READ_BUFFER, 4, 0, 0, 0],
+            ),
+            0
+        );
+        for fd in socket_fds {
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_close,
+                    [fd as u64, 0, 0, 0, 0, 0],
+                ),
+                0
+            );
+        }
+
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_pipe,
+                [PAIR_FDS, 0, 0, 0, 0, 0],
+            ),
+            0
+        );
+        let pipe_fds: [libc::c_int; 2] = read_struct(&memory, PAIR_FDS);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_write,
+                [pipe_fds[1] as u64, PAYLOAD, 4, 0, 0, 0],
+            ),
+            4
+        );
+        let read_bit = 1_u64 << pipe_fds[0];
+        memory.write(READ_SET, &read_bit.to_ne_bytes()).unwrap();
+        assert_eq!(
+            write_struct(
+                &mut memory,
+                TIMEOUT,
+                &libc::timeval {
+                    tv_sec: 5,
+                    tv_usec: 0,
+                },
+            ),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_select,
+                [pipe_fds[0] as u64 + 1, READ_SET, 0, 0, TIMEOUT, 0],
+            ),
+            1
+        );
+        assert_eq!(read_struct::<u64>(&memory, READ_SET), read_bit);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_read,
+                [pipe_fds[0] as u64, READ_BUFFER, 4, 0, 0, 0],
+            ),
+            4
+        );
+
+        memory.write(READ_SET, &read_bit.to_ne_bytes()).unwrap();
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_select,
+                [pipe_fds[0] as u64 + 1, READ_SET, 0, 0, TIMEOUT, 0],
+            ),
+            0
+        );
+        assert_eq!(read_struct::<u64>(&memory, READ_SET), 0);
+        assert_eq!(read_struct::<libc::timeval>(&memory, TIMEOUT).tv_sec, 0);
+
+        let invalid_fd = 9;
+        let invalid_bit = 1_u64 << invalid_fd;
+        memory.write(READ_SET, &invalid_bit.to_ne_bytes()).unwrap();
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_select,
+                [invalid_fd + 1, READ_SET, 0, 0, TIMEOUT, 0],
+            ),
+            negative_errno(libc::EBADF)
+        );
+        for fd in pipe_fds {
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_close,
+                    [fd as u64, 0, 0, 0, 0, 0],
+                ),
+                0
+            );
+        }
+        assert!(state.files.is_empty());
     }
 
     #[test]

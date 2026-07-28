@@ -1030,7 +1030,12 @@ impl KvmBackend {
                     }
                     (exit.args[0], std::ptr::from_mut(exit.ret) as usize)
                 }
-                VcpuExit::Hlt => return Err(self.static_elf_halt_error()?),
+                VcpuExit::Hlt => {
+                    if self.try_resume_vmware_backdoor_probe()? {
+                        continue;
+                    }
+                    return Err(self.static_elf_halt_error()?);
+                }
                 exit => return Err(Error::UnexpectedVcpuExit(format!("{exit:?}"))),
             };
             if frame_address != SYSCALL_FRAME_ADDRESS {

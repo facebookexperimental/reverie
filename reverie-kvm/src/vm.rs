@@ -45,7 +45,9 @@ use crate::bootstrap::THREAD_SYSCALL_AREA_STRIDE;
 use crate::bootstrap::configure_long_mode;
 use crate::bootstrap::configure_long_mode_with_syscall_area;
 use crate::bootstrap::configure_process_syscall_return;
+use crate::bootstrap::configure_user_segments;
 use crate::bootstrap::exception_from_halt;
+use crate::bootstrap::exception_pushes_error_code;
 use crate::bootstrap::set_syscall_return_park;
 use crate::bootstrap::set_user_segment_base;
 use crate::elf::LoadedStaticElf;
@@ -66,6 +68,16 @@ const PAGE_SIZE: u64 = 4096;
 const VMCALL: [u8; 3] = [0x0f, 0x01, 0xc1];
 const VMMCALL: [u8; 3] = [0x0f, 0x01, 0xd9];
 const HLT: u8 = 0xf4;
+const VMWARE_BACKDOOR_MAGIC: u64 = 0x564d_5868;
+const VMWARE_BACKDOOR_PORT: u64 = 0x5658;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StaticElfException {
+    vector: u8,
+    instruction_pointer: u64,
+    stack_pointer: u64,
+    rflags: u64,
+}
 
 extern "C" fn interrupt_guest_worker(_signal: libc::c_int) {}
 
@@ -837,14 +849,65 @@ impl KvmBackend {
         self.finish_forked_process(executor, child, code, stdout, stderr)
     }
 
-    pub(crate) fn static_elf_halt_error(&self) -> Result<Error> {
+    fn static_elf_exception(&self) -> Result<Option<StaticElfException>> {
         let registers = self.vcpu.get_regs()?;
-        if let Some((vector, instruction_pointer)) =
-            exception_from_halt(registers.rip, registers.rax, registers.rbx)
+        let Some(vector) = exception_from_halt(registers.rip) else {
+            return Ok(None);
+        };
+        let first_frame_word = usize::from(exception_pushes_error_code(vector));
+        let read_frame_word = |word: usize| -> Result<u64> {
+            let mut bytes = [0; std::mem::size_of::<u64>()];
+            self.memory.read_raw(
+                registers.rsp + ((first_frame_word + word) * bytes.len()) as u64,
+                &mut bytes,
+            )?;
+            Ok(u64::from_le_bytes(bytes))
+        };
+        Ok(Some(StaticElfException {
+            vector,
+            instruction_pointer: read_frame_word(0)?,
+            rflags: read_frame_word(2)?,
+            stack_pointer: read_frame_word(3)?,
+        }))
+    }
+
+    // TODO-HUMAN-REVIEW(PR-202): Review the narrowly matched VMware backdoor probe emulation.
+    pub(crate) fn try_resume_vmware_backdoor_probe(&mut self) -> Result<bool> {
+        let Some(exception) = self.static_elf_exception()? else {
+            return Ok(false);
+        };
+        if exception.vector != 13 {
+            return Ok(false);
+        }
+
+        let registers = self.vcpu.get_regs()?;
+        let mut instruction = [0];
+        if self
+            .memory
+            .read_raw(exception.instruction_pointer, &mut instruction)
+            .is_err()
+            || instruction != [0xed]
+            || registers.rbx & u64::from(u32::MAX) != VMWARE_BACKDOOR_MAGIC
+            || registers.rcx & u64::from(u32::MAX) != VMWARE_BACKDOOR_PORT
         {
+            return Ok(false);
+        }
+
+        let mut registers = registers;
+        registers.rbx = 0;
+        registers.rip = exception.instruction_pointer + 1;
+        registers.rsp = exception.stack_pointer;
+        registers.rflags = exception.rflags;
+        configure_user_segments(&self.vcpu)?;
+        self.vcpu.set_regs(&registers)?;
+        Ok(true)
+    }
+
+    pub(crate) fn static_elf_halt_error(&self) -> Result<Error> {
+        if let Some(exception) = self.static_elf_exception()? {
             return Ok(Error::GuestException {
-                vector,
-                instruction_pointer,
+                vector: exception.vector,
+                instruction_pointer: exception.instruction_pointer,
                 fault_address: self.vcpu.get_sregs()?.cr2,
             });
         }
@@ -911,7 +974,12 @@ impl KvmBackend {
                     }
                     (executor.take_segment(), executor.take_process_action())
                 }
-                VcpuExit::Hlt => return Err(self.static_elf_halt_error()?),
+                VcpuExit::Hlt => {
+                    if self.try_resume_vmware_backdoor_probe()? {
+                        continue;
+                    }
+                    return Err(self.static_elf_halt_error()?);
+                }
                 exit => return Err(Error::UnexpectedVcpuExit(format!("{exit:?}"))),
             };
 

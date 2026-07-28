@@ -402,6 +402,20 @@ fn assert_page_fault(error: Error) {
     }
 }
 
+fn assert_general_protection(error: Error) {
+    match error {
+        Error::GuestException {
+            vector,
+            instruction_pointer,
+            ..
+        } => {
+            assert_eq!(vector, 13);
+            assert_eq!(instruction_pointer, LOAD_ADDRESS);
+        }
+        error => panic!("expected general-protection exception, got {error}"),
+    }
+}
+
 #[test]
 fn static_elf_faults_are_reported_by_direct_and_tool_runtimes() {
     match Kvm::new() {
@@ -441,6 +455,57 @@ fn static_elf_faults_are_reported_by_direct_and_tool_runtimes() {
         .install_static_elf(&page_fault_image, "/bin/fault")
         .unwrap();
     assert_page_fault(page_fault_backend.run_static_elf().unwrap_err());
+
+    let mut io_fault_backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+    io_fault_backend
+        .install_static_elf(&static_elf(&[0xed]), "/bin/fault")
+        .unwrap();
+    assert_general_protection(io_fault_backend.run_static_elf().unwrap_err());
+}
+
+#[test]
+fn static_elf_vmware_probe_reports_non_vmware_in_direct_and_tool_runtimes() {
+    match Kvm::new() {
+        Ok(_) => {}
+        Err(error) if kvm_is_unavailable(&error) => {
+            eprintln!("skipping KVM VMware probe test: cannot open /dev/kvm: {error}");
+            return;
+        }
+        Err(error) => panic!("failed to probe /dev/kvm: {error}"),
+    }
+
+    let code = [
+        0xbb, 0x68, 0x58, 0x4d, 0x56, // mov ebx, 0x564d5868
+        0xb9, 0x58, 0x56, 0x00, 0x00, // mov ecx, 0x5658
+        0x31, 0xd2, // xor edx, edx
+        0xed, // in eax, dx
+        0x85, 0xdb, // test ebx, ebx
+        0x75, 0x09, // jne failure
+        0xb8, 0x3c, 0x00, 0x00, 0x00, // mov eax, SYS_exit
+        0x31, 0xff, // xor edi, edi
+        0x0f, 0x05, // syscall
+        0xb8, 0x3c, 0x00, 0x00, 0x00, // failure: mov eax, SYS_exit
+        0xbf, 0x01, 0x00, 0x00, 0x00, // mov edi, 1
+        0x0f, 0x05, // syscall
+    ];
+    let image = static_elf(&code);
+
+    let mut direct_backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+    direct_backend
+        .install_static_elf(&image, "/bin/vmware-probe")
+        .unwrap();
+    assert_eq!(direct_backend.run_static_elf().unwrap(), 0);
+
+    let mut tool_backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+    tool_backend
+        .install_static_elf(&image, "/bin/vmware-probe")
+        .unwrap();
+    let (_, code, stdout, stderr) =
+        futures::executor::block_on(tool_backend.run_static_elf_with_tool::<StraceTool>((), true))
+            .unwrap();
+    assert_eq!(code, 0);
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
 }
 
 #[test]
