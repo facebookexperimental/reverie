@@ -484,7 +484,7 @@ impl KvmBackend {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Review the KVM random-seed configuration API.
+    // TODO-HUMAN-REVIEW(PR-228): Review the KVM random-seed configuration API.
     /// Configure the deterministic seed used by virtual random devices.
     pub fn set_random_seed(&mut self, seed: u64) -> Result<()> {
         let loaded = self

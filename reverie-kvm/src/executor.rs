@@ -2283,7 +2283,7 @@ fn open_file(
     }
     if path == b"/dev/random" || path == b"/dev/urandom" {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TBD): Review cross-backend random-device stream parity.
+        // TODO-HUMAN-REVIEW(PR-228): Review cross-backend random-device stream parity.
         let bytes = deterministic_random_device_bytes(state.random_seed, 64 * 1024);
         return open_virtual_file(state, &bytes, flags, guest_cloexec);
     }
@@ -7162,7 +7162,7 @@ fn deterministic_random_bytes(tid: i32, length: usize, byte_stride: u8, first_by
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Review cross-backend random-device stream parity.
+// TODO-HUMAN-REVIEW(PR-228): Review cross-backend random-device stream parity.
 fn deterministic_random_device_bytes(seed: u64, length: usize) -> Vec<u8> {
     const BYTE_STRIDE: u8 = 73;
     const FIRST_BYTE: u8 = 41;

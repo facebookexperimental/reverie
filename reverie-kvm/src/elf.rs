@@ -119,7 +119,7 @@ pub(crate) struct LoadedStaticElf {
     pub ppid: i32,
     pub umask: libc::mode_t,
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Review caller-provided deterministic random seed state.
+    // TODO-HUMAN-REVIEW(PR-228): Review caller-provided deterministic random seed state.
     pub random_seed: u64,
     // TODO-HUMAN-REVIEW(PR-181): Review virtual capability lifecycle state.
     pub keep_capabilities: bool,
