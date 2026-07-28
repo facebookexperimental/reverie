@@ -6743,11 +6743,12 @@ fn brk(memory: &mut GuestMemory, state: &mut LoadedStaticElf, requested: u64) ->
     requested as i64
 }
 
+// TODO-HUMAN-REVIEW(PR-235): Review deterministic hole-first mmap allocation.
 fn find_mmap_address(memory: &GuestMemory, state: &LoadedStaticElf, length: u64) -> Option<u64> {
     let next = state.mmap_next.clamp(state.mmap_base, state.mmap_limit);
     memory
-        .find_unmapped_user_range(next, state.mmap_limit, length)
-        .or_else(|| memory.find_unmapped_user_range(state.mmap_base, next, length))
+        .find_unmapped_user_range(state.mmap_base, next, length)
+        .or_else(|| memory.find_unmapped_user_range(next, state.mmap_limit, length))
 }
 
 fn mmap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
@@ -13247,6 +13248,45 @@ mod tests {
             syscall_result(&mut memory, &mut state, libc::SYS_mmap, mmap_args),
             negative_errno(libc::ENOMEM)
         );
+    }
+
+    #[test]
+    fn mmap_reuses_unmapped_holes_before_cursor_exhaustion() {
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let memory_size = BOOT_RESERVED_END + 8 * PAGE_SIZE;
+        let mut memory = GuestMemory::new(0, memory_size as usize).unwrap();
+        state.mmap_base = BOOT_RESERVED_END + PAGE_SIZE;
+        state.mmap_next = state.mmap_base;
+        state.mmap_limit = state.mmap_base + 4 * PAGE_SIZE;
+        let mmap_args = [
+            0,
+            PAGE_SIZE,
+            (libc::PROT_READ | libc::PROT_WRITE) as u64,
+            (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS) as u64,
+            -1_i32 as u64,
+            0,
+        ];
+
+        let first = syscall_result(&mut memory, &mut state, libc::SYS_mmap, mmap_args) as u64;
+        let second = syscall_result(&mut memory, &mut state, libc::SYS_mmap, mmap_args) as u64;
+        assert_eq!(second, first + PAGE_SIZE);
+        assert_eq!(state.mmap_next, first + 2 * PAGE_SIZE);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_munmap,
+                [first, PAGE_SIZE, 0, 0, 0, 0],
+            ),
+            0
+        );
+
+        assert_eq!(
+            syscall_result(&mut memory, &mut state, libc::SYS_mmap, mmap_args),
+            first as i64
+        );
+        assert_eq!(state.mmap_next, first + 2 * PAGE_SIZE);
     }
 
     #[test]
