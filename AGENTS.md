@@ -13,6 +13,52 @@ The public Cargo manifests are generated from Meta's internal build metadata.
 Keep manifest changes narrow, preserve export markers, and explain any change
 that must also be reflected in the generated source.
 
+## Architecture Overview
+
+This is the coordinator-level map; the `.claude/skills/` files
+(`reverie-architecture`, `syscall-interception`, `adding-a-backend`,
+`testing-tools`, surfaced via `.llms/skills` and `.agents/skills`) are the
+task-level detail. **Read `reverie-architecture` before working anywhere in the
+tree.**
+
+Reverie is a Linux **process-instrumentation framework**: you write a *tool*
+against a small, backend-agnostic contract, and a *backend* runs a guest process
+tree and routes the guest's syscalls, signals, and CPU events to the tool. Hermit's
+`Detcore` is the flagship tool built on this. The four contracts live in the
+shared `reverie` crate:
+
+| Contract | Location | Role |
+| --- | --- | --- |
+| `Tool` | `reverie/src/tool.rs:118` | Per-process instrumentation + `async handle_*` event handlers; declares `subscriptions` (`:153`), the main hook is `handle_syscall_event` (`:234`) |
+| `GlobalTool` | `reverie/src/tool.rs:39` | Cross-process singleton; RPC via `receive_rpc` (`:62`), reached through `GlobalRPC::send_rpc` (`:337`) |
+| `Guest<T>` | `reverie/src/guest.rs:29` | A handler's view of its thread: `memory` (`:73`), `regs`/`set_regs` (`:82`/`:98`), `inject` (`:131`), `tail_inject -> Never` (`:175`), `read_clock` (`:228`) |
+| `Backend` | `reverie/src/backend.rs:147` | `#[async_trait(?Send)] async fn run<T>(command, config) -> (ExitStatus, T::GlobalState)` (`:160`); runs the whole guest lifecycle on a current-thread `LocalSet` executor |
+
+**Backends** (how the guest is driven and syscalls trapped):
+
+| Backend | Crate | Interception | Status |
+| --- | --- | --- | --- |
+| ptrace | `reverie-ptrace` | seccomp-BPF traps only subscribed syscalls; supervisor handles ptrace stops | production |
+| DBI | `reverie-dbi` | DynamoRIO rewrites the code stream; tool compiled into a release-built client `.so` | in progress |
+| KVM | `reverie-kvm` | guest runs in a VM; syscalls surface as hypercalls | in progress |
+| e9patch / liteinst | `reverie-e9patch`, `reverie-liteinst`, `reverie-preload` | in-process rewriting + `LD_PRELOAD` + seccomp/SIGSYS runtime | experimental |
+
+For ptrace the `GlobalState` lives in-process; the out-of-process backends (KVM,
+DBI) run it in a coordinator process reached over `reverie-rpc-transport`
+(UDS + bincode). Other core crates: `reverie-syscalls` (typed syscall
+decode + guest memory read/write), `reverie-memory`, `reverie-process`,
+`reverie-util`, `safeptrace`. Reference tools live in `reverie-examples`
+(`noop`, `strace`/`strace_minimal`, `counter1`/`counter2`, `chunky_print`,
+`chrome_trace`, `chaos`, `debug`, plus KVM and liteinst variants).
+
+**Build & test:** nightly toolchain (`rust-toolchain.toml`); the canonical gate is
+`./validate.sh` (build + test + doc-test + clippy + rustfmt, all
+`--workspace --all-features`). See the `testing-tools` skill for package-scoped
+commands and the host-dependent `--skip` list. **Adding a backend:** implement
+`Backend::run<T>` plus a concrete `Guest<T>`, wire `GlobalState` over
+`reverie-rpc-transport` if out-of-process, and enumerate the syscalls the
+executor services — see the `adding-a-backend` skill.
+
 ## Required Workspace Layout
 
 The dev-hermit workspace has one Reverie primary checkout and up to five
