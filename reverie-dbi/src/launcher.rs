@@ -390,7 +390,7 @@ impl DbiRunner {
     {
         let directory = tempfile::Builder::new().prefix("reverie-dbi-").tempdir()?;
         let socket = directory.path().join("coordinator.sock");
-        let global = Arc::new(G::init_global_state(&config).await);
+        let mut global = Arc::new(G::init_global_state(&config).await);
         let connected = Arc::new(AtomicBool::new(false));
         let server = RpcServer::bind_with_connection_readiness(
             &socket,
@@ -445,8 +445,27 @@ impl DbiRunner {
                 "DBI guest exited before connecting to the global-state coordinator",
             ));
         }
-        let global = Arc::try_unwrap(global)
-            .map_err(|_| io::Error::other("DBI coordinator state still has owners"))?;
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-247): Review bounded coordinator-owner drain.
+        // Aborting the server drops its connection JoinSet, but Tokio may not
+        // poll those cancellations before the outer server task completes.
+        // Give cancelled connection futures time to release their Arc<G>.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let global = loop {
+            match Arc::try_unwrap(global) {
+                Ok(global) => break global,
+                Err(still_owned) if tokio::time::Instant::now() < deadline => {
+                    global = still_owned;
+                    tokio::task::yield_now().await;
+                }
+                Err(still_owned) => {
+                    return Err(io::Error::other(format!(
+                        "DBI coordinator state still has {} owners after shutdown",
+                        Arc::strong_count(&still_owned)
+                    )));
+                }
+            }
+        };
         Ok(match wait {
             ChildWait::Status(status) => CoordinatedWait::Status(status, global),
             ChildWait::Output(output) => CoordinatedWait::Output(output, global),
