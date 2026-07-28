@@ -62,6 +62,7 @@ enum HandlerSignal {
 }
 
 type SharedHandlerSignal = Arc<Mutex<Option<HandlerSignal>>>;
+type SharedChildStarts = Arc<Mutex<Vec<std::sync::mpsc::Sender<()>>>>;
 
 // AUTONOMOUS-BOT-IMPLEMENTED: Keep root syscalls that share worker state in one backend.
 // TODO-HUMAN-REVIEW(PR-173): Review KVM root syscall ownership.
@@ -114,6 +115,8 @@ pub(crate) struct ToolContext<'a, T: Tool> {
     pub(crate) global_state: Option<Arc<T::GlobalState>>,
     pub(crate) config: <T::GlobalState as GlobalTool>::Config,
     pub(crate) subscriptions: Subscription,
+    // TODO-HUMAN-REVIEW(PR-235): Review child release on parent handler suspension.
+    pub(crate) pending_child_starts: SharedChildStarts,
 }
 
 // TODO-HUMAN-REVIEW(PR-192): Review async KVM process-action completion.
@@ -307,6 +310,7 @@ struct KvmGuest<'a, T: Tool> {
     config: &'a <T::GlobalState as GlobalTool>::Config,
     subscriptions: &'a Subscription,
     handler_signal: SharedHandlerSignal,
+    pending_child_starts: SharedChildStarts,
     stack_checked_out: Arc<AtomicBool>,
 }
 
@@ -324,6 +328,7 @@ impl<'a, T: Tool> KvmGuest<'a, T> {
         config: &'a <T::GlobalState as GlobalTool>::Config,
         subscriptions: &'a Subscription,
         handler_signal: SharedHandlerSignal,
+        pending_child_starts: SharedChildStarts,
         stack_checked_out: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -338,6 +343,7 @@ impl<'a, T: Tool> KvmGuest<'a, T> {
             config,
             subscriptions,
             handler_signal,
+            pending_child_starts,
             stack_checked_out,
         }
     }
@@ -417,6 +423,7 @@ impl<T: Tool> Guest<T> for KvmGuest<'_, T> {
                 global_state: self.shared_global_state.clone(),
                 config: self.config.clone(),
                 subscriptions: self.subscriptions.clone(),
+                pending_child_starts: self.pending_child_starts.clone(),
             };
             match self.executor.complete_injection(context).await {
                 Ok(InjectionCompletion::DoesNotReturn {
@@ -609,29 +616,44 @@ enum HandlerOutcome<T> {
 async fn drive_handler<T>(
     future: impl Future<Output = T>,
     handler_signal: SharedHandlerSignal,
+    pending_child_starts: SharedChildStarts,
 ) -> HandlerOutcome<T> {
     let mut future = pin!(future);
     poll_fn(|context| match future.as_mut().poll(context) {
         Poll::Ready(result) => Poll::Ready(HandlerOutcome::Returned(result)),
-        Poll::Pending => match handler_signal
-            .lock()
-            .expect("KVM handler signal lock poisoned")
-            .take()
-        {
-            Some(HandlerSignal::TailInjected {
-                result,
-                image_replaced,
-                process_exited,
-            }) => Poll::Ready(HandlerOutcome::TailInjected {
-                result,
-                image_replaced,
-                process_exited,
-            }),
-            Some(HandlerSignal::RuntimeError(error)) => {
-                Poll::Ready(HandlerOutcome::RuntimeError(error))
+        Poll::Pending => {
+            let starts = pending_child_starts
+                .lock()
+                .expect("KVM child-start lock poisoned")
+                .drain(..)
+                .collect::<Vec<_>>();
+            for start in starts {
+                if start.send(()).is_err() {
+                    return Poll::Ready(HandlerOutcome::RuntimeError(Error::UnexpectedVcpuExit(
+                        "KVM child exited before its parent suspended registration".to_owned(),
+                    )));
+                }
             }
-            None => Poll::Pending,
-        },
+            match handler_signal
+                .lock()
+                .expect("KVM handler signal lock poisoned")
+                .take()
+            {
+                Some(HandlerSignal::TailInjected {
+                    result,
+                    image_replaced,
+                    process_exited,
+                }) => Poll::Ready(HandlerOutcome::TailInjected {
+                    result,
+                    image_replaced,
+                    process_exited,
+                }),
+                Some(HandlerSignal::RuntimeError(error)) => {
+                    Poll::Ready(HandlerOutcome::RuntimeError(error))
+                }
+                None => Poll::Pending,
+            }
+        }
     })
     .await
 }
@@ -667,6 +689,7 @@ where
 {
     loop {
         let handler_signal = Arc::new(Mutex::new(None));
+        let pending_child_starts = Arc::new(Mutex::new(Vec::new()));
         expose_tool_scratch(memory)?;
         let registers = kvm_registers(backend.vcpu.get_regs()?, 0);
         let mut _process_completed = false;
@@ -691,9 +714,15 @@ where
                 config,
                 subscriptions,
                 handler_signal.clone(),
+                pending_child_starts.clone(),
                 stack_checked_out.clone(),
             );
-            drive_handler(tool.handle_post_exec(&mut guest), handler_signal).await
+            drive_handler(
+                tool.handle_post_exec(&mut guest),
+                handler_signal,
+                pending_child_starts,
+            )
+            .await
         };
         hide_tool_scratch(memory)?;
         match outcome {
@@ -867,6 +896,7 @@ impl KvmBackend {
 
         let registers = kvm_registers(self.vcpu.get_regs()?, 0);
         let handler_signal = Arc::new(Mutex::new(None));
+        let pending_child_starts = Arc::new(Mutex::new(Vec::new()));
         expose_tool_scratch(&memory)?;
         let start_outcome = {
             let mut guest_executor = DirectSyscallExecutor {
@@ -884,9 +914,15 @@ impl KvmBackend {
                 &config,
                 &subscriptions,
                 handler_signal.clone(),
+                pending_child_starts.clone(),
                 stack_checked_out.clone(),
             );
-            drive_handler(tool.handle_thread_start(&mut guest), handler_signal).await
+            drive_handler(
+                tool.handle_thread_start(&mut guest),
+                handler_signal,
+                pending_child_starts,
+            )
+            .await
         };
         hide_tool_scratch(&memory)?;
         match start_outcome {
@@ -911,6 +947,7 @@ impl KvmBackend {
                         .any(|number| number == syscall.number());
                     let result = if subscribed {
                         let handler_signal = Arc::new(Mutex::new(None));
+                        let pending_child_starts = Arc::new(Mutex::new(Vec::new()));
                         expose_tool_scratch(&memory)?;
                         let outcome = {
                             let mut guest_executor = DirectSyscallExecutor {
@@ -928,11 +965,13 @@ impl KvmBackend {
                                 &config,
                                 &subscriptions,
                                 handler_signal.clone(),
+                                pending_child_starts.clone(),
                                 stack_checked_out.clone(),
                             );
                             drive_handler(
                                 tool.handle_syscall_event(&mut guest, syscall),
                                 handler_signal,
+                                pending_child_starts,
                             )
                             .await
                         };
@@ -1059,6 +1098,7 @@ impl KvmBackend {
 
         let registers = kvm_registers(self.vcpu.get_regs()?, 0);
         let handler_signal = Arc::new(Mutex::new(None));
+        let pending_child_starts = Arc::new(Mutex::new(Vec::new()));
         expose_tool_scratch(&memory)?;
         let mut _process_completed = false;
         let start_outcome = {
@@ -1082,9 +1122,15 @@ impl KvmBackend {
                 config,
                 subscriptions,
                 handler_signal.clone(),
+                pending_child_starts.clone(),
                 stack_checked_out.clone(),
             );
-            drive_handler(tool.handle_thread_start(&mut guest), handler_signal).await
+            drive_handler(
+                tool.handle_thread_start(&mut guest),
+                handler_signal,
+                pending_child_starts,
+            )
+            .await
         };
         hide_tool_scratch(&memory)?;
         match start_outcome {
@@ -1259,6 +1305,7 @@ impl KvmBackend {
                     .any(|number| number == syscall.number());
             let (result, handler_replaced_image, handler_process_completed) = if subscribed {
                 let handler_signal = Arc::new(Mutex::new(None));
+                let pending_child_starts = Arc::new(Mutex::new(Vec::new()));
                 let mut handler_process_completed = false;
                 expose_tool_scratch(&memory)?;
                 let outcome = {
@@ -1287,11 +1334,13 @@ impl KvmBackend {
                         config,
                         subscriptions,
                         handler_signal.clone(),
+                        pending_child_starts.clone(),
                         stack_checked_out.clone(),
                     );
                     drive_handler(
                         tool.handle_syscall_event(&mut guest, syscall),
                         handler_signal,
+                        pending_child_starts,
                     )
                     .await
                 };
@@ -1350,6 +1399,7 @@ impl KvmBackend {
                     global_state: Some(global_state.clone()),
                     config: config.clone(),
                     subscriptions: subscriptions.clone(),
+                    pending_child_starts: Arc::new(Mutex::new(Vec::new())),
                 };
                 self.run_process_action_with_tool(executor, action, true, context)
                     .await?;
@@ -1486,6 +1536,31 @@ mod tests {
             assert!(is_backend_owned_syscall(number as u64));
         }
         assert!(!is_backend_owned_syscall(libc::SYS_clock_gettime as u64));
+    }
+
+    #[test]
+    fn handler_suspension_releases_registered_child_start() {
+        let handler_signal = Arc::new(Mutex::new(None));
+        let pending_child_starts = Arc::new(Mutex::new(Vec::new()));
+        let (start_sender, start_receiver) = std::sync::mpsc::channel();
+        pending_child_starts.lock().unwrap().push(start_sender);
+        let handler = poll_fn(|context| match start_receiver.try_recv() {
+            Ok(()) => Poll::Ready(true),
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                context.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Poll::Ready(false),
+        });
+
+        assert!(matches!(
+            futures::executor::block_on(drive_handler(
+                handler,
+                handler_signal,
+                pending_child_starts,
+            )),
+            HandlerOutcome::Returned(true)
+        ));
     }
 
     #[test]

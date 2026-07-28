@@ -918,6 +918,7 @@ impl KvmBackend {
         })?;
         let config = context.config;
         let subscriptions = context.subscriptions;
+        let pending_child_starts = context.pending_child_starts;
         let raw_child_pid = child.pid;
         let (start_sender, start_receiver) = std::sync::mpsc::channel();
         let handle = std::thread::Builder::new()
@@ -951,6 +952,10 @@ impl KvmBackend {
                     Err(error) => Err(error),
                 }
             })?;
+        pending_child_starts
+            .lock()
+            .expect("KVM child-start lock poisoned")
+            .push(start_sender.clone());
         executor.register_child_process(raw_child_pid, start_sender, handle);
         configure_process_syscall_return(
             &self.memory,

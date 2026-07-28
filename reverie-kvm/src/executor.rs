@@ -1377,13 +1377,9 @@ impl ElfExecutor {
 
     // TODO-HUMAN-REVIEW(PR-235): Review parent-registration ordering for KVM children.
     pub(crate) fn start_pending_child_processes(&mut self) -> crate::Result<()> {
-        for (&pid, process) in &mut self.pending_processes {
+        for process in self.pending_processes.values_mut() {
             if let Some(start) = process.start.take() {
-                start.send(()).map_err(|_| {
-                    crate::Error::UnexpectedVcpuExit(format!(
-                        "KVM child process {pid} exited before its parent registered it"
-                    ))
-                })?;
+                let _ = start.send(());
             }
         }
         Ok(())
