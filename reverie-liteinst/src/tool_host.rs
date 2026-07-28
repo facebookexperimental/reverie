@@ -181,6 +181,25 @@ where
             tool_fatal(124, &error);
         }
 
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-liteinst-post-exec): The kernel exec'd the guest
+        // image before this LD_PRELOAD backend attached, so — unlike the ptrace
+        // backend — the `Tool::handle_post_exec` lifecycle callback never fired.
+        // A Tool such as Detcore relies on it to determinize the auxv AT_RANDOM
+        // vector and to advance per-thread state (e.g. its seeded PRNG) exactly
+        // as the ptrace backend does; without it the guest-visible getrandom(2)
+        // stream is offset relative to ptrace and cross-backend parity fails.
+        // The guest genuinely did execve into this image, so emitting the event
+        // once for the root process's main thread restores contract parity. It
+        // is intentionally not emitted for child threads (there is none in the
+        // current single-process/thread tool mode) nor re-emitted per dispatch.
+        if is_new
+            && tid.as_raw() == self.root_pid.as_raw()
+            && let Err(error) = drive_ready(tool.handle_post_exec(&mut guest))
+        {
+            tool_fatal(124, &error);
+        }
+
         let Some(number) = usize::try_from(guest.event.number)
             .ok()
             .and_then(Sysno::new)
