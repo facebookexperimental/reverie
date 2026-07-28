@@ -12,6 +12,8 @@ use std::io;
 use std::io::Read;
 use std::io::Write;
 use std::marker::PhantomData;
+use std::os::fd::AsRawFd;
+use std::os::fd::RawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::Mutex;
@@ -46,6 +48,17 @@ pub struct BlockingRpcClient<G: GlobalTool> {
     config: G::Config,
     stream: Mutex<UnixStream>,
     _phantom: PhantomData<fn() -> G>,
+}
+
+// TODO-HUMAN-REVIEW(PR-212): Review raw descriptor exposure for in-guest
+// runtimes that must hide coordinator transport descriptors from the guest.
+impl<G: GlobalTool> AsRawFd for BlockingRpcClient<G> {
+    fn as_raw_fd(&self) -> RawFd {
+        self.stream
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_raw_fd()
+    }
 }
 
 impl<G> BlockingRpcClient<G>

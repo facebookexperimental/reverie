@@ -285,4 +285,17 @@ mod tests {
         assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
         assert_eq!(status, 0);
     }
+
+    #[test]
+    fn protected_guard_hides_descriptor_until_drop() {
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let fd = file.as_raw_fd();
+        let protected = protect_with(|| Ok::<_, std::convert::Infallible>(file)).unwrap();
+
+        assert!(is_protected(&fd));
+        assert!(uses_protected_fd(Sysno::close, fd as usize, 0));
+
+        drop(protected);
+        assert!(!is_protected(&fd));
+    }
 }
