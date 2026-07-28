@@ -3340,6 +3340,7 @@ fn setsockopt(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) ->
 }
 
 // TODO-HUMAN-REVIEW(PR-213): Review bounded host-backed AF_INET bind translation.
+// TODO-HUMAN-REVIEW(PR-217): Review filesystem-backed AF_UNIX bind translation.
 fn bind(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
     let Some(host_fd) = host_fd(state, args[0] as libc::c_int) else {
         return negative_errno(libc::EBADF);
@@ -3362,7 +3363,7 @@ fn bind(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
             .try_into()
             .expect("family slice has exact size"),
     );
-    if family != libc::AF_INET as libc::sa_family_t {
+    if !matches!(family as libc::c_int, libc::AF_INET | libc::AF_UNIX) {
         return negative_errno(libc::EAFNOSUPPORT);
     }
     // SAFETY: address is readable for length bytes and host_fd belongs to the
@@ -3459,19 +3460,21 @@ fn socketpair(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64
 }
 
 // TODO-HUMAN-REVIEW(PR-92): Review this KVM compatibility implementation.
+// TODO-HUMAN-REVIEW(PR-217): Review filesystem-backed AF_UNIX connect translation.
 fn connect(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
-    if host_fd(state, args[0] as libc::c_int).is_none() {
+    let Some(host_fd) = host_fd(state, args[0] as libc::c_int) else {
         return negative_errno(libc::EBADF);
-    }
-    let Ok(length) = usize::try_from(args[2]) else {
+    };
+    let Ok(length) = libc::socklen_t::try_from(args[2]) else {
         return negative_errno(libc::EINVAL);
     };
-    if length < std::mem::size_of::<libc::sa_family_t>()
-        || length > std::mem::size_of::<libc::sockaddr_un>()
+    let length_usize = length as usize;
+    if length_usize < std::mem::size_of::<libc::sa_family_t>()
+        || length_usize > std::mem::size_of::<libc::sockaddr_un>()
     {
         return negative_errno(libc::EINVAL);
     }
-    let mut address = vec![0; length];
+    let mut address = vec![0; length_usize];
     if memory.read(args[1], &mut address).is_err() {
         return negative_errno(libc::EFAULT);
     }
@@ -3488,7 +3491,11 @@ fn connect(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i6
     if path == b"/dev/log" {
         return 0;
     }
-    negative_errno(libc::ECONNREFUSED)
+    // SAFETY: address is readable for length bytes and host_fd belongs to the
+    // guest descriptor table. The host kernel validates the Unix address.
+    zero_or_errno(unsafe {
+        libc::connect(host_fd, address.as_ptr().cast::<libc::sockaddr>(), length)
+    })
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -8740,6 +8747,79 @@ mod tests {
                 .objects
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn unix_listener_bind_and_connect_use_guest_paths() {
+        const ADDRESS: u64 = 0x100;
+
+        let root = TestDir::new();
+        let socket_path = root.0.join("listener.sock");
+        let path = socket_path.as_os_str().as_bytes();
+        let mut address = libc::sockaddr_un {
+            sun_family: libc::AF_UNIX as libc::sa_family_t,
+            sun_path: [0; 108],
+        };
+        assert!(path.len() < address.sun_path.len());
+        for (destination, source) in address.sun_path.iter_mut().zip(path) {
+            *destination = *source as libc::c_char;
+        }
+        let address_length = std::mem::offset_of!(libc::sockaddr_un, sun_path) + path.len() + 1;
+
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        assert_eq!(write_struct(&mut memory, ADDRESS, &address), 0);
+        let server = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_socket,
+            [libc::AF_UNIX as u64, libc::SOCK_STREAM as u64, 0, 0, 0, 0],
+        );
+        let client = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_socket,
+            [libc::AF_UNIX as u64, libc::SOCK_STREAM as u64, 0, 0, 0, 0],
+        );
+        assert_eq!((server, client), (3, 4));
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_bind,
+                [server as u64, ADDRESS, address_length as u64, 0, 0, 0],
+            ),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_listen,
+                [server as u64, 1, 0, 0, 0, 0],
+            ),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_connect,
+                [client as u64, ADDRESS, address_length as u64, 0, 0, 0],
+            ),
+            0
+        );
+        for fd in [client, server] {
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_close,
+                    [fd as u64, 0, 0, 0, 0, 0],
+                ),
+                0
+            );
+        }
     }
 
     #[test]
