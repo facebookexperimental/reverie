@@ -21,6 +21,7 @@ libc = "0.2.139"
 nostd-print = { version = "0.1.0", path = "../nostd-print" }
 reverie = { version = "0.1.0", path = "../../reverie" }
 reverie-host = { version = "0.1.0", path = "../reverie-host" }
+reverie-kvm = { version = "0.1.0", path = "../../reverie-kvm" }
 reverie-ptrace = { version = "0.1.0", path = "../../reverie-ptrace" }
 reverie-process = { version = "0.1.0", path = "../../reverie-process" }
 reverie-rpc-transport = { version = "0.1.0", path = "../../reverie-rpc-transport" }
