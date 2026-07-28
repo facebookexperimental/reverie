@@ -296,6 +296,14 @@ fn execute_basic_syscall_with_output(
         sync_file(state, args[0], false)
     } else if number == libc::SYS_fdatasync as u64 {
         sync_file(state, args[0], true)
+    } else if number == libc::SYS_readahead as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-227): Review translated host readahead semantics.
+        readahead(state, args)
+    } else if number == libc::SYS_sync_file_range as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-227): Review translated host range-sync semantics.
+        sync_file_range(state, args)
     } else if number == libc::SYS_pipe as u64 {
         pipe2(memory, state, args[0], 0)
     } else if number == libc::SYS_pipe2 as u64 {
@@ -2139,6 +2147,61 @@ fn sync_file(state: &LoadedStaticElf, raw_fd: u64, data_only: bool) -> i64 {
             libc::fsync(host_fd)
         }
     };
+    if result == 0 {
+        0
+    } else {
+        io_error(std::io::Error::last_os_error())
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-227): Review translated host readahead semantics.
+fn readahead(state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    let Ok(fd) = i32::try_from(args[0]) else {
+        return negative_errno(libc::EBADF);
+    };
+    let Some(host_fd) = host_fd(state, fd) else {
+        return negative_errno(libc::EBADF);
+    };
+    let offset = args[1] as libc::off64_t;
+    let Ok(count) = usize::try_from(args[2]) else {
+        return negative_errno(libc::EINVAL);
+    };
+    if offset < 0 {
+        return negative_errno(libc::EINVAL);
+    }
+    // SAFETY: host_fd names the guest's live translated descriptor; the call
+    // has no guest pointers, and the host kernel validates the descriptor type.
+    let result = unsafe { libc::syscall(libc::SYS_readahead, host_fd, offset, count) };
+    if result == 0 {
+        0
+    } else {
+        io_error(std::io::Error::last_os_error())
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-227): Review translated host range-sync semantics.
+fn sync_file_range(state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    let Ok(fd) = i32::try_from(args[0]) else {
+        return negative_errno(libc::EBADF);
+    };
+    let Some(host_fd) = host_fd(state, fd) else {
+        return negative_errno(libc::EBADF);
+    };
+    let offset = args[1] as libc::off64_t;
+    let length = args[2] as libc::off64_t;
+    let flags = args[3] as libc::c_uint;
+    let allowed_flags = (libc::SYNC_FILE_RANGE_WAIT_BEFORE
+        | libc::SYNC_FILE_RANGE_WRITE
+        | libc::SYNC_FILE_RANGE_WAIT_AFTER) as libc::c_uint;
+    if offset < 0 || length < 0 || flags & !allowed_flags != 0 {
+        return negative_errno(libc::EINVAL);
+    }
+    // SAFETY: host_fd names the guest's live translated descriptor; the call
+    // has no guest pointers, and ranges and flags were validated above.
+    let result =
+        unsafe { libc::syscall(libc::SYS_sync_file_range, host_fd, offset, length, flags) };
     if result == 0 {
         0
     } else {
@@ -12378,6 +12441,52 @@ mod tests {
                 0
             );
         }
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_readahead,
+                [fd as u64, 0, 4096, 0, 0, 0],
+            ),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_sync_file_range,
+                [fd as u64, 0, 4096, libc::SYNC_FILE_RANGE_WRITE as u64, 0, 0,],
+            ),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_readahead,
+                [u64::MAX, 0, 1, 0, 0, 0],
+            ),
+            negative_errno(libc::EBADF)
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_sync_file_range,
+                [
+                    fd as u64,
+                    0,
+                    1,
+                    (libc::SYNC_FILE_RANGE_WAIT_BEFORE
+                        | libc::SYNC_FILE_RANGE_WRITE
+                        | libc::SYNC_FILE_RANGE_WAIT_AFTER
+                        | 8) as u64,
+                    0,
+                    0,
+                ],
+            ),
+            negative_errno(libc::EINVAL)
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
