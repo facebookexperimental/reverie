@@ -348,6 +348,12 @@ fn execute_basic_syscall_with_output(
     } else if number == libc::SYS_shutdown as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         shutdown(state, args)
+    } else if number == libc::SYS_sendto as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        sendto(memory, state, args)
+    } else if number == libc::SYS_recvfrom as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        recvfrom(memory, state, args)
     } else if number == libc::SYS_recvmmsg as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         recvmmsg(memory, state, args)
@@ -887,6 +893,18 @@ fn mutates_file_table(number: u64) -> bool {
     )
 }
 
+fn accept_flags(request: &SyscallRequest) -> Option<Result<libc::c_int, i64>> {
+    match request.number() {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        number if number == libc::SYS_accept as u64 => Some(Ok(0)),
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        number if number == libc::SYS_accept4 as u64 => {
+            Some(libc::c_int::try_from(request.args()[3]).map_err(|_| negative_errno(libc::EINVAL)))
+        }
+        _ => None,
+    }
+}
+
 impl AddressSpaceState {
     fn from_elf(state: &LoadedStaticElf) -> Self {
         Self {
@@ -917,6 +935,43 @@ impl ElfExecutor {
             exit_group: false,
             clear_child_tid: None,
         }
+    }
+
+    fn execute_accept(&mut self, request: &SyscallRequest, memory: &GuestMemory) -> Option<i64> {
+        let raw_flags = accept_flags(request)?;
+        let flags = match raw_flags {
+            Ok(flags) => flags,
+            Err(error) => return Some(error),
+        };
+        let file_table = self.file_table.clone();
+        {
+            let shared_files = file_table.lock().expect("KVM file-table lock poisoned");
+            if let Err(error) = shared_files.install(&mut self.state) {
+                return Some(io_error(error));
+            }
+        }
+
+        let mut memory = memory.clone();
+        let accepted = match accept_socket(&mut memory, &self.state, request.args(), flags) {
+            Ok(file) => file,
+            Err(error) => return Some(error),
+        };
+
+        let mut shared_files = file_table.lock().expect("KVM file-table lock poisoned");
+        if let Err(error) = shared_files.install(&mut self.state) {
+            return Some(io_error(error));
+        }
+        let result = insert_file_with_flags(
+            &mut self.state,
+            accepted,
+            flags & libc::SOCK_CLOEXEC != 0,
+            None,
+        );
+        if result >= 0 {
+            *shared_files =
+                FileTableState::try_from_elf(&self.state).expect("clone updated KVM file table");
+        }
+        Some(result)
     }
 
     fn execute_process_action(
@@ -1301,6 +1356,9 @@ impl ElfExecutor {
 
 impl SyscallExecutor for ElfExecutor {
     fn execute(&mut self, request: &SyscallRequest, memory: &GuestMemory) -> i64 {
+        if let Some(result) = self.execute_accept(request, memory) {
+            return result;
+        }
         // TODO-HUMAN-REVIEW(PR-172): Review CLONE_FILES descriptor-table sharing.
         // Thread children retain private executor state, but synchronize their
         // descriptor mappings through this shared table before every syscall.
@@ -3416,6 +3474,85 @@ fn getsockname(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6
     write_struct(memory, args[2], &length)
 }
 
+// TODO-HUMAN-REVIEW(PR-218): Review blocking accept outside the shared descriptor-table lock.
+fn accept_socket(
+    memory: &mut GuestMemory,
+    state: &LoadedStaticElf,
+    args: &[u64; 6],
+    flags: libc::c_int,
+) -> Result<std::fs::File, i64> {
+    let allowed_flags = libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK;
+    if flags & !allowed_flags != 0 {
+        return Err(negative_errno(libc::EINVAL));
+    }
+    let Some(host_fd) = host_fd(state, args[0] as libc::c_int) else {
+        return Err(negative_errno(libc::EBADF));
+    };
+
+    // SAFETY: a zeroed sockaddr_storage is valid scratch space for accept4.
+    let mut address =
+        unsafe { std::mem::MaybeUninit::<libc::sockaddr_storage>::zeroed().assume_init() };
+    let mut length = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let guest_capacity = if args[1] == 0 {
+        0
+    } else {
+        if args[2] == 0 {
+            return Err(negative_errno(libc::EFAULT));
+        }
+        let capacity = read_guest_struct::<libc::socklen_t>(memory, args[2])
+            .map_err(|_| negative_errno(libc::EFAULT))?;
+        length = length.min(capacity);
+        capacity as usize
+    };
+    let address_pointer = if args[1] == 0 {
+        std::ptr::null_mut()
+    } else {
+        std::ptr::from_mut(&mut address).cast::<libc::sockaddr>()
+    };
+    let length_pointer = if args[1] == 0 {
+        std::ptr::null_mut()
+    } else {
+        std::ptr::from_mut(&mut length)
+    };
+
+    // SAFETY: host_fd belongs to the guest descriptor table. The optional
+    // address and length pointers refer to initialized host storage.
+    let accepted_fd = unsafe {
+        libc::accept4(
+            host_fd,
+            address_pointer,
+            length_pointer,
+            flags | libc::SOCK_CLOEXEC,
+        )
+    };
+    if accepted_fd < 0 {
+        return Err(io_error(std::io::Error::last_os_error()));
+    }
+    // SAFETY: accept4 returned a new owned descriptor.
+    let accepted = unsafe { std::fs::File::from_raw_fd(accepted_fd) };
+
+    if args[1] != 0 {
+        let copy_length = guest_capacity
+            .min(length as usize)
+            .min(std::mem::size_of::<libc::sockaddr_storage>());
+        if copy_length != 0 {
+            // SAFETY: address is initialized storage and copy_length is bounded
+            // by its size.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(std::ptr::from_ref(&address).cast::<u8>(), copy_length)
+            };
+            if memory.write(args[1], bytes).is_err() {
+                return Err(negative_errno(libc::EFAULT));
+            }
+        }
+        let result = write_struct(memory, args[2], &length);
+        if result < 0 {
+            return Err(result);
+        }
+    }
+    Ok(accepted)
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-205): Review AF_UNIX socketpair descriptor ownership.
 fn socketpair(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
@@ -3511,6 +3648,161 @@ fn shutdown(state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
     // SAFETY: host_fd is a live guest-owned descriptor; shutdown validates
     // whether it refers to a socket.
     zero_or_errno(unsafe { libc::shutdown(host_fd, how) })
+}
+
+// TODO-HUMAN-REVIEW(PR-218): Review bounded guest sendto translation and SIGPIPE suppression.
+fn sendto(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    let Ok(fd) = libc::c_int::try_from(args[0]) else {
+        return negative_errno(libc::EBADF);
+    };
+    let Some(host_fd) = host_fd(state, fd) else {
+        return negative_errno(libc::EBADF);
+    };
+    let Ok(flags) = libc::c_int::try_from(args[3]) else {
+        return negative_errno(libc::EINVAL);
+    };
+    let Ok(requested_length) = usize::try_from(args[2]) else {
+        return negative_errno(libc::EINVAL);
+    };
+    let length = requested_length.min(MAX_HOST_IO);
+    let mut bytes = vec![0; length];
+    if length != 0 && memory.read(args[1], &mut bytes).is_err() {
+        return negative_errno(libc::EFAULT);
+    }
+
+    let Ok(address_length) = libc::socklen_t::try_from(args[5]) else {
+        return negative_errno(libc::EINVAL);
+    };
+    if address_length as usize > std::mem::size_of::<libc::sockaddr_storage>() {
+        return negative_errno(libc::EINVAL);
+    }
+    let mut address = vec![0; address_length as usize];
+    if args[4] != 0 && address_length != 0 && memory.read(args[4], &mut address).is_err() {
+        return negative_errno(libc::EFAULT);
+    }
+    let address_pointer = if args[4] == 0 {
+        std::ptr::null()
+    } else {
+        address.as_ptr().cast::<libc::sockaddr>()
+    };
+
+    // SAFETY: the payload and optional address are readable host buffers and
+    // host_fd belongs to the guest descriptor table. MSG_NOSIGNAL keeps a
+    // guest EPIPE from delivering SIGPIPE to the supervisor.
+    let result = unsafe {
+        libc::sendto(
+            host_fd,
+            bytes.as_ptr().cast::<libc::c_void>(),
+            bytes.len(),
+            flags | libc::MSG_NOSIGNAL,
+            address_pointer,
+            address_length,
+        )
+    };
+    if result < 0 {
+        io_error(std::io::Error::last_os_error())
+    } else {
+        result as i64
+    }
+}
+
+// TODO-HUMAN-REVIEW(PR-218): Review bounded recvfrom buffer and peer-address copyback semantics.
+fn recvfrom(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    let Ok(fd) = libc::c_int::try_from(args[0]) else {
+        return negative_errno(libc::EBADF);
+    };
+    let Some(host_fd) = host_fd(state, fd) else {
+        return negative_errno(libc::EBADF);
+    };
+    let Ok(flags) = libc::c_int::try_from(args[3]) else {
+        return negative_errno(libc::EINVAL);
+    };
+    let Ok(requested_length) = usize::try_from(args[2]) else {
+        return negative_errno(libc::EINVAL);
+    };
+    if !range_is_valid(memory, args[1], args[2]) {
+        return negative_errno(libc::EFAULT);
+    }
+    let length = requested_length.min(MAX_HOST_IO);
+    let Ok(writable) = memory.user_accessible_prefix(args[1], length) else {
+        return negative_errno(libc::EFAULT);
+    };
+    if writable == 0 && requested_length != 0 {
+        return negative_errno(libc::EFAULT);
+    }
+    let mut bytes = vec![0; writable];
+
+    // SAFETY: a zeroed sockaddr_storage is valid scratch space for recvfrom.
+    let mut address =
+        unsafe { std::mem::MaybeUninit::<libc::sockaddr_storage>::zeroed().assume_init() };
+    let mut address_length = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let guest_address_capacity = if args[4] == 0 {
+        0
+    } else {
+        if args[5] == 0 {
+            return negative_errno(libc::EFAULT);
+        }
+        let capacity = match read_guest_struct::<libc::socklen_t>(memory, args[5]) {
+            Ok(capacity) => capacity,
+            Err(_) => return negative_errno(libc::EFAULT),
+        };
+        address_length = address_length.min(capacity);
+        capacity as usize
+    };
+    let address_pointer = if args[4] == 0 {
+        std::ptr::null_mut()
+    } else {
+        std::ptr::from_mut(&mut address).cast::<libc::sockaddr>()
+    };
+    let length_pointer = if args[4] == 0 {
+        std::ptr::null_mut()
+    } else {
+        std::ptr::from_mut(&mut address_length)
+    };
+
+    // SAFETY: bytes is writable for its full length, the optional peer address
+    // points to initialized host storage, and host_fd is guest-owned.
+    let result = unsafe {
+        libc::recvfrom(
+            host_fd,
+            bytes.as_mut_ptr().cast::<libc::c_void>(),
+            bytes.len(),
+            flags,
+            address_pointer,
+            length_pointer,
+        )
+    };
+    if result < 0 {
+        return io_error(std::io::Error::last_os_error());
+    }
+    let copy_length = (result as usize).min(bytes.len());
+    if copy_length != 0 && memory.write(args[1], &bytes[..copy_length]).is_err() {
+        return negative_errno(libc::EFAULT);
+    }
+
+    if args[4] != 0 {
+        let address_copy_length = guest_address_capacity
+            .min(address_length as usize)
+            .min(std::mem::size_of::<libc::sockaddr_storage>());
+        if address_copy_length != 0 {
+            // SAFETY: address is initialized storage and address_copy_length
+            // is bounded by its size.
+            let address_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    std::ptr::from_ref(&address).cast::<u8>(),
+                    address_copy_length,
+                )
+            };
+            if memory.write(args[4], address_bytes).is_err() {
+                return negative_errno(libc::EFAULT);
+            }
+        }
+        let copy_result = write_struct(memory, args[5], &address_length);
+        if copy_result < 0 {
+            return copy_result;
+        }
+    }
+    result as i64
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -8820,6 +9112,105 @@ mod tests {
                 0
             );
         }
+    }
+
+    #[test]
+    fn elf_executor_accepts_unix_listener_connection() {
+        const ADDRESS: u64 = 0x100;
+        const PAYLOAD: u64 = 0x300;
+
+        let root = TestDir::new();
+        let socket_path = root.0.join("accept.sock");
+        let path = socket_path.as_os_str().as_bytes();
+        let mut address = libc::sockaddr_un {
+            sun_family: libc::AF_UNIX as libc::sa_family_t,
+            sun_path: [0; 108],
+        };
+        assert!(path.len() < address.sun_path.len());
+        for (destination, source) in address.sun_path.iter_mut().zip(path) {
+            *destination = *source as libc::c_char;
+        }
+        let address_length = std::mem::offset_of!(libc::sockaddr_un, sun_path) + path.len() + 1;
+
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        assert_eq!(write_struct(&mut memory, ADDRESS, &address), 0);
+        let mut executor = ElfExecutor::new(test_state(&root.0), false);
+        let server = executor.execute(
+            &SyscallRequest::new(
+                libc::SYS_socket as u64,
+                [libc::AF_UNIX as u64, libc::SOCK_STREAM as u64, 0, 0, 0, 0],
+            ),
+            &memory,
+        );
+        assert_eq!(server, 3);
+        assert_eq!(
+            executor.execute(
+                &SyscallRequest::new(
+                    libc::SYS_bind as u64,
+                    [server as u64, ADDRESS, address_length as u64, 0, 0, 0],
+                ),
+                &memory,
+            ),
+            0
+        );
+        assert_eq!(
+            executor.execute(
+                &SyscallRequest::new(libc::SYS_listen as u64, [server as u64, 1, 0, 0, 0, 0],),
+                &memory,
+            ),
+            0
+        );
+        let client = executor.execute(
+            &SyscallRequest::new(
+                libc::SYS_socket as u64,
+                [libc::AF_UNIX as u64, libc::SOCK_STREAM as u64, 0, 0, 0, 0],
+            ),
+            &memory,
+        );
+        assert_eq!(client, 4);
+        assert_eq!(
+            executor.execute(
+                &SyscallRequest::new(
+                    libc::SYS_connect as u64,
+                    [client as u64, ADDRESS, address_length as u64, 0, 0, 0],
+                ),
+                &memory,
+            ),
+            0
+        );
+        let accepted = executor.execute(
+            &SyscallRequest::new(
+                libc::SYS_accept4 as u64,
+                [server as u64, 0, 0, libc::SOCK_CLOEXEC as u64, 0, 0],
+            ),
+            &memory,
+        );
+        assert_eq!(accepted, 5);
+
+        memory.write(PAYLOAD, b"hello").unwrap();
+        assert_eq!(
+            executor.execute(
+                &SyscallRequest::new(
+                    libc::SYS_sendto as u64,
+                    [client as u64, PAYLOAD, 5, libc::MSG_NOSIGNAL as u64, 0, 0,],
+                ),
+                &memory,
+            ),
+            5
+        );
+        assert_eq!(
+            executor.execute(
+                &SyscallRequest::new(
+                    libc::SYS_recvfrom as u64,
+                    [accepted as u64, PAYLOAD + 8, 5, 0, 0, 0],
+                ),
+                &memory,
+            ),
+            5
+        );
+        let mut payload = [0; 5];
+        memory.read(PAYLOAD + 8, &mut payload).unwrap();
+        assert_eq!(&payload, b"hello");
     }
 
     #[test]
