@@ -36,6 +36,9 @@ const MAX_HOST_IO: usize = 16 * 1024 * 1024;
 const MAX_CAPTURED_OUTPUT: usize = 64 * 1024 * 1024;
 const PAGE_SIZE: u64 = 4096;
 const GUEST_NOFILE_LIMIT: libc::c_int = 1 << 20;
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-235): Review the single virtual network namespace identity.
+const GUEST_NETNS_COOKIE: u64 = 1;
 const KERNEL_SIGACTION_SIZE: usize = 32;
 const KERNEL_SIGSET_SIZE: usize = 8;
 const ROBUST_LIST_HEAD_SIZE: u64 = 3 * std::mem::size_of::<u64>() as u64;
@@ -4029,7 +4032,9 @@ fn pidfd_open(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
 // TODO-HUMAN-REVIEW(PR-213): Review host-backed AF_INET socket creation.
 fn socket(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
     let domain = args[0] as libc::c_int;
-    if !matches!(domain, libc::AF_UNIX | libc::AF_INET) {
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-235): Review host-backed AF_INET6 socket creation.
+    if !matches!(domain, libc::AF_UNIX | libc::AF_INET | libc::AF_INET6) {
         return negative_errno(libc::EAFNOSUPPORT);
     }
     let protocol = args[2] as libc::c_int;
@@ -4108,6 +4113,18 @@ fn getsockopt(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]
     }
     if capacity != 0 && args[3] == 0 {
         return negative_errno(libc::EFAULT);
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-235): Review deterministic SO_NETNS_COOKIE semantics.
+    if args[2] as libc::c_int == libc::SO_NETNS_COOKIE {
+        let bytes = GUEST_NETNS_COOKIE.to_ne_bytes();
+        let copy_length = capacity.min(bytes.len());
+        if copy_length != 0 && memory.write(args[3], &bytes[..copy_length]).is_err() {
+            return negative_errno(libc::EFAULT);
+        }
+        let result_length = copy_length as libc::socklen_t;
+        return write_struct(memory, args[4], &result_length);
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -10693,6 +10710,60 @@ mod tests {
         assert_ne!(first_cookie, 0);
         assert_ne!(first_cookie, second_cookie);
         assert_eq!(first_cookie, alias_cookie);
+    }
+
+    #[test]
+    fn getsockopt_so_netns_cookie_is_shared_by_sockets() {
+        const RESULT: u64 = 0x100;
+        const RESULT_LENGTH: u64 = 0x200;
+
+        fn cookie(memory: &mut GuestMemory, state: &mut LoadedStaticElf, fd: libc::c_int) -> u64 {
+            let full_length = std::mem::size_of::<u64>() as libc::socklen_t;
+            assert_eq!(write_struct(memory, RESULT_LENGTH, &full_length), 0);
+            assert_eq!(
+                syscall_result(
+                    memory,
+                    state,
+                    libc::SYS_getsockopt,
+                    [
+                        fd as u64,
+                        libc::SOL_SOCKET as u64,
+                        libc::SO_NETNS_COOKIE as u64,
+                        RESULT,
+                        RESULT_LENGTH,
+                        0,
+                    ],
+                ),
+                0
+            );
+            assert_eq!(
+                read_struct::<libc::socklen_t>(memory, RESULT_LENGTH),
+                full_length
+            );
+            read_struct::<u64>(memory, RESULT)
+        }
+
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let stream = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_socket,
+            [libc::AF_INET as u64, libc::SOCK_STREAM as u64, 0, 0, 0, 0],
+        ) as libc::c_int;
+        let datagram = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_socket,
+            [libc::AF_INET as u64, libc::SOCK_DGRAM as u64, 0, 0, 0, 0],
+        ) as libc::c_int;
+
+        assert_eq!(cookie(&mut memory, &mut state, stream), GUEST_NETNS_COOKIE);
+        assert_eq!(
+            cookie(&mut memory, &mut state, datagram),
+            GUEST_NETNS_COOKIE
+        );
     }
 
     #[test]
