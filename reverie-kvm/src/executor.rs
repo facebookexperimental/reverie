@@ -4137,11 +4137,24 @@ fn recvmmsg(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) 
 }
 
 // TODO-HUMAN-REVIEW(PR-92): Review this KVM compatibility implementation.
-fn ioctl(state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
-    if host_fd(state, args[0] as libc::c_int).is_none() {
+fn ioctl(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    let guest_fd = args[0] as libc::c_int;
+    if host_fd(state, guest_fd).is_none() {
         return negative_errno(libc::EBADF);
     }
     match args[1] as libc::c_ulong {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-TBD): Review virtual FIOCLEX/FIONCLEX descriptor flags.
+        libc::FIOCLEX => {
+            state.cloexec_fds.insert(guest_fd);
+            0
+        }
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-TBD): Review virtual FIOCLEX/FIONCLEX descriptor flags.
+        libc::FIONCLEX => {
+            state.cloexec_fds.remove(&guest_fd);
+            0
+        }
         libc::TCGETS | libc::TIOCGWINSZ | libc::TIOCGPGRP => negative_errno(libc::ENOTTY),
         _ => negative_errno(libc::ENOTTY),
     }
@@ -14016,6 +14029,53 @@ mod tests {
                 &mut state,
                 libc::SYS_read,
                 [0, 0x100, 1, 0, 0, 0],
+            ),
+            negative_errno(libc::EBADF)
+        );
+    }
+
+    #[test]
+    fn ioctl_cloexec_commands_update_guest_descriptor_flags() {
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        state
+            .files
+            .insert(3, std::fs::File::open("/dev/null").unwrap());
+        let host_fd = state.files.get(&3).unwrap().as_raw_fd();
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_ioctl,
+                [3, libc::FIOCLEX, 0, 0, 0, 0],
+            ),
+            0
+        );
+        assert!(state.cloexec_fds.contains(&3));
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_ioctl,
+                [3, libc::FIONCLEX, 0, 0, 0, 0],
+            ),
+            0
+        );
+        assert!(!state.cloexec_fds.contains(&3));
+        // The host descriptor remains private even when the guest clears its
+        // independently modeled close-on-exec bit.
+        assert_ne!(
+            unsafe { libc::fcntl(host_fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_ioctl,
+                [99, libc::FIOCLEX, 0, 0, 0, 0],
             ),
             negative_errno(libc::EBADF)
         );
