@@ -1082,7 +1082,7 @@ where
         regs.rdx = frame.rdx as u64;
         regs.rsi = frame.rsi as u64;
         regs.rdi = frame.rdi as u64;
-        regs.rip = frame.ret as u64;
+        regs.rip = frame.fake_ret as u64;
         regs.rsp = unsafe { (frame as *const crate::ffi::syscall_stackframe).add(1) as u64 };
         regs
     }
@@ -1096,6 +1096,10 @@ where
         };
         if regs.rax != current.rax
             || regs.orig_rax != current.orig_rax
+            // SaBRe resumes through an internal scratch trampoline. Rewriting
+            // RIP without also relocating its displaced instructions would
+            // leave the guest stack and instruction stream inconsistent.
+            || regs.rip != current.rip
             || regs.rsp != current.rsp
             || regs.eflags != current.eflags
             || regs.cs != current.cs
@@ -1125,7 +1129,6 @@ where
         frame.rdx = regs.rdx as *mut libc::c_void;
         frame.rsi = regs.rsi as *mut libc::c_void;
         frame.rdi = regs.rdi as *mut libc::c_void;
-        frame.ret = regs.rip as *mut libc::c_void;
         Ok(())
     }
 
@@ -1235,7 +1238,7 @@ where
     // TODO-HUMAN-REVIEW(PR-140): Review the intentionally single-frame backtrace contract.
     fn backtrace(&mut self) -> Option<Backtrace> {
         let frame = crate::callbacks::current_syscall_frame()?;
-        let ip = unsafe { (*frame).ret as u64 };
+        let ip = unsafe { (*frame).fake_ret as u64 };
         Some(Backtrace::new(
             self.tid,
             vec![Frame {
@@ -1570,12 +1573,17 @@ mod tests {
             assert_eq!(regs.rip, 0xf00d);
             assert_eq!(guest.backtrace().unwrap().iter().next().unwrap().ip, 0xf00d);
 
-            let mut unsupported = regs;
-            unsupported.rsp += 8;
-            assert!(guest.set_regs(unsupported).await.is_err());
+            let mut unsupported_rsp = regs;
+            unsupported_rsp.rsp += 8;
+            assert!(guest.set_regs(unsupported_rsp).await.is_err());
+
+            let mut unsupported_rip = regs;
+            unsupported_rip.rip = 0xbeef;
+            assert!(guest.set_regs(unsupported_rip).await.is_err());
 
             regs.r15 = 1515;
-            regs.rip = 0xbeef;
+            regs.rcx = 0xcafe;
+            regs.r11 = 0x202;
             guest.set_regs(regs).await?;
             Ok(123)
         }
@@ -1591,7 +1599,8 @@ mod tests {
         frame.rdi = 10usize as *mut libc::c_void;
         frame.rsi = 20usize as *mut libc::c_void;
         frame.rdx = 30usize as *mut libc::c_void;
-        frame.ret = 0xf00dusize as *mut libc::c_void;
+        frame.fake_ret = 0xf00dusize as *mut libc::c_void;
+        frame.ret = 0xdeadusize as *mut libc::c_void;
 
         assert!(crate::callbacks::current_syscall_frame().is_none());
         {
@@ -1603,7 +1612,10 @@ mod tests {
         }
         assert!(crate::callbacks::current_syscall_frame().is_none());
         assert_eq!(frame.r15 as usize, 1515);
-        assert_eq!(frame.ret as usize, 0xbeef);
+        assert_eq!(frame.rcx as usize, 0xcafe);
+        assert_eq!(frame.r11 as usize, 0x202);
+        assert_eq!(frame.fake_ret as usize, 0xf00d);
+        assert_eq!(frame.ret as usize, 0xdead);
     }
 
     #[derive(Default)]

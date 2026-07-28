@@ -86,10 +86,12 @@ pub struct syscall_stackframe {
     pub rcx: *mut libc::c_void,
     pub rbx: *mut libc::c_void,
     pub rbp_prologue: *mut libc::c_void,
-    // trampoline
+    /// Architectural guest return address after the patched syscall. SaBRe's
+    /// assembly calls this the fake return because the handler discards this
+    /// stack slot before returning through the scratch trampoline.
     pub fake_ret: *mut libc::c_void,
-    /// Syscall return address. This is where execution should continue after a
-    /// syscall has been handled.
+    /// Internal scratch-trampoline continuation. This restores the red zone,
+    /// executes displaced instructions, and then resumes guest code.
     pub ret: *mut libc::c_void,
 }
 
