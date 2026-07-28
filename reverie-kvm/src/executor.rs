@@ -918,6 +918,9 @@ fn mutates_file_table(number: u64) -> bool {
             || number == libc::SYS_dup as u64
             || number == libc::SYS_dup2 as u64
             || number == libc::SYS_dup3 as u64
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-229): Review ioctl descriptor-table serialization.
+            || number == libc::SYS_ioctl as u64
             || number == libc::SYS_fcntl as u64
             || number == libc::SYS_open as u64
             || number == libc::SYS_openat as u64
@@ -14041,41 +14044,54 @@ mod tests {
         state
             .files
             .insert(3, std::fs::File::open("/dev/null").unwrap());
-        let host_fd = state.files.get(&3).unwrap().as_raw_fd();
-        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let mut executor = ElfExecutor::new(state, false);
 
         assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_ioctl,
-                [3, libc::FIOCLEX, 0, 0, 0, 0],
+            executor.execute(
+                &SyscallRequest::new(libc::SYS_ioctl as u64, [3, libc::FIOCLEX, 0, 0, 0, 0],),
+                &memory,
             ),
             0
         );
-        assert!(state.cloexec_fds.contains(&3));
         assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_ioctl,
-                [3, libc::FIONCLEX, 0, 0, 0, 0],
+            executor.execute(
+                &SyscallRequest::new(
+                    libc::SYS_fcntl as u64,
+                    [3, libc::F_GETFD as u64, 0, 0, 0, 0],
+                ),
+                &memory,
+            ),
+            i64::from(libc::FD_CLOEXEC)
+        );
+        assert_eq!(
+            executor.execute(
+                &SyscallRequest::new(libc::SYS_ioctl as u64, [3, libc::FIONCLEX, 0, 0, 0, 0],),
+                &memory,
             ),
             0
         );
-        assert!(!state.cloexec_fds.contains(&3));
+        assert_eq!(
+            executor.execute(
+                &SyscallRequest::new(
+                    libc::SYS_fcntl as u64,
+                    [3, libc::F_GETFD as u64, 0, 0, 0, 0],
+                ),
+                &memory,
+            ),
+            0
+        );
         // The host descriptor remains private even when the guest clears its
         // independently modeled close-on-exec bit.
+        let host_fd = executor.state.files.get(&3).unwrap().as_raw_fd();
         assert_ne!(
             unsafe { libc::fcntl(host_fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
             0
         );
         assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_ioctl,
-                [99, libc::FIOCLEX, 0, 0, 0, 0],
+            executor.execute(
+                &SyscallRequest::new(libc::SYS_ioctl as u64, [99, libc::FIOCLEX, 0, 0, 0, 0],),
+                &memory,
             ),
             negative_errno(libc::EBADF)
         );
