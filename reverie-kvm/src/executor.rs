@@ -4524,7 +4524,7 @@ fn fstatfs_host(memory: &mut GuestMemory, host_fd: RawFd, output: u64) -> i64 {
     // SAFETY: fstatfs initialized stat on success.
     let mut stat = unsafe { stat.assume_init() };
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-pending): the raw host statfs leaks
+    // TODO-HUMAN-REVIEW(PR-225): the raw host statfs leaks
     // nondeterministic values (free blocks/inodes drift as the host disk is
     // written, and f_fsid identifies the host filesystem), which breaks
     // --verify for any statfs consumer (df, tar, stat -f). Canonicalize the
@@ -4536,7 +4536,7 @@ fn fstatfs_host(memory: &mut GuestMemory, host_fd: RawFd, output: u64) -> i64 {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-pending): mirror of detcore's statfs canonicalization
+// TODO-HUMAN-REVIEW(PR-225): mirror of detcore's statfs canonicalization
 // (FREE_BLOCKS_CAP / FREE_INODES_CAP, clamp free to totals, zero f_fsid) so
 // the KVM backend matches ptrace L2 determinism for statfs.
 fn canonicalize_statfs(sf: &mut libc::statfs) {
@@ -5303,7 +5303,7 @@ fn synthetic_proc_path_for_inode(inode: u64) -> Option<&'static [u8]> {
         b"/proc/mounts",
         b"/proc/self/mounts",
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-pending): /proc/self/mountinfo added to the
+        // TODO-HUMAN-REVIEW(PR-225): /proc/self/mountinfo added to the
         // synthetic surface so fstat/statx on its descriptor resolves to the
         // same stable synthetic inode as the other served /proc files.
         b"/proc/self/mountinfo",
@@ -5388,7 +5388,7 @@ fn synthetic_proc_content(state: &LoadedStaticElf, path: &[u8]) -> Option<Vec<u8
         b"/proc/filesystems" => b"nodev\tproc\nnodev\ttmpfs\n\text4\n".to_vec(),
         b"/proc/mounts" | b"/proc/self/mounts" => b"rootfs / rootfs rw 0 0\n".to_vec(),
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-pending): /proc/self/mountinfo is the primary
+        // TODO-HUMAN-REVIEW(PR-225): /proc/self/mountinfo is the primary
         // mount table modern gnulib/coreutils read (df reads it before falling
         // back to /etc/mtab). Serve a single deterministic rootfs entry
         // consistent with the /proc/mounts surface above. Fields:
@@ -8147,7 +8147,7 @@ mod tests {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-pending): regression for the /proc/self/mountinfo
+    // TODO-HUMAN-REVIEW(PR-225): regression for the /proc/self/mountinfo
     // synthetic surface (content bytes, read path, and inode round-trip) added
     // for df compatibility under --backend kvm.
     #[test]
@@ -8191,7 +8191,7 @@ mod tests {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-pending): regression for statfs canonicalization,
+    // TODO-HUMAN-REVIEW(PR-225): regression for statfs canonicalization,
     // matching detcore's canonicalize_statfs_buf so KVM statfs/fstatfs is
     // bitwise-deterministic across runs (df, tar, stat -f).
     #[test]
