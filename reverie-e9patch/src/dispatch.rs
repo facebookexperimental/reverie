@@ -97,6 +97,161 @@ pub(crate) fn fallback_dispatch_count() -> u64 {
     FALLBACK_TOTAL.load(Ordering::Relaxed)
 }
 
+/// Distinct un-rewritten syscall *sites* (instruction addresses) tracked
+/// individually by the per-site fallback counters.
+///
+/// e9patch's residual fallback surface is small by construction — the dynamic
+/// loader/startup code, the vDSO, and any site `e9tool` could not rewrite ahead
+/// of time — so a bounded open-addressing table covers it without allocation.
+/// Sites beyond this bound are still reflected in [`fallback_dispatch_count`] and
+/// tallied in [`fallback_site_overflow`], never silently dropped.
+const TRACKED_SITES: usize = 256;
+
+/// A bounded, async-signal-safe open-addressing table mapping an un-rewritten
+/// syscall *site* (instruction address) to how many times it reached the shared
+/// fallback dispatcher.
+///
+/// Fixed capacity `N`, no allocation, no locks: [`record`](Self::record) is a
+/// bounded linear probe using only relaxed atomics plus one `compare_exchange`
+/// to claim an empty slot, so it is safe to call from inside the `SIGSYS`
+/// handler. Slots are never freed, so a placed site's probe chain never regains
+/// an empty slot — which is exactly what lets [`count`](Self::count) stop at the
+/// first empty slot. A service that cannot claim a slot is tallied in `overflow`
+/// rather than dropped, so per-site data can be honestly reported as incomplete
+/// without ever losing the exact total.
+struct SiteTable<const N: usize> {
+    /// Instruction address occupying each slot (`0` == empty).
+    addr: [AtomicU64; N],
+    /// Fallback-service count for the site in the matching [`Self::addr`] slot.
+    count: [AtomicU64; N],
+    /// Services that could not be attributed to a slot (table full).
+    overflow: AtomicU64,
+}
+
+impl<const N: usize> SiteTable<N> {
+    const fn new() -> Self {
+        Self {
+            addr: [const { AtomicU64::new(0) }; N],
+            count: [const { AtomicU64::new(0) }; N],
+            overflow: AtomicU64::new(0),
+        }
+    }
+
+    /// Multiplicative (Fibonacci) hash. Instruction addresses vary in their low
+    /// bits per site, so spreading the high bits of the product avoids clustering
+    /// adjacent syscall instructions into one probe chain.
+    fn hash(address: u64) -> usize {
+        const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
+        (address.wrapping_mul(GOLDEN) >> 40) as usize % N
+    }
+
+    /// Record one fallback service for the site at `address`.
+    fn record(&self, address: u64) {
+        // Address 0 is never a mapped executable site and doubles as the
+        // empty-slot sentinel, so route it to overflow instead of corrupting the
+        // sentinel. In practice a trapping syscall instruction is never at 0.
+        if address == 0 {
+            self.overflow.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let start = Self::hash(address);
+        for step in 0..N {
+            let index = (start + step) % N;
+            let current = self.addr[index].load(Ordering::Relaxed);
+            if current == address {
+                self.count[index].fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            if current == 0 {
+                match self.addr[index].compare_exchange(
+                    0,
+                    address,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    // Claimed the empty slot for this address.
+                    Ok(_) => {
+                        self.count[index].fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                    // Lost the race but the winner took it for *our* address.
+                    Err(winner) if winner == address => {
+                        self.count[index].fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                    // Lost to a different address; keep probing.
+                    Err(_) => {}
+                }
+            }
+        }
+        self.overflow.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Fallback-service count recorded for the site at `address`.
+    ///
+    /// Returns `0` for `address == 0`, a never-seen site, or a site displaced by
+    /// overflow. Correct despite concurrent recording: slots only transition
+    /// empty→occupied, so stopping at the first empty slot never skips a site
+    /// that was already placed earlier in the same probe chain.
+    fn count(&self, address: u64) -> u64 {
+        if address == 0 {
+            return 0;
+        }
+        let start = Self::hash(address);
+        for step in 0..N {
+            let index = (start + step) % N;
+            let current = self.addr[index].load(Ordering::Relaxed);
+            if current == address {
+                return self.count[index].load(Ordering::Relaxed);
+            }
+            if current == 0 {
+                return 0;
+            }
+        }
+        0
+    }
+
+    /// Services that could not be attributed to a per-site slot.
+    fn overflow_count(&self) -> u64 {
+        self.overflow.load(Ordering::Relaxed)
+    }
+}
+
+// TODO-HUMAN-REVIEW(PR-253): Review public per-site fallback-surface observability.
+/// Per-site fallback counts, keyed by the un-rewritten site's instruction
+/// address (the address-keyed analog of LiteInst's per-site trap counter).
+static FALLBACK_SITES: SiteTable<TRACKED_SITES> = SiteTable::new();
+
+/// Record that the shared fallback dispatcher serviced a syscall issued at
+/// `address` (an un-rewritten site's instruction pointer).
+///
+/// Async-signal-safe (see [`SiteTable`]), so it is safe to call from inside the
+/// `SIGSYS` handler alongside [`record_fallback_dispatch`].
+pub(crate) fn record_fallback_site(address: u64) {
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    FALLBACK_SITES.record(address);
+}
+
+/// Number of times the fallback dispatcher serviced a syscall issued at the
+/// un-rewritten site `address`.
+///
+/// This is the address-keyed analog of LiteInst's per-site trap count: it
+/// localizes the residual fallback surface to the exact instruction addresses
+/// `e9tool` could not rewrite ahead of time, complementing the by-syscall-number
+/// view from [`fallback_syscall_count`].
+pub(crate) fn fallback_site_count(address: u64) -> u64 {
+    FALLBACK_SITES.count(address)
+}
+
+/// Fallback services that could not be attributed to a per-site slot because the
+/// bounded [`SiteTable`] was full.
+///
+/// Nonzero means per-site localization is incomplete; the totals from
+/// [`fallback_dispatch_count`] and [`fallback_syscall_count`] stay exact.
+pub(crate) fn fallback_site_overflow() -> u64 {
+    FALLBACK_SITES.overflow_count()
+}
+
 /// Number of times syscall `number` reached the shared fallback dispatcher.
 ///
 /// Returns `0` for a negative number or one at or above [`TRACKED_SYSCALLS`],
@@ -139,12 +294,14 @@ impl SyscallDispatcher for E9patchDispatcher {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // e9patch's fast path is the AOT trampoline, which never enters this
         // handler. Anything that *does* trap here is an un-rewritten fallback
-        // site, so record it for observability, then defer entirely to the
-        // shared, reviewed-once policy that LiteInst also uses. Counting does
+        // site, so record it for observability — both by syscall number and by
+        // the un-rewritten site's instruction address — then defer entirely to
+        // the shared, reviewed-once policy that LiteInst also uses. Counting does
         // not change the forwarding decision, so the SIGSYS path stays identical
         // across the two ld-preload backends; only patch timing and trampoline
         // placement differ.
         record_fallback_dispatch(event.number());
+        record_fallback_site(event.instruction_pointer());
         self.passthrough.dispatch(event);
     }
 }
@@ -182,6 +339,79 @@ mod tests {
             fallback_dispatch_count() > total_before,
             "total must advance by at least this recording"
         );
+    }
+
+    #[test]
+    fn recording_a_fallback_site_bumps_only_that_sites_count() {
+        // A private table keeps this assertion exact regardless of the
+        // process-global counters other tests touch.
+        let table = SiteTable::<8>::new();
+        let site: u64 = 0x4000_1234;
+        assert_eq!(table.count(site), 0);
+        for expected in 1..=5 {
+            table.record(site);
+            assert_eq!(table.count(site), expected);
+        }
+        // A different, never-recorded site stays at zero.
+        assert_eq!(table.count(0x4000_9999), 0);
+        assert_eq!(table.overflow_count(), 0);
+    }
+
+    #[test]
+    fn distinct_sites_are_counted_independently() {
+        let table = SiteTable::<8>::new();
+        let a: u64 = 0x1000;
+        let b: u64 = 0x2000;
+        table.record(a);
+        table.record(b);
+        table.record(b);
+        assert_eq!(table.count(a), 1);
+        assert_eq!(table.count(b), 2);
+    }
+
+    #[test]
+    fn zero_address_is_routed_to_overflow_not_the_table() {
+        // Address 0 doubles as the empty-slot sentinel, so it must never claim a
+        // real slot; it is counted only in overflow.
+        let table = SiteTable::<4>::new();
+        table.record(0);
+        assert_eq!(table.count(0), 0);
+        assert_eq!(table.overflow_count(), 1);
+    }
+
+    #[test]
+    fn full_table_overflows_without_dropping_known_sites() {
+        // Fill every slot with a distinct site, then prove a brand-new site
+        // overflows while an already-tracked site still increments.
+        let table = SiteTable::<4>::new();
+        let sites: [u64; 4] = [0x1000, 0x2000, 0x3000, 0x4000];
+        for site in sites {
+            table.record(site);
+        }
+        for site in sites {
+            assert_eq!(table.count(site), 1);
+        }
+        // A fifth distinct site cannot claim a slot: counted in overflow, not the
+        // table, and its per-site count reads back as zero.
+        let overflow_site: u64 = 0x5000;
+        table.record(overflow_site);
+        assert_eq!(table.count(overflow_site), 0);
+        assert_eq!(table.overflow_count(), 1);
+        // An already-tracked site still increments even with the table full.
+        table.record(sites[0]);
+        assert_eq!(table.count(sites[0]), 2);
+        assert_eq!(table.overflow_count(), 1);
+    }
+
+    #[test]
+    fn global_site_recording_bumps_the_matching_site() {
+        // Exercise the process-global path the SIGSYS handler uses, with an
+        // address unique to this test so the assertion is exact under concurrency.
+        let site: u64 = 0x7f00_dead_0001;
+        let before = fallback_site_count(site);
+        record_fallback_site(site);
+        assert_eq!(fallback_site_count(site), before + 1);
+        assert_eq!(fallback_site_count(0), 0);
     }
 
     #[test]

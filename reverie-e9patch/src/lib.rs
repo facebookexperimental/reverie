@@ -280,6 +280,39 @@ pub extern "C" fn reverie_e9patch_fallback_syscall_count(number: i64) -> u64 {
     dispatch::fallback_syscall_count(number)
 }
 
+// TODO-HUMAN-REVIEW(PR-253): Review public per-site fallback-surface observability.
+/// Number of times the fallback dispatcher serviced a syscall issued at the
+/// un-rewritten site `address`.
+///
+/// This is the **address-keyed** analog of LiteInst's
+/// `reverie_liteinst_site_trap_count`, closing the round-4 gap where the e9patch
+/// fallback was observable only by syscall number: it localizes the residual
+/// fallback surface to the exact instruction addresses `e9tool` could not rewrite
+/// ahead of time (loader/startup, vDSO, uncovered or JIT-emitted sites). There is
+/// no `hook`-count analog — the fallback never installs a runtime hook (that is
+/// the AOT-vs-runtime difference), so every execution of an un-rewritten site
+/// traps, making this the direct analog of LiteInst's *trap* count specifically.
+/// Returns `0` for a never-seen site or one displaced by
+/// [`reverie_e9patch_fallback_site_overflow`].
+#[unsafe(no_mangle)]
+pub extern "C" fn reverie_e9patch_fallback_site_count(address: u64) -> u64 {
+    dispatch::fallback_site_count(address)
+}
+
+// TODO-HUMAN-REVIEW(PR-253): Review public per-site fallback-surface observability.
+/// Fallback services that could not be attributed to a per-site slot because the
+/// bounded site table was full.
+///
+/// A nonzero value means per-site localization via
+/// [`reverie_e9patch_fallback_site_count`] is incomplete; the process-wide totals
+/// from [`reverie_e9patch_fallback_dispatch_count`] and
+/// [`reverie_e9patch_fallback_syscall_count`] remain exact. Reported explicitly
+/// so a bounded table never masquerades as full coverage.
+#[unsafe(no_mangle)]
+pub extern "C" fn reverie_e9patch_fallback_site_overflow() -> u64 {
+    dispatch::fallback_site_overflow()
+}
+
 /// Magic RAX value identifying an e9patch replacement-syscall trap.
 // TODO-HUMAN-REVIEW(PR-102): Review the public injected-event ABI marker.
 pub const E9PATCH_SYSCALL_TRAP_MARKER: u64 = 0x7265_7665_3965_3970;

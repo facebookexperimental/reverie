@@ -118,15 +118,31 @@ the guest through two C-ABI counters:
   shared fallback dispatcher.
 - `reverie_e9patch_fallback_syscall_count(number)` — the per-syscall-number
   breakdown.
+- `reverie_e9patch_fallback_site_count(address)` — the per-**site** breakdown,
+  keyed by the un-rewritten instruction's address.
+- `reverie_e9patch_fallback_site_overflow()` — fallback services that could not
+  be attributed to a per-site slot because the bounded site table was full.
 
-This is the e9patch analog of LiteInst's `reverie_liteinst_site_trap_count` /
-`reverie_liteinst_site_hook_count` exports, keyed by **syscall number** rather
-than by **site address** — the one difference that follows from e9patch having
-no runtime sites to key on (its trampolines are materialized ahead of time).
-Counting is relaxed-atomic and async-signal-safe, does not change the shared
-forwarding decision, and directly answers the coverage question above: a count
-near zero confirms e9tool's ahead-of-time rewriting is carrying the syscall
-load, while a large count localizes the un-rewritten surface by syscall.
+The per-site counter is the **address-keyed** analog of LiteInst's
+`reverie_liteinst_site_trap_count(address)`. Earlier the e9patch fallback was
+observable only by **syscall number**; the shared
+`reverie_preload::dispatch::SyscallEvent` also exposes the trapping
+`instruction_pointer()`, so the residual sites e9patch could not rewrite ahead of
+time (loader/startup, vDSO, uncovered or JIT-emitted code) *do* have addresses to
+key on. There is no `hook`-count analog: the fallback never installs a runtime
+hook (that is the AOT-vs-runtime difference), so every execution of an
+un-rewritten site traps — making the per-site count the analog of LiteInst's
+*trap* count specifically. The per-site table is bounded and async-signal-safe (a
+fixed open-addressing table using only relaxed atomics plus one
+`compare_exchange`, no allocation or locks); a site that cannot claim a slot is
+tallied in the overflow counter rather than dropped, so a bounded table never
+masquerades as full coverage.
+
+All counting is relaxed-atomic and async-signal-safe, does not change the shared
+forwarding decision, and directly answers the coverage question above: counts
+near zero confirm e9tool's ahead-of-time rewriting is carrying the syscall load,
+while nonzero counts localize the un-rewritten surface both by syscall number and
+by exact instruction address.
 
 ## Preload And RPC Boundary
 
