@@ -174,6 +174,7 @@ extern "C" fn handle_clone_child_start<T: ToolGlobal>() {
     // CLONE_SETTLS installs the guest's fresh TLS before this callback runs,
     // resetting SaBRe's recursion guard. Restore plugin context before Rust
     // touches thread-local state or locks, both of which may issue syscalls.
+    // TODO-HUMAN-REVIEW(PR-226): Review clone-child recursion guard restoration.
     unsafe { ffi::enter_plugin() };
 
     if Thread::<T>::current().is_none() {

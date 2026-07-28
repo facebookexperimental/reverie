@@ -202,6 +202,7 @@ pub unsafe fn clone3_syscall(
         "push rdi",
         "push rsi",
         "push rdx",
+        // TODO-HUMAN-REVIEW(PR-226): Review clone3 callback stack alignment.
         "push r10", // unused clone3 argument; keeps the callback stack aligned
         "push r8",
         "push r9",
