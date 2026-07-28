@@ -362,7 +362,7 @@ fn execute_basic_syscall_with_output(
         duplicate_fd(state, args[0], Some(args[1]), args[2], true)
     } else if number == libc::SYS_fcntl as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        fcntl(state, args)
+        fcntl(memory, state, args)
     } else if number == libc::SYS_open as u64 {
         open(memory, state, args)
     } else if number == libc::SYS_openat as u64 {
@@ -1661,6 +1661,12 @@ fn writev(
 // TODO-HUMAN-REVIEW(#120): guest readv scatters into each iovec via the
 // scalar read path; a short read or EOF stops the scatter, matching readv(2).
 fn readv(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    let Ok(fd) = libc::c_int::try_from(args[0]) else {
+        return negative_errno(libc::EBADF);
+    };
+    if state.proc_files.contains_key(&fd) {
+        return negative_errno(libc::ENOSYS);
+    }
     let Ok(count) = usize::try_from(args[2]) else {
         return negative_errno(libc::EINVAL);
     };
@@ -4971,6 +4977,7 @@ fn synthetic_proc_path_for_inode(inode: u64) -> Option<&'static [u8]> {
         b"/proc/stat",
         b"/proc/meminfo",
         b"/proc/cpuinfo",
+        b"/proc/locks",
         b"/proc/self/stat",
         b"/proc/self/status",
         b"/proc/self/cmdline",
@@ -5013,6 +5020,9 @@ fn synthetic_proc_relative_path(
 fn normalize_proc_path(state: &LoadedStaticElf, path: &[u8]) -> Option<Vec<u8>> {
     if path != b"/proc" && !path.starts_with(b"/proc/") {
         return None;
+    }
+    if path == b"/proc/self/../locks" {
+        return Some(b"/proc/locks".to_vec());
     }
     let pid = format!("/proc/{}", state.pid).into_bytes();
     if path == pid.as_slice() {
@@ -5078,12 +5088,45 @@ fn synthetic_proc_content(state: &LoadedStaticElf, path: &[u8]) -> Option<Vec<u8
         )
         .as_bytes()
         .to_vec(),
+        b"/proc/locks" => proc_locks_content(state),
         b"/proc/self/stat" => proc_self_stat_content(state),
         b"/proc/self/status" => proc_self_status_content(state),
         b"/proc/self/cmdline" => proc_self_cmdline_content(state),
         _ => return None,
     };
     Some(content)
+}
+
+// TODO-HUMAN-REVIEW(PR-211): Review guest-owned /proc/locks filtering.
+fn proc_locks_content(state: &LoadedStaticElf) -> Vec<u8> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut rows = Vec::new();
+    for file in state.files.values() {
+        let Ok(fdinfo) = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))
+        else {
+            continue;
+        };
+        for line in fdinfo.lines() {
+            let Some(details) = line
+                .strip_prefix("lock:")
+                .map(str::trim)
+                .and_then(|line| line.split_once(' ').map(|(_, details)| details))
+            else {
+                continue;
+            };
+            if !seen.insert(details.to_owned()) {
+                continue;
+            }
+            let mut fields = details.split_whitespace().collect::<Vec<_>>();
+            if fields.len() != 7 || fields[4].split(':').count() != 3 {
+                continue;
+            }
+            let object = format!("00:00:{}", rows.len() + 1);
+            fields[4] = &object;
+            rows.push(format!("{}: {}\n", rows.len() + 1, fields.join(" ")));
+        }
+    }
+    rows.concat().into_bytes()
 }
 
 /// The kernel's `comm`: the program basename, capped at 15 bytes.
@@ -5187,9 +5230,11 @@ fn open_synthetic_proc_directory(
     flags: u64,
     close_on_exec: bool,
 ) -> i64 {
-    let unsupported =
-        (libc::O_CREAT | libc::O_EXCL | libc::O_PATH | libc::O_TMPFILE | libc::O_TRUNC) as u64;
+    let unsupported = (libc::O_CREAT | libc::O_EXCL | libc::O_PATH | libc::O_TRUNC) as u64;
     if flags & unsupported != 0 {
+        return negative_errno(libc::EINVAL);
+    }
+    if flags & libc::O_TMPFILE as u64 == libc::O_TMPFILE as u64 {
         return negative_errno(libc::EINVAL);
     }
     if flags & libc::O_ACCMODE as u64 != libc::O_RDONLY as u64 {
@@ -5434,7 +5479,7 @@ fn host_fd(state: &LoadedStaticElf, guest_fd: libc::c_int) -> Option<RawFd> {
 }
 
 // TODO-HUMAN-REVIEW(PR-52): Review KVM guest fcntl compatibility boundaries.
-fn fcntl(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
+fn fcntl(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
     let guest_fd = args[0] as libc::c_int;
     let source_alias = output_alias(state, guest_fd);
     let source_proc_inode = state.proc_files.get(&guest_fd).copied();
@@ -5496,6 +5541,30 @@ fn fcntl(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
             let flags = args[2] as libc::c_int & settable;
             // SAFETY: host_fd names a live descriptor; F_SETFL consumes one int flag word.
             zero_or_errno(unsafe { libc::fcntl(host_fd, libc::F_SETFL, flags) })
+        }
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-211): Review KVM advisory-lock forwarding.
+        command @ (libc::F_SETLK | libc::F_SETLKW | libc::F_OFD_SETLK | libc::F_OFD_SETLKW) => {
+            let mut lock = match read_guest_struct::<libc::flock>(memory, args[2]) {
+                Ok(lock) => lock,
+                Err(error) => return error,
+            };
+            // FileTableState synchronizes descriptors with dup(2). Closing any
+            // duplicate releases process-associated POSIX locks, whereas OFD
+            // locks correctly remain attached to the shared open description.
+            let host_command = match command {
+                libc::F_SETLK => {
+                    lock.l_pid = 0;
+                    libc::F_OFD_SETLK
+                }
+                libc::F_SETLKW => {
+                    lock.l_pid = 0;
+                    libc::F_OFD_SETLKW
+                }
+                command => command,
+            };
+            // SAFETY: host_fd is live and lock is a fully initialized flock value.
+            zero_or_errno(unsafe { libc::fcntl(host_fd, host_command, &lock) })
         }
         _ => negative_errno(libc::ENOSYS),
     }
@@ -7701,7 +7770,20 @@ mod tests {
         let mut state = test_state(&root.0);
         let mut memory = GuestMemory::new(0, 0x4000).unwrap();
 
-        let proc_fd = open_readonly(&mut memory, &mut state, "/proc");
+        write_c_string(&mut memory, 0x100, "/proc");
+        let proc_fd = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_openat,
+            [
+                libc::AT_FDCWD as u64,
+                0x100,
+                (libc::O_RDONLY | libc::O_DIRECTORY) as u64,
+                0,
+                0,
+                0,
+            ],
+        );
         assert!(proc_fd >= 0, "open /proc failed: {proc_fd}");
 
         let stat_address = 0x1000;
@@ -7946,6 +8028,18 @@ mod tests {
         // An unlisted /proc path is not part of the synthesized surface.
         assert!(synthetic_proc_content(&state, b"/proc/self/maps").is_none());
         assert!(synthetic_proc_content(&state, b"/etc/passwd").is_none());
+
+        let fd = open_readonly(&mut memory, &mut state, "/proc/uptime");
+        assert!(fd >= 0);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_readv,
+                [fd as u64, 0x200, 1, 0, 0, 0]
+            ),
+            negative_errno(libc::ENOSYS)
+        );
     }
 
     #[test]
@@ -8117,6 +8211,79 @@ mod tests {
         );
         assert!(flags >= 0);
         assert_ne!(flags as libc::c_int & libc::O_NONBLOCK, 0);
+    }
+
+    #[test]
+    fn fcntl_advisory_locks_apply_to_host_descriptors() {
+        const LOCK: u64 = 0x100;
+
+        let root = TestDir::new();
+        let path = root.0.join("locked");
+        let first = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        let second = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut state = test_state(&root.0);
+        state.files.insert(3, first);
+        state.files.insert(4, second);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let mut lock = libc::flock {
+            l_type: libc::F_WRLCK as libc::c_short,
+            l_whence: libc::SEEK_SET as libc::c_short,
+            l_start: 0,
+            l_len: 0,
+            // POSIX SETLK ignores this output-only field; OFD SETLK requires
+            // zero, so translation must not pass a caller's stale value.
+            l_pid: 1234,
+        };
+        assert_eq!(write_struct(&mut memory, LOCK, &lock), 0);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_fcntl,
+                [3, libc::F_SETLK as u64, LOCK, 0, 0, 0],
+            ),
+            0
+        );
+        let locks = synthetic_proc_content(&state, b"/proc/locks").unwrap();
+        assert_eq!(locks, b"1: OFDLCK ADVISORY WRITE -1 00:00:1 0 EOF\n");
+        assert_eq!(
+            synthetic_proc_content(&state, b"/proc/self/../locks").unwrap(),
+            locks
+        );
+        lock.l_pid = 0;
+        assert_eq!(write_struct(&mut memory, LOCK, &lock), 0);
+        let conflict = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_fcntl,
+            [4, libc::F_OFD_SETLK as u64, LOCK, 0, 0, 0],
+        );
+        assert!(
+            conflict == negative_errno(libc::EAGAIN) || conflict == negative_errno(libc::EACCES),
+            "unexpected conflicting lock result: {conflict}"
+        );
+
+        lock.l_type = libc::F_UNLCK as libc::c_short;
+        assert_eq!(write_struct(&mut memory, LOCK, &lock), 0);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_fcntl,
+                [3, libc::F_SETLK as u64, LOCK, 0, 0, 0],
+            ),
+            0
+        );
     }
 
     #[test]
