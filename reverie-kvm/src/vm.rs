@@ -196,6 +196,23 @@ impl GuestThreadGroup {
         }
     }
 
+    fn cancel_workers(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        let workers = self.workers.lock().expect("KVM guest worker lock poisoned");
+        for &worker in workers.iter() {
+            // SAFETY: the registry lock keeps each pthread ID live for this call.
+            unsafe {
+                libc::pthread_kill(worker, worker_interrupt_signal());
+            }
+        }
+    }
+
+    // TODO-HUMAN-REVIEW(PR-211): Review KVM exec sibling cancellation ordering.
+    fn rearm_after_exec(&self) {
+        *self.exit_code.lock().expect("KVM exit-group lock poisoned") = None;
+        self.cancelled.store(false, Ordering::Release);
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED: Reuse syscall transports after guest threads exit.
     // TODO-HUMAN-REVIEW(PR-176): Review KVM transport slot lifecycle.
     fn reserve_transport_slot(&self, child_tid: i32) -> Result<usize> {
@@ -794,7 +811,18 @@ impl KvmBackend {
                     )?;
                     parked?;
                 }
-                self.exec_process(executor, &image, &argv, &envp)?;
+                // A successful exec terminates every sibling thread before the
+                // new address space becomes visible. Leaving a sibling vCPU
+                // alive lets it execute stale instructions in the replacement
+                // image and can turn an otherwise successful exec into a fault.
+                if !self.is_guest_thread {
+                    self.cancel_guest_threads();
+                }
+                let result = self.exec_process(executor, &image, &argv, &envp);
+                if !self.is_guest_thread {
+                    self.thread_group.rearm_after_exec();
+                }
+                result?;
             }
         }
         Ok(())
@@ -1041,23 +1069,7 @@ impl KvmBackend {
 
     // TODO-HUMAN-REVIEW(PR-172): Review signal-driven KVM worker cancellation.
     pub(crate) fn cancel_guest_threads(&self) {
-        self.thread_group.cancelled.store(true, Ordering::Release);
-        {
-            let workers = self
-                .thread_group
-                .workers
-                .lock()
-                .expect("KVM guest worker lock poisoned");
-            for &worker in workers.iter() {
-                // SAFETY: worker was registered by a live guest host thread. The
-                // registry lock prevents it from unregistering and exiting before
-                // pthread_kill consumes the ID. The no-op handler exists only to
-                // interrupt its blocking host syscall.
-                unsafe {
-                    libc::pthread_kill(worker, worker_interrupt_signal());
-                }
-            }
-        }
+        self.thread_group.cancel_workers();
         if !self.is_guest_thread {
             self.thread_group.join_workers();
         }
@@ -1259,6 +1271,30 @@ mod tests {
         assert!(outer_finished.load(Ordering::Acquire));
         assert!(nested_finished.load(Ordering::Acquire));
         assert!(group.worker_handles.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn exec_cancellation_joins_and_rearms_the_thread_group() {
+        let group = Arc::new(GuestThreadGroup::default());
+        let worker_group = group.clone();
+        let worker_finished = Arc::new(AtomicBool::new(false));
+        let finished = worker_finished.clone();
+        group.add_worker_handle(std::thread::spawn(move || {
+            while !worker_group.cancelled.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            finished.store(true, Ordering::Release);
+        }));
+        *group.exit_code.lock().unwrap() = Some(127);
+
+        group.cancel_workers();
+        group.join_workers();
+        group.rearm_after_exec();
+
+        assert!(worker_finished.load(Ordering::Acquire));
+        assert!(group.worker_handles.lock().unwrap().is_empty());
+        assert_eq!(group.exit_code(), None);
+        assert!(!group.cancelled.load(Ordering::Acquire));
     }
 
     #[test]

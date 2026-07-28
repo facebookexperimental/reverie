@@ -118,6 +118,7 @@ fn deterministic_cpuid_table() -> CpuId {
 
 #[derive(Clone, Copy)]
 enum FeatureRegister {
+    Eax,
     Ebx,
     Ecx,
     Edx,
@@ -126,6 +127,7 @@ enum FeatureRegister {
 impl FeatureRegister {
     fn value(self, entry: &kvm_cpuid_entry2) -> u32 {
         match self {
+            Self::Eax => entry.eax,
             Self::Ebx => entry.ebx,
             Self::Ecx => entry.ecx,
             Self::Edx => entry.edx,
@@ -134,6 +136,7 @@ impl FeatureRegister {
 
     fn name(self) -> &'static str {
         match self {
+            Self::Eax => "eax",
             Self::Ebx => "ebx",
             Self::Ecx => "ecx",
             Self::Edx => "edx",
@@ -148,14 +151,20 @@ fn validate_required_features(host: &CpuId, fixed: &CpuId) -> Result<()> {
         (7, 0, FeatureRegister::Ebx),
         (7, 0, FeatureRegister::Ecx),
         (7, 0, FeatureRegister::Edx),
+        (0xd, 0, FeatureRegister::Eax),
         (0x8000_0001, 0, FeatureRegister::Ecx),
         (0x8000_0001, 0, FeatureRegister::Edx),
     ] {
-        let required = fixed
+        let mut required = fixed
             .as_slice()
             .iter()
             .find(|entry| entry.function == function && entry.index == index)
             .map_or(0, |entry| register.value(entry));
+        if function == 1 && matches!(register, FeatureRegister::Ecx) {
+            // KVM reports OSXSAVE dynamically from the guest's CR4.OSXSAVE
+            // rather than including it in KVM_GET_SUPPORTED_CPUID.
+            required &= !bit(27);
+        }
         if required == 0 {
             continue;
         }
@@ -186,15 +195,17 @@ fn cpuid_entry(function: u32, [eax, ebx, ecx, edx]: [u32; 4]) -> kvm_cpuid_entry
     }
 }
 
-// This starts from Detcore's fixed profile and narrows it to x86-64-v2 and
-// backend-safe features. KVM additionally applies the selected masks after
-// installing the table.
+// This starts from Detcore's fixed profile and narrows it to backend-safe
+// features. AVX remains enabled because the userspace-only guest must provide
+// the extended register state expected by host executables and dynamic
+// linkers. KVM additionally applies the selected masks after installing the
+// table.
 const DETERMINISTIC_STANDARD_CPUIDS: &[[u32; 4]] = &[
     [0x0000_000d, 0x756e_6547, 0x6c65_746e, 0x4965_6e69],
     [
         0x0000_0663,
         0x0000_0800,
-        bit(0) | bit(9) | bit(13) | bit(19) | bit(20) | bit(23),
+        bit(0) | bit(9) | bit(13) | bit(19) | bit(20) | bit(23) | bit(26) | bit(27) | bit(28),
         0x078b_fbfd,
     ],
     [0x0000_0001, 0x0000_0000, 0x0000_004d, 0x002c_307d],
@@ -208,7 +219,7 @@ const DETERMINISTIC_STANDARD_CPUIDS: &[[u32; 4]] = &[
     [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000],
     [0x0000_0000, 0x0000_0001, 0x0000_0100, 0x0000_0001],
     [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000],
-    [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000],
+    [0x0000_0007, 0x0000_0340, 0x0000_0340, 0x0000_0000],
     [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000],
     [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000],
     [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000],
@@ -261,7 +272,7 @@ mod tests {
             entry(0x8000_0000, 0),
             entry(0x8000_0001, 0),
         ];
-        minimum_host_entries[1].ecx = DETERMINISTIC_STANDARD_CPUIDS[1][2];
+        minimum_host_entries[1].ecx = DETERMINISTIC_STANDARD_CPUIDS[1][2] & !bit(27);
         minimum_host_entries[1].edx = DETERMINISTIC_STANDARD_CPUIDS[1][3];
         minimum_host_entries[2].ebx = 0;
         minimum_host_entries[2].ecx = 0;
@@ -303,8 +314,12 @@ mod tests {
         assert_eq!(leaf(0).edx, u32::from_le_bytes(*b"ineI"));
         assert_eq!(leaf(1).eax, 0x0000_0663);
         assert_eq!(leaf(1).ecx & bit(30), 0);
+        assert_eq!(
+            leaf(1).ecx & (bit(26) | bit(27) | bit(28)),
+            bit(26) | bit(27) | bit(28)
+        );
         assert!(entries.iter().all(|entry| entry.function != 7));
-        assert!(entries.iter().all(|entry| entry.function != 0xd));
+        assert_eq!(leaf(0xd).eax & 0x7, 0x7);
         assert_eq!(leaf(0x8000_0000).eax, 0x8000_000a);
         assert_eq!(leaf(0x8000_0000).ebx, u32::from_le_bytes(*b"Genu"));
         assert_eq!(leaf(0x8000_0000).ecx, u32::from_le_bytes(*b"ntel"));

@@ -168,7 +168,7 @@ fn deterministic_cpuid_policy_is_visible_inside_vm() {
     assert_eq!(leaf1[1], 0x0000_0800);
     assert_eq!(
         leaf1[2],
-        bit(0) | bit(9) | bit(13) | bit(19) | bit(20) | bit(23)
+        bit(0) | bit(9) | bit(13) | bit(19) | bit(20) | bit(23) | bit(26) | bit(28)
     );
     assert_eq!(leaf1[3], 0x078b_fbfd);
     assert_eq!(leaf1[2] & bit(30), 0, "RDRAND must be hidden");
@@ -180,7 +180,7 @@ fn deterministic_cpuid_policy_is_visible_inside_vm() {
     assert_eq!(leaf7_subleaf1, [0; 4]);
 
     let xstate = read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 64);
-    assert_eq!(xstate, [0; 4]);
+    assert_eq!(xstate[0] & 0x7, 0x7);
 
     assert_eq!(
         read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 80),
@@ -197,11 +197,11 @@ fn deterministic_cpuid_policy_is_visible_inside_vm() {
     );
     assert_eq!(
         read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 128),
-        [0; 4],
+        xstate,
     );
     assert_eq!(
         read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 144),
-        [0; 4],
+        xstate,
     );
 }
 

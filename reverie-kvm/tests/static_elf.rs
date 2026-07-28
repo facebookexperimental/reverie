@@ -1275,6 +1275,35 @@ fn static_elf_executes_syscall_and_exits() {
 }
 
 #[test]
+fn static_elf_executes_avx_instruction() {
+    match Kvm::new() {
+        Ok(_) => {}
+        Err(error) if kvm_is_unavailable(&error) => {
+            eprintln!("skipping KVM AVX test: cannot open /dev/kvm: {error}");
+            return;
+        }
+        Err(error) => panic!("failed to probe /dev/kvm: {error}"),
+    }
+
+    // The host dynamic linker uses this vmovq encoding unconditionally. KVM's
+    // userspace-only guest must initialize OSXSAVE and the YMM register state
+    // that a Linux kernel would normally configure before entering userspace.
+    let code = [
+        0x31, 0xff, // xor edi, edi
+        0xc4, 0xe1, 0xf9, 0x6e, 0xcf, // vmovq rdi, xmm1
+        0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax, SYS_exit_group
+        0x0f, 0x05, // syscall
+        0x0f, 0x0b, // ud2
+    ];
+    let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+    backend
+        .install_static_elf(&static_elf(&code), "/bin/avx-probe")
+        .unwrap();
+
+    assert_eq!(backend.run_static_elf().unwrap(), 0);
+}
+
+#[test]
 fn static_elf_receives_argv_and_envp() {
     match Kvm::new() {
         Ok(_) => {}
