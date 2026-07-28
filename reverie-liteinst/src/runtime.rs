@@ -19,6 +19,8 @@ use liteinst2::trampoline::TrampolineArena;
 use reverie_preload::BuiltinTool;
 use reverie_preload::dispatch::SyscallDispatcher;
 use reverie_preload::dispatch::SyscallEvent as PreloadSyscallEvent;
+use reverie_preload::dispatch::is_fork_like;
+use reverie_preload::fork::ForkHook;
 use reverie_preload::lifecycle::InProcessSeccomp;
 use reverie_preload::lifecycle::RuntimeConfig;
 use reverie_preload::trap::raw_syscall6;
@@ -606,6 +608,55 @@ pub(crate) fn fallback_syscall_count(number: i64) -> u64 {
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-260): Review the fork-child per-process observability reset.
+/// Reset every fallback-surface counter to zero for the current process.
+///
+/// LiteInst's observability counters — the process-wide [`FALLBACK_TOTAL`], the
+/// per-syscall-number [`FALLBACK_BY_NUMBER`], and each patch site's per-site
+/// `trap`/`hook` counts ([`site_counts`]) — are process-global. A `fork`/`clone`
+/// child copy-on-write inherits the parent's accumulated values, so without a
+/// reset the child would report the parent's residual surface and hook activity
+/// as its own. This is the same per-process runtime state the shared
+/// [`ForkHook`] seam ([`reverie_preload::fork`]) exists to re-establish in the
+/// child — the exact mechanism reverie-e9patch uses for its per-process fallback
+/// counters (round 7). Only the *observability* fields are cleared; the site
+/// registry's functional patch state (`address`/`state`/`hook`/`mapping_end`) is
+/// left intact because the child COW-inherits the installed hooks and the same
+/// executable mappings, so its instrumentation must keep working.
+///
+/// Signature is `fn()` so it can be wrapped in a [`ForkHook`]. Async-signal-safe:
+/// only relaxed atomic stores plus one lock-free [`OnceLock::get`], no allocation
+/// and no locks, so it is safe to run in the child from inside the `SIGSYS`
+/// handler.
+pub(crate) fn reset_fallback_observability() {
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    FALLBACK_TOTAL.store(0, Ordering::Relaxed);
+    for slot in &FALLBACK_BY_NUMBER {
+        slot.store(0, Ordering::Relaxed);
+    }
+    if let Some(sites) = SITES.get() {
+        for site in sites {
+            site.trap_count.store(0, Ordering::Relaxed);
+            site.hook_count.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-260): Review the shared fork-following seam reuse.
+/// The shared fork-following hook: in the child of a successful fork-like
+/// syscall, reset this process's fallback observability (see
+/// [`reset_fallback_observability`]).
+///
+/// LiteInst hosts its own `SIGSYS` dispatcher rather than the shared
+/// [`PassthroughDispatcher`](reverie_preload::dispatch::PassthroughDispatcher),
+/// so it invokes this hook itself from [`process_syscall`] after forwarding a
+/// fork-like syscall — but it reuses the *same* reviewed-once
+/// [`ForkHook`]/[`is_fork_like`] seam e9patch does, rather than a private
+/// fork-detection path.
+static FORK_HOOK: ForkHook = ForkHook::new(reset_fallback_observability);
+
 fn arena_for(address: u64) -> Option<&'static RuntimeArena> {
     ARENAS.get()?.iter().find(|entry| {
         entry.mapping_start <= address
@@ -1168,6 +1219,18 @@ unsafe fn process_syscall(event: &mut SyscallEvent) {
     event.result = unsafe { raw_syscall6(event.number, event.args) };
     observe_mapping_generation(event);
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-260): Review the fork-following observability reset call.
+    // In the child of a successful fork-like syscall (`result == 0`), the
+    // COW-inherited observability counters describe the parent, not this child.
+    // Reset them through the shared ForkHook seam so per-process attribution
+    // starts clean. `is_fork_like` also matches clone3/vfork, but those never
+    // reach a successful forward here (both fail closed earlier), so gating on a
+    // zero result is sufficient and mirrors e9patch's child-side reset.
+    if is_fork_like(event.number) && event.result == 0 {
+        FORK_HOOK.run_in_child();
+    }
+
     if event.number != libc::SYS_exit && event.number != libc::SYS_exit_group && !compatibility_fork
     {
         unsafe {
@@ -1490,6 +1553,7 @@ mod tests {
     use reverie_preload::BuiltinTool;
 
     use super::ALT_STACK_ENV;
+    use super::FORK_HOOK;
     use super::MAX_PATCH_SITES;
     use super::SITE_ACTIVE;
     use super::SITE_FALLBACK;
@@ -1508,6 +1572,8 @@ mod tests {
     use super::fallback_syscall_count;
     use super::mark_site_range_stale;
     use super::record_fallback_dispatch;
+    use super::reset_fallback_observability;
+    use super::site_counts;
 
     #[test]
     fn builtin_tool_selector_maps_shared_values_only() {
@@ -1601,6 +1667,67 @@ mod tests {
         record_fallback_dispatch(-1);
         assert_eq!(fallback_syscall_count(-1), 0);
         assert!(fallback_dispatch_count() > total_before);
+    }
+
+    #[test]
+    fn fork_child_reset_zeroes_the_process_global_fallback_counters() {
+        // Serial (`--test-threads=1`), so resetting the process-global counters
+        // does not race other tests. Record on both counter families, then prove
+        // the fork-child reset clears them. This is the by-number/total analog of
+        // reverie-e9patch's round-7 `resetting_observability_zeroes_...` test.
+        let number: i64 = 404;
+        record_fallback_dispatch(number);
+        assert!(fallback_dispatch_count() > 0);
+        assert!(fallback_syscall_count(number) > 0);
+
+        reset_fallback_observability();
+
+        assert_eq!(fallback_dispatch_count(), 0);
+        assert_eq!(fallback_syscall_count(number), 0);
+    }
+
+    #[test]
+    fn fork_child_reset_zeroes_per_site_counts_but_preserves_patch_state() {
+        // The per-site trap/hook counts are observability; the site's address and
+        // state are functional patch metadata the COW-inherited child must keep.
+        // Reset must clear the former without disturbing the latter.
+        SITES.get_or_init(|| {
+            (0..MAX_PATCH_SITES)
+                .map(|_| SiteSlot::new())
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+        });
+        let address = 0x4321_9000;
+        let (site, claimed) = claim_site(address).unwrap();
+        assert!(claimed);
+        site.state.store(SITE_ACTIVE, Ordering::Release);
+        site.trap_count.store(7, Ordering::Release);
+        site.hook_count.store(11, Ordering::Release);
+        assert_eq!(site_counts(address), (7, 11));
+
+        reset_fallback_observability();
+
+        // Observability cleared...
+        assert_eq!(site_counts(address), (0, 0));
+        // ...but the functional patch state is intact, so the child's inherited
+        // instrumentation keeps working.
+        assert_eq!(site.address.load(Ordering::Acquire), address);
+        assert_eq!(site.state.load(Ordering::Acquire), SITE_ACTIVE);
+    }
+
+    #[test]
+    fn fork_hook_runs_the_observability_reset() {
+        // The static FORK_HOOK must wrap `reset_fallback_observability`, so
+        // invoking it (as `process_syscall` does in the fork child) clears the
+        // process-global counters — proving the shared ForkHook seam is wired to
+        // the reset rather than a private path.
+        record_fallback_dispatch(405);
+        assert!(fallback_dispatch_count() > 0);
+
+        FORK_HOOK.run_in_child();
+
+        assert_eq!(fallback_dispatch_count(), 0);
+        assert_eq!(fallback_syscall_count(405), 0);
     }
 
     #[test]

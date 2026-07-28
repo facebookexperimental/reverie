@@ -114,6 +114,39 @@ and `/bin/cat /dev/null`; this does not make `hermit --backend liteinst` real
 until that CLI path constructs `LiteinstBackend` and the corresponding Detcore
 preload DSO on the same landed revisions.
 
+## Fallback-surface observability
+
+The runtime exports C-ABI counters that make the size and shape of the residual
+fallback surface — the trapped syscalls the runtime could not route to the Tool
+— observable from the guest:
+
+- `reverie_liteinst_site_trap_count(address)` / `reverie_liteinst_site_hook_count(address)`
+  — the per-**site** breakdown keyed by the un-patched instruction's address.
+- `reverie_liteinst_fallback_dispatch_count()` — the process-wide total of
+  syscalls that reached the fail-closed escape surface.
+- `reverie_liteinst_fallback_syscall_count(number)` — the per-syscall-number
+  breakdown, keyed the same way as `reverie_e9patch_fallback_syscall_count` so
+  the two ld-preload backends expose a symmetric metric.
+
+These counters are **per-process**: they are process-global statics, so a
+`fork`/`clone` child copy-on-write inherits the parent's accumulated values.
+Left alone, a child would report the parent's residual surface and hook activity
+as its own. In compatibility/strace mode LiteInst forwards a fork-like syscall
+itself, so `process_syscall` invokes the shared
+[`reverie_preload::fork::ForkHook`] seam in the child (guarded by the shared
+`is_fork_like` classifier and a zero return value): immediately after the fork
+returns `0` in the child, `reset_fallback_observability` zeroes all three counter
+families so the child's attribution starts clean. Only the observability fields
+are reset — the site registry's functional patch state (address, hook, mapping
+generation) is left intact because the child COW-inherits the installed hooks and
+the same executable mappings, so its instrumentation keeps working. The reset is
+relaxed-atomic and allocation/lock-free, so it is safe to run in the child from
+inside the `SIGSYS` handler. This is the *same* fork-following seam and
+reviewed-once mechanism reverie-e9patch uses for its per-process fallback
+counters (round 7); LiteInst hosts its own dispatcher rather than the shared
+`PassthroughDispatcher`, so it calls the hook directly, but reuses the shared
+`ForkHook`/`is_fork_like` API rather than a private fork-detection path.
+
 ## Corpus sweep scorecard
 
 A 20-program C corpus was run through `hermit --backend liteinst run --strict
