@@ -4522,7 +4522,36 @@ fn fstatfs_host(memory: &mut GuestMemory, host_fd: RawFd, output: u64) -> i64 {
         return io_error(std::io::Error::last_os_error());
     }
     // SAFETY: fstatfs initialized stat on success.
-    write_struct(memory, output, &unsafe { stat.assume_init() })
+    let mut stat = unsafe { stat.assume_init() };
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-pending): the raw host statfs leaks
+    // nondeterministic values (free blocks/inodes drift as the host disk is
+    // written, and f_fsid identifies the host filesystem), which breaks
+    // --verify for any statfs consumer (df, tar, stat -f). Canonicalize the
+    // host-varying fields exactly as the ptrace/detcore backend does in
+    // detcore/src/syscalls/files.rs::canonicalize_statfs_buf, so both statfs()
+    // and fstatfs() present the same stable, deterministic view.
+    canonicalize_statfs(&mut stat);
+    write_struct(memory, output, &stat)
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-pending): mirror of detcore's statfs canonicalization
+// (FREE_BLOCKS_CAP / FREE_INODES_CAP, clamp free to totals, zero f_fsid) so
+// the KVM backend matches ptrace L2 determinism for statfs.
+fn canonicalize_statfs(sf: &mut libc::statfs) {
+    const FREE_BLOCKS_CAP: libc::fsblkcnt_t = 1_000_000;
+    const FREE_INODES_CAP: libc::fsfilcnt_t = 500_000;
+    let free_blocks = FREE_BLOCKS_CAP.min(sf.f_blocks);
+    sf.f_bfree = free_blocks;
+    sf.f_bavail = free_blocks;
+    sf.f_ffree = if sf.f_files == 0 {
+        0
+    } else {
+        FREE_INODES_CAP.min(sf.f_files)
+    };
+    // SAFETY: libc::fsid_t is a plain integer-array POD; zeroing it is valid.
+    sf.f_fsid = unsafe { std::mem::zeroed() };
 }
 
 fn access(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
@@ -5273,6 +5302,11 @@ fn synthetic_proc_path_for_inode(inode: u64) -> Option<&'static [u8]> {
         b"/proc/filesystems",
         b"/proc/mounts",
         b"/proc/self/mounts",
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-pending): /proc/self/mountinfo added to the
+        // synthetic surface so fstat/statx on its descriptor resolves to the
+        // same stable synthetic inode as the other served /proc files.
+        b"/proc/self/mountinfo",
         b"/proc/stat",
         b"/proc/meminfo",
         b"/proc/cpuinfo",
@@ -5353,6 +5387,13 @@ fn synthetic_proc_content(state: &LoadedStaticElf, path: &[u8]) -> Option<Vec<u8
         b"/proc/version" => b"Linux version 6.0.0 (reverie-kvm) #1 SMP x86_64\n".to_vec(),
         b"/proc/filesystems" => b"nodev\tproc\nnodev\ttmpfs\n\text4\n".to_vec(),
         b"/proc/mounts" | b"/proc/self/mounts" => b"rootfs / rootfs rw 0 0\n".to_vec(),
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-pending): /proc/self/mountinfo is the primary
+        // mount table modern gnulib/coreutils read (df reads it before falling
+        // back to /etc/mtab). Serve a single deterministic rootfs entry
+        // consistent with the /proc/mounts surface above. Fields:
+        // mount_id parent_id major:minor root mount_point options - fstype src super_opts
+        b"/proc/self/mountinfo" => b"1 0 0:1 / / rw - rootfs rootfs rw\n".to_vec(),
         b"/proc/stat" => concat!(
             "cpu  0 0 0 0 0 0 0 0 0 0\n",
             "cpu0 0 0 0 0 0 0 0 0 0 0\n",
@@ -8103,6 +8144,92 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&content)
         );
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-pending): regression for the /proc/self/mountinfo
+    // synthetic surface (content bytes, read path, and inode round-trip) added
+    // for df compatibility under --backend kvm.
+    #[test]
+    fn synthetic_proc_self_mountinfo_is_served_and_stable() {
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, 0x4000).unwrap();
+
+        const EXPECTED: &[u8] = b"1 0 0:1 / / rw - rootfs rootfs rw\n";
+
+        // The direct content accessor returns the deterministic entry.
+        assert_eq!(
+            synthetic_proc_content(&state, b"/proc/self/mountinfo").as_deref(),
+            Some(EXPECTED)
+        );
+
+        // A guest read through openat yields the same bytes.
+        let fd = open_readonly(&mut memory, &mut state, "/proc/self/mountinfo");
+        assert!(fd >= 0, "open /proc/self/mountinfo failed: {fd}");
+        assert_eq!(read_fd_to_end(&mut memory, &mut state, fd), EXPECTED);
+
+        // fstat/newfstatat resolve to the same stable synthetic inode so that
+        // gnulib's fstat-then-read of the mount table stays deterministic.
+        let stat_address = 0x1000;
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_fstat,
+                [fd as u64, stat_address, 0, 0, 0, 0]
+            ),
+            0
+        );
+        let stat: libc::stat = read_struct(&memory, stat_address);
+        assert_eq!(stat.st_ino, synthetic_proc_inode(b"/proc/self/mountinfo"));
+        assert_eq!(
+            synthetic_proc_path_for_inode(stat.st_ino as u64),
+            Some(b"/proc/self/mountinfo".as_slice())
+        );
+        assert_eq!(stat.st_size, EXPECTED.len() as libc::off_t);
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-pending): regression for statfs canonicalization,
+    // matching detcore's canonicalize_statfs_buf so KVM statfs/fstatfs is
+    // bitwise-deterministic across runs (df, tar, stat -f).
+    #[test]
+    fn canonicalize_statfs_zeroes_host_varying_fields() {
+        // A statfs whose free counts and fsid vary from run to run.
+        let mut sf: libc::statfs = unsafe { std::mem::zeroed() };
+        sf.f_blocks = 10_000_000;
+        sf.f_bfree = 7_123_456;
+        sf.f_bavail = 6_987_654;
+        sf.f_files = 2_000_000;
+        sf.f_ffree = 1_234_567;
+        sf.f_fsid = unsafe { std::mem::transmute::<[i32; 2], libc::fsid_t>([0x1234, 0x5678]) };
+
+        canonicalize_statfs(&mut sf);
+
+        // Free blocks are capped at 1_000_000 and clamped to the total.
+        assert_eq!(sf.f_bfree, 1_000_000);
+        assert_eq!(sf.f_bavail, 1_000_000);
+        // Free inodes are capped at 500_000 and clamped to the total.
+        assert_eq!(sf.f_ffree, 500_000);
+        // The filesystem identity is zeroed so it cannot leak host state.
+        assert_eq!(
+            unsafe { std::mem::transmute::<libc::fsid_t, [i32; 2]>(sf.f_fsid) },
+            [0, 0]
+        );
+        // Totals are untouched.
+        assert_eq!(sf.f_blocks, 10_000_000);
+        assert_eq!(sf.f_files, 2_000_000);
+
+        // Small totals clamp free values down to the total, and a zero inode
+        // total yields zero free inodes (never the cap).
+        let mut small: libc::statfs = unsafe { std::mem::zeroed() };
+        small.f_blocks = 42;
+        small.f_files = 0;
+        canonicalize_statfs(&mut small);
+        assert_eq!(small.f_bfree, 42);
+        assert_eq!(small.f_bavail, 42);
+        assert_eq!(small.f_ffree, 0);
     }
 
     #[test]
