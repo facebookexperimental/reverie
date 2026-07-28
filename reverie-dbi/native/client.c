@@ -247,7 +247,10 @@ static atomic_flag pending_clone_lock = ATOMIC_FLAG_INIT;
 static _Atomic int32_t pending_clone_virtual_child;
 static _Atomic int32_t pending_clone_creator_pid;
 static _Atomic uint64_t pending_clone_flags;
-static bool copied_process_runtime_initialized;
+/* A copied child initializes its inherited Rust runtime on its first syscall.
+ * Track the process that completed that handoff rather than a boolean: nested
+ * fork children inherit the parent's globals and must rebase again. */
+static process_id_t copied_process_runtime_pid;
 
 static bool map_inherited_virtual_identity_state(void) {
   struct stat status;
@@ -1734,7 +1737,7 @@ static bool pre_syscall(void *drcontext, int sysnum) {
   // AUTONOMOUS-BOT-IMPLEMENTED
   // TODO-HUMAN-REVIEW(PR-255): Review copied-process Detcore state rebasing.
   if (has_copied_runtime() && runtime_uses_external_global() &&
-      !copied_process_runtime_initialized) {
+      copied_process_runtime_pid != dr_get_process_id()) {
     int32_t initialized = reverie_dbi_runtime_thread_init(
         counters, drcontext, (int32_t)dr_get_thread_id(drcontext),
         (int32_t)dr_get_process_id(), in_tree_parent_pid(),
@@ -1746,7 +1749,7 @@ static bool pre_syscall(void *drcontext, int sysnum) {
       exit_runtime_tree(101);
       return false;
     }
-    copied_process_runtime_initialized = true;
+    copied_process_runtime_pid = dr_get_process_id();
   }
 
   if (has_copied_runtime() && !runtime_uses_external_global()) {
