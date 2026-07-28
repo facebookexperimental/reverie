@@ -147,6 +147,8 @@ struct ProcessBoundary {
 }
 
 enum ProcessExecutionContext {
+    InitialExec(SyscallRequest),
+    InitialExecCompleted,
     Lifecycle,
     SyscallBoundary(ProcessBoundary),
     SyscallReturn,
@@ -163,6 +165,16 @@ struct StaticElfSyscallExecutor<'a> {
 
 impl<T: Tool> GuestSyscallExecutor<T> for StaticElfSyscallExecutor<'_> {
     fn execute(&mut self, request: &SyscallRequest, memory: &GuestMemory) -> i64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-TBD): Review synthetic initial exec completion.
+        if matches!(
+            &self.process_context,
+            ProcessExecutionContext::InitialExec(expected) if expected == request
+        ) {
+            self.last_result = Some(0);
+            self.process_context = ProcessExecutionContext::InitialExecCompleted;
+            return 0;
+        }
         let result = self.executor.execute(request, memory);
         self.last_result = Some(result);
         result
@@ -176,6 +188,16 @@ impl<T: Tool> GuestSyscallExecutor<T> for StaticElfSyscallExecutor<'_> {
         T: 'a,
     {
         Box::pin(async move {
+            if matches!(
+                self.process_context,
+                ProcessExecutionContext::InitialExecCompleted
+            ) {
+                *self.process_completed = true;
+                return Ok(InjectionCompletion::DoesNotReturn {
+                    image_replaced: true,
+                    process_exited: false,
+                });
+            }
             let Some(action) = self.executor.take_process_action() else {
                 return Ok(if self.executor.has_pending_exit() {
                     InjectionCompletion::DoesNotReturn {
@@ -216,7 +238,8 @@ impl<T: Tool> GuestSyscallExecutor<T> for StaticElfSyscallExecutor<'_> {
                             .await?;
                         Ok(())
                     }
-                    ProcessExecutionContext::Lifecycle => match action {
+                    ProcessExecutionContext::InitialExec(_)
+                    | ProcessExecutionContext::Lifecycle => match action {
                         ProcessAction::Exec { image, argv, envp } => {
                             self.backend
                                 .exec_process(self.executor, &image, &argv, &envp)?;
@@ -226,6 +249,9 @@ impl<T: Tool> GuestSyscallExecutor<T> for StaticElfSyscallExecutor<'_> {
                             "fork/clone injection requires a guest syscall boundary".to_owned(),
                         )),
                     },
+                    ProcessExecutionContext::InitialExecCompleted => unreachable!(
+                        "synthetic initial exec completes before process actions are inspected"
+                    ),
                 }
             }
             .await;
@@ -674,6 +700,108 @@ async fn run_post_exec_handler<T: Tool>(
     }
 }
 
+fn initial_exec_request(memory: &GuestMemory, stack_pointer: u64) -> Result<SyscallRequest> {
+    fn read_word(memory: &GuestMemory, address: u64) -> Result<u64> {
+        let mut bytes = [0; std::mem::size_of::<u64>()];
+        memory.read(address, &mut bytes)?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    let argc = read_word(memory, stack_pointer)?;
+    let argv = stack_pointer
+        .checked_add(std::mem::size_of::<u64>() as u64)
+        .ok_or(Error::LongModeMemoryTooSmall)?;
+    let path = read_word(memory, argv)?;
+    let envp = argc
+        .checked_add(1)
+        .and_then(|words| words.checked_mul(std::mem::size_of::<u64>() as u64))
+        .and_then(|offset| argv.checked_add(offset))
+        .ok_or(Error::LongModeMemoryTooSmall)?;
+
+    Ok(SyscallRequest::new(
+        libc::SYS_execve as u64,
+        [path, argv, envp, 0, 0, 0],
+    ))
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-TBD): Review synthetic initial exec Tool delivery.
+#[allow(clippy::too_many_arguments)]
+async fn run_initial_exec_handler<T: Tool>(
+    backend: &mut KvmBackend,
+    tool: &T,
+    pid: Pid,
+    memory: &GuestMemory,
+    auxv: &[(libc::c_ulong, libc::c_ulong)],
+    thread_state: &mut T::ThreadState,
+    executor: &mut ElfExecutor,
+    global_state: &T::GlobalState,
+    config: &<T::GlobalState as GlobalTool>::Config,
+    subscriptions: &Subscription,
+    stack_checked_out: &Arc<AtomicBool>,
+) -> Result<()> {
+    let request = initial_exec_request(memory, executor.initial_stack_pointer())?;
+    let syscall = request.into_syscall()?;
+    let mut registers = kvm_registers(backend.vcpu.get_regs()?, request.number());
+    registers.rdi = request.args()[0];
+    registers.rsi = request.args()[1];
+    registers.rdx = request.args()[2];
+
+    let handler_signal = Arc::new(Mutex::new(None));
+    expose_tool_scratch(memory)?;
+    let mut _process_completed = false;
+    let outcome = {
+        let mut guest_executor = StaticElfSyscallExecutor {
+            backend,
+            executor,
+            memory: memory.clone(),
+            process_context: ProcessExecutionContext::InitialExec(request),
+            last_result: None,
+            process_completed: &mut _process_completed,
+        };
+        let mut guest = KvmGuest::<T>::new(
+            pid,
+            memory.clone(),
+            auxv,
+            registers,
+            thread_state,
+            &mut guest_executor,
+            global_state,
+            config,
+            subscriptions,
+            handler_signal.clone(),
+            stack_checked_out.clone(),
+        );
+        drive_handler(
+            tool.handle_syscall_event(&mut guest, syscall),
+            handler_signal,
+        )
+        .await
+    };
+    hide_tool_scratch(memory)?;
+
+    match outcome {
+        HandlerOutcome::Returned(result) => result.map(|_| ()).map_err(Error::Reverie),
+        HandlerOutcome::TailInjected {
+            result: Ok(_),
+            process_exited: true,
+            ..
+        } => Ok(()),
+        HandlerOutcome::TailInjected {
+            result: Ok(_),
+            image_replaced: true,
+            ..
+        } => Ok(()),
+        HandlerOutcome::TailInjected {
+            result: Err(error), ..
+        } => Err(Error::Reverie(error.into())),
+        HandlerOutcome::TailInjected { .. } => Err(Error::UnexpectedVcpuExit(
+            "initial exec handler tail-injected without completing exec".to_owned(),
+        )),
+        HandlerOutcome::RuntimeError(error) => Err(error),
+    }
+}
+
 async fn notify_tool_exit<T: Tool>(
     tool: T,
     pid: Pid,
@@ -952,7 +1080,45 @@ impl KvmBackend {
 
         if initial_post_exec {
             // The root ELF image is already installed when this backend begins.
-            // Present the same successful-exec lifecycle boundary as ptrace.
+            // Present the same initial exec syscall and successful-exec lifecycle
+            // boundaries as ptrace without loading the installed image twice.
+            if subscriptions
+                .iter_syscalls()
+                .any(|number| number == reverie::syscalls::Sysno::execve)
+            {
+                run_initial_exec_handler(
+                    self,
+                    &tool,
+                    pid,
+                    &memory,
+                    &auxv,
+                    &mut thread_state,
+                    executor,
+                    global_state,
+                    config,
+                    subscriptions,
+                    &stack_checked_out,
+                )
+                .await?;
+                auxv = executor.auxv().to_vec();
+                if let Some(exit) = executor.take_exit() {
+                    if exit.group {
+                        self.request_guest_thread_group_exit(exit.code);
+                    }
+                    self.cancel_guest_threads();
+                    notify_tool_exit(
+                        tool,
+                        pid,
+                        global_state,
+                        config,
+                        thread_state,
+                        ExitStatus::Exited(exit.code),
+                    )
+                    .await?;
+                    let (stdout, stderr) = executor.take_output();
+                    return Ok((exit.code, stdout, stderr));
+                }
+            }
             let post_exec_error = run_post_exec_handler(
                 self,
                 &tool,

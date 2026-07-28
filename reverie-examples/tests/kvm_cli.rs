@@ -99,6 +99,18 @@ fn assert_success(output: &Output) {
     );
 }
 
+fn counter2_total(output: &Output) -> u64 {
+    String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("[counter tool] Total system calls in process tree: ")
+                .and_then(|summary| summary.split(',').next())
+                .and_then(|total| total.parse().ok())
+        })
+        .unwrap_or_else(|| panic!("missing counter2 total in {:?}", output.stderr))
+}
+
 fn median_runtime(binary: &str, arguments: &[&str]) -> Duration {
     const SAMPLES: usize = 3;
 
@@ -197,6 +209,8 @@ fn production_example_clis_run_real_program_with_kvm_guest() {
             "--runner",
             "kvm",
             "--trace",
+            "execve",
+            "--trace",
             "write",
             "--no-host-envs",
             "/bin/echo",
@@ -205,7 +219,9 @@ fn production_example_clis_run_real_program_with_kvm_guest() {
     );
     assert_success(&strace);
     assert_eq!(strace.stdout, b"strace\n");
-    assert!(String::from_utf8_lossy(&strace.stderr).contains("[pid 1] write("));
+    let strace_stderr = String::from_utf8_lossy(&strace.stderr);
+    assert!(strace_stderr.contains("[pid 1] execve("));
+    assert!(strace_stderr.contains("[pid 1] write("));
 
     let chaos = run(
         env!("CARGO_BIN_EXE_chaos"),
@@ -278,6 +294,35 @@ fn production_example_clis_run_real_program_with_kvm_guest() {
     assert_success(&strace_minimal);
     assert_eq!(strace_minimal.stdout, b"strace-minimal\n");
     assert!(String::from_utf8_lossy(&strace_minimal.stderr).contains("[pid 1] write("));
+}
+
+#[test]
+fn counter2_matches_ptrace_echo_syscall_count() {
+    if !kvm_available() {
+        return;
+    }
+
+    let ptrace = run(
+        env!("CARGO_BIN_EXE_counter2"),
+        &["--no-host-envs", "--", "/bin/echo", "count-parity"],
+    );
+    let kvm = run(
+        env!("CARGO_BIN_EXE_reverie-kvm-counter2"),
+        &["/bin/echo", "count-parity"],
+    );
+
+    assert_success(&ptrace);
+    assert_success(&kvm);
+    assert_eq!(ptrace.stdout, b"count-parity\n");
+    assert_eq!(kvm.stdout, ptrace.stdout);
+    let ptrace_total = counter2_total(&ptrace);
+    let kvm_total = counter2_total(&kvm);
+    assert_eq!(kvm_total, ptrace_total);
+    for (output, total) in [(&ptrace, ptrace_total), (&kvm, kvm_total)] {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(&format!("syscalls={total}")), "{stderr}");
+        assert!(stderr.contains("from 1 processes, 1 thread"), "{stderr}");
+    }
 }
 
 #[test]

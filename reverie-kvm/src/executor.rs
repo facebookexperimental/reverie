@@ -1395,6 +1395,11 @@ impl ElfExecutor {
         &self.state.auxv
     }
 
+    // TODO-HUMAN-REVIEW(PR-TBD): Review exposing the initial stack for synthetic exec delivery.
+    pub(crate) fn initial_stack_pointer(&self) -> u64 {
+        self.state.stack_pointer
+    }
+
     pub(crate) fn segment_bases(&self) -> (u64, u64) {
         (self.state.fs_base, self.state.gs_base)
     }

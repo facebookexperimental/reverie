@@ -1661,7 +1661,8 @@ fn strace_tool_logs_syscalls_from_static_elf() {
     // via real SYSCALL instructions. Each traps through the ring0 trampoline and
     // must be observed by StraceTool, whose tail_inject is serviced by the ELF
     // guest kernel (so getpid returns 1, the write prints, and exit_group ends
-    // the run).
+    // the run). The synthetic initial exec is delivered too, but this test tool
+    // records only after injection and successful exec does not return.
     let message = b"hi\n";
     let mut code: Vec<u8> = Vec::new();
     code.extend_from_slice(&[0xb8, 0x27, 0x00, 0x00, 0x00, 0x0f, 0x05]); // mov eax,SYS_getpid; syscall
@@ -1788,7 +1789,7 @@ fn counter_tools_aggregate_intercepted_static_elf_syscalls() {
     assert_eq!(exit_code, 0);
     assert!(stdout.is_empty());
     assert!(stderr.is_empty());
-    assert_eq!(counter.total(), 3);
+    assert_eq!(counter.total(), 4);
 
     let mut hierarchical_backend = KvmBackend::new(MEMORY_SIZE).unwrap();
     hierarchical_backend
@@ -1804,7 +1805,7 @@ fn counter_tools_aggregate_intercepted_static_elf_syscalls() {
     assert_eq!(
         counter.totals(),
         HierarchicalTotals {
-            total_syscalls: 3,
+            total_syscalls: 4,
             exited_procs: 1,
             exited_threads: 1,
         }
