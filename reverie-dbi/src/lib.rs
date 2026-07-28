@@ -1471,8 +1471,10 @@ pub unsafe extern "C" fn reverie_dbi_runtime_exec_failed(
 
 /// Applies copied-child syscall policy for the built-in prototype runtime.
 #[cfg(feature = "prototype-runtime")]
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-219): Review copied-child argument and errno policy ABI.
 #[unsafe(no_mangle)]
-pub extern "C" fn reverie_dbi_runtime_copied_syscall(_sysnum: i64) -> i32 {
+pub extern "C" fn reverie_dbi_runtime_copied_syscall(_sysnum: i64, _args: *const u64) -> i32 {
     0
 }
 
