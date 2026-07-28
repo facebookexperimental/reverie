@@ -194,6 +194,9 @@ extern void reverie_dbi_runtime_background_init(void *argument);
 extern int32_t reverie_dbi_runtime_ready(uint64_t image_generation);
 extern void reverie_dbi_runtime_process_exit(void);
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-TBD): Review copied-child Tool dispatch through the external global.
+extern int32_t reverie_dbi_runtime_uses_external_global(void);
+// AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-219): Review copied-child argument and errno policy ABI.
 extern int32_t reverie_dbi_runtime_copied_syscall(int64_t sysnum,
                                                   const uint64_t *args);
@@ -1606,7 +1609,8 @@ static void post_syscall(void *drcontext, int sysnum) {
     }
   }
 
-  if (has_copied_runtime())
+  if (has_copied_runtime() &&
+      reverie_dbi_runtime_uses_external_global() == 0)
     return;
 
   if (counters->pending_thread_clone != 0) {
@@ -1713,7 +1717,8 @@ static bool pre_syscall(void *drcontext, int sysnum) {
   for (i = 0; i != 6; ++i)
     args[i] = (uint64_t)dr_syscall_get_param(drcontext, i);
 
-  if (has_copied_runtime()) {
+  if (has_copied_runtime() &&
+      reverie_dbi_runtime_uses_external_global() == 0) {
     // Record this copied child's virtual identity before any refusal so the
     // shared host<->virtual map stays coherent even when the syscall is later
     // rejected by the fail-closed unsupported-syscall policy below.
@@ -1917,14 +1922,17 @@ static void thread_init(void *drcontext) {
 static void thread_exit(void *drcontext) {
   prototype_counters_t *counters = (prototype_counters_t *)drmgr_get_tls_field(
       drcontext, thread_state_index);
-  if (counters != NULL && !has_copied_runtime()) {
+  if (counters != NULL &&
+      (!has_copied_runtime() ||
+       reverie_dbi_runtime_uses_external_global() != 0)) {
     reverie_dbi_runtime_thread_exit(counters, dr_get_thread_id(drcontext));
     dr_thread_free(drcontext, counters, sizeof(*counters));
   }
 }
 
 static void event_exit(void) {
-  if (!has_copied_runtime())
+  if (!has_copied_runtime() ||
+      reverie_dbi_runtime_uses_external_global() != 0)
     reverie_dbi_runtime_process_exit();
   uint64_t branches;
   uint64_t syscalls;
