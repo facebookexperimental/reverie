@@ -4064,7 +4064,7 @@ fn socket(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
     let domain = args[0] as libc::c_int;
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-235): Review host-backed AF_INET6 socket creation.
-    // TODO-HUMAN-REVIEW(PR-PENDING): Review host-backed AF_NETLINK creation.
+    // TODO-HUMAN-REVIEW(PR-261): Review host-backed AF_NETLINK creation.
     if !matches!(
         domain,
         libc::AF_UNIX | libc::AF_INET | libc::AF_INET6 | libc::AF_NETLINK
@@ -4236,7 +4236,7 @@ fn bind(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
             .expect("family slice has exact size"),
     );
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING): Review deterministic AF_NETLINK bind forwarding.
+    // TODO-HUMAN-REVIEW(PR-261): Review deterministic AF_NETLINK bind forwarding.
     if !matches!(
         family as libc::c_int,
         libc::AF_INET | libc::AF_UNIX | libc::AF_NETLINK
