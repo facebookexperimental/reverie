@@ -78,6 +78,8 @@ const ANON_INODE_FS_MAGIC: libc::c_long = 0x0904_1934;
 const PIPEFS_MAGIC: libc::c_long = 0x5049_5045;
 const SOCKFS_MAGIC: libc::c_long = 0x534f_434b;
 const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+// Linux UAPI value from <linux/sockios.h>; libc does not expose it.
+const SIOCETHTOOL: libc::c_ulong = 0x8946;
 // TODO-HUMAN-REVIEW(PR-136): Review the Linux UAPI value missing from pinned libc.
 const FALLOC_FL_WRITE_ZEROES: libc::c_int = 0x80;
 
@@ -341,6 +343,10 @@ fn execute_basic_syscall_with_output(
     } else if number == libc::SYS_setsockopt as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         setsockopt(memory, state, args)
+    } else if number == libc::SYS_getsockopt as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-230): Review bounded SO_TYPE copy-out semantics.
+        getsockopt(memory, state, args)
     } else if number == libc::SYS_bind as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         bind(memory, state, args)
@@ -3489,6 +3495,56 @@ fn setsockopt(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) ->
     })
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-230): Review bounded SO_TYPE copy-out semantics.
+fn getsockopt(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    let Some(host_fd) = host_fd(state, args[0] as libc::c_int) else {
+        return negative_errno(libc::EBADF);
+    };
+    if args[4] == 0 {
+        return negative_errno(libc::EFAULT);
+    }
+    let Ok(mut length) = read_guest_struct::<libc::socklen_t>(memory, args[4]) else {
+        return negative_errno(libc::EFAULT);
+    };
+    let capacity = length as usize;
+    if capacity > MAX_HOST_IO {
+        return negative_errno(libc::EINVAL);
+    }
+    if args[1] as libc::c_int != libc::SOL_SOCKET || args[2] as libc::c_int != libc::SO_TYPE {
+        return negative_errno(libc::ENOPROTOOPT);
+    }
+    if capacity != 0 && args[3] == 0 {
+        return negative_errno(libc::EFAULT);
+    }
+
+    let mut value = vec![0; capacity];
+    let value_pointer = if value.is_empty() {
+        std::ptr::null_mut()
+    } else {
+        value.as_mut_ptr().cast::<libc::c_void>()
+    };
+    // SAFETY: value_pointer is null for a zero-length request or writable for
+    // capacity bytes; host_fd belongs to the guest descriptor table.
+    if unsafe {
+        libc::getsockopt(
+            host_fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            value_pointer,
+            &mut length,
+        )
+    } != 0
+    {
+        return io_error(std::io::Error::last_os_error());
+    }
+    let copy_length = capacity.min(length as usize);
+    if copy_length != 0 && memory.write(args[3], &value[..copy_length]).is_err() {
+        return negative_errno(libc::EFAULT);
+    }
+    write_struct(memory, args[4], &length)
+}
+
 // TODO-HUMAN-REVIEW(PR-213): Review bounded host-backed AF_INET bind translation.
 // TODO-HUMAN-REVIEW(PR-217): Review filesystem-backed AF_UNIX bind translation.
 fn bind(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
@@ -4158,6 +4214,9 @@ fn ioctl(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
             state.cloexec_fds.remove(&guest_fd);
             0
         }
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-230): Review the no-guest-NIC ioctl model.
+        SIOCETHTOOL => negative_errno(libc::ENODEV),
         libc::TCGETS | libc::TIOCGWINSZ | libc::TIOCGPGRP => negative_errno(libc::ENOTTY),
         _ => negative_errno(libc::ENOTTY),
     }
@@ -9830,6 +9889,86 @@ mod tests {
     }
 
     #[test]
+    fn getsockopt_so_type_supports_bounded_and_zero_length_results() {
+        const RESULT: u64 = 0x100;
+        const RESULT_LENGTH: u64 = 0x200;
+
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let socket_fd = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_socket,
+            [libc::AF_INET as u64, libc::SOCK_STREAM as u64, 0, 0, 0, 0],
+        );
+        assert_eq!(socket_fd, 3);
+
+        assert_eq!(write_struct(&mut memory, RESULT_LENGTH, &0_u32), 0);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_getsockopt,
+                [
+                    socket_fd as u64,
+                    libc::SOL_SOCKET as u64,
+                    libc::SO_TYPE as u64,
+                    0,
+                    RESULT_LENGTH,
+                    0,
+                ],
+            ),
+            0
+        );
+        assert_eq!(read_struct::<libc::socklen_t>(&memory, RESULT_LENGTH), 0);
+
+        let full_length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        assert_eq!(write_struct(&mut memory, RESULT_LENGTH, &full_length), 0);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_getsockopt,
+                [
+                    socket_fd as u64,
+                    libc::SOL_SOCKET as u64,
+                    libc::SO_TYPE as u64,
+                    RESULT,
+                    RESULT_LENGTH,
+                    0,
+                ],
+            ),
+            0
+        );
+        assert_eq!(
+            read_struct::<libc::socklen_t>(&memory, RESULT_LENGTH),
+            full_length
+        );
+        assert_eq!(
+            read_struct::<libc::c_int>(&memory, RESULT),
+            libc::SOCK_STREAM
+        );
+
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_getsockopt,
+                [
+                    socket_fd as u64,
+                    libc::SOL_SOCKET as u64,
+                    libc::SO_TYPE as u64,
+                    RESULT,
+                    u64::MAX,
+                    0,
+                ],
+            ),
+            negative_errno(libc::EFAULT)
+        );
+    }
+
+    #[test]
     fn select_socketpair_and_shutdown_cover_ready_and_half_close_paths() {
         const PAIR_FDS: u64 = 0x100;
         const PAYLOAD: u64 = 0x200;
@@ -14094,6 +14233,13 @@ mod tests {
                 &memory,
             ),
             negative_errno(libc::EBADF)
+        );
+        assert_eq!(
+            executor.execute(
+                &SyscallRequest::new(libc::SYS_ioctl as u64, [3, SIOCETHTOOL, 0, 0, 0, 0],),
+                &memory,
+            ),
+            negative_errno(libc::ENODEV)
         );
     }
 
