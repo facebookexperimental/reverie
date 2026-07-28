@@ -313,6 +313,18 @@ fn execute_basic_syscall_with_output(
     } else if number == libc::SYS_socket as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         socket(state, args)
+    } else if number == libc::SYS_setsockopt as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        setsockopt(memory, state, args)
+    } else if number == libc::SYS_bind as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        bind(memory, state, args)
+    } else if number == libc::SYS_listen as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        listen(state, args)
+    } else if number == libc::SYS_getsockname as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        getsockname(memory, state, args)
     } else if number == libc::SYS_socketpair as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         socketpair(memory, state, args)
@@ -3247,22 +3259,140 @@ fn eventfd2(state: &mut LoadedStaticElf, initial: u64, raw_flags: u64) -> i64 {
 }
 
 // TODO-HUMAN-REVIEW(PR-92): Review this KVM compatibility implementation.
+// TODO-HUMAN-REVIEW(PR-213): Review host-backed AF_INET socket creation.
 fn socket(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
-    if args[0] as libc::c_int != libc::AF_UNIX || args[2] != 0 {
+    let domain = args[0] as libc::c_int;
+    if !matches!(domain, libc::AF_UNIX | libc::AF_INET) {
         return negative_errno(libc::EAFNOSUPPORT);
+    }
+    let protocol = args[2] as libc::c_int;
+    if domain == libc::AF_UNIX && protocol != 0 {
+        return negative_errno(libc::EPROTONOSUPPORT);
     }
     let socket_type = args[1] as libc::c_int;
     let base_type = socket_type & !(libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK);
     if base_type != libc::SOCK_DGRAM && base_type != libc::SOCK_STREAM {
         return negative_errno(libc::EPROTONOSUPPORT);
     }
-    let host_fd = unsafe { libc::socket(libc::AF_UNIX, socket_type | libc::SOCK_CLOEXEC, 0) };
+    // SAFETY: domain and type are restricted above; the kernel validates the
+    // protocol and returns a new owned descriptor on success.
+    let host_fd = unsafe { libc::socket(domain, socket_type | libc::SOCK_CLOEXEC, protocol) };
     if host_fd < 0 {
         return io_error(std::io::Error::last_os_error());
     }
     // SAFETY: socket returned a new owned descriptor.
     let file = unsafe { std::fs::File::from_raw_fd(host_fd) };
     insert_file_with_flags(state, file, socket_type & libc::SOCK_CLOEXEC != 0, None)
+}
+
+// TODO-HUMAN-REVIEW(PR-213): Review bounded guest socket-option translation.
+fn setsockopt(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    let Some(host_fd) = host_fd(state, args[0] as libc::c_int) else {
+        return negative_errno(libc::EBADF);
+    };
+    let Ok(length) = libc::socklen_t::try_from(args[4]) else {
+        return negative_errno(libc::EINVAL);
+    };
+    let length_usize = length as usize;
+    if length_usize > MAX_HOST_IO {
+        return negative_errno(libc::EINVAL);
+    }
+    let mut value = vec![0; length_usize];
+    if length_usize != 0 && memory.read(args[3], &mut value).is_err() {
+        return negative_errno(libc::EFAULT);
+    }
+    let value_ptr = if value.is_empty() {
+        std::ptr::null()
+    } else {
+        value.as_ptr().cast::<libc::c_void>()
+    };
+    // SAFETY: value_ptr is null for an empty option or readable for length
+    // bytes; host_fd belongs to the guest descriptor table.
+    zero_or_errno(unsafe {
+        libc::setsockopt(
+            host_fd,
+            args[1] as libc::c_int,
+            args[2] as libc::c_int,
+            value_ptr,
+            length,
+        )
+    })
+}
+
+// TODO-HUMAN-REVIEW(PR-213): Review bounded host-backed AF_INET bind translation.
+fn bind(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    let Some(host_fd) = host_fd(state, args[0] as libc::c_int) else {
+        return negative_errno(libc::EBADF);
+    };
+    let Ok(length) = libc::socklen_t::try_from(args[2]) else {
+        return negative_errno(libc::EINVAL);
+    };
+    let length_usize = length as usize;
+    if length_usize < std::mem::size_of::<libc::sa_family_t>()
+        || length_usize > std::mem::size_of::<libc::sockaddr_storage>()
+    {
+        return negative_errno(libc::EINVAL);
+    }
+    let mut address = vec![0; length_usize];
+    if memory.read(args[1], &mut address).is_err() {
+        return negative_errno(libc::EFAULT);
+    }
+    let family = libc::sa_family_t::from_ne_bytes(
+        address[..std::mem::size_of::<libc::sa_family_t>()]
+            .try_into()
+            .expect("family slice has exact size"),
+    );
+    if family != libc::AF_INET as libc::sa_family_t {
+        return negative_errno(libc::EAFNOSUPPORT);
+    }
+    // SAFETY: address is readable for length bytes and host_fd belongs to the
+    // guest descriptor table. Detcore has already determinized port zero.
+    zero_or_errno(unsafe { libc::bind(host_fd, address.as_ptr().cast::<libc::sockaddr>(), length) })
+}
+
+// TODO-HUMAN-REVIEW(PR-213): Review host-backed listen translation.
+fn listen(state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    let Some(host_fd) = host_fd(state, args[0] as libc::c_int) else {
+        return negative_errno(libc::EBADF);
+    };
+    // SAFETY: host_fd belongs to the guest descriptor table; listen validates
+    // whether it is a stream socket.
+    zero_or_errno(unsafe { libc::listen(host_fd, args[1] as libc::c_int) })
+}
+
+// TODO-HUMAN-REVIEW(PR-213): Review bounded getsockname copyback semantics.
+fn getsockname(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    let Some(host_fd) = host_fd(state, args[0] as libc::c_int) else {
+        return negative_errno(libc::EBADF);
+    };
+    if args[1] == 0 || args[2] == 0 {
+        return negative_errno(libc::EFAULT);
+    }
+    let Ok(mut length) = read_guest_struct::<libc::socklen_t>(memory, args[2]) else {
+        return negative_errno(libc::EFAULT);
+    };
+    let capacity = length as usize;
+    if capacity > MAX_HOST_IO {
+        return negative_errno(libc::EINVAL);
+    }
+    let mut address = vec![0; capacity];
+    // SAFETY: address is writable for capacity bytes and length describes that
+    // allocation. host_fd belongs to the guest descriptor table.
+    if unsafe {
+        libc::getsockname(
+            host_fd,
+            address.as_mut_ptr().cast::<libc::sockaddr>(),
+            &mut length,
+        )
+    } != 0
+    {
+        return io_error(std::io::Error::last_os_error());
+    }
+    let copy_length = capacity.min(length as usize);
+    if copy_length != 0 && memory.write(args[1], &address[..copy_length]).is_err() {
+        return negative_errno(libc::EFAULT);
+    }
+    write_struct(memory, args[2], &length)
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -8428,6 +8558,139 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .objects
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn inet_listener_translates_guest_socket_arguments() {
+        const BIND_ADDRESS: u64 = 0x100;
+        const REUSE_ADDRESS: u64 = 0x200;
+        const RESULT_ADDRESS: u64 = 0x300;
+        const RESULT_LENGTH: u64 = 0x400;
+
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let address = libc::sockaddr_in {
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: 0,
+            sin_addr: libc::in_addr {
+                s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+            },
+            sin_zero: [0; 8],
+        };
+        assert_eq!(write_struct(&mut memory, BIND_ADDRESS, &address), 0);
+        assert_eq!(write_struct(&mut memory, REUSE_ADDRESS, &1_i32), 0);
+
+        let socket_fd = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_socket,
+            [
+                libc::AF_INET as u64,
+                (libc::SOCK_STREAM | libc::SOCK_CLOEXEC) as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+        assert_eq!(socket_fd, 3);
+        assert!(state.cloexec_fds.contains(&(socket_fd as libc::c_int)));
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_setsockopt,
+                [
+                    socket_fd as u64,
+                    libc::SOL_SOCKET as u64,
+                    libc::SO_REUSEADDR as u64,
+                    u64::MAX,
+                    std::mem::size_of::<i32>() as u64,
+                    0,
+                ],
+            ),
+            negative_errno(libc::EFAULT)
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_setsockopt,
+                [
+                    socket_fd as u64,
+                    libc::SOL_SOCKET as u64,
+                    libc::SO_REUSEADDR as u64,
+                    REUSE_ADDRESS,
+                    std::mem::size_of::<i32>() as u64,
+                    0,
+                ],
+            ),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_bind,
+                [
+                    socket_fd as u64,
+                    BIND_ADDRESS,
+                    std::mem::size_of::<libc::sockaddr_in>() as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_listen,
+                [socket_fd as u64, 1, 0, 0, 0, 0],
+            ),
+            0
+        );
+        let address_length = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+        assert_eq!(write_struct(&mut memory, RESULT_LENGTH, &address_length), 0);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_getsockname,
+                [socket_fd as u64, RESULT_ADDRESS, u64::MAX, 0, 0, 0],
+            ),
+            negative_errno(libc::EFAULT)
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_getsockname,
+                [socket_fd as u64, RESULT_ADDRESS, RESULT_LENGTH, 0, 0, 0,],
+            ),
+            0
+        );
+        let returned_length: libc::socklen_t = read_struct(&memory, RESULT_LENGTH);
+        let returned_address: libc::sockaddr_in = read_struct(&memory, RESULT_ADDRESS);
+        assert_eq!(returned_length as usize, std::mem::size_of_val(&address));
+        assert_eq!(
+            returned_address.sin_family,
+            libc::AF_INET as libc::sa_family_t
+        );
+        assert_ne!(returned_address.sin_port, 0);
+        assert_eq!(returned_address.sin_addr.s_addr, address.sin_addr.s_addr);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_close,
+                [socket_fd as u64, 0, 0, 0, 0, 0],
+            ),
+            0
         );
     }
 
