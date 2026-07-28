@@ -322,6 +322,9 @@ fn execute_basic_syscall_with_output(
     } else if number == libc::SYS_shutdown as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         shutdown(state, args)
+    } else if number == libc::SYS_recvmmsg as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        recvmmsg(memory, state, args)
     } else if number == libc::SYS_ioctl as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         ioctl(state, args)
@@ -3351,6 +3354,248 @@ fn shutdown(state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
     // SAFETY: host_fd is a live guest-owned descriptor; shutdown validates
     // whether it refers to a socket.
     zero_or_errno(unsafe { libc::shutdown(host_fd, how) })
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-210): Review guest mmsghdr translation and nonblocking receive semantics.
+fn recvmmsg(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    let Some(host_fd) = host_fd(state, args[0] as libc::c_int) else {
+        return negative_errno(libc::EBADF);
+    };
+    let Ok(message_count) = usize::try_from(args[2]) else {
+        return negative_errno(libc::EINVAL);
+    };
+    if message_count == 0 || message_count > libc::UIO_MAXIOV as usize {
+        return negative_errno(libc::EINVAL);
+    }
+
+    let message_size = std::mem::size_of::<libc::mmsghdr>();
+    let Some(total_header_bytes) = message_count.checked_mul(message_size) else {
+        return negative_errno(libc::EINVAL);
+    };
+    if total_header_bytes > MAX_HOST_IO {
+        return negative_errno(libc::EINVAL);
+    }
+
+    let mut delivered = 0usize;
+    for index in 0..message_count {
+        let Some(message_address) = args[1].checked_add((index * message_size) as u64) else {
+            return if delivered == 0 {
+                negative_errno(libc::EFAULT)
+            } else {
+                delivered as i64
+            };
+        };
+        let mut message: libc::mmsghdr = match read_guest_struct(memory, message_address) {
+            Ok(message) => message,
+            Err(error) => {
+                return if delivered == 0 {
+                    error
+                } else {
+                    delivered as i64
+                };
+            }
+        };
+        let iov_count = message.msg_hdr.msg_iovlen;
+        if iov_count > libc::UIO_MAXIOV as usize {
+            return if delivered == 0 {
+                negative_errno(libc::EMSGSIZE)
+            } else {
+                delivered as i64
+            };
+        }
+
+        let guest_iov_address = message.msg_hdr.msg_iov as usize as u64;
+        let mut guest_iovecs = Vec::with_capacity(iov_count);
+        let mut payload_length = 0usize;
+        for iov_index in 0..iov_count {
+            let Some(iov_address) = guest_iov_address
+                .checked_add((iov_index * std::mem::size_of::<libc::iovec>()) as u64)
+            else {
+                return if delivered == 0 {
+                    negative_errno(libc::EFAULT)
+                } else {
+                    delivered as i64
+                };
+            };
+            let iov: libc::iovec = match read_guest_struct(memory, iov_address) {
+                Ok(iov) => iov,
+                Err(error) => {
+                    return if delivered == 0 {
+                        error
+                    } else {
+                        delivered as i64
+                    };
+                }
+            };
+            let Some(next_length) = payload_length.checked_add(iov.iov_len) else {
+                return if delivered == 0 {
+                    negative_errno(libc::EINVAL)
+                } else {
+                    delivered as i64
+                };
+            };
+            if next_length > MAX_HOST_IO {
+                return if delivered == 0 {
+                    negative_errno(libc::EINVAL)
+                } else {
+                    delivered as i64
+                };
+            }
+            if iov.iov_len != 0 {
+                let mut probe = vec![0; iov.iov_len];
+                if memory
+                    .read(iov.iov_base as usize as u64, &mut probe)
+                    .is_err()
+                {
+                    return if delivered == 0 {
+                        negative_errno(libc::EFAULT)
+                    } else {
+                        delivered as i64
+                    };
+                }
+            }
+            payload_length = next_length;
+            guest_iovecs.push(iov);
+        }
+
+        let name_capacity = message.msg_hdr.msg_namelen as usize;
+        let control_capacity = message.msg_hdr.msg_controllen;
+        if name_capacity > MAX_HOST_IO || control_capacity > MAX_HOST_IO {
+            return if delivered == 0 {
+                negative_errno(libc::EINVAL)
+            } else {
+                delivered as i64
+            };
+        }
+        let mut payload = vec![0u8; payload_length];
+        let mut name = vec![0u8; name_capacity];
+        let mut control = vec![0u8; control_capacity];
+        if name_capacity != 0
+            && memory
+                .read(message.msg_hdr.msg_name as usize as u64, &mut name)
+                .is_err()
+        {
+            return if delivered == 0 {
+                negative_errno(libc::EFAULT)
+            } else {
+                delivered as i64
+            };
+        }
+        if control_capacity != 0
+            && memory
+                .read(message.msg_hdr.msg_control as usize as u64, &mut control)
+                .is_err()
+        {
+            return if delivered == 0 {
+                negative_errno(libc::EFAULT)
+            } else {
+                delivered as i64
+            };
+        }
+
+        let mut host_iov = libc::iovec {
+            iov_base: payload.as_mut_ptr().cast(),
+            iov_len: payload.len(),
+        };
+        let mut host_header = libc::msghdr {
+            msg_name: if name.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                name.as_mut_ptr().cast()
+            },
+            msg_namelen: name.len() as libc::socklen_t,
+            msg_iov: std::ptr::from_mut(&mut host_iov),
+            msg_iovlen: usize::from(!payload.is_empty()),
+            msg_control: if control.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                control.as_mut_ptr().cast()
+            },
+            msg_controllen: control.len(),
+            msg_flags: 0,
+        };
+        let flags = args[3] as libc::c_int & !libc::MSG_WAITFORONE;
+        // Keep the VM executor cooperative. Detcore retries EAGAIN through its
+        // scheduler, while already queued datagrams are returned immediately.
+        let received = unsafe {
+            libc::recvmsg(
+                host_fd,
+                std::ptr::from_mut(&mut host_header),
+                flags | libc::MSG_DONTWAIT,
+            )
+        };
+        if received < 0 {
+            let error = io_error(std::io::Error::last_os_error());
+            return if delivered == 0 {
+                error
+            } else {
+                delivered as i64
+            };
+        }
+
+        let copied_length = (received as usize).min(payload.len());
+        let mut copied = 0usize;
+        for iov in &guest_iovecs {
+            let length = iov.iov_len.min(copied_length.saturating_sub(copied));
+            if length != 0
+                && memory
+                    .write(
+                        iov.iov_base as usize as u64,
+                        &payload[copied..copied + length],
+                    )
+                    .is_err()
+            {
+                return if delivered == 0 {
+                    negative_errno(libc::EFAULT)
+                } else {
+                    delivered as i64
+                };
+            }
+            copied += length;
+        }
+        if name_capacity != 0
+            && memory
+                .write(
+                    message.msg_hdr.msg_name as usize as u64,
+                    &name[..name_capacity.min(host_header.msg_namelen as usize)],
+                )
+                .is_err()
+        {
+            return if delivered == 0 {
+                negative_errno(libc::EFAULT)
+            } else {
+                delivered as i64
+            };
+        }
+        if control_capacity != 0
+            && memory
+                .write(
+                    message.msg_hdr.msg_control as usize as u64,
+                    &control[..control_capacity.min(host_header.msg_controllen)],
+                )
+                .is_err()
+        {
+            return if delivered == 0 {
+                negative_errno(libc::EFAULT)
+            } else {
+                delivered as i64
+            };
+        }
+        message.msg_hdr.msg_namelen = host_header.msg_namelen;
+        message.msg_hdr.msg_controllen = host_header.msg_controllen;
+        message.msg_hdr.msg_flags = host_header.msg_flags;
+        message.msg_len = received as libc::c_uint;
+        if write_struct(memory, message_address, &message) != 0 {
+            return if delivered == 0 {
+                negative_errno(libc::EFAULT)
+            } else {
+                delivered as i64
+            };
+        }
+        delivered += 1;
+    }
+    delivered as i64
 }
 
 // TODO-HUMAN-REVIEW(PR-92): Review this KVM compatibility implementation.
@@ -8376,6 +8621,108 @@ mod tests {
             );
         }
         assert!(state.files.is_empty());
+    }
+
+    #[test]
+    fn recvmmsg_translates_guest_headers_and_receives_multiple_datagrams() {
+        const PAIR_FDS: u64 = 0x100;
+        const FIRST_PAYLOAD: u64 = 0x200;
+        const SECOND_PAYLOAD: u64 = 0x220;
+        const MESSAGES: u64 = 0x300;
+        const FIRST_IOV: u64 = 0x400;
+        const SECOND_IOV: u64 = 0x420;
+        const FIRST_BUFFER: u64 = 0x500;
+        const SECOND_BUFFER: u64 = 0x540;
+
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        memory.write(FIRST_PAYLOAD, b"hello").unwrap();
+        memory.write(SECOND_PAYLOAD, b"world!").unwrap();
+
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_socketpair,
+                [
+                    libc::AF_UNIX as u64,
+                    libc::SOCK_DGRAM as u64,
+                    0,
+                    PAIR_FDS,
+                    0,
+                    0,
+                ],
+            ),
+            0
+        );
+        let socket_fds: [libc::c_int; 2] = read_struct(&memory, PAIR_FDS);
+        for (address, length) in [(FIRST_PAYLOAD, 5), (SECOND_PAYLOAD, 6)] {
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_write,
+                    [socket_fds[0] as u64, address, length, 0, 0, 0],
+                ),
+                length as i64
+            );
+        }
+
+        for (index, (iov_address, buffer_address)) in
+            [(FIRST_IOV, FIRST_BUFFER), (SECOND_IOV, SECOND_BUFFER)]
+                .into_iter()
+                .enumerate()
+        {
+            let iov = libc::iovec {
+                iov_base: buffer_address as usize as *mut libc::c_void,
+                iov_len: 32,
+            };
+            assert_eq!(write_struct(&mut memory, iov_address, &iov), 0);
+            let mut message = unsafe { std::mem::zeroed::<libc::mmsghdr>() };
+            message.msg_hdr.msg_iov = iov_address as usize as *mut libc::iovec;
+            message.msg_hdr.msg_iovlen = 1;
+            assert_eq!(
+                write_struct(
+                    &mut memory,
+                    MESSAGES + (index * std::mem::size_of::<libc::mmsghdr>()) as u64,
+                    &message,
+                ),
+                0
+            );
+        }
+
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_recvmmsg,
+                [
+                    socket_fds[1] as u64,
+                    MESSAGES,
+                    2,
+                    libc::MSG_DONTWAIT as u64,
+                    0,
+                    0,
+                ],
+            ),
+            2
+        );
+        let first: libc::mmsghdr = read_struct(&memory, MESSAGES);
+        let second: libc::mmsghdr = read_struct(
+            &memory,
+            MESSAGES + std::mem::size_of::<libc::mmsghdr>() as u64,
+        );
+        assert_eq!(first.msg_len, 5);
+        assert_eq!(second.msg_len, 6);
+        assert_eq!(
+            read_guest_bytes::<5>(&memory, FIRST_BUFFER).unwrap(),
+            *b"hello"
+        );
+        assert_eq!(
+            read_guest_bytes::<6>(&memory, SECOND_BUFFER).unwrap(),
+            *b"world!"
+        );
     }
 
     #[test]
