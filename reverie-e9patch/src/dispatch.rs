@@ -51,6 +51,7 @@ use core::sync::atomic::Ordering;
 use reverie_preload::dispatch::PassthroughDispatcher;
 use reverie_preload::dispatch::SyscallDispatcher;
 use reverie_preload::dispatch::SyscallEvent;
+use reverie_preload::fork::ForkHook;
 
 /// Distinct syscall numbers broken out individually by the fallback counters.
 ///
@@ -215,6 +216,22 @@ impl<const N: usize> SiteTable<N> {
     fn overflow_count(&self) -> u64 {
         self.overflow.load(Ordering::Relaxed)
     }
+
+    /// Clear every slot and the overflow tally back to the empty state.
+    ///
+    /// Async-signal-safe: only relaxed atomic stores, no allocation or locks, so
+    /// it is safe to call from the fork child inside the `SIGSYS` handler. This
+    /// re-empties the table (address `0` is the empty sentinel), so a child that
+    /// COW-inherited the parent's occupied slots starts attribution from zero.
+    fn reset(&self) {
+        for slot in &self.addr {
+            slot.store(0, Ordering::Relaxed);
+        }
+        for slot in &self.count {
+            slot.store(0, Ordering::Relaxed);
+        }
+        self.overflow.store(0, Ordering::Relaxed);
+    }
 }
 
 // TODO-HUMAN-REVIEW(PR-253): Review public per-site fallback-surface observability.
@@ -263,6 +280,31 @@ pub(crate) fn fallback_syscall_count(number: i64) -> u64 {
     }
 }
 
+// TODO-HUMAN-REVIEW(PR-256): Review the fork-child per-process observability reset.
+/// Reset every fallback-surface counter to zero for the current process.
+///
+/// The fallback counters ([`FALLBACK_TOTAL`], [`FALLBACK_BY_NUMBER`],
+/// [`FALLBACK_SITES`]) are process-global statics. A `fork`/`clone` child
+/// copy-on-write inherits the parent's accumulated values, so without a reset the
+/// child would report the parent's residual surface as its own. This is the
+/// per-process runtime state that the shared [`ForkHook`] seam
+/// ([`reverie_preload::fork`]) exists to re-establish in the child — the same
+/// mechanism LiteInst uses (there, to open a fresh coordinator connection). Here
+/// the per-process state is observability, so the child's fallback attribution
+/// starts clean.
+///
+/// Signature is `fn()` so it can be wrapped in a [`ForkHook`]. Async-signal-safe
+/// (only relaxed atomic stores), so it is safe to run in the child from inside
+/// the `SIGSYS` handler.
+pub(crate) fn reset_fallback_observability() {
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    FALLBACK_TOTAL.store(0, Ordering::Relaxed);
+    for slot in &FALLBACK_BY_NUMBER {
+        slot.store(0, Ordering::Relaxed);
+    }
+    FALLBACK_SITES.reset();
+}
+
 /// e9patch's `SIGSYS` dispatcher for sites that were **not** rewritten ahead of
 /// time by `e9tool`.
 ///
@@ -285,6 +327,26 @@ impl E9patchDispatcher {
     pub const fn new() -> Self {
         Self {
             passthrough: PassthroughDispatcher::new(),
+        }
+    }
+
+    // TODO-HUMAN-REVIEW(PR-256): Review the fork-following observability reset wiring.
+    /// The production dispatcher: like [`new`](Self::new), but additionally arms
+    /// the shared [`ForkHook`] so each `fork`/`clone` child resets its
+    /// per-process fallback observability (see `reset_fallback_observability`).
+    ///
+    /// This mirrors the shared API shape exactly — [`PassthroughDispatcher::new`]
+    /// (hook-less) plus [`PassthroughDispatcher::with_fork_hook`] (opt-in) — so
+    /// e9patch re-uses the *same* fork-following seam LiteInst does rather than
+    /// reimplementing per-process reset. Only the per-process state each backend
+    /// re-establishes differs (LiteInst: a fresh coordinator connection; e9patch:
+    /// the fallback counters), which is a consequence of what each keeps, not a
+    /// second mechanism.
+    pub fn with_fork_reset() -> Self {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        Self {
+            passthrough: PassthroughDispatcher::new()
+                .with_fork_hook(ForkHook::new(reset_fallback_observability)),
         }
     }
 }
@@ -428,5 +490,58 @@ mod tests {
         record_fallback_dispatch(-1);
         assert_eq!(fallback_syscall_count(-1), 0);
         assert!(fallback_dispatch_count() > total_before);
+    }
+
+    #[test]
+    fn site_table_reset_clears_slots_and_overflow() {
+        // Private table so the assertion is exact regardless of the
+        // process-global counters other tests touch.
+        let table = SiteTable::<4>::new();
+        for site in [0x1000_u64, 0x2000, 0x3000, 0x4000] {
+            table.record(site);
+        }
+        table.record(0x5000); // overflows the full table
+        assert_eq!(table.count(0x1000), 1);
+        assert_eq!(table.overflow_count(), 1);
+
+        table.reset();
+
+        // Every slot is empty again and the table can be re-populated cleanly.
+        for site in [0x1000_u64, 0x2000, 0x3000, 0x4000, 0x5000] {
+            assert_eq!(table.count(site), 0);
+        }
+        assert_eq!(table.overflow_count(), 0);
+        table.record(0x5000);
+        assert_eq!(table.count(0x5000), 1);
+    }
+
+    #[test]
+    fn resetting_observability_zeroes_the_process_global_counters() {
+        // Serial (`--test-threads=1`), so resetting the process-global counters
+        // does not race other tests. Record on all three counter families, then
+        // prove the shared fork-child reset clears them.
+        let number: i64 = 402;
+        let site: u64 = 0x7f00_dead_0002;
+        record_fallback_dispatch(number);
+        record_fallback_site(site);
+        assert!(fallback_dispatch_count() > 0);
+        assert!(fallback_syscall_count(number) > 0);
+        assert!(fallback_site_count(site) > 0);
+
+        reset_fallback_observability();
+
+        assert_eq!(fallback_dispatch_count(), 0);
+        assert_eq!(fallback_syscall_count(number), 0);
+        assert_eq!(fallback_site_count(site), 0);
+        assert_eq!(fallback_site_overflow(), 0);
+    }
+
+    #[test]
+    fn fork_reset_dispatcher_is_a_syscall_dispatcher() {
+        // The production constructor still yields the shared dispatcher seam;
+        // it differs from `new` only by arming the shared ForkHook.
+        fn assert_dispatcher<T: SyscallDispatcher>(_: &T) {}
+        let dispatcher = E9patchDispatcher::with_fork_reset();
+        assert_dispatcher(&dispatcher);
     }
 }

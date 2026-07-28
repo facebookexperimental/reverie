@@ -291,9 +291,20 @@ unsafe fn install_with_controller(controller: &dyn LifecycleController) -> io::R
     // unconditional default, so the same shared RuntimeConfig knob reverie-preload
     // exposes is reachable from the e9patch launcher. Unset => shared default.
     let config = runtime_config_from_env()?;
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // Use the fork-following dispatcher so each fork/clone child resets its
+    // per-process fallback observability via the shared ForkHook seam (the same
+    // per-process-reset mechanism LiteInst uses); COW-inherited parent counts
+    // would otherwise mis-attribute the child's residual surface.
     // SAFETY: the dispatcher is registered before the controller installs the
     // SIGSYS handler + filter; forwarded to the caller's contract above.
-    unsafe { reverie_preload::install(Box::new(E9patchDispatcher::new()), controller, &config) }
+    unsafe {
+        reverie_preload::install(
+            Box::new(E9patchDispatcher::with_fork_reset()),
+            controller,
+            &config,
+        )
+    }
 }
 
 /// Read the launcher environment and install the in-guest runtime it selects.

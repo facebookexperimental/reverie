@@ -83,6 +83,19 @@ it.
   once, not backend-private. Only the env-var spelling is e9patch's. This proves
   the e9patch fallback trap path can *mutate* a syscall result, not merely
   forward it.
+- **The same fork-following seam.** The production dispatcher
+  (`E9patchDispatcher::with_fork_reset`) arms reverie-preload's shared
+  `fork::ForkHook` through `PassthroughDispatcher::with_fork_hook`, so each
+  `fork`/`clone` child re-establishes its per-process runtime state in the child
+  immediately after the fork-like syscall returns `0`. This is the *same* seam,
+  and the same reviewed-once mechanism, that LiteInst uses for per-process reset
+  (there, a fresh coordinator connection). e9patch's per-process state is the
+  fallback observability below: the counters are process-global statics, so a
+  child would otherwise copy-on-write inherit — and mis-report as its own — the
+  parent's accumulated residual surface. What each backend re-establishes in the
+  child differs; the mechanism does not. `E9patchDispatcher::new` remains the
+  hook-less minimal dispatcher, mirroring `PassthroughDispatcher::new` versus
+  `with_fork_hook`.
 
 **Different (the only intended differences):**
 
@@ -143,6 +156,17 @@ forwarding decision, and directly answers the coverage question above: counts
 near zero confirm e9tool's ahead-of-time rewriting is carrying the syscall load,
 while nonzero counts localize the un-rewritten surface both by syscall number and
 by exact instruction address.
+
+These counters are **per-process**. They are process-global statics, so a
+`fork`/`clone` child copy-on-write inherits the parent's accumulated values; left
+alone, a child would report the parent's residual surface as its own. The
+production dispatcher therefore arms the shared `fork::ForkHook` seam (see
+*The same fork-following seam* above): immediately after a fork-like syscall
+returns `0` in the child, the shared hook runs `reset_fallback_observability`,
+zeroing all three counter families so the child's attribution starts clean. The
+reset is relaxed-atomic and allocation/lock-free, so it is safe to run in the
+child from inside the `SIGSYS` handler. This is the exact per-process-reset
+mechanism LiteInst uses on fork, applied to e9patch's per-process state.
 
 ## Preload And RPC Boundary
 
