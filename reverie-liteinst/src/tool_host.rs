@@ -197,7 +197,8 @@ where
             && tid.as_raw() == self.root_pid.as_raw()
             && let Err(error) = drive_ready(tool.handle_post_exec(&mut guest))
         {
-            tool_fatal(124, &error);
+            // handle_post_exec returns Errno; tool_fatal expects reverie::Error.
+            tool_fatal(124, &Error::from(error));
         }
 
         let Some(number) = usize::try_from(guest.event.number)
