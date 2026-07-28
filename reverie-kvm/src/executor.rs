@@ -224,6 +224,9 @@ pub(crate) fn is_process_syscall(number: u64) -> bool {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-92): Review wait4 process-action classification.
         || number == libc::SYS_wait4 as u64
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-TBD): Review waitid process-action classification.
+        || number == libc::SYS_waitid as u64
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -499,6 +502,10 @@ fn execute_basic_syscall_with_output(
     } else if number == libc::SYS_wait4 as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         wait4(memory, state, args)
+    } else if number == libc::SYS_waitid as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-TBD): Review serialized-child waitid emulation.
+        waitid(memory, state, args)
     } else if number == libc::SYS_getuid as u64
         || number == libc::SYS_geteuid as u64
         || number == libc::SYS_getgid as u64
@@ -590,6 +597,20 @@ fn execute_basic_syscall_with_output(
     {
         // AUTONOMOUS-BOT-IMPLEMENTED
         getxattr(memory, state, number, args)
+    } else if number == libc::SYS_setxattr as u64
+        || number == libc::SYS_lsetxattr as u64
+        || number == libc::SYS_fsetxattr as u64
+    {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic xattr mutation refusal.
+        setxattr(memory, state, number, args)
+    } else if number == libc::SYS_removexattr as u64
+        || number == libc::SYS_lremovexattr as u64
+        || number == libc::SYS_fremovexattr as u64
+    {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic xattr removal result.
+        removexattr(memory, state, number, args)
     } else if number == libc::SYS_brk as u64 {
         brk(memory, state, args[0])
     } else if number == libc::SYS_mmap as u64 {
@@ -6219,39 +6240,48 @@ fn read_capability_data(memory: &GuestMemory, address: u64) -> Result<(u64, u64,
 // TODO-HUMAN-REVIEW(PR-116): Review the no-xattr KVM guest model and errors.
 //
 // The deterministic container models no extended attributes, but Linux still
-// validates the target and attribute name before reporting ENODATA. Preserve
-// those observable path/fd/memory errors without exposing host xattr contents.
-fn getxattr(memory: &GuestMemory, state: &LoadedStaticElf, number: u64, args: &[u64; 6]) -> i64 {
-    if number == libc::SYS_fgetxattr as u64 {
+// validates the target and attribute name before reporting the modeled result.
+// Preserve those observable path/fd/memory errors without exposing host xattr
+// contents.
+fn validate_xattr_target_and_name(
+    memory: &GuestMemory,
+    state: &LoadedStaticElf,
+    number: u64,
+    args: &[u64; 6],
+) -> Result<(), i64> {
+    if number == libc::SYS_fgetxattr as u64
+        || number == libc::SYS_fsetxattr as u64
+        || number == libc::SYS_fremovexattr as u64
+    {
         let Ok(guest_fd) = libc::c_int::try_from(args[0]) else {
-            return negative_errno(libc::EBADF);
+            return Err(negative_errno(libc::EBADF));
         };
         if host_fd(state, guest_fd).is_none() {
-            return negative_errno(libc::EBADF);
+            return Err(negative_errno(libc::EBADF));
         }
     } else {
         let path = match read_c_string(memory, args[0], 4096) {
             Ok(path) => path,
-            Err(error) => return read_c_string_errno(error),
+            Err(error) => return Err(read_c_string_errno(error)),
         };
         if path.is_empty() {
-            return negative_errno(libc::ENOENT);
+            return Err(negative_errno(libc::ENOENT));
         }
         if synthetic_proc_content(state, &path).is_none() {
-            let nofollow = number == libc::SYS_lgetxattr as u64;
-            if let Err(error) = open_metadata_path(state, libc::AT_FDCWD, &path, nofollow) {
-                return error;
-            }
+            let nofollow = number == libc::SYS_lgetxattr as u64
+                || number == libc::SYS_lsetxattr as u64
+                || number == libc::SYS_lremovexattr as u64;
+            open_metadata_path(state, libc::AT_FDCWD, &path, nofollow)?;
         }
     }
 
     match read_c_string(memory, args[1], 256) {
-        Ok(name) if name.is_empty() => negative_errno(libc::ERANGE),
+        Ok(name) if name.is_empty() => Err(negative_errno(libc::ERANGE)),
         Ok(name) => {
             let empty_namespace =
                 [b"user.".as_slice(), b"trusted.", b"security."].contains(&name.as_slice());
             if empty_namespace {
-                return negative_errno(libc::EINVAL);
+                return Err(negative_errno(libc::EINVAL));
             }
             let supported_namespace = [b"user.".as_slice(), b"trusted.", b"security."]
                 .iter()
@@ -6261,13 +6291,56 @@ fn getxattr(memory: &GuestMemory, state: &LoadedStaticElf, number: u64, args: &[
                 b"system.posix_acl_access" | b"system.posix_acl_default"
             );
             if supported_namespace || supported_system_name {
-                negative_errno(libc::ENODATA)
+                Ok(())
             } else {
-                negative_errno(libc::EOPNOTSUPP)
+                Err(negative_errno(libc::EOPNOTSUPP))
             }
         }
-        Err(ReadCStringError::Fault) => negative_errno(libc::EFAULT),
-        Err(ReadCStringError::NameTooLong) => negative_errno(libc::ERANGE),
+        Err(ReadCStringError::Fault) => Err(negative_errno(libc::EFAULT)),
+        Err(ReadCStringError::NameTooLong) => Err(negative_errno(libc::ERANGE)),
+    }
+}
+
+fn getxattr(memory: &GuestMemory, state: &LoadedStaticElf, number: u64, args: &[u64; 6]) -> i64 {
+    match validate_xattr_target_and_name(memory, state, number, args) {
+        Ok(()) => negative_errno(libc::ENODATA),
+        Err(error) => error,
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-TBD): Review no-xattr mutation validation and refusal.
+fn setxattr(memory: &GuestMemory, state: &LoadedStaticElf, number: u64, args: &[u64; 6]) -> i64 {
+    if let Err(error) = validate_xattr_target_and_name(memory, state, number, args) {
+        return error;
+    }
+    let flags = args[4] as libc::c_int;
+    let allowed_flags = libc::XATTR_CREATE | libc::XATTR_REPLACE;
+    if flags & !allowed_flags != 0 || flags == allowed_flags {
+        return negative_errno(libc::EINVAL);
+    }
+    let Ok(value_length) = usize::try_from(args[3]) else {
+        return negative_errno(libc::E2BIG);
+    };
+    const XATTR_SIZE_MAX: usize = 65_536;
+    if value_length > XATTR_SIZE_MAX {
+        return negative_errno(libc::E2BIG);
+    }
+    if value_length != 0 {
+        let mut value = vec![0; value_length];
+        if memory.read(args[2], &mut value).is_err() {
+            return negative_errno(libc::EFAULT);
+        }
+    }
+    negative_errno(libc::EOPNOTSUPP)
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-TBD): Review no-xattr removal validation and result.
+fn removexattr(memory: &GuestMemory, state: &LoadedStaticElf, number: u64, args: &[u64; 6]) -> i64 {
+    match validate_xattr_target_and_name(memory, state, number, args) {
+        Ok(()) => negative_errno(libc::ENODATA),
+        Err(error) => error,
     }
 }
 
@@ -7481,6 +7554,77 @@ fn wait4(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6])
     }
     state.children.remove(&child_pid);
     i64::from(child_pid)
+}
+
+#[repr(C)]
+struct GuestWaitidSiginfo {
+    si_signo: libc::c_int,
+    si_errno: libc::c_int,
+    si_code: libc::c_int,
+    _union_alignment: libc::c_int,
+    si_pid: libc::pid_t,
+    si_uid: libc::uid_t,
+    si_status: libc::c_int,
+    _clock_alignment: libc::c_int,
+    si_utime: libc::c_long,
+    si_stime: libc::c_long,
+    _padding: [u8; std::mem::size_of::<libc::siginfo_t>() - 48],
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-TBD): Review serialized-child waitid ABI emulation.
+fn waitid(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    const EVENT_OPTIONS: u64 = libc::WEXITED as u64;
+    const ALLOWED_OPTIONS: u64 = EVENT_OPTIONS | libc::WNOHANG as u64 | libc::WNOWAIT as u64;
+
+    if args[2] == 0 {
+        return negative_errno(libc::EFAULT);
+    }
+    if args[3] & EVENT_OPTIONS == 0 || args[3] & !ALLOWED_OPTIONS != 0 {
+        return negative_errno(libc::EINVAL);
+    }
+
+    let child_pid = match args[0] as libc::idtype_t {
+        libc::P_PID => libc::pid_t::try_from(args[1])
+            .ok()
+            .filter(|pid| state.children.contains_key(pid)),
+        libc::P_ALL | libc::P_PGID => state.children.keys().next().copied(),
+        _ => return negative_errno(libc::EINVAL),
+    };
+    let Some(child_pid) = child_pid else {
+        return negative_errno(libc::ECHILD);
+    };
+    let status = state.children[&child_pid] & 0xff;
+    let info = GuestWaitidSiginfo {
+        si_signo: libc::SIGCHLD,
+        si_errno: 0,
+        si_code: libc::CLD_EXITED,
+        _union_alignment: 0,
+        si_pid: child_pid,
+        si_uid: 0,
+        si_status: status,
+        _clock_alignment: 0,
+        si_utime: 0,
+        si_stime: 0,
+        _padding: [0; std::mem::size_of::<libc::siginfo_t>() - 48],
+    };
+    let result = write_struct(memory, args[2], &info);
+    if result != 0 {
+        return result;
+    }
+    if args[4] != 0 {
+        let result = memory
+            .zero(args[4], std::mem::size_of::<libc::rusage>())
+            .map(|()| 0)
+            .unwrap_or_else(|_| negative_errno(libc::EFAULT));
+        if result != 0 {
+            return result;
+        }
+    }
+    if args[3] & libc::WNOWAIT as u64 == 0 {
+        state.children.remove(&child_pid);
+    }
+    0
 }
 
 fn write_u64(memory: &mut GuestMemory, address: u64, value: u64) -> i64 {
@@ -14615,6 +14759,73 @@ mod tests {
     }
 
     #[test]
+    fn waitid_reports_status_supports_wnowait_and_reaps() {
+        const INFO: u64 = 0x100;
+        const USAGE: u64 = 0x200;
+
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        state.children.insert(7, 3);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        memory
+            .write(USAGE, &[0xa5; std::mem::size_of::<libc::rusage>()])
+            .unwrap();
+
+        assert_eq!(
+            waitid(
+                &mut memory,
+                &mut state,
+                &[
+                    libc::P_PID as u64,
+                    7,
+                    INFO,
+                    (libc::WEXITED | libc::WNOWAIT) as u64,
+                    USAGE,
+                    0,
+                ],
+            ),
+            0
+        );
+        assert_eq!(
+            std::mem::size_of::<GuestWaitidSiginfo>(),
+            std::mem::size_of::<libc::siginfo_t>()
+        );
+        let info: libc::siginfo_t = read_struct(&memory, INFO);
+        assert_eq!(info.si_signo, libc::SIGCHLD);
+        assert_eq!(info.si_code, libc::CLD_EXITED);
+        // SAFETY: waitid writes the SIGCHLD variant of siginfo_t.
+        unsafe {
+            assert_eq!(info.si_pid(), 7);
+            assert_eq!(info.si_uid(), 0);
+            assert_eq!(info.si_status(), 3);
+            assert_eq!(info.si_utime(), 0);
+            assert_eq!(info.si_stime(), 0);
+        }
+        let mut usage = vec![0xff; std::mem::size_of::<libc::rusage>()];
+        memory.read(USAGE, &mut usage).unwrap();
+        assert!(usage.iter().all(|byte| *byte == 0));
+        assert_eq!(state.children.get(&7), Some(&3));
+
+        assert_eq!(
+            waitid(
+                &mut memory,
+                &mut state,
+                &[libc::P_PID as u64, 7, INFO, libc::WEXITED as u64, 0, 0],
+            ),
+            0
+        );
+        assert!(state.children.is_empty());
+        assert_eq!(
+            waitid(
+                &mut memory,
+                &mut state,
+                &[libc::P_PID as u64, 7, INFO, libc::WEXITED as u64, 0, 0],
+            ),
+            negative_errno(libc::ECHILD)
+        );
+    }
+
+    #[test]
     fn deterministic_getrandom_repeats_per_thread_and_separates_threads() {
         let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
 
@@ -14978,6 +15189,70 @@ mod tests {
                 [fd as u64, 0x5000, 0, 0, 0, 0]
             ),
             negative_errno(libc::EFAULT)
+        );
+
+        write_c_string(&mut memory, 0x100, "file");
+        write_c_string(&mut memory, 0x200, "user.reverie_review");
+        memory.write(0x300, b"value").unwrap();
+        for number in [libc::SYS_setxattr, libc::SYS_lsetxattr] {
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    number,
+                    [0x100, 0x200, 0x300, 5, 0, 0]
+                ),
+                negative_errno(libc::EOPNOTSUPP)
+            );
+        }
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_fsetxattr,
+                [fd as u64, 0x200, 0x300, 5, 0, 0]
+            ),
+            negative_errno(libc::EOPNOTSUPP)
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_setxattr,
+                [0x100, 0x200, 0x5000, 1, 0, 0]
+            ),
+            negative_errno(libc::EFAULT)
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_setxattr,
+                [
+                    0x100,
+                    0x200,
+                    0x300,
+                    5,
+                    (libc::XATTR_CREATE | libc::XATTR_REPLACE) as u64,
+                    0,
+                ]
+            ),
+            negative_errno(libc::EINVAL)
+        );
+        for number in [libc::SYS_removexattr, libc::SYS_lremovexattr] {
+            assert_eq!(
+                syscall_result(&mut memory, &mut state, number, [0x100, 0x200, 0, 0, 0, 0]),
+                negative_errno(libc::ENODATA)
+            );
+        }
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_fremovexattr,
+                [fd as u64, 0x200, 0, 0, 0, 0]
+            ),
+            negative_errno(libc::ENODATA)
         );
     }
 
