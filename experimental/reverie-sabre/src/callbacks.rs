@@ -168,6 +168,14 @@ pub extern "C" fn handle_syscall<T: ToolGlobal>(
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-214): Review eager child registration before guest resume.
+extern "C" fn handle_clone_child_start<T: ToolGlobal>() {
+    if Thread::<T>::current().is_none() {
+        terminate(1);
+    }
+}
+
 /// Handle the critical section for the given system call on the given thread
 // The arguments intentionally mirror SaBRe's raw syscall callback ABI.
 #[allow(clippy::if_same_then_else, clippy::too_many_arguments)]
@@ -206,6 +214,7 @@ fn handle_syscall_with_thread<T: ToolGlobal>(
                         arg4 as *mut i32,
                         arg5,
                         return_address as *const libc::c_void,
+                        handle_clone_child_start::<T>,
                     )
                 })
                 .unwrap_or_else(|e| -e.into_raw() as usize)
@@ -276,6 +285,7 @@ fn handle_syscall_with_thread<T: ToolGlobal>(
                             0,
                             arg5,
                             return_address as *mut libc::c_void,
+                            handle_clone_child_start::<T>,
                         )
                     },
                 })

@@ -9,7 +9,7 @@ Cargo must initialize it when Reverie is consumed as a Git dependency.
 | Backend | Path | Pinned revision | License |
 | --- | --- | --- | --- |
 | DynamoRIO | `third-party/dynamorio` | `929840ad9190e5086775e8debc0f0b79b4208d59` | BSD-3-Clause plus bundled component licenses |
-| SaBRe | `third-party/sabre` | `34065e7ddae6f1c90db7e0bf5c22a9aa89f9d605` | GPL-3.0-or-later, with per-file exceptions |
+| SaBRe | `third-party/sabre` | `95c7399aa6b319e54e811aae5cbd0fcb4ed72a05` | GPL-3.0-or-later, with per-file exceptions |
 | e9patch | `third-party/e9patch` | `6c2c03c1da74b14daf1788a9f8dccfa354ce04a6` (`v1.0.1`) | GPL-3.0 |
 
 The in-tree `reverie-liteinst` prototype is self-contained and does not depend
