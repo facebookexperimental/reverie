@@ -171,6 +171,11 @@ pub extern "C" fn handle_syscall<T: ToolGlobal>(
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-214): Review eager child registration before guest resume.
 extern "C" fn handle_clone_child_start<T: ToolGlobal>() {
+    // CLONE_SETTLS installs the guest's fresh TLS before this callback runs,
+    // resetting SaBRe's recursion guard. Restore plugin context before Rust
+    // touches thread-local state or locks, both of which may issue syscalls.
+    unsafe { ffi::enter_plugin() };
+
     if Thread::<T>::current().is_none() {
         terminate(1);
     }

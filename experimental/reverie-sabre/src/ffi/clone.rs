@@ -202,6 +202,7 @@ pub unsafe fn clone3_syscall(
         "push rdi",
         "push rsi",
         "push rdx",
+        "push r10", // unused clone3 argument; keeps the callback stack aligned
         "push r8",
         "push r9",
         "movq r11, xmm0",
@@ -209,6 +210,7 @@ pub unsafe fn clone3_syscall(
         "call qword ptr [rip + exit_plugin@GOTPCREL]",
         "pop r9",
         "pop r8",
+        "pop r10",
         "pop rdx",
         "pop rsi",
         "pop rdi",
