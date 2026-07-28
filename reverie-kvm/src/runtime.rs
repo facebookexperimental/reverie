@@ -110,7 +110,7 @@ enum InjectionCompletion {
 pub(crate) struct ToolContext<'a, T: Tool> {
     pub(crate) pid: Pid,
     pub(crate) thread_state: &'a T::ThreadState,
-    // TODO-HUMAN-REVIEW(PR-PENDING): Review shared GlobalTool ownership across KVM forks.
+    // TODO-HUMAN-REVIEW(PR-235): Review shared GlobalTool ownership across KVM forks.
     pub(crate) global_state: Option<Arc<T::GlobalState>>,
     pub(crate) config: <T::GlobalState as GlobalTool>::Config,
     pub(crate) subscriptions: Subscription,

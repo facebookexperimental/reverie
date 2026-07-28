@@ -144,7 +144,7 @@ pub(crate) struct LoadedStaticElf {
     pub robust_list_len: u64,
     pub files: std::collections::BTreeMap<i32, std::fs::File>,
     // AUTONOMOUS-BOT-IMPLEMENTED: Keep deterministic random descriptors on the Tool path.
-    // TODO-HUMAN-REVIEW(PR-PENDING): Review random-device descriptor lifecycle parity.
+    // TODO-HUMAN-REVIEW(PR-235): Review random-device descriptor lifecycle parity.
     pub random_device_fds: std::collections::BTreeSet<i32>,
     pub stdout_alias_fds: std::collections::BTreeSet<i32>,
     pub stderr_alias_fds: std::collections::BTreeSet<i32>,

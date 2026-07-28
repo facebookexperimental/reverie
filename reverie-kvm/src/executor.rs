@@ -875,7 +875,7 @@ pub(crate) struct ElfExecutor {
     output: Option<CapturedOutput>,
     owns_output: bool,
     next_pid: Arc<AtomicI32>,
-    // TODO-HUMAN-REVIEW(PR-PENDING): Review concurrent KVM process lifecycle ownership.
+    // TODO-HUMAN-REVIEW(PR-235): Review concurrent KVM process lifecycle ownership.
     pending_processes: std::collections::BTreeMap<i32, std::thread::JoinHandle<crate::Result<i32>>>,
     process_action: Option<ProcessAction>,
     pending_segment: Option<(SegmentBase, u64)>,
@@ -1353,7 +1353,7 @@ impl ElfExecutor {
         self.clear_child_tid = address;
     }
 
-    // TODO-HUMAN-REVIEW(PR-PENDING): Review KVM child registration and join semantics.
+    // TODO-HUMAN-REVIEW(PR-235): Review KVM child registration and join semantics.
     pub(crate) fn register_child_process(
         &mut self,
         pid: i32,
@@ -1374,7 +1374,7 @@ impl ElfExecutor {
         Ok(())
     }
 
-    // TODO-HUMAN-REVIEW(PR-PENDING): Review KVM root-exit child synchronization.
+    // TODO-HUMAN-REVIEW(PR-235): Review KVM root-exit child synchronization.
     pub(crate) fn join_all_child_processes(&mut self) -> crate::Result<()> {
         let pids = self.pending_processes.keys().copied().collect::<Vec<_>>();
         for pid in pids {
@@ -1471,7 +1471,7 @@ impl ElfExecutor {
         (self.state.fs_base, self.state.gs_base)
     }
 
-    // TODO-HUMAN-REVIEW(PR-PENDING): Review deterministic random-read Tool routing.
+    // TODO-HUMAN-REVIEW(PR-235): Review deterministic random-read Tool routing.
     pub(crate) fn is_random_device_read(&self, request: &SyscallRequest) -> bool {
         matches!(
             request.number(),
