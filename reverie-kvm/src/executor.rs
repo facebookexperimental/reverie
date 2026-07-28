@@ -6861,7 +6861,7 @@ fn proc_self_cmdline_content(state: &LoadedStaticElf) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED: Expose only the deterministic guest stack map.
-// TODO-HUMAN-REVIEW(PR-TBD): Review the minimal synthetic process map surface.
+// TODO-HUMAN-REVIEW(PR-223): Review the minimal synthetic process map surface.
 fn proc_self_maps_content(state: &LoadedStaticElf) -> Vec<u8> {
     let stack_start = state.mmap_limit;
     let stack_end = stack_start.saturating_add(STACK_LIMIT);
