@@ -4089,7 +4089,8 @@ fn setsockopt(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) ->
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-230): Review bounded SO_TYPE copy-out semantics.
 fn getsockopt(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
-    let Some(host_fd) = host_fd(state, args[0] as libc::c_int) else {
+    let guest_fd = args[0] as libc::c_int;
+    let Some(host_fd) = host_fd(state, guest_fd) else {
         return negative_errno(libc::EBADF);
     };
     if args[4] == 0 {
@@ -4102,11 +4103,29 @@ fn getsockopt(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]
     if capacity > MAX_HOST_IO {
         return negative_errno(libc::EINVAL);
     }
-    if args[1] as libc::c_int != libc::SOL_SOCKET || args[2] as libc::c_int != libc::SO_TYPE {
+    if args[1] as libc::c_int != libc::SOL_SOCKET {
         return negative_errno(libc::ENOPROTOOPT);
     }
     if capacity != 0 && args[3] == 0 {
         return negative_errno(libc::EFAULT);
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-235): Review deterministic SO_COOKIE identity semantics.
+    if args[2] as libc::c_int == libc::SO_COOKIE {
+        let Some(identity) = state.fd_object_inodes.get(&guest_fd) else {
+            return negative_errno(libc::EIO);
+        };
+        let bytes = identity.inode.to_ne_bytes();
+        let copy_length = capacity.min(bytes.len());
+        if copy_length != 0 && memory.write(args[3], &bytes[..copy_length]).is_err() {
+            return negative_errno(libc::EFAULT);
+        }
+        let result_length = copy_length as libc::socklen_t;
+        return write_struct(memory, args[4], &result_length);
+    }
+    if args[2] as libc::c_int != libc::SO_TYPE {
+        return negative_errno(libc::ENOPROTOOPT);
     }
 
     let mut value = vec![0; capacity];
@@ -10613,6 +10632,67 @@ mod tests {
             ),
             negative_errno(libc::EFAULT)
         );
+    }
+
+    #[test]
+    fn getsockopt_so_cookie_uses_open_file_identity() {
+        const RESULT: u64 = 0x100;
+        const RESULT_LENGTH: u64 = 0x200;
+
+        fn cookie(memory: &mut GuestMemory, state: &mut LoadedStaticElf, fd: libc::c_int) -> u64 {
+            let full_length = std::mem::size_of::<u64>() as libc::socklen_t;
+            assert_eq!(write_struct(memory, RESULT_LENGTH, &full_length), 0);
+            assert_eq!(
+                syscall_result(
+                    memory,
+                    state,
+                    libc::SYS_getsockopt,
+                    [
+                        fd as u64,
+                        libc::SOL_SOCKET as u64,
+                        libc::SO_COOKIE as u64,
+                        RESULT,
+                        RESULT_LENGTH,
+                        0,
+                    ],
+                ),
+                0
+            );
+            assert_eq!(
+                read_struct::<libc::socklen_t>(memory, RESULT_LENGTH),
+                full_length
+            );
+            read_struct::<u64>(memory, RESULT)
+        }
+
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let first = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_socket,
+            [libc::AF_INET as u64, libc::SOCK_STREAM as u64, 0, 0, 0, 0],
+        ) as libc::c_int;
+        let second = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_socket,
+            [libc::AF_INET as u64, libc::SOCK_STREAM as u64, 0, 0, 0, 0],
+        ) as libc::c_int;
+        let alias = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_dup,
+            [first as u64, 0, 0, 0, 0, 0],
+        ) as libc::c_int;
+
+        let first_cookie = cookie(&mut memory, &mut state, first);
+        let second_cookie = cookie(&mut memory, &mut state, second);
+        let alias_cookie = cookie(&mut memory, &mut state, alias);
+        assert_ne!(first_cookie, 0);
+        assert_ne!(first_cookie, second_cookie);
+        assert_eq!(first_cookie, alias_cookie);
     }
 
     #[test]
