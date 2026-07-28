@@ -143,6 +143,9 @@ pub(crate) struct LoadedStaticElf {
     pub robust_list_head: u64,
     pub robust_list_len: u64,
     pub files: std::collections::BTreeMap<i32, std::fs::File>,
+    // AUTONOMOUS-BOT-IMPLEMENTED: Keep deterministic random descriptors on the Tool path.
+    // TODO-HUMAN-REVIEW(PR-PENDING): Review random-device descriptor lifecycle parity.
+    pub random_device_fds: std::collections::BTreeSet<i32>,
     pub stdout_alias_fds: std::collections::BTreeSet<i32>,
     pub stderr_alias_fds: std::collections::BTreeSet<i32>,
     // AUTONOMOUS-BOT-IMPLEMENTED: Model guest close-on-exec state independently.
@@ -231,6 +234,7 @@ impl LoadedStaticElf {
             robust_list_head: 0,
             robust_list_len: 0,
             files,
+            random_device_fds: self.random_device_fds.clone(),
             stdout_alias_fds: self.stdout_alias_fds.clone(),
             stderr_alias_fds: self.stderr_alias_fds.clone(),
             cloexec_fds: self.cloexec_fds.clone(),
@@ -250,6 +254,11 @@ impl LoadedStaticElf {
             .files
             .into_iter()
             .filter(|(fd, _)| !cloexec_fds.contains(fd))
+            .collect();
+        let random_device_fds = previous
+            .random_device_fds
+            .into_iter()
+            .filter(|fd| files.contains_key(fd))
             .collect();
         let stdout_alias_fds = previous
             .stdout_alias_fds
@@ -332,6 +341,7 @@ impl LoadedStaticElf {
         self.robust_list_head = 0;
         self.robust_list_len = 0;
         self.files = files;
+        self.random_device_fds = random_device_fds;
         self.stdout_alias_fds = stdout_alias_fds;
         self.stderr_alias_fds = stderr_alias_fds;
         self.cloexec_fds = std::collections::BTreeSet::new();
@@ -557,6 +567,7 @@ fn load_executable(
         robust_list_head: 0,
         robust_list_len: 0,
         files: std::collections::BTreeMap::new(),
+        random_device_fds: std::collections::BTreeSet::new(),
         stdout_alias_fds: std::collections::BTreeSet::new(),
         stderr_alias_fds: std::collections::BTreeSet::new(),
         cloexec_fds: std::collections::BTreeSet::new(),

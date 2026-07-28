@@ -875,6 +875,8 @@ pub(crate) struct ElfExecutor {
     output: Option<CapturedOutput>,
     owns_output: bool,
     next_pid: Arc<AtomicI32>,
+    // TODO-HUMAN-REVIEW(PR-PENDING): Review concurrent KVM process lifecycle ownership.
+    pending_processes: std::collections::BTreeMap<i32, std::thread::JoinHandle<crate::Result<i32>>>,
     process_action: Option<ProcessAction>,
     pending_segment: Option<(SegmentBase, u64)>,
     exit_code: Option<i32>,
@@ -892,6 +894,7 @@ struct AddressSpaceState {
 struct FileTableState {
     stdin: Option<std::fs::File>,
     files: std::collections::BTreeMap<i32, std::fs::File>,
+    random_device_fds: std::collections::BTreeSet<i32>,
     stdout_alias_fds: std::collections::BTreeSet<i32>,
     stderr_alias_fds: std::collections::BTreeSet<i32>,
     cloexec_fds: std::collections::BTreeSet<i32>,
@@ -913,6 +916,7 @@ impl FileTableState {
                 .iter()
                 .map(|(&fd, file)| Ok((fd, file.try_clone()?)))
                 .collect::<std::io::Result<_>>()?,
+            random_device_fds: state.random_device_fds.clone(),
             stdout_alias_fds: state.stdout_alias_fds.clone(),
             stderr_alias_fds: state.stderr_alias_fds.clone(),
             cloexec_fds: state.cloexec_fds.clone(),
@@ -933,6 +937,7 @@ impl FileTableState {
             .iter()
             .map(|(&fd, file)| Ok((fd, file.try_clone()?)))
             .collect::<std::io::Result<_>>()?;
+        state.random_device_fds.clone_from(&self.random_device_fds);
         state.stdout_alias_fds.clone_from(&self.stdout_alias_fds);
         state.stderr_alias_fds.clone_from(&self.stderr_alias_fds);
         state.cloexec_fds.clone_from(&self.cloexec_fds);
@@ -1006,6 +1011,7 @@ impl ElfExecutor {
             output: capture_output.then(CapturedOutput::default),
             owns_output: true,
             next_pid: Arc::new(AtomicI32::new(next_pid)),
+            pending_processes: std::collections::BTreeMap::new(),
             process_action: None,
             pending_segment: None,
             exit_code: None,
@@ -1310,9 +1316,10 @@ impl ElfExecutor {
             address_space: Arc::new(std::sync::Mutex::new(AddressSpaceState::from_elf(&state))),
             file_table: Arc::new(std::sync::Mutex::new(FileTableState::try_from_elf(&state)?)),
             state,
-            output: self.output.is_some().then(CapturedOutput::default),
-            owns_output: true,
+            output: self.output.clone(),
+            owns_output: false,
             next_pid: self.next_pid.clone(),
+            pending_processes: std::collections::BTreeMap::new(),
             process_action: None,
             pending_segment: None,
             exit_code: None,
@@ -1333,6 +1340,7 @@ impl ElfExecutor {
             output: self.output.clone(),
             owns_output: false,
             next_pid: self.next_pid.clone(),
+            pending_processes: std::collections::BTreeMap::new(),
             process_action: None,
             pending_segment: None,
             exit_code: None,
@@ -1343,6 +1351,65 @@ impl ElfExecutor {
 
     pub(crate) fn set_clear_child_tid(&mut self, address: Option<u64>) {
         self.clear_child_tid = address;
+    }
+
+    // TODO-HUMAN-REVIEW(PR-PENDING): Review KVM child registration and join semantics.
+    pub(crate) fn register_child_process(
+        &mut self,
+        pid: i32,
+        handle: std::thread::JoinHandle<crate::Result<i32>>,
+    ) {
+        let previous = self.pending_processes.insert(pid, handle);
+        debug_assert!(previous.is_none(), "duplicate KVM child pid {pid}");
+    }
+
+    fn join_child_process(&mut self, pid: i32) -> crate::Result<()> {
+        let Some(handle) = self.pending_processes.remove(&pid) else {
+            return Ok(());
+        };
+        let code = handle.join().map_err(|_| {
+            crate::Error::UnexpectedVcpuExit(format!("KVM child process {pid} panicked"))
+        })??;
+        self.record_child_exit(pid, code);
+        Ok(())
+    }
+
+    // TODO-HUMAN-REVIEW(PR-PENDING): Review KVM root-exit child synchronization.
+    pub(crate) fn join_all_child_processes(&mut self) -> crate::Result<()> {
+        let pids = self.pending_processes.keys().copied().collect::<Vec<_>>();
+        for pid in pids {
+            self.join_child_process(pid)?;
+        }
+        Ok(())
+    }
+
+    fn synchronize_wait4(&mut self, request: &SyscallRequest) -> Option<i64> {
+        if request.number() != libc::SYS_wait4 as u64 {
+            return None;
+        }
+        let args = request.args();
+        let requested = args[0] as u32 as libc::pid_t;
+        let pending_pid = if requested == -1 {
+            self.pending_processes.keys().next().copied()
+        } else if requested > 0 && self.pending_processes.contains_key(&requested) {
+            Some(requested)
+        } else {
+            None
+        };
+        let pid = pending_pid?;
+        if args[2] & libc::WNOHANG as u64 != 0
+            && self
+                .pending_processes
+                .get(&pid)
+                .is_some_and(|handle| !handle.is_finished())
+        {
+            return Some(0);
+        }
+        if let Err(error) = self.join_child_process(pid) {
+            eprintln!("reverie-kvm child {pid} failed before wait4: {error}");
+            return Some(negative_errno(libc::EIO));
+        }
+        None
     }
 
     pub(crate) fn take_clear_child_tid(&mut self) -> Option<u64> {
@@ -1404,6 +1471,17 @@ impl ElfExecutor {
         (self.state.fs_base, self.state.gs_base)
     }
 
+    // TODO-HUMAN-REVIEW(PR-PENDING): Review deterministic random-read Tool routing.
+    pub(crate) fn is_random_device_read(&self, request: &SyscallRequest) -> bool {
+        matches!(
+            request.number(),
+            number if number == libc::SYS_read as u64 || number == libc::SYS_readv as u64
+        ) && self
+            .state
+            .random_device_fds
+            .contains(&(request.args()[0] as libc::c_int))
+    }
+
     // TODO-HUMAN-REVIEW(PR-132): Review cooperative KVM thread context updates.
     pub(crate) fn set_thread_context(&mut self, tid: i32, fs_base: u64, gs_base: u64) {
         self.state.tid = tid;
@@ -1438,6 +1516,9 @@ impl ElfExecutor {
 
 impl SyscallExecutor for ElfExecutor {
     fn execute(&mut self, request: &SyscallRequest, memory: &GuestMemory) -> i64 {
+        if let Some(result) = self.synchronize_wait4(request) {
+            return result;
+        }
         if let Some(result) = self.execute_accept(request, memory) {
             return result;
         }
@@ -2334,7 +2415,13 @@ fn open_file(
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-228): Review cross-backend random-device stream parity.
         let bytes = deterministic_random_device_bytes(state.random_seed, 64 * 1024);
-        return open_virtual_file(state, &bytes, flags, guest_cloexec);
+        let result = open_virtual_file(state, &bytes, flags, guest_cloexec);
+        if result >= 0
+            && let Ok(fd) = libc::c_int::try_from(result)
+        {
+            state.random_device_fds.insert(fd);
+        }
+        return result;
     }
     if path == b"/proc/uptime" {
         return open_virtual_file(state, b"0.00 0.00\n", flags, guest_cloexec);
@@ -2905,14 +2992,19 @@ fn insert_file_with_flags(
 // AUTONOMOUS-BOT-IMPLEMENTED: Model fcntl descriptor duplication in the guest table.
 // TODO-HUMAN-REVIEW(#91): Review minimum/error precedence and standard-fd ownership.
 // TODO-HUMAN-REVIEW(PR-136): Review fcntl duplicate object identity propagation.
+struct DuplicateFdSource {
+    output_alias: Option<OutputAlias>,
+    proc_inode: Option<u64>,
+    object_inode: Arc<GuestFileIdentity>,
+    is_random: bool,
+}
+
 fn duplicate_fd_at_or_above(
     state: &mut LoadedStaticElf,
     old_host_fd: RawFd,
     raw_minimum: u64,
     close_on_exec: bool,
-    output_alias: Option<OutputAlias>,
-    source_proc_inode: Option<u64>,
-    source_object_inode: Arc<GuestFileIdentity>,
+    source: DuplicateFdSource,
 ) -> i64 {
     let minimum = raw_minimum as libc::c_int;
     if !(0..GUEST_NOFILE_LIMIT).contains(&minimum) {
@@ -2933,7 +3025,10 @@ fn duplicate_fd_at_or_above(
     // SAFETY: fcntl returned a new owned descriptor.
     let file = unsafe { std::fs::File::from_raw_fd(duplicated) };
     state.files.insert(fd, file);
-    state.fd_object_inodes.insert(fd, source_object_inode);
+    state.fd_object_inodes.insert(fd, source.object_inode);
+    if source.is_random {
+        state.random_device_fds.insert(fd);
+    }
     if close_on_exec {
         state.cloexec_fds.insert(fd);
     } else {
@@ -2944,8 +3039,8 @@ fn duplicate_fd_at_or_above(
     } else {
         state.closed_standard_fds.remove(&fd);
     }
-    set_output_alias(state, fd, output_alias);
-    if let Some(inode) = source_proc_inode {
+    set_output_alias(state, fd, source.output_alias);
+    if let Some(inode) = source.proc_inode {
         state.proc_files.insert(fd, inode);
     }
     i64::from(fd)
@@ -2969,6 +3064,7 @@ fn duplicate_fd(
     let old_fd = raw_old_fd as libc::c_int;
     let source_alias = output_alias(state, old_fd);
     let source_proc_inode = state.proc_files.get(&old_fd).copied();
+    let source_is_random = state.random_device_fds.contains(&old_fd);
     let Some(old_host_fd) = host_fd(state, old_fd) else {
         return negative_errno(libc::EBADF);
     };
@@ -3004,6 +3100,11 @@ fn duplicate_fd(
     if let Some(new_fd) = new_fd {
         state.files.insert(new_fd, file);
         state.fd_object_inodes.insert(new_fd, source_object_inode);
+        if source_is_random {
+            state.random_device_fds.insert(new_fd);
+        } else {
+            state.random_device_fds.remove(&new_fd);
+        }
         cleanup_fd_object_inodes(state);
         if close_on_exec {
             state.cloexec_fds.insert(new_fd);
@@ -3028,6 +3129,9 @@ fn duplicate_fd(
             state
                 .fd_object_inodes
                 .insert(new_fd as libc::c_int, source_object_inode);
+            if source_is_random {
+                state.random_device_fds.insert(new_fd as libc::c_int);
+            }
         }
         if new_fd >= 0
             && let Some(inode) = source_proc_inode
@@ -6071,6 +6175,7 @@ fn fcntl(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> 
     let guest_fd = args[0] as libc::c_int;
     let source_alias = output_alias(state, guest_fd);
     let source_proc_inode = state.proc_files.get(&guest_fd).copied();
+    let source_is_random = state.random_device_fds.contains(&guest_fd);
     let Some(host_fd) = host_fd(state, guest_fd) else {
         return negative_errno(libc::EBADF);
     };
@@ -6081,18 +6186,24 @@ fn fcntl(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> 
             host_fd,
             args[2],
             false,
-            source_alias,
-            source_proc_inode,
-            source_object_inode,
+            DuplicateFdSource {
+                output_alias: source_alias,
+                proc_inode: source_proc_inode,
+                object_inode: source_object_inode,
+                is_random: source_is_random,
+            },
         ),
         libc::F_DUPFD_CLOEXEC => duplicate_fd_at_or_above(
             state,
             host_fd,
             args[2],
             true,
-            source_alias,
-            source_proc_inode,
-            source_object_inode,
+            DuplicateFdSource {
+                output_alias: source_alias,
+                proc_inode: source_proc_inode,
+                object_inode: source_object_inode,
+                is_random: source_is_random,
+            },
         ),
         libc::F_GETFL => match fd_status_flags(host_fd) {
             Ok(flags) => flags as i64,
@@ -6188,6 +6299,7 @@ fn close(state: &mut LoadedStaticElf, raw_fd: u64) -> i64 {
     };
     if state.files.remove(&fd).is_some() {
         state.cloexec_fds.remove(&fd);
+        state.random_device_fds.remove(&fd);
         state.proc_files.remove(&fd);
         state.fd_object_inodes.remove(&fd);
         cleanup_fd_object_inodes(state);
@@ -6200,6 +6312,7 @@ fn close(state: &mut LoadedStaticElf, raw_fd: u64) -> i64 {
         }
         state.closed_standard_fds.insert(fd);
         state.cloexec_fds.remove(&fd);
+        state.random_device_fds.remove(&fd);
         state.fd_object_inodes.remove(&fd);
         cleanup_fd_object_inodes(state);
         set_output_alias(state, fd, None);
@@ -8206,6 +8319,7 @@ mod tests {
             robust_list_head: 0,
             robust_list_len: 0,
             files: BTreeMap::new(),
+            random_device_fds: BTreeSet::new(),
             stdout_alias_fds: BTreeSet::new(),
             stderr_alias_fds: BTreeSet::new(),
             cloexec_fds: BTreeSet::new(),
@@ -15416,6 +15530,84 @@ mod tests {
         assert_eq!(root, deterministic_random_device_bytes(0, 32));
         assert_eq!(root[0], 41);
         assert_ne!(root, deterministic_random_device_bytes(17, 32));
+    }
+
+    #[test]
+    fn random_device_reads_remain_tool_routed_after_duplication() {
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        write_c_string(&mut memory, 0x100, "/dev/urandom");
+
+        let random_fd = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_openat,
+            [libc::AT_FDCWD as u64, 0x100, 0, 0, 0, 0],
+        );
+        assert!(random_fd >= 0);
+        assert!(state.random_device_fds.contains(&(random_fd as i32)));
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_dup3,
+                [random_fd as u64, 0, 0, 0, 0, 0],
+            ),
+            0
+        );
+        assert!(state.random_device_fds.contains(&0));
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_close,
+                [random_fd as u64, 0, 0, 0, 0, 0],
+            ),
+            0
+        );
+
+        let executor = ElfExecutor::new(state, false);
+        assert!(executor.is_random_device_read(&SyscallRequest::new(
+            libc::SYS_read as u64,
+            [0, 0x200, 8, 0, 0, 0],
+        )));
+        assert!(executor.is_random_device_read(&SyscallRequest::new(
+            libc::SYS_readv as u64,
+            [0, 0x200, 1, 0, 0, 0],
+        )));
+        assert!(!executor.is_random_device_read(&SyscallRequest::new(
+            libc::SYS_read as u64,
+            [1, 0x200, 8, 0, 0, 0],
+        )));
+    }
+
+    #[test]
+    fn forked_executors_share_captured_output_order() {
+        let root = TestDir::new();
+        let state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        memory.write(0x100, b"a").unwrap();
+        memory.write(0x101, b"b").unwrap();
+        let mut parent = ElfExecutor::new(state, true);
+        let mut child = parent.fork_child(2, false).unwrap();
+
+        assert_eq!(
+            child.execute(
+                &SyscallRequest::new(libc::SYS_write as u64, [1, 0x100, 1, 0, 0, 0]),
+                &memory,
+            ),
+            1
+        );
+        assert_eq!(
+            parent.execute(
+                &SyscallRequest::new(libc::SYS_write as u64, [1, 0x101, 1, 0, 0, 0]),
+                &memory,
+            ),
+            1
+        );
+        assert_eq!(child.take_output(), (Vec::new(), Vec::new()));
+        assert_eq!(parent.take_output(), (b"ab".to_vec(), Vec::new()));
     }
 
     fn custom_action(handler: u64) -> [u8; KERNEL_SIGACTION_SIZE] {

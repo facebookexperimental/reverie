@@ -26,6 +26,7 @@ use kvm_ioctls::Kvm;
 use kvm_ioctls::VcpuExit;
 use kvm_ioctls::VcpuFd;
 use kvm_ioctls::VmFd;
+use reverie::GlobalTool;
 use reverie::Pid;
 use reverie::Tool;
 
@@ -869,13 +870,20 @@ impl KvmBackend {
     }
 
     // TODO-HUMAN-REVIEW(PR-192): Review tool lifecycle for KVM fork children.
-    pub(crate) async fn run_process_action_with_tool<T: Tool>(
+    // TODO-HUMAN-REVIEW(PR-PENDING): Review concurrent fork-child Tool execution.
+    pub(crate) async fn run_process_action_with_tool<T>(
         &mut self,
         executor: &mut ElfExecutor,
         action: ProcessAction,
         park_syscall_return: bool,
         context: ToolContext<'_, T>,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        T: Tool + 'static,
+        T::ThreadState: 'static,
+        T::GlobalState: 'static,
+        <T::GlobalState as GlobalTool>::Config: 'static,
+    {
         let ProcessAction::Fork {
             child_pid,
             child_stack,
@@ -900,21 +908,51 @@ impl KvmBackend {
         )?;
 
         let child_pid = Pid::from_raw(child.pid);
-        let child_tool = T::new(child_pid, context.config);
+        let child_tool = T::new(child_pid, &context.config);
         let child_thread_state =
             child_tool.init_thread_state(child_pid, Some((context.pid, context.thread_state)));
-        let (code, stdout, stderr) = Box::pin(child.backend.run_static_elf_process_with_tool(
-            &mut child.executor,
-            child_pid,
-            child_tool,
-            child_thread_state,
-            context.global_state,
-            context.config,
-            context.subscriptions,
-            false,
-        ))
-        .await?;
-        self.finish_forked_process(executor, child, code, stdout, stderr)
+        let global_state = context.global_state.ok_or_else(|| {
+            Error::UnexpectedVcpuExit(
+                "forked KVM Tool process requires shared global state".to_owned(),
+            )
+        })?;
+        let config = context.config;
+        let subscriptions = context.subscriptions;
+        let raw_child_pid = child.pid;
+        let handle = std::thread::Builder::new()
+            .name(format!("reverie-kvm-process-{raw_child_pid}"))
+            .spawn(move || {
+                let result =
+                    futures::executor::block_on(child.backend.run_static_elf_process_with_tool(
+                        &mut child.executor,
+                        child_pid,
+                        child_tool,
+                        child_thread_state,
+                        global_state,
+                        &config,
+                        &subscriptions,
+                        false,
+                    ));
+                match result {
+                    Ok((code, _, _)) => {
+                        write_tid_best_effort(
+                            &mut child.backend.memory,
+                            child.executor.take_clear_child_tid(),
+                            0,
+                        );
+                        Ok(code)
+                    }
+                    Err(error) => Err(error),
+                }
+            })?;
+        executor.register_child_process(raw_child_pid, handle);
+        configure_process_syscall_return(
+            &self.memory,
+            &self.vcpu,
+            self.syscall_frame_address,
+            i64::from(raw_child_pid),
+            None,
+        )
     }
 
     fn static_elf_exception(&self) -> Result<Option<StaticElfException>> {

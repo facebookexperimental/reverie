@@ -110,9 +110,10 @@ enum InjectionCompletion {
 pub(crate) struct ToolContext<'a, T: Tool> {
     pub(crate) pid: Pid,
     pub(crate) thread_state: &'a T::ThreadState,
-    pub(crate) global_state: &'a T::GlobalState,
-    pub(crate) config: &'a <T::GlobalState as GlobalTool>::Config,
-    pub(crate) subscriptions: &'a Subscription,
+    // TODO-HUMAN-REVIEW(PR-PENDING): Review shared GlobalTool ownership across KVM forks.
+    pub(crate) global_state: Option<Arc<T::GlobalState>>,
+    pub(crate) config: <T::GlobalState as GlobalTool>::Config,
+    pub(crate) subscriptions: Subscription,
 }
 
 // TODO-HUMAN-REVIEW(PR-192): Review async KVM process-action completion.
@@ -163,7 +164,13 @@ struct StaticElfSyscallExecutor<'a> {
     process_completed: &'a mut bool,
 }
 
-impl<T: Tool> GuestSyscallExecutor<T> for StaticElfSyscallExecutor<'_> {
+impl<T> GuestSyscallExecutor<T> for StaticElfSyscallExecutor<'_>
+where
+    T: Tool + 'static,
+    T::ThreadState: 'static,
+    T::GlobalState: 'static,
+    <T::GlobalState as GlobalTool>::Config: 'static,
+{
     fn execute(&mut self, request: &SyscallRequest, memory: &GuestMemory) -> i64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-233): Review synthetic initial exec completion.
@@ -296,6 +303,7 @@ struct KvmGuest<'a, T: Tool> {
     thread_state: &'a mut T::ThreadState,
     executor: &'a mut dyn GuestSyscallExecutor<T>,
     global_state: &'a T::GlobalState,
+    shared_global_state: Option<Arc<T::GlobalState>>,
     config: &'a <T::GlobalState as GlobalTool>::Config,
     subscriptions: &'a Subscription,
     handler_signal: SharedHandlerSignal,
@@ -312,6 +320,7 @@ impl<'a, T: Tool> KvmGuest<'a, T> {
         thread_state: &'a mut T::ThreadState,
         executor: &'a mut dyn GuestSyscallExecutor<T>,
         global_state: &'a T::GlobalState,
+        shared_global_state: Option<Arc<T::GlobalState>>,
         config: &'a <T::GlobalState as GlobalTool>::Config,
         subscriptions: &'a Subscription,
         handler_signal: SharedHandlerSignal,
@@ -325,6 +334,7 @@ impl<'a, T: Tool> KvmGuest<'a, T> {
             thread_state,
             executor,
             global_state,
+            shared_global_state,
             config,
             subscriptions,
             handler_signal,
@@ -404,9 +414,9 @@ impl<T: Tool> Guest<T> for KvmGuest<'_, T> {
             let context = ToolContext {
                 pid: self.pid,
                 thread_state: self.thread_state,
-                global_state: self.global_state,
-                config: self.config,
-                subscriptions: self.subscriptions,
+                global_state: self.shared_global_state.clone(),
+                config: self.config.clone(),
+                subscriptions: self.subscriptions.clone(),
             };
             match self.executor.complete_injection(context).await {
                 Ok(InjectionCompletion::DoesNotReturn {
@@ -636,7 +646,7 @@ fn hide_tool_scratch(memory: &GuestMemory) -> Result<()> {
 
 // TODO-HUMAN-REVIEW(PR-156): Review repeated post-exec lifecycle delivery.
 #[allow(clippy::too_many_arguments)]
-async fn run_post_exec_handler<T: Tool>(
+async fn run_post_exec_handler<T>(
     backend: &mut KvmBackend,
     tool: &T,
     pid: Pid,
@@ -644,11 +654,17 @@ async fn run_post_exec_handler<T: Tool>(
     auxv: &mut Vec<(libc::c_ulong, libc::c_ulong)>,
     thread_state: &mut T::ThreadState,
     executor: &mut ElfExecutor,
-    global_state: &T::GlobalState,
+    global_state: Arc<T::GlobalState>,
     config: &<T::GlobalState as GlobalTool>::Config,
     subscriptions: &Subscription,
     stack_checked_out: &Arc<AtomicBool>,
-) -> Result<()> {
+) -> Result<()>
+where
+    T: Tool + 'static,
+    T::ThreadState: 'static,
+    T::GlobalState: 'static,
+    <T::GlobalState as GlobalTool>::Config: 'static,
+{
     loop {
         let handler_signal = Arc::new(Mutex::new(None));
         expose_tool_scratch(memory)?;
@@ -670,7 +686,8 @@ async fn run_post_exec_handler<T: Tool>(
                 registers,
                 thread_state,
                 &mut guest_executor,
-                global_state,
+                global_state.as_ref(),
+                Some(global_state.clone()),
                 config,
                 subscriptions,
                 handler_signal.clone(),
@@ -863,6 +880,7 @@ impl KvmBackend {
                 &mut thread_state,
                 &mut guest_executor,
                 &global_state,
+                None,
                 &config,
                 &subscriptions,
                 handler_signal.clone(),
@@ -906,6 +924,7 @@ impl KvmBackend {
                                 &mut thread_state,
                                 &mut guest_executor,
                                 &global_state,
+                                None,
                                 &config,
                                 &subscriptions,
                                 handler_signal.clone(),
@@ -978,46 +997,59 @@ impl KvmBackend {
         capture_output: bool,
     ) -> Result<(T::GlobalState, i32, Vec<u8>, Vec<u8>)>
     where
-        T: Tool,
+        T: Tool + 'static,
+        T::ThreadState: 'static,
+        T::GlobalState: 'static,
+        <T::GlobalState as GlobalTool>::Config: 'static,
     {
         let mut loaded = self.static_elf.take().ok_or(Error::StaticElfNotInstalled)?;
         if capture_output {
             loaded.stdin = Some(std::fs::File::open("/dev/null")?);
         }
         let pid = Pid::from_raw(self.root_pid);
-        let global_state = T::GlobalState::init_global_state(&config).await;
+        let global_state = Arc::new(T::GlobalState::init_global_state(&config).await);
         let tool = T::new(pid, &config);
         let subscriptions = T::subscriptions(&config);
         let thread_state = tool.init_thread_state(pid, None);
         let mut executor = ElfExecutor::new(loaded, capture_output);
-        let (exit_code, stdout, stderr) = self
+        let result = self
             .run_static_elf_process_with_tool(
                 &mut executor,
                 pid,
                 tool,
                 thread_state,
-                &global_state,
+                global_state.clone(),
                 &config,
                 &subscriptions,
                 true,
             )
             .await?;
+        let global_state = Arc::try_unwrap(global_state).map_err(|_| {
+            Error::UnexpectedVcpuExit("KVM child retained global Tool state after exit".to_owned())
+        })?;
+        let (exit_code, stdout, stderr) = result;
         Ok((global_state, exit_code, stdout, stderr))
     }
 
     // TODO-HUMAN-REVIEW(PR-192): Review recursive KVM process Tool runtime.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn run_static_elf_process_with_tool<T: Tool>(
+    pub(crate) async fn run_static_elf_process_with_tool<T>(
         &mut self,
         executor: &mut ElfExecutor,
         pid: Pid,
         tool: T,
         mut thread_state: T::ThreadState,
-        global_state: &T::GlobalState,
+        global_state: Arc<T::GlobalState>,
         config: &<T::GlobalState as GlobalTool>::Config,
         subscriptions: &Subscription,
         initial_post_exec: bool,
-    ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
+    ) -> Result<(i32, Vec<u8>, Vec<u8>)>
+    where
+        T: Tool + 'static,
+        T::ThreadState: 'static,
+        T::GlobalState: 'static,
+        <T::GlobalState as GlobalTool>::Config: 'static,
+    {
         let _registration = self.register_guest_thread()?;
         let mut auxv = executor.auxv().to_vec();
         // Clones share the MAP_SHARED guest mapping; a mutable handle lets the
@@ -1045,7 +1077,8 @@ impl KvmBackend {
                 registers,
                 &mut thread_state,
                 &mut guest_executor,
-                global_state,
+                global_state.as_ref(),
+                Some(global_state.clone()),
                 config,
                 subscriptions,
                 handler_signal.clone(),
@@ -1068,7 +1101,7 @@ impl KvmBackend {
             notify_tool_exit(
                 tool,
                 pid,
-                global_state,
+                global_state.as_ref(),
                 config,
                 thread_state,
                 ExitStatus::Exited(exit.code),
@@ -1127,7 +1160,7 @@ impl KvmBackend {
                 &mut auxv,
                 &mut thread_state,
                 executor,
-                global_state,
+                global_state.clone(),
                 config,
                 subscriptions,
                 &stack_checked_out,
@@ -1138,7 +1171,7 @@ impl KvmBackend {
                 notify_tool_exit(
                     tool,
                     pid,
-                    global_state,
+                    global_state.as_ref(),
                     config,
                     thread_state,
                     ExitStatus::Exited(255),
@@ -1159,7 +1192,7 @@ impl KvmBackend {
             notify_tool_exit(
                 tool,
                 pid,
-                global_state,
+                global_state.as_ref(),
                 config,
                 thread_state,
                 ExitStatus::Exited(exit.code),
@@ -1175,7 +1208,7 @@ impl KvmBackend {
                 notify_tool_exit(
                     tool,
                     pid,
-                    global_state,
+                    global_state.as_ref(),
                     config,
                     thread_state,
                     ExitStatus::Exited(code),
@@ -1217,7 +1250,8 @@ impl KvmBackend {
             // backend personality. Sending only the parent through Detcore's
             // clone handler waits forever for a child Tool start that this
             // direct-worker path cannot issue.
-            let backend_owned = is_backend_owned_syscall(request.number())
+            let backend_owned = (is_backend_owned_syscall(request.number())
+                && !executor.is_random_device_read(&request))
                 || is_thread_clone_request(&request, &memory);
             let subscribed = !backend_owned
                 && subscriptions
@@ -1248,7 +1282,8 @@ impl KvmBackend {
                         kvm_registers(registers, request.number()),
                         &mut thread_state,
                         &mut guest_executor,
-                        global_state,
+                        global_state.as_ref(),
+                        Some(global_state.clone()),
                         config,
                         subscriptions,
                         handler_signal.clone(),
@@ -1311,9 +1346,9 @@ impl KvmBackend {
                 let context: ToolContext<'_, T> = ToolContext {
                     pid,
                     thread_state: &thread_state,
-                    global_state,
-                    config,
-                    subscriptions,
+                    global_state: Some(global_state.clone()),
+                    config: config.clone(),
+                    subscriptions: subscriptions.clone(),
                 };
                 self.run_process_action_with_tool(executor, action, true, context)
                     .await?;
@@ -1328,7 +1363,7 @@ impl KvmBackend {
                     &mut auxv,
                     &mut thread_state,
                     executor,
-                    global_state,
+                    global_state.clone(),
                     config,
                     subscriptions,
                     &stack_checked_out,
@@ -1339,7 +1374,7 @@ impl KvmBackend {
                     notify_tool_exit(
                         tool,
                         pid,
-                        global_state,
+                        global_state.as_ref(),
                         config,
                         thread_state,
                         ExitStatus::Exited(255),
@@ -1353,6 +1388,7 @@ impl KvmBackend {
             }
             pending_exit = pending_exit.or_else(|| executor.take_exit());
             if let Some(exit) = pending_exit {
+                executor.join_all_child_processes()?;
                 if exit.group {
                     self.request_guest_thread_group_exit(exit.code);
                 }
@@ -1360,7 +1396,7 @@ impl KvmBackend {
                 notify_tool_exit(
                     tool,
                     pid,
-                    global_state,
+                    global_state.as_ref(),
                     config,
                     thread_state,
                     ExitStatus::Exited(exit.code),
