@@ -338,6 +338,10 @@ fn execute_basic_syscall_with_output(
     } else if number == libc::SYS_eventfd2 as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         eventfd2(state, args[0], args[1])
+    } else if number == libc::SYS_pidfd_open as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-235): Review self-only virtual pidfd translation.
+        pidfd_open(state, args)
     } else if number == libc::SYS_socket as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         socket(state, args)
@@ -963,6 +967,9 @@ fn mutates_file_table(number: u64) -> bool {
             || number == libc::SYS_epoll_create1 as u64
             || number == libc::SYS_eventfd as u64
             || number == libc::SYS_eventfd2 as u64
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-235): Review pidfd descriptor-table serialization.
+            || number == libc::SYS_pidfd_open as u64
             || number == libc::SYS_socket as u64
             || number == libc::SYS_socketpair as u64
             || number == libc::SYS_dup as u64
@@ -3606,6 +3613,32 @@ fn eventfd2(state: &mut LoadedStaticElf, initial: u64, raw_flags: u64) -> i64 {
     // SAFETY: eventfd returned a new owned descriptor.
     let file = unsafe { std::fs::File::from_raw_fd(host_fd) };
     insert_file_with_flags(state, file, flags & libc::EFD_CLOEXEC != 0, None)
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-235): Review self-only virtual pidfd translation.
+fn pidfd_open(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    let flags = args[1] as libc::c_uint;
+    if flags & !(libc::O_NONBLOCK as libc::c_uint) != 0 {
+        return negative_errno(libc::EINVAL);
+    }
+    if args[0] as libc::pid_t != state.pid {
+        return negative_errno(libc::ESRCH);
+    }
+
+    // The supervisor remains alive for every guest executor, so its pidfd has
+    // the same readiness contract as a pidfd for the live virtual process.
+    // Cross-process pidfds remain unsupported until KVM can bind them to child
+    // lifecycle state.
+    let host_fd = unsafe {
+        libc::syscall(libc::SYS_pidfd_open, libc::getpid(), flags as libc::c_uint) as libc::c_int
+    };
+    if host_fd < 0 {
+        return io_error(std::io::Error::last_os_error());
+    }
+    // SAFETY: pidfd_open returned a new owned descriptor.
+    let file = unsafe { std::fs::File::from_raw_fd(host_fd) };
+    insert_file_with_flags(state, file, true, None)
 }
 
 // TODO-HUMAN-REVIEW(PR-92): Review this KVM compatibility implementation.
@@ -12678,6 +12711,69 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn pidfd_open_self_is_cloexec_and_not_ready() {
+        const POLL_FD: u64 = 0x100;
+
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let pid = state.pid;
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let pidfd = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_pidfd_open,
+            [pid as u64, 0, 0, 0, 0, 0],
+        );
+        assert_eq!(pidfd, 3);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_fcntl,
+                [pidfd as u64, libc::F_GETFD as u64, 0, 0, 0, 0],
+            ),
+            i64::from(libc::FD_CLOEXEC)
+        );
+
+        let poll_fd = libc::pollfd {
+            fd: pidfd as libc::c_int,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(write_struct(&mut memory, POLL_FD, &poll_fd), 0);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_poll,
+                [POLL_FD, 1, 0, 0, 0, 0],
+            ),
+            0
+        );
+        let poll_fd: libc::pollfd = read_struct(&memory, POLL_FD);
+        assert_eq!(poll_fd.revents, 0);
+
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_pidfd_open,
+                [pid as u64, 1, 0, 0, 0, 0],
+            ),
+            negative_errno(libc::EINVAL)
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_pidfd_open,
+                [(pid + 1) as u64, 0, 0, 0, 0, 0],
+            ),
+            negative_errno(libc::ESRCH)
+        );
     }
 
     #[test]
