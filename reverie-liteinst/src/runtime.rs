@@ -428,6 +428,70 @@ pub(crate) fn site_counts(address: u64) -> (u64, u64) {
     })
 }
 
+/// Distinct syscall numbers broken out individually by the fallback counters.
+///
+/// x86-64 syscall numbers currently top out well under this bound; a number at
+/// or above it (or negative) is still counted in the process-wide total but is
+/// not tracked per-number. Sized to cover the whole current table with headroom.
+const TRACKED_SYSCALLS: usize = 512;
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-249): Review public fallback-surface observability counters.
+/// Total number of syscalls that reached [`LiteinstDispatcher`]'s escape surface
+/// — a trapped site the runtime could not route to the Tool (un-patchable
+/// `SITE_FALLBACK`, or an unclaimable site) and therefore failed closed with
+/// `EOPNOTSUPP`.
+static FALLBACK_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-249): Review public fallback-surface observability counters.
+/// Per-syscall-number escape counts, indexed by syscall number.
+static FALLBACK_BY_NUMBER: [AtomicU64; TRACKED_SYSCALLS] =
+    [const { AtomicU64::new(0) }; TRACKED_SYSCALLS];
+
+/// Record that one syscall reached the fail-closed escape surface.
+///
+/// Anything reaching this point is, by construction, a trapped syscall the
+/// runtime could not route to the Tool, so this counts the size of LiteInst's
+/// residual escape surface. It is the by-syscall-number analog of the per-site
+/// `trap`/`hook` counters ([`site_counts`]) and the direct counterpart of
+/// reverie-e9patch's `record_fallback_dispatch` (round 4), keyed the same way so
+/// the two ld-preload backends expose a symmetric fallback-surface metric.
+///
+/// Async-signal-safe: only relaxed atomic increments, so it is safe to call from
+/// the `SIGSYS` dispatch path. It does not change the forwarding decision.
+pub(crate) fn record_fallback_dispatch(number: i64) {
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    FALLBACK_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if let Ok(index) = usize::try_from(number)
+        && index < TRACKED_SYSCALLS
+    {
+        FALLBACK_BY_NUMBER[index].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Total syscalls that failed closed on the escape surface.
+///
+/// A large value relative to the guest's total syscall count indicates a large
+/// residual escape surface — trapped sites the runtime could not route to the
+/// Tool. For Detcore (`TOOL_REVERIE`) this directly bounds the set of syscalls
+/// (e.g. a libc-internal `getrandom`) that bypass determinism, so a nonzero
+/// count is a determinism-completeness signal, not merely a perf one.
+pub(crate) fn fallback_dispatch_count() -> u64 {
+    FALLBACK_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Number of times syscall `number` reached the escape surface.
+///
+/// Returns `0` for a negative number or one at or above [`TRACKED_SYSCALLS`],
+/// which are only ever reflected in [`fallback_dispatch_count`].
+pub(crate) fn fallback_syscall_count(number: i64) -> u64 {
+    match usize::try_from(number) {
+        Ok(index) if index < TRACKED_SYSCALLS => FALLBACK_BY_NUMBER[index].load(Ordering::Relaxed),
+        _ => 0,
+    }
+}
+
 fn arena_for(address: u64) -> Option<&'static RuntimeArena> {
     ARENAS.get()?.iter().find(|entry| {
         entry.mapping_start <= address
@@ -872,6 +936,13 @@ impl SyscallDispatcher for LiteinstDispatcher {
 
         // Generic Tool execution may allocate, lock, and block on coordinator
         // I/O, so it cannot run as a fallback inside the SIGSYS handler.
+        //
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // Record the escape before failing closed so the residual fallback
+        // surface is observable by syscall number. Counting does not change the
+        // forwarding decision (still `EOPNOTSUPP`), so the dispatch path is
+        // unchanged; this is the by-number analog of e9patch's round-4 counter.
+        record_fallback_dispatch(event.number());
         event.fail(libc::EOPNOTSUPP);
     }
 }
@@ -1311,7 +1382,43 @@ mod tests {
     use super::StackLine;
     use super::claim_site;
     use super::clone_is_fork_like;
+    use super::fallback_dispatch_count;
+    use super::fallback_syscall_count;
     use super::mark_site_range_stale;
+    use super::record_fallback_dispatch;
+
+    #[test]
+    fn recording_a_fallback_bumps_total_and_the_matching_syscall() {
+        // A syscall number unique to this test, so the per-number assertion is
+        // exact even if the process-global counters are touched concurrently.
+        let number: i64 = 402;
+        let per_before = fallback_syscall_count(number);
+        let total_before = fallback_dispatch_count();
+
+        record_fallback_dispatch(number);
+
+        assert_eq!(fallback_syscall_count(number), per_before + 1);
+        assert!(
+            fallback_dispatch_count() > total_before,
+            "total must advance by at least this recording"
+        );
+    }
+
+    #[test]
+    fn out_of_range_syscall_numbers_count_in_the_total_only() {
+        // Above the tracked bound: total advances, per-number stays zero.
+        let huge = i64::from(i32::MAX);
+        let total_before = fallback_dispatch_count();
+        record_fallback_dispatch(huge);
+        assert_eq!(fallback_syscall_count(huge), 0);
+        assert!(fallback_dispatch_count() > total_before);
+
+        // Negative numbers are never used to index the per-number table.
+        let total_before = fallback_dispatch_count();
+        record_fallback_dispatch(-1);
+        assert_eq!(fallback_syscall_count(-1), 0);
+        assert!(fallback_dispatch_count() > total_before);
+    }
 
     #[test]
     fn stack_line_formats_signed_and_hex_values() {
