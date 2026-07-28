@@ -39,6 +39,7 @@ typedef int64_t (*syscall_invoker_t)(uintptr_t, int64_t, const uint64_t *);
 typedef int32_t (*register_reader_t)(uintptr_t, struct user_regs_struct *);
 typedef int32_t (*register_writer_t)(uintptr_t, const struct user_regs_struct *);
 typedef int32_t (*memory_reader_t)(uintptr_t, uint8_t *, size_t);
+typedef size_t (*memory_writer_t)(uintptr_t, const uint8_t *, size_t);
 
 typedef struct {
   uint64_t branches;
@@ -200,7 +201,8 @@ extern int32_t reverie_dbi_runtime_pre_syscall(
     uint64_t branches, int64_t *result, int64_t *deferred_sysnum,
     uint64_t *deferred_args, syscall_invoker_t invoke_syscall,
     register_reader_t read_registers, register_writer_t write_registers,
-    memory_reader_t read_memory, reverie_emit_fn_t emit);
+    memory_reader_t read_memory, memory_writer_t write_memory,
+    reverie_emit_fn_t emit);
 extern const char *reverie_dbi_runtime_name(void);
 extern void reverie_dbi_runtime_totals(uint64_t *branches, uint64_t *syscalls,
                                        uint64_t *rewritten,
@@ -950,6 +952,14 @@ static int32_t write_registers(uintptr_t context,
 
 static int32_t read_memory(uintptr_t address, uint8_t *out, size_t size) {
   return read_app((const void *)address, out, size) ? 1 : 0;
+}
+
+// TODO-HUMAN-REVIEW(PR-PENDING): Review the fault-safe DBI memory-write callback ABI.
+static size_t write_memory(uintptr_t address, const uint8_t *value, size_t size) {
+  size_t bytes_written = 0;
+  if (address != 0)
+    dr_safe_write((void *)address, size, value, &bytes_written);
+  return bytes_written;
 }
 
 static void init_virtual_limits(void) {
@@ -1794,7 +1804,7 @@ static bool pre_syscall(void *drcontext, int sysnum) {
       (int64_t)sysnum, args,
       atomic_load_explicit(&branch_count, memory_order_relaxed), &result,
       &deferred_sysnum, deferred_args, invoke_syscall, read_registers,
-      write_registers, read_memory, reverie_dbi_emit);
+      write_registers, read_memory, write_memory, reverie_dbi_emit);
   if (action != 0 && counters->pending_thread_clone != 0)
     counters->pending_thread_clone = 0;
 
