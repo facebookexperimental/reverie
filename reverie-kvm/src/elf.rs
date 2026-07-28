@@ -138,6 +138,10 @@ pub(crate) struct LoadedStaticElf {
     pub signal_actions: std::collections::BTreeMap<i32, [u8; 32]>,
     pub signal_mask: [u8; 8],
     pub signal_alt_stack: Option<Vec<u8>>,
+    // AUTONOMOUS-BOT-IMPLEMENTED: Track the task-local robust futex registration.
+    // TODO-HUMAN-REVIEW(PR-232): Review robust-list fork and exec lifecycle semantics.
+    pub robust_list_head: u64,
+    pub robust_list_len: u64,
     pub files: std::collections::BTreeMap<i32, std::fs::File>,
     pub stdout_alias_fds: std::collections::BTreeSet<i32>,
     pub stderr_alias_fds: std::collections::BTreeSet<i32>,
@@ -224,6 +228,8 @@ impl LoadedStaticElf {
             signal_actions: self.signal_actions.clone(),
             signal_mask: self.signal_mask,
             signal_alt_stack: self.signal_alt_stack.clone(),
+            robust_list_head: 0,
+            robust_list_len: 0,
             files,
             stdout_alias_fds: self.stdout_alias_fds.clone(),
             stderr_alias_fds: self.stderr_alias_fds.clone(),
@@ -323,6 +329,8 @@ impl LoadedStaticElf {
         self.ioprio = previous.ioprio;
         self.signal_actions = signal_actions;
         self.signal_mask = previous.signal_mask;
+        self.robust_list_head = 0;
+        self.robust_list_len = 0;
         self.files = files;
         self.stdout_alias_fds = stdout_alias_fds;
         self.stderr_alias_fds = stderr_alias_fds;
@@ -546,6 +554,8 @@ fn load_executable(
         signal_actions: std::collections::BTreeMap::new(),
         signal_mask: [0; 8],
         signal_alt_stack: None,
+        robust_list_head: 0,
+        robust_list_len: 0,
         files: std::collections::BTreeMap::new(),
         stdout_alias_fds: std::collections::BTreeSet::new(),
         stderr_alias_fds: std::collections::BTreeSet::new(),

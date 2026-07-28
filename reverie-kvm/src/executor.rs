@@ -38,6 +38,7 @@ const PAGE_SIZE: u64 = 4096;
 const GUEST_NOFILE_LIMIT: libc::c_int = 1 << 20;
 const KERNEL_SIGACTION_SIZE: usize = 32;
 const KERNEL_SIGSET_SIZE: usize = 8;
+const ROBUST_LIST_HEAD_SIZE: u64 = 3 * std::mem::size_of::<u64>() as u64;
 const MEMBARRIER_SUPPORTED: libc::c_int = 0x1;
 // prctl(2) PR_CAPBSET_READ option; the deterministic container runs the guest as
 // root with the full capability bounding set up to a fixed CAP_LAST_CAP so the
@@ -736,8 +737,14 @@ fn execute_basic_syscall_with_output(
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-172): Review deterministic rseq feature refusal.
         negative_errno(libc::ENOSYS)
+    } else if number == libc::SYS_get_robust_list as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-232): Review task-local robust-list queries.
+        get_robust_list(memory, state, args)
     } else if number == libc::SYS_set_robust_list as u64 {
-        0
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-232): Review task-local robust-list registration.
+        set_robust_list(state, args)
     } else {
         negative_errno(libc::ENOSYS)
     };
@@ -811,6 +818,33 @@ fn futex(memory: &GuestMemory, args: &[u64; 6]) -> i64 {
     } else {
         result as i64
     }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-232): Review task-local robust-list registration.
+fn set_robust_list(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    if args[1] != ROBUST_LIST_HEAD_SIZE {
+        return negative_errno(libc::EINVAL);
+    }
+    state.robust_list_head = args[0];
+    state.robust_list_len = args[1];
+    0
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-232): Review task-local robust-list queries.
+fn get_robust_list(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    let requested = args[0] as libc::pid_t;
+    if requested != 0 && requested != state.tid && requested != state.pid {
+        return negative_errno(libc::ESRCH);
+    }
+    if args[1] == 0 || args[2] == 0 {
+        return negative_errno(libc::EFAULT);
+    }
+    if write_u64(memory, args[1], state.robust_list_head) != 0 {
+        return negative_errno(libc::EFAULT);
+    }
+    write_u64(memory, args[2], state.robust_list_len)
 }
 
 fn guest_host_address(
@@ -8163,6 +8197,8 @@ mod tests {
             signal_actions: BTreeMap::new(),
             signal_mask: [0; KERNEL_SIGSET_SIZE],
             signal_alt_stack: None,
+            robust_list_head: 0,
+            robust_list_len: 0,
             files: BTreeMap::new(),
             stdout_alias_fds: BTreeSet::new(),
             stderr_alias_fds: BTreeSet::new(),
@@ -15298,6 +15334,55 @@ mod tests {
             ),
             negative_errno(libc::ECHILD)
         );
+    }
+
+    #[test]
+    fn robust_list_registration_round_trips_and_resets_on_fork() {
+        const HEAD_OUTPUT: u64 = 0x100;
+        const LENGTH_OUTPUT: u64 = 0x108;
+        const REGISTERED_HEAD: u64 = 0x300;
+
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+
+        assert_eq!(
+            set_robust_list(
+                &mut state,
+                &[REGISTERED_HEAD, ROBUST_LIST_HEAD_SIZE, 0, 0, 0, 0],
+            ),
+            0
+        );
+        assert_eq!(
+            get_robust_list(
+                &mut memory,
+                &state,
+                &[0, HEAD_OUTPUT, LENGTH_OUTPUT, 0, 0, 0],
+            ),
+            0
+        );
+        assert_eq!(read_struct::<u64>(&memory, HEAD_OUTPUT), REGISTERED_HEAD);
+        assert_eq!(
+            read_struct::<u64>(&memory, LENGTH_OUTPUT),
+            ROBUST_LIST_HEAD_SIZE
+        );
+        assert_eq!(
+            get_robust_list(
+                &mut memory,
+                &state,
+                &[99, HEAD_OUTPUT, LENGTH_OUTPUT, 0, 0, 0],
+            ),
+            negative_errno(libc::ESRCH)
+        );
+        assert_eq!(
+            set_robust_list(&mut state, &[REGISTERED_HEAD, 8, 0, 0, 0, 0]),
+            negative_errno(libc::EINVAL)
+        );
+        assert_eq!(state.robust_list_head, REGISTERED_HEAD);
+
+        let child = state.try_clone_for_fork(2).unwrap();
+        assert_eq!(child.robust_list_head, 0);
+        assert_eq!(child.robust_list_len, 0);
     }
 
     #[test]
