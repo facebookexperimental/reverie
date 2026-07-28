@@ -876,12 +876,17 @@ pub(crate) struct ElfExecutor {
     owns_output: bool,
     next_pid: Arc<AtomicI32>,
     // TODO-HUMAN-REVIEW(PR-235): Review concurrent KVM process lifecycle ownership.
-    pending_processes: std::collections::BTreeMap<i32, std::thread::JoinHandle<crate::Result<i32>>>,
+    pending_processes: std::collections::BTreeMap<i32, PendingProcess>,
     process_action: Option<ProcessAction>,
     pending_segment: Option<(SegmentBase, u64)>,
     exit_code: Option<i32>,
     exit_group: bool,
     clear_child_tid: Option<u64>,
+}
+
+struct PendingProcess {
+    start: Option<std::sync::mpsc::Sender<()>>,
+    handle: std::thread::JoinHandle<crate::Result<i32>>,
 }
 
 struct AddressSpaceState {
@@ -1357,17 +1362,41 @@ impl ElfExecutor {
     pub(crate) fn register_child_process(
         &mut self,
         pid: i32,
+        start: std::sync::mpsc::Sender<()>,
         handle: std::thread::JoinHandle<crate::Result<i32>>,
     ) {
-        let previous = self.pending_processes.insert(pid, handle);
+        let previous = self.pending_processes.insert(
+            pid,
+            PendingProcess {
+                start: Some(start),
+                handle,
+            },
+        );
         debug_assert!(previous.is_none(), "duplicate KVM child pid {pid}");
     }
 
+    // TODO-HUMAN-REVIEW(PR-235): Review parent-registration ordering for KVM children.
+    pub(crate) fn start_pending_child_processes(&mut self) -> crate::Result<()> {
+        for (&pid, process) in &mut self.pending_processes {
+            if let Some(start) = process.start.take() {
+                start.send(()).map_err(|_| {
+                    crate::Error::UnexpectedVcpuExit(format!(
+                        "KVM child process {pid} exited before its parent registered it"
+                    ))
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     fn join_child_process(&mut self, pid: i32) -> crate::Result<()> {
-        let Some(handle) = self.pending_processes.remove(&pid) else {
+        let Some(mut process) = self.pending_processes.remove(&pid) else {
             return Ok(());
         };
-        let code = handle.join().map_err(|_| {
+        if let Some(start) = process.start.take() {
+            let _ = start.send(());
+        }
+        let code = process.handle.join().map_err(|_| {
             crate::Error::UnexpectedVcpuExit(format!("KVM child process {pid} panicked"))
         })??;
         self.record_child_exit(pid, code);
@@ -1401,7 +1430,7 @@ impl ElfExecutor {
             && self
                 .pending_processes
                 .get(&pid)
-                .is_some_and(|handle| !handle.is_finished())
+                .is_some_and(|process| !process.handle.is_finished())
         {
             return Some(0);
         }
@@ -15608,6 +15637,29 @@ mod tests {
         );
         assert_eq!(child.take_output(), (Vec::new(), Vec::new()));
         assert_eq!(parent.take_output(), (b"ab".to_vec(), Vec::new()));
+    }
+
+    #[test]
+    fn forked_process_waits_for_parent_registration_gate() {
+        let root = TestDir::new();
+        let state = test_state(&root.0);
+        let mut executor = ElfExecutor::new(state, false);
+        let (start_sender, start_receiver) = std::sync::mpsc::channel();
+        let (ready_sender, ready_receiver) = std::sync::mpsc::channel();
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            ready_sender.send(()).unwrap();
+            start_receiver.recv().unwrap();
+            started_sender.send(()).unwrap();
+            Ok(0)
+        });
+
+        executor.register_child_process(2, start_sender, handle);
+        ready_receiver.recv().unwrap();
+        assert!(started_receiver.try_recv().is_err());
+        executor.start_pending_child_processes().unwrap();
+        started_receiver.recv().unwrap();
+        executor.join_all_child_processes().unwrap();
     }
 
     fn custom_action(handler: u64) -> [u8; KERNEL_SIGACTION_SIZE] {

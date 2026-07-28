@@ -919,9 +919,15 @@ impl KvmBackend {
         let config = context.config;
         let subscriptions = context.subscriptions;
         let raw_child_pid = child.pid;
+        let (start_sender, start_receiver) = std::sync::mpsc::channel();
         let handle = std::thread::Builder::new()
             .name(format!("reverie-kvm-process-{raw_child_pid}"))
             .spawn(move || {
+                start_receiver.recv().map_err(|_| {
+                    Error::UnexpectedVcpuExit(format!(
+                        "KVM child process {raw_child_pid} lost its parent start gate"
+                    ))
+                })?;
                 let result =
                     futures::executor::block_on(child.backend.run_static_elf_process_with_tool(
                         &mut child.executor,
@@ -945,7 +951,7 @@ impl KvmBackend {
                     Err(error) => Err(error),
                 }
             })?;
-        executor.register_child_process(raw_child_pid, handle);
+        executor.register_child_process(raw_child_pid, start_sender, handle);
         configure_process_syscall_return(
             &self.memory,
             &self.vcpu,

@@ -1295,6 +1295,7 @@ impl KvmBackend {
                     )
                     .await
                 };
+                executor.start_pending_child_processes()?;
                 hide_tool_scratch(&memory)?;
                 match outcome {
                     HandlerOutcome::Returned(result) => (
@@ -1352,6 +1353,7 @@ impl KvmBackend {
                 };
                 self.run_process_action_with_tool(executor, action, true, context)
                     .await?;
+                executor.start_pending_child_processes()?;
             }
             if replaced_image {
                 auxv = executor.auxv().to_vec();
