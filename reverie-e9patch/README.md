@@ -61,10 +61,12 @@ it.
   `PassthroughDispatcher` **verbatim**, so the SIGSYS handler, seccomp filter,
   trusted syscall gate, and fail-closed guard policy (execve, `SIGSYS`
   reservation, `sigaltstack`/`rt_sigprocmask` mutation, non-null `clone` stacks)
-  are the same code in both backends. `install_runtime` installs the shared
-  `InProcessSeccomp` controller identically to LiteInst's `install_runtime`.
+  are the same code in both backends.
+- **The same lifecycle-controller seam.** Both backends install their runtime
+  through reverie-preload's `LifecycleController` seam. Selecting a controller is
+  a *config choice on one shared seam*, not a mechanism fork (see `RuntimeMode`).
 
-**Different (the only two intended differences):**
+**Different (the only intended differences):**
 
 1. **When patching happens.** e9patch rewrites every recovered syscall
    instruction **ahead of time** with `e9tool`; LiteInst rewrites each site **at
@@ -72,6 +74,16 @@ it.
 2. **Trampoline placement.** e9patch's trampolines are materialized by `e9tool`
    into the rewritten ELF; LiteInst allocates them at runtime in a reachable
    arena.
+3. **Which shared controller each selects** — a *consequence* of who owns
+   lifecycle, expressed through the shared seam, not a third mechanism.
+   LiteInst runs standalone, so it selects `InProcessSeccomp`
+   (`RuntimeMode::InProcessFallback`). e9patch runs the guest under the shared
+   fallback ptracer, which owns pre-`main` setup, `exec`/`clone` stops, and vDSO
+   patching, so its production controller is `HybridPtrace`
+   (`RuntimeMode::HybridPtrace`). This *is* the shared fallback ptracer, named
+   through the shared seam — `install_runtime` (in-process) and
+   `install_hybrid_runtime` (ptrace-hosted) sit side by side and differ only by
+   the controller they hand to the identical `reverie_preload::install`.
 
 Because AOT-rewritten sites never trap, the shared SIGSYS dispatcher is only
 reached by the residual sites e9patch cannot rewrite ahead of time (the dynamic
@@ -81,10 +93,22 @@ those the shared fail-closed passthrough policy is exactly correct.
 ## Preload And RPC Boundary
 
 The shared `reverie-preload` runtime and `reverie-rpc-transport` transport are
-now wired into the crate: the dispatcher, the `install_runtime` path, and the
-`.init_array` preload constructor build as part of the cdylib. What is **not yet
-on the active backend path** is arbitrary-tool in-guest dispatch — the same
-constraint LiteInst faces:
+now wired into the crate: the dispatcher, the `install_runtime`/
+`install_hybrid_runtime` paths, and the `.init_array` preload constructor build
+as part of the cdylib. The launcher-side injection is also wired into the active
+backend path: `E9patchBackend::spawn` calls `configure_guest_command` to prepend
+`libreverie_e9patch.so` to the guest's `LD_PRELOAD` and arm the selected
+`RuntimeMode` — **opt-in** via `REVERIE_E9PATCH_LDPRELOAD_FALLBACK`
+(`hybrid`/`1` → ptrace-hosted controller, `fallback` → isolated in-process
+controller). It defaults **off** so the validated ptrace-only path is unchanged
+until the in-guest runtime is exercised against a real GPL-toolchain guest; the
+`:: Backend:` diagnostic reports the active `ldpreload=` mode. The shared
+`HybridPtrace` controller is still a documented skeleton in `reverie-preload`, so
+`install_hybrid_runtime` returns `Unsupported` today — correct, because ptrace
+still performs all event handling.
+
+What remains **not yet on the active backend path** is arbitrary-tool in-guest
+dispatch — the same constraint LiteInst faces:
 
 - an injected C payload cannot contain the arbitrary Rust `T: Tool` selected
   by `Backend::run`;

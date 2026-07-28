@@ -148,6 +148,27 @@ fn is_elf_file(path: &Path) -> io::Result<bool> {
     }
 }
 
+/// Opt-in env var arming the shared ld-preload fallback runtime on the guest.
+///
+/// Default (unset/unrecognized) keeps the working ptrace-only path byte-for-byte
+/// unchanged. `hybrid` (or `1`) injects the shared runtime under e9patch's
+/// production ptrace-hosted controller; `fallback` selects the isolated
+/// in-process controller for experiments. This is opt-in until the in-guest
+/// runtime is validated against a real GPL-toolchain guest, because it installs
+/// an in-process seccomp/`SIGSYS` filter alongside the ptrace lifecycle owner.
+// TODO-HUMAN-REVIEW(PR-104): Review activating in-guest seccomp under ptrace.
+const LDPRELOAD_FALLBACK_ENV: &str = "REVERIE_E9PATCH_LDPRELOAD_FALLBACK";
+
+/// Parse [`LDPRELOAD_FALLBACK_ENV`] into a [`crate::RuntimeMode`], or `None`
+/// (leave the guest command untouched) when unset or unrecognized.
+fn ldpreload_fallback_mode() -> Option<crate::RuntimeMode> {
+    match std::env::var_os(LDPRELOAD_FALLBACK_ENV)?.to_str() {
+        Some("1") | Some("hybrid") => Some(crate::RuntimeMode::HybridPtrace),
+        Some("fallback") => Some(crate::RuntimeMode::InProcessFallback),
+        _ => None,
+    }
+}
+
 async fn spawn_tracer<T>(
     command: Command,
     config: <T::GlobalState as GlobalTool>::Config,
@@ -183,10 +204,24 @@ impl E9patchBackend {
     {
         let source = command.find_program()?;
         let arg0 = command.get_arg0().to_owned();
+
+        // Opt-in: arm the shared ld-preload fallback runtime on the guest
+        // command. Default (unset) leaves the command untouched, so the working
+        // ptrace-only path is unchanged. The shared runtime covers residual
+        // un-rewritten sites; ptrace remains the lifecycle owner and Guest.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        let ldpreload = match ldpreload_fallback_mode() {
+            Some(mode) => {
+                crate::configure_guest_command(&mut command, mode)?;
+                mode.controller_name()
+            }
+            None => "off",
+        };
+
         // TODO-HUMAN-REVIEW(PR-103): Review non-ELF ptrace fallback behavior.
         if !is_elf_file(&source)? {
             eprintln!(
-                ":: Backend: e9patch hybrid; recovered_sites=0; patched_sites=0; b0_sites=0; event_source=ptrace; controller=ptrace; main_executable=non-ELF"
+                ":: Backend: e9patch hybrid; recovered_sites=0; patched_sites=0; b0_sites=0; event_source=ptrace; controller=ptrace; ldpreload={ldpreload}; main_executable=non-ELF"
             );
             command.program(&source).arg0(arg0);
             let tracer = spawn_tracer::<T>(command, config).await?;
@@ -202,11 +237,12 @@ impl E9patchBackend {
             "injected-trap"
         };
         eprintln!(
-            ":: Backend: e9patch hybrid; recovered_sites={}; patched_sites={}; b0_sites={}; event_source={}; controller=ptrace",
+            ":: Backend: e9patch hybrid; recovered_sites={}; patched_sites={}; b0_sites={}; event_source={}; controller=ptrace; ldpreload={}",
             report.recovered_sites(),
             report.patched_sites(),
             report.b0_sites(),
             event_source,
+            ldpreload,
         );
 
         // TODO-HUMAN-REVIEW(PR-103): Review zero-site original-image execution.

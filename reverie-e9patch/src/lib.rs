@@ -43,6 +43,7 @@
 
 use std::env;
 use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
 use std::process::Command;
@@ -61,6 +62,8 @@ pub use rewrite::PreparedBinary;
 pub use rewrite::RewriteReport;
 pub use runtime::RUNTIME_ENV;
 pub use runtime::RUNTIME_FALLBACK;
+pub use runtime::RUNTIME_HYBRID;
+pub use runtime::RuntimeMode;
 
 /// Environment variable overriding the located e9patch preload library path.
 ///
@@ -108,20 +111,55 @@ pub fn preload_library_path() -> io::Result<PathBuf> {
     })
 }
 
-/// Configures a guest command to load the e9patch preload runtime.
+/// Prepends `preload` to any inherited `LD_PRELOAD`, preserving order.
+///
+/// Pure so the ordering contract (our cdylib first, existing entries after) is
+/// unit-testable without touching the process environment or spawning a guest.
+fn compose_ld_preload(preload: PathBuf, inherited: Option<OsString>) -> OsString {
+    let mut value = preload.into_os_string();
+    if let Some(existing) = inherited.filter(|existing| !existing.is_empty()) {
+        value.push(OsStr::new(":"));
+        value.push(existing);
+    }
+    value
+}
+
+/// Configures a `std::process::Command` guest to load the e9patch preload
+/// runtime in the self-contained in-process fallback mode.
 ///
 /// Prepends the located cdylib to `LD_PRELOAD` and arms the runtime via
 /// [`RUNTIME_ENV`]. This is the *same* ld-preload injection LiteInst performs;
 /// only the library name and env-var spelling differ.
 pub fn configure_command(command: &mut Command) -> io::Result<()> {
-    let mut preload = preload_library_path()?.into_os_string();
-    if let Some(existing) = env::var_os("LD_PRELOAD").filter(|value| !value.is_empty()) {
-        preload.push(OsStr::new(":"));
-        preload.push(existing);
-    }
+    let value = compose_ld_preload(preload_library_path()?, env::var_os("LD_PRELOAD"));
     command
-        .env("LD_PRELOAD", preload)
+        .env("LD_PRELOAD", value)
         .env(RUNTIME_ENV, RUNTIME_FALLBACK);
+    Ok(())
+}
+
+/// Arms a `reverie::process::Command` guest with the shared e9patch preload
+/// runtime under the requested [`RuntimeMode`].
+///
+/// This is the launcher-side half of the shared ld-preload injection — the
+/// analog of LiteInst's `configure_command`/`launch` env wiring, but for the
+/// `reverie::process::Command` the [`E9patchBackend`] spawns. It prepends the
+/// located cdylib to any `LD_PRELOAD` already on the command (falling back to
+/// the launcher's own environment) and selects the controller via
+/// [`RuntimeMode::env_value`]. Injection is *the same mechanism* LiteInst uses;
+/// only the AOT-vs-runtime patch timing and trampoline placement differ.
+pub fn configure_guest_command(
+    command: &mut reverie::process::Command,
+    mode: RuntimeMode,
+) -> io::Result<()> {
+    let inherited = command
+        .get_env("LD_PRELOAD")
+        .map(|value| value.into_owned())
+        .or_else(|| env::var_os("LD_PRELOAD"));
+    let value = compose_ld_preload(preload_library_path()?, inherited);
+    command
+        .env("LD_PRELOAD", value)
+        .env(RUNTIME_ENV, mode.env_value());
     Ok(())
 }
 
@@ -165,7 +203,11 @@ pub const E9PATCH_SOURCE_REVISION: &str = "6c2c03c1da74b14daf1788a9f8dccfa354ce0
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
     use super::E9PATCH_SOURCE_REVISION;
+    use super::compose_ld_preload;
 
     #[test]
     fn pinned_revision_is_a_full_git_object_id() {
@@ -174,6 +216,31 @@ mod tests {
             E9PATCH_SOURCE_REVISION
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit())
+        );
+    }
+
+    #[test]
+    fn ld_preload_puts_our_library_first() {
+        let composed = compose_ld_preload(
+            PathBuf::from("/opt/libreverie_e9patch.so"),
+            Some(OsString::from("/lib/a.so:/lib/b.so")),
+        );
+        assert_eq!(
+            composed,
+            OsString::from("/opt/libreverie_e9patch.so:/lib/a.so:/lib/b.so")
+        );
+    }
+
+    #[test]
+    fn ld_preload_without_inherited_is_just_our_library() {
+        assert_eq!(
+            compose_ld_preload(PathBuf::from("/opt/x.so"), None),
+            OsString::from("/opt/x.so")
+        );
+        // An empty inherited value must not produce a trailing separator.
+        assert_eq!(
+            compose_ld_preload(PathBuf::from("/opt/x.so"), Some(OsString::new())),
+            OsString::from("/opt/x.so")
         );
     }
 }
