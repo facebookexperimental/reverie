@@ -5280,6 +5280,12 @@ fn synthetic_proc_path_for_inode(inode: u64) -> Option<&'static [u8]> {
         b"/proc/self/stat",
         b"/proc/self/status",
         b"/proc/self/cmdline",
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-224): paths added to the synthetic
+        // /proc/vmstat and /proc/sys/kernel/osrelease surface so fstat/statx on
+        // their descriptors resolve to the same stable synthetic inode.
+        b"/proc/vmstat",
+        b"/proc/sys/kernel/osrelease",
     ];
     PATHS
         .iter()
@@ -5391,6 +5397,42 @@ fn synthetic_proc_content(state: &LoadedStaticElf, path: &[u8]) -> Option<Vec<u8
         b"/proc/self/stat" => proc_self_stat_content(state),
         b"/proc/self/status" => proc_self_status_content(state),
         b"/proc/self/cmdline" => proc_self_cmdline_content(state),
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-224): deterministic /proc/vmstat surface so
+        // procps `vmstat` reads its counters synthetically instead of hitting
+        // the fail-closed real-procfs refusal. All counters are fixed at 0
+        // (memory is not virtualized under KVM), matching the zeroed
+        // /proc/stat and /proc/meminfo surfaces above.
+        b"/proc/vmstat" => concat!(
+            "nr_free_pages 262144\n",
+            "nr_inactive_anon 0\n",
+            "nr_active_anon 0\n",
+            "nr_inactive_file 0\n",
+            "nr_active_file 0\n",
+            "nr_unevictable 0\n",
+            "nr_mlock 0\n",
+            "nr_anon_pages 0\n",
+            "nr_mapped 0\n",
+            "nr_file_pages 0\n",
+            "nr_dirty 0\n",
+            "nr_writeback 0\n",
+            "nr_slab_reclaimable 0\n",
+            "nr_slab_unreclaimable 0\n",
+            "pgpgin 0\n",
+            "pgpgout 0\n",
+            "pswpin 0\n",
+            "pswpout 0\n",
+            "pgfault 0\n",
+            "pgmajfault 0\n",
+        )
+        .as_bytes()
+        .to_vec(),
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-224): deterministic
+        // /proc/sys/kernel/osrelease so `sysctl -n kernel.osrelease` resolves
+        // synthetically. The value matches the KVM `uname(2)` release field
+        // ("6.0.0", see fn uname) and /proc/version above.
+        b"/proc/sys/kernel/osrelease" => b"6.0.0\n".to_vec(),
         _ => return None,
     };
     Some(content)
@@ -8338,6 +8380,44 @@ mod tests {
                 [fd as u64, 0x200, 1, 0, 0, 0]
             ),
             negative_errno(libc::ENOSYS)
+        );
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-224): regression coverage for the /proc/vmstat
+    // and /proc/sys/kernel/osrelease synthetic surfaces.
+    #[test]
+    fn synthetic_proc_vmstat_and_osrelease_are_served_deterministically() {
+        let root = TestDir::new();
+        let state = test_state(&root.0);
+
+        // /proc/vmstat is served with fixed, zeroed counters and round-trips
+        // through the deterministic-inode path table.
+        let vmstat = synthetic_proc_content(&state, b"/proc/vmstat").unwrap();
+        assert!(vmstat.starts_with(b"nr_free_pages "));
+        assert!(
+            vmstat
+                .windows(b"pgpgin 0\n".len())
+                .any(|w| w == b"pgpgin 0\n")
+        );
+        assert_eq!(
+            synthetic_proc_content(&state, b"/proc/vmstat").unwrap(),
+            vmstat,
+            "vmstat content must be stable across reads"
+        );
+        assert_eq!(
+            synthetic_proc_path_for_inode(synthetic_proc_inode(b"/proc/vmstat")),
+            Some(b"/proc/vmstat".as_slice())
+        );
+
+        // /proc/sys/kernel/osrelease matches the KVM uname(2) release field.
+        assert_eq!(
+            synthetic_proc_content(&state, b"/proc/sys/kernel/osrelease").unwrap(),
+            b"6.0.0\n"
+        );
+        assert_eq!(
+            synthetic_proc_path_for_inode(synthetic_proc_inode(b"/proc/sys/kernel/osrelease")),
+            Some(b"/proc/sys/kernel/osrelease".as_slice())
         );
     }
 
