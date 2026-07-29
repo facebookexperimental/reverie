@@ -129,6 +129,38 @@ fn dispatcher() -> Option<&'static (dyn SyscallDispatcher + 'static)> {
     }
 }
 
+fn dispatch_event(event: &mut SyscallEvent) {
+    match dispatcher() {
+        Some(dispatcher) => dispatcher.dispatch(event),
+        None => {
+            // No dispatcher registered: fail closed with ENOSYS rather than
+            // silently allowing the call.
+            event.set_result(-i64::from(libc::ENOSYS));
+        }
+    }
+}
+
+// TODO-HUMAN-REVIEW(PR-pending): Review direct invocation of the registered
+// dispatcher by ahead-of-time instrumentation trampolines.
+// AUTONOMOUS-BOT-IMPLEMENTED
+/// Dispatch a syscall from an instrumentation trampoline in ordinary context.
+///
+/// This enters the exact process-wide [`SyscallDispatcher`] registered for the
+/// shared preload runtime, but does not install or interact with a signal
+/// frame. It is intended for ahead-of-time rewriting backends such as e9patch;
+/// runtime patchers continue to enter through `SIGSYS` and
+/// [`SyscallEvent::defer_to`]. A dispatcher that requests deferred signal-frame
+/// resumption is rejected with `-ENOTSUP` because no signal frame exists here.
+pub fn dispatch_direct(number: i64, args: [u64; 6], instruction_pointer: u64) -> i64 {
+    let mut event = SyscallEvent::direct(number, args, instruction_pointer);
+    dispatch_event(&mut event);
+    if event.resume_address().is_some() {
+        -i64::from(libc::ENOTSUP)
+    } else {
+        event.resolved_result()
+    }
+}
+
 unsafe fn exit_now(code: i32) -> ! {
     let _ = unsafe { raw_syscall6(libc::SYS_exit_group, [code as u64, 0, 0, 0, 0, 0]) };
     loop {
@@ -178,14 +210,7 @@ pub(crate) unsafe extern "C" fn sigsys_handler(
         registers[libc::REG_RIP as usize] as u64,
     );
 
-    match dispatcher() {
-        Some(dispatcher) => dispatcher.dispatch(&mut event),
-        None => {
-            // No dispatcher registered: fail closed with ENOSYS rather than
-            // silently allowing the call.
-            event.set_result(-i64::from(libc::ENOSYS));
-        }
-    }
+    dispatch_event(&mut event);
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     if let Some(resume_address) = event.resume_address() {

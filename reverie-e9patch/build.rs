@@ -16,8 +16,21 @@ fn main() {
     println!("cargo:rerun-if-changed=runtime/syscall_trap.c");
     println!("cargo:rerun-if-env-changed=CC");
 
-    let output = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo did not set OUT_DIR"))
-        .join("reverie-e9patch-syscall-trap");
+    let output_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo did not set OUT_DIR"));
+    let output = output_dir.join("reverie-e9patch-syscall-trap");
+    let dispatch_page = 0x0000_0001_e900_0000_u64;
+    let dispatch_magic = 0x7265_7665_3961_6f74_u64;
+    let trap_entry = 0x0000_0000_7000_1000_u64;
+    std::fs::write(
+        output_dir.join("aot_dispatch_constants.rs"),
+        format!(
+            "pub(crate) const AOT_DISPATCH_PAGE_ADDRESS: u64 = {dispatch_page:#x};\n\
+             pub(crate) const AOT_DISPATCH_MAGIC: u64 = {dispatch_magic:#x};\n\
+             #[cfg(test)]\n\
+             pub(crate) const AOT_FALLBACK_TRAP_ENTRY: u64 = {trap_entry:#x};\n"
+        ),
+    )
+    .expect("failed to write e9patch AOT dispatch constants");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux")
         || env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("x86_64")
     {
@@ -45,6 +58,9 @@ fn main() {
                 "-c",
                 "-Wall",
             ])
+            .arg(format!("-DREVERIE_E9PATCH_AOT_PAGE={dispatch_page:#x}"))
+            .arg(format!("-DREVERIE_E9PATCH_AOT_MAGIC={dispatch_magic:#x}"))
+            .arg(format!("-DREVERIE_E9PATCH_TRAP_ENTRY={trap_entry:#x}"))
             .arg(source)
             .arg("-o")
             .arg(&object),
@@ -66,6 +82,7 @@ fn main() {
                 "-Wl,stack-size=0",
                 "-Wl,--export-dynamic",
                 "-Wl,--entry=0x0",
+                "-Wl,--sort-section=name",
                 "-Wl,--strip-all",
             ]),
         "link e9patch syscall trampoline",

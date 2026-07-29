@@ -15,12 +15,16 @@ use reverie::syscalls::Sysno;
 
 /// The register frame produced by e9tool's `state` call-trampoline argument.
 ///
-/// The frame is private to the ptrace controller. Backends opt into the event
-/// ABI with [`crate::TracerBuilder::injected_syscall_trap`].
+/// The ptrace controller and e9patch's in-process AOT dispatcher share this
+/// exact layout. Backends opt into the fallback trap ABI with
+/// [`crate::TracerBuilder::injected_syscall_trap`].
 // TODO-HUMAN-REVIEW(PR-102): Review the e9tool state-frame syscall ABI.
+// TODO-HUMAN-REVIEW(PR-pending): Review exposing the existing e9tool state frame
+// to the in-process AOT dispatcher.
+// AUTONOMOUS-BOT-IMPLEMENTED
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(C)]
-pub(crate) struct InjectedSyscallFrame {
+pub struct InjectedSyscallFrame {
     flags: u64,
     r15: u64,
     r14: u64,
@@ -62,7 +66,8 @@ impl InjectedSyscallFrame {
         | Self::RFLAGS_SF
         | Self::RFLAGS_OF;
 
-    pub(crate) fn syscall(&self) -> Syscall {
+    /// Decodes the syscall stored in this e9tool frame.
+    pub fn syscall(&self) -> Syscall {
         Syscall::from_raw(
             Sysno::from(self.rax as i32),
             SyscallArgs::new(
@@ -76,7 +81,18 @@ impl InjectedSyscallFrame {
         )
     }
 
-    pub(crate) fn emulate_syscall_entry(&mut self, trap_rflags: u64) {
+    /// Returns the six raw syscall arguments in Linux x86-64 ABI order.
+    pub fn raw_args(&self) -> [u64; 6] {
+        [self.rdi, self.rsi, self.rdx, self.r10, self.r8, self.r9]
+    }
+
+    /// Returns the address of the syscall instruction replaced by e9tool.
+    pub fn instruction_pointer(&self) -> u64 {
+        self.rip
+    }
+
+    /// Applies the architectural `RCX`/`R11` clobbers of a native syscall.
+    pub fn emulate_syscall_entry(&mut self, trap_rflags: u64) {
         // A native x86-64 syscall places the continuation RIP in RCX and the
         // pre-syscall flags in R11 before seccomp delivers its ptrace stop.
         // The replacement trampoline bypasses that instruction, so reproduce
@@ -85,7 +101,8 @@ impl InjectedSyscallFrame {
         self.r11 = self.native_rflags(trap_rflags);
     }
 
-    pub(crate) fn set_result(&mut self, result: i64) {
+    /// Stores a syscall result for e9tool to restore into guest `RAX`.
+    pub fn set_result(&mut self, result: i64) {
         self.rax = result as u64;
     }
 

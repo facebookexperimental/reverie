@@ -52,6 +52,7 @@ mod validation;
 mod vdso;
 
 pub use backend::PtraceBackend;
+pub use injected_syscall::InjectedSyscallFrame;
 pub use perf::is_perf_supported;
 pub use timer::PmuConfig;
 pub use timer::set_pmu_config;

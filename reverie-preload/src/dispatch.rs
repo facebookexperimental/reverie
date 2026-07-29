@@ -16,6 +16,19 @@
 use crate::signal;
 use crate::trap;
 
+// TODO-HUMAN-REVIEW(PR-pending): Review the public dispatch-origin contract used by
+// direct binary-rewriter trampolines.
+// AUTONOMOUS-BOT-IMPLEMENTED
+/// How a syscall reached the shared preload dispatcher.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum SyscallEventSource {
+    /// The seccomp filter delivered the syscall through the `SIGSYS` handler.
+    SignalTrap,
+    /// An instrumentation trampoline called the dispatcher in ordinary context.
+    DirectInstrumentation,
+}
+
 /// A trapped syscall, as reconstructed from the SIGSYS `ucontext`.
 ///
 /// The dispatcher inspects [`number`](Self::number)/[`args`](Self::args) and
@@ -26,16 +39,41 @@ pub struct SyscallEvent {
     number: i64,
     args: [u64; 6],
     instruction_pointer: u64,
+    source: SyscallEventSource,
     result: Option<i64>,
     resume_address: Option<u64>,
 }
 
 impl SyscallEvent {
     pub(crate) fn new(number: i64, args: [u64; 6], instruction_pointer: u64) -> Self {
+        Self::with_source(
+            number,
+            args,
+            instruction_pointer,
+            SyscallEventSource::SignalTrap,
+        )
+    }
+
+    pub(crate) fn direct(number: i64, args: [u64; 6], instruction_pointer: u64) -> Self {
+        Self::with_source(
+            number,
+            args,
+            instruction_pointer,
+            SyscallEventSource::DirectInstrumentation,
+        )
+    }
+
+    fn with_source(
+        number: i64,
+        args: [u64; 6],
+        instruction_pointer: u64,
+        source: SyscallEventSource,
+    ) -> Self {
         Self {
             number,
             args,
             instruction_pointer,
+            source,
             result: None,
             resume_address: None,
         }
@@ -54,6 +92,14 @@ impl SyscallEvent {
     /// The guest instruction pointer that issued the syscall.
     pub fn instruction_pointer(&self) -> u64 {
         self.instruction_pointer
+    }
+
+    // TODO-HUMAN-REVIEW(PR-pending): Review dispatch-origin exposure to backend
+    // dispatchers.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    /// Returns how this syscall entered the shared dispatcher.
+    pub fn source(&self) -> SyscallEventSource {
+        self.source
     }
 
     /// The result the dispatcher has chosen, if any.
@@ -248,6 +294,15 @@ mod tests {
 
         assert_eq!(event.result(), None);
         assert_eq!(event.resume_address(), Some(0x2000));
+    }
+
+    #[test]
+    fn direct_events_are_distinct_from_signal_traps() {
+        let signal = SyscallEvent::new(libc::SYS_getpid, [0; 6], 0x1000);
+        let direct = SyscallEvent::direct(libc::SYS_getpid, [0; 6], 0x1000);
+
+        assert_eq!(signal.source(), SyscallEventSource::SignalTrap);
+        assert_eq!(direct.source(), SyscallEventSource::DirectInstrumentation);
     }
 
     #[test]

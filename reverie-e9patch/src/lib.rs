@@ -22,8 +22,10 @@
 //! [`SyscallDispatcher`](reverie_preload::dispatch::SyscallDispatcher) seam.
 //! Both register a dispatcher and install the same
 //! [`InProcessSeccomp`](reverie_preload::lifecycle::InProcessSeccomp)
-//! controller via [`runtime::install_runtime`], and both fall back to the
-//! ptrace lifecycle owner for full `Guest` semantics.
+//! controller via [`runtime::install_runtime`]. E9patch's AOT trampoline calls
+//! that registered dispatcher directly in ordinary guest context; if the
+//! preload callback is absent, it retains the ptrace trap as a correctness
+//! fallback.
 //!
 //! The **only** intended differences are:
 //!
@@ -48,6 +50,7 @@ use std::io;
 use std::path::PathBuf;
 use std::process::Command;
 
+mod aot;
 mod backend;
 pub mod dispatch;
 mod rewrite;

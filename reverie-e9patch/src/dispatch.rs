@@ -34,16 +34,16 @@
 //!   execution of that site is a near-native trampoline call.
 //! * **e9patch** patches *ahead of time*: `e9tool` rewrites every recovered
 //!   syscall instruction into a freestanding call trampoline *before* the guest
-//!   ever runs. Those AOT trampolines are the fast path from the very first
-//!   execution, so [`E9patchDispatcher`] never has to publish a runtime hook.
+//!   ever runs. Those AOT trampolines call the already-registered shared
+//!   dispatcher in ordinary context from the very first execution, so
+//!   [`E9patchDispatcher`] never has to publish a runtime hook.
 //!
-//! Because AOT-rewritten sites do not trap, the `SIGSYS` dispatcher below is
-//! only reached by sites e9patch could *not* rewrite ahead of time — the
-//! dynamic loader and startup code, the vDSO fast paths, and any uncovered or
-//! JIT-emitted site. For those, the shared fail-closed passthrough policy is
-//! exactly the right behavior, and the ptrace lifecycle controller (see
-//! [`crate::E9patchBackend`]) remains the correctness-first fallback owner for
-//! the full `Guest` semantics an arbitrary tool needs.
+//! AOT-rewritten sites enter with
+//! [`SyscallEventSource::DirectInstrumentation`]. Sites e9patch could *not*
+//! rewrite ahead of time — dynamic loader/startup code, vDSO fast paths, and
+//! uncovered or JIT-emitted code — enter through `SIGSYS` with
+//! [`SyscallEventSource::SignalTrap`]. Only that residual signal-trap surface is
+//! counted as fallback; both origins use the same fail-closed policy.
 
 use core::sync::atomic::AtomicU64;
 use core::sync::atomic::Ordering;
@@ -51,6 +51,7 @@ use core::sync::atomic::Ordering;
 use reverie_preload::dispatch::PassthroughDispatcher;
 use reverie_preload::dispatch::SyscallDispatcher;
 use reverie_preload::dispatch::SyscallEvent;
+use reverie_preload::dispatch::SyscallEventSource;
 use reverie_preload::fork::ForkHook;
 
 /// Distinct syscall numbers broken out individually by the fallback counters.
@@ -305,15 +306,12 @@ pub(crate) fn reset_fallback_observability() {
     FALLBACK_SITES.reset();
 }
 
-/// e9patch's `SIGSYS` dispatcher for sites that were **not** rewritten ahead of
-/// time by `e9tool`.
+/// E9patch's shared dispatcher for AOT calls and residual `SIGSYS` traps.
 ///
-/// AOT-rewritten sites reach the tool through their e9patch trampoline and never
-/// trap, so this dispatcher governs only the fallback surface: loader/startup
-/// syscalls before instrumentation, the vDSO, and any instruction e9patch's
-/// static coverage missed. It reuses LiteInst's shared fail-closed
-/// [`PassthroughDispatcher`] verbatim — the same Reverie hooks — forwarding each
-/// such syscall through the trusted gate after applying the shared guards.
+/// It reuses LiteInst's shared fail-closed [`PassthroughDispatcher`] verbatim —
+/// the same Reverie hooks — forwarding each syscall through the trusted gate
+/// after applying the shared guards. Signal-trap events are additionally
+/// counted as the residual fallback surface; direct AOT events are not.
 #[derive(Debug, Default)]
 pub struct E9patchDispatcher {
     // The shared, reviewed-once policy. Held by value so e9patch reuses the
@@ -354,16 +352,14 @@ impl E9patchDispatcher {
 impl SyscallDispatcher for E9patchDispatcher {
     fn dispatch(&self, event: &mut SyscallEvent) {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // e9patch's fast path is the AOT trampoline, which never enters this
-        // handler. Anything that *does* trap here is an un-rewritten fallback
-        // site, so record it for observability — both by syscall number and by
-        // the un-rewritten site's instruction address — then defer entirely to
-        // the shared, reviewed-once policy that LiteInst also uses. Counting does
-        // not change the forwarding decision, so the SIGSYS path stays identical
-        // across the two ld-preload backends; only patch timing and trampoline
-        // placement differ.
-        record_fallback_dispatch(event.number());
-        record_fallback_site(event.instruction_pointer());
+        // Direct AOT calls and signal-trap fallbacks enter the exact same shared
+        // dispatcher. Only the latter are part of the residual surface, so
+        // record those by syscall number and instruction address before
+        // deferring to the reviewed-once policy LiteInst also uses.
+        if event.source() == SyscallEventSource::SignalTrap {
+            record_fallback_dispatch(event.number());
+            record_fallback_site(event.instruction_pointer());
+        }
         self.passthrough.dispatch(event);
     }
 }
