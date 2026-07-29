@@ -37,6 +37,7 @@ use goblin::elf::header::ET_EXEC;
 use goblin::elf::program_header::PF_R;
 #[cfg(test)]
 use goblin::elf::program_header::PF_W;
+use goblin::elf::program_header::PF_X;
 use goblin::elf::program_header::PT_LOAD;
 use reverie::Error;
 use sha2::Digest;
@@ -66,6 +67,8 @@ pub struct RewriteReport {
     patched_sites: usize,
     recovered_sites: usize,
     b0_sites: usize,
+    image_entry_address: u64,
+    patched_site_addresses: Vec<u64>,
 }
 
 impl RewriteReport {
@@ -115,6 +118,14 @@ impl RewriteReport {
     // TODO-HUMAN-REVIEW(PR-101): Review the public rewrite report API.
     pub fn b0_sites(&self) -> usize {
         self.b0_sites
+    }
+
+    pub(crate) fn image_entry_address(&self) -> u64 {
+        self.image_entry_address
+    }
+
+    pub(crate) fn patched_site_addresses(&self) -> &[u64] {
+        &self.patched_site_addresses
     }
 }
 
@@ -212,6 +223,7 @@ impl E9patchRewriter {
         tool.stdin(Stdio::null());
         tool.arg("--backend")
             .arg(&e9patch_snapshot)
+            .arg("--dump-all")
             .arg("--seed=1")
             .arg("--option=--tactic-B0=false")
             .arg("-O0")
@@ -274,6 +286,16 @@ impl E9patchRewriter {
             .into());
         }
 
+        let disassembly = output.with_file_name(format!(
+            "{}.DISASM.csv",
+            output
+                .file_name()
+                .expect("fixed e9patch output path has a filename")
+                .to_string_lossy()
+        ));
+        let patched_site_addresses =
+            parse_patched_site_addresses(&input_bytes, &input_elf, &disassembly, recovered_sites)?;
+
         let output_metadata = fs::symlink_metadata(&output)
             .with_context(|| format!("e9tool did not create {}", output.display()))?;
         if !output_metadata.is_file() || output_metadata.file_type().is_symlink() {
@@ -290,6 +312,8 @@ impl E9patchRewriter {
             &output,
             patched_sites,
         )?;
+        let output_elf = Elf::parse(&output_bytes)
+            .with_context(|| format!("failed to reparse e9tool output {}", output.display()))?;
 
         let mut artifact = create_sealed_artifact(&output_bytes, input_mode)?;
         artifact.seek(SeekFrom::Start(0))?;
@@ -302,9 +326,94 @@ impl E9patchRewriter {
             patched_sites,
             recovered_sites,
             b0_sites,
+            image_entry_address: output_elf.entry,
+            patched_site_addresses,
         };
         Ok(PreparedBinary { report, artifact })
     }
+}
+
+fn parse_patched_site_addresses(
+    input: &[u8],
+    elf: &Elf<'_>,
+    path: &Path,
+    recovered_sites: usize,
+) -> Result<Vec<u64>, Error> {
+    if recovered_sites == 0 && !path.exists() {
+        return Ok(Vec::new());
+    }
+    let csv = fs::read_to_string(path)
+        .with_context(|| format!("failed to read e9tool disassembly {}", path.display()))?;
+    let mut lines = csv.lines();
+    if lines.next() != Some("address,offset,size") {
+        return Err(anyhow!("invalid e9tool disassembly header in {}", path.display()).into());
+    }
+    let mut sites = Vec::with_capacity(recovered_sites);
+    for (line_number, line) in lines.enumerate() {
+        let mut fields = line.split(',');
+        let (Some(address), Some(offset), Some(size), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Err(anyhow!(
+                "invalid e9tool disassembly row {} in {}",
+                line_number + 2,
+                path.display()
+            )
+            .into());
+        };
+        let address = u64::from_str_radix(address.trim_start_matches("0x"), 16)
+            .with_context(|| format!("invalid e9tool address in {}", path.display()))?;
+        let offset = offset
+            .trim_start_matches('+')
+            .parse::<usize>()
+            .with_context(|| format!("invalid e9tool file offset in {}", path.display()))?;
+        let size = size
+            .parse::<usize>()
+            .with_context(|| format!("invalid e9tool instruction size in {}", path.display()))?;
+        let end = offset.checked_add(size).ok_or_else(|| {
+            anyhow!(
+                "overflowing e9tool instruction offset in {}",
+                path.display()
+            )
+        })?;
+        let bytes = input.get(offset..end).ok_or_else(|| {
+            anyhow!(
+                "e9tool disassembly row points outside its input in {}",
+                path.display()
+            )
+        })?;
+        if bytes == [0x0f, 0x05] {
+            let offset = offset as u64;
+            let end = end as u64;
+            let mapped_address = elf
+                .program_headers
+                .iter()
+                .filter(|header| header.p_type == PT_LOAD && header.p_flags & PF_X != 0)
+                .find(|header| {
+                    header.p_offset <= offset
+                        && end <= header.p_offset.saturating_add(header.p_filesz)
+                })
+                .and_then(|header| header.p_vaddr.checked_add(offset - header.p_offset));
+            if mapped_address != Some(address) {
+                return Err(anyhow!(
+                    "e9tool disassembly address {address:#x} does not map file offset {offset:#x} in {}",
+                    path.display()
+                )
+                .into());
+            }
+            sites.push(address);
+        }
+    }
+    sites.sort_unstable();
+    sites.dedup();
+    if sites.len() != recovered_sites {
+        return Err(anyhow!(
+            "e9tool recovered {recovered_sites} syscall sites but its disassembly identifies {}",
+            sites.len()
+        )
+        .into());
+    }
+    Ok(sites)
 }
 
 fn snapshot_input(path: &Path) -> Result<(Vec<u8>, u32), Error> {
@@ -738,6 +847,7 @@ printf 'num_patched = {patched} / {recovered}\n'
         assert_eq!(report.patched_sites(), 0);
         assert_eq!(report.recovered_sites(), 0);
         assert_eq!(report.b0_sites(), 0);
+        assert!(report.patched_site_addresses().is_empty());
 
         let mut artifact = prepared.artifact().unwrap();
         let seals = unsafe { libc::fcntl(artifact.as_raw_fd(), libc::F_GET_SEALS) };
@@ -902,6 +1012,48 @@ printf 'num_patched = {patched} / {recovered}\n'
         assert_eq!(parse_metric(diagnostic, "num_patched"), Some((7, 7)));
         assert_eq!(parse_metric(diagnostic, "num_patched_B0"), Some((0, 7)));
         assert_eq!(parse_metric(diagnostic, "num_patched_B1"), None);
+    }
+
+    #[test]
+    fn disassembly_binds_syscall_bytes_to_exact_virtual_addresses() {
+        let directory = tempfile::tempdir().unwrap();
+        let disassembly = directory.path().join("guest.DISASM.csv");
+        let elf = Elf::parse(SYSCALL_TRAP_PATCH).unwrap();
+        let (offset, address) = elf
+            .program_headers
+            .iter()
+            .filter(|header| header.p_type == PT_LOAD && header.p_flags & PF_X != 0)
+            .find_map(|header| {
+                let start = header.p_offset as usize;
+                let end = start + header.p_filesz as usize;
+                let relative = SYSCALL_TRAP_PATCH[start..end]
+                    .windows(2)
+                    .position(|bytes| bytes == [0x0f, 0x05])?;
+                let offset = start + relative;
+                let address = header.p_vaddr + offset as u64 - header.p_offset;
+                Some((offset, address))
+            })
+            .unwrap();
+        fs::write(
+            &disassembly,
+            format!("address,offset,size\n{address:#x},+{offset},2\n"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            parse_patched_site_addresses(SYSCALL_TRAP_PATCH, &elf, &disassembly, 1).unwrap(),
+            [address]
+        );
+
+        fs::write(
+            &disassembly,
+            format!("address,offset,size\n{:#x},+{offset},2\n", address + 1),
+        )
+        .unwrap();
+        assert!(parse_patched_site_addresses(SYSCALL_TRAP_PATCH, &elf, &disassembly, 1).is_err());
+
+        fs::write(&disassembly, "wrong,header\n").unwrap();
+        assert!(parse_patched_site_addresses(SYSCALL_TRAP_PATCH, &elf, &disassembly, 1).is_err());
     }
 
     #[test]

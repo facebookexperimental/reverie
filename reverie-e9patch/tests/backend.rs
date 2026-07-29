@@ -59,6 +59,14 @@ fn direct_syscall_guest() -> OsString {
 }
 
 fn compile_fixture(name: &str) -> (tempfile::TempDir, PathBuf) {
+    compile_fixture_with_flags(name, &["-fno-pie", "-no-pie"])
+}
+
+fn compile_pie_fixture(name: &str) -> (tempfile::TempDir, PathBuf) {
+    compile_fixture_with_flags(name, &["-fpie", "-pie"])
+}
+
+fn compile_fixture_with_flags(name: &str, flags: &[&str]) -> (tempfile::TempDir, PathBuf) {
     let directory = tempfile::tempdir().unwrap();
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
@@ -66,13 +74,8 @@ fn compile_fixture(name: &str) -> (tempfile::TempDir, PathBuf) {
     let output = directory.path().join(name.trim_end_matches(".c"));
     let compiler = std::env::var_os("CC").unwrap_or_else(|| OsString::from("cc"));
     let result = ProcessCommand::new(compiler)
-        .args([
-            "-std=gnu11",
-            "-O0",
-            "-fno-pie",
-            "-no-pie",
-            "-fno-stack-protector",
-        ])
+        .args(["-std=gnu11", "-O0", "-fno-stack-protector"])
+        .args(flags)
         .arg(&source)
         .arg("-o")
         .arg(&output)
@@ -176,6 +179,29 @@ impl Tool for CountRead {
     }
 }
 
+#[derive(Default)]
+struct CountGetpid;
+
+#[reverie::tool]
+impl Tool for CountGetpid {
+    type GlobalState = EventCounter;
+    type ThreadState = ();
+
+    fn subscriptions(_config: &()) -> Subscription {
+        subscriptions()
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        assert_eq!(syscall.number(), Sysno::getpid);
+        guest.send_rpc(1).await;
+        Ok(424242)
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires a built e9tool/e9patch pair and direct-syscall guest"]
 async fn rewritten_syscall_is_delivered_and_emulated() {
@@ -266,6 +292,41 @@ async fn marker_collision_at_another_rip_is_not_a_syscall_event() {
         .await
         .unwrap();
     assert_eq!(global.delivered.load(Ordering::SeqCst), 0);
+    assert_eq!(status, ExitStatus::Exited(0));
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires a built e9tool/e9patch pair and a C compiler"]
+async fn exact_trap_with_unpatched_site_is_not_a_syscall_event() {
+    let (_directory, guest) = compile_fixture("exact_trap_spoof.c");
+    let (status, global) = E9patchBackend::run::<CountGetpid>(Command::new(guest), ())
+        .await
+        .unwrap();
+    assert_eq!(global.delivered.load(Ordering::SeqCst), 0);
+    assert_eq!(status.signal(), Some(libc::SIGTRAP));
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires a built e9tool/e9patch pair and a C compiler"]
+async fn exact_trap_with_patched_site_documents_collision_filter_limit() {
+    let (_directory, guest) = compile_fixture_with_flags(
+        "exact_trap_spoof.c",
+        &["-fno-pie", "-no-pie", "-DSPOOF_PATCHED_SITE"],
+    );
+    let (_status, global) = E9patchBackend::run::<CountGetpid>(Command::new(guest), ())
+        .await
+        .unwrap();
+    assert_eq!(global.delivered.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires a built e9tool/e9patch pair and a C compiler"]
+async fn pie_rewritten_site_validates_with_runtime_load_bias() {
+    let (_directory, guest) = compile_pie_fixture("direct_spoof_getpid.c");
+    let (status, global) = E9patchBackend::run::<CountGetpid>(Command::new(guest), ())
+        .await
+        .unwrap();
+    assert_eq!(global.delivered.load(Ordering::SeqCst), 1);
     assert_eq!(status, ExitStatus::Exited(0));
 }
 

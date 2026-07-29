@@ -178,15 +178,24 @@ fn ldpreload_fallback_mode() -> Option<crate::RuntimeMode> {
 async fn spawn_tracer<T>(
     command: Command,
     config: <T::GlobalState as GlobalTool>::Config,
+    provenance: Option<(PathBuf, u64, Vec<u64>)>,
 ) -> Result<Tracer<T::GlobalState>, Error>
 where
     T: Tool + 'static,
 {
-    TracerBuilder::<T>::new(command)
-        .config(config)
-        .injected_syscall_trap(E9PATCH_SYSCALL_TRAP_MARKER, E9PATCH_SYSCALL_TRAP_RIP)
-        .spawn()
-        .await
+    let builder = TracerBuilder::<T>::new(command).config(config);
+    let builder = if let Some((image, image_entry_address, patched_site_addresses)) = provenance {
+        builder.site_validated_injected_syscall_trap(
+            E9PATCH_SYSCALL_TRAP_MARKER,
+            E9PATCH_SYSCALL_TRAP_RIP,
+            image,
+            image_entry_address,
+            patched_site_addresses,
+        )?
+    } else {
+        builder
+    };
+    builder.spawn().await
 }
 
 /// Hybrid e9patch backend with ptrace lifecycle and full `Guest` semantics.
@@ -254,12 +263,14 @@ impl E9patchBackend {
                 ":: Backend: e9patch hybrid; recovered_sites=0; patched_sites=0; b0_sites=0; event_source=ptrace; controller=ptrace; ldpreload={ldpreload}; main_executable=non-ELF"
             );
             command.program(&source).arg0(arg0);
-            let tracer = spawn_tracer::<T>(command, config).await?;
+            let tracer = spawn_tracer::<T>(command, config, None).await?;
             return Ok((tracer, ExecutableResource::Original));
         }
 
         let prepared = E9patchRewriter::from_env()?.prepare(&source)?;
         let report = prepared.report();
+        let image_entry_address = report.image_entry_address();
+        let patched_site_addresses = report.patched_site_addresses().to_vec();
         // TODO-HUMAN-REVIEW(PR-103): Review the stable backend coverage diagnostic.
         let event_source = if report.patched_sites() == 0 {
             "ptrace"
@@ -278,7 +289,7 @@ impl E9patchBackend {
         // TODO-HUMAN-REVIEW(PR-103): Review zero-site original-image execution.
         if report.patched_sites() == 0 {
             command.program(&source).arg0(arg0);
-            let tracer = spawn_tracer::<T>(command, config).await?;
+            let tracer = spawn_tracer::<T>(command, config, None).await?;
             return Ok((tracer, ExecutableResource::Original));
         }
 
@@ -297,19 +308,28 @@ impl E9patchBackend {
         executable.as_file().set_permissions(permissions)?;
         let executable = executable.into_temp_path();
 
-        let resource = if preserve_executable {
+        let (resource, mapped_image) = if preserve_executable {
             let overlay = ExecutableOverlay::mount(&executable, &source)?;
             command.program(&source).arg0(arg0);
-            ExecutableResource::Overlay {
-                mount: overlay,
-                backing_path: executable,
-            }
+            (
+                ExecutableResource::Overlay {
+                    mount: overlay,
+                    backing_path: executable,
+                },
+                source,
+            )
         } else {
             command.program(&executable).arg0(arg0);
-            ExecutableResource::Temporary(executable)
+            let mapped_image = executable.to_path_buf();
+            (ExecutableResource::Temporary(executable), mapped_image)
         };
 
-        let spawn_result = spawn_tracer::<T>(command, config).await;
+        let spawn_result = spawn_tracer::<T>(
+            command,
+            config,
+            Some((mapped_image, image_entry_address, patched_site_addresses)),
+        )
+        .await;
         match spawn_result {
             Ok(tracer) => Ok((tracer, resource)),
             Err(error) => {

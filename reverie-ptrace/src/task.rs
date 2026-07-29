@@ -10,8 +10,11 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fmt;
 use std::ops::DerefMut;
+use std::os::unix::ffi::OsStringExt;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -156,10 +159,166 @@ enum HandleSignalResult {
     /// signal needs to be delivered.
     SignalToDeliver(Stopped, Signal),
 }
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct InjectedSyscallTrap {
     pub(crate) marker: u64,
     pub(crate) rip: u64,
+    pub(crate) provenance: Option<InjectedSyscallProvenance>,
+}
+
+#[derive(Clone)]
+pub(crate) struct InjectedSyscallProvenance {
+    pub(crate) image: PathBuf,
+    pub(crate) image_inode: u64,
+    pub(crate) image_entry_address: u64,
+    pub(crate) patched_site_addresses: Arc<[u64]>,
+}
+
+#[derive(Debug)]
+struct GuestMap {
+    start: u64,
+    end: u64,
+    executable: bool,
+    inode: u64,
+    path: Option<PathBuf>,
+}
+
+impl GuestMap {
+    fn contains(&self, address: u64) -> bool {
+        self.start <= address && address < self.end
+    }
+}
+
+fn guest_maps(pid: Pid) -> Option<Vec<GuestMap>> {
+    let maps = std::fs::read(format!("/proc/{pid}/maps")).ok()?;
+    Some(
+        maps.split(|byte| *byte == b'\n')
+            .filter_map(parse_guest_map)
+            .collect(),
+    )
+}
+
+fn next_proc_maps_field<'a>(line: &'a [u8], cursor: &mut usize) -> Option<&'a [u8]> {
+    while line.get(*cursor).is_some_and(u8::is_ascii_whitespace) {
+        *cursor += 1;
+    }
+    let start = *cursor;
+    while line
+        .get(*cursor)
+        .is_some_and(|byte| !byte.is_ascii_whitespace())
+    {
+        *cursor += 1;
+    }
+    (start < *cursor).then(|| &line[start..*cursor])
+}
+
+fn parse_guest_map(line: &[u8]) -> Option<GuestMap> {
+    let mut cursor = 0;
+    let range = std::str::from_utf8(next_proc_maps_field(line, &mut cursor)?).ok()?;
+    let permissions = next_proc_maps_field(line, &mut cursor)?;
+    let offset = std::str::from_utf8(next_proc_maps_field(line, &mut cursor)?).ok()?;
+    let device = std::str::from_utf8(next_proc_maps_field(line, &mut cursor)?).ok()?;
+    let inode = std::str::from_utf8(next_proc_maps_field(line, &mut cursor)?).ok()?;
+
+    let (start, end) = range.split_once('-')?;
+    let start = u64::from_str_radix(start, 16).ok()?;
+    let end = u64::from_str_radix(end, 16).ok()?;
+    u64::from_str_radix(offset, 16).ok()?;
+    let (device_major, device_minor) = device.split_once(':')?;
+    u64::from_str_radix(device_major, 16).ok()?;
+    u64::from_str_radix(device_minor, 16).ok()?;
+    let inode = inode.parse::<u64>().ok()?;
+
+    while line.get(cursor) == Some(&b' ') {
+        cursor += 1;
+    }
+    let path = (cursor < line.len()).then(|| decode_proc_maps_path(&line[cursor..]));
+    Some(GuestMap {
+        start,
+        end,
+        executable: permissions.get(2) == Some(&b'x'),
+        inode,
+        path,
+    })
+}
+
+fn decode_proc_maps_path(bytes: &[u8]) -> PathBuf {
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\'
+            && index + 3 < bytes.len()
+            && bytes[index + 1..index + 4]
+                .iter()
+                .all(|byte| matches!(byte, b'0'..=b'7'))
+        {
+            let value = u16::from(bytes[index + 1] - b'0') * 64
+                + u16::from(bytes[index + 2] - b'0') * 8
+                + u16::from(bytes[index + 3] - b'0');
+            if let Ok(value) = u8::try_from(value) {
+                decoded.push(value);
+                index += 4;
+                continue;
+            }
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    PathBuf::from(OsString::from_vec(decoded))
+}
+
+fn guest_auxv_entry(pid: Pid, key: u64) -> Option<u64> {
+    let bytes = std::fs::read(format!("/proc/{pid}/auxv")).ok()?;
+    bytes.as_chunks::<16>().0.iter().find_map(|entry| {
+        let entry_key = u64::from_ne_bytes(entry[..8].try_into().ok()?);
+        let value = u64::from_ne_bytes(entry[8..].try_into().ok()?);
+        (entry_key == key).then_some(value)
+    })
+}
+
+impl InjectedSyscallTrap {
+    // TODO-HUMAN-REVIEW(PR-271): Review rewritten-image load-bias and patched-site
+    // collision filtering before Tool dispatch.
+    fn validates_site_provenance(
+        &self,
+        pid: Pid,
+        trap_rip: u64,
+        frame: &InjectedSyscallFrame,
+    ) -> bool {
+        let Some(provenance) = &self.provenance else {
+            return trap_rip == self.rip;
+        };
+        let Some(maps) = guest_maps(pid) else {
+            return false;
+        };
+        let matches_image = |mapping: &&GuestMap| {
+            mapping.inode == provenance.image_inode
+                && mapping.path.as_ref() == Some(&provenance.image)
+        };
+        let Some(load_bias) = guest_auxv_entry(pid, libc::AT_ENTRY)
+            .and_then(|entry| entry.checked_sub(provenance.image_entry_address))
+        else {
+            return false;
+        };
+        self.rip.checked_add(load_bias) == Some(trap_rip)
+            && maps
+                .iter()
+                .filter(matches_image)
+                .any(|mapping| mapping.executable && mapping.contains(trap_rip))
+            && maps
+                .iter()
+                .filter(matches_image)
+                .any(|mapping| mapping.executable && mapping.contains(frame.instruction_pointer()))
+            && frame
+                .instruction_pointer()
+                .checked_sub(load_bias)
+                .is_some_and(|address| {
+                    provenance
+                        .patched_site_addresses
+                        .binary_search(&address)
+                        .is_ok()
+                })
+    }
 }
 
 /// All the info needed to be able to interact with the global state.
@@ -188,7 +347,7 @@ impl<G: GlobalTool> Clone for GlobalState<G> {
             gs_ref: self.gs_ref.clone(),
             subscriptions: self.subscriptions.clone(),
             sequentialized_guest: self.sequentialized_guest.clone(),
-            injected_syscall_trap: self.injected_syscall_trap,
+            injected_syscall_trap: self.injected_syscall_trap.clone(),
         }
     }
 }
@@ -374,7 +533,7 @@ impl<L: Tool> TracedTask<L> {
                     .map(|s| s.sequentialized_guest)
                     .unwrap_or(false),
             ),
-            injected_syscall_trap: options.injected_syscall_trap,
+            injected_syscall_trap: options.injected_syscall_trap.clone(),
         };
         let thread_state = process_state.init_thread_state(tid, None);
         let (next_state, next_state_rx) = mpsc::channel(1);
@@ -1207,17 +1366,18 @@ impl<L: Tool + 'static> TracedTask<L> {
             .is_some_and(|action| matches!(action, ResumeAction::Step(_)));
         let mut regs = task.getregs()?;
         // TODO-HUMAN-REVIEW(PR-103): Review rewritten-trap provenance validation.
-        if let Some(trap) = self.global_state.injected_syscall_trap
+        if let Some(trap) = self.global_state.injected_syscall_trap.as_ref()
             && regs.rax == trap.marker
-            && regs.ip() == trap.rip
-            && self
-                .read_injected_syscall_frame(&task, regs.rdi as usize)
-                .is_ok()
         {
-            let next_state = self
-                .handle_injected_syscall(task, regs.rdi as usize, regs.eflags)
-                .await?;
-            return Ok(HandleSignalResult::SignalSuppressed(next_state));
+            if let Ok(frame) = self.read_injected_syscall_frame(&task, regs.rdi as usize)
+                && trap.validates_site_provenance(task.pid(), regs.ip(), &frame)
+            {
+                let next_state = self
+                    .handle_injected_syscall(task, regs.rdi as usize, regs.eflags)
+                    .await?;
+                return Ok(HandleSignalResult::SignalSuppressed(next_state));
+            }
+            return Ok(HandleSignalResult::SignalToDeliver(task, Signal::SIGTRAP));
         }
 
         let rip_minus_one = regs.ip() - 1;
@@ -2805,6 +2965,18 @@ impl<'a, G: GlobalTool> GlobalRPC<G> for WrappedFrom<'a, G> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proc_maps_paths_preserve_literal_whitespace_and_decode_octal_escapes() {
+        let mapping = parse_guest_map(
+            br"00400000-00401000 r-xp 00000000 08:02 123 /tmp/a  double	tab\040space\011escaped\134slash",
+        )
+        .unwrap();
+        assert_eq!(
+            mapping.path.unwrap(),
+            PathBuf::from("/tmp/a  double\ttab space\tescaped\\slash")
+        );
+    }
 
     #[test]
     fn cancellable_returns_a_completed_result() {
