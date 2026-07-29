@@ -236,6 +236,10 @@ guest for this opt-in path and returns its exit status without capturing or
 overriding the command's stdio, matching LiteInst's explicit-preload launch.
 Caller-created stdout and stderr pipes are drained concurrently and discarded,
 so output beyond pipe capacity cannot deadlock a status-only launch.
+`run_direct` resolves the same launch from `REVERIE_E9PATCH_TOOL_PRELOAD`, which
+must name a tool-specific DSO embedding the same concrete `T`. This selector is
+distinct from `REVERIE_E9PATCH_PRELOAD`, which locates the shared built-in
+runtime rather than an arbitrary Tool DSO.
 `run_direct_with_output_and_preload` remains available when the caller needs
 captured stdout and stderr. The legacy coordinator environment contract remains
 available for existing tool DSOs. New selectors use

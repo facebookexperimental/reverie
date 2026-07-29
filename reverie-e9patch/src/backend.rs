@@ -50,6 +50,12 @@ const PRELOAD_BOOTSTRAP_MAGIC: &[u8; 16] = b"REVERIE-E9-V1\0\0\0";
 const PRELOAD_BOOTSTRAP_HEADER_BYTES: usize = PRELOAD_BOOTSTRAP_MAGIC.len() + 4;
 const PRELOAD_BOOTSTRAP_MAX_BYTES: usize = 4096;
 
+/// Environment variable naming a tool-specific DSO for [`E9patchBackend::run_direct`].
+///
+/// The DSO must embed the same concrete `T` and install it from a constructor,
+/// matching LiteInst's `REVERIE_LITEINST_TOOL_PRELOAD` contract.
+pub const TOOL_PRELOAD_ENV: &str = "REVERIE_E9PATCH_TOOL_PRELOAD";
+
 /// Coordinator path and opaque tool-specific bytes consumed by an e9patch
 /// preload constructor.
 pub struct PreloadBootstrap {
@@ -397,6 +403,24 @@ where
 pub struct E9patchBackend;
 
 impl E9patchBackend {
+    /// Runs a generic Tool through the direct AOT callback using the preload
+    /// named by [`TOOL_PRELOAD_ENV`].
+    ///
+    /// This is the direct e9patch analog of LiteInst's environment-selected
+    /// backend launch. It deliberately does not replace [`Backend::run`],
+    /// which remains ptrace-hosted until the direct path covers the full guest
+    /// lifecycle.
+    pub async fn run_direct<T>(
+        command: Command,
+        config: <T::GlobalState as GlobalTool>::Config,
+    ) -> Result<(ExitStatus, T::GlobalState), Error>
+    where
+        T: Tool + 'static,
+    {
+        let preload = tool_preload_path()?;
+        Self::run_direct_with_preload::<T>(command, config, preload).await
+    }
+
     /// Runs a generic Tool through e9patch's direct AOT callback without
     /// capturing the guest's output.
     ///
@@ -757,6 +781,24 @@ fn wait_without_output(mut child: std::process::Child) -> io::Result<std::proces
     Ok(status)
 }
 
+fn tool_preload_path_from(value: Option<OsString>) -> io::Result<PathBuf> {
+    let path = value
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, TOOL_PRELOAD_ENV))?;
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{TOOL_PRELOAD_ENV}={} is not a file", path.display()),
+        ))
+    }
+}
+
+fn tool_preload_path() -> io::Result<PathBuf> {
+    tool_preload_path_from(std::env::var_os(TOOL_PRELOAD_ENV))
+}
+
 async fn launch_direct<T>(
     mut command: Command,
     config: <T::GlobalState as GlobalTool>::Config,
@@ -1044,6 +1086,25 @@ mod tests {
         };
         waiter.join().unwrap();
         assert!(result.unwrap().success());
+    }
+
+    #[test]
+    fn tool_preload_path_requires_a_file() {
+        let error = tool_preload_path_from(None).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(error.to_string(), TOOL_PRELOAD_ENV);
+
+        let directory = tempfile::tempdir().unwrap();
+        let error =
+            tool_preload_path_from(Some(directory.path().as_os_str().to_owned())).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("is not a file"), "{error}");
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        assert_eq!(
+            tool_preload_path_from(Some(file.path().as_os_str().to_owned())).unwrap(),
+            file.path()
+        );
     }
 
     #[test]

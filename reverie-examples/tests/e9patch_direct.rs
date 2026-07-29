@@ -6,6 +6,7 @@ use reverie::ExitStatus;
 use reverie::process::Command;
 use reverie::process::Stdio;
 use reverie_e9patch::E9patchBackend;
+use reverie_e9patch::TOOL_PRELOAD_ENV;
 use reverie_examples::e9patch_smoke::AotCounterTool;
 
 fn compile_guest() -> (tempfile::TempDir, PathBuf) {
@@ -106,6 +107,39 @@ async fn status_only_launch_returns_exit_status_and_global_state() {
         E9patchBackend::run_direct_with_preload::<AotCounterTool>(command, (), example_preload())
             .await
             .unwrap();
+    assert_eq!(status, ExitStatus::Exited(0));
+    assert_eq!(global.delivered(), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires a built e9tool/e9patch pair"]
+async fn environment_selected_preload_runs_status_only_tool() {
+    const CHILD_ENV: &str = "REVERIE_E9PATCH_TOOL_PRELOAD_TEST_CHILD";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let status = ProcessCommand::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "environment_selected_preload_runs_status_only_tool",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .env(TOOL_PRELOAD_ENV, example_preload())
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "isolated preload-env test failed: {status}"
+        );
+        return;
+    }
+
+    let (_directory, guest) = compile_guest();
+    let mut command = Command::new(guest);
+    command.env("REVERIE_E9PATCH_EXAMPLE_TOOL", "e9patch-smoke");
+    let (status, global) = E9patchBackend::run_direct::<AotCounterTool>(command, ())
+        .await
+        .unwrap();
     assert_eq!(status, ExitStatus::Exited(0));
     assert_eq!(global.delivered(), 1);
 }

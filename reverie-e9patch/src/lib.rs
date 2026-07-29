@@ -62,6 +62,7 @@ mod tool_host;
 
 pub use backend::E9patchBackend;
 pub use backend::PreloadBootstrap;
+pub use backend::TOOL_PRELOAD_ENV;
 pub use backend::take_preload_bootstrap;
 pub use dispatch::E9patchDispatcher;
 // Re-exported from the shared crate so a consumer selecting an e9patch built-in
