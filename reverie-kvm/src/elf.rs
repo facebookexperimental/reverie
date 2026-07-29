@@ -653,7 +653,7 @@ fn parse_shebang(image: &[u8]) -> Result<Option<(String, Option<String>)>> {
 }
 
 // TODO-HUMAN-REVIEW(PR-92): Review PATH and cwd executable resolution.
-fn resolve_executable_path(argv0: &str, envp: &[&str], cwd: &Path) -> Result<PathBuf> {
+pub(crate) fn resolve_executable_path(argv0: &str, envp: &[&str], cwd: &Path) -> Result<PathBuf> {
     let path = Path::new(argv0);
     if path.is_absolute() || path.components().count() > 1 {
         let candidate = if path.is_absolute() {
@@ -1072,5 +1072,50 @@ mod tests {
             Some(("/usr/bin/grep".to_string(), Some("-E".to_string())))
         );
         assert_eq!(parse_shebang(b"\x7fELF").unwrap(), None);
+    }
+
+    // TODO-HUMAN-REVIEW(PR-kvm-execve-path): Covers PATH resolution of a
+    // slash-less execve program name, the behavior prepare_exec now relies on
+    // so `execve("bash", ...)` matches the ptrace initial launcher instead of
+    // returning ENOENT.
+    #[test]
+    fn resolves_bare_program_name_via_path() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir =
+            std::env::temp_dir().join(format!("reverie-kvm-execve-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = dir.join("bash");
+        let mut file = std::fs::File::create(&program).unwrap();
+        file.write_all(b"\x7fELF").unwrap();
+        let mut perms = file.metadata().unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&program, perms).unwrap();
+
+        let path_env = format!("PATH={}", dir.display());
+        let cwd = std::env::current_dir().unwrap();
+
+        // A bare name is searched on PATH and resolves to the canonical file.
+        let resolved = resolve_executable_path("bash", &[path_env.as_str()], &cwd).unwrap();
+        assert_eq!(resolved, program.canonicalize().unwrap());
+
+        // A bare name absent from PATH is unresolved, not silently joined to cwd.
+        assert!(
+            resolve_executable_path("definitely-not-on-path", &[path_env.as_str()], &cwd).is_err()
+        );
+
+        // A name containing a slash keeps execve(2) semantics: resolved against
+        // cwd, never PATH-searched.
+        let relative = program.strip_prefix(&cwd).ok();
+        if let Some(relative) = relative {
+            let via_cwd =
+                resolve_executable_path(&relative.to_string_lossy(), &["PATH=/nonexistent"], &cwd)
+                    .unwrap();
+            assert_eq!(via_cwd, program.canonicalize().unwrap());
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

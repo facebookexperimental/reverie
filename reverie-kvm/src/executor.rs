@@ -30,6 +30,7 @@ use crate::elf::GuestFileIdentityEntry;
 use crate::elf::LoadedStaticElf;
 use crate::elf::STACK_LIMIT;
 use crate::elf::load_static_elf;
+use crate::elf::resolve_executable_path;
 use crate::runtime::SyscallExecutor;
 
 const MAX_HOST_IO: usize = 16 * 1024 * 1024;
@@ -1310,10 +1311,31 @@ impl ElfExecutor {
             Err(error) => return error,
         };
         let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(path));
-        let path = if path.is_absolute() {
-            path
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-kvm-execve-path): PATH resolution for a
+        // slash-less execve program name. A bare name such as
+        // `execve("bash", ...)` must be searched on PATH the same way the
+        // initial ELF loader (elf::resolve_executable_path) and libc's execvp
+        // do; joining a bare name onto cwd yields ENOENT and breaks every
+        // KVM-backend corpus example launched by bare name (bash/python3).
+        // Under the ptrace backend the initial launcher resolves the program
+        // via execvp before the guest starts, so this restores parity for the
+        // initial exec that Detcore re-injects with a rewritten path pointer.
+        // Names that already contain a slash keep exact execve(2) semantics
+        // (absolute used as-is, relative resolved against cwd) and are NOT
+        // PATH-searched.
+        let path = if path.is_absolute() || path.components().count() > 1 {
+            if path.is_absolute() {
+                path
+            } else {
+                self.state.cwd.join(path)
+            }
         } else {
-            self.state.cwd.join(path)
+            let envp_refs = envp.iter().map(String::as_str).collect::<Vec<_>>();
+            match resolve_executable_path(&path.to_string_lossy(), &envp_refs, &self.state.cwd) {
+                Ok(resolved) => resolved,
+                Err(_) => return negative_errno(libc::ENOENT),
+            }
         };
         let image = match std::fs::read(&path) {
             Ok(image) => image,
