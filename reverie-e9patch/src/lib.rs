@@ -22,11 +22,12 @@
 //! [`SyscallDispatcher`](reverie_preload::dispatch::SyscallDispatcher) seam.
 //! Both register dispatchers under the same
 //! [`InProcessSeccomp`](reverie_preload::lifecycle::InProcessSeccomp)
-//! controller. E9patch's AOT trampoline calls the registered shared built-in
-//! dispatcher directly in ordinary guest context. The generic
-//! [`E9patchBackend<T>`](E9patchBackend) deliberately leaves that callback
-//! unpublished, so rewritten sites retain the ptrace trap and cannot bypass
-//! the selected `T: Tool`.
+//! controller. E9patch's AOT trampoline calls the registered dispatcher
+//! directly in ordinary guest context. Shared built-ins use the common preload
+//! dispatcher; an opt-in tool-specific DSO calls [`install_tool`] to host a
+//! concrete generic `Tool` with coordinator RPC. The default
+//! [`E9patchBackend<T>`](E9patchBackend) still leaves that callback unpublished,
+//! so its production ptrace path cannot bypass the selected `T: Tool`.
 //!
 //! The **only** intended differences are:
 //!
@@ -55,7 +56,9 @@ mod aot;
 mod backend;
 pub mod dispatch;
 mod rewrite;
+mod rpc;
 pub mod runtime;
+mod tool_host;
 
 pub use backend::E9patchBackend;
 pub use dispatch::E9patchDispatcher;
@@ -79,6 +82,12 @@ pub use runtime::TOOL_PASSTHROUGH;
 pub use runtime::TOOL_SPOOF_GETPID;
 pub use runtime::alt_stack_from_env_value;
 pub use runtime::builtin_tool_from_env_value;
+pub use tool_host::install_tool;
+
+/// Environment variable naming the generic-Tool coordinator socket.
+// TODO-HUMAN-REVIEW(PR-269): Review the inherited
+// coordinator-path bootstrap for the first generic e9patch Tool-host slice.
+pub const COORDINATOR_ENV: &str = "REVERIE_E9PATCH_COORDINATOR";
 
 /// Environment variable overriding the located e9patch preload library path.
 ///

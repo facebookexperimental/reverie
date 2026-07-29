@@ -136,6 +136,19 @@ impl InjectedSyscallFrame {
         regs.rip = self.rip + 2;
         regs.eflags = self.native_rflags(regs.eflags);
     }
+
+    // TODO-HUMAN-REVIEW(PR-269): Review exposing the
+    // complete AOT register view to the in-process generic Tool host.
+    /// Returns the register view a Tool observes at this rewritten syscall.
+    ///
+    /// `trap_rflags` is the native flags value captured by the AOT call bridge
+    /// before its provenance checks modify flags.
+    pub fn user_regs(&self, trap_rflags: u64) -> libc::user_regs_struct {
+        let mut regs = unsafe { core::mem::zeroed::<libc::user_regs_struct>() };
+        regs.eflags = trap_rflags;
+        self.copy_to_user_regs(&mut regs);
+        regs
+    }
     // TODO-HUMAN-REVIEW(PR-103): Review representable rewritten-register updates.
     pub(crate) fn validate_user_regs_update(
         current: &libc::user_regs_struct,
@@ -179,6 +192,21 @@ impl InjectedSyscallFrame {
         self.flags = Self::e9_flags(regs.eflags);
         // e9tool documents RIP as read-only in this frame. Control flow still
         // returns to the instruction following the replaced syscall.
+    }
+
+    // TODO-HUMAN-REVIEW(PR-269): Review writable AOT
+    // register updates from the in-process generic Guest implementation.
+    /// Applies a Tool-requested register update when the e9tool frame can
+    /// represent it, rejecting control-flow and segment changes.
+    pub fn update_user_regs(
+        &mut self,
+        requested: &libc::user_regs_struct,
+        trap_rflags: u64,
+    ) -> Result<(), Errno> {
+        let current = self.user_regs(trap_rflags);
+        Self::validate_user_regs_update(&current, requested)?;
+        self.copy_from_user_regs(requested);
+        Ok(())
     }
 
     fn native_rflags(&self, base: u64) -> u64 {
@@ -263,9 +291,7 @@ mod tests {
     fn user_register_round_trip_preserves_writable_fields() {
         let mut frame = frame();
         frame.emulate_syscall_entry(0x202);
-        let mut regs = unsafe { core::mem::zeroed::<libc::user_regs_struct>() };
-        regs.eflags = 0x202;
-        frame.copy_to_user_regs(&mut regs);
+        let mut regs = frame.user_regs(0x202);
         assert_eq!(regs.orig_rax, libc::SYS_write as u64);
         assert_eq!(regs.rip, 0x401002);
         assert_eq!(regs.eflags, 0x246);
@@ -273,7 +299,7 @@ mod tests {
         regs.rax = 99;
         regs.rdi = 42;
         regs.eflags = 0x203;
-        frame.copy_from_user_regs(&regs);
+        frame.update_user_regs(&regs, 0x202).unwrap();
         assert_eq!(frame.rax, 99);
         assert_eq!(frame.rdi, 42);
         assert_eq!(frame.rip, 0x401000);

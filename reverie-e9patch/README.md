@@ -116,16 +116,23 @@ it.
    through the shared seam — `install_runtime` (in-process) and
    `install_hybrid_runtime` (ptrace-hosted) sit side by side and differ only by
    the controller they hand to the identical `reverie_preload::install`.
-4. **Which tools can use direct in-guest dispatch today.** Shared built-ins
-   publish e9patch's AOT callback and run directly. Generic `T: Tool` remains
-   ptrace-hosted until Reverie has a type-erased remote-`Guest` protocol; its
-   preload leaves the callback unpublished so no rewritten site can bypass `T`.
+4. **How a generic tool is selected.** Shared built-ins live in
+   `reverie-preload`. A generic `T: Tool` instead lives in a tool-specific DSO,
+   matching LiteInst: its constructor calls `install_tool::<T>`, connects to the
+   coordinator, and publishes the AOT callback. The production
+   `Backend::run<T>` path remains ptrace-hosted; the direct path is an explicit
+   `run_direct_with_output_and_preload` harness while its lifecycle boundary is
+   still single-process and single-thread.
 
-In shared built-in mode, AOT-rewritten sites dispatch directly and the shared
-SIGSYS dispatcher is reached only by residual sites e9patch could not rewrite
-(dynamic loader/startup code, vDSO, uncovered or JIT-emitted code). In the
-generic `E9patchBackend<T>` path, the AOT callback stays null and rewritten sites
-retain the marker/int3 ptrace route so the selected `T` remains authoritative.
+In shared built-in and opt-in generic-tool modes, AOT-rewritten sites dispatch
+directly. The shared SIGSYS dispatcher is reached only by residual sites e9patch
+could not rewrite (dynamic loader/startup code, vDSO, uncovered or JIT-emitted
+code). A generic host forwards residual syscalls outside `T::subscriptions`
+through the shared guards and fails a subscribed residual with `EOPNOTSUPP`,
+because arbitrary Rust Tool code cannot run safely in signal context. In the
+default `E9patchBackend<T>` path, the AOT callback stays null and rewritten
+sites retain the marker/int3 ptrace route so the selected `T` remains
+authoritative.
 
 ### Fallback-Surface Observability
 
@@ -202,20 +209,20 @@ Built-in tools run under the shared isolated in-process controller (the
 demo/testing path, matching reverie-preload's standalone cdylib), not the
 ptrace-hosted production controller.
 
-What remains **not yet on the active backend path** is arbitrary-tool in-guest
-dispatch — the same constraint LiteInst faces:
+Generic Tool dispatch is now available through the same typed-DSO model as
+LiteInst. `install_tool::<T>` owns per-thread `ThreadState`, implements an
+in-process `Guest<T>` over the e9tool register frame and local memory, routes
+`GlobalRPC` over the shared UDS/bincode protocol, runs start/post-exec/exit
+callbacks, and protects nested Tool syscalls plus the coordinator descriptor.
+`E9patchBackend::run_direct_with_output_and_preload` owns the coordinator and
+rewritten guest for this opt-in path.
 
-- an injected C payload cannot contain the arbitrary Rust `T: Tool` selected
-  by `Backend::run`;
-- the shared RPC transport carries `GlobalTool` requests, not syscall events
-  or remote `Guest` operations.
-
-`E9patchBackend::run` therefore still drives rewritten sites through ptrace
-today; the shared preload runtime is installed as the fail-closed fallback for
-un-rewritten sites. Moving the arbitrary-tool fast path fully in-guest requires
-a type-erased remote-Guest protocol (or a Detcore-specific loadable runtime),
-tracked as the next increment. Until then, the ptrace controller remains the
-complete slow path and `Guest` owner.
+`E9patchBackend::run` deliberately still drives generic tools through ptrace:
+the direct host does not yet cover process trees, exec rebootstrap, guest signal
+handlers, timers/RCB events, or subscribed syscalls in residual shared-library
+sites; its harness also executes the materialized rewrite path rather than the
+original executable identity. The next increment is lifecycle expansion and a
+production controller decision, not another Tool ABI.
 
 ## Toolchain
 
@@ -224,7 +231,7 @@ dependencies. Activate and build it explicitly:
 
 ```bash
 scripts/backend-submodule.sh activate e9patch
-make -C third-party/e9patch
+make -C third-party/e9patch -j8 release
 ```
 
 Set `REVERIE_E9TOOL` and `REVERIE_E9PATCH_BACKEND` when the executables are

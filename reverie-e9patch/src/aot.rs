@@ -8,13 +8,78 @@
 
 //! Direct-dispatch bridge for e9patch's ahead-of-time syscall trampolines.
 
+use std::cell::Cell;
 use std::io;
+use std::ptr;
 
 use reverie_ptrace::InjectedSyscallFrame;
 
 include!(concat!(env!("OUT_DIR"), "/aot_dispatch_constants.rs"));
 
 const PAGE_SIZE: usize = 4096;
+
+// TODO-HUMAN-REVIEW(PR-269): Review thread-local AOT
+// frame ownership and nested-dispatch restoration for generic Guest access.
+thread_local! {
+    /// The innermost e9tool frame currently being serviced on this thread.
+    static CURRENT_FRAME: Cell<*mut InjectedSyscallFrame> = const { Cell::new(ptr::null_mut()) };
+    static CURRENT_RFLAGS: Cell<u64> = const { Cell::new(0) };
+    static DISPATCH_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+struct CurrentFrameScope {
+    previous_frame: *mut InjectedSyscallFrame,
+    previous_rflags: u64,
+}
+
+impl CurrentFrameScope {
+    fn enter(frame: *mut InjectedSyscallFrame, trap_rflags: u64) -> Self {
+        let previous_frame = CURRENT_FRAME.with(|slot| slot.replace(frame));
+        let previous_rflags = CURRENT_RFLAGS.with(|slot| slot.replace(trap_rflags));
+        DISPATCH_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        Self {
+            previous_frame,
+            previous_rflags,
+        }
+    }
+}
+
+impl Drop for CurrentFrameScope {
+    fn drop(&mut self) {
+        CURRENT_FRAME.with(|slot| slot.set(self.previous_frame));
+        CURRENT_RFLAGS.with(|slot| slot.set(self.previous_rflags));
+        DISPATCH_DEPTH.with(|depth| depth.set(depth.get() - 1));
+    }
+}
+
+pub(crate) fn dispatch_is_active() -> bool {
+    DISPATCH_DEPTH.with(|depth| depth.get() != 0)
+}
+
+pub(crate) fn dispatch_is_nested() -> bool {
+    DISPATCH_DEPTH.with(|depth| depth.get() > 1)
+}
+
+pub(crate) fn current_regs() -> Option<libc::user_regs_struct> {
+    let frame = CURRENT_FRAME.with(Cell::get);
+    if frame.is_null() {
+        return None;
+    }
+    let rflags = CURRENT_RFLAGS.with(Cell::get);
+    // SAFETY: the AOT callback owns this frame for the enclosing scope.
+    Some(unsafe { (&*frame).user_regs(rflags) })
+}
+
+pub(crate) fn update_current_regs(regs: &libc::user_regs_struct) -> Result<(), reverie::Errno> {
+    let frame = CURRENT_FRAME.with(Cell::get);
+    if frame.is_null() {
+        return Err(reverie::Errno::ENOSYS);
+    }
+    let rflags = CURRENT_RFLAGS.with(Cell::get);
+    // SAFETY: the AOT callback owns this frame uniquely for the enclosing
+    // scope; nested callbacks replace CURRENT_FRAME until they return.
+    unsafe { (&mut *frame).update_user_regs(regs, rflags) }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -107,18 +172,26 @@ unsafe extern "C" fn reverie_e9patch_dispatch_aot(
     frame: *mut InjectedSyscallFrame,
     trap_rflags: u64,
 ) -> u64 {
-    let frame = unsafe { &mut *frame };
-    let number = frame.syscall_number();
+    let number = unsafe { (&*frame).syscall_number() };
     if number == reverie::syscalls::Sysno::rt_sigreturn {
         return 2;
     }
-    let args = frame.raw_args();
-    let instruction_pointer = frame.instruction_pointer();
-
-    frame.emulate_syscall_entry(trap_rflags);
+    let (args, instruction_pointer) = {
+        // SAFETY: the AOT trampoline lends this unique frame for the duration
+        // of the callback. End the reference before dispatch so the Tool host
+        // can reborrow the raw frame for Guest register access.
+        let frame = unsafe { &mut *frame };
+        let args = frame.raw_args();
+        let instruction_pointer = frame.instruction_pointer();
+        frame.emulate_syscall_entry(trap_rflags);
+        (args, instruction_pointer)
+    };
+    let _scope = CurrentFrameScope::enter(frame, trap_rflags);
     let result =
         reverie_preload::trap::dispatch_direct(number.id() as i64, args, instruction_pointer);
-    frame.set_result(result);
+    // SAFETY: dispatch has returned and no Tool borrow of the current frame is
+    // live; the trampoline still owns the same unique frame.
+    unsafe { (&mut *frame).set_result(result) };
     1
 }
 

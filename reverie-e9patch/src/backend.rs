@@ -9,7 +9,9 @@
 //! Correctness-first hybrid backend for e9patch syscall events.
 
 use std::ffi::CString;
+use std::ffi::OsStr;
 use std::fs::File;
+use std::future::Future;
 use std::io;
 use std::io::Read;
 use std::io::Write;
@@ -18,6 +20,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::ptr;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use reverie::Backend;
 use reverie::Error;
@@ -28,6 +33,7 @@ use reverie::process::Command;
 use reverie::process::Output;
 use reverie_ptrace::Tracer;
 use reverie_ptrace::TracerBuilder;
+use reverie_rpc_transport::RpcServer;
 
 use crate::E9PATCH_SYSCALL_TRAP_MARKER;
 use crate::E9PATCH_SYSCALL_TRAP_RIP;
@@ -194,6 +200,30 @@ where
 pub struct E9patchBackend;
 
 impl E9patchBackend {
+    // TODO-HUMAN-REVIEW(PR-269): Review the first
+    // ptrace-free generic Tool launch boundary and inherited preload contract.
+    /// Runs a generic Tool through e9patch's direct AOT callback and captures
+    /// the guest's output.
+    ///
+    /// `preload` must be a tool-specific DSO that embeds the same concrete `T`
+    /// and calls [`crate::install_tool::<T>`] from its constructor. The
+    /// coordinator path is inherited through [`crate::COORDINATOR_ENV`]. This
+    /// opt-in harness is intentionally separate from [`Backend::run`], whose
+    /// ptrace lifecycle remains the production default while direct-tool
+    /// lifecycle coverage is still single-process and single-thread.
+    pub async fn run_direct_with_output_and_preload<T>(
+        mut command: Command,
+        config: <T::GlobalState as GlobalTool>::Config,
+        preload: impl Into<PathBuf>,
+    ) -> Result<(Output, T::GlobalState), Error>
+    where
+        T: Tool + 'static,
+    {
+        command.stdout(reverie::process::Stdio::piped());
+        command.stderr(reverie::process::Stdio::piped());
+        launch_direct::<T>(command, config, preload.into()).await
+    }
+
     async fn spawn<T>(
         mut command: Command,
         config: <T::GlobalState as GlobalTool>::Config,
@@ -361,6 +391,173 @@ impl E9patchBackend {
             (Ok(_), Err(error)) => Err(error.into()),
         }
     }
+}
+
+async fn launch_direct<T>(
+    mut command: Command,
+    config: <T::GlobalState as GlobalTool>::Config,
+    preload: PathBuf,
+) -> Result<(Output, T::GlobalState), Error>
+where
+    T: Tool + 'static,
+{
+    if !preload.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("tool preload {} is not a file", preload.display()),
+        )
+        .into());
+    }
+    let preload = preload.canonicalize()?;
+    let source = command.find_program()?;
+    if !is_elf_file(&source)? {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "direct e9patch Tool hosting requires an ELF main executable",
+        )
+        .into());
+    }
+    let arg0 = command.get_arg0().to_owned();
+    let prepared = E9patchRewriter::from_env()?.prepare(&source)?;
+    let report = prepared.report();
+    if report.patched_sites() == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "direct e9patch Tool hosting requires at least one recovered syscall site",
+        )
+        .into());
+    }
+    eprintln!(
+        ":: Backend: e9patch direct-tool; recovered_sites={}; patched_sites={}; b0_sites={}; event_source=aot-callback; controller=in-process-seccomp",
+        report.recovered_sites(),
+        report.patched_sites(),
+        report.b0_sites(),
+    );
+
+    let mut executable = tempfile::Builder::new()
+        .prefix("reverie-e9patch-direct-guest-")
+        .tempfile()?;
+    let mut artifact = prepared.artifact()?;
+    io::copy(&mut artifact, executable.as_file_mut())?;
+    executable.as_file_mut().flush()?;
+    let mut permissions = executable.as_file().metadata()?.permissions();
+    permissions.set_mode(0o500);
+    executable.as_file().set_permissions(permissions)?;
+    let executable = executable.into_temp_path();
+    command.program(&executable).arg0(arg0);
+
+    let directory = tempfile::Builder::new()
+        .prefix("reverie-e9patch-coordinator-")
+        .tempdir()?;
+    let socket = directory.path().join("coordinator.sock");
+    let global = Arc::new(T::GlobalState::init_global_state(&config).await);
+    let connected = Arc::new(AtomicBool::new(false));
+    let server = RpcServer::bind_with_connection_readiness(
+        &socket,
+        global.clone(),
+        config,
+        connected.clone(),
+    )
+    .map_err(|error| io::Error::other(error.to_string()))?;
+
+    let mut child_command = command.into_std_lossy();
+    let configured_preload = child_command
+        .get_envs()
+        .find(|(key, _)| *key == OsStr::new("LD_PRELOAD"))
+        .map(|(_, value)| value.map(ToOwned::to_owned));
+    let mut ld_preload = preload.into_os_string();
+    let inherited_preload = match configured_preload {
+        Some(value) => value,
+        None => std::env::var_os("LD_PRELOAD"),
+    };
+    if let Some(existing) = inherited_preload.filter(|value| !value.is_empty()) {
+        ld_preload.push(OsStr::new(":"));
+        ld_preload.push(existing);
+    }
+    child_command
+        .env("LD_PRELOAD", ld_preload)
+        .env(crate::COORDINATOR_ENV, &socket);
+
+    let child = match child_command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = executable.close();
+            return Err(error.into());
+        }
+    };
+    let wait = tokio::task::spawn_blocking(move || child.wait_with_output());
+    let wait = serve_rpc_until(server, async move {
+        wait.await
+            .map_err(|error| io::Error::other(error.to_string()))?
+    })
+    .await?;
+    executable.close()?;
+    if !connected.load(Ordering::Acquire) {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "e9patch guest exited before its Tool preload connected to the coordinator",
+        )
+        .into());
+    }
+    let global = unwrap_global_after_connections(global).await?;
+    Ok((
+        Output {
+            status: wait.status.into(),
+            stdout: wait.stdout,
+            stderr: wait.stderr,
+        },
+        global,
+    ))
+}
+
+async fn serve_rpc_until<G, F, T>(server: RpcServer<G>, completion: F) -> io::Result<T>
+where
+    G: GlobalTool + 'static,
+    F: Future<Output = io::Result<T>>,
+{
+    let mut serving = tokio::task::JoinSet::new();
+    serving.spawn(server.serve());
+    tokio::pin!(completion);
+
+    let result = tokio::select! {
+        biased;
+        result = &mut completion => result,
+        result = serving.join_next() => {
+            let message = match result {
+                Some(Ok(Ok(()))) => "e9patch coordinator stopped unexpectedly".to_owned(),
+                Some(Ok(Err(error))) => error.to_string(),
+                Some(Err(error)) => error.to_string(),
+                None => "e9patch coordinator task disappeared".to_owned(),
+            };
+            return Err(io::Error::other(message));
+        }
+    };
+
+    serving.abort_all();
+    while let Some(server_result) = serving.join_next().await {
+        match server_result {
+            Err(error) if error.is_cancelled() => {}
+            Ok(Ok(())) => {
+                return Err(io::Error::other("e9patch coordinator stopped unexpectedly"));
+            }
+            Ok(Err(error)) => return Err(io::Error::other(error.to_string())),
+            Err(error) => return Err(io::Error::other(error.to_string())),
+        }
+    }
+    result
+}
+
+async fn unwrap_global_after_connections<G>(mut global: Arc<G>) -> io::Result<G> {
+    for _ in 0..1024 {
+        match Arc::try_unwrap(global) {
+            Ok(global) => return Ok(global),
+            Err(still_shared) => global = still_shared,
+        }
+        tokio::task::yield_now().await;
+    }
+    Err(io::Error::other(
+        "e9patch coordinator state still has owners after connection shutdown",
+    ))
 }
 
 #[reverie::backend(?Send)]

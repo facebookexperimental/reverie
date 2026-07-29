@@ -3,6 +3,9 @@
 # here. Keep the internal target above synchronized before the next export.
 # PR-151 promotes reverie-kvm from test-only coverage to the OSS example CLI
 # runner. Keep the internal target above synchronized before the next export.
+# The e9patch generic-Tool round adds the e9patch rlib to this existing
+# tool-specific cdylib so one concrete Tool type can be proven on both sides of
+# the preload/coordinator boundary. Keep the internal target synchronized.
 
 [package]
 name = "reverie-examples"
@@ -74,6 +77,7 @@ anyhow = "1.0.103"
 clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 libc = "0.2.186"
 reverie = { version = "0.1.0", path = "../reverie" }
+reverie-e9patch = { version = "0.1.0", path = "../reverie-e9patch", default-features = false }
 reverie-kvm = { version = "0.1.0", path = "../reverie-kvm" }
 reverie-liteinst = { version = "0.1.0", path = "../reverie-liteinst", default-features = false }
 reverie-ptrace = { version = "0.1.0", path = "../reverie-ptrace" }
@@ -82,3 +86,6 @@ serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

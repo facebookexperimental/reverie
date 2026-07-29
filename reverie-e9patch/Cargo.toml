@@ -27,11 +27,12 @@ anyhow = "1.0.103"
 goblin = { version = "0.10.7", features = ["elf64"] }
 libc = "0.2.186"
 reverie = { version = "0.1.0", path = "../reverie" }
-reverie-preload = { version = "0.1.0", path = "../reverie-preload" }
+reverie-preload = { version = "0.1.0", path = "../reverie-preload", default-features = false, features = ["coordinator-rpc"] }
 reverie-ptrace = { version = "0.1.0", path = "../reverie-ptrace" }
 reverie-rpc-transport = { version = "0.1.0", path = "../reverie-rpc-transport" }
 sha2 = "0.10.9"
 tempfile = "3.26.0"
+tokio = { version = "1.52.4", features = ["net", "rt", "time"] }
 
 [dev-dependencies]
 tokio = { version = "1.52.4", features = ["macros", "rt"] }
