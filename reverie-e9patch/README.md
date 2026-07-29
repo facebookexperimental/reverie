@@ -52,8 +52,9 @@ it.
   (`libreverie_e9patch.so`) plus `rlib`, with a `preload-constructor` feature
   that installs a `.init_array` entry (`reverie_e9patch_initialize`) — exactly
   the shape LiteInst uses. `configure_command` prepends the cdylib to
-  `LD_PRELOAD` and arms the runtime via `REVERIE_E9PATCH_RUNTIME`, mirroring
-  LiteInst's `preload_library_path`/`configure_command`.
+  `LD_PRELOAD` and selects the shared pass-through built-in via
+  `REVERIE_E9PATCH_TOOL`, mirroring LiteInst's
+  `preload_library_path`/`configure_command`.
 - **Fallback ptracer.** `E9patchBackend` runs the guest under Reverie's ptrace
   lifecycle controller, the same correctness-first owner LiteInst falls back to.
 - **The same Reverie hooks.** `E9patchDispatcher` plugs into the shared
@@ -81,8 +82,8 @@ it.
   tool — including the *mutating* `spoof-getpid` demo that returns
   `reverie_preload::SPOOF_PID` from `getpid` — is shared-crate code reviewed
   once, not backend-private. Only the env-var spelling is e9patch's. This proves
-  the e9patch fallback trap path can *mutate* a syscall result, not merely
-  forward it.
+  the e9patch direct AOT path can *mutate* a syscall result, while residual
+  un-rewritten sites still use the shared signal fallback.
 - **The same fork-following seam.** The production dispatcher
   (`E9patchDispatcher::with_fork_reset`) arms reverie-preload's shared
   `fork::ForkHook` through `PassthroughDispatcher::with_fork_hook`, so each
@@ -97,7 +98,7 @@ it.
   hook-less minimal dispatcher, mirroring `PassthroughDispatcher::new` versus
   `with_fork_hook`.
 
-**Different (the only intended differences):**
+**Different:**
 
 1. **When patching happens.** e9patch rewrites every recovered syscall
    instruction **ahead of time** with `e9tool`; LiteInst rewrites each site **at
@@ -115,11 +116,16 @@ it.
    through the shared seam — `install_runtime` (in-process) and
    `install_hybrid_runtime` (ptrace-hosted) sit side by side and differ only by
    the controller they hand to the identical `reverie_preload::install`.
+4. **Which tools can use direct in-guest dispatch today.** Shared built-ins
+   publish e9patch's AOT callback and run directly. Generic `T: Tool` remains
+   ptrace-hosted until Reverie has a type-erased remote-`Guest` protocol; its
+   preload leaves the callback unpublished so no rewritten site can bypass `T`.
 
-Because AOT-rewritten sites never trap, the shared SIGSYS dispatcher is only
-reached by the residual sites e9patch cannot rewrite ahead of time (the dynamic
-loader and startup code, the vDSO, and any uncovered or JIT-emitted site). For
-those the shared fail-closed passthrough policy is exactly correct.
+In shared built-in mode, AOT-rewritten sites dispatch directly and the shared
+SIGSYS dispatcher is reached only by residual sites e9patch could not rewrite
+(dynamic loader/startup code, vDSO, uncovered or JIT-emitted code). In the
+generic `E9patchBackend<T>` path, the AOT callback stays null and rewritten sites
+retain the marker/int3 ptrace route so the selected `T` remains authoritative.
 
 ### Fallback-Surface Observability
 
@@ -190,8 +196,8 @@ The in-guest runtime also exposes reverie-preload's shared **built-in tools**.
 `REVERIE_E9PATCH_TOOL` (which the constructor reads with priority over
 `REVERIE_E9PATCH_RUNTIME`); the constructor then calls the shared
 `reverie_preload::install_builtin`, so the dispatcher is shared-crate code. The
-`spoof-getpid` built-in returns `reverie_preload::SPOOF_PID` from `getpid`,
-demonstrating end to end that the fallback trap path can *mutate* a result.
+`spoof-getpid` built-in returns `reverie_preload::SPOOF_PID` from a rewritten
+`getpid`, demonstrating end to end that the direct AOT path can *mutate* a result.
 Built-in tools run under the shared isolated in-process controller (the
 demo/testing path, matching reverie-preload's standalone cdylib), not the
 ptrace-hosted production controller.

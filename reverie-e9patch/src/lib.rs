@@ -20,12 +20,13 @@
 //! `reverie-preload` runtime, which owns the seccomp filter, the `SIGSYS`
 //! handler, the trusted syscall gate, the fork/signal policy, and the
 //! [`SyscallDispatcher`](reverie_preload::dispatch::SyscallDispatcher) seam.
-//! Both register a dispatcher and install the same
+//! Both register dispatchers under the same
 //! [`InProcessSeccomp`](reverie_preload::lifecycle::InProcessSeccomp)
-//! controller via [`runtime::install_runtime`]. E9patch's AOT trampoline calls
-//! that registered dispatcher directly in ordinary guest context; if the
-//! preload callback is absent, it retains the ptrace trap as a correctness
-//! fallback.
+//! controller. E9patch's AOT trampoline calls the registered shared built-in
+//! dispatcher directly in ordinary guest context. The generic
+//! [`E9patchBackend<T>`](E9patchBackend) deliberately leaves that callback
+//! unpublished, so rewritten sites retain the ptrace trap and cannot bypass
+//! the selected `T: Tool`.
 //!
 //! The **only** intended differences are:
 //!
@@ -138,17 +139,20 @@ fn compose_ld_preload(preload: PathBuf, inherited: Option<OsString>) -> OsString
     value
 }
 
-/// Configures a `std::process::Command` guest to load the e9patch preload
-/// runtime in the self-contained in-process fallback mode.
+/// Configures a `std::process::Command` guest to load the e9patch preload with
+/// the self-contained shared pass-through built-in.
 ///
-/// Prepends the located cdylib to `LD_PRELOAD` and arms the runtime via
-/// [`RUNTIME_ENV`]. This is the *same* ld-preload injection LiteInst performs;
-/// only the library name and env-var spelling differ.
+/// Prepends the located cdylib to `LD_PRELOAD` and selects
+/// [`BuiltinTool::Passthrough`] via [`TOOL_ENV`]. Unlike the controller-only
+/// [`RUNTIME_FALLBACK`] mode, this publishes the direct AOT callback and can run
+/// a rewritten binary without a ptracer.
+// TODO-HUMAN-REVIEW(PR-264): Review standalone configuration selecting the
+// shared direct pass-through built-in.
 pub fn configure_command(command: &mut Command) -> io::Result<()> {
     let value = compose_ld_preload(preload_library_path()?, env::var_os("LD_PRELOAD"));
     command
         .env("LD_PRELOAD", value)
-        .env(RUNTIME_ENV, RUNTIME_FALLBACK);
+        .env(TOOL_ENV, TOOL_PASSTHROUGH);
     Ok(())
 }
 
@@ -243,7 +247,7 @@ fn builtin_tool_env_value(tool: BuiltinTool) -> &'static str {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reverie_e9patch_initialize() {
     // SAFETY: invoked from `.init_array` before application threads start; the
-    // runtime is inert unless RUNTIME_ENV arms it.
+    // runtime is inert unless RUNTIME_ENV or TOOL_ENV arms it.
     if let Err(error) = unsafe { runtime::initialize_from_environment() } {
         eprintln!("reverie-e9patch initialization failed: {error}");
         unsafe {
@@ -262,10 +266,11 @@ static REVERIE_E9PATCH_INIT: unsafe extern "C" fn() = reverie_e9patch_initialize
 ///
 /// This is the e9patch analog of LiteInst's `reverie_liteinst_site_trap_count`:
 /// a C-ABI counter that makes the instrumentation surface observable from the
-/// guest. Because AOT-rewritten sites never trap, this counts exactly the
-/// residual, un-rewritten fallback surface (loader/startup, vDSO, uncovered or
-/// JIT-emitted sites). A value near zero confirms e9tool's ahead-of-time
-/// coverage is carrying the syscall load.
+/// guest. It counts only [`SignalTrap`](reverie_preload::dispatch::SyscallEventSource::SignalTrap)
+/// events delivered to [`E9patchDispatcher`]: direct AOT built-in events and
+/// generic ptrace events are both excluded. In built-in mode this therefore
+/// measures the residual un-rewritten surface (loader/startup, vDSO, uncovered
+/// or JIT-emitted sites).
 #[unsafe(no_mangle)]
 pub extern "C" fn reverie_e9patch_fallback_dispatch_count() -> u64 {
     dispatch::fallback_dispatch_count()

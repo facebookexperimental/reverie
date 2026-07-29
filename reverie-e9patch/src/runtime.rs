@@ -8,11 +8,13 @@
 
 //! In-guest runtime install path for the e9patch ld-preload backend.
 //!
-//! This mirrors `reverie-liteinst`'s `install_runtime` exactly: it registers a
-//! [`SyscallDispatcher`](reverie_preload::dispatch::SyscallDispatcher) and then
-//! installs the shared [`InProcessSeccomp`] lifecycle controller from
-//! `reverie-preload`. The seccomp filter, `SIGSYS` handler, and trusted syscall
-//! gate are therefore the **same code** in both backends.
+//! The controller-mode path registers [`E9patchDispatcher`] and installs the
+//! shared [`InProcessSeccomp`] lifecycle controller from `reverie-preload`. The
+//! seccomp filter, `SIGSYS` handler, and trusted syscall gate are therefore the
+//! **same code** in both backends. It intentionally does not publish the direct
+//! AOT callback: generic `T: Tool` events remain owned by ptrace. Shared
+//! [`BuiltinTool`] mode publishes that callback through
+//! [`install_builtin_runtime`].
 //!
 //! The difference from LiteInst is only what the SIGSYS path is *for*. In
 //! LiteInst it is the discovery-and-patch mechanism. In e9patch the syscall
@@ -40,12 +42,13 @@ use crate::dispatch::E9patchDispatcher;
 /// `REVERIE_LITEINST_TOOL` opt-in contract.
 pub const RUNTIME_ENV: &str = "REVERIE_E9PATCH_RUNTIME";
 
-/// [`RUNTIME_ENV`] value selecting the self-contained in-process controller.
+/// [`RUNTIME_ENV`] value selecting the in-process residual controller.
 ///
-/// e9patch's arbitrary-`Tool` fast path is delivered by the AOT trampolines,
-/// not by this in-guest runtime, so the only built-in dispatcher today is the
-/// shared fail-closed fallback. A future increment adds a tool-specific preload
-/// DSO exactly as LiteInst does (`install_tool::<T>`).
+/// This installs only the residual `SIGSYS` controller. It deliberately leaves
+/// the direct AOT callback unpublished so rewritten sites retain their ptrace
+/// trap and cannot bypass the generic `T: Tool` selected by [`crate::E9patchBackend`].
+/// Use [`TOOL_ENV`] (or [`crate::configure_command`]) for a standalone shared
+/// built-in that publishes direct AOT dispatch.
 pub const RUNTIME_FALLBACK: &str = "fallback";
 
 /// [`RUNTIME_ENV`] value selecting the ptrace-hosted hybrid controller.
@@ -77,14 +80,14 @@ pub const TOOL_ENV: &str = "REVERIE_E9PATCH_TOOL";
 ///
 /// Matches [`BuiltinTool::Passthrough`]: forward every syscall through the
 /// trusted gate with the shared guards, altering no guest behavior. Proves the
-/// e9patch fallback trap path end to end.
+/// direct AOT path and residual signal fallback end to end.
 pub const TOOL_PASSTHROUGH: &str = "passthrough";
 
 /// [`TOOL_ENV`] value selecting the shared `getpid`-spoofing demo tool.
 ///
 /// Matches [`BuiltinTool::SpoofGetpid`]: forward everything except `getpid`,
 /// which returns [`reverie_preload::SPOOF_PID`]. Proves the e9patch fallback
-/// trap path can *mutate* a syscall result, not merely forward it — the
+/// AOT path can *mutate* a syscall result, not merely forward it — the
 /// capability the shared crate demonstrates via `install_builtin`.
 pub const TOOL_SPOOF_GETPID: &str = "spoof-getpid";
 
@@ -186,7 +189,7 @@ fn runtime_config_from_env() -> io::Result<RuntimeConfig> {
 ///   third architectural difference.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeMode {
-    /// Self-contained in-process seccomp + `SIGSYS`. Matches LiteInst standalone.
+    /// In-process residual seccomp + `SIGSYS`; AOT sites retain the ptrace trap.
     InProcessFallback,
     /// In-process `SIGSYS` hot path with the shared ptracer owning lifecycle.
     HybridPtrace,
@@ -221,11 +224,13 @@ impl RuntimeMode {
     }
 }
 
-/// Register [`E9patchDispatcher`] and install the self-contained in-process
-/// controller ([`InProcessSeccomp`]).
+/// Register [`E9patchDispatcher`] and install the in-process residual controller
+/// ([`InProcessSeccomp`]).
 ///
-/// This is the isolated, ptrace-free mode; it matches LiteInst's standalone
-/// `install_runtime`. e9patch's production mode is [`install_hybrid_runtime`].
+/// This controller services un-rewritten `SIGSYS` sites only. It does **not**
+/// publish the AOT callback, so a rewritten binary still needs its ptrace owner.
+/// For ptrace-free shared built-ins, use [`install_builtin_runtime`]. E9patch's
+/// generic production mode is [`install_hybrid_runtime`].
 ///
 /// # Safety
 ///

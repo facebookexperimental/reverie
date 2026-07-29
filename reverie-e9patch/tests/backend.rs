@@ -248,6 +248,16 @@ async fn direct_builtin_spoof_mutates_rewritten_getpid_result() {
     assert_eq!(output.status, ExitStatus::Exited(0), "{output:?}");
 }
 
+#[test]
+#[ignore = "requires a built e9tool/e9patch pair and a C compiler"]
+fn standalone_configuration_selects_direct_passthrough() {
+    let (_directory, guest) = materialize_prepared_fixture("direct_rt_sigreturn.c");
+    let mut command = std::process::Command::new(guest);
+    reverie_e9patch::configure_command(&mut command).unwrap();
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+}
+
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires a built e9tool/e9patch pair and a C compiler"]
 async fn marker_collision_at_another_rip_is_not_a_syscall_event() {
