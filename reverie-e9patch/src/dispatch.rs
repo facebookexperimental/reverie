@@ -32,13 +32,15 @@
 //!   [`defer_to`](reverie_preload::dispatch::SyscallEvent::defer_to)s it so the
 //!   tool callback runs later in ordinary guest context. Every subsequent
 //!   execution of that site is a near-native trampoline call.
-//! * **e9patch** patches *ahead of time*: `e9tool` rewrites every recovered
-//!   syscall instruction into a freestanding call trampoline *before* the guest
-//!   ever runs. Those AOT trampolines call the already-registered shared
-//!   dispatcher in ordinary context from the very first execution, so
-//!   [`E9patchDispatcher`] never has to publish a runtime hook.
+//! * **e9patch built-ins** patch *ahead of time*: `e9tool` rewrites every
+//!   recovered syscall instruction into a freestanding call trampoline *before*
+//!   the guest ever runs. When a shared built-in tool is selected, those AOT
+//!   trampolines call its already-registered dispatcher in ordinary context from
+//!   the very first execution. Arbitrary `T: Tool` stays on the ptrace path until
+//!   Reverie has a type-erased remote-Guest protocol; its preload deliberately
+//!   leaves the AOT callback unpublished so rewritten sites cannot bypass `T`.
 //!
-//! AOT-rewritten sites enter with
+//! AOT-rewritten built-in events enter with
 //! [`SyscallEventSource::DirectInstrumentation`]. Sites e9patch could *not*
 //! rewrite ahead of time — dynamic loader/startup code, vDSO fast paths, and
 //! uncovered or JIT-emitted code — enter through `SIGSYS` with

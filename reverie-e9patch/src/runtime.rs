@@ -291,7 +291,6 @@ pub unsafe fn install_builtin_runtime(tool: BuiltinTool) -> io::Result<()> {
 ///
 /// See [`install_runtime`].
 unsafe fn install_with_controller(controller: &dyn LifecycleController) -> io::Result<()> {
-    let dispatch_page = crate::aot::PendingDispatchPage::prepare()?;
     // AUTONOMOUS-BOT-IMPLEMENTED
     // Honor the launcher-selected shared config (ALT_STACK_ENV) instead of an
     // unconditional default, so the same shared RuntimeConfig knob reverie-preload
@@ -304,17 +303,13 @@ unsafe fn install_with_controller(controller: &dyn LifecycleController) -> io::R
     // would otherwise mis-attribute the child's residual surface.
     // SAFETY: the dispatcher is registered before the controller installs the
     // SIGSYS handler + filter; forwarded to the caller's contract above.
-    let result = unsafe {
+    unsafe {
         reverie_preload::install(
             Box::new(E9patchDispatcher::with_fork_reset()),
             controller,
             &config,
         )
-    };
-    if result.is_ok() {
-        dispatch_page.commit();
     }
-    result
 }
 
 /// Read the launcher environment and install the in-guest runtime it selects.

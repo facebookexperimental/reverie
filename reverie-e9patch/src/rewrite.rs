@@ -33,6 +33,10 @@ use goblin::elf::Elf;
 use goblin::elf::header::EM_X86_64;
 use goblin::elf::header::ET_DYN;
 use goblin::elf::header::ET_EXEC;
+#[cfg(test)]
+use goblin::elf::program_header::PF_R;
+#[cfg(test)]
+use goblin::elf::program_header::PF_W;
 use goblin::elf::program_header::PT_LOAD;
 use reverie::Error;
 use sha2::Digest;
@@ -940,8 +944,32 @@ printf 'num_patched = {patched} / {recovered}\n'
         let direct = symbols
             .get("reverie_e9patch_dispatch")
             .expect("payload must export the direct-dispatch symbol");
+        let init = symbols
+            .get("init")
+            .expect("payload must export its post-map initialization hook");
+        let dispatch_page = symbols
+            .get("reverie_e9patch_aot_page")
+            .expect("payload must export its direct-dispatch page");
         assert_eq!(trap.st_value, trap_entry);
         assert!(direct.st_value > trap.st_value);
+        assert!(init.st_value > direct.st_value);
+        assert_eq!(
+            PAYLOAD_RUNTIME_BASE + dispatch_page.st_value,
+            crate::aot::AOT_DISPATCH_PAGE_ADDRESS
+        );
+        assert_eq!(dispatch_page.st_value % 4096, 0);
+        assert_eq!(dispatch_page.st_size, 4096);
+        let dispatch_segment = elf
+            .program_headers
+            .iter()
+            .find(|segment| {
+                segment.p_type == PT_LOAD
+                    && (segment.p_vaddr..segment.p_vaddr + segment.p_memsz)
+                        .contains(&dispatch_page.st_value)
+            })
+            .expect("dispatch page is not covered by a load segment");
+        assert_ne!(dispatch_segment.p_flags & PF_R, 0);
+        assert_eq!(dispatch_segment.p_flags & PF_W, 0);
     }
 
     #[test]

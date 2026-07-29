@@ -8,6 +8,7 @@
 
 use std::ffi::OsString;
 use std::fs;
+use std::fs::File;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
@@ -27,7 +28,10 @@ use reverie::process::Stdio;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
+use reverie_e9patch::BuiltinTool;
 use reverie_e9patch::E9patchBackend;
+use reverie_e9patch::E9patchRewriter;
+use reverie_e9patch::configure_guest_builtin;
 
 #[derive(Default)]
 struct EventCounter {
@@ -81,6 +85,19 @@ fn compile_fixture(name: &str) -> (tempfile::TempDir, PathBuf) {
         String::from_utf8_lossy(&result.stderr)
     );
     (directory, output)
+}
+
+fn materialize_prepared_fixture(name: &str) -> (tempfile::TempDir, PathBuf) {
+    let (directory, guest) = compile_fixture(name);
+    let prepared = E9patchRewriter::from_env().unwrap().prepare(guest).unwrap();
+    let executable = directory.path().join("rewritten-guest");
+    let mut artifact = prepared.artifact().unwrap();
+    let mut output = File::create(&executable).unwrap();
+    std::io::copy(&mut artifact, &mut output).unwrap();
+    let mut permissions = fs::metadata(&executable).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&executable, permissions).unwrap();
+    (directory, executable)
 }
 
 #[derive(Default)]
@@ -209,6 +226,26 @@ async fn rewritten_rt_sigreturn_uses_the_original_signal_frame() {
         .await
         .unwrap();
     assert_eq!(status, ExitStatus::Exited(0));
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires a built e9tool/e9patch pair and a C compiler"]
+async fn direct_builtin_passthrough_handles_far_rt_sigreturn_site() {
+    let (_directory, guest) = materialize_prepared_fixture("direct_rt_sigreturn.c");
+    let mut command = Command::new(guest);
+    configure_guest_builtin(&mut command, BuiltinTool::Passthrough).unwrap();
+    let output = command.output().await.unwrap();
+    assert_eq!(output.status, ExitStatus::Exited(0), "{output:?}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires a built e9tool/e9patch pair and a C compiler"]
+async fn direct_builtin_spoof_mutates_rewritten_getpid_result() {
+    let (_directory, guest) = materialize_prepared_fixture("direct_spoof_getpid.c");
+    let mut command = Command::new(guest);
+    configure_guest_builtin(&mut command, BuiltinTool::SpoofGetpid).unwrap();
+    let output = command.output().await.unwrap();
+    assert_eq!(output.status, ExitStatus::Exited(0), "{output:?}");
 }
 
 #[tokio::test(flavor = "current_thread")]

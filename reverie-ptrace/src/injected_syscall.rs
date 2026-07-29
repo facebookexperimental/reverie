@@ -66,10 +66,17 @@ impl InjectedSyscallFrame {
         | Self::RFLAGS_SF
         | Self::RFLAGS_OF;
 
+    /// Returns the syscall number without materializing the full [`Syscall`]
+    /// enum. Instrumentation bridges use this compact accessor on bounded
+    /// trampoline stacks.
+    pub fn syscall_number(&self) -> Sysno {
+        Sysno::from(self.rax as i32)
+    }
+
     /// Decodes the syscall stored in this e9tool frame.
     pub fn syscall(&self) -> Syscall {
         Syscall::from_raw(
-            Sysno::from(self.rax as i32),
+            self.syscall_number(),
             SyscallArgs::new(
                 self.rdi as usize,
                 self.rsi as usize,
@@ -239,6 +246,7 @@ mod tests {
         assert_eq!(core::mem::size_of::<InjectedSyscallFrame>(), 18 * 8);
         assert_eq!(core::mem::offset_of!(InjectedSyscallFrame, rax), 15 * 8);
         assert_eq!(core::mem::offset_of!(InjectedSyscallFrame, rip), 17 * 8);
+        assert_eq!(frame().syscall_number(), Sysno::write);
     }
 
     #[test]

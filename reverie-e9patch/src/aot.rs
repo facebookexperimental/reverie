@@ -10,7 +10,6 @@
 
 use std::io;
 
-use reverie::syscalls::SyscallInfo;
 use reverie_ptrace::InjectedSyscallFrame;
 
 include!(concat!(env!("OUT_DIR"), "/aot_dispatch_constants.rs"));
@@ -18,12 +17,13 @@ include!(concat!(env!("OUT_DIR"), "/aot_dispatch_constants.rs"));
 const PAGE_SIZE: usize = 4096;
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct DispatchPage {
     magic: u64,
-    callback: unsafe extern "C" fn(*mut InjectedSyscallFrame, u64),
+    callback: usize,
 }
 
-/// An AOT dispatch page that is removed unless its runtime installation commits.
+/// A pending callback handoff for the AOT payload's post-map init hook.
 // AUTONOMOUS-BOT-IMPLEMENTED
 pub(crate) struct PendingDispatchPage {
     address: *mut libc::c_void,
@@ -31,9 +31,9 @@ pub(crate) struct PendingDispatchPage {
 }
 
 impl PendingDispatchPage {
-    /// Publish the callback at the fixed address consumed by the AOT payload.
+    /// Publish the callback for the e9patch post-map initialization hook.
     pub(crate) fn prepare() -> io::Result<Self> {
-        let requested = AOT_DISPATCH_PAGE_ADDRESS as usize as *mut libc::c_void;
+        let requested = AOT_HANDOFF_PAGE_ADDRESS as usize as *mut libc::c_void;
         let address = unsafe {
             libc::mmap(
                 requested,
@@ -53,13 +53,13 @@ impl PendingDispatchPage {
             }
             return Err(io::Error::new(
                 io::ErrorKind::AddrNotAvailable,
-                "kernel ignored fixed e9patch dispatch-page address",
+                "kernel ignored fixed e9patch handoff-page address",
             ));
         }
 
         let page = DispatchPage {
             magic: AOT_DISPATCH_MAGIC,
-            callback: reverie_e9patch_dispatch_aot,
+            callback: reverie_e9patch_dispatch_aot as *const () as usize,
         };
         unsafe {
             address.cast::<DispatchPage>().write(page);
@@ -106,10 +106,12 @@ impl Drop for PendingDispatchPage {
 unsafe extern "C" fn reverie_e9patch_dispatch_aot(
     frame: *mut InjectedSyscallFrame,
     trap_rflags: u64,
-) {
+) -> u64 {
     let frame = unsafe { &mut *frame };
-    let syscall = frame.syscall();
-    let (number, _) = syscall.into_parts();
+    let number = frame.syscall_number();
+    if number == reverie::syscalls::Sysno::rt_sigreturn {
+        return 2;
+    }
     let args = frame.raw_args();
     let instruction_pointer = frame.instruction_pointer();
 
@@ -117,6 +119,7 @@ unsafe extern "C" fn reverie_e9patch_dispatch_aot(
     let result =
         reverie_preload::trap::dispatch_direct(number.id() as i64, args, instruction_pointer);
     frame.set_result(result);
+    1
 }
 
 #[cfg(test)]
@@ -125,7 +128,9 @@ mod tests {
 
     #[test]
     fn dispatch_page_abi_matches_the_payload() {
+        assert_eq!(AOT_HANDOFF_PAGE_ADDRESS % PAGE_SIZE as u64, 0);
         assert_eq!(AOT_DISPATCH_PAGE_ADDRESS % PAGE_SIZE as u64, 0);
+        assert_ne!(AOT_HANDOFF_PAGE_ADDRESS, AOT_DISPATCH_PAGE_ADDRESS);
         assert_ne!(AOT_DISPATCH_MAGIC, 0);
         assert_eq!(
             AOT_FALLBACK_TRAP_ENTRY,
@@ -136,12 +141,12 @@ mod tests {
     }
 
     #[test]
-    fn prepared_page_publishes_the_exact_callback_and_unmaps_on_drop() {
+    fn prepared_handoff_publishes_the_exact_callback_and_unmaps_on_drop() {
         let page = PendingDispatchPage::prepare().unwrap();
         let published = unsafe { &*page.address.cast::<DispatchPage>() };
         assert_eq!(published.magic, AOT_DISPATCH_MAGIC);
         assert_eq!(
-            published.callback as *const () as usize,
+            published.callback,
             reverie_e9patch_dispatch_aot as *const () as usize
         );
 
@@ -164,11 +169,30 @@ mod tests {
         words[17] = rip;
 
         unsafe {
-            reverie_e9patch_dispatch_aot(words.as_mut_ptr().cast(), 0x202);
+            assert_eq!(
+                reverie_e9patch_dispatch_aot(words.as_mut_ptr().cast(), 0x202),
+                1
+            );
         }
 
         assert_eq!(words[15] as i64, -i64::from(libc::ENOSYS));
         assert_eq!(words[14], rip + 2);
         assert_eq!(words[5], 0x202);
+    }
+
+    #[test]
+    fn rt_sigreturn_requests_direct_tail_execution_without_mutation() {
+        let mut words = [0xfeed_face_u64; 18];
+        words[15] = libc::SYS_rt_sigreturn as u64;
+        let original = words;
+
+        unsafe {
+            assert_eq!(
+                reverie_e9patch_dispatch_aot(words.as_mut_ptr().cast(), 0x202),
+                2
+            );
+        }
+
+        assert_eq!(words, original);
     }
 }
