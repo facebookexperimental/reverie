@@ -241,7 +241,12 @@ guest `main`, and calls `install_tool_from_bootstrap::<T>` without mutating the
 environment. The selector must install the same concrete `T` as the
 coordinator; unknown selectors fail before connection. Multiple matching or
 malformed e9patch bootstraps fail closed and every matching descriptor is
-closed.
+closed. `run_direct_with_inherited_stdio_and_preload_data` uses that same
+bootstrap while replacing any caller-configured stdin, stdout, and stderr with
+inherited handles. It returns the guest status with empty output buffers, which
+matches LiteInst for tools that share the launcher's sink and preserve ordering
+between intercepted and pass-through writes. The captured-output launch remains
+available as a separate API.
 
 `E9patchBackend::run` deliberately still drives generic tools through ptrace:
 the direct host does not yet cover process trees, exec rebootstrap, guest signal

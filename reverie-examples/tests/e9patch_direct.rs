@@ -4,6 +4,7 @@ use std::process::Command as ProcessCommand;
 
 use reverie::ExitStatus;
 use reverie::process::Command;
+use reverie::process::Stdio;
 use reverie_e9patch::E9patchBackend;
 use reverie_examples::e9patch_smoke::AotCounterTool;
 
@@ -68,6 +69,26 @@ async fn sealed_bootstrap_selects_matching_tool_without_environment_mutation() {
         .await
         .unwrap();
     assert_eq!(output.status, ExitStatus::Exited(0), "{output:?}");
+    assert_eq!(global.delivered(), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires a built e9tool/e9patch pair"]
+async fn inherited_stdio_uses_sealed_bootstrap_and_returns_empty_buffers() {
+    let (_directory, guest) = compile_guest();
+    let mut command = Command::new(guest);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let (output, global) = E9patchBackend::run_direct_with_inherited_stdio_and_preload_data::<
+        AotCounterTool,
+    >(command, (), example_preload(), b"e9patch-smoke")
+    .await
+    .unwrap();
+    assert_eq!(output.status, ExitStatus::Exited(0), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
     assert_eq!(global.delivered(), 1);
 }
 

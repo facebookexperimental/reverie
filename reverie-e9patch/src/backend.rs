@@ -447,6 +447,30 @@ impl E9patchBackend {
         launch_direct::<T>(command, config, preload.into(), Some(tool_data.into())).await
     }
 
+    /// Runs a generic Tool with inherited guest stdio and a sealed constructor
+    /// bootstrap.
+    ///
+    /// The returned [`Output`] contains the guest status and empty byte
+    /// buffers. This matches LiteInst's inherited-stdio launch contract for
+    /// tools that share the launcher's output sink and need ordering between
+    /// intercepted and pass-through guest writes.
+    pub async fn run_direct_with_inherited_stdio_and_preload_data<T>(
+        mut command: Command,
+        config: <T::GlobalState as GlobalTool>::Config,
+        preload: impl Into<PathBuf>,
+        tool_data: impl Into<Vec<u8>>,
+    ) -> Result<(Output, T::GlobalState), Error>
+    where
+        T: Tool + 'static,
+    {
+        inherit_stdio(&mut command);
+        let (output, global) =
+            launch_direct::<T>(command, config, preload.into(), Some(tool_data.into())).await?;
+        debug_assert!(output.stdout.is_empty());
+        debug_assert!(output.stderr.is_empty());
+        Ok((output, global))
+    }
+
     async fn spawn<T>(
         mut command: Command,
         config: <T::GlobalState as GlobalTool>::Config,
@@ -625,6 +649,12 @@ impl E9patchBackend {
             (Ok(_), Err(error)) => Err(error.into()),
         }
     }
+}
+
+fn inherit_stdio(command: &mut Command) {
+    command.stdin(reverie::process::Stdio::inherit());
+    command.stdout(reverie::process::Stdio::inherit());
+    command.stderr(reverie::process::Stdio::inherit());
 }
 
 async fn launch_direct<T>(
@@ -858,6 +888,22 @@ mod tests {
             -1
         );
         file.into_raw_fd()
+    }
+
+    #[test]
+    fn inherited_stdio_replaces_caller_pipes() {
+        let mut command = Command::new("/bin/true");
+        command
+            .stdin(reverie::process::Stdio::piped())
+            .stdout(reverie::process::Stdio::piped())
+            .stderr(reverie::process::Stdio::piped());
+        inherit_stdio(&mut command);
+        let mut child = command.into_std_lossy().spawn().unwrap();
+        assert!(child.stdin.is_none());
+        assert!(child.stdout.is_none());
+        assert!(child.stderr.is_none());
+        let status = child.wait().unwrap();
+        assert!(status.success());
     }
 
     #[test]
