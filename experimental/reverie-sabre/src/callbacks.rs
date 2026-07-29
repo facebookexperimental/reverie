@@ -21,6 +21,7 @@ use super::thread;
 use super::thread::GuestTransitionErr;
 use super::thread::PidTid;
 use super::thread::Thread;
+use super::tool::SyscallExt;
 use super::tool::Tool;
 use super::tool::ToolGlobal;
 use super::utils;
@@ -33,6 +34,47 @@ thread_local! {
     static CURRENT_SYSCALL_FRAME: std::cell::Cell<*mut ffi::syscall_stackframe> =
         const { std::cell::Cell::new(std::ptr::null_mut()) };
     static TAIL_INJECTED_EXIT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static VFORK_PARENT_PID: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Keeps a vfork child on a native pre-exec gate while its parent is blocked
+/// inside the kernel and owns an in-flight tool/RPC request.
+struct VforkBoundaryGuard {
+    parent_pid: u32,
+    _signal_restore: guard::VforkSignalGuardRestore,
+}
+
+impl VforkBoundaryGuard {
+    fn enter() -> Self {
+        let parent_pid = current_process_id();
+        VFORK_PARENT_PID.with(|slot| {
+            assert_eq!(slot.replace(parent_pid), 0, "nested vfork boundaries");
+        });
+        Self {
+            parent_pid,
+            _signal_restore: guard::preserve_signal_guard_count_across_vfork(),
+        }
+    }
+}
+
+impl Drop for VforkBoundaryGuard {
+    fn drop(&mut self) {
+        VFORK_PARENT_PID.with(|slot| {
+            debug_assert_eq!(slot.replace(0), self.parent_pid);
+        });
+    }
+}
+
+fn is_vfork_child_process() -> bool {
+    let current_pid = current_process_id();
+    VFORK_PARENT_PID.with(|slot| {
+        let parent_pid = slot.get();
+        parent_pid != 0 && parent_pid != current_pid
+    })
+}
+
+fn current_process_id() -> u32 {
+    unsafe { syscalls::syscall0(Sysno::getpid) }.expect("getpid should succeed") as u32
 }
 
 /// Keeps the loader's live syscall frame available to the synchronous shared-tool callback.
@@ -173,6 +215,18 @@ pub extern "C" fn handle_syscall<T: ToolGlobal>(
     arg6: usize,
     wrapper_sp: *mut ffi::syscall_stackframe,
 ) -> usize {
+    // A vfork child shares the blocked parent's address space, including an
+    // in-flight RPC transport. Calling the tool before exec would deadlock on
+    // that inherited request. Run only the child preparation syscalls through
+    // SaBRe's native syscall policy; a successful exec creates a fresh image
+    // and resumes normal tool interception at its first callback.
+    if is_vfork_child_process() {
+        let sys_no = Sysno::from(syscall as i32);
+        let args = SyscallArgs::new(arg1, arg2, arg3, arg4, arg5, arg6);
+        let intercepted = Syscall::from_raw(sys_no, args);
+        return unsafe { intercepted.call() }.unwrap_or_else(|error| -error.into_raw() as usize);
+    }
+
     let mut thread = if let Some(thread) = Thread::<T>::current() {
         thread
     } else {
@@ -235,8 +289,7 @@ fn handle_syscall_with_thread<T: ToolGlobal>(
     // completes, deadlocking the in-guest allocator under concurrent clones.
     // TODO-HUMAN-REVIEW(PR-226): Review deferred clone-child registration.
     let result = if sys_no == Sysno::clone && arg2 != 0 {
-        let _vfork_guard_restore =
-            utils::is_vfork(sys_no, arg1).then(guard::preserve_signal_guard_count_across_vfork);
+        let _vfork_boundary = utils::is_vfork(sys_no, arg1).then(VforkBoundaryGuard::enter);
         // New thread with its own stack: the kernel sets the child's %rsp to
         // `child_stack`, so clone_syscall's `jmp r9` shortcut is correct.
         thread.maybe_fork_as_guest(|| {
@@ -254,8 +307,7 @@ fn handle_syscall_with_thread<T: ToolGlobal>(
                 .unwrap_or_else(|e| -e.into_raw() as usize)
         })?
     } else if sys_no == Sysno::clone {
-        let _vfork_guard_restore =
-            utils::is_vfork(sys_no, arg1).then(guard::preserve_signal_guard_count_across_vfork);
+        let _vfork_boundary = utils::is_vfork(sys_no, arg1).then(VforkBoundaryGuard::enter);
         // clone(2) without a new stack behaves like fork: the child shares the
         // parent's stack layout and must resume the guest on its ORIGINAL %rsp,
         // which fork_syscall restores from the SaBRe syscall frame.
@@ -287,7 +339,7 @@ fn handle_syscall_with_thread<T: ToolGlobal>(
                 .unwrap_or_else(|e| -e.into_raw() as usize)
         })?
     } else if utils::is_vfork(sys_no, arg1) {
-        let _vfork_guard_restore = guard::preserve_signal_guard_count_across_vfork();
+        let _vfork_boundary = VforkBoundaryGuard::enter();
         thread.maybe_fork_as_guest(|| {
             T::global()
                 .syscall_with_inject(intercepted, &LocalMemory::new(), || unsafe {
@@ -307,7 +359,7 @@ fn handle_syscall_with_thread<T: ToolGlobal>(
     } else if sys_no == Sysno::clone3 {
         let fields = read_clone3_fields(thread.get_process_and_thread_ids().pid, arg1, arg2);
         let is_vfork = fields.as_ref().is_ok_and(|fields| fields.is_vfork());
-        let _vfork_guard_restore = is_vfork.then(guard::preserve_signal_guard_count_across_vfork);
+        let _vfork_boundary = is_vfork.then(VforkBoundaryGuard::enter);
         thread.maybe_fork_as_guest(|| {
             T::global()
                 .syscall_with_inject(intercepted, &LocalMemory::new(), || match fields {
@@ -522,6 +574,8 @@ fn terminate_group(exit_code: usize) -> ! {
 mod exit_group_tests {
     use syscalls::Errno;
 
+    use super::VFORK_PARENT_PID;
+    use super::is_vfork_child_process;
     use super::read_clone3_fields;
     use super::signal_controlled_exit;
     use super::terminate_group;
@@ -557,6 +611,20 @@ mod exit_group_tests {
 
         assert!(actual.is_vfork());
         assert_eq!(actual.stack, 0x1234);
+    }
+
+    #[test]
+    fn vfork_child_gate_distinguishes_parent_and_child_processes() {
+        let current_pid = super::current_process_id();
+        VFORK_PARENT_PID.with(|slot| {
+            assert_eq!(slot.replace(current_pid), 0);
+        });
+        assert!(!is_vfork_child_process());
+
+        VFORK_PARENT_PID.with(|slot| slot.set(current_pid + 1));
+        assert!(is_vfork_child_process());
+
+        VFORK_PARENT_PID.with(|slot| slot.set(0));
     }
 
     #[test]
