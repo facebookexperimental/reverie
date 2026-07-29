@@ -374,6 +374,30 @@ impl Drop for PendingThreadClone<'_> {
     }
 }
 
+struct PendingProcessFork {
+    parent_pid: Pid,
+}
+
+impl Drop for PendingProcessFork {
+    fn drop(&mut self) {
+        // A fork child resumes directly in guest code without unwinding the
+        // plugin callback. Only the returning parent may clear its copy.
+        if current_pid() == self.parent_pid {
+            PROCESS_FORK_HANDOFF.lock().take();
+        }
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-273): Review fork-safe state transfer across ProcessCell reinitialization.
+struct ProcessForkHandoff {
+    parent_pid: Pid,
+    parent_tid: Pid,
+    thread_state: Vec<u8>,
+}
+
+static PROCESS_FORK_HANDOFF: Mutex<Option<ProcessForkHandoff>> = Mutex::new(None);
+
 struct ChildThreadRegistry<'a, T>
 where
     T: ReverieTool,
@@ -395,7 +419,8 @@ where
         let rpc = protect_with(|| BlockingRpcClient::<T::GlobalState>::connect(&socket_path, tid))?;
         let config = rpc.as_ref().config().clone();
         let tool = T::new(current_pid(), &config);
-        let thread_state = tool.init_thread_state(tid, None);
+        let thread_state = take_process_fork_handoff(&tool, tid)?
+            .unwrap_or_else(|| tool.init_thread_state(tid, None));
         let syscall_subscriptions = T::subscriptions(&config).iter_syscalls().collect();
         let mut thread_states = HashMap::new();
         thread_states.insert(
@@ -520,7 +545,6 @@ where
                 );
                 PendingThreadClone(&self.thread_clone_pending)
             });
-
         TAIL_INJECT_RESULT.with(|slot| slot.set(None));
         match poll_once(self.tool.handle_syscall_event(&mut guest, syscall)) {
             Poll::Ready(result) => shared_result(result),
@@ -710,6 +734,26 @@ where
             .or_insert_with(|| state.clone())
             .clone())
     }
+}
+
+fn take_process_fork_handoff<T>(tool: &T, child: Pid) -> Result<Option<T::ThreadState>, RpcError>
+where
+    T: ReverieTool,
+{
+    let mut slot = PROCESS_FORK_HANDOFF.lock();
+    let Some(handoff) = slot.as_ref() else {
+        return Ok(None);
+    };
+    if handoff.parent_pid == current_pid() {
+        return Ok(None);
+    }
+    let handoff = slot.take().unwrap();
+    drop(slot);
+    let parent_state = reverie_rpc_transport::codec::decode(&handoff.thread_state)?;
+    Ok(Some(tool.init_thread_state(
+        child,
+        Some((handoff.parent_tid, &parent_state)),
+    )))
 }
 
 fn remote_rpc_error(error: RpcError) -> Errno {
@@ -1179,6 +1223,28 @@ where
         }
         if self.original == Some((number, args)) {
             if let Some(inject) = self.special_inject.take() {
+                let _pending_process_fork =
+                    if self.child_threads.is_some() && is_process_fork(self.pid, number, args) {
+                        let Some(parent_state) = self.thread_state.as_ref() else {
+                            return Err(Errno::EIO);
+                        };
+                        let snapshot = reverie_rpc_transport::codec::encode(parent_state)
+                            .map_err(remote_rpc_error)?;
+                        let replaced = PROCESS_FORK_HANDOFF.lock().replace(ProcessForkHandoff {
+                            parent_pid: self.pid,
+                            parent_tid: self.tid,
+                            thread_state: snapshot,
+                        });
+                        assert!(
+                            replaced.is_none(),
+                            "nested SaBRe process-fork snapshots are unsupported"
+                        );
+                        Some(PendingProcessFork {
+                            parent_pid: self.pid,
+                        })
+                    } else {
+                        None
+                    };
                 // Fork/exit injectors may resume the child or terminate without
                 // unwinding this callback. Do not carry its parent stack pointer
                 // into that execution path.
@@ -1263,22 +1329,34 @@ where
 }
 
 // TODO-HUMAN-REVIEW(PR-212): Review clone3 thread-state detection.
-fn is_thread_clone(pid: Pid, number: Sysno, args: SyscallArgs) -> bool {
-    let flags = match number {
-        Sysno::clone => args.arg0 as u64,
+fn clone_flags(pid: Pid, number: Sysno, args: SyscallArgs) -> Option<u64> {
+    match number {
+        Sysno::clone => Some(args.arg0 as u64),
         // AUTONOMOUS-BOT-IMPLEMENTED
         Sysno::clone3 if args.arg1 >= std::mem::size_of::<u64>() => {
-            let Some(address) = Addr::<u64>::from_raw(args.arg0) else {
-                return false;
-            };
-            let Ok(flags) = SabreMemory::new(pid).read_value(address) else {
-                return false;
-            };
-            flags
+            let address = Addr::<u64>::from_raw(args.arg0)?;
+            SabreMemory::new(pid).read_value(address).ok()
         }
-        _ => return false,
+        _ => None,
+    }
+}
+
+fn is_thread_clone(pid: Pid, number: Sysno, args: SyscallArgs) -> bool {
+    clone_flags(pid, number, args).is_some_and(|flags| flags & libc::CLONE_THREAD as u64 != 0)
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-273): Review process-fork classification for state inheritance.
+fn is_process_fork(pid: Pid, number: Sysno, args: SyscallArgs) -> bool {
+    if number == Sysno::fork {
+        return true;
+    }
+    let Some(flags) = clone_flags(pid, number, args) else {
+        return false;
     };
-    flags & libc::CLONE_THREAD as u64 != 0
+    let shared_or_vfork =
+        libc::CLONE_VM as u64 | libc::CLONE_THREAD as u64 | libc::CLONE_VFORK as u64;
+    flags & shared_or_vfork == 0
 }
 
 const STACK_CAPACITY: usize = 4096;
@@ -1397,6 +1475,43 @@ mod tests {
         assert!(is_thread_clone(current_pid(), Sysno::clone3, clone3_args));
         assert!(!is_thread_clone(current_pid(), Sysno::clone, process_args));
         assert!(!is_thread_clone(current_pid(), Sysno::fork, thread_args));
+    }
+
+    #[test]
+    fn identifies_only_private_process_forks_for_lazy_state_handoff() {
+        let process_args = SyscallArgs::new(libc::SIGCHLD as usize, 0, 0, 0, 0, 0);
+        let thread_args = SyscallArgs::new(
+            (libc::CLONE_VM | libc::CLONE_THREAD) as usize,
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
+        let vfork_args = SyscallArgs::new(
+            (libc::CLONE_VM | libc::CLONE_VFORK | libc::SIGCHLD) as usize,
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
+        let clone3_flags = libc::SIGCHLD as u64;
+        let clone3_args = SyscallArgs::new(
+            &clone3_flags as *const u64 as usize,
+            std::mem::size_of_val(&clone3_flags),
+            0,
+            0,
+            0,
+            0,
+        );
+
+        assert!(is_process_fork(current_pid(), Sysno::fork, process_args));
+        assert!(is_process_fork(current_pid(), Sysno::clone, process_args));
+        assert!(is_process_fork(current_pid(), Sysno::clone3, clone3_args));
+        assert!(!is_process_fork(current_pid(), Sysno::clone, thread_args));
+        assert!(!is_process_fork(current_pid(), Sysno::clone, vfork_args));
+        assert!(!is_process_fork(current_pid(), Sysno::vfork, process_args));
     }
 
     #[test]
