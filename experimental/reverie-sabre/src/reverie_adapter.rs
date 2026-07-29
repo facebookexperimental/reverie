@@ -1145,8 +1145,9 @@ where
         let terminal_original = self.original == Some((number, args))
             && self.special_inject.is_some()
             && matches!(number, Sysno::exit | Sysno::exit_group);
+        let rewritten_thread_exit = number == Sysno::exit && self.original != Some((number, args));
         let mut terminal_tool = None;
-        if terminal_original {
+        if terminal_original || rewritten_thread_exit {
             if let (Some(tool), Some(exit_handled)) = (self.tool, self.exit_handled.as_deref_mut())
             {
                 if !*exit_handled {
@@ -1192,6 +1193,15 @@ where
                 }
                 return result;
             }
+        }
+        if rewritten_thread_exit {
+            // A Tool can replace an intercepted syscall with a terminal thread exit. Cleanup was
+            // completed above. Ask the outer SaBRe callback to publish the runtime thread's
+            // Exited state before it performs the non-returning raw exit.
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-265): Review non-original tail-injected thread exit.
+            crate::callbacks::request_tail_injected_exit(args.arg0);
+            return Ok(0);
         }
         if matches!(
             number,
@@ -1357,6 +1367,7 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
+    use std::time::Instant;
 
     use reverie_syscalls::SyscallArgs;
     use syscalls::Sysno;
@@ -1722,6 +1733,115 @@ mod tests {
             adapter.handle_syscall(syscall),
             Ok(std::process::id() as usize)
         );
+    }
+
+    #[test]
+    fn rewritten_tail_exit_publishes_runtime_exit_before_sibling_group_exit() {
+        static CLEANUPS: AtomicUsize = AtomicUsize::new(0);
+        static RUNTIME_EXITS: AtomicBool = AtomicBool::new(false);
+
+        struct ExitEventSink;
+
+        impl crate::thread::EventSink for ExitEventSink {
+            fn on_thread_exit(_pid_tid: crate::thread::PidTid) {
+                RUNTIME_EXITS.store(true, Ordering::Release);
+            }
+        }
+
+        #[derive(Default)]
+        struct ExitTool;
+
+        #[reverie::tool]
+        impl ReverieTool for ExitTool {
+            type GlobalState = ();
+            type ThreadState = ();
+
+            async fn handle_syscall_event<G: Guest<Self>>(
+                &self,
+                guest: &mut G,
+                _syscall: Syscall,
+            ) -> Result<i64, Error> {
+                guest
+                    .tail_inject(reverie_syscalls::Exit::new().with_status(23))
+                    .await
+            }
+
+            async fn on_exit_thread<G: GlobalRPC<Self::GlobalState>>(
+                &self,
+                _tid: Pid,
+                _global_state: &G,
+                _thread_state: Self::ThreadState,
+                exit_status: ExitStatus,
+            ) -> Result<(), Error> {
+                assert_eq!(exit_status, ExitStatus::Exited(23));
+                CLEANUPS.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            }
+        }
+
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            CLEANUPS.store(0, Ordering::Release);
+            RUNTIME_EXITS.store(false, Ordering::Release);
+            let worker = thread::spawn(|| {
+                let mut runtime_thread = crate::thread::Thread::<ExitEventSink>::current()
+                    .expect("worker should acquire a runtime slot");
+                runtime_thread
+                    .leave_guest_execution()
+                    .expect("worker should enter handler state");
+
+                let adapter = ReverieAdapter::new(ExitTool, (), ());
+                let syscall = Syscall::from_raw(Sysno::getpid, SyscallArgs::new(0, 0, 0, 0, 0, 0));
+                assert_eq!(adapter.handle_syscall(syscall), Ok(0));
+                assert_eq!(CLEANUPS.load(Ordering::Acquire), 1);
+                crate::callbacks::terminate_tail_injected_exit_if_requested(&mut runtime_thread);
+                unsafe { libc::_exit(99) };
+            });
+            drop(worker);
+
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !RUNTIME_EXITS.load(Ordering::Acquire) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            if !RUNTIME_EXITS.load(Ordering::Acquire) {
+                unsafe { libc::_exit(98) };
+            }
+
+            let Some(exiting_pid) = crate::thread::exit_all(|_, _| {}) else {
+                unsafe { libc::_exit(97) };
+            };
+            let group_exit_completed =
+                crate::thread::wait_for_all_to_exit(exiting_pid, Some(Duration::from_millis(100)));
+            let cleanup_once = CLEANUPS.load(Ordering::Acquire) == 1;
+            unsafe {
+                libc::_exit(if group_exit_completed && cleanup_once {
+                    0
+                } else {
+                    96
+                })
+            };
+        }
+
+        let started = Instant::now();
+        let mut status = 0;
+        loop {
+            let waited = unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) };
+            assert!(waited >= 0);
+            if waited == child {
+                break;
+            }
+            if started.elapsed() >= Duration::from_secs(2) {
+                unsafe {
+                    libc::kill(child, libc::SIGKILL);
+                    libc::waitpid(child, &mut status, 0);
+                }
+                panic!("tail-injected thread exit did not terminate");
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
     }
 
     #[test]

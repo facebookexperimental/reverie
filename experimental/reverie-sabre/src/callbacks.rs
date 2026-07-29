@@ -32,6 +32,7 @@ use crate::signal::guard;
 thread_local! {
     static CURRENT_SYSCALL_FRAME: std::cell::Cell<*mut ffi::syscall_stackframe> =
         const { std::cell::Cell::new(std::ptr::null_mut()) };
+    static TAIL_INJECTED_EXIT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 /// Keeps the loader's live syscall frame available to the synchronous shared-tool callback.
@@ -61,6 +62,26 @@ pub(crate) fn current_syscall_frame() -> Option<*mut ffi::syscall_stackframe> {
         let frame = frame.get();
         (!frame.is_null()).then_some(frame)
     })
+}
+
+pub(crate) fn request_tail_injected_exit(exit_code: usize) {
+    TAIL_INJECTED_EXIT.with(|status| {
+        assert!(
+            status.replace(Some(exit_code)).is_none(),
+            "nested tail-injected exits are unsupported"
+        );
+    });
+}
+
+pub(crate) fn terminate_tail_injected_exit_if_requested<E: thread::EventSink>(
+    thread: &mut Thread<E>,
+) {
+    if let Some(exit_code) = TAIL_INJECTED_EXIT.with(std::cell::Cell::take) {
+        // Publish the runtime slot before the raw exit. Group teardown waits on this state and a
+        // direct raw exit would otherwise leave the slot permanently in Handler.
+        let _ = thread.try_exit();
+        terminate(exit_code);
+    }
 }
 
 pub const CONTROLLED_EXIT_SIGNAL: libc::c_int = libc::SIGSTKFLT;
@@ -310,6 +331,10 @@ fn handle_syscall_with_thread<T: ToolGlobal>(
         })?
     };
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-265): Review callback-bound tail-injected thread termination.
+    terminate_tail_injected_exit_if_requested(thread);
+
     guard::drain_pending();
     thread.enter_guest_execution()?;
 
@@ -331,17 +356,28 @@ fn exit_group_with_thread<T: ToolGlobal>(thread: &mut Thread<T>, exit_code: usiz
     terminate_group(exit_code)
 }
 
-fn prepare_group_exit<T: ToolGlobal>(thread: &mut Thread<T>) {
-    thread.try_exit();
-    if let Some(exiting_pid) = thread::exit_all(|_, process_and_thread_id| unsafe {
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-265): Review exit_group ESRCH race handling.
+fn signal_controlled_exit(process_and_thread_id: PidTid) {
+    let result = unsafe {
         syscalls::syscall3(
             Sysno::tgkill,
             process_and_thread_id.pid as usize,
             process_and_thread_id.tid as usize,
             CONTROLLED_EXIT_SIGNAL as usize,
         )
-        .expect("Signaling thread failed");
-    }) {
+    };
+    match result {
+        Err(errno) if errno != Errno::ESRCH => panic!("Signaling thread failed: {errno}"),
+        _ => {}
+    }
+}
+
+fn prepare_group_exit<T: ToolGlobal>(thread: &mut Thread<T>) {
+    thread.try_exit();
+    if let Some(exiting_pid) =
+        thread::exit_all(|_, process_and_thread_id| signal_controlled_exit(process_and_thread_id))
+    {
         if !thread::wait_for_all_to_exit(exiting_pid, T::global().get_exit_timeout()) {
             let _ = T::global().on_exit_timeout();
         }
@@ -466,7 +502,9 @@ mod exit_group_tests {
     use syscalls::Errno;
 
     use super::read_clone3_stack;
+    use super::signal_controlled_exit;
     use super::terminate_group;
+    use crate::thread::PidTid;
 
     #[test]
     fn clone3_stack_read_rejects_invalid_guest_pointer() {
@@ -474,6 +512,15 @@ mod exit_group_tests {
             read_clone3_stack(std::process::id(), 1, 88),
             Err(Errno::EFAULT)
         );
+    }
+
+    #[test]
+    fn exited_group_member_is_a_successful_teardown_target() {
+        signal_controlled_exit(PidTid {
+            pid: std::process::id(),
+            // Linux's configured PID maximum is far below i32::MAX.
+            tid: i32::MAX as u32,
+        });
     }
 
     #[test]
