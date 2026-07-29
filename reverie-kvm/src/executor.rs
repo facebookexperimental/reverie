@@ -1555,6 +1555,36 @@ impl ElfExecutor {
             .contains(&(request.args()[0] as libc::c_int))
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED: Route ordinary reads to the Tool for accounting parity.
+    // TODO-HUMAN-REVIEW(PR-266): Review tool-visible vs backend-owned read classification.
+    //
+    // `read`/`readv` are otherwise backend-owned (see
+    // `runtime::is_backend_owned_syscall`) so the backend's own event loop can
+    // drain worker-created eventfds/pipes through the shared descriptor table
+    // without going through Detcore's scheduler (which would deadlock). That
+    // ownership, however, also hides ordinary guest file and stream reads from
+    // the Tool, breaking faithful syscall accounting (e.g. the dynamic linker's
+    // ELF-header `read` on a shared library) and cross-backend parity with
+    // ptrace. This narrows the hiding to exactly the worker-shared case:
+    // reads on regular files and on the standard streams are ordinary guest I/O
+    // and must reach `Tool::handle_syscall_event`; only non-regular,
+    // non-standard descriptors (eventfd/pipe/socket) stay backend-owned.
+    pub(crate) fn is_tool_visible_read(&self, request: &SyscallRequest) -> bool {
+        let number = request.number();
+        if number != libc::SYS_read as u64 && number != libc::SYS_readv as u64 {
+            return false;
+        }
+        let fd = request.args()[0] as libc::c_int;
+        if is_open_standard(&self.state, fd) {
+            return true;
+        }
+        self.state
+            .files
+            .get(&fd)
+            .and_then(|file| file.metadata().ok())
+            .is_some_and(|metadata| metadata.file_type().is_file())
+    }
+
     // TODO-HUMAN-REVIEW(PR-235): Review virtual parent identity for KVM Tool callbacks.
     pub(crate) fn parent_pid(&self) -> Option<reverie::Pid> {
         (self.state.ppid != 0).then(|| reverie::Pid::from_raw(self.state.ppid))

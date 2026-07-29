@@ -1317,7 +1317,8 @@ impl KvmBackend {
             // clone handler waits forever for a child Tool start that this
             // direct-worker path cannot issue.
             let backend_owned = (is_backend_owned_syscall(request.number())
-                && !executor.is_random_device_read(&request))
+                && !executor.is_random_device_read(&request)
+                && !executor.is_tool_visible_read(&request))
                 || is_thread_clone_request(&request, &memory);
             let subscribed = !backend_owned
                 && subscriptions

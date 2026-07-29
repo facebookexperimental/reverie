@@ -29,6 +29,7 @@ use crate::GuestMemory;
 use crate::Result;
 use crate::bootstrap::BOOT_RESERVED_END;
 use crate::bootstrap::PROGRAM_HEADERS_ADDRESS;
+use crate::bootstrap::VDSO_ADDRESS;
 
 const PAGE_SIZE: u64 = 4096;
 pub(crate) const STACK_LIMIT: u64 = 8 * 1024 * 1024;
@@ -60,6 +61,12 @@ const AT_EGID: u64 = 14;
 const AT_SECURE: u64 = 23;
 const AT_RANDOM: u64 = 25;
 const AT_EXECFN: u64 = 31;
+// Points at the base of the in-guest vDSO ELF image. glibc's dynamic linker
+// reads the vDSO's kernel-version ELF note through this entry during startup
+// (`_dl_discover_osversion`); without it glibc falls back to a `uname(2)`
+// syscall, which diverges the guest's startup syscall stream from the native
+// (ptrace) path and breaks cross-backend syscall-count parity.
+const AT_SYSINFO_EHDR: u64 = 33;
 
 // AUTONOMOUS-BOT-IMPLEMENTED: Share deterministic file identities across fork.
 // TODO-HUMAN-REVIEW(PR-136): Review linked and anonymous object identity lifetimes.
@@ -910,6 +917,7 @@ fn build_initial_stack(
     // Build the SysV initial stack image, low to high:
     //   argc, argv[0..], NULL, envp[0..], NULL, auxv pairs.., AT_NULL/0
     let auxv = vec![
+        (AT_SYSINFO_EHDR, VDSO_ADDRESS),
         (AT_PHDR, program_headers_address),
         (AT_PHENT, u64::from(elf.header.e_phentsize)),
         (AT_PHNUM, u64::from(elf.header.e_phnum)),
