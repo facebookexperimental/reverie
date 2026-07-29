@@ -66,6 +66,8 @@ impl InjectedSyscallFrame {
         | Self::RFLAGS_SF
         | Self::RFLAGS_OF;
 
+    // TODO-HUMAN-REVIEW(PR-264): Review the compact public e9tool-frame
+    // syscall-number accessor used by bounded instrumentation stacks.
     /// Returns the syscall number without materializing the full [`Syscall`]
     /// enum. Instrumentation bridges use this compact accessor on bounded
     /// trampoline stacks.
