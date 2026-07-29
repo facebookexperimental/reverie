@@ -38,6 +38,25 @@ pub type SignalHandlerInput = libc::siginfo_t;
 pub type SignalGuard = SequencerGuard<'static, SignalHandlerInput>;
 pub type SignalAntiGuard = SequencerAntiGuard<'static, SignalHandlerInput>;
 
+/// Restores the caller's signal-guard depth after a vfork-style child stops
+/// sharing its address space.
+///
+/// A successful exec in the child deliberately leaks an inclusion-zone guard
+/// because the old image never returns. With `CLONE_VM | CLONE_VFORK`, that
+/// bookkeeping temporarily lives in the blocked parent's TLS as well. The
+/// parent must recover its pre-vfork depth when the kernel resumes it. Queued
+/// signal accounting is intentionally preserved because signals may have
+/// arrived while the child was running.
+pub(crate) struct VforkSignalGuardRestore {
+    guard_count: u32,
+}
+
+impl Drop for VforkSignalGuardRestore {
+    fn drop(&mut self) {
+        signal_handler_sequencer().restore_guard_count(self.guard_count);
+    }
+}
+
 thread_local! {
     pub(crate) static SIGNAL_HANLDER_SEQUENCER: GuardedSequencer<SignalHandlerInput>
         = const { GuardedSequencer::with_initial_guard_count(1) };
@@ -192,6 +211,18 @@ impl<T> GuardedSequencer<T> {
         self.guard_state.fetch_add(GUARD_COUNT_UNIT, Acquire);
     }
 
+    fn guard_count(&self) -> u32 {
+        (self.guard_state.load(Acquire) & GUARD_COUNT_MASK) as u32
+    }
+
+    fn restore_guard_count(&self, guard_count: u32) {
+        self.guard_state
+            .try_update(AcqRel, Acquire, |state| {
+                Some((state & QUEUED_COUNT_MASK) | u64::from(guard_count))
+            })
+            .expect("signal guard restoration cannot fail");
+    }
+
     /// Decrement the counter for guards, and if the count goes to zero, we run
     /// any invocations that were added while the guard(s) were active
     fn decrement_guard_count(&self) {
@@ -273,6 +304,15 @@ pub fn invoke_guarded(handler: fn(SignalHandlerInput), siginfo: SignalHandlerInp
 #[must_use]
 pub fn enter_signal_exclusion_zone() -> SignalGuard {
     signal_handler_sequencer().guard()
+}
+
+/// Snapshot the current guard depth for a kernel vfork boundary. The returned
+/// restore object must remain live until the blocked parent resumes.
+#[must_use]
+pub(crate) fn preserve_signal_guard_count_across_vfork() -> VforkSignalGuardRestore {
+    VforkSignalGuardRestore {
+        guard_count: signal_handler_sequencer().guard_count(),
+    }
 }
 
 /// Enter an already-exiting region where signals cannot interrupt execution of
@@ -402,6 +442,16 @@ mod tests {
             // order they were received
             assert_interrupts_eq!(log, [h1, h2]);
         });
+    }
+
+    #[test]
+    fn restoring_vfork_guard_depth_preserves_queued_signal_count() {
+        let sequencer = GuardedSequencer::<SignalHandlerInput>::with_initial_guard_count(2);
+        sequencer.guard_state.store(QUEUED_COUNT_UNIT, SeqCst);
+
+        sequencer.restore_guard_count(2);
+
+        assert_eq!(sequencer.guard_state.load(SeqCst), QUEUED_COUNT_UNIT + 2);
     }
 
     #[test]

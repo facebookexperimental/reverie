@@ -418,8 +418,30 @@ pub fn sys_rt_sigprocmask(
 
 #[inline]
 pub fn is_vfork(sys_no: Sysno, arg1: usize) -> bool {
-    const VFORK_FLAGS: usize = (libc::CLONE_VM | libc::CLONE_VFORK | libc::SIGCHLD) as usize;
+    const VFORK_FLAGS: usize = (libc::CLONE_VM | libc::CLONE_VFORK) as usize;
     sys_no == Sysno::vfork || (sys_no == Sysno::clone && (arg1 & VFORK_FLAGS == VFORK_FLAGS))
+}
+
+#[cfg(test)]
+mod vfork_tests {
+    use super::*;
+
+    #[test]
+    fn clone_vfork_detection_accepts_any_exit_signal() {
+        let required = (libc::CLONE_VM | libc::CLONE_VFORK) as usize;
+
+        assert!(is_vfork(Sysno::vfork, 0));
+        assert!(is_vfork(Sysno::clone, required));
+        assert!(is_vfork(Sysno::clone, required | libc::SIGCHLD as usize));
+        assert!(is_vfork(Sysno::clone, required | libc::SIGUSR1 as usize));
+    }
+
+    #[test]
+    fn clone_vfork_detection_requires_both_semantic_flags() {
+        assert!(!is_vfork(Sysno::clone, libc::CLONE_VM as usize));
+        assert!(!is_vfork(Sysno::clone, libc::CLONE_VFORK as usize));
+        assert!(!is_vfork(Sysno::fork, 0));
+    }
 }
 
 #[cfg(test)]

@@ -86,28 +86,39 @@ pub(crate) fn terminate_tail_injected_exit_if_requested<E: thread::EventSink>(
 
 pub const CONTROLLED_EXIT_SIGNAL: libc::c_int = libc::SIGSTKFLT;
 
-/// Read clone3's stack pointer without directly dereferencing guest memory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Clone3Fields {
+    flags: u64,
+    stack: u64,
+}
+
+impl Clone3Fields {
+    fn is_vfork(self) -> bool {
+        let required = (libc::CLONE_VM | libc::CLONE_VFORK) as u64;
+        self.flags & required == required
+    }
+}
+
+/// Read clone3's flags and stack pointer without directly dereferencing guest memory.
 ///
 /// `process_vm_readv` asks the kernel to validate the address, preserving the
 /// syscall's `EFAULT` behavior when the guest supplies an invalid pointer.
-fn read_clone3_stack(pid: u32, args: usize, size: usize) -> Result<u64, Errno> {
+fn read_clone3_fields(pid: u32, args: usize, size: usize) -> Result<Clone3Fields, Errno> {
     const CLONE_ARGS_MIN_SIZE: usize = 64;
-    const STACK_OFFSET: usize = 5 * std::mem::size_of::<u64>();
 
     // Let clone3 itself report EINVAL for undersized argument structures.
     if size < CLONE_ARGS_MIN_SIZE {
-        return Ok(0);
+        return Ok(Clone3Fields { flags: 0, stack: 0 });
     }
 
-    let stack_address = args.checked_add(STACK_OFFSET).ok_or(Errno::EFAULT)?;
-    let mut stack = 0u64;
+    let mut fields = [0u64; 6];
     let local = libc::iovec {
-        iov_base: (&mut stack as *mut u64).cast(),
-        iov_len: std::mem::size_of_val(&stack),
+        iov_base: fields.as_mut_ptr().cast(),
+        iov_len: std::mem::size_of_val(&fields),
     };
     let remote = libc::iovec {
-        iov_base: stack_address as *mut libc::c_void,
-        iov_len: std::mem::size_of_val(&stack),
+        iov_base: args as *mut libc::c_void,
+        iov_len: std::mem::size_of_val(&fields),
     };
     let copied = unsafe {
         syscall!(
@@ -121,8 +132,11 @@ fn read_clone3_stack(pid: u32, args: usize, size: usize) -> Result<u64, Errno> {
         )?
     };
 
-    (copied == std::mem::size_of_val(&stack))
-        .then_some(stack)
+    (copied == std::mem::size_of_val(&fields))
+        .then_some(Clone3Fields {
+            flags: fields[0],
+            stack: fields[5],
+        })
         .ok_or(Errno::EFAULT)
 }
 
@@ -221,6 +235,8 @@ fn handle_syscall_with_thread<T: ToolGlobal>(
     // completes, deadlocking the in-guest allocator under concurrent clones.
     // TODO-HUMAN-REVIEW(PR-226): Review deferred clone-child registration.
     let result = if sys_no == Sysno::clone && arg2 != 0 {
+        let _vfork_guard_restore =
+            utils::is_vfork(sys_no, arg1).then(guard::preserve_signal_guard_count_across_vfork);
         // New thread with its own stack: the kernel sets the child's %rsp to
         // `child_stack`, so clone_syscall's `jmp r9` shortcut is correct.
         thread.maybe_fork_as_guest(|| {
@@ -238,6 +254,8 @@ fn handle_syscall_with_thread<T: ToolGlobal>(
                 .unwrap_or_else(|e| -e.into_raw() as usize)
         })?
     } else if sys_no == Sysno::clone {
+        let _vfork_guard_restore =
+            utils::is_vfork(sys_no, arg1).then(guard::preserve_signal_guard_count_across_vfork);
         // clone(2) without a new stack behaves like fork: the child shares the
         // parent's stack layout and must resume the guest on its ORIGINAL %rsp,
         // which fork_syscall restores from the SaBRe syscall frame.
@@ -269,6 +287,7 @@ fn handle_syscall_with_thread<T: ToolGlobal>(
                 .unwrap_or_else(|e| -e.into_raw() as usize)
         })?
     } else if utils::is_vfork(sys_no, arg1) {
+        let _vfork_guard_restore = guard::preserve_signal_guard_count_across_vfork();
         thread.maybe_fork_as_guest(|| {
             T::global()
                 .syscall_with_inject(intercepted, &LocalMemory::new(), || unsafe {
@@ -286,12 +305,14 @@ fn handle_syscall_with_thread<T: ToolGlobal>(
                 .unwrap_or_else(|e| -e.into_raw() as usize)
         })?
     } else if sys_no == Sysno::clone3 {
-        let stack = read_clone3_stack(thread.get_process_and_thread_ids().pid, arg1, arg2);
+        let fields = read_clone3_fields(thread.get_process_and_thread_ids().pid, arg1, arg2);
+        let is_vfork = fields.as_ref().is_ok_and(|fields| fields.is_vfork());
+        let _vfork_guard_restore = is_vfork.then(guard::preserve_signal_guard_count_across_vfork);
         thread.maybe_fork_as_guest(|| {
             T::global()
-                .syscall_with_inject(intercepted, &LocalMemory::new(), || match stack {
+                .syscall_with_inject(intercepted, &LocalMemory::new(), || match fields {
                     Err(errno) => -errno.into_raw() as usize,
-                    Ok(0) => unsafe {
+                    Ok(Clone3Fields { stack: 0, .. }) => unsafe {
                         syscall!(sys_no, arg1, arg2, arg3, arg4, arg5, arg6)
                             .unwrap_or_else(|e| -e.into_raw() as usize)
                     },
@@ -501,7 +522,7 @@ fn terminate_group(exit_code: usize) -> ! {
 mod exit_group_tests {
     use syscalls::Errno;
 
-    use super::read_clone3_stack;
+    use super::read_clone3_fields;
     use super::signal_controlled_exit;
     use super::terminate_group;
     use crate::thread::PidTid;
@@ -509,9 +530,33 @@ mod exit_group_tests {
     #[test]
     fn clone3_stack_read_rejects_invalid_guest_pointer() {
         assert_eq!(
-            read_clone3_stack(std::process::id(), 1, 88),
+            read_clone3_fields(std::process::id(), 1, 88),
             Err(Errno::EFAULT)
         );
+    }
+
+    #[test]
+    fn clone3_fields_identify_vfork_and_stack() {
+        let fields = [
+            (libc::CLONE_VM | libc::CLONE_VFORK) as u64,
+            0,
+            0,
+            0,
+            libc::SIGCHLD as u64,
+            0x1234,
+            0x2000,
+            0,
+        ];
+
+        let actual = read_clone3_fields(
+            std::process::id(),
+            fields.as_ptr() as usize,
+            std::mem::size_of_val(&fields),
+        )
+        .unwrap();
+
+        assert!(actual.is_vfork());
+        assert_eq!(actual.stack, 0x1234);
     }
 
     #[test]
