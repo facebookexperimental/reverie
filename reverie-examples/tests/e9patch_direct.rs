@@ -94,6 +94,24 @@ async fn inherited_stdio_uses_sealed_bootstrap_and_returns_empty_buffers() {
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires a built e9tool/e9patch pair"]
+async fn status_only_launch_returns_exit_status_and_global_state() {
+    let (_directory, guest) = compile_guest();
+    let mut command = Command::new(guest);
+    command
+        .env("REVERIE_E9PATCH_EXAMPLE_TOOL", "e9patch-smoke")
+        .env("REVERIE_E9PATCH_WRITE_BURST", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let (status, global) =
+        E9patchBackend::run_direct_with_preload::<AotCounterTool>(command, (), example_preload())
+            .await
+            .unwrap();
+    assert_eq!(status, ExitStatus::Exited(0));
+    assert_eq!(global.delivered(), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires a built e9tool/e9patch pair"]
 async fn legacy_environment_bootstrap_remains_compatible() {
     let (_directory, guest) = compile_guest();
     let mut command = Command::new(guest);

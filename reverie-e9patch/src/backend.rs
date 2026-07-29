@@ -397,6 +397,30 @@ where
 pub struct E9patchBackend;
 
 impl E9patchBackend {
+    /// Runs a generic Tool through e9patch's direct AOT callback without
+    /// capturing the guest's output.
+    ///
+    /// This matches LiteInst's explicit-preload status launch: the command's
+    /// stdio configuration is left unchanged and the result contains only the
+    /// guest's exit status plus the coordinator-owned global state. Any piped
+    /// stdout or stderr is drained concurrently and discarded so a noisy guest
+    /// cannot block on an unread caller pipe.
+    pub async fn run_direct_with_preload<T>(
+        command: Command,
+        config: <T::GlobalState as GlobalTool>::Config,
+        preload: impl Into<PathBuf>,
+    ) -> Result<(ExitStatus, T::GlobalState), Error>
+    where
+        T: Tool + 'static,
+    {
+        let (wait, global) =
+            launch_direct::<T>(command, config, preload.into(), false, None).await?;
+        match wait {
+            ChildWait::Status(status) => Ok((status.into(), global)),
+            ChildWait::Output(_) => unreachable!("status run returned captured output"),
+        }
+    }
+
     // TODO-HUMAN-REVIEW(PR-269): Review the first
     // ptrace-free generic Tool launch boundary and inherited preload contract.
     /// Runs a generic Tool through e9patch's direct AOT callback and captures
@@ -418,7 +442,12 @@ impl E9patchBackend {
     {
         command.stdout(reverie::process::Stdio::piped());
         command.stderr(reverie::process::Stdio::piped());
-        launch_direct::<T>(command, config, preload.into(), None).await
+        let (wait, global) =
+            launch_direct::<T>(command, config, preload.into(), true, None).await?;
+        match wait {
+            ChildWait::Output(output) => Ok((into_reverie_output(output), global)),
+            ChildWait::Status(_) => unreachable!("output run returned only a status"),
+        }
     }
 
     /// Runs a generic Tool with captured output and a sealed, inherited
@@ -444,7 +473,18 @@ impl E9patchBackend {
     {
         command.stdout(reverie::process::Stdio::piped());
         command.stderr(reverie::process::Stdio::piped());
-        launch_direct::<T>(command, config, preload.into(), Some(tool_data.into())).await
+        let (wait, global) = launch_direct::<T>(
+            command,
+            config,
+            preload.into(),
+            true,
+            Some(tool_data.into()),
+        )
+        .await?;
+        match wait {
+            ChildWait::Output(output) => Ok((into_reverie_output(output), global)),
+            ChildWait::Status(_) => unreachable!("output run returned only a status"),
+        }
     }
 
     /// Runs a generic Tool with inherited guest stdio and a sealed constructor
@@ -464,11 +504,23 @@ impl E9patchBackend {
         T: Tool + 'static,
     {
         inherit_stdio(&mut command);
-        let (output, global) =
-            launch_direct::<T>(command, config, preload.into(), Some(tool_data.into())).await?;
-        debug_assert!(output.stdout.is_empty());
-        debug_assert!(output.stderr.is_empty());
-        Ok((output, global))
+        let (wait, global) = launch_direct::<T>(
+            command,
+            config,
+            preload.into(),
+            true,
+            Some(tool_data.into()),
+        )
+        .await?;
+        match wait {
+            ChildWait::Output(output) => {
+                let output = into_reverie_output(output);
+                debug_assert!(output.stdout.is_empty());
+                debug_assert!(output.stderr.is_empty());
+                Ok((output, global))
+            }
+            ChildWait::Status(_) => unreachable!("output run returned only a status"),
+        }
     }
 
     async fn spawn<T>(
@@ -657,12 +709,61 @@ fn inherit_stdio(command: &mut Command) {
     command.stderr(reverie::process::Stdio::inherit());
 }
 
+enum ChildWait {
+    Status(std::process::ExitStatus),
+    Output(std::process::Output),
+}
+
+fn into_reverie_output(output: std::process::Output) -> Output {
+    Output {
+        status: output.status.into(),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    }
+}
+
+fn drain_pipe<R>(mut pipe: R) -> std::thread::JoinHandle<io::Result<u64>>
+where
+    R: Read + Send + 'static,
+{
+    std::thread::spawn(move || io::copy(&mut pipe, &mut io::sink()))
+}
+
+fn wait_without_output(mut child: std::process::Child) -> io::Result<std::process::ExitStatus> {
+    let drainers = [
+        child.stdout.take().map(drain_pipe),
+        child.stderr.take().map(drain_pipe),
+    ];
+    let status = child.wait();
+    if status.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    let mut drain_error = None;
+    for drainer in drainers.into_iter().flatten() {
+        let result = drainer
+            .join()
+            .map_err(|_| io::Error::other("e9patch stdio drainer panicked"))
+            .and_then(|result| result.map(|_| ()));
+        if let Err(error) = result {
+            drain_error.get_or_insert(error);
+        }
+    }
+    let status = status?;
+    if let Some(error) = drain_error {
+        return Err(error);
+    }
+    Ok(status)
+}
+
 async fn launch_direct<T>(
     mut command: Command,
     config: <T::GlobalState as GlobalTool>::Config,
     preload: PathBuf,
+    capture_output: bool,
     tool_data: Option<Vec<u8>>,
-) -> Result<(Output, T::GlobalState), Error>
+) -> Result<(ChildWait, T::GlobalState), Error>
 where
     T: Tool + 'static,
 {
@@ -768,7 +869,13 @@ where
         }
     };
     drop(bootstrap);
-    let wait = tokio::task::spawn_blocking(move || child.wait_with_output());
+    let wait = tokio::task::spawn_blocking(move || {
+        if capture_output {
+            child.wait_with_output().map(ChildWait::Output)
+        } else {
+            wait_without_output(child).map(ChildWait::Status)
+        }
+    });
     let wait = serve_rpc_until(server, async move {
         wait.await
             .map_err(|error| io::Error::other(error.to_string()))?
@@ -783,14 +890,7 @@ where
         .into());
     }
     let global = unwrap_global_after_connections(global).await?;
-    Ok((
-        Output {
-            status: wait.status.into(),
-            stdout: wait.stdout,
-            stderr: wait.stderr,
-        },
-        global,
-    ))
+    Ok((wait, global))
 }
 
 async fn serve_rpc_until<G, F, T>(server: RpcServer<G>, completion: F) -> io::Result<T>
@@ -904,6 +1004,46 @@ mod tests {
         assert!(child.stderr.is_none());
         let status = child.wait().unwrap();
         assert!(status.success());
+    }
+
+    #[test]
+    fn status_wait_drains_piped_output_without_deadlock() {
+        const CHILD_ENV: &str = "REVERIE_E9PATCH_STATUS_DRAIN_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let chunk = [b'x'; 16 * 1024];
+            for _ in 0..128 {
+                io::stdout().write_all(&chunk).unwrap();
+                io::stderr().write_all(&chunk).unwrap();
+            }
+            return;
+        }
+
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "backend::tests::status_wait_drains_piped_output_without_deadlock",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            sender.send(wait_without_output(child)).unwrap();
+        });
+        let result = match receiver.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(result) => result,
+            Err(error) => {
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                let _ = waiter.join();
+                panic!("status wait did not drain piped output before timeout: {error}");
+            }
+        };
+        waiter.join().unwrap();
+        assert!(result.unwrap().success());
     }
 
     #[test]

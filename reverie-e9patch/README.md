@@ -138,8 +138,8 @@ it.
    same sealed inherited-memfd bootstrap pattern as LiteInst, so neither the
    coordinator path nor tool selector is added to the guest environment. The
    production `Backend::run<T>` path remains ptrace-hosted; the direct path is
-   an explicit `run_direct_with_output_and_preload` harness while its lifecycle
-   boundary is still single-process and single-thread.
+   an explicit `run_direct_with_preload` family while its lifecycle boundary is
+   still single-process and single-thread.
 
 In shared built-in and opt-in generic-tool modes, AOT-rewritten sites dispatch
 directly. The shared SIGSYS dispatcher is reached only by residual sites e9patch
@@ -231,9 +231,14 @@ LiteInst. `install_tool::<T>` owns per-thread `ThreadState`, implements an
 in-process `Guest<T>` over the e9tool register frame and local memory, routes
 `GlobalRPC` over the shared UDS/bincode protocol, runs start/post-exec/exit
 callbacks, and protects nested Tool syscalls plus the coordinator descriptor.
-`E9patchBackend::run_direct_with_output_and_preload` owns the coordinator and
-rewritten guest for this opt-in path. Its legacy coordinator environment
-contract remains available for existing tool DSOs. New selectors use
+`E9patchBackend::run_direct_with_preload` owns the coordinator and rewritten
+guest for this opt-in path and returns its exit status without capturing or
+overriding the command's stdio, matching LiteInst's explicit-preload launch.
+Caller-created stdout and stderr pipes are drained concurrently and discarded,
+so output beyond pipe capacity cannot deadlock a status-only launch.
+`run_direct_with_output_and_preload` remains available when the caller needs
+captured stdout and stderr. The legacy coordinator environment contract remains
+available for existing tool DSOs. New selectors use
 `run_direct_with_output_and_preload_data`, which passes the coordinator path
 and bounded opaque bytes in a sealed inherited memfd. A constructor consumes
 exactly one matching descriptor with `take_preload_bootstrap`, closes it before
