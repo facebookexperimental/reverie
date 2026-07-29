@@ -134,10 +134,12 @@ it.
 4. **How a generic tool is selected.** Shared built-ins live in
    `reverie-preload`. A generic `T: Tool` instead lives in a tool-specific DSO,
    matching LiteInst: its constructor calls `install_tool::<T>`, connects to the
-   coordinator, and publishes the AOT callback. The production
-   `Backend::run<T>` path remains ptrace-hosted; the direct path is an explicit
-   `run_direct_with_output_and_preload` harness while its lifecycle boundary is
-   still single-process and single-thread.
+   coordinator, and publishes the AOT callback. Tool-data launchers use the
+   same sealed inherited-memfd bootstrap pattern as LiteInst, so neither the
+   coordinator path nor tool selector is added to the guest environment. The
+   production `Backend::run<T>` path remains ptrace-hosted; the direct path is
+   an explicit `run_direct_with_output_and_preload` harness while its lifecycle
+   boundary is still single-process and single-thread.
 
 In shared built-in and opt-in generic-tool modes, AOT-rewritten sites dispatch
 directly. The shared SIGSYS dispatcher is reached only by residual sites e9patch
@@ -230,7 +232,16 @@ in-process `Guest<T>` over the e9tool register frame and local memory, routes
 `GlobalRPC` over the shared UDS/bincode protocol, runs start/post-exec/exit
 callbacks, and protects nested Tool syscalls plus the coordinator descriptor.
 `E9patchBackend::run_direct_with_output_and_preload` owns the coordinator and
-rewritten guest for this opt-in path.
+rewritten guest for this opt-in path. Its legacy coordinator environment
+contract remains available for existing tool DSOs. New selectors use
+`run_direct_with_output_and_preload_data`, which passes the coordinator path
+and bounded opaque bytes in a sealed inherited memfd. A constructor consumes
+exactly one matching descriptor with `take_preload_bootstrap`, closes it before
+guest `main`, and calls `install_tool_from_bootstrap::<T>` without mutating the
+environment. The selector must install the same concrete `T` as the
+coordinator; unknown selectors fail before connection. Multiple matching or
+malformed e9patch bootstraps fail closed and every matching descriptor is
+closed.
 
 `E9patchBackend::run` deliberately still drives generic tools through ptrace:
 the direct host does not yet cover process trees, exec rebootstrap, guest signal

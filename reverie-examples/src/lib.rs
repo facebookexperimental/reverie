@@ -99,6 +99,35 @@ unsafe extern "C" fn initialize(
     if !unsafe { loaded_as_preload() } {
         return;
     }
+    let e9patch_bootstrap = match unsafe { reverie_e9patch::take_preload_bootstrap() } {
+        Ok(bootstrap) => bootstrap,
+        Err(error) => fail(&format!("invalid e9patch preload bootstrap: {error}")),
+    };
+    if let Some(bootstrap) = e9patch_bootstrap {
+        match unsafe { reverie_e9patch::take_preload_bootstrap() } {
+            Ok(None) => {}
+            Ok(Some(_)) => fail("e9patch preload bootstrap was not consumed"),
+            Err(error) => fail(&format!("invalid residual e9patch bootstrap: {error}")),
+        }
+        let selected = match String::from_utf8(bootstrap.tool_data) {
+            Ok(selected) => selected,
+            Err(_) => fail("e9patch example tool selector is not valid UTF-8"),
+        };
+        let result = match selected.as_str() {
+            "e9patch-smoke" => unsafe {
+                reverie_e9patch::install_tool_from_bootstrap::<e9patch_smoke::AotCounterTool>(
+                    &bootstrap.coordinator,
+                )
+            },
+            other => fail(&format!("unknown e9patch bootstrap tool {other:?}")),
+        };
+        if let Err(error) = result {
+            fail(&format!(
+                "e9patch bootstrap tool initialization failed: {error}"
+            ));
+        }
+        return;
+    }
     if let Some(socket) = std::env::var_os(reverie_e9patch::COORDINATOR_ENV) {
         let selected = std::env::var_os(E9PATCH_EXAMPLE_TOOL_ENV)
             .and_then(|value| value.into_string().ok())

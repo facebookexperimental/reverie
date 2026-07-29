@@ -85,6 +85,32 @@ pub unsafe fn install_tool<T>(coordinator: impl AsRef<Path>) -> io::Result<()>
 where
     T: Tool + 'static,
 {
+    unsafe { install_tool_inner::<T>(coordinator.as_ref(), true) }
+}
+
+/// Installs a concrete Tool using a consumed bootstrap coordinator path.
+///
+/// Unlike [`install_tool`], this does not remove the legacy coordinator
+/// environment variable because the sealed bootstrap did not introduce one.
+///
+/// # Safety
+///
+/// Installs process-global signal, seccomp, dispatcher, and AOT callback state.
+/// Call exactly once before application-created threads start.
+pub unsafe fn install_tool_from_bootstrap<T>(coordinator: impl AsRef<Path>) -> io::Result<()>
+where
+    T: Tool + 'static,
+{
+    unsafe { install_tool_inner::<T>(coordinator.as_ref(), false) }
+}
+
+unsafe fn install_tool_inner<T>(
+    coordinator: &Path,
+    remove_legacy_environment: bool,
+) -> io::Result<()>
+where
+    T: Tool + 'static,
+{
     if TOOL_INSTALLED
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
@@ -98,8 +124,10 @@ where
     let rpc = CoordinatorRpc::<T::GlobalState>::connect(coordinator)?;
     let pid = Pid::from_raw(raw_pid(libc::SYS_getpid).as_raw());
     let subscriptions = T::subscriptions(rpc.config()).iter_syscalls().collect();
-    // SAFETY: installation runs in a preload constructor before guest threads.
-    unsafe { std::env::remove_var(crate::COORDINATOR_ENV) };
+    if remove_legacy_environment {
+        // SAFETY: installation runs in a preload constructor before guest threads.
+        unsafe { std::env::remove_var(crate::COORDINATOR_ENV) };
+    }
     let tool = T::new(pid, rpc.config());
     let dispatch_page = aot::PendingDispatchPage::prepare()?;
     let config = crate::runtime::runtime_config_from_env()?;

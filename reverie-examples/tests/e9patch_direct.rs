@@ -50,7 +50,30 @@ fn example_preload() -> PathBuf {
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires a built e9tool/e9patch pair"]
-async fn generic_tool_runs_on_direct_aot_callback_and_rpcs() {
+async fn sealed_bootstrap_selects_matching_tool_without_environment_mutation() {
+    let (_directory, guest) = compile_guest();
+    let mut command = Command::new(guest);
+    command
+        .env("REVERIE_E9PATCH_EXPECT_BOOTSTRAP_ENV", "1")
+        .env("REVERIE_E9PATCH_COORDINATOR", "preexisting-coordinator")
+        .env("REVERIE_E9PATCH_EXAMPLE_TOOL", "preexisting-selector")
+        .env("REVERIE_E9PATCH_BOOTSTRAP_SENTINEL", "two  spaces\tand-tab");
+    let (output, global) =
+        E9patchBackend::run_direct_with_output_and_preload_data::<AotCounterTool>(
+            command,
+            (),
+            example_preload(),
+            b"e9patch-smoke",
+        )
+        .await
+        .unwrap();
+    assert_eq!(output.status, ExitStatus::Exited(0), "{output:?}");
+    assert_eq!(global.delivered(), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires a built e9tool/e9patch pair"]
+async fn legacy_environment_bootstrap_remains_compatible() {
     let (_directory, guest) = compile_guest();
     let mut command = Command::new(guest);
     command.env("REVERIE_E9PATCH_EXAMPLE_TOOL", "e9patch-smoke");
@@ -63,4 +86,27 @@ async fn generic_tool_runs_on_direct_aot_callback_and_rpcs() {
     .unwrap();
     assert_eq!(output.status, ExitStatus::Exited(0), "{output:?}");
     assert_eq!(global.delivered(), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires a built e9tool/e9patch pair"]
+async fn sealed_bootstrap_rejects_unknown_tool_selector() {
+    let (_directory, guest) = compile_guest();
+    let result = E9patchBackend::run_direct_with_output_and_preload_data::<AotCounterTool>(
+        Command::new(guest),
+        (),
+        example_preload(),
+        b"not-a-tool",
+    )
+    .await;
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("unknown selector must fail before Tool connection"),
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("exited before its Tool preload connected"),
+        "{error:#}"
+    );
 }

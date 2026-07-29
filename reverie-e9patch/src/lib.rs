@@ -61,6 +61,8 @@ pub mod runtime;
 mod tool_host;
 
 pub use backend::E9patchBackend;
+pub use backend::PreloadBootstrap;
+pub use backend::take_preload_bootstrap;
 pub use dispatch::E9patchDispatcher;
 // Re-exported from the shared crate so a consumer selecting an e9patch built-in
 // tool imports the *same* enum both ld-preload backends use. The tool is shared,
@@ -83,8 +85,13 @@ pub use runtime::TOOL_SPOOF_GETPID;
 pub use runtime::alt_stack_from_env_value;
 pub use runtime::builtin_tool_from_env_value;
 pub use tool_host::install_tool;
+pub use tool_host::install_tool_from_bootstrap;
 
-/// Environment variable naming the generic-Tool coordinator socket.
+/// Environment variable naming the generic-Tool coordinator socket for legacy
+/// tool preloads.
+///
+/// New tool-data launchers pass the coordinator path in a sealed inherited
+/// bootstrap instead.
 // TODO-HUMAN-REVIEW(PR-269): Review the inherited
 // coordinator-path bootstrap for the first generic e9patch Tool-host slice.
 pub const COORDINATOR_ENV: &str = "REVERIE_E9PATCH_COORDINATOR";
