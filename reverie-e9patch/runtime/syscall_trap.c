@@ -38,7 +38,7 @@ reverie_e9patch_syscall(void *state __attribute__((unused))) {
  * in ordinary guest context. Otherwise jump to the byte-for-byte legacy ptrace
  * trap above, preserving the existing correctness fallback.
  */
-// TODO-HUMAN-REVIEW(PR-pending): Review AOT trampoline routing through the
+// TODO-HUMAN-REVIEW(PR-264): Review AOT trampoline routing through the
 // shared reverie-preload dispatcher.
 // AUTONOMOUS-BOT-IMPLEMENTED
 __attribute__((naked, used, section(".text.100_dispatch"))) void

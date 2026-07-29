@@ -95,7 +95,7 @@ impl Drop for PendingDispatchPage {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-pending): Review the AOT callback and shared e9tool frame
+// TODO-HUMAN-REVIEW(PR-264): Review the AOT callback and shared e9tool frame
 // mutation.
 /// Routes one e9tool state frame through the registered shared dispatcher.
 ///

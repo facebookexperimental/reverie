@@ -19,7 +19,7 @@ use reverie::syscalls::Sysno;
 /// exact layout. Backends opt into the fallback trap ABI with
 /// [`crate::TracerBuilder::injected_syscall_trap`].
 // TODO-HUMAN-REVIEW(PR-102): Review the e9tool state-frame syscall ABI.
-// TODO-HUMAN-REVIEW(PR-pending): Review exposing the existing e9tool state frame
+// TODO-HUMAN-REVIEW(PR-264): Review exposing the existing e9tool state frame
 // to the in-process AOT dispatcher.
 // AUTONOMOUS-BOT-IMPLEMENTED
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -16,7 +16,7 @@
 use crate::signal;
 use crate::trap;
 
-// TODO-HUMAN-REVIEW(PR-pending): Review the public dispatch-origin contract used by
+// TODO-HUMAN-REVIEW(PR-264): Review the public dispatch-origin contract used by
 // direct binary-rewriter trampolines.
 // AUTONOMOUS-BOT-IMPLEMENTED
 /// How a syscall reached the shared preload dispatcher.
@@ -94,7 +94,7 @@ impl SyscallEvent {
         self.instruction_pointer
     }
 
-    // TODO-HUMAN-REVIEW(PR-pending): Review dispatch-origin exposure to backend
+    // TODO-HUMAN-REVIEW(PR-264): Review dispatch-origin exposure to backend
     // dispatchers.
     // AUTONOMOUS-BOT-IMPLEMENTED
     /// Returns how this syscall entered the shared dispatcher.

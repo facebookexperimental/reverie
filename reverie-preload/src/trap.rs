@@ -140,7 +140,7 @@ fn dispatch_event(event: &mut SyscallEvent) {
     }
 }
 
-// TODO-HUMAN-REVIEW(PR-pending): Review direct invocation of the registered
+// TODO-HUMAN-REVIEW(PR-264): Review direct invocation of the registered
 // dispatcher by ahead-of-time instrumentation trampolines.
 // AUTONOMOUS-BOT-IMPLEMENTED
 /// Dispatch a syscall from an instrumentation trampoline in ordinary context.
