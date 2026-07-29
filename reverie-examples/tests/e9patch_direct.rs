@@ -8,6 +8,7 @@ use reverie::process::Stdio;
 use reverie_e9patch::E9patchBackend;
 use reverie_e9patch::TOOL_PRELOAD_ENV;
 use reverie_examples::e9patch_smoke::AotCounterTool;
+use reverie_examples::run_e9patch_noop_with_preload;
 
 fn compile_guest() -> (tempfile::TempDir, PathBuf) {
     let directory = tempfile::tempdir().unwrap();
@@ -142,6 +143,20 @@ async fn environment_selected_preload_runs_status_only_tool() {
         .unwrap();
     assert_eq!(status, ExitStatus::Exited(0));
     assert_eq!(global.delivered(), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires a built e9tool/e9patch pair"]
+async fn production_noop_preserves_native_rewritten_syscall() {
+    let (_directory, guest) = compile_guest();
+    let mut command = Command::new(guest);
+    command.env("REVERIE_E9PATCH_EXPECT_NATIVE_GETPID", "1");
+    let (output, ()) = run_e9patch_noop_with_preload(command, example_preload())
+        .await
+        .unwrap();
+    assert_eq!(output.status, ExitStatus::Exited(0), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -255,7 +255,10 @@ bootstrap while replacing any caller-configured stdin, stdout, and stderr with
 inherited handles. It returns the guest status with empty output buffers, which
 matches LiteInst for tools that share the launcher's sink and preserve ordering
 between intercepted and pass-through writes. The captured-output launch remains
-available as a separate API.
+available as a separate API. The examples preload now also hosts LiteInst's
+production Noop Tool through the sealed selector; a rewritten `getpid` retains
+its native result because Noop subscribes to no events, complementing the
+e9patch smoke Tool's subscribed-result mutation proof.
 
 `E9patchBackend::run` deliberately still drives generic tools through ptrace:
 the direct host does not yet cover process trees, exec rebootstrap, guest signal

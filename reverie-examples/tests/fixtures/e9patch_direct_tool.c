@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <string.h>
+#include <unistd.h>
 
 extern char **environ;
 
@@ -61,6 +62,10 @@ int main(void) {
   }
   if (has_environment_entry("REVERIE_E9PATCH_WRITE_BURST=1")) {
     write_burst();
+  }
+  if (has_environment_entry("REVERIE_E9PATCH_EXPECT_NATIVE_GETPID=1")) {
+    long native_pid = getpid();
+    raw_exit_group(raw_getpid() == native_pid ? 0 : 1);
   }
   raw_exit_group(raw_getpid() == 424242 ? 0 : 1);
 }

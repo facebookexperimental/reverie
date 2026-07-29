@@ -53,6 +53,25 @@ pub(crate) use strace::config;
 pub(crate) use strace::filter;
 pub(crate) use strace::global_state;
 
+/// Runs the production Noop Tool through e9patch's direct AOT path.
+///
+/// The sealed selector and coordinator both use the same concrete `NoopTool`,
+/// while the caller supplies the example preload DSO that embeds it. Noop
+/// subscribes to no syscalls, so rewritten guest sites retain their native
+/// results.
+pub async fn run_e9patch_noop_with_preload(
+    command: reverie::process::Command,
+    preload: impl Into<std::path::PathBuf>,
+) -> Result<(reverie::process::Output, ()), reverie::Error> {
+    reverie_e9patch::E9patchBackend::run_direct_with_output_and_preload_data::<noop::NoopTool>(
+        command,
+        (),
+        preload,
+        b"noop",
+    )
+    .await
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-139): Review the example-tool preload constructor and selector boundary.
 #[used]
@@ -116,6 +135,11 @@ unsafe extern "C" fn initialize(
         let result = match selected.as_str() {
             "e9patch-smoke" => unsafe {
                 reverie_e9patch::install_tool_from_bootstrap::<e9patch_smoke::AotCounterTool>(
+                    &bootstrap.coordinator,
+                )
+            },
+            "noop" => unsafe {
+                reverie_e9patch::install_tool_from_bootstrap::<noop::NoopTool>(
                     &bootstrap.coordinator,
                 )
             },
