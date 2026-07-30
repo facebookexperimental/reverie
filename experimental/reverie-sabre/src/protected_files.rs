@@ -147,6 +147,89 @@ pub fn is_protected<Fd: AsRawFd>(fd: &Fd) -> bool {
     protected_files().lock().contains(fd)
 }
 
+pub(crate) fn protect_raw_fd(fd: RawFd) {
+    protected_files().lock().insert(&fd);
+}
+
+pub(crate) fn protect_raw_pair_with<F, E>(create: F) -> Result<(RawFd, RawFd), E>
+where
+    F: FnOnce() -> Result<(RawFd, RawFd), E>,
+{
+    let mut protected = protected_files().lock();
+    let pair = create()?;
+    protected.insert(&pair.0);
+    protected.insert(&pair.1);
+    Ok(pair)
+}
+
+pub(crate) fn unprotect_raw_fd(fd: RawFd) {
+    protected_files().lock().remove(&fd);
+}
+
+fn close_ranges_around_protected(first: u32, last: u32, protected: &[RawFd]) -> Vec<(u32, u32)> {
+    if first > last {
+        return vec![(first, last)];
+    }
+    let mut protected: Vec<u32> = protected
+        .iter()
+        .filter_map(|fd| u32::try_from(*fd).ok())
+        .filter(|fd| (first..=last).contains(fd))
+        .collect();
+    protected.sort_unstable();
+    protected.dedup();
+
+    let mut ranges = Vec::new();
+    let mut next = first;
+    for fd in protected {
+        if next < fd {
+            ranges.push((next, fd - 1));
+        }
+        let Some(after) = fd.checked_add(1) else {
+            return ranges;
+        };
+        next = after;
+    }
+    if next <= last {
+        ranges.push((next, last));
+    }
+    ranges
+}
+
+pub(crate) fn sys_close_range(
+    first: usize,
+    last: usize,
+    flags: usize,
+) -> Result<usize, syscalls::Errno> {
+    const CLOSE_RANGE_UNSHARE: usize = 1 << 1;
+    const CLOSE_RANGE_CLOEXEC: usize = 1 << 2;
+    if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 {
+        return Err(syscalls::Errno::EINVAL);
+    }
+
+    let first = first as u32;
+    let last = last as u32;
+    if first > last {
+        return Err(syscalls::Errno::EINVAL);
+    }
+    let mut flags = flags;
+    if flags & CLOSE_RANGE_UNSHARE != 0 {
+        unsafe { syscalls::syscall1(Sysno::unshare, libc::CLONE_FILES as usize)? };
+        flags &= !CLOSE_RANGE_UNSHARE;
+    }
+    let protected = protected_files().lock();
+    for (range_first, range_last) in close_ranges_around_protected(first, last, &protected.files) {
+        unsafe {
+            syscalls::syscall3(
+                Sysno::close_range,
+                range_first as usize,
+                range_last as usize,
+                flags,
+            )?;
+        }
+    }
+    Ok(0)
+}
+
 /// All of these syscalls take the input file descriptor as the first argument.
 /// Some syscalls, like mmap, don't conform to this pattern and need to be
 /// handled in a special way.
@@ -256,7 +339,10 @@ pub fn uses_protected_fd(sysno: Sysno, arg0: usize, arg1: usize) -> bool {
 }
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::Barrier;
     use std::sync::mpsc;
+    use std::time::Duration;
 
     use super::*;
 
@@ -297,5 +383,70 @@ mod tests {
 
         drop(protected);
         assert!(!is_protected(&fd));
+    }
+
+    #[test]
+    fn close_ranges_skip_every_protected_descriptor() {
+        assert_eq!(
+            close_ranges_around_protected(10, 20, &[12, 15, 20]),
+            vec![(10, 11), (13, 14), (16, 19)]
+        );
+        assert_eq!(
+            close_ranges_around_protected(10, 12, &[9, 13]),
+            vec![(10, 12)]
+        );
+        assert!(
+            close_ranges_around_protected(i32::MAX as u32, i32::MAX as u32, &[i32::MAX]).is_empty()
+        );
+    }
+
+    #[test]
+    fn close_range_waits_for_atomic_protected_pair_creation() {
+        let allow_registration = Arc::new(Barrier::new(2));
+        let (created_tx, created_rx) = mpsc::channel();
+        let (protected_tx, protected_rx) = mpsc::channel();
+        let creator_barrier = allow_registration.clone();
+        let creator = std::thread::spawn(move || {
+            let pair = protect_raw_pair_with(|| {
+                let mut pipe = [-1i32; 2];
+                unsafe { syscalls::syscall2(Sysno::pipe2, pipe.as_mut_ptr() as usize, 0) }.unwrap();
+                created_tx.send((pipe[0], pipe[1])).unwrap();
+                creator_barrier.wait();
+                Ok::<_, std::convert::Infallible>((pipe[0], pipe[1]))
+            })
+            .unwrap();
+            protected_tx.send(pair).unwrap();
+        });
+
+        let pair = created_rx.recv().unwrap();
+        let (closing_tx, closing_rx) = mpsc::channel();
+        let (started_tx, started_rx) = mpsc::channel();
+        let closer = std::thread::spawn(move || {
+            let first = pair.0.min(pair.1) as usize;
+            let last = pair.0.max(pair.1) as usize;
+            started_tx.send(()).unwrap();
+            let result = sys_close_range(first, last, 1 << 2);
+            closing_tx.send(result).unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        assert!(matches!(
+            closing_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        allow_registration.wait();
+        let pair = protected_rx.recv().unwrap();
+        assert_eq!(closing_rx.recv().unwrap(), Ok(0));
+        creator.join().unwrap();
+        closer.join().unwrap();
+
+        for fd in [pair.0, pair.1] {
+            let descriptor_flags =
+                unsafe { syscalls::syscall3(Sysno::fcntl, fd as usize, libc::F_GETFD as usize, 0) }
+                    .unwrap();
+            assert_eq!(descriptor_flags & libc::FD_CLOEXEC as usize, 0);
+            unprotect_raw_fd(fd);
+            unsafe { syscalls::syscall1(Sysno::close, fd as usize) }.unwrap();
+        }
     }
 }

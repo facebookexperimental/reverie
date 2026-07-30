@@ -15,7 +15,7 @@ use syscalls::Errno;
 use syscalls::Sysno;
 use syscalls::syscall;
 
-use super::protected_files::uses_protected_fd;
+use super::protected_files;
 use super::utils;
 use super::vdso;
 use crate::ffi::fn_icept;
@@ -248,7 +248,9 @@ impl SyscallExt for Syscall {
             // purposes.
             // FIXME: All logging should go through the global state instead.
             Ok(0)
-        } else if uses_protected_fd(sysno, args.arg0, args.arg1) {
+        } else if sysno == Sysno::close_range {
+            protected_files::sys_close_range(args.arg0, args.arg1, args.arg2)
+        } else if protected_files::uses_protected_fd(sysno, args.arg0, args.arg1) {
             // If this syscall operates on a protected file descriptor, we
             // should return EBADF to indicate that the file descriptor isn't
             // opened (even if it really is).
