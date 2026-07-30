@@ -144,6 +144,14 @@ struct LiteinstHelperSavedState {
     stack_value: u64,
 }
 
+#[cfg(target_arch = "x86_64")]
+fn is_legacy_vsyscall_ip(ip: Reg) -> bool {
+    const VSYSCALL_START: Reg = 0xffff_ffff_ff60_0000;
+    const VSYSCALL_END: Reg = VSYSCALL_START + 0x1000;
+
+    (VSYSCALL_START..VSYSCALL_END).contains(&ip)
+}
+
 #[derive(Debug)]
 struct Suspended {
     waker: Option<mpsc::Sender<Pid>>,
@@ -3788,6 +3796,15 @@ impl<L: Tool + 'static> TracedTask<L> {
         let (installed_task, syscall_already_skipped, liteinst_resume_rip) =
             self.maybe_install_liteinst_site(task).await?;
         task = installed_task;
+        #[cfg(target_arch = "x86_64")]
+        let is_legacy_vsyscall = !syscall_already_skipped
+            && is_legacy_vsyscall_ip(
+                task.getregs()
+                    .tracee_context(tid, "identify legacy vsyscall stop")?
+                    .ip(),
+            );
+        #[cfg(not(target_arch = "x86_64"))]
+        let is_legacy_vsyscall = false;
         let span = tracing::trace_span!(
             target: "reverie_ptrace::syscall",
             "syscall.intercept",
@@ -3812,7 +3829,15 @@ impl<L: Tool + 'static> TracedTask<L> {
             })
             .await;
 
-            if self.pending_syscall.is_some() && !syscall_already_skipped {
+            let emulate_legacy_vsyscall = is_legacy_vsyscall && self.pending_syscall.is_some();
+            if emulate_legacy_vsyscall {
+                // The kernel owns the synthetic `ret` from the fixed
+                // vsyscall page. Leave the task at its seccomp stop and mark
+                // the syscall skipped below; resuming then lets the kernel
+                // return directly to the caller without single-stepping the
+                // caller's first instruction.
+                self.pending_syscall = None;
+            } else if self.pending_syscall.is_some() && !syscall_already_skipped {
                 task = self
                     .skip_seccomp_syscall(task)
                     .await
@@ -3827,6 +3852,20 @@ impl<L: Tool + 'static> TracedTask<L> {
                     Err(err) => (-(err.into_errno()?.into_raw() as i64)) as u64,
                 };
 
+                #[cfg(target_arch = "x86_64")]
+                if emulate_legacy_vsyscall {
+                    let mut regs = task
+                        .getregs()
+                        .tracee_context(tid, "read legacy-vsyscall registers")?;
+                    *regs.orig_syscall_mut() = -1i64 as u64;
+                    *regs.ret_mut() = ret;
+                    task.setregs(&regs)
+                        .tracee_context(tid, "set legacy-vsyscall result")?;
+                } else {
+                    set_ret(&task, ret).tracee_context(tid, "set intercepted syscall result")?;
+                }
+
+                #[cfg(not(target_arch = "x86_64"))]
                 set_ret(&task, ret).tracee_context(tid, "set intercepted syscall result")?;
             }
 
