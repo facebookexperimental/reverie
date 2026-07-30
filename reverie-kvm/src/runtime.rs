@@ -1111,6 +1111,11 @@ impl KvmBackend {
             loaded.stdin = Some(std::fs::File::open("/dev/null")?);
         }
         let pid = Pid::from_raw(self.root_pid);
+        // Resolve thread ownership before any CLONE_THREAD worker is created: an
+        // explicit caller override wins, otherwise follow the tool's
+        // `Tool::thread_ownership` (default: Tool-owned "follow children"). This
+        // is why the KVM backend no longer needs the caller to opt threads in.
+        self.resolve_thread_ownership(T::thread_ownership(&config));
         let global_state = Arc::new(T::GlobalState::init_global_state(&config).await);
         let tool = T::new(pid, &config);
         let subscriptions = T::subscriptions(&config);

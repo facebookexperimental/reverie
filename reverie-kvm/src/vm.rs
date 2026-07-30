@@ -316,8 +316,16 @@ pub struct KvmBackend {
     // Who owns this backend's guest threads. The single value drives BOTH the
     // CLONE_THREAD worker dispatch path (`run_process_action_with_tool`) and
     // `futex`/CLEARTID ownership (`is_backend_owned_syscall`), so the two can
-    // never disagree. Propagated to every child backend.
+    // never disagree. Propagated to every child backend. This is the *effective*
+    // ownership; when running a tool it is resolved from `thread_ownership_override`
+    // (if set) else the tool's `Tool::thread_ownership` at run entry.
     pub(crate) thread_ownership: ThreadOwnership,
+    // Explicit caller override for `thread_ownership`. `None` means "follow the
+    // tool" — resolve from `Tool::thread_ownership` at run entry (the safe,
+    // Tool-owned "follow children" default). `Some(_)` forces that ownership
+    // regardless of the tool (set via `set_thread_ownership` /
+    // `unmonitored_threads`), and survives run-entry resolution.
+    thread_ownership_override: Option<ThreadOwnership>,
     pub(crate) static_elf: Option<LoadedStaticElf>,
     stdin: Option<File>,
     pub(crate) root_pid: i32,
@@ -416,25 +424,65 @@ impl KvmBackend {
             thread_group: Arc::new(GuestThreadGroup::default()),
             thread_slot: None,
             is_guest_thread: false,
-            // Behavior-preserving default for the mechanical bool->enum step;
-            // resolved from the Tool's `thread_ownership` at run time in a later
-            // step so the safe default becomes Tool-owned (follow children).
+            // Effective ownership before any tool run resolves it. The direct
+            // (non-tool) personality never dispatches threads through a Tool loop,
+            // so Host is the correct effective value there; when a tool runs,
+            // `run_static_elf_with_tool` resolves this from the override or the
+            // tool's `Tool::thread_ownership` (the Tool-owned "follow children"
+            // default).
             thread_ownership: ThreadOwnership::Host,
+            // No explicit caller override: follow the tool at run entry.
+            thread_ownership_override: None,
             static_elf: None,
             stdin,
             root_pid: 1,
         })
     }
 
-    /// Overrides who owns this backend's guest threads (see [`ThreadOwnership`]).
+    /// Forces who owns this backend's guest threads (see [`ThreadOwnership`]),
+    /// overriding the tool's own [`reverie::Tool::thread_ownership`].
     ///
     /// The single value drives both the CLONE_THREAD worker dispatch path and
     /// `futex`/CLEARTID ownership, so execution and synchronization can never
-    /// disagree. When running a tool, the ownership is otherwise resolved from
-    /// the tool's [`reverie::Tool::thread_ownership`]; call this to force a
-    /// specific ownership regardless of the tool. Call it before running.
+    /// disagree. Normally you do **not** call this: when running a tool the
+    /// ownership is resolved from the tool's `Tool::thread_ownership`, whose
+    /// default is the safe Tool-owned "follow children" model. Call this only to
+    /// force a specific ownership regardless of the tool; the override is sticky
+    /// and survives run-entry resolution. Call it before running.
     pub fn set_thread_ownership(&mut self, thread_ownership: ThreadOwnership) {
+        self.thread_ownership_override = Some(thread_ownership);
         self.thread_ownership = thread_ownership;
+    }
+
+    /// Opt this backend's guest threads *out* of tool monitoring: run every
+    /// child thread uninstrumented on the direct host personality with
+    /// host-backed `futex`/CLEARTID synchronization ([`ThreadOwnership::Host`]).
+    ///
+    /// This is the deliberately-named "scary" opt-out. It is **not** `unsafe`
+    /// (it cannot cause undefined behavior), but it is a determinism/coverage
+    /// hazard, so weigh it carefully:
+    ///
+    /// * The tool never sees the opted-out threads' syscalls, so it cannot
+    ///   sanitize, record, or schedule them — determinism is **not** guaranteed
+    ///   for those threads or anything ordered against them.
+    /// * A tool that expects to schedule the whole thread group (e.g. Detcore)
+    ///   has its model broken by unmonitored siblings, and mixing unmonitored
+    ///   threads with tool-owned joins can deadlock a `pthread_join`.
+    ///
+    /// Prefer leaving threads tool-owned (the default). Use this only when a
+    /// backend genuinely cannot or must not drive a thread through the tool.
+    pub fn unmonitored_threads(&mut self) -> &mut Self {
+        self.set_thread_ownership(ThreadOwnership::Host);
+        self
+    }
+
+    /// Resolves the effective [`ThreadOwnership`] for a tool run: an explicit
+    /// caller override ([`Self::set_thread_ownership`] /
+    /// [`Self::unmonitored_threads`]) wins, otherwise follow the tool's
+    /// [`reverie::Tool::thread_ownership`] (default: Tool-owned "follow
+    /// children"). Called once at run entry, before any thread is created.
+    pub(crate) fn resolve_thread_ownership(&mut self, ownership: ThreadOwnership) {
+        self.thread_ownership = self.thread_ownership_override.unwrap_or(ownership);
     }
 
     /// Panic-not-hang tripwire enforced at thread creation: the thread's
