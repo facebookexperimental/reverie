@@ -144,12 +144,16 @@ it.
 In shared built-in and opt-in generic-tool modes, AOT-rewritten sites dispatch
 directly. The shared SIGSYS dispatcher is reached only by residual sites e9patch
 could not rewrite (dynamic loader/startup code, vDSO, uncovered or JIT-emitted
-code). A generic host forwards residual syscalls outside `T::subscriptions`
-through the shared guards and fails a subscribed residual with `EOPNOTSUPP`,
-because arbitrary Rust Tool code cannot run safely in signal context. In the
-default `E9patchBackend<T>` path, the AOT callback stays null and rewritten
-sites retain the marker/int3 ptrace route so the selected `T` remains
-authoritative.
+code). Before the first direct AOT event activates the Tool lifecycle, only
+residual calls whose instruction pointer is inside the validated injected
+e9patch loader or Reverie payload executable mapping pass through the shared
+guards natively; they are not Tool events. Application residuals fail closed
+even before activation. After activation, a generic host forwards residual
+syscalls outside `T::subscriptions` and fails a subscribed residual with
+`EOPNOTSUPP`, because arbitrary Rust Tool code cannot run safely in signal
+context. In the default `E9patchBackend<T>` path, the AOT callback stays null
+and rewritten sites retain
+the marker/int3 ptrace route so the selected `T` remains authoritative.
 
 ### Fallback-Surface Observability
 
@@ -263,6 +267,13 @@ hosts LiteInst's production Strace Tool with a narrow `write` filter: a
 rewritten root-image write is decoded, injected, and reported while
 unsubscribed syscalls remain native. A subscribed residual/shared-library
 `write` remains unsupported and fails closed with `EOPNOTSUPP`.
+The preload also selects LiteInst's production Counter1 Tool. A direct launcher
+returns its coordinator-owned total, and the real e9tool fixture proves the
+exact two rewritten root-image syscalls (`getpid` and `exit_group`) are counted.
+Counter1 subscribes to every syscall. Pre-activation residuals from the injected
+loader and payload mappings are not counted; application residuals and
+post-activation runtime residuals remain outside this direct host and fail
+closed.
 
 `E9patchBackend::run` deliberately still drives generic tools through ptrace:
 the direct host does not yet cover process trees, exec rebootstrap, guest signal

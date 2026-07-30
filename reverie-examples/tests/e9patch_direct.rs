@@ -8,6 +8,7 @@ use reverie::process::Stdio;
 use reverie_e9patch::E9patchBackend;
 use reverie_e9patch::TOOL_PRELOAD_ENV;
 use reverie_examples::e9patch_smoke::AotCounterTool;
+use reverie_examples::run_e9patch_counter1_with_preload;
 use reverie_examples::run_e9patch_noop_with_preload;
 use reverie_examples::run_e9patch_write_strace_with_preload;
 
@@ -162,6 +163,21 @@ async fn production_noop_preserves_native_rewritten_syscall() {
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires a built e9tool/e9patch pair"]
+async fn production_counter1_reports_rewritten_syscall_total() {
+    let (_directory, guest) = compile_guest();
+    let mut command = Command::new(guest);
+    command.env("REVERIE_E9PATCH_EXPECT_RAW_GETPID", "1");
+    let (output, total) = run_e9patch_counter1_with_preload(command, example_preload())
+        .await
+        .unwrap();
+    assert_eq!(output.status, ExitStatus::Exited(0), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_eq!(total, 2);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires a built e9tool/e9patch pair"]
 async fn production_strace_observes_filtered_rewritten_write() {
     let (_directory, guest) = compile_guest();
     let mut command = Command::new(guest);
@@ -176,6 +192,36 @@ async fn production_strace_observes_filtered_rewritten_write() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("write(1,"), "{stderr}");
     assert!(stderr.contains(" = 15"), "{stderr}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires a built e9tool/e9patch pair"]
+async fn subscribed_residual_write_still_fails_closed_after_direct_start() {
+    let (_directory, guest) = compile_guest();
+    let mut command = Command::new(guest);
+    command.env("REVERIE_E9PATCH_EXPECT_RESIDUAL_WRITE_FAIL", "1");
+    let output = run_e9patch_write_strace_with_preload(command, example_preload())
+        .await
+        .unwrap();
+    assert_eq!(output.status, ExitStatus::Exited(0), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!stderr.contains("write("), "{stderr}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires a built e9tool/e9patch pair"]
+async fn subscribed_application_residual_fails_closed_before_direct_start() {
+    let (_directory, guest) = compile_guest();
+    let mut command = Command::new(guest);
+    command.env("REVERIE_E9PATCH_EXPECT_PRESTART_RESIDUAL_FAIL", "1");
+    let output = run_e9patch_write_strace_with_preload(command, example_preload())
+        .await
+        .unwrap();
+    assert_eq!(output.status, ExitStatus::Exited(0), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!stderr.contains("write("), "{stderr}");
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <stdint.h>
 #include <string.h>
 #include <unistd.h>
@@ -50,6 +51,12 @@ static void write_burst(void) {
 }
 
 int main(void) {
+  if (has_environment_entry("REVERIE_E9PATCH_EXPECT_PRESTART_RESIDUAL_FAIL=1")) {
+    static const char byte = 'x';
+    errno = 0;
+    long result = write(1, &byte, 1);
+    raw_exit_group(result == -1 && errno == EOPNOTSUPP ? 0 : 6);
+  }
   if (has_environment_entry("REVERIE_E9PATCH_EXPECT_BOOTSTRAP_ENV=1")) {
     if (!has_environment_entry(
             "REVERIE_E9PATCH_COORDINATOR=preexisting-coordinator") ||
@@ -72,6 +79,16 @@ int main(void) {
   if (has_environment_entry("REVERIE_E9PATCH_EXPECT_NATIVE_GETPID=1")) {
     long native_pid = getpid();
     raw_exit_group(raw_getpid() == native_pid ? 0 : 1);
+  }
+  if (has_environment_entry("REVERIE_E9PATCH_EXPECT_RAW_GETPID=1")) {
+    raw_exit_group(raw_getpid() > 0 ? 0 : 1);
+  }
+  if (has_environment_entry("REVERIE_E9PATCH_EXPECT_RESIDUAL_WRITE_FAIL=1")) {
+    static const char byte = 'x';
+    (void)raw_getpid();
+    errno = 0;
+    long result = write(1, &byte, 1);
+    raw_exit_group(result == -1 && errno == EOPNOTSUPP ? 0 : 5);
   }
   raw_exit_group(raw_getpid() == 424242 ? 0 : 1);
 }

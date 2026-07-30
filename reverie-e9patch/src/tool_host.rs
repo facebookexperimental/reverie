@@ -8,6 +8,7 @@ use core::sync::atomic::AtomicU64;
 use core::sync::atomic::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::fs;
 use std::io;
 use std::path::Path;
 use std::task::Context;
@@ -41,6 +42,7 @@ use reverie_preload::trap::raw_syscall6;
 use crate::aot;
 use crate::dispatch::record_fallback_dispatch;
 use crate::dispatch::record_fallback_site;
+use crate::rewrite::E9PATCH_LOADER_BASE;
 use crate::rpc::CoordinatorRpc;
 use crate::rpc::SpinMutex;
 
@@ -73,9 +75,12 @@ impl Drop for DispatchScratchScope {
 ///
 /// A tool-specific preload DSO normally calls this from its constructor. The
 /// function publishes the round-8 AOT callback, installs the shared seccomp
-/// controller, and routes direct rewritten sites through `T`. A subscribed
-/// site that reaches the residual `SIGSYS` surface fails closed because a Rust
-/// tool may allocate, lock, or block and therefore cannot run in signal context.
+/// controller, and routes direct rewritten sites through `T`. Residuals whose
+/// instruction pointer is inside the injected e9patch loader or Reverie payload
+/// executable mapping may run natively before the first direct AOT event,
+/// outside the Tool lifecycle. Every other subscribed residual fails closed
+/// because a Rust tool may allocate, lock, or block and therefore cannot run in
+/// signal context.
 ///
 /// # Safety
 ///
@@ -120,6 +125,7 @@ where
             "e9patch generic Tool installed twice",
         ));
     }
+    let startup_runtime_text = startup_runtime_text_ranges()?;
     let signal_state = prepare_guest_signal_state()?;
     let rpc = CoordinatorRpc::<T::GlobalState>::connect(coordinator)?;
     let pid = Pid::from_raw(raw_pid(libc::SYS_getpid).as_raw());
@@ -136,6 +142,8 @@ where
         rpc,
         root_pid: pid,
         subscriptions,
+        startup_runtime_text,
+        direct_dispatch_started: AtomicBool::new(false),
         states: SpinMutex::new(HashMap::new()),
     };
     // SAFETY: the caller provides the once-before-threads contract. The
@@ -154,7 +162,66 @@ struct ToolHost<T: Tool> {
     rpc: CoordinatorRpc<T::GlobalState>,
     root_pid: Pid,
     subscriptions: HashSet<Sysno>,
+    startup_runtime_text: [ExecutableRange; 2],
+    direct_dispatch_started: AtomicBool,
     states: SpinMutex<HashMap<i32, T::ThreadState>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExecutableRange {
+    start: u64,
+    end: u64,
+}
+
+impl ExecutableRange {
+    fn contains(self, address: u64) -> bool {
+        self.start <= address && address < self.end
+    }
+}
+
+fn executable_mapping_containing(maps: &str, address: u64) -> Option<ExecutableRange> {
+    maps.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let (addresses, permissions) = (fields.next()?, fields.next()?);
+        if !permissions
+            .as_bytes()
+            .get(2)
+            .is_some_and(|byte| *byte == b'x')
+        {
+            return None;
+        }
+        let (start, end) = addresses.split_once('-')?;
+        let range = ExecutableRange {
+            start: u64::from_str_radix(start, 16).ok()?,
+            end: u64::from_str_radix(end, 16).ok()?,
+        };
+        (range.start < range.end && range.contains(address)).then_some(range)
+    })
+}
+
+fn startup_runtime_text_ranges() -> io::Result<[ExecutableRange; 2]> {
+    let maps = fs::read_to_string("/proc/self/maps")?;
+    let loader = executable_mapping_containing(&maps, E9PATCH_LOADER_BASE).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("executable e9patch loader mapping at {E9PATCH_LOADER_BASE:#x}"),
+        )
+    })?;
+    Ok([
+        loader,
+        ExecutableRange {
+            start: crate::aot::AOT_PAYLOAD_TEXT_START,
+            end: crate::aot::AOT_PAYLOAD_TEXT_END,
+        },
+    ])
+}
+
+fn residual_must_fail_closed(
+    subscribed: bool,
+    direct_dispatch_started: bool,
+    from_injected_runtime: bool,
+) -> bool {
+    subscribed && (direct_dispatch_started || !from_injected_runtime)
 }
 
 impl<T> SyscallDispatcher for ToolHost<T>
@@ -180,28 +247,35 @@ where
 
         if event.source() == SyscallEventSource::SignalTrap {
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // Generic Rust Tool code is not async-signal-safe. Match LiteInst's
-            // unpatchable-site policy: make the residual observable, then fail
-            // closed instead of running T or silently forwarding it.
+            // Generic Rust Tool code is not async-signal-safe. Make the
+            // residual observable, then either pass pre-activation loader
+            // setup natively or fail a subscribed post-activation site closed.
             record_fallback_dispatch(event.number());
             record_fallback_site(event.instruction_pointer());
             let subscribed = usize::try_from(event.number())
                 .ok()
                 .and_then(Sysno::new)
                 .is_some_and(|number| self.subscriptions.contains(&number));
-            if subscribed {
+            if residual_must_fail_closed(
+                subscribed,
+                self.direct_dispatch_started.load(Ordering::Acquire),
+                self.startup_runtime_text
+                    .iter()
+                    .any(|range| range.contains(event.instruction_pointer())),
+            ) {
                 event.fail(libc::EOPNOTSUPP);
             } else if let Some(error) = injected_syscall_guard(event.number(), event.args()) {
                 event.fail(error.into_raw());
             } else {
-                // Reverie's contract lets unsubscribed syscalls run natively.
-                // This keeps loader/runtime residuals outside a narrow Tool's
-                // subscription set on the shared guarded pass-through path.
+                // Before the first direct event, only the injected e9patch
+                // loader and Reverie payload mappings reach this subscribed
+                // path. Afterwards, only unsubscribed residuals run natively.
                 PassthroughDispatcher::new().dispatch(event);
             }
             return;
         }
 
+        self.direct_dispatch_started.store(true, Ordering::Release);
         let _scratch_scope = DispatchScratchScope::enter();
         let tid = raw_pid(libc::SYS_gettid);
         let pid = raw_pid(libc::SYS_getpid);
@@ -975,5 +1049,39 @@ mod tests {
         assert_eq!(stack.size(), core::mem::size_of::<u64>());
         drop(stack.commit().unwrap());
         COMMITTED_STACKS.lock().clear();
+    }
+
+    #[test]
+    fn startup_runtime_provenance_is_bounded_to_injected_code() {
+        let maps = concat!(
+            "00400000-00401000 r-xp 00000000 00:00 0 /tmp/guest\n",
+            "20e9e9000-20e9ea000 r-xp 00000000 00:00 0 /tmp/guest\n",
+            "7f000000-7f001000 rw-p 00000000 00:00 0\n",
+        );
+        assert_eq!(
+            executable_mapping_containing(maps, E9PATCH_LOADER_BASE),
+            Some(ExecutableRange {
+                start: E9PATCH_LOADER_BASE,
+                end: 0x20e9_ea000,
+            })
+        );
+        assert!(crate::aot::AOT_PAYLOAD_TEXT_START < crate::aot::AOT_PAYLOAD_TEXT_END);
+        assert!(
+            ExecutableRange {
+                start: crate::aot::AOT_PAYLOAD_TEXT_START,
+                end: crate::aot::AOT_PAYLOAD_TEXT_END,
+            }
+            .contains(crate::E9PATCH_SYSCALL_TRAP_RIP)
+        );
+        assert_eq!(executable_mapping_containing(maps, 0x7f000100), None);
+    }
+
+    #[test]
+    fn residual_subscription_exempts_only_pre_activation_runtime_code() {
+        assert!(!residual_must_fail_closed(true, false, true));
+        assert!(residual_must_fail_closed(true, false, false));
+        assert!(residual_must_fail_closed(true, true, true));
+        assert!(residual_must_fail_closed(true, true, false));
+        assert!(!residual_must_fail_closed(false, true, false));
     }
 }

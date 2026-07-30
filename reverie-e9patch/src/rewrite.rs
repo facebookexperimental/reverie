@@ -53,7 +53,7 @@ pub const E9PATCH_BACKEND_ENV: &str = "REVERIE_E9PATCH_BACKEND";
 
 const SYSCALL_TRAP_PATCH: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/reverie-e9patch-syscall-trap"));
-const E9PATCH_LOADER_BASE: u64 = 0x20e9_e9000;
+pub(crate) const E9PATCH_LOADER_BASE: u64 = 0x20e9_e9000;
 
 /// Auditable, digest-bound information about one e9patch preparation.
 // TODO-HUMAN-REVIEW(PR-101): Review the public rewrite report.

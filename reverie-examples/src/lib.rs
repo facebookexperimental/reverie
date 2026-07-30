@@ -72,6 +72,26 @@ pub async fn run_e9patch_noop_with_preload(
     .await
 }
 
+/// Runs the production Counter1 Tool through e9patch's direct AOT path.
+///
+/// The sealed selector and coordinator use the same concrete `CounterLocal`,
+/// and the returned total comes from its coordinator-owned `CounterGlobal`.
+/// Counter1 subscribes to every syscall. Residuals from the injected e9patch
+/// loader and Reverie payload mappings before the first direct event run
+/// natively and are not counted; application residuals and post-activation
+/// runtime residuals fail closed.
+pub async fn run_e9patch_counter1_with_preload(
+    command: reverie::process::Command,
+    preload: impl Into<std::path::PathBuf>,
+) -> Result<(reverie::process::Output, u64), reverie::Error> {
+    let (output, global) =
+        reverie_e9patch::E9patchBackend::run_direct_with_output_and_preload_data::<
+            counter1::CounterLocal,
+        >(command, (), preload, b"counter1")
+        .await?;
+    Ok((output, global.total()))
+}
+
 /// Runs the production Strace Tool through e9patch's direct AOT path with a
 /// single `write` syscall filter.
 ///
@@ -164,6 +184,11 @@ unsafe extern "C" fn initialize(
             },
             "noop" => unsafe {
                 reverie_e9patch::install_tool_from_bootstrap::<noop::NoopTool>(
+                    &bootstrap.coordinator,
+                )
+            },
+            "counter1" => unsafe {
+                reverie_e9patch::install_tool_from_bootstrap::<counter1::CounterLocal>(
                     &bootstrap.coordinator,
                 )
             },

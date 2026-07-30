@@ -12,6 +12,10 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
+use goblin::elf::Elf;
+use goblin::elf::program_header::PF_X;
+use goblin::elf::program_header::PT_LOAD;
+
 fn main() {
     println!("cargo:rerun-if-changed=runtime/syscall_trap.S");
     println!("cargo:rerun-if-env-changed=CC");
@@ -27,7 +31,7 @@ fn main() {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux")
         || env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("x86_64")
     {
-        write_constants(&output_dir, handoff_page, 0, dispatch_magic, 0);
+        write_constants(&output_dir, handoff_page, 0, dispatch_magic, 0, 0, 0);
         std::fs::write(output, []).expect("failed to create unsupported-target payload");
         return;
     }
@@ -69,17 +73,50 @@ fn main() {
     );
 
     const PAYLOAD_RUNTIME_BASE: u64 = 0x7000_0000;
+    let (payload_text_start, payload_text_end) = payload_executable_range(&output);
     let dispatch_page =
         PAYLOAD_RUNTIME_BASE + dynamic_symbol_address(&output, "reverie_e9patch_aot_page");
     let trap_entry =
         PAYLOAD_RUNTIME_BASE + dynamic_symbol_address(&output, "reverie_e9patch_syscall");
+    let payload_text_start = PAYLOAD_RUNTIME_BASE + payload_text_start;
+    let payload_text_end = PAYLOAD_RUNTIME_BASE + payload_text_end;
+    assert!(
+        (payload_text_start..payload_text_end).contains(&trap_entry),
+        "e9patch trap entry is outside the executable payload segment"
+    );
     write_constants(
         &output_dir,
         handoff_page,
         dispatch_page,
         dispatch_magic,
         trap_entry,
+        payload_text_start,
+        payload_text_end,
     );
+}
+
+fn payload_executable_range(binary: &Path) -> (u64, u64) {
+    let bytes = std::fs::read(binary)
+        .unwrap_or_else(|error| panic!("failed to read e9patch payload: {error}"));
+    let elf = Elf::parse(&bytes)
+        .unwrap_or_else(|error| panic!("failed to parse e9patch payload: {error}"));
+    let mut executable = elf
+        .program_headers
+        .iter()
+        .filter(|header| header.p_type == PT_LOAD && header.p_flags & PF_X != 0);
+    let segment = executable
+        .next()
+        .expect("e9patch payload has no executable load segment");
+    assert!(
+        executable.next().is_none(),
+        "e9patch payload has more than one executable load segment"
+    );
+    let end = segment
+        .p_vaddr
+        .checked_add(segment.p_memsz)
+        .expect("e9patch executable segment overflows its address space");
+    assert!(segment.p_vaddr < end, "e9patch executable segment is empty");
+    (segment.p_vaddr, end)
 }
 
 fn dynamic_symbol_address(binary: &Path, symbol: &str) -> u64 {
@@ -112,6 +149,8 @@ fn write_constants(
     dispatch_page: u64,
     dispatch_magic: u64,
     trap_entry: u64,
+    payload_text_start: u64,
+    payload_text_end: u64,
 ) {
     std::fs::write(
         output_dir.join("aot_dispatch_constants.rs"),
@@ -120,6 +159,8 @@ fn write_constants(
              #[cfg(test)]\n\
              pub(crate) const AOT_DISPATCH_PAGE_ADDRESS: u64 = {dispatch_page:#x};\n\
              pub(crate) const AOT_DISPATCH_MAGIC: u64 = {dispatch_magic:#x};\n\
+             pub(crate) const AOT_PAYLOAD_TEXT_START: u64 = {payload_text_start:#x};\n\
+             pub(crate) const AOT_PAYLOAD_TEXT_END: u64 = {payload_text_end:#x};\n\
              #[cfg(test)]\n\
              pub(crate) const AOT_FALLBACK_TRAP_ENTRY: u64 = {trap_entry:#x};\n"
         ),
