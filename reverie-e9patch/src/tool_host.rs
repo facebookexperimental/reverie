@@ -1065,7 +1065,7 @@ mod tests {
                 end: 0x20e9_ea000,
             })
         );
-        assert!(crate::aot::AOT_PAYLOAD_TEXT_START < crate::aot::AOT_PAYLOAD_TEXT_END);
+        const { assert!(crate::aot::AOT_PAYLOAD_TEXT_START < crate::aot::AOT_PAYLOAD_TEXT_END) };
         assert!(
             ExecutableRange {
                 start: crate::aot::AOT_PAYLOAD_TEXT_START,
@@ -1083,5 +1083,103 @@ mod tests {
         assert!(residual_must_fail_closed(true, true, true));
         assert!(residual_must_fail_closed(true, true, false));
         assert!(!residual_must_fail_closed(false, true, false));
+    }
+
+    #[test]
+    fn coordinator_channel_classifier_matches_single_fd_operations() {
+        const FD: u64 = 7;
+        // Operations that name exactly one descriptor classify on args[0]; the
+        // guard must fire when that descriptor is the reserved coordinator fd
+        // and stay silent when args[0] names any other descriptor.
+        for number in [
+            libc::SYS_read,
+            libc::SYS_readv,
+            libc::SYS_pread64,
+            libc::SYS_preadv,
+            libc::SYS_preadv2,
+            libc::SYS_write,
+            libc::SYS_writev,
+            libc::SYS_pwrite64,
+            libc::SYS_pwritev,
+            libc::SYS_pwritev2,
+            libc::SYS_vmsplice,
+            libc::SYS_sendfile,
+            libc::SYS_fcntl,
+            libc::SYS_ioctl,
+            libc::SYS_dup,
+        ] {
+            assert!(
+                syscall_targets_fd(number, [FD, 0, 0, 0, 0, 0], FD),
+                "syscall {number} on the coordinator fd must be classified"
+            );
+            assert!(
+                !syscall_targets_fd(number, [FD + 1, 0, 0, 0, 0, 0], FD),
+                "syscall {number} on an unrelated fd must not be classified"
+            );
+        }
+    }
+
+    #[test]
+    fn coordinator_channel_classifier_checks_both_dup_targets() {
+        const FD: u64 = 9;
+        // dup2/dup3 name a descriptor in both args[0] (oldfd) and args[1]
+        // (newfd); either naming the coordinator fd must fail closed.
+        for number in [libc::SYS_dup2, libc::SYS_dup3] {
+            assert!(syscall_targets_fd(number, [FD, 0, 0, 0, 0, 0], FD));
+            assert!(syscall_targets_fd(number, [0, FD, 0, 0, 0, 0], FD));
+            assert!(!syscall_targets_fd(number, [0, 0, FD, 0, 0, 0], FD));
+        }
+    }
+
+    #[test]
+    fn coordinator_channel_classifier_checks_transfer_endpoints() {
+        const FD: u64 = 3;
+        // splice/copy_file_range name descriptors in args[0] (in) and args[2]
+        // (out); tee names them in args[0] and args[1].
+        for number in [libc::SYS_splice, libc::SYS_copy_file_range] {
+            assert!(syscall_targets_fd(number, [FD, 0, 0, 0, 0, 0], FD));
+            assert!(syscall_targets_fd(number, [0, 0, FD, 0, 0, 0], FD));
+            assert!(!syscall_targets_fd(number, [0, FD, 0, 0, 0, 0], FD));
+        }
+        assert!(syscall_targets_fd(libc::SYS_tee, [FD, 0, 0, 0, 0, 0], FD));
+        assert!(syscall_targets_fd(libc::SYS_tee, [0, FD, 0, 0, 0, 0], FD));
+        assert!(!syscall_targets_fd(libc::SYS_tee, [0, 0, FD, 0, 0, 0], FD));
+    }
+
+    #[test]
+    fn coordinator_channel_classifier_ignores_unrelated_and_channel_syscalls() {
+        const FD: u64 = 5;
+        // A syscall that does not operate on a descriptor is never classified,
+        // even when every argument happens to equal the reserved fd.
+        assert!(!syscall_targets_fd(
+            libc::SYS_getpid,
+            [FD, FD, FD, FD, FD, FD],
+            FD
+        ));
+        // close / close_range are handled separately in
+        // `protect_coordinator_channel`, so the fd classifier leaves them alone.
+        assert!(!syscall_targets_fd(
+            libc::SYS_close,
+            [FD, 0, 0, 0, 0, 0],
+            FD
+        ));
+        assert!(!syscall_targets_fd(
+            libc::SYS_close_range,
+            [FD, FD, 0, 0, 0, 0],
+            FD
+        ));
+    }
+
+    #[test]
+    fn close_range_rejects_unknown_flags_before_touching_any_descriptor() {
+        const FD: u64 = 4;
+        // Unknown flag bits fail closed with EINVAL before any descriptor is
+        // closed, so a spanning close_range with a bad flag cannot even begin
+        // to disturb the reserved coordinator fd.
+        let unknown_flag = 1_u64 << 8;
+        assert_eq!(
+            close_range_preserving_fd([0, u64::from(u32::MAX), unknown_flag, 0, 0, 0], FD),
+            -i64::from(libc::EINVAL)
+        );
     }
 }
