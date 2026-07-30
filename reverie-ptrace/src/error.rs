@@ -39,7 +39,7 @@ pub enum Error {
         /// The affected tracee.
         pid: Pid,
         /// Additional diagnostic detail.
-        message: &'static str,
+        message: String,
     },
 
     /// A public error.
@@ -48,12 +48,18 @@ pub enum Error {
 }
 
 impl Error {
-    pub(crate) fn runtime(pid: Pid, operation: &'static str, message: &'static str) -> Self {
+    pub(crate) fn runtime(pid: Pid, operation: &'static str, message: impl Into<String>) -> Self {
         Self::Runtime {
             operation,
             pid,
-            message,
+            message: message.into(),
         }
+    }
+}
+
+impl From<reverie::Errno> for Error {
+    fn from(error: reverie::Errno) -> Self {
+        Self::Internal(safeptrace::Error::Errno(error))
     }
 }
 

@@ -319,4 +319,17 @@ mod tests {
             Err(Errno::ENOTSUPP)
         );
     }
+
+    #[test]
+    fn shared_frame_accepts_stack_pointer_updates_for_e9patch() {
+        let mut updated = frame();
+        let mut current = unsafe { core::mem::zeroed::<libc::user_regs_struct>() };
+        current.eflags = 0x202;
+        updated.copy_to_user_regs(&mut current);
+        let mut requested = current;
+        requested.rsp += 8;
+
+        updated.update_user_regs(&requested, 0x202).unwrap();
+        assert_eq!(updated.rsp, frame().rsp + 8);
+    }
 }

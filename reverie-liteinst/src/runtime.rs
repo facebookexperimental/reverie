@@ -1,3 +1,4 @@
+use core::arch::global_asm;
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicI32;
 use core::sync::atomic::AtomicPtr;
@@ -27,6 +28,145 @@ use reverie_preload::trap::raw_syscall6;
 
 use crate::COMPAT_EVENT_COOKIE_ENV;
 use crate::COMPAT_EVENT_FD_ENV;
+
+pub(crate) const HOST_RUNTIME_ENV: &str = "REVERIE_LITEINST_HOST_RUNTIME";
+pub(crate) const HOST_BEGIN_MARKER: u64 = 0x7265_766c_6900_0001;
+pub(crate) const HOST_READY_MARKER: u64 = 0x7265_766c_6900_0002;
+pub(crate) const HOST_HELPER_RETURN_MARKER: u64 = 0x7265_766c_6900_0003;
+pub(crate) const HOST_SYSCALL_MARKER: u64 = 0x7265_766c_6900_0004;
+const HOST_HANDSHAKE_VERSION: u64 = 3;
+const HOST_INSTALL_RESULT_VERSION: u64 = 1;
+const HOST_HELPER_STACK_BYTES: usize = 256 * 1024;
+
+global_asm!(
+    r#"
+    .text
+    .p2align 4
+    .global reverie_liteinst_host_begin
+    .type reverie_liteinst_host_begin,@function
+reverie_liteinst_host_begin:
+    mov rax, 0x7265766c69000001
+    int3
+    .global reverie_liteinst_host_begin_rip
+reverie_liteinst_host_begin_rip:
+    ret
+    .size reverie_liteinst_host_begin, .-reverie_liteinst_host_begin
+
+    .p2align 4
+    .global reverie_liteinst_host_ready
+    .type reverie_liteinst_host_ready,@function
+reverie_liteinst_host_ready:
+    mov rax, 0x7265766c69000002
+    int3
+    .global reverie_liteinst_host_ready_rip
+reverie_liteinst_host_ready_rip:
+    ret
+    .size reverie_liteinst_host_ready, .-reverie_liteinst_host_ready
+
+    .p2align 4
+    .global reverie_liteinst_host_helper_return
+    .type reverie_liteinst_host_helper_return,@function
+reverie_liteinst_host_helper_return:
+    mov r10, 0x7265766c69000003
+    int3
+    .global reverie_liteinst_host_helper_return_rip
+reverie_liteinst_host_helper_return_rip:
+    ret
+    .size reverie_liteinst_host_helper_return, .-reverie_liteinst_host_helper_return
+
+    .p2align 4
+    .global reverie_liteinst_host_syscall_trap
+    .type reverie_liteinst_host_syscall_trap,@function
+reverie_liteinst_host_syscall_trap:
+    mov rax, 0x7265766c69000004
+    int3
+    .global reverie_liteinst_host_syscall_trap_rip
+reverie_liteinst_host_syscall_trap_rip:
+    ret
+    .size reverie_liteinst_host_syscall_trap, .-reverie_liteinst_host_syscall_trap
+
+    .p2align 4
+    .global reverie_liteinst_host_syscall_trap_call
+    .hidden reverie_liteinst_host_syscall_trap_call
+    .type reverie_liteinst_host_syscall_trap_call,@function
+reverie_liteinst_host_syscall_trap_call:
+    call reverie_liteinst_host_syscall_trap
+    .global reverie_liteinst_host_syscall_trap_return_rip
+reverie_liteinst_host_syscall_trap_return_rip:
+    ret
+    .size reverie_liteinst_host_syscall_trap_call, .-reverie_liteinst_host_syscall_trap_call
+"#
+);
+
+unsafe extern "C" {
+    fn reverie_liteinst_host_begin(frame: *const HostHandshakeFrame);
+    static reverie_liteinst_host_begin_rip: u8;
+    fn reverie_liteinst_host_ready(frame: *const HostHandshakeFrame);
+    static reverie_liteinst_host_ready_rip: u8;
+    fn reverie_liteinst_host_helper_return();
+    static reverie_liteinst_host_helper_return_rip: u8;
+    fn reverie_liteinst_host_syscall_trap_call(frame: *mut HostSyscallFrame);
+    fn reverie_liteinst_host_syscall_trap(frame: *mut HostSyscallFrame);
+    static reverie_liteinst_host_syscall_trap_rip: u8;
+    static reverie_liteinst_host_syscall_trap_return_rip: u8;
+}
+
+// TODO-HUMAN-REVIEW(PR-270): Review raw hot-trap test/provenance ABI. This
+// exposes an address for negative testing; caller validation, not secrecy, is
+// the accidental-collision boundary.
+#[unsafe(no_mangle)]
+pub extern "C" fn reverie_liteinst_host_syscall_trap_address() -> *const libc::c_void {
+    reverie_liteinst_host_syscall_trap as *const libc::c_void
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct HostHandshakeFrame {
+    version: u64,
+    begin_rip: u64,
+    ready_rip: u64,
+    install_helper: u64,
+    helper_stack_top: u64,
+    helper_return: u64,
+    helper_return_rip: u64,
+    syscall_trap_rip: u64,
+    syscall_trap_return_rip: u64,
+    install_result: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+struct HostInstallResult {
+    version: u64,
+    site_start: u64,
+    site_len: u64,
+    relocated_tail: u64,
+    trampoline_start: u64,
+    trampoline_len: u64,
+    arena_writable_start: u64,
+    arena_writable_len: u64,
+    arena_executable_start: u64,
+    arena_executable_len: u64,
+    complete: u64,
+}
+
+#[repr(align(16))]
+struct HostHelperStack([u8; HOST_HELPER_STACK_BYTES]);
+
+static mut HOST_HELPER_STACK: HostHelperStack = HostHelperStack([0; HOST_HELPER_STACK_BYTES]);
+static mut HOST_INSTALL_RESULT: HostInstallResult = HostInstallResult {
+    version: 0,
+    site_start: 0,
+    site_len: 0,
+    relocated_tail: 0,
+    trampoline_start: 0,
+    trampoline_len: 0,
+    arena_writable_start: 0,
+    arena_writable_len: 0,
+    arena_executable_start: 0,
+    arena_executable_len: 0,
+    complete: 0,
+};
 
 const UNSET_RESULT: i64 = i64::MIN;
 const SYS_IO_PGETEVENTS: i64 = 333;
@@ -80,7 +220,24 @@ pub(crate) fn reserve_coordinator_fd(fd: libc::c_int) -> io::Result<()> {
 struct RuntimeArena {
     mapping_start: u64,
     mapping_end: u64,
+    writable_start: u64,
+    writable_end: u64,
+    executable_start: u64,
+    executable_end: u64,
     arena: TrampolineArena,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RuntimeMap {
+    start: u64,
+    end: u64,
+    offset: u64,
+    device: String,
+    inode: u64,
+    readable: bool,
+    writable: bool,
+    executable: bool,
+    shared: bool,
 }
 
 struct SiteSlot {
@@ -209,6 +366,9 @@ fn runtime_config_from_env() -> io::Result<RuntimeConfig> {
 }
 
 pub(crate) fn initialize_from_environment() -> io::Result<()> {
+    if std::env::var_os(HOST_RUNTIME_ENV).as_deref() == Some(OsStr::new("1")) {
+        return initialize_host_runtime();
+    }
     let tool_value = std::env::var_os("REVERIE_LITEINST_TOOL");
     // Prefer a shared reverie-preload built-in when the selector names one, so a
     // single env var is a superset of the LiteInst-native strace/compat modes
@@ -252,6 +412,38 @@ pub(crate) fn initialize_from_environment() -> io::Result<()> {
     }
 
     install_runtime()
+}
+
+fn host_handshake_frame() -> HostHandshakeFrame {
+    // SAFETY: this only forms the address of the dedicated static helper stack;
+    // it neither reads nor creates a Rust reference to its mutable contents.
+    let stack_start = unsafe { core::ptr::addr_of_mut!(HOST_HELPER_STACK.0) as *mut u8 as usize };
+    HostHandshakeFrame {
+        version: HOST_HANDSHAKE_VERSION,
+        begin_rip: core::ptr::addr_of!(reverie_liteinst_host_begin_rip) as usize as u64,
+        ready_rip: core::ptr::addr_of!(reverie_liteinst_host_ready_rip) as usize as u64,
+        install_helper: reverie_liteinst_install_site_for_ptrace as *const () as usize as u64,
+        helper_stack_top: (stack_start + HOST_HELPER_STACK_BYTES) as u64,
+        helper_return: reverie_liteinst_host_helper_return as *const () as usize as u64,
+        helper_return_rip: core::ptr::addr_of!(reverie_liteinst_host_helper_return_rip) as usize
+            as u64,
+        syscall_trap_rip: core::ptr::addr_of!(reverie_liteinst_host_syscall_trap_rip) as usize
+            as u64,
+        syscall_trap_return_rip: core::ptr::addr_of!(reverie_liteinst_host_syscall_trap_return_rip)
+            as usize as u64,
+        install_result: core::ptr::addr_of!(HOST_INSTALL_RESULT) as usize as u64,
+    }
+}
+
+fn initialize_host_runtime() -> io::Result<()> {
+    let frame = host_handshake_frame();
+    // SAFETY: the launcher validates this exact DSO/RIP/frame before suppressing
+    // the trap. The function returns normally after ptrace resumes the tracee.
+    unsafe { reverie_liteinst_host_begin(&frame) };
+    prepare_instrumentation()?;
+    // SAFETY: identical handshake contract; all helper state is now published.
+    unsafe { reverie_liteinst_host_ready(&frame) };
+    Ok(())
 }
 
 pub(crate) fn initialize_reverie_tool() -> io::Result<()> {
@@ -362,6 +554,76 @@ fn compatibility_event_channel() -> io::Result<Option<CompatibilityEventChannel>
     }))
 }
 
+fn read_runtime_maps() -> io::Result<Vec<RuntimeMap>> {
+    let maps = std::fs::read_to_string("/proc/self/maps")?;
+    Ok(maps
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let (range, permissions, offset, device, inode) = (
+                fields.next()?,
+                fields.next()?,
+                fields.next()?,
+                fields.next()?,
+                fields.next()?,
+            );
+            let (start, end) = range.split_once('-')?;
+            let permissions = permissions.as_bytes();
+            Some(RuntimeMap {
+                start: u64::from_str_radix(start, 16).ok()?,
+                end: u64::from_str_radix(end, 16).ok()?,
+                offset: u64::from_str_radix(offset, 16).ok()?,
+                device: device.to_owned(),
+                inode: inode.parse().ok()?,
+                readable: permissions.first() == Some(&b'r'),
+                writable: permissions.get(1) == Some(&b'w'),
+                executable: permissions.get(2) == Some(&b'x'),
+                shared: permissions.get(3) == Some(&b's'),
+            })
+        })
+        .collect())
+}
+
+fn discover_arena_aliases(
+    before: &[RuntimeMap],
+    after: &[RuntimeMap],
+) -> io::Result<(RuntimeMap, RuntimeMap)> {
+    let expected_len = (ARENA_SLOTS * 4096) as u64;
+    let new_maps = after
+        .iter()
+        .filter(|mapping| {
+            !before
+                .iter()
+                .any(|old| old.start == mapping.start && old.end == mapping.end)
+                && mapping.end.checked_sub(mapping.start) == Some(expected_len)
+                && mapping.offset == 0
+                && mapping.inode != 0
+                && mapping.shared
+                && mapping.readable
+        })
+        .collect::<Vec<_>>();
+    let pairs = new_maps
+        .iter()
+        .filter_map(|writable| {
+            (writable.writable && !writable.executable).then_some(())?;
+            let executable = new_maps.iter().find(|executable| {
+                !executable.writable
+                    && executable.executable
+                    && executable.device == writable.device
+                    && executable.inode == writable.inode
+            })?;
+            Some(((*writable).clone(), (**executable).clone()))
+        })
+        .collect::<Vec<_>>();
+    match pairs.as_slice() {
+        [(writable, executable)] => Ok((writable.clone(), executable.clone())),
+        _ => Err(io::Error::other(format!(
+            "LiteInst arena allocation produced {} identity-matched alias pairs",
+            pairs.len()
+        ))),
+    }
+}
+
 fn prepare_instrumentation() -> io::Result<()> {
     prepare_live_patching().map_err(|error| io::Error::other(error.to_string()))?;
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
@@ -408,12 +670,19 @@ fn prepare_instrumentation() -> io::Result<()> {
         if mapping_start >= mapping_end {
             continue;
         }
+        let before = read_runtime_maps()?;
         let Ok(arena) = TrampolineArena::allocate_near(mapping_start, ARENA_SLOTS) else {
             continue;
         };
+        let after = read_runtime_maps()?;
+        let (writable, executable) = discover_arena_aliases(&before, &after)?;
         arenas.push(RuntimeArena {
             mapping_start,
             mapping_end,
+            writable_start: writable.start,
+            writable_end: writable.end,
+            executable_start: executable.start,
+            executable_end: executable.end,
             arena,
         });
     }
@@ -712,7 +981,11 @@ fn lock_installation() -> io::Result<InstallGuard> {
         .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "LiteInst installation is busy"))
 }
 
-unsafe fn install_site_hook(address: u64, slot: &'static SiteSlot) -> io::Result<()> {
+unsafe fn install_site_hook(
+    address: u64,
+    slot: &'static SiteSlot,
+    callback: liteinst2::trampoline::HookCallback,
+) -> io::Result<HostInstallResult> {
     let _install_guard = lock_installation()?;
     let _allocation_scope = crate::patch_alloc::enter();
     let arena = arena_for(address)
@@ -758,7 +1031,7 @@ unsafe fn install_site_hook(address: u64, slot: &'static SiteSlot) -> io::Result
                 address,
                 address as usize as *mut u8,
             ),
-            installed_syscall_hook,
+            callback,
             StalenessBudget::new(3_000).expect("non-zero staleness budget"),
             &arena.arena,
         )
@@ -778,10 +1051,104 @@ unsafe fn install_site_hook(address: u64, slot: &'static SiteSlot) -> io::Result
         set_text_protection(address, libc::PROT_READ | libc::PROT_EXEC)?;
     }
 
+    let relocated_tail = installed.trampoline().relocated_tail_address();
+    let trampoline_start = installed.trampoline().address();
+    let trampoline_len = installed.trampoline().allocation_len() as u64;
+    let result = HostInstallResult {
+        version: HOST_INSTALL_RESULT_VERSION,
+        site_start: address,
+        site_len: liteinst2::patcher::WORD_PATCH_BYTES as u64,
+        relocated_tail,
+        trampoline_start,
+        trampoline_len,
+        arena_writable_start: arena.writable_start,
+        arena_writable_len: arena.writable_end - arena.writable_start,
+        arena_executable_start: arena.executable_start,
+        arena_executable_len: arena.executable_end - arena.executable_start,
+        complete: 1,
+    };
     let installed = Box::into_raw(Box::new(installed));
     slot.hook.store(installed, Ordering::Release);
     slot.state.store(SITE_ACTIVE, Ordering::Release);
-    Ok(())
+    Ok(result)
+}
+
+// TODO-HUMAN-REVIEW(PR-270): Review stopped-tracee patch helper ABI.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reverie_liteinst_install_site_for_ptrace(address: u64) -> i64 {
+    // SAFETY: the ptrace helper is serialized and the controller reads this
+    // fixed-size record only after the helper-return trap.
+    unsafe {
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!(HOST_INSTALL_RESULT),
+            HostInstallResult::default(),
+        );
+    }
+    if let Some(site) = find_site(address) {
+        // The controller calls this helper only after observing the original
+        // syscall bytes at the address. If a prior generation is still marked
+        // active, its mapping was replaced and the old hook is no longer
+        // installed. Transition it to STALE so claim_site installs a new hook
+        // rather than returning the prior generation's relocated tail.
+        let instruction = unsafe { core::ptr::read_unaligned(address as usize as *const u16) };
+        if instruction == 0x050f
+            && matches!(
+                site.state.load(Ordering::Acquire),
+                SITE_ACTIVE | SITE_FALLBACK
+            )
+        {
+            site.state.store(SITE_STALE, Ordering::Release);
+        }
+    }
+    let Some((site, claimed)) = claim_site(address) else {
+        return -i64::from(libc::ENOSPC);
+    };
+    site.trap_count.fetch_add(1, Ordering::Relaxed);
+    let mut install_result = None;
+    if claimed {
+        match unsafe { install_site_hook(address, site, host_syscall_hook) } {
+            Ok(result) => install_result = Some(result),
+            Err(_) => site.state.store(SITE_FALLBACK, Ordering::Release),
+        }
+    }
+    while matches!(site.state.load(Ordering::Acquire), 0 | SITE_INSTALLING) {
+        core::hint::spin_loop();
+    }
+    if site.state.load(Ordering::Acquire) == SITE_ACTIVE {
+        let result = install_result.or_else(|| {
+            let hook = site.hook.load(Ordering::Acquire);
+            if hook.is_null() {
+                return None;
+            }
+            let hook = unsafe { &*hook };
+            let arena = arena_for(address)?;
+            Some(HostInstallResult {
+                version: HOST_INSTALL_RESULT_VERSION,
+                site_start: address,
+                site_len: liteinst2::patcher::WORD_PATCH_BYTES as u64,
+                relocated_tail: hook.trampoline().relocated_tail_address(),
+                trampoline_start: hook.trampoline().address(),
+                trampoline_len: hook.trampoline().allocation_len() as u64,
+                arena_writable_start: arena.writable_start,
+                arena_writable_len: arena.writable_end - arena.writable_start,
+                arena_executable_start: arena.executable_start,
+                arena_executable_len: arena.executable_end - arena.executable_start,
+                complete: 1,
+            })
+        });
+        if let Some(result) = result {
+            // SAFETY: see the reset above. Publishing `complete` is part of the
+            // same stopped-helper call and the host validates every field.
+            unsafe {
+                core::ptr::write_volatile(core::ptr::addr_of_mut!(HOST_INSTALL_RESULT), result);
+            }
+        }
+        result
+            .and_then(|result| i64::try_from(result.relocated_tail).ok())
+            .unwrap_or(-i64::from(libc::EOVERFLOW))
+    } else {
+        -i64::from(libc::EOPNOTSUPP)
+    }
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -972,6 +1339,133 @@ fn forward_nested_tool_syscall(event: &mut SyscallEvent) {
     }
 }
 
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct HostSyscallFrame {
+    flags: u64,
+    r15: u64,
+    r14: u64,
+    r13: u64,
+    r12: u64,
+    r11: u64,
+    r10: u64,
+    r9: u64,
+    r8: u64,
+    rdi: u64,
+    rsi: u64,
+    rbp: u64,
+    rbx: u64,
+    rdx: u64,
+    rcx: u64,
+    rax: u64,
+    rsp: u64,
+    rip: u64,
+}
+
+impl HostSyscallFrame {
+    const FLAGS_OF: u64 = 0x0001;
+    const FLAGS_CF: u64 = 0x0100;
+    const FLAGS_PF: u64 = 0x0400;
+    const FLAGS_AF: u64 = 0x1000;
+    const FLAGS_ZF: u64 = 0x4000;
+    const FLAGS_SF: u64 = 0x8000;
+    const STATUS_RFLAGS: u64 = 0x0001 | 0x0004 | 0x0010 | 0x0040 | 0x0080 | 0x0800;
+
+    fn from_context(context: &HookContext) -> Self {
+        Self {
+            flags: Self::encode_flags(context.rflags),
+            r15: context.r15,
+            r14: context.r14,
+            r13: context.r13,
+            r12: context.r12,
+            r11: context.r11,
+            r10: context.r10,
+            r9: context.r9,
+            r8: context.r8,
+            rdi: context.rdi,
+            rsi: context.rsi,
+            rbp: context.rbp,
+            rbx: context.rbx,
+            rdx: context.rdx,
+            rcx: context.rcx,
+            rax: context.rax,
+            rsp: context.stack_pointer,
+            rip: context.instruction_pointer,
+        }
+    }
+
+    fn copy_to_context(self, context: &mut HookContext, original_rflags: u64) {
+        context.r15 = self.r15;
+        context.r14 = self.r14;
+        context.r13 = self.r13;
+        context.r12 = self.r12;
+        context.r11 = self.r11;
+        context.r10 = self.r10;
+        context.r9 = self.r9;
+        context.r8 = self.r8;
+        context.rdi = self.rdi;
+        context.rsi = self.rsi;
+        context.rbp = self.rbp;
+        context.rbx = self.rbx;
+        context.rdx = self.rdx;
+        context.rcx = self.rcx;
+        context.rax = self.rax;
+        context.rflags = (original_rflags & !Self::STATUS_RFLAGS) | Self::decode_flags(self.flags);
+    }
+
+    fn encode_flags(flags: u64) -> u64 {
+        let mut encoded = 0;
+        for (native, e9) in [
+            (0x0001, Self::FLAGS_CF),
+            (0x0004, Self::FLAGS_PF),
+            (0x0010, Self::FLAGS_AF),
+            (0x0040, Self::FLAGS_ZF),
+            (0x0080, Self::FLAGS_SF),
+            (0x0800, Self::FLAGS_OF),
+        ] {
+            if flags & native != 0 {
+                encoded |= e9;
+            }
+        }
+        encoded
+    }
+
+    fn decode_flags(flags: u64) -> u64 {
+        let mut native = 0;
+        for (e9, bit) in [
+            (Self::FLAGS_CF, 0x0001),
+            (Self::FLAGS_PF, 0x0004),
+            (Self::FLAGS_AF, 0x0010),
+            (Self::FLAGS_ZF, 0x0040),
+            (Self::FLAGS_SF, 0x0080),
+            (Self::FLAGS_OF, 0x0800),
+        ] {
+            if flags & e9 != 0 {
+                native |= bit;
+            }
+        }
+        native
+    }
+}
+
+unsafe extern "C" fn host_syscall_hook(context: *mut HookContext) {
+    if context.is_null() {
+        unsafe { exit_now(122) };
+    }
+    let context = unsafe { &mut *context };
+    let original_rflags = context.rflags;
+    if let Some(site) = find_site(context.instruction_pointer) {
+        site.hook_count.fetch_add(1, Ordering::Relaxed);
+    }
+    let mut frame = HostSyscallFrame::from_context(context);
+    // SAFETY: the host validates the configured marker, exact trap/caller RIPs,
+    // readable frame, stack relationship, and current patched-site provenance
+    // before dispatch. These checks resist accidental collisions; same-process
+    // arbitrary code remains outside the threat model.
+    unsafe { reverie_liteinst_host_syscall_trap_call(&mut frame) };
+    frame.copy_to_context(context, original_rflags);
+}
+
 unsafe extern "C" fn installed_syscall_hook(context: *mut HookContext) {
     if context.is_null() {
         unsafe {
@@ -1083,7 +1577,10 @@ impl SyscallDispatcher for LiteinstDispatcher {
 
         if let Some((site, claimed)) = claim_site(instruction_pointer) {
             site.trap_count.fetch_add(1, Ordering::Relaxed);
-            if claimed && unsafe { install_site_hook(instruction_pointer, site) }.is_err() {
+            if claimed
+                && unsafe { install_site_hook(instruction_pointer, site, installed_syscall_hook) }
+                    .is_err()
+            {
                 site.state.store(SITE_FALLBACK, Ordering::Release);
             }
             while matches!(site.state.load(Ordering::Acquire), 0 | SITE_INSTALLING) {

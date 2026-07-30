@@ -42,6 +42,7 @@ use reverie::Signal;
 use reverie::Tid;
 use safeptrace::Error as TraceError;
 use safeptrace::Event as TraceEvent;
+use safeptrace::Running;
 use safeptrace::Stopped;
 use safeptrace::Wait;
 use thiserror::Error;
@@ -398,9 +399,19 @@ impl Timer {
     /// Postconditions: if a signal meant for this timer was the cause of the
     /// stop, the tracee will be at the precise instruction the timer event
     /// should fire at.
-    pub async fn handle_signal(&mut self, task: Stopped) -> Result<Stopped, HandleFailure> {
+    /// Drives a timer signal using caller-owned stopped-state transitions.
+    ///
+    /// LiteInst uses this hook to keep its exact-generation root-stop lease
+    /// synchronized across the precise timer's internal single steps. The
+    /// non-LiteInst caller supplies the historical raw transition.
+    pub(crate) async fn handle_signal(
+        &mut self,
+        task: Stopped,
+        step: &mut (dyn FnMut(Stopped) -> Result<Running, TraceError> + Send),
+        observe: &mut (dyn FnMut(&Wait) -> Result<(), TraceError> + Send),
+    ) -> Result<Stopped, HandleFailure> {
         match self.inner_mut_noinit() {
-            Some(t) => t.handle_signal(task).await,
+            Some(t) => t.handle_signal(task, step, observe).await,
             None => {
                 warn!("Stray SIGSTKFLT indicates a bug!");
                 Err(HandleFailure::ImproperSignal(task))
@@ -713,7 +724,12 @@ impl TimerImpl {
         }
     }
 
-    pub async fn handle_signal(&mut self, task: Stopped) -> Result<Stopped, HandleFailure> {
+    async fn handle_signal(
+        &mut self,
+        task: Stopped,
+        step: &mut (dyn FnMut(Stopped) -> Result<Running, TraceError> + Send),
+        observe: &mut (dyn FnMut(&Wait) -> Result<(), TraceError> + Send),
+    ) -> Result<Stopped, HandleFailure> {
         let signal = task.getsiginfo()?;
         if !self.generated_signal(&signal) {
             warn!(
@@ -767,7 +783,7 @@ impl TimerImpl {
                 clock_target,
                 offset,
             } => {
-                self.attempt_single_step(task, ctr, clock_target, offset)
+                self.attempt_single_step(task, ctr, clock_target, offset, step, observe)
                     .await
             }
             ActiveEvent::Imprecise { clock_min } => {
@@ -787,6 +803,8 @@ impl TimerImpl {
         ctr_initial: u64,
         target_rcb: u64,
         target_instr: u64,
+        step: &mut (dyn FnMut(Stopped) -> Result<Running, TraceError> + Send),
+        observe: &mut (dyn FnMut(&Wait) -> Result<(), TraceError> + Send),
     ) -> Result<Stopped, HandleFailure> {
         assert!(
             ctr_initial <= target_rcb,
@@ -825,7 +843,9 @@ impl TimerImpl {
                 task.getregs()?
                     .display_with_options(RegDisplayOptions { multiline: true })
             );
-            task = match task.step(None)?.next_state().await? {
+            let wait = step(task)?.next_state().await?;
+            observe(&wait)?;
+            task = match wait {
                 // a successful single step results in SIGTRAP stop
                 Wait::Stopped(new_task, TraceEvent::Signal(Signal::SIGTRAP)) => new_task,
                 wait => return Err(HandleFailure::Event(wait)),

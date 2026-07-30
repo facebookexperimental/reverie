@@ -26,6 +26,9 @@ use reverie::ExitStatus;
 use reverie::GlobalTool;
 use reverie::Tool;
 use reverie::process::Command;
+use reverie::process::Output as ReverieOutput;
+use reverie::process::Stdio as ReverieStdio;
+use reverie_ptrace::TracerBuilder;
 use reverie_rpc_transport::RpcServer;
 
 /// Environment variable naming the tool-specific preload DSO for a backend run.
@@ -190,6 +193,73 @@ fn create_preload_bootstrap(coordinator: &Path, tool_data: &[u8]) -> io::Result<
 pub struct LiteinstBackend;
 
 impl LiteinstBackend {
+    /// Runs a Tool under the ptrace-owned LiteInst hybrid runtime.
+    ///
+    /// Ptrace owns the sole Tool and GlobalTool from exec onward; the preload
+    /// contributes only dynamic site installation and injected hot-site traps.
+    /// This initial hybrid contract supports one tracee process with one thread;
+    /// fork, vfork, and clone fail closed before either side is resumed.
+    ///
+    /// Trap markers, exact DSO addresses, mapping state, and an inner runtime
+    /// call site provide strong accidental-collision resistance. They are not a
+    /// security boundary against arbitrary code already executing in the guest.
+    // TODO-HUMAN-REVIEW(PR-270): Review public host-hybrid launch API.
+    pub async fn run_host_with_preload<T>(
+        mut command: Command,
+        config: <T::GlobalState as GlobalTool>::Config,
+        preload: impl Into<PathBuf>,
+    ) -> Result<(ExitStatus, T::GlobalState), Error>
+    where
+        T: Tool + 'static,
+    {
+        let preload = configure_host_command(&mut command, preload.into())?;
+        TracerBuilder::<T>::new(command)
+            .config(config)
+            .liteinst_runtime(
+                preload,
+                crate::runtime::HOST_BEGIN_MARKER,
+                crate::runtime::HOST_READY_MARKER,
+                crate::runtime::HOST_HELPER_RETURN_MARKER,
+                crate::runtime::HOST_SYSCALL_MARKER,
+            )
+            .spawn()
+            .await?
+            .wait()
+            .await
+    }
+
+    /// Runs a Tool under the ptrace-owned LiteInst hybrid and captures output.
+    ///
+    /// The same single-process/single-thread and non-security-boundary contract
+    /// as [`Self::run_host_with_preload`] applies.
+    // TODO-HUMAN-REVIEW(PR-270): Review public host-hybrid output API.
+    pub async fn run_host_with_output_and_preload<T>(
+        mut command: Command,
+        config: <T::GlobalState as GlobalTool>::Config,
+        preload: impl Into<PathBuf>,
+    ) -> Result<(ReverieOutput, T::GlobalState), Error>
+    where
+        T: Tool + 'static,
+    {
+        command
+            .stdout(ReverieStdio::piped())
+            .stderr(ReverieStdio::piped());
+        let preload = configure_host_command(&mut command, preload.into())?;
+        TracerBuilder::<T>::new(command)
+            .config(config)
+            .liteinst_runtime(
+                preload,
+                crate::runtime::HOST_BEGIN_MARKER,
+                crate::runtime::HOST_READY_MARKER,
+                crate::runtime::HOST_HELPER_RETURN_MARKER,
+                crate::runtime::HOST_SYSCALL_MARKER,
+            )
+            .spawn()
+            .await?
+            .wait_with_output()
+            .await
+    }
+
     /// Runs a tool using an explicit tool-specific preload library.
     pub async fn run_with_preload<T>(
         command: Command,
@@ -284,6 +354,30 @@ impl LiteinstBackend {
             ChildWait::Status(_) => unreachable!("output run returned only a status"),
         }
     }
+}
+
+fn configure_host_command(command: &mut Command, preload: PathBuf) -> io::Result<PathBuf> {
+    if !preload.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("LiteInst host runtime {} is not a file", preload.display()),
+        ));
+    }
+    let preload = preload.canonicalize()?;
+    let mut ld_preload = preload.clone().into_os_string();
+    if let Some(existing) = command
+        .get_env("LD_PRELOAD")
+        .or_else(|| std::env::var_os("LD_PRELOAD").map(Into::into))
+        .filter(|value| !value.is_empty())
+    {
+        ld_preload.push(OsStr::new(":"));
+        let existing: &OsStr = existing.as_ref();
+        ld_preload.push(existing);
+    }
+    command
+        .env("LD_PRELOAD", ld_preload)
+        .env(crate::runtime::HOST_RUNTIME_ENV, "1");
+    Ok(preload)
 }
 
 fn inherit_stdio(command: &mut Command) {
