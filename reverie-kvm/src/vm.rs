@@ -308,10 +308,15 @@ pub struct KvmBackend {
     cpuid_policy: CpuidPolicy,
     hypercall_instruction: [u8; 3],
     syscall_trampoline_address: u64,
-    syscall_frame_address: u64,
+    pub(crate) syscall_frame_address: u64,
     thread_group: Arc<GuestThreadGroup>,
     thread_slot: Option<usize>,
     is_guest_thread: bool,
+    // When true, CLONE_THREAD workers are dispatched through the Tool and joined
+    // in Detcore's scheduler (Option A), so thread-synchronization syscalls such
+    // as `futex` must route to Detcore rather than the host. Propagated to every
+    // child backend and consulted by `is_backend_owned_syscall`.
+    pub(crate) dispatch_thread_tools: bool,
     pub(crate) static_elf: Option<LoadedStaticElf>,
     stdin: Option<File>,
     pub(crate) root_pid: i32,
@@ -410,6 +415,7 @@ impl KvmBackend {
             thread_group: Arc::new(GuestThreadGroup::default()),
             thread_slot: None,
             is_guest_thread: false,
+            dispatch_thread_tools: false,
             static_elf: None,
             stdin,
             root_pid: 1,
@@ -420,6 +426,16 @@ impl KvmBackend {
     ///
     /// The default is PID 1. Call this before running a tool when its process
     /// model reserves a different deterministic root identity.
+    /// Selects whether CLONE_THREAD workers are dispatched through the Tool.
+    ///
+    /// When enabled (the Option A model), workers join Detcore's scheduler and
+    /// thread-synchronization syscalls such as `futex` route to Detcore instead
+    /// of the host. Call this before running a tool; it defaults to `false` so
+    /// the hybrid/uninstrumented-worker model keeps its host-backed futex words.
+    pub fn set_dispatch_thread_tools(&mut self, dispatch_thread_tools: bool) {
+        self.dispatch_thread_tools = dispatch_thread_tools;
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-238): Review configurable KVM root process identity.
     pub fn set_root_pid(&mut self, pid: i32) -> Result<()> {
@@ -658,6 +674,9 @@ impl KvmBackend {
         write_tid_best_effort(&mut self.memory, parent_tid, child_pid);
 
         let mut child = Self::from_process_snapshot(child_snapshot)?;
+        // Forked children inherit the parent's thread-dispatch model so that
+        // `is_backend_owned_syscall` classifies futex consistently (Option A).
+        child.dispatch_thread_tools = self.dispatch_thread_tools;
         write_tid_best_effort(&mut child.memory, child_tid, child_pid);
         let (fs_base, gs_base) = child_executor.segment_bases();
         set_user_segment_base(&child.vcpu, SegmentBase::Fs, fs_base)?;
@@ -789,6 +808,9 @@ impl KvmBackend {
                     child_tid,
                     self.thread_group.clone(),
                 )?;
+                // Thread children inherit the parent's thread-dispatch model so
+                // `is_backend_owned_syscall` classifies futex consistently (Option A).
+                child.dispatch_thread_tools = self.dispatch_thread_tools;
                 child
                     .memory
                     .write_raw(child.syscall_frame_address, &parent_syscall_frame)?;
@@ -884,86 +906,231 @@ impl KvmBackend {
         T::GlobalState: 'static,
         <T::GlobalState as GlobalTool>::Config: 'static,
     {
-        let ProcessAction::Fork {
-            child_pid,
-            child_stack,
-            parent_tid,
-            child_tid,
-            clear_child_tid,
-            clear_sighand,
-        } = action
-        else {
-            return self.run_process_action(executor, action, park_syscall_return);
-        };
+        match action {
+            ProcessAction::Fork {
+                child_pid,
+                child_stack,
+                parent_tid,
+                child_tid,
+                clear_child_tid,
+                clear_sighand,
+            } => {
+                let mut child = self.prepare_forked_process(
+                    executor,
+                    child_pid,
+                    child_stack,
+                    parent_tid,
+                    child_tid,
+                    clear_child_tid,
+                    clear_sighand,
+                    park_syscall_return,
+                )?;
 
-        let mut child = self.prepare_forked_process(
-            executor,
-            child_pid,
-            child_stack,
-            parent_tid,
-            child_tid,
-            clear_child_tid,
-            clear_sighand,
-            park_syscall_return,
-        )?;
-
-        let child_pid = Pid::from_raw(child.pid);
-        let child_tool = T::new(child_pid, &context.config);
-        let child_thread_state =
-            child_tool.init_thread_state(child_pid, Some((context.pid, context.thread_state)));
-        let global_state = context.global_state.ok_or_else(|| {
-            Error::UnexpectedVcpuExit(
-                "forked KVM Tool process requires shared global state".to_owned(),
-            )
-        })?;
-        let config = context.config;
-        let subscriptions = context.subscriptions;
-        let pending_child_starts = context.pending_child_starts;
-        let raw_child_pid = child.pid;
-        let (start_sender, start_receiver) = std::sync::mpsc::channel();
-        let handle = std::thread::Builder::new()
-            .name(format!("reverie-kvm-process-{raw_child_pid}"))
-            .spawn(move || {
-                start_receiver.recv().map_err(|_| {
-                    Error::UnexpectedVcpuExit(format!(
-                        "KVM child process {raw_child_pid} lost its parent start gate"
-                    ))
+                let child_pid = Pid::from_raw(child.pid);
+                let child_tool = T::new(child_pid, &context.config);
+                let child_thread_state = child_tool
+                    .init_thread_state(child_pid, Some((context.tid, context.thread_state)));
+                let global_state = context.global_state.ok_or_else(|| {
+                    Error::UnexpectedVcpuExit(
+                        "forked KVM Tool process requires shared global state".to_owned(),
+                    )
                 })?;
-                let result =
-                    futures::executor::block_on(child.backend.run_static_elf_process_with_tool(
-                        &mut child.executor,
-                        child_pid,
-                        child_tool,
-                        child_thread_state,
-                        global_state,
-                        &config,
-                        &subscriptions,
-                        false,
-                    ));
-                match result {
-                    Ok((code, _, _)) => {
-                        write_tid_best_effort(
-                            &mut child.backend.memory,
-                            child.executor.take_clear_child_tid(),
-                            0,
+                let config = context.config;
+                let subscriptions = context.subscriptions;
+                let pending_child_starts = context.pending_child_starts;
+                let raw_child_pid = child.pid;
+                let (start_sender, start_receiver) = std::sync::mpsc::channel();
+                let handle = std::thread::Builder::new()
+                    .name(format!("reverie-kvm-process-{raw_child_pid}"))
+                    .spawn(move || {
+                        start_receiver.recv().map_err(|_| {
+                            Error::UnexpectedVcpuExit(format!(
+                                "KVM child process {raw_child_pid} lost its parent start gate"
+                            ))
+                        })?;
+                        let result = futures::executor::block_on(
+                            child.backend.run_static_elf_process_with_tool(
+                                &mut child.executor,
+                                child_pid,
+                                // A forked process child is its own leader (tid == pid).
+                                child_pid,
+                                child_tool,
+                                child_thread_state,
+                                global_state,
+                                &config,
+                                &subscriptions,
+                                false,
+                            ),
                         );
-                        Ok(code)
-                    }
-                    Err(error) => Err(error),
+                        match result {
+                            Ok((code, _, _)) => {
+                                write_tid_best_effort(
+                                    &mut child.backend.memory,
+                                    child.executor.take_clear_child_tid(),
+                                    0,
+                                );
+                                Ok(code)
+                            }
+                            Err(error) => Err(error),
+                        }
+                    })?;
+                pending_child_starts
+                    .lock()
+                    .expect("KVM child-start lock poisoned")
+                    .push(start_sender.clone());
+                executor.register_child_process(raw_child_pid, start_sender, handle);
+                configure_process_syscall_return(
+                    &self.memory,
+                    &self.vcpu,
+                    self.syscall_frame_address,
+                    i64::from(raw_child_pid),
+                    None,
+                )
+            }
+            // A CLONE_THREAD worker runs its own vCPU on a fresh OS thread but
+            // shares the guest address space, file table, and process Tool
+            // identity with its creator. It is driven through the same Tool loop
+            // as the process leader so Detcore sees its syscalls, shares its fd
+            // model, and schedules it. This mirrors the physical setup in
+            // `run_process_action`'s Thread branch, but spawns the Tool loop
+            // instead of the direct backend personality.
+            ProcessAction::Thread {
+                child_tid,
+                child_stack,
+                parent_tid,
+                child_tid_address,
+                clear_child_tid,
+                tls,
+            } => {
+                let parent_registers = self.vcpu.get_regs()?;
+                let parent_xsave = self.vcpu.get_xsave()?;
+                let (parent_fs, parent_gs) = executor.segment_bases();
+                let mut parent_syscall_frame = vec![0; FRAME_SIZE];
+                self.memory
+                    .read_raw(self.syscall_frame_address, &mut parent_syscall_frame)?;
+
+                if park_syscall_return {
+                    set_syscall_return_park(
+                        &mut self.memory,
+                        self.hypercall_instruction,
+                        self.syscall_trampoline_address,
+                        self.syscall_frame_address,
+                        true,
+                    )?;
+                    let parked = match self.vcpu.run()? {
+                        VcpuExit::Hlt => Ok(()),
+                        exit => Err(Error::UnexpectedVcpuExit(format!(
+                            "parent did not park at thread clone: {exit:?}"
+                        ))),
+                    };
+                    set_syscall_return_park(
+                        &mut self.memory,
+                        self.hypercall_instruction,
+                        self.syscall_trampoline_address,
+                        self.syscall_frame_address,
+                        false,
+                    )?;
+                    parked?;
                 }
-            })?;
-        pending_child_starts
-            .lock()
-            .expect("KVM child-start lock poisoned")
-            .push(start_sender.clone());
-        executor.register_child_process(raw_child_pid, start_sender, handle);
-        configure_process_syscall_return(
-            &self.memory,
-            &self.vcpu,
-            self.syscall_frame_address,
-            i64::from(raw_child_pid),
-            None,
-        )
+                let child_registers = self.vcpu.get_regs()?;
+
+                write_tid_best_effort(&mut self.memory, parent_tid, child_tid);
+                write_tid_best_effort(&mut self.memory, child_tid_address, child_tid);
+                let child_fs = tls.unwrap_or(parent_fs);
+                let mut child_executor = executor.thread_child(child_tid)?;
+                child_executor.set_thread_context(child_tid, child_fs, parent_gs);
+                child_executor.set_clear_child_tid(clear_child_tid);
+                let child_stdin = self.stdin.as_ref().map(File::try_clone).transpose()?;
+                let mut child = Self::from_thread_state(
+                    self.memory.clone(),
+                    child_registers,
+                    parent_xsave,
+                    child_stdin,
+                    self.cpuid_policy,
+                    child_tid,
+                    self.thread_group.clone(),
+                )?;
+                // Thread children inherit the parent's thread-dispatch model so
+                // `is_backend_owned_syscall` classifies futex consistently (Option A).
+                child.dispatch_thread_tools = self.dispatch_thread_tools;
+                child
+                    .memory
+                    .write_raw(child.syscall_frame_address, &parent_syscall_frame)?;
+                set_user_segment_base(&child.vcpu, SegmentBase::Fs, child_fs)?;
+                set_user_segment_base(&child.vcpu, SegmentBase::Gs, parent_gs)?;
+                configure_process_syscall_return(
+                    &child.memory,
+                    &child.vcpu,
+                    child.syscall_frame_address,
+                    0,
+                    Some(child_stack),
+                )?;
+
+                // CLONE_THREAD shares the process (thread-group) identity, so the
+                // worker's Tool carries the creator's pid (tgid) as its detpid,
+                // while the thread state is keyed on the new child tid. This
+                // mirrors reverie-ptrace's `cloned()`, where the child shares the
+                // process Tool identity and receives fresh per-thread state
+                // linked to the parent thread.
+                let tgid = context.pid;
+                let child_tid_pid = Pid::from_raw(child_tid);
+                let child_tool = T::new(tgid, &context.config);
+                let child_thread_state = child_tool
+                    .init_thread_state(child_tid_pid, Some((context.tid, context.thread_state)));
+                let global_state = context.global_state.ok_or_else(|| {
+                    Error::UnexpectedVcpuExit(
+                        "KVM CLONE_THREAD worker requires shared global state".to_owned(),
+                    )
+                })?;
+                let config = context.config;
+                let subscriptions = context.subscriptions;
+
+                self.vcpu.set_regs(&parent_registers)?;
+                configure_process_syscall_return(
+                    &self.memory,
+                    &self.vcpu,
+                    self.syscall_frame_address,
+                    i64::from(child_tid),
+                    None,
+                )?;
+
+                let handle = std::thread::Builder::new()
+                    .name(format!("reverie-kvm-guest-{child_tid}"))
+                    .spawn(move || {
+                        // No explicit start channel: the worker gates itself in
+                        // `handle_thread_start` -> `thread_start_request`, which
+                        // blocks on the Detcore scheduler until the parent's
+                        // clone handler has registered it (create_child_thread).
+                        let result =
+                            futures::executor::block_on(child.run_static_elf_process_with_tool(
+                                &mut child_executor,
+                                tgid,
+                                child_tid_pid,
+                                child_tool,
+                                child_thread_state,
+                                global_state,
+                                &config,
+                                &subscriptions,
+                                false,
+                            ));
+                        clear_tid_and_wake(
+                            &mut child.memory,
+                            child_executor.take_clear_child_tid(),
+                        );
+                        let cancelled = child.thread_group.cancelled.load(Ordering::Acquire);
+                        if let Err(error) = &result
+                            && !cancelled
+                        {
+                            eprintln!(
+                                "reverie-kvm guest thread {child_tid} tool loop failed: {error}"
+                            );
+                        }
+                    })?;
+                self.thread_group.add_worker_handle(handle);
+                Ok(())
+            }
+            other => self.run_process_action(executor, other, park_syscall_return),
+        }
     }
 
     fn static_elf_exception(&self) -> Result<Option<StaticElfException>> {

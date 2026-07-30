@@ -41,13 +41,11 @@ use crate::KvmBackend;
 use crate::Result;
 use crate::SyscallRequest;
 use crate::VMCALL_SYSCALL_TRANSPORT;
-use crate::bootstrap::SYSCALL_FRAME_ADDRESS;
 use crate::bootstrap::TOOL_STACK_TOP;
 use crate::bootstrap::configure_process_syscall_return;
 use crate::bootstrap::set_user_segment_base;
 use crate::executor::ElfExecutor;
 use crate::executor::ProcessAction;
-use crate::executor::is_thread_clone_request;
 
 const STACK_CAPACITY: usize = 4096;
 const TOOL_STACK_BOTTOM: u64 = TOOL_STACK_TOP - STACK_CAPACITY as u64;
@@ -66,13 +64,26 @@ type SharedChildStarts = Arc<Mutex<Vec<std::sync::mpsc::Sender<()>>>>;
 
 // AUTONOMOUS-BOT-IMPLEMENTED: Keep root syscalls that share worker state in one backend.
 // TODO-HUMAN-REVIEW(PR-173): Review KVM root syscall ownership.
-fn is_backend_owned_syscall(number: u64) -> bool {
-    // KVM guest workers run outside Detcore's scheduler. Root futexes must
-    // use the same host-backed words as workers, or Detcore deadlocks.
-    number == libc::SYS_futex as u64
-        // QEMU's root event loop waits on worker eventfds. KVM syscall
-        // injection cannot perform ppoll, so use translated host descriptors.
-        || number == libc::SYS_ppoll as u64
+fn is_backend_owned_syscall(number: u64, dispatch_thread_tools: bool) -> bool {
+    // `futex` ownership depends on how sibling threads are executed:
+    //
+    // * When guest threads are dispatched through the Tool (`dispatch_thread_tools`,
+    //   the Option A model), every thread — root and worker alike — is registered
+    //   in Detcore's scheduler. `futex` must therefore route to Detcore so that a
+    //   join's `FUTEX_WAIT` becomes a logical scheduler wait woken by the exiting
+    //   worker's logical `CLONE_CHILD_CLEARTID` wake. Executing it as a real host
+    //   futex here deadlocks: the exiting worker's wake is only simulated inside
+    //   Detcore and never reaches a real host futex word, so the waiter sleeps
+    //   forever.
+    // * In the hybrid model (instrumented root + uninstrumented worker threads
+    //   that run outside Detcore's scheduler), the root's futex must instead use
+    //   the same host-backed words as those siblings, so it stays backend-owned.
+    if number == libc::SYS_futex as u64 {
+        return !dispatch_thread_tools;
+    }
+    // QEMU's root event loop waits on worker eventfds. KVM syscall
+    // injection cannot perform ppoll, so use translated host descriptors.
+    number == libc::SYS_ppoll as u64
         // Workers can create descriptors that the root event loop consumes.
         // Scalar and vectored reads must use that shared descriptor table.
         || number == libc::SYS_read as u64
@@ -109,7 +120,11 @@ enum InjectionCompletion {
 
 // TODO-HUMAN-REVIEW(PR-192): Review awaitable KVM injection Tool context.
 pub(crate) struct ToolContext<'a, T: Tool> {
+    /// The process (thread-group) identity of the thread issuing the action.
     pub(crate) pid: Pid,
+    /// The thread identity of the thread issuing the action. Equals `pid` for a
+    /// process leader; differs for a CLONE_THREAD worker.
+    pub(crate) tid: Pid,
     pub(crate) thread_state: &'a T::ThreadState,
     // TODO-HUMAN-REVIEW(PR-235): Review shared GlobalTool ownership across KVM forks.
     pub(crate) global_state: Option<Arc<T::GlobalState>>,
@@ -291,7 +306,10 @@ where
 }
 
 struct KvmGlobal<'a, G: GlobalTool> {
-    pid: Pid,
+    // The scheduler derives the requesting DetTid from the RPC sender, so this
+    // is the issuing thread's tid (equal to the pid for a process leader,
+    // distinct for a CLONE_THREAD worker), not the thread-group pid.
+    tid: Pid,
     state: &'a G,
     config: &'a G::Config,
 }
@@ -299,7 +317,7 @@ struct KvmGlobal<'a, G: GlobalTool> {
 #[reverie::tool]
 impl<G: GlobalTool> GlobalRPC<G> for KvmGlobal<'_, G> {
     async fn send_rpc(&self, message: G::Request) -> G::Response {
-        self.state.receive_rpc(self.pid, message).await
+        self.state.receive_rpc(self.tid, message).await
     }
 
     fn config(&self) -> &G::Config {
@@ -309,6 +327,7 @@ impl<G: GlobalTool> GlobalRPC<G> for KvmGlobal<'_, G> {
 
 struct KvmGuest<'a, T: Tool> {
     pid: Pid,
+    tid: Pid,
     memory: GuestMemory,
     auxv: &'a [(libc::c_ulong, libc::c_ulong)],
     registers: libc::user_regs_struct,
@@ -327,6 +346,7 @@ impl<'a, T: Tool> KvmGuest<'a, T> {
     #[allow(clippy::too_many_arguments)]
     fn new(
         pid: Pid,
+        tid: Pid,
         memory: GuestMemory,
         auxv: &'a [(libc::c_ulong, libc::c_ulong)],
         registers: libc::user_regs_struct,
@@ -342,6 +362,7 @@ impl<'a, T: Tool> KvmGuest<'a, T> {
     ) -> Self {
         Self {
             pid,
+            tid,
             memory,
             auxv,
             registers,
@@ -371,7 +392,10 @@ impl<T: Tool> GlobalRPC<T::GlobalState> for KvmGuest<'_, T> {
         &self,
         message: <T::GlobalState as GlobalTool>::Request,
     ) -> <T::GlobalState as GlobalTool>::Response {
-        self.global_state.receive_rpc(self.pid, message).await
+        // Route by the issuing thread's tid: the scheduler keys each thread's
+        // turn (and global-time accounting) on the RPC sender. For a
+        // CLONE_THREAD worker this is the worker tid, not the thread-group pid.
+        self.global_state.receive_rpc(self.tid, message).await
     }
 
     fn config(&self) -> &<T::GlobalState as GlobalTool>::Config {
@@ -385,7 +409,7 @@ impl<T: Tool> Guest<T> for KvmGuest<'_, T> {
     type Stack = KvmStack;
 
     fn tid(&self) -> Pid {
-        self.pid
+        self.tid
     }
 
     fn pid(&self) -> Pid {
@@ -428,6 +452,7 @@ impl<T: Tool> Guest<T> for KvmGuest<'_, T> {
         if result.is_ok() {
             let context = ToolContext {
                 pid: self.pid,
+                tid: self.tid,
                 thread_state: self.thread_state,
                 global_state: self.shared_global_state.clone(),
                 config: self.config.clone(),
@@ -713,6 +738,9 @@ where
             };
             let mut guest = KvmGuest::<T>::new(
                 pid,
+                // A process leader (root, fork child, or the post-exec thread
+                // that became the new leader) has tid == pid.
+                pid,
                 memory.clone(),
                 auxv,
                 registers,
@@ -824,6 +852,8 @@ where
         };
         let mut guest = KvmGuest::<T>::new(
             pid,
+            // The initial exec runs on the root thread, where tid == pid.
+            pid,
             memory.clone(),
             auxv,
             registers,
@@ -871,20 +901,29 @@ where
 async fn notify_tool_exit<T: Tool>(
     tool: T,
     pid: Pid,
+    tid: Pid,
     global_state: &T::GlobalState,
     config: &<T::GlobalState as GlobalTool>::Config,
     thread_state: T::ThreadState,
     status: ExitStatus,
 ) -> Result<()> {
-    let global = KvmGlobal {
-        pid,
+    // on_exit_thread deregisters this thread from the scheduler, so its RPCs
+    // must be attributed to the exiting thread's tid.
+    let thread_global = KvmGlobal {
+        tid,
         state: global_state,
         config,
     };
-    tool.on_exit_thread(pid, &global, thread_state, status)
+    tool.on_exit_thread(tid, &thread_global, thread_state, status)
         .await
         .map_err(Error::Reverie)?;
-    tool.on_exit_process(pid, &global, status)
+    // The process-exit hook belongs to the thread-group leader (tid == pid).
+    let process_global = KvmGlobal {
+        tid: pid,
+        state: global_state,
+        config,
+    };
+    tool.on_exit_process(pid, &process_global, status)
         .await
         .map_err(Error::Reverie)
 }
@@ -923,6 +962,8 @@ impl KvmBackend {
                 executor: &mut executor,
             };
             let mut guest = KvmGuest::<T>::new(
+                pid,
+                // run_with_tool drives a single root thread (tid == pid).
                 pid,
                 memory.clone(),
                 &auxv,
@@ -975,6 +1016,8 @@ impl KvmBackend {
                             };
                             let mut guest = KvmGuest::<T>::new(
                                 pid,
+                                // run_with_tool drives a single root thread.
+                                pid,
                                 memory.clone(),
                                 &auxv,
                                 kvm_registers(registers, request.number()),
@@ -1013,8 +1056,9 @@ impl KvmBackend {
                 }
                 VcpuExit::Hlt => {
                     let status = ExitStatus::SUCCESS;
+                    // This HLT path terminates the process leader (tid == pid).
                     let global = KvmGlobal {
-                        pid,
+                        tid: pid,
                         state: &global_state,
                         config: &config,
                     };
@@ -1075,6 +1119,8 @@ impl KvmBackend {
             .run_static_elf_process_with_tool(
                 &mut executor,
                 pid,
+                // The root process leader has tid == pid.
+                pid,
                 tool,
                 thread_state,
                 global_state.clone(),
@@ -1096,6 +1142,7 @@ impl KvmBackend {
         &mut self,
         executor: &mut ElfExecutor,
         pid: Pid,
+        tid: Pid,
         tool: T,
         mut thread_state: T::ThreadState,
         global_state: Arc<T::GlobalState>,
@@ -1132,6 +1179,7 @@ impl KvmBackend {
             };
             let mut guest = KvmGuest::<T>::new(
                 pid,
+                tid,
                 memory.clone(),
                 &auxv,
                 registers,
@@ -1167,6 +1215,7 @@ impl KvmBackend {
             notify_tool_exit(
                 tool,
                 pid,
+                tid,
                 global_state.as_ref(),
                 config,
                 thread_state,
@@ -1208,6 +1257,7 @@ impl KvmBackend {
                     notify_tool_exit(
                         tool,
                         pid,
+                        tid,
                         global_state.as_ref(),
                         config,
                         thread_state,
@@ -1237,6 +1287,7 @@ impl KvmBackend {
                 notify_tool_exit(
                     tool,
                     pid,
+                    tid,
                     global_state.as_ref(),
                     config,
                     thread_state,
@@ -1258,6 +1309,7 @@ impl KvmBackend {
             notify_tool_exit(
                 tool,
                 pid,
+                tid,
                 global_state.as_ref(),
                 config,
                 thread_state,
@@ -1268,12 +1320,16 @@ impl KvmBackend {
             return Ok((exit.code, stdout, stderr));
         }
 
+        // Read once so the per-syscall classifier can borrow it while `self` is
+        // borrowed elsewhere in the loop body.
+        let dispatch_thread_tools = self.dispatch_thread_tools;
         loop {
             if let Some(code) = self.guest_thread_group_exit_code() {
                 self.cancel_guest_threads();
                 notify_tool_exit(
                     tool,
                     pid,
+                    tid,
                     global_state.as_ref(),
                     config,
                     thread_state,
@@ -1303,7 +1359,11 @@ impl KvmBackend {
                 }
                 exit => return Err(Error::UnexpectedVcpuExit(format!("{exit:?}"))),
             };
-            if frame_address != SYSCALL_FRAME_ADDRESS {
+            // A CLONE_THREAD worker runs on its own vCPU with a per-thread
+            // syscall area, so the transported frame is `self.syscall_frame_address`
+            // (equal to the root constant for the process leader, distinct for
+            // each worker), not the fixed root `SYSCALL_FRAME_ADDRESS`.
+            if frame_address != self.syscall_frame_address {
                 return Err(Error::UnexpectedVcpuExit(format!(
                     "syscall frame is at unexpected address {frame_address:#x}"
                 )));
@@ -1312,14 +1372,15 @@ impl KvmBackend {
             let request = SyscallRequest::read_from(&memory, frame_address)?;
             let syscall = request.into_syscall()?;
             // TODO-HUMAN-REVIEW(PR-156): Review root process-syscall Tool dispatch.
-            // KVM CLONE_THREAD workers currently execute directly through the
-            // backend personality. Sending only the parent through Detcore's
-            // clone handler waits forever for a child Tool start that this
-            // direct-worker path cannot issue.
-            let backend_owned = (is_backend_owned_syscall(request.number())
+            // CLONE_THREAD is deliberately NOT backend-owned: the parent's
+            // clone is delivered to the Tool (Detcore) so the worker inherits
+            // process-shared Tool state (fd table, memory identity) and joins
+            // Detcore's scheduler. `run_process_action_with_tool` then spawns
+            // the worker on the Tool loop, which issues the matching
+            // `handle_thread_start` the parent's clone handler waits for.
+            let backend_owned = is_backend_owned_syscall(request.number(), dispatch_thread_tools)
                 && !executor.is_random_device_read(&request)
-                && !executor.is_tool_visible_read(&request))
-                || is_thread_clone_request(&request, &memory);
+                && !executor.is_tool_visible_read(&request);
             let subscribed = !backend_owned
                 && subscriptions
                     .iter_syscalls()
@@ -1345,6 +1406,7 @@ impl KvmBackend {
                     };
                     let mut guest = KvmGuest::<T>::new(
                         pid,
+                        tid,
                         memory.clone(),
                         &auxv,
                         kvm_registers(registers, request.number()),
@@ -1399,7 +1461,7 @@ impl KvmBackend {
                 configure_process_syscall_return(
                     &memory,
                     &self.vcpu,
-                    SYSCALL_FRAME_ADDRESS,
+                    self.syscall_frame_address,
                     result,
                     None,
                 )?;
@@ -1416,6 +1478,7 @@ impl KvmBackend {
                 replaced_image |= matches!(&action, ProcessAction::Exec { .. });
                 let context: ToolContext<'_, T> = ToolContext {
                     pid,
+                    tid,
                     thread_state: &thread_state,
                     global_state: Some(global_state.clone()),
                     config: config.clone(),
@@ -1447,6 +1510,7 @@ impl KvmBackend {
                     notify_tool_exit(
                         tool,
                         pid,
+                        tid,
                         global_state.as_ref(),
                         config,
                         thread_state,
@@ -1469,6 +1533,7 @@ impl KvmBackend {
                 notify_tool_exit(
                     tool,
                     pid,
+                    tid,
                     global_state.as_ref(),
                     config,
                     thread_state,
@@ -1548,15 +1613,28 @@ mod tests {
 
     #[test]
     fn worker_shared_syscalls_are_backend_owned() {
-        for number in [
-            libc::SYS_futex,
-            libc::SYS_ppoll,
-            libc::SYS_read,
-            libc::SYS_readv,
-        ] {
-            assert!(is_backend_owned_syscall(number as u64));
+        // Descriptor/event-loop syscalls stay backend-owned in both models.
+        for dispatch_thread_tools in [false, true] {
+            for number in [libc::SYS_ppoll, libc::SYS_read, libc::SYS_readv] {
+                assert!(is_backend_owned_syscall(
+                    number as u64,
+                    dispatch_thread_tools
+                ));
+            }
+            assert!(!is_backend_owned_syscall(
+                libc::SYS_clock_gettime as u64,
+                dispatch_thread_tools
+            ));
         }
-        assert!(!is_backend_owned_syscall(libc::SYS_clock_gettime as u64));
+    }
+
+    #[test]
+    fn futex_ownership_follows_thread_dispatch_model() {
+        // Hybrid model (uninstrumented workers): the root shares host futex words.
+        assert!(is_backend_owned_syscall(libc::SYS_futex as u64, false));
+        // Option A (Tool-dispatched workers): futex routes to Detcore so joins
+        // are logical scheduler waits woken by the exiting worker's CLEARTID.
+        assert!(!is_backend_owned_syscall(libc::SYS_futex as u64, true));
     }
 
     #[test]

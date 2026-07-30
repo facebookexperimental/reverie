@@ -237,6 +237,10 @@ pub(crate) fn is_process_syscall(number: u64) -> bool {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-216): Review direct-worker classification for CLONE_THREAD.
+// CLONE_THREAD is no longer treated as backend-owned (workers now run through
+// the Tool loop; see runtime.rs), so this classifier is retained only for the
+// clone-flag decoding regression tests below.
+#[cfg(test)]
 pub(crate) fn is_thread_clone_request(request: &SyscallRequest, memory: &GuestMemory) -> bool {
     if request.number() == libc::SYS_clone as u64 {
         return request.args()[0] & libc::CLONE_THREAD as u64 != 0;
