@@ -1519,6 +1519,63 @@ impl ElfExecutor {
         None
     }
 
+    // Mirror `synchronize_wait4` for `waitid`. KVM child processes run on
+    // separate host threads tracked in `pending_processes`; their exit codes
+    // only reach `state.children` after `join_child_process`. `waitid()` (like
+    // `wait4()`) reads exclusively from `state.children`, so without this
+    // synchronization a `waitid` on a not-yet-joined child returns spurious
+    // `ECHILD`. The tool's `waitid` poll loop (detcore) converts every wait to
+    // `WNOHANG` and treats `ECHILD` as terminal, so that spurious error
+    // propagates to the guest instead of retrying — a timing-raced failure a
+    // determinism engine must not produce.
+    //
+    // While a target child is still running under a `WNOHANG` poll, report the
+    // POSIX "no child ready yet" result by zeroing the siginfo at `infop` so
+    // `si_pid == 0`; the tool's poll loop then retries instead of erroring.
+    // Once the child has finished (or for a blocking wait), join it so its exit
+    // is recorded, then fall through to `waitid()` which reaps it normally.
+    fn synchronize_waitid(
+        &mut self,
+        request: &SyscallRequest,
+        memory: &GuestMemory,
+    ) -> Option<i64> {
+        if request.number() != libc::SYS_waitid as u64 {
+            return None;
+        }
+        let args = request.args();
+        // args: [idtype, id, infop, options, rusage, _]
+        let pending_pid = match args[0] as libc::idtype_t {
+            libc::P_PID => libc::pid_t::try_from(args[1])
+                .ok()
+                .filter(|pid| self.pending_processes.contains_key(pid)),
+            libc::P_ALL | libc::P_PGID => self.pending_processes.keys().next().copied(),
+            _ => None,
+        };
+        let pid = pending_pid?;
+        if args[3] & libc::WNOHANG as u64 != 0
+            && self
+                .pending_processes
+                .get(&pid)
+                .is_some_and(|process| !process.handle.is_finished())
+        {
+            if args[2] != 0 {
+                let mut memory = memory.clone();
+                if memory
+                    .zero(args[2], std::mem::size_of::<libc::siginfo_t>())
+                    .is_err()
+                {
+                    return Some(negative_errno(libc::EFAULT));
+                }
+            }
+            return Some(0);
+        }
+        if let Err(error) = self.join_child_process(pid) {
+            eprintln!("reverie-kvm child {pid} failed before waitid: {error}");
+            return Some(negative_errno(libc::EIO));
+        }
+        None
+    }
+
     pub(crate) fn take_clear_child_tid(&mut self) -> Option<u64> {
         self.clear_child_tid.take()
     }
@@ -1659,6 +1716,9 @@ impl ElfExecutor {
 impl SyscallExecutor for ElfExecutor {
     fn execute(&mut self, request: &SyscallRequest, memory: &GuestMemory) -> i64 {
         if let Some(result) = self.synchronize_wait4(request) {
+            return result;
+        }
+        if let Some(result) = self.synchronize_waitid(request, memory) {
             return result;
         }
         if let Some(result) = self.execute_accept(request, memory) {
@@ -16633,6 +16693,83 @@ mod tests {
             ),
             negative_errno(libc::ECHILD)
         );
+    }
+
+    // Regression for the KVM `process_wait_accounting` parity gap: a `waitid`
+    // on a KVM child that lives in `pending_processes` (not yet joined into
+    // `state.children`) must not surface a spurious `ECHILD`. Before the
+    // `synchronize_waitid` hook, only `wait4` was synchronized, so `waitid`
+    // read an empty `state.children` and returned `ECHILD`, which the tool's
+    // poll loop treats as terminal and forwards to the guest.
+    #[test]
+    fn waitid_synchronizes_pending_child_and_polls_before_reap() {
+        const INFO: u64 = 0x100;
+
+        let root = TestDir::new();
+        let state = test_state(&root.0);
+        let mut executor = ElfExecutor::new(state, false);
+
+        // The child thread blocks until `join_child_process` releases it, then
+        // exits with code 9.
+        let (start_sender, start_receiver) = std::sync::mpsc::channel();
+        let (running_sender, running_receiver) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            running_sender.send(()).unwrap();
+            start_receiver.recv().unwrap();
+            Ok(9)
+        });
+        executor.register_child_process(2, start_sender, handle);
+        // Guarantee the child is running (so `handle.is_finished()` is false).
+        running_receiver.recv().unwrap();
+
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        memory
+            .write(INFO, &[0xa5; std::mem::size_of::<libc::siginfo_t>()])
+            .unwrap();
+
+        // WNOHANG poll of a still-running child reports "no child ready yet"
+        // (si_pid == 0), NOT ECHILD, so the tool's poll loop retries.
+        let poll = executor.execute(
+            &SyscallRequest::new(
+                libc::SYS_waitid as u64,
+                [
+                    libc::P_PID as u64,
+                    2,
+                    INFO,
+                    (libc::WEXITED | libc::WNOHANG) as u64,
+                    0,
+                    0,
+                ],
+            ),
+            &memory,
+        );
+        assert_eq!(poll, 0);
+        let info: libc::siginfo_t = read_struct(&memory, INFO);
+        // SAFETY: the WNOHANG no-event result is a zeroed siginfo_t.
+        unsafe {
+            assert_eq!(info.si_pid(), 0);
+        }
+        assert!(executor.state.children.is_empty());
+
+        // A blocking waitid joins the pending child (recording exit 9 into
+        // state.children) and then reaps it through `waitid()`.
+        let reap = executor.execute(
+            &SyscallRequest::new(
+                libc::SYS_waitid as u64,
+                [libc::P_PID as u64, 2, INFO, libc::WEXITED as u64, 0, 0],
+            ),
+            &memory,
+        );
+        assert_eq!(reap, 0);
+        let info: libc::siginfo_t = read_struct(&memory, INFO);
+        assert_eq!(info.si_signo, libc::SIGCHLD);
+        assert_eq!(info.si_code, libc::CLD_EXITED);
+        // SAFETY: waitid writes the SIGCHLD variant of siginfo_t.
+        unsafe {
+            assert_eq!(info.si_pid(), 2);
+            assert_eq!(info.si_status(), 9);
+        }
+        assert!(executor.state.children.is_empty());
     }
 
     #[test]
