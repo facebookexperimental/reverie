@@ -63,6 +63,12 @@ int main(void) {
   if (has_environment_entry("REVERIE_E9PATCH_WRITE_BURST=1")) {
     write_burst();
   }
+  if (has_environment_entry("REVERIE_E9PATCH_WRITE_MARKER=1")) {
+    static const char marker[] = "e9patch-strace\n";
+    if (raw_write(1, marker, sizeof(marker) - 1) != sizeof(marker) - 1) {
+      raw_exit_group(4);
+    }
+  }
   if (has_environment_entry("REVERIE_E9PATCH_EXPECT_NATIVE_GETPID=1")) {
     long native_pid = getpid();
     raw_exit_group(raw_getpid() == native_pid ? 0 : 1);

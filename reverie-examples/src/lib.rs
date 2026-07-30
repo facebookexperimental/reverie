@@ -72,6 +72,30 @@ pub async fn run_e9patch_noop_with_preload(
     .await
 }
 
+/// Runs the production Strace Tool through e9patch's direct AOT path with a
+/// single `write` syscall filter.
+///
+/// The fixed filter keeps unsubscribed guest syscalls native while proving a
+/// rewritten root-image write reaches the existing Strace handler and is
+/// injected through the direct `Guest` implementation. A subscribed residual
+/// write remains outside the direct host boundary and fails closed.
+pub async fn run_e9patch_write_strace_with_preload(
+    command: reverie::process::Command,
+    preload: impl Into<std::path::PathBuf>,
+) -> Result<reverie::process::Output, reverie::Error> {
+    let config = strace::Config {
+        filters: vec![strace::Filter {
+            inverse: false,
+            syscalls: vec![reverie::syscalls::Sysno::write],
+        }],
+    };
+    let (output, _) = reverie_e9patch::E9patchBackend::run_direct_with_output_and_preload_data::<
+        strace::Strace,
+    >(command, config, preload, b"strace")
+    .await?;
+    Ok(output)
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-139): Review the example-tool preload constructor and selector boundary.
 #[used]
@@ -140,6 +164,11 @@ unsafe extern "C" fn initialize(
             },
             "noop" => unsafe {
                 reverie_e9patch::install_tool_from_bootstrap::<noop::NoopTool>(
+                    &bootstrap.coordinator,
+                )
+            },
+            "strace" => unsafe {
+                reverie_e9patch::install_tool_from_bootstrap::<strace::Strace>(
                     &bootstrap.coordinator,
                 )
             },

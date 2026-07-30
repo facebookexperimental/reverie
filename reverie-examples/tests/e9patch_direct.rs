@@ -9,6 +9,7 @@ use reverie_e9patch::E9patchBackend;
 use reverie_e9patch::TOOL_PRELOAD_ENV;
 use reverie_examples::e9patch_smoke::AotCounterTool;
 use reverie_examples::run_e9patch_noop_with_preload;
+use reverie_examples::run_e9patch_write_strace_with_preload;
 
 fn compile_guest() -> (tempfile::TempDir, PathBuf) {
     let directory = tempfile::tempdir().unwrap();
@@ -157,6 +158,24 @@ async fn production_noop_preserves_native_rewritten_syscall() {
     assert_eq!(output.status, ExitStatus::Exited(0), "{output:?}");
     assert!(output.stdout.is_empty(), "{output:?}");
     assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires a built e9tool/e9patch pair"]
+async fn production_strace_observes_filtered_rewritten_write() {
+    let (_directory, guest) = compile_guest();
+    let mut command = Command::new(guest);
+    command
+        .env("REVERIE_E9PATCH_WRITE_MARKER", "1")
+        .env("REVERIE_E9PATCH_EXPECT_NATIVE_GETPID", "1");
+    let output = run_e9patch_write_strace_with_preload(command, example_preload())
+        .await
+        .unwrap();
+    assert_eq!(output.status, ExitStatus::Exited(0), "{output:?}");
+    assert_eq!(output.stdout, b"e9patch-strace\n", "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("write(1,"), "{stderr}");
+    assert!(stderr.contains(" = 15"), "{stderr}");
 }
 
 #[tokio::test(flavor = "current_thread")]

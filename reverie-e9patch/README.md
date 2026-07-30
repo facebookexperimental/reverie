@@ -258,7 +258,11 @@ between intercepted and pass-through writes. The captured-output launch remains
 available as a separate API. The examples preload now also hosts LiteInst's
 production Noop Tool through the sealed selector; a rewritten `getpid` retains
 its native result because Noop subscribes to no events, complementing the
-e9patch smoke Tool's subscribed-result mutation proof.
+e9patch smoke Tool's subscribed-result mutation proof. The same preload also
+hosts LiteInst's production Strace Tool with a narrow `write` filter: a
+rewritten root-image write is decoded, injected, and reported while
+unsubscribed syscalls remain native. A subscribed residual/shared-library
+`write` remains unsupported and fails closed with `EOPNOTSUPP`.
 
 `E9patchBackend::run` deliberately still drives generic tools through ptrace:
 the direct host does not yet cover process trees, exec rebootstrap, guest signal
