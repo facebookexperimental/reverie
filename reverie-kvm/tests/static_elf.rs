@@ -1002,19 +1002,26 @@ fn static_elf_runs_glibc_clone3_thread_and_restores_parent_state() {
     // Exercise every worker-dispatch path so a `pthread_join`-style
     // `FUTEX_WAIT`/`CLEARTID` round trip completes (exit 0, no hang) in each:
     //   * `Direct`: the non-Tool personality (`run_process_action`).
-    //   * `Tool(ThreadOwnership::Host)`: the hybrid model, where
+    //   * `ToolDefault`: run a tool with *no* explicit ownership override, so the
+    //     backend resolves ownership from `Tool::thread_ownership` — whose
+    //     default is Tool-owned "follow children". This locks in the safe
+    //     default (worker on the Tool loop, `futex` routed to the Tool) so a KVM
+    //     caller no longer has to opt threads in.
+    //   * `Tool(ThreadOwnership::Host)`: force the hybrid model, where
     //     `run_process_action_with_tool` falls through to the direct worker path
     //     and `futex` stays host-owned. Both execution and futex ownership are
     //     Host, so the round trip is consistent and cannot deadlock.
-    //   * `Tool(ThreadOwnership::Tool)`: the worker runs on the Tool loop and
-    //     `futex` routes to the Tool.
+    //   * `Tool(ThreadOwnership::Tool)`: force the worker onto the Tool loop with
+    //     `futex` routed to the Tool.
     #[derive(Debug, Clone, Copy)]
     enum WorkerDispatch {
         Direct,
+        ToolDefault,
         Tool(ThreadOwnership),
     }
     for dispatch in [
         WorkerDispatch::Direct,
+        WorkerDispatch::ToolDefault,
         WorkerDispatch::Tool(ThreadOwnership::Host),
         WorkerDispatch::Tool(ThreadOwnership::Tool),
     ] {
@@ -1024,6 +1031,14 @@ fn static_elf_runs_glibc_clone3_thread_and_restores_parent_state() {
             .unwrap();
         let (exit_code, stdout, stderr) = match dispatch {
             WorkerDispatch::Direct => backend.run_static_elf_captured().unwrap(),
+            WorkerDispatch::ToolDefault => {
+                // No set_thread_ownership: rely on the resolved default.
+                let (_, exit_code, stdout, stderr) = futures::executor::block_on(
+                    backend.run_static_elf_with_tool::<StraceTool>((), true),
+                )
+                .unwrap();
+                (exit_code, stdout, stderr)
+            }
             WorkerDispatch::Tool(ownership) => {
                 backend.set_thread_ownership(ownership);
                 let (_, exit_code, stdout, stderr) = futures::executor::block_on(
