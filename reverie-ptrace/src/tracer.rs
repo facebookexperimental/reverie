@@ -1899,6 +1899,22 @@ impl<T: Tool + 'static> TracerBuilder<T> {
             pause_preinit_step: None,
             #[cfg(test)]
             pause_precise_timer_step: None,
+            #[cfg(test)]
+            activate_without_handshake: false,
+            #[cfg(test)]
+            queue_pending_signal_once: None,
+            #[cfg(test)]
+            force_skip_signal_once: None,
+            #[cfg(test)]
+            force_context_none_signal_once: None,
+            #[cfg(test)]
+            force_context_signal_once: None,
+            #[cfg(test)]
+            force_preinit_signal_once: None,
+            #[cfg(test)]
+            force_post_exec_signal_once: None,
+            #[cfg(test)]
+            force_private_stub_mutation_once: None,
         });
         self
     }
@@ -2008,6 +2024,87 @@ impl<T: Tool + 'static> TracerBuilder<T> {
         self
     }
 
+    #[cfg(test)]
+    fn activate_liteinst_without_handshake_for_test(mut self) -> Self {
+        self.liteinst_runtime
+            .as_mut()
+            .expect("LiteInst runtime must be configured before test-only activation")
+            .activate_without_handshake = true;
+        self
+    }
+
+    #[cfg(test)]
+    fn queue_liteinst_pending_signal_once_for_test(mut self, queue_once: Arc<AtomicBool>) -> Self {
+        self.liteinst_runtime
+            .as_mut()
+            .expect("LiteInst runtime must be configured before pending-signal injection")
+            .queue_pending_signal_once = Some(queue_once);
+        self
+    }
+
+    #[cfg(test)]
+    fn force_liteinst_skip_signal_once_for_test(mut self, force_once: Arc<AtomicBool>) -> Self {
+        self.liteinst_runtime
+            .as_mut()
+            .expect("LiteInst runtime must be configured before skip-signal injection")
+            .force_skip_signal_once = Some(force_once);
+        self
+    }
+
+    #[cfg(test)]
+    fn force_liteinst_context_none_signal_once_for_test(
+        mut self,
+        force_once: Arc<AtomicBool>,
+    ) -> Self {
+        self.liteinst_runtime
+            .as_mut()
+            .expect("LiteInst runtime must be configured before reinjection-signal injection")
+            .force_context_none_signal_once = Some(force_once);
+        self
+    }
+
+    #[cfg(test)]
+    fn force_liteinst_context_signal_once_for_test(mut self, force_once: Arc<AtomicBool>) -> Self {
+        self.liteinst_runtime
+            .as_mut()
+            .expect("LiteInst runtime must be configured before injection-signal injection")
+            .force_context_signal_once = Some(force_once);
+        self
+    }
+
+    #[cfg(test)]
+    fn force_liteinst_preinit_signal_once_for_test(mut self, force_once: Arc<AtomicBool>) -> Self {
+        self.liteinst_runtime
+            .as_mut()
+            .expect("LiteInst runtime must be configured before preinit-signal injection")
+            .force_preinit_signal_once = Some(force_once);
+        self
+    }
+
+    #[cfg(test)]
+    fn force_liteinst_post_exec_signal_once_for_test(
+        mut self,
+        force_once: Arc<AtomicBool>,
+    ) -> Self {
+        self.liteinst_runtime
+            .as_mut()
+            .expect("LiteInst runtime must be configured before post-exec-signal injection")
+            .force_post_exec_signal_once = Some(force_once);
+        self
+    }
+
+    #[cfg(test)]
+    fn force_liteinst_private_stub_mutation_once_for_test(
+        mut self,
+        force_once: Arc<AtomicBool>,
+    ) -> Self {
+        self.liteinst_runtime
+            .as_mut()
+            .expect("LiteInst runtime must be configured before private-stub mutation")
+            .force_private_stub_mutation_once = Some(force_once);
+        self
+    }
+
     /// Filters a binary-rewriter trap unless its logical instruction address
     /// names an ahead-of-time patched site in the configured executable's
     /// canonical pathname/inode identity.
@@ -2051,6 +2148,12 @@ impl<T: Tool + 'static> TracerBuilder<T> {
 
     /// Spawns the tracer.
     pub async fn spawn(self) -> Result<Tracer<T::GlobalState>, Error> {
+        if self.liteinst_runtime.is_some() && self.gdbserver.is_some() {
+            return Err(Error::Tool(anyhow::anyhow!(
+                "LiteInst runtime activation with a GDB server is unsupported ({}): both controllers would own the executable-entry software breakpoint",
+                Errno::ENOTSUPP
+            )));
+        }
         let mut command = self.command;
         let config = self.config.unwrap_or_default();
         let liteinst_fail_closed = self.liteinst_runtime.is_some();
@@ -2364,6 +2467,7 @@ where
 mod tests {
     use reverie::Guest;
     use reverie::syscalls::Syscall;
+    use reverie::syscalls::SyscallInfo;
 
     use super::*;
 
@@ -2558,6 +2662,49 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn liteinst_runtime_rejects_gdbserver_before_spawning_tracee() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock predates Unix epoch")
+            .as_nanos();
+        let side_effect = std::env::temp_dir().join(format!(
+            "reverie-liteinst-gdb-rejected-{}-{nonce}",
+            std::process::id()
+        ));
+        let socket = side_effect.with_extension("sock");
+        assert!(!side_effect.exists());
+        assert!(!socket.exists());
+        let mut command = Command::new("/usr/bin/touch");
+        command.arg(&side_effect);
+
+        let error = match TracerBuilder::<InitFailureTool>::new(command)
+            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4)
+            .gdbserver(socket.clone())
+            .spawn()
+            .await
+        {
+            Ok(_) => panic!("LiteInst plus GDB unexpectedly spawned a tracee"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("ENOTSUPP"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("executable-entry software breakpoint"),
+            "{error}"
+        );
+        assert!(
+            !side_effect.exists(),
+            "rejected configuration ran the tracee"
+        );
+        assert!(
+            !socket.exists(),
+            "rejected configuration opened a GDB server"
+        );
+    }
+
     #[derive(Default)]
     struct RootStopTool;
 
@@ -2580,6 +2727,224 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct AllSyscallsTool;
+
+    #[reverie::tool]
+    impl Tool for AllSyscallsTool {
+        type GlobalState = ();
+        type ThreadState = ();
+
+        fn subscriptions(_config: &()) -> Subscription {
+            Subscription::all_syscalls()
+        }
+
+        async fn handle_syscall_event<G: Guest<Self>>(
+            &self,
+            guest: &mut G,
+            syscall: Syscall,
+        ) -> Result<i64, Error> {
+            Ok(guest.inject(syscall).await?)
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pre_ready_pending_signal_is_rejected_before_seccomp_resume() {
+        let queue_once = Arc::new(AtomicBool::new(true));
+        let tracer = TracerBuilder::<AllSyscallsTool>::new(Command::new("/bin/true"))
+            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4)
+            .queue_liteinst_pending_signal_once_for_test(Arc::clone(&queue_once))
+            .spawn()
+            .await
+            .expect("spawn pending-signal activation tracee");
+        let root_pid = tracer.guest_pid();
+        let error = tokio::time::timeout(Duration::from_secs(3), tracer.wait())
+            .await
+            .expect("pending-signal activation tracee hung")
+            .expect_err("queued pre-Ready signal unexpectedly resumed the tracee");
+
+        assert!(!queue_once.load(Ordering::SeqCst));
+        assert!(
+            error
+                .to_string()
+                .contains("resume after seccomp stop attempted to deliver a queued signal"),
+            "{error}"
+        );
+        assert_reaped("pending-signal activation", root_pid);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pre_ready_nested_signal_is_rejected_during_context_none_reinjection() {
+        let force_once = Arc::new(AtomicBool::new(true));
+        let tracer = TracerBuilder::<AllSyscallsTool>::new(Command::new("/bin/true"))
+            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4)
+            .force_liteinst_context_none_signal_once_for_test(Arc::clone(&force_once))
+            .spawn()
+            .await
+            .expect("spawn context-none activation tracee");
+        let root_pid = tracer.guest_pid();
+        let error = tokio::time::timeout(Duration::from_secs(3), tracer.wait())
+            .await
+            .expect("context-none activation tracee hung")
+            .expect_err("nested pre-Ready reinjection signal was silently dropped");
+
+        assert!(!force_once.load(Ordering::SeqCst), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("finish reinjected syscall observed a nested signal without the expected controller provenance"),
+            "{error}"
+        );
+        assert_reaped("context-none activation", root_pid);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pre_ready_external_sigtrap_is_rejected_during_injected_syscall_step() {
+        let force_once = Arc::new(AtomicBool::new(true));
+        let tracer = TracerBuilder::<ReplaceMmapTool>::new(Command::new("/bin/true"))
+            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4)
+            .force_liteinst_context_signal_once_for_test(Arc::clone(&force_once))
+            .spawn()
+            .await
+            .expect("spawn injected-step activation tracee");
+        let root_pid = tracer.guest_pid();
+        let error = tokio::time::timeout(Duration::from_secs(3), tracer.wait())
+            .await
+            .expect("injected-step activation tracee hung")
+            .expect_err("external pre-Ready SIGTRAP impersonated injected-step completion");
+
+        assert!(!force_once.load(Ordering::SeqCst), "{error}");
+        assert!(
+            error.to_string().contains(
+                "finish injected syscall observed a nested signal without the expected controller provenance"
+            ),
+            "{error}"
+        );
+        assert_reaped("injected-step activation", root_pid);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pre_ready_mutated_private_stub_cannot_impersonate_injected_syscall_completion() {
+        let mutate_once = Arc::new(AtomicBool::new(true));
+        let tracer = TracerBuilder::<ReplaceMmapTool>::new(Command::new("/bin/true"))
+            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4)
+            .force_liteinst_private_stub_mutation_once_for_test(Arc::clone(&mutate_once))
+            .spawn()
+            .await
+            .expect("spawn private-stub-mutation activation tracee");
+        let root_pid = tracer.guest_pid();
+        let error = tokio::time::timeout(Duration::from_secs(3), tracer.wait())
+            .await
+            .expect("private-stub-mutation activation tracee hung")
+            .expect_err("mutated private stub impersonated injected-syscall completion");
+
+        assert!(!mutate_once.load(Ordering::SeqCst), "{error}");
+        assert!(
+            error.to_string().contains(
+                "finish injected syscall observed a nested signal without the expected controller provenance"
+            ),
+            "{error}"
+        );
+        assert_reaped("private-stub-mutation activation", root_pid);
+    }
+
+    #[derive(Default)]
+    struct ReplaceMmapTool;
+
+    #[reverie::tool]
+    impl Tool for ReplaceMmapTool {
+        type GlobalState = ();
+        type ThreadState = ();
+
+        fn subscriptions(_config: &()) -> Subscription {
+            [Sysno::mmap].into_iter().collect()
+        }
+
+        async fn handle_syscall_event<G: Guest<Self>>(
+            &self,
+            guest: &mut G,
+            syscall: Syscall,
+        ) -> Result<i64, Error> {
+            assert_eq!(syscall.number(), Sysno::mmap);
+            Ok(guest.inject(reverie::syscalls::Getpid::new()).await?)
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pre_ready_nested_signal_is_rejected_while_skipping_seccomp_syscall() {
+        let force_once = Arc::new(AtomicBool::new(true));
+        let tracer = TracerBuilder::<ReplaceMmapTool>::new(Command::new("/bin/true"))
+            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4)
+            .force_liteinst_skip_signal_once_for_test(Arc::clone(&force_once))
+            .spawn()
+            .await
+            .expect("spawn skip-seccomp activation tracee");
+        let root_pid = tracer.guest_pid();
+        let error = tokio::time::timeout(Duration::from_secs(3), tracer.wait())
+            .await
+            .expect("skip-seccomp activation tracee hung")
+            .expect_err("nested pre-Ready skip signal was delivered by single-step");
+
+        assert!(!force_once.load(Ordering::SeqCst));
+        assert!(
+            error
+                .to_string()
+                .contains("skip intercepted syscall observed a nested signal without the expected controller provenance"),
+            "{error}"
+        );
+        assert_reaped("skip-seccomp activation", root_pid);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pre_ready_nested_signal_is_rejected_during_tracee_preinit() {
+        let force_once = Arc::new(AtomicBool::new(true));
+        let tracer = TracerBuilder::<InitFailureTool>::new(Command::new("/bin/true"))
+            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4)
+            .force_liteinst_preinit_signal_once_for_test(Arc::clone(&force_once))
+            .spawn()
+            .await
+            .expect("spawn preinit-signal activation tracee");
+        let root_pid = tracer.guest_pid();
+        let error = tokio::time::timeout(Duration::from_secs(3), tracer.wait())
+            .await
+            .expect("preinit-signal activation tracee hung")
+            .expect_err("nested pre-Ready preinit signal unexpectedly resumed the tracee");
+
+        assert!(!force_once.load(Ordering::SeqCst));
+        assert!(
+            error
+                .to_string()
+                .contains("tracee pre-initialization observed an unexpected nested signal"),
+            "{error}"
+        );
+        assert_reaped("preinit-signal activation", root_pid);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pre_ready_external_sigtrap_is_rejected_after_exec_event() {
+        let force_once = Arc::new(AtomicBool::new(true));
+        let tracer = TracerBuilder::<InitFailureTool>::new(Command::new("/bin/true"))
+            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4)
+            .force_liteinst_post_exec_signal_once_for_test(Arc::clone(&force_once))
+            .spawn()
+            .await
+            .expect("spawn post-exec-signal activation tracee");
+        let root_pid = tracer.guest_pid();
+        let error = tokio::time::timeout(Duration::from_secs(3), tracer.wait())
+            .await
+            .expect("post-exec-signal activation tracee hung")
+            .expect_err("external SIGTRAP impersonated the required post-exec trap");
+
+        assert!(!force_once.load(Ordering::SeqCst));
+        assert!(
+            error.to_string().contains(
+                "wait for the LiteInst post-exec trap observed a nested signal without the expected controller provenance"
+            ),
+            "{error}"
+        );
+        assert_reaped("post-exec-signal activation", root_pid);
+    }
+
+    #[derive(Default)]
     struct PreciseTimerTool;
 
     #[reverie::tool]
@@ -2591,8 +2956,10 @@ mod tests {
             Subscription::none()
         }
 
-        async fn handle_thread_start<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Error> {
-            guest.set_timer_precise(reverie::TimerSchedule::RcbsAndInstructions(100, 8))?;
+        async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
+            guest
+                .set_timer_precise(reverie::TimerSchedule::RcbsAndInstructions(100, 8))
+                .expect("configure precise timer after exec");
             Ok(())
         }
     }
@@ -2602,8 +2969,8 @@ mod tests {
             return Command::new("/bin/true");
         }
         if mode == "signal" {
-            let mut command = Command::new("/bin/sh");
-            command.args(["-c", "kill -USR1 $$; while :; do :; done"]);
+            let mut command = Command::new("/usr/bin/tail");
+            command.args(["-f", "/dev/null"]);
             return command;
         }
         let mut command = Command::new(std::env::current_exe().expect("locate test binary"));
@@ -2636,15 +3003,23 @@ mod tests {
     }
 
     async fn cancel_at_root_stop(pause: RootStopPause, mode: &str) {
+        let injected_signal = match pause {
+            RootStopPause::Signal(signal) => Some(signal),
+            RootStopPause::Seccomp => None,
+        };
         let (stop_tx, mut stop_rx) = mpsc::unbounded_channel();
         let tracer = TracerBuilder::<RootStopTool>::new(root_stop_guest_command(mode))
             .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4)
+            .activate_liteinst_without_handshake_for_test()
             .pause_liteinst_root_stop_for_test(pause, stop_tx)
             .spawn()
             .await
             .expect("spawn root-stop cancellation tracee");
         let root_pid = tracer.guest_pid();
         let mut wait = Box::pin(tracer.wait());
+        if let Some(signal) = injected_signal {
+            signal::kill(root_pid.into(), signal).expect("send root-stop test signal");
+        }
         let stopped_pid = tokio::time::timeout(Duration::from_secs(3), async {
             tokio::select! {
                 result = &mut wait => panic!("root-stop tracee completed before cancellation: {result:?}"),
@@ -2670,7 +3045,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn cancellation_during_liteinst_precise_timer_step_reaps_root() {
+    async fn pre_ready_liteinst_precise_timer_is_controller_handled_and_reaped() {
         if !crate::perf::is_perf_supported() {
             return;
         }
@@ -2715,7 +3090,8 @@ mod tests {
             return;
         }
         let builder = TracerBuilder::<PreciseTimerTool>::new(root_stop_guest_command("timer"))
-            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4);
+            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4)
+            .activate_liteinst_without_handshake_for_test();
         let held = Arc::clone(
             &builder
                 .liteinst_runtime
@@ -2760,7 +3136,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn normal_liteinst_completion_leaves_no_stale_root_stop_lease() {
         let builder = TracerBuilder::<InitFailureTool>::new(Command::new("/bin/true"))
-            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4);
+            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4)
+            .activate_liteinst_without_handshake_for_test();
         let held = Arc::clone(
             &builder
                 .liteinst_runtime
@@ -2966,6 +3343,7 @@ mod tests {
         command.args(["-c", "sleep 60 & wait"]);
         let tracer = TracerBuilder::<InitFailureTool>::new(command)
             .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4)
+            .activate_liteinst_without_handshake_for_test()
             .pause_liteinst_new_task_for_test(child_tx)
             .spawn()
             .await
@@ -3042,6 +3420,7 @@ mod tests {
         let (child_tx, mut child_rx) = mpsc::unbounded_channel();
         let tracer = TracerBuilder::<InitFailureTool>::new(clone_thread_guest_command())
             .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4)
+            .activate_liteinst_without_handshake_for_test()
             .observe_liteinst_new_task_for_test(child_tx)
             .spawn()
             .await
@@ -3088,6 +3467,7 @@ mod tests {
         let (child_tx, mut child_rx) = mpsc::unbounded_channel();
         let tracer = TracerBuilder::<InitFailureTool>::new(clone_thread_guest_command())
             .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4)
+            .activate_liteinst_without_handshake_for_test()
             .pause_liteinst_new_task_for_test(child_tx)
             .spawn()
             .await
@@ -3114,6 +3494,7 @@ mod tests {
         let (child_tx, mut child_rx) = mpsc::unbounded_channel();
         let tracer = TracerBuilder::<InitFailureTool>::new(clone_thread_guest_command())
             .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4)
+            .activate_liteinst_without_handshake_for_test()
             .pause_before_liteinst_new_task_for_test(child_tx)
             .spawn()
             .await
@@ -3140,6 +3521,7 @@ mod tests {
         let fail_once = Arc::new(AtomicBool::new(true));
         let tracer = TracerBuilder::<InitFailureTool>::new(clone_thread_guest_command())
             .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4)
+            .activate_liteinst_without_handshake_for_test()
             .observe_liteinst_new_task_for_test(child_tx)
             .fail_liteinst_discovery_once_for_test(Arc::clone(&fail_once))
             .spawn()
@@ -3188,6 +3570,7 @@ mod tests {
         let force_scan_once = Arc::new(AtomicBool::new(true));
         let tracer = TracerBuilder::<InitFailureTool>::new(clone_thread_guest_command())
             .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4)
+            .activate_liteinst_without_handshake_for_test()
             .observe_liteinst_new_task_for_test(child_tx)
             .fail_liteinst_after_task_scan_once_for_test(
                 Arc::clone(&fail_once),
@@ -3235,6 +3618,7 @@ mod tests {
         let (child_tx, mut child_rx) = mpsc::unbounded_channel();
         let tracer = TracerBuilder::<InitFailureTool>::new(clone_parent_guest_command())
             .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4)
+            .activate_liteinst_without_handshake_for_test()
             .observe_liteinst_new_task_for_test(child_tx)
             .spawn()
             .await
@@ -3276,6 +3660,7 @@ mod tests {
         let (child_tx, mut child_rx) = mpsc::unbounded_channel();
         let tracer = TracerBuilder::<InitFailureTool>::new(clone_parent_guest_command())
             .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4)
+            .activate_liteinst_without_handshake_for_test()
             .pause_liteinst_new_task_for_test(child_tx)
             .spawn()
             .await
@@ -3301,6 +3686,7 @@ mod tests {
         let (child_tx, mut child_rx) = mpsc::unbounded_channel();
         let tracer = TracerBuilder::<InitFailureTool>::new(clone_parent_guest_command())
             .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4)
+            .activate_liteinst_without_handshake_for_test()
             .pause_before_liteinst_new_task_for_test(child_tx)
             .spawn()
             .await

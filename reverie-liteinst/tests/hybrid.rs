@@ -6,9 +6,15 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+#[cfg(target_arch = "x86_64")]
+use reverie::CpuIdResult;
 use reverie::Error;
 use reverie::GlobalTool;
 use reverie::Guest;
+#[cfg(target_arch = "x86_64")]
+use reverie::Rdtsc;
+#[cfg(target_arch = "x86_64")]
+use reverie::RdtscResult;
 use reverie::Subscription;
 use reverie::Tid;
 use reverie::Tool;
@@ -22,6 +28,9 @@ use reverie_liteinst::LiteinstBackend;
 #[derive(Debug, Default)]
 struct EventCounter {
     delivered: AtomicU64,
+    cpuid_events: AtomicU64,
+    cpuid_interception: AtomicU64,
+    rdtsc_events: AtomicU64,
     last_getpid_rip: AtomicU64,
     last_getpid_r12: AtomicU64,
     helper_mprotect_callbacks: AtomicU64,
@@ -44,9 +53,75 @@ impl GlobalTool for EventCounter {
         } else if increment & (1_u64 << 61) != 0 {
             self.helper_mprotect_callbacks
                 .fetch_add(1, Ordering::SeqCst);
+        } else if increment & (1_u64 << 60) != 0 {
+            self.cpuid_events.fetch_add(1, Ordering::SeqCst);
+        } else if increment & (1_u64 << 59) != 0 {
+            self.rdtsc_events.fetch_add(1, Ordering::SeqCst);
+        } else if increment & (1_u64 << 58) != 0 {
+            self.cpuid_interception.store(1, Ordering::SeqCst);
         } else {
             self.delivered.fetch_add(increment, Ordering::SeqCst);
         }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[derive(Default)]
+struct ActivationCpuEvents;
+
+#[cfg(target_arch = "x86_64")]
+#[reverie::tool]
+impl Tool for ActivationCpuEvents {
+    type GlobalState = EventCounter;
+    type ThreadState = ();
+
+    fn subscriptions(_config: &()) -> Subscription {
+        Subscription::all()
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        Ok(guest.inject(syscall).await?)
+    }
+
+    async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), reverie::Errno> {
+        if guest.has_cpuid_interception() {
+            guest.send_rpc(1_u64 << 58).await;
+        }
+        Ok(())
+    }
+
+    async fn handle_cpuid_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        eax: u32,
+        ecx: u32,
+    ) -> Result<CpuIdResult, reverie::Errno> {
+        guest.send_rpc(1_u64 << 60).await;
+        // Keep the loader's required x86-64 feature floor while proving that
+        // the Tool, rather than the guest, decides the observed result.
+        let native = std::arch::x86_64::__cpuid_count(eax, ecx);
+        Ok(CpuIdResult {
+            eax: native.eax,
+            ebx: native.ebx,
+            ecx: native.ecx,
+            edx: native.edx,
+        })
+    }
+
+    async fn handle_rdtsc_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        request: Rdtsc,
+    ) -> Result<RdtscResult, reverie::Errno> {
+        guest.send_rpc(1_u64 << 59).await;
+        Ok(RdtscResult {
+            tsc: 0x1234_5678,
+            aux: (request == Rdtsc::Tscp).then_some(0x42),
+        })
     }
 }
 
@@ -214,6 +289,38 @@ fn compile_fixture(name: &str) -> (tempfile::TempDir, PathBuf) {
     (directory, output)
 }
 
+fn compile_static_fixture(name: &str) -> (tempfile::TempDir, PathBuf) {
+    let directory = tempfile::tempdir().unwrap();
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
+    let output = directory.path().join("li-static-exit");
+    let compiler = std::env::var_os("CC").unwrap_or_else(|| OsString::from("cc"));
+    let result = ProcessCommand::new(compiler)
+        .args([
+            "-std=gnu11",
+            "-O0",
+            "-nostdlib",
+            "-static",
+            "-fno-stack-protector",
+            "-fno-pie",
+            "-no-pie",
+            "-Wl,--build-id=none",
+        ])
+        .arg(&source)
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "failed to compile {}:\n{}",
+        source.display(),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    (directory, output)
+}
+
 fn symbol_address(binary: &std::path::Path, symbol: &str) -> u64 {
     let output = ProcessCommand::new("nm").arg(binary).output().unwrap();
     assert!(output.status.success(), "nm failed: {output:?}");
@@ -264,8 +371,55 @@ fn assert_pid_reaped(pid: u32) {
     );
 }
 
+async fn wait_for_pid_file(pid_file: &std::path::Path) -> u32 {
+    loop {
+        if let Ok(contents) = fs::read_to_string(pid_file)
+            && let Ok(pid) = contents.trim().parse::<u32>()
+        {
+            return pid;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn run_fail_closed_and_assert_reaped(command: Command, pid_file: &std::path::Path) -> Error {
+    let mut run = Box::pin(LiteinstBackend::run_host_with_output_and_preload::<
+        PassthroughGetpid,
+    >(command, (), preload_path()));
+    let mut early_result = None;
+    let pid = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::select! {
+            result = &mut run => {
+                early_result = Some(result);
+                wait_for_pid_file(pid_file).await
+            }
+            pid = wait_for_pid_file(pid_file) => pid,
+        }
+    })
+    .await
+    .expect("fail-closed fixture did not publish its pid");
+    let result = if let Some(result) = early_result {
+        result
+    } else {
+        match tokio::time::timeout(Duration::from_secs(3), &mut run).await {
+            Ok(result) => result,
+            Err(_) => {
+                drop(run);
+                assert_pid_reaped(pid);
+                panic!("fail-closed fixture hung; cancellation cleanup reaped pid {pid}");
+            }
+        }
+    };
+    let error = match result {
+        Ok(_) => panic!("required LiteInst runtime unexpectedly remained active"),
+        Err(error) => error,
+    };
+    assert_pid_reaped(pid);
+    error
+}
+
 #[tokio::test(flavor = "current_thread")]
-async fn host_lifecycle_observes_allocator_and_explicit_getrandom() {
+async fn initial_dynamic_preload_handshake_activates_host_lifecycle() {
     let (_directory, guest) = compile_fixture("allocator_getrandom.c");
     let (output, global) = LiteinstBackend::run_host_with_output_and_preload::<CountSyscalls>(
         Command::new(guest),
@@ -281,6 +435,121 @@ async fn host_lifecycle_observes_allocator_and_explicit_getrandom() {
         "host lifecycle missed allocator/pre-constructor entropy: {output:?}"
     );
     assert!(output.status.success(), "{output:?}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn initial_static_image_without_the_runtime_fails_closed() {
+    let (_directory, guest) = compile_static_fixture("hybrid_static_exit.c");
+    assert!(processes_named("li-static-exit").is_empty());
+    let pid_directory = tempfile::tempdir().unwrap();
+    let pid_file = pid_directory.path().join("guest.pid");
+    let mut command = Command::new(guest);
+    command.arg(&pid_file);
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        LiteinstBackend::run_host_with_output_and_preload::<PassthroughGetpid>(
+            command,
+            (),
+            preload_path(),
+        ),
+    )
+    .await
+    .expect("static image did not reach the entry guard");
+    let error = result.expect_err("static image unexpectedly passed the entry guard");
+    assert!(
+        !pid_file.exists(),
+        "static image executed its first side-effecting syscall before failing closed"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("verify LiteInst runtime before executable entry failed")
+            && error
+                .to_string()
+                .contains("before the required preload handshake completed"),
+        "static image did not report the guarded entry boundary: {error}"
+    );
+    let pid = error
+        .to_string()
+        .split("tracee ")
+        .nth(1)
+        .and_then(|suffix| suffix.split(':').next())
+        .and_then(|pid| pid.parse::<u32>().ok())
+        .expect("entry-guard error did not identify the exact tracee");
+    assert_pid_reaped(pid);
+    assert!(
+        processes_named("li-static-exit").is_empty(),
+        "failed static image remains stopped or unreaped"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn valid_dynamic_run_observes_restored_executable_entry() {
+    let (_directory, guest) = compile_fixture("hybrid_entry_guard.c");
+    let (output, _global) = LiteinstBackend::run_host_with_output_and_preload::<PassthroughGetpid>(
+        Command::new(guest),
+        (),
+        preload_path(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(output.stdout, b"entry-int3=0\n", "{output:?}");
+    assert!(output.status.success(), "{output:?}");
+}
+
+#[cfg(target_arch = "x86_64")]
+#[tokio::test(flavor = "current_thread")]
+async fn loader_cpu_events_are_determinized_before_ready_and_entry_is_restored() {
+    let (_directory, guest) = compile_fixture("hybrid_pre_ready_cpu.c");
+    let (output, global) =
+        LiteinstBackend::run_host_with_output_and_preload::<ActivationCpuEvents>(
+            Command::new(guest),
+            (),
+            preload_path(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(output.stdout, b"entry-int3=0 probe=1\n", "{output:?}");
+    assert!(output.status.success(), "{output:?}");
+    if global.cpuid_interception.load(Ordering::SeqCst) == 1 {
+        assert!(
+            global.cpuid_events.load(Ordering::SeqCst) >= 1,
+            "the pre-constructor IFUNC CPUID did not reach the Tool despite verified kernel interception"
+        );
+    } else {
+        assert_eq!(
+            global.cpuid_events.load(Ordering::SeqCst),
+            0,
+            "CPUID reached the Tool after the kernel reported interception unavailable"
+        );
+    }
+    assert!(
+        global.rdtsc_events.load(Ordering::SeqCst) >= 1,
+        "the pre-constructor IFUNC RDTSC did not reach the Tool"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn post_start_exec_that_drops_the_preload_fails_closed() {
+    let (_directory, guest) = compile_fixture("hybrid_exec_drop_preload.c");
+    let pid_directory = tempfile::tempdir().unwrap();
+    let pid_file = pid_directory.path().join("guest.pid");
+    let mut command = Command::new(guest);
+    command.arg(&pid_file);
+
+    let error = run_fail_closed_and_assert_reaped(command, &pid_file).await;
+    assert!(
+        error
+            .to_string()
+            .contains("reject LiteInst post-start exec failed")
+            && error
+                .to_string()
+                .contains("required preload runtime cannot be preserved across exec (phase Ready)"),
+        "post-start exec did not report the lost runtime boundary: {error}"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
