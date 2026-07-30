@@ -224,7 +224,21 @@ static _Atomic uint64_t image_generation;
 static int thread_state_index;
 static int compat_gateway_index;
 static ptr_uint_t cpuid_marker_note;
+static ptr_uint_t rdtsc_marker_note;
+static ptr_uint_t rdtscp_marker_note;
 static bool report_summary;
+
+// Deterministic virtual timestamp counter. Under DBI only one guest thread runs
+// at a time (guest threads are cooperatively serialized by Detcore at syscall
+// boundaries), so the sequence of rdtsc/rdtscp interceptions is a deterministic
+// total order. Emitting a fixed-stride monotonically increasing value therefore
+// yields bitwise-identical rdtsc/rdtscp output across repeated runs, mirroring
+// the CPUID emulation which also replaces a nondeterministic instruction with a
+// deterministic in-client value. The stride is an arbitrary positive constant
+// that keeps values strictly increasing so guests computing rdtsc deltas never
+// observe a zero or negative interval.
+static _Atomic uint64_t virtual_tsc __attribute__((aligned(64)));
+#define VIRTUAL_TSC_STRIDE UINT64_C(100)
 static process_id_t runtime_owner_pid;
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-84): Review isolation-aware process-group termination.
@@ -514,6 +528,78 @@ static dr_emit_flags_t rewrite_cpuid(void *drcontext, void *tag,
   return DR_EMIT_DEFAULT;
 }
 
+// Return the next deterministic virtual TSC value. Strictly increasing per
+// interception; see the `virtual_tsc` declaration for the determinism argument.
+static uint64_t next_virtual_tsc(void) {
+  return atomic_fetch_add_explicit(&virtual_tsc, VIRTUAL_TSC_STRIDE,
+                                   memory_order_relaxed) +
+         VIRTUAL_TSC_STRIDE;
+}
+
+// Emulate rdtsc: return the 64-bit virtual TSC in EDX:EAX, leaving all other
+// registers (notably ECX) untouched, exactly as the hardware rdtsc does.
+static void emulate_rdtsc(void) {
+  void *drcontext = dr_get_current_drcontext();
+  dr_mcontext_t registers = {sizeof(registers), DR_MC_INTEGER};
+  uint64_t tsc = next_virtual_tsc();
+
+  DR_ASSERT(dr_get_mcontext(drcontext, &registers));
+  registers.xax = (reg_t)(tsc & UINT32_C(0xFFFFFFFF));
+  registers.xdx = (reg_t)((tsc >> 32) & UINT32_C(0xFFFFFFFF));
+  DR_ASSERT(dr_set_mcontext(drcontext, &registers));
+}
+
+// Emulate rdtscp: like rdtsc, but also set ECX to the TSC_AUX value. A
+// deterministic run must report a stable processor id, so TSC_AUX is fixed at 0
+// (matching Detcore's `RdtscResult` aux handling for a single virtual CPU).
+static void emulate_rdtscp(void) {
+  void *drcontext = dr_get_current_drcontext();
+  dr_mcontext_t registers = {sizeof(registers), DR_MC_INTEGER};
+  uint64_t tsc = next_virtual_tsc();
+
+  DR_ASSERT(dr_get_mcontext(drcontext, &registers));
+  registers.xax = (reg_t)(tsc & UINT32_C(0xFFFFFFFF));
+  registers.xdx = (reg_t)((tsc >> 32) & UINT32_C(0xFFFFFFFF));
+  registers.xcx = 0;
+  DR_ASSERT(dr_set_mcontext(drcontext, &registers));
+}
+
+// Replace rdtsc and rdtscp instructions with a marker nop, mirroring
+// rewrite_cpuid. The instrumentation event installs the matching clean call.
+static dr_emit_flags_t rewrite_rdtsc(void *drcontext, void *tag,
+                                     instrlist_t *bb, bool for_trace,
+                                     bool translating) {
+  instr_t *instruction;
+  instr_t *next;
+
+  for (instruction = instrlist_first_app(bb); instruction != NULL;
+       instruction = next) {
+    emulated_instr_t emulated;
+    instr_t *marker;
+    int opcode;
+    ptr_uint_t note = 0;
+    next = instr_get_next_app(instruction);
+    opcode = instr_get_opcode(instruction);
+    if (opcode == OP_rdtsc)
+      note = rdtsc_marker_note;
+    else if (opcode == OP_rdtscp)
+      note = rdtscp_marker_note;
+    else
+      continue;
+
+    emulated = (emulated_instr_t){
+        sizeof(emulated), instr_get_app_pc(instruction), instruction, 0};
+    if (!drmgr_insert_emulation_start(drcontext, bb, instruction, &emulated))
+      DR_ASSERT(false);
+    marker = INSTR_CREATE_nop(drcontext);
+    instr_set_translation(marker, instr_get_app_pc(instruction));
+    instr_set_note(marker, (void *)note);
+    instrlist_replace(bb, instruction, marker);
+    drmgr_insert_emulation_end(drcontext, bb, next);
+  }
+  return DR_EMIT_DEFAULT;
+}
+
 static bool is_compat_syscall_instruction(instr_t *instruction) {
   return instr_is_syscall(instruction) && instr_is_interrupt(instruction) &&
          instr_get_interrupt_number(instruction) == 0x80;
@@ -615,6 +701,20 @@ static dr_emit_flags_t instrument_instruction(void *drcontext, void *tag,
       (ptr_uint_t)instr_get_note(instruction) == cpuid_marker_note) {
     dr_insert_clean_call_ex(
         drcontext, bb, instruction, (void *)emulate_cpuid,
+        DR_CLEANCALL_READS_APP_CONTEXT | DR_CLEANCALL_WRITES_APP_CONTEXT, 0);
+    return DR_EMIT_DEFAULT;
+  }
+  if (instr_is_app(instruction) &&
+      (ptr_uint_t)instr_get_note(instruction) == rdtsc_marker_note) {
+    dr_insert_clean_call_ex(
+        drcontext, bb, instruction, (void *)emulate_rdtsc,
+        DR_CLEANCALL_READS_APP_CONTEXT | DR_CLEANCALL_WRITES_APP_CONTEXT, 0);
+    return DR_EMIT_DEFAULT;
+  }
+  if (instr_is_app(instruction) &&
+      (ptr_uint_t)instr_get_note(instruction) == rdtscp_marker_note) {
+    dr_insert_clean_call_ex(
+        drcontext, bb, instruction, (void *)emulate_rdtscp,
         DR_CLEANCALL_READS_APP_CONTEXT | DR_CLEANCALL_WRITES_APP_CONTEXT, 0);
     return DR_EMIT_DEFAULT;
   }
@@ -2118,6 +2218,11 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[]) {
   cpuid_marker_note = drmgr_reserve_note_range(1);
   if (cpuid_marker_note == DRMGR_NOTE_NONE)
     DR_ASSERT(false);
+  rdtsc_marker_note = drmgr_reserve_note_range(1);
+  rdtscp_marker_note = drmgr_reserve_note_range(1);
+  if (rdtsc_marker_note == DRMGR_NOTE_NONE ||
+      rdtscp_marker_note == DRMGR_NOTE_NONE)
+    DR_ASSERT(false);
   thread_state_index = drmgr_register_tls_field();
   compat_gateway_index = drmgr_register_tls_field();
   if (thread_state_index == -1 || compat_gateway_index == -1)
@@ -2127,6 +2232,7 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[]) {
       !drmgr_register_thread_init_event(thread_init) ||
       !drmgr_register_thread_exit_event(thread_exit) ||
       !drmgr_register_bb_app2app_event(rewrite_cpuid, NULL) ||
+      !drmgr_register_bb_app2app_event(rewrite_rdtsc, NULL) ||
       !drmgr_register_bb_instrumentation_event(analyze_syscall_gateway,
                                                instrument_instruction, NULL) ||
       !drmgr_register_filter_syscall_event(filter_syscall) ||
