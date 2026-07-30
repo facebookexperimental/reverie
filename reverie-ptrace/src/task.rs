@@ -212,19 +212,64 @@ enum HandleSignalResult {
     SignalToDeliver(Stopped, Signal),
 }
 
-fn is_expected_single_step_trap(
+#[cfg(target_arch = "x86_64")]
+// Linux can report PTRACE_SINGLESTEP completion from a seccomp syscall skip as
+// TRAP_BRKPT without advancing RIP. Distinguish that kernel transition from an
+// external or guest breakpoint using the controller's exact pre-step state.
+fn is_expected_syscall_skip_breakpoint(
+    si_code: i32,
+    pre_rip: u64,
+    post_rip: u64,
+    syscall_opcode: [u8; cp::SYSCALL_INSTR_SIZE],
+    post_opcode: u8,
+    forced_external_for_test: bool,
+) -> bool {
+    !forced_external_for_test
+        && si_code == libc::TRAP_BRKPT
+        && post_rip == pre_rip
+        && syscall_opcode == [0x0f, 0x05]
+        && post_opcode != 0xcc
+}
+
+fn is_expected_syscall_skip_trap(
     task: &Stopped,
-    expected_rip: Option<u64>,
+    pre_rip: u64,
     forced_external_for_test: bool,
 ) -> Result<bool, TraceError> {
     if forced_external_for_test {
         return Ok(false);
     }
     let siginfo = task.getsiginfo()?;
-    if siginfo.si_code != libc::TRAP_TRACE {
+    if siginfo.si_code == libc::TRAP_TRACE {
+        return Ok(true);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
         return Ok(false);
     }
-    expected_rip.map_or(Ok(true), |expected| Ok(task.getregs()?.ip() == expected))
+    #[cfg(target_arch = "x86_64")]
+    if siginfo.si_code != libc::TRAP_BRKPT {
+        return Ok(false);
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let post_rip = task.getregs()?.ip();
+        let syscall_site = pre_rip
+            .checked_sub(cp::SYSCALL_INSTR_SIZE as u64)
+            .ok_or(Errno::EOVERFLOW)? as usize;
+        let mut syscall_opcode = [0; cp::SYSCALL_INSTR_SIZE];
+        task.read_exact(syscall_site, &mut syscall_opcode)?;
+        let mut post_opcode = [0];
+        task.read_exact(post_rip as usize, &mut post_opcode)?;
+        Ok(is_expected_syscall_skip_breakpoint(
+            siginfo.si_code,
+            pre_rip,
+            post_rip,
+            syscall_opcode,
+            post_opcode[0],
+            forced_external_for_test,
+        ))
+    }
 }
 
 fn is_expected_breakpoint_trap(
@@ -277,7 +322,7 @@ fn is_expected_private_syscall_trap(
 
 enum NestedTrapExpectation {
     None,
-    SingleStep(Option<u64>),
+    SyscallSkip { pre_rip: u64 },
     Breakpoint(u64),
     PrivateSyscall(u64),
 }
@@ -2481,8 +2526,8 @@ impl<L: Tool + 'static> TracedTask<L> {
         let expected = sig == Signal::SIGTRAP
             && match expected_trap {
                 NestedTrapExpectation::None => false,
-                NestedTrapExpectation::SingleStep(expected_rip) => {
-                    is_expected_single_step_trap(task, expected_rip, forced_external_for_test)?
+                NestedTrapExpectation::SyscallSkip { pre_rip } => {
+                    is_expected_syscall_skip_trap(task, pre_rip, forced_external_for_test)?
                 }
                 NestedTrapExpectation::Breakpoint(expected_rip) => {
                     is_expected_breakpoint_trap(task, expected_rip, forced_external_for_test)?
@@ -4382,8 +4427,8 @@ impl<L: Tool + 'static> TracedTask<L> {
         // -1, so that kernel would simply skip the syscall, so that we can jump to
         // our patched syscall on the first run. Please note after calling this
         // function, the task state will no longer be in ptrace event seccomp.
-        #[cfg(target_arch = "x86_64")]
         let regs = task.getregs()?;
+        let pre_rip = regs.ip();
 
         #[cfg(target_arch = "x86_64")]
         {
@@ -4420,7 +4465,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                         &task,
                         Signal::SIGTRAP,
                         "skip intercepted syscall",
-                        NestedTrapExpectation::SingleStep(None),
+                        NestedTrapExpectation::SyscallSkip { pre_rip },
                         forced_external_sigtrap,
                     )?;
                     #[cfg(target_arch = "x86_64")]
@@ -4432,7 +4477,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                         &task,
                         sig,
                         "skip intercepted syscall",
-                        NestedTrapExpectation::SingleStep(None),
+                        NestedTrapExpectation::SyscallSkip { pre_rip },
                         false,
                     )?;
                     // We can get a spurious signal here, such as SIGWINCH. Skip
@@ -5378,6 +5423,75 @@ impl<'a, G: GlobalTool> GlobalRPC<G> for WrappedFrom<'a, G> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn syscall_skip_breakpoint_requires_exact_captured_provenance() {
+        let exec_rip = 0x7f00_1234_530b;
+        let arch_prctl_rip = 0x7f00_1234_cb19;
+        let syscall_opcode = [0x0f, 0x05];
+        assert!(is_expected_syscall_skip_breakpoint(
+            libc::TRAP_BRKPT,
+            exec_rip,
+            exec_rip,
+            syscall_opcode,
+            0x48,
+            false,
+        ));
+        assert!(is_expected_syscall_skip_breakpoint(
+            libc::TRAP_BRKPT,
+            arch_prctl_rip,
+            arch_prctl_rip,
+            syscall_opcode,
+            0x48,
+            false,
+        ));
+
+        for rejected in [
+            is_expected_syscall_skip_breakpoint(
+                libc::SI_USER,
+                exec_rip,
+                exec_rip,
+                syscall_opcode,
+                0x48,
+                false,
+            ),
+            is_expected_syscall_skip_breakpoint(
+                libc::TRAP_BRKPT,
+                exec_rip,
+                exec_rip + 1,
+                syscall_opcode,
+                0x48,
+                false,
+            ),
+            is_expected_syscall_skip_breakpoint(
+                libc::TRAP_BRKPT,
+                exec_rip,
+                exec_rip,
+                [0xcc, 0x05],
+                0x48,
+                false,
+            ),
+            is_expected_syscall_skip_breakpoint(
+                libc::TRAP_BRKPT,
+                exec_rip,
+                exec_rip,
+                syscall_opcode,
+                0xcc,
+                false,
+            ),
+            is_expected_syscall_skip_breakpoint(
+                libc::TRAP_BRKPT,
+                exec_rip,
+                exec_rip,
+                syscall_opcode,
+                0x48,
+                true,
+            ),
+        ] {
+            assert!(!rejected);
+        }
+    }
 
     fn active_state() -> LiteinstRuntimeState {
         let mut state = LiteinstRuntimeState::default();

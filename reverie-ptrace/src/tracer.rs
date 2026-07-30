@@ -2747,6 +2747,56 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct TimedExecTransitionTool;
+
+    #[reverie::tool]
+    impl Tool for TimedExecTransitionTool {
+        type GlobalState = ();
+        type ThreadState = ();
+
+        fn subscriptions(_config: &()) -> Subscription {
+            Subscription::all()
+        }
+
+        async fn handle_syscall_event<G: Guest<Self>>(
+            &self,
+            guest: &mut G,
+            syscall: Syscall,
+        ) -> Result<i64, Error> {
+            guest.set_timer_precise(reverie::TimerSchedule::Rcbs(20_000_000))?;
+            Ok(guest.inject(syscall).await?)
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pre_ready_exec_skip_accepts_exact_kernel_breakpoint_transition() {
+        let tracer = TracerBuilder::<TimedExecTransitionTool>::new(Command::new("/bin/true"))
+            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4)
+            .spawn()
+            .await
+            .expect("spawn timed exec-transition activation tracee");
+        let root_pid = tracer.guest_pid();
+        let error = tokio::time::timeout(Duration::from_secs(3), tracer.wait())
+            .await
+            .expect("timed exec-transition activation tracee hung")
+            .expect_err("missing LiteInst runtime unexpectedly activated");
+
+        assert!(
+            !error
+                .to_string()
+                .contains("skip intercepted syscall observed a nested signal"),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("before the required preload handshake completed"),
+            "{error}"
+        );
+        assert_reaped("timed exec-transition activation", root_pid);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn pre_ready_pending_signal_is_rejected_before_seccomp_resume() {
         let queue_once = Arc::new(AtomicBool::new(true));
