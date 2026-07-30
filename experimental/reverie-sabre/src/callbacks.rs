@@ -37,83 +37,179 @@ thread_local! {
     static TAIL_INJECTED_EXIT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
-// Pack the owning process ID into the high half and the number of concurrent
-// vfork callers into the low half. This process-global state remains visible
-// when clone(2)/clone3(2) installs new child TLS with CLONE_SETTLS.
-static VFORK_BOUNDARY_STATE: AtomicU64 = AtomicU64::new(0);
-const VFORK_COUNT_MASK: u64 = u32::MAX as u64;
+const VFORK_CHILD_SLOT_COUNT: usize = 64;
+const VFORK_CHILD_SIGHAND: u64 = 1 << 32;
+const VFORK_CHILD_RESERVED: u64 = 1 << 63;
+const NO_VFORK_SLOT: usize = usize::MAX;
+
+struct VforkChildSlot {
+    entry: AtomicU64,
+    pid_namespace: AtomicU64,
+}
+
+impl VforkChildSlot {
+    const fn new() -> Self {
+        Self {
+            entry: AtomicU64::new(0),
+            pid_namespace: AtomicU64::new(0),
+        }
+    }
+}
+
+// Parents reserve slots before entering the kernel and pass the slot index to
+// child trampolines in a syscall-preserved XMM register. Child identity is the
+// PID-namespace inode plus namespace-relative PID, so CLONE_NEWPID children do
+// not collide with PID 1 in the parent's namespace. The fixed table remains
+// visible across CLONE_VM even when CLONE_SETTLS replaces child TLS.
+static VFORK_CHILDREN: [VforkChildSlot; VFORK_CHILD_SLOT_COUNT] =
+    [const { VforkChildSlot::new() }; VFORK_CHILD_SLOT_COUNT];
 
 /// Keeps a vfork child on a native pre-exec gate while its parent is blocked
 /// inside the kernel and owns an in-flight tool/RPC request.
 struct VforkBoundaryGuard {
-    parent_pid: u32,
+    slot: usize,
     _signal_restore: guard::VforkSignalGuardRestore,
 }
 
 impl VforkBoundaryGuard {
-    fn enter() -> Self {
-        let parent_pid = current_process_id();
-        let mut state = VFORK_BOUNDARY_STATE.load(Ordering::Acquire);
-        loop {
-            let owner = (state >> 32) as u32;
-            let count = state & VFORK_COUNT_MASK;
-            assert!(count < VFORK_COUNT_MASK, "too many concurrent vforks");
-            assert!(
-                owner == 0 || owner == parent_pid,
-                "cross-process vfork boundary"
-            );
-            let next = (u64::from(parent_pid) << 32) | (count + 1);
-            match VFORK_BOUNDARY_STATE.compare_exchange_weak(
-                state,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(observed) => state = observed,
+    fn enter() -> Option<Self> {
+        for (slot_index, slot) in VFORK_CHILDREN.iter().enumerate() {
+            if slot
+                .entry
+                .compare_exchange(0, VFORK_CHILD_RESERVED, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                slot.pid_namespace.store(0, Ordering::Release);
+                return Some(Self {
+                    slot: slot_index,
+                    _signal_restore: guard::preserve_signal_guard_count_across_vfork(),
+                });
             }
         }
-        Self {
-            parent_pid,
-            _signal_restore: guard::preserve_signal_guard_count_across_vfork(),
-        }
+        None
+    }
+
+    fn slot(&self) -> usize {
+        self.slot
     }
 }
 
 impl Drop for VforkBoundaryGuard {
     fn drop(&mut self) {
-        let mut state = VFORK_BOUNDARY_STATE.load(Ordering::Acquire);
-        loop {
-            let owner = (state >> 32) as u32;
-            let count = state & VFORK_COUNT_MASK;
-            assert_eq!(owner, self.parent_pid, "vfork owner changed");
-            assert!(count > 0, "vfork count went negative");
-            let next = if count == 1 { 0 } else { state - 1 };
-            match VFORK_BOUNDARY_STATE.compare_exchange_weak(
-                state,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(observed) => state = observed,
-            }
-        }
+        let slot = &VFORK_CHILDREN[self.slot];
+        slot.pid_namespace.store(0, Ordering::Release);
+        slot.entry.store(0, Ordering::Release);
     }
 }
 
 fn is_vfork_child_process() -> bool {
-    is_vfork_child_pid(current_process_id())
+    vfork_child_flags().is_some()
 }
 
-fn is_vfork_child_pid(current_pid: u32) -> bool {
-    let state = VFORK_BOUNDARY_STATE.load(Ordering::Acquire);
-    let parent_pid = (state >> 32) as u32;
-    state & VFORK_COUNT_MASK != 0 && parent_pid != current_pid
+fn vfork_child_flags() -> Option<usize> {
+    let current_pid = current_process_id();
+    if current_pid == 0 {
+        return None;
+    }
+    let has_pid_match = VFORK_CHILDREN.iter().any(|slot| {
+        let entry = slot.entry.load(Ordering::Acquire);
+        entry & VFORK_CHILD_RESERVED == 0 && entry as u32 == current_pid
+    });
+    has_pid_match
+        .then(current_pid_namespace)
+        .flatten()
+        .and_then(|pid_namespace| vfork_child_flags_for(current_pid, pid_namespace))
+}
+
+fn vfork_child_flags_for(current_pid: u32, pid_namespace: u64) -> Option<usize> {
+    VFORK_CHILDREN.iter().find_map(|slot| {
+        let entry = slot.entry.load(Ordering::Acquire);
+        (entry & VFORK_CHILD_RESERVED == 0
+            && entry as u32 == current_pid
+            && current_pid != 0
+            && slot.pid_namespace.load(Ordering::Acquire) == pid_namespace)
+            .then_some(if entry & VFORK_CHILD_SIGHAND != 0 {
+                libc::CLONE_SIGHAND as usize
+            } else {
+                0
+            })
+    })
+}
+
+/// Update the vfork registry before a clone child reaches its first guest callback.
+///
+/// This function is called directly from clone trampolines. It must remain
+/// allocation-free and independent of TLS because clone may install guest TLS.
+#[no_mangle]
+pub extern "C" fn reverie_sabre_after_clone_child(clone_flags: usize, vfork_slot: usize) {
+    let vfork_flags = (libc::CLONE_VM | libc::CLONE_VFORK) as usize;
+    if clone_flags & vfork_flags != vfork_flags {
+        // A private fork child inherited a snapshot of the parent's registry,
+        // but none of the parent's other threads or vfork children. Scrub that
+        // private copy before PID reuse can make a stale entry match.
+        if clone_flags & libc::CLONE_VM as usize == 0 {
+            for slot in &VFORK_CHILDREN {
+                slot.pid_namespace.store(0, Ordering::Release);
+                slot.entry.store(0, Ordering::Release);
+            }
+        }
+        return;
+    }
+
+    let child_pid = current_process_id();
+    let pid_namespace = current_pid_namespace().unwrap_or(0);
+    if activate_vfork_child(vfork_slot, child_pid, pid_namespace, clone_flags) {
+        return;
+    }
+
+    // Continuing without a registry slot could re-enter the blocked parent's
+    // RPC transport. Fail closed using a raw per-task exit.
+    unsafe {
+        loop {
+            let _ = syscalls::syscall1(Sysno::exit, libc::EAGAIN as usize);
+        }
+    }
+}
+
+fn activate_vfork_child(
+    slot_index: usize,
+    child_pid: u32,
+    pid_namespace: u64,
+    clone_flags: usize,
+) -> bool {
+    if slot_index >= VFORK_CHILD_SLOT_COUNT || child_pid == 0 || pid_namespace == 0 {
+        return false;
+    }
+    let slot = &VFORK_CHILDREN[slot_index];
+    if slot.entry.load(Ordering::Acquire) != VFORK_CHILD_RESERVED {
+        return false;
+    }
+    let mut entry = u64::from(child_pid);
+    if clone_flags & libc::CLONE_SIGHAND as usize != 0 {
+        entry |= VFORK_CHILD_SIGHAND;
+    }
+    slot.pid_namespace.store(pid_namespace, Ordering::Release);
+    slot.entry.store(entry, Ordering::Release);
+    true
 }
 
 fn current_process_id() -> u32 {
-    unsafe { syscalls::syscall0(Sysno::getpid) }.expect("getpid should succeed") as u32
+    unsafe { syscalls::syscall0(Sysno::getpid) }.unwrap_or(0) as u32
+}
+
+fn current_pid_namespace() -> Option<u64> {
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    unsafe {
+        syscalls::syscall4(
+            Sysno::newfstatat,
+            libc::AT_FDCWD as usize,
+            c"/proc/self/ns/pid".as_ptr() as usize,
+            metadata.as_mut_ptr() as usize,
+            0,
+        )
+        .ok()?;
+        Some(metadata.assume_init().st_ino)
+    }
 }
 
 fn is_vfork_native_syscall_allowed(sys_no: Sysno) -> bool {
@@ -186,39 +282,58 @@ pub(crate) fn terminate_tail_injected_exit_if_requested<E: thread::EventSink>(
 
 pub const CONTROLLED_EXIT_SIGNAL: libc::c_int = libc::SIGSTKFLT;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+const CLONE_ARGS_MIN_SIZE: usize = 64;
+const CLONE_ARGS_MAX_SIZE: usize = 4096;
+
+#[repr(C, align(8))]
+struct Clone3Buffer([u8; CLONE_ARGS_MAX_SIZE]);
+
 struct Clone3Fields {
     flags: u64,
     stack: u64,
+    size: usize,
+    buffer: Clone3Buffer,
 }
 
 impl Clone3Fields {
-    fn is_vfork(self) -> bool {
+    fn is_vfork(&self) -> bool {
         let required = (libc::CLONE_VM | libc::CLONE_VFORK) as u64;
         self.flags & required == required
     }
+
+    fn args_ptr(&self) -> usize {
+        self.buffer.0.as_ptr() as usize
+    }
 }
 
-/// Read clone3's flags and stack pointer without directly dereferencing guest memory.
+/// Snapshot clone3's arguments without directly dereferencing guest memory.
 ///
 /// `process_vm_readv` asks the kernel to validate the address, preserving the
-/// syscall's `EFAULT` behavior when the guest supplies an invalid pointer.
-fn read_clone3_fields(pid: u32, args: usize, size: usize) -> Result<Clone3Fields, Errno> {
-    const CLONE_ARGS_MIN_SIZE: usize = 64;
-
+/// syscall's `EFAULT` behavior when the guest supplies an invalid pointer. The
+/// syscall consumes this stable copy so a sibling cannot change flags between
+/// the vfork decision and the child trampoline.
+fn read_clone3_fields(pid: u32, args: usize, size: usize) -> Result<Box<Clone3Fields>, Errno> {
     // Let clone3 itself report EINVAL for undersized argument structures.
     if size < CLONE_ARGS_MIN_SIZE {
-        return Ok(Clone3Fields { flags: 0, stack: 0 });
+        return Ok(Box::new(Clone3Fields {
+            flags: 0,
+            stack: 0,
+            size,
+            buffer: Clone3Buffer([0; CLONE_ARGS_MAX_SIZE]),
+        }));
+    }
+    if size > CLONE_ARGS_MAX_SIZE {
+        return Err(Errno::E2BIG);
     }
 
-    let mut fields = [0u64; 6];
+    let mut buffer = Clone3Buffer([0; CLONE_ARGS_MAX_SIZE]);
     let local = libc::iovec {
-        iov_base: fields.as_mut_ptr().cast(),
-        iov_len: std::mem::size_of_val(&fields),
+        iov_base: buffer.0.as_mut_ptr().cast(),
+        iov_len: size,
     };
     let remote = libc::iovec {
         iov_base: args as *mut libc::c_void,
-        iov_len: std::mem::size_of_val(&fields),
+        iov_len: size,
     };
     let copied = unsafe {
         syscall!(
@@ -232,12 +347,18 @@ fn read_clone3_fields(pid: u32, args: usize, size: usize) -> Result<Clone3Fields
         )?
     };
 
-    (copied == std::mem::size_of_val(&fields))
-        .then_some(Clone3Fields {
-            flags: fields[0],
-            stack: fields[5],
-        })
-        .ok_or(Errno::EFAULT)
+    if copied != size {
+        return Err(Errno::EFAULT);
+    }
+
+    let flags = u64::from_ne_bytes(buffer.0[0..8].try_into().unwrap());
+    let stack = u64::from_ne_bytes(buffer.0[40..48].try_into().unwrap());
+    Ok(Box::new(Clone3Fields {
+        flags,
+        stack,
+        size,
+        buffer,
+    }))
 }
 
 /// Implement the thread notifier trait for any global tools
@@ -278,10 +399,23 @@ pub extern "C" fn handle_syscall<T: ToolGlobal>(
     // that inherited request. Run only the child preparation syscalls through
     // SaBRe's native syscall policy; a successful exec creates a fresh image
     // and resumes normal tool interception at its first callback.
-    if is_vfork_child_process() {
+    if let Some(clone_flags) = vfork_child_flags() {
         let sys_no = Sysno::from(syscall as i32);
         if !is_vfork_native_syscall_allowed(sys_no) {
             return -Errno::ENOSYS.into_raw() as usize;
+        }
+        if sys_no == Sysno::rt_sigaction {
+            // CLONE_SIGHAND makes the kernel signal-action table shared with
+            // the blocked parent. Without it, issue the raw syscall so the
+            // child's private kernel table changes without mutating Reverie's
+            // process-global handler metadata in the shared address space.
+            if clone_flags & libc::CLONE_SIGHAND as usize != 0 {
+                return -Errno::ENOSYS.into_raw() as usize;
+            }
+            return unsafe {
+                syscalls::syscall6(sys_no, arg1, arg2, arg3, arg4, arg5, arg6)
+                    .unwrap_or_else(|error| -error.into_raw() as usize)
+            };
         }
         let args = SyscallArgs::new(arg1, arg2, arg3, arg4, arg5, arg6);
         let intercepted = Syscall::from_raw(sys_no, args);
@@ -349,121 +483,185 @@ fn handle_syscall_with_thread<T: ToolGlobal>(
     // bookkeeping at the raw clone return can allocate before pthread startup
     // completes, deadlocking the in-guest allocator under concurrent clones.
     // TODO-HUMAN-REVIEW(PR-226): Review deferred clone-child registration.
-    let result = if sys_no == Sysno::clone && arg2 != 0 {
-        let _vfork_boundary = utils::is_vfork(sys_no, arg1).then(VforkBoundaryGuard::enter);
-        // New thread with its own stack: the kernel sets the child's %rsp to
-        // `child_stack`, so clone_syscall's `jmp r9` shortcut is correct.
-        thread.maybe_fork_as_guest(|| {
-            T::global()
-                .syscall_with_inject(intercepted, &LocalMemory::new(), || unsafe {
-                    ffi::clone_syscall(
-                        arg1,
-                        arg2 as *mut libc::c_void,
-                        arg3 as *mut i32,
-                        arg4 as *mut i32,
-                        arg5,
-                        return_address as *const libc::c_void,
-                    )
-                })
-                .unwrap_or_else(|e| -e.into_raw() as usize)
-        })?
-    } else if sys_no == Sysno::clone {
-        let _vfork_boundary = utils::is_vfork(sys_no, arg1).then(VforkBoundaryGuard::enter);
-        // clone(2) without a new stack behaves like fork: the child shares the
-        // parent's stack layout and must resume the guest on its ORIGINAL %rsp,
-        // which fork_syscall restores from the SaBRe syscall frame.
-        thread.maybe_fork_as_guest(|| {
-            T::global()
-                .syscall_with_inject(intercepted, &LocalMemory::new(), || unsafe {
-                    ffi::fork_syscall(
-                        arg1,
-                        arg3 as *mut i32,
-                        arg4 as *mut i32,
-                        arg5,
-                        wrapper_address as *const ffi::syscall_stackframe,
-                    )
-                })
-                .unwrap_or_else(|e| -e.into_raw() as usize)
-        })?
-    } else if sys_no == Sysno::fork {
-        thread.maybe_fork_as_guest(|| {
-            T::global()
-                .syscall_with_inject(intercepted, &LocalMemory::new(), || unsafe {
-                    ffi::fork_syscall(
-                        libc::SIGCHLD as usize,
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                        0,
-                        wrapper_address as *const ffi::syscall_stackframe,
-                    )
-                })
-                .unwrap_or_else(|e| -e.into_raw() as usize)
-        })?
-    } else if utils::is_vfork(sys_no, arg1) {
-        let _vfork_boundary = VforkBoundaryGuard::enter();
-        thread.maybe_fork_as_guest(|| {
-            T::global()
-                .syscall_with_inject(intercepted, &LocalMemory::new(), || unsafe {
-                    let pid = ffi::vfork_syscall();
-                    if pid == 0 {
-                        // The child is already in Guest state and jumps back to
-                        // SaBRe's trampoline instead of returning through Rust.
-                        ffi::vfork_return_from_child(
-                            wrapper_address as *const ffi::syscall_stackframe,
-                        )
-                    } else {
-                        pid
-                    }
-                })
-                .unwrap_or_else(|e| -e.into_raw() as usize)
-        })?
-    } else if sys_no == Sysno::clone3 {
-        let fields = read_clone3_fields(thread.get_process_and_thread_ids().pid, arg1, arg2);
-        let is_vfork = fields.as_ref().is_ok_and(|fields| fields.is_vfork());
-        let _vfork_boundary = is_vfork.then(VforkBoundaryGuard::enter);
-        thread.maybe_fork_as_guest(|| {
-            T::global()
-                .syscall_with_inject(intercepted, &LocalMemory::new(), || match fields {
-                    Err(errno) => -errno.into_raw() as usize,
-                    Ok(Clone3Fields { stack: 0, .. }) => unsafe {
-                        syscall!(sys_no, arg1, arg2, arg3, arg4, arg5, arg6)
-                            .unwrap_or_else(|e| -e.into_raw() as usize)
-                    },
-                    Ok(_) => unsafe {
-                        ffi::clone3_syscall(
-                            arg1,
-                            arg2,
-                            arg3,
+    let result =
+        if sys_no == Sysno::clone && arg2 != 0 {
+            let is_vfork = utils::is_vfork(sys_no, arg1);
+            let vfork_boundary = is_vfork.then(VforkBoundaryGuard::enter).flatten();
+            if is_vfork && vfork_boundary.is_none() {
+                -Errno::EAGAIN.into_raw() as usize
+            } else {
+                let vfork_slot = vfork_boundary
+                    .as_ref()
+                    .map(VforkBoundaryGuard::slot)
+                    .unwrap_or(NO_VFORK_SLOT);
+                // New thread with its own stack: the kernel sets the child's %rsp to
+                // `child_stack`, so clone_syscall's `jmp r9` shortcut is correct.
+                thread.maybe_fork_as_guest(|| {
+                    T::global()
+                        .syscall_with_inject(intercepted, &LocalMemory::new(), || unsafe {
+                            ffi::clone_syscall(
+                                arg1,
+                                arg2 as *mut libc::c_void,
+                                arg3 as *mut i32,
+                                arg4 as *mut i32,
+                                arg5,
+                                return_address as *const libc::c_void,
+                                vfork_slot as u64,
+                            )
+                        })
+                        .unwrap_or_else(|e| -e.into_raw() as usize)
+                })?
+            }
+        } else if sys_no == Sysno::clone {
+            let is_vfork = utils::is_vfork(sys_no, arg1);
+            let vfork_boundary = is_vfork.then(VforkBoundaryGuard::enter).flatten();
+            if is_vfork && vfork_boundary.is_none() {
+                -Errno::EAGAIN.into_raw() as usize
+            } else {
+                let vfork_slot = vfork_boundary
+                    .as_ref()
+                    .map(VforkBoundaryGuard::slot)
+                    .unwrap_or(NO_VFORK_SLOT);
+                // clone(2) without a new stack behaves like fork: the child shares the
+                // parent's stack layout and must resume the guest on its ORIGINAL %rsp,
+                // which fork_syscall restores from the SaBRe syscall frame.
+                thread.maybe_fork_as_guest(|| {
+                    T::global()
+                        .syscall_with_inject(intercepted, &LocalMemory::new(), || unsafe {
+                            ffi::fork_syscall(
+                                arg1,
+                                arg3 as *mut i32,
+                                arg4 as *mut i32,
+                                arg5,
+                                wrapper_address as *const ffi::syscall_stackframe,
+                                vfork_slot as u64,
+                            )
+                        })
+                        .unwrap_or_else(|e| -e.into_raw() as usize)
+                })?
+            }
+        } else if sys_no == Sysno::fork {
+            thread.maybe_fork_as_guest(|| {
+                T::global()
+                    .syscall_with_inject(intercepted, &LocalMemory::new(), || unsafe {
+                        ffi::fork_syscall(
+                            libc::SIGCHLD as usize,
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
                             0,
-                            arg5,
-                            return_address as *mut libc::c_void,
+                            wrapper_address as *const ffi::syscall_stackframe,
+                            NO_VFORK_SLOT as u64,
                         )
-                    },
+                    })
+                    .unwrap_or_else(|e| -e.into_raw() as usize)
+            })?
+        } else if utils::is_vfork(sys_no, arg1) {
+            if let Some(vfork_boundary) = VforkBoundaryGuard::enter() {
+                thread.maybe_fork_as_guest(|| {
+                    T::global()
+                        .syscall_with_inject(intercepted, &LocalMemory::new(), || unsafe {
+                            let pid = ffi::vfork_syscall();
+                            if pid == 0 {
+                                reverie_sabre_after_clone_child(
+                                    (libc::CLONE_VM | libc::CLONE_VFORK) as usize,
+                                    vfork_boundary.slot(),
+                                );
+                                // The child is already in Guest state and jumps back to
+                                // SaBRe's trampoline instead of returning through Rust.
+                                ffi::vfork_return_from_child(
+                                    wrapper_address as *const ffi::syscall_stackframe,
+                                )
+                            } else {
+                                pid
+                            }
+                        })
+                        .unwrap_or_else(|e| -e.into_raw() as usize)
+                })?
+            } else {
+                -Errno::EAGAIN.into_raw() as usize
+            }
+        } else if sys_no == Sysno::clone3 {
+            let fields = read_clone3_fields(thread.get_process_and_thread_ids().pid, arg1, arg2);
+            let is_vfork = fields.as_ref().is_ok_and(|fields| fields.is_vfork());
+            let vfork_boundary = is_vfork.then(VforkBoundaryGuard::enter).flatten();
+            if is_vfork && vfork_boundary.is_none() {
+                -Errno::EAGAIN.into_raw() as usize
+            } else {
+                let vfork_slot = vfork_boundary
+                    .as_ref()
+                    .map(VforkBoundaryGuard::slot)
+                    .unwrap_or(NO_VFORK_SLOT);
+                let clone3_intercepted = match &fields {
+                    Ok(fields) => Syscall::from_raw(
+                        sys_no,
+                        SyscallArgs::new(fields.args_ptr(), fields.size, arg3, arg4, arg5, arg6),
+                    ),
+                    Err(_) => intercepted,
+                };
+                thread.maybe_fork_as_guest(|| {
+                    T::global()
+                        .syscall_with_inject(clone3_intercepted, &LocalMemory::new(), || {
+                            match &fields {
+                                Err(errno) => -(*errno).into_raw() as usize,
+                                Ok(fields) => {
+                                    let args = fields.args_ptr();
+                                    let size = fields.size;
+                                    let flags = fields.flags;
+                                    if fields.stack == 0 {
+                                        unsafe {
+                                            ffi::clone3_fork_syscall(
+                                                args,
+                                                size,
+                                                arg3,
+                                                0,
+                                                arg5,
+                                                wrapper_address as *const ffi::syscall_stackframe,
+                                                flags,
+                                                vfork_slot as u64,
+                                            )
+                                        }
+                                    } else {
+                                        unsafe {
+                                            ffi::clone3_syscall(
+                                                args,
+                                                size,
+                                                arg3,
+                                                0,
+                                                arg5,
+                                                return_address as *mut libc::c_void,
+                                                flags,
+                                                vfork_slot as u64,
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        })
+                        .unwrap_or_else(|e| -e.into_raw() as usize)
+                })?
+            }
+        } else if sys_no == Sysno::exit {
+            T::global()
+                .syscall_with_inject(intercepted, &LocalMemory::new(), || {
+                    if thread.try_exit() {
+                        terminate(arg1);
+                    }
+                    0
                 })
                 .unwrap_or_else(|e| -e.into_raw() as usize)
-        })?
-    } else if sys_no == Sysno::exit {
-        T::global()
-            .syscall_with_inject(intercepted, &LocalMemory::new(), || {
-                if thread.try_exit() {
-                    terminate(arg1);
-                }
-                0
-            })
-            .unwrap_or_else(|e| -e.into_raw() as usize)
-    } else if sys_no == Sysno::exit_group {
-        T::global()
-            .syscall_with_inject(intercepted, &LocalMemory::new(), || {
-                exit_group_with_thread(thread, arg1)
-            })
-            .unwrap_or_else(|e| -e.into_raw() as usize)
-    } else {
-        thread.execute_as_guest(|| {
+        } else if sys_no == Sysno::exit_group {
             T::global()
-                .syscall(intercepted, &LocalMemory::new())
+                .syscall_with_inject(intercepted, &LocalMemory::new(), || {
+                    exit_group_with_thread(thread, arg1)
+                })
                 .unwrap_or_else(|e| -e.into_raw() as usize)
-        })?
-    };
+        } else {
+            thread.execute_as_guest(|| {
+                T::global()
+                    .syscall(intercepted, &LocalMemory::new())
+                    .unwrap_or_else(|e| -e.into_raw() as usize)
+            })?
+        };
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-265): Review callback-bound tail-injected thread termination.
@@ -648,31 +846,31 @@ fn terminate_group(exit_code: usize) -> ! {
 
 #[cfg(test)]
 mod exit_group_tests {
-    use std::sync::atomic::Ordering;
-
     use syscalls::Errno;
     use syscalls::Sysno;
 
-    use super::VFORK_BOUNDARY_STATE;
-    use super::is_vfork_child_pid;
+    use super::NO_VFORK_SLOT;
+    use super::activate_vfork_child;
     use super::is_vfork_child_process;
     use super::is_vfork_native_syscall_allowed;
     use super::read_clone3_fields;
+    use super::reverie_sabre_after_clone_child;
     use super::signal_controlled_exit;
     use super::terminate_group;
+    use super::vfork_child_flags_for;
     use crate::thread::PidTid;
 
     #[test]
     fn clone3_stack_read_rejects_invalid_guest_pointer() {
-        assert_eq!(
+        assert!(matches!(
             read_clone3_fields(std::process::id(), 1, 88),
             Err(Errno::EFAULT)
-        );
+        ));
     }
 
     #[test]
     fn clone3_fields_identify_vfork_and_stack() {
-        let fields = [
+        let mut fields = [
             (libc::CLONE_VM | libc::CLONE_VFORK) as u64,
             0,
             0,
@@ -690,19 +888,68 @@ mod exit_group_tests {
         )
         .unwrap();
 
+        fields[0] = 0;
+        assert_eq!(fields[0], 0);
         assert!(actual.is_vfork());
         assert_eq!(actual.stack, 0x1234);
+        assert_eq!(
+            unsafe { *(actual.args_ptr() as *const u64) },
+            (libc::CLONE_VM | libc::CLONE_VFORK) as u64
+        );
     }
 
     #[test]
     fn vfork_child_gate_distinguishes_parent_and_child_processes() {
-        let current_pid = super::current_process_id();
-        assert_eq!(VFORK_BOUNDARY_STATE.load(Ordering::Acquire), 0);
-        let boundary = super::VforkBoundaryGuard::enter();
+        assert!(super::current_pid_namespace().is_some());
+        // Linux's configured PID maximum is far below i32::MAX, so a real
+        // fork below cannot accidentally reuse this synthetic vfork PID.
+        let child_pid = i32::MAX as u32;
+        let child_pid_namespace = 0x1234;
+        let boundary = super::VforkBoundaryGuard::enter().unwrap();
+
         assert!(!is_vfork_child_process());
-        assert!(is_vfork_child_pid(current_pid + 1));
+        assert!(activate_vfork_child(
+            boundary.slot(),
+            child_pid,
+            child_pid_namespace,
+            (libc::CLONE_VM | libc::CLONE_VFORK | libc::CLONE_SIGHAND) as usize,
+        ));
+
+        assert!(!is_vfork_child_process());
+        assert_eq!(
+            vfork_child_flags_for(child_pid, child_pid_namespace),
+            Some(libc::CLONE_SIGHAND as usize)
+        );
+        assert_eq!(vfork_child_flags_for(child_pid, 0x5678), None);
+
+        // An ordinary fork inherits the registry snapshot, but its exact PID
+        // differs from the active vfork child and therefore must not enter the
+        // native gate.
+        let ordinary_fork_pid = unsafe { libc::fork() };
+        assert!(ordinary_fork_pid >= 0);
+        if ordinary_fork_pid == 0 {
+            let entered_gate = is_vfork_child_process();
+            reverie_sabre_after_clone_child(libc::SIGCHLD as usize, NO_VFORK_SLOT);
+            let stale_entry = vfork_child_flags_for(child_pid, child_pid_namespace).is_some();
+            unsafe { libc::_exit(i32::from(entered_gate || stale_entry)) };
+        }
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(ordinary_fork_pid, &mut status, 0) },
+            ordinary_fork_pid
+        );
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+
         drop(boundary);
-        assert_eq!(VFORK_BOUNDARY_STATE.load(Ordering::Acquire), 0);
+        assert!(vfork_child_flags_for(child_pid, child_pid_namespace).is_none());
+
+        let boundaries: Vec<_> = (0..super::VFORK_CHILD_SLOT_COUNT)
+            .map(|_| super::VforkBoundaryGuard::enter().unwrap())
+            .collect();
+        assert!(super::VforkBoundaryGuard::enter().is_none());
+        drop(boundaries);
+        assert!(super::VforkBoundaryGuard::enter().is_some());
     }
 
     #[test]

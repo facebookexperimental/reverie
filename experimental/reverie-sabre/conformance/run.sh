@@ -19,6 +19,7 @@ cc="${CC:-cc}"
 mkdir -p "$build_dir"
 "$cc" -std=c11 -O2 -Wall -Wextra -Werror -pthread     "$script_dir/thread_lifecycle.c" -o "$build_dir/thread_lifecycle"
 "$cc" -std=c11 -O2 -Wall -Wextra -Werror     "$script_dir/signal_forwarding.c" -o "$build_dir/signal_forwarding"
+"$cc" -std=c11 -O2 -Wall -Wextra -Werror -pthread     "$script_dir/vfork_exact_pid.c" -o "$build_dir/vfork_exact_pid"
 
 if [[ "$backend" == "all" || "$backend" == "ptrace" ]]; then
     cargo build --manifest-path "$root/Cargo.toml"         -p reverie-examples --bin counter2
@@ -39,7 +40,7 @@ if [[ "$backend" == "all" || "$backend" == "sabre" ]]; then
     }
 fi
 
-for workload in thread_lifecycle signal_forwarding; do
+for workload in thread_lifecycle signal_forwarding vfork_exact_pid; do
     executable="$build_dir/$workload"
 
     if [[ "$backend" == "all" || "$backend" == "ptrace" ]]; then
