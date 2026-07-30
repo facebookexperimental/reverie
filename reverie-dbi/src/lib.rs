@@ -1827,6 +1827,35 @@ pub extern "C" fn reverie_dbi_runtime_ready(_image_generation: u64) -> i32 {
     1
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-dbi-preempt): Review the branch-count preemption callback.
+/// Handles a branch-count preemption for the built-in prototype runtime.
+///
+/// The prototype runtime observes a single guest and has no deterministic
+/// scheduler to yield to, so branch-count preemption is a no-op here; it is only
+/// meaningful under the external-global Detcore runtime (see `detcore-dbi`), which
+/// provides the real implementation. This definition exists so the native client
+/// links against the prototype runtime.
+///
+/// # Safety
+///
+/// The context and callback pointers must remain valid for the call.
+#[cfg(feature = "prototype-runtime")]
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn reverie_dbi_runtime_preempt(
+    _counters: *mut PrototypeCounters,
+    _context: *mut c_void,
+    _tid: i32,
+    _pid: i32,
+    _branches: u64,
+    _invoke_syscall: SyscallInvoker,
+    _read_registers: RegisterReader,
+    _write_registers: RegisterWriter,
+) -> i32 {
+    0
+}
+
 /// Returns the name of the built-in DBI runtime for native summary evidence.
 #[cfg(feature = "prototype-runtime")]
 #[unsafe(no_mangle)]

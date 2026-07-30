@@ -55,6 +55,14 @@ typedef struct {
   int32_t virtual_tid;
   int32_t pending_virtual_child;
   uint64_t pending_clone_flags;
+  // AUTONOMOUS-BOT-IMPLEMENTED
+  // TODO-HUMAN-REVIEW(PR-dbi-preempt): Review branch-count preemption bookkeeping.
+  // Branch count observed at this thread's most recent synthetic sched_yield
+  // preemption. Appended at the end of the struct so the existing field layout
+  // (mirrored by detcore-dbi `NativeThreadScratch` and the prototype
+  // `PrototypeCounters` prefix view) is unchanged; the `memset` in `thread_init`
+  // zero-initializes it for every runtime.
+  uint64_t last_yield_branch;
 } prototype_counters_t;
 
 #define VIRTUAL_ROOT_PID INT32_C(3)
@@ -215,6 +223,16 @@ extern const char *reverie_dbi_runtime_name(void);
 extern void reverie_dbi_runtime_totals(uint64_t *branches, uint64_t *syscalls,
                                        uint64_t *rewritten,
                                        uint64_t *memory_hash);
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-dbi-preempt): Review the synthetic sched_yield preemption
+// callback ABI. Injects one deterministic scheduler turn (a synthetic
+// sched_yield) so a running guest thread returns control to Detcore's scheduler
+// between syscalls. Returns 0 on success and a negative value to terminate the
+// isolated runtime with an enforcement failure.
+extern int32_t reverie_dbi_runtime_preempt(
+    prototype_counters_t *counters, void *context, int32_t tid, int32_t pid,
+    uint64_t branches, syscall_invoker_t invoke_syscall,
+    register_reader_t read_registers, register_writer_t write_registers);
 
 static _Atomic uint64_t branch_count __attribute__((aligned(64)));
 static _Atomic uint64_t stdin_read_count;
@@ -227,6 +245,16 @@ static ptr_uint_t cpuid_marker_note;
 static ptr_uint_t rdtsc_marker_note;
 static ptr_uint_t rdtscp_marker_note;
 static bool report_summary;
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-dbi-preempt): Review branch-count preemption configuration.
+// Deterministic branch-count preemption. When `preemption_enabled` (set from the
+// `-preemption-quantum N` client arg with N > 0), the client injects a synthetic
+// sched_yield scheduler turn every `preemption_quantum` counted app branches so a
+// running guest thread returns control to Detcore's scheduler between syscalls.
+// Both default to the disabled state, so guests run unchanged unless the quantum
+// is supplied.
+static bool preemption_enabled;
+static uint64_t preemption_quantum;
 
 // Deterministic virtual timestamp counter. Under DBI only one guest thread runs
 // at a time (guest threads are cooperatively serialized by Detcore at syscall
@@ -660,6 +688,11 @@ static void start_pending_thread(void) {
   atomic_fetch_sub_explicit(&pending_thread_starts, 1, memory_order_release);
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-dbi-preempt): Review the branch-count preemption hook.
+// Defined below, after the runtime-readiness predicates it consults.
+static void maybe_preempt(void);
+
 static bool is_counted_branch(instr_t *instruction) {
   return instr_is_cbr(instruction) || instr_is_ubr(instruction) ||
          instr_is_call(instruction) || instr_is_return(instruction);
@@ -692,6 +725,31 @@ static dr_emit_flags_t instrument_instruction(void *drcontext, void *tag,
         drcontext, bb, instruction, (void *)start_pending_thread,
         DR_CLEANCALL_READS_APP_CONTEXT | DR_CLEANCALL_WRITES_APP_CONTEXT,
         0);
+  }
+  // AUTONOMOUS-BOT-IMPLEMENTED
+  // TODO-HUMAN-REVIEW(PR-dbi-preempt): Review the branch-count preemption hook.
+  // Mirrors the `start_pending_thread` hook above: at the first application
+  // instruction of a block, invoke `maybe_preempt`, which injects a synthetic
+  // sched_yield scheduler turn once the per-thread branch quantum elapses. Gated
+  // at instrumentation time on `preemption_enabled` (a `dr_client_main` constant)
+  // so disabled runs incur zero added instrumentation.
+  if (preemption_enabled && instr_is_app(instruction) &&
+      instruction == instrlist_first_app(bb)) {
+    // Unlike the cpuid/rdtsc/start_pending_thread hooks (which fire only at
+    // specific instructions or thread-start), this hook fires at the first
+    // instruction of EVERY basic block, so it can land mid-sequence inside
+    // register-sensitive code such as glibc's lazy PLT resolver
+    // (`_dl_runtime_resolve`), which preserves the resolved function's argument
+    // registers — including the x87/SSE/AVX vector state — across the resolve.
+    // The synthetic sched_yield writes no application registers, so the clean
+    // call must be FULLY transparent: `save_fpstate = true` makes DynamoRIO save
+    // and restore the floating-point/vector state (in addition to the general
+    // registers it always preserves) around the call. Omitting it corrupts the
+    // vector registers and makes lazy symbol resolution fail ("undefined symbol
+    // getcwd"). We do not declare WRITES_APP_CONTEXT: the app context must be
+    // restored, not propagated.
+    dr_insert_clean_call(drcontext, bb, instruction, (void *)maybe_preempt,
+                         /*save_fpstate=*/true, 0);
   }
   if (user_data != NULL && instruction == instrlist_first(bb)) {
     dr_insert_clean_call(drcontext, bb, instruction,
@@ -1792,6 +1850,51 @@ static void report_copied_unsupported_syscall(int sysnum) {
     dr_fprintf(unsupported_report_file, "@%d\n", sysnum);
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-dbi-preempt): Review deterministic branch-count preemption.
+// Runs at the first application instruction of a block (see
+// `instrument_instruction`). Once this thread has executed `preemption_quantum`
+// counted app branches since its last preemption, inject a single synthetic
+// sched_yield scheduler turn through the Detcore runtime so a thread that
+// busy-waits or tight-loops without reaching a syscall still returns control to
+// the deterministic scheduler and lets a co-runnable sibling proceed.
+//
+// The preemption point is a deterministic function of the executed instruction
+// stream: `branch_count` advances only at counted app branches (see
+// `is_counted_branch`) and `preemption_quantum` is fixed, so the same run
+// preempts at the same branch counts every time. The synthetic yield is handled
+// by Detcore's existing, deterministic sched_yield path.
+static void maybe_preempt(void) {
+  if (!preemption_enabled)
+    return;
+  void *drcontext = dr_get_current_drcontext();
+  prototype_counters_t *counters = (prototype_counters_t *)drmgr_get_tls_field(
+      drcontext, thread_state_index);
+  if (counters == NULL)
+    return;
+  // Only preempt a thread that actually drives the Reverie tool this turn.
+  // Mirror the guards used around the syscall dispatch: the runtime image must be
+  // ready, and a copied child only runs the tool when it is an external-global
+  // (RPC-connected) non-vfork process. A copied child under a prototype runtime,
+  // or a vfork stand-in, runs no scheduler turn, so skip it.
+  if (!reverie_dbi_runtime_ready(
+          atomic_load_explicit(&image_generation, memory_order_acquire)))
+    return;
+  if (has_copied_runtime() &&
+      (!runtime_uses_external_global() || is_copied_vfork_process()))
+    return;
+  uint64_t branches = atomic_load_explicit(&branch_count, memory_order_relaxed);
+  if (branches - counters->last_yield_branch < preemption_quantum)
+    return;
+  counters->last_yield_branch = branches;
+  int32_t action = reverie_dbi_runtime_preempt(
+      counters, drcontext, (int32_t)dr_get_thread_id(drcontext),
+      (int32_t)dr_get_process_id(), branches, invoke_syscall, read_registers,
+      write_registers);
+  if (action < 0)
+    exit_runtime_tree(101);
+}
+
 static bool pre_syscall(void *drcontext, int sysnum) {
   if (((uint32_t)sysnum & X32_SYSCALL_BIT) != 0) {
     dr_fprintf(diagnostic_file,
@@ -2199,6 +2302,15 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[]) {
       runtime_callbacks.panic_on_unsupported_syscalls = 1;
     else if (strcmp(argv[i], "-isolated-process-group") == 0)
       runtime_process_group = (process_id_t)getpgrp();
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-dbi-preempt): Review branch-count preemption argument.
+    else if (strcmp(argv[i], "-preemption-quantum") == 0) {
+      unsigned long long quantum = 0;
+      DR_ASSERT(++i < argc);
+      DR_ASSERT(dr_sscanf(argv[i], "%llu", &quantum) == 1);
+      preemption_quantum = (uint64_t)quantum;
+      preemption_enabled = quantum > 0;
+    }
   }
 
   if (unsupported_report_path[0] != 0) {
