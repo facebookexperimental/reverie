@@ -65,7 +65,7 @@ type SharedChildStarts = Arc<Mutex<Vec<std::sync::mpsc::Sender<()>>>>;
 
 // AUTONOMOUS-BOT-IMPLEMENTED: Keep root syscalls that share worker state in one backend.
 // TODO-HUMAN-REVIEW(PR-173): Review KVM root syscall ownership.
-fn is_backend_owned_syscall(number: u64, thread_ownership: ThreadOwnership) -> bool {
+pub(crate) fn is_backend_owned_syscall(number: u64, thread_ownership: ThreadOwnership) -> bool {
     // `futex` ownership follows the thread's `ThreadOwnership`, so it can never
     // disagree with how that thread executes:
     //

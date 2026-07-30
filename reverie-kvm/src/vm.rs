@@ -437,6 +437,32 @@ impl KvmBackend {
         self.thread_ownership = thread_ownership;
     }
 
+    /// Panic-not-hang tripwire enforced at thread creation: the thread's
+    /// *execution* owner (which dispatch arm `run_process_action_with_tool`
+    /// takes) and its *futex/CLEARTID* owner (how `is_backend_owned_syscall`
+    /// classifies `futex`) must agree. They are both derived from the single
+    /// [`ThreadOwnership`] value, so this can only fail if a future change
+    /// reintroduces a second, independent source of truth — exactly the
+    /// split-brain that historically deadlocked `pthread_join` (a Tool-executed
+    /// worker whose `futex` was host-owned: the joiner's host `FUTEX_WAIT` was
+    /// never woken by the exiting worker's logical `CLEARTID`, observed as a
+    /// silent hang / exit=124). Asserting here converts that regression into an
+    /// immediate, clearly-labelled panic instead of a hang.
+    fn debug_assert_thread_ownership_consistent(&self) {
+        debug_assert_eq!(
+            self.thread_ownership.executes_on_tool(),
+            !crate::runtime::is_backend_owned_syscall(
+                libc::SYS_futex as u64,
+                self.thread_ownership,
+            ),
+            "thread execution owner and futex owner disagree for {:?}: a \
+             Tool-executed worker with a host-owned futex (or a host-executed \
+             worker with a Tool-owned futex) deadlocks pthread_join and must be \
+             unrepresentable now that one ThreadOwnership drives both decisions",
+            self.thread_ownership,
+        );
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-238): Review configurable KVM root process identity.
     pub fn set_root_pid(&mut self, pid: i32) -> Result<()> {
@@ -811,6 +837,7 @@ impl KvmBackend {
                 )?;
                 // Thread children inherit the parent's thread ownership so
                 // execution and futex classification stay consistent.
+                self.debug_assert_thread_ownership_consistent();
                 child.thread_ownership = self.thread_ownership;
                 child
                     .memory
@@ -1068,6 +1095,7 @@ impl KvmBackend {
                 )?;
                 // Thread children inherit the parent's thread ownership so
                 // execution and futex classification stay consistent.
+                self.debug_assert_thread_ownership_consistent();
                 child.thread_ownership = self.thread_ownership;
                 child
                     .memory
