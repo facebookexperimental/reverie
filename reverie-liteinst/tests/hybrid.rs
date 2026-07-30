@@ -329,6 +329,54 @@ async fn first_site_is_installed_once_and_hot_calls_use_liteinst() {
     assert!(output.status.success(), "{output:?}");
 }
 
+async fn run_cpuid_policy_mode(
+    mode: Option<&str>,
+) -> Option<(reverie::process::Output, EventCounter)> {
+    let (_directory, guest) = compile_fixture("hybrid_cpuid_policy.c");
+    let mut command = Command::new(guest);
+    if let Some(mode) = mode {
+        command.arg(mode);
+    }
+    let (output, global) = LiteinstBackend::run_host_with_output_and_preload::<PassthroughGetpid>(
+        command,
+        (),
+        preload_path(),
+    )
+    .await
+    .unwrap();
+    if output.status.code() == Some(77) {
+        eprintln!("skipping: this host does not support ARCH_GET_CPUID");
+        return None;
+    }
+    Some((output, global))
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn patch_helper_restores_disabled_cpuid_after_installing_a_site() {
+    let Some((output, global)) = run_cpuid_policy_mode(None).await else {
+        return;
+    };
+    assert_eq!(
+        output.stdout, b"mode=active calls=32 traps=1 hooks=31 cpuid=0\n",
+        "{output:?}"
+    );
+    assert_eq!(global.delivered.load(Ordering::SeqCst), 32, "{output:?}");
+    assert!(output.status.success(), "{output:?}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn patch_helper_restores_disabled_cpuid_after_fallback() {
+    let Some((output, global)) = run_cpuid_policy_mode(Some("fallback")).await else {
+        return;
+    };
+    assert_eq!(
+        output.stdout, b"mode=fallback calls=2 traps=1 hooks=0 cpuid=0\n",
+        "{output:?}"
+    );
+    assert_eq!(global.delivered.load(Ordering::SeqCst), 2, "{output:?}");
+    assert!(output.status.success(), "{output:?}");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn first_discovery_event_can_replace_the_syscall() {
     let (_directory, guest) = compile_fixture("hybrid_hot_site.c");

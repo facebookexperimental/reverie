@@ -116,6 +116,23 @@ fn liteinst_helper_entry_rflags(flags: u64) -> u64 {
     flags & !(RFLAGS_TF | RFLAGS_DF | RFLAGS_RF | RFLAGS_AC)
 }
 
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LiteinstCpuidPolicy {
+    Unsupported,
+    UnchangedEnabled,
+    RestoreDisabled,
+}
+
+#[cfg(target_arch = "x86_64")]
+struct LiteinstHelperSavedState {
+    cpuid_policy: LiteinstCpuidPolicy,
+    regs: libc::user_regs_struct,
+    xstate: safeptrace::XState,
+    stack_address: usize,
+    stack_value: u64,
+}
+
 #[derive(Debug)]
 struct Suspended {
     waker: Option<mpsc::Sender<Pid>>,
@@ -2225,29 +2242,181 @@ impl<L: Tool + 'static> TracedTask<L> {
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn restore_liteinst_helper_state(
-        task: &mut Stopped,
-        saved_regs: &libc::user_regs_struct,
-        saved_xstate: &safeptrace::XState,
-        stack_address: usize,
-        saved_stack: u64,
-    ) -> Vec<String> {
+    async fn liteinst_arch_prctl<S: SyscallInfo>(
+        &mut self,
+        task: Stopped,
+        syscall: S,
+    ) -> (Stopped, Result<Result<i64, Errno>, TraceError>) {
+        let (nr, args) = syscall.into_parts();
+        let result = self.untraced_syscall(task, nr, args).await;
+        (Stopped::new_unchecked(self.tid()), result)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    async fn liteinst_get_cpuid_state(
+        &mut self,
+        task: Stopped,
+    ) -> (Stopped, Result<Result<i64, Errno>, TraceError>) {
+        use reverie::syscalls::ArchPrctl;
+        use reverie::syscalls::ArchPrctlCmd;
+
+        self.liteinst_arch_prctl(
+            task,
+            ArchPrctl::new().with_cmd(ArchPrctlCmd::ARCH_GET_CPUID(None)),
+        )
+        .await
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    async fn liteinst_set_cpuid_state(
+        &mut self,
+        task: Stopped,
+        state: u64,
+    ) -> (Stopped, Result<Result<i64, Errno>, TraceError>) {
+        use reverie::syscalls::ArchPrctl;
+        use reverie::syscalls::ArchPrctlCmd;
+
+        self.liteinst_arch_prctl(
+            task,
+            ArchPrctl::new().with_cmd(ArchPrctlCmd::ARCH_SET_CPUID(state)),
+        )
+        .await
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    async fn set_and_verify_liteinst_cpuid_state(
+        &mut self,
+        task: Stopped,
+        state: u64,
+    ) -> (Stopped, Vec<String>) {
+        let (task, set_result) = self.liteinst_set_cpuid_state(task, state).await;
         let mut failures = Vec::new();
-        match AddrMut::from_raw(stack_address) {
+        match set_result {
+            Ok(Ok(0)) => {}
+            Ok(Ok(result)) => failures.push(format!(
+                "ARCH_SET_CPUID({state}) returned unexpected value {result}"
+            )),
+            Ok(Err(error)) => failures.push(format!("ARCH_SET_CPUID({state}): {error}")),
+            Err(error) => failures.push(format!("inject ARCH_SET_CPUID({state}): {error}")),
+        }
+        let (task, verify_failures) = self.verify_liteinst_cpuid_state(task, state).await;
+        failures.extend(verify_failures);
+        (task, failures)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    async fn verify_liteinst_cpuid_state(
+        &mut self,
+        task: Stopped,
+        state: u64,
+    ) -> (Stopped, Vec<String>) {
+        let mut failures = Vec::new();
+        let (task, get_result) = self.liteinst_get_cpuid_state(task).await;
+        match get_result {
+            Ok(Ok(observed)) if observed == state as i64 => {}
+            Ok(Ok(observed)) => failures.push(format!(
+                "ARCH_GET_CPUID returned {observed} after setting {state}"
+            )),
+            Ok(Err(error)) => failures.push(format!("verify ARCH_GET_CPUID({state}): {error}")),
+            Err(error) => failures.push(format!("inject verification ARCH_GET_CPUID: {error}")),
+        }
+        (task, failures)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    async fn prepare_liteinst_helper_cpuid(
+        &mut self,
+        task: Stopped,
+    ) -> (Stopped, Result<LiteinstCpuidPolicy, String>) {
+        let (task, result) = self.liteinst_get_cpuid_state(task).await;
+        match result {
+            Ok(Ok(1)) => (task, Ok(LiteinstCpuidPolicy::UnchangedEnabled)),
+            Ok(Ok(0)) => {
+                let (task, enable_failures) =
+                    self.set_and_verify_liteinst_cpuid_state(task, 1).await;
+                if enable_failures.is_empty() {
+                    (task, Ok(LiteinstCpuidPolicy::RestoreDisabled))
+                } else {
+                    let (task, restore_failures) =
+                        self.set_and_verify_liteinst_cpuid_state(task, 0).await;
+                    let mut message = format!(
+                        "enable native CPUID for patch helper: {}",
+                        enable_failures.join("; ")
+                    );
+                    if !restore_failures.is_empty() {
+                        message.push_str(&format!(
+                            "; restore original CPUID policy after enable failure: {}",
+                            restore_failures.join("; ")
+                        ));
+                    }
+                    (task, Err(message))
+                }
+            }
+            Ok(Ok(state)) => (
+                task,
+                Err(format!("ARCH_GET_CPUID returned unexpected value {state}")),
+            ),
+            Ok(Err(Errno::ENODEV)) => (task, Ok(LiteinstCpuidPolicy::Unsupported)),
+            Ok(Err(error)) => (task, Err(format!("ARCH_GET_CPUID: {error}"))),
+            Err(error) => (task, Err(format!("inject ARCH_GET_CPUID: {error}"))),
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    async fn restore_liteinst_helper_state(
+        &mut self,
+        task: Stopped,
+        saved: &LiteinstHelperSavedState,
+    ) -> (Stopped, Vec<String>) {
+        let (mut task, mut failures) = match saved.cpuid_policy {
+            LiteinstCpuidPolicy::Unsupported => (task, Vec::new()),
+            LiteinstCpuidPolicy::RestoreDisabled => {
+                let (task, failures) = self.set_and_verify_liteinst_cpuid_state(task, 0).await;
+                (
+                    task,
+                    failures
+                        .into_iter()
+                        .map(|failure| format!("CPUID policy: {failure}"))
+                        .collect(),
+                )
+            }
+            LiteinstCpuidPolicy::UnchangedEnabled => {
+                let (task, failures) = self.verify_liteinst_cpuid_state(task, 1).await;
+                (
+                    task,
+                    failures
+                        .into_iter()
+                        .map(|failure| format!("CPUID policy: {failure}"))
+                        .collect(),
+                )
+            }
+        };
+        match AddrMut::from_raw(saved.stack_address) {
             Some(address) => {
-                if let Err(error) = task.write_value(address, &saved_stack) {
+                if let Err(error) = task.write_value(address, &saved.stack_value) {
                     failures.push(format!("helper stack: {error}"));
                 }
             }
             None => failures.push("helper stack: invalid restore address".to_owned()),
         }
-        if let Err(error) = task.setxstate(saved_xstate) {
+        if let Err(error) = task.setxstate(&saved.xstate) {
             failures.push(format!("XSTATE: {error}"));
         }
-        if let Err(error) = task.setregs(saved_regs) {
+        if let Err(error) = task.setregs(&saved.regs) {
             failures.push(format!("general registers: {error}"));
         }
-        failures
+        (task, failures)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    async fn rollback_liteinst_helper_error(
+        &mut self,
+        task: Stopped,
+        saved: &LiteinstHelperSavedState,
+        original: Error,
+    ) -> Error {
+        let (_, rollback_failures) = self.restore_liteinst_helper_state(task, saved).await;
+        self.liteinst_helper_failure(original, rollback_failures)
     }
 
     fn liteinst_helper_failure(&self, original: Error, rollback_failures: Vec<String>) -> Error {
@@ -2357,53 +2526,69 @@ impl<L: Tool + 'static> TracedTask<L> {
         let stack_read_address = Addr::from_raw(stack_address).ok_or(Errno::EFAULT)?;
         let stack_write_address = AddrMut::from_raw(stack_address).ok_or(Errno::EFAULT)?;
         let saved_stack: u64 = task.read_value(stack_read_address)?;
+        let mut saved = LiteinstHelperSavedState {
+            cpuid_policy: LiteinstCpuidPolicy::Unsupported,
+            regs: saved_regs,
+            xstate: saved_xstate,
+            stack_address,
+            stack_value: saved_stack,
+        };
+        let (task, cpuid_policy) = self.prepare_liteinst_helper_cpuid(task).await;
+        saved.cpuid_policy = match cpuid_policy {
+            Ok(policy) => policy,
+            Err(message) => {
+                let original = Error::runtime(
+                    self.tid(),
+                    "prepare LiteInst patch-helper CPUID policy",
+                    message,
+                );
+                let (_, rollback_failures) = self.restore_liteinst_helper_state(task, &saved).await;
+                return Err(self.liteinst_helper_failure(original, rollback_failures));
+            }
+        };
         let mut task = task;
-        task.write_value(stack_write_address, &frame.helper_return)?;
+        if let Err(error) = task.write_value(stack_write_address, &frame.helper_return) {
+            let original = Error::from(error);
+            return Err(self
+                .rollback_liteinst_helper_error(task, &saved, original)
+                .await);
+        }
 
-        let mut helper_regs = saved_regs;
+        let mut helper_regs = saved.regs;
         *helper_regs.ip_mut() = frame.install_helper;
         *helper_regs.stack_ptr_mut() = frame.helper_stack_top - 8;
         helper_regs.rdi = site;
         *helper_regs.orig_syscall_mut() = -1_i64 as u64;
-        helper_regs.eflags = liteinst_helper_entry_rflags(saved_regs.eflags);
+        helper_regs.eflags = liteinst_helper_entry_rflags(saved.regs.eflags);
         if let Err(error) = task.setregs(&helper_regs) {
             let original = Error::Internal(error);
-            let rollback = Self::restore_liteinst_helper_state(
-                &mut task,
-                &saved_regs,
-                &saved_xstate,
-                stack_address,
-                saved_stack,
-            );
-            return Err(self.liteinst_helper_failure(original, rollback));
+            return Err(self
+                .rollback_liteinst_helper_error(task, &saved, original)
+                .await);
         }
 
         let running = match self.resume_stopped(task, None) {
             Ok(running) => running,
             Err(error) => {
-                let mut stopped = Stopped::new_unchecked(self.tid());
-                let rollback = Self::restore_liteinst_helper_state(
-                    &mut stopped,
-                    &saved_regs,
-                    &saved_xstate,
-                    stack_address,
-                    saved_stack,
-                );
-                return Err(self.liteinst_helper_failure(Error::Internal(error), rollback));
+                return Err(self
+                    .rollback_liteinst_helper_error(
+                        Stopped::new_unchecked(self.tid()),
+                        &saved,
+                        Error::Internal(error),
+                    )
+                    .await);
             }
         };
         let mut wait = match running.next_state().await {
             Ok(wait) => wait,
             Err(error) => {
-                let mut stopped = Stopped::new_unchecked(self.tid());
-                let rollback = Self::restore_liteinst_helper_state(
-                    &mut stopped,
-                    &saved_regs,
-                    &saved_xstate,
-                    stack_address,
-                    saved_stack,
-                );
-                return Err(self.liteinst_helper_failure(Error::Internal(error), rollback));
+                return Err(self
+                    .rollback_liteinst_helper_error(
+                        Stopped::new_unchecked(self.tid()),
+                        &saved,
+                        Error::Internal(error),
+                    )
+                    .await);
             }
         };
         self.arm_liteinst_wait(&wait);
@@ -2415,51 +2600,37 @@ impl<L: Tool + 'static> TracedTask<L> {
                     let running = match self.resume_stopped(stopped, None) {
                         Ok(running) => running,
                         Err(error) => {
-                            let mut stopped = Stopped::new_unchecked(self.tid());
-                            let rollback = Self::restore_liteinst_helper_state(
-                                &mut stopped,
-                                &saved_regs,
-                                &saved_xstate,
-                                stack_address,
-                                saved_stack,
-                            );
-                            return Err(
-                                self.liteinst_helper_failure(Error::Internal(error), rollback)
-                            );
+                            return Err(self
+                                .rollback_liteinst_helper_error(
+                                    Stopped::new_unchecked(self.tid()),
+                                    &saved,
+                                    Error::Internal(error),
+                                )
+                                .await);
                         }
                     };
                     wait = match running.next_state().await {
                         Ok(wait) => wait,
                         Err(error) => {
-                            let mut stopped = Stopped::new_unchecked(self.tid());
-                            let rollback = Self::restore_liteinst_helper_state(
-                                &mut stopped,
-                                &saved_regs,
-                                &saved_xstate,
-                                stack_address,
-                                saved_stack,
-                            );
-                            return Err(
-                                self.liteinst_helper_failure(Error::Internal(error), rollback)
-                            );
+                            return Err(self
+                                .rollback_liteinst_helper_error(
+                                    Stopped::new_unchecked(self.tid()),
+                                    &saved,
+                                    Error::Internal(error),
+                                )
+                                .await);
                         }
                     };
                     self.arm_liteinst_wait(&wait);
                 }
                 Wait::Stopped(stopped, Event::Signal(Signal::SIGTRAP)) => {
-                    let mut stopped = stopped;
                     let regs = match stopped.getregs() {
                         Ok(regs) => regs,
                         Err(error) => {
                             let original = Error::Internal(error);
-                            let rollback = Self::restore_liteinst_helper_state(
-                                &mut stopped,
-                                &saved_regs,
-                                &saved_xstate,
-                                stack_address,
-                                saved_stack,
-                            );
-                            return Err(self.liteinst_helper_failure(original, rollback));
+                            return Err(self
+                                .rollback_liteinst_helper_error(stopped, &saved, original)
+                                .await);
                         }
                     };
                     if regs.r10 != helper_return_marker || regs.ip() != frame.helper_return_rip {
@@ -2468,14 +2639,9 @@ impl<L: Tool + 'static> TracedTask<L> {
                             "validate LiteInst patch-helper return",
                             "unexpected helper return marker or instruction pointer",
                         );
-                        let rollback = Self::restore_liteinst_helper_state(
-                            &mut stopped,
-                            &saved_regs,
-                            &saved_xstate,
-                            stack_address,
-                            saved_stack,
-                        );
-                        return Err(self.liteinst_helper_failure(original, rollback));
+                        return Err(self
+                            .rollback_liteinst_helper_error(stopped, &saved, original)
+                            .await);
                     }
                     let result = regs.rax as i64;
                     let install = if u64::try_from(result).is_ok() {
@@ -2487,26 +2653,16 @@ impl<L: Tool + 'static> TracedTask<L> {
                                     "validate LiteInst patch-helper result",
                                     "successful helper returned invalid active-hook metadata",
                                 );
-                                let rollback = Self::restore_liteinst_helper_state(
-                                    &mut stopped,
-                                    &saved_regs,
-                                    &saved_xstate,
-                                    stack_address,
-                                    saved_stack,
-                                );
-                                return Err(self.liteinst_helper_failure(original, rollback));
+                                return Err(self
+                                    .rollback_liteinst_helper_error(stopped, &saved, original)
+                                    .await);
                             }
                         }
                     } else {
                         None
                     };
-                    let rollback = Self::restore_liteinst_helper_state(
-                        &mut stopped,
-                        &saved_regs,
-                        &saved_xstate,
-                        stack_address,
-                        saved_stack,
-                    );
+                    let (stopped, rollback) =
+                        self.restore_liteinst_helper_state(stopped, &saved).await;
                     if rollback.is_empty() {
                         return Ok((stopped, install));
                     }
@@ -2518,20 +2674,14 @@ impl<L: Tool + 'static> TracedTask<L> {
                     return Err(self.liteinst_helper_failure(original, rollback));
                 }
                 Wait::Stopped(stopped, event) => {
-                    let mut stopped = stopped;
                     let original = Error::runtime(
                         self.tid(),
                         "run LiteInst patch helper",
                         format!("unexpected stopped event: {event:?}"),
                     );
-                    let rollback = Self::restore_liteinst_helper_state(
-                        &mut stopped,
-                        &saved_regs,
-                        &saved_xstate,
-                        stack_address,
-                        saved_stack,
-                    );
-                    return Err(self.liteinst_helper_failure(original, rollback));
+                    return Err(self
+                        .rollback_liteinst_helper_error(stopped, &saved, original)
+                        .await);
                 }
                 Wait::Exited(_, exit_status) => self.exit(exit_status).await,
             }
