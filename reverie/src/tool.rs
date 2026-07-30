@@ -30,6 +30,78 @@ use crate::rdtsc::Rdtsc;
 #[cfg(target_arch = "x86_64")]
 use crate::rdtsc::RdtscResult;
 
+/// Who owns a guest thread: the single axis that governs *both* how the thread
+/// executes *and* who owns its thread-synchronization primitives (`futex`,
+/// `CLONE_CHILD_CLEARTID`).
+///
+/// These two concerns must never disagree. If a thread executes under the Tool
+/// (registered in the Tool's scheduler) while its `futex` is serviced by the
+/// host — or vice versa — a `pthread_join` deadlocks: the joiner's `FUTEX_WAIT`
+/// waits in one domain while the exiting thread's `CLEARTID` wake fires in the
+/// other, so the wake never reaches the waiter. Collapsing both concerns onto
+/// this single enum makes that split-brain state *unrepresentable*: a thread is
+/// either wholly `Tool`-owned or wholly `Host`-owned, never half of each.
+///
+/// A backend that runs child threads (e.g. the KVM backend, where each guest
+/// thread runs on its own vCPU) selects the ownership for a tool's threads from
+/// [`Tool::thread_ownership`] and uses the *same* value to decide (a) whether to
+/// drive the thread through the Tool loop and (b) whether its `futex` routes to
+/// the Tool. Backends that do not run child threads (e.g. ptrace, which already
+/// routes every subscribed `futex` to the Tool) may ignore this value.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    Serialize,
+    serde::Deserialize
+)]
+pub enum ThreadOwnership {
+    /// The Tool owns the thread: it is driven through the Tool loop (so the Tool
+    /// observes every one of its syscalls and schedules it) and its `futex` /
+    /// `CLEARTID` synchronization is serviced by the Tool. This is the safe,
+    /// "follow children" default — it matches the golden ptrace backend, where
+    /// the Tool (Detcore) owns every futex and no thread synchronization touches
+    /// the host. Determinism can only be guaranteed for `Tool`-owned threads.
+    #[default]
+    Tool,
+    /// The host owns the thread: it runs uninstrumented on the backend's direct
+    /// execution personality and its `futex` / `CLEARTID` synchronization uses
+    /// real host futex words.
+    ///
+    /// This is the `unmonitored_` opt-out. It is internally consistent (host
+    /// execution + host futex, so it does not by itself deadlock a join), but it
+    /// is a determinism/coverage hazard, **not** a correctness shortcut:
+    ///
+    /// * The Tool never sees the thread's syscalls, so it cannot sanitize,
+    ///   record, or schedule them — determinism is **not** guaranteed for it or
+    ///   for anything ordered against it.
+    /// * Mixing `Host`-owned threads into a tool that expects to schedule the
+    ///   whole thread group (e.g. Detcore) breaks that tool's model.
+    ///
+    /// It is deliberately not named `unsafe_`: it cannot cause undefined
+    /// behavior, only nondeterminism and missed instrumentation.
+    Host,
+}
+
+impl ThreadOwnership {
+    /// Whether a thread with this ownership executes under the Tool loop (as
+    /// opposed to the backend's direct host execution personality).
+    pub fn executes_on_tool(self) -> bool {
+        matches!(self, ThreadOwnership::Tool)
+    }
+
+    /// Whether the thread's `futex` / `CLEARTID` synchronization is serviced by
+    /// the host rather than the Tool. This is the exact inverse of
+    /// [`Self::executes_on_tool`]; the two are derived from the same value so
+    /// execution and synchronization ownership can never disagree.
+    pub fn futex_is_host_owned(self) -> bool {
+        matches!(self, ThreadOwnership::Host)
+    }
+}
+
 /// The global half of a complete Reverie tool.
 ///
 /// One global instance of this type will exist at runtime (singleton). This
@@ -152,6 +224,26 @@ pub trait Tool: Send + Sync + Default {
     /// are not).
     fn subscriptions(_cfg: &<Self::GlobalState as GlobalTool>::Config) -> Subscription {
         Subscription::all_syscalls()
+    }
+
+    /// How this tool's guest threads (children created via `CLONE_THREAD`) are
+    /// owned. See [`ThreadOwnership`]. Called once per tree, like
+    /// [`Tool::subscriptions`].
+    ///
+    /// The default is [`ThreadOwnership::Tool`] — the tool follows its children:
+    /// every guest thread is driven through the Tool loop and its `futex`
+    /// synchronization is serviced by the Tool. This is what a determinizing
+    /// tool such as Detcore needs (it owns every futex and schedules every
+    /// thread, matching the golden ptrace backend), and it is the safe default
+    /// for any tool. Override it to return [`ThreadOwnership::Host`] only to opt
+    /// a tool's child threads *out* of instrumentation, accepting the
+    /// determinism/coverage hazard documented on that variant.
+    ///
+    /// Only backends that themselves run child threads (e.g. KVM) consult this;
+    /// backends like ptrace that already route every subscribed `futex` to the
+    /// Tool ignore it.
+    fn thread_ownership(_cfg: &<Self::GlobalState as GlobalTool>::Config) -> ThreadOwnership {
+        ThreadOwnership::Tool
     }
 
     /// A guest process creates additional threads, which need their tool state
