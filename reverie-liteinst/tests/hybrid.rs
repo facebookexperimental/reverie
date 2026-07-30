@@ -377,6 +377,54 @@ async fn patch_helper_restores_disabled_cpuid_after_fallback() {
     assert!(output.status.success(), "{output:?}");
 }
 
+async fn run_tsc_policy_mode(
+    mode: Option<&str>,
+) -> Option<(reverie::process::Output, EventCounter)> {
+    let (_directory, guest) = compile_fixture("hybrid_tsc_policy.c");
+    let mut command = Command::new(guest);
+    if let Some(mode) = mode {
+        command.arg(mode);
+    }
+    let (output, global) = LiteinstBackend::run_host_with_output_and_preload::<PassthroughGetpid>(
+        command,
+        (),
+        preload_path(),
+    )
+    .await
+    .unwrap();
+    if output.status.code() == Some(77) {
+        eprintln!("skipping: this host does not support PR_GET_TSC/PR_SET_TSC");
+        return None;
+    }
+    Some((output, global))
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn patch_helper_restores_faulting_tsc_after_installing_a_site() {
+    let Some((output, global)) = run_tsc_policy_mode(None).await else {
+        return;
+    };
+    assert_eq!(
+        output.stdout, b"mode=active calls=32 traps=1 hooks=31 tsc=2\n",
+        "{output:?}"
+    );
+    assert_eq!(global.delivered.load(Ordering::SeqCst), 32, "{output:?}");
+    assert!(output.status.success(), "{output:?}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn patch_helper_restores_faulting_tsc_after_fallback() {
+    let Some((output, global)) = run_tsc_policy_mode(Some("fallback")).await else {
+        return;
+    };
+    assert_eq!(
+        output.stdout, b"mode=fallback calls=2 traps=1 hooks=0 tsc=2\n",
+        "{output:?}"
+    );
+    assert_eq!(global.delivered.load(Ordering::SeqCst), 2, "{output:?}");
+    assert!(output.status.success(), "{output:?}");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn first_discovery_event_can_replace_the_syscall() {
     let (_directory, guest) = compile_fixture("hybrid_hot_site.c");

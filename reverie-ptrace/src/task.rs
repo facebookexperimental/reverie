@@ -125,8 +125,17 @@ enum LiteinstCpuidPolicy {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LiteinstTscPolicy {
+    Unsupported,
+    UnchangedEnabled,
+    RestoreFaulting,
+}
+
+#[cfg(target_arch = "x86_64")]
 struct LiteinstHelperSavedState {
     cpuid_policy: LiteinstCpuidPolicy,
+    tsc_policy: LiteinstTscPolicy,
     regs: libc::user_regs_struct,
     xstate: safeptrace::XState,
     stack_address: usize,
@@ -2253,6 +2262,61 @@ impl<L: Tool + 'static> TracedTask<L> {
     }
 
     #[cfg(target_arch = "x86_64")]
+    async fn liteinst_prctl(
+        &mut self,
+        task: Stopped,
+        option: libc::c_int,
+        arg2: usize,
+    ) -> (Stopped, Result<Result<i64, Errno>, TraceError>) {
+        let result = self
+            .untraced_syscall(
+                task,
+                Sysno::prctl,
+                SyscallArgs::new(option as usize, arg2, 0, 0, 0, 0),
+            )
+            .await;
+        (Stopped::new_unchecked(self.tid()), result)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    async fn liteinst_get_tsc_state(
+        &mut self,
+        task: Stopped,
+        scratch_address: usize,
+    ) -> (Stopped, Result<Result<libc::c_int, Errno>, String>) {
+        // PR_GET_TSC writes a c_int through a tracee pointer. Reuse the
+        // already-validated helper return slot: its original eight bytes are
+        // saved before this call, the helper return address replaces them
+        // before execution, and every exit path restores them.
+        let (task, result) = self
+            .liteinst_prctl(task, libc::PR_GET_TSC, scratch_address)
+            .await;
+        let result = match result {
+            Ok(Ok(0)) => match Addr::<libc::c_int>::from_raw(scratch_address) {
+                Some(address) => task
+                    .read_value(address)
+                    .map(Ok)
+                    .map_err(|error| format!("read PR_GET_TSC state: {error}")),
+                None => Err("PR_GET_TSC scratch address is null".to_owned()),
+            },
+            Ok(Ok(result)) => Err(format!("PR_GET_TSC returned unexpected value {result}")),
+            Ok(Err(error)) => Ok(Err(error)),
+            Err(error) => Err(format!("inject PR_GET_TSC: {error}")),
+        };
+        (task, result)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    async fn liteinst_set_tsc_state(
+        &mut self,
+        task: Stopped,
+        state: libc::c_int,
+    ) -> (Stopped, Result<Result<i64, Errno>, TraceError>) {
+        self.liteinst_prctl(task, libc::PR_SET_TSC, state as usize)
+            .await
+    }
+
+    #[cfg(target_arch = "x86_64")]
     async fn liteinst_get_cpuid_state(
         &mut self,
         task: Stopped,
@@ -2363,12 +2427,137 @@ impl<L: Tool + 'static> TracedTask<L> {
     }
 
     #[cfg(target_arch = "x86_64")]
+    async fn set_and_verify_liteinst_tsc_state(
+        &mut self,
+        task: Stopped,
+        scratch_address: usize,
+        state: libc::c_int,
+    ) -> (Stopped, Vec<String>) {
+        let (task, set_result) = self.liteinst_set_tsc_state(task, state).await;
+        let mut failures = Vec::new();
+        match set_result {
+            Ok(Ok(0)) => {}
+            Ok(Ok(result)) => {
+                failures.push(format!(
+                    "PR_SET_TSC({state}) returned unexpected value {result}"
+                ));
+            }
+            Ok(Err(error)) => failures.push(format!("PR_SET_TSC({state}): {error}")),
+            Err(error) => failures.push(format!("inject PR_SET_TSC({state}): {error}")),
+        }
+        let (task, verify_failures) = self
+            .verify_liteinst_tsc_state(task, scratch_address, state)
+            .await;
+        failures.extend(verify_failures);
+        (task, failures)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    async fn verify_liteinst_tsc_state(
+        &mut self,
+        task: Stopped,
+        scratch_address: usize,
+        state: libc::c_int,
+    ) -> (Stopped, Vec<String>) {
+        let mut failures = Vec::new();
+        let (task, get_result) = self.liteinst_get_tsc_state(task, scratch_address).await;
+        match get_result {
+            Ok(Ok(observed)) if observed == state => {}
+            Ok(Ok(observed)) => failures.push(format!(
+                "PR_GET_TSC returned {observed} after setting {state}"
+            )),
+            Ok(Err(error)) => failures.push(format!("verify PR_GET_TSC({state}): {error}")),
+            Err(error) => failures.push(format!("verify PR_GET_TSC({state}): {error}")),
+        }
+        (task, failures)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    async fn prepare_liteinst_helper_tsc(
+        &mut self,
+        task: Stopped,
+        scratch_address: usize,
+    ) -> (Stopped, Result<LiteinstTscPolicy, String>) {
+        let (task, result) = self.liteinst_get_tsc_state(task, scratch_address).await;
+        match result {
+            Ok(Ok(libc::PR_TSC_ENABLE)) => (task, Ok(LiteinstTscPolicy::UnchangedEnabled)),
+            Ok(Ok(libc::PR_TSC_SIGSEGV)) => {
+                let (task, enable_failures) = self
+                    .set_and_verify_liteinst_tsc_state(task, scratch_address, libc::PR_TSC_ENABLE)
+                    .await;
+                if enable_failures.is_empty() {
+                    (task, Ok(LiteinstTscPolicy::RestoreFaulting))
+                } else {
+                    let (task, restore_failures) = self
+                        .set_and_verify_liteinst_tsc_state(
+                            task,
+                            scratch_address,
+                            libc::PR_TSC_SIGSEGV,
+                        )
+                        .await;
+                    let mut message = format!(
+                        "enable native TSC for patch helper: {}",
+                        enable_failures.join("; ")
+                    );
+                    if !restore_failures.is_empty() {
+                        message.push_str(&format!(
+                            "; restore original TSC policy after enable failure: {}",
+                            restore_failures.join("; ")
+                        ));
+                    }
+                    (task, Err(message))
+                }
+            }
+            Ok(Ok(state)) => (
+                task,
+                Err(format!("PR_GET_TSC returned unexpected state {state}")),
+            ),
+            // EINVAL is the documented prctl response when this option is not
+            // supported by the running kernel/architecture.
+            Ok(Err(Errno::EINVAL)) => (task, Ok(LiteinstTscPolicy::Unsupported)),
+            Ok(Err(error)) => (task, Err(format!("PR_GET_TSC: {error}"))),
+            Err(error) => (task, Err(error)),
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
     async fn restore_liteinst_helper_state(
         &mut self,
         task: Stopped,
         saved: &LiteinstHelperSavedState,
     ) -> (Stopped, Vec<String>) {
-        let (mut task, mut failures) = match saved.cpuid_policy {
+        let (task, mut failures) = match saved.tsc_policy {
+            LiteinstTscPolicy::Unsupported => (task, Vec::new()),
+            LiteinstTscPolicy::RestoreFaulting => {
+                let (task, failures) = self
+                    .set_and_verify_liteinst_tsc_state(
+                        task,
+                        saved.stack_address,
+                        libc::PR_TSC_SIGSEGV,
+                    )
+                    .await;
+                (
+                    task,
+                    failures
+                        .into_iter()
+                        .map(|failure| format!("TSC policy: {failure}"))
+                        .collect(),
+                )
+            }
+            LiteinstTscPolicy::UnchangedEnabled => {
+                let (task, failures) = self
+                    .verify_liteinst_tsc_state(task, saved.stack_address, libc::PR_TSC_ENABLE)
+                    .await;
+                (
+                    task,
+                    failures
+                        .into_iter()
+                        .map(|failure| format!("TSC policy: {failure}"))
+                        .collect(),
+                )
+            }
+        };
+        let (mut task, cpuid_failures) = match saved.cpuid_policy {
             LiteinstCpuidPolicy::Unsupported => (task, Vec::new()),
             LiteinstCpuidPolicy::RestoreDisabled => {
                 let (task, failures) = self.set_and_verify_liteinst_cpuid_state(task, 0).await;
@@ -2391,6 +2580,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                 )
             }
         };
+        failures.extend(cpuid_failures);
         match AddrMut::from_raw(saved.stack_address) {
             Some(address) => {
                 if let Err(error) = task.write_value(address, &saved.stack_value) {
@@ -2528,6 +2718,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         let saved_stack: u64 = task.read_value(stack_read_address)?;
         let mut saved = LiteinstHelperSavedState {
             cpuid_policy: LiteinstCpuidPolicy::Unsupported,
+            tsc_policy: LiteinstTscPolicy::Unsupported,
             regs: saved_regs,
             xstate: saved_xstate,
             stack_address,
@@ -2540,6 +2731,19 @@ impl<L: Tool + 'static> TracedTask<L> {
                 let original = Error::runtime(
                     self.tid(),
                     "prepare LiteInst patch-helper CPUID policy",
+                    message,
+                );
+                let (_, rollback_failures) = self.restore_liteinst_helper_state(task, &saved).await;
+                return Err(self.liteinst_helper_failure(original, rollback_failures));
+            }
+        };
+        let (task, tsc_policy) = self.prepare_liteinst_helper_tsc(task, stack_address).await;
+        saved.tsc_policy = match tsc_policy {
+            Ok(policy) => policy,
+            Err(message) => {
+                let original = Error::runtime(
+                    self.tid(),
+                    "prepare LiteInst patch-helper TSC policy",
                     message,
                 );
                 let (_, rollback_failures) = self.restore_liteinst_helper_state(task, &saved).await;
