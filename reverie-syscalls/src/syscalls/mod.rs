@@ -2856,7 +2856,11 @@ typed_syscall! {
         readfds: Option<AddrMut<libc::fd_set>>,
         writefds: Option<AddrMut<libc::fd_set>>,
         exceptfds: Option<AddrMut<libc::fd_set>>,
-        timeout: Option<Addr<libc::timeval>>,
+        // Linux's pselect6(2) takes a `struct timespec` timeout (nanosecond
+        // resolution), not the `struct timeval` (microseconds) that plain
+        // select(2) uses. The kernel also writes the time not slept back into
+        // this pointer, so it is an in-out `AddrMut`, matching Ppoll below.
+        timeout: Option<AddrMut<Timespec>>,
         sigmask: Option<Addr<libc::sigset_t>>,
     }
 }
@@ -3622,6 +3626,24 @@ mod test {
         let syscall = Ppoll::new().with_timeout(Some(timeout_addr));
 
         let decoded = Ppoll::from(SyscallArgs::from(syscall));
+        let decoded_timeout: Option<AddrMut<Timespec>> = decoded.timeout();
+        assert_eq!(decoded_timeout, Some(timeout_addr));
+    }
+
+    #[test]
+    fn test_pselect6_timeout_is_timespec() {
+        // pselect6(2) uses a `struct timespec` timeout (nanoseconds), unlike
+        // plain select(2)'s `struct timeval`. Decoding must round-trip the
+        // in-out timespec pointer so consumers read nanoseconds, not the
+        // microseconds a timeval would imply.
+        let timeout = Timespec {
+            tv_sec: 2,
+            tv_nsec: 250_000_000,
+        };
+        let timeout_addr = AddrMut::from_ptr(&timeout).unwrap();
+        let syscall = Pselect6::new().with_timeout(Some(timeout_addr));
+
+        let decoded = Pselect6::from(SyscallArgs::from(syscall));
         let decoded_timeout: Option<AddrMut<Timespec>> = decoded.timeout();
         assert_eq!(decoded_timeout, Some(timeout_addr));
     }
