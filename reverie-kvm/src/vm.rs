@@ -28,6 +28,7 @@ use kvm_ioctls::VcpuFd;
 use kvm_ioctls::VmFd;
 use reverie::GlobalTool;
 use reverie::Pid;
+use reverie::ThreadOwnership;
 use reverie::Tool;
 
 use crate::CpuidPolicy;
@@ -312,11 +313,11 @@ pub struct KvmBackend {
     thread_group: Arc<GuestThreadGroup>,
     thread_slot: Option<usize>,
     is_guest_thread: bool,
-    // When true, CLONE_THREAD workers are dispatched through the Tool and joined
-    // in Detcore's scheduler (Option A), so thread-synchronization syscalls such
-    // as `futex` must route to Detcore rather than the host. Propagated to every
-    // child backend and consulted by `is_backend_owned_syscall`.
-    pub(crate) dispatch_thread_tools: bool,
+    // Who owns this backend's guest threads. The single value drives BOTH the
+    // CLONE_THREAD worker dispatch path (`run_process_action_with_tool`) and
+    // `futex`/CLEARTID ownership (`is_backend_owned_syscall`), so the two can
+    // never disagree. Propagated to every child backend.
+    pub(crate) thread_ownership: ThreadOwnership,
     pub(crate) static_elf: Option<LoadedStaticElf>,
     stdin: Option<File>,
     pub(crate) root_pid: i32,
@@ -415,26 +416,25 @@ impl KvmBackend {
             thread_group: Arc::new(GuestThreadGroup::default()),
             thread_slot: None,
             is_guest_thread: false,
-            dispatch_thread_tools: false,
+            // Behavior-preserving default for the mechanical bool->enum step;
+            // resolved from the Tool's `thread_ownership` at run time in a later
+            // step so the safe default becomes Tool-owned (follow children).
+            thread_ownership: ThreadOwnership::Host,
             static_elf: None,
             stdin,
             root_pid: 1,
         })
     }
 
-    /// Selects whether CLONE_THREAD workers are dispatched through the Tool.
+    /// Overrides who owns this backend's guest threads (see [`ThreadOwnership`]).
     ///
-    /// When enabled (the Option A model), each worker is spawned on the Detcore
-    /// Tool loop and joins Detcore's scheduler, and thread-synchronization
-    /// syscalls such as `futex` route to Detcore instead of the host. When
-    /// disabled — the default — workers run uninstrumented on the direct backend
-    /// personality and `futex` stays host-backed, so the two stay in the same
-    /// synchronization domain. The flag genuinely selects the worker dispatch
-    /// path in `run_process_action_with_tool`; the two settings must never be
-    /// mixed with the opposite `futex` ownership or a `pthread_join` deadlocks.
-    /// Call this before running a tool; it defaults to `false`.
-    pub fn set_dispatch_thread_tools(&mut self, dispatch_thread_tools: bool) {
-        self.dispatch_thread_tools = dispatch_thread_tools;
+    /// The single value drives both the CLONE_THREAD worker dispatch path and
+    /// `futex`/CLEARTID ownership, so execution and synchronization can never
+    /// disagree. When running a tool, the ownership is otherwise resolved from
+    /// the tool's [`reverie::Tool::thread_ownership`]; call this to force a
+    /// specific ownership regardless of the tool. Call it before running.
+    pub fn set_thread_ownership(&mut self, thread_ownership: ThreadOwnership) {
+        self.thread_ownership = thread_ownership;
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -675,9 +675,9 @@ impl KvmBackend {
         write_tid_best_effort(&mut self.memory, parent_tid, child_pid);
 
         let mut child = Self::from_process_snapshot(child_snapshot)?;
-        // Forked children inherit the parent's thread-dispatch model so that
-        // `is_backend_owned_syscall` classifies futex consistently (Option A).
-        child.dispatch_thread_tools = self.dispatch_thread_tools;
+        // Forked children inherit the parent's thread ownership so execution and
+        // `is_backend_owned_syscall`'s futex classification stay consistent.
+        child.thread_ownership = self.thread_ownership;
         write_tid_best_effort(&mut child.memory, child_tid, child_pid);
         let (fs_base, gs_base) = child_executor.segment_bases();
         set_user_segment_base(&child.vcpu, SegmentBase::Fs, fs_base)?;
@@ -809,9 +809,9 @@ impl KvmBackend {
                     child_tid,
                     self.thread_group.clone(),
                 )?;
-                // Thread children inherit the parent's thread-dispatch model so
-                // `is_backend_owned_syscall` classifies futex consistently (Option A).
-                child.dispatch_thread_tools = self.dispatch_thread_tools;
+                // Thread children inherit the parent's thread ownership so
+                // execution and futex classification stay consistent.
+                child.thread_ownership = self.thread_ownership;
                 child
                     .memory
                     .write_raw(child.syscall_frame_address, &parent_syscall_frame)?;
@@ -988,34 +988,28 @@ impl KvmBackend {
                     None,
                 )
             }
-            // Hybrid model (`dispatch_thread_tools == false`, the default):
-            // CLONE_THREAD workers run uninstrumented on the direct backend
-            // personality with host-backed synchronization, exactly as
-            // `run_process_action`'s Thread branch does. This MUST stay gated on
-            // the flag: dispatching the worker through the Detcore Tool loop here
-            // while `is_backend_owned_syscall` still classifies `futex` as
-            // host-owned (which it does whenever the flag is `false`, see
-            // runtime.rs) splits the wait/wake across two domains — the joiner's
-            // `pthread_join` issues a real host `FUTEX_WAIT` on the shared futex
-            // word, but the exiting worker's `CLONE_CHILD_CLEARTID` wake is only
-            // simulated inside Detcore's logical scheduler and never reaches that
-            // host word. The joiner then sleeps forever (observed as the guest
-            // hanging until the harness kills it, exit=124). Falling through to
-            // the direct path keeps futex ownership and worker execution in the
-            // same (host) domain, so the pre-Option-A model is deadlock-free.
-            ProcessAction::Thread { .. } if !self.dispatch_thread_tools => {
+            // `ThreadOwnership::Host`: CLONE_THREAD workers run uninstrumented on
+            // the direct backend personality with host-backed synchronization,
+            // exactly as `run_process_action`'s Thread branch does. Execution and
+            // `futex` ownership are both Host (a single `ThreadOwnership`), so the
+            // joiner's real host `FUTEX_WAIT` and the exiting worker's real host
+            // `CLONE_CHILD_CLEARTID` wake meet on the same futex word — no
+            // deadlock. (The split-brain that deadlocks a join — a Tool-executed
+            // worker whose `futex` is host-owned, so its logical CLEARTID wake
+            // never reaches the host waiter — is unrepresentable now that one
+            // enum drives both decisions.)
+            ProcessAction::Thread { .. } if self.thread_ownership.executes_on_host() => {
                 self.run_process_action(executor, action, park_syscall_return)
             }
-            // Option A model (`dispatch_thread_tools == true`): a CLONE_THREAD
-            // worker runs its own vCPU on a fresh OS thread but shares the guest
-            // address space, file table, and process Tool identity with its
-            // creator. It is driven through the same Tool loop as the process
-            // leader so Detcore sees its syscalls, shares its fd model, and
-            // schedules it; `futex` routes to Detcore (runtime.rs) so a join's
-            // logical `FUTEX_WAIT` is woken by the worker's logical `CLEARTID`.
-            // This mirrors the physical setup in `run_process_action`'s Thread
-            // branch, but spawns the Tool loop instead of the direct backend
-            // personality.
+            // `ThreadOwnership::Tool`: a CLONE_THREAD worker runs its own vCPU on
+            // a fresh OS thread but shares the guest address space, file table,
+            // and process Tool identity with its creator. It is driven through
+            // the same Tool loop as the process leader so Detcore sees its
+            // syscalls, shares its fd model, and schedules it; `futex` routes to
+            // Detcore (runtime.rs) so a join's logical `FUTEX_WAIT` is woken by
+            // the worker's logical `CLEARTID`. This mirrors the physical setup in
+            // `run_process_action`'s Thread branch, but spawns the Tool loop
+            // instead of the direct backend personality.
             ProcessAction::Thread {
                 child_tid,
                 child_stack,
@@ -1072,9 +1066,9 @@ impl KvmBackend {
                     child_tid,
                     self.thread_group.clone(),
                 )?;
-                // Thread children inherit the parent's thread-dispatch model so
-                // `is_backend_owned_syscall` classifies futex consistently (Option A).
-                child.dispatch_thread_tools = self.dispatch_thread_tools;
+                // Thread children inherit the parent's thread ownership so
+                // execution and futex classification stay consistent.
+                child.thread_ownership = self.thread_ownership;
                 child
                     .memory
                     .write_raw(child.syscall_frame_address, &parent_syscall_frame)?;

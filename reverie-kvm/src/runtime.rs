@@ -27,6 +27,7 @@ use reverie::Never;
 use reverie::Pid;
 use reverie::Stack;
 use reverie::Subscription;
+use reverie::ThreadOwnership;
 use reverie::TimerSchedule;
 use reverie::Tool;
 use reverie::syscalls::Addr;
@@ -64,22 +65,22 @@ type SharedChildStarts = Arc<Mutex<Vec<std::sync::mpsc::Sender<()>>>>;
 
 // AUTONOMOUS-BOT-IMPLEMENTED: Keep root syscalls that share worker state in one backend.
 // TODO-HUMAN-REVIEW(PR-173): Review KVM root syscall ownership.
-fn is_backend_owned_syscall(number: u64, dispatch_thread_tools: bool) -> bool {
-    // `futex` ownership depends on how sibling threads are executed:
+fn is_backend_owned_syscall(number: u64, thread_ownership: ThreadOwnership) -> bool {
+    // `futex` ownership follows the thread's `ThreadOwnership`, so it can never
+    // disagree with how that thread executes:
     //
-    // * When guest threads are dispatched through the Tool (`dispatch_thread_tools`,
-    //   the Option A model), every thread — root and worker alike — is registered
-    //   in Detcore's scheduler. `futex` must therefore route to Detcore so that a
-    //   join's `FUTEX_WAIT` becomes a logical scheduler wait woken by the exiting
-    //   worker's logical `CLONE_CHILD_CLEARTID` wake. Executing it as a real host
-    //   futex here deadlocks: the exiting worker's wake is only simulated inside
-    //   Detcore and never reaches a real host futex word, so the waiter sleeps
-    //   forever.
-    // * In the hybrid model (instrumented root + uninstrumented worker threads
-    //   that run outside Detcore's scheduler), the root's futex must instead use
-    //   the same host-backed words as those siblings, so it stays backend-owned.
+    // * `ThreadOwnership::Tool`: every thread — root and worker alike — is
+    //   registered in the Tool's (Detcore's) scheduler. `futex` must therefore
+    //   route to the Tool so that a join's `FUTEX_WAIT` becomes a logical
+    //   scheduler wait woken by the exiting worker's logical `CLONE_CHILD_CLEARTID`
+    //   wake. Executing it as a real host futex here deadlocks: the exiting
+    //   worker's wake is only simulated inside Detcore and never reaches a real
+    //   host futex word, so the waiter sleeps forever.
+    // * `ThreadOwnership::Host`: workers run uninstrumented outside the Tool's
+    //   scheduler, so the root's futex must use the same host-backed words as
+    //   those siblings and stays backend-owned.
     if number == libc::SYS_futex as u64 {
-        return !dispatch_thread_tools;
+        return thread_ownership.futex_is_host_owned();
     }
     // QEMU's root event loop waits on worker eventfds. KVM syscall
     // injection cannot perform ppoll, so use translated host descriptors.
@@ -1322,7 +1323,7 @@ impl KvmBackend {
 
         // Read once so the per-syscall classifier can borrow it while `self` is
         // borrowed elsewhere in the loop body.
-        let dispatch_thread_tools = self.dispatch_thread_tools;
+        let thread_ownership = self.thread_ownership;
         loop {
             if let Some(code) = self.guest_thread_group_exit_code() {
                 self.cancel_guest_threads();
@@ -1378,7 +1379,7 @@ impl KvmBackend {
             // Detcore's scheduler. `run_process_action_with_tool` then spawns
             // the worker on the Tool loop, which issues the matching
             // `handle_thread_start` the parent's clone handler waits for.
-            let backend_owned = is_backend_owned_syscall(request.number(), dispatch_thread_tools)
+            let backend_owned = is_backend_owned_syscall(request.number(), thread_ownership)
                 && !executor.is_random_device_read(&request)
                 && !executor.is_tool_visible_read(&request);
             let subscribed = !backend_owned
@@ -1613,28 +1614,32 @@ mod tests {
 
     #[test]
     fn worker_shared_syscalls_are_backend_owned() {
-        // Descriptor/event-loop syscalls stay backend-owned in both models.
-        for dispatch_thread_tools in [false, true] {
+        // Descriptor/event-loop syscalls stay backend-owned under both ownerships.
+        for ownership in [ThreadOwnership::Host, ThreadOwnership::Tool] {
             for number in [libc::SYS_ppoll, libc::SYS_read, libc::SYS_readv] {
-                assert!(is_backend_owned_syscall(
-                    number as u64,
-                    dispatch_thread_tools
-                ));
+                assert!(is_backend_owned_syscall(number as u64, ownership));
             }
             assert!(!is_backend_owned_syscall(
                 libc::SYS_clock_gettime as u64,
-                dispatch_thread_tools
+                ownership
             ));
         }
     }
 
     #[test]
-    fn futex_ownership_follows_thread_dispatch_model() {
-        // Hybrid model (uninstrumented workers): the root shares host futex words.
-        assert!(is_backend_owned_syscall(libc::SYS_futex as u64, false));
-        // Option A (Tool-dispatched workers): futex routes to Detcore so joins
-        // are logical scheduler waits woken by the exiting worker's CLEARTID.
-        assert!(!is_backend_owned_syscall(libc::SYS_futex as u64, true));
+    fn futex_ownership_follows_thread_ownership() {
+        // Host-owned threads (uninstrumented workers): the root shares host
+        // futex words, so futex stays backend-owned.
+        assert!(is_backend_owned_syscall(
+            libc::SYS_futex as u64,
+            ThreadOwnership::Host
+        ));
+        // Tool-owned threads: futex routes to the Tool (Detcore) so joins are
+        // logical scheduler waits woken by the exiting worker's CLEARTID.
+        assert!(!is_backend_owned_syscall(
+            libc::SYS_futex as u64,
+            ThreadOwnership::Tool
+        ));
     }
 
     #[test]

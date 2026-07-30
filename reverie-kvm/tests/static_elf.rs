@@ -22,6 +22,7 @@ use reverie::GlobalTool;
 use reverie::Guest;
 use reverie::Pid;
 use reverie::Subscription;
+use reverie::ThreadOwnership;
 use reverie::Tool;
 use reverie::syscalls::CArrayPtr;
 use reverie::syscalls::CStrPtr;
@@ -1001,26 +1002,21 @@ fn static_elf_runs_glibc_clone3_thread_and_restores_parent_state() {
     // Exercise every worker-dispatch path so a `pthread_join`-style
     // `FUTEX_WAIT`/`CLEARTID` round trip completes (exit 0, no hang) in each:
     //   * `Direct`: the non-Tool personality (`run_process_action`).
-    //   * `Tool { dispatch_thread_tools: false }`: the default hybrid model,
-    //     where `run_process_action_with_tool` must fall through to the direct
-    //     worker path. Before the gating fix this branch dispatched the worker
-    //     through the Tool loop unconditionally while `futex` stayed host-owned,
-    //     which deadlocks a real logical-futex Tool such as Detcore.
-    //   * `Tool { dispatch_thread_tools: true }`: the Option A model, where the
-    //     worker runs on the Tool loop.
+    //   * `Tool(ThreadOwnership::Host)`: the hybrid model, where
+    //     `run_process_action_with_tool` falls through to the direct worker path
+    //     and `futex` stays host-owned. Both execution and futex ownership are
+    //     Host, so the round trip is consistent and cannot deadlock.
+    //   * `Tool(ThreadOwnership::Tool)`: the worker runs on the Tool loop and
+    //     `futex` routes to the Tool.
     #[derive(Debug, Clone, Copy)]
     enum WorkerDispatch {
         Direct,
-        Tool { dispatch_thread_tools: bool },
+        Tool(ThreadOwnership),
     }
     for dispatch in [
         WorkerDispatch::Direct,
-        WorkerDispatch::Tool {
-            dispatch_thread_tools: false,
-        },
-        WorkerDispatch::Tool {
-            dispatch_thread_tools: true,
-        },
+        WorkerDispatch::Tool(ThreadOwnership::Host),
+        WorkerDispatch::Tool(ThreadOwnership::Tool),
     ] {
         let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
         backend
@@ -1028,10 +1024,8 @@ fn static_elf_runs_glibc_clone3_thread_and_restores_parent_state() {
             .unwrap();
         let (exit_code, stdout, stderr) = match dispatch {
             WorkerDispatch::Direct => backend.run_static_elf_captured().unwrap(),
-            WorkerDispatch::Tool {
-                dispatch_thread_tools,
-            } => {
-                backend.set_dispatch_thread_tools(dispatch_thread_tools);
+            WorkerDispatch::Tool(ownership) => {
+                backend.set_thread_ownership(ownership);
                 let (_, exit_code, stdout, stderr) = futures::executor::block_on(
                     backend.run_static_elf_with_tool::<StraceTool>((), true),
                 )

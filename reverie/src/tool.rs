@@ -93,6 +93,13 @@ impl ThreadOwnership {
         matches!(self, ThreadOwnership::Tool)
     }
 
+    /// Whether a thread with this ownership executes on the backend's direct
+    /// host execution personality (as opposed to the Tool loop). The exact
+    /// inverse of [`Self::executes_on_tool`].
+    pub fn executes_on_host(self) -> bool {
+        matches!(self, ThreadOwnership::Host)
+    }
+
     /// Whether the thread's `futex` / `CLEARTID` synchronization is serviced by
     /// the host rather than the Tool. This is the exact inverse of
     /// [`Self::executes_on_tool`]; the two are derived from the same value so
