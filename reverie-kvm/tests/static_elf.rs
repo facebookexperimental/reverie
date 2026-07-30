@@ -998,23 +998,50 @@ fn static_elf_runs_glibc_clone3_thread_and_restores_parent_state() {
     clone_args[56..64].copy_from_slice(&TLS.to_le_bytes());
     code.extend_from_slice(&clone_args);
 
-    for with_tool in [false, true] {
+    // Exercise every worker-dispatch path so a `pthread_join`-style
+    // `FUTEX_WAIT`/`CLEARTID` round trip completes (exit 0, no hang) in each:
+    //   * `Direct`: the non-Tool personality (`run_process_action`).
+    //   * `Tool { dispatch_thread_tools: false }`: the default hybrid model,
+    //     where `run_process_action_with_tool` must fall through to the direct
+    //     worker path. Before the gating fix this branch dispatched the worker
+    //     through the Tool loop unconditionally while `futex` stayed host-owned,
+    //     which deadlocks a real logical-futex Tool such as Detcore.
+    //   * `Tool { dispatch_thread_tools: true }`: the Option A model, where the
+    //     worker runs on the Tool loop.
+    #[derive(Debug, Clone, Copy)]
+    enum WorkerDispatch {
+        Direct,
+        Tool { dispatch_thread_tools: bool },
+    }
+    for dispatch in [
+        WorkerDispatch::Direct,
+        WorkerDispatch::Tool {
+            dispatch_thread_tools: false,
+        },
+        WorkerDispatch::Tool {
+            dispatch_thread_tools: true,
+        },
+    ] {
         let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
         backend
             .install_static_elf(&static_elf(&code), "/bin/clone3-thread-test")
             .unwrap();
-        let (exit_code, stdout, stderr) = if with_tool {
-            let (_, exit_code, stdout, stderr) = futures::executor::block_on(
-                backend.run_static_elf_with_tool::<StraceTool>((), true),
-            )
-            .unwrap();
-            (exit_code, stdout, stderr)
-        } else {
-            backend.run_static_elf_captured().unwrap()
+        let (exit_code, stdout, stderr) = match dispatch {
+            WorkerDispatch::Direct => backend.run_static_elf_captured().unwrap(),
+            WorkerDispatch::Tool {
+                dispatch_thread_tools,
+            } => {
+                backend.set_dispatch_thread_tools(dispatch_thread_tools);
+                let (_, exit_code, stdout, stderr) = futures::executor::block_on(
+                    backend.run_static_elf_with_tool::<StraceTool>((), true),
+                )
+                .unwrap();
+                (exit_code, stdout, stderr)
+            }
         };
-        assert_eq!(exit_code, 0, "with_tool={with_tool}");
-        assert!(stdout.is_empty());
-        assert!(stderr.is_empty());
+        assert_eq!(exit_code, 0, "dispatch={dispatch:?}");
+        assert!(stdout.is_empty(), "dispatch={dispatch:?}");
+        assert!(stderr.is_empty(), "dispatch={dispatch:?}");
     }
 }
 

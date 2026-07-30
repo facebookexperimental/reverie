@@ -422,16 +422,17 @@ impl KvmBackend {
         })
     }
 
-    /// Selects the root process identity exposed to the guest and Reverie tool.
-    ///
-    /// The default is PID 1. Call this before running a tool when its process
-    /// model reserves a different deterministic root identity.
     /// Selects whether CLONE_THREAD workers are dispatched through the Tool.
     ///
-    /// When enabled (the Option A model), workers join Detcore's scheduler and
-    /// thread-synchronization syscalls such as `futex` route to Detcore instead
-    /// of the host. Call this before running a tool; it defaults to `false` so
-    /// the hybrid/uninstrumented-worker model keeps its host-backed futex words.
+    /// When enabled (the Option A model), each worker is spawned on the Detcore
+    /// Tool loop and joins Detcore's scheduler, and thread-synchronization
+    /// syscalls such as `futex` route to Detcore instead of the host. When
+    /// disabled — the default — workers run uninstrumented on the direct backend
+    /// personality and `futex` stays host-backed, so the two stay in the same
+    /// synchronization domain. The flag genuinely selects the worker dispatch
+    /// path in `run_process_action_with_tool`; the two settings must never be
+    /// mixed with the opposite `futex` ownership or a `pthread_join` deadlocks.
+    /// Call this before running a tool; it defaults to `false`.
     pub fn set_dispatch_thread_tools(&mut self, dispatch_thread_tools: bool) {
         self.dispatch_thread_tools = dispatch_thread_tools;
     }
@@ -987,13 +988,34 @@ impl KvmBackend {
                     None,
                 )
             }
-            // A CLONE_THREAD worker runs its own vCPU on a fresh OS thread but
-            // shares the guest address space, file table, and process Tool
-            // identity with its creator. It is driven through the same Tool loop
-            // as the process leader so Detcore sees its syscalls, shares its fd
-            // model, and schedules it. This mirrors the physical setup in
-            // `run_process_action`'s Thread branch, but spawns the Tool loop
-            // instead of the direct backend personality.
+            // Hybrid model (`dispatch_thread_tools == false`, the default):
+            // CLONE_THREAD workers run uninstrumented on the direct backend
+            // personality with host-backed synchronization, exactly as
+            // `run_process_action`'s Thread branch does. This MUST stay gated on
+            // the flag: dispatching the worker through the Detcore Tool loop here
+            // while `is_backend_owned_syscall` still classifies `futex` as
+            // host-owned (which it does whenever the flag is `false`, see
+            // runtime.rs) splits the wait/wake across two domains — the joiner's
+            // `pthread_join` issues a real host `FUTEX_WAIT` on the shared futex
+            // word, but the exiting worker's `CLONE_CHILD_CLEARTID` wake is only
+            // simulated inside Detcore's logical scheduler and never reaches that
+            // host word. The joiner then sleeps forever (observed as the guest
+            // hanging until the harness kills it, exit=124). Falling through to
+            // the direct path keeps futex ownership and worker execution in the
+            // same (host) domain, so the pre-Option-A model is deadlock-free.
+            ProcessAction::Thread { .. } if !self.dispatch_thread_tools => {
+                self.run_process_action(executor, action, park_syscall_return)
+            }
+            // Option A model (`dispatch_thread_tools == true`): a CLONE_THREAD
+            // worker runs its own vCPU on a fresh OS thread but shares the guest
+            // address space, file table, and process Tool identity with its
+            // creator. It is driven through the same Tool loop as the process
+            // leader so Detcore sees its syscalls, shares its fd model, and
+            // schedules it; `futex` routes to Detcore (runtime.rs) so a join's
+            // logical `FUTEX_WAIT` is woken by the worker's logical `CLEARTID`.
+            // This mirrors the physical setup in `run_process_action`'s Thread
+            // branch, but spawns the Tool loop instead of the direct backend
+            // personality.
             ProcessAction::Thread {
                 child_tid,
                 child_stack,
