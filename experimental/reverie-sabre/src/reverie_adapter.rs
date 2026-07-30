@@ -15,8 +15,8 @@ use std::io;
 use std::path::Path;
 use std::pin::pin;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicI32;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
@@ -349,7 +349,7 @@ where
     thread_states: Mutex<HashMap<i32, Arc<Mutex<RemoteThreadState<T>>>>>,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-209): Review parent-state handoff for SaBRe thread clones.
-    thread_clone_pending: AtomicBool,
+    thread_clones_pending: Arc<AtomicUsize>,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-142): Review remote syscall-subscription caching and bypass.
     syscall_subscriptions: BTreeSet<Sysno>,
@@ -366,11 +366,23 @@ where
     exit_handled: bool,
 }
 
-struct PendingThreadClone<'a>(&'a AtomicBool);
+struct PendingThreadClone(Arc<AtomicUsize>);
 
-impl Drop for PendingThreadClone<'_> {
+impl PendingThreadClone {
+    fn new(pending: Arc<AtomicUsize>) -> Self {
+        pending
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_add(1)
+            })
+            .expect("too many concurrent SaBRe thread clones");
+        Self(pending)
+    }
+}
+
+impl Drop for PendingThreadClone {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        let previous = self.0.fetch_sub(1, Ordering::Release);
+        debug_assert!(previous > 0, "SaBRe thread-clone count underflow");
     }
 }
 
@@ -404,6 +416,7 @@ where
 {
     states: &'a Mutex<HashMap<i32, Arc<Mutex<RemoteThreadState<T>>>>>,
     socket_path: &'a Path,
+    thread_clones_pending: Arc<AtomicUsize>,
 }
 
 impl<T> RemoteReverieAdapter<T>
@@ -436,7 +449,7 @@ where
             config,
             socket_path,
             thread_states: Mutex::new(thread_states),
-            thread_clone_pending: AtomicBool::new(false),
+            thread_clones_pending: Arc::new(AtomicUsize::new(0)),
             syscall_subscriptions,
         })
     }
@@ -530,21 +543,13 @@ where
                 Some(ChildThreadRegistry {
                     states: &self.thread_states,
                     socket_path: &self.socket_path,
+                    thread_clones_pending: self.thread_clones_pending.clone(),
                 }),
             )),
             original,
             special_inject,
         );
 
-        let _pending_thread_clone = original
-            .filter(|(number, args)| is_thread_clone(pid, *number, *args))
-            .map(|_| {
-                assert!(
-                    !self.thread_clone_pending.swap(true, Ordering::AcqRel),
-                    "nested SaBRe thread clones are unsupported"
-                );
-                PendingThreadClone(&self.thread_clone_pending)
-            });
         TAIL_INJECT_RESULT.with(|slot| slot.set(None));
         match poll_once(self.tool.handle_syscall_event(&mut guest, syscall)) {
             Poll::Ready(result) => shared_result(result),
@@ -711,14 +716,12 @@ where
     }
 
     fn thread_state(&self, tid: Pid) -> Result<Arc<Mutex<RemoteThreadState<T>>>, RpcError> {
-        loop {
-            if let Some(state) = self.thread_states.lock().get(&tid.as_raw()).cloned() {
-                return Ok(state);
-            }
-            if !self.thread_clone_pending.load(Ordering::Acquire) {
-                break;
-            }
-            std::thread::yield_now();
+        if let Some(state) = wait_for_inherited_thread_state(
+            &self.thread_states,
+            &self.thread_clones_pending,
+            tid.as_raw(),
+        ) {
+            return Ok(state);
         }
 
         let rpc = protect_with(|| BlockingRpcClient::connect(&self.socket_path, tid))?;
@@ -733,6 +736,36 @@ where
             .entry(tid.as_raw())
             .or_insert_with(|| state.clone())
             .clone())
+    }
+}
+
+fn wait_for_inherited_thread_state<S: Clone>(
+    states: &Mutex<HashMap<i32, S>>,
+    pending: &AtomicUsize,
+    tid: i32,
+) -> Option<S> {
+    wait_for_inherited_thread_state_after_miss(states, pending, tid, || {})
+}
+
+fn wait_for_inherited_thread_state_after_miss<S: Clone, F: FnMut()>(
+    states: &Mutex<HashMap<i32, S>>,
+    pending: &AtomicUsize,
+    tid: i32,
+    mut after_miss: F,
+) -> Option<S> {
+    loop {
+        if let Some(state) = states.lock().get(&tid).cloned() {
+            return Some(state);
+        }
+        after_miss();
+        if pending.load(Ordering::Acquire) == 0 {
+            // A parent publishes the inherited state before its pending guard
+            // performs the release decrement. Recheck after observing zero so
+            // a child cannot miss an insertion between the first lookup and
+            // the counter load.
+            return states.lock().get(&tid).cloned();
+        }
+        std::thread::yield_now();
     }
 }
 
@@ -1223,6 +1256,22 @@ where
         }
         if self.original == Some((number, args)) {
             if let Some(inject) = self.special_inject.take() {
+                // The Tool may rewrite clone3's stable argument image before
+                // injection. Classify the final image here so a process clone
+                // rewritten to CLONE_THREAD cannot race parent-state handoff.
+                let final_thread_clone =
+                    self.child_threads.is_some() && is_thread_clone(self.pid, number, args);
+                let _pending_thread_clone = if final_thread_clone {
+                    let pending = self
+                        .child_threads
+                        .as_ref()
+                        .expect("thread-clone classification requires a remote registry")
+                        .thread_clones_pending
+                        .clone();
+                    Some(PendingThreadClone::new(pending))
+                } else {
+                    None
+                };
                 let _pending_process_fork =
                     if self.child_threads.is_some() && is_process_fork(self.pid, number, args) {
                         let Some(parent_state) = self.thread_state.as_ref() else {
@@ -1252,7 +1301,7 @@ where
                 // TODO-HUMAN-REVIEW(PR-140): Review frame suspension on diverging injectors.
                 let _frame_suspended = crate::callbacks::SyscallFrameGuard::suspend();
                 let result = Errno::from_ret(inject()).map(|value| value as i64);
-                if is_thread_clone(self.pid, number, args) {
+                if final_thread_clone {
                     if let Ok(child) = result {
                         self.initialize_child_thread(Pid::from_raw(child as i32))?;
                     }
@@ -1461,9 +1510,9 @@ mod tests {
     fn identifies_only_thread_clones_for_parent_state_handoff() {
         let thread_args = SyscallArgs::new(libc::CLONE_THREAD as usize, 0, 0, 0, 0, 0);
         let process_args = SyscallArgs::new(libc::SIGCHLD as usize, 0, 0, 0, 0, 0);
-        let clone3_flags = libc::CLONE_THREAD as u64;
+        let mut clone3_flags = libc::SIGCHLD as u64;
         let clone3_args = SyscallArgs::new(
-            &clone3_flags as *const u64 as usize,
+            &mut clone3_flags as *mut u64 as usize,
             std::mem::size_of_val(&clone3_flags),
             0,
             0,
@@ -1472,9 +1521,53 @@ mod tests {
         );
 
         assert!(is_thread_clone(current_pid(), Sysno::clone, thread_args));
+        assert!(!is_thread_clone(current_pid(), Sysno::clone3, clone3_args));
+        clone3_flags = libc::CLONE_THREAD as u64;
         assert!(is_thread_clone(current_pid(), Sysno::clone3, clone3_args));
+        assert_eq!(clone3_flags, libc::CLONE_THREAD as u64);
         assert!(!is_thread_clone(current_pid(), Sysno::clone, process_args));
         assert!(!is_thread_clone(current_pid(), Sysno::fork, thread_args));
+    }
+
+    #[test]
+    fn concurrent_thread_clone_guards_keep_handoff_pending() {
+        let pending = Arc::new(AtomicUsize::new(0));
+        let first = PendingThreadClone::new(pending.clone());
+        let second = PendingThreadClone::new(pending.clone());
+
+        assert_eq!(pending.load(Ordering::Acquire), 2);
+        drop(first);
+        assert_eq!(pending.load(Ordering::Acquire), 1);
+        drop(second);
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn inherited_thread_state_is_visible_after_pending_clone_finishes() {
+        let states = Arc::new(Mutex::new(HashMap::new()));
+        let pending = Arc::new(AtomicUsize::new(1));
+        let missed = Arc::new(Barrier::new(2));
+        let published = Arc::new(Barrier::new(2));
+
+        let waiter = {
+            let states = states.clone();
+            let pending = pending.clone();
+            let missed = missed.clone();
+            let published = published.clone();
+            thread::spawn(move || {
+                wait_for_inherited_thread_state_after_miss(&states, &pending, 17, || {
+                    missed.wait();
+                    published.wait();
+                })
+            })
+        };
+
+        missed.wait();
+        states.lock().insert(17, "inherited");
+        pending.fetch_sub(1, Ordering::Release);
+        published.wait();
+
+        assert_eq!(waiter.join().unwrap(), Some("inherited"));
     }
 
     #[test]
