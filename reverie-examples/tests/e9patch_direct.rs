@@ -164,6 +164,27 @@ async fn production_noop_preserves_native_rewritten_syscall() {
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires a built e9tool/e9patch pair"]
+async fn guest_process_creation_fails_closed_under_direct_host() {
+    // Noop subscribes to no syscalls, so every rewritten guest syscall takes the
+    // passthrough path (`tool_host.rs:323`) and process/thread creation and image
+    // replacement are rejected by `injected_syscall_guard`. This proves the
+    // single-process direct AOT boundary is sound: a guest cannot `clone`/`fork`
+    // or `execve` away from the tool. The fixture asserts each rewritten site
+    // returns `-EOPNOTSUPP` and exits 0; a spawned untooled child or a real
+    // exec would change the exit code, stdout, or stderr.
+    let (_directory, guest) = compile_guest();
+    let mut command = Command::new(guest);
+    command.env("REVERIE_E9PATCH_EXPECT_PROCESS_CREATION_FAILS_CLOSED", "1");
+    let (output, ()) = run_e9patch_noop_with_preload(command, example_preload())
+        .await
+        .unwrap();
+    assert_eq!(output.status, ExitStatus::Exited(0), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires a built e9tool/e9patch pair"]
 async fn production_counter1_reports_rewritten_syscall_total() {
     let (_directory, guest) = compile_guest();
     let mut command = Command::new(guest);

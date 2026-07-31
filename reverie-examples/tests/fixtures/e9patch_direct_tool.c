@@ -39,6 +39,39 @@ static long raw_write(int fd, const void *buffer, unsigned long size) {
   return rax;
 }
 
+/* fork-equivalent clone (SIGCHLD, copy parent stack). The direct AOT host must
+ * fail this closed rather than spawn an untooled child. */
+static long raw_clone_fork(void) {
+  register long rax __asm__("rax") = 56;  /* SYS_clone */
+  register long rdi __asm__("rdi") = 17;  /* CLONE flags == SIGCHLD (fork) */
+  register long rsi __asm__("rsi") = 0;   /* child stack (0 => copy parent) */
+  register long rdx __asm__("rdx") = 0;   /* parent_tid */
+  register long r10 __asm__("r10") = 0;   /* child_tid */
+  register long r8 __asm__("r8") = 0;     /* tls */
+  __asm__ volatile("syscall"
+                   : "+a"(rax)
+                   : "D"(rdi), "S"(rsi), "d"(rdx), "r"(r10), "r"(r8)
+                   : "rcx", "r11", "memory");
+  return rax;
+}
+
+/* execve of this image. The direct AOT host must fail this closed rather than
+ * let the guest replace its tooled image with an untooled one. */
+static long raw_execve_self(void) {
+  static char path[] = "/proc/self/exe";
+  static char *const argv[] = {path, 0};
+  static char *const envp[] = {0};
+  register long rax __asm__("rax") = 59;  /* SYS_execve */
+  register long rdi __asm__("rdi") = (long)path;
+  register long rsi __asm__("rsi") = (long)argv;
+  register long rdx __asm__("rdx") = (long)envp;
+  __asm__ volatile("syscall"
+                   : "+a"(rax)
+                   : "D"(rdi), "S"(rsi), "d"(rdx)
+                   : "rcx", "r11", "memory");
+  return rax;
+}
+
 static void write_burst(void) {
   static char chunk[16384];
   memset(chunk, 'x', sizeof(chunk));
@@ -82,6 +115,19 @@ int main(void) {
   }
   if (has_environment_entry("REVERIE_E9PATCH_EXPECT_RAW_GETPID=1")) {
     raw_exit_group(raw_getpid() > 0 ? 0 : 1);
+  }
+  if (has_environment_entry(
+          "REVERIE_E9PATCH_EXPECT_PROCESS_CREATION_FAILS_CLOSED=1")) {
+    /* The single-process direct AOT host must reject process/thread creation
+     * and image replacement rather than let an untooled guest escape. Each
+     * rewritten syscall site returns -EOPNOTSUPP in rax. */
+    if (raw_clone_fork() != -EOPNOTSUPP) {
+      raw_exit_group(7);
+    }
+    if (raw_execve_self() != -EOPNOTSUPP) {
+      raw_exit_group(8);
+    }
+    raw_exit_group(0);
   }
   if (has_environment_entry("REVERIE_E9PATCH_EXPECT_RESIDUAL_WRITE_FAIL=1")) {
     static const char byte = 'x';
