@@ -92,6 +92,28 @@ pub async fn run_e9patch_counter1_with_preload(
     Ok((output, global.total()))
 }
 
+/// Runs the production Counter2 Tool through e9patch's direct AOT path.
+///
+/// Counter2 differs from Counter1 by accumulating per-thread syscall counts in
+/// `ThreadState` and contributing them to the process-tree global only at the
+/// exit lifecycle: `on_exit_thread` folds the thread total into the local
+/// process count and `on_exit_process` sends a single `IncrMsg` to the
+/// coordinator-owned `CounterGlobal`. This exercises e9patch's direct exit-event
+/// path (`tool_host::finish_tool_exit`), which Counter1/Strace/Noop never
+/// trigger. The returned tuple is `CounterGlobal::totals()`:
+/// `(total_syscalls, exited_procs, exited_threads)`.
+pub async fn run_e9patch_counter2_with_preload(
+    command: reverie::process::Command,
+    preload: impl Into<std::path::PathBuf>,
+) -> Result<(reverie::process::Output, (u64, u64, u64)), reverie::Error> {
+    let (output, global) =
+        reverie_e9patch::E9patchBackend::run_direct_with_output_and_preload_data::<
+            counter2::CounterLocal,
+        >(command, (), preload, b"counter2")
+        .await?;
+    Ok((output, global.totals()))
+}
+
 /// Runs the production Strace Tool through e9patch's direct AOT path with a
 /// single `write` syscall filter.
 ///
@@ -189,6 +211,11 @@ unsafe extern "C" fn initialize(
             },
             "counter1" => unsafe {
                 reverie_e9patch::install_tool_from_bootstrap::<counter1::CounterLocal>(
+                    &bootstrap.coordinator,
+                )
+            },
+            "counter2" => unsafe {
+                reverie_e9patch::install_tool_from_bootstrap::<counter2::CounterLocal>(
                     &bootstrap.coordinator,
                 )
             },
