@@ -778,16 +778,19 @@ fn syscall_targets_fd(number: i64, args: [u64; 6], fd: u64) -> bool {
         | libc::SYS_pwritev
         | libc::SYS_pwritev2
         | libc::SYS_vmsplice
-        | libc::SYS_sendfile
         | libc::SYS_fcntl
         | libc::SYS_ioctl
         | libc::SYS_dup => args[0] == fd,
         // AUTONOMOUS-BOT-IMPLEMENTED
-        libc::SYS_dup2 | libc::SYS_dup3 => args[0] == fd || args[1] == fd,
+        // sendfile(out_fd, in_fd, ...) names a descriptor in both args[0]
+        // (out_fd) and args[1] (in_fd). Guarding out_fd alone would let a guest
+        // read the reserved coordinator channel by naming it as the in_fd
+        // source, so both endpoints must fail closed, matching `tee`.
+        libc::SYS_dup2 | libc::SYS_dup3 | libc::SYS_sendfile | libc::SYS_tee => {
+            args[0] == fd || args[1] == fd
+        }
         // AUTONOMOUS-BOT-IMPLEMENTED
         libc::SYS_splice | libc::SYS_copy_file_range => args[0] == fd || args[2] == fd,
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        libc::SYS_tee => args[0] == fd || args[1] == fd,
         _ => false,
     }
 }
@@ -1103,7 +1106,6 @@ mod tests {
             libc::SYS_pwritev,
             libc::SYS_pwritev2,
             libc::SYS_vmsplice,
-            libc::SYS_sendfile,
             libc::SYS_fcntl,
             libc::SYS_ioctl,
             libc::SYS_dup,
@@ -1123,12 +1125,43 @@ mod tests {
     fn coordinator_channel_classifier_checks_both_dup_targets() {
         const FD: u64 = 9;
         // dup2/dup3 name a descriptor in both args[0] (oldfd) and args[1]
-        // (newfd); either naming the coordinator fd must fail closed.
-        for number in [libc::SYS_dup2, libc::SYS_dup3] {
+        // (newfd); sendfile names them in args[0] (out_fd) and args[1] (in_fd),
+        // and tee in args[0] (fd_in) and args[1] (fd_out). For each, either
+        // position naming the coordinator fd must fail closed, and a match in a
+        // third, unrelated argument must not.
+        for number in [
+            libc::SYS_dup2,
+            libc::SYS_dup3,
+            libc::SYS_sendfile,
+            libc::SYS_tee,
+        ] {
             assert!(syscall_targets_fd(number, [FD, 0, 0, 0, 0, 0], FD));
             assert!(syscall_targets_fd(number, [0, FD, 0, 0, 0, 0], FD));
             assert!(!syscall_targets_fd(number, [0, 0, FD, 0, 0, 0], FD));
         }
+    }
+
+    #[test]
+    fn coordinator_channel_classifier_guards_sendfile_source() {
+        const FD: u64 = 11;
+        // Regression: sendfile(out_fd, in_fd, offset, count) previously
+        // classified on out_fd (args[0]) only, so a guest could read the
+        // reserved coordinator channel by passing it as the in_fd source
+        // (args[1]). Both endpoints must now fail closed.
+        assert!(
+            syscall_targets_fd(libc::SYS_sendfile, [0, FD, 0, 0, 0, 0], FD),
+            "sendfile naming the coordinator fd as its in_fd source must fail closed"
+        );
+        assert!(syscall_targets_fd(
+            libc::SYS_sendfile,
+            [FD, 0, 0, 0, 0, 0],
+            FD
+        ));
+        assert!(!syscall_targets_fd(
+            libc::SYS_sendfile,
+            [0, 0, FD, 0, 0, 0],
+            FD
+        ));
     }
 
     #[test]
