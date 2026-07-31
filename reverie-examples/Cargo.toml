@@ -76,7 +76,7 @@ path = "strace_minimal.rs"
 anyhow = "1.0.103"
 clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 libc = "0.2.186"
-reverie = { version = "0.1.0", path = "../reverie" }
+reverie = { version = "0.1.0", path = "../reverie", package = "reverie-core" }
 reverie-e9patch = { version = "0.1.0", path = "../reverie-e9patch", default-features = false }
 reverie-kvm = { version = "0.1.0", path = "../reverie-kvm" }
 reverie-liteinst = { version = "0.1.0", path = "../reverie-liteinst", default-features = false }

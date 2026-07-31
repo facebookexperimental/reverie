@@ -14,7 +14,7 @@ description = "Cross-process transport for the Reverie GlobalTool RPC (Unix-doma
 [dependencies]
 async-trait = "0.1.86"
 bincode = { version = "2", features = ["serde"] }
-reverie = { version = "0.1.0", path = "../reverie" }
+reverie = { version = "0.1.0", path = "../reverie", package = "reverie-core" }
 serde = { version = "1.0.219", features = ["derive"] }
 thiserror = "2.0.18"
 tokio = { version = "1.52.4", features = ["io-util", "net", "rt", "sync", "macros"] }

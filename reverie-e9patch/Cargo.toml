@@ -26,7 +26,7 @@ preload-constructor = []
 anyhow = "1.0.103"
 goblin = { version = "0.10.7", features = ["elf64"] }
 libc = "0.2.186"
-reverie = { version = "0.1.0", path = "../reverie" }
+reverie = { version = "0.1.0", path = "../reverie", package = "reverie-core" }
 reverie-preload = { version = "0.1.0", path = "../reverie-preload", default-features = false, features = ["coordinator-rpc"] }
 reverie-ptrace = { version = "0.1.0", path = "../reverie-ptrace" }
 reverie-rpc-transport = { version = "0.1.0", path = "../reverie-rpc-transport" }

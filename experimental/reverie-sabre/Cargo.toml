@@ -16,7 +16,7 @@ libc = "0.2.139"
 mimalloc = { version = "0.1", default-features = false }
 nostd-print = { version = "0.1.0", path = "../nostd-print" }
 parking_lot = { version = "0.12.1", features = ["send_guard"] }
-reverie = { version = "0.1.0", path = "../../reverie" }
+reverie = { version = "0.1.0", path = "../../reverie", package = "reverie-core" }
 reverie-memory = { version = "0.1.0", path = "../../reverie-memory" }
 reverie-rpc = { version = "0.1.0", path = "../reverie-rpc" }
 reverie-rpc-transport = { version = "0.1.0", path = "../../reverie-rpc-transport" }

@@ -19,7 +19,7 @@ anyhow = "1.0.75"
 clap = { version = "4.6.2", features = ["derive", "env"] }
 libc = "0.2.139"
 nostd-print = { version = "0.1.0", path = "../nostd-print" }
-reverie = { version = "0.1.0", path = "../../reverie" }
+reverie = { version = "0.1.0", path = "../../reverie", package = "reverie-core" }
 reverie-host = { version = "0.1.0", path = "../reverie-host" }
 reverie-kvm = { version = "0.1.0", path = "../../reverie-kvm" }
 reverie-ptrace = { version = "0.1.0", path = "../../reverie-ptrace" }
