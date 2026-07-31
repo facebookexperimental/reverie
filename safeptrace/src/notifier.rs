@@ -1013,6 +1013,24 @@ impl Event {
     }
 
     fn claim_notifier_wait(&self) -> NotifierWaitOwnership<'_> {
+        // Lock-free steady-state fast path. Once the notifier worker owns the
+        // wait and is running, and no synchronous/cleanup claimant is active,
+        // the ownership decision is a pure read that the locked loop below would
+        // resolve to `Existing` anyway. The guard on `cleanup_cancel_requested`
+        // / `cleanup_claim_waiters` excludes every sync/cancellation path (each
+        // of those sets its flag before touching `wait_owner`), so this cannot
+        // change any ownership transition; it only removes a `wait_owner_lock`
+        // acquisition from the hot async poll path.
+        if !self.cleanup_cancel_requested.load(Ordering::Acquire)
+            && self.cleanup_claim_waiters.load(Ordering::Acquire) == 0
+            && self.wait_owner.load(Ordering::Acquire) == WAIT_OWNER_NOTIFIER
+            && matches!(
+                self.worker_state.load(Ordering::Acquire),
+                WORKER_RUNNING | WORKER_FINISHING | WORKER_DONE
+            )
+        {
+            return NotifierWaitOwnership::Existing;
+        }
         let mut guard = self.wait_owner_lock.lock();
         loop {
             match self.wait_owner.load(Ordering::Acquire) {
