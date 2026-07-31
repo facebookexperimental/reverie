@@ -2,6 +2,7 @@
 
 [package]
 name = "reverie-syscalls"
+description = "Strongly-typed Linux syscall representations and (de)serialization for the Reverie framework."
 version = "0.1.0"
 authors = ["Meta Platforms"]
 edition = "2024"

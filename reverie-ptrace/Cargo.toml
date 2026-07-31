@@ -2,6 +2,7 @@
 
 [package]
 name = "reverie-ptrace"
+description = "ptrace-based execution backend for the Reverie instrumentation framework."
 version = "0.1.0"
 authors = ["Meta Platforms"]
 edition = "2024"

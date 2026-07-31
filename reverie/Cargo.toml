@@ -2,6 +2,7 @@
 
 [package]
 name = "reverie-core"
+description = "Deterministic user-space syscall and signal interception runtime — the core Reverie process-instrumentation framework."
 version = "0.1.0"
 authors = ["Meta Platforms"]
 edition = "2024"

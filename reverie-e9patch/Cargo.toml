@@ -1,5 +1,6 @@
 [package]
 name = "reverie-e9patch"
+description = "e9patch-based static binary-rewriting backend for the Reverie framework."
 version = "0.1.0"
 authors = ["Meta Platforms"]
 edition = "2024"

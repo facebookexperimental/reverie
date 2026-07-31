@@ -2,6 +2,7 @@
 
 [package]
 name = "reverie-memory"
+description = "Guest-memory access primitives for the Reverie instrumentation framework."
 version = "0.1.0"
 authors = ["Meta Platforms"]
 edition = "2024"

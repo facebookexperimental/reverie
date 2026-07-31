@@ -1,5 +1,6 @@
 [package]
 name = "reverie-dbi"
+description = "Dynamic binary instrumentation (DBI) execution backend for the Reverie framework."
 version = "0.1.0"
 authors = ["Meta Platforms"]
 edition = "2024"

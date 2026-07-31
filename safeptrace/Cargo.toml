@@ -2,6 +2,7 @@
 
 [package]
 name = "safeptrace"
+description = "Safe, ergonomic Rust wrappers around the Linux ptrace(2) API."
 version = "0.1.0"
 authors = ["Meta Platforms"]
 edition = "2024"
