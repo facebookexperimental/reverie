@@ -2084,6 +2084,31 @@ impl Notifier {
     }
 
     fn current_or_new(&self, pid: Pid) -> Result<EventHandle, Errno> {
+        // Steady-state fast path: adopt a still-live registered generation
+        // without a full procfs identity re-capture. This path is reached once
+        // per `Stopped::new_unchecked` / ptrace-op reconstruction in
+        // reverie-ptrace (`assume_stopped`), i.e. many times per trapped
+        // syscall, so the unconditional `capture_identity` below
+        // (`/proc/<pid>/stat` + `/proc/<pid>/status` read twice, `pidfd_open`,
+        // and an O_PATH open of `/proc/<pid>`) dominated per-stop cost after
+        // a8195cfc. A live exact pidfd proves the same kernel task generation
+        // (two live pidfds for one numeric pid cannot name different
+        // generations — the exec-stable invariant relied on by
+        // `registered_sync_handle`), which is exactly the adoption condition
+        // the slow path checks via `same_live_generation`. When the stored
+        // identity's pidfd is no longer live, or on any liveness error, fall
+        // through to the authoritative capture+registry loop below so stale
+        // generations and precise errors are handled identically to before.
+        let cached = {
+            let pids = self.pids.lock();
+            pids.get(&pid)
+                .map(|occupied| (occupied.handle.clone(), Arc::clone(&occupied.identity)))
+        };
+        if let Some((handle, identity)) = cached
+            && matches!(identity.pidfd_is_live(), Ok(true))
+        {
+            return Ok(handle);
+        }
         loop {
             let current = self.capture_identity(pid)?;
             if !current.is_same_process_generation() {
