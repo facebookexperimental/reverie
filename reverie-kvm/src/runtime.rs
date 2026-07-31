@@ -19,6 +19,8 @@ use std::task::Poll;
 use kvm_bindings::kvm_regs;
 use kvm_ioctls::VcpuExit;
 use reverie::Auxv;
+use reverie::DetlogMemoryRegion;
+use reverie::DetlogRegionKind;
 use reverie::ExitStatus;
 use reverie::GlobalRPC;
 use reverie::GlobalTool;
@@ -144,6 +146,14 @@ trait GuestSyscallExecutor<T: Tool>: Send + Sync {
         None
     }
 
+    /// The brk-managed heap region `[heap_base, program_break)` of the guest,
+    /// when this executor backs a loaded static ELF. `None` for executors that
+    /// do not model a heap (e.g. the direct pass-through executor). Used to
+    /// report the guest heap region for deterministic memory-map logging.
+    fn heap_region(&self) -> Option<(u64, u64)> {
+        None
+    }
+
     fn complete_injection<'a>(
         &'a mut self,
         _context: ToolContext<'a, T>,
@@ -213,6 +223,10 @@ where
 
     fn parent_pid(&self) -> Option<Pid> {
         self.executor.parent_pid()
+    }
+
+    fn heap_region(&self) -> Option<(u64, u64)> {
+        Some(self.executor.heap_region())
     }
 
     fn complete_injection<'a>(
@@ -511,6 +525,47 @@ impl<T: Tool> Guest<T> for KvmGuest<'_, T> {
         // a stable zero clock preserves deterministic syscall time while the
         // executor remains cooperative at every syscall boundary.
         Ok(0)
+    }
+
+    fn detlog_memory_regions(&self) -> Option<Vec<DetlogMemoryRegion>> {
+        // For KVM, `pid()` is the host VMM process, so the default
+        // `/proc/<pid>/maps` enumeration would hash the VMM's own stack/heap at
+        // host addresses that are not valid guest addresses. Report the real
+        // guest-address regions instead, readable through `memory()`.
+        let mut regions = Vec::new();
+
+        // Heap: the brk-managed heap spans [heap_base, program_break), where
+        // heap_base is the initial break (align_up(main_end)). `brk()` maps
+        // exactly these pages as it grows, so hashing this range reads only
+        // mapped guest memory. The gap below heap_base (down to
+        // BOOT_RESERVED_END) is unmapped and must NOT be hashed. Skip an empty
+        // heap (guest never grew its break).
+        if let Some((heap_base, program_break)) = self.executor.heap_region()
+            && program_break > heap_base
+        {
+            regions.push(DetlogMemoryRegion {
+                kind: DetlogRegionKind::Heap,
+                start: heap_base,
+                end: program_break,
+            });
+        }
+
+        // Stack: the live user stack spans [rsp, guest_end). The unused pages
+        // below rsp are deterministically zeroed at setup, so hashing the live
+        // region is both cheaper than the full 8 MiB mapping and deterministic
+        // across the two runs of a `--verify` pair (execution is deterministic,
+        // so rsp is identical at the same syscall stop).
+        let guest_end = self.memory.guest_end();
+        let rsp = self.registers.rsp;
+        if rsp >= self.memory.guest_base() && rsp < guest_end {
+            regions.push(DetlogMemoryRegion {
+                kind: DetlogRegionKind::Stack,
+                start: rsp,
+                end: guest_end,
+            });
+        }
+
+        Some(regions)
     }
 }
 

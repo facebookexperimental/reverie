@@ -24,6 +24,34 @@ use crate::tool::GlobalRPC;
 use crate::tool::GlobalTool;
 use crate::tool::Tool;
 
+/// The logical kind of a guest memory region reported by
+/// [`Guest::detlog_memory_regions`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetlogRegionKind {
+    /// The current thread's user stack.
+    Stack,
+    /// The program-break heap.
+    Heap,
+}
+
+/// A guest-address-space memory region a backend can expose for deterministic
+/// memory-map logging (`--detlog-stack` / `--detlog-heap`).
+///
+/// The `[start, end)` bounds are guest virtual addresses readable through
+/// [`Guest::memory`]. This exists for out-of-process backends (for example the
+/// KVM backend) where [`Guest::pid`] is the host VMM process rather than a
+/// process whose `/proc/<pid>/maps` describes the guest's own address space, so
+/// the default `/proc`-based enumeration would read the wrong process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DetlogMemoryRegion {
+    /// Which logical region this is.
+    pub kind: DetlogRegionKind,
+    /// Inclusive start guest virtual address.
+    pub start: u64,
+    /// Exclusive end guest virtual address.
+    pub end: u64,
+}
+
 /// A representation of a guest task (thread).
 #[async_trait]
 pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
@@ -277,6 +305,22 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     fn has_cpuid_interception(&self) -> bool {
         false
     }
+
+    /// Returns the guest-address memory regions this backend wants hashed for
+    /// deterministic memory-map logging, or `None` to fall back to reading
+    /// `/proc/<pid>/maps` for the process returned by [`Guest::pid`].
+    ///
+    /// The default is `None`, which preserves the historical behavior used by
+    /// the ptrace backend, where `pid()` is the guest process and its
+    /// `/proc/<pid>/maps` correctly describes the guest address space.
+    ///
+    /// Out-of-process backends whose `pid()` is not the guest (for example the
+    /// KVM backend, where it is the host VMM process) override this to return
+    /// real guest stack/heap ranges readable through [`Guest::memory`], so the
+    /// determinism engine hashes the guest's memory instead of the VMM's.
+    fn detlog_memory_regions(&self) -> Option<Vec<DetlogMemoryRegion>> {
+        None
+    }
 }
 
 /// Wraps a `Guest<T>` such that it implements `Guest<U>`.
@@ -408,5 +452,9 @@ where
 
     fn has_cpuid_interception(&self) -> bool {
         self.inner.has_cpuid_interception()
+    }
+
+    fn detlog_memory_regions(&self) -> Option<Vec<DetlogMemoryRegion>> {
+        self.inner.detlog_memory_regions()
     }
 }

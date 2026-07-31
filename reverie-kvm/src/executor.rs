@@ -1055,6 +1055,14 @@ impl AddressSpaceState {
 }
 
 impl ElfExecutor {
+    /// The brk-managed heap region `[heap_base, program_break)` of the loaded
+    /// guest. `heap_base` is the initial program break (`align_up(main_end)`),
+    /// so the returned range covers exactly the pages `brk()` has mapped; it is
+    /// empty when the guest has never grown its break.
+    pub(crate) fn heap_region(&self) -> (u64, u64) {
+        (self.state.heap_base, self.state.program_break)
+    }
+
     pub(crate) fn new(state: LoadedStaticElf, capture_output: bool) -> Self {
         let next_pid = state.pid.saturating_add(1);
         let address_space = Arc::new(std::sync::Mutex::new(AddressSpaceState::from_elf(&state)));
@@ -8863,6 +8871,7 @@ mod tests {
         LoadedStaticElf {
             entry_point: 0,
             stack_pointer: 0,
+            heap_base: BOOT_RESERVED_END,
             program_break: BOOT_RESERVED_END,
             brk_limit: BOOT_RESERVED_END + PAGE_SIZE,
             mmap_base: BOOT_RESERVED_END + PAGE_SIZE,

@@ -116,6 +116,9 @@ pub(crate) struct SignalFdState {
 pub(crate) struct LoadedStaticElf {
     pub entry_point: u64,
     pub stack_pointer: u64,
+    /// Initial program break set at load time (`align_up(main_end)`); the base
+    /// of the brk-managed heap. The live heap spans `[heap_base, program_break)`.
+    pub heap_base: u64,
     pub program_break: u64,
     pub brk_limit: u64,
     pub mmap_base: u64,
@@ -208,6 +211,7 @@ impl LoadedStaticElf {
         Ok(Self {
             entry_point: self.entry_point,
             stack_pointer: self.stack_pointer,
+            heap_base: self.heap_base,
             program_break: self.program_break,
             brk_limit: self.brk_limit,
             mmap_base: self.mmap_base,
@@ -572,6 +576,7 @@ fn load_executable(
     Ok(LoadedStaticElf {
         entry_point,
         stack_pointer,
+        heap_base: program_break,
         program_break,
         brk_limit,
         mmap_base: mmap_next,
