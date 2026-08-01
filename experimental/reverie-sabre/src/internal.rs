@@ -66,7 +66,7 @@ pub fn sbr_init<T: ToolGlobal>(
         *vdso_callback = Some(callbacks::handle_vdso::<T>);
         *syscall_handler = Some(callbacks::handle_syscall::<T>);
         *rdtsc_handler = Some(callbacks::handle_rdtsc::<T>);
-        *post_load = Some(callbacks::handle_post_load);
+        *post_load = Some(callbacks::handle_post_load::<T>);
 
         paths::set_sabre_path(sabre_path);
         paths::set_client_path(client_path);

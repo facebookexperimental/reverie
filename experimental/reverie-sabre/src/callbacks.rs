@@ -480,7 +480,15 @@ static POST_LOAD_PENDING: AtomicBool = AtomicBool::new(false);
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-194): Review the SaBRe loader-to-tool post-load bridge.
-pub extern "C" fn handle_post_load(_is_static: bool) {
+pub extern "C" fn handle_post_load<T: ToolGlobal>(is_static: bool) {
+    // A static client has no client-side dynamic-loader phase in which to
+    // construct the tool. Initialize it while SaBRe's libc startup state is
+    // still intact, before the loader rewrites the initial stack for the
+    // guest. Post-load delivery remains deferred until the first callback,
+    // after the guest thread has been registered.
+    if is_static {
+        let _ = T::global();
+    }
     POST_LOAD_PENDING.store(true, Ordering::Release);
 }
 
