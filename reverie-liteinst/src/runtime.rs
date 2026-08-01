@@ -34,8 +34,8 @@ pub(crate) const HOST_BEGIN_MARKER: u64 = 0x7265_766c_6900_0001;
 pub(crate) const HOST_READY_MARKER: u64 = 0x7265_766c_6900_0002;
 pub(crate) const HOST_HELPER_RETURN_MARKER: u64 = 0x7265_766c_6900_0003;
 pub(crate) const HOST_SYSCALL_MARKER: u64 = 0x7265_766c_6900_0004;
-const HOST_HANDSHAKE_VERSION: u64 = 3;
-const HOST_INSTALL_RESULT_VERSION: u64 = 1;
+const HOST_HANDSHAKE_VERSION: u64 = 4;
+const HOST_INSTALL_RESULT_VERSION: u64 = 2;
 const HOST_HELPER_STACK_BYTES: usize = 256 * 1024;
 
 global_asm!(
@@ -147,6 +147,8 @@ struct HostInstallResult {
     arena_writable_len: u64,
     arena_executable_start: u64,
     arena_executable_len: u64,
+    instruction_len: u64,
+    straddle_prefix: u64,
     complete: u64,
 }
 
@@ -165,6 +167,8 @@ static mut HOST_INSTALL_RESULT: HostInstallResult = HostInstallResult {
     arena_writable_len: 0,
     arena_executable_start: 0,
     arena_executable_len: 0,
+    instruction_len: 0,
+    straddle_prefix: 0,
     complete: 0,
 };
 
@@ -247,6 +251,8 @@ struct SiteSlot {
     mapping_end: AtomicU64,
     trap_count: AtomicU64,
     hook_count: AtomicU64,
+    instruction_len: AtomicU8,
+    straddle_prefix: AtomicU8,
 }
 
 impl SiteSlot {
@@ -258,6 +264,8 @@ impl SiteSlot {
             mapping_end: AtomicU64::new(0),
             trap_count: AtomicU64::new(0),
             hook_count: AtomicU64::new(0),
+            instruction_len: AtomicU8::new(0),
+            straddle_prefix: AtomicU8::new(0),
         }
     }
 }
@@ -1013,6 +1021,46 @@ unsafe fn install_site_hook(
     let scan = scanner
         .scan_prefix(candidate, address, liteinst2::patcher::WORD_PATCH_BYTES)
         .map_err(|error| io::Error::other(error.to_string()))?;
+    let instruction_len = scan
+        .instructions()
+        .first()
+        .expect("a successful prefix scan contains an instruction")
+        .len();
+    let straddle_prefix = scanner
+        .cache_line_size()
+        .split_offset(
+            address as usize,
+            instruction_len.min(liteinst2::patcher::NEAR_JUMP_BYTES),
+        )
+        .unwrap_or(0);
+
+    // Publish candidate metadata before installation so a failed helper can
+    // still classify its explicit ptrace fallback branch.
+    let candidate_result = HostInstallResult {
+        version: HOST_INSTALL_RESULT_VERSION,
+        site_start: address,
+        site_len: liteinst2::patcher::WORD_PATCH_BYTES as u64,
+        instruction_len: instruction_len as u64,
+        straddle_prefix: straddle_prefix as u64,
+        ..HostInstallResult::default()
+    };
+    unsafe {
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!(HOST_INSTALL_RESULT),
+            candidate_result,
+        );
+    }
+    slot.instruction_len
+        .store(instruction_len as u8, Ordering::Release);
+    slot.straddle_prefix
+        .store(straddle_prefix as u8, Ordering::Release);
+    if straddle_prefix != 0 {
+        // This runtime has no proved direct-pun or upstream-relocation path.
+        // Retain the hybrid's ptrace slow path instead of GuardedSplit.
+        return Err(io::Error::other(
+            "cache-line straddler requires ptrace fallback",
+        ));
+    }
     let code = scan.snapshot();
 
     unsafe {
@@ -1065,10 +1113,16 @@ unsafe fn install_site_hook(
         arena_writable_len: arena.writable_end - arena.writable_start,
         arena_executable_start: arena.executable_start,
         arena_executable_len: arena.executable_end - arena.executable_start,
+        instruction_len: instruction_len as u64,
+        straddle_prefix: straddle_prefix as u64,
         complete: 1,
     };
     let installed = Box::into_raw(Box::new(installed));
     slot.hook.store(installed, Ordering::Release);
+    slot.instruction_len
+        .store(instruction_len as u8, Ordering::Release);
+    slot.straddle_prefix
+        .store(straddle_prefix as u8, Ordering::Release);
     slot.state.store(SITE_ACTIVE, Ordering::Release);
     Ok(result)
 }
@@ -1133,6 +1187,8 @@ pub unsafe extern "C" fn reverie_liteinst_install_site_for_ptrace(address: u64) 
                 arena_writable_len: arena.writable_end - arena.writable_start,
                 arena_executable_start: arena.executable_start,
                 arena_executable_len: arena.executable_end - arena.executable_start,
+                instruction_len: u64::from(site.instruction_len.load(Ordering::Acquire)),
+                straddle_prefix: u64::from(site.straddle_prefix.load(Ordering::Acquire)),
                 complete: 1,
             })
         });

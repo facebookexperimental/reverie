@@ -228,6 +228,41 @@ impl LiteinstBackend {
             .await
     }
 
+    /// Runs the ptrace-owned LiteInst hybrid and returns patch-site statistics.
+    pub async fn run_host_with_preload_and_stats<T>(
+        mut command: Command,
+        config: <T::GlobalState as GlobalTool>::Config,
+        preload: impl Into<PathBuf>,
+    ) -> Result<
+        (
+            ExitStatus,
+            T::GlobalState,
+            crate::LiteinstInstrumentationStats,
+        ),
+        Error,
+    >
+    where
+        T: Tool + 'static,
+    {
+        let preload = configure_host_command(&mut command, preload.into())?;
+        let tracer = TracerBuilder::<T>::new(command)
+            .config(config)
+            .liteinst_runtime(
+                preload,
+                crate::runtime::HOST_BEGIN_MARKER,
+                crate::runtime::HOST_READY_MARKER,
+                crate::runtime::HOST_HELPER_RETURN_MARKER,
+                crate::runtime::HOST_SYSCALL_MARKER,
+            )
+            .spawn()
+            .await?;
+        let stats = tracer
+            .liteinst_instrumentation_stats()
+            .expect("LiteInst runtime tracer must expose instrumentation statistics");
+        let (status, global) = tracer.wait().await?;
+        Ok((status, global, stats.snapshot()))
+    }
+
     /// Runs a Tool under the ptrace-owned LiteInst hybrid and captures output.
     ///
     /// The same single-process/single-thread and non-security-boundary contract
@@ -258,6 +293,44 @@ impl LiteinstBackend {
             .await?
             .wait_with_output()
             .await
+    }
+
+    /// Runs the ptrace-owned LiteInst hybrid, captures output, and returns statistics.
+    pub async fn run_host_with_output_and_preload_and_stats<T>(
+        mut command: Command,
+        config: <T::GlobalState as GlobalTool>::Config,
+        preload: impl Into<PathBuf>,
+    ) -> Result<
+        (
+            ReverieOutput,
+            T::GlobalState,
+            crate::LiteinstInstrumentationStats,
+        ),
+        Error,
+    >
+    where
+        T: Tool + 'static,
+    {
+        command
+            .stdout(ReverieStdio::piped())
+            .stderr(ReverieStdio::piped());
+        let preload = configure_host_command(&mut command, preload.into())?;
+        let tracer = TracerBuilder::<T>::new(command)
+            .config(config)
+            .liteinst_runtime(
+                preload,
+                crate::runtime::HOST_BEGIN_MARKER,
+                crate::runtime::HOST_READY_MARKER,
+                crate::runtime::HOST_HELPER_RETURN_MARKER,
+                crate::runtime::HOST_SYSCALL_MARKER,
+            )
+            .spawn()
+            .await?;
+        let stats = tracer
+            .liteinst_instrumentation_stats()
+            .expect("LiteInst runtime tracer must expose instrumentation statistics");
+        let (output, global) = tracer.wait_with_output().await?;
+        Ok((output, global, stats.snapshot()))
     }
 
     /// Runs a tool using an explicit tool-specific preload library.

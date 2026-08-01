@@ -68,6 +68,8 @@ use safeptrace::Wait;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 
+use crate::LiteinstInstrumentationStats;
+use crate::LiteinstInstrumentationStatsHandle;
 use crate::cp;
 use crate::gdbstub::GdbServer;
 use crate::task::Child;
@@ -105,6 +107,7 @@ pub struct Tracer<G> {
     // Present only for the single-process dynamic LiteInst host. Ordinary
     // ptrace and e9patch lifecycles retain their existing teardown behavior.
     liteinst_cleanup: Option<LiteinstTraceeCleanup>,
+    liteinst_instrumentation_stats: Option<Arc<StdMutex<LiteinstInstrumentationStats>>>,
 }
 
 struct LiteinstTraceeCleanup {
@@ -1376,6 +1379,13 @@ impl<G: Default> Tracer<G> {
         self.guest_pid
     }
 
+    /// Returns a live observer for this tracer's LiteInst patch-site statistics.
+    pub fn liteinst_instrumentation_stats(&self) -> Option<LiteinstInstrumentationStatsHandle> {
+        self.liteinst_instrumentation_stats
+            .as_ref()
+            .map(|stats| LiteinstInstrumentationStatsHandle::from_shared(Arc::clone(stats)))
+    }
+
     /// Simultaneously waits for the tracee to exit and collect all remaining
     /// output on the stdout/stderr handles, returning an `Output` instance.
     ///
@@ -1879,6 +1889,7 @@ impl<T: Tool + 'static> TracerBuilder<T> {
             syscall_marker,
             newborn_tracees: Arc::new(StdMutex::new(HashMap::new())),
             held_root_stop: Arc::new(StdMutex::new(None)),
+            instrumentation_stats: Arc::new(StdMutex::new(LiteinstInstrumentationStats::default())),
             #[cfg(test)]
             fail_preinit: false,
             #[cfg(test)]
@@ -2207,6 +2218,10 @@ impl<T: Tool + 'static> TracerBuilder<T> {
             .liteinst_runtime
             .as_ref()
             .map(|runtime| Arc::clone(&runtime.held_root_stop));
+        let liteinst_instrumentation_stats = self
+            .liteinst_runtime
+            .as_ref()
+            .map(|runtime| Arc::clone(&runtime.instrumentation_stats));
         #[cfg(test)]
         let fail_discovery_once = self
             .liteinst_runtime
@@ -2334,6 +2349,7 @@ impl<T: Tool + 'static> TracerBuilder<T> {
             stdout,
             stderr,
             liteinst_cleanup,
+            liteinst_instrumentation_stats,
         })
     }
 }
@@ -2458,6 +2474,7 @@ where
                 stdout: Some(stdout),
                 stderr: Some(stderr),
                 liteinst_cleanup: None,
+                liteinst_instrumentation_stats: None,
             })
         }
     }

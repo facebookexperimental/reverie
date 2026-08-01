@@ -564,11 +564,9 @@ async fn first_site_is_installed_once_and_hot_calls_use_liteinst() {
 
     let (_directory, guest) = compile_fixture("hybrid_hot_site.c");
     let site = symbol_address(&guest, "reverie_liteinst_hybrid_getpid_site");
-    let (output, global) = LiteinstBackend::run_host_with_output_and_preload::<CountSyscalls>(
-        Command::new(guest),
-        (),
-        preload_path(),
-    )
+    let (output, global, stats) = LiteinstBackend::run_host_with_output_and_preload_and_stats::<
+        CountSyscalls,
+    >(Command::new(guest), (), preload_path())
     .await
     .unwrap();
 
@@ -595,7 +593,58 @@ async fn first_site_is_installed_once_and_hot_calls_use_liteinst() {
         0,
         "the patch helper must add zero mprotect Tool callbacks above the loader baseline"
     );
+    let decisions = stats.decision_counts();
+    assert_eq!(
+        decisions.into_iter().sum::<usize>(),
+        stats.patch_candidates()
+    );
+    assert_eq!(stats.distinct_rips(), decisions[0] + decisions[1]);
+    assert!(
+        decisions[1] >= 1,
+        "the known hot site must use a relocated patch: {stats}"
+    );
+    assert!(
+        stats.instruction_length_counts()[3] >= 1,
+        "the known hot site begins with a two-byte syscall: {stats}"
+    );
+    assert_eq!(
+        stats.instruction_length_counts().into_iter().sum::<usize>(),
+        stats.classified_candidates()
+    );
+    assert_eq!(
+        stats.non_straddling() + stats.cacheline_straddlers(),
+        stats.classified_candidates()
+    );
+    assert_eq!(
+        stats.straddle_prefix_counts().into_iter().sum::<usize>(),
+        stats.cacheline_straddlers()
+    );
     assert!(output.status.success(), "{output:?}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cacheline_straddler_bails_to_ptrace_and_is_counted() {
+    let (_directory, guest) = compile_fixture("hybrid_straddler_site.c");
+    let site = symbol_address(&guest, "reverie_liteinst_straddler_site");
+    assert_eq!(site % 64, 63, "fixture syscall must straddle a cache line");
+
+    let (output, global, stats) = LiteinstBackend::run_host_with_output_and_preload_and_stats::<
+        PassthroughGetpid,
+    >(Command::new(guest), (), preload_path())
+    .await
+    .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"straddler-ptrace-fallback-ok\n");
+    assert_eq!(global.delivered.load(Ordering::SeqCst), 8);
+    assert_eq!(stats.distinct_rips(), 0);
+    assert_eq!(stats.patch_candidates(), 1);
+    assert_eq!(stats.decision_counts(), [0, 0, 1, 0]);
+    assert_eq!(stats.classified_candidates(), 1);
+    assert_eq!(stats.cacheline_straddlers(), 1);
+    assert_eq!(stats.non_straddling(), 0);
+    assert_eq!(stats.instruction_length_counts(), [0, 0, 0, 1, 0]);
+    assert_eq!(stats.straddle_prefix_counts(), [1, 0, 0, 0]);
 }
 
 async fn run_cpuid_policy_mode(

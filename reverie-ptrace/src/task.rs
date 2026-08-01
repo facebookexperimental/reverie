@@ -70,6 +70,7 @@ use tokio::task::JoinError;
 use tokio::task::JoinHandle;
 use tracing::Instrument;
 
+use crate::LiteinstInstrumentationStats;
 use crate::children;
 use crate::cp;
 use crate::error::Error;
@@ -84,6 +85,7 @@ use crate::gdbstub::StopEvent;
 use crate::gdbstub::StopReason;
 use crate::gdbstub::StoppedInferior;
 use crate::injected_syscall::InjectedSyscallFrame;
+use crate::liteinst_stats::LiteinstPatchOutcome;
 use crate::regs::Reg;
 use crate::regs::RegAccess;
 use crate::stack::GuestStack;
@@ -513,6 +515,7 @@ pub(crate) struct LiteinstRuntimeConfig {
     pub(crate) syscall_marker: u64,
     pub(crate) newborn_tracees: Arc<StdMutex<HashMap<Pid, NewbornTracee>>>,
     pub(crate) held_root_stop: Arc<StdMutex<Option<HeldRootStop>>>,
+    pub(crate) instrumentation_stats: Arc<StdMutex<LiteinstInstrumentationStats>>,
     #[cfg(test)]
     pub(crate) fail_preinit: bool,
     #[cfg(test)]
@@ -623,6 +626,8 @@ struct LiteinstInstallResult {
     arena_writable_len: u64,
     arena_executable_start: u64,
     arena_executable_len: u64,
+    instruction_len: u64,
+    straddle_prefix: u64,
     complete: u64,
 }
 
@@ -2092,7 +2097,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         let config = self.global_state.liteinst_runtime.as_ref()?;
         let address = Addr::from_raw(frame_address)?;
         let frame: LiteinstHandshakeFrame = task.read_value(address).ok()?;
-        if frame.version != 3
+        if frame.version != 4
             || frame.helper_stack_top < 8
             || frame.helper_stack_top & 0xf != 0
             || trap_rip
@@ -3190,6 +3195,45 @@ impl<L: Tool + 'static> TracedTask<L> {
         }
     }
 
+    fn record_liteinst_fallback_stats(
+        &self,
+        task: &Stopped,
+        frame: LiteinstHandshakeFrame,
+        site: u64,
+    ) {
+        let shape = Addr::from_raw(frame.install_result as usize)
+            .and_then(|address| {
+                let result: LiteinstInstallResult = task.read_value(address).ok()?;
+                Some(result)
+            })
+            .and_then(|result| {
+                let instruction_len = usize::try_from(result.instruction_len).ok()?;
+                let straddle_prefix = usize::try_from(result.straddle_prefix).ok()?;
+                (result.version == 2
+                    && result.complete == 0
+                    && result.site_start == site
+                    && result.site_len == 8
+                    && (1..=15).contains(&instruction_len)
+                    && straddle_prefix < instruction_len.min(5))
+                .then_some((
+                    instruction_len,
+                    (straddle_prefix != 0).then_some(straddle_prefix),
+                ))
+            });
+        let outcome = if shape.as_ref().is_some_and(|(_, prefix)| prefix.is_some()) {
+            LiteinstPatchOutcome::PtraceStraddlerBail
+        } else {
+            LiteinstPatchOutcome::PtraceOtherFallback
+        };
+        if let Some(config) = self.global_state.liteinst_runtime.as_ref() {
+            config
+                .instrumentation_stats
+                .lock()
+                .unwrap()
+                .record_site(site, outcome, shape);
+        }
+    }
+
     fn validate_liteinst_install_result(
         &self,
         task: &Stopped,
@@ -3198,10 +3242,14 @@ impl<L: Tool + 'static> TracedTask<L> {
     ) -> Option<(u64, ActiveHookFootprint)> {
         let address = Addr::from_raw(frame.install_result as usize)?;
         let result: LiteinstInstallResult = task.read_value(address).ok()?;
-        if result.version != 1
+        let instruction_len = usize::try_from(result.instruction_len).ok()?;
+        let straddle_prefix = usize::try_from(result.straddle_prefix).ok()?;
+        if result.version != 2
             || result.complete != 1
             || result.site_start != site
             || result.site_len != 8
+            || !(1..=15).contains(&instruction_len)
+            || straddle_prefix >= instruction_len.min(5)
         {
             return None;
         }
@@ -3252,6 +3300,20 @@ impl<L: Tool + 'static> TracedTask<L> {
         {
             return None;
         }
+        self.global_state
+            .liteinst_runtime
+            .as_ref()?
+            .instrumentation_stats
+            .lock()
+            .unwrap()
+            .record_site(
+                result.site_start,
+                LiteinstPatchOutcome::RelocatedPatched,
+                Some((
+                    instruction_len,
+                    (straddle_prefix != 0).then_some(straddle_prefix),
+                )),
+            );
         Some((
             result.relocated_tail,
             ActiveHookFootprint {
@@ -3429,6 +3491,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                             }
                         }
                     } else {
+                        self.record_liteinst_fallback_stats(&stopped, frame, site);
                         None
                     };
                     let (stopped, rollback) =

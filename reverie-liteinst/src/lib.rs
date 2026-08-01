@@ -18,6 +18,7 @@ pub use backend::LiteinstBackend;
 pub use backend::PreloadBootstrap;
 pub use backend::TOOL_PRELOAD_ENV;
 pub use backend::take_preload_bootstrap;
+pub use reverie_ptrace::LiteinstInstrumentationStats;
 pub mod rpc;
 mod runtime;
 mod tool_host;

@@ -41,6 +41,7 @@ pub mod decoder;
 mod error;
 mod gdbstub;
 mod injected_syscall;
+mod liteinst_stats;
 mod perf;
 pub mod regs;
 mod stack;
@@ -53,6 +54,8 @@ mod vdso;
 
 pub use backend::PtraceBackend;
 pub use injected_syscall::InjectedSyscallFrame;
+pub use liteinst_stats::LiteinstInstrumentationStats;
+pub use liteinst_stats::LiteinstInstrumentationStatsHandle;
 pub use perf::is_perf_supported;
 pub use timer::PmuConfig;
 pub use timer::set_pmu_config;
