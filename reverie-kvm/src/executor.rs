@@ -6892,6 +6892,37 @@ fn fcntl(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> 
             // SAFETY: host_fd is live and lock is a fully initialized flock value.
             zero_or_errno(unsafe { libc::fcntl(host_fd, host_command, &lock) })
         }
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-kvm-pipe-fcntl): Review KVM guest pipe-capacity
+        // fcntl forwarding. F_GETPIPE_SZ/F_SETPIPE_SZ read and set the capacity of
+        // the real host pipe that backs the guest pipe, so both return the exact
+        // value the golden ptrace backend returns (it performs the same syscall).
+        // The capacity is a kernel-maintained property of the backing pipe — a
+        // stable 16-page (65536-byte) default, with F_SETPIPE_SZ's power-of-two
+        // page rounding computed deterministically by the kernel — not a
+        // host-timing / pid / address quantity, so the result is reproducible and
+        // matches ptrace byte-for-byte. Without this route the executor fell
+        // through to ENOSYS, so a guest querying pipe capacity (e.g. an atomic
+        // writev sizing its fill buffer) diverged from ptrace.
+        libc::F_GETPIPE_SZ => {
+            // SAFETY: host_fd names a live descriptor; F_GETPIPE_SZ takes no third argument.
+            let result = unsafe { libc::fcntl(host_fd, libc::F_GETPIPE_SZ) };
+            if result < 0 {
+                io_error(std::io::Error::last_os_error())
+            } else {
+                i64::from(result)
+            }
+        }
+        libc::F_SETPIPE_SZ => {
+            let size = args[2] as libc::c_int;
+            // SAFETY: host_fd names a live descriptor; F_SETPIPE_SZ consumes one int size.
+            let result = unsafe { libc::fcntl(host_fd, libc::F_SETPIPE_SZ, size) };
+            if result < 0 {
+                io_error(std::io::Error::last_os_error())
+            } else {
+                i64::from(result)
+            }
+        }
         _ => negative_errno(libc::ENOSYS),
     }
 }
@@ -9960,6 +9991,79 @@ mod tests {
         );
         assert!(flags >= 0);
         assert_ne!(flags as libc::c_int & libc::O_NONBLOCK, 0);
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-kvm-pipe-fcntl): regression for the F_GETPIPE_SZ /
+    // F_SETPIPE_SZ fcntl arms (were ENOSYS). They forward to the backing host
+    // pipe, so the guest observes the real, deterministic pipe capacity.
+    #[test]
+    fn fcntl_pipe_capacity_get_and_set_forward_to_host() {
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+
+        const PIPE_FDS: u64 = 0x100;
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_pipe2,
+                [PIPE_FDS, 0, 0, 0, 0, 0]
+            ),
+            0
+        );
+        let pipe_fds: [libc::c_int; 2] = read_struct(&memory, PIPE_FDS);
+        let write_fd = pipe_fds[1];
+
+        // F_GETPIPE_SZ returns the backing pipe's capacity (a positive size),
+        // where the executor previously fell through to ENOSYS.
+        let capacity = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_fcntl,
+            [write_fd as u64, libc::F_GETPIPE_SZ as u64, 0, 0, 0, 0],
+        );
+        assert!(capacity > 0, "F_GETPIPE_SZ returned {capacity}");
+
+        // F_SETPIPE_SZ grows the pipe and returns the kernel-rounded actual size,
+        // which is at least the requested size; F_GETPIPE_SZ then reflects it.
+        let requested = capacity * 2;
+        let applied = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_fcntl,
+            [
+                write_fd as u64,
+                libc::F_SETPIPE_SZ as u64,
+                requested as u64,
+                0,
+                0,
+                0,
+            ],
+        );
+        assert!(
+            applied >= requested,
+            "F_SETPIPE_SZ returned {applied}, requested {requested}"
+        );
+        let grown = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_fcntl,
+            [write_fd as u64, libc::F_GETPIPE_SZ as u64, 0, 0, 0, 0],
+        );
+        assert_eq!(grown, applied);
+
+        // An unknown fd is still rejected with EBADF, not ENOSYS.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_fcntl,
+                [99, libc::F_GETPIPE_SZ as u64, 0, 0, 0, 0],
+            ),
+            negative_errno(libc::EBADF)
+        );
     }
 
     #[test]
