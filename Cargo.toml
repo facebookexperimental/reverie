@@ -26,3 +26,4 @@ members = [
     "reverie-util",
     "safeptrace",
 ]
+exclude = ["public_autocargo/experimental"]

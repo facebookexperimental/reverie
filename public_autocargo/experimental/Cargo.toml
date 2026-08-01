@@ -8,6 +8,7 @@ authors = ["Meta Platforms"]
 edition = "2024"
 repository = "https://github.com/facebookexperimental/reverie"
 license = "BSD-2-Clause"
+publish = false
 
 [[bin]]
 name = "scrape_syscalls"
