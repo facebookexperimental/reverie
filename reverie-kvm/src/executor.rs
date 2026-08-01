@@ -6893,7 +6893,7 @@ fn fcntl(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> 
             zero_or_errno(unsafe { libc::fcntl(host_fd, host_command, &lock) })
         }
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-kvm-pipe-fcntl): Review KVM guest pipe-capacity
+        // TODO-HUMAN-REVIEW(rrnewton/reverie#318): Review KVM guest pipe-capacity
         // fcntl forwarding. F_GETPIPE_SZ/F_SETPIPE_SZ read and set the capacity of
         // the real host pipe that backs the guest pipe, so both return the exact
         // value the golden ptrace backend returns (it performs the same syscall).
@@ -9994,7 +9994,7 @@ mod tests {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-kvm-pipe-fcntl): regression for the F_GETPIPE_SZ /
+    // TODO-HUMAN-REVIEW(rrnewton/reverie#318): regression for the F_GETPIPE_SZ /
     // F_SETPIPE_SZ fcntl arms (were ENOSYS). They forward to the backing host
     // pipe, so the guest observes the real, deterministic pipe capacity.
     #[test]
