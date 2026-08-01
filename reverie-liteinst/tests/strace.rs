@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::AsRawFd;
@@ -38,6 +39,29 @@ fn run_compat_guest(program: &str, arguments: &[&str]) -> Output {
     command.args(arguments);
     configure_command(&mut command, PreloadTool::Compatibility).unwrap();
     command.output().unwrap()
+}
+
+fn compile_fixture(name: &str) -> (tempfile::TempDir, PathBuf) {
+    let directory = tempfile::tempdir().unwrap();
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
+    let output = directory.path().join(name.trim_end_matches(".c"));
+    let compiler = std::env::var_os("CC").unwrap_or_else(|| OsString::from("cc"));
+    let result = Command::new(compiler)
+        .args(["-std=gnu11", "-O0", "-fno-pie", "-no-pie"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "failed to compile {}:\n{}",
+        source.display(),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    (directory, output)
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -331,13 +355,8 @@ fn compatibility_event_fd_recovers_when_delayed_reader_drains() {
 
 #[test]
 fn compatibility_tool_rejects_process_group_escape() {
-    let output = run_compat_guest(
-        "/usr/bin/python3",
-        &[
-            "-c",
-            "import os\ntry:\n os.setsid()\nexcept PermissionError:\n print('setsid-rejected')\nelse:\n raise SystemExit('setsid unexpectedly succeeded')",
-        ],
-    );
+    let (_directory, guest) = compile_fixture("compat_setsid.c");
+    let output = run_compat_guest(guest.to_str().unwrap(), &[]);
     assert!(output.status.success(), "{output:?}");
     assert_eq!(output.stdout, b"setsid-rejected\n");
 }

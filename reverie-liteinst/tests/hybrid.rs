@@ -24,6 +24,7 @@ use reverie::syscalls::SyscallArgs;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
 use reverie_liteinst::LiteinstBackend;
+use reverie_liteinst::STRADDLER_STALENESS_TICKS_ENV;
 
 #[derive(Debug, Default)]
 struct EventCounter {
@@ -645,6 +646,27 @@ async fn cacheline_straddler_bails_to_ptrace_and_is_counted() {
     assert_eq!(stats.non_straddling(), 0);
     assert_eq!(stats.instruction_length_counts(), [0, 0, 0, 1, 0]);
     assert_eq!(stats.straddle_prefix_counts(), [1, 0, 0, 0]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cache_line_straddling_sites_default_to_ptrace_fallback() {
+    let (_directory, guest) = compile_fixture("hybrid_straddler_sites.c");
+    let mut command = Command::new(guest);
+    command.env_remove(STRADDLER_STALENESS_TICKS_ENV);
+    let (output, global) = LiteinstBackend::run_host_with_output_and_preload::<PassthroughGetpid>(
+        command,
+        (),
+        preload_path(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        output.stdout, b"offsets=57..63 calls=14 traps=7 hooks=0\n",
+        "{output:?}"
+    );
+    assert_eq!(global.delivered.load(Ordering::SeqCst), 14, "{output:?}");
+    assert!(output.status.success(), "{output:?}");
 }
 
 async fn run_cpuid_policy_mode(

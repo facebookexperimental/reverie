@@ -236,6 +236,25 @@ reverie_liteinst_rpc_sigaltstack:
     nop
     ret
     .size reverie_liteinst_rpc_sigaltstack, .-reverie_liteinst_rpc_sigaltstack
+
+    .p2align 4
+    .global reverie_liteinst_rpc_raise_sigsys
+    .hidden reverie_liteinst_rpc_raise_sigsys
+    .type reverie_liteinst_rpc_raise_sigsys,@function
+reverie_liteinst_rpc_raise_sigsys:
+    mov eax, 39
+    syscall
+    mov rdi, rax
+    .p2align 4
+    mov eax, 186
+    syscall
+    mov rsi, rax
+    mov edx, 31
+    .p2align 4
+    mov eax, 234
+    syscall
+    ret
+    .size reverie_liteinst_rpc_raise_sigsys, .-reverie_liteinst_rpc_raise_sigsys
 "#
 );
 
@@ -248,6 +267,7 @@ unsafe extern "C" {
         envp: *const *const u8,
     ) -> i64;
     fn reverie_liteinst_rpc_sigaltstack() -> i64;
+    fn reverie_liteinst_rpc_raise_sigsys() -> i64;
     fn reverie_liteinst_rpc_sigprocmask(
         how: u64,
         set: *const u64,
@@ -415,7 +435,7 @@ fn preblocked_sigsys_guest(path: &Path) {
 
 fn spoof_sigsys_guest(path: &Path) -> ! {
     unsafe { reverie_liteinst::install_tool::<CounterTool>(path) }.unwrap();
-    unsafe { libc::raise(libc::SIGSYS) };
+    unsafe { reverie_liteinst_rpc_raise_sigsys() };
     panic!("guest-generated SIGSYS returned");
 }
 

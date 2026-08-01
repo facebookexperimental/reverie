@@ -10,7 +10,6 @@ use std::io;
 use std::ptr;
 use std::sync::OnceLock;
 
-use liteinst2::patcher::StalenessBudget;
 use liteinst2::patcher::prepare_live_patching;
 use liteinst2::scanner::InstructionScanner;
 use liteinst2::trampoline::HookContext;
@@ -633,6 +632,7 @@ fn discover_arena_aliases(
 }
 
 fn prepare_instrumentation() -> io::Result<()> {
+    crate::straddler::initialize_from_environment()?;
     prepare_live_patching().map_err(|error| io::Error::other(error.to_string()))?;
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     let page_size = u64::try_from(page_size)
@@ -1018,6 +1018,8 @@ unsafe fn install_site_hook(
         return Err(io::Error::other("SIGSYS site is not an x86-64 syscall"));
     }
     let scanner = InstructionScanner::default();
+    let staleness =
+        crate::straddler::budget_for_patch(address as usize, scanner.cache_line_size())?;
     let scan = scanner
         .scan_prefix(candidate, address, liteinst2::patcher::WORD_PATCH_BYTES)
         .map_err(|error| io::Error::other(error.to_string()))?;
@@ -1080,7 +1082,7 @@ unsafe fn install_site_hook(
                 address as usize as *mut u8,
             ),
             callback,
-            StalenessBudget::new(3_000).expect("non-zero staleness budget"),
+            staleness,
             &arena.arena,
         )
     };

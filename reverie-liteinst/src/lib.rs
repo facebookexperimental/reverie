@@ -12,6 +12,7 @@ compile_error!("reverie-liteinst requires Linux x86-64");
 
 mod backend;
 mod patch_alloc;
+mod straddler;
 
 pub use backend::COORDINATOR_ENV;
 pub use backend::LiteinstBackend;
@@ -42,6 +43,8 @@ pub use runtime::TOOL_PASSTHROUGH;
 pub use runtime::TOOL_SPOOF_GETPID;
 pub use runtime::alt_stack_from_env_value;
 pub use runtime::builtin_tool_from_env_value;
+pub use straddler::STRADDLER_STALENESS_TICKS_ENV;
+pub use straddler::straddler_staleness_from_env_value;
 pub use tool_host::install_tool;
 pub use tool_host::install_tool_from_bootstrap;
 
