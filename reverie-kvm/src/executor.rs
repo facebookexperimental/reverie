@@ -8527,7 +8527,7 @@ fn sigaltstack(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u6
 /// diverged from the golden ptrace backend (which returns `EAGAIN` for an empty
 /// zero-timeout wait). `pending` is a `BTreeSet`, so iteration order — and thus
 /// which signal is dequeued — is fully deterministic.
-// TODO-HUMAN-REVIEW(PR-kvm-rt-sigtimedwait): Review virtual rt_sigtimedwait dequeue semantics.
+// TODO-HUMAN-REVIEW(rrnewton/reverie#315): Review virtual rt_sigtimedwait dequeue semantics.
 fn rt_sigtimedwait(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
     if args[3] != KERNEL_SIGSET_SIZE as u64 {
         return negative_errno(libc::EINVAL);
@@ -13937,7 +13937,7 @@ mod tests {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-kvm-rt-sigtimedwait): regression for the rt_sigtimedwait
+    // TODO-HUMAN-REVIEW(rrnewton/reverie#315): regression for the rt_sigtimedwait
     // dispatch arm (was ENOSYS). Detcore injects the zero-timeout non-blocking
     // form, so the executor is a pure poll of the guest kernel's pending set.
     #[test]
