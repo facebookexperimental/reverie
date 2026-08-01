@@ -749,6 +749,9 @@ fn execute_basic_syscall_with_output(
         rt_sigprocmask(memory, state, args)
     } else if number == libc::SYS_sigaltstack as u64 {
         sigaltstack(memory, state, args)
+    } else if number == libc::SYS_rt_sigtimedwait as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        rt_sigtimedwait(memory, state, args)
     } else if number == libc::SYS_kill as u64
         || number == libc::SYS_tkill as u64
         || number == libc::SYS_tgkill as u64
@@ -8511,6 +8514,89 @@ fn sigaltstack(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u6
     0
 }
 
+/// Emulates `rt_sigtimedwait(set, info, timeout, sigsetsize)` for the guest.
+///
+/// Detcore converts every blockable syscall to its zero-timeout non-blocking
+/// form before injecting it and then drives blocking and timeout resolution
+/// itself against the deterministic virtual clock. This handler is therefore a
+/// pure, non-blocking poll of the guest kernel's pending-signal set: it consumes
+/// the lowest-numbered pending signal that the `set` argument selects and returns
+/// its number, or reports `EAGAIN` when nothing matches (which detcore reads as
+/// "would have blocked" and reschedules deterministically). Before this route the
+/// executor fell through to `ENOSYS`, so a guest that called `sigtimedwait`
+/// diverged from the golden ptrace backend (which returns `EAGAIN` for an empty
+/// zero-timeout wait). `pending` is a `BTreeSet`, so iteration order — and thus
+/// which signal is dequeued — is fully deterministic.
+// TODO-HUMAN-REVIEW(PR-kvm-rt-sigtimedwait): Review virtual rt_sigtimedwait dequeue semantics.
+fn rt_sigtimedwait(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    if args[3] != KERNEL_SIGSET_SIZE as u64 {
+        return negative_errno(libc::EINVAL);
+    }
+    let set = match read_guest_bytes::<KERNEL_SIGSET_SIZE>(memory, args[0]) {
+        Ok(set) => set,
+        Err(error) => return error,
+    };
+    // Dequeue the lowest matching pending signal under the lock, then recompute
+    // the readiness of any signalfd whose mask also selected it, mirroring
+    // `signalfd_read` (both consume from the same shared pending set).
+    let (signal, readiness) = {
+        let mut signalfd_state = state
+            .signalfd_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let signal = signalfd_state.pending.iter().copied().find(|&signal| {
+            signal != libc::SIGKILL && signal != libc::SIGSTOP && signal_mask_contains(&set, signal)
+        });
+        let mut readiness = Vec::new();
+        if let Some(signal) = signal {
+            signalfd_state.pending.remove(&signal);
+            let affected = signalfd_state
+                .masks
+                .iter()
+                .filter_map(|(&fd, mask)| signal_mask_contains(mask, signal).then_some(fd))
+                .collect::<Vec<_>>();
+            for fd in affected {
+                let mask = signalfd_state.masks[&fd];
+                let still_ready = signalfd_state
+                    .pending
+                    .iter()
+                    .any(|&pending| signal_mask_contains(&mask, pending));
+                readiness.push((fd, still_ready));
+            }
+        }
+        (signal, readiness)
+    };
+    for (fd, ready) in readiness {
+        if let Some(file) = state.files.get(&fd)
+            && let Err(error) = set_signalfd_ready(file, ready)
+        {
+            return error;
+        }
+    }
+    let Some(signal) = signal else {
+        return negative_errno(libc::EAGAIN);
+    };
+    // Fill the guest-visible siginfo_t when requested. The x86-64 kernel layout
+    // places si_signo at 0, si_code at 8, and the kill(2) union (si_pid, si_uid)
+    // at 16/20; the delivered signal is process-local, so si_code is SI_USER.
+    if args[1] != 0 {
+        const SIGINFO_SIZE: usize = 128;
+        if !range_is_valid(memory, args[1], SIGINFO_SIZE as u64) {
+            return negative_errno(libc::EFAULT);
+        }
+        let mut info = [0u8; SIGINFO_SIZE];
+        info[0..4].copy_from_slice(&signal.to_ne_bytes());
+        info[8..12].copy_from_slice(&libc::SI_USER.to_ne_bytes());
+        info[16..20].copy_from_slice(&state.pid.to_ne_bytes());
+        info[20..24].copy_from_slice(&0i32.to_ne_bytes());
+        let written = write_bytes(memory, args[1], &info);
+        if written < 0 {
+            return written;
+        }
+    }
+    signal as i64
+}
+
 fn wait4(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
     // pid_t is a 32-bit signed value; the guest passes wait4(-1) as 0xFFFFFFFF
     // in a 64-bit register. Truncate to i32 before sign-extending so the common
@@ -13847,6 +13933,89 @@ mod tests {
                 [POLL_FD, 1, 0, 0, 0, 0],
             ),
             0
+        );
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-kvm-rt-sigtimedwait): regression for the rt_sigtimedwait
+    // dispatch arm (was ENOSYS). Detcore injects the zero-timeout non-blocking
+    // form, so the executor is a pure poll of the guest kernel's pending set.
+    #[test]
+    fn rt_sigtimedwait_polls_pending_and_reports_eagain_when_empty() {
+        const SET: u64 = 0x100;
+        const INFO: u64 = 0x180;
+
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let pid = state.pid;
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+
+        // Wait set selecting SIGUSR1.
+        let mut set = [0u8; KERNEL_SIGSET_SIZE];
+        let bit = (libc::SIGUSR1 - 1) as usize;
+        set[bit / 8] |= 1 << (bit % 8);
+        memory.write(SET, &set).unwrap();
+
+        // A wrong sigsetsize is rejected before touching guest memory, matching
+        // the kernel's EINVAL for a mismatched kernel sigset width.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_rt_sigtimedwait,
+                [SET, INFO, 0, (KERNEL_SIGSET_SIZE + 1) as u64, 0, 0],
+            ),
+            negative_errno(libc::EINVAL)
+        );
+
+        // With nothing pending, a zero-timeout wait returns EAGAIN. This is the
+        // exact divergence the change fixes: the KVM executor previously fell
+        // through to ENOSYS while the golden ptrace backend returns EAGAIN.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_rt_sigtimedwait,
+                [SET, INFO, 0, KERNEL_SIGSET_SIZE as u64, 0, 0],
+            ),
+            negative_errno(libc::EAGAIN)
+        );
+
+        // Block SIGUSR1 and self-queue it, then the wait consumes it, returns the
+        // signal number, and fills the kill(2) siginfo union (si_signo, si_pid).
+        state.signal_mask[bit / 8] |= 1 << (bit % 8);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_kill,
+                [pid as u64, libc::SIGUSR1 as u64, 0, 0, 0, 0],
+            ),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_rt_sigtimedwait,
+                [SET, INFO, 0, KERNEL_SIGSET_SIZE as u64, 0, 0],
+            ),
+            i64::from(libc::SIGUSR1)
+        );
+        let signo = i32::from_ne_bytes(read_struct::<[u8; 4]>(&memory, INFO));
+        let si_pid = i32::from_ne_bytes(read_struct::<[u8; 4]>(&memory, INFO + 16));
+        assert_eq!(signo, libc::SIGUSR1);
+        assert_eq!(si_pid, state.pid);
+
+        // The signal was dequeued: a second poll drains to EAGAIN again.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_rt_sigtimedwait,
+                [SET, INFO, 0, KERNEL_SIGSET_SIZE as u64, 0, 0],
+            ),
+            negative_errno(libc::EAGAIN)
         );
     }
 
