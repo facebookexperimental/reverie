@@ -1,6 +1,6 @@
 [package]
 name = "reverie-preload"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Meta Platforms"]
 edition = "2024"
 repository = "https://github.com/facebookexperimental/reverie"
@@ -28,7 +28,7 @@ coordinator-rpc = ["dep:serde", "dep:bincode", "dep:reverie"]
 libc = "0.2.186"
 serde = { version = "1.0.219", features = ["derive"], optional = true }
 bincode = { version = "2", features = ["serde"], optional = true }
-reverie = { version = "0.1.0", path = "../reverie", optional = true, package = "reverie-core" }
+reverie = { version = "0.2.0", path = "../reverie", optional = true, package = "reverie-core" }
 
 [[bin]]
 name = "reverie-preload-probe"

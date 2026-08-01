@@ -1,7 +1,7 @@
 [package]
 name = "reverie-e9patch"
 description = "e9patch-based static binary-rewriting backend for the Reverie framework."
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Meta Platforms"]
 edition = "2024"
 repository = "https://github.com/facebookexperimental/reverie"
@@ -27,10 +27,10 @@ preload-constructor = []
 anyhow = "1.0.103"
 goblin = { version = "0.10.7", features = ["elf64"] }
 libc = "0.2.186"
-reverie = { version = "0.1.0", path = "../reverie", package = "reverie-core" }
-reverie-preload = { version = "0.1.0", path = "../reverie-preload", default-features = false, features = ["coordinator-rpc"] }
-reverie-ptrace = { version = "0.1.0", path = "../reverie-ptrace" }
-reverie-rpc-transport = { version = "0.1.0", path = "../reverie-rpc-transport" }
+reverie = { version = "0.2.0", path = "../reverie", package = "reverie-core" }
+reverie-preload = { version = "0.2.0", path = "../reverie-preload", default-features = false, features = ["coordinator-rpc"] }
+reverie-ptrace = { version = "0.2.0", path = "../reverie-ptrace" }
+reverie-rpc-transport = { version = "0.2.0", path = "../reverie-rpc-transport" }
 sha2 = "0.10.9"
 tempfile = "3.26.0"
 tokio = { version = "1.52.4", features = ["net", "rt", "time"] }

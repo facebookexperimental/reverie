@@ -2,7 +2,8 @@
 
 [package]
 name = "nostd-print"
-version = "0.1.0"
+description = "Minimal no_std printing support for experimental Reverie instrumentation runtimes."
+version = "0.2.0"
 authors = ["Meta Platforms"]
 edition = "2021"
 repository = "https://github.com/facebookexperimental/reverie"

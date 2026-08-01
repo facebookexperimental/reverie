@@ -3,7 +3,7 @@
 [package]
 name = "reverie-ptrace"
 description = "ptrace-based execution backend for the Reverie instrumentation framework."
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Meta Platforms"]
 edition = "2024"
 repository = "https://github.com/facebookexperimental/reverie"
@@ -25,8 +25,8 @@ paste = "1.0.14"
 perf-event-open-sys = "5.0"
 procfs = "0.18.0"
 raw-cpuid = "10.7.0"
-reverie = { version = "0.1.0", path = "../reverie", package = "reverie-core" }
-safeptrace = { version = "0.1.0", path = "../safeptrace", features = ["memory", "notifier"] }
+reverie = { version = "0.2.0", path = "../reverie", package = "reverie-core" }
+safeptrace = { version = "0.2.0", path = "../safeptrace", features = ["memory", "notifier"] }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 thiserror = "2.0.18"
 tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }

@@ -3,7 +3,7 @@
 [package]
 name = "safeptrace"
 description = "Safe, ergonomic Rust wrappers around the Linux ptrace(2) API."
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Meta Platforms"]
 edition = "2024"
 repository = "https://github.com/facebookexperimental/reverie"
@@ -21,8 +21,8 @@ futures = { version = "0.3.31", features = ["async-await", "compat"] }
 libc = "0.2.186"
 nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
 parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard"] }
-reverie-memory = { version = "0.1.0", path = "../reverie-memory", optional = true }
-reverie-process = { version = "0.1.0", path = "../reverie-process" }
+reverie-memory = { version = "0.2.0", path = "../reverie-memory", optional = true }
+reverie-process = { version = "0.2.0", path = "../reverie-process" }
 syscalls = { version = "0.6.18", features = ["serde"] }
 thiserror = "2.0.18"
 

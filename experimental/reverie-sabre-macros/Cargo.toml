@@ -2,7 +2,8 @@
 
 [package]
 name = "reverie-sabre-macros"
-version = "0.1.0"
+description = "Procedural macros for the experimental Reverie SaBRe backend."
+version = "0.2.0"
 authors = ["Meta Platforms"]
 edition = "2021"
 repository = "https://github.com/facebookexperimental/reverie"

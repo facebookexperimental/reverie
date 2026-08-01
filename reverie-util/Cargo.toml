@@ -3,7 +3,7 @@
 [package]
 name = "reverie-util"
 description = "Shared utility helpers for the Reverie instrumentation framework."
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Meta Platforms"]
 edition = "2024"
 repository = "https://github.com/facebookexperimental/reverie"
@@ -13,7 +13,7 @@ license = "BSD-2-Clause"
 anyhow = "1.0.103"
 chrono = { version = "0.4.45", features = ["clock", "serde", "std"], default-features = false }
 clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
-reverie = { version = "0.1.0", path = "../reverie", package = "reverie-core" }
+reverie = { version = "0.2.0", path = "../reverie", package = "reverie-core" }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["chrono", "env-filter", "json", "local-time", "parking_lot", "registry"] }

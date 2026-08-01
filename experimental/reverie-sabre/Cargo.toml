@@ -2,7 +2,8 @@
 
 [package]
 name = "reverie-sabre"
-version = "0.1.0"
+description = "Experimental SaBRe selective binary-rewriting backend for Reverie."
+version = "0.2.0"
 authors = ["Meta Platforms"]
 edition = "2021"
 repository = "https://github.com/facebookexperimental/reverie"
@@ -14,14 +15,14 @@ heapless = "0.8.0"
 lazy_static = "1.4"
 libc = "0.2.139"
 mimalloc = { version = "0.1", default-features = false }
-nostd-print = { version = "0.1.0", path = "../nostd-print" }
+nostd-print = { version = "0.2.0", path = "../nostd-print" }
 parking_lot = { version = "0.12.1", features = ["send_guard"] }
-reverie = { version = "0.1.0", path = "../../reverie", package = "reverie-core" }
-reverie-memory = { version = "0.1.0", path = "../../reverie-memory" }
-reverie-rpc = { version = "0.1.0", path = "../reverie-rpc" }
-reverie-rpc-transport = { version = "0.1.0", path = "../../reverie-rpc-transport" }
-reverie-sabre-macros = { version = "0.1.0", path = "../reverie-sabre-macros" }
-reverie-syscalls = { version = "0.1.0", path = "../../reverie-syscalls" }
+reverie = { version = "0.2.0", path = "../../reverie", package = "reverie-core" }
+reverie-memory = { version = "0.2.0", path = "../../reverie-memory" }
+reverie-rpc = { version = "0.2.0", path = "../reverie-rpc" }
+reverie-rpc-transport = { version = "0.2.0", path = "../../reverie-rpc-transport" }
+reverie-sabre-macros = { version = "0.2.0", path = "../reverie-sabre-macros" }
+reverie-syscalls = { version = "0.2.0", path = "../../reverie-syscalls" }
 serde = { version = "1.0.185", features = ["derive", "rc"] }
 syscalls = { version = "0.6.7", features = ["serde"] }
 

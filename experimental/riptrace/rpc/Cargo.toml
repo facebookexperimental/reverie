@@ -2,13 +2,14 @@
 
 [package]
 name = "riptrace-rpc"
-version = "0.1.0"
+description = "RPC protocol types for the experimental Reverie riptrace tool."
+version = "0.2.0"
 authors = ["Meta Platforms"]
 edition = "2021"
 repository = "https://github.com/facebookexperimental/reverie"
 license = "BSD-2-Clause"
 
 [dependencies]
-reverie-rpc = { version = "0.1.0", path = "../../reverie-rpc" }
+reverie-rpc = { version = "0.2.0", path = "../../reverie-rpc" }
 serde = { version = "1.0.185", features = ["derive", "rc"] }
 syscalls = { version = "0.6.7", features = ["serde"] }

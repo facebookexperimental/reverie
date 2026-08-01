@@ -3,7 +3,7 @@
 [package]
 name = "reverie-core"
 description = "Deterministic user-space syscall and signal interception runtime — the core Reverie process-instrumentation framework."
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Meta Platforms"]
 edition = "2024"
 repository = "https://github.com/facebookexperimental/reverie"
@@ -32,8 +32,8 @@ nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "
 object = { version = "0.36.7", features = ["read", "write"] }
 procfs = "0.18.0"
 raw-cpuid = "10.7.0"
-reverie-process = { version = "0.1.0", path = "../reverie-process" }
-reverie-syscalls = { version = "0.1.0", path = "../reverie-syscalls" }
+reverie-process = { version = "0.2.0", path = "../reverie-process" }
+reverie-syscalls = { version = "0.2.0", path = "../reverie-syscalls" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 syscalls = { version = "0.6.18", features = ["serde"] }
 thiserror = "2.0.18"

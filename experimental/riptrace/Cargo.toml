@@ -2,7 +2,8 @@
 
 [package]
 name = "riptrace"
-version = "0.1.0"
+description = "Experimental syscall tracing frontend built on the Reverie SaBRe backend."
+version = "0.2.0"
 authors = ["Meta Platforms"]
 edition = "2021"
 repository = "https://github.com/facebookexperimental/reverie"
@@ -13,8 +14,8 @@ anyhow = "1.0.75"
 async-trait = "0.1.71"
 clap = { version = "3.2.25", features = ["derive", "env", "regex", "unicode"] }
 colored = "2.1.0"
-reverie-host = { version = "0.1.0", path = "../reverie-host" }
-reverie-process = { version = "0.1.0", path = "../../reverie-process" }
-riptrace-rpc = { version = "0.1.0", path = "rpc" }
+reverie-host = { version = "0.2.0", path = "../reverie-host" }
+reverie-process = { version = "0.2.0", path = "../../reverie-process" }
+riptrace-rpc = { version = "0.2.0", path = "rpc" }
 syscalls = { version = "0.6.7", features = ["serde"] }
 tokio = { version = "1.37.0", features = ["full", "test-util", "tracing"] }

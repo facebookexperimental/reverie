@@ -2,7 +2,8 @@
 
 [package]
 name = "scrape-syscalls"
-version = "0.1.0"
+description = "Generate typed syscall metadata for the Reverie instrumentation framework."
+version = "0.2.0"
 authors = ["Meta Platforms"]
 edition = "2024"
 repository = "https://github.com/facebookexperimental/reverie"
