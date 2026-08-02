@@ -87,11 +87,6 @@ fn main() {
 /// and (b) treat the tree as ready only when it is *complete*, not merely when
 /// `CMakeLists.txt` exists.
 fn ensure_dynamorio_source(source_dir: &Path) {
-    // Fast path: an already-complete tree needs no lock.
-    if source_dir_is_complete(source_dir) {
-        return;
-    }
-
     let reverie_root = source_dir
         .parent()
         .and_then(Path::parent)
@@ -102,8 +97,8 @@ fn ensure_dynamorio_source(source_dir: &Path) {
     // dropped or the process exits.
     let _lock = SourceLock::acquire(source_dir);
 
-    // Re-check under the lock: another build may have finished populating while
-    // we waited for the lock.
+    // Check under the lock: another build may be populating this shared tree,
+    // and readiness includes a clean tracked worktree.
     if source_dir_is_complete(source_dir) {
         return;
     }
@@ -121,8 +116,9 @@ fn ensure_dynamorio_source(source_dir: &Path) {
 /// A partially checked-out submodule still has `CMakeLists.txt` (git writes the
 /// working tree roughly in path order) yet is missing core sources, so checking
 /// for `CMakeLists.txt` alone is not enough. We verify completeness with a
-/// couple of deep sentinel files and, when git metadata is available, by
-/// confirming git reports no missing (deleted-from-worktree) tracked files.
+/// couple of deep sentinel files and by requiring git to report a clean tracked
+/// worktree. Inspection failures are incomplete rather than an excuse to trust
+/// the sentinels.
 fn source_dir_is_complete(source_dir: &Path) -> bool {
     if !source_dir.join("CMakeLists.txt").is_file() {
         return false;
@@ -136,16 +132,15 @@ fn source_dir_is_complete(source_dir: &Path) -> bool {
     if !source_dir.join(".git").exists() {
         return false;
     }
-    // No tracked file may be missing from the working tree.
+    // No tracked file may differ from HEAD. Ignore untracked build output.
     match Command::new("git")
         .arg("-C")
         .arg(source_dir)
-        .args(["ls-files", "--deleted"])
+        .args(["status", "--porcelain=v1", "--untracked-files=no"])
         .output()
     {
         Ok(output) if output.status.success() => output.stdout.is_empty(),
-        // If git cannot report, trust the sentinel checks performed above.
-        _ => true,
+        _ => false,
     }
 }
 
@@ -346,4 +341,84 @@ fn run(command: &mut Command, description: &str) {
 
 fn required_env(name: &str) -> OsString {
     env::var_os(name).unwrap_or_else(|| panic!("Cargo did not set {name}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_file(root: &Path, relative: &str, contents: &str) {
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+
+    fn git(root: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed with {status}");
+    }
+
+    fn complete_source_repo() -> tempfile::TempDir {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        git(root, &["init", "-q"]);
+        write_file(root, "CMakeLists.txt", "project(DynamoRIO)\n");
+        write_file(root, "core/lib/globals_shared.h", "/* sentinel */\n");
+        write_file(root, "core/unix/memcache.c", "/* sentinel */\n");
+        write_file(root, "core/extra.c", "/* tracked */\n");
+        git(root, &["add", "."]);
+        git(
+            root,
+            &[
+                "-c",
+                "user.name=Reverie Test",
+                "-c",
+                "user.email=reverie-test@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "fixture",
+            ],
+        );
+        temp
+    }
+
+    #[test]
+    fn complete_clean_source_is_accepted() {
+        let source = complete_source_repo();
+        assert!(source_dir_is_complete(source.path()));
+    }
+
+    #[test]
+    fn modified_tracked_source_is_rejected() {
+        let source = complete_source_repo();
+        write_file(source.path(), "core/extra.c", "/* modified */\n");
+        assert!(!source_dir_is_complete(source.path()));
+    }
+
+    #[test]
+    fn deleted_tracked_source_is_rejected() {
+        let source = complete_source_repo();
+        fs::remove_file(source.path().join("core/extra.c")).unwrap();
+        assert!(!source_dir_is_complete(source.path()));
+    }
+
+    #[test]
+    fn git_inspection_failure_is_rejected() {
+        let source = tempfile::tempdir().unwrap();
+        write_file(source.path(), "CMakeLists.txt", "project(DynamoRIO)\n");
+        write_file(
+            source.path(),
+            "core/lib/globals_shared.h",
+            "/* sentinel */\n",
+        );
+        write_file(source.path(), "core/unix/memcache.c", "/* sentinel */\n");
+        fs::create_dir(source.path().join(".git")).unwrap();
+        assert!(!source_dir_is_complete(source.path()));
+    }
 }
