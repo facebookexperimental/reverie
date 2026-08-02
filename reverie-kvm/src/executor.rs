@@ -407,7 +407,7 @@ fn execute_basic_syscall_with_output(
         recvmmsg(memory, state, args)
     } else if number == libc::SYS_ioctl as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        ioctl(state, args)
+        ioctl(memory, state, args)
     } else if number == libc::SYS_dup as u64 {
         duplicate_fd(state, args[0], None, 0, false)
     } else if number == libc::SYS_dup2 as u64 {
@@ -5208,11 +5208,11 @@ fn recvmmsg(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) 
 }
 
 // TODO-HUMAN-REVIEW(PR-92): Review this KVM compatibility implementation.
-fn ioctl(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
+fn ioctl(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
     let guest_fd = args[0] as libc::c_int;
-    if host_fd(state, guest_fd).is_none() {
+    let Some(host_fd) = host_fd(state, guest_fd) else {
         return negative_errno(libc::EBADF);
-    }
+    };
     match args[1] as libc::c_ulong {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-229): Review virtual FIOCLEX/FIONCLEX descriptor flags.
@@ -5229,9 +5229,59 @@ fn ioctl(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-230): Review the no-guest-NIC ioctl model.
         SIOCETHTOOL => negative_errno(libc::ENODEV),
-        libc::TCGETS | libc::TIOCGWINSZ | libc::TIOCGPGRP => negative_errno(libc::ENOTTY),
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-332): Report real terminal state to the guest.
+        // The executor's inherited standard descriptors are the real host fds, so
+        // forward the terminal-query ioctls to them (matching what the ptrace
+        // backend's syscall injection does against the real tty). This makes
+        // `isatty()` (a TCGETS probe) return the true answer: success on a
+        // terminal, ENOTTY on a pipe/file. Detcore then canonicalizes the
+        // returned geometry/attributes to a fixed terminal, so the guest's view
+        // is both faithful to tty-ness and deterministic across hosts/backends.
+        libc::TCGETS => {
+            forward_terminal_ioctl(memory, host_fd, libc::TCGETS, args[2], KERNEL_TERMIOS_SIZE)
+        }
+        libc::TIOCGWINSZ => forward_terminal_ioctl(
+            memory,
+            host_fd,
+            libc::TIOCGWINSZ,
+            args[2],
+            std::mem::size_of::<libc::winsize>(),
+        ),
+        libc::TIOCGPGRP => forward_terminal_ioctl(
+            memory,
+            host_fd,
+            libc::TIOCGPGRP,
+            args[2],
+            std::mem::size_of::<libc::pid_t>(),
+        ),
         _ => negative_errno(libc::ENOTTY),
     }
+}
+
+/// Size of the kernel `struct termios` returned by `TCGETS`: four 4-byte mode
+/// flags, the one-byte line discipline, and `c_cc[NCCS]` with `NCCS == 19`.
+/// This is the kernel ABI layout, which differs from the larger libc `termios`.
+const KERNEL_TERMIOS_SIZE: usize = 4 * 4 + 1 + 19;
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-332): Review forwarding fixed-size terminal-query
+// ioctls to the real host descriptor.
+fn forward_terminal_ioctl(
+    memory: &mut GuestMemory,
+    host_fd: RawFd,
+    request: libc::c_ulong,
+    out_addr: u64,
+    out_len: usize,
+) -> i64 {
+    let mut buf = vec![0u8; out_len];
+    // SAFETY: `buf` is `out_len` bytes long, and each of these fixed-size
+    // terminal-query ioctls writes at most that many bytes into the buffer.
+    let ret = unsafe { libc::ioctl(host_fd, request, buf.as_mut_ptr()) };
+    if ret < 0 {
+        return io_error(std::io::Error::last_os_error());
+    }
+    write_bytes(memory, out_addr, &buf)
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -16329,6 +16379,76 @@ mod tests {
             ),
             negative_errno(libc::ENODEV)
         );
+    }
+
+    #[test]
+    fn ioctl_terminal_queries_report_real_tty_ness() {
+        // A real terminal answers TCGETS/TIOCGWINSZ successfully; a non-terminal
+        // descriptor answers ENOTTY. The executor must forward these ioctls to
+        // the host descriptor and report the real answer, so a guest's isatty()
+        // matches the ptrace backend instead of always seeing a non-tty.
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+
+        // Open a pseudo-terminal; the slave end is a real tty.
+        let mut master: libc::c_int = -1;
+        let mut slave: libc::c_int = -1;
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(rc, 0, "openpty failed: {}", std::io::Error::last_os_error());
+
+        // Guest fd 3 -> the tty slave; guest fd 4 -> /dev/null (not a tty).
+        // SAFETY: `slave` is a freshly opened, owned fd handed to the File.
+        state
+            .files
+            .insert(3, unsafe { std::fs::File::from_raw_fd(slave) });
+        state
+            .files
+            .insert(4, std::fs::File::open("/dev/null").unwrap());
+
+        let memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let mut executor = ElfExecutor::new(state, false);
+
+        // TCGETS on the tty succeeds -> isatty() == true.
+        assert_eq!(
+            executor.execute(
+                &SyscallRequest::new(libc::SYS_ioctl as u64, [3, libc::TCGETS, 0x100, 0, 0, 0]),
+                &memory,
+            ),
+            0,
+        );
+        // TIOCGWINSZ on the tty succeeds.
+        assert_eq!(
+            executor.execute(
+                &SyscallRequest::new(
+                    libc::SYS_ioctl as u64,
+                    [3, libc::TIOCGWINSZ, 0x100, 0, 0, 0]
+                ),
+                &memory,
+            ),
+            0,
+        );
+        // TCGETS on a non-tty forwards to the host and reports the real ENOTTY,
+        // so isatty() stays false for pipes/files (piped output is unchanged).
+        assert_eq!(
+            executor.execute(
+                &SyscallRequest::new(libc::SYS_ioctl as u64, [4, libc::TCGETS, 0x100, 0, 0, 0]),
+                &memory,
+            ),
+            negative_errno(libc::ENOTTY),
+        );
+
+        // SAFETY: `master` is the still-open master end owned by this test.
+        unsafe {
+            libc::close(master);
+        }
     }
 
     #[test]
