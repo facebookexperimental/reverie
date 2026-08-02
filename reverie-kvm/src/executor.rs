@@ -3864,12 +3864,10 @@ fn poll(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i
 
 // TODO-HUMAN-REVIEW(PR-172): Review host-blocking KVM ppoll timeout and signal-mask semantics.
 fn ppoll(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
-    if args[3] != 0 {
-        if args[4] != KERNEL_SIGSET_SIZE as u64 {
-            return negative_errno(libc::EINVAL);
-        }
-        return negative_errno(libc::ENOSYS);
-    }
+    // Validate the timeout up front for every ppoll, mirroring detcore's
+    // handle_ppoll (hermit detcore/src/syscalls/io.rs:824-828): the kernel
+    // rejects a malformed timeout (bad pointer or out-of-range nanoseconds)
+    // regardless of whether a signal mask is present.
     let timeout = if args[2] == 0 {
         -1
     } else {
@@ -3885,6 +3883,37 @@ fn ppoll(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> 
             .saturating_add((timeout.tv_nsec as u128).div_ceil(1_000_000));
         milliseconds.min(libc::c_int::MAX as u128) as libc::c_int
     };
+    if args[3] != 0 {
+        if args[4] != KERNEL_SIGSET_SIZE as u64 {
+            return negative_errno(libc::EINVAL);
+        }
+        // The kernel copies the signal mask out of user space (copy_from_user)
+        // before it polls, so an unreadable mask pointer must fault with EFAULT
+        // rather than return a readiness result. Detcore's golden
+        // prepare_ppoll_probe does the same via read_value(signal_mask)? (hermit
+        // detcore/src/syscalls/io.rs:874-892). Observe the mask here to
+        // reproduce that fault semantics; its value is deliberately not applied
+        // across the wait (see the note below), but a bogus pointer can never be
+        // serviced as ready.
+        let mut signal_mask = [0u8; KERNEL_SIGSET_SIZE];
+        if memory.read(args[3], &mut signal_mask).is_err() {
+            return negative_errno(libc::EFAULT);
+        }
+        // A masked ppoll mirrors detcore's handle_internal_ppoll (hermit
+        // detcore/src/syscalls/io.rs:922-939): a zero-timeout probe can honor a
+        // temporary signal mask atomically, but keeping the mask active across a
+        // parked wait would require scheduler-level pending-signal state. So
+        // probe non-blocking and fail closed with ENOSYS only when the call
+        // would have blocked (nothing ready). The mask cannot affect an
+        // instantaneous poll, so a plain non-blocking poll reproduces the kernel
+        // result: a ready descriptor returns its count exactly as the unmasked
+        // path would, and a poll/read error propagates unchanged.
+        let ready = poll_with_timeout(memory, state, args, 0);
+        if ready == 0 {
+            return negative_errno(libc::ENOSYS);
+        }
+        return ready;
+    }
     poll_with_timeout(memory, state, args, timeout)
 }
 
@@ -11614,6 +11643,221 @@ mod tests {
                 .objects
                 .is_empty()
         );
+    }
+
+    /// A masked `ppoll` must return the ready count when a descriptor is already
+    /// readable (the `ppoll_readv` corpus cell), yet fail closed with `ENOSYS`
+    /// when it would have to block with the mask applied (the `ppoll_simulation`
+    /// contract). Mirrors detcore handle_internal_ppoll
+    /// (hermit detcore/src/syscalls/io.rs:922-939).
+    #[test]
+    fn ppoll_masked_ready_returns_count_and_blocking_fails_closed() {
+        const PIPE_FDS: u64 = 0x100;
+        const PAYLOAD: u64 = 0x200;
+        const READ_BUFFER: u64 = 0x280;
+        const POLL_FD: u64 = 0x300;
+        const POLL_TIMEOUT: u64 = 0x400;
+        const SIGNAL_MASK: u64 = 0x480;
+        // An address well past the single-page guest mapping [0, PAGE_SIZE): a
+        // read of KERNEL_SIGSET_SIZE bytes here fails `checked_offset`, so the
+        // masked path must fault (EFAULT) instead of servicing the poll.
+        const BAD_SIGNAL_MASK: u64 = 0x00f0_0000;
+
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+
+        // Block SIGUSR1: a realistic non-empty mask. Its value cannot affect a
+        // non-blocking poll, so it only proves the masked path is taken.
+        let mask = 1_u64 << (libc::SIGUSR1 as u64 - 1);
+        memory.write(SIGNAL_MASK, &mask.to_ne_bytes()).unwrap();
+        memory.write(PAYLOAD, b"x").unwrap();
+
+        // Create a pipe and make its read end readable.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_pipe,
+                [PIPE_FDS, 0, 0, 0, 0, 0],
+            ),
+            0
+        );
+        let pipe_fds: [libc::c_int; 2] = read_struct(&memory, PIPE_FDS);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_write,
+                [pipe_fds[1] as u64, PAYLOAD, 1, 0, 0, 0],
+            ),
+            1
+        );
+
+        let readable = libc::pollfd {
+            fd: pipe_fds[0],
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let long_timeout = libc::timespec {
+            tv_sec: 5,
+            tv_nsec: 0,
+        };
+        assert_eq!(write_struct(&mut memory, POLL_TIMEOUT, &long_timeout), 0);
+
+        // Masked ppoll on a ready descriptor returns the ready count. Before this
+        // fix the masked branch returned ENOSYS unconditionally.
+        assert_eq!(write_struct(&mut memory, POLL_FD, &readable), 0);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_ppoll,
+                [
+                    POLL_FD,
+                    1,
+                    POLL_TIMEOUT,
+                    SIGNAL_MASK,
+                    KERNEL_SIGSET_SIZE as u64,
+                    0,
+                ],
+            ),
+            1
+        );
+        let polled: libc::pollfd = read_struct(&memory, POLL_FD);
+        assert_eq!(polled.revents & libc::POLLIN, libc::POLLIN);
+
+        // NEGATIVE CONTROL: an otherwise-serviceable masked ppoll (ready fd,
+        // valid timeout, correct sigset size) whose mask pointer is unreadable
+        // must fault with EFAULT, mirroring the kernel's copy_from_user. This is
+        // the case that distinguishes reading the mask from merely checking its
+        // presence: with the mask read removed the descriptor is still ready and
+        // the call would return 1, so this assertion fails closed and pins the
+        // EFAULT path in place.
+        assert_eq!(write_struct(&mut memory, POLL_FD, &readable), 0);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_ppoll,
+                [
+                    POLL_FD,
+                    1,
+                    POLL_TIMEOUT,
+                    BAD_SIGNAL_MASK,
+                    KERNEL_SIGSET_SIZE as u64,
+                    0,
+                ],
+            ),
+            negative_errno(libc::EFAULT)
+        );
+
+        // A wrong sigset size is rejected before any polling.
+        assert_eq!(write_struct(&mut memory, POLL_FD, &readable), 0);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_ppoll,
+                [
+                    POLL_FD,
+                    1,
+                    POLL_TIMEOUT,
+                    SIGNAL_MASK,
+                    (KERNEL_SIGSET_SIZE - 1) as u64,
+                    0,
+                ],
+            ),
+            negative_errno(libc::EINVAL)
+        );
+
+        // A malformed timeout is rejected even when a mask is present.
+        let bad_timeout = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 1_000_000_000,
+        };
+        assert_eq!(write_struct(&mut memory, POLL_TIMEOUT, &bad_timeout), 0);
+        assert_eq!(write_struct(&mut memory, POLL_FD, &readable), 0);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_ppoll,
+                [
+                    POLL_FD,
+                    1,
+                    POLL_TIMEOUT,
+                    SIGNAL_MASK,
+                    KERNEL_SIGSET_SIZE as u64,
+                    0,
+                ],
+            ),
+            negative_errno(libc::EINVAL)
+        );
+
+        // Drain the pipe so the read end would block.
+        let mut byte = [0; 1];
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_read,
+                [pipe_fds[0] as u64, READ_BUFFER, 1, 0, 0, 0],
+            ),
+            1
+        );
+        memory.read(READ_BUFFER, &mut byte).unwrap();
+        assert_eq!(&byte, b"x");
+
+        let short_timeout = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 1_000_000,
+        };
+        assert_eq!(write_struct(&mut memory, POLL_TIMEOUT, &short_timeout), 0);
+
+        // Masked ppoll that would block fails closed with ENOSYS.
+        assert_eq!(write_struct(&mut memory, POLL_FD, &readable), 0);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_ppoll,
+                [
+                    POLL_FD,
+                    1,
+                    POLL_TIMEOUT,
+                    SIGNAL_MASK,
+                    KERNEL_SIGSET_SIZE as u64,
+                    0,
+                ],
+            ),
+            negative_errno(libc::ENOSYS)
+        );
+
+        // The unmasked path on the same empty descriptor times out (0), never
+        // ENOSYS -- only the masked path fails closed.
+        assert_eq!(write_struct(&mut memory, POLL_FD, &readable), 0);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_ppoll,
+                [POLL_FD, 1, POLL_TIMEOUT, 0, 0, 0],
+            ),
+            0
+        );
+
+        for fd in pipe_fds {
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_close,
+                    [fd as u64, 0, 0, 0, 0, 0],
+                ),
+                0
+            );
+        }
     }
 
     #[test]
