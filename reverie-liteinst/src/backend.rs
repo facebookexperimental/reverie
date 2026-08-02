@@ -21,6 +21,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
 use reverie::Backend;
+use reverie::BackendStatsRequest;
 use reverie::Error;
 use reverie::ExitStatus;
 use reverie::GlobalTool;
@@ -247,12 +248,13 @@ impl LiteinstBackend {
         let preload = configure_host_command(&mut command, preload.into())?;
         let tracer = TracerBuilder::<T>::new(command)
             .config(config)
-            .liteinst_runtime(
+            .liteinst_runtime_with_stats(
                 preload,
                 crate::runtime::HOST_BEGIN_MARKER,
                 crate::runtime::HOST_READY_MARKER,
                 crate::runtime::HOST_HELPER_RETURN_MARKER,
                 crate::runtime::HOST_SYSCALL_MARKER,
+                BackendStatsRequest::ENABLED,
             )
             .spawn()
             .await?;
@@ -317,12 +319,13 @@ impl LiteinstBackend {
         let preload = configure_host_command(&mut command, preload.into())?;
         let tracer = TracerBuilder::<T>::new(command)
             .config(config)
-            .liteinst_runtime(
+            .liteinst_runtime_with_stats(
                 preload,
                 crate::runtime::HOST_BEGIN_MARKER,
                 crate::runtime::HOST_READY_MARKER,
                 crate::runtime::HOST_HELPER_RETURN_MARKER,
                 crate::runtime::HOST_SYSCALL_MARKER,
+                BackendStatsRequest::ENABLED,
             )
             .spawn()
             .await?;

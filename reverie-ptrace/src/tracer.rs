@@ -44,6 +44,7 @@ use nix::sys::signal;
 use nix::sys::signal::Signal;
 use nix::unistd;
 use nix::unistd::ForkResult;
+use reverie::BackendStatsRequest;
 use reverie::Errno;
 use reverie::Error;
 use reverie::ExitStatus;
@@ -1874,12 +1875,32 @@ impl<T: Tool + 'static> TracerBuilder<T> {
     /// Dynamic mode currently fails closed if the tracee forks or adds a thread.
     // TODO-HUMAN-REVIEW(PR-270): Review dynamic LiteInst provenance API.
     pub fn liteinst_runtime(
+        self,
+        preload: impl Into<PathBuf>,
+        begin_marker: u64,
+        ready_marker: u64,
+        helper_return_marker: u64,
+        syscall_marker: u64,
+    ) -> Self {
+        self.liteinst_runtime_with_stats(
+            preload,
+            begin_marker,
+            ready_marker,
+            helper_return_marker,
+            syscall_marker,
+            BackendStatsRequest::DISABLED,
+        )
+    }
+
+    /// Enables the dynamic LiteInst runtime and optionally collects patch statistics.
+    pub fn liteinst_runtime_with_stats(
         mut self,
         preload: impl Into<PathBuf>,
         begin_marker: u64,
         ready_marker: u64,
         helper_return_marker: u64,
         syscall_marker: u64,
+        stats_request: BackendStatsRequest,
     ) -> Self {
         self.liteinst_runtime = Some(LiteinstRuntimeConfig {
             preload: preload.into(),
@@ -1889,7 +1910,9 @@ impl<T: Tool + 'static> TracerBuilder<T> {
             syscall_marker,
             newborn_tracees: Arc::new(StdMutex::new(HashMap::new())),
             held_root_stop: Arc::new(StdMutex::new(None)),
-            instrumentation_stats: Arc::new(StdMutex::new(LiteinstInstrumentationStats::default())),
+            instrumentation_stats: stats_request
+                .is_enabled()
+                .then(|| Arc::new(StdMutex::new(LiteinstInstrumentationStats::default()))),
             #[cfg(test)]
             fail_preinit: false,
             #[cfg(test)]
@@ -2221,7 +2244,7 @@ impl<T: Tool + 'static> TracerBuilder<T> {
         let liteinst_instrumentation_stats = self
             .liteinst_runtime
             .as_ref()
-            .map(|runtime| Arc::clone(&runtime.instrumentation_stats));
+            .and_then(|runtime| runtime.instrumentation_stats.as_ref().map(Arc::clone));
         #[cfg(test)]
         let fail_discovery_once = self
             .liteinst_runtime
@@ -2677,6 +2700,38 @@ mod tests {
         fn subscriptions(_config: &()) -> Subscription {
             Subscription::none()
         }
+    }
+
+    #[test]
+    fn liteinst_stats_collector_is_allocated_only_when_requested() {
+        let disabled = TracerBuilder::<InitFailureTool>::new(Command::new("/bin/true"))
+            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4);
+        assert!(
+            disabled
+                .liteinst_runtime
+                .as_ref()
+                .unwrap()
+                .instrumentation_stats
+                .is_none()
+        );
+
+        let enabled = TracerBuilder::<InitFailureTool>::new(Command::new("/bin/true"))
+            .liteinst_runtime_with_stats(
+                PathBuf::from("/not/used.so"),
+                1,
+                2,
+                3,
+                4,
+                BackendStatsRequest::ENABLED,
+            );
+        assert!(
+            enabled
+                .liteinst_runtime
+                .as_ref()
+                .unwrap()
+                .instrumentation_stats
+                .is_some()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

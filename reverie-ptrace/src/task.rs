@@ -515,7 +515,7 @@ pub(crate) struct LiteinstRuntimeConfig {
     pub(crate) syscall_marker: u64,
     pub(crate) newborn_tracees: Arc<StdMutex<HashMap<Pid, NewbornTracee>>>,
     pub(crate) held_root_stop: Arc<StdMutex<Option<HeldRootStop>>>,
-    pub(crate) instrumentation_stats: Arc<StdMutex<LiteinstInstrumentationStats>>,
+    pub(crate) instrumentation_stats: Option<Arc<StdMutex<LiteinstInstrumentationStats>>>,
     #[cfg(test)]
     pub(crate) fail_preinit: bool,
     #[cfg(test)]
@@ -3225,12 +3225,13 @@ impl<L: Tool + 'static> TracedTask<L> {
         } else {
             LiteinstPatchOutcome::PtraceOtherFallback
         };
-        if let Some(config) = self.global_state.liteinst_runtime.as_ref() {
-            config
-                .instrumentation_stats
-                .lock()
-                .unwrap()
-                .record_site(site, outcome, shape);
+        if let Some(stats) = self
+            .global_state
+            .liteinst_runtime
+            .as_ref()
+            .and_then(|config| config.instrumentation_stats.as_ref())
+        {
+            stats.lock().unwrap().record_site(site, outcome, shape);
         }
     }
 
@@ -3300,13 +3301,14 @@ impl<L: Tool + 'static> TracedTask<L> {
         {
             return None;
         }
-        self.global_state
+        if let Some(stats) = self
+            .global_state
             .liteinst_runtime
             .as_ref()?
             .instrumentation_stats
-            .lock()
-            .unwrap()
-            .record_site(
+            .as_ref()
+        {
+            stats.lock().unwrap().record_site(
                 result.site_start,
                 LiteinstPatchOutcome::RelocatedPatched,
                 Some((
@@ -3314,6 +3316,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                     (straddle_prefix != 0).then_some(straddle_prefix),
                 )),
             );
+        }
         Some((
             result.relocated_tail,
             ActiveHookFootprint {
