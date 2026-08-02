@@ -4509,6 +4509,20 @@ fn setsockopt(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) ->
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-230): Review bounded SO_TYPE copy-out semantics.
+/// Retain the logical TCP state and negotiated option header while hiding all
+/// host timing, rate, packet, and byte counters. Mirrors detcore
+/// `canonicalize_tcp_info` (hermit/detcore/src/syscalls/files.rs:95): keep only
+/// the bytes at offsets 0, 1, 5, and 6 (`tcpi_state`, `tcpi_ca_state`,
+/// `tcpi_options`, and the packed `tcpi_snd/rcv_wscale` nibbles) and zero
+/// everything else, so the guest observes a deterministic connection header.
+fn canonicalize_tcp_info(info: &mut [u8]) {
+    for (offset, byte) in info.iter_mut().enumerate() {
+        if !matches!(offset, 0 | 1 | 5 | 6) {
+            *byte = 0;
+        }
+    }
+}
+
 fn getsockopt(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
     let guest_fd = args[0] as libc::c_int;
     let Some(host_fd) = host_fd(state, guest_fd) else {
@@ -4524,6 +4538,47 @@ fn getsockopt(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]
     if capacity > MAX_HOST_IO {
         return negative_errno(libc::EINVAL);
     }
+
+    // TODO-HUMAN-REVIEW(PR-350): Review deterministic TCP_INFO canonicalization.
+    // Golden `handle_getsockopt` (hermit/detcore/src/syscalls/files.rs:2009)
+    // forwards the call to the kernel, then `canonicalize_tcp_info`
+    // (files.rs:95) retains only the logical connection header and zeroes every
+    // host timing, rate, packet, and byte counter. Mirror that here: forward to
+    // the host and canonicalize the returned bytes before copying into the
+    // guest. This implements the already-established detcore strategy on the KVM
+    // executor (routine golden-ptrace parity), not a new determinization.
+    if args[1] as libc::c_int == libc::IPPROTO_TCP && args[2] as libc::c_int == libc::TCP_INFO {
+        if capacity != 0 && args[3] == 0 {
+            return negative_errno(libc::EFAULT);
+        }
+        let mut value = vec![0; capacity];
+        let value_pointer = if value.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            value.as_mut_ptr().cast::<libc::c_void>()
+        };
+        // SAFETY: value_pointer is null for a zero-length request or writable
+        // for capacity bytes; host_fd belongs to the guest descriptor table.
+        if unsafe {
+            libc::getsockopt(
+                host_fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_INFO,
+                value_pointer,
+                &mut length,
+            )
+        } != 0
+        {
+            return io_error(std::io::Error::last_os_error());
+        }
+        let copy_length = capacity.min(length as usize);
+        canonicalize_tcp_info(&mut value[..copy_length]);
+        if copy_length != 0 && memory.write(args[3], &value[..copy_length]).is_err() {
+            return negative_errno(libc::EFAULT);
+        }
+        return write_struct(memory, args[4], &length);
+    }
+
     if args[1] as libc::c_int != libc::SOL_SOCKET {
         return negative_errno(libc::ENOPROTOOPT);
     }
@@ -12183,6 +12238,159 @@ mod tests {
             ),
             0
         );
+    }
+
+    #[test]
+    fn getsockopt_tcp_info_is_canonicalized() {
+        const BIND_ADDRESS: u64 = 0x100;
+        const NAME_ADDRESS: u64 = 0x200;
+        const NAME_LENGTH: u64 = 0x300;
+        const CONNECT_ADDRESS: u64 = 0x400;
+        const INFO_ADDRESS: u64 = 0x500;
+        const INFO_LENGTH: u64 = 0x900;
+
+        let sockaddr_len = std::mem::size_of::<libc::sockaddr_in>();
+        let loopback = libc::sockaddr_in {
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: 0,
+            sin_addr: libc::in_addr {
+                s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+            },
+            sin_zero: [0; 8],
+        };
+
+        let root = TestDir::new();
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        assert_eq!(write_struct(&mut memory, BIND_ADDRESS, &loopback), 0);
+        let mut executor = ElfExecutor::new(test_state(&root.0), false);
+
+        // Establish a live AF_INET loopback connection (depends on the connect
+        // lift): socket -> bind(127.0.0.1:0) -> listen -> getsockname -> socket
+        // -> connect -> accept4.
+        let server = executor.execute(
+            &SyscallRequest::new(
+                libc::SYS_socket as u64,
+                [libc::AF_INET as u64, libc::SOCK_STREAM as u64, 0, 0, 0, 0],
+            ),
+            &memory,
+        );
+        assert_eq!(server, 3);
+        assert_eq!(
+            executor.execute(
+                &SyscallRequest::new(
+                    libc::SYS_bind as u64,
+                    [server as u64, BIND_ADDRESS, sockaddr_len as u64, 0, 0, 0],
+                ),
+                &memory,
+            ),
+            0
+        );
+        assert_eq!(
+            executor.execute(
+                &SyscallRequest::new(libc::SYS_listen as u64, [server as u64, 1, 0, 0, 0, 0]),
+                &memory,
+            ),
+            0
+        );
+        assert_eq!(
+            write_struct(&mut memory, NAME_LENGTH, &(sockaddr_len as libc::socklen_t)),
+            0
+        );
+        assert_eq!(
+            executor.execute(
+                &SyscallRequest::new(
+                    libc::SYS_getsockname as u64,
+                    [server as u64, NAME_ADDRESS, NAME_LENGTH, 0, 0, 0],
+                ),
+                &memory,
+            ),
+            0
+        );
+        let bound: libc::sockaddr_in = read_struct(&memory, NAME_ADDRESS);
+        assert_ne!(bound.sin_port, 0);
+        let connect_address = libc::sockaddr_in {
+            sin_port: bound.sin_port,
+            ..loopback
+        };
+        assert_eq!(
+            write_struct(&mut memory, CONNECT_ADDRESS, &connect_address),
+            0
+        );
+        let client = executor.execute(
+            &SyscallRequest::new(
+                libc::SYS_socket as u64,
+                [libc::AF_INET as u64, libc::SOCK_STREAM as u64, 0, 0, 0, 0],
+            ),
+            &memory,
+        );
+        assert_eq!(client, 4);
+        assert_eq!(
+            executor.execute(
+                &SyscallRequest::new(
+                    libc::SYS_connect as u64,
+                    [client as u64, CONNECT_ADDRESS, sockaddr_len as u64, 0, 0, 0],
+                ),
+                &memory,
+            ),
+            0
+        );
+        let accepted = executor.execute(
+            &SyscallRequest::new(libc::SYS_accept4 as u64, [server as u64, 0, 0, 0, 0, 0]),
+            &memory,
+        );
+        assert_eq!(accepted, 5);
+
+        // The behavior under test: getsockopt(IPPROTO_TCP, TCP_INFO) on the
+        // established client socket forwards to the host, then canonicalizes.
+        let info_size = std::mem::size_of::<libc::tcp_info>();
+        assert_eq!(
+            write_struct(&mut memory, INFO_LENGTH, &(info_size as libc::socklen_t)),
+            0
+        );
+        assert_eq!(
+            executor.execute(
+                &SyscallRequest::new(
+                    libc::SYS_getsockopt as u64,
+                    [
+                        client as u64,
+                        libc::IPPROTO_TCP as u64,
+                        libc::TCP_INFO as u64,
+                        INFO_ADDRESS,
+                        INFO_LENGTH,
+                        0,
+                    ],
+                ),
+                &memory,
+            ),
+            0
+        );
+        let returned_len: libc::socklen_t = read_struct(&memory, INFO_LENGTH);
+        let returned_len = returned_len as usize;
+        // The kernel returns a nonempty tcp_info no larger than the buffer.
+        assert!(returned_len > 6 && returned_len <= info_size);
+        let mut info = vec![0u8; returned_len];
+        memory.read(INFO_ADDRESS, &mut info).unwrap();
+        // tcpi_state (offset 0) is retained: a completed connect is
+        // TCP_ESTABLISHED (1), proving a real host tcp_info was read, not zeroed
+        // by an error path.
+        assert_eq!(info[0], 1, "tcpi_state should be TCP_ESTABLISHED");
+        // Canonicalization: every byte outside the retained header offsets
+        // {0,1,5,6} is zeroed, hiding host timing/rate/counter nondeterminism.
+        for (offset, byte) in info.iter().enumerate() {
+            if !matches!(offset, 0 | 1 | 5 | 6) {
+                assert_eq!(*byte, 0, "byte at offset {offset} should be canonicalized");
+            }
+        }
+
+        for fd in [accepted, client, server] {
+            assert_eq!(
+                executor.execute(
+                    &SyscallRequest::new(libc::SYS_close as u64, [fd as u64, 0, 0, 0, 0, 0]),
+                    &memory,
+                ),
+                0
+            );
+        }
     }
 
     #[test]
