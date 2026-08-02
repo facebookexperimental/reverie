@@ -446,6 +446,21 @@ mod tests {
     }
 
     #[test]
+    fn inherited_guest_mapping_updates_every_slow_path() {
+        let stats = SabreStats::create(BackendStatsRequest::ENABLED)
+            .unwrap()
+            .unwrap();
+        let guest = unsafe { SabreGuestStats::from_inherited_fd(stats.raw_fd()) }.unwrap();
+
+        for path in SLOW_PATHS {
+            guest.increment_slow_path(path);
+        }
+
+        let expected = SLOW_PATHS.map(|path| (path, 1));
+        assert_eq!(stats.backend_stats().slow_paths.counts(), &expected);
+    }
+
+    #[test]
     fn snapshot_preserves_process_aware_counts_and_enum_order() {
         let stats = SabreStats::create(BackendStatsRequest::ENABLED)
             .unwrap()

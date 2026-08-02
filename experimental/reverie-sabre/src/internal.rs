@@ -64,9 +64,6 @@ pub fn sbr_init<T: ToolGlobal>(
     client_path: *const libc::c_char,
 ) {
     unsafe {
-        // Preserve private settings for exec before consuming this image's
-        // inherited stats descriptor.
-        paths::cache_tool_env();
         stats::init_guest_stats();
         *vdso_callback = Some(callbacks::handle_vdso::<T>);
         *syscall_handler = Some(callbacks::handle_syscall::<T>);

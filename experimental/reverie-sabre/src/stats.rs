@@ -21,6 +21,11 @@ static GUEST_STATS: OnceLock<Option<SabreGuestStats>> = OnceLock::new();
 
 pub(crate) fn init_guest_stats() {
     GUEST_STATS.get_or_init(|| {
+        // Keep the disabled path on the established lazy tool initialization
+        // order. Eagerly caching every private setting can otherwise run before
+        // the coordinator socket is consumed by the process-local Tool.
+        std::env::var_os(BACKEND_STATS_ENV)?;
+        paths::cache_tool_env();
         let value = unsafe { paths::take_private_env(BACKEND_STATS_ENV) }?;
         let fd = std::str::from_utf8(value.as_os_str().as_bytes())
             .ok()?
