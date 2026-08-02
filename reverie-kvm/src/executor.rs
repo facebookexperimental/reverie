@@ -796,6 +796,10 @@ fn execute_basic_syscall_with_output(
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-232): Review task-local robust-list registration.
         set_robust_list(state, args)
+    } else if number == libc::SYS_seccomp as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-344): Review deterministic seccomp unavailability.
+        seccomp(args)
     } else {
         negative_errno(libc::ENOSYS)
     };
@@ -7379,6 +7383,47 @@ fn close(state: &mut LoadedStaticElf, raw_fd: u64) -> i64 {
 // exec instead of closing it. The scan is bounded to the descriptors actually
 // open (keys of `state.files` plus any open standard fd), so a `last == U32::MAX`
 // request never walks a four-billion-wide interval.
+/// Deterministic `seccomp(2)` result, mirroring detcore's reviewed
+/// `seccomp_result` (hermit `detcore/src/syscalls/misc.rs`). Hermit cannot
+/// enforce a guest-installed BPF policy across every backend, so any operation
+/// that survives argument validation is reported as unsupported (`EOPNOTSUPP`)
+/// rather than claiming a filter was installed. The validation arms replicate
+/// the kernel's argument checks so a guest capability probe — for example
+/// `SECCOMP_GET_NOTIF_SIZES` — observes exactly the same errno under KVM as it
+/// does under the golden ptrace backend.
+fn seccomp(args: &[u64; 6]) -> i64 {
+    const SECCOMP_SET_MODE_STRICT: u32 = 0;
+    const SECCOMP_SET_MODE_FILTER: u32 = 1;
+    const SECCOMP_GET_ACTION_AVAIL: u32 = 2;
+    const SECCOMP_GET_NOTIF_SIZES: u32 = 3;
+    const SECCOMP_FILTER_FLAG_TSYNC: u32 = 1;
+
+    // The kernel treats `operation` and `flags` as unsigned ints; truncating
+    // the raw 64-bit hypercall arguments matches that width.
+    let op = args[0] as u32;
+    let flags = args[1] as u32;
+    let has_args = args[2] != 0;
+
+    if op > SECCOMP_GET_NOTIF_SIZES {
+        return negative_errno(libc::EINVAL);
+    }
+    if op == SECCOMP_SET_MODE_STRICT && (flags != 0 || has_args) {
+        return negative_errno(libc::EINVAL);
+    }
+    if op == SECCOMP_SET_MODE_FILTER && flags & !SECCOMP_FILTER_FLAG_TSYNC != 0 {
+        return negative_errno(libc::EINVAL);
+    }
+    if matches!(
+        op,
+        SECCOMP_SET_MODE_FILTER | SECCOMP_GET_ACTION_AVAIL | SECCOMP_GET_NOTIF_SIZES
+    ) && !has_args
+    {
+        return negative_errno(libc::EFAULT);
+    }
+
+    negative_errno(libc::EOPNOTSUPP)
+}
+
 fn close_range(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
     const CLOSE_RANGE_UNSHARE: u64 = 1 << 1;
     const CLOSE_RANGE_CLOEXEC: u64 = 1 << 2;
@@ -9905,6 +9950,123 @@ mod tests {
             "CLOSE_RANGE_CLOEXEC must not close the descriptor"
         );
         assert!(state.cloexec_fds.contains(&(fd as i32)));
+    }
+
+    #[test]
+    fn seccomp_reports_unsupported_matching_detcore() {
+        const SECCOMP_SET_MODE_STRICT: u64 = 0;
+        const SECCOMP_SET_MODE_FILTER: u64 = 1;
+        const SECCOMP_GET_ACTION_AVAIL: u64 = 2;
+        const SECCOMP_GET_NOTIF_SIZES: u64 = 3;
+        const SECCOMP_FILTER_FLAG_TSYNC: u64 = 1;
+        const ARGS_PTR: u64 = 0x1000;
+
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, 0x4000).unwrap();
+
+        // The capability probe exercised by syscall_quick_wins.c: a
+        // SECCOMP_GET_NOTIF_SIZES query with a non-null output buffer resolves
+        // to EOPNOTSUPP, exactly as the golden ptrace/detcore backend reports.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_seccomp,
+                [SECCOMP_GET_NOTIF_SIZES, 0, ARGS_PTR, 0, 0, 0],
+            ),
+            negative_errno(libc::EOPNOTSUPP)
+        );
+
+        // An unknown operation is rejected with EINVAL before the unsupported
+        // fallthrough.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_seccomp,
+                [SECCOMP_GET_NOTIF_SIZES + 1, 0, ARGS_PTR, 0, 0, 0],
+            ),
+            negative_errno(libc::EINVAL)
+        );
+
+        // SECCOMP_SET_MODE_STRICT must carry no flags and no args pointer.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_seccomp,
+                [SECCOMP_SET_MODE_STRICT, 1, 0, 0, 0, 0],
+            ),
+            negative_errno(libc::EINVAL)
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_seccomp,
+                [SECCOMP_SET_MODE_STRICT, 0, ARGS_PTR, 0, 0, 0],
+            ),
+            negative_errno(libc::EINVAL)
+        );
+        // The strict-mode success path (no flags, no args) still reports the
+        // backend-wide unsupported result rather than installing a policy.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_seccomp,
+                [SECCOMP_SET_MODE_STRICT, 0, 0, 0, 0, 0],
+            ),
+            negative_errno(libc::EOPNOTSUPP)
+        );
+
+        // SECCOMP_SET_MODE_FILTER rejects unknown flag bits with EINVAL but
+        // accepts the lone TSYNC flag (which then falls through to EFAULT on a
+        // null program pointer, matching the kernel's argument ordering).
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_seccomp,
+                [SECCOMP_SET_MODE_FILTER, 1 << 31, ARGS_PTR, 0, 0, 0],
+            ),
+            negative_errno(libc::EINVAL)
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_seccomp,
+                [
+                    SECCOMP_SET_MODE_FILTER,
+                    SECCOMP_FILTER_FLAG_TSYNC,
+                    0,
+                    0,
+                    0,
+                    0
+                ],
+            ),
+            negative_errno(libc::EFAULT)
+        );
+
+        // Operations that require a non-null argument buffer report EFAULT when
+        // it is null, ahead of the unsupported fallthrough.
+        for op in [
+            SECCOMP_SET_MODE_FILTER,
+            SECCOMP_GET_ACTION_AVAIL,
+            SECCOMP_GET_NOTIF_SIZES,
+        ] {
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_seccomp,
+                    [op, 0, 0, 0, 0, 0],
+                ),
+                negative_errno(libc::EFAULT)
+            );
+        }
     }
 
     #[test]
