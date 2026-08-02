@@ -4626,9 +4626,14 @@ fn bind(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
     );
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-261): Review deterministic AF_NETLINK bind forwarding.
+    // TODO-HUMAN-REVIEW(PR-349): Review host-backed AF_INET6 bind translation.
+    // AF_INET6 is forwarded to the host exactly like AF_INET; Detcore's golden
+    // handle_bind determinizes the port for both families
+    // (hermit detcore/src/syscalls/files.rs:2175) before the syscall reaches
+    // this executor, so the guest-visible port is already deterministic.
     if !matches!(
         family as libc::c_int,
-        libc::AF_INET | libc::AF_UNIX | libc::AF_NETLINK
+        libc::AF_INET | libc::AF_INET6 | libc::AF_UNIX | libc::AF_NETLINK
     ) {
         return negative_errno(libc::EAFNOSUPPORT);
     }
@@ -4806,6 +4811,7 @@ fn socketpair(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64
 
 // TODO-HUMAN-REVIEW(PR-92): Review this KVM compatibility implementation.
 // TODO-HUMAN-REVIEW(PR-217): Review filesystem-backed AF_UNIX connect translation.
+// TODO-HUMAN-REVIEW(PR-349): Review host-backed AF_INET/AF_INET6 connect translation.
 fn connect(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
     let Some(host_fd) = host_fd(state, args[0] as libc::c_int) else {
         return negative_errno(libc::EBADF);
@@ -4815,7 +4821,7 @@ fn connect(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i6
     };
     let length_usize = length as usize;
     if length_usize < std::mem::size_of::<libc::sa_family_t>()
-        || length_usize > std::mem::size_of::<libc::sockaddr_un>()
+        || length_usize > std::mem::size_of::<libc::sockaddr_storage>()
     {
         return negative_errno(libc::EINVAL);
     }
@@ -4828,16 +4834,35 @@ fn connect(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i6
             .try_into()
             .expect("family slice has exact size"),
     );
-    if family != libc::AF_UNIX as libc::sa_family_t {
-        return negative_errno(libc::EAFNOSUPPORT);
-    }
-    let path = &address[std::mem::size_of::<libc::sa_family_t>()..];
-    let path = path.split(|byte| *byte == 0).next().unwrap_or(path);
-    if path == b"/dev/log" {
-        return 0;
+    match family as libc::c_int {
+        libc::AF_UNIX => {
+            // AF_UNIX addresses never exceed sockaddr_un; reject a longer buffer
+            // exactly as the kernel would before touching the path.
+            if length_usize > std::mem::size_of::<libc::sockaddr_un>() {
+                return negative_errno(libc::EINVAL);
+            }
+            let path = &address[std::mem::size_of::<libc::sa_family_t>()..];
+            let path = path.split(|byte| *byte == 0).next().unwrap_or(path);
+            if path == b"/dev/log" {
+                return 0;
+            }
+        }
+        // AF_INET / AF_INET6 connect is forwarded to the host exactly like the
+        // already-supported bind/listen/getsockname INET paths. Detcore's golden
+        // handle_connect (hermit detcore/src/syscalls/io.rs:1138) performs no
+        // address rewriting for connect: it executes the call against the kernel
+        // and only records a best-effort loopback-peer scheduling hint. The
+        // deterministic endpoint identity for a port-zero bind was already
+        // established by handle_bind's RequestPort rewrite
+        // (detcore/src/syscalls/files.rs:2158) before the peer's connect reaches
+        // this executor, so forwarding here introduces no new nondeterministic
+        // surface and matches the ptrace backend's forward-to-host errno.
+        libc::AF_INET | libc::AF_INET6 => {}
+        _ => return negative_errno(libc::EAFNOSUPPORT),
     }
     // SAFETY: address is readable for length bytes and host_fd belongs to the
-    // guest descriptor table. The host kernel validates the Unix address.
+    // guest descriptor table. The host kernel validates the sockaddr for its
+    // family.
     zero_or_errno(unsafe {
         libc::connect(host_fd, address.as_ptr().cast::<libc::sockaddr>(), length)
     })
@@ -11540,6 +11565,230 @@ mod tests {
                 &mut state,
                 libc::SYS_close,
                 [socket_fd as u64, 0, 0, 0, 0, 0],
+            ),
+            0
+        );
+    }
+
+    // Drive a full loopback STREAM handshake through ElfExecutor::execute for
+    // the given INET family, proving connect (which used to return
+    // EAFNOSUPPORT for anything but AF_UNIX) now forwards to the host. The
+    // caller supplies a bind address builder and the sockaddr size; the learned
+    // ephemeral port from getsockname is fed back into the connect address.
+    fn assert_inet_loopback_handshake(domain: libc::c_int, sockaddr_len: usize) {
+        const BIND_ADDRESS: u64 = 0x100;
+        const NAME_ADDRESS: u64 = 0x200;
+        const NAME_LENGTH: u64 = 0x300;
+        const CONNECT_ADDRESS: u64 = 0x400;
+        const PAYLOAD: u64 = 0x500;
+
+        let loopback_v4 = libc::sockaddr_in {
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: 0,
+            sin_addr: libc::in_addr {
+                s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+            },
+            sin_zero: [0; 8],
+        };
+        let loopback_v6 = libc::sockaddr_in6 {
+            sin6_family: libc::AF_INET6 as libc::sa_family_t,
+            sin6_port: 0,
+            sin6_flowinfo: 0,
+            sin6_addr: {
+                let mut octets = [0u8; 16];
+                octets[15] = 1; // ::1
+                libc::in6_addr { s6_addr: octets }
+            },
+            sin6_scope_id: 0,
+        };
+
+        let root = TestDir::new();
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        if domain == libc::AF_INET {
+            assert_eq!(write_struct(&mut memory, BIND_ADDRESS, &loopback_v4), 0);
+        } else {
+            assert_eq!(write_struct(&mut memory, BIND_ADDRESS, &loopback_v6), 0);
+        }
+        let mut executor = ElfExecutor::new(test_state(&root.0), false);
+
+        let server = executor.execute(
+            &SyscallRequest::new(
+                libc::SYS_socket as u64,
+                [domain as u64, libc::SOCK_STREAM as u64, 0, 0, 0, 0],
+            ),
+            &memory,
+        );
+        assert_eq!(server, 3);
+        assert_eq!(
+            executor.execute(
+                &SyscallRequest::new(
+                    libc::SYS_bind as u64,
+                    [server as u64, BIND_ADDRESS, sockaddr_len as u64, 0, 0, 0],
+                ),
+                &memory,
+            ),
+            0
+        );
+        assert_eq!(
+            executor.execute(
+                &SyscallRequest::new(libc::SYS_listen as u64, [server as u64, 1, 0, 0, 0, 0]),
+                &memory,
+            ),
+            0
+        );
+
+        // Learn the host-assigned ephemeral port and reuse getsockname's exact
+        // (network byte order) port for the client's connect target.
+        assert_eq!(
+            write_struct(&mut memory, NAME_LENGTH, &(sockaddr_len as libc::socklen_t)),
+            0
+        );
+        assert_eq!(
+            executor.execute(
+                &SyscallRequest::new(
+                    libc::SYS_getsockname as u64,
+                    [server as u64, NAME_ADDRESS, NAME_LENGTH, 0, 0, 0],
+                ),
+                &memory,
+            ),
+            0
+        );
+        if domain == libc::AF_INET {
+            let bound: libc::sockaddr_in = read_struct(&memory, NAME_ADDRESS);
+            assert_ne!(bound.sin_port, 0);
+            let connect_address = libc::sockaddr_in {
+                sin_port: bound.sin_port,
+                ..loopback_v4
+            };
+            assert_eq!(
+                write_struct(&mut memory, CONNECT_ADDRESS, &connect_address),
+                0
+            );
+        } else {
+            let bound: libc::sockaddr_in6 = read_struct(&memory, NAME_ADDRESS);
+            assert_ne!(bound.sin6_port, 0);
+            let connect_address = libc::sockaddr_in6 {
+                sin6_port: bound.sin6_port,
+                ..loopback_v6
+            };
+            assert_eq!(
+                write_struct(&mut memory, CONNECT_ADDRESS, &connect_address),
+                0
+            );
+        }
+
+        let client = executor.execute(
+            &SyscallRequest::new(
+                libc::SYS_socket as u64,
+                [domain as u64, libc::SOCK_STREAM as u64, 0, 0, 0, 0],
+            ),
+            &memory,
+        );
+        assert_eq!(client, 4);
+        // The fix under test: AF_INET/AF_INET6 connect used to return
+        // EAFNOSUPPORT. A blocking loopback STREAM connect completes the
+        // handshake in-kernel against the listen backlog.
+        assert_eq!(
+            executor.execute(
+                &SyscallRequest::new(
+                    libc::SYS_connect as u64,
+                    [client as u64, CONNECT_ADDRESS, sockaddr_len as u64, 0, 0, 0],
+                ),
+                &memory,
+            ),
+            0
+        );
+        let accepted = executor.execute(
+            &SyscallRequest::new(libc::SYS_accept4 as u64, [server as u64, 0, 0, 0, 0, 0]),
+            &memory,
+        );
+        assert_eq!(accepted, 5);
+
+        // Move one datagram to prove the accepted connection is live.
+        assert_eq!(write_struct(&mut memory, PAYLOAD, b"ping\0"), 0);
+        assert_eq!(
+            executor.execute(
+                &SyscallRequest::new(
+                    libc::SYS_sendto as u64,
+                    [client as u64, PAYLOAD, 4, 0, 0, 0],
+                ),
+                &memory,
+            ),
+            4
+        );
+        assert_eq!(
+            executor.execute(
+                &SyscallRequest::new(
+                    libc::SYS_recvfrom as u64,
+                    [accepted as u64, PAYLOAD + 8, 4, 0, 0, 0],
+                ),
+                &memory,
+            ),
+            4
+        );
+        let mut received = [0u8; 4];
+        memory.read(PAYLOAD + 8, &mut received).unwrap();
+        assert_eq!(&received, b"ping");
+
+        for fd in [accepted, client, server] {
+            assert_eq!(
+                executor.execute(
+                    &SyscallRequest::new(libc::SYS_close as u64, [fd as u64, 0, 0, 0, 0, 0]),
+                    &memory,
+                ),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn inet_loopback_connect_completes_handshake() {
+        assert_inet_loopback_handshake(libc::AF_INET, std::mem::size_of::<libc::sockaddr_in>());
+    }
+
+    #[test]
+    fn inet6_loopback_connect_completes_handshake() {
+        assert_inet_loopback_handshake(libc::AF_INET6, std::mem::size_of::<libc::sockaddr_in6>());
+    }
+
+    #[test]
+    fn connect_rejects_unsupported_address_family() {
+        const ADDRESS: u64 = 0x100;
+
+        let root = TestDir::new();
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let mut executor = ElfExecutor::new(test_state(&root.0), false);
+
+        let socket_fd = executor.execute(
+            &SyscallRequest::new(
+                libc::SYS_socket as u64,
+                [libc::AF_INET as u64, libc::SOCK_STREAM as u64, 0, 0, 0, 0],
+            ),
+            &memory,
+        );
+        assert_eq!(socket_fd, 3);
+
+        // AF_APPLETALK is a valid family constant the executor does not forward;
+        // connect must still reject it before touching the host, unchanged by
+        // the AF_INET/AF_INET6 lift.
+        let mut address = [0u8; 16];
+        address[..std::mem::size_of::<libc::sa_family_t>()]
+            .copy_from_slice(&(libc::AF_APPLETALK as libc::sa_family_t).to_ne_bytes());
+        memory.write(ADDRESS, &address).unwrap();
+        assert_eq!(
+            executor.execute(
+                &SyscallRequest::new(
+                    libc::SYS_connect as u64,
+                    [socket_fd as u64, ADDRESS, 16, 0, 0, 0],
+                ),
+                &memory,
+            ),
+            negative_errno(libc::EAFNOSUPPORT)
+        );
+        assert_eq!(
+            executor.execute(
+                &SyscallRequest::new(libc::SYS_close as u64, [socket_fd as u64, 0, 0, 0, 0, 0]),
+                &memory,
             ),
             0
         );
