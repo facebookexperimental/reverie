@@ -1,14 +1,15 @@
 [submodule "third-party/dynamorio"]
 	path = third-party/dynamorio
 	url = https://github.com/rrnewton/dynamorio.git
+	update = checkout
 	shallow = true
 [submodule "third-party/sabre"]
 	path = third-party/sabre
 	url = https://github.com/rrnewton/SaBRe.git
-	update = none
+	update = checkout
 	shallow = true
 [submodule "third-party/e9patch"]
 	path = third-party/e9patch
 	url = https://github.com/GJDuck/e9patch.git
-	update = none
+	update = checkout
 	shallow = true
