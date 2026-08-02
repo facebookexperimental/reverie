@@ -4531,6 +4531,44 @@ fn getsockopt(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]
         let result_length = copy_length as libc::socklen_t;
         return write_struct(memory, args[4], &result_length);
     }
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-345): Hermit exposes a single virtual CPU, so
+    // SO_INCOMING_CPU must not leak the host CPU that processed a socket's most
+    // recent packet. Mirror detcore's reviewed handle_getsockopt (hermit
+    // detcore/src/syscalls/files.rs, TODO-HUMAN-REVIEW(PR-898)): forward to the
+    // host for the deterministic option length, then overwrite the CPU id with
+    // a canonical 0.
+    if args[2] as libc::c_int == libc::SO_INCOMING_CPU {
+        let mut value = vec![0; capacity];
+        let value_pointer = if value.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            value.as_mut_ptr().cast::<libc::c_void>()
+        };
+        // SAFETY: value_pointer is null for a zero-length request or writable
+        // for capacity bytes; host_fd belongs to the guest descriptor table.
+        if unsafe {
+            libc::getsockopt(
+                host_fd,
+                libc::SOL_SOCKET,
+                libc::SO_INCOMING_CPU,
+                value_pointer,
+                &mut length,
+            )
+        } != 0
+        {
+            return io_error(std::io::Error::last_os_error());
+        }
+        // Canonicalize the leaked host CPU id to virtual CPU 0, writing at most
+        // the option's returned length (never more than a 32-bit CPU id).
+        let zero_cpu = 0_i32.to_ne_bytes();
+        let copy_length = capacity.min(length as usize).min(zero_cpu.len());
+        if copy_length != 0 && memory.write(args[3], &zero_cpu[..copy_length]).is_err() {
+            return negative_errno(libc::EFAULT);
+        }
+        return write_struct(memory, args[4], &length);
+    }
+
     if args[2] as libc::c_int != libc::SO_TYPE {
         return negative_errno(libc::ENOPROTOOPT);
     }
@@ -11644,6 +11682,70 @@ mod tests {
                     libc::SO_TYPE as u64,
                     RESULT,
                     u64::MAX,
+                    0,
+                ],
+            ),
+            negative_errno(libc::EFAULT)
+        );
+    }
+
+    #[test]
+    fn getsockopt_so_incoming_cpu_is_canonical_zero() {
+        const RESULT: u64 = 0x100;
+        const RESULT_LENGTH: u64 = 0x200;
+
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let socket_fd = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_socket,
+            [libc::AF_INET as u64, libc::SOCK_STREAM as u64, 0, 0, 0, 0],
+        );
+        assert_eq!(socket_fd, 3);
+
+        // Pre-load a non-zero sentinel to prove the handler overwrites whatever
+        // host CPU id the kernel reports with a canonical virtual CPU 0.
+        assert_eq!(write_struct(&mut memory, RESULT, &0x5a5a_5a5a_i32), 0);
+        let full_length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        assert_eq!(write_struct(&mut memory, RESULT_LENGTH, &full_length), 0);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_getsockopt,
+                [
+                    socket_fd as u64,
+                    libc::SOL_SOCKET as u64,
+                    libc::SO_INCOMING_CPU as u64,
+                    RESULT,
+                    RESULT_LENGTH,
+                    0,
+                ],
+            ),
+            0
+        );
+        // Deterministic option length (a 32-bit CPU id) and a canonical 0 value,
+        // matching detcore's handle_getsockopt regardless of the host CPU.
+        assert_eq!(
+            read_struct::<libc::socklen_t>(&memory, RESULT_LENGTH),
+            full_length
+        );
+        assert_eq!(read_struct::<libc::c_int>(&memory, RESULT), 0);
+
+        // A null optlen pointer is rejected before the host is consulted.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_getsockopt,
+                [
+                    socket_fd as u64,
+                    libc::SOL_SOCKET as u64,
+                    libc::SO_INCOMING_CPU as u64,
+                    RESULT,
+                    0,
                     0,
                 ],
             ),
