@@ -4444,10 +4444,20 @@ fn socket(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
     }
     let socket_type = args[1] as libc::c_int;
     let base_type = socket_type & !(libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK);
+    // Detcore's golden handle_socket (hermit detcore/src/syscalls/files.rs:1806)
+    // forwards every socket type to the host and lets the kernel validate the
+    // (family, type) pair. SOCK_SEQPACKET is a valid AF_UNIX type that takes the
+    // exact same socket -> bind(autobind) -> getsockname path as the already
+    // supported SOCK_STREAM/SOCK_DGRAM, so accept it here as well. For AF_INET /
+    // AF_INET6 the host libc::socket call below rejects SOCK_SEQPACKET with
+    // EPROTONOSUPPORT, matching the ptrace backend's forward-to-host result.
     let supported_type = if domain == libc::AF_NETLINK {
         matches!(base_type, libc::SOCK_DGRAM | libc::SOCK_RAW)
     } else {
-        matches!(base_type, libc::SOCK_DGRAM | libc::SOCK_STREAM)
+        matches!(
+            base_type,
+            libc::SOCK_DGRAM | libc::SOCK_STREAM | libc::SOCK_SEQPACKET
+        )
     };
     if !supported_type {
         return negative_errno(libc::EPROTONOSUPPORT);
@@ -11622,6 +11632,101 @@ mod tests {
                 0
             );
         }
+    }
+
+    #[test]
+    fn unix_seqpacket_socket_autobinds_like_stream_and_dgram() {
+        // socket(AF_UNIX, SOCK_SEQPACKET) must take the identical
+        // socket -> bind(autobind) -> getsockname path as the already supported
+        // SOCK_STREAM/SOCK_DGRAM types, mirroring
+        // hermit/tests/c/unix_autobind_seqpacket.c. A bare-family bind (length ==
+        // offsetof(sun_path)) autobinds to an abstract name: a leading NUL byte
+        // followed by five lowercase hex digits.
+        const ADDRESS: u64 = 0x100;
+        const OBSERVED: u64 = 0x200;
+        const OBSERVED_LEN: u64 = 0x400;
+
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+
+        let request = libc::sockaddr_un {
+            sun_family: libc::AF_UNIX as libc::sa_family_t,
+            sun_path: [0; 108],
+        };
+        let request_length = std::mem::offset_of!(libc::sockaddr_un, sun_path);
+        assert_eq!(write_struct(&mut memory, ADDRESS, &request), 0);
+
+        for socket_type in [libc::SOCK_STREAM, libc::SOCK_DGRAM, libc::SOCK_SEQPACKET] {
+            let fd = syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_socket,
+                [libc::AF_UNIX as u64, socket_type as u64, 0, 0, 0, 0],
+            );
+            assert!(fd >= 0, "socket(AF_UNIX, type={socket_type}) failed: {fd}");
+
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_bind,
+                    [fd as u64, ADDRESS, request_length as u64, 0, 0, 0],
+                ),
+                0,
+                "autobind failed for type {socket_type}"
+            );
+
+            let capacity = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+            assert_eq!(write_struct(&mut memory, OBSERVED_LEN, &capacity), 0);
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_getsockname,
+                    [fd as u64, OBSERVED, OBSERVED_LEN, 0, 0, 0],
+                ),
+                0,
+                "getsockname failed for type {socket_type}"
+            );
+
+            let observed = read_struct::<libc::sockaddr_un>(&memory, OBSERVED);
+            let observed_length = read_struct::<libc::socklen_t>(&memory, OBSERVED_LEN);
+            let expected_length =
+                std::mem::offset_of!(libc::sockaddr_un, sun_path) as libc::socklen_t + 6;
+            assert_eq!(observed.sun_family, libc::AF_UNIX as libc::sa_family_t);
+            assert_eq!(observed_length, expected_length, "type {socket_type}");
+            assert_eq!(observed.sun_path[0], 0, "abstract name must lead with NUL");
+            for index in 1..6 {
+                let byte = observed.sun_path[index] as u8;
+                assert!(
+                    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte),
+                    "autobind hex byte {index} = {byte} for type {socket_type}"
+                );
+            }
+
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_close,
+                    [fd as u64, 0, 0, 0, 0, 0],
+                ),
+                0
+            );
+        }
+
+        // An unsupported AF_UNIX socket type is still rejected before the host
+        // call, matching the pre-existing SOCK_DGRAM/SOCK_STREAM allowlist.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_socket,
+                [libc::AF_UNIX as u64, libc::SOCK_RAW as u64, 0, 0, 0, 0],
+            ),
+            negative_errno(libc::EPROTONOSUPPORT)
+        );
     }
 
     #[test]
