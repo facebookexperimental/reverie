@@ -9,10 +9,6 @@ edition = "2021"
 repository = "https://github.com/facebookexperimental/reverie"
 license = "BSD-2-Clause"
 
-[features]
-default = ["plugin-runtime"]
-plugin-runtime = []
-
 [dependencies]
 atomic = "0.5.1"
 heapless = "0.8.0"
@@ -25,6 +21,7 @@ reverie = { version = "0.2.0", path = "../../reverie", package = "reverie-core" 
 reverie-memory = { version = "0.2.0", path = "../../reverie-memory" }
 reverie-rpc = { version = "0.2.0", path = "../reverie-rpc" }
 reverie-rpc-transport = { version = "0.2.0", path = "../../reverie-rpc-transport" }
+reverie-sabre-stats = { version = "0.2.0", path = "../reverie-sabre-stats" }
 reverie-sabre-macros = { version = "0.2.0", path = "../reverie-sabre-macros" }
 reverie-syscalls = { version = "0.2.0", path = "../../reverie-syscalls" }
 serde = { version = "1.0.185", features = ["derive", "rc"] }

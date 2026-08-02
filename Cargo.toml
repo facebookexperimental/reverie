@@ -5,6 +5,7 @@ members = [
     "experimental/reverie-host",
     "experimental/reverie-rpc-macros",
     "experimental/reverie-rpc",
+    "experimental/reverie-sabre-stats",
     "experimental/reverie-sabre-macros",
     "experimental/reverie-sabre-strace",
     "experimental/reverie-sabre",
