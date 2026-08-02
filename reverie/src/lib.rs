@@ -51,6 +51,7 @@
 
 mod auxv;
 mod backend;
+pub mod backend_stats;
 mod backtrace;
 mod error;
 mod guest;
@@ -64,6 +65,7 @@ mod tool;
 
 pub use auxv::*;
 pub use backend::*;
+pub use backend_stats::*;
 pub use backtrace::*;
 pub use error::*;
 pub use guest::*;
