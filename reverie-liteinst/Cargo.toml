@@ -24,7 +24,7 @@ path = "src/bin/fork_guest.rs"
 
 [dependencies]
 libc = "0.2.186"
-liteinst2 = { version = "0.1.0", git = "https://github.com/rrnewton/liteinst2", rev = "b21b248294e6cbed1dd4a7ff01e7264c06741882" }
+liteinst2 = { version = "0.1.0", git = "https://github.com/rrnewton/liteinst2", rev = "79d8c806949e5e33f8ce9b49b8e6df0094357fde" }
 reverie = { version = "0.2.0", path = "../reverie", package = "reverie-core" }
 reverie-preload = { version = "0.2.0", path = "../reverie-preload", default-features = false, features = ["coordinator-rpc"] }
 reverie-ptrace = { version = "0.2.0", path = "../reverie-ptrace" }

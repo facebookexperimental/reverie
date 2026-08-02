@@ -32,6 +32,6 @@ int main(void) {
       return 10;
     }
   }
-  puts("straddler-ptrace-fallback-ok");
+  puts("straddler-quiescent-patch-ok");
   return 0;
 }

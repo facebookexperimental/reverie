@@ -1,4 +1,4 @@
-//! Policy for publishing patch words that cross an instruction-cache line.
+//! Policy for concurrently publishing patch words across a cache line.
 
 use std::ffi::OsStr;
 use std::io;
@@ -12,9 +12,11 @@ use liteinst2::patcher::classify_word_patch;
 /// Opt-in calibrated WordPatch++ delay, in timestamp-counter ticks.
 ///
 /// The value must exceed the current machine's measured instruction-fetch
-/// staleness bound (`Tmax`). When unset, cross-cache-line sites are rejected so
-/// the hybrid backend keeps them on its ptrace path. An uncalibrated value is
-/// unsafe and violates the WordPatch++ publication contract.
+/// staleness bound (`Tmax`). When unset, concurrent cross-cache-line sites are
+/// rejected so the in-process runtime retains its trap fallback. The stopped
+/// ptrace helper instead uses caller-verified quiescent publication and does
+/// not consult this policy. An uncalibrated value is unsafe and violates the
+/// WordPatch++ publication contract.
 pub const STRADDLER_STALENESS_TICKS_ENV: &str = "REVERIE_LITEINST_STRADDLER_STALENESS_TICKS";
 
 static CALIBRATED_STALENESS: OnceLock<Option<StalenessBudget>> = OnceLock::new();

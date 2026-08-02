@@ -81,6 +81,21 @@ with the shared default. The `alt_stack_from_env_value` parser and the
 `set_guest_alt_stack` round-trip are unit-tested in `src/runtime.rs` and
 `src/lib.rs`.
 
+## Patch publication modes
+
+The stopped ptrace install helper uses LiteInst2's quiescent entrypoint. The
+backend must have every other tracee thread stopped for the complete helper
+call; the current single-process, single-thread hybrid satisfies that contract.
+Planning and relocation remain unchanged, so this route can patch a cache-line
+straddler without registering WordPatch++ traps.
+
+The in-process SIGSYS dispatcher always uses concurrent publication because
+other application threads may fetch the site. Single-line patches publish
+atomically. Split patches retain the full guarded WordPatch++ protocol and
+require `REVERIE_LITEINST_STRADDLER_STALENESS_TICKS` to be set above the
+machine's measured `Tmax`; without that calibration they fail closed to the
+trap path. Quiescent publication is never selected from this route.
+
 ## Current boundaries
 
 - Dynamically linked, non-`AT_SECURE` Linux x86-64 guests only.

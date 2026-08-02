@@ -624,7 +624,7 @@ async fn first_site_is_installed_once_and_hot_calls_use_liteinst() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn cacheline_straddler_bails_to_ptrace_and_is_counted() {
+async fn cacheline_straddler_uses_quiescent_patch_and_is_counted() {
     let (_directory, guest) = compile_fixture("hybrid_straddler_site.c");
     let site = symbol_address(&guest, "reverie_liteinst_straddler_site");
     assert_eq!(site % 64, 63, "fixture syscall must straddle a cache line");
@@ -636,11 +636,11 @@ async fn cacheline_straddler_bails_to_ptrace_and_is_counted() {
     .unwrap();
 
     assert!(output.status.success(), "{output:?}");
-    assert_eq!(output.stdout, b"straddler-ptrace-fallback-ok\n");
+    assert_eq!(output.stdout, b"straddler-quiescent-patch-ok\n");
     assert_eq!(global.delivered.load(Ordering::SeqCst), 8);
-    assert_eq!(stats.distinct_rips(), 0);
+    assert_eq!(stats.distinct_rips(), 1);
     assert_eq!(stats.patch_candidates(), 1);
-    assert_eq!(stats.decision_counts(), [0, 0, 1, 0]);
+    assert_eq!(stats.decision_counts(), [0, 1, 0, 0]);
     assert_eq!(stats.classified_candidates(), 1);
     assert_eq!(stats.cacheline_straddlers(), 1);
     assert_eq!(stats.non_straddling(), 0);
@@ -649,7 +649,7 @@ async fn cacheline_straddler_bails_to_ptrace_and_is_counted() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn cache_line_straddling_sites_default_to_ptrace_fallback() {
+async fn quiescent_helper_patches_every_cache_line_split_without_calibration() {
     let (_directory, guest) = compile_fixture("hybrid_straddler_sites.c");
     let mut command = Command::new(guest);
     command.env_remove(STRADDLER_STALENESS_TICKS_ENV);
@@ -662,7 +662,7 @@ async fn cache_line_straddling_sites_default_to_ptrace_fallback() {
     .unwrap();
 
     assert_eq!(
-        output.stdout, b"offsets=57..63 calls=14 traps=7 hooks=0\n",
+        output.stdout, b"offsets=57..63 calls=14 traps=7 hooks=7\n",
         "{output:?}"
     );
     assert_eq!(global.delivered.load(Ordering::SeqCst), 14, "{output:?}");
