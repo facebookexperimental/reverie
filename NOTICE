@@ -8,12 +8,12 @@ the root directory of this source tree.
 Third-party components
 ================================================================================
 
-Reverie's optional native backend sources are referenced as git submodules
-under `third-party/`. A normal clone does not fetch them. SaBRe and e9patch use
-`update = none`; DynamoRIO permits checkout so Cargo Git dependencies containing
-`reverie-dbi` remain buildable. No source or binaries from these projects are
-redistributed in this repository; only pinned submodule commit references are
-stored here. See `docs/BACKEND_SOURCES.md` for activation details.
+Reverie's native backend sources are referenced as git submodules under
+`third-party/`. A non-recursive clone does not fetch them; recursive submodule
+initialization and Cargo Git dependencies check out every pinned source. No
+source or binaries from these projects are redistributed in this repository;
+only pinned submodule commit references are stored here. See
+`docs/BACKEND_SOURCES.md` for activation details.
 
 Building reverie-dbi after explicitly activating DynamoRIO builds DynamoRIO
 and, transitively, the third-party projects that DynamoRIO itself vendors as

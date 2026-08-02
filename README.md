@@ -73,12 +73,13 @@ cd reverie-examples
 cargo run --bin strace -- ls
 ```
 
-## Optional Backend Sources
+## Backend Sources
 
-Large native sources for DynamoRIO, SaBRe, and e9patch are pinned but not
-checked out by default. Activate only the backend you need with
-`scripts/backend-submodule.sh`; see [Optional backend sources](docs/BACKEND_SOURCES.md)
-for revisions, build commands, and license notes.
+Large native sources for DynamoRIO, SaBRe, and e9patch are pinned as shallow
+submodules. `git submodule update --init --recursive` checks out every pinned
+source; `scripts/backend-submodule.sh` remains available for focused activation.
+See [Backend sources](docs/BACKEND_SOURCES.md) for revisions, build commands,
+and license notes.
 
 ## Usage
 

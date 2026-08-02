@@ -1,15 +1,15 @@
-# Optional backend sources
+# Backend sources
 
 Reverie's large native backend dependencies are pinned as shallow Git
-submodules under `third-party/`. They are intentionally absent from a normal
-clone. SaBRe and e9patch also use `update = none`, so a plain
-`git submodule update --init` skips them. DynamoRIO permits checkout because
-Cargo must initialize it when Reverie is consumed as a Git dependency.
+submodules under `third-party/`. A non-recursive clone leaves them absent;
+`git submodule update --init --recursive` checks out every source at its pinned
+revision. Cargo also initializes them when Reverie is consumed as a Git
+dependency.
 
 | Backend | Path | Pinned revision | License |
 | --- | --- | --- | --- |
 | DynamoRIO | `third-party/dynamorio` | `929840ad9190e5086775e8debc0f0b79b4208d59` | BSD-3-Clause plus bundled component licenses |
-| SaBRe | `third-party/sabre` | `95c7399aa6b319e54e811aae5cbd0fcb4ed72a05` | GPL-3.0-or-later, with per-file exceptions |
+| SaBRe | `third-party/sabre` | `41113f849f8799932ed8c7883f5a4de616b9e9fa` | GPL-3.0-or-later, with per-file exceptions |
 | e9patch | `third-party/e9patch` | `6c2c03c1da74b14daf1788a9f8dccfa354ce04a6` (`v1.0.1`) | GPL-3.0 |
 
 The in-tree `reverie-liteinst` prototype is self-contained and does not depend
@@ -19,8 +19,7 @@ separately built `e9tool` and `e9patch` executables.
 
 ## Activate one backend
 
-Use the repository helper to initialize and verify exactly one source. For SaBRe
-and e9patch, it explicitly overrides `update = none`:
+Use the repository helper to initialize and verify exactly one source:
 
 ```bash
 scripts/backend-submodule.sh activate dynamorio
@@ -48,10 +47,9 @@ make -C third-party/e9patch
 ```
 
 The SaBRe and e9patch build commands require the system dependencies documented
-by those upstream projects. Cargo never fetches those two sources implicitly. A
-Cargo Git checkout does initialize pinned DynamoRIO so `reverie-dbi` remains
-buildable; a normal repository clone still leaves it absent until explicitly
-initialized.
+by those upstream projects. A Cargo Git checkout initializes every pinned source;
+a normal repository clone still leaves them absent until submodules are
+explicitly initialized.
 
 ## Inspect or remove sources
 
@@ -69,7 +67,7 @@ available.
 ## CI
 
 CI starts with submodules disabled and explicitly activates DynamoRIO because
-the workspace includes `reverie-dbi`. SaBRe and e9patch remain absent because
-the Rust workspace does not compile their upstream source trees. The
+the workspace includes `reverie-dbi`. SaBRe and e9patch remain absent in that
+job because it activates only the source it builds. The
 `reverie-e9patch` tests use a controlled executable fixture by default; its
 opt-in real-tool test must activate and build only e9patch first.
