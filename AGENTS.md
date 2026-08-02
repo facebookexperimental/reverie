@@ -43,9 +43,17 @@ shared `reverie` crate:
 | KVM | `reverie-kvm` | guest runs in a VM; syscalls surface as hypercalls | in progress |
 | e9patch / liteinst | `reverie-e9patch`, `reverie-liteinst`, `reverie-preload` | in-process rewriting + `LD_PRELOAD` + seccomp/SIGSYS runtime | experimental |
 
-For ptrace the `GlobalState` lives in-process; the out-of-process backends (KVM,
-DBI) run it in a coordinator process reached over `reverie-rpc-transport`
-(UDS + bincode). Other core crates: `reverie-syscalls` (typed syscall
+For ptrace and KVM the `GlobalState` lives in-process: `send_rpc` calls
+`receive_rpc` as a direct in-address-space async call and no serialization runs
+at runtime (ptrace does a `bincode` round-trip only under `debug_assertions` as a
+self-check; KVM never does, and `reverie-kvm` does not depend on
+`reverie-rpc-transport`). The out-of-process configurations — DBI (only when a
+coordinator socket is configured so fork/exec children share one `GlobalState`),
+e9patch, and liteinst/preload — route it to a coordinator process over
+`reverie-rpc-transport` (UDS + bincode). The `Serialize + DeserializeOwned`
+bounds on `GlobalTool::Request`/`Response` are a shared compile-time contract,
+exercised at runtime only on those cross-process paths. Other core crates:
+`reverie-syscalls` (typed syscall
 decode + guest memory read/write), `reverie-memory`, `reverie-process`,
 `reverie-util`, `safeptrace`. Reference tools live in `reverie-examples`
 (`noop`, `strace`/`strace_minimal`, `counter1`/`counter2`, `chunky_print`,
