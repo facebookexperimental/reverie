@@ -1047,7 +1047,7 @@ fn mutates_file_table(number: u64) -> bool {
             || number == libc::SYS_memfd_create as u64
             || number == libc::SYS_close as u64
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-close-range): close_range removes a span of
+            // TODO-HUMAN-REVIEW(#340): close_range removes a span of
             // descriptors, so its effect must be written back to the shared file
             // table; otherwise a CLONE_FILES sibling would still resolve the
             // just-closed fds and the guest's own follow-up probe would wrongly
@@ -7286,7 +7286,7 @@ fn close(state: &mut LoadedStaticElf, raw_fd: u64) -> i64 {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-close-range): close_range(2) closes every open guest
+// TODO-HUMAN-REVIEW(#340): close_range(2) closes every open guest
 // descriptor in the inclusive interval [first, last]. The KVM guest owns one
 // logical descriptor table per process, so CLOSE_RANGE_UNSHARE (unshare-then-
 // close) is observationally equivalent to closing the range for the caller and
