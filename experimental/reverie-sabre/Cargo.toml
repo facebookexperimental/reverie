@@ -9,6 +9,10 @@ edition = "2021"
 repository = "https://github.com/facebookexperimental/reverie"
 license = "BSD-2-Clause"
 
+[features]
+default = ["plugin-runtime"]
+plugin-runtime = []
+
 [dependencies]
 atomic = "0.5.1"
 heapless = "0.8.0"

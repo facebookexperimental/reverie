@@ -37,5 +37,6 @@ pub use tool::*;
 // NOTE: Even though we set the global allocator here, anything that depends on
 // this library will use this global allocator. Thus, it will apply to all
 // tools/plugins automatically.
+#[cfg(feature = "plugin-runtime")]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
