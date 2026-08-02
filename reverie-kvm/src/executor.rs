@@ -293,6 +293,9 @@ fn execute_basic_syscall_with_output(
         pread64(memory, state, args)
     } else if number == libc::SYS_pwrite64 as u64 {
         pwrite64(memory, state, args)
+    } else if number == libc::SYS_sendfile as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        sendfile(memory, state, args, output)
     } else if number == libc::SYS_lseek as u64 {
         lseek(state, args)
     } else if number == libc::SYS_ftruncate as u64 {
@@ -421,6 +424,9 @@ fn execute_basic_syscall_with_output(
     } else if number == libc::SYS_creat as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         creat(memory, state, args)
+    } else if number == libc::SYS_memfd_create as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        memfd_create(memory, state, args)
     } else if number == libc::SYS_fstat as u64 {
         fstat(memory, state, args, capture_output)
     } else if number == libc::SYS_stat as u64 {
@@ -1030,6 +1036,12 @@ fn mutates_file_table(number: u64) -> bool {
             || number == libc::SYS_open as u64
             || number == libc::SYS_openat as u64
             || number == libc::SYS_creat as u64
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-id): memfd_create allocates a new guest
+            // descriptor, so its insertion must be written back to the shared
+            // file table; otherwise the follow-up injected fstat (and any later
+            // read/write/close) cannot resolve the fresh fd and fails EBADF.
+            || number == libc::SYS_memfd_create as u64
             || number == libc::SYS_close as u64
     )
 }
@@ -2350,6 +2362,238 @@ fn pwrite64(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i
     }
     file.write_at(&bytes, args[3])
         .map_or_else(io_error, |count| count as i64)
+}
+
+/// A host file backs a regular (or memfd) object when its mode is `S_IFREG`.
+///
+/// `sendfile(2)` requires a regular/memfd input that supports positioned reads;
+/// sockets (`S_IFSOCK`) and pipes (`S_IFIFO`) are rejected so callers fall back
+/// to the mediated `read()`/`write()` path. This mirrors Detcore's
+/// `FdType::Regular | FdType::Memfd` gate in `handle_sendfile` (memfd objects are
+/// themselves `S_IFREG`).
+fn is_regular_host_file(file: &std::fs::File) -> Result<bool, i64> {
+    Ok(file_mode(file)? & libc::S_IFMT == libc::S_IFREG)
+}
+
+// TODO-HUMAN-REVIEW(PR-id): Review sendfile forward-to-host semantics, the
+// procfs-input refusal, the regular/memfd endpoint gate, and the guest offset
+// read-back. Mirrors detcore::handle_sendfile: a procfs input or a
+// non-regular/non-memfd endpoint returns ENOSYS so glibc falls back to the
+// deterministic mediated read()/write() path.
+fn sendfile(
+    memory: &mut GuestMemory,
+    state: &LoadedStaticElf,
+    args: &[u64; 6],
+    output: Option<&mut CapturedOutput>,
+) -> i64 {
+    let Ok(out_fd) = i32::try_from(args[0]) else {
+        return negative_errno(libc::EBADF);
+    };
+    let Ok(in_fd) = i32::try_from(args[1]) else {
+        return negative_errno(libc::EBADF);
+    };
+    // Resolve the input endpoint. sendfile(2) requires an mmap-able input, so a
+    // valid-but-non-regular descriptor (a standard stream, pipe, or socket) must
+    // fail with ENOSYS to route the caller onto glibc's mediated read()+write()
+    // fallback; only a descriptor the guest does not model at all is EBADF. This
+    // mirrors detcore::handle_sendfile, which returns ENOSYS unless the input
+    // classifies as Regular/Memfd.
+    let Some(in_file) = state.files.get(&in_fd) else {
+        return if is_open_standard(state, in_fd) {
+            negative_errno(libc::ENOSYS)
+        } else {
+            negative_errno(libc::EBADF)
+        };
+    };
+    // Refuse a procfs input: a procfs fd is a regular file, so it would pass the
+    // endpoint gate below and copy live kernel bytes straight to the output,
+    // bypassing the deterministic procfs snapshot the mediated read()/write()
+    // path applies. Fail closed with ENOSYS (NOT the EACCES that
+    // ensure_fd_not_procfs reports) so glibc takes that mediated fallback, exactly
+    // as detcore::handle_sendfile does.
+    if ensure_fd_not_procfs(in_file.as_raw_fd()).is_err() {
+        return negative_errno(libc::ENOSYS);
+    }
+    // Require a regular/memfd input; ENOSYS routes sockets and pipes to the
+    // mediated fallback, which the scheduler can order and block.
+    match is_regular_host_file(in_file) {
+        Ok(true) => {}
+        Ok(false) => return negative_errno(libc::ENOSYS),
+        Err(error) => return error,
+    }
+    if let Err(error) = ensure_readable(in_file) {
+        return error;
+    }
+    let in_host = in_file.as_raw_fd();
+    let Ok(count) = usize::try_from(args[3]) else {
+        return negative_errno(libc::EINVAL);
+    };
+    let count = count.min(MAX_HOST_IO);
+    let offset_ptr = args[2];
+
+    // Fast path: a regular/memfd output that lives in the guest file table can be
+    // copied with the host's zero-copy sendfile directly, preserving kernel
+    // offset semantics.
+    if let Some(out_file) = state.files.get(&out_fd) {
+        match is_regular_host_file(out_file) {
+            Ok(true) => {}
+            // A known-but-non-regular output (pipe/socket the guest opened) takes
+            // the mediated fallback, exactly like detcore.
+            Ok(false) => return negative_errno(libc::ENOSYS),
+            Err(error) => return error,
+        }
+        if let Err(error) = ensure_writable(out_file) {
+            return error;
+        }
+        let out_host = out_file.as_raw_fd();
+        if offset_ptr == 0 {
+            // SAFETY: both are live host descriptors; a null offset advances
+            // in_fd's own file position exactly as the guest requested.
+            let copied = unsafe { libc::sendfile(out_host, in_host, std::ptr::null_mut(), count) };
+            return if copied < 0 {
+                io_error(std::io::Error::last_os_error())
+            } else {
+                copied as i64
+            };
+        }
+        // The guest supplied an explicit input offset; forward through a host
+        // off_t and write the kernel-advanced value back so the guest observes
+        // faithful sendfile semantics. off_t is i64 on x86_64.
+        if !range_is_valid(memory, offset_ptr, 8) {
+            return negative_errno(libc::EFAULT);
+        }
+        let mut raw = [0u8; 8];
+        if memory.read(offset_ptr, &mut raw).is_err() {
+            return negative_errno(libc::EFAULT);
+        }
+        let mut host_offset: libc::off_t = i64::from_ne_bytes(raw);
+        // SAFETY: both descriptors are live and host_offset is a valid writable
+        // off_t that the kernel updates in place with the new input offset.
+        let copied = unsafe { libc::sendfile(out_host, in_host, &mut host_offset, count) };
+        if copied < 0 {
+            return io_error(std::io::Error::last_os_error());
+        }
+        if memory
+            .write(offset_ptr, &host_offset.to_ne_bytes())
+            .is_err()
+        {
+            return negative_errno(libc::EFAULT);
+        }
+        return copied as i64;
+    }
+
+    // The output is not in the guest file table. A standard stream (stdout/
+    // stderr) is a legitimate sendfile target, but under KVM it has no host
+    // descriptor to hand the kernel: writes to it must flow through the same
+    // captured-output/host routing as write(2) so replay verification observes
+    // the bytes. Read the input here and re-emit through that mediated path.
+    // Anything that is neither a modeled fd nor a standard stream is EBADF.
+    if !is_open_standard(state, out_fd) {
+        return negative_errno(libc::EBADF);
+    }
+    if count == 0 {
+        return 0;
+    }
+    let mut bytes = vec![0u8; count];
+    let read = if offset_ptr == 0 {
+        // SAFETY: in_host is live and bytes is a writable host buffer of `count`.
+        unsafe { libc::read(in_host, bytes.as_mut_ptr().cast::<libc::c_void>(), count) }
+    } else {
+        if !range_is_valid(memory, offset_ptr, 8) {
+            return negative_errno(libc::EFAULT);
+        }
+        let mut raw = [0u8; 8];
+        if memory.read(offset_ptr, &mut raw).is_err() {
+            return negative_errno(libc::EFAULT);
+        }
+        let host_offset: libc::off_t = i64::from_ne_bytes(raw);
+        // SAFETY: in_host is live, bytes is a writable host buffer of `count`,
+        // and pread does not disturb in_fd's own file position.
+        unsafe {
+            libc::pread(
+                in_host,
+                bytes.as_mut_ptr().cast::<libc::c_void>(),
+                count,
+                host_offset,
+            )
+        }
+    };
+    if read < 0 {
+        return io_error(std::io::Error::last_os_error());
+    }
+    let read = read as usize;
+    bytes.truncate(read);
+    if read == 0 {
+        return 0;
+    }
+
+    // Route the copied bytes to the standard stream exactly as write(2) does.
+    let written = match output_alias(state, out_fd) {
+        Some(alias) => {
+            if let Some(output) = output {
+                if !output.append(matches!(alias, OutputAlias::Stderr), &bytes) {
+                    return negative_errno(libc::EFBIG);
+                }
+                bytes.len() as i64
+            } else {
+                host_write(out_fd, &bytes)
+            }
+        }
+        None => host_write(out_fd, &bytes),
+    };
+    if written < 0 {
+        return written;
+    }
+    // sendfile advances the explicit input offset by the number of bytes moved
+    // to the output; write it back so the guest observes faithful semantics.
+    if offset_ptr != 0 {
+        let mut raw = [0u8; 8];
+        if memory.read(offset_ptr, &mut raw).is_err() {
+            return negative_errno(libc::EFAULT);
+        }
+        let advanced = i64::from_ne_bytes(raw).saturating_add(written);
+        if memory.write(offset_ptr, &advanced.to_ne_bytes()).is_err() {
+            return negative_errno(libc::EFAULT);
+        }
+    }
+    written
+}
+
+// TODO-HUMAN-REVIEW(PR-id): Review memfd_create name/flag forwarding and guest
+// descriptor registration. The anonymous file's contents are guest-controlled
+// and its guest fd is allocated deterministically, so the result carries no host
+// pid/address/time; the host kernel validates flags and the name length.
+fn memfd_create(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    // The kernel bounds the name at 249 bytes (excluding NUL) and prepends
+    // "memfd:"; read a little past that so an over-long name reaches the host,
+    // which returns EINVAL just as a native call would.
+    let name = match read_c_string(memory, args[0], 256) {
+        Ok(name) => name,
+        Err(error) => return read_c_string_errno(error),
+    };
+    let Ok(name) = std::ffi::CString::new(name) else {
+        // A NUL byte cannot occur inside a C string read stops at NUL, but guard
+        // defensively; the kernel would reject an embedded NUL with EINVAL.
+        return negative_errno(libc::EINVAL);
+    };
+    let Ok(flags) = u32::try_from(args[1]) else {
+        return negative_errno(libc::EINVAL);
+    };
+    // Forward flags verbatim; the host kernel validates unknown bits (EINVAL).
+    // Force MFD_CLOEXEC on the host descriptor so the supervisor never leaks it,
+    // and track the guest-visible close-on-exec bit separately from the guest's
+    // requested flags.
+    let host_flags = flags | libc::MFD_CLOEXEC;
+    // SAFETY: name is a valid NUL-terminated C string; the kernel validates
+    // flags and returns a new owned descriptor on success.
+    let host_fd = unsafe { libc::memfd_create(name.as_ptr(), host_flags) };
+    if host_fd < 0 {
+        return io_error(std::io::Error::last_os_error());
+    }
+    // SAFETY: memfd_create returned a new owned descriptor.
+    let file = unsafe { std::fs::File::from_raw_fd(host_fd) };
+    let close_on_exec = flags & libc::MFD_CLOEXEC != 0;
+    insert_file_with_flags(state, file, close_on_exec, None)
 }
 
 fn lseek(state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
@@ -10064,6 +10308,165 @@ mod tests {
             ),
             negative_errno(libc::EBADF)
         );
+    }
+
+    #[test]
+    fn sendfile_copies_regular_files_with_and_without_offset() {
+        let root = TestDir::new();
+        let src_path = root.0.join("src");
+        std::fs::write(&src_path, b"abcdefghij").unwrap();
+
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+
+        // Explicit-offset copy: start at input offset 2, copy 5 bytes ("cdefg").
+        let src = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&src_path)
+            .unwrap();
+        let dst_off_path = root.0.join("dst_off");
+        let dst_off = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&dst_off_path)
+            .unwrap();
+        state.files.insert(3, src);
+        state.files.insert(4, dst_off);
+
+        const OFF: u64 = 0x100;
+        write_struct(&mut memory, OFF, &2i64);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_sendfile,
+                [4, 3, OFF, 5, 0, 0]
+            ),
+            5
+        );
+        // The kernel advances the guest-supplied offset by the bytes copied.
+        assert_eq!(read_struct::<i64>(&memory, OFF), 7);
+        assert_eq!(std::fs::read(&dst_off_path).unwrap(), b"cdefg");
+
+        // Null-offset copy: uses the input fd's own position (0 -> whole file).
+        let src2 = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&src_path)
+            .unwrap();
+        let dst_pos_path = root.0.join("dst_pos");
+        let dst_pos = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&dst_pos_path)
+            .unwrap();
+        state.files.insert(5, src2);
+        state.files.insert(6, dst_pos);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_sendfile,
+                [6, 5, 0, 100, 0, 0]
+            ),
+            10
+        );
+        assert_eq!(std::fs::read(&dst_pos_path).unwrap(), b"abcdefghij");
+    }
+
+    #[test]
+    fn sendfile_rejects_socket_input_with_enosys_and_unknown_fd_with_ebadf() {
+        let root = TestDir::new();
+        let dst_path = root.0.join("dst");
+        let dst = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&dst_path)
+            .unwrap();
+        let mut state = test_state(&root.0);
+        state.files.insert(4, dst);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+
+        // A stream socket is not a regular/memfd endpoint: sendfile returns
+        // ENOSYS so glibc falls back to the deterministic mediated read()/write().
+        let sock_fd = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_socket,
+            [libc::AF_UNIX as u64, libc::SOCK_STREAM as u64, 0, 0, 0, 0],
+        );
+        assert!(sock_fd >= 0, "socket() returned {sock_fd}");
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_sendfile,
+                [4, sock_fd as u64, 0, 16, 0, 0]
+            ),
+            negative_errno(libc::ENOSYS)
+        );
+        // An unknown input descriptor is a hard EBADF.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_sendfile,
+                [4, 99, 0, 16, 0, 0]
+            ),
+            negative_errno(libc::EBADF)
+        );
+    }
+
+    #[test]
+    fn memfd_create_registers_writable_anonymous_file() {
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+
+        const NAME: u64 = 0x100;
+        memory.write(NAME, b"guest-memfd\0").unwrap();
+        let fd = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_memfd_create,
+            [NAME, libc::MFD_CLOEXEC as u64, 0, 0, 0, 0],
+        );
+        assert!(fd >= 0, "memfd_create returned {fd}");
+        let fd = fd as i32;
+        // Registered as a live host file carrying the requested close-on-exec bit.
+        assert!(state.files.contains_key(&fd));
+        assert!(state.cloexec_fds.contains(&fd));
+
+        // The anonymous file is a working read+write regular file.
+        const BUF: u64 = 0x200;
+        memory.write(BUF, b"payload").unwrap();
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_pwrite64,
+                [fd as u64, BUF, 7, 0, 0, 0]
+            ),
+            7
+        );
+        const RBUF: u64 = 0x300;
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_pread64,
+                [fd as u64, RBUF, 7, 0, 0, 0]
+            ),
+            7
+        );
+        let mut got = [0u8; 7];
+        memory.read(RBUF, &mut got).unwrap();
+        assert_eq!(&got, b"payload");
     }
 
     #[test]
