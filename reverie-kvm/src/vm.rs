@@ -299,6 +299,25 @@ fn validate_root_pid(pid: i32) -> Result<i32> {
     }
 }
 
+/// The PID-namespace init process seen by the deterministic container. The
+/// ptrace backend runs the guest inside a real PID namespace whose `init` is
+/// PID 1, so the conventional root guest (PID 3, see detcore `ROOT_DETPID`) has
+/// `getppid() == 1`. KVM synthesizes the guest identity rather than using a real
+/// namespace, so it must reproduce the same parent value for parity.
+const CONTAINER_INIT_PID: i32 = 1;
+
+/// Deterministic parent PID for the container's root guest, matching the ptrace
+/// backend. A guest that is itself the namespace init (PID 1) has no parent and
+/// reports `getppid() == 0`, exactly as Linux `init` does; any other root guest
+/// is parented to the namespace init (PID 1).
+fn root_parent_pid(root_pid: i32) -> i32 {
+    if root_pid == CONTAINER_INIT_PID {
+        0
+    } else {
+        CONTAINER_INIT_PID
+    }
+}
+
 /// A single-vCPU KVM backend used to exercise the syscall transport.
 pub struct KvmBackend {
     // Field order ensures the vCPU and VM are dropped before registered memory.
@@ -519,6 +538,7 @@ impl KvmBackend {
         if let Some(loaded) = self.static_elf.as_mut() {
             loaded.pid = pid;
             loaded.tid = pid;
+            loaded.ppid = root_parent_pid(pid);
         }
         Ok(())
     }
@@ -590,6 +610,7 @@ impl KvmBackend {
         let mut loaded = load_static_elf(&mut self.memory, image, argv, envp, cwd)?;
         loaded.pid = self.root_pid;
         loaded.tid = self.root_pid;
+        loaded.ppid = root_parent_pid(self.root_pid);
         loaded.stdin = self.stdin.as_ref().map(File::try_clone).transpose()?;
         configure_long_mode(
             &mut self.memory,
@@ -1593,6 +1614,18 @@ mod tests {
             validate_root_pid(-1),
             Err(Error::InvalidGuestPid(-1))
         ));
+    }
+
+    #[test]
+    fn root_parent_pid_matches_ptrace_namespace_convention() {
+        // Conventional root guest (detcore ROOT_DETPID == 3) is parented to the
+        // namespace init, so getppid() == 1 exactly as under the ptrace backend.
+        assert_eq!(root_parent_pid(3), 1);
+        // Any non-init root guest is likewise parented to init.
+        assert_eq!(root_parent_pid(2), 1);
+        assert_eq!(root_parent_pid(42), 1);
+        // A guest that is itself the namespace init has no parent (getppid == 0).
+        assert_eq!(root_parent_pid(CONTAINER_INIT_PID), 0);
     }
 
     #[test]
