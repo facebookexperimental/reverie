@@ -16,6 +16,7 @@
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
+pub mod backend_stats;
 pub mod counter;
 mod launcher;
 pub mod sync_rpc;
