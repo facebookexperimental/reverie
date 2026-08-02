@@ -10737,6 +10737,89 @@ mod tests {
     }
 
     #[test]
+    fn memfd_shared_mmap_copies_file_backed_pages() {
+        // Regression coverage for the `remap-file-pages-memfd-enosys` corpus
+        // cell's KVM prerequisite chain: memfd_create -> ftruncate -> a
+        // MAP_SHARED mmap of the anonymous file must land its contents in guest
+        // memory exactly as a real file-backed mapping does (the tmpfile sibling
+        // cell already exercises the on-disk path). `remap_file_pages` itself is
+        // determinized to ENOSYS by Detcore above the backend, so this executor
+        // arm only has to make the memfd mapping faithful. memfd support landed
+        // in reverie#322; this guards the untested mmap interaction so it cannot
+        // silently regress.
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let memory_size = BOOT_RESERVED_END + 8 * PAGE_SIZE;
+        let mut memory = GuestMemory::new(0, memory_size as usize).unwrap();
+        state.mmap_base = BOOT_RESERVED_END + PAGE_SIZE;
+        state.mmap_next = state.mmap_base;
+        state.mmap_limit = state.mmap_base + 4 * PAGE_SIZE;
+
+        const NAME: u64 = 0x100;
+        memory.write(NAME, b"guest-remap\0").unwrap();
+        let fd = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_memfd_create,
+            [NAME, libc::MFD_CLOEXEC as u64, 0, 0, 0, 0],
+        );
+        assert!(fd >= 0, "memfd_create returned {fd}");
+        let fd = fd as i32;
+
+        // Size the anonymous file to two pages, matching the corpus cell.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_ftruncate,
+                [fd as u64, 2 * PAGE_SIZE, 0, 0, 0, 0],
+            ),
+            0
+        );
+
+        // Seed a payload at the start so the copy-in path is observably faithful
+        // rather than merely zero-filled.
+        const PAYLOAD: &[u8] = b"memfd-mmap-payload";
+        const BUF: u64 = 0x200;
+        memory.write(BUF, PAYLOAD).unwrap();
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_pwrite64,
+                [fd as u64, BUF, PAYLOAD.len() as u64, 0, 0, 0],
+            ),
+            PAYLOAD.len() as i64
+        );
+
+        // MAP_SHARED file-backed mapping of the memfd (nfds/offset as the cell).
+        let mapping = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_mmap,
+            [
+                0,
+                2 * PAGE_SIZE,
+                (libc::PROT_READ | libc::PROT_WRITE) as u64,
+                libc::MAP_SHARED as u64,
+                fd as u64,
+                0,
+            ],
+        );
+        assert!(mapping > 0, "mmap of memfd returned {mapping}");
+        let mapping = mapping as u64;
+
+        // The mapped guest pages carry the file contents: payload then zeros,
+        // including into the second page.
+        let mut head = [0u8; PAYLOAD.len()];
+        memory.read(mapping, &mut head).unwrap();
+        assert_eq!(&head, PAYLOAD);
+        let mut second_page = [0xffu8; 4];
+        memory.read(mapping + PAGE_SIZE, &mut second_page).unwrap();
+        assert_eq!(&second_page, &[0u8; 4], "second file-backed page is zeroed");
+    }
+
+    #[test]
     fn fcntl_advisory_locks_apply_to_host_descriptors() {
         const LOCK: u64 = 0x100;
 
