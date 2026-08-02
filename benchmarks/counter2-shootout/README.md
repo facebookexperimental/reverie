@@ -29,6 +29,10 @@ Any failed probe aborts the whole run. The runner never measures a failed cell
 or silently shrinks the intersection. Changing `known-green.json` therefore
 requires new evidence in `INITIAL_RESULTS.md`.
 
+The first published all-backend run and its raw text artifacts are in
+[`INITIAL_RESULTS.md`](INITIAL_RESULTS.md) and
+[`results/20260802T042358Z/`](results/20260802T042358Z/).
+
 ## Workloads
 
 `workload.c` is a deterministic integer workload with direct x86-64 Linux
@@ -81,7 +85,7 @@ benchmarks/counter2-shootout/run.py \
   --backends ptrace,kvm --repetitions 7 --target-seconds 5
 ```
 
-Raw artifacts are intentionally untracked under
+Ordinary run artifacts are intentionally untracked under
 `target/counter2-shootout/<UTC run id>/`:
 
 - `probes.jsonl`: pre-measurement correctness gates;
@@ -90,6 +94,9 @@ Raw artifacts are intentionally untracked under
 - `overall.csv`: geomean slowdown across workload medians;
 - `metadata.json`: source SHA, manifest digest, host, and run settings; and
 - `report.md`: human-readable tables.
+
+Only explicitly reviewed publication runs, such as the initial result above,
+are copied into `results/`.
 
 ## Interpretation
 

@@ -364,6 +364,8 @@ def main() -> None:
         fail("selected backends have no known-green workload intersection")
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_start_utc = datetime.now(timezone.utc).isoformat()
+    start_load_average = os.getloadavg()
     output = args.output or root / "target/counter2-shootout" / run_id
     output = output.resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -536,7 +538,9 @@ def main() -> None:
             }
         )
     with (output / "summary.csv").open("w", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(summary_rows[0]))
+        writer = csv.DictWriter(
+            stream, fieldnames=list(summary_rows[0]), lineterminator="\n"
+        )
         writer.writeheader()
         writer.writerows(summary_rows)
 
@@ -553,15 +557,20 @@ def main() -> None:
             }
         )
     with (output / "overall.csv").open("w", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(overall_rows[0]))
+        writer = csv.DictWriter(
+            stream, fieldnames=list(overall_rows[0]), lineterminator="\n"
+        )
         writer.writeheader()
         writer.writerows(overall_rows)
 
     metadata = {
         "schema": 1,
         "run_id": run_id,
+        "run_start_utc": run_start_utc,
         "run_utc": datetime.now(timezone.utc).isoformat(),
         "host": socket.gethostname(),
+        "logical_cpus": os.cpu_count(),
+        "start_load_average": start_load_average,
         "reverie_sha": git_output(root, "rev-parse", "HEAD"),
         "source_dirty": bool(git_output(root, "status", "--short")),
         "manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),

@@ -1,0 +1,17 @@
+workload,backend,variant,repetitions,median_ms,geomean_ms,native_median_ms,slowdown,counter_total
+counter2-cpu-heavy,dbi,dynamic,5,27056.827,27089.759,5030.08,5.379006,28299
+counter2-cpu-heavy,e9patch,dynamic,5,5059.59,5063.621,5030.08,1.005867,28268
+counter2-cpu-heavy,kvm,static,5,5526.457,5544.721,5021.411,1.100578,28269
+counter2-cpu-heavy,liteinst,dynamic,5,5070.227,5071.42,5030.08,1.007982,28268
+counter2-cpu-heavy,native,dynamic,5,5030.08,5031.599,5030.08,1.0,
+counter2-cpu-heavy,native,static,5,5021.411,5022.302,5021.411,1.0,
+counter2-cpu-heavy,ptrace,dynamic,5,5615.643,5736.685,5030.08,1.116412,28300
+counter2-cpu-heavy,sabre,dynamic,5,5103.463,5231.521,5030.08,1.014589,28269
+counter2-syscall-mix,dbi,dynamic,5,27638.558,28054.16,5036.409,5.48775,450750
+counter2-syscall-mix,e9patch,dynamic,5,5375.895,5425.28,5036.409,1.067406,450719
+counter2-syscall-mix,kvm,static,5,11660.749,11594.506,5029.885,2.318294,450720
+counter2-syscall-mix,liteinst,dynamic,5,5322.684,5329.309,5036.409,1.056841,450719
+counter2-syscall-mix,native,dynamic,5,5036.409,5029.419,5036.409,1.0,
+counter2-syscall-mix,native,static,5,5029.885,5030.159,5029.885,1.0,
+counter2-syscall-mix,ptrace,dynamic,5,12846.425,13372.484,5036.409,2.550711,450751
+counter2-syscall-mix,sabre,dynamic,5,5530.674,5516.874,5036.409,1.098138,450720
