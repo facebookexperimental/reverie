@@ -1037,7 +1037,7 @@ fn mutates_file_table(number: u64) -> bool {
             || number == libc::SYS_openat as u64
             || number == libc::SYS_creat as u64
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-id): memfd_create allocates a new guest
+            // TODO-HUMAN-REVIEW(#322): memfd_create allocates a new guest
             // descriptor, so its insertion must be written back to the shared
             // file table; otherwise the follow-up injected fstat (and any later
             // read/write/close) cannot resolve the fresh fd and fails EBADF.
@@ -2375,7 +2375,7 @@ fn is_regular_host_file(file: &std::fs::File) -> Result<bool, i64> {
     Ok(file_mode(file)? & libc::S_IFMT == libc::S_IFREG)
 }
 
-// TODO-HUMAN-REVIEW(PR-id): Review sendfile forward-to-host semantics, the
+// TODO-HUMAN-REVIEW(#322): Review sendfile forward-to-host semantics, the
 // procfs-input refusal, the regular/memfd endpoint gate, and the guest offset
 // read-back. Mirrors detcore::handle_sendfile: a procfs input or a
 // non-regular/non-memfd endpoint returns ENOSYS so glibc falls back to the
@@ -2559,7 +2559,7 @@ fn sendfile(
     written
 }
 
-// TODO-HUMAN-REVIEW(PR-id): Review memfd_create name/flag forwarding and guest
+// TODO-HUMAN-REVIEW(#322): Review memfd_create name/flag forwarding and guest
 // descriptor registration. The anonymous file's contents are guest-controlled
 // and its guest fd is allocated deterministically, so the result carries no host
 // pid/address/time; the host kernel validates flags and the name length.
