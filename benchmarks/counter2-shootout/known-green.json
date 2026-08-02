@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "evidence": "INITIAL_RESULTS.md",
+  "workloads": [
+    {
+      "id": "counter2-cpu-heavy",
+      "description": "Integer compute with one direct getpid syscall per 65536 iterations",
+      "syscall_stride": 65536,
+      "backends": {
+        "ptrace": "dynamic",
+        "kvm": "static",
+        "liteinst": "dynamic",
+        "dbi": "dynamic",
+        "sabre": "dynamic",
+        "e9patch": "dynamic"
+      }
+    },
+    {
+      "id": "counter2-syscall-mix",
+      "description": "Integer compute with one direct getpid syscall per 4096 iterations",
+      "syscall_stride": 4096,
+      "backends": {
+        "ptrace": "dynamic",
+        "kvm": "static",
+        "liteinst": "dynamic",
+        "dbi": "dynamic",
+        "sabre": "dynamic",
+        "e9patch": "dynamic"
+      }
+    }
+  ]
+}

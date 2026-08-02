@@ -119,6 +119,11 @@ Since `ptrace` adds significant overhead when the guest has a syscall-heavy
 workload, Reverie will add similarly-significant overhead. The slowdown depends
 on how many syscalls are being performed and are intercepted by the tool.
 
+The separate, non-CI [counter2 performance shootout](benchmarks/counter2-shootout/README.md)
+measures native-normalized instrumentation overhead across the available
+backends on calibrated multi-second workloads. It correctness-probes the
+known-green workload intersection before collecting any timing samples.
+
 The primary way you can improve performance with the current implementation is
 to implement the `subscriptions` callback, specifying a minimal set of syscalls
 that are actually required by your tool.
