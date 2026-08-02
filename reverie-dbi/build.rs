@@ -32,7 +32,7 @@ fn main() {
 
     let manifest_dir = PathBuf::from(required_env("CARGO_MANIFEST_DIR"));
     let source_dir = manifest_dir.join("../third-party/dynamorio");
-    require_initialized_submodule(&source_dir);
+    ensure_dynamorio_source(&source_dir);
     verify_revision(&source_dir);
 
     let out_dir = PathBuf::from(required_env("OUT_DIR"));
@@ -66,13 +66,31 @@ fn main() {
     );
 }
 
-fn require_initialized_submodule(source_dir: &Path) {
+fn ensure_dynamorio_source(source_dir: &Path) {
     if source_dir.join("CMakeLists.txt").is_file() {
         return;
     }
-    panic!(
-        "DynamoRIO submodule is not initialized at {}. Run: scripts/backend-submodule.sh activate dynamorio",
-        source_dir.display()
+
+    let reverie_root = source_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("DynamoRIO source is not inside the Reverie repository");
+    run(
+        Command::new("git").arg("-C").arg(reverie_root).args([
+            "submodule",
+            "update",
+            "--init",
+            "--recursive",
+            "--checkout",
+            "--",
+            "third-party/dynamorio",
+        ]),
+        "initialize the pinned DynamoRIO source",
+    );
+    assert!(
+        source_dir.join("CMakeLists.txt").is_file(),
+        "DynamoRIO submodule initialization did not produce {}",
+        source_dir.join("CMakeLists.txt").display()
     );
 }
 
