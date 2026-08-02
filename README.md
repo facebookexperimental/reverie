@@ -14,6 +14,10 @@ Some potential use cases include:
 See the [`reverie-examples`](reverie-examples) directory for examples of
 tools that can be built with this library.
 
+See [Backend architecture](BACKENDS.md) for the ptrace, KVM, DBI, SaBRe,
+e9patch, and LiteInst event paths and the shared RPC, ptracer, and trapping
+components.
+
 ## Features
 
  * Ergonomic syscall handling. It is easy to modify syscall arguments or return
@@ -78,9 +82,11 @@ for revisions, build commands, and license notes.
 
 ## Usage
 
-Currently, `reverie-ptrace` is the only native event runtime. The optional
-`reverie-e9patch` crate provides validated e9patch preparation and a sealed
-executable artifact, but it does not yet implement `Guest` or `Backend`.
+`reverie-ptrace` is the reference runtime. `reverie-e9patch` and
+`reverie-liteinst` also implement the generic `Backend` contract, with the
+current hybrid and in-guest boundaries documented in
+[Backend architecture](BACKENDS.md). KVM, DBI, and SaBRe currently expose
+specialized runners or adapters rather than that generic launch contract.
 
 Copy one of the example tools to a new Rust project (e.g. `cargo init`). You’ll
 see that it depends both on the general `reverie` crate for the API and on the
@@ -148,11 +154,10 @@ called it.
 
 ### Global State
 
-The global state is accessed via RPC messages. Since a future Reverie backend
-may use in-guest syscall interception, the syscall handler code may not be
-running in the same address space. Thus, all shared state is communicated via
-RPC messages. (There is, however, currently only a single ptrace-based backend
-where all tracer code is in the same address space.)
+The global state is accessed through the `GlobalRPC` interface. Some backends
+implement it as a local method call, while in-guest handlers can use the shared
+cross-process transport. See the [RPC component map](BACKENDS.md#componentrpc)
+for the current implementations.
 
 ## The Backend Contract
 
@@ -212,10 +217,10 @@ instrumentation, via its `TracerBuilder`/`Tracer` API.
 
 `reverie-ptrace` is the reference implementation. It is a *centralized* backend:
 because it traps events from outside the guest via `ptrace` + `seccomp`, it can
-keep all tool state in the tracer's address space. A future in-guest backend
-(e.g. binary rewriting) would run handlers inside the guest and communicate with
-centralized global state over RPC — but it would satisfy the exact same
-`Backend` contract, which is what lets tools move between backends unchanged.
+keep all tool state in the tracer's address space. Current in-guest paths run
+handlers inside the guest and can communicate with centralized global state
+over RPC. The exact execution modes and contract status are documented in
+[Backend architecture](BACKENDS.md).
 
 ## Platform and Architecture Support
 
