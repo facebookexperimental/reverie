@@ -18,6 +18,10 @@ use std::process::Stdio;
 use std::time::Duration;
 use std::time::Instant;
 
+use reverie_liteinst::STRADDLER_STALENESS_TICKS_ENV;
+
+const TEST_STRADDLER_STALENESS_TICKS: &str = "20000";
+
 fn preload() -> PathBuf {
     let executable = std::env::current_exe().unwrap();
     let deps = executable.parent().unwrap();
@@ -34,6 +38,13 @@ fn preload() -> PathBuf {
 fn run(tool: &str, extra: &[&str], guest: &[&str]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_reverie-liteinst-examples"));
     command
+        // The direct runtime has no ptrace fallback supervisor. Exercise its
+        // concurrent WordPatch++ path explicitly; this test value is not a
+        // production machine-calibration claim.
+        .env(
+            STRADDLER_STALENESS_TICKS_ENV,
+            TEST_STRADDLER_STALENESS_TICKS,
+        )
         .arg("--tool")
         .arg(tool)
         .arg("--preload")
@@ -166,6 +177,10 @@ fn exact_noop_tool_preserves_unrelated_inherited_descriptor() {
     let inherited_fd = inherited.as_raw_fd();
     let mut command = Command::new(env!("CARGO_BIN_EXE_reverie-liteinst-examples"));
     command
+        .env(
+            STRADDLER_STALENESS_TICKS_ENV,
+            TEST_STRADDLER_STALENESS_TICKS,
+        )
         .arg("--tool")
         .arg("noop")
         .arg("--preload")
