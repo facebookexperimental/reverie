@@ -2342,6 +2342,14 @@ impl<L: Tool + 'static> TracedTask<L> {
                 ));
             }
             Some(LiteinstTrap::Syscall(frame_address)) => {
+                if let Some(stats) = self
+                    .global_state
+                    .liteinst_runtime
+                    .as_ref()
+                    .and_then(|config| config.instrumentation_stats.as_ref())
+                {
+                    stats.lock().unwrap().record_direct_hook();
+                }
                 let next_state = self
                     .handle_injected_syscall(task, frame_address, regs.eflags)
                     .await?;
@@ -3201,38 +3209,52 @@ impl<L: Tool + 'static> TracedTask<L> {
         frame: LiteinstHandshakeFrame,
         site: u64,
     ) {
-        let shape = Addr::from_raw(frame.install_result as usize)
-            .and_then(|address| {
-                let result: LiteinstInstallResult = task.read_value(address).ok()?;
-                Some(result)
-            })
-            .and_then(|result| {
-                let instruction_len = usize::try_from(result.instruction_len).ok()?;
-                let straddle_prefix = usize::try_from(result.straddle_prefix).ok()?;
-                (result.version == 2
-                    && result.complete == 0
-                    && result.site_start == site
-                    && result.site_len == 8
-                    && (1..=15).contains(&instruction_len)
-                    && straddle_prefix < instruction_len.min(5))
-                .then_some((
-                    instruction_len,
-                    (straddle_prefix != 0).then_some(straddle_prefix),
-                ))
-            });
-        let outcome = if shape.as_ref().is_some_and(|(_, prefix)| prefix.is_some()) {
-            LiteinstPatchOutcome::PtraceStraddlerBail
-        } else {
-            LiteinstPatchOutcome::PtraceOtherFallback
-        };
-        if let Some(stats) = self
+        let stats = self
             .global_state
             .liteinst_runtime
             .as_ref()
-            .and_then(|config| config.instrumentation_stats.as_ref())
-        {
-            stats.lock().unwrap().record_site(site, outcome, shape);
-        }
+            .and_then(|config| config.instrumentation_stats.as_ref());
+        crate::liteinst_stats::with_liteinst_stats(stats, |stats| {
+            let shape = Addr::from_raw(frame.install_result as usize)
+                .and_then(|address| {
+                    let result: LiteinstInstallResult = task.read_value(address).ok()?;
+                    Some(result)
+                })
+                .and_then(|result| {
+                    let instruction_len = usize::try_from(result.instruction_len).ok()?;
+                    let straddle_prefix = usize::try_from(result.straddle_prefix).ok()?;
+                    (result.version == 2
+                        && result.complete == 0
+                        && result.site_start == site
+                        && result.site_len == 8
+                        && (1..=15).contains(&instruction_len)
+                        && straddle_prefix < instruction_len.min(5))
+                    .then_some((
+                        instruction_len,
+                        (straddle_prefix != 0).then_some(straddle_prefix),
+                    ))
+                });
+            let outcome = if shape.as_ref().is_some_and(|(_, prefix)| prefix.is_some()) {
+                LiteinstPatchOutcome::PtraceStraddlerBail
+            } else {
+                LiteinstPatchOutcome::PtraceOtherFallback
+            };
+            let process_identity =
+                u64::try_from(self.pid.as_raw()).expect("tracee PID must be positive");
+            let execution_generation = self.liteinst_runtime.lock().unwrap().generation;
+            stats.record_process_site(process_identity, execution_generation, site, outcome, shape);
+            match outcome {
+                LiteinstPatchOutcome::PtraceStraddlerBail => {
+                    stats.record_cacheline_straddler_fallback();
+                }
+                LiteinstPatchOutcome::PtraceOtherFallback => {
+                    stats.record_unpatchable_or_other_fallback();
+                }
+                LiteinstPatchOutcome::DirectPunPatched | LiteinstPatchOutcome::RelocatedPatched => {
+                    unreachable!("fallback accounting received a patched outcome")
+                }
+            }
+        });
     }
 
     fn validate_liteinst_install_result(
@@ -3308,7 +3330,13 @@ impl<L: Tool + 'static> TracedTask<L> {
             .instrumentation_stats
             .as_ref()
         {
-            stats.lock().unwrap().record_site(
+            let mut stats = stats.lock().unwrap();
+            let process_identity =
+                u64::try_from(self.pid.as_raw()).expect("tracee PID must be positive");
+            let execution_generation = self.liteinst_runtime.lock().unwrap().generation;
+            stats.record_process_site(
+                process_identity,
+                execution_generation,
                 result.site_start,
                 LiteinstPatchOutcome::RelocatedPatched,
                 Some((
@@ -3316,6 +3344,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                     (straddle_prefix != 0).then_some(straddle_prefix),
                 )),
             );
+            stats.record_ptrace_installation();
         }
         Some((
             result.relocated_tail,
@@ -3564,6 +3593,15 @@ impl<L: Tool + 'static> TracedTask<L> {
             }
             state.frame.ok_or(Errno::EIO)?
         };
+
+        if let Some(stats) = self
+            .global_state
+            .liteinst_runtime
+            .as_ref()
+            .and_then(|config| config.instrumentation_stats.as_ref())
+        {
+            stats.lock().unwrap().record_first_site_sigsys();
+        }
 
         // Convert the active seccomp stop into an ordinary stopped state before
         // calling arbitrary tracee code. The original event is still serviced

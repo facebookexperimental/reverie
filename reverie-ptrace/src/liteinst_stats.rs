@@ -8,10 +8,13 @@
 
 //! Aggregate statistics for dynamically installed LiteInst patch sites.
 
-use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::Mutex;
+
+use reverie::InstructionPatchShape;
+use reverie::PatchShapeCollector;
+use reverie::PatchShapeStats;
 
 /// Aggregate characteristics of distinct LiteInst patch-site instruction pointers.
 ///
@@ -19,25 +22,12 @@ use std::sync::Mutex;
 /// bytes is the direct-jump patch width. A cache-line straddler is an original
 /// instruction whose first five bytes cross a line; therefore its boundary is
 /// necessarily after a one-, two-, three-, or four-byte prefix.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub struct LiteinstInstrumentationStats {
-    candidate_rips: BTreeSet<u64>,
-    patched_rips: BTreeSet<u64>,
-    direct_pun_patched: usize,
-    relocated_patched: usize,
-    ptrace_straddler_bail: usize,
-    ptrace_other_fallback: usize,
-    instruction_len_5_plus: usize,
-    instruction_len_4: usize,
-    instruction_len_3: usize,
-    instruction_len_2: usize,
-    instruction_len_1: usize,
-    classified_candidates: usize,
-    non_straddling: usize,
-    straddle_after_1: usize,
-    straddle_after_2: usize,
-    straddle_after_3: usize,
-    straddle_after_4: usize,
+    candidate_sites: std::collections::BTreeSet<(u64, u64, u64)>,
+    patch_shapes: PatchShapeCollector,
+    patch_decisions: [u64; 4],
+    dispatch_paths: [u64; 5],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -72,107 +62,137 @@ impl LiteinstInstrumentationStatsHandle {
 }
 
 impl LiteinstInstrumentationStats {
+    #[cfg(test)]
     pub(crate) fn record_site(
         &mut self,
         rip: u64,
         outcome: LiteinstPatchOutcome,
         shape: Option<(usize, Option<usize>)>,
     ) {
-        if !self.candidate_rips.insert(rip) {
+        self.record_process_site(0, 0, rip, outcome, shape);
+    }
+
+    pub(crate) fn record_process_site(
+        &mut self,
+        process_identity: u64,
+        execution_generation: u64,
+        rip: u64,
+        outcome: LiteinstPatchOutcome,
+        shape: Option<(usize, Option<usize>)>,
+    ) {
+        if !self
+            .candidate_sites
+            .insert((process_identity, execution_generation, rip))
+        {
             return;
         }
-        match outcome {
-            LiteinstPatchOutcome::DirectPunPatched => {
-                self.direct_pun_patched += 1;
-                self.patched_rips.insert(rip);
-            }
-            LiteinstPatchOutcome::RelocatedPatched => {
-                self.relocated_patched += 1;
-                self.patched_rips.insert(rip);
-            }
-            LiteinstPatchOutcome::PtraceStraddlerBail => self.ptrace_straddler_bail += 1,
-            LiteinstPatchOutcome::PtraceOtherFallback => self.ptrace_other_fallback += 1,
-        }
-        let Some((instruction_len, straddle_prefix)) = shape else {
-            return;
+        let (decision_index, patched) = match outcome {
+            LiteinstPatchOutcome::DirectPunPatched => (0, true),
+            LiteinstPatchOutcome::RelocatedPatched => (1, true),
+            LiteinstPatchOutcome::PtraceStraddlerBail => (2, false),
+            LiteinstPatchOutcome::PtraceOtherFallback => (3, false),
         };
-        self.classified_candidates += 1;
-        match instruction_len {
-            1 => self.instruction_len_1 += 1,
-            2 => self.instruction_len_2 += 1,
-            3 => self.instruction_len_3 += 1,
-            4 => self.instruction_len_4 += 1,
-            5.. => self.instruction_len_5_plus += 1,
-            0 => unreachable!("x86 instructions cannot be empty"),
-        }
-        match straddle_prefix {
-            None => self.non_straddling += 1,
-            Some(1) => self.straddle_after_1 += 1,
-            Some(2) => self.straddle_after_2 += 1,
-            Some(3) => self.straddle_after_3 += 1,
-            Some(4) => self.straddle_after_4 += 1,
-            Some(prefix) => {
-                unreachable!("a five-byte patch prefix cannot straddle after byte {prefix}")
-            }
-        }
+        self.patch_decisions[decision_index] += 1;
+        let shape = shape.map(|(instruction_len, straddle_prefix)| {
+            InstructionPatchShape::new(
+                u8::try_from(instruction_len).expect("validated x86 instruction length"),
+                straddle_prefix.map(|prefix| {
+                    u8::try_from(prefix).expect("validated cache-line straddle prefix")
+                }),
+            )
+        });
+        self.patch_shapes.record_process_site(
+            process_identity,
+            execution_generation,
+            rip,
+            patched,
+            shape,
+        );
+    }
+
+    pub(crate) fn record_first_site_sigsys(&mut self) {
+        self.dispatch_paths[0] += 1;
+    }
+
+    pub(crate) fn record_ptrace_installation(&mut self) {
+        self.dispatch_paths[1] += 1;
+    }
+
+    pub(crate) fn record_cacheline_straddler_fallback(&mut self) {
+        self.dispatch_paths[2] += 1;
+    }
+
+    pub(crate) fn record_unpatchable_or_other_fallback(&mut self) {
+        self.dispatch_paths[3] += 1;
+    }
+
+    pub(crate) fn record_direct_hook(&mut self) {
+        self.dispatch_paths[4] += 1;
     }
 
     /// Returns the number of distinct instruction pointers successfully patched.
     pub fn distinct_rips(&self) -> usize {
-        self.patched_rips.len()
+        self.patch_shapes.snapshot().patched_rips() as usize
     }
 
     /// Returns distinct patch candidates, including safe straddler bailouts.
     pub fn patch_candidates(&self) -> usize {
-        self.candidate_rips.len()
+        self.candidate_sites.len()
     }
 
     /// Returns direct, relocated, straddler-bail, and other-fallback counts.
-    pub const fn decision_counts(&self) -> [usize; 4] {
-        [
-            self.direct_pun_patched,
-            self.relocated_patched,
-            self.ptrace_straddler_bail,
-            self.ptrace_other_fallback,
-        ]
+    pub const fn decision_counts(&self) -> [u64; 4] {
+        self.patch_decisions
+    }
+
+    /// Returns first-site SIGSYS, successful ptrace installation, straddler
+    /// fallback, other fallback, and installed-hook dispatch counts.
+    pub const fn dispatch_path_counts(&self) -> [u64; 5] {
+        self.dispatch_paths
+    }
+
+    /// Returns the exact aggregate patch-site shape distribution.
+    pub fn patch_shape_stats(&self) -> PatchShapeStats {
+        self.patch_shapes.snapshot()
     }
 
     /// Returns candidates with a decoded instruction shape.
-    pub const fn classified_candidates(&self) -> usize {
-        self.classified_candidates
+    pub fn classified_candidates(&self) -> usize {
+        self.patch_shapes.snapshot().classified_candidates() as usize
     }
 
     /// Returns the number of patch-site instructions crossing a cache line.
-    pub const fn cacheline_straddlers(&self) -> usize {
-        self.straddle_after_1
-            + self.straddle_after_2
-            + self.straddle_after_3
-            + self.straddle_after_4
+    pub fn cacheline_straddlers(&self) -> usize {
+        self.patch_shapes.snapshot().cacheline_straddlers() as usize
     }
 
     /// Returns the number of non-straddling patch-site instructions.
-    pub const fn non_straddling(&self) -> usize {
-        self.non_straddling
+    pub fn non_straddling(&self) -> usize {
+        self.patch_shapes.snapshot().non_straddling() as usize
     }
 
     /// Returns instruction-length counts ordered as 5+, 4, 3, 2, and 1 byte.
-    pub const fn instruction_length_counts(&self) -> [usize; 5] {
+    pub fn instruction_length_counts(&self) -> [usize; 5] {
+        let exact = self.patch_shapes.snapshot();
+        let lengths = exact.instruction_lengths();
         [
-            self.instruction_len_5_plus,
-            self.instruction_len_4,
-            self.instruction_len_3,
-            self.instruction_len_2,
-            self.instruction_len_1,
+            lengths[4..].iter().sum::<u64>() as usize,
+            lengths[3] as usize,
+            lengths[2] as usize,
+            lengths[1] as usize,
+            lengths[0] as usize,
         ]
     }
 
     /// Returns straddler counts for boundaries after 1, 2, 3, and 4 bytes.
-    pub const fn straddle_prefix_counts(&self) -> [usize; 4] {
+    pub fn straddle_prefix_counts(&self) -> [usize; 4] {
+        let exact = self.patch_shapes.snapshot();
+        let prefixes = exact.straddle_after();
         [
-            self.straddle_after_1,
-            self.straddle_after_2,
-            self.straddle_after_3,
-            self.straddle_after_4,
+            prefixes[0] as usize,
+            prefixes[1] as usize,
+            prefixes[2] as usize,
+            prefixes[3] as usize,
         ]
     }
 
@@ -182,37 +202,70 @@ impl LiteinstInstrumentationStats {
     }
 }
 
+pub(crate) fn with_liteinst_stats<R>(
+    stats: Option<&Arc<Mutex<LiteinstInstrumentationStats>>>,
+    record: impl FnOnce(&mut LiteinstInstrumentationStats) -> R,
+) -> Option<R> {
+    let stats = stats?;
+    Some(record(
+        &mut stats
+            .lock()
+            .expect("LiteInst instrumentation statistics lock poisoned"),
+    ))
+}
+
 impl fmt::Display for LiteinstInstrumentationStats {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let decisions = self.decision_counts();
+        let paths = self.dispatch_path_counts();
+        let lengths = self.instruction_length_counts();
+        let prefixes = self.straddle_prefix_counts();
         write!(
             formatter,
-            "LiteInst instrumentation stats: distinct_rips_patched={} patch_candidates={} decisions[direct_pun={},relocated={},ptrace_straddler={},ptrace_other={}] classified_candidates={} cacheline_straddlers={} non_straddling={} instruction_lengths[5+={},4={},3={},2={},1={}] straddle_prefix[1={},2={},3={},4={}]",
+            "LiteInst instrumentation stats: distinct_rips_patched={} patch_candidates={} decisions[direct_pun={},relocated={},ptrace_straddler={},ptrace_other={}] paths[first_site_sigsys={},ptrace_installation={},cacheline_straddler={},unpatchable_or_other={},direct_hook={}] classified_candidates={} cacheline_straddlers={} non_straddling={} instruction_lengths[5+={},4={},3={},2={},1={}] straddle_prefix[1={},2={},3={},4={}]",
             self.distinct_rips(),
             self.patch_candidates(),
-            self.direct_pun_patched,
-            self.relocated_patched,
-            self.ptrace_straddler_bail,
-            self.ptrace_other_fallback,
-            self.classified_candidates,
+            decisions[0],
+            decisions[1],
+            decisions[2],
+            decisions[3],
+            paths[0],
+            paths[1],
+            paths[2],
+            paths[3],
+            paths[4],
+            self.classified_candidates(),
             self.cacheline_straddlers(),
-            self.non_straddling,
-            self.instruction_len_5_plus,
-            self.instruction_len_4,
-            self.instruction_len_3,
-            self.instruction_len_2,
-            self.instruction_len_1,
-            self.straddle_after_1,
-            self.straddle_after_2,
-            self.straddle_after_3,
-            self.straddle_after_4,
+            self.non_straddling(),
+            lengths[0],
+            lengths[1],
+            lengths[2],
+            lengths[3],
+            lengths[4],
+            prefixes[0],
+            prefixes[1],
+            prefixes[2],
+            prefixes[3],
         )
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::LiteinstInstrumentationStats;
     use super::LiteinstPatchOutcome;
+    use super::with_liteinst_stats;
+
+    #[test]
+    fn disabled_collection_does_not_run_stats_only_classification() {
+        let classified = Cell::new(false);
+        let result = with_liteinst_stats(None, |_| classified.set(true));
+
+        assert!(result.is_none());
+        assert!(!classified.get());
+    }
 
     #[test]
     fn aggregates_all_requested_buckets_and_deduplicates_rips() {
@@ -249,10 +302,17 @@ mod tests {
         );
         stats.record_site(0x5000, LiteinstPatchOutcome::PtraceOtherFallback, None);
         stats.record_site(0x7000, LiteinstPatchOutcome::PtraceOtherFallback, None);
+        stats.record_first_site_sigsys();
+        stats.record_ptrace_installation();
+        stats.record_cacheline_straddler_fallback();
+        stats.record_unpatchable_or_other_fallback();
+        stats.record_direct_hook();
+        stats.record_direct_hook();
 
         assert_eq!(stats.distinct_rips(), 2);
         assert_eq!(stats.patch_candidates(), 7);
         assert_eq!(stats.decision_counts(), [1, 1, 4, 1]);
+        assert_eq!(stats.dispatch_path_counts(), [1, 1, 1, 1, 2]);
         assert_eq!(stats.classified_candidates(), 6);
         assert_eq!(stats.cacheline_straddlers(), 4);
         assert_eq!(stats.non_straddling(), 2);
@@ -260,7 +320,32 @@ mod tests {
         assert_eq!(stats.straddle_prefix_counts(), [1, 1, 1, 1]);
         assert_eq!(
             stats.to_string(),
-            "LiteInst instrumentation stats: distinct_rips_patched=2 patch_candidates=7 decisions[direct_pun=1,relocated=1,ptrace_straddler=4,ptrace_other=1] classified_candidates=6 cacheline_straddlers=4 non_straddling=2 instruction_lengths[5+=2,4=1,3=1,2=1,1=1] straddle_prefix[1=1,2=1,3=1,4=1]"
+            "LiteInst instrumentation stats: distinct_rips_patched=2 patch_candidates=7 decisions[direct_pun=1,relocated=1,ptrace_straddler=4,ptrace_other=1] paths[first_site_sigsys=1,ptrace_installation=1,cacheline_straddler=1,unpatchable_or_other=1,direct_hook=2] classified_candidates=6 cacheline_straddlers=4 non_straddling=2 instruction_lengths[5+=2,4=1,3=1,2=1,1=1] straddle_prefix[1=1,2=1,3=1,4=1]"
         );
+    }
+
+    #[test]
+    fn equal_rips_in_different_processes_or_exec_generations_remain_distinct() {
+        let mut stats = LiteinstInstrumentationStats::default();
+        for (process, generation) in [(11, 0), (12, 0), (11, 1)] {
+            stats.record_process_site(
+                process,
+                generation,
+                0x4000,
+                LiteinstPatchOutcome::RelocatedPatched,
+                Some((2, None)),
+            );
+        }
+        stats.record_process_site(
+            11,
+            0,
+            0x4000,
+            LiteinstPatchOutcome::RelocatedPatched,
+            Some((2, None)),
+        );
+
+        assert_eq!(stats.patch_candidates(), 3);
+        assert_eq!(stats.distinct_rips(), 3);
+        assert_eq!(stats.decision_counts(), [0, 3, 0, 0]);
     }
 }

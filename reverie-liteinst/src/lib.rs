@@ -12,6 +12,7 @@ compile_error!("reverie-liteinst requires Linux x86-64");
 
 mod backend;
 mod patch_alloc;
+mod stats;
 mod straddler;
 
 pub use backend::COORDINATOR_ENV;
@@ -20,6 +21,10 @@ pub use backend::PreloadBootstrap;
 pub use backend::TOOL_PRELOAD_ENV;
 pub use backend::take_preload_bootstrap;
 pub use reverie_ptrace::LiteinstInstrumentationStats;
+pub use stats::LiteinstBackendStatsSnapshot;
+pub use stats::LiteinstBackendStatsSource;
+pub use stats::LiteinstDispatchPath;
+pub use stats::LiteinstPatchDecision;
 pub mod rpc;
 mod runtime;
 mod tool_host;

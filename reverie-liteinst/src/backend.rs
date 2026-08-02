@@ -229,7 +229,12 @@ impl LiteinstBackend {
             .await
     }
 
-    /// Runs the ptrace-owned LiteInst hybrid and returns patch-site statistics.
+    /// Runs the ptrace-owned LiteInst hybrid and returns typed backend statistics.
+    ///
+    /// This source fully accounts for the current hybrid because every installed
+    /// hook returns through the ptrace-host SIGTRAP path. The in-guest Tool path
+    /// keeps direct-hook counters in each guest process; exposing those after
+    /// exit requires RPC aggregation and is deliberately not inferred here.
     pub async fn run_host_with_preload_and_stats<T>(
         mut command: Command,
         config: <T::GlobalState as GlobalTool>::Config,
@@ -238,7 +243,7 @@ impl LiteinstBackend {
         (
             ExitStatus,
             T::GlobalState,
-            crate::LiteinstInstrumentationStats,
+            crate::LiteinstBackendStatsSource,
         ),
         Error,
     >
@@ -262,7 +267,11 @@ impl LiteinstBackend {
             .liteinst_instrumentation_stats()
             .expect("LiteInst runtime tracer must expose instrumentation statistics");
         let (status, global) = tracer.wait().await?;
-        Ok((status, global, stats.snapshot()))
+        Ok((
+            status,
+            global,
+            crate::LiteinstBackendStatsSource::from_ptrace_host_hybrid(stats.snapshot()),
+        ))
     }
 
     /// Runs a Tool under the ptrace-owned LiteInst hybrid and captures output.
@@ -297,7 +306,7 @@ impl LiteinstBackend {
             .await
     }
 
-    /// Runs the ptrace-owned LiteInst hybrid, captures output, and returns statistics.
+    /// Runs the ptrace-owned LiteInst hybrid, captures output, and returns typed statistics.
     pub async fn run_host_with_output_and_preload_and_stats<T>(
         mut command: Command,
         config: <T::GlobalState as GlobalTool>::Config,
@@ -306,7 +315,7 @@ impl LiteinstBackend {
         (
             ReverieOutput,
             T::GlobalState,
-            crate::LiteinstInstrumentationStats,
+            crate::LiteinstBackendStatsSource,
         ),
         Error,
     >
@@ -333,7 +342,11 @@ impl LiteinstBackend {
             .liteinst_instrumentation_stats()
             .expect("LiteInst runtime tracer must expose instrumentation statistics");
         let (output, global) = tracer.wait_with_output().await?;
-        Ok((output, global, stats.snapshot()))
+        Ok((
+            output,
+            global,
+            crate::LiteinstBackendStatsSource::from_ptrace_host_hybrid(stats.snapshot()),
+        ))
     }
 
     /// Runs a tool using an explicit tool-specific preload library.

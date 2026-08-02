@@ -163,23 +163,41 @@ impl PatchShapeStats {
 /// Deduplicating collector for [`PatchShapeStats`].
 #[derive(Clone, Debug, Default)]
 pub struct PatchShapeCollector {
-    candidate_rips: BTreeSet<u64>,
-    patched_rips: BTreeSet<u64>,
+    candidate_sites: BTreeSet<(u64, u64, u64)>,
+    patched_sites: BTreeSet<(u64, u64, u64)>,
     stats: PatchShapeStats,
 }
 
 impl PatchShapeCollector {
     /// Records one patch decision for an instruction pointer.
     ///
-    /// Repeated decisions for the same instruction pointer are ignored. `shape`
-    /// may be absent when decoding failed before a patch decision was made.
+    /// This convenience method is for a single process and execution generation.
+    /// Backends that aggregate a process tree or survive exec must instead use
+    /// [`Self::record_process_site`] so equal virtual addresses remain distinct.
     pub fn record_site(&mut self, rip: u64, patched: bool, shape: Option<InstructionPatchShape>) {
-        if !self.candidate_rips.insert(rip) {
+        self.record_process_site(0, 0, rip, patched, shape);
+    }
+
+    /// Records one patch decision identified by process, exec generation, and RIP.
+    ///
+    /// Repeated decisions for the same three-part identity are ignored. The
+    /// identities are retained only for deduplication and never enter the
+    /// aggregate snapshot or its display output.
+    pub fn record_process_site(
+        &mut self,
+        process_identity: u64,
+        execution_generation: u64,
+        rip: u64,
+        patched: bool,
+        shape: Option<InstructionPatchShape>,
+    ) {
+        let identity = (process_identity, execution_generation, rip);
+        if !self.candidate_sites.insert(identity) {
             return;
         }
         self.stats.candidate_rips += 1;
         if patched {
-            self.patched_rips.insert(rip);
+            self.patched_sites.insert(identity);
             self.stats.patched_rips += 1;
         }
 
@@ -294,6 +312,32 @@ mod tests {
         assert_eq!(stats.instruction_lengths().iter().sum::<u64>(), 2);
         assert_eq!(stats.straddle_after()[0], 1);
         assert_eq!(stats.straddle_after().iter().sum::<u64>(), 1);
+    }
+
+    #[test]
+    fn patch_shape_collector_keeps_equal_rips_distinct_across_processes_and_execs() {
+        let mut collector = PatchShapeCollector::default();
+        for (process, generation) in [(11, 0), (12, 0), (11, 1)] {
+            collector.record_process_site(
+                process,
+                generation,
+                0x4000,
+                true,
+                Some(InstructionPatchShape::new(2, None)),
+            );
+        }
+        collector.record_process_site(
+            11,
+            0,
+            0x4000,
+            true,
+            Some(InstructionPatchShape::new(2, None)),
+        );
+
+        let stats = collector.snapshot();
+        assert_eq!(stats.candidate_rips(), 3);
+        assert_eq!(stats.patched_rips(), 3);
+        assert_eq!(stats.instruction_lengths()[1], 3);
     }
 
     #[test]
