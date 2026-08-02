@@ -30,6 +30,8 @@ use super::utils;
 use super::vdso;
 use crate::protected_files;
 use crate::signal::guard;
+use crate::stats;
+use crate::stats::SabreSlowPath;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-140): Review the loader-owned syscall-frame lifetime boundary.
@@ -510,6 +512,7 @@ pub extern "C" fn handle_syscall<T: ToolGlobal>(
     if let Some(clone_flags) = vfork_child_flags() {
         let sys_no = Sysno::from(syscall as i32);
         if !is_vfork_native_syscall_allowed(sys_no) {
+            stats::increment_guest_slow_path(SabreSlowPath::VforkChildRejected);
             return -Errno::ENOSYS.into_raw() as usize;
         }
         if sys_no == Sysno::rt_sigaction {
@@ -518,8 +521,10 @@ pub extern "C" fn handle_syscall<T: ToolGlobal>(
             // child's private kernel table changes without mutating Reverie's
             // process-global handler metadata in the shared address space.
             if clone_flags & libc::CLONE_SIGHAND as usize != 0 {
+                stats::increment_guest_slow_path(SabreSlowPath::VforkChildRejected);
                 return -Errno::ENOSYS.into_raw() as usize;
             }
+            stats::increment_guest_slow_path(SabreSlowPath::VforkChildNativeDispatch);
             return unsafe {
                 syscalls::syscall6(sys_no, arg1, arg2, arg3, arg4, arg5, arg6)
                     .unwrap_or_else(|error| -error.into_raw() as usize)
@@ -527,6 +532,7 @@ pub extern "C" fn handle_syscall<T: ToolGlobal>(
         }
         let args = SyscallArgs::new(arg1, arg2, arg3, arg4, arg5, arg6);
         let intercepted = Syscall::from_raw(sys_no, args);
+        stats::increment_guest_slow_path(SabreSlowPath::VforkChildNativeDispatch);
         return unsafe { intercepted.call() }.unwrap_or_else(|error| -error.into_raw() as usize);
     }
 

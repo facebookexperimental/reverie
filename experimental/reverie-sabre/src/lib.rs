@@ -19,6 +19,7 @@ mod reverie_adapter;
 mod rpc;
 mod signal;
 mod slot_map;
+pub mod stats;
 mod thread;
 mod tool;
 mod utils;
