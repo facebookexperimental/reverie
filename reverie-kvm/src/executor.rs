@@ -11754,6 +11754,155 @@ mod tests {
     }
 
     #[test]
+    fn so_incoming_cpu_udp4_loopback_flow_is_canonical_zero() {
+        // End-to-end model of the so_incoming_cpu_udp4 compat cell: an AF_INET
+        // SOCK_DGRAM receiver bound to loopback, a real datagram delivered from
+        // a second socket, then getsockopt(SO_INCOMING_CPU) on the receiver.
+        // This exercises the full executor path the cell drives (socket / bind /
+        // getsockname / sendto / recvfrom / getsockopt) rather than the option
+        // read in isolation, proving SO_INCOMING_CPU is canonicalized to virtual
+        // CPU 0 after the socket has actually received data on some host CPU.
+        const BIND_ADDRESS: u64 = 0x100;
+        const NAME_ADDRESS: u64 = 0x200;
+        const NAME_LENGTH: u64 = 0x300;
+        const DEST_ADDRESS: u64 = 0x400;
+        const PAYLOAD: u64 = 0x500;
+        const RECV_BUFFER: u64 = 0x600;
+        const OPT_RESULT: u64 = 0x700;
+        const OPT_LENGTH: u64 = 0x800;
+
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+
+        let loopback = libc::sockaddr_in {
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: 0,
+            sin_addr: libc::in_addr {
+                s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+            },
+            sin_zero: [0; 8],
+        };
+        let address_length = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+        assert_eq!(write_struct(&mut memory, BIND_ADDRESS, &loopback), 0);
+
+        // Receiver socket, bound to an ephemeral loopback port.
+        let receiver = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_socket,
+            [libc::AF_INET as u64, libc::SOCK_DGRAM as u64, 0, 0, 0, 0],
+        );
+        assert_eq!(receiver, 3);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_bind,
+                [
+                    receiver as u64,
+                    BIND_ADDRESS,
+                    address_length as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            0
+        );
+
+        // Recover the kernel-assigned port so the sender can target it.
+        assert_eq!(write_struct(&mut memory, NAME_LENGTH, &address_length), 0);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_getsockname,
+                [receiver as u64, NAME_ADDRESS, NAME_LENGTH, 0, 0, 0],
+            ),
+            0
+        );
+        let bound: libc::sockaddr_in = read_struct(&memory, NAME_ADDRESS);
+        assert_eq!(bound.sin_family, libc::AF_INET as libc::sa_family_t);
+        assert_ne!(bound.sin_port, 0);
+
+        let destination = libc::sockaddr_in {
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: bound.sin_port,
+            sin_addr: libc::in_addr {
+                s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+            },
+            sin_zero: [0; 8],
+        };
+        assert_eq!(write_struct(&mut memory, DEST_ADDRESS, &destination), 0);
+
+        // Sender socket delivers a datagram to the receiver over loopback.
+        let sender = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_socket,
+            [libc::AF_INET as u64, libc::SOCK_DGRAM as u64, 0, 0, 0, 0],
+        );
+        assert_eq!(sender, 4);
+        memory.write(PAYLOAD, b"udp4!").unwrap();
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_sendto,
+                [
+                    sender as u64,
+                    PAYLOAD,
+                    5,
+                    libc::MSG_NOSIGNAL as u64,
+                    DEST_ADDRESS,
+                    address_length as u64,
+                ],
+            ),
+            5
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_recvfrom,
+                [receiver as u64, RECV_BUFFER, 5, 0, 0, 0],
+            ),
+            5
+        );
+        let mut received = [0u8; 5];
+        memory.read(RECV_BUFFER, &mut received).unwrap();
+        assert_eq!(&received, b"udp4!");
+
+        // The datagram was processed on some host CPU, yet the option must read
+        // back a canonical virtual CPU 0, matching detcore's handle_getsockopt.
+        let cpu_length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        assert_eq!(write_struct(&mut memory, OPT_RESULT, &0x5a5a_5a5a_i32), 0);
+        assert_eq!(write_struct(&mut memory, OPT_LENGTH, &cpu_length), 0);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_getsockopt,
+                [
+                    receiver as u64,
+                    libc::SOL_SOCKET as u64,
+                    libc::SO_INCOMING_CPU as u64,
+                    OPT_RESULT,
+                    OPT_LENGTH,
+                    0,
+                ],
+            ),
+            0
+        );
+        assert_eq!(
+            read_struct::<libc::socklen_t>(&memory, OPT_LENGTH),
+            cpu_length
+        );
+        assert_eq!(read_struct::<libc::c_int>(&memory, OPT_RESULT), 0);
+    }
+
+    #[test]
     fn getsockopt_so_cookie_uses_open_file_identity() {
         const RESULT: u64 = 0x100;
         const RESULT_LENGTH: u64 = 0x200;
