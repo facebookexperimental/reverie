@@ -1311,6 +1311,66 @@ fn static_elf_executes_syscall_and_exits() {
 }
 
 #[test]
+fn static_elf_getppid_matches_ptrace_parity() {
+    match Kvm::new() {
+        Ok(_) => {}
+        Err(error) if kvm_is_unavailable(&error) => {
+            eprintln!("skipping KVM getppid parity test: cannot open /dev/kvm: {error}");
+            return;
+        }
+        Err(error) => panic!("failed to probe /dev/kvm: {error}"),
+    }
+
+    // A static ELF guest that issues getppid and self-checks the deterministic
+    // parent PID. The ptrace backend runs the guest inside a real PID namespace
+    // (init == 1), so the conventional root guest (detcore ROOT_DETPID == 3) has
+    // getppid() == 1; the namespace init itself (PID 1) has getppid() == 0. KVM
+    // synthesizes the guest identity and must reproduce the same values. Any
+    // mismatch takes the exit_group(42) path instead of producing a false pass.
+    #[rustfmt::skip]
+    fn getppid_probe(expected_ppid: u8) -> [u8; 36] {
+        [
+            0xb8, 0x6e, 0x00, 0x00, 0x00,   // mov eax, SYS_getppid (110)
+            0x0f, 0x05,                     // syscall
+            0x48, 0x83, 0xf8, expected_ppid, // cmp rax, expected_ppid
+            0x75, 0x09,                     // jne failure (skip the 9-byte success block)
+            0xb8, 0xe7, 0x00, 0x00, 0x00,   // mov eax, SYS_exit_group (231)
+            0x31, 0xff,                     // xor edi, edi
+            0x0f, 0x05,                     // syscall  (exit_group(0))
+            0xb8, 0xe7, 0x00, 0x00, 0x00,   // failure: mov eax, SYS_exit_group
+            0xbf, 0x2a, 0x00, 0x00, 0x00,   // mov edi, 42
+            0x0f, 0x05,                     // syscall  (exit_group(42))
+            0x0f, 0x0b,                     // ud2
+        ]
+    }
+
+    // Conventional root guest: detcore ROOT_DETPID == 3 => getppid() == 1.
+    let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+    backend
+        .install_static_elf(&static_elf(&getppid_probe(1)), "/bin/true")
+        .unwrap();
+    backend.set_root_pid(3).unwrap();
+    assert_eq!(
+        backend.run_static_elf().unwrap(),
+        0,
+        "root guest pid=3 must report getppid()==1 to match the ptrace namespace"
+    );
+
+    // Namespace init edge case: a guest that is itself PID 1 has no parent.
+    let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+    backend
+        .install_static_elf(&static_elf(&getppid_probe(0)), "/bin/true")
+        .unwrap();
+    // Default root_pid is already 1; set it explicitly to document intent.
+    backend.set_root_pid(1).unwrap();
+    assert_eq!(
+        backend.run_static_elf().unwrap(),
+        0,
+        "namespace-init guest pid=1 must report getppid()==0"
+    );
+}
+
+#[test]
 fn static_elf_executes_avx_instruction() {
     match Kvm::new() {
         Ok(_) => {}
