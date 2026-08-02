@@ -766,6 +766,9 @@ fn execute_basic_syscall_with_output(
         return kill_signal(state, number, args);
     } else if number == libc::SYS_close as u64 {
         close(state, args[0])
+    } else if number == libc::SYS_close_range as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        close_range(state, args)
     } else if number == libc::SYS_futex as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         futex(memory, args)
@@ -1043,6 +1046,13 @@ fn mutates_file_table(number: u64) -> bool {
             // read/write/close) cannot resolve the fresh fd and fails EBADF.
             || number == libc::SYS_memfd_create as u64
             || number == libc::SYS_close as u64
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-close-range): close_range removes a span of
+            // descriptors, so its effect must be written back to the shared file
+            // table; otherwise a CLONE_FILES sibling would still resolve the
+            // just-closed fds and the guest's own follow-up probe would wrongly
+            // find them open.
+            || number == libc::SYS_close_range as u64
     )
 }
 
@@ -7275,6 +7285,60 @@ fn close(state: &mut LoadedStaticElf, raw_fd: u64) -> i64 {
     negative_errno(libc::EBADF)
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-close-range): close_range(2) closes every open guest
+// descriptor in the inclusive interval [first, last]. The KVM guest owns one
+// logical descriptor table per process, so CLOSE_RANGE_UNSHARE (unshare-then-
+// close) is observationally equivalent to closing the range for the caller and
+// is accepted as a precondition; CLOSE_RANGE_CLOEXEC marks the range close-on-
+// exec instead of closing it. The scan is bounded to the descriptors actually
+// open (keys of `state.files` plus any open standard fd), so a `last == U32::MAX`
+// request never walks a four-billion-wide interval.
+fn close_range(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    const CLOSE_RANGE_UNSHARE: u64 = 1 << 1;
+    const CLOSE_RANGE_CLOEXEC: u64 = 1 << 2;
+
+    let first = args[0];
+    let last = args[1];
+    let flags = args[2];
+    if first > last {
+        return negative_errno(libc::EINVAL);
+    }
+    if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 {
+        return negative_errno(libc::EINVAL);
+    }
+
+    let in_range = |fd: libc::c_int| {
+        let fd = u64::from(fd as u32);
+        first <= fd && fd <= last
+    };
+    let mut targets: Vec<libc::c_int> = state
+        .files
+        .keys()
+        .copied()
+        .filter(|&fd| in_range(fd))
+        .collect();
+    for standard in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        if in_range(standard) && is_open_standard(state, standard) {
+            targets.push(standard);
+        }
+    }
+
+    if flags & CLOSE_RANGE_CLOEXEC != 0 {
+        for fd in targets {
+            state.cloexec_fds.insert(fd);
+        }
+        return 0;
+    }
+
+    for fd in targets {
+        // Reuse the single-fd close path so every descriptor side table stays
+        // consistent. Each fd is known open here, so close never returns EBADF.
+        close(state, u64::from(fd as u32));
+    }
+    0
+}
+
 fn arch_prctl(
     memory: &mut GuestMemory,
     state: &mut LoadedStaticElf,
@@ -9666,6 +9730,96 @@ mod tests {
             content.extend_from_slice(&chunk);
         }
         content
+    }
+
+    #[test]
+    fn close_range_closes_the_inclusive_descriptor_span() {
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, 0x4000).unwrap();
+
+        // Three live guest descriptors: 3, 4, 5.
+        let low = open_readonly(&mut memory, &mut state, "/proc/uptime");
+        let mid = open_readonly(&mut memory, &mut state, "/proc/uptime");
+        let high = open_readonly(&mut memory, &mut state, "/proc/uptime");
+        assert_eq!([low, mid, high], [3, 4, 5]);
+
+        // close_range over [4, U32::MAX] closes 4 and 5 but leaves 3 open, and
+        // the open-ended upper bound must not iterate a four-billion-wide span.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_close_range,
+                [mid as u64, u64::from(u32::MAX), 0, 0, 0, 0],
+            ),
+            0
+        );
+        assert!(state.files.contains_key(&(low as i32)));
+        assert!(!state.files.contains_key(&(mid as i32)));
+        assert!(!state.files.contains_key(&(high as i32)));
+        // Re-closing a descriptor the range already removed reports EBADF, the
+        // same signal the syscall-quick-wins corpus cell probes via fcntl.
+        assert_eq!(close(&mut state, mid as u64), negative_errno(libc::EBADF));
+
+        // A well-formed single-fd range closes exactly that descriptor.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_close_range,
+                [low as u64, low as u64, 0, 0, 0, 0],
+            ),
+            0
+        );
+        assert!(state.files.is_empty());
+    }
+
+    #[test]
+    fn close_range_validates_bounds_and_flags() {
+        const CLOSE_RANGE_CLOEXEC: u64 = 1 << 2;
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, 0x4000).unwrap();
+
+        // first > last is rejected with EINVAL.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_close_range,
+                [5, 4, 0, 0, 0, 0],
+            ),
+            negative_errno(libc::EINVAL)
+        );
+        // An unknown flag bit is rejected with EINVAL.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_close_range,
+                [0, 0, 1, 0, 0, 0],
+            ),
+            negative_errno(libc::EINVAL)
+        );
+
+        // CLOSE_RANGE_CLOEXEC marks the span close-on-exec instead of closing it.
+        let fd = open_readonly(&mut memory, &mut state, "/proc/uptime");
+        assert_eq!(fd, 3);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_close_range,
+                [fd as u64, fd as u64, CLOSE_RANGE_CLOEXEC, 0, 0, 0],
+            ),
+            0
+        );
+        assert!(
+            state.files.contains_key(&(fd as i32)),
+            "CLOSE_RANGE_CLOEXEC must not close the descriptor"
+        );
+        assert!(state.cloexec_fds.contains(&(fd as i32)));
     }
 
     #[test]
