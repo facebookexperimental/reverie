@@ -233,6 +233,7 @@ extern int32_t reverie_dbi_runtime_pre_syscall(
     memory_reader_t read_memory, memory_writer_t write_memory,
     reverie_emit_fn_t emit);
 extern const char *reverie_dbi_runtime_name(void);
+extern uint8_t reverie_dbi_runtime_kind_code(void);
 extern void reverie_dbi_runtime_totals(uint64_t *branches, uint64_t *syscalls,
                                        uint64_t *rewritten,
                                        uint64_t *memory_hash);
@@ -248,6 +249,16 @@ static ptr_uint_t cpuid_marker_note;
 static ptr_uint_t rdtsc_marker_note;
 static ptr_uint_t rdtscp_marker_note;
 static bool report_summary;
+// Typed backend-statistics sink path. When the launcher passes
+// `-stats_path <path>`, each real runtime image appends exactly one fixed-size
+// binary record to this file at `event_exit`, using DynamoRIO's own
+// append-mode file I/O (O_APPEND, so concurrent process images append their
+// 144-byte records atomically without interleaving). The launcher decodes and
+// commutatively aggregates every record in the process tree (see
+// src/backend_stats.rs). An empty path means stats collection is off. Using a
+// shared path instead of an inherited fd avoids the drrun->guest exec fd
+// inheritance problem that the diagnostic fd works around.
+static char stats_path[4096];
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-dbi-preempt): Review branch-count preemption configuration.
 // Deterministic branch-count preemption. When `preemption_enabled` (set from the
@@ -2318,6 +2329,106 @@ static void thread_exit(void *drcontext) {
   }
 }
 
+// Wire-v1 stats record layout (must byte-match src/backend_stats.rs):
+//   header(24) + 15 little-endian u64 fields(120) = 144 bytes.
+// Header: magic[8]="RVDBISTA", version u16=1, record_len u16=144, flags u32,
+//         runtime_kind u8, 7 reserved bytes (u64 alignment padding).
+#define STATS_WIRE_RECORD_LEN 144
+#define STATS_WIRE_VERSION 1
+#define STATS_WIRE_FLAG_DR_STATS_PRESENT 1u
+
+static void stats_put_u64_le(unsigned char *out, uint64_t value) {
+  for (int byte = 0; byte < 8; ++byte)
+    out[byte] = (unsigned char)((value >> (8 * byte)) & 0xff);
+}
+
+// Emits one fixed-size stats record for this runtime image to `stats_path`.
+// Called only for a real runtime owner (never a copied/vfork runtime), so the
+// totals read here belong to exactly this process image. The file is opened
+// per-image in append mode and the whole record is written by a single
+// dr_write_file, so concurrent images append their 144-byte records atomically
+// without interleaving.
+static void emit_stats_record(void) {
+  uint64_t branches = 0;
+  uint64_t syscalls = 0;
+  uint64_t rewritten = 0;
+  uint64_t memory_hash = 0;
+  reverie_dbi_runtime_totals(&branches, &syscalls, &rewritten, &memory_hash);
+  uint64_t stdin_reads =
+      atomic_load_explicit(&stdin_read_count, memory_order_relaxed);
+  uint64_t generation =
+      atomic_load_explicit(&image_generation, memory_order_acquire);
+
+  dr_stats_t dr_stats;
+  dr_stats.size = sizeof(dr_stats);
+  bool dr_stats_present = dr_get_stats(&dr_stats);
+
+  unsigned char record[STATS_WIRE_RECORD_LEN];
+  memset(record, 0, sizeof(record));
+  memcpy(record, "RVDBISTA", 8);
+  record[8] = (unsigned char)(STATS_WIRE_VERSION & 0xff);
+  record[9] = (unsigned char)((STATS_WIRE_VERSION >> 8) & 0xff);
+  record[10] = (unsigned char)(STATS_WIRE_RECORD_LEN & 0xff);
+  record[11] = (unsigned char)((STATS_WIRE_RECORD_LEN >> 8) & 0xff);
+  uint32_t flags = dr_stats_present ? STATS_WIRE_FLAG_DR_STATS_PRESENT : 0u;
+  record[12] = (unsigned char)(flags & 0xff);
+  record[13] = (unsigned char)((flags >> 8) & 0xff);
+  record[14] = (unsigned char)((flags >> 16) & 0xff);
+  record[15] = (unsigned char)((flags >> 24) & 0xff);
+  record[16] = reverie_dbi_runtime_kind_code();
+  // record[17..24] stay zero (reserved alignment padding).
+
+  size_t offset = 24;
+  stats_put_u64_le(record + offset, generation);
+  offset += 8;
+  stats_put_u64_le(record + offset, (uint64_t)(uint32_t)virtual_process_id);
+  offset += 8;
+  stats_put_u64_le(record + offset,
+                   (uint64_t)(uint32_t)virtual_parent_process_id);
+  offset += 8;
+  stats_put_u64_le(record + offset, branches);
+  offset += 8;
+  stats_put_u64_le(record + offset, syscalls);
+  offset += 8;
+  stats_put_u64_le(record + offset, rewritten);
+  offset += 8;
+  stats_put_u64_le(record + offset, stdin_reads);
+  offset += 8;
+  stats_put_u64_le(record + offset, memory_hash);
+  offset += 8;
+  stats_put_u64_le(record + offset,
+                   dr_stats_present ? dr_stats.basic_block_count : 0);
+  offset += 8;
+  stats_put_u64_le(record + offset,
+                   dr_stats_present ? dr_stats.num_threads_created : 0);
+  offset += 8;
+  stats_put_u64_le(record + offset,
+                   dr_stats_present ? dr_stats.synchs_not_at_safe_spot : 0);
+  offset += 8;
+  stats_put_u64_le(record + offset,
+                   dr_stats_present ? dr_stats.num_native_signals : 0);
+  offset += 8;
+  stats_put_u64_le(record + offset,
+                   dr_stats_present ? dr_stats.num_cache_exits : 0);
+  offset += 8;
+  stats_put_u64_le(record + offset,
+                   dr_stats_present ? dr_stats.peak_num_threads : 0);
+  offset += 8;
+  stats_put_u64_le(record + offset,
+                   dr_stats_present ? dr_stats.peak_vmm_blocks_reach_cache : 0);
+  offset += 8;
+  DR_ASSERT(offset == STATS_WIRE_RECORD_LEN);
+
+  file_t stats_file = dr_open_file(stats_path, DR_FILE_WRITE_APPEND);
+  if (stats_file == INVALID_FILE) {
+    dr_fprintf(diagnostic_file,
+               "reverie-dbi: failed to open stats sink for append\n");
+    return;
+  }
+  dr_write_file(stats_file, record, sizeof(record));
+  dr_close_file(stats_file);
+}
+
 static void event_exit(void) {
   if (!has_copied_runtime() ||
       (runtime_uses_external_global() && !is_copied_vfork_process()))
@@ -2337,6 +2448,8 @@ static void event_exit(void) {
                reverie_dbi_runtime_name(), branches, syscalls, rewritten,
                stdin_reads, memory_hash);
   }
+  if (stats_path[0] != 0 && !has_copied_runtime())
+    emit_stats_record();
   if (unsupported_report_file != INVALID_FILE) {
     dr_close_file(unsupported_report_file);
     unsupported_report_file = INVALID_FILE;
@@ -2417,6 +2530,11 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[]) {
       DR_ASSERT(dr_sscanf(argv[i], "%d", &fd) == 1);
       DR_ASSERT(fd >= 0);
       diagnostic_file = (file_t)fd;
+    }
+    else if (strcmp(argv[i], "-stats_path") == 0) {
+      DR_ASSERT(++i < argc);
+      DR_ASSERT(strlen(argv[i]) < sizeof(stats_path));
+      dr_snprintf(stats_path, sizeof(stats_path), "%s", argv[i]);
     }
     else if (strcmp(argv[i], "-unsupported-report-path") == 0) {
       DR_ASSERT(++i < argc);

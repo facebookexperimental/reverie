@@ -29,8 +29,12 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
+use reverie::BackendStatsRequest;
 use reverie::GlobalTool;
 use reverie_rpc_transport::RpcServer;
+
+use crate::backend_stats::DbiBackendStatsAggregator;
+use crate::backend_stats::DbiBackendStatsSource;
 
 const CLIENT_ENV: &str = "REVERIE_DBI_CLIENT";
 const DYNAMORIO_ENV: &str = "DYNAMORIO_HOME";
@@ -261,11 +265,20 @@ impl DbiRunner {
         G: GlobalTool + 'static,
     {
         match self
-            .run_with_global::<G>(guest, None, config, true, CoordinatedInput::Null)
+            .run_with_global::<G>(
+                guest,
+                None,
+                config,
+                true,
+                CoordinatedInput::Null,
+                BackendStatsRequest::DISABLED,
+            )
             .await?
         {
-            CoordinatedWait::Output(output, global) => Ok((output, global)),
-            CoordinatedWait::Status(_, _) => unreachable!("output launch returned only status"),
+            CoordinatedWait::Output(output, global, _) => Ok((output, global)),
+            CoordinatedWait::Status(_, _, _) => {
+                unreachable!("output launch returned only status")
+            }
         }
     }
 
@@ -288,11 +301,14 @@ impl DbiRunner {
                 config,
                 true,
                 CoordinatedInput::Null,
+                BackendStatsRequest::DISABLED,
             )
             .await?
         {
-            CoordinatedWait::Output(output, global) => Ok((output, global)),
-            CoordinatedWait::Status(_, _) => unreachable!("output launch returned only status"),
+            CoordinatedWait::Output(output, global, _) => Ok((output, global)),
+            CoordinatedWait::Status(_, _, _) => {
+                unreachable!("output launch returned only status")
+            }
         }
     }
 
@@ -316,11 +332,14 @@ impl DbiRunner {
                 config,
                 true,
                 CoordinatedInput::Reader(Box::new(input)),
+                BackendStatsRequest::DISABLED,
             )
             .await?
         {
-            CoordinatedWait::Output(output, global) => Ok((output, global)),
-            CoordinatedWait::Status(_, _) => unreachable!("output launch returned only status"),
+            CoordinatedWait::Output(output, global, _) => Ok((output, global)),
+            CoordinatedWait::Status(_, _, _) => {
+                unreachable!("output launch returned only status")
+            }
         }
     }
 
@@ -336,11 +355,20 @@ impl DbiRunner {
         G: GlobalTool + 'static,
     {
         match self
-            .run_with_global::<G>(guest, None, config, true, CoordinatedInput::Inherit)
+            .run_with_global::<G>(
+                guest,
+                None,
+                config,
+                true,
+                CoordinatedInput::Inherit,
+                BackendStatsRequest::DISABLED,
+            )
             .await?
         {
-            CoordinatedWait::Output(output, global) => Ok((output, global)),
-            CoordinatedWait::Status(_, _) => unreachable!("output launch returned only status"),
+            CoordinatedWait::Output(output, global, _) => Ok((output, global)),
+            CoordinatedWait::Status(_, _, _) => {
+                unreachable!("output launch returned only status")
+            }
         }
     }
 
@@ -356,11 +384,18 @@ impl DbiRunner {
         G: GlobalTool + 'static,
     {
         match self
-            .run_with_global::<G>(guest, None, config, false, CoordinatedInput::Inherit)
+            .run_with_global::<G>(
+                guest,
+                None,
+                config,
+                false,
+                CoordinatedInput::Inherit,
+                BackendStatsRequest::DISABLED,
+            )
             .await?
         {
-            CoordinatedWait::Status(status, global) => Ok((status, global)),
-            CoordinatedWait::Output(_, _) => unreachable!("status launch captured output"),
+            CoordinatedWait::Status(status, global, _) => Ok((status, global)),
+            CoordinatedWait::Output(_, _, _) => unreachable!("status launch captured output"),
         }
     }
 
@@ -383,11 +418,76 @@ impl DbiRunner {
                 config,
                 false,
                 CoordinatedInput::Inherit,
+                BackendStatsRequest::DISABLED,
             )
             .await?
         {
-            CoordinatedWait::Status(status, global) => Ok((status, global)),
-            CoordinatedWait::Output(_, _) => unreachable!("status launch captured output"),
+            CoordinatedWait::Status(status, global, _) => Ok((status, global)),
+            CoordinatedWait::Output(_, _, _) => unreachable!("status launch captured output"),
+        }
+    }
+
+    /// Runs `guest` with captured output, one shared global, and DBI backend statistics.
+    ///
+    /// Behaves like [`Self::output_with_global`] but additionally collects the
+    /// typed per-process instrumentation records emitted by every followed image
+    /// and aggregates them into a [`DbiBackendStatsSource`]. The source is
+    /// `Some` even when no image reached `event_exit` (an empty snapshot); it is
+    /// `None` only when statistics collection is not requested, which never
+    /// happens on this path.
+    pub async fn output_with_global_and_stats<G>(
+        &self,
+        guest: &Command,
+        config: G::Config,
+    ) -> io::Result<(Output, G, Option<DbiBackendStatsSource>)>
+    where
+        G: GlobalTool + 'static,
+    {
+        match self
+            .run_with_global::<G>(
+                guest,
+                None,
+                config,
+                true,
+                CoordinatedInput::Null,
+                BackendStatsRequest::ENABLED,
+            )
+            .await?
+        {
+            CoordinatedWait::Output(output, global, stats) => Ok((output, global, stats)),
+            CoordinatedWait::Status(_, _, _) => {
+                unreachable!("output launch returned only status")
+            }
+        }
+    }
+
+    /// Runs `guest` with inherited streams, one shared global, and DBI backend statistics.
+    ///
+    /// Behaves like [`Self::status_with_global`] but additionally aggregates the
+    /// typed per-process instrumentation records into a
+    /// [`DbiBackendStatsSource`]. See [`Self::output_with_global_and_stats`] for
+    /// the meaning of the returned option.
+    pub async fn status_with_global_and_stats<G>(
+        &self,
+        guest: &Command,
+        config: G::Config,
+    ) -> io::Result<(ExitStatus, G, Option<DbiBackendStatsSource>)>
+    where
+        G: GlobalTool + 'static,
+    {
+        match self
+            .run_with_global::<G>(
+                guest,
+                None,
+                config,
+                false,
+                CoordinatedInput::Inherit,
+                BackendStatsRequest::ENABLED,
+            )
+            .await?
+        {
+            CoordinatedWait::Status(status, global, stats) => Ok((status, global, stats)),
+            CoordinatedWait::Output(_, _, _) => unreachable!("status launch captured output"),
         }
     }
 
@@ -398,6 +498,7 @@ impl DbiRunner {
         config: G::Config,
         capture_output: bool,
         input: CoordinatedInput,
+        stats: BackendStatsRequest,
     ) -> io::Result<CoordinatedWait<G>>
     where
         G: GlobalTool + 'static,
@@ -419,7 +520,16 @@ impl DbiRunner {
         // The root records this explicit capability in shared state before any
         // fork. Copied DynamoRIO runtimes cannot reliably re-read Rust's
         // process environment after fork.
-        let runner = self.clone().client_argument("-external-global");
+        let mut runner = self.clone().client_argument("-external-global");
+        let stats_sink = if stats.is_enabled() {
+            let sink = StatsSink::new()?;
+            for argument in sink.client_arguments() {
+                runner = runner.client_argument(argument);
+            }
+            Some(sink)
+        } else {
+            None
+        };
         let mut command = runner.command(guest, environment);
         command.env(crate::sync_rpc::RPC_SOCKET_ENV, &socket);
         match &input {
@@ -480,9 +590,16 @@ impl DbiRunner {
                 }
             }
         };
+        // The whole followed process tree has been reaped, so every image that
+        // reached `event_exit` has already appended its record. Draining now is
+        // race-free.
+        let stats_source = match stats_sink {
+            Some(sink) => Some(sink.drain()?),
+            None => None,
+        };
         Ok(match wait {
-            ChildWait::Status(status) => CoordinatedWait::Status(status, global),
-            ChildWait::Output(output) => CoordinatedWait::Output(output, global),
+            ChildWait::Status(status) => CoordinatedWait::Status(status, global, stats_source),
+            ChildWait::Output(output) => CoordinatedWait::Output(output, global, stats_source),
         })
     }
 
@@ -678,6 +795,62 @@ impl DbiRunner {
     }
 }
 
+/// A per-run sink that collects fixed-size DBI stats records from every
+/// instrumented process image in the guest tree.
+///
+/// The native client appends one wire record per real runtime image to a shared
+/// file (see `native/client.c`). A shared path with append-mode opens (O_APPEND)
+/// keeps concurrent appends atomic and side-steps the drrun -> guest exec fd
+/// inheritance problem the diagnostic fd works around. After the whole tree is
+/// reaped, [`StatsSink::drain`] decodes and commutatively aggregates every
+/// record into one snapshot.
+struct StatsSink {
+    // Owns the temporary directory; dropping it removes the backing file. Held
+    // until after `drain` reads the records.
+    _directory: tempfile::TempDir,
+    path: PathBuf,
+}
+
+impl StatsSink {
+    fn new() -> io::Result<Self> {
+        let directory = tempfile::Builder::new()
+            .prefix("reverie-dbi-stats-")
+            .tempdir()?;
+        let path = directory.path().join("records.bin");
+        Ok(Self {
+            _directory: directory,
+            path,
+        })
+    }
+
+    /// The `-stats_path <path>` client arguments passed to the native client.
+    fn client_arguments(&self) -> [OsString; 2] {
+        [
+            OsString::from("-stats_path"),
+            self.path.clone().into_os_string(),
+        ]
+    }
+
+    /// Decodes and aggregates every record written by the process tree.
+    ///
+    /// A missing file means no instrumented image reported (for example the
+    /// guest died before `event_exit`); that yields an empty snapshot rather
+    /// than an error. A present but malformed or truncated stream is a hard
+    /// error, matching [`DbiBackendStatsAggregator::absorb_wire_stream`].
+    fn drain(self) -> io::Result<DbiBackendStatsSource> {
+        let bytes = match std::fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error),
+        };
+        let mut aggregator = DbiBackendStatsAggregator::new();
+        aggregator
+            .absorb_wire_stream(&bytes)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        Ok(aggregator.into_source())
+    }
+}
+
 enum ChildWait {
     Status(ExitStatus),
     Output(Output),
@@ -690,8 +863,8 @@ enum CoordinatedInput {
 }
 
 enum CoordinatedWait<G> {
-    Status(ExitStatus, G),
-    Output(Output, G),
+    Status(ExitStatus, G, Option<DbiBackendStatsSource>),
+    Output(Output, G, Option<DbiBackendStatsSource>),
 }
 
 async fn serve_rpc_until<G, F, T>(server: RpcServer<G>, completion: F) -> io::Result<T>
@@ -1375,5 +1548,126 @@ mod tests {
             std::fs::create_dir_all(&cmake).unwrap();
             assert_eq!(resolve_drrun(&cmake).unwrap(), drrun);
         }
+    }
+
+    /// Appends one already-encoded wire record to `path`, mirroring how each
+    /// followed image's `event_exit` appends to the shared sink file.
+    fn append_record(path: &Path, record: &crate::backend_stats::DbiProcessRecord) {
+        use std::io::Write as _;
+
+        let encoded = crate::backend_stats::encode_process_record(record);
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        file.write_all(&encoded).unwrap();
+    }
+
+    #[test]
+    fn stats_sink_passes_the_records_path_to_the_client() {
+        let sink = StatsSink::new().unwrap();
+        let arguments = sink.client_arguments();
+        assert_eq!(arguments[0], OsStr::new("-stats_path"));
+        assert_eq!(arguments[1], sink.path.clone().into_os_string());
+        assert_eq!(arguments[1], sink.path.as_os_str());
+    }
+
+    #[test]
+    fn stats_sink_drain_of_missing_file_yields_an_empty_snapshot() {
+        let sink = StatsSink::new().unwrap();
+        // No image ever wrote the file (e.g. the guest died before event_exit).
+        assert!(!sink.path.exists());
+        let source = sink.drain().unwrap();
+        let snapshot = source.snapshot();
+        assert_eq!(snapshot.process_images(), 0);
+        assert_eq!(snapshot.counted_branches(), 0);
+        assert_eq!(snapshot.translation().process_images_with_stats(), 0);
+    }
+
+    #[test]
+    fn stats_sink_drains_and_aggregates_appended_records() {
+        use crate::backend_stats::DbiProcessRecord;
+        use crate::backend_stats::DbiRuntimeKind;
+
+        let sink = StatsSink::new().unwrap();
+
+        // One image with DynamoRIO translation stats present.
+        append_record(
+            &sink.path,
+            &DbiProcessRecord {
+                runtime_kind: DbiRuntimeKind::Counter1,
+                dr_stats_present: true,
+                branches: 100,
+                syscalls: 10,
+                rewritten: 2,
+                stdin_reads: 1,
+                basic_blocks_built: 70,
+                threads_created: 3,
+                code_cache_exits: 30,
+                peak_threads: 3,
+                peak_reachable_cache_blocks: 400,
+                ..DbiProcessRecord::default()
+            },
+        );
+        // A second image (e.g. a followed exec) without translation stats.
+        append_record(
+            &sink.path,
+            &DbiProcessRecord {
+                runtime_kind: DbiRuntimeKind::PrototypeTool,
+                dr_stats_present: false,
+                branches: 5,
+                syscalls: 1,
+                peak_threads: 9,
+                ..DbiProcessRecord::default()
+            },
+        );
+
+        let source = sink.drain().unwrap();
+        let snapshot = source.snapshot();
+
+        // Additive fields sum across images.
+        assert_eq!(snapshot.process_images(), 2);
+        assert_eq!(snapshot.counted_branches(), 105);
+        assert_eq!(snapshot.intercepted_syscalls(), 11);
+        assert_eq!(snapshot.rewritten_syscalls(), 2);
+        assert_eq!(snapshot.stdin_reads(), 1);
+
+        let translation = snapshot.translation();
+        // Translation totals only fold in the image that reported them.
+        assert_eq!(translation.basic_blocks_built(), 70);
+        assert_eq!(translation.threads_created(), 3);
+        assert_eq!(translation.code_cache_exits(), 30);
+        assert_eq!(translation.process_images_with_stats(), 1);
+        assert_eq!(translation.process_images_without_stats(), 1);
+        // Peak gauges are max-reduced, but only over images that reported
+        // dr_stats: the no-stats image's peak_threads=9 is deliberately ignored,
+        // so the peak stays at the stats-bearing image's 3.
+        assert_eq!(translation.peak_threads_per_process(), 3);
+        assert_eq!(
+            translation.peak_reachable_code_cache_blocks_per_process(),
+            400
+        );
+    }
+
+    #[test]
+    fn stats_sink_drain_of_a_truncated_stream_is_an_error() {
+        use std::io::Write as _;
+
+        let sink = StatsSink::new().unwrap();
+        let encoded =
+            crate::backend_stats::encode_process_record(&crate::backend_stats::DbiProcessRecord {
+                branches: 42,
+                ..crate::backend_stats::DbiProcessRecord::default()
+            });
+        // Write a whole record followed by a partial one: a corrupt tail must be
+        // a hard error, not a silent end-of-stream.
+        let mut file = std::fs::File::create(&sink.path).unwrap();
+        file.write_all(&encoded).unwrap();
+        file.write_all(&encoded[..encoded.len() - 1]).unwrap();
+        drop(file);
+
+        let error = sink.drain().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
     }
 }

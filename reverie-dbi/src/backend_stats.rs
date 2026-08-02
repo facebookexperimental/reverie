@@ -752,7 +752,7 @@ mod tests {
         assert_eq!(snapshot.process_images(), 2);
         // additive: branches 100*1 + 100*4 = 500
         assert_eq!(snapshot.counted_branches(), 500);
-        assert_eq!(snapshot.translation().basic_blocks_built(), 7 * 1 + 7 * 4);
+        assert_eq!(snapshot.translation().basic_blocks_built(), 7 + 7 * 4);
         // peaks are max-reduced, not summed.
         assert_eq!(snapshot.translation().peak_threads_per_process(), 4);
         assert_eq!(

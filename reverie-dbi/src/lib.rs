@@ -1841,6 +1841,28 @@ pub extern "C" fn reverie_dbi_runtime_name() -> *const libc::c_char {
     }
 }
 
+/// Returns the wire code identifying which built-in runtime produced a stats
+/// record.
+///
+/// This is the numeric companion to [`reverie_dbi_runtime_name`]: the native
+/// client stores this byte in the fixed-size stats record so the launcher can
+/// decode it without matching the human-readable name string. The mapping is the
+/// single source of truth shared with
+/// [`crate::backend_stats::DbiRuntimeKind::to_wire`]: `Counter1` = 1,
+/// `CounterLocal` = 2, `PrototypeTool` = 0.
+#[cfg(feature = "prototype-runtime")]
+#[unsafe(no_mangle)]
+pub extern "C" fn reverie_dbi_runtime_kind_code() -> u8 {
+    let kind = if tools::counter1_exact_enabled() {
+        crate::backend_stats::DbiRuntimeKind::Counter1
+    } else if tools::counter2_exact_enabled() {
+        crate::backend_stats::DbiRuntimeKind::CounterLocal
+    } else {
+        crate::backend_stats::DbiRuntimeKind::PrototypeTool
+    };
+    kind.to_wire()
+}
+
 /// Returns process-wide prototype counters accumulated at syscall boundaries.
 ///
 /// # Safety
