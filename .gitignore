@@ -5,3 +5,6 @@ Cargo.lock
 *.orig
 **/__pycache__/
 **/.mypy_cache/
+
+# reverie-dbi build.rs advisory lock guarding shared DynamoRIO source population.
+.dynamorio-source.lock

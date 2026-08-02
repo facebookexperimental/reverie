@@ -9,6 +9,7 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs;
+use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -16,6 +17,8 @@ use std::process::Command;
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#53): validate the pinned dr_invoke_syscall_as_app mmap fix.
 const DYNAMORIO_REVISION: &str = "929840ad9190e5086775e8debc0f0b79b4208d59";
+const DYNAMORIO_URL: &str = "https://github.com/rrnewton/dynamorio.git";
+const DYNAMORIO_SUBMODULE_PATH: &str = "third-party/dynamorio";
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -66,8 +69,26 @@ fn main() {
     );
 }
 
+/// Materialize the pinned DynamoRIO source tree that lives beside `reverie-dbi`.
+///
+/// `make validate` (and cargo in general) builds `reverie-dbi` in several
+/// profiles concurrently, and every one of those builds shares a *single* git
+/// dependency checkout under `~/.cargo/git/checkouts/`. DynamoRIO is a git
+/// submodule that cargo does not reliably materialize for a git dependency, so
+/// this build script checks it out itself. Doing that naively races: one build
+/// runs `git submodule update`, which writes `CMakeLists.txt` early in the
+/// checkout, and a second build sees that file, assumes the tree is complete,
+/// and runs cmake against a half-populated source tree. That fails with
+/// "No such file or directory" for core sources such as `arch_exports.h`,
+/// `dispatch.h`, and `unix/memcache.c` — the historical `build.rs:163` panic.
+///
+/// To make a cold build robust we (a) serialize population with an exclusive
+/// advisory file lock so only one build mutates the shared checkout at a time,
+/// and (b) treat the tree as ready only when it is *complete*, not merely when
+/// `CMakeLists.txt` exists.
 fn ensure_dynamorio_source(source_dir: &Path) {
-    if source_dir.join("CMakeLists.txt").is_file() {
+    // Fast path: an already-complete tree needs no lock.
+    if source_dir_is_complete(source_dir) {
         return;
     }
 
@@ -75,23 +96,183 @@ fn ensure_dynamorio_source(source_dir: &Path) {
         .parent()
         .and_then(Path::parent)
         .expect("DynamoRIO source is not inside the Reverie repository");
-    run(
-        Command::new("git").arg("-C").arg(reverie_root).args([
+
+    // Serialize population across the concurrent `reverie-dbi` builds that share
+    // this cargo git-dependency checkout. The lock is released when `_lock` is
+    // dropped or the process exits.
+    let _lock = SourceLock::acquire(source_dir);
+
+    // Re-check under the lock: another build may have finished populating while
+    // we waited for the lock.
+    if source_dir_is_complete(source_dir) {
+        return;
+    }
+
+    populate_dynamorio_source(reverie_root, source_dir);
+
+    assert!(
+        source_dir_is_complete(source_dir),
+        "DynamoRIO source at {} is still incomplete after initialization",
+        source_dir.display()
+    );
+}
+
+/// A DynamoRIO source tree is only usable once *every* tracked file is present.
+/// A partially checked-out submodule still has `CMakeLists.txt` (git writes the
+/// working tree roughly in path order) yet is missing core sources, so checking
+/// for `CMakeLists.txt` alone is not enough. We verify completeness with a
+/// couple of deep sentinel files and, when git metadata is available, by
+/// confirming git reports no missing (deleted-from-worktree) tracked files.
+fn source_dir_is_complete(source_dir: &Path) -> bool {
+    if !source_dir.join("CMakeLists.txt").is_file() {
+        return false;
+    }
+    // Deep files whose absence produced the historical partial-checkout panics.
+    for sentinel in ["core/lib/globals_shared.h", "core/unix/memcache.c"] {
+        if !source_dir.join(sentinel).is_file() {
+            return false;
+        }
+    }
+    if !source_dir.join(".git").exists() {
+        return false;
+    }
+    // No tracked file may be missing from the working tree.
+    match Command::new("git")
+        .arg("-C")
+        .arg(source_dir)
+        .args(["ls-files", "--deleted"])
+        .output()
+    {
+        Ok(output) if output.status.success() => output.stdout.is_empty(),
+        // If git cannot report, trust the sentinel checks performed above.
+        _ => true,
+    }
+}
+
+/// Check out the pinned DynamoRIO submodule, honoring the checkout-by-default
+/// policy even on long-lived checkouts whose local `.git/config` still records
+/// the retired `update = none` for this submodule. `submodule sync` refreshes
+/// the recorded URL, and the explicit `-c submodule.<path>.update=checkout`
+/// plus `--checkout --force` override any stale local policy. If the submodule
+/// machinery is unavailable (for example cargo pruned the git metadata), fall
+/// back to fetching the pinned revision directly by URL + SHA.
+fn populate_dynamorio_source(reverie_root: &Path, source_dir: &Path) {
+    // Refresh the recorded submodule URL, ignoring failure on an odd checkout.
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(reverie_root)
+        .args(["submodule", "sync", "--", DYNAMORIO_SUBMODULE_PATH])
+        .status();
+
+    let update_policy = format!("submodule.{DYNAMORIO_SUBMODULE_PATH}.update=checkout");
+    let submodule_ok = Command::new("git")
+        .arg("-C")
+        .arg(reverie_root)
+        .args([
+            "-c",
+            &update_policy,
             "submodule",
             "update",
             "--init",
             "--recursive",
             "--checkout",
+            "--force",
             "--",
-            "third-party/dynamorio",
+            DYNAMORIO_SUBMODULE_PATH,
+        ])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+
+    if submodule_ok && source_dir_is_complete(source_dir) {
+        return;
+    }
+
+    // Fallback: fetch the exact pinned revision directly into the source tree.
+    clone_dynamorio_by_revision(source_dir);
+}
+
+/// Last-resort population when the submodule is not wired up in the checkout:
+/// initialize a repository in place (idempotent on an existing one), fetch the
+/// pinned revision from the fork by URL, and force-check-out every tracked file.
+fn clone_dynamorio_by_revision(source_dir: &Path) {
+    fs::create_dir_all(source_dir).unwrap_or_else(|error| {
+        panic!(
+            "failed to create the DynamoRIO source directory {}: {error}",
+            source_dir.display()
+        )
+    });
+    if !source_dir.join(".git").exists() {
+        run(
+            Command::new("git")
+                .arg("-C")
+                .arg(source_dir)
+                .args(["init", "-q"]),
+            "initialize a DynamoRIO source checkout",
+        );
+    }
+    run(
+        Command::new("git").arg("-C").arg(source_dir).args([
+            "fetch",
+            "--depth",
+            "1",
+            DYNAMORIO_URL,
+            DYNAMORIO_REVISION,
         ]),
-        "initialize the pinned DynamoRIO source",
+        "fetch the pinned DynamoRIO revision",
     );
-    assert!(
-        source_dir.join("CMakeLists.txt").is_file(),
-        "DynamoRIO submodule initialization did not produce {}",
-        source_dir.join("CMakeLists.txt").display()
+    run(
+        Command::new("git").arg("-C").arg(source_dir).args([
+            "checkout",
+            "--force",
+            DYNAMORIO_REVISION,
+        ]),
+        "check out the pinned DynamoRIO revision",
     );
+    // Ensure every tracked file is materialized, repairing a partial tree.
+    run(
+        Command::new("git")
+            .arg("-C")
+            .arg(source_dir)
+            .args(["checkout", "--force", "--", "."]),
+        "restore the pinned DynamoRIO working tree",
+    );
+}
+
+/// An exclusive advisory lock guarding population of the shared DynamoRIO
+/// source checkout. Held via `flock(2)` on a lock file beside the source tree;
+/// released automatically when dropped or when the build script exits.
+struct SourceLock {
+    _file: fs::File,
+}
+
+impl SourceLock {
+    fn acquire(source_dir: &Path) -> SourceLock {
+        let lock_path = source_dir
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(".dynamorio-source.lock");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed to open the DynamoRIO source lock {}: {error}",
+                    lock_path.display()
+                )
+            });
+        // Block until we hold the exclusive lock.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            panic!(
+                "failed to lock the DynamoRIO source: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        SourceLock { _file: file }
+    }
 }
 
 fn verify_revision(source_dir: &Path) {
