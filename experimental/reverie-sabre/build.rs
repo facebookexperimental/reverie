@@ -17,6 +17,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/ffi/recursion_protector.c");
     println!("cargo:rerun-if-changed=src/ffi/vfork_syscall.S");
     println!("cargo:rerun-if-changed=vendor/sabre");
+    println!("cargo:rerun-if-changed=vendor/libelf");
     println!("cargo:rerun-if-env-changed=CMAKE");
     println!("cargo:rerun-if-env-changed=CMAKE_GENERATOR");
 
@@ -47,12 +48,15 @@ fn main() {
     }
 
     let output = PathBuf::from(env::var_os("OUT_DIR").unwrap());
-    let loader = build_sabre(&source, &output.join("sabre-build"));
+    let libelf = manifest.join("vendor/libelf");
+    // Keep cached CMake state tied to this build recipe. Bump the suffix when
+    // configure or link inputs change so Cargo cannot reuse incompatible state.
+    let loader = build_sabre(&source, &output.join("sabre-build-v2"), &libelf);
     println!("cargo:rustc-env=REVERIE_SABRE_LOADER={}", loader.display());
     println!("cargo:rustc-env=REVERIE_SABRE_SOURCE={}", source.display());
 }
 
-fn build_sabre(source: &Path, build: &Path) -> PathBuf {
+fn build_sabre(source: &Path, build: &Path, libelf: &Path) -> PathBuf {
     let started = Instant::now();
     let cmake = env::var_os("CMAKE").unwrap_or_else(|| "cmake".into());
     let mut configure = Command::new(&cmake);
@@ -61,7 +65,8 @@ fn build_sabre(source: &Path, build: &Path) -> PathBuf {
         .arg(source)
         .arg("-B")
         .arg(build)
-        .arg("-DCMAKE_BUILD_TYPE=Release");
+        .arg("-DCMAKE_BUILD_TYPE=Release")
+        .arg(format!("-DCMAKE_C_FLAGS=-I{}", libelf.display()));
     if let Some(generator) = env::var_os("CMAKE_GENERATOR") {
         configure.arg("-G").arg(generator);
     }

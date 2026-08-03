@@ -288,9 +288,11 @@ production controller decision, not another Tool ABI.
 
 Cargo copies the pinned source to the package `OUT_DIR` and builds `e9tool` and
 `e9patch` there. It never writes into the source checkout. A source install
-therefore requires `make`, GCC/G++, `strip`, and `xxd`, but no prebuilt bundle
-or runtime network access. The package license records the GPL-3.0-or-later
-source alongside Reverie's BSD-2-Clause code.
+therefore requires `make`, GCC/G++, and `strip`, but no prebuilt bundle or
+runtime network access. The tiny `xxd -i` operation used by upstream is supplied
+by a Rust shim compiled by the build script, so installing Vim utilities is not
+a hidden prerequisite. The package license records the GPL-3.0-or-later source
+alongside Reverie's BSD-2-Clause code.
 
 ```bash
 cargo build -p reverie-e9patch

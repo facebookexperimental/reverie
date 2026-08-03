@@ -137,19 +137,22 @@ fn build_e9patch_tools(source: &Path, build: &Path) -> (PathBuf, PathBuf) {
         fs::remove_dir_all(build).expect("failed to reset the e9patch build directory");
     }
     copy_tree(source, build);
+    let tool_dir = build_xxd_shim(build);
+    let path = env::var_os("PATH").unwrap_or_default();
+    let path = env::join_paths(std::iter::once(tool_dir).chain(env::split_paths(&path)))
+        .expect("failed to construct e9patch build PATH");
     let jobs = env::var("NUM_JOBS")
         .ok()
         .and_then(|jobs| jobs.parse::<usize>().ok())
         .unwrap_or(1)
         .clamp(1, 16);
-    run(
-        Command::new("make")
-            .arg("-C")
-            .arg(build)
-            .arg(format!("--jobs={jobs}"))
-            .arg("release"),
-        "build e9patch tools",
-    );
+    let mut make = Command::new("make");
+    make.arg("-C")
+        .arg(build)
+        .arg(format!("--jobs={jobs}"))
+        .arg("release")
+        .env("PATH", path);
+    run(&mut make, "build e9patch tools");
     let e9tool = build.join("e9tool");
     let e9patch = build.join("e9patch");
     assert!(e9tool.is_file(), "e9patch build did not produce e9tool");
@@ -159,6 +162,56 @@ fn build_e9patch_tools(source: &Path, build: &Path) -> (PathBuf, PathBuf) {
         started.elapsed().as_secs_f64()
     );
     (e9tool, e9patch)
+}
+
+fn build_xxd_shim(build: &Path) -> PathBuf {
+    let tools = build.join(".hermit-build-tools");
+    fs::create_dir_all(&tools).expect("failed to create e9patch build-tool directory");
+    let source = tools.join("xxd.rs");
+    fs::write(
+        &source,
+        r#"use std::env;
+use std::fs;
+use std::path::Path;
+
+fn main() {
+    let args = env::args_os().skip(1).collect::<Vec<_>>();
+    assert!(args.len() == 2 && args[0] == "-i", "expected: xxd -i FILE");
+    let path = Path::new(&args[1]);
+    let bytes = fs::read(path).expect("failed to read xxd input");
+    let name = path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .chars()
+        .map(|character| if character.is_ascii_alphanumeric() { character } else { '_' })
+        .collect::<String>();
+    println!("unsigned char {name}[] = {{");
+    for chunk in bytes.chunks(12) {
+        print!("  ");
+        for byte in chunk {
+            print!("0x{byte:02x}, ");
+        }
+        println!();
+    }
+    println!("}};");
+    println!("unsigned int {name}_len = {};", bytes.len());
+}
+"#,
+    )
+    .expect("failed to write the Cargo-provided xxd shim");
+    let executable = tools.join("xxd");
+    let rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    run(
+        Command::new(rustc)
+            .arg("--edition=2021")
+            .arg("-O")
+            .arg(&source)
+            .arg("-o")
+            .arg(&executable),
+        "build the Cargo-provided xxd shim",
+    );
+    tools
 }
 
 fn copy_tree(source: &Path, destination: &Path) {
