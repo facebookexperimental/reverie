@@ -95,8 +95,41 @@ jobs:
         )
       }}
     runs-on: [self-hosted, Linux, X64, reverie]
+    # There is currently a SINGLE self-hosted `reverie` runner (a SPOF). When the
+    # fleet loads that host, the PMU/perf-counter determinism tests degrade and
+    # this job has silently wedged for hours (observed 2h44m vs a ~2min baseline).
+    # Cap execution so a wedge fails loudly and fast instead of squatting the one
+    # runner for the 6h GitHub default. 45m is generous vs the ~2min test
+    # baseline plus a cold DynamoRIO build, yet still catches an 80x wedge.
+    timeout-minutes: 45
 
     steps:
+    # PMU-sensitive tests measure hardware counters whose behaviour changes when
+    # the machine is busy: a measurement taken under host contention is INVALID
+    # and must be discarded, not reported (same principle as the nightly stress
+    # harness validity calibrator). Refuse fast and honestly rather than degrade
+    # into a multi-hour hang. Runs first, before build/test, so it reflects
+    # AMBIENT load (neighbour/fleet), not this job's own build parallelism.
+    - name: Host load precondition (PMU measurement validity)
+      env:
+        MAX_LOAD_PER_CORE: ${{ vars.REVERIE_MAX_LOAD_PER_CORE || '1.5' }}
+        SKIP_LOAD_PRECONDITION: ${{ vars.REVERIE_SKIP_LOAD_PRECONDITION }}
+      run: |
+        set -euo pipefail
+        if [ "${SKIP_LOAD_PRECONDITION:-}" = "true" ]; then
+          echo "REVERIE_SKIP_LOAD_PRECONDITION=true -> skipping host-load precondition."
+          exit 0
+        fi
+        read -r load1 _ < /proc/loadavg
+        cores="$(nproc)"
+        limit="$(awk -v c="$cores" -v m="$MAX_LOAD_PER_CORE" 'BEGIN { printf "%.2f", c * m }')"
+        echo "host 1m-load=$load1 cores=$cores max-per-core=$MAX_LOAD_PER_CORE limit=$limit"
+        over="$(awk -v l="$load1" -v lim="$limit" 'BEGIN { print (l > lim) ? 1 : 0 }')"
+        if [ "$over" = "1" ]; then
+          echo "::error title=Host too loaded to measure (not a product failure)::1-minute load average ${load1} exceeds ${limit} (${cores} cores x ${MAX_LOAD_PER_CORE}). PMU/perf-counter determinism tests cannot be measured validly on a contended host, so this run is refused rather than reporting an invalid measurement. This is NOT a Reverie regression. Remedies: re-run on a quiesced host, add a second 'reverie' self-hosted runner (removes the SPOF), raise vars.REVERIE_MAX_LOAD_PER_CORE, or set vars.REVERIE_SKIP_LOAD_PRECONDITION=true to opt out."
+          exit 1
+        fi
+        echo "Host load within budget; proceeding with host-dependent tests."
     - uses: actions/checkout@v4
       with:
         submodules: false
