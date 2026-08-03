@@ -95,13 +95,24 @@ jobs:
         )
       }}
     runs-on: [self-hosted, Linux, X64, reverie]
-    # There is currently a SINGLE self-hosted `reverie` runner (a SPOF). When the
-    # fleet loads that host, the PMU/perf-counter determinism tests degrade and
-    # this job has silently wedged for hours (observed 2h44m vs a ~2min baseline).
-    # Cap execution so a wedge fails loudly and fast instead of squatting the one
-    # runner for the 6h GitHub default. 45m is generous vs the ~2min test
-    # baseline plus a cold DynamoRIO build, yet still catches an 80x wedge.
-    timeout-minutes: 45
+    # AGGRESSIVE 10-minute box on scarce self-hosted hardware. The self-hosted
+    # `reverie` pool is small and shared (observed peak ~4 simultaneous jobs on
+    # one physical host), so a single long job consumes a large fraction of total
+    # capacity for its whole duration; the timeout is RESOURCE PROTECTION, not
+    # merely a hang detector. It is also the enforcement of "short tests only" on
+    # this hardware: the host-dependent test baseline is ~2 minutes, so 10 is
+    # already ~5x headroom, while the job silently wedged at 2h44m (~80x) once and
+    # squatted the runner. A silent hang and a merely-slow job are
+    # indistinguishable without a bound; 10 min converts either into a fast,
+    # definite signal ("re-run on a quiesced runner").
+    #
+    # This 10-minute budget assumes the WARM self-hosted cache (incremental build
+    # + ~2min tests) that is the steady state on a persistent runner. A COLD
+    # DynamoRIO/workspace build can exceed 10 min; per policy that overflow is a
+    # surfaced FINDING, not a reason to pre-emptively raise the bound -- the
+    # informative watchdog below attributes exactly which step overran and for how
+    # long, so a cold-build overflow is diagnosable rather than a bare timeout.
+    timeout-minutes: 10
 
     steps:
     # PMU-sensitive tests measure hardware counters whose behaviour changes when
@@ -156,4 +167,23 @@ jobs:
     - name: Host-dependent workspace tests
       env:
         REVERIE_REQUIRE_KVM: "1"
-      run: cargo test --workspace --all-features -- --test-threads=1
+      run: |
+        # Informative timeout: this step is the known wedge site (the 2h44m hang
+        # lived here). The job is hard-boxed at timeout-minutes:10, but a bare
+        # GitHub job timeout says only "job cancelled" -- not which step, for how
+        # long, or whether it was a genuine hang vs host-load starvation. Launch a
+        # background watchdog that, ~1-2 min before the hard box, prints this step
+        # + elapsed + two live thread/wchan snapshots of the test tree. It never
+        # fails the build (timeout-minutes stays the enforcement); on the green
+        # path the test finishes first and the watchdog is killed mid-sleep,
+        # costing nothing.
+        scripts/ci-timeout-watchdog.sh \
+          --step "Host-dependent workspace tests" \
+          --soft-deadline 300 --hard-box 540 &
+        watchdog=$!
+        set +e
+        cargo test --workspace --all-features -- --test-threads=1
+        status=$?
+        kill "$watchdog" 2>/dev/null || true
+        wait "$watchdog" 2>/dev/null || true
+        exit "$status"
