@@ -48,14 +48,34 @@ fn build_script_never_populates_source_over_the_network() {
 fn build_cache_is_content_addressed_and_visible() {
     let build_script = include_str!("../build.rs");
     for required in [
-        "source_recipe_key(&source_dir",
+        "let source_key = source_recipe_key(",
         "dynamorio-build-{source_key}",
+        "CMAKE_GENERATOR",
         "DynamoRIO build cache HIT key=sha256:",
         "DynamoRIO build cache MISS key=sha256:",
     ] {
         assert!(
             build_script.contains(required),
             "build script lacks cache invariant {required:?}"
+        );
+    }
+}
+
+#[test]
+fn ci_uses_the_vendored_content_addressed_cache() {
+    let workflow = include_str!("../../.github/workflows/ci.yml");
+    assert!(workflow.contains("out/dynamorio-install-*"));
+    assert!(
+        workflow.contains("hashFiles('reverie-dbi/vendor/dynamorio/**', 'reverie-dbi/build.rs')")
+    );
+    for obsolete in [
+        "scripts/backend-submodule.sh activate dynamorio",
+        "out/dynamorio-revision",
+        "steps.dynamorio.outputs.rev",
+    ] {
+        assert!(
+            !workflow.contains(obsolete),
+            "CI still contains obsolete cache input {obsolete:?}"
         );
     }
 }

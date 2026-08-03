@@ -70,7 +70,14 @@ fn main() {
     }
 
     let out_dir = PathBuf::from(required_env("OUT_DIR"));
-    let source_key = source_recipe_key(&source_dir, &manifest_dir.join("build.rs"));
+    let cmake = env::var_os("CMAKE").unwrap_or_else(|| OsString::from("cmake"));
+    let generator = env::var_os("CMAKE_GENERATOR");
+    let source_key = source_recipe_key(
+        &source_dir,
+        &manifest_dir.join("build.rs"),
+        &cmake,
+        generator.as_deref(),
+    );
     let build_dir = out_dir.join(format!("dynamorio-build-{source_key}"));
     let install_dir = out_dir.join(format!("dynamorio-install-{source_key}"));
     let drrun = install_dir.join("bin64/drrun");
@@ -84,7 +91,13 @@ fn main() {
         println!(
             "cargo:warning=DynamoRIO build cache MISS key=sha256:{source_key} observed_unix_seconds={observed_at}"
         );
-        build_dynamorio(&source_dir, &build_dir, &install_dir);
+        build_dynamorio(
+            &source_dir,
+            &build_dir,
+            &install_dir,
+            &cmake,
+            generator.as_deref(),
+        );
     } else {
         println!(
             "cargo:warning=DynamoRIO build cache HIT key=sha256:{source_key} observed_unix_seconds={observed_at} install={}",
@@ -106,11 +119,30 @@ fn main() {
     );
 }
 
-fn source_recipe_key(source_dir: &Path, build_script: &Path) -> String {
+fn source_recipe_key(
+    source_dir: &Path,
+    build_script: &Path,
+    cmake: &std::ffi::OsStr,
+    generator: Option<&std::ffi::OsStr>,
+) -> String {
     let mut hasher = Sha256::new();
     hash_tree(&mut hasher, source_dir, source_dir);
     hash_file(&mut hasher, b"build.rs", build_script);
+    hash_value(&mut hasher, b"CMAKE", cmake.as_encoded_bytes());
+    hash_value(
+        &mut hasher,
+        b"CMAKE_GENERATOR",
+        generator.map_or(b"<unset>", std::ffi::OsStr::as_encoded_bytes),
+    );
     format!("{:x}", hasher.finalize())
+}
+
+fn hash_value(hasher: &mut Sha256, name: &[u8], value: &[u8]) {
+    hasher.update(b"value\0");
+    hasher.update(name.len().to_le_bytes());
+    hasher.update(name);
+    hasher.update(value.len().to_le_bytes());
+    hasher.update(value);
 }
 
 fn hash_tree(hasher: &mut Sha256, root: &Path, directory: &Path) {
@@ -156,10 +188,15 @@ fn hash_name(hasher: &mut Sha256, path: &Path) {
     hasher.update(name);
 }
 
-fn build_dynamorio(source_dir: &Path, build_dir: &Path, install_dir: &Path) {
+fn build_dynamorio(
+    source_dir: &Path,
+    build_dir: &Path,
+    install_dir: &Path,
+    cmake: &std::ffi::OsStr,
+    generator: Option<&std::ffi::OsStr>,
+) {
     let started = Instant::now();
-    let cmake = env::var_os("CMAKE").unwrap_or_else(|| OsString::from("cmake"));
-    let mut configure = Command::new(&cmake);
+    let mut configure = Command::new(cmake);
     configure
         .arg("-S")
         .arg(source_dir)
@@ -175,7 +212,7 @@ fn build_dynamorio(source_dir: &Path, build_dir: &Path, install_dir: &Path) {
             "-DBUILD_EXT=ON",
             "-DBUILD_TOOLS=ON",
         ]);
-    if let Some(generator) = env::var_os("CMAKE_GENERATOR") {
+    if let Some(generator) = generator {
         configure.arg("-G").arg(generator);
     }
     run(&mut configure, "configure DynamoRIO");
@@ -247,16 +284,30 @@ mod tests {
         fs::write(source.join("nested/input.c"), "first\n").unwrap();
         let recipe = directory.path().join("build.rs");
         fs::write(&recipe, "recipe one\n").unwrap();
-        let initial = source_recipe_key(&source, &recipe);
-        assert_eq!(initial, source_recipe_key(&source, &recipe));
+        let initial = source_recipe_key(&source, &recipe, "cmake".as_ref(), None);
+        assert_eq!(
+            initial,
+            source_recipe_key(&source, &recipe, "cmake".as_ref(), None)
+        );
 
         fs::write(source.join("nested/input.c"), "second\n").unwrap();
-        let source_changed = source_recipe_key(&source, &recipe);
+        let source_changed = source_recipe_key(&source, &recipe, "cmake".as_ref(), None);
         assert_ne!(initial, source_changed);
 
         fs::write(&recipe, "recipe two\n").unwrap();
-        let recipe_changed = source_recipe_key(&source, &recipe);
+        let recipe_changed = source_recipe_key(&source, &recipe, "cmake".as_ref(), None);
         assert_ne!(source_changed, recipe_changed);
+
+        let cmake_changed = source_recipe_key(&source, &recipe, "custom-cmake".as_ref(), None);
+        assert_ne!(recipe_changed, cmake_changed);
+
+        let generator_changed = source_recipe_key(
+            &source,
+            &recipe,
+            "custom-cmake".as_ref(),
+            Some("Ninja".as_ref()),
+        );
+        assert_ne!(cmake_changed, generator_changed);
     }
 
     #[test]
