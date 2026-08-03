@@ -1,0 +1,2 @@
+Base source: e9patch 6c2c03c1da74b14daf1788a9f8dccfa354ce04a6 contrib/libdw
+gelf_getnote.c and gelf_getsym.c: DynamoRIO elfutils 302252356da5475670ac5b10dadd091c59689425

@@ -50,12 +50,12 @@ fn main() {
 
     let output = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let libelf = manifest.join("vendor/libelf");
-    let libelf_link = prepare_libelf_link(&output);
+    let libelf_link = build_libelf(&libelf, &output.join("libelf-build-v2"));
     // Keep cached CMake state tied to this build recipe. Bump the suffix when
     // configure or link inputs change so Cargo cannot reuse incompatible state.
     let loader = build_sabre(
         &source,
-        &output.join("sabre-build-v3"),
+        &output.join("sabre-build-v4"),
         &libelf,
         &libelf_link,
     );
@@ -63,15 +63,46 @@ fn main() {
     println!("cargo:rustc-env=REVERIE_SABRE_SOURCE={}", source.display());
 }
 
-fn prepare_libelf_link(output: &Path) -> PathBuf {
-    let directory = output.join("libelf-link");
-    fs::create_dir_all(&directory).expect("failed to create the libelf linker directory");
-    // Runtime images commonly ship libelf.so.1 without the development-only
-    // libelf.so alias. Give GNU ld that alias without copying or modifying the
-    // host library; the resulting executable still records libelf.so.1.
-    fs::write(directory.join("libelf.so"), "INPUT ( -l:libelf.so.1 )\n")
-        .expect("failed to write the libelf linker script");
-    directory
+fn build_libelf(source: &Path, output: &Path) -> PathBuf {
+    let mut sources = fs::read_dir(source)
+        .expect("failed to read the vendored libelf source")
+        .map(|entry| {
+            entry
+                .expect("failed to inspect a vendored libelf file")
+                .path()
+        })
+        .filter(|path| {
+            path.extension().is_some_and(|extension| extension == "c")
+                && path.file_name().is_some_and(|name| {
+                    let name = name.to_string_lossy();
+                    name.starts_with("elf") || name.starts_with("gelf")
+                })
+        })
+        .collect::<Vec<_>>();
+    sources.sort();
+    assert!(
+        sources.iter().any(|path| path.ends_with("gelf_getsym.c"))
+            && sources.iter().any(|path| path.ends_with("gelf_getnote.c")),
+        "the vendored libelf source is incomplete"
+    );
+
+    fs::create_dir_all(output).expect("failed to create the libelf build directory");
+    cc::Build::new()
+        .cargo_metadata(false)
+        .out_dir(output)
+        .include(source)
+        .include(source.join("include"))
+        .define("HAVE_CONFIG_H", None)
+        .flag_if_supported("-fPIC")
+        .opt_level(2)
+        .files(sources)
+        .compile("elf");
+
+    // SaBRe links with `-lelf`. Prefer this script to the adjacent archive so
+    // zlib follows the static libelf objects that reference it.
+    fs::write(output.join("libelf.so"), "GROUP ( libelf.a -lz )\n")
+        .expect("failed to write the static libelf linker script");
+    output.to_path_buf()
 }
 
 fn build_sabre(source: &Path, build: &Path, libelf: &Path, libelf_link: &Path) -> PathBuf {
