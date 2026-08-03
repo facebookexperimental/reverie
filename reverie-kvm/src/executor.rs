@@ -563,9 +563,21 @@ fn execute_basic_syscall_with_output(
     } else if number == libc::SYS_getresuid as u64 || number == libc::SYS_getresgid as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         get_fixed_root_ids(memory, args)
-    } else if number == libc::SYS_setresuid as u64 || number == libc::SYS_setresgid as u64 {
+    } else if is_credential_identity_noop_syscall(number) {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        set_fixed_root_ids(&args[..3])
+        // TODO-HUMAN-REVIEW(PR-kvm-credential-noop-parity): the credential-setting
+        // family (setuid/setgid and their re-/res-/fs- variants, and setgroups) is
+        // a deterministic no-op success under Detcore's fixed virtual-root
+        // identity -- getuid/geteuid/getgid/getegid are virtualized to 0 and no
+        // credential change is ever tracked -- so each returns 0: the value a real
+        // root process gets for a permitted change, and the previous virtual-0
+        // fs-id for setfsuid/setfsgid. This mirrors detcore's golden
+        // is_credential_identity_noop_syscall / Ok(0) arm so privilege-dropping
+        // guests proceed identically under KVM and the ptrace backend instead of
+        // seeing EPERM (the old setres* arm) or ENOSYS (the rest). The result is
+        // never forwarded to the host and is bitwise-identical across --verify and
+        // record/replay.
+        0
     } else if number == libc::SYS_getgroups as u64 {
         getgroups(memory, args)
     } else if number == libc::SYS_capget as u64 {
@@ -5394,13 +5406,23 @@ fn get_fixed_root_ids(memory: &mut GuestMemory, args: &[u64; 6]) -> i64 {
     0
 }
 
-// TODO-HUMAN-REVIEW(PR-92): Review this KVM compatibility implementation.
-fn set_fixed_root_ids(ids: &[u64]) -> i64 {
-    if ids.iter().all(|id| matches!(*id as u32, 0 | u32::MAX)) {
-        0
-    } else {
-        negative_errno(libc::EPERM)
-    }
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-kvm-credential-noop-parity): credential no-op set.
+/// The credential-setting syscalls that Detcore treats as deterministic no-op
+/// successes under its fixed virtual-root identity. Mirrors detcore's
+/// `is_credential_identity_noop_syscall` exactly so the KVM executor forwards
+/// none of them to the host and returns the same 0 the golden ptrace backend
+/// does, letting privilege-dropping guests proceed identically across backends.
+fn is_credential_identity_noop_syscall(number: u64) -> bool {
+    number == libc::SYS_setuid as u64
+        || number == libc::SYS_setgid as u64
+        || number == libc::SYS_setresuid as u64
+        || number == libc::SYS_setresgid as u64
+        || number == libc::SYS_setreuid as u64
+        || number == libc::SYS_setregid as u64
+        || number == libc::SYS_setgroups as u64
+        || number == libc::SYS_setfsuid as u64
+        || number == libc::SYS_setfsgid as u64
 }
 
 // TODO-HUMAN-REVIEW(PR-92): Review this KVM compatibility implementation.
@@ -19033,6 +19055,61 @@ mod tests {
         assert_eq!(after_exec.capability_permitted, reduced);
         assert_eq!(after_exec.capability_bounding, reduced);
         assert_eq!(after_exec.capability_ambient, 1);
+    }
+
+    #[test]
+    fn credential_setting_family_is_deterministic_noop_success() {
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+
+        // Under Detcore's fixed virtual-root identity every credential-setting
+        // syscall is a no-op success returning 0 -- including a change to an
+        // unprivileged id, which the host kernel would reject with EPERM. The KVM
+        // executor must match that golden ptrace/detcore behavior so a privilege-
+        // dropping guest observes identical results across backends.
+        let unprivileged = 1000_u64;
+        for number in [
+            libc::SYS_setuid,
+            libc::SYS_setgid,
+            libc::SYS_setreuid,
+            libc::SYS_setregid,
+            libc::SYS_setfsuid,
+            libc::SYS_setfsgid,
+        ] {
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    number,
+                    [unprivileged, unprivileged, 0, 0, 0, 0],
+                ),
+                0,
+                "credential syscall {number} must be a deterministic no-op success",
+            );
+        }
+        for number in [libc::SYS_setresuid, libc::SYS_setresgid] {
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    number,
+                    [unprivileged, unprivileged, unprivileged, 0, 0, 0],
+                ),
+                0,
+                "credential syscall {number} must succeed even for non-root ids",
+            );
+        }
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_setgroups,
+                [1, 0x100, 0, 0, 0, 0],
+            ),
+            0,
+            "setgroups must be a deterministic no-op success",
+        );
     }
 
     #[test]
