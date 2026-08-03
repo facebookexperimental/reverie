@@ -45,6 +45,12 @@ The first build compiles DynamoRIO in Cargo's package `OUT_DIR` with its tests,
 samples, and documentation disabled. Cargo reuses that install until the build
 script or pinned submodule revision changes.
 
+Clean CI builds enforce a 30-second source-build ratchet, based on 13.91s and
+14.54s measurements on devbig014 on 2026-08-03. Set
+`REVERIE_DBI_MAX_BUILD_SECONDS` to override that measured guard explicitly;
+local builds report actual duration without enforcing a machine-independent
+guess.
+
 Run the native client smoke tests directly:
 
 ```bash

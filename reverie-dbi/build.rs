@@ -18,12 +18,17 @@ use std::time::Instant;
 // TODO-HUMAN-REVIEW(#53): validate the pinned dr_invoke_syscall_as_app mmap fix.
 const DYNAMORIO_REVISION: &str = "929840ad9190e5086775e8debc0f0b79b4208d59";
 const MAX_PARALLEL_JOBS: usize = 16;
+// Provenance: clean 16-job builds of this curated source tree measured 13.91s
+// and 14.54s on devbig014 on 2026-08-03. CI gets slightly more than 2x the
+// slower observation; local source installs report their time without failing.
+const CI_MAX_BUILD_SECONDS: f64 = 30.0;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=vendor/dynamorio");
     println!("cargo:rerun-if-env-changed=CMAKE");
     println!("cargo:rerun-if-env-changed=CMAKE_GENERATOR");
+    println!("cargo:rerun-if-env-changed=CI");
     println!("cargo:rerun-if-env-changed=REVERIE_DBI_MAX_BUILD_SECONDS");
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux")
@@ -130,10 +135,15 @@ fn build_dynamorio(source_dir: &Path, build_dir: &Path, install_dir: &Path) {
 
     let seconds = started.elapsed().as_secs_f64();
     println!("cargo:warning=DynamoRIO source build completed in {seconds:.2}s (jobs={jobs})");
-    if let Ok(limit) = env::var("REVERIE_DBI_MAX_BUILD_SECONDS") {
-        let limit = limit
-            .parse::<f64>()
-            .expect("REVERIE_DBI_MAX_BUILD_SECONDS must be a positive number");
+    let limit = env::var("REVERIE_DBI_MAX_BUILD_SECONDS")
+        .ok()
+        .map(|limit| {
+            limit
+                .parse::<f64>()
+                .expect("REVERIE_DBI_MAX_BUILD_SECONDS must be a positive number")
+        })
+        .or_else(|| env::var_os("CI").is_some().then_some(CI_MAX_BUILD_SECONDS));
+    if let Some(limit) = limit {
         assert!(
             limit > 0.0,
             "REVERIE_DBI_MAX_BUILD_SECONDS must be positive"
