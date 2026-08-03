@@ -18,10 +18,12 @@ use std::time::Instant;
 // TODO-HUMAN-REVIEW(#53): validate the pinned dr_invoke_syscall_as_app mmap fix.
 const DYNAMORIO_REVISION: &str = "929840ad9190e5086775e8debc0f0b79b4208d59";
 const MAX_PARALLEL_JOBS: usize = 16;
-// Provenance: clean 16-job builds of this curated source tree measured 13.91s
-// and 14.54s on devbig014 on 2026-08-03. CI gets slightly more than 2x the
-// slower observation; local source installs report their time without failing.
-const CI_MAX_BUILD_SECONDS: f64 = 30.0;
+// Provenance: three clean builds of this curated source tree on 2026-08-03:
+// 13.91s and 14.54s with 16 jobs on devbig014, and 71.49s with 4 jobs on a
+// GitHub-hosted runner. Their elapsed-seconds * requested-jobs proxies were
+// 222.56, 232.64, and 285.96 job-seconds. The CI ratchet is 2x the slowest
+// observation, rounded up; local source installs report without enforcing it.
+const CI_MAX_BUILD_JOB_SECONDS: f64 = 572.0;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -135,15 +137,10 @@ fn build_dynamorio(source_dir: &Path, build_dir: &Path, install_dir: &Path) {
 
     let seconds = started.elapsed().as_secs_f64();
     println!("cargo:warning=DynamoRIO source build completed in {seconds:.2}s (jobs={jobs})");
-    let limit = env::var("REVERIE_DBI_MAX_BUILD_SECONDS")
-        .ok()
-        .map(|limit| {
-            limit
-                .parse::<f64>()
-                .expect("REVERIE_DBI_MAX_BUILD_SECONDS must be a positive number")
-        })
-        .or_else(|| env::var_os("CI").is_some().then_some(CI_MAX_BUILD_SECONDS));
-    if let Some(limit) = limit {
+    if let Ok(limit) = env::var("REVERIE_DBI_MAX_BUILD_SECONDS") {
+        let limit = limit
+            .parse::<f64>()
+            .expect("REVERIE_DBI_MAX_BUILD_SECONDS must be a positive number");
         assert!(
             limit > 0.0,
             "REVERIE_DBI_MAX_BUILD_SECONDS must be positive"
@@ -152,7 +149,17 @@ fn build_dynamorio(source_dir: &Path, build_dir: &Path, install_dir: &Path) {
             seconds <= limit,
             "DynamoRIO source build took {seconds:.2}s, exceeding the {limit:.2}s CI ratchet"
         );
+    } else if env::var_os("CI").is_some() {
+        enforce_ci_build_ratchet(seconds, jobs);
     }
+}
+
+fn enforce_ci_build_ratchet(seconds: f64, jobs: usize) {
+    let job_seconds = seconds * jobs as f64;
+    assert!(
+        job_seconds <= CI_MAX_BUILD_JOB_SECONDS,
+        "DynamoRIO source build took {seconds:.2}s with {jobs} jobs ({job_seconds:.2} job-seconds), exceeding the {CI_MAX_BUILD_JOB_SECONDS:.2} job-second CI ratchet"
+    );
 }
 
 fn run(command: &mut Command, description: &str) {
@@ -165,4 +172,22 @@ fn run(command: &mut Command, description: &str) {
 
 fn required_env(name: &str) -> OsString {
     env::var_os(name).unwrap_or_else(|| panic!("Cargo did not set {name}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn measured_clean_builds_satisfy_the_ci_ratchet() {
+        for (seconds, jobs) in [(13.91, 16), (14.54, 16), (71.49, 4)] {
+            enforce_ci_build_ratchet(seconds, jobs);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeding the 572.00 job-second CI ratchet")]
+    fn throughput_regression_fails_the_ci_ratchet() {
+        enforce_ci_build_ratchet(144.0, 4);
+    }
 }

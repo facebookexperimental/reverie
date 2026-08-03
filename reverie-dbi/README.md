@@ -45,11 +45,15 @@ The first build compiles DynamoRIO in Cargo's package `OUT_DIR` with its tests,
 samples, and documentation disabled. Cargo reuses that install until the build
 script or pinned submodule revision changes.
 
-Clean CI builds enforce a 30-second source-build ratchet, based on 13.91s and
-14.54s measurements on devbig014 on 2026-08-03. Set
-`REVERIE_DBI_MAX_BUILD_SECONDS` to override that measured guard explicitly;
-local builds report actual duration without enforcing a machine-independent
-guess.
+Clean CI builds enforce a concurrency-normalized source-build ratchet. Three
+clean builds measured on 2026-08-03 were 13.91s and 14.54s with 16 jobs on
+devbig014 and 71.49s with 4 jobs on a GitHub-hosted runner (`n=3`). Their
+elapsed-seconds times requested-jobs proxies were 222.56, 232.64, and 285.96
+job-seconds. CI rejects a value above 572 job-seconds, twice the slowest
+observation rounded up. This is a build-throughput regression guard, not a CPU
+time measurement or an ETA. Set `REVERIE_DBI_MAX_BUILD_SECONDS` to enforce an
+explicit wall-time limit on a controlled machine; local builds otherwise report
+actual duration without enforcing a machine-independent wall-time guess.
 
 Run the native client smoke tests directly:
 
