@@ -7,7 +7,7 @@ version = "0.2.0"
 authors = ["Meta Platforms"]
 edition = "2021"
 repository = "https://github.com/facebookexperimental/reverie"
-license = "BSD-2-Clause AND GPL-3.0-or-later AND LGPL-3.0-or-later"
+license = "BSD-2-Clause AND GPL-3.0-or-later AND GPL-2.0-only AND BSD-3-Clause AND MIT AND LGPL-3.0-or-later"
 
 [dependencies]
 atomic = "0.5.1"

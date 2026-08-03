@@ -13,6 +13,11 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
+
+use sha2::Digest;
+use sha2::Sha256;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#53): validate the pinned dr_invoke_syscall_as_app mmap fix.
@@ -65,20 +70,26 @@ fn main() {
     }
 
     let out_dir = PathBuf::from(required_env("OUT_DIR"));
-    let build_dir = out_dir.join("dynamorio-build");
-    let install_dir = out_dir.join("dynamorio-install");
-    let revision_stamp = out_dir.join("dynamorio-revision");
+    let source_key = source_recipe_key(&source_dir, &manifest_dir.join("build.rs"));
+    let build_dir = out_dir.join(format!("dynamorio-build-{source_key}"));
+    let install_dir = out_dir.join(format!("dynamorio-install-{source_key}"));
     let drrun = install_dir.join("bin64/drrun");
     let cmake_config = install_dir.join("cmake/DynamoRIOConfig.cmake");
+    let observed_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time predates the Unix epoch")
+        .as_secs();
 
-    let installed_revision = fs::read_to_string(&revision_stamp).unwrap_or_default();
-    if installed_revision.trim() != DYNAMORIO_REVISION
-        || !drrun.is_file()
-        || !cmake_config.is_file()
-    {
+    if !drrun.is_file() || !cmake_config.is_file() {
+        println!(
+            "cargo:warning=DynamoRIO build cache MISS key=sha256:{source_key} observed_unix_seconds={observed_at}"
+        );
         build_dynamorio(&source_dir, &build_dir, &install_dir);
-        fs::write(&revision_stamp, format!("{DYNAMORIO_REVISION}\n"))
-            .expect("failed to write the DynamoRIO revision stamp");
+    } else {
+        println!(
+            "cargo:warning=DynamoRIO build cache HIT key=sha256:{source_key} observed_unix_seconds={observed_at} install={}",
+            install_dir.display()
+        );
     }
 
     println!(
@@ -93,6 +104,56 @@ fn main() {
         "cargo:rustc-env=REVERIE_DBI_DYNAMORIO_DRRUN={}",
         drrun.display()
     );
+}
+
+fn source_recipe_key(source_dir: &Path, build_script: &Path) -> String {
+    let mut hasher = Sha256::new();
+    hash_tree(&mut hasher, source_dir, source_dir);
+    hash_file(&mut hasher, b"build.rs", build_script);
+    format!("{:x}", hasher.finalize())
+}
+
+fn hash_tree(hasher: &mut Sha256, root: &Path, directory: &Path) {
+    let mut entries = fs::read_dir(directory)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", directory.display()))
+        .map(|entry| {
+            entry
+                .unwrap_or_else(|error| {
+                    panic!("failed to inspect {}: {error}", directory.display())
+                })
+                .path()
+        })
+        .collect::<Vec<_>>();
+    entries.sort();
+
+    for path in entries {
+        let relative = path
+            .strip_prefix(root)
+            .expect("vendored path escaped its root");
+        if path.is_dir() {
+            hasher.update(b"directory\0");
+            hash_name(hasher, relative);
+            hash_tree(hasher, root, &path);
+        } else {
+            hash_file(hasher, relative.as_os_str().as_encoded_bytes(), &path);
+        }
+    }
+}
+
+fn hash_file(hasher: &mut Sha256, name: &[u8], path: &Path) {
+    hasher.update(b"file\0");
+    hasher.update(name.len().to_le_bytes());
+    hasher.update(name);
+    let contents =
+        fs::read(path).unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    hasher.update(contents.len().to_le_bytes());
+    hasher.update(contents);
+}
+
+fn hash_name(hasher: &mut Sha256, path: &Path) {
+    let name = path.as_os_str().as_encoded_bytes();
+    hasher.update(name.len().to_le_bytes());
+    hasher.update(name);
 }
 
 fn build_dynamorio(source_dir: &Path, build_dir: &Path, install_dir: &Path) {
@@ -177,6 +238,26 @@ fn required_env(name: &str) -> OsString {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_recipe_key_changes_with_source_or_recipe() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::write(source.join("nested/input.c"), "first\n").unwrap();
+        let recipe = directory.path().join("build.rs");
+        fs::write(&recipe, "recipe one\n").unwrap();
+        let initial = source_recipe_key(&source, &recipe);
+        assert_eq!(initial, source_recipe_key(&source, &recipe));
+
+        fs::write(source.join("nested/input.c"), "second\n").unwrap();
+        let source_changed = source_recipe_key(&source, &recipe);
+        assert_ne!(initial, source_changed);
+
+        fs::write(&recipe, "recipe two\n").unwrap();
+        let recipe_changed = source_recipe_key(&source, &recipe);
+        assert_ne!(source_changed, recipe_changed);
+    }
 
     #[test]
     fn measured_clean_builds_satisfy_the_ci_ratchet() {

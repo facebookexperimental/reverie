@@ -43,3 +43,19 @@ fn build_script_never_populates_source_over_the_network() {
         );
     }
 }
+
+#[test]
+fn build_cache_is_content_addressed_and_visible() {
+    let build_script = include_str!("../build.rs");
+    for required in [
+        "source_recipe_key(&source_dir",
+        "dynamorio-build-{source_key}",
+        "DynamoRIO build cache HIT key=sha256:",
+        "DynamoRIO build cache MISS key=sha256:",
+    ] {
+        assert!(
+            build_script.contains(required),
+            "build script lacks cache invariant {required:?}"
+        );
+    }
+}

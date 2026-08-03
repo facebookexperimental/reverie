@@ -8,21 +8,17 @@ the root directory of this source tree.
 Third-party components
 ================================================================================
 
-Reverie's native backend sources are referenced as git submodules under
-`third-party/`. A non-recursive clone does not fetch them; recursive submodule
-initialization and Cargo Git dependencies check out every pinned source. No
-source or binaries from these projects are redistributed in this repository;
-only pinned submodule commit references are stored here. See
-`docs/BACKEND_SOURCES.md` for activation details.
+Reverie redistributes the pinned native sources used by its optional backends
+inside their Cargo packages:
 
-Building reverie-dbi after explicitly activating DynamoRIO builds DynamoRIO
-and, transitively, the third-party projects that DynamoRIO itself vendors as
-submodules. The licenses of those components are summarized below. This NOTICE
-is provided for attribution and awareness; the authoritative and complete
-license texts live in each upstream project. Anyone who *distributes* binaries
-produced from this build must comply with all of the licenses listed here,
-including the copyleft (LGPL) obligations noted for elfutils and certain
-DynamoRIO extensions.
+  * `reverie-dbi/vendor/dynamorio`
+  * `experimental/reverie-sabre/vendor/{sabre,libelf}`
+  * `reverie-e9patch/vendor/e9patch`
+
+The `third-party/` git submodules remain developer reference checkouts, but the
+Cargo builds do not read them. The complete license texts named below are part
+of the corresponding vendored source trees and therefore part of each source
+package.
 
 --------------------------------------------------------------------------------
 DynamoRIO
@@ -30,67 +26,55 @@ DynamoRIO
 Upstream:  https://github.com/DynamoRIO/dynamorio
 Fork:      https://github.com/rrnewton/dynamorio
 Pinned commit: 929840ad9190e5086775e8debc0f0b79b4208d59
+Packaged path: `reverie-dbi/vendor/dynamorio`
 License:   BSD-3-Clause (primary), with the additional component licenses below.
-           Full text: `third-party/dynamorio/License.txt`.
+           Full text: `reverie-dbi/vendor/dynamorio/License.txt`.
 
   Copyright (c) 2010-2024 Google, Inc.   All rights reserved.
   Copyright (c) 2000-2009 VMware, Inc.   All rights reserved.
 
-DynamoRIO's License.txt calls out the following non-BSD-3 portions. The
-reverie-dbi build enables DynamoRIO extensions and tools
-(`-DBUILD_EXT=ON -DBUILD_TOOLS=ON -DBUILD_CLIENTS=ON`), so the LGPL-licensed
-extensions below are built and linked:
+DynamoRIO's License.txt calls out non-BSD-3 portions. The curated build uses
+`BUILD_CLIENTS=OFF`, `BUILD_EXT=ON`, and `BUILD_TOOLS=ON`, and retains only
+drcontainers, drmgr, drreg, drwrap, and drx. Of those packaged extensions,
+drwrap is LGPL-2.1-only; its complete text is also at
+`reverie-dbi/vendor/dynamorio/ext/drwrap/license.txt`.
 
-  * libelftc (drsyms extension) .......... BSD-style license
-  * drsyscall, drwrap, drutil extensions,
-    and the Dr. Memory Framework libraries
-    (when packaged) ...................... LGPL 2.1
-  * drsyms extension, linked against
-    elfutils libraries ................... LGPL 3 (see elfutils below)
+The curated tree does not contain drsyms, drsyscall, drutil, elfutils, libipt,
+or zlib sources.
+
+The packaged tree also contains:
+
   * third_party/valgrind headers
     (valgrind.h, memcheck.h) ............. BSD-4-Clause
                                            Copyright (C) 2000-2013 Julian Seward.
-
---------------------------------------------------------------------------------
-elfutils  (vendored by DynamoRIO at third_party/elfutils)
---------------------------------------------------------------------------------
-Upstream:  https://sourceware.org/git/elfutils.git
-Fork used: https://github.com/DynamoRIO/elfutils (per DynamoRIO .gitmodules)
-License:   The elfutils libraries linked by DynamoRIO's drsyms extension
-           (libelf, libdw, libdwfl) are dual-licensed GPL-2.0-or-later OR
-           LGPL-3.0-or-later; the standalone elfutils utilities are GPL-3.0
-           -or-later. DynamoRIO links only the libraries, under LGPL-3.0
-           -or-later.
-
-           NOTE: This is a copyleft dependency. Distributing binaries that
-           statically link elfutils requires honoring the LGPL relinking and
-           source-availability obligations.
-
---------------------------------------------------------------------------------
-libipt  (vendored by DynamoRIO at third_party/libipt)
---------------------------------------------------------------------------------
-Upstream:  https://github.com/intel/libipt
-License:   BSD-3-Clause
-           Copyright (c) Intel Corporation.
-
---------------------------------------------------------------------------------
-zlib  (vendored by DynamoRIO at third_party/zlib)
---------------------------------------------------------------------------------
-Upstream:  https://github.com/madler/zlib
-License:   zlib License
-           Copyright (c) 1995-present Jean-loup Gailly and Mark Adler.
+    The full BSD-4-Clause notice is embedded at the top of each header under
+    `reverie-dbi/vendor/dynamorio/third_party/valgrind/`.
 
 --------------------------------------------------------------------------------
 SaBRe
 --------------------------------------------------------------------------------
 Upstream:  https://github.com/srg-imperial/SaBRe
-Pinned commit: 05816ee066a7284bee8afd0e73eeb44455b254b4
-License:   GPL-3.0-or-later (primary), with per-file exceptions documented by
-           the upstream project.
+Pinned commit: 41113f849f8799932ed8c7883f5a4de616b9e9fa
+Packaged path: `experimental/reverie-sabre/vendor/sabre`
+License:   GPL-3.0-or-later (primary), with GPL-2.0-only Linux-derived files,
+           BSD-3-Clause Native Client-derived files, and MIT plugin API files.
+           The mapping and complete texts are in `LICENSE`, `LICENSE.GPL-2`,
+           `LICENSE.GPL-3`, `LICENSE.BSD-3`, and `LICENSE.MIT` at that path.
+
+SaBRe's packaged ELF reader is derived from e9patch commit
+6c2c03c1da74b14daf1788a9f8dccfa354ce04a6 plus `gelf_getnote.c` and
+`gelf_getsym.c` from DynamoRIO elfutils commit
+302252356da5475670ac5b10dadd091c59689425. It is distributed under
+LGPL-3.0-or-later; provenance and complete license texts are in
+`experimental/reverie-sabre/vendor/libelf/{REVISION,COPYING,COPYING-LGPLV3}`.
 
 --------------------------------------------------------------------------------
 e9patch
 --------------------------------------------------------------------------------
 Upstream:  https://github.com/GJDuck/e9patch
 Pinned commit: 6c2c03c1da74b14daf1788a9f8dccfa354ce04a6 (v1.0.1)
-License:   GPL-3.0
+Packaged path: `reverie-e9patch/vendor/e9patch`
+License:   GPL-3.0-only (primary; complete text in `LICENSE`), with the bundled
+           libdw subset used under LGPL-3.0-or-later (complete text in
+           `contrib/libdw/COPYING-LGPLV3`) and Zydis under MIT (complete text in
+           `contrib/zydis/LICENSE`).
