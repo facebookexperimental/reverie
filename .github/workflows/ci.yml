@@ -108,10 +108,15 @@ jobs:
       run: scripts/backend-submodule.sh activate dynamorio
     - name: Dependencies
       run: |
-        if command -v apt-get >/dev/null; then
-          sudo apt-get install -y libunwind-dev liblzma-dev cmake zlib1g-dev
-        else
+        # Detect the native package manager dnf-FIRST: the Fedora self-hosted
+        # runners also have apt-get on PATH, but its repos lack cmake/zlib1g-dev,
+        # so keying on `command -v apt-get` took the apt branch and failed with
+        # "Unable to locate package cmake" (exit 100). dnf-first routes each
+        # distro to its own manager.
+        if command -v dnf >/dev/null; then
           sudo dnf install -y libunwind-devel xz-devel cmake zlib-devel
+        elif command -v apt-get >/dev/null; then
+          sudo apt-get install -y libunwind-dev liblzma-dev cmake zlib1g-dev
         fi
     - name: Rust toolchain
       uses: dtolnay/rust-toolchain@nightly
