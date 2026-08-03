@@ -1,0 +1,925 @@
+/* ******************************************************************************
+ * Copyright (c) 2010-2025 Google, Inc.  All rights reserved.
+ * Copyright (c) 2011 Massachusetts Institute of Technology  All rights reserved.
+ * Copyright (c) 2007-2010 VMware, Inc.  All rights reserved.
+ * ******************************************************************************/
+
+/*
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * * Redistributions of source code must retain the above copyright notice,
+ *   this list of conditions and the following disclaimer.
+ *
+ * * Redistributions in binary form must reproduce the above copyright notice,
+ *   this list of conditions and the following disclaimer in the documentation
+ *   and/or other materials provided with the distribution.
+ *
+ * * Neither the name of VMware, Inc. nor the names of its contributors may be
+ *   used to endorse or promote products derived from this software without
+ *   specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL VMWARE, INC. OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH
+ * DAMAGE.
+ */
+
+/* The name "page_user_docs" is hardcoded in CMake_rundoxygen.cmake. */
+
+/**
+ ****************************************************************************
+ ****************************************************************************
+ ****************************************************************************
+\page page_user_docs Build Your Own Tool
+
+DynamoRIO is a <em>runtime code manipulation system</em> that supports
+code transformations on any part of a program, <em>while it executes</em>.
+DynamoRIO gives complete control over the runtime code stream and does not
+limit transformations to trampoline insertion.  DynamoRIO exports an
+interface for building dynamic tools for a wide variety of uses: program
+analysis and understanding, profiling, instrumentation, optimization,
+translation, etc. DynamoRIO provides efficient, transparent, and
+comprehensive manipulation of an unmodified application running on a stock
+operating system (Windows, Linux, or Android) and commodity IA-32, AMD64,
+ARM, and AArch64 hardware.  See \ref sec_limit_platforms for details of
+which platform combinations are fully supported.
+
+***************************************************************************
+This document describes the DynamoRIO system and the various APIs that it
+exports for building custom tools.  The DynamoRIO documentation follows an
+end-to-end workflow from obtaining DynamoRIO to validating deployment; for
+the complete build, run, and deploy flow, see the User Journey on the home
+page (\ref user_journey).  This page focuses on client APIs and concepts; it
+is divided into the following sections:
+
+- \subpage page_tutorials
+  <br>Gives a few short tutorials on using DynamoRIO and includes slides
+  from prior in-person tutorial presentations.
+
+- \subpage API_samples
+  <br>Shows some sample use cases and reference implementations.
+
+- \subpage page_build_client
+  <br>How to build a tool or "client" of DynamoRIO.
+
+- \subpage page_deploy
+  <br>How to run DynamoRIO.
+
+- \subpage using
+  <br>The top-level interfaces provided to a tool.
+
+- \subpage API_BT
+  <br>DynamoRIO's full runtime code manipulation interface.
+
+- \ref page_ext
+  <br>DynamoRIO's API is augmented by a collection of extension libraries.
+
+- \subpage page_standalone
+  <br>DynamoRIO can be used as a standalone library for IA-32/AMD64/ARM/AArch64
+  disassembly, decoding, encoding, and general instruction manipulation.
+  A separate static library is provided for this purpose.
+
+- \subpage overview
+  <br>A description of the implementation of the DynamoRIO system.
+
+- \subpage release_notes
+  <br>Release notes for this release, including changes since prior
+  releases and plans for future releases.
+
+<br>
+
+***************************************************************************
+***************************************************************************
+\page overview DynamoRIO System Overview
+
+DynamoRIO is a system for runtime code manipulation that is efficient,
+transparent, and comprehensive, able to observe and manipulate every
+executed instruction in an unmodified application running on a stock
+operating system and commodity hardware.
+
+***************************************************************************
+\section sec_intro Introduction
+
+DynamoRIO operates in user mode on a target process.  It acts as a
+<em>process virtual machine</em>, interposing between the application and
+the operating system.  It has a complete view of the application code
+stream and acts as a runtime control point, allowing custom tools to be
+embedded inside it:
+
+  \image html interpose.png
+  \image latex interpose.eps "Flow chart" width=10cm
+
+The application itself, along with the underlying operating system and
+hardware, remain unchanged.  DynamoRIO operates in native (non-virtual)
+environments as well as inside guest operating systems running on virtual
+machines.  Tools created on top of DynamoRIO will operate without change
+whether the underlying operating system is native or a virtual machine
+guest.
+
+***************************************************************************
+\section sec_system System Operation
+
+DynamoRIO operates by shifting an application's execution from its original
+instructions to a <em>code cache</em>, where the instructions can be freely
+modified. DynamoRIO occupies the address space with the application and has
+full control over execution, taking over whenever control leaves the code
+cache or when the operating system directly transfers control to the
+application (<em>kernel-mediated control transfers</em>):
+
+  \image html flow-highlevel.png
+  \image latex flow-highlevel.eps "Flow chart" width=10cm
+
+DynamoRIO copies the application code one <em>dynamic basic block</em> at a
+time into its basic block code cache. A block that directly targets another
+block already resident in the cache is linked to that block to avoid the
+cost of returning to the DynamoRIO dispatcher.
+
+Frequently executed sequences of basic blocks are combined into
+<em>traces</em>, which are placed in a separate code cache. DynamoRIO makes
+these traces available via its interface for convenient access to hot
+application code streams.
+
+The following figure shows the flow of control between the components of
+DynamoRIO and its code caches:
+
+  \image html flow.png
+  \image latex flow.eps "Flow chart" width=15cm
+
+The context switch is between DynamoRIO's operational state and the machine
+state of the application: both are still within the same process.
+
+Indirect branches require dynamic resolution of their targets, which is
+performed via an inlined table lookup or a compare to a known target
+inlined into a trace.
+
+\section sec_sys_transp Transparency
+
+Transparency is an important requirement for DynamoRIO and its clients.
+The subject is fully covered in \subpage transparency.
+
+***************************************************************************
+\section sec_refs References
+
+The canonical reference for DynamoRIO is:
+
+- Derek Bruening.<br>
+  <a href="http://www.burningcutlery.com/derek/phd.html">
+  Efficient, Transparent, and Comprehensive Runtime Code Manipulation</a>.<br>
+  Ph.D. Thesis, MIT, September 2004.
+
+See \ref page_publications for other publications involving DynamoRIO.
+
+****************************************************************************
+****************************************************************************
+*/
+/* It's good to use separate C comments: we've hit some sort of doxygen
+ * internal buffering error before if one comment gets too long.
+ */
+/**
+***************************************************************************
+***************************************************************************
+\page using Tool Event Model and API
+
+This section gives an overview of how to use DynamoRIO, divided into the
+following sub-sections:
+
+ - \ref sec_events
+ - \ref sec_utils
+ - \ref sec_extlibs
+ - \ref sec_extensions
+ - \ref sec_comm
+ - \ref sec_annotations
+ - \ref sec_64bit_reach
+ - \ref sec_utf8
+
+DynamoRIO exports a rich Application Programming Interface (API) to the
+user for building a DynamoRIO <em>client</em>. A DynamoRIO client is a
+library that is coupled with DynamoRIO in order to jointly operate on an
+input program binary:
+
+  \image html client.png
+  \image latex client.eps "DynamoRIO client" width=10cm
+
+To interact with the client, DynamoRIO provides specific events that a
+client can intercept.  Event interception functions, if supplied by a user
+client, are called by DynamoRIO at appropriate times.
+
+DynamoRIO can alternatively be used as a third-party disassembly library
+(see \ref page_standalone).
+
+***************************************************************************
+\section sec_events Common Events
+
+A client's primary interaction with the DynamoRIO system is via a
+set of event callbacks.  These events include the following:
+
+  - Basic block and trace creation or deletion
+    (dr_register_bb_event(), dr_register_trace_event(), dr_register_delete_event())
+  - Process initialization and exit
+    (dr_client_main(), dr_register_post_attach_event(), dr_register_exit_event())
+  - Thread initialization and exit
+    (dr_register_thread_init_event(), dr_register_thread_exit_event())
+  - Fork child initialization (Linux-only); meant to be used for
+    re-initialization of data structures and creation of new log files
+    (dr_register_fork_init_event())
+  - Application library load and unload
+    (dr_register_module_load_event(), dr_register_module_unload_event())
+  - Application fault or exception (signal on Linux)
+    (dr_register_exception_event(), dr_register_signal_event())
+  - Kernel-mediated control transfers (dr_register_kernel_xfer_event()):
+    - Application APC (Asynchronous Procedure Call), callback, or exception
+      dispatcher execution (Windows)
+    - Application signal delivery (Linux)
+    - System call that changes the context
+  - System call interception: pre-system call, post-system call, and system
+    call filtering by number
+    (dr_register_pre_syscall_event(), dr_register_post_syscall_event(),
+    dr_register_filter_syscall_event())
+  - Signal interception (Linux-only)
+    (dr_register_signal_event())
+  - Nudge received - see \ref sec_comm
+    (dr_register_nudge_event())
+
+Typically, a client will register for the desired events at
+initialization in its dr_client_main() routine.  DynamoRIO then calls the
+registered functions at the appropriate times.  Each event has a
+specific registration routine (e.g., dr_register_thread_init_event(): see
+the names in parentheses in the list above)
+and an associated unregistration routine.  The header file dr_events.h
+contains the declarations for all registration and unregistration
+routines.
+
+When attaching to an already running process, dr_client_main() is called
+in the initially taken over thread before the other threads are taken over.
+Thus, it is not the best place to take a snapshot of global state such
+as the address space.  The post-attach event (dr_register_post_attach_event())
+is provided as a point where all the other threads have been suspended but
+have not yet started executing under instrumentation: the best point to
+take a snapshot and avoid a gap between it and monitored events post-takeover.
+
+Note that clients are allowed to register multiple callbacks for the
+same event.  DynamoRIO also supports mutiple clients, each of which
+can register for the same event.  In this case, DynamoRIO sequences
+event callbacks in reverse order of when they were registered.  In
+other words, the first registered callback receives event notification
+last.  This scheme gives priority to a callback registered earlier,
+since it can override or modify the actions of clients registered
+later.  Note that DynamoRIO calls each client's dr_client_main() routine
+according to the client's priority (see \ref sec_multi_client and
+dr_register_client() in the deployment API).
+
+Systems registering multiple callbacks for a single event should be
+aware that client modifications are visible in subsequent callbacks.
+DynamoRIO makes no attempt to mitigate interference among callback
+functions.  It is the responsibility of a client to ensure
+compatibility among its callback functions and the callback functions
+of other clients.
+
+Clients can also unregister a callback using the appropriate
+unregister routine (see dr_events.h).  While unusual, it is possible for
+one callback routine to unregister another.  In this case, DynamoRIO
+still calls routines that were registered before the event.
+Unregistration takes effect before the next event.
+
+On Linux, an exec (SYS_execve) does NOT result in an exit event, but it
+WILL result in the client library being reloaded and its dr_client_main() routine
+being called again.  The system call events can be used for notification of
+SYS_execve.
+
+***************************************************************************
+\section sec_utils Common Utilities
+
+DynamoRIO provides clients with a powerful library of utilities for
+custom runtime code transformations.  The interface includes explicit
+support for creating \e transparent clients.  See the section on
+\ref transparency for a full discussion of the importance of remaining
+transparent when operating in the same process as the application.
+DynamoRIO provides common resources clients can use to avoid reliance on
+shared libraries that may be in use by the application.  The client should
+only use external resources through DynamoRIO's own API, through
+DynamoRIO Extensions (see \ref sec_extensions), through direct
+system calls, or via an external agent in a separate process that
+communicates with the client (see \ref sec_comm).  Third-party libraries
+can be used if they are linked statically or loaded privately and there is
+no possibility of global resource conflicts (e.g., a third-party library's
+memory allocation must be wrapped): see \ref sec_extlibs for more details.
+
+DynamoRIO's API provides:
+
+ - Memory allocation: both thread-private (faster as it incurs no
+   synchronization costs) and thread-shared
+ - Thread-local storage
+ - Thread-local stack separate from the application stack
+ - Simple mutexes
+ - File creation, reading, and writing
+ - Address space querying
+ - Application module iterator
+ - Processor feature identification
+ - Extra thread creation
+ - Symbol lookup (currently Windows-only)
+ - Auxiliary library loading
+
+See dr_tools.h and dr_proc.h for specifics of each routine.
+
+Another class of utilities provided by DynamoRIO are structures and
+routines for decoding, encoding, and manipulating IA-32, AMD64, ARM, and AArch64
+instructions. These are described in \ref sec_IR.
+
+\anchor subsec_forwards
+In addition, on Windows, DynamoRIO provides a number
+of utility functions that it fowards to a core Windows system library
+that we believe to be safe for clients to use:
+
+ - wcstoul
+ - wcstombs
+ - wcstol
+ - wcsstr
+ - wcsspn
+ - wcsrchr
+ - wcspbrk
+ - wcsncpy
+ - wcsncmp
+ - wcsncat
+ - wcslen
+ - wcscspn
+ - wcscpy
+ - wcscmp
+ - wcschr
+ - wcscat
+ - towupper
+ - towlower
+ - toupper
+ - tolower
+ - tan
+ - strtoul
+ - strtol
+ - strstr
+ - strspn
+ - strrchr
+ - strpbrk
+ - strncpy
+ - strncmp
+ - strncat
+ - strlen
+ - strcspn
+ - strcmp
+ - strchr
+ - sscanf
+ - sqrt
+ - sprintf
+ - sin
+ - qsort
+ - pow
+ - memset
+ - memmove
+ - memcpy
+ - memcmp
+ - memchr
+ - mbstowcs
+ - log
+ - labs
+ - isxdigit
+ - iswxdigit
+ - iswspace
+ - iswlower
+ - iswdigit
+ - iswctype
+ - iswalpha
+ - isupper
+ - isspace
+ - ispunct
+ - isprint
+ - islower
+ - isgraph
+ - isdigit
+ - iscntrl
+ - isalpha
+ - isalnum
+ - floor
+ - fabs
+ - cos
+ - ceil
+ - atol
+ - atoi
+ - atan
+ - abs
+ - _wtol
+ - _wtoi64
+ - _wtoi
+ - _wcsupr
+ - _wcsnicmp
+ - _wcslwr
+ - _wcsicmp
+ - _vsnprintf
+ - _ultow
+ - _ultoa
+ - _ui64toa
+ - _toupper
+ - _tolower
+ - _strupr
+ - _strnicmp
+ - _strlwr
+ - _stricmp
+ - _strcmpi
+ - _snwprintf
+ - _snprintf
+ - _memicmp
+ - _memccpy
+ - _ltow
+ - _ltoa
+ - _itow
+ - _itoa
+ - _i64tow
+ - _i64toa
+ - _ftol
+ - _fltused
+ - _chkstk
+ - _aullshr
+ - _aullrem
+ - _aulldiv
+ - _atoi64
+ - _allshr
+ - _allshl
+ - _allrem
+ - _allmul
+ - _alldiv
+ - __toascii
+ - __iscsymf
+ - __iscsym
+ - __isascii
+
+In general, these routines match their standard C library counterparts.  However, be
+warned that some of these may be more limited.  In particular, _vsnprintf
+and _snprintf do not support floating-point values.  DynamoRIO provides
+its own dr_snprintf() that does support floating-point values, but does
+not support printing wide characters.  When printing floating-point values
+be sure to \ref sec_trans_floating_point
+"save the application's floating point state"
+so as to avoid corrupting it.
+
+***************************************************************************
+\section sec_64bit_reach 64-Bit Reachability
+
+To simplify reachability in a 64-bit address space, DynamoRIO guarantees
+that all of its code caches are located within a single 2GB memory region.
+It also places all client memory allocated through dr_thread_alloc(),
+dr_global_alloc(), dr_nonheap_alloc(), or dr_custom_alloc() with
+#DR_ALLOC_CACHE_REACHABLE in the same region.
+
+DynamoRIO loads client libraries and Extensions (but not copies of system
+libraries) within 32-bit reachability of its code caches.  Typically, the
+code cache region is located in the low 4GB of the address space; thus, to
+avoid relocations at client library load time, it is recommended to set a
+preferred client library base in the low 4GB.  The \ref op_reachable_client
+"-reachable_client runtime option" can be used to remove this guarantee.
+The option is automatically turned off when DynamoRIO and clients are
+statically linked with the application: for such static usage, 32-bit
+reachability to the code cache by clients is not guaranteed. It is also
+disabled on macOS, where the lack of a private loader means we cannot
+control where the client library gets loaded.
+
+The net result is that any static data or code in a client library, or any
+data allocated using DynamoRIO's API routines (except dr_raw_mem_alloc() or
+dr_custom_alloc()), is guaranteed to be directly reachable from code cache
+code.  However, memory allocated through system libraries (including
+malloc, operator new, and HeapAlloc), as well as DynamoRIO's own
+internally-used heap memory, is *not* guaranteed to be reachable: only
+memory directly allocated via DynamoRIO's API.  The \ref op_reachable_heap
+"-reachable_heap runtime option" can be used to guarantee that all memory
+is reachable, at the risk of running out of memory due to the smaller space
+of available memory.
+
+To make more space available for the code caches when running larger
+applications, or for clients that use a lot of heap memory that is not
+directly referenced from the cache, we recommend that dr_custom_alloc() be
+called to obtain memory that is not guaranteed to be reachable from the
+code cache (by not passing #DR_ALLOC_CACHE_REACHABLE).  This frees up space
+in the reachable region.
+
+When inserting calls, dr_insert_call() and dr_insert_clean_call() assume
+that the call is destined for encoding into the code cache-reachable memory
+region, when determining whether a direct or indirect call is needed.
+An indirect call will clobber r11.  Use dr_insert_clean_call_ex()
+with #DR_CLEANCALL_INDIRECT to ensure reachability when encoding to
+a location other than DR's regular code region, or when a clean call is not
+needed, dr_insert_call_ex() takes in a target encode location for more
+flexible determination of direct versus indirect.
+
+DynamoRIO does not guarantee that any of its memory is allocated in the
+lower 4GB of the address space.  However, it provides several features to
+make it easier to reference addresses absolutely:
+
+ - For directly referencing a global variable \p var in a client library, the
+   client can create an operand with the address \p &var and it will
+   auto-magically turn into a pc-relative addressing mode.
+   OPND_CREATE_ABSMEM() directly creates a pc-relative operand, while
+   opnd_create_abs_addr() will convert to a pc-relative operand when an
+   absolute reference will not encode.  An opnd_create_rel_addr() operand
+   will also convert to an absolute reference when that will reach but a
+   pc-relative reference will not.
+
+ - When using an address as an immediate, use the routines
+   instrlist_insert_mov_immed_ptrsz() or
+   instrlist_insert_push_immed_ptrsz() to conveniently insert either one or
+   two instructions depending on whether the address is in the lower 4GB or
+   not.
+
+ - When using an #instr_t pointer as an immediate, use the routines
+   instrlist_insert_mov_instr_addr() or instrlist_insert_push_instr_addr()
+   to conveniently insert either one or two instructions depending on
+   whether the resulting #instr_t encoded address is in the lower 4GB or
+   not.
+
+***************************************************************************
+\section sec_utf8 String Encoding
+
+All strings in the DynamoRIO API, whether input or output parameters, are
+encoded as UTF-8.  DynamoRIO will internally convert to UTF-16 when
+interacting with the Windows kernel.  A client can use #dr_snprintf() or
+#dr_snwprintf() with the \p S format code to convert between UTF-8 and
+UTF-16 on its own.  (The _snprintf() function forwarded to ntdll does not
+perform that conversion.)
+
+
+***************************************************************************
+\section sec_extensions DynamoRIO Extension Libraries
+
+DynamoRIO supports extending the API presented to clients through
+separate libraries called DynamoRIO Extensions.  Extensions are meant to
+include features that may be too costly to make available by default or
+features contributed by third parties whose licensing requires using a
+separate library.  Extensions can be either static libraries linked with
+clients at build time or dynamic libraries loaded at runtime.  A private
+loader is used to load dynamic Extensions.
+
+Current Extensions provide symbol access and container data structures.
+Each Extension has its own documentation and has its functions and data
+structures documented separately from the main API.
+See the full list of Extensions here: \ref page_ext.
+
+Be aware that some of the DynamoRIO Extensions have LGPL licenses instead
+of the BSD license of the rest of DynamoRIO.  Such Extensions are built as
+shared libraries, have their own license.txt files, and clearly identify
+their license in their documentation.  (We also provide static versions of
+such libraries, but take care in using them that their LGPL licenses match
+your requirements.)
+
+***************************************************************************
+\section sec_extlibs Using External Libraries
+
+Clients are free to use external libraries as long as those libraries do
+not use any global user-mode resources that would interfere with the
+running application, and as long as no alertable system calls are invoked
+on Windows (see \ref sec_alertable).  While most non-graphical
+non-alertable Windows API routines are supported, native threading libraries
+such as \p libpthread.so on Linux are known to sometimes cause problems.
+
+Currently we provide a private loader for both Windows and Linux which
+supplies support for client external library use.
+Clients must either link statically to all libraries or load them using
+our private loader, which will happen automatically for shared libraries
+loaded in a typical manner.
+With private loading, the client
+uses a separate copy of each library from any copy used by the application.
+This helps to prevent re-entrancy problems (see \ref sec_trans_resource).
+Even with this separation, if these libraries use global resources there
+can still be conflicts.  Our private loader redirects heap
+allocation in the main process heap to instead use DynamoRIO's internal
+heap.  The loader also attempts to isolate other global resource usage and
+global callbacks.  Please file reports on any transparency problems
+observed when using the private loader.
+
+If DynamoRIO and clients are statically linked into the application,
+the private loader is not available and third-party library usage is
+generally no longer safe, unless that usage only happens during
+process-wide initialization (see \ref sec_static_DR).
+
+By default, all Windows clients link with libc.  To instead
+use the libc subset of routines forwarded from the DynamoRIO library to \p
+ntdll.dll (which keeps clients more lightweight and is usually sufficient
+for most C code), set this variable prior to invoking
+configure_DynamoRIO_client():
+
+\code
+  set(DynamoRIO_USE_LIBC OFF)
+\endcode
+
+C++ clients and standalone clients link with libc by default.
+
+**************************************************
+\subsection sec_alertable Avoid Alertable System Calls
+
+On Windows, DynamoRIO does not support a client (or a library used by a
+client) making alertable system calls.  These are system calls that can be
+interrupted for delivery of callbacks or asynchronous procedure calls.  At
+the Windows API layer, they include many graphical routines, any Wait
+function invoked with \p alertable=TRUE (e.g., WaitForSingleObjectEx or
+WaitForMultipleObjectsEx), any Windows message queue function (GetMessage,
+SendMessage, ReplyMessage), and asynchronous i/o.  In general, avoiding
+graphical, windowing, or asynchronous i/o library or system calls is
+advisable.  DynamoRIO does not guarantee correct execution when a callback
+arrives during client code execution.
+
+**************************************************
+\subsection sec_rpath DynamoRIO Library Search Paths
+
+DynamoRIO's loader searches for libraries in approximately the same manner
+as the system loader.  It also has support for automatically locating
+Extension libraries that are packaged in the usual place in the DynamoRIO
+file hierarchy.
+
+DynamoRIO supports setting DT_RPATH for ELF clients, via setting the
+DynamoRIO_RPATH variable to ON prior to invoking
+configure_DynamoRIO_client().  On Windows, setting that variable will
+create a "<client_basename>.drpath" text file that contains a list of
+paths.  At runtime, DynamoRIO's loader will parse this file and add each
+newline-separated path to its list of search paths.  This file is honored
+on Linux as well, though it is not automatically created there.  This
+allows clients a cross-platform mechanism to use third-party libraries in
+locations of their choosing.
+
+**************************************************
+\subsection subsec_avoid_redir Deliberately Invoking Application Routines
+
+Sometimes, a client wishes to invoke system library routines with the
+application context, rather than having them redirected and isolated by
+DynamoRIO.  This can be accomplished using dynamic binding rather than
+static: dynamically looking up each desired library routine via DR's own
+routines (such as dr_get_proc_address()).  (Using \p GetProcAddress will not
+work for this purpose as the result will be redirected.)
+
+**************************************************
+\subsection subsec_no_loader When Private Loader is Disabled
+
+On Linux, if the private loader is deliberately disabled, ld provides the -wrap
+option, which allows us to override the C library's memory heap allocation
+routines with our own.  For convenience, DynamoRIO exports
+__wrap_malloc(), __wrap_realloc(), and __wrap_free() for this purpose.
+These routines behave like their C library counterparts, but operate on
+DynamoRIO's global memory pool.  Use the -Xlinker flag with gcc to replace
+the libc routines with DynamoRIO's _wrap routines, e.g.,
+
+\code
+  gcc -Xlinker -wrap=malloc -Xlinker -wrap=realloc -Xlinker -wrap=free -Xlinker -wrap=strdup ...
+\endcode
+
+The ability to override the memory allocation routines makes it
+convenient to develop C++ clients that use the \em new and \em delete
+operators (as long as those operators are implemented using malloc and
+free).  In particular, heap allocation is required to use the C++
+Standard Template Library containers. When developing a C++ client,
+we recommend linking statically to the C++ runtime library if not using
+the provided private loader.
+
+On Linux, this is most easily accomplished by specifying the path to the
+static version of the library on the gcc command line.  gcc's
+-print-file-name option is useful for discovering this path, e.g.,
+
+\code
+  g++ -print-file-name=libstdc++.a
+\endcode
+
+A full gcc command line for building a C++ client when disabling the
+private loader (which is not the default) might look something like this
+(note that this requires static versions of the standard libraries that
+were built PIC, which is not the case in modern binary distributions and
+often requires building from source):
+
+\code
+g++ -o my-client.so -I<header dir> \
+  -fPIC -shared -nodefaultlibs \
+  -Xlinker -wrap=malloc -Xlinker -wrap=realloc -Xlinker -wrap=free \
+  `g++ -print-file-name=libstdc++.a` \
+  `g++ -print-file-name=libgcc.a` \
+  `g++ -print-file-name=libgcc_eh.a` \
+  my-client.cpp
+\endcode
+
+**************************************************
+\subsection subsec_cpp C++ Clients
+
+The 3.0 version of DynamoRIO added experimental full support for C++
+clients using the STL and other libraries.
+
+On Windows, when using the Microsoft Visual C++ compiler, we recommend
+using the \p /MT compiler flag to request a static C library.  The client
+will still use the \p kernel32.dll library but our private loader will load
+a separate copy of that library and redirect heap allocation automatically.
+Our private loader does not yet support locating SxS (side-by-side)
+libraries, so using \p /MD will most likely not work unless using a
+version of the Visual Studio compiler other than 2005 or 2008.
+
+We do not recommend that a client or its libraries invoke their own system
+calls as this bypasses DynamoRIO's monitoring of changes to the process
+address space and changes to threads or control flow.  Such system calls
+will also not work properly on Linux when using sysenter on some systems.
+If you see an assert to that effect in debug build on Linux, try the \ref
+op_sysenter "-sysenter_is_int80" option.
+
+***************************************************************************
+\section sec_comm Communication
+
+Due to transparency limitations (see \ref transparency),
+DynamoRIO can only support certain communication channels in and out of the
+target application process.  These include:
+
+ - DynamoRIO deployment control and runtime options: see \ref page_deploy
+   and \ref sec_options.  In particular, the deployment API allows users to
+   pass up-front runtime information to the client.
+ - Nudges: Since polling requires extra threads, and DynamoRIO tries not
+   to create permanent extra threads (see \ref sec_trans_thread
+   "Thread Transparency"), a mechanism called \e nudges are the preferred mechanism
+   for pushing data into the process. Nudges are used to notify DynamoRIO
+   that it needs to re-read its options, or perform some other action.
+   DynamoRIO also provides a custom nudge event that can be used by
+   clients. See dr_nudge_process() and dr_register_nudge_event().
+ - Files can be used to send data out.  An external process can wait on
+   the file.
+ - Shared memory can be used for bi-directional communication.  For an
+   example of this on Windows, see the stats sample (see \ref sec_drstats).
+
+***************************************************************************
+\section sec_annotations Annotations
+
+DynamoRIO provides a binary annotation mechanism which allows the target application to
+communicate directly with the DynamoRIO client, or with DynamoRIO itself. A binary
+annotation is generated from a macro that can be manually inserted into the source code of
+the target program. When compiled, the resulting sequence of assembly instructions has no
+effect on native execution (i.e., it is a nop, or resolves to a static default value),
+but during execution under DynamoRIO, each annotation is detected and transformed into a
+function call to a set of registered handlers. Currently DynamoRIO provides 2 simple
+annotations:
+
+ - <b>DYNAMORIO_ANNOTATE_RUNNING_ON_DYNAMORIO()</b>
+   Indicates by its return value whether the target app is running under DynamoRIO,
+
+ - <b>DYNAMORIO_ANNOTATE_LOG(format, ...)</b>
+   Writes a message to the DynamoRIO log, when the target app is running under DynamoRIO
+   and logging is enabled.
+
+An annotation may be declared void, as in DYNAMORIO_ANNOTATE_LOG(), or it may have a
+return value, as in the boolean DYNAMORIO_ANNOTATE_RUNNING_ON_DYNAMORIO(). The return
+value can be used in a branch predicate, such that some of the target app's code only
+executes under DynamoRIO, or it can be used for in-process communication to obtain data
+from DynamoRIO or its client that is only available during binary translation.
+
+\subsection subsec_annotate_app Annotating an Application
+
+Adding an annotation to a target application is primarily a simple matter of invoking the
+annotation macro at the desired program location. The macros are declared in the C header
+file <b>include/annotations/dr_annotations.h</b>, and each macro operates syntactically
+like a function call. An annotation having a return value can be used as an expression.
+DynamoRIO provides a module which defines the annotations, and clients may also provide
+modules containing custom annotations. Each compilation unit that uses annotations must be
+statically linked with the corresponding annotation module(s). For projects using cmake, a
+convenience function \b use_DynamoRIO_annotations(target, srcs) will configure the
+specified \b srcs to be linked with the annotation module.
+
+\subsection subsec_instr_annotations Instrumenting Annotations
+
+When DynamoRIO encounters an annotation in the target app, it instruments that program
+location in one of two ways:
+
+ - Return value substitution: DynamoRIO replaces the annotation with a constant return
+   value (this instrumentation is only valid for annotations having a return value),
+
+ - Handler invocation: DynamoRIO replaces the annotation with a call to each handler that
+   is currently registered for the annotation. For annotations having a return value, the
+   return value of the last registered handler will be the value to take effect at the
+   target program location.
+
+Annotation handlers are registered using API functions \b dr_annotation_register_call()
+and \b dr_annotation_register_return(). Note that changes to handler registration will
+have no effect on annotations that have already been translated by DynamoRIO into the
+code cache (until the annotated basic blocks are removed from the cache and retranslated).
+The annotation instrumentation invokes the handlers using a separate clean call for each
+handler. The return value for an annotation can be set within a handler function using
+the API function \b dr_annotation_set_return_value().
+
+\subsection subsec_create_annotations Creating Custom Annotations
+
+DynamoRIO client developers may wish to create new annotations to facilitate
+client-specific communication with the target application. For example, a client that
+inspects memory usage may have false positives for variables in the target app that are
+never referenced after initialization. The \ref API_tutorial_annotation1 walks
+through the process of creating a new annotation that allows target application
+developers to explicitly mark any variable as defined.
+
+****************************************************************************
+****************************************************************************
+*/
+/* It's good to use separate C comments: we've hit some sort of doxygen
+ * internal buffering error before if one comment gets too long.
+ */
+/* The name "Disassembly Library" is hardcoded in CMake_rundoxygen.cmake. */
+/**
+***************************************************************************
+***************************************************************************
+\page page_standalone Disassembly Library
+
+DynamoRIO can be used as a standalone library for IA-32/AMD64/ARM/AArch64
+disassembly, decoding, encoding, and general instruction manipulation,
+independently of controlling a target application.  When used in this way,
+all aspects of DynamoRIO's API routines that apply to instrumentation or
+application control are not applicable; however, the full, rich instruction
+set API is enabled.  For further information on the instruction set API see
+the following sections of the Code Manipulation API:
+
+ - \ref sec_IR
+ - \ref sec_decode
+
+\section sec_standalone Using DynamoRIO as a Standalone Library
+
+DynamoRIO can be used as a regular third-party library for a standalone
+application (instead of a client that operates on a target program).  Two
+options are provided: using the regular DynamoRIO shared library, or using
+a special static library \p drdecode.  The shared library provides not only
+decoding routines but also cross-platform resources such as file
+manipulation.
+
+When using the DynamoRIO shared library, this initialization routine must
+be called prior to using any API routines:
+
+\code dr_standalone_init() \endcode
+
+This routine returns a dummy context that can be passed to API routines.
+
+When using \p drdecode, the special context \p GLOBAL_DCONTEXT should be
+used whenever a context is required.  The \p drdecode library does not
+require initialization.
+
+Neither the context returned by dr_standalone_init() nor \p
+GLOBAL_DCONTEXT can be used as the drcontext for a thread running under
+DynamoRIO control!  It is only for standalone programs that wish to use
+DynamoRIO as a library of routines for instruction manipulation or
+other purposes.
+
+In standalone mode, the dr_set_isa_mode() routine operates globally rather
+than per-thread.
+
+Runtime options are ignored in standalone mode.  Disassembly style can be
+controlled via disassemble_set_syntax().  The processor to use will not be
+automatically set and will be assumed to be \p VENDOR_INTEL.  Use
+proc_set_vendor() to set to \p VENDOR_AMD instead.
+
+In standalone mode, there are no 32-bit-displacement reachability
+guarantees regarding DynamoRIO's heap.
+
+Some DynamoRIO API routines are not supported in standalone mode.  These
+include all event registration routines, module iteration,
+dr_memory_protect(), dr_messagebox(), dr_get_current_drcontext(),
+dr_get_thread_id(), tls fields, dr_thread_yield(), dr_sleep(), client
+threads, suspending threads, itimers, register spilling and restoring,
+dr_redirect_execution(), try/except, and code cache routines (e.g.,
+dr_delete_fragment() or flush routines).
+
+When using the \p drdecode library, no API routines other than those
+involving decoding, encoding, disassembling, instruction lists,
+instructions, or operands are supported.  The various compute_address
+routines can be used by manually filling in \p dr_mcontext_t, although far
+memory references will have their segment base ignored.  Other API routines
+are simply not present in the static library.  There is no separate set of
+headers for use with \p drdecode.
+
+When using DynamoRIO's CMake support, use the configure_DynamoRIO_decoder()
+function to set up include directories and to link with \p drdecode.  The
+next section describes how to link with the DynamoRIO shared library.
+
+
+\section sec_standalone_shared DynamoRIO Shared Library Issues
+
+Since the DynamoRIO library on Windows includes or forwards
+implementations of certain C library routines (see
+\ref subsec_forwards "C library utilities"), standalone applications
+linking to both DynamoRIO and the C library may experience linker errors
+when building and floating point problems when running.  To avoid these
+problems, explicitly list the C runtime library on the command line:
+
+\code /link /nodefaultlib libcmt.lib dynamorio.lib \endcode
+
+DynamoRIO writes to stderr and stdout using raw system calls, which can
+interfere with the buffering of library routines.  When mixing use of
+printf or fprintf with DynamoRIO output (including not only dr_printf()
+and dr_fprintf() but also passing STDOUT or STDERR to routines like
+disassemble()), you may need to flush between library printing and
+DynamoRIO printing (e.g., using fflush(stdout)) to ensure that the library
+output is visible.
+
+The binary tracedump reader (\ref sec_ex8) is an example of use of
+DynamoRIO as a standalone library.
+
+When building an application that uses DynamoRIO as a standalone library,
+follow the steps for \ref page_build_client to include the header files and link
+with the DynamoRIO library, but omit the linker flags requesting no
+standard libraries or startup files.  DynamoRIO's CMake support does this
+automatically via the configure_DynamoRIO_standalone() function.
+
+*/

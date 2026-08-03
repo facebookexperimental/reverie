@@ -8,9 +8,6 @@ repository = "https://github.com/facebookexperimental/reverie"
 license = "BSD-2-Clause"
 build = "build.rs"
 
-[build-dependencies]
-libc = "0.2.186"
-
 [lib]
 crate-type = ["cdylib", "rlib"]
 

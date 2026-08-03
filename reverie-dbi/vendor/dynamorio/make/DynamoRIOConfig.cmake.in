@@ -1,0 +1,1330 @@
+# **********************************************************
+# Copyright (c) 2010-2026 Google, Inc.    All rights reserved.
+# Copyright (c) 2009-2010 VMware, Inc.    All rights reserved.
+# **********************************************************
+
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# * Redistributions of source code must retain the above copyright notice,
+#   this list of conditions and the following disclaimer.
+#
+# * Redistributions in binary form must reproduce the above copyright notice,
+#   this list of conditions and the following disclaimer in the documentation
+#   and/or other materials provided with the distribution.
+#
+# * Neither the name of VMware, Inc. nor the names of its contributors may be
+#   used to endorse or promote products derived from this software without
+#   specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL VMWARE, INC. OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+# LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+# OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH
+# DAMAGE.
+
+###########################################################################
+#
+# How to use:
+#
+# Step 1 of 2: load this file in your client's CMakeLists.txt file:
+#
+#   find_package(DynamoRIO)
+#
+# You can optionally specify the version number you need:
+#
+#   find_package(DynamoRIO 1.4)
+#
+# If DynamoRIO is not installed in standard system directories, set
+# the DynamoRIO_DIR variable to tell find_package() where to find
+# DynamoRIO's cmake/ directory:
+#
+#   cmake -DDynamoRIO_DIR=/path/to/dynamorio/cmake <path/to/myclient/sources>
+#
+# Step 2 of 2: after you've defined your target, configure it using the
+# configure_DynamoRIO_client() function defined in this file.
+# For example:
+#
+#  add_library(myclient SHARED myclient.c)
+#  configure_DynamoRIO_client(myclient)
+#
+###########
+#
+# Standalone usage:
+#
+# If instead of a client you are using DynamoRIO as a standalone library,
+# use the configure_DynamoRIO_standalone() function:
+#
+#  add_executable(myapp myapp.c)
+#  configure_DynamoRIO_standalone(myapp)
+#
+# If using the drconfig (dr_config.h) and/or drinject (dr_inject.h) APIs,
+# you also need to explicitly link with those libraries:
+#
+#  target_link_libraries(myapp drinjectlib drconfiglib)
+#
+###########
+#
+# Decoder usage:
+#
+# If instead of a client you are using DynamoRIO's static decoder library,
+# use the configure_DynamoRIO_decoder() function:
+#
+#  add_executable(myapp myapp.c)
+#  configure_DynamoRIO_decoder(myapp)
+#
+###########
+#
+# Static DynamoRIO usage:
+#
+# If you are statically linking DynamoRIO and your client into your application,
+# use the configure_DynamoRIO_static() function:
+#
+#  add_executable(myapp myapp.c)
+#  configure_DynamoRIO_static(myapp)
+#
+# To link in a separately-built static client and ensure the linker will keep
+# its symbols, use:
+#
+#  use_DynamoRIO_static_client(myapp myclient)
+#
+# To create a pure-static binary, every client must be configured with
+# configure_DynamoRIO_static_client() instead of configure_DynamoRIO_client()
+# to avoid the DynamoRIO shared library from thwarting the link.
+#
+###########
+#
+# Frontendlib usage:
+#
+# To build a tool that uses drfrontendlib but not the DynamoRIO library,
+# the headers can be added to the include paths with:
+#
+#   configure_DynamoRIO_main_headers()
+#
+###########
+#
+# DrMemtrace usage:
+#
+# To build a tool on the drmemtrace analyzer framework, here also
+# linking in the provided reuse-distance tool as an example;
+#
+#   use_DynamoRIO_drmemtrace(myapp)
+#   target_link_libraries(myapp drmemtrace_analyzer drmemtrace_reuse_distance)
+#
+# To customize the tracer and add drmemtrace.h to the include path:
+#
+#   use_DynamoRIO_drmemtrace_tracer(myapp)
+#
+###########
+#
+# Global changes:
+#
+# Due to CMake limitations, this file must set some global values:
+# - include directories
+# - compiler flags
+#
+# In order to set the compiler flags, the base flags are emptied out:
+# - CMAKE_C_FLAGS
+# - CMAKE_CXX_FLAGS
+# - CMAKE_C_FLAGS_${CMAKE_BUILD_TYPE_UPPER}
+# - CMAKE_CXX_FLAGS_${CMAKE_BUILD_TYPE_UPPER}
+# - CMAKE_C_FLAGS_${CMAKE_CONFIGURATION_TYPES} (for each, uppercase)
+# - CMAKE_CXX_FLAGS_${CMAKE_CONFIGURATION_TYPES} (for each, uppercase)
+#
+# None of the global changes occur on the find_package(); they are only
+# implemented on the first configure_DynamoRIO_*() call.  Optionally,
+# they can be triggered earlier by calling configure_DynamoRIO_global().
+# The original cflag values are saved in variables with the prefix ORIG_
+# followed by the variable name (e.g., ORIG_CMAKE_C_FLAGS).
+# These flags are set in the configure_DynamoRIO_*() functions via
+# PARENT_SCOPE.  If you want to call these functions from another
+# function, you must first call configure_DynamoRIO_global() from
+# global scope ahead of time.
+#
+# The compiler flags are not changed when using
+# configure_DynamoRIO_decoder().
+#
+# Various properties of the targets passed to configure_DynamoRIO_*()
+# are set, so any prior values will be lost, and if later values are
+# added after the configure call they should be appended.
+#
+# The preprocessor definitions that are added to the compiler flags
+# can be retrieved via the function get_DynamoRIO_defines().
+#
+###########
+#
+# Optional parameters:
+#
+# By default, the RPATH is not set for clients, but is set for standalone usage.
+# If this variable is set it overrides the default behavior:
+#
+#  set(DynamoRIO_RPATH ON)
+#
+# In addition to setting DT_RPATH for ELF files, on Windows or Android this will
+# create a <client_basename>.drpath text file that contains a list of paths.  At
+# runtime, DynamoRIO's loader will parse this file and add each newline-separated
+# path to its list of search paths.  On Android, it is up to the caller to
+# convert the build directory paths to remote paths appropriate for the target
+# device.
+#
+# If you are not exporting all global symbols in your Linux client,
+# this file tries to automatically determine that and explicitly mark
+# required client exports as visible.  The auto-detection can be
+# overridden by setting this variable before calling the
+# configure_DynamoRIO_client():
+#
+#  set(DynamoRIO_VISATT ON)
+#
+# To request the old REG_ enum symbols (which were changed to DR_REG_ to avoid
+# conflicts with system headers) set this variable. The newly added x86 AVX-512
+# registers DR_REG_ZMM0 - DR_REG_ZMM31 as well as DR_REG_K0 - DR_REG_K7 will not
+# be provided a deprecated REG_ name and are only available via DR_REG_ symbol.
+#
+#
+#  set(DynamoRIO_REG_COMPATIBILITY ON)
+#
+# To request that PAGE_SIZE and PAGE_START be defined set this variable:
+#
+#  set(DynamoRIO_PAGE_SIZE_COMPATIBILITY ON)
+#
+# To request that NUM_SIMD_SLOTS and NUM_XMM_SLOTS be defined set this variable:
+#
+#  set(DynamoRIO_NUM_SIMD_SLOTS_COMPATIBILITY ON)
+#
+# To request a preferred base even when not targeting 64-bit:
+# (the actual base will use PREFERRED_BASE if set)
+#
+#  set(DynamoRIO_SET_PREFERRED_BASE ON)
+#
+# On Windows, by default, all clients link with the C library.
+# A standalone client or a C++ client (or a client using the drsyms
+# static library) must link with the C library.
+# A C client, however, can be made more lightweight (and also reduce
+# its exposure to transparency corner cases) by avoiding the C library
+# by turning off this variable:
+#
+#  set(DynamoRIO_USE_LIBC OFF)
+#
+# To request fast IR access (at the cost of binary compatibility):
+#
+#  set(DynamoRIO_FAST_IR ON)
+#
+###########
+#
+# Annotations:
+#
+# To include DynamoRIO annotations in an application, the annotation source files
+# will need to be compiled and linked into the application, and additional
+# configuration steps must be taken. Function use_DynamoRIO_annotations()
+# simplifies this process. The following example configures `my_target` to use
+# annotations, and appends the annotation sources to the list variable `my_target_srcs`
+# (which must then be included in the call to add_executable(), add_library(), etc.):
+#
+#   use_DynamoRIO_annotations(my_target my_target_srcs)
+#
+# To define custom annotations in a DynamoRIO client, it will be most convenient for
+# the target application developers to have a function similar to
+# use_DynamoRIO_annotations() that configures their target for use of the custom
+# annotations. A recommended approach is to model this new configuration function on
+# use_DynamoRIO_annotations(), with the source paths replaced appropriately. The following
+# global steps are required to complete the configuration of custom annotations:
+#
+#   (1) copy the custom annotation sources and headers into the annotation export
+#       directory (as specified in the new configuration function).
+#   (2) copy "dr_annotations_asm.h" into that same annotation export directory.
+#   (3) add the annotation export directory to the includes using include_directories().
+#
+###########
+#
+# Exported utility functions:
+#
+# DynamoRIO_add_rel_rpaths(target library)
+#    This function takes in a target and a list of libraries and adds
+#    relative rpaths pointing to the directories of the libraries.
+#
+###########################################################################
+
+# Naming conventions:
+# As this is included directly into the user's configuration, we have to be careful
+# to avoid namespace conflicts.  Internal (global) variables and helper functions
+# should have a "_DR_" prefix.  Public functions and variables should have DynamoRIO
+# in the name.
+
+INCLUDEFILE make/utils_exposed.cmake
+
+if (UNIX)
+  _DR_identify_clang()
+  if (NOT CMAKE_COMPILER_IS_GNUCC)
+    # Our linker script is GNU-specific
+    message(FATAL_ERROR "DynamoRIO's CMake configuration only supports the GNU linker on Linux")
+  endif (NOT CMAKE_COMPILER_IS_GNUCC)
+else (UNIX)
+  if (NOT ${COMPILER_BASE_NAME} STREQUAL "cl")
+    # Our link flags are Microsoft-specific
+    message(FATAL_ERROR "DynamoRIO's CMake configuration only supports the Microsoft compiler on Windows")
+  endif (NOT ${COMPILER_BASE_NAME} STREQUAL "cl")
+endif (UNIX)
+
+# We'll be included at the same scope as the containing project, so use
+# a prefixed var name for globals.
+get_filename_component(DynamoRIO_cwd "${CMAKE_CURRENT_LIST_FILE}" PATH)
+
+# Export variables in case client needs custom configuration that
+# our exported functions do not provide.
+# Additionally, only set if not already defined, to allow
+# for further customization.
+if (NOT DEFINED DynamoRIO_INCLUDE_DIRS)
+  set(DynamoRIO_INCLUDE_DIRS "${DynamoRIO_cwd}/../include")
+endif (NOT DEFINED DynamoRIO_INCLUDE_DIRS)
+
+# Officially CMAKE_BUILD_TYPE is supposed to be ignored for VS generators so
+# users may not have set it (xref i#1392).
+if (NOT DEFINED CMAKE_BUILD_TYPE)
+  if (DEBUG)
+    set(CMAKE_BUILD_TYPE "Debug")
+  else ()
+    set(CMAKE_BUILD_TYPE "RelWithDebInfo")
+  endif()
+endif ()
+string(TOUPPER "${CMAKE_BUILD_TYPE}" CMAKE_BUILD_TYPE_UPPER)
+
+if (NOT DEFINED DynamoRIO_USE_LIBC)
+  # i#714: the default is now ON
+  set(DynamoRIO_USE_LIBC ON)
+endif ()
+
+if (NOT DEFINED ARM AND NOT DEFINED AARCH64 AND NOT DEFINED RISCV64 AND
+    NOT DEFINED X86)
+  if (CMAKE_SYSTEM_PROCESSOR MATCHES "^aarch64" OR CMAKE_SYSTEM_PROCESSOR MATCHES "^arm64")
+    set(AARCH64 1)
+  elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "^arm")
+    set(ARM 1) # This means AArch32.
+  elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "^aarch64")
+    set(AARCH64 1)
+  elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "^riscv64")
+    set(RISCV64 1)
+  else ()
+    set(X86 1) # This means IA-32 or AMD64
+  endif ()
+endif ()
+if (NOT DEFINED DR_HOST_ARM AND NOT DEFINED DR_HOST_AARCH64 AND NOT DEFINED DR_HOST_RISCV64 AND NOT DEFINED DR_HOST_X86)
+  if (ARM)
+    set(DR_HOST_ARM 1)
+  elseif (AARCH64)
+    set(DR_HOST_AARCH64 1)
+  elseif (RISCV64)
+    set(DR_HOST_RISCV64 1)
+  else ()
+    set(DR_HOST_X86 1)
+  endif ()
+endif ()
+
+if (WIN32 OR ANDROID)
+  set(USE_DRPATH ON)
+else ()
+  set(USE_DRPATH OFF)
+endif ()
+
+
+###########################################################################
+#
+# Define functions the client can use to set up build parameters:
+
+# For VS generator we need to use a suffix on LOCATION to avoid having
+# "$(Configuration)" in the resulting path.
+if ("${CMAKE_GENERATOR}" MATCHES "Visual Studio")
+  if (DEBUG OR "${CMAKE_BUILD_TYPE}" MATCHES "Debug")
+    set(_DR_location_suffix "_DEBUG")
+  else ()
+    set(_DR_location_suffix "_RELWITHDEBINFO")
+  endif ()
+else ("${CMAKE_GENERATOR}" MATCHES "Visual Studio")
+  set(_DR_location_suffix "")
+endif ("${CMAKE_GENERATOR}" MATCHES "Visual Studio")
+
+_DR_check_if_linker_is_gnu_gold(LINKER_IS_GNU_GOLD)
+_DR_check_if_linker_is_llvm_lld(LINKER_IS_LLVM_LLD)
+
+# helper function
+function (_DR_get_lang target lang_var)
+  # Note that HAS_CXX and LINKER_LANGUAGE are only defined it
+  # explicitly set: can't be used to distinguish CXX vs C.
+  get_target_property(sources ${target} SOURCES)
+  foreach (src ${sources})
+    # LANGUAGE, however, is set for us
+    get_source_file_property(src_lang ${src} LANGUAGE)
+    if (NOT DEFINED tgt_lang)
+      set(tgt_lang ${src_lang})
+    elseif (${src_lang} MATCHES CXX)
+      # If any source file is cxx, mark as cxx
+      set(tgt_lang ${src_lang})
+    endif (NOT DEFINED tgt_lang)
+  endforeach (src)
+
+  set(${lang_var} ${tgt_lang} PARENT_SCOPE)
+endfunction (_DR_get_lang)
+
+
+# helper function
+function (_DR_get_size is_cxx x64_var)
+  if (is_cxx)
+    set(sizeof_void ${CMAKE_CXX_SIZEOF_DATA_PTR})
+  else (is_cxx)
+    set(sizeof_void ${CMAKE_C_SIZEOF_DATA_PTR})
+  endif (is_cxx)
+
+  if ("${sizeof_void}" STREQUAL "")
+    message(FATAL_ERROR "unable to determine bitwidth: did earlier ABI tests fail?  check CMakeFiles/CMakeError.log")
+  endif ("${sizeof_void}" STREQUAL "")
+
+  if (${sizeof_void} EQUAL 8)
+    set(${x64_var} ON PARENT_SCOPE)
+  else (${sizeof_void} EQUAL 8)
+    set(${x64_var} OFF PARENT_SCOPE)
+  endif (${sizeof_void} EQUAL 8)
+endfunction (_DR_get_size)
+
+
+function (_DR_get_x64 target x64_var)
+  _DR_get_lang(${target} tgt_lang)
+  if (${tgt_lang} MATCHES CXX)
+    set(tgt_cxx ON)
+  else (${tgt_lang} MATCHES CXX)
+    set(tgt_cxx OFF)
+  endif (${tgt_lang} MATCHES CXX)
+  _DR_get_size(${tgt_cxx} tgt_x64)
+  set(${x64_var} ${tgt_x64} PARENT_SCOPE)
+endfunction (_DR_get_x64)
+
+
+# i#955: support a <basename>.drpath file for loader search paths
+function (_DR_get_drpath_name out target)
+  DynamoRIO_get_full_path(client_path ${target} "${_DR_location_suffix}")
+  # NAME_WE chops off from the first . instead of the last . so we use regex:
+  string(REGEX REPLACE "\\.[^\\.]*$" "" client_base ${client_path})
+  set(${out} ${client_base}.@DR_RPATH_SUFFIX@ PARENT_SCOPE)
+endfunction (_DR_get_drpath_name)
+
+if (NOT DynamoRIO_INTERNAL)
+  # Global config once per project.
+  # We want to do this on the find_package() to avoid any additional export
+  # sets failing to find these targets (DrMem i#1400), so we try to figure
+  # out whether we should take bitwidth from C++ or C globally
+  if (CMAKE_CXX_COMPILER_WORKS)
+    set(_DR_is_cxx ON)
+  else ()
+    set(_DR_is_cxx OFF)
+  endif ()
+  _DR_get_size(${_DR_is_cxx} _DR_is_x64)
+
+  if (_DR_is_x64)
+    set(_DR_bits 64)
+  else (_DR_is_x64)
+    set(_DR_bits 32)
+  endif (_DR_is_x64)
+
+  if (DEBUG OR "${CMAKE_BUILD_TYPE}" MATCHES "Debug")
+    set(_DR_type debug)
+  else ()
+    set(_DR_type release)
+  endif ()
+
+  # if we were built w/ static drsyms, clients need dependent static libs too
+  if (UNIX)
+    # i#6909: Handle libelftc separately because libdwarf and libelf are optional.
+    if (EXISTS "${DynamoRIO_cwd}/../ext/lib${_DR_bits}/${_DR_type}/libelftc.a")
+      add_library(elftc STATIC IMPORTED)
+      set_property(TARGET elftc PROPERTY
+        IMPORTED_LOCATION "${DynamoRIO_cwd}/../ext/lib${_DR_bits}/${_DR_type}/libelftc.a")
+    endif()
+    if (EXISTS "${DynamoRIO_cwd}/../ext/lib${_DR_bits}/${_DR_type}/libdwarf.a")
+      add_library(elf STATIC IMPORTED)
+      set_property(TARGET elf PROPERTY
+        IMPORTED_LOCATION "${DynamoRIO_cwd}/../ext/lib${_DR_bits}/${_DR_type}/libelf.a")
+      add_library(dwarf STATIC IMPORTED)
+      set_property(TARGET dwarf PROPERTY
+        IMPORTED_LOCATION "${DynamoRIO_cwd}/../ext/lib${_DR_bits}/${_DR_type}/libdwarf.a")
+    endif ()
+  endif ()
+  if (WIN32 AND EXISTS "${DynamoRIO_cwd}/../ext/lib${_DR_bits}/${_DR_type}/dwarf.lib")
+    add_library(dwarf STATIC IMPORTED)
+    set_property(TARGET dwarf PROPERTY
+      IMPORTED_LOCATION "${DynamoRIO_cwd}/../ext/lib${_DR_bits}/${_DR_type}/dwarf.lib")
+    add_library(elftc STATIC IMPORTED)
+    set_property(TARGET elftc PROPERTY
+      IMPORTED_LOCATION "${DynamoRIO_cwd}/../ext/lib${_DR_bits}/${_DR_type}/elftc.lib")
+  endif ()
+
+  # Define imported target for DynamoRIO library, to allow dependencies on
+  # the library and trigger client rebuild on DynamoRIO upgrade:
+  # We always link to release build.  At runtime debug build can be
+  # swapped in instead.
+  # We assume _DR_is_x64 can have only one value per configuration.
+  include(${DynamoRIO_cwd}/DynamoRIOTarget${_DR_bits}.cmake)
+
+  # i#1804: when running from build dirs we can't easily append to the Target
+  # file, so we use a separate Map file and include it here.
+  if (EXISTS ${DynamoRIO_cwd}/DynamoRIOMap${_DR_bits}.cmake)
+    include(${DynamoRIO_cwd}/DynamoRIOMap${_DR_bits}.cmake)
+  endif ()
+endif (NOT DynamoRIO_INTERNAL)
+
+function (configure_DynamoRIO_main_headers)
+  include_directories(${DynamoRIO_INCLUDE_DIRS})
+endfunction ()
+
+# Unfortunately, CMake doesn't support removing flags on a per-target basis,
+# or per-target include dirs or link dirs, so we have to make global changes.
+# We don't want find_package() to incur those changes: only if a target
+# is actually configured.
+# The is_cxx parameter does not matter much: this routine can be called
+# with is_cxx=OFF and C++ clients will still be configured properly,
+# unless the C++ compiler and the C compiler are configured for
+# different bitwidths.
+function (configure_DynamoRIO_global is_cxx change_flags)
+  # We need to perform some global config once per cmake directory.
+  # We want it to work even if the caller puts code in a function
+  # (=> no PARENT_SCOPE var) and we want to re-execute on each re-config
+  # (=> no CACHE INTERNAL).  A global property w/ the listdir in the name
+  # fits the bill.  Xref i#1052.
+  # CMAKE_CURRENT_LIST_DIR wasn't added until CMake 2.8.3 (i#1056).
+  get_filename_component(caller_dir "${CMAKE_CURRENT_LIST_FILE}" PATH)
+  get_property(already_configured_listdir GLOBAL PROPERTY
+    DynamoRIO_configured_globally_${caller_dir})
+  if (NOT DEFINED already_configured_listdir)
+    set_property(GLOBAL PROPERTY
+      DynamoRIO_configured_globally_${caller_dir} ON)
+
+    # If called from another function, indicate whether to propagate
+    # with a variable that does not make it up to global scope
+    if (nested_scope)
+      set(just_configured ON PARENT_SCOPE)
+    endif (nested_scope)
+
+    configure_DynamoRIO_main_headers()
+
+    if (change_flags)
+      # Remove global C flags that are unsafe for a client library.
+      # Since CMake does not support removing flags on a per-target basis,
+      # we clear the base flags so we can add what we want to each target.
+      foreach (config "" ${CMAKE_BUILD_TYPE} ${CMAKE_CONFIGURATION_TYPES})
+        if ("${config}" STREQUAL "")
+          set(config_upper "")
+        else ("${config}" STREQUAL "")
+          string(TOUPPER "_${config}" config_upper)
+        endif ("${config}" STREQUAL "")
+        foreach (var CMAKE_C_FLAGS${config_upper};CMAKE_CXX_FLAGS${config_upper})
+          if ("${${var}}" STREQUAL "" OR NOT DEFINED ${var})
+            # Empty string will trip the NOT DEFINED ORIG_CMAKE_C_FLAGS check below
+            set(${var} " ")
+          endif ()
+          set(ORIG_${var} "${${var}}" PARENT_SCOPE)
+          set(local_${var} "${${var}}")
+          if (WIN32)
+            # We could limit this global var changing to Windows,
+            # but it simplifies cross-platform uses to be symmetric
+            set(MT_base "/MT")
+            if (DEBUG OR "${CMAKE_BUILD_TYPE}" MATCHES "Debug")
+              set(MT_flag "/MTd")
+            else ()
+              set(MT_flag "/MT")
+            endif()
+            if (local_${var} MATCHES "/M[TD]")
+              string(REGEX REPLACE "/M[TD]" "${MT_base}" local_${var} "${local_${var}}")
+            else ()
+              set(local_${var} "${local_${var}} ${MT_flag}")
+            endif ()
+            string(REGEX REPLACE "/RTC." "" local_${var} "${local_${var}}")
+          endif (WIN32)
+          set(CLIENT_${var} "${CLIENT_${var}} ${local_${var}}" PARENT_SCOPE)
+          if (UNIX AND X86 AND ${var} MATCHES "-m32")
+            set(base_var_value "-m32")
+          else ()
+            # If we set to "", the default values come back
+            set(base_var_value " ")
+          endif ()
+          set(${var} "${base_var_value}" PARENT_SCOPE)
+        endforeach (var)
+      endforeach (config)
+    endif (change_flags)
+
+  else (NOT DEFINED already_configured_listdir)
+    # We can detect failure to propagate to global scope on the 2nd client
+    # in the same listdir.
+    # XXX: is there any way we can have better support for functions?
+    # I spent a while trying to use CACHE INTERNAL FORCE to set the
+    # global vars but it has all kinds of weird consequences for other
+    # vars based on the original values of the now-cache vars.
+    # This behavior varies by generator and I never found a solution
+    # that worked for all generators.  Ninja was easy, but VS and Makefiles
+    # ended up with ORIG_* set to the blank values, even when ORIG_*
+    # was marked as cache.  Plus, Dr. Memory's SAVE_* values ended up
+    # w/ the cache value as well.
+    if (NOT DEFINED ORIG_CMAKE_C_FLAGS)
+      message(FATAL_ERROR "When invoking configure_DynamoRIO_*() from a function, "
+        "configure_DynamoRIO_global() must be called from global scope first.")
+    endif (NOT DEFINED ORIG_CMAKE_C_FLAGS)
+  endif (NOT DEFINED already_configured_listdir)
+endfunction (configure_DynamoRIO_global)
+
+function (DynamoRIO_extra_defines list_out tgt_cxx)
+  _DR_get_size(${tgt_cxx} tgt_x64)
+  set(defs_list "")
+  if (tgt_x64)
+    if (AARCH64)
+      set(defs_list ${defs_list} "ARM_64")
+    elseif (RISCV64)
+      set(defs_list ${defs_list} "RISCV_64")
+    else ()
+      set(defs_list ${defs_list} "X86_64")
+    endif ()
+  else (tgt_x64)
+    if (ARM)
+      set(defs_list ${defs_list} "ARM_32")
+    else ()
+      set(defs_list ${defs_list} "X86_32")
+    endif ()
+  endif (tgt_x64)
+
+  if (UNIX)
+    if (APPLE)
+      set(defs_list ${defs_list} "MACOS")
+    else (APPLE)
+      set(defs_list ${defs_list} "LINUX")
+      if (ANDROID)
+        set(defs_list ${defs_list} "ANDROID")
+      endif (ANDROID)
+    endif (APPLE)
+    if (CMAKE_COMPILER_IS_CLANG)
+      set(defs_list ${defs_list} "CLANG")
+    endif (CMAKE_COMPILER_IS_CLANG)
+  else (UNIX)
+    set(defs_list ${defs_list} "WINDOWS")
+  endif (UNIX)
+  if (DynamoRIO_INTERNAL)
+    if (DR_HOST_ARM)
+      set(defs_list ${defs_list} "DR_HOST_ARM")
+    elseif (DR_HOST_AARCH64)
+      set(defs_list ${defs_list} "DR_HOST_AARCH64")
+    elseif (DR_HOST_RISCV64)
+      set(defs_list ${defs_list} "DR_HOST_RISCV64")
+    elseif (DR_HOST_X86)
+      set(defs_list ${defs_list} "DR_HOST_X86")
+    endif ()
+    if (DR_HOST_X64)
+      set(defs_list ${defs_list} "DR_HOST_X64")
+    endif ()
+    if (NOT "${TARGET_ARCH}" STREQUAL "${CMAKE_SYSTEM_PROCESSOR}")
+      set(defs_list ${defs_list} "DR_HOST_NOT_TARGET")
+    endif ()
+  endif ()
+
+  if (DynamoRIO_REG_COMPATIBILITY)
+    set(defs_list ${defs_list} "DR_REG_ENUM_COMPATIBILITY")
+  endif (DynamoRIO_REG_COMPATIBILITY)
+
+  if (DynamoRIO_PAGE_SIZE_COMPATIBILITY)
+    set(defs_list ${defs_list} "DR_PAGE_SIZE_COMPATIBILITY")
+  endif (DynamoRIO_PAGE_SIZE_COMPATIBILITY)
+
+  if (DynamoRIO_NUM_SIMD_SLOTS_COMPATIBILITY)
+    set(defs_list ${defs_list} "DR_NUM_SIMD_SLOTS_COMPATIBILITY")
+  endif (DynamoRIO_NUM_SIMD_SLOTS_COMPATIBILITY)
+
+  if (DynamoRIO_LOG_COMPATIBILITY)
+    set(defs_list ${defs_list} "DR_LOG_DEFINE_COMPATIBILITY")
+  endif ()
+
+  if (DynamoRIO_FAST_IR)
+    set(defs_list ${defs_list} "DR_FAST_IR")
+  endif (DynamoRIO_FAST_IR)
+
+  set(${list_out} "${defs_list}" PARENT_SCOPE)
+endfunction (DynamoRIO_extra_defines)
+
+function (DynamoRIO_extra_cflags flags_out extra_cflags tgt_cxx)
+  if (DynamoRIO_FAST_IR)
+    if (NOT tgt_cxx AND CMAKE_COMPILER_IS_GNUCC)
+      # we require C99 for our extern inline functions to work properly
+      set(extra_cflags "${extra_cflags} -std=gnu99")
+    endif ()
+  endif (DynamoRIO_FAST_IR)
+  set(${flags_out} "${extra_cflags}" PARENT_SCOPE)
+endfunction (DynamoRIO_extra_cflags)
+
+
+function (_DR_set_compile_flags target is_client extra_flags static_DR)
+  # i#850: we do not want the C flags being used for asm objects so we only set
+  # on C/C++ files and not on the target.
+  # We do want the defines and include dirs to be global (or at least on the
+  # asm targets if using cpp2asm...)
+
+  _DR_get_lang(${target} tgt_lang)
+  if (${tgt_lang} MATCHES CXX)
+    set(tgt_cxx ON)
+  else (${tgt_lang} MATCHES CXX)
+    set(tgt_cxx OFF)
+  endif (${tgt_lang} MATCHES CXX)
+  _DR_get_x64(${target} tgt_x64)
+
+  set(nested_scope ON) # for propagation
+  configure_DynamoRIO_global(${tgt_cxx} ON)
+  if (just_configured)
+    # get around lack of GLOBAL_SCOPE
+    set(just_configured ON PARENT_SCOPE)
+    foreach (config "" ${CMAKE_BUILD_TYPE} ${CMAKE_CONFIGURATION_TYPES})
+      if ("${config}" STREQUAL "")
+        set(config_upper "")
+      else ("${config}" STREQUAL "")
+        string(TOUPPER "_${config}" config_upper)
+      endif ("${config}" STREQUAL "")
+      foreach (var CMAKE_C_FLAGS${config_upper};CMAKE_CXX_FLAGS${config_upper})
+        set(ORIG_${var} "${ORIG_${var}}" PARENT_SCOPE)
+        set(CLIENT_${var} "${CLIENT_${var}}" PARENT_SCOPE)
+        set(${var} "${${var}}" PARENT_SCOPE)
+      endforeach (var)
+    endforeach (config)
+  endif (just_configured)
+
+  # we ignore per-config flags here
+  if (is_client)
+    set(src_cxxflags
+      "${CLIENT_CMAKE_CXX_FLAGS} ${CLIENT_CMAKE_CXX_FLAGS_${CMAKE_BUILD_TYPE_UPPER}}")
+    set(src_cflags
+      "${CLIENT_CMAKE_C_FLAGS} ${CLIENT_CMAKE_C_FLAGS_${CMAKE_BUILD_TYPE_UPPER}}")
+  else (is_client)
+    set(src_cxxflags
+      "${ORIG_CMAKE_CXX_FLAGS} ${ORIG_CMAKE_CXX_FLAGS_${CMAKE_BUILD_TYPE_UPPER}}")
+    set(src_cflags
+      "${ORIG_CMAKE_C_FLAGS} ${ORIG_CMAKE_C_FLAGS_${CMAKE_BUILD_TYPE_UPPER}}")
+    if (WIN32)
+      # For standalone we want the original flags, but we need to
+      # explicitly link in static libc prior to dynamorio.lib to avoid
+      # conflicts w/ ntdll forwards, so we don't support dynamic libc
+      # (xref i#686) (or /MT since it puts libc last but we manipulate
+      # that later).
+      if (src_cflags MATCHES "/MD")
+        string(REGEX REPLACE "/MD" "/MT" src_cflags "${src_cflags}")
+      else ()
+        set(src_cflags "${src_cflags} /MT")
+      endif ()
+      if (src_cxxflags MATCHES "/MD")
+        string(REGEX REPLACE "/MD" "/MT" src_cxxflags "${src_cflags}")
+      else ()
+        set(src_cxxflags "${src_cxxflags} /MT")
+      endif ()
+    endif (WIN32)
+  endif (is_client)
+
+  if (src_cflags MATCHES "/MT" AND src_cflags MATCHES "/MTd")
+    # Avoid "Command line warning D9025 : overriding '/MT' with '/MTd'"
+    # which we get due to our simple concat of CMAKE_C_FLAGS with the _DEBUG version.
+    string(REGEX REPLACE "/MT([^d]|$)" "\\1" src_cflags "${src_cflags}")
+  endif ()
+  if (src_cxxflags MATCHES "/MT" AND src_cxxflags MATCHES "/MTd")
+    # Avoid "Command line warning D9025 : overriding '/MT' with '/MTd'"
+    # which we get due to our simple concat of CMAKE_C_FLAGS with the _DEBUG version.
+    string(REGEX REPLACE "/MT([^d]|$)" "\\1" src_cxxflags "${src_cxxflags}")
+  endif ()
+
+  DynamoRIO_extra_defines(extra_defines ${tgt_cxx})
+  DynamoRIO_extra_cflags(extra_flags "${extra_flags}" ${tgt_cxx})
+
+  if (UNIX)
+    if (is_client)
+
+      if (NOT DEFINED DynamoRIO_VISATT)
+        # Try to automatically determine visibility
+        if ("${src_cflags}" MATCHES "-fvisibility=hidden|-fvisibility=internal")
+          set(DynamoRIO_VISATT ON)
+        endif()
+      endif (NOT DEFINED DynamoRIO_VISATT)
+      if (DynamoRIO_VISATT)
+        set(extra_defines ${extra_defines} "USE_VISIBILITY_ATTRIBUTES")
+      endif (DynamoRIO_VISATT)
+      if (tgt_cxx)
+        set(tgt_link_flags "${tgt_link_flags}")
+      endif (tgt_cxx)
+
+      # Do non-lazy runtime binding
+      if (APPLE)
+        # Especially important on Mac where we do not yet have a private loader
+        set(tgt_link_flags "${tgt_link_flags} -Xlinker -bind_at_load")
+      else (APPLE)
+        set(tgt_link_flags "${tgt_link_flags} -Xlinker -z -Xlinker now")
+      endif (APPLE)
+
+      # avoid SElinux text relocation security violations by explicitly requesting PIC
+      # i#157, when enable private loader, symbols from default libraries and startfiles
+      # are required, so -nostartfiles and -nodefaultlibs should be removed
+      set(tgt_link_flags
+        "${tgt_link_flags} -fPIC -shared")
+      if (NOT CMAKE_COMPILER_IS_CLANG)
+        set(tgt_link_flags
+          "${tgt_link_flags} -lgcc")
+      endif ()
+
+      # i#163: avoid stack-check feature that relies on separate library
+      execute_process(COMMAND
+        ${CMAKE_C_COMPILER} -v --help
+        RESULT_VARIABLE gcc_result
+        ERROR_VARIABLE gcc_err
+        OUTPUT_VARIABLE gcc_out)
+      if (gcc_result)
+        if (APPLE AND gcc_err MATCHES "_main\", referenced from")
+          # not an error: "-v --help" tries to build w/ no src file for some reason
+        else ()
+          message(FATAL_ERROR "*** ${CMAKE_C_COMPILER} failed to run: ${gcc_out}\n${gcc_err} ***\n")
+        endif ()
+      endif (gcc_result)
+      string(REGEX MATCH "fstack-protector" flag_present "${gcc_out}")
+      if (flag_present)
+        set(extra_flags "${extra_flags} -fno-stack-protector")
+      endif (flag_present)
+
+      if (ANDROID AND tgt_cxx)
+          # We use static C++ runtime libraries on Android so we need to wrap the libc
+          # allocation functions. See https://dynamorio.org/using.html#subsec_no_loader.
+        string(APPEND tgt_link_flags " -Xlinker -wrap=malloc -Xlinker -wrap=realloc -Xlinker -wrap=free")
+      endif ()
+
+    endif (is_client)
+
+    if (NOT APPLE AND NOT ANDROID) # no .gnu.hash support on Android
+      # Generate the .hash section in addition to .gnu.hash for every target, to
+      # avoid SIGFPE when running binaries on old systems:
+      set(tgt_link_flags "${tgt_link_flags} -Wl,--hash-style=both")
+    endif ()
+
+    if (NOT DynamoRIO_USE_LIBC AND NOT tgt_cxx AND is_client)
+      set(extra_flags "${extra_flags} -nostdlib")
+      if (APPLE)
+        # Avoid errors about missing the _chk versions of memcpy, etc.
+        set(tgt_link_flags "${tgt_link_flags} -undefined dynamic_lookup")
+      endif (APPLE)
+    endif ()
+
+    # gcc is invoked for the link step so we have to repeat cflags as well
+    if (tgt_cxx)
+      set(tgt_link_flags "${src_cxxflags} ${extra_flags} ${tgt_link_flags}")
+    else ()
+      set(tgt_link_flags "${src_cflags} ${extra_flags} ${tgt_link_flags}")
+    endif ()
+  else (UNIX)
+    set(src_cxxflags "${src_cxxflags} /EHsc")
+    if (is_client)
+      # Avoid bringing in libc and/or kernel32 for stack checks
+      set(extra_flags "${extra_flags} /GS-")
+      # XXX: why isn't /debug showing up: is it
+    endif (is_client)
+
+    # Shrink binaries and pdbs (/Gy should already be there)
+    set(tgt_link_flags "${tgt_link_flags} /opt:ref /opt:icf /pdbcompress")
+
+    if (DynamoRIO_USE_LIBC OR tgt_cxx OR NOT is_client)
+      # Take advantage of the Windows private loader: no longer need
+      # /nodefaultlib or /noentry.
+      #
+      # However, for i#233, we require static libc for VS2005 and VS2008
+      # to avoid SxS.  For simplicity we just require them regardless.
+      #
+      # Plus, we can't use just /MT for clients or standalone (i#686) b/c it
+      # puts libcmt at the end and we hit dup def problems.  We need
+      # libcmt to come in before dynamorio to avoid conflicts w/
+      # forwarded routines.
+      #
+      # Note that any client linking with ntdll will have to add it
+      # AFTER these are added if any forwarded routines are used.
+      #
+      # Note that when using a static drsyms library, /noentry
+      # results in weird "missing _main" even when linking "/dll"
+      # so we no longer use it
+      if (tgt_cxx)
+        set(tgt_link_flags "${tgt_link_flags} /nodefaultlib:libcmt")
+      else (tgt_cxx)
+        set(tgt_link_flags "${tgt_link_flags} /nodefaultlib")
+      endif (tgt_cxx)
+      _DR_get_static_libc_list(static_libc)
+      target_link_libraries(${target} ${static_libc})
+    else ()
+      set(tgt_link_flags "${tgt_link_flags} /nodefaultlib /noentry")
+    endif ()
+  endif (UNIX)
+
+  # DynamoRIOTarget.cmake added the "dynamorio" imported target
+  if (static_DR)
+    target_link_libraries(${target} dynamorio_static)
+  else ()
+    target_link_libraries(${target} dynamorio)
+  endif ()
+
+  if (DEFINED DynamoRIO_RPATH)
+    set(use_rpath ${DynamoRIO_RPATH})
+  else (DEFINED DynamoRIO_RPATH)
+    if (is_client)
+      # We don't want an rpath as it makes it hard to switch
+      # between debug and release libraries at runtime
+      set(use_rpath OFF)
+    else (is_client)
+      # Standalone app is run without drdeploy script to set
+      # LD_LIBRARY_PATH, so default to rpath.  Even though it
+      # makes it more painful to switch to the debug library,
+      # that's rarely needed for standalone.
+      set(use_rpath ON)
+    endif (is_client)
+  endif (DEFINED DynamoRIO_RPATH)
+  if (use_rpath)
+    DynamoRIO_add_rel_rpaths(${target} dynamorio)
+    if (USE_DRPATH AND is_client) # doesn't make sense for standalone
+      # Create the .drpath file our loader uses
+      DynamoRIO_get_full_path(libpath dynamorio "${_DR_location_suffix}")
+      get_filename_component(libdir ${libpath} PATH)
+      _DR_get_drpath_name(drpath_file ${target})
+      file(WRITE ${drpath_file} "${libdir}\n")
+    endif ()
+  else (use_rpath)
+    set_target_properties(${target} PROPERTIES
+      SKIP_BUILD_RPATH ON)
+  endif (use_rpath)
+
+  # Append LINK_FLAGS
+  _DR_append_property_string(TARGET ${target} LINK_FLAGS "${tgt_link_flags}")
+
+  # Now set the compile flags for each source file.
+  # First, convert "/D FOO" to "/DFOO" for easier list conversion
+  string(REGEX REPLACE " /D " " /D" src_cflags_list "${src_cflags} ${extra_flags}")
+  # Now convert to list
+  string(REGEX REPLACE " " ";" src_cflags_list "${src_cflags_list}")
+  foreach (flag ${src_cflags_list})
+    if (flag MATCHES "^[-/]D" OR flag MATCHES "^[-/]I")
+      if (NOT tgt_cxx)
+        if (flag MATCHES "^[-/]D")
+          string(REGEX REPLACE "^[-/]D" "" flag_name ${flag})
+          set(tgt_defines ${tgt_defines} ${flag_name})
+        else ()
+          set(tgt_inc "${tgt_inc} ${flag}")
+        endif ()
+      endif ()
+    else ()
+      set(tgt_cflags ${tgt_cflags} ${flag})
+    endif ()
+  endforeach (flag)
+  # Ditto for cxxflags.
+  string(REGEX REPLACE " /D " " /D" src_cxxflags_list "${src_cxxflags} ${extra_flags}")
+  string(REGEX REPLACE " " ";" src_cxxflags_list "${src_cxxflags_list}")
+  foreach (flag ${src_cxxflags_list})
+    if (flag MATCHES "^[-/]D" OR flag MATCHES "^[-/]I")
+      if (tgt_cxx)
+        if (flag MATCHES "^[-/]D")
+          string(REGEX REPLACE "^[-/]D" "" flag_name ${flag})
+          set(tgt_defines ${tgt_defines} ${flag_name})
+        else ()
+          set(tgt_inc "${tgt_inc} ${flag}")
+        endif ()
+      endif ()
+    else ()
+      set(tgt_cxxflags ${tgt_cxxflags} ${flag})
+    endif ()
+  endforeach (flag)
+
+  get_target_property(srcs ${target} SOURCES)
+  foreach (src ${srcs})
+    get_source_file_property(lang ${src} LANGUAGE)
+    if ("${lang}" STREQUAL "C" OR "${lang}" STREQUAL "CXX" AND
+        # do not add COMPILE_FLAGS to an .obj file else VS2008 will try to
+        # compile the file!
+        NOT src MATCHES "\\.obj$")
+      # i#1396: don't double-add in case the same source file is in multiple
+      # DR client/standalone targets.
+      # We can't do a test of the entire flag set at once b/c we add
+      # "-fno-stack-protector" for the client and not for standalone.
+      get_source_file_property(cur_flags ${src} COMPILE_FLAGS)
+      # Avoid -std=c++* from messing w/ our regex match.
+      string(REPLACE "++" "\\+\\+" cur_flags_esc ${cur_flags})
+      if ("${lang}" STREQUAL "CXX")
+        set(tgt_flags ${tgt_cxxflags})
+      else ()
+        set(tgt_flags ${tgt_cflags})
+      endif ()
+      foreach (flag ${tgt_flags})
+        string(REPLACE "++" "\\+\\+" flag_esc ${flag})
+        if (NOT cur_flags_esc MATCHES " ${flag_esc}")
+          _DR_append_property_string(SOURCE ${src} COMPILE_FLAGS "${flag}")
+        endif ()
+      endforeach ()
+    endif ()
+  endforeach (src)
+
+  set_target_properties(${target} PROPERTIES COMPILE_FLAGS "${tgt_inc}")
+  _DR_append_property_list(TARGET ${target}
+    COMPILE_DEFINITIONS "${extra_defines};${tgt_defines}")
+endfunction(_DR_set_compile_flags)
+
+# This is a macro so that the PARENT_SCOPE changes reach the
+# caller of this macro's caller.
+macro (configure_DynamoRIO_client_helper target static_DR)
+  _DR_get_x64(${target} tgt_x64)
+
+  # We clear LINK_FLAGS and let the helper routines append to them:
+  set_target_properties(${target} PROPERTIES LINK_FLAGS "")
+
+  _DR_set_compile_flags(${target} ON "" ${static_DR})
+  if (just_configured)
+    # get around lack of GLOBAL_SCOPE
+    # do NOT set just_configured in global scope
+    foreach (config "" ${CMAKE_BUILD_TYPE} ${CMAKE_CONFIGURATION_TYPES})
+      if ("${config}" STREQUAL "")
+        set(config_upper "")
+      else ("${config}" STREQUAL "")
+        string(TOUPPER "_${config}" config_upper)
+      endif ("${config}" STREQUAL "")
+      foreach (var CMAKE_C_FLAGS${config_upper};CMAKE_CXX_FLAGS${config_upper})
+        set(ORIG_${var} "${ORIG_${var}}" PARENT_SCOPE)
+        set(CLIENT_${var} "${CLIENT_${var}}" PARENT_SCOPE)
+        set(${var} "${${var}}" PARENT_SCOPE)
+      endforeach (var)
+    endforeach (config)
+  endif (just_configured)
+
+  if (tgt_x64 OR DynamoRIO_SET_PREFERRED_BASE)
+    # While we now have private loaders that mean we don't need a preferred
+    # base in the lower 2GB, on Windows it's more efficient to avoid
+    # relocation by doing so.
+    # Naturally for multiple clients different addresses should be used.
+    # We suggest using the range 0x72000000-0x75000000.
+    if (NOT DEFINED PREFERRED_BASE)
+      set(PREFERRED_BASE 0x72000000)
+    endif ()
+    if (APPLE)
+      set(LD_FLAGS "-arch x86_64 -image_base ${PREFERRED_BASE}")
+    elseif (UNIX)
+      if (LINKER_IS_GNU_GOLD)
+        # Gold doesn't have a default version script for us to edit.  However,
+        # it has a handy command line flag that does exactly what we want.  Note
+        # that gnu ld has -Ttext as well, but it is very different.
+        # XXX: gnu ld added an equivalent -Ttext-segment to binutils 2.20 in
+        # 2009.  We could switch to that if we ever drop support for old
+        # linkers.
+        set(PREFERRED_BASE_FLAGS "-Wl,-Ttext=${PREFERRED_BASE}")
+      elseif (LINKER_IS_LLVM_LLD)
+        set(PREFERRED_BASE_FLAGS "-Wl,--image-base=${PREFERRED_BASE}")
+      else ()
+        # We use a linker script to set the preferred base
+        set(LD_SCRIPT ${CMAKE_CURRENT_BINARY_DIR}/${target}.ldscript)
+        # We do NOT add ${LD_SCRIPT} as an ADDITIONAL_MAKE_CLEAN_FILES since it's
+        # configure-time built not make-time built
+        if (DR_HOST_X86)
+          set(LD_FLAGS "-melf_x86_64")
+        elseif (DR_HOST_ARM)
+          set(LD_FLAGS "-marmelf_linux_eabi")
+        elseif (DR_HOST_AARCH64)
+          set(LD_FLAGS "-maarch64linux")
+        elseif (DR_HOST_RISCV64)
+          set(LD_FLAGS "-melf64lriscv")
+        endif ()
+
+        # In order to just tweak the default linker script we start with exactly that.
+        separate_arguments(LD_FLAGS)
+        execute_process(COMMAND
+          ${CMAKE_LINKER} ${LD_FLAGS} --verbose
+          RESULT_VARIABLE ld_result
+          ERROR_VARIABLE ld_error
+          OUTPUT_VARIABLE string)
+        if (ld_result OR ld_error)
+          message(FATAL_ERROR "*** ${CMAKE_LINKER} failed: ***\n${ld_error}")
+        endif (ld_result OR ld_error)
+
+        # Strip out just the SECTIONS{} portion
+        string(REGEX REPLACE ".*(SECTIONS.*\n\\}).*" "\\1" string "${string}")
+        # Find and replace the default base
+        string(REGEX MATCH "= *[^{\\.\n]+(0x[0-9]+)\\)? *\\+ *SIZEOF_HEADERS"
+          default_base "${string}")
+        if ("${default_base}" STREQUAL "")
+          message(FATAL_ERROR "unsupported ld version: please file this bug")
+        endif()
+        string(REGEX REPLACE ".*(0x[0-9]+).*" "\\1" default_base "${default_base}")
+        string(REGEX REPLACE "${default_base}" "${PREFERRED_BASE}" string "${string}")
+        string(REGEX REPLACE "(\n{)" "\\1\n  . = ${PREFERRED_BASE};" string "${string}")
+        file(WRITE ${LD_SCRIPT} "${string}")
+
+        # -dT is preferred, available on ld 2.18+: we could check for it
+        set(LD_SCRIPT_OPTION "-T")
+        set(PREFERRED_BASE_FLAGS "-Xlinker ${LD_SCRIPT_OPTION} -Xlinker \"${LD_SCRIPT}\"")
+      endif ()
+    else (APPLE)
+      set(PREFERRED_BASE_FLAGS "/base:${PREFERRED_BASE} /dynamicbase:no")
+    endif (APPLE)
+    _DR_append_property_string(TARGET ${target} LINK_FLAGS "${PREFERRED_BASE_FLAGS}")
+  endif (tgt_x64 OR DynamoRIO_SET_PREFERRED_BASE)
+
+  # TODO: a nice feature would be to check the client for libc imports or
+  # other not-recommended properties
+
+endmacro (configure_DynamoRIO_client_helper)
+
+function (configure_DynamoRIO_client target)
+  configure_DynamoRIO_client_helper(${target} OFF)
+endfunction ()
+
+function (configure_DynamoRIO_static_client target)
+  configure_DynamoRIO_client_helper(${target} ON)
+endfunction ()
+
+function (configure_DynamoRIO_standalone target)
+  # We don't clear LINK_FLAGS b/c we assume standalone doesn't need to have
+  # flags removed.  Usually the target LINK_FLAGS is empty at this point anyway.
+  set(extra_flags "-DDYNAMORIO_STANDALONE")
+  if (ANDROID)
+    set(extra_flags "${extra_flags} -fPIE")
+    # Clang complains that -pie is an unused option here, so only add it for
+    # 32-bit Android which uses GCC.
+    if (ANDROID32)
+      set(extra_flags "${extra_flags} -pie")
+    endif(ANDROID32)
+  endif (ANDROID)
+  _DR_set_compile_flags(${target} OFF "${extra_flags}" OFF)
+
+  # get around lack of GLOBAL_SCOPE
+  foreach (config "" ${CMAKE_BUILD_TYPE} ${CMAKE_CONFIGURATION_TYPES})
+    if ("${config}" STREQUAL "")
+      set(config_upper "")
+    else ("${config}" STREQUAL "")
+      string(TOUPPER "_${config}" config_upper)
+    endif ("${config}" STREQUAL "")
+    foreach (var CMAKE_C_FLAGS${config_upper};CMAKE_CXX_FLAGS${config_upper})
+      set(ORIG_${var} "${ORIG_${var}}" PARENT_SCOPE)
+      set(CLIENT_${var} "${CLIENT_${var}}" PARENT_SCOPE)
+      set(${var} "${${var}}" PARENT_SCOPE)
+    endforeach (var)
+  endforeach (config)
+endfunction (configure_DynamoRIO_standalone)
+
+
+function (configure_DynamoRIO_decoder target)
+  _DR_get_lang(${target} tgt_lang)
+  if (${tgt_lang} MATCHES CXX)
+    set(tgt_cxx ON)
+  else (${tgt_lang} MATCHES CXX)
+    set(tgt_cxx OFF)
+  endif (${tgt_lang} MATCHES CXX)
+
+  # we do not need propagation so no need to set nested
+  configure_DynamoRIO_global(${tgt_cxx} OFF)
+
+  DynamoRIO_extra_cflags(extra_cflags "" ${tgt_cxx})
+  _DR_append_property_string(TARGET ${target} COMPILE_FLAGS "${extra_cflags}")
+  DynamoRIO_extra_defines(extra_defs ${tgt_cxx})
+  _DR_append_property_list(TARGET ${target} COMPILE_DEFINITIONS "${extra_defs}")
+
+  # DynamoRIOTarget.cmake added the "drdecode" imported target
+  target_link_libraries(${target} drdecode)
+
+endfunction (configure_DynamoRIO_decoder)
+
+
+function (configure_DynamoRIO_static target)
+  _DR_get_lang(${target} tgt_lang)
+  if (${tgt_lang} MATCHES CXX)
+    set(tgt_cxx ON)
+  else (${tgt_lang} MATCHES CXX)
+    set(tgt_cxx OFF)
+  endif (${tgt_lang} MATCHES CXX)
+
+  configure_DynamoRIO_global(${tgt_cxx} OFF)
+
+  DynamoRIO_extra_cflags(extra_cflags "" ${tgt_cxx})
+  _DR_append_property_string(TARGET ${target} COMPILE_FLAGS "${extra_cflags}")
+  DynamoRIO_extra_defines(extra_defs ${tgt_cxx})
+  if (WIN32)
+    # For static DR, we want dllexport and not dllimport for the app API.
+    set(extra_defs ${extra_defs} DR_APP_EXPORTS)
+  endif ()
+  _DR_append_property_list(TARGET ${target} COMPILE_DEFINITIONS "${extra_defs}")
+
+  # We need libc before the ntdll_imports pulled in for DR.
+  _DR_get_static_libc_list(static_libc)
+  target_link_libraries(${target} ${static_libc})
+  target_link_libraries(${target} dynamorio_static)
+  if (UNIX AND NOT APPLE) # --as-needed not supported by Mac ld
+    # i#2070: avoid pulling libdynamorio.so
+    # Assuming LINK_FLAGS goes before target_link_libraries.
+    _DR_append_property_string(TARGET ${target} LINK_FLAGS "-Wl,--as-needed")
+    # Ensure client symbols are visible to DR via dlsym.
+    _DR_append_property_string(TARGET ${target} LINK_FLAGS "-rdynamic")
+  endif ()
+endfunction (configure_DynamoRIO_static)
+
+function (use_DynamoRIO_static_client target client)
+  DynamoRIO_force_static_link(${target} ${client})
+endfunction (use_DynamoRIO_static_client)
+
+function (get_DynamoRIO_defines outvar is_cxx)
+  DynamoRIO_extra_defines(extra_defs ${is_cxx})
+  # Historically this was returned as a string with -D.
+  set(oustr "")
+  foreach (def ${extra_defs})
+    set(outstr "${outstr} -D${def}")
+  endforeach ()
+  set(${outvar} "${outstr}" PARENT_SCOPE)
+endfunction (get_DynamoRIO_defines)
+
+###########################################################################
+#
+# To disable linking to an executable extension via use_DynamoRIO_extension():
+# set(DynamoRIO_EXT_${extname}_NOLIB ON)
+# in your ${extname}Config.cmake file
+set(DynamoRIO_EXT_drgui_NOLIB ON)
+set(DynamoRIO_EXT_droption_NOLIB ON)
+set(DynamoRIO_EXT_droption_INC ${DynamoRIO_cwd}/../ext/include)
+
+# DynamoRIO Extensions
+# Failure to call this in your client CMakeLists.txt when using an extension like
+# drmgr or drx will result in an obscure "using undefined symbol!" runtime
+# error on Linux.
+function (use_DynamoRIO_extension target extname)
+  if (NOT DynamoRIO_INTERNAL)
+    # We only support Extensions as imported targets that have already
+    # been added:
+    if (NOT TARGET ${extname} AND NOT DynamoRIO_EXT_${extname}_NOLIB)
+      message(FATAL_ERROR "DynamoRIO Extension \"${extname}\" not found")
+    endif ()
+    # See whether this Extension is packaged with DynamoRIO:
+    if (UNIX)
+      file(GLOB libs "${DynamoRIO_cwd}/../ext/lib*/*/lib${extname}.*")
+    else (UNIX)
+      file(GLOB libs "${DynamoRIO_cwd}/../ext/lib*/*/${extname}.*")
+    endif (UNIX)
+    if (NOT libs OR DynamoRIO_EXT_${extname}_INC)
+      # Support for 3rd party Extensions: caller calls find_package()
+      # to set up the imported targets for the libraries and to set
+      # DynamoRIO_EXT_${extname}_INC.
+      include_directories(${DynamoRIO_EXT_${extname}_INC})
+    else ()
+      # Local extensions are exported in the same cmake file as DynamoRIO
+      # so we do not need to include another file here.
+      include_directories(${DynamoRIO_cwd}/../ext/include)
+    endif ()
+  else (NOT DynamoRIO_INTERNAL)
+    # support building from build dir for our own samples, and from
+    # build dir for a client that includes our sources as a sub-project,
+    # in which case DynamoRIO_SOURCE_DIR will automatically be set:
+    if ("${extname}" MATCHES "_static$")
+      # support additional targets with "_static" appended
+      string(REGEX REPLACE "_static$" "" ext_dir "${extname}")
+    else ()
+      set(ext_dir "${extname}")
+    endif ()
+    # To support drreg.h including drvector.h we need all the headers
+    # in one spot, so we prefer to point at build dir copy:
+    if (EXISTS "${PROJECT_BINARY_DIR}/ext/include")
+      include_directories(${PROJECT_BINARY_DIR}/ext/include)
+    elseif (EXISTS "${PROJECT_BINARY_DIR}/../../ext/include")
+      # Two up from api/samples/
+      include_directories(${PROJECT_BINARY_DIR}/../../ext/include)
+    elseif (EXISTS "${DynamoRIO_BINARY_DIR}") # where DR is a subpackage
+      include_directories(${DynamoRIO_BINARY_DIR}/ext/include)
+    endif ()
+  endif (NOT DynamoRIO_INTERNAL)
+
+  if (DynamoRIO_RPATH AND NOT DynamoRIO_EXT_${extname}_NOLIB)
+    DynamoRIO_add_rel_rpaths(${target} ${extname})
+    if (USE_DRPATH)
+      DynamoRIO_get_full_path(libpath ${extname} "${_DR_location_suffix}")
+      get_filename_component(libdir ${libpath} PATH)
+      _DR_get_drpath_name(drpath_file ${target})
+      if (EXISTS ${drpath_file})
+        # File should have been created fresh when configured.
+        # If it's not there, this is probably a standalone app, for which
+        # a .drpath file is useless.
+        # XXX: in the future we may add support for relative dirs but for
+        # now we only support absolute.
+        file(READ ${drpath_file} cur_contents)
+        string(FIND ${cur_contents} ${libdir} cur_found)
+        if (cur_found LESS 0) # -1 if not found
+          file(APPEND ${drpath_file} "${libdir}\n")
+        endif ()
+      endif ()
+    endif (USE_DRPATH)
+  else ()
+    set_target_properties(${target} PROPERTIES SKIP_BUILD_RPATH ON)
+  endif ()
+
+  if (NOT DynamoRIO_EXT_${extname}_NOLIB)
+    target_link_libraries(${target} ${extname})
+  endif (NOT DynamoRIO_EXT_${extname}_NOLIB)
+
+  if ("${extname}" MATCHES "^droption$")
+    if (WIN32)
+      _DR_append_property_string(TARGET ${target} COMPILE_FLAGS "/std:c++17")
+    else ()
+      _DR_append_property_string(TARGET ${target} COMPILE_FLAGS "-std=c++17")
+    endif ()
+  endif ()
+endfunction (use_DynamoRIO_extension)
+
+# For clients to configure their custom annotations
+function (configure_DynamoRIO_annotation_sources srcs)
+  if (UNIX)
+    foreach (src ${srcs})
+      _DR_append_property_string(SOURCE ${src} COMPILE_FLAGS
+        "-O0 -Wno-unused-variable -Wno-return-type")
+    endforeach (src ${srcs})
+  else (UNIX)
+    # /wd4715: disable warning for "not all control paths return a value"
+    foreach (src ${srcs})
+      _DR_append_property_string(SOURCE ${src} COMPILE_FLAGS "/Od /Ob0 /GL- /wd4715")
+    endforeach (src ${srcs})
+  endif (UNIX)
+endfunction (configure_DynamoRIO_annotation_sources srcs)
+
+# For configuring target applications that use default DynamoRIO annotations
+function (use_DynamoRIO_annotations target target_srcs)
+  set(dr_annotation_dir "${DynamoRIO_cwd}/../include/annotations")
+  set(dr_annotation_srcs "${dr_annotation_dir}/dr_annotations.c")
+  configure_DynamoRIO_annotation_sources("${dr_annotation_srcs}")
+  set(${target_srcs} ${${target_srcs}} ${dr_annotation_srcs} PARENT_SCOPE)
+endfunction (use_DynamoRIO_annotations target target_srcs)
+
+function (use_DynamoRIO_drmemtrace target)
+  if (EXISTS ${DynamoRIO_cwd}/../tools/include)
+    include_directories(${DynamoRIO_cwd}/../tools/include)
+  else ()
+    # It's called "clients/" in build dirs.
+    include_directories(${DynamoRIO_cwd}/../clients/include)
+  endif ()
+  if (WIN32)
+    # The drmemtrace libraries are build with static libc.
+    if (DEBUG OR "${CMAKE_BUILD_TYPE}" MATCHES "Debug")
+      _DR_append_property_string(TARGET ${target} COMPILE_FLAGS "/MTd")
+    else ()
+      _DR_append_property_string(TARGET ${target} COMPILE_FLAGS "/MT")
+    endif ()
+  endif ()
+  if (WIN32)
+    _DR_append_property_string(TARGET ${target} COMPILE_FLAGS "/std:c++17")
+  else ()
+    _DR_append_property_string(TARGET ${target} COMPILE_FLAGS "-std=c++17")
+  endif ()
+endfunction ()
+
+function (use_DynamoRIO_drmemtrace_tracer target)
+  # The tracer header is in the same place as the analysis tool headers.
+  if (EXISTS ${DynamoRIO_cwd}/../tools/include)
+    include_directories(${DynamoRIO_cwd}/../tools/include)
+  else ()
+    # It's called "clients/" in build dirs.
+    include_directories(${DynamoRIO_cwd}/../clients/include)
+  endif ()
+endfunction ()
+
+# Support co-located DRMF without having to separately specify it
+if (NOT DrMemoryFramework_DIR AND EXISTS "${DynamoRIO_DIR}/../drmemory/drmf")
+  set(DrMemoryFramework_DIR "${DynamoRIO_DIR}/../drmemory/drmf")
+  find_package(DrMemoryFramework)
+endif ()
