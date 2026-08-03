@@ -1,4 +1,5 @@
 use std::env;
+use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -49,14 +50,31 @@ fn main() {
 
     let output = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let libelf = manifest.join("vendor/libelf");
+    let libelf_link = prepare_libelf_link(&output);
     // Keep cached CMake state tied to this build recipe. Bump the suffix when
     // configure or link inputs change so Cargo cannot reuse incompatible state.
-    let loader = build_sabre(&source, &output.join("sabre-build-v2"), &libelf);
+    let loader = build_sabre(
+        &source,
+        &output.join("sabre-build-v3"),
+        &libelf,
+        &libelf_link,
+    );
     println!("cargo:rustc-env=REVERIE_SABRE_LOADER={}", loader.display());
     println!("cargo:rustc-env=REVERIE_SABRE_SOURCE={}", source.display());
 }
 
-fn build_sabre(source: &Path, build: &Path, libelf: &Path) -> PathBuf {
+fn prepare_libelf_link(output: &Path) -> PathBuf {
+    let directory = output.join("libelf-link");
+    fs::create_dir_all(&directory).expect("failed to create the libelf linker directory");
+    // Runtime images commonly ship libelf.so.1 without the development-only
+    // libelf.so alias. Give GNU ld that alias without copying or modifying the
+    // host library; the resulting executable still records libelf.so.1.
+    fs::write(directory.join("libelf.so"), "INPUT ( -l:libelf.so.1 )\n")
+        .expect("failed to write the libelf linker script");
+    directory
+}
+
+fn build_sabre(source: &Path, build: &Path, libelf: &Path, libelf_link: &Path) -> PathBuf {
     let started = Instant::now();
     let cmake = env::var_os("CMAKE").unwrap_or_else(|| "cmake".into());
     let mut configure = Command::new(&cmake);
@@ -66,7 +84,11 @@ fn build_sabre(source: &Path, build: &Path, libelf: &Path) -> PathBuf {
         .arg("-B")
         .arg(build)
         .arg("-DCMAKE_BUILD_TYPE=Release")
-        .arg(format!("-DCMAKE_C_FLAGS=-I{}", libelf.display()));
+        .arg(format!("-DCMAKE_C_FLAGS=-I{}", libelf.display()))
+        .arg(format!(
+            "-DCMAKE_EXE_LINKER_FLAGS=-L{}",
+            libelf_link.display()
+        ));
     if let Some(generator) = env::var_os("CMAKE_GENERATOR") {
         configure.arg("-G").arg(generator);
     }

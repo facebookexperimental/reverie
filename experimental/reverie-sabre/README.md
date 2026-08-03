@@ -9,9 +9,11 @@ loader only inside the package `OUT_DIR`, with no submodule or network path.
 cargo build -p reverie-sabre
 ```
 
-A source install requires CMake, GCC/G++, the libelf runtime library, and system
-zlib and zstd development libraries. The libelf headers are pinned in this
-package so a missing development-header package does not break the source
-build. `bundled_sabre_path` returns the exact loader built for the current
-package. The package license records the GPL-3.0-or-later SaBRe and
-LGPL-3.0-or-later libelf headers alongside Reverie's BSD-2-Clause code.
+A source install requires CMake, GCC/G++, the `libelf.so.1` runtime library, and
+system zlib and zstd development libraries. The libelf headers are pinned in
+this package, and the build supplies a local linker-script alias for the runtime
+SONAME, so a missing development-header package or unversioned `libelf.so`
+symlink does not break the source build. `bundled_sabre_path` returns the exact
+loader built for the current package. The package license records the
+GPL-3.0-or-later SaBRe and LGPL-3.0-or-later libelf headers alongside Reverie's
+BSD-2-Clause code.
