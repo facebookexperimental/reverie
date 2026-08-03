@@ -565,7 +565,7 @@ fn execute_basic_syscall_with_output(
         get_fixed_root_ids(memory, args)
     } else if is_credential_identity_noop_syscall(number) {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-kvm-credential-noop-parity): the credential-setting
+        // TODO-HUMAN-REVIEW(rrnewton/reverie#354): the credential-setting
         // family (setuid/setgid and their re-/res-/fs- variants, and setgroups) is
         // a deterministic no-op success under Detcore's fixed virtual-root
         // identity -- getuid/geteuid/getgid/getegid are virtualized to 0 and no
@@ -5407,7 +5407,7 @@ fn get_fixed_root_ids(memory: &mut GuestMemory, args: &[u64; 6]) -> i64 {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-kvm-credential-noop-parity): credential no-op set.
+// TODO-HUMAN-REVIEW(rrnewton/reverie#354): credential no-op set.
 /// The credential-setting syscalls that Detcore treats as deterministic no-op
 /// successes under its fixed virtual-root identity. Mirrors detcore's
 /// `is_credential_identity_noop_syscall` exactly so the KVM executor forwards
