@@ -1,0 +1,37 @@
+SaBRe 2.0
+
+Copyright © 2019 Software Reliability Group (see AUTHORS file)
+
+SaBRe is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+SaBRe is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+See LICENSE.GPL-3 for more details.
+
+The following files were adapted from Google's Native Client
+and originally distributed under the 3-clause BSD license (see LICENSE.BSD-3):
+	includes/loader/
+		maps.h
+		rewriter.h
+	loader/
+		maps.c
+		rewriter.c
+	arch/x86_64/
+		rewriter.c
+		x86_decoder.c
+		x86_decoder.h
+
+The following files are taken from the Linux kernel
+and distributed under GNU General Public License version 2.0 (see LICENSE.GPL-2):
+	includes/
+		hash.h
+		hlist.h
+		jhash.h
+		kernel.h
+		list.h
+		rbtree_augmented.h
+		rbtree.h

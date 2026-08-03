@@ -5,7 +5,7 @@ version = "0.2.0"
 authors = ["Meta Platforms"]
 edition = "2024"
 repository = "https://github.com/facebookexperimental/reverie"
-license = "BSD-2-Clause"
+license = "BSD-2-Clause AND GPL-3.0-or-later"
 build = "build.rs"
 
 # Mirrors reverie-liteinst: the crate is both an rlib (for the ptrace-hosted

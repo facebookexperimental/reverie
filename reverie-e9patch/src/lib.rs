@@ -88,6 +88,21 @@ pub use runtime::builtin_tool_from_env_value;
 pub use tool_host::install_tool;
 pub use tool_host::install_tool_from_bootstrap;
 
+/// Returns the e9tool binary built from the source vendored in this package.
+pub fn bundled_e9tool_path() -> &'static std::path::Path {
+    std::path::Path::new(env!("REVERIE_E9TOOL"))
+}
+
+/// Returns the e9patch backend built from the source vendored in this package.
+pub fn bundled_e9patch_path() -> &'static std::path::Path {
+    std::path::Path::new(env!("REVERIE_E9PATCH_BACKEND"))
+}
+
+/// Returns the pinned, build-required e9patch source directory.
+pub fn bundled_e9patch_source_dir() -> &'static std::path::Path {
+    std::path::Path::new(env!("REVERIE_E9PATCH_SOURCE"))
+}
+
 /// Environment variable naming the generic-Tool coordinator socket for legacy
 /// tool preloads.
 ///
@@ -361,6 +376,9 @@ mod tests {
     use super::alt_stack_from_env_value;
     use super::builtin_tool_env_value;
     use super::builtin_tool_from_env_value;
+    use super::bundled_e9patch_path;
+    use super::bundled_e9patch_source_dir;
+    use super::bundled_e9tool_path;
     use super::compose_ld_preload;
     use super::set_guest_alt_stack;
 
@@ -371,6 +389,18 @@ mod tests {
             E9PATCH_SOURCE_REVISION
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit())
+        );
+    }
+
+    #[test]
+    fn bundled_tools_match_the_pinned_source() {
+        assert!(bundled_e9tool_path().is_file());
+        assert!(bundled_e9patch_path().is_file());
+        assert_eq!(
+            std::fs::read_to_string(bundled_e9patch_source_dir().join("REVISION"))
+                .unwrap()
+                .trim(),
+            E9PATCH_SOURCE_REVISION
         );
     }
 

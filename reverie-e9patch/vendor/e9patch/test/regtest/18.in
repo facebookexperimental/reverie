@@ -1,0 +1,1 @@
+./test.pie -M 'asm=/.*%gs:.*/' -P 'bug_18()@patch'

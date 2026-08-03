@@ -1,0 +1,1 @@
+./test -M 'rax in regs' -P 'entry(rax,eax,ax,bytes,size,asm)@inst'

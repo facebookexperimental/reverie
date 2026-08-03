@@ -68,8 +68,8 @@ out-of-process ptrace backend.
 
 ## Current limitations
 
-- The SaBRe loader is activated and built separately; Cargo only builds the
-  Reverie plugin and host command.
+- Cargo builds the source-vendored SaBRe loader together with the Reverie
+  plugin; no separately activated submodule is required.
 - Only the pinned loader revision and dynamically linked x86-64 guests are
   validated. Static executables are unsupported by upstream SaBRe.
 - `ReverieAdapter` can run a shared `reverie::Tool` only when each handler

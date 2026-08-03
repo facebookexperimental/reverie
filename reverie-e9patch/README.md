@@ -1,7 +1,9 @@
 # reverie-e9patch
 
-`reverie-e9patch` integrates Reverie with the e9patch static binary rewriter
-pinned in `third-party/e9patch`.
+`reverie-e9patch` integrates Reverie with the e9patch static binary rewriter.
+The build-required source is vendored at the exact revision recorded in
+`vendor/e9patch/REVISION` so a Cargo source install needs no submodule or
+network fetch.
 
 ## Hybrid Backend
 
@@ -284,13 +286,16 @@ production controller decision, not another Tool ABI.
 
 ## Toolchain
 
-The upstream source stays opt-in because it is GPL-3.0 and has system build
-dependencies. Activate and build it explicitly:
+Cargo copies the pinned source to the package `OUT_DIR` and builds `e9tool` and
+`e9patch` there. It never writes into the source checkout. A source install
+therefore requires `make`, GCC/G++, `strip`, and `xxd`, but no prebuilt bundle
+or runtime network access. The package license records the GPL-3.0-or-later
+source alongside Reverie's BSD-2-Clause code.
 
 ```bash
-scripts/backend-submodule.sh activate e9patch
-make -C third-party/e9patch -j8 release
+cargo build -p reverie-e9patch
 ```
 
-Set `REVERIE_E9TOOL` and `REVERIE_E9PATCH_BACKEND` when the executables are
-not available as `e9tool` and the adjacent `e9patch` binary.
+Rust packagers can use `bundled_e9tool_path` and `bundled_e9patch_path` to
+locate the exact Cargo-built tools. `REVERIE_E9TOOL` and
+`REVERIE_E9PATCH_BACKEND` remain explicit runtime overrides.
