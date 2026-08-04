@@ -401,11 +401,19 @@ impl PerfCounter {
     /// this; that is exactly why [`ctr_value_fast`](Self::ctr_value_fast)
     /// deliberately falls back to the syscall read when `index != 0`.
     ///
-    /// Falls back to the [`ctr_value`](Self::ctr_value) syscall read when:
-    /// * fast reads were not enabled on the [`Builder`],
-    /// * the kernel/CPU does not permit user-space `rdpmc` (`cap_user_rdpmc`),
-    /// * the counter is not currently scheduled (`index == 0`), or
-    /// * the target architecture is not x86-64.
+    /// When the counter is not currently scheduled on the PMU (`index == 0`)
+    /// there is no live hardware counter to read, so this returns the mmap
+    /// `offset` via the seqlock read path with no syscall — the same value
+    /// [`ctr_value_fast`](Self::ctr_value_fast) returns. `cap_user_rdpmc` does
+    /// not matter in that case; it is only consulted when the counter is live.
+    ///
+    /// Falls back to the [`ctr_value`](Self::ctr_value) syscall read only when:
+    /// * fast reads were not enabled on the [`Builder`] (no mmap page), or
+    /// * the counter is live (`index != 0`) but the kernel/CPU does not permit
+    ///   user-space `rdpmc` (`cap_user_rdpmc` clear).
+    ///
+    /// On a non-x86-64 target there is no portable `rdpmc`, so the
+    /// [`ctr_value`](Self::ctr_value) syscall read is always used.
     // Additive in-guest read primitive; no in-tree caller yet (the in-guest
     // patching backend that will use it is still being built).
     #[allow(dead_code)]
