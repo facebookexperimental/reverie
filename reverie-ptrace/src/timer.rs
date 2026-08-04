@@ -75,6 +75,16 @@ const AMD_EPYC_9D85_SKID_MARGIN: u64 = 1_000;
 /// the retry-harness safety property.
 pub use reverie::SKID_OVERSHOOT_MARKER;
 
+/// Fault-injection knob: when set to a parseable `u64`, this env var overrides
+/// the processor-detected skid margin for the whole process. Setting it to `0`
+/// programs the precise timer's overflow interrupt *at* the target RCB instead
+/// of `skid_margin` RCBs early, so any natural positive skid pushes the fallback
+/// single-step past the target and deterministically triggers the
+/// [`SKID_OVERSHOOT_MARKER`] path. This exists to exercise the skid overshoot +
+/// retry harness on demand; it is not a tuning knob for normal runs. A value
+/// that does not parse as `u64` is ignored (processor default retained).
+pub const SKID_MARGIN_OVERRIDE_ENV: &str = "REVERIE_SKID_MARGIN_OVERRIDE";
+
 static PMU_CONFIG: OnceLock<PmuConfig> = OnceLock::new();
 
 pub(crate) fn get_pmu_config() -> &'static PmuConfig {
@@ -98,7 +108,7 @@ impl PmuConfig {
         let fi = c
             .get_feature_info()
             .expect("CPUID feature information is required to configure the PMU");
-        Self::from_cpuid_features(fi)
+        Self::from_cpuid_features(fi).with_env_overrides()
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -118,6 +128,7 @@ impl PmuConfig {
             skid_margin: 1000,
             skid_margin_override: None,
         }
+        .with_env_overrides()
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -169,6 +180,35 @@ impl PmuConfig {
     pub fn with_skid_margin_override(mut self, skid_margin: u64) -> Self {
         self.skid_margin_override = Some(skid_margin);
         self
+    }
+
+    /// Applies the [`SKID_MARGIN_OVERRIDE_ENV`] fault-injection override, if the
+    /// env var is present and parses as a `u64`. A missing var leaves the
+    /// processor default untouched; a present-but-unparseable value is ignored
+    /// with a warning rather than aborting startup. When the override is applied
+    /// it is announced loudly on stderr, because it deliberately degrades timer
+    /// precision to force the overshoot path.
+    fn with_env_overrides(self) -> Self {
+        match std::env::var(SKID_MARGIN_OVERRIDE_ENV) {
+            Ok(raw) => match raw.trim().parse::<u64>() {
+                Ok(v) => {
+                    eprintln!(
+                        "[reverie-ptrace] {}={} active: skid margin forced to {} RCBs \
+                         (fault injection; not for production runs)",
+                        SKID_MARGIN_OVERRIDE_ENV, raw, v
+                    );
+                    self.with_skid_margin_override(v)
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[reverie-ptrace] ignoring {}={:?}: not a u64; using processor default",
+                        SKID_MARGIN_OVERRIDE_ENV, raw
+                    );
+                    self
+                }
+            },
+            Err(_) => self,
+        }
     }
 
     /// This is the experimentally determined maximum number of RCBs an overflow
@@ -996,6 +1036,22 @@ mod tests {
         assert_eq!(config.raw_rcb_event(), 0x5100d1);
         assert_eq!(config.skid_margin(), 500);
         assert_eq!(config.max_single_step_count(), 505);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn zero_skid_margin_forces_interrupt_at_target() {
+        // The force-skid witness sets REVERIE_SKID_MARGIN_OVERRIDE=0. That path
+        // runs through `with_skid_margin_override(0)`; assert the invariant it
+        // relies on: a zero margin schedules the overflow interrupt *at* the
+        // target RCB (request_event uses `ticks - skid_margin()`), so any
+        // natural positive skid overshoots and trips the marker. Kept
+        // env-free because process env is not thread-safe under the parallel
+        // test runner.
+        let config = PmuConfig::from_family_model(0x1A, 0x11).with_skid_margin_override(0);
+        assert_eq!(config.skid_margin(), 0);
+        // max_single_step_count() == skid_margin() + SINGLESTEP_TIMEOUT_RCBS (5).
+        assert_eq!(config.max_single_step_count(), 5);
     }
 
     #[cfg(target_arch = "x86_64")]
