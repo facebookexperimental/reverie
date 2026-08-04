@@ -8,10 +8,9 @@ use reverie::GlobalRPC;
 use reverie::GlobalTool;
 use reverie::Pid;
 use reverie_preload::rpc::CoordinatorClient;
-use reverie_preload::trap::raw_syscall6;
-
 // The async-signal-safe spinlock is shared across the in-guest tool hosts.
 pub(crate) use reverie_preload::sync::SpinMutex;
+use reverie_preload::trap::raw_syscall6;
 
 // TODO-HUMAN-REVIEW(PR-269): Review blocking trusted-gate
 // RPC semantics for the e9patch generic Tool host.

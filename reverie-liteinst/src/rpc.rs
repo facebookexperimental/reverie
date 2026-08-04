@@ -10,11 +10,10 @@ use std::path::PathBuf;
 use reverie::GlobalRPC;
 use reverie::GlobalTool;
 use reverie::Pid;
-use reverie_preload::trap::raw_syscall6;
-use reverie_rpc_transport::BlockingRpcClient;
-
 // The async-signal-safe spinlock is shared across the in-guest tool hosts.
 pub(crate) use reverie_preload::sync::SpinMutex;
+use reverie_preload::trap::raw_syscall6;
+use reverie_rpc_transport::BlockingRpcClient;
 
 struct RpcConnection<G: GlobalTool> {
     pid: Pid,
