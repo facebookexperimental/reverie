@@ -259,7 +259,7 @@ cleanup() {
                 }
                 NR == 1 { user += seconds($1); sys += seconds($2) }
                 NR == 2 { user += seconds($1); sys += seconds($2) }
-                END { printf "%.3f %.3f\\n", user, sys }
+                END { printf "%.3f %.3f\n", user, sys }
             ' "$VALIDATION_CPU_TIMES_FILE"
         )
     fi
