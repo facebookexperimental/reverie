@@ -110,7 +110,7 @@ impl LiteinstInstrumentationStats {
         );
     }
 
-    pub(crate) fn record_first_site_sigsys(&mut self) {
+    pub(crate) fn record_first_site_seccomp(&mut self) {
         self.dispatch_paths[0] += 1;
     }
 
@@ -145,7 +145,7 @@ impl LiteinstInstrumentationStats {
         self.patch_decisions
     }
 
-    /// Returns first-site SIGSYS, successful ptrace installation, straddler
+    /// Returns first-site `Event::Seccomp`, successful ptrace installation, straddler
     /// fallback, other fallback, and installed-hook dispatch counts.
     pub const fn dispatch_path_counts(&self) -> [u64; 5] {
         self.dispatch_paths
@@ -222,7 +222,7 @@ impl fmt::Display for LiteinstInstrumentationStats {
         let prefixes = self.straddle_prefix_counts();
         write!(
             formatter,
-            "LiteInst instrumentation stats: distinct_rips_patched={} patch_candidates={} decisions[direct_pun={},relocated={},ptrace_straddler={},ptrace_other={}] paths[first_site_sigsys={},ptrace_installation={},cacheline_straddler={},unpatchable_or_other={},direct_hook={}] classified_candidates={} cacheline_straddlers={} non_straddling={} instruction_lengths[5+={},4={},3={},2={},1={}] straddle_prefix[1={},2={},3={},4={}]",
+            "LiteInst instrumentation stats: distinct_rips_patched={} patch_candidates={} decisions[direct_pun={},relocated={},ptrace_straddler={},ptrace_other={}] paths[first_site_seccomp={},ptrace_installation={},cacheline_straddler={},unpatchable_or_other={},direct_hook={}] classified_candidates={} cacheline_straddlers={} non_straddling={} instruction_lengths[5+={},4={},3={},2={},1={}] straddle_prefix[1={},2={},3={},4={}]",
             self.distinct_rips(),
             self.patch_candidates(),
             decisions[0],
@@ -302,7 +302,7 @@ mod tests {
         );
         stats.record_site(0x5000, LiteinstPatchOutcome::PtraceOtherFallback, None);
         stats.record_site(0x7000, LiteinstPatchOutcome::PtraceOtherFallback, None);
-        stats.record_first_site_sigsys();
+        stats.record_first_site_seccomp();
         stats.record_ptrace_installation();
         stats.record_cacheline_straddler_fallback();
         stats.record_unpatchable_or_other_fallback();
@@ -320,7 +320,7 @@ mod tests {
         assert_eq!(stats.straddle_prefix_counts(), [1, 1, 1, 1]);
         assert_eq!(
             stats.to_string(),
-            "LiteInst instrumentation stats: distinct_rips_patched=2 patch_candidates=7 decisions[direct_pun=1,relocated=1,ptrace_straddler=4,ptrace_other=1] paths[first_site_sigsys=1,ptrace_installation=1,cacheline_straddler=1,unpatchable_or_other=1,direct_hook=2] classified_candidates=6 cacheline_straddlers=4 non_straddling=2 instruction_lengths[5+=2,4=1,3=1,2=1,1=1] straddle_prefix[1=1,2=1,3=1,4=1]"
+            "LiteInst instrumentation stats: distinct_rips_patched=2 patch_candidates=7 decisions[direct_pun=1,relocated=1,ptrace_straddler=4,ptrace_other=1] paths[first_site_seccomp=1,ptrace_installation=1,cacheline_straddler=1,unpatchable_or_other=1,direct_hook=2] classified_candidates=6 cacheline_straddlers=4 non_straddling=2 instruction_lengths[5+=2,4=1,3=1,2=1,1=1] straddle_prefix[1=1,2=1,3=1,4=1]"
         );
     }
 

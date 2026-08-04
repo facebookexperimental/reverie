@@ -220,6 +220,21 @@ pub(crate) fn reserve_coordinator_fd(fd: libc::c_int) -> io::Result<()> {
         })
 }
 
+/// Rebinds the protected coordinator descriptor after a fork child reconnects.
+///
+/// `COORDINATOR_FD` is process-local after fork, so this changes only the
+/// child's protection slot; the parent's connection and descriptor are intact.
+pub(crate) fn replace_coordinator_fd(old: libc::c_int, new: libc::c_int) -> io::Result<()> {
+    COORDINATOR_FD
+        .compare_exchange(old, new, Ordering::AcqRel, Ordering::Acquire)
+        .map(|_| ())
+        .map_err(|actual| {
+            io::Error::other(format!(
+                "coordinator FD changed concurrently: expected {old}, observed {actual}"
+            ))
+        })
+}
+
 struct RuntimeArena {
     mapping_start: u64,
     mapping_end: u64,
@@ -418,7 +433,10 @@ pub(crate) fn initialize_from_environment() -> io::Result<()> {
         }
     }
 
-    install_runtime()
+    install_runtime(
+        crate::stats::GuestStatsHooks::DISABLED,
+        PatchPublication::Concurrent,
+    )
 }
 
 fn host_handshake_frame() -> HostHandshakeFrame {
@@ -453,17 +471,29 @@ fn initialize_host_runtime() -> io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn initialize_reverie_tool() -> io::Result<()> {
+pub(crate) fn initialize_reverie_tool(
+    stats: crate::stats::GuestStatsHooks,
+    publication: PatchPublication,
+) -> io::Result<()> {
     TOOL_MODE.store(TOOL_REVERIE, Ordering::Release);
-    install_runtime()
+    install_runtime(stats, publication)
 }
 
-fn install_runtime() -> io::Result<()> {
+fn install_runtime(
+    stats: crate::stats::GuestStatsHooks,
+    publication: PatchPublication,
+) -> io::Result<()> {
     prepare_instrumentation()?;
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-254): Review launcher-selected RuntimeConfig at the install seam.
     let config = runtime_config_from_env()?;
-    unsafe { reverie_preload::install(Box::new(LiteinstDispatcher), &InProcessSeccomp, &config) }
+    unsafe {
+        reverie_preload::install(
+            Box::new(LiteinstDispatcher::new(stats, publication)),
+            &InProcessSeccomp,
+            &config,
+        )
+    }
 }
 
 struct CompatibilityEventChannel {
@@ -920,6 +950,36 @@ pub(crate) fn reset_fallback_observability() {
     }
 }
 
+pub(crate) fn submit_process_stats(
+    tid: reverie::Tid,
+    stats: crate::stats::GuestStatsHooks,
+) -> io::Result<()> {
+    let mut direct_hooks = 0_u64;
+    let sites = SITES
+        .get()
+        .into_iter()
+        .flatten()
+        .filter_map(|site| {
+            let trap_hits = site.trap_count.load(Ordering::Relaxed);
+            let hook_hits = site.hook_count.load(Ordering::Relaxed);
+            direct_hooks += hook_hits;
+            (trap_hits != 0 || hook_hits != 0).then(|| crate::stats::LiteinstProcessSiteStats {
+                rip: site.address.load(Ordering::Relaxed),
+                patched: site.state.load(Ordering::Relaxed) == SITE_ACTIVE,
+                instruction_length: site.instruction_len.load(Ordering::Relaxed),
+                straddle_after: site.straddle_prefix.load(Ordering::Relaxed),
+            })
+        })
+        .collect();
+    stats.submit(tid, direct_hooks, sites)
+}
+
+pub(crate) fn record_fork_child_direct_hook(instruction_pointer: u64) {
+    if let Some(site) = find_site(instruction_pointer) {
+        site.hook_count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-260): Review the shared fork-following seam reuse.
 /// The shared fork-following hook: in the child of a successful fork-like
@@ -977,7 +1037,7 @@ unsafe fn set_text_protection(address: u64, protection: i32) -> io::Result<()> {
 struct InstallGuard;
 
 #[derive(Clone, Copy)]
-enum PatchPublication {
+pub(crate) enum PatchPublication {
     /// The stopped-tracee helper is the only thread able to reach live code.
     Quiescent,
     /// Other application threads may fetch the site during publication.
@@ -1617,11 +1677,49 @@ unsafe fn locate_syscall_site(resume_address: u64) -> Option<u64> {
     None
 }
 
-struct LiteinstDispatcher;
+type RecordFallbackStats = fn(crate::stats::GuestStatsHooks, u64);
+
+struct LiteinstDispatcher {
+    stats: crate::stats::GuestStatsHooks,
+    record_fallback_stats: RecordFallbackStats,
+    publication: PatchPublication,
+}
+
+impl LiteinstDispatcher {
+    fn new(stats: crate::stats::GuestStatsHooks, publication: PatchPublication) -> Self {
+        Self {
+            stats,
+            record_fallback_stats: if stats.is_enabled() {
+                record_enabled_fallback_stats
+            } else {
+                record_disabled_fallback_stats
+            },
+            publication,
+        }
+    }
+}
+
+fn record_disabled_fallback_stats(_stats: crate::stats::GuestStatsHooks, _address: u64) {}
+
+#[cfg(test)]
+static ENABLED_FALLBACK_CLASSIFICATIONS: AtomicU64 = AtomicU64::new(0);
+
+fn record_enabled_fallback_stats(stats: crate::stats::GuestStatsHooks, address: u64) {
+    #[cfg(test)]
+    ENABLED_FALLBACK_CLASSIFICATIONS.fetch_add(1, Ordering::Relaxed);
+    let straddler =
+        find_site(address).is_some_and(|site| site.straddle_prefix.load(Ordering::Relaxed) != 0);
+    stats.record_path(if straddler {
+        crate::stats::IN_GUEST_STRADDLER_FALLBACK
+    } else {
+        crate::stats::IN_GUEST_OTHER_FALLBACK
+    });
+}
 
 impl SyscallDispatcher for LiteinstDispatcher {
     fn dispatch(&self, event: &mut PreloadSyscallEvent) {
         if unsafe { !CURRENT_EVENT.is_null() } {
+            self.stats.record_path(crate::stats::IN_GUEST_NESTED_SIGSYS);
             let mut nested = SyscallEvent {
                 number: event.number(),
                 args: event.args(),
@@ -1633,6 +1731,7 @@ impl SyscallDispatcher for LiteinstDispatcher {
             event.set_result(nested.result);
             return;
         }
+        self.stats.record_path(crate::stats::IN_GUEST_SIGSYS);
         let mode = TOOL_MODE.load(Ordering::Relaxed);
         let args = event.args();
         let compatibility_trap_fallback =
@@ -1668,7 +1767,7 @@ impl SyscallDispatcher for LiteinstDispatcher {
                         instruction_pointer,
                         site,
                         installed_syscall_hook,
-                        PatchPublication::Concurrent,
+                        self.publication,
                     )
                 }
                 .is_err()
@@ -1697,6 +1796,7 @@ impl SyscallDispatcher for LiteinstDispatcher {
         // forwarding decision (still `EOPNOTSUPP`), so the dispatch path is
         // unchanged; this is the by-number analog of e9patch's round-4 counter.
         record_fallback_dispatch(event.number());
+        (self.record_fallback_stats)(self.stats, instruction_pointer);
         event.fail(libc::EOPNOTSUPP);
     }
 }
@@ -2142,7 +2242,9 @@ mod tests {
     use reverie_preload::BuiltinTool;
 
     use super::ALT_STACK_ENV;
+    use super::ENABLED_FALLBACK_CLASSIFICATIONS;
     use super::FORK_HOOK;
+    use super::LiteinstDispatcher;
     use super::MAX_PATCH_SITES;
     use super::SITE_ACTIVE;
     use super::SITE_FALLBACK;
@@ -2163,6 +2265,22 @@ mod tests {
     use super::record_fallback_dispatch;
     use super::reset_fallback_observability;
     use super::site_counts;
+
+    #[test]
+    fn disabled_dispatch_does_not_classify_fallback_sites() {
+        let before = ENABLED_FALLBACK_CLASSIFICATIONS.load(Ordering::Relaxed);
+        let dispatcher = LiteinstDispatcher::new(
+            crate::stats::GuestStatsHooks::DISABLED,
+            super::PatchPublication::Concurrent,
+        );
+
+        (dispatcher.record_fallback_stats)(dispatcher.stats, 0xdead_beef);
+
+        assert_eq!(
+            ENABLED_FALLBACK_CLASSIFICATIONS.load(Ordering::Relaxed),
+            before
+        );
+    }
 
     #[test]
     fn builtin_tool_selector_maps_shared_values_only() {

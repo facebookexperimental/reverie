@@ -41,6 +41,7 @@ const STACK_CAPACITY: usize = 4096;
 const TAIL_NONE: u8 = 0;
 const TAIL_RESULT: u8 = 1;
 const TAIL_EXIT: u8 = 2;
+const TAIL_FORK_CHILD: u8 = 3;
 
 static COMMITTED_STACKS: SpinMutex<Vec<Box<[u8]>>> = SpinMutex::new(Vec::new());
 
@@ -83,7 +84,37 @@ pub unsafe fn install_tool<T>(coordinator: impl AsRef<Path>) -> io::Result<()>
 where
     T: Tool + 'static,
 {
-    unsafe { install_tool_inner::<T>(coordinator.as_ref(), true) }
+    unsafe {
+        install_tool_inner::<T>(
+            coordinator.as_ref(),
+            true,
+            runtime::PatchPublication::Concurrent,
+        )
+    }
+}
+
+/// Install a concrete Reverie tool with quiescent patch publication.
+///
+/// This has the same process-global effects as [`install_tool`], but skips the
+/// concurrent instruction-tearing and straddler protocol when publishing a new
+/// site. The caller must keep every other application thread from fetching
+/// guest text for the full lifetime of the installed tool.
+///
+/// # Safety
+///
+/// In addition to [`install_tool`]'s requirements, the caller asserts that no
+/// other application thread can execute while a syscall site is installed.
+pub unsafe fn install_tool_quiescent<T>(coordinator: impl AsRef<Path>) -> io::Result<()>
+where
+    T: Tool + 'static,
+{
+    unsafe {
+        install_tool_inner::<T>(
+            coordinator.as_ref(),
+            true,
+            runtime::PatchPublication::Quiescent,
+        )
+    }
 }
 
 // TODO-HUMAN-REVIEW(PR-139): Review the environment-preserving bootstrap install API.
@@ -99,12 +130,19 @@ pub unsafe fn install_tool_from_bootstrap<T>(coordinator: impl AsRef<Path>) -> i
 where
     T: Tool + 'static,
 {
-    unsafe { install_tool_inner::<T>(coordinator.as_ref(), false) }
+    unsafe {
+        install_tool_inner::<T>(
+            coordinator.as_ref(),
+            false,
+            runtime::PatchPublication::Concurrent,
+        )
+    }
 }
 
 unsafe fn install_tool_inner<T>(
     coordinator: &Path,
     remove_legacy_environment: bool,
+    publication: runtime::PatchPublication,
 ) -> io::Result<()>
 where
     T: Tool + 'static,
@@ -112,6 +150,15 @@ where
     let _signal_state = runtime::prepare_guest_signal_state()?;
     let rpc = CoordinatorRpc::<T::GlobalState>::connect(coordinator)?;
     runtime::reserve_coordinator_fd(rpc.raw_fd())?;
+    let stats =
+        if let Some(stats_coordinator) = std::env::var_os(crate::backend::STATS_COORDINATOR_ENV) {
+            let stats = crate::stats::initialize_guest_stats(Path::new(&stats_coordinator))?;
+            // SAFETY: tool installation runs before application-created threads.
+            unsafe { std::env::remove_var(crate::backend::STATS_COORDINATOR_ENV) };
+            stats
+        } else {
+            crate::stats::GuestStatsHooks::DISABLED
+        };
     COMMITTED_STACKS.lock().clear();
     let pid = Pid::from_raw(unsafe { libc::getpid() });
     let subscriptions = T::subscriptions(rpc.config()).iter_syscalls().collect();
@@ -127,11 +174,12 @@ where
             root_pid: pid,
             subscriptions,
             states: SpinMutex::new(HashMap::new()),
+            stats,
         }))
         .map_err(|_| {
             io::Error::new(io::ErrorKind::AlreadyExists, "Reverie tool installed twice")
         })?;
-    runtime::initialize_reverie_tool()
+    runtime::initialize_reverie_tool(stats, publication)
 }
 
 pub(crate) fn dispatch(event: &mut SyscallEvent) {
@@ -147,6 +195,7 @@ struct ToolHost<T: Tool> {
     root_pid: Pid,
     subscriptions: HashSet<Sysno>,
     states: SpinMutex<HashMap<i32, T::ThreadState>>,
+    stats: crate::stats::GuestStatsHooks,
 }
 
 impl<T> ToolHandler for ToolHost<T>
@@ -159,6 +208,10 @@ where
         let pid = raw_pid(libc::SYS_getpid);
         let ppid = (pid != self.root_pid).then(|| raw_pid(libc::SYS_getppid));
 
+        // These process-wide locks are valid only while thread creation stays
+        // fail-closed. A scheduler RPC may block until a sibling runs, so MT
+        // support requires per-thread RPC/state ownership before relaxing the
+        // clone guard below.
         let mut tool_slot = self.tool.lock();
         let tool = tool_slot.as_ref().unwrap_or_else(|| fatal(126));
         let mut states = self.states.lock();
@@ -211,15 +264,38 @@ where
         if !self.subscriptions.contains(&number) {
             let number = guest.event.number;
             let args = guest.event.args;
-            if is_exit_syscall(number) {
+            if is_plain_fork(number, args) {
+                let result = unsafe { raw_syscall6(number, args) };
+                if result == 0 {
+                    finish_fork_child(
+                        &mut tool_slot,
+                        &mut states,
+                        &self.rpc,
+                        self.stats,
+                        event,
+                        ForkChildContext {
+                            parent_tid: tid,
+                            parent_pid: pid,
+                            child_tid: raw_pid(libc::SYS_gettid),
+                            child_pid: raw_pid(libc::SYS_getpid),
+                        },
+                    );
+                } else {
+                    event.result = result;
+                }
+                return;
+            } else if is_exit_syscall(number) {
                 finish_tool_exit(
                     &mut tool_slot,
                     &mut states,
                     &self.rpc,
-                    tid,
-                    pid,
-                    number,
-                    args,
+                    self.stats,
+                    ToolExitContext {
+                        tid,
+                        pid,
+                        number,
+                        args,
+                    },
                 );
             } else if let Some(error) = injected_syscall_guard(number, args) {
                 event.result = -i64::from(error.into_raw());
@@ -234,30 +310,120 @@ where
             SyscallArgs::new(args[0], args[1], args[2], args[3], args[4], args[5]),
         );
 
-        match drive_syscall(tool.handle_syscall_event(&mut guest, syscall), &tail) {
-            SyscallOutcome::Return(result) => {
-                guest.event.result = match result {
-                    Ok(value) => value,
-                    Err(error) => match error.into_errno() {
-                        Ok(errno) => -(errno.into_raw() as i64),
-                        Err(error) => tool_fatal(125, &error),
-                    },
-                };
-            }
-            SyscallOutcome::Exit { number, args } => {
-                finish_tool_exit(
-                    &mut tool_slot,
-                    &mut states,
-                    &self.rpc,
-                    tid,
-                    pid,
-                    number,
-                    args,
-                );
-                event.result = unsafe { raw_syscall6(number, args) };
+        loop {
+            match drive_syscall(tool.handle_syscall_event(&mut guest, syscall), &tail) {
+                SyscallOutcome::Return(Ok(value)) => {
+                    guest.event.result = value;
+                    break;
+                }
+                SyscallOutcome::Return(Err(error)) => match error.into_errno() {
+                    // Detcore uses wait4 as a restartable scheduler poll. The
+                    // ptrace backend consumes this private errno through its
+                    // kernel restart frame; a SIGSYS dispatcher must repeat the
+                    // callback itself. Preserve explicit ERESTARTSYS results for
+                    // other Tools/syscalls, including Chaos Tool read injection.
+                    Ok(Errno::ERESTARTSYS) if number == Sysno::wait4 => continue,
+                    Ok(errno) => {
+                        guest.event.result = -(errno.into_raw() as i64);
+                        break;
+                    }
+                    Err(error) => tool_fatal(125, &error),
+                },
+                SyscallOutcome::Exit { number, args } => {
+                    finish_tool_exit(
+                        &mut tool_slot,
+                        &mut states,
+                        &self.rpc,
+                        self.stats,
+                        ToolExitContext {
+                            tid,
+                            pid,
+                            number,
+                            args,
+                        },
+                    );
+                    event.result = unsafe { raw_syscall6(number, args) };
+                    break;
+                }
+                SyscallOutcome::ForkChild {
+                    parent_tid,
+                    parent_pid,
+                    child_tid,
+                    child_pid,
+                } => {
+                    finish_fork_child(
+                        &mut tool_slot,
+                        &mut states,
+                        &self.rpc,
+                        self.stats,
+                        event,
+                        ForkChildContext {
+                            parent_tid,
+                            parent_pid,
+                            child_tid,
+                            child_pid,
+                        },
+                    );
+                    break;
+                }
             }
         }
     }
+}
+
+fn finish_fork_child<T: Tool>(
+    tool_slot: &mut Option<T>,
+    states: &mut HashMap<i32, T::ThreadState>,
+    rpc: &CoordinatorRpc<T::GlobalState>,
+    stats: crate::stats::GuestStatsHooks,
+    event: &mut SyscallEvent,
+    context: ForkChildContext,
+) {
+    let ForkChildContext {
+        parent_tid,
+        parent_pid,
+        child_tid,
+        child_pid,
+    } = context;
+    let parent_state = states
+        .remove(&parent_tid.as_raw())
+        .unwrap_or_else(|| fatal(126));
+    let child_tool = T::new(child_pid, rpc.config());
+    let child_state = child_tool.init_thread_state(child_tid, Some((parent_tid, &parent_state)));
+    states.clear();
+    states.insert(child_tid.as_raw(), child_state);
+    *tool_slot = Some(child_tool);
+    runtime::reset_fallback_observability();
+    stats.reset_after_fork();
+    if event.context != 0 {
+        runtime::record_fork_child_direct_hook(event.instruction_pointer);
+    }
+
+    let tool = tool_slot.as_ref().unwrap_or_else(|| fatal(126));
+    let state = states
+        .get_mut(&child_tid.as_raw())
+        .unwrap_or_else(|| fatal(126));
+    let child_tail = TailResult::default();
+    let mut child_guest = LiteinstGuest::<T> {
+        event,
+        tid: child_tid,
+        pid: child_pid,
+        ppid: Some(parent_pid),
+        state,
+        rpc,
+        tail: &child_tail,
+    };
+    if let Err(error) = drive_ready(tool.handle_thread_start(&mut child_guest)) {
+        tool_fatal(124, &error);
+    }
+    child_guest.event.result = 0;
+}
+
+struct ForkChildContext {
+    parent_tid: Pid,
+    parent_pid: Pid,
+    child_tid: Pid,
+    child_pid: Pid,
 }
 
 // TODO-HUMAN-REVIEW(PR-143): Review single-process Tool exit lifecycle.
@@ -265,11 +431,15 @@ fn finish_tool_exit<T: Tool>(
     tool_slot: &mut Option<T>,
     states: &mut HashMap<i32, T::ThreadState>,
     rpc: &CoordinatorRpc<T::GlobalState>,
-    tid: Pid,
-    pid: Pid,
-    number: i64,
-    args: [u64; 6],
+    stats: crate::stats::GuestStatsHooks,
+    context: ToolExitContext,
 ) {
+    let ToolExitContext {
+        tid,
+        pid,
+        number,
+        args,
+    } = context;
     let state = states
         .remove(&tid.as_raw())
         .expect("LiteInst thread state disappeared before exit");
@@ -283,7 +453,19 @@ fn finish_tool_exit<T: Tool>(
         if let Err(error) = drive_ready(tool.on_exit_process(pid, rpc, status)) {
             tool_fatal(125, &error);
         }
+        if stats.is_enabled()
+            && let Err(error) = runtime::submit_process_stats(tid, stats)
+        {
+            tool_fatal(125, &Error::from(error));
+        }
     }
+}
+
+struct ToolExitContext {
+    tid: Pid,
+    pid: Pid,
+    number: i64,
+    args: [u64; 6],
 }
 
 // TODO-HUMAN-REVIEW(PR-143): Review exit syscall lifecycle classification.
@@ -323,12 +505,30 @@ where
 
 enum SyscallOutcome {
     Return(Result<i64, Error>),
-    Exit { number: i64, args: [u64; 6] },
+    Exit {
+        number: i64,
+        args: [u64; 6],
+    },
+    ForkChild {
+        parent_tid: Pid,
+        parent_pid: Pid,
+        child_tid: Pid,
+        child_pid: Pid,
+    },
 }
 
 enum TailAction {
     Result(i64),
-    Exit { number: i64, args: [u64; 6] },
+    Exit {
+        number: i64,
+        args: [u64; 6],
+    },
+    ForkChild {
+        parent_tid: Pid,
+        parent_pid: Pid,
+        child_tid: Pid,
+        child_pid: Pid,
+    },
 }
 
 fn drive_syscall<F>(future: F, tail: &TailResult) -> SyscallOutcome
@@ -347,6 +547,19 @@ where
                 }
                 Some(TailAction::Exit { number, args }) => {
                     return SyscallOutcome::Exit { number, args };
+                }
+                Some(TailAction::ForkChild {
+                    parent_tid,
+                    parent_pid,
+                    child_tid,
+                    child_pid,
+                }) => {
+                    return SyscallOutcome::ForkChild {
+                        parent_tid,
+                        parent_pid,
+                        child_tid,
+                        child_pid,
+                    };
                 }
                 None => core::hint::spin_loop(),
             },
@@ -376,12 +589,28 @@ impl TailResult {
         self.action.store(TAIL_EXIT, Ordering::Release);
     }
 
+    fn set_fork_child(&self, parent_tid: Pid, parent_pid: Pid, child_tid: Pid, child_pid: Pid) {
+        self.number
+            .store(i64::from(parent_tid.as_raw()), Ordering::Relaxed);
+        self.value
+            .store(i64::from(parent_pid.as_raw()), Ordering::Relaxed);
+        self.args[0].store(child_tid.as_raw() as u64, Ordering::Relaxed);
+        self.args[1].store(child_pid.as_raw() as u64, Ordering::Relaxed);
+        self.action.store(TAIL_FORK_CHILD, Ordering::Release);
+    }
+
     fn take(&self) -> Option<TailAction> {
         match self.action.swap(TAIL_NONE, Ordering::AcqRel) {
             TAIL_RESULT => Some(TailAction::Result(self.value.load(Ordering::Relaxed))),
             TAIL_EXIT => Some(TailAction::Exit {
                 number: self.number.load(Ordering::Relaxed),
                 args: std::array::from_fn(|index| self.args[index].load(Ordering::Relaxed)),
+            }),
+            TAIL_FORK_CHILD => Some(TailAction::ForkChild {
+                parent_tid: Pid::from_raw(self.number.load(Ordering::Relaxed) as i32),
+                parent_pid: Pid::from_raw(self.value.load(Ordering::Relaxed) as i32),
+                child_tid: Pid::from_raw(self.args[0].load(Ordering::Relaxed) as i32),
+                child_pid: Pid::from_raw(self.args[1].load(Ordering::Relaxed) as i32),
             }),
             _ => None,
         }
@@ -412,14 +641,29 @@ impl<T: Tool> GlobalRPC<T::GlobalState> for LiteinstGuest<'_, T> {
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-326): Review the plain-fork injection boundary.
+fn is_plain_fork(number: i64, args: [u64; 6]) -> bool {
+    if number == libc::SYS_fork {
+        return true;
+    }
+    if number != libc::SYS_clone {
+        return false;
+    }
+    const SIGNAL_MASK: u64 = 0xff;
+    let allowed_flags =
+        (libc::CLONE_CHILD_CLEARTID | libc::CLONE_CHILD_SETTID | libc::CLONE_PARENT_SETTID) as u64;
+    args[1] == 0
+        && args[0] & SIGNAL_MASK == libc::SIGCHLD as u64
+        && args[0] & !(SIGNAL_MASK | allowed_flags) == 0
+}
+
 // TODO-HUMAN-REVIEW(PR-127): Review injected process/signal safety policy.
 fn injected_syscall_guard(number: i64, args: [u64; 6]) -> Option<Errno> {
     let unsupported_process =
         // AUTONOMOUS-BOT-IMPLEMENTED
-        matches!(
-            number,
-            libc::SYS_clone | libc::SYS_clone3 | libc::SYS_fork | libc::SYS_vfork
-        )
+        matches!(number, libc::SYS_clone3 | libc::SYS_vfork)
+            || (number == libc::SYS_clone && !is_plain_fork(number, args))
         // AUTONOMOUS-BOT-IMPLEMENTED
         || matches!(number, libc::SYS_execve | libc::SYS_execveat);
     let protected_signal =
@@ -541,12 +785,32 @@ impl<T: Tool> Guest<T> for LiteinstGuest<'_, T> {
     async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
         let (number, args) = syscall.into_parts();
         let number = number.id() as i64;
+        let mut raw_args = [
+            args.arg0 as u64,
+            args.arg1 as u64,
+            args.arg2 as u64,
+            args.arg3 as u64,
+            args.arg4 as u64,
+            args.arg5 as u64,
+        ];
+
+        if is_plain_fork(number, raw_args) {
+            let parent_tid = self.tid;
+            let parent_pid = self.pid;
+            let result = unsafe { raw_syscall6(number, raw_args) };
+            if result == 0 {
+                let child_tid = raw_pid(libc::SYS_gettid);
+                let child_pid = raw_pid(libc::SYS_getpid);
+                self.tail
+                    .set_fork_child(parent_tid, parent_pid, child_tid, child_pid);
+                return std::future::pending().await;
+            }
+            return Errno::from_ret(result as usize).map(|value| value as i64);
+        }
+
         // AUTONOMOUS-BOT-IMPLEMENTED
-        if matches!(
-            number,
-            libc::SYS_clone | libc::SYS_clone3 | libc::SYS_fork | libc::SYS_vfork
-        ) {
-            const MESSAGE: &[u8] = b"reverie-liteinst: clone/fork injection is unsupported\n";
+        if matches!(number, libc::SYS_clone | libc::SYS_clone3 | libc::SYS_vfork) {
+            const MESSAGE: &[u8] = b"reverie-liteinst: clone injection requires ptrace fallback\n";
             unsafe {
                 let _ = raw_syscall6(
                     libc::SYS_write,
@@ -562,15 +826,6 @@ impl<T: Tool> Guest<T> for LiteinstGuest<'_, T> {
             }
             return Err(Errno::EOPNOTSUPP);
         }
-
-        let mut raw_args = [
-            args.arg0 as u64,
-            args.arg1 as u64,
-            args.arg2 as u64,
-            args.arg3 as u64,
-            args.arg4 as u64,
-            args.arg5 as u64,
-        ];
         if let Some(error) = injected_syscall_guard(number, raw_args) {
             return Err(error);
         }
@@ -602,7 +857,21 @@ impl<T: Tool> Guest<T> for LiteinstGuest<'_, T> {
             syscall_args.arg5 as u64,
         ];
         let number = number.id() as i64;
-        if let Some(error) = injected_syscall_guard(number, args) {
+        if is_plain_fork(number, args) {
+            let parent_tid = self.tid;
+            let parent_pid = self.pid;
+            let result = unsafe { raw_syscall6(number, args) };
+            if result == 0 {
+                self.tail.set_fork_child(
+                    parent_tid,
+                    parent_pid,
+                    raw_pid(libc::SYS_gettid),
+                    raw_pid(libc::SYS_getpid),
+                );
+            } else {
+                self.tail.set_result(result);
+            }
+        } else if let Some(error) = injected_syscall_guard(number, args) {
             self.tail.set_result(-i64::from(error.into_raw()));
         } else if is_exit_syscall(number) {
             self.tail.set_exit(number, args);
@@ -613,28 +882,24 @@ impl<T: Tool> Guest<T> for LiteinstGuest<'_, T> {
         std::future::pending().await
     }
 
+    // TODO-HUMAN-REVIEW(PR-326): Review the coarse
+    // syscall-boundary clock until the minimal ptrace supervisor wires PMU delivery.
     fn set_timer(&mut self, _sched: TimerSchedule) -> Result<(), Error> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "LiteInst does not implement RCB timer delivery",
-        )
-        .into())
+        // Every intercepted syscall remains a deterministic scheduling boundary,
+        // but a CPU-bound thread cannot yet be preempted between syscalls.
+        Ok(())
     }
 
     fn set_timer_precise(&mut self, _sched: TimerSchedule) -> Result<(), Error> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "LiteInst does not implement precise RCB timer delivery",
-        )
-        .into())
+        // Same coarse boundary as set_timer; never synthesize host time.
+        Ok(())
     }
 
     fn read_clock(&mut self) -> Result<u64, Error> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "LiteInst does not implement an RCB clock",
-        )
-        .into())
+        // DBI likewise exposes a boundary sample rather than a continuously
+        // advancing PMU clock. LiteInst has no sample yet, so zero is the honest
+        // deterministic lower bound. Detcore separately charges syscall time.
+        Ok(0)
     }
 }
 

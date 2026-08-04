@@ -23,6 +23,8 @@ use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
+use std::time::Duration;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use reverie::GlobalRPC;
@@ -61,6 +63,37 @@ impl GlobalTool for Counter {
             running_total: *total,
             from: from.as_raw(),
         }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+enum GateRequest {
+    Wait,
+    Release,
+}
+
+#[derive(Default)]
+struct Gate {
+    waiting: AtomicBool,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl GlobalTool for Gate {
+    type Request = GateRequest;
+    type Response = i32;
+    type Config = String;
+
+    async fn receive_rpc(&self, from: Tid, request: GateRequest) -> i32 {
+        match request {
+            GateRequest::Wait => {
+                let released = self.release.notified();
+                self.waiting.store(true, Ordering::Release);
+                released.await;
+            }
+            GateRequest::Release => self.release.notify_one(),
+        }
+        from.as_raw()
     }
 }
 
@@ -300,4 +333,65 @@ fn blocking_client_rpc_is_ready_on_its_first_poll() {
         "server should treat a blocking client disconnect as clean"
     );
     assert_eq!(*global.total.lock().unwrap(), 9);
+}
+
+#[test]
+fn per_thread_blocking_clients_do_not_serialize_delayed_rpcs() {
+    let global = std::sync::Arc::new(Gate::default());
+    let server_global = global.clone();
+    let path = unique_sock_path("blocking-threads");
+    let server_path = path.clone();
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+
+    let server_thread = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let server =
+                    RpcServer::bind(&path, server_global, "threaded-cfg".to_string()).unwrap();
+                ready_tx.send(()).unwrap();
+                tokio::try_join!(server.serve_one(), server.serve_one()).map(|_| ())
+            })
+    });
+    ready_rx.recv().unwrap();
+
+    let (wait_tx, wait_rx) = std::sync::mpsc::sync_channel(0);
+    let wait_path = server_path.clone();
+    let wait_thread = std::thread::spawn(move || {
+        let client = BlockingRpcClient::<Gate>::connect(&wait_path, Tid::from_raw(101)).unwrap();
+        assert_eq!(client.config(), "threaded-cfg");
+        wait_tx
+            .send(client.try_send_rpc(GateRequest::Wait))
+            .unwrap();
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !global.waiting.load(Ordering::Acquire) {
+        assert!(
+            Instant::now() < deadline,
+            "first blocking RPC did not reach the coordinator"
+        );
+        std::thread::yield_now();
+    }
+
+    let release_client =
+        BlockingRpcClient::<Gate>::connect(&server_path, Tid::from_raw(202)).unwrap();
+    assert_eq!(release_client.config(), "threaded-cfg");
+    assert_eq!(
+        release_client.try_send_rpc(GateRequest::Release).unwrap(),
+        202
+    );
+    drop(release_client);
+
+    assert_eq!(
+        wait_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("a second thread connection did not release the first RPC")
+            .unwrap(),
+        101
+    );
+    wait_thread.join().unwrap();
+    assert!(server_thread.join().unwrap().is_ok());
 }

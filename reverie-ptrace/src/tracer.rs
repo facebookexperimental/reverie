@@ -2960,10 +2960,22 @@ mod tests {
             .expect_err("mutated private stub impersonated injected-syscall completion");
 
         assert!(!mutate_once.load(Ordering::SeqCst), "{error}");
+        let ptrace_write_rejected = matches!(
+            &error,
+            Error::Tool(error)
+                if matches!(
+                    error.downcast_ref::<crate::error::Error>(),
+                    Some(crate::error::Error::Internal(TraceError::Errno(Errno::EFAULT)))
+                )
+        );
+        let error = error.to_string();
+        // Some kernels reject the forced ptrace write before the mutated stub
+        // executes. Otherwise, the exact-stub provenance check must reject it.
         assert!(
-            error.to_string().contains(
-                "finish injected syscall observed a nested signal without the expected controller provenance"
-            ),
+            ptrace_write_rejected
+                || error.contains(
+                    "finish injected syscall observed a nested signal without the expected controller provenance"
+                ),
             "{error}"
         );
         assert_reaped("private-stub-mutation activation", root_pid);

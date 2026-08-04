@@ -89,10 +89,15 @@ The expected regression signature for a repeatedly executed syscall site is
 ## Supported Boundary
 
 Current support is Linux x86-64, dynamically linked non-`AT_SECURE` guests.
-Tool mode supports one process/thread. Timer and clock APIs, PMU preemption,
-guest callable signal handlers, exec bootstrap, and general clone/fork
-injection are not implemented. CPUID, RDTSC/RDTSCP, RDRAND/RDSEED, and signal
-death events are not routed as Reverie events.
+Tool mode supports one thread per process and single-threaded plain-fork
+children sharing the coordinator GlobalTool. Thread clone, clone3, vfork, exec
+bootstrap, vDSO interception, unpatchable-site fallback, PMU preemption, and
+guest callable signal handlers are not implemented. Timer arming does not
+deliver events and the RCB clock is fixed at zero. CPUID, RDTSC/RDTSCP,
+RDRAND/RDSEED, descendant signal-death, and root-exits-first lifecycle events
+are not routed to the in-guest Tool as Reverie events. A lifecycle-only
+`TracerBuilder<()>` still follows and reaps the process tree without subscribing
+to syscalls or instantiating the concrete Tool in the host.
 
 Do not turn a direct LiteInst smoke test into a Hermit determinism claim.
 Reverie-only validation is L0 evidence. L1 or L2 requires the landed Hermit CLI

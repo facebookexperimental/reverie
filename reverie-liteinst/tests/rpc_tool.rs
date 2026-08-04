@@ -93,6 +93,46 @@ fn installed_hook_reentry_bypasses_tool_with_shared_coordinator_rpc() {
         b"injected-thread=Exited(52)\ninjected-process=Exited(52)\n"
     );
 
+    let fork_guest = Command::new(binary)
+        .arg("fork-guest")
+        .arg(&socket)
+        .output()
+        .unwrap();
+    assert!(fork_guest.status.success(), "{fork_guest:?}");
+    let fork_stdout = String::from_utf8(fork_guest.stdout).unwrap();
+    let mut fields = fork_stdout.split_whitespace();
+    let fork_total: u64 = fields
+        .next()
+        .and_then(|field| field.strip_prefix("fork-rpc-total="))
+        .expect("fork guest must print the shared RPC total")
+        .parse()
+        .unwrap();
+    let sender_delta: u64 = fields
+        .next()
+        .and_then(|field| field.strip_prefix("fork-rpc-sender-delta="))
+        .expect("fork guest must print the shared RPC sender delta")
+        .parse()
+        .unwrap();
+    assert_eq!(fields.next(), None, "{fork_stdout}");
+    assert!(fork_total >= 5, "{fork_stdout}");
+    assert_eq!(sender_delta, 1, "{fork_stdout}");
+
+    for (mode, expected) in [
+        (
+            "unsubscribed-fork",
+            b"unsubscribed-fork-reconstructed\n".as_slice(),
+        ),
+        ("tail-fork", b"tail-fork-reconstructed\n".as_slice()),
+    ] {
+        let output = Command::new(binary)
+            .arg(mode)
+            .arg(&socket)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{mode}: {output:?}");
+        assert_eq!(output.stdout, expected, "{mode}: {output:?}");
+    }
+
     let guest = Command::new(binary)
         .arg("guest")
         .arg(&socket)

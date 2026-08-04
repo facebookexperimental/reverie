@@ -38,6 +38,8 @@ pub const TOOL_PRELOAD_ENV: &str = "REVERIE_LITEINST_TOOL_PRELOAD";
 ///
 /// The tool-data launcher uses a sealed inherited bootstrap instead.
 pub const COORDINATOR_ENV: &str = "REVERIE_LITEINST_COORDINATOR";
+/// Environment variable naming the optional, stats-only coordinator socket.
+pub const STATS_COORDINATOR_ENV: &str = "REVERIE_LITEINST_STATS_COORDINATOR";
 
 const PRELOAD_BOOTSTRAP_MAGIC: &[u8; 16] = b"REVERIE-LI-V1\0\0\0";
 const PRELOAD_BOOTSTRAP_HEADER_BYTES: usize = PRELOAD_BOOTSTRAP_MAGIC.len() + 4;
@@ -350,6 +352,13 @@ impl LiteinstBackend {
     }
 
     /// Runs a tool using an explicit tool-specific preload library.
+    ///
+    /// This path dispatches patchable syscalls in the guest and keeps the
+    /// `GlobalTool` in this coordinator. A lifecycle-only `TracerBuilder<()>`
+    /// follows and reaps the process tree but has no syscall subscriptions, so
+    /// the concrete `Tool` remains guest-only. Single-threaded plain-fork
+    /// children reconnect to the shared coordinator. Thread clone, clone3,
+    /// vfork, exec rebootstrap, and unpatchable-site fallback remain unsupported.
     pub async fn run_with_preload<T>(
         command: Command,
         config: <T::GlobalState as GlobalTool>::Config,
@@ -358,9 +367,50 @@ impl LiteinstBackend {
     where
         T: Tool + 'static,
     {
-        let (wait, global) = launch::<T>(command, config, preload.into(), false, None).await?;
+        let (wait, global, stats) = launch::<T>(
+            command,
+            config,
+            preload.into(),
+            false,
+            None,
+            BackendStatsRequest::DISABLED,
+        )
+        .await?;
+        debug_assert!(stats.is_none());
         match wait {
             ChildWait::Status(status) => Ok((status.into(), global)),
+            ChildWait::Output(_) => unreachable!("status run returned captured output"),
+        }
+    }
+
+    /// Runs an in-guest Tool and aggregates one typed statistics snapshot per process.
+    pub async fn run_with_preload_and_stats<T>(
+        command: Command,
+        config: <T::GlobalState as GlobalTool>::Config,
+        preload: impl Into<PathBuf>,
+    ) -> Result<
+        (
+            ExitStatus,
+            T::GlobalState,
+            crate::LiteinstBackendStatsSource,
+        ),
+        Error,
+    >
+    where
+        T: Tool + 'static,
+    {
+        let (wait, global, stats) = launch::<T>(
+            command,
+            config,
+            preload.into(),
+            false,
+            None,
+            BackendStatsRequest::ENABLED,
+        )
+        .await?;
+        let stats = stats.expect("enabled LiteInst run must return statistics");
+        match wait {
+            ChildWait::Status(status) => Ok((status.into(), global, stats)),
             ChildWait::Output(_) => unreachable!("status run returned captured output"),
         }
     }
@@ -376,9 +426,45 @@ impl LiteinstBackend {
     {
         command.stdout(reverie::process::Stdio::piped());
         command.stderr(reverie::process::Stdio::piped());
-        let (wait, global) = launch::<T>(command, config, preload.into(), true, None).await?;
+        let (wait, global, stats) = launch::<T>(
+            command,
+            config,
+            preload.into(),
+            true,
+            None,
+            BackendStatsRequest::DISABLED,
+        )
+        .await?;
+        debug_assert!(stats.is_none());
         match wait {
             ChildWait::Output(output) => Ok((output, global)),
+            ChildWait::Status(_) => unreachable!("output run returned only a status"),
+        }
+    }
+
+    /// Runs an in-guest Tool with captured output and per-process statistics.
+    pub async fn run_with_output_and_preload_and_stats<T>(
+        mut command: Command,
+        config: <T::GlobalState as GlobalTool>::Config,
+        preload: impl Into<PathBuf>,
+    ) -> Result<(Output, T::GlobalState, crate::LiteinstBackendStatsSource), Error>
+    where
+        T: Tool + 'static,
+    {
+        command.stdout(reverie::process::Stdio::piped());
+        command.stderr(reverie::process::Stdio::piped());
+        let (wait, global, stats) = launch::<T>(
+            command,
+            config,
+            preload.into(),
+            true,
+            None,
+            BackendStatsRequest::ENABLED,
+        )
+        .await?;
+        let stats = stats.expect("enabled LiteInst run must return statistics");
+        match wait {
+            ChildWait::Output(output) => Ok((output, global, stats)),
             ChildWait::Status(_) => unreachable!("output run returned only a status"),
         }
     }
@@ -396,14 +482,16 @@ impl LiteinstBackend {
     {
         command.stdout(reverie::process::Stdio::piped());
         command.stderr(reverie::process::Stdio::piped());
-        let (wait, global) = launch::<T>(
+        let (wait, global, stats) = launch::<T>(
             command,
             config,
             preload.into(),
             true,
             Some(tool_data.into()),
+            BackendStatsRequest::DISABLED,
         )
         .await?;
+        debug_assert!(stats.is_none());
         match wait {
             ChildWait::Output(output) => Ok((output, global)),
             ChildWait::Status(_) => unreachable!("output run returned only a status"),
@@ -426,14 +514,16 @@ impl LiteinstBackend {
         T: Tool + 'static,
     {
         inherit_stdio(&mut command);
-        let (wait, global) = launch::<T>(
+        let (wait, global, stats) = launch::<T>(
             command,
             config,
             preload.into(),
             true,
             Some(tool_data.into()),
+            BackendStatsRequest::DISABLED,
         )
         .await?;
+        debug_assert!(stats.is_none());
         match wait {
             ChildWait::Output(output) => {
                 debug_assert!(output.stdout.is_empty());
@@ -469,6 +559,21 @@ fn configure_host_command(command: &mut Command, preload: PathBuf) -> io::Result
     Ok(preload)
 }
 
+fn effective_command_env(command: &Command, key: &OsStr) -> Option<OsString> {
+    command.get_captured_envs().remove(key)
+}
+
+fn configure_in_guest_command_preload(command: &mut Command, preload: PathBuf) {
+    let mut ld_preload = preload.into_os_string();
+    if let Some(existing) =
+        effective_command_env(command, OsStr::new("LD_PRELOAD")).filter(|value| !value.is_empty())
+    {
+        ld_preload.push(OsStr::new(":"));
+        ld_preload.push(existing);
+    }
+    command.env("LD_PRELOAD", ld_preload);
+}
+
 fn inherit_stdio(command: &mut Command) {
     command.stdin(reverie::process::Stdio::inherit());
     command.stdout(reverie::process::Stdio::inherit());
@@ -494,7 +599,11 @@ enum ChildWait {
     Output(Output),
 }
 
-async fn serve_rpc_until<G, F, T>(server: RpcServer<G>, completion: F) -> io::Result<T>
+async fn serve_rpc_until<G, F, T>(
+    server: RpcServer<G>,
+    stats_server: Option<RpcServer<crate::stats::LiteinstStatsGlobal>>,
+    completion: F,
+) -> io::Result<T>
 where
     G: GlobalTool + 'static,
     F: Future<Output = io::Result<T>>,
@@ -504,6 +613,9 @@ where
     // outstanding connection and its GlobalTool Arc.
     let mut serving = tokio::task::JoinSet::new();
     serving.spawn(server.serve());
+    if let Some(stats_server) = stats_server {
+        serving.spawn(stats_server.serve());
+    }
     tokio::pin!(completion);
 
     let result = tokio::select! {
@@ -558,7 +670,15 @@ async fn launch<T>(
     preload: PathBuf,
     capture_output: bool,
     tool_data: Option<Vec<u8>>,
-) -> Result<(ChildWait, T::GlobalState), Error>
+    stats_request: BackendStatsRequest,
+) -> Result<
+    (
+        ChildWait,
+        T::GlobalState,
+        Option<crate::LiteinstBackendStatsSource>,
+    ),
+    Error,
+>
 where
     T: Tool + 'static,
 {
@@ -588,24 +708,26 @@ where
         connected.clone(),
     )
     .map_err(|error| io::Error::other(error.to_string()))?;
-
-    let mut child_command = command.into_std_lossy();
-    let configured_preload = child_command
-        .get_envs()
-        .find(|(key, _)| *key == OsStr::new("LD_PRELOAD"))
-        .map(|(_, value)| value.map(ToOwned::to_owned));
-    let mut ld_preload = preload.into_os_string();
-    let inherited_preload = match configured_preload {
-        Some(value) => value,
-        None => std::env::var_os("LD_PRELOAD"),
+    let (stats_global, stats_server, stats_socket) = if stats_request.is_enabled() {
+        let socket = directory.path().join("stats.sock");
+        let global = Arc::new(crate::stats::LiteinstStatsGlobal::default());
+        let server = RpcServer::bind(&socket, global.clone(), ())
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        (Some(global), Some(server), Some(socket))
+    } else {
+        (None, None, None)
     };
-    if let Some(existing) = inherited_preload.filter(|value| !value.is_empty()) {
-        ld_preload.push(OsStr::new(":"));
-        ld_preload.push(existing);
-    }
-    child_command.env("LD_PRELOAD", ld_preload);
-    let bootstrap = match tool_data {
+
+    configure_in_guest_command_preload(&mut command, preload);
+
+    let wait = match tool_data {
         Some(tool_data) => {
+            let mut child_command = command.into_std_lossy();
+            child_command.env_remove(STATS_COORDINATOR_ENV);
+            if let Some(stats_socket) = &stats_socket {
+                child_command.env(STATS_COORDINATOR_ENV, stats_socket);
+            }
+
             let bootstrap = create_preload_bootstrap(&socket, &tool_data)?;
             let bootstrap_fd = bootstrap.as_raw_fd();
             unsafe {
@@ -616,27 +738,50 @@ where
                     Ok(())
                 });
             }
-            Some(bootstrap)
+            let mut child = child_command.spawn()?;
+            drop(bootstrap);
+            let wait = tokio::task::spawn_blocking(move || {
+                if capture_output {
+                    child.wait_with_output().map(ChildWait::Output)
+                } else {
+                    child.wait().map(ChildWait::Status)
+                }
+            });
+            serve_rpc_until(server, stats_server, async move {
+                wait.await
+                    .map_err(|error| io::Error::other(error.to_string()))?
+            })
+            .await?
         }
         None => {
-            child_command.env(COORDINATOR_ENV, &socket);
-            None
+            command.env(COORDINATOR_ENV, &socket);
+            command.env_remove(STATS_COORDINATOR_ENV);
+            if let Some(stats_socket) = &stats_socket {
+                command.env(STATS_COORDINATOR_ENV, stats_socket);
+            }
+            let tracer = TracerBuilder::<()>::new(command).spawn().await?;
+            serve_rpc_until(server, stats_server, async move {
+                if capture_output {
+                    let (output, ()) = tracer
+                        .wait_with_output()
+                        .await
+                        .map_err(|error| io::Error::other(error.to_string()))?;
+                    Ok(ChildWait::Output(Output {
+                        status: output.status.into(),
+                        stdout: output.stdout,
+                        stderr: output.stderr,
+                    }))
+                } else {
+                    let (status, ()) = tracer
+                        .wait()
+                        .await
+                        .map_err(|error| io::Error::other(error.to_string()))?;
+                    Ok(ChildWait::Status(status.into()))
+                }
+            })
+            .await?
         }
     };
-    let mut child = child_command.spawn()?;
-    drop(bootstrap);
-    let wait = tokio::task::spawn_blocking(move || {
-        if capture_output {
-            child.wait_with_output().map(ChildWait::Output)
-        } else {
-            child.wait().map(ChildWait::Status)
-        }
-    });
-    let wait = serve_rpc_until(server, async move {
-        wait.await
-            .map_err(|error| io::Error::other(error.to_string()))?
-    })
-    .await?;
     if !connected.load(Ordering::Acquire) {
         return Err(io::Error::new(
             io::ErrorKind::ConnectionAborted,
@@ -645,7 +790,11 @@ where
         .into());
     }
     let global = unwrap_global_after_connections(global).await?;
-    Ok((wait, global))
+    let stats = match stats_global {
+        Some(stats) => Some(unwrap_global_after_connections(stats).await?.into_source()),
+        None => None,
+    };
+    Ok((wait, global, stats))
 }
 
 fn tool_preload_path() -> io::Result<PathBuf> {
@@ -729,10 +878,13 @@ mod tests {
                 .map_err(|error| io::Error::other(error.to_string()))?
         };
 
-        tokio::time::timeout(Duration::from_secs(5), serve_rpc_until(server, completion))
-            .await
-            .expect("the second local RPC connection blocked at its config handshake")
-            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            serve_rpc_until(server, None, completion),
+        )
+        .await
+        .expect("the second local RPC connection blocked at its config handshake")
+        .unwrap();
 
         assert_eq!(global.total.load(Ordering::Relaxed), 5);
         assert_eq!(*global.senders.lock().unwrap(), [101, 202]);
@@ -778,5 +930,79 @@ mod tests {
         assert!(child.stderr.is_none());
         let status = child.wait().unwrap();
         assert!(status.success());
+    }
+
+    #[test]
+    fn effective_command_environment_honors_override_remove_and_clear() {
+        let ambient_path = std::env::var_os("PATH").expect("test process must have PATH");
+        assert!(!ambient_path.is_empty());
+
+        let mut command = Command::new("/bin/true");
+        command.env("PATH", "/caller/bin");
+        assert_eq!(
+            effective_command_env(&command, OsStr::new("PATH")),
+            Some(OsString::from("/caller/bin"))
+        );
+
+        command.env_remove("PATH");
+        assert_eq!(effective_command_env(&command, OsStr::new("PATH")), None);
+
+        let mut cleared = Command::new("/bin/true");
+        cleared.env_clear();
+        assert_eq!(effective_command_env(&cleared, OsStr::new("PATH")), None);
+    }
+
+    #[test]
+    fn in_guest_preload_override_remove_and_clear_win_over_ambient() {
+        const CHILD_ENV: &str = "REVERIE_LITEINST_PRELOAD_ENV_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "backend::tests::in_guest_preload_override_remove_and_clear_win_over_ambient",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_ENV, "1")
+                .env("LD_PRELOAD", "libc.so.6")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child test failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        assert_eq!(std::env::var_os("LD_PRELOAD"), Some("libc.so.6".into()));
+
+        let mut command = Command::new("/bin/true");
+        command.env("LD_PRELOAD", "/caller/tool.so");
+        configure_in_guest_command_preload(&mut command, PathBuf::from("/liteinst/runtime.so"));
+        let preload = command
+            .get_envs()
+            .find(|(key, _)| *key == OsStr::new("LD_PRELOAD"))
+            .and_then(|(_, value)| value);
+        assert_eq!(
+            preload,
+            Some(OsStr::new("/liteinst/runtime.so:/caller/tool.so"))
+        );
+
+        let mut removed = Command::new("/bin/true");
+        removed.env_remove("LD_PRELOAD");
+        configure_in_guest_command_preload(&mut removed, PathBuf::from("/liteinst/runtime.so"));
+        assert_eq!(
+            effective_command_env(&removed, OsStr::new("LD_PRELOAD")),
+            Some(OsString::from("/liteinst/runtime.so"))
+        );
+
+        let mut cleared = Command::new("/bin/true");
+        cleared.env_clear();
+        configure_in_guest_command_preload(&mut cleared, PathBuf::from("/liteinst/runtime.so"));
+        assert_eq!(
+            effective_command_env(&cleared, OsStr::new("LD_PRELOAD")),
+            Some(OsString::from("/liteinst/runtime.so"))
+        );
     }
 }

@@ -18,6 +18,7 @@ mod straddler;
 pub use backend::COORDINATOR_ENV;
 pub use backend::LiteinstBackend;
 pub use backend::PreloadBootstrap;
+pub use backend::STATS_COORDINATOR_ENV;
 pub use backend::TOOL_PRELOAD_ENV;
 pub use backend::take_preload_bootstrap;
 pub use reverie_ptrace::LiteinstInstrumentationStats;
@@ -52,6 +53,7 @@ pub use straddler::STRADDLER_STALENESS_TICKS_ENV;
 pub use straddler::straddler_staleness_from_env_value;
 pub use tool_host::install_tool;
 pub use tool_host::install_tool_from_bootstrap;
+pub use tool_host::install_tool_quiescent;
 
 #[global_allocator]
 static PATCH_ALLOCATOR: patch_alloc::PatchAllocator = patch_alloc::PatchAllocator;

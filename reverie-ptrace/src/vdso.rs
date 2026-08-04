@@ -16,10 +16,12 @@ use nix::unistd;
 use reverie::Errno;
 use reverie::Error;
 use reverie::Guest;
+use reverie::Subscription;
 use reverie::Tool;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Mprotect;
+use reverie::syscalls::Sysno;
 use tracing::debug;
 
 #[repr(align(64))]
@@ -198,6 +200,20 @@ static VDSO_PATCH_INFO: LazyLock<VdsoPatchInfo> = LazyLock::new(|| {
     res
 });
 
+pub(crate) fn is_patch_required(subscriptions: &Subscription) -> bool {
+    subscriptions.iter_syscalls().any(|syscall| {
+        matches!(
+            syscall,
+            Sysno::time
+                | Sysno::clock_gettime
+                | Sysno::clock_getres
+                | Sysno::getcpu
+                | Sysno::gettimeofday
+                | Sysno::rt_sigreturn
+        )
+    })
+}
+
 // get vdso symbols offset/size from current process
 // assuming vdso binary is the same for all processes
 // so that we don't have to decode vdso for each process
@@ -338,5 +354,15 @@ mod tests {
         let info = &VDSO_PATCH_INFO;
         info.iter().for_each(|i| println!("info: {:x?}", i));
         assert!(!info.is_empty());
+    }
+
+    #[test]
+    fn patch_requirement_tracks_vdso_syscall_subscriptions() {
+        assert!(!is_patch_required(&Subscription::none()));
+        assert!(!is_patch_required(&[Sysno::read].into_iter().collect()));
+        assert!(is_patch_required(
+            &[Sysno::clock_gettime].into_iter().collect()
+        ));
+        assert!(is_patch_required(&[Sysno::time].into_iter().collect()));
     }
 }

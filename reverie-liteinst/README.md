@@ -99,26 +99,31 @@ trap path. Quiescent publication is never selected from this route.
 ## Current boundaries
 
 - Dynamically linked, non-`AT_SECURE` Linux x86-64 guests only.
-- One process and one thread are supported by `LiteinstBackend`. The
-  coordinator can service multiple simultaneous tool connections, but
-  tool-mode clone/fork/vfork injection is rejected, and process-tree reconnect
-  and exec rebootstrap are not implemented.
-- Syscalls are hosted, and intercepted normal exits route thread and process
-  callbacks on the supported single-process path. Signal deaths, CPUID,
+- One thread per process is supported by `LiteinstBackend`. Plain `fork` creates
+  a fresh child-local `Tool` and reconnects to the shared coordinator. A
+  lifecycle-only ptrace supervisor with `Tool = ()` follows and reaps the
+  process tree, including outliving and signaled descendants, but does not
+  subscribe to syscalls or host a second copy of the concrete Tool. Thread
+  clone, `clone3`, and `vfork` fail closed.
+- Patchable syscalls dispatch the Tool in guest, and intercepted normal exits
+  route thread and process callbacks on the supported single-threaded path.
+  Signal deaths, CPUID,
   RDTSC/RDTSCP, and RDRAND/RDSEED events are not routed yet.
 - Tool mode resets callable signal dispositions before activation, rejects
   later callable handlers, and validates that SIGSYS came from seccomp.
   `SIG_DFL` and `SIG_IGN` remain supported; guest signal handlers remain
   unsupported.
-- Timer arming and clock reads return an unsupported error because no RCB timer
-  or preemption event is delivered. The single-thread smoke path is not strict
-  scheduling or an L1/L2 determinism claim.
+- Timer arming currently returns success without delivery and clock reads return
+  zero because no RCB timer or preemption event is delivered. This coarse
+  syscall-boundary behavior is deterministic for the supported single-threaded
+  slice, but it is not PMU preemption or complete scheduling support.
 - Rust tool futures must make progress synchronously. Coordinator RPC and guest
   syscall injection do so; a tool future that depends on an unrelated executor
   can stall.
 - The five-byte patch window and executable mapping must be supported by
   `liteinst2`. Dynamic executable mappings without a prepared reachable arena
-  retain the trap fallback.
+  fail closed. The lifecycle-only ptrace supervisor is not a syscall slow path:
+  it has no syscall subscriptions, and no host Tool handles guest syscalls.
 - `execve` cannot safely cross the inherited filter because the handler and DSO
   mappings disappear. A future exec bootstrap must be controller-owned.
 - This is in-process instrumentation, not a security sandbox.
