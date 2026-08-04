@@ -22,6 +22,12 @@ on:
         required: true
         type: string
 
+# Gate semantics version: v2. The required status context is `merge-gate-v2`.
+# `REVERIE_MERGE_GATE_V2_BLOB` binds every authorizing run to the registered
+# workflow definition, so an old PR cannot satisfy current protection with its
+# own weaker branch-local YAML. The legacy `merge-gate` context exists only
+# during the fail-closed overlap migration.
+#
 # This lightweight required check accepts an exact PR head only after the
 # repository CI workflow succeeds. Local Reverie validation has no remotely
 # dereferenceable receipt authority yet, so a bare locally-validated label is
@@ -103,7 +109,7 @@ jobs:
           fi
 
   merge-gate:
-    name: merge-gate
+    name: merge-gate-v2
     needs: [invalidate-local-validation]
     if: always() && github.event_name != 'workflow_run'
     runs-on: ubuntu-latest
@@ -113,6 +119,27 @@ jobs:
       contents: read
       pull-requests: read
     steps:
+      - name: Require the registered v2 gate definition
+        env:
+          EXPECTED_GATE_BLOB: ${{ vars.REVERIE_MERGE_GATE_V2_BLOB }}
+          GATE_PATH: .github/workflows/merge-gate.yml
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "$EXPECTED_GATE_BLOB" ]; then
+            echo "::error::REVERIE_MERGE_GATE_V2_BLOB is not configured; refusing an unbound gate result."
+            exit 1
+          fi
+          actual_blob="$(
+            gh api "repos/${REPO}/contents/${GATE_PATH}?ref=${SHA}" --jq .sha
+          )"
+          if [ "$actual_blob" != "$EXPECTED_GATE_BLOB" ]; then
+            echo "::error::Gate definition mismatch: run used ${actual_blob}, registered v2 is ${EXPECTED_GATE_BLOB}. Rebase onto current main; a branch-owned gate cannot authorize itself."
+            exit 1
+          fi
+          echo "Gate definition is registered v2 blob ${actual_blob}."
       - name: Check out trusted gate policy
         uses: actions/checkout@v4
         with:
@@ -166,21 +193,29 @@ jobs:
           : >"$dispatch_file"
           no_result=0
 
-          queue_dispatch() {
-            local head_ref=$1 head_repo=$2 pr_number=$3 head_sha=$4
+          queue_retry() {
+            local run_status=$1 run_id=$2 pr_number=$3 head_sha=$4
             no_result=1
-            if [ "$head_repo" != "$REPO" ]; then
-              echo "::warning::NO_RESULT for PR #$pr_number at $head_sha cannot be dispatched from external repository $head_repo."
-              return
-            fi
-            printf '%s\t%s\t%s\n' "$head_ref" "$pr_number" "$head_sha" >>"$dispatch_file"
+            case "$run_status" in
+              queued | in_progress | waiting | requested | pending)
+                echo "NO_RESULT for PR #$pr_number at $head_sha is still active ($run_status); completion will refire the gate."
+                ;;
+              *)
+                if [ -z "$run_id" ]; then
+                  echo "::warning::NO_RESULT for PR #$pr_number at $head_sha has no pull-request run to rerun."
+                else
+                  printf '%s\t%s\t%s\n' "$run_id" "$pr_number" "$head_sha" >>"$dispatch_file"
+                fi
+                ;;
+            esac
           }
 
           dispatch_no_result() {
-            sort -u "$dispatch_file" | while IFS=$'\t' read -r head_ref pr_number head_sha; do
-              [ -n "$head_ref" ] || continue
-              echo "NO_RESULT: re-dispatching ci.yml for PR #$pr_number at $head_sha (ref=$head_ref)."
-              gh workflow run ci.yml --repo "$REPO" --ref "$head_ref"
+            sort -u "$dispatch_file" | while IFS=$'\t' read -r run_id pr_number head_sha; do
+              [ -n "$run_id" ] || continue
+              echo "NO_RESULT: rerunning pull-request CI run $run_id for PR #$pr_number at $head_sha."
+              gh api --method POST \
+                "repos/${REPO}/actions/runs/${run_id}/rerun" --silent
             done
           }
 
@@ -281,25 +316,39 @@ jobs:
               gh api "repos/${REPO}/actions/workflows/ci.yml/runs?head_sha=${head_sha}&per_page=100"
             )"
             run="$(python3 .dev-hermit-policy/ci-hub/check_outcome.py \
-              --select-latest-run --head-sha "$head_sha" <<< "$runs")"
+              --select-latest-run --head-sha "$head_sha" \
+              --event pull_request <<< "$runs")"
             status="$(jq -r '.status // "missing"' <<< "$run")"
             conclusion="$(jq -r '.conclusion // ""' <<< "$run")"
             url="$(jq -r '.html_url // ""' <<< "$run")"
+            run_id="$(jq -r '.id // ""' <<< "$run")"
+            regular_status=missing
+            regular_conclusion=
+            host_status=missing
+            host_conclusion=
+            if [ -n "$run_id" ]; then
+              jobs="$(gh api "repos/${REPO}/actions/runs/${run_id}/jobs?filter=latest&per_page=100")"
+              rollup="$(jq '.jobs' <<< "$jobs" |
+                python3 .dev-hermit-policy/ci-hub/check_outcome.py --select-latest-rollup)"
+              regular="$(jq '[.[] | select(.name == "Regular tests (GitHub-hosted)")] | first // {}' <<< "$rollup")"
+              host="$(jq '[.[] | select(.name == "Host-dependent tests (self-hosted)")] | first // {}' <<< "$rollup")"
+              regular_status="$(jq -r '.status // "missing"' <<< "$regular")"
+              regular_conclusion="$(jq -r '.conclusion // ""' <<< "$regular")"
+              host_status="$(jq -r '.status // "missing"' <<< "$host")"
+              host_conclusion="$(jq -r '.conclusion // ""' <<< "$host")"
+            fi
 
-            outcome=$(classify_check "$status" "$conclusion")
-            case "$outcome" in
-              PASSED)
-                echo "CI PASSED for PR #${pr_number} at $head_sha: $url"
-                ;;
-              FAILED)
-                echo "::error::CI FAILED for PR #${pr_number} at $head_sha ($status/${conclusion:-none}): ${url:-no run URL}."
-                failed=1
-                ;;
-              NO_RESULT)
-                echo "CI has NO_RESULT for PR #${pr_number} at $head_sha ($status/${conclusion:-none}); blocking without reporting failure."
-                queue_dispatch "$head_ref" "$head_repo" "$pr_number" "$head_sha"
-                ;;
-            esac
+            regular_outcome=$(classify_check "$regular_status" "$regular_conclusion")
+            host_outcome=$(classify_check "$host_status" "$host_conclusion")
+            if [ "$regular_outcome" = FAILED ] || [ "$host_outcome" = FAILED ]; then
+              echo "::error::CI FAILED for PR #${pr_number} at $head_sha: regular=$regular_status/${regular_conclusion:-none} host=$host_status/${host_conclusion:-none}: ${url:-no run URL}."
+              failed=1
+            elif [ "$regular_outcome" = PASSED ] && [ "$host_outcome" = PASSED ]; then
+              echo "Both authoritative CI jobs PASSED for PR #${pr_number} at $head_sha: $url"
+            else
+              echo "CI has NO_RESULT for PR #${pr_number} at $head_sha: regular=$regular_status/${regular_conclusion:-none} host=$host_status/${host_conclusion:-none}; blocking without reporting failure."
+              queue_retry "$status" "$run_id" "$pr_number" "$head_sha"
+            fi
           done < <(jq -r '
             .[]
             | [.number, .head.sha, .head.ref, .head.repo]
@@ -315,3 +364,23 @@ jobs:
           fi
 
           echo "Every required leg has a PASSED result."
+
+  # Transition only: mirror registered v2 into the legacy context while branch
+  # protection requires both. The reconciler disables this after v2 lands.
+  merge-gate-legacy-context:
+    name: merge-gate
+    needs: merge-gate
+    if: always() && vars.REVERIE_MERGE_GATE_LEGACY_CONTEXT == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Mirror the registered v2 result during migration
+        env:
+          V2_RESULT: ${{ needs.merge-gate.result }}
+        run: |
+          set -euo pipefail
+          if [ "$V2_RESULT" != success ]; then
+            echo "::error::merge-gate-v2 did not pass (result=${V2_RESULT})."
+            exit 1
+          fi
+          echo "merge-gate-v2 passed; emitting temporary legacy context."
