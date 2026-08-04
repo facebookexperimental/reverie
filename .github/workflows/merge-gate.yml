@@ -18,9 +18,10 @@ on:
         required: true
         type: string
 
-# This lightweight required check accepts an exact PR head after the repository
-# CI workflow succeeds or after a fully green local validate.sh run applies the
-# locally-validated label. Merge-group checks inspect their constituent PR heads
+# This lightweight required check accepts an exact PR head only after the
+# repository CI workflow succeeds. Local Reverie validation has no remotely
+# dereferenceable receipt authority yet, so a bare locally-validated label is
+# never landing evidence. Merge-group checks inspect their constituent PR heads
 # instead of trusting the synthetic queue commit.
 permissions:
   actions: read
@@ -102,11 +103,28 @@ jobs:
     if: always() && github.event_name != 'workflow_run'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: read
     steps:
-      - name: Require successful CI or local validation
+      - name: Check out trusted gate policy
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Check out canonical CI authority
+        uses: actions/checkout@v4
+        with:
+          repository: rrnewton/dev-hermit
+          ref: f9e61247e83bb07c11297541b591606de24a89a8
+          path: .dev-hermit-policy
+          persist-credentials: false
+      - name: Require PASSED CI or re-dispatch NO_RESULT
         env:
           BASE_REF: ${{ github.event.merge_group.base_ref }}
           EVENT_NAME: ${{ github.event_name }}
+          GATE_RUN_ID: ${{ github.run_id }}
           INVALIDATION_RESULT: ${{ needs.invalidate-local-validation.result }}
           PR_ACTION: ${{ github.event.action }}
           GH_TOKEN: ${{ github.token }}
@@ -116,10 +134,71 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ "$EVENT_NAME" = pull_request ] && [ "$PR_ACTION" = synchronize ] &&
-             [ "$INVALIDATION_RESULT" != success ]; then
-            echo "::error::Could not invalidate local validation from the previous PR head."
+          classify_check() {
+            python3 .dev-hermit-policy/ci-hub/check_outcome.py \
+              --status "$1" --conclusion "$2"
+          }
+
+          [ "$(classify_check completed success)" = PASSED ]
+          [ "$(classify_check "" success)" = PASSED ]
+          for conclusion in failure timed_out error startup_failure; do
+            [ "$(classify_check completed "$conclusion")" = FAILED ]
+          done
+          for state in \
+            completed:cancelled completed:skipped completed:neutral \
+            completed:stale completed:action_required queued:none \
+            in_progress:none waiting:none requested:none missing:none \
+            completed:future_state; do
+            status=${state%%:*}
+            conclusion=${state#*:}
+            [ "$conclusion" != none ] || conclusion=
+            [ "$(classify_check "$status" "$conclusion")" = NO_RESULT ]
+          done
+          echo "Required-check predicate: N=2 PASSED, N=4 FAILED, N=11 NO_RESULT."
+
+          dispatch_file="${RUNNER_TEMP:-/tmp}/reverie-gate-redispatch-${GATE_RUN_ID}.tsv"
+          : >"$dispatch_file"
+          no_result=0
+
+          queue_dispatch() {
+            local head_ref=$1 head_repo=$2 pr_number=$3 head_sha=$4
+            no_result=1
+            if [ "$head_repo" != "$REPO" ]; then
+              echo "::warning::NO_RESULT for PR #$pr_number at $head_sha cannot be dispatched from external repository $head_repo."
+              return
+            fi
+            printf '%s\t%s\t%s\n' "$head_ref" "$pr_number" "$head_sha" >>"$dispatch_file"
+          }
+
+          dispatch_no_result() {
+            sort -u "$dispatch_file" | while IFS=$'\t' read -r head_ref pr_number head_sha; do
+              [ -n "$head_ref" ] || continue
+              echo "NO_RESULT: re-dispatching ci.yml for PR #$pr_number at $head_sha (ref=$head_ref)."
+              gh workflow run ci.yml --repo "$REPO" --ref "$head_ref"
+            done
+          }
+
+          cancel_no_result_gate() {
+            echo "NO_RESULT blocks landing but is not a failure; cancelling gate run $GATE_RUN_ID after re-dispatch."
+            gh api --method POST \
+              "repos/${REPO}/actions/runs/${GATE_RUN_ID}/force-cancel" --silent
+            for _ in {1..60}; do sleep 5; done
+            echo "::error::Gate cancellation request did not terminate run $GATE_RUN_ID."
             exit 1
+          }
+
+          if [ "$EVENT_NAME" = pull_request ] && [ "$PR_ACTION" = synchronize ]; then
+            invalidation_state=$(classify_check "" "$INVALIDATION_RESULT")
+            case "$invalidation_state" in
+              PASSED) ;;
+              FAILED)
+                echo "::error::Could not invalidate local validation from the previous PR head."
+                exit 1
+                ;;
+              NO_RESULT)
+                echo "Local-validation invalidation has NO_RESULT; local labels are not admission evidence."
+                ;;
+            esac
           fi
 
           if [ "$EVENT_NAME" = pull_request ] || [ "$EVENT_NAME" = workflow_dispatch ]; then
@@ -130,8 +209,7 @@ jobs:
             pull_requests="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" | jq -c '
               [select(.base.ref == "main") | {
                 number,
-                head: {sha: .head.sha},
-                labels
+                head: {sha: .head.sha, ref: .head.ref, repo: .head.repo.full_name}
               }]
             ')"
           else
@@ -152,8 +230,9 @@ jobs:
                         pullRequest {
                           number
                           headRefOid
+                          headRefName
+                          headRepository { nameWithOwner }
                           baseRefName
-                          labels(first: 100) { nodes { name } }
                         }
                       }
                     }
@@ -166,8 +245,11 @@ jobs:
                     and .pullRequest.baseRefName == $base
                   ) | {
                     number: .pullRequest.number,
-                    head: {sha: .pullRequest.headRefOid},
-                    labels: .pullRequest.labels.nodes
+                    head: {
+                      sha: .pullRequest.headRefOid,
+                      ref: .pullRequest.headRefName,
+                      repo: .pullRequest.headRepository.nameWithOwner
+                    }
                   })
               ')"
           fi
@@ -178,17 +260,12 @@ jobs:
           fi
 
           failed=0
-          while IFS=$'\t' read -r pr_number head_sha locally_validated; do
+          while IFS=$'\t' read -r pr_number head_sha head_ref head_repo; do
             if [ -z "$head_sha" ] || [ "$head_sha" = null ]; then
               echo "::error::PR #${pr_number} has no head SHA."
               failed=1
               continue
             fi
-            if [ "$locally_validated" = true ]; then
-              echo "PR #${pr_number} is locally validated at $head_sha."
-              continue
-            fi
-
             runs="$(
               gh api "repos/${REPO}/actions/workflows/ci.yml/runs?head_sha=${head_sha}&per_page=100"
             )"
@@ -201,16 +278,32 @@ jobs:
             conclusion="$(jq -r '.conclusion // ""' <<< "$run")"
             url="$(jq -r '.html_url // ""' <<< "$run")"
 
-            if [ "$status:$conclusion" = completed:success ]; then
-              echo "CI passed for PR #${pr_number} at $head_sha: $url"
-            else
-              echo "::error::CI for PR #${pr_number} at $head_sha is $status/${conclusion:-none}: ${url:-no run URL}."
-              failed=1
-            fi
+            outcome=$(classify_check "$status" "$conclusion")
+            case "$outcome" in
+              PASSED)
+                echo "CI PASSED for PR #${pr_number} at $head_sha: $url"
+                ;;
+              FAILED)
+                echo "::error::CI FAILED for PR #${pr_number} at $head_sha ($status/${conclusion:-none}): ${url:-no run URL}."
+                failed=1
+                ;;
+              NO_RESULT)
+                echo "CI has NO_RESULT for PR #${pr_number} at $head_sha ($status/${conclusion:-none}); blocking without reporting failure."
+                queue_dispatch "$head_ref" "$head_repo" "$pr_number" "$head_sha"
+                ;;
+            esac
           done < <(jq -r '
             .[]
-            | [.number, .head.sha, any(.labels[]?; .name == "locally-validated")]
+            | [.number, .head.sha, .head.ref, .head.repo]
             | @tsv
           ' <<< "$pull_requests")
 
-          exit "$failed"
+          if [ "$failed" -ne 0 ]; then
+            exit "$failed"
+          fi
+          if [ "$no_result" -ne 0 ]; then
+            dispatch_no_result
+            cancel_no_result_gate
+          fi
+
+          echo "Every required leg has a PASSED result."
