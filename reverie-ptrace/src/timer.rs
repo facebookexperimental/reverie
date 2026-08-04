@@ -85,6 +85,15 @@ pub use reverie::SKID_OVERSHOOT_MARKER;
 /// that does not parse as `u64` is ignored (processor default retained).
 pub const SKID_MARGIN_OVERRIDE_ENV: &str = "REVERIE_SKID_MARGIN_OVERRIDE";
 
+/// Supervisor-only witness nonce. When the consuming harness (the hermit
+/// *supervisor*) sets this env var, its exact value is stamped into every
+/// [`SKID_OVERSHOOT_MARKER`] line as a ` witness=<value>` field. A downstream
+/// retry gate uses it to distinguish a genuine supervisor-emitted overshoot from
+/// guest-printed marker text: hermit strips this var from the guest environment,
+/// so the guest can neither read nor forge the value. Unset or empty leaves the
+/// marker in its plain (unauthenticated) shape.
+pub const WITNESS_TOKEN_ENV: &str = "HERMIT_SKID_WITNESS_TOKEN";
+
 static PMU_CONFIG: OnceLock<PmuConfig> = OnceLock::new();
 
 pub(crate) fn get_pmu_config() -> &'static PmuConfig {
@@ -249,14 +258,25 @@ impl PmuConfig {
     /// without capturing process stderr.
     pub fn format_skid_overshoot_marker(&self, rcb_actual: u64, rcb_target: u64) -> String {
         let overshoot = rcb_actual.saturating_sub(rcb_target);
-        format!(
+        let mut line = format!(
             "{} rcb_actual={} rcb_target={} skid_margin={} overshoot={}",
             SKID_OVERSHOOT_MARKER,
             rcb_actual,
             rcb_target,
             self.skid_margin(),
             overshoot,
-        )
+        );
+        // Supervisor-only witness nonce (see [`WITNESS_TOKEN_ENV`]): stamps the
+        // marker so a downstream retry gate can authenticate it as genuinely
+        // supervisor-emitted rather than guest-printed. Read from the env at emit
+        // time; the emit path is rare, so the lookup cost is irrelevant.
+        if let Ok(token) = std::env::var(WITNESS_TOKEN_ENV) {
+            if !token.is_empty() {
+                line.push_str(" witness=");
+                line.push_str(&token);
+            }
+        }
+        line
     }
 
     /// The event needed to configure the PMU and observe RCBs.
