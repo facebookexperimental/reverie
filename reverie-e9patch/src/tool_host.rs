@@ -1,19 +1,12 @@
 //! Generic in-guest host for Reverie tools on e9patch's direct AOT path.
 
-use core::future::Future;
 use core::sync::atomic::AtomicBool;
-use core::sync::atomic::AtomicI64;
-use core::sync::atomic::AtomicU8;
-use core::sync::atomic::AtomicU64;
 use core::sync::atomic::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::task::Context;
-use std::task::Poll;
-use std::task::Waker;
 
 use reverie::Error;
 use reverie::GlobalRPC;
@@ -37,6 +30,10 @@ use reverie_preload::dispatch::SyscallDispatcher;
 use reverie_preload::dispatch::SyscallEvent;
 use reverie_preload::dispatch::SyscallEventSource;
 use reverie_preload::lifecycle::InProcessSeccomp;
+use reverie_preload::tool_host::DrivenSyscall;
+use reverie_preload::tool_host::TailResult;
+use reverie_preload::tool_host::drive_ready;
+use reverie_preload::tool_host::drive_tool_syscall;
 use reverie_preload::trap::raw_syscall6;
 
 use crate::aot;
@@ -47,9 +44,6 @@ use crate::rpc::CoordinatorRpc;
 use crate::rpc::SpinMutex;
 
 const STACK_CAPACITY: usize = 4096;
-const TAIL_NONE: u8 = 0;
-const TAIL_RESULT: u8 = 1;
-const TAIL_EXIT: u8 = 2;
 
 static COMMITTED_STACKS: SpinMutex<Vec<Box<[u8]>>> = SpinMutex::new(Vec::new());
 static TOOL_INSTALLED: AtomicBool = AtomicBool::new(false);
@@ -340,19 +334,25 @@ where
                     number,
                     SyscallArgs::new(args[0], args[1], args[2], args[3], args[4], args[5]),
                 );
-                match drive_syscall(tool.handle_syscall_event(&mut guest, syscall), &tail) {
-                    SyscallOutcome::Return(result) => {
-                        let result = match result {
-                            Ok(value) => value,
-                            Err(error) => match error.into_errno() {
-                                Ok(errno) => -i64::from(errno.into_raw()),
-                                Err(error) => tool_fatal(125, &error),
-                            },
-                        };
-                        guest.event.set_result(result);
+                // Drive the Tool handler to a terminal outcome. The shared
+                // driver owns the wait4/ERESTARTSYS restart protocol (Reverie
+                // #362) so it cannot drift between the in-guest backends. Before
+                // this the direct host mapped a Tool error straight to `-errno`,
+                // leaking Detcore's private `ERESTARTSYS` (512) from a
+                // restartable wait4 scheduler poll out to the guest as errno 512.
+                match drive_tool_syscall(tool, &mut guest, syscall, number, &tail) {
+                    DrivenSyscall::Result(value) => {
+                        guest.event.set_result(value);
                         None
                     }
-                    SyscallOutcome::Exit { number, args } => Some((number, args)),
+                    DrivenSyscall::Exit { number, args } => Some((number, args)),
+                    DrivenSyscall::ForkChild { .. } => {
+                        // The direct AOT host bars process-tree injection
+                        // (`injected_syscall_guard` rejects clone/fork/vfork), so
+                        // the Tool can never stage a fork-child transition here.
+                        fatal(126)
+                    }
+                    DrivenSyscall::Fatal(error) => tool_fatal(125, &error),
                 }
             }
         };
@@ -418,88 +418,6 @@ fn raw_pid(number: i64) -> Pid {
         fatal(126);
     }
     Pid::from_raw(value as i32)
-}
-
-fn drive_ready<F, T>(future: F) -> T
-where
-    F: Future<Output = T>,
-{
-    let mut future = std::pin::pin!(future);
-    let waker = Waker::noop();
-    let mut context = Context::from_waker(waker);
-    loop {
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(value) => return value,
-            Poll::Pending => core::hint::spin_loop(),
-        }
-    }
-}
-
-enum SyscallOutcome {
-    Return(Result<i64, Error>),
-    Exit { number: i64, args: [u64; 6] },
-}
-
-enum TailAction {
-    Result(i64),
-    Exit { number: i64, args: [u64; 6] },
-}
-
-fn drive_syscall<F>(future: F, tail: &TailResult) -> SyscallOutcome
-where
-    F: Future<Output = Result<i64, Error>>,
-{
-    let mut future = std::pin::pin!(future);
-    let waker = Waker::noop();
-    let mut context = Context::from_waker(waker);
-    loop {
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(value) => return SyscallOutcome::Return(value),
-            Poll::Pending => match tail.take() {
-                Some(TailAction::Result(value)) => {
-                    return SyscallOutcome::Return(Ok(value));
-                }
-                Some(TailAction::Exit { number, args }) => {
-                    return SyscallOutcome::Exit { number, args };
-                }
-                None => core::hint::spin_loop(),
-            },
-        }
-    }
-}
-
-#[derive(Default)]
-struct TailResult {
-    action: AtomicU8,
-    value: AtomicI64,
-    number: AtomicI64,
-    args: [AtomicU64; 6],
-}
-
-impl TailResult {
-    fn set_result(&self, value: i64) {
-        self.value.store(value, Ordering::Relaxed);
-        self.action.store(TAIL_RESULT, Ordering::Release);
-    }
-
-    fn set_exit(&self, number: i64, args: [u64; 6]) {
-        self.number.store(number, Ordering::Relaxed);
-        for (destination, value) in self.args.iter().zip(args) {
-            destination.store(value, Ordering::Relaxed);
-        }
-        self.action.store(TAIL_EXIT, Ordering::Release);
-    }
-
-    fn take(&self) -> Option<TailAction> {
-        match self.action.swap(TAIL_NONE, Ordering::AcqRel) {
-            TAIL_RESULT => Some(TailAction::Result(self.value.load(Ordering::Relaxed))),
-            TAIL_EXIT => Some(TailAction::Exit {
-                number: self.number.load(Ordering::Relaxed),
-                args: std::array::from_fn(|index| self.args[index].load(Ordering::Relaxed)),
-            }),
-            _ => None,
-        }
-    }
 }
 
 struct E9patchGuest<'a, T: Tool> {
