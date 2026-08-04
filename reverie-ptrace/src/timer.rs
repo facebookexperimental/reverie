@@ -253,6 +253,31 @@ impl PmuConfig {
         );
     }
 
+    /// Single decision-and-record site for a skid overshoot: iff the interrupt
+    /// was delivered *past* the programmed target (`rcb_actual > rcb_target`),
+    /// emit the canonical [`SKID_OVERSHOOT_MARKER`] line **and** increment the
+    /// process-global witness counter via [`reverie::record_skid_overshoot`],
+    /// then return `true`. A non-overshoot (`rcb_actual <= rcb_target`) records
+    /// nothing and returns `false`.
+    ///
+    /// [`Self::attempt_single_step`]'s hard-failure guard is the sole runtime
+    /// caller, so a unit test that drives real `(actual, target)` pairs through
+    /// this method exercises exactly the behaviour the supervisor runs — a
+    /// genuine overshoot causes exactly one witness record — without needing a
+    /// live guest or PMU. The boolean return is what makes that behaviour
+    /// (not merely the marker arithmetic) observable in a test.
+    pub fn record_overshoot_if_past_target(&self, rcb_actual: u64, rcb_target: u64) -> bool {
+        if rcb_actual > rcb_target {
+            self.emit_skid_overshoot_marker(rcb_actual, rcb_target);
+            // Structural, in-process signal (a guest cannot forge it) so an
+            // in-process classifier can causally attribute a divergence to skid.
+            reverie::record_skid_overshoot();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Formats the canonical [`SKID_OVERSHOOT_MARKER`] line. Split out from
     /// [`Self::emit_skid_overshoot_marker`] so the exact shape is unit-testable
     /// without capturing process stderr.
@@ -910,12 +935,12 @@ impl TimerImpl {
         // overshoot marker before the panic so this hard-failure path carries
         // the same greppable signal as the detcore log-and-continue path — a
         // retry harness can then classify it as skid rather than a real bug.
-        if ctr_initial > target_rcb {
-            get_pmu_config().emit_skid_overshoot_marker(ctr_initial, target_rcb);
-            // Structural, in-process signal (a guest cannot forge it) so an
-            // in-process classifier can causally attribute a divergence to skid.
-            reverie::record_skid_overshoot();
-        }
+        // Single decision-and-record site (unit-tested via
+        // `record_overshoot_if_past_target`): emits the canonical marker and
+        // increments the process-global witness counter iff this is a genuine
+        // overshoot. The `assert!` below then converts the same condition into
+        // the hard-failure panic.
+        get_pmu_config().record_overshoot_if_past_target(ctr_initial, target_rcb);
         assert!(
             ctr_initial <= target_rcb,
             "Clock perf counter exceeds target value at start of attempted single-step: \
@@ -1104,6 +1129,70 @@ mod tests {
         let config = PmuConfig::from_family_model(0x1A, 0x11);
         let line = config.format_skid_overshoot_marker(100, 200);
         assert!(line.contains("overshoot=0"));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn overshoot_decision_records_witness_counts_and_attributes_per_run() {
+        // Drives real (rcb_actual, rcb_target) pairs through the *same*
+        // decision-and-record method the supervisor calls in
+        // `attempt_single_step`, and observes the process-global witness
+        // counter — proving the behaviour (a genuine overshoot is recorded),
+        // not merely the marker arithmetic. This test is the only writer of the
+        // witness counter in this test binary, so draining residue first makes
+        // it order-independent; env is untouched, so it is parallel-safe.
+        let _ = reverie::take_skid_overshoot_count();
+
+        // The exact CPU is irrelevant to the decision, which keys only on
+        // `actual > target`; use EPYC 9D85 (default margin 1000).
+        let config = PmuConfig::from_family_model(0x1A, 0x11);
+
+        // --- Negative bracket: a non-overshoot must record nothing. ---
+        // Interrupt delivered *at* the target, and *before* it.
+        assert!(!config.record_overshoot_if_past_target(33_000, 33_000));
+        assert!(!config.record_overshoot_if_past_target(32_500, 33_000));
+        assert_eq!(
+            reverie::take_skid_overshoot_count(),
+            0,
+            "no overshoot occurred, so the witness must be empty"
+        );
+
+        // --- Positive bracket: a genuine overshoot records exactly once. ---
+        // 500 RCB past target: a real skid past the margin.
+        assert!(config.record_overshoot_if_past_target(33_500, 33_000));
+        assert_eq!(
+            reverie::take_skid_overshoot_count(),
+            1,
+            "one real overshoot must record exactly one witness event"
+        );
+
+        // --- Counting: N genuine overshoots in one run count to N, and only
+        // genuine ones are counted. Models the heavy-tailed skid (p99 < 1000
+        // RCB, rare outliers into the tens of thousands). ---
+        let overshoots = [1u64, 500, 10_000, 47_311];
+        for &past in &overshoots {
+            assert!(config.record_overshoot_if_past_target(33_000 + past, 33_000));
+        }
+        // Interleave a non-overshoot to prove it is not counted.
+        assert!(!config.record_overshoot_if_past_target(33_000, 33_000));
+        assert_eq!(
+            reverie::take_skid_overshoot_count(),
+            overshoots.len() as u64,
+            "every genuine overshoot in run A must be counted, and only those"
+        );
+
+        // --- Per-run attribution: `take` reset makes runs disjoint, so a
+        // second verify run sees only its own overshoots and run A's count does
+        // not leak in. ---
+        assert!(config.record_overshoot_if_past_target(33_001, 33_000));
+        assert!(config.record_overshoot_if_past_target(90_000, 33_000));
+        assert_eq!(
+            reverie::take_skid_overshoot_count(),
+            2,
+            "run B is attributed only its own two overshoots"
+        );
+        // A run with zero overshoots (the common case) is attributed zero.
+        assert_eq!(reverie::take_skid_overshoot_count(), 0);
     }
 
     #[test_case(ClockCounter::new(0, 0, 10), 0, 1, Some(true))]
