@@ -67,6 +67,14 @@ const AMD_DEFAULT_SKID_MARGIN: u64 = 10_000;
 #[cfg(target_arch = "x86_64")]
 const AMD_EPYC_9D85_SKID_MARGIN: u64 = 1_000;
 
+/// The single, greppable marker emitted to stderr whenever this backend detects
+/// the RCB fallback overshooting its target. Re-exported from the
+/// backend-agnostic `reverie` crate so that this precise single-step guard and
+/// hermit's detcore log-and-continue path emit the *same* token — one marker,
+/// one source. See [`reverie::SKID_OVERSHOOT_MARKER`] for the full contract and
+/// the retry-harness safety property.
+pub use reverie::SKID_OVERSHOOT_MARKER;
+
 static PMU_CONFIG: OnceLock<PmuConfig> = OnceLock::new();
 
 pub(crate) fn get_pmu_config() -> &'static PmuConfig {
@@ -179,6 +187,36 @@ impl PmuConfig {
     /// remaining.
     pub fn max_single_step_count(&self) -> u64 {
         self.skid_margin().saturating_add(SINGLESTEP_TIMEOUT_RCBS)
+    }
+
+    /// Emits the single canonical [`SKID_OVERSHOOT_MARKER`] line to stderr.
+    ///
+    /// This is called at every site that detects the RCB-fallback preemption
+    /// landing past its programmed target, so the overshoot signal has exactly
+    /// one greppable shape regardless of which layer noticed it. It reports the
+    /// counter value actually observed, the intended target, the skid margin in
+    /// effect (the CPU-specific constant whose tuning determines how often this
+    /// fires), and the resulting overshoot.
+    pub fn emit_skid_overshoot_marker(&self, rcb_actual: u64, rcb_target: u64) {
+        eprintln!(
+            "{}",
+            self.format_skid_overshoot_marker(rcb_actual, rcb_target)
+        );
+    }
+
+    /// Formats the canonical [`SKID_OVERSHOOT_MARKER`] line. Split out from
+    /// [`Self::emit_skid_overshoot_marker`] so the exact shape is unit-testable
+    /// without capturing process stderr.
+    pub fn format_skid_overshoot_marker(&self, rcb_actual: u64, rcb_target: u64) -> String {
+        let overshoot = rcb_actual.saturating_sub(rcb_target);
+        format!(
+            "{} rcb_actual={} rcb_target={} skid_margin={} overshoot={}",
+            SKID_OVERSHOOT_MARKER,
+            rcb_actual,
+            rcb_target,
+            self.skid_margin(),
+            overshoot,
+        )
     }
 
     /// The event needed to configure the PMU and observe RCBs.
@@ -806,6 +844,15 @@ impl TimerImpl {
         step: &mut (dyn FnMut(Stopped) -> Result<Running, TraceError> + Send),
         observe: &mut (dyn FnMut(&Wait) -> Result<(), TraceError> + Send),
     ) -> Result<Stopped, HandleFailure> {
+        // The perf interrupt was delivered *past* the target: the actual skid
+        // exceeded the margin, so single-stepping (which cannot go backwards)
+        // can no longer land precisely on the target. Emit the canonical
+        // overshoot marker before the panic so this hard-failure path carries
+        // the same greppable signal as the detcore log-and-continue path — a
+        // retry harness can then classify it as skid rather than a real bug.
+        if ctr_initial > target_rcb {
+            get_pmu_config().emit_skid_overshoot_marker(ctr_initial, target_rcb);
+        }
         assert!(
             ctr_initial <= target_rcb,
             "Clock perf counter exceeds target value at start of attempted single-step: \
@@ -949,6 +996,35 @@ mod tests {
         assert_eq!(config.raw_rcb_event(), 0x5100d1);
         assert_eq!(config.skid_margin(), 500);
         assert_eq!(config.max_single_step_count(), 505);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn skid_overshoot_marker_has_canonical_shape() {
+        use super::SKID_OVERSHOOT_MARKER;
+        // EPYC 9D85: skid margin 1000. Overshoot of 33_500 (the measured
+        // baseline outlier) landing 500 RCB past a target of 33_000.
+        let config = PmuConfig::from_family_model(0x1A, 0x11);
+        let line = config.format_skid_overshoot_marker(33_500, 33_000);
+        assert_eq!(
+            line,
+            format!(
+                "{} rcb_actual=33500 rcb_target=33000 skid_margin=1000 overshoot=500",
+                SKID_OVERSHOOT_MARKER
+            )
+        );
+        // The token is what a retry harness greps for; keep it stable.
+        assert!(line.starts_with(SKID_OVERSHOOT_MARKER));
+        assert_eq!(SKID_OVERSHOOT_MARKER, "HERMIT_SKID_OVERSHOOT");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn skid_overshoot_marker_overshoot_is_saturating() {
+        // A non-overshoot call (actual <= target) must never underflow.
+        let config = PmuConfig::from_family_model(0x1A, 0x11);
+        let line = config.format_skid_overshoot_marker(100, 200);
+        assert!(line.contains("overshoot=0"));
     }
 
     #[test_case(ClockCounter::new(0, 0, 10), 0, 1, Some(true))]

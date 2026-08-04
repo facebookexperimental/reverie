@@ -58,6 +58,7 @@ pub use liteinst_stats::LiteinstInstrumentationStats;
 pub use liteinst_stats::LiteinstInstrumentationStatsHandle;
 pub use perf::is_perf_supported;
 pub use timer::PmuConfig;
+pub use timer::SKID_OVERSHOOT_MARKER;
 pub use timer::set_pmu_config;
 pub use tracer::GdbConnection;
 pub use tracer::Tracer;
