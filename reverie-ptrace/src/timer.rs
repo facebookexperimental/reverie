@@ -270,11 +270,11 @@ impl PmuConfig {
         // marker so a downstream retry gate can authenticate it as genuinely
         // supervisor-emitted rather than guest-printed. Read from the env at emit
         // time; the emit path is rare, so the lookup cost is irrelevant.
-        if let Ok(token) = std::env::var(WITNESS_TOKEN_ENV) {
-            if !token.is_empty() {
-                line.push_str(" witness=");
-                line.push_str(&token);
-            }
+        if let Ok(token) = std::env::var(WITNESS_TOKEN_ENV)
+            && !token.is_empty()
+        {
+            line.push_str(" witness=");
+            line.push_str(&token);
         }
         line
     }
