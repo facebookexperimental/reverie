@@ -17,6 +17,10 @@ on:
           pull request's head branch so the check attaches to its head SHA.
         required: true
         type: string
+      head_sha:
+        description: Exact PR head SHA to evaluate and attach this gate to.
+        required: true
+        type: string
 
 # This lightweight required check accepts an exact PR head only after the
 # repository CI workflow succeeds. Local Reverie validation has no remotely
@@ -69,7 +73,8 @@ jobs:
             gh workflow run merge-gate.yml \
               --repo "$REPO" \
               --ref "$HEAD_BRANCH" \
-              -f pr_number="$pr_number"
+              -f pr_number="$pr_number" \
+              -f head_sha="$HEAD_SHA"
           done < <(jq -r '.[] | [.number, .current] | @tsv' <<< "$matches")
 
   invalidate-local-validation:
@@ -117,13 +122,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: rrnewton/dev-hermit
-          ref: 173d87688483189154cdd44feb031347a737e29a
+          ref: 8ea20e121073e7c1fc3ce7a131a4950d7574ce42
           path: .dev-hermit-policy
           persist-credentials: false
       - name: Require PASSED CI or re-dispatch NO_RESULT
         env:
           BASE_REF: ${{ github.event.merge_group.base_ref }}
           EVENT_NAME: ${{ github.event_name }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha || inputs.head_sha }}
           GATE_RUN_ID: ${{ github.run_id }}
           INVALIDATION_RESULT: ${{ needs.invalidate-local-validation.result }}
           PR_ACTION: ${{ github.event.action }}
@@ -206,8 +212,13 @@ jobs:
               echo "::error::workflow_dispatch requires a pr_number input."
               exit 1
             fi
-            pull_requests="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" | jq -c '
-              [select(.base.ref == "main") | {
+            if [ -z "$EXPECTED_HEAD_SHA" ] ||
+               { [ "$EVENT_NAME" = workflow_dispatch ] && [ "$SHA" != "$EXPECTED_HEAD_SHA" ]; }; then
+              echo "::error::Gate run SHA $SHA does not match requested PR head ${EXPECTED_HEAD_SHA:-missing}."
+              exit 1
+            fi
+            pull_requests="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" | jq -c --arg sha "$EXPECTED_HEAD_SHA" '
+              [select(.base.ref == "main" and .state == "open" and .head.sha == $sha) | {
                 number,
                 head: {sha: .head.sha, ref: .head.ref, repo: .head.repo.full_name}
               }]
