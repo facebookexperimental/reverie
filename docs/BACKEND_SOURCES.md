@@ -12,6 +12,13 @@ dependency.
 | SaBRe | `third-party/sabre` | `41113f849f8799932ed8c7883f5a4de616b9e9fa` | GPL-3.0-or-later, with per-file exceptions |
 | e9patch | `third-party/e9patch` | `6c2c03c1da74b14daf1788a9f8dccfa354ce04a6` (`v1.0.1`) | GPL-3.0 |
 
+These native backends wrap established binary-instrumentation projects —
+[DynamoRIO](https://dynamorio.org),
+[SaBRe](https://github.com/srg-imperial/SaBRe), and
+[e9patch](https://github.com/GJDuck/e9patch). The revisions above are the exact
+commits Reverie builds against; consult each upstream project for background on
+its rewriting approach.
+
 The in-tree `reverie-liteinst` prototype is self-contained and does not depend
 on an external LiteInst checkout. The `reverie-e9patch` Rust crate builds
 without initializing the e9patch source, but runtime rewriting requires the

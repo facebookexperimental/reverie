@@ -14,9 +14,13 @@ Some potential use cases include:
 See the [`reverie-examples`](reverie-examples) directory for examples of
 tools that can be built with this library.
 
-See [Backend architecture](BACKENDS.md) for the ptrace, KVM, DBI, SaBRe,
-e9patch, and LiteInst event paths and the shared RPC, ptracer, and trapping
-components.
+Reverie is the instrumentation layer beneath
+[Hermit](https://github.com/facebookexperimental/hermit), a reproducible Linux
+container that makes a program's execution deterministic by replacing sources of
+nondeterminism such as time, randomness, and thread scheduling. Hermit is
+Reverie's primary consumer: its determinism engine is written as a Reverie tool
+(the *tool* concept is introduced in
+[Terminology and Background](#terminology-and-background) below).
 
 ## Features
 
@@ -53,6 +57,13 @@ everything down at exit. `reverie-ptrace` is the reference backend. A backend is
 a *swappable implementation* — anything playing the same role as
 `reverie-ptrace` — and it must be able to host an **arbitrary** tool, not a
 hard-coded one. See [The Backend Contract](#the-backend-contract) below.
+
+Reverie provides several backends: the production `ptrace` backend, the
+in-progress KVM and DBI (dynamic binary instrumentation) backends, and the
+experimental SaBRe, e9patch, and LiteInst rewriting backends. With the
+*backend* role now in hand, see [Backend architecture](BACKENDS.md) for how each
+one hooks, traps, and routes a guest's events, and for the shared RPC, ptracer,
+and trapping components they build on.
 
 ## Building and Testing
 

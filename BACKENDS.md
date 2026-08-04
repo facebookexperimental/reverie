@@ -1,5 +1,11 @@
 # Reverie backend architecture
 
+> New to Reverie? Read the [README](README.md) first for the *tool*, *guest*,
+> *backend*, and *subscription* vocabulary this document builds on. This guide is
+> the backend author's and reviewer's reference for how each backend hooks,
+> traps, and routes a guest's events; it assumes those terms are already
+> familiar.
+
 Reverie separates a tool's policy from the mechanism that observes a guest.
 `Tool` owns process-local and thread-local state, `GlobalTool` owns the singleton
 state shared by the guest tree, `Guest<T>` exposes the live task, and
