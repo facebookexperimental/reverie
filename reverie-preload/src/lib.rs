@@ -26,7 +26,10 @@
 //!   seam that makes switching to a hybrid in-process-trap + ptrace backend an
 //!   additive change rather than a rewrite;
 //! * [`rpc`] (feature `coordinator-rpc`) — a synchronous coordinator RPC client
-//!   wire-compatible with the async `reverie-rpc-transport`.
+//!   wire-compatible with the async `reverie-rpc-transport`;
+//! * [`tool_host`] (feature `coordinator-rpc`) — the backend-agnostic driver
+//!   that polls an in-guest Reverie tool's `async` handlers with a no-op waker
+//!   and carries the shared `ERESTARTSYS` restart protocol.
 //!
 //! # Coverage boundaries
 //!
@@ -61,6 +64,9 @@ pub mod trap;
 
 #[cfg(feature = "coordinator-rpc")]
 pub mod rpc;
+
+#[cfg(feature = "coordinator-rpc")]
+pub mod tool_host;
 
 use std::env;
 use std::ffi::OsStr;
