@@ -23,6 +23,51 @@ The in-tree `reverie-liteinst` prototype is self-contained and does not depend
 on an external LiteInst checkout. `reverie-{dbi,sabre,e9patch}` source builds
 produce their required native artifacts without a submodule or network path.
 
+## What "curated" removes
+
+A vendored tree is not a byte copy of its upstream pin. Two classes of file are
+dropped, and each is enforced by a test rather than by convention:
+
+- **Binary files.** Upstream documentation and Windows-resource images —
+  DynamoRIO's `api/docs/**` and `tools/DR*/res/*` images and e9patch's
+  `.github/e9patch.png` — are removed. No build step reads them, and this
+  repository does not carry binaries. Guarded by
+  `vendored_dynamorio_source_contains_no_binary_files`
+  (`reverie-dbi/tests/build_script_source.rs`),
+  `the_vendored_source_contains_no_binary_files`
+  (`reverie-e9patch/tests/vendor_source.rs`), and the same-named SaBRe test in
+  `experimental/reverie-sabre/src/lib.rs`. Each scans real file bytes for NUL,
+  so a renamed blob is caught too.
+- **Components the build does not compile.** e9tool only decodes and formats
+  instructions, so Zydis is compiled with upstream's `ZYDIS_DISABLE_ENCODER`
+  switch and its encoder sources — including the generated 2.6 MB
+  `contrib/zydis/src/Generated/EncoderTables.inc` — are not redistributed.
+  Guarded by `the_zydis_encoder_is_disabled_and_its_sources_are_absent`.
+
+One text file exceeds the repository's 2 MiB ceiling:
+`reverie-e9patch/vendor/e9patch/contrib/zydis/src/Generated/InstructionDefinitions.inc`
+(5.7 MB). Zydis commits `src/Generated/*.inc` as tracked source — they are
+produced out of band by the separate `zydis-db` tooling, no generator exists in
+any vendored tree, and `contrib/zydis/.gitignore` does not list them — and
+`src/SharedData.c` `#include`s this one, so the decoder cannot be built without
+it. It is the sole entry in `LARGE_TEXT_ALLOWLIST`
+(`reverie-e9patch/tests/vendor_source.rs`); every other vendored tree has an
+empty allowlist, and any new oversized file fails the corresponding test.
+
+## Parallel builds of the vendored e9patch tree
+
+`reverie-e9patch/build.rs` runs `make --jobs=N release` over its `OUT_DIR` copy.
+Upstream's `dev` goal lists `contrib/zydis/libZydis.a`, `contrib/libdw/libdw.a`,
+and `e9tool` as sibling prerequisites, so under `-j` the e9tool link can start
+before either archive exists and the build fails with a missing archive or
+undefined `Zydis*` / libdw references. The curated `Makefile` therefore attaches
+both archives to `e9tool` as **order-only** prerequisites, selected by goal at
+parse time (a `dev:`-scoped target variable is not visible while prerequisite
+lists are expanded). `all` and `check` keep upstream behaviour and link the
+system `-lZydis` / `-ldw`. `contrib_archives_are_ordered_before_the_e9tool_link`
+and `the_system_library_goals_do_not_build_the_contrib_archives` assert both
+sides against GNU make's own parsed dependency database.
+
 ## Inspect a developer reference checkout
 
 Use the repository helper to initialize and verify exactly one source:

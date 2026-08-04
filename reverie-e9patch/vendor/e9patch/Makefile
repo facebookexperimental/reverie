@@ -43,6 +43,26 @@ E9TOOL_CXXFLAGS ::= -Isrc/e9tool -Wno-unused-function
 E9TOOL_LDFLAGS ::= -Wl,--dynamic-list=src/e9tool/e9tool.syms
 E9TOOL_LDLIBS ::= -ldl -lz
 
+# CURATED (reverie): serialize the contrib archives before the e9tool link.
+#
+# The `dev` goal lists contrib/zydis/libZydis.a, contrib/libdw/libdw.a, and
+# e9tool as sibling prerequisites, so under `make -j` the link may start before
+# either archive exists and fails with undefined Zydis / libdw references. The
+# fix has to be a prerequisite of `e9tool` itself, and prerequisite lists are
+# expanded when the makefile is read -- a `dev:`-scoped target variable is not
+# visible then (it is only visible while the recipe runs, and, unlike a variable
+# set directly on the target, not even during secondary expansion). So the
+# archives are selected here, by goal, and attached as ORDER-ONLY prerequisites
+# so they stay out of `$^` and do not force a relink when an archive is newer.
+#
+# Goals that do not go through `dev` keep upstream behaviour exactly: `all` and
+# `check` link the system -lZydis / -ldw and never build the contrib archives.
+ifneq ($(filter dev release debug sanitize,$(MAKECMDGOALS)),)
+E9TOOL_LINK_ORDER ::= | contrib/zydis/libZydis.a contrib/libdw/libdw.a
+else
+E9TOOL_LINK_ORDER ::=
+endif
+
 #########################################################################
 # CONVENTIONAL BUILD
 #########################################################################
@@ -54,7 +74,7 @@ all: e9tool e9patch
 e9tool: CXXFLAGS += $(E9TOOL_CXXFLAGS)
 e9tool: LDFLAGS += $(E9TOOL_LDFLAGS)
 e9tool: LDLIBS += $(E9TOOL_LIBS) $(E9TOOL_LDLIBS)
-e9tool: $(E9TOOL_OBJS)
+e9tool: $(E9TOOL_OBJS) $(E9TOOL_LINK_ORDER)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS) $(LDLIBS)
 
 e9patch: $(E9PATCH_OBJS)
@@ -153,7 +173,10 @@ contrib/zydis/libZydis.a:
 contrib/libdw/libdw.a:
 	$(MAKE) -C contrib/libdw
 
-dev: E9TOOL_CXXFLAGS += -Icontrib/libdw \
+# CURATED (reverie): -DZYDIS_DISABLE_ENCODER must match contrib/zydis/Makefile,
+# which builds libZydis.a without the encoder; <Zydis/Zydis.h> would otherwise
+# include the removed <Zydis/Encoder.h>.
+dev: E9TOOL_CXXFLAGS += -DZYDIS_DISABLE_ENCODER -Icontrib/libdw \
 	-Icontrib/zydis/include -Icontrib/zydis/dependencies/zycore/include
 dev: E9TOOL_LIBS += contrib/zydis/libZydis.a contrib/libdw/libdw.a
 dev: contrib/zydis/libZydis.a contrib/libdw/libdw.a e9patch e9tool

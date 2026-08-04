@@ -79,3 +79,77 @@ fn ci_uses_the_vendored_content_addressed_cache() {
         );
     }
 }
+
+/// Walk every regular file under a vendored source tree.
+fn vendored_files(root: &Path) -> Vec<std::path::PathBuf> {
+    fn walk(dir: &Path, found: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("failed to walk the vendored source") {
+            let entry = entry.expect("failed to read a vendored directory entry");
+            let path = entry.path();
+            let kind = entry.file_type().expect("failed to stat a vendored path");
+            if kind.is_dir() {
+                walk(&path, found);
+            } else if kind.is_file() {
+                found.push(path);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(root, &mut found);
+    assert!(
+        found.len() > 100,
+        "the vendored DynamoRIO walk found only {} files",
+        found.len()
+    );
+    found
+}
+
+/// The vendored DynamoRIO tree is source, not payload.
+///
+/// The curated tree originally carried thirteen upstream documentation and
+/// Windows-resource images (`api/docs/**/*.png|ico`, `tools/DR*/res/*.ico|bmp`,
+/// 302 kB total) that no build step reads. Detection is a NUL-byte scan over
+/// the real bytes, so a renamed blob is still caught.
+#[test]
+fn vendored_dynamorio_source_contains_no_binary_files() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/dynamorio");
+    let mut offenders = Vec::new();
+    for path in vendored_files(&root) {
+        let bytes = std::fs::read(&path).expect("failed to read a vendored DynamoRIO file");
+        if bytes.contains(&0) {
+            let relative = path.strip_prefix(&root).unwrap_or(&path);
+            offenders.push(format!("{} ({} bytes)", relative.display(), bytes.len()));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "the vendored DynamoRIO source must not contain binary files: {}",
+        offenders.join(", ")
+    );
+}
+
+/// No vendored text file may exceed the 2 MiB coordinator-approval ceiling.
+///
+/// Unlike the e9patch tree there is no approved exception here, so the
+/// allowlist is empty and any oversized file is a regression.
+#[test]
+fn vendored_dynamorio_source_has_no_oversized_text_files() {
+    const LARGE_TEXT_LIMIT: u64 = 2 * 1024 * 1024;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/dynamorio");
+    let mut offenders = Vec::new();
+    for path in vendored_files(&root) {
+        let size = path
+            .metadata()
+            .expect("failed to stat a vendored DynamoRIO file")
+            .len();
+        if size > LARGE_TEXT_LIMIT {
+            let relative = path.strip_prefix(&root).unwrap_or(&path);
+            offenders.push(format!("{} ({size} bytes)", relative.display()));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "vendored text files over {LARGE_TEXT_LIMIT} bytes need coordinator approval: {}",
+        offenders.join(", ")
+    );
+}

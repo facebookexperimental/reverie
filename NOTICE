@@ -42,6 +42,13 @@ drwrap is LGPL-2.1-only; its complete text is also at
 The curated tree does not contain drsyms, drsyscall, drutil, elfutils, libipt,
 or zlib sources.
 
+The curated tree also omits upstream's documentation and Windows-resource
+images (`api/docs/genimages/*.png`, `api/docs/images/*`, `tools/DRinstall/res/*`,
+`tools/DRstats/res/*`). They are documentation assets that no build step reads,
+and this repository does not carry binary files. Their removal changes no
+licensing: they are covered by the same DynamoRIO BSD-3-Clause grant above,
+whose complete text remains packaged.
+
 The packaged tree also contains:
 
   * third_party/valgrind headers
@@ -78,3 +85,14 @@ License:   GPL-3.0-only (primary; complete text in `LICENSE`), with the bundled
            libdw subset used under LGPL-3.0-or-later (complete text in
            `contrib/libdw/COPYING-LGPLV3`) and Zydis under MIT (complete text in
            `contrib/zydis/LICENSE`).
+
+The curated tree omits upstream's `.github/e9patch.png` project logo, because
+this repository does not carry binary files.
+
+e9tool only decodes and formats instructions, so the packaged Zydis is built
+with upstream's `ZYDIS_DISABLE_ENCODER` switch and the encoder sources are not
+redistributed: `contrib/zydis/src/Encoder.c`, `src/EncoderData.c`,
+`include/Zydis/Encoder.h`, `include/Zydis/Internal/EncoderData.h`, and the
+generated `src/Generated/EncoderTables.inc` (2.6 MB). None of them was ever in
+the `contrib/zydis` object list. The Zydis MIT text stays packaged in full and
+covers the retained decoder, formatter, and generated decoder tables.
