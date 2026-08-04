@@ -117,7 +117,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: rrnewton/dev-hermit
-          ref: f9e61247e83bb07c11297541b591606de24a89a8
+          ref: 173d87688483189154cdd44feb031347a737e29a
           path: .dev-hermit-policy
           persist-credentials: false
       - name: Require PASSED CI or re-dispatch NO_RESULT
@@ -269,11 +269,8 @@ jobs:
             runs="$(
               gh api "repos/${REPO}/actions/workflows/ci.yml/runs?head_sha=${head_sha}&per_page=100"
             )"
-            run="$(jq --arg sha "$head_sha" '
-              [.workflow_runs[] | select(.head_sha == $sha)]
-              | sort_by(.created_at)
-              | last // {}
-            ' <<< "$runs")"
+            run="$(python3 .dev-hermit-policy/ci-hub/check_outcome.py \
+              --select-latest-run --head-sha "$head_sha" <<< "$runs")"
             status="$(jq -r '.status // "missing"' <<< "$run")"
             conclusion="$(jq -r '.conclusion // ""' <<< "$run")"
             url="$(jq -r '.html_url // ""' <<< "$run")"

@@ -15,10 +15,12 @@ fail() {
     exit 1
 }
 
-grep -Fq 'ref: f9e61247e83bb07c11297541b591606de24a89a8' "$workflow" ||
+grep -Fq 'ref: 173d87688483189154cdd44feb031347a737e29a' "$workflow" ||
     fail "gate must pin the canonical parent authority"
 grep -Fq 'python3 .dev-hermit-policy/ci-hub/check_outcome.py' "$workflow" ||
     fail "gate must call the canonical check-status classifier"
+grep -Fq -- '--select-latest-run --head-sha "$head_sha"' "$workflow" ||
+    fail "gate must select the latest run at the exact PR head"
 grep -Fq 'NO_RESULT: re-dispatching ci.yml' "$workflow" ||
     fail "NO_RESULT must re-dispatch CI"
 grep -Fq '/force-cancel' "$workflow" ||
