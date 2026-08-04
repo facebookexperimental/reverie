@@ -912,6 +912,9 @@ impl TimerImpl {
         // retry harness can then classify it as skid rather than a real bug.
         if ctr_initial > target_rcb {
             get_pmu_config().emit_skid_overshoot_marker(ctr_initial, target_rcb);
+            // Structural, in-process signal (a guest cannot forge it) so an
+            // in-process classifier can causally attribute a divergence to skid.
+            reverie::record_skid_overshoot();
         }
         assert!(
             ctr_initial <= target_rcb,
