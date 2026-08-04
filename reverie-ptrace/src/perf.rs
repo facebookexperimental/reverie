@@ -380,6 +380,45 @@ impl PerfCounter {
         self.ctr_value()
     }
 
+    /// Read the current counter value using the `rdpmc` instruction, with no
+    /// syscall on the fast path even when the counter is *currently scheduled*
+    /// on the PMU (`index != 0`).
+    ///
+    /// This is an **additive read primitive** intended for **in-guest,
+    /// same-core** use: a guest thread reading its own performance counter from
+    /// user space. It changes only *how a counter value is read* — it does not
+    /// change how time or ordering is observed, and it does not alter the
+    /// behavior of [`ctr_value`](Self::ctr_value) or
+    /// [`ctr_value_fast`](Self::ctr_value_fast).
+    ///
+    /// # Correctness contract
+    ///
+    /// `rdpmc` reads the hardware PMC of *whatever core executes the
+    /// instruction*. It is therefore only correct when the calling thread is
+    /// the monitored thread running on the core the counter is scheduled on —
+    /// i.e. the guest reading itself in-guest. A cross-core reader (such as the
+    /// ptrace supervisor reading a stopped guest on another core) must NOT use
+    /// this; that is exactly why [`ctr_value_fast`](Self::ctr_value_fast)
+    /// deliberately falls back to the syscall read when `index != 0`.
+    ///
+    /// Falls back to the [`ctr_value`](Self::ctr_value) syscall read when:
+    /// * fast reads were not enabled on the [`Builder`],
+    /// * the kernel/CPU does not permit user-space `rdpmc` (`cap_user_rdpmc`),
+    /// * the counter is not currently scheduled (`index == 0`), or
+    /// * the target architecture is not x86-64.
+    // Additive in-guest read primitive; no in-tree caller yet (the in-guest
+    // patching backend that will use it is still being built).
+    #[allow(dead_code)]
+    pub fn ctr_value_rdpmc(&self) -> Result<u64, Errno> {
+        match self.mmap {
+            Some(ptr) => {
+                // SAFETY: self.mmap is constructed as the correct page or not at all
+                unsafe { self.ctr_value_rdpmc_loop(ptr) }
+            }
+            None => self.ctr_value_fallback(),
+        }
+    }
+
     /// Safety: `ptr` must refer to the metadata page corresponding to self.fd.
     #[deny(unsafe_op_in_unsafe_fn)]
     #[inline(always)]
@@ -447,10 +486,133 @@ impl PerfCounter {
         Ok(count as u64)
     }
 
+    /// Safety: `ptr` must refer to the metadata page corresponding to self.fd,
+    /// and the calling thread must be the monitored thread running on the core
+    /// the counter is scheduled on (see [`ctr_value_rdpmc`](Self::ctr_value_rdpmc)).
+    #[cfg(target_arch = "x86_64")]
+    #[allow(dead_code)]
+    #[deny(unsafe_op_in_unsafe_fn)]
+    #[inline(always)]
+    unsafe fn ctr_value_rdpmc_loop(
+        &self,
+        ptr: NonNull<perf::perf_event_mmap_page>,
+    ) -> Result<u64, Errno> {
+        use std::ptr::addr_of_mut;
+        let ptr = ptr.as_ptr();
+        // `pmc_width` and the capability bits are fixed for the lifetime of the
+        // mapping, so read them once outside the seqlock loop.
+        // SAFETY: ptr is a valid, aligned perf metadata page.
+        let width = unsafe { (*ptr).pmc_width } as u32;
+        // SAFETY: reading the raw `capabilities` word of the capability union.
+        let caps = unsafe { (*ptr).__bindgen_anon_1.capabilities };
+        // `cap_user_rdpmc` is bit 2 of the capability bitfield (after `cap_bit0`
+        // and `cap_bit0_is_deprecated`).
+        let cap_user_rdpmc = (caps >> 2) & 1 == 1;
+
+        let mut seq;
+        let mut running;
+        let mut enabled;
+        let mut count: i64;
+        // This mirrors the seqlock synchronization in `ctr_value_fast_loop`; see
+        // https://www.kernel.org/doc/html/latest/locking/seqlock.html and the
+        // rdpmc self-monitoring example in perf_event_open(2).
+        loop {
+            loop {
+                // SAFETY: ptr->lock is valid and aligned
+                seq = unsafe { read_once(addr_of_mut!((*ptr).lock)) };
+                if seq & 1 == 0 {
+                    break;
+                }
+            }
+            smp_rmb();
+            let index;
+            // SAFETY: these reads are synchronized by the seqlock; nothing is
+            // acted upon until the outer loop confirms serialization.
+            unsafe {
+                running = (*ptr).time_running;
+                enabled = (*ptr).time_enabled;
+                count = (*ptr).offset;
+                index = (*ptr).index;
+            }
+            if index != 0 {
+                if !cap_user_rdpmc {
+                    // Counter is live but user-space rdpmc is disabled; the only
+                    // correct read is the slow syscall path.
+                    return self.ctr_value_fallback();
+                }
+                // `index != 0` means the counter is scheduled on this core's
+                // PMU; read the raw hardware counter and add it to `offset`.
+                // Sign-extend the rdpmc result from `pmc_width` bits to 64 bits
+                // (arithmetic shifts on a signed value), exactly as the kernel's
+                // rdpmc self-monitoring example in perf_event_open(2) does: the
+                // hardware counter can wrap, and `offset` is chosen so that
+                // `offset + sign_extend(rdpmc)` is the current count mod 2^width.
+                // SAFETY: index-1 is the currently-scheduled PMC for this core,
+                // and cap_user_rdpmc confirmed user-space rdpmc is permitted.
+                let raw = unsafe { rdpmc(index - 1) };
+                let pmc = ((raw << (64 - width)) as i64) >> (64 - width);
+                count = count.wrapping_add(pmc);
+            }
+            smp_rmb();
+            // SAFETY: ptr->lock is valid and aligned
+            if seq == unsafe { read_once(addr_of_mut!((*ptr).lock)) } {
+                // Unchanged seq => our reads were not torn by a writer.
+                break;
+            }
+        }
+        if running != enabled {
+            // Non-equal running/enabled time means the event was descheduled at
+            // some point, making counts inaccurate and unrecoverable. Same
+            // condition the slow path detects as EOF when attr.pinned = 1.
+            panic!("rdpmc perf event was probably descheduled!")
+        }
+        Ok(count as u64)
+    }
+
+    /// Non-x86-64 fallback: there is no portable `rdpmc`, so always use the
+    /// syscall read.
+    #[cfg(not(target_arch = "x86_64"))]
+    #[allow(dead_code)]
+    #[inline(always)]
+    unsafe fn ctr_value_rdpmc_loop(
+        &self,
+        _ptr: NonNull<perf::perf_event_mmap_page>,
+    ) -> Result<u64, Errno> {
+        self.ctr_value_fallback()
+    }
+
     /// Return the underlying perf fd.
     pub fn raw_fd(&self) -> libc::c_int {
         self.fd
     }
+}
+
+/// Execute the `rdpmc` instruction to read hardware performance counter number
+/// `counter`. Returns the raw counter value (the low `pmc_width` bits are
+/// meaningful; higher bits are unspecified and must be masked by the caller).
+///
+/// SAFETY: the caller must ensure `counter` is the currently-scheduled PMC
+/// index for the calling core (i.e. `index - 1` from the perf mmap page) and
+/// that user-space `rdpmc` is permitted (`cap_user_rdpmc`). Executing `rdpmc`
+/// without user-space access enabled raises `#GP`.
+#[cfg(target_arch = "x86_64")]
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn rdpmc(counter: u32) -> u64 {
+    let lo: u32;
+    let hi: u32;
+    // SAFETY: rdpmc reads the counter selected by ecx into edx:eax and touches
+    // no memory or other registers.
+    unsafe {
+        core::arch::asm!(
+            "rdpmc",
+            in("ecx") counter,
+            out("eax") lo,
+            out("edx") hi,
+            options(nostack, preserves_flags),
+        );
+    }
+    ((hi as u64) << 32) | (lo as u64)
 }
 
 fn close_perf_fd(fd: libc::c_int) {
@@ -661,6 +823,115 @@ mod test {
         let ctr = pc.ctr_value().expect("perf test operation should succeed");
         assert!(ctr >= ITERS);
         assert!(ctr <= ITERS + 100); // `.disable()` overhead
+    }
+
+    /// The in-guest `rdpmc` read must agree with the syscall read. Because the
+    /// counter is live, we can't assert exact equality; instead we bracket the
+    /// rdpmc read between two syscall reads on the same (monotonic) thread and
+    /// require `before <= rdpmc <= after`.
+    #[test]
+    fn rdpmc_read_agrees_with_syscall_read() {
+        ret_without_perf!();
+        let pc = Builder::new(gettid().as_raw(), -1)
+            .sample_period(PerfCounter::DISABLE_SAMPLE_PERIOD)
+            .event(Event::Hardware(HardwareEvent::BranchInstructions))
+            .fast_reads(true)
+            .create()
+            .expect("perf test operation should succeed");
+        pc.reset().expect("perf test operation should succeed");
+        pc.enable().expect("perf test operation should succeed");
+
+        // Repeat so we exercise the live (`index != 0`) case, which requires the
+        // counter to be scheduled on this core when we read it.
+        for _ in 0..1000 {
+            do_branches(1000);
+            let before = pc.ctr_value().expect("syscall read");
+            let via_rdpmc = pc.ctr_value_rdpmc().expect("rdpmc read");
+            let after = pc.ctr_value().expect("syscall read");
+            assert!(
+                before <= via_rdpmc && via_rdpmc <= after,
+                "rdpmc read {via_rdpmc} not in bracket [{before}, {after}]"
+            );
+        }
+    }
+
+    /// Microbenchmark: cost of a single counter read via `rdpmc` (in-guest,
+    /// same-core, `index != 0` live case) versus the `read(2)` syscall fallback.
+    ///
+    /// Ignored by default because it prints timings rather than asserting on
+    /// them (timing is host-dependent). Run with:
+    ///   `cargo test -p reverie-ptrace --release perf::test::bench_rdpmc_vs_read \
+    ///        -- --ignored --nocapture`
+    ///
+    /// The counter self-monitors this thread, so it stays scheduled on this
+    /// core (`index != 0`) throughout — the exact case the ptrace fast path
+    /// deliberately punts to the syscall. If rdpmc had silently fallen back to
+    /// the syscall, the two timings would be equal; a large gap is itself proof
+    /// the rdpmc path was taken.
+    #[test]
+    #[ignore]
+    fn bench_rdpmc_vs_read() {
+        use std::time::Instant;
+        ret_without_perf!();
+        const LOOP: usize = 100_000; // reads per timed sample
+        const REPS: usize = 25; // independent timed samples
+        const WARMUP: usize = 5;
+
+        let pc = Builder::new(gettid().as_raw(), -1)
+            .sample_period(PerfCounter::DISABLE_SAMPLE_PERIOD)
+            .event(Event::Hardware(HardwareEvent::BranchInstructions))
+            .fast_reads(true)
+            .create()
+            .expect("perf create");
+        pc.reset().expect("perf reset");
+        pc.enable().expect("perf enable");
+
+        let time_loop = |read: &dyn Fn() -> u64| -> Vec<f64> {
+            let mut samples = Vec::with_capacity(REPS);
+            for rep in 0..(WARMUP + REPS) {
+                let start = Instant::now();
+                let mut acc = 0u64;
+                for _ in 0..LOOP {
+                    acc = acc.wrapping_add(std::hint::black_box(read()));
+                }
+                std::hint::black_box(acc);
+                let ns_per_op = start.elapsed().as_nanos() as f64 / LOOP as f64;
+                if rep >= WARMUP {
+                    samples.push(ns_per_op);
+                }
+            }
+            samples
+        };
+
+        let median = |mut v: Vec<f64>| -> f64 {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        let min = |v: &[f64]| v.iter().cloned().fold(f64::INFINITY, f64::min);
+
+        let rdpmc_s = time_loop(&|| pc.ctr_value_rdpmc().expect("rdpmc"));
+        let read_s = time_loop(&|| pc.ctr_value().expect("read"));
+
+        let rdpmc_med = median(rdpmc_s.clone());
+        let read_med = median(read_s.clone());
+        eprintln!("=== rdpmc vs read() microbenchmark ===");
+        eprintln!("host: self-monitoring thread, BranchInstructions, fast_reads=true");
+        eprintln!("loop size (reads/sample): {LOOP}");
+        eprintln!("reps (timed samples): {REPS} (+{WARMUP} warmup, discarded)");
+        eprintln!(
+            "rdpmc  (index!=0 live): min={:.1} ns  median={:.1} ns",
+            min(&rdpmc_s),
+            rdpmc_med
+        );
+        eprintln!(
+            "read() (syscall fallback): min={:.1} ns  median={:.1} ns",
+            min(&read_s),
+            read_med
+        );
+        eprintln!(
+            "gap (median read / median rdpmc): {:.1}x",
+            read_med / rdpmc_med
+        );
     }
 
     #[test]
