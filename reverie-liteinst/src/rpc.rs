@@ -1,7 +1,5 @@
 //! Coordinator RPC adapter for in-guest Reverie tools.
 
-use core::cell::UnsafeCell;
-use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicI32;
 use core::sync::atomic::Ordering;
 use std::io;
@@ -15,56 +13,8 @@ use reverie::Pid;
 use reverie_preload::trap::raw_syscall6;
 use reverie_rpc_transport::BlockingRpcClient;
 
-pub(crate) struct SpinMutex<T> {
-    held: AtomicBool,
-    value: UnsafeCell<T>,
-}
-
-impl<T> SpinMutex<T> {
-    pub(crate) const fn new(value: T) -> Self {
-        Self {
-            held: AtomicBool::new(false),
-            value: UnsafeCell::new(value),
-        }
-    }
-
-    pub(crate) fn lock(&self) -> SpinGuard<'_, T> {
-        while self
-            .held
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
-        SpinGuard { mutex: self }
-    }
-}
-
-unsafe impl<T: Send> Sync for SpinMutex<T> {}
-
-pub(crate) struct SpinGuard<'a, T> {
-    mutex: &'a SpinMutex<T>,
-}
-
-impl<T> core::ops::Deref for SpinGuard<'_, T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe { &*self.mutex.value.get() }
-    }
-}
-
-impl<T> core::ops::DerefMut for SpinGuard<'_, T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { &mut *self.mutex.value.get() }
-    }
-}
-
-impl<T> Drop for SpinGuard<'_, T> {
-    fn drop(&mut self) {
-        self.mutex.held.store(false, Ordering::Release);
-    }
-}
+// The async-signal-safe spinlock is shared across the in-guest tool hosts.
+pub(crate) use reverie_preload::sync::SpinMutex;
 
 struct RpcConnection<G: GlobalTool> {
     pid: Pid,

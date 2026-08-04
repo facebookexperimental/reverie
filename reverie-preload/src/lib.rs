@@ -20,6 +20,8 @@
 //! * [`fork`] — fork-following (the filter is inherited atomically; only
 //!   per-process state must be reset);
 //! * [`signal`] — signal multiplexing / reserved-signal policy;
+//! * [`sync`] — the async-signal-safe [`SpinMutex`](sync::SpinMutex) the
+//!   in-guest tool hosts use for RPC and per-thread state;
 //! * [`lifecycle`] — the [`LifecycleController`](lifecycle::LifecycleController)
 //!   seam that makes switching to a hybrid in-process-trap + ptrace backend an
 //!   additive change rather than a rewrite;
@@ -54,6 +56,7 @@ pub mod fork;
 pub mod lifecycle;
 pub mod seccomp;
 pub mod signal;
+pub mod sync;
 pub mod trap;
 
 #[cfg(feature = "coordinator-rpc")]
