@@ -15,7 +15,7 @@ fail() {
     exit 1
 }
 
-grep -Fq 'ref: 8ea20e121073e7c1fc3ce7a131a4950d7574ce42' "$workflow" ||
+grep -Fq 'ref: 4b78d727f35bc8612ac460a6e270dda5f5df304c' "$workflow" ||
     fail "gate must pin the canonical parent authority"
 grep -Fq 'python3 .dev-hermit-policy/ci-hub/check_outcome.py' "$workflow" ||
     fail "gate must call the canonical check-status classifier"

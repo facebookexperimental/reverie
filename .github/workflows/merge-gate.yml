@@ -122,7 +122,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: rrnewton/dev-hermit
-          ref: 8ea20e121073e7c1fc3ce7a131a4950d7574ce42
+          ref: 4b78d727f35bc8612ac460a6e270dda5f5df304c
           path: .dev-hermit-policy
           persist-credentials: false
       - name: Require PASSED CI or re-dispatch NO_RESULT
