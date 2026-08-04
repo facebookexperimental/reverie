@@ -1,11 +1,13 @@
 //! Coordinator RPC adapter for in-guest Reverie tools.
 
+use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicI32;
 use core::sync::atomic::Ordering;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Once;
 
 use reverie::GlobalRPC;
 use reverie::GlobalTool;
@@ -14,6 +16,37 @@ use reverie::Pid;
 pub(crate) use reverie_preload::sync::SpinMutex;
 use reverie_preload::trap::raw_syscall6;
 use reverie_rpc_transport::BlockingRpcClient;
+
+/// Set by a `pthread_atfork` child hook after this process forks. The guest RPC
+/// hot path consults this flag instead of issuing a `getpid` syscall on every
+/// hop: it is only ever set in a freshly forked child, so an ordinary
+/// (non-forking) round-trip performs no identity syscalls at all.
+static FORKED_SINCE_LAST_RPC: AtomicBool = AtomicBool::new(false);
+static FORK_DETECTOR_REGISTERED: Once = Once::new();
+
+/// `pthread_atfork` child callback. Runs in the freshly forked child in an
+/// async-signal-restricted context, so it does nothing but a single atomic
+/// store; the actual coordinator reconnect happens lazily on the child's next
+/// [`CoordinatorRpc::send_rpc`].
+extern "C" fn note_fork_in_child() {
+    FORKED_SINCE_LAST_RPC.store(true, Ordering::Release);
+}
+
+/// Install the fork detector exactly once per process. `pthread_atfork`
+/// registrations are inherited across `fork`, so descendants reuse it without
+/// re-registering. This covers the supported fork path — a single-threaded
+/// guest calling libc `fork()` — where the child handler is guaranteed to run
+/// before any child code (and thus before the child's first RPC). Thread clone,
+/// `clone3`, and `vfork` remain unsupported in tool mode.
+fn register_fork_detector() {
+    FORK_DETECTOR_REGISTERED.call_once(|| {
+        // SAFETY: `pthread_atfork` only records callbacks; `note_fork_in_child`
+        // is async-signal-safe (one relaxed-domain atomic store).
+        unsafe {
+            libc::pthread_atfork(None, None, Some(note_fork_in_child));
+        }
+    });
+}
 
 struct RpcConnection<G: GlobalTool> {
     pid: Pid,
@@ -41,6 +74,7 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
 
     /// Connect before installing seccomp and decode the coordinator config.
     pub fn connect(path: impl AsRef<Path>) -> io::Result<Self> {
+        register_fork_detector();
         let path = path.as_ref().to_path_buf();
         let pid = current_id(libc::SYS_getpid)?;
         let tid = current_id(libc::SYS_gettid)?;
@@ -60,17 +94,23 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
 #[reverie::tool]
 impl<G: GlobalTool> GlobalRPC<G> for CoordinatorRpc<G> {
     async fn send_rpc(&self, message: G::Request) -> G::Response {
-        let pid = current_id(libc::SYS_getpid).unwrap_or_else(|_| rpc_fatal(122));
-        let tid = current_id(libc::SYS_gettid).unwrap_or_else(|_| rpc_fatal(122));
         let mut connection = self.connection.lock();
-        if connection.pid != pid {
-            let client =
-                BlockingRpcClient::connect(&self.path, tid).unwrap_or_else(|_| rpc_fatal(123));
-            let new_fd = client.as_raw_fd();
-            let old_fd = self.fd.swap(new_fd, Ordering::AcqRel);
-            crate::runtime::replace_coordinator_fd(old_fd, new_fd)
-                .unwrap_or_else(|_| rpc_fatal(123));
-            *connection = RpcConnection { pid, client };
+        // Fork detection without a per-hop syscall: the common round-trip only
+        // reads the atfork flag. It is set exclusively in a freshly forked
+        // child, so `getpid`/`gettid` are issued only when a fork has actually
+        // happened and the inherited connection may still belong to the parent.
+        if FORKED_SINCE_LAST_RPC.swap(false, Ordering::AcqRel) {
+            let pid = current_id(libc::SYS_getpid).unwrap_or_else(|_| rpc_fatal(122));
+            if connection.pid != pid {
+                let tid = current_id(libc::SYS_gettid).unwrap_or_else(|_| rpc_fatal(122));
+                let client =
+                    BlockingRpcClient::connect(&self.path, tid).unwrap_or_else(|_| rpc_fatal(123));
+                let new_fd = client.as_raw_fd();
+                let old_fd = self.fd.swap(new_fd, Ordering::AcqRel);
+                crate::runtime::replace_coordinator_fd(old_fd, new_fd)
+                    .unwrap_or_else(|_| rpc_fatal(123));
+                *connection = RpcConnection { pid, client };
+            }
         }
         match connection.client.try_send_rpc(message) {
             Ok(response) => response,

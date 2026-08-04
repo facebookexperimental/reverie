@@ -127,17 +127,23 @@ fn write_message(stream: &mut UnixStream, payload: &[u8]) -> Result<(), RpcError
 }
 
 fn read_message(stream: &mut UnixStream, max_len: usize) -> Result<Vec<u8>, RpcError> {
+    // Read the 4-byte length prefix in one `read` on the common path. The loop
+    // only re-enters the kernel on a short read or `EINTR`, collapsing the
+    // former 1-byte probe + 3-byte remainder into a single syscall per hop.
     let mut header = [0u8; 4];
-    loop {
-        match stream.read(&mut header[..1]) {
-            Ok(0) => return Err(RpcError::Closed),
-            Ok(1) => break,
-            Ok(_) => unreachable!("one-byte read returned more than one byte"),
+    let mut filled = 0;
+    while filled < header.len() {
+        match stream.read(&mut header[filled..]) {
+            // A clean EOF exactly at a frame boundary is a graceful close;
+            // preserve the previous 1-byte-probe semantics.
+            Ok(0) if filled == 0 => return Err(RpcError::Closed),
+            // EOF partway through the header is a truncated frame.
+            Ok(0) => return Err(RpcError::Io(io::Error::from(io::ErrorKind::UnexpectedEof))),
+            Ok(n) => filled += n,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(RpcError::Io(error)),
         }
     }
-    stream.read_exact(&mut header[1..])?;
 
     let len = u32::from_be_bytes(header) as usize;
     if len > max_len {
