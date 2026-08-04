@@ -63,8 +63,11 @@ use core::task::Poll;
 use core::task::Waker;
 
 use reverie::Error;
+use reverie::Guest;
 use reverie::Pid;
+use reverie::Tool;
 use reverie::syscalls::Errno;
+use reverie::syscalls::Syscall;
 use reverie::syscalls::Sysno;
 
 const TAIL_NONE: u8 = 0;
@@ -204,49 +207,69 @@ pub enum DrivenSyscall {
 /// Drive a subscribed syscall's Tool handler to a terminal outcome, applying
 /// the `ERESTARTSYS` restart protocol (Reverie #362).
 ///
-/// `make_future` produces a fresh `handle_syscall_event` future on each call;
-/// it is re-invoked when the Tool asks to restart the syscall (Detcore's
-/// `wait4` scheduler poll). `number` is the subscribed syscall so the driver
-/// can decide — in exactly one place — which syscalls are restartable.
+/// The Tool's `handle_syscall_event` future is recreated — by reborrowing
+/// `guest` — each time the Tool asks to restart the syscall (Detcore's `wait4`
+/// scheduler poll). Taking `tool`/`guest`/`syscall` by reference rather than a
+/// caller-supplied `FnMut() -> Future` closure is deliberate: a closure that
+/// returned a future borrowing `guest` cannot satisfy `FnMut` (the borrow would
+/// escape the closure body), so the restart loop must own the re-invocation.
+/// `number` is the subscribed syscall so [`classify_outcome`] can decide — in
+/// exactly one place — which syscalls are restartable.
 ///
 /// The restart policy is intentionally narrow: only `wait4` restarts on a
 /// private `ERESTARTSYS`. Every other Tool/syscall — including Chaos Tool read
 /// injection — preserves an explicit `ERESTARTSYS` result to the guest.
-pub fn drive_tool_syscall<F>(
+pub fn drive_tool_syscall<T, G>(
+    tool: &T,
+    guest: &mut G,
+    syscall: Syscall,
     number: Sysno,
     tail: &TailResult,
-    mut make_future: impl FnMut() -> F,
 ) -> DrivenSyscall
 where
-    F: Future<Output = Result<i64, Error>>,
+    T: Tool,
+    G: Guest<T>,
 {
     loop {
-        match drive_syscall(make_future(), tail) {
-            SyscallOutcome::Return(Ok(value)) => return DrivenSyscall::Result(value),
-            SyscallOutcome::Return(Err(error)) => match error.into_errno() {
-                // Detcore uses wait4 as a restartable scheduler poll. The ptrace
-                // backend consumes this private errno through its kernel restart
-                // frame; a SIGSYS dispatcher must repeat the callback itself.
-                // Preserve explicit ERESTARTSYS results for other Tools/syscalls.
-                Ok(Errno::ERESTARTSYS) if number == Sysno::wait4 => continue,
-                Ok(errno) => return DrivenSyscall::Result(-(errno.into_raw() as i64)),
-                Err(error) => return DrivenSyscall::Fatal(error),
-            },
-            SyscallOutcome::Exit { number, args } => return DrivenSyscall::Exit { number, args },
-            SyscallOutcome::ForkChild {
-                parent_tid,
-                parent_pid,
-                child_tid,
-                child_pid,
-            } => {
-                return DrivenSyscall::ForkChild {
-                    parent_tid,
-                    parent_pid,
-                    child_tid,
-                    child_pid,
-                };
-            }
+        // Reborrow `guest` for a fresh future each restart; the future is
+        // consumed (and its borrow of `guest` released) inside `drive_syscall`.
+        let outcome = drive_syscall(tool.handle_syscall_event(guest, syscall), tail);
+        if let Some(driven) = classify_outcome(number, outcome) {
+            return driven;
         }
+    }
+}
+
+/// Map a single driven [`SyscallOutcome`] onto a terminal [`DrivenSyscall`], or
+/// `None` when the shared restart protocol requires re-running the Tool callback
+/// (a private `ERESTARTSYS` from Detcore's restartable `wait4` poll).
+///
+/// This isolates the whole restart *policy* in one pure, directly testable
+/// place; [`drive_tool_syscall`] owns only the re-invocation loop around it.
+fn classify_outcome(number: Sysno, outcome: SyscallOutcome) -> Option<DrivenSyscall> {
+    match outcome {
+        SyscallOutcome::Return(Ok(value)) => Some(DrivenSyscall::Result(value)),
+        SyscallOutcome::Return(Err(error)) => match error.into_errno() {
+            // Detcore uses wait4 as a restartable scheduler poll. The ptrace
+            // backend consumes this private errno through its kernel restart
+            // frame; a SIGSYS dispatcher must repeat the callback itself.
+            // Preserve explicit ERESTARTSYS results for other Tools/syscalls.
+            Ok(Errno::ERESTARTSYS) if number == Sysno::wait4 => None,
+            Ok(errno) => Some(DrivenSyscall::Result(-(errno.into_raw() as i64))),
+            Err(error) => Some(DrivenSyscall::Fatal(error)),
+        },
+        SyscallOutcome::Exit { number, args } => Some(DrivenSyscall::Exit { number, args }),
+        SyscallOutcome::ForkChild {
+            parent_tid,
+            parent_pid,
+            child_tid,
+            child_pid,
+        } => Some(DrivenSyscall::ForkChild {
+            parent_tid,
+            parent_pid,
+            child_tid,
+            child_pid,
+        }),
     }
 }
 
@@ -379,46 +402,31 @@ mod tests {
         assert!(tail.take().is_none());
     }
 
+    // The restart *policy* lives in `classify_outcome`; `drive_tool_syscall`'s
+    // signature (`tool`/`guest`/`syscall` by reference) needs a real Tool+Guest
+    // to exercise, so its restart loop is verified through this pure helper.
+
     #[test]
-    fn drive_tool_syscall_returns_a_result() {
-        let tail = TailResult::default();
-        match drive_tool_syscall(Sysno::read, &tail, || async { Ok::<i64, Error>(5) }) {
-            DrivenSyscall::Result(value) => assert_eq!(value, 5),
+    fn classify_outcome_returns_a_ready_result() {
+        match classify_outcome(Sysno::read, SyscallOutcome::Return(Ok(5))) {
+            Some(DrivenSyscall::Result(value)) => assert_eq!(value, 5),
             _ => panic!("expected a driven result"),
         }
     }
 
     #[test]
-    fn drive_tool_syscall_restarts_wait4_on_erestartsys() {
-        let tail = TailResult::default();
-        let calls = core::cell::Cell::new(0_u32);
-        let outcome = drive_tool_syscall(Sysno::wait4, &tail, || {
-            let attempt = calls.get();
-            calls.set(attempt + 1);
-            async move {
-                if attempt == 0 {
-                    Err(Error::from(Errno::ERESTARTSYS))
-                } else {
-                    Ok(9)
-                }
-            }
-        });
-        match outcome {
-            DrivenSyscall::Result(value) => assert_eq!(value, 9),
-            _ => panic!("expected the restarted result"),
-        }
-        // The first ERESTARTSYS restarted the callback; the second resolved it.
-        assert_eq!(calls.get(), 2);
+    fn classify_outcome_restarts_wait4_on_erestartsys() {
+        // A private ERESTARTSYS from wait4 asks the driver to re-run the
+        // callback: no terminal outcome, so the loop restarts.
+        let outcome = SyscallOutcome::Return(Err(Error::from(Errno::ERESTARTSYS)));
+        assert!(classify_outcome(Sysno::wait4, outcome).is_none());
     }
 
     #[test]
-    fn drive_tool_syscall_preserves_erestartsys_for_non_wait4() {
-        let tail = TailResult::default();
-        let outcome = drive_tool_syscall(Sysno::read, &tail, || async {
-            Err::<i64, Error>(Error::from(Errno::ERESTARTSYS))
-        });
-        match outcome {
-            DrivenSyscall::Result(value) => {
+    fn classify_outcome_preserves_erestartsys_for_non_wait4() {
+        let outcome = SyscallOutcome::Return(Err(Error::from(Errno::ERESTARTSYS)));
+        match classify_outcome(Sysno::read, outcome) {
+            Some(DrivenSyscall::Result(value)) => {
                 assert_eq!(value, -(Errno::ERESTARTSYS.into_raw() as i64));
             }
             _ => panic!("expected ERESTARTSYS surfaced to the guest"),
@@ -426,18 +434,41 @@ mod tests {
     }
 
     #[test]
-    fn drive_tool_syscall_surfaces_a_parked_fork_child() {
-        let tail = TailResult::default();
-        tail.set_fork_child(
-            Pid::from_raw(1),
-            Pid::from_raw(2),
-            Pid::from_raw(3),
-            Pid::from_raw(4),
-        );
-        match drive_tool_syscall(Sysno::clone, &tail, || {
-            core::future::pending::<Result<i64, Error>>()
-        }) {
-            DrivenSyscall::ForkChild { child_pid, .. } => assert_eq!(child_pid.as_raw(), 4),
+    fn classify_outcome_surfaces_an_errno() {
+        let outcome = SyscallOutcome::Return(Err(Error::from(Errno::ENOSYS)));
+        match classify_outcome(Sysno::read, outcome) {
+            Some(DrivenSyscall::Result(value)) => {
+                assert_eq!(value, -(Errno::ENOSYS.into_raw() as i64));
+            }
+            _ => panic!("expected the errno negated into the result"),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_passes_through_an_exit() {
+        let outcome = SyscallOutcome::Exit {
+            number: libc::SYS_exit_group,
+            args: [3, 0, 0, 0, 0, 0],
+        };
+        match classify_outcome(Sysno::exit_group, outcome) {
+            Some(DrivenSyscall::Exit { number, args }) => {
+                assert_eq!(number, libc::SYS_exit_group);
+                assert_eq!(args[0], 3);
+            }
+            _ => panic!("expected the exit passed through"),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_passes_through_a_fork_child() {
+        let outcome = SyscallOutcome::ForkChild {
+            parent_tid: Pid::from_raw(1),
+            parent_pid: Pid::from_raw(2),
+            child_tid: Pid::from_raw(3),
+            child_pid: Pid::from_raw(4),
+        };
+        match classify_outcome(Sysno::clone, outcome) {
+            Some(DrivenSyscall::ForkChild { child_pid, .. }) => assert_eq!(child_pid.as_raw(), 4),
             _ => panic!("expected a fork-child transition"),
         }
     }

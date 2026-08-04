@@ -1,17 +1,9 @@
 //! Generic in-guest host for Reverie tools.
 
-use core::future::Future;
-use core::sync::atomic::AtomicI64;
-use core::sync::atomic::AtomicU8;
-use core::sync::atomic::AtomicU64;
-use core::sync::atomic::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io;
 use std::path::Path;
-use std::task::Context;
-use std::task::Poll;
-use std::task::Waker;
 
 use reverie::Error;
 use reverie::GlobalRPC;
@@ -30,6 +22,10 @@ use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallArgs;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
+use reverie_preload::tool_host::DrivenSyscall;
+use reverie_preload::tool_host::TailResult;
+use reverie_preload::tool_host::drive_ready;
+use reverie_preload::tool_host::drive_tool_syscall;
 use reverie_preload::trap::raw_syscall6;
 
 use crate::rpc::CoordinatorRpc;
@@ -38,10 +34,6 @@ use crate::runtime;
 use crate::runtime::SyscallEvent;
 
 const STACK_CAPACITY: usize = 4096;
-const TAIL_NONE: u8 = 0;
-const TAIL_RESULT: u8 = 1;
-const TAIL_EXIT: u8 = 2;
-const TAIL_FORK_CHILD: u8 = 3;
 
 static COMMITTED_STACKS: SpinMutex<Vec<Box<[u8]>>> = SpinMutex::new(Vec::new());
 
@@ -310,63 +302,50 @@ where
             SyscallArgs::new(args[0], args[1], args[2], args[3], args[4], args[5]),
         );
 
-        loop {
-            match drive_syscall(tool.handle_syscall_event(&mut guest, syscall), &tail) {
-                SyscallOutcome::Return(Ok(value)) => {
-                    guest.event.result = value;
-                    break;
-                }
-                SyscallOutcome::Return(Err(error)) => match error.into_errno() {
-                    // Detcore uses wait4 as a restartable scheduler poll. The
-                    // ptrace backend consumes this private errno through its
-                    // kernel restart frame; a SIGSYS dispatcher must repeat the
-                    // callback itself. Preserve explicit ERESTARTSYS results for
-                    // other Tools/syscalls, including Chaos Tool read injection.
-                    Ok(Errno::ERESTARTSYS) if number == Sysno::wait4 => continue,
-                    Ok(errno) => {
-                        guest.event.result = -(errno.into_raw() as i64);
-                        break;
-                    }
-                    Err(error) => tool_fatal(125, &error),
-                },
-                SyscallOutcome::Exit { number, args } => {
-                    finish_tool_exit(
-                        &mut tool_slot,
-                        &mut states,
-                        &self.rpc,
-                        self.stats,
-                        ToolExitContext {
-                            tid,
-                            pid,
-                            number,
-                            args,
-                        },
-                    );
-                    event.result = unsafe { raw_syscall6(number, args) };
-                    break;
-                }
-                SyscallOutcome::ForkChild {
-                    parent_tid,
-                    parent_pid,
-                    child_tid,
-                    child_pid,
-                } => {
-                    finish_fork_child(
-                        &mut tool_slot,
-                        &mut states,
-                        &self.rpc,
-                        self.stats,
-                        event,
-                        ForkChildContext {
-                            parent_tid,
-                            parent_pid,
-                            child_tid,
-                            child_pid,
-                        },
-                    );
-                    break;
-                }
+        // Drive the Tool handler to a terminal outcome. The shared driver owns
+        // the wait4/ERESTARTSYS restart protocol (Reverie #362) so it cannot
+        // drift between the in-guest backends; this host maps each terminal
+        // outcome onto its own per-thread lifecycle (exit/fork-child) state.
+        match drive_tool_syscall(tool, &mut guest, syscall, number, &tail) {
+            DrivenSyscall::Result(value) => {
+                guest.event.result = value;
             }
+            DrivenSyscall::Exit { number, args } => {
+                finish_tool_exit(
+                    &mut tool_slot,
+                    &mut states,
+                    &self.rpc,
+                    self.stats,
+                    ToolExitContext {
+                        tid,
+                        pid,
+                        number,
+                        args,
+                    },
+                );
+                event.result = unsafe { raw_syscall6(number, args) };
+            }
+            DrivenSyscall::ForkChild {
+                parent_tid,
+                parent_pid,
+                child_tid,
+                child_pid,
+            } => {
+                finish_fork_child(
+                    &mut tool_slot,
+                    &mut states,
+                    &self.rpc,
+                    self.stats,
+                    event,
+                    ForkChildContext {
+                        parent_tid,
+                        parent_pid,
+                        child_tid,
+                        child_pid,
+                    },
+                );
+            }
+            DrivenSyscall::Fatal(error) => tool_fatal(125, &error),
         }
     }
 }
@@ -486,135 +465,6 @@ fn raw_pid(number: i64) -> Pid {
         fatal(126);
     }
     Pid::from_raw(value as i32)
-}
-
-fn drive_ready<F, T>(future: F) -> T
-where
-    F: Future<Output = T>,
-{
-    let mut future = std::pin::pin!(future);
-    let waker = Waker::noop();
-    let mut context = Context::from_waker(waker);
-    loop {
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(value) => return value,
-            Poll::Pending => core::hint::spin_loop(),
-        }
-    }
-}
-
-enum SyscallOutcome {
-    Return(Result<i64, Error>),
-    Exit {
-        number: i64,
-        args: [u64; 6],
-    },
-    ForkChild {
-        parent_tid: Pid,
-        parent_pid: Pid,
-        child_tid: Pid,
-        child_pid: Pid,
-    },
-}
-
-enum TailAction {
-    Result(i64),
-    Exit {
-        number: i64,
-        args: [u64; 6],
-    },
-    ForkChild {
-        parent_tid: Pid,
-        parent_pid: Pid,
-        child_tid: Pid,
-        child_pid: Pid,
-    },
-}
-
-fn drive_syscall<F>(future: F, tail: &TailResult) -> SyscallOutcome
-where
-    F: Future<Output = Result<i64, Error>>,
-{
-    let mut future = std::pin::pin!(future);
-    let waker = Waker::noop();
-    let mut context = Context::from_waker(waker);
-    loop {
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(value) => return SyscallOutcome::Return(value),
-            Poll::Pending => match tail.take() {
-                Some(TailAction::Result(value)) => {
-                    return SyscallOutcome::Return(Ok(value));
-                }
-                Some(TailAction::Exit { number, args }) => {
-                    return SyscallOutcome::Exit { number, args };
-                }
-                Some(TailAction::ForkChild {
-                    parent_tid,
-                    parent_pid,
-                    child_tid,
-                    child_pid,
-                }) => {
-                    return SyscallOutcome::ForkChild {
-                        parent_tid,
-                        parent_pid,
-                        child_tid,
-                        child_pid,
-                    };
-                }
-                None => core::hint::spin_loop(),
-            },
-        }
-    }
-}
-
-#[derive(Default)]
-struct TailResult {
-    action: AtomicU8,
-    value: AtomicI64,
-    number: AtomicI64,
-    args: [AtomicU64; 6],
-}
-
-impl TailResult {
-    fn set_result(&self, value: i64) {
-        self.value.store(value, Ordering::Relaxed);
-        self.action.store(TAIL_RESULT, Ordering::Release);
-    }
-
-    fn set_exit(&self, number: i64, args: [u64; 6]) {
-        self.number.store(number, Ordering::Relaxed);
-        for (destination, value) in self.args.iter().zip(args) {
-            destination.store(value, Ordering::Relaxed);
-        }
-        self.action.store(TAIL_EXIT, Ordering::Release);
-    }
-
-    fn set_fork_child(&self, parent_tid: Pid, parent_pid: Pid, child_tid: Pid, child_pid: Pid) {
-        self.number
-            .store(i64::from(parent_tid.as_raw()), Ordering::Relaxed);
-        self.value
-            .store(i64::from(parent_pid.as_raw()), Ordering::Relaxed);
-        self.args[0].store(child_tid.as_raw() as u64, Ordering::Relaxed);
-        self.args[1].store(child_pid.as_raw() as u64, Ordering::Relaxed);
-        self.action.store(TAIL_FORK_CHILD, Ordering::Release);
-    }
-
-    fn take(&self) -> Option<TailAction> {
-        match self.action.swap(TAIL_NONE, Ordering::AcqRel) {
-            TAIL_RESULT => Some(TailAction::Result(self.value.load(Ordering::Relaxed))),
-            TAIL_EXIT => Some(TailAction::Exit {
-                number: self.number.load(Ordering::Relaxed),
-                args: std::array::from_fn(|index| self.args[index].load(Ordering::Relaxed)),
-            }),
-            TAIL_FORK_CHILD => Some(TailAction::ForkChild {
-                parent_tid: Pid::from_raw(self.number.load(Ordering::Relaxed) as i32),
-                parent_pid: Pid::from_raw(self.value.load(Ordering::Relaxed) as i32),
-                child_tid: Pid::from_raw(self.args[0].load(Ordering::Relaxed) as i32),
-                child_pid: Pid::from_raw(self.args[1].load(Ordering::Relaxed) as i32),
-            }),
-            _ => None,
-        }
-    }
 }
 
 struct LiteinstGuest<'a, T: Tool> {
