@@ -743,7 +743,7 @@ fn execute_basic_syscall_with_output(
     } else if number == libc::SYS_getrandom as u64 {
         getrandom(memory, state.tid, args[0], args[1])
     } else if number == libc::SYS_clock_gettime as u64 {
-        write_bytes(memory, args[1], &[0; 16])
+        clock_gettime(memory, state, args)
     } else if number == libc::SYS_nanosleep as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         nanosleep(memory, args)
@@ -8719,6 +8719,19 @@ fn validate_sleep_request(memory: &GuestMemory, address: u64) -> i64 {
     }
 }
 
+fn clock_gettime(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    let nanoseconds = state.logical_clock_ns;
+    let time = libc::timespec {
+        tv_sec: (nanoseconds / 1_000_000_000) as libc::time_t,
+        tv_nsec: (nanoseconds % 1_000_000_000) as libc::c_long,
+    };
+    let result = write_struct(memory, args[1], &time);
+    if result == 0 {
+        state.logical_clock_ns = state.logical_clock_ns.saturating_add(1);
+    }
+    result
+}
+
 fn gettimeofday(memory: &mut GuestMemory, args: &[u64; 6]) -> i64 {
     if args[0] != 0 {
         let timeval = libc::timeval {
@@ -9656,6 +9669,7 @@ mod tests {
             pid: 1,
             tid: 1,
             ppid: 0,
+            logical_clock_ns: 0,
             umask: 0o022,
             random_seed: 0,
             keep_capabilities: false,
@@ -9749,6 +9763,41 @@ mod tests {
         // getcwd includes the trailing NUL in its returned length.
         assert_eq!(bytes.pop(), Some(0));
         PathBuf::from(std::ffi::OsString::from_vec(bytes))
+    }
+
+    #[test]
+    fn clock_gettime_advances_private_logical_clock_after_successful_write() {
+        const TIME: u64 = 0x100;
+
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+
+        for expected_nanoseconds in [0, 1] {
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_clock_gettime,
+                    [libc::CLOCK_MONOTONIC as u64, TIME, 0, 0, 0, 0],
+                ),
+                0
+            );
+            let time: libc::timespec = read_struct(&memory, TIME);
+            assert_eq!(time.tv_sec, 0);
+            assert_eq!(time.tv_nsec, expected_nanoseconds);
+        }
+
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_clock_gettime,
+                [libc::CLOCK_MONOTONIC as u64, PAGE_SIZE, 0, 0, 0, 0,],
+            ),
+            negative_errno(libc::EFAULT)
+        );
+        assert_eq!(state.logical_clock_ns, 2);
     }
 
     #[test]
