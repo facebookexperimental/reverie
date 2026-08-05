@@ -80,7 +80,7 @@ while [[ $# -gt 0 ]]; do
         --no-label-pr) LABEL_PR=0; shift ;;
         -h|--help)
             echo "Usage: ./validate.sh [--label-pr|--no-label-pr]"
-            echo "A green run labels the current PR locally-validated by default."
+            echo "A green exact-head run writes a receipt; the optional PR label is derived cache."
             exit 0
             ;;
         *)
@@ -370,6 +370,7 @@ readonly -a REGULAR_TEST_SKIP_ARGS=(
     --skip tests::uid_namespace
 )
 
+run_check "Cross-client skill discovery" "$ROOT_DIR/scripts/check-skill-discovery.rs"
 run_check "Merge-gate policy" "$ROOT_DIR/scripts/check-merge-gate-policy.sh"
 run_check "Build workspace" cargo build --workspace --all-features
 run_check "Test regular workspace cases" cargo test --workspace --all-features \

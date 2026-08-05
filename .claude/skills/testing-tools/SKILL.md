@@ -13,20 +13,26 @@ see the Assurance Levels table in `AGENTS.md`).
 
 ## The canonical gate: `./validate.sh`
 
-`validate.sh` is the CI-equivalent gate; a green run labels a PR locally
-validated. It sets `RUSTFLAGS` (`-D warnings` plus an lzma link arg) and runs, in
-order:
+`validate.sh` is the local repository gate. It writes an exact-SHA receipt and may
+apply a derived `locally-validated` label; the label is only a cache. It sets
+`RUSTFLAGS` (`-D warnings` plus an lzma link arg) and runs, in order:
 
-1. **Build** — `cargo build --workspace --all-features`
-2. **Test** — `cargo test --workspace --all-features` with `--skip` for
+1. **Skill discovery** — `scripts/check-skill-discovery.rs`
+2. **Merge policy** — `scripts/check-merge-gate-policy.sh`
+3. **Build** — `cargo build --workspace --all-features`
+4. **Test** — `cargo test --workspace --all-features` with `--skip` for
    host-dependent cases (see list below)
-3. **Doc tests** — `cargo test --workspace --doc`
-4. **Clippy** — `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-5. **Rustfmt** — `cargo fmt --all -- --check`
+5. **Doc tests** — `cargo test --workspace --doc`
+6. **Clippy** — `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+7. **Rustfmt** — `cargo fmt --all -- --check`
 
-Run all five before opening or updating a PR. The GitHub-hosted **Regular tests**
-job is the required CI check; **Host-dependent tests** run only when
-`REVERIE_SELF_HOSTED=true` and a matching self-hosted runner is registered.
+Use focused tests while editing, then run this full local gate once at the
+final committed head. For landing, Reverie's current authoritative
+`merge-gate-v2` must dereference exact-head passing results for both
+`Regular tests (GitHub-hosted)` and `Host-dependent tests (self-hosted)`. A
+local receipt or `locally-validated` label is supplemental cache evidence, not
+landing authority; missing, skipped, stale, or failed authoritative jobs are
+not green.
 
 ## Package-scoped iteration
 

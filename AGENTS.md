@@ -15,11 +15,12 @@ that must also be reflected in the generated source.
 
 ## Architecture Overview
 
-This is the coordinator-level map; the `.claude/skills/` files
-(`reverie-architecture`, `syscall-interception`, `adding-a-backend`,
-`testing-tools`, surfaced via `.llms/skills` and `.agents/skills`) are the
-task-level detail. **Read `reverie-architecture` before working anywhere in the
-tree.**
+This is the coordinator-level map; the canonical `.claude/skills/` files
+(`reverie-architecture`, `syscall-interception`, `adding-a-backend`, and
+`testing-tools`) are the task-level detail. Claude reads them through
+`.llms/skills`; stock Codex reads the structured
+`.agents/skills/<name>/SKILL.md` package links. **Read `reverie-architecture`
+before working anywhere in the tree.**
 
 Reverie is a Linux **process-instrumentation framework**: you write a *tool*
 against a small, backend-agnostic contract, and a *backend* runs a guest process
@@ -69,19 +70,17 @@ executor services — see the `adding-a-backend` skill.
 
 ## Required Workspace Layout
 
-The dev-hermit workspace has one Reverie primary checkout and up to five
-canonical nested slots:
+The dev-hermit workspace uses nested layout v3: one Reverie primary checkout
+and registered named slots that contain every product checkout:
 
 ```text
 ~/work/dev-hermit/
 |-- reverie/                  primary checkout; main integration only
 `-- worktrees/
-    |-- slot01/
-    |   `-- reverie/
-    |-- slot02/
-    |   `-- reverie/
-    `-- slotNN/
-        `-- reverie/
+    `-- <slot>/
+        |-- hermit/
+        |-- reverie/
+        `-- liteinst2/
 ```
 
 - The primary checkout stays on `main` and is mutated only by the landing
@@ -90,10 +89,15 @@ canonical nested slots:
   slot. Never do feature work in the primary checkout.
 - Slot names are intentionally unrelated to branch names. A slot is reusable;
   a feature branch remains descriptive and task-specific.
-- The parent harness permits at most five warm slots; use its registry and
-  provisioning policy rather than creating product worktrees directly.
-- An idle slot is clean and at detached HEAD. An active slot has exactly one
-  feature branch and one mutating agent.
+- The parent permits at most twelve active worktrees and five clean parked
+  slots. `worktrees/ACTIVE.md` records every active agent, task, branch, and
+  owned path.
+- Provision and release only through the parent
+  `scripts/allocate-worktree.rs` and `scripts/release-worktree.rs`; never create
+  a product worktree directly.
+- A parked slot is clean and detached at the parent-pinned gitlink. An active
+  slot has one mutating owner unless the registry explicitly records disjoint
+  shared ownership.
 
 Use `git worktree list --porcelain` to inspect ownership. A branch may be
 checked out in only one worktree.
@@ -108,8 +112,10 @@ Every mutating agent must follow these rules:
 4. Do not share a slot with another mutating agent.
 5. Do not overwrite, reset, remove, or include changes you did not create.
 6. Keep generated files, scratch output, and build artifacts out of Git.
-7. End with a clean worktree. Durable work is committed when the task permits;
-   otherwise preserve it in a named stash and report the recovery command.
+7. End with all intended work committed on the task feature branch. Never use
+   a stash as a handoff.
+8. Register the slot and ownership in the parent before the first edit; do not
+   use raw `git worktree add`, move, or removal commands.
 
 Never use `git clean`, `git reset --hard`, `git checkout -- <path>`, or
 similar discard operations to make a checkout look clean. Unexpected changes
@@ -117,34 +123,35 @@ belong to another agent until proven otherwise.
 
 ## Starting A Task
 
-The coordinator assigns an idle slot. Before editing:
+The coordinator assigns an idle slot from the dev-hermit root before editing:
 
 ```bash
-PRIMARY=~/work/dev-hermit/reverie
-SLOT=~/work/dev-hermit/worktrees/slot01/reverie
-BRANCH=impl-example
-
-git -C "$PRIMARY" status --short --branch
-git -C "$SLOT" status --short --branch
-git -C "$SLOT" fetch origin
-git -C "$SLOT" switch --detach origin/main
-git -C "$SLOT" switch -c "$BRANCH"
+with-proxy git -C reverie fetch origin main
+test "$(git -C reverie rev-parse HEAD)" = \
+  "$(git -C reverie rev-parse origin/main)"
+./scripts/allocate-worktree.rs \
+  --agent <agent> --slot <slot> --task <task-id> --product all \
+  --reverie-branch <descriptive-feature-branch> \
+  --purpose "<one-line outcome>"
+git -C worktrees/<slot>/hermit switch --detach "$(git rev-parse HEAD:hermit)"
+git -C worktrees/<slot>/liteinst2 switch --detach "$(git rev-parse HEAD:liteinst2)"
 ```
 
-Both status checks must be clean. If the intended branch already exists and is
-not checked out elsewhere, switch to it instead of creating it:
+The coordinator first verifies that all three primaries are clean, on `main`,
+and current under the parent guide. Fetching and comparing Reverie's target ref
+before allocation ensures the new Reverie branch cannot start from a stale
+`origin/main`; `--product all` creates the required nested slot shape. Detaching
+the unchanged children at the parent gitlinks preserves the recorded Hermit and
+LiteInst2 inputs instead of applying one global start point to all products. The
+allocator verifies and records ownership. In the assigned
+`worktrees/<slot>/reverie`, confirm a clean status and verify that the dedicated
+feature branch starts at current `origin/main` unless the task names another
+base. Run every mutating command with that slot as the explicit working
+directory.
 
-```bash
-git -C "$SLOT" switch "$BRANCH"
-```
-
-Create feature branches from current `origin/main` unless the task explicitly
-names a different base. Record the slot, branch, and task purpose in the task
-note before the first edit. Run all mutating commands with the slot as the
-working directory.
-
-If all parent slots are active, do not fall back to the primary checkout. Wait
-for a slot or obtain explicit approval for a temporary worktree.
+If no slot is available, do not fall back to the primary checkout or create a
+non-canonical path. The coordinator must reclaim a clean parked slot or finish
+existing work first.
 
 ## While Working
 
@@ -185,27 +192,16 @@ A worker handoff must include:
 - known failures or untested behavior;
 - a clean `git status --short`.
 
-If the task authorizes commits, commit only the task's files on its feature
-branch. If committing is not authorized, preserve all task files, including
-untracked files, in a clearly named stash:
+Commit only the task-owned files on the dedicated feature branch, push with an
+explicit refspec, and open a draft PR unless the task explicitly forbids
+publication. The author owns review fixes, rebases, exact-head revalidation,
+and shepherding through landing.
 
-```bash
-git stash push -u -m "<agent/task>: <plain summary>" -- <task-paths...>
-git stash show --stat --include-untracked stash@{0}
-```
-
-Post the stash name and contents in the task note. Never drop another agent's
-stash.
-
-After the work has landed or been safely preserved, release the slot:
-
-```bash
-git -C ~/work/dev-hermit/worktrees/slot01/reverie status --short
-git -C ~/work/dev-hermit/worktrees/slot01/reverie switch --detach origin/main
-```
-
-Do not detach a dirty worktree. Do not delete permanent slot worktrees; their
-build caches are intentionally reusable.
+Only the coordinator closes or parks the slot. After the intended work is
+committed and handed off, record exact SHAs and validation in
+`worktrees/ARCHIVED.md`, then use the parent
+`scripts/release-worktree.rs`. Never detach, delete, or repurpose a dirty slot;
+a dirty recovery requires a documented recovery SHA.
 
 ## Precise Communication
 
@@ -231,8 +227,8 @@ explicitly. The ladder is cumulative; each level presupposes the ones below it:
 | --- | --- | --- |
 | L0 | Builds and tests pass | `cargo test --workspace --all-features` exits 0 |
 | L1 | Runs deterministically under strict mode | `hermit run --strict` |
-| L2 | Bitwise-identical repeat run | `hermit run --strict --verify` |
-| L3 | Memory determinism | `hermit run --strict --verify --detlog-heap --detlog-stack` |
+| L2 | Strict repeat parity | `hermit run --strict --verify --verify-strict --verify-json REPORT.json -- PROGRAM` compares exit status/stdout/stderr exactly and INFO messages under the declared canonical policy; the JSON result must report `bitwise_parity: true`, `compared_log_messages.left > 0`, and `compared_log_messages.right > 0`; KVM's output-only fallback cannot claim L2 |
+| L3 | Memory determinism | L2's strict command and JSON predicate, adding `--detlog-heap --detlog-stack` before `-- PROGRAM` |
 | L4 | Stress-hardened | L2/L3 repeated 20x with no divergence |
 
 A Reverie-only change is floored at L0 (the Reverie suite green); it does not
@@ -251,6 +247,17 @@ Every result about a run states, explicitly:
 A non-strict result never counts as "passing" on its own. If a run used
 `--no-strict` or any other relaxation, label it as such and do not present it
 as a determinism guarantee.
+
+Default `--verify` uses the lossy `Stripped` comparator and cannot establish
+L2. `--verify-strict` preserves virtual-time values, retired-branch counts,
+syscall arguments/results, sizes, flags, and other numeric INFO payloads. Its
+declared canonical envelope still removes irreproducible wall-clock prefixes
+and maps host addresses by first appearance, so report that envelope rather
+than calling the log files literally byte-identical. L2 additionally requires
+the `--verify-json` consumer predicate: `bitwise_parity` must be true and both
+`compared_log_messages.left` and `.right` must be greater than zero. A more
+aggressively normalized comparison may localize a divergence, but it is not L2
+evidence.
 
 ### Completion Reports
 
@@ -296,16 +303,15 @@ When a checkout is unexpectedly dirty:
 2. Inspect `git status`, `git diff`, untracked files, current branch, and
    worktree ownership.
 3. Attribute paths by task and agent. Do not combine unrelated changes.
-4. Preserve each attributed group separately with a path-scoped named stash,
-   including `-u` for untracked files.
-5. Verify each stash with
-   `git stash show --stat --include-untracked <stash>`.
-6. Record stash names, branch provenance, and recovery instructions in task
-   notes.
-7. Confirm the checkout is clean before assigning it again.
+4. Have the owning agent commit every coherent intended change to its feature
+   or recovery branch. Do not stash, reset, clean, or absorb it into another
+   task.
+5. Record the recovery SHA, branch provenance, owned paths, and remaining
+   blocker in the parent registry and task notes.
+6. Keep the slot active until the state is cleanly handed off; only the
+   coordinator may release or reclaim it through the registry-aware script.
 
-Ambiguous files must be preserved and reported, not guessed away. Stashing is
-a recovery mechanism, not the normal multi-agent workflow.
+Ambiguous files must be preserved and reported, not guessed away.
 
 ## Git And Pull Request Workflow
 
@@ -324,12 +330,18 @@ feature branches -> rrnewton/reverie main -> periodic upstream pull request
 - Run focused validation and the applicable formatting, lint, and test gates.
 - Push the feature branch to `origin` and open the pull request against fork
   `main`; do not target upstream for routine CI iteration.
-- Require the GitHub-hosted **Regular tests** job to pass at the PR head.
-- The **Host-dependent tests** job is enabled by setting the repository
-  variable `REVERIE_SELF_HOSTED=true` after a matching runner is registered.
-- Only an authorized coordinator lands changes and updates the parent gitlink;
-  use a reviewed pull request or an explicitly authorized fast-forward.
-- Never force-push `main`, rewrite shared branches, or merge around failing CI.
+- The PR author owns review fixes, rebases, and exact-head validation through
+  landing. Do not hand ordinary queue work to a separate lander.
+- Reverie's current authoritative landing gate is `merge-gate-v2` at the exact
+  PR head. It dereferences both `Regular tests (GitHub-hosted)` and
+  `Host-dependent tests (self-hosted)` and requires both to pass. A local
+  validation receipt, `locally-validated` label, raw exit, or copied comment is
+  supplemental evidence only and cannot authorize landing. Await the two
+  authoritative jobs; a missing, skipped, stale, or failed result is not green.
+- Only an authorized coordinator lands changes and updates the parent gitlink
+  through the serialized landing path.
+- Never force-push `main`, rewrite shared branches, or merge around a genuine
+  validation failure.
 
 Apply `post-facto-human-review` exactly for: (1) new syscall support, with both
 audit tags above; (2) a Reverie API/core-abstraction change to `Tool`, `Guest`,
@@ -366,38 +378,34 @@ are mandatory for every implementation and review agent.
    for the coordinator, who does it only after confirming the work is on
    `main`. An agent that closes its own task is asserting a landing it cannot
    witness.
-2. **When your work is complete, set the task to `IMPLEMENTED` and post the PR
-   link.** "Complete" means the feature branch is pushed and a pull request is
-   open against `rrnewton/reverie:main`. Record the transition and evidence:
+2. **When your work is complete, add the `implemented` tag and post the PR
+   link.** `IMPLEMENTED` is a tag, not a TaskGraph status. The task remains
+   `in_progress`. Preserve every existing tag because `--tags` replaces the
+   full set:
 
    ```bash
-   tg update <task> --status implemented
-   tg note <task> "Implemented: https://github.com/rrnewton/reverie/pull/<n> \
+   tg update <task> --tags <existing-tags>,implemented
+   tg note <task> "IMPLEMENTED: https://github.com/rrnewton/reverie/pull/<n> \
      | branch <feature-branch> @ <40-hex SHA> | base origin/main <SHA> \
      | validation: <exact commands + results, assurance level, backend>"
    ```
 
    The PR link and the exact tested SHA are required, not optional. A branch
    name alone is not evidence.
-3. **Adversarial review confirms the work exists in the PR.** Before a task is
-   trusted as `IMPLEMENTED`, a reviewer independently verifies that the claimed
-   change is actually present in the pull request diff, that the cited tests
-   exist and were run at the PR head SHA, and that the reported assurance level
-   (L0–L4), backend, and relaxations match reality. A Reverie-only change is
-   floored at L0 and does not establish a determinism guarantee on its own; a
-   claim that does not survive this check is not `IMPLEMENTED`.
-4. **The task stays `IMPLEMENTED` until the PR lands on `main`.** Open,
-   in-review, CI-red, awaiting-merge, and blocked-on-a-dependency PRs are all
-   still `IMPLEMENTED`, never `closed`. If the branch stops fast-forwarding, or
-   CI goes red, or a required check is not green at the PR head, the task
-   remains `IMPLEMENTED` (or moves back to `in_progress`) — it does not advance.
-5. **Only the coordinator closes tasks, after landing confirmation.** The
-   coordinator closes a task only after verifying the PR is merged into
-   `rrnewton/reverie:main` (the required **Regular tests** job green at the
-   merged head, the commit reachable from `main`), and, when the change is
-   consumed by Hermit, that the Hermit-side reverie pin was bumped to the
-   landed SHA. Landing confirmation is a merge commit on `main`, not a green
-   local run.
+3. **Adversarial review confirms the work exists in the PR.** A reviewer checks
+   the claimed diff and exact-SHA validation. A Reverie-only change is floored
+   at L0 and does not establish a determinism guarantee on its own. If the
+   published artifact is missing, superseded, or does not contain the claim,
+   remove the `implemented` tag and keep the task `in_progress`.
+4. **The task stays `in_progress` + `implemented` until the PR lands on
+   `main`.** Open, in-review, validation-red, awaiting-merge, and
+   blocked-on-a-dependency PRs are never `closed`.
+5. **Only the coordinator closes tasks, through the verified gateway.** After
+   freshly verifying target-main ancestry, use the dev-hermit parent's
+   `./ci-hub/bin/close-task <task> --code <PR-or-full-SHA> \
+   --repo rrnewton/reverie --source <checkout>`. Never use raw
+   `tg update --status closed`. A green run, GitHub state, label, or PR head is
+   not landing evidence.
 
 ### Done vs. Not Done
 
@@ -407,22 +415,22 @@ the lower status and say why in a task note.
 **Done (coordinator may close):**
 
 - PR #### is merged into `rrnewton/reverie:main`; the merge commit is on `main`
-  and the required **Regular tests** job was green at that head.
+  and the verified closure gateway accepts its freshly fetched ancestry.
 - A coordinated Hermit/Reverie change: the Reverie PR merged first, the Hermit
   consumer revalidated against the exact landed SHA, and the parent gitlink
   updated.
 
-**`IMPLEMENTED` (agent's terminal state — do NOT close):**
+**`in_progress` + `implemented` (agent's terminal state — do NOT close):**
 
-- Branch pushed, PR open, CI green, awaiting coordinator merge.
-- PR open but CI red, or a required check missing/queued/stale — still
-  `IMPLEMENTED`; report the exact failure, do not close.
+- Branch pushed, PR open, exact-head validation green, awaiting merge.
+- PR open but validation red, or an exact-head receipt missing/stale — still
+  `in_progress` + `implemented`; report the exact failure, do not close.
 - Reverie change committed and pushed but the Hermit pin bump that consumes it
-  has not landed — `IMPLEMENTED` with the dependent Hermit SHAs named.
+  has not landed — `in_progress` + `implemented` with dependency SHAs named.
 
-**Not done (stays `in_progress`, never `IMPLEMENTED` or `closed`):**
+**Not done (stays `in_progress`, never tagged `implemented` or closed):**
 
-- Code written but uncommitted, stashed, or not pushed.
+- Code written but uncommitted or not pushed. Never use a stash as a handoff.
 - "It builds/tests pass locally" with no pushed branch and no open PR.
 - A green local `cargo test` presented as project completion — a Reverie-only
   suite pass is floored at L0 and is not an integrated determinism guarantee.
@@ -457,9 +465,10 @@ build config, and minimal curated documentation only. Experiments, bulk AI
 research notes, binaries, and vendored clones do **not** belong here — they live
 in the `dev-hermit` parent workspace at `~/work/dev-hermit/experiments/` and
 `~/work/dev-hermit/ai_docs/`. The `repo-cleanliness` skill
-(`.claude/skills/repo-cleanliness.md`, also surfaced via `.llms/skills` and
-`.agents/skills`) is the full standing rule; this section is the mandatory
-pre-commit gate.
+(`.claude/skills/repo-cleanliness/SKILL.md`, also surfaced to Claude via
+`.llms/skills` and to stock Codex via
+`.agents/skills/repo-cleanliness/SKILL.md`) is the full standing rule; this
+section is the mandatory pre-commit gate.
 
 Before every commit, audit exactly what you are about to stage and fix any
 misplaced file *before* committing — never "commit now, clean up later":
@@ -495,20 +504,15 @@ correct home, then commit.
 The coordinator should periodically run:
 
 ```bash
-PRIMARY=~/work/dev-hermit/reverie
-
-test -f "$PRIMARY/AGENTS.md"
-git -C "$PRIMARY" branch --list main
-git -C "$PRIMARY" status --short --branch
-
-for slot in ~/work/dev-hermit/worktrees/slot*/reverie; do
-    test -d "$slot" || continue
-    git -C "$slot" status --short --branch
-    git -C "$slot" remote -v
-done
+cd ~/work/dev-hermit
+./scripts/allocate-worktree.rs --agent registry-audit --check-only
+git -C reverie status --short --branch
+git -C reverie worktree list --porcelain
 ```
 
-The expected idle state is a clean primary checkout on `main` and clean,
-detached parked slots. Every checkout uses `rrnewton/reverie` as `origin` and
-`facebookexperimental/reverie` as `upstream`. Any dirty or missing checkout
-blocks assignment until its state is attributed and preserved.
+Reconcile the allocator state, `worktrees/ACTIVE.md`, Git worktree registry, and
+filesystem before assigning a slot. The expected idle state is a clean primary
+checkout on latest `main` and clean detached parked slots. Every checkout uses
+`rrnewton/reverie` as `origin` and `facebookexperimental/reverie` as `upstream`.
+Any dirty or missing checkout blocks assignment until its state is attributed
+and preserved.

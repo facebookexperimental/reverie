@@ -2,7 +2,10 @@ SUBMODULE_PROXY ?= $(shell command -v with-proxy 2>/dev/null)
 SUBMODULE_GIT = $(SUBMODULE_PROXY) git
 
 .PHONY: checkout-all checkout-e9patch checkout-optional-submodules checkout-sabre \
-	sync-submodule-policy
+	check-skill-discovery sync-submodule-policy
+
+check-skill-discovery:
+	@./scripts/check-skill-discovery.rs
 
 checkout-e9patch:
 	@$(SUBMODULE_GIT) -c submodule.third-party/e9patch.update=checkout \

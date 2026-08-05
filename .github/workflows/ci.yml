@@ -26,6 +26,10 @@ jobs:
       uses: dtolnay/rust-toolchain@nightly
       with:
         components: clippy, rustfmt
+    - name: Cross-client skill discovery
+      run: |
+        rustc scripts/check-skill-discovery.rs -o "$RUNNER_TEMP/check-skill-discovery"
+        "$RUNNER_TEMP/check-skill-discovery"
     # reverie-dbi/build.rs compiles the vendored DynamoRIO source on first use.
     # Cache the content-addressed install tree; both the Actions key and the
     # restored directory require the exact vendored source + recipe content.
