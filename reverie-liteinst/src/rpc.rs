@@ -7,7 +7,6 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Once;
 
 use reverie::GlobalRPC;
 use reverie::GlobalTool;
@@ -17,35 +16,34 @@ pub(crate) use reverie_preload::sync::SpinMutex;
 use reverie_preload::trap::raw_syscall6;
 use reverie_rpc_transport::BlockingRpcClient;
 
-/// Set by a `pthread_atfork` child hook after this process forks. The guest RPC
-/// hot path consults this flag instead of issuing a `getpid` syscall on every
-/// hop: it is only ever set in a freshly forked child, so an ordinary
-/// (non-forking) round-trip performs no identity syscalls at all.
+/// Set in a freshly forked child by [`note_fork_in_child`]. The guest RPC hot
+/// path consults this flag instead of issuing a `getpid` syscall on every hop,
+/// so an ordinary (non-forking) round-trip performs no identity syscalls at all.
 static FORKED_SINCE_LAST_RPC: AtomicBool = AtomicBool::new(false);
-static FORK_DETECTOR_REGISTERED: Once = Once::new();
 
-/// `pthread_atfork` child callback. Runs in the freshly forked child in an
-/// async-signal-restricted context, so it does nothing but a single atomic
-/// store; the actual coordinator reconnect happens lazily on the child's next
-/// [`CoordinatorRpc::send_rpc`].
-extern "C" fn note_fork_in_child() {
+/// Record that this process is a freshly forked child whose inherited
+/// coordinator connection still belongs to the parent.
+///
+/// The tool host calls this from `finish_fork_child`, which is driven by
+/// *syscall interception* rather than libc. That placement is load-bearing for
+/// two reasons:
+///
+///   - It observes every supported fork, including a raw `SYS_fork` or a raw
+///     plain `SYS_clone` issued without libc (Go's runtime, hand-written
+///     `syscall(2)` call sites). A `pthread_atfork` child handler would see
+///     only forks that went through glibc's `fork()` wrapper and would silently
+///     leave such a child on the parent's connection.
+///   - It runs before the child's `handle_thread_start` callback, which is the
+///     child's first opportunity to issue an RPC. A `pthread_atfork` handler
+///     runs later, inside the libc wrapper after the fork syscall returns, so a
+///     tool that sends an RPC from `handle_thread_start` would be attributed to
+///     the parent.
+///
+/// The actual reconnect happens lazily on the child's next
+/// [`CoordinatorRpc::send_rpc`]; this is only a flag store, so it stays safe in
+/// the restricted post-fork context.
+pub(crate) fn note_fork_in_child() {
     FORKED_SINCE_LAST_RPC.store(true, Ordering::Release);
-}
-
-/// Install the fork detector exactly once per process. `pthread_atfork`
-/// registrations are inherited across `fork`, so descendants reuse it without
-/// re-registering. This covers the supported fork path — a single-threaded
-/// guest calling libc `fork()` — where the child handler is guaranteed to run
-/// before any child code (and thus before the child's first RPC). Thread clone,
-/// `clone3`, and `vfork` remain unsupported in tool mode.
-fn register_fork_detector() {
-    FORK_DETECTOR_REGISTERED.call_once(|| {
-        // SAFETY: `pthread_atfork` only records callbacks; `note_fork_in_child`
-        // is async-signal-safe (one relaxed-domain atomic store).
-        unsafe {
-            libc::pthread_atfork(None, None, Some(note_fork_in_child));
-        }
-    });
 }
 
 struct RpcConnection<G: GlobalTool> {
@@ -74,7 +72,6 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
 
     /// Connect before installing seccomp and decode the coordinator config.
     pub fn connect(path: impl AsRef<Path>) -> io::Result<Self> {
-        register_fork_detector();
         let path = path.as_ref().to_path_buf();
         let pid = current_id(libc::SYS_getpid)?;
         let tid = current_id(libc::SYS_gettid)?;

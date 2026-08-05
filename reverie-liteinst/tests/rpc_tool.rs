@@ -117,6 +117,38 @@ fn installed_hook_reentry_bypasses_tool_with_shared_coordinator_rpc() {
     assert!(fork_total >= 5, "{fork_stdout}");
     assert_eq!(sender_delta, 1, "{fork_stdout}");
 
+    // Same contract, but the child is created by a bare `SYS_fork` instruction
+    // that never enters libc — the shape Go's runtime and hand-written
+    // `syscall(2)` sites produce. A `pthread_atfork`-based detector cannot see
+    // this fork, so the child would silently keep sending on the parent's
+    // inherited connection and the sender delta would be 0.
+    let raw_fork_guest = Command::new(binary)
+        .arg("raw-fork-guest")
+        .arg(&socket)
+        .output()
+        .unwrap();
+    assert!(raw_fork_guest.status.success(), "{raw_fork_guest:?}");
+    let raw_fork_stdout = String::from_utf8(raw_fork_guest.stdout).unwrap();
+    let mut raw_fields = raw_fork_stdout.split_whitespace();
+    let raw_fork_total: u64 = raw_fields
+        .next()
+        .and_then(|field| field.strip_prefix("raw-fork-rpc-total="))
+        .expect("raw fork guest must print the shared RPC total")
+        .parse()
+        .unwrap();
+    let raw_sender_delta: u64 = raw_fields
+        .next()
+        .and_then(|field| field.strip_prefix("raw-fork-rpc-sender-delta="))
+        .expect("raw fork guest must print the shared RPC sender delta")
+        .parse()
+        .unwrap();
+    assert_eq!(raw_fields.next(), None, "{raw_fork_stdout}");
+    assert!(raw_fork_total >= 5, "{raw_fork_stdout}");
+    assert_eq!(
+        raw_sender_delta, 1,
+        "a raw SYS_fork child must reconnect under its own identity: {raw_fork_stdout}"
+    );
+
     for (mode, expected) in [
         (
             "unsubscribed-fork",

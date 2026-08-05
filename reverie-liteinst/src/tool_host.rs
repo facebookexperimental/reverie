@@ -364,6 +364,13 @@ fn finish_fork_child<T: Tool>(
         child_tid,
         child_pid,
     } = context;
+    // This child inherited the parent's coordinator connection. Flag it before
+    // any child-side callback can issue an RPC (`handle_thread_start` below is
+    // the first such opportunity) so the next `send_rpc` reconnects under the
+    // child's own identity. Doing it here rather than from a `pthread_atfork`
+    // hook also covers forks that never enter libc, such as a raw `SYS_fork` or
+    // a raw plain `SYS_clone`.
+    crate::rpc::note_fork_in_child();
     let parent_state = states
         .remove(&parent_tid.as_raw())
         .unwrap_or_else(|| fatal(126));

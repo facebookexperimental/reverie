@@ -330,6 +330,26 @@ reverie_liteinst_rpc_raise_sigsys:
     syscall
     ret
     .size reverie_liteinst_rpc_raise_sigsys, .-reverie_liteinst_rpc_raise_sigsys
+
+    # A raw `SYS_fork` (x86-64 __NR_fork = 57) that never enters libc, so no
+    # `pthread_atfork` child handler can run. This is the shape Go's runtime and
+    # hand-written `syscall(2)` call sites produce; the tool host must still
+    # notice the child inherited the parent's coordinator connection.
+    .p2align 4
+    .global reverie_liteinst_rpc_raw_fork
+    .hidden reverie_liteinst_rpc_raw_fork
+    .type reverie_liteinst_rpc_raw_fork,@function
+reverie_liteinst_rpc_raw_fork:
+    mov eax, 57
+    .global reverie_liteinst_rpc_raw_fork_site
+    .hidden reverie_liteinst_rpc_raw_fork_site
+reverie_liteinst_rpc_raw_fork_site:
+    syscall
+    nop
+    nop
+    nop
+    ret
+    .size reverie_liteinst_rpc_raw_fork, .-reverie_liteinst_rpc_raw_fork
 "#
 );
 
@@ -343,6 +363,7 @@ unsafe extern "C" {
     ) -> i64;
     fn reverie_liteinst_rpc_sigaltstack() -> i64;
     fn reverie_liteinst_rpc_raise_sigsys() -> i64;
+    fn reverie_liteinst_rpc_raw_fork() -> i64;
     fn reverie_liteinst_rpc_sigprocmask(
         how: u64,
         set: *const u64,
@@ -586,6 +607,41 @@ fn fork_guest(path: &Path) {
     );
 }
 
+/// Same shape as [`fork_guest`], but the fork is a bare `SYS_fork` instruction
+/// that never enters libc, so no `pthread_atfork` child handler can run.
+///
+/// The child must still be recognized as a fresh child and reconnect under its
+/// own identity. `CounterGlobal` keys its sender set on the RPC's `from` tid and
+/// `BlockingRpcClient::connect` stamps the connect-time tid, so a child that
+/// wrongly reuses the parent's inherited connection reports the PARENT's tid and
+/// leaves the sender count unchanged (delta 0). A correctly reconnected child
+/// adds exactly one new sender (delta 1).
+fn raw_fork_guest(path: &Path) {
+    unsafe { reverie_liteinst::install_tool::<CounterTool>(path) }.unwrap();
+    let parent = unsafe { reverie_liteinst_rpc_getpid() };
+    assert_eq!(parent, i64::from(unsafe { libc::getpid() }));
+    let senders_before_fork = LAST_SENDERS.load(Ordering::Relaxed);
+
+    let child = unsafe { reverie_liteinst_rpc_raw_fork() };
+    assert!(child >= 0, "raw SYS_fork failed: {child}");
+    if child == 0 {
+        // In the child: this RPC must be attributed to the child, not the parent.
+        let observed = unsafe { reverie_liteinst_rpc_getpid() };
+        assert_eq!(observed, i64::from(unsafe { libc::getpid() }));
+        assert_ne!(observed, parent, "child must not report the parent pid");
+        unsafe { libc::_exit(0) };
+    }
+
+    wait_for_child(child as libc::pid_t);
+    let observed = unsafe { reverie_liteinst_rpc_getpid() };
+    assert_eq!(observed, i64::from(unsafe { libc::getpid() }));
+    let sender_delta = LAST_SENDERS.load(Ordering::Relaxed) - senders_before_fork;
+    println!(
+        "raw-fork-rpc-total={} raw-fork-rpc-sender-delta={sender_delta}",
+        LAST_TOTAL.load(Ordering::Relaxed)
+    );
+}
+
 fn check_reconstructed_fork(label: &str) {
     CHILD_RECONSTRUCTED.store(false, Ordering::Release);
     let child = unsafe { libc::fork() };
@@ -627,6 +683,7 @@ fn main() {
         Some("unsubscribed-lifecycle") => unsubscribed_lifecycle_guest(Path::new(&path)),
         Some("injected-exit") => injected_exit_guest(Path::new(&path)),
         Some("fork-guest") => fork_guest(Path::new(&path)),
+        Some("raw-fork-guest") => raw_fork_guest(Path::new(&path)),
         Some("unsubscribed-fork") => unsubscribed_fork_guest(Path::new(&path)),
         Some("tail-fork") => tail_fork_guest(Path::new(&path)),
         _ => panic!("expected coordinator or guest"),
