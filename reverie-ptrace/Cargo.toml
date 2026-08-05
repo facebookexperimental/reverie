@@ -10,7 +10,7 @@ license = "BSD-2-Clause"
 
 [dependencies]
 anyhow = "1.0.103"
-async-trait = "0.1.86"
+async-trait = "0.1.91"
 bincode = { version = "2", features = ["serde"] }
 bytes = { version = "1.12.1", features = ["serde"] }
 close-err = "1.0.2"
