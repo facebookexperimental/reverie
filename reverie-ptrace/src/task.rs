@@ -74,6 +74,10 @@ use crate::LiteinstInstrumentationStats;
 use crate::children;
 use crate::cp;
 use crate::error::Error;
+use crate::error::LiteinstActivationFailure;
+use crate::error::LiteinstActivationFailureReason;
+use crate::error::LiteinstActivationOperation;
+use crate::error::LiteinstActivationStage;
 use crate::error::TraceResultExt;
 use crate::gdbstub::BreakpointType;
 use crate::gdbstub::CoreRegs;
@@ -910,8 +914,8 @@ pub struct TracedTask<L: Tool> {
     /// Controller-owned breakpoint preventing the executable entry before Ready.
     liteinst_entry_guard: Option<LiteinstEntryGuard>,
 
-    /// Original fail-closed error retained while the exit waiter reaps root.
-    liteinst_failure: Option<String>,
+    /// Original typed fail-closed error retained while the exit waiter reaps root.
+    liteinst_failure: Option<LiteinstActivationFailure>,
 
     /// pending signal to deliver. This can happen when
     /// syscall got interrupted (by signal)
@@ -1750,15 +1754,15 @@ impl<L: Tool + 'static> TracedTask<L> {
         )
         .await;
         if let Some(sig) = unexpected_preinit_signal.lock().unwrap().take() {
-            self.liteinst_failure = Some(
+            self.record_liteinst_failure(
+                LiteinstActivationFailureReason::UnexpectedPreinitSignal,
                 Error::runtime(
                     self.tid(),
                     "reject unexpected LiteInst activation signal",
                     format!(
                         "received {sig} before the required preload handshake completed: tracee pre-initialization observed an unexpected nested signal"
                     ),
-                )
-                .to_string(),
+                ),
             );
         }
         let mut task = task?;
@@ -2051,7 +2055,9 @@ impl<L: Tool + 'static> TracedTask<L> {
             let task = self.assume_stopped();
             self.write_injected_syscall_result(&task, result)?;
             self.injected_syscall_frame = None;
-            let signal = self.take_pending_signal_for_resume("resume injected syscall")?;
+            let signal = self.take_pending_signal_for_resume(
+                LiteinstActivationOperation::ResumeInjectedSyscall,
+            )?;
             return self.resume_stopped(task, signal)?.next_state().await;
         }
 
@@ -2090,8 +2096,9 @@ impl<L: Tool + 'static> TracedTask<L> {
             self.pending_syscall = None;
             self.pending_syscall_already_skipped = false;
             self.injected_syscall_frame = None;
-            let signal =
-                self.take_pending_signal_for_resume("resume intercepted injected syscall")?;
+            let signal = self.take_pending_signal_for_resume(
+                LiteinstActivationOperation::ResumeInterceptedInjectedSyscall,
+            )?;
             let wait = self.resume_stopped(task, signal)?.next_state().await?;
             tracing::trace!(
                 target: "reverie_ptrace::syscall",
@@ -2314,7 +2321,8 @@ impl<L: Tool + 'static> TracedTask<L> {
             if observed != guarded_instruction {
                 return Err(Errno::EPROTO.into());
             }
-            self.liteinst_failure = Some(
+            self.record_liteinst_failure(
+                LiteinstActivationFailureReason::ExecutableEntryBeforeHandshake,
                 Error::runtime(
                     self.tid(),
                     "verify LiteInst runtime before executable entry",
@@ -2322,8 +2330,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                         "tracee reached guarded executable entry {:#x} before the required preload handshake completed",
                         guard.address
                     ),
-                )
-                .to_string(),
+                ),
             );
             return Err(Errno::EPROTO.into());
         }
@@ -2335,13 +2342,13 @@ impl<L: Tool + 'static> TracedTask<L> {
             }
             Some(LiteinstTrap::HandshakeReady) => {
                 if let Err(error) = self.restore_liteinst_entry_guard(&mut task) {
-                    self.liteinst_failure = Some(
+                    self.record_liteinst_failure(
+                        LiteinstActivationFailureReason::RestoreExecutableEntryGuard,
                         Error::runtime(
                             self.tid(),
                             "restore LiteInst executable-entry guard",
                             error.to_string(),
-                        )
-                        .to_string(),
+                        ),
                     );
                     return Err(error);
                 }
@@ -2376,7 +2383,8 @@ impl<L: Tool + 'static> TracedTask<L> {
         }
         let phase = self.liteinst_runtime.lock().unwrap().phase;
         if self.global_state.liteinst_runtime.is_some() && phase != LiteinstRuntimePhase::Ready {
-            self.liteinst_failure = Some(
+            self.record_liteinst_failure(
+                LiteinstActivationFailureReason::UnexpectedActivationTrap,
                 Error::runtime(
                     self.tid(),
                     "reject unexpected LiteInst activation trap",
@@ -2384,8 +2392,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                         "received SIGTRAP at RIP {:#x} with RAX {:#x} that matched neither the entry guard nor a validated runtime handshake (phase {phase:?})",
                         regs.ip(), regs.rax
                     ),
-                )
-                .to_string(),
+                ),
             );
             return Err(Errno::EPROTO.into());
         }
@@ -2506,12 +2513,24 @@ impl<L: Tool + 'static> TracedTask<L> {
             && !test_activation_bypass
     }
 
+    fn record_liteinst_failure(&mut self, reason: LiteinstActivationFailureReason, error: Error) {
+        let stage = match self.liteinst_runtime.lock().unwrap().phase {
+            LiteinstRuntimePhase::Ready => LiteinstActivationStage::PostReady,
+            LiteinstRuntimePhase::PreExec
+            | LiteinstRuntimePhase::Waiting
+            | LiteinstRuntimePhase::Bootstrap => LiteinstActivationStage::PreReady,
+        };
+        self.liteinst_failure = Some(LiteinstActivationFailure::new(stage, reason, error));
+    }
+
     fn reject_liteinst_activation_signal(
         &mut self,
         sig: Signal,
+        reason: LiteinstActivationFailureReason,
         detail: impl Into<String>,
     ) -> TraceError {
-        self.liteinst_failure = Some(
+        self.record_liteinst_failure(
+            reason,
             Error::runtime(
                 self.tid(),
                 "reject unexpected LiteInst activation signal",
@@ -2519,15 +2538,14 @@ impl<L: Tool + 'static> TracedTask<L> {
                     "received {sig} before the required preload handshake completed: {}",
                     detail.into()
                 ),
-            )
-            .to_string(),
+            ),
         );
         Errno::EPROTO.into()
     }
 
     fn take_pending_signal_for_resume(
         &mut self,
-        operation: &'static str,
+        operation: LiteinstActivationOperation,
     ) -> Result<Option<Signal>, TraceError> {
         let signal = self.pending_signal.take();
         if self.liteinst_activation_in_progress()
@@ -2535,7 +2553,11 @@ impl<L: Tool + 'static> TracedTask<L> {
         {
             return Err(self.reject_liteinst_activation_signal(
                 sig,
-                format!("{operation} attempted to deliver a queued signal"),
+                LiteinstActivationFailureReason::SignalBeforeHandshake(operation),
+                format!(
+                    "{} attempted to deliver a queued signal",
+                    operation.as_str()
+                ),
             ));
         }
         Ok(signal)
@@ -2545,7 +2567,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         &mut self,
         task: &Stopped,
         sig: Signal,
-        operation: &'static str,
+        operation: LiteinstActivationOperation,
         expected_trap: NestedTrapExpectation,
         forced_external_for_test: bool,
     ) -> Result<(), TraceError> {
@@ -2570,8 +2592,10 @@ impl<L: Tool + 'static> TracedTask<L> {
         }
         Err(self.reject_liteinst_activation_signal(
             sig,
+            LiteinstActivationFailureReason::UnexpectedControllerProvenance(operation),
             format!(
-                "{operation} observed a nested signal without the expected controller provenance"
+                "{} observed a nested signal without the expected controller provenance",
+                operation.as_str()
             ),
         ))
     }
@@ -2588,6 +2612,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                         HandleSignalResult::SignalToDeliver(_, _) => {
                             Err(self.reject_liteinst_activation_signal(
                                 sig,
+                                LiteinstActivationFailureReason::UnexpectedActivationSignal,
                                 "the fault was not a subscribed, controller-intercepted CPUID or RDTSC instruction",
                             ))
                         }
@@ -2598,6 +2623,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                     if !was_timer {
                         return Err(self.reject_liteinst_activation_signal(
                             sig,
+                            LiteinstActivationFailureReason::UnexpectedActivationSignal,
                             "the signal was not generated by this tracee's controller timer",
                         ));
                     }
@@ -2606,6 +2632,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                 sig => {
                     return Err(self.reject_liteinst_activation_signal(
                         sig,
+                        LiteinstActivationFailureReason::UnexpectedActivationSignal,
                         "the signal is outside the activation allowlist",
                     ));
                 }
@@ -2649,15 +2676,15 @@ impl<L: Tool + 'static> TracedTask<L> {
             if state.phase != LiteinstRuntimePhase::PreExec {
                 let phase = state.phase;
                 drop(state);
-                self.liteinst_failure = Some(
+                self.record_liteinst_failure(
+                    LiteinstActivationFailureReason::PostStartExec,
                     Error::runtime(
                         self.tid(),
                         "reject LiteInst post-start exec",
                         format!(
                             "the required preload runtime cannot be preserved across exec (phase {phase:?})"
                         ),
-                    )
-                    .to_string(),
+                    ),
                 );
                 return Err(Errno::ENOTSUPP.into());
             }
@@ -2698,7 +2725,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                     self.validate_nested_liteinst_activation_signal(
                         &task,
                         Signal::SIGTRAP,
-                        "wait for the LiteInst post-exec trap",
+                        LiteinstActivationOperation::WaitForPostExecTrap,
                         NestedTrapExpectation::Breakpoint(expected_post_exec_rip),
                         forced_external_sigtrap,
                     )?;
@@ -2708,35 +2735,35 @@ impl<L: Tool + 'static> TracedTask<L> {
                     self.validate_nested_liteinst_activation_signal(
                         &task,
                         sig,
-                        "wait for the LiteInst post-exec trap",
+                        LiteinstActivationOperation::WaitForPostExecTrap,
                         NestedTrapExpectation::None,
                         false,
                     )?;
                     unreachable!("activation validation must reject a non-SIGTRAP signal")
                 }
                 Wait::Stopped(_, event) => {
-                    self.liteinst_failure = Some(
+                    self.record_liteinst_failure(
+                        LiteinstActivationFailureReason::UnexpectedPostExecEvent,
                         Error::runtime(
                             self.tid(),
                             "validate LiteInst post-exec trap",
                             format!(
                                 "received unexpected {event:?} before tracee pre-initialization"
                             ),
-                        )
-                        .to_string(),
+                        ),
                     );
                     return Err(Errno::EPROTO.into());
                 }
                 Wait::Exited(pid, exit_status) => {
-                    self.liteinst_failure = Some(
+                    self.record_liteinst_failure(
+                        LiteinstActivationFailureReason::ExitedBeforePostExecTrap,
                         Error::runtime(
                             pid,
                             "validate LiteInst post-exec trap",
                             format!(
                                 "tracee exited with {exit_status:?} before the required post-exec SIGTRAP"
                             ),
-                        )
-                        .to_string(),
+                        ),
                     );
                     return Err(Errno::EPROTO.into());
                 }
@@ -2753,13 +2780,13 @@ impl<L: Tool + 'static> TracedTask<L> {
         };
         let mut task = self.tracee_preinit(task).await?;
         if let Err(error) = self.install_liteinst_entry_guard(&mut task) {
-            self.liteinst_failure = Some(
+            self.record_liteinst_failure(
+                LiteinstActivationFailureReason::InstallExecutableEntryGuard,
                 Error::runtime(
                     self.tid(),
                     "install LiteInst executable-entry guard",
                     error.to_string(),
-                )
-                .to_string(),
+                ),
             );
             return Err(error);
         }
@@ -2772,13 +2799,13 @@ impl<L: Tool + 'static> TracedTask<L> {
             .is_some_and(|runtime| runtime.activate_without_handshake)
         {
             if let Err(error) = self.restore_liteinst_entry_guard(&mut task) {
-                self.liteinst_failure = Some(
+                self.record_liteinst_failure(
+                    LiteinstActivationFailureReason::RestoreExecutableEntryGuard,
                     Error::runtime(
                         self.tid(),
                         "restore test LiteInst executable-entry guard",
                         error.to_string(),
-                    )
-                    .to_string(),
+                    ),
                 );
                 return Err(error);
             }
@@ -3891,7 +3918,9 @@ impl<L: Tool + 'static> TracedTask<L> {
             {
                 self.pending_signal = Some(Signal::SIGUSR1);
             }
-            let sig = self.take_pending_signal_for_resume("resume after seccomp stop")?;
+            let sig = self.take_pending_signal_for_resume(
+                LiteinstActivationOperation::ResumeAfterSeccompStop,
+            )?;
             let running = self
                 .resume_stopped(task, sig)
                 .tracee_context(tid, "resume after seccomp stop")?;
@@ -4575,23 +4604,24 @@ impl<L: Tool + 'static> TracedTask<L> {
             }
         };
         let exit_status = match (outcome, self.liteinst_failure.take()) {
-            (_, Some(original)) => return Err(anyhow::anyhow!(original).into()),
+            (_, Some(original)) => return Err(anyhow::Error::new(original).into()),
             (Ok(exit_status), None) => exit_status,
             (Err(error), _) => return Err(error),
         };
         if self.global_state.liteinst_runtime.is_some() {
             let phase = self.liteinst_runtime.lock().unwrap().phase;
             if phase != LiteinstRuntimePhase::Ready {
-                return Err(anyhow::anyhow!(
+                return Err(anyhow::Error::new(LiteinstActivationFailure::new(
+                    LiteinstActivationStage::PreReady,
+                    LiteinstActivationFailureReason::TerminatedBeforeHandshake,
                     Error::runtime(
                         self.tid(),
                         "verify LiteInst runtime activation",
                         format!(
                             "tracee terminated before the required preload handshake completed (phase {phase:?})"
                         ),
-                    )
-                    .to_string()
-                )
+                    ),
+                ))
                 .into());
             }
         }
@@ -4659,7 +4689,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                     self.validate_nested_liteinst_activation_signal(
                         &task,
                         Signal::SIGTRAP,
-                        "skip intercepted syscall",
+                        LiteinstActivationOperation::SkipInterceptedSyscall,
                         NestedTrapExpectation::SyscallSkip { pre_rip },
                         forced_external_sigtrap,
                     )?;
@@ -4671,7 +4701,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                     self.validate_nested_liteinst_activation_signal(
                         &task,
                         sig,
-                        "skip intercepted syscall",
+                        LiteinstActivationOperation::SkipInterceptedSyscall,
                         NestedTrapExpectation::SyscallSkip { pre_rip },
                         false,
                     )?;
@@ -4821,7 +4851,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                     self.validate_nested_liteinst_activation_signal(
                         &stopped,
                         sig,
-                        "finish reinjected syscall",
+                        LiteinstActivationOperation::FinishReinjectedSyscall,
                         NestedTrapExpectation::None,
                         forced_external_sigtrap,
                     )?;
@@ -4832,7 +4862,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                     self.validate_nested_liteinst_activation_signal(
                         &stopped,
                         sig,
-                        "finish injected syscall",
+                        LiteinstActivationOperation::FinishInjectedSyscall,
                         NestedTrapExpectation::PrivateSyscall(
                             (cp::PRIVATE_PAGE_OFFSET + cp::SYSCALL_INSTR_SIZE) as u64,
                         ),

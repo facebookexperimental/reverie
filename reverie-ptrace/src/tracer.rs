@@ -2510,6 +2510,33 @@ mod tests {
     use reverie::syscalls::SyscallInfo;
 
     use super::*;
+    use crate::error::LiteinstActivationFailureCategory;
+    use crate::error::LiteinstActivationFailureReason;
+    use crate::error::LiteinstActivationOperation;
+    use crate::error::LiteinstActivationStage;
+    use crate::error::liteinst_activation_failure_category;
+    use crate::error::liteinst_activation_failure_reason;
+
+    fn assert_liteinst_activation_failure(
+        error: &Error,
+        expected: LiteinstActivationFailureReason,
+    ) {
+        assert_eq!(
+            liteinst_activation_failure_reason(error),
+            Some(expected),
+            "{error}"
+        );
+    }
+
+    fn assert_general_pre_ready_liteinst_activation_failure(error: &Error) {
+        assert_eq!(
+            liteinst_activation_failure_category(error),
+            Some(LiteinstActivationFailureCategory::General(
+                LiteinstActivationStage::PreReady,
+            )),
+            "{error}"
+        );
+    }
 
     fn fork_paused_child() -> Pid {
         match unsafe { unistd::fork() }.expect("fork test child") {
@@ -2854,18 +2881,10 @@ mod tests {
             .expect("timed exec-transition activation tracee hung")
             .expect_err("missing LiteInst runtime unexpectedly activated");
 
-        assert!(
-            !error
-                .to_string()
-                .contains("skip intercepted syscall observed a nested signal"),
-            "{error}"
-        );
-        assert!(
-            error
-                .to_string()
-                .contains("before the required preload handshake completed"),
-            "{error}"
-        );
+        // The exact fail-closed reason depends on which activation signal wins
+        // after the valid syscall-skip transition. What matters here is that
+        // the skip itself did not fail and activation remained pre-Ready.
+        assert_general_pre_ready_liteinst_activation_failure(&error);
         assert_reaped("timed exec-transition activation", root_pid);
     }
 
@@ -2885,11 +2904,11 @@ mod tests {
             .expect_err("queued pre-Ready signal unexpectedly resumed the tracee");
 
         assert!(!queue_once.load(Ordering::SeqCst));
-        assert!(
-            error
-                .to_string()
-                .contains("resume after seccomp stop attempted to deliver a queued signal"),
-            "{error}"
+        assert_liteinst_activation_failure(
+            &error,
+            LiteinstActivationFailureReason::SignalBeforeHandshake(
+                LiteinstActivationOperation::ResumeAfterSeccompStop,
+            ),
         );
         assert_reaped("pending-signal activation", root_pid);
     }
@@ -2910,11 +2929,11 @@ mod tests {
             .expect_err("nested pre-Ready reinjection signal was silently dropped");
 
         assert!(!force_once.load(Ordering::SeqCst), "{error}");
-        assert!(
-            error
-                .to_string()
-                .contains("finish reinjected syscall observed a nested signal without the expected controller provenance"),
-            "{error}"
+        assert_liteinst_activation_failure(
+            &error,
+            LiteinstActivationFailureReason::UnexpectedControllerProvenance(
+                LiteinstActivationOperation::FinishReinjectedSyscall,
+            ),
         );
         assert_reaped("context-none activation", root_pid);
     }
@@ -2935,11 +2954,11 @@ mod tests {
             .expect_err("external pre-Ready SIGTRAP impersonated injected-step completion");
 
         assert!(!force_once.load(Ordering::SeqCst), "{error}");
-        assert!(
-            error.to_string().contains(
-                "finish injected syscall observed a nested signal without the expected controller provenance"
+        assert_liteinst_activation_failure(
+            &error,
+            LiteinstActivationFailureReason::UnexpectedControllerProvenance(
+                LiteinstActivationOperation::FinishInjectedSyscall,
             ),
-            "{error}"
         );
         assert_reaped("injected-step activation", root_pid);
     }
@@ -2968,14 +2987,16 @@ mod tests {
                     Some(crate::error::Error::Internal(TraceError::Errno(Errno::EFAULT)))
                 )
         );
-        let error = error.to_string();
         // Some kernels reject the forced ptrace write before the mutated stub
         // executes. Otherwise, the exact-stub provenance check must reject it.
         assert!(
             ptrace_write_rejected
-                || error.contains(
-                    "finish injected syscall observed a nested signal without the expected controller provenance"
-                ),
+                || liteinst_activation_failure_reason(&error)
+                    == Some(
+                        LiteinstActivationFailureReason::UnexpectedControllerProvenance(
+                            LiteinstActivationOperation::FinishInjectedSyscall,
+                        ),
+                    ),
             "{error}"
         );
         assert_reaped("private-stub-mutation activation", root_pid);
@@ -3019,11 +3040,11 @@ mod tests {
             .expect_err("nested pre-Ready skip signal was delivered by single-step");
 
         assert!(!force_once.load(Ordering::SeqCst));
-        assert!(
-            error
-                .to_string()
-                .contains("skip intercepted syscall observed a nested signal without the expected controller provenance"),
-            "{error}"
+        assert_liteinst_activation_failure(
+            &error,
+            LiteinstActivationFailureReason::UnexpectedControllerProvenance(
+                LiteinstActivationOperation::SkipInterceptedSyscall,
+            ),
         );
         assert_reaped("skip-seccomp activation", root_pid);
     }
@@ -3044,11 +3065,9 @@ mod tests {
             .expect_err("nested pre-Ready preinit signal unexpectedly resumed the tracee");
 
         assert!(!force_once.load(Ordering::SeqCst));
-        assert!(
-            error
-                .to_string()
-                .contains("tracee pre-initialization observed an unexpected nested signal"),
-            "{error}"
+        assert_liteinst_activation_failure(
+            &error,
+            LiteinstActivationFailureReason::UnexpectedPreinitSignal,
         );
         assert_reaped("preinit-signal activation", root_pid);
     }
@@ -3069,11 +3088,11 @@ mod tests {
             .expect_err("external SIGTRAP impersonated the required post-exec trap");
 
         assert!(!force_once.load(Ordering::SeqCst));
-        assert!(
-            error.to_string().contains(
-                "wait for the LiteInst post-exec trap observed a nested signal without the expected controller provenance"
+        assert_liteinst_activation_failure(
+            &error,
+            LiteinstActivationFailureReason::UnexpectedControllerProvenance(
+                LiteinstActivationOperation::WaitForPostExecTrap,
             ),
-            "{error}"
         );
         assert_reaped("post-exec-signal activation", root_pid);
     }
