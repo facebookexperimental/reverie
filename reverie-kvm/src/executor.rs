@@ -49,6 +49,7 @@ const MEMBARRIER_SUPPORTED: libc::c_int = 0x1;
 // answer is host-independent.
 const PR_CAPBSET_READ: u64 = 23;
 const PR_CAPBSET_DROP: u64 = 24;
+const CAP_SYS_PTRACE: u64 = 19;
 const GUEST_CAP_LAST_CAP: u64 = 40;
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 const PROCESS_CLONE_TID_FLAGS: u64 = libc::CLONE_PARENT_SETTID as u64
@@ -881,25 +882,56 @@ fn set_robust_list(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
     if args[1] != ROBUST_LIST_HEAD_SIZE {
         return negative_errno(libc::EINVAL);
     }
-    state.robust_list_head = args[0];
-    state.robust_list_len = args[1];
+    let updated = state
+        .task_lifecycle
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .set_robust_list(state.tid, args[0]);
+    debug_assert!(
+        updated,
+        "current KVM task is absent from its lifecycle table"
+    );
+    if !updated {
+        return negative_errno(libc::ESRCH);
+    }
     0
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-232): Review task-local robust-list queries.
+// TODO-HUMAN-REVIEW(PR-232): Review process-tree robust-list queries.
 fn get_robust_list(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
-    let requested = args[0] as libc::pid_t;
-    if requested != 0 && requested != state.tid && requested != state.pid {
+    let requested = match args[0] as libc::pid_t {
+        0 => state.tid,
+        tid => tid,
+    };
+    let Some(target) = state
+        .task_lifecycle
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(requested)
+    else {
         return negative_errno(libc::ESRCH);
+    };
+
+    // Every task has the fixed virtual-root credentials. Match the remaining
+    // ptrace access predicates: same-thread-group reads are always allowed;
+    // cross-process reads require either a dumpable target or CAP_SYS_PTRACE.
+    if target.tgid != state.pid
+        && !target.dumpable
+        && state.capability_effective & (1_u64 << CAP_SYS_PTRACE) == 0
+    {
+        return negative_errno(libc::EPERM);
     }
-    if args[1] == 0 || args[2] == 0 {
+
+    // Linux resolves and authorizes the target first, then writes the fixed
+    // header size before the head pointer. Preserve that partial-copy ordering.
+    if args[2] == 0 || write_u64(memory, args[2], ROBUST_LIST_HEAD_SIZE) != 0 {
         return negative_errno(libc::EFAULT);
     }
-    if write_u64(memory, args[1], state.robust_list_head) != 0 {
+    if args[1] == 0 || write_u64(memory, args[1], target.robust_list_head) != 0 {
         return negative_errno(libc::EFAULT);
     }
-    write_u64(memory, args[2], state.robust_list_len)
+    0
 }
 
 fn guest_host_address(
@@ -925,6 +957,7 @@ fn guest_host_address(
 /// [`crate::KvmBackend::run_static_elf`] uses directly.
 pub(crate) struct ElfExecutor {
     state: LoadedStaticElf,
+    task_generation: u64,
     address_space: Arc<std::sync::Mutex<AddressSpaceState>>,
     file_table: Arc<std::sync::Mutex<FileTableState>>,
     output: Option<CapturedOutput>,
@@ -1105,6 +1138,11 @@ impl ElfExecutor {
     }
 
     pub(crate) fn new(state: LoadedStaticElf, capture_output: bool) -> Self {
+        let task_generation = state
+            .task_lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .ensure_registered(state.tid, state.pid, state.dumpable);
         let next_pid = state.pid.saturating_add(1);
         let address_space = Arc::new(std::sync::Mutex::new(AddressSpaceState::from_elf(&state)));
         let file_table = Arc::new(std::sync::Mutex::new(
@@ -1112,6 +1150,7 @@ impl ElfExecutor {
         ));
         Self {
             state,
+            task_generation,
             address_space,
             file_table,
             output: capture_output.then(CapturedOutput::default),
@@ -1429,6 +1468,7 @@ impl ElfExecutor {
 
     pub(crate) fn fork_child(&self, child_pid: i32, clear_sighand: bool) -> crate::Result<Self> {
         let mut state = self.state.try_clone_for_fork(child_pid)?;
+        state.dumpable = self.current_dumpable();
         if clear_sighand {
             state.signal_actions.retain(|_, action| {
                 let handler = usize::from_ne_bytes(
@@ -1439,10 +1479,18 @@ impl ElfExecutor {
                 handler == libc::SIG_IGN
             });
         }
-        Ok(Self {
-            address_space: Arc::new(std::sync::Mutex::new(AddressSpaceState::from_elf(&state))),
-            file_table: Arc::new(std::sync::Mutex::new(FileTableState::try_from_elf(&state)?)),
+        let address_space = Arc::new(std::sync::Mutex::new(AddressSpaceState::from_elf(&state)));
+        let file_table = Arc::new(std::sync::Mutex::new(FileTableState::try_from_elf(&state)?));
+        let task_generation = state
+            .task_lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .register(state.tid, state.pid, state.dumpable);
+        let child = Self {
             state,
+            task_generation,
+            address_space,
+            file_table,
             output: self.output.clone(),
             owns_output: false,
             next_pid: self.next_pid.clone(),
@@ -1452,7 +1500,8 @@ impl ElfExecutor {
             exit_code: None,
             exit_group: false,
             clear_child_tid: None,
-        })
+        };
+        Ok(child)
     }
 
     // TODO-HUMAN-REVIEW(PR-172): Review shared address-space and output ownership.
@@ -1460,9 +1509,16 @@ impl ElfExecutor {
         let mut state = self.state.try_clone_for_fork(child_tid)?;
         state.pid = self.state.pid;
         state.ppid = self.state.ppid;
+        state.dumpable = self.current_dumpable();
         state.signalfd_state = self.state.signalfd_state.clone();
-        Ok(Self {
+        let task_generation = state
+            .task_lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .register(state.tid, state.pid, state.dumpable);
+        let child = Self {
             state,
+            task_generation,
             address_space: self.address_space.clone(),
             file_table: self.file_table.clone(),
             output: self.output.clone(),
@@ -1474,7 +1530,17 @@ impl ElfExecutor {
             exit_code: None,
             exit_group: false,
             clear_child_tid: None,
-        })
+        };
+        Ok(child)
+    }
+
+    fn current_dumpable(&self) -> bool {
+        self.state
+            .task_lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(self.state.tid)
+            .map_or(self.state.dumpable, |task| task.dumpable)
     }
 
     pub(crate) fn set_clear_child_tid(&mut self, address: Option<u64>) {
@@ -1633,6 +1699,14 @@ impl ElfExecutor {
     pub(crate) fn replace_after_exec(&mut self, state: LoadedStaticElf) {
         let previous = std::mem::replace(&mut self.state, state);
         self.state.inherit_process_state(previous);
+        self.task_generation = self
+            .state
+            .task_lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(self.state.tid)
+            .expect("execing KVM task is absent from its lifecycle table")
+            .generation;
         *self
             .address_space
             .lock()
@@ -1736,10 +1810,14 @@ impl ElfExecutor {
 
     /// Returns and clears a pending thread-local or group-wide exit.
     pub(crate) fn take_exit(&mut self) -> Option<ProcessExit> {
-        self.exit_code.take().map(|code| {
-            let group = std::mem::take(&mut self.exit_group);
-            ProcessExit { code, group }
-        })
+        let code = self.exit_code.take()?;
+        self.state
+            .task_lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(self.state.tid, self.task_generation);
+        let group = std::mem::take(&mut self.exit_group);
+        Some(ProcessExit { code, group })
     }
 
     pub(crate) fn take_output(&mut self) -> (Vec<u8>, Vec<u8>) {
@@ -1751,6 +1829,16 @@ impl ElfExecutor {
         } else {
             (Vec::new(), Vec::new())
         }
+    }
+}
+
+impl Drop for ElfExecutor {
+    fn drop(&mut self) {
+        self.state
+            .task_lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(self.state.tid, self.task_generation);
     }
 }
 
@@ -7636,20 +7724,31 @@ fn prctl(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
         option if option == libc::PR_GET_KEEPCAPS as u64 => i64::from(state.keep_capabilities),
         // AUTONOMOUS-BOT-IMPLEMENTED
         option if option == libc::PR_SET_DUMPABLE as u64 => match args[1] {
-            0 => {
+            value @ (0 | 1) => {
+                let dumpable = value == 1;
                 // TODO-HUMAN-REVIEW(PR-235): Review virtual dumpability mutation.
-                state.dumpable = false;
-                0
-            }
-            1 => {
-                state.dumpable = true;
+                state.dumpable = dumpable;
+                let updated = state
+                    .task_lifecycle
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .set_dumpable(state.pid, dumpable);
+                debug_assert!(updated, "current KVM process has no live task entry");
                 0
             }
             _ => negative_errno(libc::EINVAL),
         },
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-235): Review virtual dumpability queries.
-        option if option == libc::PR_GET_DUMPABLE as u64 => i64::from(state.dumpable),
+        option if option == libc::PR_GET_DUMPABLE as u64 => state
+            .task_lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(state.tid)
+            .map_or_else(
+                || i64::from(state.dumpable),
+                |task| i64::from(task.dumpable),
+            ),
         option if option == libc::PR_CAP_AMBIENT as u64 => {
             prctl_cap_ambient(state, args[1], args[2])
         }
@@ -9688,8 +9787,9 @@ mod tests {
             signal_mask: [0; KERNEL_SIGSET_SIZE],
             signal_alt_stack: None,
             signalfd_state: Arc::new(std::sync::Mutex::new(crate::elf::SignalFdState::default())),
-            robust_list_head: 0,
-            robust_list_len: 0,
+            task_lifecycle: Arc::new(std::sync::Mutex::new(
+                crate::elf::TaskLifecycleTable::with_root(1, 1, true),
+            )),
             files: BTreeMap::new(),
             random_device_fds: BTreeSet::new(),
             stdout_alias_fds: BTreeSet::new(),
@@ -19115,52 +19215,273 @@ mod tests {
     }
 
     #[test]
-    fn robust_list_registration_round_trips_and_resets_on_fork() {
+    fn robust_list_peer_lookup_distinguishes_live_tasks_and_uses_exact_tid() {
         const HEAD_OUTPUT: u64 = 0x100;
         const LENGTH_OUTPUT: u64 = 0x108;
-        const REGISTERED_HEAD: u64 = 0x300;
+        const PARENT_HEAD: u64 = 0x300;
+        const CHILD_HEAD: u64 = 0x500;
+        const THREAD_HEAD: u64 = 0x700;
 
         let root = TestDir::new();
-        let mut state = test_state(&root.0);
+        let mut parent = ElfExecutor::new(test_state(&root.0), false);
+        let mut child = parent.fork_child(2, false).unwrap();
+        let mut thread = parent.thread_child(3).unwrap();
         let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
 
         assert_eq!(
             set_robust_list(
-                &mut state,
-                &[REGISTERED_HEAD, ROBUST_LIST_HEAD_SIZE, 0, 0, 0, 0],
+                &mut parent.state,
+                &[PARENT_HEAD, ROBUST_LIST_HEAD_SIZE, 0, 0, 0, 0],
             ),
             0
         );
+
+        // A live child that has not registered a head is not ESRCH: Linux
+        // reports a null head and the fixed robust-list header size.
         assert_eq!(
             get_robust_list(
                 &mut memory,
-                &state,
-                &[0, HEAD_OUTPUT, LENGTH_OUTPUT, 0, 0, 0],
+                &parent.state,
+                &[2, HEAD_OUTPUT, LENGTH_OUTPUT, 0, 0, 0],
             ),
             0
         );
-        assert_eq!(read_struct::<u64>(&memory, HEAD_OUTPUT), REGISTERED_HEAD);
+        assert_eq!(read_struct::<u64>(&memory, HEAD_OUTPUT), 0);
         assert_eq!(
             read_struct::<u64>(&memory, LENGTH_OUTPUT),
             ROBUST_LIST_HEAD_SIZE
         );
+
+        assert_eq!(
+            set_robust_list(
+                &mut child.state,
+                &[CHILD_HEAD, ROBUST_LIST_HEAD_SIZE, 0, 0, 0, 0],
+            ),
+            0
+        );
         assert_eq!(
             get_robust_list(
                 &mut memory,
-                &state,
+                &parent.state,
+                &[2, HEAD_OUTPUT, LENGTH_OUTPUT, 0, 0, 0],
+            ),
+            0
+        );
+        assert_eq!(read_struct::<u64>(&memory, HEAD_OUTPUT), CHILD_HEAD);
+
+        // A nonleader's numeric query for the group leader must resolve tid 1,
+        // not alias to the caller merely because tid 1 is its tgid.
+        assert_eq!(
+            set_robust_list(
+                &mut thread.state,
+                &[THREAD_HEAD, ROBUST_LIST_HEAD_SIZE, 0, 0, 0, 0],
+            ),
+            0
+        );
+        assert_eq!(
+            get_robust_list(
+                &mut memory,
+                &thread.state,
+                &[1, HEAD_OUTPUT, LENGTH_OUTPUT, 0, 0, 0],
+            ),
+            0
+        );
+        assert_eq!(read_struct::<u64>(&memory, HEAD_OUTPUT), PARENT_HEAD);
+        assert_eq!(
+            get_robust_list(
+                &mut memory,
+                &thread.state,
+                &[0, HEAD_OUTPUT, LENGTH_OUTPUT, 0, 0, 0],
+            ),
+            0
+        );
+        assert_eq!(read_struct::<u64>(&memory, HEAD_OUTPUT), THREAD_HEAD);
+
+        assert_eq!(
+            get_robust_list(
+                &mut memory,
+                &parent.state,
                 &[99, HEAD_OUTPUT, LENGTH_OUTPUT, 0, 0, 0],
             ),
             negative_errno(libc::ESRCH)
         );
         assert_eq!(
-            set_robust_list(&mut state, &[REGISTERED_HEAD, 8, 0, 0, 0, 0]),
+            set_robust_list(&mut parent.state, &[PARENT_HEAD, 8, 0, 0, 0, 0]),
             negative_errno(libc::EINVAL)
         );
-        assert_eq!(state.robust_list_head, REGISTERED_HEAD);
+    }
 
-        let child = state.try_clone_for_fork(2).unwrap();
-        assert_eq!(child.robust_list_head, 0);
-        assert_eq!(child.robust_list_len, 0);
+    #[test]
+    fn robust_list_lifecycle_resets_on_exec_removes_on_exit_and_reuses_tid() {
+        const HEAD_OUTPUT: u64 = 0x100;
+        const LENGTH_OUTPUT: u64 = 0x108;
+        const CHILD_HEAD: u64 = 0x900;
+
+        let root = TestDir::new();
+        let parent = ElfExecutor::new(test_state(&root.0), false);
+        let mut child = parent.fork_child(2, false).unwrap();
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+
+        assert_eq!(
+            set_robust_list(
+                &mut child.state,
+                &[CHILD_HEAD, ROBUST_LIST_HEAD_SIZE, 0, 0, 0, 0],
+            ),
+            0
+        );
+        assert_eq!(
+            prctl(
+                &mut child.state,
+                &[libc::PR_SET_DUMPABLE as u64, 0, 0, 0, 0, 0],
+            ),
+            0
+        );
+
+        // Exec retains the task but clears its robust head and resets
+        // dumpability. Peer lookup must still succeed with the empty state.
+        child.replace_after_exec(test_state(&root.0));
+        assert_eq!(
+            get_robust_list(
+                &mut memory,
+                &parent.state,
+                &[2, HEAD_OUTPUT, LENGTH_OUTPUT, 0, 0, 0],
+            ),
+            0
+        );
+        assert_eq!(read_struct::<u64>(&memory, HEAD_OUTPUT), 0);
+        assert_eq!(
+            read_struct::<u64>(&memory, LENGTH_OUTPUT),
+            ROBUST_LIST_HEAD_SIZE
+        );
+        assert_eq!(
+            prctl(
+                &mut child.state,
+                &[libc::PR_GET_DUMPABLE as u64, 0, 0, 0, 0, 0],
+            ),
+            1
+        );
+
+        // Consuming an exit is the task-exit boundary; executor destruction is
+        // only an idempotent fallback. Reusing the same synthetic tid creates a
+        // fresh empty entry rather than exposing the exited task's pointer.
+        assert_eq!(
+            child.execute(
+                &SyscallRequest::new(libc::SYS_exit as u64, [0, 0, 0, 0, 0, 0]),
+                &memory,
+            ),
+            0
+        );
+        assert!(child.take_exit().is_some());
+        assert_eq!(
+            get_robust_list(
+                &mut memory,
+                &parent.state,
+                &[2, HEAD_OUTPUT, LENGTH_OUTPUT, 0, 0, 0],
+            ),
+            negative_errno(libc::ESRCH)
+        );
+        let replacement = parent.fork_child(2, false).unwrap();
+        // The exited executor may be destroyed after the tid has been reused;
+        // its stale generation must not remove the replacement's entry.
+        drop(child);
+        assert_eq!(
+            get_robust_list(
+                &mut memory,
+                &parent.state,
+                &[2, HEAD_OUTPUT, LENGTH_OUTPUT, 0, 0, 0],
+            ),
+            0
+        );
+        assert_eq!(read_struct::<u64>(&memory, HEAD_OUTPUT), 0);
+        drop(replacement);
+    }
+
+    #[test]
+    fn get_robust_list_checks_access_before_linux_ordered_copyout() {
+        const HEAD_OUTPUT: u64 = 0x100;
+        const LENGTH_OUTPUT: u64 = 0x108;
+        const PARENT_HEAD: u64 = 0x300;
+        const HEAD_SENTINEL: u64 = 0xaaaa_aaaa_aaaa_aaaa;
+        const LENGTH_SENTINEL: u64 = 0xbbbb_bbbb_bbbb_bbbb;
+        const INVALID: u64 = PAGE_SIZE + 8;
+
+        let root = TestDir::new();
+        let mut parent = ElfExecutor::new(test_state(&root.0), false);
+        let mut child = parent.fork_child(2, false).unwrap();
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        memory
+            .write(HEAD_OUTPUT, &HEAD_SENTINEL.to_ne_bytes())
+            .unwrap();
+        memory
+            .write(LENGTH_OUTPUT, &LENGTH_SENTINEL.to_ne_bytes())
+            .unwrap();
+
+        // Fixed-root credentials normally permit peer reads. Once the caller
+        // drops CAP_SYS_PTRACE, a nondumpable process is rejected before either
+        // output location is modified.
+        assert_eq!(
+            prctl(
+                &mut child.state,
+                &[libc::PR_SET_DUMPABLE as u64, 0, 0, 0, 0, 0],
+            ),
+            0
+        );
+        parent.state.capability_effective &= !(1_u64 << CAP_SYS_PTRACE);
+        assert_eq!(
+            get_robust_list(
+                &mut memory,
+                &parent.state,
+                &[2, HEAD_OUTPUT, LENGTH_OUTPUT, 0, 0, 0],
+            ),
+            negative_errno(libc::EPERM)
+        );
+        assert_eq!(read_struct::<u64>(&memory, HEAD_OUTPUT), HEAD_SENTINEL);
+        assert_eq!(read_struct::<u64>(&memory, LENGTH_OUTPUT), LENGTH_SENTINEL);
+
+        parent.state.capability_effective |= 1_u64 << CAP_SYS_PTRACE;
+        assert_eq!(
+            set_robust_list(
+                &mut parent.state,
+                &[PARENT_HEAD, ROBUST_LIST_HEAD_SIZE, 0, 0, 0, 0],
+            ),
+            0
+        );
+
+        // Linux writes len_ptr first. A bad head_ptr therefore leaves the
+        // length written, while a bad len_ptr leaves head_ptr untouched.
+        assert_eq!(
+            get_robust_list(
+                &mut memory,
+                &parent.state,
+                &[0, INVALID, LENGTH_OUTPUT, 0, 0, 0],
+            ),
+            negative_errno(libc::EFAULT)
+        );
+        assert_eq!(
+            read_struct::<u64>(&memory, LENGTH_OUTPUT),
+            ROBUST_LIST_HEAD_SIZE
+        );
+
+        memory
+            .write(HEAD_OUTPUT, &HEAD_SENTINEL.to_ne_bytes())
+            .unwrap();
+        assert_eq!(
+            get_robust_list(
+                &mut memory,
+                &parent.state,
+                &[0, HEAD_OUTPUT, INVALID, 0, 0, 0],
+            ),
+            negative_errno(libc::EFAULT)
+        );
+        assert_eq!(read_struct::<u64>(&memory, HEAD_OUTPUT), HEAD_SENTINEL);
+
+        // Target resolution precedes copyout validation.
+        assert_eq!(
+            get_robust_list(&mut memory, &parent.state, &[99, INVALID, INVALID, 0, 0, 0],),
+            negative_errno(libc::ESRCH)
+        );
+
+        drop(child);
     }
 
     #[test]

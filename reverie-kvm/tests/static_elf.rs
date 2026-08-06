@@ -108,8 +108,53 @@ fn run_host_program_captured(
     (stdout, stderr)
 }
 
+fn run_host_program_with_tool_captured(
+    program: &str,
+    argv: &[&str],
+    cwd: &std::path::Path,
+) -> (Vec<u8>, Vec<u8>) {
+    const REAL_PROGRAM_MEMORY_SIZE: usize = 256 * 1024 * 1024;
+
+    let image = std::fs::read(program).unwrap();
+    let mut backend = KvmBackend::new(REAL_PROGRAM_MEMORY_SIZE).unwrap();
+    backend
+        .install_static_elf_with_context(&image, argv, &["PATH=/usr/bin:/bin"], cwd)
+        .unwrap();
+    let (_, code, stdout, stderr) =
+        futures::executor::block_on(backend.run_static_elf_with_tool::<StraceTool>((), true))
+            .unwrap();
+    assert_eq!(
+        code,
+        0,
+        "{program} {argv:?} exited {code}; stdout={}; stderr={}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr),
+    );
+    (stdout, stderr)
+}
+
 fn run_host_program(program: &str, argv: &[&str], cwd: &std::path::Path) {
     let _ = run_host_program_captured(program, argv, cwd);
+}
+
+fn compile_c_program(directory: &std::path::Path, name: &str, source: &str) -> PathBuf {
+    let source_path = directory.join(format!("{name}.c"));
+    let executable_path = directory.join(name);
+    std::fs::write(&source_path, source).unwrap();
+    let output = std::process::Command::new("/usr/bin/gcc")
+        .args(["-O2", "-pthread"])
+        .arg(&source_path)
+        .arg("-o")
+        .arg(&executable_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "gcc failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    executable_path
 }
 
 fn set_interrupt_signal_blocked(blocked: bool) -> bool {
@@ -1052,6 +1097,147 @@ fn static_elf_runs_glibc_clone3_thread_and_restores_parent_state() {
         assert!(stdout.is_empty(), "dispatch={dispatch:?}");
         assert!(stderr.is_empty(), "dispatch={dispatch:?}");
     }
+}
+
+#[test]
+fn real_glibc_get_robust_list_tracks_fork_and_thread_lifecycles() {
+    match Kvm::new() {
+        Ok(_) => {}
+        Err(error) if kvm_is_unavailable(&error) => {
+            eprintln!("skipping KVM robust-list lifecycle test: cannot open /dev/kvm: {error}");
+            return;
+        }
+        Err(error) => panic!("failed to probe /dev/kvm: {error}"),
+    }
+
+    let directory = TestDirectory::new();
+    let executable = compile_c_program(
+        &directory.0,
+        "robust-list-lifecycle",
+        r#"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <linux/futex.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static int tid_pipe[2];
+static int release_pipe[2];
+
+static void *worker(void *unused) {
+  (void)unused;
+  pid_t tid = (pid_t)syscall(SYS_gettid);
+  struct robust_list_head *self_head = NULL;
+  struct robust_list_head *leader_head = NULL;
+  size_t self_len = 0;
+  size_t leader_len = 0;
+  char byte = 0;
+
+  if (syscall(SYS_get_robust_list, 0, &self_head, &self_len) != 0 ||
+      syscall(SYS_get_robust_list, getpid(), &leader_head, &leader_len) != 0 ||
+      self_head == NULL || leader_head == NULL || self_head == leader_head ||
+      self_len != sizeof(*self_head) || leader_len != sizeof(*leader_head) ||
+      write(tid_pipe[1], &tid, sizeof(tid)) != sizeof(tid) ||
+      read(release_pipe[0], &byte, sizeof(byte)) != sizeof(byte)) {
+    return (void *)(uintptr_t)1;
+  }
+  return NULL;
+}
+
+int main(void) {
+  int ready_pipe[2];
+  int child_release_pipe[2];
+  if (pipe(ready_pipe) != 0 || pipe(child_release_pipe) != 0) {
+    return 10;
+  }
+
+  pid_t child = fork();
+  if (child < 0) {
+    return 11;
+  }
+  if (child == 0) {
+    char byte = 1;
+    if (write(ready_pipe[1], &byte, sizeof(byte)) != sizeof(byte) ||
+        read(child_release_pipe[0], &byte, sizeof(byte)) != sizeof(byte)) {
+      _exit(12);
+    }
+    _exit(0);
+  }
+
+  char byte = 0;
+  if (read(ready_pipe[0], &byte, sizeof(byte)) != sizeof(byte)) {
+    return 13;
+  }
+  struct robust_list_head *head = (void *)(uintptr_t)1;
+  size_t length = 0;
+  if (syscall(SYS_get_robust_list, child, &head, &length) != 0 ||
+      length != sizeof(*head)) {
+    return 14;
+  }
+  byte = 1;
+  if (write(child_release_pipe[1], &byte, sizeof(byte)) != sizeof(byte)) {
+    return 15;
+  }
+  int status = 0;
+  if (waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
+      WEXITSTATUS(status) != 0) {
+    return 16;
+  }
+  errno = 0;
+  if (syscall(SYS_get_robust_list, child, &head, &length) != -1 ||
+      errno != ESRCH) {
+    return 17;
+  }
+
+  if (pipe(tid_pipe) != 0 || pipe(release_pipe) != 0) {
+    return 18;
+  }
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, worker, NULL) != 0) {
+    return 19;
+  }
+  pid_t tid = 0;
+  if (read(tid_pipe[0], &tid, sizeof(tid)) != sizeof(tid)) {
+    return 20;
+  }
+  head = NULL;
+  length = 0;
+  if (syscall(SYS_get_robust_list, tid, &head, &length) != 0 ||
+      head == NULL || length != sizeof(*head)) {
+    return 21;
+  }
+  byte = 1;
+  if (write(release_pipe[1], &byte, sizeof(byte)) != sizeof(byte)) {
+    return 22;
+  }
+  void *result = NULL;
+  if (pthread_join(thread, &result) != 0 || result != NULL) {
+    return 23;
+  }
+  errno = 0;
+  if (syscall(SYS_get_robust_list, tid, &head, &length) != -1 ||
+      errno != ESRCH) {
+    return 24;
+  }
+
+  puts("robust-list lifecycle ok");
+  return 0;
+}
+"#,
+    );
+    let executable = executable.to_str().unwrap();
+    let (stdout, stderr) =
+        run_host_program_with_tool_captured(executable, &[executable], &directory.0);
+    assert_eq!(stdout, b"robust-list lifecycle ok\n");
+    assert!(
+        stderr.is_empty(),
+        "stderr={}",
+        String::from_utf8_lossy(&stderr)
+    );
 }
 
 #[test]
