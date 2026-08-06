@@ -24,7 +24,7 @@ use sha2::Sha256;
 const DYNAMORIO_REVISION: &str = "929840ad9190e5086775e8debc0f0b79b4208d59";
 const MAX_PARALLEL_JOBS: usize = 16;
 // Provenance: three clean builds of this curated source tree on 2026-08-03:
-// 13.91s and 14.54s with 16 jobs on devbig014, and 71.49s with 4 jobs on a
+// 13.91s and 14.54s with 16 jobs on a development runner, and 71.49s with 4 jobs on a
 // GitHub-hosted runner. Their elapsed-seconds * requested-jobs proxies were
 // 222.56, 232.64, and 285.96 job-seconds. The CI ratchet is 2x the slowest
 // observation, rounded up; local source installs report without enforcing it.
