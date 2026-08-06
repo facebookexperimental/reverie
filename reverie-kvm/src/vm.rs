@@ -26,6 +26,8 @@ use kvm_ioctls::Kvm;
 use kvm_ioctls::VcpuExit;
 use kvm_ioctls::VcpuFd;
 use kvm_ioctls::VmFd;
+use reverie::BackendStatsRequest;
+use reverie::BackendStatsSource;
 use reverie::GlobalTool;
 use reverie::Pid;
 use reverie::ThreadOwnership;
@@ -58,6 +60,8 @@ use crate::executor::ElfExecutor;
 use crate::executor::ProcessAction;
 use crate::runtime::SyscallExecutor;
 use crate::runtime::ToolContext;
+use crate::stats::KvmBackendStats;
+use crate::stats::KvmExitCollector;
 use crate::syscall::FRAME_SIZE;
 
 /// KVM currently permits userspace exits for this standardized hypercall.
@@ -348,6 +352,9 @@ pub struct KvmBackend {
     pub(crate) static_elf: Option<LoadedStaticElf>,
     stdin: Option<File>,
     pub(crate) root_pid: i32,
+    // One optional collector is shared by every fork and thread backend in the
+    // guest tree. `None` is the allocation-free, update-free default.
+    pub(crate) exit_collector: Option<Arc<KvmExitCollector>>,
 }
 
 struct KvmProcessSnapshot {
@@ -455,7 +462,34 @@ impl KvmBackend {
             static_elf: None,
             stdin,
             root_pid: 1,
+            exit_collector: None,
         })
+    }
+
+    /// Enables or disables completed-process-tree KVM exit statistics.
+    ///
+    /// Call this once before entering the guest. Enabling creates the collector
+    /// that every later fork and `CLONE_THREAD` child inherits; disabling drops
+    /// it, so unmeasured runs allocate and update no statistics state.
+    pub fn set_backend_stats_request(&mut self, request: BackendStatsRequest) {
+        self.exit_collector = request
+            .is_enabled()
+            .then(|| Arc::new(KvmExitCollector::default()));
+    }
+
+    /// Returns whether this process tree is collecting KVM exit statistics.
+    pub fn backend_stats_request(&self) -> BackendStatsRequest {
+        BackendStatsRequest::new(self.exit_collector.is_some())
+    }
+
+    /// Records one vCPU exit in the shared process-tree collector, when enabled.
+    ///
+    /// This is an associated function over a disjoint field so callers can use
+    /// it while the live [`VcpuExit`] still borrows the vCPU's `KVM_RUN` mapping.
+    pub(crate) fn record_exit(collector: Option<&KvmExitCollector>, exit: &VcpuExit<'_>) {
+        if let Some(collector) = collector {
+            collector.record(exit);
+        }
     }
 
     /// Forces who owns this backend's guest threads (see [`ThreadOwnership`]),
@@ -751,7 +785,9 @@ impl KvmBackend {
                 self.syscall_frame_address,
                 true,
             )?;
-            let parked = match self.vcpu.run()? {
+            let vcpu_exit = self.vcpu.run()?;
+            Self::record_exit(self.exit_collector.as_deref(), &vcpu_exit);
+            let parked = match vcpu_exit {
                 VcpuExit::Hlt => Ok(()),
                 exit => Err(Error::UnexpectedVcpuExit(format!(
                     "parent did not park at fork: {exit:?}"
@@ -773,6 +809,7 @@ impl KvmBackend {
         // Forked children inherit the parent's thread ownership so execution and
         // `is_backend_owned_syscall`'s futex classification stay consistent.
         child.thread_ownership = self.thread_ownership;
+        child.exit_collector = self.exit_collector.clone();
         write_tid_best_effort(&mut child.memory, child_tid, child_pid);
         let (fs_base, gs_base) = child_executor.segment_bases();
         set_user_segment_base(&child.vcpu, SegmentBase::Fs, fs_base)?;
@@ -871,7 +908,9 @@ impl KvmBackend {
                         self.syscall_frame_address,
                         true,
                     )?;
-                    let parked = match self.vcpu.run()? {
+                    let vcpu_exit = self.vcpu.run()?;
+                    Self::record_exit(self.exit_collector.as_deref(), &vcpu_exit);
+                    let parked = match vcpu_exit {
                         VcpuExit::Hlt => Ok(()),
                         exit => Err(Error::UnexpectedVcpuExit(format!(
                             "parent did not park at thread clone: {exit:?}"
@@ -908,6 +947,7 @@ impl KvmBackend {
                 // execution and futex classification stay consistent.
                 self.debug_assert_thread_ownership_consistent();
                 child.thread_ownership = self.thread_ownership;
+                child.exit_collector = self.exit_collector.clone();
                 child
                     .memory
                     .write_raw(child.syscall_frame_address, &parent_syscall_frame)?;
@@ -956,7 +996,9 @@ impl KvmBackend {
                         self.syscall_frame_address,
                         true,
                     )?;
-                    let parked = match self.vcpu.run()? {
+                    let vcpu_exit = self.vcpu.run()?;
+                    Self::record_exit(self.exit_collector.as_deref(), &vcpu_exit);
+                    let parked = match vcpu_exit {
                         VcpuExit::Hlt => Ok(()),
                         exit => Err(Error::UnexpectedVcpuExit(format!(
                             "process did not park before exec: {exit:?}"
@@ -1129,7 +1171,9 @@ impl KvmBackend {
                         self.syscall_frame_address,
                         true,
                     )?;
-                    let parked = match self.vcpu.run()? {
+                    let vcpu_exit = self.vcpu.run()?;
+                    Self::record_exit(self.exit_collector.as_deref(), &vcpu_exit);
+                    let parked = match vcpu_exit {
                         VcpuExit::Hlt => Ok(()),
                         exit => Err(Error::UnexpectedVcpuExit(format!(
                             "parent did not park at thread clone: {exit:?}"
@@ -1166,6 +1210,7 @@ impl KvmBackend {
                 // execution and futex classification stay consistent.
                 self.debug_assert_thread_ownership_consistent();
                 child.thread_ownership = self.thread_ownership;
+                child.exit_collector = self.exit_collector.clone();
                 child
                     .memory
                     .write_raw(child.syscall_frame_address, &parent_syscall_frame)?;
@@ -1350,6 +1395,7 @@ impl KvmBackend {
                 Err(error) if error.errno() == libc::EINTR => continue,
                 Err(error) => return Err(error.into()),
             };
+            Self::record_exit(self.exit_collector.as_deref(), &vcpu_exit);
             let (segment_update, process_action) = match vcpu_exit {
                 VcpuExit::Hypercall(exit) => {
                     if exit.nr != VMCALL_SYSCALL_TRANSPORT {
@@ -1507,7 +1553,9 @@ impl KvmBackend {
         F: FnMut(Syscall, &GuestMemory) -> i64,
     {
         loop {
-            match self.vcpu.run()? {
+            let vcpu_exit = self.vcpu.run()?;
+            Self::record_exit(self.exit_collector.as_deref(), &vcpu_exit);
+            match vcpu_exit {
                 VcpuExit::Hypercall(exit) => {
                     if exit.nr != VMCALL_SYSCALL_TRANSPORT {
                         return Err(Error::UnexpectedHypercall(exit.nr));
@@ -1525,6 +1573,19 @@ impl KvmBackend {
     /// Exposes the VM fd for future backend setup without transferring ownership.
     pub fn vm_fd(&self) -> &VmFd {
         &self.vm
+    }
+}
+
+impl BackendStatsSource for KvmBackend {
+    type Snapshot = KvmBackendStats;
+
+    /// Snapshots exits from the root and every inherited fork/thread collector.
+    /// End-of-run callers observe a complete tree because the KVM run paths join
+    /// process workers and guest threads before returning to the root caller.
+    fn backend_stats(&self) -> Self::Snapshot {
+        self.exit_collector
+            .as_deref()
+            .map_or_else(KvmBackendStats::default, KvmExitCollector::snapshot)
     }
 }
 

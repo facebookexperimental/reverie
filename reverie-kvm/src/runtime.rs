@@ -1049,7 +1049,9 @@ impl KvmBackend {
         }
 
         loop {
-            match self.vcpu.run()? {
+            let vcpu_exit = self.vcpu.run()?;
+            Self::record_exit(self.exit_collector.as_deref(), &vcpu_exit);
+            match vcpu_exit {
                 VcpuExit::Hypercall(exit) => {
                     if exit.nr != VMCALL_SYSCALL_TRANSPORT {
                         return Err(Error::UnexpectedHypercall(exit.nr));
@@ -1405,6 +1407,7 @@ impl KvmBackend {
                 Err(error) if error.errno() == libc::EINTR => continue,
                 Err(error) => return Err(error.into()),
             };
+            Self::record_exit(self.exit_collector.as_deref(), &vcpu_exit);
             let (frame_address, return_slot) = match vcpu_exit {
                 VcpuExit::Hypercall(exit) => {
                     if exit.nr != VMCALL_SYSCALL_TRANSPORT {

@@ -16,6 +16,8 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use kvm_ioctls::Kvm;
+use reverie::BackendStatsRequest;
+use reverie::BackendStatsSource;
 use reverie::ExitStatus;
 use reverie::GlobalRPC;
 use reverie::GlobalTool;
@@ -39,6 +41,8 @@ use reverie_kvm::Error;
 use reverie_kvm::HierarchicalCounterTool;
 use reverie_kvm::HierarchicalTotals;
 use reverie_kvm::KvmBackend;
+use reverie_kvm::KvmBackendStats;
+use reverie_kvm::KvmExitReason;
 use reverie_kvm::StraceTool;
 
 const MEMORY_SIZE: usize = 16 * 1024 * 1024;
@@ -417,6 +421,17 @@ impl Tool for FailingPostExecTool {
 
 fn kvm_is_unavailable(error: &kvm_ioctls::Error) -> bool {
     matches!(error.errno(), libc::ENOENT | libc::EACCES | libc::EPERM)
+}
+
+fn kvm_available(test: &str) -> bool {
+    match Kvm::new() {
+        Ok(_) => true,
+        Err(error) if kvm_is_unavailable(&error) => {
+            eprintln!("skipping {test}: cannot open /dev/kvm: {error}");
+            false
+        }
+        Err(error) => panic!("failed to probe /dev/kvm: {error}"),
+    }
 }
 
 fn assert_invalid_opcode(error: Error) {
@@ -1554,6 +1569,235 @@ fn static_elf_getppid_matches_ptrace_parity() {
         0,
         "namespace-init guest pid=1 must report getppid()==0"
     );
+}
+
+fn run_stats_program(code: &[u8], name: &str, request: BackendStatsRequest) -> KvmBackendStats {
+    let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+    backend.set_backend_stats_request(request);
+    backend.install_static_elf(&static_elf(code), name).unwrap();
+    let (_, exit_code, stdout, stderr) =
+        futures::executor::block_on(backend.run_static_elf_with_tool::<StraceTool>((), true))
+            .unwrap();
+    assert_eq!(exit_code, 0, "{name}");
+    assert!(stdout.is_empty(), "{name}");
+    assert!(stderr.is_empty(), "{name}");
+
+    let snapshot = backend.backend_stats();
+    assert_eq!(
+        request.collect(&backend),
+        request.is_enabled().then(|| snapshot.clone()),
+        "{name} request and snapshot source must agree"
+    );
+    snapshot
+}
+
+fn stats_root_program() -> Vec<u8> {
+    vec![
+        0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax, SYS_getpid
+        0x0f, 0x05, // syscall
+        0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax, SYS_exit_group
+        0x31, 0xff, // xor edi, edi
+        0x0f, 0x05, // syscall
+        0x0f, 0x0b, // ud2
+    ]
+}
+
+fn patch_stats_jump(code: &mut [u8], operand: usize, target: usize) {
+    let displacement = i32::try_from(target as isize - (operand + 4) as isize).unwrap();
+    code[operand..operand + 4].copy_from_slice(&displacement.to_le_bytes());
+}
+
+fn append_stats_exit(code: &mut Vec<u8>, group: bool) {
+    let number = if group {
+        libc::SYS_exit_group
+    } else {
+        libc::SYS_exit
+    };
+    code.push(0xb8); // mov eax, SYS_exit[_group]
+    code.extend_from_slice(&(number as u32).to_le_bytes());
+    code.extend_from_slice(&[
+        0x31, 0xff, // xor edi, edi
+        0x0f, 0x05, // syscall
+        0x0f, 0x0b, // ud2
+    ]);
+}
+
+fn stats_fork_program() -> Vec<u8> {
+    let mut code = vec![
+        0xb8, 0x39, 0x00, 0x00, 0x00, // mov eax, SYS_fork
+        0x0f, 0x05, // syscall
+        0x85, 0xc0, // test eax, eax
+        0x0f, 0x84, 0, 0, 0, 0, // jz child
+    ];
+    let child_jump = code.len() - 4;
+
+    code.extend_from_slice(&[
+        0x89, 0xc7, // mov edi, eax
+        0x48, 0x83, 0xec, 0x10, // sub rsp, 16
+        0x48, 0x89, 0xe6, // mov rsi, rsp
+        0x31, 0xd2, // xor edx, edx
+        0x45, 0x31, 0xd2, // xor r10d, r10d
+        0xb8, 0x3d, 0x00, 0x00, 0x00, // mov eax, SYS_wait4
+        0x0f, 0x05, // syscall
+    ]);
+    append_stats_exit(&mut code, true);
+
+    let child = code.len();
+    patch_stats_jump(&mut code, child_jump, child);
+    code.extend_from_slice(&[
+        0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax, SYS_getpid
+        0x0f, 0x05, // syscall
+    ]);
+    append_stats_exit(&mut code, true);
+    code
+}
+
+fn stats_clone_thread_program() -> Vec<u8> {
+    const CHILD_TID: u64 = LOAD_ADDRESS + 0x1800;
+    const CHILD_STACK: u64 = LOAD_ADDRESS + 0x1900;
+    const CHILD_STACK_SIZE: u64 = 0x600;
+
+    let flags = libc::CLONE_VM as u64
+        | libc::CLONE_FS as u64
+        | libc::CLONE_FILES as u64
+        | libc::CLONE_SIGHAND as u64
+        | libc::CLONE_THREAD as u64
+        | libc::CLONE_SYSVSEM as u64
+        | libc::CLONE_CHILD_SETTID as u64
+        | libc::CLONE_CHILD_CLEARTID as u64;
+
+    let mut code = vec![0x48, 0xb9]; // movabs rcx, child_tid
+    code.extend_from_slice(&CHILD_TID.to_le_bytes());
+    code.extend_from_slice(&[
+        0xc7, 0x01, 0xff, 0xff, 0xff, 0x7f, // mov dword ptr [rcx], 0x7fffffff
+        0xb8, 0xb3, 0x01, 0x00, 0x00, // mov eax, SYS_clone3
+        0x48, 0xbf, // movabs rdi, clone_args
+    ]);
+    let clone_args_operand = code.len();
+    code.extend_from_slice(&0_u64.to_le_bytes());
+    code.extend_from_slice(&[
+        0xbe, 0x58, 0x00, 0x00, 0x00, // mov esi, sizeof(clone_args)
+        0x0f, 0x05, // syscall
+        0x85, 0xc0, // test eax, eax
+        0x0f, 0x84, 0, 0, 0, 0, // jz child
+    ]);
+    let child_jump = code.len() - 4;
+
+    code.extend_from_slice(&[0x48, 0xb9]); // movabs rcx, child_tid
+    code.extend_from_slice(&CHILD_TID.to_le_bytes());
+    let wait = code.len();
+    code.extend_from_slice(&[
+        0x83, 0x39, 0x00, // cmp dword ptr [rcx], 0
+        0x0f, 0x85, 0, 0, 0, 0, // jne wait
+    ]);
+    let wait_jump = code.len() - 4;
+    patch_stats_jump(&mut code, wait_jump, wait);
+    append_stats_exit(&mut code, true);
+
+    let child = code.len();
+    patch_stats_jump(&mut code, child_jump, child);
+    code.extend_from_slice(&[
+        0xb8, 0xba, 0x00, 0x00, 0x00, // mov eax, SYS_gettid
+        0x0f, 0x05, // syscall
+    ]);
+    append_stats_exit(&mut code, false);
+
+    while !code.len().is_multiple_of(8) {
+        code.push(0);
+    }
+    let clone_args_address = LOAD_ADDRESS + code.len() as u64;
+    code[clone_args_operand..clone_args_operand + 8]
+        .copy_from_slice(&clone_args_address.to_le_bytes());
+    let mut clone_args = [0_u8; 88];
+    clone_args[0..8].copy_from_slice(&flags.to_le_bytes());
+    clone_args[16..24].copy_from_slice(&CHILD_TID.to_le_bytes());
+    clone_args[40..48].copy_from_slice(&CHILD_STACK.to_le_bytes());
+    clone_args[48..56].copy_from_slice(&CHILD_STACK_SIZE.to_le_bytes());
+    code.extend_from_slice(&clone_args);
+    code
+}
+
+fn assert_exact_stats(snapshot: &KvmBackendStats, hypercalls: u64, halts: u64) {
+    assert_eq!(snapshot.count(KvmExitReason::Hypercall), hypercalls);
+    assert_eq!(snapshot.count(KvmExitReason::Hlt), halts);
+    assert_eq!(snapshot.total_exits(), hypercalls + halts, "{snapshot}");
+}
+
+#[test]
+fn kvm_stats_disabled_run_records_no_exits() {
+    if !kvm_available("kvm_stats_disabled_run_records_no_exits") {
+        return;
+    }
+
+    let snapshot = run_stats_program(
+        &stats_root_program(),
+        "/bin/kvm-stats-disabled",
+        BackendStatsRequest::DISABLED,
+    );
+    assert_exact_stats(&snapshot, 0, 0);
+}
+
+#[test]
+fn kvm_stats_root_production_loop_is_exact_and_repeatable() {
+    if !kvm_available("kvm_stats_root_production_loop_is_exact_and_repeatable") {
+        return;
+    }
+
+    let first = run_stats_program(
+        &stats_root_program(),
+        "/bin/kvm-stats-root",
+        BackendStatsRequest::ENABLED,
+    );
+    let second = run_stats_program(
+        &stats_root_program(),
+        "/bin/kvm-stats-root",
+        BackendStatsRequest::ENABLED,
+    );
+    assert_exact_stats(&first, 2, 0);
+    assert_eq!(first, second);
+}
+
+#[test]
+fn kvm_stats_fork_process_tree_is_exact_and_repeatable() {
+    if !kvm_available("kvm_stats_fork_process_tree_is_exact_and_repeatable") {
+        return;
+    }
+
+    let first = run_stats_program(
+        &stats_fork_program(),
+        "/bin/kvm-stats-fork",
+        BackendStatsRequest::ENABLED,
+    );
+    let second = run_stats_program(
+        &stats_fork_program(),
+        "/bin/kvm-stats-fork",
+        BackendStatsRequest::ENABLED,
+    );
+    // Root: fork + wait4 + exit_group. Child: getpid + exit_group.
+    assert_exact_stats(&first, 5, 1);
+    assert_eq!(first, second);
+}
+
+#[test]
+fn kvm_stats_clone_thread_process_tree_is_exact_and_repeatable() {
+    if !kvm_available("kvm_stats_clone_thread_process_tree_is_exact_and_repeatable") {
+        return;
+    }
+
+    let first = run_stats_program(
+        &stats_clone_thread_program(),
+        "/bin/kvm-stats-thread",
+        BackendStatsRequest::ENABLED,
+    );
+    let second = run_stats_program(
+        &stats_clone_thread_program(),
+        "/bin/kvm-stats-thread",
+        BackendStatsRequest::ENABLED,
+    );
+    // Root: clone3 + exit_group. Child: gettid + exit. The parent waits in
+    // guest memory for CLONE_CHILD_CLEARTID, so the child exit is counted first.
+    assert_exact_stats(&first, 4, 1);
+    assert_eq!(first, second);
 }
 
 #[test]
