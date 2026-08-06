@@ -11,7 +11,7 @@ Third-party components
 Reverie redistributes the pinned native sources used by its optional backends
 inside their Cargo packages:
 
-  * `reverie-dbi/vendor/dynamorio`
+  * `reverie-dbt/vendor/dynamorio`
   * `experimental/reverie-sabre/vendor/{sabre,libelf}`
   * `reverie-e9patch/vendor/e9patch`
 
@@ -26,9 +26,9 @@ DynamoRIO
 Upstream:  https://github.com/DynamoRIO/dynamorio
 Fork:      https://github.com/rrnewton/dynamorio
 Pinned commit: 929840ad9190e5086775e8debc0f0b79b4208d59
-Packaged path: `reverie-dbi/vendor/dynamorio`
+Packaged path: `reverie-dbt/vendor/dynamorio`
 License:   BSD-3-Clause (primary), with the additional component licenses below.
-           Full text: `reverie-dbi/vendor/dynamorio/License.txt`.
+           Full text: `reverie-dbt/vendor/dynamorio/License.txt`.
 
   Copyright (c) 2010-2024 Google, Inc.   All rights reserved.
   Copyright (c) 2000-2009 VMware, Inc.   All rights reserved.
@@ -37,7 +37,7 @@ DynamoRIO's License.txt calls out non-BSD-3 portions. The curated build uses
 `BUILD_CLIENTS=OFF`, `BUILD_EXT=ON`, and `BUILD_TOOLS=ON`, and retains only
 drcontainers, drmgr, drreg, drwrap, and drx. Of those packaged extensions,
 drwrap is LGPL-2.1-only; its complete text is also at
-`reverie-dbi/vendor/dynamorio/ext/drwrap/license.txt`.
+`reverie-dbt/vendor/dynamorio/ext/drwrap/license.txt`.
 
 The curated tree does not contain drsyms, drsyscall, drutil, elfutils, libipt,
 or zlib sources.
@@ -55,7 +55,7 @@ The packaged tree also contains:
     (valgrind.h, memcheck.h) ............. BSD-4-Clause
                                            Copyright (C) 2000-2013 Julian Seward.
     The full BSD-4-Clause notice is embedded at the top of each header under
-    `reverie-dbi/vendor/dynamorio/third_party/valgrind/`.
+    `reverie-dbt/vendor/dynamorio/third_party/valgrind/`.
 
 --------------------------------------------------------------------------------
 SaBRe

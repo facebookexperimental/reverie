@@ -753,7 +753,7 @@ impl<T: Tool> Guest<T> for LiteinstGuest<'_, T> {
     }
 
     fn read_clock(&mut self) -> Result<u64, Error> {
-        // DBI likewise exposes a boundary sample rather than a continuously
+        // DBT likewise exposes a boundary sample rather than a continuously
         // advancing PMU clock. LiteInst has no sample yet, so zero is the honest
         // deterministic lower bound. Detcore separately charges syscall time.
         Ok(0)

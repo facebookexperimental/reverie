@@ -3,7 +3,7 @@
     "ptrace",
     "kvm",
     "liteinst",
-    "dbi",
+    "dbt",
     "sabre",
     "e9patch"
   ],

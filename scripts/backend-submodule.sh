@@ -8,7 +8,7 @@ usage() {
 usage: scripts/backend-submodule.sh <activate|deactivate|status> <backend|all>
 
 backends:
-  dynamorio   DynamoRIO source used by reverie-dbi
+  dynamorio   DynamoRIO source used by reverie-dbt
   sabre       SaBRe loader source used by reverie-sabre
   e9patch     e9patch source reserved for the rewriting backend
 EOF
@@ -17,7 +17,7 @@ EOF
 
 backend_path() {
     case "$1" in
-        dynamorio|dbi) printf '%s\n' third-party/dynamorio ;;
+        dynamorio|dbt) printf '%s\n' third-party/dynamorio ;;
         sabre) printf '%s\n' third-party/sabre ;;
         e9patch) printf '%s\n' third-party/e9patch ;;
         *) return 1 ;;

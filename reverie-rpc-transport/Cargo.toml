@@ -9,7 +9,7 @@ authors = ["Meta Platforms"]
 edition = "2021"
 repository = "https://github.com/facebookexperimental/reverie"
 license = "BSD-2-Clause"
-description = "Cross-process transport for the Reverie GlobalTool RPC (Unix-domain sockets + bincode). Shared by non-ptrace backends (DBI, KVM, ...) that must run GlobalState in a separate coordinator process."
+description = "Cross-process transport for the Reverie GlobalTool RPC (Unix-domain sockets + bincode). Shared by non-ptrace backends (DBT, KVM, ...) that must run GlobalState in a separate coordinator process."
 
 [dependencies]
 async-trait = "0.1.86"

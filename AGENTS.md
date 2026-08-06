@@ -40,7 +40,7 @@ shared `reverie` crate:
 | Backend | Crate | Interception | Status |
 | --- | --- | --- | --- |
 | ptrace | `reverie-ptrace` | seccomp-BPF traps only subscribed syscalls; supervisor handles ptrace stops | production |
-| DBI | `reverie-dbi` | DynamoRIO rewrites the code stream; tool compiled into a release-built client `.so` | in progress |
+| DBT | `reverie-dbt` | DynamoRIO rewrites the code stream; tool compiled into a release-built client `.so` | in progress |
 | KVM | `reverie-kvm` | guest runs in a VM; syscalls surface as hypercalls | in progress |
 | e9patch / liteinst | `reverie-e9patch`, `reverie-liteinst`, `reverie-preload` | in-process rewriting + `LD_PRELOAD` + seccomp/SIGSYS runtime | experimental |
 
@@ -48,7 +48,7 @@ For ptrace and KVM the `GlobalState` lives in-process: `send_rpc` calls
 `receive_rpc` as a direct in-address-space async call and no serialization runs
 at runtime (ptrace does a `bincode` round-trip only under `debug_assertions` as a
 self-check; KVM never does, and `reverie-kvm` does not depend on
-`reverie-rpc-transport`). The out-of-process configurations — DBI (only when a
+`reverie-rpc-transport`). The out-of-process configurations — DBT (only when a
 coordinator socket is configured so fork/exec children share one `GlobalState`),
 e9patch, and liteinst/preload — route it to a coordinator process over
 `reverie-rpc-transport` (UDS + bincode). The `Serialize + DeserializeOwned`
@@ -261,7 +261,7 @@ Reverie-side change without an integrated Hermit run at the stated level.
 
 Every result about a run states, explicitly:
 
-- **Backend**: `ptrace`, `DBI`, or `KVM`.
+- **Backend**: `ptrace`, `DBT`, or `KVM`.
 - **Log level**: the `RUST_LOG`/`--log` level, or "default" when unset.
 - **Relaxations**: any flag that weakens determinism, for example
   `--no-strict`. State "none" when there are none.

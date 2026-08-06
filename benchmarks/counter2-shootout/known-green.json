@@ -10,7 +10,7 @@
         "ptrace": "dynamic",
         "kvm": "static",
         "liteinst": "dynamic",
-        "dbi": "dynamic",
+        "dbt": "dynamic",
         "sabre": "dynamic",
         "e9patch": "dynamic"
       }
@@ -23,7 +23,7 @@
         "ptrace": "dynamic",
         "kvm": "static",
         "liteinst": "dynamic",
-        "dbi": "dynamic",
+        "dbt": "dynamic",
         "sabre": "dynamic",
         "e9patch": "dynamic"
       }

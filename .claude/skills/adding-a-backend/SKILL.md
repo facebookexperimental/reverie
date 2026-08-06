@@ -1,6 +1,6 @@
 ---
 name: adding-a-backend
-description: "How to add a new Reverie execution backend — implementing Backend::run<T>, providing a Guest<T> view (regs, memory, inject/tail_inject), wiring GlobalState over reverie-rpc-transport for out-of-process backends, and enumerating serviced syscalls. Read when building or extending a backend (ptrace/KVM/DBI/e9patch)."
+description: "How to add a new Reverie execution backend — implementing Backend::run<T>, providing a Guest<T> view (regs, memory, inject/tail_inject), wiring GlobalState over reverie-rpc-transport for out-of-process backends, and enumerating serviced syscalls. Read when building or extending a backend (ptrace/KVM/DBT/e9patch)."
 ---
 
 # Adding a Backend
@@ -9,14 +9,14 @@ A backend is what actually *runs* the guest and delivers its events to a `Tool`.
 Tools are backend-agnostic (see `reverie-architecture`); a backend's job is to
 satisfy two contracts — `Backend` and `Guest` — so any existing tool runs over
 it unchanged. Study `reverie-ptrace` (production, complete) as the reference and
-`reverie-kvm` / `reverie-dbi` (in progress) for the out-of-process pattern.
+`reverie-kvm` / `reverie-dbt` (in progress) for the out-of-process pattern.
 
 Concrete entry points to read: `PtraceBackend` (a ZST) in
 `reverie-ptrace/src/backend.rs`, which delegates to `TracerBuilder::<T>` +
 `Tracer::wait` in `reverie-ptrace/src/tracer.rs`; `KvmBackend` in
 `reverie-kvm/src/vm.rs` with `run_static_elf_with_tool::<T>` /
-`run_with_tool::<T, F>`; and `DbiGuest<'a, T>` + `DbiRunner` in
-`reverie-dbi/src/lib.rs`.
+`run_with_tool::<T, F>`; and `DbtGuest<'a, T>` + `DbtRunner` in
+`reverie-dbt/src/lib.rs`.
 
 ## 1. Implement `Backend::run<T>`
 
@@ -55,7 +55,7 @@ the same single-threaded driving model unless it genuinely needs otherwise.
 backend supplies a concrete `Guest` implementation backed by its transport:
 
 - `type Memory: MemoryAccess` + `memory()` — read/write **guest** address space
-  (ptrace: `process_vm_readv`/writev; KVM: guest-physical translation; DBI:
+  (ptrace: `process_vm_readv`/writev; KVM: guest-physical translation; DBT:
   in-process reads). Handlers dereference pointer args through this.
 - `async regs()` / `async set_regs()` — the trapped thread's registers.
 - `type Stack` + `async stack()` — guest stack access.
@@ -70,10 +70,10 @@ backend supplies a concrete `Guest` implementation backed by its transport:
 - `daemonize`, `backtrace`, `has_cpuid_interception` — implement or return a
   principled "unsupported".
 
-## 3. Out-of-process `GlobalState` (KVM, DBI)
+## 3. Out-of-process `GlobalState` (KVM, DBT)
 
 With ptrace the supervisor shares one address space, so `GlobalState` lives
-in-process. **KVM and DBI run guest code in a separate address space**, so the
+in-process. **KVM and DBT run guest code in a separate address space**, so the
 `GlobalTool` singleton runs in a **coordinator process** and handlers reach it
 over **`reverie-rpc-transport`** (Unix domain socket + bincode):
 
@@ -87,20 +87,20 @@ over **`reverie-rpc-transport`** (Unix domain socket + bincode):
 ## 4. Enumerate serviced syscalls (executor completeness)
 
 The ptrace backend lets unsubscribed syscalls run natively, so it "supports"
-everything by default. An **executing** backend (KVM, DBI) must *itself* perform
+everything by default. An **executing** backend (KVM, DBT) must *itself* perform
 each syscall it injects, so it needs an explicit dispatch arm per syscall.
 Un-enumerated syscalls fall through to a default — typically `ENOSYS` — which
 surfaces as a guest failure. Extending such a backend means:
 
 1. Add the syscall to the backend's executor/dispatch (e.g. the KVM
-   `executor.rs` if/else chain, or the DBI client dispatch).
+   `executor.rs` if/else chain, or the DBT client dispatch).
 2. Add the classification entry if the tool gates on it.
 3. Mark bot-authored entries with `// AUTONOMOUS-BOT-IMPLEMENTED` and
    `// TODO-HUMAN-REVIEW(PR-id)` per this repo's Autonomous Bot Audit Tags rule.
 4. Add a regression at the narrowest useful layer.
 
 This incremental "ratchet" (add one syscall family, prove it, repeat) is the
-established way the KVM and DBI backends grow coverage.
+established way the KVM and DBT backends grow coverage.
 
 ## 5. Backend-specific footguns (from prior work)
 
@@ -111,12 +111,12 @@ established way the KVM and DBI backends grow coverage.
   non-returning, so record any Exit **before** the tail_inject. The KVM executor
   ENOSYSes every un-enumerated syscall and had no socket support until added
   incrementally. Needs `/dev/kvm` with `Cap::ExitHypercall`; x86_64 only.
-- **DBI (DynamoRIO):** a handler returns its decision as
-  `DbiSyscallOutcome::{Suppress(i64), ExecuteOriginal(Syscall)}`; native FFI
-  callbacks (`DbiRuntimeCallbacks`) bridge DR ↔ Rust and the async handler future
+- **DBT (DynamoRIO):** a handler returns its decision as
+  `DbtSyscallOutcome::{Suppress(i64), ExecuteOriginal(Syscall)}`; native FFI
+  callbacks (`DbtRuntimeCallbacks`) bridge DR ↔ Rust and the async handler future
   is polled on the guest thread. The tool is *compiled into* the client `.so`
   (no runtime tool selection); it must be **release-built** (debug frames
-  overflow the DR stack); a Rust `panic!` in a DBI handler `SIGABRT`s (no
+  overflow the DR stack); a Rust `panic!` in a DBT handler `SIGABRT`s (no
   unwind). Tools run only in the traced-tree root; copied children bypass the
   Rust path. `set_regs` maps to `dr_set_mcontext` (returns `EIO` on failure).
 - **All out-of-process backends:** correctness must not depend on a shared
@@ -129,7 +129,7 @@ determinism claim (L1+) requires an **integrated Hermit run** at the stated
 level with the backend named — a Reverie-side change never establishes L1 by
 itself (see the Assurance Levels table in `AGENTS.md`). Run the example tools
 (`noop`, `counter1/2`, `strace`) over the new backend as smoke tests; see the
-`testing-tools` skill for commands and the `reverie-dbi/scripts/` harness.
+`testing-tools` skill for commands and the `reverie-dbt/scripts/` harness.
 
 ## Post-facto human-review criteria
 

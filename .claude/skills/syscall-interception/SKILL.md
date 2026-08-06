@@ -1,6 +1,6 @@
 ---
 name: syscall-interception
-description: "How a Reverie tool observes and rewrites guest syscalls — declaring subscriptions, the handle_syscall_event hook, inject vs. tail_inject, typed syscalls via reverie-syscalls, reading/writing guest memory, and the per-backend trap mechanisms (ptrace seccomp, DBI, KVM hypercalls). Read when writing or debugging syscall handlers."
+description: "How a Reverie tool observes and rewrites guest syscalls — declaring subscriptions, the handle_syscall_event hook, inject vs. tail_inject, typed syscalls via reverie-syscalls, reading/writing guest memory, and the per-backend trap mechanisms (ptrace seccomp, DBT, KVM hypercalls). Read when writing or debugging syscall handlers."
 ---
 
 # Syscall Interception
@@ -74,7 +74,7 @@ through the guest's memory interface, never the host's:
   `write_exact`/`read_value`/`write_value`/`read_cstring`/`reader`/`writer`
   (e.g. read a `pathname` a syscall points at, or write a virtualized `struct`
   back into a guest buffer after `inject`). Addressing types: `Addr<T>`,
-  `AddrMut<T>`, `AddrSlice`, `LocalMemory` (the in-process impl DBI uses).
+  `AddrMut<T>`, `AddrSlice`, `LocalMemory` (the in-process impl DBT uses).
 - `guest.regs()` / `guest.set_regs()` (`:82`/`:98`) for raw register access when
   you need it (e.g. rewriting a syscall number/args before injection).
 - To *edit* a syscall's arguments, construct a modified typed syscall with a
@@ -102,12 +102,12 @@ The handler code is backend-agnostic, but *how* the syscall is trapped differs
 | Backend | Trap mechanism | Cost profile |
 | --- | --- | --- |
 | **ptrace** (`reverie-ptrace`) | seccomp-BPF filter raises `PTRACE_EVENT_SECCOMP` only for subscribed syscalls; supervisor handles it in a ptrace stop | ~0 for unsubscribed; ~26–40 µs per *observed* syscall |
-| **DBI** (`reverie-dbi`) | DynamoRIO rewrites the guest's code stream; a clean-call thunk lands in the tool `.so` on every syscall | flat ~2 µs *every* syscall (no free fast path) |
+| **DBT** (`reverie-dbt`) | DynamoRIO rewrites the guest's code stream; a clean-call thunk lands in the tool `.so` on every syscall | flat ~2 µs *every* syscall (no free fast path) |
 | **KVM** (`reverie-kvm`) | guest runs in a VM; syscalls surface as VM exits / hypercalls routed to the tool | VM-exit bounded |
 | **e9patch / liteinst** (`reverie-preload`) | in-process instruction rewriting + an `LD_PRELOAD` + seccomp/SIGSYS runtime that redirects syscalls in-process | in-process, no supervisor round-trip |
 
 Practical consequences you will hit:
-- The **KVM/DBI executor** must enumerate the syscalls it services; an
+- The **KVM/DBT executor** must enumerate the syscalls it services; an
   un-enumerated syscall falls through to a default `ENOSYS` arm. Adding support
   means adding both the classification and the executor arm (this is the
   recurring "KVM ratchet" and "determinize family" work in the memory index).

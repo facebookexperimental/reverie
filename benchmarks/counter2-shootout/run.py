@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 
-BACKENDS = ("ptrace", "kvm", "liteinst", "dbi", "sabre", "e9patch")
+BACKENDS = ("ptrace", "kvm", "liteinst", "dbt", "sabre", "e9patch")
 COUNTER_PATTERNS = (
     re.compile(
         rb"Total system calls in process tree: (?P<total>[0-9]+), "
@@ -194,19 +194,19 @@ def backend_environment(
     backend: str, env: dict[str, str], root: Path, target: Path
 ) -> dict[str, str]:
     result = env.copy()
-    if backend == "dbi":
+    if backend == "dbt":
         helper = require_file(
-            target / "reverie-dbi-dynamorio-path", "DBI DynamoRIO path helper"
+            target / "reverie-dbt-dynamorio-path", "DBT DynamoRIO path helper"
         )
         if not result.get("DYNAMORIO_HOME"):
             result["DYNAMORIO_HOME"] = subprocess.check_output(
                 [str(helper), "home"], cwd=root, text=True
             ).strip()
         result.setdefault(
-            "REVERIE_DBI_CLIENT",
-            str(target / "reverie-dbi-native" / "libreverie_dbi_client.so"),
+            "REVERIE_DBT_CLIENT",
+            str(target / "reverie-dbt-native" / "libreverie_dbt_client.so"),
         )
-        require_file(Path(result["REVERIE_DBI_CLIENT"]), "DBI native client")
+        require_file(Path(result["REVERIE_DBT_CLIENT"]), "DBT native client")
     elif backend == "e9patch":
         result.setdefault("REVERIE_E9TOOL", str(root / "third-party/e9patch/e9tool"))
         result.setdefault(
@@ -241,9 +241,9 @@ def backend_command(
             str(artifact),
             *arguments,
         ]
-    if backend == "dbi":
+    if backend == "dbt":
         return [
-            str(require_file(target / "reverie-dbi-counter2-exact", "DBI exact counter2")),
+            str(require_file(target / "reverie-dbt-counter2-exact", "DBT exact counter2")),
             "--",
             str(artifact),
             *arguments,

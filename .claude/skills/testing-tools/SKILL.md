@@ -1,6 +1,6 @@
 ---
 name: testing-tools
-description: "How to build, run, and test Reverie tools — the nightly toolchain, validate.sh gate, package-scoped cargo commands, the host-dependent test skip list, running the reverie-examples tools (noop/strace/counter/chaos) over a backend, and the reverie-dbi test scripts. Read before validating a Reverie change or writing a new tool."
+description: "How to build, run, and test Reverie tools — the nightly toolchain, validate.sh gate, package-scoped cargo commands, the host-dependent test skip list, running the reverie-examples tools (noop/strace/counter/chaos) over a backend, and the reverie-dbt test scripts. Read before validating a Reverie change or writing a new tool."
 ---
 
 # Testing Reverie Tools
@@ -99,17 +99,17 @@ Every tool takes a `--runner ptrace|kvm` selector (`reverie-examples/src/kvm_run
 so the same binary exercises either backend. `noop` first, then `strace`, is the
 standard "is a new backend wired up?" sequence.
 
-## DBI (DynamoRIO) test scripts
+## DBT (DynamoRIO) test scripts
 
-`reverie-dbi/scripts/` holds the DBI harness (the DBI client must be
+`reverie-dbt/scripts/` holds the DBT harness (the DBT client must be
 **release-built** — debug frames overflow the DynamoRIO stack; a Rust panic in a
-DBI handler `SIGABRT`s):
+DBT handler `SIGABRT`s):
 
-- `build-client.sh` — build the DBI client `.so` (release).
-- `test-echo.sh` — run a guest under the DBI backend.
+- `build-client.sh` — build the DBT client `.so` (release).
+- `test-echo.sh` — run a guest under the DBT backend.
 - `test-cpuid.sh` — CPUID interception check.
-- `test-example-tools.sh` — runs each example tool over DBI by env-var selector
-  (`HERMIT_DBI_NOOP` / `STRACE` / `SYSCALL_HISTOGRAM` / `COUNTER1` / `COUNTER2` /
+- `test-example-tools.sh` — runs each example tool over DBT by env-var selector
+  (`HERMIT_DBT_NOOP` / `STRACE` / `SYSCALL_HISTOGRAM` / `COUNTER1` / `COUNTER2` /
   `CHUNKY_PRINT` / `CHROME_TRACE` / `CHAOS`, plus test-only `REWRITE_EXIT` /
   `SET_REG` / `PPID` / `BACKTRACE`) under `drrun -c <client> -- <guest>`.
 
@@ -123,14 +123,14 @@ tests are inline `#[cfg(test)]` modules (e.g. `noop.rs`).
   proves the same thing cheaper).
 - Treat syscall/signal/clone/exec/memory/timer changes as concurrency-sensitive:
   cover lifecycle edge cases (thread start, post-exec, exit ordering).
-- For a syscall added to an executing backend (KVM/DBI), add a test that runs a
+- For a syscall added to an executing backend (KVM/DBT), add a test that runs a
   guest actually issuing that syscall over that backend.
 - Bot-authored syscall entries need `// AUTONOMOUS-BOT-IMPLEMENTED` and
   `// TODO-HUMAN-REVIEW(PR-id)` markers (see `AGENTS.md`).
 
 ## Reporting results
 
-Bind every claim to evidence: exact command, backend (`ptrace`/`KVM`/`DBI`), log
+Bind every claim to evidence: exact command, backend (`ptrace`/`KVM`/`DBT`), log
 level, relaxations (state "none"), and observed output — not a paraphrase. For
 determinism, name the level (L0–L4) and remember a Reverie-only run is L0. See
 the Precise Communication section of `AGENTS.md`.

@@ -14,7 +14,7 @@
 //! request it sends is dispatched to [`GlobalTool::receive_rpc`] on the shared
 //! instance. Because the instance is shared behind an [`Arc`], all connected
 //! guests — including forked children that connect later — observe one unified
-//! global state, which is exactly the property the DBI backend currently lacks.
+//! global state, which is exactly the property the DBT backend currently lacks.
 
 use std::path::Path;
 use std::path::PathBuf;

@@ -59,7 +59,7 @@ a *swappable implementation* — anything playing the same role as
 hard-coded one. See [The Backend Contract](#the-backend-contract) below.
 
 Reverie provides several backends: the production `ptrace` backend, the
-in-progress KVM and DBI (dynamic binary instrumentation) backends, and the
+in-progress KVM and DBT (dynamic binary instrumentation) backends, and the
 experimental SaBRe, e9patch, and LiteInst rewriting backends. With the
 *backend* role now in hand, see [Backend architecture](BACKENDS.md) for how each
 one hooks, traps, and routes a guest's events, and for the shared RPC, ptracer,
@@ -97,7 +97,7 @@ and license notes.
 `reverie-ptrace` is the reference runtime. `reverie-e9patch` and
 `reverie-liteinst` also implement the generic `Backend` contract, with the
 current hybrid and in-guest boundaries documented in
-[Backend architecture](BACKENDS.md). KVM, DBI, and SaBRe currently expose
+[Backend architecture](BACKENDS.md). KVM, DBT, and SaBRe currently expose
 specialized runners or adapters rather than that generic launch contract.
 
 Copy one of the example tools to a new Rust project (e.g. `cargo init`). You’ll

@@ -2,6 +2,6 @@ backend,workloads,geomean_slowdown
 ptrace,2,1.687496
 kvm,2,1.59733
 liteinst,2,1.032122
-dbi,2,5.433106
+dbt,2,5.433106
 sabre,2,1.055537
 e9patch,2,1.03618

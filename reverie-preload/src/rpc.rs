@@ -16,7 +16,7 @@
 //!
 //! The frame format is **identical** to the async
 //! [`reverie-rpc-transport`](https://github.com/rrnewton/reverie/pull/98)
-//! `RpcServer<G>`, so one coordinator serves both async (DBI/SaBRe) and this
+//! `RpcServer<G>`, so one coordinator serves both async (DBT/SaBRe) and this
 //! synchronous (ld-preload) client:
 //!
 //! * framing: `u32` big-endian length prefix, then a bincode 2
@@ -300,7 +300,7 @@ mod tests {
     // A tiny coordinator that speaks the exact wire protocol: send a config
     // frame, then echo each request's numeric payload incremented by one,
     // aggregating a running total to model shared GlobalState across
-    // connections (the property the DBI backend lacks).
+    // connections (the property the DBT backend lacks).
     #[test]
     fn end_to_end_against_a_wire_server() {
         let dir =

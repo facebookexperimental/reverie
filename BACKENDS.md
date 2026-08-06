@@ -35,10 +35,10 @@ source of every syscall event.
 `PtraceBackend`, `E9patchBackend`, and `LiteinstBackend` currently implement the
 generic `Backend` trait
 ([ptrace implementation][ptrace-backend], [e9patch implementation][e9-backend],
-[LiteInst implementation][lite-backend]). `KvmBackend`, the DBI runtime, and
+[LiteInst implementation][lite-backend]). `KvmBackend`, the DBT runtime, and
 the SaBRe adapter expose real `Tool`/`Guest` execution paths, but do not yet
 implement that common launch contract
-([KVM runner][kvm-runner], [DBI guest][dbi-guest],
+([KVM runner][kvm-runner], [DBT guest][dbt-guest],
 [SaBRe adapter][sabre-adapter]). This is an API-status distinction, not a claim
 that the latter paths are simulations.
 
@@ -48,7 +48,7 @@ that the latter paths are simulations.
 | --- | --- | --- | --- |
 | **ptrace** | No guest code patch. A subscription-derived seccomp filter returns `TRACE` for selected syscalls, producing ptrace stops ([filter][ptrace-filter], [dispatch][ptrace-dispatch]). | Ptrace owns the subscribed boundary. Unsubscribed syscalls are deliberately allowed, while injected syscalls use a private allowed gate ([filter][ptrace-filter]). | Process/thread tool state and the singleton are in the tracer. `GlobalRPC` becomes a local call tagged with the tracee TID ([RPC implementation][ptrace-rpc]). |
 | **KVM** | No host-ELF patching. The prototype guest syscall trampoline emits hypercall 12 with a syscall frame; a KVM exit drives `Tool::handle_syscall_event` for subscribed calls ([transport ABI][kvm-transport], [dispatch loop][kvm-dispatch]). | The static-ELF personality defines the guest syscall ABI, so the hypercall is the boundary rather than a coverage backstop. This is currently a specialized static-ELF runner, not a general Linux guest kernel ([static-ELF runner][kvm-static]). | `KvmGuest` holds real per-thread `T::ThreadState`; children get their own tool/thread state while sharing one `Arc<GlobalState>`. RPC calls `receive_rpc` directly with the issuing TID ([state setup][kvm-static], [KVM RPC][kvm-rpc]). |
-| **DBI / DBT** | No persistent ELF patch. DynamoRIO builds translated basic blocks, registers syscall callbacks, and replaces CPUID/RDTSC in its code cache ([event registration][dbi-events], [syscall callback][dbi-syscall], [instruction rewrites][dbi-instructions]). | DynamoRIO's translated execution and pre-syscall callback form the interception boundary. This is not the shared seccomp/SIGSYS completeness trap used by preload backends ([event registration][dbi-events]). | Tool code runs in the DynamoRIO client. Coordinated launches use one `RpcServer`; the guest uses a blocking, wire-compatible client and reconnects after fork. Without a coordinator, DBI falls back to an in-process singleton ([DBI coordinator][dbi-coordinator], [DBI RPC selection][dbi-rpc], [DBI wire client][dbi-wire]). |
+| **DBT / DBT** | No persistent ELF patch. DynamoRIO builds translated basic blocks, registers syscall callbacks, and replaces CPUID/RDTSC in its code cache ([event registration][dbt-events], [syscall callback][dbt-syscall], [instruction rewrites][dbt-instructions]). | DynamoRIO's translated execution and pre-syscall callback form the interception boundary. This is not the shared seccomp/SIGSYS completeness trap used by preload backends ([event registration][dbt-events]). | Tool code runs in the DynamoRIO client. Coordinated launches use one `RpcServer`; the guest uses a blocking, wire-compatible client and reconnects after fork. Without a coordinator, DBT falls back to an in-process singleton ([DBT coordinator][dbt-coordinator], [DBT RPC selection][dbt-rpc], [DBT wire client][dbt-wire]). |
 | **SaBRe** | SaBRe rewrites mapped executable `.text` at load time. It byte-scans for candidates, decodes candidate functions, relocates safe neighboring instructions into nearby scratch space, and installs a five-byte jump to the plugin handler ([range scan][sabre-scan], [jump trampoline][sabre-jump]). It also supports named-function and vDSO detours through the plugin API ([plugin API][sabre-api]). | If a known site cannot fit a jump, SaBRe writes a reserved instruction and handles the resulting `SIGILL` ([UD fallback][sabre-ud], [SIGILL handler][sabre-sigill]). The current Reverie host launch path itself installs no independent seccomp completeness filter; the loader only installs that SIGILL handler ([host launch][sabre-host], [loader setup][sabre-loader]). Therefore an entirely missed syscall site is not proved fail-closed by the current integration. | The plugin runs the tool in guest context. The remote adapter keeps per-thread state and one protected blocking RPC client per thread; a coordinator serves the shared singleton ([remote state][sabre-remote-state], [child state][sabre-child-state], [coordinator][sabre-coordinator]). Local adapter modes also exist, so SaBRe RPC is a mode choice rather than part of the rewriter itself ([adapter modes][sabre-adapter]). |
 | **e9patch, generic `Backend`** | `e9tool` rewrites every recovered syscall in the root ELF ahead of time. Preparation rejects partial coverage and signal-based B0 sites ([rewrite invocation][e9-rewrite]). The replacement frame emits a validated `SIGTRAP` to the ptracer ([hybrid setup][e9-hybrid]). | The ptracer remains attached for loader/shared-library syscalls, lifecycle, signals, timers, and full `Guest` semantics. Thus real e9patch sites still pay a ptrace stop, and residual sites remain ptrace-controlled ([hybrid contract][e9-hybrid]). | The arbitrary tool remains ptrace-hosted, so state and RPC follow the ptrace model ([generic run][e9-generic-run]). |
 | **e9patch, direct opt-in** | The same AOT frame calls the shared dispatcher directly in ordinary guest context ([AOT bridge][e9-aot]). | The shared preload seccomp/SIGSYS runtime traps residual post-constructor syscalls and enforces its documented fail-closed guards. Its stated boundary excludes static/`AT_SECURE` guests, early loader calls, and exec ([preload boundary][preload-lib], [trap flow][preload-trap]). | A tool-specific preload hosts `T`; a UDS `RpcServer` owns the singleton and the guest uses the preload coordinator client ([direct launch][e9-direct], [e9 RPC][e9-rpc]). Direct lifecycle coverage is currently single-process and single-thread, so this path does not replace the generic backend yet ([direct boundary][e9-direct-boundary]). |
@@ -66,15 +66,15 @@ method call in another ([global tool contract][tool-traits],
 
 Existing implementations are:
 
-- **Local:** ptrace and KVM call the singleton directly; DBI also has this as a
+- **Local:** ptrace and KVM call the singleton directly; DBT also has this as a
   non-coordinated fallback ([ptrace][ptrace-rpc], [KVM][kvm-rpc],
-  [DBI][dbi-rpc]).
+  [DBT][dbt-rpc]).
 - **Shared UDS transport:** `reverie-rpc-transport` provides async and blocking
   clients plus a multi-connection `RpcServer` around one `Arc<G>`. Frames are a
   big-endian `u32` length followed by bincode-legacy payload bytes
   ([server][rpc-server], [codec][rpc-codec]). SaBRe uses `BlockingRpcClient`;
-  DBI implements the same wire contract for its injected client
-  ([SaBRe][sabre-remote-state], [DBI][dbi-wire]).
+  DBT implements the same wire contract for its injected client
+  ([SaBRe][sabre-remote-state], [DBT][dbt-wire]).
 - **Preload trusted-gate client:** e9patch and LiteInst wrap the shared preload
   `CoordinatorClient`, which reserves a descriptor and performs synchronous
   request/response RPC ([preload client][preload-rpc], [e9patch wrapper][e9-rpc],
@@ -189,13 +189,13 @@ not as a prerequisite for sharing code ([direct boundary][e9-direct-boundary]).
 [kvm-dispatch]: https://github.com/rrnewton/reverie/blob/2f812840b718a6ac2a772a56cd05490765465ebf/reverie-kvm/src/runtime.rs#L1051-L1105
 [kvm-static]: https://github.com/rrnewton/reverie/blob/2f812840b718a6ac2a772a56cd05490765465ebf/reverie-kvm/src/runtime.rs#L1140-L1197
 [kvm-rpc]: https://github.com/rrnewton/reverie/blob/2f812840b718a6ac2a772a56cd05490765465ebf/reverie-kvm/src/runtime.rs#L323-L418
-[dbi-guest]: https://github.com/rrnewton/reverie/blob/2f812840b718a6ac2a772a56cd05490765465ebf/reverie-dbi/src/lib.rs#L200-L275
-[dbi-events]: https://github.com/rrnewton/reverie/blob/2f812840b718a6ac2a772a56cd05490765465ebf/reverie-dbi/native/client.c#L2475-L2499
-[dbi-syscall]: https://github.com/rrnewton/reverie/blob/2f812840b718a6ac2a772a56cd05490765465ebf/reverie-dbi/native/client.c#L2010-L2044
-[dbi-instructions]: https://github.com/rrnewton/reverie/blob/2f812840b718a6ac2a772a56cd05490765465ebf/reverie-dbi/native/client.c#L525-L624
-[dbi-coordinator]: https://github.com/rrnewton/reverie/blob/2f812840b718a6ac2a772a56cd05490765465ebf/reverie-dbi/src/launcher.rs#L394-L424
-[dbi-rpc]: https://github.com/rrnewton/reverie/blob/2f812840b718a6ac2a772a56cd05490765465ebf/reverie-dbi/src/lib.rs#L210-L263
-[dbi-wire]: https://github.com/rrnewton/reverie/blob/2f812840b718a6ac2a772a56cd05490765465ebf/reverie-dbi/src/sync_rpc.rs#L9-L32
+[dbt-guest]: https://github.com/rrnewton/reverie/blob/2f812840b718a6ac2a772a56cd05490765465ebf/reverie-dbt/src/lib.rs#L200-L275
+[dbt-events]: https://github.com/rrnewton/reverie/blob/2f812840b718a6ac2a772a56cd05490765465ebf/reverie-dbt/native/client.c#L2475-L2499
+[dbt-syscall]: https://github.com/rrnewton/reverie/blob/2f812840b718a6ac2a772a56cd05490765465ebf/reverie-dbt/native/client.c#L2010-L2044
+[dbt-instructions]: https://github.com/rrnewton/reverie/blob/2f812840b718a6ac2a772a56cd05490765465ebf/reverie-dbt/native/client.c#L525-L624
+[dbt-coordinator]: https://github.com/rrnewton/reverie/blob/2f812840b718a6ac2a772a56cd05490765465ebf/reverie-dbt/src/launcher.rs#L394-L424
+[dbt-rpc]: https://github.com/rrnewton/reverie/blob/2f812840b718a6ac2a772a56cd05490765465ebf/reverie-dbt/src/lib.rs#L210-L263
+[dbt-wire]: https://github.com/rrnewton/reverie/blob/2f812840b718a6ac2a772a56cd05490765465ebf/reverie-dbt/src/sync_rpc.rs#L9-L32
 [sabre-adapter]: https://github.com/rrnewton/reverie/blob/2f812840b718a6ac2a772a56cd05490765465ebf/experimental/reverie-sabre/src/reverie_adapter.rs#L80-L169
 [sabre-scan]: https://github.com/rrnewton/SaBRe/blob/df1839a129d93b69f47a819a3769c8cbb0b4ec60/arch/x86_64/rewriter.c#L921-L976
 [sabre-jump]: https://github.com/rrnewton/SaBRe/blob/df1839a129d93b69f47a819a3769c8cbb0b4ec60/arch/x86_64/rewriter.c#L177-L213

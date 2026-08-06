@@ -5,7 +5,7 @@ target. It measures the instrumentation overhead of Reverie's exact shared
 [`counter2`](../../reverie-examples/counter2_tool.rs) Tool over calibrated
 multi-second fixed-work guests.
 
-The runner supports `ptrace`, `kvm`, `liteinst`, `dbi`, `sabre`, and `e9patch`.
+The runner supports `ptrace`, `kvm`, `liteinst`, `dbt`, `sabre`, and `e9patch`.
 It reports each backend against the matching native executable rather than
 comparing raw times from unlike static and dynamic binaries.
 

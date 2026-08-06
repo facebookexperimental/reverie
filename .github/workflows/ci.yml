@@ -30,14 +30,14 @@ jobs:
       run: |
         rustc scripts/check-skill-discovery.rs -o "$RUNNER_TEMP/check-skill-discovery"
         "$RUNNER_TEMP/check-skill-discovery"
-    # reverie-dbi/build.rs compiles the vendored DynamoRIO source on first use.
+    # reverie-dbt/build.rs compiles the vendored DynamoRIO source on first use.
     # Cache the content-addressed install tree; both the Actions key and the
     # restored directory require the exact vendored source + recipe content.
     - name: Cache DynamoRIO build
       uses: actions/cache@v4
       with:
-        path: target/*/build/reverie-dbi-*/out/dynamorio-install-*
-        key: dynamorio-${{ runner.os }}-${{ hashFiles('reverie-dbi/vendor/dynamorio/**', 'reverie-dbi/build.rs') }}
+        path: target/*/build/reverie-dbt-*/out/dynamorio-install-*
+        key: dynamorio-${{ runner.os }}-${{ hashFiles('reverie-dbt/vendor/dynamorio/**', 'reverie-dbt/build.rs') }}
     - name: Build
       run: cargo build --workspace --all-features
     - name: Test regular workspace cases

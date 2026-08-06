@@ -9,7 +9,7 @@
 //! End-to-end round-trip tests for the cross-process GlobalTool RPC over a real
 //! Unix-domain socket.
 //!
-//! The key property under test is the one the DBI backend currently lacks:
+//! The key property under test is the one the DBT backend currently lacks:
 //! multiple independent client connections (standing in for the processes of a
 //! `fork` tree) all reach **one shared** `GlobalTool` instance, so their effects
 //! aggregate instead of fragmenting per-process.

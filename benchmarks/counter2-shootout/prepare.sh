@@ -2,7 +2,7 @@
 set -euo pipefail
 
 root=$(git -C "$(dirname -- "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
-requested=${1:-ptrace,kvm,liteinst,dbi,sabre,e9patch}
+requested=${1:-ptrace,kvm,liteinst,dbt,sabre,e9patch}
 jobs=${JOBS:-8}
 
 has_backend() {
@@ -20,9 +20,9 @@ if ((${#example_bins[@]} > 0)); then
     -p reverie-examples "${example_bins[@]}"
 fi
 
-if has_backend dbi; then
+if has_backend dbt; then
   "$root/scripts/backend-submodule.sh" activate dynamorio
-  PROFILE=release "$root/reverie-dbi/scripts/build-client.sh"
+  PROFILE=release "$root/reverie-dbt/scripts/build-client.sh"
 fi
 
 if has_backend sabre; then

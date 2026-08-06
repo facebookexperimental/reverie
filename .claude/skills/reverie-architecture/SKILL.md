@@ -1,6 +1,6 @@
 ---
 name: reverie-architecture
-description: "Map of the Reverie process-instrumentation framework — the Tool/GlobalTool/Guest/Backend contracts, the crate layout, and how a tool observes and rewrites a guest's syscalls across the ptrace, KVM, and DBI backends. Read this first when working anywhere in reverie."
+description: "Map of the Reverie process-instrumentation framework — the Tool/GlobalTool/Guest/Backend contracts, the crate layout, and how a tool observes and rewrites a guest's syscalls across the ptrace, KVM, and DBT backends. Read this first when working anywhere in reverie."
 ---
 
 # Reverie Architecture
@@ -9,7 +9,7 @@ Reverie is a Linux **process-instrumentation framework**. You write a *tool*
 against a small, backend-agnostic contract; a *backend* runs a guest process
 tree and routes the guest's syscalls, signals, and CPU events to your tool. The
 same tool binary can, in principle, run over any backend (ptrace today; KVM and
-DBI are in progress). Hermit's `Detcore` is the flagship tool: it hosts the
+DBT are in progress). Hermit's `Detcore` is the flagship tool: it hosts the
 determinism engine on top of Reverie.
 
 The four contracts all live in the shared **`reverie`** crate:
@@ -58,7 +58,7 @@ process in the guest tree. It exposes `type Request/Response/Config` and
 `guest.send_rpc(...)` to talk to the global.
 
 For **ptrace**, the global lives in-process (one address space supervises the
-tree). For **out-of-process backends (DBI, KVM)** the global runs in a separate
+tree). For **out-of-process backends (DBT, KVM)** the global runs in a separate
 coordinator process reached over the **`reverie-rpc-transport`** crate (Unix
 domain sockets + bincode). `counter1` (in-process RPC) and `counter2`
 (UDS coordinator aggregating a fork/exec tree) are the reference examples.
@@ -111,13 +111,13 @@ thread), so drive `run` on a current-thread `LocalSet` executor.
 | Backend | Crate | Interception mechanism | Status |
 | --- | --- | --- | --- |
 | **ptrace** | `reverie-ptrace` | ptrace stops + a seccomp-BPF filter that traps only subscribed syscalls (unsubscribed run at native speed) | production |
-| **DBI** | `reverie-dbi` | DynamoRIO dynamic binary instrumentation; tool compiled into a client `.so`, run via `drrun`; intercepts *every* syscall | in progress |
+| **DBT** | `reverie-dbt` | DynamoRIO dynamic binary instrumentation; tool compiled into a client `.so`, run via `drrun`; intercepts *every* syscall | in progress |
 | **KVM** | `reverie-kvm` | runs the guest in a KVM VM; syscalls surface as hypercalls | in progress |
 | **e9patch / liteinst** | `reverie-e9patch`, `reverie-liteinst`, `reverie-preload` | in-process rewriting (static e9patch / dynamic liteinst) + a shared `LD_PRELOAD` + seccomp/SIGSYS runtime; **hybrid** — ptrace stays the lifecycle/`Guest` controller while rewritten sites originate the events | experimental |
 
 Backend trade-off (see the benchmark memory): ptrace is bimodal — free for
 unsubscribed syscalls, ~26–40 µs per *observed* syscall (the ptrace-stop tax);
-DBI has a flat ~2 µs interception floor for *every* syscall, so it wins ~10× for
+DBT has a flat ~2 µs interception floor for *every* syscall, so it wins ~10× for
 observation-heavy tools (strace, Detcore) and loses for sparse-subscription
 tools. See the `syscall-interception` skill for the per-backend detail and the
 `adding-a-backend` skill for how to wire a new one.
@@ -136,7 +136,7 @@ Contracts & core:
 
 Backends:
 - **`reverie-ptrace`** — production ptrace/seccomp backend.
-- **`reverie-kvm`**, **`reverie-dbi`**, **`reverie-e9patch`**,
+- **`reverie-kvm`**, **`reverie-dbt`**, **`reverie-e9patch`**,
   **`reverie-liteinst`** — alternative backends (see table).
 - **`reverie-preload`** — shared LD_PRELOAD + seccomp/SIGSYS runtime for the
   ld-preload backends (e9patch, liteinst).

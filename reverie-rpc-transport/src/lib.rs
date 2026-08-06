@@ -18,11 +18,11 @@
 //! request/response RPC: [`GlobalRPC::send_rpc`] takes a
 //! [`GlobalTool::Request`] and returns a [`GlobalTool::Response`], both bounded
 //! `Serialize + DeserializeOwned`. Today every backend (ptrace, KVM, SaBRe,
-//! DBI) implements that trait by calling [`GlobalTool::receive_rpc`] *directly,
+//! DBT) implements that trait by calling [`GlobalTool::receive_rpc`] *directly,
 //! in the same address space*. That is fine only while the whole process tree
 //! shares one `GlobalState`.
 //!
-//! The DBI backend breaks this assumption: DynamoRIO follows `fork`, so each
+//! The DBT backend breaks this assumption: DynamoRIO follows `fork`, so each
 //! guest process ends up with its own copy of the global state and counts /
 //! scheduling never aggregate across the tree. The fix is to move `GlobalState`
 //! into a single **coordinator** process and have every guest process talk to
@@ -53,8 +53,8 @@
 //!
 //! This is the shared scaffolding plus round-trip tests. Wiring a backend's
 //! `Guest`/launcher to spawn a coordinator and connect clients (starting with
-//! DBI) is a follow-up; that work is additionally gated on the separate
-//! Detcore-over-DBI hang tracked by the verification task.
+//! DBT) is a follow-up; that work is additionally gated on the separate
+//! Detcore-over-DBT hang tracked by the verification task.
 //!
 //! [`GlobalTool`]: reverie::GlobalTool
 //! [`GlobalTool::Request`]: reverie::GlobalTool::Request

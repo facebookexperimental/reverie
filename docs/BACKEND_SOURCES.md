@@ -8,7 +8,7 @@ initialize or read the submodules.
 
 | Backend | Path | Pinned revision | License |
 | --- | --- | --- | --- |
-| DynamoRIO | `reverie-dbi/vendor/dynamorio` | `929840ad9190e5086775e8debc0f0b79b4208d59` | BSD-3-Clause, LGPL-2.1-only drwrap, BSD-4-Clause Valgrind headers |
+| DynamoRIO | `reverie-dbt/vendor/dynamorio` | `929840ad9190e5086775e8debc0f0b79b4208d59` | BSD-3-Clause, LGPL-2.1-only drwrap, BSD-4-Clause Valgrind headers |
 | SaBRe | `experimental/reverie-sabre/vendor/{sabre,libelf}` | `41113f849f8799932ed8c7883f5a4de616b9e9fa` | GPL-3.0-or-later plus documented GPL-2.0-only/BSD-3-Clause/MIT exceptions; LGPL-3.0-or-later libelf |
 | e9patch | `reverie-e9patch/vendor/e9patch` | `6c2c03c1da74b14daf1788a9f8dccfa354ce04a6` (`v1.0.1`) | GPL-3.0-only, LGPL-3.0-or-later libdw, MIT Zydis |
 
@@ -20,7 +20,7 @@ commits Reverie builds against; consult each upstream project for background on
 its rewriting approach.
 
 The in-tree `reverie-liteinst` prototype is self-contained and does not depend
-on an external LiteInst checkout. `reverie-{dbi,sabre,e9patch}` source builds
+on an external LiteInst checkout. `reverie-{dbt,sabre,e9patch}` source builds
 produce their required native artifacts without a submodule or network path.
 
 ## What "curated" removes
@@ -33,7 +33,7 @@ dropped, and each is enforced by a test rather than by convention:
   `.github/e9patch.png` — are removed. No build step reads them, and this
   repository does not carry binaries. Guarded by
   `vendored_dynamorio_source_contains_no_binary_files`
-  (`reverie-dbi/tests/build_script_source.rs`),
+  (`reverie-dbt/tests/build_script_source.rs`),
   `the_vendored_source_contains_no_binary_files`
   (`reverie-e9patch/tests/vendor_source.rs`), and the same-named SaBRe test in
   `experimental/reverie-sabre/src/lib.rs`. Each scans real file bytes for NUL,
@@ -86,7 +86,7 @@ Activation is optional and is used only to compare or update the vendored
 source. Normal Cargo builds do not require it. Build the packages directly:
 
 ```bash
-cargo build -p reverie-dbi
+cargo build -p reverie-dbt
 
 cargo build -p reverie-sabre
 
