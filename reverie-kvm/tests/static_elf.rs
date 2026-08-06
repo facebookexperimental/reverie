@@ -1256,6 +1256,145 @@ int main(void) {
 }
 
 #[test]
+fn real_glibc_scm_rights_translate_across_thread_and_fork_tables() {
+    match Kvm::new() {
+        Ok(_) => {}
+        Err(error) if kvm_is_unavailable(&error) => {
+            eprintln!("skipping KVM SCM_RIGHTS test: cannot open /dev/kvm: {error}");
+            return;
+        }
+        Err(error) => panic!("failed to probe /dev/kvm: {error}"),
+    }
+
+    let directory = TestDirectory::new();
+    let executable = compile_c_program(
+        &directory.0,
+        "scm-rights-translation",
+        r#"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static int sockets[2];
+static int received_fds[2] = {-1, -1};
+
+static void *receive_rights(void *unused) {
+  (void)unused;
+  char payload = 0;
+  char control[CMSG_SPACE(2 * sizeof(int))];
+  struct iovec iov = {.iov_base = &payload, .iov_len = 1};
+  struct msghdr message;
+  memset(&message, 0, sizeof(message));
+  memset(control, 0, sizeof(control));
+  message.msg_iov = &iov;
+  message.msg_iovlen = 1;
+  message.msg_control = control;
+  message.msg_controllen = sizeof(control);
+  if (recvmsg(sockets[1], &message, MSG_CMSG_CLOEXEC) != 1 || payload != 'q' ||
+      (message.msg_flags & MSG_CTRUNC) != 0) {
+    return (void *)1;
+  }
+  struct cmsghdr *cmsg = CMSG_FIRSTHDR(&message);
+  if (cmsg == NULL || cmsg->cmsg_level != SOL_SOCKET ||
+      cmsg->cmsg_type != SCM_RIGHTS ||
+      cmsg->cmsg_len != CMSG_LEN(2 * sizeof(int))) {
+    return (void *)2;
+  }
+  memcpy(received_fds, CMSG_DATA(cmsg), sizeof(received_fds));
+  return NULL;
+}
+
+static int send_rights(const int fds[2]) {
+  char payload = 'q';
+  char control[CMSG_SPACE(2 * sizeof(int))];
+  struct iovec iov = {.iov_base = &payload, .iov_len = 1};
+  struct msghdr message;
+  memset(&message, 0, sizeof(message));
+  memset(control, 0, sizeof(control));
+  message.msg_iov = &iov;
+  message.msg_iovlen = 1;
+  message.msg_control = control;
+  message.msg_controllen = sizeof(control);
+  struct cmsghdr *cmsg = CMSG_FIRSTHDR(&message);
+  cmsg->cmsg_level = SOL_SOCKET;
+  cmsg->cmsg_type = SCM_RIGHTS;
+  cmsg->cmsg_len = CMSG_LEN(2 * sizeof(int));
+  memcpy(CMSG_DATA(cmsg), fds, 2 * sizeof(int));
+  return (int)sendmsg(sockets[0], &message, 0);
+}
+
+int main(void) {
+  int pipe_fds[2];
+  if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sockets) != 0 || pipe(pipe_fds) != 0 ||
+      sockets[0] != 3 || sockets[1] != 4 || pipe_fds[0] != 5 || pipe_fds[1] != 6) {
+    return 10;
+  }
+
+  int invalid[2] = {pipe_fds[0], 999};
+  errno = 0;
+  if (send_rights(invalid) != -1 || errno != EBADF) {
+    return 11;
+  }
+  if (send_rights(pipe_fds) != 1) {
+    return 12;
+  }
+
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, receive_rights, NULL) != 0) {
+    return 13;
+  }
+  void *thread_result = NULL;
+  if (pthread_join(thread, &thread_result) != 0 || thread_result != NULL) {
+    return 14;
+  }
+  if (received_fds[0] != 7 || received_fds[1] != 8 ||
+      (fcntl(received_fds[0], F_GETFD) & FD_CLOEXEC) == 0 ||
+      (fcntl(received_fds[1], F_GETFD) & FD_CLOEXEC) == 0) {
+    return 15;
+  }
+
+  close(pipe_fds[0]);
+  close(pipe_fds[1]);
+  pid_t child = fork();
+  if (child < 0) {
+    return 16;
+  }
+  if (child == 0) {
+    char byte = 'z';
+    _exit(write(received_fds[1], &byte, 1) == 1 ? 0 : 17);
+  }
+  char byte = 0;
+  int status = 0;
+  if (read(received_fds[0], &byte, 1) != 1 || byte != 'z' ||
+      waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
+      WEXITSTATUS(status) != 0) {
+    return 18;
+  }
+
+  puts("scm-rights translation ok");
+  return 0;
+}
+"#,
+    );
+    let executable = executable.to_str().unwrap();
+    let (stdout, stderr) =
+        run_host_program_with_tool_captured(executable, &[executable], &directory.0);
+    assert_eq!(stdout, b"scm-rights translation ok\n");
+    assert!(
+        stderr.is_empty(),
+        "stderr={}",
+        String::from_utf8_lossy(&stderr)
+    );
+}
+
+#[test]
 fn worker_exit_group_terminates_the_root_with_its_status() {
     match Kvm::new() {
         Ok(_) => {}
