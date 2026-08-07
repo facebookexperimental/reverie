@@ -20,14 +20,16 @@
 //! `reverie-preload` runtime, which owns the seccomp filter, the `SIGSYS`
 //! handler, the trusted syscall gate, the fork/signal policy, and the
 //! [`SyscallDispatcher`](reverie_preload::dispatch::SyscallDispatcher) seam.
-//! Both register dispatchers under the same
-//! [`InProcessSeccomp`](reverie_preload::lifecycle::InProcessSeccomp)
-//! controller. E9patch's AOT trampoline calls the registered dispatcher
-//! directly in ordinary guest context. Shared built-ins use the common preload
-//! dispatcher; an opt-in tool-specific DSO calls [`install_tool`] to host a
-//! concrete generic `Tool` with coordinator RPC. The default
-//! [`E9patchBackend<T>`](E9patchBackend) still leaves that callback unpublished,
-//! so its production ptrace path cannot bypass the selected `T: Tool`.
+//! Both use the same guest-half trap installer through
+//! [`InProcessSeccomp`](reverie_preload::lifecycle::InProcessSeccomp) or
+//! [`HybridPtrace`](reverie_preload::lifecycle::HybridPtrace); neither
+//! controller constructs a launcher. E9patch's AOT trampoline calls the
+//! registered dispatcher directly in ordinary guest context. Shared built-ins
+//! use the common preload dispatcher; an opt-in tool-specific DSO calls
+//! [`install_tool`] to host a concrete generic `Tool` with coordinator RPC. The
+//! default [`E9patchBackend<T>`](E9patchBackend) still leaves that callback
+//! unpublished, so its production ptrace path cannot bypass the selected
+//! `T: Tool`.
 //!
 //! The **only** intended differences are:
 //!

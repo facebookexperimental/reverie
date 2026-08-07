@@ -9,28 +9,30 @@
 //! The lifecycle-controller seam.
 //!
 //! The runtime keeps *policy* (the [`SyscallDispatcher`](crate::dispatch)) apart
-//! from *mechanism* (how a syscall gets trapped and how process lifecycle events
-//! — startup, `exec`, thread creation — are covered). [`LifecycleController`] is
-//! the mechanism seam.
+//! from the guest-half trap mechanism. [`LifecycleController`] installs that
+//! guest-half mechanism only; startup, `exec`, thread creation, and reaping are
+//! launcher responsibilities outside this trait.
 //!
-//! Today the only controller is [`InProcessSeccomp`]: seccomp + SIGSYS entirely
-//! in-process. The `research-ldpreload-derisking` task showed this cannot cover
-//! the ~40 loader/startup syscalls before the constructor, vDSO fast paths, or
-//! `exec`. The intended remedy is a **hybrid** controller that keeps in-process
-//! trapping on the hot path but adds a minimal ptrace/launcher lifecycle owner
-//! (SaBRe-style) for pre-`main` setup, vDSO patching, and exec/clone stops.
+//! [`InProcessSeccomp`] and [`HybridPtrace`] both install seccomp + SIGSYS
+//! entirely in-process. The `research-ldpreload-derisking` task showed that this
+//! guest-half mechanism cannot cover the ~40 loader/startup syscalls before the
+//! constructor, vDSO fast paths, or `exec` rebootstrap. `HybridPtrace` names an
+//! intended pairing with a separately constructed ptrace lifecycle owner; it
+//! does not construct or verify that launcher.
 //!
 //! Because both share this trait and the same [`RuntimeConfig`]/dispatcher, that
 //! switch is *additive*: implement a new controller, select it via config; the
-//! dispatcher, seccomp filter, trap handler, and RPC client are unchanged. See
-//! [`HybridPtrace`] for the documented skeleton.
+//! dispatcher, seccomp filter, trap handler, and RPC client are unchanged. Both
+//! controllers install the identical guest-half in-process trap (see
+//! [`install_in_process_trap`]); launcher selection is a separate caller
+//! responsibility. See [`HybridPtrace`] for the precise boundary.
 
 use std::io;
 
 use crate::seccomp::SeccompFilter;
 use crate::trap;
 
-/// How the runtime is told to trap and cover the guest.
+/// How the runtime installs its guest-half syscall trap.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuntimeConfig {
     /// Run the SIGSYS handler on an alternate signal stack.
@@ -71,26 +73,69 @@ impl LifecycleController for InProcessSeccomp {
     }
 
     unsafe fn install(&self, config: &RuntimeConfig) -> io::Result<()> {
-        // Order matters: the handler must be in place before the filter starts
-        // trapping, and the filter must whitelist the trusted gate.
-        unsafe { trap::install_handler(config.use_alt_stack)? };
-        let mut filter = SeccompFilter::for_trusted_gate(trap::trusted_gate())?;
-        unsafe { filter.install() }
+        // SAFETY: forwarded to the caller's once-after-dispatcher-registered
+        // contract; this controller adds no launcher, so the in-process trap is
+        // the whole mechanism.
+        unsafe { install_in_process_trap(config) }
     }
 }
 
-/// Documented skeleton for the hybrid in-process-trap + ptrace-lifecycle backend.
+/// Build (but do not install) the trap-everything-but-the-trusted-gate seccomp
+/// filter that every controller installs on the guest hot path.
 ///
-/// This is intentionally not yet functional: building the ptrace lifecycle owner
-/// is a separate task (see the SaBRe real-backend work). It exists here to pin
-/// the seam so the switch is a drop-in. A real implementation would:
+/// Kept separate from [`install_in_process_trap`] so the buildable precondition
+/// is unit-testable without installing irreversible process-global state.
+fn build_trap_filter() -> io::Result<SeccompFilter> {
+    SeccompFilter::for_trusted_gate(trap::trusted_gate())
+}
+
+/// Install the shared **guest-half** in-process syscall trap: the `SIGSYS`
+/// handler first, then the trusted-gate seccomp filter that whitelists it.
 ///
-/// * launch the guest under a thin ptrace controller that installs a pre-`exec`
-///   seccomp filter (closing the loader/startup gap and covering static/`exec`);
-/// * keep this crate's in-process SIGSYS trap on the hot path for ordinary
-///   syscalls (no ptrace stop per syscall);
-/// * let the controller handle `exec`/`clone`/`vfork` stops and vDSO patching,
-///   which the in-process filter cannot.
+/// This is the exact guest-half mechanism both [`InProcessSeccomp`] and
+/// [`HybridPtrace`] put on the syscall path; neither type encodes a launcher.
+/// Syscalls trap to the in-process handler. If the caller separately runs the
+/// guest under ptrace, a residual `SIGSYS` is still visible as a signal-delivery
+/// stop before reinjection.
+///
+/// # Safety
+///
+/// Installs process-global, largely irreversible state (signal handler, seccomp
+/// filter). Call exactly once, after the dispatcher is registered. Ordering is
+/// load-bearing: the handler must be in place before the filter starts trapping,
+/// and the filter must whitelist the trusted gate.
+unsafe fn install_in_process_trap(config: &RuntimeConfig) -> io::Result<()> {
+    unsafe { trap::install_handler(config.use_alt_stack)? };
+    let mut filter = build_trap_filter()?;
+    unsafe { filter.install() }
+}
+
+/// The guest half of a hybrid in-process-trap + ptrace-lifecycle arrangement.
+///
+/// This is the guest half of a two-part backend. When paired with a unit-tool
+/// tracer, rewritten hot-path sites add no `PTRACE_EVENT_SECCOMP` round trip:
+///
+/// * **This call (guest half, run in the `LD_PRELOAD` constructor)** installs the
+///   exact same in-process `SIGSYS` trap as [`InProcessSeccomp`] — the handler,
+///   then the trusted-gate seccomp filter — via [`install_in_process_trap`].
+///   Rewritten sites therefore stay on the in-process hot path, and a tool such
+///   as Detcore can run entirely in-guest. Un-instrumented / fail-closed sites
+///   resolve through the in-guest `SIGSYS` handler; under a ptrace launcher the
+///   signal is still observed as a signal-delivery stop before reinjection.
+/// * **A launcher half (parent process, not this crate)** may use
+///   `reverie_ptrace::TracerBuilder::<()>` as a unit-tool lifecycle reaper. Its
+///   empty subscription set adds no `PTRACE_EVENT_SECCOMP` syscall action; it
+///   follows/reaps the process tree and forwards signal-delivery stops. The
+///   launcher does not close the dynamic-loader window before this preload
+///   constructor runs, and a residual `SIGSYS` remains ptrace-visible as signal
+///   delivery even though the in-guest handler, not a host Tool, services it.
+///
+/// This type installs no lifecycle owner and does not bind or inspect whichever
+/// launcher the caller selected. A caller that pairs it with a unit-tool tracer
+/// gets the disjoint arrangement above; other callers must reason about their
+/// launcher's subscription/filter behavior separately. Because the guest-half
+/// mechanism is identical to [`InProcessSeccomp`], the type itself does not
+/// create a second syscall-interception mechanism.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct HybridPtrace;
 
@@ -99,12 +144,13 @@ impl LifecycleController for HybridPtrace {
         "hybrid-ptrace"
     }
 
-    unsafe fn install(&self, _config: &RuntimeConfig) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "hybrid-ptrace lifecycle controller is not yet implemented; \
-             use InProcessSeccomp or the SaBRe real backend",
-        ))
+    unsafe fn install(&self, config: &RuntimeConfig) -> io::Result<()> {
+        // The guest half installs the same in-process SIGSYS trap as
+        // InProcessSeccomp. Launcher selection and its ptrace subscriptions are
+        // separate caller responsibilities.
+        // SAFETY: forwarded to the caller's once-after-dispatcher-registered
+        // contract.
+        unsafe { install_in_process_trap(config) }
     }
 }
 
@@ -119,10 +165,18 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_is_not_yet_installable() {
-        let config = RuntimeConfig::default();
-        let err = unsafe { HybridPtrace.install(&config) }.unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    fn hybrid_guest_half_builds_the_shared_in_process_trap_filter() {
+        // HybridPtrace's guest half installs the exact same in-process SIGSYS
+        // trap as InProcessSeccomp (handler, then trusted-gate filter); it
+        // differs only by the controller identity selected by its caller.
+        // `install()` itself installs irreversible, all-trapping
+        // process-global state and cannot run inside the shared test binary, so
+        // assert the previously-absent mechanism now exists: the trap filter
+        // both controllers install builds for the live trusted gate and is
+        // non-empty. When HybridPtrace was a stub this path returned
+        // io::ErrorKind::Unsupported and built nothing.
+        let filter = build_trap_filter().expect("shared trap filter builds for the live gate");
+        assert!(!filter.is_empty());
     }
 
     #[test]

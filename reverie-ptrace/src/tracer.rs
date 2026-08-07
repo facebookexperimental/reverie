@@ -1429,8 +1429,47 @@ impl<G: Default> Tracer<G> {
         ))
     }
 
+    /// Waits for the tracee to exit while concurrently draining and discarding
+    /// any piped stdout/stderr, returning its exit status and global state.
+    ///
+    /// This is the discard-output counterpart of [`Tracer::wait_with_output`]
+    /// and shares its deadlock-avoidance behavior: the stdin handle, if any, is
+    /// closed before waiting, and both output pipes are read as the guest
+    /// produces bytes. Unlike `wait_with_output` the bytes are sunk rather than
+    /// buffered, so a guest that writes unbounded output costs no memory here.
+    ///
+    /// Prefer this over the bare [`Tracer::wait`] whenever the caller piped the
+    /// guest's stdio but does not want the output. `wait` never touches the
+    /// pipes, so a guest that fills the (64 KiB by default) pipe buffer blocks
+    /// in `write(2)` forever while the parent waits for a process that can
+    /// never exit.
+    pub async fn wait_discarding_output(mut self) -> Result<(ExitStatus, G), Error> {
+        use tokio::io::AsyncRead;
+
+        async fn drain<A: AsyncRead + Unpin>(io: Option<A>) -> Result<(), Error> {
+            if let Some(mut io) = io {
+                tokio::io::copy(&mut io, &mut tokio::io::sink()).await?;
+            }
+            Ok(())
+        }
+
+        drop(self.stdin.take());
+
+        let stdout = drain(self.stdout.take());
+        let stderr = drain(self.stderr.take());
+
+        let ((status, state), (), ()) = future::try_join3(self.wait(), stdout, stderr).await?;
+
+        Ok((status, state))
+    }
+
     /// Waits for the tracee to exit and returns its exit status and global
     /// state.
+    ///
+    /// This does **not** touch the guest's stdio handles. If the caller piped
+    /// stdout or stderr, use [`Tracer::wait_with_output`] or
+    /// [`Tracer::wait_discarding_output`] instead; otherwise a guest that fills
+    /// an unread pipe buffer deadlocks against this wait.
     pub async fn wait(mut self) -> Result<(ExitStatus, G), Error> {
         // Note: The usage of LocalSet is *very* important here. Once polled,
         // the `tracer` future drives all tracees to completion. The `fork` for

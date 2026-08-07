@@ -123,25 +123,27 @@ it.
 2. **Trampoline placement.** e9patch's trampolines are materialized by `e9tool`
    into the rewritten ELF; LiteInst allocates them at runtime in a reachable
    arena.
-3. **Which shared controller each selects** — a *consequence* of who owns
-   lifecycle, expressed through the shared seam, not a third mechanism.
+3. **Which shared controller identity each selects.**
    LiteInst runs standalone, so it selects `InProcessSeccomp`
-   (`RuntimeMode::InProcessFallback`). e9patch runs the guest under the shared
-   fallback ptracer, which owns pre-`main` setup, `exec`/`clone` stops, and vDSO
-   patching, so its production controller is `HybridPtrace`
-   (`RuntimeMode::HybridPtrace`). This *is* the shared fallback ptracer, named
-   through the shared seam — `install_runtime` (in-process) and
-   `install_hybrid_runtime` (ptrace-hosted) sit side by side and differ only by
-   the controller they hand to the identical `reverie_preload::install`.
+   (`RuntimeMode::InProcessFallback`). e9patch can select `HybridPtrace`
+   (`RuntimeMode::HybridPtrace`), but that value installs only the identical
+   guest-half SIGSYS/seccomp mechanism; it neither constructs nor proves the
+   launcher. The legacy environment-bootstrap direct path separately uses a
+   unit-tool `TracerBuilder<()>` to follow and reap lifecycle events. Its empty
+   subscriptions add no `PTRACE_EVENT_SECCOMP` action, while residual SIGSYS is
+   still ptrace-visible as signal delivery. The loader-before-constructor and
+   vDSO windows remain uncovered.
 4. **How a generic tool is selected.** Shared built-ins live in
    `reverie-preload`. A generic `T: Tool` instead lives in a tool-specific DSO,
    matching LiteInst: its constructor calls `install_tool::<T>`, connects to the
    coordinator, and publishes the AOT callback. Tool-data launchers use the
    same sealed inherited-memfd bootstrap pattern as LiteInst, so neither the
    coordinator path nor tool selector is added to the guest environment. The
-   production `Backend::run<T>` path remains ptrace-hosted; the direct path is
-   an explicit `run_direct_with_preload` family while its lifecycle boundary is
-   still single-process and single-thread.
+   production `Backend::run<T>` path remains ptrace-hosted. The explicit legacy
+   `run_direct_with_preload` environment path has a unit-tool lifecycle reaper;
+   the sealed-bootstrap `*_with_preload_data` path remains a plain
+   single-process spawn. Neither path claims full generic-Tool process-tree or
+   exec-rebootstrap semantics.
 
 In shared built-in and opt-in generic-tool modes, AOT-rewritten sites dispatch
 directly. The shared SIGSYS dispatcher is reached only by residual sites e9patch
@@ -217,9 +219,12 @@ backend path: `E9patchBackend::spawn` calls `configure_guest_command` to prepend
 controller). It defaults **off** so the validated ptrace-only path is unchanged
 until the in-guest runtime is exercised against a real GPL-toolchain guest; the
 `:: Backend:` diagnostic reports the active `ldpreload=` mode. The shared
-`HybridPtrace` controller is still a documented skeleton in `reverie-preload`, so
-`install_hybrid_runtime` returns `Unsupported` today — correct, because ptrace
-still performs all event handling.
+`HybridPtrace` is now an implemented guest-half controller, so
+`install_hybrid_runtime` installs the shared SIGSYS handler and trusted-gate
+filter instead of returning `Unsupported`. It does not configure the ptrace
+launcher: the default `Backend::run<T>` path retains its generic host Tool,
+while the legacy direct environment path separately selects the unit-tool
+lifecycle reaper described above.
 
 The in-guest runtime also exposes reverie-preload's shared **built-in tools**.
 `configure_guest_builtin(command, tool)` prepends the cdylib and sets

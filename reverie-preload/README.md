@@ -13,7 +13,7 @@ mechanism is written and reviewed once instead of duplicated per backend (DRY).
 | `dispatch` | The `SyscallDispatcher` seam + shared fail-closed `PassthroughDispatcher`. |
 | `fork` | Fork-following hook (the filter is inherited atomically; only per-process state resets). |
 | `signal` | Signal multiplexing / reserved-signal (`SIGSYS`) policy + alt-stack. |
-| `lifecycle` | `LifecycleController` seam: `InProcessSeccomp` today, `HybridPtrace` skeleton for the minimal switch. |
+| `lifecycle` | `LifecycleController` guest-half seam: `InProcessSeccomp` and `HybridPtrace` install the same SIGSYS/seccomp mechanism; launcher selection is separate. |
 | `rpc` (feature `coordinator-rpc`) | Synchronous coordinator client, **wire-compatible** with the async `reverie-rpc-transport` (`RpcServer<G>`). |
 
 ## Coverage boundaries
@@ -46,14 +46,18 @@ unsafe {
 }
 ```
 
-## Switching to hybrid-ptrace
+## Hybrid-ptrace boundary
 
 The `LifecycleController` trait separates *policy* (`SyscallDispatcher`) from
-*mechanism* (how syscalls are trapped and how lifecycle events are covered).
-Moving to a hybrid in-process-trap + ptrace-lifecycle backend (to cover startup,
-`exec`, and vDSO) is therefore additive: implement a new controller and select
-it via `RuntimeConfig`; the dispatcher, seccomp filter, trap handler, and RPC
-client are unchanged. `lifecycle::HybridPtrace` pins that seam.
+the guest-half trap mechanism. `lifecycle::HybridPtrace` is implemented and
+installs the same in-process SIGSYS handler and trusted-gate seccomp filter as
+`InProcessSeccomp`; it does not create or inspect a ptrace launcher. A caller may
+pair it with a unit-tool `TracerBuilder<()>`: that launcher adds no
+`PTRACE_EVENT_SECCOMP` syscall action, but it still sees residual SIGSYS as a
+signal-delivery stop before reinjection. Neither controller closes the
+dynamic-loader window before the preload constructor or covers vDSO fast paths;
+`exec` requires caller-owned rebootstrap policy. The dispatcher, seccomp filter,
+trap handler, and RPC client remain shared.
 
 ## Migration note for existing backends
 
