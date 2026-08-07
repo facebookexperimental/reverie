@@ -2173,10 +2173,10 @@ static bool is_dynamorio_owned_word(uintptr_t word) {
 // change on every run of the same guest.
 //
 // Detcore's `--detlog-stack` hashes the WHOLE `[stack]` VMA, dead space
-// included, so that residue makes every DBI stack hash differ run to run even
+// included, so that residue makes every DBT stack hash differ run to run even
 // though the guest's own stack bytes are bit-identical. Measured on
 // `c-programs/kcmp-eperm` under `--strict --base-env minimal`: 38 of 38 stack
-// hashes differ between two DBI runs, while ptrace differs in 0 of 38; at the
+// hashes differ between two DBT runs, while ptrace differs in 0 of 38; at the
 // byte level exactly 32 of 135168 `[stack]` bytes differ, all of them below the
 // deepest byte the guest itself ever writes.
 //
@@ -2206,7 +2206,7 @@ static bool is_dynamorio_owned_word(uintptr_t word) {
 // the guest has executed. Its dead frames are now in the same range, and they
 // are the guest's, not DynamoRIO's. Selecting by position here erases them:
 // measured with a neutral marker planted in guest-owned dead stack, native and
-// ptrace preserved it (90/90/90) while DBI zeroed it after a clone in 4 of 4
+// ptrace preserved it (90/90/90) while DBT zeroed it after a clone in 4 of 4
 // runs -- a deterministic wrong answer, the failure mode a determinism tool is
 // least able to notice. So the re-armed scrub selects by ownership instead,
 // zeroing only words `is_dynamorio_owned_word` identifies. That is enough,
@@ -2230,7 +2230,7 @@ static bool is_dynamorio_owned_word(uintptr_t word) {
 //
 // KNOWN LIMIT, narrowed but not closed. The first scrub is still positional, so
 // dead bytes the dynamic loader left below the stack pointer before the guest
-// ran are zeroed under DBI and not under ptrace. That is a cross-backend
+// ran are zeroed under DBT and not under ptrace. That is a cross-backend
 // difference in a region no correct program reads, and it is the price of
 // removing non-pointer residue; the review's finding was about guest data
 // written DURING execution, which the clone path now preserves. Separately,
