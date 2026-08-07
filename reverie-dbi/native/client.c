@@ -324,6 +324,12 @@ static process_id_t copied_process_runtime_pid;
  * re-arm can reach it. */
 static _Atomic int32_t guest_stack_scrubbed;
 
+/* Set once the first scrub has run. Distinguishes the initial scrub, where the
+ * dead stack below the application's stack pointer is DynamoRIO's and the
+ * loader's, from every later (clone-re-armed) scrub, by which time the guest
+ * has run and its own dead frames are in the same range. */
+static _Atomic int32_t guest_stack_initially_scrubbed;
+
 static bool map_inherited_virtual_identity_state(void) {
   struct stat status;
   void *mapping;
@@ -1820,6 +1826,11 @@ static void post_syscall(void *drcontext, int sysnum) {
   // exactly one `[stack]` hash differ. Re-arming here costs one scan per clone
   // rather than one per syscall, and it covers the child too, which returns
   // from the same syscall with the parent's latch inherited.
+  //
+  // The re-armed scan selects by ownership, not by position (see
+  // `scrub_guest_stack_residue`). That distinction is what makes re-arming safe
+  // at all: by this point the guest has run, and its own dead frames share the
+  // range with DynamoRIO's residue. `stack_scrub_marker.c` is the bracket.
   if (is_clone_syscall(sysnum))
     atomic_store_explicit(&guest_stack_scrubbed, 0, memory_order_release);
 
@@ -2110,6 +2121,18 @@ static bool find_guest_stack_vma(uintptr_t *start, uintptr_t *end) {
   return found;
 }
 
+// Whether a word read out of the guest's dead stack is an address DynamoRIO
+// allocated for itself. `dr_memory_is_dr_internal` is DynamoRIO's own
+// `is_dynamo_address`, documented in `core/os_api.h` as "memory allocated by DR
+// for its own purposes, and would not exist if the application were run
+// natively" -- an observed ownership test on the value. It is a vmarea lookup,
+// never a dereference, so an arbitrary stack word is a safe argument.
+static bool is_dynamorio_owned_word(uintptr_t word) {
+  if (word == 0)
+    return false;
+  return dr_memory_is_dr_internal((const byte *)word);
+}
+
 // Removes DynamoRIO's own footprint from the guest's dead stack.
 //
 // DynamoRIO initializes on the application's own initial stack before switching
@@ -2133,24 +2156,58 @@ static bool find_guest_stack_vma(uintptr_t *start, uintptr_t *end) {
 // application syscall after DynamoRIO has deposited state on the application
 // stack -- the earliest point at which DynamoRIO is provably off that stack and
 // the application's context is available -- zero the part of the `[stack]` VMA
-// below the application's stack pointer minus the red zone. Those bytes are not
-// guest state, so no guest-visible information is lost, and the hashed range is
+// below the application's stack pointer minus the red zone. The hashed range is
 // unchanged.
 //
-// Deliberately latched rather than run on every syscall. The guest's own dead
-// frames below its stack pointer are a real, deterministic channel that the
-// `[stack]` hash detects today -- a probe that dirties 16 KiB of stack, returns,
-// and then syscalls does move the hash -- and scrubbing every syscall would
-// erase it. The latch is set after a scrub and cleared at the two measured
-// points where DynamoRIO writes its own addresses into the dead stack:
-// initialization (a fresh image starts with it clear) and clone-family syscall
-// servicing (`post_syscall` re-arms it).
+// TWO SCRUBS, TWO SELECTION RULES, because they face different memory.
 //
-// KNOWN LIMIT, not closed by this change: nothing prevents DynamoRIO from
-// leaving a code-cache address in the dead stack at some other moment. The two
-// triggers above are the ones observed; a third would reappear as a
-// nondeterministic `[stack]` hash on the affected guest, not as a silent wrong
-// answer.
+// The FIRST scrub runs before the guest's own code has executed. Everything
+// below the application's stack pointer at that moment was put there by
+// DynamoRIO's initialization and the dynamic loader, so zeroing all of it is
+// blunt but sound, and it has to be blunt: most of the run-varying residue is
+// not a pointer. Dumping every nonzero word in the range across two runs shows
+// 21 words differing, and only 8 of them are DynamoRIO addresses; the rest are
+// the raw host pid packed several ways (`000ad552000ad552`, `ffffffff000ad552`)
+// and its ASCII decimal rendering (`3037393930370020`). No ownership test on an
+// address can catch a pid or a digit string, so a value-based rule here would
+// leave the hash nondeterministic -- measured, 38 of 38 differing, i.e. no
+// better than doing nothing.
+//
+// EVERY LATER scrub is re-armed by a clone (see `post_syscall`) and runs after
+// the guest has executed. Its dead frames are now in the same range, and they
+// are the guest's, not DynamoRIO's. Selecting by position here erases them:
+// measured with a neutral marker planted in guest-owned dead stack, native and
+// ptrace preserved it (90/90/90) while DBI zeroed it after a clone in 4 of 4
+// runs -- a deterministic wrong answer, the failure mode a determinism tool is
+// least able to notice. So the re-armed scrub selects by ownership instead,
+// zeroing only words `is_dynamorio_owned_word` identifies. That is enough,
+// because what a clone deposits IS a pointer: the qword one frame below the
+// post-fork stack pointer holds a code-cache address. Measured on a forking
+// guest: dropping the re-arm entirely leaves 1 of 42 hashes differing, and the
+// ownership-only re-arm brings it back to 0 of 42 while preserving the marker.
+//
+// Deliberately latched rather than run on every syscall, so the cost is one
+// scan per residue-depositing event rather than one per syscall. The latch is
+// set after a scrub and cleared at the two measured points where DynamoRIO
+// writes its own addresses into the dead stack: initialization (a fresh image
+// starts with it clear) and clone-family syscall servicing.
+//
+// RESIDUAL RISK of the ownership rule, stated rather than hidden: a guest word
+// that happens to equal an address inside DynamoRIO's private mappings is
+// indistinguishable from residue and is zeroed. The guest cannot learn those
+// addresses through any supported channel, and the word must also sit below the
+// stack pointer minus the red zone, where the ABI already lets the kernel and
+// signal delivery clobber it.
+//
+// KNOWN LIMIT, narrowed but not closed. The first scrub is still positional, so
+// dead bytes the dynamic loader left below the stack pointer before the guest
+// ran are zeroed under DBI and not under ptrace. That is a cross-backend
+// difference in a region no correct program reads, and it is the price of
+// removing non-pointer residue; the review's finding was about guest data
+// written DURING execution, which the clone path now preserves. Separately,
+// nothing prevents DynamoRIO from leaving residue at some third moment; that
+// would reappear as a nondeterministic `[stack]` hash -- a visible failure, not
+// a silent wrong answer.
 static void scrub_guest_stack_residue(void *drcontext) {
   if (atomic_load_explicit(&guest_stack_scrubbed, memory_order_acquire) != 0)
     return;
@@ -2174,10 +2231,14 @@ static void scrub_guest_stack_residue(void *drcontext) {
   // so a thread that is will still scrub when it reaches its next syscall.
   if (pointer <= start || pointer > end)
     return;
+  const bool initial =
+      atomic_exchange_explicit(&guest_stack_initially_scrubbed, 1,
+                               memory_order_acq_rel) == 0;
   atomic_store_explicit(&guest_stack_scrubbed, 1, memory_order_release);
   if (pointer - start <= GUEST_STACK_RED_ZONE_BYTES)
     return;
   uintptr_t ceiling = pointer - GUEST_STACK_RED_ZONE_BYTES;
+  ceiling &= ~(uintptr_t)(sizeof(uintptr_t) - 1);
   const uintptr_t page = (uintptr_t)dr_page_size();
   for (uintptr_t cursor = start; cursor < ceiling;) {
     uintptr_t next = (cursor / page + 1) * page;
@@ -2191,8 +2252,19 @@ static void scrub_guest_stack_residue(void *drcontext) {
     // Reading a never-faulted page maps the shared zero page; writing one would
     // commit it. Skipping the all-zero pages keeps the scrub from inflating the
     // guest's resident set by the size of its unused stack.
-    if (offset != length)
-      memset(bytes, 0, length);
+    if (offset != length) {
+      if (initial) {
+        memset(bytes, 0, length);
+      } else {
+        for (size_t at = 0; at + sizeof(uintptr_t) <= length;
+             at += sizeof(uintptr_t)) {
+          uintptr_t word;
+          memcpy(&word, bytes + at, sizeof(word));
+          if (is_dynamorio_owned_word(word))
+            memset(bytes + at, 0, sizeof(word));
+        }
+      }
+    }
     cursor = next;
   }
 }
