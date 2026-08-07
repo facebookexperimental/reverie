@@ -1530,6 +1530,9 @@ impl ElfExecutor {
         let mut state = self.state.try_clone_for_fork(child_tid)?;
         state.pid = self.state.pid;
         state.ppid = self.state.ppid;
+        // A CLONE_THREAD worker stays inside the same process, so it inherits the
+        // thread group leader's position in the traced process tree.
+        state.is_traced_tree_root = self.state.is_traced_tree_root;
         state.dumpable = self.current_dumpable();
         state.signalfd_state = self.state.signalfd_state.clone();
         let task_generation = state
@@ -1813,7 +1816,19 @@ impl ElfExecutor {
     }
 
     // TODO-HUMAN-REVIEW(PR-235): Review virtual parent identity for KVM Tool callbacks.
+    /// The parent inside the *traced* process tree, backing `Guest::ppid`.
+    ///
+    /// This is deliberately not `state.ppid`, which is the guest-visible
+    /// `getppid(2)` value. The root guest synthesizes a container-init parent
+    /// (PID 1) so `getppid()` matches the ptrace backend's PID namespace, but it
+    /// has no traced parent. Reverie derives `Guest::is_root_process` from this
+    /// returning `None`, and Detcore only registers the root thread with its
+    /// scheduler when `Guest::is_root_thread()` is true, so reporting the
+    /// synthetic parent here makes the root guest permanently unschedulable.
     pub(crate) fn parent_pid(&self) -> Option<reverie::Pid> {
+        if self.state.is_traced_tree_root {
+            return None;
+        }
         (self.state.ppid != 0).then(|| reverie::Pid::from_raw(self.state.ppid))
     }
 
@@ -10465,6 +10480,7 @@ mod tests {
             pid: 1,
             tid: 1,
             ppid: 0,
+            is_traced_tree_root: true,
             logical_clock_ns: 0,
             umask: 0o022,
             random_seed: 0,
@@ -18264,6 +18280,42 @@ mod tests {
         );
         assert_eq!(state.mmap_next, state.mmap_limit);
         assert!(memory.user_range_is_mapped(first, 2 * PAGE_SIZE));
+    }
+
+    // Regression: a root guest renumbered by `KvmBackend::set_root_pid` gets a
+    // synthetic container-init `getppid()` of 1 for ptrace parity. If that
+    // guest-visible value also drove `Guest::ppid`, `Guest::is_root_process`
+    // would be false for the root guest and Detcore would never register the
+    // root thread with its scheduler, hanging every KVM run before the first
+    // syscall. The traced-tree answer must stay independent of `getppid()`.
+    #[test]
+    fn renumbered_root_guest_has_no_traced_parent_but_keeps_getppid() {
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        // What `KvmBackend::set_root_pid(ROOT_DETPID)` produces.
+        state.pid = 3;
+        state.tid = 3;
+        state.ppid = 1;
+        let memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let mut executor = ElfExecutor::new(state, false);
+
+        assert!(executor.parent_pid().is_none());
+        // The guest-visible value is unchanged: `getppid()` still returns 1.
+        assert_eq!(
+            executor.execute(
+                &SyscallRequest::new(libc::SYS_getppid as u64, [0, 0, 0, 0, 0, 0]),
+                &memory,
+            ),
+            1
+        );
+
+        // A CLONE_THREAD worker stays in the root process, so it is also root.
+        let thread = executor.thread_child(4).unwrap();
+        assert!(thread.parent_pid().is_none());
+
+        // A forked child does have a traced parent.
+        let child = executor.fork_child(5, false).unwrap();
+        assert_eq!(child.parent_pid(), Some(reverie::Pid::from_raw(3)));
     }
 
     #[test]

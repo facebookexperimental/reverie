@@ -225,7 +225,23 @@ pub(crate) struct LoadedStaticElf {
     pub pid: i32,
     // TODO-HUMAN-REVIEW(PR-132): Review single-vCPU thread identity transitions.
     pub tid: i32,
+    /// The value this process reports from `getppid(2)`.
+    ///
+    /// This is a *guest-visible* identity, not the traced-tree parent: the root
+    /// guest synthesizes a container-init parent (see `root_parent_pid`) so that
+    /// `getppid()` matches the ptrace backend's PID namespace, even though the
+    /// root guest has no traced parent. Use [`Self::is_traced_tree_root`] to
+    /// answer the traced-tree question.
     pub ppid: i32,
+    /// True iff this process is the root of the *traced* process tree, i.e. it
+    /// was installed by the backend rather than created by a guest `fork`/`clone`.
+    ///
+    /// Kept separate from [`Self::ppid`] because the two answer different
+    /// questions and disagree for any root guest whose synthetic `getppid()` is
+    /// non-zero. Reverie's `Guest::ppid` contract is "None if this is the root of
+    /// the traced process tree", and `Guest::is_root_process` is derived from it,
+    /// so conflating the two makes the root guest invisible to the tool.
+    pub is_traced_tree_root: bool,
     // Direct KVM workers do not participate in Detcore's virtual clock. Keep a
     // private logical clock so repeated observations advance deterministically
     // without making host thread scheduling observable.
@@ -328,6 +344,8 @@ impl LoadedStaticElf {
             pid: child_pid,
             tid: child_pid,
             ppid: self.pid,
+            // A guest-created child always has a traced parent: this process.
+            is_traced_tree_root: false,
             logical_clock_ns: self.logical_clock_ns,
             umask: self.umask,
             random_seed: self.random_seed,
@@ -465,6 +483,8 @@ impl LoadedStaticElf {
         self.pid = previous.pid;
         self.tid = previous.tid;
         self.ppid = previous.ppid;
+        // `execve` replaces the image, never the position in the process tree.
+        self.is_traced_tree_root = previous.is_traced_tree_root;
         self.logical_clock_ns = previous.logical_clock_ns;
         self.umask = previous.umask;
         self.random_seed = previous.random_seed;
@@ -698,6 +718,10 @@ fn load_executable(
         pid: 1,
         tid: 1,
         ppid: 0,
+        // The backend-installed image is the root of the traced process tree.
+        // `KvmBackend::set_root_pid` may later renumber `pid`/`tid`/`ppid`; it
+        // must not change this.
+        is_traced_tree_root: true,
         logical_clock_ns: 0,
         umask: 0o022,
         random_seed: 0,
