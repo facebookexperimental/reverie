@@ -317,7 +317,13 @@ static _Atomic int32_t copied_vfork_pid;
 static process_id_t copied_process_runtime_pid;
 
 /* Latch for `scrub_guest_stack_residue`: 0 means the application's dead stack
- * may still hold DynamoRIO addresses and the next syscall must scrub it. Set
+ * may still hold DynamoRIO addresses and the next scrub point must clear it.
+ * The INITIAL scrub is NOT syscall-triggered -- it runs at the guest's first
+ * application instruction, before the guest has executed anything, which is
+ * exactly what makes erasing the region sound. (An earlier revision scrubbed at
+ * the first syscall; by then the guest has run and its own writes below the
+ * stack pointer would be destroyed. This comment described that superseded
+ * design.) Set
  * once per DynamoRIO initialization and re-armed after a clone-family syscall,
  * the other point at which DynamoRIO is measured to deposit its own addresses
  * on the application stack. Declared here, ahead of `post_syscall`, so the
