@@ -316,6 +316,14 @@ static _Atomic int32_t copied_vfork_pid;
  * fork children inherit the parent's globals and must rebase again. */
 static process_id_t copied_process_runtime_pid;
 
+/* Latch for `scrub_guest_stack_residue`: 0 means the application's dead stack
+ * may still hold DynamoRIO addresses and the next syscall must scrub it. Set
+ * once per DynamoRIO initialization and re-armed after a clone-family syscall,
+ * the other point at which DynamoRIO is measured to deposit its own addresses
+ * on the application stack. Declared here, ahead of `post_syscall`, so the
+ * re-arm can reach it. */
+static _Atomic int32_t guest_stack_scrubbed;
+
 static bool map_inherited_virtual_identity_state(void) {
   struct stat status;
   void *mapping;
@@ -1804,6 +1812,17 @@ static void post_syscall(void *drcontext, int sysnum) {
       drcontext, thread_state_index);
   DR_ASSERT(counters != NULL);
 
+  // Re-arm the guest-stack scrub (see `scrub_guest_stack_residue`). Servicing a
+  // clone-family syscall is the second measured point -- after DynamoRIO's own
+  // initialization -- at which a DynamoRIO address is left in the application's
+  // dead stack: on `c-programs`-style fork probes the qword one frame below the
+  // post-fork stack pointer holds a code-cache address whose per-run value made
+  // exactly one `[stack]` hash differ. Re-arming here costs one scan per clone
+  // rather than one per syscall, and it covers the child too, which returns
+  // from the same syscall with the parent's latch inherited.
+  if (is_clone_syscall(sysnum))
+    atomic_store_explicit(&guest_stack_scrubbed, 0, memory_order_release);
+
   if (counters->pending_virtual_child != 0 && is_clone_syscall(sysnum)) {
     int32_t virtual_child = complete_clone_identity(counters, syscall_result);
     if (syscall_result > 0) {
@@ -2018,7 +2037,168 @@ static void preempt_return(void) {
   // dr_redirect_execution does not return on success.
 }
 
+// The x86-64 SysV red zone: the 128 bytes below `rsp` that a leaf function may
+// use without adjusting the stack pointer. Everything below it is dead by the
+// ABI -- the kernel and signal delivery may clobber it at any moment -- so it
+// is the only safe floor for the scrub below.
+#define GUEST_STACK_RED_ZONE_BYTES 128
+
+static const char *parse_hex_prefix(const char *text, uintptr_t *value) {
+  uintptr_t parsed = 0;
+  const char *cursor = text;
+  for (; *cursor != '\0'; ++cursor) {
+    unsigned digit;
+    if (*cursor >= '0' && *cursor <= '9')
+      digit = (unsigned)(*cursor - '0');
+    else if (*cursor >= 'a' && *cursor <= 'f')
+      digit = (unsigned)(*cursor - 'a') + 10;
+    else if (*cursor >= 'A' && *cursor <= 'F')
+      digit = (unsigned)(*cursor - 'A') + 10;
+    else
+      break;
+    parsed = (parsed << 4) | digit;
+  }
+  if (cursor == text)
+    return NULL;
+  *value = parsed;
+  return cursor;
+}
+
+// Locates the `[stack]` VMA in `/proc/self/maps`. Detcore selects the region it
+// hashes by the very same `[stack]` pathname tag (`procmaps::MMapPath::Stack`),
+// so resolving it the same way binds the scrub to exactly the bytes the hash
+// covers instead of to a correlated guess at where the stack is. Uses
+// DynamoRIO's file API, whose raw syscalls are DynamoRIO's own and therefore
+// never surface as guest syscall events.
+static bool find_guest_stack_vma(uintptr_t *start, uintptr_t *end) {
+  file_t maps = dr_open_file("/proc/self/maps", DR_FILE_READ);
+  if (maps == INVALID_FILE)
+    return false;
+  char chunk[4096];
+  char line[512];
+  size_t used = 0;
+  bool found = false;
+  ssize_t got;
+  while (!found && (got = dr_read_file(maps, chunk, sizeof(chunk))) > 0) {
+    for (ssize_t i = 0; i < got && !found; ++i) {
+      if (chunk[i] != '\n') {
+        // A `/proc/self/maps` line longer than the buffer can only be a long
+        // pathname; the address range we need is at the front, so truncating
+        // the tail is safe and the `[stack]` tag is never that far out.
+        if (used + 1 < sizeof(line))
+          line[used++] = chunk[i];
+        continue;
+      }
+      line[used] = '\0';
+      used = 0;
+      if (strstr(line, "[stack]") == NULL)
+        continue;
+      uintptr_t low = 0;
+      uintptr_t high = 0;
+      const char *cursor = parse_hex_prefix(line, &low);
+      if (cursor == NULL || *cursor != '-')
+        continue;
+      cursor = parse_hex_prefix(cursor + 1, &high);
+      if (cursor == NULL || low >= high)
+        continue;
+      *start = low;
+      *end = high;
+      found = true;
+    }
+  }
+  dr_close_file(maps);
+  return found;
+}
+
+// Removes DynamoRIO's own footprint from the guest's dead stack.
+//
+// DynamoRIO initializes on the application's own initial stack before switching
+// to its private dstack, and it never unwinds or clears those frames. The dead
+// bytes it leaves behind hold DynamoRIO's private mapping addresses -- whose
+// base is `-vm_base` plus a per-run random jitter drawn from DynamoRIO's PRNG
+// (`core/heap.c` `vmm_place_vmcode`, seeded from the OS unless `-prng_seed` is
+// set) -- and the raw host pid, in both binary and decimal-string form. Both
+// change on every run of the same guest.
+//
+// Detcore's `--detlog-stack` hashes the WHOLE `[stack]` VMA, dead space
+// included, so that residue makes every DBI stack hash differ run to run even
+// though the guest's own stack bytes are bit-identical. Measured on
+// `c-programs/kcmp-eperm` under `--strict --base-env minimal`: 38 of 38 stack
+// hashes differ between two DBI runs, while ptrace differs in 0 of 38; at the
+// byte level exactly 32 of 135168 `[stack]` bytes differ, all of them below the
+// deepest byte the guest itself ever writes.
+//
+// Every other backend presents this region as the kernel left it: zero. Restore
+// that at the source rather than adjusting what Detcore hashes: at the first
+// application syscall after DynamoRIO has deposited state on the application
+// stack -- the earliest point at which DynamoRIO is provably off that stack and
+// the application's context is available -- zero the part of the `[stack]` VMA
+// below the application's stack pointer minus the red zone. Those bytes are not
+// guest state, so no guest-visible information is lost, and the hashed range is
+// unchanged.
+//
+// Deliberately latched rather than run on every syscall. The guest's own dead
+// frames below its stack pointer are a real, deterministic channel that the
+// `[stack]` hash detects today -- a probe that dirties 16 KiB of stack, returns,
+// and then syscalls does move the hash -- and scrubbing every syscall would
+// erase it. The latch is set after a scrub and cleared at the two measured
+// points where DynamoRIO writes its own addresses into the dead stack:
+// initialization (a fresh image starts with it clear) and clone-family syscall
+// servicing (`post_syscall` re-arms it).
+//
+// KNOWN LIMIT, not closed by this change: nothing prevents DynamoRIO from
+// leaving a code-cache address in the dead stack at some other moment. The two
+// triggers above are the ones observed; a third would reappear as a
+// nondeterministic `[stack]` hash on the affected guest, not as a silent wrong
+// answer.
+static void scrub_guest_stack_residue(void *drcontext) {
+  if (atomic_load_explicit(&guest_stack_scrubbed, memory_order_acquire) != 0)
+    return;
+  // Only the process's initial thread runs on the kernel-provided `[stack]`;
+  // every other thread has its own mmap'd stack, which carries no `[stack]` tag
+  // and is therefore not hashed. Checking that first keeps a sibling thread
+  // from re-reading `/proc/self/maps` on each of its syscalls while the latch
+  // is armed. The stack-pointer bounds check below, not this one, is what makes
+  // the scrub correct; this only makes it cheap.
+  if (dr_get_thread_id(drcontext) != dr_get_process_id())
+    return;
+  dr_mcontext_t context = {sizeof(context), DR_MC_CONTROL};
+  if (!dr_get_mcontext(drcontext, &context))
+    return;
+  uintptr_t start = 0;
+  uintptr_t end = 0;
+  if (!find_guest_stack_vma(&start, &end))
+    return;
+  uintptr_t pointer = (uintptr_t)context.xsp;
+  // Leave the latch clear if this thread is not in fact on the `[stack]` VMA,
+  // so a thread that is will still scrub when it reaches its next syscall.
+  if (pointer <= start || pointer > end)
+    return;
+  atomic_store_explicit(&guest_stack_scrubbed, 1, memory_order_release);
+  if (pointer - start <= GUEST_STACK_RED_ZONE_BYTES)
+    return;
+  uintptr_t ceiling = pointer - GUEST_STACK_RED_ZONE_BYTES;
+  const uintptr_t page = (uintptr_t)dr_page_size();
+  for (uintptr_t cursor = start; cursor < ceiling;) {
+    uintptr_t next = (cursor / page + 1) * page;
+    if (next > ceiling)
+      next = ceiling;
+    unsigned char *bytes = (unsigned char *)cursor;
+    size_t length = (size_t)(next - cursor);
+    size_t offset = 0;
+    while (offset != length && bytes[offset] == 0)
+      ++offset;
+    // Reading a never-faulted page maps the shared zero page; writing one would
+    // commit it. Skipping the all-zero pages keeps the scrub from inflating the
+    // guest's resident set by the size of its unused stack.
+    if (offset != length)
+      memset(bytes, 0, length);
+    cursor = next;
+  }
+}
+
 static bool pre_syscall(void *drcontext, int sysnum) {
+  scrub_guest_stack_residue(drcontext);
   if (((uint32_t)sysnum & X32_SYSCALL_BIT) != 0) {
     dr_fprintf(diagnostic_file,
                "reverie-dbi: x32-marked syscalls are unsupported\n");
