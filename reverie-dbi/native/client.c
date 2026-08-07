@@ -330,6 +330,12 @@ static _Atomic int32_t guest_stack_scrubbed;
  * has run and its own dead frames are in the same range. */
 static _Atomic int32_t guest_stack_initially_scrubbed;
 
+/* Clean call that performs the INITIAL scrub at the guest's first application
+ * instruction. Declared here, ahead of `instrument_instruction`, so the
+ * instrumentation hook can reach it; defined beside
+ * `scrub_guest_stack_residue`, whose rules it exists to make sound. */
+static void scrub_guest_stack_before_first_instruction(void);
+
 static bool map_inherited_virtual_identity_state(void) {
   struct stat status;
   void *mapping;
@@ -773,6 +779,23 @@ static dr_emit_flags_t instrument_instruction(void *drcontext, void *tag,
         drcontext, bb, instruction, (void *)start_pending_thread,
         DR_CLEANCALL_READS_APP_CONTEXT | DR_CLEANCALL_WRITES_APP_CONTEXT,
         0);
+  }
+  // The INITIAL guest-stack scrub runs HERE -- at the first application
+  // instruction -- and not, as it once did, at the first application syscall.
+  // That is what makes its blunt positional rule true instead of merely
+  // plausible: at this point DynamoRIO's initialization is complete and off the
+  // application stack, and the guest has executed ZERO instructions, so every
+  // byte below the stack pointer really is DynamoRIO's or the loader's. Any
+  // byte the guest writes -- including before its first syscall, which is the
+  // case `first_scrub_marker.c` plants -- is written strictly after this and
+  // therefore survives. Gated at instrumentation time so that once the scrub
+  // has run no further block carries the call.
+  if (instr_is_app(instruction) && instruction == instrlist_first_app(bb) &&
+      atomic_load_explicit(&guest_stack_initially_scrubbed,
+                           memory_order_acquire) == 0) {
+    dr_insert_clean_call_ex(drcontext, bb, instruction,
+                            (void *)scrub_guest_stack_before_first_instruction,
+                            DR_CLEANCALL_READS_APP_CONTEXT, 0);
   }
   // AUTONOMOUS-BOT-IMPLEMENTED
   // TODO-HUMAN-REVIEW(PR-dbi-preempt): Review the branch-count preemption hook.
@@ -2269,7 +2292,20 @@ static void scrub_guest_stack_residue(void *drcontext) {
   }
 }
 
+// See `instrument_instruction`. Runs once, before the guest's first
+// application instruction.
+static void scrub_guest_stack_before_first_instruction(void) {
+  scrub_guest_stack_residue(dr_get_current_drcontext());
+}
+
 static bool pre_syscall(void *drcontext, int sysnum) {
+  // Retained as a FALLBACK, not as the initial-scrub site. Normally the latch
+  // is already set by the first-instruction hook above and this returns
+  // immediately; it still runs the ownership-based scrub each time a clone
+  // re-arms it. If some guest ever reached a syscall without executing an
+  // application instruction, this would take the initial path exactly as
+  // before, so the change degrades to the old behaviour rather than to no
+  // scrub at all.
   scrub_guest_stack_residue(drcontext);
   if (((uint32_t)sysnum & X32_SYSCALL_BIT) != 0) {
     dr_fprintf(diagnostic_file,

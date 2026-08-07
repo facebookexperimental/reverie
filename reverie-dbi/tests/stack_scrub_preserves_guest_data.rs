@@ -114,6 +114,121 @@ fn assert_marker_preserved(label: &str, output: &Output) {
     );
 }
 
+/// Compiles [`tests/fixtures/first_scrub_marker.c`].
+///
+/// `-static -nostdlib -nostartfiles` is the whole point, not a detail: the
+/// marker has to be planted before the process's FIRST syscall, and a libc
+/// guest cannot do that because glibc startup has already issued several by the
+/// time `main` runs. `-fno-builtin` keeps the compiler from lowering the plant
+/// loop into a `memset` call that does not exist in a freestanding binary.
+fn compile_first_scrub_fixture() -> PathBuf {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/first_scrub_marker.c");
+    let binary = Path::new(env!("CARGO_TARGET_TMPDIR")).join("first_scrub_marker");
+    let compile = Command::new(std::env::var("CC").unwrap_or_else(|_| "cc".into()))
+        .args([
+            "-O2",
+            "-g",
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-static",
+            "-nostdlib",
+            "-nostartfiles",
+            "-fno-builtin",
+        ])
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to start the C compiler: {error}"));
+    assert!(
+        compile.status.success(),
+        "failed to compile {}:\n{}",
+        source.display(),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    binary
+}
+
+/// Exit-status and count assertions for the freestanding first-scrub fixture.
+///
+/// Deliberately not `assert_marker_preserved`: that one pins the clone
+/// fixture's three counts (`after_plain`/`after_clone`), which this fixture
+/// does not have. Same discipline though -- assert the counts, not just the
+/// status, so a failure names WHICH read lost the marker rather than only that
+/// one did.
+fn assert_first_scrub_marker_preserved(label: &str, output: &Output) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let context = format!("{label}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+
+    assert_ne!(
+        output.status.code(),
+        Some(2),
+        "the fixture reported a harness failure, so this run measured nothing\n{context}"
+    );
+    let field = |name: &str| -> i32 {
+        stdout
+            .split_whitespace()
+            .find_map(|token| token.strip_prefix(name)?.parse().ok())
+            .unwrap_or_else(|| panic!("no `{name}<n>` field in the fixture output\n{context}"))
+    };
+    assert_eq!(
+        field("before="),
+        MARKER_WORDS,
+        "the plant never took\n{context}"
+    );
+    assert_eq!(
+        field("after_first_syscall="),
+        MARKER_WORDS,
+        "the INITIAL scrub erased guest data written before the first syscall; \
+         it is still selecting by position from the pre-syscall hook instead of \
+         running before the guest's first instruction\n{context}"
+    );
+    assert!(
+        output.status.success(),
+        "the fixture exited unsuccessfully\n{context}"
+    );
+}
+
+/// The INITIAL scrub must not erase what the guest wrote before its first
+/// syscall.
+///
+/// The initial scrub selects by POSITION -- it zeroes everything below the
+/// stack pointer -- which is sound only if the guest has not run yet. It used
+/// to run from the pre-syscall hook, by which point the guest has executed
+/// arbitrarily much code, so anything it had written into dead stack was
+/// deleted. Measured at `bb7b17f4` with this fixture: native preserved the
+/// marker while DBI erased it in 4 of 4 runs, deterministically -- which is
+/// what makes it dangerous, since a repeat-run oracle sees perfect stability.
+///
+/// The fix moves the initial scrub to the guest's first application
+/// instruction, where "the guest has not run yet" is true by construction
+/// rather than by hope.
+#[test]
+#[ignore = "requires a built DynamoRIO and the reverie-dbi native client; run with --ignored"]
+fn initial_scrub_preserves_guest_data_written_before_the_first_syscall() {
+    let fixture = compile_first_scrub_fixture();
+
+    // Control: uninstrumented. If this fails, the fixture or host is at fault
+    // and the DBI legs below prove nothing either way.
+    let native = Command::new(&fixture)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run the fixture natively: {error}"));
+    assert_first_scrub_marker_preserved("native (no instrumentation)", &native);
+
+    let runner = reverie_dbi::DbiRunner::from_env()
+        .expect("DYNAMORIO_HOME (or DynamoRIO_DIR) and REVERIE_DBI_CLIENT must be set");
+    for run in 1..=RUNS {
+        let guest = Command::new(&fixture);
+        let output = runner
+            .output(&guest)
+            .unwrap_or_else(|error| panic!("DBI run {run} failed to start: {error}"));
+        assert_first_scrub_marker_preserved(&format!("DBI run {run} of {RUNS}"), &output);
+    }
+}
+
 #[test]
 #[ignore = "requires a built DynamoRIO and the reverie-dbi native client; run with --ignored"]
 fn clone_rearmed_scrub_preserves_guest_written_dead_stack() {
