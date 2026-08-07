@@ -7,7 +7,7 @@
     "sabre",
     "e9patch"
   ],
-  "host": "devbig014.atn7.facebook.com",
+  "host": "devbig014",
   "manifest_sha256": "5039a2efea1f508c548cb3cf27cee264b602da3ba62d73662ae80127a6eabb8e",
   "repetitions": 5,
   "reverie_sha": "36ce950a5c4207046c62efbd2904d5c808a4238f",

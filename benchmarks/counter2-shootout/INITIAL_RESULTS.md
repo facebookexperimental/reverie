@@ -7,7 +7,7 @@ performance baseline, not a CI ratchet.
 
 - Framework commit: `36ce950a5c4207046c62efbd2904d5c808a4238f`
 - Run: `20260802T042358Z`
-- Host: `devbig014.atn7.facebook.com`, 316 logical CPUs
+- Host: `devbig014`, 316 logical CPUs
 - Host load immediately before launch: 70.88 / 93.51 / 102.71
 - Command: `benchmarks/counter2-shootout/run.py`
 - Configuration: 5 second native target, 1 warmup, 5 measured repetitions,
