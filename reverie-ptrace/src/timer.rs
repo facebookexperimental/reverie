@@ -333,11 +333,23 @@ pub fn set_pmu_config(config: PmuConfig) -> Result<(), PmuConfig> {
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn has_precise_ip() -> bool {
     let cpu = raw_cpuid::CpuId::new();
-    let has_debug_store = cpu.get_feature_info().is_some_and(|info| info.has_ds());
+    let feature_info = cpu.get_feature_info();
+    let has_debug_store = feature_info.as_ref().is_some_and(|info| info.has_ds());
 
+    // Identify the CPU by vendor and model only. Debug-printing the whole
+    // `CpuId` (or a whole `FeatureInfo`) also dumps per-core topology --
+    // `initial_local_apic_id`, `x2apic_id`, `core_id` -- which reflects
+    // whichever core this thread happens to be scheduled on, not any property
+    // of the machine. That made this line differ between otherwise identical
+    // runs even though the decision below is a pure function of `has_ds()`.
     debug!(
-        "Setting precise_ip to {} for cpu {:?}",
-        has_debug_store, cpu
+        "Setting precise_ip to {} for cpu vendor {} family {:?} model {:?} stepping {:?}",
+        has_debug_store,
+        cpu.get_vendor_info()
+            .map_or_else(|| "unknown".to_string(), |v| v.as_str().to_string()),
+        feature_info.as_ref().map(|i| i.family_id()),
+        feature_info.as_ref().map(|i| i.model_id()),
+        feature_info.as_ref().map(|i| i.stepping_id()),
     );
 
     has_debug_store

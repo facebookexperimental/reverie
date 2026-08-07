@@ -7,7 +7,7 @@
  */
 
 //! Provides APIs to disable VDSOs at runtime.
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
 use goblin::elf::Elf;
@@ -172,11 +172,11 @@ fn align_up(value: usize, alignment: usize) -> usize {
 }
 
 /// Per-symbol VDSO patch info: `symbol name -> (base offset, size, replacement bytes)`.
-type VdsoPatchInfo = HashMap<&'static str, (u64, usize, &'static [u8])>;
+type VdsoPatchInfo = BTreeMap<&'static str, (u64, usize, &'static [u8])>;
 
 static VDSO_PATCH_INFO: LazyLock<VdsoPatchInfo> = LazyLock::new(|| {
     let info = vdso_get_symbols_info();
-    let mut res = HashMap::new();
+    let mut res = BTreeMap::new();
 
     for (k, v) in VDSO_SYMBOLS {
         if let Some(&(base, size)) = info.get(*k) {
@@ -217,8 +217,8 @@ pub(crate) fn is_patch_required(subscriptions: &Subscription) -> bool {
 // get vdso symbols offset/size from current process
 // assuming vdso binary is the same for all processes
 // so that we don't have to decode vdso for each process
-fn vdso_get_symbols_info() -> HashMap<&'static str, (u64, usize)> {
-    let mut res = HashMap::new();
+fn vdso_get_symbols_info() -> BTreeMap<&'static str, (u64, usize)> {
+    let mut res = BTreeMap::new();
     procfs::process::Process::new(unistd::getpid().as_raw())
         .map_or_else(
             |_| Vec::new(),
