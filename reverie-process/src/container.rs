@@ -96,42 +96,64 @@ impl Container {
     /// Returns the configured features that cannot be represented by
     /// `std::process::Command`.
     pub(super) fn std_conversion_blockers(&self) -> Vec<&'static str> {
+        // Keep this exhaustive: adding Container state must fail to compile
+        // until the standard-command conversion explicitly classifies it.
+        let Self {
+            env: _,
+            current_dir: _,
+            chroot,
+            namespace,
+            stdin: _,
+            stdout: _,
+            stderr: _,
+            uid_map,
+            gid_map,
+            mounts,
+            local_networking_only,
+            hostname,
+            domainname,
+            seccomp,
+            seccomp_notify,
+            pty,
+            affinity,
+        } = self;
+
         let mut blockers = Vec::new();
 
-        if self.chroot.is_some() {
+        if chroot.is_some() {
             blockers.push("chroot");
         }
-        if !self.namespace.is_empty() {
+        if !namespace.is_empty() {
             blockers.push("Linux namespaces");
         }
-        if !self.uid_map.is_empty() {
+        if !uid_map.is_empty() {
             blockers.push("user ID mappings");
         }
-        if !self.gid_map.is_empty() {
+        if !gid_map.is_empty() {
             blockers.push("group ID mappings");
         }
-        if !self.mounts.is_empty() {
+        if !mounts.is_empty() {
             blockers.push("mounts");
         }
-        if self.local_networking_only {
+        if *local_networking_only {
             blockers.push("local-only networking");
         }
-        if self.hostname.is_some() {
+        if hostname.is_some() {
             blockers.push("hostname");
         }
-        if self.domainname.is_some() {
+        if domainname.is_some() {
             blockers.push("domain name");
         }
-        if self.seccomp.is_some() {
+        if seccomp.is_some() {
             blockers.push("seccomp filter");
         }
-        if self.seccomp_notify {
+        if *seccomp_notify {
             blockers.push("seccomp notification");
         }
-        if self.pty.is_some() {
+        if pty.is_some() {
             blockers.push("pseudoterminal");
         }
-        if self.affinity.is_some() {
+        if affinity.is_some() {
             blockers.push("CPU affinity");
         }
 
