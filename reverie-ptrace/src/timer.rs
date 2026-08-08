@@ -175,7 +175,7 @@ impl PmuConfig {
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn try_from_family_model(family_id: u8, model_id: u8) -> Option<Self> {
+    pub(crate) fn try_from_family_model(family_id: u8, model_id: u8) -> Option<Self> {
         // based on rr's PerfCounters_x86.h and PerfCounters.cc
         let (rcb_event, skid_margin) = match family_id {
             // Intel

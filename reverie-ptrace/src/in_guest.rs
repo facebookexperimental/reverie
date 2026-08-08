@@ -42,7 +42,14 @@ impl InGuestRcbCounter {
     fn current_thread_with_optional_syscall_gate(
         raw_syscall: Option<unsafe fn(i64, [u64; 6]) -> i64>,
     ) -> Result<Self, Errno> {
-        let config = PmuConfig::try_new().ok_or(Errno::ENODEV)?;
+        Self::current_thread_with_config(PmuConfig::try_new(), raw_syscall)
+    }
+
+    fn current_thread_with_config(
+        config: Option<PmuConfig>,
+        raw_syscall: Option<unsafe fn(i64, [u64; 6]) -> i64>,
+    ) -> Result<Self, Errno> {
+        let config = config.ok_or(Errno::ENODEV)?;
         let mut builder = Builder::new(0, -1);
         builder
             .sample_period(0)
@@ -63,5 +70,17 @@ impl InGuestRcbCounter {
     #[inline(always)]
     pub fn read(&self) -> Result<u64, Errno> {
         self.counter.ctr_value_rdpmc()
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_cf_is_refused_before_perf_event_open() {
+        let config = PmuConfig::try_from_family_model(0x06, 0xcf);
+        let error = InGuestRcbCounter::current_thread_with_config(config, None).unwrap_err();
+        assert_eq!(error, Errno::ENODEV);
     }
 }

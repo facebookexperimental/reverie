@@ -348,6 +348,14 @@ static mut RCB_HANDLER_DEPTH: u32 = 0;
 
 /// Install the current thread's in-guest RCB clock before seccomp is active.
 pub(crate) fn initialize_rcb_clock() -> io::Result<()> {
+    initialize_rcb_clock_with(|| unsafe {
+        reverie_ptrace::InGuestRcbCounter::current_thread_with_syscall_gate(raw_syscall6)
+    })
+}
+
+fn initialize_rcb_clock_with(
+    create: impl FnOnce() -> Result<reverie_ptrace::InGuestRcbCounter, reverie::Errno>,
+) -> io::Result<()> {
     let owner = unsafe { raw_syscall6(libc::SYS_gettid, [0; 6]) } as libc::pid_t;
     if owner <= 0 {
         return Err(io::Error::last_os_error());
@@ -370,11 +378,12 @@ pub(crate) fn initialize_rcb_clock() -> io::Result<()> {
         RCB_HANDLER_DEDUCTION = 0;
         RCB_HANDLER_DEPTH = active_depth;
     }
-    let clock = match optional_rcb_clock(unsafe {
-        reverie_ptrace::InGuestRcbCounter::current_thread_with_syscall_gate(raw_syscall6)
-    }) {
-        Some(clock) => clock,
-        None => return Ok(()),
+    let clock = match create() {
+        Ok(clock) => clock,
+        // The in-guest clock is optional. CPU discovery, perf-event setup,
+        // mmap, reset, and enable failures all mean unavailable, not a failed
+        // Tool installation.
+        Err(_) => return Ok(()),
     };
     let active_entry = if active_depth == 0 {
         0
@@ -392,13 +401,6 @@ pub(crate) fn initialize_rcb_clock() -> io::Result<()> {
         RCB_HANDLER_DEPTH = active_depth;
     }
     Ok(())
-}
-
-/// An in-guest RCB clock is an optional acceleration/capability. Every failure
-/// while identifying the PMU, opening or mapping its event, or enabling it must
-/// leave the rest of LiteInst usable instead of making Tool installation fatal.
-fn optional_rcb_clock<T>(result: Result<T, reverie::Errno>) -> Option<T> {
-    result.ok()
 }
 
 fn rcb_clock() -> io::Result<Option<&'static reverie_ptrace::InGuestRcbCounter>> {
@@ -3317,6 +3319,9 @@ mod tests {
     use super::FORK_HOOK;
     use super::LiteinstDispatcher;
     use super::MAX_PATCH_SITES;
+    use super::RCB_CLOCK;
+    use super::RCB_CLOCK_OWNER;
+    use super::RCB_CLOCK_UNAVAILABLE;
     use super::SITE_ACTIVE;
     use super::SITE_FALLBACK;
     use super::SITE_INSTALLING;
@@ -3332,14 +3337,17 @@ mod tests {
     use super::clone_is_fork_like;
     use super::fallback_dispatch_count;
     use super::fallback_syscall_count;
+    use super::initialize_rcb_clock_with;
     use super::mark_site_range_stale;
-    use super::optional_rcb_clock;
+    use super::raw_syscall6;
     use super::record_fallback_dispatch;
     use super::reset_fallback_observability;
     use super::site_counts;
 
     #[test]
-    fn every_optional_rcb_setup_error_degrades_to_unavailable() {
+    fn every_optional_rcb_setup_error_takes_the_real_unavailable_path() {
+        let owner = unsafe { raw_syscall6(libc::SYS_gettid, [0; 6]) } as libc::pid_t;
+        assert!(owner > 0);
         for error in [
             reverie::Errno::EACCES,
             reverie::Errno::EPERM,
@@ -3351,13 +3359,11 @@ mod tests {
             reverie::Errno::EBUSY,
             reverie::Errno::EIO,
         ] {
-            assert_eq!(
-                optional_rcb_clock::<()>(Err(error)),
-                None,
-                "optional RCB setup error {error:?} must not abort Tool installation"
-            );
+            initialize_rcb_clock_with(|| Err(error)).unwrap();
+            assert!(unsafe { RCB_CLOCK }.is_null());
+            assert!(unsafe { RCB_CLOCK_UNAVAILABLE });
+            assert_eq!(unsafe { RCB_CLOCK_OWNER }, owner);
         }
-        assert_eq!(optional_rcb_clock::<u64>(Ok(17)), Some(17));
     }
 
     #[test]
