@@ -126,6 +126,19 @@ impl Command {
         Ok(self.into_std())
     }
 
+    /// Converts this command to [`std::process::Command`], refusing to discard
+    /// any container configuration.
+    ///
+    /// This compatibility shim preserves the former return type for callers
+    /// whose commands are representable. It panics instead of silently losing
+    /// unsupported configuration. New callers should use [`Self::try_into_std`]
+    /// to handle that refusal explicitly.
+    pub fn into_std_lossy(self) -> std::process::Command {
+        self.try_into_std().unwrap_or_else(|error| {
+            panic!("Command::into_std_lossy refused unsupported configuration: {error}")
+        })
+    }
+
     fn into_std(self) -> std::process::Command {
         let mut result = std::process::Command::new(self.get_program());
         result.args(self.get_args());
@@ -635,7 +648,7 @@ mod tests {
     }
 
     #[test]
-    fn try_into_std() {
+    fn into_std_lossy_compatibility() {
         let mut cmd = Command::new("env");
         cmd.args(["-0"]);
         cmd.current_dir("/foo/bar");
@@ -643,7 +656,7 @@ mod tests {
         cmd.env("FOO", "1");
         cmd.env("BAR", "2");
 
-        let stdcmd = cmd.try_into_std().unwrap();
+        let stdcmd = cmd.into_std_lossy();
 
         assert_eq!(stdcmd.get_program(), "env");
         assert_eq!(stdcmd.get_args().collect::<Vec<_>>(), ["-0"]);
@@ -674,6 +687,25 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "cannot convert to std::process::Command without losing: seccomp filter"
+        );
+
+        let filter = FilterBuilder::new()
+            .default_action(Action::Allow)
+            .syscalls([(Sysno::brk, Action::KillProcess)])
+            .build();
+        let mut command = Command::new("true");
+        command.seccomp(filter);
+        let panic =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| command.into_std_lossy()))
+                .unwrap_err();
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("legacy conversion panic must carry a string diagnostic");
+        assert_eq!(
+            message,
+            "Command::into_std_lossy refused unsupported configuration: cannot convert to std::process::Command without losing: seccomp filter"
         );
 
         let mut command = Command::new("true");
