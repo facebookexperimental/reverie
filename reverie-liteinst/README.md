@@ -100,32 +100,36 @@ trap path. Quiescent publication is never selected from this route.
 
 - Dynamically linked, non-`AT_SECURE` Linux x86-64 guests only.
 - One thread per process is supported by `LiteinstBackend`. Plain `fork` creates
-  a fresh child-local `Tool` and reconnects to the shared coordinator. A
-  lifecycle-only ptrace supervisor with `Tool = ()` follows and reaps the
-  process tree, including outliving and signaled descendants, but does not
-  subscribe to syscalls or host a second copy of the concrete Tool. Thread
-  clone, `clone3`, and `vfork` fail closed.
+  a fresh child-local `Tool` and reconnects to the shared coordinator. The same
+  path accepts process-like `clone3`; `vfork` is translated to a COW child and
+  preserves parent suspension through child exit. The coordinator drains
+  inherited RPC connections to follow outliving and signaled descendants
+  without attaching ptrace. Thread-style clone remains fail closed.
 - Patchable syscalls dispatch the Tool in guest, and intercepted normal exits
   route thread and process callbacks on the supported single-threaded path.
-  Signal deaths, CPUID,
-  RDTSC/RDTSCP, and RDRAND/RDSEED events are not routed yet.
+  CPUID and RDTSC/RDTSCP route through the Tool; determinized CPUID responses
+  hide RDRAND/RDSEED from conforming guests.
+- Subscribed vDSO symbols share ptrace's authoritative symbol table, are
+  rewritten into syscall entry sites before activation, and use ordinary
+  LiteInst Tool hooks.
 - Tool mode resets callable signal dispositions before activation, rejects
   later callable handlers, and validates that SIGSYS came from seccomp.
   `SIG_DFL` and `SIG_IGN` remain supported; guest signal handlers remain
   unsupported.
-- Timer arming currently returns success without delivery and clock reads return
-  zero because no RCB timer or preemption event is delivered. This coarse
-  syscall-boundary behavior is deterministic for the supported single-threaded
-  slice, but it is not PMU preemption or complete scheduling support.
+- Timer arming currently returns success without delivery. Clock reads use a
+  calling-thread RDPMC RCB counter and deduct branches retired inside active
+  LiteInst handlers. Hosts that deny perf-event access report the clock as
+  unsupported. This is not PMU preemption or complete scheduling support.
 - Rust tool futures must make progress synchronously. Coordinator RPC and guest
   syscall injection do so; a tool future that depends on an unrelated executor
   can stall.
 - The five-byte patch window and executable mapping must be supported by
   `liteinst2`. Dynamic executable mappings without a prepared reachable arena
-  fail closed. The lifecycle-only ptrace supervisor is not a syscall slow path:
-  it has no syscall subscriptions, and no host Tool handles guest syscalls.
+  fail closed.
 - `execve` cannot safely cross the inherited filter because the handler and DSO
-  mappings disappear. A future exec bootstrap must be controller-owned.
+  mappings disappear. It remains fail closed; completing exec requires a
+  non-seccomp in-guest coverage mechanism or another bootstrap that does not
+  reintroduce a ptracer.
 - This is in-process instrumentation, not a security sandbox.
 
 Hermit CLI linkage and a published `liteinst2` revision are separate integration

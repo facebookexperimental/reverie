@@ -5,12 +5,14 @@ use std::collections::HashSet;
 use std::io;
 use std::path::Path;
 
+use liteinst2::trampoline::HookContext;
 use reverie::Error;
 use reverie::GlobalRPC;
 use reverie::GlobalTool;
 use reverie::Guest;
 use reverie::Never;
 use reverie::Pid;
+use reverie::Rdtsc;
 use reverie::Stack;
 use reverie::TimerSchedule;
 use reverie::Tool;
@@ -58,6 +60,7 @@ impl Drop for DispatchScratchScope {
 
 trait ToolHandler: Send + Sync {
     fn dispatch(&self, event: &mut SyscallEvent);
+    fn dispatch_instruction(&self, kind: runtime::InstructionEventKind, context: &mut HookContext);
 }
 
 static HANDLER: std::sync::OnceLock<Box<dyn ToolHandler>> = std::sync::OnceLock::new();
@@ -139,7 +142,6 @@ unsafe fn install_tool_inner<T>(
 where
     T: Tool + 'static,
 {
-    let _signal_state = runtime::prepare_guest_signal_state()?;
     let rpc = CoordinatorRpc::<T::GlobalState>::connect(coordinator)?;
     runtime::reserve_coordinator_fd(rpc.raw_fd())?;
     let stats =
@@ -151,9 +153,19 @@ where
         } else {
             crate::stats::GuestStatsHooks::DISABLED
         };
+    runtime::initialize_rcb_clock()?;
     COMMITTED_STACKS.lock().clear();
     let pid = Pid::from_raw(unsafe { libc::getpid() });
-    let subscriptions = T::subscriptions(rpc.config()).iter_syscalls().collect();
+    let subscriptions = T::subscriptions(rpc.config());
+    let instruction_subscriptions = runtime::InstructionSubscriptions {
+        cpuid: subscriptions.has_cpuid(),
+        rdtsc: subscriptions.has_rdtsc(),
+    };
+    runtime::preflight_instruction_faulting(instruction_subscriptions)?;
+    let vdso_sites = reverie_ptrace::patch_current_vdso(&subscriptions)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let _signal_state = runtime::prepare_guest_signal_state(instruction_subscriptions)?;
+    let syscall_subscriptions = subscriptions.iter_syscalls().collect();
     if remove_legacy_environment {
         // SAFETY: legacy tool installation runs before application-created threads.
         unsafe { std::env::remove_var(crate::backend::COORDINATOR_ENV) };
@@ -164,14 +176,15 @@ where
             tool: SpinMutex::new(Some(tool)),
             rpc,
             root_pid: pid,
-            subscriptions,
+            subscriptions: syscall_subscriptions,
+            instruction_subscriptions,
             states: SpinMutex::new(HashMap::new()),
             stats,
         }))
         .map_err(|_| {
             io::Error::new(io::ErrorKind::AlreadyExists, "Reverie tool installed twice")
         })?;
-    runtime::initialize_reverie_tool(stats, publication)
+    runtime::initialize_reverie_tool(stats, publication, instruction_subscriptions, &vdso_sites)
 }
 
 pub(crate) fn dispatch(event: &mut SyscallEvent) {
@@ -181,11 +194,19 @@ pub(crate) fn dispatch(event: &mut SyscallEvent) {
     }
 }
 
+pub(crate) fn dispatch_instruction(kind: runtime::InstructionEventKind, context: &mut HookContext) {
+    match HANDLER.get() {
+        Some(handler) => handler.dispatch_instruction(kind, context),
+        None => fatal(126),
+    }
+}
+
 struct ToolHost<T: Tool> {
     tool: SpinMutex<Option<T>>,
     rpc: CoordinatorRpc<T::GlobalState>,
     root_pid: Pid,
     subscriptions: HashSet<Sysno>,
+    instruction_subscriptions: runtime::InstructionSubscriptions,
     states: SpinMutex<HashMap<i32, T::ThreadState>>,
     stats: crate::stats::GuestStatsHooks,
 }
@@ -220,6 +241,8 @@ where
             state,
             rpc: &self.rpc,
             tail: &tail,
+            cpuid_interception: self.instruction_subscriptions.cpuid,
+            fork_parent_state: None,
         };
 
         if is_new && let Err(error) = drive_ready(tool.handle_thread_start(&mut guest)) {
@@ -257,14 +280,18 @@ where
             let number = guest.event.number;
             let args = guest.event.args;
             if is_plain_fork(number, args) {
-                let result = unsafe { raw_syscall6(number, args) };
+                guest.prepare_fork_parent_state();
+                let result = forward_plain_fork(number, args);
                 if result == 0 {
+                    let parent_state = guest.take_fork_parent_state();
+                    drop(guest);
                     finish_fork_child(
                         &mut tool_slot,
                         &mut states,
                         &self.rpc,
                         self.stats,
                         event,
+                        parent_state,
                         ForkChildContext {
                             parent_tid: tid,
                             parent_pid: pid,
@@ -331,12 +358,15 @@ where
                 child_tid,
                 child_pid,
             } => {
+                let parent_state = guest.take_fork_parent_state();
+                drop(guest);
                 finish_fork_child(
                     &mut tool_slot,
                     &mut states,
                     &self.rpc,
                     self.stats,
                     event,
+                    parent_state,
                     ForkChildContext {
                         parent_tid,
                         parent_pid,
@@ -348,6 +378,77 @@ where
             DrivenSyscall::Fatal(error) => tool_fatal(125, &error),
         }
     }
+
+    fn dispatch_instruction(&self, kind: runtime::InstructionEventKind, context: &mut HookContext) {
+        let _scratch_scope = DispatchScratchScope::enter();
+        let tid = raw_pid(libc::SYS_gettid);
+        let pid = raw_pid(libc::SYS_getpid);
+        let ppid = (pid != self.root_pid).then(|| raw_pid(libc::SYS_getppid));
+        let tool_slot = self.tool.lock();
+        let tool = tool_slot.as_ref().unwrap_or_else(|| fatal(126));
+        let mut states = self.states.lock();
+        let is_new = !states.contains_key(&tid.as_raw());
+        let state = states
+            .entry(tid.as_raw())
+            .or_insert_with(|| tool.init_thread_state(tid, None));
+        let tail = TailResult::default();
+        let mut event = SyscallEvent {
+            number: -1,
+            args: [0; 6],
+            instruction_pointer: context.instruction_pointer,
+            result: 0,
+            context: context as *mut HookContext as usize,
+        };
+        let mut guest = LiteinstGuest::<T> {
+            event: &mut event,
+            tid,
+            pid,
+            ppid,
+            state,
+            rpc: &self.rpc,
+            tail: &tail,
+            cpuid_interception: self.instruction_subscriptions.cpuid,
+            fork_parent_state: None,
+        };
+        if is_new && let Err(error) = drive_ready(tool.handle_thread_start(&mut guest)) {
+            tool_fatal(124, &error);
+        }
+        if is_new
+            && tid.as_raw() == self.root_pid.as_raw()
+            && let Err(error) = drive_ready(tool.handle_post_exec(&mut guest))
+        {
+            tool_fatal(124, &Error::from(error));
+        }
+
+        match kind {
+            runtime::InstructionEventKind::Cpuid => {
+                let result = drive_ready(tool.handle_cpuid_event(
+                    &mut guest,
+                    context.rax as u32,
+                    context.rcx as u32,
+                ))
+                .unwrap_or_else(|error| tool_fatal(125, &Error::from(error)));
+                context.rax = u64::from(result.eax);
+                context.rbx = u64::from(result.ebx);
+                context.rcx = u64::from(result.ecx);
+                context.rdx = u64::from(result.edx);
+            }
+            runtime::InstructionEventKind::Rdtsc | runtime::InstructionEventKind::Rdtscp => {
+                let request = if kind == runtime::InstructionEventKind::Rdtscp {
+                    Rdtsc::Tscp
+                } else {
+                    Rdtsc::Tsc
+                };
+                let result = drive_ready(tool.handle_rdtsc_event(&mut guest, request))
+                    .unwrap_or_else(|error| tool_fatal(125, &Error::from(error)));
+                context.rax = result.tsc as u32 as u64;
+                context.rdx = result.tsc.checked_shr(32).unwrap_or(0);
+                if let Some(aux) = result.aux {
+                    context.rcx = u64::from(aux);
+                }
+            }
+        }
+    }
 }
 
 fn finish_fork_child<T: Tool>(
@@ -356,6 +457,7 @@ fn finish_fork_child<T: Tool>(
     rpc: &CoordinatorRpc<T::GlobalState>,
     stats: crate::stats::GuestStatsHooks,
     event: &mut SyscallEvent,
+    parent_snapshot: T::ThreadState,
     context: ForkChildContext,
 ) {
     let ForkChildContext {
@@ -364,6 +466,7 @@ fn finish_fork_child<T: Tool>(
         child_tid,
         child_pid,
     } = context;
+    runtime::emit_in_guest_stage(b"fork-child-thread-start-begin");
     // This child inherited the parent's coordinator connection. Flag it before
     // any child-side callback can issue an RPC (`handle_thread_start` below is
     // the first such opportunity) so the next `send_rpc` reconnects under the
@@ -371,11 +474,12 @@ fn finish_fork_child<T: Tool>(
     // hook also covers forks that never enter libc, such as a raw `SYS_fork` or
     // a raw plain `SYS_clone`.
     crate::rpc::note_fork_in_child();
-    let parent_state = states
+    let inherited_parent_state = states
         .remove(&parent_tid.as_raw())
         .unwrap_or_else(|| fatal(126));
+    drop(inherited_parent_state);
     let child_tool = T::new(child_pid, rpc.config());
-    let child_state = child_tool.init_thread_state(child_tid, Some((parent_tid, &parent_state)));
+    let child_state = child_tool.init_thread_state(child_tid, Some((parent_tid, &parent_snapshot)));
     states.clear();
     states.insert(child_tid.as_raw(), child_state);
     *tool_slot = Some(child_tool);
@@ -398,10 +502,13 @@ fn finish_fork_child<T: Tool>(
         state,
         rpc,
         tail: &child_tail,
+        cpuid_interception: runtime::cpuid_interception_enabled(),
+        fork_parent_state: None,
     };
     if let Err(error) = drive_ready(tool.handle_thread_start(&mut child_guest)) {
         tool_fatal(124, &error);
     }
+    runtime::emit_in_guest_stage(b"fork-child-thread-start-complete");
     child_guest.event.result = 0;
 }
 
@@ -482,6 +589,33 @@ struct LiteinstGuest<'a, T: Tool> {
     state: &'a mut T::ThreadState,
     rpc: &'a CoordinatorRpc<T::GlobalState>,
     tail: &'a TailResult,
+    cpuid_interception: bool,
+    fork_parent_state: Option<T::ThreadState>,
+}
+
+impl<T: Tool> LiteinstGuest<'_, T> {
+    /// Materialize the parent view while every synchronization owner still
+    /// exists. A raw process fork can otherwise copy a locked Tool-state mutex
+    /// into the child after its owning thread disappeared. Round-tripping via
+    /// the existing ThreadState migration contract gives the child private,
+    /// unlocked synchronization primitives without a backend-specific Tool API.
+    fn prepare_fork_parent_state(&mut self) {
+        let encoded = bincode::serde::encode_to_vec(&*self.state, bincode::config::standard())
+            .unwrap_or_else(|_| fatal(126));
+        let (snapshot, consumed) = bincode::serde::decode_from_slice::<T::ThreadState, _>(
+            &encoded,
+            bincode::config::standard(),
+        )
+        .unwrap_or_else(|_| fatal(126));
+        if consumed != encoded.len() {
+            fatal(126);
+        }
+        self.fork_parent_state = Some(snapshot);
+    }
+
+    fn take_fork_parent_state(&mut self) -> T::ThreadState {
+        self.fork_parent_state.take().unwrap_or_else(|| fatal(126))
+    }
 }
 
 #[reverie::tool]
@@ -504,6 +638,12 @@ fn is_plain_fork(number: i64, args: [u64; 6]) -> bool {
     if number == libc::SYS_fork {
         return true;
     }
+    if number == libc::SYS_vfork {
+        return true;
+    }
+    if number == libc::SYS_clone3 {
+        return clone3_is_plain_fork(args[0], args[1]);
+    }
     if number != libc::SYS_clone {
         return false;
     }
@@ -515,12 +655,96 @@ fn is_plain_fork(number: i64, args: [u64; 6]) -> bool {
         && args[0] & !(SIGNAL_MASK | allowed_flags) == 0
 }
 
+fn clone3_is_plain_fork(address: u64, size: u64) -> bool {
+    const CLONE_ARGS_SIZE_VER0: usize = 64;
+    const CLONE_ARGS_SIZE_VER2: usize = 88;
+    if address == 0 || size < CLONE_ARGS_SIZE_VER0 as u64 {
+        return false;
+    }
+    let mut fields = [0_u64; CLONE_ARGS_SIZE_VER2 / core::mem::size_of::<u64>()];
+    let read_len = usize::try_from(size)
+        .unwrap_or(usize::MAX)
+        .min(core::mem::size_of_val(&fields));
+    let local = libc::iovec {
+        iov_base: fields.as_mut_ptr().cast(),
+        iov_len: read_len,
+    };
+    let remote = libc::iovec {
+        iov_base: address as usize as *mut libc::c_void,
+        iov_len: read_len,
+    };
+    let pid = unsafe { raw_syscall6(libc::SYS_getpid, [0; 6]) };
+    let read = unsafe {
+        raw_syscall6(
+            libc::SYS_process_vm_readv,
+            [
+                pid as u64,
+                (&raw const local) as u64,
+                1,
+                (&raw const remote) as u64,
+                1,
+                0,
+            ],
+        )
+    };
+    if read != read_len as i64 {
+        return false;
+    }
+
+    let allowed_flags =
+        (libc::CLONE_CHILD_CLEARTID | libc::CLONE_CHILD_SETTID | libc::CLONE_PARENT_SETTID) as u64;
+    let flags = fields[0];
+    flags & !allowed_flags == 0
+        && fields[4] == libc::SIGCHLD as u64
+        && fields[5] == 0
+        && fields[6] == 0
+        && fields[8..].iter().all(|field| *field == 0)
+}
+
+fn forward_plain_fork(number: i64, args: [u64; 6]) -> i64 {
+    let result = if number == libc::SYS_vfork {
+        // A real vfork child would run the instrumentation callback on the
+        // parent's shared stack. Use a COW fork and preserve vfork's parent
+        // suspension until the child exits. Exec remains fail-closed, so exit
+        // is the only supported vfork completion boundary for now.
+        unsafe { raw_syscall6(libc::SYS_fork, [0; 6]) }
+    } else {
+        unsafe { raw_syscall6(number, args) }
+    };
+    if number == libc::SYS_vfork && result > 0 {
+        let mut info = core::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        loop {
+            let waited = unsafe {
+                raw_syscall6(
+                    libc::SYS_waitid,
+                    [
+                        libc::P_PID as u64,
+                        result as u64,
+                        info.as_mut_ptr() as u64,
+                        (libc::WEXITED | libc::WNOWAIT) as u64,
+                        0,
+                        0,
+                    ],
+                )
+            };
+            if waited == -i64::from(libc::EINTR) {
+                continue;
+            }
+            if waited < 0 {
+                return waited;
+            }
+            break;
+        }
+    }
+    result
+}
+
 // TODO-HUMAN-REVIEW(PR-127): Review injected process/signal safety policy.
 fn injected_syscall_guard(number: i64, args: [u64; 6]) -> Option<Errno> {
     let unsupported_process =
         // AUTONOMOUS-BOT-IMPLEMENTED
-        matches!(number, libc::SYS_clone3 | libc::SYS_vfork)
-            || (number == libc::SYS_clone && !is_plain_fork(number, args))
+        (matches!(number, libc::SYS_clone | libc::SYS_clone3 | libc::SYS_vfork)
+            && !is_plain_fork(number, args))
         // AUTONOMOUS-BOT-IMPLEMENTED
         || matches!(number, libc::SYS_execve | libc::SYS_execveat);
     let protected_signal =
@@ -654,7 +878,8 @@ impl<T: Tool> Guest<T> for LiteinstGuest<'_, T> {
         if is_plain_fork(number, raw_args) {
             let parent_tid = self.tid;
             let parent_pid = self.pid;
-            let result = unsafe { raw_syscall6(number, raw_args) };
+            self.prepare_fork_parent_state();
+            let result = forward_plain_fork(number, raw_args);
             if result == 0 {
                 let child_tid = raw_pid(libc::SYS_gettid);
                 let child_pid = raw_pid(libc::SYS_getpid);
@@ -693,7 +918,11 @@ impl<T: Tool> Guest<T> for LiteinstGuest<'_, T> {
         let kernel_signal_mask =
             (number == libc::SYS_rt_sigprocmask && raw_args[1] != 0).then(|| {
                 let requested = unsafe { (raw_args[1] as *const u64).read_unaligned() };
-                requested & !(1_u64 << (libc::SIGSYS - 1))
+                let mut reserved = 1_u64 << (libc::SIGSYS - 1);
+                if runtime::cpuid_interception_enabled() || runtime::rdtsc_interception_enabled() {
+                    reserved |= 1_u64 << (libc::SIGSEGV - 1);
+                }
+                requested & !reserved
             });
         if let Some(mask) = kernel_signal_mask.as_ref() {
             raw_args[1] = mask as *const u64 as u64;
@@ -717,7 +946,8 @@ impl<T: Tool> Guest<T> for LiteinstGuest<'_, T> {
         if is_plain_fork(number, args) {
             let parent_tid = self.tid;
             let parent_pid = self.pid;
-            let result = unsafe { raw_syscall6(number, args) };
+            self.prepare_fork_parent_state();
+            let result = forward_plain_fork(number, args);
             if result == 0 {
                 self.tail.set_fork_child(
                     parent_tid,
@@ -753,10 +983,11 @@ impl<T: Tool> Guest<T> for LiteinstGuest<'_, T> {
     }
 
     fn read_clock(&mut self) -> Result<u64, Error> {
-        // DBT likewise exposes a boundary sample rather than a continuously
-        // advancing PMU clock. LiteInst has no sample yet, so zero is the honest
-        // deterministic lower bound. Detcore separately charges syscall time.
-        Ok(0)
+        runtime::read_guest_rcb_clock().map_err(Error::from)
+    }
+
+    fn has_cpuid_interception(&self) -> bool {
+        self.cpuid_interception
     }
 }
 

@@ -27,6 +27,7 @@ name = "reverie-liteinst-lifecycle-guest"
 path = "src/bin/lifecycle_guest.rs"
 
 [dependencies]
+bincode = { version = "2", features = ["serde"] }
 libc = "0.2.186"
 liteinst2 = { version = "0.1.0", git = "https://github.com/rrnewton/liteinst2", rev = "95ee5e6917fa33191eb41c3f1606ea8b03c1b78c" }
 reverie = { version = "0.2.0", path = "../reverie", package = "reverie-core" }

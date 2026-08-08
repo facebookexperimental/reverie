@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -95,8 +94,20 @@ fn guest_command(mode: &str) -> Command {
 }
 
 fn assert_reaped(pid: u32) {
+    // Once the root exits this descendant is reparented to the host's subreaper.
+    // Closing its inherited coordinator connection proves it has exited, but
+    // procfs may expose the zombie briefly before that independent reaper gets
+    // scheduled (notably on the GitHub-hosted runner). Bound the observation
+    // instead of racing a single procfs lookup against reaping.
+    let proc_entry = PathBuf::from(format!("/proc/{pid}"));
+    for _ in 0..100 {
+        if !proc_entry.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert!(
-        !Path::new(&format!("/proc/{pid}")).exists(),
+        !proc_entry.exists(),
         "LiteInst descendant {pid} remains in procfs"
     );
     let mut status = 0;

@@ -10,12 +10,14 @@ use std::io;
 use std::ptr;
 use std::sync::OnceLock;
 
+use liteinst2::patcher::PatchError;
 use liteinst2::patcher::prepare_live_patching;
 use liteinst2::scanner::InstructionScanner;
 use liteinst2::trampoline::HookContext;
 use liteinst2::trampoline::HookSite;
 use liteinst2::trampoline::InstalledHook;
 use liteinst2::trampoline::TrampolineArena;
+use liteinst2::trampoline::TrampolineError;
 use reverie_preload::BuiltinTool;
 use reverie_preload::dispatch::SyscallDispatcher;
 use reverie_preload::dispatch::SyscallEvent as PreloadSyscallEvent;
@@ -94,6 +96,51 @@ reverie_liteinst_host_syscall_trap_call:
 reverie_liteinst_host_syscall_trap_return_rip:
     ret
     .size reverie_liteinst_host_syscall_trap_call, .-reverie_liteinst_host_syscall_trap_call
+
+    # These instruction sites are reached only after the nested-hook path has
+    # temporarily enabled native execution. Keeping them private to that path
+    # guarantees they have never been patched when they are first executed.
+    .p2align 4
+    .global reverie_liteinst_native_cpuid
+    .hidden reverie_liteinst_native_cpuid
+    .type reverie_liteinst_native_cpuid,@function
+reverie_liteinst_native_cpuid:
+    push rbx
+    mov r8, rdx
+    mov eax, edi
+    mov ecx, esi
+    cpuid
+    mov dword ptr [r8], eax
+    mov dword ptr [r8 + 4], ebx
+    mov dword ptr [r8 + 8], ecx
+    mov dword ptr [r8 + 12], edx
+    pop rbx
+    ret
+    .size reverie_liteinst_native_cpuid, .-reverie_liteinst_native_cpuid
+
+    .p2align 4
+    .global reverie_liteinst_native_rdtsc
+    .hidden reverie_liteinst_native_rdtsc
+    .type reverie_liteinst_native_rdtsc,@function
+reverie_liteinst_native_rdtsc:
+    rdtsc
+    shl rdx, 32
+    or rax, rdx
+    ret
+    .size reverie_liteinst_native_rdtsc, .-reverie_liteinst_native_rdtsc
+
+    .p2align 4
+    .global reverie_liteinst_native_rdtscp
+    .hidden reverie_liteinst_native_rdtscp
+    .type reverie_liteinst_native_rdtscp,@function
+reverie_liteinst_native_rdtscp:
+    mov r8, rdi
+    rdtscp
+    mov dword ptr [r8], ecx
+    shl rdx, 32
+    or rax, rdx
+    ret
+    .size reverie_liteinst_native_rdtscp, .-reverie_liteinst_native_rdtscp
 "#
 );
 
@@ -108,6 +155,9 @@ unsafe extern "C" {
     fn reverie_liteinst_host_syscall_trap(frame: *mut HostSyscallFrame);
     static reverie_liteinst_host_syscall_trap_rip: u8;
     static reverie_liteinst_host_syscall_trap_return_rip: u8;
+    fn reverie_liteinst_native_cpuid(eax: u32, ecx: u32, result: *mut NativeCpuidResult);
+    fn reverie_liteinst_native_rdtsc() -> u64;
+    fn reverie_liteinst_native_rdtscp(aux: *mut u32) -> u64;
 }
 
 // TODO-HUMAN-REVIEW(PR-270): Review raw hot-trap test/provenance ABI. This
@@ -185,6 +235,9 @@ pub const TOOL_PASSTHROUGH: &str = "passthrough";
 pub const TOOL_SPOOF_GETPID: &str = "spoof-getpid";
 const EVENT_CHANNEL_IDENTITY_FAILURE_STATUS: i32 = 120;
 const EVENT_CHANNEL_WRITE_FAILURE_STATUS: i32 = 121;
+const IN_GUEST_STAGE_WRITE_FAILURE_STATUS: i32 = 123;
+/// Enables fail-closed, allocation-free in-guest lifecycle stage markers on stderr.
+pub const IN_GUEST_STAGE_STREAM_ENV: &str = "REVERIE_LITEINST_IN_GUEST_STAGE_STREAM";
 const MAX_PATCH_SITES: usize = 4096;
 const ARENA_SLOTS: usize = 128;
 const PATCH_SNAPSHOT_BYTES: usize = 64;
@@ -192,6 +245,8 @@ const SITE_INSTALLING: u8 = 1;
 const SITE_ACTIVE: u8 = 2;
 const SITE_FALLBACK: u8 = 3;
 const SITE_STALE: u8 = 4;
+const INSTRUCTION_CPUID: u8 = 1;
+const INSTRUCTION_RDTSC: u8 = 2;
 
 static TOOL_MODE: AtomicU8 = AtomicU8::new(0);
 static EVENT_FD: AtomicI32 = AtomicI32::new(libc::STDERR_FILENO);
@@ -199,6 +254,7 @@ static COORDINATOR_FD: AtomicI32 = AtomicI32::new(-1);
 static EVENT_COOKIE: AtomicU64 = AtomicU64::new(0);
 static EVENT_DEVICE: AtomicU64 = AtomicU64::new(0);
 static EVENT_INODE: AtomicU64 = AtomicU64::new(0);
+static IN_GUEST_STAGE_STREAM: AtomicBool = AtomicBool::new(false);
 
 #[thread_local]
 static mut CURRENT_EVENT: *mut SyscallEvent = ptr::null_mut();
@@ -207,6 +263,189 @@ static ARENAS: OnceLock<Vec<RuntimeArena>> = OnceLock::new();
 static SITES: OnceLock<Box<[SiteSlot]>> = OnceLock::new();
 static PAGE_SIZE: AtomicU64 = AtomicU64::new(0);
 static INSTALL_HELD: AtomicBool = AtomicBool::new(false);
+static INSTRUCTION_SUBSCRIPTIONS: AtomicU8 = AtomicU8::new(0);
+static PATCH_PUBLICATION: AtomicU8 = AtomicU8::new(PatchPublication::Concurrent as u8);
+static PROCESS_FORKS_ALLOWED: AtomicBool = AtomicBool::new(true);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InstructionEventKind {
+    Cpuid,
+    Rdtsc,
+    Rdtscp,
+}
+
+#[derive(Default)]
+#[repr(C)]
+struct NativeCpuidResult {
+    eax: u32,
+    ebx: u32,
+    ecx: u32,
+    edx: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct InstructionSubscriptions {
+    pub(crate) cpuid: bool,
+    pub(crate) rdtsc: bool,
+}
+
+#[thread_local]
+static mut RCB_CLOCK: *mut reverie_ptrace::InGuestRcbCounter = ptr::null_mut();
+#[thread_local]
+static mut RCB_CLOCK_OWNER: libc::pid_t = 0;
+#[thread_local]
+static mut RCB_CLOCK_UNAVAILABLE: bool = false;
+#[thread_local]
+static mut RCB_HANDLER_ENTRY: u64 = 0;
+#[thread_local]
+static mut RCB_HANDLER_DEDUCTION: u64 = 0;
+#[thread_local]
+static mut RCB_HANDLER_DEPTH: u32 = 0;
+
+/// Install the current thread's in-guest RCB clock before seccomp is active.
+pub(crate) fn initialize_rcb_clock() -> io::Result<()> {
+    let owner = unsafe { raw_syscall6(libc::SYS_gettid, [0; 6]) } as libc::pid_t;
+    if owner <= 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // A fork child can first discover that its inherited counter has the wrong
+    // owner from inside the still-active fork callback. Preserve that callback
+    // depth while replacing the counter; resetting it would make the outer
+    // leave underflow after child reconstruction completes.
+    let active_depth = unsafe { RCB_HANDLER_DEPTH };
+    // Publish an unavailable sentinel before creating the perf event. When a
+    // fork child first initializes after seccomp is active, the builder's own
+    // syscalls can re-enter an already-patched syscall hook; that nested hook
+    // must observe this owner as initialized instead of recursively creating
+    // another counter.
+    unsafe {
+        RCB_CLOCK = ptr::null_mut();
+        RCB_CLOCK_OWNER = owner;
+        RCB_CLOCK_UNAVAILABLE = true;
+        RCB_HANDLER_ENTRY = 0;
+        RCB_HANDLER_DEDUCTION = 0;
+        RCB_HANDLER_DEPTH = active_depth;
+    }
+    let clock = match unsafe {
+        reverie_ptrace::InGuestRcbCounter::current_thread_with_syscall_gate(raw_syscall6)
+    } {
+        Ok(clock) => clock,
+        Err(error)
+            if matches!(
+                error.into_raw(),
+                libc::EACCES | libc::EPERM | libc::ENOENT | libc::ENODEV | libc::ENOSYS
+            ) =>
+        {
+            unsafe {
+                RCB_CLOCK_UNAVAILABLE = true;
+            }
+            return Ok(());
+        }
+        Err(error) => return Err(io::Error::from_raw_os_error(error.into_raw())),
+    };
+    let active_entry = if active_depth == 0 {
+        0
+    } else {
+        clock
+            .read()
+            .map_err(|error| io::Error::from_raw_os_error(error.into_raw()))?
+    };
+    unsafe {
+        RCB_CLOCK = Box::into_raw(Box::new(clock));
+        RCB_CLOCK_OWNER = owner;
+        RCB_CLOCK_UNAVAILABLE = false;
+        RCB_HANDLER_ENTRY = active_entry;
+        RCB_HANDLER_DEDUCTION = 0;
+        RCB_HANDLER_DEPTH = active_depth;
+    }
+    Ok(())
+}
+
+fn rcb_clock() -> io::Result<Option<&'static reverie_ptrace::InGuestRcbCounter>> {
+    let owner = unsafe { raw_syscall6(libc::SYS_gettid, [0; 6]) } as libc::pid_t;
+    if unsafe { RCB_CLOCK_OWNER } != owner {
+        // A fork/clone child inherits the parent's TLS bytes, including an fd
+        // that still measures the parent thread. Leak that inherited handle
+        // and bind a fresh PMU event to this calling thread.
+        initialize_rcb_clock()?;
+    }
+    let current = unsafe { RCB_CLOCK };
+    if current.is_null() {
+        debug_assert!(unsafe { RCB_CLOCK_UNAVAILABLE });
+        Ok(None)
+    } else {
+        Ok(Some(unsafe { &*current }))
+    }
+}
+
+/// Mark entry into an ordinary-context tool callback.
+pub(crate) fn enter_rcb_handler() -> io::Result<()> {
+    let Some(clock) = rcb_clock()? else {
+        unsafe {
+            RCB_HANDLER_DEPTH = RCB_HANDLER_DEPTH.saturating_add(1);
+        }
+        return Ok(());
+    };
+    let sample = clock
+        .read()
+        .map_err(|error| io::Error::from_raw_os_error(error.into_raw()))?;
+    unsafe {
+        if RCB_HANDLER_DEPTH == 0 {
+            RCB_HANDLER_ENTRY = sample;
+        }
+        RCB_HANDLER_DEPTH = RCB_HANDLER_DEPTH.saturating_add(1);
+    }
+    Ok(())
+}
+
+/// Deduct all RCBs retired while the outermost tool callback was active.
+pub(crate) fn leave_rcb_handler() -> io::Result<()> {
+    unsafe {
+        if RCB_HANDLER_DEPTH == 0 {
+            return Err(io::Error::other("LiteInst RCB handler depth underflow"));
+        }
+        RCB_HANDLER_DEPTH -= 1;
+        if RCB_HANDLER_DEPTH != 0 {
+            return Ok(());
+        }
+    }
+    let Some(clock) = rcb_clock()? else {
+        return Ok(());
+    };
+    let sample = clock
+        .read()
+        .map_err(|error| io::Error::from_raw_os_error(error.into_raw()))?;
+    unsafe {
+        RCB_HANDLER_DEDUCTION =
+            RCB_HANDLER_DEDUCTION.saturating_add(sample.saturating_sub(RCB_HANDLER_ENTRY));
+        RCB_HANDLER_ENTRY = 0;
+    }
+    Ok(())
+}
+
+/// Return guest-only RCB time, excluding all completed and currently-active
+/// LiteInst handler branches.
+pub(crate) fn read_guest_rcb_clock() -> io::Result<u64> {
+    let Some(clock) = rcb_clock()? else {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "LiteInst in-guest RCB clock is unavailable on this host",
+        ));
+    };
+    let sample = clock
+        .read()
+        .map_err(|error| io::Error::from_raw_os_error(error.into_raw()))?;
+    unsafe {
+        let active = if RCB_HANDLER_DEPTH == 0 {
+            0
+        } else {
+            sample.saturating_sub(RCB_HANDLER_ENTRY)
+        };
+        Ok(sample
+            .saturating_sub(RCB_HANDLER_DEDUCTION)
+            .saturating_sub(active))
+    }
+}
 
 pub(crate) fn reserve_coordinator_fd(fd: libc::c_int) -> io::Result<()> {
     COORDINATOR_FD
@@ -238,6 +477,7 @@ pub(crate) fn replace_coordinator_fd(old: libc::c_int, new: libc::c_int) -> io::
 struct RuntimeArena {
     mapping_start: u64,
     mapping_end: u64,
+    mapping_name: Box<str>,
     writable_start: u64,
     writable_end: u64,
     executable_start: u64,
@@ -346,6 +586,9 @@ pub(crate) unsafe fn install_builtin_runtime(tool: BuiltinTool) -> io::Result<()
 /// ([`install_runtime`], used by the `strace`/`compat`/Detcore modes); a shared
 /// [`BuiltinTool`] runs through `install_builtin`, which uses the shared default.
 pub const ALT_STACK_ENV: &str = "REVERIE_LITEINST_ALT_STACK";
+/// Allows a caller to keep fork-family syscalls fail-closed while integrating
+/// a Tool whose process lifecycle is not ready for the direct backend.
+pub const PROCESS_FORK_ENV: &str = "REVERIE_LITEINST_PROCESS_FORK";
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-254): Review alt-stack env parse/reject contract.
@@ -385,6 +628,181 @@ pub fn alt_stack_from_env_value(value: Option<&OsStr>) -> io::Result<bool> {
 fn runtime_config_from_env() -> io::Result<RuntimeConfig> {
     let use_alt_stack = alt_stack_from_env_value(std::env::var_os(ALT_STACK_ENV).as_deref())?;
     Ok(RuntimeConfig { use_alt_stack })
+}
+
+pub(crate) fn cpuid_interception_enabled() -> bool {
+    INSTRUCTION_SUBSCRIPTIONS.load(Ordering::Acquire) & INSTRUCTION_CPUID != 0
+}
+
+pub(crate) fn rdtsc_interception_enabled() -> bool {
+    INSTRUCTION_SUBSCRIPTIONS.load(Ordering::Acquire) & INSTRUCTION_RDTSC != 0
+}
+
+pub(crate) fn preflight_instruction_faulting(
+    subscriptions: InstructionSubscriptions,
+) -> io::Result<()> {
+    if !subscriptions.cpuid && !subscriptions.rdtsc {
+        return Ok(());
+    }
+
+    // The exact setter probes temporarily change this thread's instruction
+    // controls. Keep inherited asynchronous handlers from running application
+    // CPUID/RDTSC during that bounded window, and restore the caller's exact
+    // signal mask on every return path.
+    let all_signals = u64::MAX;
+    let mut previous_mask = 0;
+    let masked = unsafe {
+        raw_syscall6(
+            libc::SYS_rt_sigprocmask,
+            [
+                libc::SIG_SETMASK as u64,
+                (&raw const all_signals) as u64,
+                (&raw mut previous_mask) as u64,
+                core::mem::size_of::<u64>() as u64,
+                0,
+                0,
+            ],
+        )
+    };
+    if masked != 0 {
+        return Err(io::Error::from_raw_os_error((-masked) as i32));
+    }
+    let _signal_mask = SignalInstallGuard {
+        restore_mask: previous_mask,
+    };
+
+    if subscriptions.cpuid {
+        const ARCH_GET_CPUID: u64 = 0x1011;
+        const ARCH_SET_CPUID: u64 = 0x1012;
+        let previous =
+            unsafe { raw_syscall6(libc::SYS_arch_prctl, [ARCH_GET_CPUID, 0, 0, 0, 0, 0]) };
+        if previous < 0 {
+            return Err(instruction_control_unavailable("CPUID faulting", previous));
+        }
+        let result = unsafe { raw_syscall6(libc::SYS_arch_prctl, [ARCH_SET_CPUID, 0, 0, 0, 0, 0]) };
+        if result != 0 {
+            return Err(instruction_control_unavailable("CPUID faulting", result));
+        }
+        let restored = unsafe {
+            raw_syscall6(
+                libc::SYS_arch_prctl,
+                [ARCH_SET_CPUID, previous as u64, 0, 0, 0, 0],
+            )
+        };
+        if restored != 0 {
+            unsafe { exit_now(126) };
+        }
+    }
+    if subscriptions.rdtsc {
+        let mut previous = 0;
+        let result = unsafe {
+            raw_syscall6(
+                libc::SYS_prctl,
+                [
+                    libc::PR_GET_TSC as u64,
+                    (&raw mut previous) as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        };
+        if result != 0 {
+            return Err(instruction_control_unavailable("TSC faulting", result));
+        }
+        let result = unsafe {
+            raw_syscall6(
+                libc::SYS_prctl,
+                [
+                    libc::PR_SET_TSC as u64,
+                    libc::PR_TSC_SIGSEGV as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        };
+        if result != 0 {
+            return Err(instruction_control_unavailable("TSC faulting", result));
+        }
+        let restored = unsafe {
+            raw_syscall6(
+                libc::SYS_prctl,
+                [libc::PR_SET_TSC as u64, previous as u64, 0, 0, 0, 0],
+            )
+        };
+        if restored != 0 {
+            unsafe { exit_now(126) };
+        }
+    }
+    Ok(())
+}
+
+fn instruction_control_unavailable(control: &str, result: i64) -> io::Error {
+    let error = io::Error::from_raw_os_error((-result) as i32);
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("{control} is unavailable: {error}"),
+    )
+}
+
+fn install_instruction_signal_handler(
+    subscriptions: InstructionSubscriptions,
+    on_alt_stack: bool,
+) -> io::Result<()> {
+    let mut bits = 0;
+    if subscriptions.cpuid {
+        bits |= INSTRUCTION_CPUID;
+    }
+    if subscriptions.rdtsc {
+        bits |= INSTRUCTION_RDTSC;
+    }
+    INSTRUCTION_SUBSCRIPTIONS.store(bits, Ordering::Release);
+    if bits == 0 {
+        return Ok(());
+    }
+
+    let mut action: libc::sigaction = unsafe { core::mem::zeroed() };
+    action.sa_flags = libc::SA_SIGINFO | if on_alt_stack { libc::SA_ONSTACK } else { 0 };
+    action.sa_sigaction = instruction_sigsegv_handler as *const () as usize;
+    if unsafe { libc::sigemptyset(&mut action.sa_mask) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::sigaction(libc::SIGSEGV, &action, ptr::null_mut()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn enable_instruction_faulting(subscriptions: InstructionSubscriptions) -> io::Result<()> {
+    if subscriptions.cpuid {
+        const ARCH_SET_CPUID: u64 = 0x1012;
+        let result = unsafe { raw_syscall6(libc::SYS_arch_prctl, [ARCH_SET_CPUID, 0, 0, 0, 0, 0]) };
+        if result != 0 {
+            return Err(io::Error::from_raw_os_error((-result) as i32));
+        }
+    }
+    if subscriptions.rdtsc {
+        let result = unsafe {
+            raw_syscall6(
+                libc::SYS_prctl,
+                [
+                    libc::PR_SET_TSC as u64,
+                    libc::PR_TSC_SIGSEGV as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::from_raw_os_error((-result) as i32));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn initialize_from_environment() -> io::Result<()> {
@@ -436,6 +854,8 @@ pub(crate) fn initialize_from_environment() -> io::Result<()> {
     install_runtime(
         crate::stats::GuestStatsHooks::DISABLED,
         PatchPublication::Concurrent,
+        InstructionSubscriptions::default(),
+        &[],
     )
 }
 
@@ -474,26 +894,58 @@ fn initialize_host_runtime() -> io::Result<()> {
 pub(crate) fn initialize_reverie_tool(
     stats: crate::stats::GuestStatsHooks,
     publication: PatchPublication,
+    instructions: InstructionSubscriptions,
+    vdso_sites: &[reverie_ptrace::VdsoSyscallSite],
 ) -> io::Result<()> {
+    let stage_stream = match std::env::var_os(IN_GUEST_STAGE_STREAM_ENV).as_deref() {
+        None => false,
+        Some(value) if value == OsStr::new("0") => false,
+        Some(value) if value == OsStr::new("1") => true,
+        Some(value) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unsupported {IN_GUEST_STAGE_STREAM_ENV} value {value:?}"),
+            ));
+        }
+    };
+    IN_GUEST_STAGE_STREAM.store(stage_stream, Ordering::Release);
+    let process_forks_allowed = match std::env::var_os(PROCESS_FORK_ENV).as_deref() {
+        None => true,
+        Some(value) if value == OsStr::new("1") => true,
+        Some(value) if value == OsStr::new("0") => false,
+        Some(value) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unsupported {PROCESS_FORK_ENV} value {value:?}"),
+            ));
+        }
+    };
+    PROCESS_FORKS_ALLOWED.store(process_forks_allowed, Ordering::Release);
     TOOL_MODE.store(TOOL_REVERIE, Ordering::Release);
-    install_runtime(stats, publication)
+    install_runtime(stats, publication, instructions, vdso_sites)
 }
 
 fn install_runtime(
     stats: crate::stats::GuestStatsHooks,
     publication: PatchPublication,
+    instructions: InstructionSubscriptions,
+    vdso_sites: &[reverie_ptrace::VdsoSyscallSite],
 ) -> io::Result<()> {
+    PATCH_PUBLICATION.store(publication as u8, Ordering::Release);
     prepare_instrumentation()?;
+    install_vdso_sites(vdso_sites)?;
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-254): Review launcher-selected RuntimeConfig at the install seam.
     let config = runtime_config_from_env()?;
+    install_instruction_signal_handler(instructions, config.use_alt_stack)?;
     unsafe {
         reverie_preload::install(
             Box::new(LiteinstDispatcher::new(stats, publication)),
             &InProcessSeccomp,
             &config,
         )
-    }
+    }?;
+    enable_instruction_faulting(instructions)
 }
 
 struct CompatibilityEventChannel {
@@ -689,6 +1141,14 @@ fn prepare_instrumentation() -> io::Result<()> {
         let Some(permissions) = fields.next() else {
             continue;
         };
+        let mapping_name = fields
+            .nth(3)
+            .unwrap_or("[anonymous]")
+            .rsplit('/')
+            .next()
+            .unwrap_or("[anonymous]")
+            .to_owned()
+            .into_boxed_str();
         if !permissions
             .as_bytes()
             .get(2)
@@ -717,6 +1177,7 @@ fn prepare_instrumentation() -> io::Result<()> {
         arenas.push(RuntimeArena {
             mapping_start,
             mapping_end,
+            mapping_name,
             writable_start: writable.start,
             writable_end: writable.end,
             executable_start: executable.start,
@@ -1034,14 +1495,32 @@ unsafe fn set_text_protection(address: u64, protection: i32) -> io::Result<()> {
     Ok(())
 }
 
+unsafe fn set_mapping_protection(start: u64, len: u64, protection: i32) -> io::Result<()> {
+    let result =
+        unsafe { raw_syscall6(libc::SYS_mprotect, [start, len, protection as u64, 0, 0, 0]) };
+    if result < 0 {
+        return Err(io::Error::from_raw_os_error((-result) as i32));
+    }
+    Ok(())
+}
+
 struct InstallGuard;
 
 #[derive(Clone, Copy)]
+#[repr(u8)]
 pub(crate) enum PatchPublication {
     /// The stopped-tracee helper is the only thread able to reach live code.
     Quiescent,
     /// Other application threads may fetch the site during publication.
     Concurrent,
+}
+
+fn patch_publication() -> PatchPublication {
+    if PATCH_PUBLICATION.load(Ordering::Acquire) == PatchPublication::Quiescent as u8 {
+        PatchPublication::Quiescent
+    } else {
+        PatchPublication::Concurrent
+    }
 }
 
 impl Drop for InstallGuard {
@@ -1062,6 +1541,8 @@ unsafe fn install_site_hook(
     slot: &'static SiteSlot,
     callback: liteinst2::trampoline::HookCallback,
     publication: PatchPublication,
+    expected_instruction: &[u8],
+    manage_protection: bool,
 ) -> io::Result<HostInstallResult> {
     let _install_guard = lock_installation()?;
     let _allocation_scope = crate::patch_alloc::enter();
@@ -1083,8 +1564,10 @@ unsafe fn install_site_hook(
     // SAFETY: arena_for proved this byte range lies in a live executable VMA.
     let candidate =
         unsafe { core::slice::from_raw_parts(address as usize as *const u8, available) };
-    if candidate.get(..2) != Some(&[0x0F, 0x05]) {
-        return Err(io::Error::other("SIGSYS site is not an x86-64 syscall"));
+    if candidate.get(..expected_instruction.len()) != Some(expected_instruction) {
+        return Err(io::Error::other(
+            "fault site does not contain the expected x86-64 instruction",
+        ));
     }
     let scanner = InstructionScanner::default();
     let scan = scanner
@@ -1132,37 +1615,60 @@ unsafe fn install_site_hook(
     };
     let code = scan.snapshot();
 
-    unsafe {
-        set_text_protection(
-            address,
-            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-        )?;
+    if manage_protection {
+        unsafe {
+            set_text_protection(
+                address,
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+            )?;
+        }
     }
-    let site = HookSite::new(
-        &scanner,
-        &scan,
-        code,
-        address,
-        address,
-        address as usize as *mut u8,
-    );
-    let installed = match publication {
-        PatchPublication::Quiescent => unsafe {
-            InstalledHook::install_replacing_first_in_arena_quiescent(site, callback, &arena.arena)
-        },
-        PatchPublication::Concurrent => unsafe {
-            InstalledHook::install_replacing_first_in_arena(
-                site,
-                callback,
-                staleness.expect("concurrent publication has a staleness budget"),
-                &arena.arena,
-            )
-        },
+    // A guarded cross-line plan rejects a trampoline displacement containing
+    // the temporary INT3 byte at another instruction head. Arena slots have
+    // distinct rel32 displacements, so retry a bounded number of fresh slots;
+    // this changes no guest bytes and preserves the same patch mechanism.
+    let mut attempts = 0;
+    let installed = loop {
+        attempts += 1;
+        let site = HookSite::new(
+            &scanner,
+            &scan,
+            code,
+            address,
+            address,
+            address as usize as *mut u8,
+        );
+        let candidate = match publication {
+            PatchPublication::Quiescent => unsafe {
+                InstalledHook::install_replacing_first_in_arena_quiescent(
+                    site,
+                    callback,
+                    &arena.arena,
+                )
+            },
+            PatchPublication::Concurrent => unsafe {
+                InstalledHook::install_replacing_first_in_arena(
+                    site,
+                    callback,
+                    staleness.expect("concurrent publication has a staleness budget"),
+                    &arena.arena,
+                )
+            },
+        };
+        match candidate {
+            Ok(installed) => break Ok(installed),
+            Err(TrampolineError::Patch(PatchError::GuardByteConflict { .. })) if attempts < 16 => {
+                continue;
+            }
+            Err(error) => break Err(error),
+        }
     };
     let installed = match installed {
         Ok(installed) => installed,
         Err(error) => {
-            let _ = unsafe { set_text_protection(address, libc::PROT_READ | libc::PROT_EXEC) };
+            if manage_protection {
+                let _ = unsafe { set_text_protection(address, libc::PROT_READ | libc::PROT_EXEC) };
+            }
             return Err(io::Error::other(error.to_string()));
         }
     };
@@ -1174,11 +1680,15 @@ unsafe fn install_site_hook(
         PatchPublication::Quiescent => unsafe { installed.activate_quiescent() },
     };
     if let Err(error) = activation {
-        let _ = unsafe { set_text_protection(address, libc::PROT_READ | libc::PROT_EXEC) };
+        if manage_protection {
+            let _ = unsafe { set_text_protection(address, libc::PROT_READ | libc::PROT_EXEC) };
+        }
         return Err(io::Error::other(error.to_string()));
     }
-    unsafe {
-        set_text_protection(address, libc::PROT_READ | libc::PROT_EXEC)?;
+    if manage_protection {
+        unsafe {
+            set_text_protection(address, libc::PROT_READ | libc::PROT_EXEC)?;
+        }
     }
 
     let relocated_tail = installed.trampoline().relocated_tail_address();
@@ -1207,6 +1717,58 @@ unsafe fn install_site_hook(
         .store(straddle_prefix as u8, Ordering::Release);
     slot.state.store(SITE_ACTIVE, Ordering::Release);
     Ok(result)
+}
+
+fn install_vdso_sites(sites: &[reverie_ptrace::VdsoSyscallSite]) -> io::Result<()> {
+    for site_info in sites {
+        let address = site_info.address;
+        let (site, claimed) = claim_site(address)
+            .ok_or_else(|| io::Error::other("LiteInst vDSO site table is full"))?;
+        if !claimed {
+            return Err(io::Error::other("LiteInst vDSO site was claimed twice"));
+        }
+        unsafe {
+            set_mapping_protection(
+                site_info.mapping_start,
+                site_info.mapping_len,
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+            )?;
+            install_site_hook(
+                address,
+                site,
+                vdso_callback(site_info.number)?,
+                PatchPublication::Quiescent,
+                &[0x0f, 0x05],
+                false,
+            )
+        }
+        .map_err(|error| {
+            site.state.store(SITE_FALLBACK, Ordering::Release);
+            io::Error::other(format!("failed to install LiteInst vDSO hook: {error}"))
+        })?;
+        unsafe {
+            set_mapping_protection(
+                site_info.mapping_start,
+                site_info.mapping_len,
+                libc::PROT_READ | libc::PROT_EXEC,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn vdso_callback(number: i64) -> io::Result<liteinst2::trampoline::HookCallback> {
+    match number {
+        libc::SYS_time => Ok(installed_vdso_time_hook),
+        libc::SYS_clock_gettime => Ok(installed_vdso_clock_gettime_hook),
+        libc::SYS_getcpu => Ok(installed_vdso_getcpu_hook),
+        libc::SYS_gettimeofday => Ok(installed_vdso_gettimeofday_hook),
+        libc::SYS_clock_getres => Ok(installed_vdso_clock_getres_hook),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported LiteInst vDSO syscall number {number}"),
+        )),
+    }
 }
 
 // TODO-HUMAN-REVIEW(PR-270): Review stopped-tracee patch helper ABI.
@@ -1248,6 +1810,8 @@ pub unsafe extern "C" fn reverie_liteinst_install_site_for_ptrace(address: u64) 
                 site,
                 host_syscall_hook,
                 PatchPublication::Quiescent,
+                &[0x0f, 0x05],
+                true,
             )
         } {
             Ok(result) => install_result = Some(result),
@@ -1334,8 +1898,15 @@ impl Drop for SignalInstallGuard {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-133): Review atomic signal-state preparation.
-pub(crate) fn prepare_guest_signal_state() -> io::Result<SignalInstallGuard> {
+pub(crate) fn prepare_guest_signal_state(
+    instructions: InstructionSubscriptions,
+) -> io::Result<SignalInstallGuard> {
     let sigsys = 1_u64 << (libc::SIGSYS - 1);
+    let sigsegv = if instructions.cpuid || instructions.rdtsc {
+        1_u64 << (libc::SIGSEGV - 1)
+    } else {
+        0
+    };
     let install_mask = u64::MAX;
     let mut previous_mask = 0_u64;
     let result = unsafe {
@@ -1355,7 +1926,7 @@ pub(crate) fn prepare_guest_signal_state() -> io::Result<SignalInstallGuard> {
         return Err(io::Error::from_raw_os_error((-result) as i32));
     }
     let guard = SignalInstallGuard {
-        restore_mask: previous_mask & !sigsys,
+        restore_mask: previous_mask & !(sigsys | sigsegv),
     };
 
     for signal in 1..=64 {
@@ -1408,7 +1979,10 @@ pub(crate) fn signal_action_supported(number: i64, args: [u64; 6]) -> bool {
     if number != libc::SYS_rt_sigaction || args[1] == 0 {
         return true;
     }
-    if args[0] == libc::SIGSYS as u64 {
+    if args[0] == libc::SIGSYS as u64
+        || (args[0] == libc::SIGSEGV as u64
+            && INSTRUCTION_SUBSCRIPTIONS.load(Ordering::Acquire) != 0)
+    {
         return false;
     }
 
@@ -1611,11 +2185,335 @@ unsafe extern "C" fn host_syscall_hook(context: *mut HookContext) {
     frame.copy_to_context(context, original_rflags);
 }
 
-unsafe extern "C" fn installed_syscall_hook(context: *mut HookContext) {
+fn instruction_at(address: u64) -> Option<(InstructionEventKind, &'static [u8])> {
+    let arena = arena_for(address)?;
+    let available = usize::try_from(arena.mapping_end.checked_sub(address)?)
+        .ok()?
+        .min(3);
+    if available < 2 {
+        return None;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(address as usize as *const u8, available) };
+    match bytes {
+        [0x0f, 0xa2, ..] => Some((InstructionEventKind::Cpuid, &[0x0f, 0xa2])),
+        [0x0f, 0x31, ..] => Some((InstructionEventKind::Rdtsc, &[0x0f, 0x31])),
+        [0x0f, 0x01, 0xf9] => Some((InstructionEventKind::Rdtscp, &[0x0f, 0x01, 0xf9])),
+        _ => None,
+    }
+}
+
+fn instruction_is_subscribed(kind: InstructionEventKind) -> bool {
+    let bits = INSTRUCTION_SUBSCRIPTIONS.load(Ordering::Acquire);
+    match kind {
+        InstructionEventKind::Cpuid => bits & INSTRUCTION_CPUID != 0,
+        InstructionEventKind::Rdtsc | InstructionEventKind::Rdtscp => bits & INSTRUCTION_RDTSC != 0,
+    }
+}
+
+fn instruction_callback(kind: InstructionEventKind) -> liteinst2::trampoline::HookCallback {
+    match kind {
+        InstructionEventKind::Cpuid => installed_cpuid_hook,
+        InstructionEventKind::Rdtsc => installed_rdtsc_hook,
+        InstructionEventKind::Rdtscp => installed_rdtscp_hook,
+    }
+}
+
+unsafe fn set_all_instruction_native(enabled: bool) -> io::Result<()> {
+    if cpuid_interception_enabled() {
+        unsafe { set_instruction_native(InstructionEventKind::Cpuid, enabled) }?;
+    }
+    if rdtsc_interception_enabled() {
+        unsafe { set_instruction_native(InstructionEventKind::Rdtsc, enabled) }?;
+    }
+    Ok(())
+}
+
+unsafe fn deliver_default_sigsegv() -> ! {
+    let default_action = KernelSigaction::default();
+    let _ = unsafe {
+        raw_syscall6(
+            libc::SYS_rt_sigaction,
+            [
+                libc::SIGSEGV as u64,
+                (&raw const default_action) as u64,
+                0,
+                core::mem::size_of::<u64>() as u64,
+                0,
+                0,
+            ],
+        )
+    };
+    let pid = unsafe { raw_syscall6(libc::SYS_getpid, [0; 6]) };
+    let tid = unsafe { raw_syscall6(libc::SYS_gettid, [0; 6]) };
+    let _ = unsafe {
+        raw_syscall6(
+            libc::SYS_tgkill,
+            [pid as u64, tid as u64, libc::SIGSEGV as u64, 0, 0, 0],
+        )
+    };
+    unsafe { exit_now(128 + libc::SIGSEGV) }
+}
+
+unsafe extern "C" fn instruction_sigsegv_handler(
+    signal: libc::c_int,
+    info: *mut libc::siginfo_t,
+    context: *mut libc::c_void,
+) {
+    if signal != libc::SIGSEGV || context.is_null() {
+        emit_in_guest_stage(b"instruction-sigsegv-invalid-context");
+        unsafe { deliver_default_sigsegv() };
+    }
+    let context = unsafe { &mut *context.cast::<libc::ucontext_t>() };
+    let address = context.uc_mcontext.gregs[libc::REG_RIP as usize] as u64;
+    let Some((kind, expected)) = instruction_at(address) else {
+        if let Some(arena) = arena_for(address) {
+            let available = usize::try_from(arena.mapping_end.saturating_sub(address))
+                .unwrap_or(0)
+                .min(8);
+            let bytes =
+                unsafe { core::slice::from_raw_parts(address as usize as *const u8, available) };
+            let fault_address = if info.is_null() {
+                0
+            } else {
+                unsafe { (*info).si_addr() as usize as u64 }
+            };
+            emit_instruction_refusal_stage(
+                b"instruction-sigsegv-unrecognized-bytes",
+                address.saturating_sub(arena.mapping_start),
+                fault_address,
+                context.uc_mcontext.gregs[libc::REG_RSP as usize] as u64,
+                arena.mapping_name.as_bytes(),
+                arena.mapping_end.saturating_sub(arena.mapping_start),
+                bytes,
+            );
+        } else {
+            emit_in_guest_stage(b"instruction-sigsegv-no-reachable-arena");
+        }
+        unsafe { deliver_default_sigsegv() };
+    };
+    if !instruction_is_subscribed(kind) {
+        emit_in_guest_stage(b"instruction-sigsegv-unsubscribed");
+        unsafe { deliver_default_sigsegv() };
+    }
+
+    // An unpatched instruction reached from an active Tool callback must not
+    // allocate a trampoline. After fork, the arena cursor is process-private
+    // but its backing pages are shared; child publication would let the parent
+    // reuse and overwrite the same slot. Execute at the private native helper
+    // and advance the faulting context instead.
+    if unsafe { !CURRENT_EVENT.is_null() } {
+        emit_in_guest_stage(match kind {
+            InstructionEventKind::Cpuid => b"nested-instruction-fault-native-cpuid",
+            InstructionEventKind::Rdtsc => b"nested-instruction-fault-native-rdtsc",
+            InstructionEventKind::Rdtscp => b"nested-instruction-fault-native-rdtscp",
+        });
+        if unsafe { set_instruction_native(kind, true) }.is_err() {
+            emit_in_guest_stage(b"instruction-sigsegv-enable-native-failed");
+            unsafe { deliver_default_sigsegv() };
+        }
+        unsafe { execute_native_fault_instruction(kind, context, expected.len()) };
+        if unsafe { set_instruction_native(kind, false) }.is_err() {
+            emit_in_guest_stage(b"instruction-sigsegv-disable-native-failed");
+            unsafe { deliver_default_sigsegv() };
+        }
+        return;
+    }
+
+    let Some((site, claimed)) = claim_site(address) else {
+        emit_in_guest_stage(b"instruction-sigsegv-site-table-full");
+        unsafe { deliver_default_sigsegv() };
+    };
+    site.trap_count.fetch_add(1, Ordering::Relaxed);
+    if unsafe { set_all_instruction_native(true) }.is_err() {
+        emit_in_guest_stage(b"instruction-sigsegv-enable-native-failed");
+        unsafe { deliver_default_sigsegv() };
+    }
+    if claimed
+        && unsafe {
+            install_site_hook(
+                address,
+                site,
+                instruction_callback(kind),
+                patch_publication(),
+                expected,
+                true,
+            )
+        }
+        .is_err()
+    {
+        site.state.store(SITE_FALLBACK, Ordering::Release);
+    }
+    if unsafe { set_all_instruction_native(false) }.is_err() {
+        emit_in_guest_stage(b"instruction-sigsegv-disable-native-failed");
+        unsafe { deliver_default_sigsegv() };
+    }
+    while matches!(site.state.load(Ordering::Acquire), 0 | SITE_INSTALLING) {
+        core::hint::spin_loop();
+    }
+    if site.state.load(Ordering::Acquire) != SITE_ACTIVE {
+        emit_in_guest_stage(b"instruction-sigsegv-site-install-failed");
+        unsafe { deliver_default_sigsegv() };
+    }
+    let hook = site.hook.load(Ordering::Acquire);
+    if hook.is_null() {
+        emit_in_guest_stage(b"instruction-sigsegv-hook-missing");
+        unsafe { deliver_default_sigsegv() };
+    }
+    context.uc_mcontext.gregs[libc::REG_RIP as usize] =
+        unsafe { (*hook).trampoline().address() } as i64;
+}
+
+unsafe fn execute_native_fault_instruction(
+    kind: InstructionEventKind,
+    context: &mut libc::ucontext_t,
+    instruction_len: usize,
+) {
+    let registers = &mut context.uc_mcontext.gregs;
+    match kind {
+        InstructionEventKind::Cpuid => {
+            let mut result = NativeCpuidResult::default();
+            unsafe {
+                reverie_liteinst_native_cpuid(
+                    registers[libc::REG_RAX as usize] as u32,
+                    registers[libc::REG_RCX as usize] as u32,
+                    &mut result,
+                )
+            };
+            registers[libc::REG_RAX as usize] = i64::from(result.eax);
+            registers[libc::REG_RBX as usize] = i64::from(result.ebx);
+            registers[libc::REG_RCX as usize] = i64::from(result.ecx);
+            registers[libc::REG_RDX as usize] = i64::from(result.edx);
+        }
+        InstructionEventKind::Rdtsc => {
+            let value = unsafe { reverie_liteinst_native_rdtsc() };
+            registers[libc::REG_RAX as usize] = i64::from(value as u32);
+            registers[libc::REG_RDX as usize] = (value >> 32) as i64;
+        }
+        InstructionEventKind::Rdtscp => {
+            let mut aux = 0;
+            let value = unsafe { reverie_liteinst_native_rdtscp(&mut aux) };
+            registers[libc::REG_RAX as usize] = i64::from(value as u32);
+            registers[libc::REG_RDX as usize] = (value >> 32) as i64;
+            registers[libc::REG_RCX as usize] = i64::from(aux);
+        }
+    }
+    registers[libc::REG_RIP as usize] =
+        registers[libc::REG_RIP as usize].saturating_add(instruction_len as i64);
+}
+
+unsafe fn set_instruction_native(kind: InstructionEventKind, enabled: bool) -> io::Result<()> {
+    let result = match kind {
+        InstructionEventKind::Cpuid => unsafe {
+            const ARCH_SET_CPUID: u64 = 0x1012;
+            raw_syscall6(
+                libc::SYS_arch_prctl,
+                [ARCH_SET_CPUID, u64::from(enabled), 0, 0, 0, 0],
+            )
+        },
+        InstructionEventKind::Rdtsc | InstructionEventKind::Rdtscp => unsafe {
+            raw_syscall6(
+                libc::SYS_prctl,
+                [
+                    libc::PR_SET_TSC as u64,
+                    if enabled {
+                        libc::PR_TSC_ENABLE as u64
+                    } else {
+                        libc::PR_TSC_SIGSEGV as u64
+                    },
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        },
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error((-result) as i32))
+    }
+}
+
+unsafe fn installed_instruction_hook(context: *mut HookContext, kind: InstructionEventKind) {
+    if context.is_null() || enter_rcb_handler().is_err() {
+        unsafe { exit_now(122) };
+    }
+    let context = unsafe { &mut *context };
+    if let Some(site) = find_site(context.instruction_pointer) {
+        site.hook_count.fetch_add(1, Ordering::Relaxed);
+    }
+    if unsafe { set_instruction_native(kind, true) }.is_err() {
+        unsafe { exit_now(122) };
+    }
+    // A previously patched instruction still jumps here while native faulting
+    // is enabled. Re-entering the Tool would deadlock on its already-held lock,
+    // so execute the instruction at a private, never-patched site instead.
+    if unsafe { !CURRENT_EVENT.is_null() } {
+        emit_in_guest_stage(match kind {
+            InstructionEventKind::Cpuid => b"nested-instruction-native-cpuid",
+            InstructionEventKind::Rdtsc => b"nested-instruction-native-rdtsc",
+            InstructionEventKind::Rdtscp => b"nested-instruction-native-rdtscp",
+        });
+        unsafe { execute_native_instruction(kind, context) };
+        if unsafe { set_instruction_native(kind, false) }.is_err() || leave_rcb_handler().is_err() {
+            unsafe { exit_now(122) };
+        }
+        return;
+    }
+    crate::tool_host::dispatch_instruction(kind, context);
+    if unsafe { set_instruction_native(kind, false) }.is_err() || leave_rcb_handler().is_err() {
+        unsafe { exit_now(122) };
+    }
+}
+
+unsafe fn execute_native_instruction(kind: InstructionEventKind, context: &mut HookContext) {
+    match kind {
+        InstructionEventKind::Cpuid => {
+            let mut result = NativeCpuidResult::default();
+            unsafe {
+                reverie_liteinst_native_cpuid(context.rax as u32, context.rcx as u32, &mut result)
+            };
+            context.rax = u64::from(result.eax);
+            context.rbx = u64::from(result.ebx);
+            context.rcx = u64::from(result.ecx);
+            context.rdx = u64::from(result.edx);
+        }
+        InstructionEventKind::Rdtsc => {
+            let value = unsafe { reverie_liteinst_native_rdtsc() };
+            context.rax = value as u32 as u64;
+            context.rdx = value >> 32;
+        }
+        InstructionEventKind::Rdtscp => {
+            let mut aux = 0;
+            let value = unsafe { reverie_liteinst_native_rdtscp(&mut aux) };
+            context.rax = value as u32 as u64;
+            context.rdx = value >> 32;
+            context.rcx = u64::from(aux);
+        }
+    }
+}
+
+unsafe extern "C" fn installed_cpuid_hook(context: *mut HookContext) {
+    unsafe { installed_instruction_hook(context, InstructionEventKind::Cpuid) }
+}
+
+unsafe extern "C" fn installed_rdtsc_hook(context: *mut HookContext) {
+    unsafe { installed_instruction_hook(context, InstructionEventKind::Rdtsc) }
+}
+
+unsafe extern "C" fn installed_rdtscp_hook(context: *mut HookContext) {
+    unsafe { installed_instruction_hook(context, InstructionEventKind::Rdtscp) }
+}
+
+unsafe fn installed_syscall_hook_for(context: *mut HookContext, number: Option<i64>) {
     if context.is_null() {
         unsafe {
             exit_now(122);
         }
+    }
+    if enter_rcb_handler().is_err() {
+        unsafe { exit_now(122) };
     }
     // SAFETY: generated LiteInst code passes a unique mutable saved frame.
     let context_pointer = context as usize;
@@ -1624,7 +2522,7 @@ unsafe extern "C" fn installed_syscall_hook(context: *mut HookContext) {
         site.hook_count.fetch_add(1, Ordering::Relaxed);
     }
     let mut event = SyscallEvent {
-        number: context.rax as i64,
+        number: number.unwrap_or(context.rax as i64),
         args: [
             context.rdi,
             context.rsi,
@@ -1644,6 +2542,9 @@ unsafe extern "C" fn installed_syscall_hook(context: *mut HookContext) {
         context.rax = event.result as u64;
         context.rcx = context.instruction_pointer.saturating_add(2);
         context.r11 = context.rflags;
+        if leave_rcb_handler().is_err() {
+            unsafe { exit_now(122) };
+        }
         return;
     }
     unsafe {
@@ -1657,6 +2558,33 @@ unsafe extern "C" fn installed_syscall_hook(context: *mut HookContext) {
     context.rax = event.result as u64;
     context.rcx = context.instruction_pointer.saturating_add(2);
     context.r11 = context.rflags;
+    if leave_rcb_handler().is_err() {
+        unsafe { exit_now(122) };
+    }
+}
+
+unsafe extern "C" fn installed_syscall_hook(context: *mut HookContext) {
+    unsafe { installed_syscall_hook_for(context, None) }
+}
+
+unsafe extern "C" fn installed_vdso_time_hook(context: *mut HookContext) {
+    unsafe { installed_syscall_hook_for(context, Some(libc::SYS_time)) }
+}
+
+unsafe extern "C" fn installed_vdso_clock_gettime_hook(context: *mut HookContext) {
+    unsafe { installed_syscall_hook_for(context, Some(libc::SYS_clock_gettime)) }
+}
+
+unsafe extern "C" fn installed_vdso_getcpu_hook(context: *mut HookContext) {
+    unsafe { installed_syscall_hook_for(context, Some(libc::SYS_getcpu)) }
+}
+
+unsafe extern "C" fn installed_vdso_gettimeofday_hook(context: *mut HookContext) {
+    unsafe { installed_syscall_hook_for(context, Some(libc::SYS_gettimeofday)) }
+}
+
+unsafe extern "C" fn installed_vdso_clock_getres_hook(context: *mut HookContext) {
+    unsafe { installed_syscall_hook_for(context, Some(libc::SYS_clock_getres)) }
 }
 
 unsafe fn locate_syscall_site(resume_address: u64) -> Option<u64> {
@@ -1761,18 +2689,22 @@ impl SyscallDispatcher for LiteinstDispatcher {
 
         if let Some((site, claimed)) = claim_site(instruction_pointer) {
             site.trap_count.fetch_add(1, Ordering::Relaxed);
-            if claimed
-                && unsafe {
+            if claimed {
+                let native = unsafe { set_all_instruction_native(true) };
+                let installed = native.and_then(|()| unsafe {
                     install_site_hook(
                         instruction_pointer,
                         site,
                         installed_syscall_hook,
                         self.publication,
+                        &[0x0f, 0x05],
+                        true,
                     )
+                });
+                let restored = unsafe { set_all_instruction_native(false) };
+                if installed.is_err() || restored.is_err() {
+                    site.state.store(SITE_FALLBACK, Ordering::Release);
                 }
-                .is_err()
-            {
-                site.state.store(SITE_FALLBACK, Ordering::Release);
             }
             while matches!(site.state.load(Ordering::Acquire), 0 | SITE_INSTALLING) {
                 core::hint::spin_loop();
@@ -1815,9 +2747,8 @@ unsafe extern "C" fn tool_trampoline() {
 
 // TODO-HUMAN-REVIEW(PR-127): Review process-global preload safety guards.
 fn protect_runtime_control(event: &mut SyscallEvent) -> bool {
-    let unsupported_control =
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        matches!(event.number, libc::SYS_clone3 | libc::SYS_vfork);
+    let unsupported_process =
+        is_fork_like(event.number) && !PROCESS_FORKS_ALLOWED.load(Ordering::Acquire);
     let protected_signal =
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-133): Review fail-closed guest signal-handler policy.
@@ -1827,7 +2758,7 @@ fn protect_runtime_control(event: &mut SyscallEvent) -> bool {
         // AUTONOMOUS-BOT-IMPLEMENTED
         || (event.number == libc::SYS_rt_sigprocmask && event.args[1] != 0);
 
-    if unsupported_control {
+    if unsupported_process {
         event.result = -i64::from(libc::ENOTSUP);
     } else if protected_signal {
         event.result = -i64::from(libc::EPERM);
@@ -1913,9 +2844,8 @@ unsafe fn process_syscall(event: &mut SyscallEvent) {
     // In the child of a successful fork-like syscall (`result == 0`), the
     // COW-inherited observability counters describe the parent, not this child.
     // Reset them through the shared ForkHook seam so per-process attribution
-    // starts clean. `is_fork_like` also matches clone3/vfork, but those never
-    // reach a successful forward here (both fail closed earlier), so gating on a
-    // zero result is sufficient and mirrors e9patch's child-side reset.
+    // starts clean. Gating on a zero result is sufficient and mirrors
+    // e9patch's child-side reset.
     if is_fork_like(event.number) && event.result == 0 {
         FORK_HOOK.run_in_child();
     }
@@ -2166,6 +3096,96 @@ unsafe fn trace_event(event: &SyscallEvent, result: Option<i64>) {
     }
 }
 
+/// Emit an allocation-free stage marker from the in-guest Tool process.
+///
+/// This is opt-in because production guests own stderr. When enabled, a short
+/// write is fail-closed so an absent marker cannot be mistaken for a negative
+/// observation across the host/in-guest process boundary.
+pub(crate) fn emit_in_guest_stage(stage: &[u8]) {
+    if !IN_GUEST_STAGE_STREAM.load(Ordering::Acquire) {
+        return;
+    }
+    let mut line = StackLine::new();
+    line.push_bytes(b"INFO reverie_liteinst::tool_host: [in-guest pid=");
+    line.push_signed(unsafe { raw_syscall6(libc::SYS_getpid, [0; 6]) });
+    line.push_bytes(b" tid=");
+    line.push_signed(unsafe { raw_syscall6(libc::SYS_gettid, [0; 6]) });
+    line.push_bytes(b"] stage=");
+    line.push_bytes(stage);
+    line.push_bytes(b"\n");
+    let written = unsafe {
+        raw_syscall6(
+            libc::SYS_write,
+            [
+                libc::STDERR_FILENO as u64,
+                line.bytes.as_ptr() as u64,
+                line.len as u64,
+                0,
+                0,
+                0,
+            ],
+        )
+    };
+    if written != line.len as i64 {
+        unsafe { exit_now(IN_GUEST_STAGE_WRITE_FAILURE_STATUS) };
+    }
+}
+
+fn emit_instruction_refusal_stage(
+    stage: &[u8],
+    rip_offset: u64,
+    fault_address: u64,
+    stack_pointer: u64,
+    mapping_name: &[u8],
+    mapping_len: u64,
+    bytes: &[u8],
+) {
+    if !IN_GUEST_STAGE_STREAM.load(Ordering::Acquire) {
+        return;
+    }
+    let mut line = StackLine::new();
+    line.push_bytes(b"INFO reverie_liteinst::tool_host: [in-guest pid=");
+    line.push_signed(unsafe { raw_syscall6(libc::SYS_getpid, [0; 6]) });
+    line.push_bytes(b" tid=");
+    line.push_signed(unsafe { raw_syscall6(libc::SYS_gettid, [0; 6]) });
+    line.push_bytes(b"] stage=");
+    line.push_bytes(stage);
+    line.push_bytes(b" rip-offset=0x");
+    line.push_hex(rip_offset);
+    line.push_bytes(b" fault=0x");
+    line.push_hex(fault_address);
+    line.push_bytes(b" rsp=0x");
+    line.push_hex(stack_pointer);
+    line.push_bytes(b" map=");
+    line.push_bytes(mapping_name);
+    line.push_bytes(b" map-len=0x");
+    line.push_hex(mapping_len);
+    line.push_bytes(b" bytes=");
+    for (index, byte) in bytes.iter().enumerate() {
+        if index != 0 {
+            line.push_bytes(b"-");
+        }
+        line.push_hex_byte(*byte);
+    }
+    line.push_bytes(b"\n");
+    let written = unsafe {
+        raw_syscall6(
+            libc::SYS_write,
+            [
+                libc::STDERR_FILENO as u64,
+                line.bytes.as_ptr() as u64,
+                line.len as u64,
+                0,
+                0,
+                0,
+            ],
+        )
+    };
+    if written != line.len as i64 {
+        unsafe { exit_now(IN_GUEST_STAGE_WRITE_FAILURE_STATUS) };
+    }
+}
+
 unsafe fn exit_now(code: i32) -> ! {
     let _ = unsafe { raw_syscall6(libc::SYS_exit_group, [code as u64, 0, 0, 0, 0, 0]) };
     loop {
@@ -2231,6 +3251,14 @@ impl StackLine {
             }
         }
         self.push_bytes(&digits[cursor..]);
+    }
+
+    fn push_hex_byte(&mut self, value: u8) {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        self.push_bytes(&[
+            DIGITS[usize::from(value >> 4)],
+            DIGITS[usize::from(value & 0xf)],
+        ]);
     }
 }
 

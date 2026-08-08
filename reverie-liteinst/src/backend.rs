@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::process::Output;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use reverie::Backend;
@@ -354,11 +355,11 @@ impl LiteinstBackend {
     /// Runs a tool using an explicit tool-specific preload library.
     ///
     /// This path dispatches patchable syscalls in the guest and keeps the
-    /// `GlobalTool` in this coordinator. A lifecycle-only `TracerBuilder<()>`
-    /// follows and reaps the process tree but has no syscall subscriptions, so
-    /// the concrete `Tool` remains guest-only. Single-threaded plain-fork
-    /// children reconnect to the shared coordinator. Thread clone, clone3,
-    /// vfork, exec rebootstrap, and unpatchable-site fallback remain unsupported.
+    /// `GlobalTool` in this coordinator. The coordinator drains inherited RPC
+    /// connections to follow process-like fork/clone3 descendants without
+    /// attaching ptrace. Vfork is translated to a COW child and supports the
+    /// child-exit completion boundary. Thread clone, exec rebootstrap, and
+    /// unpatchable-site fallback remain unsupported.
     pub async fn run_with_preload<T>(
         command: Command,
         config: <T::GlobalState as GlobalTool>::Config,
@@ -602,6 +603,7 @@ enum ChildWait {
 async fn serve_rpc_until<G, F, T>(
     server: RpcServer<G>,
     stats_server: Option<RpcServer<crate::stats::LiteinstStatsGlobal>>,
+    connection_counts: Vec<Arc<AtomicUsize>>,
     completion: F,
 ) -> io::Result<T>
 where
@@ -631,6 +633,25 @@ where
             return Err(io::Error::other(message));
         }
     };
+
+    // A fork child inherits the parent's connected socket. If it later needs
+    // its own identity, the client opens the replacement before dropping the
+    // inherited descriptor. Consequently this count cannot transiently reach
+    // zero while a supported descendant still owns coordinator state.
+    while connection_counts
+        .iter()
+        .any(|count| count.load(Ordering::Acquire) != 0)
+    {
+        if let Some(server_result) = serving.try_join_next() {
+            let message = match server_result {
+                Ok(Ok(())) => "LiteInst coordinator stopped unexpectedly".to_owned(),
+                Ok(Err(error)) => error.to_string(),
+                Err(error) => error.to_string(),
+            };
+            return Err(io::Error::other(message));
+        }
+        tokio::task::yield_now().await;
+    }
 
     serving.abort_all();
     while let Some(server_result) = serving.join_next().await {
@@ -708,11 +729,13 @@ where
         connected.clone(),
     )
     .map_err(|error| io::Error::other(error.to_string()))?;
+    let mut connection_counts = vec![server.connection_count()];
     let (stats_global, stats_server, stats_socket) = if stats_request.is_enabled() {
         let socket = directory.path().join("stats.sock");
         let global = Arc::new(crate::stats::LiteinstStatsGlobal::default());
         let server = RpcServer::bind(&socket, global.clone(), ())
             .map_err(|error| io::Error::other(error.to_string()))?;
+        connection_counts.push(server.connection_count());
         (Some(global), Some(server), Some(socket))
     } else {
         (None, None, None)
@@ -747,37 +770,30 @@ where
                     child.wait().map(ChildWait::Status)
                 }
             });
-            serve_rpc_until(server, stats_server, async move {
+            serve_rpc_until(server, stats_server, connection_counts, async move {
                 wait.await
                     .map_err(|error| io::Error::other(error.to_string()))?
             })
             .await?
         }
         None => {
-            command.env(COORDINATOR_ENV, &socket);
-            command.env_remove(STATS_COORDINATOR_ENV);
+            let mut child_command = command.into_std_lossy();
+            child_command.env(COORDINATOR_ENV, &socket);
+            child_command.env_remove(STATS_COORDINATOR_ENV);
             if let Some(stats_socket) = &stats_socket {
-                command.env(STATS_COORDINATOR_ENV, stats_socket);
+                child_command.env(STATS_COORDINATOR_ENV, stats_socket);
             }
-            let tracer = TracerBuilder::<()>::new(command).spawn().await?;
-            serve_rpc_until(server, stats_server, async move {
+            let mut child = child_command.spawn()?;
+            let wait = tokio::task::spawn_blocking(move || {
                 if capture_output {
-                    let (output, ()) = tracer
-                        .wait_with_output()
-                        .await
-                        .map_err(|error| io::Error::other(error.to_string()))?;
-                    Ok(ChildWait::Output(Output {
-                        status: output.status.into(),
-                        stdout: output.stdout,
-                        stderr: output.stderr,
-                    }))
+                    child.wait_with_output().map(ChildWait::Output)
                 } else {
-                    let (status, ()) = tracer
-                        .wait()
-                        .await
-                        .map_err(|error| io::Error::other(error.to_string()))?;
-                    Ok(ChildWait::Status(status.into()))
+                    child.wait().map(ChildWait::Status)
                 }
+            });
+            serve_rpc_until(server, stats_server, connection_counts, async move {
+                wait.await
+                    .map_err(|error| io::Error::other(error.to_string()))?
             })
             .await?
         }
@@ -859,6 +875,7 @@ mod tests {
         let socket = directory.path().join("coordinator.sock");
         let global = Arc::new(MultiClientGlobal::default());
         let server = RpcServer::bind(&socket, global.clone(), 41).unwrap();
+        let connection_counts = vec![server.connection_count()];
 
         let clients = tokio::task::spawn_blocking(move || -> io::Result<()> {
             let mut first = CoordinatorClient::connect(&socket)?;
@@ -880,7 +897,7 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(5),
-            serve_rpc_until(server, None, completion),
+            serve_rpc_until(server, None, connection_counts, completion),
         )
         .await
         .expect("the second local RPC connection blocked at its config handshake")

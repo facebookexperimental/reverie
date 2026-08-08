@@ -44,6 +44,8 @@ pub use reverie_preload::SPOOF_PID;
 /// `REVERIE_LITEINST_ALT_STACK` selector and parser for the shared
 /// `reverie-preload` `RuntimeConfig` alt-stack knob.
 pub use runtime::ALT_STACK_ENV;
+pub use runtime::IN_GUEST_STAGE_STREAM_ENV;
+pub use runtime::PROCESS_FORK_ENV;
 /// `REVERIE_LITEINST_TOOL` values and parser for shared built-in selection.
 pub use runtime::TOOL_PASSTHROUGH;
 pub use runtime::TOOL_SPOOF_GETPID;
@@ -183,6 +185,15 @@ pub fn configure_command_builtin(command: &mut Command, tool: BuiltinTool) -> io
 /// round-trips through [`alt_stack_from_env_value`].
 pub fn set_guest_alt_stack(command: &mut Command, use_alt_stack: bool) {
     command.env(ALT_STACK_ENV, if use_alt_stack { "1" } else { "0" });
+}
+
+/// Select whether the direct runtime may forward process-creation syscalls.
+///
+/// This does not add support for thread-style clone. It lets a consumer retain
+/// the existing fail-closed boundary until its Tool lifecycle has a positive
+/// fork bracket.
+pub fn set_guest_process_forks(command: &mut Command, allowed: bool) {
+    command.env(PROCESS_FORK_ENV, if allowed { "1" } else { "0" });
 }
 
 // TODO-HUMAN-REVIEW(#61): this constructor installs process-wide signal and seccomp state.

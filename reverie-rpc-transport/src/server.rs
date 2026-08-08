@@ -20,6 +20,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use reverie::GlobalTool;
@@ -43,6 +44,7 @@ pub struct RpcServer<G: GlobalTool> {
     path: PathBuf,
     readiness: Option<Arc<AtomicBool>>,
     connection_readiness: Option<Arc<AtomicBool>>,
+    connection_count: Arc<AtomicUsize>,
 }
 
 impl<G> RpcServer<G>
@@ -109,6 +111,7 @@ where
             path,
             readiness,
             connection_readiness,
+            connection_count: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -122,6 +125,16 @@ where
     /// use, e.g. to generate the final run summary after serving).
     pub fn global(&self) -> Arc<G> {
         self.global.clone()
+    }
+
+    /// A live count of accepted guest connections.
+    ///
+    /// Fork children inherit the underlying socket descriptor, so the count
+    /// remains nonzero until the last process holding that connection exits or
+    /// reconnects. Coordinators can therefore drain an in-guest process tree
+    /// without attaching an external lifecycle tracer.
+    pub fn connection_count(&self) -> Arc<AtomicUsize> {
+        self.connection_count.clone()
     }
 
     /// Accept connections forever, spawning one task per connection. Returns
@@ -139,7 +152,10 @@ where
             let config = self.config.clone();
             let readiness = self.readiness.clone();
             let connection_readiness = self.connection_readiness.clone();
+            self.connection_count.fetch_add(1, Ordering::AcqRel);
+            let connection_guard = ConnectionGuard(self.connection_count.clone());
             connections.spawn(async move {
+                let _connection_guard = connection_guard;
                 if let Err(e) =
                     serve_connection_inner(global, config, stream, readiness, connection_readiness)
                         .await
@@ -157,6 +173,8 @@ where
     /// is primarily useful for tests and for single-guest scenarios.
     pub async fn serve_one(&self) -> Result<(), RpcError> {
         let (stream, _addr) = self.listener.accept().await?;
+        self.connection_count.fetch_add(1, Ordering::AcqRel);
+        let _connection_guard = ConnectionGuard(self.connection_count.clone());
         serve_connection_inner(
             self.global.clone(),
             self.config.clone(),
@@ -165,6 +183,14 @@ where
             self.connection_readiness.clone(),
         )
         .await
+    }
+}
+
+struct ConnectionGuard(Arc<AtomicUsize>);
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 

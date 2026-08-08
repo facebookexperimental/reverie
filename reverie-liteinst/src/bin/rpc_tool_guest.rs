@@ -9,12 +9,15 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use reverie::CpuIdResult;
 use reverie::Error;
 use reverie::ExitStatus;
 use reverie::GlobalRPC;
 use reverie::GlobalTool;
 use reverie::Guest;
 use reverie::Pid;
+use reverie::Rdtsc;
+use reverie::RdtscResult;
 use reverie::Subscription;
 use reverie::Tid;
 use reverie::Tool;
@@ -25,6 +28,11 @@ use reverie::syscalls::Sysno;
 use reverie_rpc_transport::RpcServer;
 
 const CALLS: u64 = 32;
+const TOOL_CPUID_EAX: u32 = 0x1111_1111;
+const TOOL_CPUID_EBX: u32 = 0x2222_2222;
+const TOOL_CPUID_ECX: u32 = 0;
+const TOOL_CPUID_EDX: u32 = 0x4444_4444;
+const INSTRUCTION_CONTROL_UNAVAILABLE_STATUS: i32 = 77;
 static LAST_TOTAL: AtomicU64 = AtomicU64::new(0);
 static LAST_SENDERS: AtomicU64 = AtomicU64::new(0);
 static LAST_NESTED_UID: AtomicI64 = AtomicI64::new(-1);
@@ -32,6 +40,31 @@ static LAST_MASK_RESULT: AtomicI64 = AtomicI64::new(0);
 static LAST_FIRST_USE_EXEC_RESULT: AtomicI64 = AtomicI64::new(0);
 static LAST_FIRST_USE_SIGNAL_RESULT: AtomicI64 = AtomicI64::new(0);
 static CHILD_RECONSTRUCTED: AtomicBool = AtomicBool::new(false);
+static RCB_BEFORE: AtomicU64 = AtomicU64::new(0);
+static RCB_AFTER: AtomicU64 = AtomicU64::new(0);
+static RCB_AVAILABLE: AtomicBool = AtomicBool::new(false);
+static VDSO_CLOCK_CALLS: AtomicU64 = AtomicU64::new(0);
+static CHILD_NESTED_CPUID_NATIVE: AtomicBool = AtomicBool::new(false);
+static CHILD_NESTED_RDTSC_NATIVE: AtomicBool = AtomicBool::new(false);
+static CHILD_NESTED_RDTSCP_NATIVE: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, Default, Eq, PartialEq)]
+#[repr(C)]
+struct CpuidWords {
+    eax: u32,
+    ebx: u32,
+    ecx: u32,
+    edx: u32,
+}
+
+fn tool_cpuid_words() -> CpuidWords {
+    CpuidWords {
+        eax: TOOL_CPUID_EAX,
+        ebx: TOOL_CPUID_EBX,
+        ecx: TOOL_CPUID_ECX,
+        edx: TOOL_CPUID_EDX,
+    }
+}
 
 #[derive(Default)]
 struct CounterGlobal {
@@ -90,6 +123,157 @@ impl Tool for CounterTool {
         let (total, senders) = guest.send_rpc(1).await;
         LAST_TOTAL.store(total, Ordering::Relaxed);
         LAST_SENDERS.store(senders, Ordering::Relaxed);
+        Ok(guest.inject(syscall).await?)
+    }
+}
+
+#[derive(Default)]
+struct InstructionTool;
+
+#[reverie::tool]
+impl Tool for InstructionTool {
+    type GlobalState = CounterGlobal;
+    type ThreadState = ();
+
+    fn subscriptions(_cfg: &()) -> Subscription {
+        let mut subscriptions = Subscription::none();
+        subscriptions.cpuid().rdtsc();
+        subscriptions
+    }
+
+    async fn handle_cpuid_event<G: Guest<Self>>(
+        &self,
+        _guest: &mut G,
+        _eax: u32,
+        _ecx: u32,
+    ) -> Result<CpuIdResult, reverie::Errno> {
+        Ok(CpuIdResult {
+            eax: TOOL_CPUID_EAX,
+            ebx: TOOL_CPUID_EBX,
+            ecx: TOOL_CPUID_ECX,
+            edx: TOOL_CPUID_EDX,
+        })
+    }
+
+    async fn handle_rdtsc_event<G: Guest<Self>>(
+        &self,
+        _guest: &mut G,
+        request: Rdtsc,
+    ) -> Result<RdtscResult, reverie::Errno> {
+        Ok(RdtscResult {
+            tsc: match request {
+                Rdtsc::Tsc => 0x1234_5678_9abc_def0,
+                Rdtsc::Tscp => 0x0fed_cba9_8765_4321,
+            },
+            aux: (request == Rdtsc::Tscp).then_some(0x2468_ace0),
+        })
+    }
+}
+
+#[derive(Default)]
+struct NestedInstructionForkTool;
+
+#[reverie::tool]
+impl Tool for NestedInstructionForkTool {
+    type GlobalState = CounterGlobal;
+    type ThreadState = ();
+
+    fn subscriptions(_cfg: &()) -> Subscription {
+        let mut subscriptions: Subscription = [Sysno::fork, Sysno::getpid, Sysno::wait4]
+            .into_iter()
+            .collect();
+        subscriptions.cpuid().rdtsc();
+        subscriptions
+    }
+
+    async fn handle_thread_start<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Error> {
+        if guest.ppid().is_some() {
+            let observed = nested_cpuid(0, 0);
+            CHILD_NESTED_CPUID_NATIVE.store(observed != tool_cpuid_words(), Ordering::Release);
+            CHILD_NESTED_RDTSC_NATIVE.store(
+                unsafe { reverie_liteinst_rpc_nested_rdtsc() } != 0x1234_5678_9abc_def0,
+                Ordering::Release,
+            );
+            let (tsc, _) = nested_rdtscp();
+            CHILD_NESTED_RDTSCP_NATIVE.store(tsc != 0x0fed_cba9_8765_4321, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    async fn handle_cpuid_event<G: Guest<Self>>(
+        &self,
+        _guest: &mut G,
+        _eax: u32,
+        _ecx: u32,
+    ) -> Result<CpuIdResult, reverie::Errno> {
+        Ok(CpuIdResult {
+            eax: TOOL_CPUID_EAX,
+            ebx: TOOL_CPUID_EBX,
+            ecx: TOOL_CPUID_ECX,
+            edx: TOOL_CPUID_EDX,
+        })
+    }
+
+    async fn handle_rdtsc_event<G: Guest<Self>>(
+        &self,
+        _guest: &mut G,
+        request: Rdtsc,
+    ) -> Result<RdtscResult, reverie::Errno> {
+        Ok(RdtscResult {
+            tsc: match request {
+                Rdtsc::Tsc => 0x1234_5678_9abc_def0,
+                Rdtsc::Tscp => 0x0fed_cba9_8765_4321,
+            },
+            aux: (request == Rdtsc::Tscp).then_some(0x2468_ace0),
+        })
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        Ok(guest.inject(syscall).await?)
+    }
+}
+
+#[derive(Default)]
+struct ClockAndVdsoTool;
+
+#[reverie::tool]
+impl Tool for ClockAndVdsoTool {
+    type GlobalState = CounterGlobal;
+    type ThreadState = ();
+
+    fn subscriptions(_cfg: &()) -> Subscription {
+        [Sysno::getpid, Sysno::clock_gettime].into_iter().collect()
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        if syscall.number() == Sysno::getpid {
+            match guest.read_clock() {
+                Ok(before) => {
+                    let mut branches = 0_u64;
+                    for index in 0..1024_u64 {
+                        if std::hint::black_box(index & 1) == 0 {
+                            branches = branches.wrapping_add(index);
+                        }
+                    }
+                    std::hint::black_box(branches);
+                    let after = guest.read_clock()?;
+                    RCB_BEFORE.store(before, Ordering::Relaxed);
+                    RCB_AFTER.store(after, Ordering::Relaxed);
+                    RCB_AVAILABLE.store(true, Ordering::Release);
+                }
+                Err(_) => RCB_AVAILABLE.store(false, Ordering::Release),
+            }
+        } else if syscall.number() == Sysno::clock_gettime {
+            VDSO_CLOCK_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(guest.inject(syscall).await?)
     }
 }
@@ -350,6 +534,78 @@ reverie_liteinst_rpc_raw_fork_site:
     nop
     ret
     .size reverie_liteinst_rpc_raw_fork, .-reverie_liteinst_rpc_raw_fork
+
+    # One stable CPUID site is deliberately used both outside and inside a Tool
+    # callback. The former must be Tool-virtualized; the latter must execute
+    # natively rather than recursively acquiring the Tool lock.
+    .p2align 4
+    .global reverie_liteinst_rpc_nested_cpuid
+    .hidden reverie_liteinst_rpc_nested_cpuid
+    .type reverie_liteinst_rpc_nested_cpuid,@function
+reverie_liteinst_rpc_nested_cpuid:
+    push rbx
+    mov r8, rdx
+    mov eax, edi
+    mov ecx, esi
+    cpuid
+    mov dword ptr [r8], eax
+    mov dword ptr [r8 + 4], ebx
+    mov dword ptr [r8 + 8], ecx
+    mov dword ptr [r8 + 12], edx
+    pop rbx
+    ret
+    .size reverie_liteinst_rpc_nested_cpuid, .-reverie_liteinst_rpc_nested_cpuid
+
+    .p2align 4
+    .global reverie_liteinst_rpc_nested_rdtsc
+    .hidden reverie_liteinst_rpc_nested_rdtsc
+    .type reverie_liteinst_rpc_nested_rdtsc,@function
+reverie_liteinst_rpc_nested_rdtsc:
+    rdtsc
+    shl rdx, 32
+    or rax, rdx
+    ret
+    .size reverie_liteinst_rpc_nested_rdtsc, .-reverie_liteinst_rpc_nested_rdtsc
+
+    .p2align 4
+    .global reverie_liteinst_rpc_nested_rdtscp
+    .hidden reverie_liteinst_rpc_nested_rdtscp
+    .type reverie_liteinst_rpc_nested_rdtscp,@function
+reverie_liteinst_rpc_nested_rdtscp:
+    mov r8, rdi
+    rdtscp
+    mov dword ptr [r8], ecx
+    shl rdx, 32
+    or rax, rdx
+    ret
+    .size reverie_liteinst_rpc_nested_rdtscp, .-reverie_liteinst_rpc_nested_rdtscp
+
+    # Force the instruction to begin at byte 61 of a cache line. The eight-byte
+    # LiteInst publication word therefore straddles the boundary and exercises
+    # the quiescent instruction-publication contract without calibration.
+    .p2align 6
+    .global reverie_liteinst_straddling_cpuid
+    .hidden reverie_liteinst_straddling_cpuid
+    .type reverie_liteinst_straddling_cpuid,@function
+reverie_liteinst_straddling_cpuid:
+    push rbx
+    .fill 60, 1, 0x90
+    cpuid
+    pop rbx
+    ret
+    .size reverie_liteinst_straddling_cpuid, .-reverie_liteinst_straddling_cpuid
+
+    .p2align 6
+    .global reverie_liteinst_straddling_rdtsc
+    .hidden reverie_liteinst_straddling_rdtsc
+    .type reverie_liteinst_straddling_rdtsc,@function
+reverie_liteinst_straddling_rdtsc:
+    .fill 61, 1, 0x90
+    rdtsc
+    shl rdx, 32
+    or rax, rdx
+    ret
+    .size reverie_liteinst_straddling_rdtsc, .-reverie_liteinst_straddling_rdtsc
 "#
 );
 
@@ -364,6 +620,11 @@ unsafe extern "C" {
     fn reverie_liteinst_rpc_sigaltstack() -> i64;
     fn reverie_liteinst_rpc_raise_sigsys() -> i64;
     fn reverie_liteinst_rpc_raw_fork() -> i64;
+    fn reverie_liteinst_rpc_nested_cpuid(eax: u32, ecx: u32, result: *mut CpuidWords);
+    fn reverie_liteinst_rpc_nested_rdtsc() -> u64;
+    fn reverie_liteinst_rpc_nested_rdtscp(aux: *mut u32) -> u64;
+    fn reverie_liteinst_straddling_cpuid() -> u64;
+    fn reverie_liteinst_straddling_rdtsc() -> u64;
     fn reverie_liteinst_rpc_sigprocmask(
         how: u64,
         set: *const u64,
@@ -380,6 +641,18 @@ unsafe extern "C" {
     static reverie_liteinst_rpc_getuid_site: u8;
     static reverie_liteinst_rpc_sigprocmask_site: u8;
     static reverie_liteinst_rpc_wait4_site: u8;
+}
+
+fn nested_cpuid(eax: u32, ecx: u32) -> CpuidWords {
+    let mut result = CpuidWords::default();
+    unsafe { reverie_liteinst_rpc_nested_cpuid(eax, ecx, &mut result) };
+    result
+}
+
+fn nested_rdtscp() -> (u64, u32) {
+    let mut aux = 0;
+    let tsc = unsafe { reverie_liteinst_rpc_nested_rdtscp(&mut aux) };
+    (tsc, aux)
 }
 
 fn coordinator(path: &Path) {
@@ -542,6 +815,70 @@ fn spoof_sigsys_guest(path: &Path) -> ! {
     panic!("guest-generated SIGSYS returned");
 }
 
+fn instruction_guest(path: &Path) {
+    // This fixture creates no application threads, matching the direct Hermit
+    // lifecycle contract. Exercise quiescent publication so every cache-line
+    // placement is valid without a machine-specific WordPatch++ calibration.
+    if let Err(error) = unsafe { reverie_liteinst::install_tool_quiescent::<InstructionTool>(path) }
+    {
+        fail_instruction_install(error);
+    }
+    assert_eq!(
+        unsafe { reverie_liteinst_straddling_cpuid() } as u32,
+        0x1111_1111
+    );
+    assert_eq!(
+        unsafe { reverie_liteinst_straddling_rdtsc() },
+        0x1234_5678_9abc_def0
+    );
+    let cpuid = core::arch::x86_64::__cpuid_count(0, 0);
+    let feature_leaf = core::arch::x86_64::__cpuid_count(1, 0);
+    let extended_feature_leaf = core::arch::x86_64::__cpuid_count(7, 0);
+    let tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    let mut aux = 0;
+    let tscp = unsafe { core::arch::x86_64::__rdtscp(&mut aux) };
+    assert_eq!(cpuid.eax, 0x1111_1111);
+    assert_eq!(cpuid.ebx, 0x2222_2222);
+    assert_eq!(cpuid.ecx, 0);
+    assert_eq!(cpuid.edx, 0x4444_4444);
+    assert_eq!(feature_leaf.ecx & (1 << 30), 0, "RDRAND must be masked");
+    assert_eq!(
+        extended_feature_leaf.ebx & (1 << 18),
+        0,
+        "RDSEED must be masked"
+    );
+    assert_eq!(tsc, 0x1234_5678_9abc_def0);
+    assert_eq!(tscp, 0x0fed_cba9_8765_4321);
+    assert_eq!(aux, 0x2468_ace0);
+    println!("cpuid=tool rdtsc=tool rdtscp=tool rdrand=masked rdseed=masked");
+    std::io::stdout().flush().unwrap();
+}
+
+fn clock_and_vdso_guest(path: &Path) {
+    unsafe { reverie_liteinst::install_tool::<ClockAndVdsoTool>(path) }.unwrap();
+    let pid = unsafe { libc::getpid() };
+    assert!(pid > 0);
+
+    let mut time = core::mem::MaybeUninit::<libc::timespec>::uninit();
+    assert_eq!(
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, time.as_mut_ptr()) },
+        0
+    );
+    assert_eq!(VDSO_CLOCK_CALLS.load(Ordering::Relaxed), 1);
+
+    if RCB_AVAILABLE.load(Ordering::Acquire) {
+        let before = RCB_BEFORE.load(Ordering::Relaxed);
+        let after = RCB_AFTER.load(Ordering::Relaxed);
+        assert_eq!(
+            after, before,
+            "branches retired inside the Tool handler must be deducted"
+        );
+        println!("rcb=measured before={before} after={after} vdso-calls=1");
+    } else {
+        println!("rcb=unmeasured vdso-calls=1");
+    }
+}
+
 fn unsubscribed_lifecycle_guest(path: &Path) -> ! {
     unsafe { reverie_liteinst::install_tool::<UnsubscribedLifecycleTool>(path) }.unwrap();
     let flags = libc::CLONE_VM | libc::CLONE_VFORK | libc::SIGCHLD;
@@ -607,6 +944,72 @@ fn fork_guest(path: &Path) {
     );
 }
 
+fn nested_instruction_fork_guest(path: &Path) {
+    if let Err(error) =
+        unsafe { reverie_liteinst::install_tool_quiescent::<NestedInstructionForkTool>(path) }
+    {
+        fail_instruction_install(error);
+    }
+    assert_eq!(nested_cpuid(0, 0), tool_cpuid_words());
+    assert_eq!(
+        unsafe { reverie_liteinst_rpc_nested_rdtsc() },
+        0x1234_5678_9abc_def0
+    );
+    assert_eq!(nested_rdtscp(), (0x0fed_cba9_8765_4321, 0x2468_ace0));
+
+    let child = unsafe { libc::fork() };
+    assert!(
+        child >= 0,
+        "fork failed: {}",
+        std::io::Error::last_os_error()
+    );
+    if child == 0 {
+        assert!(
+            CHILD_NESTED_CPUID_NATIVE.load(Ordering::Acquire),
+            "Tool-internal CPUID must execute natively"
+        );
+        assert!(
+            CHILD_NESTED_RDTSC_NATIVE.load(Ordering::Acquire),
+            "Tool-internal RDTSC must execute natively"
+        );
+        assert!(
+            CHILD_NESTED_RDTSCP_NATIVE.load(Ordering::Acquire),
+            "Tool-internal RDTSCP must execute natively"
+        );
+        assert_eq!(
+            nested_cpuid(0, 0),
+            tool_cpuid_words(),
+            "the same CPUID site must remain Tool-virtualized in guest code"
+        );
+        assert_eq!(
+            unsafe { reverie_liteinst_rpc_nested_rdtsc() },
+            0x1234_5678_9abc_def0,
+            "the same RDTSC site must remain Tool-virtualized in guest code"
+        );
+        assert_eq!(
+            nested_rdtscp(),
+            (0x0fed_cba9_8765_4321, 0x2468_ace0),
+            "the same RDTSCP site must remain Tool-virtualized in guest code"
+        );
+        let observed = unsafe { reverie_liteinst_rpc_getpid() };
+        assert_eq!(observed, i64::from(unsafe { libc::getpid() }));
+        unsafe { libc::_exit(0) };
+    }
+
+    wait_for_child(child);
+    println!(
+        "nested-cpuid=native nested-rdtsc=native nested-rdtscp=native guest-cpuid=tool guest-rdtsc=tool guest-rdtscp=tool child-getpid=complete child-exit=0"
+    );
+}
+
+fn fail_instruction_install(error: std::io::Error) -> ! {
+    if error.kind() == std::io::ErrorKind::Unsupported {
+        eprintln!("instruction-control-unavailable");
+        std::process::exit(INSTRUCTION_CONTROL_UNAVAILABLE_STATUS);
+    }
+    panic!("failed to install instruction Tool: {error}");
+}
+
 /// Same shape as [`fork_guest`], but the fork is a bare `SYS_fork` instruction
 /// that never enters libc, so no `pthread_atfork` child handler can run.
 ///
@@ -640,6 +1043,80 @@ fn raw_fork_guest(path: &Path) {
         "raw-fork-rpc-total={} raw-fork-rpc-sender-delta={sender_delta}",
         LAST_TOTAL.load(Ordering::Relaxed)
     );
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct CloneArgs {
+    flags: u64,
+    pidfd: u64,
+    child_tid: u64,
+    parent_tid: u64,
+    exit_signal: u64,
+    stack: u64,
+    stack_size: u64,
+    tls: u64,
+    set_tid: u64,
+    set_tid_size: u64,
+    cgroup: u64,
+}
+
+fn clone3_guest(path: &Path) {
+    unsafe { reverie_liteinst::install_tool::<CounterTool>(path) }.unwrap();
+    let parent = unsafe { reverie_liteinst_rpc_getpid() };
+    let senders_before_fork = LAST_SENDERS.load(Ordering::Relaxed);
+    let args = CloneArgs {
+        exit_signal: libc::SIGCHLD as u64,
+        ..CloneArgs::default()
+    };
+    let child = unsafe {
+        libc::syscall(
+            libc::SYS_clone3,
+            &args as *const CloneArgs,
+            core::mem::size_of::<CloneArgs>(),
+        )
+    };
+    assert!(
+        child >= 0,
+        "clone3 failed: {}",
+        std::io::Error::last_os_error()
+    );
+    if child == 0 {
+        let observed = unsafe { reverie_liteinst_rpc_getpid() };
+        assert_eq!(observed, i64::from(unsafe { libc::getpid() }));
+        assert_ne!(observed, parent);
+        unsafe { libc::_exit(0) };
+    }
+    wait_for_child(child as libc::pid_t);
+    let observed = unsafe { reverie_liteinst_rpc_getpid() };
+    assert_eq!(observed, parent);
+    let sender_delta = LAST_SENDERS.load(Ordering::Relaxed) - senders_before_fork;
+    assert_eq!(sender_delta, 1);
+    println!("clone3=child-reconstructed sender-delta=1");
+}
+
+fn vfork_guest(path: &Path) {
+    unsafe { reverie_liteinst::install_tool::<CounterTool>(path) }.unwrap();
+    let parent = unsafe { reverie_liteinst_rpc_getpid() };
+    let senders_before_fork = LAST_SENDERS.load(Ordering::Relaxed);
+    let child = unsafe { libc::syscall(libc::SYS_vfork) };
+    assert!(
+        child >= 0,
+        "vfork failed: {}",
+        std::io::Error::last_os_error()
+    );
+    if child == 0 {
+        let observed = unsafe { reverie_liteinst_rpc_getpid() };
+        assert_eq!(observed, i64::from(unsafe { libc::getpid() }));
+        assert_ne!(observed, parent);
+        unsafe { libc::_exit(0) };
+    }
+    wait_for_child(child as libc::pid_t);
+    let observed = unsafe { reverie_liteinst_rpc_getpid() };
+    assert_eq!(observed, parent);
+    let sender_delta = LAST_SENDERS.load(Ordering::Relaxed) - senders_before_fork;
+    assert_eq!(sender_delta, 1);
+    println!("vfork=translated-cow-child sender-delta=1");
 }
 
 fn check_reconstructed_fork(label: &str) {
@@ -680,10 +1157,15 @@ fn main() {
         Some("pending-sigsys") => pending_sigsys_guest(Path::new(&path)),
         Some("preblocked-sigsys") => preblocked_sigsys_guest(Path::new(&path)),
         Some("spoof-sigsys") => spoof_sigsys_guest(Path::new(&path)),
+        Some("instruction-guest") => instruction_guest(Path::new(&path)),
+        Some("clock-and-vdso-guest") => clock_and_vdso_guest(Path::new(&path)),
         Some("unsubscribed-lifecycle") => unsubscribed_lifecycle_guest(Path::new(&path)),
         Some("injected-exit") => injected_exit_guest(Path::new(&path)),
         Some("fork-guest") => fork_guest(Path::new(&path)),
+        Some("nested-instruction-fork") => nested_instruction_fork_guest(Path::new(&path)),
         Some("raw-fork-guest") => raw_fork_guest(Path::new(&path)),
+        Some("clone3-guest") => clone3_guest(Path::new(&path)),
+        Some("vfork-guest") => vfork_guest(Path::new(&path)),
         Some("unsubscribed-fork") => unsubscribed_fork_guest(Path::new(&path)),
         Some("tail-fork") => tail_fork_guest(Path::new(&path)),
         _ => panic!("expected coordinator or guest"),

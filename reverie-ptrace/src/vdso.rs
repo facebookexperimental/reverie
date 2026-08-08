@@ -200,7 +200,7 @@ static VDSO_PATCH_INFO: LazyLock<VdsoPatchInfo> = LazyLock::new(|| {
     res
 });
 
-pub(crate) fn is_patch_required(subscriptions: &Subscription) -> bool {
+pub fn is_patch_required(subscriptions: &Subscription) -> bool {
     subscriptions.iter_syscalls().any(|syscall| {
         matches!(
             syscall,
@@ -212,6 +212,88 @@ pub(crate) fn is_patch_required(subscriptions: &Subscription) -> bool {
                 | Sysno::rt_sigreturn
         )
     })
+}
+
+/// One vDSO entry point rewritten for an in-guest syscall hook.
+#[derive(Clone, Copy, Debug)]
+pub struct VdsoSyscallSite {
+    /// Address at which the in-guest backend should install its hook.
+    pub address: u64,
+    /// Linux syscall number implemented by this entry point.
+    pub number: i64,
+    /// Start of the special vDSO mapping containing this entry point.
+    pub mapping_start: u64,
+    /// Length of the special vDSO mapping containing this entry point.
+    pub mapping_len: u64,
+}
+
+/// Rewrite the calling process's vDSO entry points into hookable syscalls.
+///
+/// Returns each rewritten symbol's entry address and syscall number so an
+/// in-guest patching backend can install its ordinary syscall trampoline while
+/// the process is still single-threaded. The two-byte syscall is deliberately
+/// placed at the aligned symbol entry: LiteInst needs a full patch word after
+/// the hook address, which is not guaranteed at the tail of an eight-byte
+/// pseudo-vDSO function. This shares the authoritative symbol table with
+/// ptrace's stopped-guest path instead of maintaining a backend-specific list.
+#[cfg(target_arch = "x86_64")]
+pub fn patch_current_vdso(subscriptions: &Subscription) -> Result<Vec<VdsoSyscallSite>, Error> {
+    if !is_patch_required(subscriptions) {
+        return Ok(Vec::new());
+    }
+    let process =
+        procfs::process::Process::new(unistd::getpid().as_raw()).map_err(|_| Errno::ENOENT)?;
+    let maps = process.maps().map_err(|_| Errno::EIO)?;
+    let Some(vdso) = maps
+        .iter()
+        .find(|entry| entry.pathname == procfs::process::MMapPath::Vdso)
+    else {
+        return Err(Errno::ENOENT.into());
+    };
+    let start = vdso.address.0 as usize;
+    let len = (vdso.address.1 - vdso.address.0) as usize;
+    Errno::result(unsafe {
+        libc::mprotect(
+            start as *mut libc::c_void,
+            len,
+            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+        )
+    })?;
+
+    let mut syscall_sites = Vec::new();
+    for (name, (offset, size, _bytes)) in VDSO_PATCH_INFO.iter() {
+        let symbol = start + *offset as usize;
+        let number = match *name {
+            "__vdso_time" => libc::SYS_time,
+            "__vdso_clock_gettime" => libc::SYS_clock_gettime,
+            "__vdso_getcpu" => libc::SYS_getcpu,
+            "__vdso_gettimeofday" => libc::SYS_gettimeofday,
+            "__vdso_clock_getres" => libc::SYS_clock_getres,
+            _ => continue,
+        };
+        assert!(*size >= 3);
+        unsafe {
+            core::ptr::write(symbol as *mut u8, 0x0f);
+            core::ptr::write((symbol + 1) as *mut u8, 0x05);
+            core::ptr::write((symbol + 2) as *mut u8, 0xc3);
+            core::ptr::write_bytes((symbol + 3) as *mut u8, 0x90, size - 3);
+        }
+        syscall_sites.push(VdsoSyscallSite {
+            address: symbol as u64,
+            number,
+            mapping_start: start as u64,
+            mapping_len: len as u64,
+        });
+    }
+
+    Errno::result(unsafe {
+        libc::mprotect(
+            start as *mut libc::c_void,
+            len,
+            libc::PROT_READ | libc::PROT_EXEC,
+        )
+    })?;
+    Ok(syscall_sites)
 }
 
 // get vdso symbols offset/size from current process

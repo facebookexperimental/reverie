@@ -87,6 +87,7 @@ pub enum SoftwareEvent {
 pub struct PerfCounter {
     fd: libc::c_int,
     mmap: Option<NonNull<perf::perf_event_mmap_page>>,
+    raw_syscall: Option<unsafe fn(i64, [u64; 6]) -> i64>,
 }
 
 impl Event {
@@ -198,6 +199,20 @@ impl Builder {
     /// disabled state. Additional initialization steps should be performed,
     /// followed by a call to [`PerfCounter::enable`].
     pub fn create(&self) -> Result<PerfCounter, Errno> {
+        self.create_with_optional_raw_syscall(None)
+    }
+
+    pub(crate) fn create_with_raw_syscall(
+        &self,
+        raw_syscall: unsafe fn(i64, [u64; 6]) -> i64,
+    ) -> Result<PerfCounter, Errno> {
+        self.create_with_optional_raw_syscall(Some(raw_syscall))
+    }
+
+    fn create_with_optional_raw_syscall(
+        &self,
+        raw_syscall: Option<unsafe fn(i64, [u64; 6]) -> i64>,
+    ) -> Result<PerfCounter, Errno> {
         let mut attr = perf::perf_event_attr::default();
         attr.size = core::mem::size_of_val(&attr) as u32;
         attr.type_ = self.evt.attr_type();
@@ -216,32 +231,65 @@ impl Builder {
         let group_fd: libc::c_int = -1; // always create a new group
         let flags = perf::PERF_FLAG_FD_CLOEXEC; // marginally more safe if we fork+exec
 
-        let fd = Errno::result(unsafe {
-            libc::syscall(libc::SYS_perf_event_open, &attr, pid, cpu, group_fd, flags)
-        })?;
+        let fd = if let Some(raw_syscall) = raw_syscall {
+            Errno::from_ret(unsafe {
+                raw_syscall(
+                    libc::SYS_perf_event_open,
+                    [
+                        (&raw const attr) as u64,
+                        pid as i64 as u64,
+                        cpu as i64 as u64,
+                        group_fd as i64 as u64,
+                        flags.into(),
+                        0,
+                    ],
+                ) as usize
+            })?
+        } else {
+            Errno::result(unsafe {
+                libc::syscall(libc::SYS_perf_event_open, &attr, pid, cpu, group_fd, flags)
+            })? as usize
+        };
         let fd = fd as libc::c_int;
 
         let mmap = if self.fast_reads {
-            let res = Errno::result(unsafe {
-                libc::mmap(
-                    core::ptr::null_mut(),
-                    get_mmap_size(),
-                    libc::PROT_READ, // leaving PROT_WRITE unset lets us passively read
-                    libc::MAP_SHARED,
-                    fd,
-                    0,
-                )
-            });
+            let res = if let Some(raw_syscall) = raw_syscall {
+                Errno::from_ret(unsafe {
+                    raw_syscall(
+                        libc::SYS_mmap,
+                        [
+                            0,
+                            get_mmap_size() as u64,
+                            libc::PROT_READ as u64,
+                            libc::MAP_SHARED as u64,
+                            fd as u64,
+                            0,
+                        ],
+                    ) as usize
+                })
+                .map(|address| address as *mut libc::c_void)
+            } else {
+                Errno::result(unsafe {
+                    libc::mmap(
+                        core::ptr::null_mut(),
+                        get_mmap_size(),
+                        libc::PROT_READ, // leaving PROT_WRITE unset lets us passively read
+                        libc::MAP_SHARED,
+                        fd,
+                        0,
+                    )
+                })
+            };
             match res {
                 Ok(ptr) => match NonNull::new(ptr as *mut _) {
                     Some(ptr) => Some(ptr),
                     None => {
-                        close_perf_fd(fd);
+                        close_perf_fd(fd, raw_syscall);
                         return Err(Errno::ENOMEM);
                     }
                 },
                 Err(e) => {
-                    close_perf_fd(fd);
+                    close_perf_fd(fd, raw_syscall);
                     return Err(e);
                 }
             }
@@ -249,7 +297,11 @@ impl Builder {
             None
         };
 
-        Ok(PerfCounter { fd, mmap })
+        Ok(PerfCounter {
+            fd,
+            mmap,
+            raw_syscall,
+        })
     }
 
     pub(crate) fn check_for_pmu_bugs(&mut self) -> &mut Self {
@@ -272,7 +324,17 @@ impl PerfCounter {
     /// Call the `PERF_EVENT_IOC_ENABLE` ioctl. Enables increments of the
     /// counter and event generation.
     pub fn enable(&self) -> Result<(), Errno> {
-        Errno::result(unsafe { ioctls::ENABLE(self.fd, 0) }).and(Ok(()))
+        if let Some(raw_syscall) = self.raw_syscall {
+            Errno::from_ret(unsafe {
+                raw_syscall(
+                    libc::SYS_ioctl,
+                    [self.fd as u64, perf::ENABLE as u64, 0, 0, 0, 0],
+                ) as usize
+            })
+            .and(Ok(()))
+        } else {
+            Errno::result(unsafe { ioctls::ENABLE(self.fd, 0) }).and(Ok(()))
+        }
     }
 
     /// Call the `PERF_EVENT_IOC_ENABLE` ioctl. Disables increments of the
@@ -291,7 +353,17 @@ impl PerfCounter {
     /// Call the `PERF_EVENT_IOC_RESET` ioctl. Resets the counter value to 0,
     /// which results in delayed overflow events.
     pub fn reset(&self) -> Result<(), Errno> {
-        Errno::result(unsafe { ioctls::RESET(self.fd, 0) }).and(Ok(()))
+        if let Some(raw_syscall) = self.raw_syscall {
+            Errno::from_ret(unsafe {
+                raw_syscall(
+                    libc::SYS_ioctl,
+                    [self.fd as u64, perf::RESET as u64, 0, 0, 0, 0],
+                ) as usize
+            })
+            .and(Ok(()))
+        } else {
+            Errno::result(unsafe { ioctls::RESET(self.fd, 0) }).and(Ok(()))
+        }
     }
 
     /// Call the `PERF_EVENT_IOC_PERIOD` ioctl. This causes the counter to
@@ -339,8 +411,27 @@ impl PerfCounter {
         let mut value = 0u64;
         let expected_bytes = std::mem::size_of_val(&value);
         loop {
-            let res =
-                unsafe { libc::read(self.fd, &mut value as *mut u64 as *mut _, expected_bytes) };
+            let res = if let Some(raw_syscall) = self.raw_syscall {
+                match Errno::from_ret(unsafe {
+                    raw_syscall(
+                        libc::SYS_read,
+                        [
+                            self.fd as u64,
+                            (&raw mut value) as u64,
+                            expected_bytes as u64,
+                            0,
+                            0,
+                            0,
+                        ],
+                    ) as usize
+                }) {
+                    Ok(value) => value as isize,
+                    Err(Errno::EINTR) => continue,
+                    Err(error) => return Err(error),
+                }
+            } else {
+                unsafe { libc::read(self.fd, (&raw mut value).cast(), expected_bytes) }
+            };
             if res == -1 {
                 let errno = Errno::last();
                 if errno != Errno::EINTR {
@@ -623,20 +714,40 @@ unsafe fn rdpmc(counter: u32) -> u64 {
     ((hi as u64) << 32) | (lo as u64)
 }
 
-fn close_perf_fd(fd: libc::c_int) {
-    Errno::result(unsafe { libc::close(fd) }).expect("Could not close perf fd");
+fn close_perf_fd(fd: libc::c_int, raw_syscall: Option<unsafe fn(i64, [u64; 6]) -> i64>) {
+    if let Some(raw_syscall) = raw_syscall {
+        Errno::from_ret(unsafe {
+            raw_syscall(libc::SYS_close, [fd as u64, 0, 0, 0, 0, 0]) as usize
+        })
+        .expect("Could not close perf fd");
+    } else {
+        Errno::result(unsafe { libc::close(fd) }).expect("Could not close perf fd");
+    }
 }
-fn close_mmap(ptr: *mut perf::perf_event_mmap_page) {
-    Errno::result(unsafe { libc::munmap(ptr as *mut _, get_mmap_size()) })
+fn close_mmap(
+    ptr: *mut perf::perf_event_mmap_page,
+    raw_syscall: Option<unsafe fn(i64, [u64; 6]) -> i64>,
+) {
+    if let Some(raw_syscall) = raw_syscall {
+        Errno::from_ret(unsafe {
+            raw_syscall(
+                libc::SYS_munmap,
+                [ptr as u64, get_mmap_size() as u64, 0, 0, 0, 0],
+            ) as usize
+        })
         .expect("Could not munmap ring buffer");
+    } else {
+        Errno::result(unsafe { libc::munmap(ptr as *mut _, get_mmap_size()) })
+            .expect("Could not munmap ring buffer");
+    }
 }
 
 impl Drop for PerfCounter {
     fn drop(&mut self) {
         if let Some(ptr) = self.mmap {
-            close_mmap(ptr.as_ptr());
+            close_mmap(ptr.as_ptr(), self.raw_syscall);
         }
-        close_perf_fd(self.fd);
+        close_perf_fd(self.fd, self.raw_syscall);
     }
 }
 

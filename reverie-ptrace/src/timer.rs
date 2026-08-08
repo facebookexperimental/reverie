@@ -110,6 +110,24 @@ pub struct PmuConfig {
 }
 
 impl PmuConfig {
+    /// Attempts to configure the PMU without assuming that this CPU has a
+    /// measured deterministic-timer profile.
+    ///
+    /// In-guest clocks can treat an unknown CPU as an unavailable optional
+    /// capability. Precise ptrace timers retain [`Self::new`]'s fail-fast
+    /// contract because they also require a measured skid margin.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn try_new() -> Option<Self> {
+        let features = raw_cpuid::CpuId::new().get_feature_info()?;
+        Self::try_from_family_model(features.family_id(), features.model_id())
+            .map(Self::with_env_overrides)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn try_new() -> Option<Self> {
+        Some(Self::new())
+    }
+
     /// Creates / initializes the PMU config.
     #[cfg(target_arch = "x86_64")]
     pub fn new() -> Self {
@@ -147,6 +165,17 @@ impl PmuConfig {
 
     #[cfg(target_arch = "x86_64")]
     fn from_family_model(family_id: u8, model_id: u8) -> Self {
+        Self::try_from_family_model(family_id, model_id).unwrap_or_else(|| match family_id {
+            0x06 => panic!("Unsupported Intel processor model: {:#x}", model_id),
+            family => panic!(
+                "Unsupported processor family, model: ({:#x},{:#x})",
+                family, model_id
+            ),
+        })
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn try_from_family_model(family_id: u8, model_id: u8) -> Option<Self> {
         // based on rr's PerfCounters_x86.h and PerfCounters.cc
         let (rcb_event, skid_margin) = match family_id {
             // Intel
@@ -164,7 +193,7 @@ impl PmuConfig {
                 0x9A => (0x5101c4, 125),                      // Intel Alder Lake
                 0x8F => (0x5101c4, 125),                      // Intel Sapphire Rapids
                 0x86 => (0x5101c4, 100),                      // Intel Icelake
-                model => panic!("Unsupported Intel processor model: {:#x}", model),
+                _ => return None,
             },
             // Turin EPYC family 1Ah model 11h has p99 skid of 384 RCBs. A 1K
             // performance margin accepts rare larger overshoots because the
@@ -172,17 +201,14 @@ impl PmuConfig {
             0x1A if model_id == 0x11 => (AMD_RCB_EVENT, AMD_EPYC_9D85_SKID_MARGIN),
             // Other Zen CPUs keep rr's 10K guard because they have exhibited rare large skid.
             0x17 | 0x19 | 0x1A => (AMD_RCB_EVENT, AMD_DEFAULT_SKID_MARGIN),
-            family => panic!(
-                "Unsupported processor family, model: ({:#x},{:#x})",
-                family, model_id
-            ),
+            _ => return None,
         };
 
-        Self {
+        Some(Self {
             rcb_event,
             skid_margin,
             skid_margin_override: None,
-        }
+        })
     }
 
     /// Overrides the processor-specific skid margin while preserving the detected PMU event.
@@ -1076,6 +1102,13 @@ mod tests {
         let config = PmuConfig::from_family_model(0x1A, 0x11);
         assert_eq!(config.raw_rcb_event(), 0x5100d1);
         assert_eq!(config.skid_margin(), 1_000);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn unknown_cpu_is_unavailable_to_fallible_in_guest_clock() {
+        assert_eq!(PmuConfig::try_from_family_model(0x06, 0xCF), None);
+        assert_eq!(PmuConfig::try_from_family_model(0xFF, 0x01), None);
     }
 
     #[cfg(target_arch = "x86_64")]
