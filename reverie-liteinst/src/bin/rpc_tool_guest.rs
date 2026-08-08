@@ -647,7 +647,8 @@ reverie_liteinst_rpc_nested_rdtscp:
 
     # Force the instruction to begin at byte 61 of a cache line. The eight-byte
     # LiteInst publication word therefore straddles the boundary and exercises
-    # the quiescent instruction-publication contract without calibration.
+    # both guarded Concurrent publication and calibration-free Quiescent
+    # publication in their respective fixture processes.
     .p2align 6
     .global reverie_liteinst_straddling_cpuid
     .hidden reverie_liteinst_straddling_cpuid
@@ -883,13 +884,27 @@ fn spoof_sigsys_guest(path: &Path) -> ! {
     panic!("guest-generated SIGSYS returned");
 }
 
-fn instruction_guest(path: &Path) {
-    // This fixture creates no application threads, matching the direct Hermit
-    // lifecycle contract. Exercise quiescent publication so every cache-line
-    // placement is valid without a machine-specific WordPatch++ calibration.
+#[derive(Clone, Copy)]
+enum InstructionPublication {
+    Concurrent,
+    Quiescent,
+}
+
+fn instruction_guest(path: &Path, publication: InstructionPublication) {
     INSTRUCTION_EXPECTED_UID.store(i64::from(unsafe { libc::getuid() }), Ordering::Relaxed);
-    if let Err(error) = unsafe { reverie_liteinst::install_tool_quiescent::<InstructionTool>(path) }
-    {
+    let install = match publication {
+        // Exercise the public production default, including guarded
+        // instruction-site publication.
+        InstructionPublication::Concurrent => unsafe {
+            reverie_liteinst::install_tool::<InstructionTool>(path)
+        },
+        // Retain the stopped-tracee/Hermit single-thread contract as a
+        // separate bracket that does not require WordPatch++ calibration.
+        InstructionPublication::Quiescent => unsafe {
+            reverie_liteinst::install_tool_quiescent::<InstructionTool>(path)
+        },
+    };
+    if let Err(error) = install {
         fail_instruction_install(error);
     }
     assert_eq!(nested_cpuid(0, 0), tool_cpuid_words());
@@ -1297,7 +1312,12 @@ fn main() {
         Some("pending-sigsys") => pending_sigsys_guest(Path::new(&path)),
         Some("preblocked-sigsys") => preblocked_sigsys_guest(Path::new(&path)),
         Some("spoof-sigsys") => spoof_sigsys_guest(Path::new(&path)),
-        Some("instruction-guest") => instruction_guest(Path::new(&path)),
+        Some("instruction-guest") => {
+            instruction_guest(Path::new(&path), InstructionPublication::Concurrent)
+        }
+        Some("instruction-guest-quiescent") => {
+            instruction_guest(Path::new(&path), InstructionPublication::Quiescent)
+        }
         Some("clock-and-vdso-guest") => clock_and_vdso_guest(Path::new(&path)),
         Some("unsubscribed-lifecycle") => unsubscribed_lifecycle_guest(Path::new(&path)),
         Some("injected-exit") => injected_exit_guest(Path::new(&path)),

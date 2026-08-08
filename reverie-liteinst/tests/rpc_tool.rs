@@ -5,7 +5,10 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
+use reverie_liteinst::STRADDLER_STALENESS_TICKS_ENV;
+
 const INSTRUCTION_CONTROL_UNAVAILABLE_STATUS: i32 = 77;
+const TEST_STRADDLER_STALENESS_TICKS: &str = "20000";
 
 fn output_with_timeout(mut command: Command, timeout: Duration) -> Output {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -82,32 +85,63 @@ fn installed_hook_reentry_bypasses_tool_with_shared_coordinator_rpc() {
         "{spoofed_sigsys:?}"
     );
 
-    let mut instruction_command = Command::new(binary);
-    instruction_command.arg("instruction-guest").arg(&socket);
-    let instruction_guest = output_with_timeout(instruction_command, Duration::from_secs(10));
-    let instruction_control_available = if instruction_guest.status.code()
-        == Some(INSTRUCTION_CONTROL_UNAVAILABLE_STATUS)
-    {
-        assert!(instruction_guest.stdout.is_empty(), "{instruction_guest:?}");
-        assert_eq!(
-            instruction_guest.stderr, b"instruction-control-unavailable\n",
-            "the refusal path must emit exactly one diagnostic"
-        );
-        eprintln!("instruction capability evidence: positive=0 refusal=1");
-        false
-    } else {
-        assert!(instruction_guest.status.success(), "{instruction_guest:?}");
-        assert_eq!(
-            instruction_guest.stdout,
-            b"cpuid=tool rdtsc=tool rdtscp=tool rdrand=masked rdseed=masked instruction-handler-rpc=1 patched-native=1 first-use-native=1 nested-syscall-native=1 tool-callbacks=9\n"
-        );
-        assert!(
-            instruction_guest.stderr.is_empty(),
-            "the successful instruction path emitted a refusal diagnostic: {instruction_guest:?}"
-        );
-        eprintln!("instruction capability evidence: positive=1 refusal=0");
-        true
-    };
+    let mut instruction_positives = 0;
+    let mut instruction_refusals = 0;
+    for (mode, concurrent) in [
+        ("instruction-guest", true),
+        ("instruction-guest-quiescent", false),
+    ] {
+        let mut instruction_command = Command::new(binary);
+        instruction_command.arg(mode).arg(&socket);
+        if concurrent {
+            instruction_command.env(
+                STRADDLER_STALENESS_TICKS_ENV,
+                TEST_STRADDLER_STALENESS_TICKS,
+            );
+        } else {
+            instruction_command.env_remove(STRADDLER_STALENESS_TICKS_ENV);
+        }
+        let instruction_guest = output_with_timeout(instruction_command, Duration::from_secs(10));
+        if instruction_guest.status.code() == Some(INSTRUCTION_CONTROL_UNAVAILABLE_STATUS) {
+            assert!(
+                instruction_guest.stdout.is_empty(),
+                "{mode}: {instruction_guest:?}"
+            );
+            assert_eq!(
+                instruction_guest.stderr, b"instruction-control-unavailable\n",
+                "{mode}: the refusal path must emit exactly one diagnostic"
+            );
+            instruction_refusals += 1;
+            eprintln!("instruction publication evidence: mode={mode} positive=0 refusal=1");
+        } else {
+            assert!(
+                instruction_guest.status.success(),
+                "{mode}: {instruction_guest:?}"
+            );
+            assert_eq!(
+                instruction_guest.stdout,
+                b"cpuid=tool rdtsc=tool rdtscp=tool rdrand=masked rdseed=masked instruction-handler-rpc=1 patched-native=1 first-use-native=1 nested-syscall-native=1 tool-callbacks=9\n",
+                "{mode}"
+            );
+            assert!(
+                instruction_guest.stderr.is_empty(),
+                "{mode}: the successful instruction path emitted a refusal diagnostic: {instruction_guest:?}"
+            );
+            instruction_positives += 1;
+            eprintln!("instruction publication evidence: mode={mode} positive=1 refusal=0");
+        }
+    }
+    assert!(
+        matches!(
+            (instruction_positives, instruction_refusals),
+            (2, 0) | (0, 2)
+        ),
+        "Concurrent and Quiescent instruction controls must agree: positive={instruction_positives} refusal={instruction_refusals}"
+    );
+    eprintln!(
+        "instruction publication total: positive={instruction_positives} refusal={instruction_refusals}"
+    );
+    let instruction_control_available = instruction_positives == 2;
 
     if instruction_control_available {
         let nested_instruction_fork = Command::new(binary)
