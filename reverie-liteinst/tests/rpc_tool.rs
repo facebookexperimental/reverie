@@ -99,7 +99,7 @@ fn installed_hook_reentry_bypasses_tool_with_shared_coordinator_rpc() {
         assert!(instruction_guest.status.success(), "{instruction_guest:?}");
         assert_eq!(
             instruction_guest.stdout,
-            b"cpuid=tool rdtsc=tool rdtscp=tool rdrand=masked rdseed=masked instruction-handler-rpc=1 patched-native=1 first-use-native=1 nested-syscall-native=1 cpuid-callbacks=6\n"
+            b"cpuid=tool rdtsc=tool rdtscp=tool rdrand=masked rdseed=masked instruction-handler-rpc=1 patched-native=1 first-use-native=1 nested-syscall-native=1 tool-callbacks=9\n"
         );
         assert!(
             instruction_guest.stderr.is_empty(),
