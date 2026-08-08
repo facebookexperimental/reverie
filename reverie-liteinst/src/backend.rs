@@ -18,8 +18,8 @@ use std::path::PathBuf;
 use std::process::Output;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use reverie::Backend;
 use reverie::BackendStatsRequest;
@@ -31,6 +31,7 @@ use reverie::process::Command;
 use reverie::process::Output as ReverieOutput;
 use reverie::process::Stdio as ReverieStdio;
 use reverie_ptrace::TracerBuilder;
+use reverie_rpc_transport::ConnectionMonitor;
 use reverie_rpc_transport::RpcServer;
 
 /// Environment variable naming the tool-specific preload DSO for a backend run.
@@ -45,6 +46,7 @@ pub const STATS_COORDINATOR_ENV: &str = "REVERIE_LITEINST_STATS_COORDINATOR";
 const PRELOAD_BOOTSTRAP_MAGIC: &[u8; 16] = b"REVERIE-LI-V1\0\0\0";
 const PRELOAD_BOOTSTRAP_HEADER_BYTES: usize = PRELOAD_BOOTSTRAP_MAGIC.len() + 4;
 const PRELOAD_BOOTSTRAP_MAX_BYTES: usize = 4096;
+const RPC_CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 // TODO-HUMAN-REVIEW(PR-139): Review the public inherited preload bootstrap contract.
 /// Coordinator path and tool-specific bytes consumed by a preload constructor.
@@ -603,8 +605,29 @@ enum ChildWait {
 async fn serve_rpc_until<G, F, T>(
     server: RpcServer<G>,
     stats_server: Option<RpcServer<crate::stats::LiteinstStatsGlobal>>,
-    connection_counts: Vec<Arc<AtomicUsize>>,
+    connection_monitors: Vec<ConnectionMonitor>,
     completion: F,
+) -> io::Result<T>
+where
+    G: GlobalTool + 'static,
+    F: Future<Output = io::Result<T>>,
+{
+    serve_rpc_until_with_timeout(
+        server,
+        stats_server,
+        connection_monitors,
+        completion,
+        RPC_CONNECTION_DRAIN_TIMEOUT,
+    )
+    .await
+}
+
+async fn serve_rpc_until_with_timeout<G, F, T>(
+    server: RpcServer<G>,
+    stats_server: Option<RpcServer<crate::stats::LiteinstStatsGlobal>>,
+    connection_monitors: Vec<ConnectionMonitor>,
+    completion: F,
+    drain_timeout: Duration,
 ) -> io::Result<T>
 where
     G: GlobalTool + 'static,
@@ -620,7 +643,7 @@ where
     }
     tokio::pin!(completion);
 
-    let result = tokio::select! {
+    let mut result = tokio::select! {
         biased;
         result = &mut completion => result,
         result = serving.join_next() => {
@@ -637,20 +660,40 @@ where
     // A fork child inherits the parent's connected socket. If it later needs
     // its own identity, the client opens the replacement before dropping the
     // inherited descriptor. Consequently this count cannot transiently reach
-    // zero while a supported descendant still owns coordinator state.
-    while connection_counts
-        .iter()
-        .any(|count| count.load(Ordering::Acquire) != 0)
-    {
-        if let Some(server_result) = serving.try_join_next() {
-            let message = match server_result {
-                Ok(Ok(())) => "LiteInst coordinator stopped unexpectedly".to_owned(),
-                Ok(Err(error)) => error.to_string(),
-                Err(error) => error.to_string(),
+    // zero while a supported descendant still owns coordinator state. Block
+    // on last-close notifications instead of keeping this task runnable, but
+    // fail closed after a finite interval if a descriptor is leaked.
+    let drain = async {
+        for monitor in &connection_monitors {
+            monitor.wait_for_idle().await;
+        }
+    };
+    tokio::pin!(drain);
+    let drain_result = tokio::select! {
+        biased;
+        result = serving.join_next() => {
+            let message = match result {
+                Some(Ok(Ok(()))) => "LiteInst coordinator stopped unexpectedly".to_owned(),
+                Some(Ok(Err(error))) => error.to_string(),
+                Some(Err(error)) => error.to_string(),
+                None => "LiteInst coordinator task disappeared".to_owned(),
             };
             return Err(io::Error::other(message));
         }
-        tokio::task::yield_now().await;
+        result = tokio::time::timeout(drain_timeout, &mut drain) => result,
+    };
+    if drain_result.is_err() {
+        let active_connections = connection_monitors
+            .iter()
+            .map(ConnectionMonitor::active_connections)
+            .sum::<usize>();
+        result = Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "LiteInst coordinator retained {active_connections} active RPC connection(s) for {}ms after guest exit",
+                drain_timeout.as_millis()
+            ),
+        ));
     }
 
     serving.abort_all();
@@ -729,13 +772,13 @@ where
         connected.clone(),
     )
     .map_err(|error| io::Error::other(error.to_string()))?;
-    let mut connection_counts = vec![server.connection_count()];
+    let mut connection_monitors = vec![server.connection_monitor()];
     let (stats_global, stats_server, stats_socket) = if stats_request.is_enabled() {
         let socket = directory.path().join("stats.sock");
         let global = Arc::new(crate::stats::LiteinstStatsGlobal::default());
         let server = RpcServer::bind(&socket, global.clone(), ())
             .map_err(|error| io::Error::other(error.to_string()))?;
-        connection_counts.push(server.connection_count());
+        connection_monitors.push(server.connection_monitor());
         (Some(global), Some(server), Some(socket))
     } else {
         (None, None, None)
@@ -770,7 +813,7 @@ where
                     child.wait().map(ChildWait::Status)
                 }
             });
-            serve_rpc_until(server, stats_server, connection_counts, async move {
+            serve_rpc_until(server, stats_server, connection_monitors, async move {
                 wait.await
                     .map_err(|error| io::Error::other(error.to_string()))?
             })
@@ -791,7 +834,7 @@ where
                     child.wait().map(ChildWait::Status)
                 }
             });
-            serve_rpc_until(server, stats_server, connection_counts, async move {
+            serve_rpc_until(server, stats_server, connection_monitors, async move {
                 wait.await
                     .map_err(|error| io::Error::other(error.to_string()))?
             })
@@ -875,7 +918,7 @@ mod tests {
         let socket = directory.path().join("coordinator.sock");
         let global = Arc::new(MultiClientGlobal::default());
         let server = RpcServer::bind(&socket, global.clone(), 41).unwrap();
-        let connection_counts = vec![server.connection_count()];
+        let connection_monitors = vec![server.connection_monitor()];
 
         let clients = tokio::task::spawn_blocking(move || -> io::Result<()> {
             let mut first = CoordinatorClient::connect(&socket)?;
@@ -897,7 +940,7 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(5),
-            serve_rpc_until(server, None, connection_counts, completion),
+            serve_rpc_until(server, None, connection_monitors, completion),
         )
         .await
         .expect("the second local RPC connection blocked at its config handshake")
@@ -905,6 +948,54 @@ mod tests {
 
         assert_eq!(global.total.load(Ordering::Relaxed), 5);
         assert_eq!(*global.senders.lock().unwrap(), [101, 202]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn coordinator_connection_drain_is_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("coordinator.sock");
+        let global = Arc::new(MultiClientGlobal::default());
+        let server = RpcServer::bind(&socket, global, 41).unwrap();
+        let connection_monitors = vec![server.connection_monitor()];
+        let (connected_tx, connected_rx) = tokio::sync::oneshot::channel();
+
+        let client = tokio::spawn(async move {
+            let _client = reverie_rpc_transport::RpcClient::<MultiClientGlobal>::connect(
+                &socket,
+                Tid::from_raw(303),
+            )
+            .await
+            .unwrap();
+            connected_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let completion = async move {
+            connected_rx
+                .await
+                .map_err(|error| io::Error::other(error.to_string()))
+        };
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            serve_rpc_until_with_timeout(
+                server,
+                None,
+                connection_monitors,
+                completion,
+                Duration::from_millis(25),
+            ),
+        )
+        .await
+        .expect("a held connection left the coordinator drain unbounded")
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            error.to_string(),
+            "LiteInst coordinator retained 1 active RPC connection(s) for 25ms after guest exit"
+        );
+
+        client.abort();
+        let _ = client.await;
     }
 
     #[test]

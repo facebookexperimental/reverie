@@ -75,5 +75,6 @@ pub use blocking_client::BlockingRpcClient;
 pub use client::RpcClient;
 pub use envelope::RequestEnvelope;
 pub use error::RpcError;
+pub use server::ConnectionMonitor;
 pub use server::RpcServer;
 pub use server::serve_connection;

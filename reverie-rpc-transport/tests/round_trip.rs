@@ -149,6 +149,50 @@ async fn aggregates_across_many_connections() {
 }
 
 #[tokio::test]
+async fn connection_monitor_wakes_only_after_the_last_client_closes() {
+    let global = std::sync::Arc::new(Counter::default());
+    let path = unique_sock_path("connection-monitor");
+    let server = RpcServer::bind(&path, global, "monitor".to_string()).unwrap();
+    let monitor = server.connection_monitor();
+    let server_path = server.path().to_path_buf();
+    let serving = tokio::spawn(async move { server.serve().await });
+
+    let first = RpcClient::<Counter>::connect(&server_path, Tid::from_raw(1))
+        .await
+        .unwrap();
+    let second = RpcClient::<Counter>::connect(&server_path, Tid::from_raw(2))
+        .await
+        .unwrap();
+    assert_eq!(monitor.active_connections(), 2);
+
+    let mut idle = tokio::spawn({
+        let monitor = monitor.clone();
+        async move { monitor.wait_for_idle().await }
+    });
+    tokio::task::yield_now().await;
+    assert!(!idle.is_finished(), "an active connection reported idle");
+
+    drop(first);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut idle)
+            .await
+            .is_err(),
+        "the first close woke the idle waiter while a client remained"
+    );
+
+    drop(second);
+    tokio::time::timeout(Duration::from_secs(1), idle)
+        .await
+        .expect("the last close did not promptly wake the idle waiter")
+        .unwrap();
+    assert_eq!(monitor.active_connections(), 0);
+
+    serving.abort();
+    let _ = serving.await;
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
 async fn aborting_server_drops_live_connection_tasks() {
     let global = std::sync::Arc::new(Counter::default());
     let path = unique_sock_path("abort-connections");
