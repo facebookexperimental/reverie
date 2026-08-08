@@ -140,21 +140,37 @@ impl Command {
     }
 
     fn into_std(self) -> std::process::Command {
-        let mut result = std::process::Command::new(self.get_program());
-        result.args(self.get_args());
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
 
-        if self.container.env.is_cleared() {
+        // Keep this exhaustive: adding Command state must fail to compile until
+        // the standard-command conversion explicitly preserves or refuses it.
+        let Self {
+            program,
+            args,
+            pre_exec,
+            container,
+        } = self;
+
+        let mut result = std::process::Command::new(OsStr::from_bytes(program.to_bytes()));
+        result.args(
+            args.iter()
+                .skip(1)
+                .map(|arg| OsStr::from_bytes(arg.to_bytes())),
+        );
+
+        if container.env.is_cleared() {
             result.env_clear();
         }
 
-        for (key, value) in self.get_envs() {
+        for (key, value) in container.get_envs() {
             match value {
                 Some(value) => result.env(key, value),
                 None => result.env_remove(key),
             };
         }
 
-        if let Some(dir) = self.get_current_dir() {
+        if let Some(dir) = container.get_current_dir() {
             result.current_dir(dir);
         }
 
@@ -162,18 +178,18 @@ impl Command {
         {
             use std::os::unix::process::CommandExt;
 
-            result.arg0(self.get_arg0());
+            result.arg0(OsStr::from_bytes(args.get(0).to_bytes()));
 
-            for mut f in self.pre_exec {
+            for mut f in pre_exec {
                 unsafe {
                     result.pre_exec(move || f().map_err(Into::into));
                 }
             }
         }
 
-        result.stdin(self.container.stdin);
-        result.stdout(self.container.stdout);
-        result.stderr(self.container.stderr);
+        result.stdin(container.stdin);
+        result.stdout(container.stdout);
+        result.stderr(container.stderr);
 
         result
     }
