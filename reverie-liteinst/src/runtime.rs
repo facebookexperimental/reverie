@@ -258,6 +258,50 @@ static IN_GUEST_STAGE_STREAM: AtomicBool = AtomicBool::new(false);
 
 #[thread_local]
 static mut CURRENT_EVENT: *mut SyscallEvent = ptr::null_mut();
+// Reentry is a property of Tool execution, not of syscall-event storage:
+// instruction callbacks have no current SyscallEvent but must take the same
+// native/raw bypasses while holding Tool and thread-state locks.
+#[thread_local]
+static TOOL_CALLBACK_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+struct ToolCallbackGuard {
+    previous: bool,
+}
+
+impl ToolCallbackGuard {
+    fn enter() -> Self {
+        let previous = TOOL_CALLBACK_ACTIVE.swap(true, Ordering::Relaxed);
+        Self { previous }
+    }
+}
+
+impl Drop for ToolCallbackGuard {
+    fn drop(&mut self) {
+        TOOL_CALLBACK_ACTIVE.store(self.previous, Ordering::Relaxed);
+    }
+}
+
+struct CurrentEventGuard {
+    previous: *mut SyscallEvent,
+}
+
+impl CurrentEventGuard {
+    fn enter(event: *mut SyscallEvent) -> Self {
+        let previous = unsafe { CURRENT_EVENT };
+        unsafe { CURRENT_EVENT = event };
+        Self { previous }
+    }
+}
+
+impl Drop for CurrentEventGuard {
+    fn drop(&mut self) {
+        unsafe { CURRENT_EVENT = self.previous };
+    }
+}
+
+fn tool_callback_active() -> bool {
+    TOOL_CALLBACK_ACTIVE.load(Ordering::Relaxed)
+}
 
 static ARENAS: OnceLock<Vec<RuntimeArena>> = OnceLock::new();
 static SITES: OnceLock<Box<[SiteSlot]>> = OnceLock::new();
@@ -2301,7 +2345,7 @@ unsafe extern "C" fn instruction_sigsegv_handler(
     // but its backing pages are shared; child publication would let the parent
     // reuse and overwrite the same slot. Execute at the private native helper
     // and advance the faulting context instead.
-    if unsafe { !CURRENT_EVENT.is_null() } {
+    if tool_callback_active() {
         emit_in_guest_stage(match kind {
             InstructionEventKind::Cpuid => b"nested-instruction-fault-native-cpuid",
             InstructionEventKind::Rdtsc => b"nested-instruction-fault-native-rdtsc",
@@ -2449,7 +2493,7 @@ unsafe fn installed_instruction_hook(context: *mut HookContext, kind: Instructio
     // A previously patched instruction still jumps here while native faulting
     // is enabled. Re-entering the Tool would deadlock on its already-held lock,
     // so execute the instruction at a private, never-patched site instead.
-    if unsafe { !CURRENT_EVENT.is_null() } {
+    if tool_callback_active() {
         emit_in_guest_stage(match kind {
             InstructionEventKind::Cpuid => b"nested-instruction-native-cpuid",
             InstructionEventKind::Rdtsc => b"nested-instruction-native-rdtsc",
@@ -2461,7 +2505,10 @@ unsafe fn installed_instruction_hook(context: *mut HookContext, kind: Instructio
         }
         return;
     }
-    crate::tool_host::dispatch_instruction(kind, context);
+    {
+        let _tool_callback = ToolCallbackGuard::enter();
+        crate::tool_host::dispatch_instruction(kind, context);
+    }
     if unsafe { set_instruction_native(kind, false) }.is_err() || leave_rcb_handler().is_err() {
         unsafe { exit_now(122) };
     }
@@ -2537,7 +2584,7 @@ unsafe fn installed_syscall_hook_for(context: *mut HookContext, number: Option<i
     };
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-133): Review guarded installed-hook bypass for Tool-internal syscalls.
-    if unsafe { !CURRENT_EVENT.is_null() } {
+    if tool_callback_active() {
         forward_nested_tool_syscall(&mut event);
         context.rax = event.result as u64;
         context.rcx = context.instruction_pointer.saturating_add(2);
@@ -2547,10 +2594,10 @@ unsafe fn installed_syscall_hook_for(context: *mut HookContext, number: Option<i
         }
         return;
     }
-    unsafe {
-        CURRENT_EVENT = &mut event;
-        tool_trampoline();
-        CURRENT_EVENT = ptr::null_mut();
+    {
+        let _tool_callback = ToolCallbackGuard::enter();
+        let _current_event = CurrentEventGuard::enter(&mut event);
+        unsafe { tool_trampoline() };
     }
     if event.result == UNSET_RESULT {
         event.result = -i64::from(libc::ENOSYS);
@@ -2646,7 +2693,7 @@ fn record_enabled_fallback_stats(stats: crate::stats::GuestStatsHooks, address: 
 
 impl SyscallDispatcher for LiteinstDispatcher {
     fn dispatch(&self, event: &mut PreloadSyscallEvent) {
-        if unsafe { !CURRENT_EVENT.is_null() } {
+        if tool_callback_active() {
             self.stats.record_path(crate::stats::IN_GUEST_NESTED_SIGSYS);
             let mut nested = SyscallEvent {
                 number: event.number(),

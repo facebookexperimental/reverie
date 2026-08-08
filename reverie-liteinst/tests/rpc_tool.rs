@@ -1,10 +1,28 @@
 use std::process::Command;
+use std::process::Output;
 use std::process::Stdio;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
 const INSTRUCTION_CONTROL_UNAVAILABLE_STATUS: i32 = 77;
+
+fn output_with_timeout(mut command: Command, timeout: Duration) -> Output {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!("child exceeded {timeout:?}: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
 
 #[test]
 fn installed_hook_reentry_bypasses_tool_with_shared_coordinator_rpc() {
@@ -64,12 +82,9 @@ fn installed_hook_reentry_bypasses_tool_with_shared_coordinator_rpc() {
         "{spoofed_sigsys:?}"
     );
 
-    let instruction_guest = Command::new(binary)
-        .arg("instruction-guest")
-        .arg(&socket)
-        .env(reverie_liteinst::IN_GUEST_STAGE_STREAM_ENV, "1")
-        .output()
-        .unwrap();
+    let mut instruction_command = Command::new(binary);
+    instruction_command.arg("instruction-guest").arg(&socket);
+    let instruction_guest = output_with_timeout(instruction_command, Duration::from_secs(10));
     let instruction_control_available = if instruction_guest.status.code()
         == Some(INSTRUCTION_CONTROL_UNAVAILABLE_STATUS)
     {
@@ -84,7 +99,7 @@ fn installed_hook_reentry_bypasses_tool_with_shared_coordinator_rpc() {
         assert!(instruction_guest.status.success(), "{instruction_guest:?}");
         assert_eq!(
             instruction_guest.stdout,
-            b"cpuid=tool rdtsc=tool rdtscp=tool rdrand=masked rdseed=masked\n"
+            b"cpuid=tool rdtsc=tool rdtscp=tool rdrand=masked rdseed=masked instruction-handler-rpc=1 patched-native=1 first-use-native=1 nested-syscall-native=1 cpuid-callbacks=6\n"
         );
         assert!(
             instruction_guest.stderr.is_empty(),

@@ -47,6 +47,12 @@ static VDSO_CLOCK_CALLS: AtomicU64 = AtomicU64::new(0);
 static CHILD_NESTED_CPUID_NATIVE: AtomicBool = AtomicBool::new(false);
 static CHILD_NESTED_RDTSC_NATIVE: AtomicBool = AtomicBool::new(false);
 static CHILD_NESTED_RDTSCP_NATIVE: AtomicBool = AtomicBool::new(false);
+static INSTRUCTION_CPUID_CALLBACKS: AtomicU64 = AtomicU64::new(0);
+static INSTRUCTION_HANDLER_RPC_CALLS: AtomicU64 = AtomicU64::new(0);
+static INSTRUCTION_PATCHED_CPUID_NATIVE: AtomicBool = AtomicBool::new(false);
+static INSTRUCTION_FIRST_USE_CPUID_NATIVE: AtomicBool = AtomicBool::new(false);
+static INSTRUCTION_NESTED_SYSCALL_NATIVE: AtomicBool = AtomicBool::new(false);
+static INSTRUCTION_EXPECTED_UID: AtomicI64 = AtomicI64::new(-1);
 
 #[derive(Debug, Default, Eq, PartialEq)]
 #[repr(C)]
@@ -136,17 +142,33 @@ impl Tool for InstructionTool {
     type ThreadState = ();
 
     fn subscriptions(_cfg: &()) -> Subscription {
-        let mut subscriptions = Subscription::none();
+        let mut subscriptions: Subscription = [Sysno::getuid].into_iter().collect();
         subscriptions.cpuid().rdtsc();
         subscriptions
     }
 
     async fn handle_cpuid_event<G: Guest<Self>>(
         &self,
-        _guest: &mut G,
+        guest: &mut G,
         _eax: u32,
         _ecx: u32,
     ) -> Result<CpuIdResult, reverie::Errno> {
+        let callback = INSTRUCTION_CPUID_CALLBACKS.fetch_add(1, Ordering::Relaxed) + 1;
+        if callback == 1 {
+            INSTRUCTION_PATCHED_CPUID_NATIVE
+                .store(nested_cpuid(0, 0) != tool_cpuid_words(), Ordering::Relaxed);
+            INSTRUCTION_FIRST_USE_CPUID_NATIVE.store(
+                first_use_cpuid(0, 0) != tool_cpuid_words(),
+                Ordering::Relaxed,
+            );
+            let uid = unsafe { reverie_liteinst_rpc_getuid() };
+            INSTRUCTION_NESTED_SYSCALL_NATIVE.store(
+                uid == INSTRUCTION_EXPECTED_UID.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            let _ = guest.send_rpc(1).await;
+            INSTRUCTION_HANDLER_RPC_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(CpuIdResult {
             eax: TOOL_CPUID_EAX,
             ebx: TOOL_CPUID_EBX,
@@ -556,6 +578,30 @@ reverie_liteinst_rpc_nested_cpuid:
     ret
     .size reverie_liteinst_rpc_nested_cpuid, .-reverie_liteinst_rpc_nested_cpuid
 
+    # This CPUID site is first reached from an active instruction Tool callback.
+    # It must execute natively without publishing a hook; its later application
+    # use must still enter the Tool.
+    .p2align 4
+    .global reverie_liteinst_rpc_first_use_cpuid
+    .hidden reverie_liteinst_rpc_first_use_cpuid
+    .type reverie_liteinst_rpc_first_use_cpuid,@function
+reverie_liteinst_rpc_first_use_cpuid:
+    push rbx
+    mov r8, rdx
+    mov eax, edi
+    mov ecx, esi
+    .global reverie_liteinst_rpc_first_use_cpuid_site
+    .hidden reverie_liteinst_rpc_first_use_cpuid_site
+reverie_liteinst_rpc_first_use_cpuid_site:
+    cpuid
+    mov dword ptr [r8], eax
+    mov dword ptr [r8 + 4], ebx
+    mov dword ptr [r8 + 8], ecx
+    mov dword ptr [r8 + 12], edx
+    pop rbx
+    ret
+    .size reverie_liteinst_rpc_first_use_cpuid, .-reverie_liteinst_rpc_first_use_cpuid
+
     .p2align 4
     .global reverie_liteinst_rpc_nested_rdtsc
     .hidden reverie_liteinst_rpc_nested_rdtsc
@@ -621,6 +667,7 @@ unsafe extern "C" {
     fn reverie_liteinst_rpc_raise_sigsys() -> i64;
     fn reverie_liteinst_rpc_raw_fork() -> i64;
     fn reverie_liteinst_rpc_nested_cpuid(eax: u32, ecx: u32, result: *mut CpuidWords);
+    fn reverie_liteinst_rpc_first_use_cpuid(eax: u32, ecx: u32, result: *mut CpuidWords);
     fn reverie_liteinst_rpc_nested_rdtsc() -> u64;
     fn reverie_liteinst_rpc_nested_rdtscp(aux: *mut u32) -> u64;
     fn reverie_liteinst_straddling_cpuid() -> u64;
@@ -646,6 +693,12 @@ unsafe extern "C" {
 fn nested_cpuid(eax: u32, ecx: u32) -> CpuidWords {
     let mut result = CpuidWords::default();
     unsafe { reverie_liteinst_rpc_nested_cpuid(eax, ecx, &mut result) };
+    result
+}
+
+fn first_use_cpuid(eax: u32, ecx: u32) -> CpuidWords {
+    let mut result = CpuidWords::default();
+    unsafe { reverie_liteinst_rpc_first_use_cpuid(eax, ecx, &mut result) };
     result
 }
 
@@ -819,10 +872,17 @@ fn instruction_guest(path: &Path) {
     // This fixture creates no application threads, matching the direct Hermit
     // lifecycle contract. Exercise quiescent publication so every cache-line
     // placement is valid without a machine-specific WordPatch++ calibration.
+    INSTRUCTION_EXPECTED_UID.store(i64::from(unsafe { libc::getuid() }), Ordering::Relaxed);
     if let Err(error) = unsafe { reverie_liteinst::install_tool_quiescent::<InstructionTool>(path) }
     {
         fail_instruction_install(error);
     }
+    assert_eq!(nested_cpuid(0, 0), tool_cpuid_words());
+    assert_eq!(
+        first_use_cpuid(0, 0),
+        tool_cpuid_words(),
+        "a first-use site reached inside the Tool must remain unpublished"
+    );
     assert_eq!(
         unsafe { reverie_liteinst_straddling_cpuid() } as u32,
         0x1111_1111
@@ -850,7 +910,23 @@ fn instruction_guest(path: &Path) {
     assert_eq!(tsc, 0x1234_5678_9abc_def0);
     assert_eq!(tscp, 0x0fed_cba9_8765_4321);
     assert_eq!(aux, 0x2468_ace0);
-    println!("cpuid=tool rdtsc=tool rdtscp=tool rdrand=masked rdseed=masked");
+    assert!(
+        INSTRUCTION_PATCHED_CPUID_NATIVE.load(Ordering::Relaxed),
+        "a patched CPUID reached inside its Tool callback must execute natively"
+    );
+    assert!(
+        INSTRUCTION_FIRST_USE_CPUID_NATIVE.load(Ordering::Relaxed),
+        "a first-use CPUID reached inside its Tool callback must execute natively"
+    );
+    assert!(
+        INSTRUCTION_NESTED_SYSCALL_NATIVE.load(Ordering::Relaxed),
+        "a subscribed syscall reached inside an instruction callback must execute natively"
+    );
+    assert_eq!(INSTRUCTION_HANDLER_RPC_CALLS.load(Ordering::Relaxed), 1);
+    assert_eq!(INSTRUCTION_CPUID_CALLBACKS.load(Ordering::Relaxed), 6);
+    println!(
+        "cpuid=tool rdtsc=tool rdtscp=tool rdrand=masked rdseed=masked instruction-handler-rpc=1 patched-native=1 first-use-native=1 nested-syscall-native=1 cpuid-callbacks=6"
+    );
     std::io::stdout().flush().unwrap();
 }
 
