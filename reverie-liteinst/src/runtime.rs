@@ -370,22 +370,11 @@ pub(crate) fn initialize_rcb_clock() -> io::Result<()> {
         RCB_HANDLER_DEDUCTION = 0;
         RCB_HANDLER_DEPTH = active_depth;
     }
-    let clock = match unsafe {
+    let clock = match optional_rcb_clock(unsafe {
         reverie_ptrace::InGuestRcbCounter::current_thread_with_syscall_gate(raw_syscall6)
-    } {
-        Ok(clock) => clock,
-        Err(error)
-            if matches!(
-                error.into_raw(),
-                libc::EACCES | libc::EPERM | libc::ENOENT | libc::ENODEV | libc::ENOSYS
-            ) =>
-        {
-            unsafe {
-                RCB_CLOCK_UNAVAILABLE = true;
-            }
-            return Ok(());
-        }
-        Err(error) => return Err(io::Error::from_raw_os_error(error.into_raw())),
+    }) {
+        Some(clock) => clock,
+        None => return Ok(()),
     };
     let active_entry = if active_depth == 0 {
         0
@@ -403,6 +392,13 @@ pub(crate) fn initialize_rcb_clock() -> io::Result<()> {
         RCB_HANDLER_DEPTH = active_depth;
     }
     Ok(())
+}
+
+/// An in-guest RCB clock is an optional acceleration/capability. Every failure
+/// while identifying the PMU, opening or mapping its event, or enabling it must
+/// leave the rest of LiteInst usable instead of making Tool installation fatal.
+fn optional_rcb_clock<T>(result: Result<T, reverie::Errno>) -> Option<T> {
+    result.ok()
 }
 
 fn rcb_clock() -> io::Result<Option<&'static reverie_ptrace::InGuestRcbCounter>> {
@@ -3337,9 +3333,32 @@ mod tests {
     use super::fallback_dispatch_count;
     use super::fallback_syscall_count;
     use super::mark_site_range_stale;
+    use super::optional_rcb_clock;
     use super::record_fallback_dispatch;
     use super::reset_fallback_observability;
     use super::site_counts;
+
+    #[test]
+    fn every_optional_rcb_setup_error_degrades_to_unavailable() {
+        for error in [
+            reverie::Errno::EACCES,
+            reverie::Errno::EPERM,
+            reverie::Errno::ENODEV,
+            reverie::Errno::EOPNOTSUPP,
+            reverie::Errno::EINVAL,
+            reverie::Errno::EMFILE,
+            reverie::Errno::ENFILE,
+            reverie::Errno::EBUSY,
+            reverie::Errno::EIO,
+        ] {
+            assert_eq!(
+                optional_rcb_clock::<()>(Err(error)),
+                None,
+                "optional RCB setup error {error:?} must not abort Tool installation"
+            );
+        }
+        assert_eq!(optional_rcb_clock::<u64>(Ok(17)), Some(17));
+    }
 
     #[test]
     fn disabled_dispatch_does_not_classify_fallback_sites() {

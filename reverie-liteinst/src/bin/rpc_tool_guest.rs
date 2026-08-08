@@ -42,6 +42,8 @@ static LAST_FIRST_USE_SIGNAL_RESULT: AtomicI64 = AtomicI64::new(0);
 static CHILD_RECONSTRUCTED: AtomicBool = AtomicBool::new(false);
 static RCB_BEFORE: AtomicU64 = AtomicU64::new(0);
 static RCB_AFTER: AtomicU64 = AtomicU64::new(0);
+static RCB_CALLBACKS: AtomicU64 = AtomicU64::new(0);
+static RCB_ENTRIES: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static RCB_AVAILABLE: AtomicBool = AtomicBool::new(false);
 static VDSO_CLOCK_CALLS: AtomicU64 = AtomicU64::new(0);
 static CHILD_NESTED_CPUID_NATIVE: AtomicBool = AtomicBool::new(false);
@@ -70,6 +72,21 @@ fn tool_cpuid_words() -> CpuidWords {
         ecx: TOOL_CPUID_ECX,
         edx: TOOL_CPUID_EDX,
     }
+}
+
+#[inline(never)]
+fn retire_conditional_branches(iterations: u64) {
+    let mut remaining = iterations;
+    unsafe {
+        core::arch::asm!(
+            "2:",
+            "dec {remaining}",
+            "jnz 2b",
+            remaining = inout(reg) remaining,
+            options(nostack),
+        );
+    }
+    std::hint::black_box(remaining);
 }
 
 #[derive(Default)]
@@ -278,18 +295,21 @@ impl Tool for ClockAndVdsoTool {
         syscall: Syscall,
     ) -> Result<i64, Error> {
         if syscall.number() == Sysno::getpid {
+            let callback = RCB_CALLBACKS.fetch_add(1, Ordering::Relaxed);
             match guest.read_clock() {
                 Ok(before) => {
-                    let mut branches = 0_u64;
-                    for index in 0..1024_u64 {
-                        if std::hint::black_box(index & 1) == 0 {
-                            branches = branches.wrapping_add(index);
-                        }
+                    if let Some(entry) = RCB_ENTRIES.get(callback as usize) {
+                        entry.store(before, Ordering::Relaxed);
                     }
-                    std::hint::black_box(branches);
-                    let after = guest.read_clock()?;
-                    RCB_BEFORE.store(before, Ordering::Relaxed);
-                    RCB_AFTER.store(after, Ordering::Relaxed);
+                    if callback == 0 {
+                        // This is deliberately much more handler work than the
+                        // guest performs between either pair of clock samples.
+                        // If handler RCBs leak, the first interval dominates.
+                        retire_conditional_branches(65_536);
+                        let after = guest.read_clock()?;
+                        RCB_BEFORE.store(before, Ordering::Relaxed);
+                        RCB_AFTER.store(after, Ordering::Relaxed);
+                    }
                     RCB_AVAILABLE.store(true, Ordering::Release);
                 }
                 Err(_) => RCB_AVAILABLE.store(false, Ordering::Release),
@@ -958,8 +978,11 @@ fn instruction_guest(path: &Path) {
 
 fn clock_and_vdso_guest(path: &Path) {
     unsafe { reverie_liteinst::install_tool::<ClockAndVdsoTool>(path) }.unwrap();
-    let pid = unsafe { libc::getpid() };
-    assert!(pid > 0);
+    assert!(unsafe { reverie_liteinst_rpc_getpid() } > 0);
+    retire_conditional_branches(128);
+    assert!(unsafe { reverie_liteinst_rpc_getpid() } > 0);
+    retire_conditional_branches(4_096);
+    assert!(unsafe { reverie_liteinst_rpc_getpid() } > 0);
 
     let mut time = core::mem::MaybeUninit::<libc::timespec>::uninit();
     assert_eq!(
@@ -975,7 +998,22 @@ fn clock_and_vdso_guest(path: &Path) {
             after, before,
             "branches retired inside the Tool handler must be deducted"
         );
-        println!("rcb=measured before={before} after={after} vdso-calls=1");
+        let first = RCB_ENTRIES[0].load(Ordering::Relaxed);
+        let second = RCB_ENTRIES[1].load(Ordering::Relaxed);
+        let third = RCB_ENTRIES[2].load(Ordering::Relaxed);
+        let small_guest_delta = second.checked_sub(first).unwrap();
+        let large_guest_delta = third.checked_sub(second).unwrap();
+        assert!(
+            small_guest_delta > 0,
+            "known guest branches must advance the RCB clock: {first} -> {second}"
+        );
+        assert!(
+            large_guest_delta > small_guest_delta,
+            "4,096 guest branches must advance the guest-only clock more than 128 guest branches; the 65,536 Tool branches before the first interval must be excluded: small={small_guest_delta} large={large_guest_delta}"
+        );
+        println!(
+            "rcb=measured before={before} after={after} small-guest-delta={small_guest_delta} large-guest-delta={large_guest_delta} vdso-calls=1"
+        );
     } else {
         println!("rcb=unmeasured vdso-calls=1");
     }
