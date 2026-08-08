@@ -901,7 +901,7 @@ where
         // guest via a `pre_exec` `F_SETFD` clear, expressed against
         // `std::process::Command`. This path is not yet tree-reaped.
         Some(tool_data) => {
-            let mut child_command = command.into_std_lossy();
+            let mut child_command = command.try_into_std()?;
             let bootstrap = create_preload_bootstrap(&socket, &tool_data)?;
             let bootstrap_fd = bootstrap.as_raw_fd();
             // SAFETY: fcntl(2) is async-signal-safe and the closure captures only
@@ -1163,7 +1163,7 @@ mod tests {
             .stdout(reverie::process::Stdio::piped())
             .stderr(reverie::process::Stdio::piped());
         inherit_stdio(&mut command);
-        let mut child = command.into_std_lossy().spawn().unwrap();
+        let mut child = command.try_into_std().unwrap().spawn().unwrap();
         assert!(child.stdin.is_none());
         assert!(child.stdout.is_none());
         assert!(child.stderr.is_none());

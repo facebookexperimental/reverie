@@ -93,6 +93,51 @@ impl Default for Container {
 }
 
 impl Container {
+    /// Returns the configured features that cannot be represented by
+    /// `std::process::Command`.
+    pub(super) fn std_conversion_blockers(&self) -> Vec<&'static str> {
+        let mut blockers = Vec::new();
+
+        if self.chroot.is_some() {
+            blockers.push("chroot");
+        }
+        if !self.namespace.is_empty() {
+            blockers.push("Linux namespaces");
+        }
+        if !self.uid_map.is_empty() {
+            blockers.push("user ID mappings");
+        }
+        if !self.gid_map.is_empty() {
+            blockers.push("group ID mappings");
+        }
+        if !self.mounts.is_empty() {
+            blockers.push("mounts");
+        }
+        if self.local_networking_only {
+            blockers.push("local-only networking");
+        }
+        if self.hostname.is_some() {
+            blockers.push("hostname");
+        }
+        if self.domainname.is_some() {
+            blockers.push("domain name");
+        }
+        if self.seccomp.is_some() {
+            blockers.push("seccomp filter");
+        }
+        if self.seccomp_notify {
+            blockers.push("seccomp notification");
+        }
+        if self.pty.is_some() {
+            blockers.push("pseudoterminal");
+        }
+        if self.affinity.is_some() {
+            blockers.push("CPU affinity");
+        }
+
+        blockers
+    }
+
     /// Creates a new `Container` that inherits everything from the parent
     /// process.
     pub fn new() -> Self {

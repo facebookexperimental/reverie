@@ -34,6 +34,7 @@ mod stdio;
 mod util;
 
 use std::ffi::CString;
+use std::io;
 
 pub use child::Child;
 pub use child::Output;
@@ -104,12 +105,28 @@ impl Command {
         result
     }
 
-    /// This provides a *lossy* conversion to [`std::process::Command`]. The
-    /// features that are not supported by [`std::process::Command`] but *are*
-    /// supported by [`Command`] cannot be converted. For example, namespace and
-    /// mount configurations cannot be converted since they are not supported by
-    /// [`std::process::Command`].
-    pub fn into_std_lossy(self) -> std::process::Command {
+    /// Converts this command to [`std::process::Command`].
+    ///
+    /// This fails if the command contains container configuration that cannot
+    /// be represented by [`std::process::Command`], rather than silently
+    /// discarding that configuration. This includes namespaces, mounts,
+    /// seccomp filters, pseudoterminals, and CPU affinity.
+    pub fn try_into_std(self) -> io::Result<std::process::Command> {
+        let blockers = self.container.std_conversion_blockers();
+        if !blockers.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "cannot convert to std::process::Command without losing: {}",
+                    blockers.join(", ")
+                ),
+            ));
+        }
+
+        Ok(self.into_std())
+    }
+
+    fn into_std(self) -> std::process::Command {
         let mut result = std::process::Command::new(self.get_program());
         result.args(self.get_args());
 
@@ -618,7 +635,7 @@ mod tests {
     }
 
     #[test]
-    fn into_std_lossy() {
+    fn try_into_std() {
         let mut cmd = Command::new("env");
         cmd.args(["-0"]);
         cmd.current_dir("/foo/bar");
@@ -626,7 +643,7 @@ mod tests {
         cmd.env("FOO", "1");
         cmd.env("BAR", "2");
 
-        let stdcmd = cmd.into_std_lossy();
+        let stdcmd = cmd.try_into_std().unwrap();
 
         assert_eq!(stdcmd.get_program(), "env");
         assert_eq!(stdcmd.get_args().collect::<Vec<_>>(), ["-0"]);
@@ -637,6 +654,45 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(envs, [("BAR", Some("2")), ("FOO", Some("1"))]);
+    }
+
+    #[test]
+    fn try_into_std_refuses_container_configuration() {
+        use syscalls::Sysno;
+
+        use super::seccomp::Action;
+        use super::seccomp::FilterBuilder;
+
+        let filter = FilterBuilder::new()
+            .default_action(Action::Allow)
+            .syscalls([(Sysno::brk, Action::KillProcess)])
+            .build();
+        let mut command = Command::new("true");
+        command.seccomp(filter);
+        let error = command.try_into_std().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "cannot convert to std::process::Command without losing: seccomp filter"
+        );
+
+        let mut command = Command::new("true");
+        command.unshare(Namespace::MOUNT);
+        let error = command.try_into_std().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "cannot convert to std::process::Command without losing: Linux namespaces"
+        );
+
+        let mut command = Command::new("true");
+        command.container.affinity(0);
+        let error = command.try_into_std().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "cannot convert to std::process::Command without losing: CPU affinity"
+        );
     }
 
     #[tokio::test]

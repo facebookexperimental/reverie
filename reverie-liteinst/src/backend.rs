@@ -745,7 +745,7 @@ where
 
     let wait = match tool_data {
         Some(tool_data) => {
-            let mut child_command = command.into_std_lossy();
+            let mut child_command = command.try_into_std()?;
             child_command.env_remove(STATS_COORDINATOR_ENV);
             if let Some(stats_socket) = &stats_socket {
                 child_command.env(STATS_COORDINATOR_ENV, stats_socket);
@@ -777,7 +777,7 @@ where
             .await?
         }
         None => {
-            let mut child_command = command.into_std_lossy();
+            let mut child_command = command.try_into_std()?;
             child_command.env(COORDINATOR_ENV, &socket);
             child_command.env_remove(STATS_COORDINATOR_ENV);
             if let Some(stats_socket) = &stats_socket {
@@ -941,7 +941,7 @@ mod tests {
             .stdout(reverie::process::Stdio::piped())
             .stderr(reverie::process::Stdio::piped());
         inherit_stdio(&mut command);
-        let mut child = command.into_std_lossy().spawn().unwrap();
+        let mut child = command.try_into_std().unwrap().spawn().unwrap();
         assert!(child.stdin.is_none());
         assert!(child.stdout.is_none());
         assert!(child.stderr.is_none());
