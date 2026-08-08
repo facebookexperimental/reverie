@@ -208,7 +208,14 @@ append_validation_ledger() {
     if ((VALIDATION_COMMIT_ANCHORED == 1)); then commit_anchored_json=true; else commit_anchored_json=false; fi
     if ((VALIDATION_TREE_DIRTY == 1)); then tree_dirty_json=true; else tree_dirty_json=false; fi
 
-    line="{\"schema_version\":3,\"repo\":\"reverie\","
+    # `producer` names the writer that emitted this row, so receipt provenance is
+    # a recorded fact rather than forensics inferred from `repo`/`cwd`. The slug
+    # is repo-qualified because both hermit and reverie ship a `validate.sh` and
+    # a bare name could not distinguish them. It must stay registered in the
+    # parent's qualifying-receipt `producer.known` list; an unregistered value is
+    # REFUSED once `applies_from_finished_at` is set, which is exactly the drift
+    # this field exists to make visible.
+    line="{\"schema_version\":3,\"producer\":\"reverie-validate-sh\",\"repo\":\"reverie\","
     line+="\"started_at\":$(json_quote "$VALIDATION_STARTED_AT"),"
     line+="\"finished_at\":$(json_quote "$finished_at"),\"host\":$(json_quote "$VALIDATION_HOST"),"
     line+="\"slot\":$(json_quote "$VALIDATION_SLOT"),\"cwd\":$(json_quote "$ROOT_DIR"),"
