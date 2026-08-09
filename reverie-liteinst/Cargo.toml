@@ -37,9 +37,11 @@ reverie-rpc-transport = { version = "0.2.0", path = "../reverie-rpc-transport" }
 serde = { version = "1.0.219", features = ["derive"] }
 tokio = { version = "1.52.4", features = ["macros", "net", "rt", "time"] }
 tempfile = "3.27.0"
+tracing = "0.1.41"
 
 [dev-dependencies]
 tokio = { version = "1.52.4", features = ["test-util"] }
+tracing-subscriber = "0.3.23"
 
 [[bin]]
 name = "reverie-liteinst-trap-count-guest"

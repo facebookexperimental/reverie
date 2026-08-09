@@ -693,18 +693,20 @@ where
         result = serving.join_next() => return Err(rpc_server_stopped(result)),
         result = tokio::time::timeout(drain_timeout, &mut drain) => result,
     };
-    if drain_result.is_err() && result.is_ok() {
+    if drain_result.is_err() {
         let active_connections = connection_monitors
             .iter()
             .map(ConnectionMonitor::active_connections)
             .sum::<usize>();
-        result = Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!(
-                "LiteInst coordinator retained {active_connections} active RPC connection(s) for {}ms after guest exit",
-                drain_timeout.as_millis()
-            ),
-        ));
+        let timeout_message = format!(
+            "LiteInst coordinator retained {active_connections} active RPC connection(s) for {}ms after guest exit",
+            drain_timeout.as_millis()
+        );
+        if result.is_ok() {
+            result = Err(io::Error::new(io::ErrorKind::TimedOut, timeout_message));
+        } else {
+            tracing::warn!("{timeout_message}; preserving guest completion error");
+        }
     }
 
     serving.abort_all();
@@ -892,6 +894,19 @@ mod tests {
     use reverie_preload::rpc::CoordinatorClient;
 
     use super::*;
+
+    struct CapturedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for CapturedLogWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[tokio::test]
     async fn coordinator_global_waits_for_cancelled_connection_owners() {
@@ -1234,6 +1249,15 @@ mod tests {
         let server = RpcServer::bind(&socket, Arc::new(MultiClientGlobal::default()), 41).unwrap();
         let connection_monitors = vec![server.connection_monitor()];
         let (connected_tx, connected_rx) = tokio::sync::oneshot::channel();
+        let captured_logs = Arc::new(Mutex::new(Vec::new()));
+        let writer_logs = captured_logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_writer(move || CapturedLogWriter(writer_logs.clone()))
+            .finish();
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
 
         let client = tokio::spawn(async move {
             let _client = reverie_rpc_transport::RpcClient::<MultiClientGlobal>::connect(
@@ -1273,6 +1297,10 @@ mod tests {
             error.to_string(),
             "guest completion failed before RPC drain"
         );
+        let logs = String::from_utf8(captured_logs.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains(
+            "LiteInst coordinator retained 1 active RPC connection(s) for 25ms after guest exit; preserving guest completion error"
+        ));
 
         client.abort();
         let _ = client.await;
