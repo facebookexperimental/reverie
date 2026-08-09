@@ -32,6 +32,7 @@ use reverie::process::Output as ReverieOutput;
 use reverie::process::Stdio as ReverieStdio;
 use reverie_ptrace::TracerBuilder;
 use reverie_rpc_transport::ConnectionMonitor;
+use reverie_rpc_transport::RpcError;
 use reverie_rpc_transport::RpcServer;
 
 /// Environment variable naming the tool-specific preload DSO for a backend run.
@@ -641,20 +642,38 @@ where
     if let Some(stats_server) = stats_server {
         serving.spawn(stats_server.serve());
     }
+
+    serve_rpc_tasks_until_with_timeout(serving, connection_monitors, completion, drain_timeout)
+        .await
+}
+
+fn rpc_server_stopped(
+    result: Option<Result<Result<(), RpcError>, tokio::task::JoinError>>,
+) -> io::Error {
+    let message = match result {
+        Some(Ok(Ok(()))) => "LiteInst coordinator stopped unexpectedly".to_owned(),
+        Some(Ok(Err(error))) => error.to_string(),
+        Some(Err(error)) => error.to_string(),
+        None => "LiteInst coordinator task disappeared".to_owned(),
+    };
+    io::Error::other(message)
+}
+
+async fn serve_rpc_tasks_until_with_timeout<F, T>(
+    mut serving: tokio::task::JoinSet<Result<(), RpcError>>,
+    connection_monitors: Vec<ConnectionMonitor>,
+    completion: F,
+    drain_timeout: Duration,
+) -> io::Result<T>
+where
+    F: Future<Output = io::Result<T>>,
+{
     tokio::pin!(completion);
 
     let mut result = tokio::select! {
         biased;
         result = &mut completion => result,
-        result = serving.join_next() => {
-            let message = match result {
-                Some(Ok(Ok(()))) => "LiteInst coordinator stopped unexpectedly".to_owned(),
-                Some(Ok(Err(error))) => error.to_string(),
-                Some(Err(error)) => error.to_string(),
-                None => "LiteInst coordinator task disappeared".to_owned(),
-            };
-            return Err(io::Error::other(message));
-        }
+        result = serving.join_next() => return Err(rpc_server_stopped(result)),
     };
 
     // A fork child inherits the parent's connected socket. If it later needs
@@ -671,18 +690,10 @@ where
     tokio::pin!(drain);
     let drain_result = tokio::select! {
         biased;
-        result = serving.join_next() => {
-            let message = match result {
-                Some(Ok(Ok(()))) => "LiteInst coordinator stopped unexpectedly".to_owned(),
-                Some(Ok(Err(error))) => error.to_string(),
-                Some(Err(error)) => error.to_string(),
-                None => "LiteInst coordinator task disappeared".to_owned(),
-            };
-            return Err(io::Error::other(message));
-        }
+        result = serving.join_next() => return Err(rpc_server_stopped(result)),
         result = tokio::time::timeout(drain_timeout, &mut drain) => result,
     };
-    if drain_result.is_err() {
+    if drain_result.is_err() && result.is_ok() {
         let active_connections = connection_monitors
             .iter()
             .map(ConnectionMonitor::active_connections)
@@ -912,6 +923,11 @@ mod tests {
         }
     }
 
+    #[test]
+    fn production_coordinator_drain_timeout_is_thirty_seconds() {
+        assert_eq!(RPC_CONNECTION_DRAIN_TIMEOUT, Duration::from_secs(30));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn coordinator_serves_multiple_local_rpc_connections() {
         let directory = tempfile::tempdir().unwrap();
@@ -1039,6 +1055,70 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn coordinator_surfaces_server_failure_during_connection_drain() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("coordinator.sock");
+        let server = RpcServer::bind(&socket, Arc::new(MultiClientGlobal::default()), 41).unwrap();
+        let monitor = server.connection_monitor();
+        let (connected_tx, connected_rx) = tokio::sync::oneshot::channel();
+        let (release_client_tx, release_client_rx) = tokio::sync::oneshot::channel();
+        let (complete_tx, complete_rx) = tokio::sync::oneshot::channel();
+        let (fail_server_tx, fail_server_rx) = tokio::sync::oneshot::channel();
+
+        let client = tokio::spawn(async move {
+            let client = reverie_rpc_transport::RpcClient::<MultiClientGlobal>::connect(
+                &socket,
+                Tid::from_raw(505),
+            )
+            .await
+            .unwrap();
+            connected_tx.send(()).unwrap();
+            release_client_rx.await.unwrap();
+            drop(client);
+        });
+        let mut server_tasks = tokio::task::JoinSet::new();
+        server_tasks.spawn(server.serve());
+        server_tasks.spawn(async move {
+            fail_server_rx.await.unwrap();
+            Err(RpcError::Io(io::Error::other("drain-phase server failure")))
+        });
+        let completion = async move {
+            complete_rx
+                .await
+                .map_err(|error| io::Error::other(error.to_string()))
+        };
+        let mut serving = Box::pin(serve_rpc_tasks_until_with_timeout(
+            server_tasks,
+            vec![monitor.clone()],
+            completion,
+            Duration::from_secs(1),
+        ));
+
+        connected_rx.await.unwrap();
+        assert_eq!(monitor.active_connections(), 1);
+        complete_tx.send(()).unwrap();
+        let drain_poll =
+            std::future::poll_fn(|context| std::task::Poll::Ready(serving.as_mut().poll(context)))
+                .await;
+        assert!(drain_poll.is_pending());
+        assert_eq!(monitor.active_connections(), 1);
+
+        fail_server_tx.send(()).unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(1), serving)
+            .await
+            .expect("the drain did not observe the injected server failure")
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(
+            error.to_string(),
+            "rpc i/o error: drain-phase server failure"
+        );
+
+        release_client_tx.send(()).unwrap();
+        client.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn coordinator_connection_drain_is_bounded() {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("coordinator.sock");
@@ -1080,6 +1160,57 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "LiteInst coordinator retained 1 active RPC connection(s) for 25ms after guest exit"
+        );
+
+        client.abort();
+        let _ = client.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn coordinator_drain_timeout_preserves_completion_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("coordinator.sock");
+        let server = RpcServer::bind(&socket, Arc::new(MultiClientGlobal::default()), 41).unwrap();
+        let connection_monitors = vec![server.connection_monitor()];
+        let (connected_tx, connected_rx) = tokio::sync::oneshot::channel();
+
+        let client = tokio::spawn(async move {
+            let _client = reverie_rpc_transport::RpcClient::<MultiClientGlobal>::connect(
+                &socket,
+                Tid::from_raw(606),
+            )
+            .await
+            .unwrap();
+            connected_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let completion = async move {
+            connected_rx
+                .await
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            Err::<(), _>(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "guest completion failed before RPC drain",
+            ))
+        };
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            serve_rpc_until_with_timeout(
+                server,
+                None,
+                connection_monitors,
+                completion,
+                Duration::from_millis(25),
+            ),
+        )
+        .await
+        .expect("a held connection left the coordinator drain unbounded")
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "guest completion failed before RPC drain"
         );
 
         client.abort();
