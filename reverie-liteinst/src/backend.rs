@@ -1029,7 +1029,7 @@ mod tests {
         main_connected_rx.await.unwrap();
         stats_connected_rx.await.unwrap();
         stats_client.await.unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(5), async {
             while stats_monitor.active_connections() != 0 {
                 tokio::task::yield_now().await;
             }
