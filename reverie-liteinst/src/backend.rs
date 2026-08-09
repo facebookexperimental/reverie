@@ -923,9 +923,70 @@ mod tests {
         }
     }
 
-    #[test]
-    fn production_coordinator_drain_timeout_is_thirty_seconds() {
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn production_coordinator_drain_timeout_is_thirty_seconds() {
         assert_eq!(RPC_CONNECTION_DRAIN_TIMEOUT, Duration::from_secs(30));
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("coordinator.sock");
+        let server = RpcServer::bind(&socket, Arc::new(MultiClientGlobal::default()), 41).unwrap();
+        let monitor = server.connection_monitor();
+        let (connected_tx, connected_rx) = tokio::sync::oneshot::channel();
+        let (complete_tx, complete_rx) = tokio::sync::oneshot::channel();
+
+        let client = tokio::spawn(async move {
+            let _client = reverie_rpc_transport::RpcClient::<MultiClientGlobal>::connect(
+                &socket,
+                Tid::from_raw(707),
+            )
+            .await
+            .unwrap();
+            connected_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let completion = async move {
+            complete_rx
+                .await
+                .map_err(|error| io::Error::other(error.to_string()))
+        };
+        let mut serving = Box::pin(serve_rpc_until(
+            server,
+            None,
+            vec![monitor.clone()],
+            completion,
+        ));
+
+        let initial_poll =
+            std::future::poll_fn(|context| std::task::Poll::Ready(serving.as_mut().poll(context)))
+                .await;
+        assert!(initial_poll.is_pending());
+        connected_rx.await.unwrap();
+        assert_eq!(monitor.active_connections(), 1);
+
+        complete_tx.send(()).unwrap();
+        let drain_poll =
+            std::future::poll_fn(|context| std::task::Poll::Ready(serving.as_mut().poll(context)))
+                .await;
+        assert!(drain_poll.is_pending());
+        tokio::time::advance(Duration::from_secs(29)).await;
+        let before_deadline =
+            std::future::poll_fn(|context| std::task::Poll::Ready(serving.as_mut().poll(context)))
+                .await;
+        assert!(before_deadline.is_pending());
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let error = tokio::time::timeout(Duration::from_secs(1), serving)
+            .await
+            .expect("the production coordinator drain did not expire at 30 seconds")
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            error.to_string(),
+            "LiteInst coordinator retained 1 active RPC connection(s) for 30000ms after guest exit"
+        );
+
+        client.abort();
+        let _ = client.await;
     }
 
     #[tokio::test(flavor = "current_thread")]
