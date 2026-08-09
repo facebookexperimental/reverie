@@ -32,6 +32,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
 use reverie::Backend;
+use reverie::BackendStatsSource;
 use reverie::Error;
 use reverie::ExitStatus;
 use reverie::GlobalTool;
@@ -44,6 +45,8 @@ use reverie_rpc_transport::RpcServer;
 
 use crate::E9PATCH_SYSCALL_TRAP_MARKER;
 use crate::E9PATCH_SYSCALL_TRAP_RIP;
+use crate::E9patchBackendStatsSnapshot;
+use crate::E9patchBackendStatsSource;
 use crate::E9patchRewriter;
 
 const PRELOAD_BOOTSTRAP_MAGIC: &[u8; 16] = b"REVERIE-E9-V1\0\0\0";
@@ -552,7 +555,14 @@ impl E9patchBackend {
         mut command: Command,
         config: <T::GlobalState as GlobalTool>::Config,
         preserve_executable: bool,
-    ) -> Result<(Tracer<T::GlobalState>, ExecutableResource), Error>
+    ) -> Result<
+        (
+            Tracer<T::GlobalState>,
+            ExecutableResource,
+            E9patchBackendStatsSource,
+        ),
+        Error,
+    >
     where
         T: Tool + 'static,
     {
@@ -574,38 +584,32 @@ impl E9patchBackend {
 
         // TODO-HUMAN-REVIEW(PR-103): Review non-ELF ptrace fallback behavior.
         if !is_elf_file(&source)? {
+            let stats = E9patchBackendStatsSource::unsupported_non_elf();
             eprintln!(
-                ":: Backend: e9patch hybrid; recovered_sites=0; patched_sites=0; b0_sites=0; event_source=ptrace; controller=ptrace; ldpreload={ldpreload}; main_executable=non-ELF"
+                ":: Backend: e9patch hybrid; {}; controller=ptrace; ldpreload={ldpreload}",
+                stats.snapshot(),
             );
             command.program(&source).arg0(arg0);
             let tracer = spawn_tracer::<T>(command, config, None).await?;
-            return Ok((tracer, ExecutableResource::Original));
+            return Ok((tracer, ExecutableResource::Original, stats));
         }
 
         let prepared = E9patchRewriter::from_env()?.prepare(&source)?;
         let report = prepared.report();
         let image_entry_address = report.image_entry_address();
         let patched_site_addresses = report.patched_site_addresses().to_vec();
+        let stats = E9patchBackendStatsSource::from_report(report);
         // TODO-HUMAN-REVIEW(PR-103): Review the stable backend coverage diagnostic.
-        let event_source = if report.patched_sites() == 0 {
-            "ptrace"
-        } else {
-            "injected-trap"
-        };
         eprintln!(
-            ":: Backend: e9patch hybrid; recovered_sites={}; patched_sites={}; b0_sites={}; event_source={}; controller=ptrace; ldpreload={}",
-            report.recovered_sites(),
-            report.patched_sites(),
-            report.b0_sites(),
-            event_source,
-            ldpreload,
+            ":: Backend: e9patch hybrid; {}; controller=ptrace; ldpreload={ldpreload}",
+            stats.snapshot(),
         );
 
         // TODO-HUMAN-REVIEW(PR-103): Review zero-site original-image execution.
         if report.patched_sites() == 0 {
             command.program(&source).arg0(arg0);
             let tracer = spawn_tracer::<T>(command, config, None).await?;
-            return Ok((tracer, ExecutableResource::Original));
+            return Ok((tracer, ExecutableResource::Original, stats));
         }
 
         // E9patch's loader reopens the executable, so an anonymous memfd is not
@@ -646,7 +650,7 @@ impl E9patchBackend {
         )
         .await;
         match spawn_result {
-            Ok(tracer) => Ok((tracer, resource)),
+            Ok(tracer) => Ok((tracer, resource, stats)),
             Err(error) => {
                 let _ = resource.cleanup();
                 Err(error)
@@ -663,7 +667,7 @@ impl E9patchBackend {
     where
         T: Tool + 'static,
     {
-        let (tracer, resource) = Self::spawn::<T>(command, config, false).await?;
+        let (tracer, resource, _stats) = Self::spawn::<T>(command, config, false).await?;
         let result = tracer.wait_with_output().await;
         let cleanup = resource.cleanup();
         match (result, cleanup) {
@@ -690,7 +694,7 @@ impl E9patchBackend {
     where
         T: Tool + 'static,
     {
-        let (tracer, resource) = Self::spawn::<T>(command, config, true).await?;
+        let (tracer, resource, _stats) = Self::spawn::<T>(command, config, true).await?;
         let result = tracer.wait().await;
         let cleanup = resource.cleanup();
         match (result, cleanup) {
@@ -717,7 +721,7 @@ impl E9patchBackend {
     where
         T: Tool + 'static,
     {
-        let (tracer, resource) = Self::spawn::<T>(command, config, true).await?;
+        let (tracer, resource, _stats) = Self::spawn::<T>(command, config, true).await?;
         let result = tracer.wait_with_output().await;
         let cleanup = resource.cleanup();
         match (result, cleanup) {
@@ -1045,6 +1049,8 @@ async fn unwrap_global_after_connections<G>(mut global: Arc<G>) -> io::Result<G>
 
 #[reverie::backend(?Send)]
 impl Backend for E9patchBackend {
+    type Stats = E9patchBackendStatsSnapshot;
+
     async fn run<T>(
         command: Command,
         config: <T::GlobalState as GlobalTool>::Config,
@@ -1052,11 +1058,28 @@ impl Backend for E9patchBackend {
     where
         T: Tool + 'static,
     {
-        let (tracer, resource) = Self::spawn::<T>(command, config, false).await?;
+        let (tracer, resource, _stats) = Self::spawn::<T>(command, config, false).await?;
         let result = tracer.wait().await;
         let cleanup = resource.cleanup();
         match (result, cleanup) {
             (Ok(result), Ok(())) => Ok(result),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error.into()),
+        }
+    }
+
+    async fn run_with_stats<T>(
+        command: Command,
+        config: <T::GlobalState as GlobalTool>::Config,
+    ) -> Result<(ExitStatus, T::GlobalState, Self::Stats), Error>
+    where
+        T: Tool + 'static,
+    {
+        let (tracer, resource, stats) = Self::spawn::<T>(command, config, false).await?;
+        let result = tracer.wait().await;
+        let cleanup = resource.cleanup();
+        match (result, cleanup) {
+            (Ok((status, global)), Ok(())) => Ok((status, global, stats.backend_stats())),
             (Err(error), _) => Err(error),
             (Ok(_), Err(error)) => Err(error.into()),
         }

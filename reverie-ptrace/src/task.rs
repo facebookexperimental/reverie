@@ -71,6 +71,7 @@ use tokio::task::JoinHandle;
 use tracing::Instrument;
 
 use crate::LiteinstInstrumentationStats;
+use crate::PtraceBackendStatsSource;
 use crate::children;
 use crate::cp;
 use crate::error::Error;
@@ -852,6 +853,9 @@ struct GlobalState<G: GlobalTool> {
 
     /// Optional dynamic LiteInst runtime configuration.
     liteinst_runtime: Option<LiteinstRuntimeConfig>,
+
+    /// Optional collector for general ptrace lifecycle activity.
+    backend_stats: Option<PtraceBackendStatsSource>,
 }
 
 impl<G: GlobalTool> Clone for GlobalState<G> {
@@ -863,6 +867,7 @@ impl<G: GlobalTool> Clone for GlobalState<G> {
             sequentialized_guest: self.sequentialized_guest.clone(),
             injected_syscall_trap: self.injected_syscall_trap.clone(),
             liteinst_runtime: self.liteinst_runtime.clone(),
+            backend_stats: self.backend_stats.clone(),
         }
     }
 }
@@ -872,6 +877,7 @@ pub(crate) struct TracedTaskOptions<'a> {
     pub(crate) events: &'a Subscription,
     pub(crate) injected_syscall_trap: Option<InjectedSyscallTrap>,
     pub(crate) liteinst_runtime: Option<LiteinstRuntimeConfig>,
+    pub(crate) backend_stats: Option<PtraceBackendStatsSource>,
 }
 
 /// Our runtime representation of what Reverie knows about a guest thread. Its
@@ -1063,6 +1069,7 @@ impl<L: Tool> TracedTask<L> {
             ),
             injected_syscall_trap: options.injected_syscall_trap.clone(),
             liteinst_runtime: options.liteinst_runtime,
+            backend_stats: options.backend_stats,
         };
         let thread_state = process_state.init_thread_state(tid, None);
         let (next_state, next_state_rx) = mpsc::channel(1);
@@ -4538,6 +4545,9 @@ impl<L: Tool + 'static> TracedTask<L> {
         })?;
 
         loop {
+            if let Some(stats) = &self.global_state.backend_stats {
+                stats.record_wait(&task_state);
+            }
             // A nested handler may forward a stop it already armed before
             // inspecting the status. Accept only that exact generation/status;
             // every ordinary returned transition still requires an empty slot.
@@ -4626,6 +4636,9 @@ impl<L: Tool + 'static> TracedTask<L> {
             }
         }
 
+        if let Some(stats) = &self.global_state.backend_stats {
+            stats.record_tracee_exit();
+        }
         log_guest_exit(self.tid(), self.pid(), exit_status);
         self.tool_exit(exit_status).await?;
 

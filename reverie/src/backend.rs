@@ -40,13 +40,14 @@
 //! The [`Backend`] trait makes the minimal contract explicit and machine
 //! checked. It is intentionally small -- a real backend will usually expose a
 //! richer, backend-specific builder as well (see the "Beyond the minimal
-//! contract" section below) -- but every backend must at least be able to
-//! satisfy [`Backend::run`].
+//! contract" section below) -- but every backend must support both an ordinary
+//! [`Backend::run`] and a stats-enabled [`Backend::run_with_stats`].
 //!
 //! [reverie_ptrace]: https://docs.rs/reverie-ptrace
 
 use async_trait::async_trait;
 
+use crate::BackendStatsSnapshot;
 use crate::Error;
 use crate::ExitStatus;
 use crate::GlobalTool;
@@ -92,6 +93,9 @@ use crate::process::Command;
 /// 7. **Return the result.** When the root guest exits, yield the guest's
 ///    [`ExitStatus`] together with the (now uniquely owned) global state so the
 ///    caller can read out whatever the tool accumulated.
+/// 8. **Report backend activity on request.** The stats-enabled entry point
+///    activates the backend's real collectors and returns its typed snapshot;
+///    unsupported measurements are not encoded as zero.
 ///
 /// The associated `GlobalState` a backend must return is exactly
 /// [`T::GlobalState`](Tool::GlobalState); returning `(ExitStatus,
@@ -111,6 +115,8 @@ use crate::process::Command;
 ///
 /// #[reverie::backend(?Send)]
 /// impl Backend for MyBackend {
+///     type Stats = MyBackendStats;
+///
 ///     async fn run<T: Tool + 'static>(
 ///         command: Command,
 ///         config: <T::GlobalState as GlobalTool>::Config,
@@ -121,14 +127,31 @@ use crate::process::Command;
 ///         let tracer = SomeTracer::<T>::new(command).config(config).spawn().await?;
 ///         tracer.wait().await
 ///     }
+///
+///     async fn run_with_stats<T: Tool + 'static>(
+///         command: Command,
+///         config: <T::GlobalState as GlobalTool>::Config,
+///     ) -> Result<(ExitStatus, T::GlobalState, Self::Stats), Error> {
+///         let tracer = SomeTracer::<T>::new(command)
+///             .config(config)
+///             .collect_backend_stats()
+///             .spawn()
+///             .await?;
+///         let stats = tracer.backend_stats();
+///         let (status, global) = tracer.wait().await?;
+///         Ok((status, global, stats.snapshot()))
+///     }
 /// }
 /// ```
 ///
 /// # Beyond the minimal contract
 ///
 /// [`run`](Backend::run) is deliberately the *smallest* useful entry point: run
-/// a command under a tool and hand back the result. Real backends typically
-/// layer extra, backend-specific capabilities on top -- for example
+/// a command under a tool and hand back the result.
+/// [`run_with_stats`](Backend::run_with_stats) adds an explicit, typed
+/// observation path without imposing collection cost on an ordinary run. Real
+/// backends typically layer extra, backend-specific capabilities on top -- for
+/// example
 /// `reverie-ptrace` additionally offers output capture, a GDB server, and
 /// spawning a *function* (rather than a `Command`) under instrumentation. Those
 /// live on the backend's own builder type; this trait only fixes the common
@@ -142,9 +165,17 @@ use crate::process::Command;
 /// The returned future is **not** required to be [`Send`]. The reference
 /// `ptrace` backend is inherently single-threaded -- all ptrace operations for
 /// a guest must happen on one thread -- so requiring `Send` would exclude it.
-/// Drive [`run`](Backend::run) on a current-thread (`LocalSet`) executor.
+/// Drive [`run`](Backend::run) and [`run_with_stats`](Backend::run_with_stats)
+/// on a current-thread (`LocalSet`) executor.
 #[async_trait(?Send)]
 pub trait Backend {
+    /// Typed, displayable statistics produced by this backend.
+    ///
+    /// This type is backend-specific so a metric that the backend cannot
+    /// measure is absent from its schema instead of being reported as a
+    /// misleading zero.
+    type Stats: BackendStatsSnapshot;
+
     /// Run `command` as the root of a guest process tree, instrumented by the
     /// tool `T`, and drive it to completion.
     ///
@@ -161,6 +192,19 @@ pub trait Backend {
         command: Command,
         config: <T::GlobalState as GlobalTool>::Config,
     ) -> Result<(ExitStatus, T::GlobalState), Error>
+    where
+        T: Tool + 'static;
+
+    /// Run `command` while collecting real backend activity statistics.
+    ///
+    /// Implementors must enable their backend's collector and return the
+    /// resulting snapshot. There is deliberately no default implementation:
+    /// an empty snapshot must never stand in for unsupported collection, and
+    /// a reported zero must mean that the measured event did not occur.
+    async fn run_with_stats<T>(
+        command: Command,
+        config: <T::GlobalState as GlobalTool>::Config,
+    ) -> Result<(ExitStatus, T::GlobalState, Self::Stats), Error>
     where
         T: Tool + 'static;
 }

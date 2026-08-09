@@ -71,6 +71,7 @@ use tokio::sync::mpsc;
 
 use crate::LiteinstInstrumentationStats;
 use crate::LiteinstInstrumentationStatsHandle;
+use crate::PtraceBackendStatsSource;
 use crate::cp;
 use crate::gdbstub::GdbServer;
 use crate::task::Child;
@@ -109,6 +110,9 @@ pub struct Tracer<G> {
     // ptrace and e9patch lifecycles retain their existing teardown behavior.
     liteinst_cleanup: Option<LiteinstTraceeCleanup>,
     liteinst_instrumentation_stats: Option<Arc<StdMutex<LiteinstInstrumentationStats>>>,
+
+    // Present only when the caller requested general ptrace activity stats.
+    backend_stats: Option<PtraceBackendStatsSource>,
 }
 
 struct LiteinstTraceeCleanup {
@@ -1387,6 +1391,11 @@ impl<G: Default> Tracer<G> {
             .map(|stats| LiteinstInstrumentationStatsHandle::from_shared(Arc::clone(stats)))
     }
 
+    /// Returns the live ptrace activity-statistics source when collection was enabled.
+    pub fn backend_stats(&self) -> Option<PtraceBackendStatsSource> {
+        self.backend_stats.clone()
+    }
+
     /// Simultaneously waits for the tracee to exit and collect all remaining
     /// output on the stdout/stderr handles, returning an `Output` instance.
     ///
@@ -1717,9 +1726,7 @@ async fn postspawn<L: Tool + 'static>(
     child: Running,
     gref: Arc<L::GlobalState>,
     config: <L::GlobalState as GlobalTool>::Config,
-    events: &Subscription,
-    injected_syscall_trap: Option<InjectedSyscallTrap>,
-    liteinst_runtime: Option<LiteinstRuntimeConfig>,
+    options: TracedTaskOptions<'_>,
     gdbserver: Option<GdbServer>,
 ) -> Result<BoxFuture<'static, Result<ExitStatus, Error>>, TraceError> {
     let pid = child.pid();
@@ -1756,11 +1763,7 @@ async fn postspawn<L: Tool + 'static>(
         pid,
         config,
         gref,
-        TracedTaskOptions {
-            events,
-            injected_syscall_trap,
-            liteinst_runtime,
-        },
+        options,
         orphan_sender,
         daemon_kill,
         gdbserver,
@@ -1847,6 +1850,9 @@ pub struct TracerBuilder<T: Tool + 'static> {
 
     /// Dynamic LiteInst runtime handshake and hot-site configuration.
     liteinst_runtime: Option<LiteinstRuntimeConfig>,
+
+    /// Whether to collect general ptrace activity statistics.
+    backend_stats_request: BackendStatsRequest,
 }
 
 impl<T: Tool + 'static> TracerBuilder<T> {
@@ -1859,6 +1865,7 @@ impl<T: Tool + 'static> TracerBuilder<T> {
             sequentialized_guest: false,
             injected_syscall_trap: None,
             liteinst_runtime: None,
+            backend_stats_request: BackendStatsRequest::DISABLED,
         }
     }
 
@@ -1887,6 +1894,12 @@ impl<T: Tool + 'static> TracerBuilder<T> {
     /// sequentializes thread execution. This helps avoid deadlocks.
     pub fn sequentialized_guest(mut self) -> Self {
         self.sequentialized_guest = true;
+        self
+    }
+
+    /// Enables or disables general ptrace activity statistics for this run.
+    pub fn backend_stats(mut self, request: BackendStatsRequest) -> Self {
+        self.backend_stats_request = request;
         self
     }
 
@@ -2227,6 +2240,7 @@ impl<T: Tool + 'static> TracerBuilder<T> {
                 Errno::ENOTSUPP
             )));
         }
+        let backend_stats = PtraceBackendStatsSource::from_request(self.backend_stats_request);
         let mut command = self.command;
         let config = self.config.unwrap_or_default();
         let liteinst_fail_closed = self.liteinst_runtime.is_some();
@@ -2370,9 +2384,12 @@ impl<T: Tool + 'static> TracerBuilder<T> {
             running_child,
             gref.clone(),
             config,
-            &events,
-            self.injected_syscall_trap,
-            self.liteinst_runtime,
+            TracedTaskOptions {
+                events: &events,
+                injected_syscall_trap: self.injected_syscall_trap,
+                liteinst_runtime: self.liteinst_runtime,
+                backend_stats: backend_stats.clone(),
+            },
             gdbserver,
         )
         .await
@@ -2412,6 +2429,7 @@ impl<T: Tool + 'static> TracerBuilder<T> {
             stderr,
             liteinst_cleanup,
             liteinst_instrumentation_stats,
+            backend_stats,
         })
     }
 }
@@ -2517,9 +2535,12 @@ where
                 child,
                 gref.clone(),
                 config,
-                &events,
-                None,
-                None,
+                TracedTaskOptions {
+                    events: &events,
+                    injected_syscall_trap: None,
+                    liteinst_runtime: None,
+                    backend_stats: None,
+                },
                 None,
             )
             .await
@@ -2537,6 +2558,7 @@ where
                 stderr: Some(stderr),
                 liteinst_cleanup: None,
                 liteinst_instrumentation_stats: None,
+                backend_stats: None,
             })
         }
     }

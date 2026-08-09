@@ -30,6 +30,7 @@ use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
 use reverie_e9patch::BuiltinTool;
 use reverie_e9patch::E9patchBackend;
+use reverie_e9patch::E9patchRewriteSupport;
 use reverie_e9patch::E9patchRewriter;
 use reverie_e9patch::configure_guest_builtin;
 
@@ -255,6 +256,20 @@ async fn rewritten_rt_sigreturn_uses_the_original_signal_frame() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[ignore = "requires a built e9tool/e9patch pair and a ptrace-capable host"]
+async fn elf_stats_report_measured_coverage_even_when_counts_are_zero() {
+    let (status, (), stats) = E9patchBackend::run_with_stats::<()>(Command::new("/bin/true"), ())
+        .await
+        .unwrap();
+
+    assert_eq!(status, ExitStatus::Exited(0));
+    assert_eq!(stats.rewrite_support(), E9patchRewriteSupport::Measured);
+    assert!(stats.recovered_sites().is_some());
+    assert!(stats.patched_sites().is_some());
+    assert!(stats.b0_sites().is_some());
+}
+
+#[tokio::test(flavor = "current_thread")]
 #[ignore = "requires a built e9tool/e9patch pair and a C compiler"]
 async fn direct_builtin_passthrough_handles_far_rt_sigreturn_site() {
     let (_directory, guest) = materialize_prepared_fixture("direct_rt_sigreturn.c");
@@ -340,8 +355,14 @@ async fn non_elf_script_uses_ptrace_fallback() {
     permissions.set_mode(0o755);
     fs::set_permissions(&guest, permissions).unwrap();
 
-    let (status, ()) = E9patchBackend::run::<()>(Command::new(guest), ())
+    let (status, (), stats) = E9patchBackend::run_with_stats::<()>(Command::new(guest), ())
         .await
         .unwrap();
     assert_eq!(status, ExitStatus::Exited(0));
+    assert_eq!(
+        stats.rewrite_support(),
+        E9patchRewriteSupport::UnsupportedNonElf
+    );
+    assert_eq!(stats.recovered_sites(), None);
+    assert_eq!(stats.patched_sites(), None);
 }

@@ -60,6 +60,7 @@ pub mod dispatch;
 mod rewrite;
 mod rpc;
 pub mod runtime;
+mod stats;
 mod tool_host;
 
 pub use backend::E9patchBackend;
@@ -87,6 +88,10 @@ pub use runtime::TOOL_PASSTHROUGH;
 pub use runtime::TOOL_SPOOF_GETPID;
 pub use runtime::alt_stack_from_env_value;
 pub use runtime::builtin_tool_from_env_value;
+pub use stats::E9patchBackendStatsSnapshot;
+pub use stats::E9patchBackendStatsSource;
+pub use stats::E9patchEventSource;
+pub use stats::E9patchRewriteSupport;
 pub use tool_host::install_tool;
 pub use tool_host::install_tool_from_bootstrap;
 

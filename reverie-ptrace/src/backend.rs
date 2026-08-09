@@ -9,12 +9,15 @@
 //! The ptrace backend's implementation of the [`reverie::Backend`] contract.
 
 use reverie::Backend;
+use reverie::BackendStatsRequest;
+use reverie::BackendStatsSource;
 use reverie::Error;
 use reverie::ExitStatus;
 use reverie::GlobalTool;
 use reverie::Tool;
 use reverie::process::Command;
 
+use crate::PtraceBackendStatsSnapshot;
 use crate::TracerBuilder;
 
 /// The reference Reverie backend: supervises the guest with `ptrace` + `seccomp`
@@ -45,6 +48,8 @@ pub struct PtraceBackend;
 
 #[reverie::backend(?Send)]
 impl Backend for PtraceBackend {
+    type Stats = PtraceBackendStatsSnapshot;
+
     async fn run<T>(
         command: Command,
         config: <T::GlobalState as GlobalTool>::Config,
@@ -61,5 +66,43 @@ impl Backend for PtraceBackend {
             .spawn()
             .await?;
         tracer.wait().await
+    }
+
+    async fn run_with_stats<T>(
+        command: Command,
+        config: <T::GlobalState as GlobalTool>::Config,
+    ) -> Result<(ExitStatus, T::GlobalState, Self::Stats), Error>
+    where
+        T: Tool + 'static,
+    {
+        let tracer = TracerBuilder::<T>::new(command)
+            .config(config)
+            .backend_stats(BackendStatsRequest::ENABLED)
+            .spawn()
+            .await?;
+        let stats = tracer
+            .backend_stats()
+            .expect("enabled ptrace run must create an activity-statistics source");
+        let (status, global) = tracer.wait().await?;
+        Ok((status, global, stats.backend_stats()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stats_run_observes_real_tracee_activity() {
+        let (status, (), stats) =
+            PtraceBackend::run_with_stats::<()>(Command::new("/bin/true"), ())
+                .await
+                .unwrap();
+
+        assert_eq!(status, ExitStatus::Exited(0));
+        assert_eq!(stats.tracees_started(), 1);
+        assert!(stats.stop_events() > 0);
+        assert_eq!(stats.exited_tracees(), 1);
+        assert!(stats.exec_stops() > 0);
     }
 }

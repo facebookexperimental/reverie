@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use reverie::Backend;
 use reverie::BackendStatsRequest;
+use reverie::BackendStatsSource;
 use reverie::Error;
 use reverie::ExitStatus;
 use reverie::GlobalTool;
@@ -586,6 +587,8 @@ fn inherit_stdio(command: &mut Command) {
 
 #[reverie::backend(?Send)]
 impl Backend for LiteinstBackend {
+    type Stats = crate::LiteinstBackendStatsSnapshot;
+
     async fn run<T>(
         command: Command,
         config: <T::GlobalState as GlobalTool>::Config,
@@ -595,6 +598,19 @@ impl Backend for LiteinstBackend {
     {
         let preload = tool_preload_path()?;
         Self::run_with_preload::<T>(command, config, preload).await
+    }
+
+    async fn run_with_stats<T>(
+        command: Command,
+        config: <T::GlobalState as GlobalTool>::Config,
+    ) -> Result<(ExitStatus, T::GlobalState, Self::Stats), Error>
+    where
+        T: Tool + 'static,
+    {
+        let preload = tool_preload_path()?;
+        let (status, global, stats) =
+            Self::run_with_preload_and_stats::<T>(command, config, preload).await?;
+        Ok((status, global, stats.backend_stats()))
     }
 }
 
