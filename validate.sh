@@ -108,10 +108,7 @@ VALIDATION_STARTED_EPOCH=$(date +%s)
 VALIDATION_HOST=$(hostname -s 2>/dev/null || hostname 2>/dev/null || printf unknown)
 DEV_HERMIT_PARENT=$(find_dev_hermit_parent || true)
 VALIDATION_SLOT=$(validation_slot_name "$DEV_HERMIT_PARENT")
-VALIDATION_LEDGER_FILE=${REVERIE_VALIDATE_LEDGER:-}
-if [[ -z $VALIDATION_LEDGER_FILE && -n $DEV_HERMIT_PARENT ]]; then
-    VALIDATION_LEDGER_FILE="$DEV_HERMIT_PARENT/ignored/validate-run-ledger.jsonl"
-fi
+VALIDATION_LEDGER_TOOL="${HOME:?HOME is required}/work/dev-hermit/ci-hub/ledger/validate_rows.py"
 VALIDATION_COMMIT=$(git rev-parse HEAD 2>/dev/null || printf unknown)
 VALIDATION_GIT_DEPTH=$(git rev-list --count HEAD 2>/dev/null || printf 0)
 VALIDATION_GIT_AHEAD=0
@@ -138,14 +135,10 @@ else
 fi
 VALIDATION_CPU_TIMES_FILE=$(mktemp "${TMPDIR:-/tmp}/reverie-validate-cpu.XXXXXX")
 readonly VALIDATION_STARTED_AT VALIDATION_STARTED_EPOCH VALIDATION_HOST
-readonly DEV_HERMIT_PARENT VALIDATION_SLOT VALIDATION_LEDGER_FILE
+readonly DEV_HERMIT_PARENT VALIDATION_SLOT VALIDATION_LEDGER_TOOL
 readonly VALIDATION_COMMIT VALIDATION_GIT_DEPTH VALIDATION_GIT_AHEAD
 readonly VALIDATION_GIT_BEHIND VALIDATION_TREE_DIRTY VALIDATION_COMMIT_ANCHORED
 readonly VALIDATION_CACHE_STATE VALIDATION_CPU_TIMES_FILE
-
-if [[ -z $VALIDATION_LEDGER_FILE ]]; then
-    printf 'No validation ledger: standalone Reverie checkout; dev-hermit parent is absent.\n'
-fi
 
 record_ledger_gate() {
     ledger_gate_names+=("$1")
@@ -170,8 +163,6 @@ append_validation_ledger() {
     local commit_anchored_json tree_dirty_json
     local executed_tests filtered_tests
     local i
-
-    [[ -n $VALIDATION_LEDGER_FILE ]] || return 0
 
     finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     if ((exit_status == 0 && failures == 0)); then
@@ -230,22 +221,11 @@ append_validation_ledger() {
     line+="\"real_seconds\":$wall_seconds,\"user_seconds\":$cpu_user,\"sys_seconds\":$cpu_sys,"
     line+="\"log_file\":$(json_quote "$LOG_FILE"),\"gates\":$gates_json}"
 
-    if ! mkdir -p "$(dirname -- "$VALIDATION_LEDGER_FILE")"; then
-        printf 'WARN: unable to create validation ledger directory for %s\n' \
-            "$VALIDATION_LEDGER_FILE" >&2
-        return 0
-    fi
-    if command -v flock >/dev/null 2>&1; then
-        if ! (
-            flock -x 9
-            printf '%s\n' "$line" >&9
-        ) 9>>"$VALIDATION_LEDGER_FILE"; then
-            printf 'WARN: unable to append validation ledger %s\n' \
-                "$VALIDATION_LEDGER_FILE" >&2
-        fi
-    elif ! printf '%s\n' "$line" >>"$VALIDATION_LEDGER_FILE"; then
-        printf 'WARN: unable to append validation ledger %s\n' \
-            "$VALIDATION_LEDGER_FILE" >&2
+    if [[ ! -r $VALIDATION_LEDGER_TOOL ]]; then
+        printf 'WARN: canonical validation ledger writer is unavailable at %s\n' \
+            "$VALIDATION_LEDGER_TOOL" >&2
+    elif ! printf '%s\n' "$line" | python3 "$VALIDATION_LEDGER_TOOL" record >/dev/null; then
+        printf 'WARN: canonical validation ledger writer refused the row\n' >&2
     fi
 }
 
