@@ -951,6 +951,94 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn coordinator_two_monitor_drain_is_level_triggered() {
+        let directory = tempfile::tempdir().unwrap();
+        let main_socket = directory.path().join("coordinator.sock");
+        let stats_socket = directory.path().join("stats.sock");
+        let main_server =
+            RpcServer::bind(&main_socket, Arc::new(MultiClientGlobal::default()), 41).unwrap();
+        let stats_server = RpcServer::bind(
+            &stats_socket,
+            Arc::new(crate::stats::LiteinstStatsGlobal::default()),
+            (),
+        )
+        .unwrap();
+        let main_monitor = main_server.connection_monitor();
+        let stats_monitor = stats_server.connection_monitor();
+        let connection_monitors = vec![main_monitor.clone(), stats_monitor.clone()];
+        let (main_connected_tx, main_connected_rx) = tokio::sync::oneshot::channel();
+        let (stats_connected_tx, stats_connected_rx) = tokio::sync::oneshot::channel();
+        let (release_main_tx, release_main_rx) = tokio::sync::oneshot::channel();
+        let (complete_tx, complete_rx) = tokio::sync::oneshot::channel();
+
+        let main_client = tokio::spawn(async move {
+            let client = reverie_rpc_transport::RpcClient::<MultiClientGlobal>::connect(
+                &main_socket,
+                Tid::from_raw(404),
+            )
+            .await
+            .unwrap();
+            main_connected_tx.send(()).unwrap();
+            release_main_rx.await.unwrap();
+            drop(client);
+        });
+        let stats_client = tokio::spawn(async move {
+            let client =
+                reverie_rpc_transport::RpcClient::<crate::stats::LiteinstStatsGlobal>::connect(
+                    &stats_socket,
+                    Tid::from_raw(405),
+                )
+                .await
+                .unwrap();
+            stats_connected_tx.send(()).unwrap();
+            drop(client);
+        });
+        let completion = async move {
+            complete_rx
+                .await
+                .map_err(|error| io::Error::other(error.to_string()))
+        };
+        let mut serving = Box::pin(serve_rpc_until_with_timeout(
+            main_server,
+            Some(stats_server),
+            connection_monitors,
+            completion,
+            Duration::from_secs(1),
+        ));
+
+        let initial_poll =
+            std::future::poll_fn(|context| std::task::Poll::Ready(serving.as_mut().poll(context)))
+                .await;
+        assert!(initial_poll.is_pending());
+        main_connected_rx.await.unwrap();
+        stats_connected_rx.await.unwrap();
+        stats_client.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while stats_monitor.active_connections() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the stats connection did not close before the drain began");
+        assert_eq!(main_monitor.active_connections(), 1);
+        assert_eq!(stats_monitor.active_connections(), 0);
+
+        complete_tx.send(()).unwrap();
+        let drain_poll =
+            std::future::poll_fn(|context| std::task::Poll::Ready(serving.as_mut().poll(context)))
+                .await;
+        assert!(drain_poll.is_pending());
+        assert_eq!(main_monitor.active_connections(), 1);
+
+        release_main_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), serving)
+            .await
+            .expect("the two-monitor coordinator drain hung")
+            .unwrap();
+        main_client.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn coordinator_connection_drain_is_bounded() {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("coordinator.sock");
