@@ -89,7 +89,8 @@ fn main() {
         .expect("system time predates the Unix epoch")
         .as_secs();
 
-    let _invalid_install = if install_dir.exists() && !install_is_usable(&install_dir) {
+    let _invalid_install = if install_dir.exists() && !install_is_usable(&install_dir, &source_key)
+    {
         println!(
             "cargo:warning=DynamoRIO build cache INVALID key=sha256:{source_key} install={}; rebuilding",
             install_dir.display()
@@ -99,7 +100,7 @@ fn main() {
         None
     };
 
-    if !install_is_usable(&install_dir) {
+    if !install_is_usable(&install_dir, &source_key) {
         println!(
             "cargo:warning=DynamoRIO build cache MISS key=sha256:{source_key} observed_unix_seconds={observed_at}"
         );
@@ -113,13 +114,13 @@ fn main() {
             &cmake,
             generator.as_deref(),
         );
-        write_install_manifest(&staged_install);
+        write_install_attestation(&staged_install, &source_key);
         assert!(
-            install_is_usable(&staged_install),
+            install_is_usable(&staged_install, &source_key),
             "DynamoRIO source build produced an incomplete install at {}",
             staged_install.display()
         );
-        let published = publish_install(&staged_install, &install_dir);
+        let published = publish_install(&staged_install, &install_dir, &source_key);
         println!(
             "cargo:warning=DynamoRIO build cache {} key=sha256:{source_key} install={}",
             if published { "PUBLISHED" } else { "RACE-HIT" },
@@ -204,8 +205,10 @@ const ELF_INSTALL_ARTIFACTS: &[&str] = &[
     "ext/lib64/release/libdrx.so",
 ];
 const INSTALL_MANIFEST: &str = ".reverie-dbt-install.sha256";
+const INSTALL_PROVENANCE: &str = ".reverie-dbt-install.provenance";
+const INSTALL_PROVENANCE_SCHEMA: &str = "reverie-dbt-dynamorio-install-v1";
 
-fn install_is_usable(install_dir: &Path) -> bool {
+fn install_is_usable(install_dir: &Path, expected_source_key: &str) -> bool {
     let artifacts_present = REQUIRED_INSTALL_ARTIFACTS.iter().all(|relative| {
         install_dir
             .join(relative)
@@ -219,14 +222,27 @@ fn install_is_usable(install_dir: &Path) -> bool {
         .join("bin64/drrun")
         .metadata()
         .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0);
-    drrun_executable
-        && ELF_INSTALL_ARTIFACTS
+    if !drrun_executable
+        || !ELF_INSTALL_ARTIFACTS
             .iter()
             .all(|relative| has_elf_magic(&install_dir.join(relative)))
-        && fs::read_to_string(install_dir.join(INSTALL_MANIFEST))
+    {
+        return false;
+    }
+
+    let Some((recorded_manifest, actual_manifest, recorded_provenance)) =
+        fs::read_to_string(install_dir.join(INSTALL_MANIFEST))
             .ok()
             .zip(install_manifest_contents(install_dir).ok())
-            .is_some_and(|(recorded, actual)| recorded == actual)
+            .zip(fs::read_to_string(install_dir.join(INSTALL_PROVENANCE)).ok())
+            .map(|((recorded, actual), provenance)| (recorded, actual, provenance))
+    else {
+        return false;
+    };
+    if recorded_manifest != actual_manifest {
+        return false;
+    }
+    recorded_provenance == install_provenance(expected_source_key, &recorded_manifest)
 }
 
 fn has_elf_magic(path: &Path) -> bool {
@@ -235,7 +251,7 @@ fn has_elf_magic(path: &Path) -> bool {
         .is_some_and(|contents| contents.starts_with(b"\x7fELF"))
 }
 
-fn write_install_manifest(install_dir: &Path) {
+fn write_install_attestation(install_dir: &Path, source_key: &str) {
     let contents = install_manifest_contents(install_dir).unwrap_or_else(|error| {
         panic!(
             "failed to inventory DynamoRIO install {}: {error}",
@@ -248,6 +264,25 @@ fn write_install_manifest(install_dir: &Path) {
             install_dir.display()
         )
     });
+    let manifest = fs::read_to_string(install_dir.join(INSTALL_MANIFEST))
+        .expect("the just-written DynamoRIO install manifest must be readable");
+    fs::write(
+        install_dir.join(INSTALL_PROVENANCE),
+        install_provenance(source_key, &manifest),
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "failed to write DynamoRIO install provenance in {}: {error}",
+            install_dir.display()
+        )
+    });
+}
+
+fn install_provenance(source_key: &str, manifest: &str) -> String {
+    let manifest_digest = Sha256::digest(manifest.as_bytes());
+    format!(
+        "schema={INSTALL_PROVENANCE_SCHEMA}\nsource_recipe_sha256={source_key}\nmanifest_sha256={manifest_digest:x}\n"
+    )
 }
 
 fn install_manifest_contents(install_dir: &Path) -> io::Result<String> {
@@ -258,7 +293,8 @@ fn install_manifest_contents(install_dir: &Path) -> io::Result<String> {
         paths.sort();
         for path in paths {
             let relative = path.strip_prefix(root).map_err(io::Error::other)?;
-            if relative == Path::new(INSTALL_MANIFEST) {
+            if relative == Path::new(INSTALL_MANIFEST) || relative == Path::new(INSTALL_PROVENANCE)
+            {
                 continue;
             }
             let file_type = fs::symlink_metadata(&path)?.file_type();
@@ -298,24 +334,38 @@ fn install_manifest_contents(install_dir: &Path) -> io::Result<String> {
 /// Two Cargo invocations can miss simultaneously. They may both do temporary
 /// work, but directory rename ensures consumers observe either no cache entry
 /// or one complete immutable install. The loser verifies and reuses the winner.
-fn publish_install(staged_install: &Path, install_dir: &Path) -> bool {
+fn publish_install(staged_install: &Path, install_dir: &Path, source_key: &str) -> bool {
+    publish_install_after_precheck(staged_install, install_dir, source_key, || {})
+}
+
+fn publish_install_after_precheck<F>(
+    staged_install: &Path,
+    install_dir: &Path,
+    source_key: &str,
+    after_precheck: F,
+) -> bool
+where
+    F: FnOnce(),
+{
     assert!(
-        install_is_usable(staged_install),
+        install_is_usable(staged_install, source_key),
         "refusing to publish incomplete DynamoRIO install {}",
         staged_install.display()
     );
-    if install_is_usable(install_dir) {
-        return false;
+    if install_dir.exists() {
+        if install_is_usable(install_dir, source_key) {
+            return false;
+        }
+        panic!(
+            "refusing to replace incomplete DynamoRIO cache entry {}",
+            install_dir.display()
+        );
     }
-    assert!(
-        !install_dir.exists(),
-        "refusing to replace incomplete DynamoRIO cache entry {}",
-        install_dir.display()
-    );
+    after_precheck();
 
     match fs::rename(staged_install, install_dir) {
         Ok(()) => true,
-        Err(error) if install_is_usable(install_dir) => {
+        Err(error) if install_is_usable(install_dir, source_key) => {
             println!(
                 "cargo:warning=another builder published the DynamoRIO cache entry first: {error}"
             );
@@ -381,7 +431,9 @@ impl StagingDirectory {
             }
             match fs::rename(install_dir, &path) {
                 Ok(()) => return Some(Self { path }),
-                Err(_) if !install_dir.exists() || install_is_usable(install_dir) => return None,
+                Err(_) if !install_dir.exists() || install_is_usable(install_dir, source_key) => {
+                    return None;
+                }
                 Err(error) => panic!(
                     "failed to quarantine unusable DynamoRIO cache entry {} -> {}: {error}",
                     install_dir.display(),
@@ -563,6 +615,9 @@ fn required_env(name: &str) -> OsString {
 mod tests {
     use super::*;
 
+    const TEST_SOURCE_KEY: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
     #[test]
     fn source_recipe_key_changes_with_source_or_recipe() {
         let directory = tempfile::tempdir().unwrap();
@@ -622,7 +677,12 @@ mod tests {
             if ELF_INSTALL_ARTIFACTS.contains(relative) {
                 fs::write(
                     &artifact,
-                    [b"\x7fELF".as_slice(), marker.as_bytes()].concat(),
+                    [
+                        b"\x7fELF".as_slice(),
+                        relative.as_bytes(),
+                        marker.as_bytes(),
+                    ]
+                    .concat(),
                 )
                 .unwrap();
             } else {
@@ -633,7 +693,7 @@ mod tests {
         let mut permissions = drrun.metadata().unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(drrun, permissions).unwrap();
-        write_install_manifest(path);
+        write_install_attestation(path, TEST_SOURCE_KEY);
     }
 
     #[test]
@@ -645,8 +705,8 @@ mod tests {
         complete_fixture(&first, "first");
         complete_fixture(&second, "second");
 
-        assert!(publish_install(&first, &published));
-        assert!(!publish_install(&second, &published));
+        assert!(publish_install(&first, &published, TEST_SOURCE_KEY));
+        assert!(!publish_install(&second, &published, TEST_SOURCE_KEY));
         assert!(
             fs::read_to_string(published.join("bin64/drrun"))
                 .unwrap()
@@ -671,19 +731,79 @@ mod tests {
         let (first_won, second_won) = std::thread::scope(|scope| {
             let first_thread = scope.spawn(|| {
                 barrier.wait();
-                publish_install(&first, &published)
+                publish_install(&first, &published, TEST_SOURCE_KEY)
             });
             let second_thread = scope.spawn(|| {
                 barrier.wait();
-                publish_install(&second, &published)
+                publish_install(&second, &published, TEST_SOURCE_KEY)
             });
             (first_thread.join().unwrap(), second_thread.join().unwrap())
         });
 
         assert_ne!(first_won, second_won, "exactly one publisher must win");
-        assert!(install_is_usable(&published));
+        assert!(install_is_usable(&published, TEST_SOURCE_KEY));
         let marker = fs::read_to_string(published.join("bin64/drrun")).unwrap();
         assert!(marker.ends_with("first") || marker.ends_with("second"));
+    }
+
+    #[test]
+    fn publisher_losing_after_precheck_reuses_winner_without_panicking() {
+        let directory = tempfile::tempdir().unwrap();
+        let winner = directory.path().join("winner");
+        let loser = directory.path().join("loser");
+        let published = directory.path().join("published");
+        complete_fixture(&winner, "winner");
+        complete_fixture(&loser, "loser");
+
+        let loser_won = publish_install_after_precheck(&loser, &published, TEST_SOURCE_KEY, || {
+            assert!(publish_install(&winner, &published, TEST_SOURCE_KEY))
+        });
+
+        assert!(
+            !loser_won,
+            "the publisher that lost the race must fall back"
+        );
+        assert!(loser.exists(), "the loser must retain its staging tree");
+        assert!(install_is_usable(&published, TEST_SOURCE_KEY));
+        assert!(
+            fs::read_to_string(published.join("bin64/drrun"))
+                .unwrap()
+                .ends_with("winner")
+        );
+    }
+
+    #[test]
+    fn self_consistent_wrong_elf_does_not_match_publisher_provenance() {
+        let directory = tempfile::tempdir().unwrap();
+        let install = directory.path().join("install");
+        complete_fixture(&install, "correct");
+        assert!(install_is_usable(&install, TEST_SOURCE_KEY));
+
+        fs::copy(
+            install.join("lib64/release/libdrpreload.so"),
+            install.join("lib64/release/libdynamorio.so"),
+        )
+        .unwrap();
+        let forged_manifest = install_manifest_contents(&install).unwrap();
+        fs::write(install.join(INSTALL_MANIFEST), forged_manifest).unwrap();
+
+        assert!(
+            !install_is_usable(&install, TEST_SOURCE_KEY),
+            "regenerating a self-consistent inventory must not rewrite publisher provenance"
+        );
+    }
+
+    #[test]
+    fn attestation_is_bound_to_the_expected_source_recipe() {
+        let directory = tempfile::tempdir().unwrap();
+        let install = directory.path().join("install");
+        complete_fixture(&install, "correct");
+
+        assert!(install_is_usable(&install, TEST_SOURCE_KEY));
+        assert!(!install_is_usable(
+            &install,
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        ));
     }
 
     #[test]
@@ -694,7 +814,7 @@ mod tests {
         let incomplete = directory.path().join("incomplete");
         complete_fixture(&staged, "complete");
         fs::create_dir(&incomplete).unwrap();
-        publish_install(&staged, &incomplete);
+        publish_install(&staged, &incomplete, TEST_SOURCE_KEY);
     }
 
     #[test]
@@ -703,18 +823,18 @@ mod tests {
         let cache = directory.path().join("cache");
         let install = cache.join("dynamorio-install-key");
         complete_fixture(&install, "original");
-        assert!(install_is_usable(&install));
+        assert!(install_is_usable(&install, TEST_SOURCE_KEY));
 
         fs::remove_file(install.join("lib64/release/libdynamorio.so")).unwrap();
-        assert!(!install_is_usable(&install));
+        assert!(!install_is_usable(&install, TEST_SOURCE_KEY));
         let quarantined = StagingDirectory::quarantine(&cache, &install, "key")
             .expect("the unusable entry must be quarantined");
         assert!(!install.exists());
 
         let staged = directory.path().join("replacement");
         complete_fixture(&staged, "replacement");
-        assert!(publish_install(&staged, &install));
-        assert!(install_is_usable(&install));
+        assert!(publish_install(&staged, &install, TEST_SOURCE_KEY));
+        assert!(install_is_usable(&install, TEST_SOURCE_KEY));
         drop(quarantined);
     }
 
