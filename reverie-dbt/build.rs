@@ -499,6 +499,34 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_publishers_produce_one_complete_winner() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        let published = directory.path().join("published");
+        complete_fixture(&first, "first");
+        complete_fixture(&second, "second");
+        let barrier = std::sync::Barrier::new(2);
+
+        let (first_won, second_won) = std::thread::scope(|scope| {
+            let first_thread = scope.spawn(|| {
+                barrier.wait();
+                publish_install(&first, &published)
+            });
+            let second_thread = scope.spawn(|| {
+                barrier.wait();
+                publish_install(&second, &published)
+            });
+            (first_thread.join().unwrap(), second_thread.join().unwrap())
+        });
+
+        assert_ne!(first_won, second_won, "exactly one publisher must win");
+        assert!(install_is_complete(&published));
+        let marker = fs::read_to_string(published.join("bin64/drrun")).unwrap();
+        assert!(marker == "first" || marker == "second");
+    }
+
+    #[test]
     #[should_panic(expected = "refusing to replace incomplete DynamoRIO cache entry")]
     fn incomplete_cache_entry_fails_closed() {
         let directory = tempfile::tempdir().unwrap();
