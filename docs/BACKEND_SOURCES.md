@@ -3,8 +3,8 @@
 Reverie's optional native backend dependencies have two representations. The
 `third-party/` git submodules are developer reference checkouts. The Cargo
 packages redistribute curated pinned source under their own `vendor/`
-directories and build only that source inside Cargo `OUT_DIR`; Cargo does not
-initialize or read the submodules.
+directories and build only that source in Cargo target-local scratch/cache
+directories; Cargo does not initialize or read the submodules.
 
 | Backend | Path | Pinned revision | License |
 | --- | --- | --- | --- |

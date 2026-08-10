@@ -34,16 +34,20 @@ revision recorded in `vendor/dynamorio/REVISION`. Build normally:
 cargo build -p reverie-dbt
 ```
 
-Cargo configures, builds, and installs the pinned source inside the package's
-`OUT_DIR`; it never mutates its source checkout and does not fetch a runtime or
-source bundle. No external SDK or `DYNAMORIO_HOME` is used. The vendored tree is
+Cargo configures and builds the pinned source in a temporary directory beside
+the package `OUT_DIR`, then atomically publishes a content-addressed install in
+the Cargo target profile. Distinct package fingerprints (such as `cargo build`
+and `cargo doc`) reuse that immutable install; it never mutates its source
+checkout and does not fetch a runtime or source bundle. No external SDK or
+`DYNAMORIO_HOME` is used. The vendored tree is
 pruned to DynamoRIO core, deployment tools, build support, and the five
 extensions used by the native client (`drcontainers`, `drmgr`, `drreg`, `drwrap`,
 and `drx`).
 
-The first build compiles DynamoRIO in Cargo's package `OUT_DIR` with its tests,
-samples, and documentation disabled. Cargo reuses that install until the build
-script or pinned submodule revision changes.
+The first build compiles DynamoRIO with its tests, samples, and documentation
+disabled. Cargo reuses that install until the build script, build tool recipe,
+or pinned source changes. Concurrent first builds publish by atomic rename, so
+no consumer can observe or overwrite a partial install.
 
 Clean CI builds enforce a concurrency-normalized source-build ratchet. Three
 clean builds measured on 2026-08-03 were 13.91s and 14.54s with 16 jobs on

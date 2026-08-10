@@ -36,7 +36,7 @@ jobs:
     - name: Cache DynamoRIO build
       uses: actions/cache@v4
       with:
-        path: target/*/build/reverie-dbt-*/out/dynamorio-install-*
+        path: target/*/reverie-dbt-native-cache/dynamorio-install-*
         key: dynamorio-${{ runner.os }}-${{ hashFiles('reverie-dbt/vendor/dynamorio/**', 'reverie-dbt/build.rs') }}
     - name: Build
       run: cargo build --workspace --all-features

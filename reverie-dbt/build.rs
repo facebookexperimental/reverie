@@ -11,6 +11,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process;
 use std::process::Command;
 use std::time::Instant;
 use std::time::SystemTime;
@@ -78,25 +79,43 @@ fn main() {
         &cmake,
         generator.as_deref(),
     );
-    let build_dir = out_dir.join(format!("dynamorio-build-{source_key}"));
-    let install_dir = out_dir.join(format!("dynamorio-install-{source_key}"));
+    let cache_root = shared_cache_root(&out_dir);
+    let install_dir = cache_root.join(format!("dynamorio-install-{source_key}"));
     let drrun = install_dir.join("bin64/drrun");
-    let cmake_config = install_dir.join("cmake/DynamoRIOConfig.cmake");
     let observed_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time predates the Unix epoch")
         .as_secs();
 
-    if !drrun.is_file() || !cmake_config.is_file() {
+    if !install_is_complete(&install_dir) {
+        assert!(
+            !install_dir.exists(),
+            "DynamoRIO build cache contains an incomplete install at {}",
+            install_dir.display()
+        );
         println!(
             "cargo:warning=DynamoRIO build cache MISS key=sha256:{source_key} observed_unix_seconds={observed_at}"
         );
+        let staging = StagingDirectory::create(&cache_root, &source_key);
+        let build_dir = staging.path().join("build");
+        let staged_install = staging.path().join("install");
         build_dynamorio(
             &source_dir,
             &build_dir,
-            &install_dir,
+            &staged_install,
             &cmake,
             generator.as_deref(),
+        );
+        assert!(
+            install_is_complete(&staged_install),
+            "DynamoRIO source build produced an incomplete install at {}",
+            staged_install.display()
+        );
+        let published = publish_install(&staged_install, &install_dir);
+        println!(
+            "cargo:warning=DynamoRIO build cache {} key=sha256:{source_key} install={}",
+            if published { "PUBLISHED" } else { "RACE-HIT" },
+            install_dir.display()
         );
     } else {
         println!(
@@ -117,6 +136,129 @@ fn main() {
         "cargo:rustc-env=REVERIE_DBT_DYNAMORIO_DRRUN={}",
         drrun.display()
     );
+}
+
+/// Put native artifacts outside Cargo's package-fingerprint directory.
+///
+/// Cargo gives the same package a different `OUT_DIR` when build-dependency
+/// profiles differ (for example, `cargo build` versus `cargo doc`). Both
+/// directories are children of the same target/profile `build` directory, so
+/// its parent is the narrowest cache scope they can safely share.
+fn shared_cache_root(out_dir: &Path) -> PathBuf {
+    let package_fingerprint = out_dir.parent().unwrap_or_else(|| {
+        panic!(
+            "Cargo OUT_DIR has no package directory: {}",
+            out_dir.display()
+        )
+    });
+    let cargo_build_dir = package_fingerprint.parent().unwrap_or_else(|| {
+        panic!(
+            "Cargo OUT_DIR has no build directory: {}",
+            out_dir.display()
+        )
+    });
+    assert_eq!(
+        cargo_build_dir.file_name(),
+        Some(std::ffi::OsStr::new("build")),
+        "unexpected Cargo OUT_DIR layout: {}",
+        out_dir.display()
+    );
+    cargo_build_dir
+        .parent()
+        .expect("Cargo build directory has no profile parent")
+        .join("reverie-dbt-native-cache")
+}
+
+fn install_is_complete(install_dir: &Path) -> bool {
+    install_dir.join("bin64/drrun").is_file()
+        && install_dir.join("cmake/DynamoRIOConfig.cmake").is_file()
+}
+
+/// Atomically publish a complete install without overwriting another builder.
+///
+/// Two Cargo invocations can miss simultaneously. They may both do temporary
+/// work, but directory rename ensures consumers observe either no cache entry
+/// or one complete immutable install. The loser verifies and reuses the winner.
+fn publish_install(staged_install: &Path, install_dir: &Path) -> bool {
+    assert!(
+        install_is_complete(staged_install),
+        "refusing to publish incomplete DynamoRIO install {}",
+        staged_install.display()
+    );
+    if install_is_complete(install_dir) {
+        return false;
+    }
+    assert!(
+        !install_dir.exists(),
+        "refusing to replace incomplete DynamoRIO cache entry {}",
+        install_dir.display()
+    );
+
+    match fs::rename(staged_install, install_dir) {
+        Ok(()) => true,
+        Err(error) if install_is_complete(install_dir) => {
+            println!(
+                "cargo:warning=another builder published the DynamoRIO cache entry first: {error}"
+            );
+            false
+        }
+        Err(error) => panic!(
+            "failed to atomically publish DynamoRIO install {} -> {}: {error}",
+            staged_install.display(),
+            install_dir.display()
+        ),
+    }
+}
+
+struct StagingDirectory {
+    path: PathBuf,
+}
+
+impl StagingDirectory {
+    fn create(cache_root: &Path, source_key: &str) -> Self {
+        fs::create_dir_all(cache_root).unwrap_or_else(|error| {
+            panic!(
+                "failed to create DynamoRIO cache root {}: {error}",
+                cache_root.display()
+            )
+        });
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time predates the Unix epoch")
+            .as_nanos();
+        for attempt in 0..100 {
+            let path = cache_root.join(format!(
+                ".staging-{source_key}-{}-{nonce}-{attempt}",
+                process::id()
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => return Self { path },
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!(
+                    "failed to create DynamoRIO staging directory {}: {error}",
+                    path.display()
+                ),
+            }
+        }
+        panic!("failed to allocate a unique DynamoRIO staging directory")
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for StagingDirectory {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "reverie-dbt: failed to remove staging directory {}: {error}",
+                    self.path.display()
+                );
+            }
+        }
+    }
 }
 
 fn source_recipe_key(
@@ -308,6 +450,63 @@ mod tests {
             Some("Ninja".as_ref()),
         );
         assert_ne!(cmake_changed, generator_changed);
+    }
+
+    #[test]
+    fn cargo_fingerprints_share_one_profile_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory
+            .path()
+            .join("target/debug/build/reverie-dbt-first/out");
+        let second = directory
+            .path()
+            .join("target/debug/build/reverie-dbt-second/out");
+        assert_eq!(shared_cache_root(&first), shared_cache_root(&second));
+        assert_eq!(
+            shared_cache_root(&first),
+            directory
+                .path()
+                .join("target/debug/reverie-dbt-native-cache")
+        );
+    }
+
+    fn complete_fixture(path: &Path, marker: &str) {
+        fs::create_dir_all(path.join("bin64")).unwrap();
+        fs::create_dir_all(path.join("cmake")).unwrap();
+        fs::write(path.join("bin64/drrun"), marker).unwrap();
+        fs::write(path.join("cmake/DynamoRIOConfig.cmake"), marker).unwrap();
+    }
+
+    #[test]
+    fn atomic_publish_never_overwrites_a_complete_winner() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        let published = directory.path().join("published");
+        complete_fixture(&first, "first");
+        complete_fixture(&second, "second");
+
+        assert!(publish_install(&first, &published));
+        assert!(!publish_install(&second, &published));
+        assert_eq!(
+            fs::read_to_string(published.join("bin64/drrun")).unwrap(),
+            "first"
+        );
+        assert!(
+            second.exists(),
+            "losing builder still owns its staging tree"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "refusing to replace incomplete DynamoRIO cache entry")]
+    fn incomplete_cache_entry_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let staged = directory.path().join("staged");
+        let incomplete = directory.path().join("incomplete");
+        complete_fixture(&staged, "complete");
+        fs::create_dir(&incomplete).unwrap();
+        publish_install(&staged, &incomplete);
     }
 
     #[test]

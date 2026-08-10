@@ -49,7 +49,9 @@ fn build_cache_is_content_addressed_and_visible() {
     let build_script = include_str!("../build.rs");
     for required in [
         "let source_key = source_recipe_key(",
-        "dynamorio-build-{source_key}",
+        "let cache_root = shared_cache_root(&out_dir)",
+        "dynamorio-install-{source_key}",
+        "fs::rename(staged_install, install_dir)",
         "CMAKE_GENERATOR",
         "DynamoRIO build cache HIT key=sha256:",
         "DynamoRIO build cache MISS key=sha256:",
@@ -64,7 +66,7 @@ fn build_cache_is_content_addressed_and_visible() {
 #[test]
 fn ci_uses_the_vendored_content_addressed_cache() {
     let workflow = include_str!("../../.github/workflows/ci.yml");
-    assert!(workflow.contains("out/dynamorio-install-*"));
+    assert!(workflow.contains("reverie-dbt-native-cache/dynamorio-install-*"));
     assert!(
         workflow.contains("hashFiles('reverie-dbt/vendor/dynamorio/**', 'reverie-dbt/build.rs')")
     );
