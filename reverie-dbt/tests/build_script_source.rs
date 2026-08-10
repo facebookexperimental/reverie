@@ -49,7 +49,9 @@ fn build_cache_is_content_addressed_and_visible() {
     let build_script = include_str!("../build.rs");
     for required in [
         "let source_key = source_recipe_key(",
-        "let cache_root = shared_cache_root(&out_dir)",
+        "let cache_root = cache_root_for_out_dir(&out_dir)",
+        "DynamoRIO shared cache disabled for unrecognized OUT_DIR",
+        "out_dir.join(\"reverie-dbt-native-cache\")",
         "dynamorio-install-{source_key}",
         "fs::rename(staged_install, install_dir)",
         "CMAKE_GENERATOR",

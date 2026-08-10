@@ -7,6 +7,7 @@
  */
 
 use std::env;
+use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;
 use std::io;
@@ -81,7 +82,7 @@ fn main() {
         &cmake,
         generator.as_deref(),
     );
-    let cache_root = shared_cache_root(&out_dir);
+    let cache_root = cache_root_for_out_dir(&out_dir);
     let install_dir = cache_root.join(format!("dynamorio-install-{source_key}"));
     let drrun = install_dir.join("bin64/drrun");
     let observed_at = SystemTime::now()
@@ -150,32 +151,36 @@ fn main() {
 /// Put native artifacts outside Cargo's package-fingerprint directory.
 ///
 /// Cargo gives the same package a different `OUT_DIR` when build-dependency
-/// profiles differ (for example, `cargo build` versus `cargo doc`). Both
-/// directories are children of the same target/profile `build` directory, so
-/// its parent is the narrowest cache scope they can safely share.
-fn shared_cache_root(out_dir: &Path) -> PathBuf {
-    let package_fingerprint = out_dir.parent().unwrap_or_else(|| {
-        panic!(
-            "Cargo OUT_DIR has no package directory: {}",
+/// profiles differ (for example, `cargo build` versus `cargo doc`). Cargo uses
+/// both `build/reverie-dbt-HASH/out` for workspace packages and
+/// `build/reverie-dbt/HASH/out` for some external consumers. In either layout,
+/// the profile directory above `build` is the narrowest cache scope the
+/// fingerprints can safely share.
+fn shared_cache_root(out_dir: &Path) -> Option<PathBuf> {
+    let fingerprint_dir = out_dir.parent()?;
+    let fingerprint_parent = fingerprint_dir.parent()?;
+    let cargo_build_dir = if fingerprint_parent.file_name() == Some(OsStr::new("build")) {
+        fingerprint_parent
+    } else if fingerprint_parent.file_name() == Some(OsStr::new("reverie-dbt")) {
+        let candidate = fingerprint_parent.parent()?;
+        (candidate.file_name() == Some(OsStr::new("build"))).then_some(candidate)?
+    } else {
+        return None;
+    };
+    Some(cargo_build_dir.parent()?.join("reverie-dbt-native-cache"))
+}
+
+/// Unknown Cargo layouts must not abort the consuming build or share an
+/// unproven cache scope. Fall back to this fingerprint's own `OUT_DIR`; the
+/// first use rebuilds and later uses may reuse only that isolated entry.
+fn cache_root_for_out_dir(out_dir: &Path) -> PathBuf {
+    shared_cache_root(out_dir).unwrap_or_else(|| {
+        println!(
+            "cargo:warning=DynamoRIO shared cache disabled for unrecognized OUT_DIR {}; rebuilding in an isolated cache",
             out_dir.display()
-        )
-    });
-    let cargo_build_dir = package_fingerprint.parent().unwrap_or_else(|| {
-        panic!(
-            "Cargo OUT_DIR has no build directory: {}",
-            out_dir.display()
-        )
-    });
-    assert_eq!(
-        cargo_build_dir.file_name(),
-        Some(std::ffi::OsStr::new("build")),
-        "unexpected Cargo OUT_DIR layout: {}",
-        out_dir.display()
-    );
-    cargo_build_dir
-        .parent()
-        .expect("Cargo build directory has no profile parent")
-        .join("reverie-dbt-native-cache")
+        );
+        out_dir.join("reverie-dbt-native-cache")
+    })
 }
 
 const REQUIRED_INSTALL_ARTIFACTS: &[&str] = &[
@@ -653,20 +658,45 @@ mod tests {
     }
 
     #[test]
-    fn cargo_fingerprints_share_one_profile_cache() {
+    fn workspace_and_consumer_fingerprints_share_one_profile_cache() {
         let directory = tempfile::tempdir().unwrap();
-        let first = directory
-            .path()
-            .join("target/debug/build/reverie-dbt-first/out");
-        let second = directory
-            .path()
-            .join("target/debug/build/reverie-dbt-second/out");
-        assert_eq!(shared_cache_root(&first), shared_cache_root(&second));
-        assert_eq!(
-            shared_cache_root(&first),
-            directory
+        for profile in ["debug", "release"] {
+            let workspace_first = directory
                 .path()
-                .join("target/debug/reverie-dbt-native-cache")
+                .join(format!("target/{profile}/build/reverie-dbt-first/out"));
+            let workspace_second = directory
+                .path()
+                .join(format!("target/{profile}/build/reverie-dbt-second/out"));
+            let consumer_first = directory
+                .path()
+                .join(format!("target/{profile}/build/reverie-dbt/first/out"));
+            let consumer_second = directory
+                .path()
+                .join(format!("target/{profile}/build/reverie-dbt/second/out"));
+            let expected = directory
+                .path()
+                .join(format!("target/{profile}/reverie-dbt-native-cache"));
+
+            for out_dir in [
+                workspace_first,
+                workspace_second,
+                consumer_first,
+                consumer_second,
+            ] {
+                assert_eq!(shared_cache_root(&out_dir), Some(expected.clone()));
+                assert_eq!(cache_root_for_out_dir(&out_dir), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn unrecognized_out_dir_uses_an_isolated_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let out_dir = directory.path().join("unrecognized/layout/out");
+        assert_eq!(shared_cache_root(&out_dir), None);
+        assert_eq!(
+            cache_root_for_out_dir(&out_dir),
+            out_dir.join("reverie-dbt-native-cache")
         );
     }
 
