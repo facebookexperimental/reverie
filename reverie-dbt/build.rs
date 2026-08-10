@@ -9,6 +9,8 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs;
+use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process;
@@ -87,12 +89,17 @@ fn main() {
         .expect("system time predates the Unix epoch")
         .as_secs();
 
-    if !install_is_complete(&install_dir) {
-        assert!(
-            !install_dir.exists(),
-            "DynamoRIO build cache contains an incomplete install at {}",
+    let _invalid_install = if install_dir.exists() && !install_is_usable(&install_dir) {
+        println!(
+            "cargo:warning=DynamoRIO build cache INVALID key=sha256:{source_key} install={}; rebuilding",
             install_dir.display()
         );
+        StagingDirectory::quarantine(&cache_root, &install_dir, &source_key)
+    } else {
+        None
+    };
+
+    if !install_is_usable(&install_dir) {
         println!(
             "cargo:warning=DynamoRIO build cache MISS key=sha256:{source_key} observed_unix_seconds={observed_at}"
         );
@@ -106,8 +113,9 @@ fn main() {
             &cmake,
             generator.as_deref(),
         );
+        write_install_manifest(&staged_install);
         assert!(
-            install_is_complete(&staged_install),
+            install_is_usable(&staged_install),
             "DynamoRIO source build produced an incomplete install at {}",
             staged_install.display()
         );
@@ -169,9 +177,120 @@ fn shared_cache_root(out_dir: &Path) -> PathBuf {
         .join("reverie-dbt-native-cache")
 }
 
-fn install_is_complete(install_dir: &Path) -> bool {
-    install_dir.join("bin64/drrun").is_file()
-        && install_dir.join("cmake/DynamoRIOConfig.cmake").is_file()
+const REQUIRED_INSTALL_ARTIFACTS: &[&str] = &[
+    "bin64/drrun",
+    "cmake/DynamoRIOConfig.cmake",
+    "cmake/DynamoRIOTarget64.cmake",
+    "cmake/DynamoRIOTarget64-release.cmake",
+    "include/dr_api.h",
+    "lib64/release/libdynamorio.so",
+    "lib64/release/libdrpreload.so",
+    "ext/include/drmgr.h",
+    "ext/include/drreg.h",
+    "ext/include/drwrap.h",
+    "ext/include/drx.h",
+    "ext/lib64/release/libdrmgr.so",
+    "ext/lib64/release/libdrreg.so",
+    "ext/lib64/release/libdrwrap.so",
+    "ext/lib64/release/libdrx.so",
+];
+const ELF_INSTALL_ARTIFACTS: &[&str] = &[
+    "bin64/drrun",
+    "lib64/release/libdynamorio.so",
+    "lib64/release/libdrpreload.so",
+    "ext/lib64/release/libdrmgr.so",
+    "ext/lib64/release/libdrreg.so",
+    "ext/lib64/release/libdrwrap.so",
+    "ext/lib64/release/libdrx.so",
+];
+const INSTALL_MANIFEST: &str = ".reverie-dbt-install.sha256";
+
+fn install_is_usable(install_dir: &Path) -> bool {
+    let artifacts_present = REQUIRED_INSTALL_ARTIFACTS.iter().all(|relative| {
+        install_dir
+            .join(relative)
+            .metadata()
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+    });
+    if !artifacts_present {
+        return false;
+    }
+    let drrun_executable = install_dir
+        .join("bin64/drrun")
+        .metadata()
+        .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0);
+    drrun_executable
+        && ELF_INSTALL_ARTIFACTS
+            .iter()
+            .all(|relative| has_elf_magic(&install_dir.join(relative)))
+        && fs::read_to_string(install_dir.join(INSTALL_MANIFEST))
+            .ok()
+            .zip(install_manifest_contents(install_dir).ok())
+            .is_some_and(|(recorded, actual)| recorded == actual)
+}
+
+fn has_elf_magic(path: &Path) -> bool {
+    fs::read(path)
+        .ok()
+        .is_some_and(|contents| contents.starts_with(b"\x7fELF"))
+}
+
+fn write_install_manifest(install_dir: &Path) {
+    let contents = install_manifest_contents(install_dir).unwrap_or_else(|error| {
+        panic!(
+            "failed to inventory DynamoRIO install {}: {error}",
+            install_dir.display()
+        )
+    });
+    fs::write(install_dir.join(INSTALL_MANIFEST), contents).unwrap_or_else(|error| {
+        panic!(
+            "failed to write DynamoRIO install manifest in {}: {error}",
+            install_dir.display()
+        )
+    });
+}
+
+fn install_manifest_contents(install_dir: &Path) -> io::Result<String> {
+    fn walk(root: &Path, directory: &Path, lines: &mut Vec<String>) -> io::Result<()> {
+        let mut paths = fs::read_dir(directory)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<io::Result<Vec<_>>>()?;
+        paths.sort();
+        for path in paths {
+            let relative = path.strip_prefix(root).map_err(io::Error::other)?;
+            if relative == Path::new(INSTALL_MANIFEST) {
+                continue;
+            }
+            let file_type = fs::symlink_metadata(&path)?.file_type();
+            if file_type.is_dir() {
+                walk(root, &path, lines)?;
+            } else if file_type.is_symlink() {
+                lines.push(format!(
+                    "symlink {} {}",
+                    fs::read_link(&path)?.display(),
+                    relative.display()
+                ));
+            } else if file_type.is_file() {
+                let mut hasher = Sha256::new();
+                hasher.update(fs::read(&path)?);
+                lines.push(format!(
+                    "sha256:{:x} {}",
+                    hasher.finalize(),
+                    relative.display()
+                ));
+            } else {
+                return Err(io::Error::other(format!(
+                    "unsupported installed artifact {}",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    let mut lines = Vec::new();
+    walk(install_dir, install_dir, &mut lines)?;
+    Ok(format!("{}\n", lines.join("\n")))
 }
 
 /// Atomically publish a complete install without overwriting another builder.
@@ -181,11 +300,11 @@ fn install_is_complete(install_dir: &Path) -> bool {
 /// or one complete immutable install. The loser verifies and reuses the winner.
 fn publish_install(staged_install: &Path, install_dir: &Path) -> bool {
     assert!(
-        install_is_complete(staged_install),
+        install_is_usable(staged_install),
         "refusing to publish incomplete DynamoRIO install {}",
         staged_install.display()
     );
-    if install_is_complete(install_dir) {
+    if install_is_usable(install_dir) {
         return false;
     }
     assert!(
@@ -196,7 +315,7 @@ fn publish_install(staged_install: &Path, install_dir: &Path) -> bool {
 
     match fs::rename(staged_install, install_dir) {
         Ok(()) => true,
-        Err(error) if install_is_complete(install_dir) => {
+        Err(error) if install_is_usable(install_dir) => {
             println!(
                 "cargo:warning=another builder published the DynamoRIO cache entry first: {error}"
             );
@@ -245,6 +364,32 @@ impl StagingDirectory {
 
     fn path(&self) -> &Path {
         &self.path
+    }
+
+    fn quarantine(cache_root: &Path, install_dir: &Path, source_key: &str) -> Option<Self> {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time predates the Unix epoch")
+            .as_nanos();
+        for attempt in 0..100 {
+            let path = cache_root.join(format!(
+                ".invalid-{source_key}-{}-{nonce}-{attempt}",
+                process::id()
+            ));
+            if path.exists() {
+                continue;
+            }
+            match fs::rename(install_dir, &path) {
+                Ok(()) => return Some(Self { path }),
+                Err(_) if !install_dir.exists() || install_is_usable(install_dir) => return None,
+                Err(error) => panic!(
+                    "failed to quarantine unusable DynamoRIO cache entry {} -> {}: {error}",
+                    install_dir.display(),
+                    path.display()
+                ),
+            }
+        }
+        panic!("failed to allocate a unique DynamoRIO quarantine path")
     }
 }
 
@@ -471,10 +616,24 @@ mod tests {
     }
 
     fn complete_fixture(path: &Path, marker: &str) {
-        fs::create_dir_all(path.join("bin64")).unwrap();
-        fs::create_dir_all(path.join("cmake")).unwrap();
-        fs::write(path.join("bin64/drrun"), marker).unwrap();
-        fs::write(path.join("cmake/DynamoRIOConfig.cmake"), marker).unwrap();
+        for relative in REQUIRED_INSTALL_ARTIFACTS {
+            let artifact = path.join(relative);
+            fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+            if ELF_INSTALL_ARTIFACTS.contains(relative) {
+                fs::write(
+                    &artifact,
+                    [b"\x7fELF".as_slice(), marker.as_bytes()].concat(),
+                )
+                .unwrap();
+            } else {
+                fs::write(&artifact, marker).unwrap();
+            }
+        }
+        let drrun = path.join("bin64/drrun");
+        let mut permissions = drrun.metadata().unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(drrun, permissions).unwrap();
+        write_install_manifest(path);
     }
 
     #[test]
@@ -488,9 +647,10 @@ mod tests {
 
         assert!(publish_install(&first, &published));
         assert!(!publish_install(&second, &published));
-        assert_eq!(
-            fs::read_to_string(published.join("bin64/drrun")).unwrap(),
-            "first"
+        assert!(
+            fs::read_to_string(published.join("bin64/drrun"))
+                .unwrap()
+                .ends_with("first")
         );
         assert!(
             second.exists(),
@@ -521,9 +681,9 @@ mod tests {
         });
 
         assert_ne!(first_won, second_won, "exactly one publisher must win");
-        assert!(install_is_complete(&published));
+        assert!(install_is_usable(&published));
         let marker = fs::read_to_string(published.join("bin64/drrun")).unwrap();
-        assert!(marker == "first" || marker == "second");
+        assert!(marker.ends_with("first") || marker.ends_with("second"));
     }
 
     #[test]
@@ -535,6 +695,27 @@ mod tests {
         complete_fixture(&staged, "complete");
         fs::create_dir(&incomplete).unwrap();
         publish_install(&staged, &incomplete);
+    }
+
+    #[test]
+    fn deleted_runtime_library_is_quarantined_and_rebuilt() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = directory.path().join("cache");
+        let install = cache.join("dynamorio-install-key");
+        complete_fixture(&install, "original");
+        assert!(install_is_usable(&install));
+
+        fs::remove_file(install.join("lib64/release/libdynamorio.so")).unwrap();
+        assert!(!install_is_usable(&install));
+        let quarantined = StagingDirectory::quarantine(&cache, &install, "key")
+            .expect("the unusable entry must be quarantined");
+        assert!(!install.exists());
+
+        let staged = directory.path().join("replacement");
+        complete_fixture(&staged, "replacement");
+        assert!(publish_install(&staged, &install));
+        assert!(install_is_usable(&install));
+        drop(quarantined);
     }
 
     #[test]
