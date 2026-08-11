@@ -85,12 +85,22 @@ pub(crate) fn is_backend_owned_syscall(number: u64, thread_ownership: ThreadOwne
         return thread_ownership.futex_is_host_owned();
     }
     // QEMU's root event loop waits on worker eventfds. KVM syscall
-    // injection cannot perform ppoll, so use translated host descriptors.
-    number == libc::SYS_ppoll as u64
-        // Workers can create descriptors that the root event loop consumes.
-        // Scalar and vectored reads must use that shared descriptor table.
-        || number == libc::SYS_read as u64
-        || number == libc::SYS_readv as u64
+    // injection cannot perform ppoll, so use translated host descriptors in
+    // either ownership mode.
+    if number == libc::SYS_ppoll as u64 {
+        return true;
+    }
+
+    // Host-owned workers execute outside the Tool and can create descriptors
+    // that the root event loop consumes. Their scalar and vectored reads must
+    // therefore use the backend's shared descriptor table. Tool-owned workers,
+    // however, are registered with the Tool's scheduler, so their reads must
+    // reach Tool::handle_syscall_event. In particular, Detcore makes internal
+    // pipes physically nonblocking while keeping them logically blocking; if
+    // the backend consumes those reads itself, the implementation-only EAGAIN
+    // leaks to the guest instead of entering Detcore's polling retry path.
+    thread_ownership.executes_on_host()
+        && (number == libc::SYS_read as u64 || number == libc::SYS_readv as u64)
 }
 
 /// Executes a syscall on behalf of a KVM guest.
@@ -1676,15 +1686,26 @@ mod tests {
     }
 
     #[test]
-    fn worker_shared_syscalls_are_backend_owned() {
-        // Descriptor/event-loop syscalls stay backend-owned under both ownerships.
+    fn worker_shared_syscall_ownership_follows_thread_ownership() {
+        // ppoll always stays backend-owned because KVM injection cannot execute it.
         for ownership in [ThreadOwnership::Host, ThreadOwnership::Tool] {
-            for number in [libc::SYS_ppoll, libc::SYS_read, libc::SYS_readv] {
-                assert!(is_backend_owned_syscall(number as u64, ownership));
-            }
+            assert!(is_backend_owned_syscall(libc::SYS_ppoll as u64, ownership));
             assert!(!is_backend_owned_syscall(
                 libc::SYS_clock_gettime as u64,
                 ownership
+            ));
+        }
+
+        // Host-owned workers share descriptors outside the Tool, so reads stay
+        // backend-owned. Tool-owned reads must reach the Tool's subscriptions.
+        for number in [libc::SYS_read, libc::SYS_readv] {
+            assert!(is_backend_owned_syscall(
+                number as u64,
+                ThreadOwnership::Host
+            ));
+            assert!(!is_backend_owned_syscall(
+                number as u64,
+                ThreadOwnership::Tool
             ));
         }
     }
