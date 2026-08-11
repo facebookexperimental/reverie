@@ -452,13 +452,13 @@ impl StagingDirectory {
 
 impl Drop for StagingDirectory {
     fn drop(&mut self) {
-        if let Err(error) = fs::remove_dir_all(&self.path) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                eprintln!(
-                    "reverie-dbt: failed to remove staging directory {}: {error}",
-                    self.path.display()
-                );
-            }
+        if let Err(error) = fs::remove_dir_all(&self.path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "reverie-dbt: failed to remove staging directory {}: {error}",
+                self.path.display()
+            );
         }
     }
 }
