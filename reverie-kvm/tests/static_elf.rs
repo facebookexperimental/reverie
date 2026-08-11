@@ -1651,22 +1651,21 @@ fn static_elf_executes_syscall_and_exits() {
 }
 
 #[test]
-fn static_elf_getppid_matches_ptrace_parity() {
+fn kvm_static_elf_getppid_follows_pid_namespace_contract() {
     match Kvm::new() {
         Ok(_) => {}
         Err(error) if kvm_is_unavailable(&error) => {
-            eprintln!("skipping KVM getppid parity test: cannot open /dev/kvm: {error}");
+            eprintln!("skipping KVM getppid namespace test: cannot open /dev/kvm: {error}");
             return;
         }
         Err(error) => panic!("failed to probe /dev/kvm: {error}"),
     }
 
     // A static ELF guest that issues getppid and self-checks the deterministic
-    // parent PID. The ptrace backend runs the guest inside a real PID namespace
-    // (init == 1), so the conventional root guest (detcore ROOT_DETPID == 3) has
-    // getppid() == 1; the namespace init itself (PID 1) has getppid() == 0. KVM
-    // synthesizes the guest identity and must reproduce the same values. Any
-    // mismatch takes the exit_group(42) path instead of producing a false pass.
+    // parent PID. Linux PID-namespace semantics give a conventional root guest
+    // (detcore ROOT_DETPID == 3) getppid() == 1, while namespace init (PID 1)
+    // has getppid() == 0. KVM synthesizes the guest identity and must reproduce
+    // those pinned semantics. Any mismatch takes the exit_group(42) path.
     #[rustfmt::skip]
     fn getppid_probe(expected_ppid: u8) -> [u8; 36] {
         [
@@ -1693,7 +1692,7 @@ fn static_elf_getppid_matches_ptrace_parity() {
     assert_eq!(
         backend.run_static_elf().unwrap(),
         0,
-        "root guest pid=3 must report getppid()==1 to match the ptrace namespace"
+        "root guest pid=3 must report getppid()==1 in the PID namespace"
     );
 
     // Namespace init edge case: a guest that is itself PID 1 has no parent.
