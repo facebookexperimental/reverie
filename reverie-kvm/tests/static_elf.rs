@@ -1115,6 +1115,129 @@ fn static_elf_runs_glibc_clone3_thread_and_restores_parent_state() {
 }
 
 #[test]
+fn host_owned_worker_descriptors_keep_read_and_readv_backend_owned() {
+    match Kvm::new() {
+        Ok(_) => {}
+        Err(error) if kvm_is_unavailable(&error) => {
+            eprintln!("skipping KVM Host-owned descriptor test: cannot open /dev/kvm: {error}");
+            return;
+        }
+        Err(error) => panic!("failed to probe /dev/kvm: {error}"),
+    }
+
+    let directory = TestDirectory::new();
+    let executable = compile_c_program(
+        &directory.0,
+        "host-owned-worker-descriptors",
+        r#"
+#define _GNU_SOURCE
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdint.h>
+#include <sys/eventfd.h>
+#include <sys/uio.h>
+#include <unistd.h>
+
+#define EVENT_READ_FD 198
+#define VECTOR_READ_FD 199
+
+static _Atomic int ready;
+
+static void *worker(void *unused) {
+  (void)unused;
+  int event = eventfd(0, EFD_CLOEXEC);
+  int pipe_fds[2];
+  if (event < 0 || pipe(pipe_fds) != 0 ||
+      dup2(event, EVENT_READ_FD) != EVENT_READ_FD ||
+      dup2(pipe_fds[0], VECTOR_READ_FD) != VECTOR_READ_FD) {
+    atomic_store_explicit(&ready, -1, memory_order_release);
+    return (void *)(uintptr_t)1;
+  }
+  close(event);
+  close(pipe_fds[0]);
+
+  uint64_t counter = 7;
+  char first = 'v';
+  char second = 'r';
+  struct iovec vector[2] = {
+      {.iov_base = &first, .iov_len = 1},
+      {.iov_base = &second, .iov_len = 1},
+  };
+  if (write(EVENT_READ_FD, &counter, sizeof(counter)) != sizeof(counter) ||
+      writev(pipe_fds[1], vector, 2) != 2) {
+    atomic_store_explicit(&ready, -1, memory_order_release);
+    return (void *)(uintptr_t)1;
+  }
+  close(pipe_fds[1]);
+  atomic_store_explicit(&ready, 1, memory_order_release);
+  return NULL;
+}
+
+int main(void) {
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, worker, NULL) != 0) {
+    return 10;
+  }
+  int state;
+  while ((state = atomic_load_explicit(&ready, memory_order_acquire)) == 0) {
+  }
+  if (state < 0) {
+    return 11;
+  }
+
+  uint64_t counter = 0;
+  if (read(EVENT_READ_FD, &counter, sizeof(counter)) != sizeof(counter) || counter != 7) {
+    return 12;
+  }
+  char first = 0;
+  char second = 0;
+  struct iovec vector[2] = {
+      {.iov_base = &first, .iov_len = 1},
+      {.iov_base = &second, .iov_len = 1},
+  };
+  if (readv(VECTOR_READ_FD, vector, 2) != 2 || first != 'v' || second != 'r') {
+    return 13;
+  }
+
+  void *result = NULL;
+  if (pthread_join(thread, &result) != 0 || result != NULL) {
+    return 14;
+  }
+  return 0;
+}
+"#,
+    );
+    let executable = executable.to_str().unwrap();
+    let image = std::fs::read(executable).unwrap();
+    let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+    backend
+        .install_static_elf_with_context(
+            &image,
+            &[executable],
+            &["PATH=/usr/bin:/bin"],
+            &directory.0,
+        )
+        .unwrap();
+    backend.set_thread_ownership(ThreadOwnership::Host);
+    let (trace, code, stdout, stderr) =
+        futures::executor::block_on(backend.run_static_elf_with_tool::<StraceTool>((), true))
+            .unwrap();
+
+    assert_eq!(code, 0);
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+    let entries = trace.formatted();
+    assert!(
+        !entries.iter().any(|entry| entry.starts_with("read(198,")),
+        "Host-owned eventfd read unexpectedly reached the Tool: {entries:?}"
+    );
+    assert!(
+        !entries.iter().any(|entry| entry.starts_with("readv(199,")),
+        "Host-owned pipe readv unexpectedly reached the Tool: {entries:?}"
+    );
+}
+
+#[test]
 fn real_glibc_get_robust_list_tracks_fork_and_thread_lifecycles() {
     match Kvm::new() {
         Ok(_) => {}
