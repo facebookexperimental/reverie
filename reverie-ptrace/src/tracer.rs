@@ -1790,8 +1790,10 @@ fn seccomp_filter(events: &Subscription) -> seccomp::Filter {
                 .iter_syscalls()
                 .map(|syscall| (syscall, Action::Trace(0))),
         )
-        // Always allow these syscalls to pass through untraced.
-        .syscall(Sysno::restart_syscall, Action::Allow)
+        // rt_sigreturn must execute from Reverie's private page while restoring
+        // a signal frame. restart_syscall deliberately has no unconditional
+        // override: like every ordinary syscall, it is traced exactly when the
+        // Tool subscribes to it and otherwise falls through to the Allow default.
         .syscall(Sysno::rt_sigreturn, Action::Allow)
         // Allow untraced syscalls through without tracing them.
         .ip_range(
@@ -2905,6 +2907,61 @@ mod tests {
         ) -> Result<i64, Error> {
             Ok(guest.inject(syscall).await?)
         }
+    }
+
+    #[derive(Default)]
+    struct SubscribedRestartSyscallTool;
+
+    #[reverie::tool]
+    impl Tool for SubscribedRestartSyscallTool {
+        type GlobalState = ();
+        type ThreadState = ();
+
+        fn subscriptions(_config: &()) -> Subscription {
+            [Sysno::restart_syscall].into_iter().collect()
+        }
+
+        async fn handle_syscall_event<G: Guest<Self>>(
+            &self,
+            _guest: &mut G,
+            syscall: Syscall,
+        ) -> Result<i64, Error> {
+            assert_eq!(syscall.number(), Sysno::restart_syscall);
+            Ok(0x5a)
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscribed_restart_syscall_reaches_the_tool() {
+        let tracer = spawn_fn::<SubscribedRestartSyscallTool, _>(|| {
+            let result = unsafe { libc::syscall(libc::SYS_restart_syscall) };
+            assert_eq!(result, 0x5a, "subscribed restart_syscall bypassed the Tool");
+        })
+        .await
+        .expect("spawn subscribed restart_syscall guest");
+
+        let (status, _) = tokio::time::timeout(Duration::from_secs(3), tracer.wait())
+            .await
+            .expect("subscribed restart_syscall guest hung")
+            .expect("subscribed restart_syscall guest failed");
+        assert_eq!(status, ExitStatus::Exited(0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unsubscribed_restart_syscall_retains_the_linux_result() {
+        let tracer = spawn_fn::<InitFailureTool, _>(|| {
+            let result = unsafe { libc::syscall(libc::SYS_restart_syscall) };
+            assert_eq!(result, -1, "unsubscribed restart_syscall was intercepted");
+            assert_eq!(Errno::last(), Errno::EINTR);
+        })
+        .await
+        .expect("spawn unsubscribed restart_syscall guest");
+
+        let (status, _) = tokio::time::timeout(Duration::from_secs(3), tracer.wait())
+            .await
+            .expect("unsubscribed restart_syscall guest hung")
+            .expect("unsubscribed restart_syscall guest failed");
+        assert_eq!(status, ExitStatus::Exited(0));
     }
 
     #[derive(Default)]
