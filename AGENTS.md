@@ -100,8 +100,9 @@ and registered named slots that contain every product checkout:
   `scripts/allocate-worktree.rs` and `scripts/release-worktree.rs`; never create
   a product worktree directly.
 - A parked slot is clean and detached at the parent-pinned gitlink. An active
-  slot has one mutating owner unless the registry explicitly records disjoint
-  shared ownership.
+  slot has exactly one mutating owner. Another agent may join only through the
+  allocator's explicit read-only operation; a registry entry never authorizes
+  disjoint mutating ownership.
 
 Use `git worktree list --porcelain` to inspect ownership. A branch may be
 checked out in only one worktree.
