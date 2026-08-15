@@ -11,7 +11,7 @@ license = "BSD-2-Clause"
 [dependencies]
 addr2line = "0.26.1"
 anyhow = "1.0.104"
-async-trait = "0.1.91"
+async-trait = "0.1.92"
 bitflags = { version = "2.13.1", features = ["serde", "std"], default-features = false }
 byteorder = "1.5"
 libc = "0.2.186"
