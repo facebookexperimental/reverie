@@ -29,7 +29,7 @@ safeptrace = { version = "0.1.0", path = "../safeptrace", features = ["memory", 
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 thiserror = "2.0.19"
 tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
-tokio-stream = { version = "0.1.18", features = ["fs", "io-util", "net", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1.19", features = ["fs", "io-util", "net", "signal", "sync", "time"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 tracing-subscriber = { version = "0.3.23", features = ["chrono", "env-filter", "json", "local-time", "parking_lot", "registry"] }
 unwind = { version = "0.4.2", features = ["ptrace"] }
