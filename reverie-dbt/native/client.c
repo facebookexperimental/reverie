@@ -3859,6 +3859,13 @@ static void runtime_background_init(void *argument) {
   evidence_callback_enter();
   reverie_dbt_runtime_background_init_v2(&runtime_callbacks_page.value);
   evidence_callback_leave();
+  // DynamoRIO implements a client thread as a distinct process sharing the
+  // application address space. Protected evidence emitted by the external
+  // scheduler is therefore admitted under this process's SO_PEERCRED identity,
+  // not the application process identity. No application thread-exit or
+  // process-exit callback runs when this entry point returns, so complete this
+  // sender explicitly before the client process exits.
+  require_evidence_flush(EVIDENCE_FRAME_FINAL);
   atomic_store_explicit(&runtime_background_state, 3, memory_order_release);
 }
 

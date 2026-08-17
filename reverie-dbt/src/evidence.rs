@@ -1500,7 +1500,7 @@ mod tests {
     }
 
     #[test]
-    fn native_process_finalization_follows_runtime_output() {
+    fn native_processes_finalize_after_their_runtime_output() {
         let source = include_str!("../native/client.c");
         let event_exit = source
             .split_once("static void event_exit(void) {")
@@ -1516,7 +1516,19 @@ mod tests {
             .split_once("static void ensure_runtime_background(void)")
             .unwrap()
             .0;
-        assert!(!background.contains("EVIDENCE_FRAME_FINAL"));
+        let background_runtime = background
+            .find("reverie_dbt_runtime_background_init_v2(&runtime_callbacks_page.value);")
+            .unwrap();
+        let background_callback_leave = background.find("evidence_callback_leave();").unwrap();
+        let background_final = background
+            .find("require_evidence_flush(EVIDENCE_FRAME_FINAL);")
+            .unwrap();
+        let background_quiescent = background
+            .find("atomic_store_explicit(&runtime_background_state, 3")
+            .unwrap();
+        assert!(background_runtime < background_callback_leave);
+        assert!(background_callback_leave < background_final);
+        assert!(background_final < background_quiescent);
         assert!(event_exit.contains("finalize_runtime_process();"));
         let finalizer = source
             .split_once("static void finalize_runtime_process(void) {")
