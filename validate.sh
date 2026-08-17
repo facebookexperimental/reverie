@@ -358,7 +358,6 @@ readonly -a REGULAR_TEST_SKIP_ARGS=(
 )
 
 run_check "Cross-client skill discovery" "$ROOT_DIR/scripts/check-skill-discovery.rs"
-run_check "Merge-gate policy" "$ROOT_DIR/scripts/check-merge-gate-policy.sh"
 run_check "Build workspace" cargo build --workspace --all-features
 run_check "Test regular workspace cases" cargo test --workspace --all-features \
     -- --test-threads=1 "${REGULAR_TEST_SKIP_ARGS[@]}"

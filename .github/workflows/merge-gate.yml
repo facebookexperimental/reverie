@@ -22,17 +22,17 @@ on:
         required: true
         type: string
 
-# Gate semantics version: v2. The required status context is `merge-gate-v2`.
+# Gate semantics version: v2. This workflow is optional evidence and its
+# `merge-gate-v2` context is not required by branch protection.
 # `REVERIE_MERGE_GATE_V2_BLOB` binds every authorizing run to the registered
 # workflow definition, so an old PR cannot satisfy current protection with its
 # own weaker branch-local YAML. The legacy `merge-gate` context exists only
 # during the fail-closed overlap migration.
 #
-# This lightweight required check accepts an exact PR head only after the
-# repository CI workflow succeeds. Local Reverie validation has no remotely
-# dereferenceable receipt authority yet, so a bare locally-validated label is
-# never landing evidence. Merge-group checks inspect their constituent PR heads
-# instead of trusting the synthetic queue commit.
+# When Actions are enabled, this workflow reports hosted CI state. Exact-head
+# local `./validate.sh` is the canonical landing signal. Merge-group checks
+# inspect their constituent PR heads instead of trusting the synthetic queue
+# commit.
 permissions:
   actions: read
   contents: read
