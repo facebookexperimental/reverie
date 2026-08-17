@@ -18,6 +18,7 @@
 
 pub mod backend_stats;
 pub mod counter;
+mod evidence;
 mod launcher;
 pub mod sync_rpc;
 #[cfg(feature = "prototype-runtime")]
@@ -39,6 +40,9 @@ use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
 
+pub use evidence::DbtEvidence;
+pub use evidence::DbtEvidenceLogLevel;
+pub use evidence::decode_evidence;
 // TODO-HUMAN-REVIEW(PR-134): Review the native bootstrap failure ABI export.
 pub use launcher::CLIENT_THREAD_START_FAILURE_EXIT_CODE;
 pub use launcher::DbtRunner;
@@ -98,6 +102,25 @@ pub type RuntimeEmitter = unsafe extern "C" fn(*const u8, usize);
 /// Native callback that yields a DBT client thread at a DynamoRIO-safe point.
 pub type RuntimeIdler = unsafe extern "C" fn();
 
+/// Version of the native-client/external-runtime callback ABI.
+///
+/// An external runtime used with this native client must export
+/// `reverie_dbt_runtime_abi_version`, `reverie_dbt_runtime_callbacks_size`,
+/// `reverie_dbt_runtime_thread_created_v2`, and
+/// `reverie_dbt_runtime_background_init_v2`. Advancing a consumer's Reverie
+/// revision without those matching exports is an incomplete cross-repository
+/// update and fails at link or at the pre-callback ABI check.
+pub const DBT_RUNTIME_ABI_VERSION: u32 = 2;
+
+#[repr(C)]
+struct DbtRuntimeCallbacksV1 {
+    emit: RuntimeEmitter,
+    idle: RuntimeIdler,
+    panic_on_unsupported_syscalls: i32,
+    unsupported_report_fd: i32,
+    emit_stdout: RuntimeEmitter,
+}
+
 // TODO-HUMAN-REVIEW(PR-66): Confirm the C-compatible callback layout.
 /// Callbacks supplied to an external Tool runtime on its background client thread.
 #[repr(C)]
@@ -121,6 +144,26 @@ pub struct DbtRuntimeCallbacks {
     /// of the struct so the existing field layout matches the C
     /// `runtime_callbacks_t`.
     pub emit_stdout: RuntimeEmitter,
+    /// Emits one already-formatted structured tracing record into the protected
+    /// evidence transport. Raw lifecycle and unsupported-syscall diagnostics
+    /// continue to use [`Self::emit`].
+    pub emit_evidence: RuntimeEmitter,
+    /// Protected [`DbtEvidenceLogLevel`] discriminant selected by the launcher.
+    pub evidence_log_level: i32,
+}
+
+/// Reports the exact native-client/external-runtime ABI version.
+#[cfg(feature = "prototype-runtime")]
+#[unsafe(no_mangle)]
+pub extern "C" fn reverie_dbt_runtime_abi_version() -> u32 {
+    DBT_RUNTIME_ABI_VERSION
+}
+
+/// Reports the exact callback-structure size for the current ABI version.
+#[cfg(feature = "prototype-runtime")]
+#[unsafe(no_mangle)]
+pub extern "C" fn reverie_dbt_runtime_callbacks_size() -> usize {
+    std::mem::size_of::<DbtRuntimeCallbacks>()
 }
 
 /// Result of dispatching a syscall through an external DBT Tool.
@@ -1448,7 +1491,13 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_init(
     // root) so every `DbtGuest` built afterwards reports it through
     // `Guest::ppid`. A per-process constant; each thread writes the same value.
     PROCESS_PPID.store(in_tree_ppid, Ordering::Relaxed);
-    unsafe { counters.write(PrototypeCounters::default()) };
+    // The native client publishes stable virtual identities in fields after
+    // this public three-counter prefix before entering Rust. Reset only the
+    // prototype-owned prefix: writing a fresh `PrototypeCounters` value is
+    // sufficient and deliberately leaves the native-only suffix untouched.
+    unsafe {
+        counters.write(PrototypeCounters::default());
+    }
     0
 }
 
@@ -1462,13 +1511,14 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_init(
 #[cfg(feature = "prototype-runtime")]
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
-pub unsafe extern "C" fn reverie_dbt_runtime_thread_created(
+pub unsafe extern "C" fn reverie_dbt_runtime_thread_created_v2(
     _counters: *mut PrototypeCounters,
     _context: *mut c_void,
     _parent_tid: i32,
     _pid: i32,
     _branches: u64,
     _child_tid: i32,
+    _virtual_child_tid: i32,
     _child_tid_addr: u64,
     _flags: u64,
     _invoke_syscall: SyscallInvoker,
@@ -1476,6 +1526,48 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_created(
     _write_registers: RegisterWriter,
 ) -> i32 {
     0
+}
+
+/// Compatibility entry point for native clients using ABI version 1.
+///
+/// Version 1 had no separate virtual child identity. Its callers therefore
+/// preserve their original behavior by using the host child identity for both.
+///
+/// # Safety
+///
+/// The pointers and callbacks must satisfy the version-1 thread-created ABI.
+#[cfg(feature = "prototype-runtime")]
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn reverie_dbt_runtime_thread_created(
+    counters: *mut PrototypeCounters,
+    context: *mut c_void,
+    parent_tid: i32,
+    pid: i32,
+    branches: u64,
+    child_tid: i32,
+    child_tid_addr: u64,
+    flags: u64,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
+    write_registers: RegisterWriter,
+) -> i32 {
+    unsafe {
+        reverie_dbt_runtime_thread_created_v2(
+            counters,
+            context,
+            parent_tid,
+            pid,
+            branches,
+            child_tid,
+            child_tid,
+            child_tid_addr,
+            flags,
+            invoke_syscall,
+            read_registers,
+            write_registers,
+        )
+    }
 }
 
 /// Releases prototype state for an exiting application thread.
@@ -1780,11 +1872,10 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
 /// Initializes the built-in prototype runtime on a native client thread.
 ///
 /// The `argument` is a `*const DbtRuntimeCallbacks` (the native
-/// `runtime_callbacks_t`). The only field consumed here is `emit_stdout`, a
-/// re-entrancy-safe DynamoRIO stdout emitter recorded so tools that suppress and
-/// re-emit guest stdout (e.g. `chunky_print`) can flush buffered bytes. This
-/// runs on the background client thread before any flush boundary, so the
-/// emitter is installed well ahead of the first `exit`/epoch flush.
+/// `runtime_callbacks_t`). It records the re-entrancy-safe stdout emitter. The
+/// native client emits image-initialization evidence from the first application
+/// thread, because DynamoRIO client threads have a distinct process identity
+/// and must not appear as guest-process evidence senders.
 ///
 /// # Safety
 ///
@@ -1793,9 +1884,26 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
 // TODO-HUMAN-REVIEW(PR-162): Review the stdout-emitter init delivery.
 #[cfg(feature = "prototype-runtime")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn reverie_dbt_runtime_background_init(argument: *mut c_void) {
+pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v2(argument: *mut c_void) {
     if !argument.is_null() {
         let callbacks = unsafe { &*(argument as *const DbtRuntimeCallbacks) };
+        tools::set_stdout_emitter(callbacks.emit_stdout);
+    }
+}
+
+/// Compatibility entry point for native clients using ABI version 1.
+///
+/// The version-1 callback structure ends after `emit_stdout`; this function
+/// must not read the protected-evidence fields added by ABI version 2.
+///
+/// # Safety
+///
+/// `argument` must be null or point to a valid version-1 callback structure.
+#[cfg(feature = "prototype-runtime")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reverie_dbt_runtime_background_init(argument: *mut c_void) {
+    if !argument.is_null() {
+        let callbacks = unsafe { &*(argument as *const DbtRuntimeCallbacksV1) };
         tools::set_stdout_emitter(callbacks.emit_stdout);
     }
 }

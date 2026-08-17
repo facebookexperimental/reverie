@@ -11,15 +11,19 @@
 #include <linux/sched.h>
 #include <poll.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/shm.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
+#include <sys/un.h>
 #include <sys/user.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -33,6 +37,19 @@
 
 #ifndef X86_64
 #error "The Reverie DynamoRIO prototype currently requires x86-64"
+#endif
+
+#ifndef O_PATH
+#define O_PATH 010000000
+#endif
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+#ifndef MREMAP_FIXED
+#define MREMAP_FIXED 2
+#endif
+#ifndef SHM_REMAP
+#define SHM_REMAP 040000
 #endif
 
 typedef int64_t (*syscall_invoker_t)(uintptr_t, int64_t, const uint64_t *);
@@ -76,6 +93,13 @@ typedef struct {
   // `maybe_preempt` and restored by `preempt_return` so the injected syscall is
   // transparent to the guest. Allocated per thread when preemption is enabled.
   dr_mcontext_t *preempt_mcontext;
+  // Process identity whose protected-evidence thread count includes this
+  // client-owned thread state. Fork-child duplicate exit callbacks retain the
+  // parent's identity and therefore cannot decrement the child's count.
+  process_id_t evidence_thread_process;
+  // One-shot guard for the runtime thread-exit hook. Some exit syscalls do not
+  // receive a DynamoRIO thread_exit callback; others can receive both paths.
+  uint64_t runtime_thread_exit_called;
 } prototype_counters_t;
 
 #define VIRTUAL_ROOT_PID INT32_C(3)
@@ -166,6 +190,7 @@ static const cpuid_result_t extended_cpuid[] = {
 // exit, and app-level writes re-enter the syscall interception path.
 typedef void (*reverie_emit_fn_t)(const char *buf, size_t len);
 typedef void (*reverie_idle_fn_t)(void);
+#define REVERIE_DBT_RUNTIME_ABI_VERSION 2u
 // TODO-HUMAN-REVIEW(PR-162): Review the additive stdout-emit runtime callback ABI.
 typedef struct {
   reverie_emit_fn_t emit;
@@ -178,6 +203,11 @@ typedef struct {
   // buffered bytes to the real stdout at a flush boundary. Added at the end of
   // the struct so the existing field layout is unchanged.
   reverie_emit_fn_t emit_stdout;
+  // Structured tracing records use a distinct authenticated transport. Raw
+  // lifecycle and unsupported-syscall diagnostics remain on `emit`.
+  reverie_emit_fn_t emit_evidence;
+  // DbtEvidenceLogLevel discriminant: off/error/warn/info/debug/trace = 0..5.
+  int32_t evidence_log_level;
 } runtime_callbacks_t;
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#90): Confirm diagnostic fd ownership across exec.
@@ -197,6 +227,8 @@ static void reverie_dbt_emit(const char *buf, size_t len) {
 static void reverie_dbt_emit_stdout(const char *buf, size_t len) {
   dr_write_file(STDOUT, buf, len);
 }
+static void reverie_dbt_emit_evidence(const char *buf, size_t len);
+static void runtime_idle(void);
 
 // TODO-HUMAN-REVIEW(PR-131): Review the native thread lifecycle callback ABI.
 extern int32_t reverie_dbt_runtime_thread_init(
@@ -204,10 +236,13 @@ extern int32_t reverie_dbt_runtime_thread_init(
     int32_t in_tree_ppid, uint64_t branches, int32_t defer_runtime,
     syscall_invoker_t invoke_syscall, register_reader_t read_registers,
     register_writer_t write_registers);
-extern int32_t reverie_dbt_runtime_thread_created(
+extern uint32_t reverie_dbt_runtime_abi_version(void);
+extern size_t reverie_dbt_runtime_callbacks_size(void);
+extern int32_t reverie_dbt_runtime_thread_created_v2(
     prototype_counters_t *counters, void *context, int32_t parent_tid,
-    int32_t pid, uint64_t branches, int32_t child_tid, uint64_t child_tid_addr,
-    uint64_t flags, syscall_invoker_t invoke_syscall,
+    int32_t pid, uint64_t branches, int32_t child_tid,
+    int32_t virtual_child_tid, uint64_t child_tid_addr, uint64_t flags,
+    syscall_invoker_t invoke_syscall,
     register_reader_t read_registers, register_writer_t write_registers);
 
 extern void reverie_dbt_runtime_thread_exit(prototype_counters_t *counters,
@@ -216,7 +251,7 @@ extern void reverie_dbt_runtime_thread_exit(prototype_counters_t *counters,
 extern uint64_t reverie_dbt_runtime_image_init(void);
 extern void reverie_dbt_runtime_exec_failed(prototype_counters_t *counters,
                                             int32_t pid);
-extern void reverie_dbt_runtime_background_init(void *argument);
+extern void reverie_dbt_runtime_background_init_v2(void *argument);
 extern int32_t reverie_dbt_runtime_ready(uint64_t image_generation);
 extern void reverie_dbt_runtime_process_exit(void);
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -241,6 +276,7 @@ extern void reverie_dbt_runtime_totals(uint64_t *branches, uint64_t *syscalls,
 static _Atomic uint64_t branch_count __attribute__((aligned(64)));
 static _Atomic uint64_t stdin_read_count;
 static _Atomic uint64_t pending_thread_starts;
+static _Atomic int32_t runtime_background_state;
 static _Atomic uint64_t virtual_time_ns = UINT64_C(1000000000);
 static _Atomic uint64_t image_generation;
 static int thread_state_index;
@@ -249,6 +285,9 @@ static ptr_uint_t cpuid_marker_note;
 static ptr_uint_t rdtsc_marker_note;
 static ptr_uint_t rdtscp_marker_note;
 static bool report_summary;
+static bool test_wait_for_background;
+static bool test_kill_announced_child;
+static bool test_thread_exit_evidence;
 // Typed backend-statistics sink path. When the launcher passes
 // `-stats_path <path>`, each real runtime image appends exactly one fixed-size
 // binary record to this file at `event_exit`, using DynamoRIO's own
@@ -287,6 +326,12 @@ static bool preempt_gate_main_only = true;
 static _Atomic uint64_t virtual_tsc __attribute__((aligned(64)));
 #define VIRTUAL_TSC_STRIDE UINT64_C(100)
 static process_id_t runtime_owner_pid;
+static bool has_copied_runtime(void);
+static bool is_copied_vfork_process(void);
+static void finalize_runtime_process(void);
+static void complete_runtime_thread_exit(prototype_counters_t *counters,
+                                         void *drcontext,
+                                         bool explicit_exit);
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-84): Review isolation-aware process-group termination.
 static process_id_t runtime_process_group;
@@ -298,6 +343,586 @@ static void exit_runtime_tree(int exit_code) {
       runtime_process_group != dr_get_process_id())
     kill((pid_t)runtime_process_group, SIGKILL);
   dr_exit_process(exit_code);
+}
+
+#define EVIDENCE_CHANNEL_HEADER_LEN 80
+#define EVIDENCE_TOKEN_LEN 32
+#define EVIDENCE_ADDRESS_LEN 16
+#define EVIDENCE_BUFFER_CAPACITY (1024 * 1024)
+// A followed tree may create many short-lived app and scheduler processes.
+// Bound client memory explicitly, fail closed at capacity, and reclaim only a
+// finalized slot whose exact pid+starttime identity no longer exists.
+#define EVIDENCE_MAX_SENDERS 8192
+#define EVIDENCE_FRAME_START 1
+#define EVIDENCE_FRAME_DATA 2
+#define EVIDENCE_FRAME_EXEC 3
+#define EVIDENCE_FRAME_EXEC_CANCEL 4
+#define EVIDENCE_FRAME_FINAL 5
+#define EVIDENCE_FRAME_ERROR 6
+#define EVIDENCE_FRAME_CHILD 7
+#define EVIDENCE_CONFIG_PAGE_SIZE 4096
+
+static const unsigned char evidence_channel_magic[8] = {'R', 'V', 'D', 'B',
+                                                        'T', 'E', '2', 0};
+typedef union {
+  struct {
+    unsigned char enabled;
+    unsigned char address[EVIDENCE_ADDRESS_LEN];
+    unsigned char token[EVIDENCE_TOKEN_LEN];
+  } value;
+  unsigned char page[EVIDENCE_CONFIG_PAGE_SIZE];
+} evidence_config_page_t;
+
+// The application and client share one address space. Keep the endpoint and
+// the gate-active bit on their own directly referenced page, then seal the page
+// read-only before the first application instruction. Integrity never relies
+// on the token being secret.
+static evidence_config_page_t evidence_config_page
+    __attribute__((aligned(EVIDENCE_CONFIG_PAGE_SIZE)));
+typedef union {
+  runtime_callbacks_t value;
+  unsigned char page[EVIDENCE_CONFIG_PAGE_SIZE];
+} runtime_callbacks_page_t;
+_Static_assert(sizeof(runtime_callbacks_page_t) == EVIDENCE_CONFIG_PAGE_SIZE,
+               "runtime callback page must occupy exactly one page");
+
+// The guest and client share one address space, and this client loads at a
+// stable preferred address. Keep every callback and policy field on a dedicated
+// page, finish initialization in `dr_client_main`, and seal it before the first
+// application instruction. Otherwise a syscall-free guest entry point could
+// replace `emit_evidence` before the first syscall starts the background
+// runtime, then forge records while the callback-depth gate is legitimately
+// active.
+static runtime_callbacks_page_t runtime_callbacks_page
+    __attribute__((aligned(EVIDENCE_CONFIG_PAGE_SIZE))) = {
+        .value =
+            {
+                .emit = reverie_dbt_emit,
+                .idle = runtime_idle,
+                .panic_on_unsupported_syscalls = 0,
+                .unsupported_report_fd = 0,
+                .emit_stdout = reverie_dbt_emit_stdout,
+                .emit_evidence = reverie_dbt_emit,
+                .evidence_log_level = 0,
+            },
+};
+typedef struct {
+  process_id_t process;
+  uint64_t start_time;
+  uint64_t sequence;
+  bool started;
+  bool exec_pending;
+  bool overflow;
+  bool transport_failed;
+  bool finalization_started;
+  bool finalized;
+  bool initialization_record_sent;
+  uint32_t active_threads;
+} evidence_sender_state_t;
+
+static unsigned char *evidence_buffer;
+static size_t evidence_buffer_length;
+static void *evidence_lock;
+static evidence_sender_state_t *evidence_senders;
+static _Thread_local uint32_t evidence_callback_depth;
+
+static bool evidence_is_enabled(void) {
+  return evidence_config_page.value.enabled != 0;
+}
+
+static void evidence_callback_enter(void) { ++evidence_callback_depth; }
+
+static void evidence_callback_leave(void) {
+  DR_ASSERT(evidence_callback_depth != 0);
+  --evidence_callback_depth;
+}
+
+static bool decode_hex(const char *encoded, unsigned char *out, size_t out_len) {
+  size_t index;
+  if (encoded == NULL || strlen(encoded) != out_len * 2)
+    return false;
+  for (index = 0; index < out_len; ++index) {
+    unsigned char high = (unsigned char)encoded[index * 2];
+    unsigned char low = (unsigned char)encoded[index * 2 + 1];
+    if (high >= '0' && high <= '9')
+      high = (unsigned char)(high - '0');
+    else if (high >= 'a' && high <= 'f')
+      high = (unsigned char)(high - 'a' + 10);
+    else
+      return false;
+    if (low >= '0' && low <= '9')
+      low = (unsigned char)(low - '0');
+    else if (low >= 'a' && low <= 'f')
+      low = (unsigned char)(low - 'a' + 10);
+    else
+      return false;
+    out[index] = (unsigned char)((high << 4) | low);
+  }
+  return true;
+}
+
+static void put_u32_le(unsigned char *out, uint32_t value) {
+  out[0] = (unsigned char)(value & 0xff);
+  out[1] = (unsigned char)((value >> 8) & 0xff);
+  out[2] = (unsigned char)((value >> 16) & 0xff);
+  out[3] = (unsigned char)((value >> 24) & 0xff);
+}
+
+static void put_u64_le(unsigned char *out, uint64_t value) {
+  int byte;
+  for (byte = 0; byte != 8; ++byte)
+    out[byte] = (unsigned char)((value >> (byte * 8)) & 0xff);
+}
+
+static uint64_t evidence_hash_update(uint64_t hash,
+                                     const unsigned char *bytes,
+                                     size_t length) {
+  while (length-- != 0)
+    hash = (hash ^ *bytes++) * UINT64_C(0x00000100000001b3);
+  return hash;
+}
+
+static uint64_t evidence_frame_hash(uint64_t seed, unsigned char kind,
+                                    size_t payload_length, uint64_t sequence,
+                                    const unsigned char *payload) {
+  unsigned char encoded_length[4];
+  unsigned char encoded_sequence[8];
+  put_u32_le(encoded_length, (uint32_t)payload_length);
+  put_u64_le(encoded_sequence, sequence);
+  seed = evidence_hash_update(seed, &kind, 1);
+  seed = evidence_hash_update(seed, encoded_length, sizeof(encoded_length));
+  seed = evidence_hash_update(seed, encoded_sequence, sizeof(encoded_sequence));
+  return evidence_hash_update(seed, payload, payload_length);
+}
+
+static bool evidence_write_all(int descriptor, const unsigned char *buffer,
+                               size_t length) {
+  while (length != 0) {
+    ssize_t written = write(descriptor, buffer, length);
+    if (written < 0 && errno == EINTR)
+      continue;
+    if (written <= 0)
+      return false;
+    buffer += (size_t)written;
+    length -= (size_t)written;
+  }
+  return true;
+}
+
+static bool evidence_send_frame(unsigned char kind, const unsigned char *payload,
+                                size_t payload_length, uint64_t sequence) {
+  struct sockaddr_un address;
+  unsigned char header[EVIDENCE_CHANNEL_HEADER_LEN] = {0};
+  socklen_t address_length;
+  const struct timeval timeout = {.tv_sec = 0, .tv_usec = 250000};
+  int attempt;
+
+  if (payload_length > EVIDENCE_BUFFER_CAPACITY)
+    return false;
+  memset(&address, 0, sizeof(address));
+  address.sun_family = AF_UNIX;
+  memcpy(address.sun_path + 1, evidence_config_page.value.address,
+         sizeof(evidence_config_page.value.address));
+  address_length = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 +
+                               sizeof(evidence_config_page.value.address));
+
+  memcpy(header, evidence_channel_magic, sizeof(evidence_channel_magic));
+  memcpy(header + 8, evidence_config_page.value.token,
+         sizeof(evidence_config_page.value.token));
+  header[40] = kind;
+  put_u32_le(header + 48, (uint32_t)payload_length);
+  put_u64_le(header + 56, sequence);
+  put_u64_le(header + 64,
+             evidence_frame_hash(UINT64_C(0xcbf29ce484222325), kind,
+                                 payload_length, sequence, payload));
+  put_u64_le(header + 72,
+             evidence_frame_hash(UINT64_C(0x9e3779b97f4a7c15), kind,
+                                 payload_length, sequence, payload));
+
+  // A frame is applied only once by sequence plus its two payload hashes. If
+  // the collector accepted it but its ACK was lost, resend the identical frame
+  // instead of converting scheduler delay into evidence failure.
+  for (attempt = 0; attempt != 20; ++attempt) {
+    unsigned char acknowledgement = 1;
+    ssize_t received;
+    bool ok;
+    int descriptor = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (descriptor < 0) {
+      dr_sleep(1);
+      continue;
+    }
+    if (setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO, &timeout,
+                   sizeof(timeout)) != 0 ||
+        setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                   sizeof(timeout)) != 0 ||
+        connect(descriptor, (const struct sockaddr *)&address, address_length) !=
+            0) {
+      close(descriptor);
+      dr_sleep(1);
+      continue;
+    }
+    ok = evidence_write_all(descriptor, header, sizeof(header)) &&
+         evidence_write_all(descriptor, payload, payload_length);
+    do {
+      received = ok ? read(descriptor, &acknowledgement, 1) : -1;
+    } while (received < 0 && errno == EINTR);
+    close(descriptor);
+    if (received == 1)
+      return acknowledgement == 0;
+    dr_sleep(1);
+  }
+  return false;
+}
+
+static bool evidence_process_start_time(process_id_t process,
+                                        uint64_t *start_time) {
+  char path[64];
+  char stat_buffer[1024];
+  char *cursor;
+  char *end;
+  int descriptor;
+  int length;
+  int field;
+  uint64_t parsed = 0;
+  length = dr_snprintf(path, sizeof(path), "/proc/%d/stat", (int)process);
+  if (length <= 0 || (size_t)length >= sizeof(path))
+    return false;
+  descriptor = open(path, O_RDONLY | O_CLOEXEC);
+  if (descriptor < 0)
+    return false;
+  do {
+    length = (int)read(descriptor, stat_buffer, sizeof(stat_buffer) - 1);
+  } while (length < 0 && errno == EINTR);
+  close(descriptor);
+  if (length <= 0 || (size_t)length >= sizeof(stat_buffer))
+    return false;
+  stat_buffer[length] = 0;
+  cursor = strrchr(stat_buffer, ')');
+  if (cursor == NULL)
+    return false;
+  ++cursor;
+  for (field = 3; field <= 22; ++field) {
+    while (*cursor == ' ')
+      ++cursor;
+    if (*cursor == 0)
+      return false;
+    end = cursor;
+    while (*end != 0 && *end != ' ')
+      ++end;
+    if (field == 22) {
+      if (cursor == end)
+        return false;
+      while (cursor != end) {
+        if (*cursor < '0' || *cursor > '9')
+          return false;
+        parsed = parsed * 10 + (uint64_t)(*cursor++ - '0');
+      }
+      *start_time = parsed;
+      return true;
+    }
+    cursor = end;
+  }
+  return false;
+}
+
+static bool evidence_current_identity(process_id_t *process,
+                                      uint64_t *start_time) {
+  *process = (process_id_t)getpid();
+  return evidence_process_start_time(*process, start_time);
+}
+
+static evidence_sender_state_t *evidence_sender_locked(void) {
+  process_id_t process;
+  uint64_t start_time;
+  evidence_sender_state_t *empty = NULL;
+  evidence_sender_state_t *reusable = NULL;
+  size_t index;
+  if (!evidence_current_identity(&process, &start_time))
+    return NULL;
+  for (index = 0; index != EVIDENCE_MAX_SENDERS; ++index) {
+    evidence_sender_state_t *candidate = &evidence_senders[index];
+    if (candidate->process == process && candidate->start_time == start_time)
+      return candidate;
+    if (candidate->process == 0 && empty == NULL)
+      empty = candidate;
+    if (candidate->finalized && reusable == NULL) {
+      uint64_t observed_start_time;
+      if (!evidence_process_start_time(candidate->process,
+                                       &observed_start_time) ||
+          observed_start_time != candidate->start_time)
+        reusable = candidate;
+    }
+  }
+  if (empty == NULL)
+    empty = reusable;
+  if (empty == NULL) {
+    dr_fprintf(diagnostic_file,
+               "reverie-dbt: evidence sender-state capacity exceeded\n");
+    return NULL;
+  }
+  memset(empty, 0, sizeof(*empty));
+  empty->process = process;
+  empty->start_time = start_time;
+  return empty;
+}
+
+static bool evidence_flush_locked(evidence_sender_state_t *sender,
+                                  unsigned char terminal_kind) {
+  if (sender == NULL || sender->finalized)
+    return false;
+  if (!sender->started) {
+    if (!evidence_send_frame(EVIDENCE_FRAME_START, NULL, 0, 0))
+      return false;
+    sender->sequence = 1;
+    sender->started = true;
+  }
+  if (sender->overflow) {
+    static const unsigned char message[] = "client evidence buffer overflow";
+    (void)evidence_send_frame(EVIDENCE_FRAME_ERROR, message,
+                              sizeof(message) - 1, sender->sequence++);
+    return false;
+  }
+  if (evidence_buffer_length != 0) {
+    if (!evidence_send_frame(EVIDENCE_FRAME_DATA, evidence_buffer,
+                             evidence_buffer_length, sender->sequence++))
+      return false;
+    evidence_buffer_length = 0;
+  }
+  if (terminal_kind != 0) {
+    if (!evidence_send_frame(terminal_kind, NULL, 0, sender->sequence++))
+      return false;
+    if (terminal_kind == EVIDENCE_FRAME_EXEC)
+      sender->exec_pending = true;
+    else if (terminal_kind == EVIDENCE_FRAME_EXEC_CANCEL)
+      sender->exec_pending = false;
+    else if (terminal_kind == EVIDENCE_FRAME_FINAL) {
+      sender->started = false;
+      sender->finalized = true;
+    }
+  }
+  return true;
+}
+
+static bool evidence_flush(unsigned char terminal_kind) {
+  bool ok;
+  evidence_sender_state_t *sender;
+  if (!evidence_is_enabled())
+    return true;
+  // The live negative test withholds the child's frames after the parent has
+  // announced it, then kills it. Publication must refuse that missing process.
+  if (test_kill_announced_child && runtime_process_group != 0 &&
+      dr_get_process_id() != runtime_process_group)
+    return true;
+  dr_mutex_lock(evidence_lock);
+  sender = evidence_sender_locked();
+  if (sender == NULL) {
+    dr_mutex_unlock(evidence_lock);
+    return false;
+  }
+  if (terminal_kind == EVIDENCE_FRAME_EXEC_CANCEL && !sender->exec_pending) {
+    dr_mutex_unlock(evidence_lock);
+    return false;
+  }
+  if (terminal_kind == EVIDENCE_FRAME_EXEC && sender->exec_pending) {
+    dr_mutex_unlock(evidence_lock);
+    return false;
+  }
+  ok = !sender->transport_failed && evidence_flush_locked(sender, terminal_kind);
+  if (!ok)
+    sender->transport_failed = true;
+  dr_mutex_unlock(evidence_lock);
+  return ok;
+}
+
+static void require_evidence_flush(unsigned char terminal_kind) {
+  if (!evidence_flush(terminal_kind)) {
+    dr_fprintf(diagnostic_file,
+               "reverie-dbt: protected evidence transport failed\n");
+    exit_runtime_tree(101);
+  }
+}
+
+static void reverie_dbt_emit_evidence(const char *buf, size_t len) {
+  bool ok;
+  evidence_sender_state_t *sender;
+  if (!evidence_is_enabled()) {
+    reverie_dbt_emit(buf, len);
+    return;
+  }
+  if (test_kill_announced_child && runtime_process_group != 0 &&
+      dr_get_process_id() != runtime_process_group)
+    return;
+  if (evidence_callback_depth == 0) {
+    dr_fprintf(diagnostic_file,
+               "reverie-dbt: rejected evidence outside a protected callback\n");
+    exit_runtime_tree(101);
+    return;
+  }
+  dr_mutex_lock(evidence_lock);
+  sender = evidence_sender_locked();
+  if (len == 0 || len > EVIDENCE_BUFFER_CAPACITY - 4) {
+    if (sender != NULL)
+      sender->overflow = true;
+  } else {
+    put_u32_le(evidence_buffer, (uint32_t)len);
+    memcpy(evidence_buffer + 4, buf, len);
+    evidence_buffer_length = len + 4;
+  }
+  // Each structured tracing callback is one authenticated DATA frame. The ACK
+  // arrives before this callback returns, preserving callback order across
+  // processes instead of deferring records until a later syscall or exit.
+  ok = sender != NULL && !sender->transport_failed &&
+       evidence_flush_locked(sender, 0);
+  if (!ok && sender != NULL)
+    sender->transport_failed = true;
+  dr_mutex_unlock(evidence_lock);
+  if (!ok) {
+    dr_fprintf(diagnostic_file,
+               "reverie-dbt: protected evidence record send failed\n");
+    exit_runtime_tree(101);
+  }
+}
+
+static bool evidence_announce_child(process_id_t child) {
+  unsigned char payload[12];
+  evidence_sender_state_t *sender;
+  uint64_t child_start_time;
+  bool ok;
+  if (!evidence_is_enabled())
+    return true;
+  if (child <= 0 || !evidence_process_start_time(child, &child_start_time))
+    return false;
+  put_u32_le(payload, (uint32_t)child);
+  put_u64_le(payload + 4, child_start_time);
+  dr_mutex_lock(evidence_lock);
+  sender = evidence_sender_locked();
+  if (sender != NULL && !sender->started)
+    ok = evidence_flush_locked(sender, 0);
+  else
+    ok = sender != NULL;
+  if (ok)
+    ok = !sender->transport_failed &&
+         evidence_send_frame(EVIDENCE_FRAME_CHILD, payload, sizeof(payload),
+                             sender->sequence++);
+  if (!ok && sender != NULL)
+    sender->transport_failed = true;
+  dr_mutex_unlock(evidence_lock);
+  return ok;
+}
+
+static void require_evidence_child(process_id_t child) {
+  if (!evidence_announce_child(child)) {
+    dr_fprintf(diagnostic_file,
+               "reverie-dbt: protected child evidence announcement failed\n");
+    exit_runtime_tree(101);
+  }
+}
+
+static void evidence_thread_enter(prototype_counters_t *counters) {
+  evidence_sender_state_t *sender;
+  if (!evidence_is_enabled())
+    return;
+  dr_mutex_lock(evidence_lock);
+  sender = evidence_sender_locked();
+  if (sender == NULL || sender->active_threads == UINT32_MAX) {
+    dr_mutex_unlock(evidence_lock);
+    dr_fprintf(diagnostic_file,
+               "reverie-dbt: protected evidence thread count failed\n");
+    exit_runtime_tree(101);
+    return;
+  }
+  ++sender->active_threads;
+  counters->evidence_thread_process = dr_get_process_id();
+  dr_mutex_unlock(evidence_lock);
+}
+
+static void evidence_count_fork_child_thread(prototype_counters_t *counters) {
+  evidence_sender_state_t *sender;
+  process_id_t process = dr_get_process_id();
+  if (!evidence_is_enabled() || counters->evidence_thread_process == process)
+    return;
+
+  // DynamoRIO keeps the calling application thread across fork without
+  // issuing a new thread_init callback in the child. Count that surviving
+  // thread at the child-side clone boundary, before it can create and join
+  // additional threads whose exits would otherwise look like the process end.
+  dr_mutex_lock(evidence_lock);
+  sender = evidence_sender_locked();
+  if (sender == NULL || sender->active_threads != 0) {
+    dr_mutex_unlock(evidence_lock);
+    dr_fprintf(diagnostic_file,
+               "reverie-dbt: protected fork-child thread count failed\n");
+    exit_runtime_tree(101);
+    return;
+  }
+  sender->active_threads = 1;
+  counters->evidence_thread_process = process;
+  dr_mutex_unlock(evidence_lock);
+}
+
+static void evidence_emit_image_initialization(void) {
+  static const char record[] =
+      "1970-01-01T00:00:00.000000Z INFO reverie_dbt::evidence: "
+      "protected evidence initialized\n";
+  evidence_sender_state_t *sender;
+  bool emit = false;
+  if (!evidence_is_enabled() ||
+      runtime_callbacks_page.value.evidence_log_level < 3)
+    return;
+  dr_mutex_lock(evidence_lock);
+  sender = evidence_sender_locked();
+  if (sender != NULL && !sender->initialization_record_sent) {
+    sender->initialization_record_sent = true;
+    emit = true;
+  }
+  dr_mutex_unlock(evidence_lock);
+  if (!emit) {
+    if (sender == NULL) {
+      dr_fprintf(diagnostic_file,
+                 "reverie-dbt: protected evidence image initialization failed\n");
+      exit_runtime_tree(101);
+    }
+    return;
+  }
+  reverie_dbt_emit_evidence(record, sizeof(record) - 1);
+}
+
+static void evidence_thread_leave(prototype_counters_t *counters) {
+  evidence_sender_state_t *sender;
+  bool last_thread;
+  process_id_t process = dr_get_process_id();
+  if (!evidence_is_enabled() || counters->evidence_thread_process != process)
+    return;
+  dr_mutex_lock(evidence_lock);
+  sender = evidence_sender_locked();
+  if (sender == NULL || sender->active_threads == 0) {
+    dr_mutex_unlock(evidence_lock);
+    dr_fprintf(diagnostic_file,
+               "reverie-dbt: protected evidence thread exit was uncounted\n");
+    exit_runtime_tree(101);
+    return;
+  }
+  last_thread = --sender->active_threads == 0;
+  counters->evidence_thread_process = 0;
+  dr_mutex_unlock(evidence_lock);
+  if (last_thread &&
+      !(test_kill_announced_child && runtime_process_group != 0 &&
+        process != runtime_process_group))
+    finalize_runtime_process();
+}
+
+static void initialize_evidence_transport(void) {
+  if (!evidence_is_enabled())
+    return;
+  evidence_lock = dr_mutex_create();
+  evidence_buffer =
+      (unsigned char *)dr_global_alloc(EVIDENCE_BUFFER_CAPACITY);
+  evidence_senders = (evidence_sender_state_t *)dr_global_alloc(
+      sizeof(evidence_sender_state_t) * EVIDENCE_MAX_SENDERS);
+  DR_ASSERT(evidence_lock != NULL && evidence_buffer != NULL &&
+            evidence_senders != NULL);
+  memset(evidence_senders, 0,
+         sizeof(evidence_sender_state_t) * EVIDENCE_MAX_SENDERS);
 }
 static int32_t virtual_process_id = VIRTUAL_ROOT_PID;
 static int32_t virtual_parent_process_id = VIRTUAL_INIT_PID;
@@ -713,11 +1338,13 @@ static void start_pending_thread(void) {
   if (counters == NULL || counters->pending_thread_start == 0)
     return;
 
+  evidence_callback_enter();
   int32_t init_result = reverie_dbt_runtime_thread_init(
       counters, drcontext, (int32_t)dr_get_thread_id(drcontext),
       (int32_t)dr_get_process_id(), in_tree_parent_pid(),
       atomic_load_explicit(&branch_count, memory_order_relaxed), 0,
       invoke_syscall, read_registers, write_registers);
+  evidence_callback_leave();
   // TODO-HUMAN-REVIEW(PR-134): Confirm retryable native child startup.
   if (init_result > 0) {
     counters->pending_thread_start = 2;
@@ -890,6 +1517,8 @@ static int64_t invoke_raw_syscall(uintptr_t context, int64_t sysnum,
                                            args[0], args[1], args[2], args[3],
                                            args[4], args[5]);
 }
+
+static bool is_exec_syscall(int sysnum);
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-106): keep the identity memfd (fd 197) and diagnostic fd
@@ -1077,6 +1706,14 @@ static int32_t complete_clone_identity(prototype_counters_t *counters,
     return 0;
 
   if (result > 0) {
+    if ((flags & CLONE_THREAD) == 0) {
+      require_evidence_child((process_id_t)result);
+      if (test_kill_announced_child && kill((pid_t)result, SIGKILL) != 0) {
+        dr_fprintf(diagnostic_file,
+                   "reverie-dbt: failed to kill announced test child\n");
+        exit_runtime_tree(101);
+      }
+    }
     if ((flags & CLONE_THREAD) != 0 &&
         lookup_virtual_identity((int32_t)result, &mapped))
       virtual_child = mapped;
@@ -1084,6 +1721,8 @@ static int32_t complete_clone_identity(prototype_counters_t *counters,
       remember_virtual_identity((int32_t)result, virtual_child);
   } else if (result == 0) {
     int32_t host_tid = (int32_t)dr_get_thread_id(dr_get_current_drcontext());
+    if ((flags & CLONE_THREAD) == 0)
+      evidence_count_fork_child_thread(counters);
     if ((flags & CLONE_THREAD) != 0 &&
         lookup_virtual_identity(host_tid, &mapped))
       virtual_child = mapped;
@@ -1119,6 +1758,295 @@ static bool pending_identity_is_process(const prototype_counters_t *counters) {
          (counters->pending_clone_flags & CLONE_THREAD) == 0;
 }
 
+typedef struct {
+  struct msghdr msg_hdr;
+  unsigned int msg_len;
+} evidence_mmsghdr_t;
+
+static bool sockaddr_is_evidence(const void *address, size_t length) {
+  struct sockaddr_un candidate;
+  const size_t expected =
+      offsetof(struct sockaddr_un, sun_path) + 1 + EVIDENCE_ADDRESS_LEN;
+  if (!evidence_is_enabled() || address == NULL || length != expected ||
+      !read_app(address, &candidate, expected))
+    return false;
+  return candidate.sun_family == AF_UNIX && candidate.sun_path[0] == 0 &&
+         memcmp(candidate.sun_path + 1,
+                evidence_config_page.value.address,
+                EVIDENCE_ADDRESS_LEN) == 0;
+}
+
+static bool message_targets_evidence(const void *address) {
+  struct msghdr message;
+  return address != NULL && read_app(address, &message, sizeof(message)) &&
+         sockaddr_is_evidence(message.msg_name, message.msg_namelen);
+}
+
+static bool proc_link_is_memory(const char *link, size_t length) {
+  static const char prefix[] = "/proc/";
+  static const char suffix[] = "/mem";
+  return length >= sizeof(prefix) - 1 + sizeof(suffix) - 1 &&
+         memcmp(link, prefix, sizeof(prefix) - 1) == 0 &&
+         memcmp(link + length - (sizeof(suffix) - 1), suffix,
+                sizeof(suffix) - 1) == 0;
+}
+
+static bool fd_is_proc_mem(uintptr_t context, int fd) {
+  char descriptor_path[64];
+  char target[4096];
+  uint64_t arguments[6];
+  int path_length = dr_snprintf(descriptor_path, sizeof(descriptor_path),
+                                "/proc/self/fd/%d", fd);
+  int64_t target_length;
+  if (path_length <= 0 || (size_t)path_length >= sizeof(descriptor_path))
+    return false;
+  memset(arguments, 0, sizeof(arguments));
+  arguments[0] = (uint64_t)(uint32_t)AT_FDCWD;
+  arguments[1] = (uint64_t)(uintptr_t)descriptor_path;
+  arguments[2] = (uint64_t)(uintptr_t)target;
+  arguments[3] = sizeof(target) - 1;
+  target_length = invoke_raw_syscall(context, SYS_readlinkat, arguments);
+  if (target_length <= 0 || (size_t)target_length >= sizeof(target))
+    return false;
+  target[target_length] = 0;
+  return proc_link_is_memory(target, (size_t)target_length);
+}
+
+static bool path_is_proc_mem(uintptr_t context, int directory_fd,
+                             const void *path) {
+  uint64_t open_arguments[6] = {
+      (uint64_t)(uint32_t)directory_fd,
+      (uint64_t)(uintptr_t)path,
+      O_PATH | O_CLOEXEC,
+      0,
+  };
+  int64_t descriptor;
+  bool matches;
+  if (path == NULL)
+    return false;
+  descriptor = invoke_raw_syscall(context, SYS_openat, open_arguments);
+  if (descriptor < 0)
+    return false;
+  matches = fd_is_proc_mem(context, (int)descriptor);
+  const uint64_t close_arguments[6] = {(uint64_t)descriptor};
+  (void)invoke_raw_syscall(context, SYS_close, close_arguments);
+  return matches;
+}
+
+static bool syscall_returns_open_fd(int sysnum) {
+  return sysnum == SYS_open || sysnum == SYS_creat || sysnum == SYS_openat
+#ifdef SYS_openat2
+         || sysnum == SYS_openat2
+#endif
+      ;
+}
+
+static bool reject_opened_proc_mem(uintptr_t context, int sysnum,
+                                   int64_t descriptor) {
+  if (!evidence_is_enabled() || descriptor < 0 ||
+      !syscall_returns_open_fd(sysnum) ||
+      !fd_is_proc_mem(context, (int)descriptor))
+    return false;
+  const uint64_t close_arguments[6] = {(uint64_t)descriptor};
+  (void)invoke_raw_syscall(context, SYS_close, close_arguments);
+  return true;
+}
+
+static bool syscall_uses_proc_mem_fd(uintptr_t context, int sysnum,
+                                     const uint64_t *args) {
+  switch (sysnum) {
+  case SYS_read:
+  case SYS_write:
+  case SYS_pread64:
+  case SYS_pwrite64:
+  case SYS_readv:
+  case SYS_writev:
+#ifdef SYS_preadv
+  case SYS_preadv:
+#endif
+#ifdef SYS_pwritev
+  case SYS_pwritev:
+#endif
+#ifdef SYS_preadv2
+  case SYS_preadv2:
+#endif
+#ifdef SYS_pwritev2
+  case SYS_pwritev2:
+#endif
+  case SYS_lseek:
+    return fd_is_proc_mem(context, (int)args[0]);
+  case SYS_mmap:
+    return args[4] != (uint64_t)-1 &&
+           fd_is_proc_mem(context, (int)args[4]);
+#ifdef SYS_sendfile
+  case SYS_sendfile:
+    return fd_is_proc_mem(context, (int)args[0]) ||
+           fd_is_proc_mem(context, (int)args[1]);
+#endif
+#ifdef SYS_splice
+  case SYS_splice:
+    return fd_is_proc_mem(context, (int)args[0]) ||
+           fd_is_proc_mem(context, (int)args[2]);
+#endif
+#ifdef SYS_copy_file_range
+  case SYS_copy_file_range:
+    return fd_is_proc_mem(context, (int)args[0]) ||
+           fd_is_proc_mem(context, (int)args[2]);
+#endif
+  default:
+    return false;
+  }
+}
+
+static bool range_overlaps_page(uint64_t address, uint64_t length,
+                                const void *page, size_t page_length) {
+  const uintptr_t page_start = (uintptr_t)page;
+  const uintptr_t page_end = page_start + page_length;
+  const uintptr_t start = (uintptr_t)address;
+  uintptr_t end;
+  if (length == 0)
+    return false;
+  if (length > UINTPTR_MAX - start)
+    end = UINTPTR_MAX;
+  else
+    end = start + (uintptr_t)length;
+  return start < page_end && end > page_start;
+}
+
+static bool range_overlaps_protected_evidence_state(uint64_t address,
+                                                    uint64_t length) {
+  return range_overlaps_page(address, length, &evidence_config_page,
+                             sizeof(evidence_config_page)) ||
+         range_overlaps_page(address, length, &runtime_callbacks_page,
+                             sizeof(runtime_callbacks_page));
+}
+
+static bool syscall_targets_protected_evidence_state(int sysnum,
+                                                     const uint64_t *args) {
+  switch (sysnum) {
+  case SYS_mprotect:
+  case SYS_munmap:
+  case SYS_madvise:
+#ifdef SYS_pkey_mprotect
+  case SYS_pkey_mprotect:
+#endif
+    return range_overlaps_protected_evidence_state(args[0], args[1]);
+  case SYS_mremap:
+    if (range_overlaps_protected_evidence_state(args[0], args[1]))
+      return true;
+    return (args[3] & MREMAP_FIXED) != 0 &&
+           range_overlaps_protected_evidence_state(args[4], args[2]);
+  case SYS_mmap:
+    return (args[3] & (MAP_FIXED | MAP_FIXED_NOREPLACE)) != 0 &&
+           range_overlaps_protected_evidence_state(args[0], args[1]);
+#ifdef SYS_process_madvise
+  case SYS_process_madvise:
+    // The target ranges live in application memory and can race validation;
+    // evidence mode does not permit this cross-process mutation primitive.
+    return true;
+#endif
+#ifdef SYS_shmat
+  case SYS_shmat:
+    // SHM_REMAP can replace an existing mapping and supplies no segment length
+    // in the syscall arguments, so it cannot be range-validated safely here.
+    return (args[2] & SHM_REMAP) != 0;
+#endif
+#if defined(SYS_io_uring_setup) || defined(SYS_io_uring_enter) ||             \
+    defined(SYS_io_uring_register)
+#ifdef SYS_io_uring_setup
+  case SYS_io_uring_setup:
+#endif
+#ifdef SYS_io_uring_enter
+  case SYS_io_uring_enter:
+#endif
+#ifdef SYS_io_uring_register
+  case SYS_io_uring_register:
+#endif
+    // Submission queues execute fd, memory, and socket operations without
+    // traversing the intercepted syscall path that protects this channel.
+    return true;
+#endif
+  default:
+    return false;
+  }
+}
+
+// Reject app-originated traffic to the evidence endpoint even if the guest has
+// recovered the client arguments or token from shared address-space state. The
+// native sender uses client-private libc syscalls while the guest is stopped,
+// so it never traverses this application-syscall policy.
+static bool protect_evidence_socket_syscall(uintptr_t context, int sysnum,
+                                            const uint64_t *args,
+                                            int64_t *result) {
+  if (!evidence_is_enabled())
+    return false;
+  if (syscall_targets_protected_evidence_state(sysnum, args) ||
+      syscall_uses_proc_mem_fd(context, sysnum, args))
+    goto forbidden;
+  switch (sysnum) {
+  case SYS_connect:
+    if (!sockaddr_is_evidence((const void *)(uintptr_t)args[1], args[2]))
+      return false;
+    break;
+  case SYS_sendto:
+    if (!sockaddr_is_evidence((const void *)(uintptr_t)args[4], args[5]))
+      return false;
+    break;
+  case SYS_sendmsg:
+    if (!message_targets_evidence((const void *)(uintptr_t)args[1]))
+      return false;
+    break;
+#ifdef SYS_sendmmsg
+  case SYS_sendmmsg: {
+    uint64_t index;
+    if (args[1] == 0 || args[2] > 1024)
+      return false;
+    for (index = 0; index < args[2]; ++index) {
+      evidence_mmsghdr_t message;
+      uintptr_t address = (uintptr_t)args[1] + index * sizeof(message);
+      if (!read_app((const void *)address, &message, sizeof(message)))
+        return false;
+      if (sockaddr_is_evidence(message.msg_hdr.msg_name,
+                               message.msg_hdr.msg_namelen))
+        goto forbidden;
+    }
+    return false;
+  }
+#endif
+  case SYS_open:
+  case SYS_creat:
+    if (!path_is_proc_mem(context, AT_FDCWD,
+                          (const void *)(uintptr_t)args[0]))
+      return false;
+    break;
+  case SYS_openat:
+#ifdef SYS_openat2
+  case SYS_openat2:
+#endif
+    if (!path_is_proc_mem(context, (int)args[0],
+                          (const void *)(uintptr_t)args[1]))
+      return false;
+    break;
+#ifdef SYS_process_vm_readv
+  case SYS_process_vm_readv:
+#endif
+#ifdef SYS_process_vm_writev
+  case SYS_process_vm_writev:
+#endif
+  case SYS_ptrace:
+#ifdef SYS_pidfd_getfd
+  case SYS_pidfd_getfd:
+#endif
+    break;
+  default:
+    return false;
+  }
+
+forbidden:
+  *result = -EPERM;
+  return true;
+}
+
 static int64_t invoke_syscall(uintptr_t context, int64_t sysnum,
                               const uint64_t *args) {
   prototype_counters_t *counters = (prototype_counters_t *)drmgr_get_tls_field(
@@ -1127,6 +2055,8 @@ static int64_t invoke_syscall(uintptr_t context, int64_t sysnum,
   int64_t result;
   bool is_clone;
   DR_ASSERT(counters != NULL);
+  if (protect_evidence_socket_syscall(context, (int)sysnum, args, &result))
+    return result;
   memcpy(translated, args, sizeof(translated));
   if (!translate_identity_arguments((int)sysnum, translated))
     return unknown_identity_error((int)sysnum);
@@ -1145,7 +2075,16 @@ static int64_t invoke_syscall(uintptr_t context, int64_t sysnum,
   is_clone = prepare_clone_identity(counters, (int)sysnum, translated);
   if (preserve_internal_descriptors(context, (int)sysnum, translated, &result))
     return result;
+  if (is_exec_syscall((int)sysnum))
+    require_evidence_flush(EVIDENCE_FRAME_EXEC);
+  if (sysnum == SYS_exit || sysnum == SYS_exit_group)
+    complete_runtime_thread_exit(counters, (void *)context,
+                                 sysnum == SYS_exit);
   result = invoke_raw_syscall(context, sysnum, translated);
+  if (is_exec_syscall((int)sysnum) && result < 0)
+    require_evidence_flush(EVIDENCE_FRAME_EXEC_CANCEL);
+  if (reject_opened_proc_mem(context, (int)sysnum, result))
+    return -EPERM;
   if (is_clone) {
     int32_t virtual_child = complete_clone_identity(counters, result);
     if (result > 0)
@@ -1742,8 +2681,6 @@ static bool syscall_reads_stdin(void *drcontext, int sysnum,
 
 static bool filter_syscall(void *drcontext, int sysnum) { return true; }
 
-static bool has_copied_runtime(void);
-static bool is_copied_vfork_process(void);
 static void ensure_runtime_background(void);
 static void runtime_background_init(void *argument);
 
@@ -1843,9 +2780,16 @@ static bool prepare_original_identity_syscall(void *drcontext,
 static void post_syscall(void *drcontext, int sysnum) {
   ptr_int_t syscall_result = (ptr_int_t)dr_syscall_get_result(drcontext);
   ptr_int_t host_syscall_result = syscall_result;
+  int32_t completed_virtual_child = 0;
   prototype_counters_t *counters = (prototype_counters_t *)drmgr_get_tls_field(
       drcontext, thread_state_index);
   DR_ASSERT(counters != NULL);
+
+  if (reject_opened_proc_mem((uintptr_t)drcontext, sysnum,
+                             host_syscall_result)) {
+    dr_syscall_set_result(drcontext, (reg_t)-EPERM);
+    return;
+  }
 
   // Re-arm the guest-stack scrub (see `scrub_guest_stack_residue`). Servicing a
   // clone-family syscall is the second measured point -- after DynamoRIO's own
@@ -1865,6 +2809,7 @@ static void post_syscall(void *drcontext, int sysnum) {
 
   if (counters->pending_virtual_child != 0 && is_clone_syscall(sysnum)) {
     int32_t virtual_child = complete_clone_identity(counters, syscall_result);
+    completed_virtual_child = virtual_child;
     if (syscall_result > 0) {
       syscall_result = virtual_child;
       dr_syscall_set_result(drcontext, (reg_t)syscall_result);
@@ -1890,19 +2835,24 @@ static void post_syscall(void *drcontext, int sysnum) {
     }
   }
 
+  if (is_exec_syscall(sysnum) && evidence_is_enabled())
+    require_evidence_flush(EVIDENCE_FRAME_EXEC_CANCEL);
+
   if (has_copied_runtime() &&
       (!runtime_uses_external_global() || is_copied_vfork_process()))
     return;
 
   if (counters->pending_thread_clone != 0) {
     if (host_syscall_result >= 0) {
-      int32_t registration = reverie_dbt_runtime_thread_created(
+      evidence_callback_enter();
+      int32_t registration = reverie_dbt_runtime_thread_created_v2(
           counters, drcontext, (int32_t)dr_get_thread_id(drcontext),
           (int32_t)dr_get_process_id(),
           atomic_load_explicit(&branch_count, memory_order_relaxed),
-          (int32_t)host_syscall_result, counters->thread_clone_ctid,
-          counters->thread_clone_flags, invoke_syscall, read_registers,
-          write_registers);
+          (int32_t)host_syscall_result, completed_virtual_child,
+          counters->thread_clone_ctid, counters->thread_clone_flags,
+          invoke_syscall, read_registers, write_registers);
+      evidence_callback_leave();
       if (registration < 0) {
         dr_fprintf(diagnostic_file,
                    "reverie-dbt: child thread registration failed\n");
@@ -1913,7 +2863,9 @@ static void post_syscall(void *drcontext, int sysnum) {
     counters->pending_thread_clone = 0;
   }
   if (is_exec_syscall(sysnum)) {
+    evidence_callback_enter();
     reverie_dbt_runtime_exec_failed(counters, (int32_t)dr_get_process_id());
+    evidence_callback_leave();
     return;
   }
 
@@ -1944,6 +2896,65 @@ static bool is_copied_vfork_process(void) {
   return has_copied_runtime() &&
          atomic_load_explicit(&copied_vfork_pid, memory_order_acquire) ==
              (int32_t)dr_get_process_id();
+}
+
+static void finalize_runtime_process(void) {
+  evidence_sender_state_t *sender = NULL;
+  if (evidence_is_enabled()) {
+    dr_mutex_lock(evidence_lock);
+    sender = evidence_sender_locked();
+    if (sender == NULL) {
+      dr_mutex_unlock(evidence_lock);
+      dr_fprintf(diagnostic_file,
+                 "reverie-dbt: protected evidence finalization failed\n");
+      exit_runtime_tree(101);
+      return;
+    }
+    if (sender->finalization_started) {
+      dr_mutex_unlock(evidence_lock);
+      return;
+    }
+    sender->finalization_started = true;
+    dr_mutex_unlock(evidence_lock);
+  }
+  if (!has_copied_runtime() ||
+      (runtime_uses_external_global() && !is_copied_vfork_process())) {
+    evidence_callback_enter();
+    reverie_dbt_runtime_process_exit();
+    evidence_callback_leave();
+  }
+  if (!evidence_is_enabled())
+    return;
+
+  if (!has_copied_runtime()) {
+    int attempts = 0;
+    int32_t state =
+        atomic_load_explicit(&runtime_background_state, memory_order_acquire);
+    while ((state == 1 || state == 2) && attempts++ != 5000) {
+      dr_sleep(1);
+      state =
+          atomic_load_explicit(&runtime_background_state, memory_order_acquire);
+    }
+    if (state == 1 || state == 2) {
+      dr_fprintf(diagnostic_file,
+                 "reverie-dbt: runtime background did not quiesce after shutdown\n");
+      exit_runtime_tree(101);
+      return;
+    }
+  }
+  require_evidence_flush(EVIDENCE_FRAME_FINAL);
+}
+
+static bool evidence_current_process_finalized(void) {
+  evidence_sender_state_t *sender;
+  bool finalized;
+  if (!evidence_is_enabled())
+    return true;
+  dr_mutex_lock(evidence_lock);
+  sender = evidence_sender_locked();
+  finalized = sender != NULL && sender->finalized;
+  dr_mutex_unlock(evidence_lock);
+  return finalized;
 }
 
 static void report_copied_unsupported_syscall(int sysnum) {
@@ -2350,6 +3361,11 @@ static bool pre_syscall(void *drcontext, int sysnum) {
   // TODO-HUMAN-REVIEW(PR-134): Review post-application runtime bootstrap.
   if (!has_copied_runtime())
     ensure_runtime_background();
+  if (test_wait_for_background && !has_copied_runtime()) {
+    while (atomic_load_explicit(&runtime_background_state,
+                                memory_order_acquire) != 3)
+      dr_sleep(1);
+  }
 
   /* A delayed entry-block flush is not synchronous.  If a native child reaches
    * a syscall through an inherited fragment, start it here after the
@@ -2365,16 +3381,24 @@ static bool pre_syscall(void *drcontext, int sysnum) {
   for (i = 0; i != 6; ++i)
     args[i] = (uint64_t)dr_syscall_get_param(drcontext, i);
 
+  if (protect_evidence_socket_syscall((uintptr_t)drcontext, sysnum, args,
+                                      &result)) {
+    dr_syscall_set_result(drcontext, (reg_t)result);
+    return false;
+  }
+
   // AUTONOMOUS-BOT-IMPLEMENTED
   // TODO-HUMAN-REVIEW(PR-255): Review copied-process Detcore state rebasing.
   if (has_copied_runtime() && runtime_uses_external_global() &&
       !is_copied_vfork_process() &&
       copied_process_runtime_pid != dr_get_process_id()) {
+    evidence_callback_enter();
     int32_t initialized = reverie_dbt_runtime_thread_init(
         counters, drcontext, (int32_t)dr_get_thread_id(drcontext),
         (int32_t)dr_get_process_id(), in_tree_parent_pid(),
         atomic_load_explicit(&branch_count, memory_order_relaxed), 0,
         invoke_syscall, read_registers, write_registers);
+    evidence_callback_leave();
     if (initialized != 0) {
       dr_fprintf(diagnostic_file,
                  "reverie-dbt: copied process state initialization failed\n");
@@ -2396,8 +3420,10 @@ static bool pre_syscall(void *drcontext, int sysnum) {
           (int32_t)dr_get_thread_id(dr_get_current_drcontext()),
           counters->pending_virtual_child);
     }
+    evidence_callback_enter();
     int32_t copied_action =
         reverie_dbt_runtime_copied_syscall((int64_t)sysnum, args);
+    evidence_callback_leave();
     // Negative actions are deterministic errno values synthesized by the
     // copied-child policy. They avoid executing a host-dependent syscall while
     // preserving the error that the instrumented root observes.
@@ -2448,7 +3474,13 @@ static bool pre_syscall(void *drcontext, int sysnum) {
       dr_syscall_set_result(drcontext, (reg_t)result);
       return false;
     }
-    return prepare_original_identity_syscall(drcontext, counters, sysnum, args);
+    if (sysnum == SYS_exit || sysnum == SYS_exit_group)
+      complete_runtime_thread_exit(counters, drcontext, sysnum == SYS_exit);
+    bool execute =
+        prepare_original_identity_syscall(drcontext, counters, sysnum, args);
+    if (execute && is_exec_syscall(sysnum))
+      require_evidence_flush(EVIDENCE_FRAME_EXEC);
+    return execute;
   }
   while (!reverie_dbt_runtime_ready(
       atomic_load_explicit(&image_generation, memory_order_acquire)))
@@ -2467,6 +3499,7 @@ static bool pre_syscall(void *drcontext, int sysnum) {
 
   int64_t deferred_sysnum = sysnum;
   uint64_t deferred_args[6] = {0};
+  evidence_callback_enter();
   int32_t action = reverie_dbt_runtime_pre_syscall(
       drcontext, counters, (int32_t)dr_get_thread_id(drcontext),
       (int32_t)dr_get_process_id(),
@@ -2475,6 +3508,8 @@ static bool pre_syscall(void *drcontext, int sysnum) {
       atomic_load_explicit(&branch_count, memory_order_relaxed), &result,
       &deferred_sysnum, deferred_args, invoke_syscall, read_registers,
       write_registers, read_memory, write_memory, reverie_dbt_emit);
+  evidence_callback_leave();
+  DR_ASSERT(evidence_callback_depth == 0);
   if (action != 0 && counters->pending_thread_clone != 0)
     counters->pending_thread_clone = 0;
 
@@ -2497,6 +3532,11 @@ static bool pre_syscall(void *drcontext, int sysnum) {
     dr_syscall_set_sysnum(drcontext, sysnum);
     for (i = 0; i != 6; ++i)
       dr_syscall_set_param(drcontext, i, (reg_t)args[i]);
+    if (protect_evidence_socket_syscall((uintptr_t)drcontext, sysnum, args,
+                                        &result)) {
+      dr_syscall_set_result(drcontext, (reg_t)result);
+      return false;
+    }
     if (thread_clone_metadata(drcontext, sysnum, &clone_flags, &clone_ctid)) {
       counters->pending_thread_clone = 1;
       counters->thread_clone_flags = clone_flags;
@@ -2508,13 +3548,13 @@ static bool pre_syscall(void *drcontext, int sysnum) {
       dr_syscall_set_result(drcontext, (reg_t)result);
       return false;
     }
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-255): Review pre-exit guest-transport deregistration.
-    if (runtime_uses_external_global() && sysnum == SYS_exit_group)
-      reverie_dbt_runtime_thread_exit(
-          counters, drcontext, (int32_t)dr_get_thread_id(drcontext),
-          invoke_syscall);
-    return prepare_original_identity_syscall(drcontext, counters, sysnum, args);
+    if (sysnum == SYS_exit || sysnum == SYS_exit_group)
+      complete_runtime_thread_exit(counters, drcontext, sysnum == SYS_exit);
+    bool execute =
+        prepare_original_identity_syscall(drcontext, counters, sysnum, args);
+    if (execute && is_exec_syscall(sysnum))
+      require_evidence_flush(EVIDENCE_FRAME_EXEC);
+    return execute;
   }
 
   /* Prototype runtimes can decline these calls; external Tools such as
@@ -2528,7 +3568,13 @@ static bool pre_syscall(void *drcontext, int sysnum) {
     dr_syscall_set_result(drcontext, (reg_t)result);
     return false;
   }
-  return prepare_original_identity_syscall(drcontext, counters, sysnum, args);
+  if (sysnum == SYS_exit || sysnum == SYS_exit_group)
+    complete_runtime_thread_exit(counters, drcontext, sysnum == SYS_exit);
+  bool execute =
+      prepare_original_identity_syscall(drcontext, counters, sysnum, args);
+  if (execute && is_exec_syscall(sysnum))
+    require_evidence_flush(EVIDENCE_FRAME_EXEC);
+  return execute;
 }
 
 static void thread_init(void *drcontext) {
@@ -2563,21 +3609,9 @@ static void thread_init(void *drcontext) {
     DR_ASSERT(counters->preempt_mcontext != NULL);
   }
 
-  int32_t pending_thread_start =
-      !has_copied_runtime() && dr_get_thread_id(drcontext) != dr_get_process_id() &&
-      reverie_dbt_runtime_ready(
-          atomic_load_explicit(&image_generation, memory_order_acquire));
-  int32_t init_result = reverie_dbt_runtime_thread_init(
-      counters, drcontext, (int32_t)dr_get_thread_id(drcontext),
-      (int32_t)dr_get_process_id(), in_tree_parent_pid(),
-      atomic_load_explicit(&branch_count, memory_order_relaxed), 1, invoke_syscall,
-      read_registers, write_registers);
-  if (init_result < 0) {
-    dr_fprintf(diagnostic_file,
-               "reverie-dbt: runtime thread initialization failed\n");
-    exit_runtime_tree(101);
-    return;
-  }
+  // Publish stable virtual identities before entering Rust. Detcore consumes
+  // these fields while constructing its thread state; host tid/pid remain
+  // separate callback arguments for native targeting and pending-map lookup.
   counters->virtual_pid =
       pending_child != 0 && !is_thread ? pending_child : virtual_process_id;
   counters->virtual_ppid = pending_child != 0 && !is_thread
@@ -2587,6 +3621,27 @@ static void thread_init(void *drcontext) {
       pending_child != 0 ? pending_child : ensure_virtual_identity(host_tid);
   counters->pending_virtual_child = 0;
   counters->pending_clone_flags = pending_child != 0 ? clone_flags : 0;
+
+  int32_t pending_thread_start =
+      !has_copied_runtime() && dr_get_thread_id(drcontext) != dr_get_process_id() &&
+      reverie_dbt_runtime_ready(
+          atomic_load_explicit(&image_generation, memory_order_acquire));
+  evidence_thread_enter(counters);
+  evidence_callback_enter();
+  evidence_emit_image_initialization();
+  int32_t init_result = reverie_dbt_runtime_thread_init(
+      counters, drcontext, (int32_t)dr_get_thread_id(drcontext),
+      (int32_t)dr_get_process_id(), in_tree_parent_pid(),
+      atomic_load_explicit(&branch_count, memory_order_relaxed), 1, invoke_syscall,
+      read_registers, write_registers);
+  evidence_callback_leave();
+  DR_ASSERT(evidence_callback_depth == 0);
+  if (init_result < 0) {
+    dr_fprintf(diagnostic_file,
+               "reverie-dbt: runtime thread initialization failed\n");
+    exit_runtime_tree(101);
+    return;
+  }
   if (pending_child != 0) {
     if (!is_thread && (clone_flags & CLONE_VFORK) != 0)
       atomic_store_explicit(&copied_vfork_pid,
@@ -2607,19 +3662,50 @@ static void thread_init(void *drcontext) {
   }
 }
 
-static void thread_exit(void *drcontext) {
-  prototype_counters_t *counters = (prototype_counters_t *)drmgr_get_tls_field(
-      drcontext, thread_state_index);
-  if (counters != NULL &&
-      (!has_copied_runtime() ||
-       (runtime_uses_external_global() && !is_copied_vfork_process()))) {
+static void complete_runtime_thread_exit(prototype_counters_t *counters,
+                                         void *drcontext,
+                                         bool explicit_exit) {
+  bool owns_runtime;
+  if (counters->runtime_thread_exit_called != 0)
+    return;
+  counters->runtime_thread_exit_called = 1;
+  owns_runtime = !has_copied_runtime() ||
+                 (runtime_uses_external_global() &&
+                  !is_copied_vfork_process());
+  if (owns_runtime) {
+    evidence_callback_enter();
     reverie_dbt_runtime_thread_exit(counters, drcontext,
                                     dr_get_thread_id(drcontext),
                                     invoke_syscall);
-    if (counters->preempt_mcontext != NULL)
-      dr_thread_free(drcontext, counters->preempt_mcontext,
-                     sizeof(dr_mcontext_t));
-    dr_thread_free(drcontext, counters, sizeof(*counters));
+    evidence_callback_leave();
+    if (test_thread_exit_evidence && explicit_exit &&
+        evidence_is_enabled() &&
+        counters->evidence_thread_process == dr_get_process_id()) {
+      static const char record[] =
+          "1970-01-01T00:00:00.000000Z INFO reverie_dbt::evidence: "
+          "explicit SYS_exit thread callback completed\n";
+      evidence_callback_enter();
+      reverie_dbt_emit_evidence(record, sizeof(record) - 1);
+      evidence_callback_leave();
+    }
+  }
+}
+
+static void thread_exit(void *drcontext) {
+  prototype_counters_t *counters = (prototype_counters_t *)drmgr_get_tls_field(
+      drcontext, thread_state_index);
+  if (counters != NULL) {
+    bool owns_runtime =
+        !has_copied_runtime() ||
+        (runtime_uses_external_global() && !is_copied_vfork_process());
+    complete_runtime_thread_exit(counters, drcontext, false);
+    evidence_thread_leave(counters);
+    if (owns_runtime) {
+      if (counters->preempt_mcontext != NULL)
+        dr_thread_free(drcontext, counters->preempt_mcontext,
+                       sizeof(dr_mcontext_t));
+      dr_thread_free(drcontext, counters, sizeof(*counters));
+    }
   }
 }
 
@@ -2724,9 +3810,7 @@ static void emit_stats_record(void) {
 }
 
 static void event_exit(void) {
-  if (!has_copied_runtime() ||
-      (runtime_uses_external_global() && !is_copied_vfork_process()))
-    reverie_dbt_runtime_process_exit();
+  finalize_runtime_process();
   uint64_t branches;
   uint64_t syscalls;
   uint64_t rewritten;
@@ -2748,6 +3832,16 @@ static void event_exit(void) {
     dr_close_file(unsupported_report_file);
     unsupported_report_file = INVALID_FILE;
   }
+  if (evidence_is_enabled() && !is_copied_vfork_process() &&
+      evidence_current_process_finalized()) {
+    dr_global_free(evidence_buffer, EVIDENCE_BUFFER_CAPACITY);
+    evidence_buffer = NULL;
+    dr_global_free(evidence_senders,
+                   sizeof(evidence_sender_state_t) * EVIDENCE_MAX_SENDERS);
+    evidence_senders = NULL;
+    dr_mutex_destroy(evidence_lock);
+    evidence_lock = NULL;
+  }
   dr_mutex_destroy(resource_lock);
   drwrap_exit();
   drx_exit();
@@ -2759,15 +3853,13 @@ static void event_exit(void) {
 
 static void runtime_idle(void) { dr_sleep(1); }
 
-static _Atomic int32_t runtime_background_state;
-
-static runtime_callbacks_t runtime_callbacks = {
-    reverie_dbt_emit, runtime_idle, 0, 0, reverie_dbt_emit_stdout};
-
 static void runtime_background_init(void *argument) {
   (void)argument;
   atomic_store_explicit(&runtime_background_state, 2, memory_order_release);
-  reverie_dbt_runtime_background_init(&runtime_callbacks);
+  evidence_callback_enter();
+  reverie_dbt_runtime_background_init_v2(&runtime_callbacks_page.value);
+  evidence_callback_leave();
+  atomic_store_explicit(&runtime_background_state, 3, memory_order_release);
 }
 
 static void ensure_runtime_background(void) {
@@ -2790,14 +3882,86 @@ static void ensure_runtime_background(void) {
 DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[]) {
   drreg_options_t register_options = {sizeof(register_options), 1, false};
   bool external_global = false;
+  bool test_direct_evidence_entry = false;
+  bool test_runtime_abi_mismatch = false;
+  bool evidence_socket_seen = false;
+  bool evidence_token_seen = false;
+  unsigned char evidence_address[EVIDENCE_ADDRESS_LEN] = {0};
+  unsigned char evidence_token[EVIDENCE_TOKEN_LEN] = {0};
 
+  diagnostic_file = STDERR;
   for (int i = 1; i < argc; ++i) {
     if (strcmp(argv[i], "-external-global") == 0)
       external_global = true;
+    else if (strcmp(argv[i], "-test-direct-evidence-entry") == 0)
+      test_direct_evidence_entry = true;
+    else if (strcmp(argv[i], "-test-runtime-abi-mismatch") == 0)
+      test_runtime_abi_mismatch = true;
+    else if (strcmp(argv[i], "-test-wait-for-background") == 0)
+      test_wait_for_background = true;
+    else if (strcmp(argv[i], "-test-kill-announced-child") == 0)
+      test_kill_announced_child = true;
+    else if (strcmp(argv[i], "-test-thread-exit-evidence") == 0)
+      test_thread_exit_evidence = true;
+    else if (strcmp(argv[i], "-diagnostic_fd") == 0) {
+      int fd;
+      DR_ASSERT(++i < argc);
+      DR_ASSERT(dr_sscanf(argv[i], "%d", &fd) == 1);
+      DR_ASSERT(fd >= 0);
+      diagnostic_file = (file_t)fd;
+    } else if (strcmp(argv[i], "-evidence-socket") == 0) {
+      DR_ASSERT(++i < argc);
+      DR_ASSERT(decode_hex(argv[i], evidence_address,
+                           sizeof(evidence_address)));
+      evidence_socket_seen = true;
+    } else if (strcmp(argv[i], "-evidence-token") == 0) {
+      DR_ASSERT(++i < argc);
+      DR_ASSERT(decode_hex(argv[i], evidence_token, sizeof(evidence_token)));
+      evidence_token_seen = true;
+    } else if (strcmp(argv[i], "-evidence-log-level") == 0) {
+      int level;
+      DR_ASSERT(++i < argc);
+      DR_ASSERT(dr_sscanf(argv[i], "%d", &level) == 1);
+      DR_ASSERT(level >= 0 && level <= 5);
+      runtime_callbacks_page.value.evidence_log_level = level;
+    }
   }
-  diagnostic_file = STDERR;
+  uint32_t runtime_abi_version = reverie_dbt_runtime_abi_version();
+  if (test_runtime_abi_mismatch)
+    ++runtime_abi_version;
+  if (runtime_abi_version != REVERIE_DBT_RUNTIME_ABI_VERSION ||
+      reverie_dbt_runtime_callbacks_size() != sizeof(runtime_callbacks_t)) {
+    dr_fprintf(diagnostic_file,
+               "reverie-dbt: native/runtime ABI version or callback size mismatch\n");
+    dr_exit_process(101);
+    return;
+  }
+  DR_ASSERT(evidence_socket_seen == evidence_token_seen);
+  DR_ASSERT(dr_page_size() == EVIDENCE_CONFIG_PAGE_SIZE);
+  evidence_config_page.value.enabled =
+      (unsigned char)(evidence_socket_seen && evidence_token_seen);
+  memcpy(evidence_config_page.value.address, evidence_address,
+         sizeof(evidence_address));
+  memcpy(evidence_config_page.value.token, evidence_token,
+         sizeof(evidence_token));
+  DR_ASSERT(dr_memory_protect(&evidence_config_page,
+                              sizeof(evidence_config_page),
+                              DR_MEMPROT_READ));
+  runtime_callbacks_page.value.emit_evidence =
+      evidence_is_enabled() ? reverie_dbt_emit_evidence : reverie_dbt_emit;
+  if (!evidence_is_enabled())
+    runtime_callbacks_page.value.evidence_log_level = 0;
   atomic_store_explicit(&runtime_background_state, 0, memory_order_release);
   runtime_owner_pid = dr_get_process_id();
+  initialize_evidence_transport();
+  if (test_direct_evidence_entry) {
+    static const char record[] =
+        "1970-01-01T00:00:00.000000Z INFO reverie_dbt::evidence: "
+        "direct entry must be refused\n";
+    DR_ASSERT(evidence_is_enabled());
+    reverie_dbt_emit_evidence(record, sizeof(record) - 1);
+    DR_ASSERT(false);
+  }
   initialize_virtual_identity_state(external_global);
   if (lookup_virtual_identity((int32_t)runtime_owner_pid,
                               &virtual_process_id)) {
@@ -2818,13 +3982,11 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[]) {
   for (int i = 1; i < argc; ++i) {
     if (strcmp(argv[i], "-summary") == 0)
       report_summary = true;
-    else if (strcmp(argv[i], "-diagnostic_fd") == 0) {
-      int fd;
-      DR_ASSERT(++i < argc);
-      DR_ASSERT(dr_sscanf(argv[i], "%d", &fd) == 1);
-      DR_ASSERT(fd >= 0);
-      diagnostic_file = (file_t)fd;
-    }
+    else if (strcmp(argv[i], "-diagnostic_fd") == 0 ||
+             strcmp(argv[i], "-evidence-socket") == 0 ||
+             strcmp(argv[i], "-evidence-token") == 0 ||
+             strcmp(argv[i], "-evidence-log-level") == 0)
+      ++i;
     else if (strcmp(argv[i], "-stats_path") == 0) {
       DR_ASSERT(++i < argc);
       DR_ASSERT(strlen(argv[i]) < sizeof(stats_path));
@@ -2837,7 +3999,18 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[]) {
                   "%s", argv[i]);
     }
     else if (strcmp(argv[i], "-panic-on-unsupported-syscalls") == 0)
-      runtime_callbacks.panic_on_unsupported_syscalls = 1;
+      runtime_callbacks_page.value.panic_on_unsupported_syscalls = 1;
+    else if (strcmp(argv[i], "-test-direct-evidence-entry") == 0) {
+      /* Handled before application initialization. */
+    }
+    else if (strcmp(argv[i], "-test-runtime-abi-mismatch") == 0) {
+      /* Handled before application initialization. */
+    }
+    else if (strcmp(argv[i], "-test-wait-for-background") == 0 ||
+             strcmp(argv[i], "-test-kill-announced-child") == 0 ||
+             strcmp(argv[i], "-test-thread-exit-evidence") == 0) {
+      /* Used only by native lifecycle regression tests. */
+    }
     else if (strcmp(argv[i], "-isolated-process-group") == 0)
       runtime_process_group = (process_id_t)getpgrp();
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2878,7 +4051,11 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[]) {
       dr_fprintf(diagnostic_file,
                  "reverie-dbt: failed to open private unsupported-syscall report\n");
   }
-  runtime_callbacks.unsupported_report_fd = (int32_t)unsupported_report_file;
+  runtime_callbacks_page.value.unsupported_report_fd =
+      (int32_t)unsupported_report_file;
+  DR_ASSERT(dr_memory_protect(&runtime_callbacks_page,
+                              sizeof(runtime_callbacks_page),
+                              DR_MEMPROT_READ));
 
   dr_set_client_name("Reverie DynamoRIO backend prototype",
                      "https://github.com/rrnewton/reverie");

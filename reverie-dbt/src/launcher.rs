@@ -35,6 +35,8 @@ use reverie_rpc_transport::RpcServer;
 
 use crate::backend_stats::DbtBackendStatsAggregator;
 use crate::backend_stats::DbtBackendStatsSource;
+use crate::evidence::DbtEvidenceLogLevel;
+use crate::evidence::EvidenceSession;
 
 const CLIENT_ENV: &str = "REVERIE_DBT_CLIENT";
 const DYNAMORIO_ENV: &str = "DYNAMORIO_HOME";
@@ -67,6 +69,8 @@ pub struct DbtRunner {
     drrun: PathBuf,
     client: PathBuf,
     client_arguments: Vec<OsString>,
+    evidence: Option<Arc<EvidenceSession>>,
+    evidence_log_level: DbtEvidenceLogLevel,
     summary: bool,
     isolated_process_group: bool,
     terminate_process_group_on_exit: bool,
@@ -102,6 +106,8 @@ impl DbtRunner {
             drrun,
             client,
             client_arguments: Vec::new(),
+            evidence: None,
+            evidence_log_level: DbtEvidenceLogLevel::Info,
             summary: false,
             isolated_process_group: false,
             terminate_process_group_on_exit: false,
@@ -119,6 +125,36 @@ impl DbtRunner {
     /// Adds an argument passed to the native client in every instrumented process image.
     pub fn client_argument(mut self, argument: impl Into<OsString>) -> Self {
         self.client_arguments.push(argument.into());
+        self
+    }
+
+    /// Collects canonical runtime evidence over a protected one-run sideband.
+    ///
+    /// `file` must be a fresh, empty, unlinked `O_RDWR` regular file. The caller
+    /// retains its handle for reading after the complete followed process tree
+    /// exits. During execution, authenticated length-framed records live only in
+    /// launcher memory; the file is non-authoritative and may be guest-mutable.
+    /// After every image sends its final marker and the tree is reaped, the
+    /// launcher truncates and publishes one checksummed framed artifact. Use
+    /// [`crate::decode_evidence`] rather than splitting that artifact on newlines.
+    ///
+    /// One configured collector is valid for exactly one run. Clones share that
+    /// same run; a later run requires a new runner and a new empty file.
+    pub fn evidence_file(mut self, file: &File) -> io::Result<Self> {
+        self.evidence = Some(Arc::new(EvidenceSession::new(file)?));
+        // Evidence is published only after this non-escapable process group is
+        // empty. The native client rejects guest setpgid/setsid while this mode
+        // is active, so no followed descendant can outlive publication.
+        self.isolated_process_group = true;
+        Ok(self)
+    }
+
+    /// Sets the protected tracing level used only by the evidence subscriber.
+    ///
+    /// This client argument is not added to the guest environment, so selecting
+    /// INFO for verification does not overwrite a guest's own `HERMIT_LOG`.
+    pub fn evidence_log_level(mut self, level: DbtEvidenceLogLevel) -> Self {
+        self.evidence_log_level = level;
         self
     }
 
@@ -145,7 +181,7 @@ impl DbtRunner {
 
     /// Runs `guest` with inherited standard streams and waits for it to exit.
     pub fn status(&self, guest: &Command) -> io::Result<ExitStatus> {
-        let child = self.command(guest, None).spawn()?;
+        let child = self.spawn_command(&mut self.command(guest, None))?;
         self.wait_for_status(child)
     }
 
@@ -155,29 +191,29 @@ impl DbtRunner {
         guest: &Command,
         environment: &BTreeMap<OsString, OsString>,
     ) -> io::Result<ExitStatus> {
-        let child = self.command(guest, Some(environment)).spawn()?;
+        let child = self.spawn_command(&mut self.command(guest, Some(environment)))?;
         self.wait_for_status(child)
     }
 
     /// Runs `guest` and captures its standard output and standard error.
     pub fn output(&self, guest: &Command) -> io::Result<Output> {
-        let child = self
-            .command(guest, None)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        let child = self.spawn_command(
+            self.command(guest, None)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )?;
         self.wait_with_output(child)
     }
 
     /// Captures guest output while preserving an inherited terminal stdin.
     pub fn output_with_inherited_stdin(&self, guest: &Command) -> io::Result<Output> {
-        let child = self
-            .command(guest, None)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        let child = self.spawn_command(
+            self.command(guest, None)
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )?;
         self.wait_with_output(child)
     }
 
@@ -191,12 +227,12 @@ impl DbtRunner {
     where
         R: Read + Send,
     {
-        let mut child = self
-            .command(guest, None)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        let mut child = self.spawn_command(
+            self.command(guest, None)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )?;
         let mut stdin = child.stdin.take().ok_or_else(|| {
             io::Error::new(io::ErrorKind::BrokenPipe, "failed to open DBT guest stdin")
         })?;
@@ -225,12 +261,12 @@ impl DbtRunner {
     where
         R: Read + Send + 'static,
     {
-        let child = self
-            .command(guest, None)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        let child = self.spawn_command(
+            self.command(guest, None)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )?;
         self.wait_with_output_and_detached_reader(child, input)
     }
 
@@ -240,12 +276,12 @@ impl DbtRunner {
         guest: &Command,
         environment: &BTreeMap<OsString, OsString>,
     ) -> io::Result<Output> {
-        let child = self
-            .command(guest, Some(environment))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        let child = self.spawn_command(
+            self.command(guest, Some(environment))
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )?;
         self.wait_with_output(child)
     }
 
@@ -546,7 +582,7 @@ impl DbtRunner {
         if capture_output {
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
         }
-        let child = command.spawn()?;
+        let child = runner.spawn_command(&mut command)?;
         let wait = tokio::task::spawn_blocking(move || match input {
             CoordinatedInput::Reader(input) => runner
                 .wait_with_output_and_detached_reader(child, input)
@@ -603,22 +639,66 @@ impl DbtRunner {
         })
     }
 
-    fn wait_for_status(&self, mut child: Child) -> io::Result<ExitStatus> {
-        if !self.manages_process_group() {
-            return child.wait();
+    fn spawn_command(&self, command: &mut Command) -> io::Result<Child> {
+        if let Some(evidence) = &self.evidence {
+            evidence.claim_run()?;
         }
-
-        let process_group = child.id() as i32;
-        let observed = wait_for_exit_without_reaping(child.id());
-        let terminated = match observed {
-            Ok(()) => terminate_process_group(process_group),
-            Err(_) => Ok(()),
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = self.finish_evidence(false);
+                return Err(error);
+            }
         };
-        let status = child.wait();
+        if let Some(evidence) = &self.evidence
+            && let Err(error) = evidence.publish_root(child.id())
+        {
+            if self.manages_process_group() {
+                let _ = terminate_process_group(child.id() as i32);
+                let _ = wait_for_process_group_no_live_members(child.id() as i32);
+            } else {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+            let _ = self.finish_evidence(false);
+            return Err(error);
+        }
+        Ok(child)
+    }
 
-        observed?;
-        terminated?;
-        status
+    fn wait_for_status(&self, mut child: Child) -> io::Result<ExitStatus> {
+        let status = if !self.manages_process_group() {
+            child.wait()
+        } else {
+            let process_group = child.id() as i32;
+            let observed = wait_for_exit_without_reaping(child.id());
+            let terminated = if observed.is_ok() {
+                terminate_process_group(process_group)
+            } else {
+                Ok(())
+            };
+            let emptied = match (&observed, &terminated) {
+                (Ok(()), Ok(())) => wait_for_process_group_no_live_members(process_group),
+                _ => Ok(()),
+            };
+            let status = child.wait();
+            match (observed.and(terminated).and(emptied), status) {
+                (Ok(()), status) => status,
+                (Err(error), _) => Err(error),
+            }
+        };
+        let evidence = self.finish_evidence(status.is_ok());
+        match (status, evidence) {
+            (Ok(status), Ok(())) => Ok(status),
+            (Err(error), _) => Err(error),
+            (Ok(status), Err(error)) => Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "DBT guest exited with status {:?} while protected evidence failed: {error}",
+                    status.code()
+                ),
+            )),
+        }
     }
 
     fn wait_with_output(&self, mut child: Child) -> io::Result<Output> {
@@ -706,12 +786,23 @@ impl DbtRunner {
     fn terminate_and_reap(&self, child: &mut Child) {
         if self.manages_process_group() {
             let _ = terminate_process_group(child.id() as i32);
+            let _ = wait_for_process_group_no_live_members(child.id() as i32);
         }
         let _ = child.wait();
+        let _ = self.finish_evidence(false);
     }
 
     fn manages_process_group(&self) -> bool {
-        self.isolated_process_group || self.terminate_process_group_on_exit
+        self.evidence.is_some()
+            || self.isolated_process_group
+            || self.terminate_process_group_on_exit
+    }
+
+    fn finish_evidence(&self, publication_allowed: bool) -> io::Result<()> {
+        match &self.evidence {
+            Some(evidence) => evidence.finish(publication_allowed),
+            None => Ok(()),
+        }
     }
 
     fn command(
@@ -728,8 +819,14 @@ impl DbtRunner {
             .arg(&self.client)
             .arg("-diagnostic_fd")
             .arg(DIAGNOSTIC_FD.to_string());
+        if let Some(evidence) = &self.evidence {
+            command.args(evidence.client_arguments());
+            command
+                .arg("-evidence-log-level")
+                .arg(self.evidence_log_level.code().to_string());
+        }
         command.args(&self.client_arguments);
-        if self.isolated_process_group {
+        if self.evidence.is_some() || self.isolated_process_group {
             command.arg("-isolated-process-group");
         }
         if self.summary {
@@ -772,8 +869,9 @@ impl DbtRunner {
             command.process_group(0);
         }
 
-        // SAFETY: personality(2) and dup2(2) are async-signal-safe and the closure
-        // captures no process state. Both settings survive drrun and guest execs.
+        // SAFETY: personality(2) and dup2(2) are async-signal-safe. Process-group
+        // isolation is configured above through CommandExt::process_group; all
+        // settings survive drrun and guest execs.
         unsafe {
             command.pre_exec(|| {
                 if libc::dup2(libc::STDERR_FILENO, DIAGNOSTIC_FD) == -1 {
@@ -1031,6 +1129,59 @@ fn terminate_process_group(process_group: i32) -> io::Result<()> {
     Ok(())
 }
 
+fn wait_for_process_group_no_live_members(process_group: i32) -> io::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    wait_for_process_group_no_live_members_until(process_group, deadline)
+}
+
+fn wait_for_process_group_no_live_members_until(
+    process_group: i32,
+    deadline: std::time::Instant,
+) -> io::Result<()> {
+    loop {
+        let mut live_member = false;
+        for entry in std::fs::read_dir("/proc")? {
+            let entry = entry?;
+            if entry
+                .file_name()
+                .as_bytes()
+                .iter()
+                .any(|byte| !byte.is_ascii_digit())
+            {
+                continue;
+            }
+            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            let Some(after_name) = stat.rsplit_once(')').map(|(_, tail)| tail.trim_start()) else {
+                continue;
+            };
+            let mut fields = after_name.split_ascii_whitespace();
+            let Some(state) = fields.next() else {
+                continue;
+            };
+            let _parent = fields.next();
+            let Some(group) = fields.next().and_then(|field| field.parse::<i32>().ok()) else {
+                continue;
+            };
+            if group == process_group && !matches!(state, "Z" | "X") {
+                live_member = true;
+                break;
+            }
+        }
+        if !live_member {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "DBT process group still had live members after termination",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 fn shebang(program: &OsStr) -> Option<(PathBuf, Vec<OsString>)> {
     let mut bytes = Vec::new();
     File::open(Path::new(program))
@@ -1125,6 +1276,8 @@ fn require_file(path: &Path, description: &str) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Seek as _;
+
     use super::*;
 
     fn runner() -> DbtRunner {
@@ -1132,6 +1285,8 @@ mod tests {
             drrun: PathBuf::from("/opt/dynamorio/bin64/drrun"),
             client: PathBuf::from("/opt/reverie/libreverie_dbt_client.so"),
             client_arguments: Vec::new(),
+            evidence: None,
+            evidence_log_level: DbtEvidenceLogLevel::Info,
             summary: false,
             isolated_process_group: false,
             terminate_process_group_on_exit: false,
@@ -1145,6 +1300,32 @@ mod tests {
         let mut permissions = std::fs::metadata(path).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    fn compile_evidence_forge_fixture(directory: &Path) -> PathBuf {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/evidence_forge.c");
+        let output = directory.join("evidence_forge");
+        let compiler = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+        let status = Command::new(compiler)
+            .args(["-std=gnu11", "-O2", "-Wall", "-Wextra", "-Werror"])
+            .arg(source)
+            .arg("-o")
+            .arg(&output)
+            .status()
+            .expect("failed to invoke the C compiler for evidence_forge.c");
+        assert!(status.success(), "failed to compile evidence_forge.c");
+        output
+    }
+
+    fn disclose_evidence_credentials(runner: &DbtRunner, guest: &mut Command) {
+        let arguments = runner
+            .evidence
+            .as_ref()
+            .expect("test runner has no evidence session")
+            .client_arguments();
+        guest
+            .env("EVIDENCE_SOCKET", &arguments[1])
+            .env("EVIDENCE_TOKEN", &arguments[3]);
     }
 
     struct BlockingReader(std::sync::mpsc::Receiver<()>);
@@ -1180,6 +1361,15 @@ mod tests {
                 .get_args()
                 .any(|argument| argument == OsStr::new("-isolated-process-group"))
         );
+    }
+
+    #[test]
+    fn process_group_wait_times_out_while_a_live_member_remains() {
+        let process_group = unsafe { libc::getpgrp() };
+        let error =
+            wait_for_process_group_no_live_members_until(process_group, std::time::Instant::now())
+                .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 
     #[test]
@@ -1669,5 +1859,269 @@ mod tests {
 
         let error = sink.drain().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Other);
+    }
+
+    #[test]
+    #[ignore = "requires built DynamoRIO and native client; run explicitly with --ignored"]
+    fn protected_evidence_rejects_disclosed_credentials_and_config_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = compile_evidence_forge_fixture(directory.path());
+        let mut file = tempfile::tempfile().unwrap();
+        let runner = DbtRunner::from_env()
+            .expect("DYNAMORIO_HOME and REVERIE_DBT_CLIENT must select the live native client")
+            .evidence_file(&file)
+            .unwrap()
+            .client_argument("-test-wait-for-background");
+        let mut guest = Command::new(fixture);
+        disclose_evidence_credentials(&runner, &mut guest);
+
+        let mut command = runner.command(&guest, None);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = runner.spawn_command(&mut command).unwrap();
+        let process_group = child.id() as i32;
+        let output = child.wait_with_output().unwrap();
+        wait_for_process_group_no_live_members(process_group).unwrap();
+        if let Err(error) = runner.finish_evidence(true) {
+            panic!(
+                "protected evidence guard run failed: {error}; stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert!(
+            output.status.success(),
+            "guard fixture failed: status={:?} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"evidence-guards-ok\n");
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        let evidence = crate::decode_evidence(&bytes).unwrap();
+        assert!(
+            !evidence.records().is_empty(),
+            "live integrity run produced no canonical evidence records"
+        );
+        assert!(evidence.records().iter().all(|record| {
+            !record
+                .windows(b"forged-evidence".len())
+                .any(|window| window == b"forged-evidence")
+        }));
+    }
+
+    #[test]
+    #[ignore = "requires built DynamoRIO and native client; run explicitly with --ignored"]
+    fn protected_evidence_refuses_a_valid_frame_from_outside_the_guest_tree() {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = compile_evidence_forge_fixture(directory.path());
+        let mut file = tempfile::tempfile().unwrap();
+        let runner = DbtRunner::from_env()
+            .expect("DYNAMORIO_HOME and REVERIE_DBT_CLIENT must select the live native client")
+            .evidence_file(&file)
+            .unwrap()
+            .client_argument("-test-wait-for-background");
+        let mut guest = Command::new("/bin/sleep");
+        guest.arg("30");
+        let mut command = runner.command(&guest, None);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = runner.spawn_command(&mut command).unwrap();
+        let process_group = child.id() as i32;
+
+        let mut outside = Command::new(fixture);
+        outside.env("EVIDENCE_FORGE_MODE", "outside-tree");
+        disclose_evidence_credentials(&runner, &mut outside);
+        let outside_output = outside.output().unwrap();
+        assert!(
+            outside_output.status.success(),
+            "outside-tree probe failed: {outside_output:?}"
+        );
+        assert_eq!(outside_output.stdout, b"outside-tree-evidence-refused\n");
+
+        terminate_process_group(process_group).unwrap();
+        wait_for_process_group_no_live_members(process_group).unwrap();
+        let _ = child.wait();
+        let error = runner.finish_evidence(true).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            error.to_string(),
+            "DBT evidence peer is outside the launched process tree"
+        );
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert!(
+            bytes.is_empty(),
+            "refused outside-tree frame published evidence"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires built DynamoRIO and native client; run explicitly with --ignored"]
+    fn protected_evidence_retries_after_a_dropped_acknowledgement() {
+        let mut file = tempfile::tempfile().unwrap();
+        let runner = DbtRunner::from_env()
+            .expect("DYNAMORIO_HOME and REVERIE_DBT_CLIENT must select the live native client")
+            .evidence_file(&file)
+            .unwrap()
+            .client_argument("-test-wait-for-background");
+        runner
+            .evidence
+            .as_ref()
+            .unwrap()
+            .drop_next_acknowledgement();
+        let guest = Command::new("/bin/true");
+        let mut command = runner.command(&guest, None);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = runner.spawn_command(&mut command).unwrap();
+        let process_group = child.id() as i32;
+        let output = child.wait_with_output().unwrap();
+        wait_for_process_group_no_live_members(process_group).unwrap();
+        if let Err(error) = runner.finish_evidence(true) {
+            panic!(
+                "protected evidence retry run failed: {error}; stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert!(
+            output.status.success(),
+            "retry guest failed: status={:?} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        let evidence = crate::decode_evidence(&bytes).unwrap();
+        assert!(
+            !evidence.records().is_empty(),
+            "retry run produced no canonical evidence records"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires built DynamoRIO and native client; run explicitly with --ignored"]
+    fn protected_evidence_refuses_an_announced_child_killed_before_start() {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = compile_evidence_forge_fixture(directory.path());
+        let mut file = tempfile::tempfile().unwrap();
+        let runner = DbtRunner::from_env()
+            .expect("DYNAMORIO_HOME and REVERIE_DBT_CLIENT must select the live native client")
+            .evidence_file(&file)
+            .unwrap()
+            .client_argument("-test-kill-announced-child");
+        let mut guest = Command::new(fixture);
+        guest.env("EVIDENCE_FORGE_MODE", "killed-child");
+        let mut command = runner.command(&guest, None);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = runner.spawn_command(&mut command).unwrap();
+        let process_group = child.id() as i32;
+        let output = child.wait_with_output().unwrap();
+        wait_for_process_group_no_live_members(process_group).unwrap();
+        assert!(
+            output.status.success(),
+            "killed-child control failed: {output:?}"
+        );
+        assert_eq!(output.stdout, b"killed-announced-child-ok\n");
+        let error = runner.finish_evidence(true).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("missing a child process START or FINAL frame"),
+            "collector refused the killed child for the wrong reason: {error}; stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert!(
+            bytes.is_empty(),
+            "refused evidence run published an artifact"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires built DynamoRIO and native client; run explicitly with --ignored"]
+    fn protected_evidence_rejects_direct_emitter_entry() {
+        let mut file = tempfile::tempfile().unwrap();
+        let runner = DbtRunner::from_env()
+            .expect("DYNAMORIO_HOME and REVERIE_DBT_CLIENT must select the live native client")
+            .evidence_file(&file)
+            .unwrap()
+            .client_argument("-test-direct-evidence-entry");
+        let guest = Command::new("/bin/true");
+        let mut command = runner.command(&guest, None);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = runner.spawn_command(&mut command).unwrap();
+        let process_group = child.id() as i32;
+        let output = child.wait_with_output().unwrap();
+        wait_for_process_group_no_live_members(process_group).unwrap();
+        assert!(runner.finish_evidence(true).is_err());
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(output.status.code(), Some(101));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("rejected evidence outside a protected callback"),
+            "direct emitter failed for the wrong reason: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            bytes.is_empty(),
+            "failed evidence run published an artifact"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires built DynamoRIO and native client; run explicitly with --ignored"]
+    fn native_runtime_abi_mismatch_fails_before_guest_execution() {
+        let mut file = tempfile::tempfile().unwrap();
+        let runner = DbtRunner::from_env()
+            .expect("DYNAMORIO_HOME and REVERIE_DBT_CLIENT must select the live native client")
+            .evidence_file(&file)
+            .unwrap()
+            .client_argument("-test-runtime-abi-mismatch");
+        let guest = Command::new("/bin/true");
+        let mut command = runner.command(&guest, None);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = runner.spawn_command(&mut command).unwrap();
+        let process_group = child.id() as i32;
+        let output = child.wait_with_output().unwrap();
+        wait_for_process_group_no_live_members(process_group).unwrap();
+        assert!(runner.finish_evidence(true).is_err());
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(output.status.code(), Some(101));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("native/runtime ABI version or callback size mismatch"),
+            "runtime ABI mismatch failed for the wrong reason: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            bytes.is_empty(),
+            "runtime ABI mismatch published an evidence artifact"
+        );
     }
 }
