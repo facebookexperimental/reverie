@@ -5347,9 +5347,14 @@ impl<L: Tool + 'static> TracedTask<L> {
         // may run all the way to exit in this case, so we must not assume it
         // stops again.
         if !matches!(self.resumed_by_gdb, Some(ResumeAction::Step(_))) {
+            // Release the siblings frozen above *before* waiting for this
+            // task's next event. gdb has resumed everything, and this task may
+            // now block on a sibling -- a join, a futex, a pipe read -- which a
+            // frozen sibling can never satisfy. Waiting first deadlocks the
+            // guest.
+            self.thaw_all().await?;
             let wait = running.next_state().await?;
             self.arm_liteinst_wait(&wait);
-            self.thaw_all().await?;
             return Ok(wait);
         }
 
@@ -5396,9 +5401,12 @@ impl<L: Tool + 'static> TracedTask<L> {
         let running = self
             .await_gdb_resume(task, ExpectedGdbResume::Resume)
             .await?;
+        // Same ordering requirement as the plain-continue path above: the
+        // step-over is finished and the breakpoint is back in place, so the
+        // siblings must be released before this task's next event is awaited.
+        self.thaw_all().await?;
         let wait = running.next_state().await?;
         self.arm_liteinst_wait(&wait);
-        self.thaw_all().await?;
         Ok(wait)
     }
 
