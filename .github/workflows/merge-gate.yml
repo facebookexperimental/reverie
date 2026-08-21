@@ -1,14 +1,6 @@
 name: Merge Gate
 
 on:
-  pull_request:
-    branches: [main]
-    types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review]
-  merge_group:
-    types: [checks_requested]
-  workflow_run:
-    workflows: ["Rust"]
-    types: [completed]
   workflow_dispatch:
     inputs:
       pr_number:
