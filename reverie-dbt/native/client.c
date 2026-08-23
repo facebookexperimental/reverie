@@ -80,6 +80,10 @@ typedef struct {
   // `PrototypeCounters` prefix view) is unchanged; the `memset` in `thread_init`
   // zero-initializes it for every runtime.
   uint64_t last_yield_branch;
+  // One-shot delivery latch for the process-clone result callback. Kept
+  // client-only so identity handoff state can retain its existing CLONE_VM
+  // lifetime without causing a later syscall to repeat the callback.
+  uint64_t pending_process_clone_result;
   // AUTONOMOUS-BOT-IMPLEMENTED
   // TODO-HUMAN-REVIEW(PR-dbi-preempt): Review safe-point preemption thread state.
   // Client-only safe-point preemption state, appended AFTER the fields the Rust
@@ -190,7 +194,7 @@ static const cpuid_result_t extended_cpuid[] = {
 // exit, and app-level writes re-enter the syscall interception path.
 typedef void (*reverie_emit_fn_t)(const char *buf, size_t len);
 typedef void (*reverie_idle_fn_t)(void);
-#define REVERIE_DBT_RUNTIME_ABI_VERSION 2u
+#define REVERIE_DBT_RUNTIME_ABI_VERSION 3u
 // TODO-HUMAN-REVIEW(PR-162): Review the additive stdout-emit runtime callback ABI.
 typedef struct {
   reverie_emit_fn_t emit;
@@ -251,6 +255,8 @@ extern void reverie_dbt_runtime_thread_exit(prototype_counters_t *counters,
 extern uint64_t reverie_dbt_runtime_image_init(void);
 extern void reverie_dbt_runtime_exec_failed(prototype_counters_t *counters,
                                             int32_t pid);
+extern void reverie_dbt_runtime_process_clone_result(
+    prototype_counters_t *counters, int64_t sysnum, int64_t result);
 extern void reverie_dbt_runtime_background_init_v2(void *argument);
 extern int32_t reverie_dbt_runtime_ready(uint64_t image_generation);
 extern void reverie_dbt_runtime_process_exit(void);
@@ -1680,6 +1686,13 @@ static void release_clone_identity_handoff(int32_t virtual_child) {
 static bool prepare_clone_identity(prototype_counters_t *counters, int sysnum,
                                    const uint64_t *args) {
   uint64_t flags;
+  if (counters->pending_process_clone_result != 0) {
+    dr_fprintf(
+        diagnostic_file,
+        "reverie-dbt: stale process-clone result state before clone syscall %d\n",
+        sysnum);
+    exit_runtime_tree(101);
+  }
   if (!clone_identity_flags(sysnum, args, &flags))
     return false;
   DR_ASSERT(counters->pending_virtual_child == 0);
@@ -1687,6 +1700,7 @@ static bool prepare_clone_identity(prototype_counters_t *counters, int sysnum,
     acquire_clone_identity_handoff();
   counters->pending_virtual_child = allocate_virtual_identity();
   counters->pending_clone_flags = flags;
+  counters->pending_process_clone_result = (flags & CLONE_THREAD) == 0;
   if ((flags & CLONE_THREAD) == 0) {
     atomic_store_explicit(&pending_clone_flags, flags, memory_order_relaxed);
     atomic_store_explicit(&pending_clone_creator_pid,
@@ -2806,6 +2820,27 @@ static void post_syscall(void *drcontext, int sysnum) {
   // range with DynamoRIO's residue. `stack_scrub_marker.c` is the bracket.
   if (is_clone_syscall(sysnum))
     atomic_store_explicit(&guest_stack_scrubbed, 0, memory_order_release);
+
+  /* The measured delivery matrix reports both branches for fork and separate-VM
+   * clone/clone3, but only the parent result for clone(CLONE_VM) and vfork.
+   * Bind this callback to the actual clone-family post-event: CLONE_VM identity
+   * handoff can remain pending briefly in shared state, and a later syscall must
+   * not be misreported as another clone result. */
+  if (!is_clone_syscall(sysnum) &&
+      counters->pending_process_clone_result != 0) {
+    dr_fprintf(diagnostic_file,
+               "reverie-dbt: stale process-clone result state before syscall %d\n",
+               sysnum);
+    exit_runtime_tree(101);
+  }
+  if (is_clone_syscall(sysnum) &&
+      counters->pending_process_clone_result != 0) {
+    counters->pending_process_clone_result = 0;
+    evidence_callback_enter();
+    reverie_dbt_runtime_process_clone_result(counters, (int64_t)sysnum,
+                                             host_syscall_result);
+    evidence_callback_leave();
+  }
 
   if (counters->pending_virtual_child != 0 && is_clone_syscall(sysnum)) {
     int32_t virtual_child = complete_clone_identity(counters, syscall_result);

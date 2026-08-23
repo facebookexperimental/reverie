@@ -32,6 +32,7 @@ use std::pin::pin;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::AtomicU16;
 use std::sync::atomic::AtomicU64;
@@ -106,11 +107,12 @@ pub type RuntimeIdler = unsafe extern "C" fn();
 ///
 /// An external runtime used with this native client must export
 /// `reverie_dbt_runtime_abi_version`, `reverie_dbt_runtime_callbacks_size`,
-/// `reverie_dbt_runtime_thread_created_v2`, and
+/// `reverie_dbt_runtime_thread_created_v2`,
+/// `reverie_dbt_runtime_process_clone_result`, and
 /// `reverie_dbt_runtime_background_init_v2`. Advancing a consumer's Reverie
 /// revision without those matching exports is an incomplete cross-repository
 /// update and fails at link or at the pre-callback ABI check.
-pub const DBT_RUNTIME_ABI_VERSION: u32 = 2;
+pub const DBT_RUNTIME_ABI_VERSION: u32 = 3;
 
 #[repr(C)]
 struct DbtRuntimeCallbacksV1 {
@@ -1457,6 +1459,8 @@ static TOTAL_SYSCALLS: AtomicU64 = AtomicU64::new(0);
 static TOTAL_REWRITTEN: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "prototype-runtime")]
 static IMAGE_GENERATION: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "prototype-runtime")]
+static PROCESS_CLONE_RESULT_PROBE: AtomicBool = AtomicBool::new(false);
 
 /// Begins a new DynamoRIO application image and returns its generation.
 #[cfg(feature = "prototype-runtime")]
@@ -1607,6 +1611,34 @@ pub unsafe extern "C" fn reverie_dbt_runtime_exec_failed(
     _counters: *mut PrototypeCounters,
     _pid: i32,
 ) {
+}
+
+/// Reports a delivered native result of a process-creating clone-family syscall.
+///
+/// DynamoRIO delivers the post-syscall event in both parent and child for `fork`
+/// and separate-VM `clone` and `clone3`. A `clone(CLONE_VM)` process and `vfork`
+/// deliver only the parent result; no runtime callback runs in the vfork child
+/// before it execs or exits. External runtimes use this
+/// result callback for state that must change after a successful delivered process
+/// clone result but remain untouched when the syscall fails. A runtime that cannot
+/// allow unmediated vfork-child behavior must reject that vfork before execution.
+///
+/// # Safety
+///
+/// `counters` must be the pointer initialized for the current application
+/// thread.
+#[cfg(feature = "prototype-runtime")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reverie_dbt_runtime_process_clone_result(
+    _counters: *mut PrototypeCounters,
+    sysnum: i64,
+    result: i64,
+) {
+    if PROCESS_CLONE_RESULT_PROBE.load(Ordering::Acquire) {
+        tools::emit_line(&format!(
+            "reverie-dbt-test: process-clone-result sysnum={sysnum} result={result}"
+        ));
+    }
 }
 
 /// Applies copied-child syscall policy for the built-in prototype runtime.
@@ -1888,6 +1920,10 @@ pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v2(argument: *mut c
     if !argument.is_null() {
         let callbacks = unsafe { &*(argument as *const DbtRuntimeCallbacks) };
         tools::set_stdout_emitter(callbacks.emit_stdout);
+        PROCESS_CLONE_RESULT_PROBE.store(
+            std::env::var_os("REVERIE_DBT_TEST_PROCESS_CLONE_RESULTS").is_some(),
+            Ordering::Release,
+        );
     }
 }
 

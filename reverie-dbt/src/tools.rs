@@ -296,7 +296,7 @@ pub(crate) fn emit_counter2_exact_summary() {
 /// Writes one line of tool output through the DynamoRIO emit callback. Using
 /// DynamoRIO I/O (not `eprintln!`) avoids two hazards: the guest closing its own
 /// stderr before exit, and app-level `write(2)`s re-entering the syscall hook.
-fn emit_line(line: &str) {
+pub(crate) fn emit_line(line: &str) {
     let raw = EMITTER.load(Ordering::Relaxed);
     if raw == 0 {
         return;
