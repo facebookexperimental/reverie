@@ -13,8 +13,10 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fmt;
+use std::io::Write;
 use std::ops::DerefMut;
 use std::os::unix::ffi::OsStringExt;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -1329,6 +1331,72 @@ fn set_ret(task: &Stopped, ret: Reg) -> Result<Reg, TraceError> {
     *regs.ret_mut() = ret;
     task.setregs(&regs)?;
     Ok(old)
+}
+
+/// Canonical marker emitted when a guest-thread task dies of a panic.
+///
+/// The token is what a harness greps for, in the same spirit as
+/// `HERMIT_SKID_OVERSHOOT`; keep it stable. It exists because an exit code
+/// alone cannot say *why* a run ended, and this failure mode was expensive
+/// precisely because it was unreadable: the run hung, so a panic was
+/// indistinguishable from a slow run to every harness that judges by wall time.
+const TASK_PANIC_MARKER: &str = "HERMIT_TASK_PANIC";
+
+/// Exit status used when a guest-thread task panics.
+///
+/// This is rustc's conventional panic status inside the tracer process. An
+/// embedding executable may normalize it at an outer process boundary, so the
+/// marker above remains the authoritative machine-readable diagnosis.
+const TASK_PANIC_EXIT_CODE: i32 = 101;
+
+/// Renders the one-line panic marker. Separate from the exit so it can be
+/// tested without ending the test process.
+fn format_task_panic_marker(tid: Pid, payload: &(dyn std::any::Any + Send)) -> String {
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&'static str>().copied())
+        .unwrap_or("<non-string panic payload>");
+    // Always exactly one line: a marker that can wrap is a marker a harness
+    // cannot grep. The panic's own (multi-line) output has already reached
+    // stderr through the default hook; this line exists to be machine-read.
+    let message: String = message
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    format!(
+        "{} tid={} exit={} message={}",
+        TASK_PANIC_MARKER,
+        tid,
+        TASK_PANIC_EXIT_CODE,
+        message.trim()
+    )
+}
+
+/// A guest-thread task died of a panic. End the run, loudly.
+///
+/// WHY THE PROCESS EXITS RATHER THAN PROPAGATING AN ERROR. Tokio's task harness
+/// catches a panic in a `spawn_local` task and parks it in the `JoinHandle`,
+/// which nothing polls until `tool_exit`. The run cannot reach `tool_exit`,
+/// because by then the tool's scheduler is parked waiting for a turn request
+/// this task will never post, and detcore's `Ivar` has no way to report that
+/// its writer is gone -- so every other guest thread waits forever and the run
+/// hangs until an external timeout kills it. There is no live party left to
+/// hand an error to. detcore reached the same conclusion about its own
+/// scheduler task and built `immediate_fatal_exit` for exactly this.
+///
+/// Exiting does not leak the guest: `postspawn` sets `PTRACE_O_EXITKILL`, so
+/// the tracees die with the tracer. The terminal-deadlock path already relies
+/// on that.
+fn guest_task_panic_is_fatal(tid: Pid, payload: Box<dyn std::any::Any + Send>) -> ! {
+    // `eprintln!` rather than `tracing::error!` on purpose, matching detcore's
+    // terminal-deadlock report: the tracing writer prefixes a real wall-clock
+    // timestamp, and a marker meant to be compared across runs must not carry
+    // one.
+    eprintln!("{}", format_task_panic_marker(tid, payload.as_ref()));
+    let _ = std::io::stderr().flush();
+    let _ = std::io::stdout().flush();
+    std::process::exit(TASK_PANIC_EXIT_CODE)
 }
 
 fn log_guest_exit(tid: Pid, pid: Pid, exit_status: ExitStatus) {
@@ -4137,7 +4205,12 @@ impl<L: Tool + 'static> TracedTask<L> {
 
         let id = child.pid();
 
-        let task = tokio::task::spawn_local(async move {
+        // A panic anywhere in this body would otherwise be caught by tokio's
+        // task harness and silently wedge the whole run; see
+        // `guest_task_panic_is_fatal`. The body is built as its own future so
+        // the catch sits at the task boundary and covers all of it.
+        let panic_tid = id;
+        let body = async move {
             // The child could potentially exit here. In most cases the first
             // event we get here should be `Event::Signal(Signal::SIGSTOP)`, but
             // we can also receive `Event::Exit` if a thread is created via
@@ -4270,6 +4343,12 @@ impl<L: Tool + 'static> TracedTask<L> {
                     }
                 }
                 Ok(exit_status) => exit_status,
+            }
+        };
+        let task = tokio::task::spawn_local(async move {
+            match AssertUnwindSafe(body).catch_unwind().await {
+                Ok(exit_status) => exit_status,
+                Err(payload) => guest_task_panic_is_fatal(panic_tid, payload),
             }
         });
 
@@ -5919,6 +5998,51 @@ mod tests {
         assert_eq!(
             liteinst_helper_entry_rflags(transient | preserved),
             preserved
+        );
+    }
+
+    #[test]
+    fn task_panic_marker_has_canonical_shape() {
+        // The token and the field order are what a harness greps for; keep
+        // them stable.
+        let line = format_task_panic_marker(
+            Pid::from_raw(4242),
+            &"Clock perf counter exceeds target value" as &(dyn std::any::Any + Send),
+        );
+        assert_eq!(
+            line,
+            "HERMIT_TASK_PANIC tid=4242 exit=101 \
+             message=Clock perf counter exceeds target value"
+        );
+        assert!(line.starts_with(TASK_PANIC_MARKER));
+        assert_eq!(TASK_PANIC_MARKER, "HERMIT_TASK_PANIC");
+        assert_eq!(TASK_PANIC_EXIT_CODE, 101);
+    }
+
+    #[test]
+    fn task_panic_marker_is_always_one_greppable_line() {
+        // A `panic!` with a formatted message arrives as `String`, and a
+        // multi-line message would otherwise split the marker across lines and
+        // make it unmatchable.
+        let payload = String::from("first line\nsecond line\r\nthird");
+        let line =
+            format_task_panic_marker(Pid::from_raw(7), &payload as &(dyn std::any::Any + Send));
+        assert_eq!(line.lines().count(), 1);
+        assert_eq!(
+            line,
+            "HERMIT_TASK_PANIC tid=7 exit=101 message=first line second line  third"
+        );
+    }
+
+    #[test]
+    fn task_panic_marker_survives_a_non_string_payload() {
+        // `panic_any(42)` carries no string. The marker must still be emitted:
+        // an unreadable reason is not a reason to go back to hanging.
+        let line =
+            format_task_panic_marker(Pid::from_raw(9), &42u32 as &(dyn std::any::Any + Send));
+        assert_eq!(
+            line,
+            "HERMIT_TASK_PANIC tid=9 exit=101 message=<non-string panic payload>"
         );
     }
 }
