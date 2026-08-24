@@ -27,13 +27,15 @@
 //!
 //! Anti-vacuity: a discovery checker over an empty tree passes while asserting
 //! nothing. So this one always reports the host and skill counts it discovered,
-//! and refuses outright if the repository-wide skill count is zero.
+//! requires the repository's intended skill hosts to remain present, and refuses
+//! outright if the repository-wide skill count is zero.
 
 use std::collections::BTreeSet;
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
 use std::os::unix::fs::symlink;
+use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -59,6 +61,12 @@ const QUARANTINE_PREFIX: &str = ".skill_reset";
 
 /// The one non-package entry tolerated in a skill root.
 const README: &str = "README.md";
+
+/// Structural hosts that this repository intentionally exposes to both clients.
+/// Skill package names remain fully dynamic; this only prevents discovery from
+/// silently losing an entire host while another host keeps the global count
+/// nonzero.
+const REQUIRED_HOSTS: &[&str] = &[".", "reverie-liteinst"];
 
 fn git_root() -> Result<PathBuf, String> {
     let output = Command::new("git")
@@ -385,6 +393,7 @@ fn discover_skills(canonical: &Path, root: &Path) -> Result<BTreeSet<String>, St
     let mut skills = BTreeSet::new();
     for name in entry_names(canonical)? {
         if name == README {
+            require_real_file(&canonical.join(README), root)?;
             continue;
         }
         let package = canonical.join(&name);
@@ -432,7 +441,9 @@ fn check_host(root: &Path, relative: &Path) -> Result<Host, String> {
     // has to itself; a Codex entry with no canonical package is a half-mirrored
     // leftover that resolves to nothing. Neither is a warning.
     let mut codex_entries = entry_names(&codex)?;
-    codex_entries.remove(README);
+    if codex_entries.remove(README) {
+        require_real_file(&codex.join(README), root)?;
+    }
     if codex_entries != skills {
         let missing: Vec<&String> = skills.difference(&codex_entries).collect();
         let extra: Vec<&String> = codex_entries.difference(&skills).collect();
@@ -482,6 +493,21 @@ fn inspect(root: &Path) -> Result<Vec<Host>, String> {
     if relatives.is_empty() {
         return Err(format!(
             "discovered no skill hosts under {}; this check would assert nothing",
+            root.display()
+        ));
+    }
+    let discovered_hosts: BTreeSet<String> =
+        relatives.iter().map(|path| host_label(path)).collect();
+    let missing_hosts: Vec<&str> = REQUIRED_HOSTS
+        .iter()
+        .copied()
+        .filter(|host| !discovered_hosts.contains(*host))
+        .collect();
+    if !missing_hosts.is_empty() {
+        return Err(format!(
+            "missing required skill host(s) {missing_hosts:?} under {}; discovered {discovered_hosts:?}. \
+             Skill names are dynamic, but the repository root and reverie-liteinst must both remain \
+             visible to Claude and Codex.",
             root.display()
         ));
     }
@@ -666,12 +692,82 @@ fn expect_refusal(root: &Path, case: &str) -> Result<(), String> {
     }
 }
 
+fn expect_refusal_containing(root: &Path, case: &str, expected: &str) -> Result<(), String> {
+    match inspect(root) {
+        Ok(_) => Err(format!(
+            "discovery regression accepted a repository that {case}"
+        )),
+        Err(error) if error.contains(expected) => Ok(()),
+        Err(error) => Err(format!(
+            "discovery regression refused a repository that {case}, but for the wrong reason: \
+             expected {expected:?}, got {error:?}"
+        )),
+    }
+}
+
+/// README.md is metadata, not a skill package, but exempting its name must not
+/// exempt its filesystem identity. Exercise both client roots against the three
+/// non-file shapes most likely to hide drift: an external symlink, a directory,
+/// and a Unix-domain socket.
+fn exercise_readme_refusals(
+    root: &Path,
+    readme: &Path,
+    outside: &Path,
+    client: &str,
+) -> Result<(), String> {
+    let original = fs::read(readme)
+        .map_err(|error| format!("cannot read positive {client} README fixture: {error}"))?;
+    fs::remove_file(readme)
+        .map_err(|error| format!("cannot remove positive {client} README fixture: {error}"))?;
+
+    symlink(outside, readme)
+        .map_err(|error| format!("cannot create external {client} README symlink: {error}"))?;
+    expect_refusal_containing(
+        root,
+        &format!("uses an external symlink for the {client} README exemption"),
+        "README.md must be a regular file",
+    )?;
+    fs::remove_file(readme)
+        .map_err(|error| format!("cannot remove external {client} README symlink: {error}"))?;
+
+    fs::create_dir(readme)
+        .map_err(|error| format!("cannot create directory {client} README fixture: {error}"))?;
+    expect_refusal_containing(
+        root,
+        &format!("uses a directory for the {client} README exemption"),
+        "README.md must be a regular file",
+    )?;
+    fs::remove_dir(readme)
+        .map_err(|error| format!("cannot remove directory {client} README fixture: {error}"))?;
+
+    let socket = UnixListener::bind(readme)
+        .map_err(|error| format!("cannot create socket {client} README fixture: {error}"))?;
+    expect_refusal_containing(
+        root,
+        &format!("uses a nonregular socket for the {client} README exemption"),
+        "README.md must be a regular file",
+    )?;
+    drop(socket);
+    fs::remove_file(readme)
+        .map_err(|error| format!("cannot remove socket {client} README fixture: {error}"))?;
+
+    fs::write(readme, original)
+        .map_err(|error| format!("cannot restore positive {client} README fixture: {error}"))?;
+    inspect(root).map_err(|error| {
+        format!("discovery regression left the {client} README fixture broken: {error}")
+    })?;
+    Ok(())
+}
+
 /// Prove the discovery pass can actually fail. Every mutation below is applied
 /// to a well-formed fixture, refused, and then undone; the fixture is checked
 /// again at the end so a failed restore cannot make a later case lie.
 fn discovery_regression_tests() -> Result<(), String> {
     let fixture = fixture_root("discovery")?;
     let root = fixture.0.join("repo");
+    let outside_readme = fixture.0.join("outside-readme");
+    fs::write(&outside_readme, "outside fixture\n")
+        .map_err(|error| format!("cannot create external README fixture: {error}"))?;
 
     // Host A: canonical under .claude, mirrored to .llms, with policy files.
     let a_canonical = root.join(".claude/skills");
@@ -683,6 +779,8 @@ fn discovery_regression_tests() -> Result<(), String> {
         .map_err(|error| format!("cannot write fixture: {error}"))?;
     link("AGENTS.md", &root.join("CLAUDE.md"))?;
     link("../.claude/skills", &root.join(".llms/skills"))?;
+    fs::write(a_canonical.join(README), "# canonical fixture\n")
+        .map_err(|error| format!("cannot write fixture: {error}"))?;
     fs::write(a_codex.join(README), "# fixture\n")
         .map_err(|error| format!("cannot write fixture: {error}"))?;
     for name in ["alpha", "beta"] {
@@ -692,7 +790,7 @@ fn discovery_regression_tests() -> Result<(), String> {
 
     // Host B: the opposite orientation — canonical under .llms, mirrored to
     // .claude — and no policy files, which must be tolerated.
-    let nested = root.join("nested");
+    let nested = root.join("reverie-liteinst");
     let b_canonical = nested.join(".llms/skills");
     let b_codex = nested.join(".agents/skills");
     fs::create_dir_all(&b_canonical).map_err(|error| format!("cannot create fixture: {error}"))?;
@@ -716,6 +814,69 @@ fn discovery_regression_tests() -> Result<(), String> {
             "discovery regression found {discovered} skills in the fixture, expected 3"
         ));
     }
+
+    // Repository-wide non-emptiness is not enough: deleting either intended
+    // host must fail even while the other still exposes real skills.
+    for (host, hidden, label) in [
+        (
+            &root,
+            root.join(".skill_reset-root-host"),
+            "repository root",
+        ),
+        (
+            &nested,
+            root.join(".skill_reset-reverie-liteinst-host"),
+            "reverie-liteinst",
+        ),
+    ] {
+        if host == &root {
+            let hidden_claude = hidden.join(".claude");
+            let hidden_llms = hidden.join(".llms");
+            let hidden_agents = hidden.join(".agents");
+            fs::create_dir_all(&hidden)
+                .map_err(|error| format!("cannot create hidden host fixture: {error}"))?;
+            fs::rename(root.join(".claude"), &hidden_claude)
+                .map_err(|error| format!("cannot hide root Claude host: {error}"))?;
+            fs::rename(root.join(".llms"), &hidden_llms)
+                .map_err(|error| format!("cannot hide root LLMS host: {error}"))?;
+            fs::rename(root.join(".agents"), &hidden_agents)
+                .map_err(|error| format!("cannot hide root Codex host: {error}"))?;
+            expect_refusal_containing(
+                &root,
+                "omits the required repository-root host while reverie-liteinst remains nonempty",
+                "missing required skill host(s) [\".\"]",
+            )?;
+            fs::rename(&hidden_claude, root.join(".claude"))
+                .map_err(|error| format!("cannot restore root Claude host: {error}"))?;
+            fs::rename(&hidden_llms, root.join(".llms"))
+                .map_err(|error| format!("cannot restore root LLMS host: {error}"))?;
+            fs::rename(&hidden_agents, root.join(".agents"))
+                .map_err(|error| format!("cannot restore root Codex host: {error}"))?;
+            fs::remove_dir(&hidden)
+                .map_err(|error| format!("cannot remove hidden root host fixture: {error}"))?;
+        } else {
+            fs::rename(host, &hidden)
+                .map_err(|error| format!("cannot hide {label} host: {error}"))?;
+            expect_refusal_containing(
+                &root,
+                "omits the required reverie-liteinst host while the root remains nonempty",
+                "missing required skill host(s) [\"reverie-liteinst\"]",
+            )?;
+            fs::rename(&hidden, host)
+                .map_err(|error| format!("cannot restore {label} host: {error}"))?;
+        }
+        inspect(&root).map_err(|error| {
+            format!("discovery regression left the {label} host broken after restore: {error}")
+        })?;
+    }
+
+    exercise_readme_refusals(
+        &root,
+        &a_canonical.join(README),
+        &outside_readme,
+        "canonical",
+    )?;
+    exercise_readme_refusals(&root, &a_codex.join(README), &outside_readme, "Codex")?;
 
     // A skill Claude has and Codex cannot see.
     fs::remove_file(a_codex.join("beta")).map_err(|error| format!("cannot mutate: {error}"))?;
@@ -770,7 +931,20 @@ fn discovery_regression_tests() -> Result<(), String> {
     fs::create_dir_all(empty_root.join(".llms"))
         .map_err(|error| format!("cannot create fixture: {error}"))?;
     link("../.claude/skills", &empty_root.join(".llms/skills"))?;
-    expect_refusal(&empty_root, "contains no skill packages anywhere")?;
+
+    let empty_nested = empty_root.join("reverie-liteinst");
+    fs::create_dir_all(empty_nested.join(".llms/skills"))
+        .map_err(|error| format!("cannot create fixture: {error}"))?;
+    fs::create_dir_all(empty_nested.join(".agents/skills"))
+        .map_err(|error| format!("cannot create fixture: {error}"))?;
+    fs::create_dir_all(empty_nested.join(".claude"))
+        .map_err(|error| format!("cannot create fixture: {error}"))?;
+    link("../.llms/skills", &empty_nested.join(".claude/skills"))?;
+    expect_refusal_containing(
+        &empty_root,
+        "contains both required hosts but no skill packages anywhere",
+        "zero skill packages",
+    )?;
 
     // And a tree with no client directories at all.
     let bare = fixture_root("bare")?;
