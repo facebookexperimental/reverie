@@ -7,9 +7,31 @@
  * LICENSE file in the root directory of this source tree.
  */
 //! Verify that Claude and stock Codex discover the same Reverie product skills.
+//!
+//! There is deliberately NO roster in this file. The checker DISCOVERS every
+//! skill host in the working tree and every skill package inside it, then
+//! asserts the dual-client shape for whatever it found:
+//!
+//!   * exactly one of `<host>/.claude/skills` and `<host>/.llms/skills` is the
+//!     canonical real directory holding the skill packages;
+//!   * the other one is an internal symlink to it, so Claude reads the same
+//!     bytes under either spelling;
+//!   * `<host>/.agents/skills` is a real directory holding one whole-package
+//!     symlink per canonical skill, spelled canonically, resolving inside the
+//!     repository, so stock Codex reads those same bytes;
+//!   * the two rosters match exactly in both directions — a package that only
+//!     one client can see is a refusal, not a warning.
+//!
+//! As skills are regrown, they are picked up with no edit to this file, and the
+//! shape above is enforced on each new one.
+//!
+//! Anti-vacuity: a discovery checker over an empty tree passes while asserting
+//! nothing. So this one always reports the host and skill counts it discovered,
+//! and refuses outright if the repository-wide skill count is zero.
 
 use std::collections::BTreeSet;
 use std::env;
+use std::fmt::Write as _;
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::Path;
@@ -18,19 +40,25 @@ use std::process::Command;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-const ROOT_SKILLS: &[&str] = &[
-    "adding-a-backend",
-    "repo-cleanliness",
-    "reverie-architecture",
-    "syscall-interception",
-    "testing-tools",
-];
+/// The two directory names Claude reads skill packages from. Exactly one is
+/// canonical per host; the other mirrors it.
+const CLAUDE_SKILL_ROOTS: &[&str] = &[".claude/skills", ".llms/skills"];
 
-const LITEINST_SKILLS: &[&str] = &[
-    "liteinst-binary-instrumentation",
-    "liteinst-testing",
-    "liteinst-tool-lifecycle",
-];
+/// The directory stock Codex reads skill packages from.
+const CODEX_SKILL_ROOT: &str = ".agents/skills";
+
+/// Client directories, used to prune the host walk.
+const CLIENT_DIR_NAMES: &[&str] = &[".claude", ".llms", ".agents"];
+
+/// Directory names never descended into while discovering hosts.
+const PRUNED_DIR_NAMES: &[&str] = &[".git", "target", "node_modules"];
+
+/// Quarantine directories from a skills bankruptcy hold preserved copies of
+/// retired packages. They are not live skills and must not be discovered.
+const QUARANTINE_PREFIX: &str = ".skill_reset";
+
+/// The one non-package entry tolerated in a skill root.
+const README: &str = "README.md";
 
 fn git_root() -> Result<PathBuf, String> {
     let output = Command::new("git")
@@ -99,6 +127,23 @@ fn require_real_directory(path: &Path, root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn require_real_file(path: &Path, root: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(format!("{} must be a regular file", path.display()));
+    }
+    canonical_within(path, root)?;
+    Ok(())
+}
+
+fn is_slug(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
 fn frontmatter<'a>(contents: &'a str, path: &Path) -> Result<&'a str, String> {
     let rest = contents
         .strip_prefix("---\n")
@@ -148,11 +193,7 @@ fn checked_frontmatter<'a>(
                 path.display()
             )
         })?;
-    if name.is_empty()
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-    {
+    if !is_slug(name) {
         return Err(format!(
             "{} frontmatter name {:?} is not a lowercase-hyphenated slug",
             path.display(),
@@ -193,6 +234,324 @@ fn checked_frontmatter<'a>(
         ));
     }
     Ok(metadata)
+}
+
+fn entry_names(path: &Path) -> Result<BTreeSet<String>, String> {
+    fs::read_dir(path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?
+        .map(|entry| {
+            let entry = entry.map_err(|error| format!("cannot read directory entry: {error}"))?;
+            entry
+                .file_name()
+                .into_string()
+                .map_err(|name| format!("non-UTF-8 skill entry: {name:?}"))
+        })
+        .collect()
+}
+
+fn exists(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
+/// A directory that at least one client is told to read skills from. Detected
+/// by the presence of any client skill root, so a tree that only one client can
+/// see is still discovered — and then refused below.
+fn is_skill_host(dir: &Path) -> bool {
+    CLAUDE_SKILL_ROOTS
+        .iter()
+        .chain(std::iter::once(&CODEX_SKILL_ROOT))
+        .any(|name| exists(&dir.join(name)))
+}
+
+/// Enumerate every skill host in the working tree, as paths relative to `root`.
+/// The repository root itself is a candidate; the empty path denotes it.
+fn discover_hosts(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut hosts = Vec::new();
+    let mut stack = vec![PathBuf::new()];
+    while let Some(relative) = stack.pop() {
+        let directory = root.join(&relative);
+        if is_skill_host(&directory) {
+            hosts.push(relative.clone());
+        }
+        for entry in fs::read_dir(&directory)
+            .map_err(|error| format!("cannot read {}: {error}", directory.display()))?
+        {
+            let entry = entry.map_err(|error| format!("cannot read directory entry: {error}"))?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|name| format!("non-UTF-8 directory entry: {name:?}"))?;
+            if PRUNED_DIR_NAMES.contains(&name.as_str())
+                || CLIENT_DIR_NAMES.contains(&name.as_str())
+                || name.starts_with(QUARANTINE_PREFIX)
+            {
+                continue;
+            }
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+            // Symlinked directories are never descended into: they would let
+            // the walk leave the repository or loop.
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                continue;
+            }
+            // A nested checkout (submodule or worktree) is a separate
+            // repository and owns its own skill policy.
+            if exists(&path.join(".git")) {
+                continue;
+            }
+            stack.push(relative.join(name));
+        }
+    }
+    hosts.sort();
+    Ok(hosts)
+}
+
+fn host_label(relative: &Path) -> String {
+    if relative.as_os_str().is_empty() {
+        ".".to_owned()
+    } else {
+        relative.display().to_string()
+    }
+}
+
+struct Host {
+    label: String,
+    /// `.claude/skills` or `.llms/skills`, whichever holds the real packages.
+    canonical_root: String,
+    /// The other Claude spelling, a symlink to `canonical_root`.
+    mirror_root: String,
+    policy: &'static str,
+    skills: BTreeSet<String>,
+}
+
+/// Which Claude spelling is canonical here, and which mirrors it. Discovered,
+/// not assumed: the repository root and `reverie-liteinst` disagree today, and
+/// either orientation is legal as long as the mirror is intact.
+fn resolve_claude_roots(host: &Path) -> Result<(String, String), String> {
+    let mut canonical = Vec::new();
+    let mut mirrored = Vec::new();
+    let mut absent = Vec::new();
+    for name in CLAUDE_SKILL_ROOTS {
+        let path = host.join(name);
+        match fs::symlink_metadata(&path) {
+            Err(_) => absent.push(*name),
+            Ok(metadata) if metadata.file_type().is_symlink() => mirrored.push(*name),
+            Ok(metadata) if metadata.is_dir() => canonical.push(*name),
+            Ok(_) => {
+                return Err(format!(
+                    "{} must be a directory of skill packages or a symlink to one",
+                    path.display()
+                ));
+            }
+        }
+    }
+    if canonical.len() != 1 || mirrored.len() != 1 {
+        return Err(format!(
+            "{}: exactly one of {CLAUDE_SKILL_ROOTS:?} must be a real directory holding the skill \
+             packages and the other must be a symlink to it, so both Claude spellings read the \
+             same bytes (found real: {canonical:?}, symlink: {mirrored:?}, absent: {absent:?})",
+            host.display()
+        ));
+    }
+    Ok((
+        canonical.remove(0).to_owned(),
+        mirrored.remove(0).to_owned(),
+    ))
+}
+
+/// Policy-file shape. Absence is tolerated on purpose: the 2026-08-16 skills
+/// bankruptcy moved Reverie's `AGENTS.md`/`CLAUDE.md` into
+/// `.skill_reset_20260816/` and the owner is regrowing them step by step. This
+/// tolerance is DELIBERATE AND TEMPORARY — it is not a statement that a
+/// repository should have no agent policy. When the files come back, the
+/// symlink shape below is enforced again with no edit to this file.
+fn check_policy_files(host: &Path, root: &Path) -> Result<&'static str, String> {
+    let agents = host.join("AGENTS.md");
+    let claude = host.join("CLAUDE.md");
+    match (exists(&agents), exists(&claude)) {
+        (false, false) => Ok("absent (tolerated while skills are regrown)"),
+        _ => {
+            require_real_file(&agents, root)?;
+            require_internal_symlink(&claude, Path::new("AGENTS.md"), root)?;
+            Ok("AGENTS.md with CLAUDE.md symlink")
+        }
+    }
+}
+
+/// Skill names in a canonical root: every entry is a package directory, apart
+/// from an optional README.
+fn discover_skills(canonical: &Path, root: &Path) -> Result<BTreeSet<String>, String> {
+    let mut skills = BTreeSet::new();
+    for name in entry_names(canonical)? {
+        if name == README {
+            continue;
+        }
+        let package = canonical.join(&name);
+        require_real_directory(&package, root)?;
+        if !is_slug(&name) {
+            return Err(format!(
+                "{} is not a lowercase-hyphenated skill package name",
+                package.display()
+            ));
+        }
+        skills.insert(name);
+    }
+    Ok(skills)
+}
+
+fn check_host(root: &Path, relative: &Path) -> Result<Host, String> {
+    let host = root.join(relative);
+    let (canonical_root, mirror_root) = resolve_claude_roots(&host)?;
+    let canonical = host.join(&canonical_root);
+    require_real_directory(&canonical, root)?;
+
+    // The mirror is spelled relative to its own parent directory, e.g.
+    // `.llms/skills -> ../.claude/skills`.
+    let mirror = host.join(&mirror_root);
+    require_internal_symlink(
+        &mirror,
+        &PathBuf::from(format!("../{canonical_root}")),
+        root,
+    )?;
+    if canonical_within(&mirror, root)? != canonical_within(&canonical, root)? {
+        return Err(format!(
+            "{} and {} must resolve to the same skill packages",
+            mirror.display(),
+            canonical.display()
+        ));
+    }
+
+    let codex = host.join(CODEX_SKILL_ROOT);
+    require_real_directory(&codex, root)?;
+
+    let policy = check_policy_files(&host, root)?;
+    let skills = discover_skills(&canonical, root)?;
+
+    // Both directions. A package Codex cannot see is a skill Claude silently
+    // has to itself; a Codex entry with no canonical package is a half-mirrored
+    // leftover that resolves to nothing. Neither is a warning.
+    let mut codex_entries = entry_names(&codex)?;
+    codex_entries.remove(README);
+    if codex_entries != skills {
+        let missing: Vec<&String> = skills.difference(&codex_entries).collect();
+        let extra: Vec<&String> = codex_entries.difference(&skills).collect();
+        return Err(format!(
+            "{} and {} expose different skills:\n  canonical only (invisible to Codex): \
+             {missing:?}\n  Codex only (no canonical package): {extra:?}",
+            canonical.display(),
+            codex.display()
+        ));
+    }
+
+    for name in &skills {
+        let package = canonical.join(name);
+        let skill_file = package.join("SKILL.md");
+        require_real_file(&skill_file, root)?;
+        let contents = fs::read_to_string(&skill_file)
+            .map_err(|error| format!("cannot read {}: {error}", skill_file.display()))?;
+        checked_frontmatter(&contents, &skill_file, name)?;
+
+        let entry = codex.join(name);
+        require_internal_symlink(
+            &entry,
+            &PathBuf::from(format!("../../{canonical_root}/{name}")),
+            root,
+        )?;
+        if canonical_within(&entry, root)? != canonical_within(&package, root)? {
+            return Err(format!(
+                "{} does not resolve to the canonical package {}",
+                entry.display(),
+                package.display()
+            ));
+        }
+        require_real_file(&entry.join("SKILL.md"), root)?;
+    }
+
+    Ok(Host {
+        label: host_label(relative),
+        canonical_root,
+        mirror_root,
+        policy,
+        skills,
+    })
+}
+
+fn inspect(root: &Path) -> Result<Vec<Host>, String> {
+    let relatives = discover_hosts(root)?;
+    if relatives.is_empty() {
+        return Err(format!(
+            "discovered no skill hosts under {}; this check would assert nothing",
+            root.display()
+        ));
+    }
+    let hosts: Vec<Host> = relatives
+        .iter()
+        .map(|relative| check_host(root, relative))
+        .collect::<Result<_, _>>()?;
+    let total: usize = hosts.iter().map(|host| host.skills.len()).sum();
+    if total == 0 {
+        return Err(format!(
+            "discovered {} skill host(s) but zero skill packages under {}; a pass here would \
+             assert nothing, so it is refused. Add a skill, or delete this check along with the \
+             empty client directories.",
+            hosts.len(),
+            root.display()
+        ));
+    }
+    Ok(hosts)
+}
+
+fn report(hosts: &[Host]) -> String {
+    let mut out = String::new();
+    let total: usize = hosts.iter().map(|host| host.skills.len()).sum();
+    for host in hosts {
+        let names: Vec<&str> = host.skills.iter().map(String::as_str).collect();
+        let listed = if names.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", names.join(", "))
+        };
+        let _ = writeln!(
+            out,
+            "check-skill-discovery: host {} — canonical {}, Claude mirror {}, Codex {}, policy {}, \
+             {} skill(s){listed}",
+            host.label,
+            host.canonical_root,
+            host.mirror_root,
+            CODEX_SKILL_ROOT,
+            host.policy,
+            host.skills.len(),
+        );
+    }
+    let _ = write!(
+        out,
+        "check-skill-discovery: PASS (discovered {} host(s) and {total} skill(s); each is \
+         reachable by both Claude and Codex)",
+        hosts.len(),
+    );
+    out
+}
+
+struct FixtureRoot(PathBuf);
+
+impl Drop for FixtureRoot {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn fixture_root(tag: &str) -> Result<FixtureRoot, String> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("system clock precedes Unix epoch: {error}"))?
+        .as_nanos();
+    let path = env::temp_dir().join(format!(
+        "reverie-skill-discovery-{tag}-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&path).map_err(|error| format!("cannot create fixture: {error}"))?;
+    Ok(FixtureRoot(path))
 }
 
 fn parser_regression_tests() -> Result<(), String> {
@@ -240,23 +599,8 @@ fn parser_regression_tests() -> Result<(), String> {
     Ok(())
 }
 
-struct FixtureRoot(PathBuf);
-
-impl Drop for FixtureRoot {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
 fn filesystem_regression_tests() -> Result<(), String> {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| format!("system clock precedes Unix epoch: {error}"))?
-        .as_nanos();
-    let fixture = FixtureRoot(env::temp_dir().join(format!(
-        "reverie-skill-discovery-{}-{nonce}",
-        std::process::id()
-    )));
+    let fixture = fixture_root("fs")?;
     let root = fixture.0.join("repo");
     let outside = fixture.0.join("outside");
     fs::create_dir_all(outside.join("skills"))
@@ -297,148 +641,160 @@ fn filesystem_regression_tests() -> Result<(), String> {
     Ok(())
 }
 
-fn entry_names(path: &Path) -> Result<BTreeSet<String>, String> {
-    fs::read_dir(path)
-        .map_err(|error| format!("cannot read {}: {error}", path.display()))?
-        .map(|entry| {
-            let entry = entry.map_err(|error| format!("cannot read directory entry: {error}"))?;
-            entry
-                .file_name()
-                .into_string()
-                .map_err(|name| format!("non-UTF-8 skill entry: {name:?}"))
-        })
-        .collect()
+fn write_skill_package(canonical: &Path, name: &str) -> Result<(), String> {
+    let package = canonical.join(name);
+    fs::create_dir_all(&package)
+        .map_err(|error| format!("cannot create fixture package: {error}"))?;
+    fs::write(
+        package.join("SKILL.md"),
+        format!("---\nname: {name}\ndescription: \"Fixture skill.\"\n---\n# {name}\n"),
+    )
+    .map_err(|error| format!("cannot write fixture package: {error}"))
 }
 
-fn expected_names(skills: &[&str], suffix: &str, readme: bool) -> BTreeSet<String> {
-    let mut names: BTreeSet<String> = skills
-        .iter()
-        .map(|name| format!("{name}{suffix}"))
-        .collect();
-    if readme {
-        names.insert("README.md".to_owned());
+fn link(target: &str, path: &Path) -> Result<(), String> {
+    symlink(target, path)
+        .map_err(|error| format!("cannot create fixture link {}: {error}", path.display()))
+}
+
+fn expect_refusal(root: &Path, case: &str) -> Result<(), String> {
+    match inspect(root) {
+        Ok(_) => Err(format!(
+            "discovery regression accepted a repository that {case}"
+        )),
+        Err(_) => Ok(()),
     }
-    names
 }
 
-fn check_group(
-    root: &Path,
-    canonical_root: &Path,
-    codex_root: &Path,
-    skills: &[&str],
-    target_root: &str,
-) -> Result<(), String> {
-    require_real_directory(canonical_root, root)?;
-    require_real_directory(codex_root, root)?;
+/// Prove the discovery pass can actually fail. Every mutation below is applied
+/// to a well-formed fixture, refused, and then undone; the fixture is checked
+/// again at the end so a failed restore cannot make a later case lie.
+fn discovery_regression_tests() -> Result<(), String> {
+    let fixture = fixture_root("discovery")?;
+    let root = fixture.0.join("repo");
 
-    let actual_canonical = entry_names(canonical_root)?;
-    let expected_canonical = expected_names(skills, "", false);
-    if actual_canonical != expected_canonical {
+    // Host A: canonical under .claude, mirrored to .llms, with policy files.
+    let a_canonical = root.join(".claude/skills");
+    let a_codex = root.join(".agents/skills");
+    fs::create_dir_all(&a_canonical).map_err(|error| format!("cannot create fixture: {error}"))?;
+    fs::create_dir_all(&a_codex).map_err(|error| format!("cannot create fixture: {error}"))?;
+    fs::create_dir_all(root.join(".llms")).map_err(|error| format!("cannot create: {error}"))?;
+    fs::write(root.join("AGENTS.md"), "fixture policy\n")
+        .map_err(|error| format!("cannot write fixture: {error}"))?;
+    link("AGENTS.md", &root.join("CLAUDE.md"))?;
+    link("../.claude/skills", &root.join(".llms/skills"))?;
+    fs::write(a_codex.join(README), "# fixture\n")
+        .map_err(|error| format!("cannot write fixture: {error}"))?;
+    for name in ["alpha", "beta"] {
+        write_skill_package(&a_canonical, name)?;
+        link(&format!("../../.claude/skills/{name}"), &a_codex.join(name))?;
+    }
+
+    // Host B: the opposite orientation — canonical under .llms, mirrored to
+    // .claude — and no policy files, which must be tolerated.
+    let nested = root.join("nested");
+    let b_canonical = nested.join(".llms/skills");
+    let b_codex = nested.join(".agents/skills");
+    fs::create_dir_all(&b_canonical).map_err(|error| format!("cannot create fixture: {error}"))?;
+    fs::create_dir_all(&b_codex).map_err(|error| format!("cannot create fixture: {error}"))?;
+    fs::create_dir_all(nested.join(".claude"))
+        .map_err(|error| format!("cannot create fixture: {error}"))?;
+    link("../.llms/skills", &nested.join(".claude/skills"))?;
+    write_skill_package(&b_canonical, "gamma")?;
+    link("../../.llms/skills/gamma", &b_codex.join("gamma"))?;
+
+    let hosts = inspect(&root)?;
+    if hosts.len() != 2 {
         return Err(format!(
-            "canonical entries differ in {}:\n  actual: {actual_canonical:?}\n  expected: {expected_canonical:?}",
-            canonical_root.display()
+            "discovery regression found {} hosts in the fixture, expected 2",
+            hosts.len()
+        ));
+    }
+    let discovered: usize = hosts.iter().map(|host| host.skills.len()).sum();
+    if discovered != 3 {
+        return Err(format!(
+            "discovery regression found {discovered} skills in the fixture, expected 3"
         ));
     }
 
-    let actual_codex = entry_names(codex_root)?;
-    let expected_codex = expected_names(skills, "", true);
-    if actual_codex != expected_codex {
-        return Err(format!(
-            "Codex entries differ in {}:\n  actual: {actual_codex:?}\n  expected: {expected_codex:?}",
-            codex_root.display()
-        ));
-    }
+    // A skill Claude has and Codex cannot see.
+    fs::remove_file(a_codex.join("beta")).map_err(|error| format!("cannot mutate: {error}"))?;
+    expect_refusal(&root, "hides a canonical skill from Codex")?;
+    link("../../.claude/skills/beta", &a_codex.join("beta"))?;
 
-    for name in skills {
-        let canonical_dir = canonical_root.join(name);
-        require_real_directory(&canonical_dir, root)?;
-        let canonical_path = canonical_dir.join("SKILL.md");
-        let canonical_file_metadata = fs::symlink_metadata(&canonical_path)
-            .map_err(|error| format!("cannot inspect {}: {error}", canonical_path.display()))?;
-        if !canonical_file_metadata.is_file() || canonical_file_metadata.file_type().is_symlink() {
-            return Err(format!(
-                "{} must be a regular file",
-                canonical_path.display()
-            ));
-        }
-        canonical_within(&canonical_path, root)?;
-        let canonical = fs::read_to_string(&canonical_path)
-            .map_err(|error| format!("cannot read {}: {error}", canonical_path.display()))?;
-        checked_frontmatter(&canonical, &canonical_path, name)?;
+    // A Codex entry with no canonical package — exactly the leftover a skills
+    // bankruptcy produces when it moves packages but not their mirrors.
+    link("../../.claude/skills/delta", &a_codex.join("delta"))?;
+    expect_refusal(&root, "exposes a Codex entry with no canonical package")?;
+    fs::remove_file(a_codex.join("delta")).map_err(|error| format!("cannot restore: {error}"))?;
 
-        let entry = codex_root.join(name);
-        require_internal_symlink(
-            &entry,
-            &PathBuf::from(format!("{target_root}/{name}")),
-            root,
-        )?;
-        let resolved = fs::canonicalize(&entry)
-            .map_err(|error| format!("cannot resolve {}: {error}", entry.display()))?;
-        let expected = fs::canonicalize(&canonical_dir)
-            .map_err(|error| format!("cannot resolve {}: {error}", canonical_dir.display()))?;
-        if resolved != expected {
-            return Err(format!(
-                "{} resolves to {}, expected canonical package {}",
-                entry.display(),
-                resolved.display(),
-                expected.display()
-            ));
-        }
-        let resolved_skill = entry.join("SKILL.md");
-        let resolved_metadata = fs::symlink_metadata(&resolved_skill)
-            .map_err(|error| format!("cannot inspect {}: {error}", resolved_skill.display()))?;
-        if !resolved_metadata.is_file() || resolved_metadata.file_type().is_symlink() {
-            return Err(format!(
-                "{} must resolve to a regular file",
-                resolved_skill.display()
-            ));
-        }
-    }
+    // A Codex entry that is a real directory, so the two clients could drift.
+    fs::remove_file(a_codex.join("beta")).map_err(|error| format!("cannot mutate: {error}"))?;
+    write_skill_package(&a_codex, "beta")?;
+    expect_refusal(&root, "forks a skill into a second copy under Codex")?;
+    fs::remove_dir_all(a_codex.join("beta")).map_err(|error| format!("cannot restore: {error}"))?;
+    link("../../.claude/skills/beta", &a_codex.join("beta"))?;
 
-    Ok(())
-}
+    // A Codex entry spelled through the mirror rather than the canonical root.
+    // It resolves, but it leaves two spellings of the same package in the tree.
+    fs::remove_file(a_codex.join("beta")).map_err(|error| format!("cannot mutate: {error}"))?;
+    link("../../.llms/skills/beta", &a_codex.join("beta"))?;
+    expect_refusal(&root, "spells a Codex mirror non-canonically")?;
+    fs::remove_file(a_codex.join("beta")).map_err(|error| format!("cannot restore: {error}"))?;
+    link("../../.claude/skills/beta", &a_codex.join("beta"))?;
 
-fn check(root: &Path) -> Result<(), String> {
-    require_internal_symlink(&root.join("CLAUDE.md"), Path::new("AGENTS.md"), root)?;
-    require_internal_symlink(
-        &root.join(".llms/skills"),
-        Path::new("../.claude/skills"),
-        root,
-    )?;
-    check_group(
-        root,
-        &root.join(".claude/skills"),
-        &root.join(".agents/skills"),
-        ROOT_SKILLS,
-        "../../.claude/skills",
-    )?;
+    // A broken Claude mirror: one spelling reaches the skills, the other does
+    // not. This is the repository root's state after the bankruptcy.
+    fs::remove_file(root.join(".llms/skills"))
+        .map_err(|error| format!("cannot mutate: {error}"))?;
+    expect_refusal(&root, "leaves the second Claude spelling unreachable")?;
+    link("../.claude/skills", &root.join(".llms/skills"))?;
 
-    let liteinst = root.join("reverie-liteinst");
-    require_real_directory(&liteinst, root)?;
-    require_internal_symlink(&liteinst.join("CLAUDE.md"), Path::new("AGENTS.md"), root)?;
-    require_internal_symlink(
-        &liteinst.join(".claude/skills"),
-        Path::new("../.llms/skills"),
-        root,
-    )?;
-    check_group(
-        root,
-        &liteinst.join(".llms/skills"),
-        &liteinst.join(".agents/skills"),
-        LITEINST_SKILLS,
-        "../../.llms/skills",
-    )?;
+    // A package whose frontmatter name no longer matches its directory.
+    fs::write(
+        a_canonical.join("beta/SKILL.md"),
+        "---\nname: renamed\ndescription: \"Fixture skill.\"\n---\n# beta\n",
+    )
+    .map_err(|error| format!("cannot mutate: {error}"))?;
+    expect_refusal(&root, "declares a skill name that is not its directory")?;
+    write_skill_package(&a_canonical, "beta")?;
+
+    // A host with client directories and no packages at all must not pass
+    // silently — this is the vacuous-discovery trap.
+    let empty = fixture_root("empty")?;
+    let empty_root = empty.0.join("repo");
+    fs::create_dir_all(empty_root.join(".claude/skills"))
+        .map_err(|error| format!("cannot create fixture: {error}"))?;
+    fs::create_dir_all(empty_root.join(".agents/skills"))
+        .map_err(|error| format!("cannot create fixture: {error}"))?;
+    fs::create_dir_all(empty_root.join(".llms"))
+        .map_err(|error| format!("cannot create fixture: {error}"))?;
+    link("../.claude/skills", &empty_root.join(".llms/skills"))?;
+    expect_refusal(&empty_root, "contains no skill packages anywhere")?;
+
+    // And a tree with no client directories at all.
+    let bare = fixture_root("bare")?;
+    fs::create_dir_all(bare.0.join("repo"))
+        .map_err(|error| format!("cannot create fixture: {error}"))?;
+    expect_refusal(&bare.0.join("repo"), "has no skill hosts")?;
+
+    // Every mutation above was undone; prove it.
+    inspect(&root).map_err(|error| {
+        format!("discovery regression left the fixture broken after restore: {error}")
+    })?;
     Ok(())
 }
 
 fn main() {
-    if let Err(error) = parser_regression_tests() {
-        eprintln!("check-skill-discovery: ERROR: {error}");
-        std::process::exit(1);
-    }
-    if let Err(error) = filesystem_regression_tests() {
-        eprintln!("check-skill-discovery: ERROR: {error}");
-        std::process::exit(1);
+    for test in [
+        parser_regression_tests,
+        filesystem_regression_tests,
+        discovery_regression_tests,
+    ] {
+        if let Err(error) = test() {
+            eprintln!("check-skill-discovery: ERROR: {error}");
+            std::process::exit(1);
+        }
     }
     let root = match env::args().nth(1) {
         Some(path) => PathBuf::from(path),
@@ -450,13 +806,11 @@ fn main() {
             }
         },
     };
-    if let Err(error) = check(&root) {
-        eprintln!("check-skill-discovery: ERROR: {error}");
-        std::process::exit(1);
+    match inspect(&root) {
+        Ok(hosts) => println!("{}", report(&hosts)),
+        Err(error) => {
+            eprintln!("check-skill-discovery: ERROR: {error}");
+            std::process::exit(1);
+        }
     }
-    println!(
-        "check-skill-discovery: PASS ({} root packages, {} LiteInst packages)",
-        ROOT_SKILLS.len(),
-        LITEINST_SKILLS.len()
-    );
 }
