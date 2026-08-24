@@ -294,6 +294,7 @@ static bool report_summary;
 static bool test_wait_for_background;
 static bool test_kill_announced_child;
 static bool test_thread_exit_evidence;
+static bool test_leave_process_clone_result_pending;
 // Typed backend-statistics sink path. When the launcher passes
 // `-stats_path <path>`, each real runtime image appends exactly one fixed-size
 // binary record to this file at `event_exit`, using DynamoRIO's own
@@ -1664,6 +1665,25 @@ static bool is_clone_syscall(int sysnum) {
          sysnum == SYS_clone3;
 }
 
+typedef enum {
+  /* Guest::inject observes its synchronous backend/API result after existing
+   * virtual-child identity normalization. Only application syscalls have a
+   * DynamoRIO post-event that can consume the callback latch. */
+  CLONE_SYSCALL_INJECTED,
+  CLONE_SYSCALL_ORIGINAL,
+} clone_syscall_origin_t;
+
+static bool fail_if_process_clone_result_pending(
+    const prototype_counters_t *counters, int sysnum) {
+  if (counters->pending_process_clone_result == 0)
+    return false;
+  dr_fprintf(diagnostic_file,
+             "reverie-dbt: stale process-clone result state before syscall %d\n",
+             sysnum);
+  exit_runtime_tree(101);
+  return true;
+}
+
 static void acquire_clone_identity_handoff(void) {
   while (atomic_flag_test_and_set_explicit(&pending_clone_lock,
                                            memory_order_acquire))
@@ -1684,15 +1704,11 @@ static void release_clone_identity_handoff(int32_t virtual_child) {
 }
 
 static bool prepare_clone_identity(prototype_counters_t *counters, int sysnum,
-                                   const uint64_t *args) {
+                                   const uint64_t *args,
+                                   clone_syscall_origin_t origin) {
   uint64_t flags;
-  if (counters->pending_process_clone_result != 0) {
-    dr_fprintf(
-        diagnostic_file,
-        "reverie-dbt: stale process-clone result state before clone syscall %d\n",
-        sysnum);
-    exit_runtime_tree(101);
-  }
+  if (fail_if_process_clone_result_pending(counters, sysnum))
+    return false;
   if (!clone_identity_flags(sysnum, args, &flags))
     return false;
   DR_ASSERT(counters->pending_virtual_child == 0);
@@ -1700,7 +1716,8 @@ static bool prepare_clone_identity(prototype_counters_t *counters, int sysnum,
     acquire_clone_identity_handoff();
   counters->pending_virtual_child = allocate_virtual_identity();
   counters->pending_clone_flags = flags;
-  counters->pending_process_clone_result = (flags & CLONE_THREAD) == 0;
+  if (origin == CLONE_SYSCALL_ORIGINAL && (flags & CLONE_THREAD) == 0)
+    counters->pending_process_clone_result = 1;
   if ((flags & CLONE_THREAD) == 0) {
     atomic_store_explicit(&pending_clone_flags, flags, memory_order_relaxed);
     atomic_store_explicit(&pending_clone_creator_pid,
@@ -2086,7 +2103,8 @@ static int64_t invoke_syscall(uintptr_t context, int64_t sysnum,
                ? counters->pending_virtual_child
                : counters->virtual_tid;
 
-  is_clone = prepare_clone_identity(counters, (int)sysnum, translated);
+  is_clone = prepare_clone_identity(counters, (int)sysnum, translated,
+                                    CLONE_SYSCALL_INJECTED);
   if (preserve_internal_descriptors(context, (int)sysnum, translated, &result))
     return result;
   if (is_exec_syscall((int)sysnum))
@@ -2785,7 +2803,8 @@ static bool prepare_original_identity_syscall(void *drcontext,
     if (translated[i] != args[i])
       dr_syscall_set_param(drcontext, i, (reg_t)translated[i]);
   }
-  (void)prepare_clone_identity(counters, sysnum, translated);
+  (void)prepare_clone_identity(counters, sysnum, translated,
+                               CLONE_SYSCALL_ORIGINAL);
   return true;
 }
 
@@ -2835,7 +2854,8 @@ static void post_syscall(void *drcontext, int sysnum) {
   }
   if (is_clone_syscall(sysnum) &&
       counters->pending_process_clone_result != 0) {
-    counters->pending_process_clone_result = 0;
+    if (!test_leave_process_clone_result_pending)
+      counters->pending_process_clone_result = 0;
     evidence_callback_enter();
     reverie_dbt_runtime_process_clone_result(counters, (int64_t)sysnum,
                                              host_syscall_result);
@@ -3351,6 +3371,12 @@ static void scrub_guest_stack_before_first_instruction(void) {
 }
 
 static bool pre_syscall(void *drcontext, int sysnum) {
+  prototype_counters_t *counters = (prototype_counters_t *)drmgr_get_tls_field(
+      drcontext, thread_state_index);
+  DR_ASSERT(counters != NULL);
+  if (fail_if_process_clone_result_pending(counters, sysnum))
+    return false;
+
   // Retained as a FALLBACK, not as the initial-scrub site. Normally the latch
   // is already set by the first-instruction hook above and this returns
   // immediately; it still runs the ownership-based scrub each time a clone
@@ -3389,10 +3415,6 @@ static bool pre_syscall(void *drcontext, int sysnum) {
   uint64_t args[6];
   int64_t result = 0;
   int i;
-  prototype_counters_t *counters = (prototype_counters_t *)drmgr_get_tls_field(
-      drcontext, thread_state_index);
-  DR_ASSERT(counters != NULL);
-
   // TODO-HUMAN-REVIEW(PR-134): Review post-application runtime bootstrap.
   if (!has_copied_runtime())
     ensure_runtime_background();
@@ -3945,6 +3967,9 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[]) {
       test_kill_announced_child = true;
     else if (strcmp(argv[i], "-test-thread-exit-evidence") == 0)
       test_thread_exit_evidence = true;
+    else if (strcmp(argv[i],
+                    "-test-leave-process-clone-result-pending") == 0)
+      test_leave_process_clone_result_pending = true;
     else if (strcmp(argv[i], "-diagnostic_fd") == 0) {
       int fd;
       DR_ASSERT(++i < argc);
@@ -4050,7 +4075,9 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[]) {
     }
     else if (strcmp(argv[i], "-test-wait-for-background") == 0 ||
              strcmp(argv[i], "-test-kill-announced-child") == 0 ||
-             strcmp(argv[i], "-test-thread-exit-evidence") == 0) {
+             strcmp(argv[i], "-test-thread-exit-evidence") == 0 ||
+             strcmp(argv[i],
+                    "-test-leave-process-clone-result-pending") == 0) {
       /* Used only by native lifecycle regression tests. */
     }
     else if (strcmp(argv[i], "-isolated-process-group") == 0)

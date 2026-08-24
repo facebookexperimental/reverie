@@ -395,6 +395,10 @@ where
             args.arg4 as u64,
             args.arg5 as u64,
         ];
+        // The native bridge classifies this as an injected syscall: clone
+        // identity bookkeeping still completes synchronously, while the
+        // original-syscall post-event latch remains disarmed because the raw
+        // result is returned directly to this Tool call.
         let result =
             unsafe { (self.invoke_syscall)(self.context, number.id() as i64, args.as_ptr()) };
         Errno::from_ret(result as usize).map(|value| value as i64)
@@ -1613,7 +1617,8 @@ pub unsafe extern "C" fn reverie_dbt_runtime_exec_failed(
 ) {
 }
 
-/// Reports a delivered native result of a process-creating clone-family syscall.
+/// Reports a delivered native result of an application-originated,
+/// process-creating clone-family syscall.
 ///
 /// DynamoRIO delivers the post-syscall event in both parent and child for `fork`
 /// and separate-VM `clone` and `clone3`. A `clone(CLONE_VM)` process and `vfork`
@@ -1622,6 +1627,9 @@ pub unsafe extern "C" fn reverie_dbt_runtime_exec_failed(
 /// result callback for state that must change after a successful delivered process
 /// clone result but remain untouched when the syscall fails. A runtime that cannot
 /// allow unmediated vfork-child behavior must reject that vfork before execution.
+/// A clone issued synchronously through [`Guest::inject`] returns its backend/API
+/// result, including existing virtual-child identity normalization, directly to
+/// the Tool and does not also enter this post-event callback.
 ///
 /// # Safety
 ///

@@ -102,6 +102,7 @@ const TEST_REWRITE_EXIT_ENV: &str = "HERMIT_DBT_TEST_REWRITE_EXIT";
 const TEST_SET_REG_ENV: &str = "HERMIT_DBT_TEST_SET_REG";
 const TEST_PPID_ENV: &str = "HERMIT_DBT_TEST_PPID";
 const TEST_BACKTRACE_ENV: &str = "HERMIT_DBT_TEST_BACKTRACE";
+const TEST_INJECT_INVALID_CLONE_ENV: &str = "HERMIT_DBT_TEST_INJECT_INVALID_CLONE";
 const COUNTER1_ENV: &str = "HERMIT_DBT_COUNTER1";
 const COUNTER2_ENV: &str = "HERMIT_DBT_COUNTER2";
 const CHUNKY_PRINT_ENV: &str = "HERMIT_DBT_CHUNKY_PRINT";
@@ -137,6 +138,9 @@ static TEST_REWRITE_EXIT_ENABLED: LazyLock<bool> =
 static TEST_SET_REG_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(TEST_SET_REG_ENV));
 static TEST_PPID_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(TEST_PPID_ENV));
 static TEST_BACKTRACE_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(TEST_BACKTRACE_ENV));
+static TEST_INJECT_INVALID_CLONE_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| env_flag(TEST_INJECT_INVALID_CLONE_ENV));
+static TEST_INJECT_INVALID_CLONE_DONE: AtomicBool = AtomicBool::new(false);
 static COUNTER1_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(COUNTER1_ENV));
 static COUNTER2_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(COUNTER2_ENV));
 static CHUNKY_PRINT_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(CHUNKY_PRINT_ENV));
@@ -518,6 +522,46 @@ impl Tool for SetRegTool {
             }
             _ => guest.tail_inject(syscall).await,
         }
+    }
+}
+
+/// Regression tool that performs one invalid process-clone through
+/// [`Guest::inject`] while handling `getuid`, then lets the original `getuid`
+/// execute normally. The injected syscall returns synchronously to the Tool;
+/// it must not arm the native post-event callback latch used by original
+/// application syscalls.
+#[derive(Clone, Copy, Debug, Default)]
+struct InjectInvalidCloneTool;
+
+#[reverie::tool]
+impl Tool for InjectInvalidCloneTool {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        if syscall.number() == Sysno::getuid
+            && !TEST_INJECT_INVALID_CLONE_DONE.swap(true, Ordering::SeqCst)
+        {
+            let flags = (libc::CLONE_SIGHAND | libc::SIGCHLD) as usize;
+            let invalid_clone =
+                Syscall::from_raw(Sysno::clone, SyscallArgs::new(flags, 0, 0, 0, 0, 0));
+            match guest.inject(invalid_clone).await {
+                Err(errno) if errno == reverie::syscalls::Errno::EINVAL => {
+                    emit_line("reverie-dbt-test: injected invalid clone returned EINVAL");
+                }
+                other => {
+                    emit_line(&format!(
+                        "reverie-dbt-test: injected invalid clone returned {other:?}"
+                    ));
+                    return Err(reverie::syscalls::Errno::EIO.into());
+                }
+            }
+        }
+        guest.tail_inject(syscall).await
     }
 }
 
@@ -1351,6 +1395,7 @@ enum ActiveTool {
     SetReg,
     Ppid,
     Backtrace,
+    InjectInvalidClone,
     Counter1,
     Counter2,
     ChunkyPrint,
@@ -1361,6 +1406,8 @@ enum ActiveTool {
 fn active_tool() -> Option<ActiveTool> {
     if *TEST_REWRITE_EXIT_ENABLED {
         Some(ActiveTool::RewriteExit)
+    } else if *TEST_INJECT_INVALID_CLONE_ENABLED {
+        Some(ActiveTool::InjectInvalidClone)
     } else if *TEST_SET_REG_ENABLED {
         Some(ActiveTool::SetReg)
     } else if *TEST_PPID_ENABLED {
@@ -1781,6 +1828,17 @@ pub(crate) fn run_active_tool(
             read_registers,
             write_registers,
             read_memory,
+        ),
+        ActiveTool::InjectInvalidClone => dispatch(
+            &InjectInvalidCloneTool,
+            context,
+            tid,
+            pid,
+            branches,
+            syscall,
+            invoke_syscall,
+            read_registers,
+            write_registers,
         ),
         ActiveTool::Counter1 => dispatch_counter1(
             context,
