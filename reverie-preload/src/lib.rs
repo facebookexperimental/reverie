@@ -47,7 +47,6 @@
 //! * **As a standalone `LD_PRELOAD` (`cdylib`):** set `REVERIE_PRELOAD_TOOL` and
 //!   preload `libreverie_preload.so`; the constructor installs a built-in tool.
 
-#![feature(thread_local)]
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]

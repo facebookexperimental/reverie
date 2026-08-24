@@ -5,6 +5,7 @@ use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::AtomicU8;
 use core::sync::atomic::AtomicU64;
 use core::sync::atomic::Ordering;
+use std::cell::Cell;
 use std::ffi::OsStr;
 use std::io;
 use std::ptr;
@@ -256,13 +257,13 @@ static EVENT_DEVICE: AtomicU64 = AtomicU64::new(0);
 static EVENT_INODE: AtomicU64 = AtomicU64::new(0);
 static IN_GUEST_STAGE_STREAM: AtomicBool = AtomicBool::new(false);
 
-#[thread_local]
-static mut CURRENT_EVENT: *mut SyscallEvent = ptr::null_mut();
-// Reentry is a property of Tool execution, not of syscall-event storage:
-// instruction callbacks have no current SyscallEvent but must take the same
-// native/raw bypasses while holding Tool and thread-state locks.
-#[thread_local]
-static TOOL_CALLBACK_ACTIVE: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static CURRENT_EVENT: Cell<*mut SyscallEvent> = const { Cell::new(ptr::null_mut()) };
+    // Reentry is a property of Tool execution, not of syscall-event storage:
+    // instruction callbacks have no current SyscallEvent but must take the same
+    // native/raw bypasses while holding Tool and thread-state locks.
+    static TOOL_CALLBACK_ACTIVE: AtomicBool = const { AtomicBool::new(false) };
+}
 
 struct ToolCallbackGuard {
     previous: bool,
@@ -270,14 +271,14 @@ struct ToolCallbackGuard {
 
 impl ToolCallbackGuard {
     fn enter() -> Self {
-        let previous = TOOL_CALLBACK_ACTIVE.swap(true, Ordering::Relaxed);
+        let previous = TOOL_CALLBACK_ACTIVE.with(|active| active.swap(true, Ordering::Relaxed));
         Self { previous }
     }
 }
 
 impl Drop for ToolCallbackGuard {
     fn drop(&mut self) {
-        TOOL_CALLBACK_ACTIVE.store(self.previous, Ordering::Relaxed);
+        TOOL_CALLBACK_ACTIVE.with(|active| active.store(self.previous, Ordering::Relaxed));
     }
 }
 
@@ -287,20 +288,19 @@ struct CurrentEventGuard {
 
 impl CurrentEventGuard {
     fn enter(event: *mut SyscallEvent) -> Self {
-        let previous = unsafe { CURRENT_EVENT };
-        unsafe { CURRENT_EVENT = event };
+        let previous = CURRENT_EVENT.replace(event);
         Self { previous }
     }
 }
 
 impl Drop for CurrentEventGuard {
     fn drop(&mut self) {
-        unsafe { CURRENT_EVENT = self.previous };
+        CURRENT_EVENT.set(self.previous);
     }
 }
 
 fn tool_callback_active() -> bool {
-    TOOL_CALLBACK_ACTIVE.load(Ordering::Relaxed)
+    TOOL_CALLBACK_ACTIVE.with(|active| active.load(Ordering::Relaxed))
 }
 
 static ARENAS: OnceLock<Vec<RuntimeArena>> = OnceLock::new();
@@ -333,18 +333,15 @@ pub(crate) struct InstructionSubscriptions {
     pub(crate) rdtsc: bool,
 }
 
-#[thread_local]
-static mut RCB_CLOCK: *mut reverie_ptrace::InGuestRcbCounter = ptr::null_mut();
-#[thread_local]
-static mut RCB_CLOCK_OWNER: libc::pid_t = 0;
-#[thread_local]
-static mut RCB_CLOCK_UNAVAILABLE: bool = false;
-#[thread_local]
-static mut RCB_HANDLER_ENTRY: u64 = 0;
-#[thread_local]
-static mut RCB_HANDLER_DEDUCTION: u64 = 0;
-#[thread_local]
-static mut RCB_HANDLER_DEPTH: u32 = 0;
+thread_local! {
+    static RCB_CLOCK: Cell<*mut reverie_ptrace::InGuestRcbCounter> =
+        const { Cell::new(ptr::null_mut()) };
+    static RCB_CLOCK_OWNER: Cell<libc::pid_t> = const { Cell::new(0) };
+    static RCB_CLOCK_UNAVAILABLE: Cell<bool> = const { Cell::new(false) };
+    static RCB_HANDLER_ENTRY: Cell<u64> = const { Cell::new(0) };
+    static RCB_HANDLER_DEDUCTION: Cell<u64> = const { Cell::new(0) };
+    static RCB_HANDLER_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
 
 /// Install the current thread's in-guest RCB clock before seccomp is active.
 pub(crate) fn initialize_rcb_clock() -> io::Result<()> {
@@ -364,20 +361,18 @@ fn initialize_rcb_clock_with(
     // owner from inside the still-active fork callback. Preserve that callback
     // depth while replacing the counter; resetting it would make the outer
     // leave underflow after child reconstruction completes.
-    let active_depth = unsafe { RCB_HANDLER_DEPTH };
+    let active_depth = RCB_HANDLER_DEPTH.get();
     // Publish an unavailable sentinel before creating the perf event. When a
     // fork child first initializes after seccomp is active, the builder's own
     // syscalls can re-enter an already-patched syscall hook; that nested hook
     // must observe this owner as initialized instead of recursively creating
     // another counter.
-    unsafe {
-        RCB_CLOCK = ptr::null_mut();
-        RCB_CLOCK_OWNER = owner;
-        RCB_CLOCK_UNAVAILABLE = true;
-        RCB_HANDLER_ENTRY = 0;
-        RCB_HANDLER_DEDUCTION = 0;
-        RCB_HANDLER_DEPTH = active_depth;
-    }
+    RCB_CLOCK.set(ptr::null_mut());
+    RCB_CLOCK_OWNER.set(owner);
+    RCB_CLOCK_UNAVAILABLE.set(true);
+    RCB_HANDLER_ENTRY.set(0);
+    RCB_HANDLER_DEDUCTION.set(0);
+    RCB_HANDLER_DEPTH.set(active_depth);
     let clock = match create() {
         Ok(clock) => clock,
         // The in-guest clock is optional. CPU discovery, perf-event setup,
@@ -392,28 +387,26 @@ fn initialize_rcb_clock_with(
             .read()
             .map_err(|error| io::Error::from_raw_os_error(error.into_raw()))?
     };
-    unsafe {
-        RCB_CLOCK = Box::into_raw(Box::new(clock));
-        RCB_CLOCK_OWNER = owner;
-        RCB_CLOCK_UNAVAILABLE = false;
-        RCB_HANDLER_ENTRY = active_entry;
-        RCB_HANDLER_DEDUCTION = 0;
-        RCB_HANDLER_DEPTH = active_depth;
-    }
+    RCB_CLOCK.set(Box::into_raw(Box::new(clock)));
+    RCB_CLOCK_OWNER.set(owner);
+    RCB_CLOCK_UNAVAILABLE.set(false);
+    RCB_HANDLER_ENTRY.set(active_entry);
+    RCB_HANDLER_DEDUCTION.set(0);
+    RCB_HANDLER_DEPTH.set(active_depth);
     Ok(())
 }
 
 fn rcb_clock() -> io::Result<Option<&'static reverie_ptrace::InGuestRcbCounter>> {
     let owner = unsafe { raw_syscall6(libc::SYS_gettid, [0; 6]) } as libc::pid_t;
-    if unsafe { RCB_CLOCK_OWNER } != owner {
+    if RCB_CLOCK_OWNER.get() != owner {
         // A fork/clone child inherits the parent's TLS bytes, including an fd
         // that still measures the parent thread. Leak that inherited handle
         // and bind a fresh PMU event to this calling thread.
         initialize_rcb_clock()?;
     }
-    let current = unsafe { RCB_CLOCK };
+    let current = RCB_CLOCK.get();
     if current.is_null() {
-        debug_assert!(unsafe { RCB_CLOCK_UNAVAILABLE });
+        debug_assert!(RCB_CLOCK_UNAVAILABLE.get());
         Ok(None)
     } else {
         Ok(Some(unsafe { &*current }))
@@ -423,33 +416,28 @@ fn rcb_clock() -> io::Result<Option<&'static reverie_ptrace::InGuestRcbCounter>>
 /// Mark entry into an ordinary-context tool callback.
 pub(crate) fn enter_rcb_handler() -> io::Result<()> {
     let Some(clock) = rcb_clock()? else {
-        unsafe {
-            RCB_HANDLER_DEPTH = RCB_HANDLER_DEPTH.saturating_add(1);
-        }
+        RCB_HANDLER_DEPTH.set(RCB_HANDLER_DEPTH.get().saturating_add(1));
         return Ok(());
     };
     let sample = clock
         .read()
         .map_err(|error| io::Error::from_raw_os_error(error.into_raw()))?;
-    unsafe {
-        if RCB_HANDLER_DEPTH == 0 {
-            RCB_HANDLER_ENTRY = sample;
-        }
-        RCB_HANDLER_DEPTH = RCB_HANDLER_DEPTH.saturating_add(1);
+    if RCB_HANDLER_DEPTH.get() == 0 {
+        RCB_HANDLER_ENTRY.set(sample);
     }
+    RCB_HANDLER_DEPTH.set(RCB_HANDLER_DEPTH.get().saturating_add(1));
     Ok(())
 }
 
 /// Deduct all RCBs retired while the outermost tool callback was active.
 pub(crate) fn leave_rcb_handler() -> io::Result<()> {
-    unsafe {
-        if RCB_HANDLER_DEPTH == 0 {
-            return Err(io::Error::other("LiteInst RCB handler depth underflow"));
-        }
-        RCB_HANDLER_DEPTH -= 1;
-        if RCB_HANDLER_DEPTH != 0 {
-            return Ok(());
-        }
+    let depth = RCB_HANDLER_DEPTH.get();
+    if depth == 0 {
+        return Err(io::Error::other("LiteInst RCB handler depth underflow"));
+    }
+    RCB_HANDLER_DEPTH.set(depth - 1);
+    if depth != 1 {
+        return Ok(());
     }
     let Some(clock) = rcb_clock()? else {
         return Ok(());
@@ -457,11 +445,12 @@ pub(crate) fn leave_rcb_handler() -> io::Result<()> {
     let sample = clock
         .read()
         .map_err(|error| io::Error::from_raw_os_error(error.into_raw()))?;
-    unsafe {
-        RCB_HANDLER_DEDUCTION =
-            RCB_HANDLER_DEDUCTION.saturating_add(sample.saturating_sub(RCB_HANDLER_ENTRY));
-        RCB_HANDLER_ENTRY = 0;
-    }
+    RCB_HANDLER_DEDUCTION.set(
+        RCB_HANDLER_DEDUCTION
+            .get()
+            .saturating_add(sample.saturating_sub(RCB_HANDLER_ENTRY.get())),
+    );
+    RCB_HANDLER_ENTRY.set(0);
     Ok(())
 }
 
@@ -477,16 +466,14 @@ pub(crate) fn read_guest_rcb_clock() -> io::Result<u64> {
     let sample = clock
         .read()
         .map_err(|error| io::Error::from_raw_os_error(error.into_raw()))?;
-    unsafe {
-        let active = if RCB_HANDLER_DEPTH == 0 {
-            0
-        } else {
-            sample.saturating_sub(RCB_HANDLER_ENTRY)
-        };
-        Ok(sample
-            .saturating_sub(RCB_HANDLER_DEDUCTION)
-            .saturating_sub(active))
-    }
+    let active = if RCB_HANDLER_DEPTH.get() == 0 {
+        0
+    } else {
+        sample.saturating_sub(RCB_HANDLER_ENTRY.get())
+    };
+    Ok(sample
+        .saturating_sub(RCB_HANDLER_DEDUCTION.get())
+        .saturating_sub(active))
 }
 
 pub(crate) fn reserve_coordinator_fd(fd: libc::c_int) -> io::Result<()> {
@@ -2779,7 +2766,7 @@ impl SyscallDispatcher for LiteinstDispatcher {
 }
 
 unsafe extern "C" fn tool_trampoline() {
-    let event = unsafe { CURRENT_EVENT };
+    let event = CURRENT_EVENT.get();
     if event.is_null() {
         unsafe {
             exit_now(123);
@@ -3360,9 +3347,9 @@ mod tests {
             reverie::Errno::EIO,
         ] {
             initialize_rcb_clock_with(|| Err(error)).unwrap();
-            assert!(unsafe { RCB_CLOCK }.is_null());
-            assert!(unsafe { RCB_CLOCK_UNAVAILABLE });
-            assert_eq!(unsafe { RCB_CLOCK_OWNER }, owner);
+            assert!(RCB_CLOCK.get().is_null());
+            assert!(RCB_CLOCK_UNAVAILABLE.get());
+            assert_eq!(RCB_CLOCK_OWNER.get(), owner);
         }
     }
 

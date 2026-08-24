@@ -21,6 +21,7 @@
 
 use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::Ordering;
+use std::cell::Cell;
 use std::io;
 use std::ptr;
 
@@ -74,10 +75,11 @@ unsafe extern "C" {
 /// The registered dispatcher, as a leaked thin pointer to a boxed trait object.
 static DISPATCHER: AtomicPtr<Box<dyn SyscallDispatcher>> = AtomicPtr::new(ptr::null_mut());
 
-/// Per-thread reentrancy guard. `#[thread_local]` (not `thread_local!`) so first
-/// access performs no lazy initialization / allocation inside the handler.
-#[thread_local]
-static mut IN_HANDLER: bool = false;
+thread_local! {
+    /// Per-thread reentrancy guard. The const initializer and no-drop `Cell`
+    /// select native TLS without Rust's lazy-initialization state machine.
+    static IN_HANDLER: Cell<bool> = const { Cell::new(false) };
+}
 
 /// Execute a real syscall through the trusted gate.
 ///
@@ -190,10 +192,10 @@ pub(crate) unsafe extern "C" fn sigsys_handler(
 
     // Reentrancy guard: a trapped syscall inside the handler is a bug (the
     // dispatcher must use the trusted gate). Fail closed rather than recurse.
-    if unsafe { IN_HANDLER } {
+    if IN_HANDLER.get() {
         unsafe { exit_now(125) };
     }
-    unsafe { IN_HANDLER = true };
+    IN_HANDLER.set(true);
 
     let context = unsafe { &mut *context.cast::<libc::ucontext_t>() };
     let registers = &mut context.uc_mcontext.gregs;
@@ -220,7 +222,7 @@ pub(crate) unsafe extern "C" fn sigsys_handler(
     } else {
         registers[libc::REG_RAX as usize] = event.resolved_result();
     }
-    unsafe { IN_HANDLER = false };
+    IN_HANDLER.set(false);
 }
 
 /// Install the SIGSYS handler (and, optionally, an alternate signal stack).

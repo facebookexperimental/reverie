@@ -19,6 +19,7 @@ use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering;
 use std::alloc::System;
+use std::cell::Cell;
 
 const PATCH_HEAP_BYTES: usize = 32 * 1024 * 1024;
 
@@ -217,34 +218,28 @@ struct ToolHeapLock<'a> {
     heap: &'a ToolHeap,
 }
 
-#[thread_local]
-static mut INSTALLATION_DEPTH: usize = 0;
-
-#[thread_local]
-static mut DISPATCH_DEPTH: usize = 0;
+thread_local! {
+    // Const, no-drop TLS is important here: the global allocator consults
+    // these counters before it can choose a safe backing heap.
+    static INSTALLATION_DEPTH: Cell<usize> = const { Cell::new(0) };
+    static DISPATCH_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
 
 pub(crate) struct PatchAllocationScope;
 
 impl Drop for PatchAllocationScope {
     fn drop(&mut self) {
-        // SAFETY: scopes are entered and dropped on the same thread.
-        unsafe {
-            INSTALLATION_DEPTH -= 1;
-        }
+        INSTALLATION_DEPTH.set(INSTALLATION_DEPTH.get() - 1);
     }
 }
 
 pub(crate) fn enter() -> PatchAllocationScope {
-    // SAFETY: the counter belongs exclusively to this thread.
-    unsafe {
-        INSTALLATION_DEPTH += 1;
-    }
+    INSTALLATION_DEPTH.set(INSTALLATION_DEPTH.get() + 1);
     PatchAllocationScope
 }
 
 fn installation_active() -> bool {
-    // SAFETY: reading this thread's scalar TLS value has no side effects.
-    unsafe { INSTALLATION_DEPTH != 0 }
+    INSTALLATION_DEPTH.get() != 0
 }
 
 // TODO-HUMAN-REVIEW(PR-148): Review the dispatch allocator scope API.
@@ -252,25 +247,18 @@ pub(crate) struct DispatchAllocationScope;
 
 impl Drop for DispatchAllocationScope {
     fn drop(&mut self) {
-        // SAFETY: scopes are entered and dropped on the same thread.
-        unsafe {
-            DISPATCH_DEPTH -= 1;
-        }
+        DISPATCH_DEPTH.set(DISPATCH_DEPTH.get() - 1);
     }
 }
 
 // TODO-HUMAN-REVIEW(PR-148): Review signal-context tool allocation isolation.
 pub(crate) fn enter_dispatch() -> DispatchAllocationScope {
-    // SAFETY: the counter belongs exclusively to this thread.
-    unsafe {
-        DISPATCH_DEPTH += 1;
-    }
+    DISPATCH_DEPTH.set(DISPATCH_DEPTH.get() + 1);
     DispatchAllocationScope
 }
 
 fn dispatch_active() -> bool {
-    // SAFETY: reading this thread's scalar TLS value has no side effects.
-    unsafe { DISPATCH_DEPTH != 0 }
+    DISPATCH_DEPTH.get() != 0
 }
 
 pub(crate) struct PatchAllocator;
