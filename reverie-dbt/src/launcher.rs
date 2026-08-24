@@ -688,17 +688,7 @@ impl DbtRunner {
             }
         };
         let evidence = self.finish_evidence(status.is_ok());
-        match (status, evidence) {
-            (Ok(status), Ok(())) => Ok(status),
-            (Err(error), _) => Err(error),
-            (Ok(status), Err(error)) => Err(io::Error::new(
-                error.kind(),
-                format!(
-                    "DBT guest exited with status {:?} while protected evidence failed: {error}",
-                    status.code()
-                ),
-            )),
-        }
+        combine_status_and_evidence(status, evidence)
     }
 
     fn wait_with_output(&self, mut child: Child) -> io::Result<Output> {
@@ -890,6 +880,53 @@ impl DbtRunner {
             });
         }
         command
+    }
+}
+
+/// Combine the guest's exit status with the evidence-session outcome.
+///
+/// Pulled out of `wait_for_status` as a free function ON PURPOSE: the contract
+/// below is about ERROR KINDS, and every other evidence test in this file needs a
+/// real DynamoRIO run to reach the code it checks. A contract that can only be
+/// exercised end-to-end is a contract that stops being exercised. This one is
+/// pure, so the regression test costs nothing and always runs.
+///
+/// THE CONTRACT: when the guest produced an exit status, THE GUEST RAN -- a
+/// process that never launched cannot produce one -- so the resulting error must
+/// not carry a kind a caller can read as a spawn failure.
+///
+/// This used to re-emit `error.kind()`, and the evidence layer produces
+/// spawn-shaped kinds after the guest is already running: `PermissionDenied` from
+/// its peer-credential checks (see `evidence.rs::handle_connection`, and
+/// `protected_evidence_refuses_a_valid_frame_from_outside_the_guest_tree`, which
+/// asserts exactly that kind), and `NotFound` from a bare `?` on
+/// `/proc/<pid>/stat` when the peer exits before it is read.
+///
+/// No in-tree Reverie caller branches on the error returned from this arm; the
+/// public status/output entry points propagate it. Current Hermit also wraps all
+/// DBT runner errors in an unconditional "failed to launch drrun" message and
+/// does not inspect `ErrorKind`, so this change alone does not correct that
+/// diagnostic. It establishes the truthful distinction required by the paired
+/// Hermit fix: errors produced after an exit status exists become `Other`,
+/// while spawn errors bypass this helper and retain their original kind.
+///
+/// `other` is the honest kind: the failure is in evidence finalization, which is
+/// not an `io::ErrorKind` any caller should branch on. The underlying error is
+/// preserved verbatim in the message, which is where the cause has always been
+/// read.
+fn combine_status_and_evidence(
+    status: io::Result<ExitStatus>,
+    evidence: io::Result<()>,
+) -> io::Result<ExitStatus> {
+    match (status, evidence) {
+        (Ok(status), Ok(())) => Ok(status),
+        // An error without an exit status keeps its own kind. Spawn errors
+        // bypass this helper entirely and likewise remain unchanged.
+        (Err(error), _) => Err(error),
+        (Ok(status), Err(error)) => Err(io::Error::other(format!(
+            "DBT guest exited with status {:?} while protected evidence failed: {error}",
+            status.code()
+        ))),
     }
 }
 
@@ -1859,6 +1896,76 @@ mod tests {
 
         let error = sink.drain().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Other);
+    }
+
+    /// A post-launch evidence failure must NOT surface a spawn-shaped kind.
+    ///
+    /// Current Hermit does not yet inspect this kind: it reports every DBT
+    /// runner error as "failed to launch drrun". The paired Hermit change needs
+    /// an honest discriminator before it can correct that message. This test
+    /// guarantees that evidence finalization cannot retain a spawn-shaped kind
+    /// after the guest has already produced an exit status.
+    ///
+    /// NOT `#[ignore]`, unlike every other evidence test here: those need built
+    /// DynamoRIO and so only run when someone asks for them. This contract is
+    /// about error kinds, not about DynamoRIO, and it runs on every `cargo test`.
+    #[test]
+    fn a_post_launch_evidence_failure_never_reports_a_spawn_kind() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let exited = ExitStatus::from_raw(0x100); // exit code 1
+        for kind in [
+            io::ErrorKind::NotFound,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::ExecutableFileBusy,
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::TimedOut,
+        ] {
+            let error = combine_status_and_evidence(
+                Ok(exited),
+                Err(io::Error::new(kind, "evidence collector said no")),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::Other,
+                "a post-launch failure must not surface {kind:?} to a caller that branches on the kind to blame the binary"
+            );
+            // The cause must survive verbatim; truncating it is what cost the
+            // original investigation its answer.
+            assert!(
+                error.to_string().contains("evidence collector said no"),
+                "underlying cause lost: {error}"
+            );
+            assert!(
+                error.to_string().contains("DBT guest exited with status"),
+                "the message must say the guest ran: {error}"
+            );
+        }
+    }
+
+    /// The other direction, so the fix above cannot be over-applied. An error
+    /// without an exit status keeps its kind, and genuine spawn errors bypass
+    /// this helper entirely.
+    #[test]
+    fn an_error_without_exit_status_keeps_its_own_kind() {
+        for kind in [io::ErrorKind::NotFound, io::ErrorKind::PermissionDenied] {
+            let error =
+                combine_status_and_evidence(Err(io::Error::new(kind, "no such file")), Ok(()))
+                    .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                kind,
+                "an error without an exit status must keep its kind"
+            );
+        }
+        // An evidence failure alongside a status error must not mask it.
+        let error = combine_status_and_evidence(
+            Err(io::Error::new(io::ErrorKind::NotFound, "no such file")),
+            Err(io::Error::other("evidence also failed")),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]
