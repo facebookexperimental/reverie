@@ -19,7 +19,7 @@ linked-hash-map = { version = "0.5", features = ["serde_impl"] }
 memmap2 = "0.9.11"
 never-say-never = "6"
 nix = { version = "0.31.3", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
-object = { version = "0.37.3", features = ["read", "write"] }
+object = { version = "0.38.1", features = ["read", "write"] }
 procfs = "0.18.0"
 raw-cpuid = "10.7.0"
 reverie-process = { version = "0.1.0", path = "../reverie-process" }
