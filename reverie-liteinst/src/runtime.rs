@@ -1350,17 +1350,55 @@ const TRACKED_SYSCALLS: usize = 512;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-249): Review public fallback-surface observability counters.
-/// Total number of syscalls that reached [`LiteinstDispatcher`]'s escape surface
-/// — a trapped site the runtime could not route to the Tool (un-patchable
+/// Total and per-syscall counts for [`LiteinstDispatcher`]'s escape surface —
+/// trapped sites the runtime could not route to the Tool (un-patchable
 /// `SITE_FALLBACK`, or an unclaimable site) and therefore failed closed with
 /// `EOPNOTSUPP`.
-static FALLBACK_TOTAL: AtomicU64 = AtomicU64::new(0);
+struct FallbackCounters {
+    total: AtomicU64,
+    by_number: [AtomicU64; TRACKED_SYSCALLS],
+}
+
+impl FallbackCounters {
+    const fn new() -> Self {
+        Self {
+            total: AtomicU64::new(0),
+            by_number: [const { AtomicU64::new(0) }; TRACKED_SYSCALLS],
+        }
+    }
+
+    fn record(&self, number: i64) {
+        self.total.fetch_add(1, Ordering::Relaxed);
+        if let Ok(index) = usize::try_from(number)
+            && index < TRACKED_SYSCALLS
+        {
+            self.by_number[index].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn total(&self) -> u64 {
+        self.total.load(Ordering::Relaxed)
+    }
+
+    fn by_number(&self, number: i64) -> u64 {
+        match usize::try_from(number) {
+            Ok(index) if index < TRACKED_SYSCALLS => self.by_number[index].load(Ordering::Relaxed),
+            _ => 0,
+        }
+    }
+
+    fn reset(&self) {
+        self.total.store(0, Ordering::Relaxed);
+        for slot in &self.by_number {
+            slot.store(0, Ordering::Relaxed);
+        }
+    }
+}
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-249): Review public fallback-surface observability counters.
-/// Per-syscall-number escape counts, indexed by syscall number.
-static FALLBACK_BY_NUMBER: [AtomicU64; TRACKED_SYSCALLS] =
-    [const { AtomicU64::new(0) }; TRACKED_SYSCALLS];
+/// Process-wide counters used by the installed runtime.
+static FALLBACK_COUNTERS: FallbackCounters = FallbackCounters::new();
 
 /// Record that one syscall reached the fail-closed escape surface.
 ///
@@ -1375,12 +1413,7 @@ static FALLBACK_BY_NUMBER: [AtomicU64; TRACKED_SYSCALLS] =
 /// the `SIGSYS` dispatch path. It does not change the forwarding decision.
 pub(crate) fn record_fallback_dispatch(number: i64) {
     // AUTONOMOUS-BOT-IMPLEMENTED
-    FALLBACK_TOTAL.fetch_add(1, Ordering::Relaxed);
-    if let Ok(index) = usize::try_from(number)
-        && index < TRACKED_SYSCALLS
-    {
-        FALLBACK_BY_NUMBER[index].fetch_add(1, Ordering::Relaxed);
-    }
+    FALLBACK_COUNTERS.record(number);
 }
 
 /// Total syscalls that failed closed on the escape surface.
@@ -1391,7 +1424,7 @@ pub(crate) fn record_fallback_dispatch(number: i64) {
 /// (e.g. a libc-internal `getrandom`) that bypass determinism, so a nonzero
 /// count is a determinism-completeness signal, not merely a perf one.
 pub(crate) fn fallback_dispatch_count() -> u64 {
-    FALLBACK_TOTAL.load(Ordering::Relaxed)
+    FALLBACK_COUNTERS.total()
 }
 
 /// Number of times syscall `number` reached the escape surface.
@@ -1399,20 +1432,16 @@ pub(crate) fn fallback_dispatch_count() -> u64 {
 /// Returns `0` for a negative number or one at or above [`TRACKED_SYSCALLS`],
 /// which are only ever reflected in [`fallback_dispatch_count`].
 pub(crate) fn fallback_syscall_count(number: i64) -> u64 {
-    match usize::try_from(number) {
-        Ok(index) if index < TRACKED_SYSCALLS => FALLBACK_BY_NUMBER[index].load(Ordering::Relaxed),
-        _ => 0,
-    }
+    FALLBACK_COUNTERS.by_number(number)
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-260): Review the fork-child per-process observability reset.
 /// Reset every fallback-surface counter to zero for the current process.
 ///
-/// LiteInst's observability counters — the process-wide [`FALLBACK_TOTAL`], the
-/// per-syscall-number [`FALLBACK_BY_NUMBER`], and each patch site's per-site
-/// `trap`/`hook` counts ([`site_counts`]) — are process-global. A `fork`/`clone`
-/// child copy-on-write inherits the parent's accumulated values, so without a
+/// LiteInst's process-wide [`FALLBACK_COUNTERS`] and each patch site's per-site
+/// `trap`/`hook` counts ([`site_counts`]) are inherited by a `fork`/`clone`
+/// child copy-on-write, so without a
 /// reset the child would report the parent's residual surface and hook activity
 /// as its own. This is the same per-process runtime state the shared
 /// [`ForkHook`] seam ([`reverie_preload::fork`]) exists to re-establish in the
@@ -1426,17 +1455,18 @@ pub(crate) fn fallback_syscall_count(number: i64) -> u64 {
 /// only relaxed atomic stores plus one lock-free [`OnceLock::get`], no allocation
 /// and no locks, so it is safe to run in the child from inside the `SIGSYS`
 /// handler.
+fn reset_site_observability(sites: &[SiteSlot]) {
+    for site in sites {
+        site.trap_count.store(0, Ordering::Relaxed);
+        site.hook_count.store(0, Ordering::Relaxed);
+    }
+}
+
 pub(crate) fn reset_fallback_observability() {
     // AUTONOMOUS-BOT-IMPLEMENTED
-    FALLBACK_TOTAL.store(0, Ordering::Relaxed);
-    for slot in &FALLBACK_BY_NUMBER {
-        slot.store(0, Ordering::Relaxed);
-    }
+    FALLBACK_COUNTERS.reset();
     if let Some(sites) = SITES.get() {
-        for site in sites {
-            site.trap_count.store(0, Ordering::Relaxed);
-            site.hook_count.store(0, Ordering::Relaxed);
-        }
+        reset_site_observability(sites);
     }
 }
 
@@ -3304,6 +3334,7 @@ mod tests {
     use super::ALT_STACK_ENV;
     use super::ENABLED_FALLBACK_CLASSIFICATIONS;
     use super::FORK_HOOK;
+    use super::FallbackCounters;
     use super::LiteinstDispatcher;
     use super::MAX_PATCH_SITES;
     use super::RCB_CLOCK;
@@ -3328,8 +3359,7 @@ mod tests {
     use super::mark_site_range_stale;
     use super::raw_syscall6;
     use super::record_fallback_dispatch;
-    use super::reset_fallback_observability;
-    use super::site_counts;
+    use super::reset_site_observability;
 
     #[test]
     fn every_optional_rcb_setup_error_takes_the_real_unavailable_path() {
@@ -3432,52 +3462,42 @@ mod tests {
 
     #[test]
     fn recording_a_fallback_bumps_total_and_the_matching_syscall() {
-        // A syscall number unique to this test, so the per-number assertion is
-        // exact even if the process-global counters are touched concurrently.
+        let counters = FallbackCounters::new();
         let number: i64 = 402;
-        let per_before = fallback_syscall_count(number);
-        let total_before = fallback_dispatch_count();
 
-        record_fallback_dispatch(number);
+        counters.record(number);
 
-        assert_eq!(fallback_syscall_count(number), per_before + 1);
-        assert!(
-            fallback_dispatch_count() > total_before,
-            "total must advance by at least this recording"
-        );
+        assert_eq!(counters.by_number(number), 1);
+        assert_eq!(counters.total(), 1);
     }
 
     #[test]
     fn out_of_range_syscall_numbers_count_in_the_total_only() {
+        let counters = FallbackCounters::new();
         // Above the tracked bound: total advances, per-number stays zero.
         let huge = i64::from(i32::MAX);
-        let total_before = fallback_dispatch_count();
-        record_fallback_dispatch(huge);
-        assert_eq!(fallback_syscall_count(huge), 0);
-        assert!(fallback_dispatch_count() > total_before);
+        counters.record(huge);
+        assert_eq!(counters.by_number(huge), 0);
+        assert_eq!(counters.total(), 1);
 
         // Negative numbers are never used to index the per-number table.
-        let total_before = fallback_dispatch_count();
-        record_fallback_dispatch(-1);
-        assert_eq!(fallback_syscall_count(-1), 0);
-        assert!(fallback_dispatch_count() > total_before);
+        counters.record(-1);
+        assert_eq!(counters.by_number(-1), 0);
+        assert_eq!(counters.total(), 2);
     }
 
     #[test]
-    fn fork_child_reset_zeroes_the_process_global_fallback_counters() {
-        // Serial (`--test-threads=1`), so resetting the process-global counters
-        // does not race other tests. Record on both counter families, then prove
-        // the fork-child reset clears them. This is the by-number/total analog of
-        // reverie-e9patch's round-7 `resetting_observability_zeroes_...` test.
+    fn fallback_counter_reset_zeroes_total_and_per_number_counts() {
+        let counters = FallbackCounters::new();
         let number: i64 = 404;
-        record_fallback_dispatch(number);
-        assert!(fallback_dispatch_count() > 0);
-        assert!(fallback_syscall_count(number) > 0);
+        counters.record(number);
+        assert_eq!(counters.total(), 1);
+        assert_eq!(counters.by_number(number), 1);
 
-        reset_fallback_observability();
+        counters.reset();
 
-        assert_eq!(fallback_dispatch_count(), 0);
-        assert_eq!(fallback_syscall_count(number), 0);
+        assert_eq!(counters.total(), 0);
+        assert_eq!(counters.by_number(number), 0);
     }
 
     #[test]
@@ -3485,24 +3505,20 @@ mod tests {
         // The per-site trap/hook counts are observability; the site's address and
         // state are functional patch metadata the COW-inherited child must keep.
         // Reset must clear the former without disturbing the latter.
-        SITES.get_or_init(|| {
-            (0..MAX_PATCH_SITES)
-                .map(|_| SiteSlot::new())
-                .collect::<Vec<_>>()
-                .into_boxed_slice()
-        });
+        let site = SiteSlot::new();
         let address = 0x4321_9000;
-        let (site, claimed) = claim_site(address).unwrap();
-        assert!(claimed);
+        site.address.store(address, Ordering::Release);
         site.state.store(SITE_ACTIVE, Ordering::Release);
         site.trap_count.store(7, Ordering::Release);
         site.hook_count.store(11, Ordering::Release);
-        assert_eq!(site_counts(address), (7, 11));
+        assert_eq!(site.trap_count.load(Ordering::Acquire), 7);
+        assert_eq!(site.hook_count.load(Ordering::Acquire), 11);
 
-        reset_fallback_observability();
+        reset_site_observability(std::slice::from_ref(&site));
 
         // Observability cleared...
-        assert_eq!(site_counts(address), (0, 0));
+        assert_eq!(site.trap_count.load(Ordering::Acquire), 0);
+        assert_eq!(site.hook_count.load(Ordering::Acquire), 0);
         // ...but the functional patch state is intact, so the child's inherited
         // instrumentation keeps working.
         assert_eq!(site.address.load(Ordering::Acquire), address);
@@ -3512,15 +3528,31 @@ mod tests {
     #[test]
     fn fork_hook_runs_the_observability_reset() {
         // The static FORK_HOOK must wrap `reset_fallback_observability`, so
-        // invoking it (as `process_syscall` does in the fork child) clears the
-        // process-global counters — proving the shared ForkHook seam is wired to
-        // the reset rather than a private path.
+        // invoking it (as `process_syscall` does in the fork child) clears both
+        // process-global and per-site counters — proving the shared ForkHook seam
+        // is wired to the complete production reset rather than a private path.
+        SITES.get_or_init(|| {
+            (0..MAX_PATCH_SITES)
+                .map(|_| SiteSlot::new())
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+        });
+        let address = 0x7654_3000;
+        let (site, claimed) = claim_site(address).unwrap();
+        assert!(claimed);
+        site.state.store(SITE_ACTIVE, Ordering::Release);
+        site.trap_count.store(7, Ordering::Release);
+        site.hook_count.store(11, Ordering::Release);
         record_fallback_dispatch(405);
         assert!(fallback_dispatch_count() > 0);
 
         FORK_HOOK.run_in_child();
 
         assert_eq!(fallback_dispatch_count(), 0);
+        assert_eq!(site.trap_count.load(Ordering::Acquire), 0);
+        assert_eq!(site.hook_count.load(Ordering::Acquire), 0);
+        assert_eq!(site.address.load(Ordering::Acquire), address);
+        assert_eq!(site.state.load(Ordering::Acquire), SITE_ACTIVE);
         assert_eq!(fallback_syscall_count(405), 0);
     }
 

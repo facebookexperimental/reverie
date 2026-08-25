@@ -901,7 +901,6 @@ fn tool_preload_path() -> io::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::fd::IntoRawFd;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicU64;
     use std::time::Duration;
@@ -1322,17 +1321,56 @@ mod tests {
         let _ = client.await;
     }
 
+    /// Identifies live bootstrap objects by protocol payload, not descriptor
+    /// number. Another parallel test may reuse an integer immediately after
+    /// this test closes it, but cannot turn an unrelated descriptor into the
+    /// uniquely identified bootstrap object.
+    fn open_test_bootstraps() -> io::Result<Vec<(PathBuf, Vec<u8>)>> {
+        let mut open = Vec::new();
+        for entry in std::fs::read_dir("/proc/self/fd")? {
+            let entry = entry?;
+            let Some(fd) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<libc::c_int>().ok())
+            else {
+                continue;
+            };
+            if fd <= libc::STDERR_FILENO {
+                continue;
+            }
+            if let Some(bootstrap) = read_preload_bootstrap(fd)? {
+                open.push((bootstrap.coordinator, bootstrap.tool_data));
+            }
+        }
+        Ok(open)
+    }
+
     #[test]
     fn rejects_and_closes_multiple_matching_bootstraps() {
-        let first = create_preload_bootstrap(Path::new("/tmp/first.sock"), b"one")
-            .unwrap()
-            .into_raw_fd();
-        let second = create_preload_bootstrap(Path::new("/tmp/second.sock"), b"two")
-            .unwrap()
-            .into_raw_fd();
-        let third = create_preload_bootstrap(Path::new("/tmp/third.sock"), b"three")
-            .unwrap()
-            .into_raw_fd();
+        let expected = [
+            (
+                PathBuf::from("/tmp/reverie-liteinst-fd-reuse-test-1.sock"),
+                b"one".to_vec(),
+            ),
+            (
+                PathBuf::from("/tmp/reverie-liteinst-fd-reuse-test-2.sock"),
+                b"two".to_vec(),
+            ),
+            (
+                PathBuf::from("/tmp/reverie-liteinst-fd-reuse-test-3.sock"),
+                b"three".to_vec(),
+            ),
+        ];
+        for (coordinator, tool_data) in &expected {
+            let bootstrap = create_preload_bootstrap(coordinator, tool_data).unwrap();
+            std::mem::forget(bootstrap);
+        }
+        let open = open_test_bootstraps().unwrap();
+        assert!(
+            expected.iter().all(|expected| open.contains(expected)),
+            "created bootstrap descriptors are not all visible: {open:?}"
+        );
 
         let error = match unsafe { take_preload_bootstrap() } {
             Err(error) => error,
@@ -1340,12 +1378,11 @@ mod tests {
         };
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(error.to_string(), "multiple LiteInst preload bootstraps");
-        assert_eq!(unsafe { libc::fcntl(first, libc::F_GETFD) }, -1);
-        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
-        assert_eq!(unsafe { libc::fcntl(second, libc::F_GETFD) }, -1);
-        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
-        assert_eq!(unsafe { libc::fcntl(third, libc::F_GETFD) }, -1);
-        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+        let open = open_test_bootstraps().unwrap();
+        assert!(
+            expected.iter().all(|expected| !open.contains(expected)),
+            "rejected bootstrap descriptors remain open: {open:?}"
+        );
     }
 
     #[test]

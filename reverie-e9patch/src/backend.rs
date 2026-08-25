@@ -1090,7 +1090,6 @@ impl Backend for E9patchBackend {
 mod tests {
     use std::os::fd::AsRawFd;
     use std::os::fd::FromRawFd;
-    use std::os::fd::IntoRawFd;
 
     use super::*;
 
@@ -1159,7 +1158,7 @@ mod tests {
         assert_eq!(captured_ld_preload(&cleared), TOOL_PRELOAD);
     }
 
-    fn create_sealed_packet(packet: &[u8]) -> libc::c_int {
+    fn create_sealed_packet(packet: &[u8]) -> OwnedFd {
         let fd = unsafe {
             libc::memfd_create(
                 c"reverie-e9patch-malformed-test".as_ptr(),
@@ -1175,7 +1174,47 @@ mod tests {
             unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) },
             -1
         );
-        file.into_raw_fd()
+        file.into()
+    }
+
+    /// Identifies live bootstrap objects by protocol payload, not descriptor
+    /// number. Another parallel test may reuse an integer immediately after
+    /// this test closes it, but cannot turn an unrelated descriptor into the
+    /// uniquely identified bootstrap object.
+    fn open_test_bootstraps() -> io::Result<Vec<(PathBuf, Vec<u8>)>> {
+        let mut open = Vec::new();
+        for entry in std::fs::read_dir("/proc/self/fd")? {
+            let entry = entry?;
+            let Some(fd) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<libc::c_int>().ok())
+            else {
+                continue;
+            };
+            if fd <= libc::STDERR_FILENO {
+                continue;
+            }
+            if let Some(bootstrap) = read_preload_bootstrap(fd)? {
+                open.push((bootstrap.coordinator, bootstrap.tool_data));
+            }
+        }
+        Ok(open)
+    }
+
+    fn named_memfd_is_open(name: &str) -> io::Result<bool> {
+        for entry in std::fs::read_dir("/proc/self/fd")? {
+            let entry = entry?;
+            let target = match std::fs::read_link(entry.path()) {
+                Ok(target) => target,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if target.to_string_lossy().contains(name) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     #[test]
@@ -1261,29 +1300,47 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
 
         let unrelated = tempfile::tempfile().unwrap();
-        let bootstrap_fd = create_preload_bootstrap(Path::new("/tmp/coordinator.sock"), b"noop")
-            .unwrap()
-            .into_raw_fd();
+        let first_expected = (PathBuf::from("/tmp/coordinator.sock"), b"noop".to_vec());
+        let bootstrap = create_preload_bootstrap(&first_expected.0, &first_expected.1).unwrap();
+        std::mem::forget(bootstrap);
+        assert!(open_test_bootstraps().unwrap().contains(&first_expected));
 
         let bootstrap = unsafe { take_preload_bootstrap() }.unwrap().unwrap();
         assert_eq!(bootstrap.coordinator, Path::new("/tmp/coordinator.sock"));
         assert_eq!(bootstrap.tool_data, b"noop");
-        assert_eq!(unsafe { libc::fcntl(bootstrap_fd, libc::F_GETFD) }, -1);
-        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+        assert!(
+            !open_test_bootstraps().unwrap().contains(&first_expected),
+            "consumed bootstrap descriptor remains open"
+        );
         assert_ne!(
             unsafe { libc::fcntl(unrelated.as_raw_fd(), libc::F_GETFD) },
             -1
         );
 
-        let first = create_preload_bootstrap(Path::new("/tmp/first.sock"), b"one")
-            .unwrap()
-            .into_raw_fd();
-        let second = create_preload_bootstrap(Path::new("/tmp/second.sock"), b"two")
-            .unwrap()
-            .into_raw_fd();
-        let third = create_preload_bootstrap(Path::new("/tmp/third.sock"), b"three")
-            .unwrap()
-            .into_raw_fd();
+        let multiple_expected = [
+            (
+                PathBuf::from("/tmp/e9patch-fd-reuse-test-1.sock"),
+                b"one".to_vec(),
+            ),
+            (
+                PathBuf::from("/tmp/e9patch-fd-reuse-test-2.sock"),
+                b"two".to_vec(),
+            ),
+            (
+                PathBuf::from("/tmp/e9patch-fd-reuse-test-3.sock"),
+                b"three".to_vec(),
+            ),
+        ];
+        for (coordinator, tool_data) in &multiple_expected {
+            let bootstrap = create_preload_bootstrap(coordinator, tool_data).unwrap();
+            std::mem::forget(bootstrap);
+        }
+        let open = open_test_bootstraps().unwrap();
+        assert!(
+            multiple_expected
+                .iter()
+                .all(|expected| open.contains(expected))
+        );
 
         let error = match unsafe { take_preload_bootstrap() } {
             Err(error) => error,
@@ -1291,25 +1348,29 @@ mod tests {
         };
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(error.to_string(), "multiple e9patch preload bootstraps");
-        for fd in [first, second, third] {
-            assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
-            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
-        }
+        let open = open_test_bootstraps().unwrap();
+        assert!(
+            multiple_expected
+                .iter()
+                .all(|expected| !open.contains(expected)),
+            "rejected bootstrap descriptors remain open: {open:?}"
+        );
 
         let malformed = create_sealed_packet(PRELOAD_BOOTSTRAP_MAGIC);
-        let valid = create_preload_bootstrap(Path::new("/tmp/valid.sock"), b"valid")
-            .unwrap()
-            .into_raw_fd();
+        std::mem::forget(malformed);
+        let valid_expected = (PathBuf::from("/tmp/valid.sock"), b"valid".to_vec());
+        let valid = create_preload_bootstrap(&valid_expected.0, &valid_expected.1).unwrap();
+        std::mem::forget(valid);
+        assert!(named_memfd_is_open("reverie-e9patch-malformed-test").unwrap());
+        assert!(named_memfd_is_open("reverie-e9patch-bootstrap").unwrap());
         let error = match unsafe { take_preload_bootstrap() } {
             Err(error) => error,
             Ok(_) => panic!("malformed bootstrap must fail"),
         };
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(error.to_string(), "invalid e9patch preload bootstrap size");
-        for fd in [malformed, valid] {
-            assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
-            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
-        }
+        assert!(!named_memfd_is_open("reverie-e9patch-malformed-test").unwrap());
+        assert!(!named_memfd_is_open("reverie-e9patch-bootstrap").unwrap());
     }
 
     #[test]
@@ -1319,11 +1380,13 @@ mod tests {
             let bootstrap =
                 create_preload_bootstrap(Path::new("/tmp/stdio.sock"), b"stdio").unwrap();
             assert!(bootstrap.as_raw_fd() > libc::STDERR_FILENO);
-            let bootstrap_fd = bootstrap.into_raw_fd();
+            let expected = (PathBuf::from("/tmp/stdio.sock"), b"stdio".to_vec());
+            std::mem::forget(bootstrap);
+            assert!(open_test_bootstraps().unwrap().contains(&expected));
             let consumed = unsafe { take_preload_bootstrap() }.unwrap().unwrap();
             assert_eq!(consumed.coordinator, Path::new("/tmp/stdio.sock"));
             assert_eq!(consumed.tool_data, b"stdio");
-            assert_eq!(unsafe { libc::fcntl(bootstrap_fd, libc::F_GETFD) }, -1);
+            assert!(!open_test_bootstraps().unwrap().contains(&expected));
             return;
         }
 
