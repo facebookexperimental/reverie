@@ -196,7 +196,7 @@ impl Symbols {
     pub fn find_symbol(&self, probe: u64) -> Option<SymbolMapName<'_>> {
         self.context
             .symbol_map
-            .get(probe + self.base_addr())
+            .before(probe + self.base_addr())
             .copied()
     }
 
