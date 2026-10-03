@@ -22,6 +22,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use syscalls::Errno;
 
+use super::clone::child_stack;
 use super::clone::clone_with_stack;
 use super::env::Env;
 use super::error::AddContext;
@@ -765,10 +766,7 @@ impl Container {
 
         let writer_fd = writer.as_raw_fd();
 
-        // NOTE: Must use a dynamically allocated stack here. Programs expect to
-        // have at least 2 MB of stack space and if we've already used up some
-        // stack space before this is called we could overflow the stack.
-        let mut stack = vec![0u8; 1024 * 1024 * 2];
+        let mut stack = child_stack();
 
         // Disable io redirection just before forking. We want the child process to
         // be able to call `println!()` and have that output go to stdout.

@@ -10,11 +10,20 @@ use syscalls::Errno;
 
 use super::Pid;
 
+const CHILD_STACK_SIZE: usize = 2 * 1024 * 1024;
+
+pub(super) fn child_stack() -> Vec<u8> {
+    // The clone child performs container setup before exec. Allocate the same
+    // 2 MiB minimum that programs expect instead of consuming the caller's
+    // remaining stack or relying on a single page.
+    vec![0u8; CHILD_STACK_SIZE]
+}
+
 pub fn clone<F>(cb: F, flags: libc::c_int) -> Result<Pid, Errno>
 where
     F: FnMut() -> i32,
 {
-    let mut stack = [0u8; 4096];
+    let mut stack = child_stack();
     clone_with_stack(cb, flags, &mut stack)
 }
 
