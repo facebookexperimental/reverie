@@ -213,7 +213,7 @@ mod tests {
     #[test]
     fn exec_adopts_but_fork_reconnects_handoff_socket() {
         let saved_fd = unsafe { libc::dup(SOCKET_FD) };
-        let socket_path = std::env::temp_dir().join(format!(
+        let socket_path = std::path::Path::new("/tmp").join(format!(
             "reverie-sabre-rpc-{}-{}.sock",
             std::process::id(),
             saved_fd

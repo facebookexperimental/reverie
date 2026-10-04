@@ -15,6 +15,7 @@ use reverie_syscalls::SyscallInfo;
 
 use crate::Never;
 use crate::Pid;
+use crate::SignalEvent;
 use crate::auxv::Auxv;
 use crate::backtrace::Backtrace;
 use crate::error::Error;
@@ -23,6 +24,34 @@ use crate::timer::TimerSchedule;
 use crate::tool::GlobalRPC;
 use crate::tool::GlobalTool;
 use crate::tool::Tool;
+
+/// The logical kind of a guest memory region reported by
+/// [`Guest::detlog_memory_regions`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetlogRegionKind {
+    /// The current thread's user stack.
+    Stack,
+    /// The program-break heap.
+    Heap,
+}
+
+/// A guest-address-space memory region a backend can expose for deterministic
+/// memory-map logging (`--detlog-stack` / `--detlog-heap`).
+///
+/// The `[start, end)` bounds are guest virtual addresses readable through
+/// [`Guest::memory`]. This exists for out-of-process backends (for example the
+/// KVM backend) where [`Guest::pid`] is the host VMM process rather than a
+/// process whose `/proc/<pid>/maps` describes the guest's own address space, so
+/// the default `/proc`-based enumeration would read the wrong process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DetlogMemoryRegion {
+    /// Which logical region this is.
+    pub kind: DetlogRegionKind,
+    /// Inclusive start guest virtual address.
+    pub start: u64,
+    /// Exclusive end guest virtual address.
+    pub end: u64,
+}
 
 /// A representation of a guest task (thread).
 #[async_trait]
@@ -61,6 +90,48 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     /// true).
     fn is_root_thread(&self) -> bool {
         self.is_root_process() && self.is_main_thread()
+    }
+
+    /// Whether this task is still executing the launcher for a spawned Command.
+    ///
+    /// This is logging provenance, not a guest identity or execution-mode test.
+    /// A backend may return true only for its Command-launch root before the
+    /// first successful exec replaces the inherited launcher address space.
+    /// Function tests, attached tasks, descendants and post-exec guest tasks
+    /// must return false. Callers must additionally establish the type of any
+    /// value before formatting a launch-image pointer as a host address.
+    fn is_command_bootstrap(&self) -> bool {
+        false
+    }
+
+    /// Whether this task is executing a backend-owned, guest-resident
+    /// runtime's bootstrap on the guest's behalf, rather than guest code.
+    ///
+    /// A backend may return true only for the one thread that executed a
+    /// validated runtime-begin event, and only until the matching event that
+    /// ends the bootstrap of that exec generation: the runtime's ready report,
+    /// or its report that preparation failed. These events are trap points at
+    /// fixed positions in the traced program, so the window is deterministic.
+    /// Backends without a guest-resident runtime, every other thread or forked
+    /// process, and every task outside such a window, return false.
+    ///
+    /// The window covers the runtime's own preparation between those two
+    /// events. Guest constructors that run before the begin event (for example
+    /// those of the executable's `DT_NEEDED` libraries) or after the ending
+    /// event are outside it. One kind of guest code is inside it: code that
+    /// the runtime reaches through an import the guest interposes on, such as
+    /// an exported `malloc` or `open64`. It runs on the bootstrapping thread
+    /// and is reported as part of the bootstrap.
+    ///
+    /// The syscalls issued in this window are still delivered to the Tool,
+    /// which must still handle them: the Tool keeps full knowledge of the file
+    /// descriptors and mappings they create. A Tool that models guest-visible
+    /// resource consumption, such as a virtual clock charged per syscall, must
+    /// not attribute these syscalls to the guest. Otherwise the same program
+    /// observes a different state under a backend that performs no such
+    /// bootstrap.
+    fn is_backend_runtime_bootstrap(&self) -> bool {
+        false
     }
 
     /// Reads and returns the auxv table for this process.
@@ -174,6 +245,196 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     /// ```
     async fn tail_inject<S: SyscallInfo>(&mut self, syscall: S) -> Never;
 
+    /// Terminates the current guest thread with status zero after the Tool has
+    /// determined that this thread must never resume guest execution.
+    ///
+    /// This abandons the current callback and runs the backend's consuming
+    /// thread-exit cleanup exactly once. It accepts no syscall and does not
+    /// authorize other nonreturning injections from restricted callbacks.
+    /// It does not request termination of other live threads. Backends whose
+    /// ordinary exit injection already provides this contract use that path.
+    /// An already-established backend exit retains its status.
+    ///
+    /// Backend process-lifetime limits still apply. Explicit KVM leader cancellation
+    /// cancels live siblings, while normal raw leader `SYS_exit` leaves them running.
+    /// Nonleader cancellation also leaves live siblings running.
+    async fn cancel_current_thread(&mut self) -> Never {
+        self.tail_inject(reverie_syscalls::Exit::default()).await
+    }
+
+    /// Retires only the current guest thread after the Tool has determined
+    /// that it must never resume, without requesting cancellation of peers.
+    ///
+    /// This abandons the callback and runs consuming thread cleanup once. It
+    /// defaults to a raw thread exit with status zero; an established backend
+    /// exit keeps its status. A KVM leader retains and joins live workers, then
+    /// adopts the final process status, including a peer's later group exit.
+    /// Unlike explicit cancellation, retirement does not discard their work.
+    /// Restricted signal callbacks do not gain arbitrary syscall injection.
+    async fn retire_current_thread(&mut self) -> Never {
+        self.tail_inject(reverie_syscalls::Exit::default()).await
+    }
+
+    /// Defers one already-selected signal for delivery by the backend at its
+    /// next safe return-to-userspace boundary.
+    ///
+    /// Backends may return `ENOSYS` when the current callback has no resumable
+    /// userspace register context (for example, a lifecycle callback), when
+    /// signal provenance is unsupported, or when deterministic recipient
+    /// selection is not available. Callers must handle that refusal rather
+    /// than assuming the event was queued.
+    ///
+    /// This is additive to the historical host-signal path. Backends that do
+    /// not own a virtual guest signal frame retain the default explicit
+    /// `ENOSYS`; adding this method does not change ptrace signal delivery.
+    async fn defer_signal_delivery(&mut self, _event: SignalEvent) -> Result<(), Error> {
+        Err(Errno::ENOSYS.into())
+    }
+
+    /// Queues a Tool-selected terminal child event for the current process.
+    ///
+    /// The caller supplies a complete process-directed `SIGCHLD` event with
+    /// `CLD_EXITED`, `CLD_KILLED`, or `CLD_DUMPED`, and owns its child-status
+    /// provenance and deterministic ordering. `CLD_EXITED` carries an unsigned
+    /// exit byte; `CLD_KILLED` carries a terminal-default Linux signal number;
+    /// `CLD_DUMPED` carries a core-default signal number. The backend validates
+    /// the receiver and that class-specific status domain, preserves
+    /// process-wide pending ownership and first-siginfo coalescing, and reports
+    /// whether queue publication preceded any failure. Wait status and child reaping remain
+    /// independent. This operation never recursively invokes a Tool hook or
+    /// resumes guest instructions; normal receiver boundaries own delivery.
+    ///
+    /// Backends may refuse unsupported contexts or process lifetimes. In
+    /// particular, KVM initially supports only a live single-thread parent at
+    /// a transported return-to-user boundary. A KVM run that installs
+    /// [`crate::BackendSignalControlMode::ToolControlled`] must instead use the
+    /// generation-bound run-scoped
+    /// [`crate::ProcessSignalControl::publish_child_exit`] operation; this
+    /// generation-free compatibility surface is then refused before mutation.
+    /// The historical private deferral operation and its refusal policy are
+    /// otherwise unchanged.
+    async fn queue_child_exit_signal(
+        &mut self,
+        _event: SignalEvent,
+    ) -> crate::ChildExitSignalOutcome {
+        crate::ChildExitSignalOutcome::RejectedBeforeCommit {
+            kind: crate::ChildExitSignalErrorKind::Unsupported,
+            errno: Errno::ENOSYS,
+        }
+    }
+
+    /// Publishes a Tool-selected process alarm at this stopped task's boundary.
+    ///
+    /// The caller owns deterministic ordering and supplies the complete normal
+    /// Linux SIGALRM/SI_KERNEL siginfo (zero except for signo and code). KVM
+    /// supports only the current sole live receiver, with no pending process
+    /// action and a resumable transported boundary that has not completed an
+    /// injected process action. The operation preserves
+    /// shared pending ownership and first siginfo, including when blocked or
+    /// ignored. Installing SIG_IGN later invalidates older pending generations.
+    ///
+    /// No Tool hook, guest instruction, timer operation, or wait completion is
+    /// performed. The receipt is only pending-state publication. The historical
+    /// private [`Guest::defer_signal_delivery`] operation remains independent.
+    async fn queue_process_alarm_signal(
+        &mut self,
+        _event: SignalEvent,
+    ) -> crate::ProcessAlarmSignalOutcome {
+        crate::ProcessAlarmSignalOutcome::RejectedBeforeCommit {
+            kind: crate::ProcessAlarmSignalErrorKind::Unsupported,
+            errno: Errno::ENOSYS,
+        }
+    }
+
+    /// Backend process/task lifetime identity, including at thread start.
+    fn signal_task_identity(&self) -> Option<crate::SignalTaskIdentity> {
+        None
+    }
+
+    /// Current parked-observation capability, bound to this exact callback.
+    fn parked_signal_site(&self) -> Option<crate::CallbackSignalSite> {
+        None
+    }
+
+    /// Authenticates a zero-effect attempt of this exact original scalar read.
+    ///
+    /// A site is returned only after an actual injection of the identical raw
+    /// syscall and arguments returned EAGAIN/EWOULDBLOCK, while its original
+    /// callback remains live. A later injection invalidates that attempt. A
+    /// positive/partial result, EOF, another errno or another syscall is never
+    /// eligible. This query does not execute or restart the read, consume a
+    /// signal or grant scheduler ownership. Unsupported backends return None.
+    fn polled_read_signal_site(
+        &self,
+        _call: crate::syscalls::Read,
+    ) -> Option<crate::CallbackSignalSite> {
+        None
+    }
+
+    /// Authenticates the current original scalar write to backend-captured output.
+    ///
+    /// This read-only query returns the full callback identity only when `call`
+    /// is the exact unconsumed original syscall (including all raw arguments)
+    /// and its current descriptor aliases an enabled captured stdout/stderr
+    /// stream. It does not execute the write, publish or consume a signal,
+    /// validate the buffer, or promise a successful byte count.
+    ///
+    /// The caller must query again with the identical call immediately before
+    /// publication and require the same identity, without an intervening guest
+    /// operation or injection. KVM additionally requires its existing sole-live-
+    /// leader boundary, no prior injected execution, and no active observation
+    /// or checked-out stack. Ordinary files, pipes, sockets and uncaptured host
+    /// streams are not admitted by this query. The query does not change signal
+    /// publication admission; callers must act on `None` themselves. Unsupported
+    /// backends return `None`.
+    fn captured_write_signal_site(
+        &self,
+        _call: crate::syscalls::Write,
+    ) -> Option<crate::CallbackSignalSite> {
+        None
+    }
+
+    /// Active nested observation, available to the Tool's real signal-hook RPCs.
+    fn signal_observation_lease(&self) -> Option<crate::ParkedObservationLease> {
+        None
+    }
+
+    /// Sequentially observes real pending events without abandoning the original syscall.
+    async fn observe_parked_signal(
+        &mut self,
+        _site: crate::CallbackSignalSite,
+        _lease: crate::ParkedObservationLease,
+    ) -> Result<crate::ParkedSignalObservation, crate::SignalObservationFailure> {
+        Err(crate::SignalObservationFailure::RejectedBeforeRemoval {
+            errno: Errno::ENOSYS,
+        })
+    }
+
+    /// Transfers a reserved fatal selection to the driver; success never returns.
+    async fn terminate_from_parked_signal(
+        &mut self,
+        _selection: crate::PreparedSignalToken,
+    ) -> Result<Never, crate::SignalObservationFailure> {
+        Err(crate::SignalObservationFailure::RejectedBeforeRemoval {
+            errno: Errno::ENOSYS,
+        })
+    }
+
+    /// Retained irreversible effects, independently of the current observation lease.
+    fn parked_signal_failure_context(&self) -> Option<crate::ParkedSignalFailureContext> {
+        None
+    }
+
+    /// Cancels through the driver without tail-injecting Exit or rolling back effects.
+    async fn cancel_parked_signal(
+        &mut self,
+        _context: crate::ParkedSignalFailureContext,
+    ) -> Result<Never, crate::SignalObservationFailure> {
+        Err(crate::SignalObservationFailure::RejectedBeforeRemoval {
+            errno: Errno::ENOSYS,
+        })
+    }
+
     /// Like [`Guest::inject`], but will retry the syscall if `EINTR` or
     /// `ERESTARTSYS` are returned.
     ///
@@ -277,6 +538,22 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     fn has_cpuid_interception(&self) -> bool {
         false
     }
+
+    /// Returns the guest-address memory regions this backend wants hashed for
+    /// deterministic memory-map logging, or `None` to fall back to reading
+    /// `/proc/<pid>/maps` for the process returned by [`Guest::pid`].
+    ///
+    /// The default is `None`, which preserves the historical behavior used by
+    /// the ptrace backend, where `pid()` is the guest process and its
+    /// `/proc/<pid>/maps` correctly describes the guest address space.
+    ///
+    /// Out-of-process backends whose `pid()` is not the guest (for example the
+    /// KVM backend, where it is the host VMM process) override this to return
+    /// real guest stack/heap ranges readable through [`Guest::memory`], so the
+    /// determinism engine hashes the guest's memory instead of the VMM's.
+    fn detlog_memory_regions(&self) -> Option<Vec<DetlogMemoryRegion>> {
+        None
+    }
 }
 
 /// Wraps a `Guest<T>` such that it implements `Guest<U>`.
@@ -341,6 +618,14 @@ where
         self.inner.ppid()
     }
 
+    fn is_command_bootstrap(&self) -> bool {
+        self.inner.is_command_bootstrap()
+    }
+
+    fn is_backend_runtime_bootstrap(&self) -> bool {
+        self.inner.is_backend_runtime_bootstrap()
+    }
+
     fn is_main_thread(&self) -> bool {
         self.inner.is_main_thread()
     }
@@ -390,6 +675,76 @@ where
         self.inner.tail_inject(syscall).await
     }
 
+    async fn cancel_current_thread(&mut self) -> Never {
+        self.inner.cancel_current_thread().await
+    }
+
+    async fn retire_current_thread(&mut self) -> Never {
+        self.inner.retire_current_thread().await
+    }
+
+    async fn defer_signal_delivery(&mut self, event: SignalEvent) -> Result<(), Error> {
+        self.inner.defer_signal_delivery(event).await
+    }
+
+    async fn queue_child_exit_signal(
+        &mut self,
+        event: SignalEvent,
+    ) -> crate::ChildExitSignalOutcome {
+        self.inner.queue_child_exit_signal(event).await
+    }
+
+    async fn queue_process_alarm_signal(
+        &mut self,
+        event: SignalEvent,
+    ) -> crate::ProcessAlarmSignalOutcome {
+        self.inner.queue_process_alarm_signal(event).await
+    }
+
+    fn signal_task_identity(&self) -> Option<crate::SignalTaskIdentity> {
+        self.inner.signal_task_identity()
+    }
+    fn parked_signal_site(&self) -> Option<crate::CallbackSignalSite> {
+        self.inner.parked_signal_site()
+    }
+    fn polled_read_signal_site(
+        &self,
+        call: crate::syscalls::Read,
+    ) -> Option<crate::CallbackSignalSite> {
+        self.inner.polled_read_signal_site(call)
+    }
+    fn captured_write_signal_site(
+        &self,
+        call: crate::syscalls::Write,
+    ) -> Option<crate::CallbackSignalSite> {
+        self.inner.captured_write_signal_site(call)
+    }
+    fn signal_observation_lease(&self) -> Option<crate::ParkedObservationLease> {
+        self.inner.signal_observation_lease()
+    }
+    async fn observe_parked_signal(
+        &mut self,
+        site: crate::CallbackSignalSite,
+        lease: crate::ParkedObservationLease,
+    ) -> Result<crate::ParkedSignalObservation, crate::SignalObservationFailure> {
+        self.inner.observe_parked_signal(site, lease).await
+    }
+    async fn terminate_from_parked_signal(
+        &mut self,
+        selection: crate::PreparedSignalToken,
+    ) -> Result<Never, crate::SignalObservationFailure> {
+        self.inner.terminate_from_parked_signal(selection).await
+    }
+    fn parked_signal_failure_context(&self) -> Option<crate::ParkedSignalFailureContext> {
+        self.inner.parked_signal_failure_context()
+    }
+    async fn cancel_parked_signal(
+        &mut self,
+        context: crate::ParkedSignalFailureContext,
+    ) -> Result<Never, crate::SignalObservationFailure> {
+        self.inner.cancel_parked_signal(context).await
+    }
+
     fn set_timer(&mut self, sched: TimerSchedule) -> Result<(), Error> {
         self.inner.set_timer(sched)
     }
@@ -408,5 +763,9 @@ where
 
     fn has_cpuid_interception(&self) -> bool {
         self.inner.has_cpuid_interception()
+    }
+
+    fn detlog_memory_regions(&self) -> Option<Vec<DetlogMemoryRegion>> {
+        self.inner.detlog_memory_regions()
     }
 }

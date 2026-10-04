@@ -51,12 +51,18 @@
 
 mod auxv;
 mod backend;
+pub mod backend_stats;
 mod backtrace;
 mod error;
 mod guest;
 #[cfg(target_arch = "x86_64")]
+pub mod pmu;
+mod process_signal_control;
+#[cfg(target_arch = "x86_64")]
 mod rdtsc;
 mod regs;
+mod signal;
+mod signal_observation;
 mod stack;
 mod subscription;
 mod timer;
@@ -64,6 +70,7 @@ mod tool;
 
 pub use auxv::*;
 pub use backend::*;
+pub use backend_stats::*;
 pub use backtrace::*;
 pub use error::*;
 pub use guest::*;
@@ -74,6 +81,8 @@ pub use rdtsc::*;
 pub use regs::RegDisplay;
 pub use regs::RegDisplayOptions;
 pub use reverie_process as process;
+pub use signal::*;
+pub use signal_observation::*;
 pub use stack::*;
 pub use subscription::*;
 pub use timer::*;
@@ -113,3 +122,6 @@ pub use reverie_syscalls as syscalls;
 
 /// `Never` type is a stopgap for the unstable `!` type (i.e., the never type).
 pub type Never = never_say_never::Never;
+
+// Run-owned process signal control; no borrowed Guest is retained.
+pub use process_signal_control::*;

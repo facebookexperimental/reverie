@@ -95,6 +95,13 @@ pub struct FilterBuilder {
 
     /// Ranges of instruction pointer values.
     ip_ranges: Vec<(u64, u64, Action)>,
+
+    /// Exact instruction pointer values, checked before `ip_ranges`.
+    instruction_pointers: Vec<(u64, Action)>,
+
+    /// A second architecture whose syscalls take an action instead of killing
+    /// the process.
+    alternate_arch: Option<(TargetArch, Action)>,
 }
 
 /// The target architecture.
@@ -212,6 +219,8 @@ impl FilterBuilder {
             default_action: Action::KillThread,
             syscalls: Default::default(),
             ip_ranges: Default::default(),
+            instruction_pointers: Default::default(),
+            alternate_arch: None,
         }
     }
 
@@ -258,6 +267,34 @@ impl FilterBuilder {
         self
     }
 
+    /// Lets syscalls of a second architecture take `action` instead of killing
+    /// the process.
+    ///
+    /// The architecture check at the start of the filter then continues for
+    /// the target architecture, returns `action` for `arch`, and kills the
+    /// process for any other architecture. `action` is returned for every
+    /// syscall of `arch`, whatever its number or instruction pointer, because
+    /// the rest of the filter is written against the target architecture's
+    /// syscall table.
+    ///
+    /// When this is never called, the filter's architecture check is exactly
+    /// the same as before this method existed.
+    pub fn alternate_arch(&mut self, arch: TargetArch, action: Action) -> &mut Self {
+        self.alternate_arch = Some((arch, action));
+        self
+    }
+
+    /// Take an action if the instruction pointer is exactly `ip`, whatever
+    /// the syscall number.
+    ///
+    /// Seccomp reports the address after the syscall instruction. Rules added
+    /// with this method are checked in sequence before every
+    /// [`FilterBuilder::ip_range`] rule and every syscall rule.
+    pub fn instruction_pointer(&mut self, ip: u64, action: Action) -> &mut Self {
+        self.instruction_pointers.push((ip, action));
+        self
+    }
+
     /// Take an action if the instruction pointer `ip >= begin && ip < end`.
     ///
     /// This is useful in conjunction with `mmap`. For example, we can use this
@@ -285,10 +322,20 @@ impl FilterBuilder {
         let mut filter = Filter::new();
 
         // This should be the first step for every seccomp-bpf filter.
-        VALIDATE_ARCH(self.target_arch as u32).into_bpf(&mut filter);
+        match self.alternate_arch {
+            None => VALIDATE_ARCH(self.target_arch as u32).into_bpf(&mut filter),
+            Some((arch, action)) => {
+                VALIDATE_ARCH_OR_ALTERNATE(self.target_arch as u32, arch as u32, action.into())
+                    .into_bpf(&mut filter)
+            }
+        }
 
-        if !self.ip_ranges.is_empty() {
+        if !self.instruction_pointers.is_empty() || !self.ip_ranges.is_empty() {
             LOAD_SYSCALL_IP().into_bpf(&mut filter);
+
+            for (ip, action) in &self.instruction_pointers {
+                IP_EQ(*ip, (*action).into()).into_bpf(&mut filter);
+            }
 
             for (begin, end, action) in &self.ip_ranges {
                 IP_RANGE(*begin, *end, (*action).into()).into_bpf(&mut filter);
@@ -314,6 +361,85 @@ impl FilterBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn words(filter: &Filter) -> Vec<(u16, u8, u8, u32)> {
+        filter
+            .instructions()
+            .iter()
+            .map(|insn| (insn.code, insn.jt, insn.jf, insn.k))
+            .collect()
+    }
+
+    const LD_ARCH: (u16, u8, u8, u32) = (0x20, 0, 0, 4);
+    const RET_KILL_PROCESS: (u16, u8, u8, u32) = (0x06, 0, 0, 0x8000_0000);
+
+    #[test]
+    fn alternate_arch_prologue_is_exact_and_unset_emits_nothing_new() {
+        let mut plain = FilterBuilder::new();
+        plain
+            .target_arch(TargetArch::x86_64)
+            .default_action(Action::Allow)
+            .syscall(Sysno::getpid, Action::Trace(0));
+        let mut routed = plain.clone();
+        routed.alternate_arch(TargetArch::x86, Action::Trace(0x7101));
+        let plain = words(&plain.build());
+        let routed = words(&routed.build());
+
+        assert_eq!(
+            plain[..3],
+            [LD_ARCH, (0x15, 1, 0, AUDIT_ARCH_X86_64), RET_KILL_PROCESS]
+        );
+        assert_eq!(
+            routed[..5],
+            [
+                LD_ARCH,
+                (0x15, 3, 0, AUDIT_ARCH_X86_64),
+                (0x15, 0, 1, AUDIT_ARCH_X86),
+                (0x06, 0, 0, 0x7ff0_0000 | 0x7101),
+                RET_KILL_PROCESS,
+            ]
+        );
+        // Everything after the architecture check is unchanged.
+        assert_eq!(plain[3..], routed[5..]);
+    }
+
+    #[test]
+    fn instruction_pointer_is_an_exact_match_checked_before_ranges() {
+        let mut builder = FilterBuilder::new();
+        builder
+            .default_action(Action::Allow)
+            .ip_range(0x7100_0002, 0x7100_0003, Action::Allow)
+            .instruction_pointer(0x1234_5678_7100_0006, Action::Trace(0x7102));
+        let words = words(&builder.build());
+        let ld_mem = |slot| (0x60, 0, 0, slot);
+        assert_eq!(
+            words[3..7],
+            [
+                (0x20, 0, 0, 8),
+                (0x02, 0, 0, 0),
+                (0x20, 0, 0, 12),
+                (0x02, 0, 0, 1)
+            ],
+            "LOAD_SYSCALL_IP"
+        );
+        assert_eq!(
+            words[7..12],
+            [
+                (0x15, 0, 3, 0x1234_5678),
+                ld_mem(0),
+                (0x15, 0, 1, 0x7100_0006),
+                (0x06, 0, 0, 0x7ff0_0000 | 0x7102),
+                ld_mem(1),
+            ]
+        );
+        // The range follows, unchanged.
+        let mut range_only = FilterBuilder::new();
+        range_only
+            .default_action(Action::Allow)
+            .ip_range(0x7100_0002, 0x7100_0003, Action::Allow);
+        let range_only = self::words(&range_only.build());
+        assert_eq!(words[12..], range_only[7..]);
+    }
 
     #[cfg(target_arch = "x86_64")]
     #[test]

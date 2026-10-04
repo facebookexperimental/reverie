@@ -207,6 +207,9 @@ mod tests {
 
     #[test]
     fn smoke_tests() {
+        if crate::test_runs_in_own_process() {
+            return;
+        }
         let sock = Fd::socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_IP).unwrap();
 
         let lo = IfName::LOOPBACK;

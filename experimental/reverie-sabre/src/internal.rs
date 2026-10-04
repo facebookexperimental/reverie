@@ -24,6 +24,7 @@ use super::ffi;
 use super::paths;
 use super::rpc;
 use super::signal;
+use super::stats;
 use super::tool::Tool;
 use super::tool::ToolGlobal;
 
@@ -35,6 +36,9 @@ pub fn init_tool<T: Tool>() -> T {
     // connect to the socket), there isn't anything we can do except panic. A
     // client without a connection to the global state isn't very useful.
     paths::cache_tool_env();
+    if let Some(tool) = T::new_without_legacy_rpc() {
+        return tool;
+    }
     let channel = rpc::BaseChannel::new().unwrap();
 
     T::new(MakeClient::make_client(Box::new(channel)))
@@ -55,14 +59,20 @@ pub fn sbr_init<T: ToolGlobal>(
     vdso_callback: *mut Option<ffi::handle_vdso_fn>,
     syscall_handler: *mut Option<ffi::handle_syscall_fn>,
     rdtsc_handler: *mut Option<ffi::handle_rdtsc_fn>,
-    _post_load: *mut Option<ffi::post_load_fn>,
+    post_load: *mut Option<ffi::post_load_fn>,
     sabre_path: *const libc::c_char,
     client_path: *const libc::c_char,
 ) {
     unsafe {
+        // Register the tool's declared detours before stats, paths or signal
+        // setup can call an intercepted libc function.
+        register_detours::<T>(fn_icept_reg);
+
+        stats::init_guest_stats();
         *vdso_callback = Some(callbacks::handle_vdso::<T>);
         *syscall_handler = Some(callbacks::handle_syscall::<T>);
         *rdtsc_handler = Some(callbacks::handle_rdtsc::<T>);
+        *post_load = Some(callbacks::handle_post_load::<T>);
 
         paths::set_sabre_path(sabre_path);
         paths::set_client_path(client_path);
@@ -74,9 +84,6 @@ pub fn sbr_init<T: ToolGlobal>(
 
         *argc -= 1;
         *argv = (*argv).wrapping_add(1);
-
-        // Setting up function detours
-        register_detours::<T>(fn_icept_reg);
     }
 }
 

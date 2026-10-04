@@ -1,4 +1,4 @@
 # The SaBRe loader ABI currently targeted by reverie-sabre.
-repository = "https://github.com/srg-imperial/SaBRe"
-revision = "05816ee066a7284bee8afd0e73eeb44455b254b4"
+repository = "https://github.com/rrnewton/SaBRe"
+revision = "95c7399aa6b319e54e811aae5cbd0fcb4ed72a05"
 architecture = "x86_64"

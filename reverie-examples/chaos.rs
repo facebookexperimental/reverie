@@ -22,10 +22,18 @@ use reverie_util::CommonToolArguments;
 use serde::Deserialize;
 use serde::Serialize;
 
+#[path = "src/kvm_runner.rs"]
+mod kvm_runner;
+
 /// A tool to introduce inject "chaos" into a running process. A pathological
 /// kernel is simulated by forcing reads to only return one byte a time.
 #[derive(Debug, Parser)]
 struct Args {
+    // TODO-HUMAN-REVIEW(PR-195): Review chaos runner selection.
+    /// Execution runner; KVM selects the prototype KvmGuest host.
+    #[clap(long, value_enum, default_value = "ptrace")]
+    runner: kvm_runner::Runner,
+
     #[clap(flatten)]
     common_opts: CommonToolArguments,
 
@@ -33,8 +41,9 @@ struct Args {
     chaos_opts: ChaosOpts,
 }
 
-#[derive(Parser, Debug, Serialize, Deserialize, Clone, Default)]
-struct ChaosOpts {
+// TODO-HUMAN-REVIEW(PR-157): Review crate-local reuse of the production chaos config.
+#[derive(Parser, Debug, Serialize, Deserialize, Clone, Default, Eq, PartialEq)]
+pub(crate) struct ChaosOpts {
     /// Skips the first N syscalls of a process before doing any intervention.
     /// This is useful when you need to skip past an error caused by the tool.
     #[clap(long, value_name = "N", default_value = "0")]
@@ -53,8 +62,27 @@ struct ChaosOpts {
     no_interrupt: bool,
 }
 
+impl ChaosOpts {
+    // TODO-HUMAN-REVIEW(PR-157): Review the narrow LiteInst config constructor API.
+    #[allow(dead_code)]
+    pub(crate) fn for_liteinst(
+        skip: Option<u64>,
+        no_read: bool,
+        no_recv: bool,
+        no_interrupt: bool,
+    ) -> Self {
+        Self {
+            skip: skip.unwrap_or_default(),
+            no_read,
+            no_recv,
+            no_interrupt,
+        }
+    }
+}
+
+// TODO-HUMAN-REVIEW(PR-157): Review crate-local reuse of the production chaos tool.
 #[derive(Debug, Default)]
-struct ChaosTool {
+pub(crate) struct ChaosTool {
     count: AtomicU64,
 }
 
@@ -66,8 +94,9 @@ impl Clone for ChaosTool {
     }
 }
 
+// TODO-HUMAN-REVIEW(PR-157): Review crate-local reuse of the chaos global state.
 #[derive(Debug, Default, Clone)]
-struct ChaosToolGlobal {}
+pub(crate) struct ChaosToolGlobal {}
 
 #[reverie::global_tool]
 impl GlobalTool for ChaosToolGlobal {
@@ -124,7 +153,7 @@ impl Tool for ChaosTool {
                     *guest.thread_state_mut() = true;
 
                     // XXX: inject a signal like SIGINT?
-                    let err = Errno::ERESTARTSYS;
+                    let err = Errno::EINTR;
 
                     eprintln!(
                         "[pid={}, n={}] {} = {}",
@@ -175,15 +204,38 @@ impl Tool for ChaosTool {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Error> {
+fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    let stdin = match args.runner {
+        kvm_runner::Runner::Ptrace => None,
+        kvm_runner::Runner::Kvm => kvm_runner::reserve_stdin()?,
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(run_main(args, stdin))
+}
+
+async fn run_main(args: Args, stdin: Option<std::fs::File>) -> anyhow::Result<()> {
     let log_guard = args.common_opts.init_tracing();
-    let tracer = reverie_ptrace::TracerBuilder::<ChaosTool>::new(args.common_opts.into())
-        .config(args.chaos_opts)
-        .spawn()
-        .await?;
-    let (status, _) = tracer.wait().await?;
+    let (status, _) = match args.runner {
+        kvm_runner::Runner::Ptrace => {
+            let tracer =
+                reverie_ptrace::TracerBuilder::<ChaosTool>::new(args.common_opts.clone().into())
+                    .config(args.chaos_opts)
+                    .spawn()
+                    .await?;
+            tracer.wait().await?
+        }
+        kvm_runner::Runner::Kvm => {
+            let result =
+                kvm_runner::run::<ChaosTool>(&args.common_opts, args.chaos_opts, stdin).await?;
+            (
+                reverie::ExitStatus::Exited(result.exit_code),
+                result.global_state,
+            )
+        }
+    };
     drop(log_guard); // Flush logs before exiting.
     status.raise_or_exit()
 }

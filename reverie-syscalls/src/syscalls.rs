@@ -491,6 +491,7 @@ syscall_list! {
         // Missing: landlock_create_ruleset => LandlockCreateRuleset,
         // Missing: landlock_add_rule => LandlockAddRule,
         // Missing: landlock_restrict_self => LandlockRestrictSelf,
+        fchmodat2 => Fchmodat2,
     }
 }
 
@@ -2837,6 +2838,14 @@ typed_syscall! {
         dirfd: i32,
         path: Option<PathPtr>,
         mode: Mode,
+    }
+}
+
+typed_syscall! {
+    pub struct Fchmodat2 {
+        dirfd: i32,
+        path: Option<PathPtr>,
+        mode: Mode,
         flags: AtFlags,
     }
 }
@@ -2856,7 +2865,11 @@ typed_syscall! {
         readfds: Option<AddrMut<libc::fd_set>>,
         writefds: Option<AddrMut<libc::fd_set>>,
         exceptfds: Option<AddrMut<libc::fd_set>>,
-        timeout: Option<Addr<libc::timeval>>,
+        // Linux's pselect6(2) takes a `struct timespec` timeout (nanosecond
+        // resolution), not the `struct timeval` (microseconds) that plain
+        // select(2) uses. The kernel also writes the time not slept back into
+        // this pointer, so it is an in-out `AddrMut`, matching Ppoll below.
+        timeout: Option<AddrMut<Timespec>>,
         sigmask: Option<Addr<libc::sigset_t>>,
     }
 }
@@ -3582,6 +3595,70 @@ mod test {
     use crate::ReadAddr;
 
     #[test]
+    fn fchmodat_variants_have_distinct_arities_and_preserve_raw_registers() {
+        let memory = LocalMemory::new();
+        let old_raw = SyscallArgs::new(
+            libc::AT_FDCWD as usize,
+            0,
+            0o600,
+            0xdead_beef,
+            0xfeed_face,
+            0xcafe_babe,
+        );
+        let old = Syscall::from_raw(Sysno::fchmodat, old_raw);
+        assert!(matches!(old, Syscall::Fchmodat(_)));
+        assert_eq!(
+            format!("{}", old.display(&memory)),
+            "fchmodat(-100, NULL, Mode(S_IRUSR | S_IWUSR))"
+        );
+        let (number, raw) = old.into_parts();
+        assert_eq!(number, Sysno::fchmodat);
+        assert_eq!(
+            [raw.arg0, raw.arg1, raw.arg2, raw.arg3, raw.arg4, raw.arg5],
+            [
+                libc::AT_FDCWD as usize,
+                0,
+                0o600,
+                0xdead_beef,
+                0xfeed_face,
+                0xcafe_babe,
+            ]
+        );
+
+        let flags = AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_EMPTY_PATH;
+        let new_raw = SyscallArgs::new(
+            libc::AT_FDCWD as usize,
+            0,
+            0o600,
+            flags.bits() as usize,
+            0xdead_beef,
+            0xcafe_babe,
+        );
+        let new = Syscall::from_raw(Sysno::fchmodat2, new_raw);
+        assert!(matches!(new, Syscall::Fchmodat2(_)));
+        let rendered = format!("{}", new.display(&memory));
+        assert!(rendered.starts_with("fchmodat2(-100, NULL, Mode(S_IRUSR | S_IWUSR), AtFlags("));
+        assert!(rendered.contains("AT_SYMLINK_NOFOLLOW"));
+        assert!(rendered.contains("AT_EMPTY_PATH"));
+        assert_eq!(rendered.matches(", ").count(), 3);
+        assert!(!rendered.contains("3735928559"));
+        assert!(!rendered.contains("3405691582"));
+        let (number, raw) = new.into_parts();
+        assert_eq!(number, Sysno::fchmodat2);
+        assert_eq!(
+            [raw.arg0, raw.arg1, raw.arg2, raw.arg3, raw.arg4, raw.arg5],
+            [
+                libc::AT_FDCWD as usize,
+                0,
+                0o600,
+                flags.bits() as usize,
+                0xdead_beef,
+                0xcafe_babe,
+            ]
+        );
+    }
+
+    #[test]
     fn test_syscall_openat_path() {
         assert_eq!(Openat::NAME, "openat");
         assert_eq!(Openat::NUMBER, Sysno::openat);
@@ -3622,6 +3699,24 @@ mod test {
         let syscall = Ppoll::new().with_timeout(Some(timeout_addr));
 
         let decoded = Ppoll::from(SyscallArgs::from(syscall));
+        let decoded_timeout: Option<AddrMut<Timespec>> = decoded.timeout();
+        assert_eq!(decoded_timeout, Some(timeout_addr));
+    }
+
+    #[test]
+    fn test_pselect6_timeout_is_timespec() {
+        // pselect6(2) uses a `struct timespec` timeout (nanoseconds), unlike
+        // plain select(2)'s `struct timeval`. Decoding must round-trip the
+        // in-out timespec pointer so consumers read nanoseconds, not the
+        // microseconds a timeval would imply.
+        let timeout = Timespec {
+            tv_sec: 2,
+            tv_nsec: 250_000_000,
+        };
+        let timeout_addr = AddrMut::from_ptr(&timeout).unwrap();
+        let syscall = Pselect6::new().with_timeout(Some(timeout_addr));
+
+        let decoded = Pselect6::from(SyscallArgs::from(syscall));
         let decoded_timeout: Option<AddrMut<Timespec>> = decoded.timeout();
         assert_eq!(decoded_timeout, Some(timeout_addr));
     }

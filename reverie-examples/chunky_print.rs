@@ -32,6 +32,9 @@ use tracing::debug;
 use tracing::info;
 use tracing::trace;
 
+#[path = "src/kvm_runner.rs"]
+mod kvm_runner;
+
 /// How many system calls (in each thread) define an epoch?
 const EPOCH: u64 = 10;
 
@@ -55,7 +58,8 @@ pub enum Msg {
 type LogicalTime = u64;
 
 #[derive(Debug, Default)]
-struct ChunkyPrintGlobal(Mutex<Inner>);
+// TODO-HUMAN-REVIEW(PR-152): Review crate-local LiteInst hosting visibility.
+pub(crate) struct ChunkyPrintGlobal(Mutex<Inner>);
 
 #[derive(Debug, Default)]
 struct Inner {
@@ -86,6 +90,13 @@ impl GlobalTool for ChunkyPrintGlobal {
                 let _ = mg.flush_messages();
             }
         }
+    }
+}
+
+impl ChunkyPrintGlobal {
+    // TODO-HUMAN-REVIEW(PR-152): Review the shared final-output flush boundary.
+    pub(crate) fn flush(&self) -> io::Result<()> {
+        self.0.lock().unwrap().flush_messages()
     }
 }
 
@@ -161,7 +172,8 @@ impl Inner {
 }
 
 #[derive(Debug, Default)]
-struct ChunkyPrintLocal {
+// TODO-HUMAN-REVIEW(PR-152): Review crate-local LiteInst hosting visibility.
+pub(crate) struct ChunkyPrintLocal {
     stdout_disconnected: AtomicBool,
     stderr_disconnected: AtomicBool,
 }
@@ -261,16 +273,49 @@ impl Tool for ChunkyPrintLocal {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Error> {
-    let args = CommonToolArguments::parse();
-    let log_guard = args.init_tracing();
-    let tracer = reverie_ptrace::TracerBuilder::<ChunkyPrintLocal>::new(args.into())
-        .spawn()
-        .await?;
-    let (status, global_state) = tracer.wait().await?;
+#[derive(Debug, Parser)]
+struct Args {
+    // TODO-HUMAN-REVIEW(PR-195): Review chunky_print runner selection.
+    /// Execution runner; KVM selects the prototype KvmGuest host.
+    #[clap(long, value_enum, default_value = "ptrace")]
+    runner: kvm_runner::Runner,
+
+    #[clap(flatten)]
+    common: CommonToolArguments,
+}
+
+fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+    let stdin = match args.runner {
+        kvm_runner::Runner::Ptrace => None,
+        kvm_runner::Runner::Kvm => kvm_runner::reserve_stdin()?,
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(run_main(args, stdin))
+}
+
+async fn run_main(args: Args, stdin: Option<std::fs::File>) -> anyhow::Result<()> {
+    let log_guard = args.common.init_tracing();
+    let (status, global_state) = match args.runner {
+        kvm_runner::Runner::Ptrace => {
+            let tracer =
+                reverie_ptrace::TracerBuilder::<ChunkyPrintLocal>::new(args.common.clone().into())
+                    .spawn()
+                    .await?;
+            tracer.wait().await?
+        }
+        kvm_runner::Runner::Kvm => {
+            let result = kvm_runner::run::<ChunkyPrintLocal>(&args.common, (), stdin).await?;
+            (
+                reverie::ExitStatus::Exited(result.exit_code),
+                result.global_state,
+            )
+        }
+    };
     trace!(" [chunky_print] global exit, flushing last messages.");
-    let _ = global_state.0.lock().unwrap().flush_messages();
+    global_state.flush()?;
     drop(log_guard); // Flush logs before exiting.
     status.raise_or_exit()
 }

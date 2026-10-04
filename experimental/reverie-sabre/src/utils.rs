@@ -7,6 +7,7 @@
  */
 
 use std::ffi::CStr;
+use std::ffi::CString;
 use std::mem::MaybeUninit;
 
 use syscalls::Errno;
@@ -48,6 +49,14 @@ pub fn sys_readlink(
 }
 
 const MAX_EXEC_ARG_POINTERS: usize = 1 << 18;
+
+fn exec_filename<'a>(filename: &'a CStr, client_path: &'a CStr) -> &'a CStr {
+    if filename.to_bytes() == b"/proc/self/exe" {
+        client_path
+    } else {
+        filename
+    }
+}
 
 /// Read one pointer from guest memory without risking a process-local fault.
 fn read_guest_pointer(address: usize) -> Result<*const libc::c_char, Errno> {
@@ -114,6 +123,12 @@ pub fn sys_execve(
     // argv. This also prevents a null filename from truncating the new list.
     unsafe { syscall!(Sysno::access, filename as usize, libc::F_OK as usize)? };
 
+    // SaBRe is the kernel-visible executable, so a native exec of
+    // /proc/self/exe would otherwise re-enter the loader with SaBRe itself as
+    // the client. Preserve the guest-visible meaning already used by
+    // sys_readlink and execute the current client image instead.
+    let filename = exec_filename(unsafe { CStr::from_ptr(filename) }, paths::client_path());
+
     let arguments = collect_exec_arguments(argv)?;
     let environment = collect_exec_arguments(envp)?;
     let sabre = paths::sabre_path().as_ptr();
@@ -121,7 +136,7 @@ pub fn sys_execve(
     new_argv.push(sabre);
     new_argv.push(paths::plugin_path().as_ptr());
     new_argv.push(c"--".as_ptr());
-    new_argv.push(filename);
+    new_argv.push(filename.as_ptr());
     new_argv.extend(arguments.into_iter().skip(1));
     new_argv.push(core::ptr::null());
 
@@ -144,8 +159,69 @@ pub fn sys_execve(
     }
 }
 
-pub fn sys_execveat() -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+/// `execveat(2)` under SaBRe.
+///
+/// Detcore rewrites every guest `execve` into an
+/// `execveat(AT_FDCWD, path, argv, envp, 0)` before injecting it (see
+/// `From<Execve> for Execveat` and `handle_execveat` in detcore), so this must
+/// re-enter SaBRe exactly like [`sys_execve`] instead of failing with `ENOSYS`.
+/// The directory-relative and `AT_EMPTY_PATH` (`fexecve`) forms are resolved
+/// through `/proc/self/fd` so they keep working after the loader is prepended.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-128): Review execveat re-entry and /proc/self/fd path resolution.
+pub fn sys_execveat(
+    dirfd: libc::c_int,
+    pathname: *const libc::c_char,
+    argv: *const *const libc::c_char,
+    envp: *const *const libc::c_char,
+    flags: libc::c_int,
+) -> Result<usize, Errno> {
+    // Fast path: `AT_FDCWD` with a normal (non-empty) path resolves the program
+    // identically to `execve`. This is the form Detcore always emits.
+    if dirfd == libc::AT_FDCWD && (flags & libc::AT_EMPTY_PATH) == 0 {
+        return sys_execve(pathname, argv, envp);
+    }
+
+    // General case: materialize an absolute path the re-entered loader can open,
+    // then reuse the `execve` re-entry with that path as the program image.
+    let resolved = resolve_execveat_path(dirfd, pathname, flags)?;
+    sys_execve(resolved.as_ptr(), argv, envp)
+}
+
+/// Turn an `execveat` `(dirfd, pathname, flags)` triple into an absolute path
+/// the SaBRe loader can `execve`, honoring the same lookup rules as the kernel.
+fn resolve_execveat_path(
+    dirfd: libc::c_int,
+    pathname: *const libc::c_char,
+    flags: libc::c_int,
+) -> Result<CString, Errno> {
+    let path_bytes: &[u8] = if pathname.is_null() {
+        b""
+    } else {
+        unsafe { CStr::from_ptr(pathname) }.to_bytes()
+    };
+
+    // An absolute pathname ignores `dirfd` entirely.
+    if path_bytes.first() == Some(&b'/') {
+        return CString::new(path_bytes).map_err(|_| Errno::EINVAL);
+    }
+
+    if path_bytes.is_empty() {
+        // Only `AT_EMPTY_PATH` (e.g. `fexecve`) permits an empty pathname; it
+        // execs the file the descriptor itself refers to.
+        if (flags & libc::AT_EMPTY_PATH) == 0 {
+            return Err(Errno::ENOENT);
+        }
+        return CString::new(format!("/proc/self/fd/{}", dirfd)).map_err(|_| Errno::EINVAL);
+    }
+
+    // A relative pathname resolves against `dirfd` (or the cwd for `AT_FDCWD`).
+    if dirfd == libc::AT_FDCWD {
+        return CString::new(path_bytes).map_err(|_| Errno::EINVAL);
+    }
+    let mut combined = format!("/proc/self/fd/{}/", dirfd).into_bytes();
+    combined.extend_from_slice(path_bytes);
+    CString::new(combined).map_err(|_| Errno::EINVAL)
 }
 
 /// glibc defines this to be much larger than what the kernel accepts. Since we
@@ -160,7 +236,6 @@ pub struct KernelSigset(u64);
 
 impl KernelSigset {
     /// Check if the sigset contains a signal.
-    #[allow(unused)]
     pub fn contains(&self, sig: libc::c_int) -> bool {
         let mask = sigmask(sig);
         (self.0 & mask) == mask
@@ -171,6 +246,49 @@ impl KernelSigset {
         let mask = sigmask(sig);
         self.0 &= !mask
     }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-175): Review queued-signal preservation across rt_sigsuspend injection.
+pub fn sys_rt_sigsuspend(
+    sigset_ptr: *const KernelSigset,
+    sigset_size: usize,
+) -> Result<usize, Errno> {
+    if sigset_size != core::mem::size_of::<KernelSigset>() {
+        return unsafe {
+            syscalls::syscall2(Sysno::rt_sigsuspend, sigset_ptr as usize, sigset_size)
+        };
+    }
+
+    let mut sigset = MaybeUninit::<KernelSigset>::uninit();
+    let local = libc::iovec {
+        iov_base: sigset.as_mut_ptr().cast(),
+        iov_len: core::mem::size_of::<KernelSigset>(),
+    };
+    let remote = libc::iovec {
+        iov_base: sigset_ptr.cast_mut().cast(),
+        iov_len: core::mem::size_of::<KernelSigset>(),
+    };
+    let copied = unsafe {
+        syscall!(
+            Sysno::process_vm_readv,
+            std::process::id() as usize,
+            &local as *const libc::iovec as usize,
+            1,
+            &remote as *const libc::iovec as usize,
+            1,
+            0
+        )?
+    };
+    if copied != core::mem::size_of::<KernelSigset>() {
+        return Err(Errno::EFAULT);
+    }
+    let sigset = unsafe { sigset.assume_init() };
+    if signal::pending_unblocked_caught_signal(&sigset) {
+        return Err(Errno::EINTR);
+    }
+
+    unsafe { syscalls::syscall2(Sysno::rt_sigsuspend, sigset_ptr as usize, sigset_size) }
 }
 
 /// The x86_64 kernel ABI representation of `struct sigaction`. libc's
@@ -314,13 +432,42 @@ pub fn sys_rt_sigprocmask(
 
 #[inline]
 pub fn is_vfork(sys_no: Sysno, arg1: usize) -> bool {
-    const VFORK_FLAGS: usize = (libc::CLONE_VM | libc::CLONE_VFORK | libc::SIGCHLD) as usize;
+    const VFORK_FLAGS: usize = (libc::CLONE_VM | libc::CLONE_VFORK) as usize;
     sys_no == Sysno::vfork || (sys_no == Sysno::clone && (arg1 & VFORK_FLAGS == VFORK_FLAGS))
+}
+
+#[cfg(test)]
+mod vfork_tests {
+    use super::*;
+
+    #[test]
+    fn clone_vfork_detection_accepts_any_exit_signal() {
+        let required = (libc::CLONE_VM | libc::CLONE_VFORK) as usize;
+
+        assert!(is_vfork(Sysno::vfork, 0));
+        assert!(is_vfork(Sysno::clone, required));
+        assert!(is_vfork(Sysno::clone, required | libc::SIGCHLD as usize));
+        assert!(is_vfork(Sysno::clone, required | libc::SIGUSR1 as usize));
+    }
+
+    #[test]
+    fn clone_vfork_detection_requires_both_semantic_flags() {
+        assert!(!is_vfork(Sysno::clone, libc::CLONE_VM as usize));
+        assert!(!is_vfork(Sysno::clone, libc::CLONE_VFORK as usize));
+        assert!(!is_vfork(Sysno::fork, 0));
+    }
 }
 
 #[cfg(test)]
 mod exec_tests {
     use super::*;
+
+    #[test]
+    fn proc_self_exe_executes_the_client_image() {
+        let client = c"/tmp/reverie-sabre-client";
+        assert_eq!(exec_filename(c"/proc/self/exe", client), client);
+        assert_eq!(exec_filename(c"/bin/echo", client), c"/bin/echo");
+    }
 
     #[test]
     fn execve_rejects_invalid_filename_without_replacing_the_process() {
@@ -364,7 +511,60 @@ mod exec_tests {
     }
 
     #[test]
-    fn execveat_remains_explicitly_unsupported() {
-        assert_eq!(sys_execveat(), Err(Errno::ENOSYS));
+    fn execveat_at_fdcwd_matches_execve_validation() {
+        // AT_FDCWD with flags==0 must resolve exactly like execve, including its
+        // pointer validation, rather than returning ENOSYS.
+        assert_eq!(
+            sys_execveat(
+                libc::AT_FDCWD,
+                core::ptr::null(),
+                core::ptr::null(),
+                core::ptr::null(),
+                0,
+            ),
+            Err(Errno::EFAULT)
+        );
+        let missing = c"/definitely/missing/reverie-sabre-execveat-test";
+        assert_eq!(
+            sys_execveat(
+                libc::AT_FDCWD,
+                missing.as_ptr(),
+                core::ptr::null(),
+                core::ptr::null(),
+                0,
+            ),
+            Err(Errno::ENOENT)
+        );
+    }
+
+    #[test]
+    fn execveat_resolves_paths_like_the_kernel() {
+        // Absolute pathnames ignore the directory fd.
+        let absolute = c"/usr/bin/env";
+        assert_eq!(
+            resolve_execveat_path(7, absolute.as_ptr(), 0),
+            Ok(CString::new("/usr/bin/env").unwrap())
+        );
+        // Relative pathnames resolve against the directory fd via /proc/self/fd.
+        let relative = c"child";
+        assert_eq!(
+            resolve_execveat_path(7, relative.as_ptr(), 0),
+            Ok(CString::new("/proc/self/fd/7/child").unwrap())
+        );
+        // AT_FDCWD relative paths stay as-is (cwd-relative).
+        assert_eq!(
+            resolve_execveat_path(libc::AT_FDCWD, relative.as_ptr(), 0),
+            Ok(CString::new("child").unwrap())
+        );
+        // AT_EMPTY_PATH (fexecve) execs the descriptor itself.
+        assert_eq!(
+            resolve_execveat_path(7, c"".as_ptr(), libc::AT_EMPTY_PATH),
+            Ok(CString::new("/proc/self/fd/7").unwrap())
+        );
+        // An empty path without AT_EMPTY_PATH is ENOENT, like the kernel.
+        assert_eq!(
+            resolve_execveat_path(7, c"".as_ptr(), 0),
+            Err(Errno::ENOENT)
+        );
     }
 }

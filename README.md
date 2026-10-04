@@ -14,6 +14,14 @@ Some potential use cases include:
 See the [`reverie-examples`](reverie-examples) directory for examples of
 tools that can be built with this library.
 
+Reverie is the instrumentation layer beneath
+[Hermit](https://github.com/facebookexperimental/hermit), a reproducible Linux
+container that makes a program's execution deterministic by replacing sources of
+nondeterminism such as time, randomness, and thread scheduling. Hermit is
+Reverie's primary consumer: its determinism engine is written as a Reverie tool
+(the *tool* concept is introduced in
+[Terminology and Background](#terminology-and-background) below).
+
 ## Features
 
  * Ergonomic syscall handling. It is easy to modify syscall arguments or return
@@ -50,6 +58,13 @@ a *swappable implementation* — anything playing the same role as
 `reverie-ptrace` — and it must be able to host an **arbitrary** tool, not a
 hard-coded one. See [The Backend Contract](#the-backend-contract) below.
 
+Reverie provides several backends: the production `ptrace` backend, the
+in-progress KVM and DBT (dynamic binary instrumentation) backends, and the
+experimental SaBRe, e9patch, and LiteInst rewriting backends. With the
+*backend* role now in hand, see [Backend architecture](BACKENDS.md) for how each
+one hooks, traps, and routes a guest's events, and for the shared RPC, ptracer,
+and trapping components they build on.
+
 ## Building and Testing
 
 Reverie needs the following system-level dependencies:
@@ -69,20 +84,25 @@ cd reverie-examples
 cargo run --bin strace -- ls
 ```
 
-## Optional Backend Sources
+## Backend Sources
 
-Large native sources for DynamoRIO, SaBRe, and e9patch are pinned but not
-checked out by default. Activate only the backend you need with
-`scripts/backend-submodule.sh`; see [Optional backend sources](docs/BACKEND_SOURCES.md)
-for revisions, build commands, and license notes.
+Large native sources for DynamoRIO, SaBRe, and e9patch are pinned as shallow
+submodules. `git submodule update --init --recursive` checks out every pinned
+source; `scripts/backend-submodule.sh` remains available for focused activation.
+See [Backend sources](docs/BACKEND_SOURCES.md) for revisions, build commands,
+and license notes.
 
 ## Usage
 
-Currently, there is only the `reverie-ptrace` backend which uses `ptrace` to
-intercept syscalls. Copy one of the example tools to a new Rust project (e.g.
-`cargo init`). You’ll see that it depends both on the general `reverie` crate
-for the API and on the specific backend implementation crate,
-`reverie_ptrace`.
+`reverie-ptrace` is the reference runtime. `reverie-e9patch` and
+`reverie-liteinst` also implement the generic `Backend` contract, with the
+current hybrid and in-guest boundaries documented in
+[Backend architecture](BACKENDS.md). KVM, DBT, and SaBRe currently expose
+specialized runners or adapters rather than that generic launch contract.
+
+Copy one of the example tools to a new Rust project (e.g. `cargo init`). You’ll
+see that it depends both on the general `reverie` crate for the API and on the
+specific backend implementation crate, `reverie_ptrace`.
 
 Running a tool always follows the same shape: pick a backend, hand it a command
 and the tool's config, and receive the guest's exit status together with the
@@ -110,6 +130,11 @@ let (exit_status, global_state) =
 Since `ptrace` adds significant overhead when the guest has a syscall-heavy
 workload, Reverie will add similarly-significant overhead. The slowdown depends
 on how many syscalls are being performed and are intercepted by the tool.
+
+The separate, non-CI [counter2 performance shootout](benchmarks/counter2-shootout/README.md)
+measures native-normalized instrumentation overhead across the available
+backends on calibrated multi-second workloads. It correctness-probes the
+known-green workload intersection before collecting any timing samples.
 
 The primary way you can improve performance with the current implementation is
 to implement the `subscriptions` callback, specifying a minimal set of syscalls
@@ -146,11 +171,10 @@ called it.
 
 ### Global State
 
-The global state is accessed via RPC messages. Since a future Reverie backend
-may use in-guest syscall interception, the syscall handler code may not be
-running in the same address space. Thus, all shared state is communicated via
-RPC messages. (There is, however, currently only a single ptrace-based backend
-where all tracer code is in the same address space.)
+The global state is accessed through the `GlobalRPC` interface. Some backends
+implement it as a local method call, while in-guest handlers can use the shared
+cross-process transport. See the [RPC component map](BACKENDS.md#componentrpc)
+for the current implementations.
 
 ## The Backend Contract
 
@@ -189,31 +213,51 @@ backend must:
 7. **Return `(ExitStatus, T::GlobalState)`.** When the root guest exits, hand
    back its exit status together with the (now uniquely owned) global state, so
    the caller can read out whatever the tool accumulated.
+8. **Report backend activity on request.** Enable the backend's real statistics
+   collector and return its typed snapshot; unsupported measurements are not
+   represented by a successful zero.
+9. **Capture guest output on request.** Pipe stdout and stderr and return their
+   bytes together with the exit status, final global state, and typed backend
+   statistics.
 
 This contract is captured explicitly by the `reverie::Backend` trait:
 
 ```rust
 #[reverie::backend(?Send)]
 pub trait Backend {
+    type Stats: BackendStatsSnapshot;
+
     async fn run<T: Tool + 'static>(
         command: Command,
         config: <T::GlobalState as GlobalTool>::Config,
     ) -> Result<(ExitStatus, T::GlobalState), Error>;
+
+    async fn run_with_stats<T: Tool + 'static>(
+        command: Command,
+        config: <T::GlobalState as GlobalTool>::Config,
+    ) -> Result<(ExitStatus, T::GlobalState, Self::Stats), Error>;
+
+    async fn run_with_output<T: Tool + 'static>(
+        command: Command,
+        config: <T::GlobalState as GlobalTool>::Config,
+    ) -> Result<(Output, T::GlobalState, Self::Stats), Error>;
 }
 ```
 
-`reverie::Backend::run` is the *minimal common denominator* every backend must
-provide. A real backend will typically also expose a richer, backend-specific
-builder: `reverie-ptrace`, for example, additionally supports output capture, a
-GDB server, and spawning a *function* (rather than a `Command`) under
-instrumentation, via its `TracerBuilder`/`Tracer` API.
+`reverie::Backend::run` is the smallest entry point. The required
+`run_with_stats` and `run_with_output` entry points expose backend activity and
+captured guest output through the same common contract. A real backend will
+typically also expose a richer, backend-specific builder: `reverie-ptrace`, for
+example, additionally supports a GDB server, spawning a *function* (rather than
+a `Command`) under instrumentation, and lower-level lifecycle and stdio control
+through its `TracerBuilder`/`Tracer` API.
 
 `reverie-ptrace` is the reference implementation. It is a *centralized* backend:
 because it traps events from outside the guest via `ptrace` + `seccomp`, it can
-keep all tool state in the tracer's address space. A future in-guest backend
-(e.g. binary rewriting) would run handlers inside the guest and communicate with
-centralized global state over RPC — but it would satisfy the exact same
-`Backend` contract, which is what lets tools move between backends unchanged.
+keep all tool state in the tracer's address space. Current in-guest paths run
+handlers inside the guest and can communicate with centralized global state
+over RPC. The exact execution modes and contract status are documented in
+[Backend architecture](BACKENDS.md).
 
 ## Platform and Architecture Support
 

@@ -145,11 +145,103 @@ impl Command {
         }
 
         Error::result(
-            unsafe { libc::execvpe(self.program.as_ptr(), self.args.as_ptr(), env.as_ptr()) },
+            unsafe { execvpe_zeroed_tail(&self.program, self.args.as_ptr(), env.as_ptr()) },
             Context::Exec,
         )
         .unwrap_err()
     }
+}
+
+/// Issues `execve` with the three argument registers `execve` ignores
+/// (arg3..arg5) set to zero.
+///
+/// `libc::execvpe` reaches the `execve` instruction with whatever the launcher
+/// last left in those registers. The kernel ignores them and clears them in the
+/// new image, but a ptrace tracer records all six argument registers at the
+/// seccomp stop, so leftover launcher state would enter the recorded launch.
+/// glibc's `syscall(3)` moves its fifth, sixth and seventh arguments into r10,
+/// r8 and r9, so passing explicit zeros defines them.
+///
+/// Returns -1 with `errno` set, like `execve(2)`.
+unsafe fn execve_zeroed_tail(
+    path: *const libc::c_char,
+    argv: *const *const libc::c_char,
+    envp: *const *const libc::c_char,
+) -> libc::c_int {
+    let zero: libc::c_long = 0;
+    unsafe { libc::syscall(libc::SYS_execve, path, argv, envp, zero, zero, zero) as libc::c_int }
+}
+
+/// Behaves like glibc `execvpe(3)`, but issues every `execve` through
+/// [`execve_zeroed_tail`]. The `PATH` search and its error precedence follow
+/// glibc: `EACCES` is remembered, and `ENOENT`, `ESTALE`, `ENOTDIR`, `ENODEV`
+/// and `ETIMEDOUT` move on to the next entry. A candidate that fails with
+/// `ENOEXEC` is handed to `libc::execvpe`, which runs it through `/bin/sh`.
+///
+/// MUST NOT allocate: this runs in the child between `clone` and `execve`.
+unsafe fn execvpe_zeroed_tail(
+    program: &std::ffi::CStr,
+    argv: *const *const libc::c_char,
+    envp: *const *const libc::c_char,
+) -> libc::c_int {
+    const NAME_MAX: usize = libc::NAME_MAX as usize;
+    const PATH_MAX: usize = libc::PATH_MAX as usize;
+    let errno = || io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    let set_errno = |value| unsafe { *libc::__errno_location() = value };
+
+    let file = program.to_bytes();
+    if file.is_empty() {
+        set_errno(libc::ENOENT);
+        return -1;
+    }
+    if file.contains(&b'/') {
+        unsafe { execve_zeroed_tail(program.as_ptr(), argv, envp) };
+        if errno() == libc::ENOEXEC {
+            return unsafe { libc::execvpe(program.as_ptr(), argv, envp) };
+        }
+        return -1;
+    }
+    if file.len() > NAME_MAX {
+        set_errno(libc::ENAMETOOLONG);
+        return -1;
+    }
+
+    let path = unsafe { libc::getenv(c"PATH".as_ptr()) };
+    let path = if path.is_null() {
+        &b"/bin:/usr/bin"[..]
+    } else {
+        unsafe { std::ffi::CStr::from_ptr(path) }.to_bytes()
+    };
+
+    let mut buffer = [0u8; PATH_MAX + NAME_MAX + 2];
+    let mut got_eacces = false;
+    for dir in path.split(|byte| *byte == b':') {
+        if dir.len() >= PATH_MAX {
+            continue;
+        }
+        // An empty entry means the current directory, as in glibc.
+        let mut len = dir.len();
+        buffer[..len].copy_from_slice(dir);
+        if !dir.is_empty() {
+            buffer[len] = b'/';
+            len += 1;
+        }
+        buffer[len..len + file.len()].copy_from_slice(file);
+        buffer[len + file.len()] = 0;
+        let candidate = buffer.as_ptr() as *const libc::c_char;
+
+        unsafe { execve_zeroed_tail(candidate, argv, envp) };
+        match errno() {
+            libc::ENOEXEC => return unsafe { libc::execvpe(candidate, argv, envp) },
+            libc::EACCES => got_eacces = true,
+            libc::ENOENT | libc::ESTALE | libc::ENOTDIR | libc::ENODEV | libc::ETIMEDOUT => {}
+            _ => return -1,
+        }
+    }
+    if got_eacces {
+        set_errno(libc::EACCES);
+    }
+    -1
 }
 
 /// Sends an error and closes the pipe. Ignore any errors if this fails.

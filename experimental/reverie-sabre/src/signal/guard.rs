@@ -9,6 +9,7 @@
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::mem;
+use core::sync::atomic::AtomicU32;
 use core::sync::atomic::AtomicU64;
 use core::sync::atomic::Ordering::*;
 
@@ -37,9 +38,54 @@ pub type SignalHandlerInput = libc::siginfo_t;
 pub type SignalGuard = SequencerGuard<'static, SignalHandlerInput>;
 pub type SignalAntiGuard = SequencerAntiGuard<'static, SignalHandlerInput>;
 
+/// Restores the caller's signal-guard depth after a vfork-style child stops
+/// sharing its address space.
+///
+/// A successful exec in the child deliberately leaks an inclusion-zone guard
+/// because the old image never returns. With `CLONE_VM | CLONE_VFORK`, that
+/// bookkeeping temporarily lives in the blocked parent's TLS as well. The
+/// parent must recover its pre-vfork depth when the kernel resumes it. Queued
+/// signal accounting is intentionally preserved because signals may have
+/// arrived while the child was running.
+pub(crate) struct VforkSignalGuardRestore {
+    guard_count: u32,
+}
+
+impl Drop for VforkSignalGuardRestore {
+    fn drop(&mut self) {
+        signal_handler_sequencer().restore_guard_count(self.guard_count);
+    }
+}
+
 thread_local! {
     pub(crate) static SIGNAL_HANLDER_SEQUENCER: GuardedSequencer<SignalHandlerInput>
         = const { GuardedSequencer::with_initial_guard_count(1) };
+    static PENDING_SIGNAL_COUNTS: [AtomicU32; SIGNAL_COUNT]
+        = const { [const { AtomicU32::new(0) }; SIGNAL_COUNT] };
+}
+
+const SIGNAL_COUNT: usize = 64;
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-175): Review per-thread queued-signal accounting.
+fn signal_index(signal: libc::c_int) -> Option<usize> {
+    usize::try_from(signal)
+        .ok()
+        .and_then(|signal| signal.checked_sub(1))
+        .filter(|index| *index < SIGNAL_COUNT)
+}
+
+pub(crate) fn signal_is_pending(signal: libc::c_int) -> bool {
+    signal_index(signal)
+        .is_some_and(|index| PENDING_SIGNAL_COUNTS.with(|counts| counts[index].load(Acquire) != 0))
+}
+
+pub(crate) fn mark_signal_dispatched(signal: libc::c_int) {
+    let Some(index) = signal_index(signal) else {
+        return;
+    };
+    let previous = PENDING_SIGNAL_COUNTS.with(|counts| counts[index].fetch_sub(1, AcqRel));
+    debug_assert!(previous > 0, "dispatched signal was not pending");
 }
 
 /// Marker struct that triggers "run-on-drop" behavior for defered invocations.
@@ -165,6 +211,18 @@ impl<T> GuardedSequencer<T> {
         self.guard_state.fetch_add(GUARD_COUNT_UNIT, Acquire);
     }
 
+    fn guard_count(&self) -> u32 {
+        (self.guard_state.load(Acquire) & GUARD_COUNT_MASK) as u32
+    }
+
+    fn restore_guard_count(&self, guard_count: u32) {
+        self.guard_state
+            .try_update(AcqRel, Acquire, |state| {
+                Some((state & QUEUED_COUNT_MASK) | u64::from(guard_count))
+            })
+            .expect("signal guard restoration cannot fail");
+    }
+
     /// Decrement the counter for guards, and if the count goes to zero, we run
     /// any invocations that were added while the guard(s) were active
     fn decrement_guard_count(&self) {
@@ -229,7 +287,15 @@ fn signal_handler_sequencer() -> &'static GuardedSequencer<SignalHandlerInput> {
 /// Queue a signal event without executing guest or tool code from the kernel
 /// signal frame. The event is drained only from a runtime callback.
 pub fn invoke_guarded(handler: fn(SignalHandlerInput), siginfo: SignalHandlerInput) {
-    let _ = signal_handler_sequencer().enqueue_deferred(handler, siginfo);
+    let signal = siginfo.si_signo;
+    if let Some(index) = signal_index(signal) {
+        PENDING_SIGNAL_COUNTS.with(|counts| counts[index].fetch_add(1, AcqRel));
+        if !signal_handler_sequencer().enqueue_deferred(handler, siginfo) {
+            PENDING_SIGNAL_COUNTS.with(|counts| counts[index].fetch_sub(1, AcqRel));
+        }
+    } else {
+        let _ = signal_handler_sequencer().enqueue_deferred(handler, siginfo);
+    }
 }
 
 /// Enter a region where signals cannot interrupt invocation of the current
@@ -238,6 +304,15 @@ pub fn invoke_guarded(handler: fn(SignalHandlerInput), siginfo: SignalHandlerInp
 #[must_use]
 pub fn enter_signal_exclusion_zone() -> SignalGuard {
     signal_handler_sequencer().guard()
+}
+
+/// Snapshot the current guard depth for a kernel vfork boundary. The returned
+/// restore object must remain live until the blocked parent resumes.
+#[must_use]
+pub(crate) fn preserve_signal_guard_count_across_vfork() -> VforkSignalGuardRestore {
+    VforkSignalGuardRestore {
+        guard_count: signal_handler_sequencer().guard_count(),
+    }
 }
 
 /// Enter an already-exiting region where signals cannot interrupt execution of
@@ -367,6 +442,16 @@ mod tests {
             // order they were received
             assert_interrupts_eq!(log, [h1, h2]);
         });
+    }
+
+    #[test]
+    fn restoring_vfork_guard_depth_preserves_queued_signal_count() {
+        let sequencer = GuardedSequencer::<SignalHandlerInput>::with_initial_guard_count(2);
+        sequencer.guard_state.store(QUEUED_COUNT_UNIT, SeqCst);
+
+        sequencer.restore_guard_count(2);
+
+        assert_eq!(sequencer.guard_state.load(SeqCst), QUEUED_COUNT_UNIT + 2);
     }
 
     #[test]
@@ -555,6 +640,23 @@ mod tests {
 
             assert_eq!(5, INVOKE_COUNT.with(|count| count.load(SeqCst)));
         })
+    }
+
+    #[test]
+    fn queued_signal_number_remains_visible_until_dispatch() {
+        let mut siginfo: SignalHandlerInput = unsafe { core::mem::zeroed() };
+        siginfo.si_signo = libc::SIGUSR1;
+
+        SIGNAL_HANLDER_SEQUENCER.with(|sequencer| {
+            sequencer.guard_state.store(1, SeqCst);
+            while sequencer.queue.dequeue().is_some() {}
+        });
+        PENDING_SIGNAL_COUNTS.with(|counts| counts[(libc::SIGUSR1 - 1) as usize].store(0, SeqCst));
+
+        invoke_guarded(|input| mark_signal_dispatched(input.si_signo), siginfo);
+        assert!(signal_is_pending(libc::SIGUSR1));
+        drain_pending();
+        assert!(!signal_is_pending(libc::SIGUSR1));
     }
 }
 

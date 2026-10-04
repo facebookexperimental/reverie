@@ -68,6 +68,8 @@ pub enum vFile {
     Fstat(i32),
     Unlink(PathBuf),
     Readlink(PathBuf),
+    /// An unrecognized Host-I/O operation requires an empty protocol reply.
+    Unsupported,
 }
 
 impl ParseCommand for vFile {
@@ -111,7 +113,14 @@ impl ParseCommand for vFile {
             let fname = PathBuf::from(OsString::from_vec(fname));
             Some(vFile::Readlink(fname))
         } else {
-            None
+            // Host-I/O names are matched through the second colon. Keep
+            // missing delimiters malformed, but let an unrecognized complete
+            // operation reach the normal empty-response path. Known operations
+            // above retain their own argument parsing failures.
+            // https://sourceware.org/gdb/current/onlinedocs/gdb.html/Host-I_002fO-Packets.html
+            let operation = bytes.strip_prefix(b":")?;
+            let separator = operation.iter().position(|byte| *byte == b':')?;
+            (separator != 0).then_some(vFile::Unsupported)
         }
     }
 }
@@ -121,6 +130,62 @@ mod test {
     use std::mem;
 
     use super::*;
+
+    #[test]
+    fn unknown_vfile_operations_are_valid_commands() {
+        for packet in [
+            "vFile:lstat:2f746573742f6d697373696e67",
+            "vFile:stat:",
+            "vFile:future-operation:opaque,args",
+            "vFile:open-extra:zz",
+            "vFile:pread-extra:",
+        ] {
+            assert!(
+                Command::try_parse(BytesMut::from(packet)).is_ok(),
+                "unsupported operation must reach the empty-response handler: {packet}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_supported_vfile_operations_remain_errors() {
+        for packet in ["vFile", "vFile:", "vFile::", "vFile:lstat", "vFileX:lstat:"] {
+            assert_eq!(
+                Command::try_parse(BytesMut::from(packet)),
+                Err(CommandParseError::MalformedCommand("vFile".into())),
+                "missing or invalid operation delimiters must remain malformed: {packet}"
+            );
+        }
+        for packet in [
+            "vFile:setfs:",
+            "vFile:close:",
+            "vFile:pread:",
+            "vFile:pwrite:",
+            "vFile:fstat:",
+            "vFile:open:2f",
+            "vFile:open:2f,0",
+            "vFile:pread:1,2",
+            "vFile:pwrite:1",
+        ] {
+            assert_eq!(
+                Command::try_parse(BytesMut::from(packet)),
+                Err(CommandParseError::MalformedCommand("vFile".into())),
+                "missing supported arguments must remain malformed: {packet}"
+            );
+        }
+        for operation in [
+            "setfs", "open", "close", "pread", "pwrite", "fstat", "unlink", "readlink",
+        ] {
+            for suffix in ["", ":zz"] {
+                let packet = format!("vFile:{operation}{suffix}");
+                assert_eq!(
+                    Command::try_parse(BytesMut::from(packet.as_str())),
+                    Err(CommandParseError::MalformedCommand("vFile".into())),
+                    "malformed supported operation must not become unsupported: {packet}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn hostio_stat_size_check() {

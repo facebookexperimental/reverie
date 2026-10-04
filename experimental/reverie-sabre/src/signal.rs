@@ -233,6 +233,7 @@ macro_rules! generate_signal_handlers {
             $(
                 #[allow(non_snake_case)]
                 pub fn $signal_name<T: ToolGlobal>(handler_input: HandlerInput) {
+                    signal::guard::mark_signal_dispatched(signal_values::$signal_name);
 
                     T::global().handle_signal_event(signal_values::$signal_name);
 
@@ -244,7 +245,7 @@ macro_rules! generate_signal_handlers {
                         let signal = signal_values::$signal_name as libc::c_int;
                         match pair.guest_facing_action.sa_sigaction {
                             libc::SIG_DFL if pair.override_default_handler.is_none() => {
-                                dispatch_default(signal)
+                                dispatch_default::<T>(signal)
                             }
                             libc::SIG_IGN => {}
                             _ => unsafe {
@@ -437,6 +438,24 @@ macro_rules! generate_signal_handlers {
                 .expect("registered signal action is missing")
                 .guest_facing_action
         }
+
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-175): Review pending caught-signal selection for sigsuspend.
+        pub(crate) fn pending_unblocked_caught_signal(mask: &crate::utils::KernelSigset) -> bool {
+            $(
+                let signal = signal_values::$signal_name;
+                if signal::guard::signal_is_pending(signal) && !mask.contains(signal) {
+                    let action = get_registered_guest_handler(signal);
+                    if !matches!(
+                        action.sa_sigaction,
+                        libc::SIG_DFL | libc::SIG_IGN | libc::SIG_ERR
+                    ) {
+                        return true;
+                    }
+                }
+            )+
+            false
+        }
     };
 }
 
@@ -506,10 +525,15 @@ fn default_disposition(signal: libc::c_int) -> DefaultDisposition {
     }
 }
 
-fn dispatch_default(signal: libc::c_int) {
+fn dispatch_default<T: ToolGlobal>(signal: libc::c_int) {
+    dispatch_default_with(signal, callbacks::prepare_signal_termination::<T>);
+}
+
+fn dispatch_default_with(signal: libc::c_int, before_terminate: impl FnOnce()) {
     match default_disposition(signal) {
         DefaultDisposition::Ignore | DefaultDisposition::Continue => return,
-        DefaultDisposition::Stop | DefaultDisposition::Terminate => {}
+        DefaultDisposition::Stop => {}
+        DefaultDisposition::Terminate => before_terminate(),
     }
 
     unsafe {
@@ -573,13 +597,29 @@ mod disposition_tests {
     }
 
     #[test]
-    fn terminating_default_action_preserves_signaled_wait_status() {
+    fn terminating_default_action_runs_cleanup_and_preserves_signaled_wait_status() {
+        let mut pipe = [0; 2];
+        assert_eq!(0, unsafe { libc::pipe(pipe.as_mut_ptr()) });
         let child = unsafe { libc::fork() };
         assert!(child >= 0);
         if child == 0 {
-            dispatch_default(libc::SIGTERM);
+            unsafe { libc::close(pipe[0]) };
+            dispatch_default_with(libc::SIGTERM, || {
+                let byte = 1_u8;
+                assert_eq!(1, unsafe {
+                    libc::write(pipe[1], (&byte as *const u8).cast(), 1)
+                });
+            });
             unsafe { libc::_exit(99) };
         }
+
+        unsafe { libc::close(pipe[1]) };
+        let mut byte = 0_u8;
+        assert_eq!(1, unsafe {
+            libc::read(pipe[0], (&mut byte as *mut u8).cast(), 1)
+        });
+        assert_eq!(byte, 1);
+        unsafe { libc::close(pipe[0]) };
 
         let mut status = 0;
         assert_eq!(child, unsafe { libc::waitpid(child, &mut status, 0) });
@@ -593,7 +633,7 @@ mod disposition_tests {
         assert!(child >= 0);
         if child == 0 {
             assert_eq!(0, unsafe { libc::setpgid(0, 0) });
-            dispatch_default(libc::SIGTSTP);
+            dispatch_default_with(libc::SIGTSTP, || panic!("stop must not run exit cleanup"));
             unsafe { libc::_exit(0) };
         }
 
@@ -706,8 +746,10 @@ mod blocking_restart_tests {
         let child = unsafe { libc::fork() };
         assert!(child >= 0);
         if child == 0 {
-            dispatch_default(libc::SIGURG);
-            dispatch_default(libc::SIGCONT);
+            dispatch_default_with(libc::SIGURG, || panic!("ignore must not run exit cleanup"));
+            dispatch_default_with(libc::SIGCONT, || {
+                panic!("continue must not run exit cleanup")
+            });
             unsafe { libc::_exit(17) };
         }
 

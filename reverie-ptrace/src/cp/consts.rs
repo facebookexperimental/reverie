@@ -7,7 +7,7 @@
  */
 
 /// A page that is reserved by Reverie in every guest process.
-pub const PRIVATE_PAGE_OFFSET: usize = 0x7000_0000;
+pub const PRIVATE_PAGE_OFFSET: usize = 0x7100_0000;
 
 /// trampoline data from private pages
 pub const TRAMPOLINE_BASE: usize = PRIVATE_PAGE_OFFSET;

@@ -10,4 +10,4 @@ mod consts;
 mod mmap;
 
 pub use consts::*;
-pub use mmap::populate_mmap_page;
+pub use mmap::mmap_page_contents;

@@ -555,6 +555,9 @@ mod tests {
 
     #[test]
     fn test_create_dir_all() {
+        if crate::test_runs_in_own_process() {
+            return;
+        }
         let tempdir = tempfile::TempDir::new().unwrap();
         let path = CString::new(
             tempdir
@@ -572,6 +575,9 @@ mod tests {
 
     #[test]
     fn test_touch_path() {
+        if crate::test_runs_in_own_process() {
+            return;
+        }
         let tempdir = tempfile::TempDir::new().unwrap();
         let path = CString::new(
             tempdir
@@ -589,6 +595,9 @@ mod tests {
 
     #[test]
     fn test_nonblocking() -> Result<(), Errno> {
+        if crate::test_runs_in_own_process() {
+            return Ok(());
+        }
         let (r, w) = pipe()?;
 
         assert!(!r.is_nonblocking()?);

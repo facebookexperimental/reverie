@@ -50,3 +50,33 @@ This tool is meant to emulate a pathological kernel where:
     returned at a time.
  2. `EINTR` is returned instead of running the real syscall for every other
     read.
+
+## LiteInst backend
+
+Build the shared example preload and its launcher:
+
+```sh
+cargo build -p reverie-examples --lib --bin reverie-liteinst-examples
+```
+
+Run the exact example `Tool` implementations through `LiteinstBackend`:
+
+```sh
+target/debug/reverie-liteinst-examples --tool noop -- /bin/echo hello
+target/debug/reverie-liteinst-examples --tool chaos --skip 32 --no-interrupt -- target/debug/reverie-liteinst-env-guest exercise-chaos-read
+target/debug/reverie-liteinst-examples --tool counter1 -- /bin/echo hello
+target/debug/reverie-liteinst-examples --tool chunky-print -- /bin/echo hello
+target/debug/reverie-liteinst-examples --tool counter2 -- /bin/echo hello
+target/debug/reverie-liteinst-examples --tool strace --trace write -- /bin/echo hello
+target/debug/reverie-liteinst-examples --tool strace-minimal -- /bin/echo hello
+target/debug/reverie-liteinst-examples --tool debug --port 1234 -- /bin/true
+```
+
+The `debug` selector is intentionally ptrace-assisted: the GDB remote protocol
+needs an external controller for registers, breakpoints, and lifecycle stops.
+The other eight selectors execute their production `Tool` through LiteInst's
+in-guest preload and patch path.
+
+This path supports dynamically linked Linux x86-64 guests. The LiteInst runtime
+still rejects guest-installed callable signal handlers and clone/fork injection;
+see `reverie-liteinst/README.md` for the complete backend boundary.

@@ -2,10 +2,6 @@ name: Rust
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
 
 env:
   CARGO_TERM_COLOR: always
@@ -20,40 +16,94 @@ jobs:
     - uses: actions/checkout@v4
       with:
         submodules: false
-    - name: Activate DynamoRIO backend source
-      env:
-        GIT_CONFIG_COUNT: "1"
-        GIT_CONFIG_KEY_0: safe.directory
-        GIT_CONFIG_VALUE_0: ${{ github.workspace }}
-      run: scripts/backend-submodule.sh activate dynamorio
     - name: Dependencies
       run: sudo apt-get install -y libunwind-dev liblzma-dev cmake zlib1g-dev
+    - name: Establish ordinary-user namespace prerequisite
+      id: userns
+      timeout-minutes: 1
+      shell: bash
+      run: |
+        set -euo pipefail
+        # This setting is system-wide inside the disposable hosted runner VM.
+        # Never apply it on the shared hardware runner or from a local shell.
+        [[ ${GITHUB_ACTIONS:-} == true && ${RUNNER_ENVIRONMENT:-} == github-hosted ]]
+        [[ ${RUNNER_OS:-} == Linux && ${GITHUB_JOB:-} == regular && $EUID != 0 ]]
+        source /etc/os-release
+        [[ $ID == ubuntu ]]
+
+        setting=kernel.apparmor_restrict_unprivileged_userns
+        setting_path=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+        original=unavailable
+        if [[ -r $setting_path ]]; then
+          original=$(cat "$setting_path")
+        fi
+        printf 'Namespace prerequisite: uid=%s %s=%s\n' "$EUID" "$setting" "$original"
+        initial_status=0
+        /usr/bin/unshare --user --map-root-user --mount --propagation private -- /usr/bin/true || initial_status=$?
+        printf 'Initial namespace probe exit=%s (diagnostics retained above)\n' "$initial_status"
+        if [[ $initial_status == 0 ]]; then
+          echo 'Namespace prerequisite already satisfied; setting unchanged.'
+          exit 0
+        fi
+        if [[ $original != 1 ]]; then
+          echo '::error::Namespace prerequisite failed without the supported restriction value 1.'
+          exit "$initial_status"
+        fi
+
+        # Arm restoration before attempting the only permitted setting change.
+        # A failed write or second probe must still restore the recorded value.
+        echo 'original_restriction=1' >> "$GITHUB_OUTPUT"
+        echo 'restore_required=true' >> "$GITHUB_OUTPUT"
+        sudo -n sysctl -w "$setting=0"
+        [[ $(cat "$setting_path") == 0 ]]
+        repeated_status=0
+        /usr/bin/unshare --user --map-root-user --mount --propagation private -- /usr/bin/true || repeated_status=$?
+        printf 'Namespace probe after %s=0 exit=%s\n' "$setting" "$repeated_status"
+        if [[ $repeated_status != 0 ]]; then
+          echo '::error::Namespace prerequisite still fails; tests cannot start.'
+          exit "$repeated_status"
+        fi
+        echo 'Namespace probe passed after the controlled restriction change.'
     - name: Rust toolchain
+      id: toolchain
       uses: dtolnay/rust-toolchain@nightly
       with:
         components: clippy, rustfmt
-    # reverie-dbi/build.rs compiles DynamoRIO (Release) from the pinned submodule
-    # on first build, which is expensive on GitHub-hosted runners. Cache the
-    # install tree keyed on the DynamoRIO revision and build.rs: build.rs skips
-    # the CMake build when the revision stamp, drrun, and DynamoRIOConfig.cmake
-    # are already present, so restoring the install short-circuits the build.
-    - name: DynamoRIO revision
-      id: dynamorio
-      run: echo "rev=$(git -C third-party/dynamorio rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+    - name: Cross-client skill discovery
+      run: |
+        rustc scripts/check-skill-discovery.rs -o "$RUNNER_TEMP/check-skill-discovery"
+        "$RUNNER_TEMP/check-skill-discovery"
+    # reverie-dbt/build.rs compiles the vendored DynamoRIO source on first use.
+    # Cache the content-addressed install tree; both the Actions key and the
+    # restored directory require the exact vendored source + recipe content.
     - name: Cache DynamoRIO build
       uses: actions/cache@v4
       with:
-        path: |
-          target/*/build/reverie-dbi-*/out/dynamorio-install
-          target/*/build/reverie-dbi-*/out/dynamorio-revision
-        key: dynamorio-${{ runner.os }}-${{ steps.dynamorio.outputs.rev }}-${{ hashFiles('reverie-dbi/build.rs') }}
+        path: target/*/reverie-dbt-native-cache/dynamorio-install-*
+        key: dynamorio-${{ runner.os }}-${{ hashFiles('reverie-dbt/vendor/dynamorio/**', 'reverie-dbt/build.rs') }}
     - name: Build
       run: cargo build --workspace --all-features
+    - name: Cache constructor-disabled LiteInst conformance artifacts
+      uses: actions/cache@v4
+      with:
+        # Keep release/no-default artifacts separate from all-features builds.
+        # Cargo still verifies source, dependency and compiler fingerprints.
+        path: target/liteinst-conformance
+        key: liteinst-conformance-${{ github.job }}-release-no-default-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
+    - name: LiteInst real target-loader conformance
+      # Uses ptrace and native loader oracles; no PMU or self-hosted runner needed.
+      # The bounded runner builds the release DSO, binds its digest and requires
+      # exactly one executed, passing test.
+      run: reverie-liteinst/tests/run_target_loader_conformance.sh
+    - name: DBT virtual identity and pidfd_open policy
+      run: reverie-dbt/scripts/test-identity-policy.sh
     - name: Test regular workspace cases
       run: >-
-        cargo test --workspace --all-features --
+        cargo test --workspace --exclude reverie-kvm --exclude reverie-preload --all-features --no-fail-fast --
         --test-threads=1
         --skip container::tests::bind_to_low_port
+        --skip container::tests::mount_error_from_child_is_returned
+        --skip container::tests::test_directory_is_available_after_mount
         --skip container::tests::pin_affinity_to_all_cores
         --skip tests::domainname
         --skip tests::hostname
@@ -62,6 +112,7 @@ jobs:
         --skip tests::local_networking_there_can_be_only_one
         --skip tests::mount_and_move_tmpfs
         --skip tests::mount_bind
+        --skip tests::mount_bind_readonly_rejects_writes
         --skip tests::mount_devpts_basic
         --skip tests::mount_devpts_isolated
         --skip tests::mount_proc
@@ -76,6 +127,21 @@ jobs:
       run: cargo clippy --workspace --all-targets --all-features
     - name: Format
       run: cargo fmt --all -- --check
+    - name: Restore hosted-runner namespace restriction
+      if: ${{ always() && steps.userns.outputs.restore_required == 'true' }}
+      timeout-minutes: 1
+      shell: bash
+      env:
+        ORIGINAL_RESTRICTION: ${{ steps.userns.outputs.original_restriction }}
+      run: |
+        set -euo pipefail
+        [[ ${GITHUB_ACTIONS:-} == true && ${RUNNER_ENVIRONMENT:-} == github-hosted ]]
+        [[ ${RUNNER_OS:-} == Linux && ${GITHUB_JOB:-} == regular && $EUID != 0 ]]
+        source /etc/os-release
+        [[ $ID == ubuntu && $ORIGINAL_RESTRICTION == 1 ]]
+        sudo -n sysctl -w "kernel.apparmor_restrict_unprivileged_userns=$ORIGINAL_RESTRICTION"
+        [[ $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns) == "$ORIGINAL_RESTRICTION" ]]
+        echo "Restored namespace restriction to recorded value $ORIGINAL_RESTRICTION."
 
   hardware:
     name: Host-dependent tests (self-hosted)
@@ -86,7 +152,16 @@ jobs:
           github.event_name == 'push' ||
           (
             github.event_name == 'workflow_dispatch' &&
-            github.actor == 'rrnewton'
+            (
+              github.actor == 'rrnewton' ||
+              (
+                github.actor == 'rrnewton-bots' &&
+                github.triggering_actor == 'rrnewton-bots' &&
+                github.repository == 'rrnewton/reverie' &&
+                github.ref == 'refs/heads/main' &&
+                github.ref_protected == true
+              )
+            )
           ) ||
           (
             github.event_name == 'pull_request' &&
@@ -95,25 +170,89 @@ jobs:
         )
       }}
     runs-on: [self-hosted, Linux, X64, reverie]
+    # AGGRESSIVE 10-minute box on scarce self-hosted hardware. The self-hosted
+    # `reverie` pool is small and shared (observed peak ~4 simultaneous jobs on
+    # one physical host), so a single long job consumes a large fraction of total
+    # capacity for its whole duration; the timeout is RESOURCE PROTECTION, not
+    # merely a hang detector. It is also the enforcement of "short tests only" on
+    # this hardware: the host-dependent test baseline is ~2 minutes, so 10 is
+    # already ~5x headroom, while the job silently wedged at 2h44m (~80x) once and
+    # squatted the runner. A silent hang and a merely-slow job are
+    # indistinguishable without a bound; 10 min converts either into a fast,
+    # definite signal ("re-run on a quiesced runner").
+    #
+    # This 10-minute budget assumes the WARM self-hosted cache (incremental build
+    # + ~2min tests) that is the steady state on a persistent runner. A COLD
+    # DynamoRIO/workspace build can exceed 10 min; per policy that overflow is a
+    # surfaced FINDING, not a reason to pre-emptively raise the bound -- the
+    # informative watchdog below attributes exactly which step overran and for how
+    # long, so a cold-build overflow is diagnosable rather than a bare timeout.
+    timeout-minutes: 10
 
     steps:
+    # PMU-sensitive tests measure hardware counters whose behaviour changes when
+    # the machine is busy: a measurement taken under host contention is INVALID
+    # and must be discarded, not reported (same principle as the nightly stress
+    # harness validity calibrator). Refuse fast and honestly rather than degrade
+    # into a multi-hour hang. Runs first, before build/test, so it reflects
+    # AMBIENT load (neighbour/fleet), not this job's own build parallelism.
+    - name: Host load precondition (PMU measurement validity)
+      env:
+        MAX_LOAD_PER_CORE: ${{ vars.REVERIE_MAX_LOAD_PER_CORE || '1.5' }}
+        SKIP_LOAD_PRECONDITION: ${{ vars.REVERIE_SKIP_LOAD_PRECONDITION }}
+      run: |
+        set -euo pipefail
+        if [ "${SKIP_LOAD_PRECONDITION:-}" = "true" ]; then
+          echo "REVERIE_SKIP_LOAD_PRECONDITION=true -> skipping host-load precondition."
+          exit 0
+        fi
+        read -r load1 _ < /proc/loadavg
+        cores="$(nproc)"
+        limit="$(awk -v c="$cores" -v m="$MAX_LOAD_PER_CORE" 'BEGIN { printf "%.2f", c * m }')"
+        echo "host 1m-load=$load1 cores=$cores max-per-core=$MAX_LOAD_PER_CORE limit=$limit"
+        over="$(awk -v l="$load1" -v lim="$limit" 'BEGIN { print (l > lim) ? 1 : 0 }')"
+        if [ "$over" = "1" ]; then
+          echo "::error title=Host too loaded to measure (not a product failure)::1-minute load average ${load1} exceeds ${limit} (${cores} cores x ${MAX_LOAD_PER_CORE}). PMU/perf-counter determinism tests cannot be measured validly on a contended host, so this run is refused rather than reporting an invalid measurement. This is NOT a Reverie regression. Remedies: re-run on a quiesced host, add a second 'reverie' self-hosted runner (removes the SPOF), raise vars.REVERIE_MAX_LOAD_PER_CORE, or set vars.REVERIE_SKIP_LOAD_PRECONDITION=true to opt out."
+          exit 1
+        fi
+        echo "Host load within budget; proceeding with host-dependent tests."
     - uses: actions/checkout@v4
       with:
         submodules: false
-    - name: Activate DynamoRIO backend source
-      env:
-        GIT_CONFIG_COUNT: "1"
-        GIT_CONFIG_KEY_0: safe.directory
-        GIT_CONFIG_VALUE_0: ${{ github.workspace }}
-      run: scripts/backend-submodule.sh activate dynamorio
     - name: Dependencies
       run: |
-        if command -v apt-get >/dev/null; then
-          sudo apt-get install -y libunwind-dev liblzma-dev cmake zlib1g-dev
-        else
+        # Detect the native package manager dnf-FIRST: the Fedora self-hosted
+        # runners also have apt-get on PATH, but its repos lack cmake/zlib1g-dev,
+        # so keying on `command -v apt-get` took the apt branch and failed with
+        # "Unable to locate package cmake" (exit 100). dnf-first routes each
+        # distro to its own manager.
+        if command -v dnf >/dev/null; then
           sudo dnf install -y libunwind-devel xz-devel cmake zlib-devel
+        elif command -v apt-get >/dev/null; then
+          sudo apt-get install -y libunwind-dev liblzma-dev cmake zlib1g-dev
         fi
     - name: Rust toolchain
       uses: dtolnay/rust-toolchain@nightly
     - name: Host-dependent workspace tests
-      run: cargo test --workspace --all-features -- --test-threads=1
+      env:
+        REVERIE_REQUIRE_KVM: "1"
+      run: |
+        # Informative timeout: this step is the known wedge site (the 2h44m hang
+        # lived here). The job is hard-boxed at timeout-minutes:10, but a bare
+        # GitHub job timeout says only "job cancelled" -- not which step, for how
+        # long, or whether it was a genuine hang vs host-load starvation. Launch a
+        # background watchdog that, ~1-2 min before the hard box, prints this step
+        # + elapsed + two live thread/wchan snapshots of the test tree. It never
+        # fails the build (timeout-minutes stays the enforcement); on the green
+        # path the test finishes first and the watchdog is killed mid-sleep,
+        # costing nothing.
+        scripts/ci-timeout-watchdog.sh \
+          --step "Host-dependent workspace tests" \
+          --soft-deadline 300 --hard-box 540 &
+        watchdog=$!
+        set +e
+        cargo test --workspace --all-features -- --test-threads=1
+        status=$?
+        kill "$watchdog" 2>/dev/null || true
+        wait "$watchdog" 2>/dev/null || true
+        exit "$status"

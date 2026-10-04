@@ -1,0 +1,37 @@
+[package]
+name = "reverie-sabre-strace"
+description = "Strace tool for the experimental Reverie SaBRe instrumentation backend."
+version = "0.4.0"
+authors = ["Meta Platforms"]
+edition = "2021"
+repository = "https://github.com/facebookexperimental/reverie"
+license = "BSD-2-Clause"
+
+[lib]
+name = "reverie_sabre_strace_plugin"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "reverie-sabre-strace"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.75"
+clap = { version = "4.6.2", features = ["derive", "env"] }
+libc = "0.2.139"
+nostd-print = { version = "0.4.0", path = "../nostd-print" }
+reverie = { version = "0.4.0", path = "../../reverie", package = "reverie-core" }
+reverie-host = { version = "0.4.0", path = "../reverie-host" }
+reverie-kvm = { version = "0.4.0", path = "../../reverie-kvm" }
+reverie-ptrace = { version = "0.4.0", path = "../../reverie-ptrace" }
+reverie-process = { version = "0.4.0", path = "../../reverie-process" }
+reverie-rpc-transport = { version = "0.4.0", path = "../../reverie-rpc-transport" }
+reverie-sabre = { version = "0.4.0", path = "../reverie-sabre" }
+reverie-syscalls = { version = "0.4.0", path = "../../reverie-syscalls" }
+reverie-util = { version = "0.4.0", path = "../../reverie-util" }
+serde = { version = "1.0.188", features = ["derive"] }
+serde_json = "1.0.140"
+syscalls = { version = "0.6.7", features = ["serde"] }
+tempfile = "3.27.0"
+tokio = { version = "1.37.0", features = ["rt", "macros"] }
+tracing = "0.1.41"

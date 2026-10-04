@@ -188,6 +188,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_open() {
+        if crate::test_runs_in_own_process() {
+            return;
+        }
         let pty = Pty::open().unwrap();
 
         let child1 = pty.child().unwrap();

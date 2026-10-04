@@ -276,10 +276,6 @@ mod test {
     /// Here we break in the libc `uname` function (called by the `uname`
     /// coreutil), `finish` back out to its caller, and then `continue` to exit.
     /// The session must complete cleanly and still produce the expected output.
-    ///
-    /// Excluded from the fbcode build: spawning the tracee needs a mount that
-    /// the internal test sandbox denies (EPERM). Still runs in upstream CI.
-    #[cfg(not(fbcode_build))]
     #[tokio::test(flavor = "current_thread")]
     async fn debug_uname_finish_then_continue() {
         let session = RemoteGdbSession::new("gdb", "/bin/uname", vec!["-s"]);

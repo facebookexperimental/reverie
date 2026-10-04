@@ -22,7 +22,7 @@ pub(crate) const RETURN_RIP_WORD: usize = 8;
 pub(crate) const RETURN_FLAGS_WORD: usize = 9;
 pub(crate) const SAVED_RBX_WORD: usize = 10;
 const FRAME_WORDS: usize = 11;
-const FRAME_SIZE: usize = WORD_SIZE * FRAME_WORDS;
+pub(crate) const FRAME_SIZE: usize = WORD_SIZE * FRAME_WORDS;
 
 /// A Linux syscall request transported from guest to host memory.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,7 +100,7 @@ impl SyscallRequest {
 
     pub(crate) fn read_from(memory: &GuestMemory, guest_address: u64) -> Result<Self> {
         let mut frame = [0; FRAME_SIZE];
-        memory.read(guest_address, &mut frame)?;
+        memory.read_raw(guest_address, &mut frame)?;
         let mut words = [0; REQUEST_WORDS];
         for (index, value) in words.iter_mut().enumerate() {
             let start = index * WORD_SIZE;
@@ -117,7 +117,7 @@ impl SyscallRequest {
         guest_address: u64,
         result: i64,
     ) -> Result<()> {
-        memory.write(
+        memory.write_raw(
             guest_address + (RESULT_WORD * WORD_SIZE) as u64,
             &result.to_le_bytes(),
         )

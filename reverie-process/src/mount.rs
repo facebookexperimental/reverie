@@ -22,7 +22,6 @@ use syscalls::Errno;
 use super::fd::FileType;
 use super::fd::create_dir_all;
 use super::fd::touch_path;
-use super::util;
 
 /// A mount.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -33,6 +32,19 @@ pub struct Mount {
     flags: MountFlags,
     data: Option<CString>,
     touch_target: bool,
+    allow_readonly_fallback: bool,
+    /// A path, fstype or data string that could not be represented as a C
+    /// string, recorded at BUILD time and reported at [`Mount::mount`] time.
+    ///
+    /// ⚠️ WHY A FLAG AND NOT A `Result` FROM THE BUILDER. `mount()` runs AFTER
+    /// FORK, where this module documents that it cannot allocate -- so the
+    /// failure cannot be discovered or described there. And making the builder
+    /// fallible would change `Mount::new(..) -> Self` into
+    /// `-> Result<Self, _>` for every caller, including hermit, to report a
+    /// condition none of them can do anything about except refuse the mount.
+    /// Recording one bool costs nothing after fork and turns a panic into the
+    /// `Errno` the caller already handles.
+    unrepresentable: bool,
 }
 
 /// Represents a bind mount. Can be converted into a [`Mount`].
@@ -47,16 +59,39 @@ pub struct Bind {
     pub target: CString,
 }
 
+/// `util::to_cstring` panics on an interior NUL. Every mount path, source,
+/// fstype and data string went through it, so a recoverable "this is not a
+/// valid C string" was a panic inside the builder. Measured on reverie main
+/// 200439dc8de9:
+///
+/// ```text
+/// Mount::new(OsStr::from_bytes(b"/test/work\0dir"))
+///   panicked at reverie-process/src/util.rs:17:41:
+///   called `Result::unwrap()` on an `Err` value: NulError(10, [...])
+/// ```
+///
+/// This returns the empty string on failure and says so, letting the caller
+/// record it and refuse the mount instead of aborting the process.
+fn checked_cstring<S: AsRef<OsStr>>(s: S) -> (CString, bool) {
+    match CString::new(s.as_ref().as_bytes()) {
+        Ok(c) => (c, true),
+        Err(_) => (CString::default(), false),
+    }
+}
+
 impl Mount {
     /// Creates a new mount at the path `target`.
     pub fn new<S: AsRef<OsStr>>(target: S) -> Self {
+        let (t, ok) = checked_cstring(target);
         Self {
+            unrepresentable: !ok,
             source: None,
-            target: util::to_cstring(target),
+            target: t,
             fstype: None,
             flags: MountFlags::empty(),
             data: None,
             touch_target: false,
+            allow_readonly_fallback: false,
         }
     }
 
@@ -162,7 +197,9 @@ impl Mount {
 
     /// Sets the mount point target.
     pub fn target<S: AsRef<OsStr>>(mut self, target: S) -> Self {
-        self.target = util::to_cstring(target);
+        let (t, ok) = checked_cstring(target);
+        self.target = t;
+        self.unrepresentable |= !ok;
         self
     }
 
@@ -173,7 +210,9 @@ impl Mount {
 
     /// Sets the source of the mount.
     pub fn source<S: AsRef<OsStr>>(mut self, path: S) -> Self {
-        self.source = Some(util::to_cstring(path));
+        let (v, ok) = checked_cstring(path);
+        self.source = Some(v);
+        self.unrepresentable |= !ok;
         self
     }
 
@@ -200,6 +239,17 @@ impl Mount {
     /// Make the file system read-only.
     pub fn readonly(mut self) -> Self {
         self.flags |= MountFlags::MS_RDONLY;
+        self
+    }
+
+    // TODO-HUMAN-REVIEW(PR-615)
+    /// Allows a new writable proc mount that fails with `EPERM` to retry read-only.
+    ///
+    /// This explicitly permits the resulting mount to be less capable than
+    /// requested. It has no effect on non-proc or already-read-only mounts,
+    /// remounts, bind mounts, moves, or propagation changes.
+    pub fn allow_readonly_fallback(mut self) -> Self {
+        self.allow_readonly_fallback = true;
         self
     }
 
@@ -241,13 +291,17 @@ impl Mount {
 
     /// Sets the filesystem type.
     pub fn fstype<S: AsRef<OsStr>>(mut self, fstype: S) -> Self {
-        self.fstype = Some(util::to_cstring(fstype));
+        let (v, ok) = checked_cstring(fstype);
+        self.fstype = Some(v);
+        self.unrepresentable |= !ok;
         self
     }
 
     /// Sets any additional data required by the mount.
     pub fn data<S: AsRef<OsStr>>(mut self, data: S) -> Self {
-        self.data = Some(util::to_cstring(data));
+        let (v, ok) = checked_cstring(data);
+        self.data = Some(v);
+        self.unrepresentable |= !ok;
         self
     }
 
@@ -275,7 +329,109 @@ impl Mount {
     /// NOTE: This function *must* not allocate since it is called after `fork`
     /// (or `clone`) and before `execve`. Any allocations could cause deadlocks
     /// (which are hard to track down).
+    /// The flags the kernel will not let a read-only bind remount drop, read back
+    /// from the mount that now exists at our target.
+    ///
+    /// ⚠️ WITHOUT THIS, A READ-ONLY BIND OF A `nosuid` OR `nodev` SOURCE FAILS
+    /// WITH EPERM AND THE WHOLE CONTAINER NEVER SPAWNS. Inside a user namespace
+    /// the kernel locks these flags, and `do_remount` refuses any remount that
+    /// would clear one; passing only `MS_RDONLY` asks to clear every other flag
+    /// the source had. Re-supplying them asks for exactly what is already there,
+    /// which is permitted.
+    ///
+    /// Measured 2026-08-27: this cost a whole validate arm. Hermit places its
+    /// frozen `/etc/group` and empty nscd directory in TMPDIR and binds each
+    /// read-only, so a TMPDIR on `/run/user/<uid>` -- `nosuid,nodev` on any
+    /// systemd host -- failed every container spawn. 610 of that arm's 612 e2e
+    /// rows came from this single mount, each one reading as a test result while
+    /// measuring nothing. `nosuid` alone and `nodev` alone were each sufficient.
+    ///
+    /// ⚠️ `statfs` RATHER THAN `/proc/self/mountinfo` BECAUSE THIS RUNS AFTER
+    /// FORK, where the surrounding contract forbids allocation. `statfs` is one
+    /// syscall onto a caller-owned buffer and parses nothing.
+    ///
+    /// ⚠️ AND ONLY THE FLAGS WHOSE `ST_` AND `MS_` VALUES COINCIDE. That is true
+    /// for `NOSUID`, `NODEV`, `NOEXEC`, `NOATIME` and `NODIRATIME`, and FALSE for
+    /// `RELATIME`: `ST_RELATIME` is 0x1000 while `MS_RELATIME` is 0x200000, so
+    /// copying the raw bits across would set `MS_SYNCHRONOUS`-adjacent garbage
+    /// rather than the flag intended. Relatime is therefore left out; the kernel
+    /// keeps the existing atime policy when a remount names none.
+    fn locked_source_flags(&self) -> MountFlags {
+        // SAFETY: `statfs` writes only into `buffer`, and `target_ptr` is a
+        // NUL-terminated C string owned by `self` for the whole call.
+        let mut buffer = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        let flags = unsafe {
+            if libc::statvfs(self.target_ptr(), buffer.as_mut_ptr()) != 0 {
+                // Cannot read the source, so add nothing: the remount then
+                // behaves exactly as it did before this function existed.
+                return MountFlags::empty();
+            }
+            buffer.assume_init().f_flag
+        };
+        let mut preserved = MountFlags::empty();
+        for (probe, flag) in [
+            (libc::ST_NOSUID, MountFlags::MS_NOSUID),
+            (libc::ST_NODEV, MountFlags::MS_NODEV),
+            (libc::ST_NOEXEC, MountFlags::MS_NOEXEC),
+            (libc::ST_NOATIME, MountFlags::MS_NOATIME),
+            (libc::ST_NODIRATIME, MountFlags::MS_NODIRATIME),
+        ] {
+            if flags & probe != 0 {
+                preserved |= flag;
+            }
+        }
+        preserved
+    }
+
+    fn mount_with_flags(&self, flags: MountFlags) -> Result<(), Errno> {
+        // SAFETY: Every non-null pointer comes from a live `CString` owned by
+        // `self`, and `target` is always present. `mount` only borrows these
+        // buffers for the duration of the syscall.
+        Errno::result(unsafe {
+            libc::mount(
+                self.source_ptr(),
+                self.target_ptr(),
+                self.fstype_ptr(),
+                flags.bits(),
+                self.data_ptr(),
+            )
+        })?;
+
+        Ok(())
+    }
+
+    fn readonly_proc_fallback(&self, error: Errno) -> Option<MountFlags> {
+        let is_proc = self
+            .fstype
+            .as_ref()
+            .is_some_and(|fstype| fstype.as_bytes() == b"proc");
+        // These operations ignore the filesystem type, so `proc` does not
+        // identify the filesystem being changed. Only a new mount can retry.
+        let other_operations = MountFlags::MS_REMOUNT
+            | MountFlags::MS_BIND
+            | MountFlags::MS_MOVE
+            | MountFlags::MS_SHARED
+            | MountFlags::MS_PRIVATE
+            | MountFlags::MS_SLAVE
+            | MountFlags::MS_UNBINDABLE;
+        (self.allow_readonly_fallback
+            && error == Errno::EPERM
+            && is_proc
+            && !self.flags.intersects(other_operations)
+            && !self.flags.contains(MountFlags::MS_RDONLY))
+        .then_some(self.flags | MountFlags::MS_RDONLY)
+    }
+
     pub(super) fn mount(&mut self) -> Result<(), Errno> {
+        // ⚠️ REFUSE, DO NOT PANIC. A path/fstype/data string that is not a valid
+        // C string was recorded at build time (see `unrepresentable`). This is
+        // the first point that can report it, and it is a plain flag test
+        // because this runs after fork where allocation is not available.
+        // EINVAL is what the kernel returns for a malformed mount argument, so
+        // the caller's existing error path already knows what to do with it.
+        if self.unrepresentable {
+            return Err(Errno::EINVAL);
+        }
         // NOTE: Although we can't allocate here, we can safely *modify* `self`.
         // When this function is called, we have forked virtual memory and any
         // modifications we make are copy-on-write and lost when `execve` is
@@ -299,15 +455,27 @@ impl Mount {
             }
         }
 
-        Errno::result(unsafe {
-            libc::mount(
-                self.source_ptr(),
-                self.target_ptr(),
-                self.fstype_ptr(),
-                self.flags.bits(),
-                self.data_ptr(),
-            )
-        })?;
+        match self.mount_with_flags(self.flags) {
+            Err(error) => match self.readonly_proc_fallback(error) {
+                Some(flags) => self.mount_with_flags(flags),
+                None => Err(error),
+            },
+            result => result,
+        }?;
+
+        // Linux ignores MS_RDONLY on the initial bind mount. Apply per-mount flags with the
+        // required bind remount so a read-only bind cannot mutate its source inode.
+        if self.flags.contains(MountFlags::MS_BIND) && self.flags.contains(MountFlags::MS_RDONLY) {
+            Errno::result(unsafe {
+                libc::mount(
+                    ptr::null(),
+                    self.target_ptr(),
+                    ptr::null(),
+                    (self.flags | MountFlags::MS_REMOUNT | self.locked_source_flags()).bits(),
+                    ptr::null(),
+                )
+            })?;
+        }
 
         Ok(())
     }
@@ -323,15 +491,24 @@ impl Bind {
         S: AsRef<OsStr>,
         T: AsRef<OsStr>,
     {
+        let (src, src_ok) = checked_cstring(source);
+        let (tgt, tgt_ok) = checked_cstring(target);
+        debug_assert!(
+            src_ok && tgt_ok,
+            "Bind path not representable as a C string; the Mount it converts \
+             into is marked unrepresentable and its mount() will fail EINVAL"
+        );
         Self {
-            source: util::to_cstring(source),
-            target: util::to_cstring(target),
+            source: src,
+            target: tgt,
         }
     }
 }
 
 impl From<Bind> for Mount {
     fn from(b: Bind) -> Self {
+        let src_empty = b.source.as_bytes().is_empty();
+        let tgt_empty = b.target.as_bytes().is_empty();
         Self {
             source: Some(b.source),
             target: b.target,
@@ -339,6 +516,12 @@ impl From<Bind> for Mount {
             flags: MountFlags::MS_BIND,
             data: None,
             touch_target: false,
+            allow_readonly_fallback: false,
+            // A Bind built from a path that was not representable as a C string
+            // holds an EMPTY CString (see `checked_cstring`). Empty source or
+            // target is never a valid bind mount, so it carries the refusal
+            // forward rather than attempting mount(2) with "".
+            unrepresentable: src_empty || tgt_empty,
         }
     }
 }
@@ -347,11 +530,14 @@ impl From<&str> for Bind {
     fn from(s: &str) -> Self {
         if let Some((source, target)) = s.split_once(':') {
             Self {
-                source: util::to_cstring(source),
-                target: util::to_cstring(target),
+                source: checked_cstring(source).0,
+                target: checked_cstring(target).0,
             }
         } else {
-            let source = util::to_cstring(s);
+            // A Rust `&str` may contain an interior NUL, so this path panicked
+            // too. An unrepresentable path becomes empty here and the Mount it
+            // converts into refuses with EINVAL.
+            let source = checked_cstring(s).0;
             let target = source.clone();
             Self { source, target }
         }
@@ -459,6 +645,12 @@ impl FromStr for Mount {
         }
 
         if let Some(propagation) = map.remove("bind-propagation").flatten() {
+            if !is_bind_mount {
+                return Err(MountParseError::Invalid(
+                    "bind-propagation".into(),
+                    Some(propagation.into()),
+                ));
+            }
             let flags = match propagation {
                 "shared" => MountFlags::MS_SHARED,
                 "slave" => MountFlags::MS_SLAVE,
@@ -475,8 +667,9 @@ impl FromStr for Mount {
             };
 
             mount = mount.flags(flags);
-        } else {
-            // All mounts get these flags by default.
+        } else if is_bind_mount {
+            // Bind mounts are private by default. Propagation flags are a
+            // separate mount operation and are invalid on a fresh tmpfs mount.
             mount = mount.flags(MountFlags::MS_REC | MountFlags::MS_PRIVATE);
         }
 
@@ -504,6 +697,76 @@ mod tests {
     }
 
     #[test]
+    fn proc_mount_retries_readonly_only_after_permission_denial() {
+        let proc_mount = Mount::proc();
+        assert_eq!(proc_mount.readonly_proc_fallback(Errno::EPERM), None);
+        assert_eq!(
+            proc_mount
+                .clone()
+                .allow_readonly_fallback()
+                .readonly_proc_fallback(Errno::EPERM),
+            Some(MountFlags::MS_RDONLY)
+        );
+        assert_eq!(
+            proc_mount
+                .clone()
+                .allow_readonly_fallback()
+                .readonly_proc_fallback(Errno::ENOENT),
+            None
+        );
+        assert_eq!(
+            Mount::proc()
+                .readonly()
+                .allow_readonly_fallback()
+                .readonly_proc_fallback(Errno::EPERM),
+            None
+        );
+        assert_eq!(
+            Mount::tmpfs("/tmp")
+                .allow_readonly_fallback()
+                .readonly_proc_fallback(Errno::EPERM),
+            None
+        );
+    }
+
+    #[test]
+    fn proc_mount_readonly_fallback_excludes_other_mount_operations() {
+        let mount = Mount::proc().allow_readonly_fallback();
+        let ordinary_flags = MountFlags::MS_NOSUID | MountFlags::MS_NODEV | MountFlags::MS_NOEXEC;
+        assert_eq!(
+            mount
+                .clone()
+                .flags(ordinary_flags)
+                .readonly_proc_fallback(Errno::EPERM),
+            Some(ordinary_flags | MountFlags::MS_RDONLY)
+        );
+        for flags in [
+            MountFlags::MS_REMOUNT,
+            MountFlags::MS_BIND,
+            MountFlags::MS_MOVE,
+            MountFlags::MS_SHARED,
+            MountFlags::MS_PRIVATE,
+            MountFlags::MS_SLAVE,
+            MountFlags::MS_UNBINDABLE,
+            MountFlags::MS_REMOUNT | MountFlags::MS_BIND,
+            MountFlags::MS_BIND | MountFlags::MS_REC,
+            MountFlags::MS_SHARED | MountFlags::MS_REC,
+            MountFlags::MS_PRIVATE | MountFlags::MS_REC,
+            MountFlags::MS_SLAVE | MountFlags::MS_REC,
+            MountFlags::MS_UNBINDABLE | MountFlags::MS_REC,
+        ] {
+            assert_eq!(
+                mount
+                    .clone()
+                    .flags(flags)
+                    .readonly_proc_fallback(Errno::EPERM),
+                None,
+                "must not retry a non-creation mount operation: {flags:?}"
+            );
+        }
+    }
+
+    #[test]
     fn parse_mount() {
         assert_eq!(
             Mount::from_str("type=bind,source=/foo,target=/bar,readonly"),
@@ -519,7 +782,14 @@ mod tests {
         );
         assert_eq!(
             Mount::from_str("type=tmpfs,target=/tmp"),
-            Ok(Mount::tmpfs("/tmp").rprivate())
+            Ok(Mount::tmpfs("/tmp"))
+        );
+        assert_eq!(
+            Mount::from_str("type=tmpfs,target=/tmp,bind-propagation=rprivate"),
+            Err(MountParseError::Invalid(
+                "bind-propagation".into(),
+                Some("rprivate".into())
+            ))
         );
         assert_eq!(
             Mount::from_str("target=foo, ,,,"),
@@ -553,5 +823,65 @@ mod tests {
             Mount::from(Bind::from("source:target")),
             Mount::bind("source", "target")
         );
+    }
+}
+
+#[cfg(test)]
+mod unrepresentable_paths_are_refused_not_panics {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    use syscalls::Errno;
+
+    use super::Bind;
+    use super::Mount;
+
+    /// ⚠️ THIS PANICKED BEFORE, AND THE PANIC WAS THE WHOLE DEFECT. Every mount
+    /// path went through `util::to_cstring`, which unwraps `CString::new`.
+    /// Measured on reverie main 200439dc8de9:
+    ///   panicked at reverie-process/src/util.rs:17:41:
+    ///   called `Result::unwrap()` on an `Err` value: NulError(10, [...])
+    /// A recoverable "this path is not a valid C string" aborted the process.
+    #[test]
+    fn a_target_with_an_interior_nul_refuses_instead_of_panicking() {
+        let bad = OsStr::from_bytes(b"/test/work\0dir");
+        let mut m = Mount::new(bad);
+        assert_eq!(m.mount(), Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn an_unrepresentable_source_fstype_or_data_also_refuses() {
+        let bad = OsStr::from_bytes(b"bad\0value");
+        for m in [
+            Mount::new("/test").source(bad),
+            Mount::new("/test").fstype(bad),
+            Mount::new("/test").data(bad),
+        ] {
+            let mut m = m;
+            assert_eq!(m.mount(), Err(Errno::EINVAL));
+        }
+    }
+
+    /// ⚠️ THE CONTROL, WITHOUT WHICH THE THREE ABOVE PROVE NOTHING. A refusal
+    /// that fired on every mount would pass them and break every real mount.
+    /// A representable path must NOT be marked unrepresentable -- it must get
+    /// past the flag test and fail (or succeed) on the real syscall instead.
+    #[test]
+    fn a_representable_path_is_not_refused_by_this_check() {
+        let mut m = Mount::new("/test/workdir").fstype("tmpfs");
+        let got = m.mount();
+        assert_ne!(
+            got,
+            Err(Errno::EINVAL),
+            "a valid path must reach mount(2); EINVAL here means the refusal \
+             over-fired and no mount would ever work"
+        );
+    }
+
+    #[test]
+    fn a_bind_from_a_str_with_an_interior_nul_refuses() {
+        let b = Bind::from("/test/a\0b");
+        let mut m: Mount = b.into();
+        assert_eq!(m.mount(), Err(Errno::EINVAL));
     }
 }

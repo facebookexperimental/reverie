@@ -11,7 +11,9 @@
 mod clone;
 
 pub use clone::clone_syscall;
+pub use clone::clone3_fork_syscall;
 pub use clone::clone3_syscall;
+pub use clone::fork_syscall;
 pub use clone::vfork_return_from_child;
 pub use clone::vfork_syscall;
 
@@ -68,6 +70,7 @@ pub type icept_reg_fn = extern "C" fn(*const fn_icept);
 
 unsafe impl Send for fn_icept {}
 unsafe impl Sync for fn_icept {}
+// TODO-HUMAN-REVIEW(PR-242): Review the architectural versus trampoline return slots.
 #[repr(C)]
 pub struct syscall_stackframe {
     pub rbp_stackalign: *mut libc::c_void,
@@ -85,11 +88,22 @@ pub struct syscall_stackframe {
     pub rcx: *mut libc::c_void,
     pub rbx: *mut libc::c_void,
     pub rbp_prologue: *mut libc::c_void,
-    // trampoline
+    /// Original guest RFLAGS, saved separately from the writable r11 register.
+    pub rflags: u64,
+    /// Architectural guest return address after the patched syscall. SaBRe's
+    /// assembly calls this the fake return because the handler discards this
+    /// stack slot before returning through the scratch trampoline.
     pub fake_ret: *mut libc::c_void,
-    /// Syscall return address. This is where execution should continue after a
-    /// syscall has been handled.
+    /// Internal scratch-trampoline continuation. This restores the red zone,
+    /// executes displaced instructions, and then resumes guest code.
     pub ret: *mut libc::c_void,
+}
+
+impl syscall_stackframe {
+    /// The rewrite reserves the x86-64 red zone before pushing its two returns.
+    pub(crate) fn guest_stack_pointer(&self) -> u64 {
+        self as *const Self as u64 + std::mem::size_of::<Self>() as u64 + 0x80
+    }
 }
 
 pub type handle_syscall_fn = extern "C" fn(

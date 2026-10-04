@@ -40,6 +40,8 @@ pub enum PacketParseError {
     EmptyBuf,
     #[error("missing checksum")]
     MissingChecksum,
+    #[error("packet data exceeds the {limit}-byte advertised limit")]
+    PacketTooLarge { limit: usize },
     #[error("mulformed checksum")]
     MalformedChecksum,
     #[error(transparent)]
@@ -65,17 +67,32 @@ pub enum Packet {
     Command(Command),
 }
 
+/// Find the unescaped checksum delimiter, retaining escape state across reads.
+pub(super) fn checksum_delimiter(bytes: &[u8], escaped: &mut bool) -> Option<usize> {
+    bytes.iter().position(|byte| {
+        if *escaped {
+            *escaped = false;
+            false
+        } else if *byte == b'}' {
+            *escaped = true;
+            false
+        } else {
+            *byte == b'#'
+        }
+    })
+}
+
 // Remove leading `$' and trailing `#[xx]`, and validate checksum.
 fn decode_packet(mut bytes: BytesMut) -> Result<BytesMut, PacketParseError> {
-    let end_of_body = bytes
-        .iter()
-        .position(|b| *b == b'#')
-        .ok_or(PacketParseError::MissingChecksum)?;
+    let end_of_body =
+        checksum_delimiter(&bytes, &mut false).ok_or(PacketParseError::MissingChecksum)?;
 
     // Split buffer into body and checksum, note the packet
     // starts with a `$'.
     let (body, checksum) = bytes.split_at_mut(end_of_body);
-    let checksum = &checksum[1..][..2]; // skip the '#'
+    let checksum = checksum
+        .get(1..3) // skip the '#'
+        .ok_or(PacketParseError::MissingChecksum)?;
 
     // Validate checksum without leading `$'.
     let checksum = decode_hex(checksum).map_err(|_| PacketParseError::MalformedChecksum)?;
@@ -122,6 +139,30 @@ impl Packet {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn partial_checksum_is_an_error_instead_of_a_panic() {
+        for partial in [b"$qC#".as_slice(), b"$qC#b".as_slice()] {
+            assert_eq!(
+                decode_packet(BytesMut::from(partial)),
+                Err(PacketParseError::MissingChecksum)
+            );
+        }
+    }
+
+    #[test]
+    fn escaped_checksum_marker_is_packet_data() {
+        for (frame, body) in [
+            (b"$X1,1:}##c0".as_slice(), b"X1,1:}#".as_slice()),
+            (b"$X1,1:}]#fa".as_slice(), b"X1,1:}]".as_slice()),
+            (b"$X1,1:}}#1a".as_slice(), b"X1,1:}}".as_slice()),
+        ] {
+            assert_eq!(
+                decode_packet(BytesMut::from(frame)),
+                Ok(BytesMut::from(body))
+            );
+        }
+    }
 
     #[test]
     fn can_decode_packet() {

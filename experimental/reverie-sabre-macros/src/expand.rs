@@ -127,6 +127,19 @@ impl ToTokens for Tool {
         // Implement the entry point for our plugin.
         tokens.extend(quote! {
             #[no_mangle]
+            pub unsafe extern "C" fn reverie_sabre_install_loader_bootstrap_v1(
+                callback: ::reverie_sabre::bootstrap::TakeStateFn,
+            ) -> i32 {
+                if !<#ty as ::reverie_sabre::Tool>::supports_loader_bootstrap() {
+                    return -libc::ENOTSUP;
+                }
+                match unsafe { ::reverie_sabre::bootstrap::install(callback) } {
+                    Ok(()) => 0,
+                    Err(error) => -error.into_raw(),
+                }
+            }
+
+            #[no_mangle]
             pub extern "C" fn sbr_init(
                 argc: *mut i32,
                 argv: *mut *mut *mut libc::c_char,

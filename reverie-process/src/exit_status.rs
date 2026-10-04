@@ -215,6 +215,9 @@ mod tests_non_sanitized {
 
     #[test]
     fn normal_exit() {
+        if crate::test_runs_in_own_process() {
+            return;
+        }
         assert_eq!(
             run_forked(|| { unsafe { libc::_exit(0) } }),
             Ok(ExitStatus::Exited(0))
@@ -246,6 +249,9 @@ mod tests_non_sanitized {
 
     #[test]
     fn exit_by_signal() {
+        if crate::test_runs_in_own_process() {
+            return;
+        }
         assert_eq!(
             run_forked(|| {
                 signal::raise(Signal::SIGALRM)?;
@@ -265,6 +271,9 @@ mod tests_non_sanitized {
 
     #[test]
     fn propagate_exit() {
+        if crate::test_runs_in_own_process() {
+            return;
+        }
         // NOTE: These tests fail under a sanitized build. ASAN leak detection
         // must be disabled for this to run correctly. To disable ASAN leak
         // detection, set the `ASAN_OPTIONS=detect_leaks=0` environment variable
@@ -284,6 +293,9 @@ mod tests_non_sanitized {
 
     #[test]
     fn propagate_signal() {
+        if crate::test_runs_in_own_process() {
+            return;
+        }
         assert_eq!(
             run_forked(|| { ExitStatus::Signaled(Signal::SIGILL, true).raise_or_exit() }),
             Ok(ExitStatus::Signaled(Signal::SIGILL, true))

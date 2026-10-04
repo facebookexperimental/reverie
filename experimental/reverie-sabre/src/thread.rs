@@ -611,6 +611,8 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc;
+    use std::thread;
     use std::thread::spawn;
 
     use super::*;
@@ -648,6 +650,47 @@ mod tests {
 
     fn current_test_thread() -> Option<Thread<TestEventSink>> {
         Thread::<TestEventSink>::current()
+    }
+
+    #[test]
+    fn process_fork_does_not_copy_locked_slot_map() {
+        run_test_in_new_thread(|| {
+            let (locked_tx, locked_rx) = mpsc::sync_channel(0);
+            let (release_tx, release_rx) = mpsc::sync_channel(0);
+            let locker = spawn(move || {
+                let _guard = SLOT_MAP.lock_entries_for_test();
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            locked_rx.recv().unwrap();
+
+            let release = spawn(move || {
+                thread::sleep(Duration::from_millis(25));
+                release_tx.send(()).unwrap();
+            });
+            let guard = crate::slot_map::lock_for_fork();
+            let child = unsafe { libc::fork() };
+            assert!(child >= 0);
+            if child == 0 {
+                // Raw SaBRe process-clone trampolines jump directly back to
+                // guest code, so their copied Rust guard never runs. Reproduce
+                // that path and require the child callback to release the lock
+                // before the child registers thread state.
+                mem::forget(guard);
+                unsafe { crate::slot_map::unlock_after_fork_child() };
+                unsafe { libc::alarm(5) };
+                let registered = generate_thread_and_slot_key().is_some();
+                unsafe { libc::_exit(if registered { 0 } else { 1 }) };
+            }
+
+            drop(guard);
+            release.join().unwrap();
+            locker.join().unwrap();
+            let mut status = 0;
+            assert_eq!(child, unsafe { libc::waitpid(child, &mut status, 0) });
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+        });
     }
 
     pub fn run_test_in_new_thread<T>(t: T)

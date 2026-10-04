@@ -10,11 +10,14 @@
 //!
 //! These are deliberately trivial: they exercise the [`crate::KvmBackend`]
 //! `run_with_tool` path end to end without needing a Linux execution runtime.
-//! [`StraceTool`] is an strace-style observer that records each intercepted
-//! syscall's name and then forwards it (via `tail_inject`) to the backend's
-//! `SyscallExecutor`, exactly as the default [`reverie::Tool`] handler would.
+//! [`StraceTool`] is an strace-style observer that, for each intercepted
+//! syscall, records both its name and its *fully decoded* rendering (arguments
+//! dereferenced from guest memory) and then forwards it to the backend's
+//! `SyscallExecutor`, exactly as the ptrace `Strace` example tool does.
 
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use reverie::ExitStatus;
 use reverie::GlobalRPC;
@@ -22,20 +25,57 @@ use reverie::GlobalTool;
 use reverie::Guest;
 use reverie::Pid;
 use reverie::Tool;
+use reverie::syscalls::Displayable;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 
-/// Global state for [`StraceTool`]: the ordered list of intercepted syscall
-/// names, aggregated from every guest thread through Reverie's global RPC.
+/// One intercepted syscall recorded by [`StraceTool`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StraceEntry {
+    /// The bare syscall mnemonic, for example `"write"`.
+    pub name: String,
+    /// The fully decoded syscall rendering, with typed arguments and pointers
+    /// resolved against guest memory, for example `write(1, 0x3000, 5)` or
+    /// `mmap(NULL, 0, ProtFlags(0x0), MapFlags(0x0), 0, 0)`. This has the same
+    /// fidelity as the ptrace `Strace` example tool's
+    /// `Displayable::display_with_outputs`, rather than the raw, undecoded
+    /// argument words the `Debug` form prints.
+    pub formatted: String,
+}
+
+/// Global state for [`StraceTool`]: the ordered list of intercepted syscalls,
+/// aggregated from every guest thread through Reverie's global RPC.
 #[derive(Default)]
 pub struct StraceLog {
-    syscalls: Mutex<Vec<String>>,
+    entries: Mutex<Vec<StraceEntry>>,
 }
 
 impl StraceLog {
     /// Returns the syscall names recorded so far, in interception order.
     pub fn syscalls(&self) -> Vec<String> {
-        self.syscalls
+        self.entries
+            .lock()
+            .expect("strace log lock poisoned")
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect()
+    }
+
+    /// Returns the fully decoded syscall renderings (name + real, dereferenced
+    /// arguments) recorded so far, in interception order.
+    pub fn formatted(&self) -> Vec<String> {
+        self.entries
+            .lock()
+            .expect("strace log lock poisoned")
+            .iter()
+            .map(|entry| entry.formatted.clone())
+            .collect()
+    }
+
+    /// Returns the recorded entries (name + decoded rendering), in interception
+    /// order.
+    pub fn entries(&self) -> Vec<StraceEntry> {
+        self.entries
             .lock()
             .expect("strace log lock poisoned")
             .clone()
@@ -44,25 +84,29 @@ impl StraceLog {
 
 #[reverie::global_tool]
 impl GlobalTool for StraceLog {
-    type Request = String;
+    // `(name, formatted rendering)`. A tuple of `String`s already satisfies
+    // `Serialize + DeserializeOwned`, so the RPC transport needs no extra
+    // dependency (the generated manifests stay untouched).
+    type Request = (String, String);
     type Response = ();
     type Config = ();
 
-    async fn receive_rpc(&self, _from: Pid, name: String) {
-        self.syscalls
+    async fn receive_rpc(&self, _from: Pid, (name, formatted): (String, String)) {
+        self.entries
             .lock()
             .expect("strace log lock poisoned")
-            .push(name);
+            .push(StraceEntry { name, formatted });
     }
 }
 
-/// An strace-like Reverie tool: on every subscribed syscall it prints the
-/// syscall (name + decoded arguments) to stderr, records the name in
-/// [`StraceLog`], then tail-injects the syscall so the backend executor still
-/// performs it. Running this through [`crate::KvmBackend::run_with_tool`] proves
-/// the KVM `Guest`/`Tool` interface works: interception, typed decoding, global
-/// RPC, and injection all flow through the same Reverie contracts the ptrace
-/// backend uses.
+/// An strace-like Reverie tool: on every subscribed syscall it renders the
+/// syscall with its decoded arguments (dereferenced from guest memory), prints
+/// it to stderr, records it in [`StraceLog`], and injects the syscall so the
+/// backend executor still performs it. Running this through
+/// [`crate::KvmBackend::run_with_tool`] proves the KVM `Guest`/`Tool` interface
+/// works: interception, typed decoding, argument dereferencing, global RPC, and
+/// injection all flow through the same Reverie contracts the ptrace backend
+/// uses.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StraceTool;
 
@@ -76,16 +120,96 @@ impl Tool for StraceTool {
         guest: &mut G,
         syscall: Syscall,
     ) -> Result<i64, reverie::Error> {
-        // `SyscallInfo::name` is the bare mnemonic recorded for assertions;
-        // the Debug form additionally shows the decoded, typed arguments.
-        // (`Syscall` has no bare `Display`; its pretty printer needs guest
-        // memory to render pointers, which strace-lite does not require.)
-        let name = syscall.name();
-        eprintln!("[kvm-strace] {name} {syscall:?}");
-        guest.send_rpc(name.to_owned()).await;
-        // Forward to the backend `SyscallExecutor`, matching the default
-        // `Tool::handle_syscall_event` behavior. `tail_inject` returns `Never`,
-        // which coerces to the declared return type.
+        let name = syscall.name().to_owned();
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-156): Review non-returning KVM strace injection.
+        if matches!(syscall, Syscall::Exit(_) | Syscall::ExitGroup(_)) {
+            let formatted = format!("{}", syscall.display_with_outputs(&guest.memory()));
+            eprintln!("[kvm-strace] {formatted} = ?");
+            guest.send_rpc((name, formatted)).await;
+            guest.tail_inject(syscall).await
+        }
+        // Execute the syscall through the backend `SyscallExecutor` first (like
+        // the ptrace `Strace` tool's `inject`), so output buffers are populated
+        // before rendering. Then record the *fully decoded* syscall — arguments
+        // dereferenced from guest memory via `display_with_outputs` — rather
+        // than the `Debug` form, which prints only the raw, undecoded argument
+        // words and made KVM strace appear to have "zeroed" arguments. This
+        // gives KVM strace the same real-argument fidelity as the ptrace and
+        // SaBRe backends.
+        let result = guest.inject(syscall).await;
+        let formatted = format!("{}", syscall.display_with_outputs(&guest.memory()));
+        eprintln!(
+            "[kvm-strace] {formatted} = {}",
+            result.unwrap_or_else(|errno| -(errno.into_raw() as i64)),
+        );
+        guest.send_rpc((name, formatted)).await;
+        Ok(result?)
+    }
+
+    async fn on_exit_thread<G: GlobalRPC<Self::GlobalState>>(
+        &self,
+        _tid: Pid,
+        _global: &G,
+        _thread_state: Self::ThreadState,
+        _status: ExitStatus,
+    ) -> Result<(), reverie::Error> {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Syscall counters, ported from reverie-examples/counter1.rs and counter2.rs to
+// the KVM backend. They exercise the same Reverie contracts StraceTool does
+// (interception, global RPC, tail_inject, and — for the hierarchical variant —
+// per-thread ThreadState plus on_exit aggregation), proving these standard
+// example Tools run unmodified over `KvmGuest`.
+// ---------------------------------------------------------------------------
+
+/// Global state for [`CounterTool`]: one running total of intercepted syscalls,
+/// aggregated from every guest thread through Reverie's global RPC. This is the
+/// KVM port of `reverie-examples/counter1.rs`.
+#[derive(Default)]
+pub struct SyscallCounter {
+    total: AtomicU64,
+}
+
+impl SyscallCounter {
+    /// Total number of syscalls counted so far.
+    pub fn total(&self) -> u64 {
+        self.total.load(Ordering::SeqCst)
+    }
+}
+
+#[reverie::global_tool]
+impl GlobalTool for SyscallCounter {
+    // Each RPC is one intercepted syscall; the unit payload avoids pulling a
+    // serde-derive dependency into reverie-kvm (cf. StraceLog's `String`).
+    type Request = ();
+    type Response = ();
+    type Config = ();
+
+    async fn receive_rpc(&self, _from: Pid, _msg: ()) {
+        self.total.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// counter1 ported to KVM: on every subscribed syscall, RPC-increment the global
+/// total, then tail-inject so the backend executor still performs the syscall.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CounterTool;
+
+#[reverie::tool]
+impl Tool for CounterTool {
+    type GlobalState = SyscallCounter;
+    type ThreadState = ();
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, reverie::Error> {
+        guest.send_rpc(()).await;
         guest.tail_inject(syscall).await
     }
 
@@ -96,6 +220,103 @@ impl Tool for StraceTool {
         _thread_state: Self::ThreadState,
         _status: ExitStatus,
     ) -> Result<(), reverie::Error> {
+        Ok(())
+    }
+}
+
+/// Aggregated global state for [`HierarchicalCounterTool`], the KVM port of
+/// `reverie-examples/counter2.rs`: a process-tree total plus process and thread
+/// tallies, contributed once per process at exit.
+#[derive(Default)]
+pub struct HierarchicalCounter {
+    inner: Mutex<HierarchicalTotals>,
+}
+
+/// The counts exposed by [`HierarchicalCounter`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HierarchicalTotals {
+    pub total_syscalls: u64,
+    pub exited_procs: u64,
+    pub exited_threads: u64,
+}
+
+impl HierarchicalCounter {
+    /// Snapshot of the aggregated totals.
+    pub fn totals(&self) -> HierarchicalTotals {
+        *self.inner.lock().expect("counter global lock poisoned")
+    }
+}
+
+#[reverie::global_tool]
+impl GlobalTool for HierarchicalCounter {
+    /// One contribution per process at exit: (syscalls, threads). A plain tuple
+    /// satisfies the Serialize/DeserializeOwned bound without a serde derive.
+    type Request = (u64, u64);
+    type Response = ();
+    type Config = ();
+
+    async fn receive_rpc(&self, _from: Pid, (n, t): (u64, u64)) {
+        let mut g = self.inner.lock().expect("counter global lock poisoned");
+        g.total_syscalls += n;
+        g.exited_threads += t;
+        g.exited_procs += 1;
+    }
+}
+
+/// counter2 ported to KVM: each thread tallies its own syscalls in per-thread
+/// `ThreadState`; on thread exit that tally rolls up to the process; on process
+/// exit the process total is RPC'd once to the global aggregator.
+#[derive(Debug, Default)]
+pub struct HierarchicalCounterTool {
+    proc_syscalls: AtomicU64,
+    exited_threads: AtomicU64,
+}
+
+impl Clone for HierarchicalCounterTool {
+    fn clone(&self) -> Self {
+        HierarchicalCounterTool {
+            proc_syscalls: AtomicU64::new(self.proc_syscalls.load(Ordering::SeqCst)),
+            exited_threads: AtomicU64::new(self.exited_threads.load(Ordering::SeqCst)),
+        }
+    }
+}
+
+#[reverie::tool]
+impl Tool for HierarchicalCounterTool {
+    type GlobalState = HierarchicalCounter;
+    /// Per-thread syscall tally.
+    type ThreadState = u64;
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, reverie::Error> {
+        *guest.thread_state_mut() += 1;
+        guest.tail_inject(syscall).await
+    }
+
+    async fn on_exit_thread<G: GlobalRPC<Self::GlobalState>>(
+        &self,
+        _tid: Pid,
+        _global: &G,
+        thread_state: Self::ThreadState,
+        _status: ExitStatus,
+    ) -> Result<(), reverie::Error> {
+        self.proc_syscalls.fetch_add(thread_state, Ordering::SeqCst);
+        self.exited_threads.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn on_exit_process<G: GlobalRPC<Self::GlobalState>>(
+        self,
+        _pid: Pid,
+        global: &G,
+        _status: ExitStatus,
+    ) -> Result<(), reverie::Error> {
+        let count = self.proc_syscalls.load(Ordering::SeqCst);
+        let threads = self.exited_threads.load(Ordering::SeqCst);
+        let _ = global.send_rpc((count, threads)).await;
         Ok(())
     }
 }

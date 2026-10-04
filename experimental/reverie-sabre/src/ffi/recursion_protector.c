@@ -5,8 +5,6 @@
  *  SPDX-License-Identifier: MIT
  */
 
-// @lint-ignore-every LICENSELINT vendored SaBRe file; keep upstream MIT header
-
 #include <stdbool.h>
 
 // Sanitizers intercept various function calls, look here:
@@ -20,7 +18,7 @@
 // be called during pthread initialization which will happen before the
 // sanitizers initialization phase.
 // TODO(andronat): Will the following create any issues with other libraries?
-// e.g. overlapping offsets and thus writing/reading from wrong variables?
+// e.g. overlapping offsets and thus writting/reading from wrong variables?
 static _Thread_local bool from_plugin
     __attribute__((tls_model("initial-exec"))) = false;
 

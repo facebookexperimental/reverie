@@ -6,10 +6,90 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicU32;
+use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::Ordering::AcqRel;
+use core::sync::atomic::Ordering::Acquire;
+use core::sync::atomic::Ordering::Release;
 use core::sync::atomic::Ordering::SeqCst;
 use std::sync::Arc;
 use std::sync::RwLock;
+
+// Every SlotMap access increments the reader count. A process-forming clone
+// sets the high bit and waits for the count to reach zero, which proves that
+// none of the per-map locks is held when the kernel copies them into the child.
+// These atomics deliberately avoid a host lock: the child has to release the
+// copied state before it can use runtime services after a raw clone.
+const SLOT_MAP_FORK_BIT: usize = 1 << (usize::BITS - 1);
+static SLOT_MAP_ACCESS: AtomicUsize = AtomicUsize::new(0);
+static SLOT_MAP_FORK_OWNER: AtomicBool = AtomicBool::new(false);
+
+struct SlotMapAccessGuard;
+
+impl Drop for SlotMapAccessGuard {
+    fn drop(&mut self) {
+        let previous = SLOT_MAP_ACCESS.fetch_sub(1, Release);
+        debug_assert_ne!(previous & !SLOT_MAP_FORK_BIT, 0);
+    }
+}
+
+fn lock_for_access() -> SlotMapAccessGuard {
+    loop {
+        let state = SLOT_MAP_ACCESS.load(Acquire);
+        if state & SLOT_MAP_FORK_BIT != 0 {
+            core::hint::spin_loop();
+            continue;
+        }
+        assert_ne!(
+            state,
+            SLOT_MAP_FORK_BIT - 1,
+            "slot map reader count overflow"
+        );
+        if SLOT_MAP_ACCESS
+            .compare_exchange_weak(state, state + 1, Acquire, Acquire)
+            .is_ok()
+        {
+            return SlotMapAccessGuard;
+        }
+    }
+}
+
+pub(crate) struct SlotMapForkGuard;
+
+impl Drop for SlotMapForkGuard {
+    fn drop(&mut self) {
+        SLOT_MAP_ACCESS.store(0, Release);
+        SLOT_MAP_FORK_OWNER.store(false, Release);
+    }
+}
+
+pub(crate) fn lock_for_fork() -> SlotMapForkGuard {
+    while SLOT_MAP_FORK_OWNER
+        .compare_exchange_weak(false, true, Acquire, Acquire)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    let previous = SLOT_MAP_ACCESS.fetch_or(SLOT_MAP_FORK_BIT, AcqRel);
+    debug_assert_eq!(previous & SLOT_MAP_FORK_BIT, 0);
+    while SLOT_MAP_ACCESS.load(Acquire) != SLOT_MAP_FORK_BIT {
+        core::hint::spin_loop();
+    }
+    SlotMapForkGuard
+}
+
+/// Release the write lock copied into a process created by a raw clone.
+///
+/// # Safety
+///
+/// The caller must establish that this process inherited the lock while it
+/// was held by the thread that created the process, and that the copied guard
+/// cannot subsequently be dropped in this process.
+pub(crate) unsafe fn unlock_after_fork_child() {
+    SLOT_MAP_ACCESS.store(0, Release);
+    SLOT_MAP_FORK_OWNER.store(false, Release);
+}
 
 /// This is the key for addressing specific values from the slot map.
 #[repr(transparent)]
@@ -43,6 +123,13 @@ pub struct SlotMap<T> {
     disallowed_partition_value: AtomicU32,
 }
 
+#[cfg(test)]
+pub(crate) struct SlotMapEntriesGuard<'a, T> {
+    // Drop the per-map lock before decrementing the global reader count.
+    _entries: std::sync::RwLockWriteGuard<'a, Vec<Arc<T>>>,
+    _access: SlotMapAccessGuard,
+}
+
 impl<T: 'static> SlotMap<T> {
     pub fn new() -> Self {
         Self {
@@ -54,6 +141,7 @@ impl<T: 'static> SlotMap<T> {
     pub fn stop_inserts_for_partition(&self, partition: u32) -> bool {
         // Serialize with insertion so a successful insert cannot linearize
         // after this method returns.
+        let _access = lock_for_access();
         let _entries = self.entries.write().unwrap_or_else(|err| err.into_inner());
         self.disallowed_partition_value.swap(partition, SeqCst) != partition
     }
@@ -76,6 +164,7 @@ impl<T: 'static> SlotMap<T> {
             return Err(InsertError::InsertsDisallowedBeforeInsert);
         }
 
+        let _access = lock_for_access();
         let mut entries = self.entries.write().unwrap_or_else(|err| err.into_inner());
         if partition.is_some_and(|p| !self.inserts_allowed_for_partition(p)) {
             return Err(InsertError::InsertsDisallowedDuringInsert);
@@ -87,6 +176,7 @@ impl<T: 'static> SlotMap<T> {
     }
 
     pub fn get(&self, key: SlotKey) -> Option<Arc<T>> {
+        let _access = lock_for_access();
         self.entries
             .read()
             .unwrap_or_else(|err| err.into_inner())
@@ -95,6 +185,7 @@ impl<T: 'static> SlotMap<T> {
     }
 
     pub fn entries(&self) -> impl Iterator<Item = (SlotKey, Arc<T>)> {
+        let _access = lock_for_access();
         self.entries
             .read()
             .unwrap_or_else(|err| err.into_inner())
@@ -113,11 +204,22 @@ impl<T: 'static> SlotMap<T> {
 
     #[cfg(test)]
     pub fn clear(&self) {
+        let _access = lock_for_access();
         self.entries
             .write()
             .unwrap_or_else(|err| err.into_inner())
             .clear();
         self.disallowed_partition_value.store(u32::MAX, SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lock_entries_for_test(&self) -> SlotMapEntriesGuard<'_, T> {
+        let access = lock_for_access();
+        let entries = self.entries.write().unwrap_or_else(|err| err.into_inner());
+        SlotMapEntriesGuard {
+            _entries: entries,
+            _access: access,
+        }
     }
 }
 

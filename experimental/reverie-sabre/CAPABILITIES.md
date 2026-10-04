@@ -1,8 +1,8 @@
 # reverie-sabre capabilities
 
-Status as of 2026-07-21: experimental Linux x86-64 backend. The restored
+Status as of 2026-07-26: experimental Linux x86-64 loader adapter. The restored
 runtime can run dynamically linked programs under the pinned SaBRe loader and
-the riptrace demo, but it is not a drop-in replacement for
+shared example tools, but it is not a drop-in replacement for
 `reverie-ptrace`.
 
 ## Supported runtime behavior
@@ -10,14 +10,16 @@ the riptrace demo, but it is not a drop-in replacement for
 | Area | Current behavior |
 | --- | --- |
 | Syscalls | Intercepts rewritten syscall instructions and invokes the synchronous in-process `Tool::syscall` callback. The default implementation performs the real syscall. |
-| Guest memory | Exposes direct local-process memory through `LocalMemory`; there is no remote memory or register API. |
+| Guest memory | Uses `SabreMemory` with kernel-validated `process_vm_readv` and `process_vm_writev` access to the current guest process. Invalid pointers report `EFAULT` instead of faulting the plugin. |
+| Shared-tool guest context | The `ReverieAdapter` exposes the live SaBRe syscall frame through `Guest::regs`, supports writes to saved GPRs and the return IP through `Guest::set_regs`, and returns the current guest IP from `Guest::backtrace`. The fixed trampoline stack pointer, syscall number/result registers, flags, and segment state are read-only. |
+| Shared-tool event selection | Both local and remote `ReverieAdapter` paths bypass `Tool::handle_syscall_event` for syscalls excluded by `Tool::subscriptions`. The SaBRe loader still rewrites and enters the plugin for those syscalls. |
 | Threads | Creates backend records lazily when an intercepted thread is first observed. Start and exit callbacks are emitted at most once for a tracked thread. Repeated pthread create/return/join waves are covered by the conformance gate. |
-| Process exit | `exit_group` requests orderly exit from tracked threads, then issues a real kernel `exit_group` so threads that never reached an interception boundary cannot survive. Configurable timeout handling is supported. |
+| Process exit | `exit_group` requests orderly exit from tracked threads, delivers one process-exit callback, then issues a real kernel `exit_group` so threads that never reached an interception boundary cannot survive. Configurable timeout handling is supported. |
 | Signals | Central handlers mediate standard catchable signals. Guest `rt_sigaction` registration and query are virtualized, including `SA_RESTART`. Linux default ignore, continue, stop, and terminate dispositions are preserved. |
 | Signal exclusion | The kernel handler only enqueues fixed-size events. Tool and guest callbacks drain from normal runtime context; bounded-queue overflow coalesces standard signals. |
-| Fork and exec | Forked children lazily construct a new Tool and RPC transport. `execve` re-enters the pinned SaBRe loader so the plugin remains active across the new image. `execveat` remains unsupported. |
+| Fork and exec | Forked children lazily construct the same selected Tool with new process-local adapter state and RPC transport. Shared production tools reconnect to their host-owned `GlobalTool`. `execve` re-enters the pinned SaBRe loader so the plugin remains active across the new image, and loader post-load notifications drive `Tool::handle_post_exec` at the first rewritten syscall. `execveat` remains unsupported. |
 | Timing and detours | Supports RDTSC callbacks, selected VDSO callbacks, and macro-generated function detours. |
-| Global state | Uses a synchronous generated RPC client to a host-side service. The channel is process-local and recreated after fork. |
+| Global state | Legacy plugins use a synchronous generated RPC client to a host-side service. The shared production chaos, Chrome Trace, chunky-print, counter1, and counter2 tools use `reverie-rpc-transport` to keep one `GlobalTool` in the host; each guest thread opens a process-local connection and reconnects after fork or exec. |
 | Loader inputs | Validated with dynamically linked x86-64 guests and the loader revision in `SABRE_UPSTREAM.toml`. |
 
 SIGCHLD keeps children waitable when its guest disposition is `SIG_DFL`.
@@ -34,13 +36,12 @@ ptrace `counter2` example and the SaBRe `riptrace` tool:
   child, verifies SIGCHLD, SIGINT, and SIGTERM delivery, then resets SIGCHLD to
   `SIG_DFL` and confirms the next child remains waitable.
 
-Activate and build upstream SaBRe at the pinned revision, then run:
+Cargo builds the pinned, vendored SaBRe source in its package `OUT_DIR`. Build
+the crate, then run:
 
 ```bash
-scripts/backend-submodule.sh activate sabre
-cmake -S third-party/sabre -B target/sabre
-cmake --build target/sabre
-SABRE_BINARY=target/sabre/sabre \
+cargo build -p reverie-sabre
+SABRE_BINARY="$(find target/debug/build -path '*/out/sabre-build/sabre' -type f -print -quit)" \
   experimental/reverie-sabre/conformance/run.sh all
 ```
 
@@ -62,10 +63,33 @@ Unit-level runtime checks are:
 cargo test -p reverie-sabre
 ```
 
+## Shared example-tool matrix
+
+The following matrix was observed at Reverie `5b9446b` with release-built
+`reverie-sabre-strace` artifacts and the pinned SaBRe loader revision
+`34065e7d`. Each cell is one run with default tool logging and no relaxation
+flags.
+
+| Shared tool | `/bin/true` | `/bin/echo sabre-TOOL` | `/bin/cat /dev/null` | `/bin/sh -c 'exit 7'` |
+| --- | --- | --- | --- | --- |
+| `counter1` | PASS, exit 0 (6 syscalls observed) | PASS, exact guest output and exit 0 (87 syscalls observed) | PASS, exit 0 (93 syscalls observed) | PASS, guest exit 7 propagated (138 syscalls observed) |
+| `counter2` | PASS, exit 0 (21 syscalls observed) | PASS, exact guest output and exit 0 (102 syscalls observed) | PASS, exit 0 (108 syscalls observed) | PASS, guest exit 7 propagated (153 syscalls observed) |
+| `noop` | PASS, exit 0 | PASS, exact guest output and exit 0 | PASS, exit 0 | PASS, guest exit 7 propagated |
+
+The shared `counter2` coordinator also aggregates forked process trees. A
+`/bin/sh` workload that starts `/bin/true` in a child and waits for it
+produces one summary covering two process identities and two thread
+identities.
+
+These are L0 compatibility observations for the synchronous SaBRe adapter.
+The example runner does not implement Reverie's generic `Backend` contract and
+does not load Detcore, so the matrix makes no Hermit L1/L2 determinism claim.
+
 ## Known limitations
 
-- The SaBRe backend has a separate synchronous `reverie_sabre::Tool` API.
-  Existing async `reverie::Tool` implementations cannot switch backends.
+- The SaBRe adapter has a synchronous `reverie_sabre::Tool` API and a
+  `ReverieAdapter` subset for shared tools whose handlers complete on the first
+  poll. Only `Guest::tail_inject` may suspend; other pending futures fail.
 - Thread observation is callback-driven. A native thread that never reaches an
   intercepted runtime boundary has no backend record. Join itself is kernel
   behavior, not a distinct SaBRe tool event.
@@ -79,15 +103,22 @@ cargo test -p reverie-sabre
   as the runtime's controlled-exit signal.
 - Tool callbacks can observe signals but cannot replace, suppress, or redirect
   delivery through a shared backend-neutral contract.
-- There is no tool-facing register, stack, remote injection, subscription,
-  CPUID, timer, or PMU interface comparable to `reverie-ptrace`.
+- Register access is limited to the live syscall callback frame, backtraces
+  contain only the current guest IP, and there is no remote injection, CPUID,
+  timer, or PMU interface comparable to `reverie-ptrace`.
+- Syscall subscriptions bypass the shared handler after the loader enters the
+  plugin; they do not prevent rewriting or plugin-entry overhead. Instruction
+  subscriptions remain unsupported.
 - `execveat`, static binaries, non-x86-64 guests, loader distribution, and broad
   clone/vfork/exec stress coverage remain unsupported or unverified.
 - `execve` validates the pathname and argv pointer list before replacing the
   image, but loader-time failures after SaBRe starts cannot return to the old image.
+- SaBRe begins interception after its loader and plugin are established, so
+  syscall totals intentionally exclude earlier launcher and loader syscalls and
+  are not numerically identical to ptrace totals for the same command.
 - RPC is blocking, reserves guest file descriptor 100, and injected-process
   formatting may allocate.
 
-This backend is an extension under `experimental/`; it does not change shared
+This adapter is an extension under `experimental/`; it does not change shared
 Reverie core abstractions. See `ASSESSMENT.md` for provenance and loader
 build details.

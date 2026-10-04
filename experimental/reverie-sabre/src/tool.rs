@@ -15,7 +15,7 @@ use syscalls::Errno;
 use syscalls::Sysno;
 use syscalls::syscall;
 
-use super::protected_files::uses_protected_fd;
+use super::protected_files;
 use super::utils;
 use super::vdso;
 use crate::ffi::fn_icept;
@@ -43,6 +43,29 @@ pub trait Tool {
     /// undefined. It may not be called until *after* libc is loaded.
     fn new(client: Self::Client) -> Self;
 
+    /// Constructs a tool that owns a non-legacy RPC transport.
+    ///
+    /// Returning `Some` bypasses creation of the historical
+    /// `experimental/reverie-rpc` channel. The default keeps the existing
+    /// constructor path for all current tools.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-128): Review the alternate transport constructor boundary.
+    fn new_without_legacy_rpc() -> Option<Self>
+    where
+        Self: Sized,
+    {
+        None
+    }
+
+    /// Opts into the supervised initial-image bootstrap protocol. The tool
+    /// must consume and validate its opaque state before guest callbacks use
+    /// newly initialized thread state. Existing tools are unchanged by default.
+    fn supports_loader_bootstrap() -> bool
+    where
+        Self: Sized,
+    {
+        false
+    }
     /// This is called in place of a system call. For example, if the program
     /// called the `open` syscall, this callback would be called instead. By
     /// default, the real syscall is simply called.
@@ -84,6 +107,23 @@ pub trait Tool {
     /// signaled to exit before `on_thread_start` is called.
     #[inline]
     fn on_thread_exit(&self, _thread_id: u32) {}
+
+    /// Called after SaBRe has loaded or reloaded the guest image.
+    ///
+    /// The initial load and every successful `execve` reach this callback after
+    /// the client mappings have been rewritten and before guest execution
+    /// resumes.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-194): Review the loader post-load lifecycle callback.
+    #[inline]
+    fn on_post_load(&self) {}
+
+    /// Called after all tracked threads have received their exit callback and
+    /// immediately before an `exit_group` terminates the process.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-194): Review the process-exit lifecycle callback.
+    #[inline]
+    fn on_process_exit(&self, _exit_code: i32) {}
 
     /// Called whenever the `rdtsc` instruction was executed. This should return
     /// the RDTSC timestamp counter.
@@ -187,7 +227,14 @@ impl SyscallExt for Syscall {
                 args.arg2 as *const *const libc::c_char,
             )
         } else if sysno == Sysno::execveat {
-            utils::sys_execveat()
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            utils::sys_execveat(
+                args.arg0 as libc::c_int,
+                args.arg1 as *const libc::c_char,
+                args.arg2 as *const *const libc::c_char,
+                args.arg3 as *const *const libc::c_char,
+                args.arg4 as libc::c_int,
+            )
         } else if sysno == Sysno::rt_sigaction {
             utils::sys_rt_sigaction(
                 args.arg0 as libc::c_int,
@@ -202,12 +249,18 @@ impl SyscallExt for Syscall {
                 args.arg2 as *mut _,
                 args.arg3,
             )
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-175): Review atomic rt_sigsuspend wake preservation.
+        } else if sysno == Sysno::rt_sigsuspend {
+            utils::sys_rt_sigsuspend(args.arg0 as *const _, args.arg1)
         } else if sysno == Sysno::close && args.arg0 == libc::STDERR_FILENO as usize {
             // Prevent stderr from getting closed. We need this for logging
             // purposes.
             // FIXME: All logging should go through the global state instead.
             Ok(0)
-        } else if uses_protected_fd(sysno, args.arg0, args.arg1) {
+        } else if sysno == Sysno::close_range {
+            protected_files::sys_close_range(args.arg0, args.arg1, args.arg2)
+        } else if protected_files::uses_protected_fd(sysno, args.arg0, args.arg1) {
             // If this syscall operates on a protected file descriptor, we
             // should return EBADF to indicate that the file descriptor isn't
             // opened (even if it really is).

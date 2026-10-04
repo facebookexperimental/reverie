@@ -39,23 +39,27 @@ impl Stopped {
 
     /// Reads a single u64.
     fn read_u64(&self, addr: Addr<u64>) -> Result<u64, Errno> {
-        ptrace::read(self.0.into(), unsafe {
-            addr.as_ptr() as *mut ::core::ffi::c_void
+        self.1.on_held_tid(|| {
+            ptrace::read(self.0.into(), unsafe {
+                addr.as_ptr() as *mut ::core::ffi::c_void
+            })
+            .map_err(|err| Errno::new(err as i32))
+            .map(|x| x as u64)
         })
-        .map_err(|err| Errno::new(err as i32))
-        .map(|x| x as u64)
     }
 
     /// Writes a single u64.
     fn write_u64(&mut self, addr: AddrMut<u64>, value: u64) -> Result<(), Errno> {
-        unsafe {
-            ptrace::write(
-                self.0.into(),
-                addr.as_mut_ptr() as *mut ::core::ffi::c_void,
-                value as c_long,
-            )
-        }
-        .map_err(|err| Errno::new(err as i32))
+        self.1.on_held_tid(|| {
+            unsafe {
+                ptrace::write(
+                    self.0.into(),
+                    addr.as_mut_ptr() as *mut ::core::ffi::c_void,
+                    value as c_long,
+                )
+            }
+            .map_err(|err| Errno::new(err as i32))
+        })
     }
 }
 
@@ -71,25 +75,28 @@ impl MemoryAccess for Stopped {
         remote: &[io::IoSlice],
         local: &mut [io::IoSliceMut],
     ) -> Result<usize, Errno> {
-        Errno::result(unsafe {
-            libc::process_vm_readv(
-                self.0.as_raw(),
-                local.as_ptr() as *const libc::iovec,
-                local.len() as libc::c_ulong,
-                remote.as_ptr() as *const libc::iovec,
-                remote.len() as libc::c_ulong,
-                0,
-            )
-        })
-        .map(|x| x as usize)
-        .or_else(|err| {
-            if err == Errno::EFAULT {
-                // Treat page faults as an EOF.
-                Ok(0)
-            } else {
-                Err(err)
-            }
-        })
+        self.1
+            .on_held_tid(|| {
+                Errno::result(unsafe {
+                    libc::process_vm_readv(
+                        self.0.as_raw(),
+                        local.as_ptr() as *const libc::iovec,
+                        local.len() as libc::c_ulong,
+                        remote.as_ptr() as *const libc::iovec,
+                        remote.len() as libc::c_ulong,
+                        0,
+                    )
+                })
+                .map(|x| x as usize)
+            })
+            .or_else(|err| {
+                if err == Errno::EFAULT {
+                    // Treat page faults as an EOF.
+                    Ok(0)
+                } else {
+                    Err(err)
+                }
+            })
     }
 
     /// Does a vectored writes to the address space. Returns the number of bytes
@@ -103,25 +110,28 @@ impl MemoryAccess for Stopped {
         local: &[io::IoSlice],
         remote: &mut [io::IoSliceMut],
     ) -> Result<usize, Errno> {
-        Errno::result(unsafe {
-            libc::process_vm_writev(
-                self.0.as_raw(),
-                local.as_ptr() as *const libc::iovec,
-                local.len() as libc::c_ulong,
-                remote.as_ptr() as *const libc::iovec,
-                remote.len() as libc::c_ulong,
-                0,
-            )
-        })
-        .map(|x| x as usize)
-        .or_else(|err| {
-            if err == Errno::EFAULT {
-                // Treat page faults as an EOF.
-                Ok(0)
-            } else {
-                Err(err)
-            }
-        })
+        self.1
+            .on_held_tid(|| {
+                Errno::result(unsafe {
+                    libc::process_vm_writev(
+                        self.0.as_raw(),
+                        local.as_ptr() as *const libc::iovec,
+                        local.len() as libc::c_ulong,
+                        remote.as_ptr() as *const libc::iovec,
+                        remote.len() as libc::c_ulong,
+                        0,
+                    )
+                })
+                .map(|x| x as usize)
+            })
+            .or_else(|err| {
+                if err == Errno::EFAULT {
+                    // Treat page faults as an EOF.
+                    Ok(0)
+                } else {
+                    Err(err)
+                }
+            })
     }
 
     /// Performs a read starting at the given address. The number of bytes read
@@ -163,6 +173,24 @@ impl MemoryAccess for Stopped {
         }
     }
 
+    fn read_exact_with_user_access<'a, A>(&self, addr: A, buf: &mut [u8]) -> Result<(), Errno>
+    where
+        A: Into<Addr<'a, u8>>,
+    {
+        let addr = addr.into();
+        addr.as_raw().checked_add(buf.len()).ok_or(Errno::EFAULT)?;
+
+        let remote = unsafe { AddrSlice::from_raw_parts(addr, buf.len()) };
+        let remote = [unsafe { remote.as_ioslice() }];
+        let mut local = [io::IoSliceMut::new(buf)];
+
+        if self.read_vectored(&remote, &mut local)? == buf.len() {
+            Ok(())
+        } else {
+            Err(Errno::EFAULT)
+        }
+    }
+
     fn write(&mut self, addr: AddrMut<u8>, buf: &[u8]) -> Result<usize, Errno> {
         let size = buf.len();
         if size == 0 {
@@ -189,6 +217,34 @@ impl MemoryAccess for Stopped {
         } else {
             // The address range fits into one page. Nothing special to do.
             self.write_aligned(addr, buf)
+        }
+    }
+
+    fn write_with_user_access(&mut self, addr: AddrMut<u8>, buf: &[u8]) -> Result<usize, Errno> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        addr.as_raw().checked_add(buf.len()).ok_or(Errno::EFAULT)?;
+        let local = libc::iovec {
+            iov_base: buf.as_ptr().cast_mut().cast(),
+            iov_len: buf.len(),
+        };
+        let remote = libc::iovec {
+            iov_base: addr.as_raw() as *mut libc::c_void,
+            iov_len: buf.len(),
+        };
+        // SAFETY: local describes the live source slice. The remote address is
+        // only a numeric kernel operand; no Rust reference is formed from it.
+        // Unlike POKEDATA, process_vm_writev checks writable VMA permissions.
+        let written = self.1.on_held_tid(|| {
+            Errno::result(unsafe {
+                libc::process_vm_writev(self.0.as_raw(), &local, 1, &remote, 1, 0)
+            })
+        })? as usize;
+        if written == 0 {
+            Err(Errno::EFAULT)
+        } else {
+            Ok(written)
         }
     }
 }
@@ -321,6 +377,273 @@ mod test {
             },
             |_| {},
         ));
+    }
+
+    fn page_size() -> usize {
+        let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        assert!(size > 0);
+        size as usize
+    }
+
+    fn map_pages(count: usize) -> (*mut u8, usize) {
+        let length = page_size().checked_mul(count).unwrap();
+        let mapping = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                length,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(mapping, libc::MAP_FAILED);
+        (mapping.cast(), length)
+    }
+
+    fn unmap_pages(mapping: *mut u8, length: usize) {
+        assert_eq!(unsafe { libc::munmap(mapping.cast(), length) }, 0);
+    }
+
+    fn assert_user_copy_bytes(
+        memory: &Stopped,
+        address: usize,
+        total: usize,
+        offset: usize,
+        source: &[u8],
+        copied: usize,
+    ) {
+        for at in (0..total).step_by(8) {
+            // PEEK can inspect canaries even on the child's PROT_NONE page.
+            let actual = memory
+                .read_u64(Addr::from_raw(address + at).unwrap())
+                .unwrap()
+                .to_ne_bytes();
+            for (index, byte) in actual.into_iter().enumerate() {
+                let index = at + index;
+                let expected = if index >= offset && index - offset < copied {
+                    source[index - offset]
+                } else {
+                    0xa5
+                };
+                assert_eq!(byte, expected, "destination byte {index}");
+            }
+        }
+    }
+
+    #[test]
+    fn remote_user_copy_checks_permissions_at_every_size_and_preserves_prefixes() {
+        let page = page_size();
+        for protection in [libc::PROT_READ, libc::PROT_NONE] {
+            for offset in [0, page - 3, page] {
+                for length in [0, 1, 7, 8, 9, page + 8] {
+                    let (mapping, total) = map_pages(3);
+                    unsafe { core::ptr::write_bytes(mapping, 0xa5, total) };
+                    let passed = fork_helper(
+                        mapping as usize,
+                        move |child, address| {
+                            let mut memory = Stopped::new_unchecked(child);
+                            let source: Vec<_> =
+                                (0..length + 1).map(|i| (19 + i * 37) as u8).collect();
+                            let source = &source[1..];
+                            let destination = AddrMut::from_raw(address + offset).unwrap();
+                            let expected = if offset < page {
+                                (page - offset).min(length)
+                            } else {
+                                0
+                            };
+                            assert_eq!(
+                                memory.write_with_user_access(destination, source),
+                                if expected != 0 || length == 0 {
+                                    Ok(expected)
+                                } else {
+                                    Err(Errno::EFAULT)
+                                },
+                                "protection={protection} offset={offset} length={length}"
+                            );
+                            assert_user_copy_bytes(
+                                &memory, address, total, offset, source, expected,
+                            );
+                            true
+                        },
+                        move |address| {
+                            assert_eq!(
+                                unsafe {
+                                    libc::mprotect(
+                                        (*address as *mut u8).add(page).cast(),
+                                        page,
+                                        protection,
+                                    )
+                                },
+                                0
+                            );
+                        },
+                    );
+                    unmap_pages(mapping, total);
+                    assert!(passed);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn remote_user_copy_does_not_change_the_eight_byte_debugger_contract() {
+        let (mapping, length) = map_pages(1);
+        let passed = fork_helper(
+            mapping as usize,
+            move |child, address| {
+                let mut memory = Stopped::new_unchecked(child);
+                let destination = AddrMut::from_raw(address).unwrap();
+                let original = *b"debugger";
+                assert_eq!(memory.write(destination, &original), Ok(8));
+                assert_eq!(
+                    memory.write_with_user_access(destination, b"rejected"),
+                    Err(Errno::EFAULT)
+                );
+                assert_eq!(
+                    memory
+                        .read_u64(Addr::from_raw(address).unwrap())
+                        .unwrap()
+                        .to_ne_bytes(),
+                    original
+                );
+                true
+            },
+            move |address| {
+                assert_eq!(
+                    unsafe {
+                        libc::mprotect(*address as *mut libc::c_void, length, libc::PROT_READ)
+                    },
+                    0
+                );
+            },
+        );
+        unmap_pages(mapping, length);
+        assert!(passed);
+    }
+
+    #[test]
+    fn remote_user_copy_empty_and_invalid_addresses_preserve_memory() {
+        let (mapping, total) = map_pages(1);
+        unsafe { core::ptr::write_bytes(mapping, 0xa5, total) };
+        let passed = fork_helper(
+            mapping as usize,
+            move |child, address| {
+                let mut memory = Stopped::new_unchecked(child);
+                for invalid in [1, usize::MAX - 3, usize::MAX] {
+                    let destination = AddrMut::from_raw(invalid).unwrap();
+                    assert_eq!(memory.write_with_user_access(destination, &[]), Ok(0));
+                    for source in [&b"x"[..], &b"rejected"[..]] {
+                        assert_eq!(
+                            memory.write_with_user_access(destination, source),
+                            Err(Errno::EFAULT)
+                        );
+                        assert_user_copy_bytes(&memory, address, total, 0, &[], 0);
+                    }
+                }
+                true
+            },
+            |_| {},
+        );
+        unmap_pages(mapping, total);
+        assert!(passed);
+    }
+
+    #[test]
+    fn remote_user_copy_preserves_non_fault_errno() {
+        // An invalid PID cannot be recycled into a live target. The unchecked
+        // handle deliberately exercises a kernel error, not a stopped child.
+        let mut memory = Stopped::new_unchecked(Pid::from_raw(-1));
+        let mut destination = [0xa5; 8];
+        let address = AddrMut::from_ptr(destination.as_mut_ptr()).unwrap();
+        assert_eq!(
+            memory.write_with_user_access(address, b"rejected"),
+            Err(Errno::ESRCH)
+        );
+        assert_eq!(destination, [0xa5; 8]);
+        assert_eq!(
+            memory.write_with_user_access(AddrMut::from_raw(usize::MAX).unwrap(), &[]),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn remote_read_exact_with_user_access_reads_eight_bytes() {
+        let expected = [1, 2, 3, 4, 5, 6, 7, 8];
+        let (mapping, length) = map_pages(1);
+        unsafe { core::ptr::copy_nonoverlapping(expected.as_ptr(), mapping, expected.len()) };
+
+        let passed = fork_helper(
+            mapping as usize,
+            move |child, address| {
+                let memory = Stopped::new_unchecked(child);
+                let address = Addr::from_raw(address).unwrap();
+                let mut observed = [0; 8];
+                memory
+                    .read_exact_with_user_access(address, &mut observed)
+                    .unwrap();
+                observed == expected
+            },
+            |_| {},
+        );
+
+        unmap_pages(mapping, length);
+        assert!(passed);
+    }
+
+    #[test]
+    fn remote_read_exact_with_user_access_rejects_prot_none() {
+        let (mapping, length) = map_pages(1);
+        let passed = fork_helper(
+            mapping as usize,
+            move |child, address| {
+                let memory = Stopped::new_unchecked(child);
+                let address = Addr::from_raw(address).unwrap();
+                let mut observed = [0; 8];
+                memory.read_exact_with_user_access(address, &mut observed) == Err(Errno::EFAULT)
+            },
+            move |address| {
+                assert_eq!(
+                    unsafe {
+                        libc::mprotect(*address as *mut libc::c_void, length, libc::PROT_NONE)
+                    },
+                    0
+                );
+            },
+        );
+
+        unmap_pages(mapping, length);
+        assert!(passed);
+    }
+
+    #[test]
+    fn remote_read_exact_with_user_access_rejects_cross_page_partial_read() {
+        let page_size = page_size();
+        let (mapping, length) = map_pages(2);
+        let start = unsafe { mapping.add(page_size - 4) };
+        let expected = [1, 2, 3, 4, 5, 6, 7, 8];
+        unsafe { core::ptr::copy_nonoverlapping(expected.as_ptr(), start, expected.len()) };
+
+        let passed = fork_helper(
+            start as usize,
+            move |child, address| {
+                let memory = Stopped::new_unchecked(child);
+                let address = Addr::from_raw(address).unwrap();
+                let mut observed = [0; 8];
+                memory.read_exact_with_user_access(address, &mut observed) == Err(Errno::EFAULT)
+            },
+            move |_| {
+                assert_eq!(
+                    unsafe {
+                        libc::mprotect(mapping.add(page_size).cast(), page_size, libc::PROT_NONE)
+                    },
+                    0
+                );
+            },
+        );
+
+        unmap_pages(mapping, length);
+        assert!(passed);
     }
 
     #[test]

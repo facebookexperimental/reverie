@@ -7,8 +7,5 @@ https://github.com/srg-imperial/SaBRe at commit
 - `recursion_protector.c` from `plugin_api/recursion_protector.c`
 - `vfork_syscall.S` from `plugin_api/arch/x86_64/vfork_syscall.s`
 
-Both source files carry the MIT SPDX identifier and keep their upstream contents,
-except that `recursion_protector.c` gains a single `// @lint-ignore-every
-LICENSELINT` directive so fbsource's license linter does not flag the retained
-third-party MIT header. The assembly file keeps Reverie's existing uppercase `.S`
-destination name.
+Both source files carry the MIT SPDX identifier. Their contents are unmodified;
+the assembly file keeps Reverie's existing uppercase `.S` destination name.

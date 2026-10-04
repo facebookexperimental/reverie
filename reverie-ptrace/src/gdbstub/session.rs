@@ -552,6 +552,9 @@ impl Session {
             },
             // TODO T92309086: implement ACL for hostio.
             Base::vFile(hostio) => match hostio {
+                // Unsupported Host-I/O is an empty reply, not an F-success
+                // result and not a request to access the host filesystem.
+                vFile::Unsupported => {}
                 vFile::Setfs(pid) => {
                     match pid {
                         Some(pid) => {
