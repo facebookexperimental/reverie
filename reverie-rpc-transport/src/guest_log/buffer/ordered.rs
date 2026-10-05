@@ -114,28 +114,32 @@ pub(super) fn size(limits: Limits) -> io::Result<usize> {
 }
 
 pub(super) unsafe fn initialize(pointer: *mut u8, limits: Limits) {
-    pointer.cast::<Header>().write(Header {
-        max_record_bytes: limits.max_record_bytes as u64,
-        host_pending_bytes: limits.host_pending_bytes as u64,
-        guest_pending_bytes: limits.guest_pending_bytes as u64,
-        pending_records: limits.pending_records as u64,
-        admission: std::array::from_fn(|_| AtomicU64::new(0)),
-        used: std::array::from_fn(|_| AtomicU64::new(0)),
-        next_order: AtomicU64::new(1),
-        collector: AtomicU64::new(0),
-        order_fault: AtomicU64::new(0),
-        guest_failure: AtomicU64::new(0),
-    });
-    let credits = pointer.add(std::mem::size_of::<Header>()).cast::<Credit>();
+    unsafe {
+        pointer.cast::<Header>().write(Header {
+            max_record_bytes: limits.max_record_bytes as u64,
+            host_pending_bytes: limits.host_pending_bytes as u64,
+            guest_pending_bytes: limits.guest_pending_bytes as u64,
+            pending_records: limits.pending_records as u64,
+            admission: std::array::from_fn(|_| AtomicU64::new(0)),
+            used: std::array::from_fn(|_| AtomicU64::new(0)),
+            next_order: AtomicU64::new(1),
+            collector: AtomicU64::new(0),
+            order_fault: AtomicU64::new(0),
+            guest_failure: AtomicU64::new(0),
+        })
+    };
+    let credits = unsafe { pointer.add(std::mem::size_of::<Header>()) }.cast::<Credit>();
     for index in 0..limits.pending_records {
-        credits.add(index).write(Credit {
-            state: AtomicU64::new(FREE),
-            generation: AtomicU64::new(0),
-            producer: AtomicU64::new(0),
-            sequence: AtomicU64::new(0),
-            length: AtomicU64::new(0),
-            order: AtomicU64::new(0),
-        });
+        unsafe {
+            credits.add(index).write(Credit {
+                state: AtomicU64::new(FREE),
+                generation: AtomicU64::new(0),
+                producer: AtomicU64::new(0),
+                sequence: AtomicU64::new(0),
+                length: AtomicU64::new(0),
+                order: AtomicU64::new(0),
+            })
+        };
     }
 }
 
