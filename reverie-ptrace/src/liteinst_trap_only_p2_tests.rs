@@ -414,11 +414,11 @@ impl Tool for P2Tool {
         let regs = guest.regs().await;
         guest
             .send_rpc(format!(
-                "thread-start rip={} rax={} rcx={} r11={:#x}",
+                "thread-start rip={} rax={} rcx={} r11=rflags:{}",
                 code(regs.rip),
                 value(regs.rax, guest.pid()),
                 code(regs.rcx),
-                regs.r11
+                regs.r11 == regs.eflags
             ))
             .await;
         Ok(())
