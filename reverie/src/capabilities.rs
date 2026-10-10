@@ -269,6 +269,8 @@ impl BackendCapabilities {
     /// `reverie-dbt`: the guest runs under dynamic binary translation with the
     /// tool in the guest process.
     pub const DBT: Self = Self {
+        tool_shares_guest_descriptor_table: true,
+        rediscovers_descriptors_after_exec: true,
         needs_killed_thread_rpc_cancellation: true,
         tracks_process_children: false,
         runs_exit_robust_list: false,
@@ -400,6 +402,8 @@ mod tests {
         assert_eq!(
             table(BackendCapabilities::DBT),
             ptrace_with(serde_json::json!({
+                "tool_shares_guest_descriptor_table": true,
+                "rediscovers_descriptors_after_exec": true,
                 "needs_killed_thread_rpc_cancellation": true,
                 "tracks_process_children": false,
                 "runs_exit_robust_list": false,

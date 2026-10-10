@@ -451,7 +451,7 @@ fn connect_guest(
     path: &Path,
     pid: u32,
 ) -> std::io::Result<GuestConnection> {
-    let fd = invoke(
+    let mut fd = invoke(
         context,
         invoke_syscall,
         libc::SYS_socket,
@@ -465,6 +465,19 @@ fn connect_guest(
         ],
     )? as i32;
     let result = (|| {
+        // The private connection must not occupy a guest's closed stdin,
+        // stdout or stderr. Keep CLOEXEC and release that slot before any
+        // guest syscall can observe the cached connection.
+        if fd <= libc::STDERR_FILENO {
+            let relocated = invoke(
+                context,
+                invoke_syscall,
+                libc::SYS_fcntl,
+                [fd as u64, libc::F_DUPFD_CLOEXEC as u64, 3, 0, 0, 0],
+            )? as i32;
+            close_guest(context, invoke_syscall, fd);
+            fd = relocated;
+        }
         let address = unix_address(path)?;
         invoke(
             context,
@@ -831,5 +844,115 @@ mod initial_config_tests {
                 assert!(error.primary.is_none());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct SocketProbe {
+        allocated_fd: i32,
+        duplicate_result: i64,
+        connect_result: i64,
+        calls: Vec<(i64, [u64; 6])>,
+    }
+
+    impl SocketProbe {
+        fn new(allocated_fd: i32) -> Self {
+            Self {
+                allocated_fd,
+                duplicate_result: 9,
+                connect_result: 0,
+                calls: Vec::new(),
+            }
+        }
+
+        fn connect(&mut self) -> std::io::Result<GuestConnection> {
+            connect_guest(
+                self as *mut Self as usize,
+                socket_syscall,
+                Path::new("/test-coordinator"),
+                123,
+            )
+        }
+
+        fn arguments(&self, number: i64) -> Vec<[u64; 6]> {
+            self.calls
+                .iter()
+                .filter_map(|(call, arguments)| (*call == number).then_some(*arguments))
+                .collect()
+        }
+    }
+
+    unsafe extern "C" fn socket_syscall(context: usize, number: i64, args: *const u64) -> i64 {
+        let probe = unsafe { &mut *(context as *mut SocketProbe) };
+        let args = unsafe { std::ptr::read(args.cast::<[u64; 6]>()) };
+        probe.calls.push((number, args));
+        match number {
+            libc::SYS_socket => i64::from(probe.allocated_fd),
+            libc::SYS_fcntl => probe.duplicate_result,
+            libc::SYS_connect => probe.connect_result,
+            libc::SYS_close => 0,
+            libc::SYS_read => {
+                // A zero-length config frame is enough for connect_guest's
+                // handshake; no guest memory or real descriptor is involved.
+                unsafe { std::ptr::write_bytes(args[1] as *mut u8, 0, args[2] as usize) };
+                args[2] as i64
+            }
+            _ => -i64::from(libc::ENOSYS),
+        }
+    }
+
+    #[test]
+    fn private_rpc_socket_leaves_closed_stdio_available() {
+        for allocated_fd in 0..=3 {
+            let mut probe = SocketProbe::new(allocated_fd);
+            let connection = probe.connect().unwrap();
+            let expected_fd = if allocated_fd < 3 { 9 } else { allocated_fd };
+            assert_eq!(connection.fd, expected_fd);
+            let duplicates = probe.arguments(libc::SYS_fcntl);
+            let closes = probe.arguments(libc::SYS_close);
+            if allocated_fd < 3 {
+                assert_eq!(duplicates.len(), 1);
+                assert_eq!(
+                    duplicates[0][..3],
+                    [allocated_fd as u64, libc::F_DUPFD_CLOEXEC as u64, 3]
+                );
+                assert_eq!(closes.len(), 1);
+                assert_eq!(closes[0][0], allocated_fd as u64);
+                assert_eq!(probe.calls[2].0, libc::SYS_close);
+                assert_eq!(probe.calls[3].0, libc::SYS_connect);
+            } else {
+                assert!(duplicates.is_empty());
+                assert!(closes.is_empty());
+            }
+            assert_eq!(probe.arguments(libc::SYS_connect)[0][0], expected_fd as u64);
+            assert_eq!(probe.arguments(libc::SYS_read)[0][0], expected_fd as u64);
+        }
+    }
+
+    #[test]
+    fn private_rpc_relocation_failure_closes_the_original_once() {
+        let mut probe = SocketProbe::new(0);
+        probe.duplicate_result = -i64::from(libc::EMFILE);
+        let error = probe.connect().err().expect("duplication must fail");
+        assert_eq!(error.raw_os_error(), Some(libc::EMFILE));
+        assert!(probe.arguments(libc::SYS_connect).is_empty());
+        let closes = probe.arguments(libc::SYS_close);
+        assert_eq!(closes.len(), 1);
+        assert_eq!(closes[0][0], 0);
+    }
+
+    #[test]
+    fn private_rpc_connect_failure_closes_original_and_duplicate_once() {
+        let mut probe = SocketProbe::new(2);
+        probe.connect_result = -i64::from(libc::ECONNREFUSED);
+        let error = probe.connect().err().expect("connection must fail");
+        assert_eq!(error.raw_os_error(), Some(libc::ECONNREFUSED));
+        let closes = probe.arguments(libc::SYS_close);
+        assert_eq!(closes.len(), 2);
+        assert_eq!(closes[0][0], 2);
+        assert_eq!(closes[1][0], 9);
     }
 }

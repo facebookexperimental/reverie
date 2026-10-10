@@ -4081,72 +4081,6 @@ static bool fd_matches_stdin(void* drcontext, int fd) {
 #endif
 }
 
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(#77): Confirm pipe EAGAIN retry preserves signal and
-// short-I/O semantics.
-static bool fd_is_pipe(void* drcontext, int fd) {
-#ifdef SYS_fstat
-  struct stat value = {0};
-  uint64_t stat_args[6] = {(uint64_t)fd, (uint64_t)(uintptr_t)&value};
-  return invoke_syscall((uintptr_t)drcontext, SYS_fstat, stat_args) == 0 &&
-      S_ISFIFO(value.st_mode);
-#else
-  return false;
-#endif
-}
-
-static short pipe_io_events(int sysnum) {
-  switch (sysnum) {
-#ifdef SYS_read
-    case SYS_read:
-#endif
-#ifdef SYS_readv
-    case SYS_readv:
-#endif
-      return POLLIN;
-#ifdef SYS_write
-    case SYS_write:
-#endif
-#ifdef SYS_writev
-    case SYS_writev:
-#endif
-      return POLLOUT;
-    default:
-      return 0;
-  }
-}
-
-static void retry_pipe_eagain(
-    void* drcontext,
-    int sysnum,
-    const uint64_t* args,
-    int64_t* result) {
-#if defined(SYS_poll)
-  short events = pipe_io_events(sysnum);
-  int fd = (int)args[0];
-  if (*result != -EAGAIN || events == 0 || !fd_is_pipe(drcontext, fd))
-    return;
-
-  while (*result == -EAGAIN) {
-    struct pollfd ready = {.fd = fd, .events = events};
-    uint64_t poll_args[6] = {
-        (uint64_t)(uintptr_t)&ready, 1, (uint64_t)(int64_t)-1};
-    int64_t poll_result =
-        invoke_syscall((uintptr_t)drcontext, SYS_poll, poll_args);
-    if (poll_result < 0) {
-      *result = poll_result;
-      return;
-    }
-    *result = invoke_syscall((uintptr_t)drcontext, sysnum, args);
-  }
-#else
-  (void)drcontext;
-  (void)sysnum;
-  (void)args;
-  (void)result;
-#endif
-}
-
 static bool
 syscall_reads_stdin(void* drcontext, int sysnum, const uint64_t* args) {
   int fd;
@@ -5194,7 +5128,11 @@ static bool pre_syscall(void* drcontext, int sysnum) {
     return false;
   }
   if (action == 1) {
-    retry_pipe_eagain(drcontext, sysnum, args, &result);
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#77): Confirm pipe EAGAIN retry preserves signal and
+    // short-I/O semantics.
+    // Detcore owns blocking retries and logs the completed I/O result. Preserve
+    // that result, including EAGAIN and short transfers, without native retries.
     result = virtualize_identity_result(counters, sysnum, result);
     dr_syscall_set_result(drcontext, (reg_t)result);
     return false;
