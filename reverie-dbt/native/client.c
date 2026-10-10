@@ -147,14 +147,20 @@ typedef struct {
 #define VIRTUAL_IDENTITY_FD 197
 #define CLIENT_THREAD_START_FAILURE_EXIT_CODE 125
 #define DBT_DIAGNOSTIC_FD 198
-#define VIRTUAL_IDENTITY_MAGIC UINT64_C(0x5245565049443033)
+#define VIRTUAL_IDENTITY_MAGIC UINT64_C(0x5245565049443034)
 #define MAX_VIRTUAL_IDENTITIES 8192
 #define TEST_REUSED_TID_STALE (INT32_MAX - INT32_C(5))
+#define EXEC_HELPER_RETIREMENT_TIMEOUT_MS UINT64_C(60000)
 
 typedef struct {
   int32_t virtual_pid;
-  _Atomic uint64_t count;
-} pending_thread_clone_t;
+  _Atomic uint64_t pending_thread_clones;
+  _Atomic uint64_t image_epoch;
+  _Atomic uint64_t finished_helper_epoch;
+  // Published by finished_helper_epoch after this helper's acknowledged FINAL.
+  int32_t helper_pid;
+  uint64_t helper_start_time;
+} process_control_t;
 
 typedef struct {
   uint64_t magic;
@@ -167,8 +173,8 @@ typedef struct {
   // AUTONOMOUS-BOT-IMPLEMENTED
   // TODO-HUMAN-REVIEW(PR-shared-dbi-clock): Review shared continuous DBI time.
   _Atomic uint64_t virtual_time_ns;
-  size_t pending_thread_clone_count;
-  pending_thread_clone_t pending_thread_clones[MAX_VIRTUAL_IDENTITIES];
+  size_t process_control_count;
+  process_control_t process_controls[MAX_VIRTUAL_IDENTITIES];
   _Atomic bool thread_clone_process_exit_test_exercised;
   /* The launch-time descriptor identity survives exec, unlike numeric fd 0. */
   bool initial_stdin_valid;
@@ -405,6 +411,7 @@ static ptr_uint_t rdtsc_marker_note;
 static ptr_uint_t rdtscp_marker_note;
 static bool report_summary;
 static bool test_wait_for_background;
+static bool test_delay_exec_helper_exit;
 static bool test_kill_announced_child;
 static bool test_thread_exit_evidence;
 static bool test_leave_process_clone_result_pending;
@@ -736,9 +743,16 @@ static bool evidence_send_frame(
   return false;
 }
 
-static bool evidence_process_start_time(
+typedef enum {
+  PROCESS_IDENTITY_ERROR = -1,
+  PROCESS_IDENTITY_ABSENT = 0,
+  PROCESS_IDENTITY_PRESENT = 1,
+} process_identity_result_t;
+
+static process_identity_result_t read_process_identity(
     process_id_t process,
-    uint64_t* start_time) {
+    uint64_t* start_time,
+    char* state) {
   char path[64];
   char stat_buffer[1024];
   char* cursor;
@@ -749,43 +763,60 @@ static bool evidence_process_start_time(
   uint64_t parsed = 0;
   length = dr_snprintf(path, sizeof(path), "/proc/%d/stat", (int)process);
   if (length <= 0 || (size_t)length >= sizeof(path))
-    return false;
+    return PROCESS_IDENTITY_ERROR;
   descriptor = open(path, O_RDONLY | O_CLOEXEC);
   if (descriptor < 0)
-    return false;
+    return errno == ENOENT || errno == ESRCH ? PROCESS_IDENTITY_ABSENT
+                                           : PROCESS_IDENTITY_ERROR;
   do {
     length = (int)read(descriptor, stat_buffer, sizeof(stat_buffer) - 1);
   } while (length < 0 && errno == EINTR);
+  int read_error = length < 0 ? errno : 0;
   close(descriptor);
+  if (read_error == ENOENT || read_error == ESRCH)
+    return PROCESS_IDENTITY_ABSENT;
   if (length <= 0 || (size_t)length >= sizeof(stat_buffer))
-    return false;
+    return PROCESS_IDENTITY_ERROR;
   stat_buffer[length] = 0;
   cursor = strrchr(stat_buffer, ')');
   if (cursor == NULL)
-    return false;
+    return PROCESS_IDENTITY_ERROR;
   ++cursor;
   for (field = 3; field <= 22; ++field) {
     while (*cursor == ' ')
       ++cursor;
     if (*cursor == 0)
-      return false;
+      return PROCESS_IDENTITY_ERROR;
     end = cursor;
     while (*end != 0 && *end != ' ')
       ++end;
+    if (field == 3) {
+      if (end - cursor != 1)
+        return PROCESS_IDENTITY_ERROR;
+      *state = *cursor;
+    }
     if (field == 22) {
       if (cursor == end)
-        return false;
+        return PROCESS_IDENTITY_ERROR;
       while (cursor != end) {
         if (*cursor < '0' || *cursor > '9')
-          return false;
+          return PROCESS_IDENTITY_ERROR;
         parsed = parsed * 10 + (uint64_t)(*cursor++ - '0');
       }
       *start_time = parsed;
-      return true;
+      return PROCESS_IDENTITY_PRESENT;
     }
     cursor = end;
   }
-  return false;
+  return PROCESS_IDENTITY_ERROR;
+}
+
+static bool evidence_process_start_time(
+    process_id_t process,
+    uint64_t* start_time) {
+  char state;
+  return read_process_identity(process, start_time, &state) ==
+      PROCESS_IDENTITY_PRESENT;
 }
 
 static bool evidence_current_identity(
@@ -1146,6 +1177,11 @@ static void initialize_evidence_transport(void) {
 static int32_t virtual_process_id = VIRTUAL_ROOT_PID;
 static int32_t virtual_parent_process_id = VIRTUAL_INIT_PID;
 static virtual_identity_state_t* virtual_identity_state;
+// Private to this image, including its one background helper. Copied children
+// never start an inherited helper; their first exec claims their own record.
+static process_control_t* runtime_process_control;
+static uint64_t runtime_process_epoch;
+static bool runtime_retirement_requested;
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-154): Review serialized clone identity handoff.
 static atomic_flag pending_clone_lock = ATOMIC_FLAG_INIT;
@@ -1263,29 +1299,165 @@ static int32_t allocate_virtual_identity(void) {
       &virtual_identity_state->next_virtual_id, 1, memory_order_relaxed);
 }
 
-static _Atomic uint64_t* pending_thread_clones_for(int32_t virtual_pid) {
-  pending_thread_clone_t* entry;
+static process_control_t* process_control_for(int32_t virtual_pid) {
+  process_control_t* entry;
   size_t i;
   DR_ASSERT(virtual_pid > 0);
 
   virtual_identity_lock();
-  for (i = 0; i != virtual_identity_state->pending_thread_clone_count; ++i) {
-    entry = &virtual_identity_state->pending_thread_clones[i];
+  for (i = 0; i != virtual_identity_state->process_control_count; ++i) {
+    entry = &virtual_identity_state->process_controls[i];
     if (entry->virtual_pid == virtual_pid) {
       virtual_identity_unlock();
-      return &entry->count;
+      return entry;
     }
   }
 
   DR_ASSERT(
-      virtual_identity_state->pending_thread_clone_count <
-      MAX_VIRTUAL_IDENTITIES);
-  entry = &virtual_identity_state->pending_thread_clones
-               [virtual_identity_state->pending_thread_clone_count++];
+      virtual_identity_state->process_control_count < MAX_VIRTUAL_IDENTITIES);
+  entry = &virtual_identity_state
+               ->process_controls[virtual_identity_state->process_control_count++];
   entry->virtual_pid = virtual_pid;
-  atomic_init(&entry->count, 0);
+  atomic_init(&entry->pending_thread_clones, 0);
+  atomic_init(&entry->image_epoch, 0);
+  atomic_init(&entry->finished_helper_epoch, 0);
+  entry->helper_pid = 0;
+  entry->helper_start_time = 0;
   virtual_identity_unlock();
-  return &entry->count;
+  return entry;
+}
+
+static _Atomic uint64_t* pending_thread_clones_for(int32_t virtual_pid) {
+  return &process_control_for(virtual_pid)->pending_thread_clones;
+}
+
+// 1 means kernel exit is complete, 0 means still pending, -1 is a failure.
+static int confirm_previous_helper_exit(void) {
+  process_id_t helper = (process_id_t)runtime_process_control->helper_pid;
+  if (helper <= 0)
+    return -1;
+
+  // A client helper is a clone child of an application thread, including when
+  // another thread becomes the leader during exec. __WALL includes its zero
+  // exit signal; omitting __WNOTHREAD includes children of the whole group.
+  // Observe without reaping first: SIG_IGN/SA_NOCLDWAIT can auto-reap a helper
+  // after parent exec, and a guest CLONE_PARENT child could reuse its PID.
+  siginfo_t info = {0};
+  int result = waitid(
+      P_PID, (id_t)helper, &info, WEXITED | WNOHANG | WNOWAIT | __WALL);
+  int wait_error = result < 0 ? errno : 0;
+  if (wait_error == EINTR)
+    return 0;
+  if (wait_error != 0 && wait_error != ECHILD)
+    return -1;
+
+  uint64_t start_time;
+  char state;
+  process_identity_result_t identity =
+      read_process_identity(helper, &start_time, &state);
+  if (identity == PROCESS_IDENTITY_ERROR)
+    return -1;
+  if (identity == PROCESS_IDENTITY_ABSENT ||
+      start_time != runtime_process_control->helper_start_time)
+    return 1;
+  if (wait_error == ECHILD)
+    return state == 'Z' || state == 'X' ? 1 : -1;
+  if (info.si_pid == 0)
+    return 0;
+  if (info.si_pid != helper || info.si_code != CLD_EXITED ||
+      info.si_status != 0 || (state != 'Z' && state != 'X'))
+    return -1;
+
+  // The acknowledged sender's pid/start-time identity matches the waitable
+  // zombie. This is the same identity contract as protected evidence. No guest
+  // or other application thread runs in this image yet, so nobody can reap
+  // that zombie between this check and the targeted wait. Consume only this
+  // helper, keeping repeated exec from accumulating client-owned zombies.
+  int status;
+  pid_t reaped = waitpid((pid_t)helper, &status, WNOHANG | __WALL);
+  if (reaped < 0 && errno == EINTR)
+    return 0;
+  return reaped == helper && WIFEXITED(status) && WEXITSTATUS(status) == 0
+      ? 1
+      : -1;
+}
+
+static bool claim_runtime_image(void) {
+  runtime_process_control = process_control_for(virtual_process_id);
+  virtual_identity_lock();
+  uint64_t previous = atomic_load_explicit(
+      &runtime_process_control->image_epoch, memory_order_relaxed);
+  if (previous == UINT64_MAX) {
+    virtual_identity_unlock();
+    dr_fprintf(diagnostic_file, "reverie-dbt: runtime image epoch overflowed\n");
+    exit_runtime_tree(101);
+    return false;
+  }
+  runtime_process_epoch = previous + 1;
+  atomic_store_explicit(
+      &runtime_process_control->image_epoch,
+      runtime_process_epoch,
+      memory_order_release);
+  virtual_identity_unlock();
+
+  // Every owner syscall starts the helper before native execution, or exits
+  // on spawn failure. Thus an owner that execs has a real predecessor helper,
+  // even for a runtime whose background entry returns immediately. A copied
+  // fork/vfork child has no own image epoch until this first real exec.
+  if (previous == 0)
+    return true;
+
+  // Successful exec created this image. Ask the old helper to retire through
+  // its idle callback and await its own acknowledged FINAL and kernel exit
+  // before any new thread callback can publish START. Returning from the
+  // helper callback alone has not released its shared descriptor table.
+  // Failed exec never reaches this claim.
+  // This host-time budget only bounds lifecycle control; it never enters the
+  // guest clock, and expiry cannot stand in for evidence completion.
+  struct timespec started;
+  if (clock_gettime(CLOCK_MONOTONIC, &started) != 0) {
+    dr_fprintf(
+        diagnostic_file, "reverie-dbt: could not time exec helper retirement\n");
+    exit_runtime_tree(101);
+    return false;
+  }
+  for (;;) {
+    if (atomic_load_explicit(
+            &runtime_process_control->finished_helper_epoch,
+            memory_order_acquire) == previous) {
+      int completion = confirm_previous_helper_exit();
+      if (completion > 0)
+        return true;
+      if (completion < 0) {
+        dr_fprintf(
+            diagnostic_file,
+            "reverie-dbt: could not confirm previous runtime helper kernel "
+            "exit for image epoch %llu\n",
+            (unsigned long long)previous);
+        exit_runtime_tree(101);
+        return false;
+      }
+    }
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+      dr_fprintf(
+          diagnostic_file, "reverie-dbt: could not time exec helper retirement\n");
+      exit_runtime_tree(101);
+      return false;
+    }
+    int64_t elapsed_ms = (int64_t)(now.tv_sec - started.tv_sec) * INT64_C(1000) +
+        (now.tv_nsec - started.tv_nsec) / INT64_C(1000000);
+    if (elapsed_ms >= (int64_t)EXEC_HELPER_RETIREMENT_TIMEOUT_MS) {
+      dr_fprintf(
+          diagnostic_file,
+          "reverie-dbt: previous runtime helper did not finish image epoch "
+          "%llu before exec retirement timeout\n",
+          (unsigned long long)previous);
+      exit_runtime_tree(101);
+      return false;
+    }
+    dr_sleep(1);
+  }
 }
 
 static void finish_pending_thread_clone(int32_t virtual_pid) {
@@ -5443,11 +5615,27 @@ static dr_signal_action_t event_signal(void* drcontext, dr_siginfo_t* info) {
 }
 
 static void runtime_idle(void) {
+  if (!runtime_retirement_requested &&
+      atomic_load_explicit(
+          &runtime_process_control->image_epoch, memory_order_acquire) !=
+          runtime_process_epoch) {
+    runtime_retirement_requested = true;
+    reverie_dbt_runtime_process_exit();
+  }
   dr_sleep(1);
 }
 
 static void runtime_background_init(void* argument) {
   (void)argument;
+  runtime_process_control->helper_pid = (int32_t)getpid();
+  if (!evidence_process_start_time(
+          (process_id_t)runtime_process_control->helper_pid,
+          &runtime_process_control->helper_start_time)) {
+    dr_fprintf(
+        diagnostic_file, "reverie-dbt: could not identify runtime helper\n");
+    exit_runtime_tree(101);
+    return;
+  }
   atomic_store_explicit(&runtime_background_state, 2, memory_order_release);
   evidence_callback_enter();
   evidence_emit_image_initialization();
@@ -5479,6 +5667,20 @@ static void runtime_background_init(void* argument) {
   // sender explicitly before the client process exits.
   require_evidence_flush(EVIDENCE_FRAME_FINAL);
   atomic_store_explicit(&runtime_background_state, 3, memory_order_release);
+  atomic_store_explicit(
+      &runtime_process_control->finished_helper_epoch,
+      runtime_process_epoch,
+      memory_order_release);
+  if (test_delay_exec_helper_exit && runtime_process_epoch == 1) {
+    // This fixture must exec once. Hold its first helper (and shared FDs)
+    // until the successor claims its image, then expose the window between
+    // acknowledged FINAL and kernel exit. Later images exit normally.
+    while (atomic_load_explicit(
+               &runtime_process_control->image_epoch, memory_order_acquire) ==
+           runtime_process_epoch)
+      dr_sleep(1);
+    dr_sleep(1000);
+  }
 }
 
 static void ensure_runtime_background(void) {
@@ -5544,6 +5746,8 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
       test_runtime_abi_mismatch = true;
     else if (strcmp(argv[i], "-test-wait-for-background") == 0)
       test_wait_for_background = true;
+    else if (strcmp(argv[i], "-test-delay-exec-helper-exit") == 0)
+      test_delay_exec_helper_exit = true;
     else if (strcmp(argv[i], "-test-kill-announced-child") == 0)
       test_kill_announced_child = true;
     else if (strcmp(argv[i], "-test-thread-exit-evidence") == 0)
@@ -5638,6 +5842,8 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
     virtual_parent_process_id = VIRTUAL_INIT_PID;
     remember_virtual_identity((int32_t)runtime_owner_pid, virtual_process_id);
   }
+  if (!claim_runtime_image())
+    return;
   atomic_store_explicit(
       pending_thread_clones_for(virtual_process_id), 0, memory_order_release);
   atomic_store_explicit(
@@ -5677,6 +5883,7 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
       /* Handled before application initialization. */
     } else if (
         strcmp(argv[i], "-test-wait-for-background") == 0 ||
+        strcmp(argv[i], "-test-delay-exec-helper-exit") == 0 ||
         strcmp(argv[i], "-test-kill-announced-child") == 0 ||
         strcmp(argv[i], "-test-thread-exit-evidence") == 0 ||
         strcmp(argv[i], "-test-reused-tid") == 0 ||
