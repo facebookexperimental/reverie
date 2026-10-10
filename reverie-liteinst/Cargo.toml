@@ -83,6 +83,11 @@ name = "region_stacks"
 path = "tests/region_stacks.rs"
 required-features = ["allocator-fixture"]
 
+[[test]]
+name = "standalone_constructor"
+path = "tests/standalone_constructor.rs"
+required-features = ["allocator-fixture"]
+
 [[bin]]
 name = "reverie-liteinst-exec-guest"
 path = "src/bin/exec_guest.rs"

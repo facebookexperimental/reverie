@@ -28,6 +28,10 @@
 #[path = "../glibc_compat.rs"]
 mod glibc_compat;
 
+#[used]
+#[unsafe(link_section = ".init_array")]
+static RESOLVE_REAL_DL_FIND_OBJECT: extern "C" fn() = glibc_compat::resolve_real_dl_find_object;
+
 // The cdylib's native archive dependency does not propagate to this binary.
 // Bind it here too; build.rs forces extraction before std's dynamic unwinder.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]

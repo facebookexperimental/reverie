@@ -324,7 +324,7 @@ fn qualify_runtime() -> Result<QualifiedRuntime, String> {
             features: &features,
             profile_name: "dev",
             profile: &profile,
-            initializer: "reverie_liteinst_initialize",
+            initializer: artifact::STANDALONE_ROOT,
             source_head: &source.head,
             source_tree: &source.tree,
             source_lock_sha256: &source.lock.sha256,

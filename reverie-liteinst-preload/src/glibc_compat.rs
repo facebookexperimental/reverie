@@ -74,19 +74,20 @@ static REAL_DL_FIND_OBJECT: AtomicUsize = AtomicUsize::new(UNRESOLVED);
 const UNRESOLVED: usize = 0;
 const ABSENT: usize = 1;
 
-#[used]
-#[unsafe(link_section = ".init_array")]
-static RESOLVE_REAL_DL_FIND_OBJECT: extern "C" fn() = resolve_real_dl_find_object;
-
 /// Finds the guest's real `_dl_find_object@GLIBC_2.35` and caches it. It
-/// runs as an `.init_array` entry, and on a lookup before that entry has run.
+/// runs from each compilation root's constructor, and on an earlier lookup.
 /// Two threads racing to run it store the same answer.
-extern "C" fn resolve_real_dl_find_object() {
+#[inline(never)]
+#[unsafe(export_name = "reverie_liteinst_resolve_real_dl_find_object")]
+pub(super) extern "C" fn resolve_real_dl_find_object() {
     let address =
         reverie::glibc_symbol::glibc_versioned_function(b"_dl_find_object", b"GLIBC_2.35")
             .unwrap_or(ABSENT);
     REAL_DL_FIND_OBJECT.store(address, Ordering::Release);
 }
+
+// Keep the real resolver local in both the preload and non-PIE fixture.
+core::arch::global_asm!(".hidden reverie_liteinst_resolve_real_dl_find_object");
 
 /// The guest's real `_dl_find_object`, if its libc has one.
 fn real_dl_find_object() -> Option<DlFindObjectFn> {

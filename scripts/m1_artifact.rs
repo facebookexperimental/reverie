@@ -1,6 +1,6 @@
-//! Shared, fail-closed diagnostic artifact qualification. No Cargo invocation is
-//! implicit in consumer verification. Producer commands are bounded separately
-//! from the enclosing validation DAG's CPU/memory/PID containment.
+//! Shared, fail-closed constructor and diagnostic artifact qualification.
+//! No Cargo invocation is implicit in consumer verification. Producer commands
+//! are bounded separately from the enclosing validation DAG's CPU/memory/PID containment.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -38,6 +38,18 @@ use sha2::Sha256;
 
 pub type Result<T> = std::result::Result<T, String>;
 pub const SCHEMA: u32 = 2;
+/// Explicit constructor contract for the genuine standalone preload. Generic
+/// embeddings and Detcore continue to request their exported initializer name.
+pub const STANDALONE_ROOT: &str = "reverie_liteinst_standalone_entry";
+const GENERIC_INITIALIZER: &str = "reverie_liteinst_initialize";
+const STANDALONE_BODY: &str = "reverie_liteinst_standalone_body";
+const STANDALONE_INITIALIZER: &str = "reverie_liteinst_standalone_initialize";
+const STANDALONE_RESOLVER: &str = "reverie_liteinst_resolve_real_dl_find_object";
+const CONSTRUCTOR_BRIDGE: &str = "reverie_inguest_constructor_entry";
+const CONSTRUCTOR_ADOPTION: &str = "reverie_inguest_constructor_adopt_entry";
+const CONSTRUCTOR_GATE: &str = "reverie_inguest_trusted_syscall_ip";
+const CONSTRUCTOR_GATE_OWNER: &str = "reverie_inguest_trusted_syscall";
+const CONSTRUCTOR_GATE_RETURN: &str = "reverie_inguest_trusted_syscall_return_ip";
 pub const FROZEN_RUST_ORACLE: &str =
     "d85c3094519855dde18571047b945aeca112b8e4df2138cff83fc33bfba0bce8";
 pub const FROZEN_C_ORACLE: &str =
@@ -75,6 +87,13 @@ fn require(condition: bool, message: impl Into<String>) -> Result<()> {
 
 pub fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Hash the exact source compiled into this host proof library/module. Consumers
+/// compare it with Cargo metadata's canonical library target source, independent
+/// of the runtime artifact's package and source identity.
+pub fn qualifier_source_sha256() -> String {
+    sha256(include_bytes!("m1_artifact.rs"))
 }
 
 pub fn file_sha256(path: &Path) -> Result<String> {
@@ -757,12 +776,33 @@ pub struct SymbolEvidence {
     pub visibility: u8,
 }
 
+/// Constructor-only evidence for the normal, feature-empty standalone leaf.
+/// This distinct type cannot satisfy the mandatory diagnostic RuntimeReceipt.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConstructorQualification {
+    pub artifact: FileIdentity,
+    pub initializer: SymbolEvidence,
+    pub init_array_slot: u64,
+    pub init_array_resolution: String,
+    pub standalone_constructor: StandaloneConstructorEvidence,
+    pub needed: Vec<String>,
+    pub required_versions: Vec<String>,
+    pub readelf_versions: FileIdentity,
+    pub readelf_symbols_relocations: FileIdentity,
+    pub objdump_disassembly: FileIdentity,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ElfQualification {
     pub initializer: SymbolEvidence,
     pub init_array_slot: u64,
     pub init_array_resolution: String,
+    /// Present only for the explicit standalone contract. This is emitted
+    /// constructor routing evidence, not execution or whole-memory isolation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standalone_constructor: Option<StandaloneConstructorEvidence>,
     pub exports: Vec<SymbolEvidence>,
     pub allocation_shims: BTreeMap<String, SymbolEvidence>,
     pub needed: Vec<String>,
@@ -785,6 +825,48 @@ pub struct ElfQualification {
     pub readelf_versions: FileIdentity,
     pub readelf_symbols_relocations: FileIdentity,
     pub objdump_disassembly: FileIdentity,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConstructorTransfer {
+    pub instruction: u64,
+    pub target: u64,
+    pub local_got_slot: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StandaloneConstructorEvidence {
+    pub generic_initializer: SymbolEvidence,
+    pub body: SymbolEvidence,
+    pub selected_initializer: SymbolEvidence,
+    pub resolver: SymbolEvidence,
+    pub bridge: SymbolEvidence,
+    pub adoption: SymbolEvidence,
+    /// Zero-size interior instruction label, not a standalone function.
+    pub native_gate: SymbolEvidence,
+    pub native_gate_owner: SymbolEvidence,
+    pub native_gate_return: SymbolEvidence,
+    pub native_gate_offset: u64,
+    /// Finite dev Result::is_err call route; never a generic graph edge.
+    pub adoption_helper_edges: Vec<GotEdge>,
+    pub function_sha256: BTreeMap<String, String>,
+    pub environ_got_slot: u64,
+    pub selector_address: u64,
+    pub active_body_materialization: u64,
+    pub active_bridge_transfer: ConstructorTransfer,
+    pub inert_resolver_transfer: ConstructorTransfer,
+    pub body_initializer_call: ConstructorTransfer,
+    pub body_resolver_transfer: ConstructorTransfer,
+    pub bridge_adoption_call: ConstructorTransfer,
+    pub body_pointer_load: u64,
+    pub adoption_body_call: u64,
+    pub adoption_recipe: String,
+    pub bootstrap_record: u64,
+    pub bootstrap_bottom: u64,
+    pub bootstrap_top: u64,
+    pub observation: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1000,6 +1082,371 @@ fn export(elf: &Elf<'_>, name: &str) -> Result<(usize, sym::Sym)> {
         format!("required function {name} is not externally exported"),
     )?;
     Ok((index, s))
+}
+
+fn private_function(elf: &Elf<'_>, name: &str) -> Result<sym::Sym> {
+    let candidates: Vec<_> =
+        elf.syms
+            .iter()
+            .filter(|s| elf.strtab.get_at(s.st_name) == Some(name) && executable_symbol(elf, s))
+            .chain(elf.dynsyms.iter().filter(|s| {
+                elf.dynstrtab.get_at(s.st_name) == Some(name) && executable_symbol(elf, s)
+            }))
+            .collect();
+    require(
+        !candidates.is_empty(),
+        format!("missing private constructor function {name}"),
+    )?;
+    let first = candidates[0];
+    require(
+        candidates.iter().all(|s| {
+            s.st_value == first.st_value
+                && s.st_size == first.st_size
+                && private_constructor_binding(s.st_bind(), s.st_visibility())
+        }),
+        format!("constructor function {name} is ambiguous/preemptible"),
+    )?;
+    Ok(first)
+}
+
+fn private_constructor_binding(binding: u8, visibility: u8) -> bool {
+    binding == sym::STB_LOCAL || matches!(visibility, sym::STV_HIDDEN | sym::STV_INTERNAL)
+}
+
+fn unique_standalone_slot(root_slots: &[u64], generic_slots: &[u64]) -> Result<u64> {
+    require(
+        generic_slots.is_empty(),
+        "generic initializer is a second leaf init_array root",
+    )?;
+    require(
+        root_slots.len() == 1,
+        "standalone native root must have exactly one relocated init_array slot",
+    )?;
+    Ok(root_slots[0])
+}
+
+fn standalone_symbols(elf: &Elf<'_>) -> Result<BTreeMap<String, sym::Sym>> {
+    let mut symbols = BTreeMap::new();
+    for name in [
+        STANDALONE_ROOT,
+        STANDALONE_BODY,
+        STANDALONE_INITIALIZER,
+        STANDALONE_RESOLVER,
+        CONSTRUCTOR_BRIDGE,
+        CONSTRUCTOR_ADOPTION,
+        CONSTRUCTOR_GATE_OWNER,
+    ] {
+        symbols.insert(name.to_owned(), private_function(elf, name)?);
+    }
+    // The dev adoption compiler emits a local Result<&ToolRegion,i32>::is_err
+    // call. Select its full range only by the exact type/method role. Optimized
+    // code may inline it; no arbitrary std function becomes a graph endpoint.
+    for (name, symbol) in constructor_result_helpers(elf)? {
+        symbols.insert(name, symbol);
+    }
+    // This cannot be inferred from an rlib/no_mangle declaration. Require the
+    // actual public dynamic export even when the real leaf no longer calls it.
+    symbols.insert(
+        GENERIC_INITIALIZER.to_owned(),
+        export(elf, GENERIC_INITIALIZER)?.1,
+    );
+    require(
+        symbols
+            .values()
+            .map(|s| s.st_value)
+            .collect::<BTreeSet<_>>()
+            .len()
+            == symbols.len(),
+        "standalone constructor roles alias one another",
+    )?;
+    Ok(symbols)
+}
+
+fn constructor_result_helpers(elf: &Elf<'_>) -> Result<BTreeMap<String, sym::Sym>> {
+    let mut result = BTreeMap::new();
+    for symbol in elf.syms.iter().filter(|s| executable_symbol(elf, s)) {
+        let Some(name) = elf.strtab.get_at(symbol.st_name) else {
+            continue;
+        };
+        if name.contains("_4core6result")
+            && name.contains("6ResultR")
+            && name.contains("15reverie_inguest5guest11tool_region10ToolRegionlE6is_err")
+        {
+            require(
+                symbol.st_bind() == sym::STB_LOCAL,
+                "constructor Result::is_err helper is preemptible",
+            )?;
+            if let Some(prior) = result.insert(name.to_owned(), symbol) {
+                require(
+                    prior.st_value == symbol.st_value
+                        && prior.st_size == symbol.st_size
+                        && prior.st_bind() == symbol.st_bind()
+                        && prior.st_visibility() == symbol.st_visibility(),
+                    "conflicting constructor Result::is_err symbol",
+                )?;
+            }
+        }
+    }
+    require(
+        result.len() <= 1,
+        "ambiguous constructor Result::is_err helper",
+    )?;
+    Ok(result)
+}
+
+fn constructor_interior_label(elf: &Elf<'_>, name: &str, owner: &sym::Sym) -> Result<sym::Sym> {
+    let labels: Vec<_> = elf
+        .syms
+        .iter()
+        .filter(|s| elf.strtab.get_at(s.st_name) == Some(name))
+        .chain(
+            elf.dynsyms
+                .iter()
+                .filter(|s| elf.dynstrtab.get_at(s.st_name) == Some(name)),
+        )
+        .collect();
+    require(
+        labels.len() == 1,
+        format!("constructor interior label {name} is absent/ambiguous"),
+    )?;
+    let label = labels[0];
+    require(
+        owner.st_bind() == sym::STB_LOCAL
+            && owner.st_visibility() == sym::STV_HIDDEN
+            && label.st_type() == sym::STT_NOTYPE
+            && label.st_size == 0
+            && label.st_bind() == sym::STB_LOCAL
+            && label.st_visibility() == sym::STV_HIDDEN
+            && label.st_shndx == owner.st_shndx
+            && label.st_value >= owner.st_value
+            && owner
+                .st_value
+                .checked_add(owner.st_size)
+                .is_some_and(|end| label.st_value < end),
+        format!(
+            "constructor label {name} is not a unique hidden interior label of its actual function"
+        ),
+    )?;
+    Ok(label)
+}
+
+const CONSTRUCTOR_GATE_OWNER_BYTES: &[u8] = &[
+    0x41, 0x54, 0x4c, 0x8d, 0x25, 0x1c, 0, 0, 0, 0x48, 0x89, 0xf8, 0x48, 0x89, 0xf7, 0x48, 0x89,
+    0xd6, 0x48, 0x89, 0xca, 0x4d, 0x89, 0xc2, 0x4d, 0x89, 0xc8, 0x4c, 0x8b, 0x4c, 0x24, 0x10, 0x0f,
+    0x05, 0x41, 0xff, 0xe4, 0xf3, 0x0f, 0x1e, 0xfa, 0x41, 0x5c, 0xc3,
+];
+const CONSTRUCTOR_RESULT_HELPER_BYTES: &[u8] = &[
+    0x48, 0x89, 0x7c, 0x24, 0xf8, 0x8b, 0x07, 0x48, 0x83, 0xf8, 0, 0x0f, 0x94, 0xc0, 0x34, 0xff,
+    0x24, 0x01, 0xc3,
+];
+
+fn constructor_gate_operands(code: &[u8], ip_offset: u64, return_offset: u64) -> Result<()> {
+    require(
+        code == CONSTRUCTOR_GATE_OWNER_BYTES
+            && ip_offset == 0x20
+            && return_offset == 0x22
+            && code.get(0x20..0x25) == Some(&[0x0f, 0x05, 0x41, 0xff, 0xe4]),
+        "constructor gate owner/label offset is not the complete existing syscall/JMP R12 gate",
+    )
+}
+
+// Objdump annotates NOTYPE interior labels with additional headers. Authenticate
+// exactly these two annotations and their instruction cursor; retain the raw
+// evidence verbatim and feed all instruction bytes to the unchanged strict
+// verifier. This is not acceptance of arbitrary nested headers/functions.
+fn constructor_gate_disassembly_view(
+    text: &str,
+    owner: &sym::Sym,
+    labels: &BTreeMap<u64, &str>,
+) -> Result<String> {
+    let end = owner
+        .st_value
+        .checked_add(owner.st_size)
+        .ok_or("gate owner range overflows")?;
+    let mut within = false;
+    let mut cursor = owner.st_value;
+    let mut seen = BTreeSet::new();
+    let mut output = String::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some((address, suffix)) = trimmed.split_once(" <").filter(|(_, s)| s.ends_with(">:"))
+        {
+            let address = u64::from_str_radix(address, 16)
+                .map_err(|_| "invalid constructor disassembly header")?;
+            if let Some(name) = labels.get(&address) {
+                require(
+                    within
+                        && cursor == address
+                        && suffix == format!("{name}>:")
+                        && seen.insert(address),
+                    "gate interior header is duplicate/misplaced or names the wrong actual label",
+                )?;
+                continue;
+            }
+            if within {
+                require(cursor == end, "gate owner raw disassembly is truncated")?;
+            }
+            within = address == owner.st_value;
+            if within {
+                cursor = address;
+            }
+        } else if let Some((address, raw)) = trimmed
+            .split_once(':')
+            .and_then(|(address, raw)| {
+                u64::from_str_radix(address.trim(), 16)
+                    .ok()
+                    .map(|address| (address, raw))
+            })
+            .filter(|_| within)
+        {
+            let bytes = raw
+                .split_whitespace()
+                .map_while(raw_byte)
+                .collect::<Vec<_>>();
+            require(
+                address == cursor && !bytes.is_empty(),
+                "gate annotation cursor has a gap or missing bytes",
+            )?;
+            cursor = cursor
+                .checked_add(bytes.len() as u64)
+                .ok_or("gate instruction cursor overflow")?;
+            require(
+                cursor <= end,
+                "gate disassembly overruns its complete function",
+            )?;
+        }
+        output.push_str(line);
+        output.push('\n');
+    }
+    if within {
+        require(cursor == end, "gate owner raw disassembly is incomplete")?;
+    }
+    require(
+        seen.len() == labels.len(),
+        "actual gate interior label header is missing",
+    )?;
+    Ok(output)
+}
+
+// Producer and independent consumer use the same constructor-specific header
+// treatment. Generic byte coverage and graph rules remain unchanged.
+fn verify_constructor_complete_bytes(
+    elf: &Elf<'_>,
+    initializer: &str,
+    text: &str,
+    expected: &BTreeMap<u64, Vec<u8>>,
+) -> Result<()> {
+    if initializer == STANDALONE_ROOT {
+        let owner = private_function(elf, CONSTRUCTOR_GATE_OWNER)?;
+        let ip = constructor_interior_label(elf, CONSTRUCTOR_GATE, &owner)?;
+        let return_ip = constructor_interior_label(elf, CONSTRUCTOR_GATE_RETURN, &owner)?;
+        let view = constructor_gate_disassembly_view(
+            text,
+            &owner,
+            &BTreeMap::from([
+                (ip.st_value, CONSTRUCTOR_GATE),
+                (return_ip.st_value, CONSTRUCTOR_GATE_RETURN),
+            ]),
+        )?;
+        verify_disassembly_bytes(&view, expected)
+    } else {
+        verify_disassembly_bytes(text, expected)
+    }
+}
+
+fn standalone_init_slot(elf: &Elf<'_>, bytes: &[u8], root: &sym::Sym) -> Result<(u64, String)> {
+    let (generic_index, generic) = export(elf, GENERIC_INITIALIZER)?;
+    let sections: Vec<_> = elf
+        .section_headers
+        .iter()
+        .filter(|s| {
+            s.sh_type == section_header::SHT_INIT_ARRAY
+                && elf.shdr_strtab.get_at(s.sh_name) == Some(".init_array")
+        })
+        .collect();
+    require(
+        sections.len() == 1,
+        "standalone requires one .init_array section",
+    )?;
+    let s = sections[0];
+    require(
+        s.sh_size > 0 && s.sh_size % 8 == 0 && s.sh_addr % 8 == 0,
+        "standalone has invalid .init_array layout",
+    )?;
+    require(
+        elf.program_headers.iter().any(|p| {
+            p.p_type == program_header::PT_LOAD
+                && s.sh_addr >= p.p_vaddr
+                && s.sh_addr
+                    .checked_add(s.sh_size)
+                    .is_some_and(|end| end <= p.p_vaddr.saturating_add(p.p_filesz))
+                && p.p_offset.checked_add(s.sh_addr - p.p_vaddr) == Some(s.sh_offset)
+        }),
+        "standalone .init_array is not wholly file-backed at its actual load address",
+    )?;
+    let start = usize::try_from(s.sh_offset).map_err(|e| e.to_string())?;
+    let len = usize::try_from(s.sh_size).map_err(|e| e.to_string())?;
+    let entries = bytes
+        .get(start..start.checked_add(len).ok_or("init_array overflow")?)
+        .ok_or("init_array outside ELF")?;
+    let relocations: Vec<_> = elf
+        .dynrelas
+        .iter()
+        .chain(elf.dynrels.iter())
+        .chain(elf.pltrelocs.iter())
+        .collect();
+    let mut root_slots = Vec::new();
+    let mut generic_slots = Vec::new();
+    for (i, entry) in entries.as_chunks::<8>().0.iter().enumerate() {
+        let slot = s.sh_addr + i as u64 * 8;
+        let raw = u64::from_le_bytes(*entry);
+        let records: Vec<_> = relocations.iter().filter(|r| r.r_offset == slot).collect();
+        require(
+            records.len() <= 1,
+            "overlapping standalone init_array relocations",
+        )?;
+        let mut resolved = None;
+        if let Some(r) = records.first() {
+            let addend = r.r_addend.unwrap_or(raw as i64);
+            if r.r_type == reloc::R_X86_64_RELATIVE && r.r_sym == 0 && addend >= 0 {
+                resolved = Some(addend as u64);
+            } else if r.r_type == reloc::R_X86_64_64 && addend == 0 {
+                if r.r_sym == generic_index {
+                    resolved = Some(generic.st_value);
+                } else if let Some(symbol) = elf
+                    .dynsyms
+                    .get(r.r_sym)
+                    .filter(|symbol| symbol.st_shndx != section_header::SHN_UNDEF as usize)
+                {
+                    resolved = Some(symbol.st_value);
+                }
+            }
+        } else {
+            require(
+                raw != root.st_value && raw != generic.st_value,
+                "standalone/generic initializer pointer lacks loader relocation",
+            )?;
+        }
+        if resolved == Some(generic.st_value) {
+            generic_slots.push(slot);
+        }
+        if resolved == Some(root.st_value) {
+            let record = records
+                .first()
+                .ok_or("standalone root lacks loader relocation")?;
+            let addend = record.r_addend.unwrap_or(raw as i64);
+            require(
+                record.r_type == reloc::R_X86_64_RELATIVE
+                    && record.r_sym == 0
+                    && addend >= 0
+                    && addend as u64 == root.st_value,
+                "standalone root requires an exact RELATIVE/symbol-zero relocation; a dynamic alias is not its loader identity",
+            )?;
+            root_slots.push(slot);
+        }
+    }
+    Ok((unique_standalone_slot(&root_slots, &generic_slots)?,
+        "Unique loader relocation to exact hidden standalone root; no generic initializer registration".to_owned()))
 }
 
 fn init_array_slot(
@@ -1222,8 +1669,13 @@ fn proof_functions(elf: &Elf<'_>, initializer_name: &str) -> Result<BTreeMap<u64
         })
         .collect();
     // Do not let a naming predicate prune a mandatory entry or compiler shim.
-    for name in EXPORTS.into_iter().chain([initializer_name]) {
+    for name in EXPORTS {
         addresses.insert(export(elf, name)?.1.st_value);
+    }
+    if initializer_name == STANDALONE_ROOT {
+        addresses.extend(constructor_proof_functions(elf)?.keys().copied());
+    } else {
+        addresses.insert(export(elf, initializer_name)?.1.st_value);
     }
     for shim in SHIMS {
         let candidates: Vec<_> = elf
@@ -1242,6 +1694,22 @@ fn proof_functions(elf: &Elf<'_>, initializer_name: &str) -> Result<BTreeMap<u64
         )?;
         addresses.insert(candidates[0].st_value);
     }
+    selected_function_ranges(elf, addresses)
+}
+
+/// The standalone constructor scope is independent of diagnostic M1 exports,
+/// but retains every private role and the actual public generic initializer.
+fn constructor_proof_functions(elf: &Elf<'_>) -> Result<BTreeMap<u64, u64>> {
+    selected_function_ranges(
+        elf,
+        standalone_symbols(elf)?
+            .values()
+            .map(|s| s.st_value)
+            .collect(),
+    )
+}
+
+fn selected_function_ranges(elf: &Elf<'_>, addresses: BTreeSet<u64>) -> Result<BTreeMap<u64, u64>> {
     let mut functions = BTreeMap::new();
     for address in addresses {
         let sizes: BTreeSet<_> = elf
@@ -1409,6 +1877,961 @@ fn verify_disassembly_bytes(text: &str, expected: &BTreeMap<u64, Vec<u8>>) -> Re
     Ok(())
 }
 
+// These are finite checks for the reviewed constructor, not another call-graph
+// rule. In particular no register-indirect edge is added to disassembly_edges.
+struct ConstructorCode<'a> {
+    address: u64,
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> ConstructorCode<'a> {
+    fn ip(&self) -> u64 {
+        self.address + self.offset as u64
+    }
+    fn exact(&mut self, expected: &[u8]) -> Result<u64> {
+        let ip = self.ip();
+        let end = self
+            .offset
+            .checked_add(expected.len())
+            .ok_or("constructor byte overflow")?;
+        require(
+            self.bytes.get(self.offset..end) == Some(expected),
+            format!("unsupported constructor instruction/operand at {ip:#x}"),
+        )?;
+        self.offset = end;
+        Ok(ip)
+    }
+    fn relative(&mut self, opcode: &[u8]) -> Result<(u64, u64)> {
+        let ip = self.exact(opcode)?;
+        let end = self
+            .offset
+            .checked_add(4)
+            .ok_or("constructor displacement overflow")?;
+        let raw = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or("truncated constructor displacement")?;
+        let displacement = i32::from_le_bytes(raw.try_into().unwrap());
+        self.offset = end;
+        let target = self
+            .ip()
+            .checked_add_signed(i64::from(displacement))
+            .ok_or("constructor relative address overflow")?;
+        Ok((ip, target))
+    }
+    fn conditional(&mut self, condition: u8) -> Result<u64> {
+        if self.bytes.get(self.offset) == Some(&(0x70 | condition)) {
+            self.exact(&[0x70 | condition])?;
+            let byte = *self
+                .bytes
+                .get(self.offset)
+                .ok_or("truncated constructor branch")?;
+            self.offset += 1;
+            self.ip()
+                .checked_add_signed(i64::from(byte as i8))
+                .ok_or_else(|| "constructor branch overflow".to_owned())
+        } else {
+            self.relative(&[0x0f, 0x80 | condition])
+                .map(|(_, target)| target)
+        }
+    }
+    fn jump(&mut self) -> Result<ConstructorTransfer> {
+        let ip = self.ip();
+        let target = if self.bytes.get(self.offset) == Some(&0xeb) {
+            self.exact(&[0xeb])?;
+            let byte = *self
+                .bytes
+                .get(self.offset)
+                .ok_or("truncated constructor jump")?;
+            self.offset += 1;
+            self.ip()
+                .checked_add_signed(i64::from(byte as i8))
+                .ok_or("constructor jump overflow")?
+        } else {
+            self.relative(&[0xe9])?.1
+        };
+        Ok(ConstructorTransfer {
+            instruction: ip,
+            target,
+            local_got_slot: None,
+        })
+    }
+    fn transfer(&mut self, call: bool, got: &BTreeMap<u64, u64>) -> Result<ConstructorTransfer> {
+        if self.bytes.get(self.offset) == Some(&(if call { 0xe8 } else { 0xe9 })) {
+            let (instruction, target) = self.relative(&[if call { 0xe8 } else { 0xe9 }])?;
+            Ok(ConstructorTransfer {
+                instruction,
+                target,
+                local_got_slot: None,
+            })
+        } else {
+            let (instruction, slot) = self.relative(&[0xff, if call { 0x15 } else { 0x25 }])?;
+            let target = *got
+                .get(&slot)
+                .ok_or("constructor transfer is not an exact LOCAL RELATIVE GOT route")?;
+            Ok(ConstructorTransfer {
+                instruction,
+                target,
+                local_got_slot: Some(slot),
+            })
+        }
+    }
+    fn done(&self) -> Result<()> {
+        require(
+            self.offset == self.bytes.len(),
+            "constructor has unchecked trailing instructions",
+        )
+    }
+}
+
+fn loaded_bytes<'a>(
+    elf: &Elf<'_>,
+    bytes: &'a [u8],
+    address: u64,
+    length: usize,
+) -> Result<&'a [u8]> {
+    let end = address
+        .checked_add(length as u64)
+        .ok_or("constructor data range overflow")?;
+    let offsets: BTreeSet<_> = elf
+        .program_headers
+        .iter()
+        .filter_map(|p| {
+            (p.p_type == program_header::PT_LOAD
+                && p.p_flags & program_header::PF_R != 0
+                && address >= p.p_vaddr
+                && end <= p.p_vaddr.checked_add(p.p_filesz)?)
+            .then(|| p.p_offset.checked_add(address - p.p_vaddr))
+            .flatten()
+        })
+        .collect();
+    require(
+        offsets.len() == 1,
+        "constructor data lacks unique readable file-backed range",
+    )?;
+    let offset = usize::try_from(*offsets.iter().next().unwrap()).map_err(|e| e.to_string())?;
+    bytes
+        .get(
+            offset
+                ..offset
+                    .checked_add(length)
+                    .ok_or("constructor data offset overflow")?,
+        )
+        .ok_or_else(|| "constructor data outside actual ELF".to_owned())
+}
+
+struct PrefixRoute {
+    environ: u64,
+    selector: u64,
+    materialization: u64,
+    active: ConstructorTransfer,
+    inert: ConstructorTransfer,
+}
+
+fn standalone_prefix(
+    code: &[u8],
+    address: u64,
+    body: u64,
+    bridge: u64,
+    resolver: u64,
+) -> Result<PrefixRoute> {
+    let mut c = ConstructorCode {
+        address,
+        bytes: code,
+        offset: 0,
+    };
+    c.exact(&[0xf3, 0x0f, 0x1e, 0xfa])?;
+    let (_, environ) = c.relative(&[0x48, 0x8b, 0x05])?;
+    c.exact(&[0x48, 0x8b, 0x10, 0x48, 0x85, 0xd2])?;
+    let no_vector = c.conditional(4)?;
+    let (_, selector) = c.relative(&[0x4c, 0x8d, 0x05])?;
+    let vector_loop = c.ip();
+    c.exact(&[0x4c, 0x8b, 0x12, 0x4d, 0x85, 0xd2])?;
+    let vector_end = c.conditional(4)?;
+    c.exact(&[0x45, 0x31, 0xc9])?;
+    let byte_loop = c.ip();
+    c.exact(&[0x43, 0x8a, 0x04, 0x0a, 0x84, 0xc0])?;
+    let short_entry = c.conditional(4)?;
+    c.exact(&[0x43, 0x3a, 0x04, 0x08])?;
+    let mismatch = c.conditional(5)?;
+    c.exact(&[0x41, 0xff, 0xc1, 0x41, 0x83, 0xf9, 22])?;
+    require(
+        c.conditional(5)? == byte_loop,
+        "selector byte loop has wrong destination",
+    )?;
+    let (materialization, supplied_body) = c.relative(&[0x48, 0x8d, 0x3d])?;
+    let active = c.jump()?;
+    let next_entry = c.ip();
+    c.exact(&[0x48, 0x83, 0xc2, 8])?;
+    require(
+        c.jump()?.target == vector_loop,
+        "selector vector loop has wrong destination",
+    )?;
+    let inert_entry = c.ip();
+    let inert = c.jump()?;
+    c.done()?;
+    require(
+        supplied_body == body && active.target == bridge && inert.target == resolver,
+        "standalone prefix does not materialize/transfer to its actual owned body/bridge/resolver",
+    )?;
+    require(
+        no_vector == inert_entry
+            && vector_end == inert_entry
+            && short_entry == next_entry
+            && mismatch == next_entry,
+        "standalone missing/short/mismatched selector branch is wrong",
+    )?;
+    Ok(PrefixRoute {
+        environ,
+        selector,
+        materialization,
+        active,
+        inert,
+    })
+}
+
+fn standalone_body_order(
+    code: &[u8],
+    address: u64,
+    helper: u64,
+    resolver: u64,
+    got: &BTreeMap<u64, u64>,
+) -> Result<(ConstructorTransfer, ConstructorTransfer)> {
+    let mut c = ConstructorCode {
+        address,
+        bytes: code,
+        offset: 0,
+    };
+    if c.bytes.starts_with(&[0xf3, 0x0f, 0x1e, 0xfa]) {
+        c.exact(&[0xf3, 0x0f, 0x1e, 0xfa])?;
+    }
+    let push = c.bytes.get(c.offset) == Some(&0x50);
+    c.exact(if push {
+        &[0x50]
+    } else {
+        &[0x48, 0x83, 0xec, 8]
+    })?;
+    let initialization = c.transfer(true, got)?;
+    let resolution = if c.bytes.get(c.offset) == Some(&0x58)
+        || c.bytes.get(c.offset..c.offset + 4) == Some(&[0x48, 0x83, 0xc4, 8])
+    {
+        c.exact(if push {
+            &[0x58]
+        } else {
+            &[0x48, 0x83, 0xc4, 8]
+        })?;
+        c.transfer(false, got)?
+    } else {
+        let resolution = c.transfer(true, got)?;
+        c.exact(if push {
+            &[0x58]
+        } else {
+            &[0x48, 0x83, 0xc4, 8]
+        })?;
+        c.exact(&[0xc3])?;
+        resolution
+    };
+    c.done()?;
+    require(
+        initialization.target == helper && resolution.target == resolver,
+        "active standalone body does not finish its exact initializer before explicit resolution",
+    )?;
+    Ok((initialization, resolution))
+}
+
+// Canonical complete scalar native bridge at RV780. Only the explicitly
+// checked same-owner RIP displacements may differ. This matches instructions
+// and operands; hashes below remain hashes of the entire unmodified ELF bytes.
+// The template includes the original diagnostic/exit route and its limitations.
+const CONSTRUCTOR_NATIVE_HEX: &str = concat!(
+    "f30f1efa66480f6ec466480f6ecb66480f6ed566490f6edc66490f6ee566490f6eee66490f6ef766480f6eff31c0b201f00fb015f54216040f85bf010000b80900000048bf000000000060000048be000000000100000031d241ba2200100049c7c0ffffffff4531c94c8d2505000000e9bfd1ffff",
+    "f30f1efa4885c00f887b01000049bd00000000006000004c39e874274889c748be0000000001000000b80b0000004c8d2505000000e985d1fffff30f1efae94501000048bf0010000000600000be00f00f00ba03000000b80a0000004c8d2505000000e957d1ffff",
+    "f30f1efa4885c00f851301000049bd001000000060000041c6450000498d7d28b92000000048c707ffffffff4883c708ffc975f148c7070300000049be301002000060000066480f7ec049890666480f7ec84989460866480f7ed04989461066480f7ed84989461866480f7ee04989462066480f7ee84989462866480f7ef04989463066480f7ef84989463849c746500100000049c7464801000000b8ba0000004c8d2505000000e9aad0ffff",
+    "f30f1efa4885c07e6a4989464048bf0010100000600000be00008000ba03000000b80a0000004c8d2505000000e978d0fffff30f1efa4885c0753848bc00109000006000004c89f7e83d05000048b83010020000600000488b5808488b68104c8b60184c8b68204c8b70284c8b7830488b20c3",
+    "b801000000bf02000000488d3531000000ba250000004c8d2505000000e915d0fffff30f1efab8e7000000bf7f0000004c8d2505000000e9fbcffffff30f1efa0f0b",
+);
+const CONSTRUCTOR_RECORD: u64 = 0x6000_0002_1030;
+const CONSTRUCTOR_BOTTOM: u64 = 0x6000_0010_1000;
+const CONSTRUCTOR_TOP: u64 = 0x6000_0090_1000;
+
+fn native_template() -> Vec<u8> {
+    let mut bytes = CONSTRUCTOR_NATIVE_HEX
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect::<Vec<_>>();
+    bytes.extend_from_slice(b"reverie constructor bootstrap failed\n");
+    bytes
+}
+
+fn constructor_native_bridge(
+    code: &[u8],
+    address: u64,
+    initializing: u64,
+    gate: u64,
+    adopt: u64,
+) -> Result<ConstructorTransfer> {
+    let template = native_template();
+    require(
+        code.len() == template.len(),
+        "native constructor bridge has unsupported extent",
+    )?;
+    let fields = [
+        (0x34, initializing, 0x38),
+        (0x71, gate, 0x75),
+        (0xab, gate, 0xaf),
+        (0xd9, gate, 0xdd),
+        (0x186, gate, 0x18a),
+        (0x1b8, gate, 0x1bc),
+        (0x1d3, adopt, 0x1d7),
+        (0x21b, gate, 0x21f),
+        (0x235, gate, 0x239),
+    ];
+    for (offset, target, end) in fields {
+        let displacement = i32::from_le_bytes(code[offset..offset + 4].try_into().unwrap());
+        require(
+            (address + end).checked_add_signed(i64::from(displacement)) == Some(target),
+            format!(
+                "native constructor relocation/transfer at {:#x} is not its exact local target",
+                address + offset as u64
+            ),
+        )?;
+    }
+    for (offset, (&actual, &expected)) in code.iter().zip(&template).enumerate() {
+        if !fields
+            .iter()
+            .any(|(start, _, _)| (*start..*start + 4).contains(&offset))
+        {
+            require(
+                actual == expected,
+                format!(
+                    "native constructor opcode/operand differs at {:#x}",
+                    address + offset as u64
+                ),
+            )?;
+        }
+    }
+    // In this complete template RDI is saved in XMM7 at +0x27, recovered into
+    // RAX and stored to record+0x38 at +0x165. Fresh NOREPLACE/2050 occupied
+    // pages/RW guarded interior precede MOV RSP,top (+0x1c5), and only then
+    // record->RDI and the actual local adoption CALL (+0x1d2) are executed.
+    Ok(ConstructorTransfer {
+        instruction: address + 0x1d2,
+        target: adopt,
+        local_got_slot: None,
+    })
+}
+
+#[derive(Clone)]
+struct EncodedConstructorInstruction {
+    address: u64,
+    bytes: Vec<u8>,
+}
+
+fn constructor_instructions(
+    text: &str,
+    function: u64,
+) -> Result<Vec<EncodedConstructorInstruction>> {
+    let mut selected = false;
+    let mut instructions = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some((address, suffix)) = line
+            .split_once(" <")
+            .filter(|(_, suffix)| suffix.ends_with(">:"))
+        {
+            let _ = suffix;
+            selected = u64::from_str_radix(address, 16).ok() == Some(function);
+            continue;
+        }
+        if !selected {
+            continue;
+        }
+        let Some((address, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let Ok(address) = u64::from_str_radix(address.trim(), 16) else {
+            continue;
+        };
+        let bytes = rest
+            .split_whitespace()
+            .map_while(raw_byte)
+            .collect::<Vec<_>>();
+        require(
+            !bytes.is_empty(),
+            "constructor instruction lacks checked raw bytes",
+        )?;
+        instructions.push(EncodedConstructorInstruction { address, bytes });
+    }
+    require(
+        !instructions.is_empty(),
+        "constructor instruction range missing",
+    )?;
+    Ok(instructions)
+}
+
+// An optimized recipe relies only on one callee-saved record register. Decode
+// the finite integer instruction families used by this adoption prefix to
+// reject a write to that register (including a 32-bit write). Unknown encodings
+// fail; this never resolves a generic indirect call or executes arbitrary CFGs.
+fn keeps_adoption_register(bytes: &[u8], register: u8) -> bool {
+    let mut offset = 0;
+    while bytes
+        .get(offset)
+        .is_some_and(|b| matches!(*b, 0xf0 | 0x66 | 0xf3))
+    {
+        offset += 1;
+    }
+    let rex = bytes
+        .get(offset)
+        .copied()
+        .filter(|b| (0x40..=0x4f).contains(b))
+        .unwrap_or(0);
+    if rex != 0 {
+        offset += 1;
+    }
+    let Some(&op) = bytes.get(offset) else {
+        return false;
+    };
+    if (0x50..=0x57).contains(&op) {
+        return register != 4;
+    }
+    if matches!(
+        op,
+        0xe8 | 0xe9
+            | 0xeb
+            | 0x84
+            | 0x85
+            | 0x38
+            | 0x39
+            | 0x3a
+            | 0x3b
+            | 0x90
+            | 0xa8
+            | 0xa9
+            | 0x04
+            | 0x0c
+            | 0x14
+            | 0x1c
+            | 0x24
+            | 0x2c
+            | 0x34
+            | 0x3c
+    ) || (0x70..=0x7f).contains(&op)
+    {
+        return true;
+    }
+    if (0x58..=0x5f).contains(&op) {
+        return register != 4 && (op - 0x58 + (rex & 1) * 8) != register;
+    }
+    let byte_reg = |r: u8| if rex == 0 && r >= 4 { r - 4 } else { r };
+    if (0xb0..=0xb7).contains(&op) {
+        return byte_reg(op - 0xb0 + (rex & 1) * 8) != register;
+    }
+    if (0xb8..=0xbf).contains(&op) {
+        return op - 0xb8 + (rex & 1) * 8 != register;
+    }
+    if op == 0x0f {
+        return match bytes.get(offset + 1) {
+            Some(0x80..=0x8f | 0x1f | 0xa3) => true,
+            Some(0xb1) => bytes
+                .get(offset + 2)
+                .is_some_and(|m| m >> 6 != 3 || (m & 7) + (rex & 1) * 8 != register),
+            Some(0x90..=0x9f) => bytes
+                .get(offset + 2)
+                .is_some_and(|m| m >> 6 != 3 || byte_reg((m & 7) + (rex & 1) * 8) != register),
+            Some(0xb6 | 0xb7 | 0xbe | 0xbf) => bytes
+                .get(offset + 2)
+                .is_some_and(|m| ((m >> 3) & 7) + ((rex >> 2) & 1) * 8 != register),
+            _ => false,
+        };
+    }
+    let Some(&m) = bytes.get(offset + 1) else {
+        return false;
+    };
+    let reg = ((m >> 3) & 7) + ((rex >> 2) & 1) * 8;
+    let rm = (m & 7) + (rex & 1) * 8;
+    match op {
+        0x8b | 0x8d => reg != register,
+        0x8a => byte_reg(reg) != register,
+        0x88 | 0xc0 | 0xd2 | 0xc6 => m >> 6 != 3 || byte_reg(rm) != register,
+        0x89 | 0x01 | 0x09 | 0x11 | 0x19 | 0x21 | 0x29 | 0x31 | 0xc1 | 0xd3 | 0xc7 => {
+            m >> 6 != 3 || rm != register
+        }
+        0x03 | 0x0b | 0x13 | 0x1b | 0x23 | 0x2b | 0x33 => reg != register,
+        0x80 => (m >> 3) & 7 == 7 || m >> 6 != 3 || byte_reg(rm) != register,
+        0x81 | 0x83 => (m >> 3) & 7 == 7 || m >> 6 != 3 || rm != register,
+        0xff => {
+            matches!((m >> 3) & 7, 2 | 4)
+                || ((m >> 3) & 7 == 6 && register != 4)
+                || (!matches!((m >> 3) & 7, 2 | 4 | 6) && (m >> 6 != 3 || rm != register))
+        }
+        _ => false,
+    }
+}
+
+fn adoption_memory_write(bytes: &[u8]) -> Result<Option<(u8, i32, i32)>> {
+    let mut offset = 0;
+    let mut word = false;
+    while bytes
+        .get(offset)
+        .is_some_and(|b| matches!(*b, 0xf0 | 0x66 | 0xf3))
+    {
+        word |= bytes[offset] == 0x66;
+        offset += 1;
+    }
+    let rex = bytes
+        .get(offset)
+        .copied()
+        .filter(|b| (0x40..=0x4f).contains(b))
+        .unwrap_or(0);
+    if rex != 0 {
+        offset += 1;
+    }
+    let op = *bytes.get(offset).ok_or("empty adoption instruction")?;
+    offset += 1;
+    let (writes, byte) = if op == 0x0f {
+        let second = *bytes.get(offset).ok_or("truncated adoption instruction")?;
+        offset += 1;
+        (
+            second == 0xb1 || (0x90..=0x9f).contains(&second),
+            (0x90..=0x9f).contains(&second),
+        )
+    } else {
+        let group = bytes.get(offset).map(|m| (m >> 3) & 7);
+        (
+            matches!(
+                op,
+                0x88 | 0x89
+                    | 0xc6
+                    | 0xc7
+                    | 0x01
+                    | 0x09
+                    | 0x11
+                    | 0x19
+                    | 0x21
+                    | 0x29
+                    | 0x31
+                    | 0xc0
+                    | 0xc1
+                    | 0xd2
+                    | 0xd3
+            ) || (matches!(op, 0x80 | 0x81 | 0x83) && group != Some(7))
+                || (op == 0xff && matches!(group, Some(0 | 1))),
+            matches!(op, 0x88 | 0xc6 | 0xc0 | 0xd2 | 0x80),
+        )
+    };
+    if !writes {
+        return Ok(None);
+    }
+    let m = *bytes.get(offset).ok_or("truncated adoption write")?;
+    offset += 1;
+    if m >> 6 == 3 {
+        return Ok(None);
+    }
+    let base = if m & 7 == 4 {
+        let sib = *bytes
+            .get(offset)
+            .ok_or("truncated adoption stack address")?;
+        offset += 1;
+        require(
+            (sib >> 3) & 7 == 4 && rex & 2 == 0,
+            "unsupported indexed adoption write",
+        )?;
+        sib & 7
+    } else {
+        m & 7
+    };
+    if m >> 6 == 0 && base == 5 {
+        return Ok(None);
+    } // RIP-relative, not either owned frame slot.
+    let displacement = match m >> 6 {
+        0 => 0,
+        1 => i32::from(
+            *bytes
+                .get(offset)
+                .ok_or("truncated adoption write displacement")? as i8,
+        ),
+        2 => i32::from_le_bytes(
+            bytes
+                .get(offset..offset + 4)
+                .ok_or("truncated adoption write displacement")?
+                .try_into()
+                .unwrap(),
+        ),
+        _ => unreachable!(),
+    };
+    let width = if byte {
+        1
+    } else if word {
+        2
+    } else if rex & 8 != 0 {
+        8
+    } else {
+        4
+    };
+    require(
+        displacement.checked_add(width).is_some(),
+        "adoption write extent overflows",
+    )?;
+    Ok(Some((base + (rex & 1) * 8, displacement, width)))
+}
+
+fn constructor_adoption_helper_edges(
+    instructions: &[EncodedConstructorInstruction],
+    supplied: usize,
+    got: &BTreeMap<u64, u64>,
+    helpers: &BTreeSet<u64>,
+) -> Result<Vec<GotEdge>> {
+    let mut edges = Vec::new();
+    // Census the complete function, not only exact CALL RAX instructions or
+    // the prefix before the supplied-body call. Prefix parsing here identifies
+    // unsupported FF /2..5 transfers; it never admits their prefixed forms.
+    // Only the original bare encodings earn the proofs below.
+    for (index, call) in instructions.iter().enumerate() {
+        let opcode = call
+            .bytes
+            .iter()
+            .take_while(|byte| {
+                matches!(
+                    **byte,
+                    0xf0 | 0xf2
+                        | 0xf3
+                        | 0x26
+                        | 0x2e
+                        | 0x36
+                        | 0x3e
+                        | 0x64
+                        | 0x65
+                        | 0x66
+                        | 0x67
+                        | 0x40..=0x4f
+                )
+            })
+            .count();
+        if call.bytes.get(opcode) != Some(&0xff) {
+            continue;
+        }
+        let modrm = *call
+            .bytes
+            .get(opcode + 1)
+            .ok_or("truncated adoption FF instruction")?;
+        if !matches!((modrm >> 3) & 7, 2..=5) {
+            continue;
+        }
+        if call.bytes.len() == 6 && call.bytes.starts_with(&[0xff, 0x15]) {
+            let slot = call
+                .address
+                .checked_add(6)
+                .and_then(|end| {
+                    end.checked_add_signed(i64::from(i32::from_le_bytes(
+                        call.bytes[2..6].try_into().unwrap(),
+                    )))
+                })
+                .ok_or("adoption RIP-relative call address overflows")?;
+            require(
+                got.contains_key(&slot),
+                "adoption RIP-relative call lacks its independently qualified local RELATIVE GOT target",
+            )?;
+            continue;
+        }
+        require(
+            call.bytes == [0xff, 0xd0],
+            "unsupported adoption indirect call/jump encoding or prefix",
+        )?;
+        if index == supplied {
+            continue;
+        }
+        require(
+            index >= 2
+                && index < supplied
+                && edges.is_empty()
+                && instructions[0].bytes == [0x48, 0x83, 0xec, 0x68]
+                && instructions[index - 1].bytes == [0x48, 0x8d, 0x7c, 0x24, 0x38],
+            "unrecognized/extra adoption register-indirect helper call",
+        )?;
+        let load = &instructions[index - 2];
+        require(
+            load.bytes.len() == 7 && load.bytes.starts_with(&[0x48, 0x8b, 0x05]),
+            "adoption helper lacks exact RIP-relative GOT load into RAX",
+        )?;
+        let slot = load
+            .address
+            .checked_add(7)
+            .and_then(|end| {
+                end.checked_add_signed(i64::from(i32::from_le_bytes(
+                    load.bytes[3..7].try_into().unwrap(),
+                )))
+            })
+            .ok_or("adoption helper GOT address overflows")?;
+        let target = *got
+            .get(&slot)
+            .ok_or("adoption helper GOT target is unresolved/preemptible")?;
+        require(
+            helpers.contains(&target),
+            "adoption indirect helper is not its exact local Result::is_err role",
+        )?;
+        edges.push(GotEdge {
+            source_function: instructions[0].address,
+            instruction: call.address,
+            slot,
+            target_function: target,
+        });
+    }
+    Ok(edges)
+}
+
+fn adoption_body_operand(
+    instructions: &[EncodedConstructorInstruction],
+    got: &BTreeMap<u64, u64>,
+    helpers: &BTreeSet<u64>,
+) -> Result<(u64, u64, String, Vec<GotEdge>)> {
+    let calls: Vec<_> = instructions
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| i.bytes == [0xff, 0xd0])
+        .collect();
+    let supplied: Vec<_> = calls
+        .iter()
+        .copied()
+        .filter(|(index, _)| {
+            *index > 0
+                && (instructions[*index - 1].bytes == [0x48, 0x8b, 0x04, 0x24]
+                    || (*index >= 3
+                        && instructions[*index - 3].bytes == [0x48, 0x8b, 0x43, 0x38]
+                        && instructions[*index - 2].bytes == [0x48, 0x89, 0xe1]
+                        && instructions[*index - 1].bytes == [0x48, 0x89, 0x4b, 0x60]))
+        })
+        .collect();
+    require(
+        supplied.len() == 1,
+        "adoption must have one specifically proved supplied-body CALL RAX",
+    )?;
+    let (call_index, call) = supplied[0];
+    let helper_edges = constructor_adoption_helper_edges(instructions, call_index, got, helpers)?;
+    let prefix = &instructions[..call_index];
+    if prefix.len() >= 7
+        && prefix[prefix.len() - 3].bytes == [0x48, 0x8b, 0x43, 0x38]
+        && prefix[prefix.len() - 2].bytes == [0x48, 0x89, 0xe1]
+        && prefix[prefix.len() - 1].bytes == [0x48, 0x89, 0x4b, 0x60]
+    {
+        require(
+            prefix[0].bytes == [0x41, 0x56]
+                && prefix[1].bytes == [0x53]
+                && prefix[2].bytes == [0x48, 0x83, 0xec, 0x28]
+                && prefix[3].bytes
+                    == [vec![0x48, 0xbb], CONSTRUCTOR_RECORD.to_le_bytes().to_vec()].concat()
+                && prefix[4].bytes == [0x49, 0x89, 0xe6]
+                && prefix[5].bytes == [0x48, 0x39, 0xdf]
+                && prefix[6].bytes.starts_with(&[0x0f, 0x85])
+                && prefix[4..].iter().all(|i| {
+                    keeps_adoption_register(&i.bytes, 3) && keeps_adoption_register(&i.bytes, 4)
+                }),
+            "optimized adoption record register is not the checked native record or is overwritten",
+        )?;
+        for instruction in &prefix[4..] {
+            if let Some((3, displacement, width)) = adoption_memory_write(&instruction.bytes)? {
+                require(
+                    displacement >= 0x40 || displacement + width <= 0x38,
+                    "optimized adoption overwrites its supplied-body field",
+                )?;
+            }
+        }
+        return Ok((prefix[prefix.len() - 3].address, call.address, "Optimized checked native-record RBX; literal +0x38 load into RAX, sample store +0x60, CALL RAX".to_owned(), helper_edges));
+    }
+    // Dev code preserves the entry record argument in an owned frame. This is
+    // deliberately a separate finite recipe, not acceptance of arbitrary
+    // spilled/register-indirect callees. The two eight-byte slots may not be
+    // overwritten by another instruction in this adoption function.
+    require(
+        prefix.len() >= 4
+            && prefix[0].bytes == [0x48, 0x83, 0xec, 0x68]
+            && prefix[1].bytes == [0x48, 0x89, 0xfe]
+            && prefix[2].bytes == [0x48, 0x89, 0x74, 0x24, 0x18]
+            && prefix.last().unwrap().bytes == [0x48, 0x8b, 0x04, 0x24],
+        "unsupported adoption supplied-body operand recipe",
+    )?;
+    let loads: Vec<_> = prefix
+        .windows(3)
+        .filter(|w| {
+            w[0].bytes == [0x48, 0x8b, 0x44, 0x24, 0x18]
+                && w[1].bytes == [0x48, 0x8b, 0x48, 0x38]
+                && w[2].bytes == [0x48, 0x89, 0x0c, 0x24]
+        })
+        .collect();
+    require(
+        loads.len() == 1,
+        "dev adoption does not load the unique original-record body field",
+    )?;
+    // Every explicit frame-memory write is inspected, and stack-pointer writes
+    // other than the one entry subtraction are rejected. Calls use the scalar
+    // ABI; the source-bound from_native/publish/atomic helpers do not receive
+    // an address overlapping either retained pointer slot.
+    for (index, instruction) in prefix.iter().enumerate().skip(1) {
+        let b = &instruction.bytes;
+        require(
+            keeps_adoption_register(b, 4),
+            "dev adoption changes its retained frame base",
+        )?;
+        if let Some((4, displacement, width)) = adoption_memory_write(b)? {
+            if displacement < 0x20 && displacement + width > 0x18 {
+                require(
+                    index == 2,
+                    "dev adoption overwrites its original record-pointer slot",
+                )?;
+            }
+            if displacement < 8 && displacement + width > 0 {
+                require(
+                    instruction.address == loads[0][2].address,
+                    "dev adoption overwrites its supplied-body slot",
+                )?;
+            }
+        }
+    }
+    Ok((loads[0][1].address, call.address, "Dev owned-frame original RDI slot +0x18; literal record+0x38 load, body slot +0, reload RAX and CALL RAX".to_owned(), helper_edges))
+}
+
+fn qualify_standalone_constructor(
+    elf: &Elf<'_>,
+    bytes: &[u8],
+    code: &BTreeMap<u64, Vec<u8>>,
+    disassembly: &str,
+    got: &BTreeMap<u64, u64>,
+) -> Result<StandaloneConstructorEvidence> {
+    let symbols = standalone_symbols(elf)?;
+    let symbol = |name| symbol_evidence(name, &symbols[name]);
+    let address = |name| symbols[name].st_value;
+    let prefix = standalone_prefix(
+        &code[&address(STANDALONE_ROOT)],
+        address(STANDALONE_ROOT),
+        address(STANDALONE_BODY),
+        address(CONSTRUCTOR_BRIDGE),
+        address(STANDALONE_RESOLVER),
+    )?;
+    let environ: Vec<_> = elf
+        .dynrelas
+        .iter()
+        .chain(elf.dynrels.iter())
+        .chain(elf.pltrelocs.iter())
+        .filter(|r| r.r_offset == prefix.environ)
+        .collect();
+    require(
+        environ.len() == 1
+            && environ[0].r_type == reloc::R_X86_64_GLOB_DAT
+            && environ[0].r_addend.unwrap_or(0) == 0
+            && elf.dynsyms.get(environ[0].r_sym).is_some_and(|s| {
+                elf.dynstrtab.get_at(s.st_name) == Some("environ")
+                    && s.st_shndx == section_header::SHN_UNDEF as usize
+            }),
+        "standalone prefix does not use its actual dynamically relocated environ",
+    )?;
+    require(
+        elf.program_headers.iter().any(|p| {
+            p.p_type == program_header::PT_GNU_RELRO
+                && prefix.environ >= p.p_vaddr
+                && prefix
+                    .environ
+                    .checked_add(8)
+                    .is_some_and(|end| end <= p.p_vaddr.saturating_add(p.p_memsz))
+        }),
+        "standalone environ relocation slot is outside RELRO",
+    )?;
+    loaded_bytes(elf, bytes, prefix.environ, 8)?;
+    require(
+        loaded_bytes(elf, bytes, prefix.selector, 22)? == b"REVERIE_LITEINST_TOOL=",
+        "standalone selector bytes differ",
+    )?;
+    let (body_initializer_call, body_resolver_transfer) = standalone_body_order(
+        &code[&address(STANDALONE_BODY)],
+        address(STANDALONE_BODY),
+        address(STANDALONE_INITIALIZER),
+        address(STANDALONE_RESOLVER),
+        got,
+    )?;
+    let gate_owner = &symbols[CONSTRUCTOR_GATE_OWNER];
+    let gate_label = constructor_interior_label(elf, CONSTRUCTOR_GATE, gate_owner)?;
+    let gate_return = constructor_interior_label(elf, CONSTRUCTOR_GATE_RETURN, gate_owner)?;
+    constructor_gate_operands(
+        &code[&gate_owner.st_value],
+        gate_label.st_value - gate_owner.st_value,
+        gate_return.st_value - gate_owner.st_value,
+    )?;
+    let result_helpers = constructor_result_helpers(elf)?;
+    for helper in result_helpers.values() {
+        require(
+            code[&helper.st_value] == CONSTRUCTOR_RESULT_HELPER_BYTES,
+            "constructor Result::is_err helper has unsupported complete bytes",
+        )?;
+    }
+    let initializing: Vec<_> = elf
+        .syms
+        .iter()
+        .filter(|s| {
+            s.st_type() == sym::STT_OBJECT
+                && s.st_shndx != section_header::SHN_UNDEF as usize
+                && s.st_size == 1
+                && s.st_bind() == sym::STB_LOCAL
+        })
+        .filter(|s| {
+            elf.strtab
+                .get_at(s.st_name)
+                .is_some_and(|name| name.contains("tool_region") && name.ends_with("INITIALIZING"))
+        })
+        .collect();
+    require(
+        initializing.len() == 1,
+        "native constructor initializing guard is absent/ambiguous",
+    )?;
+    require(
+        elf.program_headers.iter().any(|p| {
+            p.p_type == program_header::PT_LOAD
+                && p.p_flags & program_header::PF_W != 0
+                && initializing[0].st_value >= p.p_vaddr
+                && initializing[0]
+                    .st_value
+                    .checked_add(1)
+                    .is_some_and(|end| end <= p.p_vaddr.saturating_add(p.p_memsz))
+        }),
+        "native constructor initializing guard is not loader-mapped writable data",
+    )?;
+    let bridge_adoption_call = constructor_native_bridge(
+        &code[&address(CONSTRUCTOR_BRIDGE)],
+        address(CONSTRUCTOR_BRIDGE),
+        initializing[0].st_value,
+        gate_label.st_value,
+        address(CONSTRUCTOR_ADOPTION),
+    )?;
+    let adoption_instructions =
+        constructor_instructions(disassembly, address(CONSTRUCTOR_ADOPTION))?;
+    let (body_pointer_load, adoption_body_call, adoption_recipe, adoption_helper_edges) =
+        adoption_body_operand(
+            &adoption_instructions,
+            got,
+            &result_helpers.values().map(|s| s.st_value).collect(),
+        )?;
+    let function_sha256 = symbols
+        .iter()
+        .map(|(name, s)| (name.clone(), sha256(&code[&s.st_value])))
+        .collect();
+    Ok(StandaloneConstructorEvidence {
+        generic_initializer: symbol(GENERIC_INITIALIZER), body: symbol(STANDALONE_BODY),
+        selected_initializer: symbol(STANDALONE_INITIALIZER), resolver: symbol(STANDALONE_RESOLVER),
+        bridge: symbol(CONSTRUCTOR_BRIDGE), adoption: symbol(CONSTRUCTOR_ADOPTION),
+        native_gate: symbol_evidence(CONSTRUCTOR_GATE, &gate_label), native_gate_owner: symbol(CONSTRUCTOR_GATE_OWNER),
+        native_gate_return: symbol_evidence(CONSTRUCTOR_GATE_RETURN, &gate_return),
+        native_gate_offset: gate_label.st_value - gate_owner.st_value, adoption_helper_edges,
+        function_sha256, environ_got_slot: prefix.environ, selector_address: prefix.selector,
+        active_body_materialization: prefix.materialization, active_bridge_transfer: prefix.active,
+        inert_resolver_transfer: prefix.inert, body_initializer_call, body_resolver_transfer, bridge_adoption_call,
+        body_pointer_load, adoption_body_call, adoption_recipe, bootstrap_record: CONSTRUCTOR_RECORD,
+        bootstrap_bottom: CONSTRUCTOR_BOTTOM, bootstrap_top: CONSTRUCTOR_TOP,
+        observation: "Complete actual function bytes; exact native missing/present selector branches, same-owner hidden body/bridge/adoption, supplied-body operand recipe and explicit initializer-then-resolver order. Dynamic environ provider is not authenticated. Scalar ABI and source-bound unchanged adoption helpers remain premises; this is not universal CFG/provider/protected-interior proof, execution, first-entire-DSO-Rust isolation or whole caller-window equality.".to_owned(),
+    })
+}
+
 fn disassembly_edges(
     text: &str,
     functions: &BTreeMap<u64, u64>,
@@ -1517,24 +2940,29 @@ fn shortest_path(graph: &BTreeMap<u64, BTreeSet<u64>>, from: u64, to: u64) -> Re
     ))
 }
 
-pub fn qualify_elf(
-    path: &Path,
+struct CollectedProofEvidence {
+    readelf_versions: FileIdentity,
+    readelf_symbols_relocations: FileIdentity,
+    objdump_disassembly: FileIdentity,
+}
+
+fn collect_proof_evidence(
+    artifact: &FileIdentity,
+    elf: &Elf<'_>,
+    bytes: &[u8],
     initializer_name: &str,
+    scope: &BTreeMap<u64, u64>,
     runner: &mut Runner,
-) -> Result<ElfQualification> {
-    let artifact = FileIdentity::read(path)?;
+) -> Result<CollectedProofEvidence> {
     let cwd = artifact.path.parent().ok_or("artifact has no parent")?;
     let path_string = artifact.path.to_str().ok_or("artifact path is not UTF-8")?;
     runner.text("readelf", &["--version-info", "--wide", path_string], cwd)?;
     let readelf_versions = runner.commands.last().unwrap().stdout.clone();
-    let bytes = fs::read(&artifact.path).map_err(|e| e.to_string())?;
-    let elf = Elf::parse(&bytes).map_err(|e| format!("parse actual runtime ELF: {e}"))?;
-    let scope = proof_functions(&elf, initializer_name)?;
-    let expected_bytes = proof_function_bytes(&elf, &bytes, &scope)?;
+    let expected_bytes = proof_function_bytes(elf, bytes, scope)?;
     let mut disassembly = Vec::new();
     let mut emitted = 0usize;
     let limit = MAX_OBJDUMP_BYTES.min(runner.max_stream_bytes);
-    for (&address, &size) in &scope {
+    for (&address, &size) in scope {
         // One aggregate budget covers all stdout/stderr from all intervals.
         // Reserve the separator before spawning; neither a per-range nor a
         // concatenated-output cap can silently grow with the function count.
@@ -1572,7 +3000,7 @@ pub fn qualify_elf(
     }
     let text = std::str::from_utf8(&disassembly)
         .map_err(|e| format!("objdump output is not UTF-8: {e}"))?;
-    verify_disassembly_bytes(text, &expected_bytes)?;
+    verify_constructor_complete_bytes(elf, initializer_name, text, &expected_bytes)?;
     let disassembly_path = runner
         .logs
         .join(format!("objdump-scope-{:04}.stdout", runner.serial));
@@ -1585,30 +3013,74 @@ pub fn qualify_elf(
     )?;
     let readelf_symbols_relocations = runner.commands.last().unwrap().stdout.clone();
     artifact.verify()?;
-    qualify_elf_from_evidence(
-        path,
-        initializer_name,
+    Ok(CollectedProofEvidence {
         readelf_versions,
         readelf_symbols_relocations,
         objdump_disassembly,
-    )
+    })
 }
 
-/// Consumer-side requalification uses the same ELF parser, call-path builder and
-/// portability oracle with retained, hashed producer evidence; no tools/builds.
-pub fn qualify_elf_from_evidence(
+pub fn qualify_elf(
     path: &Path,
     initializer_name: &str,
-    readelf_versions: FileIdentity,
-    readelf_symbols_relocations: FileIdentity,
-    objdump_disassembly: FileIdentity,
+    runner: &mut Runner,
 ) -> Result<ElfQualification> {
-    readelf_versions.verify()?;
-    readelf_symbols_relocations.verify()?;
-    objdump_disassembly.verify()?;
     let artifact = FileIdentity::read(path)?;
     let bytes = fs::read(&artifact.path).map_err(|e| e.to_string())?;
     let elf = Elf::parse(&bytes).map_err(|e| format!("parse actual runtime ELF: {e}"))?;
+    let scope = proof_functions(&elf, initializer_name)?;
+    let evidence =
+        collect_proof_evidence(&artifact, &elf, &bytes, initializer_name, &scope, runner)?;
+    qualify_elf_from_evidence(
+        path,
+        initializer_name,
+        evidence.readelf_versions,
+        evidence.readelf_symbols_relocations,
+        evidence.objdump_disassembly,
+    )
+}
+
+/// Qualify the exact standalone loader route, never diagnostic allocator work.
+/// Uses the same complete-byte/tool/portability/constructor proof as the M1
+/// interfaces, with an explicit constructor-only collection and result type.
+pub fn qualify_constructor(path: &Path, runner: &mut Runner) -> Result<ConstructorQualification> {
+    let artifact = FileIdentity::read(path)?;
+    let bytes = fs::read(&artifact.path).map_err(|e| e.to_string())?;
+    let elf = Elf::parse(&bytes).map_err(|e| format!("parse actual runtime ELF: {e}"))?;
+    let scope = constructor_proof_functions(&elf)?;
+    let evidence =
+        collect_proof_evidence(&artifact, &elf, &bytes, STANDALONE_ROOT, &scope, runner)?;
+    qualify_constructor_from_evidence(
+        path,
+        evidence.readelf_versions,
+        evidence.readelf_symbols_relocations,
+        evidence.objdump_disassembly,
+    )
+}
+
+fn retained_tool_text(
+    readelf_versions: &FileIdentity,
+    readelf_symbols_relocations: &FileIdentity,
+    objdump_disassembly: &FileIdentity,
+) -> Result<(String, String)> {
+    readelf_versions.verify()?;
+    readelf_symbols_relocations.verify()?;
+    objdump_disassembly.verify()?;
+    let version_text = fs::read_to_string(&readelf_versions.path)
+        .map_err(|e| format!("read retained version evidence: {e}"))?;
+    require(
+        fs::metadata(&objdump_disassembly.path)
+            .map_err(|e| e.to_string())?
+            .len()
+            <= MAX_OBJDUMP_BYTES as u64,
+        "retained disassembly exceeds unchanged byte cap",
+    )?;
+    let disassembly = fs::read_to_string(&objdump_disassembly.path)
+        .map_err(|e| format!("read retained disassembly: {e}"))?;
+    Ok((version_text, disassembly))
+}
+
+fn qualify_portability(elf: &Elf<'_>, version_text: &str) -> Result<Vec<String>> {
     require(
         elf.header.e_type == header::ET_DYN
             && elf.header.e_machine == header::EM_X86_64
@@ -1635,9 +3107,77 @@ pub fn qualify_elf_from_evidence(
         elf.libraries.iter().all(|n| ALLOWED_NEEDED.contains(n)),
         format!("runtime needs non-glibc library: {:?}", elf.libraries),
     )?;
-    let (initializer_index, initializer) = export(&elf, initializer_name)?;
+    let required_versions = required_versions(version_text)?;
+    require(
+        required_versions == elf_required_versions(elf)?,
+        "retained readelf and actual ELF symbol-version requirements differ",
+    )?;
+    Ok(required_versions)
+}
+
+/// Independently requalify the mandatory standalone constructor using actual
+/// selected ELF bytes and retained, hashed tool evidence. No Cargo/tools run.
+pub fn qualify_constructor_from_evidence(
+    path: &Path,
+    readelf_versions: FileIdentity,
+    readelf_symbols_relocations: FileIdentity,
+    objdump_disassembly: FileIdentity,
+) -> Result<ConstructorQualification> {
+    let (version_text, disassembly) = retained_tool_text(
+        &readelf_versions,
+        &readelf_symbols_relocations,
+        &objdump_disassembly,
+    )?;
+    let artifact = FileIdentity::read(path)?;
+    let bytes = fs::read(&artifact.path).map_err(|e| e.to_string())?;
+    let elf = Elf::parse(&bytes).map_err(|e| format!("parse actual runtime ELF: {e}"))?;
+    let required_versions = qualify_portability(&elf, &version_text)?;
+    let initializer = private_function(&elf, STANDALONE_ROOT)?;
     let (init_array_slot, init_array_resolution) =
-        init_array_slot(&elf, &bytes, initializer_index, &initializer)?;
+        standalone_init_slot(&elf, &bytes, &initializer)?;
+    let scope = constructor_proof_functions(&elf)?;
+    let expected_bytes = proof_function_bytes(&elf, &bytes, &scope)?;
+    verify_constructor_complete_bytes(&elf, STANDALONE_ROOT, &disassembly, &expected_bytes)?;
+    let got_targets = local_got_targets(&elf)?;
+    let standalone_constructor =
+        qualify_standalone_constructor(&elf, &bytes, &expected_bytes, &disassembly, &got_targets)?;
+    artifact.verify()?;
+    Ok(ConstructorQualification {
+        artifact,
+        initializer: symbol_evidence(STANDALONE_ROOT, &initializer),
+        init_array_slot,
+        init_array_resolution,
+        standalone_constructor,
+        needed: elf.libraries.iter().map(|s| (*s).to_owned()).collect(),
+        required_versions,
+        readelf_versions,
+        readelf_symbols_relocations,
+        objdump_disassembly,
+    })
+}
+
+/// Consumer-side requalification uses the same ELF parser, call-path builder and
+/// portability oracle with retained, hashed producer evidence; no tools/builds.
+pub fn qualify_elf_from_evidence(
+    path: &Path,
+    initializer_name: &str,
+    readelf_versions: FileIdentity,
+    readelf_symbols_relocations: FileIdentity,
+    objdump_disassembly: FileIdentity,
+) -> Result<ElfQualification> {
+    let artifact = FileIdentity::read(path)?;
+    let bytes = fs::read(&artifact.path).map_err(|e| e.to_string())?;
+    let elf = Elf::parse(&bytes).map_err(|e| format!("parse actual runtime ELF: {e}"))?;
+    let (initializer, init_array_slot, init_array_resolution) =
+        if initializer_name == STANDALONE_ROOT {
+            let initializer = private_function(&elf, STANDALONE_ROOT)?;
+            let (slot, resolution) = standalone_init_slot(&elf, &bytes, &initializer)?;
+            (initializer, slot, resolution)
+        } else {
+            let (index, initializer) = export(&elf, initializer_name)?;
+            let (slot, resolution) = init_array_slot(&elf, &bytes, index, &initializer)?;
+            (initializer, slot, resolution)
+        };
     let exports = EXPORTS
         .iter()
         .map(|name| export(&elf, name).map(|(_, s)| symbol_evidence(name, &s)))
@@ -1687,25 +3227,15 @@ pub fn qualify_elf_from_evidence(
         )?;
         allocation_shims.insert(shim.to_owned(), symbol_evidence(name, &s));
     }
-    let version_text = fs::read_to_string(&readelf_versions.path)
-        .map_err(|e| format!("read retained version evidence: {e}"))?;
-    let required_versions = required_versions(&version_text)?;
-    require(
-        required_versions == elf_required_versions(&elf)?,
-        "retained readelf and actual ELF symbol-version requirements differ",
+    let (version_text, disassembly) = retained_tool_text(
+        &readelf_versions,
+        &readelf_symbols_relocations,
+        &objdump_disassembly,
     )?;
-    require(
-        fs::metadata(&objdump_disassembly.path)
-            .map_err(|e| e.to_string())?
-            .len()
-            <= MAX_OBJDUMP_BYTES as u64,
-        "retained disassembly exceeds unchanged byte cap",
-    )?;
-    let disassembly = fs::read_to_string(&objdump_disassembly.path)
-        .map_err(|e| format!("read retained disassembly: {e}"))?;
+    let required_versions = qualify_portability(&elf, &version_text)?;
     let scope = proof_functions(&elf, initializer_name)?;
     let expected_bytes = proof_function_bytes(&elf, &bytes, &scope)?;
-    verify_disassembly_bytes(&disassembly, &expected_bytes)?;
+    verify_constructor_complete_bytes(&elf, initializer_name, &disassembly, &expected_bytes)?;
     let functions = elf
         .syms
         .iter()
@@ -1714,6 +3244,17 @@ pub fn qualify_elf_from_evidence(
         .collect();
     let got_targets = local_got_targets(&elf)?;
     let (graph, local_got_edges) = disassembly_edges(&disassembly, &functions, &got_targets)?;
+    let standalone_constructor = if initializer_name == STANDALONE_ROOT {
+        Some(qualify_standalone_constructor(
+            &elf,
+            &bytes,
+            &expected_bytes,
+            &disassembly,
+            &got_targets,
+        )?)
+    } else {
+        None
+    };
     let mut call_paths = BTreeMap::new();
     let mut inline_routes = BTreeMap::new();
     for (entry, shim) in [
@@ -1789,6 +3330,7 @@ pub fn qualify_elf_from_evidence(
         initializer: symbol_evidence(initializer_name, &initializer),
         init_array_slot,
         init_array_resolution,
+        standalone_constructor,
         exports,
         allocation_shims,
         needed: elf.libraries.iter().map(|s| (*s).to_owned()).collect(),
@@ -1959,7 +3501,9 @@ pub fn verify_runtime_receipt(
     require(
         receipt.qualification.initializer.name == expected.initializer
             && receipt.qualification.init_array_slot != 0
-            && !receipt.qualification.init_array_resolution.is_empty(),
+            && !receipt.qualification.init_array_resolution.is_empty()
+            && receipt.qualification.standalone_constructor.is_some()
+                == (expected.initializer == STANDALONE_ROOT),
         "runtime constructor identity is unqualified",
     )?;
     let exports: BTreeSet<_> = receipt
@@ -2123,6 +3667,558 @@ mod tests {
         ] {
             assert!(verify_disassembly_bytes(&incomplete, &expected).is_err());
         }
+        standalone_constructor_mutation_controls();
+        standalone_registration_mutation_controls();
+    }
+
+    // Exercise the affected loader-relocation resolution, not only the pure
+    // slot-count/binding predicates. This ELF is parsed from self-contained
+    // encoded ELF64 headers, dynamic symbols and a real RELA init-array slot.
+    fn standalone_registration_mutation_controls() {
+        fn registration(kind: u32, symbol: u32, addend: i64) -> Result<(u64, String)> {
+            fn put(bytes: &mut [u8], offset: usize, width: usize, value: u64) {
+                bytes[offset..offset + width].copy_from_slice(&value.to_le_bytes()[..width]);
+            }
+            const ROOT: u64 = 0x1100;
+            const GENERIC: u64 = 0x1200;
+            const SLOT: u64 = 0x1800;
+            let mut bytes = vec![0u8; 0x1000];
+            bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+            for (offset, width, value) in [
+                (16, 2, u64::from(header::ET_DYN)),
+                (18, 2, u64::from(header::EM_X86_64)),
+                (20, 4, 1),
+                (32, 8, 64),
+                (40, 8, 0xa00),
+                (52, 2, 64),
+                (54, 2, 56),
+                (56, 2, 2),
+                (58, 2, 64),
+                (60, 2, 4),
+                (62, 2, 3),
+            ] {
+                put(&mut bytes, offset, width, value);
+            }
+            for (index, kind, offset, address, size) in [
+                (0, program_header::PT_LOAD, 0, 0x1000, 0x1000),
+                (1, program_header::PT_DYNAMIC, 0x300, 0x1300, 0x90),
+            ] {
+                let start = 64 + index * 56;
+                for (field, width, value) in [
+                    (0, 4, u64::from(kind)),
+                    (4, 4, u64::from(program_header::PF_R | program_header::PF_X)),
+                    (8, 8, offset),
+                    (16, 8, address),
+                    (24, 8, address),
+                    (32, 8, size),
+                    (40, 8, size),
+                    (48, 8, 8),
+                ] {
+                    put(&mut bytes, start + field, width, value);
+                }
+            }
+            let names = format!("\0{GENERIC_INITIALIZER}\0preemptible_root_alias\0");
+            bytes[0x500..0x500 + names.len()].copy_from_slice(names.as_bytes());
+            for (index, name, value) in [(1, 1, GENERIC), (2, GENERIC_INITIALIZER.len() + 2, ROOT)]
+            {
+                let start = 0x400 + index * 24;
+                put(&mut bytes, start, 4, name as u64);
+                bytes[start + 4] = (sym::STB_GLOBAL << 4) | sym::STT_FUNC;
+                bytes[start + 5] = sym::STV_DEFAULT;
+                put(&mut bytes, start + 6, 2, 1);
+                put(&mut bytes, start + 8, 8, value);
+                put(&mut bytes, start + 16, 8, 16);
+            }
+            // One SysV hash bucket and three dynamic symbols, including the
+            // defined DEFAULT-visible alias at the hidden root's exact address.
+            for (index, value) in [1, 3, 1, 0, 2, 0].into_iter().enumerate() {
+                put(&mut bytes, 0x600 + index * 4, 4, value);
+            }
+            put(&mut bytes, 0x700, 8, SLOT);
+            put(
+                &mut bytes,
+                0x708,
+                8,
+                (u64::from(symbol) << 32) | u64::from(kind),
+            );
+            put(&mut bytes, 0x710, 8, addend as u64);
+            put(&mut bytes, 0x800, 8, ROOT);
+            for (index, (tag, value)) in [
+                (5, 0x1500),              // DT_STRTAB
+                (10, names.len() as u64), // DT_STRSZ
+                (6, 0x1400),              // DT_SYMTAB
+                (11, 24),                 // DT_SYMENT
+                (4, 0x1600),              // DT_HASH
+                (7, 0x1700),              // DT_RELA
+                (8, 24),                  // DT_RELASZ
+                (9, 24),                  // DT_RELAENT
+                (0, 0),                   // DT_NULL
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                put(&mut bytes, 0x300 + index * 16, 8, tag);
+                put(&mut bytes, 0x308 + index * 16, 8, value);
+            }
+            let section_names = b"\0.text\0.init_array\0.shstrtab\0";
+            bytes[0x900..0x900 + section_names.len()].copy_from_slice(section_names);
+            for (index, name, kind, flags, address, offset, size, alignment, entry) in [
+                (
+                    1,
+                    1,
+                    section_header::SHT_PROGBITS,
+                    6,
+                    ROOT,
+                    0x100,
+                    0x200,
+                    16,
+                    0,
+                ),
+                (
+                    2,
+                    7,
+                    section_header::SHT_INIT_ARRAY,
+                    3,
+                    SLOT,
+                    0x800,
+                    8,
+                    8,
+                    8,
+                ),
+                (
+                    3,
+                    19,
+                    section_header::SHT_STRTAB,
+                    0,
+                    0,
+                    0x900,
+                    section_names.len() as u64,
+                    1,
+                    0,
+                ),
+            ] {
+                let start = 0xa00 + index * 64;
+                for (field, width, value) in [
+                    (0, 4, name),
+                    (4, 4, u64::from(kind)),
+                    (8, 8, flags),
+                    (16, 8, address),
+                    (24, 8, offset),
+                    (32, 8, size),
+                    (48, 8, alignment),
+                    (56, 8, entry),
+                ] {
+                    put(&mut bytes, start + field, width, value);
+                }
+            }
+            let elf = Elf::parse(&bytes).expect("self-contained relocation-control ELF parses");
+            let alias = elf.dynsyms.get(2).unwrap();
+            assert_eq!(alias.st_bind(), sym::STB_GLOBAL);
+            assert_eq!(alias.st_visibility(), sym::STV_DEFAULT);
+            assert_eq!(alias.st_value, ROOT);
+            assert_eq!(elf.dynrelas.len(), 1);
+            let root = sym::Sym {
+                st_info: (sym::STB_LOCAL << 4) | sym::STT_FUNC,
+                st_other: sym::STV_HIDDEN,
+                st_shndx: 1,
+                st_value: ROOT,
+                st_size: 16,
+                ..sym::Sym::default()
+            };
+            standalone_init_slot(&elf, &bytes, &root)
+        }
+        assert_eq!(
+            registration(reloc::R_X86_64_RELATIVE, 0, 0x1100).unwrap().0,
+            0x1800
+        );
+        assert!(registration(reloc::R_X86_64_RELATIVE, 2, 0x1100).is_err());
+        assert!(registration(reloc::R_X86_64_RELATIVE, 0, 0x1108).is_err());
+        assert!(
+            registration(reloc::R_X86_64_64, 2, 0).is_err(),
+            "a loader-preemptible DEFAULT alias must not certify the hidden root by nominal address"
+        );
+    }
+
+    // Rejection controls share the existing helper test identity; they do not
+    // replace any allocation/coverage assertion or claim execution of this
+    // synthetic encoding. Actual producer bytes remain a separate prerequisite.
+    fn standalone_constructor_mutation_controls() {
+        assert!(private_constructor_binding(
+            sym::STB_LOCAL,
+            sym::STV_DEFAULT
+        ));
+        assert!(private_constructor_binding(
+            sym::STB_GLOBAL,
+            sym::STV_HIDDEN
+        ));
+        assert!(!private_constructor_binding(
+            sym::STB_GLOBAL,
+            sym::STV_DEFAULT
+        ));
+        assert!(!private_constructor_binding(
+            sym::STB_GLOBAL,
+            sym::STV_PROTECTED
+        ));
+        assert_eq!(unique_standalone_slot(&[0x8000], &[]).unwrap(), 0x8000);
+        for (root, generic) in [
+            (vec![], vec![]),
+            (vec![0x8000, 0x8008], vec![]),
+            (vec![0x8000], vec![0x8010]),
+        ] {
+            assert!(unique_standalone_slot(&root, &generic).is_err());
+        }
+
+        fn emit(code: &mut Vec<u8>, opcode: &[u8]) -> usize {
+            code.extend_from_slice(opcode);
+            let displacement = code.len();
+            code.extend_from_slice(&[0; 4]);
+            displacement
+        }
+        fn patch(code: &mut [u8], displacement: usize, target: u64) {
+            let delta = i32::try_from(target as i64 - (0x1000 + displacement as i64 + 4)).unwrap();
+            code[displacement..displacement + 4].copy_from_slice(&delta.to_le_bytes());
+        }
+        let mut prefix = vec![0xf3, 0x0f, 0x1e, 0xfa];
+        let environ = emit(&mut prefix, &[0x48, 0x8b, 0x05]);
+        prefix.extend_from_slice(&[0x48, 0x8b, 0x10, 0x48, 0x85, 0xd2]);
+        let no_vector = emit(&mut prefix, &[0x0f, 0x84]);
+        let selector = emit(&mut prefix, &[0x4c, 0x8d, 0x05]);
+        let vector_loop = 0x1000 + prefix.len() as u64;
+        prefix.extend_from_slice(&[0x4c, 0x8b, 0x12, 0x4d, 0x85, 0xd2]);
+        let vector_end = emit(&mut prefix, &[0x0f, 0x84]);
+        prefix.extend_from_slice(&[0x45, 0x31, 0xc9]);
+        let byte_loop = 0x1000 + prefix.len() as u64;
+        prefix.extend_from_slice(&[0x43, 0x8a, 0x04, 0x0a, 0x84, 0xc0]);
+        let short_entry = emit(&mut prefix, &[0x0f, 0x84]);
+        prefix.extend_from_slice(&[0x43, 0x3a, 0x04, 0x08]);
+        let mismatch = emit(&mut prefix, &[0x0f, 0x85]);
+        prefix.extend_from_slice(&[0x41, 0xff, 0xc1, 0x41, 0x83, 0xf9, 22]);
+        let byte_again = emit(&mut prefix, &[0x0f, 0x85]);
+        let body = emit(&mut prefix, &[0x48, 0x8d, 0x3d]);
+        let bridge = emit(&mut prefix, &[0xe9]);
+        let next_entry = 0x1000 + prefix.len() as u64;
+        prefix.extend_from_slice(&[0x48, 0x83, 0xc2, 8]);
+        let vector_again = emit(&mut prefix, &[0xe9]);
+        let inert_entry = 0x1000 + prefix.len() as u64;
+        let resolver = emit(&mut prefix, &[0xe9]);
+        for (offset, target) in [
+            (environ, 0x6000),
+            (selector, 0x5000),
+            (no_vector, inert_entry),
+            (vector_end, inert_entry),
+            (short_entry, next_entry),
+            (mismatch, next_entry),
+            (byte_again, byte_loop),
+            (body, 0x2000),
+            (bridge, 0x3000),
+            (vector_again, vector_loop),
+            (resolver, 0x4000),
+        ] {
+            patch(&mut prefix, offset, target);
+        }
+        let route = standalone_prefix(&prefix, 0x1000, 0x2000, 0x3000, 0x4000).unwrap();
+        assert_eq!(route.environ, 0x6000);
+        assert_eq!(route.selector, 0x5000);
+        for offset in [no_vector, short_entry, body, bridge, resolver] {
+            let mut bad = prefix.clone();
+            bad[offset] ^= 1;
+            assert!(standalone_prefix(&bad, 0x1000, 0x2000, 0x3000, 0x4000).is_err());
+        }
+
+        let mut body_code = vec![0x50];
+        let init_call = emit(&mut body_code, &[0xe8]);
+        body_code.push(0x58);
+        let resolve_tail = emit(&mut body_code, &[0xe9]);
+        patch(&mut body_code, init_call, 0x2000);
+        patch(&mut body_code, resolve_tail, 0x3000);
+        standalone_body_order(&body_code, 0x1000, 0x2000, 0x3000, &BTreeMap::new()).unwrap();
+        let mut reversed = body_code.clone();
+        patch(&mut reversed, init_call, 0x3000);
+        patch(&mut reversed, resolve_tail, 0x2000);
+        assert!(
+            standalone_body_order(&reversed, 0x1000, 0x2000, 0x3000, &BTreeMap::new()).is_err()
+        );
+
+        let mut native = native_template();
+        for (offset, target) in [
+            (0x34, 0x9000),
+            (0x71, 0xa000),
+            (0xab, 0xa000),
+            (0xd9, 0xa000),
+            (0x186, 0xa000),
+            (0x1b8, 0xa000),
+            (0x1d3, 0xb000),
+            (0x21b, 0xa000),
+            (0x235, 0xa000),
+        ] {
+            patch(&mut native, offset, target);
+        }
+        constructor_native_bridge(&native, 0x1000, 0x9000, 0xa000, 0xb000).unwrap();
+        for offset in [0x34, 0x71, 0x168, 0x1c8, 0x1d3] {
+            let mut bad = native.clone();
+            bad[offset] ^= 1;
+            assert!(constructor_native_bridge(&bad, 0x1000, 0x9000, 0xa000, 0xb000).is_err());
+        }
+        for clobber in [&[0x31, 0xdb][..], &[0xb7, 0][..], &[0x48, 0x89, 0xc3][..]] {
+            assert!(!keeps_adoption_register(clobber, 3));
+        }
+        assert!(!keeps_adoption_register(&[0x48, 0x83, 0xc4, 8], 4));
+
+        let mut optimized = vec![
+            vec![0x41, 0x56],
+            vec![0x53],
+            vec![0x48, 0x83, 0xec, 0x28],
+            [vec![0x48, 0xbb], CONSTRUCTOR_RECORD.to_le_bytes().to_vec()].concat(),
+            vec![0x49, 0x89, 0xe6],
+            vec![0x48, 0x39, 0xdf],
+            vec![0x0f, 0x85, 0, 0, 0, 0],
+            vec![0x48, 0x8b, 0x43, 0x38],
+            vec![0x48, 0x89, 0xe1],
+            vec![0x48, 0x89, 0x4b, 0x60],
+            vec![0xff, 0xd0],
+        ];
+        fn encoded(code: &[Vec<u8>]) -> Vec<EncodedConstructorInstruction> {
+            let mut address = 0x1000;
+            code.iter()
+                .map(|bytes| {
+                    let instruction = EncodedConstructorInstruction {
+                        address,
+                        bytes: bytes.clone(),
+                    };
+                    address += bytes.len() as u64;
+                    instruction
+                })
+                .collect()
+        }
+        adoption_body_operand(&encoded(&optimized), &BTreeMap::new(), &BTreeSet::new()).unwrap();
+        optimized[7][3] = 0x30;
+        assert!(
+            adoption_body_operand(&encoded(&optimized), &BTreeMap::new(), &BTreeSet::new())
+                .is_err()
+        );
+        optimized[7][3] = 0x38;
+        optimized.insert(7, vec![0x48, 0xc7, 0x43, 0x38, 0, 0, 0, 0]);
+        assert!(
+            adoption_body_operand(&encoded(&optimized), &BTreeMap::new(), &BTreeSet::new())
+                .is_err()
+        );
+
+        let mut dev = vec![
+            vec![0x48, 0x83, 0xec, 0x68],
+            vec![0x48, 0x89, 0xfe],
+            vec![0x48, 0x89, 0x74, 0x24, 0x18],
+            vec![0x48, 0x8b, 0x44, 0x24, 0x18],
+            vec![0x48, 0x8b, 0x48, 0x38],
+            vec![0x48, 0x89, 0x0c, 0x24],
+            vec![0x48, 0x8b, 0x04, 0x24],
+            vec![0xff, 0xd0],
+        ];
+        adoption_body_operand(&encoded(&dev), &BTreeMap::new(), &BTreeSet::new()).unwrap();
+        dev.insert(6, vec![0xc6, 0x04, 0x24, 0]);
+        assert!(adoption_body_operand(&encoded(&dev), &BTreeMap::new(), &BTreeSet::new()).is_err());
+        dev.remove(6);
+        dev.insert(3, vec![0x48, 0xc7, 0x44, 0x24, 0x18, 0, 0, 0, 0]);
+        assert!(adoption_body_operand(&encoded(&dev), &BTreeMap::new(), &BTreeSet::new()).is_err());
+        constructor_gate_operands(CONSTRUCTOR_GATE_OWNER_BYTES, 0x20, 0x22).unwrap();
+        for (ip, ret) in [(0x21, 0x22), (0x20, 0x23)] {
+            assert!(constructor_gate_operands(CONSTRUCTOR_GATE_OWNER_BYTES, ip, ret).is_err());
+        }
+        let mut bad_gate = CONSTRUCTOR_GATE_OWNER_BYTES.to_vec();
+        bad_gate[0x24] ^= 1;
+        assert!(constructor_gate_operands(&bad_gate, 0x20, 0x22).is_err());
+        let mut helper_case = vec![
+            vec![0x48, 0x83, 0xec, 0x68],
+            vec![0x48, 0x89, 0xfe],
+            vec![0x48, 0x89, 0x74, 0x24, 0x18],
+            vec![0x48, 0x8b, 0x05, 0, 0, 0, 0],
+            vec![0x48, 0x8d, 0x7c, 0x24, 0x38],
+            vec![0xff, 0xd0],
+            vec![0x48, 0x8b, 0x44, 0x24, 0x18],
+            vec![0x48, 0x8b, 0x48, 0x38],
+            vec![0x48, 0x89, 0x0c, 0x24],
+            vec![0x48, 0x8b, 0x04, 0x24],
+            vec![0xff, 0xd0],
+        ];
+        let helper_encoding = encoded(&helper_case);
+        let slot = helper_encoding[3].address + 7;
+        let got = BTreeMap::from([(slot, 0x7000)]);
+        let helpers = BTreeSet::from([0x7000]);
+        let (_, _, _, edges) = adoption_body_operand(&helper_encoding, &got, &helpers).unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].target_function, 0x7000);
+        assert!(
+            adoption_body_operand(
+                &helper_encoding,
+                &BTreeMap::from([(slot, 0x7001)]),
+                &helpers
+            )
+            .is_err()
+        );
+        assert!(adoption_body_operand(&helper_encoding, &BTreeMap::new(), &helpers).is_err());
+        helper_case.insert(6, vec![0xff, 0xd0]);
+        assert!(adoption_body_operand(&encoded(&helper_case), &got, &helpers).is_err());
+        helper_case.remove(6);
+        helper_case[4][4] = 0x30;
+        assert!(adoption_body_operand(&encoded(&helper_case), &got, &helpers).is_err());
+
+        let mut raw_gate = format!("0000000000001000 <{CONSTRUCTOR_GATE_OWNER}>:\n");
+        let mut offset = 0usize;
+        for length in [2usize, 7, 3, 3, 3, 3, 3, 3, 5, 2, 3, 4, 2, 1] {
+            if offset == 0x20 {
+                raw_gate.push_str(&format!("0000000000001020 <{CONSTRUCTOR_GATE}>:\n"));
+            }
+            if offset == 0x22 {
+                raw_gate.push_str(&format!("0000000000001022 <{CONSTRUCTOR_GATE_RETURN}>:\n"));
+            }
+            raw_gate.push_str(&format!(
+                "{:x}: {} mnemonic\n",
+                0x1000 + offset,
+                CONSTRUCTOR_GATE_OWNER_BYTES[offset..offset + length]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ));
+            offset += length;
+        }
+        assert_eq!(offset, 44);
+        let owner = sym::Sym {
+            st_value: 0x1000,
+            st_size: 44,
+            ..sym::Sym::default()
+        };
+        let labels = BTreeMap::from([
+            (0x1020, CONSTRUCTOR_GATE),
+            (0x1022, CONSTRUCTOR_GATE_RETURN),
+        ]);
+        let view = constructor_gate_disassembly_view(&raw_gate, &owner, &labels).unwrap();
+        verify_disassembly_bytes(
+            &view,
+            &BTreeMap::from([(0x1000, CONSTRUCTOR_GATE_OWNER_BYTES.to_vec())]),
+        )
+        .unwrap();
+        for bad in [
+            raw_gate.replace(CONSTRUCTOR_GATE_RETURN,"wrong_gate_label"),
+            raw_gate.replace("0000000000001022 <","0000000000001023 <"),
+            raw_gate.replace(&format!("0000000000001022 <{CONSTRUCTOR_GATE_RETURN}>:\n"),""),
+            raw_gate.replace(&format!("0000000000001022 <{CONSTRUCTOR_GATE_RETURN}>:\n"),
+                &format!("0000000000001022 <{CONSTRUCTOR_GATE_RETURN}>:\n0000000000001022 <{CONSTRUCTOR_GATE_RETURN}>:\n")),
+        ] {
+            assert!(constructor_gate_disassembly_view(&bad,&owner,&labels).is_err());
+        }
+    }
+
+    fn standalone_adoption_indirect_mutation_controls() {
+        fn encoded(code: &[Vec<u8>]) -> Vec<EncodedConstructorInstruction> {
+            let mut address = 0x1000;
+            code.iter()
+                .map(|bytes| {
+                    let instruction = EncodedConstructorInstruction {
+                        address,
+                        bytes: bytes.clone(),
+                    };
+                    address += bytes.len() as u64;
+                    instruction
+                })
+                .collect()
+        }
+        let helper_case = vec![
+            vec![0x48, 0x83, 0xec, 0x68],
+            vec![0x48, 0x89, 0xfe],
+            vec![0x48, 0x89, 0x74, 0x24, 0x18],
+            vec![0x48, 0x8b, 0x05, 0, 0, 0, 0],
+            vec![0x48, 0x8d, 0x7c, 0x24, 0x38],
+            vec![0xff, 0xd0],
+            vec![0x48, 0x8b, 0x44, 0x24, 0x18],
+            vec![0x48, 0x8b, 0x48, 0x38],
+            vec![0x48, 0x89, 0x0c, 0x24],
+            vec![0x48, 0x8b, 0x04, 0x24],
+            vec![0xff, 0xd0],
+        ];
+        let helper_encoding = encoded(&helper_case);
+        let slot = helper_encoding[3].address + 7;
+        let got = BTreeMap::from([(slot, 0x7000)]);
+        let helpers = BTreeSet::from([0x7000]);
+        let (_, _, _, edges) = adoption_body_operand(&helper_encoding, &got, &helpers).unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].target_function, 0x7000);
+        // Keep the later proved supplied-body CALL RAX present in every case.
+        // Target certification cannot be obtained by simply omitting another
+        // indirect transfer from the helper enumerator.
+        let unsupported: &[(&str, &[u8])] = &[
+            ("CALL RCX", &[0xff, 0xd1]),
+            ("CALL RDX", &[0xff, 0xd2]),
+            ("REX CALL R8", &[0x41, 0xff, 0xd0]),
+            ("REX.W CALL RAX", &[0x48, 0xff, 0xd0]),
+            ("operand-prefix CALL RAX", &[0x66, 0xff, 0xd0]),
+            ("REP-prefix CALL RCX", &[0xf3, 0xff, 0xd1]),
+            ("BND-prefix CALL RCX", &[0xf2, 0xff, 0xd1]),
+            ("NOTRACK CALL RCX", &[0x3e, 0xff, 0xd1]),
+            ("CALL [RAX]", &[0xff, 0x10]),
+            ("CALL [RCX]", &[0xff, 0x11]),
+            ("CALL [RSP]", &[0xff, 0x14, 0x24]),
+            ("CALL [RSP+8]", &[0xff, 0x54, 0x24, 8]),
+            ("REX CALL [R8]", &[0x41, 0xff, 0x10]),
+            ("JMP RAX", &[0xff, 0xe0]),
+            ("JMP RCX", &[0xff, 0xe1]),
+            ("REX JMP R8", &[0x41, 0xff, 0xe0]),
+            ("JMP [RAX]", &[0xff, 0x20]),
+            ("JMP [RSP]", &[0xff, 0x24, 0x24]),
+            ("JMP [RSP+8]", &[0xff, 0x64, 0x24, 8]),
+            ("far CALL [RAX]", &[0xff, 0x18]),
+            ("far JMP [RAX]", &[0xff, 0x28]),
+            ("address-prefix CALL", &[0x67, 0xff, 0x15, 0, 0, 0, 0]),
+        ];
+        let mut accepted = Vec::new();
+        for &(name, replacement) in unsupported {
+            let mut mutated = helper_case.clone();
+            mutated[5] = replacement.to_vec();
+            if adoption_body_operand(&encoded(&mutated), &got, &helpers).is_ok() {
+                accepted.push(name);
+            }
+        }
+        // The enumeration must cover the full function, including instructions
+        // after the supplied-body call, rather than only the prefix.
+        for (name, extra) in [
+            ("late CALL RCX", vec![0xff, 0xd1]),
+            ("late REX CALL R8", vec![0x41, 0xff, 0xd0]),
+            ("late JMP [RAX]", vec![0xff, 0x20]),
+        ] {
+            let mut mutated = helper_case.clone();
+            mutated.push(extra);
+            if adoption_body_operand(&encoded(&mutated), &got, &helpers).is_ok() {
+                accepted.push(name);
+            }
+        }
+        // The only separately admitted memory-call encoding is the original
+        // bare CALL [RIP+disp32], with its independently qualified local GOT.
+        let mut rip_case = helper_case.clone();
+        rip_case.insert(6, vec![0xff, 0x15, 0, 0, 0, 0]);
+        let rip_encoding = encoded(&rip_case);
+        let rip_slot = rip_encoding[6].address + 6;
+        let mut local_got = got.clone();
+        local_got.insert(rip_slot, 0x7100);
+        adoption_body_operand(&rip_encoding, &local_got, &helpers).unwrap();
+        if adoption_body_operand(&rip_encoding, &got, &helpers).is_ok() {
+            accepted.push("unresolved RIP CALL");
+        }
+        for (name, replacement) in [
+            ("RIP JMP", vec![0xff, 0x25, 0, 0, 0, 0]),
+            ("prefixed RIP CALL", vec![0x3e, 0xff, 0x15, 0, 0, 0, 0]),
+        ] {
+            let mut mutated = rip_case.clone();
+            mutated[6] = replacement;
+            let encoded = encoded(&mutated);
+            let mut local_got = got.clone();
+            local_got.insert(encoded[6].address + encoded[6].bytes.len() as u64, 0x7100);
+            if adoption_body_operand(&encoded, &local_got, &helpers).is_ok() {
+                accepted.push(name);
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "unproved adoption transfers qualified: {accepted:?}"
+        );
     }
 
     #[test]
@@ -2136,6 +4232,7 @@ mod tests {
             assert!(edges.is_empty());
             assert!(shortest_path(&graph, 0x1000, 0x2000).is_err());
         }
+        standalone_adoption_indirect_mutation_controls();
     }
 
     #[test]

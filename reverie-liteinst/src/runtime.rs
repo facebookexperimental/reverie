@@ -488,17 +488,24 @@ fn runtime_config_from_env() -> io::Result<RuntimeConfig> {
 
 pub(crate) fn initialize_from_environment() -> io::Result<()> {
     let tool_value = std::env::var_os("REVERIE_LITEINST_TOOL");
+    initialize_from_selected_value(tool_value.as_deref())
+}
+
+// Both acquisition paths own the selected value across initialization. The
+// actual standalone leaf reads the same raw environment vector as its native
+// activation prefix; generic embeddings retain std::env/getenv acquisition.
+pub(crate) fn initialize_from_selected_value(tool_value: Option<&OsStr>) -> io::Result<()> {
     // Prefer a shared reverie-inguest built-in when the selector names one, so a
     // single env var is a superset of the LiteInst-native strace/compat modes
     // (matches e9patch's single TOOL_ENV selecting shared built-ins).
-    if let Some(value) = tool_value.as_deref()
+    if let Some(value) = tool_value
         && let Some(tool) = builtin_tool_from_env_value(value)
     {
         require_site_patching("built-in Tool")?;
         // SAFETY: the loader calls this once before application threads start.
         return unsafe { install_builtin_runtime(tool) };
     }
-    let mode = match tool_value.as_deref() {
+    let mode = match tool_value {
         None => return Ok(()),
         Some(value) if value == OsStr::new("strace") => TOOL_STRACE,
         Some(value) if value == OsStr::new("compat") => TOOL_COMPAT,

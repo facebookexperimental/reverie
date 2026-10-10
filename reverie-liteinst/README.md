@@ -29,6 +29,22 @@ The independent legacy `reverie-inguest/preload-constructor` feature still owns
 its own constructor if another dependency enables it; the core disables that
 dependency's default features.
 
+The standalone leaf's native constructor scans the current `environ` vector
+for the first exact `REVERIE_LITEINST_TOOL=` entry. If present, it enters a
+fixed guarded constructor stack before running the named Tool initialization.
+It copies the selected value before calling other providers. Empty or invalid
+values refuse initialization there. With no selector, the leaf remains inert
+and runs only its existing compatibility resolver. The environment must remain
+valid and stable from the native scan through copying the selected value.
+
+This leaf deliberately ignores an interposed `getenv` for its Tool selector,
+and its constructor root cannot be replaced by interposing the public generic
+initializer. The separately exported `reverie_liteinst_initialize` retains its
+`std::env`/`getenv` selection semantics for embeddings. On the active leaf,
+runtime initialization and its dispatch scope finish before the compatibility
+resolver runs. Earlier loader/CRT initialization and the inert resolver are
+outside the constructor-stack placement guarantee.
+
 A Tool-specific preload must declare `reverie_liteinst::PrivateToolAllocator` as
 its root `#[global_allocator]`. Ordinary Rust allocation uses only the reusable
 32 MiB Tool arena and the process-lifetime 32 MiB installation arena, before,

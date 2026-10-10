@@ -2,7 +2,9 @@
 
 use std::env;
 use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::io;
+use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -18,6 +20,9 @@ mod patch_alloc;
 #[cfg(feature = "allocator-fixture")]
 #[doc(hidden)]
 pub mod stack_fixture;
+#[cfg(feature = "allocator-fixture")]
+#[doc(hidden)]
+pub mod standalone_fixture;
 mod stats;
 mod straddler;
 mod syscall_fallback;
@@ -55,6 +60,9 @@ pub use reverie_inguest::guest::host::PhysicalCreation;
 pub use reverie_inguest::guest::host::PhysicalCreationHook;
 pub use reverie_inguest::guest::host::RefusedChild;
 pub use reverie_inguest::guest::host::set_physical_creation_hook;
+/// Native fixed-stack entry used by the owned standalone leaf.
+#[doc(hidden)]
+pub use reverie_inguest::guest::tool_region::constructor_entry;
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-254): Review shared RuntimeConfig alt-stack re-exports.
 /// `REVERIE_LITEINST_ALT_STACK` selector and parser for the shared
@@ -251,8 +259,49 @@ pub fn set_guest_site_patching(command: &mut Command, enabled: bool) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reverie_liteinst_initialize() {
     let _scope = reverie_inguest::guest::alloc::enter_dispatch();
-    let result =
-        patch_alloc::preflight_allocator().and_then(|()| runtime::initialize_from_environment());
+    initialization_or_exit(
+        patch_alloc::preflight_allocator().and_then(|()| runtime::initialize_from_environment()),
+    );
+}
+
+/// Initialize the actual standalone leaf after native fixed-stack adoption.
+///
+/// This private leaf control reads the first exact selector from the current
+/// `environ` vector. It deliberately does not consult an interposed `getenv`;
+/// [`reverie_liteinst_initialize`] retains that generic embedding behavior.
+/// The owned value is copied before initialization calls other providers.
+///
+/// # Safety
+///
+/// Call once from the actual leaf's authenticated constructor body, before
+/// application threads start. The environment must remain valid and stable
+/// from the native selector scan through this copy. No active runtime may
+/// precede this initialization. The caller invokes its compatibility resolver
+/// only after this function returns and its dispatch scope has been dropped.
+#[doc(hidden)]
+#[inline(never)]
+#[unsafe(export_name = "reverie_liteinst_standalone_initialize")]
+pub unsafe extern "C" fn initialize_standalone() {
+    let _scope = reverie_inguest::guest::alloc::enter_dispatch();
+    let result = patch_alloc::preflight_allocator().and_then(|()| {
+        let selected = reverie_inguest::guest::support::environment_value(b"REVERIE_LITEINST_TOOL")
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "REVERIE_LITEINST_TOOL disappeared during standalone initialization",
+                )
+            })?;
+        let selected = OsString::from_vec(selected.to_vec());
+        runtime::initialize_from_selected_value(Some(&selected))
+    });
+    initialization_or_exit(result);
+}
+
+// The actual leaf cannot be redirected through another object's initializer.
+// This does not change the separately exported generic initializer.
+core::arch::global_asm!(".hidden reverie_liteinst_standalone_initialize");
+
+fn initialization_or_exit(result: io::Result<()>) {
     if let Err(error) = result {
         eprintln!("reverie-liteinst initialization failed: {error}");
         // libc's _exit, not a raw exit_group from this library: an exit_group

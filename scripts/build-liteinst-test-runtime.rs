@@ -18,6 +18,7 @@
 //! No directory search or warm-file fallback is permitted.
 
 pub mod m1_artifact;
+mod standalone_constructor_fixture;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -202,7 +203,117 @@ fn produce_stack_guest(
     Ok((binary_path, receipt_path))
 }
 
-fn produce(config: Config) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf)> {
+struct StandaloneInputs {
+    guest: PathBuf,
+    guest_receipt: PathBuf,
+    root: PathBuf,
+    root_receipt: PathBuf,
+}
+
+fn produce_standalone_inputs(
+    workspace: &std::path::Path,
+    bundle: &std::path::Path,
+    runner: &mut Runner,
+) -> Result<StandaloneInputs> {
+    const PROBE: &[u8] =
+        include_bytes!("../reverie-liteinst/tests/fixtures/standalone_constructor_guest.c");
+    let compiler = std::env::var("CC").unwrap_or_else(|_| "cc".to_owned());
+    let compiler_version = runner.text(&compiler, &["--version"], workspace)?;
+    let guest_path = bundle.join("standalone_constructor_guest");
+    let root_path = bundle.join("libstandalone_root_interposer.so");
+    let guest_receipt_path = bundle.join("standalone-constructor-guest.json");
+    let root_receipt_path = bundle.join("standalone-root-interposer.json");
+    for (relative, bytes, output, receipt_path, shared) in [
+        (
+            "reverie-liteinst/tests/fixtures/standalone_constructor_guest.c",
+            PROBE,
+            &guest_path,
+            &guest_receipt_path,
+            false,
+        ),
+        (
+            "reverie-liteinst/tests/fixtures/standalone_root_interposer.c",
+            standalone_constructor_fixture::ROOT_SOURCE,
+            &root_path,
+            &root_receipt_path,
+            true,
+        ),
+    ] {
+        let source = FileIdentity::read(&workspace.join(relative))?;
+        check(
+            source.sha256 == m1_artifact::sha256(bytes),
+            "standalone fixture compiled/current source differs",
+        )?;
+        check(!output.exists(), "standalone fixture output already exists")?;
+        runner.run(
+            &compiler,
+            &[
+                "-std=c11".to_owned(),
+                "-Wall".to_owned(),
+                "-Wextra".to_owned(),
+                "-Werror".to_owned(),
+                "-fsyntax-only".to_owned(),
+                source.path.to_string_lossy().into_owned(),
+            ],
+            workspace,
+        )?;
+        let arguments = if shared {
+            standalone_constructor_fixture::root_arguments(&source.path, output)
+        } else {
+            vec![
+                "-std=c11".to_owned(),
+                "-O0".to_owned(),
+                "-fno-builtin".to_owned(),
+                "-fno-lto".to_owned(),
+                "-Wl,--export-dynamic".to_owned(),
+                "-Wl,-z,now".to_owned(),
+                source.path.to_string_lossy().into_owned(),
+                "-o".to_owned(),
+                output.to_string_lossy().into_owned(),
+                "-ldl".to_owned(),
+            ]
+        };
+        runner.run(&compiler, &arguments, workspace)?;
+        let receipt = GuestReceipt {
+            schema_version: 1,
+            source,
+            binary: FileIdentity::read(output)?,
+            compiler_version: compiler_version.clone(),
+            command: runner
+                .commands
+                .last()
+                .ok_or("standalone compiler command missing")?
+                .clone(),
+            executed_tests: 0,
+        };
+        m1_artifact::write_new(
+            receipt_path,
+            &serde_json::to_vec_pretty(&receipt).map_err(|e| e.to_string())?,
+        )?;
+        if shared {
+            standalone_constructor_fixture::verify_root_receipt(
+                receipt_path,
+                output,
+                &receipt.source.path,
+            )?;
+        } else {
+            m1_artifact::verify_guest_receipt(
+                receipt_path,
+                output,
+                &receipt.source.path,
+                &m1_artifact::sha256(PROBE),
+            )?;
+        }
+    }
+    Ok(StandaloneInputs {
+        guest: guest_path,
+        guest_receipt: guest_receipt_path,
+        root: root_path,
+        root_receipt: root_receipt_path,
+    })
+}
+
+fn produce(config: Config) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf, StandaloneInputs)> {
     check(
         config.workspace_root.is_absolute()
             && config.target_directory.is_absolute()
@@ -348,7 +459,7 @@ fn produce(config: Config) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf)> {
         "staged/current artifact hashes differ",
     )?;
     let qualification =
-        m1_artifact::qualify_elf(&stage, "reverie_liteinst_initialize", &mut runner)?;
+        m1_artifact::qualify_elf(&stage, m1_artifact::STANDALONE_ROOT, &mut runner)?;
     let compiler = std::env::var("CC").unwrap_or_else(|_| "cc".to_owned());
     let compiler_version = runner.text(&compiler, &["--version"], &root)?;
     let guest_path = bundle.join("m1_allocator_guest");
@@ -388,6 +499,7 @@ fn produce(config: Config) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf)> {
     };
     let (stack_guest_path, stack_guest_receipt_path) =
         produce_stack_guest(&root, &bundle, &mut runner)?;
+    let standalone = produce_standalone_inputs(&root, &bundle, &mut runner)?;
     let after =
         m1_artifact::source_identity(&root, &root.join("Cargo.lock"), &oracles, &mut runner)?;
     check(
@@ -470,6 +582,22 @@ fn produce(config: Config) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf)> {
             "REVERIE_LITEINST_STACK_GUEST_MANIFEST",
             stack_guest_receipt_path.as_path(),
         ),
+        (
+            "REVERIE_LITEINST_CONSTRUCTOR_GUEST",
+            standalone.guest.as_path(),
+        ),
+        (
+            "REVERIE_LITEINST_CONSTRUCTOR_GUEST_MANIFEST",
+            standalone.guest_receipt.as_path(),
+        ),
+        (
+            "REVERIE_LITEINST_ROOT_INTERPOSER",
+            standalone.root.as_path(),
+        ),
+        (
+            "REVERIE_LITEINST_ROOT_INTERPOSER_MANIFEST",
+            standalone.root_receipt.as_path(),
+        ),
     ]);
     let mut shell = String::new();
     let mut github = String::new();
@@ -492,6 +620,7 @@ fn produce(config: Config) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf)> {
         guest_receipt_path,
         stack_guest_path,
         stack_guest_receipt_path,
+        standalone,
     ))
 }
 
@@ -518,7 +647,7 @@ fn run() -> Result<()> {
         serde_json::from_slice(&fs::read(&path).map_err(|e| format!("read config: {e}"))?)
             .map_err(|e| format!("producer config: {e}"))?
     };
-    let (receipt_path, guest_receipt_path, stack_guest_path, stack_guest_receipt_path) =
+    let (receipt_path, guest_receipt_path, stack_guest_path, stack_guest_receipt_path, standalone) =
         produce(config)?;
     // JSON output is data, never a shell `export` snippet with quote ambiguity.
     let receipt: RuntimeReceipt =
@@ -536,6 +665,10 @@ fn run() -> Result<()> {
             "REVERIE_LITEINST_ALLOCATOR_GUEST_MANIFEST": guest_receipt_path,
             "REVERIE_LITEINST_STACK_GUEST": stack_guest_path,
             "REVERIE_LITEINST_STACK_GUEST_MANIFEST": stack_guest_receipt_path,
+            "REVERIE_LITEINST_CONSTRUCTOR_GUEST": standalone.guest,
+            "REVERIE_LITEINST_CONSTRUCTOR_GUEST_MANIFEST": standalone.guest_receipt,
+            "REVERIE_LITEINST_ROOT_INTERPOSER": standalone.root,
+            "REVERIE_LITEINST_ROOT_INTERPOSER_MANIFEST": standalone.root_receipt,
             "artifact_sha256": receipt.artifact.sha256,
             "guest_sha256": guest.binary.sha256,
             "executed_tests": 0,

@@ -52,8 +52,18 @@ unpublished exact-syscall continuation remains a separate path. The new
 ordinary callback entry is after LiteInst's register capture: that earlier
 trampoline still writes to the interrupted stack. The registered alternate
 stack is process-local under the existing thread restrictions; this does
-not admit new guest threads. A Tool root may separately use the native
-constructor bootstrap; that does not establish all cold-entry isolation.
+not admit new guest threads.
+
+The standalone preload's active constructor also uses the native bootstrap.
+Its register-only selector prefix transfers to a fixed guarded 8 MiB stack
+before the first named Tool initialization body runs. The bootstrap retains
+that lease for process lifetime and restores the loader's original stack on
+return. The runtime initializes before its compatibility resolver, and both
+run on that owned stack. A missing raw Tool selector leaves the preload inert;
+its compatibility resolver retains its existing placement. Earlier loader,
+CRT and lazy compatibility work remain outside this guarantee. Other Tool
+roots must explicitly use the bootstrap; exporting a generic initializer does
+not place calls to it on an owned stack.
 
 These leases establish placement and boundary guards. Their interiors remain
 on protection key zero. They do not prevent a guest from writing an interior

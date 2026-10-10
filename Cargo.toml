@@ -20,6 +20,7 @@ members = [
     "reverie-examples",
     "reverie-kvm",
     "reverie-liteinst",
+    "reverie-liteinst-artifact",
     "reverie-liteinst-preload",
     "reverie-memory",
     "reverie-process",

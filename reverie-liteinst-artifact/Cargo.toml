@@ -1,0 +1,19 @@
+[package]
+name = "reverie-liteinst-artifact"
+version = "0.4.1"
+authors = ["Meta Platforms"]
+edition = "2024"
+repository = "https://github.com/facebookexperimental/reverie"
+license = "BSD-2-Clause"
+publish = false
+description = "Host-only qualification of Reverie LiteInst artifacts"
+
+[lib]
+path = "../scripts/m1_artifact.rs"
+
+[dependencies]
+goblin = "=0.10.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "=0.10.9"
+libc = "0.2"
