@@ -50,6 +50,7 @@ use super::util::to_cstring;
 
 mod resource_startup;
 pub use resource_startup::ChildParentResourceStartContext;
+pub use resource_startup::LinuxMonotonicDeadline;
 pub use resource_startup::ParentResourcePublication;
 pub use resource_startup::ParentResourceStartContext;
 pub use resource_startup::ParentResourceStartupFailure;

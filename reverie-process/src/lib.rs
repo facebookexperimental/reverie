@@ -46,6 +46,7 @@ pub use container::ChildParentResourceStartContext;
 pub use container::ChildStartContext;
 pub use container::Container;
 pub use container::DeferredContainerRun;
+pub use container::LinuxMonotonicDeadline;
 pub use container::MAX_STARTUP_FDS;
 pub use container::OwnedContainerCleanup;
 pub use container::OwnedDecodeFailure;

@@ -24,6 +24,64 @@ const PARENT_HELD: u8 = 16;
 const LEAF_DIRECTORY: u8 = 32;
 const LEAF_NAME_SIZE: usize = 18;
 
+/// An absolute Linux `CLOCK_MONOTONIC` deadline in nanoseconds.
+///
+/// This value is sampled before clone by the native startup API. It is an I/O
+/// deadline in the unchanged host clock namespace, not guest virtual time or
+/// a representation of [`std::time::Instant`]. Native callers may carry the
+/// scalar across exec without reconstructing or renewing its budget.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LinuxMonotonicDeadline(u64);
+
+impl LinuxMonotonicDeadline {
+    /// The original absolute deadline for a native `CLOCK_MONOTONIC` check.
+    pub fn as_nanoseconds(self) -> u64 {
+        self.0
+    }
+
+    fn from_sample(now: u64, timeout: std::time::Duration) -> Result<Self, StartupError> {
+        let allowance = u64::try_from(timeout.as_nanos())
+            .ok()
+            .filter(|value| *value != 0)
+            .ok_or(StartupError::InvalidTimeout)?;
+        let deadline = now
+            .checked_add(allowance)
+            .filter(|value| *value != 0)
+            .ok_or(StartupError::InvalidTimeout)?;
+        Ok(Self(deadline))
+    }
+
+    fn remaining_nanoseconds(self) -> Result<u64, StartupError> {
+        self.0
+            .checked_sub(linux_monotonic_nanoseconds()?)
+            .filter(|value| *value != 0)
+            .ok_or(StartupError::TimedOut)
+    }
+}
+
+fn linux_monotonic_nanoseconds() -> Result<u64, StartupError> {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    Errno::result(unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) })?;
+    let seconds = u64::try_from(time.tv_sec).map_err(|_| StartupError::Io(Errno::EOVERFLOW))?;
+    let nanos = u64::try_from(time.tv_nsec)
+        .ok()
+        .filter(|value| *value < 1_000_000_000)
+        .ok_or(StartupError::Io(Errno::EOVERFLOW))?;
+    seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(nanos))
+        .ok_or(StartupError::Io(Errno::EOVERFLOW))
+}
+
+#[derive(Clone, Copy)]
+enum ResourceClock {
+    Instant,
+    LinuxMonotonic,
+}
+
 /// The opt-in publication, decoded only after a genuine successful child wait.
 ///
 /// The workload value or original startup refusal is kept separately from
@@ -120,6 +178,7 @@ pub struct ParentResourceStartContext<'a> {
     child_pid: Pid,
     child_pidfd: BorrowedFd<'a>,
     deadline: std::time::Instant,
+    native_deadline: Option<LinuxMonotonicDeadline>,
     phase: ParentResourceStartupPhase,
     frame: &'a mut ResourceFrame,
 }
@@ -140,9 +199,19 @@ impl ParentResourceStartContext<'_> {
         self.child_pidfd
     }
 
-    /// The one absolute startup I/O deadline shared by both deliveries.
+    /// The original startup deadline, or the native API's cleanup projection.
+    ///
+    /// When [`Self::native_deadline`] is present, only that raw scalar grants
+    /// startup I/O permission. This earlier `Instant` remains available for
+    /// the original owned cleanup and finalization APIs.
     pub fn deadline(&self) -> std::time::Instant {
         self.deadline
+    }
+
+    /// The native API's one raw deadline, shared by both deliveries and exec.
+    /// The original `Instant` startup API returns `None`.
+    pub fn native_deadline(&self) -> Option<LinuxMonotonicDeadline> {
+        self.native_deadline
     }
 
     /// Number of received owners, including owners in a malformed frame.
@@ -195,9 +264,16 @@ pub struct ChildParentResourceStartContext<'a> {
 }
 
 impl ChildParentResourceStartContext<'_> {
-    /// The original absolute startup I/O deadline.
+    /// The original startup deadline, or the native API's cleanup projection.
+    /// Native callers must use [`Self::native_deadline`] for permission.
     pub fn deadline(&self) -> std::time::Instant {
         self.socket.inner.deadline
+    }
+
+    /// The unchanged raw native deadline to carry into the first exec.
+    /// The original `Instant` startup API returns `None`.
+    pub fn native_deadline(&self) -> Option<LinuxMonotonicDeadline> {
+        self.socket.native_deadline
     }
 
     /// Delivers the actual base and waits for parent acquisition before creation.
@@ -308,10 +384,81 @@ impl Container {
         F: FnMut(S) -> (T, U),
         T: Serialize,
     {
+        self.run_with_resource_startup_owned(
+            timeout,
+            ResourceClock::Instant,
+            parent_start,
+            child_start,
+            run,
+        )
+    }
+
+    /// Performs the same directory handoff with a native monotonic deadline.
+    ///
+    /// All ownership, callback, wire, wait-before-decode and publication
+    /// requirements of [`Self::run_with_parent_resource_startup_owned`] apply.
+    /// Before clone, this entry samples one checked absolute Linux
+    /// `CLOCK_MONOTONIC` scalar. Both deliveries, acknowledgements and final
+    /// permission use that scalar; callbacks may carry it through exec for
+    /// the first native lookup. No I/O or retry renews the budget.
+    ///
+    /// The accompanying `Instant` is sampled immediately before the raw clock
+    /// and is only an earlier cleanup projection. It never grants startup
+    /// permission. Callbacks are not preempted, and this entry does not impose
+    /// a workload timeout or change guest virtual time.
+    pub fn run_with_native_parent_resource_startup_owned<P, C, F, S, T, U>(
+        &mut self,
+        timeout: std::time::Duration,
+        parent_start: &mut P,
+        child_start: &mut C,
+        run: &mut F,
+    ) -> ParentResourceStartupResult<T>
+    where
+        P: FnMut(ParentResourceStartContext<'_>) -> Result<(), StartupError>,
+        C: FnMut(&mut ChildParentResourceStartContext<'_>) -> Result<S, StartupError>,
+        F: FnMut(S) -> (T, U),
+        T: Serialize,
+    {
+        self.run_with_resource_startup_owned(
+            timeout,
+            ResourceClock::LinuxMonotonic,
+            parent_start,
+            child_start,
+            run,
+        )
+    }
+
+    fn run_with_resource_startup_owned<P, C, F, S, T, U>(
+        &mut self,
+        timeout: std::time::Duration,
+        clock: ResourceClock,
+        parent_start: &mut P,
+        child_start: &mut C,
+        run: &mut F,
+    ) -> ParentResourceStartupResult<T>
+    where
+        P: FnMut(ParentResourceStartContext<'_>) -> Result<(), StartupError>,
+        C: FnMut(&mut ChildParentResourceStartContext<'_>) -> Result<S, StartupError>,
+        F: FnMut(S) -> (T, U),
+        T: Serialize,
+    {
         let before = ParentResourceStartupFailure::before;
         self.validate_pinned_clone()
             .map_err(|error| before(error.into()))?;
-        let deadline = std::time::Instant::now()
+        // In native mode this sample precedes the raw clock sample. The
+        // resulting Instant is cleanup-only, never a second I/O authority.
+        let cleanup_start = std::time::Instant::now();
+        let native_deadline = match clock {
+            ResourceClock::Instant => None,
+            ResourceClock::LinuxMonotonic => Some(
+                LinuxMonotonicDeadline::from_sample(
+                    linux_monotonic_nanoseconds().map_err(before)?,
+                    timeout,
+                )
+                .map_err(before)?,
+            ),
+        };
+        let deadline = cleanup_start
             .checked_add(timeout)
             .filter(|_| !timeout.is_zero())
             .ok_or_else(|| before(StartupError::InvalidTimeout))?;
@@ -325,7 +472,10 @@ impl Container {
         {
             return Err(before(StartupError::Io(Errno::ECHILD)));
         }
-        let (parent, child) = ResourceSocket::pair(deadline)?;
+        let (parent, child) = match native_deadline {
+            Some(native) => ResourceSocket::pair_native(deadline, native)?,
+            None => ResourceSocket::pair(deadline)?,
+        };
         let mut parent = Some(parent);
         let mut child = Some(child);
         let uid_map = &make_id_map(&self.uid_map);
@@ -409,6 +559,7 @@ impl Container {
                     child_pid: owned.cleanup().pid,
                     child_pidfd: owned.cleanup().pidfd.as_ref().unwrap().as_fd(),
                     deadline,
+                    native_deadline,
                     phase,
                     frame: &mut frame,
                 });
@@ -434,7 +585,7 @@ impl Container {
             retained.extend(eof.take_descriptors());
             validation?;
             socket.send(STARTUP_READY, &[], None)?;
-            socket.inner.close_write()?;
+            socket.close_write()?;
             Ok(())
         })();
         let mut cause = exchange.err();
@@ -511,7 +662,7 @@ impl Container {
             if child_context.phase != ChildPhase::LeafSent {
                 return Err(StartupError::Protocol);
             }
-            socket.inner.close_write()?;
+            socket.close_write()?;
             let mut permission = socket.receive(Some(STARTUP_READY));
             let validated = permission.validate(Some(STARTUP_READY));
             secondary.append(&mut permission.secondary_errors);
@@ -542,13 +693,7 @@ impl Container {
                 Err(error) => Err(error),
             },
             Err(error) => {
-                append_error(
-                    &mut failure,
-                    &mut secondary,
-                    socket
-                        .inner
-                        .send(STARTUP_FAILURE, &StartupFds::default(), Some(error)),
-                );
+                append_error(&mut failure, &mut secondary, socket.send_failure(error));
                 // No worker exists on this refusal path. The parent retains
                 // the real wait and any received directory even if this
                 // final endpoint close itself refuses.
@@ -641,6 +786,7 @@ fn valid_leaf_name(name: &[u8]) -> bool {
 
 struct ResourceSocket {
     inner: StartupSocket,
+    native_deadline: Option<LinuxMonotonicDeadline>,
 }
 
 struct ResourceChildIo {
@@ -654,6 +800,20 @@ impl ResourceSocket {
     fn pair<T>(
         deadline: std::time::Instant,
     ) -> Result<(Self, Self), Box<ParentResourceStartupFailure<T>>> {
+        Self::pair_with_deadline(deadline, None)
+    }
+
+    fn pair_native<T>(
+        deadline: std::time::Instant,
+        native: LinuxMonotonicDeadline,
+    ) -> Result<(Self, Self), Box<ParentResourceStartupFailure<T>>> {
+        Self::pair_with_deadline(deadline, Some(native))
+    }
+
+    fn pair_with_deadline<T>(
+        deadline: std::time::Instant,
+        native_deadline: Option<LinuxMonotonicDeadline>,
+    ) -> Result<(Self, Self), Box<ParentResourceStartupFailure<T>>> {
         let (parent, child) =
             StartupSocket::pair(deadline).map_err(ParentResourceStartupFailure::before)?;
         let convert =
@@ -666,6 +826,7 @@ impl ResourceSocket {
                         fd: Fd::from(fd),
                         deadline,
                     },
+                    native_deadline,
                 })
             };
         Ok((convert(parent)?, convert(child)?))
@@ -673,6 +834,59 @@ impl ResourceSocket {
 
     fn close(self) -> Result<(), StartupError> {
         self.inner.fd.close().map_err(Into::into)
+    }
+
+    fn check_native_deadline(&self) -> Result<(), StartupError> {
+        match self.native_deadline {
+            Some(deadline) => deadline.remaining_nanoseconds().map(|_| ()),
+            None => Ok(()),
+        }
+    }
+
+    fn poll(&self, events: libc::c_short) -> Result<(), StartupError> {
+        let Some(deadline) = self.native_deadline else {
+            return self.inner.poll(events);
+        };
+        loop {
+            let millis = deadline
+                .remaining_nanoseconds()?
+                .div_ceil(1_000_000)
+                .min(i32::MAX as u64) as i32;
+            let mut fd = libc::pollfd {
+                fd: self.inner.fd.as_raw_fd(),
+                events,
+                revents: 0,
+            };
+            match Errno::result(unsafe { libc::poll(&mut fd, 1, millis) }) {
+                Ok(0) | Err(Errno::EINTR) => continue,
+                Ok(_) if fd.revents & libc::POLLNVAL != 0 => {
+                    return Err(StartupError::Io(Errno::EBADF));
+                }
+                Ok(_) => return self.check_native_deadline(),
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    fn close_write(&self) -> Result<(), StartupError> {
+        self.check_native_deadline()?;
+        self.inner.close_write()?;
+        self.check_native_deadline()
+    }
+
+    fn send_failure(&self, error: StartupError) -> Result<(), StartupError> {
+        if self.native_deadline.is_none() {
+            return self
+                .inner
+                .send(STARTUP_FAILURE, &StartupFds::default(), Some(error));
+        }
+        let mut frame = [0u8; STARTUP_FRAME_SIZE];
+        frame[..4].copy_from_slice(b"RVS1");
+        frame[4] = STARTUP_FAILURE;
+        frame[6] =
+            bincode::serde::encode_into_slice(error, &mut frame[8..], bincode::config::legacy())
+                .map_err(|_| StartupError::Protocol)? as u8;
+        self.send_frame(&frame, &[])
     }
 
     fn send(
@@ -689,6 +903,14 @@ impl ResourceSocket {
             frame[6] = LEAF_NAME_SIZE as u8;
             frame[8..26].copy_from_slice(name);
         }
+        self.send_frame(&frame, descriptors)
+    }
+
+    fn send_frame(
+        &self,
+        frame: &[u8; STARTUP_FRAME_SIZE],
+        descriptors: &[BorrowedFd<'_>],
+    ) -> Result<(), StartupError> {
         let socket = &self.inner;
         let mut ancillary = [0usize; 16];
         let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
@@ -717,13 +939,14 @@ impl ResourceSocket {
         }
         let mut offset = 0;
         while offset < frame.len() {
-            socket.poll(libc::POLLOUT)?;
+            self.poll(libc::POLLOUT)?;
             let mut iov = libc::iovec {
                 iov_base: frame[offset..].as_ptr().cast_mut().cast(),
                 iov_len: frame.len() - offset,
             };
             message.msg_iov = &mut iov;
             message.msg_iovlen = 1;
+            self.check_native_deadline()?;
             match Errno::result(unsafe {
                 libc::sendmsg(socket.fd.as_raw_fd(), &message, libc::MSG_NOSIGNAL)
             }) {
@@ -732,6 +955,7 @@ impl ResourceSocket {
                     offset += size as usize;
                     message.msg_control = std::ptr::null_mut();
                     message.msg_controllen = 0;
+                    self.check_native_deadline()?;
                 }
                 Err(Errno::EINTR | Errno::EAGAIN) => continue,
                 Err(error) => return Err(error.into()),
@@ -751,7 +975,7 @@ impl ResourceSocket {
             secondary_errors: Vec::new(),
         };
         loop {
-            if let Err(error) = socket.poll(libc::POLLIN) {
+            if let Err(error) = self.poll(libc::POLLIN) {
                 frame.record_error(error);
                 return frame;
             }
@@ -765,6 +989,10 @@ impl ResourceSocket {
             message.msg_iovlen = 1;
             message.msg_control = ancillary.as_mut_ptr().cast();
             message.msg_controllen = std::mem::size_of_val(&ancillary);
+            if let Err(error) = self.check_native_deadline() {
+                frame.record_error(error);
+                return frame;
+            }
             let size = match Errno::result(unsafe {
                 libc::recvmsg(socket.fd.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC)
             }) {
@@ -807,6 +1035,11 @@ impl ResourceSocket {
                 || frame.descriptors.len() > MAX_STARTUP_FDS
             {
                 frame.record_error(StartupError::Protocol);
+            }
+            // Receive first acquired every actual SCM_RIGHTS owner. An expired
+            // raw deadline refuses permission while retaining those owners.
+            if let Err(error) = self.check_native_deadline() {
+                frame.record_error(error);
             }
             if size == 0 {
                 frame.eof = true;
