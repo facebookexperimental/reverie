@@ -48,6 +48,14 @@ use super::stdio::Stdio;
 use super::util::reset_signal_handling;
 use super::util::to_cstring;
 
+mod resource_startup;
+pub use resource_startup::ChildParentResourceStartContext;
+pub use resource_startup::ParentResourcePublication;
+pub use resource_startup::ParentResourceStartContext;
+pub use resource_startup::ParentResourceStartupFailure;
+pub use resource_startup::ParentResourceStartupPhase;
+pub use resource_startup::ParentResourceStartupResult;
+
 /// A `Container` is a configuration of how a process shall be spawned. It can,
 /// but doesn't have to, include Linux namespace configuration.
 ///
