@@ -623,17 +623,45 @@ pub struct CompiledSources {
     layout: CompiledSourceLayout,
     image_kind: FixedImageKind,
     workspace_root: PathBuf,
-    workspace_head: String,
-    workspace_tree: String,
+    authority: CompiledSourceAuthority,
     manifest: FileIdentity,
     reverie_pin: String,
     reverie_root: PathBuf,
-    reverie_tree: String,
     packages: BTreeMap<String, PackageIdentity>,
     files: BTreeMap<String, FileIdentity>,
     leaf: PackageIdentity,
 }
-/// Only resolve() can construct this type. Deserializing evidence does not
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum CompiledSourceAuthority {
+    Git {
+        workspace_head: String,
+        workspace_tree: String,
+        reverie_tree: String,
+    },
+    DeclaredContent {
+        workspace_inventory: Vec<DeclaredSourceFile>,
+        workspace_sha256: String,
+        reverie_inventory: Vec<DeclaredSourceFile>,
+        reverie_sha256: String,
+        compiler_root: CompilerRootBinding,
+    },
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeclaredSourceFile {
+    relative: String,
+    size: u64,
+    sha256: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompilerRootBinding {
+    logical_root: PathBuf,
+    canonical_root: PathBuf,
+    cargo_home: Option<(PathBuf, PathBuf)>,
+}
+/// Only the fresh Git/content factories can construct this type. Deserializing evidence does not
 /// authorize compiler filenames or establish the current Cargo source graph.
 pub struct VerifiedCompiledSources {
     record: CompiledSources,
@@ -646,6 +674,247 @@ const COMPILED_RV_LOCATION_FILES: [&str; 6] = [
     "reverie-inguest/src/guest/tool_region.rs",
     "reverie-liteinst-preload/src/lib.rs",
 ];
+const CONTENT_WORKSPACE_FILES: [&str; 6] = [
+    "liteinst-runtime-build/Cargo.toml",
+    "liteinst-runtime-build/Cargo.lock",
+    "liteinst-runtime-build/runtime/Cargo.toml",
+    "liteinst-runtime-build/runtime/src/lib.rs",
+    "liteinst-runtime-build/build.rs",
+    "liteinst-runtime-build/artifact.rs",
+];
+// Reviewed literal expectations, not hashes generated from the current checkout
+// or bytes embedded after a runtime edit. The qualifier self-hash is separate.
+const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 13] = [
+    (
+        "Cargo.toml",
+        869,
+        "bf6c6108361a52f1c2e3fef0976edc700b9c9f780b3699130b2e690b058b99a4",
+    ),
+    (
+        "reverie-liteinst-artifact/Cargo.toml",
+        456,
+        "74f41a07055f00263e4a068c0f6c54ce45da4c355800ae71a02d76aa573090c5",
+    ),
+    (
+        "reverie-inguest/Cargo.toml",
+        2911,
+        "d25daf0166aaee74838fdeadb2ece9a4b206806b52f93533dbdcef93488e90f1",
+    ),
+    (
+        "reverie-inguest/src/lib.rs",
+        11214,
+        "2721dda5f84ab0ed33c9186395f76f24cc1d80fdbca42c73fcac9272946e5571",
+    ),
+    (
+        "reverie-liteinst/Cargo.toml",
+        3658,
+        "c87da55171e660f03ad02adb4ffc18bc6752166466c469ecdfd8b6724b0aa490",
+    ),
+    (
+        "reverie-liteinst/src/lib.rs",
+        21855,
+        "e9a35af42e1f8bc26c8c02c781fe1c12840e1e4d69494996ae9409b37b7dc0c3",
+    ),
+    (
+        "reverie-liteinst-preload/Cargo.toml",
+        916,
+        "62dbd63e5dc9591139ca50b8f17d63fdce3eeda1d2830809969538642251095a",
+    ),
+    (
+        "reverie-liteinst-preload/src/lib.rs",
+        842,
+        "40587a60db06dc95538745208d23e7ec55a069c79ac86bfef87377df5a59fbe6",
+    ),
+    (
+        "reverie-liteinst/src/patch_alloc.rs",
+        24730,
+        "4e624b555d15acaeb72c9d4bf4d29e52666b377fb9a9ef48ef07447b6e834561",
+    ),
+    (
+        "reverie-inguest/src/guest/alloc.rs",
+        35989,
+        "5b3826b9e2dc9158f903e6989356e1f412395d9f86b3c7e736c2b3ed7d24b447",
+    ),
+    (
+        "reverie-inguest/src/guest/tool_region_constructor.rs",
+        30585,
+        "ea43ed2b281db6efa9524e45430b87153094355277a16292c63d0d596ce5fc66",
+    ),
+    (
+        "reverie-inguest/src/guest/tool_region_arena.rs",
+        10111,
+        "adbb364c17a4b9e2dc8d576378050ef8ed11407c0440f31e0c47ba994460b5d8",
+    ),
+    (
+        "reverie-inguest/src/guest/tool_region.rs",
+        19239,
+        "d834f1394203227397101b11fc1ca6377258afd9ea2c120bd137a8044665be13",
+    ),
+];
+fn content_catalog_matches(relative: &str, size: u64, digest: &str) -> Result<()> {
+    require(
+        CONTENT_REVERIE_CATALOG
+            .iter()
+            .any(|&(path, expected_size, expected_digest)| {
+                relative == path && size == expected_size && digest == expected_digest
+            }),
+        format!("declared Reverie source differs from reviewed catalog: {relative}"),
+    )
+}
+fn declared_inventory(
+    root: &Path,
+    relatives: &[&str],
+) -> Result<(Vec<DeclaredSourceFile>, BTreeMap<String, FileIdentity>)> {
+    let mut inventory = BTreeMap::new();
+    let mut files = BTreeMap::new();
+    for &relative in relatives {
+        let file = exact_source_file(root, relative)?;
+        let size = fs::metadata(&file.path).map_err(|e| e.to_string())?.len();
+        file.verify()?;
+        require(
+            inventory
+                .insert(
+                    relative,
+                    DeclaredSourceFile {
+                        relative: relative.into(),
+                        size,
+                        sha256: file.sha256.clone(),
+                    },
+                )
+                .is_none(),
+            "duplicate declared source filename",
+        )?;
+        files.insert(relative.into(), file);
+    }
+    Ok((inventory.into_values().collect(), files))
+}
+fn declared_inventory_sha256(inventory: &[DeclaredSourceFile]) -> Result<String> {
+    // Serde emits these fixed fields and ordered relative entries. No absolute
+    // pathname is part of this location-independent content identity.
+    Ok(sha256(
+        &serde_json::to_vec(inventory).map_err(|e| e.to_string())?,
+    ))
+}
+fn content_reverie_inventory(
+    root: &Path,
+) -> Result<(Vec<DeclaredSourceFile>, BTreeMap<String, FileIdentity>)> {
+    let mut relatives: Vec<_> = CONTENT_REVERIE_CATALOG
+        .iter()
+        .map(|entry| entry.0)
+        .collect();
+    relatives.push("scripts/m1_artifact.rs");
+    let (inventory, files) = declared_inventory(root, &relatives)?;
+    for entry in &inventory {
+        if entry.relative == "scripts/m1_artifact.rs" {
+            require(
+                entry.sha256 == qualifier_source_sha256(),
+                "declared qualifier source differs from compiled host qualifier",
+            )?;
+        } else {
+            content_catalog_matches(&entry.relative, entry.size, &entry.sha256)?;
+        }
+    }
+    Ok((inventory, files))
+}
+fn clean_absolute_source_root(root: &Path) -> Result<()> {
+    let normalized: PathBuf = root.components().collect();
+    require(
+        root.is_absolute() && normalized.as_os_str() == root.as_os_str(),
+        "compiled source root has a lexical alias",
+    )
+}
+impl CompilerRootBinding {
+    fn resolve(logical_root: &Path, pin: &str) -> Result<Self> {
+        clean_absolute_source_root(logical_root)?;
+        let canonical_root = fs::canonicalize(logical_root).map_err(|e| e.to_string())?;
+        if canonical_root.as_os_str() == logical_root.as_os_str() {
+            return Ok(Self {
+                logical_root: logical_root.into(),
+                canonical_root,
+                cargo_home: None,
+            });
+        }
+        // The one observed alias is the CARGO_HOME root. No checkout/package/
+        // source subdirectory may supply a second alias or change the suffix.
+        let cargo_home = std::env::var_os("CARGO_HOME")
+            .ok_or("compiler source alias is not an explicit Cargo home root")?;
+        Self::resolve_cargo_home(logical_root, pin, Path::new(&cargo_home))
+    }
+    fn resolve_cargo_home(logical_root: &Path, pin: &str, cargo_home: &Path) -> Result<Self> {
+        require(source_pin_is_full(pin), "compiler root requires a full pin")?;
+        clean_absolute_source_root(logical_root)?;
+        clean_absolute_source_root(cargo_home)?;
+        let canonical_home = fs::canonicalize(cargo_home).map_err(|e| e.to_string())?;
+        let suffix = format!("git/checkouts/reverie-2fc770f7a9c80803/{}", &pin[..7]);
+        require(
+            logical_root.as_os_str() == cargo_home.join(&suffix).as_os_str(),
+            "compiler alias is not the observed Cargo checkout root",
+        )?;
+        let canonical_root = fs::canonicalize(logical_root).map_err(|e| e.to_string())?;
+        require(
+            canonical_root.as_os_str() == canonical_home.join(suffix).as_os_str(),
+            "compiler Cargo root contains an internal alias",
+        )?;
+        Ok(Self {
+            logical_root: logical_root.into(),
+            canonical_root,
+            cargo_home: Some((cargo_home.into(), canonical_home)),
+        })
+    }
+    fn verify(&self) -> Result<()> {
+        require(
+            fs::canonicalize(&self.logical_root)
+                .map_err(|e| e.to_string())?
+                .as_os_str()
+                == self.canonical_root.as_os_str(),
+            "compiler root mapping changed during use",
+        )?;
+        if let Some((logical, canonical)) = &self.cargo_home {
+            require(
+                fs::canonicalize(logical)
+                    .map_err(|e| e.to_string())?
+                    .as_os_str()
+                    == canonical.as_os_str(),
+                "compiler Cargo home mapping changed during use",
+            )?;
+        }
+        Ok(())
+    }
+    fn source_path(&self, relative: &str) -> Result<PathBuf> {
+        self.verify()?;
+        let file = exact_source_file(&self.canonical_root, relative)?;
+        let logical = self.logical_root.join(relative);
+        require(
+            real_file(&logical)?.as_os_str() == file.path.as_os_str(),
+            "compiler source mapping does not reach its exact declared file",
+        )?;
+        Ok(logical)
+    }
+}
+fn verify_declared_content(
+    (workspace_root, workspace_inventory, workspace_sha256): (&Path, &[DeclaredSourceFile], &str),
+    (reverie_root, reverie_inventory, reverie_sha256): (&Path, &[DeclaredSourceFile], &str),
+    compiler_root: &CompilerRootBinding,
+) -> Result<()> {
+    compiler_root.verify()?;
+    require(
+        compiler_root.canonical_root.as_os_str() == reverie_root.as_os_str(),
+        "declared compiler root differs from Reverie inventory root",
+    )?;
+    let (current_workspace, _) = declared_inventory(workspace_root, &CONTENT_WORKSPACE_FILES)?;
+    let (current_reverie, _) = content_reverie_inventory(reverie_root)?;
+    require(
+        current_workspace == workspace_inventory
+            && declared_inventory_sha256(&current_workspace)? == workspace_sha256,
+        "declared workspace content changed during use",
+    )?;
+    require(
+        current_reverie == reverie_inventory
+            && declared_inventory_sha256(&current_reverie)? == reverie_sha256,
+        "declared Reverie content changed during use",
+    )?;
+    Ok(())
+}
 fn source_pin_is_full(pin: &str) -> bool {
     pin.len() == 40
         && pin
@@ -869,6 +1138,157 @@ fn compiled_leaf_package(
     )?;
     Ok(leaf)
 }
+fn content_package(
+    metadata: &Value,
+    name: &str,
+    target: &str,
+    kind: &[&str],
+    binding: &CompilerRootBinding,
+    source: &str,
+) -> Result<PackageIdentity> {
+    let candidates: Vec<_> = metadata["packages"]
+        .as_array()
+        .ok_or("content metadata packages missing")?
+        .iter()
+        .filter(|p| p["name"] == name)
+        .collect();
+    require(
+        candidates.len() == 1,
+        format!("content source needs one package {name}"),
+    )?;
+    let raw = candidates[0];
+    let manifest_relative = format!("{name}/Cargo.toml");
+    let compiler_manifest = binding.source_path(&manifest_relative)?;
+    require(
+        raw["manifest_path"].as_str() == compiler_manifest.to_str(),
+        "content metadata manifest differs from exact compiler spelling",
+    )?;
+    require(
+        raw["source"].as_str() == Some(source) && raw["version"] == "0.4.1",
+        "content metadata source/version differs from full pin",
+    )?;
+    let id = format!(
+        "{}#{name}@0.4.1",
+        source
+            .rsplit_once('#')
+            .ok_or("content Git source lacks revision")?
+            .0
+    );
+    require(
+        raw["id"] == id,
+        "content package ID differs from independent full pin",
+    )?;
+    let targets: Vec<_> = raw["targets"]
+        .as_array()
+        .ok_or("content package targets missing")?
+        .iter()
+        .filter(|t| t["name"] == target)
+        .collect();
+    require(targets.len() == 1, "content library target is ambiguous")?;
+    let t = targets[0];
+    let (compiler_target, canonical_target) = if name == "reverie-liteinst-artifact" {
+        // Cargo retains this exact declared host-only target spelling. This
+        // single manifest declaration is not permission for source aliases.
+        (
+            binding
+                .logical_root
+                .join("reverie-liteinst-artifact/../scripts/m1_artifact.rs"),
+            binding.source_path("scripts/m1_artifact.rs")?,
+        )
+    } else {
+        let relative = format!("{name}/src/lib.rs");
+        let path = binding.source_path(&relative)?;
+        (path.clone(), path)
+    };
+    require(
+        t["src_path"].as_str() == compiler_target.to_str()
+            && strings(&t["kind"])? == kind
+            && strings(&t["crate_types"])? == kind,
+        "content library target/source/type differs",
+    )?;
+    let target_source = real_file(&compiler_target)?;
+    require(
+        target_source.as_os_str() == real_file(&canonical_target)?.as_os_str(),
+        "content target does not reach exact declared file",
+    )?;
+    let manifest = exact_source_file(&binding.canonical_root, &manifest_relative)?.path;
+    Ok(PackageIdentity {
+        id,
+        name: name.into(),
+        manifest,
+        source: Some(source.into()),
+        target: target.into(),
+        kind: kind.iter().map(|s| (*s).into()).collect(),
+        crate_types: kind.iter().map(|s| (*s).into()).collect(),
+        target_source,
+    })
+}
+fn content_manifest_and_lock_pin(metadata: &Value, root: &Path, source: &str) -> Result<()> {
+    let packages = metadata["packages"]
+        .as_array()
+        .ok_or("content metadata packages missing")?;
+    for (name, relative, dependency, kind) in [
+        (
+            "hermit-liteinst-runtime-build",
+            "liteinst-runtime-build/Cargo.toml",
+            "reverie-liteinst-artifact",
+            Some("build"),
+        ),
+        (
+            "hermit-liteinst-runtime-artifact",
+            "liteinst-runtime-build/runtime/Cargo.toml",
+            "reverie-liteinst-preload",
+            None,
+        ),
+    ] {
+        let selected: Vec<_> = packages.iter().filter(|p| p["name"] == name).collect();
+        require(
+            selected.len() == 1
+                && selected[0]["manifest_path"].as_str() == root.join(relative).to_str(),
+            "content build package does not match declared manifest",
+        )?;
+        let dependencies: Vec<_> = selected[0]["dependencies"]
+            .as_array()
+            .ok_or("content build dependencies missing")?
+            .iter()
+            .filter(|d| d["name"] == dependency)
+            .collect();
+        require(
+            dependencies.len() == 1
+                && dependencies[0]["source"].as_str() == source.rsplit_once('#').map(|s| s.0)
+                && dependencies[0]["kind"].as_str() == kind
+                && (kind.is_some() || dependencies[0]["kind"].is_null())
+                && dependencies[0]["rename"].is_null()
+                && dependencies[0]["path"].is_null(),
+            "content manifest dependency differs from independent full pin",
+        )?;
+    }
+    let lock = fs::read_to_string(root.join("liteinst-runtime-build/Cargo.lock"))
+        .map_err(|e| e.to_string())?;
+    for name in [
+        "reverie-inguest",
+        "reverie-liteinst",
+        "reverie-liteinst-preload",
+        "reverie-liteinst-artifact",
+    ] {
+        let name_line = format!("name = \"{name}\"");
+        let entries: Vec<_> = lock
+            .split("[[package]]")
+            .filter(|entry| entry.lines().any(|line| line == name_line))
+            .collect();
+        let source_line = format!("source = \"{source}\"");
+        require(
+            entries.len() == 1
+                && entries[0]
+                    .lines()
+                    .filter(|line| line.starts_with("source = "))
+                    .collect::<Vec<_>>()
+                    == [source_line.as_str()],
+            "content lock source differs from independent full pin",
+        )?;
+    }
+    Ok(())
+}
 // Only filename() supplies this helper's identity from its private verified record.
 fn compiled_role_filename(
     layout: CompiledSourceLayout,
@@ -1084,17 +1504,163 @@ impl VerifiedCompiledSources {
             layout: expected.layout,
             image_kind: expected.image_kind,
             workspace_root: root,
-            workspace_head,
-            workspace_tree,
+            authority: CompiledSourceAuthority::Git {
+                workspace_head,
+                workspace_tree,
+                reverie_tree: rv_tree,
+            },
             manifest,
             reverie_pin: expected.reverie_pin.into(),
             reverie_root: rv_root,
-            reverie_tree: rv_tree,
             packages,
             files,
             leaf,
         };
         let verified = Self { record };
+        verified.verify_unchanged(runner)?;
+        Ok(verified)
+    }
+    /// Explicit standalone source-copy authority. It never catches a Git error
+    /// or accepts caller-supplied metadata, inventories or compiler mappings.
+    pub fn resolve_content(
+        expected: &CompiledSourceExpectation<'_>,
+        runner: &mut Runner,
+    ) -> Result<Self> {
+        require(
+            expected.layout == CompiledSourceLayout::HermitGit
+                && expected.image_kind == FixedImageKind::Standalone,
+            "declared content factory supports only standalone Hermit builds",
+        )?;
+        require(
+            source_pin_is_full(expected.reverie_pin),
+            "compiled source requires an independent full Reverie pin",
+        )?;
+        for name in ["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"] {
+            if let Some(flags) = std::env::var_os(name) {
+                require(
+                    !flags
+                        .to_str()
+                        .ok_or("compiler flags are not UTF-8")?
+                        .contains("--remap-path-prefix"),
+                    "caller compiler filename remapping is unsupported",
+                )?;
+            }
+        }
+        let root = fs::canonicalize(expected.workspace_root).map_err(|e| e.to_string())?;
+        require(
+            root.as_os_str() == expected.workspace_root.as_os_str(),
+            "compiled source workspace is not canonical",
+        )?;
+        let (workspace_inventory, workspace_files) =
+            declared_inventory(&root, &CONTENT_WORKSPACE_FILES)?;
+        let manifest = workspace_files
+            .get("liteinst-runtime-build/Cargo.toml")
+            .ok_or("declared build manifest missing")?
+            .clone();
+        require(
+            manifest.path.as_os_str() == expected.manifest.as_os_str(),
+            "compiled source manifest differs from the explicit build root",
+        )?;
+        let output = runner.run(
+            "cargo",
+            &[
+                "metadata".into(),
+                "--locked".into(),
+                "--offline".into(),
+                "--format-version=1".into(),
+                "--manifest-path".into(),
+                manifest
+                    .path
+                    .to_str()
+                    .ok_or("compiled manifest is not UTF-8")?
+                    .into(),
+            ],
+            &root,
+        )?;
+        let metadata: Value = serde_json::from_slice(&output)
+            .map_err(|e| format!("fresh compiled source metadata: {e}"))?;
+        let source = format!(
+            "git+https://github.com/rrnewton/reverie.git?rev={0}#{0}",
+            expected.reverie_pin
+        );
+        content_manifest_and_lock_pin(&metadata, &root, &source)?;
+        let selected: Vec<_> = metadata["packages"]
+            .as_array()
+            .ok_or("content metadata packages missing")?
+            .iter()
+            .filter(|p| p["name"] == "reverie-inguest")
+            .collect();
+        require(
+            selected.len() == 1,
+            "one compiled reverie-inguest source required",
+        )?;
+        let raw_manifest = selected[0]["manifest_path"]
+            .as_str()
+            .ok_or("content dependency manifest missing")?;
+        let logical_root = raw_manifest
+            .strip_suffix("/reverie-inguest/Cargo.toml")
+            .ok_or("content dependency manifest has wrong suffix")?;
+        let binding = CompilerRootBinding::resolve(Path::new(logical_root), expected.reverie_pin)?;
+        let (reverie_inventory, reverie_files) =
+            content_reverie_inventory(&binding.canonical_root)?;
+        let mut packages = BTreeMap::new();
+        for (name, target, kind) in [
+            (
+                "reverie-inguest",
+                "reverie_inguest",
+                &["cdylib", "rlib"][..],
+            ),
+            ("reverie-liteinst", "reverie_liteinst", &["rlib"][..]),
+            (
+                "reverie-liteinst-preload",
+                "reverie_liteinst_preload",
+                &["cdylib"][..],
+            ),
+            (
+                "reverie-liteinst-artifact",
+                "reverie_liteinst_artifact",
+                &["lib"][..],
+            ),
+        ] {
+            packages.insert(
+                name.into(),
+                content_package(&metadata, name, target, kind, &binding, &source)?,
+            );
+        }
+        let leaf = packages
+            .get("reverie-liteinst-preload")
+            .ok_or("content leaf missing")?
+            .clone();
+        let files = workspace_files
+            .into_iter()
+            .map(|(path, file)| (format!("workspace:{path}"), file))
+            .chain(
+                reverie_files
+                    .into_iter()
+                    .map(|(path, file)| (format!("rv:{path}"), file)),
+            )
+            .collect();
+        let authority = CompiledSourceAuthority::DeclaredContent {
+            workspace_sha256: declared_inventory_sha256(&workspace_inventory)?,
+            workspace_inventory,
+            reverie_sha256: declared_inventory_sha256(&reverie_inventory)?,
+            reverie_inventory,
+            compiler_root: binding.clone(),
+        };
+        let verified = Self {
+            record: CompiledSources {
+                layout: expected.layout,
+                image_kind: expected.image_kind,
+                workspace_root: root,
+                authority,
+                manifest,
+                reverie_pin: expected.reverie_pin.into(),
+                reverie_root: binding.canonical_root,
+                packages,
+                files,
+                leaf,
+            },
+        };
         verified.verify_unchanged(runner)?;
         Ok(verified)
     }
@@ -1104,22 +1670,63 @@ impl VerifiedCompiledSources {
     pub fn package(&self) -> &PackageIdentity {
         &self.record.leaf
     }
+    /// Exact retained Cargo compiler spelling; canonical PackageIdentity remains
+    /// unchanged for artifact selection. Consumers compare this raw path exactly.
+    pub fn compiler_manifest_path(&self) -> Result<PathBuf> {
+        self.verify_files()?;
+        match &self.record.authority {
+            CompiledSourceAuthority::Git { .. } => Ok(self.record.leaf.manifest.clone()),
+            CompiledSourceAuthority::DeclaredContent { compiler_root, .. } => {
+                let logical = compiler_root.source_path("reverie-liteinst-preload/Cargo.toml")?;
+                require(
+                    real_file(&logical)?.as_os_str() == self.record.leaf.manifest.as_os_str(),
+                    "compiler manifest does not match verified canonical package",
+                )?;
+                Ok(logical)
+            }
+        }
+    }
     pub fn verify_unchanged(&self, runner: &mut Runner) -> Result<()> {
         let r = &self.record;
-        require(
-            compiled_git_identity(&r.workspace_root, runner)?
-                == (r.workspace_head.clone(), r.workspace_tree.clone()),
-            "compiled workspace changed during use",
-        )?;
-        require(
-            compiled_git_identity(&r.reverie_root, runner)?
-                == (r.reverie_pin.clone(), r.reverie_tree.clone()),
-            "compiled Reverie checkout changed during use",
-        )?;
+        if let CompiledSourceAuthority::Git {
+            workspace_head,
+            workspace_tree,
+            reverie_tree,
+        } = &r.authority
+        {
+            require(
+                compiled_git_identity(&r.workspace_root, runner)?
+                    == (workspace_head.clone(), workspace_tree.clone()),
+                "compiled workspace changed during use",
+            )?;
+            require(
+                compiled_git_identity(&r.reverie_root, runner)?
+                    == (r.reverie_pin.clone(), reverie_tree.clone()),
+                "compiled Reverie checkout changed during use",
+            )?;
+        }
         r.manifest.verify()?;
         self.verify_files()
     }
     fn verify_files(&self) -> Result<()> {
+        if let CompiledSourceAuthority::DeclaredContent {
+            workspace_inventory,
+            workspace_sha256,
+            reverie_inventory,
+            reverie_sha256,
+            compiler_root,
+        } = &self.record.authority
+        {
+            verify_declared_content(
+                (
+                    &self.record.workspace_root,
+                    workspace_inventory,
+                    workspace_sha256,
+                ),
+                (&self.record.reverie_root, reverie_inventory, reverie_sha256),
+                compiler_root,
+            )?;
+        }
         self.record.manifest.verify()?;
         for file in self.record.files.values() {
             file.verify()?;
@@ -1143,6 +1750,21 @@ impl VerifiedCompiledSources {
             .files
             .get(&format!("rv:{relative}"))
             .ok_or("verified source context lacks exact filename role")?;
+        if let CompiledSourceAuthority::DeclaredContent { compiler_root, .. } =
+            &self.record.authority
+        {
+            self.verify_files()?;
+            let logical = compiler_root.source_path(relative)?;
+            require(
+                real_file(&logical)?.as_os_str() == file.path.as_os_str(),
+                "compiler filename does not match verified role",
+            )?;
+            return Ok(logical
+                .to_str()
+                .ok_or("compiled source filename is not UTF-8")?
+                .as_bytes()
+                .to_vec());
+        }
         compiled_role_filename(self.record.layout, relative, file)
     }
 }
@@ -23060,6 +23682,408 @@ pub fn verify_runtime_receipt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Additional controls in the existing current-artifact test. These exercise
+    // production catalog/mapping/readback predicates without creating opaque
+    // source authority or pretending test JSON is fresh Cargo metadata.
+    fn content_source_identity_controls() {
+        use std::os::unix::fs::symlink;
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        struct OwnedScratch(PathBuf);
+        impl Drop for OwnedScratch {
+            fn drop(&mut self) {
+                fs::remove_dir_all(&self.0).expect("remove only newly created content controls");
+            }
+        }
+        let parent = fs::canonicalize(std::env::temp_dir()).unwrap();
+        let root = parent.join(format!(
+            "content-source-controls-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        let owned = OwnedScratch(root.clone());
+        let pin = "347e802e861094bbf827c4fc1bb067c18de7d8dd";
+        let suffix = "git/checkouts/reverie-2fc770f7a9c80803/347e802";
+        let cargo_one = root.join("cargo-one");
+        let rv_one = cargo_one.join(suffix);
+        let cargo_two = root.join("cargo-two");
+        let rv_two = cargo_two.join(suffix);
+        // Current compiled bytes are inputs only. Each must independently match
+        // the fixed reviewed length/digest catalog before any positive is earned.
+        let compiled_files: [(&str, &[u8]); 14] = [
+            ("Cargo.toml", include_bytes!("../Cargo.toml")),
+            (
+                "reverie-liteinst-artifact/Cargo.toml",
+                include_bytes!("../reverie-liteinst-artifact/Cargo.toml"),
+            ),
+            (
+                "reverie-inguest/Cargo.toml",
+                include_bytes!("../reverie-inguest/Cargo.toml"),
+            ),
+            (
+                "reverie-inguest/src/lib.rs",
+                include_bytes!("../reverie-inguest/src/lib.rs"),
+            ),
+            (
+                "reverie-liteinst/Cargo.toml",
+                include_bytes!("../reverie-liteinst/Cargo.toml"),
+            ),
+            (
+                "reverie-liteinst/src/lib.rs",
+                include_bytes!("../reverie-liteinst/src/lib.rs"),
+            ),
+            (
+                "reverie-liteinst-preload/Cargo.toml",
+                include_bytes!("../reverie-liteinst-preload/Cargo.toml"),
+            ),
+            (
+                "reverie-liteinst-preload/src/lib.rs",
+                include_bytes!("../reverie-liteinst-preload/src/lib.rs"),
+            ),
+            (
+                "reverie-liteinst/src/patch_alloc.rs",
+                include_bytes!("../reverie-liteinst/src/patch_alloc.rs"),
+            ),
+            (
+                "reverie-inguest/src/guest/alloc.rs",
+                include_bytes!("../reverie-inguest/src/guest/alloc.rs"),
+            ),
+            (
+                "reverie-inguest/src/guest/tool_region_constructor.rs",
+                include_bytes!("../reverie-inguest/src/guest/tool_region_constructor.rs"),
+            ),
+            (
+                "reverie-inguest/src/guest/tool_region_arena.rs",
+                include_bytes!("../reverie-inguest/src/guest/tool_region_arena.rs"),
+            ),
+            (
+                "reverie-inguest/src/guest/tool_region.rs",
+                include_bytes!("../reverie-inguest/src/guest/tool_region.rs"),
+            ),
+            ("scripts/m1_artifact.rs", include_bytes!("m1_artifact.rs")),
+        ];
+        for rv in [&rv_one, &rv_two] {
+            for &(relative, bytes) in &compiled_files {
+                fs::create_dir_all(rv.join(relative).parent().unwrap()).unwrap();
+                fs::write(rv.join(relative), bytes).unwrap();
+            }
+        }
+        let (rv_inventory, _) = content_reverie_inventory(&rv_one).unwrap();
+        assert_eq!(rv_inventory.len(), 14);
+        assert!(
+            rv_inventory
+                .windows(2)
+                .all(|pair| pair[0].relative < pair[1].relative)
+        );
+        let (copy_inventory, _) = content_reverie_inventory(&rv_two).unwrap();
+        assert_eq!(rv_inventory, copy_inventory);
+        let rv_digest = declared_inventory_sha256(&rv_inventory).unwrap();
+        assert_eq!(
+            rv_digest,
+            declared_inventory_sha256(&copy_inventory).unwrap()
+        );
+        for &(relative, size, digest) in &CONTENT_REVERIE_CATALOG {
+            content_catalog_matches(relative, size, digest).unwrap();
+            assert!(content_catalog_matches(relative, size + 1, digest).is_err());
+            assert!(content_catalog_matches(relative, size, &"0".repeat(64)).is_err());
+            assert!(content_catalog_matches(&format!("./{relative}"), size, digest).is_err());
+            let bytes = fs::read(rv_one.join(relative)).unwrap();
+            let mut changed = bytes.clone();
+            changed[0] ^= 1;
+            fs::write(rv_one.join(relative), &changed).unwrap();
+            let refusal = content_reverie_inventory(&rv_one).unwrap_err();
+            assert!(
+                refusal.contains("differs from reviewed catalog"),
+                "{relative}: {refusal}"
+            );
+            fs::write(rv_one.join(relative), &bytes).unwrap();
+            content_reverie_inventory(&rv_one).unwrap();
+        }
+        let helper = rv_one.join("scripts/m1_artifact.rs");
+        let bytes = fs::read(&helper).unwrap();
+        fs::write(&helper, b"changed qualifier before resolution").unwrap();
+        assert!(
+            content_reverie_inventory(&rv_one)
+                .unwrap_err()
+                .contains("compiled host qualifier")
+        );
+        fs::write(&helper, bytes).unwrap();
+        let role = rv_one.join("reverie-inguest/src/guest/alloc.rs");
+        let role_bytes = fs::read(&role).unwrap();
+        fs::remove_file(&role).unwrap();
+        assert!(content_reverie_inventory(&rv_one).is_err());
+        symlink(rv_two.join("reverie-inguest/src/guest/alloc.rs"), &role).unwrap();
+        assert!(content_reverie_inventory(&rv_one).is_err());
+        fs::remove_file(&role).unwrap();
+        fs::write(&role, &role_bytes).unwrap();
+        let guest = rv_one.join("reverie-inguest/src/guest");
+        let saved = rv_one.join("reverie-inguest/src/saved-guest");
+        fs::rename(&guest, &saved).unwrap();
+        symlink(&saved, &guest).unwrap();
+        assert!(content_reverie_inventory(&rv_one).is_err());
+        fs::remove_file(&guest).unwrap();
+        fs::rename(&saved, &guest).unwrap();
+
+        let link = root.join("cargo-link");
+        symlink(&cargo_one, &link).unwrap();
+        let logical_root = link.join(suffix);
+        let binding = CompilerRootBinding::resolve_cargo_home(&logical_root, pin, &link).unwrap();
+        let canonical = CompilerRootBinding::resolve(&rv_one, pin).unwrap();
+        assert_eq!(canonical.canonical_root, rv_one);
+        assert_eq!(binding.canonical_root, rv_one);
+        assert_eq!(
+            binding
+                .source_path("reverie-liteinst-preload/Cargo.toml")
+                .unwrap()
+                .as_os_str(),
+            logical_root
+                .join("reverie-liteinst-preload/Cargo.toml")
+                .as_os_str()
+        );
+        assert!(
+            CompilerRootBinding::resolve_cargo_home(
+                &link.join("git/checkouts/other/347e802"),
+                pin,
+                &link
+            )
+            .is_err()
+        );
+        assert!(
+            CompilerRootBinding::resolve_cargo_home(
+                &logical_root,
+                "047e802e861094bbf827c4fc1bb067c18de7d8dd",
+                &link
+            )
+            .is_err()
+        );
+        assert!(CompilerRootBinding::resolve_cargo_home(&logical_root, "short", &link).is_err());
+        assert!(
+            CompilerRootBinding::resolve_cargo_home(
+                &PathBuf::from(format!("{}/./{}", link.display(), suffix)),
+                pin,
+                &link
+            )
+            .is_err()
+        );
+        let source = format!("git+https://github.com/rrnewton/reverie.git?rev={pin}#{pin}");
+        for (name, target, kind) in [
+            (
+                "reverie-inguest",
+                "reverie_inguest",
+                &["cdylib", "rlib"][..],
+            ),
+            ("reverie-liteinst", "reverie_liteinst", &["rlib"][..]),
+            (
+                "reverie-liteinst-preload",
+                "reverie_liteinst_preload",
+                &["cdylib"][..],
+            ),
+            (
+                "reverie-liteinst-artifact",
+                "reverie_liteinst_artifact",
+                &["lib"][..],
+            ),
+        ] {
+            let relative_target = if name == "reverie-liteinst-artifact" {
+                "reverie-liteinst-artifact/../scripts/m1_artifact.rs".into()
+            } else {
+                format!("{name}/src/lib.rs")
+            };
+            let raw_manifest = logical_root.join(name).join("Cargo.toml");
+            let raw_target = logical_root.join(&relative_target);
+            let valid = serde_json::json!({"packages": [{"name":name, "version":"0.4.1",
+                "id":format!("{}#{name}@0.4.1", source.rsplit_once('#').unwrap().0), "source":source,
+                "manifest_path":raw_manifest, "targets":[{"name":target, "kind":kind, "crate_types":kind, "src_path":raw_target}]}]});
+            let selected = content_package(&valid, name, target, kind, &binding, &source).unwrap();
+            assert_eq!(
+                selected.manifest.as_os_str(),
+                rv_one.join(name).join("Cargo.toml").as_os_str()
+            );
+            for (field, value) in [
+                ("name", serde_json::json!("lookalike")),
+                ("version", serde_json::json!("0.4.0")),
+                ("id", serde_json::json!("wrong-package-id")),
+                (
+                    "source",
+                    serde_json::json!(source.replacen(
+                        pin,
+                        "047e802e861094bbf827c4fc1bb067c18de7d8dd",
+                        1
+                    )),
+                ),
+                (
+                    "source",
+                    serde_json::json!(source.replace(
+                        &format!("#{pin}"),
+                        "#047e802e861094bbf827c4fc1bb067c18de7d8dd"
+                    )),
+                ),
+                (
+                    "manifest_path",
+                    serde_json::json!(rv_one.join(name).join("Cargo.toml")),
+                ),
+                (
+                    "manifest_path",
+                    serde_json::json!(format!("{}/{name}/./Cargo.toml", logical_root.display())),
+                ),
+            ] {
+                let mut bad = valid.clone();
+                bad["packages"][0][field] = value;
+                assert!(
+                    content_package(&bad, name, target, kind, &binding, &source).is_err(),
+                    "content {name}/{field}"
+                );
+            }
+            for (field, value) in [
+                ("name", serde_json::json!("wrong-target")),
+                ("kind", serde_json::json!(["bin"])),
+                ("crate_types", serde_json::json!(["bin"])),
+                ("src_path", serde_json::json!(rv_one.join(&relative_target))),
+                (
+                    "src_path",
+                    serde_json::json!(format!("{}/{name}/src/./lib.rs", logical_root.display())),
+                ),
+            ] {
+                let mut bad = valid.clone();
+                bad["packages"][0]["targets"][0][field] = value;
+                assert!(
+                    content_package(&bad, name, target, kind, &binding, &source).is_err(),
+                    "content target {name}/{field}"
+                );
+            }
+            let mut duplicate = valid.clone();
+            duplicate["packages"]
+                .as_array_mut()
+                .unwrap()
+                .push(valid["packages"][0].clone());
+            assert!(content_package(&duplicate, name, target, kind, &binding, &source).is_err());
+        }
+        for relative in CONTENT_WORKSPACE_FILES {
+            fs::create_dir_all(root.join(relative).parent().unwrap()).unwrap();
+            fs::write(root.join(relative), format!("snapshot {relative}\n")).unwrap();
+        }
+        let lock = root.join("liteinst-runtime-build/Cargo.lock");
+        let lock_bytes = [
+            "reverie-inguest",
+            "reverie-liteinst",
+            "reverie-liteinst-preload",
+            "reverie-liteinst-artifact",
+        ]
+        .into_iter()
+        .map(|name| format!("[[package]]\nname = \"{name}\"\nsource = \"{source}\"\n"))
+        .collect::<String>();
+        fs::write(&lock, &lock_bytes).unwrap();
+        let pin_metadata = serde_json::json!({"packages": [
+            {"name":"hermit-liteinst-runtime-build", "manifest_path":root.join("liteinst-runtime-build/Cargo.toml"),
+             "dependencies":[{"name":"reverie-liteinst-artifact", "source":source.rsplit_once('#').unwrap().0, "kind":"build", "rename":null, "path":null}]},
+            {"name":"hermit-liteinst-runtime-artifact", "manifest_path":root.join("liteinst-runtime-build/runtime/Cargo.toml"),
+             "dependencies":[{"name":"reverie-liteinst-preload", "source":source.rsplit_once('#').unwrap().0, "kind":null, "rename":null, "path":null}]}
+        ]});
+        content_manifest_and_lock_pin(&pin_metadata, &root, &source).unwrap();
+        for index in 0..2 {
+            for (field, value) in [
+                ("name", serde_json::json!("wrong-dependency")),
+                (
+                    "source",
+                    serde_json::json!("git+https://github.com/rrnewton/reverie.git?rev=wrong"),
+                ),
+                ("kind", serde_json::json!("dev")),
+                ("rename", serde_json::json!("alias")),
+                ("path", serde_json::json!(rv_one)),
+            ] {
+                let mut bad = pin_metadata.clone();
+                bad["packages"][index]["dependencies"][0][field] = value;
+                assert!(
+                    content_manifest_and_lock_pin(&bad, &root, &source).is_err(),
+                    "declared manifest dependency {index}/{field}"
+                );
+            }
+            let mut bad = pin_metadata.clone();
+            bad["packages"][index]["manifest_path"] = serde_json::json!(format!(
+                "{}/./liteinst-runtime-build/Cargo.toml",
+                root.display()
+            ));
+            assert!(content_manifest_and_lock_pin(&bad, &root, &source).is_err());
+        }
+        for wrong in [
+            lock_bytes.replacen(pin, "047e802e861094bbf827c4fc1bb067c18de7d8dd", 1),
+            lock_bytes.replacen(
+                &format!("#{pin}"),
+                "#047e802e861094bbf827c4fc1bb067c18de7d8dd",
+                1,
+            ),
+            lock_bytes.replace(
+                "name = \"reverie-liteinst-artifact\"",
+                "name = \"lookalike\"",
+            ),
+            format!("{lock_bytes}{lock_bytes}"),
+        ] {
+            fs::write(&lock, wrong).unwrap();
+            assert!(content_manifest_and_lock_pin(&pin_metadata, &root, &source).is_err());
+            fs::write(&lock, &lock_bytes).unwrap();
+            content_manifest_and_lock_pin(&pin_metadata, &root, &source).unwrap();
+        }
+        let (workspace_inventory, _) = declared_inventory(&root, &CONTENT_WORKSPACE_FILES).unwrap();
+        let workspace_digest = declared_inventory_sha256(&workspace_inventory).unwrap();
+        let verify = || {
+            verify_declared_content(
+                (&root, &workspace_inventory, &workspace_digest),
+                (&rv_one, &rv_inventory, &rv_digest),
+                &binding,
+            )
+        };
+        verify().unwrap();
+        for relative in CONTENT_WORKSPACE_FILES {
+            let path = root.join(relative);
+            let bytes = fs::read(&path).unwrap();
+            fs::write(&path, b"changed after resolution").unwrap();
+            assert!(verify().unwrap_err().contains("workspace content changed"));
+            fs::write(&path, bytes).unwrap();
+            verify().unwrap();
+        }
+        fs::write(&role, b"changed runtime after resolution").unwrap();
+        assert!(verify().unwrap_err().contains("reviewed catalog"));
+        fs::write(&role, role_bytes).unwrap();
+        verify().unwrap();
+        fs::remove_file(&link).unwrap();
+        symlink(&cargo_two, &link).unwrap();
+        assert_eq!(content_reverie_inventory(&rv_two).unwrap().0, rv_inventory);
+        assert!(verify().unwrap_err().contains("root mapping changed"));
+        fs::remove_file(&link).unwrap();
+        symlink(&cargo_one, &link).unwrap();
+        verify().unwrap();
+        let checkout = cargo_one.join(suffix);
+        let moved = cargo_one.join("moved-checkout");
+        fs::rename(&checkout, &moved).unwrap();
+        symlink(&moved, &checkout).unwrap();
+        assert!(
+            CompilerRootBinding::resolve_cargo_home(&logical_root, pin, &link)
+                .unwrap_err()
+                .contains("internal alias")
+        );
+        assert!(binding.verify().is_err());
+        fs::remove_file(&checkout).unwrap();
+        fs::rename(&moved, &checkout).unwrap();
+        verify().unwrap();
+
+        let authority = CompiledSourceAuthority::DeclaredContent {
+            workspace_inventory,
+            workspace_sha256: workspace_digest,
+            reverie_inventory: rv_inventory,
+            reverie_sha256: rv_digest,
+            compiler_root: binding,
+        };
+        let value = serde_json::to_value(&authority).unwrap();
+        assert_eq!(value["kind"], "declared_content");
+        assert!(value.get("workspace_head").is_none());
+        let mut unknown = value.clone();
+        unknown["fabricated_git_head"] = serde_json::json!(pin);
+        assert!(serde_json::from_value::<CompiledSourceAuthority>(unknown).is_err());
+        let mut unknown = value;
+        unknown["reverie_inventory"][0]["unknown"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<CompiledSourceAuthority>(unknown).is_err());
+        drop(owned);
+    }
     // Nested in missing_build_finished_is_a_failed_current_artifact_selection.
     // Exercise the production identity predicates with uniquely owned inputs.
     // It NEVER constructs VerifiedCompiledSources or replaces resolve() Cargo/Git reads.
@@ -31229,6 +32253,7 @@ mod tests {
     #[test]
     fn missing_build_finished_is_a_failed_current_artifact_selection() {
         compiled_source_identity_controls();
+        content_source_identity_controls();
         compiled_source_data_adapter_controls();
         detcore_validate_template_controls();
         let package = PackageIdentity {
