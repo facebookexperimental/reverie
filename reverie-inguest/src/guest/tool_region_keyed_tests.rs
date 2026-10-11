@@ -267,17 +267,17 @@ fn vma(address: usize) -> Result<(bool, u32), i32> {
                     continue;
                 }
                 let text = &line[..length];
-                if let Some(dash) = text.iter().position(|&c| c == b'-') {
-                    if let Some(low) = hex(&text[..dash]) {
-                        let space = text.iter().position(|&c| c == b' ').ok_or(110)?;
-                        let high = hex(&text[dash + 1..space]).ok_or(111)?;
-                        check(!matched || observed.is_some(), 112)?;
-                        matched = low <= address && address < high;
-                        if matched {
-                            check(space + 4 < text.len(), 113)?;
-                            writable = &text[space + 1..space + 4] == b"rw-";
-                            check(writable || &text[space + 1..space + 4] == b"---", 114)?;
-                        }
+                if let Some(dash) = text.iter().position(|&c| c == b'-')
+                    && let Some(low) = hex(&text[..dash])
+                {
+                    let space = text.iter().position(|&c| c == b' ').ok_or(110)?;
+                    let high = hex(&text[dash + 1..space]).ok_or(111)?;
+                    check(!matched || observed.is_some(), 112)?;
+                    matched = low <= address && address < high;
+                    if matched {
+                        check(space + 4 < text.len(), 113)?;
+                        writable = &text[space + 1..space + 4] == b"rw-";
+                        check(writable || &text[space + 1..space + 4] == b"---", 114)?;
                     }
                 }
                 if matched && text.starts_with(b"ProtectionKey:") {

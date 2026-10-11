@@ -285,15 +285,15 @@ impl Preparing {
             }
             // Never free a key while even an unconfirmed tagged mapping may
             // remain. Successful whole-reservation removal is the proof.
-            if self.mapping.is_none() {
-                if let Some(key) = self.key {
-                    let result = unsafe {
-                        calls.syscall(libc::SYS_pkey_free, [u64::from(key.0), 0, 0, 0, 0, 0])
-                    };
-                    match zero(result) {
-                        Ok(()) => self.key = None,
-                        Err(errno) => error.cleanup_errno = Some(errno),
-                    }
+            if self.mapping.is_none()
+                && let Some(key) = self.key
+            {
+                let result = unsafe {
+                    calls.syscall(libc::SYS_pkey_free, [u64::from(key.0), 0, 0, 0, 0, 0])
+                };
+                match zero(result) {
+                    Ok(()) => self.key = None,
+                    Err(errno) => error.cleanup_errno = Some(errno),
                 }
             }
         }

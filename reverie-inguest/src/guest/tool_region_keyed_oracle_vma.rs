@@ -195,12 +195,12 @@ fn line(
             (Some(start), Some(end)) => number(&value[start..=end], 10),
             _ => None,
         };
-        if let (Some(entry), Some(parsed)) = (current.as_mut(), parsed) {
-            if parsed <= 15 {
-                entry.key = parsed as u32;
-                entry.key_seen = true;
-                return;
-            }
+        if let (Some(entry), Some(parsed)) = (current.as_mut(), parsed)
+            && parsed <= 15
+        {
+            entry.key = parsed as u32;
+            entry.key_seen = true;
+            return;
         }
         result.errors |= BAD_PARSE;
     }

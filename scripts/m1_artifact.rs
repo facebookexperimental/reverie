@@ -753,8 +753,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 14] = [
     ),
     (
         "reverie-inguest/src/guest/tool_region_keyed.rs",
-        24228,
-        "233d850247a468775681c13af13b2e9d0af1c10124cba2c5ea3af886cda8a920",
+        24192,
+        "57ee407899e8650f1ef79714c8548cc82065a070e99fa92b2080a42874c5ca3a",
     ),
 ];
 fn content_catalog_matches(relative: &str, size: u64, digest: &str) -> Result<()> {

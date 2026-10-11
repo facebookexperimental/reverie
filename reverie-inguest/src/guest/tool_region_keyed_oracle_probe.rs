@@ -29,8 +29,8 @@ unsafe extern "C" {
 static CURRENT: AtomicPtr<Observation> = AtomicPtr::new(core::ptr::null_mut());
 
 pub(super) fn supported() -> bool {
-    // SAFETY: native x86-64 CPUID is available before any PKRU instruction.
-    unsafe { core::arch::x86_64::__cpuid_count(7, 0).ecx & (1 << 4) != 0 }
+    // Native x86-64 CPUID is available before any PKRU instruction.
+    core::arch::x86_64::__cpuid_count(7, 0).ecx & (1 << 4) != 0
 }
 
 pub(super) fn rights() -> u32 {
@@ -44,13 +44,11 @@ pub(super) fn rights() -> u32 {
 }
 
 pub(super) fn instruction(write: bool) -> usize {
-    // SAFETY: these linked assembly symbols name bytes, not Rust objects.
-    unsafe {
-        if write {
-            core::ptr::addr_of!(reverie_keyed_oracle_store_mov) as usize
-        } else {
-            core::ptr::addr_of!(reverie_keyed_oracle_load_mov) as usize
-        }
+    // These linked assembly symbols name bytes, not Rust objects.
+    if write {
+        core::ptr::addr_of!(reverie_keyed_oracle_store_mov) as usize
+    } else {
+        core::ptr::addr_of!(reverie_keyed_oracle_load_mov) as usize
     }
 }
 
