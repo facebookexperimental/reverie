@@ -98,6 +98,11 @@ name = "fixed_arena"
 path = "tests/fixed_arena.rs"
 required-features = ["allocator-fixture"]
 
+[[test]]
+name = "tool_tls"
+path = "tests/tool_tls.rs"
+required-features = ["allocator-fixture"]
+
 [[bin]]
 name = "reverie-liteinst-exec-guest"
 path = "src/bin/exec_guest.rs"

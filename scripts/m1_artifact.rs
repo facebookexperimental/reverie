@@ -707,8 +707,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 13] = [
     ),
     (
         "reverie-liteinst/Cargo.toml",
-        3773,
-        "99f208532c018f40f98b70b33cbf815be652ee5835291ea9dbe6d7314d85f2e9",
+        3870,
+        "c673042f821b533e03215c3efcf67b8458551376c39411747e9b595a9520defe",
     ),
     (
         "reverie-liteinst/src/lib.rs",
@@ -15352,7 +15352,15 @@ const FIXED_OPTIMIZED_TLS_THUNK_DIAGNOSTIC_HEX: &str =
     "50488d3da0960a00e8832f0a00488d808800000059c3";
 const FIXED_DEV_TLS_CELL_GETTER_HEX: &str =
     "4883ec1848897c24084889742410488d3daba42100e8b6321e00488d80480000004883c418c3";
-// Only five whole observed cell-access recipes are accepted. The caller must
+const FIXED_DEV_TLS_CELL_GETTER_EVENT_ARGUMENT_HEX: &str =
+    "4883ec1848897c24084889742410488d3ddb4a2200e8a6d11e00488d80400000004883c418c3";
+const FIXED_OPTIMIZED_PATCH_ALLOC_EVENT_ARGUMENT_HEX: &str = "41574156415453504889d34989f6ff157c850a004885c074774c8b78204d85ff746e4989c4488d3dec7f0a00e80f190a004883b840000000007463498b542410498b0f498d76ff49f7de31c04889cf4801d7723e4801f772394c21f74989f84929d04901d8410f92c14981f801000002410f93c24508ca75194889c8f04d0fb1074889c1b80000000075c14889f8eb0231c04883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff25fe840a00";
+const FIXED_OPTIMIZED_TLS_THUNK_EVENT_ARGUMENT_HEX: &str =
+    "50488d3d907d0a00e8b3160a00488d804000000059c3";
+const FIXED_OPTIMIZED_PATCH_ALLOC_DIAGNOSTIC_EVENT_ARGUMENT_HEX: &str = "41574156415453504889d34989f6ff1554a00a004885c074774c8b78204d85ff746e4989c4488d3dfc9a0a00e8ef330a004883b880000000007463498b542410498b0f498d76ff49f7de31c04889cf4801d7723e4801f772394c21f74989f84929d04901d8410f92c14981f801000002410f93c24508ca75194889c8f04d0fb1074889c1b80000000075c14889f8eb0231c04883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff2596a00a00";
+const FIXED_OPTIMIZED_TLS_THUNK_DIAGNOSTIC_EVENT_ARGUMENT_HEX: &str =
+    "50488d3da0980a00e893310a00488d808000000059c3";
+// Only ten whole observed cell-access recipes are accepted. The caller must
 // authenticate STT_TLS/zero-fill/module identity with fixed_tls_cell and the
 // descriptor/provider joins; a synthetic SymbolEvidence is not ELF admission.
 fn fixed_tls_cell_access_recipe(
@@ -15388,6 +15396,31 @@ fn fixed_tls_cell_access_recipe(
         ("fixed_tls_cell_getter", 0x48) => {
             (FIXED_DEV_TLS_CELL_GETTER_HEX, 29, &[(17, 21), (22, 26)])
         }
+        ("fixed_tls_cell_getter", 0x40) => (
+            FIXED_DEV_TLS_CELL_GETTER_EVENT_ARGUMENT_HEX,
+            29,
+            &[(17, 21), (22, 26)],
+        ),
+        ("fixed_patch_alloc", 64) => (
+            FIXED_OPTIMIZED_PATCH_ALLOC_EVENT_ARGUMENT_HEX,
+            52,
+            &[(16, 20), (40, 44), (45, 49), (182, 186)],
+        ),
+        ("fixed_tls_fn_once", 64) => (
+            FIXED_OPTIMIZED_TLS_THUNK_EVENT_ARGUMENT_HEX,
+            16,
+            &[(4, 8), (9, 13)],
+        ),
+        ("fixed_patch_alloc", 128) => (
+            FIXED_OPTIMIZED_PATCH_ALLOC_DIAGNOSTIC_EVENT_ARGUMENT_HEX,
+            52,
+            &[(16, 20), (40, 44), (45, 49), (182, 186)],
+        ),
+        ("fixed_tls_fn_once", 128) => (
+            FIXED_OPTIMIZED_TLS_THUNK_DIAGNOSTIC_EVENT_ARGUMENT_HEX,
+            16,
+            &[(4, 8), (9, 13)],
+        ),
         _ => return Err("unsupported whole TLS read role/cell-offset pair".into()),
     };
     require(
@@ -15439,7 +15472,7 @@ fn qualify_allocator_tls_boundary_in_source_context(
         == FixedImageKind::Detcore
     {
         require(
-            allocation_bytes.len() == 241 && matches!(cell.address, 0xa0 | 0xe0),
+            allocation_bytes.len() == 241 && matches!(cell.address, 0x98 | 0xa0 | 0xd8 | 0xe0),
             "Detcore validate allocation/TLS shape differs",
         )?;
         let module = fixed_rip_target(allocation, allocation_bytes, 54, 58)?;
@@ -15495,7 +15528,7 @@ fn qualify_allocator_tls_boundary_in_source_context(
         // The real optimized alloc preserves ready backing in R12 and its
         // cursor in R15 before the actual TLS query. RAX from the query is the
         // module base; its finite exact displacement must equal the authenticated
-        // actual TLS cell (normal0x48 / diagnostic0x88). No imported allocator/copy.
+        // actual TLS cell (retained0x48/0x88 or observed0x40/0x80). No imported allocator/copy.
         let module = fixed_rip_target(allocation, allocation_bytes, 0x28, 0x2c)?;
         let plt = fixed_rip_target(allocation, allocation_bytes, 0x2d, 0x31)?;
         let backing = fixed_local_call_operand(
@@ -16055,8 +16088,12 @@ fn validate_fixed_backing_evidence_in_source_context(
             && tls.tls_cell.binding == sym::STB_LOCAL
             && canonical_rust_symbol(&tls.tls_cell.name).as_deref() == Some(FIXED_TLS_CELL_ROLE)
             && match image_kind {
-                FixedImageKind::Standalone => matches!(tls.tls_cell.address, 0x48 | 0x88),
-                FixedImageKind::Detcore => matches!(tls.tls_cell.address, 0xa0 | 0xe0),
+                FixedImageKind::Standalone => {
+                    matches!(tls.tls_cell.address, 0x40 | 0x48 | 0x80 | 0x88)
+                }
+                FixedImageKind::Detcore => {
+                    matches!(tls.tls_cell.address, 0x98 | 0xa0 | 0xd8 | 0xe0)
+                }
             }
             && tls.tls_cell.size == 8
             && tls.tls_offset_slot
@@ -16089,7 +16126,8 @@ fn validate_fixed_backing_evidence_in_source_context(
     ) {
         (Some(_), Some(edge), Some(resolution)) => require(
             resolution == "local_relative_readonly_function_pointer"
-                && tls.tls_cell.address == 0x48
+                && (tls.tls_cell.address == 0x48
+                    || (image_kind == FixedImageKind::Standalone && tls.tls_cell.address == 0x40))
                 && edge.local_got_slot.is_none()
                 && tls
                     .local_chain
@@ -16107,8 +16145,68 @@ fn validate_fixed_backing_evidence_in_source_context(
                 .all(|role| tls.local_chain.contains_key(*role)),
             "Fixed TLS local function-pointer chain is incomplete or mislabeled as GOT",
         )?,
-        (None, None, None) => {}
+        (None, None, None) => {
+            let extent = match (image_kind, tls.tls_cell.address) {
+                (FixedImageKind::Standalone, 0x40 | 0x80) => Some(186),
+                (FixedImageKind::Detcore, 0x98 | 0xd8) => Some(241),
+                _ => None,
+            };
+            if let Some(extent) = extent {
+                require(
+                    tls.local_chain
+                        .get("fixed_patch_alloc")
+                        .is_some_and(|s| s.size == extent)
+                        && tls
+                            .local_chain
+                            .get("fixed_tls_fn_once")
+                            .is_some_and(|s| s.size == 22)
+                        && tls
+                            .local_chain
+                            .keys()
+                            .map(String::as_str)
+                            .collect::<BTreeSet<_>>()
+                            == BTreeSet::from(["fixed_patch_alloc", "fixed_tls_fn_once"]),
+                    "new optimized TLS offset lacks its exact None-LocalKey whole chain",
+                )?;
+            }
+        }
         _ => return Err("Fixed TLS local function-pointer evidence is inconsistent".into()),
+    }
+    if image_kind == FixedImageKind::Standalone
+        && tls.tls_cell.address == 0x40
+        && tls.local_key_object.is_some()
+    {
+        let try_with = tls.local_chain.get("fixed_tls_try_with");
+        require(
+            tls.local_chain
+                .get("fixed_patch_alloc")
+                .is_some_and(|s| s.size == 177)
+                && tls
+                    .local_key_object
+                    .is_some_and(|key| key != 0 && key.is_multiple_of(8))
+                && tls.local_key_transfer.as_ref().is_some_and(|edge| {
+                    try_with.is_some_and(|caller| {
+                        caller.address.checked_add(0x15) == Some(edge.instruction)
+                    })
+                })
+                && tls
+                    .local_chain
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<BTreeSet<_>>()
+                    == BTreeSet::from([
+                        "fixed_patch_alloc",
+                        "fixed_installation_active",
+                        "fixed_tls_fn_once",
+                        "fixed_tls_get",
+                        "fixed_tls_with",
+                        "fixed_tls_try_with",
+                        "fixed_tls_cell_getter",
+                        "fixed_tls_cell_callback",
+                        "fixed_tls_cell_read",
+                    ]),
+            "new DEV TLS offset lacks its complete Some-LocalKey whole chain",
+        )?;
     }
     require(
         backing
@@ -19124,6 +19222,182 @@ const DETCORE_VALIDATE_TEMPLATES: &[DetcoreValidateTemplate] = &[
             },
         ],
         transfers: &[(48, 2), (165, 3), (194, 4), (210, 5), (237, 6)],
+    },
+    // Actual event normal TLS body, SHA256 e3640a6c2bf6ab14c37132bad5079062b04f8ee1f33edb8bad1788051d9291bb.
+    DetcoreValidateTemplate {
+        role: "fixed_patch_alloc",
+        hex: "41574156415453504889d34989f6ff150cb818004885c0747c4989c44c8b782041f6c7070f85a50000004d85ff0f84b1000000488d3d6e7c1800e8810213004883b89800000000745d498b542410498b07498d76ff49f7de31c94889c74801d772354801f772304c21f74989f84929d072504901d8410f92c14981f801000002410f93c24508ca750ef04d0fb10775ca4889f9eb0231c94889c84883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff25c6b71800488d3ddfac1500ff15a1801800488d1502ad1500bf080000004c89feff1584941800488d3dedac1500ff150fa61800",
+        operands: &[
+            DetcoreValidateOperand {
+                displacement: 16,
+                next: 20,
+                key: "fixed_arena_backing",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 54,
+                next: 58,
+                key: "fixed_publication_tls_descriptor",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 59,
+                next: 63,
+                key: "fixed_tls_get_addr_plt",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 190,
+                next: 194,
+                key: "fixed_tool_alloc",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 197,
+                next: 201,
+                key: "fixed_detcore_validate_fixed_patch_alloc_194_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 203,
+                next: 207,
+                key: "fixed_heap_panic_sub_overflow",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 210,
+                next: 214,
+                key: "fixed_detcore_validate_fixed_patch_alloc_207_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 224,
+                next: 228,
+                key: "fixed_heap_panic_misaligned",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 231,
+                next: 235,
+                key: "fixed_detcore_validate_fixed_patch_alloc_228_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 237,
+                next: 241,
+                key: "fixed_panic_null_reference",
+                got: true,
+            },
+        ],
+        transfers: &[(14, 0), (58, 2), (188, 3), (201, 5), (222, 7), (235, 9)],
+    },
+    // Actual event normal TLS body, SHA256 db8ec5915319258301190b284d997db73b9c71263837328381e3f2d0204aad6c.
+    DetcoreValidateTemplate {
+        role: "fixed_tls_fn_once",
+        hex: "50488d3d10791800e823ff1200488d809800000059c3",
+        operands: &[
+            DetcoreValidateOperand {
+                displacement: 4,
+                next: 8,
+                key: "fixed_publication_tls_descriptor",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 9,
+                next: 13,
+                key: "fixed_tls_get_addr_plt",
+                got: false,
+            },
+        ],
+        transfers: &[(8, 1)],
+    },
+    // Actual event diagnostic TLS body, SHA256 425180fc2fadd76cf2a9fdb77d09695db03acfedb4fc9e4c6cbafc1b45a3a6f6.
+    DetcoreValidateTemplate {
+        role: "fixed_patch_alloc",
+        hex: "41574156415453504889d34989f6ff1584d518004885c0747c4989c44c8b782041f6c7070f85a50000004d85ff0f84b1000000488d3d3e991800e8811c13004883b8d800000000745d498b542410498b07498d76ff49f7de31c94889c74801d772354801f772304c21f74989f84929d072504901d8410f92c14981f801000002410f93c24508ca750ef04d0fb10775ca4889f9eb0231c94889c84883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff250ed51800488d3d57c71500ff15a99d1800488d157ac71500bf080000004c89feff158cb11800488d3d65c71500ff1517c31800",
+        operands: &[
+            DetcoreValidateOperand {
+                displacement: 16,
+                next: 20,
+                key: "fixed_arena_backing",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 54,
+                next: 58,
+                key: "fixed_publication_tls_descriptor",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 59,
+                next: 63,
+                key: "fixed_tls_get_addr_plt",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 190,
+                next: 194,
+                key: "fixed_tool_alloc",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 197,
+                next: 201,
+                key: "fixed_detcore_validate_fixed_patch_alloc_194_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 203,
+                next: 207,
+                key: "fixed_heap_panic_sub_overflow",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 210,
+                next: 214,
+                key: "fixed_detcore_validate_fixed_patch_alloc_207_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 224,
+                next: 228,
+                key: "fixed_heap_panic_misaligned",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 231,
+                next: 235,
+                key: "fixed_detcore_validate_fixed_patch_alloc_228_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 237,
+                next: 241,
+                key: "fixed_panic_null_reference",
+                got: true,
+            },
+        ],
+        transfers: &[(14, 0), (58, 2), (188, 3), (201, 5), (222, 7), (235, 9)],
+    },
+    // Actual event diagnostic TLS body, SHA256 31ceb9edab518b7358ba5a075392aedb542d84b6abc81f3b950bde2949d48e51.
+    DetcoreValidateTemplate {
+        role: "fixed_tls_fn_once",
+        hex: "50488d3de0951800e823191300488d80d800000059c3",
+        operands: &[
+            DetcoreValidateOperand {
+                displacement: 4,
+                next: 8,
+                key: "fixed_publication_tls_descriptor",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 9,
+                next: 13,
+                key: "fixed_tls_get_addr_plt",
+                got: false,
+            },
+        ],
+        transfers: &[(8, 1)],
     },
 ];
 struct DetcoreRecipeBindings<'a> {
@@ -30676,6 +30950,51 @@ mod tests {
                 72,
                 &[(17, 21, 3780144), (22, 26, 3554368)],
             ),
+            (
+                "fixed_tls_cell_getter",
+                1588208,
+                "4883ec1848897c24084889742410488d3ddb4a2200e8a6d11e00488d80400000004883c418c3",
+                64,
+                &[(17, 21, 3835616), (22, 26, 3607984)],
+            ),
+            (
+                "fixed_patch_alloc",
+                640992,
+                "41574156415453504889d34989f6ff157c850a004885c074774c8b78204d85ff746e4989c4488d3dec7f0a00e80f190a004883b840000000007463498b542410498b0f498d76ff49f7de31c04889cf4801d7723e4801f772394c21f74989f84929d04901d8410f92c14981f801000002410f93c24508ca75194889c8f04d0fb1074889c1b80000000075c14889f8eb0231c04883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff25fe840a00",
+                64,
+                &[
+                    (16, 20, 1330544),
+                    (40, 44, 1329144),
+                    (45, 49, 1302816),
+                    (182, 186, 1330584),
+                ],
+            ),
+            (
+                "fixed_tls_fn_once",
+                641632,
+                "50488d3d907d0a00e8b3160a00488d804000000059c3",
+                64,
+                &[(4, 8, 1329144), (9, 13, 1302816)],
+            ),
+            (
+                "fixed_patch_alloc",
+                658960,
+                "41574156415453504889d34989f6ff1554a00a004885c074774c8b78204d85ff746e4989c4488d3dfc9a0a00e8ef330a004883b880000000007463498b542410498b0f498d76ff49f7de31c04889cf4801d7723e4801f772394c21f74989f84929d04901d8410f92c14981f801000002410f93c24508ca75194889c8f04d0fb1074889c1b80000000075c14889f8eb0231c04883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff2596a00a00",
+                128,
+                &[
+                    (16, 20, 1355384),
+                    (40, 44, 1354040),
+                    (45, 49, 1327664),
+                    (182, 186, 1355616),
+                ],
+            ),
+            (
+                "fixed_tls_fn_once",
+                659600,
+                "50488d3da0980a00e893310a00488d808000000059c3",
+                128,
+                &[(4, 8, 1354040), (9, 13, 1327664)],
+            ),
         ];
         for &(role, address, hex, offset, operands) in samples {
             let bytes = fixed_hex(hex);
@@ -30754,12 +31073,196 @@ mod tests {
                 .is_err()
             );
         }
+        fixed_optimized_tls_transfer_controls();
     }
 
     // Actual retained dev try_with is 175B with CALL [RAX] at +0x15.
     // This control is nested in an original host test identity. Synthetic
     // metadata exercises the extractor/census; physical qualification still
     // requires the complete same-ELF LocalKey/function/prefix/TLS proof.
+    // Actual new optimized functions exercise the unchanged qualified-chain
+    // fallback and full transfer census without changing generic wrappers.
+    fn fixed_optimized_tls_transfer_controls() {
+        type Sample<'a> = (
+            &'a str,
+            u64,
+            &'a str,
+            u64,
+            &'a [(usize, usize, u64)],
+            &'a [usize],
+            &'a [(u64, u64)],
+        );
+        let samples: &[Sample<'_>] = &[
+            (
+                "fixed_patch_alloc",
+                640992,
+                "41574156415453504889d34989f6ff157c850a004885c074774c8b78204d85ff746e4989c4488d3dec7f0a00e80f190a004883b840000000007463498b542410498b0f498d76ff49f7de31c04889cf4801d7723e4801f772394c21f74989f84929d04901d8410f92c14981f801000002410f93c24508ca75194889c8f04d0fb1074889c1b80000000075c14889f8eb0231c04883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff25fe840a00",
+                64,
+                &[
+                    (16, 20, 1330544),
+                    (40, 44, 1329144),
+                    (45, 49, 1302816),
+                    (182, 186, 1330584),
+                ],
+                &[
+                    0, 2, 4, 6, 7, 8, 11, 14, 20, 23, 25, 29, 32, 34, 37, 44, 49, 56, 57, 59, 64,
+                    67, 71, 74, 76, 79, 82, 84, 87, 89, 92, 95, 98, 101, 105, 112, 116, 119, 121,
+                    124, 129, 132, 137, 139, 142, 144, 146, 150, 151, 153, 155, 157, 158, 163, 166,
+                    169, 173, 174, 176, 178, 180,
+                ],
+                &[(1330544, 739600), (1330584, 758448)],
+            ),
+            (
+                "fixed_tls_fn_once",
+                641632,
+                "50488d3d907d0a00e8b3160a00488d804000000059c3",
+                64,
+                &[(4, 8, 1329144), (9, 13, 1302816)],
+                &[0, 1, 8, 13, 20, 21],
+                &[],
+            ),
+            (
+                "fixed_patch_alloc",
+                658960,
+                "41574156415453504889d34989f6ff1554a00a004885c074774c8b78204d85ff746e4989c4488d3dfc9a0a00e8ef330a004883b880000000007463498b542410498b0f498d76ff49f7de31c04889cf4801d7723e4801f772394c21f74989f84929d04901d8410f92c14981f801000002410f93c24508ca75194889c8f04d0fb1074889c1b80000000075c14889f8eb0231c04883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff2596a00a00",
+                128,
+                &[
+                    (16, 20, 1355384),
+                    (40, 44, 1354040),
+                    (45, 49, 1327664),
+                    (182, 186, 1355616),
+                ],
+                &[
+                    0, 2, 4, 6, 7, 8, 11, 14, 20, 23, 25, 29, 32, 34, 37, 44, 49, 56, 57, 59, 64,
+                    67, 71, 74, 76, 79, 82, 84, 87, 89, 92, 95, 98, 101, 105, 112, 116, 119, 121,
+                    124, 129, 132, 137, 139, 142, 144, 146, 150, 151, 153, 155, 157, 158, 163, 166,
+                    169, 173, 174, 176, 178, 180,
+                ],
+                &[(1355384, 781888), (1355616, 784624)],
+            ),
+            (
+                "fixed_tls_fn_once",
+                659600,
+                "50488d3da0980a00e893310a00488d808000000059c3",
+                128,
+                &[(4, 8, 1354040), (9, 13, 1327664)],
+                &[0, 1, 8, 13, 20, 21],
+                &[],
+            ),
+        ];
+        for &(role, address, whole, offset, operands, offsets, input_got) in samples {
+            let bytes = fixed_hex(whole);
+            let cell=SymbolEvidence {name:"_RNvNCNKNvNtCsTest_16reverie_liteinst11patch_alloc18INSTALLATION_DEPTH0s_023___RUST_STD_INTERNAL_VAL".into(),
+                address:offset,size:8,binding:sym::STB_LOCAL,visibility:sym::STV_DEFAULT};
+            let symbol = sym::Sym {
+                st_value: address,
+                st_size: bytes.len() as u64,
+                ..Default::default()
+            };
+            let instructions: Vec<_> = offsets
+                .iter()
+                .enumerate()
+                .map(|(i, &at)| {
+                    let end = offsets.get(i + 1).copied().unwrap_or(bytes.len());
+                    EncodedConstructorInstruction {
+                        address: address + at as u64,
+                        bytes: bytes[at..end].to_vec(),
+                    }
+                })
+                .collect();
+            let got: BTreeMap<_, _> = input_got.iter().copied().collect();
+            let pc = if role == "fixed_patch_alloc" { 44 } else { 8 };
+            let plt = operands[if role == "fixed_patch_alloc" { 2 } else { 1 }].2;
+            let boundary = AllocatorTlsBoundary {
+                dependency: "existing_installation_depth_tls".into(),
+                provider_symbol: "__tls_get_addr".into(),
+                provider_version: "GLIBC_2.3".into(),
+                provider_library: "ld-linux-x86-64.so.2".into(),
+                plt_address: plt,
+                got_slot: 0x8000,
+                dynamic_symbol_index: 1,
+                tls_cell: cell,
+                tls_module_slot: 0x9000,
+                tls_offset_slot: 0x9008,
+                callsites: vec![ConstructorTransfer {
+                    instruction: address + pc,
+                    target: plt,
+                    local_got_slot: None,
+                }],
+                local_key_object: None,
+                local_key_transfer: None,
+                local_key_resolution: None,
+                unisolated: true,
+                plt_sha256: "0".repeat(64),
+                function_sha256: BTreeMap::from([(role.into(), sha256(&bytes))]),
+                local_chain: BTreeMap::from([(
+                    role.into(),
+                    SymbolEvidence {
+                        name: role.into(),
+                        address,
+                        size: bytes.len() as u64,
+                        binding: sym::STB_LOCAL,
+                        visibility: sym::STV_DEFAULT,
+                    },
+                )]),
+            };
+            let check = |tls: &AllocatorTlsBoundary,
+                         got: &BTreeMap<u64, u64>|
+             -> Result<Vec<ConstructorTransfer>> {
+                fixed_tls_cell_access_recipe(role, address, &bytes, &tls.tls_cell, operands)?;
+                let edges = fixed_tls_transfers(role, &symbol, &instructions, tls, got)?;
+                fixed_census_transfers(&instructions, address, &bytes, &edges, got, false)?;
+                Ok(edges)
+            };
+            let edges = check(&boundary, &got).unwrap();
+            if role == "fixed_patch_alloc" {
+                assert_eq!(
+                    edges,
+                    vec![
+                        ConstructorTransfer {
+                            instruction: address + 14,
+                            target: input_got[0].1,
+                            local_got_slot: Some(input_got[0].0)
+                        },
+                        ConstructorTransfer {
+                            instruction: address + 44,
+                            target: plt,
+                            local_got_slot: None
+                        },
+                        ConstructorTransfer {
+                            instruction: address + 180,
+                            target: input_got[1].1,
+                            local_got_slot: Some(input_got[1].0)
+                        },
+                    ]
+                );
+            } else {
+                assert_eq!(edges, boundary.callsites);
+            }
+            assert!(
+                fixed_census_transfers(&instructions, address, &bytes, &edges[1..], &got, false)
+                    .is_err()
+            );
+            let mut bad = boundary.clone();
+            bad.callsites.clear();
+            assert!(check(&bad, &got).is_err());
+            let mut bad = boundary.clone();
+            bad.local_chain.remove(role);
+            assert!(check(&bad, &got).is_err());
+            let mut bad = boundary.clone();
+            bad.local_chain.get_mut(role).unwrap().size += 1;
+            assert!(check(&bad, &got).is_err());
+            for &(slot, _) in input_got {
+                let mut missing = got.clone();
+                missing.remove(&slot);
+                assert!(check(&boundary, &missing).is_err());
+            }
+            let mut bad = boundary.clone();
+            bad.tls_cell.address ^= 8;
+            assert!(check(&bad, &got).is_err());
+        }
+    }
+
     fn fixed_tls_local_key_transfer_controls() {
         let address = 0x1f8b00;
         let key = 0x365d40;
@@ -31227,6 +31730,7 @@ mod tests {
         let mut diagnostic_tls = backing.clone();
         diagnostic_tls.tls_boundary.tls_cell.address = 0x88;
         validate_fixed_backing_evidence(&diagnostic_tls).unwrap();
+        fixed_tls_offset_schema_controls(&backing);
         let value = serde_json::to_value(&backing).unwrap();
         for field in [
             "fixed_arena_version",
@@ -31323,6 +31827,338 @@ mod tests {
         let mut unknown = value;
         unknown["legacy_exemption"] = serde_json::json!(true);
         assert!(serde_json::from_value::<AllocatorBackingEvidence>(unknown).is_err());
+    }
+
+    // Actual observed chains used only in structural schemas. Their literal
+    // code, provider and ELF/source joins must still be requalified physically.
+    fn fixed_tls_offset_schema_controls(backing: &AllocatorBackingEvidence) {
+        type ChainSample<'a> = (&'a str, &'a str, u64, u64, &'a str);
+        type ProfileSample<'a> = (
+            FixedImageKind,
+            u64,
+            &'a [ChainSample<'a>],
+            Option<u64>,
+            u64,
+            u64,
+            &'a [(u64, u64)],
+        );
+        let profiles: &[ProfileSample<'_>] = &[
+            (
+                FixedImageKind::Standalone,
+                64,
+                &[
+                    (
+                        "fixed_patch_alloc",
+                        "_RNvXs3_NtCsnMqmb1yYhM_16reverie_liteinst11patch_allocNtB5_26FixedPrivatePatchAllocatorNtNtNtCsayI02cGi06u_4core5alloc6global11GlobalAlloc5alloc",
+                        1630672,
+                        177,
+                        "2e1ff2e684e217f615d4d9665111be1d893ee9ef7de3bb56ef57e2e91c8ab3df",
+                    ),
+                    (
+                        "fixed_installation_active",
+                        "_RNvNtCsnMqmb1yYhM_16reverie_liteinst11patch_alloc19installation_active",
+                        1627664,
+                        25,
+                        "840fb69089bfa32eb6d3e5c1cc076793632ee2b9a026cf8343d0201976056591",
+                    ),
+                    (
+                        "fixed_tls_fn_once",
+                        "_RNvYNCNKNvNtCsnMqmb1yYhM_16reverie_liteinst11patch_alloc18INSTALLATION_DEPTH0s_0INtNtNtCsayI02cGi06u_4core3ops8function6FnOnceTINtNtB1n_6option6OptionQIB22_INtNtB1n_4cell4CelljEEEEE9call_onceBa_",
+                        1587584,
+                        37,
+                        "cdbb184fbc6f4fcab850c742d09c9f59d11402d074f854a5384247c3e0e356e4",
+                    ),
+                    (
+                        "fixed_tls_get",
+                        "_RNvMs3_NtNtCsa2m0ZrbF74z_3std6thread5localINtB5_8LocalKeyINtNtCsayI02cGi06u_4core4cell4CelljEE3getCsk1nybVdH5QO_15reverie_inguest",
+                        2102560,
+                        13,
+                        "9d45f59884dc78cae879d5a39a71852e5a2f02882a998d4f99a48e6a5ceccc4b",
+                    ),
+                    (
+                        "fixed_tls_with",
+                        "_RINvMs2_NtNtCsa2m0ZrbF74z_3std6thread5localINtB6_8LocalKeyINtNtCsayI02cGi06u_4core4cell4CelljEE4withNvMs8_BX_BU_3getjECsk1nybVdH5QO_15reverie_inguest",
+                        2100000,
+                        62,
+                        "a564f7c26754147f724faf645a2fde45470fd58af5805d323d80637a6f14a532",
+                    ),
+                    (
+                        "fixed_tls_try_with",
+                        "_RINvMs2_NtNtCsa2m0ZrbF74z_3std6thread5localINtB6_8LocalKeyINtNtCsayI02cGi06u_4core4cell4CelljEE8try_withNvMs8_BX_BU_3getjECsk1nybVdH5QO_15reverie_inguest",
+                        2100064,
+                        175,
+                        "01bc31b9baafddf0e6bdd7fb0dbafd905fe8438eb4d7b8b2dd91e805b29b1b94",
+                    ),
+                    (
+                        "fixed_tls_cell_getter",
+                        "_RNCNKNvNtCsnMqmb1yYhM_16reverie_liteinst11patch_alloc18INSTALLATION_DEPTH0s_0B7_",
+                        1588208,
+                        38,
+                        "9e8d4be75c847cc059535eac25342c880b7145b7627fa058f3dd6502748955ab",
+                    ),
+                    (
+                        "fixed_tls_cell_callback",
+                        "_RNvYNvMs8_NtCsayI02cGi06u_4core4cellINtB8_4CelljE3getINtNtNtBa_3ops8function6FnOnceTRBy_EE9call_onceCsk1nybVdH5QO_15reverie_inguest",
+                        2181392,
+                        25,
+                        "a93a1905f85bdcd66ba208d3f462611121f192a3e419316eef48f6d48384b795",
+                    ),
+                    (
+                        "fixed_tls_cell_read",
+                        "_RNvMs8_NtCsayI02cGi06u_4core4cellINtB5_4CelljE3getCsdiSZO7VNmEz_12thread_local",
+                        2318864,
+                        9,
+                        "19c145446b1c59b56ba7b422314ffa92488b16a4819eeaff9f55e7130028c0d3",
+                    ),
+                ],
+                Some(3616368),
+                3835616,
+                3607984,
+                &[(1588229, 3607984)],
+            ),
+            (
+                FixedImageKind::Standalone,
+                64,
+                &[
+                    (
+                        "fixed_patch_alloc",
+                        "_RNvXs3_NtCsgAoOCLDCwcG_16reverie_liteinst11patch_allocNtB5_26FixedPrivatePatchAllocatorNtNtNtCsayI02cGi06u_4core5alloc6global11GlobalAlloc5alloc",
+                        640992,
+                        186,
+                        "25d9eae2aa30daeffc9b1672115733f3d17efa01475e95c1328db1c5ae7033d9",
+                    ),
+                    (
+                        "fixed_tls_fn_once",
+                        "_RNvYNCNKNvNtCsgAoOCLDCwcG_16reverie_liteinst11patch_alloc18INSTALLATION_DEPTH0s_0INtNtNtCsayI02cGi06u_4core3ops8function6FnOnceTINtNtB1o_6option6OptionQIB23_INtNtB1o_4cell4CelljEEEEE9call_onceBa_.llvm.17218051606089903038",
+                        641632,
+                        22,
+                        "d9889b1ed0344d2608c9ba91e72ca76fc5f6f48cc98cc3fdd82a9d523b6ec08c",
+                    ),
+                ],
+                None,
+                1329144,
+                1302816,
+                &[(641036, 1302816), (641640, 1302816)],
+            ),
+            (
+                FixedImageKind::Standalone,
+                128,
+                &[
+                    (
+                        "fixed_patch_alloc",
+                        "_RNvXs3_NtCsKwcmsQo8hu_16reverie_liteinst11patch_allocNtB5_26FixedPrivatePatchAllocatorNtNtNtCsayI02cGi06u_4core5alloc6global11GlobalAlloc5alloc",
+                        658960,
+                        186,
+                        "2eeaa291eccd1b08a65743f2b9ef5e79ec16ecc75b3a507adf9905219ba6e9ae",
+                    ),
+                    (
+                        "fixed_tls_fn_once",
+                        "_RNvYNCNKNvNtCsKwcmsQo8hu_16reverie_liteinst11patch_alloc18INSTALLATION_DEPTH0s_0INtNtNtCsayI02cGi06u_4core3ops8function6FnOnceTINtNtB1n_6option6OptionQIB22_INtNtB1n_4cell4CelljEEEEE9call_onceBa_.llvm.4137768869416488777",
+                        659600,
+                        22,
+                        "95f132c6fe02f4d415e055b1553a3926cc6fc31edce3134a8ada6d00207b28bb",
+                    ),
+                ],
+                None,
+                1354040,
+                1327664,
+                &[(659004, 1327664), (659608, 1327664)],
+            ),
+            (
+                FixedImageKind::Detcore,
+                152,
+                &[
+                    (
+                        "fixed_patch_alloc",
+                        "_RNvXs3_NtCs8embAShPx8w_16reverie_liteinst11patch_allocNtB5_26FixedPrivatePatchAllocatorNtNtNtCsayI02cGi06u_4core5alloc6global11GlobalAlloc5alloc",
+                        7311264,
+                        241,
+                        "e3640a6c2bf6ab14c37132bad5079062b04f8ee1f33edb8bad1788051d9291bb",
+                    ),
+                    (
+                        "fixed_tls_fn_once",
+                        "_RNvYNCNKNvNtCs8embAShPx8w_16reverie_liteinst11patch_alloc18INSTALLATION_DEPTH0s_0INtNtNtCsayI02cGi06u_4core3ops8function6FnOnceTINtNtB1o_6option6OptionQIB23_INtNtB1o_4cell4CelljEEEEE9call_onceBa_.llvm.16865387250626100676",
+                        7312176,
+                        22,
+                        "db8ec5915319258301190b284d997db73b9c71263837328381e3f2d0204aad6c",
+                    ),
+                ],
+                None,
+                8916040,
+                8557152,
+                &[(7311322, 8557152), (7312184, 8557152)],
+            ),
+            (
+                FixedImageKind::Detcore,
+                216,
+                &[
+                    (
+                        "fixed_patch_alloc",
+                        "_RNvXs3_NtCscR1iFr7dyJ9_16reverie_liteinst11patch_allocNtB5_26FixedPrivatePatchAllocatorNtNtNtCsayI02cGi06u_4core5alloc6global11GlobalAlloc5alloc",
+                        7328592,
+                        241,
+                        "425180fc2fadd76cf2a9fdb77d09695db03acfedb4fc9e4c6cbafc1b45a3a6f6",
+                    ),
+                    (
+                        "fixed_tls_fn_once",
+                        "_RNvYNCNKNvNtCscR1iFr7dyJ9_16reverie_liteinst11patch_alloc18INSTALLATION_DEPTH0s_0INtNtNtCsayI02cGi06u_4core3ops8function6FnOnceTINtNtB1o_6option6OptionQIB23_INtNtB1o_4cell4CelljEEEEE9call_onceBa_.llvm.17234572149339365889",
+                        7329504,
+                        22,
+                        "31ceb9edab518b7358ba5a075392aedb542d84b6abc81f3b950bde2949d48e51",
+                    ),
+                ],
+                None,
+                8940744,
+                8581136,
+                &[(7328650, 8581136), (7329512, 8581136)],
+            ),
+        ];
+        for &(kind, offset, chain, key, module, plt, calls) in profiles {
+            let mut sample = backing.clone();
+            if kind == FixedImageKind::Detcore {
+                sample
+                    .selection_objects
+                    .get_mut("fixed_compiler_global_marker")
+                    .unwrap()
+                    .name = "_RNvCsTest_16detcore_liteinst26REVERIE_LITEINST_ALLOCATOR".into();
+            }
+            let tls = &mut sample.tls_boundary;
+            tls.tls_cell.address = offset;
+            tls.tls_module_slot = module;
+            tls.tls_offset_slot = module + 8;
+            tls.plt_address = plt;
+            tls.local_chain = chain
+                .iter()
+                .map(|&(role, name, address, size, _)| {
+                    (
+                        role.into(),
+                        SymbolEvidence {
+                            name: name.into(),
+                            address,
+                            size,
+                            binding: sym::STB_LOCAL,
+                            visibility: sym::STV_DEFAULT,
+                        },
+                    )
+                })
+                .collect();
+            tls.function_sha256 = chain
+                .iter()
+                .map(|&(role, _, _, _, hash)| (role.into(), hash.into()))
+                .collect();
+            tls.callsites = calls
+                .iter()
+                .map(|&(instruction, target)| ConstructorTransfer {
+                    instruction,
+                    target,
+                    local_got_slot: None,
+                })
+                .collect();
+            tls.local_key_object = key;
+            tls.local_key_transfer = key.map(|_| ConstructorTransfer {
+                instruction: tls.local_chain["fixed_tls_try_with"].address + 0x15,
+                target: tls.local_chain["fixed_tls_fn_once"].address,
+                local_got_slot: None,
+            });
+            tls.local_key_resolution =
+                key.map(|_| "local_relative_readonly_function_pointer".into());
+            let check = |b: &AllocatorBackingEvidence| {
+                validate_fixed_backing_evidence_in_source_context(b, kind)
+            };
+            check(&sample).unwrap();
+            for mutation in 0..10 {
+                let mut bad = sample.clone();
+                let tls = &mut bad.tls_boundary;
+                match mutation {
+                    0 => tls.tls_cell.address = 0x50,
+                    1 => tls.tls_cell.size = 9,
+                    2 => tls.tls_cell.binding = sym::STB_GLOBAL,
+                    3 => tls.tls_cell.name.push_str("foreign"),
+                    4 => tls.callsites[0].target += 1,
+                    5 => tls.local_chain.get_mut("fixed_patch_alloc").unwrap().size = 16,
+                    6 => tls.provider_symbol = "malloc".into(),
+                    7 => tls.provider_version = "GLIBC_2.4".into(),
+                    8 => tls.provider_library = "libc.so.6".into(),
+                    9 => tls.tls_offset_slot += 1,
+                    _ => unreachable!(),
+                }
+                assert!(
+                    check(&bad).is_err(),
+                    "profile{offset:#x} invalid cell/shape/provider{mutation}"
+                );
+            }
+            for &(role, _, _, _, _) in chain {
+                let mut bad = sample.clone();
+                bad.tls_boundary.local_chain.remove(role);
+                assert!(
+                    check(&bad).is_err(),
+                    "profile{offset:#x} missing chain{role}"
+                );
+                let mut bad = sample.clone();
+                bad.tls_boundary.function_sha256.remove(role);
+                assert!(
+                    check(&bad).is_err(),
+                    "profile{offset:#x} missing hash{role}"
+                );
+            }
+            if let Some(key) = key {
+                for mutation in 0..9 {
+                    let mut bad = sample.clone();
+                    let tls = &mut bad.tls_boundary;
+                    match mutation {
+                        0 => tls.local_key_object = None,
+                        1 => tls.local_key_transfer = None,
+                        2 => tls.local_key_resolution = None,
+                        3 => tls.local_key_object = Some(0),
+                        4 => tls.local_key_object = Some(key + 1),
+                        5 => tls.local_key_resolution = Some("guessed_GOT".into()),
+                        6 => tls.local_key_transfer.as_mut().unwrap().instruction += 1,
+                        7 => tls.local_key_transfer.as_mut().unwrap().target += 1,
+                        8 => tls.local_key_transfer.as_mut().unwrap().local_got_slot = Some(0x1234),
+                        _ => unreachable!(),
+                    }
+                    assert!(
+                        check(&bad).is_err(),
+                        "DEV missing/inconsistent tuple{mutation}"
+                    );
+                }
+                let mut bad = sample.clone();
+                let tls = &mut bad.tls_boundary;
+                tls.local_key_object = None;
+                tls.local_key_transfer = None;
+                tls.local_key_resolution = None;
+                assert!(check(&bad).is_err(), "stripped DEV is not optimized");
+                bad.tls_boundary
+                    .local_chain
+                    .get_mut("fixed_patch_alloc")
+                    .unwrap()
+                    .size = 186;
+                assert!(check(&bad).is_err(), "DEV chain relabeled as optimized");
+            } else {
+                for mutation in 0..3 {
+                    let mut bad = sample.clone();
+                    match mutation {
+                        0 => bad.tls_boundary.local_key_object = Some(0x8000),
+                        1 => {
+                            bad.tls_boundary.local_key_transfer = Some(ConstructorTransfer {
+                                instruction: 1,
+                                target: 2,
+                                local_got_slot: None,
+                            })
+                        }
+                        2 => {
+                            bad.tls_boundary.local_key_resolution =
+                                Some("local_relative_readonly_function_pointer".into())
+                        }
+                        _ => unreachable!(),
+                    }
+                    assert!(
+                        check(&bad).is_err(),
+                        "None-chain inconsistent tuple{mutation}"
+                    );
+                }
+            }
+        }
     }
 
     // Synthetic parser rejection controls only. These exercise exact bytes,
@@ -37451,6 +38287,7 @@ mod tests {
         context.insert("rv:reverie-inguest/src/guest/tool_region_constructor.rs".to_owned(),fixed_hex("2f6275696c642f2e636172676f2f6769742f636865636b6f7574732f726576657269652d326663373730663761396338303830332f666334623438642f726576657269652d696e67756573742f7372632f67756573742f746f6f6c5f726567696f6e5f636f6e7374727563746f722e7273"));
         context.insert("rv:reverie-liteinst/src/patch_alloc.rs".to_owned(),fixed_hex("2f6275696c642f2e636172676f2f6769742f636865636b6f7574732f726576657269652d326663373730663761396338303830332f666334623438642f726576657269652d6c697465696e73742f7372632f70617463685f616c6c6f632e7273"));
         let mapping_context = detcore_validate_control_context("b0dc3d1");
+        let event_context = detcore_validate_control_context("6cbe1b7");
         type DetcoreTemplateCase<'a> = (usize, u64, &'a [(&'a str, u64)], &'a [(u64, u64)], u64);
         let cases: &[DetcoreTemplateCase<'_>] = &[
             (
@@ -38099,9 +38936,79 @@ mod tests {
                 &[(8955488, 7536560)],
                 0xe0,
             ),
+            (
+                36,
+                7311264,
+                &[
+                    ("fixed_arena_backing", 7520672),
+                    ("fixed_publication_tls_descriptor", 8916040),
+                    ("fixed_tls_get_addr_plt", 8557152),
+                    ("fixed_tool_alloc", 7529360),
+                    ("fixed_detcore_validate_fixed_patch_alloc_194_data", 8731976),
+                    ("fixed_heap_panic_sub_overflow", 8514336),
+                    ("fixed_detcore_validate_fixed_patch_alloc_207_data", 8732024),
+                    ("fixed_heap_panic_misaligned", 8511079),
+                    ("fixed_detcore_validate_fixed_patch_alloc_228_data", 8732024),
+                    ("fixed_panic_null_reference", 8511054),
+                ],
+                &[
+                    (8931264, 7520672),
+                    (8931368, 7529360),
+                    (8917264, 8514336),
+                    (8922376, 8511079),
+                    (8926880, 8511054),
+                ],
+                152,
+            ),
+            (
+                37,
+                7312176,
+                &[
+                    ("fixed_publication_tls_descriptor", 8916040),
+                    ("fixed_tls_get_addr_plt", 8557152),
+                ],
+                &[],
+                152,
+            ),
+            (
+                38,
+                7328592,
+                &[
+                    ("fixed_arena_backing", 7537888),
+                    ("fixed_publication_tls_descriptor", 8940744),
+                    ("fixed_tls_get_addr_plt", 8581136),
+                    ("fixed_tool_alloc", 7538832),
+                    ("fixed_detcore_validate_fixed_patch_alloc_194_data", 8756080),
+                    ("fixed_heap_panic_sub_overflow", 8538320),
+                    ("fixed_detcore_validate_fixed_patch_alloc_207_data", 8756128),
+                    ("fixed_heap_panic_misaligned", 8535063),
+                    ("fixed_detcore_validate_fixed_patch_alloc_228_data", 8756128),
+                    ("fixed_panic_null_reference", 8535038),
+                ],
+                &[
+                    (8956136, 7537888),
+                    (8956192, 7538832),
+                    (8942024, 8538320),
+                    (8947136, 8535063),
+                    (8951640, 8535038),
+                ],
+                216,
+            ),
+            (
+                39,
+                7329504,
+                &[
+                    ("fixed_publication_tls_descriptor", 8940744),
+                    ("fixed_tls_get_addr_plt", 8581136),
+                ],
+                &[],
+                216,
+            ),
         ];
         for &(index, address, input_targets, input_got, tls) in cases {
-            let context = if index >= 31 {
+            let context = if index >= 36 {
+                event_context.clone()
+            } else if index >= 31 {
                 mapping_context.clone()
             } else {
                 context.clone()

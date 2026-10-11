@@ -4,7 +4,6 @@ use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::AtomicU8;
 use core::sync::atomic::AtomicU64;
 use core::sync::atomic::Ordering;
-use std::cell::Cell;
 use std::ffi::CStr;
 use std::ffi::OsStr;
 use std::io;
@@ -101,27 +100,6 @@ static EVENT_FD: AtomicI32 = AtomicI32::new(libc::STDERR_FILENO);
 static EVENT_COOKIE: AtomicU64 = AtomicU64::new(0);
 static EVENT_DEVICE: AtomicU64 = AtomicU64::new(0);
 static EVENT_INODE: AtomicU64 = AtomicU64::new(0);
-
-thread_local! {
-    static CURRENT_EVENT: Cell<*mut SyscallEvent> = const { Cell::new(ptr::null_mut()) };
-}
-
-struct CurrentEventGuard {
-    previous: *mut SyscallEvent,
-}
-
-impl CurrentEventGuard {
-    fn enter(event: *mut SyscallEvent) -> Self {
-        let previous = CURRENT_EVENT.replace(event);
-        Self { previous }
-    }
-}
-
-impl Drop for CurrentEventGuard {
-    fn drop(&mut self) {
-        CURRENT_EVENT.set(self.previous);
-    }
-}
 
 static ARENAS: OnceLock<Vec<RuntimeArena>> = OnceLock::new();
 static SITES: OnceLock<Box<[SiteSlot]>> = OnceLock::new();
@@ -2534,8 +2512,9 @@ unsafe fn dispatch_syscall_context(
     }
     {
         let _tool_callback = ToolCallbackGuard::enter();
-        let _current_event = CurrentEventGuard::enter(&mut event);
-        unsafe { tool_trampoline() };
+        // SAFETY: this unique local event remains live until the synchronous
+        // trampoline returns; the trampoline does not retain its pointer.
+        unsafe { tool_trampoline((&raw mut event).cast::<core::ffi::c_void>()) };
     }
     if event.result == UNSET_RESULT {
         event.result = -i64::from(libc::ENOSYS);
@@ -2591,8 +2570,8 @@ unsafe extern "C" fn unpublished_syscall_hook(context: *mut HookContext) {
         record_enabled_fallback_stats(stats, event.instruction_pointer);
     }
     if unpublished_read_write_allowed(event.number) {
-        // No ToolCallbackGuard or CURRENT_EVENT spans guest I/O: a nested
-        // guest handler's own syscalls must still traverse their guest path.
+        // No ToolCallbackGuard spans guest I/O: a nested guest handler's own
+        // syscalls must still traverse their guest path.
         unsafe { process_syscall(&mut event) };
     } else {
         FALLBACK_REFUSALS.record(event.number);
@@ -2830,13 +2809,15 @@ fn record_enabled_fallback_stats(stats: crate::stats::GuestStatsHooks, address: 
     });
 }
 
-unsafe extern "C" fn tool_trampoline() {
-    let event = CURRENT_EVENT.get();
+unsafe extern "C" fn tool_trampoline(event: *mut core::ffi::c_void) {
+    let event = event.cast::<SyscallEvent>();
     if event.is_null() {
         unsafe {
             exit_now(123);
         }
     }
+    // SAFETY: the sole caller supplies its unique live local SyscallEvent for
+    // this synchronous call, and process_syscall does not retain the reference.
     unsafe {
         process_syscall(&mut *event);
     }
