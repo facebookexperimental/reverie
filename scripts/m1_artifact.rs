@@ -20468,7 +20468,14 @@ fn fixed_detcore_publication_cohort(
     let new = DETCORE_PUBLICATION_COHORT
         .iter()
         .all(|(role, _, index)| witnesses[*role].template_index == *index);
-    require(old || new, "mixed authenticated Detcore publication family")?;
+    let keyed_normal = DETCORE_PUBLICATION_COHORT
+        .iter()
+        .zip([31, 32, 33, 18, 11])
+        .all(|((role, _, _), index)| witnesses[*role].template_index == index);
+    require(
+        old || new || keyed_normal,
+        "mixed authenticated Detcore publication family",
+    )?;
     let region = *targets
         .get("fixed_region")
         .ok_or("Detcore publication REGION absent")?;
@@ -40045,6 +40052,7 @@ mod tests {
             }
         }
         detcore_publication_cohort_controls();
+        detcore_keyed_normal_publication_controls();
     }
 
     fn detcore_validate_control_context(pin: &str) -> BTreeMap<String, Vec<u8>> {
@@ -40321,7 +40329,7 @@ mod tests {
         };
         for mask in 0..32 {
             let graph = detcore_publication_control_graph(mask, false);
-            if mask == 0 || mask == 31 {
+            if mask == 0 || mask == 7 || mask == 31 {
                 check(&graph).unwrap();
             } else {
                 assert_eq!(
@@ -40336,7 +40344,7 @@ mod tests {
             check(&alias).unwrap_err(),
             "aliased Detcore publication roles"
         );
-        for mask in [0, 31] {
+        for mask in [0, 7, 31] {
             let mut graph = detcore_publication_control_graph(mask, false);
             graph.witnesses.remove("fixed_tool_dealloc");
             assert_eq!(
@@ -40401,6 +40409,223 @@ mod tests {
                 "Detcore publication witness loses its actual role/address/transfers"
             );
         }
+    }
+
+    // Retained ordinary validate-profile machine sample. Its physical provenance
+    // stays in the private receipt; filenames use the existing normalized fixture
+    // context. This unit graph is not current Cargo/source authority or physical
+    // ELF requalification. Raw bodies, addresses, Location objects, GOT targets
+    // and instruction boundaries are retained inputs, not recipe-created bytes.
+    fn detcore_keyed_normal_publication_control_graph() -> DetcorePublicationControlGraph {
+        type Sample = (&'static str, u64, usize, &'static str, &'static [usize]);
+        let samples: [Sample; 6] = [
+            (
+                "fixed_constructor_prepare",
+                0x741170,
+                31,
+                "415741564154534883ec484989ff4989e4488d7c2408bb010000004c89fe4c89e2b901000000e895f1ffff0fb644241084c00f848500000041f6c7070f85890000004d85ff0f84950000004c8b7424084d89675848b9001000000060000048894c24184c8974242088442428488d3515ef1604488d7c2430488d542418e80e700000807c2440fe753441f6c607755e4d85f6746e49c7464803000000c605dfee160400488d3ddeee1604e8217000004885c0740931db807810ff0f94c389d84883c4485b415c415e415fc3488d1566341300bf080000004c89feff1508fb1500488d3d51341300ff155b0a1600488d1514341300bf080000004c89f6ff15e6fa1500488d3dff331300ff15390a1600ff151b0a1600",
+                &[
+                    0, 2, 4, 6, 7, 11, 14, 17, 22, 27, 30, 33, 38, 43, 48, 50, 56, 60, 66, 69, 75,
+                    80, 84, 94, 99, 104, 108, 115, 120, 125, 130, 135, 137, 141, 143, 146, 148,
+                    156, 163, 170, 175, 178, 180, 182, 186, 189, 191, 195, 196, 198, 200, 202, 203,
+                    210, 215, 218, 224, 231, 237, 244, 249, 252, 258, 265, 271,
+                ],
+            ),
+            (
+                "fixed_generic_prepare",
+                0x741290,
+                32,
+                "415741564154534883ec484989ff4989e4488d7c24084c89fe4c89e2b902000000e87af0ffff0fb6442410bb0100000084c00f848500000041f6c7070f85890000004d85ff0f84950000004c8b7424084d89675848b9001000000060000048894c24184c8974242088442428488d35f5ed1604488d7c2430488d542418e8ee6e0000807c2440fe753441f6c607755e4d85f6746e49c7464803000000c605bfed160400488d3dbeed1604e8016f00004885c0740931db807810ff0f94c389d84883c4485b415c415e415fc3488d155e331300bf080000004c89feff15e8f91500488d3d49331300ff153b091600488d15f4321300bf080000004c89f6ff15c6f91500488d3ddf321300ff1519091600ff15fb081600",
+                &[
+                    0, 2, 4, 6, 7, 11, 14, 17, 22, 25, 28, 33, 38, 43, 48, 50, 56, 60, 66, 69, 75,
+                    80, 84, 94, 99, 104, 108, 115, 120, 125, 130, 135, 137, 141, 143, 146, 148,
+                    156, 163, 170, 175, 178, 180, 182, 186, 189, 191, 195, 196, 198, 200, 202, 203,
+                    210, 215, 218, 224, 231, 237, 244, 249, 252, 258, 265, 271,
+                ],
+            ),
+            (
+                "fixed_region_publication_set",
+                0x748200,
+                33,
+                "4889f80fb64e1884c9740f488b4a10488948100f10020f1100c3488b4a1048894e100f10020f1106c6461801c64010fec3",
+                &[0, 3, 7, 9, 11, 15, 19, 22, 25, 26, 30, 34, 37, 40, 44, 48],
+            ),
+            (
+                "fixed_tool_dealloc",
+                0x7399c0,
+                18,
+                "530fb6052a67170484c075504889f3488d3d22671704e865e800004885c0743c807810ff74364889d848c1e81c483d01000600722748be0000001000600000488d86000000024839c37311488b53f8488dbe003002f05be974f5ffffe8affcffff",
+                &[
+                    0, 1, 8, 10, 12, 15, 22, 27, 30, 32, 36, 38, 41, 45, 51, 53, 63, 70, 73, 75,
+                    79, 86, 87, 92,
+                ],
+            ),
+            (
+                "fixed_tool_realloc",
+                0x739a30,
+                11,
+                "554157415641554154534883ec180fb605ad66170484c00f85dc0000004d89c74989ce4989d44889f3488d3d98661704e8dbe700004885c00f84bb000000807810ff0f84b100000049bd0000001000600000498dad003002f048892c244c896c240848c7442410000000024889d848c1e81c483d01000600727f498d85000000024839c37373498d4424ff4985c40f95c048b900000000000000804c29e14939cf0f97c108c175404889e74c89e64c89fae88af6ffff4885c0742d4d39f74d0f42f74889df4889c64c89f24989c6ff1584951600488b53f84889ef4c89eee87df4ffff4c89f0eb0231c04883c4185b415c415d415e415f5dc3e8a2fbffff",
+                &[
+                    0, 1, 3, 5, 7, 9, 10, 14, 21, 23, 29, 32, 35, 38, 41, 48, 53, 56, 62, 66, 72,
+                    82, 89, 93, 98, 107, 110, 114, 120, 122, 129, 132, 134, 139, 142, 145, 155,
+                    158, 161, 164, 166, 168, 171, 174, 177, 182, 185, 187, 190, 194, 197, 200, 203,
+                    206, 212, 216, 219, 222, 227, 230, 232, 234, 238, 239, 241, 243, 245, 247, 248,
+                    249,
+                ],
+            ),
+            (
+                "fixed_region_publication_get",
+                0x748240,
+                6,
+                "0fb64f1831c084c9480f45c7c3",
+                &[0, 4, 6, 8, 12],
+            ),
+        ];
+        let mut targets: BTreeMap<String, u64> = BTreeMap::from([
+            ("fixed_constructor_prepare".into(), 0x741170),
+            ("fixed_copy_bytes".into(), 0x7396b0),
+            ("fixed_generic_prepare".into(), 0x741290),
+            ("fixed_heap_allocate".into(), 0x739170),
+            ("fixed_heap_deallocate".into(), 0x738f90),
+            ("fixed_heap_panic_misaligned".into(), 0x83bd67),
+            ("fixed_initializing".into(), 0x48b00f2),
+            ("fixed_native_from_native".into(), 0x740330),
+            ("fixed_panic_null_reference".into(), 0x83bd4e),
+            ("fixed_publication_cannot_unwind".into(), 0x83bcc3),
+            ("fixed_refuse_foreign".into(), 0x7396d0),
+            ("fixed_region".into(), 0x48b00f8),
+            ("fixed_region_publication_get".into(), 0x748240),
+            ("fixed_region_publication_set".into(), 0x748200),
+            ("fixed_region_ready".into(), 0x48b0110),
+            ("fixed_region_value16".into(), 0x48b0108),
+            ("fixed_tool_dealloc".into(), 0x7399c0),
+            ("fixed_tool_realloc".into(), 0x739a30),
+        ]);
+        for (key, address) in [
+            (
+                "fixed_detcore_validate_fixed_constructor_prepare_192_data",
+                0x8746a8,
+            ),
+            (
+                "fixed_detcore_validate_fixed_constructor_prepare_213_data",
+                0x8746a8,
+            ),
+            (
+                "fixed_detcore_validate_fixed_constructor_prepare_226_data",
+                0x874678,
+            ),
+            (
+                "fixed_detcore_validate_fixed_constructor_prepare_247_data",
+                0x874678,
+            ),
+            (
+                "fixed_detcore_validate_fixed_generic_prepare_192_data",
+                0x8746c0,
+            ),
+            (
+                "fixed_detcore_validate_fixed_generic_prepare_213_data",
+                0x8746c0,
+            ),
+            (
+                "fixed_detcore_validate_fixed_generic_prepare_226_data",
+                0x874678,
+            ),
+            (
+                "fixed_detcore_validate_fixed_generic_prepare_247_data",
+                0x874678,
+            ),
+        ] {
+            targets.insert(key.into(), address);
+            targets.insert(format!("{key}_file"), 0x122ad7);
+        }
+        let got = BTreeMap::from([
+            (0x8a0d58, 0x83bd67),
+            (0x8a1ca0, 0x83bcc3),
+            (0x8a1cb8, 0x83bd4e),
+            (0x8a3088, 0x7396b0),
+        ]);
+        let context = detcore_validate_control_context("b0dc3d1");
+        let filename = &context["rv:reverie-inguest/src/guest/tool_region_constructor.rs"];
+        let readonly = BTreeMap::from([
+            (
+                0x874678,
+                fixed_hex("000000000000000071000000000000007802000012000000"),
+            ),
+            (
+                0x8746a8,
+                fixed_hex("000000000000000071000000000000008a0200000e000000"),
+            ),
+            (
+                0x8746c0,
+                fixed_hex("000000000000000071000000000000009b0200000e000000"),
+            ),
+            (0x122ad7, filename.to_vec()),
+        ]);
+        let mut witnesses = BTreeMap::new();
+        let mut transfers = BTreeMap::new();
+        let mut selected = BTreeMap::new();
+        for (role, address, index, whole, offsets) in samples {
+            let bytes = fixed_hex(whole);
+            let qualify = |actual: &[u8]| {
+                let instructions: Vec<_> = offsets
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &offset)| {
+                        let end = offsets.get(i + 1).copied().unwrap_or(actual.len());
+                        EncodedConstructorInstruction {
+                            address: address + offset as u64,
+                            bytes: actual[offset..end].to_vec(),
+                        }
+                    })
+                    .collect();
+                fixed_detcore_qualified_operation(
+                    role,
+                    address,
+                    (actual, &instructions),
+                    DetcoreRecipeBindings {
+                        targets: &targets,
+                        got: &got,
+                        readonly: &readonly,
+                        context: &context,
+                    },
+                    0xe0,
+                    false,
+                )
+            };
+            let witness =
+                qualify(&bytes).unwrap_or_else(|error| panic!("retained normal {role}: {error}"));
+            assert_eq!(witness.template_index, index);
+            for byte in 0..bytes.len() {
+                for bit in 0..8 {
+                    let mut bad = bytes.clone();
+                    bad[byte] ^= 1 << bit;
+                    assert!(
+                        qualify(&bad).is_err(),
+                        "retained normal literal/operand {role}+{byte} bit{bit}"
+                    );
+                }
+            }
+            selected.insert(role.into(), address);
+            transfers.insert(role.into(), witness.edges.clone());
+            witnesses.insert(role.into(), witness);
+        }
+        DetcorePublicationControlGraph {
+            witnesses,
+            transfers,
+            selected,
+            targets,
+        }
+    }
+
+    fn detcore_keyed_normal_publication_controls() {
+        let graph = detcore_keyed_normal_publication_control_graph();
+        fixed_detcore_publication_cohort(
+            &graph.witnesses,
+            &graph.transfers,
+            &graph.selected,
+            &graph.targets,
+        )
+        .expect("the authenticated retained normal publication cohort must compose");
     }
 
     // Also nested in the same existing helper identity, AFTER template/data integration.
