@@ -373,20 +373,244 @@ fn fallback_refusal_is_counted_separately_from_tool_errors() {
     }
 }
 
-fn output_with_timeout(mut command: Command, timeout: Duration) -> Output {
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command.spawn().unwrap();
-    let deadline = Instant::now() + timeout;
-    loop {
-        if child.try_wait().unwrap().is_some() {
-            return child.wait_with_output().unwrap();
+/// Own direct-child cleanup through capture errors and caller unwinding.
+/// This deliberately retains the tests' existing process-group semantics.
+struct KillOnDropChild(Option<std::process::Child>);
+
+impl KillOnDropChild {
+    fn new(child: std::process::Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn child(&mut self) -> &mut std::process::Child {
+        self.0.as_mut().expect("child has not been reaped")
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let status = self.child().try_wait()?;
+        if status.is_some() {
+            // try_wait reaped the child: never direct later cleanup at its PID.
+            self.0 = None;
         }
+        Ok(status)
+    }
+
+    fn kill_and_wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        // It may have exited between polling and killing. wait still owns and
+        // reaps that child; a kill error must not replace the timeout failure.
+        let _ = self.child().kill();
+        let status = self.child().wait()?;
+        self.0 = None;
+        Ok(status)
+    }
+}
+
+impl Drop for KillOnDropChild {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn output_with_timeout(mut command: Command, timeout: Duration) -> Output {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+
+    fn nonblocking(fd: libc::c_int) -> std::io::Result<()> {
+        // SAFETY: fd is one of this invocation's owned pipe read handles.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn read_chunk(pipe: &mut impl Read, bytes: &mut Vec<u8>) -> std::io::Result<bool> {
+        // One bounded chunk per stream keeps a continuously writable stream
+        // from starving the other stream or the absolute deadline check.
+        let mut buffer = [0; 8192];
+        match pipe.read(&mut buffer) {
+            Ok(0) => Ok(true),
+            Ok(count) => {
+                bytes.extend_from_slice(&buffer[..count]);
+                Ok(false)
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = KillOnDropChild::new(command.spawn().unwrap());
+    let deadline = Instant::now() + timeout;
+    let mut stdout = child.child().stdout.take().unwrap();
+    let mut stderr = child.child().stderr.take().unwrap();
+    nonblocking(stdout.as_raw_fd()).unwrap();
+    nonblocking(stderr.as_raw_fd()).unwrap();
+    let (mut stdout_bytes, mut stderr_bytes) = (Vec::new(), Vec::new());
+    let (mut stdout_eof, mut stderr_eof) = (false, false);
+    let mut status = None;
+    loop {
         if Instant::now() >= deadline {
-            child.kill().unwrap();
-            let output = child.wait_with_output().unwrap();
+            // Closing the readers before reaping never waits for a descendant
+            // that retained a pipe writer. Subtree cleanup belongs to the
+            // outer test box; kernel-uninterruptible reaping needs that bound.
+            drop(stdout);
+            drop(stderr);
+            let status = status.unwrap_or_else(|| child.kill_and_wait().unwrap());
+            let output = Output {
+                status,
+                stdout: stdout_bytes,
+                stderr: stderr_bytes,
+            };
             panic!("child exceeded {timeout:?}: {output:?}");
         }
-        thread::sleep(Duration::from_millis(10));
+        if status.is_none() {
+            status = child.try_wait().unwrap();
+        }
+        if !stdout_eof {
+            stdout_eof = read_chunk(&mut stdout, &mut stdout_bytes).unwrap_or_else(|error| {
+                panic!("stdout capture failed: {error}; stdout={stdout_bytes:?} stderr={stderr_bytes:?}")
+            });
+        }
+        if !stderr_eof && Instant::now() < deadline {
+            stderr_eof = read_chunk(&mut stderr, &mut stderr_bytes).unwrap_or_else(|error| {
+                panic!("stderr capture failed: {error}; stdout={stdout_bytes:?} stderr={stderr_bytes:?}")
+            });
+        }
+        if Instant::now() >= deadline {
+            continue;
+        }
+        if let Some(status) = status
+            && stdout_eof
+            && stderr_eof
+        {
+            return Output {
+                status,
+                stdout: stdout_bytes,
+                stderr: stderr_bytes,
+            };
+        }
+        let mut pipes = [
+            libc::pollfd {
+                fd: if stdout_eof { -1 } else { stdout.as_raw_fd() },
+                events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: if stderr_eof { -1 } else { stderr.as_raw_fd() },
+                events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+                revents: 0,
+            },
+        ];
+        // Poll child status even when both pipes closed before child exit.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let millis = remaining.as_millis().min(10) as libc::c_int;
+        // SAFETY: pipes contains two initialized, owned (or disabled) fds.
+        if unsafe { libc::poll(pipes.as_mut_ptr(), pipes.len() as libc::nfds_t, millis) } == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                panic!(
+                    "capture poll failed: {error}; stdout={stdout_bytes:?} stderr={stderr_bytes:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn timeout_capture_drains_both_8192_byte_pipes_while_child_runs() {
+    use std::os::unix::process::CommandExt;
+
+    let mut command = Command::new("/bin/sh");
+    command.arg("-c").arg(
+        "i=0; while [ \"$i\" -lt 4096 ]; do \
+         printf 'out-0123456789abcdef\\n'; \
+         printf 'err-0123456789abcdef\\n' >&2; i=$((i+1)); done",
+    );
+    // Control only this regression's pipe capacity. The workload must exceed
+    // both pipes, rather than relying on the host's default capacity.
+    unsafe {
+        command.pre_exec(|| {
+            for fd in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+                if libc::fcntl(fd, libc::F_SETPIPE_SZ, 8192) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::fcntl(fd, libc::F_GETPIPE_SZ) != 8192 {
+                    return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+                }
+            }
+            Ok(())
+        });
+    }
+    let output = output_with_timeout(command, Duration::from_secs(20));
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"out-0123456789abcdef\n".repeat(4096));
+    assert_eq!(output.stderr, b"err-0123456789abcdef\n".repeat(4096));
+}
+
+#[test]
+fn timeout_capture_preserves_prefixes_and_reaps_child_and_coordinator_on_unwind() {
+    let directory = tempfile::tempdir().unwrap();
+    let pid_file = directory.path().join("child.pid");
+    let mut coordinator = KillOnDropChild::new(
+        Command::new("/bin/sh")
+            .args(["-c", "while :; do :; done"])
+            .spawn()
+            .unwrap(),
+    );
+    let coordinator_pid = coordinator.child().id();
+    let mut command = Command::new("/bin/sh");
+    command
+        .args([
+            "-c",
+            "printf '%s\\n' \"$$\" > \"$1\"; printf 'stdout-prefix\\n'; \
+             printf 'stderr-prefix\\n' >&2; while :; do :; done",
+            "timeout-control",
+        ])
+        .arg(&pid_file);
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _coordinator = coordinator;
+        output_with_timeout(command, Duration::from_secs(1))
+    }))
+    .expect_err("a live child must remain a timeout failure");
+    let message = failure.downcast_ref::<String>().unwrap();
+    assert!(message.contains("child exceeded 1s:"), "{message}");
+    assert!(
+        message.contains("stdout: \"stdout-prefix\\n\""),
+        "{message}"
+    );
+    assert!(
+        message.contains("stderr: \"stderr-prefix\\n\""),
+        "{message}"
+    );
+    let child_pid: u32 = std::fs::read_to_string(pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    for pid in [child_pid, coordinator_pid] {
+        let mut status = 0;
+        // SAFETY: these are the two direct children owned by this test. A
+        // successful cleanup has already reaped them, so neither is waitable.
+        assert_eq!(
+            unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
     }
 }
 
@@ -975,13 +1199,15 @@ fn late_code_guest(
     let binary = env!("CARGO_BIN_EXE_reverie-liteinst-rpc-tool-guest");
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("coordinator.sock");
-    let mut coordinator = Command::new(binary)
-        .arg("coordinator")
-        .arg(&socket)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let coordinator = KillOnDropChild::new(
+        Command::new(binary)
+            .arg("coordinator")
+            .arg(&socket)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
     let deadline = Instant::now() + Duration::from_secs(5);
     while !socket.exists() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
@@ -992,8 +1218,7 @@ fn late_code_guest(
     reverie_liteinst::set_guest_alt_stack(&mut command, on_alt_stack);
     configure(&mut command);
     let output = ready.then(|| output_with_timeout(command, Duration::from_secs(20)));
-    let _ = coordinator.kill();
-    let _ = coordinator.wait();
+    drop(coordinator);
     output.expect("coordinator socket was not created")
 }
 
