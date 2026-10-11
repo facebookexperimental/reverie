@@ -2,7 +2,8 @@
 name = "reverie-liteinst-artifact"
 version = "0.4.1"
 authors = ["Meta Platforms"]
-edition = "2024"
+# The shared source is also included by Hermit's Rust 2021 script consumers.
+edition = "2021"
 repository = "https://github.com/facebookexperimental/reverie"
 license = "BSD-2-Clause"
 publish = false

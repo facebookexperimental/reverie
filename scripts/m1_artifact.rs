@@ -692,8 +692,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 13] = [
     ),
     (
         "reverie-liteinst-artifact/Cargo.toml",
-        456,
-        "74f41a07055f00263e4a068c0f6c54ce45da4c355800ae71a02d76aa573090c5",
+        533,
+        "f61d31f8d1426853ccc6516b79f49644475efb56399e125de2f3b63b5b77c4ee",
     ),
     (
         "reverie-inguest/Cargo.toml",
@@ -20837,8 +20837,8 @@ fn qualify_fixed_operation_closure(
         })?;
         fixed_census_transfers(&instructions, address, actual, &edges, got, internal_switch)
             .map_err(|error| format!("Fixed role {role} at {address:#x}: {error}"))?;
-        if image_kind == FixedImageKind::Standalone
-            && let Some(witness) = fixed_normal_return_qualified_operation(
+        let normal_return_witness = if image_kind == FixedImageKind::Standalone {
+            fixed_normal_return_qualified_operation(
                 &role,
                 address,
                 (actual, &instructions),
@@ -20846,7 +20846,10 @@ fn qualify_fixed_operation_closure(
                 got,
                 &context.readonly,
             )?
-        {
+        } else {
+            None
+        };
+        if let Some(witness) = normal_return_witness {
             require(
                 normal_return_witnesses
                     .insert(role.clone(), witness)
