@@ -17,6 +17,8 @@
 //! exact Cargo profile object, oracle paths/hashes and source HEAD/tree/lock hash.
 //! No directory search or warm-file fallback is permitted.
 
+mod allocator_declaration_fixture;
+mod fixed_arena_fixture;
 mod generic_bootstrap_fixture;
 pub mod m1_artifact;
 mod standalone_constructor_fixture;
@@ -444,6 +446,7 @@ fn produce(
         target.to_string_lossy().into_owned(),
         "--message-format=json-render-diagnostics".to_owned(),
     ];
+    let cargo_build_command_index = runner.commands.len();
     let output = runner.run("cargo", &arguments, &root)?;
     let messages =
         std::str::from_utf8(&output).map_err(|e| format!("Cargo artifact messages: {e}"))?;
@@ -453,6 +456,21 @@ fn produce(
         &config.expected_features,
         &config.expected_cargo_profile,
         &target,
+    )?;
+    let declaration_messages = runner
+        .commands
+        .get(cargo_build_command_index)
+        .ok_or("current Cargo command record missing")?
+        .stdout
+        .clone();
+    let declarations = allocator_declaration_fixture::run(
+        &root,
+        &bundle,
+        &metadata,
+        &declaration_messages,
+        &cargo_artifact,
+        &target,
+        &runner,
     )?;
     let current = FileIdentity::read(&cargo_artifact.reported_path)?;
     let stage = bundle.join("libreverie_liteinst.so");
@@ -511,6 +529,7 @@ fn produce(
         produce_stack_guest(&root, &bundle, &mut runner)?;
     let standalone = produce_standalone_inputs(&root, &bundle, &mut runner)?;
     let generic = generic_bootstrap_fixture::produce(&root, &bundle, &mut runner)?;
+    let fixed = fixed_arena_fixture::produce(&root, &bundle, &mut runner)?;
     let after =
         m1_artifact::source_identity(&root, &root.join("Cargo.lock"), &oracles, &mut runner)?;
     check(
@@ -520,6 +539,7 @@ fn produce(
     current.verify()?;
     artifact.verify()?;
     let receipt = RuntimeReceipt {
+        compiled_sources: None,
         schema_version: m1_artifact::SCHEMA,
         source_before: before,
         source_after: after,
@@ -577,7 +597,14 @@ fn produce(
         &guest.source.path,
         m1_artifact::FROZEN_C_ORACLE,
     )?;
+    let declaration_inputs =
+        allocator_declaration_fixture::bind_runtime_inputs(&bundle, &receipt_path, &declarations)?;
+    let fixed_inputs = fixed_arena_fixture::bind_inputs(&root, &bundle, &receipt_path, &fixed.1)?;
     let inputs = BTreeMap::from([
+        (
+            "REVERIE_LITEINST_ALLOCATOR_DECLARATIONS_MANIFEST",
+            declaration_inputs.as_path(),
+        ),
         ("REVERIE_LITEINST_PRELOAD", receipt.artifact.path.as_path()),
         (
             "REVERIE_LITEINST_TEST_RUNTIME_MANIFEST",
@@ -611,6 +638,12 @@ fn produce(
         ),
         (generic_bootstrap_fixture::GUEST_ENV, generic.0.as_path()),
         (generic_bootstrap_fixture::RECEIPT_ENV, generic.1.as_path()),
+        (fixed_arena_fixture::GUEST_ENV, fixed.0.as_path()),
+        (fixed_arena_fixture::RECEIPT_ENV, fixed.1.as_path()),
+        (
+            "REVERIE_LITEINST_FIXED_INPUTS_MANIFEST",
+            fixed_inputs.as_path(),
+        ),
     ]);
     let mut shell = String::new();
     let mut github = String::new();
@@ -691,6 +724,10 @@ fn run() -> Result<()> {
             "REVERIE_LITEINST_ROOT_INTERPOSER_MANIFEST": standalone.root_receipt,
             "REVERIE_LITEINST_GENERIC_GUEST": generic.0,
             "REVERIE_LITEINST_GENERIC_GUEST_MANIFEST": generic.1,
+            "REVERIE_LITEINST_FIXED_GUEST": receipt_path.parent().ok_or("runtime bundle absent")?.join("fixed_arena_guest"),
+            "REVERIE_LITEINST_FIXED_GUEST_MANIFEST": receipt_path.parent().ok_or("runtime bundle absent")?.join("fixed-arena-guest.json"),
+            "REVERIE_LITEINST_FIXED_INPUTS_MANIFEST": receipt_path.parent().ok_or("runtime bundle absent")?.join("fixed-arena-inputs.json"),
+            "REVERIE_LITEINST_ALLOCATOR_DECLARATIONS_MANIFEST": receipt_path.parent().ok_or("runtime bundle absent")?.join("allocator-declarations/runtime-inputs.json"),
             "artifact_sha256": receipt.artifact.sha256,
             "guest_sha256": guest.binary.sha256,
             "executed_tests": 0,

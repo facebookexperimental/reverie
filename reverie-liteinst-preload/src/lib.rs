@@ -7,8 +7,11 @@ mod glibc_compat;
 #[cfg(not(test))]
 mod constructor;
 
-#[global_allocator]
-static ALLOCATOR: reverie_liteinst::PrivateToolAllocator = reverie_liteinst::PrivateToolAllocator;
+#[cfg(not(test))]
+reverie_liteinst::declare_fixed_tool_allocator!();
+
+#[cfg(test)]
+reverie_liteinst::declare_legacy_private_tool_allocator!();
 
 #[cfg(test)]
 #[used]

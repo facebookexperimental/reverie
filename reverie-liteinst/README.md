@@ -22,7 +22,7 @@ cargo build -p reverie-liteinst-preload
 Cargo produces `libreverie_liteinst_preload.so`; Hermit installs that artifact
 under its existing resource name `libreverie_liteinst.so`. The leaf owns its
 constructor, glibc compatibility code, static unwinder and unconditional
-`PrivateToolAllocator`. The old core `preload-constructor` feature is a deprecated
+`FixedPrivatePatchAllocator`. The old core `preload-constructor` feature is a deprecated
 no-op, including in workspace feature unions. Linking the core into a host
 program does not replace that program's allocator or add a LiteInst constructor.
 The independent legacy `reverie-inguest/preload-constructor` feature still owns
@@ -50,31 +50,77 @@ runtime initialization and its dispatch scope finish before the compatibility
 resolver runs. Earlier loader/CRT initialization and the inert resolver are
 outside the constructor-stack placement guarantee.
 
-A Tool-specific preload must declare `reverie_liteinst::PrivateToolAllocator` as
-its root `#[global_allocator]`. Ordinary Rust allocation uses only the reusable
-32 MiB Tool arena and the process-lifetime 32 MiB installation arena, before,
-during and after callbacks. Exhaustion returns null through `GlobalAlloc` and
-never falls back to the guest allocator. Reallocation and deallocation preserve
-the original arena's ownership across scope changes. A foreign-address ownership
-mismatch terminates through the trusted syscall gate before reading a header.
+A Tool-specific preload uses `reverie_liteinst::declare_fixed_tool_allocator!()`
+once at its crate root. This declares both the compiler allocator and a strong,
+hidden, immutable backing descriptor. Authenticated startup reserves two fixed
+32 MiB arenas before publishing the region: reusable storage at
+`0x600010000000..0x600012000000` and process-lifetime installation storage at
+`0x600014000000..0x600016000000`, each between inaccessible guard pages. Their
+mutable cursor/free-list/lock state lives in the fixed control area. Allocation
+before publication and exhaustion return null through `GlobalAlloc`; neither
+can bootstrap lazily or fall back to guest allocation. Reallocation and
+deallocation preserve the original arena's ownership across scope changes.
+A foreign or unready address refuses through the trusted syscall gate before
+reading an allocation header.
 
-Legacy embedded Tools may explicitly declare `ScopedToolAllocator` to retain the
-prior dispatch/installation-scoped policy. The RPC and lifecycle fixtures and
+Legacy embedded Tools use `declare_legacy_scoped_tool_allocator!()` to retain the
+prior dispatch/installation-scoped policy, or
+`declare_legacy_private_tool_allocator!()` for the always-private BSS policy.
+These are explicit source declarations, not automatic defaults. Missing or
+duplicate backing declarations are link errors. A custom/default allocator
+control can use `declare_legacy_tool_backing!()` without replacing its allocator;
+that declaration cannot bypass the allocation ownership check.
+The RPC and lifecycle fixtures and
 example preload do so; this also preserves the examples rlib's existing allocator
 propagation into its host binaries. These legacy roots are not isolated preloads.
 Every `install_tool` variant checks a fallible compiler-selected allocation in a
 dispatch scope before creating a Tool, opening RPC or installing a filter. A
 System-only root is refused with `EOPNOTSUPP`; exhaustion returns `ENOMEM`.
+Fixed ownership must already be published, or preflight returns `EAGAIN` before
+allocating. Preflight accepts only the selected backing, never both fixed and
+legacy storage together.
 
 This boundary covers compiler-selected Rust allocation. It does not isolate
-allocations inside libc or the loader, guest TLS, callback stacks, mapping
-placement or memory permissions. Those require separate barriers; the arenas
-remain bounded storage, not a security sandbox or a claim of complete Tool
-memory isolation.
+allocations inside libc or the loader, guest TLS, or all entry-frame storage.
+The installation-depth counter still lives in ELF TLS and is reached through
+the loader's `__tls_get_addr`; this slice does not isolate that resolver's work.
+The interiors remain on protection key zero; boundary guards do not prevent
+guest writes into them or destructive mappings. Those require separate barriers.
+This is not a claim of complete Tool memory isolation.
 
 The alternate signal stack and the typed Tool continuation use explicit fixed
 region backing. See [the stack storage contract](STACK_MEMORY.md) for the exact
 range, guards, lifetime and remaining isolation work.
+
+## Artifact qualification boundary
+
+The loader-byte proof deliberately supports a restricted ELF layout: retained
+section tables, little-endian x86-64 shared objects, nonempty page-disjoint LOAD
+segments, and a complete read-only ELF/program-header mapping at file and virtual
+offset zero. The unique dynamic table and all relocation, symbol, string, hash
+and version tables must have matching complete section, file and loaded views.
+They must remain protected after relocation, and no declared relocation may
+write into those inputs. Relative fast-count prefixes must contain exactly
+symbol-zero relative relocations.
+
+Qualification requires eager binding with the supported NOW flags. Empty or
+aliased LOAD mappings, ambiguous metadata, packed relocations, COPY relocations,
+local IFUNC/resolver callbacks and unsupported loader extensions are refused.
+These are explicit format exclusions; an unproved input never earns a partial
+qualification. Both producer collection and consumer requalification apply the
+same boundary. This does not establish protection against arbitrary later guest
+stores or mapping changes, and does not expand the memory-isolation contract above.
+
+For Hermit Cargo Git builds, full Fixed qualification resolves locked, offline
+Cargo metadata independently of the artifact receipt. The caller supplies the
+full Reverie revision and build root; the checker joins the exact package,
+target, clean Git checkout and source blobs before accepting compiler filename
+operands. Consumers repeat that resolution. A receipt cannot authorize a source
+path, a short revision, a remapped filename or a different checkout namespace.
+This path currently requires Git metadata in the Hermit source tree; Gitless
+source imports are explicitly unsupported for full Fixed staging, even when
+the caller supplies a valid revision. Ordinary ELF constructor discovery is a
+separate, narrower check and does not establish full allocator qualification.
 
 ## Event path
 

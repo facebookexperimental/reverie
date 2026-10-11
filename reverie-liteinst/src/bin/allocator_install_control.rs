@@ -8,6 +8,9 @@ use reverie::Pid;
 use reverie::Subscription;
 use reverie::Tool;
 
+// Keep the compiler's default System allocator and the original refusal test.
+reverie_liteinst::declare_legacy_tool_backing!();
+
 static TOOL_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Default)]

@@ -24,7 +24,7 @@ pub mod artifact;
 pub mod contract;
 
 pub const RUST_ORACLE_SHA256: &str =
-    "d85c3094519855dde18571047b945aeca112b8e4df2138cff83fc33bfba0bce8";
+    "e707144e4e5735c03f9139cc4a2a89d6be2089461d88ed2c949cdd770a7d2cf0";
 pub const C_ORACLE_SHA256: &str =
     "e21fd8768d61edc7d14f51b98e2c5f9087fd4ddcfa08a19a2ca646b6df912b2e";
 const RUST_ORACLE_BYTES: &[u8] = include_bytes!("../../src/allocator_fixture.rs");
@@ -320,6 +320,7 @@ fn qualify_runtime() -> Result<QualifiedRuntime, String> {
             ("c_workload".to_owned(), C_ORACLE_SHA256.to_owned()),
         ]);
         let expectation = artifact::ConsumerExpectation {
+            compiled_sources: None,
             package: &package,
             features: &features,
             profile_name: "dev",

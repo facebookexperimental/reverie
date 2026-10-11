@@ -4,8 +4,8 @@
 //! During a bounded installation scope, allocations from liteinst2 and
 //! iced-x86 therefore come from this prepublished process-lifetime buffer.
 //! Objects that survive registration are intentionally never reclaimed. Preload
-//! leaves use [`PrivatePatchAllocator`], whose other allocations always use the
-//! reusable Tool arena. Embedded legacy Tools may explicitly use [`PatchAllocator`]
+//! leaves use [`FixedPrivatePatchAllocator`], whose other allocations always use
+//! the fixed reusable Tool arena. Embedded legacy Tools may explicitly use [`PatchAllocator`]
 //! to preserve their scoped allocation behavior.
 
 use core::alloc::GlobalAlloc;
@@ -16,9 +16,12 @@ use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering;
 use std::cell::Cell;
 
+use reverie_inguest::guest::alloc::FixedToolAllocator;
 use reverie_inguest::guest::alloc::GuestAllocator;
 use reverie_inguest::guest::alloc::PrivateToolAllocator;
-use reverie_inguest::guest::alloc::tool_heap_contains;
+use reverie_inguest::guest::alloc::fixed_copy_bytes;
+use reverie_inguest::guest::alloc::fixed_zero_bytes;
+use reverie_inguest::guest::tool_region::fixed_arena_backing;
 
 const PATCH_HEAP_BYTES: usize = 32 * 1024 * 1024;
 
@@ -38,8 +41,32 @@ impl PatchHeap {
         }
     }
 
+    fn span(&self) -> PatchSpan<'_> {
+        PatchSpan {
+            base: self.bytes.get().cast::<u8>() as usize,
+            next: &self.next,
+        }
+    }
+
     fn allocate(&self, layout: Layout) -> *mut u8 {
-        let base = self.bytes.get().cast::<u8>() as usize;
+        self.span().allocate(layout)
+    }
+
+    fn contains(&self, pointer: *mut u8) -> bool {
+        self.span().contains(pointer)
+    }
+}
+
+/// The same monotonic algorithm over either legacy or authenticated fixed storage.
+#[derive(Clone, Copy)]
+struct PatchSpan<'a> {
+    base: usize,
+    next: &'a AtomicUsize,
+}
+
+impl PatchSpan<'_> {
+    fn allocate(&self, layout: Layout) -> *mut u8 {
+        let base = self.base;
         let mut current = self.next.load(Ordering::Relaxed);
         loop {
             let Some(aligned_address) = base
@@ -67,9 +94,19 @@ impl PatchHeap {
     }
 
     fn contains(&self, pointer: *mut u8) -> bool {
-        let base = self.bytes.get().cast::<u8>() as usize;
+        let base = self.base;
         (base..base + PATCH_HEAP_BYTES).contains(&(pointer as usize))
     }
+}
+
+fn fixed_patch_heap() -> Option<PatchSpan<'static>> {
+    let backing = fixed_arena_backing()?;
+    Some(PatchSpan {
+        base: backing.patch_bottom,
+        // SAFETY: authentic published backing owns this process-lifetime
+        // atomic; PatchSpan advances it only through checked reservations.
+        next: unsafe { &*backing.patch_cursor },
+    })
 }
 
 static PATCH_HEAP: PatchHeap = PatchHeap::new();
@@ -101,10 +138,118 @@ pub(crate) fn fixture_installation_depth() -> usize {
     INSTALLATION_DEPTH.get()
 }
 
-#[cfg(feature = "allocator-fixture")]
-pub(crate) fn fixture_patch_heap_bounds() -> (usize, usize) {
+pub(crate) fn legacy_patch_heap_bounds() -> (usize, usize) {
     let base = PATCH_HEAP.bytes.get().cast::<u8>() as usize;
     (base, base + PATCH_HEAP_BYTES)
+}
+
+/// Select only the declared image's actual ready bounds; never acquire an
+/// allocator lock, reserve a region or substitute Legacy for unready Fixed.
+#[cfg(feature = "allocator-fixture")]
+pub(crate) fn fixture_selected_bounds() -> Option<((usize, usize), (usize, usize))> {
+    let selected = crate::allocator_backing::selected_backing().ok()?;
+    Some((selected.tool, selected.patch))
+}
+
+#[cfg(feature = "allocator-fixture")]
+pub(crate) struct FixtureBackingState {
+    pub(crate) kind: u64,
+    pub(crate) ready: bool,
+    pub(crate) tool: reverie_inguest::guest::alloc::ToolHeapFixtureState,
+    pub(crate) patch_base: usize,
+    pub(crate) patch_end: usize,
+    pub(crate) patch_next_address: usize,
+    pub(crate) patch_next: usize,
+}
+
+/// Feature-only observation of the existing selected backing. Descriptor
+/// kinds Legacy=1/Fixed=2 map to observation kinds 0/1, respectively. This
+/// adapter never selects an allocator or initializes/resets its metadata.
+#[cfg(feature = "allocator-fixture")]
+pub(crate) fn fixture_backing_state() -> Option<FixtureBackingState> {
+    use reverie_inguest::guest::alloc;
+    use reverie_inguest::guest::tool_region;
+
+    use crate::allocator_backing::FIXED;
+    use crate::allocator_backing::LEGACY;
+
+    let selected = match crate::allocator_backing::selected_backing() {
+        Ok(selected) => selected,
+        Err(error) if error.raw_os_error() == Some(libc::EAGAIN) => {
+            // selected_backing returns EAGAIN only for a valid Fixed descriptor
+            // whose owner is not ready. The shared wrapper exports status 1
+            // and never inspects these unused placeholders. No metadata getter
+            // or metadata dereference runs on this branch.
+            return Some(FixtureBackingState {
+                kind: 1,
+                ready: false,
+                tool: alloc::ToolHeapFixtureState {
+                    base: 0,
+                    end: 0,
+                    next_address: 0,
+                    next: 0,
+                    free_head_address: 0,
+                    free_head: 0,
+                    lock_address: 0,
+                    lock_held: false,
+                    head_address: 0,
+                    head_span: 0,
+                    head_next: 0,
+                },
+                patch_base: 0,
+                patch_end: 0,
+                patch_next_address: 0,
+                patch_next: 0,
+            });
+        }
+        Err(_) => return None,
+    };
+    let (kind, tool, patch_next_address, patch_next) = match selected.kind {
+        LEGACY => (
+            0,
+            alloc::fixture_tool_heap_state()?,
+            (&raw const PATCH_HEAP.next) as usize,
+            PATCH_HEAP.next.load(Ordering::Acquire),
+        ),
+        FIXED => {
+            let backing = tool_region::fixed_arena_backing()?;
+            let metadata = tool_region::fixture_fixed_arena_metadata()?;
+            let tool = alloc::fixture_fixed_tool_heap_state()?;
+            let patch_next_address = backing.patch_cursor as usize;
+            // Join independently returned actual cells and spans; no guessed
+            // metadata address is dereferenced by this observation adapter.
+            if selected.tool != (backing.tool_bottom, backing.tool_top)
+                || selected.patch != (backing.patch_bottom, backing.patch_top)
+                || tool.next_address != metadata.tool_cursor
+                || tool.free_head_address != metadata.tool_free_head
+                || tool.lock_address != metadata.tool_lock
+                || patch_next_address != metadata.patch_cursor
+            {
+                return None;
+            }
+            (
+                1,
+                tool,
+                patch_next_address,
+                // SAFETY: the authentic ready backing owns this live atomic;
+                // this diagnostic only samples it without mutation.
+                unsafe { (*backing.patch_cursor).load(Ordering::Acquire) },
+            )
+        }
+        _ => return None,
+    };
+    if selected.tool != (tool.base, tool.end) {
+        return None;
+    }
+    Some(FixtureBackingState {
+        kind,
+        ready: true,
+        tool,
+        patch_base: selected.patch.0,
+        patch_end: selected.patch.1,
+        patch_next_address,
+        patch_next,
+    })
 }
 
 /// Legacy allocator for embedded Tools: private during installation/dispatch,
@@ -115,6 +260,83 @@ pub struct PatchAllocator;
 /// Tool-owned arenas, independent of dispatch depth. Installation storage has
 /// process lifetime; other allocations can be reused after deallocation.
 pub struct PrivatePatchAllocator;
+
+/// Compiler allocator for a genuine preload with fixed Tool-owned backing.
+///
+/// Reservation belongs to authenticated startup, never to an allocator call.
+/// Before publication allocations return null; foreign or unready frees and
+/// reallocations refuse before reading any allocation header. Legacy embedded
+/// callers continue to select their explicit legacy allocator declarations.
+pub struct FixedPrivatePatchAllocator;
+
+impl FixedPrivatePatchAllocator {
+    /// Refuse an address outside this image's already-published fixed arenas.
+    /// This range check does not establish that the address is a live allocation.
+    #[doc(hidden)]
+    pub fn require_owned_address(address: usize) {
+        if !fixed_patch_heap().is_some_and(|heap| heap.contains(address as *mut u8)) {
+            FixedToolAllocator::require_owned_address(address);
+        }
+    }
+}
+
+// SAFETY: the two fixed spans are disjoint and authenticated before publication.
+// Metadata access uses the same locked/atomic algorithms as the legacy arenas.
+unsafe impl GlobalAlloc for FixedPrivatePatchAllocator {
+    #[inline(never)]
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let Some(patch) = fixed_patch_heap() else {
+            return ptr::null_mut();
+        };
+        if installation_active() {
+            patch.allocate(layout)
+        } else {
+            // SAFETY: the caller provides a valid allocation layout.
+            unsafe { FixedToolAllocator.alloc(layout) }
+        }
+    }
+
+    #[inline(never)]
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: the caller provides a valid allocation layout.
+        let pointer = unsafe { self.alloc(layout) };
+        if !pointer.is_null() {
+            // SAFETY: the returned allocation holds layout.size writable bytes.
+            unsafe { fixed_zero_bytes(pointer, layout.size()) };
+        }
+        pointer
+    }
+
+    #[inline(never)]
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        Self::require_owned_address(pointer as usize);
+        if !fixed_patch_heap().is_some_and(|heap| heap.contains(pointer)) {
+            // SAFETY: ownership was checked; the caller supplies the live layout.
+            unsafe { FixedToolAllocator.dealloc(pointer, layout) };
+        }
+        // Patch objects keep their original process-lifetime storage even when
+        // the installation scope which allocated them has already ended.
+    }
+
+    #[inline(never)]
+    unsafe fn realloc(&self, pointer: *mut u8, old: Layout, new_size: usize) -> *mut u8 {
+        Self::require_owned_address(pointer as usize);
+        let patch = fixed_patch_heap().filter(|heap| heap.contains(pointer));
+        let Some(patch) = patch else {
+            // SAFETY: ownership was checked; the caller supplies the live layout.
+            return unsafe { FixedToolAllocator.realloc(pointer, old, new_size) };
+        };
+        let Ok(layout) = Layout::from_size_align(new_size, old.align()) else {
+            return ptr::null_mut();
+        };
+        let replacement = patch.allocate(layout);
+        if !replacement.is_null() {
+            // SAFETY: monotonic patch allocations are disjoint and both are live.
+            unsafe { fixed_copy_bytes(pointer, replacement, old.size().min(new_size)) };
+        }
+        replacement
+    }
+}
 
 impl PrivatePatchAllocator {
     /// Check arbitrary-address backing-store ownership without dereferencing it.
@@ -131,13 +353,14 @@ impl PrivatePatchAllocator {
 /// Check the caller's compiler-selected allocator before any Tool installation
 /// effects. The caller holds a dispatch allocation scope for legacy roots.
 pub(crate) fn preflight_allocator() -> std::io::Result<()> {
+    let backing = crate::allocator_backing::selected_backing()?;
     let layout = Layout::new::<u64>();
     // SAFETY: a nonzero valid layout; freed below through the same allocator.
     let pointer = unsafe { std::alloc::alloc(layout) };
     if pointer.is_null() {
         return Err(std::io::Error::from_raw_os_error(libc::ENOMEM));
     }
-    let owned = PATCH_HEAP.contains(pointer) || tool_heap_contains(pointer);
+    let owned = backing.contains(pointer as usize);
     // SAFETY: pointer is the live allocation just returned by std::alloc.
     unsafe { std::alloc::dealloc(pointer, layout) };
     if owned {

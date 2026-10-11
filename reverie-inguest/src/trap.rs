@@ -208,6 +208,18 @@ pub unsafe fn raw_syscall6(number: i64, args: [u64; 6]) -> i64 {
     }
 }
 
+/// Scalar entry used while constructing unpublished Tool state. Keeping the
+/// arguments separate avoids compiler-generated aggregate copies through libc
+/// before the Tool is ready. This reaches the same trusted syscall gate.
+///
+/// # Safety
+/// The syscall arguments and original return stack must remain valid, exactly
+/// as for `raw_syscall6`; unused syscall arguments are zero.
+#[inline(never)]
+pub(crate) unsafe fn raw_syscall3(number: i64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
+    unsafe { reverie_inguest_trusted_syscall(number as u64, arg0, arg1, arg2, 0, 0, 0) }
+}
+
 /// Execute a guest syscall with its interrupted protection-key permissions.
 ///
 /// The kernel performs the actual copies, including partial transfers and real

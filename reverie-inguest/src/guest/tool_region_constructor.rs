@@ -109,6 +109,8 @@ const _: () = {
     assert!(RECORD_ADDRESS + size_of::<NativeRecord>() <= GENERIC_RECORD_ADDRESS);
     assert!(GENERIC_RECORD_ADDRESS & 15 == 0);
     assert!(GENERIC_RECORD_ADDRESS + size_of::<NativeRecord>() <= BASE + CONTROL_BYTES);
+    assert!(GENERIC_RECORD_ADDRESS + size_of::<NativeRecord>() <= arena::METADATA_ADDRESS);
+    assert!(STACK_EXTENT_END <= arena::TOOL_BOTTOM - PAGE);
     assert!(BASE + CONTROL_BYTES <= BASE + DATA_FIRST * PAGE);
     assert!(STACK_BOTTOM == BASE + 0x101000 && STACK_TOP == BASE + 0x901000);
     assert!(STACK_EXTENT_END == BASE + 0x902000);
@@ -318,7 +320,7 @@ macro_rules! native_bootstrap {
         "movq xmm6, r15",
         "movq xmm7, rdi",
         // A scalar BSS locator is explicitly outside the region claim. No
-        // contender spins or enters OnceLock while this gate is occupied.
+        // contender spins or starts publication while this gate is occupied.
         "xor eax, eax",
         "mov dl, 1",
         "lock cmpxchg byte ptr [rip + {initializing}], dl",
@@ -581,7 +583,7 @@ impl NativeFreshOwner {
         {
             return Err(libc::EINVAL);
         }
-        let current = unsafe { raw_syscall6(libc::SYS_gettid, [0; 6]) };
+        let current = unsafe { crate::trap::raw_syscall3(libc::SYS_gettid, 0, 0, 0) };
         let record_ref = unsafe { &*record };
         if current <= 0
             || record_ref.owner_tid != current as usize
@@ -606,19 +608,27 @@ impl NativeFreshOwner {
         {
             return Err(libc::EINVAL);
         }
+        // Both origins supply authenticated fresh native ownership. Complete
+        // payload protections/scalar metadata/permanent bands before READY or
+        // any body allocation; failure keeps the native owned stack in place.
+        unsafe { arena::initialize_fixed_arenas((BASE + PAGE) as *mut Control) }?;
         Ok(Self { record, origin })
     }
 
     fn publish(self) -> Result<&'static ToolRegion, i32> {
-        REGION
-            .set(Ok(ToolRegion {
+        // SAFETY: self retains the native prefix's exclusive INITIALIZING
+        // ownership from its successful CAS. from_native authenticated this
+        // fresh owner and completed arena setup without releasing that gate.
+        unsafe {
+            REGION.set_under_gate(Ok(ToolRegion {
                 control: (BASE + PAGE) as *mut Control,
                 bootstrap: Some(BootstrapOwner {
                     origin: self.origin,
                     address: self.record as usize,
                 }),
             }))
-            .map_err(|_| libc::EAGAIN)?;
+        }
+        .map_err(|_| libc::EAGAIN)?;
         unsafe { &(*self.record).phase }.store(READY, Ordering::Release);
         INITIALIZING.store(false, Ordering::Release);
         REGION

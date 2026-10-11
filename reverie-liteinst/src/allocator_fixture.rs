@@ -18,6 +18,7 @@ const ALLOCATION_FAILED: u64 = 2;
 const BUSY: u64 = 3;
 const REGISTRY_FULL: u64 = 4;
 const UNKNOWN_ALLOCATION: u64 = 5;
+const NOT_READY: u64 = 6;
 const SLOTS: usize = 32;
 
 #[repr(C)]
@@ -89,16 +90,14 @@ fn depths() -> (u64, u64) {
     )
 }
 
-fn bounds() -> ((usize, usize), (usize, usize)) {
-    (
-        reverie_inguest::guest::alloc::fixture_tool_heap_bounds(),
-        crate::patch_alloc::fixture_patch_heap_bounds(),
-    )
+fn bounds() -> Option<((usize, usize), (usize, usize))> {
+    crate::patch_alloc::fixture_selected_bounds()
 }
 
 fn private_member(address: usize) -> bool {
-    let (tool, patch) = bounds();
-    (tool.0..tool.1).contains(&address) || (patch.0..patch.1).contains(&address)
+    bounds().is_some_and(|(tool, patch)| {
+        (tool.0..tool.1).contains(&address) || (patch.0..patch.1).contains(&address)
+    })
 }
 
 fn initial(size: usize, align: usize) -> M1Result {
@@ -143,7 +142,18 @@ pub unsafe extern "C" fn m1_query(output: *mut M1Query) -> u64 {
         return INVALID;
     }
     let (installation_depth, dispatch_depth) = depths();
-    let (tool, patch) = bounds();
+    let Some((tool, patch)) = bounds() else {
+        let result = M1Query {
+            abi_version: ABI_VERSION,
+            status: NOT_READY,
+            installation_depth,
+            dispatch_depth,
+            ..M1Query::default()
+        };
+        // SAFETY: the caller supplies one complete writable query record.
+        unsafe { output.write(result) };
+        return NOT_READY;
+    };
     let mut result = M1Query {
         abi_version: ABI_VERSION,
         installation_depth,

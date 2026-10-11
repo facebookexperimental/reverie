@@ -13,11 +13,12 @@
 //! allocations are therefore isolated from libc until they are released or
 //! the process exits.
 //!
-//! The arena is zero-initialized and page-aligned, so the loader places it in
+//! Legacy storage is zero-initialized and page-aligned, so the loader places it in
 //! anonymous memory (`.bss`) rather than in a mapping of the file that holds
 //! it. A backend that reads an object's file mappings for code addresses
 //! (LiteInst's entry census) therefore never finds the runtime's own state
-//! there, wherever the runtime is linked.
+//! there, wherever the runtime is linked. Explicit fixed consumers instead use
+//! already-published ToolRegion storage, with no allocator-triggered setup.
 
 use core::alloc::GlobalAlloc;
 use core::alloc::Layout;
@@ -31,7 +32,7 @@ use core::sync::atomic::Ordering;
 use std::alloc::System;
 use std::cell::Cell;
 
-const TOOL_HEAP_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const TOOL_HEAP_BYTES: usize = 32 * 1024 * 1024;
 /// Ends a free list. No block starts at offset 0 (the bump cursor starts past
 /// it), so this can be 0 and the whole heap's initial value is zero.
 const FREE_LIST_END: usize = 0;
@@ -50,24 +51,52 @@ struct ToolHeapBlock {
 const MIN_FREE_SPAN: usize = (size_of::<ToolHeapBlock>() + size_of::<usize>() + 1)
     .next_multiple_of(align_of::<ToolHeapBlock>());
 
-/// Reusable storage for allocations made while the guest allocator is interrupted.
-struct ToolHeap {
-    bytes: UnsafeCell<ToolHeapBytes>,
-    next: UnsafeCell<usize>,
-    free_head: UnsafeCell<usize>,
-    locked: AtomicBool,
+/// Scalar state shared by the Legacy and Fixed reusable algorithms.
+#[repr(C)]
+pub(crate) struct ToolHeapMetadata {
+    pub(crate) next: UnsafeCell<usize>,
+    pub(crate) free_head: UnsafeCell<usize>,
+    pub(crate) locked: AtomicBool,
 }
 
-// SAFETY: every metadata access is serialized by `locked`.
+// SAFETY: cursor/free-list accesses hold this metadata's own lock.
+unsafe impl Sync for ToolHeapMetadata {}
+
+impl ToolHeapMetadata {
+    const fn new() -> Self {
+        Self {
+            next: UnsafeCell::new(0),
+            free_head: UnsafeCell::new(FREE_LIST_END),
+            locked: AtomicBool::new(false),
+        }
+    }
+
+    /// Initialize only authenticated fresh, unpublished anonymous storage.
+    pub(crate) unsafe fn initialize_at(address: *mut Self) {
+        // SAFETY: the fresh owner exclusively owns writable aligned storage.
+        // Individual scalar stores avoid constructing any arena/bitmap value.
+        unsafe {
+            ptr::addr_of_mut!((*address).next).write(UnsafeCell::new(0));
+            ptr::addr_of_mut!((*address).free_head).write(UnsafeCell::new(FREE_LIST_END));
+            ptr::addr_of_mut!((*address).locked).write(AtomicBool::new(false));
+        }
+    }
+}
+
+/// Legacy BSS ownership stays separate from the allocation algorithm.
+struct ToolHeap {
+    bytes: UnsafeCell<ToolHeapBytes>,
+    metadata: ToolHeapMetadata,
+}
+
+// SAFETY: the shared span algorithm serializes this heap's scalar state.
 unsafe impl Sync for ToolHeap {}
 
 impl ToolHeap {
     const fn new() -> Self {
         Self {
             bytes: UnsafeCell::new(ToolHeapBytes([0; TOOL_HEAP_BYTES])),
-            next: UnsafeCell::new(0),
-            free_head: UnsafeCell::new(FREE_LIST_END),
-            locked: AtomicBool::new(false),
+            metadata: ToolHeapMetadata::new(),
         }
     }
 
@@ -76,19 +105,52 @@ impl ToolHeap {
         unsafe { ptr::addr_of_mut!((*self.bytes.get()).0).cast::<u8>() }
     }
 
+    fn span(&self) -> ToolHeapSpan<'_> {
+        ToolHeapSpan {
+            base: self.base(),
+            bytes: TOOL_HEAP_BYTES,
+            metadata: &self.metadata,
+        }
+    }
+
+    fn allocate(&self, layout: Layout) -> *mut u8 {
+        self.span().allocate(layout)
+    }
+
+    unsafe fn deallocate(&self, pointer: *mut u8) {
+        // SAFETY: the caller supplies a live allocation from this heap.
+        unsafe { self.span().deallocate(pointer) };
+    }
+
+    fn contains(&self, pointer: *mut u8) -> bool {
+        self.span().contains(pointer)
+    }
+}
+
+/// Borrowed storage and its scalar state; never owns/copies the byte arena.
+pub(crate) struct ToolHeapSpan<'a> {
+    pub(crate) base: *mut u8,
+    pub(crate) bytes: usize,
+    pub(crate) metadata: &'a ToolHeapMetadata,
+}
+
+impl ToolHeapSpan<'_> {
     fn lock(&self) -> ToolHeapLock<'_> {
         while self
+            .metadata
             .locked
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
             core::hint::spin_loop();
         }
-        ToolHeapLock { heap: self }
+        ToolHeapLock {
+            metadata: self.metadata,
+        }
     }
 
     fn layout_end(&self, block_offset: usize, layout: Layout) -> Option<(*mut u8, usize)> {
-        let base = self.base() as usize;
+        let base = self.base as usize;
         let block_address = base.checked_add(block_offset)?;
         let payload_start = block_address
             .checked_add(size_of::<ToolHeapBlock>())?
@@ -100,14 +162,14 @@ impl ToolHeap {
     }
 
     fn block(&self, offset: usize) -> *mut ToolHeapBlock {
-        self.base().wrapping_add(offset).cast()
+        self.base.wrapping_add(offset).cast()
     }
 
     fn allocate(&self, layout: Layout) -> *mut u8 {
         let _guard = self.lock();
         let mut previous = FREE_LIST_END;
         // SAFETY: the heap lock serializes free-list access.
-        let mut current = unsafe { *self.free_head.get() };
+        let mut current = unsafe { *self.metadata.free_head.get() };
 
         while current != FREE_LIST_END {
             let block = self.block(current);
@@ -136,7 +198,7 @@ impl ToolHeap {
                         next
                     };
                     if previous == FREE_LIST_END {
-                        *self.free_head.get() = replacement;
+                        *self.metadata.free_head.get() = replacement;
                     } else {
                         (*self.block(previous)).next = replacement;
                     }
@@ -152,7 +214,7 @@ impl ToolHeap {
         }
 
         // SAFETY: the heap lock serializes bump-cursor access.
-        let cursor = unsafe { *self.next.get() };
+        let cursor = unsafe { *self.metadata.next.get() };
         // Offset 0 stays unused: it is FREE_LIST_END.
         let Some(block_offset) = align_up(cursor.max(1), align_of::<ToolHeapBlock>()) else {
             return ptr::null_mut();
@@ -160,7 +222,7 @@ impl ToolHeap {
         let Some((pointer, end)) = self.layout_end(block_offset, layout) else {
             return ptr::null_mut();
         };
-        if end > TOOL_HEAP_BYTES {
+        if end > self.bytes {
             return ptr::null_mut();
         }
 
@@ -174,7 +236,7 @@ impl ToolHeap {
                 .sub(size_of::<usize>())
                 .cast::<usize>()
                 .write(block_offset);
-            *self.next.get() = end;
+            *self.metadata.next.get() = end;
         }
         pointer
     }
@@ -188,7 +250,7 @@ impl ToolHeap {
         // only the immediate free neighbors, never across a live allocation.
         unsafe {
             let mut previous = FREE_LIST_END;
-            let mut next = *self.free_head.get();
+            let mut next = *self.metadata.free_head.get();
             while next != FREE_LIST_END && next < block_offset {
                 previous = next;
                 next = (*self.block(next)).next;
@@ -196,7 +258,7 @@ impl ToolHeap {
             let block = self.block(block_offset);
             (*block).next = next;
             if previous == FREE_LIST_END {
-                *self.free_head.get() = block_offset;
+                *self.metadata.free_head.get() = block_offset;
             } else {
                 (*self.block(previous)).next = block_offset;
             }
@@ -224,13 +286,13 @@ impl ToolHeap {
     }
 
     fn contains(&self, pointer: *mut u8) -> bool {
-        let base = self.base() as usize;
-        (base..base + TOOL_HEAP_BYTES).contains(&(pointer as usize))
+        let base = self.base as usize;
+        (base..base + self.bytes).contains(&(pointer as usize))
     }
 }
 
 struct ToolHeapLock<'a> {
-    heap: &'a ToolHeap,
+    metadata: &'a ToolHeapMetadata,
 }
 
 thread_local! {
@@ -278,12 +340,105 @@ pub fn fixture_dispatch_depth() -> usize {
     DISPATCH_DEPTH.get()
 }
 
-/// Half-open bounds of the backing storage used by the actual Tool allocator.
+/// Actual Legacy BSS bounds without allocation or region initialization.
+#[doc(hidden)]
+pub fn legacy_tool_heap_bounds() -> (usize, usize) {
+    let base = TOOL_HEAP.base() as usize;
+    (base, base + TOOL_HEAP_BYTES)
+}
+
+/// Half-open bounds of the backing storage used by the Legacy Tool allocator.
 #[cfg(feature = "allocator-fixture")]
 #[doc(hidden)]
 pub fn fixture_tool_heap_bounds() -> (usize, usize) {
-    let base = TOOL_HEAP.base() as usize;
-    (base, base + TOOL_HEAP_BYTES)
+    legacy_tool_heap_bounds()
+}
+
+#[cfg(feature = "allocator-fixture")]
+#[doc(hidden)]
+#[allow(missing_docs)]
+#[derive(Clone, Copy)]
+pub struct ToolHeapFixtureState {
+    pub base: usize,
+    pub end: usize,
+    pub next_address: usize,
+    pub next: usize,
+    pub free_head_address: usize,
+    pub free_head: usize,
+    pub lock_address: usize,
+    pub lock_held: bool,
+    pub head_address: usize,
+    pub head_span: usize,
+    pub head_next: usize,
+}
+
+/// Snapshot a real span without allocation, initialization or route changes.
+/// Busy or malformed metadata refuses; only one validated head is read, under
+/// this span's actual allocator lock. The lock sample includes this query.
+#[cfg(feature = "allocator-fixture")]
+fn fixture_span_state(heap: ToolHeapSpan<'_>) -> Option<ToolHeapFixtureState> {
+    heap.metadata
+        .locked
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .ok()?;
+    let _guard = ToolHeapLock {
+        metadata: heap.metadata,
+    };
+    // SAFETY: this span's actual allocator lock serializes the scalar reads.
+    let (next, free_head) = unsafe { (*heap.metadata.next.get(), *heap.metadata.free_head.get()) };
+    let (mut head_address, mut head_span, mut head_next) = (0, 0, 0);
+    if free_head != FREE_LIST_END {
+        if free_head % align_of::<ToolHeapBlock>() != 0
+            || free_head > heap.bytes.checked_sub(size_of::<ToolHeapBlock>())?
+        {
+            return None;
+        }
+        // SAFETY: exactly one real head header, under the selected allocator
+        // lock, after checking its offset, alignment and complete header span.
+        let block = heap.block(free_head);
+        (head_span, head_next) = unsafe { ((*block).span, (*block).next) };
+        let end = free_head.checked_add(head_span)?;
+        if head_span < MIN_FREE_SPAN
+            || end > heap.bytes
+            || end % align_of::<ToolHeapBlock>() != 0
+            || (head_next != FREE_LIST_END
+                && (head_next < end
+                    || head_next % align_of::<ToolHeapBlock>() != 0
+                    || head_next > heap.bytes - size_of::<ToolHeapBlock>()))
+        {
+            return None;
+        }
+        head_address = block as usize;
+    }
+    let base = heap.base as usize;
+    Some(ToolHeapFixtureState {
+        base,
+        end: base.checked_add(heap.bytes)?,
+        next_address: heap.metadata.next.get() as usize,
+        next,
+        free_head_address: heap.metadata.free_head.get() as usize,
+        free_head,
+        lock_address: (&raw const heap.metadata.locked) as usize,
+        lock_held: heap.metadata.locked.load(Ordering::Relaxed),
+        head_address,
+        head_span,
+        head_next,
+    })
+}
+
+/// Observe the actual Legacy BSS allocator state without selecting backing.
+#[cfg(feature = "allocator-fixture")]
+#[doc(hidden)]
+pub fn fixture_tool_heap_state() -> Option<ToolHeapFixtureState> {
+    fixture_span_state(TOOL_HEAP.span())
+}
+
+/// Observe Fixed state only after authentic completed owner publication.
+/// No metadata address is guessed or dereferenced before readiness.
+#[cfg(feature = "allocator-fixture")]
+#[doc(hidden)]
+pub fn fixture_fixed_tool_heap_state() -> Option<ToolHeapFixtureState> {
+    fixture_span_state(super::tool_region::fixed_tool_heap()?)
 }
 
 fn dispatch_active() -> bool {
@@ -357,6 +512,133 @@ unsafe impl GlobalAlloc for PrivateToolAllocator {
             unsafe {
                 ptr::copy_nonoverlapping(pointer, replacement, old.size().min(new_size));
                 TOOL_HEAP.deallocate(pointer);
+            }
+        }
+        replacement
+    }
+}
+
+/// Reusable allocation from an already-published fixed ToolRegion arena.
+///
+/// Allocation before completed publication or after exhaustion returns null.
+/// This allocator never initializes a reservation or chooses BSS/System. Its
+/// contents and scalar metadata inherit through COW on a quiescent plain fork;
+/// an inherited held lock is not reset or advertised as supported.
+pub struct FixedToolAllocator;
+
+impl FixedToolAllocator {
+    /// Refuse unready ownership or a foreign address before any header read.
+    /// GlobalAlloc callers must still provide a live allocation and its layout.
+    #[doc(hidden)]
+    pub fn require_owned_address(address: usize) {
+        let Some(heap) = super::tool_region::fixed_tool_heap() else {
+            refuse_foreign_allocation();
+        };
+        if !heap.contains(address as *mut u8) {
+            refuse_foreign_allocation();
+        }
+    }
+
+    fn owned_heap(address: usize) -> ToolHeapSpan<'static> {
+        let Some(heap) = super::tool_region::fixed_tool_heap() else {
+            refuse_foreign_allocation();
+        };
+        if !heap.contains(address as *mut u8) {
+            refuse_foreign_allocation();
+        }
+        heap
+    }
+}
+
+/// Membership in the actual ready Fixed reusable span, without initialization.
+#[doc(hidden)]
+pub fn fixed_tool_heap_contains(pointer: *const u8) -> bool {
+    super::tool_region::fixed_tool_heap().is_some_and(|heap| heap.contains(pointer.cast_mut()))
+}
+
+/// Clear a live Fixed allocation without an interposable libc memory call.
+///
+/// # Safety
+/// `pointer` must cover `length` writable bytes. The caller must obey the
+/// x86-64 SysV clear-direction-flag contract used by all Rust Tool entries.
+#[doc(hidden)]
+#[inline(never)]
+pub unsafe fn fixed_zero_bytes(pointer: *mut u8, length: usize) {
+    // SAFETY: the valid writable range and clear DF are caller requirements.
+    // REP changes only the declared index/count registers, preserving flags.
+    unsafe {
+        core::arch::asm!(
+            "rep stosb",
+            in("al") 0_u8,
+            inout("rdi") pointer => _,
+            inout("rcx") length => _,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Copy live disjoint Fixed allocations without an interposable libc call.
+///
+/// # Safety
+/// `source` and `destination` must cover `length` readable and writable bytes,
+/// respectively, and must not overlap. The caller must obey the x86-64 SysV
+/// clear-direction-flag contract used by all Rust Tool entries.
+#[doc(hidden)]
+#[inline(never)]
+pub unsafe fn fixed_copy_bytes(source: *const u8, destination: *mut u8, length: usize) {
+    // SAFETY: the two valid disjoint ranges and clear DF are caller requirements.
+    unsafe {
+        core::arch::asm!(
+            "rep movsb",
+            inout("rsi") source => _,
+            inout("rdi") destination => _,
+            inout("rcx") length => _,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+// SAFETY: the same serialized span algorithm honors Layout, and every free or
+// realloc authenticates ready backing/range before touching a block header.
+unsafe impl GlobalAlloc for FixedToolAllocator {
+    #[inline(never)]
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let Some(heap) = super::tool_region::fixed_tool_heap() else {
+            return ptr::null_mut();
+        };
+        heap.allocate(layout)
+    }
+
+    #[inline(never)]
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let pointer = unsafe { self.alloc(layout) };
+        if !pointer.is_null() {
+            // SAFETY: pointer covers layout.size writable bytes.
+            unsafe { fixed_zero_bytes(pointer, layout.size()) };
+        }
+        pointer
+    }
+
+    #[inline(never)]
+    unsafe fn dealloc(&self, pointer: *mut u8, _layout: Layout) {
+        let heap = Self::owned_heap(pointer as usize);
+        // SAFETY: the caller supplies a live allocation from this ready span.
+        unsafe { heap.deallocate(pointer) };
+    }
+
+    #[inline(never)]
+    unsafe fn realloc(&self, pointer: *mut u8, old: Layout, new_size: usize) -> *mut u8 {
+        let heap = Self::owned_heap(pointer as usize);
+        let Ok(layout) = Layout::from_size_align(new_size, old.align()) else {
+            return ptr::null_mut();
+        };
+        let replacement = heap.allocate(layout);
+        if !replacement.is_null() {
+            // SAFETY: live allocations are disjoint. Failure leaves the source
+            // live, exactly as in the Legacy reusable allocator.
+            unsafe {
+                fixed_copy_bytes(pointer, replacement, old.size().min(new_size));
+                heap.deallocate(pointer);
             }
         }
         replacement
@@ -441,7 +723,7 @@ unsafe impl GlobalAlloc for GuestAllocator {
 
 impl Drop for ToolHeapLock<'_> {
     fn drop(&mut self) {
-        self.heap.locked.store(false, Ordering::Release);
+        self.metadata.locked.store(false, Ordering::Release);
     }
 }
 

@@ -4,8 +4,7 @@ use std::alloc::GlobalAlloc;
 use std::alloc::Layout;
 use std::alloc::System;
 
-#[global_allocator]
-static ALLOCATOR: reverie_liteinst::PrivateToolAllocator = reverie_liteinst::PrivateToolAllocator;
+reverie_liteinst::declare_legacy_private_tool_allocator!();
 
 fn main() {
     let mode = std::env::args()

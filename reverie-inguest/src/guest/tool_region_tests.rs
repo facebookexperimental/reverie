@@ -597,13 +597,61 @@ fn rounding_invalid_sizes_and_real_bitmap_exhaustion() {
         );
         drop(one);
         drop(two);
-        let available = DATA_END - DATA_FIRST;
+        // Exhaust the same complete real bitmap, now partitioned by the two
+        // permanent arena/guard bands. No searchable capacity is hidden.
+        let bands = [(65535, 73729), (81919, 90113)];
+        assert_eq!(bands, [arena::TOOL_BAND, arena::PATCH_BAND]);
+        let searchable = DATA_END - DATA_FIRST;
+        assert_eq!(searchable, 1048319);
+        {
+            let mut held = region.lock().unwrap();
+            let bitmap = held.bitmap();
+            for page in DATA_FIRST..DATA_END {
+                let permanent = bands
+                    .iter()
+                    .any(|&(start, end)| start <= page && page < end);
+                assert_eq!(
+                    bitmap[page / 64] & (1_u64 << (page % 64)) != 0,
+                    permanent,
+                    "unexpected initial ownership bit {page}"
+                );
+            }
+        }
+        let free = [(256, 65535), (73729, 81919), (90113, 1048575)];
+        let lengths = [65279, 8190, 958462];
+        let available: usize = lengths.iter().sum();
+        let permanent: usize = bands.iter().map(|&(start, end)| end - start).sum();
+        assert_eq!(available, 1031931);
+        assert_eq!(permanent, 8194 + 8194);
+        assert_eq!(available + permanent, searchable);
         assert_eq!(
-            region.claim(available + 1).unwrap_err().raw_os_error(),
+            region.claim(searchable + 1).unwrap_err().raw_os_error(),
             Some(libc::ENOMEM)
         );
-        assert_eq!(region.claim(available).unwrap(), DATA_FIRST);
-        assert!(owns(region, DATA_FIRST, available));
+        assert_eq!(
+            region.claim(available).unwrap_err().raw_os_error(),
+            Some(libc::ENOMEM),
+            "total free capacity is not one contiguous extent"
+        );
+        for (index, ((start, end), length)) in free.into_iter().zip(lengths).enumerate() {
+            assert_eq!(end - start, length);
+            assert_eq!(region.claim(length).unwrap(), start);
+            assert!(owns(region, start, length));
+            let mut held = region.lock().unwrap();
+            let bitmap = held.bitmap();
+            for page in DATA_FIRST..DATA_END {
+                let expected = bands.iter().any(|&(low, high)| low <= page && page < high)
+                    || free[..=index]
+                        .iter()
+                        .any(|&(low, high)| low <= page && page < high);
+                assert_eq!(
+                    bitmap[page / 64] & (1_u64 << (page % 64)) != 0,
+                    expected,
+                    "unexpected ownership after band {index}: bit {page}"
+                );
+            }
+        }
+        assert!(owns(region, DATA_FIRST, searchable));
         assert_eq!(
             region.claim(1).unwrap_err().raw_os_error(),
             Some(libc::ENOMEM)
@@ -615,6 +663,14 @@ fn rounding_invalid_sizes_and_real_bitmap_exhaustion() {
         // This exercises the full real bitmap, not a synthetic small capacity.
         // No four-GiB mprotect or write occurs: a formerly virgin page faults.
         guard(BASE + (DATA_FIRST + 64) * PAGE);
+        for bottom in [arena::TOOL_BOTTOM, arena::PATCH_BOTTOM] {
+            assert_eq!(permissions_at(bottom), "rw-p");
+            assert_eq!(permissions_at(bottom + arena::ARENA_BYTES - 1), "rw-p");
+            for address in [bottom - PAGE, bottom + arena::ARENA_BYTES] {
+                assert_eq!(permissions_at(address), "---p");
+                guard(address);
+            }
+        }
     });
 }
 
@@ -856,6 +912,315 @@ fn plain_fork_preserves_private_cow_contents_and_allocator_ownership() {
                 "child bitmap writes must be COW too"
             );
             assert_eq!(unsafe { core::ptr::read_volatile(address) }, 0x19);
+        },
+    );
+}
+
+fn fixed_refusal(address: usize, realloc: bool) {
+    use core::alloc::GlobalAlloc;
+    use core::alloc::Layout;
+
+    use super::super::alloc::FixedToolAllocator;
+
+    let pid = raw(libc::SYS_fork, [0; 6]);
+    assert!(pid >= 0, "raw fork failed: {pid}");
+    if pid == 0 {
+        let layout = Layout::from_size_align(8, 8).unwrap();
+        // Deliberately invalid GlobalAlloc pointers test the reject-only gate.
+        // No header or payload at these addresses may be dereferenced.
+        unsafe {
+            if realloc {
+                FixedToolAllocator.realloc(address as *mut u8, layout, 16);
+            } else {
+                FixedToolAllocator.dealloc(address as *mut u8, layout);
+            }
+        }
+        raw_exit(90);
+    }
+    let status = wait_raw(pid);
+    assert!(
+        libc::WIFEXITED(status),
+        "refusal read a header: {status:#x}"
+    );
+    assert_eq!(libc::WEXITSTATUS(status), 127);
+}
+
+#[test]
+fn fixed_allocator_readiness_and_foreign_headers_refuse() {
+    isolated(
+        "fixed_allocator_readiness_and_foreign_headers_refuse",
+        || {
+            use core::alloc::GlobalAlloc;
+            use core::alloc::Layout;
+
+            use super::super::alloc::FixedToolAllocator;
+            use super::super::alloc::PrivateToolAllocator;
+            use super::super::alloc::fixed_tool_heap_contains;
+
+            let layout = Layout::from_size_align(64, 64).unwrap();
+            assert!(fixed_arena_backing().is_none());
+            assert!(arena::metadata_addresses().is_none());
+            assert!(!fixed_tool_heap_contains(arena::TOOL_BOTTOM as *const u8));
+            assert!(unsafe { FixedToolAllocator.alloc(layout) }.is_null());
+            assert!(unsafe { FixedToolAllocator.alloc_zeroed(layout) }.is_null());
+            // Even a guessed address inside the future arena must refuse before
+            // reading the unmapped backpointer while authentic publication is absent.
+            fixed_refusal(arena::TOOL_BOTTOM + 32, false);
+            fixed_refusal(arena::TOOL_BOTTOM + 32, true);
+
+            let region = ToolRegion::reserve().unwrap();
+            let backing = fixed_arena_backing().unwrap();
+            assert_eq!(backing.tool_bottom, arena::TOOL_BOTTOM);
+            assert_eq!(backing.tool_top, arena::TOOL_BOTTOM + arena::ARENA_BYTES);
+            assert_eq!(backing.patch_bottom, arena::PATCH_BOTTOM);
+            assert_eq!(backing.patch_top, arena::PATCH_BOTTOM + arena::ARENA_BYTES);
+            assert!(owns(region, arena::TOOL_BAND.0, 8194));
+            assert!(owns(region, arena::PATCH_BAND.0, 8194));
+            assert!(!fixed_tool_heap_contains(backing.tool_top as *const u8));
+            fixed_refusal(backing.tool_bottom - PAGE + 32, false);
+            fixed_refusal(backing.tool_bottom - PAGE + 32, true);
+            let legacy = unsafe { PrivateToolAllocator.alloc(layout) };
+            assert!(!legacy.is_null());
+            assert!(!fixed_tool_heap_contains(legacy));
+            fixed_refusal(legacy as usize, false);
+            fixed_refusal(legacy as usize, true);
+            unsafe { PrivateToolAllocator.dealloc(legacy, layout) };
+        },
+    );
+}
+
+#[test]
+fn fixed_reusable_allocations_preserve_alignment_reuse_and_failed_realloc() {
+    isolated(
+        "fixed_reusable_allocations_preserve_alignment_reuse_and_failed_realloc",
+        || {
+            use core::alloc::GlobalAlloc;
+            use core::alloc::Layout;
+
+            use super::super::alloc::FixedToolAllocator;
+            use super::super::alloc::fixed_tool_heap_contains;
+            use super::super::alloc::tool_heap_contains;
+
+            ToolRegion::reserve().unwrap();
+            let addresses = arena::metadata_addresses().unwrap();
+            for address in [
+                addresses.tool_cursor,
+                addresses.tool_free_head,
+                addresses.tool_lock,
+                addresses.patch_cursor,
+            ] {
+                assert!(
+                    (arena::METADATA_ADDRESS..arena::METADATA_ADDRESS + PAGE).contains(&address)
+                );
+            }
+            let backing = fixed_arena_backing().unwrap();
+            assert_eq!(addresses.patch_cursor, backing.patch_cursor as usize);
+            assert_eq!(
+                unsafe { (*backing.patch_cursor).load(Ordering::Acquire) },
+                0
+            );
+            let layout = Layout::from_size_align(257, 4096).unwrap();
+            let pointer = unsafe { FixedToolAllocator.alloc_zeroed(layout) };
+            assert!(!pointer.is_null());
+            assert!(fixed_tool_heap_contains(pointer));
+            assert!(!tool_heap_contains(pointer));
+            assert_eq!(pointer as usize % layout.align(), 0);
+            assert!(pointer as usize + layout.size() <= backing.tool_top);
+            for index in 0..layout.size() {
+                assert_eq!(unsafe { pointer.add(index).read() }, 0);
+                unsafe { pointer.add(index).write(index as u8) };
+            }
+            let failed =
+                unsafe { FixedToolAllocator.realloc(pointer, layout, arena::ARENA_BYTES + 1) };
+            assert!(failed.is_null());
+            for index in 0..layout.size() {
+                assert_eq!(unsafe { pointer.add(index).read() }, index as u8);
+            }
+            let grown = unsafe { FixedToolAllocator.realloc(pointer, layout, 8192) };
+            assert!(!grown.is_null());
+            assert_eq!(grown as usize % layout.align(), 0);
+            for index in 0..layout.size() {
+                assert_eq!(unsafe { grown.add(index).read() }, index as u8);
+            }
+            unsafe {
+                FixedToolAllocator.dealloc(grown, Layout::from_size_align(8192, 4096).unwrap());
+            }
+            let reused = unsafe { FixedToolAllocator.alloc(layout) };
+            assert_eq!(reused, pointer);
+            // These are actual cells used by the shared algorithm, read only while
+            // this isolated owner is quiescent; neither address is a guessed span.
+            assert!(unsafe { (addresses.tool_cursor as *const usize).read() } > layout.size());
+            assert_ne!(
+                unsafe { (addresses.tool_free_head as *const usize).read() },
+                0
+            );
+            unsafe { FixedToolAllocator.dealloc(reused, layout) };
+        },
+    );
+}
+
+#[test]
+fn fixed_payloads_and_scalar_metadata_inherit_without_reset_on_plain_fork() {
+    isolated(
+        "fixed_payloads_and_scalar_metadata_inherit_without_reset_on_plain_fork",
+        || {
+            use core::alloc::GlobalAlloc;
+            use core::alloc::Layout;
+
+            use super::super::alloc::FixedToolAllocator;
+
+            ToolRegion::reserve().unwrap();
+            let backing = fixed_arena_backing().unwrap();
+            let layout = Layout::from_size_align(64, 64).unwrap();
+            let live = unsafe { FixedToolAllocator.alloc(layout) };
+            let free = unsafe { FixedToolAllocator.alloc(layout) };
+            assert!(!live.is_null() && !free.is_null());
+            unsafe {
+                live.write(0x19);
+                FixedToolAllocator.dealloc(free, layout);
+                (backing.patch_bottom as *mut u8).write(0x27);
+            }
+            // SAFETY: the isolated control advances this authentic fresh cursor
+            // past the deliberately initialized patch payload, never backwards.
+            unsafe { (*backing.patch_cursor).store(64, Ordering::Release) };
+            // No reusable/bitmap lock is held across this supported quiescent fork.
+            let pid = raw(libc::SYS_fork, [0; 6]);
+            assert!(pid >= 0, "raw fork failed: {pid}");
+            if pid == 0 {
+                let Some(child) = fixed_arena_backing() else {
+                    raw_exit(91)
+                };
+                if unsafe { (*child.patch_cursor).load(Ordering::Acquire) } != 64
+                    || unsafe { live.read() } != 0x19
+                    || unsafe { (child.patch_bottom as *const u8).read() } != 0x27
+                {
+                    raw_exit(92);
+                }
+                let reused = unsafe { FixedToolAllocator.alloc(layout) };
+                if reused != free {
+                    raw_exit(93);
+                }
+                unsafe {
+                    reused.write(0xa6);
+                    live.write(0xe8);
+                    (child.patch_bottom as *mut u8).write(0xb4);
+                }
+                // SAFETY: only the isolated child's private COW cursor advances.
+                unsafe { (*child.patch_cursor).store(128, Ordering::Release) };
+                raw_exit(0);
+            }
+            let status = wait_raw(pid);
+            assert!(libc::WIFEXITED(status), "COW child status: {status:#x}");
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+            assert_eq!(unsafe { live.read() }, 0x19);
+            assert_eq!(unsafe { (backing.patch_bottom as *const u8).read() }, 0x27);
+            assert_eq!(
+                unsafe { (*backing.patch_cursor).load(Ordering::Acquire) },
+                64
+            );
+            let reused = unsafe { FixedToolAllocator.alloc(layout) };
+            assert_eq!(reused, free, "child free-list mutation must be COW");
+            unsafe {
+                FixedToolAllocator.dealloc(reused, layout);
+                FixedToolAllocator.dealloc(live, layout);
+            }
+        },
+    );
+}
+
+#[test]
+fn ordinary_reserve_retains_collision_errno_after_owned_unmap() {
+    isolated(
+        "ordinary_reserve_retains_collision_errno_after_owned_unmap",
+        || {
+            let occupant = map(
+                BASE,
+                2 * PAGE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_FIXED_NOREPLACE,
+            );
+            assert_eq!(occupant, BASE);
+            // SAFETY: these two pages belong only to this isolated child.
+            unsafe {
+                core::ptr::write_volatile(occupant as *mut u8, 0x35);
+                core::ptr::write_volatile((occupant + PAGE) as *mut u8, 0xe2);
+            }
+            assert_eq!(protection(occupant, 2 * PAGE, libc::PROT_READ), 0);
+            assert_eq!(permissions_at(occupant), "r--p");
+            assert_eq!(permissions_at(occupant + PAGE), "r--p");
+
+            // This is the public caching path, not reserve_inner or REGION.
+            assert_eq!(
+                ToolRegion::reserve().unwrap_err().raw_os_error(),
+                Some(libc::EEXIST),
+            );
+            assert_eq!(permissions_at(occupant), "r--p");
+            assert_eq!(permissions_at(occupant + PAGE), "r--p");
+            // SAFETY: failed reservation must leave our two readable pages.
+            unsafe {
+                assert_eq!(core::ptr::read_volatile(occupant as *const u8), 0x35);
+                assert_eq!(
+                    core::ptr::read_volatile((occupant + PAGE) as *const u8),
+                    0xe2,
+                );
+            }
+
+            // Open before freeing the gap, as mapping_overlaps requires.
+            let mut maps = std::fs::File::open("/proc/self/maps").unwrap();
+            assert_eq!(
+                raw(
+                    libc::SYS_munmap,
+                    [occupant as u64, (2 * PAGE) as u64, 0, 0, 0, 0],
+                ),
+                0,
+            );
+            assert_eq!(resident_query(occupant), -i64::from(libc::ENOMEM));
+            assert_eq!(resident_query(occupant + PAGE), -i64::from(libc::ENOMEM));
+            // The collision is gone. Retry would now reserve and publish a
+            // region; preservation requires the original cached EEXIST.
+            assert_eq!(
+                ToolRegion::reserve().unwrap_err().raw_os_error(),
+                Some(libc::EEXIST),
+            );
+            assert!(!mapping_overlaps(&mut maps, BASE, END));
+        },
+    );
+}
+
+#[test]
+fn raw_fork_with_unpublished_initialization_gate_refuses_nonwaiting() {
+    isolated(
+        "raw_fork_with_unpublished_initialization_gate_refuses_nonwaiting",
+        || {
+            // Start in a fresh isolated process. Own the same real RAII gate
+            // used by ordinary reserve, without publishing a reservation.
+            let guard = InitializationGuard::acquire().unwrap();
+            let child = raw(libc::SYS_fork, [0; 6]);
+            assert!(child >= 0, "raw fork failed: {child}");
+            if child == 0 {
+                // The child inherits an occupied gate. Do not drop/reset its
+                // inherited guard, format/panic, run the harness or allocate.
+                // reserve's genuine EAGAIN path constructs a raw OS error.
+                let code = match ToolRegion::reserve() {
+                    Err(error) if error.raw_os_error() == Some(libc::EAGAIN) => 0,
+                    Err(_) => 111,
+                    Ok(_) => 112,
+                };
+                raw_exit(code);
+            }
+            // Existing bounded WNOHANG wait kills and reaps on its 3s limit.
+            // All assertions, unwinding and guard cleanup occur in the parent.
+            let status = wait_raw(child);
+            assert!(
+                libc::WIFEXITED(status),
+                "held-gate child status: {status:#x}"
+            );
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+            drop(guard);
+            // Parent gate release remains effective; ordinary reserve can
+            // still publish once and reuse the exact same public owner.
+            let region = ToolRegion::reserve().unwrap();
+            assert!(core::ptr::eq(region, ToolRegion::reserve().unwrap()));
         },
     );
 }

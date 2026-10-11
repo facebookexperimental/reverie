@@ -35,6 +35,8 @@ unsafe impl GlobalAlloc for CountingSystem {
 #[global_allocator]
 static ALLOCATOR: CountingSystem = CountingSystem;
 
+reverie_liteinst::declare_legacy_tool_backing!();
+
 fn main() {
     const BYTES: usize = 96 * 1024 * 1024;
     let before = ALLOCATIONS.load(Ordering::Relaxed);

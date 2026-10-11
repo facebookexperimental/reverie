@@ -11,10 +11,14 @@ use std::process::Command;
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 compile_error!("reverie-liteinst requires Linux x86-64");
 
+mod allocator_backing;
 #[cfg(feature = "allocator-fixture")]
 #[doc(hidden)]
 pub mod allocator_fixture;
 mod backend;
+#[cfg(feature = "allocator-fixture")]
+#[doc(hidden)]
+pub mod fixed_arena_fixture;
 #[cfg(feature = "allocator-fixture")]
 #[doc(hidden)]
 pub mod generic_fixture;
@@ -48,6 +52,9 @@ mod tool_host;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-252): Review shared reverie-inguest built-in re-exports.
+#[doc(hidden)]
+pub use allocator_backing::AllocatorBackingDescriptor;
+pub use patch_alloc::FixedPrivatePatchAllocator as FixedToolAllocator;
 pub use patch_alloc::PatchAllocator as ScopedToolAllocator;
 pub use patch_alloc::PrivatePatchAllocator as PrivateToolAllocator;
 /// Shared `reverie-inguest` built-in tool enum and getpid spoof constant.
@@ -247,9 +254,13 @@ pub fn set_guest_site_patching(command: &mut Command, enabled: bool) {
 // TODO-HUMAN-REVIEW(#61): this constructor installs process-wide signal and seccomp state.
 /// Initializes the preload runtime when selected by the launcher environment.
 ///
-/// The actual preload leaf owns the constructor and declares
-/// [`PrivateToolAllocator`]. An embedded legacy root must explicitly declare
-/// [`ScopedToolAllocator`]. The core installs neither an allocator nor its own
+/// The actual preload leaf owns the constructor and uses
+/// [`declare_fixed_tool_allocator!`]. An embedded legacy root uses
+/// [`declare_legacy_scoped_tool_allocator!`] or
+/// [`declare_legacy_private_tool_allocator!`] for its existing policy. Each
+/// declaration couples the compiler allocator with its immutable backing
+/// contract; a missing or duplicate declaration is a link error. The core
+/// installs neither a default allocator nor its own
 /// LiteInst constructor. The independent legacy `reverie-inguest` constructor
 /// can still be enabled by that dependency's `preload-constructor` feature.
 /// A caller whose allocator does not own the dispatch preflight allocation is

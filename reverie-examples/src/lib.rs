@@ -14,8 +14,7 @@
 
 // This legacy example cdylib also exports an rlib. Preserve its prior scoped
 // allocation policy explicitly, including example binaries that link the rlib.
-#[global_allocator]
-static ALLOCATOR: reverie_liteinst::ScopedToolAllocator = reverie_liteinst::ScopedToolAllocator;
+reverie_liteinst::declare_legacy_scoped_tool_allocator!();
 
 use std::ffi::CStr;
 use std::ffi::OsStr;

@@ -93,6 +93,11 @@ name = "generic_bootstrap"
 path = "tests/generic_bootstrap.rs"
 required-features = ["allocator-fixture"]
 
+[[test]]
+name = "fixed_arena"
+path = "tests/fixed_arena.rs"
+required-features = ["allocator-fixture"]
+
 [[bin]]
 name = "reverie-liteinst-exec-guest"
 path = "src/bin/exec_guest.rs"

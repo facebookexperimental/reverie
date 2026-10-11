@@ -11,7 +11,8 @@
 //! This reserves virtual address space, not a physically committed buffer.
 //! Used interiors remain on protection key zero. Boundary guards do not stop
 //! guest writes to an interior or destructive fixed mappings. This module
-//! makes no all-entry, TLS, allocator-arena or permission-isolation claim.
+//! makes no all-entry, TLS or permission-isolation claim. Explicit Fixed
+//! allocators share the fresh owner's guarded payloads and scalar metadata.
 //!
 //! Reservation and leasing are ordinary setup operations only. They must not
 //! run from a signal handler, an interrupted initializer, or a live callback.
@@ -19,11 +20,11 @@
 //! inherits the mappings, occupied pages and live contents through COW.
 
 use core::cell::UnsafeCell;
+use core::mem::MaybeUninit;
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering;
 use std::io;
-use std::sync::OnceLock;
 
 use super::support::raw_zero_result;
 use crate::trap::raw_syscall6;
@@ -40,13 +41,70 @@ const DATA_FIRST: usize = CONTROL_BYTES / PAGE;
 const DATA_END: usize = BYTES / PAGE - 1;
 const BITMAP_WORDS: usize = BYTES / PAGE / 64;
 
+type RegionResult = Result<ToolRegion, i32>;
+
+struct RegionPublication {
+    published: AtomicBool,
+    value: UnsafeCell<MaybeUninit<RegionResult>>,
+}
+
+// SAFETY: all writes require exclusive INITIALIZING ownership; the value is
+// fully initialized before release publication and never overwritten/reset.
+// Readers obtain the immutable reference only after acquire publication.
+// ToolRegion is already Send + Sync and remains alive for process lifetime.
+unsafe impl Sync for RegionPublication {}
+
+impl RegionPublication {
+    const fn new() -> Self {
+        Self {
+            published: AtomicBool::new(false),
+            value: UnsafeCell::new(MaybeUninit::uninit()),
+        }
+    }
+
+    #[inline(never)]
+    fn get(&self) -> Option<&RegionResult> {
+        if !self.published.load(Ordering::Acquire) {
+            return None;
+        }
+        // SAFETY: the release publication precedes this acquire observation;
+        // there is no writer after publication. The cast uses MaybeUninit<T>'s
+        // documented layout equivalence, not guessed Rust enum offsets.
+        Some(unsafe { &*self.value.get().cast::<RegionResult>() })
+    }
+
+    /// # Safety
+    /// The caller must exclusively own INITIALIZING for this image, not merely
+    /// observe that its byte is true. No second publication writer may run.
+    /// The input must be the actual ordinary reserve result or authenticated
+    /// fresh native owner. The slot and its owner must outlive all references.
+    #[inline(never)]
+    unsafe fn set_under_gate(&self, value: RegionResult) -> Result<(), RegionResult> {
+        if self.published.load(Ordering::Acquire) {
+            return Err(value);
+        }
+        // SAFETY: exclusive gate ownership and unpublished state prevent any
+        // competing writer or reader of this storage. No existing value drops.
+        unsafe { self.value.get().cast::<RegionResult>().write(value) };
+        self.published.store(true, Ordering::Release);
+        Ok(())
+    }
+}
+
 // The publication locator is deliberately outside the fixed-region claim.
-// Only a successfully reserved, initialized region is published here.
-static REGION: OnceLock<Result<ToolRegion, i32>> = OnceLock::new();
+// A complete owner or retained reservation error is published exactly once.
+static REGION: RegionPublication = RegionPublication::new();
 // Every path which can initialize REGION first owns this nonwaiting gate.
-// OnceLock::get is nonblocking; set is uncontended under this gate. A handler
-// interrupting ordinary initialization gets EAGAIN rather than waiting on it.
+// Readers never wait, and publication requires this gate's exclusive owner.
+// A handler interrupting initialization gets EAGAIN rather than waiting on it.
 static INITIALIZING: AtomicBool = AtomicBool::new(false);
+
+/// Feature-only publication observation; never initialize or select backing.
+#[cfg(feature = "allocator-fixture")]
+#[doc(hidden)]
+pub fn fixture_region_published() -> bool {
+    REGION.get().is_some_and(Result::is_ok)
+}
 
 #[repr(C)]
 struct Control {
@@ -115,8 +173,10 @@ impl ToolRegion {
         if REGION.get().is_none() {
             let _initializing = InitializationGuard::acquire()?;
             if REGION.get().is_none() {
-                REGION
-                    .set(Self::reserve_inner())
+                // SAFETY: _initializing owns INITIALIZING through this call,
+                // including reserve_inner; the second get found no publication.
+                // Publish the actual complete reservation result under that gate.
+                unsafe { REGION.set_under_gate(Self::reserve_inner()) }
                     .map_err(|_| io::Error::from_raw_os_error(libc::EAGAIN))?;
             }
         }
@@ -169,12 +229,19 @@ impl ToolRegion {
         // Anonymous pages are initially zero. Construct the scalar lock in
         // place, without putting the 128 KiB bitmap on the caller's stack.
         // The zero-filled u64 bitmap is valid and is not exposed before the
-        // OnceLock publishes this owner. Control/outer guards are excluded
+        // REGION publishes this owner. Control/outer guards are excluded
         // from the allocator's searchable interval rather than marked free.
         unsafe { core::ptr::addr_of_mut!((*control).held).write(AtomicBool::new(false)) };
         // Fresh anonymous storage also provides valid zeroed atomic scalar
         // representations for registered_alternate. Native constructor setup
         // obtains the same fresh zeroed control before typed adoption.
+        // Complete all permanent arena/guard occupancy before publication,
+        // even for Legacy owners which keep using their separate BSS heaps.
+        // SAFETY: this path owns a fresh exact mapping and unpublished Control.
+        if let Err(errno) = unsafe { arena::initialize_fixed_arenas(control) } {
+            unsafe { raw_syscall6(libc::SYS_munmap, [BASE as u64, BYTES as u64, 0, 0, 0, 0]) };
+            return Err(errno);
+        }
         Ok(Self {
             control,
             bootstrap: None,
@@ -350,6 +417,19 @@ impl Drop for InitializationGuard {
         INITIALIZING.store(false, Ordering::Release);
     }
 }
+
+#[path = "tool_region_arena.rs"]
+mod arena;
+#[doc(hidden)]
+pub use arena::FixedArenaBacking;
+#[doc(hidden)]
+pub use arena::FixedArenaMetadataAddresses;
+#[doc(hidden)]
+pub use arena::fixed_arena_backing;
+pub(crate) use arena::fixed_tool_heap;
+#[cfg(feature = "allocator-fixture")]
+#[doc(hidden)]
+pub use arena::fixture_fixed_arena_metadata;
 
 #[path = "tool_region_constructor.rs"]
 mod constructor;
