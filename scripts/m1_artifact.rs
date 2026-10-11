@@ -12154,6 +12154,61 @@ const PUBLICATION_WRAPPER_RECIPES: &[FixedWrapperRecipe] = &[
             (269, 270, "fixed_arena_setup", false),
         ],
     },
+    // eaa normal 0xb7610, exact291; canonical normal247 return join required below.
+    FixedWrapperRecipe {
+        role: "fixed_native_from_native",
+        hex: FIXED_NORMAL_FROM_NATIVE_291,
+        operands: &[
+            FixedWrapperOperand {
+                displacement: 53,
+                next: 57,
+                target: "fixed_initializing",
+                got: false,
+                target_offset: 0,
+            },
+            FixedWrapperOperand {
+                displacement: 103,
+                next: 107,
+                target: "fixed_scalar_syscall",
+                got: false,
+                target_offset: 0,
+            },
+            FixedWrapperOperand {
+                displacement: 148,
+                next: 152,
+                target: "fixed_region",
+                got: false,
+                target_offset: 0,
+            },
+            FixedWrapperOperand {
+                displacement: 153,
+                next: 157,
+                target: "fixed_region_publication_get",
+                got: false,
+                target_offset: 0,
+            },
+            FixedWrapperOperand {
+                displacement: 231,
+                next: 235,
+                target: "fixed_native_bitmap_range",
+                got: false,
+                target_offset: 0,
+            },
+            FixedWrapperOperand {
+                displacement: 270,
+                next: 274,
+                target: "fixed_arena_setup",
+                got: false,
+                target_offset: 0,
+            },
+        ],
+        transfers: &[
+            (102, 103, "fixed_scalar_syscall", false),
+            (152, 153, "fixed_region_publication_get", false),
+            (230, 231, "fixed_native_bitmap_range", false),
+            (269, 270, "fixed_arena_setup", false),
+        ],
+    },
     // normal 0xb98b0, 64 bytes, sha256 bb6739685e971b1e02475c6dada5c55abc59bfa32878b2c54cb7d5d66daa54f1.
     FixedWrapperRecipe {
         role: "fixed_arena_backing",
@@ -12839,6 +12894,8 @@ const PUBLICATION_ROLE_SYMBOLS: &[(&str, &str)] = &[
         "_RNvMs_NtNtCs_15reverie_inguest5guest11tool_regionNtB4_17RegionPublication14set_under_gate",
     ),
 ];
+
+const FIXED_NORMAL_FROM_NATIVE_291: &str = "5541574156534883ec1848bb001000000060000080f901b83000020041b8a00002004c0f44c04909d84939f00f85950000000fb605c73b090249b800f0efffff9fffff4c01c24881faffff7f00777884c0747489cd4989febfba0000004989f731f631d231c9e855daffff4885c07e7f4c89f94939474075764883795001756f488379380074688b0183e00f83f808755e488d3d703b0902e823ccffff4885c0754dba02000000b801000000f0490fb15748753b0fb60384c074144c89f741c7060b000000eb32c70716000000eb2a48c74424080001000048c744241002090000488d7c2408e8a5feffff84c0741b4c89f741c7061600000031ed40886f084883c4185b415e415f5dc34889dfe8aeccffff4c89f7a8017405418916ebdb4d893eebd8";
 
 const FIXED_WRAPPER_RECIPES: &[FixedWrapperRecipe] = &[
     // Insert this exact new typed strong-CAS entry in FIXED_WRAPPER_RECIPES.
@@ -20446,6 +20503,151 @@ fn fixed_detcore_publication_cohort(
     Ok(())
 }
 
+// Private whole-body/census witnesses; never serialized or caller-authored.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FixedNormalReturnIdentity {
+    Caller291,
+    Setup247,
+    OtherSetup,
+}
+struct AuthenticatedFixedNormalReturn {
+    role: String,
+    address: u64,
+    identity: FixedNormalReturnIdentity,
+    edges: Vec<ConstructorTransfer>,
+}
+
+fn fixed_normal_return_qualified_operation(
+    role: &str,
+    address: u64,
+    (bytes, instructions): (&[u8], &[EncodedConstructorInstruction]),
+    targets: &BTreeMap<String, u64>,
+    got: &BTreeMap<u64, u64>,
+    readonly: &BTreeMap<u64, Vec<u8>>,
+) -> Result<Option<AuthenticatedFixedNormalReturn>> {
+    let (identity, edges) = if role == "fixed_native_from_native" {
+        let matching: Vec<_> = FIXED_WRAPPER_RECIPES
+            .iter()
+            .chain(PUBLICATION_WRAPPER_RECIPES)
+            .filter(|recipe| {
+                recipe.role == role
+                    && fixed_template_shape(
+                        bytes,
+                        &fixed_hex(recipe.hex),
+                        recipe.operands.iter().map(|op| op.displacement),
+                    )
+            })
+            .collect();
+        if !matching
+            .iter()
+            .any(|recipe| recipe.hex == FIXED_NORMAL_FROM_NATIVE_291)
+        {
+            return Ok(None); // Pre-existing caller contracts acquire no new restriction.
+        }
+        require(matching.len() == 1, "ambiguous new normal caller identity")?;
+        (
+            FixedNormalReturnIdentity::Caller291,
+            fixed_wrapper_recipe(role, address, bytes, targets, got, readonly)?,
+        )
+    } else if role == "fixed_arena_setup" {
+        let edges = fixed_arena_recipe(role, address, bytes, targets, got)?;
+        let matching: Vec<_> = FIXED_ARENA_TEMPLATES
+            .iter()
+            .filter(|template| {
+                template.role == role
+                    && fixed_template_shape(
+                        bytes,
+                        template.bytes,
+                        template.operands.iter().map(|op| op.displacement),
+                    )
+            })
+            .collect();
+        require(
+            matching.len() == 1,
+            "ambiguous qualified normal setup identity",
+        )?;
+        let identity = if matching[0].bytes == FIXED_ARENA_BYTES_10 {
+            FixedNormalReturnIdentity::Setup247
+        } else {
+            FixedNormalReturnIdentity::OtherSetup
+        };
+        (identity, edges)
+    } else {
+        return Ok(None);
+    };
+    fixed_census_transfers(instructions, address, bytes, &edges, got, false)?;
+    Ok(Some(AuthenticatedFixedNormalReturn {
+        role: role.into(),
+        address,
+        identity,
+        edges,
+    }))
+}
+
+fn fixed_normal_return_contract(
+    witnesses: &BTreeMap<String, AuthenticatedFixedNormalReturn>,
+    transfers: &BTreeMap<String, Vec<ConstructorTransfer>>,
+    selected: &BTreeMap<String, u64>,
+    targets: &BTreeMap<String, u64>,
+) -> Result<()> {
+    let Some(caller) = witnesses.get("fixed_native_from_native") else {
+        return Ok(()); // Conditional only on the additional authenticated291 body.
+    };
+    require(
+        caller.identity == FixedNormalReturnIdentity::Caller291,
+        "unknown authenticated new normal caller",
+    )?;
+    let setup = witnesses
+        .get("fixed_arena_setup")
+        .filter(|setup| setup.identity == FixedNormalReturnIdentity::Setup247)
+        .ok_or("new normal caller lacks authenticated canonical normal247 setup")?;
+    for (role, witness) in [
+        ("fixed_native_from_native", caller),
+        ("fixed_arena_setup", setup),
+    ] {
+        require(
+            witness.role == role
+                && witness.address != 0
+                && selected.get(role) == Some(&witness.address)
+                && targets.get(role) == Some(&witness.address)
+                && transfers.get(role) == Some(&witness.edges),
+            "normal return witness loses its actual role/address/transfers",
+        )?;
+    }
+    let region = *targets
+        .get("fixed_region")
+        .ok_or("normal return REGION absent")?;
+    let initializing = *targets
+        .get("fixed_initializing")
+        .ok_or("normal return INITIALIZING absent")?;
+    require(
+        region != 0
+            && initializing != 0
+            && BTreeSet::from([caller.address, setup.address, region, initializing]).len() == 4,
+        "normal return receiver/function identities alias",
+    )?;
+    let setup_pc = caller
+        .address
+        .checked_add(269)
+        .ok_or("normal setup call PC overflow")?;
+    let incoming: Vec<_> = caller
+        .edges
+        .iter()
+        .filter(|edge| edge.target == setup.address)
+        .collect();
+    require(
+        incoming.len() == 1
+            && incoming[0].instruction == setup_pc
+            && incoming[0].local_got_slot.is_none(),
+        "new normal caller lacks unique exact direct setup edge",
+    )?;
+    // Full291 bytes prove the fixed control receiver, payload and EDX error store.
+    // Full247 bytes prove EBX literal1, success XOR EBX,EBX and the sole full
+    // EAX/EDX epilogue. Its six actual bitmap/syscall edges remain recursively
+    // qualified by the production closure; no enum, extent or source type is ABI proof.
+    Ok(())
+}
+
 struct FixedOperationClosure {
     transfers: BTreeMap<String, Vec<ConstructorTransfer>>,
     guarded: BTreeMap<String, FixedGuardedTerminal>,
@@ -20492,6 +20694,7 @@ fn qualify_fixed_operation_closure(
     let mut transfers = BTreeMap::new();
     let mut guarded = BTreeMap::new();
     let mut detcore_witnesses = BTreeMap::new();
+    let mut normal_return_witnesses = BTreeMap::new();
     let trusted = private_function(elf, CONSTRUCTOR_GATE_OWNER)?;
     constructor_gate_operands(
         code.get(&trusted.st_value)
@@ -20634,6 +20837,23 @@ fn qualify_fixed_operation_closure(
         })?;
         fixed_census_transfers(&instructions, address, actual, &edges, got, internal_switch)
             .map_err(|error| format!("Fixed role {role} at {address:#x}: {error}"))?;
+        if image_kind == FixedImageKind::Standalone
+            && let Some(witness) = fixed_normal_return_qualified_operation(
+                &role,
+                address,
+                (actual, &instructions),
+                &context.targets,
+                got,
+                &context.readonly,
+            )?
+        {
+            require(
+                normal_return_witnesses
+                    .insert(role.clone(), witness)
+                    .is_none(),
+                "duplicate authenticated normal return role",
+            )?;
+        }
         for edge in &edges {
             if edge.target == tls.plt_address {
                 require(
@@ -20699,6 +20919,18 @@ fn qualify_fixed_operation_closure(
             .collect();
         fixed_detcore_publication_cohort(
             &detcore_witnesses,
+            &transfers,
+            &selected,
+            &context.targets,
+        )?;
+    }
+    if image_kind == FixedImageKind::Standalone {
+        let selected = roles
+            .iter()
+            .map(|(role, symbol)| (role.clone(), symbol.st_value))
+            .collect();
+        fixed_normal_return_contract(
+            &normal_return_witnesses,
             &transfers,
             &selected,
             &context.targets,
@@ -29612,6 +29844,7 @@ mod tests {
         dev_fixed_heap_mutation_controls();
         fixed_release_heap_full_recipes_and_negative_controls();
         fixed_arena_recipe_mutation_controls();
+        fixed_normal_return_contract_controls();
         publication_integrated_recipe_controls();
         publication_dev_recipe_controls();
         fixed_compiler_shim_controls();
@@ -31449,6 +31682,579 @@ mod tests {
         bad.local_chain
             .insert("wrong_tls_role".into(), function("wrong", address, 175));
         assert!(fixed_tls_transfers("wrong_tls_role", &symbol, &ins, &bad, &got).is_err());
+    }
+
+    struct FixedNormalReturnControlGraph {
+        caller_address: u64,
+        caller: Vec<u8>,
+        caller_offsets: &'static [usize],
+        setup_address: u64,
+        setup: Vec<u8>,
+        setup_offsets: &'static [usize],
+        targets: BTreeMap<String, u64>,
+    }
+
+    // Independent frozen a29/eaa normal whole bodies and real objdump boundaries.
+    // Address operands retain their actual original bindings in these positives.
+    fn fixed_normal_return_control_graph(sample: usize) -> FixedNormalReturnControlGraph {
+        match sample {
+            0 => FixedNormalReturnControlGraph {
+                caller_address: 0xb9150,
+                caller: fixed_hex(
+                    "5541574156534883ec1848bb001000000060000080f901b83000020041b8a00002004c0f44c04909d84939f00f85950000000fb60590f0080249b800f0efffff9fffff4c01c24881faffff7f00777884c0747489cd4989febfba0000004989f731f631d231c9e875bfffff4885c07e7f4c89f94939474075764883795001756f488379380074688b0183e00f83f808755e488d3d38f00802e833bfffff4885c0754dba02000000b801000000f0490fb15748753b0fb60384c074144c89f741c7060b000000eb32c70716000000eb2a48c74424080001000048c744241002090000488d7c2408e825feffff84c0741b4c89f741c7061600000031ed40886f084883c4185b415e415f5dc34889dfe80e0100004c89f783f8017505418916ebda4d893eebd7",
+                ),
+                caller_offsets: &[
+                    0, 1, 3, 5, 6, 10, 20, 23, 28, 34, 38, 41, 44, 50, 57, 67, 70, 77, 79, 81, 83,
+                    85, 88, 93, 96, 98, 100, 102, 107, 110, 112, 115, 119, 121, 126, 128, 133, 135,
+                    137, 140, 143, 145, 152, 157, 160, 162, 167, 172, 178, 180, 183, 185, 187, 190,
+                    197, 199, 205, 207, 216, 225, 230, 235, 237, 239, 242, 249, 251, 255, 259, 260,
+                    262, 264, 265, 266, 269, 274, 277, 280, 282, 285, 287, 290,
+                ],
+                setup_address: 0xb9370,
+                setup: fixed_hex(
+                    "41574156415453504989febeffff0000ba0120010031c9e8f4feffffbb0100000041bf1600000084c00f84b7000000beff3f0100ba016001004c89f731c9e8cdfeffff84c00f849b00000049bc0030020000600000498db42400d0fd0fbf0a000000ba00000002b903000000e84fbdffff4885c0786a498db42400d0fd13bf0a000000ba00000002b903000000e82ebdffff4885c078490f57c0410f29042441c64424100049c744241800000000beffff0000ba012001004c89f7b901000000e84bfeffffbeff3f0100ba016001004c89f7b901000000e834feffff31dbeb064989c741f7df89d84489fa4883c4085b415c415e415fc3",
+                ),
+                setup_offsets: &[
+                    0, 2, 4, 6, 7, 8, 11, 16, 21, 23, 28, 33, 39, 41, 47, 52, 57, 60, 62, 67, 69,
+                    75, 85, 93, 98, 103, 108, 113, 116, 118, 126, 131, 136, 141, 146, 149, 151,
+                    154, 159, 165, 174, 179, 184, 187, 192, 197, 202, 207, 210, 215, 220, 222, 224,
+                    227, 230, 232, 235, 239, 240, 242, 244, 246,
+                ],
+                targets: BTreeMap::from([
+                    ("fixed_initializing".into(), 0x2148219),
+                    ("fixed_scalar_syscall".into(), 0xb5130),
+                    ("fixed_region".into(), 0x2148220),
+                    ("fixed_region_publication_get".into(), 0xb5120),
+                    ("fixed_native_bitmap_range".into(), 0xb9060),
+                    ("fixed_arena_setup".into(), 0xb9370),
+                    ("fixed_native_from_native".into(), 0xb9150),
+                    ("fixed_setup_bitmap_range".into(), 0xb9280),
+                ]),
+            },
+            1 => FixedNormalReturnControlGraph {
+                caller_address: 0xb7610,
+                caller: fixed_hex(
+                    "5541574156534883ec1848bb001000000060000080f901b83000020041b8a00002004c0f44c04909d84939f00f85950000000fb605c73b090249b800f0efffff9fffff4c01c24881faffff7f00777884c0747489cd4989febfba0000004989f731f631d231c9e855daffff4885c07e7f4c89f94939474075764883795001756f488379380074688b0183e00f83f808755e488d3d703b0902e823ccffff4885c0754dba02000000b801000000f0490fb15748753b0fb60384c074144c89f741c7060b000000eb32c70716000000eb2a48c74424080001000048c744241002090000488d7c2408e8a5feffff84c0741b4c89f741c7061600000031ed40886f084883c4185b415e415f5dc34889dfe8aeccffff4c89f7a8017405418916ebdb4d893eebd8",
+                ),
+                caller_offsets: &[
+                    0, 1, 3, 5, 6, 10, 20, 23, 28, 34, 38, 41, 44, 50, 57, 67, 70, 77, 79, 81, 83,
+                    85, 88, 93, 96, 98, 100, 102, 107, 110, 112, 115, 119, 121, 126, 128, 133, 135,
+                    137, 140, 143, 145, 152, 157, 160, 162, 167, 172, 178, 180, 183, 185, 187, 190,
+                    197, 199, 205, 207, 216, 225, 230, 235, 237, 239, 242, 249, 251, 255, 259, 260,
+                    262, 264, 265, 266, 269, 274, 277, 279, 281, 284, 286, 289,
+                ],
+                setup_address: 0xb43d0,
+                setup: fixed_hex(
+                    "41574156415453504989febeffff0000ba0120010031c9e8f4feffffbb0100000041bf1600000084c00f84b7000000beff3f0100ba016001004c89f731c9e8cdfeffff84c00f849b00000049bc0030020000600000498db42400d0fd0fbf0a000000ba00000002b903000000e88f0c00004885c0786a498db42400d0fd13bf0a000000ba00000002b903000000e86e0c00004885c078490f57c0410f29042441c64424100049c744241800000000beffff0000ba012001004c89f7b901000000e84bfeffffbeff3f0100ba016001004c89f7b901000000e834feffff31dbeb064989c741f7df89d84489fa4883c4085b415c415e415fc3",
+                ),
+                setup_offsets: &[
+                    0, 2, 4, 6, 7, 8, 11, 16, 21, 23, 28, 33, 39, 41, 47, 52, 57, 60, 62, 67, 69,
+                    75, 85, 93, 98, 103, 108, 113, 116, 118, 126, 131, 136, 141, 146, 149, 151,
+                    154, 159, 165, 174, 179, 184, 187, 192, 197, 202, 207, 210, 215, 220, 222, 224,
+                    227, 230, 232, 235, 239, 240, 242, 244, 246,
+                ],
+                targets: BTreeMap::from([
+                    ("fixed_initializing".into(), 0x214b210),
+                    ("fixed_scalar_syscall".into(), 0xb50d0),
+                    ("fixed_region".into(), 0x214b218),
+                    ("fixed_region_publication_get".into(), 0xb42d0),
+                    ("fixed_native_bitmap_range".into(), 0xb75a0),
+                    ("fixed_arena_setup".into(), 0xb43d0),
+                    ("fixed_native_from_native".into(), 0xb7610),
+                    ("fixed_setup_bitmap_range".into(), 0xb42e0),
+                ]),
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    fn fixed_normal_return_control_instructions(
+        address: u64,
+        bytes: &[u8],
+        offsets: &[usize],
+    ) -> Vec<EncodedConstructorInstruction> {
+        offsets
+            .iter()
+            .enumerate()
+            .map(|(i, &offset)| {
+                let end = offsets.get(i + 1).copied().unwrap_or(bytes.len());
+                EncodedConstructorInstruction {
+                    address: address + offset as u64,
+                    bytes: bytes[offset..end].to_vec(),
+                }
+            })
+            .collect()
+    }
+
+    fn fixed_normal_return_contract_controls() {
+        let got = BTreeMap::new();
+        let readonly = BTreeMap::new();
+        for sample in 0..2 {
+            let graph = fixed_normal_return_control_graph(sample);
+            let caller = fixed_wrapper_recipe(
+                "fixed_native_from_native",
+                graph.caller_address,
+                &graph.caller,
+                &graph.targets,
+                &got,
+                &readonly,
+            )
+            .expect("frozen normal caller whole recipe (new291 must fail first on old checker)");
+            let setup = fixed_arena_recipe(
+                "fixed_arena_setup",
+                graph.setup_address,
+                &graph.setup,
+                &graph.targets,
+                &got,
+            )
+            .expect("frozen canonical normal247 setup whole recipe");
+            assert_eq!(
+                caller
+                    .iter()
+                    .map(|e| (
+                        e.instruction - graph.caller_address,
+                        e.target,
+                        e.local_got_slot
+                    ))
+                    .collect::<Vec<_>>(),
+                [
+                    (102, graph.targets["fixed_scalar_syscall"], None),
+                    (152, graph.targets["fixed_region_publication_get"], None),
+                    (230, graph.targets["fixed_native_bitmap_range"], None),
+                    (269, graph.setup_address, None),
+                ]
+            );
+            assert_eq!(
+                setup
+                    .iter()
+                    .map(|e| (
+                        e.instruction - graph.setup_address,
+                        e.target,
+                        e.local_got_slot
+                    ))
+                    .collect::<Vec<_>>(),
+                [
+                    (23, graph.targets["fixed_setup_bitmap_range"], None),
+                    (62, graph.targets["fixed_setup_bitmap_range"], None),
+                    (108, graph.targets["fixed_scalar_syscall"], None),
+                    (141, graph.targets["fixed_scalar_syscall"], None),
+                    (192, graph.targets["fixed_setup_bitmap_range"], None),
+                    (215, graph.targets["fixed_setup_bitmap_range"], None),
+                ]
+            );
+            for (role, address, bytes, offsets, edges) in [
+                (
+                    "fixed_native_from_native",
+                    graph.caller_address,
+                    &graph.caller,
+                    graph.caller_offsets,
+                    &caller,
+                ),
+                (
+                    "fixed_arena_setup",
+                    graph.setup_address,
+                    &graph.setup,
+                    graph.setup_offsets,
+                    &setup,
+                ),
+            ] {
+                let instructions =
+                    fixed_normal_return_control_instructions(address, bytes, offsets);
+                fixed_census_transfers(&instructions, address, bytes, edges, &got, false).unwrap();
+                let check = |actual: &[u8], targets: &BTreeMap<String, u64>| {
+                    if role == "fixed_native_from_native" {
+                        fixed_wrapper_recipe(role, address, actual, targets, &got, &readonly)
+                    } else {
+                        fixed_arena_recipe(role, address, actual, targets, &got)
+                    }
+                };
+                // Every byte/bit: saves, fixed receiver/payload, tags, full EAX/EDX
+                // return, TEST mask/JE, shifted backbranches, stores and epilogue.
+                for byte in 0..bytes.len() {
+                    for bit in 0..8 {
+                        let mut bad = bytes.clone();
+                        bad[byte] ^= 1 << bit;
+                        assert!(
+                            check(&bad, &graph.targets).is_err(),
+                            "normal sample{sample} {role}+{byte}/{bit}"
+                        );
+                    }
+                }
+                for end in 0..bytes.len() {
+                    assert!(check(&bytes[..end], &graph.targets).is_err());
+                }
+                for extra in [
+                    &[0x90][..],
+                    &[0xc3][..],
+                    &[0xe8, 0, 0, 0, 0][..],
+                    &[0xff, 0xd0][..],
+                ] {
+                    let mut bad = bytes.clone();
+                    bad.extend_from_slice(extra);
+                    assert!(check(&bad, &graph.targets).is_err());
+                }
+                for index in 0..edges.len() {
+                    let mut bad = edges.to_vec();
+                    bad.remove(index);
+                    assert!(
+                        fixed_census_transfers(&instructions, address, bytes, &bad, &got, false)
+                            .is_err()
+                    );
+                    let mut bad = edges.to_vec();
+                    bad.push(edges[index].clone());
+                    assert!(
+                        fixed_census_transfers(&instructions, address, bytes, &bad, &got, false)
+                            .is_err()
+                    );
+                    let mut bad = edges.to_vec();
+                    bad[index].target += 1;
+                    assert!(
+                        fixed_census_transfers(&instructions, address, bytes, &bad, &got, false)
+                            .is_err()
+                    );
+                }
+                let mut bad = instructions.clone();
+                bad.remove(0);
+                assert!(fixed_census_transfers(&bad, address, bytes, edges, &got, false).is_err());
+                let mut bad = instructions.clone();
+                bad.insert(0, instructions[0].clone());
+                assert!(fixed_census_transfers(&bad, address, bytes, edges, &got, false).is_err());
+            }
+            for key in [
+                "fixed_initializing",
+                "fixed_scalar_syscall",
+                "fixed_region",
+                "fixed_region_publication_get",
+                "fixed_native_bitmap_range",
+                "fixed_arena_setup",
+            ] {
+                let mut bad = graph.targets.clone();
+                bad.remove(key);
+                assert!(
+                    fixed_wrapper_recipe(
+                        "fixed_native_from_native",
+                        graph.caller_address,
+                        &graph.caller,
+                        &bad,
+                        &got,
+                        &readonly
+                    )
+                    .is_err()
+                );
+                let mut bad = graph.targets.clone();
+                bad.insert(key.into(), graph.targets[key] + 1);
+                assert!(
+                    fixed_wrapper_recipe(
+                        "fixed_native_from_native",
+                        graph.caller_address,
+                        &graph.caller,
+                        &bad,
+                        &got,
+                        &readonly
+                    )
+                    .is_err()
+                );
+            }
+            for tag in [2u32, 3, 0x101, 0x80000001] {
+                let mut bad = graph.setup.clone();
+                bad[29..33].copy_from_slice(&tag.to_le_bytes());
+                assert!(
+                    fixed_arena_recipe(
+                        "fixed_arena_setup",
+                        graph.setup_address,
+                        &bad,
+                        &graph.targets,
+                        &got
+                    )
+                    .is_err(),
+                    "noncanonical EBX error tag {tag:#x}"
+                );
+            }
+        }
+        fixed_normal_return_join_controls();
+    }
+
+    struct FixedNormalReturnControlProof {
+        witnesses: BTreeMap<String, AuthenticatedFixedNormalReturn>,
+        transfers: BTreeMap<String, Vec<ConstructorTransfer>>,
+        selected: BTreeMap<String, u64>,
+    }
+
+    // Same complete recipes, operands, actual instruction census and witness
+    // factory as the production closure; no control constructs an identity enum.
+    fn fixed_normal_return_control_proof(
+        graph: &FixedNormalReturnControlGraph,
+    ) -> Result<FixedNormalReturnControlProof> {
+        let got = BTreeMap::new();
+        let readonly = BTreeMap::new();
+        let mut witnesses = BTreeMap::new();
+        let mut transfers = BTreeMap::new();
+        let mut selected = BTreeMap::new();
+        for (role, address, bytes, offsets) in [
+            (
+                "fixed_native_from_native",
+                graph.caller_address,
+                &graph.caller,
+                graph.caller_offsets,
+            ),
+            (
+                "fixed_arena_setup",
+                graph.setup_address,
+                &graph.setup,
+                graph.setup_offsets,
+            ),
+        ] {
+            let edges = if role == "fixed_native_from_native" {
+                fixed_wrapper_recipe(role, address, bytes, &graph.targets, &got, &readonly)?
+            } else {
+                fixed_arena_recipe(role, address, bytes, &graph.targets, &got)?
+            };
+            let instructions = fixed_normal_return_control_instructions(address, bytes, offsets);
+            fixed_census_transfers(&instructions, address, bytes, &edges, &got, false)?;
+            if let Some(witness) = fixed_normal_return_qualified_operation(
+                role,
+                address,
+                (bytes, &instructions),
+                &graph.targets,
+                &got,
+                &readonly,
+            )? {
+                assert_eq!(witness.edges, edges);
+                witnesses.insert(role.into(), witness);
+            }
+            transfers.insert(role.into(), edges);
+            selected.insert(role.into(), address);
+        }
+        Ok(FixedNormalReturnControlProof {
+            witnesses,
+            transfers,
+            selected,
+        })
+    }
+
+    fn fixed_normal_return_control_join(
+        proof: &FixedNormalReturnControlProof,
+        graph: &FixedNormalReturnControlGraph,
+    ) -> Result<()> {
+        fixed_normal_return_contract(
+            &proof.witnesses,
+            &proof.transfers,
+            &proof.selected,
+            &graph.targets,
+        )
+    }
+
+    fn fixed_normal_return_rebind_caller(graph: &mut FixedNormalReturnControlGraph) {
+        for (displacement, next, key) in [
+            (53, 57, "fixed_initializing"),
+            (103, 107, "fixed_scalar_syscall"),
+            (148, 152, "fixed_region"),
+            (153, 157, "fixed_region_publication_get"),
+            (231, 235, "fixed_native_bitmap_range"),
+            (270, 274, "fixed_arena_setup"),
+        ] {
+            let delta =
+                i32::try_from(graph.targets[key] as i64 - (graph.caller_address + next) as i64)
+                    .unwrap();
+            graph.caller[displacement..displacement + 4].copy_from_slice(&delta.to_le_bytes());
+        }
+    }
+
+    fn fixed_normal_return_join_controls() {
+        for sample in 0..2 {
+            let graph = fixed_normal_return_control_graph(sample);
+            let proof = fixed_normal_return_control_proof(&graph).unwrap();
+            if sample == 0 {
+                assert!(!proof.witnesses.contains_key("fixed_native_from_native"));
+            } else {
+                let caller = proof.witnesses.get("fixed_native_from_native").expect(
+                    "actual291 must produce a recipe/census witness through the full recipe union",
+                );
+                assert!(caller.identity == FixedNormalReturnIdentity::Caller291);
+            }
+            assert!(
+                proof.witnesses["fixed_arena_setup"].identity
+                    == FixedNormalReturnIdentity::Setup247
+            );
+            fixed_normal_return_control_join(&proof, &graph).unwrap();
+        }
+        // The two authentic247 bodies share one proved contract, not a chronology label.
+        let mut compatible = fixed_normal_return_control_graph(1);
+        let old = fixed_normal_return_control_graph(0);
+        compatible.setup_address = old.setup_address;
+        compatible.setup = old.setup;
+        compatible.setup_offsets = old.setup_offsets;
+        for key in [
+            "fixed_arena_setup",
+            "fixed_setup_bitmap_range",
+            "fixed_scalar_syscall",
+        ] {
+            compatible.targets.insert(key.into(), old.targets[key]);
+        }
+        fixed_normal_return_rebind_caller(&mut compatible);
+        let proof = fixed_normal_return_control_proof(&compatible).unwrap();
+        fixed_normal_return_control_join(&proof, &compatible).unwrap();
+
+        // Retained real DEV449 setup: individually whole-recipe/typed/census valid.
+        // Rebind ALL caller operands, so only the finite247 return-contract join refuses.
+        let mut outside = fixed_normal_return_control_graph(1);
+        outside.setup_address = 0x1e5a20;
+        outside.setup = fixed_hex(
+            "4881ec8800000048897c241848897c2430beffff0000ba0120010031c9e88efbffffa8017512c744242416000000c744242001000000eb4c488b7c2418beff3f0100ba0160010031c9e862fbffffa8017502ebd2bf0a00000048be0000001000600000ba00000002b903000000e8be0c0100488944241048894424384883f8007c46eb108b4424208b5424244881c488000000c3bf0a00000048be0000001400600000ba00000002b903000000e87e0c0100488944240848894424404883f8000f8cd8000000eb1d488b4c241048894c247831c04829c889442424c744242001000000eb9f48b80030020000600000488944244848bf0030020000600000e88d6c000031c089c7e8c47b0000488b7c24184889442450488b4424504889442428488b4424284889442458488b4424584889442468488b442468488944246048b800300200006000004883c018488944247048b80030020000600000488b4c246048894818beffff0000ba01200100b901000000e838faffff488b7c2418beff3f0100ba01600100b901000000e81ffaffffc744242000000000e9e6feffff488b4c240848898c248000000031c04829c889442424c744242001000000e9c3feffff",
+        );
+        outside.setup_offsets = &[
+            0, 7, 12, 17, 22, 27, 29, 34, 36, 38, 46, 54, 56, 61, 66, 71, 73, 78, 80, 82, 84, 89,
+            99, 104, 109, 114, 119, 124, 128, 130, 132, 136, 140, 147, 148, 153, 163, 168, 173,
+            178, 183, 188, 192, 198, 200, 205, 210, 212, 215, 219, 227, 229, 239, 244, 254, 259,
+            261, 263, 268, 273, 278, 283, 288, 293, 298, 303, 308, 313, 318, 328, 332, 337, 347,
+            352, 356, 361, 366, 371, 376, 381, 386, 391, 396, 401, 409, 414, 419, 427, 429, 432,
+            436, 444,
+        ];
+        for (key, address) in [
+            ("fixed_arena_setup", 0x1e5a20),
+            ("fixed_setup_bitmap_range", 0x1e55d0),
+            ("fixed_scalar_syscall", 0x1f6750),
+            ("fixed_heap_metadata_initialize", 0x1ec7b0),
+            ("fixed_metadata_atomic_new_usize", 0x1ed6f0),
+        ] {
+            outside.targets.insert(key.into(), address);
+        }
+        fixed_normal_return_rebind_caller(&mut outside);
+        let proof = fixed_normal_return_control_proof(&outside).expect(
+            "wrong-contract graph must first pass both actual whole recipes and complete censuses",
+        );
+        assert!(
+            proof.witnesses["fixed_native_from_native"].identity
+                == FixedNormalReturnIdentity::Caller291
+        );
+        assert!(
+            proof.witnesses["fixed_arena_setup"].identity == FixedNormalReturnIdentity::OtherSetup
+        );
+        assert_eq!(
+            fixed_normal_return_control_join(&proof, &outside).unwrap_err(),
+            "new normal caller lacks authenticated canonical normal247 setup"
+        );
+
+        // Still recipe/census valid: wrong same-size target and interior selected target.
+        for shift in [1, 0x2000] {
+            let mut graph = fixed_normal_return_control_graph(1);
+            graph
+                .targets
+                .insert("fixed_arena_setup".into(), graph.setup_address + shift);
+            fixed_normal_return_rebind_caller(&mut graph);
+            let proof = fixed_normal_return_control_proof(&graph).unwrap();
+            assert_eq!(
+                fixed_normal_return_control_join(&proof, &graph).unwrap_err(),
+                "normal return witness loses its actual role/address/transfers"
+            );
+        }
+        // Typed receiver aliases must reach the join, not fail a malformed displacement.
+        for (key, other) in [
+            ("fixed_region", "fixed_initializing"),
+            ("fixed_initializing", "fixed_region"),
+        ] {
+            let mut graph = fixed_normal_return_control_graph(1);
+            graph.targets.insert(key.into(), graph.targets[other]);
+            fixed_normal_return_rebind_caller(&mut graph);
+            let proof = fixed_normal_return_control_proof(&graph).unwrap();
+            assert_eq!(
+                fixed_normal_return_control_join(&proof, &graph).unwrap_err(),
+                "normal return receiver/function identities alias"
+            );
+        }
+        let graph = fixed_normal_return_control_graph(1);
+        let mut proof = fixed_normal_return_control_proof(&graph).unwrap();
+        proof.witnesses.remove("fixed_arena_setup");
+        assert_eq!(
+            fixed_normal_return_control_join(&proof, &graph).unwrap_err(),
+            "new normal caller lacks authenticated canonical normal247 setup"
+        );
+        let mut proof = fixed_normal_return_control_proof(&graph).unwrap();
+        proof
+            .selected
+            .insert("fixed_arena_setup".into(), graph.setup_address + 1);
+        assert_eq!(
+            fixed_normal_return_control_join(&proof, &graph).unwrap_err(),
+            "normal return witness loses its actual role/address/transfers"
+        );
+        for role in ["fixed_native_from_native", "fixed_arena_setup"] {
+            for mutation in 0..4 {
+                let mut proof = fixed_normal_return_control_proof(&graph).unwrap();
+                let edges = proof.transfers.get_mut(role).unwrap();
+                match mutation {
+                    0 => {
+                        edges.remove(0);
+                    }
+                    1 => {
+                        edges.push(edges[0].clone());
+                    }
+                    2 => {
+                        edges[0].instruction += 1;
+                    }
+                    3 => {
+                        edges[0].local_got_slot = Some(0xdead);
+                    }
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    fixed_normal_return_control_join(&proof, &graph).unwrap_err(),
+                    "normal return witness loses its actual role/address/transfers"
+                );
+            }
+            let (address, bytes, offsets) = if role == "fixed_native_from_native" {
+                (graph.caller_address, &graph.caller, graph.caller_offsets)
+            } else {
+                (graph.setup_address, &graph.setup, graph.setup_offsets)
+            };
+            let instructions = fixed_normal_return_control_instructions(address, bytes, offsets);
+            for mutation in 0..3 {
+                let mut bad = instructions.clone();
+                match mutation {
+                    0 => {
+                        bad.remove(0);
+                    }
+                    1 => {
+                        bad.insert(0, instructions[0].clone());
+                    }
+                    2 => {
+                        bad[0].bytes[0] ^= 1;
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(
+                    fixed_normal_return_qualified_operation(
+                        role,
+                        address,
+                        (bytes, &bad),
+                        &graph.targets,
+                        &BTreeMap::new(),
+                        &BTreeMap::new()
+                    )
+                    .is_err()
+                );
+            }
+        }
+        let mut missing = fixed_normal_return_control_graph(1);
+        missing.setup.clear();
+        assert!(fixed_normal_return_control_proof(&missing).is_err());
+        // Explicit full/partial EAX, EDX errno, success clear and branch/store mutations.
+        for (offset, value) in [
+            (220, 0x90),
+            (230, 0x88),
+            (231, 0xc8),
+            (234, 0xea),
+            (221, 0xc0),
+            (41, 0x75),
+        ] {
+            let mut bad = fixed_normal_return_control_graph(1);
+            bad.setup[offset] = value;
+            assert!(fixed_normal_return_control_proof(&bad).is_err());
+        }
+        for (offset, value) in [(277, 0x90), (278, 2), (279, 0x75), (285, 0xda), (290, 0xd7)] {
+            let mut bad = fixed_normal_return_control_graph(1);
+            bad.caller[offset] = value;
+            assert!(fixed_normal_return_control_proof(&bad).is_err());
+        }
     }
 
     fn fixed_backing_schema_controls() {
