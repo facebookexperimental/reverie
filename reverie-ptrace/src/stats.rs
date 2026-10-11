@@ -288,7 +288,7 @@ impl PtraceBackendStatsSource {
                     Event::Seccomp => {
                         self.collector.seccomp_stops.fetch_add(1, Ordering::Relaxed);
                     }
-                    Event::Signal(_) => {
+                    Event::Signal(_) | Event::RawSignal(_) => {
                         self.collector.signal_stops.fetch_add(1, Ordering::Relaxed);
                     }
                     Event::Exit | Event::Stop | Event::Syscall => {}

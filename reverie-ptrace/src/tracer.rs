@@ -2091,6 +2091,8 @@ fn resume_group_sigstop_retaining(task: Stopped) -> Result<Running, (Stopped, Er
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HeldRootStopStatus {
     Signal(Signal),
+    /// A signal nix cannot name (`Event::RawSignal`).
+    RawSignal(i32),
     NewChild(EventChildLink),
     Exec(Pid),
     VforkDone,
@@ -2104,6 +2106,7 @@ impl HeldRootStop {
     pub(crate) fn from_event(task: &Stopped, event: &Event) -> Self {
         let status = match event {
             Event::Signal(signal) => HeldRootStopStatus::Signal(*signal),
+            Event::RawSignal(signal) => HeldRootStopStatus::RawSignal(*signal),
             Event::NewChild(op, child) => HeldRootStopStatus::NewChild(EventChildLink {
                 tid: child.pid(),
                 parent_tid: task.pid(),
@@ -2148,6 +2151,7 @@ impl HeldRootStop {
         }
         let class = match self.status {
             HeldRootStopStatus::Signal(signal) => Stop::Signal(signal as i32),
+            HeldRootStopStatus::RawSignal(signal) => Stop::Signal(signal),
             HeldRootStopStatus::NewChild(link) => Stop::Event(match link.op {
                 ChildOp::Fork => libc::PTRACE_EVENT_FORK,
                 ChildOp::Vfork => libc::PTRACE_EVENT_VFORK,
@@ -2300,6 +2304,33 @@ impl RootStopLease {
         signal: T,
     ) -> Result<Running, TraceError> {
         self.take_for_transition()?.syscall(signal)
+    }
+
+    /// `resume` for a signal that may be one nix cannot name.
+    pub(crate) fn resume_any(
+        self,
+        signal: Option<safeptrace::AnySignal>,
+    ) -> Result<Running, TraceError> {
+        match signal {
+            Some(signal) if signal.as_nix().is_none() => self.resume_raw(signal.raw()),
+            signal => self.resume(signal.and_then(safeptrace::AnySignal::as_nix)),
+        }
+    }
+
+    /// `resume`, delivering a raw signal number nix cannot name
+    /// (`Stopped::resume_raw`).
+    pub(crate) fn resume_raw(mut self, signal: i32) -> Result<Running, TraceError> {
+        self.take_for_transition()?.resume_raw(signal)
+    }
+
+    /// `step`, delivering a raw signal number (`Stopped::step_raw`).
+    pub(crate) fn step_raw(mut self, signal: i32) -> Result<Running, TraceError> {
+        self.take_for_transition()?.step_raw(signal)
+    }
+
+    /// `syscall`, delivering a raw signal number (`Stopped::syscall_raw`).
+    pub(crate) fn syscall_raw(mut self, signal: i32) -> Result<Running, TraceError> {
+        self.take_for_transition()?.syscall_raw(signal)
     }
 }
 

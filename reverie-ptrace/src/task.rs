@@ -59,6 +59,7 @@ use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallArgs;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
+use safeptrace::AnySignal;
 use safeptrace::ChildOp;
 use safeptrace::Error as TraceError;
 use safeptrace::Event;
@@ -401,17 +402,18 @@ enum HandleSignalResult {
     /// Signal is suppressed with task resumed.
     SignalSuppressed(Wait),
     /// signal needs to be delivered.
-    SignalToDeliver(Stopped, Signal),
+    SignalToDeliver(Stopped, AnySignal),
 }
 
 /// Whether a stop reported as `sig` without a ptrace event is a job-control
 /// group stop rather than a signal-delivery stop. Under `PTRACE_TRACEME` both
 /// look identical in the wait status; only a group stop has no siginfo, so
 /// `PTRACE_GETSIGINFO` fails with `EINVAL` (see ptrace(2), "Group-stop").
-fn is_group_stop(task: &Stopped, sig: Signal) -> Result<bool, TraceError> {
+fn is_group_stop(task: &Stopped, sig: impl Into<AnySignal>) -> Result<bool, TraceError> {
+    // A realtime signal (one nix cannot name) is never a stop signal.
     if !matches!(
-        sig,
-        Signal::SIGSTOP | Signal::SIGTSTP | Signal::SIGTTIN | Signal::SIGTTOU
+        sig.into().as_nix(),
+        Some(Signal::SIGSTOP | Signal::SIGTSTP | Signal::SIGTTIN | Signal::SIGTTOU)
     ) {
         return Ok(false);
     }
@@ -427,10 +429,14 @@ fn is_group_stop(task: &Stopped, sig: Signal) -> Result<bool, TraceError> {
 /// seccomp filter (`thread_may_be_seccomp_filtered`), which can refuse it or
 /// kill the tracer at it. The stop is then taken for a signal-delivery stop,
 /// as main takes it.
-fn is_group_stop_unless_filtered(task: &Stopped, sig: Signal) -> Result<bool, TraceError> {
+fn is_group_stop_unless_filtered(
+    task: &Stopped,
+    sig: impl Into<AnySignal>,
+) -> Result<bool, TraceError> {
+    let sig = sig.into();
     if !matches!(
-        sig,
-        Signal::SIGSTOP | Signal::SIGTSTP | Signal::SIGTTIN | Signal::SIGTTOU
+        sig.as_nix(),
+        Some(Signal::SIGSTOP | Signal::SIGTSTP | Signal::SIGTTIN | Signal::SIGTTOU)
     ) || thread_may_be_seccomp_filtered()
     {
         return Ok(false);
@@ -439,8 +445,8 @@ fn is_group_stop_unless_filtered(task: &Stopped, sig: Signal) -> Result<bool, Tr
 }
 
 /// The bit for `sig` in a kernel signal mask as read by `PTRACE_GETSIGMASK`.
-fn signal_mask_bit(sig: Signal) -> u64 {
-    1u64 << (sig as i32 - 1)
+fn signal_mask_bit(sig: impl Into<AnySignal>) -> u64 {
+    1u64 << (sig.into().raw() - 1)
 }
 
 /// A copy of a stop's siginfo, kept to be written back with
@@ -480,10 +486,11 @@ enum PrivateStep {
 /// Classifies the signal-delivery stop that ended a private-page step.
 fn classify_private_step(
     ip: u64,
-    signal: Signal,
+    signal: impl Into<AnySignal>,
     private_syscall: u64,
     syscall_len: u64,
 ) -> PrivateStep {
+    let signal = signal.into();
     if ip == private_syscall {
         PrivateStep::NotRun
     } else if Some(ip) == private_syscall.checked_add(syscall_len) {
@@ -501,7 +508,7 @@ fn classify_private_step(
 /// siginfo.
 #[derive(Clone, Copy)]
 struct TakenSignal {
-    signal: Signal,
+    signal: AnySignal,
     siginfo: StoredSiginfo,
     /// The same siginfo's bytes, as the kernel wrote them
     /// (`Stopped::getsiginfo_bytes`), which a Tool sees.
@@ -516,7 +523,7 @@ impl TakenSignal {
     /// kill the tracer at it. Without the record, the signal is resumed as
     /// main resumes it, and nothing is restored or counted for it
     /// (`resume_with_signal`).
-    fn at_stop(task: &Stopped, signal: Signal) -> Option<Self> {
+    fn at_stop(task: &Stopped, signal: AnySignal) -> Option<Self> {
         if thread_may_be_seccomp_filtered() {
             return None;
         }
@@ -532,21 +539,21 @@ impl TakenSignal {
 /// The signal a stopped guest resumes with, and, if
 /// `Tool::handle_signal_event` reported it, how its delivery stop took it.
 struct SignalResume {
-    signal: Option<Signal>,
+    signal: Option<AnySignal>,
     reported: Option<TakenSignal>,
     /// The siginfo the reporting callback chose for the signal
     /// (`Guest::set_signal_info`), written when the signal is resumed from a
     /// signal-delivery stop (`resume_with_signal`).
-    replacement: Option<(Signal, SiginfoBytes)>,
+    replacement: Option<(AnySignal, SiginfoBytes)>,
 }
 
 /// What `Tool::handle_signal_event` left for a signal (`report_signal`).
 struct SignalVerdict {
     /// The signal to resume with, `None` if the callback suppressed it.
-    signal: Option<Signal>,
+    signal: Option<AnySignal>,
     /// The siginfo the callback chose for its signal, with that signal
     /// (`Guest::set_signal_info`).
-    replacement: Option<(Signal, SiginfoBytes)>,
+    replacement: Option<(AnySignal, SiginfoBytes)>,
 }
 
 /// Linux's `siginfo_t` as bytes, the form a Tool reads and writes.
@@ -2332,7 +2339,7 @@ pub struct TracedTask<L: Tool> {
 
     /// pending signal to deliver. This can happen when
     /// syscall got interrupted (by signal)
-    pending_signal: Option<Signal>,
+    pending_signal: Option<AnySignal>,
 
     /// How the delivery stop of the signal in `pending_signal` took it, when
     /// `status_to_result` held it.
@@ -2362,18 +2369,18 @@ pub struct TracedTask<L: Tool> {
     /// for any other stop, `None` if no injection has completed. Set by
     /// `status_to_result`. Siginfo cannot classify the stop, because a guest
     /// may queue itself a SIGTRAP whose `si_code` mimics a syscall stop.
-    latest_injection_stop: Option<Option<Signal>>,
+    latest_injection_stop: Option<Option<AnySignal>>,
 
     /// Whether `Tool::handle_signal_event` is running (`report_signal`).
     in_signal_callback: bool,
 
     /// The signal the running `Tool::handle_signal_event` reports, and its
     /// siginfo when its stop recorded one (`Guest::signal_info`).
-    reported_signal: Option<(Signal, Option<SiginfoBytes>)>,
+    reported_signal: Option<(AnySignal, Option<SiginfoBytes>)>,
 
     /// The siginfo the running `Tool::handle_signal_event` chose for its
     /// signal (`Guest::set_signal_info`).
-    replacement_signal_info: Option<(Signal, SiginfoBytes)>,
+    replacement_signal_info: Option<(AnySignal, SiginfoBytes)>,
 
     /// Whether a syscall the running held-signal callback
     /// (`in_held_signal_callback`) injected, other than `restart_syscall`,
@@ -2435,7 +2442,7 @@ pub struct TracedTask<L: Tool> {
     /// it follows instances only for standard signals, which have at most
     /// one pending instance per queue; real-time signals, which can queue
     /// several, are out of its scope.
-    reported_requeued_signals: HashMap<Signal, u32>,
+    reported_requeued_signals: HashMap<AnySignal, u32>,
 
     /// A channel to allow short-circuiting the next state to main run loop. This
     /// is useful inside of `inject` or `tail_inject` where we might need to
@@ -3286,7 +3293,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                 arm_preinit_stop(held_root_stop, &task, &event);
                 match event {
                     Event::Signal(Signal::SIGTRAP) => break task,
-                    Event::Signal(sig) => {
+                    Event::Signal(_) | Event::RawSignal(_) => {
                         // We can catch spurious signals here, such as SIGWINCH.
                         // All we can do is skip over them.
                         tracing::debug!(
@@ -3294,8 +3301,14 @@ impl<L: Tool + 'static> TracedTask<L> {
                             task.pid(),
                             event
                         );
+                        let sig = match event {
+                            Event::Signal(sig) => AnySignal::from(sig),
+                            Event::RawSignal(raw) => AnySignal::new(raw).ok_or(Errno::EINVAL)?,
+                            _ => unreachable!(),
+                        };
                         let sig = owner.filter_direct_unreported(&task, sig).await;
-                        running = RootStopLease::new(task, held_root_stop.clone()).resume(sig)?;
+                        running =
+                            RootStopLease::new(task, held_root_stop.clone()).resume_any(sig)?;
                     }
                     Event::Seccomp => {
                         // Injected mmap trapped. We may not necessarily
@@ -3983,9 +3996,22 @@ impl<L: Tool + 'static> TracedTask<L> {
         self.ordinary_continuation()?;
         let result = match event {
             Event::Signal(sig) => self
-                .handle_signal(stopped, sig, unreported_stop_signal == Some(sig))
+                .handle_signal(stopped, sig.into(), unreported_stop_signal == Some(sig))
                 .await
                 .tracee_context(tid, "handle signal-delivery stop"),
+            // A realtime signal: reported to `Tool::handle_raw_signal_event`
+            // and delivered by its raw number
+            // (https://github.com/rrnewton/reverie/issues/207).
+            Event::RawSignal(raw) => match AnySignal::new(raw) {
+                Some(sig) => self
+                    .handle_signal(stopped, sig, false)
+                    .await
+                    .tracee_context(tid, "handle realtime signal-delivery stop"),
+                None => panic!(
+                    "tracee {} stopped for signal {}, which Linux does not have",
+                    tid, raw
+                ),
+            },
             Event::Exec(_new_pid) => self
                 .handle_exec_event(stopped)
                 .await
@@ -4119,7 +4145,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             let task = self.finish_disregarded_timer(task, disregarded).await?;
             let held = self.take_pending_signal_for_resume()?;
             let resume = self
-                .report_held_signal(&task, Some(Signal::SIGTRAP), held)
+                .report_held_signal(&task, Some(Signal::SIGTRAP.into()), held)
                 .await?;
             return self.resume_with_signal(task, resume).await;
         }
@@ -4178,7 +4204,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             self.injected_syscall_frame = None;
             let held = self.take_pending_signal_for_resume()?;
             let resume = self
-                .report_held_signal(&task, Some(Signal::SIGTRAP), held)
+                .report_held_signal(&task, Some(Signal::SIGTRAP.into()), held)
                 .await?;
             let wait = self.resume_with_signal(task, resume).await?;
             tracing::trace!(
@@ -4231,7 +4257,10 @@ impl<L: Tool + 'static> TracedTask<L> {
                     .await?;
                 return Ok(HandleSignalResult::SignalSuppressed(next_state));
             }
-            return Ok(HandleSignalResult::SignalToDeliver(task, Signal::SIGTRAP));
+            return Ok(HandleSignalResult::SignalToDeliver(
+                task,
+                Signal::SIGTRAP.into(),
+            ));
         }
 
         let rip_minus_one = regs.ip() - 1;
@@ -4331,16 +4360,19 @@ impl<L: Tool + 'static> TracedTask<L> {
                         .await?,
                 )
             }
-            _ => HandleSignalResult::SignalToDeliver(task, Signal::SIGSEGV),
+            _ => HandleSignalResult::SignalToDeliver(task, Signal::SIGSEGV.into()),
         })
     }
 
     #[cfg(not(target_arch = "x86_64"))]
     async fn handle_sigsegv(&mut self, task: Stopped) -> Result<HandleSignalResult, TraceError> {
-        Ok(HandleSignalResult::SignalToDeliver(task, Signal::SIGSEGV))
+        Ok(HandleSignalResult::SignalToDeliver(
+            task,
+            Signal::SIGSEGV.into(),
+        ))
     }
 
-    fn take_pending_signal_for_resume(&mut self) -> Result<Option<Signal>, TraceError> {
+    fn take_pending_signal_for_resume(&mut self) -> Result<Option<AnySignal>, TraceError> {
         Ok(self.pending_signal.take())
     }
 
@@ -4461,8 +4493,8 @@ impl<L: Tool + 'static> TracedTask<L> {
     async fn report_held_signal(
         &mut self,
         task: &Stopped,
-        stop_signal: Option<Signal>,
-        signal: Option<Signal>,
+        stop_signal: Option<AnySignal>,
+        signal: Option<AnySignal>,
     ) -> Result<SignalResume, TraceError> {
         let record = self.pending_signal_taken.take();
         let reported = std::mem::take(&mut self.pending_signal_reported);
@@ -4576,8 +4608,10 @@ impl<L: Tool + 'static> TracedTask<L> {
     /// `Tool::handle_signal_event`. A job-control stop signal is recorded
     /// (`unreported_stop_signal`), so that the group stop its delivery makes
     /// is reported instead.
-    fn pass_held_signal_unreported(&mut self, signal: Option<Signal>) -> SignalResume {
-        if let Some(sig @ (Signal::SIGTSTP | Signal::SIGTTIN | Signal::SIGTTOU)) = signal {
+    fn pass_held_signal_unreported(&mut self, signal: Option<AnySignal>) -> SignalResume {
+        if let Some(sig @ (Signal::SIGTSTP | Signal::SIGTTIN | Signal::SIGTTOU)) =
+            signal.and_then(AnySignal::as_nix)
+        {
             self.unreported_stop_signal = Some(sig);
         }
         SignalResume {
@@ -4601,7 +4635,7 @@ impl<L: Tool + 'static> TracedTask<L> {
     /// changes no count, kept or dropped.
     async fn pass_held_signal_unreported_unless_filtered(
         &mut self,
-        signal: Option<Signal>,
+        signal: Option<AnySignal>,
         taken: Option<TakenSignal>,
         restore_count: bool,
     ) -> Result<SignalResume, TraceError> {
@@ -4622,7 +4656,8 @@ impl<L: Tool + 'static> TracedTask<L> {
 
     /// Ends one reported, requeued instance of `sig`
     /// (`reported_requeued_signals`), returning whether there was one.
-    fn take_reported_requeue(&mut self, sig: Signal) -> bool {
+    fn take_reported_requeue(&mut self, sig: impl Into<AnySignal>) -> bool {
+        let sig = sig.into();
         let Some(count) = self.reported_requeued_signals.get_mut(&sig) else {
             return false;
         };
@@ -4644,7 +4679,12 @@ impl<L: Tool + 'static> TracedTask<L> {
     /// (`hold_pending_signal`), and its count ends. Kept, it goes back into
     /// the queue when the guest's mask blocks it (Linux's synchronous dequeue
     /// can take a blocked signal at a step), and then keeps its count.
-    async fn filter_direct_unreported(&mut self, task: &Stopped, sig: Signal) -> Option<Signal> {
+    async fn filter_direct_unreported(
+        &mut self,
+        task: &Stopped,
+        sig: impl Into<AnySignal>,
+    ) -> Option<AnySignal> {
+        let sig = sig.into();
         let counted = self.take_reported_requeue(sig);
         let info = TakenSignal::at_stop(task, sig).map(|taken| taken.bytes);
         if !self.keeps_unreported_signal(sig, info).await {
@@ -4675,7 +4715,13 @@ impl<L: Tool + 'static> TracedTask<L> {
     /// a guest's signal from the hook. Showing them all changes nothing for a
     /// Tool that keeps the signals it does not own, as the hook's contract
     /// requires and its default does.
-    async fn keeps_unreported_signal(&self, sig: Signal, info: Option<SiginfoBytes>) -> bool {
+    async fn keeps_unreported_signal(&self, sig: AnySignal, info: Option<SiginfoBytes>) -> bool {
+        // `UnreportedSignal` names a signal with nix's `Signal`, which has no
+        // realtime signals; one is kept, as the hook's default keeps every
+        // signal (https://github.com/rrnewton/reverie/issues/207).
+        let Some(sig) = sig.as_nix() else {
+            return true;
+        };
         let unreported = reverie::UnreportedSignal::new(self.pid(), self.tid(), sig, info);
         let keep = self
             .process_state
@@ -4771,9 +4817,31 @@ impl<L: Tool + 'static> TracedTask<L> {
             }
             task.setsiginfo_bytes(&bytes)?;
         }
-        self.resume_stopped(task, signal)?
+        self.resume_stopped_any(task, signal)?
             .next_state_with_owner(&self.ptracer_waits)
             .await
+    }
+
+    /// The Tool's verdict on `sig`: `Tool::handle_signal_event` for a signal
+    /// nix can name, `Tool::handle_raw_signal_event` for one it cannot (a
+    /// realtime signal; https://github.com/rrnewton/reverie/issues/207).
+    async fn tool_signal_verdict(&mut self, sig: AnySignal) -> Result<Option<AnySignal>, Errno> {
+        match sig.as_nix() {
+            Some(signal) => self
+                .process_state
+                .clone()
+                .handle_signal_event(self, signal)
+                .await
+                .map(|verdict| verdict.map(AnySignal::from)),
+            None => self
+                .process_state
+                .clone()
+                .handle_raw_signal_event(self, sig.raw())
+                .await?
+                // A number outside 1 to 64 names no signal to deliver.
+                .map(|raw| AnySignal::new(raw).ok_or(Errno::EINVAL))
+                .transpose(),
+        }
     }
 
     /// Runs `Tool::handle_signal_event` for `sig` and returns its verdict.
@@ -4789,7 +4857,7 @@ impl<L: Tool + 'static> TracedTask<L> {
     /// (<https://github.com/rrnewton/reverie/issues/862>).
     async fn report_signal(
         &mut self,
-        sig: Signal,
+        sig: AnySignal,
         held: bool,
         info: Option<SiginfoBytes>,
     ) -> Result<SignalVerdict, TraceError> {
@@ -4803,13 +4871,8 @@ impl<L: Tool + 'static> TracedTask<L> {
         let outer_held = std::mem::replace(&mut self.in_held_signal_callback, held);
         let result = if held {
             let outer_execed = std::mem::replace(&mut self.signal_callback_execed, false);
-            let result = cancellable(self.cancel_handler.clone(), async {
-                self.process_state
-                    .clone()
-                    .handle_signal_event(self, sig)
-                    .await
-            })
-            .await;
+            let result =
+                cancellable(self.cancel_handler.clone(), self.tool_signal_verdict(sig)).await;
             let execed = self.signal_callback_execed;
             self.signal_callback_execed = outer_execed || execed;
             // A callback that executed a program cannot ask for the signal:
@@ -4821,10 +4884,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             // none.
             result.unwrap_or(Ok((!execed).then_some(sig)))
         } else {
-            self.process_state
-                .clone()
-                .handle_signal_event(self, sig)
-                .await
+            self.tool_signal_verdict(sig).await
         };
         self.in_signal_callback = outer;
         self.reported_signal = outer_reported;
@@ -4899,11 +4959,13 @@ impl<L: Tool + 'static> TracedTask<L> {
     async fn handle_signal(
         &mut self,
         task: Stopped,
-        sig: Signal,
+        sig: AnySignal,
         report_group_stop: bool,
     ) -> Result<Wait, TraceError> {
         #[cfg(test)]
-        if let Some(stats) = self.global_state.backend_stats.as_ref() {
+        if let Some(stats) = self.global_state.backend_stats.as_ref()
+            && let Some(sig) = sig.as_nix()
+        {
             stats.record_signal_stop(&task, sig);
         }
         tracing::debug!("[{}] handle_signal: received signal {}", task.pid(), sig);
@@ -4940,11 +5002,11 @@ impl<L: Tool + 'static> TracedTask<L> {
         if !group_stop {
             self.take_reported_requeue(sig);
         }
-        let result = match sig {
-            Signal::SIGSEGV => self.handle_sigsegv(task).await?,
-            Signal::SIGSTOP => self.handle_sigstop(task).await?,
-            Signal::SIGTRAP => self.handle_sigtrap(task).await?,
-            sig if sig == Timer::signal_type() => {
+        let result = match sig.as_nix() {
+            Some(Signal::SIGSEGV) => self.handle_sigsegv(task).await?,
+            Some(Signal::SIGSTOP) => self.handle_sigstop(task).await?,
+            Some(Signal::SIGTRAP) => self.handle_sigtrap(task).await?,
+            Some(timer) if timer == Timer::signal_type() => {
                 let (was_timer, task) = self.handle_timer(task).await?;
                 if was_timer {
                     HandleSignalResult::SignalSuppressed(
@@ -4956,7 +5018,9 @@ impl<L: Tool + 'static> TracedTask<L> {
                     HandleSignalResult::SignalToDeliver(task, sig)
                 }
             }
-            sig => HandleSignalResult::SignalToDeliver(task, sig),
+            // A realtime signal (one nix cannot name) is always delivered
+            // to the guest after the Tool's verdict, like any other signal.
+            _ => HandleSignalResult::SignalToDeliver(task, sig),
         };
 
         match result {
@@ -5049,9 +5113,13 @@ impl<L: Tool + 'static> TracedTask<L> {
                     self.arm_liteinst_root_stop(&task, &event);
                     let signal = match event {
                         Event::Signal(signal) => self.filter_direct_unreported(&task, signal).await,
+                        Event::RawSignal(raw) => match AnySignal::new(raw) {
+                            Some(signal) => self.filter_direct_unreported(&task, signal).await,
+                            None => None,
+                        },
                         _ => None,
                     };
-                    running = self.resume_stopped(task, signal)?;
+                    running = self.resume_stopped_any(task, signal)?;
                 }
                 Wait::Exited(pid, exit_status) => return Ok(Wait::Exited(pid, exit_status)),
             }
@@ -5289,7 +5357,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                     .getregs()
                     .tracee_context(tid, "read registers for a test resume signal")?;
                 if let Some(sig) = hook(self.tid, &regs) {
-                    self.pending_signal = Some(sig);
+                    self.pending_signal = Some(sig.into());
                     self.pending_signal_taken = None;
                     self.pending_signal_reported = false;
                 }
@@ -5411,6 +5479,61 @@ impl<L: Tool + 'static> TracedTask<L> {
             return Err(Errno::ECANCELED.into());
         }
         self.lease_liteinst_root_stop(task).syscall(signal)
+    }
+
+    /// `resume_stopped` for a signal that may be one nix cannot name
+    /// (`AnySignal`), delivered by its raw number.
+    fn resume_stopped_any(
+        &self,
+        task: Stopped,
+        signal: Option<AnySignal>,
+    ) -> Result<Running, TraceError> {
+        match signal {
+            Some(signal) if signal.as_nix().is_none() => {
+                if self.global_state.fatal_session.is_failed() {
+                    return Err(Errno::ECANCELED.into());
+                }
+                self.lease_liteinst_root_stop(task).resume_raw(signal.raw())
+            }
+            signal => self.resume_stopped(task, signal.and_then(AnySignal::as_nix)),
+        }
+    }
+
+    /// `step_stopped` for a signal that may be one nix cannot name.
+    fn step_stopped_any(
+        &self,
+        task: Stopped,
+        signal: Option<AnySignal>,
+    ) -> Result<Running, TraceError> {
+        match signal {
+            Some(signal) if signal.as_nix().is_none() => {
+                if self.global_state.fatal_session.is_failed() {
+                    return Err(Errno::ECANCELED.into());
+                }
+                #[cfg(test)]
+                record_step_for_test(task.pid());
+                self.lease_liteinst_root_stop(task).step_raw(signal.raw())
+            }
+            signal => self.step_stopped(task, signal.and_then(AnySignal::as_nix)),
+        }
+    }
+
+    /// `syscall_stopped` for a signal that may be one nix cannot name.
+    fn syscall_stopped_any(
+        &self,
+        task: Stopped,
+        signal: Option<AnySignal>,
+    ) -> Result<Running, TraceError> {
+        match signal {
+            Some(signal) if signal.as_nix().is_none() => {
+                if self.global_state.fatal_session.is_failed() {
+                    return Err(Errno::ECANCELED.into());
+                }
+                self.lease_liteinst_root_stop(task)
+                    .syscall_raw(signal.raw())
+            }
+            signal => self.syscall_stopped(task, signal.and_then(AnySignal::as_nix)),
+        }
     }
 
     async fn handle_new_task(
@@ -7026,11 +7149,11 @@ impl<L: Tool + 'static> TracedTask<L> {
                     task.setregs(&regs)?;
                     break Ok(task);
                 }
-                Wait::Stopped(task, Event::Signal(sig)) => {
+                Wait::Stopped(task, event) if let Some(sig) = event.signal() => {
                     // We can get a spurious signal here, such as SIGWINCH. Skip
                     // past them until the tracee eventually arrives at SIGTRAP.
                     let sig = self.filter_direct_unreported(&task, sig).await;
-                    running = self.step_stopped(task, sig)?;
+                    running = self.step_stopped_any(task, sig)?;
                 }
                 Wait::Stopped(task, event) => {
                     panic!(
@@ -7363,7 +7486,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             let wait = running.next_state_with_owner(&self.ptracer_waits).await?;
             self.arm_liteinst_wait(&wait);
             let (stopped, sig) = match wait {
-                Wait::Stopped(stopped, Event::Signal(sig)) => {
+                Wait::Stopped(stopped, event) if let Some(sig) = event.signal() => {
                     if sig == Signal::SIGTRAP
                         && std::mem::take(&mut self.stale_private_step_trap)
                         && stopped.getregs()?.ip() != after_syscall
@@ -7379,7 +7502,10 @@ impl<L: Tool + 'static> TracedTask<L> {
                     }
                     if sig == Signal::SIGTRAP {
                         lift_requeued(&stopped, requeued)?;
-                        return Ok((Wait::Stopped(stopped, Event::Signal(sig)), seccomp_trapped));
+                        return Ok((
+                            Wait::Stopped(stopped, Event::from_signal(sig)),
+                            seccomp_trapped,
+                        ));
                     }
                     (stopped, sig)
                 }
@@ -7432,7 +7558,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                         nr
                     );
                     returned |= bit;
-                    running = self.step_stopped(stopped, sig)?;
+                    running = self.step_stopped_any(stopped, Some(sig))?;
                 } else if let Some(mask) = mask {
                     tracing::debug!(
                         "[scheduler/tool] (pid = {}) requeueing {} delivered after injected {} completed",
@@ -7443,7 +7569,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                     stopped.setsigmask(mask | bit)?;
                     requeued |= bit;
                     returned |= bit;
-                    running = self.step_stopped(stopped, sig)?;
+                    running = self.step_stopped_any(stopped, Some(sig))?;
                 } else {
                     tracing::debug!(
                         "[scheduler/tool] (pid = {}) holding {} delivered after injected {} completed; later signals stay queued",
@@ -7453,11 +7579,17 @@ impl<L: Tool + 'static> TracedTask<L> {
                     );
                     lift_requeued(&stopped, requeued)?;
                     self.stale_private_step_trap = true;
-                    return Ok((Wait::Stopped(stopped, Event::Signal(sig)), seccomp_trapped));
+                    return Ok((
+                        Wait::Stopped(stopped, Event::from_signal(sig)),
+                        seccomp_trapped,
+                    ));
                 }
             } else {
                 lift_requeued(&stopped, requeued)?;
-                return Ok((Wait::Stopped(stopped, Event::Signal(sig)), seccomp_trapped));
+                return Ok((
+                    Wait::Stopped(stopped, Event::from_signal(sig)),
+                    seccomp_trapped,
+                ));
             }
         }
     }
@@ -7511,15 +7643,18 @@ impl<L: Tool + 'static> TracedTask<L> {
         seccomp_trapped: bool,
         nr: Sysno,
     ) -> Result<(Wait, bool), TraceError> {
-        fn requeueable(sig: Signal) -> bool {
-            !matches!(sig, Signal::SIGKILL | Signal::SIGSTOP | Signal::SIGTRAP)
+        fn requeueable(sig: AnySignal) -> bool {
+            !matches!(
+                sig.as_nix(),
+                Some(Signal::SIGKILL | Signal::SIGSTOP | Signal::SIGTRAP)
+            )
         }
         fn before_instruction(stopped: &Stopped) -> Result<bool, TraceError> {
             Ok(stopped.getregs()?.ip() as usize == cp::PRIVATE_PAGE_OFFSET)
         }
         match &wait {
-            Wait::Stopped(stopped, Event::Signal(sig))
-                if requeueable(*sig) && before_instruction(stopped)? => {}
+            Wait::Stopped(stopped, event)
+                if event.signal().is_some_and(requeueable) && before_instruction(stopped)? => {}
             _ => return Ok((wait, seccomp_trapped)),
         }
         let Wait::Stopped(stopped, _) = &wait else {
@@ -7530,8 +7665,10 @@ impl<L: Tool + 'static> TracedTask<L> {
         let mut wait = wait;
         loop {
             match wait {
-                Wait::Stopped(stopped, Event::Signal(sig))
-                    if requeueable(sig) && before_instruction(&stopped)? =>
+                Wait::Stopped(stopped, event)
+                    if let Some(sig) = event.signal()
+                        && requeueable(sig)
+                        && before_instruction(&stopped)? =>
                 {
                     let deliver = if is_group_stop(&stopped, sig)? {
                         None
@@ -7546,7 +7683,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                         Some(sig)
                     };
                     wait = self
-                        .syscall_stopped(stopped, deliver)?
+                        .syscall_stopped_any(stopped, deliver)?
                         .next_state_with_owner(&self.ptracer_waits)
                         .await?;
                     self.arm_liteinst_wait(&wait);
@@ -7586,7 +7723,12 @@ impl<L: Tool + 'static> TracedTask<L> {
     fn note_injection_stop(&mut self, wait: &Wait) -> Result<(), TraceError> {
         if let Wait::Stopped(stopped, event) = wait {
             self.latest_injection_stop = Some(match event {
-                Event::Signal(sig) if !is_group_stop_unless_filtered(stopped, *sig)? => Some(*sig),
+                event
+                    if let Some(sig) = event.signal()
+                        && !is_group_stop_unless_filtered(stopped, sig)? =>
+                {
+                    Some(sig)
+                }
                 _ => None,
             });
         }
@@ -7597,7 +7739,7 @@ impl<L: Tool + 'static> TracedTask<L> {
     /// stop `stopped`, in `pending_signal` for delivery when the guest resumes
     /// at its syscall site, and records what it was taken with
     /// (`pending_signal_taken`, see `status_to_result`).
-    fn hold_pending_signal(&mut self, stopped: &Stopped, sig: Signal) {
+    fn hold_pending_signal(&mut self, stopped: &Stopped, sig: AnySignal) {
         if let Some(held) = self.pending_signal {
             // TaskGraph reverie_pending_signal_single_slot.
             tracing::warn!(
@@ -7626,7 +7768,10 @@ impl<L: Tool + 'static> TracedTask<L> {
         self.note_injection_stop(&wait_status)?;
         match wait_status {
             Wait::Stopped(stopped, event) => match event {
-                Event::Signal(sig) if context.is_none() => {
+                event
+                    if let Some(sig) = event.signal()
+                        && context.is_none() =>
+                {
                     // The guest's own pending syscall, resumed from its
                     // syscall stop to its exit (`inner_inject`). Linux reports
                     // the exit stop before any signal-delivery stop for a
@@ -7641,7 +7786,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                     }
                     Ok(Err(Errno::ERESTARTSYS))
                 }
-                Event::Signal(sig) => {
+                event if let Some(sig) = event.signal() => {
                     let mut regs = stopped.getregs()?;
                     // NB: it is possible to get interrupted by signal (such as
                     // SIGCHLD) before single step finishes, while RIP still
@@ -8199,7 +8344,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                 // TODO: combine with handle_signal!
                 Event::Signal(Signal::SIGCHLD) => {
                     let sig = self.filter_direct_unreported(&task, Signal::SIGCHLD).await;
-                    let running = self.step_stopped(task, sig)?;
+                    let running = self.step_stopped_any(task, sig)?;
                     let wait = running
                         .next_state_with_owner(&self.ptracer_waits)
                         .await?
@@ -8400,7 +8545,7 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
         };
         // Linux replaces a siginfo whose `si_signo` is not the resumed
         // signal's, so a mismatched one could never be delivered.
-        if i32::from_ne_bytes(info[0..4].try_into().expect("four bytes")) != signal as i32 {
+        if i32::from_ne_bytes(info[0..4].try_into().expect("four bytes")) != signal.raw() {
             return Err(Errno::EINVAL);
         }
         // Written now, from the signal-delivery stop the thread is at, so a

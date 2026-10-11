@@ -82,17 +82,23 @@ pub fn waitpidfd(raw_fd: RawFd, flags: WaitPidFlag) -> Result<Option<i32>, Errno
 /// Lossless wait status for a notifier-owned thread or pidfd.
 #[cfg(feature = "notifier")]
 pub fn wait_raw(id: IdType, flags: WaitPidFlag) -> Result<Option<i32>, Errno> {
+    Ok(wait_status(id, flags)?.map(|(_, status)| status))
+}
+
+/// The PID that changed state and its lossless wait status, or `None` when
+/// no state changed (`WNOHANG`).
+pub fn wait_status(id: IdType, flags: WaitPidFlag) -> Result<Option<(Pid, i32)>, Errno> {
     let si = waitid_si(id, flags)?;
 
-    if unsafe { si.si_pid() } == 0 {
+    let pid = unsafe { si.si_pid() };
+    if pid == 0 {
         return Ok(None);
     }
 
-    Ok(Some(siginfo_to_status(si)))
+    Ok(Some((Pid::from_raw(pid), siginfo_to_status(si))))
 }
 
 // Converts a siginfo to a more compact status code.
-#[cfg(feature = "notifier")]
 fn siginfo_to_status(si: libc::siginfo_t) -> i32 {
     let si_status = unsafe { si.si_status() };
 
@@ -106,10 +112,12 @@ fn siginfo_to_status(si: libc::siginfo_t) -> i32 {
         other => panic!("unexpected si_code: {}", other),
     };
 
-    debug_assert_eq!(
-        siginfo_to_waitstatus(si),
-        WaitStatus::from_raw(Pid::from_raw(unsafe { si.si_pid() }), status).unwrap()
-    );
+    // Cross-check against nix's decoder where it can decode at all: it cannot
+    // name a realtime signal (32 to 64), and the raw status above is what the
+    // caller uses (https://github.com/rrnewton/reverie/issues/207).
+    if let Ok(decoded) = WaitStatus::from_raw(Pid::from_raw(unsafe { si.si_pid() }), status) {
+        debug_assert_eq!(siginfo_to_waitstatus(si), decoded);
+    }
 
     status
 }
@@ -145,6 +153,9 @@ fn siginfo_to_waitstatus(si: libc::siginfo_t) -> WaitStatus {
 ///   - Err when syscall returns -1.
 ///   - OK(WaitStatus::StillAlive) when no state change
 ///   - OK(WaitStatus::...) when state has changed.
+///
+/// `WaitStatus` cannot hold a realtime signal; [`wait_status`] keeps it.
+#[cfg(test)]
 pub fn waitid(waitid_type: IdType, flags: WaitPidFlag) -> Result<WaitStatus, Errno> {
     let siginfo = waitid_si(waitid_type, flags)?;
 

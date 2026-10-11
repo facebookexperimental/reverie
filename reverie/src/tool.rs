@@ -787,6 +787,26 @@ pub trait Tool: Send + Sync + Default {
         Ok(Some(signal))
     }
 
+    /// Handles a guest's signal that [`Signal`] cannot name before it is
+    /// delivered to the guest: a realtime signal, numbered 32 to 64 (glibc
+    /// reserves 32 and 33, so `SIGRTMIN()` is 34). `signal` is the raw number.
+    /// A backend reports every other signal to [`Tool::handle_signal_event`]
+    /// (<https://github.com/rrnewton/reverie/issues/207>).
+    ///
+    /// # Return value
+    ///  - `Some(sig)`: the raw signal `sig` will be delivered to the guest.
+    ///  - `None`: the signal is suppressed and never delivered to the guest.
+    ///
+    /// The default delivers it unchanged, as a backend that could not report
+    /// it would.
+    async fn handle_raw_signal_event<T: Guest<Self>>(
+        &self,
+        _guest: &mut T,
+        signal: i32,
+    ) -> Result<Option<i32>, Errno> {
+        Ok(Some(signal))
+    }
+
     /// Decides whether a signal that the backend passes to the guest without
     /// reporting it to [`Tool::handle_signal_event`] reaches the guest at all.
     ///
