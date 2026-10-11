@@ -40,7 +40,12 @@ valid and stable from the native scan through copying the selected value.
 This leaf deliberately ignores an interposed `getenv` for its Tool selector,
 and its constructor root cannot be replaced by interposing the public generic
 initializer. The separately exported `reverie_liteinst_initialize` retains its
-`std::env`/`getenv` selection semantics for embeddings. On the active leaf,
+`std::env`/`getenv` selection semantics for embeddings, now on its own fresh
+fixed guarded startup stack before the first Rust instruction. An explicit
+call selecting no Tool still retains that reservation without activating a
+runtime. A repeated call or existing region refuses before a second selector
+or body call. See [the stack storage contract](STACK_MEMORY.md) for its scalar
+startup requirements and separate ownership diagnostics. On the active leaf,
 runtime initialization and its dispatch scope finish before the compatibility
 resolver runs. Earlier loader/CRT initialization and the inert resolver are
 outside the constructor-stack placement guarantee.

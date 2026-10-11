@@ -61,9 +61,29 @@ that lease for process lifetime and restores the loader's original stack on
 return. The runtime initializes before its compatibility resolver, and both
 run on that owned stack. A missing raw Tool selector leaves the preload inert;
 its compatibility resolver retains its existing placement. Earlier loader,
-CRT and lazy compatibility work remain outside this guarantee. Other Tool
-roots must explicitly use the bootstrap; exporting a generic initializer does
-not place calls to it on an owned stack.
+CRT and lazy compatibility work remain outside this guarantee.
+
+The separate public `reverie_liteinst_initialize` entry also reserves a fresh
+fixed guarded 8 MiB startup stack before entering Rust, including the dispatch
+scope, allocator preflight and `std::env`/`getenv` selector. It retains the
+existing getter semantics. An explicit call whose getter selects no Tool
+returns with the reservation retained and without installing a runtime; this
+is different from the selector-absent standalone constructor, which stays
+inert without reserving the region. A second explicit call, a pre-existing
+ordinary region or any fixed-address collision attempts exit127 before the
+getter or body runs, with no stderr write or guest-stack fallback. Call once
+per image during trusted single-threaded startup, before any runtime filter,
+using the scalar SysV ABI. Nonlocal exits and asynchronous signal-frame
+isolation are outside this entry contract.
+
+Constructor and explicit-generic startup use distinct private ownership
+records and diagnostics. Neither can adopt the other's record or an ordinary
+reservation. The stack lease remains occupied through normal return and plain
+fork COW. Using the fixed stack does not change a legacy embedding's selected
+allocator: `ScopedToolAllocator` remains its explicit compatibility policy;
+only the isolated preload's `PrivateToolAllocator` supplies the unconditional
+Rust allocation barrier. Other Tool roots must explicitly use an appropriate
+bootstrap; merely exporting a function supplies no placement guarantee.
 
 These leases establish placement and boundary guards. Their interiors remain
 on protection key zero. They do not prevent a guest from writing an interior

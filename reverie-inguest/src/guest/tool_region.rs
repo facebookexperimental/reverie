@@ -94,7 +94,7 @@ pub enum StackBacking {
 #[derive(Debug)]
 pub struct ToolRegion {
     control: *mut Control,
-    bootstrap: Option<usize>,
+    bootstrap: Option<constructor::BootstrapOwner>,
 }
 
 // SAFETY: the mapping lives until process exit. Every bitmap access holds its
@@ -358,8 +358,12 @@ pub use constructor::ConstructorStack;
 pub use constructor::ConstructorStackRecord;
 pub use constructor::constructor_entry;
 pub use constructor::constructor_stack;
+#[doc(hidden)]
+pub use constructor::generic_entry;
 #[cfg(feature = "allocator-fixture")]
 pub use constructor::reverie_inguest_constructor_stack_query;
+#[cfg(feature = "allocator-fixture")]
+pub use constructor::reverie_inguest_generic_stack_query;
 
 fn validate_reservation(mapping: usize) -> Result<(), i32> {
     if mapping == BASE {

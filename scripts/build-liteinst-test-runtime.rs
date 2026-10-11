@@ -17,6 +17,7 @@
 //! exact Cargo profile object, oracle paths/hashes and source HEAD/tree/lock hash.
 //! No directory search or warm-file fallback is permitted.
 
+mod generic_bootstrap_fixture;
 pub mod m1_artifact;
 mod standalone_constructor_fixture;
 
@@ -313,7 +314,16 @@ fn produce_standalone_inputs(
     })
 }
 
-fn produce(config: Config) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf, StandaloneInputs)> {
+fn produce(
+    config: Config,
+) -> Result<(
+    PathBuf,
+    PathBuf,
+    PathBuf,
+    PathBuf,
+    StandaloneInputs,
+    (PathBuf, PathBuf),
+)> {
     check(
         config.workspace_root.is_absolute()
             && config.target_directory.is_absolute()
@@ -500,6 +510,7 @@ fn produce(config: Config) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf, Standa
     let (stack_guest_path, stack_guest_receipt_path) =
         produce_stack_guest(&root, &bundle, &mut runner)?;
     let standalone = produce_standalone_inputs(&root, &bundle, &mut runner)?;
+    let generic = generic_bootstrap_fixture::produce(&root, &bundle, &mut runner)?;
     let after =
         m1_artifact::source_identity(&root, &root.join("Cargo.lock"), &oracles, &mut runner)?;
     check(
@@ -598,6 +609,8 @@ fn produce(config: Config) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf, Standa
             "REVERIE_LITEINST_ROOT_INTERPOSER_MANIFEST",
             standalone.root_receipt.as_path(),
         ),
+        (generic_bootstrap_fixture::GUEST_ENV, generic.0.as_path()),
+        (generic_bootstrap_fixture::RECEIPT_ENV, generic.1.as_path()),
     ]);
     let mut shell = String::new();
     let mut github = String::new();
@@ -621,6 +634,7 @@ fn produce(config: Config) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf, Standa
         stack_guest_path,
         stack_guest_receipt_path,
         standalone,
+        generic,
     ))
 }
 
@@ -647,8 +661,14 @@ fn run() -> Result<()> {
         serde_json::from_slice(&fs::read(&path).map_err(|e| format!("read config: {e}"))?)
             .map_err(|e| format!("producer config: {e}"))?
     };
-    let (receipt_path, guest_receipt_path, stack_guest_path, stack_guest_receipt_path, standalone) =
-        produce(config)?;
+    let (
+        receipt_path,
+        guest_receipt_path,
+        stack_guest_path,
+        stack_guest_receipt_path,
+        standalone,
+        generic,
+    ) = produce(config)?;
     // JSON output is data, never a shell `export` snippet with quote ambiguity.
     let receipt: RuntimeReceipt =
         serde_json::from_slice(&fs::read(&receipt_path).map_err(|e| e.to_string())?)
@@ -669,6 +689,8 @@ fn run() -> Result<()> {
             "REVERIE_LITEINST_CONSTRUCTOR_GUEST_MANIFEST": standalone.guest_receipt,
             "REVERIE_LITEINST_ROOT_INTERPOSER": standalone.root,
             "REVERIE_LITEINST_ROOT_INTERPOSER_MANIFEST": standalone.root_receipt,
+            "REVERIE_LITEINST_GENERIC_GUEST": generic.0,
+            "REVERIE_LITEINST_GENERIC_GUEST_MANIFEST": generic.1,
             "artifact_sha256": receipt.artifact.sha256,
             "guest_sha256": guest.binary.sha256,
             "executed_tests": 0,

@@ -43,6 +43,7 @@ fn native() -> ConstructorStack {
     assert_eq!(stack.extent_end, STACK_EXTENT_END);
     assert_eq!(stack.owner_tid as i64, raw(libc::SYS_gettid, [0; 6]));
     assert_eq!(stack.body_entry, body as *const () as usize);
+    assert_eq!(stack.body_call_sample_rsp, STACK_TOP - 16);
     for rsp in [
         stack.first_rust_sample_rsp,
         stack.body_call_sample_rsp,

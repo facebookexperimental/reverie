@@ -15,6 +15,9 @@ compile_error!("reverie-liteinst requires Linux x86-64");
 #[doc(hidden)]
 pub mod allocator_fixture;
 mod backend;
+#[cfg(feature = "allocator-fixture")]
+#[doc(hidden)]
+pub mod generic_fixture;
 mod interior_entry;
 mod patch_alloc;
 #[cfg(feature = "allocator-fixture")]
@@ -250,18 +253,53 @@ pub fn set_guest_site_patching(command: &mut Command, enabled: bool) {
 /// LiteInst constructor. The independent legacy `reverie-inguest` constructor
 /// can still be enabled by that dependency's `preload-constructor` feature.
 /// A caller whose allocator does not own the dispatch preflight allocation is
-/// refused before runtime activation.
+/// refused before runtime activation. This explicit call first reserves a fixed
+/// guarded scalar stack, even when its environment getter selects no Tool. Such
+/// a call returns with that reservation retained and without runtime activation.
+/// A repeated call, or an already-owned/colliding region, refuses before a
+/// second getter/body invocation. The selector-absent standalone constructor
+/// remains a separate inert path and does not call this entry.
 ///
 /// # Safety
 ///
-/// The dynamic loader must call this exactly once before application threads
-/// start. Calling it again would stack an irreversible seccomp filter.
+/// Call once during trusted single-threaded startup, with clear DF and no
+/// active runtime filter. Repeated calls refuse before reading the selector
+/// or installing another runtime.
+#[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reverie_liteinst_initialize() {
+    core::arch::naked_asm!(
+        "endbr64",
+        "lea rdi, [rip + {body}]",
+        "jmp {entry}",
+        body = sym reverie_liteinst_generic_body,
+        entry = sym reverie_inguest::guest::tool_region::generic_entry,
+    );
+}
+
+// Distinct local Rust body: the existing dispatch/preflight/getter order stays
+// intact, and only the native entry may supply this body to its fresh bootstrap.
+#[unsafe(no_mangle)]
+#[inline(never)]
+unsafe extern "C" fn reverie_liteinst_generic_body() {
     let _scope = reverie_inguest::guest::alloc::enter_dispatch();
     initialization_or_exit(
         patch_alloc::preflight_allocator().and_then(|()| runtime::initialize_from_environment()),
     );
+}
+
+core::arch::global_asm!(".hidden reverie_liteinst_generic_body");
+
+/// Establish an ordinary region owner for the explicit-entry refusal control.
+/// This setup operation is separate from all read-only placement queries.
+#[cfg(feature = "allocator-fixture")]
+#[doc(hidden)]
+#[unsafe(no_mangle)]
+pub extern "C" fn m4_generic_ordinary_owner_setup() -> i32 {
+    match reverie_inguest::guest::tool_region::ToolRegion::reserve() {
+        Ok(_) => 0,
+        Err(error) => -error.raw_os_error().unwrap_or(libc::EIO),
+    }
 }
 
 /// Initialize the actual standalone leaf after native fixed-stack adoption.

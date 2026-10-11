@@ -88,6 +88,11 @@ name = "standalone_constructor"
 path = "tests/standalone_constructor.rs"
 required-features = ["allocator-fixture"]
 
+[[test]]
+name = "generic_bootstrap"
+path = "tests/generic_bootstrap.rs"
+required-features = ["allocator-fixture"]
+
 [[bin]]
 name = "reverie-liteinst-exec-guest"
 path = "src/bin/exec_guest.rs"

@@ -42,6 +42,9 @@ pub const SCHEMA: u32 = 2;
 /// embeddings and Detcore continue to request their exported initializer name.
 pub const STANDALONE_ROOT: &str = "reverie_liteinst_standalone_entry";
 const GENERIC_INITIALIZER: &str = "reverie_liteinst_initialize";
+const GENERIC_BODY: &str = "reverie_liteinst_generic_body";
+const GENERIC_BRIDGE: &str = "reverie_inguest_generic_entry";
+const GENERIC_ADOPTION: &str = "reverie_inguest_generic_adopt_entry";
 const STANDALONE_BODY: &str = "reverie_liteinst_standalone_body";
 const STANDALONE_INITIALIZER: &str = "reverie_liteinst_standalone_initialize";
 const STANDALONE_RESOLVER: &str = "reverie_liteinst_resolve_real_dl_find_object";
@@ -776,7 +779,8 @@ pub struct SymbolEvidence {
     pub visibility: u8,
 }
 
-/// Constructor-only evidence for the normal, feature-empty standalone leaf.
+/// Constructor and mandatory public generic-route evidence for the normal,
+/// feature-empty standalone leaf.
 /// This distinct type cannot satisfy the mandatory diagnostic RuntimeReceipt.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -786,6 +790,7 @@ pub struct ConstructorQualification {
     pub init_array_slot: u64,
     pub init_array_resolution: String,
     pub standalone_constructor: StandaloneConstructorEvidence,
+    pub generic_bootstrap: GenericBootstrapEvidence,
     pub needed: Vec<String>,
     pub required_versions: Vec<String>,
     pub readelf_versions: FileIdentity,
@@ -803,6 +808,9 @@ pub struct ElfQualification {
     /// constructor routing evidence, not execution or whole-memory isolation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub standalone_constructor: Option<StandaloneConstructorEvidence>,
+    /// Mandatory even when an embedding requests a different initializer.
+    /// Old receipts cannot omit this route or replace it with a source label.
+    pub generic_bootstrap: GenericBootstrapEvidence,
     pub exports: Vec<SymbolEvidence>,
     pub allocation_shims: BTreeMap<String, SymbolEvidence>,
     pub needed: Vec<String>,
@@ -843,14 +851,17 @@ pub struct StandaloneConstructorEvidence {
     pub selected_initializer: SymbolEvidence,
     pub resolver: SymbolEvidence,
     pub bridge: SymbolEvidence,
-    pub adoption: SymbolEvidence,
+    pub native_dispatch_version: u32,
+    pub prepare: SymbolEvidence,
     /// Zero-size interior instruction label, not a standalone function.
     pub native_gate: SymbolEvidence,
     pub native_gate_owner: SymbolEvidence,
     pub native_gate_return: SymbolEvidence,
     pub native_gate_offset: u64,
-    /// Finite dev Result::is_err call route; never a generic graph edge.
-    pub adoption_helper_edges: Vec<GotEdge>,
+    /// Actual independently selected preparation roles; never a body dispatch edge.
+    pub preparation_helpers: BTreeMap<String, SymbolEvidence>,
+    pub prepare_helper_transfers: Vec<ConstructorTransfer>,
+    pub prepare_helper_edges: Vec<GotEdge>,
     pub function_sha256: BTreeMap<String, String>,
     pub environ_got_slot: u64,
     pub selector_address: u64,
@@ -859,10 +870,64 @@ pub struct StandaloneConstructorEvidence {
     pub inert_resolver_transfer: ConstructorTransfer,
     pub body_initializer_call: ConstructorTransfer,
     pub body_resolver_transfer: ConstructorTransfer,
-    pub bridge_adoption_call: ConstructorTransfer,
-    pub body_pointer_load: u64,
-    pub adoption_body_call: u64,
-    pub adoption_recipe: String,
+    pub bridge_prepare_call: ConstructorTransfer,
+    pub prepare_return: u64,
+    pub native_body_retain: u64,
+    pub native_ready_gate: u64,
+    pub native_body_identity_check: u64,
+    pub native_body_sample_store: u64,
+    /// Genuine native CALL R15, not a fictitious direct ConstructorTransfer.
+    pub native_body_call: u64,
+    pub native_body_call_width: u8,
+    pub native_body_return: u64,
+    pub native_returned_store: u64,
+    pub native_restore: u64,
+    pub native_return: u64,
+    pub bootstrap_record: u64,
+    pub bootstrap_bottom: u64,
+    pub bootstrap_top: u64,
+    pub observation: String,
+}
+
+/// Complete emitted public-entry -> native bridge -> adoption -> supplied-body
+/// evidence. This records actual ELF roles and bytes, not execution, allocator
+/// ownership, successful runtime initialization or whole-memory isolation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenericBootstrapEvidence {
+    pub public_initializer: SymbolEvidence,
+    pub body: SymbolEvidence,
+    pub bridge: SymbolEvidence,
+    pub native_dispatch_version: u32,
+    pub prepare: SymbolEvidence,
+    pub native_gate: SymbolEvidence,
+    pub native_gate_owner: SymbolEvidence,
+    pub native_gate_return: SymbolEvidence,
+    pub native_gate_offset: u64,
+    pub initializing_guard: u64,
+    pub function_sha256: BTreeMap<String, String>,
+    pub body_materialization: u64,
+    pub entry_bridge_transfer: ConstructorTransfer,
+    pub bridge_prepare_call: ConstructorTransfer,
+    pub prepare_return: u64,
+    pub native_body_retain: u64,
+    pub native_ready_gate: u64,
+    pub native_body_identity_check: u64,
+    pub native_body_sample_store: u64,
+    /// Genuine native CALL R15, not a fictitious direct ConstructorTransfer.
+    pub native_body_call: u64,
+    pub native_body_call_width: u8,
+    pub native_body_return: u64,
+    pub native_returned_store: u64,
+    pub native_body_save: u64,
+    pub native_stack_switch: u64,
+    pub native_restore: u64,
+    pub native_return: u64,
+    pub terminal_exit_transfer: ConstructorTransfer,
+    pub terminal_ud2: u64,
+    pub preparation_helpers: BTreeMap<String, SymbolEvidence>,
+    pub prepare_helper_transfers: Vec<ConstructorTransfer>,
+    pub prepare_helper_edges: Vec<GotEdge>,
     pub bootstrap_record: u64,
     pub bootstrap_bottom: u64,
     pub bootstrap_top: u64,
@@ -1138,12 +1203,9 @@ fn standalone_symbols(elf: &Elf<'_>) -> Result<BTreeMap<String, sym::Sym>> {
     ] {
         symbols.insert(name.to_owned(), private_function(elf, name)?);
     }
-    // The dev adoption compiler emits a local Result<&ToolRegion,i32>::is_err
-    // call. Select its full range only by the exact type/method role. Optimized
-    // code may inline it; no arbitrary std function becomes a graph endpoint.
-    for (name, symbol) in constructor_result_helpers(elf)? {
-        symbols.insert(name, symbol);
-    }
+    // Whole private typed owner helpers remain source-bound preparation roles.
+    // They confer no supplied-body target or compiler-frame dispatch proof.
+    symbols.extend(preparation_symbols(elf)?);
     // This cannot be inferred from an rlib/no_mangle declaration. Require the
     // actual public dynamic export even when the real leaf no longer calls it.
     symbols.insert(
@@ -1162,35 +1224,317 @@ fn standalone_symbols(elf: &Elf<'_>) -> Result<BTreeMap<String, sym::Sym>> {
     Ok(symbols)
 }
 
-fn constructor_result_helpers(elf: &Elf<'_>) -> Result<BTreeMap<String, sym::Sym>> {
+fn generic_public_initializer(elf: &Elf<'_>) -> Result<sym::Sym> {
+    let (_, initializer) = export(elf, GENERIC_INITIALIZER)?;
+    require(
+        initializer.st_visibility() == sym::STV_DEFAULT && initializer.st_size == 16,
+        "public generic initializer must retain its strong DEFAULT-visible 16-byte ABI entry",
+    )?;
+    require(
+        elf.syms
+            .iter()
+            .filter(|s| {
+                elf.strtab.get_at(s.st_name) == Some(GENERIC_INITIALIZER)
+                    && executable_symbol(elf, s)
+            })
+            .all(|s| {
+                s.st_value == initializer.st_value
+                    && s.st_size == initializer.st_size
+                    && s.st_bind() == sym::STB_GLOBAL
+                    && s.st_visibility() == sym::STV_DEFAULT
+            }),
+        "public generic initializer has conflicting static/dynamic ABI identities",
+    )?;
+    Ok(initializer)
+}
+
+fn generic_symbols(elf: &Elf<'_>) -> Result<BTreeMap<String, sym::Sym>> {
+    let mut symbols = BTreeMap::from([(
+        GENERIC_INITIALIZER.to_owned(),
+        generic_public_initializer(elf)?,
+    )]);
+    for name in [GENERIC_BODY, GENERIC_BRIDGE, GENERIC_ADOPTION] {
+        let function = private_function(elf, name)?;
+        require(
+            elf.syms
+                .iter()
+                .filter(|s| elf.strtab.get_at(s.st_name) == Some(name) && executable_symbol(elf, s))
+                .chain(elf.dynsyms.iter().filter(|s| {
+                    elf.dynstrtab.get_at(s.st_name) == Some(name) && executable_symbol(elf, s)
+                }))
+                .all(|s| {
+                    s.st_visibility() == sym::STV_HIDDEN
+                        && matches!(s.st_bind(), sym::STB_LOCAL | sym::STB_GLOBAL)
+                }),
+            format!("generic bootstrap role {name} must be a defined hidden function"),
+        )?;
+        symbols.insert(name.to_owned(), function);
+    }
+    symbols.insert(
+        CONSTRUCTOR_GATE_OWNER.to_owned(),
+        private_function(elf, CONSTRUCTOR_GATE_OWNER)?,
+    );
+    symbols.extend(preparation_symbols(elf)?);
+    // Roles must own distinct complete functions. Alias names or overlapping
+    // ranges cannot manufacture a bridge, body or adoption operand route.
+    require_disjoint_bootstrap_roles(&symbols)?;
+    Ok(symbols)
+}
+
+fn require_disjoint_bootstrap_roles(symbols: &BTreeMap<String, sym::Sym>) -> Result<()> {
+    let roles: Vec<_> = symbols.iter().collect();
+    for (index, (name, function)) in roles.iter().enumerate() {
+        let end = function
+            .st_value
+            .checked_add(function.st_size)
+            .ok_or("bootstrap function range overflows")?;
+        require(
+            function.st_size != 0,
+            "bootstrap role has no complete function extent",
+        )?;
+        for (other_name, other) in &roles[index + 1..] {
+            let other_end = other
+                .st_value
+                .checked_add(other.st_size)
+                .ok_or("bootstrap function range overflows")?;
+            require(
+                end <= other.st_value || other_end <= function.st_value,
+                format!("bootstrap roles {name} and {other_name} alias/overlap"),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn combined_bootstrap_symbols(elf: &Elf<'_>) -> Result<BTreeMap<String, sym::Sym>> {
+    let mut symbols = standalone_symbols(elf)?;
+    for (name, function) in generic_symbols(elf)? {
+        if let Some(shared) = symbols.get(&name) {
+            require(
+                shared.st_value == function.st_value
+                    && shared.st_size == function.st_size
+                    && shared.st_bind() == function.st_bind()
+                    && shared.st_visibility() == function.st_visibility(),
+                "constructor and generic proofs disagree about a shared role",
+            )?;
+        } else {
+            symbols.insert(name, function);
+        }
+    }
+    require_disjoint_bootstrap_roles(&symbols)?;
+    Ok(symbols)
+}
+
+/// Check the actual loader registration independently of the public prefix.
+/// Standalone's exact private root checks remain separate and unchanged.
+fn generic_no_init_registration(
+    elf: &Elf<'_>,
+    bytes: &[u8],
+    generic_roles: &BTreeSet<u64>,
+) -> Result<()> {
+    let sections: Vec<_> = elf
+        .section_headers
+        .iter()
+        .filter(|s| s.sh_type == section_header::SHT_INIT_ARRAY)
+        .collect();
+    require(
+        sections.len() == 1 && elf.shdr_strtab.get_at(sections[0].sh_name) == Some(".init_array"),
+        "generic registration proof requires the unique actual .init_array section",
+    )?;
+    let section = sections[0];
+    require(
+        section.sh_size > 0 && section.sh_size % 8 == 0 && section.sh_addr % 8 == 0,
+        "generic registration proof has invalid init_array layout",
+    )?;
+    let dynamic = elf
+        .dynamic
+        .as_ref()
+        .ok_or("generic registration proof lacks dynamic data")?;
+    let array_tags: Vec<_> = dynamic
+        .dyns
+        .iter()
+        .filter(|d| d.d_tag == goblin::elf::dynamic::DT_INIT_ARRAY)
+        .collect();
+    let size_tags: Vec<_> = dynamic
+        .dyns
+        .iter()
+        .filter(|d| d.d_tag == goblin::elf::dynamic::DT_INIT_ARRAYSZ)
+        .collect();
+    require(
+        array_tags.len() == 1
+            && size_tags.len() == 1
+            && array_tags[0].d_val == section.sh_addr
+            && size_tags[0].d_val == section.sh_size,
+        "loader init_array tags differ from the inspected actual section",
+    )?;
+    require(
+        !dynamic.dyns.iter().any(|d| {
+            (d.d_tag == goblin::elf::dynamic::DT_INIT && generic_roles.contains(&d.d_val))
+                || (matches!(
+                    d.d_tag,
+                    goblin::elf::dynamic::DT_PREINIT_ARRAY
+                        | goblin::elf::dynamic::DT_PREINIT_ARRAYSZ
+                ) && d.d_val != 0)
+        }),
+        "generic initializer has a loader init/preinit registration",
+    )?;
+    require(
+        elf.program_headers.iter().any(|p| {
+            p.p_type == program_header::PT_LOAD
+                && section.sh_addr >= p.p_vaddr
+                && section
+                    .sh_addr
+                    .checked_add(section.sh_size)
+                    .is_some_and(|end| {
+                        p.p_vaddr
+                            .checked_add(p.p_filesz)
+                            .is_some_and(|load_end| end <= load_end)
+                    })
+                && p.p_offset.checked_add(section.sh_addr - p.p_vaddr) == Some(section.sh_offset)
+        }),
+        "generic registration proof init_array is not wholly file-backed at its load address",
+    )?;
+    let entries = loaded_bytes(
+        elf,
+        bytes,
+        section.sh_addr,
+        usize::try_from(section.sh_size).map_err(|e| e.to_string())?,
+    )?;
+    let relocations: Vec<_> = elf
+        .dynrelas
+        .iter()
+        .chain(elf.dynrels.iter())
+        .chain(elf.pltrelocs.iter())
+        .collect();
+    for (index, entry) in entries.as_chunks::<8>().0.iter().enumerate() {
+        let slot = section.sh_addr + index as u64 * 8;
+        let raw = u64::from_le_bytes(*entry);
+        let records: Vec<_> = relocations.iter().filter(|r| r.r_offset == slot).collect();
+        require(
+            records.len() <= 1,
+            "overlapping generic init_array relocations",
+        )?;
+        let target = if let Some(r) = records.first() {
+            let addend = r.r_addend.unwrap_or(raw as i64);
+            if r.r_type == reloc::R_X86_64_RELATIVE && r.r_sym == 0 && addend >= 0 {
+                addend as u64
+            } else if r.r_type == reloc::R_X86_64_64 {
+                let symbol = elf
+                    .dynsyms
+                    .get(r.r_sym)
+                    .filter(|s| s.st_shndx != section_header::SHN_UNDEF as usize)
+                    .ok_or("unresolved generic registration proof init_array target")?;
+                symbol
+                    .st_value
+                    .checked_add_signed(addend)
+                    .ok_or("generic init_array relocation target overflows")?
+            } else {
+                return Err("unsupported init_array relocation cannot prove absence of generic registration".to_owned());
+            }
+        } else {
+            raw
+        };
+        require(
+            !generic_roles.contains(&target),
+            "generic bootstrap role is registered in init_array",
+        )?;
+    }
+    Ok(())
+}
+
+/// Normalize Rust-v0 crate disambiguators only; all remaining path/type/
+/// method/backreference spelling must match one actually emitted typed role.
+/// This is deliberately not a general demangler or substring allowlist.
+fn preparation_role(name: &str) -> Option<&'static str> {
+    let plain = if let Some((plain, suffix)) = name.split_once(".llvm.") {
+        if suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        plain
+    } else {
+        name
+    };
+    let mut canonical = String::new();
+    let mut remaining = plain;
+    while let Some(offset) = remaining.find("Cs") {
+        canonical.push_str(&remaining[..offset]);
+        remaining = &remaining[offset + 2..];
+        let end = remaining
+            .bytes()
+            .take_while(|b| b.is_ascii_alphanumeric())
+            .count();
+        if end == 0 || remaining.as_bytes().get(end) != Some(&b'_') {
+            return None;
+        }
+        canonical.push_str("Cs_");
+        remaining = &remaining[end + 1..];
+    }
+    canonical.push_str(remaining);
+    match canonical.as_str() {
+        "_RINvMNtNtCs_3std4sync9once_lockINtB3_8OnceLockINtNtCs_4core6result6ResultNtNtNtCs_15reverie_inguest5guest11tool_region10ToolRegionlEE10initializeNCINvB2_11get_or_initNCNvB2_10try_insert0E0zEB1B_" => {
+            Some("tool_region_once_initialize")
+        }
+        "_RINvYINtNtNtCs_4core3ops5range5RangejENtNtNtNtBa_4iter6traits8iterator8Iterator8try_folduNCINvNvBL_3all5checkjNCNvMs_NtNtNtCs_15reverie_inguest5guest11tool_region11constructorNtB22_16NativeFreshOwner11from_natives_0E0INtNtB8_12control_flow11ControlFlowuEEB28_" => {
+            Some("from_native_bitmap_range")
+        }
+        "_RNvMs16_NtNtCs_4core4sync6atomicINtB6_6AtomicjE5storeCs_15reverie_inguest" => {
+            Some("atomic_usize_store")
+        }
+        "_RNvMs_NtNtNtCs_15reverie_inguest5guest11tool_region11constructorNtB4_16NativeFreshOwner11from_native" => {
+            Some("from_native")
+        }
+        "_RNvMs_NtNtNtCs_15reverie_inguest5guest11tool_region11constructorNtB4_16NativeFreshOwner7publish" => {
+            Some("publish")
+        }
+        "_RNvNtCs_4core9panicking19panic_cannot_unwind" => Some("panic_cannot_unwind"),
+        "_RNvNtCs_4core9panicking32panic_null_reference_constructed" => {
+            Some("panic_null_reference_constructed")
+        }
+        "_RNvNtCs_4core9panicking36panic_misaligned_pointer_dereference" => {
+            Some("panic_misaligned_pointer_dereference")
+        }
+        "reverie_inguest_trusted_syscall" => Some("trusted_syscall"),
+        _ => None,
+    }
+}
+
+fn preparation_symbols(elf: &Elf<'_>) -> Result<BTreeMap<String, sym::Sym>> {
     let mut result = BTreeMap::new();
+    let mut roles = BTreeSet::new();
     for symbol in elf.syms.iter().filter(|s| executable_symbol(elf, s)) {
         let Some(name) = elf.strtab.get_at(symbol.st_name) else {
             continue;
         };
-        if name.contains("_4core6result")
-            && name.contains("6ResultR")
-            && name.contains("15reverie_inguest5guest11tool_region10ToolRegionlE6is_err")
-        {
+        let Some(role) = preparation_role(name) else {
+            continue;
+        };
+        require(
+            symbol.st_bind() == sym::STB_LOCAL,
+            format!("preparation helper {role} is preemptible"),
+        )?;
+        require(
+            !elf.dynsyms
+                .iter()
+                .any(|s| elf.dynstrtab.get_at(s.st_name) == Some(name)),
+            "private preparation helper has a dynamic identity",
+        )?;
+        if let Some(prior) = result.get(name) {
+            let prior: &sym::Sym = prior;
             require(
-                symbol.st_bind() == sym::STB_LOCAL,
-                "constructor Result::is_err helper is preemptible",
+                prior.st_value == symbol.st_value
+                    && prior.st_size == symbol.st_size
+                    && prior.st_bind() == symbol.st_bind()
+                    && prior.st_visibility() == symbol.st_visibility(),
+                "conflicting preparation helper identity",
             )?;
-            if let Some(prior) = result.insert(name.to_owned(), symbol) {
-                require(
-                    prior.st_value == symbol.st_value
-                        && prior.st_size == symbol.st_size
-                        && prior.st_bind() == symbol.st_bind()
-                        && prior.st_visibility() == symbol.st_visibility(),
-                    "conflicting constructor Result::is_err symbol",
-                )?;
-            }
+        } else {
+            require(
+                roles.insert(role),
+                format!("ambiguous preparation helper {role}"),
+            )?;
+            result.insert(name.to_owned(), symbol);
         }
     }
-    require(
-        result.len() <= 1,
-        "ambiguous constructor Result::is_err helper",
-    )?;
     Ok(result)
 }
 
@@ -1235,11 +1579,6 @@ const CONSTRUCTOR_GATE_OWNER_BYTES: &[u8] = &[
     0xd6, 0x48, 0x89, 0xca, 0x4d, 0x89, 0xc2, 0x4d, 0x89, 0xc8, 0x4c, 0x8b, 0x4c, 0x24, 0x10, 0x0f,
     0x05, 0x41, 0xff, 0xe4, 0xf3, 0x0f, 0x1e, 0xfa, 0x41, 0x5c, 0xc3,
 ];
-const CONSTRUCTOR_RESULT_HELPER_BYTES: &[u8] = &[
-    0x48, 0x89, 0x7c, 0x24, 0xf8, 0x8b, 0x07, 0x48, 0x83, 0xf8, 0, 0x0f, 0x94, 0xc0, 0x34, 0xff,
-    0x24, 0x01, 0xc3,
-];
-
 fn constructor_gate_operands(code: &[u8], ip_offset: u64, return_offset: u64) -> Result<()> {
     require(
         code == CONSTRUCTOR_GATE_OWNER_BYTES
@@ -1328,30 +1667,27 @@ fn constructor_gate_disassembly_view(
     Ok(output)
 }
 
-// Producer and independent consumer use the same constructor-specific header
-// treatment. Generic byte coverage and graph rules remain unchanged.
+// Every qualification now includes the common trusted gate's whole function.
+// Producer and independent consumer use only its two exact interior headers;
+// arbitrary nested headers, byte coverage and graph rules remain unchanged.
 fn verify_constructor_complete_bytes(
     elf: &Elf<'_>,
-    initializer: &str,
+    _initializer: &str,
     text: &str,
     expected: &BTreeMap<u64, Vec<u8>>,
 ) -> Result<()> {
-    if initializer == STANDALONE_ROOT {
-        let owner = private_function(elf, CONSTRUCTOR_GATE_OWNER)?;
-        let ip = constructor_interior_label(elf, CONSTRUCTOR_GATE, &owner)?;
-        let return_ip = constructor_interior_label(elf, CONSTRUCTOR_GATE_RETURN, &owner)?;
-        let view = constructor_gate_disassembly_view(
-            text,
-            &owner,
-            &BTreeMap::from([
-                (ip.st_value, CONSTRUCTOR_GATE),
-                (return_ip.st_value, CONSTRUCTOR_GATE_RETURN),
-            ]),
-        )?;
-        verify_disassembly_bytes(&view, expected)
-    } else {
-        verify_disassembly_bytes(text, expected)
-    }
+    let owner = private_function(elf, CONSTRUCTOR_GATE_OWNER)?;
+    let ip = constructor_interior_label(elf, CONSTRUCTOR_GATE, &owner)?;
+    let return_ip = constructor_interior_label(elf, CONSTRUCTOR_GATE_RETURN, &owner)?;
+    let view = constructor_gate_disassembly_view(
+        text,
+        &owner,
+        &BTreeMap::from([
+            (ip.st_value, CONSTRUCTOR_GATE),
+            (return_ip.st_value, CONSTRUCTOR_GATE_RETURN),
+        ]),
+    )?;
+    verify_disassembly_bytes(&view, expected)
 }
 
 fn standalone_init_slot(elf: &Elf<'_>, bytes: &[u8], root: &sym::Sym) -> Result<(u64, String)> {
@@ -1677,6 +2013,7 @@ fn proof_functions(elf: &Elf<'_>, initializer_name: &str) -> Result<BTreeMap<u64
     } else {
         addresses.insert(export(elf, initializer_name)?.1.st_value);
     }
+    addresses.extend(generic_symbols(elf)?.values().map(|s| s.st_value));
     for shim in SHIMS {
         let candidates: Vec<_> = elf
             .syms
@@ -1698,11 +2035,11 @@ fn proof_functions(elf: &Elf<'_>, initializer_name: &str) -> Result<BTreeMap<u64
 }
 
 /// The standalone constructor scope is independent of diagnostic M1 exports,
-/// but retains every private role and the actual public generic initializer.
+/// but retains every private constructor and generic bootstrap role.
 fn constructor_proof_functions(elf: &Elf<'_>) -> Result<BTreeMap<u64, u64>> {
     selected_function_ranges(
         elf,
-        standalone_symbols(elf)?
+        combined_bootstrap_symbols(elf)?
             .values()
             .map(|s| s.st_value)
             .collect(),
@@ -2140,62 +2477,121 @@ fn standalone_body_order(
     Ok((initialization, resolution))
 }
 
-// Canonical complete scalar native bridge at RV780. Only the explicitly
-// checked same-owner RIP displacements may differ. This matches instructions
-// and operands; hashes below remain hashes of the entire unmodified ELF bytes.
-// The template includes the original diagnostic/exit route and its limitations.
-const CONSTRUCTOR_NATIVE_HEX: &str = concat!(
-    "f30f1efa66480f6ec466480f6ecb66480f6ed566490f6edc66490f6ee566490f6eee66490f6ef766480f6eff31c0b201f00fb015f54216040f85bf010000b80900000048bf000000000060000048be000000000100000031d241ba2200100049c7c0ffffffff4531c94c8d2505000000e9bfd1ffff",
-    "f30f1efa4885c00f887b01000049bd00000000006000004c39e874274889c748be0000000001000000b80b0000004c8d2505000000e985d1fffff30f1efae94501000048bf0010000000600000be00f00f00ba03000000b80a0000004c8d2505000000e957d1ffff",
-    "f30f1efa4885c00f851301000049bd001000000060000041c6450000498d7d28b92000000048c707ffffffff4883c708ffc975f148c7070300000049be301002000060000066480f7ec049890666480f7ec84989460866480f7ed04989461066480f7ed84989461866480f7ee04989462066480f7ee84989462866480f7ef04989463066480f7ef84989463849c746500100000049c7464801000000b8ba0000004c8d2505000000e9aad0ffff",
-    "f30f1efa4885c07e6a4989464048bf0010100000600000be00008000ba03000000b80a0000004c8d2505000000e978d0fffff30f1efa4885c0753848bc00109000006000004c89f7e83d05000048b83010020000600000488b5808488b68104c8b60184c8b68204c8b70284c8b7830488b20c3",
-    "b801000000bf02000000488d3531000000ba250000004c8d2505000000e915d0fffff30f1efab8e7000000bf7f0000004c8d2505000000e9fbcffffff30f1efa0f0b",
-);
+const NATIVE_DISPATCH_VERSION: u32 = 1;
 const CONSTRUCTOR_RECORD: u64 = 0x6000_0002_1030;
+const GENERIC_RECORD: u64 = 0x6000_0002_10a0;
 const CONSTRUCTOR_BOTTOM: u64 = 0x6000_0010_1000;
 const CONSTRUCTOR_TOP: u64 = 0x6000_0090_1000;
 
-fn native_template() -> Vec<u8> {
-    let mut bytes = CONSTRUCTOR_NATIVE_HEX
+/// PCs are populated only by the complete actual emitted native recipe.
+/// The supplied-body CALL is not represented as a direct graph edge.
+struct NativeDispatchRoute {
+    prepare: ConstructorTransfer,
+    prepare_return: u64,
+    body_retain: u64,
+    ready_gate: u64,
+    body_identity_check: u64,
+    body_sample_store: u64,
+    body_call: u64,
+    body_return: u64,
+    returned_store: u64,
+    body_save: u64,
+    stack_switch: u64,
+    restore: u64,
+    native_return: u64,
+    terminal_exit: ConstructorTransfer,
+    terminal_ud2: u64,
+}
+
+// Actual root build-only emission01: complete744B Constructor and669B
+// ExplicitGeneric native functions. Normal-release and diagnostic-dev match
+// byte-for-byte after only the independently checked displacement fields.
+const CONSTRUCTOR_NATIVE_HEX: &str = concat!(
+    "f30f1efa66480f6ec466480f6ecb66480f6ed566490f6edc66490f6ee566490f6eee66490f6ef766480f6eff31c0b201f00fb015448d09040f8543020000b80900000048bf000000000060000048be000000000100000031d241",
+    "ba2200100049c7c0ffffffff4531c94c8d2505000000e95f3c0000f30f1efa4885c00f88ff01000049bd00000000006000004c39e874274889c748be0000000001000000b80b0000004c8d2505000000e9253c0000f30f1efae9",
+    "c901000048bf0010000000600000be00f00f00ba03000000b80a0000004c8d2505000000e9f73b0000f30f1efa4885c00f859701000049bd001000000060000041c6450000498d7d28b92000000048c707ffffffff4883c708ff",
+    "c975f148c7070300000049be301002000060000066480f7ec049890666480f7ec84989460866480f7ed04989461066480f7ed84989461866480f7ee04989462066480f7ee84989462866480f7ef04989463066480f7ef8498946",
+    "3849c746500100000049c7464801000000b8ba0000004c8d2505000000e94a3b0000f30f1efa4885c00f8eea0000004989464048bf0010100000600000be00008000ba03000000b80a0000004c8d2505000000e9143b0000f30f",
+    "1efa4885c00f85b400000066490f7eff48bc00109000006000004c89f7e8900f000085c00f859500000048b800109000006000004839c40f858200000049be301002000060000049837e5001757149837e4803756a803d5e8b09",
+    "040075614d85ff745c4d397e3875564883ec104989666041ffd748b8f00f9000006000004839c4753c4883c41049be301002000060000049c746480400000048b83010020000600000488b5808488b68104c8b60184c8b68204c",
+    "8b70284c8b7830488b20c3b801000000bf02000000488d3531000000ba250000004c8d2505000000e9313a0000f30f1efab8e7000000bf7f0000004c8d2505000000e9173a0000f30f1efa0f0b7265766572696520636f6e7374",
+    "727563746f7220626f6f747374726170206661696c65640a",
+);
+
+#[derive(Clone, Copy)]
+enum NativeDispatchOrigin {
+    Constructor,
+    ExplicitGeneric,
+}
+
+fn native_template(origin: NativeDispatchOrigin) -> Vec<u8> {
+    let mut code = CONSTRUCTOR_NATIVE_HEX
         .as_bytes()
         .as_chunks::<2>()
         .0
         .iter()
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
         .collect::<Vec<_>>();
-    bytes.extend_from_slice(b"reverie constructor bootstrap failed\n");
-    bytes
+    if matches!(origin, NativeDispatchOrigin::ExplicitGeneric) {
+        code.truncate(0x281);
+        for offset in [0x11a, 0x201, 0x24b, 0x25d] {
+            code[offset..offset + 8].copy_from_slice(&GENERIC_RECORD.to_le_bytes());
+        }
+        code.extend_from_slice(&[
+            0xb8, 0xe7, 0x00, 0x00, 0x00, 0xbf, 0x7f, 0x00, 0x00, 0x00, 0x4c, 0x8d, 0x25, 0x05,
+            0x00, 0x00, 0x00, 0xe9, 0x55, 0x37, 0x00, 0x00, 0xf3, 0x0f, 0x1e, 0xfa, 0x0f, 0x0b,
+        ]);
+    }
+    code
 }
 
-fn constructor_native_bridge(
+fn native_dispatch_bridge(
     code: &[u8],
     address: u64,
     initializing: u64,
     gate: u64,
-    adopt: u64,
-) -> Result<ConstructorTransfer> {
-    let template = native_template();
+    prepare: u64,
+    origin: NativeDispatchOrigin,
+) -> Result<NativeDispatchRoute> {
+    let template = native_template(origin);
     require(
         code.len() == template.len(),
-        "native constructor bridge has unsupported extent",
+        "native dispatch has unsupported complete extent",
     )?;
-    let fields = [
+    require(
+        address.checked_add(code.len() as u64).is_some(),
+        "native dispatch address range overflows",
+    )?;
+    let mut fields = vec![
         (0x34, initializing, 0x38),
         (0x71, gate, 0x75),
         (0xab, gate, 0xaf),
         (0xd9, gate, 0xdd),
         (0x186, gate, 0x18a),
-        (0x1b8, gate, 0x1bc),
-        (0x1d3, adopt, 0x1d7),
-        (0x21b, gate, 0x21f),
-        (0x235, gate, 0x239),
+        (0x1bc, gate, 0x1c0),
+        (0x1e0, prepare, 0x1e4),
+        // CMP [RIP+disp32],0: RIP base includes the final immediate byte.
+        (0x219, initializing, 0x21e),
     ];
-    for (offset, target, end) in fields {
+    let (terminal_exit, terminal_ud2) = match origin {
+        NativeDispatchOrigin::Constructor => {
+            fields.extend([(0x29f, gate, 0x2a3), (0x2b9, gate, 0x2bd)]);
+            (0x2b8, 0x2c1)
+        }
+        NativeDispatchOrigin::ExplicitGeneric => {
+            fields.push((0x293, gate, 0x297));
+            (0x292, 0x29b)
+        }
+    };
+    for &(offset, target, end) in &fields {
         let displacement = i32::from_le_bytes(code[offset..offset + 4].try_into().unwrap());
         require(
-            (address + end).checked_add_signed(i64::from(displacement)) == Some(target),
+            address
+                .checked_add(end)
+                .and_then(|end| end.checked_add_signed(i64::from(displacement)))
+                == Some(target),
             format!(
-                "native constructor relocation/transfer at {:#x} is not its exact local target",
+                "native dispatch displacement at {:#x} is not its exact local target",
                 address + offset as u64
             ),
         )?;
@@ -2208,21 +2604,115 @@ fn constructor_native_bridge(
             require(
                 actual == expected,
                 format!(
-                    "native constructor opcode/operand differs at {:#x}",
+                    "native dispatch opcode/operand differs at {:#x}",
                     address + offset as u64
                 ),
             )?;
         }
     }
-    // In this complete template RDI is saved in XMM7 at +0x27, recovered into
-    // RAX and stored to record+0x38 at +0x165. Fresh NOREPLACE/2050 occupied
-    // pages/RW guarded interior precede MOV RSP,top (+0x1c5), and only then
-    // record->RDI and the actual local adoption CALL (+0x1d2) are executed.
-    Ok(ConstructorTransfer {
-        instruction: address + 0x1d2,
-        target: adopt,
-        local_got_slot: None,
+    // The entire byte sequence proves original RDI→XMM7/bodyfield→R15,
+    // exact fresh origin/RDI, scalar prepare, status/TOP/version/READY/guard/
+    // identity gates, frame16/interior sample and sole41FFD7 CALL. Returned
+    // RSP is compared (never reseeded); ADD16 and RETURNED precede the full
+    // literal-record scalar restore and RET. Every fatal branch/terminal byte
+    // is checked, including Constructor's fixed diagnostic string.
+    Ok(NativeDispatchRoute {
+        prepare: ConstructorTransfer {
+            instruction: address + 0x1df,
+            target: prepare,
+            local_got_slot: None,
+        },
+        prepare_return: address + 0x1e4,
+        body_retain: address + 0x1cd,
+        ready_gate: address + 0x210,
+        body_identity_check: address + 0x225,
+        body_sample_store: address + 0x22f,
+        body_call: address + 0x233,
+        body_return: address + 0x236,
+        returned_store: address + 0x253,
+        body_save: address + 0x165,
+        stack_switch: address + 0x1d2,
+        restore: address + 0x25b,
+        native_return: address + 0x280,
+        terminal_exit: ConstructorTransfer {
+            instruction: address + terminal_exit,
+            target: gate,
+            local_got_slot: None,
+        },
+        terminal_ud2: address + terminal_ud2,
     })
+}
+
+fn constructor_native_bridge(
+    code: &[u8],
+    address: u64,
+    initializing: u64,
+    gate: u64,
+    prepare: u64,
+) -> Result<NativeDispatchRoute> {
+    native_dispatch_bridge(
+        code,
+        address,
+        initializing,
+        gate,
+        prepare,
+        NativeDispatchOrigin::Constructor,
+    )
+}
+
+fn generic_entry_prefix(
+    code: &[u8],
+    address: u64,
+    body: u64,
+    bridge: u64,
+) -> Result<(u64, ConstructorTransfer)> {
+    require(
+        code.len() == 16,
+        "public generic initializer has unsupported complete extent",
+    )?;
+    let mut entry = ConstructorCode {
+        address,
+        bytes: code,
+        offset: 0,
+    };
+    entry.exact(&[0xf3, 0x0f, 0x1e, 0xfa])?;
+    let (body_materialization, actual_body) = entry.relative(&[0x48, 0x8d, 0x3d])?;
+    require(
+        actual_body == body,
+        "public generic initializer does not materialize its exact hidden body in RDI",
+    )?;
+    // Require the native direct E9, not an arbitrary graph/GOT/register route.
+    let (instruction, target) = entry.relative(&[0xe9])?;
+    require(
+        target == bridge,
+        "public generic initializer does not tail-jump to its exact hidden native bridge",
+    )?;
+    entry.done()?;
+    Ok((
+        body_materialization,
+        ConstructorTransfer {
+            instruction,
+            target,
+            local_got_slot: None,
+        },
+    ))
+}
+
+fn generic_native_bridge(
+    code: &[u8],
+    address: u64,
+    initializing: u64,
+    gate: u64,
+    prepare: u64,
+) -> Result<NativeDispatchRoute> {
+    native_dispatch_bridge(
+        code,
+        address,
+        initializing,
+        gate,
+        prepare,
+        NativeDispatchOrigin::ExplicitGeneric,
+    )
 }
 
 #[derive(Clone)]
@@ -2273,227 +2763,36 @@ fn constructor_instructions(
     Ok(instructions)
 }
 
-// An optimized recipe relies only on one callee-saved record register. Decode
-// the finite integer instruction families used by this adoption prefix to
-// reject a write to that register (including a 32-bit write). Unknown encodings
-// fail; this never resolves a generic indirect call or executes arbitrary CFGs.
-fn keeps_adoption_register(bytes: &[u8], register: u8) -> bool {
-    let mut offset = 0;
-    while bytes
-        .get(offset)
-        .is_some_and(|b| matches!(*b, 0xf0 | 0x66 | 0xf3))
-    {
-        offset += 1;
-    }
-    let rex = bytes
-        .get(offset)
-        .copied()
-        .filter(|b| (0x40..=0x4f).contains(b))
-        .unwrap_or(0);
-    if rex != 0 {
-        offset += 1;
-    }
-    let Some(&op) = bytes.get(offset) else {
-        return false;
-    };
-    if (0x50..=0x57).contains(&op) {
-        return register != 4;
-    }
-    if matches!(
-        op,
-        0xe8 | 0xe9
-            | 0xeb
-            | 0x84
-            | 0x85
-            | 0x38
-            | 0x39
-            | 0x3a
-            | 0x3b
-            | 0x90
-            | 0xa8
-            | 0xa9
-            | 0x04
-            | 0x0c
-            | 0x14
-            | 0x1c
-            | 0x24
-            | 0x2c
-            | 0x34
-            | 0x3c
-    ) || (0x70..=0x7f).contains(&op)
-    {
-        return true;
-    }
-    if (0x58..=0x5f).contains(&op) {
-        return register != 4 && (op - 0x58 + (rex & 1) * 8) != register;
-    }
-    let byte_reg = |r: u8| if rex == 0 && r >= 4 { r - 4 } else { r };
-    if (0xb0..=0xb7).contains(&op) {
-        return byte_reg(op - 0xb0 + (rex & 1) * 8) != register;
-    }
-    if (0xb8..=0xbf).contains(&op) {
-        return op - 0xb8 + (rex & 1) * 8 != register;
-    }
-    if op == 0x0f {
-        return match bytes.get(offset + 1) {
-            Some(0x80..=0x8f | 0x1f | 0xa3) => true,
-            Some(0xb1) => bytes
-                .get(offset + 2)
-                .is_some_and(|m| m >> 6 != 3 || (m & 7) + (rex & 1) * 8 != register),
-            Some(0x90..=0x9f) => bytes
-                .get(offset + 2)
-                .is_some_and(|m| m >> 6 != 3 || byte_reg((m & 7) + (rex & 1) * 8) != register),
-            Some(0xb6 | 0xb7 | 0xbe | 0xbf) => bytes
-                .get(offset + 2)
-                .is_some_and(|m| ((m >> 3) & 7) + ((rex >> 2) & 1) * 8 != register),
-            _ => false,
-        };
-    }
-    let Some(&m) = bytes.get(offset + 1) else {
-        return false;
-    };
-    let reg = ((m >> 3) & 7) + ((rex >> 2) & 1) * 8;
-    let rm = (m & 7) + (rex & 1) * 8;
-    match op {
-        0x8b | 0x8d => reg != register,
-        0x8a => byte_reg(reg) != register,
-        0x88 | 0xc0 | 0xd2 | 0xc6 => m >> 6 != 3 || byte_reg(rm) != register,
-        0x89 | 0x01 | 0x09 | 0x11 | 0x19 | 0x21 | 0x29 | 0x31 | 0xc1 | 0xd3 | 0xc7 => {
-            m >> 6 != 3 || rm != register
-        }
-        0x03 | 0x0b | 0x13 | 0x1b | 0x23 | 0x2b | 0x33 => reg != register,
-        0x80 => (m >> 3) & 7 == 7 || m >> 6 != 3 || byte_reg(rm) != register,
-        0x81 | 0x83 => (m >> 3) & 7 == 7 || m >> 6 != 3 || rm != register,
-        0xff => {
-            matches!((m >> 3) & 7, 2 | 4)
-                || ((m >> 3) & 7 == 6 && register != 4)
-                || (!matches!((m >> 3) & 7, 2 | 4 | 6) && (m >> 6 != 3 || rm != register))
-        }
-        _ => false,
-    }
-}
-
-fn adoption_memory_write(bytes: &[u8]) -> Result<Option<(u8, i32, i32)>> {
-    let mut offset = 0;
-    let mut word = false;
-    while bytes
-        .get(offset)
-        .is_some_and(|b| matches!(*b, 0xf0 | 0x66 | 0xf3))
-    {
-        word |= bytes[offset] == 0x66;
-        offset += 1;
-    }
-    let rex = bytes
-        .get(offset)
-        .copied()
-        .filter(|b| (0x40..=0x4f).contains(b))
-        .unwrap_or(0);
-    if rex != 0 {
-        offset += 1;
-    }
-    let op = *bytes.get(offset).ok_or("empty adoption instruction")?;
-    offset += 1;
-    let (writes, byte) = if op == 0x0f {
-        let second = *bytes.get(offset).ok_or("truncated adoption instruction")?;
-        offset += 1;
-        (
-            second == 0xb1 || (0x90..=0x9f).contains(&second),
-            (0x90..=0x9f).contains(&second),
-        )
-    } else {
-        let group = bytes.get(offset).map(|m| (m >> 3) & 7);
-        (
-            matches!(
-                op,
-                0x88 | 0x89
-                    | 0xc6
-                    | 0xc7
-                    | 0x01
-                    | 0x09
-                    | 0x11
-                    | 0x19
-                    | 0x21
-                    | 0x29
-                    | 0x31
-                    | 0xc0
-                    | 0xc1
-                    | 0xd2
-                    | 0xd3
-            ) || (matches!(op, 0x80 | 0x81 | 0x83) && group != Some(7))
-                || (op == 0xff && matches!(group, Some(0 | 1))),
-            matches!(op, 0x88 | 0xc6 | 0xc0 | 0xd2 | 0x80),
-        )
-    };
-    if !writes {
-        return Ok(None);
-    }
-    let m = *bytes.get(offset).ok_or("truncated adoption write")?;
-    offset += 1;
-    if m >> 6 == 3 {
-        return Ok(None);
-    }
-    let base = if m & 7 == 4 {
-        let sib = *bytes
-            .get(offset)
-            .ok_or("truncated adoption stack address")?;
-        offset += 1;
-        require(
-            (sib >> 3) & 7 == 4 && rex & 2 == 0,
-            "unsupported indexed adoption write",
-        )?;
-        sib & 7
-    } else {
-        m & 7
-    };
-    if m >> 6 == 0 && base == 5 {
-        return Ok(None);
-    } // RIP-relative, not either owned frame slot.
-    let displacement = match m >> 6 {
-        0 => 0,
-        1 => i32::from(
-            *bytes
-                .get(offset)
-                .ok_or("truncated adoption write displacement")? as i8,
-        ),
-        2 => i32::from_le_bytes(
-            bytes
-                .get(offset..offset + 4)
-                .ok_or("truncated adoption write displacement")?
-                .try_into()
-                .unwrap(),
-        ),
-        _ => unreachable!(),
-    };
-    let width = if byte {
-        1
-    } else if word {
-        2
-    } else if rex & 8 != 0 {
-        8
-    } else {
-        4
-    };
-    require(
-        displacement.checked_add(width).is_some(),
-        "adoption write extent overflows",
-    )?;
-    Ok(Some((base + (rex & 1) * 8, displacement, width)))
-}
-
-fn constructor_adoption_helper_edges(
+/// Census every actual instruction in the complete prepare function. Only
+/// direct private helper transfers and independently resolved local RELATIVE
+/// GOT transfers to those same exact roles are admitted. A register-indirect
+/// supplied-body transfer is never a preparation helper, at any position.
+fn preparation_transfers(
     instructions: &[EncodedConstructorInstruction],
-    supplied: usize,
     got: &BTreeMap<u64, u64>,
     helpers: &BTreeSet<u64>,
-) -> Result<Vec<GotEdge>> {
+) -> Result<(Vec<ConstructorTransfer>, Vec<GotEdge>)> {
+    let first = instructions
+        .first()
+        .ok_or("empty complete prepare function")?
+        .address;
+    let mut expected = first;
+    let mut boundaries = BTreeSet::new();
+    for instruction in instructions {
+        require(
+            instruction.address == expected && !instruction.bytes.is_empty(),
+            "prepare instruction sequence is discontinuous/empty",
+        )?;
+        boundaries.insert(instruction.address);
+        expected = expected
+            .checked_add(instruction.bytes.len() as u64)
+            .ok_or("prepare instruction range overflows")?;
+    }
+    let mut transfers = Vec::new();
     let mut edges = Vec::new();
-    // Census the complete function, not only exact CALL RAX instructions or
-    // the prefix before the supplied-body call. Prefix parsing here identifies
-    // unsupported FF /2..5 transfers; it never admits their prefixed forms.
-    // Only the original bare encodings earn the proofs below.
-    for (index, call) in instructions.iter().enumerate() {
-        let opcode = call
-            .bytes
+    for instruction in instructions {
+        let bytes = &instruction.bytes;
+        let prefix = bytes
             .iter()
             .take_while(|byte| {
                 matches!(
@@ -2512,186 +2811,130 @@ fn constructor_adoption_helper_edges(
                 )
             })
             .count();
-        if call.bytes.get(opcode) != Some(&0xff) {
-            continue;
-        }
-        let modrm = *call
-            .bytes
-            .get(opcode + 1)
-            .ok_or("truncated adoption FF instruction")?;
-        if !matches!((modrm >> 3) & 7, 2..=5) {
-            continue;
-        }
-        if call.bytes.len() == 6 && call.bytes.starts_with(&[0xff, 0x15]) {
-            let slot = call
+        let opcode = *bytes.get(prefix).ok_or("prefix-only prepare instruction")?;
+        let second = if opcode == 0x0f {
+            Some(
+                *bytes
+                    .get(prefix + 1)
+                    .ok_or("truncated prepare two-byte opcode")?,
+            )
+        } else {
+            None
+        };
+        let system_group = if second == Some(0x01) {
+            Some(
+                *bytes
+                    .get(prefix + 2)
+                    .ok_or("truncated prepare system-group opcode")?,
+            )
+        } else {
+            None
+        };
+        // Intentional kernel/system/interrupt transfers have no independently
+        // qualified helper target. Raw SYSCALL belongs only to the separately
+        // byte-qualified trusted gate, never to ordinary Rust preparation.
+        require(
+            !matches!(opcode, 0xcc | 0xcd | 0xce | 0xcf | 0xf1 | 0xf4)
+                && !matches!(second, Some(0x05 | 0x07 | 0x0b | 0x34 | 0x35 | 0x37 | 0xaa))
+                && !matches!(system_group, Some(0xc1..=0xc3 | 0xd9)),
+            "unqualified prepare kernel/system/interrupt transfer",
+        )?;
+        let relative = |offset: usize, width: usize| -> Result<u64> {
+            let displacement = match width {
+                1 => i64::from(*bytes.get(offset).ok_or("truncated prepare branch")? as i8),
+                4 => i64::from(i32::from_le_bytes(
+                    bytes
+                        .get(offset..offset + 4)
+                        .ok_or("truncated prepare transfer")?
+                        .try_into()
+                        .unwrap(),
+                )),
+                _ => return Err("unsupported prepare displacement width".to_owned()),
+            };
+            instruction
                 .address
-                .checked_add(6)
-                .and_then(|end| {
-                    end.checked_add_signed(i64::from(i32::from_le_bytes(
-                        call.bytes[2..6].try_into().unwrap(),
-                    )))
-                })
-                .ok_or("adoption RIP-relative call address overflows")?;
+                .checked_add(bytes.len() as u64)
+                .and_then(|end| end.checked_add_signed(displacement))
+                .ok_or("prepare transfer target overflows".to_owned())
+        };
+        if matches!(opcode, 0xe8 | 0xe9 | 0xeb | 0x70..=0x7f | 0xe0..=0xe3)
+            || (opcode == 0x0f
+                && bytes
+                    .get(prefix + 1)
+                    .is_some_and(|b| (0x80..=0x8f).contains(b)))
+        {
             require(
-                got.contains_key(&slot),
-                "adoption RIP-relative call lacks its independently qualified local RELATIVE GOT target",
+                prefix == 0,
+                "prefixed prepare direct transfer is unsupported",
             )?;
-            continue;
-        }
-        require(
-            call.bytes == [0xff, 0xd0],
-            "unsupported adoption indirect call/jump encoding or prefix",
-        )?;
-        if index == supplied {
-            continue;
-        }
-        require(
-            index >= 2
-                && index < supplied
-                && edges.is_empty()
-                && instructions[0].bytes == [0x48, 0x83, 0xec, 0x68]
-                && instructions[index - 1].bytes == [0x48, 0x8d, 0x7c, 0x24, 0x38],
-            "unrecognized/extra adoption register-indirect helper call",
-        )?;
-        let load = &instructions[index - 2];
-        require(
-            load.bytes.len() == 7 && load.bytes.starts_with(&[0x48, 0x8b, 0x05]),
-            "adoption helper lacks exact RIP-relative GOT load into RAX",
-        )?;
-        let slot = load
-            .address
-            .checked_add(7)
-            .and_then(|end| {
-                end.checked_add_signed(i64::from(i32::from_le_bytes(
-                    load.bytes[3..7].try_into().unwrap(),
-                )))
-            })
-            .ok_or("adoption helper GOT address overflows")?;
-        let target = *got
-            .get(&slot)
-            .ok_or("adoption helper GOT target is unresolved/preemptible")?;
-        require(
-            helpers.contains(&target),
-            "adoption indirect helper is not its exact local Result::is_err role",
-        )?;
-        edges.push(GotEdge {
-            source_function: instructions[0].address,
-            instruction: call.address,
-            slot,
-            target_function: target,
-        });
-    }
-    Ok(edges)
-}
-
-fn adoption_body_operand(
-    instructions: &[EncodedConstructorInstruction],
-    got: &BTreeMap<u64, u64>,
-    helpers: &BTreeSet<u64>,
-) -> Result<(u64, u64, String, Vec<GotEdge>)> {
-    let calls: Vec<_> = instructions
-        .iter()
-        .enumerate()
-        .filter(|(_, i)| i.bytes == [0xff, 0xd0])
-        .collect();
-    let supplied: Vec<_> = calls
-        .iter()
-        .copied()
-        .filter(|(index, _)| {
-            *index > 0
-                && (instructions[*index - 1].bytes == [0x48, 0x8b, 0x04, 0x24]
-                    || (*index >= 3
-                        && instructions[*index - 3].bytes == [0x48, 0x8b, 0x43, 0x38]
-                        && instructions[*index - 2].bytes == [0x48, 0x89, 0xe1]
-                        && instructions[*index - 1].bytes == [0x48, 0x89, 0x4b, 0x60]))
-        })
-        .collect();
-    require(
-        supplied.len() == 1,
-        "adoption must have one specifically proved supplied-body CALL RAX",
-    )?;
-    let (call_index, call) = supplied[0];
-    let helper_edges = constructor_adoption_helper_edges(instructions, call_index, got, helpers)?;
-    let prefix = &instructions[..call_index];
-    if prefix.len() >= 7
-        && prefix[prefix.len() - 3].bytes == [0x48, 0x8b, 0x43, 0x38]
-        && prefix[prefix.len() - 2].bytes == [0x48, 0x89, 0xe1]
-        && prefix[prefix.len() - 1].bytes == [0x48, 0x89, 0x4b, 0x60]
-    {
-        require(
-            prefix[0].bytes == [0x41, 0x56]
-                && prefix[1].bytes == [0x53]
-                && prefix[2].bytes == [0x48, 0x83, 0xec, 0x28]
-                && prefix[3].bytes
-                    == [vec![0x48, 0xbb], CONSTRUCTOR_RECORD.to_le_bytes().to_vec()].concat()
-                && prefix[4].bytes == [0x49, 0x89, 0xe6]
-                && prefix[5].bytes == [0x48, 0x39, 0xdf]
-                && prefix[6].bytes.starts_with(&[0x0f, 0x85])
-                && prefix[4..].iter().all(|i| {
-                    keeps_adoption_register(&i.bytes, 3) && keeps_adoption_register(&i.bytes, 4)
-                }),
-            "optimized adoption record register is not the checked native record or is overwritten",
-        )?;
-        for instruction in &prefix[4..] {
-            if let Some((3, displacement, width)) = adoption_memory_write(&instruction.bytes)? {
+            let (offset, width, external) = match opcode {
+                0xe8 | 0xe9 => (1, 4, true),
+                0xeb => (1, 1, true),
+                0x0f => (2, 4, false),
+                _ => (1, 1, false),
+            };
+            require(
+                bytes.len() == offset + width,
+                "extra/truncated prepare direct transfer",
+            )?;
+            let target = relative(offset, width)?;
+            if boundaries.contains(&target) && opcode != 0xe8 {
+                continue;
+            }
+            require(
+                external && helpers.contains(&target),
+                "prepare direct transfer is not an exact private preparation role/in-function branch",
+            )?;
+            transfers.push(ConstructorTransfer {
+                instruction: instruction.address,
+                target,
+                local_got_slot: None,
+            });
+        } else if opcode == 0xff {
+            let modrm = *bytes
+                .get(prefix + 1)
+                .ok_or("truncated prepare FF instruction")?;
+            if !matches!((modrm >> 3) & 7, 2..=5) {
+                continue;
+            }
+            require(
+                prefix == 0 && bytes.len() == 6 && bytes.starts_with(&[0xff, 0x15]),
+                "unsupported prepare register/memory/prefixed indirect call/jump",
+            )?;
+            let slot = relative(2, 4)?;
+            let target = *got
+                .get(&slot)
+                .ok_or("prepare call GOT is unresolved/preemptible")?;
+            require(
+                helpers.contains(&target),
+                "prepare GOT target lacks exact private helper role",
+            )?;
+            transfers.push(ConstructorTransfer {
+                instruction: instruction.address,
+                target,
+                local_got_slot: Some(slot),
+            });
+            edges.push(GotEdge {
+                source_function: first,
+                instruction: instruction.address,
+                slot,
+                target_function: target,
+            });
+        } else {
+            require(
+                !matches!(opcode, 0x9a | 0xea | 0xca | 0xcb | 0xcf),
+                "unsupported prepare far transfer/return",
+            )?;
+            if opcode == 0xc3 {
                 require(
-                    displacement >= 0x40 || displacement + width <= 0x38,
-                    "optimized adoption overwrites its supplied-body field",
+                    prefix == 0 && bytes.len() == 1,
+                    "prefixed/extra prepare RET",
                 )?;
             }
-        }
-        return Ok((prefix[prefix.len() - 3].address, call.address, "Optimized checked native-record RBX; literal +0x38 load into RAX, sample store +0x60, CALL RAX".to_owned(), helper_edges));
-    }
-    // Dev code preserves the entry record argument in an owned frame. This is
-    // deliberately a separate finite recipe, not acceptance of arbitrary
-    // spilled/register-indirect callees. The two eight-byte slots may not be
-    // overwritten by another instruction in this adoption function.
-    require(
-        prefix.len() >= 4
-            && prefix[0].bytes == [0x48, 0x83, 0xec, 0x68]
-            && prefix[1].bytes == [0x48, 0x89, 0xfe]
-            && prefix[2].bytes == [0x48, 0x89, 0x74, 0x24, 0x18]
-            && prefix.last().unwrap().bytes == [0x48, 0x8b, 0x04, 0x24],
-        "unsupported adoption supplied-body operand recipe",
-    )?;
-    let loads: Vec<_> = prefix
-        .windows(3)
-        .filter(|w| {
-            w[0].bytes == [0x48, 0x8b, 0x44, 0x24, 0x18]
-                && w[1].bytes == [0x48, 0x8b, 0x48, 0x38]
-                && w[2].bytes == [0x48, 0x89, 0x0c, 0x24]
-        })
-        .collect();
-    require(
-        loads.len() == 1,
-        "dev adoption does not load the unique original-record body field",
-    )?;
-    // Every explicit frame-memory write is inspected, and stack-pointer writes
-    // other than the one entry subtraction are rejected. Calls use the scalar
-    // ABI; the source-bound from_native/publish/atomic helpers do not receive
-    // an address overlapping either retained pointer slot.
-    for (index, instruction) in prefix.iter().enumerate().skip(1) {
-        let b = &instruction.bytes;
-        require(
-            keeps_adoption_register(b, 4),
-            "dev adoption changes its retained frame base",
-        )?;
-        if let Some((4, displacement, width)) = adoption_memory_write(b)? {
-            if displacement < 0x20 && displacement + width > 0x18 {
-                require(
-                    index == 2,
-                    "dev adoption overwrites its original record-pointer slot",
-                )?;
-            }
-            if displacement < 8 && displacement + width > 0 {
-                require(
-                    instruction.address == loads[0][2].address,
-                    "dev adoption overwrites its supplied-body slot",
-                )?;
-            }
+            require(opcode != 0xc2, "prepare RET with immediate is unsupported")?;
         }
     }
-    Ok((loads[0][1].address, call.address, "Dev owned-frame original RDI slot +0x18; literal record+0x38 load, body slot +0, reload RAX and CALL RAX".to_owned(), helper_edges))
+    Ok((transfers, edges))
 }
 
 fn qualify_standalone_constructor(
@@ -2759,13 +3002,7 @@ fn qualify_standalone_constructor(
         gate_label.st_value - gate_owner.st_value,
         gate_return.st_value - gate_owner.st_value,
     )?;
-    let result_helpers = constructor_result_helpers(elf)?;
-    for helper in result_helpers.values() {
-        require(
-            code[&helper.st_value] == CONSTRUCTOR_RESULT_HELPER_BYTES,
-            "constructor Result::is_err helper has unsupported complete bytes",
-        )?;
-    }
+    let preparation_helpers = preparation_symbols(elf)?;
     let initializing: Vec<_> = elf
         .syms
         .iter()
@@ -2797,21 +3034,29 @@ fn qualify_standalone_constructor(
         }),
         "native constructor initializing guard is not loader-mapped writable data",
     )?;
-    let bridge_adoption_call = constructor_native_bridge(
+    let route = constructor_native_bridge(
         &code[&address(CONSTRUCTOR_BRIDGE)],
         address(CONSTRUCTOR_BRIDGE),
         initializing[0].st_value,
         gate_label.st_value,
         address(CONSTRUCTOR_ADOPTION),
     )?;
-    let adoption_instructions =
+    let prepare_instructions =
         constructor_instructions(disassembly, address(CONSTRUCTOR_ADOPTION))?;
-    let (body_pointer_load, adoption_body_call, adoption_recipe, adoption_helper_edges) =
-        adoption_body_operand(
-            &adoption_instructions,
-            got,
-            &result_helpers.values().map(|s| s.st_value).collect(),
-        )?;
+    let (prepare_helper_transfers, prepare_helper_edges) = preparation_transfers(
+        &prepare_instructions,
+        got,
+        &preparation_helpers.values().map(|s| s.st_value).collect(),
+    )?;
+    let preparation_helpers = preparation_helpers
+        .iter()
+        .map(|(name, s)| {
+            (
+                preparation_role(name).unwrap().to_owned(),
+                symbol_evidence(name, s),
+            )
+        })
+        .collect();
     let function_sha256 = symbols
         .iter()
         .map(|(name, s)| (name.clone(), sha256(&code[&s.st_value])))
@@ -2819,16 +3064,160 @@ fn qualify_standalone_constructor(
     Ok(StandaloneConstructorEvidence {
         generic_initializer: symbol(GENERIC_INITIALIZER), body: symbol(STANDALONE_BODY),
         selected_initializer: symbol(STANDALONE_INITIALIZER), resolver: symbol(STANDALONE_RESOLVER),
-        bridge: symbol(CONSTRUCTOR_BRIDGE), adoption: symbol(CONSTRUCTOR_ADOPTION),
+        bridge: symbol(CONSTRUCTOR_BRIDGE), native_dispatch_version: NATIVE_DISPATCH_VERSION, prepare: symbol(CONSTRUCTOR_ADOPTION),
         native_gate: symbol_evidence(CONSTRUCTOR_GATE, &gate_label), native_gate_owner: symbol(CONSTRUCTOR_GATE_OWNER),
         native_gate_return: symbol_evidence(CONSTRUCTOR_GATE_RETURN, &gate_return),
-        native_gate_offset: gate_label.st_value - gate_owner.st_value, adoption_helper_edges,
+        native_gate_offset: gate_label.st_value - gate_owner.st_value, preparation_helpers, prepare_helper_transfers, prepare_helper_edges,
         function_sha256, environ_got_slot: prefix.environ, selector_address: prefix.selector,
         active_body_materialization: prefix.materialization, active_bridge_transfer: prefix.active,
-        inert_resolver_transfer: prefix.inert, body_initializer_call, body_resolver_transfer, bridge_adoption_call,
-        body_pointer_load, adoption_body_call, adoption_recipe, bootstrap_record: CONSTRUCTOR_RECORD,
+        inert_resolver_transfer: prefix.inert, body_initializer_call, body_resolver_transfer,
+        bridge_prepare_call: route.prepare, prepare_return: route.prepare_return,
+        native_body_retain: route.body_retain, native_ready_gate: route.ready_gate,
+        native_body_identity_check: route.body_identity_check,
+        native_body_sample_store: route.body_sample_store,
+        native_body_call: route.body_call, native_body_call_width: 3,
+        native_body_return: route.body_return, native_returned_store: route.returned_store,
+        native_restore: route.restore, native_return: route.native_return,
+        bootstrap_record: CONSTRUCTOR_RECORD,
         bootstrap_bottom: CONSTRUCTOR_BOTTOM, bootstrap_top: CONSTRUCTOR_TOP,
-        observation: "Complete actual function bytes; exact native missing/present selector branches, same-owner hidden body/bridge/adoption, supplied-body operand recipe and explicit initializer-then-resolver order. Dynamic environ provider is not authenticated. Scalar ABI and source-bound unchanged adoption helpers remain premises; this is not universal CFG/provider/protected-interior proof, execution, first-entire-DSO-Rust isolation or whole caller-window equality.".to_owned(),
+        observation: "Complete actual function bytes; exact native missing/present selector branches, same-owner hidden body/bridge/prepare, native original-RDI/R15 lineage and supplied-body CALL recipe and explicit initializer-then-resolver order. Dynamic environ provider is not authenticated. Scalar ABI and source-bound typed Constructor adoption/publication helpers remain premises; this is not universal CFG/provider/protected-interior proof, execution, first-entire-DSO-Rust isolation or whole caller-window equality.".to_owned(),
+    })
+}
+
+fn qualify_generic_bootstrap(
+    elf: &Elf<'_>,
+    bytes: &[u8],
+    code: &BTreeMap<u64, Vec<u8>>,
+    disassembly: &str,
+    got: &BTreeMap<u64, u64>,
+) -> Result<GenericBootstrapEvidence> {
+    let symbols = generic_symbols(elf)?;
+    let symbol = |name| symbol_evidence(name, &symbols[name]);
+    let address = |name| symbols[name].st_value;
+    generic_no_init_registration(
+        elf,
+        bytes,
+        &[
+            GENERIC_INITIALIZER,
+            GENERIC_BODY,
+            GENERIC_BRIDGE,
+            GENERIC_ADOPTION,
+        ]
+        .map(&address)
+        .into_iter()
+        .collect(),
+    )?;
+    let (body_materialization, entry_bridge_transfer) = generic_entry_prefix(
+        &code[&address(GENERIC_INITIALIZER)],
+        address(GENERIC_INITIALIZER),
+        address(GENERIC_BODY),
+        address(GENERIC_BRIDGE),
+    )?;
+    let gate_owner = &symbols[CONSTRUCTOR_GATE_OWNER];
+    let gate_label = constructor_interior_label(elf, CONSTRUCTOR_GATE, gate_owner)?;
+    let gate_return = constructor_interior_label(elf, CONSTRUCTOR_GATE_RETURN, gate_owner)?;
+    constructor_gate_operands(
+        &code[&gate_owner.st_value],
+        gate_label.st_value - gate_owner.st_value,
+        gate_return.st_value - gate_owner.st_value,
+    )?;
+    let preparation_helpers = preparation_symbols(elf)?;
+    // The native election must use the same actual single-byte local guard;
+    // an invented data address or a guard for a different region earns no proof.
+    let initializing: Vec<_> = elf
+        .syms
+        .iter()
+        .filter(|s| {
+            s.st_type() == sym::STT_OBJECT
+                && s.st_shndx != section_header::SHN_UNDEF as usize
+                && s.st_size == 1
+                && s.st_bind() == sym::STB_LOCAL
+        })
+        .filter(|s| {
+            elf.strtab
+                .get_at(s.st_name)
+                .is_some_and(|name| name.contains("tool_region") && name.ends_with("INITIALIZING"))
+        })
+        .collect();
+    require(
+        initializing.len() == 1,
+        "native generic initializing guard is absent/ambiguous",
+    )?;
+    let initializing_guard = initializing[0].st_value;
+    require(
+        elf.program_headers.iter().any(|p| {
+            p.p_type == program_header::PT_LOAD
+                && p.p_flags & program_header::PF_W != 0
+                && initializing_guard >= p.p_vaddr
+                && initializing_guard
+                    .checked_add(1)
+                    .is_some_and(|end| end <= p.p_vaddr.saturating_add(p.p_memsz))
+        }),
+        "native generic initializing guard is not loader-mapped writable data",
+    )?;
+    let route = generic_native_bridge(
+        &code[&address(GENERIC_BRIDGE)],
+        address(GENERIC_BRIDGE),
+        initializing_guard,
+        gate_label.st_value,
+        address(GENERIC_ADOPTION),
+    )?;
+    let prepare_instructions = constructor_instructions(disassembly, address(GENERIC_ADOPTION))?;
+    let (prepare_helper_transfers, prepare_helper_edges) = preparation_transfers(
+        &prepare_instructions,
+        got,
+        &preparation_helpers.values().map(|s| s.st_value).collect(),
+    )?;
+    let preparation_helpers = preparation_helpers
+        .iter()
+        .map(|(name, s)| {
+            (
+                preparation_role(name).unwrap().to_owned(),
+                symbol_evidence(name, s),
+            )
+        })
+        .collect();
+    let function_sha256 = symbols
+        .iter()
+        .map(|(name, s)| (name.clone(), sha256(&code[&s.st_value])))
+        .collect();
+    Ok(GenericBootstrapEvidence {
+        public_initializer: symbol(GENERIC_INITIALIZER),
+        body: symbol(GENERIC_BODY),
+        bridge: symbol(GENERIC_BRIDGE),
+        native_dispatch_version: NATIVE_DISPATCH_VERSION,
+        prepare: symbol(GENERIC_ADOPTION),
+        native_gate: symbol_evidence(CONSTRUCTOR_GATE, &gate_label),
+        native_gate_owner: symbol(CONSTRUCTOR_GATE_OWNER),
+        native_gate_return: symbol_evidence(CONSTRUCTOR_GATE_RETURN, &gate_return),
+        native_gate_offset: gate_label.st_value - gate_owner.st_value,
+        initializing_guard,
+        function_sha256,
+        body_materialization,
+        entry_bridge_transfer,
+        bridge_prepare_call: route.prepare,
+        prepare_return: route.prepare_return,
+        native_body_retain: route.body_retain,
+        native_ready_gate: route.ready_gate,
+        native_body_identity_check: route.body_identity_check,
+        native_body_sample_store: route.body_sample_store,
+        native_body_call: route.body_call,
+        native_body_call_width: 3,
+        native_body_return: route.body_return,
+        native_returned_store: route.returned_store,
+        native_body_save: route.body_save,
+        native_stack_switch: route.stack_switch,
+        native_restore: route.restore,
+        native_return: route.native_return,
+        terminal_exit_transfer: route.terminal_exit,
+        terminal_ud2: route.terminal_ud2,
+        preparation_helpers,
+        prepare_helper_transfers,
+        prepare_helper_edges,
+        bootstrap_record: GENERIC_RECORD,
+        bootstrap_bottom: CONSTRUCTOR_BOTTOM,
+        bootstrap_top: CONSTRUCTOR_TOP,
+        observation: "Complete actual DEFAULT-visible public generic ENDBR64/LEA/JMP, hidden fresh native bridge and no-write exit127/UD2 terminal; original RDI retained in native R15 matches the owned Generic record+0x38 before its native width3 supplied-body CALL. All selected function bytes and trusted-gate labels are retained and independently requalified. Whole actual prepare/helper intervals and source-bound typed origin/publication/atomic/compiler-refusal roles are premises, not recursive imported-provider closure; runtime placement/None/repeat/allocator assertions remain separate; no execution or whole-memory-isolation credit.".to_owned(),
     })
 }
 
@@ -3141,6 +3530,8 @@ pub fn qualify_constructor_from_evidence(
     let got_targets = local_got_targets(&elf)?;
     let standalone_constructor =
         qualify_standalone_constructor(&elf, &bytes, &expected_bytes, &disassembly, &got_targets)?;
+    let generic_bootstrap =
+        qualify_generic_bootstrap(&elf, &bytes, &expected_bytes, &disassembly, &got_targets)?;
     artifact.verify()?;
     Ok(ConstructorQualification {
         artifact,
@@ -3148,6 +3539,7 @@ pub fn qualify_constructor_from_evidence(
         init_array_slot,
         init_array_resolution,
         standalone_constructor,
+        generic_bootstrap,
         needed: elf.libraries.iter().map(|s| (*s).to_owned()).collect(),
         required_versions,
         readelf_versions,
@@ -3255,6 +3647,8 @@ pub fn qualify_elf_from_evidence(
     } else {
         None
     };
+    let generic_bootstrap =
+        qualify_generic_bootstrap(&elf, &bytes, &expected_bytes, &disassembly, &got_targets)?;
     let mut call_paths = BTreeMap::new();
     let mut inline_routes = BTreeMap::new();
     for (entry, shim) in [
@@ -3331,6 +3725,7 @@ pub fn qualify_elf_from_evidence(
         init_array_slot,
         init_array_resolution,
         standalone_constructor,
+        generic_bootstrap,
         exports,
         allocation_shims,
         needed: elf.libraries.iter().map(|s| (*s).to_owned()).collect(),
@@ -3506,6 +3901,66 @@ pub fn verify_runtime_receipt(
                 == (expected.initializer == STANDALONE_ROOT),
         "runtime constructor identity is unqualified",
     )?;
+    if let Some(constructor) = &receipt.qualification.standalone_constructor {
+        require(
+            constructor.native_dispatch_version == NATIVE_DISPATCH_VERSION
+                && constructor.native_body_call_width == 3
+                && constructor.prepare.name == CONSTRUCTOR_ADOPTION
+                && constructor.bridge_prepare_call.target == constructor.prepare.address
+                && constructor.bridge_prepare_call.local_got_slot.is_none()
+                && constructor.prepare_return
+                    == constructor
+                        .bridge_prepare_call
+                        .instruction
+                        .checked_add(5)
+                        .ok_or("Constructor prepare return PC overflows")?
+                && constructor.native_body_return
+                    == constructor
+                        .native_body_call
+                        .checked_add(3)
+                        .ok_or("Constructor body return PC overflows")?,
+            "runtime native Constructor ABI identity is unqualified",
+        )?;
+    }
+    let generic = &receipt.qualification.generic_bootstrap;
+    require(
+        generic.native_dispatch_version == NATIVE_DISPATCH_VERSION
+            && generic.native_body_call_width == 3
+            && generic.prepare_return
+                == generic
+                    .bridge_prepare_call
+                    .instruction
+                    .checked_add(5)
+                    .ok_or("prepare return PC overflows")?
+            && generic.native_body_return
+                == generic
+                    .native_body_call
+                    .checked_add(3)
+                    .ok_or("body return PC overflows")?
+            && generic.public_initializer.name == GENERIC_INITIALIZER
+            && generic.public_initializer.binding == sym::STB_GLOBAL
+            && generic.public_initializer.visibility == sym::STV_DEFAULT
+            && generic.public_initializer.size == 16
+            && generic.body.name == GENERIC_BODY
+            && generic.bridge.name == GENERIC_BRIDGE
+            && generic.prepare.name == GENERIC_ADOPTION
+            && [&generic.body, &generic.bridge, &generic.prepare]
+                .iter()
+                .all(|s| {
+                    s.visibility == sym::STV_HIDDEN
+                        && matches!(s.binding, sym::STB_LOCAL | sym::STB_GLOBAL)
+                })
+            && generic.entry_bridge_transfer.target == generic.bridge.address
+            && generic.entry_bridge_transfer.local_got_slot.is_none()
+            && generic.bridge_prepare_call.target == generic.prepare.address
+            && generic.bridge_prepare_call.local_got_slot.is_none()
+            && generic.terminal_exit_transfer.target == generic.native_gate.address
+            && generic.terminal_exit_transfer.local_got_slot.is_none()
+            && generic.bootstrap_record == GENERIC_RECORD
+            && generic.bootstrap_bottom == CONSTRUCTOR_BOTTOM
+            && generic.bootstrap_top == CONSTRUCTOR_TOP,
+        "runtime mandatory generic bootstrap identity is unqualified",
+    )?;
     let exports: BTreeSet<_> = receipt
         .qualification
         .exports
@@ -3669,6 +4124,269 @@ mod tests {
         }
         standalone_constructor_mutation_controls();
         standalone_registration_mutation_controls();
+        generic_entry_and_native_mutation_controls();
+        generic_loader_and_public_mutation_controls();
+    }
+
+    // Synthetic parser rejection controls only. These exercise exact bytes,
+    // observed ELF roles and computed transfers, never runtime placement or a
+    // manufactured production receipt. The existing five test identities stay.
+    fn generic_entry_and_native_mutation_controls() {
+        fn patch(code: &mut [u8], displacement: usize, target: u64) {
+            let end = 0x1000 + displacement as u64 + 4;
+            let value = i32::try_from(target as i64 - end as i64).unwrap();
+            code[displacement..displacement + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let mut public = vec![
+            0xf3, 0x0f, 0x1e, 0xfa, 0x48, 0x8d, 0x3d, 0, 0, 0, 0, 0xe9, 0, 0, 0, 0,
+        ];
+        patch(&mut public, 7, 0x8000);
+        patch(&mut public, 12, 0x9000);
+        let (materialization, transfer) =
+            generic_entry_prefix(&public, 0x1000, 0x8000, 0x9000).unwrap();
+        assert_eq!(materialization, 0x1004);
+        assert_eq!(transfer.instruction, 0x100b);
+        assert_eq!(transfer.target, 0x9000);
+        assert!(transfer.local_got_slot.is_none());
+        for (offset, value) in [
+            (0, 0x90),
+            (6, 0x05),
+            (7, 1),
+            (11, 0xe8),
+            (11, 0xeb),
+            (11, 0xff),
+            (12, 1),
+        ] {
+            let mut mutated = public.clone();
+            mutated[offset] = value;
+            assert!(generic_entry_prefix(&mutated, 0x1000, 0x8000, 0x9000).is_err());
+        }
+        for mutated in [public[..15].to_vec(), [public.clone(), vec![0x90]].concat()] {
+            assert!(generic_entry_prefix(&mutated, 0x1000, 0x8000, 0x9000).is_err());
+        }
+        assert!(generic_entry_prefix(&public, 0x1000, 0x8008, 0x9000).is_err());
+        assert!(generic_entry_prefix(&public, 0x1000, 0x8000, 0x9008).is_err());
+
+        native_dispatch_mutation_controls();
+
+        let function = |address, size| sym::Sym {
+            st_value: address,
+            st_size: size,
+            ..sym::Sym::default()
+        };
+        let roles = BTreeMap::from([
+            ("entry".to_owned(), function(0x1000, 16)),
+            ("body".to_owned(), function(0x2000, 32)),
+        ]);
+        require_disjoint_bootstrap_roles(&roles).unwrap();
+        for bad in [
+            function(0x1000, 32),
+            function(0x1008, 32),
+            function(0x2000, 0),
+            function(u64::MAX, 32),
+        ] {
+            let mut mutated = roles.clone();
+            mutated.insert("body".to_owned(), bad);
+            assert!(require_disjoint_bootstrap_roles(&mutated).is_err());
+        }
+    }
+
+    fn generic_loader_and_public_mutation_controls() {
+        fn put(bytes: &mut [u8], offset: usize, width: usize, value: u64) {
+            bytes[offset..offset + width].copy_from_slice(&value.to_le_bytes()[..width]);
+        }
+        const ROOT: u64 = 0x1100;
+        const GENERIC: u64 = 0x1200;
+        const SLOT: u64 = 0x1800;
+        let mut bytes = vec![0_u8; 0x1000];
+        bytes[..16].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        for (offset, width, value) in [
+            (16, 2, u64::from(header::ET_DYN)),
+            (18, 2, u64::from(header::EM_X86_64)),
+            (20, 4, 1),
+            (32, 8, 64),
+            (40, 8, 0xb00),
+            (52, 2, 64),
+            (54, 2, 56),
+            (56, 2, 2),
+            (58, 2, 64),
+            (60, 2, 4),
+            (62, 2, 3),
+        ] {
+            put(&mut bytes, offset, width, value);
+        }
+        for (start, kind, flags, offset, address, size, alignment) in [
+            (64, program_header::PT_LOAD, 7, 0, 0x1000, 0x1000, 0x1000),
+            (
+                120,
+                program_header::PT_DYNAMIC,
+                6,
+                0x300,
+                0x1300,
+                12 * 16,
+                8,
+            ),
+        ] {
+            for (field, width, value) in [
+                (0, 4, u64::from(kind)),
+                (4, 4, flags),
+                (8, 8, offset),
+                (16, 8, address),
+                (24, 8, address),
+                (32, 8, size),
+                (40, 8, size),
+                (48, 8, alignment),
+            ] {
+                put(&mut bytes, start + field, width, value);
+            }
+        }
+        let names = format!("\0{GENERIC_INITIALIZER}\0generic_alias\0");
+        bytes[0x500..0x500 + names.len()].copy_from_slice(names.as_bytes());
+        for (index, name) in [(1, 1), (2, GENERIC_INITIALIZER.len() as u64 + 2)] {
+            let start = 0x400 + index * 24;
+            put(&mut bytes, start, 4, name);
+            put(
+                &mut bytes,
+                start + 4,
+                1,
+                u64::from((sym::STB_GLOBAL << 4) | sym::STT_FUNC),
+            );
+            put(&mut bytes, start + 5, 1, u64::from(sym::STV_DEFAULT));
+            put(&mut bytes, start + 6, 2, 1);
+            put(&mut bytes, start + 8, 8, GENERIC);
+            put(&mut bytes, start + 16, 8, 16);
+        }
+        for (index, value) in [1, 3, 1, 0, 2, 0].into_iter().enumerate() {
+            put(&mut bytes, 0x600 + index * 4, 4, value);
+        }
+        put(&mut bytes, 0x700, 8, SLOT);
+        put(&mut bytes, 0x708, 8, u64::from(reloc::R_X86_64_RELATIVE));
+        put(&mut bytes, 0x710, 8, ROOT);
+        put(&mut bytes, 0x800, 8, ROOT);
+        for (index, (tag, value)) in [
+            (goblin::elf::dynamic::DT_INIT_ARRAY, SLOT),
+            (goblin::elf::dynamic::DT_INIT_ARRAYSZ, 8),
+            (goblin::elf::dynamic::DT_STRTAB, 0x1500),
+            (goblin::elf::dynamic::DT_STRSZ, names.len() as u64),
+            (goblin::elf::dynamic::DT_SYMTAB, 0x1400),
+            (goblin::elf::dynamic::DT_SYMENT, 24),
+            (goblin::elf::dynamic::DT_HASH, 0x1600),
+            (goblin::elf::dynamic::DT_RELA, 0x1700),
+            (goblin::elf::dynamic::DT_RELASZ, 24),
+            (goblin::elf::dynamic::DT_RELAENT, 24),
+            (goblin::elf::dynamic::DT_INIT, ROOT),
+            (goblin::elf::dynamic::DT_NULL, 0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            put(&mut bytes, 0x300 + index * 16, 8, tag);
+            put(&mut bytes, 0x308 + index * 16, 8, value);
+        }
+        let section_names = b"\0.text\0.init_array\0.shstrtab\0";
+        bytes[0x900..0x900 + section_names.len()].copy_from_slice(section_names);
+        for (index, name, kind, flags, address, offset, size, alignment, entry) in [
+            (
+                1,
+                1,
+                section_header::SHT_PROGBITS,
+                6,
+                ROOT,
+                0x100,
+                0x200,
+                16,
+                0,
+            ),
+            (
+                2,
+                7,
+                section_header::SHT_INIT_ARRAY,
+                3,
+                SLOT,
+                0x800,
+                8,
+                8,
+                8,
+            ),
+            (
+                3,
+                19,
+                section_header::SHT_STRTAB,
+                0,
+                0,
+                0x900,
+                section_names.len() as u64,
+                1,
+                0,
+            ),
+        ] {
+            let start = 0xb00 + index * 64;
+            for (field, width, value) in [
+                (0, 4, name),
+                (4, 4, u64::from(kind)),
+                (8, 8, flags),
+                (16, 8, address),
+                (24, 8, offset),
+                (32, 8, size),
+                (48, 8, alignment),
+                (56, 8, entry),
+            ] {
+                put(&mut bytes, start + field, width, value);
+            }
+        }
+        let check = |bytes: &[u8]| {
+            let elf = Elf::parse(bytes).map_err(|e| e.to_string())?;
+            let public = generic_public_initializer(&elf)?;
+            generic_no_init_registration(&elf, bytes, &BTreeSet::from([public.st_value]))
+        };
+        check(&bytes)
+            .expect("encoded actual loader registration control parses and has no generic slot");
+        for (offset, width, value) in [
+            (0x41c, 1, u64::from((sym::STB_WEAK << 4) | sym::STT_FUNC)),
+            (0x41d, 1, u64::from(sym::STV_PROTECTED)),
+            (0x41d, 1, u64::from(sym::STV_HIDDEN)),
+            (0x428, 8, 15),
+            (0x41e, 2, 0),
+            (0x418, 4, 0),
+            (0x710, 8, GENERIC),
+            (0x308, 8, SLOT + 8),
+            (0x318, 8, 16),
+            (0x3a8, 8, GENERIC),
+            (0x3a0, 8, goblin::elf::dynamic::DT_PREINIT_ARRAY),
+            (0xb44, 4, u64::from(section_header::SHT_INIT_ARRAY)),
+            (0xb98, 8, 0x808),
+            (0x708, 8, u64::from(reloc::R_X86_64_GLOB_DAT)),
+            (
+                0x708,
+                8,
+                (1_u64 << 32) | u64::from(reloc::R_X86_64_RELATIVE),
+            ),
+        ] {
+            let mut mutated = bytes.clone();
+            put(&mut mutated, offset, width, value);
+            assert!(
+                check(&mutated).is_err(),
+                "generic role/loader mutation at {offset:#x} was admitted"
+            );
+        }
+        for symbol in [1_u64, 2] {
+            let mut mutated = bytes.clone();
+            put(
+                &mut mutated,
+                0x708,
+                8,
+                (symbol << 32) | u64::from(reloc::R_X86_64_64),
+            );
+            put(&mut mutated, 0x710, 8, 0);
+            assert!(
+                check(&mutated).is_err(),
+                "loader-visible direct/alias generic registration was admitted"
+            );
+        }
+        let mut unrelocated = bytes.clone();
+        put(&mut unrelocated, 0x388, 8, 0);
+        put(&mut unrelocated, 0x800, 8, GENERIC);
+        assert!(check(&unrelocated).is_err());
     }
 
     // Exercise the affected loader-relocation resolution, not only the pure
@@ -3939,86 +4657,7 @@ mod tests {
             standalone_body_order(&reversed, 0x1000, 0x2000, 0x3000, &BTreeMap::new()).is_err()
         );
 
-        let mut native = native_template();
-        for (offset, target) in [
-            (0x34, 0x9000),
-            (0x71, 0xa000),
-            (0xab, 0xa000),
-            (0xd9, 0xa000),
-            (0x186, 0xa000),
-            (0x1b8, 0xa000),
-            (0x1d3, 0xb000),
-            (0x21b, 0xa000),
-            (0x235, 0xa000),
-        ] {
-            patch(&mut native, offset, target);
-        }
-        constructor_native_bridge(&native, 0x1000, 0x9000, 0xa000, 0xb000).unwrap();
-        for offset in [0x34, 0x71, 0x168, 0x1c8, 0x1d3] {
-            let mut bad = native.clone();
-            bad[offset] ^= 1;
-            assert!(constructor_native_bridge(&bad, 0x1000, 0x9000, 0xa000, 0xb000).is_err());
-        }
-        for clobber in [&[0x31, 0xdb][..], &[0xb7, 0][..], &[0x48, 0x89, 0xc3][..]] {
-            assert!(!keeps_adoption_register(clobber, 3));
-        }
-        assert!(!keeps_adoption_register(&[0x48, 0x83, 0xc4, 8], 4));
-
-        let mut optimized = vec![
-            vec![0x41, 0x56],
-            vec![0x53],
-            vec![0x48, 0x83, 0xec, 0x28],
-            [vec![0x48, 0xbb], CONSTRUCTOR_RECORD.to_le_bytes().to_vec()].concat(),
-            vec![0x49, 0x89, 0xe6],
-            vec![0x48, 0x39, 0xdf],
-            vec![0x0f, 0x85, 0, 0, 0, 0],
-            vec![0x48, 0x8b, 0x43, 0x38],
-            vec![0x48, 0x89, 0xe1],
-            vec![0x48, 0x89, 0x4b, 0x60],
-            vec![0xff, 0xd0],
-        ];
-        fn encoded(code: &[Vec<u8>]) -> Vec<EncodedConstructorInstruction> {
-            let mut address = 0x1000;
-            code.iter()
-                .map(|bytes| {
-                    let instruction = EncodedConstructorInstruction {
-                        address,
-                        bytes: bytes.clone(),
-                    };
-                    address += bytes.len() as u64;
-                    instruction
-                })
-                .collect()
-        }
-        adoption_body_operand(&encoded(&optimized), &BTreeMap::new(), &BTreeSet::new()).unwrap();
-        optimized[7][3] = 0x30;
-        assert!(
-            adoption_body_operand(&encoded(&optimized), &BTreeMap::new(), &BTreeSet::new())
-                .is_err()
-        );
-        optimized[7][3] = 0x38;
-        optimized.insert(7, vec![0x48, 0xc7, 0x43, 0x38, 0, 0, 0, 0]);
-        assert!(
-            adoption_body_operand(&encoded(&optimized), &BTreeMap::new(), &BTreeSet::new())
-                .is_err()
-        );
-
-        let mut dev = vec![
-            vec![0x48, 0x83, 0xec, 0x68],
-            vec![0x48, 0x89, 0xfe],
-            vec![0x48, 0x89, 0x74, 0x24, 0x18],
-            vec![0x48, 0x8b, 0x44, 0x24, 0x18],
-            vec![0x48, 0x8b, 0x48, 0x38],
-            vec![0x48, 0x89, 0x0c, 0x24],
-            vec![0x48, 0x8b, 0x04, 0x24],
-            vec![0xff, 0xd0],
-        ];
-        adoption_body_operand(&encoded(&dev), &BTreeMap::new(), &BTreeSet::new()).unwrap();
-        dev.insert(6, vec![0xc6, 0x04, 0x24, 0]);
-        assert!(adoption_body_operand(&encoded(&dev), &BTreeMap::new(), &BTreeSet::new()).is_err());
-        dev.remove(6);
-        dev.insert(3, vec![0x48, 0xc7, 0x44, 0x24, 0x18, 0, 0, 0, 0]);
-        assert!(adoption_body_operand(&encoded(&dev), &BTreeMap::new(), &BTreeSet::new()).is_err());
+        native_dispatch_mutation_controls();
         constructor_gate_operands(CONSTRUCTOR_GATE_OWNER_BYTES, 0x20, 0x22).unwrap();
         for (ip, ret) in [(0x21, 0x22), (0x20, 0x23)] {
             assert!(constructor_gate_operands(CONSTRUCTOR_GATE_OWNER_BYTES, ip, ret).is_err());
@@ -4026,41 +4665,6 @@ mod tests {
         let mut bad_gate = CONSTRUCTOR_GATE_OWNER_BYTES.to_vec();
         bad_gate[0x24] ^= 1;
         assert!(constructor_gate_operands(&bad_gate, 0x20, 0x22).is_err());
-        let mut helper_case = vec![
-            vec![0x48, 0x83, 0xec, 0x68],
-            vec![0x48, 0x89, 0xfe],
-            vec![0x48, 0x89, 0x74, 0x24, 0x18],
-            vec![0x48, 0x8b, 0x05, 0, 0, 0, 0],
-            vec![0x48, 0x8d, 0x7c, 0x24, 0x38],
-            vec![0xff, 0xd0],
-            vec![0x48, 0x8b, 0x44, 0x24, 0x18],
-            vec![0x48, 0x8b, 0x48, 0x38],
-            vec![0x48, 0x89, 0x0c, 0x24],
-            vec![0x48, 0x8b, 0x04, 0x24],
-            vec![0xff, 0xd0],
-        ];
-        let helper_encoding = encoded(&helper_case);
-        let slot = helper_encoding[3].address + 7;
-        let got = BTreeMap::from([(slot, 0x7000)]);
-        let helpers = BTreeSet::from([0x7000]);
-        let (_, _, _, edges) = adoption_body_operand(&helper_encoding, &got, &helpers).unwrap();
-        assert_eq!(edges.len(), 1);
-        assert_eq!(edges[0].target_function, 0x7000);
-        assert!(
-            adoption_body_operand(
-                &helper_encoding,
-                &BTreeMap::from([(slot, 0x7001)]),
-                &helpers
-            )
-            .is_err()
-        );
-        assert!(adoption_body_operand(&helper_encoding, &BTreeMap::new(), &helpers).is_err());
-        helper_case.insert(6, vec![0xff, 0xd0]);
-        assert!(adoption_body_operand(&encoded(&helper_case), &got, &helpers).is_err());
-        helper_case.remove(6);
-        helper_case[4][4] = 0x30;
-        assert!(adoption_body_operand(&encoded(&helper_case), &got, &helpers).is_err());
-
         let mut raw_gate = format!("0000000000001000 <{CONSTRUCTOR_GATE_OWNER}>:\n");
         let mut offset = 0usize;
         for length in [2usize, 7, 3, 3, 3, 3, 3, 3, 5, 2, 3, 4, 2, 1] {
@@ -4108,10 +4712,361 @@ mod tests {
         }
     }
 
-    fn standalone_adoption_indirect_mutation_controls() {
-        fn encoded(code: &[Vec<u8>]) -> Vec<EncodedConstructorInstruction> {
+    fn native_dispatch_mutation_controls() {
+        for origin in [
+            NativeDispatchOrigin::Constructor,
+            NativeDispatchOrigin::ExplicitGeneric,
+        ] {
+            let mut code = native_template(origin);
+            let fields = match origin {
+                NativeDispatchOrigin::Constructor => vec![
+                    (0x34, 0x9000, 0x38),
+                    (0x71, 0xa000, 0x75),
+                    (0xab, 0xa000, 0xaf),
+                    (0xd9, 0xa000, 0xdd),
+                    (0x186, 0xa000, 0x18a),
+                    (0x1bc, 0xa000, 0x1c0),
+                    (0x1e0, 0xb000, 0x1e4),
+                    (0x219, 0x9000, 0x21e),
+                    (0x29f, 0xa000, 0x2a3),
+                    (0x2b9, 0xa000, 0x2bd),
+                ],
+                NativeDispatchOrigin::ExplicitGeneric => vec![
+                    (0x34, 0x9000, 0x38),
+                    (0x71, 0xa000, 0x75),
+                    (0xab, 0xa000, 0xaf),
+                    (0xd9, 0xa000, 0xdd),
+                    (0x186, 0xa000, 0x18a),
+                    (0x1bc, 0xa000, 0x1c0),
+                    (0x1e0, 0xb000, 0x1e4),
+                    (0x219, 0x9000, 0x21e),
+                    (0x293, 0xa000, 0x297),
+                ],
+            };
+            for &(offset, target, end) in &fields {
+                let displacement = i32::try_from(target as i64 - (0x1000 + end) as i64).unwrap();
+                code[offset..offset + 4].copy_from_slice(&displacement.to_le_bytes());
+            }
+            let check =
+                |code: &[u8]| native_dispatch_bridge(code, 0x1000, 0x9000, 0xa000, 0xb000, origin);
+            let route = check(&code).unwrap();
+            assert_eq!(route.prepare.instruction, 0x11df);
+            assert_eq!(route.prepare.target, 0xb000);
+            assert!(route.prepare.local_got_slot.is_none());
+            assert_eq!(route.prepare_return, route.prepare.instruction + 5);
+            assert_eq!(route.body_retain, 0x11cd);
+            assert_eq!(route.ready_gate, 0x1210);
+            assert_eq!(route.body_identity_check, 0x1225);
+            assert_eq!(route.body_sample_store, 0x122f);
+            assert_eq!(route.body_call, 0x1233);
+            assert_eq!(route.body_return, route.body_call + 3);
+            assert_eq!(route.returned_store, 0x1253);
+            assert_eq!(route.restore, 0x125b);
+            assert_eq!(route.native_return, 0x1280);
+            assert_eq!(&code[0x233..0x236], &[0x41, 0xff, 0xd7]);
+            match origin {
+                NativeDispatchOrigin::Constructor => {
+                    assert_eq!(code.len(), 744);
+                    assert_eq!(route.terminal_exit.instruction, 0x12b8);
+                    assert_eq!(route.terminal_ud2, 0x12c1);
+                    assert_eq!(&code[0x2c3..], b"reverie constructor bootstrap failed\n");
+                }
+                NativeDispatchOrigin::ExplicitGeneric => {
+                    assert_eq!(code.len(), 669);
+                    assert_eq!(route.terminal_exit.instruction, 0x1292);
+                    assert_eq!(route.terminal_ud2, 0x129b);
+                }
+            }
+            // Every opcode, literal, displacement, guard/status/READY/identity
+            // branch, frame/sample/phase/store/restore and terminal byte is a
+            // meaningful strict predicate, including bytes after the body RET.
+            for offset in 0..code.len() {
+                let mut changed = code.clone();
+                changed[offset] ^= 1;
+                assert!(
+                    check(&changed).is_err(),
+                    "accepted changed native byte {offset:#x}"
+                );
+            }
+            for offset in [0x11a, 0x201, 0x24b, 0x25d] {
+                let opposite = match origin {
+                    NativeDispatchOrigin::Constructor => GENERIC_RECORD,
+                    NativeDispatchOrigin::ExplicitGeneric => CONSTRUCTOR_RECORD,
+                };
+                let mut mixed = code.clone();
+                mixed[offset..offset + 8].copy_from_slice(&opposite.to_le_bytes());
+                assert!(
+                    check(&mixed).is_err(),
+                    "accepted mixed origin at {offset:#x}"
+                );
+            }
+            for end in 0..code.len() {
+                assert!(check(&code[..end]).is_err());
+            }
+            let mut extra = code.clone();
+            extra.push(0x90);
+            assert!(check(&extra).is_err());
+            assert!(
+                native_dispatch_bridge(&code, u64::MAX, 0x9000, 0xa000, 0xb000, origin).is_err()
+            );
+            for (initializing, gate, prepare) in [
+                (0x9008, 0xa000, 0xb000),
+                (0x9000, 0xa008, 0xb000),
+                (0x9000, 0xa000, 0xb008),
+            ] {
+                assert!(
+                    native_dispatch_bridge(&code, 0x1000, initializing, gate, prepare, origin)
+                        .is_err()
+                );
+            }
+            // Retained-register/alias/CMOV and body-field clobbers migrate from
+            // obsolete Rust spill layouts to the exact native-only lineage.
+            // No injected write/unknown transfer is credited by a graph path.
+            for clobber in [
+                vec![0x45, 0x31, 0xff],
+                vec![0x49, 0x89, 0xc7],
+                vec![0x41, 0xbf, 0, 0, 0, 0],
+                vec![0x66, 0x41, 0xbf, 0, 0],
+                vec![0x41, 0xb7, 0],
+                vec![0x4c, 0x0f, 0x44, 0xf8],
+                vec![0x44, 0x0f, 0x44, 0xf8],
+                vec![0x66, 0x44, 0x0f, 0x44, 0xf8],
+                vec![0x4c, 0x0f, 0x44, 0x3c, 0x24],
+                vec![0x44, 0x0f, 0x44, 0x3c, 0x24],
+                vec![0x49, 0xc7, 0x46, 0x38, 0, 0, 0, 0],
+                vec![0x41, 0xc6, 0x46, 0x38, 0],
+                vec![0x49, 0x8b, 0x46, 0x38],
+                vec![0x48, 0xbc, 0, 0, 0, 0, 0, 0, 0, 0],
+                vec![0xff, 0xd0],
+                vec![0xff, 0xd1],
+                vec![0xff, 0x20],
+                vec![0x41, 0xff, 0xd7],
+                vec![0x48, 0x41, 0xff, 0xd7],
+                vec![0x66, 0x41, 0xff, 0xd7],
+                vec![0xf2, 0x41, 0xff, 0xd7],
+                vec![0x3e, 0x41, 0xff, 0xd7],
+                vec![0xff, 0x15, 0, 0, 0, 0],
+                vec![0xff, 0x25, 0, 0, 0, 0],
+                vec![0xe8, 0, 0, 0, 0],
+                vec![0xe9, 0, 0, 0, 0],
+            ] {
+                for offset in [0x1cd, 0x1e4, 0x233, 0x236, 0x25b, 0x280] {
+                    let mut changed = code.clone();
+                    changed.splice(offset..offset, clobber.clone());
+                    assert!(
+                        check(&changed).is_err(),
+                        "accepted native injection at {offset:#x}: {clobber:02x?}"
+                    );
+                }
+            }
+            // Fixed-size confused call target/width, sampleTOP, phase and stack
+            // reseeding bypass controls exercise the complete-byte predicate.
+            for (offset, replacement) in [
+                (0x1cd, vec![0x4c, 0x0f, 0x44, 0xf8, 0x90]),
+                (0x1e4, vec![0x31, 0xc0]), // erase scalar refusal status
+                (0x210, vec![0x49, 0x83, 0x7e, 0x48, 4]),
+                (0x225, vec![0x4d, 0x39, 0x76, 0x38]),
+                (0x22b, vec![0x48, 0x83, 0xec, 0]), // sampleTOP, no frame16
+                (0x233, vec![0x41, 0xff, 0xd6]),    // CALL R14
+                (0x233, vec![0xff, 0xd0, 0x90]),    // old CALL RAX width2
+                (0x240, vec![0x48, 0x89, 0xc4]),    // reseed returned RSP
+                (0x253, vec![0x49, 0xc7, 0x46, 0x48, 3, 0, 0, 0]),
+            ] {
+                let mut changed = code.clone();
+                changed[offset..offset + replacement.len()].copy_from_slice(&replacement);
+                assert!(
+                    check(&changed).is_err(),
+                    "accepted confused native operation at {offset:#x}"
+                );
+            }
+            // Complete current intervals remain checked outside this matcher.
+            // Synthetic byte spans only: this exercises interval/raw-byte
+            // coverage, not instruction decoding or an emitted artifact proof.
+            // Keep each span within the unchanged maximum x86 byte width.
+            let mut raw = "0000000000001000 <native-control>:\n".to_owned();
+            for (index, span) in code.chunks(15).enumerate() {
+                raw.push_str(&format!(
+                    "{:x}: {} synthetic-only\n",
+                    0x1000 + index * 15,
+                    span.iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ));
+            }
+            let scope = BTreeMap::from([(0x1000, code.clone())]);
+            verify_disassembly_bytes(&raw, &scope).unwrap();
+            for bad in [
+                raw.replace("1000:", "1001:"),
+                raw.replacen("41 ff d7", "41 ff d6", 1),
+                format!("{raw}1000: c3 extra\n"),
+            ] {
+                assert!(verify_disassembly_bytes(&bad, &scope).is_err());
+            }
+        }
+    }
+
+    fn native_dispatch_schema_controls() {
+        let symbol = SymbolEvidence {
+            name: "synthetic-parser-only".to_owned(),
+            address: 0x1000,
+            size: 1,
+            binding: sym::STB_LOCAL,
+            visibility: sym::STV_HIDDEN,
+        };
+        let transfer = ConstructorTransfer {
+            instruction: 0x1000,
+            target: 0x2000,
+            local_got_slot: None,
+        };
+        let proof = GenericBootstrapEvidence {
+            public_initializer: symbol.clone(),
+            body: symbol.clone(),
+            bridge: symbol.clone(),
+            native_dispatch_version: NATIVE_DISPATCH_VERSION,
+            prepare: symbol.clone(),
+            native_gate: symbol.clone(),
+            native_gate_owner: symbol.clone(),
+            native_gate_return: symbol,
+            native_gate_offset: 0,
+            initializing_guard: 0,
+            function_sha256: BTreeMap::new(),
+            body_materialization: 0,
+            entry_bridge_transfer: transfer.clone(),
+            bridge_prepare_call: transfer.clone(),
+            prepare_return: 0,
+            native_body_retain: 0,
+            native_ready_gate: 0,
+            native_body_identity_check: 0,
+            native_body_sample_store: 0,
+            native_body_call: 0,
+            native_body_call_width: 3,
+            native_body_return: 0,
+            native_returned_store: 0,
+            native_body_save: 0,
+            native_stack_switch: 0,
+            native_restore: 0,
+            native_return: 0,
+            terminal_exit_transfer: transfer,
+            terminal_ud2: 0,
+            preparation_helpers: BTreeMap::new(),
+            prepare_helper_transfers: Vec::new(),
+            prepare_helper_edges: Vec::new(),
+            bootstrap_record: GENERIC_RECORD,
+            bootstrap_bottom: CONSTRUCTOR_BOTTOM,
+            bootstrap_top: CONSTRUCTOR_TOP,
+            observation: "synthetic deserialization control, never emitted/qualified evidence"
+                .to_owned(),
+        };
+        let encoded = serde_json::to_value(&proof).unwrap();
+        assert_eq!(
+            serde_json::from_value::<GenericBootstrapEvidence>(encoded.clone()).unwrap(),
+            proof
+        );
+        for required in [
+            "native_dispatch_version",
+            "prepare",
+            "bridge_prepare_call",
+            "prepare_return",
+            "native_body_retain",
+            "native_ready_gate",
+            "native_body_identity_check",
+            "native_body_sample_store",
+            "native_body_call",
+            "native_body_call_width",
+            "native_body_return",
+            "native_returned_store",
+            "native_restore",
+            "native_return",
+            "preparation_helpers",
+            "prepare_helper_transfers",
+            "prepare_helper_edges",
+        ] {
+            let mut missing = encoded.clone();
+            missing.as_object_mut().unwrap().remove(required);
+            assert!(
+                serde_json::from_value::<GenericBootstrapEvidence>(missing).is_err(),
+                "defaulted {required}"
+            );
+        }
+        for retired in [
+            "adoption",
+            "bridge_adoption_call",
+            "body_pointer_load",
+            "adoption_body_call",
+            "adoption_recipe",
+            "adoption_helper_edges",
+        ] {
+            let mut old = encoded.clone();
+            old.as_object_mut()
+                .unwrap()
+                .insert(retired.to_owned(), serde_json::Value::Null);
+            assert!(
+                serde_json::from_value::<GenericBootstrapEvidence>(old).is_err(),
+                "accepted retired {retired}"
+            );
+        }
+    }
+
+    fn preparation_role_mutation_controls() {
+        // Exact actually emitted type-specialized role names, not arbitrary
+        // std helpers or body-specific dispatch exceptions.
+        let names = [
+            "reverie_inguest_trusted_syscall",
+            "_RINvYINtNtNtCsayI02cGi06u_4core3ops5range5RangejENtNtNtNtBa_4iter6traits8iterator8Iterator8try_folduNCINvNvBL_3all5checkjNCNvMs_NtNtNtCsbPdJyRcwhkv_15reverie_inguest5guest11tool_region11constructorNtB22_16NativeFreshOwner11from_natives_0E0INtNtB8_12control_flow11ControlFlowuEEB28_",
+            "_RINvMNtNtCsa2m0ZrbF74z_3std4sync9once_lockINtB3_8OnceLockINtNtCsayI02cGi06u_4core6result6ResultNtNtNtCsbPdJyRcwhkv_15reverie_inguest5guest11tool_region10ToolRegionlEE10initializeNCINvB2_11get_or_initNCNvB2_10try_insert0E0zEB1B_",
+            "_RNvNtCsayI02cGi06u_4core9panicking19panic_cannot_unwind",
+            "_RNvMs_NtNtNtCsk1nybVdH5QO_15reverie_inguest5guest11tool_region11constructorNtB4_16NativeFreshOwner11from_native",
+            "_RNvNtCsayI02cGi06u_4core9panicking36panic_misaligned_pointer_dereference",
+            "_RNvMs16_NtNtCsayI02cGi06u_4core4sync6atomicINtB6_6AtomicjE5storeCsk1nybVdH5QO_15reverie_inguest",
+            "_RNvNtCsayI02cGi06u_4core9panicking32panic_null_reference_constructed",
+            "_RNvMs_NtNtNtCsk1nybVdH5QO_15reverie_inguest5guest11tool_region11constructorNtB4_16NativeFreshOwner7publish",
+        ];
+        let mut roles = BTreeSet::new();
+        for name in names {
+            let role = preparation_role(name).unwrap();
+            assert!(roles.insert(role));
+            assert_eq!(preparation_role(&format!("{name}.llvm.123")), Some(role));
+            assert!(preparation_role(&format!("{name}.llvm.not_a_number")).is_none());
+            assert!(preparation_role(&format!("{name}extra")).is_none());
+            assert!(preparation_role(&format!("prefix{name}")).is_none());
+            assert!(
+                preparation_role(&name.replace("15reverie_inguest", "15foreign_inguest")).is_none()
+                    || !name.contains("15reverie_inguest")
+            );
+            assert!(
+                preparation_role(&name.replace("ToolRegion", "GuestArena")).is_none()
+                    || !name.contains("ToolRegion")
+            );
+            assert!(
+                preparation_role(&name.replace("NativeFreshOwner", "OrdinaryOwner___")).is_none()
+                    || !name.contains("NativeFreshOwner")
+            );
+        }
+        assert_eq!(roles.len(), 9);
+        for unproved in [
+            "from_native",
+            "NativeFreshOwner::publish",
+            "memcpy",
+            "memset",
+            "_RNvNtCs123_4core9panicking5panic",
+            "_RNvMs16_NtNtCs123_4core4sync6atomicINtB6_6AtomicjE4loadCs123_15reverie_inguest",
+            "reverie_inguest_generic_adopt_entry",
+            "reverie_liteinst_generic_body",
+            "_RNvMs_NtNtNtCs123_15reverie_inguest5guest11tool_region11constructorNtB4_16NativeFreshOwner11from_natives_0",
+        ] {
+            assert!(
+                preparation_role(unproved).is_none(),
+                "accepted unproved role {unproved}"
+            );
+        }
+    }
+
+    fn preparation_transfer_mutation_controls() {
+        let encode = |parts: &[Vec<u8>]| {
             let mut address = 0x1000;
-            code.iter()
+            parts
+                .iter()
                 .map(|bytes| {
                     let instruction = EncodedConstructorInstruction {
                         address,
@@ -4120,105 +5075,138 @@ mod tests {
                     address += bytes.len() as u64;
                     instruction
                 })
-                .collect()
-        }
-        let helper_case = vec![
-            vec![0x48, 0x83, 0xec, 0x68],
-            vec![0x48, 0x89, 0xfe],
-            vec![0x48, 0x89, 0x74, 0x24, 0x18],
-            vec![0x48, 0x8b, 0x05, 0, 0, 0, 0],
-            vec![0x48, 0x8d, 0x7c, 0x24, 0x38],
-            vec![0xff, 0xd0],
-            vec![0x48, 0x8b, 0x44, 0x24, 0x18],
-            vec![0x48, 0x8b, 0x48, 0x38],
-            vec![0x48, 0x89, 0x0c, 0x24],
-            vec![0x48, 0x8b, 0x04, 0x24],
-            vec![0xff, 0xd0],
-        ];
-        let helper_encoding = encoded(&helper_case);
-        let slot = helper_encoding[3].address + 7;
-        let got = BTreeMap::from([(slot, 0x7000)]);
+                .collect::<Vec<_>>()
+        };
         let helpers = BTreeSet::from([0x7000]);
-        let (_, _, _, edges) = adoption_body_operand(&helper_encoding, &got, &helpers).unwrap();
-        assert_eq!(edges.len(), 1);
+        let direct = vec![vec![0xe8, 0xfb, 0x5f, 0, 0], vec![0xc3]];
+        let (transfers, edges) =
+            preparation_transfers(&encode(&direct), &BTreeMap::new(), &helpers).unwrap();
+        assert_eq!(transfers[0].target, 0x7000);
+        assert!(edges.is_empty());
+        let rip = vec![vec![0xff, 0x15, 0, 0, 0, 0], vec![0xc3]];
+        let got = BTreeMap::from([(0x1006, 0x7000)]);
+        let (transfers, edges) = preparation_transfers(&encode(&rip), &got, &helpers).unwrap();
+        assert_eq!(transfers[0].local_got_slot, Some(0x1006));
         assert_eq!(edges[0].target_function, 0x7000);
-        // Keep the later proved supplied-body CALL RAX present in every case.
-        // Target certification cannot be obtained by simply omitting another
-        // indirect transfer from the helper enumerator.
-        let unsupported: &[(&str, &[u8])] = &[
-            ("CALL RCX", &[0xff, 0xd1]),
-            ("CALL RDX", &[0xff, 0xd2]),
-            ("REX CALL R8", &[0x41, 0xff, 0xd0]),
-            ("REX.W CALL RAX", &[0x48, 0xff, 0xd0]),
-            ("operand-prefix CALL RAX", &[0x66, 0xff, 0xd0]),
-            ("REP-prefix CALL RCX", &[0xf3, 0xff, 0xd1]),
-            ("BND-prefix CALL RCX", &[0xf2, 0xff, 0xd1]),
-            ("NOTRACK CALL RCX", &[0x3e, 0xff, 0xd1]),
-            ("CALL [RAX]", &[0xff, 0x10]),
-            ("CALL [RCX]", &[0xff, 0x11]),
-            ("CALL [RSP]", &[0xff, 0x14, 0x24]),
-            ("CALL [RSP+8]", &[0xff, 0x54, 0x24, 8]),
-            ("REX CALL [R8]", &[0x41, 0xff, 0x10]),
-            ("JMP RAX", &[0xff, 0xe0]),
-            ("JMP RCX", &[0xff, 0xe1]),
-            ("REX JMP R8", &[0x41, 0xff, 0xe0]),
-            ("JMP [RAX]", &[0xff, 0x20]),
-            ("JMP [RSP]", &[0xff, 0x24, 0x24]),
-            ("JMP [RSP+8]", &[0xff, 0x64, 0x24, 8]),
-            ("far CALL [RAX]", &[0xff, 0x18]),
-            ("far JMP [RAX]", &[0xff, 0x28]),
-            ("address-prefix CALL", &[0x67, 0xff, 0x15, 0, 0, 0, 0]),
-        ];
-        let mut accepted = Vec::new();
-        for &(name, replacement) in unsupported {
-            let mut mutated = helper_case.clone();
-            mutated[5] = replacement.to_vec();
-            if adoption_body_operand(&encoded(&mutated), &got, &helpers).is_ok() {
-                accepted.push(name);
-            }
+        for unqualified in [BTreeMap::new(), BTreeMap::from([(0x1006, 0x7008)])] {
+            assert!(preparation_transfers(&encode(&rip), &unqualified, &helpers).is_err());
         }
-        // The enumeration must cover the full function, including instructions
-        // after the supplied-body call, rather than only the prefix.
-        for (name, extra) in [
-            ("late CALL RCX", vec![0xff, 0xd1]),
-            ("late REX CALL R8", vec![0x41, 0xff, 0xd0]),
-            ("late JMP [RAX]", vec![0xff, 0x20]),
+        // Former supplied CALL RAX and every alias/prefixed/late/extra transfer
+        // now refuse everywhere in Rust prepare: dispatch lives only in native.
+        for bad in [
+            vec![0xff, 0xd0],
+            vec![0xff, 0xd1],
+            vec![0xff, 0xd2],
+            vec![0x41, 0xff, 0xd0],
+            vec![0x41, 0xff, 0xd7],
+            vec![0x48, 0xff, 0xd0],
+            vec![0x66, 0xff, 0xd0],
+            vec![0xf3, 0xff, 0xd1],
+            vec![0xf2, 0xff, 0xd1],
+            vec![0x3e, 0xff, 0xd1],
+            vec![0xff, 0x10],
+            vec![0xff, 0x11],
+            vec![0xff, 0x14, 0x24],
+            vec![0xff, 0x54, 0x24, 8],
+            vec![0x41, 0xff, 0x10],
+            vec![0xff, 0xe0],
+            vec![0xff, 0xe1],
+            vec![0x41, 0xff, 0xe0],
+            vec![0xff, 0x20],
+            vec![0xff, 0x24, 0x24],
+            vec![0xff, 0x64, 0x24, 8],
+            vec![0xff, 0x18],
+            vec![0xff, 0x28],
+            vec![0xff, 0x25, 0, 0, 0, 0],
+            vec![0x67, 0xff, 0x15, 0, 0, 0, 0],
+            vec![0x3e, 0xff, 0x15, 0, 0, 0, 0],
+            vec![0xff],
+            vec![0xff, 0x15, 0, 0],
+            vec![0xff, 0x15, 0, 0, 0, 0, 0x90],
+            vec![0xe8],
+            vec![0xe8, 0, 0],
+            vec![0xe8, 0, 0, 0, 0, 0x90],
+            vec![0x66, 0xe8, 0, 0, 0, 0],
+            vec![0xe9, 0xff, 0xff, 0xff, 0x7f],
+            vec![0x9a],
+            vec![0xea],
+            vec![0xca],
+            vec![0xcb],
+            vec![0xcf],
         ] {
-            let mut mutated = helper_case.clone();
-            mutated.push(extra);
-            if adoption_body_operand(&encoded(&mutated), &got, &helpers).is_ok() {
-                accepted.push(name);
+            for index in [0, 1, 2] {
+                let mut mutated = direct.clone();
+                mutated.insert(index, bad.clone());
+                assert!(
+                    preparation_transfers(&encode(&mutated), &got, &helpers).is_err(),
+                    "accepted {bad:02x?} at {index}"
+                );
             }
         }
-        // The only separately admitted memory-call encoding is the original
-        // bare CALL [RIP+disp32], with its independently qualified local GOT.
-        let mut rip_case = helper_case.clone();
-        rip_case.insert(6, vec![0xff, 0x15, 0, 0, 0, 0]);
-        let rip_encoding = encoded(&rip_case);
-        let rip_slot = rip_encoding[6].address + 6;
-        let mut local_got = got.clone();
-        local_got.insert(rip_slot, 0x7100);
-        adoption_body_operand(&rip_encoding, &local_got, &helpers).unwrap();
-        if adoption_body_operand(&rip_encoding, &got, &helpers).is_ok() {
-            accepted.push("unresolved RIP CALL");
-        }
-        for (name, replacement) in [
-            ("RIP JMP", vec![0xff, 0x25, 0, 0, 0, 0]),
-            ("prefixed RIP CALL", vec![0x3e, 0xff, 0x15, 0, 0, 0, 0]),
+        // A valid source/helper CALL elsewhere cannot launder an unqualified
+        // kernel gate, interrupt, system-return, privileged halt or VM transfer.
+        // Prefixes, truncation and extra bytes never make these forms ordinary.
+        for transfer in [
+            vec![0x0f, 0x05],       // SYSCALL
+            vec![0x0f, 0x07],       // SYSRET
+            vec![0x0f, 0x34],       // SYSENTER
+            vec![0x0f, 0x35],       // SYSEXIT
+            vec![0xcd, 0x80],       // INT80
+            vec![0xcd, 0x03],       // another INT vector
+            vec![0xcc],             // INT3
+            vec![0xce],             // INTO
+            vec![0xf1],             // INT1
+            vec![0xcf],             // IRET
+            vec![0x0f, 0xaa],       // RSM
+            vec![0x0f, 0x01, 0xc1], // VMCALL
+            vec![0x0f, 0x01, 0xc2], // VMLAUNCH
+            vec![0x0f, 0x01, 0xc3], // VMRESUME
+            vec![0x0f, 0x01, 0xd9], // VMMCALL
+            vec![0x0f, 0x37],       // GETSEC
+            vec![0xf4],             // HLT
+            vec![0x0f, 0x0b],       // UD2
         ] {
-            let mut mutated = rip_case.clone();
-            mutated[6] = replacement;
-            let encoded = encoded(&mutated);
-            let mut local_got = got.clone();
-            local_got.insert(encoded[6].address + encoded[6].bytes.len() as u64, 0x7100);
-            if adoption_body_operand(&encoded, &local_got, &helpers).is_ok() {
-                accepted.push(name);
+            for prefix in [
+                vec![],
+                vec![0x48],
+                vec![0x66],
+                vec![0xf2],
+                vec![0xf3],
+                vec![0x67],
+                vec![0x3e],
+            ] {
+                let mut bytes = prefix;
+                bytes.extend(&transfer);
+                for index in [0, 1, 2] {
+                    let mut mutated = direct.clone();
+                    mutated.insert(index, bytes.clone());
+                    assert!(
+                        preparation_transfers(&encode(&mutated), &got, &helpers).is_err(),
+                        "accepted kernel/system transfer {bytes:02x?} at {index}"
+                    );
+                }
+                bytes.push(0x90);
+                assert!(preparation_transfers(&encode(&[bytes]), &got, &helpers).is_err());
             }
+        }
+        for truncated in [
+            vec![0x0f],
+            vec![0x48, 0x0f],
+            vec![0x0f, 0x01],
+            vec![0x66, 0x0f, 0x01],
+            vec![0xcd],
+            vec![0x66, 0xcd],
+        ] {
+            assert!(preparation_transfers(&encode(&[truncated]), &got, &helpers).is_err());
         }
         assert!(
-            accepted.is_empty(),
-            "unproved adoption transfers qualified: {accepted:?}"
+            preparation_transfers(&encode(&direct), &BTreeMap::new(), &BTreeSet::new()).is_err()
         );
+        let branch = encode(&[vec![0x75, 0], vec![0xc3]]);
+        preparation_transfers(&branch, &BTreeMap::new(), &BTreeSet::new()).unwrap();
+        let mut discontinuous = branch;
+        discontinuous[1].address += 1;
+        assert!(preparation_transfers(&discontinuous, &BTreeMap::new(), &BTreeSet::new()).is_err());
     }
 
     #[test]
@@ -4232,7 +5220,10 @@ mod tests {
             assert!(edges.is_empty());
             assert!(shortest_path(&graph, 0x1000, 0x2000).is_err());
         }
-        standalone_adoption_indirect_mutation_controls();
+        preparation_transfer_mutation_controls();
+        preparation_role_mutation_controls();
+        native_dispatch_schema_controls();
+        native_dispatch_mutation_controls();
     }
 
     #[test]
