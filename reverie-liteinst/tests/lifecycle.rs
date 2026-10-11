@@ -2289,3 +2289,7 @@ async fn refused_guest_connection_fails_the_run() {
     }
     assert!(!marker.exists(), "the refused guest ran its program");
 }
+
+#[cfg(feature = "allocator-fixture")]
+#[path = "lifecycle/mapping_routes.rs"]
+mod mapping_routes;

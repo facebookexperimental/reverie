@@ -127,3 +127,8 @@ required-features = ["allocator-fixture"]
 name = "reverie-liteinst-allocator-private-control"
 path = "src/bin/allocator_private_control.rs"
 required-features = ["allocator-fixture"]
+
+[[test]]
+name = "mapping_integrity"
+path = "tests/mapping_integrity.rs"
+required-features = ["allocator-fixture"]

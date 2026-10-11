@@ -1224,3 +1224,196 @@ fn raw_fork_with_unpublished_initialization_gate_refuses_nonwaiting() {
         },
     );
 }
+
+#[test]
+fn published_owner_protects_reservation_without_a_signal_restorer() {
+    isolated(
+        "published_owner_protects_reservation_without_a_signal_restorer",
+        || {
+            let guarded = super::super::restorer::mapping_change_refused;
+            assert!(REGION.get().is_none());
+            assert!(!guarded(libc::SYS_process_madvise, [0; 6]));
+            let region = ToolRegion::reserve().unwrap();
+            let lease = region.stack(PAGE).unwrap();
+            assert!(REGION.get().is_some_and(Result::is_ok));
+
+            // These are real published-owner addresses: the outer guards, a
+            // live writable lease, and still-reserved future lease capacity.
+            // No restorer has been registered in this isolated process.
+            let addresses = [BASE, lease.base(), END - PAGE, BASE + BYTES / 2];
+            let numbers = [
+                libc::SYS_munmap,
+                libc::SYS_mprotect,
+                libc::SYS_pkey_mprotect,
+                libc::SYS_madvise,
+                libc::SYS_remap_file_pages,
+                libc::SYS_mseal,
+            ];
+            let mut missing = Vec::new();
+            for number in numbers {
+                for address in addresses {
+                    if !guarded(number, [address as u64, PAGE as u64, 0, 0, 0, 0]) {
+                        missing.push((number, address));
+                    }
+                    assert!(!guarded(number, [address as u64, 0, 0, 0, 0, 0]));
+                }
+                for address in [BASE - PAGE, END] {
+                    assert!(!guarded(number, [address as u64, PAGE as u64, 0, 0, 0, 0]));
+                }
+            }
+            assert!(
+                missing.is_empty(),
+                "unprotected owner operations: {missing:?}"
+            );
+            assert!(guarded(libc::SYS_process_madvise, [0; 6]));
+            // Genuine Tool leases remain usable through their own raw gates.
+            zero_interior(&lease);
+            dirty_interior(&lease);
+            drop(lease);
+            zero_interior(&region.stack(PAGE).unwrap());
+        },
+    );
+}
+
+#[test]
+fn absent_and_failed_owner_do_not_protect_an_unrecognized_mapping() {
+    isolated(
+        "absent_and_failed_owner_do_not_protect_an_unrecognized_mapping",
+        || {
+            let guarded = super::super::restorer::mapping_change_refused;
+            let args = [BASE as u64, PAGE as u64, 0, 0, 0, 0];
+            assert!(REGION.get().is_none());
+            assert!(!guarded(libc::SYS_mprotect, args));
+            assert!(REGION.get().is_none(), "query must not reserve memory");
+            assert_eq!(
+                map(
+                    BASE,
+                    PAGE,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_FIXED_NOREPLACE
+                ),
+                BASE
+            );
+            assert_eq!(
+                ToolRegion::reserve().unwrap_err().raw_os_error(),
+                Some(libc::EEXIST)
+            );
+            assert!(REGION.get().is_some_and(Result::is_err));
+            assert!(!guarded(libc::SYS_mprotect, args));
+            assert!(!guarded(libc::SYS_process_madvise, [0; 6]));
+            assert_eq!(raw(libc::SYS_munmap, args), 0);
+        },
+    );
+}
+
+#[test]
+fn published_owner_mapping_guard_is_inherited_by_plain_fork() {
+    isolated(
+        "published_owner_mapping_guard_is_inherited_by_plain_fork",
+        || {
+            let _region = ToolRegion::reserve().unwrap();
+            let pid = raw(libc::SYS_fork, [0; 6]);
+            if pid == 0 {
+                let guarded = super::super::restorer::mapping_change_refused(
+                    libc::SYS_mprotect,
+                    [
+                        (END - PAGE) as u64,
+                        PAGE as u64,
+                        libc::PROT_WRITE as u64,
+                        0,
+                        0,
+                        0,
+                    ],
+                );
+                raw_exit(if guarded { 0 } else { 1 });
+            }
+            assert!(pid > 0, "fork failed: {pid}");
+            let status = wait_raw(pid);
+            assert!(libc::WIFEXITED(status), "child did not exit: {status:#x}");
+            assert_eq!(libc::WEXITSTATUS(status), 0, "child lost owner protection");
+        },
+    );
+}
+
+#[test]
+fn invalid_kernel_break_query_refuses_without_returning_an_errno_as_a_pointer() {
+    isolated(
+        "invalid_kernel_break_query_refuses_without_returning_an_errno_as_a_pointer",
+        || {
+            let _region = ToolRegion::reserve().unwrap();
+            let pid = raw(libc::SYS_fork, [0; 6]);
+            if pid == 0 {
+                // Only this disposable child changes seccomp state. Make the
+                // actual trusted brk(0) query return EPERM; every other syscall
+                // remains available, including the guard's diagnostic/exit.
+                let filter = [
+                    libc::sock_filter {
+                        code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+                        jt: 0,
+                        jf: 0,
+                        k: 0,
+                    },
+                    libc::sock_filter {
+                        code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+                        jt: 0,
+                        jf: 1,
+                        k: libc::SYS_brk as u32,
+                    },
+                    libc::sock_filter {
+                        code: (libc::BPF_RET | libc::BPF_K) as u16,
+                        jt: 0,
+                        jf: 0,
+                        k: libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+                    },
+                    libc::sock_filter {
+                        code: (libc::BPF_RET | libc::BPF_K) as u16,
+                        jt: 0,
+                        jf: 0,
+                        k: libc::SECCOMP_RET_ALLOW,
+                    },
+                ];
+                let program = libc::sock_fprog {
+                    len: filter.len() as u16,
+                    filter: filter.as_ptr() as *mut libc::sock_filter,
+                };
+                if raw(
+                    libc::SYS_prctl,
+                    [libc::PR_SET_NO_NEW_PRIVS as u64, 1, 0, 0, 0, 0],
+                ) != 0
+                {
+                    raw_exit(111);
+                }
+                if raw(
+                    libc::SYS_seccomp,
+                    [
+                        libc::SECCOMP_SET_MODE_FILTER as u64,
+                        0,
+                        (&raw const program) as u64,
+                        0,
+                        0,
+                        0,
+                    ],
+                ) != 0
+                {
+                    raw_exit(112);
+                }
+                let _ = super::super::restorer::mapping_change_result(
+                    libc::SYS_brk,
+                    [BASE as u64, 0, 0, 0, 0, 0],
+                );
+                raw_exit(113); // No scalar, including -EPERM, may be returned.
+            }
+            assert!(pid > 0, "fork failed: {pid}");
+            let status = wait_raw(pid);
+            assert!(
+                libc::WIFEXITED(status),
+                "guard child did not exit: {status:#x}"
+            );
+            assert_eq!(
+                libc::WEXITSTATUS(status),
+                125,
+                "invalid break query did not refuse"
+            );
+        },
+    );
+}

@@ -332,6 +332,11 @@ pub unsafe fn forward_nested_tool_syscall(
     } else if !(protect_runtime_control(event)
         || unsafe { protect_runtime_descriptors(event, false) })
     {
+        if let Some(result) = super::restorer::owner_mapping_change_result(event.number, event.args)
+        {
+            event.result = result;
+            return;
+        }
         event.result = unsafe { event.forward() };
         observe(event);
     }

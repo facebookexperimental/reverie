@@ -85,8 +85,28 @@ allocations inside libc or the loader, guest TLS, or all entry-frame storage.
 The installation-depth counter still lives in ELF TLS and is reached through
 the loader's `__tls_get_addr`; this slice does not isolate that resolver's work.
 The interiors remain on protection key zero; boundary guards do not prevent
-guest writes into them or destructive mappings. Those require separate barriers.
-This is not a claim of complete Tool memory isolation.
+guest writes into them. This is not a claim of complete Tool memory isolation.
+
+Once a runtime publishes a ToolRegion owner, its physical syscall forwarding
+protects the entire four-GiB reservation, including unused lease capacity.
+This also applies to a Legacy allocator runtime that owns fixed Tool stacks;
+a backing declaration alone does not activate protection. The existing FullTool
+unsubscribed, injected and tail-injected paths check final arguments. Nested Tool
+syscalls and native Strace/Compat forwarding activate the same guard when an
+owner is published. A Tool may still emulate or rewrite a guest operation.
+
+Overlapping `munmap`, `mprotect`, `pkey_mprotect`, `madvise`, `remap_file_pages`,
+fixed `mmap`, `mremap` and raw `mseal` are refused with `EPERM`. Mapping ranges
+include effective huge-page extents. `SHM_REMAP` and `process_madvise` retain a
+conservative refusal because their effective targets cannot be established by
+this guard. A refused `brk` instead returns the genuine unchanged break, as its
+raw Linux ABI requires. If that current break cannot be established, the runtime
+refuses the configuration. Trusted Tool allocation and lease operations retain
+their raw gates, and mappings outside the reservation remain usable.
+
+This finite guard does not prevent CPU stores, kernel writes through guest
+buffers, aliases, external writers or jumps into trusted code. It adds no
+protection-key assignment or TLS isolation, and does not admit new syscalls.
 
 The alternate signal stack and the typed Tool continuation use explicit fixed
 region backing. See [the stack storage contract](STACK_MEMORY.md) for the exact

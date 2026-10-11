@@ -1,6 +1,10 @@
 // Legacy embedded Tool root: intentionally retains scoped allocation behavior.
 reverie_liteinst::declare_legacy_scoped_tool_allocator!();
 
+#[cfg(feature = "allocator-fixture")]
+#[path = "lifecycle_guest/mapping_routes.rs"]
+mod mapping_routes;
+
 use core::arch::global_asm;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
@@ -2799,6 +2803,17 @@ fn main() {
     let mut arguments = std::env::args_os();
     let _program = arguments.next();
     let mode = arguments.next().expect("missing lifecycle fixture mode");
+    #[cfg(feature = "allocator-fixture")]
+    if mode == "mapping-routes" {
+        let route = arguments.next().expect("missing mapping route");
+        let operation = arguments.next().expect("missing mapping operation");
+        assert!(arguments.next().is_none(), "unexpected mapping argument");
+        mapping_routes::run(
+            route.to_str().expect("UTF8 route"),
+            operation.to_str().expect("UTF8 operation"),
+        );
+        return;
+    }
     if let Some(mode) = mode.to_str() {
         if matches!(
             mode,

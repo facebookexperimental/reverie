@@ -424,6 +424,9 @@ where
             } else if let Some(error) = injected_syscall_guard(&self.runtime, number, args) {
                 event.result = -i64::from(error.into_raw());
                 return;
+            } else if let Some(result) = super::restorer::mapping_change_result(number, args) {
+                event.result = result;
+                return;
             } else if let Some(result) =
                 unsafe { super::protect::protect_forwarded_descriptor_change(number, args) }
             {
@@ -2273,11 +2276,9 @@ fn injected_syscall_guard(
     if super::sigalrm::admitted() && assigns_protection_key(number, args) {
         return Some(Errno::EPERM);
     }
-    // Signal phase 1: an accepted SIGALRM restorer's page stays mapped,
-    // unchanged, for the rest of the process's life.
-    if super::restorer::mapping_change_refused(number, args) {
-        return Some(Errno::EPERM);
-    }
+    // Mapping protection is result-bearing and checked separately at each
+    // physical forwarding site: raw brk refusals return the current break,
+    // not an errno that would corrupt libc's saved break.
     let unsupported_process =
         // AUTONOMOUS-BOT-IMPLEMENTED
         (matches!(number, libc::SYS_clone | libc::SYS_clone3 | libc::SYS_vfork)
@@ -2628,6 +2629,9 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
         if let Some(error) = injected_syscall_guard(self.runtime, number, raw_args) {
             return Err(error);
         }
+        if let Some(result) = super::restorer::mapping_change_result(number, raw_args) {
+            return Errno::from_ret(result as usize).map(|value| value as i64);
+        }
         if let Some(result) =
             unsafe { super::protect::protect_forwarded_descriptor_change(number, raw_args) }
         {
@@ -2768,6 +2772,8 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
             }
         } else if let Some(error) = injected_syscall_guard(self.runtime, number, args) {
             self.tail.set_result(-i64::from(error.into_raw()));
+        } else if let Some(result) = super::restorer::mapping_change_result(number, args) {
+            self.tail.set_result(result);
         } else if let Some(result) =
             unsafe { super::protect::protect_forwarded_descriptor_change(number, args) }
         {

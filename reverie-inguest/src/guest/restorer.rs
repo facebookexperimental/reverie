@@ -672,9 +672,10 @@ fn overlaps_in(table: &[AtomicU64], start: u64, length: u64) -> bool {
     })
 }
 
-/// Whether the guest call `number(args)` could unmap, replace, reprotect or
-/// advise a protected restorer page, and so must be refused (EPERM) before
-/// the kernel. The inventory follows design section 4 and closure 3:
+/// Whether an errno-returning guest mapping call could change a protected
+/// restorer page or any part of this image's published ToolRegion reservation.
+/// Refuse these operations with EPERM before the kernel. The restorer inventory
+/// follows design section 4 and closure 3:
 /// `munmap`, `mprotect`, `pkey_mprotect`, `madvise`, and `remap_file_pages`
 /// over one; `mremap` of an overlapping source, or with `MREMAP_FIXED` to an
 /// overlapping destination; `mmap` with `MAP_FIXED` or `MAP_FIXED_NOREPLACE`
@@ -690,15 +691,121 @@ fn overlaps_in(table: &[AtomicU64], start: u64, length: u64) -> bool {
 /// that cannot be read). Every `shmat` with `SHM_REMAP` is refused: a
 /// segment's page size, and so its effective extent, is not observable
 /// before the attach.
-/// `brk` cannot reach a protected page: [`glibc_restorer_accepted`] admits
-/// only a mapping above the break.
+/// ToolRegion protection also includes `mseal`, which could prevent later
+/// leases from changing the permissions of currently unused reservation pages.
+/// This predicate does not handle `brk`'s distinct return convention; physical
+/// forwarding callers must use [`mapping_change_result`]. A restorer alone
+/// needs no `brk` guard because [`glibc_restorer_accepted`] admits only mappings
+/// above the current break.
 pub fn mapping_change_refused(number: i64, args: [u64; 6]) -> bool {
     let facts = MappingFacts {
         hugetlbfs_page_size: &hugetlbfs_page_size,
         default_huge_page_size: &|| unsafe { default_huge_page_size() },
         page_size_at: &|address| unsafe { kernel_page_size_at(address) },
     };
-    mapping_change_refused_in(&PROTECTED_PAGES, number, args, &facts)
+    mapping_change_refused_in(
+        &PROTECTED_PAGES,
+        number,
+        args,
+        &facts,
+        super::tool_region::published_owner().is_some(),
+    )
+}
+
+/// A synthetic raw result for a refused physical mapping operation. Unlike an
+/// errno-only guard, this preserves Linux's raw `brk` ABI: a denied change
+/// returns the genuine unchanged break. `None` leaves physical forwarding to
+/// the caller. The caller must pass the final, possibly Tool-rewritten inputs.
+///
+/// This protects only the finite mapping-operation inventory below. It does
+/// not prevent CPU stores, kernel buffer writes or entry into trusted gates.
+pub fn mapping_change_result(number: i64, args: [u64; 6]) -> Option<i64> {
+    if number == libc::SYS_brk && args[0] != 0 && super::tool_region::published_owner().is_some() {
+        // SAFETY: brk(0) observes the current break and changes no mapping.
+        let current = unsafe { raw_syscall6(libc::SYS_brk, [0; 6]) };
+        return match break_change(current, args[0]) {
+            BreakChange::Forward => None,
+            BreakChange::Unchanged(value) => Some(value),
+            BreakChange::Unknown => {
+                // An errno or fabricated pointer here would poison libc's
+                // cached break. Refuse this configuration without returning
+                // a purported successful brk result to the guest or Tool.
+                const MESSAGE: &[u8] = b"reverie-inguest: cannot establish current break for ToolRegion mapping protection\n";
+                unsafe {
+                    let _ = raw_syscall6(
+                        libc::SYS_write,
+                        [
+                            libc::STDERR_FILENO as u64,
+                            MESSAGE.as_ptr() as u64,
+                            MESSAGE.len() as u64,
+                            0,
+                            0,
+                            0,
+                        ],
+                    );
+                    super::support::exit_now(125);
+                }
+            }
+        };
+    }
+    mapping_change_refused(number, args).then_some(-i64::from(libc::EPERM))
+}
+
+/// The mapping response for newly guarded native/nested routes. Their old
+/// restorer-only behavior stays unchanged until this image actually owns a
+/// ToolRegion. Once it does, both protected sets are checked.
+pub fn owner_mapping_change_result(number: i64, args: [u64; 6]) -> Option<i64> {
+    super::tool_region::published_owner()?;
+    mapping_change_result(number, args)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BreakChange {
+    Forward,
+    Unchanged(i64),
+    Unknown,
+}
+
+// Even five-level x86-64 paging has no user address at or above this bound.
+const USER_ADDRESS_LIMIT: u64 = 1 << 56;
+
+fn break_change(current: i64, requested: u64) -> BreakChange {
+    if current <= 0 || current as u64 >= USER_ADDRESS_LIMIT {
+        return BreakChange::Unknown;
+    }
+    if requested == 0 || requested == current as u64 {
+        return BreakChange::Forward;
+    }
+    let ceiling = |value: u64| {
+        value
+            .checked_add(PAGE_SIZE - 1)
+            .map(|v| v & !(PAGE_SIZE - 1))
+    };
+    let Some(old_page_end) = ceiling(current as u64) else {
+        return BreakChange::Unknown;
+    };
+    if requested >= USER_ADDRESS_LIMIT {
+        return BreakChange::Unchanged(current);
+    }
+    let Some(new_page_end) = ceiling(requested) else {
+        return BreakChange::Unchanged(current);
+    };
+    let first = old_page_end.min(new_page_end);
+    let end = old_page_end.max(new_page_end);
+    if owner_overlaps(first, end - first) {
+        BreakChange::Unchanged(current)
+    } else {
+        BreakChange::Forward
+    }
+}
+
+fn owner_overlaps(start: u64, length: u64) -> bool {
+    if length == 0 {
+        return false;
+    }
+    let first = start & !(PAGE_SIZE - 1);
+    let end = start.saturating_add(length);
+    first < super::tool_region::END as u64 && (super::tool_region::BASE as u64) < end
 }
 
 /// What [`mapping_change_refused`] asks the kernel, separated for tests.
@@ -806,14 +913,17 @@ fn mapping_change_refused_in(
     number: i64,
     args: [u64; 6],
     facts: &MappingFacts<'_>,
+    owner: bool,
 ) -> bool {
-    if !table.iter().any(|slot| slot.load(Ordering::Acquire) != 0) {
+    if !owner && !table.iter().any(|slot| slot.load(Ordering::Acquire) != 0) {
         return false;
     }
-    let overlaps = |start, length| overlaps_in(table, start, length);
+    let overlaps = |start, length| {
+        overlaps_in(table, start, length) || (owner && owner_overlaps(start, length))
+    };
     let overlaps_rounded = |start, length, unit| {
         let (start, length) = round_out(start, length, unit);
-        overlaps_in(table, start, length)
+        overlaps(start, length)
     };
     match number {
         libc::SYS_munmap
@@ -821,6 +931,9 @@ fn mapping_change_refused_in(
         | libc::SYS_pkey_mprotect
         | libc::SYS_madvise
         | libc::SYS_remap_file_pages => overlaps(args[0], args[1]),
+        // Do not silently broaden the old restorer-only predicate. Sealing
+        // an owned unused PROT_NONE page would prevent a later Tool lease.
+        libc::SYS_mseal => owner && overlaps(args[0], args[1]),
         // Its ranges are in a vector, and its target may be this process:
         // refused while any page is protected (signal phase 1 takes the
         // refusal, msg1635).
@@ -880,6 +993,152 @@ fn mapping_change_refused_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn break_mapping_refusal_preserves_the_raw_break_result() {
+        let base = super::super::tool_region::BASE as u64;
+        let end = super::super::tool_region::END as u64;
+        // Query, no change, and changes wholly within an already mapped page
+        // do not change the reservation. Exact adjacent extents stay outside.
+        for (current, request) in [
+            (base - PAGE_SIZE, 0),
+            (base - PAGE_SIZE, base - PAGE_SIZE),
+            (base - 2, base - 1),
+            (base - 1, base - 2),
+            (end + 1, end + 2),
+            (end + 2, end + 1),
+            (base - 1, base),
+            (base - 2 * PAGE_SIZE, base),
+            (end + PAGE_SIZE, end),
+            (end, end + PAGE_SIZE),
+        ] {
+            assert_eq!(break_change(current as i64, request), BreakChange::Forward);
+        }
+        // A refused shrink or growth returns the observed break, not -EPERM.
+        for (current, request) in [
+            (base - PAGE_SIZE, base + 1),
+            (base - PAGE_SIZE, end + PAGE_SIZE),
+            (end + PAGE_SIZE, end - PAGE_SIZE),
+            (end + PAGE_SIZE, base - PAGE_SIZE),
+            (base - PAGE_SIZE, USER_ADDRESS_LIMIT),
+            (base - PAGE_SIZE, u64::MAX),
+        ] {
+            assert_eq!(
+                break_change(current as i64, request),
+                BreakChange::Unchanged(current as i64),
+            );
+        }
+        for current in [
+            0,
+            -1,
+            -i64::from(libc::EPERM),
+            USER_ADDRESS_LIMIT as i64,
+            i64::MAX,
+        ] {
+            assert_eq!(break_change(current, base), BreakChange::Unknown);
+        }
+    }
+
+    #[test]
+    fn owner_mapping_ranges_preserve_boundaries_and_huge_page_extents() {
+        let base = super::super::tool_region::BASE as u64;
+        let end = super::super::tool_region::END as u64;
+        let pages = table();
+        let huge = 1_u64 << 21;
+        let facts = MappingFacts {
+            hugetlbfs_page_size: &|fd| (fd == 7).then_some(huge),
+            default_huge_page_size: &|| Some(huge),
+            page_size_at: &|address| {
+                if address == base - 2 * huge {
+                    None
+                } else {
+                    Some(PAGE_SIZE)
+                }
+            },
+        };
+        let call = |number, args| mapping_change_refused_in(&pages, number, args, &facts, true);
+        for number in [
+            libc::SYS_munmap,
+            libc::SYS_mprotect,
+            libc::SYS_pkey_mprotect,
+            libc::SYS_madvise,
+            libc::SYS_remap_file_pages,
+            libc::SYS_mseal,
+        ] {
+            assert!(call(number, [base - PAGE_SIZE, PAGE_SIZE + 1, 0, 0, 0, 0]));
+            assert!(call(number, [end - 1, 1, 0, 0, 0, 0]));
+            assert!(call(number, [base - PAGE_SIZE, u64::MAX, 0, 0, 0, 0]));
+            assert!(!call(number, [base - PAGE_SIZE, PAGE_SIZE, 0, 0, 0, 0]));
+            assert!(!call(number, [end, PAGE_SIZE, 0, 0, 0, 0]));
+            assert!(!call(number, [base, 0, 0, 0, 0, 0]));
+        }
+        let anonymous = (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS) as u64;
+        for fixed in [libc::MAP_FIXED, libc::MAP_FIXED_NOREPLACE] {
+            let flags = anonymous | fixed as u64;
+            for extra in [
+                0,
+                libc::MAP_HUGETLB as u64,
+                (libc::MAP_HUGETLB | libc::MAP_HUGE_2MB) as u64,
+                (libc::MAP_HUGETLB | libc::MAP_HUGE_1GB) as u64,
+            ] {
+                assert!(call(
+                    libc::SYS_mmap,
+                    [base, PAGE_SIZE, 0, flags | extra, u64::MAX, 0]
+                ));
+                // The owner endpoints are also 1-GiB boundaries.
+                assert!(!call(
+                    libc::SYS_mmap,
+                    [base - PAGE_SIZE, PAGE_SIZE, 0, flags | extra, u64::MAX, 0]
+                ));
+                assert!(!call(
+                    libc::SYS_mmap,
+                    [end, PAGE_SIZE, 0, flags | extra, u64::MAX, 0]
+                ));
+            }
+            // File-backed huge page size is read independently of MAP_HUGETLB.
+            assert!(call(
+                libc::SYS_mmap,
+                [base, PAGE_SIZE, 0, fixed as u64, 7, 0]
+            ));
+        }
+        assert!(!call(
+            libc::SYS_mmap,
+            [base, PAGE_SIZE, 0, anonymous, u64::MAX, 0]
+        ));
+        let maymove = libc::MREMAP_MAYMOVE as u64;
+        let fixed = maymove | libc::MREMAP_FIXED as u64;
+        assert!(call(libc::SYS_mremap, [base, 0, PAGE_SIZE, maymove, 0, 0]));
+        assert!(call(
+            libc::SYS_mremap,
+            [base - PAGE_SIZE, PAGE_SIZE, PAGE_SIZE, fixed, base, 0]
+        ));
+        assert!(!call(
+            libc::SYS_mremap,
+            [base - PAGE_SIZE, PAGE_SIZE, PAGE_SIZE, maymove, base, 0]
+        ));
+        assert!(!call(
+            libc::SYS_mremap,
+            [base - PAGE_SIZE, PAGE_SIZE, PAGE_SIZE, fixed, end, 0]
+        ));
+        assert!(call(
+            libc::SYS_mremap,
+            [base - 2 * huge, PAGE_SIZE, PAGE_SIZE, fixed, base, 0]
+        ));
+        assert!(call(
+            libc::SYS_shmat,
+            [0, base, libc::SHM_REMAP as u64, 0, 0, 0]
+        ));
+        assert!(!call(libc::SYS_shmat, [0, base, 0, 0, 0, 0]));
+        assert!(call(libc::SYS_process_madvise, [0; 6]));
+        // An owner adds a disjoint extent, never consumes a restorer slot.
+        assert!(pages.iter().all(|page| page.load(Ordering::Relaxed) == 0));
+        assert!(protect_in(&pages, 0x7000_1000));
+        assert!(call(
+            libc::SYS_mprotect,
+            [0x7000_1000, PAGE_SIZE, 0, 0, 0, 0]
+        ));
+        assert!(call(libc::SYS_mprotect, [base, PAGE_SIZE, 0, 0, 0, 0]));
+    }
 
     #[test]
     fn vm_flags_that_change_a_mapping_on_fork_are_recognized() {
@@ -1279,8 +1538,9 @@ mod tests {
             default_huge_page_size: &default_huge,
             page_size_at: &page_size,
         };
-        let call =
-            |number: i64, args: [u64; 6]| mapping_change_refused_in(&pages, number, args, &facts);
+        let call = |number: i64, args: [u64; 6]| {
+            mapping_change_refused_in(&pages, number, args, &facts, false)
+        };
         let far = 0x1_0000_0000_u64;
         // Nothing protected: nothing refused, not even SHM_REMAP.
         assert!(!call(libc::SYS_munmap, [page, 4096, 0, 0, 0, 0]));

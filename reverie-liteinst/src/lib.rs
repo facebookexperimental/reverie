@@ -518,3 +518,8 @@ mod tests {
         }
     }
 }
+
+/// Bounded spare-lease diagnostics for the separate mapping integrity fixture.
+#[cfg(feature = "allocator-fixture")]
+#[doc(hidden)]
+pub mod mapping_integrity_fixture;

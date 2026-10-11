@@ -2906,7 +2906,13 @@ unsafe fn process_syscall(event: &mut SyscallEvent) {
             trace_event(event, None);
         }
     }
-    event.result = unsafe { event.forward() };
+    event.result = match reverie_inguest::guest::restorer::owner_mapping_change_result(
+        event.number,
+        event.args,
+    ) {
+        Some(result) => result,
+        None => unsafe { event.forward() },
+    };
     observe_mapping_generation(event);
 
     // AUTONOMOUS-BOT-IMPLEMENTED

@@ -509,3 +509,16 @@ impl Drop for StackLease {
 #[cfg(test)]
 #[path = "tool_region_tests.rs"]
 mod tests;
+
+/// Observe an already published owner without reserving, waiting or accessing
+/// its mutable control pages. An initialization error is not ownership. Plain
+/// fork inherits both this immutable publication and the reservation.
+pub(crate) fn published_owner() -> Option<&'static ToolRegion> {
+    REGION.get()?.as_ref().ok()
+}
+
+// Separate feature-only actions; no layout or existing stack API changes.
+#[cfg(feature = "allocator-fixture")]
+#[doc(hidden)]
+#[path = "tool_region_mapping_fixture.rs"]
+pub mod mapping_fixture;
