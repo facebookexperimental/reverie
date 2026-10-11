@@ -16,6 +16,14 @@
 #[path = "tool_region_constructor_tests.rs"]
 mod constructor;
 
+// Native hardware oracle preparation only. The baseline deliberately fails
+// its new denial assertions on key-zero owners; no existing test is weakened.
+#[path = "tool_region_keyed_oracle.rs"]
+mod keyed_oracle;
+
+#[path = "tool_region_keyed_tests.rs"]
+mod keyed_owner;
+
 use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
@@ -68,7 +76,13 @@ fn isolated(name: &str, body: fn()) {
         .1;
     let exact = format!("{module}::{name}");
     let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", &exact, "--nocapture", "--test-threads=1"])
+        .args([
+            "--exact",
+            &exact,
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
         .env(CHILD_ENV, name)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

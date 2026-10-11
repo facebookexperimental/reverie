@@ -431,6 +431,20 @@ pub(crate) use arena::fixed_tool_heap;
 #[doc(hidden)]
 pub use arena::fixture_fixed_arena_metadata;
 
+#[path = "tool_region_keyed.rs"]
+mod keyed;
+pub use keyed::KeyedLeaseError;
+pub use keyed::KeyedLeaseStage;
+pub use keyed::KeyedPrepareError;
+pub use keyed::KeyedPrepareKind;
+pub use keyed::KeyedQuarantine;
+pub use keyed::KeyedRegionSpans;
+pub use keyed::KeyedSpan;
+pub use keyed::KeyedStack;
+pub use keyed::KeyedStackLease;
+pub use keyed::KeyedToolRegion;
+pub use keyed::OwnedKeyDescriptor;
+
 #[path = "tool_region_constructor.rs"]
 mod constructor;
 pub use constructor::ConstructorStack;

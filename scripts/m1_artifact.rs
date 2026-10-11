@@ -666,12 +666,13 @@ struct CompilerRootBinding {
 pub struct VerifiedCompiledSources {
     record: CompiledSources,
 }
-const COMPILED_RV_LOCATION_FILES: [&str; 6] = [
+const COMPILED_RV_LOCATION_FILES: [&str; 7] = [
     "reverie-liteinst/src/patch_alloc.rs",
     "reverie-inguest/src/guest/alloc.rs",
     "reverie-inguest/src/guest/tool_region_constructor.rs",
     "reverie-inguest/src/guest/tool_region_arena.rs",
     "reverie-inguest/src/guest/tool_region.rs",
+    "reverie-inguest/src/guest/tool_region_keyed.rs",
     "reverie-liteinst-preload/src/lib.rs",
 ];
 const CONTENT_WORKSPACE_FILES: [&str; 6] = [
@@ -684,7 +685,7 @@ const CONTENT_WORKSPACE_FILES: [&str; 6] = [
 ];
 // Reviewed literal expectations, not hashes generated from the current checkout
 // or bytes embedded after a runtime edit. The qualifier self-hash is separate.
-const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 13] = [
+const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 14] = [
     (
         "Cargo.toml",
         869,
@@ -747,8 +748,13 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 13] = [
     ),
     (
         "reverie-inguest/src/guest/tool_region.rs",
-        19765,
-        "3b67484c132bb522d86012aa1247192c5a7ad6afda66409fa2616500a3516210",
+        20158,
+        "523efccd5741480393f4d42a373efa58d13dee646d594aad192b389f5aee9f33",
+    ),
+    (
+        "reverie-inguest/src/guest/tool_region_keyed.rs",
+        24228,
+        "233d850247a468775681c13af13b2e9d0af1c10124cba2c5ea3af886cda8a920",
     ),
 ];
 fn content_catalog_matches(relative: &str, size: u64, digest: &str) -> Result<()> {
@@ -24712,7 +24718,7 @@ mod tests {
         let rv_two = cargo_two.join(suffix);
         // Current compiled bytes are inputs only. Each must independently match
         // the fixed reviewed length/digest catalog before any positive is earned.
-        let compiled_files: [(&str, &[u8]); 14] = [
+        let compiled_files: [(&str, &[u8]); 15] = [
             ("Cargo.toml", include_bytes!("../Cargo.toml")),
             (
                 "reverie-liteinst-artifact/Cargo.toml",
@@ -24762,6 +24768,10 @@ mod tests {
                 "reverie-inguest/src/guest/tool_region.rs",
                 include_bytes!("../reverie-inguest/src/guest/tool_region.rs"),
             ),
+            (
+                "reverie-inguest/src/guest/tool_region_keyed.rs",
+                include_bytes!("../reverie-inguest/src/guest/tool_region_keyed.rs"),
+            ),
             ("scripts/m1_artifact.rs", include_bytes!("m1_artifact.rs")),
         ];
         for rv in [&rv_one, &rv_two] {
@@ -24771,7 +24781,7 @@ mod tests {
             }
         }
         let (rv_inventory, _) = content_reverie_inventory(&rv_one).unwrap();
-        assert_eq!(rv_inventory.len(), 14);
+        assert_eq!(rv_inventory.len(), 15);
         assert!(
             rv_inventory
                 .windows(2)
