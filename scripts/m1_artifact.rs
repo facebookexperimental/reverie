@@ -5340,6 +5340,96 @@ const FIXED_RELEASE_HEAP_OPERANDS_4: &[FixedReleaseHeapOperand] = &[
         kind: FixedReleaseHeapOperandKind::DirectCall,
     },
 ];
+// Current publication-based diagnostic release: fixed_tool_dealloc, 290 bytes.
+// Actual whole-body SHA256 c539094b48d3228ceceece7b58944ea421d04e25841098c9234aa347879d8a5a.
+const FIXED_RELEASE_HEAP_5: &str = "530fb6050000000084c00f850d0100004889f3488d3d00000000e8000000004885c00f84f5000000807810ff0f84eb0000004889d848c1e819483d080030000f85d800000048b90000001000600000488b53f840b60148bf103002000060000031c0f0400fb03774120f1f8000000000f39031c0f0400fb03775f5488b81083002f04885c0400f94c64839d0400f93c74008f7754866662e0f1f8400000000004889c6488b4401084885c074054839d072ee48894411084889543108488b3c314c8d04374939d0752048033c11721a48893c3148894431084889f2eb0c4889441108488991083002f04885c07426488b3411488d3c164839d772194839c7751448033401720e48893411488b4401084889441108c681103002f0005bc3e800000000";
+const FIXED_RELEASE_HEAP_OPERANDS_5: &[FixedReleaseHeapOperand] = &[
+    FixedReleaseHeapOperand {
+        instruction: 1,
+        displacement: 4,
+        next: 8,
+        key: "fixed_initializing",
+        addend: 0,
+        kind: FixedReleaseHeapOperandKind::Object,
+    },
+    FixedReleaseHeapOperand {
+        instruction: 19,
+        displacement: 22,
+        next: 26,
+        key: "fixed_region",
+        addend: 0,
+        kind: FixedReleaseHeapOperandKind::Object,
+    },
+    FixedReleaseHeapOperand {
+        instruction: 26,
+        displacement: 27,
+        next: 31,
+        key: "fixed_region_publication_get",
+        addend: 0,
+        kind: FixedReleaseHeapOperandKind::DirectCall,
+    },
+    FixedReleaseHeapOperand {
+        instruction: 285,
+        displacement: 286,
+        next: 290,
+        key: "fixed_refuse_foreign",
+        addend: 0,
+        kind: FixedReleaseHeapOperandKind::DirectCall,
+    },
+];
+// Current publication-based diagnostic release: fixed_tool_realloc, 463 bytes.
+// Actual whole-body SHA256 49b08f0569b53707087e02bc5f88e4792973f10e1520b003351bc55b43ac56dc.
+const FIXED_RELEASE_HEAP_6: &str = "4157415641554154534883ec200fb6050000000084c00f85ae0100004d89c74989ce4989d44889f3488d3d00000000e8000000004885c00f848d010000807810ff0f848301000049bd0000001000600000498d85003002f048894424084c896c241048c7442418000000024889d848c1e819483d080030000f854c010000498d4424ff4985c40f94c048b900000000000000804c29e14939cf0f96c120c180f9010f85cc000000488d7c24084c89e64c89fae8000000004885c00f84b30000004d39f74d0f42f74889df4989c74889c64c89f2ff1500000000488b4bf8b20148be103002000060000031c0f00fb01674196666666666662e0f1f840000000000f39031c0f00fb01675f6498b95083002f04885d20f94c04839ca400f93c64008c67554666666662e0f1f8400000000004889d6498b5415084885d274054839ca72ee4989540d0849894c3508498b7c3500488d04374839c84c89f8752949037c0d00722249897c350049895435084889f1eb1331c0eb454989540d0849898d083002f04c89f84885d27429498b740d00488d3c0e4839cf721b4839d775164903741500720f4989740d00498b5415084989540d0841c685103002f0004883c4205b415c415d415e415fc3e800000000";
+const FIXED_RELEASE_HEAP_OPERANDS_6: &[FixedReleaseHeapOperand] = &[
+    FixedReleaseHeapOperand {
+        instruction: 13,
+        displacement: 16,
+        next: 20,
+        key: "fixed_initializing",
+        addend: 0,
+        kind: FixedReleaseHeapOperandKind::Object,
+    },
+    FixedReleaseHeapOperand {
+        instruction: 40,
+        displacement: 43,
+        next: 47,
+        key: "fixed_region",
+        addend: 0,
+        kind: FixedReleaseHeapOperandKind::Object,
+    },
+    FixedReleaseHeapOperand {
+        instruction: 47,
+        displacement: 48,
+        next: 52,
+        key: "fixed_region_publication_get",
+        addend: 0,
+        kind: FixedReleaseHeapOperandKind::DirectCall,
+    },
+    FixedReleaseHeapOperand {
+        instruction: 178,
+        displacement: 179,
+        next: 183,
+        key: "fixed_span_allocate",
+        addend: 0,
+        kind: FixedReleaseHeapOperandKind::DirectCall,
+    },
+    FixedReleaseHeapOperand {
+        instruction: 211,
+        displacement: 213,
+        next: 217,
+        key: "fixed_copy_bytes",
+        addend: 0,
+        kind: FixedReleaseHeapOperandKind::GotCall,
+    },
+    FixedReleaseHeapOperand {
+        instruction: 458,
+        displacement: 459,
+        next: 463,
+        key: "fixed_refuse_foreign",
+        addend: 0,
+        kind: FixedReleaseHeapOperandKind::DirectCall,
+    },
+];
 const FIXED_RELEASE_HEAP_TEMPLATES: &[FixedReleaseHeapTemplate] = &[
     FixedReleaseHeapTemplate {
         role: "fixed_span_allocate",
@@ -5366,12 +5456,22 @@ const FIXED_RELEASE_HEAP_TEMPLATES: &[FixedReleaseHeapTemplate] = &[
         hex: FIXED_RELEASE_HEAP_4,
         operands: FIXED_RELEASE_HEAP_OPERANDS_4,
     },
+    FixedReleaseHeapTemplate {
+        role: "fixed_tool_dealloc",
+        hex: FIXED_RELEASE_HEAP_5,
+        operands: FIXED_RELEASE_HEAP_OPERANDS_5,
+    },
+    FixedReleaseHeapTemplate {
+        role: "fixed_tool_realloc",
+        hex: FIXED_RELEASE_HEAP_6,
+        operands: FIXED_RELEASE_HEAP_OPERANDS_6,
+    },
 ];
 
 /// Qualify whole optimized shared-heap methods, including every inlined path.
 ///
 /// The caller binds the exact canonical roles and LOCAL mapped objects, checks
-/// REGION is its actual 32-byte OnceLock and INITIALIZING its one-byte guard,
+/// REGION is its actual 32-byte publication object and INITIALIZING its one-byte guard,
 /// and closes the returned copy/refusal/allocate callees independently. `got`
 /// contains only unique LOCAL RELATIVE relocations in complete mapped RELRO.
 /// There is no dynamic lookup, TLS access, unknown call or readonly table here.
@@ -5389,61 +5489,99 @@ fn fixed_release_heap_recipe(
     got: &BTreeMap<u64, u64>,
     _readonly: &BTreeMap<u64, Vec<u8>>,
 ) -> Result<Vec<ConstructorTransfer>> {
+    fixed_release_heap_from_templates(
+        role,
+        address,
+        bytes,
+        targets,
+        got,
+        FIXED_RELEASE_HEAP_TEMPLATES,
+    )
+}
+
+fn fixed_release_heap_from_templates(
+    role: &str,
+    address: u64,
+    bytes: &[u8],
+    targets: &BTreeMap<String, u64>,
+    got: &BTreeMap<u64, u64>,
+    templates: &[FixedReleaseHeapTemplate],
+) -> Result<Vec<ConstructorTransfer>> {
     require(
         address != 0
             && address.checked_add(bytes.len() as u64).is_some()
             && targets.get(role) == Some(&address),
         "Fixed release heap has absent/overflowing or wrong typed identity",
     )?;
-    let candidates: Vec<_> = FIXED_RELEASE_HEAP_TEMPLATES
+    let mut matches = Vec::new();
+    let mut errors = Vec::new();
+    // Equal role and extent do not identify a recipe: the current getter-based
+    // dealloc and the retained inlined-publication body are both 290 bytes.
+    // Authenticate every operand and literal before counting a complete match.
+    for template in templates
         .iter()
-        .filter(|template| template.role == role && template.hex.len() == bytes.len() * 2)
-        .collect();
-    require(
-        candidates.len() == 1,
-        "unrecognized Fixed release heap role/extent",
-    )?;
-    let template = candidates[0];
-    let mut fields = Vec::new();
-    let mut transfers = Vec::new();
-    for operand in template.operands {
-        let base = *targets
-            .get(operand.key)
-            .ok_or_else(|| format!("Fixed release heap missing role {}", operand.key))?;
-        require(base != 0, "Fixed release heap null operand identity")?;
-        let target = base
-            .checked_add(operand.addend)
-            .ok_or("Fixed release heap object field overflows")?;
-        let actual = fixed_rip_target(address, bytes, operand.displacement, operand.next)?;
-        let slot = match operand.kind {
-            FixedReleaseHeapOperandKind::GotCall => {
-                require(
-                    got.get(&actual) == Some(&target),
-                    "Fixed release heap requires its exact local RELATIVE/RELRO callee",
-                )?;
-                Some(actual)
+        .filter(|t| t.role == role && t.hex.len() == bytes.len() * 2)
+    {
+        let result: Result<Vec<ConstructorTransfer>> = (|| {
+            let mut fields = Vec::new();
+            let mut transfers = Vec::new();
+            for operand in template.operands {
+                let base = *targets
+                    .get(operand.key)
+                    .ok_or_else(|| format!("Fixed release heap missing role {}", operand.key))?;
+                require(base != 0, "Fixed release heap null operand identity")?;
+                let target = base
+                    .checked_add(operand.addend)
+                    .ok_or("Fixed release heap object field overflows")?;
+                let actual = fixed_rip_target(address, bytes, operand.displacement, operand.next)?;
+                let slot = match operand.kind {
+                    FixedReleaseHeapOperandKind::GotCall => {
+                        require(
+                            got.get(&actual) == Some(&target),
+                            "Fixed release heap requires its exact local RELATIVE/RELRO callee",
+                        )?;
+                        Some(actual)
+                    }
+                    FixedReleaseHeapOperandKind::Object
+                    | FixedReleaseHeapOperandKind::DirectCall => {
+                        require(actual == target, "Fixed release heap wrong operand target")?;
+                        None
+                    }
+                };
+                fields.push((operand.displacement, operand.next, actual));
+                if !matches!(operand.kind, FixedReleaseHeapOperandKind::Object) {
+                    transfers.push(ConstructorTransfer {
+                        instruction: address
+                            .checked_add(operand.instruction as u64)
+                            .ok_or("Fixed release heap transfer address overflows")?,
+                        target,
+                        local_got_slot: slot,
+                    });
+                }
             }
-            FixedReleaseHeapOperandKind::Object | FixedReleaseHeapOperandKind::DirectCall => {
-                require(actual == target, "Fixed release heap wrong operand target")?;
-                None
-            }
-        };
-        fields.push((operand.displacement, operand.next, actual));
-        if !matches!(operand.kind, FixedReleaseHeapOperandKind::Object) {
-            transfers.push(ConstructorTransfer {
-                instruction: address
-                    .checked_add(operand.instruction as u64)
-                    .ok_or("Fixed release heap transfer address overflows")?,
-                target,
-                local_got_slot: slot,
-            });
+            fixed_whole_recipe(address, bytes, template.hex, &fields)?;
+            // All readiness/refusal branches, absolute span/metadata literals, lock
+            // operations, checked arithmetic, free-list ordering, split/coalesce stores
+            // and complete stack restoration are held exact by the whole byte recipe.
+            Ok(transfers)
+        })();
+        match result {
+            Ok(transfers) => matches.push(transfers),
+            Err(error) => errors.push(error),
         }
     }
-    fixed_whole_recipe(address, bytes, template.hex, &fields)?;
-    // All readiness/refusal branches, absolute span/metadata literals, lock
-    // operations, checked arithmetic, free-list ordering, split/coalesce stores
-    // and complete stack restoration are held exact by the whole byte recipe.
-    Ok(transfers)
+    require(
+        !matches.is_empty(),
+        format!(
+            "unrecognized complete Fixed release heap recipe: {}",
+            errors.join("; ")
+        ),
+    )?;
+    require(
+        matches.len() == 1,
+        "ambiguous complete Fixed release heap recipe",
+    )?;
+    Ok(matches.remove(0))
 }
 
 // DEV-only pure source handoff. Caller provides fixed_whole_recipe, fixed_rip_target,
@@ -26405,6 +26543,289 @@ mod tests {
         }
     }
 
+    // Actual release allocator-fixture bodies from one immutable emitted image.
+    // The equal-size older dealloc remains covered by the original heap controls.
+    fn fixed_release_publication_heap_controls() {
+        let readonly = BTreeMap::new();
+        let targets: BTreeMap<String, u64> = [
+            ("fixed_initializing".into(), 0x4153000),
+            ("fixed_region".into(), 0x4153008),
+            ("fixed_region_publication_get".into(), 0xb9bb0),
+            ("fixed_tool_dealloc".into(), 0xb8e90),
+            ("fixed_tool_realloc".into(), 0xb8fc0),
+            ("fixed_span_allocate".into(), 0xb8540),
+            ("fixed_copy_bytes".into(), 0xb8870),
+            ("fixed_refuse_foreign".into(), 0xb8a20),
+        ]
+        .into_iter()
+        .collect();
+        let got = BTreeMap::from([(0x14ab40, targets["fixed_copy_bytes"])]);
+        let samples = [
+            (
+                "fixed_tool_dealloc",
+                0xb8e90u64,
+                fixed_hex(
+                    "530fb60568a1090484c00f850d0100004889f3488d3d5ea10904e8010d00004885c00f84f5000000807810ff0f84eb0000004889d848c1e819483d080030000f85d800000048b90000001000600000488b53f840b60148bf103002000060000031c0f0400fb03774120f1f8000000000f39031c0f0400fb03775f5488b81083002f04885c0400f94c64839d0400f93c74008f7754866662e0f1f8400000000004889c6488b4401084885c074054839d072ee48894411084889543108488b3c314c8d04374939d0752048033c11721a48893c3148894431084889f2eb0c4889441108488991083002f04885c07426488b3411488d3c164839d772194839c7751448033401720e48893411488b4401084889441108c681103002f0005bc3e86efaffff",
+                ),
+                &[
+                    0, 1, 8, 10, 16, 19, 26, 31, 34, 40, 44, 50, 53, 57, 63, 69, 79, 83, 86, 96,
+                    98, 103, 105, 112, 114, 116, 121, 123, 130, 133, 137, 140, 144, 147, 149, 160,
+                    163, 168, 171, 173, 176, 178, 183, 188, 192, 196, 199, 201, 205, 207, 211, 216,
+                    219, 221, 226, 233, 236, 238, 242, 246, 249, 251, 254, 256, 260, 262, 266, 271,
+                    276, 283, 284, 285,
+                ][..],
+                &[
+                    "fixed_tool_dealloc",
+                    "fixed_initializing",
+                    "fixed_region",
+                    "fixed_region_publication_get",
+                    "fixed_refuse_foreign",
+                ][..],
+                vec![
+                    ConstructorTransfer {
+                        instruction: 0xb8e90 + 26,
+                        target: targets["fixed_region_publication_get"],
+                        local_got_slot: None,
+                    },
+                    ConstructorTransfer {
+                        instruction: 0xb8e90 + 285,
+                        target: targets["fixed_refuse_foreign"],
+                        local_got_slot: None,
+                    },
+                ],
+            ),
+            (
+                "fixed_tool_realloc",
+                0xb8fc0u64,
+                fixed_hex(
+                    "4157415641554154534883ec200fb6052ca0090484c00f85ae0100004d89c74989ce4989d44889f3488d3d19a00904e8bc0b00004885c00f848d010000807810ff0f848301000049bd0000001000600000498d85003002f048894424084c896c241048c7442418000000024889d848c1e819483d080030000f854c010000498d4424ff4985c40f94c048b900000000000000804c29e14939cf0f96c120c180f9010f85cc000000488d7c24084c89e64c89fae8c9f4ffff4885c00f84b30000004d39f74d0f42f74889df4989c74889c64c89f2ff15a71a0900488b4bf8b20148be103002000060000031c0f00fb01674196666666666662e0f1f840000000000f39031c0f00fb01675f6498b95083002f04885d20f94c04839ca400f93c64008c67554666666662e0f1f8400000000004889d6498b5415084885d274054839ca72ee4989540d0849894c3508498b7c3500488d04374839c84c89f8752949037c0d00722249897c350049895435084889f1eb1331c0eb454989540d0849898d083002f04c89f84885d27429498b740d00488d3c0e4839cf721b4839d775164903741500720f4989740d00498b5415084989540d0841c685103002f0004883c4205b415c415d415e415fc3e891f8ffff",
+                ),
+                &[
+                    0, 2, 4, 6, 8, 9, 13, 20, 22, 28, 31, 34, 37, 40, 47, 52, 55, 61, 65, 71, 81,
+                    88, 93, 98, 107, 110, 114, 120, 126, 131, 134, 137, 147, 150, 153, 156, 158,
+                    161, 167, 172, 175, 178, 183, 186, 192, 195, 199, 202, 205, 208, 211, 217, 221,
+                    223, 233, 235, 239, 241, 256, 258, 260, 264, 266, 273, 276, 279, 282, 286, 289,
+                    291, 304, 307, 312, 315, 317, 320, 322, 327, 332, 337, 341, 344, 347, 349, 354,
+                    356, 361, 366, 369, 371, 373, 375, 380, 387, 390, 393, 395, 400, 404, 407, 409,
+                    412, 414, 419, 421, 426, 431, 436, 444, 448, 449, 451, 453, 455, 457, 458,
+                ][..],
+                &[
+                    "fixed_tool_realloc",
+                    "fixed_initializing",
+                    "fixed_region",
+                    "fixed_region_publication_get",
+                    "fixed_span_allocate",
+                    "fixed_copy_bytes",
+                    "fixed_refuse_foreign",
+                ][..],
+                vec![
+                    ConstructorTransfer {
+                        instruction: 0xb8fc0 + 47,
+                        target: targets["fixed_region_publication_get"],
+                        local_got_slot: None,
+                    },
+                    ConstructorTransfer {
+                        instruction: 0xb8fc0 + 178,
+                        target: targets["fixed_span_allocate"],
+                        local_got_slot: None,
+                    },
+                    ConstructorTransfer {
+                        instruction: 0xb8fc0 + 211,
+                        target: targets["fixed_copy_bytes"],
+                        local_got_slot: Some(0x14ab40),
+                    },
+                    ConstructorTransfer {
+                        instruction: 0xb8fc0 + 458,
+                        target: targets["fixed_refuse_foreign"],
+                        local_got_slot: None,
+                    },
+                ],
+            ),
+        ];
+        // Evaluate both before asserting, preserving both failing-first refusals.
+        let results: Vec<_> = samples
+            .iter()
+            .map(|(role, address, bytes, _, _, _)| {
+                fixed_release_heap_recipe(role, *address, bytes, &targets, &got, &readonly)
+            })
+            .collect();
+        assert!(
+            results.iter().all(Result::is_ok),
+            "actual publication heap recipes: {results:?}"
+        );
+        for ((role, address, bytes, offsets, keys, expected), result) in samples.iter().zip(results)
+        {
+            let edges = result.unwrap();
+            assert_eq!(&edges, expected);
+            let instructions = fixed_normal_return_control_instructions(*address, bytes, offsets);
+            fixed_census_transfers(&instructions, *address, bytes, &edges, &got, false).unwrap();
+            for omitted in 0..edges.len() {
+                let mut missing = edges.clone();
+                missing.remove(omitted);
+                assert!(
+                    fixed_census_transfers(&instructions, *address, bytes, &missing, &got, false)
+                        .is_err()
+                );
+                let mut retargeted = edges.clone();
+                retargeted[omitted].target += 1;
+                assert!(
+                    fixed_census_transfers(
+                        &instructions,
+                        *address,
+                        bytes,
+                        &retargeted,
+                        &got,
+                        false
+                    )
+                    .is_err()
+                );
+            }
+            // Includes readiness/error arms, returned-payload offset, fixed span,
+            // locking/coalescing and stack restoration, as well as every operand.
+            for index in 0..bytes.len() {
+                for bit in 0..8 {
+                    let mut bad = bytes.clone();
+                    bad[index] ^= 1 << bit;
+                    assert!(
+                        fixed_release_heap_recipe(role, *address, &bad, &targets, &got, &readonly)
+                            .is_err(),
+                        "accepted {role} byte {index} bit {bit}"
+                    );
+                }
+            }
+            for end in 0..bytes.len() {
+                assert!(
+                    fixed_release_heap_recipe(
+                        role,
+                        *address,
+                        &bytes[..end],
+                        &targets,
+                        &got,
+                        &readonly
+                    )
+                    .is_err()
+                );
+            }
+            let mut appended = bytes.clone();
+            appended.push(0x90);
+            assert!(
+                fixed_release_heap_recipe(role, *address, &appended, &targets, &got, &readonly)
+                    .is_err()
+            );
+            let mut prefixed = vec![0x90];
+            prefixed.extend_from_slice(bytes);
+            assert!(
+                fixed_release_heap_recipe(role, *address, &prefixed, &targets, &got, &readonly)
+                    .is_err()
+            );
+            for key in *keys {
+                for replacement in [None, Some(0), Some(targets[*key] + 1), Some(u64::MAX)] {
+                    let mut bad = targets.clone();
+                    match replacement {
+                        None => {
+                            bad.remove(*key);
+                        }
+                        Some(value) => {
+                            bad.insert((*key).into(), value);
+                        }
+                    }
+                    assert!(
+                        fixed_release_heap_recipe(role, *address, bytes, &bad, &got, &readonly)
+                            .is_err(),
+                        "accepted wrong {key}"
+                    );
+                }
+            }
+            assert!(
+                fixed_release_heap_recipe("unknown", *address, bytes, &targets, &got, &readonly)
+                    .is_err()
+            );
+            for bad_address in [0, u64::MAX] {
+                assert!(
+                    fixed_release_heap_recipe(role, bad_address, bytes, &targets, &got, &readonly)
+                        .is_err()
+                );
+            }
+            if *role == "fixed_tool_realloc" {
+                for bad_got in [
+                    BTreeMap::new(),
+                    BTreeMap::from([(0x14ab40, targets["fixed_copy_bytes"] + 1)]),
+                ] {
+                    assert!(
+                        fixed_release_heap_recipe(
+                            role, *address, bytes, &targets, &bad_got, &readonly
+                        )
+                        .is_err()
+                    );
+                }
+            }
+            let slide = 0x4000;
+            let moved_targets = targets
+                .iter()
+                .map(|(key, value)| (key.clone(), value + slide))
+                .collect();
+            let moved_got = got
+                .iter()
+                .map(|(slot, value)| (slot + slide, value + slide))
+                .collect();
+            let moved_edges: Vec<_> = expected
+                .iter()
+                .map(|edge| ConstructorTransfer {
+                    instruction: edge.instruction + slide,
+                    target: edge.target + slide,
+                    local_got_slot: edge.local_got_slot.map(|slot| slot + slide),
+                })
+                .collect();
+            assert_eq!(
+                fixed_release_heap_recipe(
+                    role,
+                    address + slide,
+                    bytes,
+                    &moved_targets,
+                    &moved_got,
+                    &readonly
+                )
+                .unwrap(),
+                moved_edges
+            );
+            // Each candidate must first pass independently. Duplicating that
+            // complete typed recipe must refuse, even with identical edges.
+            let accepted: Vec<_> = FIXED_RELEASE_HEAP_TEMPLATES
+                .iter()
+                .filter(|t| {
+                    fixed_release_heap_from_templates(
+                        role,
+                        *address,
+                        bytes,
+                        &targets,
+                        &got,
+                        std::slice::from_ref(*t),
+                    )
+                    .is_ok()
+                })
+                .collect();
+            assert_eq!(accepted.len(), 1);
+            let duplicate = (0..2)
+                .map(|_| FixedReleaseHeapTemplate {
+                    role: accepted[0].role,
+                    hex: accepted[0].hex,
+                    operands: accepted[0].operands,
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                fixed_release_heap_from_templates(
+                    role, *address, bytes, &targets, &got, &duplicate
+                )
+                .unwrap_err()
+                .contains("ambiguous complete")
+            );
+            assert!(
+                fixed_release_heap_from_templates(role, *address, bytes, &targets, &got, &[])
+                    .is_err()
+            );
+        }
+    }
+
     fn fixed_release_heap_full_recipes_and_negative_controls() {
         let readonly = BTreeMap::new();
         {
@@ -29917,6 +30338,7 @@ mod tests {
         generic_entry_and_native_mutation_controls();
         generic_loader_and_public_mutation_controls();
         detcore_loader_and_public_mutation_controls();
+        fixed_release_publication_heap_controls();
     }
 
     // Physical ELF-data controls; this synthetic input never substitutes for
