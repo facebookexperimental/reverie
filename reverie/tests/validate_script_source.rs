@@ -53,16 +53,29 @@ required-features = ["allocator-fixture"]"#;
     let producer = VALIDATE_SCRIPT
         .find("run_check \"LiteInst allocator fixtures\" build_liteinst_allocator_fixtures")
         .unwrap();
-    let tests = VALIDATE_SCRIPT
-        .find("run_test_check \"Test regular workspace cases\" env")
+    // The counted runner accepts only a command that starts with `cargo
+    // test`, so the fixture paths reach this step through the environment:
+    // exported immediately before it and un-exported immediately after.
+    let export = VALIDATE_SCRIPT
+        .find("export REVERIE_LITEINST_PRELOAD ")
         .unwrap();
-    assert!(build < producer && producer < tests);
-    let test_command = &VALIDATE_SCRIPT[tests
-        ..VALIDATE_SCRIPT[tests..]
-            .find("run_test_check \"Documentation tests\"")
-            .unwrap()
-            + tests];
-    assert!(test_command.contains("cargo test --workspace --all-features"));
+    let tests = VALIDATE_SCRIPT
+        .find(
+            "run_test_check \"Test regular workspace cases\" cargo test --workspace --all-features",
+        )
+        .unwrap();
+    let unexport = VALIDATE_SCRIPT
+        .find("export -n REVERIE_LITEINST_PRELOAD ")
+        .unwrap();
+    let docs = VALIDATE_SCRIPT
+        .find("run_test_check \"Documentation tests\"")
+        .unwrap();
+    assert!(build < producer && producer < export && export < tests);
+    assert!(tests < unexport && unexport < docs);
+    let exported = &VALIDATE_SCRIPT[export..tests];
+    let test_command = &VALIDATE_SCRIPT[tests..unexport];
+    let unexported = &VALIDATE_SCRIPT[unexport..docs];
+    assert!(!test_command.contains(" env "));
     assert!(test_command.contains("\"${REGULAR_TEST_SKIP_ARGS[@]}\""));
     for input in [
         "REVERIE_LITEINST_PRELOAD",
@@ -70,7 +83,14 @@ required-features = ["allocator-fixture"]"#;
         "REVERIE_LITEINST_ALLOCATOR_GUEST",
         "REVERIE_LITEINST_ALLOCATOR_GUEST_MANIFEST",
     ] {
-        assert!(test_command.contains(&format!("{input}=\"${input}\"")));
+        assert!(
+            exported.contains(input),
+            "{input} is not exported for the step"
+        );
+        assert!(
+            unexported.contains(input),
+            "{input} stays exported after the step"
+        );
     }
     assert!(
         VALIDATE_SCRIPT
