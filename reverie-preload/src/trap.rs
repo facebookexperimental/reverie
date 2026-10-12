@@ -673,6 +673,11 @@ mod tests {
                 "--nocapture",
             ])
             .env(CHILD, "1")
+            // TSYNC extends the filter to every thread, and jemalloc's
+            // background thread blocks SIGSYS: its first trapped syscall would
+            // be force-delivered to a blocked signal and kill the process
+            // before the panic reaches the harness.
+            .env("MALLOC_CONF", "background_thread:false")
             .output()
             .unwrap();
         // The test harness reports the child's test as failed and exits 101.
