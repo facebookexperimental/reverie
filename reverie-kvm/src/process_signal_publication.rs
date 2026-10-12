@@ -1223,6 +1223,8 @@ fn child_exit_signal_event(
         }
         reverie::ExitStatus::Signaled(signal, true) => (libc::CLD_DUMPED, signal as libc::c_int),
         reverie::ExitStatus::Signaled(signal, false) => (libc::CLD_KILLED, signal as libc::c_int),
+        reverie::ExitStatus::SignaledRaw(signal, true) => (libc::CLD_DUMPED, signal),
+        reverie::ExitStatus::SignaledRaw(signal, false) => (libc::CLD_KILLED, signal),
     };
     let mut info = [0; reverie::SIGNAL_INFO_SIZE];
     info[..4].copy_from_slice(&libc::SIGCHLD.to_ne_bytes());

@@ -25,6 +25,10 @@ pub enum ExitStatus {
     Exited(i32),
     /// Program killed by signal, with or without a coredump.
     Signaled(Signal, bool),
+    /// Program killed by a signal that nix's [`Signal`] cannot name, a
+    /// realtime signal (32 to 64), with or without a coredump. The number is
+    /// the raw signal number (<https://github.com/rrnewton/reverie/issues/997>).
+    SignaledRaw(i32, bool),
 }
 
 impl ExitStatus {
@@ -36,10 +40,17 @@ impl ExitStatus {
         if libc::WIFEXITED(code) {
             ExitStatus::Exited(libc::WEXITSTATUS(code))
         } else {
-            ExitStatus::Signaled(
-                Signal::try_from(libc::WTERMSIG(code)).unwrap(),
-                libc::WCOREDUMP(code),
-            )
+            Self::signaled(libc::WTERMSIG(code), libc::WCOREDUMP(code))
+        }
+    }
+
+    /// The status of a process killed by the raw signal `signal`:
+    /// [`ExitStatus::Signaled`] when nix names it, else
+    /// [`ExitStatus::SignaledRaw`].
+    pub fn signaled(signal: i32, coredump: bool) -> Self {
+        match Signal::try_from(signal) {
+            Ok(signal) => ExitStatus::Signaled(signal, coredump),
+            Err(_) => ExitStatus::SignaledRaw(signal, coredump),
         }
     }
 
@@ -54,6 +65,13 @@ impl ExitStatus {
                     sig as i32 & 0x7f
                 }
             }
+            ExitStatus::SignaledRaw(sig, coredump) => {
+                if coredump {
+                    (sig | 0x80) & 0xff
+                } else {
+                    sig & 0x7f
+                }
+            }
         }
     }
 
@@ -62,6 +80,7 @@ impl ExitStatus {
         match self {
             ExitStatus::Exited(_) => None,
             ExitStatus::Signaled(sig, _) => Some(*sig as i32 & 0x7f),
+            ExitStatus::SignaledRaw(sig, _) => Some(*sig & 0x7f),
         }
     }
 
@@ -108,6 +127,25 @@ impl ExitStatus {
                 // Incase the signal is not fatal:
                 std::process::exit(signal as i32 + 128);
             }
+            ExitStatus::SignaledRaw(signal, core_dump) => {
+                if core_dump {
+                    let limit = libc::rlimit {
+                        rlim_cur: 0,
+                        rlim_max: 0,
+                    };
+                    unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) };
+                }
+                // As above, with the raw number nix cannot name.
+                unsafe {
+                    libc::signal(signal, libc::SIG_DFL);
+                    libc::raise(signal);
+                    let mut mask: libc::sigset_t = std::mem::zeroed();
+                    libc::sigemptyset(&mut mask);
+                    libc::sigaddset(&mut mask, signal);
+                    libc::sigprocmask(libc::SIG_UNBLOCK, &mask, std::ptr::null_mut());
+                }
+                std::process::exit(signal + 128);
+            }
             ExitStatus::Exited(code) => std::process::exit(code),
         }
     }
@@ -122,7 +160,7 @@ impl From<ExitStatus> for std::process::ExitStatus {
 impl From<std::process::ExitStatus> for ExitStatus {
     fn from(status: std::process::ExitStatus) -> Self {
         if let Some(sig) = status.signal() {
-            ExitStatus::Signaled(Signal::try_from(sig).unwrap(), true)
+            ExitStatus::signaled(sig, true)
         } else {
             ExitStatus::Exited(status.code().unwrap_or(255))
         }
@@ -266,6 +304,68 @@ mod tests_non_sanitized {
                 unreachable!();
             }),
             Ok(ExitStatus::Signaled(Signal::SIGILL, true))
+        );
+    }
+
+    // Like `run_forked`, decoding the raw wait status with
+    // `ExitStatus::from_raw`, which keeps a realtime signal nix's
+    // `WaitStatus` cannot hold.
+    fn run_forked_raw<F>(f: F) -> ExitStatus
+    where
+        F: FnOnce(),
+    {
+        match unsafe { fork() }.unwrap() {
+            ForkResult::Parent { child, .. } => {
+                let mut status = 0;
+                assert_eq!(
+                    unsafe { libc::waitpid(child.as_raw(), &mut status, 0) },
+                    child.as_raw()
+                );
+                ExitStatus::from_raw(status)
+            }
+            ForkResult::Child => {
+                let limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) };
+                f();
+                unsafe { ::libc::_exit(0) };
+            }
+        }
+    }
+
+    /// A process killed by a realtime signal, which nix's `Signal` cannot
+    /// name, is `SignaledRaw` with its number, and `raise_or_exit`
+    /// propagates it (<https://github.com/rrnewton/reverie/issues/997>).
+    #[test]
+    fn raw_signal_statuses_round_trip() {
+        for (signal, coredump) in [(34, false), (64, false), (40, true)] {
+            let status = ExitStatus::SignaledRaw(signal, coredump);
+            assert_eq!(ExitStatus::from_raw(status.into_raw()), status);
+            assert_eq!(ExitStatus::signaled(signal, coredump), status);
+        }
+        assert_eq!(
+            ExitStatus::signaled(libc::SIGKILL, false),
+            ExitStatus::Signaled(Signal::SIGKILL, false)
+        );
+    }
+
+    #[test]
+    fn exit_by_a_realtime_signal() {
+        if crate::test_runs_in_own_process() {
+            return;
+        }
+        let signal = libc::SIGRTMIN() + 1;
+        let killed = run_forked_raw(|| {
+            unsafe { libc::raise(signal) };
+        });
+        assert_eq!(killed, ExitStatus::SignaledRaw(signal, false));
+        assert_eq!(killed.signal(), Some(signal));
+        assert_eq!(killed.code(), None);
+        assert_eq!(
+            run_forked_raw(|| ExitStatus::SignaledRaw(signal, false).raise_or_exit()),
+            ExitStatus::SignaledRaw(signal, false)
         );
     }
 

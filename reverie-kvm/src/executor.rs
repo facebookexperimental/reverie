@@ -21538,6 +21538,8 @@ fn waitid_result(
         ExitStatus::Exited(code) => (libc::CLD_EXITED, code),
         ExitStatus::Signaled(signal, true) => (libc::CLD_DUMPED, signal as libc::c_int),
         ExitStatus::Signaled(signal, false) => (libc::CLD_KILLED, signal as libc::c_int),
+        ExitStatus::SignaledRaw(signal, true) => (libc::CLD_DUMPED, signal),
+        ExitStatus::SignaledRaw(signal, false) => (libc::CLD_KILLED, signal),
     };
     let info = GuestWaitidSiginfo {
         si_signo: libc::SIGCHLD,

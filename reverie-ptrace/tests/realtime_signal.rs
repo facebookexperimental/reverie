@@ -726,3 +726,51 @@ fn one_realtime_instance_survives_an_ordinary_retry() {
 fn an_ordinary_retry_without_a_realtime_signal_completes() {
     realtime_instances_survive_an_ordinary_retry(0);
 }
+
+/// A guest that a realtime signal kills ends with
+/// `ExitStatus::SignaledRaw`, and its exit status is the signal; the tracer
+/// panicked decoding it (<https://github.com/rrnewton/reverie/issues/997>).
+#[test]
+fn a_guest_killed_by_a_realtime_signal_exits_with_it() {
+    let signal = libc::SIGRTMIN() + 1;
+    let (output, log) = test_fn::<RawSignalTool, _>(move || {
+        // SAFETY: raise has no preconditions; the default action ends the
+        // process.
+        unsafe { libc::raise(signal) };
+    })
+    .expect("run realtime-termination guest");
+
+    assert_eq!(output.status, ExitStatus::SignaledRaw(signal, false));
+    assert_eq!(output.status.signal(), Some(signal));
+    assert_eq!(*log.raw.lock().unwrap(), vec![signal]);
+}
+
+/// A guest's child that a realtime signal kills is reaped by the guest
+/// with that signal, and the guest runs on to its own exit.
+#[test]
+fn a_child_killed_by_a_realtime_signal_is_reaped_with_it() {
+    let signal = libc::SIGRTMIN() + 1;
+    let (output, log) = test_fn::<RawSignalTool, _>(move || {
+        // SAFETY: the child only raises and exits; the parent waits for it.
+        unsafe {
+            let child = libc::fork();
+            if child == 0 {
+                libc::raise(signal);
+                libc::_exit(3);
+            }
+            let mut status = 0;
+            assert_eq!(libc::waitpid(child, &mut status, 0), child);
+            assert!(libc::WIFSIGNALED(status), "status {status:#x}");
+            assert_eq!(libc::WTERMSIG(status), signal);
+        }
+    })
+    .expect("run realtime-killed-child guest");
+
+    assert_eq!(
+        output.status,
+        ExitStatus::Exited(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(*log.raw.lock().unwrap(), vec![signal]);
+}

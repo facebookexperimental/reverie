@@ -3021,16 +3021,22 @@ fn guest_task_panic_is_fatal(tid: Pid, payload: Box<dyn std::any::Any + Send>) -
 }
 
 fn log_guest_exit(tid: Pid, pid: Pid, exit_status: ExitStatus) {
-    if let ExitStatus::Signaled(signal, core_dumped) = exit_status {
-        tracing::error!(
-            target: "reverie_ptrace::lifecycle",
-            %tid,
-            %pid,
-            %signal,
-            core_dumped,
-            "guest terminated by signal"
-        );
-    }
+    let (signal, core_dumped) = match exit_status {
+        ExitStatus::Signaled(signal, core_dumped) => (AnySignal::from(signal), core_dumped),
+        ExitStatus::SignaledRaw(raw, core_dumped) => match AnySignal::new(raw) {
+            Some(signal) => (signal, core_dumped),
+            None => return,
+        },
+        ExitStatus::Exited(_) => return,
+    };
+    tracing::error!(
+        target: "reverie_ptrace::lifecycle",
+        %tid,
+        %pid,
+        %signal,
+        core_dumped,
+        "guest terminated by signal"
+    );
 }
 
 /// Handles a potentially internal error, converting it to an exit status.

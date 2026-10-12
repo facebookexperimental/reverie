@@ -759,8 +759,12 @@ impl Wait {
         Ok(if libc::WIFEXITED(status) {
             Wait::Exited(pid, ExitStatus::Exited(libc::WEXITSTATUS(status)))
         } else if libc::WIFSIGNALED(status) {
-            let sig = Signal::try_from(libc::WTERMSIG(status)).map_err(|_| Errno::EINVAL)?;
-            Wait::Exited(pid, ExitStatus::Signaled(sig, libc::WCOREDUMP(status)))
+            // A realtime signal is `ExitStatus::SignaledRaw`
+            // (<https://github.com/rrnewton/reverie/issues/997>).
+            Wait::Exited(
+                pid,
+                ExitStatus::signaled(libc::WTERMSIG(status), libc::WCOREDUMP(status)),
+            )
         } else if libc::WIFSTOPPED(status) {
             let task = Stopped::from_token(pid, token);
 
@@ -3495,6 +3499,31 @@ mod test {
                 "first signal {first}"
             );
         }
+        Ok(())
+    }
+
+    /// A tracee that a realtime signal kills decodes as
+    /// `ExitStatus::SignaledRaw` with its number; it failed with EINVAL
+    /// (<https://github.com/rrnewton/reverie/issues/997>).
+    #[cfg(not(sanitized))]
+    #[test]
+    fn a_tracee_killed_by_a_realtime_signal_exits_signaled_raw()
+    -> Result<(), Box<dyn std::error::Error + 'static>> {
+        let (pid, tracee) = trace(
+            || {
+                unsafe { libc::raise(40) };
+                0
+            },
+            Options::PTRACE_O_EXITKILL,
+        )?;
+        let stopped = match tracee.resume(None)?.wait()? {
+            Wait::Stopped(stopped, Event::RawSignal(40)) => stopped,
+            other => panic!("expected a raw 40 delivery stop, got {other:?}"),
+        };
+        assert_eq!(
+            stopped.resume_raw(40)?.wait()?,
+            Wait::Exited(pid, ExitStatus::SignaledRaw(40, false))
+        );
         Ok(())
     }
 }
