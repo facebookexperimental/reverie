@@ -18,6 +18,11 @@
 //! every host: it exports the six functions glibc 2.42 looks up, under both of
 //! the names the x86_64 kernel exports, and each is the syscall stub the patch
 //! plan gives it, so a call reaches the Tool as a syscall.
+//!
+//! Like the kernel's, the image versions every export as `LINUX_2.6`
+//! (`.gnu.version` and `.gnu.version_d`). Go's runtime walks the version
+//! definitions of any vDSO it finds without checking that they exist, so an
+//! unversioned image crashes every Go program at startup.
 
 use std::sync::LazyLock;
 
@@ -66,6 +71,17 @@ const PHDR_SIZE: usize = 56;
 const SHDR_SIZE: usize = 64;
 const SYM_SIZE: usize = 24;
 const DYN_SIZE: usize = 16;
+const VERSYM_SIZE: usize = 2;
+const VERDEF_SIZE: usize = 20;
+const VERDAUX_SIZE: usize = 8;
+
+/// The kernel's vDSO soname, the name of its base version definition.
+const SONAME: &str = "linux-vdso.so.1";
+/// The one version the x86_64 kernel gives every vDSO export.
+const VERSION: &str = "LINUX_2.6";
+/// [`VERSION`]'s index in the version definitions; 1 is the base (soname).
+const VERSION_INDEX: u16 = 2;
+const VER_FLG_BASE: u16 = 1;
 
 const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
@@ -79,6 +95,8 @@ const SHT_HASH: u32 = 5;
 const SHT_DYNAMIC: u32 = 6;
 const SHT_NOTE: u32 = 7;
 const SHT_DYNSYM: u32 = 11;
+const SHT_GNU_VERDEF: u32 = 0x6fff_fffd;
+const SHT_GNU_VERSYM: u32 = 0x6fff_ffff;
 const SHF_ALLOC: u64 = 2;
 const SHF_EXECINSTR: u64 = 4;
 
@@ -88,17 +106,22 @@ const DT_STRTAB: u64 = 5;
 const DT_SYMTAB: u64 = 6;
 const DT_STRSZ: u64 = 10;
 const DT_SYMENT: u64 = 11;
+const DT_VERSYM: u64 = 0x6fff_fff0;
+const DT_VERDEF: u64 = 0x6fff_fffc;
+const DT_VERDEFNUM: u64 = 0x6fff_fffd;
 
 const STB_GLOBAL: u8 = 1;
 const STB_WEAK: u8 = 2;
 const STT_FUNC: u8 = 2;
 
 /// Section indices, in the order of the section header table.
-const SECTION_NAMES: [&str; 8] = [
+const SECTION_NAMES: [&str; 10] = [
     "",
     ".hash",
     ".dynsym",
     ".dynstr",
+    ".gnu.version",
+    ".gnu.version_d",
     ".text",
     ".note",
     ".dynamic",
@@ -106,8 +129,8 @@ const SECTION_NAMES: [&str; 8] = [
 ];
 const DYNSYM: usize = 2;
 const DYNSTR: usize = 3;
-const TEXT: usize = 4;
-const SHSTRTAB: usize = 7;
+const TEXT: usize = 6;
+const SHSTRTAB: usize = 9;
 
 /// One section header, linked at 0: an allocated section's address is its
 /// offset.
@@ -135,6 +158,20 @@ fn put64(image: &mut [u8], at: usize, value: u64) {
     image[at..at + 8].copy_from_slice(&value.to_le_bytes());
 }
 
+/// The System V ELF hash, which version definitions carry for their names.
+fn elf_hash(name: &str) -> u32 {
+    let mut hash: u32 = 0;
+    for byte in name.bytes() {
+        hash = (hash << 4).wrapping_add(u32::from(byte));
+        let high = hash & 0xf000_0000;
+        if high != 0 {
+            hash ^= high >> 24;
+        }
+        hash &= !high;
+    }
+    hash
+}
+
 /// A string table and the offset of each string in it.
 fn string_table<'a>(strings: impl IntoIterator<Item = &'a str>) -> (Vec<u8>, Vec<usize>) {
     let mut table = vec![0];
@@ -158,7 +195,10 @@ fn build() -> Vec<u8> {
         .flat_map(|(name, alias, _)| [*name, *alias])
         .collect();
     let symbol_count = names.len() + 1;
-    let (dynstr, name_offsets) = string_table(names.iter().copied());
+    let (dynstr, string_offsets) = string_table(names.iter().copied().chain([SONAME, VERSION]));
+    let name_offsets = &string_offsets[..names.len()];
+    let soname_offset = string_offsets[names.len()];
+    let version_offset = string_offsets[names.len() + 1];
     let (shstrtab, section_name_offsets) = string_table(SECTION_NAMES);
     let stubs: Vec<&[u8]> = FUNCTIONS
         .iter()
@@ -173,7 +213,12 @@ fn build() -> Vec<u8> {
     let hash_size = 4 * (2 + 1 + symbol_count);
     let dynsym = (hash + hash_size).next_multiple_of(8);
     let dynstr_at = dynsym + symbol_count * SYM_SIZE;
-    let text = (dynstr_at + dynstr.len()).next_multiple_of(16);
+    let versym = (dynstr_at + dynstr.len()).next_multiple_of(2);
+    let versym_size = symbol_count * VERSYM_SIZE;
+    // Two definitions, each one verdef and the verdaux naming it.
+    let verdef = (versym + versym_size).next_multiple_of(8);
+    let verdef_size = 2 * (VERDEF_SIZE + VERDAUX_SIZE);
+    let text = (verdef + verdef_size).next_multiple_of(16);
     let mut function_offsets = Vec::new();
     let mut text_end = text;
     for stub in &stubs {
@@ -183,12 +228,15 @@ fn build() -> Vec<u8> {
     let note = text_end;
     let note_size = 12 + 8 + 4;
     let dynamic = (note + note_size).next_multiple_of(8);
-    let dynamic_entries: [(u64, u64); 6] = [
+    let dynamic_entries: [(u64, u64); 9] = [
         (DT_HASH, hash as u64),
         (DT_STRTAB, dynstr_at as u64),
         (DT_SYMTAB, dynsym as u64),
         (DT_STRSZ, dynstr.len() as u64),
         (DT_SYMENT, SYM_SIZE as u64),
+        (DT_VERSYM, versym as u64),
+        (DT_VERDEF, verdef as u64),
+        (DT_VERDEFNUM, 2),
         (DT_NULL, 0),
     ];
     let shstrtab_at = dynamic + dynamic_entries.len() * DYN_SIZE;
@@ -271,6 +319,32 @@ fn build() -> Vec<u8> {
     }
     image[dynstr_at..dynstr_at + dynstr.len()].copy_from_slice(&dynstr);
 
+    // Symbol versions: the null symbol is local (0), every export LINUX_2.6.
+    for symbol in 1..symbol_count {
+        put16(&mut image, versym + symbol * VERSYM_SIZE, VERSION_INDEX);
+    }
+
+    // Version definitions, as the kernel lays them out: the base definition
+    // naming the soname, then LINUX_2.6, each followed by its one verdaux.
+    let definitions = [
+        (VER_FLG_BASE, 1, SONAME, soname_offset),
+        (0, VERSION_INDEX, VERSION, version_offset),
+    ];
+    for (index, (flags, ndx, name, name_offset)) in definitions.into_iter().enumerate() {
+        let at = verdef + index * (VERDEF_SIZE + VERDAUX_SIZE);
+        let last = index + 1 == definitions.len();
+        put16(&mut image, at, 1); // vd_version
+        put16(&mut image, at + 2, flags); // vd_flags
+        put16(&mut image, at + 4, ndx); // vd_ndx
+        put16(&mut image, at + 6, 1); // vd_cnt
+        put32(&mut image, at + 8, elf_hash(name)); // vd_hash
+        put32(&mut image, at + 12, VERDEF_SIZE as u32); // vd_aux
+        let next = if last { 0 } else { VERDEF_SIZE + VERDAUX_SIZE };
+        put32(&mut image, at + 16, next as u32); // vd_next
+        put32(&mut image, at + VERDEF_SIZE, name_offset as u32); // vda_name
+        put32(&mut image, at + VERDEF_SIZE + 4, 0); // vda_next
+    }
+
     for (offset, stub) in function_offsets.iter().zip(&stubs) {
         image[*offset..*offset + stub.len()].copy_from_slice(stub);
     }
@@ -316,6 +390,26 @@ fn build() -> Vec<u8> {
             offset: dynstr_at,
             size: dynstr.len(),
             align: 1,
+            ..Section::default()
+        },
+        Section {
+            kind: SHT_GNU_VERSYM,
+            flags: SHF_ALLOC,
+            offset: versym,
+            size: versym_size,
+            link: DYNSYM as u32,
+            align: 2,
+            entsize: VERSYM_SIZE as u64,
+            ..Section::default()
+        },
+        Section {
+            kind: SHT_GNU_VERDEF,
+            flags: SHF_ALLOC,
+            offset: verdef,
+            size: verdef_size,
+            link: DYNSTR as u32,
+            info: definitions.len() as u32,
+            align: 8,
             ..Section::default()
         },
         Section {
@@ -440,5 +534,76 @@ mod tests {
         assert_eq!(notes[0].n_type, 0);
         assert_eq!(notes[0].desc, CANONICAL_LINUX_VERSION_CODE.to_le_bytes());
         assert!(elf.dynamic.is_some());
+    }
+
+    /// `LINUX_2.6`'s hash as Go's runtime (`vdsoLinuxVersion`) and glibc
+    /// (`dl_vdso_vsym`) hard-code it.
+    #[test]
+    fn the_version_hash_is_the_one_go_and_glibc_expect() {
+        assert_eq!(elf_hash(VERSION), 0x3ae_75f6);
+    }
+
+    /// Walk the version definitions the way Go's runtime does
+    /// (`vdsoFindVersion` follows `DT_VERDEF` without checking that it
+    /// exists), and check that every export carries the version it finds,
+    /// as in the kernel's vDSO.
+    #[test]
+    fn the_canonical_vdso_versions_every_export_as_linux_2_6() {
+        let image = canonical_vdso_image();
+        let elf = goblin::elf::Elf::parse(image).unwrap();
+        let dynamic = elf.dynamic.as_ref().unwrap();
+        let tag = |wanted: u64| {
+            dynamic
+                .dyns
+                .iter()
+                .find(|entry| entry.d_tag == wanted)
+                .map(|entry| entry.d_val as usize)
+                .unwrap_or_else(|| panic!("no dynamic tag {wanted:#x}"))
+        };
+        let versym = tag(DT_VERSYM);
+        let verdef = tag(DT_VERDEF);
+        assert_eq!(tag(DT_VERDEFNUM), 2);
+        let strtab = tag(DT_STRTAB);
+        let u16_at = |at: usize| u16::from_le_bytes(image[at..at + 2].try_into().unwrap());
+        let u32_at = |at: usize| u32::from_le_bytes(image[at..at + 4].try_into().unwrap());
+        let string_at = |at: usize| {
+            let end = image[at..].iter().position(|byte| *byte == 0).unwrap();
+            std::str::from_utf8(&image[at..at + end]).unwrap()
+        };
+
+        let mut definitions = Vec::new();
+        let mut def = verdef;
+        loop {
+            let aux = def + u32_at(def + 12) as usize;
+            definitions.push((
+                u16_at(def + 2),
+                u16_at(def + 4),
+                u32_at(def + 8),
+                string_at(strtab + u32_at(aux) as usize).to_owned(),
+            ));
+            let next = u32_at(def + 16) as usize;
+            if next == 0 {
+                break;
+            }
+            def += next;
+        }
+        assert_eq!(
+            definitions,
+            [
+                (VER_FLG_BASE, 1, elf_hash(SONAME), SONAME.to_owned()),
+                (0, VERSION_INDEX, 0x3ae_75f6, VERSION.to_owned()),
+            ]
+        );
+
+        let symbols = elf.dynsyms.len();
+        assert_eq!(symbols, 1 + 2 * FUNCTIONS.len());
+        assert_eq!(u16_at(versym), 0, "the null symbol is local");
+        for symbol in 1..symbols {
+            assert_eq!(
+                u16_at(versym + 2 * symbol),
+                VERSION_INDEX,
+                "symbol {symbol}"
+            );
+        }
     }
 }
