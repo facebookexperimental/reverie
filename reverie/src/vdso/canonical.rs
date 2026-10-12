@@ -585,7 +585,10 @@ mod tests {
         let mut definitions = Vec::new();
         let mut def = verdef;
         loop {
+            assert_eq!(u16_at(def), 1, "vd_version");
+            assert_eq!(u16_at(def + 6), 1, "vd_cnt: one verdaux per definition");
             let aux = def + u32_at(def + 12) as usize;
+            assert_eq!(u32_at(aux + 4), 0, "vda_next: no second verdaux");
             definitions.push((
                 u16_at(def + 2),
                 u16_at(def + 4),
@@ -605,6 +608,24 @@ mod tests {
                 (0, VERSION_INDEX, 0x3ae_75f6, VERSION.to_owned()),
             ]
         );
+
+        // The section headers link the tables as the kernel's do:
+        // .gnu.version to .dynsym, .gnu.version_d to .dynstr with sh_info
+        // counting the definitions.
+        let section = |name: &str| {
+            elf.section_headers
+                .iter()
+                .find(|header| elf.shdr_strtab.get_at(header.sh_name) == Some(name))
+                .unwrap_or_else(|| panic!("no {name} section"))
+        };
+        let versym_section = section(".gnu.version");
+        assert_eq!(versym_section.sh_link as usize, DYNSYM);
+        assert_eq!(versym_section.sh_entsize, VERSYM_SIZE as u64);
+        assert_eq!(versym_section.sh_addr as usize, versym);
+        let verdef_section = section(".gnu.version_d");
+        assert_eq!(verdef_section.sh_link as usize, DYNSTR);
+        assert_eq!(verdef_section.sh_info, 2);
+        assert_eq!(verdef_section.sh_addr as usize, verdef);
 
         let symbols = elf.dynsyms.len();
         assert_eq!(symbols, 1 + 2 * FUNCTIONS.len());
