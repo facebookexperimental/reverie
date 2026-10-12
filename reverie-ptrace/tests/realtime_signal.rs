@@ -30,6 +30,7 @@ use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::Getpid;
 use reverie::syscalls::Ppoll;
+use reverie::syscalls::Read;
 use reverie::syscalls::RtSigprocmask;
 use reverie::syscalls::RtTgsigqueueinfo;
 use reverie::syscalls::Syscall;
@@ -602,6 +603,11 @@ fn queued_realtime_instances_keep_their_order_through_a_held_signals_callback() 
 /// `rt_sigprocmask(SIG_UNBLOCK, buf, NULL)`, then `Guest::inject_with_retry`
 /// of `getpid`. The tool returns the `getpid` result.
 const RETRY_FD: i32 = 903;
+/// Like `RETRY_FD`, but the retried syscall is `read(READ_TIMER_FD, buf, 8)`,
+/// which blocks until the guest's timer at `READ_TIMER_FD` expires.
+const RETRY_READ_FD: i32 = 904;
+/// The descriptor the guest moves its timerfd to for `RETRY_READ_FD`.
+const READ_TIMER_FD: i32 = 905;
 
 /// Like `RawSignalTool`, for `RETRY_FD`.
 #[derive(Clone, Copy, Debug, Default)]
@@ -624,7 +630,9 @@ impl Tool for RetryTool {
         syscall: Syscall,
     ) -> Result<i64, Error> {
         match syscall {
-            Syscall::Write(write) if write.fd() == RETRY_FD && write.len() == 0 => {
+            Syscall::Write(write)
+                if (write.fd() == RETRY_FD || write.fd() == RETRY_READ_FD) && write.len() == 0 =>
+            {
                 let set = write.buf().and_then(|buf| Addr::from_raw(buf.as_raw()));
                 let unblocked = guest
                     .inject(
@@ -638,7 +646,20 @@ impl Tool for RetryTool {
                 guest
                     .send_rpc(Report::Injected(unblocked.map_err(Errno::into_raw)))
                     .await;
-                let result = guest.inject_with_retry(Getpid::new()).await;
+                let result = if write.fd() == RETRY_READ_FD {
+                    guest
+                        .inject_with_retry(
+                            Read::new()
+                                .with_fd(READ_TIMER_FD)
+                                .with_buf(
+                                    write.buf().and_then(|buf| AddrMut::from_raw(buf.as_raw())),
+                                )
+                                .with_len(8),
+                        )
+                        .await
+                } else {
+                    guest.inject_with_retry(Getpid::new()).await
+                };
                 guest
                     .send_rpc(Report::Injected(result.map_err(Errno::into_raw)))
                     .await;
@@ -732,6 +753,86 @@ fn one_realtime_instance_survives_an_ordinary_retry() {
 #[test]
 fn an_ordinary_retry_without_a_realtime_signal_completes() {
     realtime_instances_survive_an_ordinary_retry(0);
+}
+
+/// An ordinary callback's `inject_with_retry` of a blocking syscall, with one
+/// signal held and a realtime signal queued, returns the syscall's restart
+/// code at once (https://github.com/rrnewton/reverie/issues/998). SIGUSR1
+/// stops the first `read` before its `syscall` and is held. The retry keeps
+/// SIGRTMIN+4 queued until the `read`'s entry, where it is pending, so the
+/// `read` returns ERESTARTSYS without blocking. A further retry would return
+/// the same until the timer expired; instead the guest's syscall returns it,
+/// the signals run their handlers as when the guest unblocked them natively,
+/// and the guest's `write`, whose handlers lack SA_RESTART, fails with EINTR.
+/// The guest calls again and the `read` blocks until the timer expires.
+#[test]
+fn a_retried_blocking_syscall_returns_its_restart_code_while_a_signal_is_held() {
+    let (output, log) = test_fn::<RetryTool, _>(move || {
+        DELIVERIES.store(0, Ordering::SeqCst);
+        let realtime = libc::SIGRTMIN() + 4;
+        handle_with_siginfo(libc::SIGUSR1);
+        handle_with_siginfo(realtime);
+        set_blocked(libc::SIGUSR1, true);
+        set_blocked(realtime, true);
+        queue_to_self(libc::SIGUSR1, 7);
+        queue_to_self(realtime, 111);
+        // SAFETY: plain syscalls; the timer spec is fully initialized.
+        unsafe {
+            let timer = libc::timerfd_create(libc::CLOCK_MONOTONIC, 0);
+            assert!(timer >= 0);
+            let spec = libc::itimerspec {
+                it_interval: libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                },
+                it_value: libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 500_000_000,
+                },
+            };
+            assert_eq!(
+                libc::timerfd_settime(timer, 0, &spec, std::ptr::null_mut()),
+                0
+            );
+            assert_eq!(libc::dup2(timer, READ_TIMER_FD), READ_TIMER_FD);
+        }
+        let call = || {
+            // SAFETY: the set is initialized before use.
+            let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
+            unsafe {
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, libc::SIGUSR1);
+                libc::sigaddset(&mut set, realtime);
+            }
+            // SAFETY: the tool replaces this zero-length write; the `read`
+            // it injects writes 8 bytes into `set`.
+            let ret = unsafe {
+                libc::write(
+                    RETRY_READ_FD,
+                    &mut set as *mut libc::sigset_t as *const libc::c_void,
+                    0,
+                )
+            };
+            (ret, std::io::Error::last_os_error().raw_os_error())
+        };
+        assert_eq!(call(), (-1, Some(libc::EINTR)));
+        assert_eq!(delivered(), vec![(realtime, 111), (libc::SIGUSR1, 7)]);
+        assert_eq!(call().0, 8);
+    })
+    .expect("run retried-blocking-syscall guest");
+
+    assert_eq!(
+        output.status,
+        ExitStatus::Exited(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let injected = log.injected.lock().unwrap();
+    assert_eq!(
+        injected[..],
+        [Ok(0), Err(Errno::ERESTARTSYS.into_raw()), Ok(0), Ok(8),],
+        "the first retry returns the restart code instead of retrying until the timer expires"
+    );
 }
 
 /// A guest that a realtime signal kills ends with

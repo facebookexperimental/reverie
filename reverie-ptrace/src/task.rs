@@ -2436,6 +2436,12 @@ pub struct TracedTask<L: Tool> {
     /// may queue itself a SIGTRAP whose `si_code` mimics a syscall stop.
     latest_injection_stop: Option<Option<AnySignal>>,
 
+    /// Whether the syscall of the injection that last completed ran. False
+    /// when `status_to_result` reported that a signal stopped it before its
+    /// `syscall` instruction (`-ERESTARTSYS`, not run). Read by
+    /// `Guest::inject_with_retry`.
+    last_injection_ran: bool,
+
     /// Whether `Tool::handle_signal_event` is running (`report_signal`).
     in_signal_callback: bool,
 
@@ -2711,6 +2717,7 @@ impl<L: Tool> TracedTask<L> {
             ptracer_waits: Arc::new(PtracerWaitOwner::default()),
             preinit_generation: None,
             latest_injection_stop: None,
+            last_injection_ran: true,
             in_signal_callback: false,
             signal_callback_replaced_restart_block: false,
             signal_callback_guest_restart_block: false,
@@ -2788,6 +2795,7 @@ impl<L: Tool> TracedTask<L> {
             ptracer_waits,
             preinit_generation: None,
             latest_injection_stop: None,
+            last_injection_ran: true,
             in_signal_callback: false,
             signal_callback_replaced_restart_block: false,
             signal_callback_guest_restart_block: false,
@@ -2862,6 +2870,7 @@ impl<L: Tool> TracedTask<L> {
             ptracer_waits,
             preinit_generation: None,
             latest_injection_stop: None,
+            last_injection_ran: true,
             in_signal_callback: false,
             signal_callback_replaced_restart_block: false,
             signal_callback_guest_restart_block: false,
@@ -8073,6 +8082,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         child_context: Option<libc::user_regs_struct>,
     ) -> Result<Result<i64, Errno>, TraceError> {
         self.note_injection_stop(&wait_status)?;
+        self.last_injection_ran = true;
         match wait_status {
             Wait::Stopped(stopped, event) => match event {
                 event
@@ -8091,6 +8101,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                     if sig != Signal::SIGTRAP {
                         self.hold_pending_signal(&stopped, sig);
                     }
+                    self.last_injection_ran = false;
                     Ok(Err(Errno::ERESTARTSYS))
                 }
                 event if let Some(sig) = event.signal() => {
@@ -8116,6 +8127,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                                 // Any signal, including an external SIGTRAP,
                                 // stopped the step before the syscall ran.
                                 *regs.ret_mut() = (-(Errno::ERESTARTSYS.into_raw()) as i64) as u64;
+                                self.last_injection_ran = false;
                                 self.hold_pending_signal(&stopped, sig);
                             }
                             PrivateStep::Ran => {}
@@ -8144,6 +8156,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                         // overwriting it would execute the syscall twice.
                         if regs.ip() as usize == cp::PRIVATE_PAGE_OFFSET {
                             *regs.ret_mut() = (-(Errno::ERESTARTSYS.into_raw()) as i64) as u64;
+                            self.last_injection_ran = false;
                         }
                         self.hold_pending_signal(&stopped, sig);
                     } else if regs.ip() as usize == cp::PRIVATE_PAGE_OFFSET {
@@ -8156,6 +8169,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                         // does not deliver an unclaimed SIGTRAP
                         // (`handle_sigtrap`).
                         *regs.ret_mut() = (-(Errno::ERESTARTSYS.into_raw()) as i64) as u64;
+                        self.last_injection_ran = false;
                     }
                     let result = Errno::from_ret(regs.ret() as usize).map(|x| x as i64);
                     if let Some(context) = context {
@@ -8968,6 +8982,30 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
         // Call a non-templatized function to reduce code bloat.
         let (nr, args) = syscall.into_parts();
         self.do_inject(nr, args).await
+    }
+
+    /// Retries as the provided method does, except when the syscall ran and
+    /// returned `EINTR` or `ERESTARTSYS` while a signal is held
+    /// (`pending_signal`). Another signal was pending at its entry, as an
+    /// injection that starts with a signal held keeps realtime signals queued
+    /// until then (`step_keeping_realtime_queued`), so a retry would return
+    /// the same code at once until the syscall's own condition is met
+    /// (https://github.com/rrnewton/reverie/issues/998). The code is
+    /// returned instead, so the guest's syscall returns it and the signals
+    /// are delivered when the guest resumes, as natively. A syscall that a
+    /// signal stopped before its instruction did not run and is retried.
+    async fn inject_with_retry<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
+        loop {
+            match self.inject(syscall).await {
+                Err(error @ (Errno::EINTR | Errno::ERESTARTSYS))
+                    if self.last_injection_ran && self.pending_signal.is_some() =>
+                {
+                    return Err(error);
+                }
+                Err(Errno::EINTR) | Err(Errno::ERESTARTSYS) => continue,
+                result => return result,
+            }
+        }
     }
 
     #[allow(unreachable_code)]
