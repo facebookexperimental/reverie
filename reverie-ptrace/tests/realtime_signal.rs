@@ -590,3 +590,139 @@ fn queued_realtime_instances_keep_their_order_through_a_held_signals_callback() 
         "{injected:?}"
     );
 }
+
+/// A zero-length write to this descriptor is replaced with an injected
+/// `rt_sigprocmask(SIG_UNBLOCK, buf, NULL)`, then `Guest::inject_with_retry`
+/// of `getpid`. The tool returns the `getpid` result.
+const RETRY_FD: i32 = 903;
+
+/// Like `RawSignalTool`, for `RETRY_FD`.
+#[derive(Clone, Copy, Debug, Default)]
+struct RetryTool;
+
+#[reverie::tool]
+impl Tool for RetryTool {
+    type GlobalState = Log;
+    type ThreadState = ();
+
+    fn subscriptions(_config: &()) -> Subscription {
+        let mut subscription = Subscription::none();
+        subscription.syscall(Sysno::write);
+        subscription
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        match syscall {
+            Syscall::Write(write) if write.fd() == RETRY_FD && write.len() == 0 => {
+                let set = write.buf().and_then(|buf| Addr::from_raw(buf.as_raw()));
+                let unblocked = guest
+                    .inject(
+                        RtSigprocmask::new()
+                            .with_how(libc::SIG_UNBLOCK)
+                            .with_set(set)
+                            .with_oldset(None)
+                            .with_sigsetsize(8),
+                    )
+                    .await;
+                guest
+                    .send_rpc(Report::Injected(unblocked.map_err(Errno::into_raw)))
+                    .await;
+                let result = guest.inject_with_retry(Getpid::new()).await;
+                guest
+                    .send_rpc(Report::Injected(result.map_err(Errno::into_raw)))
+                    .await;
+                Ok(result?)
+            }
+            _ => guest.tail_inject(syscall).await,
+        }
+    }
+
+    async fn handle_raw_signal_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: i32,
+    ) -> Result<Option<i32>, Errno> {
+        guest.send_rpc(Report::Raw(signal)).await;
+        Ok(Some(signal))
+    }
+}
+
+/// An ordinary syscall callback's `inject_with_retry` keeps every queued
+/// instance of a realtime signal (from the Codex review of
+/// https://github.com/rrnewton/reverie/pull/995). The callback unblocks the
+/// signal, so its first instance stops the retried `getpid` before its
+/// `syscall` and is held. A retry that took the next instance would hold it
+/// in the same single slot and lose the first. The retry keeps the realtime
+/// signals queued instead, so `getpid` completes and the handlers see every
+/// value in order: the held instance keeps its siginfo when it is passed on
+/// after the callback's injections. `queued` is 0 and 1 for the controls.
+fn realtime_instances_survive_an_ordinary_retry(queued: usize) {
+    let (output, log) = test_fn::<RetryTool, _>(move || {
+        DELIVERIES.store(0, Ordering::SeqCst);
+        let signal = libc::SIGRTMIN() + 4;
+        handle_with_siginfo(signal);
+        set_blocked(signal, true);
+        for value in [111, 222].into_iter().take(queued) {
+            queue_to_self(signal, value);
+        }
+        // SAFETY: the set is initialized before use.
+        let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, signal);
+        }
+        // SAFETY: the tool replaces this zero-length write.
+        let ret = unsafe {
+            libc::write(
+                RETRY_FD,
+                &set as *const libc::sigset_t as *const libc::c_void,
+                0,
+            )
+        };
+        // SAFETY: getpid has no preconditions.
+        assert_eq!(ret, unsafe { libc::getpid() } as isize);
+        let expected: Vec<(i32, i64)> = [111, 222]
+            .into_iter()
+            .take(queued)
+            .map(|value| (signal, value))
+            .collect();
+        assert_eq!(delivered(), expected);
+    })
+    .expect("run ordinary-retry realtime guest");
+
+    assert_eq!(
+        output.status,
+        ExitStatus::Exited(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // With a second instance pending, the held first one is passed on
+    // unreported, as any held signal is while another signal is pending
+    // (`report_held_signal`), and keeps its siginfo (value 111 above); the
+    // second is reported at its own stop.
+    assert_eq!(log.raw.lock().unwrap().len(), queued.min(1));
+    let injected = log.injected.lock().unwrap();
+    assert!(
+        matches!(injected[..], [Ok(0), Ok(pid)] if pid > 0),
+        "{injected:?}"
+    );
+}
+
+#[test]
+fn two_realtime_instances_survive_an_ordinary_retry() {
+    realtime_instances_survive_an_ordinary_retry(2);
+}
+
+#[test]
+fn one_realtime_instance_survives_an_ordinary_retry() {
+    realtime_instances_survive_an_ordinary_retry(1);
+}
+
+#[test]
+fn an_ordinary_retry_without_a_realtime_signal_completes() {
+    realtime_instances_survive_an_ordinary_retry(0);
+}

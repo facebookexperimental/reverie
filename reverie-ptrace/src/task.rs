@@ -483,11 +483,11 @@ enum PrivateStep {
     Unexpected,
 }
 
-/// Classifies the signal-delivery stop that ended a private-page step.
 /// The realtime signals, 32 to 64, as bits of a kernel signal mask (bit
 /// `n - 1` for signal `n`).
 const REALTIME_SIGNAL_BITS: u64 = !0u64 << 31;
 
+/// Classifies the signal-delivery stop that ended a private-page step.
 fn classify_private_step(
     ip: u64,
     signal: impl Into<AnySignal>,
@@ -2420,7 +2420,7 @@ pub struct TracedTask<L: Tool> {
     /// being held: the held signal's resume empties `pending_signal` no
     /// more, so a signal held there would wait for a later syscall stop
     /// that a guest about to exit need not make. A realtime signal is not
-    /// taken from the queue at all there (`step_held_callback_injection`):
+    /// taken from the queue at all there (`step_keeping_realtime_queued`):
     /// put back, it would go behind later instances of its number.
     in_held_signal_callback: bool,
 
@@ -4505,6 +4505,38 @@ impl<L: Tool + 'static> TracedTask<L> {
     /// A returning `tail_inject` from the callback ends it and passes the
     /// signal on (`report_signal`).
     async fn report_held_signal(
+        &mut self,
+        task: &Stopped,
+        stop_signal: Option<AnySignal>,
+        signal: Option<AnySignal>,
+    ) -> Result<SignalResume, TraceError> {
+        let taken = self.pending_signal_taken;
+        // Resumed from a signal-delivery stop, whose siginfo can be written.
+        let writable = self.latest_injection_stop.unwrap_or(stop_signal).is_some()
+            && !thread_may_be_seccomp_filtered();
+        let mut resume = self
+            .report_or_pass_held_signal(task, stop_signal, signal)
+            .await?;
+        // A realtime signal passed on unreported keeps its siginfo, which can
+        // carry a `sigqueue` value; Linux would otherwise make one up for the
+        // stop it is resumed from after the callback's injections
+        // (<https://github.com/rrnewton/reverie/issues/207>). A named signal
+        // is passed on as before.
+        if resume.reported.is_none()
+            && resume.replacement.is_none()
+            && writable
+            && let (Some(sig), Some(taken)) = (resume.signal, taken)
+            && sig == taken.signal
+            && sig.as_nix().is_none()
+        {
+            resume.replacement = Some((sig, taken.bytes));
+        }
+        Ok(resume)
+    }
+
+    /// `report_held_signal`, before a realtime signal passed on unreported
+    /// gets its siginfo back.
+    async fn report_or_pass_held_signal(
         &mut self,
         task: &Stopped,
         stop_signal: Option<AnySignal>,
@@ -7247,15 +7279,20 @@ impl<L: Tool + 'static> TracedTask<L> {
 
         task.setregs(&regs)?;
 
-        // A held-signal callback's injection keeps every realtime signal
-        // queued (`step_held_callback_injection`).
-        let realtime_unblocked = if self.in_held_signal_callback && child_context.is_none() {
+        // An injection in a held signal's callback, or one that starts with
+        // a signal already held, keeps every realtime signal queued
+        // (`step_keeping_realtime_queued`).
+        let realtime_unblocked = if child_context.is_none()
+            && (self.in_held_signal_callback || self.pending_signal.is_some())
+        {
             REALTIME_SIGNAL_BITS & !task.getsigmask()?
         } else {
             0
         };
         if realtime_unblocked != 0 {
-            let (wait, seccomp_trapped) = self.step_held_callback_injection(task, nr).await?;
+            let requeue = self.in_held_signal_callback;
+            let (wait, seccomp_trapped) =
+                self.step_keeping_realtime_queued(task, nr, requeue).await?;
             let result = self
                 .status_to_result(wait, Some(oldregs), child_context)
                 .await?;
@@ -7694,18 +7731,35 @@ impl<L: Tool + 'static> TracedTask<L> {
             unreachable!("matched a stopped task")
         };
         let original_mask = stopped.getsigmask()?;
-        self.requeue_signals_until_syscall_entry(wait, original_mask, original_mask, nr, false)
-            .await
+        self.requeue_signals_until_syscall_entry(
+            wait,
+            original_mask,
+            original_mask,
+            nr,
+            false,
+            true,
+        )
+        .await
     }
 
-    /// Runs a syscall that a held-signal callback injects
-    /// (`in_held_signal_callback`) with every realtime signal (32 to 64)
-    /// blocked until the syscall's entry, so none is taken from the kernel's
-    /// queue before the `syscall` instruction. One taken there would be put
-    /// back (`requeue_signals_before_original_syscall`) at the tail of its
-    /// queue, behind later instances of the same signal, which Linux delivers
-    /// first in, first out. Standard signals have at most one pending instance
-    /// each, so their requeue keeps their order; they stop the step as before.
+    /// Runs an injected syscall with every realtime signal (32 to 64) blocked
+    /// until the syscall's entry, so none is taken from the kernel's queue
+    /// before the `syscall` instruction. Two injections need this:
+    ///
+    /// - One in a held signal's callback (`in_held_signal_callback`, with
+    ///   `requeue`). A signal taken before its instruction is put back in the
+    ///   queue (`requeue_signals_before_original_syscall`), and a realtime
+    ///   one would go to the tail, behind later instances of its number,
+    ///   which Linux delivers first in, first out.
+    /// - One that starts while a signal is held (`pending_signal`), such as
+    ///   the retry of an injection a realtime signal stopped
+    ///   (`Guest::inject_with_retry`). A signal taken before its instruction
+    ///   is held, and a second would replace the first in the single slot,
+    ///   losing it and its siginfo.
+    ///
+    /// Standard signals, which have at most one pending instance each, stop
+    /// the step as before: requeued with `requeue`, else returned for the
+    /// generic not-run handling (`status_to_result`).
     ///
     /// The thread is resumed with `PTRACE_SYSCALL` to the syscall-entry stop,
     /// where its own mask is restored before `step_private_syscall` runs the
@@ -7717,10 +7771,11 @@ impl<L: Tool + 'static> TracedTask<L> {
     /// notification is taken as `step_private_syscall_discarding_late_timer`
     /// takes it, and a SIGTRAP is discarded as `untraced_syscall_with`
     /// discards it.
-    async fn step_held_callback_injection(
+    async fn step_keeping_realtime_queued(
         &mut self,
         task: Stopped,
         nr: Sysno,
+        requeue: bool,
     ) -> Result<(Wait, bool), TraceError> {
         let original_mask = task.getsigmask()?;
         let mask = original_mask | REALTIME_SIGNAL_BITS;
@@ -7730,24 +7785,29 @@ impl<L: Tool + 'static> TracedTask<L> {
             .next_state_with_owner(&self.ptracer_waits)
             .await?;
         self.arm_liteinst_wait(&wait);
-        self.requeue_signals_until_syscall_entry(wait, original_mask, mask, nr, true)
+        self.requeue_signals_until_syscall_entry(wait, original_mask, mask, nr, true, requeue)
             .await
     }
 
     /// The loop of `requeue_signals_before_original_syscall` and
-    /// `step_held_callback_injection`: requeues each signal that stops the
-    /// thread before its private-page `syscall` instruction, blocked in
-    /// `mask`, until the syscall-entry stop, where `original_mask` is
-    /// restored and `step_private_syscall` runs the syscall. With
-    /// `held_callback`, a SIGTRAP before the instruction is discarded and the
-    /// thread's own timer notification, live or late, is taken.
+    /// `step_keeping_realtime_queued`: runs the thread, blocked in `mask`, to
+    /// its private-page syscall's entry stop, where `original_mask` is
+    /// restored and `step_private_syscall` runs the syscall. A signal that
+    /// stops it before the `syscall` instruction is requeued with `requeue`,
+    /// else returned with `original_mask` restored. With `plain_injection`
+    /// (not a frame-mode injection of the original syscall), a SIGTRAP
+    /// before the instruction is discarded and the thread's own timer
+    /// notification, live or late, is taken, as
+    /// `step_private_syscall_discarding_late_timer` takes it; otherwise only
+    /// a late timer overflow is.
     async fn requeue_signals_until_syscall_entry(
         &mut self,
         wait: Wait,
         original_mask: u64,
         mut mask: u64,
         nr: Sysno,
-        held_callback: bool,
+        plain_injection: bool,
+        requeue: bool,
     ) -> Result<(Wait, bool), TraceError> {
         fn requeueable(sig: AnySignal) -> bool {
             !matches!(
@@ -7762,7 +7822,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         loop {
             match wait {
                 Wait::Stopped(stopped, Event::Signal(Signal::SIGTRAP))
-                    if held_callback
+                    if plain_injection
                         && before_instruction(&stopped)?
                         && !thread_may_be_seccomp_filtered() =>
                 {
@@ -7784,7 +7844,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                 {
                     let deliver = if is_group_stop(&stopped, sig)? {
                         None
-                    } else if held_callback
+                    } else if plain_injection
                         && sig == Timer::signal_type()
                         && let Some(notification) = self.take_own_timer_notification(&stopped)?
                     {
@@ -7797,12 +7857,15 @@ impl<L: Tool + 'static> TracedTask<L> {
                             }
                         };
                         None
-                    } else if !held_callback
+                    } else if !plain_injection
                         && sig == Timer::signal_type()
                         && self.consume_own_timer_overflow(&stopped)?
                     {
                         LATE_TIMER_SIGNALS_DISCARDED.fetch_add(1, Ordering::Relaxed);
                         None
+                    } else if !requeue {
+                        stopped.setsigmask(original_mask)?;
+                        return Ok((Wait::Stopped(stopped, event), false));
                     } else {
                         mask |= signal_mask_bit(sig);
                         stopped.setsigmask(mask)?;

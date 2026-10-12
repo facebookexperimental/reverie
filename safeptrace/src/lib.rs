@@ -2015,11 +2015,15 @@ impl Running {
                 Wait::Stopped(stopped, event) => {
                     if pred(&event) {
                         break Ok(Wait::Stopped(stopped, event));
-                    } else if let Event::Signal(sig) = event {
-                        self = stopped.resume(Some(sig))?;
-                    } else {
-                        self = stopped.resume(None)?;
                     }
+                    // Forward a signal, named or not
+                    // (<https://github.com/rrnewton/reverie/issues/207>): a
+                    // resume without one would suppress it.
+                    self = match event {
+                        Event::Signal(sig) => stopped.resume(Some(sig))?,
+                        Event::RawSignal(raw) => stopped.resume_raw(raw)?,
+                        _ => stopped.resume(None)?,
+                    };
                 }
                 task => break Ok(task),
             }
@@ -2231,6 +2235,8 @@ mod test {
                                 break stopped;
                             } else if let Event::Signal(sig) = event {
                                 running = stopped.resume(Some(sig))?;
+                            } else if let Event::RawSignal(raw) = event {
+                                running = stopped.resume_raw(raw)?;
                             } else {
                                 running = stopped.resume(None)?;
                             }
@@ -3418,6 +3424,77 @@ mod test {
             wait_group(pid)?,
             Some(Wait::Exited(pid, ExitStatus::Exited(0)))
         );
+        Ok(())
+    }
+
+    static FIRST_SIGNAL_DELIVERIES: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    extern "C" fn count_first_signal(_signal: libc::c_int) {
+        FIRST_SIGNAL_DELIVERIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    extern "C" fn ignore_target_signal(_signal: libc::c_int) {}
+
+    /// `wait_for_signal` forwards a signal it passes over, named or realtime,
+    /// rather than suppress it (from the Codex review of
+    /// <https://github.com/rrnewton/reverie/pull/995>). The tracee sends
+    /// itself a caught `first` signal, then SIGUSR1; the wait selects
+    /// SIGUSR1, and the tracee exits 0 only if `first`'s handler ran once.
+    /// Before, a realtime `first` was resumed with no signal and dropped
+    /// (exit 42); SIGUSR2 is the named control.
+    #[cfg(all(feature = "notifier", not(sanitized)))]
+    #[test]
+    fn wait_for_signal_forwards_an_intervening_signal_named_or_realtime()
+    -> Result<(), Box<dyn std::error::Error + 'static>> {
+        for first in [libc::SIGUSR2, 40] {
+            let (pid, tracee) = trace(
+                move || {
+                    for (signal, handler) in [
+                        (first, count_first_signal as *const () as usize),
+                        (libc::SIGUSR1, ignore_target_signal as *const () as usize),
+                    ] {
+                        let mut action: libc::sigaction =
+                            unsafe { MaybeUninit::zeroed().assume_init() };
+                        action.sa_sigaction = handler;
+                        assert_eq!(
+                            unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) },
+                            0
+                        );
+                    }
+                    for signal in [first, libc::SIGUSR1] {
+                        let ret = unsafe {
+                            let pid = libc::syscall(libc::SYS_getpid);
+                            let tid = libc::syscall(libc::SYS_gettid);
+                            libc::syscall(libc::SYS_tgkill, pid, tid, signal)
+                        };
+                        assert_eq!(ret, 0);
+                    }
+                    let calls = FIRST_SIGNAL_DELIVERIES.load(std::sync::atomic::Ordering::SeqCst);
+                    if calls == 1 { 0 } else { 42 }
+                },
+                Options::PTRACE_O_EXITKILL,
+            )?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let status = runtime.block_on(async {
+                let selected = tracee
+                    .resume(None)?
+                    .wait_for_signal(Signal::SIGUSR1)
+                    .await?;
+                let stopped = match selected {
+                    Wait::Stopped(stopped, Event::Signal(Signal::SIGUSR1)) => stopped,
+                    other => panic!("expected the SIGUSR1 stop, got {other:?}"),
+                };
+                stopped.resume(Some(Signal::SIGUSR1))?.next_state().await
+            })?;
+            assert_eq!(
+                status,
+                Wait::Exited(pid, ExitStatus::Exited(0)),
+                "first signal {first}"
+            );
+        }
         Ok(())
     }
 }
