@@ -1155,6 +1155,11 @@ struct AdmissionTool;
 impl Tool for AdmissionTool {
     type GlobalState = AdmissionGlobal;
     type ThreadState = ();
+    fn subscriptions(_: &u8) -> Subscription {
+        let mut subscription = Subscription::all_syscalls();
+        subscription.cpuid();
+        subscription
+    }
     fn observe_signal_dequeues(mode: &u8) -> bool {
         *mode != 2
     }
