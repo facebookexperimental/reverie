@@ -4540,8 +4540,8 @@ impl<L: Tool + 'static> TracedTask<L> {
         Ok(resume)
     }
 
-    /// `report_held_signal`, before a realtime signal passed on unreported
-    /// gets its siginfo back.
+    /// `report_held_signal`, before a signal passed on unreported gets its
+    /// siginfo back.
     async fn report_or_pass_held_signal(
         &mut self,
         task: &Stopped,

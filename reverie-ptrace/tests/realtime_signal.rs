@@ -151,6 +151,8 @@ impl Tool for RawSignalTool {
 /// Handler calls, each recorded as `signal << 32 | si_value`.
 static DELIVERED: [AtomicI64; 4] = [const { AtomicI64::new(0) }; 4];
 static DELIVERIES: AtomicUsize = AtomicUsize::new(0);
+/// The si_code (high half) and si_pid (low half) of the last SIGUSR1 handled.
+static LAST_SIGUSR1_ORIGIN: AtomicI64 = AtomicI64::new(0);
 
 extern "C" fn record_delivery(
     signal: libc::c_int,
@@ -159,6 +161,11 @@ extern "C" fn record_delivery(
 ) {
     // SAFETY: an SA_SIGINFO handler gets the kernel's siginfo.
     let value = unsafe { (*info).si_value().sival_ptr } as i64;
+    if signal == libc::SIGUSR1 {
+        // SAFETY: as above.
+        let (code, pid) = unsafe { ((*info).si_code, (*info).si_pid()) };
+        LAST_SIGUSR1_ORIGIN.store((i64::from(code) << 32) | i64::from(pid), Ordering::SeqCst);
+    }
     let slot = DELIVERIES.fetch_add(1, Ordering::SeqCst);
     if let Some(slot) = DELIVERED.get(slot) {
         slot.store((signal as i64) << 32 | value, Ordering::SeqCst);
@@ -810,6 +817,13 @@ fn a_held_named_signal_passed_on_keeps_its_value() {
         // SAFETY: getpid has no preconditions.
         assert_eq!(ret, unsafe { libc::getpid() } as isize);
         assert_eq!(delivered(), vec![(realtime, 111), (libc::SIGUSR1, 7)]);
+        // SAFETY: getpid has no preconditions.
+        let me = unsafe { libc::getpid() };
+        assert_eq!(
+            LAST_SIGUSR1_ORIGIN.load(Ordering::SeqCst),
+            (i64::from(libc::SI_QUEUE) << 32) | i64::from(me),
+            "SIGUSR1's si_code and si_pid are the ones sigqueue gave it"
+        );
     })
     .expect("run held-named-signal guest");
 
