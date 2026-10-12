@@ -243,21 +243,8 @@ typedef struct _clone_record_t {
     reg_t for_dynamorio_clone[4];
 } __attribute__((__aligned__(ABI_STACK_ALIGNMENT))) clone_record_t;
 
-#if defined(LINUX) && defined(X86_64)
-/* get_clone_record() reconstructs the stack base by rounding up to the next
- * page. Leave room on the minimum x86 page for the client's entry call/prologue
- * (48 bytes in the Release bootstrap) and worst-case XSTATE stack alignment.
- * Large admission contexts belong in the pending allocation, not this copied
- * bootstrap record. The real client-thread startup regression also exercises
- * the compiler-generated entry stack, which this layout check cannot measure.
- */
-_Static_assert(sizeof(clone_record_t) + AVX_ALIGNMENT + 8 * sizeof(reg_t) <= 4096,
-               "clone record leaves no room for client-thread bootstrap");
-#endif
-
 /* i#350: set up signal handler for safe_read/faults during init */
 static thread_sig_info_t init_info;
-DECLARE_CXTSWPROT_VAR(static volatile int64 signal_admission_sequence, 0);
 static kernel_sigset_t init_sigmask;
 
 #ifdef DEBUG
@@ -1410,29 +1397,6 @@ free_pending_signal(thread_sig_info_t *info, int sig)
     info->num_pending--;
 }
 
-static void
-retire_signal_admission(thread_sig_info_t *info)
-{
-#ifdef LINUX
-    if (info->injected_sigsuspend.held != NULL) {
-        special_heap_free(info->sigheap, info->injected_sigsuspend.held);
-        info->num_pending--;
-    }
-    memset(&info->injected_sigsuspend, 0, sizeof(info->injected_sigsuspend));
-#endif
-    if (info->active_admission != NULL) {
-        special_heap_free(info->sigheap, info->active_admission);
-        info->active_admission = NULL;
-        info->admission_token = 0;
-        info->num_pending--;
-    }
-    if (info->admission_return != NULL) {
-        special_heap_free(info->sigheap, info->admission_return);
-        info->admission_return = NULL;
-        info->num_pending--;
-    }
-}
-
 /* This is split from os_fork_init() so the new logfiles are available
  * (xref i#189/PR 452168).  It had to be after dynamo_other_thread_exit()
  * called in dynamorio_fork_init() after os_fork_init() else we clean
@@ -1478,13 +1442,6 @@ signal_fork_init(dcontext_t *dcontext)
         init_itimer(dcontext, true /*first*/);
     }
     info->num_unstarted_children = 0;
-    /* Fork does not inherit a parent's pending signal, admission token, or
-     * logical wait. Its currently inherited mask remains unchanged. */
-    retire_signal_admission(info);
-    info->in_sigsuspend = false;
-#ifdef LINUX
-    memset(&info->sigsuspend, 0, sizeof(info->sigsuspend));
-#endif
     for (i = 1; i <= MAX_SIGNUM; i++) {
         /* "A child created via fork(2) initially has an empty pending signal set" */
         dcontext->signals_pending = 0;
@@ -1622,7 +1579,6 @@ signal_thread_exit(dcontext_t *dcontext, bool other_thread)
                              sizeof(int) HEAPACCT(ACCT_OTHER));
         }
     }
-    retire_signal_admission(info);
     for (i = 1; i <= MAX_SIGNUM; i++) {
         /* pending queue is per-thread and not shared */
         while (info->sigpending[i] != NULL) {
@@ -2591,13 +2547,20 @@ handle_sigprocmask(dcontext_t *dcontext, int how, kernel_sigset_t *app_set,
     if (app_set != NULL) {
         /* app_set was already read into safe_set above. */
         if (execute_syscall) {
-            /* Linux accepts readable, read-only input. Filter a private copy
-             * rather than mutating application memory and restoring it later.
-             * The owning thread's non-ignorable syscall consumes this buffer
-             * before pending application signals can run. Post-handling
-             * restores the original argument before any client post-event.
+            /* The syscall will execute, so remove from the set passed
+             * to it.   We restore post-syscall.
+             * XXX i#1187: we could crash here touching app memory -- could
+             * use TRY, but the app could pass read-only memory and it
+             * would work natively!  Better to swap in our own
+             * allocated data struct. This would prevent a second read (by
+             * the kernel) too, which might fail if it does not _remain_
+             * readable anymore.  There's a transparency issue w/
+             * races too if another thread looks at this memory.  This
+             * won't happen by default b/c -intercept_all_signals is
+             * on by default so we don't try to solve all these
+             * issues.
              */
-            info->sigprocmask_kernel_set = safe_set;
+            info->pre_syscall_app_sigprocmask = safe_set;
         }
         if (how == SIG_BLOCK) {
             /* The set of blocked signals is the union of the current
@@ -2609,7 +2572,7 @@ handle_sigprocmask(dcontext_t *dcontext, int how, kernel_sigset_t *app_set,
                         ATOMIC_DEC(int, info->sighand->threads_unmasked[i]);
                     kernel_sigaddset(&info->app_sigblocked, i);
                     if (execute_syscall)
-                        kernel_sigdelset(&info->sigprocmask_kernel_set, i);
+                        kernel_sigdelset(app_set, i);
                 }
             }
         } else if (how == SIG_UNBLOCK) {
@@ -2622,7 +2585,7 @@ handle_sigprocmask(dcontext_t *dcontext, int how, kernel_sigset_t *app_set,
                         ATOMIC_INC(int, info->sighand->threads_unmasked[i]);
                     kernel_sigdelset(&info->app_sigblocked, i);
                     if (execute_syscall)
-                        kernel_sigdelset(&info->sigprocmask_kernel_set, i);
+                        kernel_sigdelset(app_set, i);
                 }
             }
         } else if (how == SIG_SETMASK) {
@@ -2635,7 +2598,7 @@ handle_sigprocmask(dcontext_t *dcontext, int how, kernel_sigset_t *app_set,
                     ATOMIC_DEC(int, info->sighand->threads_unmasked[i]);
                     kernel_sigaddset(&info->app_sigblocked, i);
                     if (execute_syscall)
-                        kernel_sigdelset(&info->sigprocmask_kernel_set, i);
+                        kernel_sigdelset(app_set, i);
                 }
             }
         }
@@ -2664,11 +2627,8 @@ handle_sigprocmask(dcontext_t *dcontext, int how, kernel_sigset_t *app_set,
             *error_code = status;
         }
         return false; /* skip syscall */
-    } else {
-        if (app_set != NULL)
-            set_syscall_param(dcontext, 1, (reg_t)&info->sigprocmask_kernel_set);
+    } else
         return true;
-    }
 }
 
 /* need to add in our signals that the app thinks are blocked */
@@ -2679,12 +2639,18 @@ handle_post_sigprocmask(dcontext_t *dcontext, int how, kernel_sigset_t *app_set,
     thread_sig_info_t *info = (thread_sig_info_t *)dcontext->signal_field;
     int i;
     if (!DYNAMO_OPTION(intercept_all_signals)) {
-        /* app_set is the original pointer saved by pre_system_call. The
-         * private copy was used only as kernel input: application memory is
-         * untouched unless it also serves as the legitimate output buffer.
-         * Restore even on kernel failure before post-events or re-execution.
+        /* Restore app memory.
+         * XXX i#1187: See comment in handle_sigprocmask about read-only
+         * app_set. Ideally, we would replace app_set with our own copy
+         * pre-syscall so that we only need to restore a pointer to the original
+         * app copy post-syscall.
+         * In case of a write failure below, we do not return an EFAULT as it would
+         * be incorrect to expect app_set to be writeable. We try continuing and
+         * return a cloberred app_set to the app. This is low priority as
+         * -intercept_all_signals is true by default.
          */
-        set_syscall_param(dcontext, 1, (reg_t)app_set);
+        safe_write_ex(app_set, sizeof(*app_set), &info->pre_syscall_app_sigprocmask,
+                      NULL);
     }
     if (oset != NULL) {
         /* Note that we check validity of oset post-syscall only, after the app's
@@ -2761,105 +2727,6 @@ handle_post_sigpending(dcontext_t *dcontext, kernel_sigset_t *set, size_t sigset
     return 0;
 }
 
-#ifdef LINUX
-/* Keep the kernel-owned subset distinct from DR's virtual application mask.
- * In particular, DR's own blocked emulated signals must neither leak into an
- * application frame nor be replaced by application mask changes.
- */
-static void
-merge_nonemulated_sigmask(thread_sig_info_t *info, kernel_sigset_t *mask,
-                         kernel_sigset_t *source)
-{
-    if (DYNAMO_OPTION(intercept_all_signals))
-        return;
-    for (int sig = 1; sig <= MAX_SIGNUM; sig++) {
-        if (!EMULATE_SIGMASK(info, sig)) {
-            if (kernel_sigismember(source, sig))
-                kernel_sigaddset(mask, sig);
-            else
-                kernel_sigdelset(mask, sig);
-        }
-    }
-}
-
-int
-handle_pre_sigsuspend(dcontext_t *dcontext, const kernel_sigset_t *set,
-                      size_t sigsetsize)
-{
-    thread_sig_info_t *info = (thread_sig_info_t *)dcontext->signal_field;
-    if (!info->in_sigsuspend) {
-        kernel_sigset_t captured;
-        /* Linux copies once, before changing the mask. In particular, a bad
-         * size/address must not enter a suspend or modify the old mask, and a
-         * read-only application sigset is valid input.
-         */
-        if (sigsetsize != sizeof(captured))
-            return EINVAL;
-        if (set == NULL || !d_r_safe_read(set, sizeof(captured), &captured))
-            return EFAULT;
-        kernel_sigdelset(&captured, SIGKILL);
-        kernel_sigdelset(&captured, SIGSTOP);
-        kernel_sigset_t physical;
-        int result = sigprocmask_syscall(SIG_SETMASK, NULL, &physical, sizeof(physical));
-        if (result != 0)
-            return -result;
-        info->sigsuspend.return_mask = info->app_sigblocked;
-        merge_nonemulated_sigmask(info, &info->sigsuspend.return_mask, &physical);
-        info->sigsuspend.kernel_mask = physical;
-        merge_nonemulated_sigmask(info, &info->sigsuspend.kernel_mask, &captured);
-        /* Keep the temporary physical subset installed for this entire logical
-         * wait. A suppressed or ignored signal must not expose the original
-         * mask between the physical EINTR and the internal retry.
-         */
-        result = sigprocmask_syscall(SIG_SETMASK, &info->sigsuspend.kernel_mask, NULL,
-                                    sizeof(kernel_sigset_t));
-        if (result != 0)
-            return -result;
-        info->sigsuspend.mask_arg = (reg_t)set;
-        info->sigsuspend.next_pc = dcontext->asynch_target;
-        info->sigsuspend.syscall_pc =
-            get_prior_syscall_pc(dcontext, dcontext->asynch_target);
-        d_r_mutex_lock(&info->sigblocked_lock);
-        info->app_sigblocked_save = info->app_sigblocked;
-        clear_blocked(dcontext, info);
-        for (int sig = 1; sig <= MAX_SIGNUM; sig++) {
-            if (EMULATE_SIGMASK(info, sig) && kernel_sigismember(&captured, sig)) {
-                ATOMIC_DEC(int, info->sighand->threads_unmasked[sig]);
-                kernel_sigaddset(&info->app_sigblocked, sig);
-            }
-        }
-        info->in_sigsuspend = true;
-        d_r_mutex_unlock(&info->sigblocked_lock);
-    }
-    /* Internal re-entry retains the original copy and original saved mask:
-     * neither a client continuation nor a second application thread can turn
-     * this one logical wait into a fresh read of the application's sigset.
-     */
-    set_syscall_param(dcontext, 0, (reg_t)&info->sigsuspend.kernel_mask);
-    set_syscall_param(dcontext, 1, sizeof(kernel_sigset_t));
-
-    /* Observe the dispatcher's eligibility rule without modifying a queue.
-     * Its pool backing stays mapped; an interrupting arrival can replace the
-     * head, in which case dispatch rechecks eligibility under its usual guard.
-     * We only set the pending flag, never clear an arrival's notification.
-     * A later arrival is covered by at_syscall/fcache-entry interruption. Do
-     * not add an accessing_sigpending window here: arrivals during that guard
-     * are dropped by the existing nested-signal policy.
-     */
-    for (int sig = 1; sig <= MAX_SIGNUM; sig++) {
-        sigpending_t *pending = info->sigpending[sig];
-        bool eligible = pending != NULL &&
-            (pending->unblocked_at_receipt ||
-             !kernel_sigismember(&info->app_sigblocked, sig));
-        __asm__ __volatile__("" : : : "memory");
-        if (eligible || pending != info->sigpending[sig]) {
-            dcontext->signals_pending = 1;
-            break;
-        }
-    }
-    return 0;
-}
-#else
 void
 handle_sigsuspend(dcontext_t *dcontext, kernel_sigset_t *set, size_t sigsetsize)
 {
@@ -2887,32 +2754,12 @@ handle_sigsuspend(dcontext_t *dcontext, kernel_sigset_t *set, size_t sigsetsize)
     d_r_mutex_unlock(&info->sigblocked_lock);
     DOLOG(4, LOG_ASYNCH, dump_unmasked(dcontext, __FUNCTION__););
 }
-#endif
 
 static void
 terminate_sigsuspend(dcontext_t *dcontext, thread_sig_info_t *info,
                      kernel_ucontext_t *ucxt)
 {
     ASSERT(info->in_sigsuspend);
-#ifdef LINUX
-    if (ucxt != NULL) {
-        /* Linux runs the caught handler under the temporary mask (plus its
-         * action/automatic mask). Only sigreturn restores the original mask.
-         * Restoring app_sigblocked here would admit a temporary-blocked signal
-         * while the handler is running.
-         */
-        /* The caller passes the captured full return mask explicitly to frame
-         * copying. Do not replace this with app_sigblocked: that is still the
-         * handler's temporary mask, not the mask for its eventual sigreturn.
-         */
-        info->in_sigsuspend = false;
-        if (info->injected_sigsuspend.phase == INJECTED_SUSPEND_ADMITTING) {
-            info->injected_sigsuspend.phase = INJECTED_SUSPEND_NONE;
-            info->injected_sigsuspend.token = 0;
-        }
-        return;
-    }
-#endif
     /* Sigsuspend ends when a signal is received, so restore the
      * old blocked set.
      */
@@ -2925,27 +2772,12 @@ terminate_sigsuspend(dcontext_t *dcontext, thread_sig_info_t *info,
         }
     }
     info->in_sigsuspend = false;
-#ifdef LINUX
-    if (info->injected_sigsuspend.phase == INJECTED_SUSPEND_ADMITTING) {
-        info->injected_sigsuspend.phase = INJECTED_SUSPEND_NONE;
-        info->injected_sigsuspend.token = 0;
-    }
-    kernel_sigset_t physical;
-    sigprocmask_syscall(SIG_SETMASK, NULL, &physical, sizeof(physical));
-    merge_nonemulated_sigmask(info, &physical, &info->sigsuspend.return_mask);
-    sigprocmask_syscall(SIG_SETMASK, &physical, NULL, sizeof(physical));
-#endif
-    /* A genuine syscall error or explicit client redirect can also end the
-     * suspend without constructing a delivered signal frame.
-     */
-    if (ucxt != NULL) {
-        /* Update the set to restore to post-signal-delivery. */
+    /* Update the set to restore to post-signal-delivery. */
 #ifdef MACOS
-        ucxt->uc_sigmask = *(__darwin_sigset_t *)&info->app_sigblocked;
+    ucxt->uc_sigmask = *(__darwin_sigset_t *)&info->app_sigblocked;
 #else
-        ucxt->uc_sigmask = info->app_sigblocked;
+    ucxt->uc_sigmask = info->app_sigblocked;
 #endif
-    }
     DOLOG(3, LOG_ASYNCH, {
         LOG(THREAD, LOG_ASYNCH, 3, "after sigsuspend, blocked signals are now:\n");
         dump_sigset(dcontext, &info->app_sigblocked);
@@ -2953,324 +2785,6 @@ terminate_sigsuspend(dcontext_t *dcontext, thread_sig_info_t *info,
     d_r_mutex_unlock(&info->sigblocked_lock);
     DOLOG(4, LOG_ASYNCH, dump_unmasked(dcontext, __FUNCTION__););
 }
-
-#ifdef LINUX
-/* Linux's private restart result. It is consumed by the owned interruption,
- * never exposed as an application syscall result. */
-enum { INJECTED_ERESTARTNOHAND = 514 };
-
-static bool
-unsupported_injected_restart(reg_t result)
-{
-    return (ptr_int_t)result == -512 || (ptr_int_t)result == -513 ||
-        (ptr_int_t)result == -516;
-}
-
-bool
-signal_injection_permitted(dcontext_t *dcontext, int sysnum)
-{
-    thread_sig_info_t *info = (thread_sig_info_t *)dcontext->signal_field;
-    if (info->injected_sigsuspend.phase == INJECTED_SUSPEND_NONE &&
-        info->active_admission == NULL)
-        return true;
-    switch (sysnum) {
-    case SYS_rt_sigsuspend:
-    case SYS_ppoll:
-    case SYS_pselect6:
-    case SYS_epoll_pwait:
-#ifdef SYS_epoll_pwait2
-    case SYS_epoll_pwait2:
-#endif
-    case SYS_rt_sigtimedwait:
-        /* This API has one signal-wait owner, not a stack of nested waits. */
-        return false;
-    default: break;
-    }
-    if (info->injected_sigsuspend.phase != INJECTED_SUSPEND_NONE) {
-        switch (sysnum) {
-        case SYS_clone:
-#ifdef SYS_clone3
-        case SYS_clone3:
-#endif
-#ifdef SYS_fork
-        case SYS_fork:
-#endif
-#ifdef SYS_vfork
-        case SYS_vfork:
-#endif
-        case SYS_execve:
-#ifdef SYS_execveat
-        case SYS_execveat:
-#endif
-            /* Duplicating/replacing a still-owned callback is not an outcome
-             * of the returning-wait contract. Terminal exit remains allowed. */
-            return false;
-        default: break;
-        }
-    }
-    return true;
-}
-
-bool
-signal_begin_injected_sigsuspend(dcontext_t *dcontext)
-{
-    thread_sig_info_t *info = (thread_sig_info_t *)dcontext->signal_field;
-    injected_sigsuspend_t *wait = &info->injected_sigsuspend;
-    if (wait->phase != INJECTED_SUSPEND_NONE || info->in_sigsuspend ||
-        info->active_admission != NULL)
-        return false;
-    memset(wait, 0, sizeof(*wait));
-    wait->original_sysnum = MCXT_SYSNUM_REG(get_mcontext(dcontext));
-    /* record_pending_signal must not transfer out of the live client callback,
-     * even if a surrounding synchronization state happens to be NO_LOCKS. */
-    wait->phase = INJECTED_SUSPEND_RUNNING;
-    return true;
-}
-
-reg_t
-signal_wait_injected_sigsuspend(dcontext_t *dcontext)
-{
-    thread_sig_info_t *info = (thread_sig_info_t *)dcontext->signal_field;
-    injected_sigsuspend_t *wait = &info->injected_sigsuspend;
-    ASSERT(wait->phase == INJECTED_SUSPEND_RUNNING && info->in_sigsuspend);
-    kernel_sigset_t blocked, physical;
-    kernel_sigfillset(&blocked);
-    /* Capture/validate the guest mask in prehandling, before blocking crash
-     * signals. No guest reads or Tool calls occur in this short interval. */
-    int error = sigprocmask_syscall(SIG_SETMASK, &blocked, &physical, sizeof(blocked));
-    if (error != 0)
-        return error;
-    reg_t result = -EINTR;
-    for (;;) {
-        /* Physical blocking closes check -> kernel-entry. A later signal stays
-         * kernel-pending until rt_sigsuspend atomically installs kernel_mask.
-         * Its return restores this blocked mask before the next queue check.
-         * Never hold accessing_sigpending across that wait. */
-        info->accessing_sigpending = true;
-        __asm__ __volatile__("" : : : "memory");
-        for (int sig = 1; sig <= MAX_SIGNUM; ++sig) {
-            sigpending_t *pending = info->sigpending[sig];
-            if (pending != NULL &&
-                (pending->unblocked_at_receipt ||
-                 !kernel_sigismember(&info->app_sigblocked, sig))) {
-                info->sigpending[sig] = pending->next;
-                pending->next = NULL;
-                wait->held = pending;
-                wait->signal = sig;
-                break;
-            }
-        }
-        __asm__ __volatile__("" : : : "memory");
-        info->accessing_sigpending = false;
-        if (wait->held != NULL)
-            break;
-        result = dynamorio_syscall(SYS_rt_sigsuspend, 2,
-                                   &info->sigsuspend.kernel_mask,
-                                   sizeof(kernel_sigset_t));
-        if ((ptr_int_t)result != -EINTR)
-            break;
-        /* An internal or discarded signal with no eligible application record
-         * has not completed the logical wait. This retry is still inside the
-         * original returning injection and its shared blocked registration. */
-    }
-    error = sigprocmask_syscall(SIG_SETMASK, &physical, NULL, sizeof(physical));
-    if (error != 0) {
-        /* A valid private kernel mask cannot fail. Continuing with the short
-         * exclusion mask installed would silently change application behavior. */
-        CLIENT_ASSERT(false, "returning injection could not restore physical mask");
-        os_terminate(dcontext, TERMINATE_PROCESS);
-    }
-    return result;
-}
-
-void
-signal_finish_injected_sigsuspend(dcontext_t *dcontext,
-                                  dr_syscall_invoke_result_t *result)
-{
-    thread_sig_info_t *info = (thread_sig_info_t *)dcontext->signal_field;
-    injected_sigsuspend_t *wait = &info->injected_sigsuspend;
-    ASSERT(wait->phase == INJECTED_SUSPEND_RUNNING);
-    if ((ptr_int_t)result->value != -EINTR || !info->in_sigsuspend) {
-        ASSERT(wait->held == NULL);
-        wait->phase = INJECTED_SUSPEND_NONE;
-        return;
-    }
-    wait->suspend = info->sigsuspend;
-    wait->saved_mask = info->app_sigblocked_save;
-    wait->token = (uint64)atomic_add_exchange_int64(&signal_admission_sequence, 1);
-    wait->phase = INJECTED_SUSPEND_HELD;
-    /* Post-hook injections may run, but cannot consume this wait's captured
-     * state. Keep its temporary application/physical mask in force. */
-    info->in_sigsuspend = false;
-    result->interruption = wait->token;
-    result->value = (reg_t)-(ptr_int_t)INJECTED_ERESTARTNOHAND;
-}
-
-DR_API
-bool
-dr_complete_syscall_interruption(void *drcontext, uint64 token, reg_t result)
-{
-    dcontext_t *dcontext = (dcontext_t *)drcontext;
-    if (dcontext == NULL || dcontext == GLOBAL_DCONTEXT ||
-        dcontext != get_thread_private_dcontext() ||
-        !dcontext->client_data->in_pre_syscall)
-        return false;
-    thread_sig_info_t *info = (thread_sig_info_t *)dcontext->signal_field;
-    injected_sigsuspend_t *wait = &info->injected_sigsuspend;
-    if (token == 0 || token != wait->token ||
-        wait->phase != INJECTED_SUSPEND_HELD || info->in_sigsuspend ||
-        info->active_admission != NULL)
-        return false;
-    /* This API implements ERESTARTNOHAND, not arbitrary substitution of another
-     * Linux restart protocol. Ordinary final Tool results remain unchanged. */
-    if (unsupported_injected_restart(result))
-        return false;
-    wait->final_result = result;
-    wait->phase = INJECTED_SUSPEND_READY;
-    dcontext->signals_pending = 1;
-    return true;
-}
-
-DR_API
-bool
-dr_cancel_syscall_interruption(void *drcontext, uint64 token)
-{
-    dcontext_t *dcontext = (dcontext_t *)drcontext;
-    if (dcontext == NULL || dcontext == GLOBAL_DCONTEXT ||
-        dcontext != get_thread_private_dcontext())
-        return false;
-    thread_sig_info_t *info = (thread_sig_info_t *)dcontext->signal_field;
-    injected_sigsuspend_t *wait = &info->injected_sigsuspend;
-    if (token == 0 || token != wait->token ||
-        wait->phase != INJECTED_SUSPEND_HELD || info->in_sigsuspend ||
-        info->active_admission != NULL)
-        return false;
-    info->sigsuspend = wait->suspend;
-    info->app_sigblocked_save = wait->saved_mask;
-    info->in_sigsuspend = true;
-    terminate_sigsuspend(dcontext, info, NULL);
-    info->accessing_sigpending = true;
-    __asm__ __volatile__("" : : : "memory");
-    if (wait->held != NULL) {
-        special_heap_free(info->sigheap, wait->held);
-        info->num_pending--;
-    }
-    memset(wait, 0, sizeof(*wait));
-    __asm__ __volatile__("" : : : "memory");
-    info->accessing_sigpending = false;
-    return true;
-}
-
-static void
-activate_injected_sigsuspend(dcontext_t *dcontext, thread_sig_info_t *info)
-{
-    injected_sigsuspend_t *wait = &info->injected_sigsuspend;
-    if (wait->phase != INJECTED_SUSPEND_READY)
-        return;
-    ASSERT(!info->in_sigsuspend && info->active_admission == NULL);
-    /* Queue publication shares the normal pending-list exclusion. The held
-     * allocation has remained owned/countable throughout asynchronous work. */
-    info->accessing_sigpending = true;
-    __asm__ __volatile__("" : : : "memory");
-    if (wait->held != NULL) {
-        wait->held->next = info->sigpending[wait->signal];
-        info->sigpending[wait->signal] = wait->held;
-        wait->held = NULL;
-    }
-    info->sigsuspend = wait->suspend;
-    info->app_sigblocked_save = wait->saved_mask;
-    info->in_sigsuspend = true;
-    wait->phase = INJECTED_SUSPEND_ADMITTING;
-    /* Publish the completed outer callback's result once, before signal policy.
-     * In particular ERESTARTNOHAND remains visible to that policy, as at a
-     * ptrace signal-delivery stop. The current application arguments and PC
-     * already belong to dispatch, not to the injection's private stack. */
-    get_mcontext(dcontext)->MC_RETVAL_REG = wait->final_result;
-    __asm__ __volatile__("" : : : "memory");
-    info->accessing_sigpending = false;
-}
-
-void
-handle_post_sigsuspend(dcontext_t *dcontext)
-{
-    thread_sig_info_t *info = (thread_sig_info_t *)dcontext->signal_field;
-    ASSERT(info->in_sigsuspend);
-    set_syscall_param(dcontext, 0, info->sigsuspend.mask_arg);
-    if ((ptr_int_t)get_mcontext(dcontext)->IF_X86_ELSE(xax, IF_RISCV64_ELSE(a0, r0)) !=
-        -EINTR) {
-        terminate_sigsuspend(dcontext, info, NULL);
-        return;
-    }
-    /* A physical signal may already have been consumed by DR, or may be
-     * ignored/suppressed by a client. Dispatch must decide before any guest
-     * instruction can observe this provisional EINTR.
-     */
-    dcontext->signals_pending = 1;
-}
-
-static void
-prepare_sigsuspend_delivery(dcontext_t *dcontext, thread_sig_info_t *info)
-{
-    if (!info->in_sigsuspend)
-        return;
-    injected_sigsuspend_t *wait = &info->injected_sigsuspend;
-    if (wait->phase == INJECTED_SUSPEND_ADMITTING) {
-        /* Policy sees the interrupted result. Caught commit, not preparation,
-         * resolves ERESTARTNOHAND to EINTR. Do not overwrite policy register
-         * edits if dispatch examines another pending signal in this attempt. */
-        return;
-    }
-    /* Also covers another pending signal encountered at the retried syscall
-     * before its pre-handler. Caught sigsuspend is never SA_RESTART-restarted.
-     */
-    get_mcontext(dcontext)->IF_X86_ELSE(xax, IF_RISCV64_ELSE(a0, r0)) = -EINTR;
-    set_syscall_param(dcontext, 0, info->sigsuspend.mask_arg);
-    set_syscall_param(dcontext, 1, sizeof(kernel_sigset_t));
-    dcontext->next_tag = info->sigsuspend.next_pc;
-}
-
-static void
-retry_sigsuspend(dcontext_t *dcontext, thread_sig_info_t *info)
-{
-    if (!info->in_sigsuspend)
-        return;
-    if (info->injected_sigsuspend.phase == INJECTED_SUSPEND_ADMITTING) {
-        int original_sysnum = info->injected_sigsuspend.original_sysnum;
-        /* The old Tool future has already rejoined shared scheduling. A
-         * suppressed signal cannot resume blocking underneath that future.
-         * Linux no-handler restart restores the old mask and enters a fresh
-         * syscall; that real entry obtains fresh Tool/resource accounting. */
-        terminate_sigsuspend(dcontext, info, NULL);
-        info->injected_sigsuspend.phase = INJECTED_SUSPEND_NONE;
-        info->injected_sigsuspend.token = 0;
-        /* Signal policy may have changed result, arguments, or PC. Linux uses
-         * that selected context when resolving a no-handler restart; it does
-         * not reload a snapshot taken before the policy hook. */
-        if ((ptr_int_t)get_mcontext(dcontext)->MC_RETVAL_REG ==
-            -INJECTED_ERESTARTNOHAND) {
-            MCXT_SYSNUM_REG(get_mcontext(dcontext)) = original_sysnum;
-            /* Unlike dispatch's ordinary restart helper, Linux does not
-             * require policy-selected preceding bytes to decode as a syscall.
-             * Rewind by the ISA instruction length even after an explicit PC
-             * edit, retaining the selected arguments and wraparound behavior. */
-            uint syslen = syscall_instr_length(
-                dcontext->last_fragment == NULL
-                    ? DEFAULT_ISA_MODE : FRAG_ISA_MODE(dcontext->last_fragment->flags));
-            dcontext->next_tag = (app_pc)((ptr_uint_t)dcontext->next_tag - syslen);
-        }
-        return;
-    }
-    /* No caught handler consumed this logical wait. Do not restore the old
-     * mask, re-read application memory, or let the guest see EINTR. Re-enter
-     * the original syscall instruction with its original arguments, using the
-     * same instruction/ISA-aware continuation calculation as dispatch.
-     */
-    MCXT_SYSNUM_REG(get_mcontext(dcontext)) = SYS_rt_sigsuspend;
-    set_syscall_param(dcontext, 0, info->sigsuspend.mask_arg);
-    set_syscall_param(dcontext, 1, sizeof(kernel_sigset_t));
-    dcontext->next_tag = info->sigsuspend.syscall_pc;
-}
-#endif
 
 /**** utility routines ***********************************************/
 #ifdef DEBUG
@@ -4391,8 +3905,7 @@ memcpy_rt_frame(sigframe_rt_t *frame, byte *dst, bool from_pending)
  */
 static void
 copy_frame_to_stack(dcontext_t *dcontext, thread_sig_info_t *info, int sig,
-                    sigframe_rt_t *frame, byte *sp, bool from_pending,
-                    kernel_sigset_t *return_mask)
+                    sigframe_rt_t *frame, byte *sp, bool from_pending)
 {
     bool rtframe = IS_RT_FOR_APP(info, sig);
     uint frame_size = get_app_frame_size(info, sig);
@@ -4450,42 +3963,17 @@ copy_frame_to_stack(dcontext_t *dcontext, thread_sig_info_t *info, int sig,
         /* Just throw away this signal and deliver SIGSEGV instead with the
          * same sigcontext, like the kernel does.
          */
-        if (from_pending && info->active_admission != NULL &&
-            frame == &info->active_admission->rt_frame)
-            retire_signal_admission(info);
-        else
-            free_pending_signal(info, sig);
+        free_pending_signal(info, sig);
         os_forge_exception(0, UNREADABLE_MEMORY_EXECUTION_EXCEPTION);
         ASSERT_NOT_REACHED();
     }
 
-    kernel_sigset_t full_mask;
-    kernel_sigset_t *mask_to_restore;
+    kernel_sigset_t *mask_to_restore = NULL;
     if (info->pre_syscall_app_sigprocmask_valid) {
         mask_to_restore = &info->pre_syscall_app_sigprocmask;
         info->pre_syscall_app_sigprocmask_valid = false;
     } else {
         mask_to_restore = &info->app_sigblocked;
-    }
-    if (return_mask != NULL) {
-        /* A caught sigsuspend keeps the temporary mask for the handler while
-         * restoring its distinct, once-captured original mask on sigreturn.
-         */
-        mask_to_restore = return_mask;
-    } else {
-        full_mask = *mask_to_restore;
-#ifdef LINUX
-        kernel_sigset_t physical;
-        if (from_pending)
-            sigprocmask_syscall(SIG_SETMASK, NULL, &physical, sizeof(physical));
-        else
-            /* Current kernel mask here includes DR's signal-handler mask.
-             * The authentic interrupted frame carries the prior real subset.
-             */
-            physical = frame->uc.uc_sigmask;
-        merge_nonemulated_sigmask(info, &full_mask, &physical);
-#endif
-        mask_to_restore = &full_mask;
     }
 
     /* if !has_restorer we do NOT add the restorer code to the exec list here,
@@ -5164,15 +4652,6 @@ adjust_syscall_for_restart(dcontext_t *dcontext, thread_sig_info_t *info, int si
          */
         return false;
     }
-#ifdef LINUX
-    /* The generated-code pre-entry interruption path can reach here without
-     * a kernel restart decision. Linux never restarts a caught sigsuspend,
-     * even with SA_RESTART. Suppression is handled by its logical-wait retry,
-     * not by changing the authentic caught-delivery frame to a restart frame.
-     */
-    if (info->in_sigsuspend && dcontext->sys_num == SYS_rt_sigsuspend)
-        return false;
-#endif
     /* Don't restart if the app's handler says not to */
     if (info->sighand->action[sig] != NULL &&
         !TEST(SA_RESTART, info->sighand->action[sig]->flags)) {
@@ -5664,18 +5143,7 @@ record_pending_signal(dcontext_t *dcontext, int sig, kernel_ucontext_t *ucxt,
          * back to d_r_dispatch and don't need to receive it now (which complicates
          * post-syscall handling)
          */
-    }
-#ifdef LINUX
-    else if (info->injected_sigsuspend.phase != INJECTED_SUSPEND_NONE &&
-             (forged || reroute || can_always_delay[sig] ||
-              is_sys_kill(dcontext, pc, (byte *)sc->SC_XSP, &frame->info))) {
-        /* A returning client injection still owns its language/runtime stack.
-         * In particular, NO_LOCKS_NO_XFER numerically satisfies NO_LOCKS and is
-         * not sufficient proof that entering application delivery is safe.
-         * Retain the authentic signal below for post-callback dispatch. */
-    }
-#endif
-    else if (thread_synch_check_state(dcontext, THREAD_SYNCH_NO_LOCKS) &&
+    } else if (thread_synch_check_state(dcontext, THREAD_SYNCH_NO_LOCKS) &&
                /* Avoid grabbing locks for xl8 while in a suspended state (i#3026). */
                ksynch_get_value(&ostd->suspended) == 0) {
         /* The signal interrupted DR or the client but it's at a safe spot so
@@ -6777,20 +6245,11 @@ execute_handler_from_cache(dcontext_t *dcontext, int sig, sigframe_rt_t *our_fra
 
     LOG(THREAD, LOG_ASYNCH, 3, "\txsp is " PFX "\n", xsp);
 
-    kernel_sigset_t *return_mask = NULL;
-#ifdef LINUX
-    kernel_sigset_t suspend_return_mask;
-    if (info->in_sigsuspend) {
-        suspend_return_mask = info->sigsuspend.return_mask;
-        return_mask = &suspend_return_mask;
-    }
-#endif
     if (info->in_sigsuspend)
         terminate_sigsuspend(dcontext, info, uc);
 
     /* copy frame to appropriate stack and convert to non-rt if necessary */
-    copy_frame_to_stack(dcontext, info, sig, our_frame, (void *)xsp,
-                        false /*!pending*/, return_mask);
+    copy_frame_to_stack(dcontext, info, sig, our_frame, (void *)xsp, false /*!pending*/);
     LOG(THREAD, LOG_ASYNCH, 3, "\tcopied frame from " PFX " to " PFX "\n", our_frame,
         xsp);
     sigcontext_t *app_sc = get_sigcontext_from_app_frame(info, sig, (void *)xsp);
@@ -6817,15 +6276,6 @@ execute_handler_from_cache(dcontext_t *dcontext, int sig, sigframe_rt_t *our_fra
     if ((info->sighand->action[sig]->flags & SA_NOMASK) == 0)
         kernel_sigaddset(&blocked, sig);
     set_blocked(dcontext, &blocked, false /*relative: OR these in*/);
-#ifdef LINUX
-    /* This path resumes through the original kernel signal frame. Updating
-     * only the current real mask would be undone by that sigreturn.
-     */
-    for (int i = 1; i <= MAX_SIGNUM; i++) {
-        if (!EMULATE_SIGMASK(info, i) && kernel_sigismember(&blocked, i))
-            kernel_sigaddset(&uc->uc_sigmask, i);
-    }
-#endif
 
     /* Doesn't matter what most app registers are, signal handler doesn't
      * expect anything except the frame on the stack.  We do need to set xsp,
@@ -6888,13 +6338,19 @@ execute_handler_from_cache(dcontext_t *dcontext, int sig, sigframe_rt_t *our_fra
     return true;
 }
 
-static void
-prepare_pending_signal(dcontext_t *dcontext, int sig, sigpending_t *pending)
+static bool
+execute_handler_from_dispatch(dcontext_t *dcontext, int sig)
 {
-    sigframe_rt_t *frame = &(pending->rt_frame);
+    thread_sig_info_t *info = (thread_sig_info_t *)dcontext->signal_field;
+    byte *xsp = get_sigstack_frame_ptr(dcontext, info, sig, NULL);
+    sigframe_rt_t *frame = &(info->sigpending[sig]->rt_frame);
     priv_mcontext_t *mcontext = get_mcontext(dcontext);
     sigcontext_t *sc;
     kernel_ucontext_t *uc;
+    kernel_sigset_t blocked;
+
+    dr_signal_action_t action;
+
     LOG(THREAD, LOG_ASYNCH, 2, "execute_handler_from_dispatch for signal %d\n", sig);
     RSTATS_INC(num_signals);
 
@@ -6917,7 +6373,7 @@ prepare_pending_signal(dcontext_t *dcontext, int sig, sigpending_t *pending)
         dump_sigcontext(dcontext, sc);
     }
 #endif
-    if (pending->use_sigcontext) {
+    if (info->sigpending[sig]->use_sigcontext) {
         LOG(THREAD, LOG_ASYNCH, 2,
             "%s: using sigcontext, not mcontext (syscall restart)\n", __FUNCTION__);
     } else {
@@ -6965,7 +6421,7 @@ prepare_pending_signal(dcontext_t *dcontext, int sig, sigpending_t *pending)
      * receive in pre_system_call or something? what if ignorable?  XXX!
      */
 
-    if (!pending->use_sigcontext) {
+    if (!info->sigpending[sig]->use_sigcontext) {
         /* for the pc we want the app pc not the cache pc */
         sc->SC_XIP = (ptr_uint_t)dcontext->next_tag;
         /* Point at the rseq abort handler if in an rseq region. */
@@ -6979,59 +6435,18 @@ prepare_pending_signal(dcontext_t *dcontext, int sig, sigpending_t *pending)
         }
         LOG(THREAD, LOG_ASYNCH, 3, "\tset frame's eip to " PFX "\n", sc->SC_XIP);
     }
-}
 
-static bool
-commit_pending_signal(dcontext_t *dcontext, int sig, sigpending_t *pending,
-                      dr_signal_action_t action, const sigcontext_t *interrupted)
-{
-    thread_sig_info_t *info = (thread_sig_info_t *)dcontext->signal_field;
-    byte *xsp = get_sigstack_frame_ptr(dcontext, info, sig, NULL);
-    sigframe_rt_t *frame = &pending->rt_frame;
-    priv_mcontext_t *mcontext = get_mcontext(dcontext);
-    kernel_ucontext_t *uc = get_ucontext_from_rt_frame(frame);
-    sigcontext_t *sc = SIGCXT_FROM_UCXT(uc);
-    kernel_sigset_t blocked;
-#ifdef LINUX
-    if (info->injected_sigsuspend.phase == INJECTED_SUSPEND_ADMITTING &&
-        unsupported_injected_restart(action == DR_SIGNAL_SUPPRESS
-                                          ? mcontext->MC_RETVAL_REG
-                                          : sc->SC_RETURN_REG)) {
-        /* A legacy policy may edit the frame without using the owned API's
-         * typed refusal. Do not release an unimplemented private restart
-         * protocol into the application. */
-        CLIENT_ASSERT(false, "unsupported signal-policy restart protocol");
-        os_terminate(dcontext, TERMINATE_PROCESS);
-    }
-#endif
+    sigcontext_t sc_interrupted = *sc;
+    action = send_signal_to_client(dcontext, sig, frame, NULL,
+                                   info->sigpending[sig]->access_address,
+                                   false /*not blocked*/, NULL);
     /* in order to pass to the client, we come all the way here for signals
      * the app has no handler for
      */
     if (action == DR_SIGNAL_REDIRECT) {
-        ASSERT(interrupted != NULL);
-        sigcontext_t sc_interrupted = *interrupted;
-#ifdef LINUX
-        /* An explicit client redirect replaces the application continuation;
-         * unlike suppression it abandons this wait. Preserve the chosen PC
-         * while restoring the suspend's original mask.
-         */
-        if (info->in_sigsuspend &&
-            info->injected_sigsuspend.phase != INJECTED_SUSPEND_ADMITTING)
-            terminate_sigsuspend(dcontext, info, NULL);
-#endif
         /* send_signal_to_client copied mcontext into frame's sc */
         priv_mcontext_t *mcontext = get_mcontext(dcontext);
         ucontext_to_mcontext(mcontext, uc);
-        dcontext->next_tag = canonicalize_pc_target(dcontext, mcontext->pc);
-#ifdef LINUX
-        /* An interrupted returning injection must consume its restart result
-         * even when policy explicitly redirects. Preserve the selected context
-         * and resolve it by the same no-handler rule as suppression. */
-        if (info->injected_sigsuspend.phase == INJECTED_SUSPEND_ADMITTING) {
-            retry_sigsuspend(dcontext, info);
-            mcontext->pc = dcontext->next_tag;
-        }
-#endif
         if (is_building_trace(dcontext)) {
             LOG(THREAD, LOG_ASYNCH, 3, "\tsquashing trace-in-progress\n");
             trace_abort(dcontext);
@@ -7058,7 +6473,7 @@ commit_pending_signal(dcontext_t *dcontext, int sig, sigpending_t *pending,
         LOG(THREAD, LOG_ASYNCH, 2, "%s: executing default action\n",
             (action == DR_SIGNAL_BYPASS) ? "client forcing default"
                                          : "app signal handler is SIG_DFL");
-        if (pending->use_sigcontext) {
+        if (info->sigpending[sig]->use_sigcontext) {
             /* after the default action we want to go to the sigcontext */
             dcontext->next_tag = canonicalize_pc_target(dcontext, (app_pc)sc->SC_XIP);
             ucontext_to_mcontext(get_mcontext(dcontext), uc);
@@ -7069,28 +6484,6 @@ commit_pending_signal(dcontext_t *dcontext, int sig, sigpending_t *pending,
     }
     CLIENT_ASSERT(action == DR_SIGNAL_DELIVER, "invalid signal event return value");
 
-    kernel_sigset_t *return_mask = NULL;
-#ifdef LINUX
-    if (info->injected_sigsuspend.phase == INJECTED_SUSPEND_ADMITTING) {
-        if ((ptr_int_t)sc->SC_RETURN_REG == -INJECTED_ERESTARTNOHAND) {
-            /* Only a caught disposition resolves ERESTARTNOHAND to EINTR. The
-             * selected frame includes explicit signal-policy register writes;
-             * neither SA_RESTART nor the old snapshot overrides them. */
-            sc->SC_RETURN_REG = -EINTR;
-        }
-#    ifdef X86_64
-        /* Linux x64_setup_rt_frame saves the selected return context first,
-         * then clears live handler AX for the handler prototype convention.
-         * The saved result above must not be confused with live entry AX. */
-        mcontext->xax = 0;
-#    endif
-    }
-    kernel_sigset_t suspend_return_mask;
-    if (info->in_sigsuspend) {
-        suspend_return_mask = info->sigsuspend.return_mask;
-        return_mask = &suspend_return_mask;
-    }
-#endif
     if (info->in_sigsuspend)
         terminate_sigsuspend(dcontext, info, uc);
 
@@ -7098,7 +6491,7 @@ commit_pending_signal(dcontext_t *dcontext, int sig, sigpending_t *pending,
      * chance to make changes, copy the frame to the appropriate stack
      * location and convert to non-rt if necessary
      */
-    copy_frame_to_stack(dcontext, info, sig, frame, xsp, true /*pending*/, return_mask);
+    copy_frame_to_stack(dcontext, info, sig, frame, xsp, true /*pending*/);
     /* now point at the app's frame */
     sc = get_sigcontext_from_app_frame(info, sig, (void *)xsp);
 
@@ -7110,15 +6503,6 @@ commit_pending_signal(dcontext_t *dcontext, int sig, sigpending_t *pending,
     if ((info->sighand->action[sig]->flags & SA_NOMASK) == 0)
         kernel_sigaddset(&blocked, sig);
     set_blocked(dcontext, &blocked, false /*relative: OR these in*/);
-#ifdef LINUX
-    kernel_sigset_t physical_blocked;
-    kernel_sigemptyset(&physical_blocked);
-    for (int i = 1; i <= MAX_SIGNUM; i++) {
-        if (!EMULATE_SIGMASK(info, i) && kernel_sigismember(&blocked, i))
-            kernel_sigaddset(&physical_blocked, i);
-    }
-    sigprocmask_syscall(SIG_BLOCK, &physical_blocked, NULL, sizeof(physical_blocked));
-#endif
 
     /* if we were building a trace, kill it */
     if (is_building_trace(dcontext)) {
@@ -7212,121 +6596,6 @@ commit_pending_signal(dcontext_t *dcontext, int sig, sigpending_t *pending,
 
     LOG(THREAD, LOG_ASYNCH, 3, "\tset xsp to " PFX "\n", xsp);
     return true;
-}
-
-static bool
-execute_handler_from_dispatch(dcontext_t *dcontext, int sig)
-{
-    thread_sig_info_t *info = (thread_sig_info_t *)dcontext->signal_field;
-    sigpending_t *pending = info->sigpending[sig];
-    prepare_pending_signal(dcontext, sig, pending);
-    sigcontext_t interrupted = *get_sigcontext_from_rt_frame(&pending->rt_frame);
-    dr_signal_action_t action = send_signal_to_client(
-        dcontext, sig, &pending->rt_frame, NULL, pending->access_address, false, NULL);
-    return commit_pending_signal(dcontext, sig, pending, action, &interrupted);
-}
-
-DR_API
-bool
-dr_signal_admission_resume(void *drcontext, uint64 token, int delivery_signal,
-                           const byte *replacement, const dr_mcontext_t *registers)
-{
-#if defined(LINUX) && defined(X86_64)
-    dcontext_t *dcontext = (dcontext_t *)drcontext;
-    if (dcontext == NULL || dcontext != get_thread_private_dcontext())
-        return false;
-    thread_sig_info_t *info = (thread_sig_info_t *)dcontext->signal_field;
-    if (info == NULL || info->accessing_sigpending ||
-        info->active_admission == NULL || token == 0 ||
-        token != info->admission_token || info->admission_return != NULL ||
-        (delivery_signal != 0 && delivery_signal != info->admission_signal) ||
-        (registers != NULL &&
-         (registers->size != sizeof(*registers) || registers->flags != DR_MC_ALL)))
-        return false;
-    sigpending_t *pending = info->active_admission;
-    int sig = info->admission_signal;
-    if (info->injected_sigsuspend.phase == INJECTED_SUSPEND_ADMITTING &&
-        unsupported_injected_restart(
-            registers != NULL ? registers->xax
-                : delivery_signal == 0 ? pending->admission_ordinary.MC_RETVAL_REG
-                                       : get_sigcontext_from_rt_frame(&pending->rt_frame)
-                                             ->SC_RETURN_REG)) {
-        /* Refuse before changing masks, contexts, or token ownership. The
-         * caller may report the unsupported policy outcome or select another
-         * representable result; it cannot accidentally resume with it. */
-        return false;
-    }
-    if (replacement != NULL) {
-        kernel_siginfo_t selected;
-        memcpy(&selected, replacement, sizeof(selected));
-        if (selected.si_signo != sig)
-            return false;
-        if (delivery_signal == sig)
-            pending->rt_frame.info = selected;
-    }
-    /* The native commit has the same short pending-heap exclusion as ordinary
-     * delivery, including its unwritable-stack failure path. No Tool code or
-     * suspended Rust ownership remains here. */
-    info->accessing_sigpending = true;
-    __asm__ __volatile__("" : : : "memory");
-    /* R1: ordinary interruption and restart-adjusted delivery are different
-     * continuations. Only an explicit Tool register write updates both. */
-    *get_mcontext(dcontext) = pending->admission_ordinary;
-    dcontext->next_tag = pending->admission_ordinary.pc;
-    if (registers != NULL) {
-        dr_mcontext_t selected_registers = *registers;
-        if (!dr_mcontext_to_priv_mcontext(get_mcontext(dcontext), &selected_registers)) {
-            __asm__ __volatile__("" : : : "memory");
-            info->accessing_sigpending = false;
-            return false;
-        }
-        mcontext_to_ucontext(&pending->rt_frame.uc, get_mcontext(dcontext));
-        dcontext->next_tag = registers->pc;
-    }
-    info->pre_syscall_app_sigprocmask = info->admission_pre_mask;
-    info->pre_syscall_app_sigprocmask_valid = info->admission_pre_mask_valid;
-    info->in_sigsuspend = info->admission_in_sigsuspend;
-    info->sigsuspend = pending->admission_sigsuspend;
-    info->app_sigblocked_save = info->admission_sigsuspend_mask;
-    commit_pending_signal(dcontext, sig, pending,
-                          delivery_signal == 0 ? DR_SIGNAL_SUPPRESS : DR_SIGNAL_DELIVER,
-                          NULL);
-    retry_sigsuspend(dcontext, info);
-
-    /* The full authentic XSTATE, including x87 and components not represented
-     * in dr_mcontext_t, must survive the private Rust continuation. A generic
-     * dr_redirect_execution cannot restore it. Use the existing kernel
-     * rt_sigreturn -> fcache_return mechanism instead, without another delivery
-     * notification. This private frame never appears on the application stack.
-     */
-    sigframe_rt_t return_frame = pending->rt_frame;
-    get_mcontext(dcontext)->pc = dcontext->next_tag;
-    mcontext_to_ucontext(&return_frame.uc, get_mcontext(dcontext));
-    return_frame.uc.uc_stack = info->sigstack;
-    sigprocmask_syscall(SIG_SETMASK, NULL, SIGMASK_FROM_UCXT(&return_frame.uc),
-                        sizeof(kernel_sigset_t));
-    transfer_from_sig_handler_to_fcache_return(
-        dcontext, &return_frame.uc, NULL, sig, dcontext->next_tag,
-        (linkstub_t *)get_asynch_linkstub(), false /* already committed/not delivery */);
-    info->admission_return = pending;
-    info->active_admission = NULL;
-    info->admission_token = 0;
-    dcontext->signals_pending = -1;
-    __asm__ __volatile__("" : : : "memory");
-    info->accessing_sigpending = false;
-    if (is_building_trace(dcontext))
-        trace_abort(dcontext);
-    dcontext->whereami = DR_WHERE_FCACHE;
-    byte *return_stack = (byte *)&return_frame + sizeof(char *);
-    /* As in thread_set_self_context: jump, not call, after skipping pretcode.
-     * The detached backing is freed at the next dispatcher entry, after the
-     * kernel consumes it. Async arrivals still append to the ordinary queues. */
-    void (*return_target)(void) = dynamorio_sigreturn;
-    asm volatile("mov %0, %%rax\n\tmov %1, %%rcx\n\tmov %%rax, %%rsp\n\tjmp *%%rcx"
-                 : : "r"(return_stack), "r"(return_target) : "rax", "rcx", "memory");
-    ASSERT_NOT_REACHED();
-#endif
-    return false;
 }
 
 /* Sends a signal to a currently-native thread.
@@ -7587,7 +6856,7 @@ execute_native_handler(dcontext_t *dcontext, int sig, sigframe_rt_t *our_frame,
     /* We cannot reuse the current signal frame, therefore we create a copy. */
     byte *new_xsp = get_sigstack_frame_ptr(dcontext, info, sig, our_frame);
     copy_frame_to_stack(dcontext, info, sig, our_frame, (void *)new_xsp,
-                        false /*!pending*/, NULL);
+                        false /*!pending*/);
     DOLOG(2, LOG_ASYNCH, {
         LOG(THREAD, LOG_ASYNCH, 3, "Pre-signal blocked signals, stored in our frame:\n");
         dump_sigset(dcontext, (kernel_sigset_t *)&our_frame->uc.uc_sigmask);
@@ -8046,35 +7315,10 @@ receive_pending_signal(dcontext_t *dcontext)
     thread_sig_info_t *info = (thread_sig_info_t *)dcontext->signal_field;
     sigpending_t *temp;
     int sig;
-    dr_signal_admission_status_t admission;
     LOG(THREAD, LOG_ASYNCH, 3, "receive_pending_signal\n");
-#ifdef LINUX
-    if (info->injected_sigsuspend.phase == INJECTED_SUSPEND_RUNNING ||
-        info->injected_sigsuspend.phase == INJECTED_SUSPEND_HELD) {
-        /* A returning client must consume the typed outcome before leaving its
-         * syscall event. A numeric restart value alone is never a guest result. */
-        CLIENT_ASSERT(false, "uncompleted returning syscall interruption");
-        os_terminate(dcontext, TERMINATE_PROCESS);
-    }
-#endif
-    if (info->active_admission != NULL) {
-        dcontext->signals_pending = -1;
-        return;
-    }
-    admission = instrument_signal_admission(dcontext, NULL, NULL);
-    if (admission == DR_SIGNAL_ADMISSION_WAIT) {
-        /* The client must finish its old owned continuation, not execute an
-         * application instruction merely to manufacture a safe point. */
-        dcontext->signals_pending = -1;
-        return;
-    }
     if (info->interrupted != NULL) {
         relink_interrupted_fragment(dcontext, info);
     }
-#ifdef LINUX
-    activate_injected_sigsuspend(dcontext, info);
-    prepare_sigsuspend_delivery(dcontext, info);
-#endif
     /* grab first pending signal
      * XXX: start with real-time ones?
      */
@@ -8084,14 +7328,6 @@ receive_pending_signal(dcontext_t *dcontext)
     info->accessing_sigpending = true;
     /* barrier to prevent compiler from moving the above write below the loop */
     __asm__ __volatile__("" : : : "memory");
-    /* The kernel has consumed the private return frame before this dispatcher
-     * entry. Retirement uses the same exclusion as pending queue allocations:
-     * sigheap's free list is deliberately nonlocking. */
-    if (info->admission_return != NULL) {
-        special_heap_free(info->sigheap, info->admission_return);
-        info->admission_return = NULL;
-        info->num_pending--;
-    }
     if (!info->multiple_pending_units &&
         info->num_pending + 2 >= DYNAMO_OPTION(max_pending_signals)) {
         /* We're close to the limit: proactively get a new unit while it's safe
@@ -8139,40 +7375,7 @@ receive_pending_signal(dcontext_t *dcontext)
              * allowed to remove the front entry from info->sigpending[sig] and
              * jump to d_r_dispatch.
              */
-            if (admission == DR_SIGNAL_ADMISSION_START) {
-                sigpending_t *pending = info->sigpending[sig];
-                prepare_pending_signal(dcontext, sig, pending);
-                sigcontext_t interrupted =
-                    *get_sigcontext_from_rt_frame(&pending->rt_frame);
-                dr_signal_action_t action = send_signal_to_client(
-                    dcontext, sig, &pending->rt_frame, NULL, pending->access_address,
-                    false, NULL);
-                if (action == DR_SIGNAL_DELIVER) {
-                    /* Detach once, keeping the allocation counted and owned by
-                     * this thread. Nothing in the async client sees its pointer. */
-                    info->sigpending[sig] = pending->next;
-                    pending->next = NULL;
-                    info->active_admission = pending;
-                    info->admission_signal = sig;
-                    info->admission_token =
-                        (uint64)atomic_add_exchange_int64(&signal_admission_sequence, 1);
-                    pending->admission_ordinary = *get_mcontext(dcontext);
-                    pending->admission_ordinary.pc = dcontext->next_tag;
-                    info->admission_pre_mask_valid =
-                        info->pre_syscall_app_sigprocmask_valid;
-                    info->admission_pre_mask = info->pre_syscall_app_sigprocmask;
-                    info->admission_in_sigsuspend = info->in_sigsuspend;
-#ifdef LINUX
-                    pending->admission_sigsuspend = info->sigsuspend;
-#endif
-                    info->admission_sigsuspend_mask = info->app_sigblocked_save;
-                    break;
-                }
-                executing =
-                    commit_pending_signal(dcontext, sig, pending, action, &interrupted);
-            } else {
-                executing = execute_handler_from_dispatch(dcontext, sig);
-            }
+            executing = execute_handler_from_dispatch(dcontext, sig);
             temp = info->sigpending[sig];
             info->sigpending[sig] = temp->next;
             special_heap_free(info->sigheap, temp);
@@ -8201,39 +7404,6 @@ receive_pending_signal(dcontext_t *dcontext)
     if (sig > MAX_SIGNUM) {
         LOG(THREAD, LOG_ASYNCH, 3, "\tclearing signals_pending flag\n");
         dcontext->signals_pending = 0;
-    }
-#ifdef LINUX
-    if (info->active_admission == NULL)
-        retry_sigsuspend(dcontext, info);
-#endif
-    if (info->active_admission != NULL) {
-        dr_mcontext_t delivery, redirect;
-        dr_signal_admission_t event;
-        dr_mcontext_init(&delivery);
-        dr_mcontext_init(&redirect);
-        ucontext_to_mcontext(dr_mcontext_as_priv_mcontext(&delivery),
-                             &info->active_admission->rt_frame.uc);
-        *dr_mcontext_as_priv_mcontext(&redirect) =
-            info->active_admission->admission_ordinary;
-        event.token = info->admission_token;
-        event.sig = info->admission_signal;
-        ASSERT(sizeof(event.siginfo) == sizeof(info->active_admission->rt_frame.info));
-        memcpy(event.siginfo, &info->active_admission->rt_frame.info,
-               sizeof(event.siginfo));
-        event.mcontext = &delivery;
-        /* Private stub/injected syscalls must not consume the interrupted
-         * application's restore-mask or sigsuspend bookkeeping. */
-        info->pre_syscall_app_sigprocmask_valid = false;
-        info->in_sigsuspend = false;
-        dr_signal_admission_status_t started =
-            instrument_signal_admission(dcontext, &event, &redirect);
-        if (started != DR_SIGNAL_ADMISSION_START) {
-            CLIENT_ASSERT(false, "signal admission owner lost its continuation");
-            os_terminate(dcontext, TERMINATE_PROCESS);
-        }
-        *get_mcontext(dcontext) = *dr_mcontext_as_priv_mcontext(&redirect);
-        dcontext->next_tag = canonicalize_pc_target(dcontext, redirect.pc);
-        dcontext->signals_pending = -1;
     }
 }
 
@@ -8345,12 +7515,6 @@ handle_sigreturn(dcontext_t *dcontext, void *ucxt_param, int style)
 
         /* Discard blocked signals, re-set from prev mask stored in frame. */
         set_blocked(dcontext, SIGMASK_FROM_UCXT(ucxt), true /*absolute*/);
-#ifdef LINUX
-        /* The application's frame owns its nonemulated return mask, including
-         * legitimate handler edits. Keep only DR's emulated physical subset.
-         */
-        merge_nonemulated_sigmask(info, &our_mask, SIGMASK_FROM_UCXT(ucxt));
-#endif
         /* Restore DR's so sigreturn syscall won't change it. */
         *SIGMASK_FROM_UCXT(ucxt) = our_mask;
     }
@@ -8387,7 +7551,6 @@ handle_sigreturn(dcontext_t *dcontext, void *ucxt_param, int style)
         ucxt = &frame->uc; /* we leave ucxt NULL for x86: not needed there */
 #    endif
         set_blocked(dcontext, &prevset, true /*absolute*/);
-        merge_nonemulated_sigmask(info, &our_mask, &prevset);
         /* Restore DR's so sigreturn syscall won't change it. */
         convert_rt_mask_to_nonrt(frame, &our_mask);
     }
@@ -9504,11 +8667,7 @@ sig_detach(dcontext_t *dcontext, sigframe_rt_t *frame, KSYNCH_TYPE *detached)
     /* Update the mask of the signal frame so that the later sigreturn will
      * restore the app signal mask.
      */
-    kernel_sigset_t return_mask = info->app_sigblocked;
-#ifdef LINUX
-    merge_nonemulated_sigmask(info, &return_mask, &frame->uc.uc_sigmask);
-#endif
-    memcpy(&frame->uc.uc_sigmask, &return_mask, sizeof(return_mask));
+    memcpy(&frame->uc.uc_sigmask, &info->app_sigblocked, sizeof(info->app_sigblocked));
 
     /* Copy the signal frame to the app stack.
      * XXX: We live with the transparency risk of storing the signal frame on
@@ -9516,8 +8675,7 @@ sig_detach(dcontext_t *dcontext, sigframe_rt_t *frame, KSYNCH_TYPE *detached)
      * and that we're not clobbering any app data beyond TOS.
      */
     xsp = get_sigstack_frame_ptr(dcontext, info, SUSPEND_SIGNAL, frame);
-    copy_frame_to_stack(dcontext, info, SUSPEND_SIGNAL, frame, xsp, false /*!pending*/,
-                        &return_mask);
+    copy_frame_to_stack(dcontext, info, SUSPEND_SIGNAL, frame, xsp, false /*!pending*/);
 
 #ifdef HAVE_SIGALTSTACK
     /* Make sure the frame's sigstack reflects the app stack.

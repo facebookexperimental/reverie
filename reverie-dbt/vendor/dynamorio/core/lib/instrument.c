@@ -263,7 +263,6 @@ static callback_list_t exception_callbacks = {
 static callback_list_t signal_callbacks = {
     0,
 };
-static callback_list_t signal_admission_callbacks = { 0 };
 #endif
 #ifdef PROGRAM_SHEPHERDING
 static callback_list_t security_violation_callbacks = {
@@ -879,7 +878,6 @@ free_all_callback_lists(void)
     free_callback_list(&exception_callbacks);
 #else
     free_callback_list(&signal_callbacks);
-    free_callback_list(&signal_admission_callbacks);
 #endif
     free_callback_list(&clean_call_insertion_callbacks);
 #ifdef PROGRAM_SHEPHERDING
@@ -1274,25 +1272,6 @@ dr_unregister_signal_event(dr_signal_action_t (*func)(void *drcontext,
                                                       dr_siginfo_t *siginfo))
 {
     return remove_callback(&signal_callbacks, (void (*)(void))func, true);
-}
-
-bool
-dr_register_signal_admission_event(dr_signal_admission_cb_t func)
-{
-#if defined(LINUX) && defined(X86_64)
-    if (func == NULL || signal_admission_callbacks.num != 0)
-        return false;
-    add_callback(&signal_admission_callbacks, (void (*)(void))func, true);
-    return true;
-#else
-    return false;
-#endif
-}
-
-bool
-dr_unregister_signal_admission_event(dr_signal_admission_cb_t func)
-{
-    return remove_callback(&signal_admission_callbacks, (void (*)(void))func, true);
 }
 #endif /* WINDOWS */
 
@@ -2233,16 +2212,6 @@ bool
 dr_signal_hook_exists(void)
 {
     return (signal_callbacks.num > 0);
-}
-
-dr_signal_admission_status_t
-instrument_signal_admission(dcontext_t *dcontext, const dr_signal_admission_t *event,
-                            dr_mcontext_t *redirect)
-{
-    dr_signal_admission_status_t result = DR_SIGNAL_ADMISSION_BYPASS;
-    call_all_ret(result, =, , signal_admission_callbacks, dr_signal_admission_cb_t,
-                 (void *)dcontext, event, redirect);
-    return result;
 }
 #endif /* WINDOWS */
 

@@ -161,9 +161,6 @@ dr_signal_action_t
 instrument_signal(dcontext_t *dcontext, dr_siginfo_t *siginfo);
 bool
 dr_signal_hook_exists(void);
-dr_signal_admission_status_t
-instrument_signal_admission(dcontext_t *dcontext, const dr_signal_admission_t *event,
-                            dr_mcontext_t *redirect);
 #endif
 int
 get_num_client_threads(void);

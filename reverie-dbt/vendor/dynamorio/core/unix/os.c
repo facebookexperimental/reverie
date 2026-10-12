@@ -5987,74 +5987,6 @@ dr_invoke_syscall_as_app(void *drcontext, int sysnum, int arg_count, ...)
     return res;
 }
 
-#ifdef LINUX
-DR_API
-bool
-dr_invoke_syscall_as_app_with_result(void *drcontext, int sysnum, int arg_count,
-                                    const reg_t *args,
-                                    dr_syscall_invoke_result_t *result)
-{
-    dcontext_t *dcontext = (dcontext_t *)drcontext;
-    if (dcontext == NULL || dcontext == GLOBAL_DCONTEXT ||
-        dcontext != get_thread_private_dcontext() || result == NULL ||
-        arg_count < 0 || arg_count > 6 || (arg_count != 0 && args == NULL))
-        return false;
-    priv_mcontext_t *mc = get_mcontext(dcontext);
-    bool suspend = sysnum == SYS_rt_sigsuspend;
-    if (!signal_injection_permitted(dcontext, sysnum))
-        return false;
-    if (suspend && (!dcontext->client_data->in_pre_syscall ||
-                    !signal_begin_injected_sigsuspend(dcontext)))
-        return false;
-
-    reg_t saved_args[6], actual_args[6] = { 0 };
-    reg_t saved_sysnum = MCXT_SYSNUM_REG(mc), saved_result = MCXT_SYSCALL_RES(mc);
-    int saved_number = dcontext->sys_num;
-    reg_t saved_params[5] = { dcontext->sys_param0, dcontext->sys_param1,
-                             dcontext->sys_param2, dcontext->sys_param3,
-                             dcontext->sys_param4 };
-    bool saved_skip = dcontext->client_data->skip_client_syscall_events;
-    for (int i = 0; i < 6; ++i) {
-        saved_args[i] = sys_param(dcontext, i);
-        if (i < arg_count)
-            set_syscall_param(dcontext, i, args[i]);
-    }
-    MCXT_SYSNUM_REG(mc) = sysnum;
-    dcontext->client_data->skip_client_syscall_events = true;
-    result->interruption = 0;
-    if (pre_system_call(dcontext)) {
-        /* Prehandling owns argument substitutions (including private masks).
-         * Executing the original varargs here bypasses those substitutions. */
-        for (int i = 0; i < arg_count; ++i)
-            actual_args[i] = sys_param(dcontext, i);
-        result->value = suspend ? signal_wait_injected_sigsuspend(dcontext)
-                                : dynamorio_syscall(dcontext->sys_num, arg_count,
-                                                    actual_args[0], actual_args[1],
-                                                    actual_args[2], actual_args[3],
-                                                    actual_args[4], actual_args[5]);
-        MCXT_SYSCALL_RES(mc) = result->value;
-        post_system_call(dcontext);
-    }
-    result->value = MCXT_SYSCALL_RES(mc);
-    if (suspend)
-        signal_finish_injected_sigsuspend(dcontext, result);
-    /* Later post-hook injections must not inherit this injection's DR syscall
-     * metadata. Its suspended signal state is separately owned by the token. */
-    dcontext->client_data->skip_client_syscall_events = saved_skip;
-    dcontext->sys_num = saved_number;
-    dcontext->sys_param0 = saved_params[0];
-    dcontext->sys_param1 = saved_params[1];
-    dcontext->sys_param2 = saved_params[2];
-    dcontext->sys_param3 = saved_params[3];
-    dcontext->sys_param4 = saved_params[4];
-    for (int i = 0; i < 6; ++i)
-        set_syscall_param(dcontext, i, saved_args[i]);
-    MCXT_SYSCALL_RES(mc) = saved_result;
-    MCXT_SYSNUM_REG(mc) = saved_sysnum;
-    return true;
-}
-#endif
-
 static inline bool
 is_thread_create_syscall_helper(ptr_uint_t sysnum, uint64 flags)
 {
@@ -8233,18 +8165,15 @@ pre_system_call(dcontext_t *dcontext)
            asmlinkage int
            sys_rt_sigsuspend(sigset_t *unewset, size_t sigsetsize)
          */
-#ifdef LINUX
-        int status = handle_pre_sigsuspend(
-            dcontext, (const kernel_sigset_t *)sys_param(dcontext, 0),
-            (size_t)sys_param(dcontext, 1));
-        if (status != 0) {
-            set_failure_return_val(dcontext, status);
-            execute_syscall = false;
-        }
-#else
+        /* TODO i#7955: If a signal is already pending (either because it was blocked
+         * and is now unblocked by sigsuspend, or because it was already unblocked
+         * but delayed by DR), executing sigsuspend may hang because the signal
+         * was already consumed by DR's signal handler. We should detect this (e.g.,
+         * check signals_pending > 0 after handle_sigsuspend) and preemptively deliver
+         * the signal and skip/re-execute the syscall.
+         */
         handle_sigsuspend(dcontext, (kernel_sigset_t *)sys_param(dcontext, 0),
                           (size_t)sys_param(dcontext, 1));
-#endif
         break;
     }
 #ifdef LINUX
@@ -9819,9 +9748,6 @@ post_system_call(dcontext_t *dcontext)
         break;
     }
 #ifdef LINUX
-    case SYS_rt_sigsuspend:
-        handle_post_sigsuspend(dcontext);
-        break;
     case SYS_rt_sigpending: {
         if (success) {
             int status = handle_post_sigpending(

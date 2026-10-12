@@ -1285,65 +1285,6 @@ DR_API
  */
 reg_t
 dr_invoke_syscall_as_app(void *drcontext, int sysnum, int arg_count, ...);
-
-#    ifdef LINUX
-/** Result of a returning application-syscall injection. An interruption is an
- * owned DR continuation, not an application-visible errno. */
-typedef struct _dr_syscall_invoke_result_t {
-    reg_t value;
-    uint64 interruption;
-} dr_syscall_invoke_result_t;
-
-DR_API
-/**
- * Invokes a syscall from the owning thread's pre-syscall callback. Unlike
- * dr_invoke_syscall_as_app(), an interrupted rt_sigsuspend can return to the
- * client without entering an application signal handler underneath its live
- * callback. DR retains the authentic pending signal and the captured mask.
- * A nonzero interruption token must be completed after that callback's owned
- * work finishes, before the client returns false from its syscall event.
- * The internal restart value must never be passed to application code alone.
- *
- * Only one interrupted injection may be outstanding. A second signal/mask wait,
- * a signal/mask wait from an owned signal continuation, or conversion of the
- * interrupted callback to a nonterminal execute-original/tail outcome is not
- * represented by this API and must be refused before application execution. Ordinary
- * post-hook injections are permitted; they do not own the retained wait.
- * Fork/clone/exec injections while the interrupted callback remains owned are
- * refused; terminal exit is permitted and consumes ownership during cleanup.
- */
-bool
-dr_invoke_syscall_as_app_with_result(void *drcontext, int sysnum, int arg_count,
-                                    const reg_t *args,
-                                    dr_syscall_invoke_result_t *result);
-
-DR_API
-/**
- * Completes an interrupted returning injection with the final outer callback
- * result. This must run after all callback-owned language/runtime borrows end.
- * The original internal restart value requests ordinary Linux no-handler
- * restart: signal policy first observes that result. Suppression retires this
- * attempt and restores its old mask; if the selected result still requests a
- * restart, DR re-enters the real application syscall (and its normal client
- * event), preserving the selected arguments and continuation. Explicit policy
- * result/register changes are preserved. Caught delivery alone resolves the
- * internal restart to EINTR, independently of SA_RESTART. No application
- * instruction executes with an unresolved token.
- * Other private Linux restart protocols (ERESTARTSYS, ERESTARTNOINTR, and
- * ERESTART_RESTARTBLOCK) are not represented. Completion refuses them; an
- * owned signal-policy register edit to one also refuses without consuming
- * its signal token. Ordinary application results are unaffected.
- */
-bool
-dr_complete_syscall_interruption(void *drcontext, uint64 token, reg_t result);
-
-DR_API
-/** Consumes an interrupted injection before an exact terminal Exit/ExitGroup
- * outcome executes. Restores the wait's mask and retires its held signal once;
- * it does not resume the saved application continuation. */
-bool
-dr_cancel_syscall_interruption(void *drcontext, uint64 token);
-#    endif
 #endif
 
 /**************************************************

@@ -64,7 +64,6 @@ use reverie::GlobalTool;
 use reverie::Guest;
 use reverie::Never;
 use reverie::Pid;
-use reverie::Signal;
 use reverie::Stack;
 use reverie::TimerSchedule;
 use reverie::Tool;
@@ -124,9 +123,7 @@ pub type RuntimeIdler = unsafe extern "C" fn();
 /// Version 6 retains the 48-byte callback layout and requires the initialized
 /// native mode and a returned startup status; the no-mode V1/V2 entries are not
 /// admitted initialization routes.
-/// Version 7 also requires `reverie_dbt_runtime_signal_event`, entered only from
-/// the native owned signal continuation.
-pub const DBT_RUNTIME_ABI_VERSION: u32 = 7;
+pub const DBT_RUNTIME_ABI_VERSION: u32 = 6;
 
 /// Initialized native execution mode supplied by the version-6 startup bridge.
 ///
@@ -261,61 +258,6 @@ pub enum DbtSyscallOutcome {
     ExecuteOriginal(Syscall),
 }
 
-/// Owned signal payload exchanged with the native admission continuation.
-///
-/// No pointer into DynamoRIO's pending queue crosses the runtime boundary.
-/// Version 7 adds this 200-byte, 8-byte-aligned wire object without changing
-/// [`DbtRuntimeCallbacks`]. The caller initializes all fields before entry.
-#[repr(C)]
-pub struct DbtSignalEvent {
-    /// Signal reported by the kernel.
-    pub signal: i32,
-    /// Signal selected for delivery on a successful returning callback.
-    pub delivered_signal: i32,
-    /// Authentic Linux siginfo, or an explicitly selected replacement.
-    pub signal_info: [u8; reverie::SIGNAL_INFO_SIZE],
-    /// Nonzero only for an explicit replacement for the reported signal.
-    pub signal_info_changed: i32,
-    /// Reserved; must be zero.
-    pub reserved: u32,
-    /// Deferred native syscall number when the callback terminates its task.
-    pub deferred_sysnum: i64,
-    /// Deferred native syscall arguments.
-    pub deferred_args: [u64; 6],
-}
-
-/// Result of the real Tool signal hook after its future and Guest borrow end.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DbtSignalOutcome {
-    /// Commit delivery through DynamoRIO's existing signal machinery.
-    Deliver(Signal),
-    /// Resume the ordinary interrupted context without installing a frame.
-    Suppress,
-    /// Execute the Tool's terminal syscall after leaving Rust ownership.
-    ExecuteOriginal(Syscall),
-}
-
-/// The owned transport cannot synthesize Linux provenance for a different signal.
-#[derive(Debug)]
-pub struct UnsupportedSignalTransformation {
-    /// Authentic reported signal.
-    pub reported: Signal,
-    /// Different signal requested by the Tool.
-    pub requested: Signal,
-}
-
-impl std::fmt::Display for UnsupportedSignalTransformation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "DBT signal transport cannot transform {:?} into {:?} without authentic replacement provenance",
-            self.reported, self.requested
-        )
-    }
-}
-
-impl std::error::Error for UnsupportedSignalTransformation {}
-
 /// In-process guest state passed to a Reverie tool handler.
 pub struct DbtGuest<'a, T>
 where
@@ -334,8 +276,6 @@ where
     write_registers: RegisterWriter,
     read_memory: Option<MemoryReader>,
     tail_inject_result: Arc<TailInjectResult>,
-    signal_info: Option<[u8; reverie::SIGNAL_INFO_SIZE]>,
-    signal_info_replacement: Option<[u8; reverie::SIGNAL_INFO_SIZE]>,
 }
 
 impl<'a, T> DbtGuest<'a, T>
@@ -371,8 +311,6 @@ where
             write_registers,
             read_memory: None,
             tail_inject_result: Arc::new(TailInjectResult::default()),
-            signal_info: None,
-            signal_info_replacement: None,
         }
     }
 
@@ -502,19 +440,6 @@ where
 
     fn thread_state(&self) -> &T::ThreadState {
         self.thread_state
-    }
-
-    fn signal_info(&self) -> Option<[u8; reverie::SIGNAL_INFO_SIZE]> {
-        self.signal_info_replacement.or(self.signal_info)
-    }
-
-    fn set_signal_info(&mut self, info: [u8; reverie::SIGNAL_INFO_SIZE]) -> Result<(), Errno> {
-        let original = self.signal_info.ok_or(Errno::EINVAL)?;
-        if info[..4] != original[..4] {
-            return Err(Errno::EINVAL);
-        }
-        self.signal_info_replacement = Some(info);
-        Ok(())
     }
 
     async fn regs(&mut self) -> libc::user_regs_struct {
@@ -1778,82 +1703,6 @@ fn run_tool_syscall_inner<T: Tool>(
     }
 }
 
-/// Drives the shared Tool signal hook from an exclusively owned native continuation.
-///
-/// The native caller must retain the authentic delivery frame and both interrupted
-/// contexts until this returns. Register callbacks operate on that saved application
-/// state, never on the private continuation's registers. No frame or mask is
-/// committed here. In particular, suppression does not restart an interrupted syscall.
-#[allow(clippy::too_many_arguments)]
-pub fn run_tool_signal_with_memory_reader<T: Tool>(
-    tool: &T,
-    context: usize,
-    tid: Pid,
-    pid: Pid,
-    branch_count: u64,
-    thread_state: &mut T::ThreadState,
-    global_state: &T::GlobalState,
-    config: &<T::GlobalState as GlobalTool>::Config,
-    event: &mut DbtSignalEvent,
-    invoke_syscall: SyscallInvoker,
-    read_registers: RegisterReader,
-    write_registers: RegisterWriter,
-    read_memory: MemoryReader,
-) -> Result<DbtSignalOutcome, Error> {
-    let signal = Signal::try_from(event.signal).map_err(|_| Errno::EINVAL)?;
-    if event.reserved != 0
-        || i32::from_ne_bytes(event.signal_info[..4].try_into().unwrap()) != event.signal
-    {
-        return Err(Errno::EINVAL.into());
-    }
-    event.signal_info_changed = 0;
-    event.delivered_signal = event.signal;
-    let mut guest = DbtGuest::new(
-        context,
-        tid,
-        pid,
-        current_ppid(),
-        branch_count,
-        thread_state,
-        global_state,
-        config,
-        invoke_syscall,
-        read_registers,
-        write_registers,
-    )
-    .with_memory_reader(read_memory);
-    guest.signal_info = Some(event.signal_info);
-    let tail_result = Arc::clone(&guest.tail_inject_result);
-    let result = run_ready(tool.handle_signal_event(&mut guest, signal), &tail_result);
-    match result {
-        Some(Ok(Some(delivered))) => {
-            if delivered != signal {
-                return Err(std::io::Error::other(UnsupportedSignalTransformation {
-                    reported: signal,
-                    requested: delivered,
-                })
-                .into());
-            }
-            event.delivered_signal = delivered as i32;
-            if let Some(replacement) = guest.signal_info_replacement {
-                event.signal_info = replacement;
-                event.signal_info_changed = 1;
-            }
-            Ok(DbtSignalOutcome::Deliver(delivered))
-        }
-        Some(Ok(None)) => Ok(DbtSignalOutcome::Suppress),
-        Some(Err(errno)) => Err(errno.into()),
-        None => match tail_result
-            .take()
-            .expect("signal hook suspended without a tail-inject result")
-        {
-            TailInjectAction::ExecuteOriginal(syscall) => {
-                Ok(DbtSignalOutcome::ExecuteOriginal(syscall))
-            }
-        },
-    }
-}
-
 /// Returns the Cargo-vendored DynamoRIO launcher built for this crate.
 pub fn bundled_drrun_path() -> &'static Path {
     Path::new(env!("REVERIE_DBT_DYNAMORIO_DRRUN"))
@@ -2137,69 +1986,6 @@ unsafe fn write_deferred_syscall(syscall: Syscall, number: *mut i64, args: *mut 
         syscall_args.arg5 as u64,
     ];
     unsafe { std::slice::from_raw_parts_mut(args, values.len()) }.copy_from_slice(&values);
-}
-
-/// Drives the prototype Tool's signal hook from the owned native continuation.
-///
-/// # Safety
-/// All pointers/callbacks must remain valid for this call and `counters` must be
-/// exclusively owned by this thread. No Rust borrow may survive the return.
-#[allow(clippy::too_many_arguments)]
-#[cfg(feature = "prototype-runtime")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn reverie_dbt_runtime_signal_event(
-    context: *mut c_void,
-    counters: *mut c_void,
-    tid: i32,
-    pid: i32,
-    _image_generation: u64,
-    branches: u64,
-    event: *mut DbtSignalEvent,
-    invoke_syscall: SyscallInvoker,
-    read_registers: RegisterReader,
-    write_registers: RegisterWriter,
-    read_memory: MemoryReader,
-    _write_memory: MemoryWriter,
-    emit: RuntimeEmitter,
-) -> i32 {
-    if context.is_null() || counters.is_null() || event.is_null() {
-        return -1;
-    }
-    let event = unsafe { &mut *event };
-    tools::set_emitter(emit);
-    let result = run_tool_signal_with_memory_reader(
-        &PROTOTYPE_TOOL,
-        context as usize,
-        Pid::from_raw(tid),
-        Pid::from_raw(pid),
-        branches,
-        unsafe { &mut *counters.cast::<PrototypeCounters>() },
-        &GLOBAL_STATE,
-        &CONFIG,
-        event,
-        invoke_syscall,
-        read_registers,
-        write_registers,
-        read_memory,
-    );
-    match result {
-        Ok(DbtSignalOutcome::Deliver(_)) => 0,
-        Ok(DbtSignalOutcome::Suppress) => 1,
-        Ok(DbtSignalOutcome::ExecuteOriginal(syscall)) => {
-            unsafe {
-                write_deferred_syscall(
-                    syscall,
-                    &mut event.deferred_sysnum,
-                    event.deferred_args.as_mut_ptr(),
-                )
-            };
-            2
-        }
-        Err(error) => {
-            tools::emit_line(&format!("reverie-dbt: signal admission failed: {error}"));
-            -1
-        }
-    }
 }
 
 /// Handles a DynamoRIO pre-syscall event.
@@ -2634,154 +2420,9 @@ pub unsafe extern "C" fn reverie_dbt_runtime_totals(
 mod tests {
     use super::*;
 
-    #[derive(Default)]
-    struct SignalProbe(u8);
-
-    #[reverie::tool]
-    impl Tool for SignalProbe {
-        type GlobalState = ();
-        type ThreadState = u32;
-
-        async fn handle_signal_event<G: Guest<Self>>(
-            &self,
-            guest: &mut G,
-            signal: Signal,
-        ) -> Result<Option<Signal>, Errno> {
-            assert_eq!(signal, Signal::SIGCHLD);
-            let original = guest.signal_info().expect("owned authentic payload");
-            assert_eq!(original[24], 0x91);
-            // Exercise the actual async Tool driver, including a suspended poll.
-            let mut first = true;
-            std::future::poll_fn(|cx| {
-                if first {
-                    first = false;
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
-                } else {
-                    Poll::Ready(())
-                }
-            })
-            .await;
-            *guest.thread_state_mut() += 1;
-            let mut replacement = original;
-            replacement[24] = 0x72;
-            guest.set_signal_info(replacement)?;
-            replacement[..4].copy_from_slice(&(Signal::SIGUSR1 as i32).to_ne_bytes());
-            assert_eq!(guest.set_signal_info(replacement), Err(Errno::EINVAL));
-            assert_eq!(guest.signal_info().unwrap()[24], 0x72);
-            match self.0 {
-                0 => Ok(Some(signal)),
-                1 => Ok(None),
-                2 => Ok(Some(Signal::SIGUSR1)),
-                3 => Err(Errno::EIO),
-                4 => {
-                    guest
-                        .tail_inject(reverie::syscalls::Exit::new().with_status(31))
-                        .await
-                }
-                _ => unreachable!(),
-            }
-        }
-    }
-
-    fn signal_event() -> DbtSignalEvent {
-        let mut info = [0u8; reverie::SIGNAL_INFO_SIZE];
-        info[..4].copy_from_slice(&(Signal::SIGCHLD as i32).to_ne_bytes());
-        info[24] = 0x91;
-        DbtSignalEvent {
-            signal: Signal::SIGCHLD as i32,
-            delivered_signal: 0,
-            signal_info: info,
-            signal_info_changed: 0,
-            reserved: 0,
-            deferred_sysnum: 0,
-            deferred_args: [0; 6],
-        }
-    }
-
-    fn probe_signal(mode: u8, event: &mut DbtSignalEvent) -> Result<DbtSignalOutcome, Error> {
-        unsafe extern "C" fn no_read(_: usize, _: *mut u8, _: usize) -> i32 {
-            panic!("signal probe must not inspect unrelated memory")
-        }
-        let mut entries = 0;
-        let result = run_tool_signal_with_memory_reader(
-            &SignalProbe(mode),
-            0,
-            Pid::from_raw(3),
-            Pid::from_raw(3),
-            41,
-            &mut entries,
-            &(),
-            &(),
-            event,
-            invoke,
-            read_regs,
-            write_regs_noop,
-            no_read,
-        );
-        assert_eq!(entries, 1);
-        result
-    }
-
-    #[test]
-    fn signal_admission_drives_real_tool_and_preserves_selected_siginfo() {
-        let mut event = signal_event();
-        assert_eq!(
-            probe_signal(0, &mut event).unwrap(),
-            DbtSignalOutcome::Deliver(Signal::SIGCHLD)
-        );
-        assert_eq!(event.signal_info_changed, 1);
-        assert_eq!(event.signal_info[24], 0x72);
-        assert_eq!(event.delivered_signal, Signal::SIGCHLD as i32);
-    }
-
-    #[test]
-    fn signal_admission_suppression_does_not_commit_a_replacement() {
-        let mut event = signal_event();
-        assert_eq!(
-            probe_signal(1, &mut event).unwrap(),
-            DbtSignalOutcome::Suppress
-        );
-        assert_eq!(event.signal_info_changed, 0);
-        assert_eq!(event.signal_info[24], 0x91);
-    }
-
-    #[test]
-    fn signal_admission_refuses_transformation_without_fabricating_siginfo() {
-        let mut event = signal_event();
-        let error = probe_signal(2, &mut event).unwrap_err();
-        let Error::Io(error) = error else {
-            panic!("expected typed transformation refusal")
-        };
-        let refusal = error
-            .get_ref()
-            .unwrap()
-            .downcast_ref::<UnsupportedSignalTransformation>()
-            .unwrap();
-        assert_eq!(refusal.reported, Signal::SIGCHLD);
-        assert_eq!(refusal.requested, Signal::SIGUSR1);
-        assert_eq!(event.signal_info_changed, 0);
-    }
-
-    #[test]
-    fn signal_admission_preserves_error_and_terminal_tail_injection() {
-        assert!(matches!(
-            probe_signal(3, &mut signal_event()),
-            Err(Error::Errno(Errno::EIO))
-        ));
-        assert_eq!(
-            probe_signal(4, &mut signal_event()).unwrap(),
-            DbtSignalOutcome::ExecuteOriginal(
-                reverie::syscalls::Exit::new().with_status(31).into()
-            )
-        );
-    }
-
     #[test]
     fn startup_abi_preserves_layout_and_requires_initialized_native_mode() {
-        assert_eq!(reverie_dbt_runtime_abi_version(), 7);
-        assert_eq!(std::mem::size_of::<DbtSignalEvent>(), 200);
-        assert_eq!(std::mem::align_of::<DbtSignalEvent>(), 8);
+        assert_eq!(reverie_dbt_runtime_abi_version(), 6);
         assert_eq!(reverie_dbt_runtime_callbacks_size(), 48);
         assert_eq!(std::mem::size_of::<DbtRuntimeCallbacks>(), 48);
         assert_eq!(

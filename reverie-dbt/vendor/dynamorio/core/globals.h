@@ -624,8 +624,6 @@ exiting_dynamorio(void);
 
 void
 handle_system_call(dcontext_t *dcontext);
-app_pc
-get_prior_syscall_pc(dcontext_t *dcontext, app_pc post_syscall_pc);
 
 /* self-protection */
 void

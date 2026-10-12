@@ -328,16 +328,6 @@ typedef struct rt_sigframe {
 #endif
 } sigframe_rt_t;
 
-#ifdef LINUX
-typedef struct _sigsuspend_context_t {
-    kernel_sigset_t kernel_mask;
-    kernel_sigset_t return_mask;
-    reg_t mask_arg;
-    app_pc syscall_pc;
-    app_pc next_pc;
-} sigsuspend_context_t;
-#endif
-
 /* we have to queue up both rt and non-rt signals because we delay
  * their delivery.
  * PR 304708: we now leave in rt form right up until we copy to the
@@ -353,16 +343,6 @@ typedef struct _sigpending_t {
     /* Was this unblocked at receive time? */
     bool unblocked_at_receipt;
     struct _sigpending_t *next;
-    /* The detached pending allocation owns both continuations. Keep the ordinary
-     * context out of thread_sig_info_t: clone_record_t copies that structure onto
-     * the bootstrap stack and must leave room for get_clone_record()'s caller.
-     * This is initialized under the pending guard before client dispatch.
-     */
-    priv_mcontext_t admission_ordinary;
-#ifdef LINUX
-    /* Private injected syscalls must not overwrite the interrupted wait. */
-    sigsuspend_context_t admission_sigsuspend;
-#endif
 #if defined(LINUX) && defined(X86)
     /* fpstate is no longer kept inside the frame, and is not always present.
      * if we delay we need to ensure we have room for it.
@@ -374,30 +354,6 @@ typedef struct _sigpending_t {
      */
 #endif /* LINUX && X86 */
 } sigpending_t;
-
-#ifdef LINUX
-typedef enum {
-    INJECTED_SUSPEND_NONE,
-    INJECTED_SUSPEND_RUNNING,
-    INJECTED_SUSPEND_HELD,
-    INJECTED_SUSPEND_READY,
-    INJECTED_SUSPEND_ADMITTING,
-} injected_suspend_phase_t;
-
-/* No borrowed client argument or queue-head pointer survives a returning
- * injection. The held allocation remains counted in num_pending. This small
- * record is also covered by clone_record_t's bootstrap-size assertion. */
-typedef struct _injected_sigsuspend_t {
-    injected_suspend_phase_t phase;
-    uint64 token;
-    sigpending_t *held;
-    int signal;
-    int original_sysnum;
-    reg_t final_result;
-    sigsuspend_context_t suspend;
-    kernel_sigset_t saved_mask;
-} injected_sigsuspend_t;
-#endif
 
 size_t
 signal_frame_extra_size(bool include_alignment);
@@ -517,21 +473,6 @@ typedef struct _thread_sig_info_t {
     bool accessing_sigpending;
     bool nested_pending_ok;
 
-    /* An admitted signal is detached from the queue before private client work.
-     * Its frame owns the authentic XSTATE and restart-adjusted context. The
-     * ordinary context remains separate: suppression must not restart a syscall.
-     */
-    sigpending_t *active_admission;
-    /* Kernel sigreturn still reads this backing after token retirement. Free it
-     * only at the next dispatcher entry, never in the consuming clean call. */
-    sigpending_t *admission_return;
-    uint64 admission_token;
-    int admission_signal;
-    bool admission_pre_mask_valid;
-    kernel_sigset_t admission_pre_mask;
-    bool admission_in_sigsuspend;
-    kernel_sigset_t admission_sigsuspend_mask;
-
     /* This thread's application signal mask: the set of blocked signals.
      * We need to keep this in sync with the thread-group-shared
      * sighand->threads_unmasked.
@@ -553,11 +494,9 @@ typedef struct _thread_sig_info_t {
 
     /* for returning the old mask (xref PR 523394) */
     kernel_sigset_t pre_syscall_app_sigblocked;
-    /* Private filtered input for the current sigprocmask syscall (i#1187).
-     * Independent of the saved return mask used by temporary-mask waits.
+    /* for preserving the app memory (xref i#1187), and for preserving app
+     * mask supporting ppoll, epoll_pwait and pselect
      */
-    kernel_sigset_t sigprocmask_kernel_set;
-    /* for preserving app mask supporting ppoll, epoll_pwait and pselect */
     kernel_sigset_t pre_syscall_app_sigprocmask;
     /* True if pre_syscall_app_sigprocmask holds a pre-syscall sigmask */
     bool pre_syscall_app_sigprocmask_valid;
@@ -571,15 +510,6 @@ typedef struct _thread_sig_info_t {
     /* to handle sigsuspend we have to save blocked set */
     bool in_sigsuspend;
     kernel_sigset_t app_sigblocked_save;
-#ifdef LINUX
-    /* One logical wait owns this captured mask until caught delivery. An
-     * ignored/suppressed signal retries without reading application memory or
-     * exposing the old mask in between. The original argument register is
-     * restored before post-syscall events and pending-signal delivery.
-     */
-    sigsuspend_context_t sigsuspend;
-    injected_sigsuspend_t injected_sigsuspend;
-#endif
 
     /* to inherit in children must not modify until they're scheduled */
     volatile int num_unstarted_children;
