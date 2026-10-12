@@ -4523,17 +4523,17 @@ impl<L: Tool + 'static> TracedTask<L> {
         let mut resume = self
             .report_or_pass_held_signal(task, stop_signal, signal)
             .await?;
-        // A realtime signal passed on unreported keeps its siginfo, which can
-        // carry a `sigqueue` value; Linux would otherwise make one up for the
-        // stop it is resumed from after the callback's injections
-        // (<https://github.com/rrnewton/reverie/issues/207>). A named signal
-        // is passed on as before.
+        // A signal passed on unreported keeps its siginfo, which can carry a
+        // `sigqueue` value and its sender; Linux would otherwise make one up
+        // (SI_USER from the tracer, no value) for the stop it is resumed from
+        // after the callback's injections
+        // (<https://github.com/rrnewton/reverie/issues/207>,
+        // <https://github.com/rrnewton/reverie/issues/999>).
         if resume.reported.is_none()
             && resume.replacement.is_none()
             && writable
             && let (Some(sig), Some(taken)) = (resume.signal, taken)
             && sig == taken.signal
-            && sig.as_nix().is_none()
         {
             resume.replacement = Some((sig, taken.bytes));
         }

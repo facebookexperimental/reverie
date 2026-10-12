@@ -9505,9 +9505,12 @@ fn dropping_an_unreported_held_signal_keeps_a_reported_instances_count() {
 /// once. Before instances carried their count, this already held; the test
 /// fails if a kept instance does not give its count back.
 ///
-/// Known gap pinned here (https://github.com/rrnewton/reverie/issues/845):
-/// the fallback resumes the held signal from a syscall stop, where Linux
-/// makes up its siginfo (SI_USER, the tracer as sender) as it requeues it.
+/// The handler sees the instance's own siginfo (SI_QUEUE, the guest as
+/// sender, its value): the held signal passed on unreported gets its recorded
+/// siginfo written back (https://github.com/rrnewton/reverie/issues/999).
+/// Before, it saw the one Linux made up for the stop it was resumed from
+/// (SI_USER, the tracer as sender, no value), a case of
+/// https://github.com/rrnewton/reverie/issues/845.
 #[test]
 fn a_reported_signal_kept_by_a_fallback_is_not_reported_again() {
     let (output, log) = test_fn_bounded::<BlockInFirstSignalHook, _>(
@@ -9566,10 +9569,15 @@ fn a_reported_signal_kept_by_a_fallback_is_not_reported_again() {
             fields[3],
             fields[5..].join(" ")
         ),
-        format!("-1 {} 1 {} 0 0 0 1", libc::EINTR, libc::SI_USER),
-        "the handler runs once; its siginfo is the one Linux made up when the fallback resumed it from a syscall stop (SI_USER from the tracer, no value), as for any held signal passed on unreported (known gap)"
+        format!(
+            "-1 {} 1 {} {} 0 0 1",
+            libc::EINTR,
+            libc::SI_QUEUE,
+            QUEUED_VALUE
+        ),
+        "the handler runs once, with the instance's own siginfo (SI_QUEUE and its value)"
     );
-    assert_ne!(fields[4], pid, "the sender is the tracer");
+    assert_eq!(fields[4], pid, "the sender is the guest, as queued");
     assert_eq!(
         *log.signals.lock().unwrap(),
         vec![libc::SIGUSR1],

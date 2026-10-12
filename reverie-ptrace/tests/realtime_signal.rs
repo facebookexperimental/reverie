@@ -774,3 +774,49 @@ fn a_child_killed_by_a_realtime_signal_is_reaped_with_it() {
     );
     assert_eq!(*log.raw.lock().unwrap(), vec![signal]);
 }
+
+/// A held named signal passed on unreported keeps its siginfo too
+/// (https://github.com/rrnewton/reverie/issues/999). SIGUSR1 queued with
+/// value 7 stops the retried `getpid` and is held; with SIGRTMIN+4 (value
+/// 111) pending, it is passed on unreported, resumed from the injection's
+/// stop. Linux would make up an SI_USER siginfo with no value for it there.
+/// The handlers run as natively: SIGRTMIN+4's frame nests above SIGUSR1's.
+#[test]
+fn a_held_named_signal_passed_on_keeps_its_value() {
+    let (output, _log) = test_fn::<RetryTool, _>(move || {
+        DELIVERIES.store(0, Ordering::SeqCst);
+        let realtime = libc::SIGRTMIN() + 4;
+        handle_with_siginfo(libc::SIGUSR1);
+        handle_with_siginfo(realtime);
+        set_blocked(libc::SIGUSR1, true);
+        set_blocked(realtime, true);
+        queue_to_self(libc::SIGUSR1, 7);
+        queue_to_self(realtime, 111);
+        // SAFETY: the set is initialized before use.
+        let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGUSR1);
+            libc::sigaddset(&mut set, realtime);
+        }
+        // SAFETY: the tool replaces this zero-length write.
+        let ret = unsafe {
+            libc::write(
+                RETRY_FD,
+                &set as *const libc::sigset_t as *const libc::c_void,
+                0,
+            )
+        };
+        // SAFETY: getpid has no preconditions.
+        assert_eq!(ret, unsafe { libc::getpid() } as isize);
+        assert_eq!(delivered(), vec![(realtime, 111), (libc::SIGUSR1, 7)]);
+    })
+    .expect("run held-named-signal guest");
+
+    assert_eq!(
+        output.status,
+        ExitStatus::Exited(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
