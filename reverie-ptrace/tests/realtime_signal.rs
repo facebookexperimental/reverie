@@ -13,6 +13,7 @@
 //! Before, decoding such a stop failed with EINVAL and ended the run.
 
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -26,9 +27,11 @@ use reverie::Pid;
 use reverie::Subscription;
 use reverie::Tool;
 use reverie::syscalls::Addr;
+use reverie::syscalls::AddrMut;
 use reverie::syscalls::Getpid;
 use reverie::syscalls::Ppoll;
 use reverie::syscalls::RtSigprocmask;
+use reverie::syscalls::RtTgsigqueueinfo;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::Sysno;
 use reverie_ptrace::testing::test_fn;
@@ -278,10 +281,14 @@ fn realtime_signal_stops_reach_the_tool_and_are_delivered() {
 }
 
 /// Two queued instances of a realtime signal wake an injected `ppoll` whose
-/// mask admits them, as they would wake the guest's own `ppoll`: the first
-/// stops the injection, is held, and reaches the handler when the guest
-/// resumes; the second stays queued behind the guest's restored mask until
-/// the guest unblocks it. Both keep their `sigqueue` values and order.
+/// mask admits them, as they would wake the guest's own `ppoll`. The
+/// injection returns ERESTARTNOHAND. The kernel reports the step's SIGTRAP
+/// before the signal (a realtime signal is never synchronous-class), so the
+/// first instance is not held: it stops the guest after the injection, at an
+/// ordinary signal-delivery stop, and reaches the handler; the second stays
+/// queued behind the guest's restored mask until the guest unblocks it. Both
+/// keep their `sigqueue` values and order. The held path is
+/// `a_realtime_signal_pending_before_an_injected_syscall_interrupts_it`.
 #[test]
 fn a_realtime_signal_that_wakes_an_injected_syscall_is_delivered_after_it() {
     let (output, log) = test_fn::<RawSignalTool, _>(|| {
@@ -366,5 +373,220 @@ fn a_realtime_signal_pending_before_an_injected_syscall_interrupts_it() {
     assert_eq!(
         *log.injected.lock().unwrap(),
         vec![Ok(0), Err(Errno::ERESTARTSYS.into_raw())]
+    );
+}
+
+/// A zero-length write to this descriptor is replaced, for a `HeldCallbackPlan`
+/// at `buf`, with an injected `rt_sigprocmask(SIG_UNBLOCK, &buf.unblock_a,
+/// NULL)`, then an injected `getpid`. The tool returns the `getpid` result.
+const HELD_CALLBACK_FD: i32 = 902;
+
+/// Guest memory for `HELD_CALLBACK_FD`.
+#[repr(C)]
+struct HeldCallbackPlan {
+    unblock_a: u64,
+    block_b: u64,
+    info2: libc::siginfo_t,
+    info3: libc::siginfo_t,
+}
+
+static PLAN_ADDR: AtomicUsize = AtomicUsize::new(0);
+static PLAN_DONE: AtomicBool = AtomicBool::new(false);
+
+fn held_a() -> i32 {
+    libc::SIGRTMIN() + 4
+}
+
+fn queued_b() -> i32 {
+    libc::SIGRTMIN() + 6
+}
+
+/// Like `RawSignalTool` for `HELD_CALLBACK_FD`; its raw-signal hook, at the
+/// first report of `held_a()`, injects: block `queued_b()`, queue it twice
+/// with `rt_tgsigqueueinfo` (values 2 and 3), unblock it, and `getpid`.
+#[derive(Clone, Copy, Debug, Default)]
+struct HeldCallbackTool;
+
+#[reverie::tool]
+impl Tool for HeldCallbackTool {
+    type GlobalState = Log;
+    type ThreadState = ();
+
+    fn subscriptions(_config: &()) -> Subscription {
+        let mut subscription = Subscription::none();
+        subscription.syscall(Sysno::write);
+        subscription
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        match syscall {
+            Syscall::Write(write) if write.fd() == HELD_CALLBACK_FD && write.len() == 0 => {
+                let base = write.buf().map_or(0, |buf| buf.as_raw());
+                PLAN_ADDR.store(base, Ordering::SeqCst);
+                let unblocked = guest
+                    .inject(
+                        RtSigprocmask::new()
+                            .with_how(libc::SIG_UNBLOCK)
+                            .with_set(Addr::from_raw(base))
+                            .with_oldset(None)
+                            .with_sigsetsize(8),
+                    )
+                    .await;
+                guest
+                    .send_rpc(Report::Injected(unblocked.map_err(Errno::into_raw)))
+                    .await;
+                let result = guest.inject(Getpid::new()).await;
+                guest
+                    .send_rpc(Report::Injected(result.map_err(Errno::into_raw)))
+                    .await;
+                Ok(result?)
+            }
+            _ => guest.tail_inject(syscall).await,
+        }
+    }
+
+    async fn handle_raw_signal_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: i32,
+    ) -> Result<Option<i32>, Errno> {
+        guest.send_rpc(Report::Raw(signal)).await;
+        if signal == held_a() && !PLAN_DONE.swap(true, Ordering::SeqCst) {
+            let base = PLAN_ADDR.load(Ordering::SeqCst);
+            let block_b = Addr::from_raw(base + std::mem::offset_of!(HeldCallbackPlan, block_b));
+            let pid = guest.pid().as_raw();
+            let tid = guest.tid().as_raw();
+            let mut results = vec![
+                guest
+                    .inject(
+                        RtSigprocmask::new()
+                            .with_how(libc::SIG_BLOCK)
+                            .with_set(block_b)
+                            .with_oldset(None)
+                            .with_sigsetsize(8),
+                    )
+                    .await,
+            ];
+            for offset in [
+                std::mem::offset_of!(HeldCallbackPlan, info2),
+                std::mem::offset_of!(HeldCallbackPlan, info3),
+            ] {
+                results.push(
+                    guest
+                        .inject(
+                            RtTgsigqueueinfo::new()
+                                .with_tgid(pid)
+                                .with_tid(tid)
+                                .with_sig(queued_b())
+                                .with_siginfo(AddrMut::from_raw(base + offset)),
+                        )
+                        .await,
+                );
+            }
+            results.push(
+                guest
+                    .inject(
+                        RtSigprocmask::new()
+                            .with_how(libc::SIG_UNBLOCK)
+                            .with_set(block_b)
+                            .with_oldset(None)
+                            .with_sigsetsize(8),
+                    )
+                    .await,
+            );
+            results.push(guest.inject(Getpid::new()).await);
+            for result in results {
+                guest
+                    .send_rpc(Report::Injected(result.map_err(Errno::into_raw)))
+                    .await;
+            }
+        }
+        Ok(Some(signal))
+    }
+}
+
+/// A queued siginfo for `rt_tgsigqueueinfo`: SI_QUEUE from this process,
+/// with `value`. x86_64 layout: si_signo, si_errno, si_code, padding, then
+/// si_pid, si_uid and si_value.
+fn queued_siginfo(signal: i32, value: i64) -> libc::siginfo_t {
+    let mut raw = [0u8; 128];
+    raw[0..4].copy_from_slice(&signal.to_ne_bytes());
+    raw[8..12].copy_from_slice(&libc::SI_QUEUE.to_ne_bytes());
+    // SAFETY: getpid and getuid have no preconditions.
+    raw[16..20].copy_from_slice(&unsafe { libc::getpid() }.to_ne_bytes());
+    raw[20..24].copy_from_slice(&unsafe { libc::getuid() }.to_ne_bytes());
+    raw[24..32].copy_from_slice(&value.to_ne_bytes());
+    // SAFETY: siginfo_t is 128 plain bytes on Linux.
+    unsafe { std::mem::transmute(raw) }
+}
+
+/// Instances of one realtime signal that a held signal's callback queues
+/// keep their order, and the held signal keeps its siginfo, through the
+/// callback's injections (from the review of
+/// https://github.com/rrnewton/reverie/pull/995). A, held when it stops the
+/// marker's injected `getpid`, is reported to the raw hook, whose injections
+/// queue B twice (values 2, then 3) and unblock it. An injection there that
+/// took B from the kernel's queue would put it back behind the later
+/// instance, and the handlers would see B 3 before B 2. Linux runs them as:
+/// B 2 (its frame nested above A's), B 3 once B 2's handler returns, then A
+/// with value 77.
+#[test]
+fn queued_realtime_instances_keep_their_order_through_a_held_signals_callback() {
+    let (output, log) = test_fn::<HeldCallbackTool, _>(|| {
+        DELIVERIES.store(0, Ordering::SeqCst);
+        let (a, b) = (held_a(), queued_b());
+        handle_with_siginfo(a);
+        handle_with_siginfo(b);
+        set_blocked(a, true);
+        queue_to_self(a, 77);
+        let plan = HeldCallbackPlan {
+            unblock_a: 1u64 << (a - 1),
+            block_b: 1u64 << (b - 1),
+            info2: queued_siginfo(b, 2),
+            info3: queued_siginfo(b, 3),
+        };
+        // SAFETY: the tool replaces this zero-length write.
+        let ret = unsafe {
+            libc::write(
+                HELD_CALLBACK_FD,
+                &plan as *const HeldCallbackPlan as *const libc::c_void,
+                0,
+            )
+        };
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        assert_eq!((ret, errno), (-1, Some(libc::EINTR)));
+        assert_eq!(delivered(), vec![(b, 2), (b, 3), (a, 77)]);
+    })
+    .expect("run held-callback realtime-order guest");
+
+    assert_eq!(
+        output.status,
+        ExitStatus::Exited(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (a, b) = (held_a(), queued_b());
+    assert_eq!(*log.raw.lock().unwrap(), vec![a, b, b]);
+    // The marker's unblock and its getpid (stopped by A), then the
+    // callback's block, two queues, unblock and getpid (a pid).
+    let injected = log.injected.lock().unwrap();
+    assert_eq!(
+        injected[..6],
+        [
+            Ok(0),
+            Err(Errno::ERESTARTSYS.into_raw()),
+            Ok(0),
+            Ok(0),
+            Ok(0),
+            Ok(0)
+        ]
+    );
+    assert!(
+        matches!(injected[6..], [Ok(pid)] if pid > 0),
+        "{injected:?}"
     );
 }

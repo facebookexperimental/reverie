@@ -837,7 +837,9 @@ pub trait Tool: Send + Sync + Default {
     ///  - `false`: the signal is dropped and never delivered to the guest.
     ///
     /// The default keeps every signal. A backend that never passes a signal
-    /// on unreported never calls it.
+    /// on unreported never calls it. A realtime signal, which
+    /// [`UnreportedSignal`](crate::UnreportedSignal) cannot name, is not
+    /// shown and is always kept.
     async fn filter_unreported_signal<R: GlobalRPC<Self::GlobalState>>(
         &self,
         _rpc: &R,

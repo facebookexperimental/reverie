@@ -3381,4 +3381,43 @@ mod test {
             Event::Signal(Signal::SIGUSR1)
         );
     }
+
+    /// The plain wait helpers decode a realtime stop as `Event::RawSignal`
+    /// too, with and without the `notifier` feature. Before, they reported
+    /// it as a SIGSTOP (<https://github.com/rrnewton/reverie/issues/207>).
+    /// `wait_all` and `try_wait_all` decode as `wait_group` does
+    /// (`Wait::from_wait_helper`); the peeks return only the PID. Waiting
+    /// by process group keeps this test to its own tracee.
+    #[cfg(not(sanitized))]
+    #[test]
+    fn wait_group_decodes_a_realtime_stop() -> Result<(), Box<dyn std::error::Error + 'static>> {
+        let (pid, tracee) = trace(
+            || {
+                let mut action: libc::sigaction = unsafe { MaybeUninit::zeroed().assume_init() };
+                action.sa_sigaction = libc::SIG_IGN;
+                assert_eq!(
+                    unsafe { libc::sigaction(40, &action, std::ptr::null_mut()) },
+                    0
+                );
+                let ret = unsafe {
+                    let pid = libc::syscall(libc::SYS_getpid);
+                    let tid = libc::syscall(libc::SYS_gettid);
+                    libc::syscall(libc::SYS_tgkill, pid, tid, 40)
+                };
+                if ret == 0 { 0 } else { 1 }
+            },
+            Options::PTRACE_O_EXITKILL,
+        )?;
+        let _running = tracee.resume(None)?;
+        let stopped = match wait_group(pid)? {
+            Some(Wait::Stopped(stopped, Event::RawSignal(40))) => stopped,
+            other => panic!("expected a raw 40 delivery stop, got {other:?}"),
+        };
+        let _running = stopped.resume_raw(40)?;
+        assert_eq!(
+            wait_group(pid)?,
+            Some(Wait::Exited(pid, ExitStatus::Exited(0)))
+        );
+        Ok(())
+    }
 }
