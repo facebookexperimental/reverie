@@ -372,8 +372,26 @@ handle_post_sigprocmask(dcontext_t *dcontext, int how, kernel_sigset_t *set,
                         kernel_sigset_t *oset, size_t sigsetsize);
 int
 handle_post_sigpending(dcontext_t *dcontext, kernel_sigset_t *set, size_t sigsetsize);
+#ifdef LINUX
+int
+handle_pre_sigsuspend(dcontext_t *dcontext, const kernel_sigset_t *set,
+                      size_t sigsetsize);
+void
+handle_post_sigsuspend(dcontext_t *dcontext);
+bool
+signal_begin_injected_sigsuspend(dcontext_t *dcontext);
+bool
+signal_injection_permitted(dcontext_t *dcontext, int sysnum);
+reg_t
+signal_wait_injected_sigsuspend(dcontext_t *dcontext);
+struct _dr_syscall_invoke_result_t;
+void
+signal_finish_injected_sigsuspend(dcontext_t *dcontext,
+                                  struct _dr_syscall_invoke_result_t *result);
+#else
 void
 handle_sigsuspend(dcontext_t *dcontext, kernel_sigset_t *set, size_t sigsetsize);
+#endif
 
 #ifdef LINUX
 ptr_int_t
