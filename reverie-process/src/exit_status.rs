@@ -187,7 +187,7 @@ impl From<ExitStatus> for std::process::ExitStatus {
 impl From<std::process::ExitStatus> for ExitStatus {
     fn from(status: std::process::ExitStatus) -> Self {
         if let Some(sig) = status.signal() {
-            ExitStatus::signaled(sig, true)
+            ExitStatus::signaled(sig, status.core_dumped())
         } else {
             ExitStatus::Exited(status.code().unwrap_or(255))
         }
@@ -364,6 +364,32 @@ mod tests_non_sanitized {
 
     /// A raw signal status round-trips through `into_raw` and `from_raw`,
     /// and `signaled` picks `SignaledRaw` only for a number nix cannot name.
+    /// Converting to std's `ExitStatus` and back keeps every status,
+    /// including whether a core was dumped, for named signals and for
+    /// realtime ones, 32 and 33 among them.
+    #[test]
+    fn statuses_round_trip_through_std() {
+        let statuses = [
+            ExitStatus::Exited(0),
+            ExitStatus::Exited(42),
+            ExitStatus::Signaled(Signal::SIGKILL, false),
+            ExitStatus::Signaled(Signal::SIGILL, true),
+            ExitStatus::SignaledRaw(32, false),
+            ExitStatus::SignaledRaw(33, false),
+            ExitStatus::SignaledRaw(33, true),
+            ExitStatus::SignaledRaw(64, false),
+            ExitStatus::SignaledRaw(64, true),
+        ];
+        for status in statuses {
+            let std_status = std::process::ExitStatus::from(status);
+            assert_eq!(ExitStatus::from(std_status), status, "{status:?}");
+            assert_eq!(
+                std_status.core_dumped(),
+                status.into_raw() & 0x80 != 0 && status.code().is_none()
+            );
+        }
+    }
+
     #[test]
     fn raw_signal_statuses_round_trip() {
         for (signal, coredump) in [(34, false), (64, false), (40, true)] {
