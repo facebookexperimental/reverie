@@ -105,6 +105,7 @@ const DT_HASH: u64 = 4;
 const DT_STRTAB: u64 = 5;
 const DT_SYMTAB: u64 = 6;
 const DT_STRSZ: u64 = 10;
+const DT_SONAME: u64 = 14;
 const DT_SYMENT: u64 = 11;
 const DT_VERSYM: u64 = 0x6fff_fff0;
 const DT_VERDEF: u64 = 0x6fff_fffc;
@@ -228,12 +229,13 @@ fn build() -> Vec<u8> {
     let note = text_end;
     let note_size = 12 + 8 + 4;
     let dynamic = (note + note_size).next_multiple_of(8);
-    let dynamic_entries: [(u64, u64); 9] = [
+    let dynamic_entries: [(u64, u64); 10] = [
         (DT_HASH, hash as u64),
         (DT_STRTAB, dynstr_at as u64),
         (DT_SYMTAB, dynsym as u64),
         (DT_STRSZ, dynstr.len() as u64),
         (DT_SYMENT, SYM_SIZE as u64),
+        (DT_SONAME, soname_offset as u64),
         (DT_VERSYM, versym as u64),
         (DT_VERDEF, verdef as u64),
         (DT_VERDEFNUM, 2),
@@ -534,6 +536,15 @@ mod tests {
         assert_eq!(notes[0].n_type, 0);
         assert_eq!(notes[0].desc, CANONICAL_LINUX_VERSION_CODE.to_le_bytes());
         assert!(elf.dynamic.is_some());
+    }
+
+    /// Like the kernel's, the image names itself `linux-vdso.so.1`: glibc names
+    /// the vDSO's link map from DT_SONAME, so `dlopen("linux-vdso.so.1",
+    /// RTLD_NOLOAD)` finds it only if the image carries one.
+    #[test]
+    fn the_canonical_vdso_has_the_kernels_soname() {
+        let elf = goblin::elf::Elf::parse(canonical_vdso_image()).unwrap();
+        assert_eq!(elf.soname, Some(SONAME));
     }
 
     /// `LINUX_2.6`'s hash as Go's runtime (`vdsoLinuxVersion`) and glibc
