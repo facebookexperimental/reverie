@@ -143,7 +143,12 @@ impl ExitStatus {
                 // 32 and 33, which it reserves for itself. The kernel's
                 // sigaction is handler, flags, restorer and a 64-bit mask.
                 let default: [u64; 4] = [libc::SIG_DFL as u64, 0, 0, 0];
-                let unblock: u64 = 1 << (signal - 1);
+                // A number outside 1 to 64 names no signal: none is raised,
+                // and the process exits below.
+                let unblock: u64 = u32::try_from(signal - 1)
+                    .ok()
+                    .and_then(|bit| 1u64.checked_shl(bit))
+                    .unwrap_or(0);
                 unsafe {
                     libc::syscall(
                         libc::SYS_rt_sigaction,
@@ -415,6 +420,24 @@ mod tests_non_sanitized {
                 run_forked_raw(|| ExitStatus::SignaledRaw(signal, false).raise_or_exit()),
                 ExitStatus::SignaledRaw(signal, false),
                 "raise_or_exit of signal {signal}"
+            );
+            // With the signal blocked first, raise_or_exit must unblock it.
+            assert_eq!(
+                run_forked_raw(|| {
+                    let block: u64 = 1 << (signal - 1);
+                    unsafe {
+                        libc::syscall(
+                            libc::SYS_rt_sigprocmask,
+                            libc::SIG_BLOCK,
+                            &block as *const u64,
+                            std::ptr::null_mut::<u64>(),
+                            8,
+                        )
+                    };
+                    ExitStatus::SignaledRaw(signal, false).raise_or_exit()
+                }),
+                ExitStatus::SignaledRaw(signal, false),
+                "raise_or_exit of blocked signal {signal}"
             );
         }
     }
