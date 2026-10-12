@@ -449,7 +449,7 @@ fn table_program(leaf: u32, subleaf: u32, values: [u32; 4]) -> Vec<u8> {
 #[test]
 fn unsubscribed_cpuid_keeps_the_installed_table_and_indexed_xstate_policy() {
     for (leaf, subleaf, expected) in [
-        (0x80000001, 0, [0x663, 0, 1, 0x20100800]),
+        (0x80000001, 0, [0x663, 0, 0x21, 0x20100800]),
         (0xd, 1, [0; 4]),
         (0xd, 17, [0; 4]),
         (0xd, 19, [0; 4]),

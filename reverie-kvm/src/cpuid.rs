@@ -25,7 +25,7 @@ pub struct CpuidPolicy {
 }
 
 impl CpuidPolicy {
-    /// A fixed x86-64-v2 baseline for deterministic execution.
+    /// A fixed x86-64-v3 baseline for deterministic execution.
     // TODO-HUMAN-REVIEW(PR-129): Review the fixed KVM CPUID profile API.
     pub const fn deterministic() -> Self {
         Self {
@@ -259,14 +259,29 @@ fn indexed_cpuid_entry(
 // This starts from Detcore's fixed profile and narrows it to backend-safe
 // features. AVX remains enabled because the userspace-only guest must provide
 // the extended register state expected by host executables and dynamic
-// linkers. KVM additionally applies the selected masks after installing the
-// table.
+// linkers. The profile advertises the complete x86-64-v3 feature set for the
+// same reason: glibc builds that declare an x86-64-v3 minimum ISA level abort
+// in `_dl_fatal_printf` before `main` when the reported CPUID lacks any of
+// MOVBE, FMA, F16C, LZCNT, AVX2, BMI1, or BMI2. These add instructions only;
+// AVX already supplies the YMM state they operate on. KVM additionally applies
+// the selected masks after installing the table.
 const DETERMINISTIC_STANDARD_CPUIDS: &[[u32; 4]] = &[
     [0x0000_000d, 0x756e_6547, 0x6c65_746e, 0x4965_6e69],
     [
         0x0000_0663,
         0x0000_0800,
-        bit(0) | bit(9) | bit(13) | bit(19) | bit(20) | bit(23) | bit(26) | bit(27) | bit(28),
+        bit(0)
+            | bit(9)
+            | bit(12)
+            | bit(13)
+            | bit(19)
+            | bit(20)
+            | bit(22)
+            | bit(23)
+            | bit(26)
+            | bit(27)
+            | bit(28)
+            | bit(29),
         0x078b_fbfd,
     ],
     [0x0000_0001, 0x0000_0000, 0x0000_004d, 0x002c_307d],
@@ -274,7 +289,12 @@ const DETERMINISTIC_STANDARD_CPUIDS: &[[u32; 4]] = &[
     [0x0000_0120, 0x01c0_003f, 0x0000_003f, 0x0000_0001],
     [0x0000_0000, 0x0000_0000, 0x0000_0003, 0x0000_0000],
     [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000],
-    [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000],
+    [
+        0x0000_0000,
+        bit(3) | bit(5) | bit(8),
+        0x0000_0000,
+        0x0000_0000,
+    ],
     [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000],
     [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000],
     [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000],
@@ -306,7 +326,7 @@ const DETERMINISTIC_XSTATE_CPUIDS: &[(u32, [u32; 4])] = &[
 
 const DETERMINISTIC_EXTENDED_CPUIDS: &[[u32; 4]] = &[
     [0x8000_000a, 0x756e_6547, 0x6c65_746e, 0x4965_6e69],
-    [0x0000_0663, 0x0000_0000, 0x0000_0001, 0x2010_0800],
+    [0x0000_0663, 0x0000_0000, bit(0) | bit(5), 0x2010_0800],
     [0x554d_4551, 0x7269_5620, 0x6c61_7574, 0x5543_5020],
     [0x7265_7620, 0x6e6f_6973, 0x352e_3220, 0x0000_002b],
     [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000],
@@ -349,7 +369,7 @@ mod tests {
         ];
         minimum_host_entries[1].ecx = DETERMINISTIC_STANDARD_CPUIDS[1][2] & !bit(27);
         minimum_host_entries[1].edx = DETERMINISTIC_STANDARD_CPUIDS[1][3];
-        minimum_host_entries[2].ebx = 0;
+        minimum_host_entries[2].ebx = DETERMINISTIC_STANDARD_CPUIDS[7][1];
         minimum_host_entries[2].ecx = 0;
         minimum_host_entries[2].edx = 0;
         minimum_host_entries[6].ecx = DETERMINISTIC_EXTENDED_CPUIDS[1][2];
@@ -394,8 +414,19 @@ mod tests {
             leaf(1, 0).ecx & (bit(26) | bit(27) | bit(28)),
             bit(26) | bit(27) | bit(28)
         );
+        assert_eq!(
+            leaf(1, 0).ecx & (bit(12) | bit(13) | bit(20) | bit(22) | bit(23) | bit(29)),
+            bit(12) | bit(13) | bit(20) | bit(22) | bit(23) | bit(29)
+        );
         assert_eq!(leaf(4, 0).flags, KVM_CPUID_FLAG_SIGNIFCANT_INDEX);
-        assert!(entries.iter().all(|entry| entry.function != 7));
+        assert_eq!(leaf(7, 0).flags, KVM_CPUID_FLAG_SIGNIFCANT_INDEX);
+        assert_eq!(leaf(7, 0).ebx, bit(3) | bit(5) | bit(8));
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.function != 7 || entry.index == 0)
+        );
+        assert_eq!(leaf(0x8000_0001, 0).ecx & bit(5), bit(5));
         assert_eq!(leaf(0xb, 0).flags, KVM_CPUID_FLAG_SIGNIFCANT_INDEX);
         assert_eq!(leaf(0xd, 0).eax & 0x7, 0x7);
         assert_eq!(leaf(0x8000_0000, 0).eax, 0x8000_000a);

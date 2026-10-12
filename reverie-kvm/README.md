@@ -245,7 +245,7 @@ page-aligned frame per request, so a single KVM run can route several syscalls.
 
 Every vCPU receives an explicit CPUID table through `KVM_SET_CPUID2` before
 its first `KVM_RUN`. The default `CpuidPolicy::deterministic` policy replaces
-the host table with a fixed x86-64-v2 profile based on Detcore's CPUID table,
+the host table with a fixed x86-64-v3 profile based on Detcore's CPUID table,
 then removes `RDRAND`, `RDSEED`, TSX, AVX-512 feature bits, and the AVX-512
 extended register state. This keeps standard and extended identity, feature,
 cache, and topology leaves independent of the KVM host. VM creation fails if
