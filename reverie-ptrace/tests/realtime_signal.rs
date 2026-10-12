@@ -603,11 +603,16 @@ fn queued_realtime_instances_keep_their_order_through_a_held_signals_callback() 
 /// `rt_sigprocmask(SIG_UNBLOCK, buf, NULL)`, then `Guest::inject_with_retry`
 /// of `getpid`. The tool returns the `getpid` result.
 const RETRY_FD: i32 = 903;
-/// Like `RETRY_FD`, but the retried syscall is `read(READ_TIMER_FD, buf, 8)`,
-/// which blocks until the guest's timer at `READ_TIMER_FD` expires.
-const RETRY_READ_FD: i32 = 904;
-/// The descriptor the guest moves its timerfd to for `RETRY_READ_FD`.
+/// Like `RETRY_FD`, but the call is `Guest::inject_restartable` of
+/// `read(READ_TIMER_FD, buf, 8)`, which blocks until the guest's timer at
+/// `READ_TIMER_FD` expires.
+const RESTARTABLE_READ_FD: i32 = 904;
+/// The descriptor the guest moves its timerfd to for the read markers.
 const READ_TIMER_FD: i32 = 905;
+/// Like `RESTARTABLE_READ_FD`, with `Guest::inject_with_retry`.
+const RETRY_READ_FD: i32 = 906;
+/// Like `RETRY_FD`, with `Guest::inject_restartable` of `getpid`.
+const RESTARTABLE_FD: i32 = 907;
 
 /// Like `RawSignalTool`, for `RETRY_FD`.
 #[derive(Clone, Copy, Debug, Default)]
@@ -631,7 +636,9 @@ impl Tool for RetryTool {
     ) -> Result<i64, Error> {
         match syscall {
             Syscall::Write(write)
-                if (write.fd() == RETRY_FD || write.fd() == RETRY_READ_FD) && write.len() == 0 =>
+                if [RETRY_FD, RESTARTABLE_READ_FD, RETRY_READ_FD, RESTARTABLE_FD]
+                    .contains(&write.fd())
+                    && write.len() == 0 =>
             {
                 let set = write.buf().and_then(|buf| Addr::from_raw(buf.as_raw()));
                 let unblocked = guest
@@ -646,19 +653,15 @@ impl Tool for RetryTool {
                 guest
                     .send_rpc(Report::Injected(unblocked.map_err(Errno::into_raw)))
                     .await;
-                let result = if write.fd() == RETRY_READ_FD {
-                    guest
-                        .inject_with_retry(
-                            Read::new()
-                                .with_fd(READ_TIMER_FD)
-                                .with_buf(
-                                    write.buf().and_then(|buf| AddrMut::from_raw(buf.as_raw())),
-                                )
-                                .with_len(8),
-                        )
-                        .await
-                } else {
-                    guest.inject_with_retry(Getpid::new()).await
+                let read = Read::new()
+                    .with_fd(READ_TIMER_FD)
+                    .with_buf(write.buf().and_then(|buf| AddrMut::from_raw(buf.as_raw())))
+                    .with_len(8);
+                let result = match write.fd() {
+                    RESTARTABLE_READ_FD => guest.inject_restartable(read).await,
+                    RETRY_READ_FD => guest.inject_with_retry(read).await,
+                    RESTARTABLE_FD => guest.inject_restartable(Getpid::new()).await,
+                    _ => guest.inject_with_retry(Getpid::new()).await,
                 };
                 guest
                     .send_rpc(Report::Injected(result.map_err(Errno::into_raw)))
@@ -689,6 +692,11 @@ impl Tool for RetryTool {
 /// value in order: the held instance keeps its siginfo when it is passed on
 /// after the callback's injections. `queued` is 0 and 1 for the controls.
 fn realtime_instances_survive_an_ordinary_retry(queued: usize) {
+    realtime_instances_survive_a_retry(queued, RETRY_FD);
+}
+
+/// `realtime_instances_survive_an_ordinary_retry` through `marker`.
+fn realtime_instances_survive_a_retry(queued: usize, marker: i32) {
     let (output, log) = test_fn::<RetryTool, _>(move || {
         DELIVERIES.store(0, Ordering::SeqCst);
         let signal = libc::SIGRTMIN() + 4;
@@ -706,7 +714,7 @@ fn realtime_instances_survive_an_ordinary_retry(queued: usize) {
         // SAFETY: the tool replaces this zero-length write.
         let ret = unsafe {
             libc::write(
-                RETRY_FD,
+                marker,
                 &set as *const libc::sigset_t as *const libc::c_void,
                 0,
             )
@@ -755,18 +763,30 @@ fn an_ordinary_retry_without_a_realtime_signal_completes() {
     realtime_instances_survive_an_ordinary_retry(0);
 }
 
-/// An ordinary callback's `inject_with_retry` of a blocking syscall, with one
-/// signal held and a realtime signal queued, returns the syscall's restart
-/// code at once (https://github.com/rrnewton/reverie/issues/998). SIGUSR1
-/// stops the first `read` before its `syscall` and is held. The retry keeps
-/// SIGRTMIN+4 queued until the `read`'s entry, where it is pending, so the
-/// `read` returns ERESTARTSYS without blocking. A further retry would return
-/// the same until the timer expired; instead the guest's syscall returns it,
-/// the signals run their handlers as when the guest unblocked them natively,
-/// and the guest's `write`, whose handlers lack SA_RESTART, fails with EINTR.
-/// The guest calls again and the `read` blocks until the timer expires.
+/// `inject_restartable` retries a syscall that a signal stopped before it
+/// ran, as `inject_with_retry` does: the first instance is held there, and
+/// returning ERESTARTSYS would fail the guest's call although `getpid` never
+/// ran and no second signal was pending at its entry.
 #[test]
-fn a_retried_blocking_syscall_returns_its_restart_code_while_a_signal_is_held() {
+fn a_restartable_call_that_did_not_run_is_retried() {
+    realtime_instances_survive_a_retry(1, RESTARTABLE_FD);
+}
+
+/// With a second instance queued, the retried `getpid` cannot block, so it
+/// completes and `inject_restartable` returns its result.
+#[test]
+fn two_realtime_instances_survive_a_restartable_retry() {
+    realtime_instances_survive_a_retry(2, RESTARTABLE_FD);
+}
+
+/// A guest `write`'s return value and errno.
+type WriteResult = (isize, Option<i32>);
+
+/// The guest of the held-signal blocking-read tests. SIGUSR1 (value 7) and
+/// SIGRTMIN+4 (value 111) are queued and blocked; a 500 ms timer is at
+/// `READ_TIMER_FD`. `check` gets a call through `marker`, which returns the
+/// guest `write`'s result and errno, and SIGRTMIN+4's number.
+fn held_signal_blocking_read_guest(marker: i32, check: fn(&dyn Fn() -> WriteResult, i32)) -> Log {
     let (output, log) = test_fn::<RetryTool, _>(move || {
         DELIVERIES.store(0, Ordering::SeqCst);
         let realtime = libc::SIGRTMIN() + 4;
@@ -808,31 +828,61 @@ fn a_retried_blocking_syscall_returns_its_restart_code_while_a_signal_is_held() 
             // it injects writes 8 bytes into `set`.
             let ret = unsafe {
                 libc::write(
-                    RETRY_READ_FD,
+                    marker,
                     &mut set as *mut libc::sigset_t as *const libc::c_void,
                     0,
                 )
             };
             (ret, std::io::Error::last_os_error().raw_os_error())
         };
-        assert_eq!(call(), (-1, Some(libc::EINTR)));
-        assert_eq!(delivered(), vec![(realtime, 111), (libc::SIGUSR1, 7)]);
-        assert_eq!(call().0, 8);
+        check(&call, realtime);
     })
-    .expect("run retried-blocking-syscall guest");
-
+    .expect("run held-signal blocking-read guest");
     assert_eq!(
         output.status,
         ExitStatus::Exited(0),
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    log
+}
+
+/// A callback's `inject_restartable` of a blocking syscall, with one signal
+/// held and a realtime signal queued, returns the syscall's restart code at
+/// once (https://github.com/rrnewton/reverie/issues/998). SIGUSR1 stops the
+/// first `read` before its `syscall` and is held. The retry keeps
+/// SIGRTMIN+4 queued until the `read`'s entry, where it is pending, so the
+/// `read` returns ERESTARTSYS without blocking; `inject_with_retry` would
+/// repeat that until the timer expired. The guest's `write` returns the code,
+/// both handlers run, and the `write`, whose handlers lack SA_RESTART, fails
+/// with EINTR. The guest calls again and the `read` blocks until the timer
+/// expires.
+#[test]
+fn a_restartable_blocking_syscall_returns_its_restart_code_while_a_signal_is_held() {
+    let log = held_signal_blocking_read_guest(RESTARTABLE_READ_FD, |call, realtime| {
+        assert_eq!(call(), (-1, Some(libc::EINTR)));
+        assert_eq!(delivered(), vec![(realtime, 111), (libc::SIGUSR1, 7)]);
+        assert_eq!(call().0, 8);
+    });
     let injected = log.injected.lock().unwrap();
     assert_eq!(
         injected[..],
-        [Ok(0), Err(Errno::ERESTARTSYS.into_raw()), Ok(0), Ok(8),],
+        [Ok(0), Err(Errno::ERESTARTSYS.into_raw()), Ok(0), Ok(8)],
         "the first retry returns the restart code instead of retrying until the timer expires"
     );
+}
+
+/// `inject_with_retry` keeps its contract: in the same case it retries the
+/// `read` until the timer expires, and the signals run their handlers after
+/// the guest's `write` returns.
+#[test]
+fn inject_with_retry_still_retries_a_blocking_syscall_while_a_signal_is_held() {
+    let log = held_signal_blocking_read_guest(RETRY_READ_FD, |call, realtime| {
+        assert_eq!(call().0, 8);
+        assert_eq!(delivered(), vec![(realtime, 111), (libc::SIGUSR1, 7)]);
+    });
+    let injected = log.injected.lock().unwrap();
+    assert_eq!(injected[..], [Ok(0), Ok(8)]);
 }
 
 /// A guest that a realtime signal kills ends with

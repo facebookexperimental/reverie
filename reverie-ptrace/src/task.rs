@@ -2439,7 +2439,7 @@ pub struct TracedTask<L: Tool> {
     /// Whether the syscall of the injection that last completed ran. False
     /// when `status_to_result` reported that a signal stopped it before its
     /// `syscall` instruction (`-ERESTARTSYS`, not run). Read by
-    /// `Guest::inject_with_retry`.
+    /// `Guest::inject_restartable`.
     last_injection_ran: bool,
 
     /// Whether `Tool::handle_signal_event` is running (`report_signal`).
@@ -8984,17 +8984,18 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
         self.do_inject(nr, args).await
     }
 
-    /// Retries as the provided method does, except when the syscall ran and
-    /// returned `EINTR` or `ERESTARTSYS` while a signal is held
-    /// (`pending_signal`). Another signal was pending at its entry, as an
-    /// injection that starts with a signal held keeps realtime signals queued
-    /// until then (`step_keeping_realtime_queued`), so a retry would return
-    /// the same code at once until the syscall's own condition is met
-    /// (https://github.com/rrnewton/reverie/issues/998). The code is
-    /// returned instead, so the guest's syscall returns it and the signals
-    /// are delivered when the guest resumes, as natively. A syscall that a
-    /// signal stopped before its instruction did not run and is retried.
-    async fn inject_with_retry<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
+    /// Returns `EINTR` or `ERESTARTSYS` from a syscall that ran while a
+    /// signal is held (`pending_signal`). An injection that starts with a
+    /// signal held keeps realtime signals queued until the syscall's entry,
+    /// so one queued then is pending there, and a retry would return the same
+    /// code at once until the syscall's own condition is met
+    /// (<https://github.com/rrnewton/reverie/issues/998>). The held signal is
+    /// delivered as the guest resumes, and Linux restarts the guest's
+    /// syscall or fails it with `EINTR` by its handler. Without a held
+    /// signal the code is retried as before, for example after a group stop
+    /// or a signal the tracer consumes. A syscall that a signal stopped
+    /// before it ran is retried.
+    async fn inject_restartable<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
         loop {
             match self.inject(syscall).await {
                 Err(error @ (Errno::EINTR | Errno::ERESTARTSYS))

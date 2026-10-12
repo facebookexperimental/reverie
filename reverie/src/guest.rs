@@ -523,6 +523,23 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
         }
     }
 
+    /// Like [`Guest::inject_with_retry`], but for a call whose callback can be
+    /// re-run: a backend may return `EINTR` or `ERESTARTSYS` from a syscall
+    /// that ran, instead of retrying it, when it will deliver a signal as the
+    /// guest resumes. The caller must return that code unchanged as the
+    /// guest's syscall result. Linux then restarts the guest's syscall or
+    /// fails it with `EINTR`, by the handler's `SA_RESTART`. A restart runs
+    /// the whole callback again, including every injection before this one,
+    /// so those must be safe to repeat.
+    ///
+    /// A syscall that a signal stopped before it ran is retried, as by
+    /// `inject_with_retry`. The default retries every interrupted call; the
+    /// ptrace backend returns the code when a signal is held for delivery
+    /// (<https://github.com/rrnewton/reverie/issues/998>).
+    async fn inject_restartable<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
+        self.inject_with_retry(syscall).await
+    }
+
     /// Converts this `Guest<T>` such that it implements `Guest<U>`. This is
     /// useful when forwarding callbacks to a "child" tool.
     #[allow(clippy::wrong_self_convention)]
@@ -808,6 +825,10 @@ where
 
     async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
         self.inner.inject(syscall).await
+    }
+
+    async fn inject_restartable<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
+        self.inner.inject_restartable(syscall).await
     }
 
     async fn tail_inject<S: SyscallInfo>(&mut self, syscall: S) -> Never {
