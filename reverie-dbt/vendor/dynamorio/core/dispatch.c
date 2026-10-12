@@ -54,6 +54,12 @@
 #include "arch.h"
 #include "instrument.h"
 
+#ifdef LINUX
+#    include <errno.h>
+#    undef errno
+#    include "unix/include/syscall.h"
+#endif
+
 #ifdef DGC_DIAGNOSTICS
 #    include "instr.h"
 #    include "disassemble.h"
@@ -733,8 +739,8 @@ dispatch_enter_native(dcontext_t *dcontext)
     ASSERT_NOT_REACHED();
 }
 
-static void
-set_next_tag_to_prior_syscall(dcontext_t *dcontext)
+app_pc
+get_prior_syscall_pc(dcontext_t *dcontext, app_pc post_syscall_pc)
 {
     /* We need to remember both the post-syscall resumption point and
      * the fact that we need to execute a syscall, but we only have
@@ -745,10 +751,17 @@ set_next_tag_to_prior_syscall(dcontext_t *dcontext)
      * will not know the syscall number: but any re-execution in a loop
      * will go back to the main bb.
      */
-    dcontext->next_tag -= syscall_instr_length(
+    app_pc syscall_pc = post_syscall_pc - syscall_instr_length(
         dcontext->last_fragment == NULL ? DEFAULT_ISA_MODE
                                         : FRAG_ISA_MODE(dcontext->last_fragment->flags));
-    ASSERT(is_syscall_at_pc(dcontext, dcontext->next_tag));
+    ASSERT(is_syscall_at_pc(dcontext, syscall_pc));
+    return syscall_pc;
+}
+
+static void
+set_next_tag_to_prior_syscall(dcontext_t *dcontext)
+{
+    dcontext->next_tag = get_prior_syscall_pc(dcontext, dcontext->next_tag);
 }
 
 static void
@@ -2104,6 +2117,24 @@ handle_system_call(dcontext_t *dcontext)
         set_at_syscall(dcontext, true);
         KSTART_DC(dcontext, syscall_fcache); /* stopped in dispatch_exit_fcache_stats */
         bool is_ignorable = ignorable_system_call(sysnum, NULL, dcontext);
+#ifdef LINUX
+        /* Sigsuspend's pre-handler is deliberately idempotent: it retains one
+         * captured temporary mask across internal retries. Let the ordinary
+         * pending-signal fcache-entry check abort this blocking syscall too.
+         * This closes arrival after the pre-handler's queue check; an arrival
+         * at the syscall instruction uses record_pending_signal's at_syscall
+         * interruption path instead.
+         */
+        bool is_sigsuspend = dcontext->sys_num == SYS_rt_sigsuspend;
+        is_ignorable = is_ignorable || is_sigsuspend;
+        /* A client may have rewritten the original syscall number. The
+         * actual sigprocmask pre-handler has changed virtual mask state and
+         * may have staged private input, so complete it before delivery just
+         * as for an original non-ignorable sigprocmask.
+         */
+        if (dcontext->sys_num == SYS_rt_sigprocmask)
+            is_ignorable = false;
+#endif
         do {
 #ifdef UNIX
             /* It is difficult to undo some pre-syscall handling, especially for
@@ -2141,12 +2172,24 @@ handle_system_call(dcontext_t *dcontext)
             /* i#2019: see comments in dispatch_enter_fcache() */
             KSTOP(syscall_fcache);
             dcontext->whereami = DR_WHERE_DISPATCH;
-            set_at_syscall(dcontext, false);
             dcontext->next_tag = saved_next_tag;
-            set_next_tag_to_prior_syscall(dcontext);
-            /* This only happens for ignorable syscalls so there is no pre-syscall
-             * handling to undo or worry about dupilcating when we re-attempt to
-             * execute it after the app's signal handler.
+#ifdef LINUX
+            if (is_sigsuspend) {
+                /* Provisional interrupted context for signal delivery, not a
+                 * guest return. If no caught signal consumes the suspend,
+                 * receive_pending_signal restores the captured wait instead.
+                 */
+                get_mcontext(dcontext)->IF_X86_ELSE(xax, IF_RISCV64_ELSE(a0, r0)) =
+                    -EINTR;
+                handle_post_system_call(dcontext);
+            } else
+#endif
+            {
+                set_at_syscall(dcontext, false);
+                set_next_tag_to_prior_syscall(dcontext);
+            }
+            /* Ordinary ignorable syscalls have no pre-handling to undo.
+             * Sigsuspend retains its temporary mask until caught delivery.
              */
             LOG(THREAD, LOG_DISPATCH, 2,
                 "Signal arrived in DR: aborting ignorable syscall enter; interrupted " PFX

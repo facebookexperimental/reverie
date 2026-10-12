@@ -86,6 +86,17 @@ typedef int32_t (*memory_reader_t)(uintptr_t, uint8_t*, size_t);
 typedef size_t (*memory_writer_t)(uintptr_t, const uint8_t*, size_t);
 
 typedef struct {
+  int32_t signal;
+  int32_t delivered_signal;
+  unsigned char signal_info[128];
+  int32_t signal_info_changed;
+  uint32_t reserved;
+  int64_t deferred_sysnum;
+  uint64_t deferred_args[6];
+} dbt_signal_event_t;
+_Static_assert(sizeof(dbt_signal_event_t) == 200, "DBT signal ABI size");
+
+typedef struct {
   uint64_t branches;
   uint64_t observed_syscalls;
   uint64_t rewritten_syscalls;
@@ -140,6 +151,21 @@ typedef struct {
   // to the virtual PID that the application passed. Numeric PID equality alone
   // is insufficient because guest and host PID spaces can overlap.
   translated_child_wait_t translated_child_wait;
+  // Separate from the preemption slot: no suspended continuation can overwrite
+  // another's registers or enter Rust while its thread-state borrow is live.
+  uint64_t signal_token;
+  uint64_t signal_image_generation;
+  process_id_t signal_owner_pid;
+  thread_id_t signal_owner_tid;
+  uint32_t signal_phase; // 1: captured, 2: Rust returned, 3: terminal syscall
+  bool signal_registers_changed;
+  dr_mcontext_t* signal_mcontext;
+  dbt_signal_event_t signal_event;
+  int32_t signal_action;
+  uint64_t syscall_interruption;
+  uint64_t syscall_interruption_generation;
+  process_id_t syscall_interruption_pid;
+  thread_id_t syscall_interruption_tid;
 } prototype_counters_t;
 
 #define VIRTUAL_ROOT_PID INT32_C(3)
@@ -248,7 +274,7 @@ static const cpuid_result_t extended_cpuid[] = {
 // exit, and app-level writes re-enter the syscall interception path.
 typedef void (*reverie_emit_fn_t)(const char* buf, size_t len);
 typedef void (*reverie_idle_fn_t)(void);
-#define REVERIE_DBT_RUNTIME_ABI_VERSION 6u
+#define REVERIE_DBT_RUNTIME_ABI_VERSION 7u
 #define REVERIE_DBT_STARTUP_STANDALONE 1u
 #define REVERIE_DBT_STARTUP_COORDINATED 2u
 // TODO-HUMAN-REVIEW(PR-162): Review the additive stdout-emit runtime callback
@@ -373,6 +399,12 @@ extern int32_t reverie_dbt_runtime_pre_syscall(
     memory_reader_t read_memory,
     memory_writer_t write_memory,
     reverie_emit_fn_t emit);
+extern int32_t reverie_dbt_runtime_signal_event(
+    void* context, void* counters, int32_t tid, int32_t pid,
+    uint64_t image_generation, uint64_t branches, dbt_signal_event_t* event,
+    syscall_invoker_t invoke_syscall, register_reader_t read_registers,
+    register_writer_t write_registers, memory_reader_t read_memory,
+    memory_writer_t write_memory, reverie_emit_fn_t emit);
 // Answers one rdtsc (with_aux == 0) or rdtscp: 1 with *tsc (and *aux) written
 // when the runtime's tool answers it, 0 when the runtime leaves it to the
 // client's fixed-stride counter, negative on failure (ABI version 5).
@@ -570,16 +602,22 @@ static size_t evidence_buffer_length;
 static void* evidence_lock;
 static evidence_sender_state_t* evidence_senders;
 static _Thread_local uint32_t evidence_callback_depth;
+// Unlike the evidence tag, this is consulted by the admission ownership gate
+// before any new signal callback can acquire runtime/thread-state references.
+static _Thread_local uint32_t native_runtime_entries;
 
 static bool evidence_is_enabled(void) {
   return evidence_config_page.value.enabled != 0;
 }
 
 static void evidence_callback_enter(void) {
+  ++native_runtime_entries;
   ++evidence_callback_depth;
 }
 
 static void evidence_callback_leave(void) {
+  DR_ASSERT(native_runtime_entries != 0);
+  --native_runtime_entries;
   DR_ASSERT(evidence_callback_depth != 0);
   --evidence_callback_depth;
 }
@@ -1990,6 +2028,7 @@ static void start_pending_thread(void) {
 // Defined below, after the runtime-readiness predicates it consults.
 static void maybe_preempt(app_pc pc);
 static void preempt_return(void);
+static void signal_admission_return(void);
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-dbi-preempt): Review the injected-syscall stub.
@@ -2004,6 +2043,7 @@ static void preempt_return(void);
 #define PREEMPT_STUB_SYSCALL_LEN 2 /* bytes of `syscall` (0F 05) */
 #define PREEMPT_STUB_LEN 4 /* syscall (2) + ud2 (2) */
 static byte* preempt_stub;
+static byte* signal_stub;
 
 static bool is_counted_branch(instr_t* instruction) {
   return instr_is_cbr(instruction) || instr_is_ubr(instruction) ||
@@ -2120,6 +2160,17 @@ static dr_emit_flags_t instrument_instruction(
     bool for_trace,
     bool translating,
     void* user_data) {
+  // Private control instructions never enter application branch accounting,
+  // stack scrubbing, thread admission, or the synthetic sched_yield path.
+  if (instr_is_app(instruction) && signal_stub != NULL) {
+    app_pc pc = instr_get_app_pc(instruction);
+    if (pc >= signal_stub && pc < signal_stub + PREEMPT_STUB_LEN) {
+      if (pc == signal_stub + PREEMPT_STUB_SYSCALL_LEN)
+        dr_insert_clean_call(drcontext, bb, instruction,
+                             (void*)signal_admission_return, false, 0);
+      return DR_EMIT_DEFAULT;
+    }
+  }
   // A shared fragment can be compiled before any thread clone is pending.
   // Always retain the runtime check: thread-init's mcontext PC is not a valid
   // application entry address on Linux, so it cannot flush an older fragment.
@@ -2436,16 +2487,31 @@ static bool translate_identity_argument(uint64_t* argument) {
 
 static int64_t
 invoke_raw_syscall(uintptr_t context, int64_t sysnum, const uint64_t* args) {
-  return (int64_t)dr_invoke_syscall_as_app(
-      (void*)context,
-      (int)sysnum,
-      6,
-      args[0],
-      args[1],
-      args[2],
-      args[3],
-      args[4],
-      args[5]);
+  prototype_counters_t* counters = drmgr_get_tls_field(
+      (void*)context, thread_state_index);
+  reg_t raw_args[6];
+  for (int i = 0; i < 6; ++i) raw_args[i] = (reg_t)args[i];
+  dr_syscall_invoke_result_t invocation;
+  if (!dr_invoke_syscall_as_app_with_result(
+          (void*)context, (int)sysnum, 6, raw_args, &invocation)) {
+    dr_fprintf(diagnostic_file,
+               "reverie-dbt: returning syscall injection ownership refused\n");
+    exit_runtime_tree(101);
+    return -EIO;
+  }
+  if (invocation.interruption != 0) {
+    if (counters == NULL || counters->syscall_interruption != 0) {
+      dr_fprintf(diagnostic_file, "reverie-dbt: nested syscall interruption refused\n");
+      exit_runtime_tree(101);
+      return -EIO;
+    }
+    counters->syscall_interruption = invocation.interruption;
+    counters->syscall_interruption_generation =
+        atomic_load_explicit(&image_generation, memory_order_acquire);
+    counters->syscall_interruption_pid = dr_get_process_id();
+    counters->syscall_interruption_tid = dr_get_thread_id((void*)context);
+  }
+  return (int64_t)invocation.value;
 }
 
 static bool is_exec_syscall(int sysnum);
@@ -3329,8 +3395,12 @@ invoke_syscall(uintptr_t context, int64_t sysnum, const uint64_t* args) {
 
 static int32_t read_registers(uintptr_t context, struct user_regs_struct* out) {
   dr_mcontext_t registers = {sizeof(registers), DR_MC_ALL};
+  prototype_counters_t* counters =
+      drmgr_get_tls_field((void*)context, thread_state_index);
   memset(out, 0, sizeof(*out));
-  if (!dr_get_mcontext((void*)context, &registers))
+  if (counters != NULL && counters->signal_token != 0)
+    registers = *counters->signal_mcontext;
+  else if (!dr_get_mcontext((void*)context, &registers))
     return 0;
 
   out->r15 = registers.r15;
@@ -3368,7 +3438,12 @@ static int32_t write_registers(
     uintptr_t context,
     const struct user_regs_struct* in) {
   dr_mcontext_t registers = {sizeof(registers), DR_MC_ALL};
-  if (!dr_get_mcontext((void*)context, &registers))
+  prototype_counters_t* counters =
+      drmgr_get_tls_field((void*)context, thread_state_index);
+  bool signal_owned = counters != NULL && counters->signal_token != 0;
+  if (signal_owned)
+    registers = *counters->signal_mcontext;
+  else if (!dr_get_mcontext((void*)context, &registers))
     return 0;
 
   registers.r15 = in->r15;
@@ -3389,7 +3464,11 @@ static int32_t write_registers(
   registers.xflags = in->eflags;
   registers.xsp = in->rsp;
 
-  if (!dr_set_mcontext((void*)context, &registers))
+  if (signal_owned) {
+    registers.pc = (app_pc)in->rip;
+    *counters->signal_mcontext = registers;
+    counters->signal_registers_changed = true;
+  } else if (!dr_set_mcontext((void*)context, &registers))
     return 0;
   return 1;
 }
@@ -4585,7 +4664,7 @@ static void maybe_preempt(app_pc pc) {
   // An injected sched_yield is already in flight for this thread (we are
   // between the redirect to the stub and `preempt_return`); never nest a
   // preemption.
-  if (counters->preempt_pending != 0)
+  if (counters->preempt_pending != 0 || counters->signal_token != 0)
     return;
   // Only preempt a thread that actually drives the Reverie tool this turn.
   // Mirror the guards used around the syscall dispatch: the runtime image must
@@ -4880,6 +4959,55 @@ static bool pre_syscall(void* drcontext, int sysnum) {
   prototype_counters_t* counters =
       (prototype_counters_t*)drmgr_get_tls_field(drcontext, thread_state_index);
   DR_ASSERT(counters != NULL);
+  if (counters->signal_token != 0 && counters->signal_phase == 1) {
+    if (native_runtime_entries != 0 || counters->preempt_pending != 0 ||
+        sysnum != SYS_gettid ||
+        counters->signal_owner_tid != dr_get_thread_id(drcontext) ||
+        counters->signal_owner_pid != dr_get_process_id() ||
+        counters->signal_image_generation !=
+            atomic_load_explicit(&image_generation, memory_order_acquire)) {
+      dr_fprintf(diagnostic_file, "reverie-dbt: invalid signal continuation owner\n");
+      exit_runtime_tree(101);
+      return false;
+    }
+    // The private syscall is a safe entry boundary, never a Tool syscall or
+    // extra scheduler turn. Drop all Rust ownership before the native commit.
+    counters->signal_phase = 2;
+    evidence_callback_enter();
+    counters->signal_action = reverie_dbt_runtime_signal_event(
+        drcontext, counters, (int32_t)dr_get_thread_id(drcontext),
+        (int32_t)dr_get_process_id(), counters->signal_image_generation,
+        atomic_load_explicit(&branch_count, memory_order_relaxed),
+        &counters->signal_event, invoke_syscall, read_registers, write_registers,
+        read_memory, write_memory, reverie_dbt_emit);
+    evidence_callback_leave();
+    if (counters->signal_action < 0 || counters->signal_action > 2 ||
+        native_runtime_entries != 0) {
+      exit_runtime_tree(101);
+      return false;
+    }
+    if (counters->signal_action == 2) {
+      // Returning native syscalls need a different continuation. The shared
+      // signal hook uses this terminal path for cancellation.
+      dbt_signal_event_t* event = &counters->signal_event;
+      if (event->deferred_sysnum != SYS_exit &&
+          event->deferred_sysnum != SYS_exit_group) {
+        dr_fprintf(diagnostic_file,
+                   "reverie-dbt: nonterminal signal tail-injection is unsupported\n");
+        exit_runtime_tree(101);
+        return false;
+      }
+      counters->signal_phase = 3;
+      dr_syscall_set_sysnum(drcontext, (int)event->deferred_sysnum);
+      for (int i = 0; i != 6; ++i)
+        dr_syscall_set_param(drcontext, i, (reg_t)event->deferred_args[i]);
+      complete_runtime_thread_exit(
+          counters, drcontext, event->deferred_sysnum == SYS_exit);
+      return true;
+    }
+    dr_syscall_set_result(drcontext, 0);
+    return false;
+  }
   if (fail_if_process_clone_result_pending(counters, sysnum))
     return false;
 
@@ -5120,6 +5248,27 @@ static bool pre_syscall(void* drcontext, int sysnum) {
       reverie_dbt_emit);
   evidence_callback_leave();
   DR_ASSERT(evidence_callback_depth == 0);
+  if (counters->syscall_interruption != 0) {
+    uint64_t token = counters->syscall_interruption;
+    bool owner = native_runtime_entries == 0 &&
+        counters->syscall_interruption_pid == dr_get_process_id() &&
+        counters->syscall_interruption_tid == dr_get_thread_id(drcontext) &&
+        counters->syscall_interruption_generation ==
+            atomic_load_explicit(&image_generation, memory_order_acquire);
+    bool terminal = action == 2 &&
+        (deferred_sysnum == SYS_exit || deferred_sysnum == SYS_exit_group);
+    bool resolved = owner &&
+        (terminal ? dr_cancel_syscall_interruption(drcontext, token)
+                  : action == 1 && dr_complete_syscall_interruption(
+                        drcontext, token, (reg_t)result));
+    if (!resolved) {
+      dr_fprintf(diagnostic_file,
+                 "reverie-dbt: interrupted syscall final outcome refused\n");
+      exit_runtime_tree(101);
+      return false;
+    }
+    counters->syscall_interruption = 0;
+  }
   if (action != 0 && counters->pending_thread_clone != 0)
     counters->pending_thread_clone = 0;
 
@@ -5220,6 +5369,9 @@ static void thread_init(void* drcontext) {
         (dr_mcontext_t*)dr_thread_alloc(drcontext, sizeof(dr_mcontext_t));
     DR_ASSERT(counters->preempt_mcontext != NULL);
   }
+  counters->signal_mcontext =
+      (dr_mcontext_t*)dr_thread_alloc(drcontext, sizeof(dr_mcontext_t));
+  DR_ASSERT(counters->signal_mcontext != NULL);
 
   int32_t pending_thread_start =
       dr_get_thread_id(drcontext) != dr_get_process_id() &&
@@ -5313,6 +5465,8 @@ static void thread_exit(void* drcontext) {
     complete_runtime_thread_exit(counters, drcontext, false);
     evidence_thread_leave(counters);
     if (owns_runtime) {
+      if (counters->signal_mcontext != NULL)
+        dr_thread_free(drcontext, counters->signal_mcontext, sizeof(dr_mcontext_t));
       if (counters->preempt_mcontext != NULL)
         dr_thread_free(
             drcontext, counters->preempt_mcontext, sizeof(dr_mcontext_t));
@@ -5550,6 +5704,75 @@ static void virtualize_translated_child_wait_target(
 static dr_signal_action_t event_signal(void* drcontext, dr_siginfo_t* info) {
   virtualize_translated_child_wait_target(drcontext, info);
   return DR_SIGNAL_DELIVER;
+}
+
+static dr_signal_admission_status_t signal_admission_event(
+    void* drcontext, const dr_signal_admission_t* event, dr_mcontext_t* redirect) {
+  prototype_counters_t* counters =
+      drmgr_get_tls_field(drcontext, thread_state_index);
+  if (event == NULL) {
+    if (counters == NULL ||
+        !reverie_dbt_runtime_ready(
+            atomic_load_explicit(&image_generation, memory_order_acquire)) ||
+        (has_copied_runtime() &&
+         (!runtime_uses_external_global() || is_copied_vfork_process())))
+      return DR_SIGNAL_ADMISSION_BYPASS;
+    if (native_runtime_entries != 0 || counters->preempt_pending != 0 ||
+        counters->signal_token != 0 || counters->pending_thread_start != 0 ||
+        counters->pending_process_clone_result != 0)
+      return DR_SIGNAL_ADMISSION_WAIT;
+    return DR_SIGNAL_ADMISSION_START;
+  }
+  if (counters == NULL || event->token == 0 || native_runtime_entries != 0 ||
+      counters->preempt_pending != 0 || counters->signal_token != 0) {
+    dr_fprintf(diagnostic_file, "reverie-dbt: signal admission ownership violation\n");
+    exit_runtime_tree(101);
+    return DR_SIGNAL_ADMISSION_WAIT;
+  }
+  counters->signal_token = event->token;
+  counters->signal_owner_tid = dr_get_thread_id(drcontext);
+  counters->signal_owner_pid = dr_get_process_id();
+  counters->signal_image_generation =
+      atomic_load_explicit(&image_generation, memory_order_acquire);
+  counters->signal_phase = 1;
+  counters->signal_registers_changed = false;
+  *counters->signal_mcontext = *event->mcontext;
+  memset(&counters->signal_event, 0, sizeof(counters->signal_event));
+  counters->signal_event.signal = event->sig;
+  counters->signal_event.delivered_signal = event->sig;
+  memcpy(counters->signal_event.signal_info, event->siginfo, sizeof(event->siginfo));
+  redirect->pc = signal_stub;
+  redirect->xax = SYS_gettid;
+  return DR_SIGNAL_ADMISSION_START;
+}
+
+static void signal_admission_return(void) {
+  void* drcontext = dr_get_current_drcontext();
+  prototype_counters_t* counters =
+      drmgr_get_tls_field(drcontext, thread_state_index);
+  if (counters == NULL || counters->signal_token == 0 ||
+      counters->signal_phase != 2 || native_runtime_entries != 0 ||
+      counters->signal_owner_tid != dr_get_thread_id(drcontext) ||
+      counters->signal_owner_pid != dr_get_process_id() ||
+      counters->signal_image_generation !=
+          atomic_load_explicit(&image_generation, memory_order_acquire)) {
+    dr_fprintf(diagnostic_file, "reverie-dbt: stale signal return continuation\n");
+    exit_runtime_tree(101);
+    return;
+  }
+  uint64_t token = counters->signal_token;
+  int signal = counters->signal_action == 1
+      ? 0 : counters->signal_event.delivered_signal;
+  const byte* replacement = counters->signal_event.signal_info_changed
+      ? counters->signal_event.signal_info : NULL;
+  const dr_mcontext_t* registers = counters->signal_registers_changed
+      ? counters->signal_mcontext : NULL;
+  counters->signal_token = 0;
+  counters->signal_phase = 0;
+  if (!dr_signal_admission_resume(drcontext, token, signal, replacement, registers)) {
+    dr_fprintf(diagnostic_file, "reverie-dbt: signal commit refused\n");
+    exit_runtime_tree(101);
+  }
 }
 
 static void runtime_idle(void) {
@@ -5865,6 +6088,13 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
     preempt_stub[2] = 0x0f; // ud2
     preempt_stub[3] = 0x0b;
   }
+  signal_stub = (byte*)dr_nonheap_alloc(
+      dr_page_size(), DR_MEMPROT_READ | DR_MEMPROT_WRITE | DR_MEMPROT_EXEC);
+  DR_ASSERT(signal_stub != NULL);
+  signal_stub[0] = 0x0f;
+  signal_stub[1] = 0x05;
+  signal_stub[2] = 0x0f;
+  signal_stub[3] = 0x0b;
 
   if (unsupported_report_path[0] != 0) {
     unsupported_report_file =
@@ -5913,6 +6143,7 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
       !drmgr_register_filter_syscall_event(filter_syscall) ||
       !drmgr_register_pre_syscall_event(pre_syscall) ||
       !drmgr_register_post_syscall_event(post_syscall) ||
-      !drmgr_register_signal_event(event_signal))
+      !drmgr_register_signal_event(event_signal) ||
+      !dr_register_signal_admission_event(signal_admission_event))
     DR_ASSERT(false);
 }
