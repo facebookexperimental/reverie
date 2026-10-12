@@ -28,6 +28,9 @@ pub enum ExitStatus {
     /// Program killed by a signal that nix's [`Signal`] cannot name, a
     /// realtime signal (32 to 64), with or without a coredump. The number is
     /// the raw signal number (<https://github.com/rrnewton/reverie/issues/997>).
+    /// It is only for numbers nix cannot name: build a status from a raw
+    /// number with [`ExitStatus::signaled`], which picks this or
+    /// [`ExitStatus::Signaled`].
     SignaledRaw(i32, bool),
 }
 
@@ -135,14 +138,33 @@ impl ExitStatus {
                     };
                     unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) };
                 }
-                // As above, with the raw number nix cannot name.
+                // As above, with the raw number nix cannot name, through raw
+                // syscalls: glibc's signal(), raise() and sigprocmask() refuse
+                // 32 and 33, which it reserves for itself. The kernel's
+                // sigaction is handler, flags, restorer and a 64-bit mask.
+                let default: [u64; 4] = [libc::SIG_DFL as u64, 0, 0, 0];
+                let unblock: u64 = 1 << (signal - 1);
                 unsafe {
-                    libc::signal(signal, libc::SIG_DFL);
-                    libc::raise(signal);
-                    let mut mask: libc::sigset_t = std::mem::zeroed();
-                    libc::sigemptyset(&mut mask);
-                    libc::sigaddset(&mut mask, signal);
-                    libc::sigprocmask(libc::SIG_UNBLOCK, &mask, std::ptr::null_mut());
+                    libc::syscall(
+                        libc::SYS_rt_sigaction,
+                        signal,
+                        default.as_ptr(),
+                        std::ptr::null_mut::<u64>(),
+                        8,
+                    );
+                    libc::syscall(
+                        libc::SYS_tgkill,
+                        libc::getpid(),
+                        libc::syscall(libc::SYS_gettid),
+                        signal,
+                    );
+                    libc::syscall(
+                        libc::SYS_rt_sigprocmask,
+                        libc::SIG_UNBLOCK,
+                        &unblock as *const u64,
+                        std::ptr::null_mut::<u64>(),
+                        8,
+                    );
                 }
                 std::process::exit(signal + 128);
             }
@@ -335,9 +357,8 @@ mod tests_non_sanitized {
         }
     }
 
-    /// A process killed by a realtime signal, which nix's `Signal` cannot
-    /// name, is `SignaledRaw` with its number, and `raise_or_exit`
-    /// propagates it (<https://github.com/rrnewton/reverie/issues/997>).
+    /// A raw signal status round-trips through `into_raw` and `from_raw`,
+    /// and `signaled` picks `SignaledRaw` only for a number nix cannot name.
     #[test]
     fn raw_signal_statuses_round_trip() {
         for (signal, coredump) in [(34, false), (64, false), (40, true)] {
@@ -351,22 +372,51 @@ mod tests_non_sanitized {
         );
     }
 
+    /// A process killed by a realtime signal, which nix's `Signal` cannot
+    /// name, is `SignaledRaw` with its number, and `raise_or_exit`
+    /// propagates it (<https://github.com/rrnewton/reverie/issues/997>),
+    /// including 32 and 33, which glibc reserves and its `raise()` refuses.
     #[test]
     fn exit_by_a_realtime_signal() {
         if crate::test_runs_in_own_process() {
             return;
         }
-        let signal = libc::SIGRTMIN() + 1;
-        let killed = run_forked_raw(|| {
-            unsafe { libc::raise(signal) };
-        });
-        assert_eq!(killed, ExitStatus::SignaledRaw(signal, false));
-        assert_eq!(killed.signal(), Some(signal));
-        assert_eq!(killed.code(), None);
-        assert_eq!(
-            run_forked_raw(|| ExitStatus::SignaledRaw(signal, false).raise_or_exit()),
-            ExitStatus::SignaledRaw(signal, false)
-        );
+        for signal in [32, 33, libc::SIGRTMIN() + 1] {
+            // glibc handles 32 and 33 itself; the child sets the default
+            // action and unblocks the signal with raw syscalls first.
+            let killed = run_forked_raw(|| unsafe {
+                let default: [u64; 4] = [libc::SIG_DFL as u64, 0, 0, 0];
+                let unblock: u64 = 1 << (signal - 1);
+                libc::syscall(
+                    libc::SYS_rt_sigaction,
+                    signal,
+                    default.as_ptr(),
+                    std::ptr::null_mut::<u64>(),
+                    8,
+                );
+                libc::syscall(
+                    libc::SYS_rt_sigprocmask,
+                    libc::SIG_UNBLOCK,
+                    &unblock as *const u64,
+                    std::ptr::null_mut::<u64>(),
+                    8,
+                );
+                libc::syscall(
+                    libc::SYS_tgkill,
+                    libc::getpid(),
+                    libc::syscall(libc::SYS_gettid),
+                    signal,
+                );
+            });
+            assert_eq!(killed, ExitStatus::SignaledRaw(signal, false));
+            assert_eq!(killed.signal(), Some(signal));
+            assert_eq!(killed.code(), None);
+            assert_eq!(
+                run_forked_raw(|| ExitStatus::SignaledRaw(signal, false).raise_or_exit()),
+                ExitStatus::SignaledRaw(signal, false),
+                "raise_or_exit of signal {signal}"
+            );
+        }
     }
 
     #[test]

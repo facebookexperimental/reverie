@@ -651,7 +651,10 @@ impl Tool for LifecycleTool {
         _thread_state: (),
         exit_status: ExitStatus,
     ) -> Result<(), Error> {
-        if matches!(exit_status, ExitStatus::Signaled(..)) {
+        if matches!(
+            exit_status,
+            ExitStatus::Signaled(..) | ExitStatus::SignaledRaw(..)
+        ) {
             global_state
                 .send_rpc(lifecycle_event(
                     EVENT_EXIT_THREAD,
@@ -669,7 +672,10 @@ impl Tool for LifecycleTool {
         global_state: &G,
         exit_status: ExitStatus,
     ) -> Result<(), Error> {
-        if matches!(exit_status, ExitStatus::Signaled(..)) {
+        if matches!(
+            exit_status,
+            ExitStatus::Signaled(..) | ExitStatus::SignaledRaw(..)
+        ) {
             global_state
                 .send_rpc(lifecycle_event(
                     EVENT_EXIT_PROCESS,
