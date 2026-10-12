@@ -786,8 +786,11 @@ type WriteResult = (isize, Option<i32>);
 /// SIGRTMIN+4 (value 111) are queued and blocked; a 500 ms timer is at
 /// `READ_TIMER_FD`. `check` gets a call through `marker`, which returns the
 /// guest `write`'s result and errno, and SIGRTMIN+4's number.
-fn held_signal_blocking_read_guest(marker: i32, check: fn(&dyn Fn() -> WriteResult, i32)) -> Log {
-    let (output, log) = test_fn::<RetryTool, _>(move || {
+fn held_signal_blocking_read_guest<T: Tool<GlobalState = Log> + Default + 'static>(
+    marker: i32,
+    check: fn(&dyn Fn() -> WriteResult, i32),
+) -> Log {
+    let (output, log) = test_fn::<T, _>(move || {
         DELIVERIES.store(0, Ordering::SeqCst);
         let realtime = libc::SIGRTMIN() + 4;
         handle_with_siginfo(libc::SIGUSR1);
@@ -859,11 +862,12 @@ fn held_signal_blocking_read_guest(marker: i32, check: fn(&dyn Fn() -> WriteResu
 /// expires.
 #[test]
 fn a_restartable_blocking_syscall_returns_its_restart_code_while_a_signal_is_held() {
-    let log = held_signal_blocking_read_guest(RESTARTABLE_READ_FD, |call, realtime| {
-        assert_eq!(call(), (-1, Some(libc::EINTR)));
-        assert_eq!(delivered(), vec![(realtime, 111), (libc::SIGUSR1, 7)]);
-        assert_eq!(call().0, 8);
-    });
+    let log =
+        held_signal_blocking_read_guest::<RetryTool>(RESTARTABLE_READ_FD, |call, realtime| {
+            assert_eq!(call(), (-1, Some(libc::EINTR)));
+            assert_eq!(delivered(), vec![(realtime, 111), (libc::SIGUSR1, 7)]);
+            assert_eq!(call().0, 8);
+        });
     let injected = log.injected.lock().unwrap();
     assert_eq!(
         injected[..],
@@ -872,12 +876,78 @@ fn a_restartable_blocking_syscall_returns_its_restart_code_while_a_signal_is_hel
     );
 }
 
+/// `RetryTool` run as a child tool, through `Guest::into_guest`, as a tool
+/// that wraps another forwards its callbacks.
+#[derive(Clone, Copy, Debug, Default)]
+struct WrappingTool(RetryTool);
+
+impl AsMut<RetryTool> for WrappingTool {
+    fn as_mut(&mut self) -> &mut RetryTool {
+        &mut self.0
+    }
+}
+
+/// The thread state of `WrappingTool`, which `IntoGuest` requires to hold
+/// the child's.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct WrappingThread(());
+
+impl AsRef<()> for WrappingThread {
+    fn as_ref(&self) -> &() {
+        &self.0
+    }
+}
+
+impl AsMut<()> for WrappingThread {
+    fn as_mut(&mut self) -> &mut () {
+        &mut self.0
+    }
+}
+
+#[reverie::tool]
+impl Tool for WrappingTool {
+    type GlobalState = Log;
+    type ThreadState = WrappingThread;
+
+    fn subscriptions(_config: &()) -> Subscription {
+        RetryTool::subscriptions(&())
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        self.0
+            .handle_syscall_event(&mut guest.into_guest(), syscall)
+            .await
+    }
+}
+
+/// `IntoGuest` forwards `inject_restartable` to the backend's guest: through
+/// a wrapping tool, the restartable read returns its restart code as it does
+/// directly. The provided method would retry it until the timer expired.
+#[test]
+fn a_restartable_call_through_a_wrapping_tool_returns_its_restart_code() {
+    let log =
+        held_signal_blocking_read_guest::<WrappingTool>(RESTARTABLE_READ_FD, |call, realtime| {
+            assert_eq!(call(), (-1, Some(libc::EINTR)));
+            assert_eq!(delivered(), vec![(realtime, 111), (libc::SIGUSR1, 7)]);
+            assert_eq!(call().0, 8);
+        });
+    let injected = log.injected.lock().unwrap();
+    assert_eq!(
+        injected[..],
+        [Ok(0), Err(Errno::ERESTARTSYS.into_raw()), Ok(0), Ok(8)]
+    );
+}
+
 /// `inject_with_retry` keeps its contract: in the same case it retries the
 /// `read` until the timer expires, and the signals run their handlers after
 /// the guest's `write` returns.
 #[test]
 fn inject_with_retry_still_retries_a_blocking_syscall_while_a_signal_is_held() {
-    let log = held_signal_blocking_read_guest(RETRY_READ_FD, |call, realtime| {
+    let log = held_signal_blocking_read_guest::<RetryTool>(RETRY_READ_FD, |call, realtime| {
         assert_eq!(call().0, 8);
         assert_eq!(delivered(), vec![(realtime, 111), (libc::SIGUSR1, 7)]);
     });

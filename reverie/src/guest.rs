@@ -527,8 +527,9 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     /// re-run: a backend may return `EINTR` or `ERESTARTSYS` from a syscall
     /// that ran, instead of retrying it, when it will deliver a signal as the
     /// guest resumes. The caller must return that code unchanged as the
-    /// guest's syscall result. Linux then restarts the guest's syscall or
-    /// fails it with `EINTR`, by the handler's `SA_RESTART`. A restart runs
+    /// guest's syscall result. For `ERESTARTSYS`, Linux then restarts the
+    /// guest's syscall or fails it with `EINTR`, by the handler's
+    /// `SA_RESTART`; a returned `EINTR` stays `EINTR`. A restart runs
     /// the whole callback again, including every injection before this one,
     /// so those must be safe to repeat.
     ///
