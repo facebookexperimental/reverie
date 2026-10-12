@@ -770,13 +770,15 @@ run_check "Build workspace" cargo build --workspace --all-features
 run_check "LiteInst allocator fixtures" build_liteinst_allocator_fixtures
 run_check "DBT virtual identity and pidfd_open policy" \
     "$ROOT_DIR/reverie-dbt/scripts/test-identity-policy.sh"
-run_test_check "Test regular workspace cases" env \
-    REVERIE_LITEINST_PRELOAD="$REVERIE_LITEINST_PRELOAD" \
-    REVERIE_LITEINST_TEST_RUNTIME_MANIFEST="$REVERIE_LITEINST_TEST_RUNTIME_MANIFEST" \
-    REVERIE_LITEINST_ALLOCATOR_GUEST="$REVERIE_LITEINST_ALLOCATOR_GUEST" \
-    REVERIE_LITEINST_ALLOCATOR_GUEST_MANIFEST="$REVERIE_LITEINST_ALLOCATOR_GUEST_MANIFEST" \
-    cargo test --workspace --all-features \
+# The counted runner accepts only a command that starts with `cargo test`, so
+# the fixture paths reach the tests through the environment rather than an
+# `env NAME=VALUE` prefix. They are exported for this step alone.
+export REVERIE_LITEINST_PRELOAD REVERIE_LITEINST_TEST_RUNTIME_MANIFEST \
+    REVERIE_LITEINST_ALLOCATOR_GUEST REVERIE_LITEINST_ALLOCATOR_GUEST_MANIFEST
+run_test_check "Test regular workspace cases" cargo test --workspace --all-features \
     -- --test-threads=1 "${REGULAR_TEST_SKIP_ARGS[@]}"
+export -n REVERIE_LITEINST_PRELOAD REVERIE_LITEINST_TEST_RUNTIME_MANIFEST \
+    REVERIE_LITEINST_ALLOCATOR_GUEST REVERIE_LITEINST_ALLOCATOR_GUEST_MANIFEST
 run_test_check "Documentation tests" cargo test --workspace --doc
 run_check "Clippy" cargo clippy --workspace --all-targets --all-features -- -D warnings
 run_check "Rustfmt" cargo fmt --all -- --check
