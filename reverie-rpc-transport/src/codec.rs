@@ -68,6 +68,75 @@ where
     Ok(value)
 }
 
+struct BoundedWriter<const LIMIT: usize> {
+    bytes: Vec<u8>,
+    exceeded: Option<usize>,
+}
+
+impl<const LIMIT: usize> bincode::enc::write::Writer for BoundedWriter<LIMIT> {
+    fn write(&mut self, bytes: &[u8]) -> Result<(), bincode::error::EncodeError> {
+        if self.exceeded.is_some() {
+            return Err(bincode::error::EncodeError::Other(
+                "bounded bincode output limit exceeded",
+            ));
+        }
+        let len = self.bytes.len().checked_add(bytes.len());
+        if !matches!(len, Some(len) if len <= LIMIT) {
+            self.exceeded = Some(len.unwrap_or(usize::MAX));
+            return Err(bincode::error::EncodeError::Other(
+                "bounded bincode output limit exceeded",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
+/// Serialize with the legacy wire format, refusing before the output exceeds
+/// `LIMIT` bytes. Serialization writes directly into the bounded output rather
+/// than first constructing an unrestricted encoded value.
+pub fn encode_bounded<T, const LIMIT: usize>(value: &T) -> Result<Vec<u8>, RpcError>
+where
+    T: Serialize + ?Sized,
+{
+    let mut writer = BoundedWriter::<LIMIT> {
+        bytes: Vec::new(),
+        exceeded: None,
+    };
+    let result = bincode::serde::encode_into_writer(value, &mut writer, bincode::config::legacy());
+    if let Some(len) = writer.exceeded {
+        return Err(RpcError::FrameTooLarge { len, max: LIMIT });
+    }
+    result?;
+    Ok(writer.bytes)
+}
+
+/// Deserialize exactly one legacy bincode value from at most `LIMIT` bytes.
+///
+/// Bincode's configured decoding limit also checks its allocation claims, such
+/// as a declared string length. It does not bound allocations made by arbitrary
+/// custom `Deserialize` implementations. Trailing input is always refused.
+pub fn decode_exact_bounded<T, const LIMIT: usize>(bytes: &[u8]) -> Result<T, RpcError>
+where
+    T: DeserializeOwned,
+{
+    if bytes.len() > LIMIT {
+        return Err(RpcError::FrameTooLarge {
+            len: bytes.len(),
+            max: LIMIT,
+        });
+    }
+    let (value, consumed) =
+        bincode::serde::decode_from_slice(bytes, bincode::config::legacy().with_limit::<LIMIT>())?;
+    if consumed != bytes.len() {
+        return Err(bincode::error::DecodeError::Other(
+            "trailing bytes after bounded bincode value",
+        )
+        .into());
+    }
+    Ok(value)
+}
+
 /// Write `payload` as one length-prefixed frame and flush.
 pub async fn write_message<W>(writer: &mut W, payload: &[u8]) -> Result<(), RpcError>
 where
@@ -168,6 +237,103 @@ mod tests {
         let bytes = encode(&value).unwrap();
         let back: (u64, String, Vec<u8>) = decode(&bytes).unwrap();
         assert_eq!(value, back);
+    }
+
+    #[test]
+    fn bounded_noninitial_state_round_trip_preserves_legacy_bytes() {
+        #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct State {
+            clock: u64,
+            random_counter: u64,
+            random_block: [u8; 32],
+            memory_id: u64,
+            completed: Vec<(u64, String)>,
+        }
+        let value = State {
+            clock: 4_231_007,
+            random_counter: 129,
+            random_block: [0x9b; 32],
+            memory_id: 17,
+            completed: vec![(37, "read".into()), (38, "write".into())],
+        };
+        let bytes = encode_bounded::<_, 1024>(&value).unwrap();
+        assert_eq!(bytes, encode(&value).unwrap());
+        assert_eq!(decode_exact_bounded::<State, 1024>(&bytes).unwrap(), value);
+    }
+
+    #[test]
+    fn bounded_exact_and_zero_limits() {
+        let value = [0x7a_u8; 16];
+        let bytes = encode_bounded::<_, 16>(&value).unwrap();
+        assert_eq!(bytes.len(), 16);
+        assert_eq!(decode_exact_bounded::<[u8; 16], 16>(&bytes).unwrap(), value);
+        assert!(matches!(
+            encode_bounded::<_, 15>(&value),
+            Err(RpcError::FrameTooLarge { len: 16, max: 15 })
+        ));
+        assert!(matches!(
+            decode_exact_bounded::<[u8; 16], 15>(&bytes),
+            Err(RpcError::FrameTooLarge { len: 16, max: 15 })
+        ));
+        assert_eq!(encode_bounded::<_, 0>(&()).unwrap(), []);
+        decode_exact_bounded::<(), 0>(&[]).unwrap();
+    }
+
+    #[test]
+    fn bounded_writer_refuses_before_extending_and_latches_failure() {
+        use bincode::enc::write::Writer;
+        let mut writer = BoundedWriter::<4> {
+            bytes: Vec::new(),
+            exceeded: None,
+        };
+        writer.write(&[1, 2, 3]).unwrap();
+        assert!(writer.write(&[4, 5]).is_err());
+        assert_eq!(writer.bytes, [1, 2, 3]);
+        assert_eq!(writer.exceeded, Some(5));
+        assert!(writer.write(&[4]).is_err());
+        assert_eq!(writer.bytes, [1, 2, 3]);
+
+        struct IgnoresWriteFailure;
+        impl serde::Serialize for IgnoresWriteFailure {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                use serde::ser::SerializeSeq;
+                let mut seq = serializer.serialize_seq(Some(2))?;
+                let _ = seq.serialize_element(&[0_u8; 32]);
+                seq.end()
+            }
+        }
+        assert!(matches!(
+            encode_bounded::<_, 8>(&IgnoresWriteFailure),
+            Err(RpcError::FrameTooLarge { max: 8, .. })
+        ));
+    }
+
+    #[test]
+    fn bounded_decode_refuses_malformed_truncated_and_trailing_values() {
+        let bytes = encode(&(42_u64, "complete".to_owned())).unwrap();
+        for len in 0..bytes.len() {
+            assert!(decode_exact_bounded::<(u64, String), 128>(&bytes[..len]).is_err());
+        }
+        assert!(decode_exact_bounded::<bool, 1>(&[2]).is_err());
+        let mut trailing = encode(&42_u64).unwrap();
+        trailing.push(0);
+        assert!(matches!(
+            decode_exact_bounded::<u64, 16>(&trailing),
+            Err(RpcError::Decode(bincode::error::DecodeError::Other(_)))
+        ));
+        assert_eq!(decode::<u64>(&trailing).unwrap(), 42);
+    }
+
+    #[test]
+    fn bounded_decode_checks_declared_allocation_before_payload() {
+        let declared_length = 1024_u64.to_le_bytes();
+        assert!(matches!(
+            decode_exact_bounded::<String, 32>(&declared_length),
+            Err(RpcError::Decode(bincode::error::DecodeError::LimitExceeded))
+        ));
     }
 
     #[tokio::test]
