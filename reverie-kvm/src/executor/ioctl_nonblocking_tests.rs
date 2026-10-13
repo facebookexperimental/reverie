@@ -299,9 +299,22 @@ fn ioctl_fionbio_keeps_virtual_signalfd_physically_nonblocking() {
     assert_eq!(
         f.ioctl_at(alias as u64, libc::FIONBIO, u64::MAX),
         negative_errno(libc::EFAULT),
-        "input copy precedes the blocking-mode guard"
+        "input copy precedes the mode change"
     );
-    assert_eq!(f.set(alias, 0), negative_errno(libc::ENOSYS));
+    // Clearing it makes the guest description blocking for every alias;
+    // the host keeper stays nonblocking.
+    assert_eq!(f.set(alias, 0), 0);
+    for observed in [fd, alias] {
+        let guest = f.call(
+            libc::SYS_fcntl,
+            [observed as u64, libc::F_GETFL as u64, 0, 0, 0, 0],
+        );
+        assert_eq!(guest, i64::from(before & !libc::O_NONBLOCK), "guest flags of {observed}");
+        let physical =
+            fd_status_flags(host_fd(&f.executor.state, observed as i32).unwrap()).unwrap();
+        assert_eq!(physical, before, "physical flags of {observed}");
+    }
+    assert_eq!(f.set(fd, 1), 0);
     assert_eq!(f.flags(fd), before);
     assert_eq!(f.flags(alias), before);
     assert_eq!(f.fd_flags(fd), i64::from(libc::FD_CLOEXEC));

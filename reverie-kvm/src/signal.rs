@@ -17,6 +17,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::Weak;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use kvm_bindings::kvm_regs;
 use kvm_bindings::kvm_xsave;
@@ -395,9 +397,22 @@ pub(crate) struct OwnedSignalDequeue {
 /// One keeper is shared by all descriptor aliases of one signalfd. Creation
 /// pins it before publishing the guest descriptor; close/exec can drop this
 /// bounded eventfd owner under the signal transaction without a blocking close.
+///
+/// The keeper also holds the description's guest-visible blocking mode
+/// (`O_NONBLOCK` clear). Linux keeps that flag on the open file description,
+/// so dup aliases and a forked child share it, as they share this keeper. The
+/// host eventfd itself stays nonblocking whatever the guest asks: no host
+/// read of it can ever wait outside the scheduler.
 #[derive(Clone, Debug)]
-pub(crate) struct SignalFdCarrier(Arc<std::fs::File>);
+pub(crate) struct SignalFdCarrier(Arc<std::fs::File>, Arc<AtomicBool>);
 impl SignalFdCarrier {
+    /// Whether the guest's description is in blocking mode.
+    pub(crate) fn guest_blocking(&self) -> bool {
+        self.1.load(Ordering::SeqCst)
+    }
+    pub(crate) fn set_guest_blocking(&self, blocking: bool) {
+        self.1.store(blocking, Ordering::SeqCst);
+    }
     pub(crate) fn pin_eventfd(file: &std::fs::File) -> std::io::Result<Self> {
         // The only production caller owns a freshly created EFD_NONBLOCK fd.
         // Existing signalfd F_SETFL/SCM_RIGHTS/proc-reopen guards preserve it.
@@ -409,7 +424,10 @@ impl SignalFdCarrier {
             return Err(std::io::Error::last_os_error());
         }
         // SAFETY: successful F_DUPFD_CLOEXEC returns a newly owned descriptor.
-        Ok(Self(Arc::new(unsafe { std::fs::File::from_raw_fd(fd) })))
+        Ok(Self(
+            Arc::new(unsafe { std::fs::File::from_raw_fd(fd) }),
+            Arc::new(AtomicBool::new(false)),
+        ))
     }
     pub(crate) fn file(&self) -> &std::fs::File {
         &self.0

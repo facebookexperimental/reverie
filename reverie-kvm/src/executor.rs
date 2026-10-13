@@ -11601,6 +11601,21 @@ fn virtual_signalfd_write_error(
     signalfd_mask(state, fd).map(|_| negative_errno(errno))
 }
 
+/// The readiness keeper of signalfd `fd`, which also holds its open file
+/// description's guest-visible blocking mode.
+fn signalfd_carrier(
+    state: &LoadedStaticElf,
+    fd: libc::c_int,
+) -> Option<crate::signal::SignalFdCarrier> {
+    state
+        .process_signals
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .signalfd_carriers
+        .get(&fd)
+        .cloned()
+}
+
 fn signalfd_mask(state: &LoadedStaticElf, fd: libc::c_int) -> Option<Arc<KernelSigset>> {
     state
         .process_signals
@@ -12986,9 +13001,6 @@ fn signalfd(
     }
 
     let requested_fd = args[0] as libc::c_int;
-    if requested_fd == -1 && flags & libc::SFD_NONBLOCK == 0 {
-        return negative_errno(libc::ENOSYS);
-    }
 
     let update_aliases = if requested_fd != -1 {
         if flags != 0 {
@@ -13065,14 +13077,11 @@ fn signalfd(
     }
 
     let (guest_fd, carrier) = if requested_fd == -1 {
-        let event_flags = libc::EFD_CLOEXEC
-            | if flags & libc::SFD_NONBLOCK != 0 {
-                libc::EFD_NONBLOCK
-            } else {
-                0
-            };
+        // The host eventfd is nonblocking even for a blocking signalfd: the
+        // guest's mode lives on the keeper, and a read that would wait is
+        // refused rather than left to block a host thread.
         // SAFETY: eventfd validates its bounded flags and returns a new owned fd.
-        let host_fd = unsafe { libc::eventfd(0, event_flags) };
+        let host_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         if host_fd < 0 {
             return io_error(std::io::Error::last_os_error());
         }
@@ -13087,6 +13096,7 @@ fn signalfd(
                 return io_error(error);
             }
         };
+        carrier.set_guest_blocking(flags & libc::SFD_NONBLOCK == 0);
         let guest_fd = insert_file_with_flags(state, file, flags & libc::SFD_CLOEXEC != 0, None);
         if guest_fd < 0 {
             return guest_fd;
@@ -13523,17 +13533,7 @@ fn signalfd_read_stream(
     if let Err(error) = ensure_read_capable(file).and_then(|()| ensure_readable(file)) {
         return Some(error);
     }
-    let raw_fd = file.as_raw_fd();
-    let status_flags = match fd_status_flags(raw_fd) {
-        Ok(flags) => flags,
-        Err(error) => return Some(error),
-    };
-    if !force_nonblocking && status_flags & libc::O_NONBLOCK == 0 {
-        // A host wait would escape Detcore's scheduler and race the readiness
-        // publication. Creation and F_SETFL prevent this state; keep the read
-        // path fail-closed as a defensive invariant.
-        return Some(negative_errno(libc::ENOSYS));
-    }
+    let blocking = !force_nonblocking && signalfd_carrier(state, fd)?.guest_blocking();
     let total = vectors
         .iter()
         .try_fold(0usize, |total, vector| total.checked_add(vector.length));
@@ -13568,7 +13568,15 @@ fn signalfd_read_stream(
             if completed != 0 {
                 return Some((completed * SIGNALFD_RECORD_SIZE) as i64);
             }
-            return Some(negative_errno(libc::EAGAIN));
+            // A blocking read with nothing pending would wait for a signal.
+            // A host wait would escape Detcore's scheduler and race the
+            // readiness publication, and a scheduler-owned wait is not
+            // modeled, so that one case is refused.
+            return Some(negative_errno(if blocking {
+                libc::ENOSYS
+            } else {
+                libc::EAGAIN
+            }));
         };
         let record = encode_signalfd_siginfo(event);
         if cursor.write(memory, &record).is_err() {
@@ -15814,10 +15822,11 @@ fn fionbio(
         Ok(value) => value,
         Err(error) => return error,
     };
-    if value == 0 && signalfd_mask(state, guest_fd).is_some() {
-        // Keep F_SETFL's virtual-signalfd policy: scheduler-owned blocking
-        // waits are unsupported. Refuse before changing any alias's flags.
-        return negative_errno(libc::ENOSYS);
+    if let Some(carrier) = signalfd_carrier(state, guest_fd) {
+        // As F_SETFL: the mode is the guest description's, and the host
+        // keeper stays nonblocking.
+        carrier.set_guest_blocking(value == 0);
+        return 0;
     }
     if value == 0 {
         // Keep F_SETFL's inotify policy for the same reason.
@@ -18533,20 +18542,24 @@ fn fcntl(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> 
         ),
         libc::F_GETFL => match fd_status_flags(host_fd) {
             Ok(flags) => i64::from(
-                flags
-                    | if source_synthetic_proc_nofollow {
-                        libc::O_NOFOLLOW
-                    } else {
-                        0
-                    }
-                    | if source_fdinfo
-                        .as_ref()
-                        .is_some_and(|info| info.nofollow_status)
-                    {
-                        libc::O_NOFOLLOW
-                    } else {
-                        0
-                    },
+                match signalfd_carrier(state, guest_fd) {
+                    // The host keeper is always nonblocking; report the
+                    // guest description's own mode.
+                    Some(carrier) if carrier.guest_blocking() => flags & !libc::O_NONBLOCK,
+                    Some(_) => flags | libc::O_NONBLOCK,
+                    None => flags,
+                } | if source_synthetic_proc_nofollow {
+                    libc::O_NOFOLLOW
+                } else {
+                    0
+                } | if source_fdinfo
+                    .as_ref()
+                    .is_some_and(|info| info.nofollow_status)
+                {
+                    libc::O_NOFOLLOW
+                } else {
+                    0
+                },
             ),
             Err(error) => error,
         },
@@ -18585,10 +18598,20 @@ fn fcntl(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> 
                 // changes, including changes shared by descriptor aliases.
                 return negative_errno(libc::EINVAL);
             }
-            if source_signalfd_mask.is_some() && flags & libc::O_NONBLOCK == 0 {
-                // Blocking virtual signalfd waits require scheduler ownership;
-                // reject before changing the shared open-file description.
-                return negative_errno(libc::ENOSYS);
+            if source_signalfd_mask.is_some() {
+                // The guest's O_NONBLOCK belongs to the keeper, shared by
+                // every alias; the host keeper itself stays nonblocking.
+                let Some(carrier) = signalfd_carrier(state, guest_fd) else {
+                    return negative_errno(libc::EBADF);
+                };
+                // SAFETY: host_fd names a live descriptor; F_SETFL consumes one int flag word.
+                let result = zero_or_errno(unsafe {
+                    libc::fcntl(host_fd, libc::F_SETFL, flags | libc::O_NONBLOCK)
+                });
+                if result == 0 {
+                    carrier.set_guest_blocking(flags & libc::O_NONBLOCK == 0);
+                }
+                return result;
             }
             if flags & libc::O_NONBLOCK == 0 {
                 // Blocking inotify waits are refused the same way.
@@ -52164,47 +52187,50 @@ mod tests {
             "an address rejected by access_ok fails before dequeue",
         );
     }
+    /// A blocking signalfd is the guest description's mode, shared by every
+    /// alias as Linux shares O_NONBLOCK on the open file description, while
+    /// the host keeper stays nonblocking. A read returns pending signals in
+    /// either mode; only a blocking read with nothing pending, which would
+    /// wait, is refused.
     #[test]
-    fn blocking_signalfd_forms_refuse_before_mutation_and_aliases_stay_nonblocking() {
+    fn blocking_signalfd_mode_is_shared_by_aliases_and_only_a_waiting_read_is_refused() {
         const MASK: u64 = 0x100;
+        const INFO: u64 = 0x200;
+        const VALUE: u64 = 0x380;
         let root = TestDir::new();
         let mut state = test_state(&root.0);
+        let pid = state.pid;
         let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
         let mut mask = KernelSigset::default();
         mask.insert(libc::SIGUSR1);
         memory.write(MASK, &mask.to_bytes()).unwrap();
         test_block_signal(&mut state, libc::SIGUSR1);
-        let original_next_inode = state.file_identity_table.lock().unwrap().next_inode;
-        for (number, flags) in [
-            (libc::SYS_signalfd, 0),
-            (libc::SYS_signalfd4, 0),
-            (libc::SYS_signalfd4, libc::SFD_CLOEXEC as u64),
-        ] {
+        let getfl = |memory: &mut GuestMemory, state: &mut LoadedStaticElf, fd: i64| {
+            syscall_result(
+                memory,
+                state,
+                libc::SYS_fcntl,
+                [fd as u64, libc::F_GETFL as u64, 0, 0, 0, 0],
+            ) & i64::from(libc::O_NONBLOCK)
+        };
+        let read = |memory: &mut GuestMemory, state: &mut LoadedStaticElf, fd: i64| {
+            syscall_result(
+                memory,
+                state,
+                libc::SYS_read,
+                [fd as u64, INFO, 128, 0, 0, 0],
+            )
+        };
+        let raise = |state: &mut LoadedStaticElf| {
             assert_eq!(
-                syscall_result(
-                    &mut memory,
-                    &mut state,
-                    number,
-                    [u64::MAX, MASK, KERNEL_SIGSET_SIZE as u64, flags, 0, 0],
-                ),
-                negative_errno(libc::ENOSYS),
+                result_of(kill_signal(
+                    state,
+                    libc::SYS_kill as u64,
+                    &[pid as u64, libc::SIGUSR1 as u64, 0, 0, 0, 0],
+                )),
+                0,
             );
-            assert!(state.files.is_empty());
-            assert!(state.fd_object_inodes.is_empty());
-            assert!(
-                state
-                    .process_signals
-                    .lock()
-                    .unwrap()
-                    .signalfd_masks
-                    .is_empty()
-            );
-            assert_eq!(
-                state.file_identity_table.lock().unwrap().next_inode,
-                original_next_inode,
-                "blocking refusal must precede fd identity allocation",
-            );
-        }
+        };
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -52213,8 +52239,45 @@ mod tests {
                 [u64::MAX, MASK, KERNEL_SIGSET_SIZE as u64, 0x4000, 0, 0],
             ),
             negative_errno(libc::EINVAL),
-            "flag validation precedes the unsupported blocking-mode guard",
         );
+        for (expected_fd, (number, flags)) in [
+            (libc::SYS_signalfd, 0),
+            (libc::SYS_signalfd4, 0),
+            (libc::SYS_signalfd4, libc::SFD_CLOEXEC as u64),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fd = syscall_result(
+                &mut memory,
+                &mut state,
+                number,
+                [u64::MAX, MASK, KERNEL_SIGSET_SIZE as u64, flags, 0, 0],
+            );
+            assert_eq!(fd, 3 + expected_fd as i64);
+            assert_eq!(
+                getfl(&mut memory, &mut state, fd),
+                0,
+                "blocking mode is reported"
+            );
+            let host = host_fd(&state, fd as libc::c_int).unwrap();
+            assert_ne!(
+                fd_status_flags(host).unwrap() & libc::O_NONBLOCK,
+                0,
+                "the host keeper stays nonblocking",
+            );
+            // Nothing pending: a blocking read would wait, and is refused.
+            assert_eq!(
+                read(&mut memory, &mut state, fd),
+                negative_errno(libc::ENOSYS)
+            );
+            // A pending signal is read in blocking mode too.
+            raise(&mut state);
+            assert_eq!(read(&mut memory, &mut state, fd), 128);
+            let info: libc::signalfd_siginfo = read_struct(&memory, INFO);
+            assert_eq!(info.ssi_signo, libc::SIGUSR1 as u32);
+        }
+
         let signal_fd = syscall_result(
             &mut memory,
             &mut state,
@@ -52228,14 +52291,13 @@ mod tests {
                 0,
             ],
         );
-        assert_eq!(signal_fd, 3);
+        assert_eq!(signal_fd, 6);
         let alias = syscall_result(
             &mut memory,
             &mut state,
             libc::SYS_dup,
             [signal_fd as u64, 0, 0, 0, 0, 0],
         );
-        assert_eq!(alias, 4);
         let fixed_alias = syscall_result(
             &mut memory,
             &mut state,
@@ -52252,63 +52314,44 @@ mod tests {
         assert_eq!(fcntl_alias, 20);
         let aliases = [signal_fd, alias, fixed_alias, fcntl_alias];
         for fd in aliases {
-            assert_ne!(
-                syscall_result(
-                    &mut memory,
-                    &mut state,
-                    libc::SYS_fcntl,
-                    [fd as u64, libc::F_GETFL as u64, 0, 0, 0, 0],
-                ) & i64::from(libc::O_NONBLOCK),
-                0,
-            );
+            assert_ne!(getfl(&mut memory, &mut state, fd), 0);
         }
-        for fd in aliases {
-            assert_eq!(
-                syscall_result(
-                    &mut memory,
-                    &mut state,
-                    libc::SYS_fcntl,
-                    [fd as u64, libc::F_SETFL as u64, 0, 0, 0, 0],
-                ),
-                negative_errno(libc::ENOSYS),
-            );
-            for observed in aliases {
-                assert_ne!(
-                    syscall_result(
-                        &mut memory,
-                        &mut state,
-                        libc::SYS_fcntl,
-                        [observed as u64, libc::F_GETFL as u64, 0, 0, 0, 0],
-                    ) & i64::from(libc::O_NONBLOCK),
-                    0,
-                    "F_SETFL refusal through alias {fd} changed shared status flags",
-                );
-            }
-        }
+        // Clearing O_NONBLOCK through one alias makes every alias blocking.
         assert_eq!(
             syscall_result(
                 &mut memory,
                 &mut state,
                 libc::SYS_fcntl,
-                [
-                    alias as u64,
-                    libc::F_SETFL as u64,
-                    libc::O_NONBLOCK as u64,
-                    0,
-                    0,
-                    0,
-                ],
+                [alias as u64, libc::F_SETFL as u64, 0, 0, 0, 0],
             ),
             0,
         );
+        for fd in aliases {
+            assert_eq!(getfl(&mut memory, &mut state, fd), 0, "alias {fd}");
+        }
+        assert_eq!(
+            read(&mut memory, &mut state, fcntl_alias),
+            negative_errno(libc::ENOSYS)
+        );
+        let host = host_fd(&state, signal_fd as libc::c_int).unwrap();
+        assert_ne!(fd_status_flags(host).unwrap() & libc::O_NONBLOCK, 0);
+        // FIONBIO through another alias makes every alias nonblocking again.
+        assert_eq!(write_struct(&mut memory, VALUE, &1_i32), 0);
         assert_eq!(
             syscall_result(
                 &mut memory,
                 &mut state,
-                libc::SYS_read,
-                [signal_fd as u64, 0x200, 128, 0, 0, 0],
+                libc::SYS_ioctl,
+                [fixed_alias as u64, libc::FIONBIO, VALUE, 0, 0, 0],
             ),
-            negative_errno(libc::EAGAIN),
+            0,
+        );
+        for fd in aliases {
+            assert_ne!(getfl(&mut memory, &mut state, fd), 0, "alias {fd}");
+        }
+        assert_eq!(
+            read(&mut memory, &mut state, signal_fd),
+            negative_errno(libc::EAGAIN)
         );
         assert_eq!(
             syscall_result(
@@ -52318,7 +52361,7 @@ mod tests {
                 [signal_fd as u64, MASK, KERNEL_SIGSET_SIZE as u64, 0, 0, 0],
             ),
             signal_fd,
-            "mask updates on an existing nonblocking description remain supported",
+            "mask updates on an existing description remain supported",
         );
         let masks = &state.process_signals.lock().unwrap().signalfd_masks;
         for fd in aliases {
