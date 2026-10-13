@@ -840,6 +840,18 @@ fn execute_basic_syscall_inner(
     } else if number == libc::SYS_timerfd_gettime as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         timerfd_gettime(memory, state, args)
+    } else if number == libc::SYS_inotify_init as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        inotify_init1(state, 0)
+    } else if number == libc::SYS_inotify_init1 as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        inotify_init1(state, args[0])
+    } else if number == libc::SYS_inotify_add_watch as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        inotify_add_watch(memory, state, args)
+    } else if number == libc::SYS_inotify_rm_watch as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        inotify_rm_watch(state, args)
     } else if number == libc::SYS_pidfd_open as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-235): Review self-only virtual pidfd translation.
@@ -3306,6 +3318,10 @@ fn mutates_file_table(number: u64) -> bool {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-235): Review timerfd descriptor-table serialization.
             || number == libc::SYS_timerfd_create as u64
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-1015): Review inotify descriptor-table serialization.
+            || number == libc::SYS_inotify_init as u64
+            || number == libc::SYS_inotify_init1 as u64
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-235): Review pidfd descriptor-table serialization.
             || number == libc::SYS_pidfd_open as u64
@@ -8913,6 +8929,26 @@ fn read(
     if requested_length == 0 {
         return Ok(0);
     }
+    match host_fd_is_inotify(host_fd) {
+        // Linux's readv calls inotify's read once with the same buffer and
+        // count, so the staged readv path applies scalar read semantics.
+        Ok(true) => {
+            return Ok(staged_vectored_transfer(
+                memory,
+                state,
+                libc::SYS_readv,
+                host_fd,
+                &[GuestIoVec {
+                    base: args[1],
+                    length,
+                }],
+                &[0; 6],
+                true,
+            ));
+        }
+        Ok(false) => {}
+        Err(error) => return Ok(error),
+    }
     Ok(host_read(memory, host_fd, args[1], length))
 }
 
@@ -9640,6 +9676,29 @@ fn vectored_io(
             return negative_errno(libc::EOPNOTSUPP);
         }
     }
+    staged_vectored_transfer(memory, state, number, host_fd, &guest_iovecs, args, reading)
+}
+
+fn staged_vectored_transfer(
+    memory: &mut GuestMemory,
+    state: &LoadedStaticElf,
+    number: libc::c_long,
+    host_fd: RawFd,
+    guest_iovecs: &[GuestIoVec],
+    args: &[u64; 6],
+    reading: bool,
+) -> i64 {
+    let inotify = if reading {
+        match host_fd_is_inotify(host_fd) {
+            Ok(inotify) => inotify,
+            Err(error) => return error,
+        }
+    } else {
+        false
+    };
+    if inotify && let Err(error) = ensure_inotify_nonblocking(host_fd) {
+        return error;
+    }
     let staging_alignment = direct_io_memory_alignment(host_fd);
 
     // Give the host one iovec for every bounded guest iovec, with the same
@@ -9651,7 +9710,7 @@ fn vectored_io(
     // atomicity, packet-consumption, and eventfd-consumption rules without ever
     // exposing the supervisor's guest-memory mapping.
     let mut staged_vectors = Vec::with_capacity(guest_iovecs.len());
-    for vector in &guest_iovecs {
+    for vector in guest_iovecs {
         let prefix = if reading {
             memory
                 .user()
@@ -9677,12 +9736,26 @@ fn vectored_io(
         staged_vectors.push(staged);
     }
 
+    // Inotify cookie virtualization restores an EFAULT read's partly written
+    // cookie from the first nonempty vector's prior contents.
+    let inotify_original = if inotify {
+        staged_vectors
+            .iter()
+            .find(|vector| vector.guest.length != 0)
+            .map(|vector| vector.accessible_slice(vector.accessible_length).to_vec())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let mut host_iovecs = staged_host_iovecs(&mut staged_vectors);
     if !reading {
         return invoke_vectored_write(number, host_fd, &mut host_iovecs, args);
     }
 
     let result = invoke_vectored_read(number, host_fd, &mut host_iovecs, args);
+    if inotify {
+        virtualize_staged_inotify_cookies(&mut staged_vectors, result, &inotify_original, state);
+    }
     if result >= 0 {
         let mut remaining = result as usize;
         for vector in &staged_vectors {
@@ -10278,6 +10351,7 @@ fn sync_file(state: &LoadedStaticElf, raw_fd: u64, data_only: bool) -> i64 {
 }
 
 include!("executor/syncfs.rs");
+include!("executor/inotify.rs");
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-227): Review translated host readahead semantics.
@@ -15725,6 +15799,14 @@ fn fionbio(
         // waits are unsupported. Refuse before changing any alias's flags.
         return negative_errno(libc::ENOSYS);
     }
+    if value == 0 {
+        // Keep F_SETFL's inotify policy for the same reason.
+        match host_fd_is_inotify(host_fd) {
+            Ok(true) => return negative_errno(libc::ENOSYS),
+            Ok(false) => {}
+            Err(error) => return error,
+        }
+    }
     if let Some(owner) = state.pipe_owners.get(&guest_fd) {
         owner.set_nonblocking(host_fd, value)
     } else {
@@ -18485,6 +18567,14 @@ fn fcntl(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> 
                 // Blocking virtual signalfd waits require scheduler ownership;
                 // reject before changing the shared open-file description.
                 return negative_errno(libc::ENOSYS);
+            }
+            if flags & libc::O_NONBLOCK == 0 {
+                // Blocking inotify waits are refused the same way.
+                match host_fd_is_inotify(host_fd) {
+                    Ok(true) => return negative_errno(libc::ENOSYS),
+                    Ok(false) => {}
+                    Err(error) => return error,
+                }
             }
             // SAFETY: host_fd names a live descriptor; F_SETFL consumes one int flag word.
             if let Some(owner) = source_pipe_owner {
@@ -22205,6 +22295,7 @@ pub(crate) fn native_loaded_state(cwd: &std::path::Path) -> LoadedStaticElf {
         proc_mounts: Arc::new(crate::proc_mounts::ProcMountSnapshot::capture().unwrap()),
         fd_object_inodes: std::collections::BTreeMap::new(),
         file_identity_table: Arc::new(std::sync::Mutex::new(crate::elf::GuestFileIdentityTable {
+            inotify_cookies: InotifyCookieTable::default(),
             next_inode: 0x2100_0000,
             objects: std::collections::BTreeMap::new(),
             proc_transfers: std::collections::BTreeMap::new(),
@@ -22225,6 +22316,7 @@ mod tests {
     include!("executor/pipe_owner_tests.rs");
     include!("executor/ioctl_nonblocking_tests.rs");
     include!("executor/syncfs_tests.rs");
+    include!("executor/inotify_tests.rs");
     include!("executor/shared_file_tests.rs");
     include!("executor/read_zero_cancel_tests.rs");
     include!("executor/random_device_stream_tests.rs");

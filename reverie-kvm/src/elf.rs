@@ -348,6 +348,8 @@ pub(crate) struct GuestFileIdentityTable {
     /// keyed by their pinned backing memfd.
     pub proc_transfers:
         std::collections::BTreeMap<(libc::dev_t, libc::ino_t), crate::executor::ProcTransfer>,
+    /// Run-wide virtual inotify rename cookies; see executor/inotify.rs.
+    pub inotify_cookies: crate::executor::InotifyCookieTable,
 }
 
 /// Process-tree-wide state whose lifetime follows a guest task rather than an
@@ -2029,6 +2031,7 @@ fn load_executable(
         fdinfo_table: std::sync::Weak::new(),
         fd_object_inodes: std::collections::BTreeMap::new(),
         file_identity_table: std::sync::Arc::new(std::sync::Mutex::new(GuestFileIdentityTable {
+            inotify_cookies: crate::executor::InotifyCookieTable::default(),
             next_inode: 0x2100_0000,
             objects: std::collections::BTreeMap::new(),
             proc_transfers: std::collections::BTreeMap::new(),
