@@ -58,6 +58,8 @@ pub(crate) mod parent_death;
 
 const PAGE_SIZE: u64 = 4096;
 pub(crate) const TASK_COMM_LEN: usize = 16;
+/// The fixed ELF64 layout also used by the ptrace tracee initializer.
+pub(crate) const LINUX_FIXED_PERSONALITY: u32 = 0x0004_0000;
 pub(crate) const STACK_LIMIT: u64 = 8 * 1024 * 1024;
 const MAX_PROGRAM_HEADERS_SIZE: usize = PAGE_SIZE as usize;
 const MAX_INTERPRETER_BYTES: u64 = 16 * 1024 * 1024;
@@ -916,6 +918,10 @@ pub(crate) struct LoadedStaticElf {
     // TODO-HUMAN-REVIEW(PR-221): Review direct-worker logical clock semantics.
     pub logical_clock_ns: u64,
     pub umask: libc::mode_t,
+    /// Per-task ELF64 Linux personality. Only UNAME26 can change within the
+    /// fixed ADDR_NO_RANDOMIZE layout. Fork and clone copy it by value; ordinary
+    /// supported exec preserves the calling task's value.
+    pub(crate) linux_personality: u32,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-228): Review caller-provided deterministic random seed state.
     pub random_seed: u64,
@@ -1160,6 +1166,7 @@ impl LoadedStaticElf {
             is_traced_tree_root: false,
             logical_clock_ns: self.logical_clock_ns,
             umask: self.umask,
+            linux_personality: self.linux_personality,
             random_seed: self.random_seed,
             ids_per_task: self.ids_per_task,
             getrandom_offset: 0,
@@ -1412,6 +1419,7 @@ impl LoadedStaticElf {
         self.logical_clock_ns = previous.logical_clock_ns;
         self.signal_dequeue_failure = previous.signal_dequeue_failure;
         self.umask = previous.umask;
+        self.linux_personality = previous.linux_personality;
         self.random_seed = previous.random_seed;
         self.ids_per_task = previous.ids_per_task;
         self.getrandom_offset = previous.getrandom_offset;
@@ -1958,6 +1966,7 @@ fn load_executable(
         is_traced_tree_root: true,
         logical_clock_ns: 0,
         umask: 0o022,
+        linux_personality: LINUX_FIXED_PERSONALITY,
         random_seed: 0,
         ids_per_task: reverie::task_ids::LINUX_IDS_PER_TASK,
         getrandom_offset: 0,

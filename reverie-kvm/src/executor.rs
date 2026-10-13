@@ -1250,8 +1250,11 @@ fn execute_basic_syscall_inner(
     } else if number == libc::SYS_readlinkat as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         readlinkat(memory, state, args, capture_metadata)
+    } else if number == libc::SYS_personality as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        personality(state, args[0])
     } else if number == libc::SYS_uname as u64 {
-        uname(memory, args[0])
+        uname(memory, state, args[0])
     } else if number == libc::SYS_prlimit64 as u64 {
         prlimit64(memory, args)
     } else if number == libc::SYS_rt_sigaction as u64 {
@@ -6185,6 +6188,7 @@ impl ElfExecutor {
                     | libc::SYS_tkill
                     | libc::SYS_truncate
                     | libc::SYS_umask
+                    | libc::SYS_personality
                     | libc::SYS_uname
                     | libc::SYS_unlink
                     | libc::SYS_unlinkat
@@ -20587,12 +20591,38 @@ fn readlink_at_impl(
     }
 }
 
-fn uname(memory: &mut GuestMemory, address: u64) -> i64 {
+const PERSONALITY_UNAME26: u32 = 0x0002_0000;
+
+// TODO-HUMAN-REVIEW(PR-1013): Review the per-task fixed-layout personality profile.
+fn personality(state: &mut LoadedStaticElf, raw: u64) -> i64 {
+    // Linux's syscall argument is unsigned int, including its query sentinel.
+    let requested = raw as u32;
+    let previous = state.linux_personality;
+    if requested == u32::MAX {
+        return i64::from(previous);
+    }
+    // Other execution domains or address-layout changes are not implemented.
+    // Refuse before publishing state rather than reporting a flag with no effect.
+    if requested & !PERSONALITY_UNAME26 != crate::elf::LINUX_FIXED_PERSONALITY {
+        return negative_errno(libc::ENOSYS);
+    }
+    state.linux_personality = requested;
+    i64::from(previous)
+}
+
+fn uname(memory: &mut GuestMemory, state: &LoadedStaticElf, address: u64) -> i64 {
+    // Linux's UNAME26 rule maps a 6.0.0 release to 2.6.(0 + 60).
+    // Keep this transformation tied to the existing lower virtual release.
+    let release: &[u8] = if state.linux_personality & PERSONALITY_UNAME26 != 0 {
+        b"2.6.60"
+    } else {
+        b"6.0.0"
+    };
     let mut utsname = [0; 65 * 6];
     for (index, value) in [
         b"Linux".as_slice(),
         b"reverie-kvm".as_slice(),
-        b"6.0.0".as_slice(),
+        release,
         b"#1".as_slice(),
         b"x86_64".as_slice(),
         b"(none)".as_slice(),
@@ -21917,6 +21947,7 @@ pub(crate) fn native_loaded_state(cwd: &std::path::Path) -> LoadedStaticElf {
         is_traced_tree_root: true,
         logical_clock_ns: 0,
         umask: 0o022,
+        linux_personality: crate::elf::LINUX_FIXED_PERSONALITY,
         random_seed: 0,
         ids_per_task: reverie::task_ids::LINUX_IDS_PER_TASK,
         getrandom_offset: 0,
@@ -21983,6 +22014,7 @@ pub(crate) fn test_loaded_state_for_vm(cwd: &std::path::Path) -> LoadedStaticElf
 mod tests {
     include!("../tests/support/executor_terminal_tests.rs");
     include!("executor/parent_death_tests.rs");
+    include!("executor/personality_tests.rs");
     include!("executor/pipe_owner_tests.rs");
     include!("executor/ioctl_nonblocking_tests.rs");
     include!("executor/syncfs_tests.rs");
