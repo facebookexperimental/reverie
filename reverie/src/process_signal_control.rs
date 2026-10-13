@@ -298,6 +298,7 @@ pub trait ProcessSignalControl: Debug + Send + Sync {
     /// disposition handling as [`Self::publish_alarm`]. No Tool hook, guest
     /// instruction, timer operation or wait completion is performed.
     /// Backends without a controlled signal queue keep the default `ENOSYS`.
+    // TODO-HUMAN-REVIEW(PR-1019): Review the timer-expiry publication API.
     fn publish_timer_expiry(
         &self,
         _process: SignalProcessId,

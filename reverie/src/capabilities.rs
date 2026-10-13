@@ -285,7 +285,6 @@ impl BackendCapabilities {
     pub const KVM: Self = Self {
         needs_killed_thread_rpc_cancellation: true,
         runs_exit_robust_list: false,
-        supports_parked_write_signal_interruption: false,
         defers_vfork_child_registration: true,
         virtualizes_capability_prctls: true,
         virtualizes_cpuid: true,
@@ -421,7 +420,6 @@ mod tests {
             ptrace_with(serde_json::json!({
                 "needs_killed_thread_rpc_cancellation": true,
                 "runs_exit_robust_list": false,
-                "supports_parked_write_signal_interruption": false,
                 "defers_vfork_child_registration": true,
                 "virtualizes_capability_prctls": true,
                 "virtualizes_cpuid": true,
