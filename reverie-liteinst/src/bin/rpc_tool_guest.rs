@@ -53,6 +53,9 @@ mod vdso_fail_closed_guest;
 #[path = "rpc_tool_guest/late_code.rs"]
 mod late_code_guest;
 
+#[path = "rpc_tool_guest/fixed_gates.rs"]
+mod fixed_gates_guest;
+
 const CALLS: u64 = 32;
 const TOOL_CPUID_EAX: u32 = 0x1111_1111;
 const TOOL_CPUID_EBX: u32 = 0x2222_2222;
@@ -3098,6 +3101,12 @@ fn main() {
     let path = args.next().expect("socket path");
     match mode.to_str() {
         Some("coordinator") => coordinator(Path::new(&path)),
+        Some("fixed-gates") => fixed_gates_guest::run(Path::new(&path)),
+        Some("fixed-gate-collision") => fixed_gates_guest::collision(Path::new(&path)),
+        Some("fixed-gate-inherited-filter") => {
+            fixed_gates_guest::inherited_filter(Path::new(&path))
+        }
+        Some("fixed-gate-install-failure") => fixed_gates_guest::install_failure(Path::new(&path)),
         Some("guest") => guest(Path::new(&path)),
         Some("syscall-fallback") => syscall_fallback_guest::run(Path::new(&path)),
         Some("syscall-fallback-xstate") => syscall_fallback_guest::run_xstate(Path::new(&path)),

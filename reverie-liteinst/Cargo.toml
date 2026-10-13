@@ -21,6 +21,9 @@ default = []
 preload-constructor = []
 # Exposes a fixed test ABI in the actual runtime without changing its allocator.
 allocator-fixture = ["reverie-inguest/allocator-fixture"]
+# Native-exec prerequisite. Only the FullTool installation route is admitted;
+# successor exec itself remains refused until its bootstrap is implemented.
+fixed-syscall-gates = ["reverie-inguest/fixed-syscall-gates"]
 
 [[bin]]
 name = "reverie-liteinst-allocator-host-control"
@@ -137,3 +140,8 @@ required-features = ["allocator-fixture"]
 name = "mapping_integrity"
 path = "tests/mapping_integrity.rs"
 required-features = ["allocator-fixture"]
+
+[[test]]
+name = "fixed_gates"
+path = "tests/fixed_gates.rs"
+required-features = ["fixed-syscall-gates"]

@@ -294,7 +294,7 @@ pub unsafe extern "C" fn reverie_inguest_generic_stack_query(
     unsafe { output.write(record) };
     0
 }
-
+#[cfg(not(feature = "fixed-syscall-gates"))]
 unsafe extern "C" {
     #[link_name = "reverie_inguest_trusted_syscall_ip"]
     fn native_gate();
@@ -768,4 +768,104 @@ pub(super) fn malformed_ticket_control() {
     assert!(REGION.get().is_none());
     // Consume no legitimate owner and publish no partial failure.
     assert_eq!(unsafe { (*pointer).body }, 0);
+}
+
+#[cfg(feature = "fixed-syscall-gates")]
+unsafe extern "C" {
+    #[link_name = "reverie_inguest_trusted_syscall_ip"]
+    fn legacy_native_gate();
+    // The core gate owner publishes this aligned eight-byte word only after
+    // the complete page is validated and sealed RX. It never returns to zero.
+    #[link_name = "reverie_inguest_fixed_gates_published"]
+    static FIXED_GATES_PUBLISHED: usize;
+}
+
+// Bootstrap starts before the fixed page exists; a body may publish it before
+// returning or taking a native terminal path. Select before either gate's
+// memory-free interval, without touching the caller's stack or Linux operands.
+// The default artifact keeps its original direct gate operand and bytes.
+#[cfg(feature = "fixed-syscall-gates")]
+#[unsafe(naked)]
+unsafe extern "C" fn native_gate() {
+    core::arch::naked_asm!(
+        "endbr64",
+        // MOV/JRCXZ preserves incoming flags; SYSCALL already clobbers RCX/R11.
+        "mov rcx, [rip + {published}]",
+        "jrcxz 2f",
+        "movabs r11, {fixed_entry}",
+        "jmp r11",
+        "2:",
+        "jmp {legacy_gate}",
+        published = sym FIXED_GATES_PUBLISHED,
+        fixed_entry = const crate::trap::FIXED_NATIVE_ENTRY,
+        legacy_gate = sym legacy_native_gate,
+    );
+}
+
+#[cfg(all(test, feature = "fixed-syscall-gates"))]
+mod fixed_gate_tests {
+    use super::*;
+
+    unsafe extern "C" fn unexpected_sigsys(_: i32, _: *mut libc::siginfo_t, _: *mut libc::c_void) {
+        let _ = unsafe { crate::trap::raw_syscall6(libc::SYS_exit_group, [91, 0, 0, 0, 0, 0]) };
+    }
+
+    unsafe extern "C" fn install_fixed_filter() {
+        unsafe { crate::trap::prepare_fixed_gates() }.unwrap();
+        unsafe { crate::signal::install_runtime_handler(libc::SIGSYS, unexpected_sigsys, 0) }
+            .unwrap();
+        let mut filter = crate::seccomp::SeccompFilter::for_trusted_gates_with_signal_return(
+            crate::trap::trusted_gate(),
+            crate::trap::guest_syscall_gate(),
+            Some(crate::signal::signal_restorer_return_ip()),
+        )
+        .unwrap();
+        unsafe { filter.install() }.unwrap();
+    }
+
+    unsafe extern "C" fn forbidden_second_body() {
+        let _ = unsafe { crate::trap::raw_syscall6(libc::SYS_exit_group, [92, 0, 0, 0, 0, 0]) };
+    }
+
+    fn repeat_after_publication(
+        name: &str,
+        bootstrap: unsafe extern "C" fn(unsafe extern "C" fn()),
+    ) {
+        const CHILD: &str = "REVERIE_FIXED_BOOTSTRAP_TERMINAL_CHILD";
+        if std::env::var(CHILD).ok().as_deref() == Some(name) {
+            assert!(!crate::trap::fixed_gates_published());
+            assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) }, 0);
+            // The first real cold prefix uses the legacy gate before its body
+            // publishes fixed gates. The repeat's mmap collision and terminal
+            // must use the fixed gate; the installed filter excludes legacy.
+            unsafe { bootstrap(install_fixed_filter) };
+            assert!(crate::trap::fixed_gates_published());
+            unsafe { bootstrap(forbidden_second_body) };
+            unreachable!("native repeated-entry terminal unexpectedly returned");
+        }
+        let module = module_path!().split_once("::").unwrap().1;
+        let test = format!("{module}::{name}");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test, "--nocapture"])
+            .env(CHILD, name)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(127), "{output:?}");
+    }
+
+    #[test]
+    fn published_constructor_repeat_exits_through_the_fixed_native_gate() {
+        repeat_after_publication(
+            "published_constructor_repeat_exits_through_the_fixed_native_gate",
+            constructor_entry,
+        );
+    }
+
+    #[test]
+    fn published_generic_repeat_exits_through_the_fixed_native_gate() {
+        repeat_after_publication(
+            "published_generic_repeat_exits_through_the_fixed_native_gate",
+            generic_entry,
+        );
+    }
 }

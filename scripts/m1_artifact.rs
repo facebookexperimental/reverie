@@ -698,8 +698,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 14] = [
     ),
     (
         "reverie-inguest/Cargo.toml",
-        2911,
-        "d25daf0166aaee74838fdeadb2ece9a4b206806b52f93533dbdcef93488e90f1",
+        3005,
+        "c6e9c66e38ebe53237b83b669f1a9f971233dcca5b134bcc1e9997e7f541d915",
     ),
     (
         "reverie-inguest/src/lib.rs",
@@ -708,8 +708,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 14] = [
     ),
     (
         "reverie-liteinst/Cargo.toml",
-        3870,
-        "c673042f821b533e03215c3efcf67b8458551376c39411747e9b595a9520defe",
+        4191,
+        "14be2e36ba865ba7a660823be9105ec35797948c08c7dcf3d2b8a9705ad25703",
     ),
     (
         "reverie-liteinst/src/lib.rs",
@@ -738,8 +738,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 14] = [
     ),
     (
         "reverie-inguest/src/guest/tool_region_constructor.rs",
-        30585,
-        "ea43ed2b281db6efa9524e45430b87153094355277a16292c63d0d596ce5fc66",
+        34690,
+        "c519cdb088ba730ed3a11de6571be1a78e79b30aef032abcc59ada42c6eeec7e",
     ),
     (
         "reverie-inguest/src/guest/tool_region_arena.rs",

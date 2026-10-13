@@ -144,6 +144,25 @@ separate, narrower check and does not establish full allocator qualification.
 
 ## Event path
 
+The experimental `fixed-syscall-gates` Cargo feature is a native-exec
+prerequisite, disabled by default. It supports only explicit FullTool
+installation, with no inherited seccomp filter. Compatibility, strace and
+built-in selectors are refused before handler publication. Existing ordinary
+builds retain their current gates and signal-return policy.
+
+This feature reserves the page at `0x500000000000` without replacing an
+existing mapping, copies its scalar, guest-permission and signal-return gates
+while writable, then seals the page read-execute before publishing it.
+Physical guest mapping changes cannot remove or replace the published page.
+An installation error after publication terminates the process with status
+127; it cannot resume with a partial runtime. This is mapping integrity, not
+protection against arbitrary guest entry into trusted code.
+
+Exec remains refused. Successor bootstrap, private Tool TLS and genuine Tool
+state continuity are still required before enabling it. The optional artifact
+also needs its own compiler/source qualification before a Hermit consumer can
+use it; ordinary artifact qualification does not qualify fixed gates.
+
 1. A tool-specific DSO calls `install_tool::<T>` from its preload constructor.
    It connects to the coordinator and receives `T::GlobalState::Config` before
    seccomp is active.

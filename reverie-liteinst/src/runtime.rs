@@ -312,6 +312,8 @@ pub fn builtin_tool_from_env_value(value: &OsStr) -> Option<BuiltinTool> {
 /// The dynamic loader must call this exactly once before application threads
 /// start; it installs process-wide, irreversible seccomp state.
 pub(crate) unsafe fn install_builtin_runtime(tool: BuiltinTool) -> io::Result<()> {
+    #[cfg(feature = "fixed-syscall-gates")]
+    require_fixed_gate_full_tool(false)?;
     let region = reverie_inguest::guest::tool_region::ToolRegion::reserve()?;
     unsafe {
         reverie_inguest::install_builtin_with_stack_backing(
@@ -473,6 +475,13 @@ pub(crate) fn initialize_from_environment() -> io::Result<()> {
 // actual standalone leaf reads the same raw environment vector as its native
 // activation prefix; generic embeddings retain std::env/getenv acquisition.
 pub(crate) fn initialize_from_selected_value(tool_value: Option<&OsStr>) -> io::Result<()> {
+    // The experimental artifact has only a FullTool contract. Refuse before
+    // reserving its page or changing a handler, rather than silently changing
+    // the compatibility/built-in signal-return policy.
+    #[cfg(feature = "fixed-syscall-gates")]
+    if tool_value.is_some() {
+        require_fixed_gate_full_tool(false)?;
+    }
     // Prefer a shared reverie-inguest built-in when the selector names one, so a
     // single env var is a superset of the LiteInst-native strace/compat modes
     // (matches e9patch's single TOOL_ENV selecting shared built-ins).
@@ -627,6 +636,15 @@ fn install_runtime(
     vdso_sites: &[reverie_ptrace::VdsoSyscallSite],
     _prepared_callbacks: Option<PreparedCallbacks>,
 ) -> io::Result<()> {
+    #[cfg(feature = "fixed-syscall-gates")]
+    {
+        require_fixed_gate_full_tool(TOOL_MODE.load(Ordering::Acquire) == TOOL_REVERIE)?;
+        if !reverie_inguest::trap::fixed_gates_published() {
+            return Err(io::Error::other(
+                "FullTool fixed syscall gates are not prepared",
+            ));
+        }
+    }
     // Active LiteInst only: inert compatibility loads never reserve this
     // range, and generic e9patch/SaBRe callers keep their existing backing.
     // Reserve before any instruction/guard/SIGSYS handler is installed.
@@ -665,6 +683,18 @@ fn install_runtime(
         )
     }?;
     enable_instruction_faulting(instructions)
+}
+
+#[cfg(feature = "fixed-syscall-gates")]
+fn require_fixed_gate_full_tool(full_tool: bool) -> io::Result<()> {
+    if full_tool {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "fixed syscall gates require the in-guest FullTool installation route",
+        ))
+    }
 }
 
 struct CompatibilityEventChannel {
@@ -3830,5 +3860,17 @@ mod tests {
             before,
             "the previous mask must be restored exactly"
         );
+    }
+
+    #[cfg(feature = "fixed-syscall-gates")]
+    #[test]
+    fn fixed_gate_artifact_refuses_non_fulltool_before_publication() {
+        assert!(!reverie_inguest::trap::fixed_gates_published());
+        assert!(super::initialize_from_selected_value(None).is_ok());
+        for mode in ["compat", "strace", "noop", "getpid"] {
+            let error = super::initialize_from_selected_value(Some(OsStr::new(mode))).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::Unsupported, "{mode}");
+            assert!(!reverie_inguest::trap::fixed_gates_published());
+        }
     }
 }

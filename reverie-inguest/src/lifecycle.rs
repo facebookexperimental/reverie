@@ -141,6 +141,13 @@ fn build_trap_filter(config: &RuntimeConfig) -> io::Result<SeccompFilter> {
 /// load-bearing: the handler must be in place before the filter starts trapping,
 /// and the filter must whitelist the trusted gate.
 unsafe fn install_in_process_trap(config: &RuntimeConfig, backing: StackBacking) -> io::Result<()> {
+    #[cfg(feature = "fixed-syscall-gates")]
+    if trap::fixed_gates_published() && !config.restrict_signal_return {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "fixed syscall gates require restricted runtime signal return",
+        ));
+    }
     unsafe { trap::install_handler_with_backing(config.use_alt_stack, backing)? };
     let mut filter = build_trap_filter(config)?;
     unsafe { filter.install() }?;

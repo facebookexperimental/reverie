@@ -30,9 +30,65 @@ use crate::dispatch::SyscallDispatcher;
 use crate::dispatch::SyscallEvent;
 use crate::seccomp::TrustedGate;
 use crate::signal;
+#[cfg(feature = "fixed-syscall-gates")]
+mod fixed_gates;
 pub mod frame;
 mod panic_report;
 mod pkru;
+
+/// Frozen optional gate ABI. These constants emit no default-path code.
+#[doc(hidden)]
+pub const FIXED_GATE_BASE: u64 = 0x5000_0000_0000;
+#[doc(hidden)]
+pub const FIXED_GATE_BYTES: u64 = 4096;
+#[doc(hidden)]
+pub const FIXED_NATIVE_ENTRY: u64 = FIXED_GATE_BASE + 0x7c;
+#[doc(hidden)]
+pub const FIXED_GUEST_ENTRY: u64 = FIXED_GATE_BASE + 0x100;
+#[doc(hidden)]
+pub const FIXED_SIGNAL_RESTORER_ENTRY: u64 = FIXED_GATE_BASE + 0x300;
+#[doc(hidden)]
+pub const FIXED_SIGNAL_RESTORER_RETURN_IP: u64 = FIXED_GATE_BASE + 0x30b;
+
+/// Whether this process permanently selected the fully sealed fixed gate page.
+pub fn fixed_gates_published() -> bool {
+    #[cfg(feature = "fixed-syscall-gates")]
+    {
+        fixed_gates::published()
+    }
+    #[cfg(not(feature = "fixed-syscall-gates"))]
+    {
+        false
+    }
+}
+
+/// The exact dedicated owned range after publication, including page padding.
+pub fn fixed_gate_region() -> Option<(u64, u64)> {
+    fixed_gates_published().then_some((FIXED_GATE_BASE, FIXED_GATE_BASE + FIXED_GATE_BYTES))
+}
+
+/// Prepare the optional page using legacy bootstrap syscalls, RW then RX.
+/// Collision refuses; no existing mapping is adopted. Publication is permanent.
+///
+/// # Safety
+/// The owner must call at its single FullTool installation boundary, before
+/// ANY runtime handler/action/filter is published and while no other thread
+/// can prepare or alter the mapping. No inherited/foreign filter is admitted.
+/// Later installation failure must terminate through the selected gate; the
+/// page must never be unmapped or reverted after successful publication.
+pub unsafe fn prepare_fixed_gates() -> io::Result<()> {
+    #[cfg(feature = "fixed-syscall-gates")]
+    {
+        unsafe { fixed_gates::prepare() }
+    }
+    #[cfg(not(feature = "fixed-syscall-gates"))]
+    {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "fixed syscall gates are not compiled",
+        ))
+    }
+}
 
 /// Whether the runtime's installation found OSPKE enabled (RDPKRU and WRPKRU
 /// run); false before installation.
@@ -195,6 +251,10 @@ thread_local! {
 /// The call must return through its original stack; this is not an ordinary
 /// wrapper for `rt_sigreturn` or `clone` with a replaced child stack.
 pub unsafe fn raw_syscall6(number: i64, args: [u64; 6]) -> i64 {
+    #[cfg(feature = "fixed-syscall-gates")]
+    if fixed_gates_published() {
+        return unsafe { fixed_gates::scalar(number, args) };
+    }
     unsafe {
         reverie_inguest_trusted_syscall(
             number as u64,
@@ -217,6 +277,10 @@ pub unsafe fn raw_syscall6(number: i64, args: [u64; 6]) -> i64 {
 /// as for `raw_syscall6`; unused syscall arguments are zero.
 #[inline(never)]
 pub(crate) unsafe fn raw_syscall3(number: i64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
+    #[cfg(feature = "fixed-syscall-gates")]
+    if fixed_gates_published() {
+        return unsafe { fixed_gates::scalar3_or6(number, arg0, arg1, arg2, 0, 0, 0) };
+    }
     unsafe { reverie_inguest_trusted_syscall(number as u64, arg0, arg1, arg2, 0, 0, 0) }
 }
 
@@ -233,6 +297,10 @@ pub(crate) unsafe fn raw_syscall3(number: i64, arg0: u64, arg1: u64, arg2: u64) 
 /// Like the ordinary gate, this cannot resume a clone with a different stack
 /// and must not be used as an ordinary wrapper around rt_sigreturn.
 pub unsafe fn raw_syscall6_with_pkru(number: i64, args: [u64; 6], pkru: u32) -> i64 {
+    #[cfg(feature = "fixed-syscall-gates")]
+    if fixed_gates_published() {
+        return unsafe { fixed_gates::guest(number, &args, pkru).result };
+    }
     unsafe { reverie_inguest_guest_syscall(number, args.as_ptr(), pkru).result }
 }
 
@@ -277,6 +345,13 @@ pub unsafe fn raw_syscall6_with_result(
 ) -> NativeSyscallResult {
     match guest_pkru {
         Some(pkru) => {
+            #[cfg(feature = "fixed-syscall-gates")]
+            let result = if fixed_gates_published() {
+                unsafe { fixed_gates::guest(number, &args, pkru) }
+            } else {
+                unsafe { reverie_inguest_guest_syscall(number, args.as_ptr(), pkru) }
+            };
+            #[cfg(not(feature = "fixed-syscall-gates"))]
             let result = unsafe { reverie_inguest_guest_syscall(number, args.as_ptr(), pkru) };
             NativeSyscallResult {
                 result: result.result,
@@ -292,6 +367,13 @@ pub unsafe fn raw_syscall6_with_result(
 
 /// The address range of the trusted gate, for building the seccomp filter.
 pub fn trusted_gate() -> TrustedGate {
+    #[cfg(feature = "fixed-syscall-gates")]
+    if fixed_gates_published() {
+        return TrustedGate {
+            syscall_ip: FIXED_GATE_BASE + 0x80,
+            return_ip: FIXED_GATE_BASE + 0x82,
+        };
+    }
     TrustedGate {
         syscall_ip: ptr::addr_of!(reverie_inguest_trusted_syscall_ip) as usize as u64,
         return_ip: ptr::addr_of!(reverie_inguest_trusted_syscall_return_ip) as usize as u64,
@@ -302,6 +384,13 @@ pub fn trusted_gate() -> TrustedGate {
 /// Its addresses can be allowlisted on any CPU; unsupported CPUs never execute
 /// its RDPKRU/WRPKRU instructions.
 pub fn guest_syscall_gate() -> TrustedGate {
+    #[cfg(feature = "fixed-syscall-gates")]
+    if fixed_gates_published() {
+        return TrustedGate {
+            syscall_ip: FIXED_GATE_BASE + 0x200,
+            return_ip: FIXED_GATE_BASE + 0x202,
+        };
+    }
     TrustedGate {
         syscall_ip: ptr::addr_of!(reverie_inguest_guest_syscall_ip) as usize as u64,
         return_ip: ptr::addr_of!(reverie_inguest_guest_syscall_return_ip) as usize as u64,

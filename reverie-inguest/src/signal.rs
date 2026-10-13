@@ -51,12 +51,20 @@ unsafe extern "C" {
 /// syscall filter can admit `rt_sigreturn` only at
 /// [`signal_restorer_return_ip`] (signal phase 1, design section 3).
 pub fn signal_restorer() -> u64 {
+    #[cfg(feature = "fixed-syscall-gates")]
+    if crate::trap::fixed_gates_published() {
+        return crate::trap::FIXED_SIGNAL_RESTORER_ENTRY;
+    }
     reverie_inguest_signal_restorer as *const () as u64
 }
 
 /// The instruction pointer Linux reports for the restorer's `rt_sigreturn`:
 /// the address after its `syscall` instruction.
 pub fn signal_restorer_return_ip() -> u64 {
+    #[cfg(feature = "fixed-syscall-gates")]
+    if crate::trap::fixed_gates_published() {
+        return crate::trap::FIXED_SIGNAL_RESTORER_RETURN_IP;
+    }
     reverie_inguest_signal_restorer_return_ip as *const () as u64
 }
 

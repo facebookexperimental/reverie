@@ -190,9 +190,40 @@ pub fn snapshot() -> Option<CallbackPoolSnapshot> {
     })
 }
 
+#[cfg(not(feature = "fixed-syscall-gates"))]
 unsafe extern "C" {
     #[link_name = "reverie_inguest_trusted_syscall_ip"]
     fn native_gate();
+}
+
+#[cfg(feature = "fixed-syscall-gates")]
+unsafe extern "C" {
+    #[link_name = "reverie_inguest_trusted_syscall_ip"]
+    fn legacy_native_gate();
+    // Eight-byte, one-way publication after validation and RX sealing.
+    #[link_name = "reverie_inguest_fixed_gates_published"]
+    static FIXED_GATES_PUBLISHED: usize;
+}
+
+// A native failure may precede pool preparation or follow filter admission.
+// Preserve Linux operands and R12, selecting before the memory-free gate.
+// This adds no selector instructions to the ordinary callback recipe.
+#[cfg(feature = "fixed-syscall-gates")]
+#[unsafe(naked)]
+unsafe extern "C" fn native_gate() {
+    core::arch::naked_asm!(
+        "endbr64",
+        // MOV/JRCXZ preserves flags and uses only native syscall clobbers.
+        "mov rcx, [rip + {published}]",
+        "jrcxz 2f",
+        "movabs r11, {fixed_entry}",
+        "jmp r11",
+        "2:",
+        "jmp {legacy_gate}",
+        published = sym FIXED_GATES_PUBLISHED,
+        fixed_entry = const crate::trap::FIXED_NATIVE_ENTRY,
+        legacy_gate = sym legacy_native_gate,
+    );
 }
 
 /// Enter an occupied pool stack, or retain the exact registered alternate
@@ -366,3 +397,95 @@ core::arch::global_asm!(
 #[cfg(test)]
 #[path = "installed_stack_tests.rs"]
 mod tests;
+
+#[cfg(all(test, not(feature = "fixed-syscall-gates")))]
+mod ordinary_gate_byte_controls {
+    use super::*;
+
+    unsafe extern "C" {
+        #[link_name = "reverie_inguest_trusted_syscall"]
+        fn legacy_scalar_gate(
+            number: u64,
+            arg0: u64,
+            arg1: u64,
+            arg2: u64,
+            arg3: u64,
+            arg4: u64,
+            arg5: u64,
+        ) -> i64;
+        #[link_name = "reverie_inguest_installed_callback_entry_end"]
+        fn installed_entry_end();
+    }
+
+    #[test]
+    fn ordinary_gate_bytes_and_terminal_operand_remain_the_qualified_recipe() {
+        // Literal complete legacy body from the independent artifact checker;
+        // read the emitted mapped text, not a second assembly string.
+        let expected = [
+            0x41, 0x54, 0x4c, 0x8d, 0x25, 0x1c, 0, 0, 0, 0x48, 0x89, 0xf8, 0x48, 0x89, 0xf7, 0x48,
+            0x89, 0xd6, 0x48, 0x89, 0xca, 0x4d, 0x89, 0xc2, 0x4d, 0x89, 0xc8, 0x4c, 0x8b, 0x4c,
+            0x24, 0x10, 0x0f, 0x05, 0x41, 0xff, 0xe4, 0xf3, 0x0f, 0x1e, 0xfa, 0x41, 0x5c, 0xc3,
+        ];
+        let owner = legacy_scalar_gate as *const () as usize;
+        // SAFETY: these hidden symbols name retained runtime RX text, with the
+        // complete 44-byte owner and terminal interval defined by naked_asm.
+        let actual = unsafe { core::slice::from_raw_parts(owner as *const u8, expected.len()) };
+        assert_eq!(actual, expected);
+        assert_eq!(native_gate as *const () as usize - owner, 0x20);
+        let end = installed_entry_end as *const () as usize;
+        let jump = unsafe { core::slice::from_raw_parts((end - 11) as *const u8, 5) };
+        assert_eq!(jump[0], 0xe9);
+        let displacement = i32::from_le_bytes(jump[1..].try_into().unwrap());
+        assert_eq!(
+            (end as i64 - 6 + i64::from(displacement)) as usize,
+            owner + 0x20
+        );
+        let tail = unsafe { core::slice::from_raw_parts((end - 6) as *const u8, 6) };
+        assert_eq!(tail, [0xf3, 0x0f, 0x1e, 0xfa, 0x0f, 0x0b]);
+    }
+}
+
+#[cfg(all(test, feature = "fixed-syscall-gates"))]
+mod fixed_gate_tests {
+    use super::*;
+
+    unsafe extern "C" fn unexpected_sigsys(_: i32, _: *mut libc::siginfo_t, _: *mut libc::c_void) {
+        let _ = unsafe { crate::trap::raw_syscall6(libc::SYS_exit_group, [91, 0, 0, 0, 0, 0]) };
+    }
+
+    unsafe extern "C" fn unexpected_callback(_: *mut libc::c_void) {
+        let _ = unsafe { crate::trap::raw_syscall6(libc::SYS_exit_group, [92, 0, 0, 0, 0, 0]) };
+    }
+
+    #[test]
+    fn published_unprepared_installed_callback_exits_through_the_fixed_native_gate() {
+        const CHILD: &str = "REVERIE_FIXED_INSTALLED_TERMINAL_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            assert!(snapshot().is_none());
+            assert!(!crate::trap::fixed_gates_published());
+            assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) }, 0);
+            unsafe { crate::trap::prepare_fixed_gates() }.unwrap();
+            unsafe { crate::signal::install_runtime_handler(libc::SIGSYS, unexpected_sigsys, 0) }
+                .unwrap();
+            let mut filter = crate::seccomp::SeccompFilter::for_trusted_gates_with_signal_return(
+                crate::trap::trusted_gate(),
+                crate::trap::guest_syscall_gate(),
+                Some(crate::signal::signal_restorer_return_ip()),
+            )
+            .unwrap();
+            unsafe { filter.install() }.unwrap();
+            unsafe { entry(core::ptr::null_mut(), unexpected_callback) };
+            unreachable!("native terminal unexpectedly returned");
+        }
+        let module = module_path!().split_once("::").unwrap().1;
+        let test = format!(
+            "{module}::published_unprepared_installed_callback_exits_through_the_fixed_native_gate"
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test, "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(127), "{output:?}");
+    }
+}

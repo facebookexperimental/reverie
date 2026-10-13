@@ -27,6 +27,8 @@ allocator-fixture = []
 # loader maps the cdylib. Disable to embed the runtime and drive it manually
 # (for example from a backend that installs it after its own bootstrap).
 preload-constructor = []
+# Explicit FullTool-only fixed syscall/restorer ABI; off by default.
+fixed-syscall-gates = []
 # Synchronous coordinator RPC client, wire-compatible with the async
 # `reverie-rpc-transport` `RpcServer<G>` (u32-BE length prefix + bincode2
 # `config::legacy`). Opt-in so the default cdylib stays a lean libc-only .so.

@@ -233,6 +233,20 @@ where
     // runtime does not read the Tool's state as code addresses either.
     let _private_allocations = reverie_inguest::guest::alloc::enter_dispatch();
     crate::patch_alloc::preflight_allocator()?;
+    #[cfg(feature = "fixed-syscall-gates")]
+    let mut fixed_install = FixedGateInstallation { complete: false };
+    #[cfg(feature = "fixed-syscall-gates")]
+    unsafe {
+        if reverie_inguest::guest::sigalrm::seccomp_filter_count() != Some(0) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "fixed syscall gates refuse an inherited or unreadable seccomp filter state",
+            ));
+        }
+        // All runtime signal actions and their filter must select the same
+        // fixed page. Prepare it before any callback or handler is published.
+        reverie_inguest::trap::prepare_fixed_gates()?;
+    }
     crate::syscall_fallback::initialize()?;
     let rpc =
         CoordinatorRpc::<T::GlobalState>::connect(coordinator, runtime::replace_coordinator_fd)?;
@@ -291,14 +305,40 @@ where
         .map_err(|_| {
             io::Error::new(io::ErrorKind::AlreadyExists, "Reverie tool installed twice")
         })?;
-    runtime::initialize_reverie_tool(
+    let result = runtime::initialize_reverie_tool(
         stats,
         publication,
         instruction_subscriptions,
         site_patching,
         &vdso_sites,
         prepared_callbacks,
-    )
+    );
+    #[cfg(feature = "fixed-syscall-gates")]
+    {
+        fixed_install.complete = result.is_ok();
+    }
+    result
+}
+
+/// A published fixed gate cannot be rolled back while an installed action or
+/// filter can still name it. A failed install must not resume guest code.
+#[cfg(feature = "fixed-syscall-gates")]
+struct FixedGateInstallation {
+    complete: bool,
+}
+
+#[cfg(feature = "fixed-syscall-gates")]
+impl Drop for FixedGateInstallation {
+    fn drop(&mut self) {
+        if !self.complete && reverie_inguest::trap::fixed_gates_published() {
+            unsafe {
+                // Even stderr may be a full blocking pipe. Publication has
+                // made returning unsafe, so diagnostics cannot precede exit.
+                raw_syscall6(libc::SYS_exit_group, [127, 0, 0, 0, 0, 0]);
+                core::arch::asm!("ud2", options(noreturn));
+            }
+        }
+    }
 }
 
 /// Sends `request` to the coordinator's global state and waits for its
