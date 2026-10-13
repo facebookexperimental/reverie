@@ -179,10 +179,15 @@ impl EntryDriverWatch {
 
     pub(crate) async fn wait(&self) {
         loop {
-            // Both subscriptions precede the state checks. A callback drop or
-            // unrelated gate reopening only rotates this loop; it is not a
-            // fatal event and is never a publication receipt.
-            let gate = self.gate.subscribe();
+            // Both subscriptions precede the state checks. The gate's part of
+            // `check` is only its failure, so subscribe to that alone: the
+            // gate's ordinary change channel completes on every copy, entry
+            // and exit of every vCPU sharing it, and waking each parked
+            // sibling for each of those made every guest syscall cost
+            // O(threads) host wakeups. An owner change only rotates this
+            // loop; it is not a fatal event and is never a publication
+            // receipt.
+            let gate = self.gate.subscribe_failure();
             let owner = self.owner.as_ref().map(DriverOwner::subscribe);
             if self.check().is_err() {
                 return;

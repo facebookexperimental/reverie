@@ -328,6 +328,10 @@ struct State {
     failure: Option<Arc<PendingFailure>>,
     sender: Option<oneshot::Sender<()>>,
     changed: Change,
+    // Completed once, by the first change notification after a failure is
+    // recorded (`EntryGate::subscribe_failure`). A failure is never cleared.
+    failed_sender: Option<oneshot::Sender<()>>,
+    failed: Change,
     copy_changed: Arc<Condvar>,
     owner_notifications: Vec<owner::OwnerNotification>,
     retired_origins: Vec<EntryOrigin>,
@@ -339,6 +343,7 @@ struct State {
 
 struct ChangeSignal {
     sender: Option<oneshot::Sender<()>>,
+    failed: Option<oneshot::Sender<()>>,
     copies: Arc<Condvar>,
     owners: Vec<owner::OwnerNotification>,
     origins: Vec<EntryOrigin>,
@@ -401,6 +406,11 @@ impl State {
         self.changed = receiver.shared();
         ChangeSignal {
             sender: self.sender.replace(sender),
+            failed: if self.failure.is_some() {
+                self.failed_sender.take()
+            } else {
+                None
+            },
             copies: self.copy_changed.clone(),
             owners: std::mem::take(&mut self.owner_notifications),
             origins: std::mem::take(&mut self.retired_origins),
@@ -426,6 +436,9 @@ fn notify(change: ChangeSignal) {
     drop(change.origins);
     if let Some(sender) = change.sender {
         let _ = sender.send(());
+    }
+    if let Some(failed) = change.failed {
+        let _ = failed.send(());
     }
 }
 
@@ -504,6 +517,7 @@ impl EntryGate {
 
     pub(crate) fn new() -> Arc<Self> {
         let (sender, receiver) = oneshot::channel();
+        let (failed_sender, failed) = oneshot::channel();
         Arc::new(Self {
             #[cfg(test)]
             prepare_probe: Mutex::new(None),
@@ -519,6 +533,8 @@ impl EntryGate {
                 failure: None,
                 sender: Some(sender),
                 changed: receiver.shared(),
+                failed_sender: Some(failed_sender),
+                failed: failed.shared(),
                 copy_changed: Arc::new(Condvar::new()),
                 owner_notifications: Vec::new(),
                 retired_origins: Vec::new(),
@@ -544,6 +560,14 @@ impl EntryGate {
             probe,
             pending_observed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Completes once the gate has recorded a failure (or the gate is gone).
+    /// Unlike [`Self::subscribe`] it is not completed by the ordinary changes
+    /// every copy, entry and exit makes, so a waiter that only cares about
+    /// failure (`EntryDriverWatch`) is not woken by each of them.
+    pub(crate) fn subscribe_failure(&self) -> Change {
+        self.state.lock().unwrap().failed.clone()
     }
 
     #[cfg(test)]
@@ -1865,6 +1889,60 @@ mod tests {
             );
             assert_eq!(observer.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
         }
+    }
+
+    /// The failure subscription a parked callback waits on is not completed
+    /// by the copies, entries and exits every sibling vCPU makes (each of which
+    /// completes the ordinary change channel), only by a recorded failure.
+    /// Before, `EntryDriverWatch` waited on the ordinary channel, so each guest
+    /// syscall woke every parked sibling thread.
+    #[test]
+    fn failure_subscription_ignores_ordinary_changes_and_completes_on_failure() {
+        let gate = EntryGate::new();
+        let mut participant = gate.register().unwrap();
+        let waker = noop_waker();
+        let mut failed = pin!(gate.subscribe_failure());
+        let mut changed = pin!(gate.subscribe());
+        assert!(
+            failed
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+
+        drop(gate.try_copy(None).unwrap().unwrap());
+        let mut entry = participant.try_enter().unwrap().unwrap();
+        assert!(entry.activate(|| Ok(())).unwrap());
+        entry.withdraw();
+        entry.acknowledge(Ok(())).unwrap();
+        assert!(
+            changed
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_ready(),
+            "the ordinary channel still reports every change"
+        );
+        assert!(
+            failed
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending(),
+            "an ordinary change completed the failure subscription"
+        );
+
+        gate.poison(None, protocol_failure("fail"));
+        assert!(
+            failed
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_ready()
+        );
+        // A subscription taken after the failure is already complete.
+        assert!(
+            pin!(gate.subscribe_failure())
+                .poll(&mut Context::from_waker(&waker))
+                .is_ready()
+        );
     }
 
     #[test]

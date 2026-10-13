@@ -6130,10 +6130,11 @@ mod tests {
                 let generation = memory.entry_gate().test_state().generation;
                 let probe = probe(&memory, None);
                 let waker = Waker::from(probe.clone());
-                // This is the same subscription used by the checked Tool
-                // driver's private-failure future before polling its callback.
-                let watch = crate::entry::driver::EntryDriverWatch::for_memory(&memory);
-                let mut changed = Box::pin(watch.wait());
+                // The gate's ordinary change channel, which this preparation's
+                // copy retirement completes. (The checked Tool driver's
+                // private-failure future now waits on the gate's failure
+                // channel, which an ordinary retirement does not complete.)
+                let mut changed = Box::pin(memory.entry_gate().subscribe());
                 assert!(
                     changed
                         .as_mut()
@@ -6154,7 +6155,6 @@ mod tests {
                 memory.read(0, &mut actual).unwrap();
                 assert_eq!(actual, [0xa5; PAGE_SIZE]);
                 drop(changed);
-                drop(watch);
                 drop(waker);
                 drop(probe);
                 drop(user);
@@ -6169,8 +6169,7 @@ mod tests {
                 let memory = fixture(!writable);
                 let probe = probe(&memory, Some(WakeAction::SetWritable(writable)));
                 let waker = Waker::from(probe.clone());
-                let watch = crate::entry::driver::EntryDriverWatch::for_memory(&memory);
-                let mut changed = Box::pin(watch.wait());
+                let mut changed = Box::pin(memory.entry_gate().subscribe());
                 assert!(
                     changed
                         .as_mut()
@@ -6212,8 +6211,7 @@ mod tests {
                 ));
                 let probe = probe(&memory, Some(WakeAction::Poison(cause.clone())));
                 let waker = Waker::from(probe.clone());
-                let watch = crate::entry::driver::EntryDriverWatch::for_memory(&memory);
-                let mut changed = Box::pin(watch.wait());
+                let mut changed = Box::pin(memory.entry_gate().subscribe());
                 assert!(
                     changed
                         .as_mut()
