@@ -13799,6 +13799,7 @@ fn getsockopt(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]
             | libc::SO_REUSEADDR
             | libc::SO_KEEPALIVE
             | libc::SO_BROADCAST
+            | libc::SO_ERROR
     ) {
         return negative_errno(libc::ENOPROTOOPT);
     }
@@ -13875,6 +13876,9 @@ fn getsockopt(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]
         return write_struct(memory, args[4], &length);
     }
 
+    // SO_ERROR reads and clears the socket's pending error, as the kernel
+    // does for the ptrace backend (Detcore forwards it there too); a guest
+    // polls for a nonblocking connect's completion before asking.
     if !matches!(
         option,
         libc::SO_TYPE
@@ -13883,6 +13887,7 @@ fn getsockopt(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]
             | libc::SO_REUSEADDR
             | libc::SO_KEEPALIVE
             | libc::SO_BROADCAST
+            | libc::SO_ERROR
     ) {
         return negative_errno(libc::ENOPROTOOPT);
     }
@@ -36452,6 +36457,11 @@ mod tests {
             option_length,
         );
         assert_mutable(&mut memory, &mut state, [0, 0, 0]);
+        // A socket with no pending error reports 0, as on Linux.
+        assert_eq!(
+            scalar_option(&mut memory, &mut state, socket_fd as u64, libc::SO_ERROR),
+            0
+        );
 
         assert_eq!(
             syscall_result(
@@ -36495,7 +36505,7 @@ mod tests {
             "option length must win when value and length overlap"
         );
 
-        for unsupported in [libc::SO_ERROR, libc::SO_SNDBUF] {
+        for unsupported in [libc::SO_RCVBUF, libc::SO_SNDBUF] {
             let sentinel = 0x5a5a_5a5a_i32;
             let length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
             assert_eq!(write_struct(&mut memory, VALUE, &sentinel), 0);
