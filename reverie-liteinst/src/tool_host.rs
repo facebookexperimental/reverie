@@ -374,7 +374,7 @@ unsafe fn patch_initial_image_vdso(
     // admits only the qualified immutable extent and the RW -> RX sequence,
     // through the already adopted Tool raw gate, and cannot unwind under NX.
     unsafe {
-        reverie_ptrace::patch_current_vdso_trapping_owned(
+        reverie::vdso::patch_current_vdso_trapping_owned(
             subscriptions,
             |address, len, protection| {
                 let restoring = step == 1;
@@ -439,7 +439,7 @@ mod initial_vdso_tests {
             // The fatal guard is outside catch_unwind: a panic cannot turn
             // into the expected terminal status by unwinding this owner.
             let _ = std::panic::catch_unwind(|| unsafe {
-                reverie_ptrace::patch_current_vdso_trapping_owned(
+                reverie::vdso::patch_current_vdso_trapping_owned(
                     &reverie::Subscription::all(),
                     |address, len, protection| {
                         if protection == libc::PROT_READ | libc::PROT_EXEC {
@@ -597,9 +597,9 @@ where
     let vdso_sites = if let Some(result) = initial_vdso {
         result.map(|()| Vec::new())
     } else if site_patching {
-        reverie_ptrace::patch_current_vdso(&subscriptions)
+        reverie::vdso::patch_current_vdso(&subscriptions)
     } else {
-        reverie_ptrace::patch_current_vdso_trapping(&subscriptions).map(|()| Vec::new())
+        reverie::vdso::patch_current_vdso_trapping(&subscriptions).map(|()| Vec::new())
     }
     .map_err(|error| {
         io::Error::other(reverie_inguest::guest::host::describe_reverie_error(&error))

@@ -349,7 +349,7 @@ pub const PROCESS_FORK_ENV: &str = "REVERIE_LITEINST_PROCESS_FORK";
 /// through the in-guest `SIGSYS` fallback (`crate::syscall_fallback`). That
 /// includes subscribed vDSO fast paths: they get ptrace's whole
 /// `mov $nr, %eax; syscall; ret` stubs with no hook
-/// ([`reverie_ptrace::patch_current_vdso_trapping`]) instead of hooked bare
+/// ([`reverie::vdso::patch_current_vdso_trapping`]) instead of hooked bare
 /// `syscall`s. Subscribed `cpuid`, `rdtsc`, and `rdtscp` instructions are
 /// covered too: no instruction site is claimed or patched, and each one is
 /// emulated through the same fallback continuation, as for late code.
@@ -545,7 +545,7 @@ pub(crate) fn initialize_reverie_tool(
     publication: PatchPublication,
     instructions: InstructionSubscriptions,
     site_patching: bool,
-    vdso_sites: &[reverie_ptrace::VdsoSyscallSite],
+    vdso_sites: &[reverie::vdso::VdsoSyscallSite],
     prepared_callbacks: PreparedCallbacks,
     #[cfg(feature = "exec-private-init")] initial: Option<
         &reverie_inguest::guest::exec_private::InitialImageControl,
@@ -655,7 +655,7 @@ fn install_runtime(
     stats: crate::stats::GuestStatsHooks,
     publication: PatchPublication,
     instructions: InstructionSubscriptions,
-    vdso_sites: &[reverie_ptrace::VdsoSyscallSite],
+    vdso_sites: &[reverie::vdso::VdsoSyscallSite],
     _prepared_callbacks: Option<PreparedCallbacks>,
     #[cfg(feature = "exec-private-init")] initial: Option<
         &reverie_inguest::guest::exec_private::InitialImageControl,
@@ -2214,7 +2214,7 @@ unsafe fn install_site_hook(
     Ok(())
 }
 
-fn install_vdso_sites(sites: &[reverie_ptrace::VdsoSyscallSite]) -> io::Result<()> {
+fn install_vdso_sites(sites: &[reverie::vdso::VdsoSyscallSite]) -> io::Result<()> {
     for site_info in sites {
         let address = site_info.address;
         let (site, claimed) = claim_site(address)

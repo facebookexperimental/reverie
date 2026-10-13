@@ -52,6 +52,7 @@ rust_library(
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:syscalls",
         "fbsource//third-party/rust:thiserror",
+        "fbsource//third-party/rust:tracing",
         "fbsource//third-party/rust:typed-arena",
         ":reverie-process",
         ":reverie-syscalls",

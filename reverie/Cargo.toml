@@ -43,6 +43,7 @@ reverie-syscalls = { version = "0.4.1", path = "../reverie-syscalls" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 syscalls = { version = "0.6.18", features = ["serde"] }
 thiserror = "2.0.18"
+tracing = "0.1.41"
 typed-arena = "2"
 
 [dev-dependencies]

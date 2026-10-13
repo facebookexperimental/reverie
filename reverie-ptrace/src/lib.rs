@@ -83,6 +83,13 @@ pub use injected_syscall::InjectedSyscallFrame;
 pub use perf::is_perf_supported;
 pub use perf::pmu_validation;
 use reverie::process::launch_window;
+pub use reverie::vdso::VdsoSyscallSite;
+#[cfg(target_arch = "x86_64")]
+pub use reverie::vdso::patch_current_vdso;
+#[cfg(target_arch = "x86_64")]
+pub use reverie::vdso::patch_current_vdso_trapping;
+#[cfg(target_arch = "x86_64")]
+pub use reverie::vdso::patch_current_vdso_trapping_owned;
 pub use stats::PtraceBackendStatsSnapshot;
 pub use stats::PtraceBackendStatsSource;
 pub use timer::PmuConfig;
@@ -105,10 +112,3 @@ pub use tracer::quarantine_cleanup_resource;
 pub use tracer::spawn_fn;
 pub use tracer::spawn_fn_with_config;
 pub use validation::PmuValidationError;
-pub use vdso::VdsoSyscallSite;
-#[cfg(target_arch = "x86_64")]
-pub use vdso::patch_current_vdso;
-#[cfg(target_arch = "x86_64")]
-pub use vdso::patch_current_vdso_trapping;
-#[cfg(target_arch = "x86_64")]
-pub use vdso::patch_current_vdso_trapping_owned;
