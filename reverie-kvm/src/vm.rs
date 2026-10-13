@@ -5992,7 +5992,7 @@ mod tests {
         )
         .unwrap();
         let (status, stdout, stderr) = completion.result.unwrap();
-        assert_eq!(status, 0);
+        assert_eq!(status, ExitStatus::Exited(0));
         assert!(stdout.is_empty());
         assert!(stderr.is_empty());
     }

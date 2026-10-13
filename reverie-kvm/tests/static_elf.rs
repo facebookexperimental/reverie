@@ -7353,7 +7353,7 @@ fn static_elf_refuses_a_required_signal_control_the_tool_declined() {
         if take {
             // Taking the offered control satisfies the requirement.
             let (status, stdout, stderr) = completion.result.unwrap();
-            assert_eq!(status, 0);
+            assert_eq!(status, reverie::ExitStatus::Exited(0));
             assert!(stdout.is_empty() && stderr.is_empty());
             assert_eq!(global.thread_starts.load(Ordering::SeqCst), 1);
             assert!(global.failures.lock().unwrap().is_empty());
@@ -12990,7 +12990,7 @@ int main(void) {
     let completion = completion.unwrap();
     let global = completion.global_state;
     let (status, stdout, stderr) = completion.result.unwrap();
-    assert_eq!(status, 0);
+    assert_eq!(status, reverie::ExitStatus::Exited(0));
     assert!(stdout.is_empty());
     assert!(stderr.is_empty());
     assert!(global.permit.into_inner().unwrap().is_none());
@@ -20797,7 +20797,7 @@ fn returned_public_run_case(
     DROPPED_RUN_CONFIGS.lock().unwrap().remove(&config);
     let completion = completion.expect("the returning run failed to start");
     let (status, _, _) = completion.result.expect("the returning run failed");
-    assert_eq!(status, 7);
+    assert_eq!(status, reverie::ExitStatus::Exited(7));
     let calls = std::mem::take(&mut *calls.lock().unwrap());
     let exits = calls
         .iter()

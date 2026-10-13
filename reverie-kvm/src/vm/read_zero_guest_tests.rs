@@ -289,7 +289,7 @@ mod read_zero_guest_tests {
                 .map(|completion| {
                     let result = completion.result.map(|(status, stdout, stderr)| {
                         assert!(stdout.is_empty() && stderr.is_empty());
-                        status
+                        conventional_exit_code(status)
                     });
                     (
                         result,

@@ -230,7 +230,7 @@ int main(void) { syscall(SYS_getpid, 0x72657469); return 87; }
             assert_eq!(receipts[0].outcome, reverie::SignalBoundaryOutcome::Failed);
         } else {
             let (status, stdout, stderr) = completion.result.unwrap();
-            assert_eq!(status, 0);
+            assert_eq!(status, reverie::ExitStatus::Exited(0));
             assert!(stdout.is_empty() && stderr.is_empty());
             assert_eq!(
                 receipts[0].outcome,
@@ -431,7 +431,7 @@ int main(int argc, char **argv) {
             );
         } else {
             let (actual, stdout, stderr) = completion.result.unwrap();
-            assert_eq!(actual, status);
+            assert_eq!(actual, reverie::ExitStatus::Exited(status));
             assert!(stdout.is_empty() && stderr.is_empty());
         }
         let events = completion.global_state.exits.into_inner().unwrap();

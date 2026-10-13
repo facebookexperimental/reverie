@@ -641,7 +641,7 @@ mod entry_wait_tests {
             };
             assert_eq!(
                 completed.result.unwrap(),
-                (expected, Vec::new(), Vec::new())
+                (ExitStatus::Exited(expected), Vec::new(), Vec::new())
             );
             expected
         };

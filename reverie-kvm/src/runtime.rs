@@ -3162,8 +3162,10 @@ async fn finish_tool_process_after_workers<T: Tool>(
 pub struct ToolRunCompletion<G> {
     /// Global Tool state, retained on runtime failure for consuming cleanup.
     pub global_state: G,
-    /// Guest output/status, or a typed fatal runtime/Tool cause.
-    pub result: Result<(i32, Vec<u8>, Vec<u8>)>,
+    /// Guest wait status and output, or a typed fatal runtime/Tool cause. The
+    /// status keeps death by signal (and its core-dump bit) distinct from an
+    /// ordinary exit with the same shell code.
+    pub result: Result<(ExitStatus, Vec<u8>, Vec<u8>)>,
 }
 
 /// Complete the owner after physical worker joins. A fork child's logical wait
@@ -4639,7 +4641,12 @@ impl KvmBackend {
             .run_static_elf_with_tool_completion::<T>(config, capture_output)
             .await?;
         let (status, stdout, stderr) = completion.result?;
-        Ok((completion.global_state, status, stdout, stderr))
+        Ok((
+            completion.global_state,
+            conventional_exit_code(status),
+            stdout,
+            stderr,
+        ))
     }
 
     /// Runs the installed ELF and retains GlobalState even after a runtime
@@ -4789,9 +4796,7 @@ impl KvmBackend {
                     .finish_public_tool_panic(failure.complete(result), Some(failure.clone()));
             }
         };
-        let result = failure
-            .complete(result)
-            .map(|(status, stdout, stderr)| (conventional_exit_code(status), stdout, stderr));
+        let result = failure.complete(result);
         let result = self.finish_public_tool_panic(result, Some(failure.clone()));
         Ok(ToolRunCompletion {
             global_state,
