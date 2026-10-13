@@ -90,6 +90,25 @@ pub struct DbtRunner {
     defer_evidence_finish: bool,
 }
 
+// A blocking socket-to-pipe splice can hold the child's stdin pipe mutex
+// while waiting for the next input byte. Read first, then write, so a child
+// can consume each chunk while its producer remains open.
+fn copy_streaming_input<R: Read, W: io::Write>(reader: &mut R, writer: &mut W) -> io::Result<u64> {
+    let mut buffer = [0u8; 8192];
+    let mut copied = 0;
+    loop {
+        let count = match reader.read(&mut buffer) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if count == 0 {
+            return Ok(copied);
+        }
+        writer.write_all(&buffer[..count])?;
+        copied += count as u64;
+    }
+}
+
 impl DbtRunner {
     /// The static facts about how this backend runs a guest that a tool may
     /// need, in the same form [`reverie::Backend::capabilities`] reports them
@@ -312,7 +331,7 @@ impl DbtRunner {
         })?;
 
         std::thread::scope(|scope| {
-            let writer = scope.spawn(move || io::copy(&mut input, &mut stdin));
+            let writer = scope.spawn(move || copy_streaming_input(&mut input, &mut stdin));
             let output = self.wait_with_output(child);
             let write_result = writer
                 .join()
@@ -879,7 +898,7 @@ impl DbtRunner {
         // TODO-HUMAN-REVIEW(PR-84): Review detaching a source-blocked input pump at child exit.
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         std::thread::spawn(move || {
-            let _ = sender.send(io::copy(&mut input, &mut stdin));
+            let _ = sender.send(copy_streaming_input(&mut input, &mut stdin));
         });
         let output = self.wait_with_output(child)?;
         match receiver.try_recv() {
@@ -1991,6 +2010,72 @@ mod tests {
                 (OsStr::new("ONLY"), Some(OsStr::new("guest")))
             ]
         );
+    }
+
+    #[test]
+    fn streaming_input_reaches_child_before_source_closes() {
+        use std::io::Write as _;
+        use std::os::unix::net::UnixStream;
+        use std::sync::mpsc;
+        use std::time::Duration;
+        use std::time::Instant;
+
+        let (mut source, mut producer) = UnixStream::pair().unwrap();
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let mut output = child.stdout.take().unwrap();
+        let pump = std::thread::spawn(move || copy_streaming_input(&mut source, &mut input));
+        let (send, receive) = mpsc::channel();
+        let echoes = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let mut byte = [0];
+                let result = output.read_exact(&mut byte).map(|()| byte[0]);
+                if send.send(result).is_err() {
+                    break;
+                }
+            }
+        });
+        let bound = Duration::from_secs(3);
+        let mut progress = Vec::new();
+        for byte in [b'A', b'B'] {
+            let sent = producer.write_all(&[byte]);
+            let echoed = receive.recv_timeout(bound);
+            let complete = sent.is_ok() && matches!(echoed, Ok(Ok(value)) if value == byte);
+            progress.push((byte, sent, echoed));
+            if !complete {
+                break;
+            }
+        }
+        // Snapshot the oracle while the producer is still open. EOF below is
+        // cleanup only and cannot turn a failed progress assertion into a pass.
+        let before_eof = progress.len() == 2
+            && progress.iter().all(|(byte, sent, echoed)| {
+                sent.is_ok() && matches!(echoed, Ok(Ok(value)) if value == byte)
+            });
+        drop(producer);
+        let deadline = Instant::now() + bound;
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                break child.wait().unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let copied = pump.join().unwrap();
+        echoes.join().unwrap();
+        assert!(
+            before_eof,
+            "input did not reach child before EOF: {progress:?}"
+        );
+        assert_eq!(copied.unwrap(), 2);
+        assert!(status.success(), "{status}");
     }
 
     #[test]
