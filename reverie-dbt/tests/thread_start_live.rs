@@ -34,6 +34,10 @@ fn compile_fixture(directory: &Path, name: &str) -> PathBuf {
 }
 
 fn run_fixture(name: &str, client_argument: &str) -> Output {
+    run_fixture_with_env(name, client_argument, &[])
+}
+
+fn run_fixture_with_env(name: &str, client_argument: &str, env: &[(&str, &str)]) -> Output {
     let directory = tempfile::tempdir().expect("fixture tempdir");
     let fixture = compile_fixture(directory.path(), name);
     // A broken startup gate can prevent the guest from handling even SIGALRM.
@@ -51,6 +55,7 @@ fn run_fixture(name: &str, client_argument: &str) -> Output {
         .expect("REVERIE_DBT_CLIENT must point to the built native client");
     let mut guest = Command::new(fixture);
     guest.env("REVERIE_DBT_TEST_DRRUN", reverie_dbt::bundled_drrun_path());
+    guest.envs(env.iter().copied());
     DbtRunner::new(launcher, client)
         .expect("create bounded native runner")
         .client_argument(client_argument)
@@ -198,5 +203,68 @@ fn a_dead_robust_mutex_owner_is_marked_owner_dead() {
         b"robust fork_child=1 thread=1 exit_group_thread=1 waited_thread=1 \
           exec_child=1 exec_killed_thread=1 failed_exec=1 sigkill=ETIMEDOUT \
           walk_stop=1\n"
+    );
+}
+
+/// The native client's atomic guest-word compare-and-exchange, which Detcore
+/// uses to mark a dead robust-mutex owner's word under DBT
+/// (https://github.com/rrnewton/hermit/issues/4238), replaces a matching word,
+/// leaves a mismatching one alone and reports what it held, refuses a
+/// misaligned address with EINVAL, turns faults on an unmapped or read-only
+/// word into EFAULT without storing, and keeps every increment when a client
+/// thread and the calling thread each make 200000 retry-loop increments of one
+/// word at the same time (Claude review of
+/// https://github.com/rrnewton/reverie/pull/1023).
+#[test]
+#[ignore = "requires a built DynamoRIO and the reverie-dbt native client; run explicitly with --ignored"]
+fn the_native_compare_exchange_reports_each_outcome() {
+    let output = run_fixture("settid_virtual_identity", "-test-compare-exchange");
+    assert!(output.status.success(), "guest failed: {output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "reverie-dbt: compare-exchange self-test matched=1 mismatched=1 \
+             core=1 misaligned=1 unmapped=1 unwritable=1 contended=1"
+        ),
+        "{stderr}"
+    );
+}
+
+/// The compare-and-exchange reaches the guest's own pages through
+/// `Guest::memory()` and the callback the runtime installed: it succeeds on a
+/// word whose page holds code the guest has run, which DynamoRIO has made
+/// read-only for its code cache while the guest still sees it writable, the
+/// code still runs afterwards, and genuinely read-only and unmapped words, and
+/// a word in a shared mapping past the end of its file, give EFAULT without a
+/// store (Codex review of
+/// https://github.com/rrnewton/reverie/pull/1023). The same exchange made
+/// from a DynamoRIO client thread, outside any system-call event, is refused
+/// with EFAULT, says so on stderr, and leaves the word alone (Claude re-check
+/// of the same pull request).
+#[test]
+#[ignore = "requires a built DynamoRIO and the reverie-dbt native client; run explicitly with --ignored"]
+fn the_guest_compare_exchange_writes_a_page_dynamorio_protects() {
+    let output = run_fixture_with_env(
+        "compare_exchange_guest",
+        "-test-compare-exchange",
+        &[("HERMIT_DBT_TEST_COMPARE_EXCHANGE", "1")],
+    );
+    assert!(output.status.success(), "guest failed: {output:?}");
+    assert_eq!(
+        output.stdout,
+        b"cas_guest gated=1 code_page=1 refused=1 code_ok=1 read_only=1 unmapped=1 \
+          past_eof=1\n"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "reverie-dbt: compare-exchange refused outside a system-call event \
+             on a page DynamoRIO made read-only"
+        ),
+        "the exchange outside a system-call event was not refused by the gate: {stderr}"
+    );
+    assert!(
+        stderr.contains("reverie-dbt: compare-exchange on a page DynamoRIO made read-only"),
+        "the code page was not one DynamoRIO protects, so this case did not run: {stderr}"
     );
 }

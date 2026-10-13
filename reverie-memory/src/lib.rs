@@ -144,6 +144,28 @@ pub trait MemoryAccess {
         Err(Errno::ENOSYS)
     }
 
+    /// Atomically replaces the aligned 32-bit word at `addr` with `desired`
+    /// if it holds `expected`, and returns the value the word held: the store
+    /// happened exactly when that value equals `expected`. This is the
+    /// compare-and-exchange Linux performs on a futex word
+    /// (`futex_cmpxchg_value_locked`), with the same visibility to other
+    /// threads and processes that map the word.
+    ///
+    /// A misaligned address is `EINVAL`, and an address that cannot be read
+    /// and written is `EFAULT`, both without storing.
+    ///
+    /// The default is unsupported. `ENOSYS` means a missing backend
+    /// capability, as for [`Self::write_with_user_access`]: the consuming Tool
+    /// must not emulate it with a separate read and write.
+    fn compare_exchange_u32(
+        &mut self,
+        _addr: AddrMut<u32>,
+        _expected: u32,
+        _desired: u32,
+    ) -> Result<u32, Errno> {
+        Err(Errno::ENOSYS)
+    }
+
     /// Reads exactly the number of bytes wanted by `buf`.
     fn read_exact<'a, A>(&self, addr: A, mut buf: &mut [u8]) -> Result<(), Errno>
     where
@@ -514,5 +536,40 @@ mod native_user_write_tests {
         assert_eq!(result, Err(Errno::EOPNOTSUPP));
         assert_eq!(Errno::EOPNOTSUPP, Errno::new(libc::ENOTSUP));
         assert_eq!(target, [0xa5; 8]);
+    }
+}
+
+#[cfg(test)]
+mod compare_exchange_default_tests {
+    use super::*;
+
+    #[test]
+    fn compare_exchange_default_refuses_without_using_ordinary_memory_access() {
+        struct Unsupported;
+        impl MemoryAccess for Unsupported {
+            fn read_vectored(
+                &self,
+                _: &[io::IoSlice],
+                _: &mut [io::IoSliceMut],
+            ) -> Result<usize, Errno> {
+                panic!("compare-exchange must not fall back to a read");
+            }
+
+            fn write_vectored(
+                &mut self,
+                _: &[io::IoSlice],
+                _: &mut [io::IoSliceMut],
+            ) -> Result<usize, Errno> {
+                panic!("compare-exchange must not fall back to a write");
+            }
+        }
+
+        let word = 7u32;
+        let address = AddrMut::from_ptr(&word as *const u32).unwrap();
+        assert_eq!(
+            Unsupported.compare_exchange_u32(address, 7, 8),
+            Err(Errno::ENOSYS)
+        );
+        assert_eq!(word, 7);
     }
 }

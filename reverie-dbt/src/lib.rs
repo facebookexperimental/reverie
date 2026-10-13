@@ -103,6 +103,115 @@ pub type MemoryReader = unsafe extern "C" fn(usize, *mut u8, usize) -> i32;
 /// Returns the number of bytes written before the first guest-memory fault.
 pub type MemoryWriter = unsafe extern "C" fn(usize, *const u8, usize) -> usize;
 
+/// Native callback that atomically replaces the aligned 32-bit guest word at
+/// an address with a desired value if it holds an expected one, and stores the
+/// value the word held through the last argument: the native client's
+/// `runtime_compare_exchange_u32` (ABI version 8). Returns 0, `-EINVAL` for a
+/// misaligned address, or `-EFAULT` where the word cannot be read and written.
+pub type MemoryCompareExchange = unsafe extern "C" fn(usize, u32, u32, *mut u32) -> i32;
+
+/// The native client's compare-and-exchange, once the runtime's background
+/// initialization has installed it with [`install_guest_compare_exchange`].
+static GUEST_COMPARE_EXCHANGE: std::sync::OnceLock<MemoryCompareExchange> =
+    std::sync::OnceLock::new();
+
+/// Installs the native client's compare-and-exchange
+/// ([`DbtRuntimeCallbacks::compare_exchange_u32`]) for [`DbtMemory`]. A
+/// runtime calls this from its background initialization; later calls keep
+/// the first value, which is the same callback in every image.
+pub fn install_guest_compare_exchange(compare_exchange: MemoryCompareExchange) {
+    let _ = GUEST_COMPARE_EXCHANGE.set(compare_exchange);
+}
+
+/// Guest memory for the DBT backend. The tool runs in the guest's address
+/// space, so reads and writes are [`LocalMemory`]'s. In addition,
+/// [`MemoryAccess::compare_exchange_u32`] runs the native client's atomic
+/// compare-and-exchange once a runtime has installed it; before that it is
+/// `ENOSYS`. The native side checks the word's page first and gives `EFAULT`
+/// for one that is unmapped or not writable, so it never faults on a word it
+/// refuses; a page DynamoRIO protects for its code cache is written only
+/// inside a system-call event, and gives `EFAULT` outside one. It does not
+/// catch faults: a mapping that changes between the check and the exchange
+/// aborts the run, which a tool rules out by running the exchange while no
+/// other guest thread runs.
+#[derive(Debug)]
+pub struct DbtMemory {
+    local: LocalMemory,
+    compare_exchange: Option<MemoryCompareExchange>,
+}
+
+impl Default for DbtMemory {
+    /// The same as [`DbtMemory::new`].
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DbtMemory {
+    /// Guest memory with the compare-and-exchange the runtime installed, if any.
+    pub fn new() -> Self {
+        Self {
+            local: LocalMemory::new(),
+            compare_exchange: GUEST_COMPARE_EXCHANGE.get().copied(),
+        }
+    }
+}
+
+impl MemoryAccess for DbtMemory {
+    fn read_vectored(
+        &self,
+        read_from: &[std::io::IoSlice],
+        write_to: &mut [std::io::IoSliceMut],
+    ) -> Result<usize, Errno> {
+        self.local.read_vectored(read_from, write_to)
+    }
+
+    fn write_vectored(
+        &mut self,
+        read_from: &[std::io::IoSlice],
+        write_to: &mut [std::io::IoSliceMut],
+    ) -> Result<usize, Errno> {
+        self.local.write_vectored(read_from, write_to)
+    }
+
+    fn read<'a, A>(&self, addr: A, buf: &mut [u8]) -> Result<usize, Errno>
+    where
+        A: Into<reverie::syscalls::Addr<'a, u8>>,
+    {
+        self.local.read(addr, buf)
+    }
+
+    fn write(&mut self, addr: AddrMut<u8>, buf: &[u8]) -> Result<usize, Errno> {
+        self.local.write(addr, buf)
+    }
+
+    fn write_with_user_access(&mut self, addr: AddrMut<u8>, buf: &[u8]) -> Result<usize, Errno> {
+        self.local.write_with_user_access(addr, buf)
+    }
+
+    fn compare_exchange_u32(
+        &mut self,
+        addr: AddrMut<u32>,
+        expected: u32,
+        desired: u32,
+    ) -> Result<u32, Errno> {
+        let Some(compare_exchange) = self.compare_exchange else {
+            return Err(Errno::ENOSYS);
+        };
+        let mut observed = 0u32;
+        // SAFETY: the callback writes only through `observed`, which outlives
+        // the call, and touches the guest word only after checking that its
+        // page is mapped and writable (see `DbtMemory`).
+        let status = unsafe { compare_exchange(addr.as_raw(), expected, desired, &mut observed) };
+        match status {
+            0 => Ok(observed),
+            negative if negative < 0 => Err(Errno::new(-negative)),
+            // The native contract has no positive result.
+            _ => Err(Errno::EPROTO),
+        }
+    }
+}
+
 // TODO-HUMAN-REVIEW(PR-66): Confirm the external runtime callback ABI.
 /// Native callback used to emit runtime diagnostics without re-entering guest I/O.
 pub type RuntimeEmitter = unsafe extern "C" fn(*const u8, usize);
@@ -126,7 +235,9 @@ pub type RuntimeIdler = unsafe extern "C" fn();
 /// admitted initialization routes.
 /// Version 7 also requires `reverie_dbt_runtime_signal_event`, entered only from
 /// the native owned signal continuation.
-pub const DBT_RUNTIME_ABI_VERSION: u32 = 7;
+/// Version 8 appends [`DbtRuntimeCallbacks::compare_exchange_u32`], growing the
+/// callback layout from 48 to 56 bytes.
+pub const DBT_RUNTIME_ABI_VERSION: u32 = 8;
 
 /// Initialized native execution mode supplied by the version-6 startup bridge.
 ///
@@ -204,6 +315,11 @@ pub struct DbtRuntimeCallbacks {
     pub emit_evidence: RuntimeEmitter,
     /// Protected [`DbtEvidenceLogLevel`] discriminant selected by the launcher.
     pub evidence_log_level: i32,
+    /// The native client's atomic compare-and-exchange of an aligned guest
+    /// word (ABI version 8). A runtime installs it with
+    /// [`install_guest_compare_exchange`] so that [`DbtMemory`] offers
+    /// [`MemoryAccess::compare_exchange_u32`].
+    pub compare_exchange_u32: MemoryCompareExchange,
 }
 
 /// Reports the exact native-client/external-runtime ABI version.
@@ -461,7 +577,7 @@ impl<T> Guest<T> for DbtGuest<'_, T>
 where
     T: Tool,
 {
-    type Memory = LocalMemory;
+    type Memory = DbtMemory;
     type Stack = DbtStack;
 
     fn tid(&self) -> Pid {
@@ -493,7 +609,7 @@ where
     }
 
     fn memory(&self) -> Self::Memory {
-        LocalMemory::new()
+        DbtMemory::new()
     }
 
     fn thread_state_mut(&mut self) -> &mut T::ThreadState {
@@ -2470,6 +2586,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v3(
         return 1;
     }
     tools::set_stdout_emitter(callbacks.emit_stdout);
+    install_guest_compare_exchange(callbacks.compare_exchange_u32);
     PROCESS_CLONE_RESULT_PROBE.store(
         std::env::var_os("REVERIE_DBT_TEST_PROCESS_CLONE_RESULTS").is_some(),
         Ordering::Release,
@@ -2777,13 +2894,74 @@ mod tests {
         );
     }
 
+    /// Stands in for the native client's `runtime_compare_exchange_u32`.
+    unsafe extern "C" fn fake_compare_exchange(
+        address: usize,
+        expected: u32,
+        desired: u32,
+        observed: *mut u32,
+    ) -> i32 {
+        if !address.is_multiple_of(4) {
+            return -libc::EINVAL;
+        }
+        if address == 4 {
+            return -libc::EFAULT;
+        }
+        let word = unsafe { &*(address as *const std::sync::atomic::AtomicU32) };
+        let value =
+            match word.compare_exchange(expected, desired, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(value) | Err(value) => value,
+            };
+        unsafe { *observed = value };
+        0
+    }
+
+    #[test]
+    fn dbt_memory_compare_exchange_reports_the_native_result() {
+        let word = std::sync::atomic::AtomicU32::new(7);
+        let address = AddrMut::from_ptr(word.as_ptr()).unwrap();
+        let mut memory = DbtMemory {
+            local: LocalMemory::new(),
+            compare_exchange: Some(fake_compare_exchange),
+        };
+        assert_eq!(memory.compare_exchange_u32(address, 7, 9), Ok(7));
+        assert_eq!(word.load(Ordering::SeqCst), 9);
+        assert_eq!(memory.compare_exchange_u32(address, 7, 11), Ok(9));
+        assert_eq!(word.load(Ordering::SeqCst), 9);
+        let misaligned = AddrMut::from_raw(word.as_ptr() as usize + 1).unwrap();
+        assert_eq!(
+            memory.compare_exchange_u32(misaligned, 9, 1),
+            Err(Errno::EINVAL)
+        );
+        let faulting = AddrMut::from_raw(4).unwrap();
+        assert_eq!(
+            memory.compare_exchange_u32(faulting, 9, 1),
+            Err(Errno::EFAULT)
+        );
+    }
+
+    #[test]
+    fn dbt_memory_without_a_native_compare_exchange_is_unsupported() {
+        let word = std::sync::atomic::AtomicU32::new(7);
+        let address = AddrMut::from_ptr(word.as_ptr()).unwrap();
+        let mut memory = DbtMemory {
+            local: LocalMemory::new(),
+            compare_exchange: None,
+        };
+        assert_eq!(
+            memory.compare_exchange_u32(address, 7, 9),
+            Err(Errno::ENOSYS)
+        );
+        assert_eq!(word.load(Ordering::SeqCst), 7);
+    }
+
     #[test]
     fn startup_abi_preserves_layout_and_requires_initialized_native_mode() {
-        assert_eq!(reverie_dbt_runtime_abi_version(), 7);
+        assert_eq!(reverie_dbt_runtime_abi_version(), 8);
         assert_eq!(std::mem::size_of::<DbtSignalEvent>(), 200);
         assert_eq!(std::mem::align_of::<DbtSignalEvent>(), 8);
-        assert_eq!(reverie_dbt_runtime_callbacks_size(), 48);
-        assert_eq!(std::mem::size_of::<DbtRuntimeCallbacks>(), 48);
+        assert_eq!(reverie_dbt_runtime_callbacks_size(), 56);
+        assert_eq!(std::mem::size_of::<DbtRuntimeCallbacks>(), 56);
         assert_eq!(
             DbtStartupMode::try_from(1).unwrap(),
             DbtStartupMode::Standalone

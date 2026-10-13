@@ -102,6 +102,7 @@ const STRACE_ENV: &str = "HERMIT_DBT_STRACE";
 const NOOP_ENV: &str = "HERMIT_DBT_NOOP";
 const TEST_REWRITE_EXIT_ENV: &str = "HERMIT_DBT_TEST_REWRITE_EXIT";
 const TEST_SET_REG_ENV: &str = "HERMIT_DBT_TEST_SET_REG";
+const TEST_COMPARE_EXCHANGE_ENV: &str = "HERMIT_DBT_TEST_COMPARE_EXCHANGE";
 const TEST_PPID_ENV: &str = "HERMIT_DBT_TEST_PPID";
 const TEST_BACKTRACE_ENV: &str = "HERMIT_DBT_TEST_BACKTRACE";
 const TEST_INJECT_INVALID_CLONE_ENV: &str = "HERMIT_DBT_TEST_INJECT_INVALID_CLONE";
@@ -138,6 +139,8 @@ static NOOP_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(NOOP_ENV));
 static TEST_REWRITE_EXIT_ENABLED: LazyLock<bool> =
     LazyLock::new(|| env_flag(TEST_REWRITE_EXIT_ENV));
 static TEST_SET_REG_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(TEST_SET_REG_ENV));
+static TEST_COMPARE_EXCHANGE_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| env_flag(TEST_COMPARE_EXCHANGE_ENV));
 static TEST_PPID_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(TEST_PPID_ENV));
 static TEST_BACKTRACE_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(TEST_BACKTRACE_ENV));
 static TEST_INJECT_INVALID_CLONE_ENABLED: LazyLock<bool> =
@@ -534,6 +537,47 @@ impl Tool for SetRegTool {
             }
             _ => guest.tail_inject(syscall).await,
         }
+    }
+}
+
+/// `prctl` option that asks [`CompareExchangeTool`] for one compare-and-exchange:
+/// `prctl(COMPARE_EXCHANGE_PRCTL, address, expected, desired)`.
+pub const COMPARE_EXCHANGE_PRCTL: u64 = 0x4341_5321;
+
+/// Regression tool for [`MemoryAccess::compare_exchange_u32`] on the guest's
+/// own pages: on `prctl(COMPARE_EXCHANGE_PRCTL, address, expected, desired)`
+/// it runs the exchange through `Guest::memory()`, and so through the native
+/// callback the runtime installed, and returns the value the word held, or
+/// `-errno`. Every other syscall runs unchanged.
+#[derive(Clone, Copy, Debug, Default)]
+struct CompareExchangeTool;
+
+#[reverie::tool]
+impl Tool for CompareExchangeTool {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        let (number, args) = syscall.into_parts();
+        if number != Sysno::prctl || args.arg0 as u64 != COMPARE_EXCHANGE_PRCTL {
+            guest.tail_inject(syscall).await;
+        }
+        let Some(address) = reverie::syscalls::AddrMut::<u32>::from_raw(args.arg1) else {
+            return Ok(-(libc::EFAULT as i64));
+        };
+        Ok(
+            match guest
+                .memory()
+                .compare_exchange_u32(address, args.arg2 as u32, args.arg3 as u32)
+            {
+                Ok(observed) => observed as i64,
+                Err(errno) => -(errno.into_raw() as i64),
+            },
+        )
     }
 }
 
@@ -1352,6 +1396,7 @@ enum ActiveTool {
     Noop,
     RewriteExit,
     SetReg,
+    CompareExchange,
     Ppid,
     Backtrace,
     InjectInvalidClone,
@@ -1369,6 +1414,8 @@ fn active_tool() -> Option<ActiveTool> {
         Some(ActiveTool::InjectInvalidClone)
     } else if *TEST_SET_REG_ENABLED {
         Some(ActiveTool::SetReg)
+    } else if *TEST_COMPARE_EXCHANGE_ENABLED {
+        Some(ActiveTool::CompareExchange)
     } else if *TEST_PPID_ENABLED {
         Some(ActiveTool::Ppid)
     } else if *TEST_BACKTRACE_ENABLED {
@@ -1756,6 +1803,17 @@ pub(crate) fn run_active_tool(
         ),
         ActiveTool::SetReg => dispatch(
             &SetRegTool,
+            context,
+            tid,
+            pid,
+            branches,
+            syscall,
+            invoke_syscall,
+            read_registers,
+            write_registers,
+        ),
+        ActiveTool::CompareExchange => dispatch(
+            &CompareExchangeTool,
             context,
             tid,
             pid,

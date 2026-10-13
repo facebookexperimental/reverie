@@ -201,6 +201,19 @@ pub struct BackendCapabilities {
     /// admit a handler at all; when it does not admit one in a given process,
     /// the guest's `rt_sigaction` fails and nothing is published.
     pub virtualizes_guest_sigalrm: bool,
+
+    /// The tool's guest memory implements
+    /// [`MemoryAccess::compare_exchange_u32`](reverie_syscalls::MemoryAccess::compare_exchange_u32)
+    /// for guest words on pages the guest can write, so the tool can change a
+    /// guest futex word atomically, as Linux does; a word the guest cannot
+    /// write gives `EFAULT`, as Linux's own store would. The exchange is
+    /// atomic against other guest threads, but its check that the page is
+    /// writable is not, so a tool runs it while no other guest thread runs. Where
+    /// [`Self::runs_exit_robust_list`] is false, a tool that models robust-futex
+    /// owner death can then mark an owner word `FUTEX_OWNER_DIED` itself before
+    /// it wakes a modeled waiter, instead of depending on when the kernel's
+    /// own cleanup runs.
+    pub supports_guest_memory_compare_exchange: bool,
 }
 
 impl BackendCapabilities {
@@ -230,6 +243,7 @@ impl BackendCapabilities {
         provides_process_signal_control: false,
         emulates_child_waits: false,
         virtualizes_guest_sigalrm: false,
+        supports_guest_memory_compare_exchange: false,
     };
 
     /// `reverie-e9patch`: the guest is rewritten ahead of time and then run
@@ -277,6 +291,7 @@ impl BackendCapabilities {
         requires_thread_directed_process_signals: true,
         supports_parked_write_signal_interruption: false,
         reports_child_exit_publication: false,
+        supports_guest_memory_compare_exchange: true,
         ..Self::PTRACE
     };
 
@@ -333,6 +348,7 @@ mod tests {
             "provides_process_signal_control": false,
             "emulates_child_waits": false,
             "virtualizes_guest_sigalrm": false,
+            "supports_guest_memory_compare_exchange": false,
         })
     }
 
@@ -409,6 +425,7 @@ mod tests {
                 "requires_thread_directed_process_signals": true,
                 "supports_parked_write_signal_interruption": false,
                 "reports_child_exit_publication": false,
+                "supports_guest_memory_compare_exchange": true,
             }))
         );
     }

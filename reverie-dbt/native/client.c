@@ -85,6 +85,8 @@ typedef int32_t (*register_reader_t)(uintptr_t, struct user_regs_struct*);
 typedef int32_t (*register_writer_t)(uintptr_t, const struct user_regs_struct*);
 typedef int32_t (*memory_reader_t)(uintptr_t, uint8_t*, size_t);
 typedef size_t (*memory_writer_t)(uintptr_t, const uint8_t*, size_t);
+typedef int32_t (
+    *memory_compare_exchange_t)(uintptr_t, uint32_t, uint32_t, uint32_t*);
 
 typedef struct {
   int32_t signal;
@@ -177,6 +179,10 @@ typedef struct {
   // host TIDs before an exec or exit_group, so a failed exec restores them
   // (`translate_process_robust_lists`).
   bool process_robust_lists_translated;
+  // Set while this thread runs the client's pre- or post-system-call event,
+  // the only events from which DynamoRIO recovers a client write to a page it
+  // made read-only (`runtime_compare_exchange_u32`).
+  bool in_syscall_event;
 } prototype_counters_t;
 
 #define VIRTUAL_ROOT_PID INT32_C(3)
@@ -285,7 +291,7 @@ static const cpuid_result_t extended_cpuid[] = {
 // exit, and app-level writes re-enter the syscall interception path.
 typedef void (*reverie_emit_fn_t)(const char* buf, size_t len);
 typedef void (*reverie_idle_fn_t)(void);
-#define REVERIE_DBT_RUNTIME_ABI_VERSION 7u
+#define REVERIE_DBT_RUNTIME_ABI_VERSION 8u
 #define REVERIE_DBT_STARTUP_STANDALONE 1u
 #define REVERIE_DBT_STARTUP_COORDINATED 2u
 // TODO-HUMAN-REVIEW(PR-162): Review the additive stdout-emit runtime callback
@@ -306,6 +312,10 @@ typedef struct {
   reverie_emit_fn_t emit_evidence;
   // DbtEvidenceLogLevel discriminant: off/error/warn/info/debug/trace = 0..5.
   int32_t evidence_log_level;
+  // Atomic compare-and-exchange of an aligned guest word
+  // (`runtime_compare_exchange_u32`), the runtime's
+  // MemoryAccess::compare_exchange_u32. Added in ABI version 8.
+  memory_compare_exchange_t compare_exchange_u32;
 } runtime_callbacks_t;
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#90): Confirm diagnostic fd ownership across exec.
@@ -460,6 +470,16 @@ static bool test_thread_exit_evidence;
 static bool test_leave_process_clone_result_pending;
 static bool test_backend_failure;
 static bool test_backend_failure_sender_lookup_miss;
+static bool test_compare_exchange;
+static atomic_flag compare_exchange_self_tested = ATOMIC_FLAG_INIT;
+static void run_compare_exchange_self_test(void);
+static uint32_t compare_exchange_word(
+    uint32_t* word,
+    uint32_t expected,
+    uint32_t desired);
+/* How many exchanges compare_exchange_word has made, for the self-test's check
+ * that runtime_compare_exchange_u32 goes through it. */
+static _Atomic uint64_t compare_exchange_word_calls;
 static bool test_reused_tid;
 static bool test_thread_clone_process_exit;
 static bool test_thread_start_write;
@@ -585,6 +605,11 @@ _Static_assert(
 // replace `emit_evidence` before the first syscall starts the background
 // runtime, then forge records while the callback-depth gate is legitimately
 // active.
+static int32_t runtime_compare_exchange_u32(
+    uintptr_t address,
+    uint32_t expected,
+    uint32_t desired,
+    uint32_t* observed);
 static runtime_callbacks_page_t runtime_callbacks_page
     __attribute__((aligned(EVIDENCE_CONFIG_PAGE_SIZE))) = {
         .value =
@@ -596,6 +621,7 @@ static runtime_callbacks_page_t runtime_callbacks_page
                 .emit_stdout = reverie_dbt_emit_stdout,
                 .emit_evidence = reverie_dbt_emit,
                 .evidence_log_level = 0,
+                .compare_exchange_u32 = runtime_compare_exchange_u32,
             },
 };
 typedef struct {
@@ -5040,6 +5066,43 @@ static void scrub_guest_stack_residue(void* drcontext) {
   }
 }
 
+/* `-test-compare-exchange` also answers
+ * prctl(COMPARE_EXCHANGE_OUTSIDE_EVENT_PRCTL, address, expected, desired) by
+ * running runtime_compare_exchange_u32 from a DynamoRIO client thread, which
+ * is never inside a system-call event, and returning its status or the
+ * observed value. The guest fixture uses it on a page DynamoRIO protects. */
+#define COMPARE_EXCHANGE_OUTSIDE_EVENT_PRCTL 0x43415322u
+
+typedef struct {
+  uintptr_t address;
+  uint32_t expected;
+  uint32_t desired;
+  int32_t status;
+  uint32_t observed;
+  _Atomic int done;
+} compare_exchange_outside_event_t;
+
+static void compare_exchange_outside_event(void* argument) {
+  compare_exchange_outside_event_t* request =
+      (compare_exchange_outside_event_t*)argument;
+  request->status = runtime_compare_exchange_u32(
+      request->address, request->expected, request->desired, &request->observed);
+  atomic_store_explicit(&request->done, 1, memory_order_release);
+}
+
+static int64_t compare_exchange_from_client_thread(
+    uintptr_t address,
+    uint32_t expected,
+    uint32_t desired) {
+  compare_exchange_outside_event_t request = {
+      .address = address, .expected = expected, .desired = desired};
+  if (!dr_create_client_thread(compare_exchange_outside_event, &request))
+    return -EAGAIN;
+  while (!atomic_load_explicit(&request.done, memory_order_acquire))
+    dr_thread_yield();
+  return request.status < 0 ? request.status : (int64_t)request.observed;
+}
+
 // See `instrument_instruction`. Runs once, before the guest's first
 // application instruction.
 static void scrub_guest_stack_before_first_instruction(void) {
@@ -5047,6 +5110,23 @@ static void scrub_guest_stack_before_first_instruction(void) {
 }
 
 static bool pre_syscall(void* drcontext, int sysnum) {
+  // At the first system call rather than in thread_init: the self-test starts
+  // and waits for a client thread, which cannot initialize while thread_init
+  // holds DynamoRIO's thread lock.
+  if (test_compare_exchange &&
+      !atomic_flag_test_and_set(&compare_exchange_self_tested))
+    run_compare_exchange_self_test();
+  if (test_compare_exchange && sysnum == SYS_prctl &&
+      dr_syscall_get_param(drcontext, 0) ==
+          COMPARE_EXCHANGE_OUTSIDE_EVENT_PRCTL) {
+    dr_syscall_set_result(
+        drcontext,
+        (reg_t)compare_exchange_from_client_thread(
+            (uintptr_t)dr_syscall_get_param(drcontext, 1),
+            (uint32_t)dr_syscall_get_param(drcontext, 2),
+            (uint32_t)dr_syscall_get_param(drcontext, 3)));
+    return false;
+  }
   prototype_counters_t* counters =
       (prototype_counters_t*)drmgr_get_tls_field(drcontext, thread_state_index);
   DR_ASSERT(counters != NULL);
@@ -5446,6 +5526,135 @@ static bool pre_syscall(void* drcontext, int sysnum) {
   return execute;
 }
 
+/* The contended half of the self-test: two threads each add one to the same
+ * word this many times through compare_exchange_word, the exchange that
+ * runtime_compare_exchange_u32 performs after its access checks, as a retry
+ * loop. Only an atomic compare-and-exchange keeps every increment. The access
+ * checks, which cost far more than the exchange, are left out so that the
+ * two threads collide often enough to expose a non-atomic exchange. */
+#define COMPARE_EXCHANGE_CONTENDED_INCREMENTS 200000
+
+typedef struct {
+  uint32_t* word;
+  _Atomic int contender_ready;
+  _Atomic int start;
+  _Atomic int finished;
+} compare_exchange_contest_t;
+
+static void compare_exchange_increment_many(
+    compare_exchange_contest_t* contest) {
+  while (!atomic_load_explicit(&contest->start, memory_order_acquire))
+    ;
+  for (int i = 0; i < COMPARE_EXCHANGE_CONTENDED_INCREMENTS; ++i) {
+    uint32_t value = __atomic_load_n(contest->word, __ATOMIC_RELAXED);
+    for (;;) {
+      uint32_t observed = compare_exchange_word(contest->word, value, value + 1);
+      if (observed == value)
+        break;
+      value = observed;
+    }
+  }
+}
+
+static void compare_exchange_contender(void* argument) {
+  compare_exchange_contest_t* contest = (compare_exchange_contest_t*)argument;
+  atomic_store_explicit(&contest->contender_ready, 1, memory_order_release);
+  compare_exchange_increment_many(contest);
+  atomic_store_explicit(&contest->finished, 1, memory_order_release);
+}
+
+/* Races a DynamoRIO client thread against the calling thread, both
+ * incrementing one word; true when no increment was lost. */
+static bool compare_exchange_survives_contention(uint32_t* word) {
+  compare_exchange_contest_t contest = {.word = word};
+  *word = 0;
+  if (!dr_create_client_thread(compare_exchange_contender, &contest))
+    return false;
+  // Start both loops only once the client thread runs, so they overlap.
+  while (!atomic_load_explicit(&contest.contender_ready, memory_order_acquire))
+    dr_thread_yield();
+  atomic_store_explicit(&contest.start, 1, memory_order_release);
+  compare_exchange_increment_many(&contest);
+  while (!atomic_load_explicit(&contest.finished, memory_order_acquire))
+    dr_thread_yield();
+  return __atomic_load_n(word, __ATOMIC_SEQ_CST) ==
+      2u * COMPARE_EXCHANGE_CONTENDED_INCREMENTS;
+}
+
+/* `-test-compare-exchange`: checks runtime_compare_exchange_u32's outcomes on
+ * client-owned memory once, at the first system call, and reports them on the
+ * diagnostic stream for reverie-dbt's live tests. */
+static void run_compare_exchange_self_test(void) {
+  size_t page = dr_page_size();
+  uint32_t* writable =
+      (uint32_t*)dr_nonheap_alloc(page, DR_MEMPROT_READ | DR_MEMPROT_WRITE);
+  uint32_t* read_only =
+      (uint32_t*)dr_nonheap_alloc(page, DR_MEMPROT_READ | DR_MEMPROT_WRITE);
+  DR_ASSERT(writable != NULL && read_only != NULL);
+  writable[0] = 7;
+  read_only[0] = 7;
+  DR_ASSERT(dr_memory_protect(read_only, page, DR_MEMPROT_READ));
+  uint32_t observed = 0;
+  uint64_t core_calls_before =
+      atomic_load_explicit(&compare_exchange_word_calls, memory_order_relaxed);
+  int matched = runtime_compare_exchange_u32(
+                    (uintptr_t)writable, 7, 9, &observed) == 0 &&
+      observed == 7 && writable[0] == 9;
+  int mismatched = runtime_compare_exchange_u32(
+                       (uintptr_t)writable, 7, 11, &observed) == 0 &&
+      observed == 9 && writable[0] == 9;
+  int through_core =
+      atomic_load_explicit(&compare_exchange_word_calls, memory_order_relaxed) -
+          core_calls_before ==
+      2;
+  int misaligned = runtime_compare_exchange_u32(
+                       (uintptr_t)writable + 1, 9, 1, &observed) == -EINVAL &&
+      writable[0] == 9;
+  int unmapped =
+      runtime_compare_exchange_u32((uintptr_t)8, 0, 1, &observed) == -EFAULT;
+  int unwritable = runtime_compare_exchange_u32(
+                       (uintptr_t)read_only, 7, 9, &observed) == -EFAULT &&
+      read_only[0] == 7;
+  int contended = compare_exchange_survives_contention(writable + 16);
+  dr_fprintf(
+      diagnostic_file,
+      "reverie-dbt: compare-exchange self-test matched=%d mismatched=%d "
+      "core=%d misaligned=%d unmapped=%d unwritable=%d contended=%d\n",
+      matched,
+      mismatched,
+      through_core,
+      misaligned,
+      unmapped,
+      unwritable,
+      contended);
+  DR_ASSERT(
+      dr_memory_protect(read_only, page, DR_MEMPROT_READ | DR_MEMPROT_WRITE));
+  dr_nonheap_free(writable, page);
+  dr_nonheap_free(read_only, page);
+}
+
+/* The registered system-call events: mark the thread as inside one for
+ * runtime_compare_exchange_u32, around the real handlers. */
+static void set_in_syscall_event(void* drcontext, bool value) {
+  prototype_counters_t* counters =
+      (prototype_counters_t*)drmgr_get_tls_field(drcontext, thread_state_index);
+  if (counters != NULL)
+    counters->in_syscall_event = value;
+}
+
+static bool pre_syscall_event(void* drcontext, int sysnum) {
+  set_in_syscall_event(drcontext, true);
+  bool execute = pre_syscall(drcontext, sysnum);
+  set_in_syscall_event(drcontext, false);
+  return execute;
+}
+
+static void post_syscall_event(void* drcontext, int sysnum) {
+  set_in_syscall_event(drcontext, true);
+  post_syscall(drcontext, sysnum);
+  set_in_syscall_event(drcontext, false);
+}
+
 static void thread_init(void* drcontext) {
   prototype_counters_t* counters =
       (prototype_counters_t*)dr_thread_alloc(drcontext, sizeof(*counters));
@@ -5549,6 +5758,92 @@ typedef struct {
 /* The bound Linux puts on a robust-list walk (ROBUST_LIST_LIMIT). */
 #define DBT_ROBUST_LIST_LIMIT 2048
 
+/* The exchange itself: one lock cmpxchg on a word the caller has already
+ * found readable and writable. Returns the value the word held. */
+static uint32_t compare_exchange_word(
+    uint32_t* word,
+    uint32_t expected,
+    uint32_t desired) {
+  atomic_fetch_add_explicit(&compare_exchange_word_calls, 1, memory_order_relaxed);
+  uint32_t value = expected;
+  __atomic_compare_exchange_n(
+      word, &value, desired, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+  return value;
+}
+
+/* Atomically replaces the aligned guest word at `address` with `desired` if it
+ * holds `expected`, as Linux's futex_cmpxchg_value_locked does, and stores the
+ * value the word held at `observed`. Returns 0, -EINVAL for a misaligned
+ * address, -EFAULT for a word that is not mapped readable and writable, or
+ * -ENOSYS on a thread DynamoRIO does not know. This is the runtime's
+ * MemoryAccess::compare_exchange_u32 (ABI version 8).
+ *
+ * The word's access is decided from DynamoRIO's view of the guest mapping
+ * before the exchange, not by catching a fault: a fault caught with
+ * DR_TRY_EXCEPT cannot be told apart from a user-sent SIGSEGV, which it would
+ * then swallow, possibly after the exchange had stored. So a word on an
+ * unmapped, unreadable or read-only page is -EFAULT without being touched.
+ *
+ * A writable page that DynamoRIO has made read-only because it holds
+ * translated code (DR_MEMPROT_PRETEND_WRITE) is writable for the guest.
+ * DynamoRIO recovers a client write to such a page, flushing the code and
+ * re-executing the write, but only from a pre- or post-system-call event with
+ * no locks held (see DR_MEMPROT_PRETEND_WRITE in os_api.h). Outside those
+ * events such a word is -EFAULT, reported on the diagnostic stream. Detcore's
+ * owner-death stores, and translate_robust_owner's rewrites before an exit,
+ * exit_group or exec, run inside system-call events; only a rewrite from
+ * DynamoRIO's thread-exit event can meet this case.
+ *
+ * With no try/except, a fault on the exchange itself aborts the run
+ * (DynamoRIO's client-fault handler, core/unix/signal.c). The checks and the
+ * safe read just before it leave only a concurrent change to the mapping
+ * between them and the exchange, which Hermit's sequentialized turns rule
+ * out: no other thread of the guest runs during the tool's turn. */
+static int32_t runtime_compare_exchange_u32(
+    uintptr_t address,
+    uint32_t expected,
+    uint32_t desired,
+    uint32_t* observed) {
+  if (address % sizeof(uint32_t) != 0)
+    return -EINVAL;
+  void* drcontext = dr_get_current_drcontext();
+  if (drcontext == NULL)
+    return -ENOSYS;
+  dr_mem_info_t info;
+  if (!dr_query_memory_ex((const byte*)address, &info) ||
+      info.type == DR_MEMTYPE_FREE ||
+      (info.prot & (DR_MEMPROT_READ | DR_MEMPROT_WRITE)) !=
+          (DR_MEMPROT_READ | DR_MEMPROT_WRITE))
+    return -EFAULT;
+  if ((info.prot & DR_MEMPROT_PRETEND_WRITE) != 0) {
+    prototype_counters_t* counters =
+        (prototype_counters_t*)drmgr_get_tls_field(drcontext, thread_state_index);
+    if (counters == NULL || !counters->in_syscall_event) {
+      // Not silent: the caller loses a store Linux would have made. For a
+      // robust-futex owner word this is translate_robust_owner from
+      // DynamoRIO's thread-exit event, which stops its walk here as Linux's
+      // walk stops at a word it cannot make writable.
+      dr_fprintf(
+          diagnostic_file,
+          "reverie-dbt: compare-exchange refused outside a system-call event "
+          "on a page DynamoRIO made read-only (address %p)\n",
+          (void*)address);
+      return -EFAULT;
+    }
+    if (test_compare_exchange)
+      dr_fprintf(
+          diagnostic_file,
+          "reverie-dbt: compare-exchange on a page DynamoRIO made read-only\n");
+  }
+  // A word the mapping calls readable may still fault, for example in a
+  // shared mapping past the end of its file; read it safely first.
+  uint32_t current;
+  if (!read_app((const void*)address, &current, sizeof(current)))
+    return -EFAULT;
+  *observed = compare_exchange_word((uint32_t*)address, expected, desired);
+  return 0;
+}
+
 /* Rewrites the robust futex word at `word_address` to name `to_tid` when it
  * names `from_tid`, keeping its other bits. The store is a compare-and-swap,
  * retried as Linux's handle_futex_death retries its own, so a FUTEX_WAITERS
@@ -5557,38 +5852,25 @@ typedef struct {
  * handle_futex_death ends the walk: a misaligned, unreadable or unwritable
  * word. */
 static bool translate_robust_owner(
-    void* drcontext,
     uintptr_t word_address,
     int32_t from_tid,
     int32_t to_tid) {
-  uint32_t* word = (uint32_t*)word_address;
   uint32_t value;
-  if (word_address % sizeof(*word) != 0 ||
-      !read_app(word, &value, sizeof(value)))
+  if (word_address % sizeof(value) != 0 ||
+      !read_app((const void*)word_address, &value, sizeof(value)))
     return false;
   for (;;) {
     if ((value & FUTEX_TID_MASK) != (uint32_t)from_tid)
       return true;
     uint32_t translated = (value & ~(uint32_t)FUTEX_TID_MASK) |
         ((uint32_t)to_tid & FUTEX_TID_MASK);
-    bool swapped = false;
-    volatile bool faulted = false;
-    DR_TRY_EXCEPT(
-        drcontext,
-        {
-          swapped = __atomic_compare_exchange_n(
-              word,
-              &value,
-              translated,
-              false,
-              __ATOMIC_SEQ_CST,
-              __ATOMIC_SEQ_CST);
-        },
-        { faulted = true; });
-    if (faulted)
+    uint32_t observed;
+    if (runtime_compare_exchange_u32(
+            word_address, value, translated, &observed) != 0)
       return false;
-    if (swapped)
+    if (observed == value)
       return true;
+    value = observed;
   }
 }
 
@@ -5597,7 +5879,6 @@ static bool translate_robust_owner(
  * it ends, the pending slot last. Rewrites each owner word naming `from_tid`
  * to name `to_tid`. */
 static void translate_robust_list(
-    void* drcontext,
     int32_t list_tid,
     int32_t from_tid,
     int32_t to_tid) {
@@ -5618,7 +5899,7 @@ static void translate_robust_list(
     uintptr_t next = 0;
     bool fetched = read_app((const void*)entry, &next, sizeof(next));
     if (entry != pending &&
-        !translate_robust_owner(drcontext, entry + offset, from_tid, to_tid))
+        !translate_robust_owner(entry + offset, from_tid, to_tid))
       return;
     if (!fetched)
       return;
@@ -5627,7 +5908,7 @@ static void translate_robust_list(
       break;
   }
   if (pending != 0)
-    translate_robust_owner(drcontext, pending + offset, from_tid, to_tid);
+    translate_robust_owner(pending + offset, from_tid, to_tid);
 }
 
 /* As a thread exits, Linux walks its robust list and marks FUTEX_OWNER_DIED,
@@ -5645,7 +5926,7 @@ static void translate_robust_list_owners(
     void* drcontext,
     int32_t host_tid,
     int32_t virtual_tid) {
-  translate_robust_list(drcontext, host_tid, virtual_tid, host_tid);
+  translate_robust_list(host_tid, virtual_tid, host_tid);
 }
 
 /* An exec and an exit_group kill every other thread of the process, and
@@ -5673,9 +5954,9 @@ static void translate_process_robust_lists(
   if (!lookup_virtual_identity(self, &self_virtual))
     self_virtual = counters->virtual_tid;
   if (restore)
-    translate_robust_list(drcontext, self, self, self_virtual);
+    translate_robust_list(self, self, self_virtual);
   else
-    translate_robust_list(drcontext, self, self_virtual, self);
+    translate_robust_list(self, self_virtual, self);
 
   size_t size = MAX_VIRTUAL_IDENTITIES * sizeof(virtual_identity_t);
   virtual_identity_t* identities = (virtual_identity_t*)dr_global_alloc(size);
@@ -5690,9 +5971,9 @@ static void translate_process_robust_lists(
     if (host <= 0 || host == self || syscall(SYS_tgkill, pid, host, 0) != 0)
       continue;
     if (restore)
-      translate_robust_list(drcontext, host, host, virtual_id);
+      translate_robust_list(host, host, virtual_id);
     else
-      translate_robust_list(drcontext, host, virtual_id, host);
+      translate_robust_list(host, virtual_id, host);
   }
   dr_global_free(identities, size);
   counters->process_robust_lists_translated = !restore;
@@ -6198,6 +6479,8 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
       test_backend_failure = true;
     else if (strcmp(argv[i], "-test-backend-failure-sender-lookup-miss") == 0)
       test_backend_failure_sender_lookup_miss = true;
+    else if (strcmp(argv[i], "-test-compare-exchange") == 0)
+      test_compare_exchange = true;
     else if (strcmp(argv[i], "-test-reused-tid") == 0)
       test_reused_tid = true;
     else if (strcmp(argv[i], "-test-thread-clone-process-exit") == 0)
@@ -6332,7 +6615,8 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
         strcmp(argv[i], "-test-thread-start-write") == 0 ||
         strcmp(argv[i], "-test-leave-process-clone-result-pending") == 0 ||
         strcmp(argv[i], "-test-backend-failure") == 0 ||
-        strcmp(argv[i], "-test-backend-failure-sender-lookup-miss") == 0) {
+        strcmp(argv[i], "-test-backend-failure-sender-lookup-miss") == 0 ||
+        strcmp(argv[i], "-test-compare-exchange") == 0) {
       /* Used only by native lifecycle regression tests. */
     } else if (strcmp(argv[i], "-isolated-process-group") == 0)
       runtime_process_group = (process_id_t)getpgrp();
@@ -6420,8 +6704,8 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
       !drmgr_register_bb_instrumentation_event(
           analyze_syscall_gateway, instrument_instruction, NULL) ||
       !drmgr_register_filter_syscall_event(filter_syscall) ||
-      !drmgr_register_pre_syscall_event(pre_syscall) ||
-      !drmgr_register_post_syscall_event(post_syscall) ||
+      !drmgr_register_pre_syscall_event(pre_syscall_event) ||
+      !drmgr_register_post_syscall_event(post_syscall_event) ||
       !drmgr_register_signal_event(event_signal) ||
       !dr_register_signal_admission_event(signal_admission_event))
     DR_ASSERT(false);
