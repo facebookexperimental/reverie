@@ -27,6 +27,9 @@ allocator-fixture = []
 # loader maps the cdylib. Disable to embed the runtime and drive it manually
 # (for example from a backend that installs it after its own bootstrap).
 preload-constructor = []
+# Host process launch/RPC lifetime owner. Guest bootstrap and typed statistics
+# remain usable without this feature; it never registers a constructor.
+launcher = ["coordinator-rpc", "dep:tempfile", "dep:tokio", "dep:tracing"]
 # Explicit FullTool-only fixed syscall/restorer ABI; off by default.
 fixed-syscall-gates = []
 # Private GNU loader InitialImage experiment; no successor exec admission.
@@ -47,7 +50,13 @@ reverie = { version = "0.4.1", path = "../reverie", optional = true, package = "
 reverie-ptrace = { version = "0.4.1", path = "../reverie-ptrace", optional = true }
 reverie-rpc-transport = { version = "0.4.1", path = "../reverie-rpc-transport", optional = true }
 
+tempfile = { version = "3.27.0", optional = true }
+tokio = { version = "1.52.4", features = ["macros", "net", "rt", "time"], optional = true }
+tracing = { version = "0.1.41", optional = true }
+
 [dev-dependencies]
+tokio = { version = "1.52.4", features = ["test-util"] }
+tracing-subscriber = "0.3.23"
 iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder"] }
 
 [[bin]]

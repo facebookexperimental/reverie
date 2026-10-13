@@ -752,11 +752,41 @@ mod tests {
             std::str::from_utf8(&name[..len]).unwrap(),
             executable.to_str().unwrap()
         );
-        unsafe { libc::munmap(page, 4096) };
-        assert_eq!(
-            unsafe { mapping_name_at(page as u64 + 16, &mut name) },
-            None
-        );
+        // The other libtest threads may reuse an unmapped address immediately.
+        // Fork while this page is still live: only this thread survives in the
+        // child's private address space, and its unmap/scan/exit path uses no
+        // allocation, formatting, or inherited userspace locks.
+        let child = unsafe { raw_syscall6(libc::SYS_fork, [0; 6]) };
+        assert!(child >= 0, "raw fork failed: {child}");
+        if child == 0 {
+            let unmapped =
+                unsafe { raw_syscall6(libc::SYS_munmap, [page as u64, 4096, 0, 0, 0, 0]) };
+            let status = if unmapped != 0 {
+                101
+            } else if unsafe { mapping_name_at(page as u64 + 16, &mut name) }.is_some() {
+                102
+            } else {
+                0
+            };
+            unsafe { exit_now(status) };
+        }
+        let mut status = 0_i32;
+        loop {
+            let waited = unsafe {
+                raw_syscall6(
+                    libc::SYS_wait4,
+                    [child as u64, (&raw mut status) as u64, 0, 0, 0, 0],
+                )
+            };
+            if waited == -i64::from(libc::EINTR) {
+                continue;
+            }
+            assert_eq!(waited, child);
+            break;
+        }
+        assert_eq!(unsafe { libc::munmap(page, 4096) }, 0);
+        assert!(libc::WIFEXITED(status), "mapping child status: {status:#x}");
+        assert_eq!(libc::WEXITSTATUS(status), 0, "child unmap/absence check");
     }
     #[test]
     fn own_byte_reads_stop_at_an_unreadable_page_without_faulting() {

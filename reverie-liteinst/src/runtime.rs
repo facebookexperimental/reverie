@@ -1460,11 +1460,13 @@ pub(crate) fn submit_process_stats(
             let trap_hits = site.trap_count.load(Ordering::Relaxed);
             let hook_hits = site.hook_count.load(Ordering::Relaxed);
             direct_hooks += hook_hits;
-            (trap_hits != 0 || hook_hits != 0).then(|| crate::stats::LiteinstProcessSiteStats {
-                rip: site.address.load(Ordering::Relaxed),
-                patched: site.state.load(Ordering::Relaxed) == SITE_ACTIVE,
-                instruction_length: site.instruction_len.load(Ordering::Relaxed),
-                straddle_after: site.straddle_prefix.load(Ordering::Relaxed),
+            (trap_hits != 0 || hook_hits != 0).then(|| {
+                crate::stats::LiteinstProcessSiteStats::new(
+                    site.address.load(Ordering::Relaxed),
+                    site.state.load(Ordering::Relaxed) == SITE_ACTIVE,
+                    site.instruction_len.load(Ordering::Relaxed),
+                    site.straddle_prefix.load(Ordering::Relaxed),
+                )
             })
         })
         .collect();

@@ -54,13 +54,21 @@
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 compile_error!("reverie-inguest requires Linux x86-64");
 
+pub mod bootstrap;
 pub mod dispatch;
 pub mod fmt;
 pub mod fork;
 pub mod guest;
+#[cfg(all(feature = "coordinator-rpc", feature = "exec-private-init"))]
+#[doc(hidden)]
+pub mod initial_image_stats;
+#[cfg(feature = "launcher")]
+pub mod launcher;
 pub mod lifecycle;
 pub mod seccomp;
 pub mod signal;
+#[cfg(feature = "coordinator-rpc")]
+pub mod stats;
 pub mod sync;
 pub mod trap;
 
