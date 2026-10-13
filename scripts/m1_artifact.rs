@@ -2024,7 +2024,46 @@ pub struct AllocatorTlsBoundary {
     pub plt_sha256: String,
     pub function_sha256: BTreeMap<String, String>,
     pub local_chain: BTreeMap<String, SymbolEvidence>,
+    /// Absent evidence preserves the retained-thunk/DEV contract and bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_allocation: Option<DirectAllocationTlsEvidence>,
 }
+
+/// Versioned finite absence evidence, not a TLS-isolation or source authority.
+/// Consumer admission always re-extracts this from its actual ELF and verified
+/// compiled sources and compares the entire qualification record.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectAllocationTlsEvidence {
+    version: u32,
+    policy: String,
+    elf_sha256: String,
+    compiled_sources_sha256: String,
+    reverie_pin: String,
+    allocation_sha256: String,
+    mappings: Vec<TlsExecutableMapping>,
+    static_symbol_count: usize,
+    dynamic_symbol_count: usize,
+    raw_names_sha256: String,
+    loader_writer_count: usize,
+    loader_writers_sha256: String,
+    named_getters: Vec<u64>,
+    recipe_getters: Vec<u64>,
+    getter_pointer_slots: Vec<u64>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TlsExecutableMapping {
+    program_header_index: usize,
+    file_offset: u64,
+    virtual_address: u64,
+    file_size: u64,
+    memory_size: u64,
+    flags: u32,
+    sha256: String,
+}
+const DIRECT_TLS_CENSUS_POLICY: &str =
+    "installation_depth_named_getter_pt_load22_raw_loader_pointers_v1";
 
 /// Mandatory same-ELF Fixed selection, never a name/descriptor-only admission.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -15720,6 +15759,330 @@ fn fixed_tls_cell_access_recipe(
     fixed_whole_recipe(address, bytes, hex, operands)
 }
 
+struct DirectTlsGetterCensus {
+    mappings: Vec<TlsExecutableMapping>,
+    raw_names_sha256: String,
+    loader_writer_count: usize,
+    loader_writers_sha256: String,
+    named_getters: Vec<u64>,
+    recipe_getters: Vec<u64>,
+    getter_pointer_slots: Vec<u64>,
+}
+
+// This low-level census grants no admission. Its production caller first
+// authenticates loader metadata and actual VerifiedCompiledSources. Tests can
+// exercise physical bytes/names independently without fabricating that type.
+fn direct_tls_getter_census(
+    elf: &Elf<'_>,
+    bytes: &[u8],
+    cell: &SymbolEvidence,
+    module: u64,
+    plt: u64,
+) -> Result<DirectTlsGetterCensus> {
+    let mut raw_names = Vec::new();
+    let mut named_getters = BTreeSet::new();
+    for (dynamic, symbols, strings) in [
+        (false, &elf.syms, &elf.strtab),
+        (true, &elf.dynsyms, &elf.dynstrtab),
+    ] {
+        for symbol in symbols.iter() {
+            let name = strings
+                .get_at(symbol.st_name)
+                .ok_or("raw TLS census symbol name is malformed")?;
+            raw_names.push((
+                dynamic,
+                name,
+                symbol.st_info,
+                symbol.st_other,
+                symbol.st_shndx,
+                symbol.st_value,
+                symbol.st_size,
+            ));
+            if !name.contains("INSTALLATION_DEPTH") {
+                continue;
+            }
+            // Inspect the raw name BEFORE callable type/size/mapping filters.
+            // An actual scalar TLS cell is not a callable identity.
+            if canonical_rust_symbol(name).as_deref() == Some(FIXED_TLS_CELL_ROLE) {
+                require(
+                    !dynamic
+                        && symbol.st_type() == sym::STT_TLS
+                        && symbol.st_bind() == sym::STB_LOCAL
+                        && symbol.st_value == cell.address
+                        && symbol.st_size == cell.size,
+                    "raw INSTALLATION_DEPTH cell identity differs",
+                )?;
+                continue;
+            }
+            require(
+                !dynamic
+                    && fixed_emitted_role(name) == Some("fixed_tls_fn_once")
+                    && symbol.st_type() == sym::STT_FUNC
+                    && symbol.st_bind() == sym::STB_LOCAL
+                    && symbol.st_size == 22
+                    && symbol.st_value != 0,
+                "raw INSTALLATION_DEPTH getter is unknown, dynamic or malformed",
+            )?;
+            let (mapping, offset) = unique_file_mapping(elf, bytes, symbol.st_value, 22)?;
+            require(
+                mapping.p_flags == program_header::PF_R | program_header::PF_X,
+                "raw INSTALLATION_DEPTH getter is not file-backed RX",
+            )?;
+            fixed_tls_cell_access_recipe(
+                "fixed_tls_fn_once",
+                symbol.st_value,
+                &bytes[offset..offset + 22],
+                cell,
+                &[(4, 8, module), (9, 13, plt)],
+            )?;
+            require(
+                named_getters.insert(symbol.st_value),
+                "duplicate raw INSTALLATION_DEPTH getter",
+            )?;
+        }
+    }
+    let writers = loader_writers(elf)?;
+    let mut mappings = Vec::new();
+    let mut recipe_getters = BTreeSet::new();
+    for (index, segment) in elf.program_headers.iter().enumerate() {
+        if segment.p_type != program_header::PT_LOAD || segment.p_flags & program_header::PF_X == 0
+        {
+            continue;
+        }
+        let offset = loader_meta_usize(segment.p_offset)?;
+        let length = loader_meta_usize(segment.p_filesz)?;
+        let code = loader_meta_slice(bytes, offset, length)?;
+        let end = segment
+            .p_vaddr
+            .checked_add(segment.p_filesz)
+            .ok_or("TLS census executable mapping overflows")?;
+        require(
+            segment.p_flags == program_header::PF_R | program_header::PF_X
+                && segment.p_filesz != 0
+                && segment.p_memsz >= segment.p_filesz
+                && writers
+                    .iter()
+                    .all(|w| w.relocation.r_offset >= end || w.end <= segment.p_vaddr),
+            "TLS census mapping is malformed, writable or loader-modified",
+        )?;
+        mappings.push(TlsExecutableMapping {
+            program_header_index: index,
+            file_offset: segment.p_offset,
+            virtual_address: segment.p_vaddr,
+            file_size: segment.p_filesz,
+            memory_size: segment.p_memsz,
+            flags: segment.p_flags,
+            sha256: sha256(code),
+        });
+        // Every byte start of each physical file-backed executable PT_LOAD,
+        // including unnamed code and bytes absent from executable sections.
+        for (start, candidate) in code.windows(22).enumerate() {
+            if candidate[..4] != [0x50, 0x48, 0x8d, 0x3d]
+                || candidate[8] != 0xe8
+                || candidate[13..16] != [0x48, 0x8d, 0x80]
+                || candidate[20..] != [0x59, 0xc3]
+                || u64::from(u32::from_le_bytes(candidate[16..20].try_into().unwrap()))
+                    != cell.address
+            {
+                continue;
+            }
+            let address = segment
+                .p_vaddr
+                .checked_add(start as u64)
+                .ok_or("TLS census recipe address overflows")?;
+            fixed_tls_cell_access_recipe(
+                "fixed_tls_fn_once",
+                address,
+                candidate,
+                cell,
+                &[(4, 8, module), (9, 13, plt)],
+            )?;
+            recipe_getters.insert(address);
+        }
+    }
+    require(
+        !mappings.is_empty(),
+        "TLS census has no executable PT_LOAD mapping",
+    )?;
+    let getters: BTreeSet<_> = named_getters.union(&recipe_getters).copied().collect();
+    let mut getter_pointer_slots = BTreeSet::new();
+    let mut raw_writers = Vec::new();
+    for writer in &writers {
+        let r = &writer.relocation;
+        let width = loader_meta_usize(writer.end - r.r_offset)?;
+        let (_, offset) = unique_file_mapping(elf, bytes, r.r_offset, width)?;
+        let raw = loader_meta_slice(bytes, offset, width)?;
+        let mut targets = Vec::new();
+        for word in raw.as_chunks::<8>().0 {
+            targets.push(u64::from_le_bytes(*word));
+        }
+        if let Some(addend) = r.r_addend {
+            if let Ok(target) = u64::try_from(addend) {
+                targets.push(target);
+            }
+        }
+        if r.r_sym != 0 {
+            let symbol = elf
+                .dynsyms
+                .get(r.r_sym)
+                .ok_or("TLS census relocation symbol absent")?;
+            if symbol.st_shndx != section_header::SHN_UNDEF as usize {
+                let addend = r
+                    .r_addend
+                    .unwrap_or_else(|| targets.first().copied().unwrap_or(0) as i64);
+                targets.push(
+                    symbol
+                        .st_value
+                        .checked_add_signed(addend)
+                        .ok_or("TLS census symbol pointer overflows")?,
+                );
+            }
+        }
+        for target in &targets {
+            if getters
+                .iter()
+                .any(|&getter| getter <= *target && *target < getter.saturating_add(22))
+            {
+                getter_pointer_slots.insert(r.r_offset);
+            }
+        }
+        raw_writers.push((
+            r.r_offset,
+            writer.end,
+            r.r_type,
+            r.r_sym,
+            r.r_addend,
+            sha256(raw),
+            targets,
+        ));
+    }
+    Ok(DirectTlsGetterCensus {
+        mappings,
+        raw_names_sha256: sha256(&serde_json::to_vec(&raw_names).map_err(|e| e.to_string())?),
+        loader_writer_count: writers.len(),
+        loader_writers_sha256: sha256(
+            &serde_json::to_vec(&raw_writers).map_err(|e| e.to_string())?,
+        ),
+        named_getters: named_getters.into_iter().collect(),
+        recipe_getters: recipe_getters.into_iter().collect(),
+        getter_pointer_slots: getter_pointer_slots.into_iter().collect(),
+    })
+}
+
+fn direct_tls_source_context(
+    sources: Option<&VerifiedCompiledSources>,
+) -> Result<&VerifiedCompiledSources> {
+    let sources = sources
+        .ok_or("direct allocation TLS proof requires independently verified compiled sources")?;
+    sources.require_image(STANDALONE_ROOT)?;
+    Ok(sources)
+}
+
+fn derive_direct_allocation_tls_evidence(
+    elf: &Elf<'_>,
+    bytes: &[u8],
+    cell: &SymbolEvidence,
+    module: u64,
+    plt: u64,
+    allocation_bytes: &[u8],
+    sources: Option<&VerifiedCompiledSources>,
+) -> Result<DirectAllocationTlsEvidence> {
+    let sources = direct_tls_source_context(sources)?;
+    authenticate_loader_metadata(elf, bytes)?;
+    let census = direct_tls_getter_census(elf, bytes, cell, module, plt)?;
+    require(
+        census.named_getters.is_empty()
+            && census.recipe_getters.is_empty()
+            && census.getter_pointer_slots.is_empty(),
+        "direct allocation TLS proof found a getter or raw loader pointer edge",
+    )?;
+    Ok(DirectAllocationTlsEvidence {
+        version: 1,
+        policy: DIRECT_TLS_CENSUS_POLICY.into(),
+        elf_sha256: sha256(bytes),
+        compiled_sources_sha256: sha256(
+            &serde_json::to_vec(sources.record()).map_err(|e| e.to_string())?,
+        ),
+        reverie_pin: sources.record().reverie_pin.clone(),
+        allocation_sha256: sha256(allocation_bytes),
+        mappings: census.mappings,
+        static_symbol_count: elf.syms.len(),
+        dynamic_symbol_count: elf.dynsyms.len(),
+        raw_names_sha256: census.raw_names_sha256,
+        loader_writer_count: census.loader_writer_count,
+        loader_writers_sha256: census.loader_writers_sha256,
+        named_getters: census.named_getters,
+        recipe_getters: census.recipe_getters,
+        getter_pointer_slots: census.getter_pointer_slots,
+    })
+}
+
+fn validate_direct_allocation_tls_evidence(
+    tls: &AllocatorTlsBoundary,
+    proof: &DirectAllocationTlsEvidence,
+) -> Result<()> {
+    let hash =
+        |s: &str, length: usize| s.len() == length && s.bytes().all(|b| b.is_ascii_hexdigit());
+    let allocation = tls
+        .local_chain
+        .get("fixed_patch_alloc")
+        .ok_or("direct TLS allocation role absent")?;
+    require(
+        proof.version == 1
+            && proof.policy == DIRECT_TLS_CENSUS_POLICY
+            && [
+                proof.elf_sha256.as_str(),
+                proof.compiled_sources_sha256.as_str(),
+                proof.raw_names_sha256.as_str(),
+                proof.loader_writers_sha256.as_str(),
+                proof.allocation_sha256.as_str(),
+            ]
+            .iter()
+            .all(|h| hash(h, 64))
+            && hash(&proof.reverie_pin, 40)
+            && proof.static_symbol_count != 0
+            && !proof.mappings.is_empty()
+            && proof.mappings.iter().all(|m| {
+                m.flags == program_header::PF_R | program_header::PF_X
+                    && m.file_size != 0
+                    && m.memory_size >= m.file_size
+                    && m.file_offset.checked_add(m.file_size).is_some()
+                    && m.virtual_address.checked_add(m.memory_size).is_some()
+                    && hash(&m.sha256, 64)
+            })
+            && proof
+                .mappings
+                .windows(2)
+                .all(|w| w[0].program_header_index < w[1].program_header_index)
+            && proof.named_getters.is_empty()
+            && proof.recipe_getters.is_empty()
+            && proof.getter_pointer_slots.is_empty()
+            && matches!(tls.tls_cell.address, 0x40 | 0x80)
+            && allocation.size == 186
+            && fixed_emitted_role(&allocation.name) == Some("fixed_patch_alloc")
+            && tls
+                .local_chain
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>()
+                == BTreeSet::from(["fixed_patch_alloc"])
+            && tls.function_sha256.get("fixed_patch_alloc") == Some(&proof.allocation_sha256)
+            && tls.callsites
+                == [ConstructorTransfer {
+                    instruction: allocation
+                        .address
+                        .checked_add(0x2c)
+                        .ok_or("direct TLS callsite overflows")?,
+                    target: tls.plt_address,
+                    local_got_slot: None,
+                }]
+            && tls.local_key_object.is_none()
+            && tls.local_key_transfer.is_none()
+            && tls.local_key_resolution.is_none(),
+        "direct allocation TLS provenance/recipe/census is incomplete or inconsistent",
+    )
+}
+
 fn qualify_allocator_tls_boundary_in_source_context(
     elf: &Elf<'_>,
     bytes: &[u8],
@@ -15727,6 +16090,7 @@ fn qualify_allocator_tls_boundary_in_source_context(
     _disassembly: &str,
     got: &BTreeMap<u64, u64>,
     image_kind: FixedImageKind,
+    sources: Option<&VerifiedCompiledSources>,
 ) -> Result<AllocatorTlsBoundary> {
     let roles = fixed_role_symbols(elf)?;
     let cell = fixed_tls_cell(elf)?;
@@ -15992,6 +16356,23 @@ fn qualify_allocator_tls_boundary_in_source_context(
     };
     fixed_tls_descriptor(elf, bytes, module)?;
     let (dynamic_symbol_index, got_slot, plt_sha256) = fixed_tls_import(elf, bytes, plt)?;
+    let direct_allocation = if image_kind == FixedImageKind::Standalone
+        && matches!(cell.address, 0x40 | 0x80)
+        && allocation_bytes.len() == 186
+        && !roles.contains_key("fixed_tls_fn_once")
+    {
+        Some(derive_direct_allocation_tls_evidence(
+            elf,
+            bytes,
+            &cell,
+            module,
+            plt,
+            allocation_bytes,
+            sources,
+        )?)
+    } else {
+        None
+    };
     Ok(AllocatorTlsBoundary {
         dependency: "existing_installation_depth_tls".to_owned(),
         provider_symbol: "__tls_get_addr".to_owned(),
@@ -16012,6 +16393,7 @@ fn qualify_allocator_tls_boundary_in_source_context(
         plt_sha256,
         function_sha256: hashes,
         local_chain: chain,
+        direct_allocation,
     })
 }
 
@@ -16558,6 +16940,13 @@ fn validate_fixed_backing_evidence_in_source_context(
                 .all(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())),
         "Fixed backing lacks the exact named unisolated TLS boundary",
     )?;
+    require(
+        tls.direct_allocation.is_none()
+            || (tls.local_key_object.is_none()
+                && tls.local_key_transfer.is_none()
+                && tls.local_key_resolution.is_none()),
+        "direct TLS provenance cannot relabel a LocalKey chain",
+    )?;
     match (
         &tls.local_key_object,
         &tls.local_key_transfer,
@@ -16585,6 +16974,13 @@ fn validate_fixed_backing_evidence_in_source_context(
                 .all(|role| tls.local_chain.contains_key(*role)),
             "Fixed TLS local function-pointer chain is incomplete or mislabeled as GOT",
         )?,
+        (None, None, None) if tls.direct_allocation.is_some() => {
+            require(
+                image_kind == FixedImageKind::Standalone,
+                "direct allocation TLS proof belongs only to standalone images",
+            )?;
+            validate_direct_allocation_tls_evidence(tls, tls.direct_allocation.as_ref().unwrap())?;
+        }
         (None, None, None) => {
             let extent = match (image_kind, tls.tls_cell.address) {
                 (FixedImageKind::Standalone, 0x40 | 0x80) => Some(186),
@@ -16776,6 +17172,7 @@ fn qualify_fixed_allocator_in_source_context(
         disassembly,
         got,
         image_kind,
+        sources,
     )?;
     let context = fixed_machine_context(
         (elf, bytes),
@@ -32133,6 +32530,7 @@ mod tests {
                 unisolated: true,
                 plt_sha256: "0".repeat(64),
                 function_sha256: BTreeMap::from([(role.into(), sha256(&bytes))]),
+                direct_allocation: None,
                 local_chain: BTreeMap::from([(
                     role.into(),
                     SymbolEvidence {
@@ -32243,6 +32641,7 @@ mod tests {
             unisolated: true,
             plt_sha256: "0".repeat(64),
             function_sha256: BTreeMap::new(),
+            direct_allocation: None,
             local_chain: BTreeMap::from([
                 (
                     "fixed_tls_try_with".into(),
@@ -33048,6 +33447,7 @@ mod tests {
                 unisolated: true, plt_sha256: "0".repeat(64),
                 function_sha256: BTreeMap::from([("fixed_patch_alloc".to_owned(), "0".repeat(64))]),
                 local_chain: BTreeMap::from([("fixed_patch_alloc".to_owned(), functions["fixed_patch_alloc"].clone())]),
+                direct_allocation: None,
             },
             allocator_transfers: FIXED_REQUIRED_ROLES[..4]
                 .iter()
@@ -33242,6 +33642,8 @@ mod tests {
         diagnostic_tls.tls_boundary.tls_cell.address = 0x88;
         validate_fixed_backing_evidence(&diagnostic_tls).unwrap();
         fixed_tls_offset_schema_controls(&backing);
+        fixed_tls_direct_schema_controls(&backing);
+        fixed_tls_direct_census_controls();
         let value = serde_json::to_value(&backing).unwrap();
         for field in [
             "fixed_arena_version",
@@ -33338,6 +33740,369 @@ mod tests {
         let mut unknown = value;
         unknown["legacy_exemption"] = serde_json::json!(true);
         assert!(serde_json::from_value::<AllocatorBackingEvidence>(unknown).is_err());
+    }
+
+    // Physical mini-ELF census controls only: no verified-source fabrication,
+    // whole constructor qualification, or allocator-execution credit.
+    fn fixed_tls_direct_census_controls() {
+        fn put(bytes: &mut [u8], at: usize, width: usize, value: u64) {
+            bytes[at..at + width].copy_from_slice(&value.to_le_bytes()[..width]);
+        }
+        fn rip(code: &mut [u8], address: u64, field: usize, next: usize, target: u64) {
+            let value = i32::try_from(target as i64 - (address + next as u64) as i64).unwrap();
+            code[field..next].copy_from_slice(&value.to_le_bytes());
+        }
+        fn getter() -> Vec<u8> {
+            let mut code = fixed_hex(FIXED_OPTIMIZED_TLS_THUNK_EVENT_ARGUMENT_HEX);
+            rip(&mut code, 0x1500, 4, 8, 0x3300);
+            rip(&mut code, 0x1500, 9, 13, 0x1800);
+            code
+        }
+        let getter_name = FIXED_EMITTED_ROLE_SYMBOLS
+            .iter()
+            .find(|&&(role, _)| role == "fixed_tls_fn_once")
+            .unwrap()
+            .1
+            .replace("Cs_", "Cs1_");
+        let cell_name = FIXED_TLS_CELL_ROLE.replace("Cs_", "Cs1_");
+        let mut base = vec![0_u8; 0x7000];
+        base[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        for (at, width, value) in [
+            (16, 2, 3),
+            (18, 2, 62),
+            (20, 4, 1),
+            (32, 8, 64),
+            (40, 8, 0x6000),
+            (52, 2, 64),
+            (54, 2, 56),
+            (56, 2, 5),
+            (58, 2, 64),
+            (60, 2, 9),
+            (62, 2, 8),
+        ] {
+            put(&mut base, at, width, value);
+        }
+        for (index, kind, flags, address, size) in [
+            (0, 1, 4, 0, 0x1000),
+            (1, 1, 5, 0x1000, 0x1000),
+            (2, 1, 6, 0x3000, 0x1000),
+            (3, 1, 4, 0x4000, 0x3000),
+            (4, 2, 6, 0x3800, 0x100),
+        ] {
+            let at = 64 + index * 56;
+            for (offset, width, value) in [
+                (0, 4, kind),
+                (4, 4, flags),
+                (8, 8, address),
+                (16, 8, address),
+                (24, 8, address),
+                (32, 8, size),
+                (40, 8, size),
+                (48, 8, 4096),
+            ] {
+                put(&mut base, at + offset, width, value);
+            }
+        }
+        let static_names = format!("\0{cell_name}\0{getter_name}\0");
+        let getter_name_offset = cell_name.len() + 2;
+        let dynamic_names = format!("\0{getter_name}\0");
+        assert!(static_names.len() < 0x200 && dynamic_names.len() < 0x200);
+        base[0x4200..0x4200 + static_names.len()].copy_from_slice(static_names.as_bytes());
+        base[0x4600..0x4600 + dynamic_names.len()].copy_from_slice(dynamic_names.as_bytes());
+        for (offset, width, value) in [
+            (0, 4, 1),
+            (4, 1, u64::from(sym::STT_TLS)),
+            (6, 2, 7),
+            (8, 8, 0x40),
+            (16, 8, 8),
+        ] {
+            put(&mut base, 0x4018 + offset, width, value);
+        }
+        for (index, (tag, value)) in [
+            (goblin::elf::dynamic::DT_STRTAB, 0x4600),
+            (goblin::elf::dynamic::DT_STRSZ, dynamic_names.len() as u64),
+            (goblin::elf::dynamic::DT_SYMTAB, 0x4400),
+            (goblin::elf::dynamic::DT_SYMENT, 24),
+            (goblin::elf::dynamic::DT_HASH, 0x5000),
+            (goblin::elf::dynamic::DT_RELA, 0x4800),
+            (goblin::elf::dynamic::DT_RELASZ, 24),
+            (goblin::elf::dynamic::DT_RELAENT, 24),
+            (goblin::elf::dynamic::DT_NULL, 0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            put(&mut base, 0x3800 + index * 16, 8, tag);
+            put(&mut base, 0x3808 + index * 16, 8, value);
+        }
+        for (i, value) in [1, 2, 1, 0, 0].into_iter().enumerate() {
+            put(&mut base, 0x5000 + i * 4, 4, value);
+        }
+        for (index, kind, flags, address, size, link, entry) in [
+            (1, 1, 6, 0x1000, 0x100, 0, 0),
+            (2, 2, 0, 0x4000, 72, 3, 24),
+            (3, 3, 0, 0x4200, static_names.len() as u64, 0, 0),
+            (4, 11, 0, 0x4400, 48, 5, 24),
+            (5, 3, 0, 0x4600, dynamic_names.len() as u64, 0, 0),
+            (6, 4, 0, 0x4800, 24, 4, 24),
+            (7, 8, 0x403, 0, 8, 0, 0),
+            (8, 3, 0, 0x5100, 1, 0, 0),
+        ] {
+            let at = 0x6000 + index * 64;
+            for (offset, width, value) in [
+                (4, 4, kind),
+                (8, 8, flags),
+                (16, 8, address),
+                (24, 8, address),
+                (32, 8, size),
+                (40, 4, link),
+                (48, 8, 8),
+                (56, 8, entry),
+            ] {
+                put(&mut base, at + offset, width, value);
+            }
+        }
+        let cell = SymbolEvidence {
+            name: cell_name,
+            address: 0x40,
+            size: 8,
+            binding: sym::STB_LOCAL,
+            visibility: sym::STV_HIDDEN,
+        };
+        let census = |bytes: &[u8]| {
+            direct_tls_getter_census(&Elf::parse(bytes).unwrap(), bytes, &cell, 0x3300, 0x1800)
+        };
+        let good = census(&base).unwrap();
+        assert!(
+            good.named_getters.is_empty()
+                && good.recipe_getters.is_empty()
+                && good.getter_pointer_slots.is_empty()
+        );
+        assert_eq!(good.mappings.len(), 1);
+        assert_eq!(good.mappings[0].file_size, 0x1000);
+        assert!(direct_tls_source_context(None).is_err());
+        let elf = Elf::parse(&base).unwrap();
+        assert!(
+            derive_direct_allocation_tls_evidence(&elf, &base, &cell, 0x3300, 0x1800, &[], None)
+                .is_err()
+        );
+        let mut unnamed = base.clone();
+        unnamed[0x1500..0x1516].copy_from_slice(&getter());
+        // The recipe is outside the only executable section's 0x100-byte
+        // extent and has no symbol: PT_LOAD bytes remain part of the census.
+        let found = census(&unnamed).unwrap();
+        assert_eq!(found.recipe_getters, [0x1500]);
+        let mut pointer = unnamed.clone();
+        for (offset, value) in [
+            (0, 0x3400),
+            (8, u64::from(reloc::R_X86_64_RELATIVE)),
+            (16, 0x1500),
+        ] {
+            put(&mut pointer, 0x4800 + offset, 8, value);
+        }
+        // Writable/unprotected destination and unnamed target must not be
+        // dropped by the RELRO/local-symbol GOT map used for other proofs.
+        assert_eq!(census(&pointer).unwrap().getter_pointer_slots, [0x3400]);
+        for (field, next, target) in [(4, 8, 0x3308), (9, 13, 0x1801)] {
+            let mut bad = unnamed.clone();
+            rip(&mut bad[0x1500..0x1516], 0x1500, field, next, target);
+            assert!(
+                census(&bad).is_err(),
+                "unnamed getter wrong descriptor/provider operand"
+            );
+        }
+        for (size, binding, dynamic, unknown) in [
+            (0, sym::STB_LOCAL, false, false),
+            (22, sym::STB_GLOBAL, false, false),
+            (22, sym::STB_LOCAL, true, false),
+            (22, sym::STB_LOCAL, false, true),
+        ] {
+            let mut bad = base.clone();
+            let row = if dynamic { 0x4418 } else { 0x4030 };
+            let name = if dynamic {
+                1
+            } else {
+                getter_name_offset as u64
+            };
+            for (offset, width, value) in [
+                (0, 4, name),
+                (4, 1, u64::from((binding << 4) | sym::STT_FUNC)),
+                (6, 2, 1),
+                (8, 8, 0x1500),
+                (16, 8, size),
+            ] {
+                put(&mut bad, row + offset, width, value);
+            }
+            if unknown {
+                let end = 0x4200 + getter_name_offset + getter_name.len();
+                bad[end] = b'X';
+                bad[end + 1] = 0;
+                put(
+                    &mut bad,
+                    0x6000 + 3 * 64 + 32,
+                    8,
+                    (static_names.len() + 1) as u64,
+                );
+            }
+            assert!(
+                census(&bad).is_err(),
+                "raw getter is not pruned before validation"
+            );
+        }
+        let mut named = unnamed.clone();
+        for (offset, width, value) in [
+            (0, 4, getter_name_offset as u64),
+            (4, 1, u64::from(sym::STT_FUNC)),
+            (6, 2, 1),
+            (8, 8, 0x1500),
+            (16, 8, 22),
+        ] {
+            put(&mut named, 0x4030 + offset, width, value);
+        }
+        assert_eq!(census(&named).unwrap().named_getters, [0x1500]);
+        named[0x1500] ^= 1;
+        assert!(
+            census(&named).is_err(),
+            "named getter whole body must be exact"
+        );
+        let mut allocation = fixed_hex(FIXED_OPTIMIZED_PATCH_ALLOC_EVENT_ARGUMENT_HEX);
+        let operands = [
+            (16, 20, 0x3310),
+            (40, 44, 0x3300),
+            (45, 49, 0x1800),
+            (182, 186, 0x3318),
+        ];
+        for &(field, next, target) in &operands {
+            rip(&mut allocation, 0x1100, field, next, target);
+        }
+        fixed_tls_cell_access_recipe("fixed_patch_alloc", 0x1100, &allocation, &cell, &operands)
+            .unwrap();
+        for field in [0, 16, 40, 45, 52, 182] {
+            let mut bad = allocation.clone();
+            bad[field] ^= 1;
+            assert!(
+                fixed_tls_cell_access_recipe("fixed_patch_alloc", 0x1100, &bad, &cell, &operands)
+                    .is_err()
+            );
+        }
+        // Actual mapping bytes participate in the record join even when a
+        // change does not create a getter. An old census cannot be replayed.
+        let mut changed = base.clone();
+        changed[0x1700] = 0x90;
+        assert_ne!(good.mappings, census(&changed).unwrap().mappings);
+    }
+
+    // Synthetic direct-schema positive. The old checker must refuse this
+    // additive route before implementation; hashes here do not qualify an ELF.
+    fn fixed_tls_direct_schema_controls(backing: &AllocatorBackingEvidence) {
+        let mut direct = backing.clone();
+        let tls = &mut direct.tls_boundary;
+        tls.tls_cell.address = 0x40;
+        let allocation = tls.local_chain.get_mut("fixed_patch_alloc").unwrap();
+        allocation.size = 186;
+        allocation.name = FIXED_EMITTED_ROLE_SYMBOLS
+            .iter()
+            .find(|&&(role, _)| role == "fixed_patch_alloc")
+            .unwrap()
+            .1
+            .replace("Cs_", "Cs1_");
+        let address = allocation.address;
+        tls.callsites = vec![ConstructorTransfer {
+            instruction: address + 0x2c,
+            target: tls.plt_address,
+            local_got_slot: None,
+        }];
+        let allocation_sha256 = tls.function_sha256["fixed_patch_alloc"].clone();
+        let mut value = serde_json::to_value(&direct).unwrap();
+        value["tls_boundary"]["direct_allocation"] = serde_json::json!({
+            "version": 1,
+            "policy": "installation_depth_named_getter_pt_load22_raw_loader_pointers_v1",
+            "elf_sha256": "0".repeat(64),
+            "compiled_sources_sha256": "1".repeat(64),
+            "reverie_pin": "2".repeat(40),
+            "allocation_sha256": allocation_sha256,
+            "mappings": [{"program_header_index": 1, "file_offset": 0x1000,
+                "virtual_address": 0x1000, "file_size": 0x1000, "memory_size": 0x1000,
+                "flags": 5, "sha256": "0".repeat(64)}],
+            "static_symbol_count": 1, "dynamic_symbol_count": 1,
+            "raw_names_sha256": "0".repeat(64),
+            "loader_writer_count": 0, "loader_writers_sha256": "0".repeat(64),
+            "named_getters": [], "recipe_getters": [], "getter_pointer_slots": []
+        });
+        let decoded: AllocatorBackingEvidence = serde_json::from_value(value.clone()).unwrap();
+        validate_fixed_backing_evidence(&decoded).unwrap();
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), value);
+        for (field, replacement) in [
+            ("version", serde_json::json!(2)),
+            ("policy", serde_json::json!("empty_role_map")),
+            ("elf_sha256", serde_json::json!("")),
+            ("compiled_sources_sha256", serde_json::json!("")),
+            ("reverie_pin", serde_json::json!("")),
+            ("allocation_sha256", serde_json::json!("3".repeat(64))),
+            ("mappings", serde_json::json!([])),
+            ("static_symbol_count", serde_json::json!(0)),
+            ("named_getters", serde_json::json!([0x1500])),
+            ("recipe_getters", serde_json::json!([0x1500])),
+            ("getter_pointer_slots", serde_json::json!([0x3400])),
+        ] {
+            let mut bad = value.clone();
+            bad["tls_boundary"]["direct_allocation"][field] = replacement;
+            assert!(
+                validate_fixed_backing_evidence(&serde_json::from_value(bad).unwrap()).is_err(),
+                "synthetic direct provenance mutation {field}"
+            );
+        }
+        for field in [
+            "elf_sha256",
+            "compiled_sources_sha256",
+            "raw_names_sha256",
+            "loader_writers_sha256",
+        ] {
+            let mut stale = value.clone();
+            stale["tls_boundary"]["direct_allocation"][field] = serde_json::json!("3".repeat(64));
+            let stale: AllocatorBackingEvidence = serde_json::from_value(stale).unwrap();
+            // Structural hash spelling is not authority. Complete record Eq
+            // at the real independently re-extracting consumer must see this.
+            assert_ne!(
+                stale, decoded,
+                "direct record join excludes no provenance field"
+            );
+        }
+        for mutation in 0..7 {
+            let mut bad = decoded.clone();
+            let tls = &mut bad.tls_boundary;
+            match mutation {
+                0 => tls.callsites.clear(),
+                1 => tls.callsites.push(tls.callsites[0].clone()),
+                2 => tls.callsites[0].instruction += 1,
+                3 => tls.callsites[0].target += 1,
+                4 => tls.tls_cell.address = 0x48,
+                5 => tls.local_key_object = Some(1),
+                6 => tls
+                    .function_sha256
+                    .remove("fixed_patch_alloc")
+                    .map(|_| ())
+                    .unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_fixed_backing_evidence(&bad).is_err(),
+                "direct role/edge/tuple mutation{mutation}"
+            );
+        }
+        let mut unknown = value.clone();
+        unknown["tls_boundary"]["direct_allocation"]["absent"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<AllocatorBackingEvidence>(unknown).is_err());
+        let mut old = value;
+        old["tls_boundary"]
+            .as_object_mut()
+            .unwrap()
+            .remove("direct_allocation");
+        let old: AllocatorBackingEvidence = serde_json::from_value(old).unwrap();
+        assert!(
+            validate_fixed_backing_evidence(&old).is_err(),
+            "missing direct provenance cannot erase the old required FnOnce chain"
+        );
     }
 
     // Actual observed chains used only in structural schemas. Their literal
