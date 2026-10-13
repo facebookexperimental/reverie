@@ -568,7 +568,7 @@ fn process_alarm_signal_tool_sigchld_replacement_preserves_thread_fault_and_proc
             let alarm = process_alarm_event(executor.state.pid);
             let selected = match origin {
                 "fault" => {
-                    crate::vm::PageZeroFault::for_test(executor.page_zero_fault_event(0)).pending()
+                    crate::vm::UserTrap::for_test(executor.page_zero_fault_event(0)).pending()
                 }
                 "thread" | "process" => {
                     if origin == "thread" {

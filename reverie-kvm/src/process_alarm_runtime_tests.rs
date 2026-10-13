@@ -228,7 +228,7 @@ fn process_alarm_signal_transport_contexts_match_resumable_boundaries() {
     let mut info = [0; reverie::SIGNAL_INFO_SIZE];
     info[0..4].copy_from_slice(&libc::SIGSEGV.to_ne_bytes());
     info[8..12].copy_from_slice(&crate::signal::SEGV_MAPERR.to_ne_bytes());
-    let fault = PageZeroFault::for_test(
+    let fault = UserTrap::for_test(
         SignalEvent::new(
             libc::SIGSEGV,
             info,

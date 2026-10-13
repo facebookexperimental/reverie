@@ -225,13 +225,25 @@ fn cpuid_tool_returns_exact_full_registers_flags_stack_and_one_rpc_per_instructi
 
 #[test]
 fn cpuid_subscription_keeps_unrelated_locked_overlength_and_debug_faults_exact() {
+    // A genuine #UD (a locked CPUID, or ud2) is the guest's own fault: it is
+    // delivered as SIGILL, and never reaches the CPUID callback.
+    for code in [vec![0xf0, 0x0f, 0xa2], vec![0x0f, 0x0b]] {
+        let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+        backend
+            .install_static_elf(&static_elf(&code), "/cpuid-fault")
+            .unwrap();
+        let completion = futures::executor::block_on(
+            backend.run_static_elf_with_tool_completion::<CpuidTool>((true, 0), true),
+        )
+        .unwrap();
+        assert_invalid_opcode_signal(completion.result.unwrap().0);
+        assert_eq!(completion.global_state.calls.lock().unwrap().len(), 0);
+    }
     let mut overlong = vec![0x66; 14];
     overlong.extend_from_slice(&[0x0f, 0xa2]);
     for (code, vector, rip, calls) in [
-        (vec![0xf0, 0x0f, 0xa2], 6, LOAD_ADDRESS, 0),
         (overlong, 13, LOAD_ADDRESS, 0),
         (vec![0xfa], 13, LOAD_ADDRESS, 0),
-        (vec![0x0f, 0x0b], 6, LOAD_ADDRESS, 0),
         (
             vec![
                 0x9c, 0x48, 0x81, 0x0c, 0x24, 0x00, 0x01, 0, 0, 0x9d, 0x0f, 0xa2,

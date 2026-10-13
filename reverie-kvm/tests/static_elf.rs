@@ -831,6 +831,9 @@ mod msync;
 #[path = "support/msync_lifecycle.rs"]
 mod msync_lifecycle;
 
+#[path = "support/hardware_traps.rs"]
+mod hardware_traps;
+
 #[test]
 fn file_script_exec_plain() {
     file_script_exec_control("file_script_exec_plain", "plain");
@@ -5078,18 +5081,11 @@ fn unwrap_shared_guest_exception(error: Error) -> Error {
     }
 }
 
-fn assert_invalid_opcode(error: Error) {
-    match unwrap_shared_guest_exception(error) {
-        Error::GuestException {
-            vector,
-            instruction_pointer,
-            ..
-        } => {
-            assert_eq!(vector, 6);
-            assert_eq!(instruction_pointer, LOAD_ADDRESS);
-        }
-        error => panic!("expected invalid-opcode exception, got {error}"),
-    }
+/// A user-mode #UD is the guest's own fault, not a backend error: Linux's
+/// `exc_invalid_op` raises SIGILL, whose default action terminates the process
+/// and dumps core.
+fn assert_invalid_opcode_signal(status: ExitStatus) {
+    assert_eq!(status, ExitStatus::from_raw(libc::SIGILL | 0x80));
 }
 
 fn assert_page_fault(error: Error) {
@@ -5145,9 +5141,14 @@ fn fault_only_assertion_rejects_actual_tool_exit_cleanup_failure() {
     if !kvm_available("fault_only_assertion_rejects_actual_tool_exit_cleanup_failure") {
         return;
     }
+    // A load outside the page tables stays a backend-reported exception. A
+    // #UD would instead be delivered to the guest as SIGILL.
     let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
     backend
-        .install_static_elf(&static_elf(&[0x0f, 0x0b]), "/bin/fault-with-cleanup")
+        .install_static_elf(
+            &static_elf(&[0x48, 0xa1, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00]),
+            "/bin/fault-with-cleanup",
+        )
         .unwrap();
     let error = match futures::executor::block_on(
         backend.run_static_elf_with_tool::<FailingFaultExitTool>((), true),
@@ -5165,9 +5166,9 @@ fn fault_only_assertion_rejects_actual_tool_exit_cleanup_failure() {
     assert!(matches!(
         fault.as_ref(),
         Error::GuestException {
-            vector: 6,
+            vector: 14,
             instruction_pointer: LOAD_ADDRESS,
-            ..
+            fault_address: 0x4000_0000,
         }
     ));
     assert_eq!(cleanup.len(), 1, "unexpected cleanup causes: {cleanup:?}");
@@ -5179,9 +5180,10 @@ fn fault_only_assertion_rejects_actual_tool_exit_cleanup_failure() {
         Error::Reverie(reverie::Error::Errno(errno)) if *errno == Errno::EIO
     ));
     // Only the assertion is caught. The actual run above must retain both
-    // failures, and the unchanged vector/RIP oracle is satisfied by its primary.
+    // failures, and the unchanged vector/RIP/CR2 oracle is satisfied by its
+    // primary.
     let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        assert_invalid_opcode(error);
+        assert_page_fault(error);
     }));
     assert!(
         rejected.is_err(),
@@ -5200,27 +5202,29 @@ fn static_elf_faults_are_reported_by_direct_and_tool_runtimes() {
         Err(error) => panic!("failed to probe /dev/kvm: {error}"),
     }
 
+    // A user-mode #UD is delivered to the guest as SIGILL by both runtimes.
     let image = static_elf(&[0x0f, 0x0b]);
 
     let mut direct_backend = KvmBackend::new(MEMORY_SIZE).unwrap();
     direct_backend
         .install_static_elf(&image, "/bin/fault")
         .unwrap();
-    assert_invalid_opcode(direct_backend.run_static_elf().unwrap_err());
+    assert_eq!(direct_backend.run_static_elf().unwrap(), 128 + libc::SIGILL);
 
     let mut tool_backend = KvmBackend::new(MEMORY_SIZE).unwrap();
     tool_backend
         .install_static_elf(&image, "/bin/fault")
         .unwrap();
-    let error = match futures::executor::block_on(
-        tool_backend.run_static_elf_with_tool::<StraceTool>((), true),
-    ) {
-        Ok(_) => panic!("tool runtime reported a guest exception as success"),
-        Err(error) => error,
-    };
-    assert_invalid_opcode(error);
+    let completion = futures::executor::block_on(
+        tool_backend.run_static_elf_with_tool_completion::<StraceTool>((), true),
+    )
+    .unwrap();
+    let (status, stdout, stderr) = completion.result.unwrap();
+    assert_invalid_opcode_signal(status);
+    assert!(stdout.is_empty() && stderr.is_empty());
 
     // movabs rax, qword ptr [0x40000000], an address outside the page tables.
+    // Both runtimes still report this backend layout gap as an exception.
     let page_fault_image =
         static_elf(&[0x48, 0xa1, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00]);
     let mut page_fault_backend = KvmBackend::new(MEMORY_SIZE).unwrap();
@@ -5228,6 +5232,18 @@ fn static_elf_faults_are_reported_by_direct_and_tool_runtimes() {
         .install_static_elf(&page_fault_image, "/bin/fault")
         .unwrap();
     assert_page_fault(page_fault_backend.run_static_elf().unwrap_err());
+
+    let mut tool_page_fault_backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+    tool_page_fault_backend
+        .install_static_elf(&page_fault_image, "/bin/fault")
+        .unwrap();
+    let error = match futures::executor::block_on(
+        tool_page_fault_backend.run_static_elf_with_tool::<StraceTool>((), true),
+    ) {
+        Ok(_) => panic!("tool runtime reported a guest exception as success"),
+        Err(error) => error,
+    };
+    assert_page_fault(error);
 
     let mut io_fault_backend = KvmBackend::new(MEMORY_SIZE).unwrap();
     io_fault_backend
@@ -17343,15 +17359,18 @@ fn subscribed_timestamp_dispatch_refuses_unrelated_exceptions() {
         return;
     }
 
+    // An unrelated #UD reaches the guest as SIGILL, never as a timestamp
+    // callback.
     let mut invalid_opcode_backend = KvmBackend::new(MEMORY_SIZE).unwrap();
     invalid_opcode_backend
         .install_static_elf(&static_elf(&[0x0f, 0x0b]), "/bin/fault")
         .unwrap();
-    let error = futures::executor::block_on(
-        invalid_opcode_backend.run_static_elf_with_tool::<TimestampTool>(true, true),
+    let completion = futures::executor::block_on(
+        invalid_opcode_backend.run_static_elf_with_tool_completion::<TimestampTool>(true, true),
     )
-    .unwrap_err();
-    assert_invalid_opcode(error);
+    .unwrap();
+    assert_invalid_opcode_signal(completion.result.unwrap().0);
+    assert!(completion.global_state.calls().is_empty());
 
     let mut general_protection_backend = KvmBackend::new(MEMORY_SIZE).unwrap();
     general_protection_backend
@@ -17486,10 +17505,14 @@ fn static_elf_unsubscribed_rdtscp_remains_guest_exception() {
     backend
         .install_static_elf(&image, "/bin/unsubscribed-rdtscp")
         .unwrap();
-    let error =
-        futures::executor::block_on(backend.run_static_elf_with_tool::<TimestampTool>(false, true))
-            .unwrap_err();
-    assert_invalid_opcode(error);
+    // The deterministic CPUID policy hides RDTSCP, so it is a genuine #UD:
+    // SIGILL kills the guest before its exit syscall and no callback runs.
+    let completion = futures::executor::block_on(
+        backend.run_static_elf_with_tool_completion::<TimestampTool>(false, true),
+    )
+    .unwrap();
+    assert_invalid_opcode_signal(completion.result.unwrap().0);
+    assert!(completion.global_state.calls().is_empty());
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -17855,7 +17878,8 @@ fn locked_and_overlength_timestamp_encodings_remain_faults() {
             backend.run_static_elf_with_tool_completion::<TimestampTool>(true, true),
         )
         .unwrap();
-        assert_invalid_opcode(completion.result.unwrap_err());
+        // LOCK makes the encoding a genuine #UD, delivered as SIGILL.
+        assert_invalid_opcode_signal(completion.result.unwrap().0);
         assert!(completion.global_state.calls().is_empty());
     }
     let mut code = vec![0x66; 14];

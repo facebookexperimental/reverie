@@ -21,7 +21,15 @@ pub(crate) const RESULT_WORD: usize = 7;
 pub(crate) const RETURN_RIP_WORD: usize = 8;
 pub(crate) const RETURN_FLAGS_WORD: usize = 9;
 pub(crate) const SAVED_RBX_WORD: usize = 10;
-const FRAME_WORDS: usize = 11;
+/// Nonzero when the trampoline must return with IRETQ rather than SYSRETQ,
+/// because the staged user context has RCX/R11 values that SYSRETQ would
+/// replace with RIP/RFLAGS (see `stage_process_signal_return`).
+pub(crate) const FULL_RETURN_WORD: usize = 11;
+pub(crate) const RETURN_RCX_WORD: usize = 12;
+pub(crate) const RETURN_R11_WORD: usize = 13;
+/// The five-word IRETQ frame (RIP, CS, RFLAGS, RSP, SS) for a full return.
+pub(crate) const IRET_FRAME_WORD: usize = 14;
+const FRAME_WORDS: usize = 19;
 pub(crate) const FRAME_SIZE: usize = WORD_SIZE * FRAME_WORDS;
 
 /// A Linux syscall request transported from guest to host memory.

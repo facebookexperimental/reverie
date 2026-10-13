@@ -49,6 +49,7 @@ use crate::VMCALL_SYSCALL_TRANSPORT;
 use crate::bootstrap::TOOL_STACK_SIZE;
 use crate::bootstrap::process_syscall_return_registers;
 use crate::bootstrap::set_user_segment_base;
+use crate::bootstrap::stage_process_signal_return;
 use crate::bootstrap::stage_process_syscall_return;
 use crate::executor::ChildStartCancellation;
 #[cfg(test)]
@@ -116,9 +117,9 @@ pub(crate) mod entry_wait_observation {
 }
 use crate::memory::UserMemory;
 use crate::vm::CompletedSyscallBoundary;
-use crate::vm::PageZeroFault;
 use crate::vm::ProcessActionContinuation;
 use crate::vm::ProcessActionOutcome;
+use crate::vm::UserTrap;
 
 const STACK_CAPACITY: usize = TOOL_STACK_SIZE as usize;
 
@@ -514,7 +515,7 @@ enum ProcessExecutionContext {
     Instruction,
     ThreadEntrySignal,
     SignalBoundary(CompletedSyscallBoundary),
-    FaultBoundary(Box<PageZeroFault>),
+    FaultBoundary(Box<UserTrap>),
     SyscallBoundary(CompletedSyscallBoundary),
 }
 
@@ -3931,6 +3932,40 @@ impl KvmBackend {
         }
     }
 
+    /// Requests a delivery permit for a CPU exception the Tool has just let
+    /// through, immediately before its frame or default action is committed.
+    ///
+    /// The exception is raised by the running task at its faulting
+    /// instruction, a deterministic point in that task's own execution. The
+    /// permit is requested after the Tool's signal callback, with no further
+    /// Tool request before `finish_signal_boundary` settles it, so the Tool
+    /// does not hold it across a scheduling point where a sibling's exit could
+    /// need one. A fatal fault then reaches the Tool as a terminal receipt
+    /// before its parent can observe the death, as a fatal signal taken at a
+    /// syscall boundary does. When the Tool declines, the fault is still
+    /// synchronous and is still delivered: it cannot be deferred.
+    fn authorize_fault_boundary<G: GlobalTool>(
+        &self,
+        executor: &ElfExecutor,
+        global: &G,
+    ) -> Result<()> {
+        if !executor.signal_controlled() || executor.delivery_permit().is_some() {
+            return Ok(());
+        }
+        let identity = executor.signal_task_identity().ok_or_else(|| {
+            Error::UnexpectedVcpuExit("CPU exception lost task generation".to_owned())
+        })?;
+        let permit = global
+            .authorize_backend_signal_boundary(identity)
+            .map_err(Error::Reverie)?;
+        if permit.is_some() && executor.delivery_permit() != permit {
+            return Err(Error::UnexpectedVcpuExit(
+                "unregistered CPU exception permit".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn finish_signal_boundary<G: GlobalTool>(
         &mut self,
         executor: &mut ElfExecutor,
@@ -4889,7 +4924,7 @@ impl KvmBackend {
         config: &<T::GlobalState as GlobalTool>::Config,
         subscriptions: &Subscription,
         stack_checked_out: &Arc<AtomicBool>,
-        fault: Option<&PageZeroFault>,
+        fault: Option<&UserTrap>,
         thread_entry: bool,
     ) -> Result<CallbackOutcome<Option<PendingSignal>>>
     where
@@ -4929,7 +4964,7 @@ impl KvmBackend {
             auxv,
             fault.map_or_else(
                 || kvm_registers(registers, syscall_number),
-                PageZeroFault::user_registers,
+                UserTrap::user_registers,
             ),
             thread_state,
             global_state,
@@ -5001,7 +5036,7 @@ impl KvmBackend {
                 auxv,
                 fault.map_or_else(
                     || kvm_registers(registers, syscall_number),
-                    PageZeroFault::user_registers,
+                    UserTrap::user_registers,
                 ),
                 thread_state,
                 &mut guest_executor,
@@ -5672,10 +5707,10 @@ impl KvmBackend {
                         if self.try_resume_vmware_backdoor_probe()? {
                             continue;
                         }
-                        let Some(fault) = self.capture_page_zero_fault(executor)? else {
+                        let Some(fault) = self.capture_user_trap(executor)? else {
                             return Err(self.static_elf_halt_error()?);
                         };
-                        executor.prepare_captured_page_zero_fault();
+                        executor.prepare_captured_trap(fault.event.signal());
                         executor.set_current_user_stack_pointer(fault.registers.rsp);
                         let pending = self
                             .filter_next_pending_signal_with_tool(
@@ -5712,14 +5747,31 @@ impl KvmBackend {
                         if let Some((segment, address)) = executor.take_segment() {
                             set_user_segment_base(&self.vcpu, segment, address)?;
                         }
+                        if pending.is_some() && !executor.has_pending_exit() {
+                            self.authorize_fault_boundary(executor, global_state.as_ref())?;
+                        }
+                        let mut delivered = false;
                         if !executor.has_pending_exit() {
                             if let Some(pending) = pending {
-                                self.deliver_page_zero_fault(executor, &fault, pending)?;
+                                delivered = self.deliver_user_trap(executor, &fault, pending)?;
                             } else {
                                 fault.resume_user(self, fault.registers)?;
                             }
                         }
-                        if let Some(exit) = executor.take_exit() {
+                        let mut fault_exit = executor.take_exit();
+                        let outcome = if let Some(exit) = fault_exit {
+                            exit.signal_boundary_outcome()
+                        } else if delivered {
+                            reverie::SignalBoundaryOutcome::Caught
+                        } else {
+                            reverie::SignalBoundaryOutcome::NoHandler
+                        };
+                        // Settles a permit granted for this fault; a permitless
+                        // fault has nothing to settle and returns immediately.
+                        self.finish_signal_boundary(executor, global_state.as_ref(), outcome)
+                            .await?;
+                        fault_exit = fault_exit.or_else(|| executor.take_exit());
+                        if let Some(exit) = fault_exit {
                             self.discard_process_clear_tid_at_signal_return(executor);
                             if exit.group {
                                 self.request_guest_thread_group_exit(exit.status);
@@ -5809,7 +5861,7 @@ impl KvmBackend {
                         signal_exit = signal_exit.or_else(|| executor.take_exit());
                         signal_delivered = delivered;
                         if !delivered && signal_exit.is_none() {
-                            stage_process_syscall_return(
+                            stage_process_signal_return(
                                 &mut memory,
                                 &self.vcpu,
                                 frame_address,

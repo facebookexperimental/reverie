@@ -45,6 +45,10 @@ pub(crate) const SS_AUTODISARM: i32 = i32::MIN;
 pub(crate) const USER_CODE_SELECTOR: u16 = 0x23;
 pub(crate) const USER_DATA_SELECTOR: u16 = 0x1b;
 pub(crate) const SEGV_MAPERR: i32 = 1;
+/// `si_code` Linux reports for a #UD (`do_error_trap(..., SIGILL, ILL_ILLOPN, ...)`).
+pub(crate) const ILL_ILLOPN: i32 = 2;
+/// `si_code` Linux reports for a #DE (`do_error_trap(..., SIGFPE, FPE_INTDIV, ...)`).
+pub(crate) const FPE_INTDIV: i32 = 1;
 
 const UC_FP_XSTATE: u64 = 0x1;
 const UC_SIGCONTEXT_SS: u64 = 0x2;

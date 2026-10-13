@@ -7096,39 +7096,51 @@ impl ElfExecutor {
         self.state.thread_signals.lock().observe_ignored = true;
     }
 
+    #[cfg(test)]
     pub(crate) fn page_zero_fault_event(&self, address: u64) -> reverie::SignalEvent {
+        self.trap_signal_event(libc::SIGSEGV, crate::signal::SEGV_MAPERR, address)
+    }
+
+    /// The thread-directed `siginfo_t` Linux's `force_sig_fault` builds for a
+    /// synchronous CPU exception: `si_signo`, `si_code`, and `si_addr`.
+    pub(crate) fn trap_signal_event(
+        &self,
+        signal: libc::c_int,
+        code: i32,
+        address: u64,
+    ) -> reverie::SignalEvent {
         let mut info = [0; reverie::SIGNAL_INFO_SIZE];
-        info[..4].copy_from_slice(&libc::SIGSEGV.to_ne_bytes());
-        info[8..12].copy_from_slice(&crate::signal::SEGV_MAPERR.to_ne_bytes());
+        info[..4].copy_from_slice(&signal.to_ne_bytes());
+        info[8..12].copy_from_slice(&code.to_ne_bytes());
         info[16..24].copy_from_slice(&address.to_ne_bytes());
         reverie::SignalEvent::new(
-            libc::SIGSEGV,
+            signal,
             info,
             reverie::SignalTarget::Thread {
                 pid: reverie::Pid::from_raw(self.state.pid),
                 tid: reverie::Pid::from_raw(self.state.tid),
             },
         )
-        .expect("captured page fault has coherent signal information")
+        .expect("captured CPU exception has coherent signal information")
     }
 
-    pub(crate) fn prepare_captured_page_zero_fault(&mut self) {
+    /// Applies Linux `force_sig_info_to_task` to a captured CPU exception's
+    /// signal: when the signal is blocked or ignored, it is unblocked and its
+    /// action is reset to the default, so the fault can neither be deferred nor
+    /// discarded. A handled, unblocked signal keeps its handler.
+    pub(crate) fn prepare_captured_trap(&mut self, signal: libc::c_int) {
         let transaction = self.state.signal_transaction.clone();
         let _transaction = transaction.lock().unwrap_or_else(|p| p.into_inner());
-        if self.signal_mask().contains(libc::SIGSEGV)
-            || self.signal_disposition(libc::SIGSEGV) == SignalDisposition::Ignore
+        if self.signal_mask().contains(signal)
+            || self.signal_disposition(signal) == SignalDisposition::Ignore
         {
-            self.state
-                .thread_signals
-                .lock()
-                .blocked
-                .remove(libc::SIGSEGV);
+            self.state.thread_signals.lock().blocked.remove(signal);
             self.state
                 .process_signals
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .dispositions
-                .remove(&libc::SIGSEGV);
+                .remove(&signal);
         }
     }
 

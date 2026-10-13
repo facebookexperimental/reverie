@@ -66,6 +66,7 @@ use crate::bootstrap::exception_from_halt;
 use crate::bootstrap::exception_pushes_error_code;
 use crate::bootstrap::process_syscall_return_registers;
 use crate::bootstrap::set_user_segment_base;
+use crate::bootstrap::stage_process_signal_return;
 use crate::bootstrap::stage_process_syscall_return;
 use crate::bootstrap::syscall_hypercall_address;
 use crate::bootstrap::thread_tool_stack_top;
@@ -176,13 +177,61 @@ impl<I> InstructionBoundary<I> {
     }
 }
 
+/// The signal Linux raises for a CPU exception taken in user mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct UserTrapSignal {
+    pub(crate) signal: libc::c_int,
+    pub(crate) code: i32,
+    /// `si_addr`: the faulting instruction for SIGILL and SIGFPE, CR2 for
+    /// SIGSEGV.
+    pub(crate) address: u64,
+}
+
+/// Maps a user-mode CPU exception to the signal Linux's x86 trap handlers
+/// raise for it, or `None` when this backend keeps it as a backend error.
+///
+/// - #DE (0): `exc_divide_error` -> SIGFPE, FPE_INTDIV, si_addr = RIP. This
+///   covers both division by zero and quotient overflow, as on Linux.
+/// - #UD (6): `exc_invalid_op` -> SIGILL, ILL_ILLOPN, si_addr = RIP.
+/// - #PF (14): only a not-present user access to page zero, the one page this
+///   backend's page tables deliberately leave unmapped below the identity
+///   limit (error code 4 read, 6 write, 20 instruction fetch) ->
+///   SIGSEGV, SEGV_MAPERR, si_addr = CR2. Other page faults still name a
+///   backend layout gap rather than a guest fault, so they stay errors.
+pub(crate) fn user_trap_signal(
+    vector: u8,
+    error_code: u64,
+    instruction_pointer: u64,
+    fault_address: u64,
+) -> Option<UserTrapSignal> {
+    let (signal, code, address) = match vector {
+        0 => (libc::SIGFPE, crate::signal::FPE_INTDIV, instruction_pointer),
+        6 => (libc::SIGILL, crate::signal::ILL_ILLOPN, instruction_pointer),
+        14 if fault_address < PAGE_SIZE && [4, 6, 20].contains(&error_code) => {
+            (libc::SIGSEGV, crate::signal::SEGV_MAPERR, fault_address)
+        }
+        _ => return None,
+    };
+    Some(UserTrapSignal {
+        signal,
+        code,
+        address,
+    })
+}
+
+/// A synchronous CPU exception taken in guest user mode that Linux reports to
+/// the faulting thread as a signal (`force_sig_fault`). The faulting
+/// instruction has not retired: `registers.rip` names it, so a handler that
+/// returns re-executes it, exactly as on Linux.
 #[derive(Clone)]
-pub(crate) struct PageZeroFault {
+pub(crate) struct UserTrap {
     pub(crate) registers: kvm_regs,
     pub(crate) event: reverie::SignalEvent,
     code_segment: u16,
     stack_segment: u16,
+    vector: u8,
     error_code: u64,
+    /// The `sigcontext.cr2` value: CR2 for a page fault, otherwise zero.
     address: u64,
     halted_registers: kvm_regs,
     special_registers: kvm_bindings::kvm_sregs,
@@ -191,7 +240,7 @@ pub(crate) struct PageZeroFault {
     transport_address: u64,
 }
 
-impl PageZeroFault {
+impl UserTrap {
     #[cfg(test)]
     pub(crate) fn for_test(event: reverie::SignalEvent) -> Self {
         Self {
@@ -204,6 +253,7 @@ impl PageZeroFault {
             xsave: Arc::new(unsafe { std::mem::zeroed() }),
             code_segment: crate::signal::USER_CODE_SELECTOR,
             stack_segment: crate::signal::USER_DATA_SELECTOR,
+            vector: 14,
             error_code: 4,
             address: 0,
             transport: [0; FRAME_SIZE],
@@ -2576,7 +2626,7 @@ impl KvmBackend {
         clear_sighand: bool,
         share_address_space: bool,
         park_syscall_return: bool,
-        fault: Option<&PageZeroFault>,
+        fault: Option<&UserTrap>,
     ) -> Result<ForkedProcess> {
         let mut stop = std::pin::pin!(std::future::pending());
         futures::executor::block_on(self.prepare_forked_process_admitted(
@@ -2607,7 +2657,7 @@ impl KvmBackend {
         clear_sighand: bool,
         share_address_space: bool,
         park_syscall_return: bool,
-        fault: Option<&PageZeroFault>,
+        fault: Option<&UserTrap>,
         stop: Pin<&mut (dyn Future<Output = ()> + Send + '_)>,
     ) -> Result<Option<ForkedProcess>> {
         let shared_file_snapshot = self.memory.contains_shared_file();
@@ -2827,7 +2877,7 @@ impl KvmBackend {
         executor: &mut ElfExecutor,
         action: ProcessAction,
         park_syscall_return: bool,
-        fault: Option<&PageZeroFault>,
+        fault: Option<&UserTrap>,
         mut stop: Pin<&mut (dyn Future<Output = ()> + Send + '_)>,
         direct_registration: Option<&GuestThreadRegistration>,
     ) -> Result<ProcessActionOutcome> {
@@ -3417,7 +3467,7 @@ impl KvmBackend {
         action: ProcessAction,
         park_syscall_return: bool,
         context: ToolContext<'_, T>,
-        fault: Option<&PageZeroFault>,
+        fault: Option<&UserTrap>,
     ) -> Result<ProcessActionOutcome>
     where
         T: Tool + 'static,
@@ -4098,7 +4148,7 @@ impl KvmBackend {
         executor: &mut ElfExecutor,
         action: ProcessAction,
         context: ToolContext<'_, T>,
-        fault: &PageZeroFault,
+        fault: &UserTrap,
     ) -> Result<ProcessActionOutcome>
     where
         T: Tool + 'static,
@@ -4374,21 +4424,26 @@ impl KvmBackend {
         Ok(())
     }
 
-    pub(crate) fn capture_page_zero_fault(
-        &self,
-        executor: &ElfExecutor,
-    ) -> Result<Option<PageZeroFault>> {
+    pub(crate) fn capture_user_trap(&self, executor: &ElfExecutor) -> Result<Option<UserTrap>> {
         let halted_registers = self.vcpu.get_regs()?;
-        if exception_from_halt(halted_registers.rip) != Some(14) {
+        let Some(vector) = exception_from_halt(halted_registers.rip) else {
             return Ok(None);
-        }
+        };
         let special_registers = self.vcpu.get_sregs()?;
-        let address = special_registers.cr2;
-        if address >= PAGE_SIZE {
+        // The exception stub halts with the hardware frame on its stack: an
+        // optional error code, then RIP, CS, RFLAGS, RSP, SS.
+        let first = usize::from(exception_pushes_error_code(vector));
+        let mut frame = [0; 6 * 8];
+        let words = first + 5;
+        if self
+            .memory
+            .read_raw(halted_registers.rsp, &mut frame[..words * 8])
+            .is_err()
+        {
+            // An unreadable frame cannot be a user trap; keep the exception's
+            // own diagnostic.
             return Ok(None);
         }
-        let mut frame = [0; 6 * 8];
-        self.memory.read_raw(halted_registers.rsp, &mut frame)?;
         let word = |index: usize| {
             u64::from_le_bytes(
                 frame[index * 8..index * 8 + 8]
@@ -4396,11 +4451,13 @@ impl KvmBackend {
                     .expect("exception frame word"),
             )
         };
-        let error_code = word(0);
-        let code_segment = word(2);
-        let stack_segment = word(5);
-        if ![4, 6, 20].contains(&error_code)
-            || code_segment != u64::from(crate::signal::USER_CODE_SELECTOR)
+        let error_code = if first == 1 { word(0) } else { 0 };
+        let instruction_pointer = word(first);
+        let code_segment = word(first + 1);
+        let stack_segment = word(first + 4);
+        // Only a trap taken in guest user mode is the guest's own fault. A
+        // fault in backend-owned supervisor code stays a backend error.
+        if code_segment != u64::from(crate::signal::USER_CODE_SELECTOR)
             || ![
                 u64::from(crate::signal::USER_DATA_SELECTOR),
                 u64::from(crate::signal::USER_DATA_SELECTOR & !3),
@@ -4409,20 +4466,33 @@ impl KvmBackend {
         {
             return Ok(None);
         }
+        let Some(signal) = user_trap_signal(
+            vector,
+            error_code,
+            instruction_pointer,
+            special_registers.cr2,
+        ) else {
+            return Ok(None);
+        };
         let mut registers = halted_registers;
-        registers.rip = word(1);
-        registers.rflags = word(3);
-        registers.rsp = word(4);
+        registers.rip = instruction_pointer;
+        registers.rflags = word(first + 2);
+        registers.rsp = word(first + 3);
         let mut transport = [0; FRAME_SIZE];
         self.memory
             .read_raw(self.syscall_frame_address, &mut transport)?;
-        Ok(Some(PageZeroFault {
+        Ok(Some(UserTrap {
             registers,
-            event: executor.page_zero_fault_event(address),
+            event: executor.trap_signal_event(signal.signal, signal.code, signal.address),
             code_segment: code_segment as u16,
             stack_segment: stack_segment as u16,
+            vector,
             error_code,
-            address,
+            address: if vector == 14 {
+                special_registers.cr2
+            } else {
+                0
+            },
             halted_registers,
             special_registers,
             xsave: Arc::new(self.vcpu.get_xsave()?),
@@ -4548,10 +4618,10 @@ impl KvmBackend {
         )
     }
 
-    pub(crate) fn deliver_page_zero_fault(
+    pub(crate) fn deliver_user_trap(
         &mut self,
         executor: &mut ElfExecutor,
-        fault: &PageZeroFault,
+        fault: &UserTrap,
         pending: crate::executor::PendingSignal,
     ) -> Result<bool> {
         self.deliver_selected_signal_at_boundary(
@@ -4594,7 +4664,7 @@ impl KvmBackend {
         syscall_frame_address: u64,
         interrupted: kvm_regs,
         pending: crate::executor::PendingSignal,
-        fault: Option<&PageZeroFault>,
+        fault: Option<&UserTrap>,
         thread_entry: bool,
     ) -> Result<bool> {
         let signal = pending.event.signal();
@@ -4650,7 +4720,7 @@ impl KvmBackend {
             mcontext.cs = fault.code_segment;
             mcontext.ss = fault.stack_segment;
             mcontext.err = fault.error_code;
-            mcontext.trapno = 14;
+            mcontext.trapno = fault.vector.into();
             mcontext.cr2 = fault.address;
         }
         let frame = RtSigframe {
@@ -5078,7 +5148,7 @@ impl KvmBackend {
                                 restored,
                             )?;
                             if !delivered {
-                                stage_process_syscall_return(
+                                stage_process_signal_return(
                                     &mut self.memory,
                                     &self.vcpu,
                                     frame_address,
@@ -5131,11 +5201,11 @@ impl KvmBackend {
                     if self.try_resume_vmware_backdoor_probe()? {
                         continue;
                     }
-                    let Some(fault) = self.capture_page_zero_fault(executor)? else {
+                    let Some(fault) = self.capture_user_trap(executor)? else {
                         return Err(self.static_elf_halt_error()?);
                     };
-                    executor.prepare_captured_page_zero_fault();
-                    self.deliver_page_zero_fault(executor, &fault, fault.pending())?;
+                    executor.prepare_captured_trap(fault.event.signal());
+                    self.deliver_user_trap(executor, &fault, fault.pending())?;
                     if executor.has_pending_exit() {
                         self.discard_process_clear_tid_at_signal_return(executor);
                         self.clear_registered_worker_tid_before_exit(executor);
@@ -5905,6 +5975,56 @@ mod worker_panic_tests;
 
 #[cfg(test)]
 pub(crate) use tests::minimal_test_elf;
+
+#[cfg(test)]
+mod user_trap_signal_tests {
+    use super::*;
+
+    #[test]
+    fn user_mode_exceptions_raise_the_linux_trap_signal() {
+        let rip = 0x40_1234;
+        assert_eq!(
+            user_trap_signal(0, 0, rip, 0xdead_0000),
+            Some(UserTrapSignal {
+                signal: libc::SIGFPE,
+                code: crate::signal::FPE_INTDIV,
+                address: rip,
+            })
+        );
+        assert_eq!(
+            user_trap_signal(6, 0, rip, 0xdead_0000),
+            Some(UserTrapSignal {
+                signal: libc::SIGILL,
+                code: crate::signal::ILL_ILLOPN,
+                address: rip,
+            })
+        );
+        for (error_code, address) in [(4, 0), (6, 0x18), (20, 0xfff)] {
+            assert_eq!(
+                user_trap_signal(14, error_code, rip, address),
+                Some(UserTrapSignal {
+                    signal: libc::SIGSEGV,
+                    code: crate::signal::SEGV_MAPERR,
+                    address,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn other_exceptions_stay_backend_errors() {
+        let rip = 0x40_1234;
+        // A page fault outside page zero, or with a present/reserved/kernel
+        // error code, names a backend layout gap rather than a guest fault.
+        assert_eq!(user_trap_signal(14, 6, rip, PAGE_SIZE), None);
+        assert_eq!(user_trap_signal(14, 7, rip, 0), None);
+        assert_eq!(user_trap_signal(14, 2, rip, 0), None);
+        // #DB, #BP, #GP and the rest are not translated here.
+        for vector in [1, 3, 4, 5, 7, 8, 10, 11, 12, 13, 16, 17, 18, 19, 20, 21, 31] {
+            assert_eq!(user_trap_signal(vector, 0, rip, 0), None, "vector {vector}");
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -8696,7 +8816,7 @@ mod tests {
                         .expect("test entry admission was unexpectedly closed"),
                     VcpuExit::Hlt
                 ));
-                let fault = backend.capture_page_zero_fault(&executor).unwrap().unwrap();
+                let fault = backend.capture_user_trap(&executor).unwrap().unwrap();
                 let mut frame_before = [0; PAGE_SIZE as usize];
                 let mut exception_before = [0; PAGE_SIZE as usize];
                 backend

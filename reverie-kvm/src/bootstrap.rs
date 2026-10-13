@@ -17,8 +17,12 @@ use crate::GuestMemory;
 use crate::Result;
 use crate::VMCALL_SYSCALL_TRANSPORT;
 use crate::syscall::FRAME_SIZE;
+use crate::syscall::FULL_RETURN_WORD;
+use crate::syscall::IRET_FRAME_WORD;
 use crate::syscall::RESULT_WORD;
 use crate::syscall::RETURN_FLAGS_WORD;
+use crate::syscall::RETURN_R11_WORD;
+use crate::syscall::RETURN_RCX_WORD;
 use crate::syscall::RETURN_RIP_WORD;
 use crate::syscall::SAVED_RBX_WORD;
 
@@ -437,6 +441,8 @@ pub(crate) fn stage_process_syscall_return(
         (RETURN_RIP_WORD, registers.rip),
         (RETURN_FLAGS_WORD, registers.rflags),
         (SAVED_RBX_WORD, registers.rbx),
+        // A syscall return is SYSRETQ-shaped; never reuse an older request.
+        (FULL_RETURN_WORD, 0),
     ] {
         write_u64(
             memory,
@@ -452,6 +458,40 @@ pub(crate) fn stage_process_syscall_return(
     live.r14 = registers.r14;
     live.r15 = registers.r15;
     vcpu.set_regs(&live)?;
+    Ok(())
+}
+
+/// Stages the context `rt_sigreturn` restored. Linux restores every register
+/// from the signal frame, and returns with IRET whenever SYSRET could not
+/// reproduce it (RCX != RIP or R11 != RFLAGS). That is the normal case for a
+/// handler returning to an interrupted CPU exception, where RCX and R11 are
+/// live program values; a SYSRET return would silently replace them.
+pub(crate) fn stage_process_signal_return(
+    memory: &mut GuestMemory,
+    vcpu: &VcpuFd,
+    syscall_frame_address: u64,
+    registers: kvm_bindings::kvm_regs,
+) -> Result<()> {
+    stage_process_syscall_return(memory, vcpu, syscall_frame_address, registers)?;
+    if registers.rcx == registers.rip && registers.r11 == registers.rflags {
+        return Ok(());
+    }
+    for (word, value) in [
+        (RETURN_RCX_WORD, registers.rcx),
+        (RETURN_R11_WORD, registers.r11),
+        (IRET_FRAME_WORD, registers.rip),
+        (IRET_FRAME_WORD + 1, u64::from(USER_CODE_SELECTOR)),
+        (IRET_FRAME_WORD + 2, registers.rflags),
+        (IRET_FRAME_WORD + 3, registers.rsp),
+        (IRET_FRAME_WORD + 4, u64::from(USER_DATA_SELECTOR)),
+        (FULL_RETURN_WORD, 1),
+    ] {
+        write_u64(
+            memory,
+            frame_word_address_u64(syscall_frame_address, word),
+            value,
+        )?;
+    }
     Ok(())
 }
 
@@ -932,7 +972,42 @@ fn syscall_trampoline(hypercall_instruction: [u8; 3], syscall_frame_address: u64
         RETURN_FLAGS_WORD,
     );
     load_absolute(&mut code, syscall_frame_address, 0x48, 0x1c, SAVED_RBX_WORD);
+    // cmp qword ptr [FULL_RETURN_WORD], 0; jne full_return
+    code.extend_from_slice(&[0x48, 0x83, 0x3c, 0x25]);
+    code.extend_from_slice(
+        &frame_word_address(syscall_frame_address, FULL_RETURN_WORD).to_le_bytes(),
+    );
+    code.extend_from_slice(&[0x00, 0x75, 0x03]);
+    // sysretq: RCX becomes RIP and R11 becomes RFLAGS.
     code.extend_from_slice(&[0x48, 0x0f, 0x07]);
+    // full_return: consume the request, restore RCX/R11, and IRETQ through
+    // the staged frame, as Linux returns to a context SYSRET cannot express.
+    // mov qword ptr [FULL_RETURN_WORD], 0
+    code.extend_from_slice(&[0x48, 0xc7, 0x04, 0x25]);
+    code.extend_from_slice(
+        &frame_word_address(syscall_frame_address, FULL_RETURN_WORD).to_le_bytes(),
+    );
+    code.extend_from_slice(&0_u32.to_le_bytes());
+    load_absolute(
+        &mut code,
+        syscall_frame_address,
+        0x48,
+        0x0c,
+        RETURN_RCX_WORD,
+    );
+    load_absolute(
+        &mut code,
+        syscall_frame_address,
+        0x4c,
+        0x1c,
+        RETURN_R11_WORD,
+    );
+    // mov rsp, IRET frame (sign-extended imm32), then iretq
+    code.extend_from_slice(&[0x48, 0xc7, 0xc4]);
+    code.extend_from_slice(
+        &frame_word_address(syscall_frame_address, IRET_FRAME_WORD).to_le_bytes(),
+    );
+    code.extend_from_slice(&[0x48, 0xcf]);
     code
 }
 
@@ -977,8 +1052,79 @@ mod tests {
         let code = syscall_trampoline([0x0f, 0x01, 0xc1], SYSCALL_FRAME_ADDRESS);
 
         assert!(code.windows(3).any(|window| window == [0x0f, 0x01, 0xc1]));
-        assert_eq!(&code[code.len() - 3..], &[0x48, 0x0f, 0x07]);
+        // The SYSRETQ return is taken unless a full return was staged; the
+        // full return consumes its request, restores RCX/R11, and IRETQs.
+        let full = frame_word_address(SYSCALL_FRAME_ADDRESS, FULL_RETURN_WORD).to_le_bytes();
+        let mut tail = vec![0x48, 0x83, 0x3c, 0x25];
+        tail.extend_from_slice(&full);
+        tail.extend_from_slice(&[0x00, 0x75, 0x03, 0x48, 0x0f, 0x07]);
+        tail.extend_from_slice(&[0x48, 0xc7, 0x04, 0x25]);
+        tail.extend_from_slice(&full);
+        tail.extend_from_slice(&[0, 0, 0, 0, 0x48, 0x8b, 0x0c, 0x25]);
+        tail.extend_from_slice(
+            &frame_word_address(SYSCALL_FRAME_ADDRESS, RETURN_RCX_WORD).to_le_bytes(),
+        );
+        tail.extend_from_slice(&[0x4c, 0x8b, 0x1c, 0x25]);
+        tail.extend_from_slice(
+            &frame_word_address(SYSCALL_FRAME_ADDRESS, RETURN_R11_WORD).to_le_bytes(),
+        );
+        tail.extend_from_slice(&[0x48, 0xc7, 0xc4]);
+        tail.extend_from_slice(
+            &frame_word_address(SYSCALL_FRAME_ADDRESS, IRET_FRAME_WORD).to_le_bytes(),
+        );
+        tail.extend_from_slice(&[0x48, 0xcf]);
+        assert!(code.ends_with(&tail));
         assert!(code.len() < THREAD_TSS_OFFSET as usize);
+    }
+
+    #[test]
+    fn signal_return_requests_iret_only_when_sysret_would_change_registers() {
+        const FRAME: u64 = 0x1000;
+        let kvm = kvm_ioctls::Kvm::new();
+        let Ok(kvm) = kvm else {
+            eprintln!("skipping: cannot open /dev/kvm");
+            return;
+        };
+        let vm = kvm.create_vm().unwrap();
+        let vcpu = vm.create_vcpu(0).unwrap();
+        let mut memory = GuestMemory::new(0, 0x4000).unwrap();
+        let word = |memory: &GuestMemory, word: usize| {
+            read_u64(memory, frame_word_address_u64(FRAME, word)).unwrap()
+        };
+        let mut registers = kvm_bindings::kvm_regs {
+            rip: 0x40_1000,
+            rcx: 0x40_1000,
+            rflags: 0x246,
+            r11: 0x246,
+            rsp: 0x7fff_0000,
+            ..Default::default()
+        };
+        // A SYSRET-shaped context keeps the SYSRET return.
+        stage_process_signal_return(&mut memory, &vcpu, FRAME, registers).unwrap();
+        assert_eq!(word(&memory, FULL_RETURN_WORD), 0);
+
+        registers.rcx = 0x1122_3344_5566_7788;
+        registers.r11 = 0x0123_4567_89ab_cdef;
+        stage_process_signal_return(&mut memory, &vcpu, FRAME, registers).unwrap();
+        assert_eq!(word(&memory, FULL_RETURN_WORD), 1);
+        assert_eq!(word(&memory, RETURN_RCX_WORD), registers.rcx);
+        assert_eq!(word(&memory, RETURN_R11_WORD), registers.r11);
+        assert_eq!(
+            (0..5)
+                .map(|index| word(&memory, IRET_FRAME_WORD + index))
+                .collect::<Vec<_>>(),
+            vec![
+                registers.rip,
+                u64::from(USER_CODE_SELECTOR),
+                registers.rflags,
+                registers.rsp,
+                u64::from(USER_DATA_SELECTOR),
+            ]
+        );
+
+        // An ordinary syscall return never reuses that request.
+        stage_process_syscall_return(&mut memory, &vcpu, FRAME, registers).unwrap();
+        assert_eq!(word(&memory, FULL_RETURN_WORD), 0);
     }
 
     #[test]
