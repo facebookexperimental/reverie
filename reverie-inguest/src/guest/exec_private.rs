@@ -26,6 +26,8 @@ pub struct NativeControl {
     init_input_len: u64,
     runtime_ready: u64,
     kernel_mask: u64,
+    // Initially captured by the private loader, then updated only after an
+    // actual successful guest registration syscall. Tool setters are refused.
     kernel_robust_head: u64,
     kernel_robust_len: u64,
     kernel_clear_tid: u64,
@@ -133,6 +135,47 @@ pub fn callback_native_tid() -> Option<i32> {
         return None;
     }
     i32::try_from(tid).ok()
+}
+
+/// Current guest registrations in the calling native thread.
+///
+/// Addresses are recorded kernel arguments, never dereferenced Tool pointers.
+/// This value does not authorize an exec or a change to either registration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GuestKernelRegistrations {
+    /// Last successful guest clear-child-TID registration.
+    pub clear_tid: u64,
+    /// Last successful guest robust-list registration, checked against Linux.
+    pub robust_head: u64,
+    /// Kernel robust-list ABI length.
+    pub robust_len: u64,
+}
+
+/// Inspect registrations only in the actual ready native Tool callback.
+///
+/// The robust-list query must agree with the success-only guest ledger. Linux
+/// does not provide a generally available clear-TID query; its value comes
+/// from the initial loader capture and every successful guest setter. This
+/// check never uses a destructive setter as a query. A caller needing an exec
+/// cut must repeat it at its final edge, without intervening guest execution.
+pub fn callback_kernel_registrations() -> Option<GuestKernelRegistrations> {
+    callback_native_tid()?;
+    let control = control_pointer();
+    let read = |p: *const u64| unsafe { p.read_volatile() };
+    let recorded = GuestKernelRegistrations {
+        clear_tid: read(unsafe { &raw const (*control).kernel_clear_tid }),
+        robust_head: read(unsafe { &raw const (*control).kernel_robust_head }),
+        robust_len: read(unsafe { &raw const (*control).kernel_robust_len }),
+    };
+    let mut head = 0_u64;
+    let mut length = 0_u64;
+    let rc = unsafe {
+        crate::trap::raw_syscall6(
+            libc::SYS_get_robust_list,
+            [0, (&raw mut head) as u64, (&raw mut length) as u64, 0, 0, 0],
+        )
+    };
+    (rc == 0 && head == recorded.robust_head && length == recorded.robust_len).then_some(recorded)
 }
 
 /// Read the bounded, immutable native input packet before coordinator redemption.
@@ -342,6 +385,18 @@ pub unsafe fn physical_syscall(
             u64::from(pkru.is_some()),
         )
     };
+    // The assembly leaf has restored Tool FS and callback phase before any
+    // Rust executes. Preserve actual failed-call state; do not infer success
+    // merely from the requested address or a Detcore-emulated return value.
+    let control = control_pointer();
+    unsafe {
+        if number == libc::SYS_set_tid_address && result.result > 0 {
+            (&raw mut (*control).kernel_clear_tid).write_volatile(args[0]);
+        } else if number == libc::SYS_set_robust_list && result.result == 0 {
+            (&raw mut (*control).kernel_robust_head).write_volatile(args[0]);
+            (&raw mut (*control).kernel_robust_len).write_volatile(args[1]);
+        }
+    }
     crate::trap::NativeSyscallResult {
         result: result.result,
         pkru: pkru.map(|_| result.pkru as u32),
@@ -820,6 +875,311 @@ mod tests {
                     unsafe { physical_syscall(libc::SYS_exit_group, [73, 0, 0, 0, 0, 0], None) };
             },
             127,
+        );
+    }
+    #[test]
+    fn physical_guest_registration_keeps_the_current_successful_kernel_values() {
+        isolated(
+            || {
+                let mut control = unsafe { scalar_control() };
+                reverie_inguest_private_exec_control
+                    .store((&raw mut control) as usize, Ordering::Release);
+                let mut clear_tid = 41_i32;
+                let clear_address = (&raw mut clear_tid) as u64;
+                let tid = unsafe { crate::trap::raw_syscall6(libc::SYS_gettid, [0; 6]) };
+                assert_eq!(
+                    unsafe {
+                        physical_syscall(
+                            libc::SYS_set_tid_address,
+                            [clear_address, 0, 0, 0, 0, 0],
+                            None,
+                        )
+                    }
+                    .result,
+                    tid
+                );
+                assert_eq!(control.kernel_clear_tid, clear_address);
+
+                let mut robust = [0_u64; 3];
+                let robust_address = robust.as_mut_ptr() as u64;
+                robust[0] = robust_address;
+                let robust_len = size_of_val(&robust) as u64;
+                assert_eq!(
+                    unsafe {
+                        physical_syscall(
+                            libc::SYS_set_robust_list,
+                            [robust_address, robust_len, 0, 0, 0, 0],
+                            None,
+                        )
+                    }
+                    .result,
+                    0
+                );
+                assert_eq!(control.kernel_robust_head, robust_address);
+                assert_eq!(control.kernel_robust_len, robust_len);
+                assert_eq!(
+                    unsafe {
+                        physical_syscall(
+                            libc::SYS_set_robust_list,
+                            [0, robust_len - 1, 0, 0, 0, 0],
+                            None,
+                        )
+                    }
+                    .result,
+                    -i64::from(libc::EINVAL)
+                );
+                assert_eq!(control.kernel_robust_head, robust_address);
+                assert_eq!(control.kernel_robust_len, robust_len);
+                let mut actual_head = 0_u64;
+                let mut actual_len = 0_u64;
+                assert_eq!(
+                    unsafe {
+                        crate::trap::raw_syscall6(
+                            libc::SYS_get_robust_list,
+                            [
+                                0,
+                                (&raw mut actual_head) as u64,
+                                (&raw mut actual_len) as u64,
+                                0,
+                                0,
+                                0,
+                            ],
+                        )
+                    },
+                    0
+                );
+                assert_eq!((actual_head, actual_len), (robust_address, robust_len));
+                assert_eq!(clear_tid, 41);
+                // Remove only this isolated native-leaf fixture's registrations
+                // before its local buffers go out of scope. This is not exec.
+                assert_eq!(
+                    unsafe {
+                        physical_syscall(
+                            libc::SYS_set_robust_list,
+                            [0, robust_len, 0, 0, 0, 0],
+                            None,
+                        )
+                    }
+                    .result,
+                    0
+                );
+                assert_eq!(
+                    unsafe { physical_syscall(libc::SYS_set_tid_address, [0; 6], None) }.result,
+                    tid
+                );
+                assert_eq!(control.kernel_clear_tid, 0);
+                assert_eq!(control.kernel_robust_head, 0);
+            },
+            0,
+        );
+    }
+
+    #[test]
+    fn native_nested_tool_registration_setters_are_refused_before_forwarding() {
+        isolated(
+            || {
+                let mut control = unsafe { scalar_control() };
+                reverie_inguest_private_exec_control
+                    .store((&raw mut control) as usize, Ordering::Release);
+                let mut clear_tid = 73_i32;
+                let mut robust = [0_u64; 3];
+                robust[0] = robust.as_mut_ptr() as u64;
+                for (number, args) in [
+                    (
+                        libc::SYS_set_tid_address,
+                        [(&raw mut clear_tid) as u64, 0, 0, 0, 0, 0],
+                    ),
+                    (
+                        libc::SYS_set_robust_list,
+                        [
+                            robust.as_ptr() as u64,
+                            size_of_val(&robust) as u64,
+                            0,
+                            0,
+                            0,
+                            0,
+                        ],
+                    ),
+                ] {
+                    let mut event = crate::guest::event::SyscallEvent {
+                        number,
+                        args,
+                        instruction_pointer: 0,
+                        result: i64::MIN,
+                        context: 0,
+                        dispatch: crate::guest::event::SyscallDispatch::Trap,
+                        guest_pkru: None,
+                    };
+                    let mut observed = false;
+                    unsafe {
+                        crate::guest::trap_dispatch::forward_nested_tool_syscall(
+                            &mut event,
+                            |_| observed = true,
+                        );
+                    }
+                    assert_eq!(event.result, -i64::from(libc::EPERM));
+                    assert!(!observed);
+                }
+            },
+            0,
+        );
+    }
+
+    #[test]
+    fn callback_kernel_registrations_requires_actual_owner_and_current_robust_list() {
+        isolated(
+            || {
+                assert_eq!(callback_kernel_registrations(), None);
+                let mut control = unsafe { scalar_control() };
+                control.native_tid =
+                    unsafe { crate::trap::raw_syscall6(libc::SYS_gettid, [0; 6]) } as u64;
+                reverie_inguest_private_exec_control
+                    .store((&raw mut control) as usize, Ordering::Release);
+                let mut clear_tid = 73_i32;
+                let clear_address = (&raw mut clear_tid) as u64;
+                let mut robust = [0_u64; 3];
+                let robust_address = robust.as_mut_ptr() as u64;
+                robust[0] = robust_address;
+                let robust_len = size_of_val(&robust) as u64;
+                assert_eq!(
+                    unsafe {
+                        physical_syscall(
+                            libc::SYS_set_tid_address,
+                            [clear_address, 0, 0, 0, 0, 0],
+                            None,
+                        )
+                    }
+                    .result,
+                    control.native_tid as i64
+                );
+                assert_eq!(
+                    unsafe {
+                        physical_syscall(
+                            libc::SYS_set_robust_list,
+                            [robust_address, robust_len, 0, 0, 0, 0],
+                            None,
+                        )
+                    }
+                    .result,
+                    0
+                );
+                assert_eq!(callback_kernel_registrations(), None); // not ready
+                unsafe { (&raw mut control.runtime_ready).write_volatile(1) };
+                let expected = Some(GuestKernelRegistrations {
+                    clear_tid: clear_address,
+                    robust_head: robust_address,
+                    robust_len,
+                });
+                assert_eq!(callback_kernel_registrations(), expected);
+                assert_eq!(callback_kernel_registrations(), expected);
+                assert_eq!(clear_tid, 73);
+                assert_eq!(control.kernel_clear_tid, clear_address);
+                unsafe { (&raw mut control.kernel_robust_head).write_volatile(0) };
+                assert_eq!(callback_kernel_registrations(), None);
+                unsafe {
+                    (&raw mut control.kernel_robust_head).write_volatile(robust_address);
+                    (&raw mut control.phase).write_volatile(3);
+                }
+                assert_eq!(callback_kernel_registrations(), None);
+                unsafe { (&raw mut control.phase).write_volatile(4) };
+                assert_eq!(callback_kernel_registrations(), expected);
+                // Test-only cleanup before the stack buffers are dropped.
+                assert_eq!(
+                    unsafe {
+                        physical_syscall(
+                            libc::SYS_set_robust_list,
+                            [0, robust_len, 0, 0, 0, 0],
+                            None,
+                        )
+                    }
+                    .result,
+                    0
+                );
+                assert_eq!(
+                    unsafe { physical_syscall(libc::SYS_set_tid_address, [0; 6], None) }.result,
+                    control.native_tid as i64
+                );
+            },
+            0,
+        );
+    }
+
+    #[test]
+    fn ordinary_nested_registration_setters_keep_their_existing_forwarding() {
+        isolated(
+            || {
+                assert!(!active());
+                let tid = unsafe { crate::trap::raw_syscall6(libc::SYS_gettid, [0; 6]) };
+                let mut clear_tid = 73_i32;
+                let mut robust = [0_u64; 3];
+                let robust_address = robust.as_mut_ptr() as u64;
+                robust[0] = robust_address;
+                let robust_len = size_of_val(&robust) as u64;
+                for (number, args, expected) in [
+                    (
+                        libc::SYS_set_tid_address,
+                        [(&raw mut clear_tid) as u64, 0, 0, 0, 0, 0],
+                        tid,
+                    ),
+                    (
+                        libc::SYS_set_robust_list,
+                        [robust_address, robust_len, 0, 0, 0, 0],
+                        0,
+                    ),
+                ] {
+                    let mut event = crate::guest::event::SyscallEvent {
+                        number,
+                        args,
+                        instruction_pointer: 0,
+                        result: i64::MIN,
+                        context: 0,
+                        dispatch: crate::guest::event::SyscallDispatch::Trap,
+                        guest_pkru: None,
+                    };
+                    let mut observed = false;
+                    unsafe {
+                        crate::guest::trap_dispatch::forward_nested_tool_syscall(
+                            &mut event,
+                            |_| observed = true,
+                        );
+                    }
+                    assert_eq!(event.result, expected);
+                    assert!(observed);
+                }
+                let mut actual_head = 0_u64;
+                let mut actual_len = 0_u64;
+                assert_eq!(
+                    unsafe {
+                        crate::trap::raw_syscall6(
+                            libc::SYS_get_robust_list,
+                            [
+                                0,
+                                (&raw mut actual_head) as u64,
+                                (&raw mut actual_len) as u64,
+                                0,
+                                0,
+                                0,
+                            ],
+                        )
+                    },
+                    0
+                );
+                assert_eq!((actual_head, actual_len), (robust_address, robust_len));
+                assert_eq!(
+                    unsafe {
+                        crate::trap::raw_syscall6(
+                            libc::SYS_set_robust_list,
+                            [0, robust_len, 0, 0, 0, 0],
+                        )
+                    },
+                    0
+                );
+                assert_eq!(
+                    unsafe { crate::trap::raw_syscall6(libc::SYS_set_tid_address, [0; 6]) },
+                    tid
+                );
+            },
+            0,
         );
     }
     #[test]

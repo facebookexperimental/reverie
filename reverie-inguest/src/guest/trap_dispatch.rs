@@ -282,6 +282,10 @@ impl<S: TrapSeam> SyscallDispatcher for InGuestDispatcher<S> {
 /// syscall that ran, `observe` sees it (LiteInst marks patch sites in a
 /// remapped range stale).
 ///
+/// With a published native private-loader control, Tool calls to
+/// `set_tid_address` and `set_robust_list` also fail with `EPERM`: their
+/// per-thread kernel registrations belong to the guest.
+///
 /// # Safety
 ///
 /// The caller must be entitled to run `event`'s syscall natively with its own
@@ -293,6 +297,16 @@ pub unsafe fn forward_nested_tool_syscall(
     event: &mut SyscallEvent,
     observe: impl FnOnce(&SyscallEvent),
 ) {
+    #[cfg(feature = "exec-private-init")]
+    if super::exec_private::active()
+        && matches!(
+            event.number,
+            libc::SYS_set_tid_address | libc::SYS_set_robust_list
+        )
+    {
+        event.result = -i64::from(libc::EPERM);
+        return;
+    }
     let unsupported_process =
         // AUTONOMOUS-BOT-IMPLEMENTED
         event.number == libc::SYS_clone
