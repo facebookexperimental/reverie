@@ -223,7 +223,8 @@ enum AfterTrap {
 // A trap that the Tool does not observe does not decide the event: the event
 // is left as it was, so it is witnessed only by what does end it, once. That
 // is the stop that cancels it, or, if the guest exits first, the exit.
-// The trap is a guest `int3`, which Reverie consumes without delivering it.
+// The trap is a guest `icebp`, which Reverie consumes without delivering it
+// (a guest's own `int3` is delivered, as on Linux).
 #[test_case(AfterTrap::Syscall, 1; "the syscall after the trap is the one witness")]
 #[test_case(AfterTrap::Exit, 1; "an exit after the trap is the one witness")]
 #[test_case(AfterTrap::ObservedExit, 1; "an observed exit after the trap is the one witness")]
@@ -239,7 +240,7 @@ fn a_disregarded_trap_past_the_target_is_witnessed_once(after: AfterTrap, witnes
             block_timer_signal();
             unsafe { syscall_no_branches(Sysno::clock_getres) };
             do_branches(TIMEOUT_RCBS * 2);
-            unsafe { core::arch::asm!("int3") };
+            unsafe { core::arch::asm!(".byte 0xf1") };
             match after {
                 AfterTrap::Syscall => unsafe { syscall_no_branches(Sysno::getpid) },
                 AfterTrap::Exit => unsafe { syscall_no_branches(Sysno::exit_group) },

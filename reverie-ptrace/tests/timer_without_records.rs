@@ -166,14 +166,14 @@ fn mask_timer_signal(how: libc::c_int) {
     }
 }
 
-/// Makes the request, then runs `rounds` rounds of a loop with an `int3` and
+/// Makes the request, then runs `rounds` rounds of a loop with an `icebp` and
 /// one conditional branch each.
-fn int3_loop(rounds: u64) {
+fn icebp_loop(rounds: u64) {
     unsafe {
         core::arch::asm!(
             "syscall",
             "2:",
-            "int3",
+            ".byte 0xf1",
             "dec {rounds}",
             "jnz 2b",
             rounds = inout(reg) rounds => _,
@@ -186,7 +186,7 @@ fn int3_loop(rounds: u64) {
     }
 }
 
-// A guest `int3` that Reverie consumes one branch after the request, far
+// A guest `icebp` that Reverie consumes one branch after the request, far
 // before the period, leaves the event as it was, and it fires once at its
 // target, or past it only with a witnessed skid overshoot, should the
 // processor raise the notification more than the skid margin late.
@@ -195,7 +195,7 @@ fn a_trap_before_the_period_does_not_cancel_the_timer() {
     ret_without_perf!();
     let (events, witnesses, keeps) = run(|| {
         request();
-        unsafe { core::arch::asm!("int3") };
+        unsafe { core::arch::asm!(".byte 0xf1") };
         do_branches(2 * PERF_RCBS);
     });
     assert_eq!(
@@ -219,7 +219,7 @@ fn a_trap_past_the_target_cancels_the_timer() {
         mask_timer_signal(libc::SIG_BLOCK);
         request();
         do_branches(2 * PERF_RCBS);
-        unsafe { core::arch::asm!("int3") };
+        unsafe { core::arch::asm!(".byte 0xf1") };
         mask_timer_signal(libc::SIG_UNBLOCK);
         do_branches(PERF_RCBS);
     });
@@ -243,7 +243,7 @@ fn a_trap_past_the_period_cancels_the_timer() {
         mask_timer_signal(libc::SIG_BLOCK);
         request();
         do_branches(PERF_RCBS - 2);
-        unsafe { core::arch::asm!("int3") };
+        unsafe { core::arch::asm!(".byte 0xf1") };
         mask_timer_signal(libc::SIG_UNBLOCK);
         do_branches(PERF_RCBS);
     });
@@ -270,7 +270,7 @@ fn a_trap_among_the_single_steps_cancels_the_timer() {
     let (events, witnesses, keeps) = run(|| {
         request();
         do_branches(PERF_RCBS - 2);
-        unsafe { core::arch::asm!("int3") };
+        unsafe { core::arch::asm!(".byte 0xf1") };
         do_branches(PERF_RCBS);
     });
     assert_eq!(keeps, 0, "the trap must not keep the event");
@@ -291,7 +291,7 @@ fn a_trap_among_the_single_steps_cancels_the_timer() {
 #[test]
 fn the_first_trap_near_the_target_cancels_the_timer_in_a_loop_that_traps_in_every_round() {
     ret_without_perf!();
-    let (events, witnesses, keeps) = run(|| int3_loop(2 * PERF_RCBS));
+    let (events, witnesses, keeps) = run(|| icebp_loop(2 * PERF_RCBS));
     // Each trap short of the keep point keeps the event, one per branch from
     // the request's clock on, on every processor in the table.
     assert_eq!(
@@ -335,7 +335,7 @@ fn a_trap_just_past_the_keep_point_cancels_the_timer() {
     let (events, witnesses, keeps) = run(move || {
         request();
         do_branches(branches);
-        unsafe { core::arch::asm!("int3") };
+        unsafe { core::arch::asm!(".byte 0xf1") };
         do_branches(PERF_RCBS);
     });
     assert_eq!(keeps, 0, "the trap must not keep the event");
@@ -357,7 +357,7 @@ fn a_trap_just_short_of_the_keep_point_keeps_the_timer() {
     let (events, witnesses, keeps) = run(move || {
         request();
         do_branches(branches);
-        unsafe { core::arch::asm!("int3") };
+        unsafe { core::arch::asm!(".byte 0xf1") };
         do_branches(2 * PERF_RCBS);
     });
     assert_eq!(

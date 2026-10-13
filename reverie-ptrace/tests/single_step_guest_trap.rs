@@ -8,7 +8,7 @@
 
 //! A precise timer event single-steps the guest to its target, and each step
 //! ends in a SIGTRAP stop. An instruction that raises a SIGTRAP of its own,
-//! such as `int3`, ends in a SIGTRAP stop too. The stepping passes that stop
+//! such as `icebp`, ends in a SIGTRAP stop too. The stepping passes that stop
 //! on to the code that handles SIGTRAPs rather than take it for its step's,
 //! so that a trap that Reverie handles reaches it.
 //!
@@ -31,6 +31,13 @@
 //! Each guest makes the syscall at which the Tool requests the timer, then
 //! runs two loops with one conditional branch per round and the instructions
 //! under test between them.
+
+//!
+//! The traps here are `icebp` and a guest's `tgkill` of SIGTRAP, which Reverie
+//! still neither handles nor delivers. A guest's own `int3` is not one of
+//! them: Reverie delivers its SIGTRAP as Linux does, so it is a signal the
+//! Tool sees (`tests/guest_int3.rs`,
+//! <https://github.com/rrnewton/hermit/issues/1715>).
 
 #![cfg(target_arch = "x86_64")]
 
@@ -170,8 +177,6 @@ impl Tool for PreciseTimerTool {
 enum Between {
     /// A `nop`, which does not trap.
     Nop,
-    /// `int3`, which Linux reports as a SIGTRAP with SI_KERNEL.
-    Int3,
     /// `icebp`, which Linux reports as a SIGTRAP with TRAP_BRKPT when the
     /// processor sets no DR6 status bit for it. An AMD EPYC 9D85 sets none
     /// even when it single-steps the instruction.
@@ -187,8 +192,6 @@ enum Between {
     /// Linux then reports with TRAP_BRKPT as the syscall returns. That is the
     /// step's report, and no trap of the guest's.
     SyscallAfterLoadsOfSs,
-    /// An `int3` just after two loads of SS.
-    Int3AfterLoadsOfSs,
     /// An `icebp` just after two loads of SS, which raises TRAP_BRKPT like
     /// the step of a `syscall` there.
     IcebpAfterLoadsOfSs,
@@ -234,7 +237,6 @@ impl Between {
     fn run(self, before: u64, after: u64) {
         match self {
             Between::Nop => between_loops!(before, after, ["nop"]),
-            Between::Int3 => between_loops!(before, after, ["int3"]),
             // `icebp`, also known as `int1`.
             Between::Icebp => between_loops!(before, after, [".byte 0xf1"]),
             Between::Tgkill => {
@@ -268,12 +270,6 @@ impl Between {
                 ],
                 ss = out(reg) _,
                 getpid = const libc::SYS_getpid
-            ),
-            Between::Int3AfterLoadsOfSs => between_loops!(
-                before,
-                after,
-                ["mov {ss:e}, ss", "mov ss, {ss:e}", "mov ss, {ss:e}", "int3"],
-                ss = out(reg) _
             ),
             Between::IcebpAfterLoadsOfSs => between_loops!(
                 before,
@@ -375,13 +371,10 @@ fn timer_events(between: Between, schedule: Schedule, before: u64) -> Run {
 // artificial signal the steps start at the request, so they run the trap.
 // With a PMU signal they run it as long as the processor's skid stays below
 // the margin; a later signal comes after the trap's stop.
-#[test_case(Between::Int3, LESS_RCBS; "int3, artificial signal")]
-#[test_case(Between::Int3, PERF_RCBS; "int3, perf signal")]
 #[test_case(Between::Icebp, LESS_RCBS; "icebp, artificial signal")]
 #[test_case(Between::Icebp, PERF_RCBS; "icebp, perf signal")]
 #[test_case(Between::Tgkill, LESS_RCBS; "tgkill, artificial signal")]
 #[test_case(Between::Tgkill, PERF_RCBS; "tgkill, perf signal")]
-#[test_case(Between::Int3AfterLoadsOfSs, LESS_RCBS; "int3 after loads of SS")]
 #[test_case(Between::IcebpAfterLoadsOfSs, LESS_RCBS; "icebp after loads of SS")]
 fn a_trap_before_the_target_does_not_cancel_the_timer(between: Between, rcbs: u64) {
     ret_without_perf!();
@@ -402,7 +395,6 @@ fn a_trap_before_the_target_does_not_cancel_the_timer(between: Between, rcbs: u6
 // the target, which is further than any skid margin reaches. The trap's stop
 // therefore comes before the PMU signal on every host, and whether the event
 // fires must not depend on which side of the trap the signal came.
-#[test_case(Between::Int3; "int3")]
 #[test_case(Between::Icebp; "icebp")]
 #[test_case(Between::Tgkill; "tgkill")]
 fn a_trap_before_the_perf_signal_does_not_cancel_the_timer(between: Between) {
@@ -429,7 +421,6 @@ fn the_timer_fires_without_a_trap(between: Between, rcbs: u64) {
 // the guest runs it. Only the artificial signal starts the steps at a known
 // point: a PMU signal more than the skid margin late would come after the
 // trap's stop.
-#[test_case(Between::Int3; "int3")]
 #[test_case(Between::Icebp; "icebp")]
 #[test_case(Between::Tgkill; "tgkill")]
 fn a_trap_past_the_target_does_not_cancel_the_timer(between: Between) {
@@ -448,7 +439,6 @@ fn a_trap_past_the_target_does_not_cancel_the_timer(between: Between) {
 // with the clock unchanged, so the event's instruction pointer is checked
 // too.
 #[test_case(Between::Nop, 2; "nop")]
-#[test_case(Between::Int3, 2; "int3")]
 #[test_case(Between::Icebp, 2; "icebp")]
 #[test_case(Between::Tgkill, 6; "tgkill")]
 fn a_trap_among_the_instructions_past_the_target_counts_once(between: Between, instructions: u64) {
@@ -470,13 +460,13 @@ fn a_trap_among_the_instructions_past_the_target_counts_once(between: Between, i
 }
 
 /// Makes the `clock_getres` at which the Tool requests the timer, then runs
-/// `rounds` rounds of a loop with an `int3` and one conditional branch each.
-fn int3_loop(rounds: u64) {
+/// `rounds` rounds of a loop with an `icebp` and one conditional branch each.
+fn icebp_loop(rounds: u64) {
     unsafe {
         core::arch::asm!(
             "syscall",
             "2:",
-            "int3",
+            ".byte 0xf1",
             "dec {rounds}",
             "jnz 2b",
             rounds = inout(reg) rounds => _,
@@ -497,7 +487,7 @@ fn int3_loop(rounds: u64) {
 #[test_case(PERF_RCBS; "perf signal")]
 fn the_timer_fires_in_a_loop_that_traps_in_every_round(rcbs: u64) {
     ret_without_perf!();
-    let run = run(move || int3_loop(2 * rcbs), Schedule::rcbs(rcbs));
+    let run = run(move || icebp_loop(2 * rcbs), Schedule::rcbs(rcbs));
     run.assert_fired_once_at(rcbs, "at its target inside the loop");
     if rcbs == LESS_RCBS {
         run.assert_kept(0);
@@ -526,8 +516,8 @@ fn the_timer_fires_in_a_loop_that_traps_in_every_round(rcbs: u64) {
 
 /// Makes the `clock_getres` at which the Tool requests the timer, then
 /// `getppids` calls of `getppid`, then runs `rounds` rounds of a loop with an
-/// `int3` and one conditional branch each.
-fn int3_loop_after_getppids(getppids: u64, rounds: u64) {
+/// `icebp` and one conditional branch each.
+fn icebp_loop_after_getppids(getppids: u64, rounds: u64) {
     unsafe {
         core::arch::asm!(
             "syscall",
@@ -537,7 +527,7 @@ fn int3_loop_after_getppids(getppids: u64, rounds: u64) {
             "dec {getppids}",
             "jnz 2b",
             "3:",
-            "int3",
+            ".byte 0xf1",
             "dec {rounds}",
             "jnz 3b",
             getppids = inout(reg) getppids => _,
@@ -560,7 +550,7 @@ fn int3_loop_after_getppids(getppids: u64, rounds: u64) {
 fn an_observed_stop_cancels_the_timer_in_a_loop_that_traps_in_every_round(getppids: u64) {
     ret_without_perf!();
     let run = run(
-        move || int3_loop_after_getppids(getppids, 2 * PERF_RCBS),
+        move || icebp_loop_after_getppids(getppids, 2 * PERF_RCBS),
         Schedule::rcbs(PERF_RCBS),
     );
     assert_eq!(
@@ -571,6 +561,53 @@ fn an_observed_stop_cancels_the_timer_in_a_loop_that_traps_in_every_round(getppi
     assert_eq!(
         run.witnesses, 0,
         "the event was cancelled before it was due"
+    );
+    run.assert_kept(0);
+}
+
+extern "C" fn ignore_trap(_signum: libc::c_int) {}
+
+/// Installs a SIGTRAP handler that returns at once, so a delivered `int3`
+/// does not end the guest.
+fn catch_sigtrap() {
+    // SAFETY: installs a handler that does nothing.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = ignore_trap as *const () as usize;
+        libc::sigemptyset(&mut action.sa_mask);
+        assert_eq!(
+            libc::sigaction(libc::SIGTRAP, &action, std::ptr::null_mut()),
+            0
+        );
+    }
+}
+
+/// Makes the `clock_getres` at which the Tool requests the timer, then runs
+/// `before` rounds of a loop with one conditional branch each, an `int3`, and
+/// `after` more rounds.
+fn int3_between_loops(before: u64, after: u64) {
+    between_loops!(before, after, ["int3"]);
+}
+
+// A guest's own `int3` is delivered, as on Linux (`tests/guest_int3.rs`), so
+// its stop is a signal the Tool observes rather than a trap Reverie
+// disregards. Whether it comes among the steps toward the target or long
+// before the PMU signal, it decides the event the way an observed stop does.
+#[test_case(LESS_RCBS, LESS_RCBS - 1; "among the steps")]
+#[test_case(PERF_RCBS, 1; "before the perf signal")]
+fn a_delivered_int3_is_an_observed_stop(rcbs: u64, before: u64) {
+    ret_without_perf!();
+    let run = run(
+        move || {
+            catch_sigtrap();
+            int3_between_loops(before, 2 * rcbs - before);
+        },
+        Schedule::rcbs(rcbs),
+    );
+    assert_eq!(
+        run.clocks,
+        Vec::<u64>::new(),
+        "an observed stop before the target cancels the event"
     );
     run.assert_kept(0);
 }

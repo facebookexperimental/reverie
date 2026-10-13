@@ -743,6 +743,46 @@ fn is_private_seccomp_trap(task: &Stopped, after_syscall: u64) -> Result<bool, T
         && unsafe { siginfo.si_addr() } as u64 == after_syscall)
 }
 
+/// The `si_code` Linux gives the SIGTRAP of a `#BP` (`int3`) that no ptrace
+/// mechanism raised: `do_int3_user` sends it with `force_sig`, which stamps
+/// `SI_KERNEL`. `libc` does not export it.
+const SI_KERNEL: libc::c_int = 0x80;
+
+/// The one-byte `int3` opcode.
+const INT3: u8 = 0xcc;
+
+/// `int $3`, the two-byte encoding of the same trap, which Linux reports the
+/// same way.
+const INT_3: [u8; 2] = [0xcd, 0x03];
+
+/// Whether the SIGTRAP `task` stopped with is the guest's own `int3`, retired
+/// just before `rip`. Two observations must agree: the kernel's `si_code` is
+/// `SI_KERNEL`, which no single step (`TRAP_TRACE`), ptrace breakpoint report
+/// (`TRAP_BRKPT`, also `icebp`'s) or sender (`SI_USER`, `SI_TKILL`, `SI_QUEUE`)
+/// carries; and the instruction that ends at `rip` is `int3` (`0xcc`) or
+/// `int $3` (`0xcd 0x03`). Bytes that cannot be read are not evidence, and the
+/// trap stays undelivered; so does an `int3` another thread overwrote or
+/// unmapped before this read. The caller excludes the `int3`s Reverie
+/// planted itself.
+fn is_guest_int3_trap(task: &Stopped, rip: u64) -> Result<bool, TraceError> {
+    if !cfg!(target_arch = "x86_64") {
+        return Ok(false);
+    }
+    let siginfo = task.getsiginfo()?;
+    if siginfo.si_signo != libc::SIGTRAP || siginfo.si_code != SI_KERNEL {
+        return Ok(false);
+    }
+    let byte_before = |distance: u64| -> Option<u8> {
+        let site = rip.checked_sub(distance)?;
+        task.read_value(Addr::<u8>::from_raw(site as usize)?).ok()
+    };
+    Ok(match byte_before(1) {
+        Some(INT3) => true,
+        Some(last) if last == INT_3[1] => byte_before(2) == Some(INT_3[0]),
+        _ => false,
+    })
+}
+
 /// Whether `nr` installs a temporary signal mask that the kernel restores only
 /// after signal handling (`TIF_RESTORE_SIGMASK`). A ptrace mask write discards
 /// that pending restore, so a signal stopping such a syscall must not be
@@ -4373,6 +4413,33 @@ impl<L: Tool + 'static> TracedTask<L> {
             HandleSignalResult::SignalSuppressed(
                 running.next_state_with_owner(&self.ptracer_waits).await?,
             )
+        } else if is_guest_int3_trap(&task, regs.ip())? {
+            // The guest's own `int3`, at a site that holds no breakpoint of
+            // Reverie's (the first arm). Linux delivers its SIGTRAP: a handler
+            // runs, or the default action kills the guest with a core. Before,
+            // it fell to the arm below, and the guest ran past its own
+            // breakpoint (https://github.com/rrnewton/hermit/issues/1715).
+            if self.attached_by_gdb {
+                // Under a debugger, as natively, the trap stops the guest and
+                // is reported to GDB, whose resume decides whether the guest
+                // gets the signal (`continue` drops it; `signal SIGTRAP`
+                // passes it on).
+                self.notify_gdb_stop(StopReason::stopped(
+                    task.pid(),
+                    self.pid(),
+                    StopEvent::Signal(Signal::SIGTRAP),
+                    regs.into(),
+                ))
+                .await?;
+                let running = self
+                    .await_gdb_resume(task, ExpectedGdbResume::Resume)
+                    .await?;
+                HandleSignalResult::SignalSuppressed(
+                    running.next_state_with_owner(&self.ptracer_waits).await?,
+                )
+            } else {
+                HandleSignalResult::SignalToDeliver(task, Signal::SIGTRAP.into())
+            }
         } else {
             UNCLAIMED_SIGTRAPS_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
             // The trap is not delivered and makes no Tool callback, so it

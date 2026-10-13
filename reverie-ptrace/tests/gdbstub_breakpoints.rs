@@ -320,6 +320,17 @@ where
     F: FnOnce(Remote) -> Fut,
     Fut: Future<Output = ()>,
 {
+    let status = debug_to_end(path, name, client).await;
+    assert_eq!(status, ExitStatus::Exited(0));
+}
+
+/// Runs `path` under Reverie's GDB server, with `client` as GDB, and returns
+/// how the guest ended.
+async fn debug_to_end<F, Fut>(path: &Path, name: &str, client: F) -> ExitStatus
+where
+    F: FnOnce(Remote) -> Fut,
+    Fut: Future<Output = ()>,
+{
     let socket = std::env::temp_dir().join(format!(
         "reverie-gdbstub-{name}-{}.sock",
         std::process::id()
@@ -347,7 +358,7 @@ where
     .await
     .expect("the guest and the GDB session finish");
     let _ = std::fs::remove_file(&socket);
-    assert_eq!(status, ExitStatus::Exited(0));
+    status
 }
 
 /// GDB's sequence for two breakpoints 6 bytes apart: insert both in ascending
@@ -493,4 +504,68 @@ async fn reinserting_through_another_thread_writes_the_breakpoint_back() {
         assert_exited_zero(&remote.resume().await, "after removing the breakpoint");
     })
     .await;
+}
+
+/// The guest that executes its own `int3`, and the address just past it.
+struct Int3Guest {
+    path: PathBuf,
+    /// `reverie_after_guest_int3`, where the guest stops after the trap.
+    after: u64,
+}
+
+fn int3_guest() -> &'static Int3Guest {
+    static GUEST: LazyLock<Int3Guest> = LazyLock::new(|| {
+        let (path, addresses) =
+            build_guest("gdbstub_guest_int3", &[], &["reverie_after_guest_int3"]);
+        Int3Guest {
+            path,
+            after: addresses[0],
+        }
+    });
+    &GUEST
+}
+
+/// A guest's own `int3` stops it and is reported to GDB as a SIGTRAP, not as
+/// a breakpoint of GDB's, with %rip past the instruction, as natively. GDB's
+/// `continue` drops the signal, so the guest runs on and exits 0. Before,
+/// Reverie resumed the guest without reporting the trap
+/// (https://github.com/rrnewton/hermit/issues/1715).
+#[tokio::test]
+async fn a_guest_int3_stops_gdb_and_continue_drops_its_signal() {
+    let Int3Guest { path, after } = int3_guest();
+    debug(path, "guest-int3-continue", |mut remote| async move {
+        let stop = remote.resume().await;
+        assert!(
+            !stop.contains("swbreak"),
+            "a guest int3 is not a GDB breakpoint: {stop:?}"
+        );
+        assert_eq!(stop_rip(&stop), *after, "stopped away from the int3");
+        assert_exited_zero(&remote.resume().await, "after continuing past the int3");
+    })
+    .await;
+}
+
+/// GDB's `signal SIGTRAP` passes the guest's trap on, and its default action
+/// kills the guest.
+#[tokio::test]
+async fn a_guest_int3_that_gdb_passes_on_kills_the_guest() {
+    let Int3Guest { path, after } = int3_guest();
+    let status = debug_to_end(path, "guest-int3-signal", |mut remote| async move {
+        let stop = remote.resume().await;
+        assert_eq!(stop_rip(&stop), *after, "stopped away from the int3");
+        let thread = remote.thread.clone();
+        let end = remote.request(&format!("vCont;C05:{thread}")).await;
+        // The server reports the death by signal with an `X` packet, whose
+        // signal byte carries the core-dump bit when a core was dumped
+        // (`X85`); the exit status below names the signal.
+        assert!(
+            end.starts_with('X'),
+            "expected death by a signal, got {end:?}"
+        );
+    })
+    .await;
+    assert!(
+        matches!(status, ExitStatus::Signaled(reverie::Signal::SIGTRAP, _)),
+        "{status:?}"
+    );
 }
