@@ -17,6 +17,37 @@ backend-specific syscall list
 [`Guest`][guest-trait], [`GlobalRPC`][global-rpc],
 [`Subscription`][subscription]).
 
+## Status, 2026-10-13
+
+The mechanism matrix and its source links were written against Reverie
+`2f812840` (2026-08-01), and the links still point at that commit. Since then:
+
+- `reverie-preload` was renamed `reverie-inguest` (`e1fbd91c`, 2026-10-05).
+  Where this document says "preload", it means that crate.
+- LiteInst's ptrace-hosted hybrid ("Mode B") was deleted (`fd5b962a`).
+  LiteInst now runs only in the guest.
+- Hermit has a seventh backend, **in-guest-trap**: LiteInst with syscall-site
+  patching off (`REVERIE_LITEINST_SITE_PATCHING=0`). Every syscall reaches
+  the tool through the shared seccomp/`SIGSYS` trap. It is the reference for
+  the patching backends: a patcher may change how a syscall reaches the
+  dispatcher, never what the dispatcher does with it. See its row in the
+  matrix below.
+- The KVM row describes the 2026-08 static-ELF prototype. `reverie-kvm` has
+  grown since; its `/proc` handling is tracked in
+  https://github.com/rrnewton/hermit/issues/4213.
+- The closing recommendation ("do not merge the rewriters, completeness
+  traps, or lifecycle controllers") is superseded by Hermit's backend
+  consolidation:
+  - every in-guest backend uses one runtime in `reverie-inguest`;
+  - every patcher (LiteInst at run time, SaBRe at load time, e9patch ahead of
+    time) leaves a missed site on the shared `SIGSYS` trap;
+  - the per-backend `Guest` implementations, RPC clients and signal policies
+    are to be removed.
+
+  See "Consolidation (October 2026)" in Hermit's
+  [docs/ARCHITECTURE.md](https://github.com/rrnewton/hermit/blob/main/docs/ARCHITECTURE.md),
+  and https://github.com/rrnewton/hermit/issues/3520.
+
 This guide keeps three independent questions separate:
 
 1. **Hooking:** what makes an event leave normal guest execution and reach a
@@ -48,11 +79,12 @@ that the latter paths are simulations.
 | --- | --- | --- | --- |
 | **ptrace** | No guest code patch. A subscription-derived seccomp filter returns `TRACE` for selected syscalls, producing ptrace stops ([filter][ptrace-filter], [dispatch][ptrace-dispatch]). | Ptrace owns the subscribed boundary. Unsubscribed syscalls are deliberately allowed, while injected syscalls use a private allowed gate ([filter][ptrace-filter]). | Process/thread tool state and the singleton are in the tracer. `GlobalRPC` becomes a local call tagged with the tracee TID ([RPC implementation][ptrace-rpc]). |
 | **KVM** | No host-ELF patching. The prototype guest syscall trampoline emits hypercall 12 with a syscall frame; a KVM exit drives `Tool::handle_syscall_event` for subscribed calls ([transport ABI][kvm-transport], [dispatch loop][kvm-dispatch]). | The static-ELF personality defines the guest syscall ABI, so the hypercall is the boundary rather than a coverage backstop. This is currently a specialized static-ELF runner, not a general Linux guest kernel ([static-ELF runner][kvm-static]). | `KvmGuest` holds real per-thread `T::ThreadState`; children get their own tool/thread state while sharing one `Arc<GlobalState>`. RPC calls `receive_rpc` directly with the issuing TID ([state setup][kvm-static], [KVM RPC][kvm-rpc]). |
-| **DBT / DBT** | No persistent ELF patch. DynamoRIO builds translated basic blocks, registers syscall callbacks, and replaces CPUID/RDTSC in its code cache ([event registration][dbt-events], [syscall callback][dbt-syscall], [instruction rewrites][dbt-instructions]). | DynamoRIO's translated execution and pre-syscall callback form the interception boundary. This is not the shared seccomp/SIGSYS completeness trap used by preload backends ([event registration][dbt-events]). | Tool code runs in the DynamoRIO client. Coordinated launches use one `RpcServer`; the guest uses a blocking, wire-compatible client and reconnects after fork. Without a coordinator, DBT falls back to an in-process singleton ([DBT coordinator][dbt-coordinator], [DBT RPC selection][dbt-rpc], [DBT wire client][dbt-wire]). |
+| **DBT (DynamoRIO)** | No persistent ELF patch. DynamoRIO builds translated basic blocks, registers syscall callbacks, and replaces CPUID/RDTSC in its code cache ([event registration][dbt-events], [syscall callback][dbt-syscall], [instruction rewrites][dbt-instructions]). | DynamoRIO's translated execution and pre-syscall callback form the interception boundary. This is not the shared seccomp/SIGSYS completeness trap used by preload backends ([event registration][dbt-events]). | Tool code runs in the DynamoRIO client. Coordinated launches use one `RpcServer`; the guest uses a blocking, wire-compatible client and reconnects after fork. Without a coordinator, DBT falls back to an in-process singleton ([DBT coordinator][dbt-coordinator], [DBT RPC selection][dbt-rpc], [DBT wire client][dbt-wire]). |
 | **SaBRe** | SaBRe rewrites mapped executable `.text` at load time. It byte-scans for candidates, decodes candidate functions, relocates safe neighboring instructions into nearby scratch space, and installs a five-byte jump to the plugin handler ([range scan][sabre-scan], [jump trampoline][sabre-jump]). It also supports named-function and vDSO detours through the plugin API ([plugin API][sabre-api]). | If a known site cannot fit a jump, SaBRe writes a reserved instruction and handles the resulting `SIGILL` ([UD fallback][sabre-ud], [SIGILL handler][sabre-sigill]). The current Reverie host launch path itself installs no independent seccomp completeness filter; the loader only installs that SIGILL handler ([host launch][sabre-host], [loader setup][sabre-loader]). Therefore an entirely missed syscall site is not proved fail-closed by the current integration. | The plugin runs the tool in guest context. The remote adapter keeps per-thread state and one protected blocking RPC client per thread; a coordinator serves the shared singleton ([remote state][sabre-remote-state], [child state][sabre-child-state], [coordinator][sabre-coordinator]). Local adapter modes also exist, so SaBRe RPC is a mode choice rather than part of the rewriter itself ([adapter modes][sabre-adapter]). |
 | **e9patch, generic `Backend`** | `e9tool` rewrites every recovered syscall in the root ELF ahead of time. Preparation rejects partial coverage and signal-based B0 sites ([rewrite invocation][e9-rewrite]). The replacement frame emits a validated `SIGTRAP` to the ptracer ([hybrid setup][e9-hybrid]). | The ptracer remains attached for loader/shared-library syscalls, lifecycle, signals, timers, and full `Guest` semantics. Thus real e9patch sites still pay a ptrace stop, and residual sites remain ptrace-controlled ([hybrid contract][e9-hybrid]). | The arbitrary tool remains ptrace-hosted, so state and RPC follow the ptrace model ([generic run][e9-generic-run]). |
 | **e9patch, direct opt-in** | The same AOT frame calls the shared dispatcher directly in ordinary guest context ([AOT bridge][e9-aot]). | The shared preload seccomp/SIGSYS runtime traps residual post-constructor syscalls and enforces its documented fail-closed guards. Its stated boundary excludes static/`AT_SECURE` guests, early loader calls, and exec ([preload boundary][preload-lib], [trap flow][preload-trap]). | A tool-specific preload hosts `T`; a UDS `RpcServer` owns the singleton and the guest uses the preload coordinator client ([direct launch][e9-direct], [e9 RPC][e9-rpc]). Direct lifecycle coverage is currently single-process and single-thread, so this path does not replace the generic backend yet ([direct boundary][e9-direct-boundary]). |
 | **LiteInst, direct `Backend`** (a.k.a. "Mode A": in-guest, no per-syscall ptrace round-trip) | The first execution of a syscall site reaches seccomp/SIGSYS. The dispatcher installs a replace-first LiteInst hook, then changes the saved signal-context RIP to its trampoline. The first and subsequent calls therefore enter the same normal-context tool callback ([dispatcher][lite-dispatch], [patch install][lite-patch]). | The shared trap catches first use and residual sites. An unpatchable generic-tool site fails with `EOPNOTSUPP` instead of running arbitrary Rust in signal context ([LiteInst fallback][lite-fallback], [shared trap][preload-trap]). | A tool DSO hosts process/thread state. `CoordinatorRpc` sends typed requests to the launcher's shared `RpcServer` ([tool host][lite-tool-host], [LiteInst RPC][lite-rpc], [launcher][lite-launcher]). The current generic backend supports one process and one thread ([LiteInst boundaries][lite-readme]). |
+| **in-guest-trap** (Hermit backend; added after `2f812840`) | None: no syscall site is rewritten. The shared seccomp filter turns every syscall into `SIGSYS` (`REVERIE_LITEINST_SITE_PATCHING=0`). | The shared `reverie-inguest` trap catches every syscall, so there is no missed-site case to back up. | As LiteInst: a tool DSO in the guest hosts process and thread state, and the launcher's `RpcServer` owns the singleton. |
 
 ## Shared components
 
