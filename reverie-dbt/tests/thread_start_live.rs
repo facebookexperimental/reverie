@@ -157,3 +157,46 @@ fn a_stalled_clone_fails_with_an_admission_diagnostic() {
         .expect("positive numeric host TID");
     assert!(host_tid > 0, "{diagnostic}");
 }
+
+/// The TID words Linux stores for CLONE_PARENT_SETTID (a process clone, and a
+/// thread clone as pthread_create makes) and CLONE_CHILD_SETTID (a process
+/// clone, as fork makes), and both words of a clone3 given distinct ones, hold
+/// the virtual TID that clone returned and that the child's gettid or getpid
+/// reports, not the host TID the kernel wrote
+/// (https://github.com/rrnewton/hermit/issues/3147).
+#[test]
+#[ignore = "requires a built DynamoRIO and the reverie-dbt native client; run explicitly with --ignored"]
+fn clone_settid_words_hold_the_virtual_tid() {
+    let output = run_fixture("settid_virtual_identity", "-test-wait-for-background");
+    assert!(output.status.success(), "guest failed: {output:?}");
+    assert_eq!(
+        output.stdout,
+        b"settid parent=1 thread=1 child=1 clone3=1\n"
+    );
+}
+
+/// A robust mutex whose owner dies returns EOWNERDEAD to the next locker, when
+/// the owner was a forked child's main thread, an exiting thread, a thread that
+/// exit_group killed, a process that exec'd, or a thread that a sibling's exec
+/// killed, and a locker already asleep on it is woken. A failed exec leaves
+/// the held mutexes unlockable, and the walk stops at a misaligned owner word
+/// as Linux's does. The owner words name virtual TIDs (glibc
+/// writes them from its pthread struct, see
+/// `clone_settid_words_hold_the_virtual_tid`), and Linux marks only words
+/// naming the dying thread's host TID, so the client rewrites them just before
+/// the native exit or exec, and back if the exec fails (Claude reviews of
+/// https://github.com/rrnewton/reverie/pull/1020). A SIGKILLed owner runs no
+/// client code, so its mutex is not marked: the pinned ETIMEDOUT flips when
+/// https://github.com/rrnewton/hermit/issues/4239 is fixed.
+#[test]
+#[ignore = "requires a built DynamoRIO and the reverie-dbt native client; run explicitly with --ignored"]
+fn a_dead_robust_mutex_owner_is_marked_owner_dead() {
+    let output = run_fixture("robust_owner_death", "-test-wait-for-background");
+    assert!(output.status.success(), "guest failed: {output:?}");
+    assert_eq!(
+        output.stdout,
+        b"robust fork_child=1 thread=1 exit_group_thread=1 waited_thread=1 \
+          exec_child=1 exec_killed_thread=1 failed_exec=1 sigkill=ETIMEDOUT \
+          walk_stop=1\n"
+    );
+}

@@ -9,6 +9,7 @@
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/futex.h>
 #include <linux/sched.h>
 #include <poll.h>
 #include <signal.h>
@@ -166,6 +167,16 @@ typedef struct {
   uint64_t syscall_interruption_generation;
   process_id_t syscall_interruption_pid;
   thread_id_t syscall_interruption_tid;
+  // Where the pending clone asked Linux to store the new child's TID: in the
+  // parent for CLONE_PARENT_SETTID, in the child for CLONE_CHILD_SETTID
+  // (`clone_settid_addresses`). Appended so the prefix the Rust side mirrors
+  // is unchanged.
+  uint64_t pending_clone_parent_tid;
+  uint64_t pending_clone_child_tid;
+  // Set once this thread has rewritten its process's robust owner words to
+  // host TIDs before an exec or exit_group, so a failed exec restores them
+  // (`translate_process_robust_lists`).
+  bool process_robust_lists_translated;
 } prototype_counters_t;
 
 #define VIRTUAL_ROOT_PID INT32_C(3)
@@ -502,7 +513,12 @@ static void mark_backend_failure(void);
 static void complete_runtime_thread_exit(
     prototype_counters_t* counters,
     void* drcontext,
-    bool explicit_exit);
+    bool explicit_exit,
+    bool exit_group);
+static void translate_process_robust_lists(
+    void* drcontext,
+    prototype_counters_t* counters,
+    bool restore);
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-84): Review isolation-aware process-group termination.
 static process_id_t runtime_process_group;
@@ -2785,6 +2801,41 @@ static bool process_clone_metadata(
   }
 }
 
+/* The addresses where Linux stores the new child's TID: `parent_tid`, in the
+ * parent, for CLONE_PARENT_SETTID, and `child_tid`, in the child, for
+ * CLONE_CHILD_SETTID. They are clone's third and fourth arguments, or
+ * clone3's parent_tid and child_tid fields; fork and vfork take neither. */
+static void clone_settid_addresses(
+    int sysnum,
+    const uint64_t* args,
+    uint64_t* parent_tid,
+    uint64_t* child_tid) {
+  *parent_tid = 0;
+  *child_tid = 0;
+  switch (sysnum) {
+    case SYS_clone:
+      *parent_tid = args[2];
+      *child_tid = args[3];
+      return;
+#ifdef SYS_clone3
+    case SYS_clone3: {
+      uint64_t clone3_args[4];
+      if (args[0] != 0 && args[1] >= sizeof(clone3_args) &&
+          read_app(
+              (const void*)(uintptr_t)args[0],
+              clone3_args,
+              sizeof(clone3_args))) {
+        *child_tid = clone3_args[2];
+        *parent_tid = clone3_args[3];
+      }
+      return;
+    }
+#endif
+    default:
+      return;
+  }
+}
+
 static bool is_clone_syscall(int sysnum) {
   return sysnum == SYS_fork || sysnum == SYS_vfork || sysnum == SYS_clone ||
       sysnum == SYS_clone3;
@@ -2848,6 +2899,11 @@ static bool prepare_clone_identity(
     acquire_clone_identity_handoff();
   counters->pending_virtual_child = allocate_virtual_identity();
   counters->pending_clone_flags = flags;
+  clone_settid_addresses(
+      sysnum,
+      args,
+      &counters->pending_clone_parent_tid,
+      &counters->pending_clone_child_tid);
   if (origin == CLONE_SYSCALL_ORIGINAL && (flags & CLONE_THREAD) == 0) {
     uint64_t child_tid_addr = 0;
     int32_t exit_signal = -1;
@@ -2906,6 +2962,8 @@ static int32_t complete_clone_identity(
     int64_t result) {
   int32_t virtual_child = counters->pending_virtual_child;
   uint64_t flags = counters->pending_clone_flags;
+  uint64_t parent_tid = counters->pending_clone_parent_tid;
+  uint64_t child_tid = counters->pending_clone_child_tid;
   if (virtual_child == 0)
     return 0;
 
@@ -2967,11 +3025,33 @@ static int32_t complete_clone_identity(
      * authoritative when Linux reuses a host TID whose old mapping is still in
      * the shared table. */
     remember_virtual_identity((int32_t)result, virtual_child);
+    /* Linux stores at parent_tid the same TID clone returns. The kernel stored
+     * the host TID, and the guest gets virtual_child as the result, so store
+     * that instead: glibc's pthread struct keeps this word as the thread's TID
+     * and pthread_join waits on it
+     * (https://github.com/rrnewton/hermit/issues/3147).
+     * The kernel wrote it during the call, in the parent, so nothing can
+     * overwrite it later. Linux ignores a failed store, and so does this. */
+    if ((flags & CLONE_PARENT_SETTID) != 0 && parent_tid != 0)
+      write_app(
+          (void*)(uintptr_t)parent_tid, &virtual_child, sizeof(virtual_child));
   } else if (result == 0) {
     int32_t host_tid = (int32_t)dr_get_thread_id(dr_get_current_drcontext());
     if ((flags & CLONE_THREAD) == 0)
       evidence_initialize_fork_child_thread(counters);
     remember_virtual_identity(host_tid, virtual_child);
+    /* CLONE_CHILD_SETTID: the kernel stored the child's host TID at child_tid
+     * in the child's memory before the child ran; store its virtual TID, the
+     * one gettid returns. glibc's fork passes its own TID word here.
+     * Known limits, none of which glibc or musl produce: a thread's child never
+     * reaches this point (its state starts empty in thread_init), and neither
+     * does a CLONE_VM process child, so with CLONE_CHILD_SETTID either keeps
+     * the host TID there. And a vfork-style child, which runs before its
+     * parent's clone returns, sees the host TID at parent_tid until the parent
+     * stores the virtual one. */
+    if ((flags & CLONE_CHILD_SETTID) != 0 && child_tid != 0)
+      write_app(
+          (void*)(uintptr_t)child_tid, &virtual_child, sizeof(virtual_child));
     if ((flags & CLONE_THREAD) != 0) {
       counters->virtual_tid = virtual_child;
     } else {
@@ -3003,6 +3083,8 @@ static int32_t complete_clone_identity(
     release_clone_identity_handoff(virtual_child);
   }
   counters->pending_virtual_child = 0;
+  counters->pending_clone_parent_tid = 0;
+  counters->pending_clone_child_tid = 0;
   if (!(result == 0 && (flags & CLONE_THREAD) == 0 && runtime_owner_pid != 0 &&
         dr_get_process_id() != runtime_owner_pid &&
         runtime_uses_external_global()))
@@ -3373,13 +3455,21 @@ invoke_syscall(uintptr_t context, int64_t sysnum, const uint64_t* args) {
       counters, (int)sysnum, translated, CLONE_SYSCALL_INJECTED);
   if (preserve_internal_descriptors(context, (int)sysnum, translated, &result))
     return result;
-  if (is_exec_syscall((int)sysnum))
+  if (is_exec_syscall((int)sysnum)) {
     require_evidence_flush(EVIDENCE_FRAME_EXEC);
+    translate_process_robust_lists((void*)context, counters, false);
+  }
   if (sysnum == SYS_exit || sysnum == SYS_exit_group)
-    complete_runtime_thread_exit(counters, (void*)context, sysnum == SYS_exit);
+    complete_runtime_thread_exit(
+        counters,
+        (void*)context,
+        sysnum == SYS_exit,
+        sysnum == SYS_exit_group);
   result = invoke_raw_syscall(context, sysnum, translated);
-  if (is_exec_syscall((int)sysnum) && result < 0)
+  if (is_exec_syscall((int)sysnum) && result < 0) {
     require_evidence_flush(EVIDENCE_FRAME_EXEC_CANCEL);
+    translate_process_robust_lists((void*)context, counters, true);
+  }
   if (reject_opened_proc_mem(context, (int)sysnum, result))
     return -EPERM;
   if (is_clone) {
@@ -4463,6 +4553,8 @@ static void post_syscall(void* drcontext, int sysnum) {
 
   if (is_exec_syscall(sysnum) && evidence_is_enabled())
     require_evidence_flush(EVIDENCE_FRAME_EXEC_CANCEL);
+  if (is_exec_syscall(sysnum))
+    translate_process_robust_lists(drcontext, counters, true);
 
   if (has_copied_runtime() &&
       (!runtime_uses_external_global() || is_copied_vfork_process()))
@@ -5001,7 +5093,10 @@ static bool pre_syscall(void* drcontext, int sysnum) {
       for (int i = 0; i != 6; ++i)
         dr_syscall_set_param(drcontext, i, (reg_t)event->deferred_args[i]);
       complete_runtime_thread_exit(
-          counters, drcontext, event->deferred_sysnum == SYS_exit);
+          counters,
+          drcontext,
+          event->deferred_sysnum == SYS_exit,
+          event->deferred_sysnum == SYS_exit_group);
       return true;
     }
     dr_syscall_set_result(drcontext, 0);
@@ -5195,11 +5290,14 @@ static bool pre_syscall(void* drcontext, int sysnum) {
       return false;
     }
     if (sysnum == SYS_exit || sysnum == SYS_exit_group)
-      complete_runtime_thread_exit(counters, drcontext, sysnum == SYS_exit);
+      complete_runtime_thread_exit(
+          counters, drcontext, sysnum == SYS_exit, sysnum == SYS_exit_group);
     bool execute = prepare_original_identity_syscall(
         drcontext, counters, sysnum, args, false);
-    if (execute && is_exec_syscall(sysnum))
+    if (execute && is_exec_syscall(sysnum)) {
       require_evidence_flush(EVIDENCE_FRAME_EXEC);
+      translate_process_robust_lists(drcontext, counters, false);
+    }
     return execute;
   }
   while (!reverie_dbt_runtime_ready(
@@ -5314,11 +5412,14 @@ static bool pre_syscall(void* drcontext, int sysnum) {
       return false;
     }
     if (sysnum == SYS_exit || sysnum == SYS_exit_group)
-      complete_runtime_thread_exit(counters, drcontext, sysnum == SYS_exit);
+      complete_runtime_thread_exit(
+          counters, drcontext, sysnum == SYS_exit, sysnum == SYS_exit_group);
     bool execute = prepare_original_identity_syscall(
         drcontext, counters, sysnum, args, true);
-    if (execute && is_exec_syscall(sysnum))
+    if (execute && is_exec_syscall(sysnum)) {
       require_evidence_flush(EVIDENCE_FRAME_EXEC);
+      translate_process_robust_lists(drcontext, counters, false);
+    }
     return execute;
   }
 
@@ -5334,11 +5435,14 @@ static bool pre_syscall(void* drcontext, int sysnum) {
     return false;
   }
   if (sysnum == SYS_exit || sysnum == SYS_exit_group)
-    complete_runtime_thread_exit(counters, drcontext, sysnum == SYS_exit);
+    complete_runtime_thread_exit(
+        counters, drcontext, sysnum == SYS_exit, sysnum == SYS_exit_group);
   bool execute = prepare_original_identity_syscall(
       drcontext, counters, sysnum, args, false);
-  if (execute && is_exec_syscall(sysnum))
+  if (execute && is_exec_syscall(sysnum)) {
     require_evidence_flush(EVIDENCE_FRAME_EXEC);
+    translate_process_robust_lists(drcontext, counters, false);
+  }
   return execute;
 }
 
@@ -5431,14 +5535,187 @@ static void thread_init(void* drcontext) {
   set_pending_thread_start(counters, (uint64_t)pending_thread_start);
 }
 
+/* Linux's robust-list ABI (include/uapi/linux/futex.h). */
+typedef struct dbt_robust_list {
+  struct dbt_robust_list* next;
+} dbt_robust_list_t;
+
+typedef struct {
+  dbt_robust_list_t list;
+  long futex_offset;
+  dbt_robust_list_t* list_op_pending;
+} dbt_robust_list_head_t;
+
+/* The bound Linux puts on a robust-list walk (ROBUST_LIST_LIMIT). */
+#define DBT_ROBUST_LIST_LIMIT 2048
+
+/* Rewrites the robust futex word at `word_address` to name `to_tid` when it
+ * names `from_tid`, keeping its other bits. The store is a compare-and-swap,
+ * retried as Linux's handle_futex_death retries its own, so a FUTEX_WAITERS
+ * bit that a concurrent locker sets between the read and the store is kept,
+ * and Linux's walk still wakes that locker. Returns false where
+ * handle_futex_death ends the walk: a misaligned, unreadable or unwritable
+ * word. */
+static bool translate_robust_owner(
+    void* drcontext,
+    uintptr_t word_address,
+    int32_t from_tid,
+    int32_t to_tid) {
+  uint32_t* word = (uint32_t*)word_address;
+  uint32_t value;
+  if (word_address % sizeof(*word) != 0 ||
+      !read_app(word, &value, sizeof(value)))
+    return false;
+  for (;;) {
+    if ((value & FUTEX_TID_MASK) != (uint32_t)from_tid)
+      return true;
+    uint32_t translated = (value & ~(uint32_t)FUTEX_TID_MASK) |
+        ((uint32_t)to_tid & FUTEX_TID_MASK);
+    bool swapped = false;
+    volatile bool faulted = false;
+    DR_TRY_EXCEPT(
+        drcontext,
+        {
+          swapped = __atomic_compare_exchange_n(
+              word,
+              &value,
+              translated,
+              false,
+              __ATOMIC_SEQ_CST,
+              __ATOMIC_SEQ_CST);
+        },
+        { faulted = true; });
+    if (faulted)
+      return false;
+    if (swapped)
+      return true;
+  }
+}
+
+/* Walks the robust list of `list_tid`, a host TID in this process, as Linux's
+ * exit_robust_list walks it: in its order and within its bound, ending where
+ * it ends, the pending slot last. Rewrites each owner word naming `from_tid`
+ * to name `to_tid`. */
+static void translate_robust_list(
+    void* drcontext,
+    int32_t list_tid,
+    int32_t from_tid,
+    int32_t to_tid) {
+  uintptr_t head_address = 0;
+  size_t length = 0;
+  dbt_robust_list_head_t head;
+  if (from_tid <= 0 || to_tid <= 0 || from_tid == to_tid)
+    return;
+  if (syscall(SYS_get_robust_list, list_tid, &head_address, &length) != 0 ||
+      head_address == 0 || length != sizeof(head) ||
+      !read_app((const void*)head_address, &head, sizeof(head)))
+    return;
+  uintptr_t offset = (uintptr_t)head.futex_offset;
+  uintptr_t pending = (uintptr_t)head.list_op_pending & ~(uintptr_t)1;
+  uintptr_t entry = (uintptr_t)head.list.next & ~(uintptr_t)1;
+  unsigned limit = DBT_ROBUST_LIST_LIMIT;
+  while (entry != head_address) {
+    uintptr_t next = 0;
+    bool fetched = read_app((const void*)entry, &next, sizeof(next));
+    if (entry != pending &&
+        !translate_robust_owner(drcontext, entry + offset, from_tid, to_tid))
+      return;
+    if (!fetched)
+      return;
+    entry = next & ~(uintptr_t)1;
+    if (--limit == 0)
+      break;
+  }
+  if (pending != 0)
+    translate_robust_owner(drcontext, pending + offset, from_tid, to_tid);
+}
+
+/* As a thread exits, Linux walks its robust list and marks FUTEX_OWNER_DIED,
+ * and wakes a waiter, in each lock whose owner word names the thread's TID.
+ * glibc writes owner words from its pthread struct's TID word, which holds
+ * the virtual TID (`complete_clone_identity`; the main thread's comes from
+ * set_tid_address, whose result is virtualized too), so Linux would never
+ * match one. Just before the thread's native exit, rewrite each such word to
+ * the host TID so that Linux's own walk marks and wakes it, atomically and at
+ * the moment Linux does it. An exec and an exit_group are handled by
+ * `translate_process_robust_lists`. A thread that dies without passing through
+ * `complete_runtime_thread_exit`, such as a SIGKILLed process, is not covered
+ * (https://github.com/rrnewton/hermit/issues/4239). */
+static void translate_robust_list_owners(
+    void* drcontext,
+    int32_t host_tid,
+    int32_t virtual_tid) {
+  translate_robust_list(drcontext, host_tid, virtual_tid, host_tid);
+}
+
+/* An exec and an exit_group kill every other thread of the process, and
+ * each walks its robust list as it dies with no client code of its own
+ * guaranteed to run first: for an exit_group, DynamoRIO terminates the other
+ * threads and may deliver their thread-exit events only after they are gone.
+ * (Linux also walks the execing thread's own list, in exec_mm_release.) So
+ * just before an exec or exit_group, rewrite the owner words of every thread
+ * of this process from its virtual TID to its host TID, and if an exec fails
+ * (`restore`), rewrite them back. The other threads are the identity table's
+ * host TIDs that tgkill(pid, tid, 0) finds in this thread group. Until the
+ * call returns or the process is gone, a thread of this process that runs
+ * and unlocks a robust mutex it holds gets EPERM from glibc, whose owner
+ * check compares the word with the virtual TID; a mutex it locks in that
+ * window keeps the virtual TID. */
+static void translate_process_robust_lists(
+    void* drcontext,
+    prototype_counters_t* counters,
+    bool restore) {
+  if (restore && !counters->process_robust_lists_translated)
+    return;
+  int32_t self = (int32_t)dr_get_thread_id(drcontext);
+  int32_t pid = (int32_t)dr_get_process_id();
+  int32_t self_virtual = 0;
+  if (!lookup_virtual_identity(self, &self_virtual))
+    self_virtual = counters->virtual_tid;
+  if (restore)
+    translate_robust_list(drcontext, self, self, self_virtual);
+  else
+    translate_robust_list(drcontext, self, self_virtual, self);
+
+  size_t size = MAX_VIRTUAL_IDENTITIES * sizeof(virtual_identity_t);
+  virtual_identity_t* identities = (virtual_identity_t*)dr_global_alloc(size);
+  virtual_identity_lock();
+  size_t count = virtual_identity_state->count;
+  memcpy(
+      identities, virtual_identity_state->identities, count * sizeof(*identities));
+  virtual_identity_unlock();
+  for (size_t i = 0; i < count; ++i) {
+    int32_t host = identities[i].host;
+    int32_t virtual_id = identities[i].virtual_id;
+    if (host <= 0 || host == self || syscall(SYS_tgkill, pid, host, 0) != 0)
+      continue;
+    if (restore)
+      translate_robust_list(drcontext, host, host, virtual_id);
+    else
+      translate_robust_list(drcontext, host, virtual_id, host);
+  }
+  dr_global_free(identities, size);
+  counters->process_robust_lists_translated = !restore;
+}
+
 static void complete_runtime_thread_exit(
     prototype_counters_t* counters,
     void* drcontext,
-    bool explicit_exit) {
+    bool explicit_exit,
+    bool exit_group) {
   bool owns_runtime;
   if (counters->runtime_thread_exit_called != 0)
     return;
   counters->runtime_thread_exit_called = 1;
+  if (exit_group)
+    translate_process_robust_lists(drcontext, counters, false);
+  {
+    int32_t host_tid = (int32_t)dr_get_thread_id(drcontext);
+    int32_t virtual_tid = 0;
+    if (!lookup_virtual_identity(host_tid, &virtual_tid))
+      virtual_tid = counters->virtual_tid;
+    translate_robust_list_owners(drcontext, host_tid, virtual_tid);
+  }
   owns_runtime = !has_copied_runtime() ||
       (runtime_uses_external_global() && !is_copied_vfork_process());
   if (owns_runtime) {
@@ -5464,7 +5741,7 @@ static void thread_exit(void* drcontext) {
   if (counters != NULL) {
     bool owns_runtime = !has_copied_runtime() ||
         (runtime_uses_external_global() && !is_copied_vfork_process());
-    complete_runtime_thread_exit(counters, drcontext, false);
+    complete_runtime_thread_exit(counters, drcontext, false, false);
     evidence_thread_leave(counters);
     if (owns_runtime) {
       if (counters->signal_mcontext != NULL)
