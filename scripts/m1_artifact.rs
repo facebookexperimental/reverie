@@ -2220,6 +2220,14 @@ const FIXED_EMITTED_ROLE_SYMBOLS: &[(&str, &str)] = &[
         "fixed_tls_cell_read",
         "_RNvMs8_NtCs_4core4cellINtB5_4CelljE3getCs_12thread_local",
     ),
+    // The ordinary DEV linker can keep this identical typed monomorphization
+    // from parking_lot instead. Selection alone grants no provider admission:
+    // the unique LOCAL role, complete nine bytes and actual callback/GOT edge
+    // below remain mandatory for either emitted spelling.
+    (
+        "fixed_tls_cell_read",
+        "_RNvMs8_NtCs_4core4cellINtB5_4CelljE3getCs_11parking_lot",
+    ),
     (
         "fixed_tls_access_refusal",
         "_RNvNtNtCs_3std6thread5local18panic_access_error",
@@ -8751,9 +8759,21 @@ const FIXED_SUPPORT_ROLE_SYMBOLS: &[(&str, &str)] = &[
         "fixed_heap_atomic_compare_u8",
         "_RINvNtNtCs_4core4sync6atomic28atomic_compare_exchange_weakhECs_12futures_util",
     ),
+    // Ordinary DEV emission can select this local typed instantiation. The
+    // existing whole-body, readonly, ordering and transfer proofs still apply.
+    (
+        "fixed_heap_atomic_compare_u8",
+        "_RINvNtNtCs_4core4sync6atomic28atomic_compare_exchange_weakhECs_11parking_lot",
+    ),
     (
         "fixed_heap_atomic_store_u8",
         "_RINvNtNtCs_4core4sync6atomic12atomic_storehECs_9once_cell",
+    ),
+    // Ordinary DEV emission can select this local typed instantiation. The
+    // existing whole-body, readonly, ordering and transfer proofs still apply.
+    (
+        "fixed_heap_atomic_store_u8",
+        "_RINvNtNtCs_4core4sync6atomic12atomic_storehECs_11parking_lot",
     ),
     (
         "fixed_heap_block",
@@ -9983,6 +10003,12 @@ const FIXED_OPERATION_ROLE_SYMBOLS: &[(&str, &str)] = &[
         "_RINvNtNtCs_4core4sync6atomic11atomic_loadhECs_9once_cell",
         "_RINvNtNtCs_4core4sync6atomic11atomic_loadhECs_9once_cell",
     ),
+    // Ordinary DEV emission can select this local typed instantiation. The
+    // existing whole-body, readonly, ordering and transfer proofs still apply.
+    (
+        "_RINvNtNtCs_4core4sync6atomic11atomic_loadhECs_9once_cell",
+        "_RINvNtNtCs_4core4sync6atomic11atomic_loadhECs_11parking_lot",
+    ),
     (
         "_RINvNtNtCs_4core4sync6atomic11atomic_loadjECs_16parking_lot_core",
         "_RINvNtNtCs_4core4sync6atomic11atomic_loadjECs_16parking_lot_core",
@@ -10099,9 +10125,21 @@ const FIXED_OPERATION_ROLE_SYMBOLS: &[(&str, &str)] = &[
         "_RNvXsk_NtNtCs_4core3ops5rangeINtB5_5RangejEINtB5_11RangeBoundsjE11start_boundCs_6ruzstd",
         "_RNvXsk_NtNtCs_4core3ops5rangeINtB5_5RangejEINtB5_11RangeBoundsjE11start_boundCs_6ruzstd",
     ),
+    // Ordinary DEV 0x234fd0, complete 11B provider: exact caller-selected
+    // instantiation; the existing body, readonly and transfer recipe still applies.
+    (
+        "_RNvXsk_NtNtCs_4core3ops5rangeINtB5_5RangejEINtB5_11RangeBoundsjE11start_boundCs_6ruzstd",
+        "_RNvXsk_NtNtCs_4core3ops5rangeINtB5_5RangejEINtB5_11RangeBoundsjE11start_boundCs_12regex_syntax",
+    ),
     (
         "_RNvXsk_NtNtCs_4core3ops5rangeINtB5_5RangejEINtB5_11RangeBoundsjE9end_boundCs_6ruzstd",
         "_RNvXsk_NtNtCs_4core3ops5rangeINtB5_5RangejEINtB5_11RangeBoundsjE9end_boundCs_6ruzstd",
+    ),
+    // Ordinary DEV 0x234fe0, complete 18B provider: exact caller-selected
+    // instantiation; the existing body, readonly and transfer recipe still applies.
+    (
+        "_RNvXsk_NtNtCs_4core3ops5rangeINtB5_5RangejEINtB5_11RangeBoundsjE9end_boundCs_6ruzstd",
+        "_RNvXsk_NtNtCs_4core3ops5rangeINtB5_5RangejEINtB5_11RangeBoundsjE9end_boundCs_12regex_syntax",
     ),
     (
         "_RNvYjNtNtCs_4core3cmp3Ord3minCs_6goblin",
@@ -12877,6 +12915,12 @@ const PUBLICATION_ROLE_SYMBOLS: &[(&str, &str)] = &[
         "_RINvNtNtCs_4core4sync6atomic12atomic_storejECs_3nix",
         "_RINvNtNtCs_4core4sync6atomic12atomic_storejECs_3nix",
     ),
+    // Ordinary DEV emission can select this local typed instantiation. The
+    // existing whole-body, readonly, ordering and transfer proofs still apply.
+    (
+        "_RINvNtNtCs_4core4sync6atomic12atomic_storejECs_3nix",
+        "_RINvNtNtCs_4core4sync6atomic12atomic_storejECs_11parking_lot",
+    ),
     (
         "_RINvNtNtCs_4core4sync6atomic23atomic_compare_exchangejECs_3log",
         "_RINvNtNtCs_4core4sync6atomic23atomic_compare_exchangejECs_3log",
@@ -12921,6 +12965,12 @@ const PUBLICATION_ROLE_SYMBOLS: &[(&str, &str)] = &[
         "_RNvNvMs9_NtCs_4core3numj13unchecked_add18precondition_checkCs_6ruzstd",
         "_RNvNvMs9_NtCs_4core3numj13unchecked_add18precondition_checkCs_6ruzstd",
     ),
+    // Ordinary DEV 0x3265c0, complete 82B provider: exact caller-selected
+    // instantiation; the existing body, readonly and transfer recipe still applies.
+    (
+        "_RNvNvMs9_NtCs_4core3numj13unchecked_add18precondition_checkCs_6ruzstd",
+        "_RNvNvMs9_NtCs_4core3numj13unchecked_add18precondition_checkCs_16parking_lot_core",
+    ),
     (
         "_RNvXNtNtCs_4core3cmp5implsuNtB4_9PartialEq2eqCs_6goblin",
         "_RNvXNtNtCs_4core3cmp5implsuNtB4_9PartialEq2eqCs_6goblin",
@@ -12937,9 +12987,21 @@ const PUBLICATION_ROLE_SYMBOLS: &[(&str, &str)] = &[
         "_RNvXs3_NtNtCs_4core4iter5rangeINtNtNtB9_3ops5range5RangejENtB5_17RangeIteratorImpl9spec_nextCs_6ruzstd",
         "_RNvXs3_NtNtCs_4core4iter5rangeINtNtNtB9_3ops5range5RangejENtB5_17RangeIteratorImpl9spec_nextCs_6ruzstd",
     ),
+    // Ordinary DEV 0x326930, complete 124B provider: exact caller-selected
+    // instantiation; the existing body, readonly and transfer recipe still applies.
+    (
+        "_RNvXs3_NtNtCs_4core4iter5rangeINtNtNtB9_3ops5range5RangejENtB5_17RangeIteratorImpl9spec_nextCs_6ruzstd",
+        "_RNvXs3_NtNtCs_4core4iter5rangeINtNtNtB9_3ops5range5RangejENtB5_17RangeIteratorImpl9spec_nextCs_16parking_lot_core",
+    ),
     (
         "_RNvXs4_NtNtCs_4core4iter5rangeINtNtNtB9_3ops5range5RangejENtNtNtB7_6traits8iterator8Iterator4nextCs_6ruzstd",
         "_RNvXs4_NtNtCs_4core4iter5rangeINtNtNtB9_3ops5range5RangejENtNtNtB7_6traits8iterator8Iterator4nextCs_6ruzstd",
+    ),
+    // Ordinary DEV 0x3269b0, complete 16B provider: exact caller-selected
+    // instantiation; the existing body, readonly and transfer recipe still applies.
+    (
+        "_RNvXs4_NtNtCs_4core4iter5rangeINtNtNtB9_3ops5range5RangejENtNtNtB7_6traits8iterator8Iterator4nextCs_6ruzstd",
+        "_RNvXs4_NtNtCs_4core4iter5rangeINtNtNtB9_3ops5range5RangejENtNtNtB7_6traits8iterator8Iterator4nextCs_16parking_lot_core",
     ),
     (
         "_RNvXs9_NtNtCs_4core3ops12control_flowINtB5_11ControlFlowuENtNtB9_3cmp9PartialEq2eqCs_6goblin",
@@ -12948,6 +13010,12 @@ const PUBLICATION_ROLE_SYMBOLS: &[(&str, &str)] = &[
     (
         "_RNvXsL_NtNtCs_4core4iter5rangejNtB5_4Step17forward_uncheckedCs_6ruzstd",
         "_RNvXsL_NtNtCs_4core4iter5rangejNtB5_4Step17forward_uncheckedCs_6ruzstd",
+    ),
+    // Ordinary DEV 0x3269c0, complete 64B provider: exact caller-selected
+    // instantiation; the existing body, readonly and transfer recipe still applies.
+    (
+        "_RNvXsL_NtNtCs_4core4iter5rangejNtB5_4Step17forward_uncheckedCs_6ruzstd",
+        "_RNvXsL_NtNtCs_4core4iter5rangejNtB5_4Step17forward_uncheckedCs_16parking_lot_core",
     ),
     (
         "_RNvXs_NtNtCs_4core3ops12control_flowINtB4_11ControlFlowuEINtNtB6_9try_trait12FromResidualIBK_uNtNtB8_7convert10InfallibleEE13from_residualCs_6goblin",
@@ -15909,21 +15977,16 @@ fn qualify_allocator_tls_boundary_in_source_context(
             local_got_slot: None,
         };
         let (callback_address, callback_bytes) = bind("fixed_tls_cell_callback")?;
-        let read_slot = fixed_local_call_operand(
-            callback_address,
-            callback_bytes,
-            16,
-            20,
-            roles["fixed_tls_cell_read"].st_value,
-            got,
-        )?;
+        // Missing or unrecognized emission must refuse, not panic on indexing.
+        let (read, read_bytes) = bind("fixed_tls_cell_read")?;
+        let read_slot =
+            fixed_local_call_operand(callback_address, callback_bytes, 16, 20, read, got)?;
         fixed_whole_recipe(
             callback_address,
             callback_bytes,
             "4883ec1848897c2408488b7c2408ff15c48219004883c418c3",
             &[(16, 20, read_slot)],
         )?;
-        let (read, read_bytes) = bind("fixed_tls_cell_read")?;
         fixed_whole_recipe(read, read_bytes, "48897c24f8488b07c3", &[])?;
         (plt, module, Some(key), Some(transfer))
     };
@@ -16017,6 +16080,174 @@ fn fixed_role_symbols(elf: &Elf<'_>) -> Result<BTreeMap<String, sym::Sym>> {
         )?;
     }
     Ok(result)
+}
+
+// Both observed equality cohorts can coexist in one DSO. This finite census
+// grants byte coverage only; admission chooses one pair from complete callers.
+const FIXED_HEAP_EQUAL_COHORTS: [(&str, &str); 2] = [
+    (
+        "_RNvXsf_NtCs_4core6optionINtB5_6OptionjENtNtB7_3cmp9PartialEq2eqCs_12regex_syntax",
+        "_RNvXsj_NtNtCs_4core3cmp5implsjNtB7_9PartialEq2eqCs_12regex_syntax",
+    ),
+    (
+        "_RNvXsf_NtCs_4core6optionINtB5_6OptionjENtNtB7_3cmp9PartialEq2eqCs_10safeptrace",
+        "_RNvXsj_NtNtCs_4core3cmp5implsjNtB7_9PartialEq2eqCs_10safeptrace",
+    ),
+];
+
+fn fixed_heap_equal_candidates(elf: &Elf<'_>) -> Result<BTreeMap<&'static str, sym::Sym>> {
+    let mut result = BTreeMap::new();
+    for (option, scalar) in FIXED_HEAP_EQUAL_COHORTS {
+        for spelling in [option, scalar] {
+            let candidates: Vec<_> = elf
+                .syms
+                .iter()
+                .filter(|symbol| {
+                    elf.strtab
+                        .get_at(symbol.st_name)
+                        .and_then(canonical_rust_symbol)
+                        .as_deref()
+                        == Some(spelling)
+                })
+                .collect();
+            if candidates.is_empty() {
+                continue;
+            }
+            require(
+                candidates.len() == 1,
+                "ambiguous exact heap equality provider",
+            )?;
+            let symbol = candidates[0];
+            let name = elf.strtab.get_at(symbol.st_name).unwrap();
+            require(
+                executable_symbol(elf, &symbol)
+                    && symbol.st_bind() == sym::STB_LOCAL
+                    && !elf
+                        .dynsyms
+                        .iter()
+                        .any(|dynamic| elf.dynstrtab.get_at(dynamic.st_name) == Some(name)),
+                "heap equality provider is not executable LOCAL/non-dynamic",
+            )?;
+            result.insert(spelling, symbol);
+        }
+    }
+    Ok(result)
+}
+
+// Rebind only this two-role cohort, after the unchanged whole2690B caller
+// shape, both actual GOT operands and the complete124B/22B providers prove it.
+// This does not change the ordinary emitted-role duplicate/alias rules.
+fn fixed_select_heap_equal_cohort(
+    elf: &Elf<'_>,
+    bytes: &[u8],
+    code: &BTreeMap<u64, Vec<u8>>,
+    got: &BTreeMap<u64, u64>,
+    roles: &mut BTreeMap<String, sym::Sym>,
+) -> Result<()> {
+    let Some(caller) = roles.get("fixed_heap_deallocate") else {
+        return Ok(());
+    };
+    let (_, caller_code) = fixed_private_role_code("fixed_heap_deallocate", roles, code)?;
+    if !fixed_template_shape(
+        caller_code,
+        &fixed_hex(DEV_FIXED_HEAP_HEX_1),
+        DEV_FIXED_HEAP_OPERANDS_1.iter().map(|op| op.displacement),
+    ) {
+        // Other bodies still require their original complete production proof.
+        return Ok(());
+    }
+    require(
+        loaded_bytes(elf, bytes, caller.st_value, caller_code.len())? == caller_code,
+        "heap equality caller loses its physical complete bytes",
+    )?;
+    let candidates = fixed_heap_equal_candidates(elf)?;
+    let mut selected = None;
+    for (displacement, next) in [(1143, 1147), (1923, 1927)] {
+        let slot = fixed_rip_target(caller.st_value, caller_code, displacement, next)?;
+        require(
+            fixed_readonly_range(elf, bytes, slot, 8)? == [0; 8],
+            "heap equality GOT lacks its exact file-zero word",
+        )?;
+        let relros: Vec<_> = elf
+            .program_headers
+            .iter()
+            .filter(|header| header.p_type == program_header::PT_GNU_RELRO)
+            .collect();
+        require(
+            relros.len() == 1
+                && slot >= relros[0].p_vaddr
+                && slot.checked_add(8).is_some_and(|end| {
+                    relros[0]
+                        .p_vaddr
+                        .checked_add(relros[0].p_memsz)
+                        .is_some_and(|limit| end <= (limit & !4095))
+                }),
+            "heap equality GOT is not wholly in unique protected RELRO",
+        )?;
+        let writers = extent_writers(elf, slot, 8)?;
+        let target = *got
+            .get(&slot)
+            .ok_or("heap equality GOT is unauthenticated")?;
+        require(
+            writers.len() == 1
+                && writers[0].r_offset == slot
+                && writers[0].r_type == reloc::R_X86_64_RELATIVE
+                && writers[0].r_sym == 0
+                && writers[0].r_addend == Some(i64::try_from(target).map_err(|e| e.to_string())?),
+            "heap equality GOT lacks its sole exact local RELATIVE writer",
+        )?;
+        require(
+            selected.is_none_or(|prior| prior == target),
+            "deallocate equality operands select different providers",
+        )?;
+        selected = Some(target);
+    }
+    let selected = selected.unwrap();
+    let cohorts: Vec<_> = FIXED_HEAP_EQUAL_COHORTS
+        .iter()
+        .filter(|(option, _)| {
+            candidates
+                .get(option)
+                .is_some_and(|s| s.st_value == selected)
+        })
+        .collect();
+    require(
+        cohorts.len() == 1,
+        "deallocate lacks one exact typed equality cohort",
+    )?;
+    let (option_name, scalar_name) = *cohorts[0];
+    let option = candidates[option_name];
+    let scalar = *candidates
+        .get(scalar_name)
+        .ok_or("heap equality scalar provider absent")?;
+    let mut bodies = Vec::new();
+    for symbol in [option, scalar] {
+        let body = code
+            .get(&symbol.st_value)
+            .ok_or("heap equality provider lacks whole bytes")?;
+        require(
+            body.len() as u64 == symbol.st_size
+                && loaded_bytes(elf, bytes, symbol.st_value, body.len())? == body,
+            "heap equality provider loses its physical complete bytes",
+        )?;
+        let (mapping, _) = unique_file_mapping(elf, bytes, symbol.st_value, body.len())?;
+        require(
+            mapping.p_flags & (program_header::PF_R | program_header::PF_W | program_header::PF_X)
+                == program_header::PF_R | program_header::PF_X,
+            "heap equality provider is not uniquely mapped RX",
+        )?;
+        bodies.push(body);
+    }
+    fixed_whole_recipe(
+        option.st_value,
+        bodies[0],
+        DEV_FIXED_HEAP_HEX_23,
+        &[(105, 109, scalar.st_value)],
+    )?;
+    fixed_whole_recipe(scalar.st_value, bodies[1], DEV_FIXED_HEAP_HEX_22, &[])?;
+    roles.insert("fixed_heap_option_usize_equal".into(), option);
+    roles.insert("fixed_heap_usize_equal".into(), scalar);
+    Ok(())
 }
 
 fn compiler_shim_symbols(elf: &Elf<'_>) -> Result<BTreeMap<String, sym::Sym>> {
@@ -16526,6 +16757,9 @@ fn qualify_fixed_allocator_in_source_context(
     )?;
     let disassembly = gate_view.as_str();
     let mut roles = fixed_role_symbols(elf)?;
+    if image_kind == FixedImageKind::Standalone {
+        fixed_select_heap_equal_cohort(elf, bytes, code, got, &mut roles)?;
+    }
     let shims = compiler_shim_symbols(elf)?;
     if image_kind == FixedImageKind::Detcore {
         for (name, symbol) in &shims {
@@ -22392,6 +22626,11 @@ fn constructor_proof_functions(elf: &Elf<'_>) -> Result<BTreeMap<u64, u64>> {
         .values()
         .map(|s| s.st_value)
         .chain(fixed_role_symbols(elf)?.values().map(|s| s.st_value))
+        .chain(
+            fixed_heap_equal_candidates(elf)?
+                .values()
+                .map(|s| s.st_value),
+        )
         .chain(compiler_shim_symbols(elf)?.values().map(|s| s.st_value))
         .collect();
     selected_function_ranges(elf, addresses)
@@ -34935,8 +35174,596 @@ mod tests {
         native_dispatch_mutation_controls();
     }
 
+    // These complete miniature ELFs exercise caller-bound selection, not whole
+    // artifact admission. Original dev-heap body/data/census controls also run.
+    fn fixed_heap_equal_cohort_controls() {
+        fn put(bytes: &mut [u8], offset: usize, width: usize, value: u64) {
+            bytes[offset..offset + width].copy_from_slice(&value.to_le_bytes()[..width]);
+        }
+        fn relative(bytes: &mut [u8], address: u64, displacement: usize, next: usize, target: u64) {
+            let delta = i32::try_from(target as i64 - (address + next as u64) as i64).unwrap();
+            bytes[displacement..next].copy_from_slice(&delta.to_le_bytes());
+        }
+        fn fixture(cohort: usize) -> Vec<u8> {
+            let mut bytes = vec![0_u8; 0x9000];
+            bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+            for (at, width, value) in [
+                (16, 2, 3),
+                (18, 2, 62),
+                (20, 4, 1),
+                (32, 8, 64),
+                (40, 8, 0x7000),
+                (52, 2, 64),
+                (54, 2, 56),
+                (56, 2, 6),
+                (58, 2, 64),
+                (60, 2, 9),
+            ] {
+                put(&mut bytes, at, width, value);
+            }
+            for (index, kind, flags, address, size) in [
+                (0, 1, 4, 0, 0x1000),
+                (1, 1, 5, 0x1000, 0x3000),
+                (2, 1, 6, 0x4000, 0x1000),
+                (3, 1, 4, 0x5000, 0x4000),
+                (4, 0x6474_e552, 4, 0x4000, 0x1000),
+                (5, 2, 6, 0x4200, 16 * 9),
+            ] {
+                let base = 64 + index * 56;
+                for (offset, width, value) in [
+                    (0, 4, kind),
+                    (4, 4, flags),
+                    (8, 8, address),
+                    (16, 8, address),
+                    (24, 8, address),
+                    (32, 8, size),
+                    (40, 8, size),
+                    (48, 8, 4096),
+                ] {
+                    put(&mut bytes, base + offset, width, value);
+                }
+            }
+            let mut caller = fixed_hex(DEV_FIXED_HEAP_HEX_1);
+            // Relocate every original displacement to this miniature image.
+            // Its unrelated operands do not earn whole artifact admission.
+            for op in DEV_FIXED_HEAP_OPERANDS_1 {
+                let target = match op.kind {
+                    0 => 0x4020,
+                    1 => 0x3000,
+                    2 => 0x4010,
+                    _ => unreachable!(),
+                };
+                relative(&mut caller, 0x1000, op.displacement, op.next, target);
+            }
+            for (displacement, next, slot) in [(1143, 1147, 0x4000), (1923, 1927, 0x4008)] {
+                relative(&mut caller, 0x1000, displacement, next, slot);
+            }
+            bytes[0x1000..0x1000 + caller.len()].copy_from_slice(&caller);
+            let names = [
+                "fixture_heap_deallocate".to_owned(),
+                FIXED_HEAP_EQUAL_COHORTS[0].0.replace("Cs_", "Cs1_"),
+                FIXED_HEAP_EQUAL_COHORTS[0].1.replace("Cs_", "Cs1_"),
+                FIXED_HEAP_EQUAL_COHORTS[1].0.replace("Cs_", "Cs1_"),
+                FIXED_HEAP_EQUAL_COHORTS[1].1.replace("Cs_", "Cs1_"),
+            ];
+            let addresses = [0x1000, 0x2000, 0x2100, 0x2200, 0x2300];
+            let sizes = [2690, 124, 22, 124, 22];
+            let mut strings = vec![0];
+            for (index, name) in names.iter().enumerate() {
+                let row = 0x6000 + (index + 1) * 24;
+                put(&mut bytes, row, 4, strings.len() as u64);
+                put(&mut bytes, row + 4, 1, 2);
+                put(&mut bytes, row + 6, 2, 1);
+                put(&mut bytes, row + 8, 8, addresses[index]);
+                put(&mut bytes, row + 16, 8, sizes[index]);
+                strings.extend_from_slice(name.as_bytes());
+                strings.push(0);
+            }
+            bytes[0x5000..0x5000 + strings.len()].copy_from_slice(&strings);
+            for (option, scalar) in [(0x2000, 0x2100), (0x2200, 0x2300)] {
+                let mut body = fixed_hex(DEV_FIXED_HEAP_HEX_23);
+                relative(&mut body, option, 105, 109, scalar);
+                bytes[option as usize..option as usize + body.len()].copy_from_slice(&body);
+                let body = fixed_hex(DEV_FIXED_HEAP_HEX_22);
+                bytes[scalar as usize..scalar as usize + body.len()].copy_from_slice(&body);
+            }
+            for (index, slot) in [0x4000, 0x4008].into_iter().enumerate() {
+                let row = 0x6500 + index * 24;
+                put(&mut bytes, row, 8, slot);
+                put(&mut bytes, row + 8, 8, 8);
+                put(&mut bytes, row + 16, 8, [0x2000, 0x2200][cohort]);
+            }
+            // One null dynamic symbol. Mutation controls expose a real provider.
+            for (index, word) in [1, 1, 0, 0, 0].into_iter().enumerate() {
+                put(&mut bytes, 0x6a00 + index * 4, 4, word);
+            }
+            for (index, (tag, value)) in [
+                (7, 0x6500),
+                (8, 48),
+                (9, 24),
+                (6, 0x6800),
+                (11, 24),
+                (5, 0x5000),
+                (10, strings.len() as u64),
+                (4, 0x6a00),
+                (0, 0),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                put(&mut bytes, 0x4200 + index * 16, 8, tag);
+                put(&mut bytes, 0x4208 + index * 16, 8, value);
+            }
+            for (index, kind, flags, address, size, link, entry) in [
+                (1, 1, 6, 0x1000, 0x3000, 0, 0),
+                (2, 1, 3, 0x4000, 0x1000, 0, 0),
+                (3, 3, 0, 0x5000, strings.len() as u64, 0, 0),
+                (4, 2, 0, 0x6000, 24 * 6, 3, 24),
+                (5, 4, 2, 0x6500, 48, 7, 24),
+                (6, 6, 3, 0x4200, 16 * 9, 3, 16),
+                (7, 11, 2, 0x6800, 48, 3, 24),
+                (8, 5, 2, 0x6a00, 20, 7, 4),
+            ] {
+                let base = 0x7000 + index * 64;
+                for (offset, width, value) in [
+                    (4, 4, kind),
+                    (8, 8, flags),
+                    (16, 8, address),
+                    (24, 8, address),
+                    (32, 8, size),
+                    (40, 4, link),
+                    (48, 8, 8),
+                    (56, 8, entry),
+                ] {
+                    put(&mut bytes, base + offset, width, value);
+                }
+            }
+            bytes
+        }
+        fn select(bytes: &[u8], missing_got: bool) -> Result<BTreeMap<String, sym::Sym>> {
+            let elf = Elf::parse(bytes).map_err(|error| error.to_string())?;
+            let mut roles = BTreeMap::from([
+                ("fixed_heap_deallocate".into(), elf.syms.get(1).unwrap()),
+                (
+                    "fixed_heap_option_usize_equal".into(),
+                    elf.syms.get(2).unwrap(),
+                ),
+                ("fixed_heap_usize_equal".into(), elf.syms.get(3).unwrap()),
+            ]);
+            let code = [0x1000, 0x2000, 0x2100, 0x2200, 0x2300]
+                .into_iter()
+                .zip([2690, 124, 22, 124, 22])
+                .map(|(address, size)| {
+                    (
+                        address,
+                        bytes[address as usize..address as usize + size].to_vec(),
+                    )
+                })
+                .collect();
+            let mut got = BTreeMap::new();
+            for relocation in elf.dynrelas.iter() {
+                got.insert(relocation.r_offset, relocation.r_addend.unwrap() as u64);
+            }
+            if missing_got {
+                got.remove(&0x4000);
+            }
+            fixed_select_heap_equal_cohort(&elf, bytes, &code, &got, &mut roles)?;
+            Ok(roles)
+        }
+        for cohort in [0, 1] {
+            let bytes = fixture(cohort);
+            let selected = select(&bytes, false).unwrap();
+            assert_eq!(
+                selected["fixed_heap_option_usize_equal"].st_value,
+                [0x2000, 0x2200][cohort]
+            );
+            assert_eq!(
+                selected["fixed_heap_usize_equal"].st_value,
+                [0x2100, 0x2300][cohort]
+            );
+            assert!(select(&bytes, true).is_err());
+            for (offset, width, value) in [
+                (0x4000, 8, 1),
+                (0x6528, 8, [0x2200, 0x2000][cohort]),
+                (0x6508, 8, 6),
+                (64 + 4 * 56 + 40, 8, 0x800),
+                (64 + 56 + 4, 4, 4),
+                (64 + 56 + 4, 4, 7),
+                (0x6000 + (2 + cohort * 2) * 24 + 4, 1, 0x12),
+            ] {
+                let mut bad = bytes.clone();
+                put(&mut bad, offset, width, value);
+                assert!(
+                    select(&bad, false).is_err(),
+                    "accepted cohort metadata mutation {offset:#x}"
+                );
+            }
+            let option = [0x2000, 0x2200][cohort];
+            let scalar = [0x2100, 0x2300][cohort];
+            let mut cross = bytes.clone();
+            relative(
+                &mut cross[option as usize..option as usize + 124],
+                option,
+                105,
+                109,
+                [0x2300, 0x2100][cohort],
+            );
+            assert!(select(&cross, false).is_err());
+            for address in [option, scalar] {
+                let mut bad = bytes.clone();
+                bad[address as usize] ^= 1;
+                assert!(select(&bad, false).is_err());
+            }
+            // Each selected spelling remains primitive/method/crate exact.
+            for symbol_index in [2 + cohort * 2, 3 + cohort * 2] {
+                let row = 0x6000 + symbol_index * 24;
+                let name =
+                    u32::from_le_bytes(bytes[row..row + 4].try_into().unwrap()) as usize + 0x5000;
+                let length = bytes[name..].iter().position(|byte| *byte == 0).unwrap();
+                let spelling = std::str::from_utf8(&bytes[name..name + length]).unwrap();
+                for pattern in [
+                    if symbol_index % 2 == 0 {
+                        "Optionj"
+                    } else {
+                        "implsj"
+                    },
+                    "2eq",
+                    if cohort == 0 {
+                        "regex_syntax"
+                    } else {
+                        "safeptrace"
+                    },
+                ] {
+                    let mut bad = bytes.clone();
+                    let offset = name + spelling.find(pattern).unwrap() + pattern.len() - 1;
+                    bad[offset] = b'z';
+                    assert!(select(&bad, false).is_err());
+                }
+                let mut global = bytes.clone();
+                put(&mut global, row + 4, 1, 0x12);
+                assert!(select(&global, false).is_err());
+            }
+            let mut exposed = bytes.clone();
+            let row = 0x6000 + (2 + cohort * 2) * 24;
+            exposed[0x6818..0x6830].copy_from_slice(&bytes[row..row + 24]);
+            put(&mut exposed, 0x6a04, 4, 2);
+            assert!(select(&exposed, false).is_err());
+            let mut duplicate = bytes.clone();
+            let other = 0x6000 + (4 - cohort * 2) * 24;
+            duplicate[other..other + 4].copy_from_slice(&bytes[row..row + 4]);
+            assert!(select(&duplicate, false).is_err());
+            // An inactive selector does not admit a different caller body:
+            // the unchanged complete production recipe must still refuse it.
+            let mut bad = bytes.clone();
+            bad[0x1000] ^= 1;
+            select(&bad, false).unwrap();
+            let body = &bad[0x1000..0x1000 + 2690];
+            let fields = DEV_FIXED_HEAP_OPERANDS_1
+                .iter()
+                .map(|op| {
+                    (
+                        op.displacement,
+                        op.next,
+                        fixed_rip_target(0x1000, body, op.displacement, op.next).unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert!(fixed_whole_recipe(0x1000, body, DEV_FIXED_HEAP_HEX_1, &fields).is_err());
+        }
+    }
+
+    // These miniature ELF symbol tables exercise the production role census.
+    // They grant no source, machine-code or runtime qualification by themselves.
+    fn fixed_dev_helper_emission_controls() {
+        fixed_heap_equal_cohort_controls();
+        const OLD: &str =
+            "_RNvMs8_NtCsayI02cGi06u_4core4cellINtB5_4CelljE3getCsdiSZO7VNmEz_12thread_local";
+        const NEW: &str =
+            "_RNvMs8_NtCsayI02cGi06u_4core4cellINtB5_4CelljE3getCslNQMiMVKk4_11parking_lot";
+        fn elf_symbols(extra: &[(&str, u8)]) -> Vec<u8> {
+            fn field(bytes: &mut [u8], offset: usize, value: u64, width: usize) {
+                bytes[offset..offset + width].copy_from_slice(&value.to_le_bytes()[..width]);
+            }
+            let required: Vec<_> = FIXED_REQUIRED_ROLES
+                .iter()
+                .map(|role| {
+                    FIXED_EMITTED_ROLE_SYMBOLS
+                        .iter()
+                        .find(|(name, _)| name == role)
+                        .unwrap()
+                        .1
+                        .replace("Cs_", "Cs1_")
+                })
+                .collect();
+            let names: Vec<_> = required
+                .iter()
+                .map(|name| (name.as_str(), sym::STB_LOCAL))
+                .chain(extra.iter().copied())
+                .collect();
+            let mut bytes = vec![0_u8; 0x4000];
+            bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+            for (offset, value, width) in [
+                (16, 3, 2),
+                (18, 62, 2),
+                (20, 1, 4),
+                (32, 64, 8),
+                (40, 0x3000, 8),
+                (52, 64, 2),
+                (54, 56, 2),
+                (56, 1, 2),
+                (58, 64, 2),
+                (60, 4, 2),
+            ] {
+                field(&mut bytes, offset, value, width);
+            }
+            // One readable/executable load contains every synthetic function.
+            for (offset, value, width) in [
+                (64, 1, 4),
+                (68, 5, 4),
+                (80, 0x1000, 8),
+                (96, 0x4000, 8),
+                (104, 0x4000, 8),
+                (112, 0x1000, 8),
+            ] {
+                field(&mut bytes, offset, value, width);
+            }
+            let mut strings = vec![0];
+            for (index, (name, binding)) in names.iter().enumerate() {
+                let offset = 0x2000 + 24 * (index + 1);
+                field(&mut bytes, offset, strings.len() as u64, 4);
+                bytes[offset + 4] = (*binding << 4) | sym::STT_FUNC;
+                field(&mut bytes, offset + 6, 1, 2);
+                field(&mut bytes, offset + 8, 0x1800 + index as u64 * 32, 8);
+                field(&mut bytes, offset + 16, 9, 8);
+                strings.extend_from_slice(name.as_bytes());
+                strings.push(0);
+            }
+            assert!(strings.len() < 0x1000);
+            bytes[0x1000..0x1000 + strings.len()].copy_from_slice(&strings);
+            for (section, kind, flags, address, offset, size, link, entry) in [
+                (1, 1, 6, 0x1000, 0, 0x1000, 0, 0),
+                (2, 3, 0, 0, 0x1000, strings.len() as u64, 0, 0),
+                (3, 2, 0, 0, 0x2000, 24 * (names.len() + 1) as u64, 2, 24),
+            ] {
+                let base = 0x3000 + section * 64;
+                for (delta, value, width) in [
+                    (4, kind, 4),
+                    (8, flags, 8),
+                    (16, address, 8),
+                    (24, offset, 8),
+                    (32, size, 8),
+                    (40, link, 4),
+                    (48, 8, 8),
+                    (56, entry, 8),
+                ] {
+                    field(&mut bytes, base + delta, value, width);
+                }
+            }
+            bytes
+        }
+        // Exact observed atomic helper spellings feed the same production
+        // role census. These controls qualify selection only; existing full
+        // provider/switch/readonly/constant-order/GOT mutation tests stay.
+        for (role, old, new) in [
+            (
+                "_RINvNtNtCs_4core4sync6atomic11atomic_loadhECs_9once_cell",
+                "_RINvNtNtCs_4core4sync6atomic11atomic_loadhECs_9once_cell",
+                "_RINvNtNtCs_4core4sync6atomic11atomic_loadhECs_11parking_lot",
+            ),
+            (
+                "fixed_heap_atomic_compare_u8",
+                "_RINvNtNtCs_4core4sync6atomic28atomic_compare_exchange_weakhECs_12futures_util",
+                "_RINvNtNtCs_4core4sync6atomic28atomic_compare_exchange_weakhECs_11parking_lot",
+            ),
+            (
+                "fixed_heap_atomic_store_u8",
+                "_RINvNtNtCs_4core4sync6atomic12atomic_storehECs_9once_cell",
+                "_RINvNtNtCs_4core4sync6atomic12atomic_storehECs_11parking_lot",
+            ),
+            (
+                "_RINvNtNtCs_4core4sync6atomic12atomic_storejECs_3nix",
+                "_RINvNtNtCs_4core4sync6atomic12atomic_storejECs_3nix",
+                "_RINvNtNtCs_4core4sync6atomic12atomic_storejECs_11parking_lot",
+            ),
+        ] {
+            let old = old.replace("Cs_", "Cs1_");
+            let new = new.replace("Cs_", "Cs1_");
+            for name in [&old, &new] {
+                let bytes = elf_symbols(&[(name, sym::STB_LOCAL)]);
+                let roles = fixed_role_symbols(&Elf::parse(&bytes).unwrap()).unwrap();
+                assert_eq!(fixed_emitted_role(name), Some(role));
+                assert!(roles.contains_key(role));
+            }
+            for extras in [
+                vec![
+                    (old.as_str(), sym::STB_LOCAL),
+                    (new.as_str(), sym::STB_LOCAL),
+                ],
+                vec![(new.as_str(), sym::STB_GLOBAL)],
+            ] {
+                let bytes = elf_symbols(&extras);
+                assert!(fixed_role_symbols(&Elf::parse(&bytes).unwrap()).is_err());
+            }
+            let wrong_primitive = if new.contains("hE") {
+                new.replace("hE", "mE")
+            } else {
+                assert!(new.contains("jE"));
+                new.replace("jE", "mE")
+            };
+            for wrong in [
+                wrong_primitive,
+                new.replace("atomic_", "changed_"),
+                new.replace("11parking_lot", "9untrusted"),
+            ] {
+                assert_ne!(fixed_emitted_role(&wrong), Some(role));
+                let bytes = elf_symbols(&[(&wrong, sym::STB_LOCAL)]);
+                let roles = fixed_role_symbols(&Elf::parse(&bytes).unwrap()).unwrap();
+                assert!(fixed_private_role_code(role, &roles, &BTreeMap::new()).is_err());
+            }
+            let bytes = elf_symbols(&[]);
+            let roles = fixed_role_symbols(&Elf::parse(&bytes).unwrap()).unwrap();
+            assert!(fixed_private_role_code(role, &roles, &BTreeMap::new()).is_err());
+        }
+        // Exact range helpers selected by retained production caller operands.
+        // These miniature ELFs qualify selection only; whole-body, readonly,
+        // terminal and transfer qualification remains in the existing recipes.
+        for (role, old, new, primitive, method, crate_name) in [
+            (
+                "_RNvXsk_NtNtCs_4core3ops5rangeINtB5_5RangejEINtB5_11RangeBoundsjE11start_boundCs_6ruzstd",
+                "_RNvXsk_NtNtCs_4core3ops5rangeINtB5_5RangejEINtB5_11RangeBoundsjE11start_boundCs_6ruzstd",
+                "_RNvXsk_NtNtCs_4core3ops5rangeINtB5_5RangejEINtB5_11RangeBoundsjE11start_boundCs_12regex_syntax",
+                "5RangejE",
+                "11start_bound",
+                "12regex_syntax",
+            ),
+            (
+                "_RNvXsk_NtNtCs_4core3ops5rangeINtB5_5RangejEINtB5_11RangeBoundsjE9end_boundCs_6ruzstd",
+                "_RNvXsk_NtNtCs_4core3ops5rangeINtB5_5RangejEINtB5_11RangeBoundsjE9end_boundCs_6ruzstd",
+                "_RNvXsk_NtNtCs_4core3ops5rangeINtB5_5RangejEINtB5_11RangeBoundsjE9end_boundCs_12regex_syntax",
+                "5RangejE",
+                "9end_bound",
+                "12regex_syntax",
+            ),
+            (
+                "_RNvNvMs9_NtCs_4core3numj13unchecked_add18precondition_checkCs_6ruzstd",
+                "_RNvNvMs9_NtCs_4core3numj13unchecked_add18precondition_checkCs_6ruzstd",
+                "_RNvNvMs9_NtCs_4core3numj13unchecked_add18precondition_checkCs_16parking_lot_core",
+                "3numj",
+                "18precondition_check",
+                "16parking_lot_core",
+            ),
+            (
+                "_RNvXs3_NtNtCs_4core4iter5rangeINtNtNtB9_3ops5range5RangejENtB5_17RangeIteratorImpl9spec_nextCs_6ruzstd",
+                "_RNvXs3_NtNtCs_4core4iter5rangeINtNtNtB9_3ops5range5RangejENtB5_17RangeIteratorImpl9spec_nextCs_6ruzstd",
+                "_RNvXs3_NtNtCs_4core4iter5rangeINtNtNtB9_3ops5range5RangejENtB5_17RangeIteratorImpl9spec_nextCs_16parking_lot_core",
+                "5RangejE",
+                "9spec_next",
+                "16parking_lot_core",
+            ),
+            (
+                "_RNvXs4_NtNtCs_4core4iter5rangeINtNtNtB9_3ops5range5RangejENtNtNtB7_6traits8iterator8Iterator4nextCs_6ruzstd",
+                "_RNvXs4_NtNtCs_4core4iter5rangeINtNtNtB9_3ops5range5RangejENtNtNtB7_6traits8iterator8Iterator4nextCs_6ruzstd",
+                "_RNvXs4_NtNtCs_4core4iter5rangeINtNtNtB9_3ops5range5RangejENtNtNtB7_6traits8iterator8Iterator4nextCs_16parking_lot_core",
+                "5RangejE",
+                "4next",
+                "16parking_lot_core",
+            ),
+            (
+                "_RNvXsL_NtNtCs_4core4iter5rangejNtB5_4Step17forward_uncheckedCs_6ruzstd",
+                "_RNvXsL_NtNtCs_4core4iter5rangejNtB5_4Step17forward_uncheckedCs_6ruzstd",
+                "_RNvXsL_NtNtCs_4core4iter5rangejNtB5_4Step17forward_uncheckedCs_16parking_lot_core",
+                "5rangej",
+                "17forward_unchecked",
+                "16parking_lot_core",
+            ),
+        ] {
+            let old = old.replace("Cs_", "Cs1_");
+            let new = new.replace("Cs_", "Cs1_");
+            for name in [&old, &new] {
+                let bytes = elf_symbols(&[(name, sym::STB_LOCAL)]);
+                let roles = fixed_role_symbols(&Elf::parse(&bytes).unwrap()).unwrap();
+                assert_eq!(fixed_emitted_role(name), Some(role));
+                assert!(roles.contains_key(role));
+            }
+            for extras in [
+                vec![
+                    (old.as_str(), sym::STB_LOCAL),
+                    (new.as_str(), sym::STB_LOCAL),
+                ],
+                vec![(new.as_str(), sym::STB_GLOBAL)],
+            ] {
+                let bytes = elf_symbols(&extras);
+                assert!(fixed_role_symbols(&Elf::parse(&bytes).unwrap()).is_err());
+            }
+            assert!(new.contains(primitive) && new.contains(method) && new.contains(crate_name));
+            for wrong in [
+                new.replace(primitive, &primitive.replace('j', "m")),
+                new.replace(method, &format!("{}x", &method[..method.len() - 1])),
+                new.replace(crate_name, "9untrusted"),
+                // Another physically present helper cohort must not become an
+                // alternative merely because it has the same Rust primitive.
+                new.replace(crate_name, "8iced_x86"),
+            ] {
+                assert_ne!(wrong, new);
+                assert_ne!(fixed_emitted_role(&wrong), Some(role));
+                let bytes = elf_symbols(&[(&wrong, sym::STB_LOCAL)]);
+                let roles = fixed_role_symbols(&Elf::parse(&bytes).unwrap()).unwrap();
+                assert!(fixed_private_role_code(role, &roles, &BTreeMap::new()).is_err());
+            }
+            let bytes = elf_symbols(&[]);
+            let roles = fixed_role_symbols(&Elf::parse(&bytes).unwrap()).unwrap();
+            assert!(fixed_private_role_code(role, &roles, &BTreeMap::new()).is_err());
+        }
+        let provider = vec![0x48, 0x89, 0x7c, 0x24, 0xf8, 0x48, 0x8b, 0x07, 0xc3];
+        for name in [OLD, NEW] {
+            let bytes = elf_symbols(&[(name, sym::STB_LOCAL)]);
+            let elf = Elf::parse(&bytes).unwrap();
+            let roles = fixed_role_symbols(&elf).unwrap();
+            assert_eq!(fixed_emitted_role(name), Some("fixed_tls_cell_read"));
+            let address = roles["fixed_tls_cell_read"].st_value;
+            let code = BTreeMap::from([(address, provider.clone())]);
+            let (actual, body) =
+                fixed_private_role_code("fixed_tls_cell_read", &roles, &code).unwrap();
+            assert_eq!(actual, address);
+            fixed_whole_recipe(actual, body, "48897c24f8488b07c3", &[]).unwrap();
+            for offset in 0..body.len() {
+                let mut wrong = body.to_vec();
+                wrong[offset] ^= 1;
+                assert!(fixed_whole_recipe(actual, &wrong, "48897c24f8488b07c3", &[]).is_err());
+            }
+        }
+        for extras in [
+            vec![(OLD, sym::STB_LOCAL), (NEW, sym::STB_LOCAL)],
+            vec![(NEW, sym::STB_GLOBAL)],
+        ] {
+            let bytes = elf_symbols(&extras);
+            assert!(fixed_role_symbols(&Elf::parse(&bytes).unwrap()).is_err());
+        }
+        for wrong in [
+            NEW.replace("4CelljE", "4CellmE"),
+            NEW.replace("3get", "3set"),
+            NEW.replace("11parking_lot", "9untrusted"),
+        ] {
+            assert_eq!(fixed_emitted_role(&wrong), None);
+            let bytes = elf_symbols(&[(&wrong, sym::STB_LOCAL)]);
+            let roles = fixed_role_symbols(&Elf::parse(&bytes).unwrap()).unwrap();
+            assert!(
+                fixed_private_role_code("fixed_tls_cell_read", &roles, &BTreeMap::new())
+                    .unwrap_err()
+                    .contains("absent")
+            );
+        }
+        let bytes = elf_symbols(&[]);
+        let roles = fixed_role_symbols(&Elf::parse(&bytes).unwrap()).unwrap();
+        assert!(
+            fixed_private_role_code("fixed_tls_cell_read", &roles, &BTreeMap::new())
+                .unwrap_err()
+                .contains("absent")
+        );
+        // Actual measured callback CALL operand, separately checked against its
+        // resolved local RELATIVE/RELRO target by production qualification.
+        let callback = [
+            0x48, 0x83, 0xec, 0x18, 0x48, 0x89, 0x7c, 0x24, 0x08, 0x48, 0x8b, 0x7c, 0x24, 0x08,
+            0xff, 0x15, 0x74, 0xdd, 0x1b, 0, 0x48, 0x83, 0xc4, 0x18, 0xc3,
+        ];
+        let got = BTreeMap::from([(0x3ac5d8, 0x324cb0)]);
+        assert_eq!(
+            fixed_local_call_operand(0x1ee850, &callback, 16, 20, 0x324cb0, &got).unwrap(),
+            0x3ac5d8
+        );
+        assert!(fixed_local_call_operand(0x1ee850, &callback, 16, 20, 0x324cb1, &got).is_err());
+        assert!(
+            fixed_local_call_operand(0x1ee850, &callback, 16, 20, 0x324cb0, &BTreeMap::new())
+                .is_err()
+        );
+        let mut wrong = callback;
+        wrong[16] ^= 1;
+        assert!(fixed_local_call_operand(0x1ee850, &wrong, 16, 20, 0x324cb0, &got).is_err());
+    }
+
     #[test]
     fn missing_build_finished_is_a_failed_current_artifact_selection() {
+        fixed_dev_helper_emission_controls();
         compiled_source_identity_controls();
         content_source_identity_controls();
         compiled_source_data_adapter_controls();
