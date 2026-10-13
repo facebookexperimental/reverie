@@ -18608,6 +18608,43 @@ fn fcntl(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> 
             zero_or_errno(unsafe { libc::fcntl(host_fd, host_command, &lock) })
         }
         // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-1016): Review KVM advisory-lock queries.
+        // The lock model above installs every guest lock as an OFD lock on the
+        // shared open description, so a query asks the same question of the
+        // host: F_GETLK becomes F_OFD_GETLK. The host answers with the first
+        // conflicting lock or F_UNLCK, and the result is copied back as
+        // fcntl(2) does. A conflicting holder is an OFD lock, which Linux
+        // reports with l_pid -1, so a guest F_GETLK never sees a host pid.
+        command @ (libc::F_GETLK | libc::F_OFD_GETLK) => {
+            let mut lock = match read_guest_struct::<libc::flock>(memory, args[2]) {
+                Ok(lock) => lock,
+                Err(error) => return error,
+            };
+            let host_command = if command == libc::F_GETLK {
+                lock.l_pid = 0;
+                libc::F_OFD_GETLK
+            } else {
+                command
+            };
+            // SAFETY: host_fd is live and lock is a fully initialized flock
+            // value the kernel overwrites in place.
+            let result = zero_or_errno(unsafe { libc::fcntl(host_fd, host_command, &mut lock) });
+            if result != 0 {
+                return result;
+            }
+            // SAFETY: flock is initialized plain data; the view is bounded to it.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    std::ptr::from_ref(&lock).cast::<u8>(),
+                    std::mem::size_of::<libc::flock>(),
+                )
+            };
+            match memory.user().write(args[2], bytes) {
+                Ok(()) => 0,
+                Err(_) => negative_errno(libc::EFAULT),
+            }
+        }
+        // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(rrnewton/reverie#318): Review KVM guest pipe-capacity
         // fcntl forwarding. F_GETPIPE_SZ/F_SETPIPE_SZ read and set the capacity
         // of the real host pipe that backs the guest pipe, matching the golden
@@ -29411,6 +29448,97 @@ mod tests {
                 [3, libc::F_SETLK as u64, LOCK, 0, 0, 0],
             ),
             0
+        );
+    }
+
+    #[test]
+    fn fcntl_getlk_reports_conflicts_from_host_descriptors() {
+        const LOCK: u64 = 0x100;
+
+        let root = TestDir::new();
+        let path = root.0.join("queried");
+        let first = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        let second = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut state = test_state(&root.0);
+        state.files.insert(3, first);
+        state.files.insert(4, second);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let lock = |l_type: i32, l_start: i64, l_len: i64, l_pid: i32| libc::flock {
+            l_type: l_type as libc::c_short,
+            l_whence: libc::SEEK_SET as libc::c_short,
+            l_start,
+            l_len,
+            l_pid,
+        };
+        let fcntl = |memory: &mut GuestMemory, state: &mut LoadedStaticElf, fd: u64, cmd: i32| {
+            syscall_result(
+                memory,
+                state,
+                libc::SYS_fcntl,
+                [fd, cmd as u64, LOCK, 0, 0, 0],
+            )
+        };
+        assert_eq!(
+            write_struct(&mut memory, LOCK, &lock(libc::F_WRLCK, 0, 100, 0)),
+            0
+        );
+        assert_eq!(fcntl(&mut memory, &mut state, 3, libc::F_SETLK), 0);
+
+        // Outside the locked range: Linux answers F_UNLCK and leaves the rest.
+        assert_eq!(
+            write_struct(&mut memory, LOCK, &lock(libc::F_WRLCK, 200, 50, 1234)),
+            0
+        );
+        assert_eq!(fcntl(&mut memory, &mut state, 4, libc::F_GETLK), 0);
+        let answer: libc::flock = read_struct(&memory, LOCK);
+        assert_eq!(i32::from(answer.l_type), libc::F_UNLCK);
+
+        // Overlapping, through another open description: the holder's range,
+        // with l_pid -1 (an OFD holder), never a host pid.
+        assert_eq!(
+            write_struct(&mut memory, LOCK, &lock(libc::F_RDLCK, 50, 10, 0)),
+            0
+        );
+        assert_eq!(fcntl(&mut memory, &mut state, 4, libc::F_GETLK), 0);
+        let answer: libc::flock = read_struct(&memory, LOCK);
+        assert_eq!(
+            (
+                i32::from(answer.l_type),
+                answer.l_start,
+                answer.l_len,
+                answer.l_pid
+            ),
+            (libc::F_WRLCK, 0, 100, -1)
+        );
+
+        // The holder's own description does not conflict with itself.
+        assert_eq!(
+            write_struct(&mut memory, LOCK, &lock(libc::F_WRLCK, 50, 10, 0)),
+            0
+        );
+        assert_eq!(fcntl(&mut memory, &mut state, 3, libc::F_OFD_GETLK), 0);
+        let answer: libc::flock = read_struct(&memory, LOCK);
+        assert_eq!(i32::from(answer.l_type), libc::F_UNLCK);
+
+        // A query through a bad address faults.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_fcntl,
+                [3, libc::F_GETLK as u64, 2 * PAGE_SIZE, 0, 0, 0],
+            ),
+            negative_errno(libc::EFAULT)
         );
     }
 
