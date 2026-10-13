@@ -374,6 +374,8 @@ pub(crate) struct TaskLifecycleTable {
     >,
     process_exits: std::collections::BTreeMap<(i32, u64), ProcessExitState>,
     pub(crate) parent_death: parent_death::ParentDeathState,
+    /// Thread-group id of the root guest the table was created for.
+    root_tgid: Option<i32>,
 }
 
 #[derive(Debug, Default)]
@@ -385,9 +387,19 @@ struct ProcessExitState {
 
 impl TaskLifecycleTable {
     pub(crate) fn with_root(tid: i32, tgid: i32, pgid: i32, dumpable: bool) -> Self {
-        let mut table = Self::default();
+        let mut table = Self {
+            root_tgid: Some(tgid),
+            ..Self::default()
+        };
         table.register(tid, tgid, pgid, dumpable);
         table
+    }
+
+    /// True when the root guest is not PID 1, so the namespace init it is
+    /// parented to (`getppid() == 1`) is synthesized rather than a guest task.
+    pub(crate) fn synthesizes_namespace_init(&self) -> bool {
+        self.root_tgid
+            .is_some_and(|root| root != crate::vm::CONTAINER_INIT_PID)
     }
 
     pub(crate) fn register(&mut self, tid: i32, tgid: i32, pgid: i32, dumpable: bool) -> u64 {

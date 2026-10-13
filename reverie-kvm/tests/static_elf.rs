@@ -10152,10 +10152,12 @@ int main(int argc, char **argv) {
   int hold[2] = {-1, -1};
   if ((mode == 0 || (mode >= 6 && mode <= 9)) && pipe(ready) != 0) return 10;
   if (mode == 9 && (pipe(verdict) != 0 || pipe(release) != 0 || pipe(hold) != 0)) return 26;
+  /* Read before fork: once this process exits the child is reparented, and
+     its getppid() names the namespace init, which never exits. */
+  pid_t root = getpid();
   pid_t child = fork();
   if (child < 0) return 11;
   if (child == 0) {
-    pid_t root = getppid();
     if (mode == 4 || mode == 5 || mode == 7 || mode == 8) {
       struct sigaction action = {0};
       action.sa_handler = (mode == 4 || mode == 7) ? SIG_IGN : SIG_DFL;

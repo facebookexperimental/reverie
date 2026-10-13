@@ -20887,12 +20887,14 @@ fn kill_signal(state: &mut LoadedStaticElf, number: u64, args: &[u64; 6]) -> Sys
     }
 
     let targets_self = {
-        let processes: Vec<(i32, i32)> = state
-            .task_lifecycle
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .processes()
-            .collect();
+        let (processes, synthesized_init) = {
+            let lifecycle = state
+                .task_lifecycle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let processes: Vec<(i32, i32)> = lifecycle.processes().collect();
+            (processes, lifecycle.synthesizes_namespace_init())
+        };
         match target {
             // Process groups are distinct from thread groups. A fork inherits
             // its parent's PGID, so group delivery is supported only when the
@@ -20950,6 +20952,16 @@ fn kill_signal(state: &mut LoadedStaticElf, number: u64, args: &[u64; 6]) -> Sys
                 true
             }
             _ if target == state.pid => true,
+            // A root guest that is not PID 1 is parented to the synthesized
+            // namespace init (`getppid() == 1`), so a liveness probe must find
+            // that init. Delivering a signal to it is not modeled.
+            crate::vm::CONTAINER_INIT_PID if synthesized_init => {
+                return continue_with(if signal == 0 {
+                    0
+                } else {
+                    negative_errno(libc::ENOSYS)
+                });
+            }
             _ if !processes.iter().any(|(tgid, _)| *tgid == target) => {
                 return continue_with(negative_errno(libc::ESRCH));
             }
@@ -58812,6 +58824,41 @@ mod tests {
                 assert_eq!(actual, [0xa5; PAGE_SIZE as usize]);
             }
         }
+    }
+
+    #[test]
+    fn kill_probes_the_synthesized_namespace_init() {
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        // Renumber the root guest as the conventional PID 3, whose parent is
+        // the synthesized init.
+        state.pid = 3;
+        state.tid = 3;
+        state.pgid = 3;
+        state.ppid = crate::vm::CONTAINER_INIT_PID;
+        state.task_lifecycle = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::elf::TaskLifecycleTable::with_root(3, 3, 3, true),
+        ));
+        let kill = |state: &mut LoadedStaticElf, pid: i64, signal: i32| {
+            result_of(kill_signal(
+                state,
+                libc::SYS_kill as u64,
+                &[pid as u64, signal as u64, 0, 0, 0, 0],
+            ))
+        };
+        assert_eq!(kill(&mut state, 1, 0), 0);
+        assert_eq!(
+            kill(&mut state, 1, libc::SIGTERM),
+            negative_errno(libc::ENOSYS)
+        );
+        assert_eq!(kill(&mut state, 2, 0), negative_errno(libc::ESRCH));
+        assert!(state.thread_signals.lock().pending.is_empty());
+
+        // A root guest that is itself PID 1 is the init; there is no other.
+        let mut init = test_state(&root.0);
+        assert_eq!(init.pid, 1);
+        assert_eq!(kill(&mut init, 1, 0), 0);
+        assert_eq!(kill(&mut init, 2, 0), negative_errno(libc::ESRCH));
     }
 
     #[test]

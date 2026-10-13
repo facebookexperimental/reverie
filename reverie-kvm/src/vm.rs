@@ -1191,7 +1191,7 @@ fn validate_root_pid(pid: i32) -> Result<i32> {
 /// PID 1, so the conventional root guest (PID 3, see detcore `ROOT_DETPID`) has
 /// `getppid() == 1`. KVM synthesizes the guest identity rather than using a real
 /// namespace, so it must reproduce the same parent value for parity.
-const CONTAINER_INIT_PID: i32 = 1;
+pub(crate) const CONTAINER_INIT_PID: i32 = 1;
 
 /// Deterministic parent PID for the container's root guest, matching the ptrace
 /// backend. A guest that is itself the namespace init (PID 1) has no parent and
