@@ -15916,10 +15916,8 @@ fn direct_tls_getter_census(
         for word in raw.as_chunks::<8>().0 {
             targets.push(u64::from_le_bytes(*word));
         }
-        if let Some(addend) = r.r_addend {
-            if let Ok(target) = u64::try_from(addend) {
-                targets.push(target);
-            }
+        if let Some(target) = r.r_addend.and_then(|addend| u64::try_from(addend).ok()) {
+            targets.push(target);
         }
         if r.r_sym != 0 {
             let symbol = elf
