@@ -8,24 +8,21 @@
 
 // reinject stat* as fstatat unittest
 
-use reverie::Tool;
-
-#[derive(Debug, Default, Clone)]
-struct LocalState;
-
-#[reverie::tool]
-impl Tool for LocalState {
-    type GlobalState = ();
-    type ThreadState = ();
-}
-
 #[cfg(all(not(sanitized), test))]
 mod tests {
     use std::mem::MaybeUninit;
 
+    use reverie::Tool;
     use reverie_ptrace::testing::check_fn;
 
-    use super::*;
+    #[derive(Debug, Default, Clone)]
+    struct LocalState;
+
+    #[reverie::tool]
+    impl Tool for LocalState {
+        type GlobalState = ();
+        type ThreadState = ();
+    }
 
     #[test]
     fn stat_can_be_reinjected() {
