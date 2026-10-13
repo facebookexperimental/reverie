@@ -5169,6 +5169,9 @@ impl ElfExecutor {
             | (libc::SI_TKILL, reverie::SignalTarget::Thread { .. })
             | (libc::SI_TIMER, reverie::SignalTarget::Process { .. }) => true,
             (libc::SI_KERNEL, reverie::SignalTarget::Process { .. }) => signal == libc::SIGALRM,
+            // The SIGPIPE a failed pipe or socket write raises in its writer
+            // (`raise_guest_sigpipe`).
+            (libc::SI_USER, reverie::SignalTarget::Thread { .. }) => signal == libc::SIGPIPE,
             // A caller-supplied rt_sigqueueinfo/rt_tgsigqueueinfo record
             // (Linux's SIL_RT layout, e.g. SI_QUEUE), which `sigqueueinfo`
             // checked against Linux's rules when the guest queued it.
@@ -5176,10 +5179,7 @@ impl ElfExecutor {
             _ => false,
         };
         if signal > 31
-            || matches!(
-                signal,
-                libc::SIGKILL | libc::SIGSTOP | libc::SIGCHLD | libc::SIGPIPE
-            )
+            || matches!(signal, libc::SIGKILL | libc::SIGSTOP | libc::SIGCHLD)
             || !supported_provenance
         {
             return Err(reverie::syscalls::Errno::ENOSYS);
@@ -8369,14 +8369,69 @@ fn write(
             .map_or_else(io_error, |count| count as i64);
     }
 
-    write_without_sigpipe(
-        state
-            .files
-            .get(&fd)
-            .expect("owned descriptor disappeared")
-            .as_raw_fd(),
-        &bytes,
-    )
+    let host_fd = state
+        .files
+        .get(&fd)
+        .expect("owned descriptor disappeared")
+        .as_raw_fd();
+    let (written, sigpipe) = suppress_host_sigpipe_reporting(|| {
+        // SAFETY: bytes is a live host buffer and host_fd is a live backing descriptor.
+        unsafe { libc::write(host_fd, bytes.as_ptr().cast::<libc::c_void>(), bytes.len()) as i64 }
+    });
+    with_guest_sigpipe(state, written, sigpipe)
+}
+
+/// Linux raises SIGPIPE in the writing thread when a write fails because the
+/// reading side is gone (`pipe_write`, `sk_stream_error`), even after a
+/// partial count: `send_sig(SIGPIPE, current, 0)`, an SI_USER signal from the
+/// caller's own process. The real kernel made that decision for the host
+/// write `suppress_host_sigpipe_reporting` contained; this queues the guest's
+/// copy for its next return to user, then returns the write's result.
+// TODO-HUMAN-REVIEW(PR-1018): Review guest SIGPIPE synthesis.
+fn with_guest_sigpipe(state: &LoadedStaticElf, result: i64, sigpipe: bool) -> i64 {
+    if sigpipe && let Err(error) = raise_guest_sigpipe(state) {
+        return error;
+    }
+    result
+}
+
+fn raise_guest_sigpipe(state: &LoadedStaticElf) -> Result<(), i64> {
+    let signal = libc::SIGPIPE;
+    let transaction = state.signal_transaction.clone();
+    let _transaction = transaction.lock().unwrap_or_else(|p| p.into_inner());
+    {
+        let process_signals = state
+            .process_signals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let disposition = signal_disposition_with_action(
+            process_signals.dispositions.get(&signal).copied(),
+            signal,
+        );
+        let mut thread_signals = state.thread_signals.lock();
+        // An ignored, unblocked signal is discarded at generation, as Linux
+        // does, unless a Tool observes ignored signals.
+        if disposition == SignalDisposition::Ignore
+            && !thread_signals.blocked.contains(signal)
+            && !thread_signals.observe_ignored
+        {
+            return Ok(());
+        }
+        let event = reverie::SignalEvent::new(
+            signal,
+            crate::signal::signal_info_user(signal, state.pid, 0, libc::SI_USER),
+            reverie::SignalTarget::Thread {
+                pid: reverie::Pid::from_raw(state.pid),
+                tid: reverie::Pid::from_raw(state.tid),
+            },
+        )
+        .map_err(|errno| negative_errno(errno.into_raw()))?;
+        thread_signals
+            .pending
+            .enqueue(event, process_signals.pending_generation(signal))
+            .map_err(|errno| negative_errno(errno.into_raw()))?;
+    }
+    refresh_all_signalfd_readiness_locked(state)
 }
 
 fn signal_is_pending(signal: libc::c_int) -> Result<bool, libc::c_int> {
@@ -8398,6 +8453,7 @@ fn signal_is_pending(signal: libc::c_int) -> Result<bool, libc::c_int> {
     }
 }
 
+#[cfg(test)]
 fn write_without_sigpipe(fd: RawFd, bytes: &[u8]) -> i64 {
     suppress_host_sigpipe(|| {
         // SAFETY: bytes is a live host buffer and fd is a live backing descriptor.
@@ -8405,18 +8461,26 @@ fn write_without_sigpipe(fd: RawFd, bytes: &[u8]) -> i64 {
     })
 }
 
+#[cfg(test)]
 fn suppress_host_sigpipe(operation: impl FnOnce() -> i64) -> i64 {
+    suppress_host_sigpipe_reporting(operation).0
+}
+
+/// `suppress_host_sigpipe`, also reporting whether the host kernel raised
+/// SIGPIPE for this operation: the decision Linux would have made for the
+/// guest.
+fn suppress_host_sigpipe_reporting(operation: impl FnOnce() -> i64) -> (i64, bool) {
     // A guest backing pipe must not deliver SIGPIPE into the supervisor. Block it in this thread,
     // then synchronously consume the signal generated by this write while preserving a signal that
     // was already pending before the write.
     let mut blocked = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
     // SAFETY: blocked is writable and sigemptyset initializes it on success.
     if unsafe { libc::sigemptyset(blocked.as_mut_ptr()) } != 0 {
-        return io_error(std::io::Error::last_os_error());
+        return (io_error(std::io::Error::last_os_error()), false);
     }
     // SAFETY: sigemptyset initialized blocked, and SIGPIPE is a valid signal.
     if unsafe { libc::sigaddset(blocked.as_mut_ptr(), libc::SIGPIPE) } != 0 {
-        return io_error(std::io::Error::last_os_error());
+        return (io_error(std::io::Error::last_os_error()), false);
     }
     // SAFETY: both calls above initialized blocked.
     let blocked = unsafe { blocked.assume_init() };
@@ -8425,7 +8489,7 @@ fn suppress_host_sigpipe(operation: impl FnOnce() -> i64) -> i64 {
     let mask_result =
         unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, previous.as_mut_ptr()) };
     if mask_result != 0 {
-        return negative_errno(mask_result);
+        return (negative_errno(mask_result), false);
     }
     // SAFETY: pthread_sigmask initialized previous on success.
     let previous = unsafe { previous.assume_init() };
@@ -8437,7 +8501,7 @@ fn suppress_host_sigpipe(operation: impl FnOnce() -> i64) -> i64 {
             unsafe {
                 libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
             }
-            return negative_errno(error);
+            return (negative_errno(error), false);
         }
     };
 
@@ -8445,6 +8509,7 @@ fn suppress_host_sigpipe(operation: impl FnOnce() -> i64) -> i64 {
     let error = (written < 0).then(std::io::Error::last_os_error);
 
     let mut drain_error = None;
+    let mut generated = false;
     // A pipe write can return a positive partial count and still generate
     // SIGPIPE if its reader closes before the remaining bytes are written.
     // Drain any newly pending SIGPIPE, not only an EPIPE result.
@@ -8457,6 +8522,7 @@ fn suppress_host_sigpipe(operation: impl FnOnce() -> i64) -> i64 {
                     let wait_result = unsafe { libc::sigwait(&blocked, &mut signal) };
                     if wait_result == 0 {
                         debug_assert_eq!(signal, libc::SIGPIPE);
+                        generated = true;
                         break;
                     }
                     if wait_result != libc::EINTR {
@@ -8474,12 +8540,19 @@ fn suppress_host_sigpipe(operation: impl FnOnce() -> i64) -> i64 {
     let restore_result =
         unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut()) };
     if restore_result != 0 {
-        return negative_errno(restore_result);
+        return (negative_errno(restore_result), false);
     }
     if let Some(error) = drain_error {
-        return negative_errno(error);
+        return (negative_errno(error), false);
     }
-    error.map_or(written, io_error)
+    // With a host SIGPIPE already pending, a new one cannot be told apart;
+    // EPIPE is then the evidence Linux's write paths raise it on.
+    let generated = generated
+        || (had_pending_sigpipe
+            && error
+                .as_ref()
+                .is_some_and(|error| error.raw_os_error() == Some(libc::EPIPE)));
+    (error.map_or(written, io_error), generated)
 }
 
 fn host_write(fd: RawFd, bytes: &[u8]) -> i64 {
@@ -9423,13 +9496,23 @@ fn validate_positioned_vectored_flags(
     Ok(())
 }
 
+#[cfg(test)]
 fn invoke_vectored_write(
     number: libc::c_long,
     host_fd: RawFd,
     host_iovecs: &mut [libc::iovec],
     args: &[u64; 6],
 ) -> i64 {
-    suppress_host_sigpipe(|| {
+    invoke_vectored_write_reporting(number, host_fd, host_iovecs, args).0
+}
+
+fn invoke_vectored_write_reporting(
+    number: libc::c_long,
+    host_fd: RawFd,
+    host_iovecs: &mut [libc::iovec],
+    args: &[u64; 6],
+) -> (i64, bool) {
+    suppress_host_sigpipe_reporting(|| {
         // SAFETY: every host iovec points into a live buffer for its declared
         // length, and host_fd belongs to the translated guest descriptor. The
         // positioned syscalls receive their complete x86-64 argument shape.
@@ -9761,7 +9844,9 @@ fn staged_vectored_transfer(
     };
     let mut host_iovecs = staged_host_iovecs(&mut staged_vectors);
     if !reading {
-        return invoke_vectored_write(number, host_fd, &mut host_iovecs, args);
+        let (written, sigpipe) =
+            invoke_vectored_write_reporting(number, host_fd, &mut host_iovecs, args);
+        return with_guest_sigpipe(state, written, sigpipe);
     }
 
     let result = invoke_vectored_read(number, host_fd, &mut host_iovecs, args);
@@ -21269,7 +21354,7 @@ const KERNEL_SIGINFO_SIZE: usize = 48;
 /// (`EINVAL`); and a caller may supply a kernel or `tkill` code
 /// (`si_code >= 0` or `SI_TKILL`) only when the id it names is its own tid
 /// (`EPERM`). Every delivery `kill_signal` refuses (another process,
-/// real-time queues, `SIGCHLD`/`SIGPIPE`, stop signals) stays refused.
+/// real-time queues, `SIGCHLD`, stop signals) stays refused.
 fn sigqueueinfo(
     memory: &GuestMemory,
     state: &mut LoadedStaticElf,
@@ -21460,7 +21545,9 @@ fn send_signal(
     // These producer classes require state this first foundation does not yet
     // model. Reject them before mask/disposition handling so a blocked or
     // ignored action cannot turn an unsupported delivery into false success.
-    if signal > 31 || matches!(signal, libc::SIGCHLD | libc::SIGPIPE) {
+    // SIGPIPE is an ordinary signal here, as a broken-pipe write raises it
+    // (`raise_guest_sigpipe`).
+    if signal > 31 || signal == libc::SIGCHLD {
         return continue_with(negative_errno(libc::ENOSYS));
     }
 
@@ -21550,7 +21637,7 @@ fn send_thread_signal(
         if task.tgid != state.pid {
             return continue_with(negative_errno(libc::ENOSYS));
         }
-        if signal > 31 || matches!(signal, libc::SIGCHLD | libc::SIGPIPE) {
+        if signal > 31 || signal == libc::SIGCHLD {
             return continue_with(negative_errno(libc::ENOSYS));
         }
         if signal == libc::SIGKILL {
@@ -51009,6 +51096,171 @@ mod tests {
         );
     }
 
+    /// A write to a pipe whose reader is gone raises SIGPIPE in the writer, as
+    /// Linux's pipe_write does: SI_USER from the caller's own process, for
+    /// write and for the vectored writes, beside the EPIPE result. An
+    /// ignored, unblocked SIGPIPE is discarded at generation.
+    #[test]
+    fn broken_pipe_writes_raise_sigpipe_in_the_writer() {
+        const MASK: u64 = 0x100;
+        const PIPE_FDS: u64 = 0x140;
+        const DATA: u64 = 0x180;
+        const IOV: u64 = 0x1c0;
+        const INFO: u64 = 0x200;
+        const ACTION: u64 = 0x300;
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let pid = state.pid;
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let mut mask = KernelSigset::default();
+        mask.insert(libc::SIGPIPE);
+        memory.write(MASK, &mask.to_bytes()).unwrap();
+        memory.write(DATA, b"x").unwrap();
+        let iov = libc::iovec {
+            iov_base: DATA as *mut libc::c_void,
+            iov_len: 1,
+        };
+        assert_eq!(write_struct(&mut memory, IOV, &iov), 0);
+        test_block_signal(&mut state, libc::SIGPIPE);
+        let signal_fd = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_signalfd4,
+            [
+                u64::MAX,
+                MASK,
+                KERNEL_SIGSET_SIZE as u64,
+                libc::SFD_NONBLOCK as u64,
+                0,
+                0,
+            ],
+        );
+        assert!(signal_fd >= 3);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_pipe2,
+                [PIPE_FDS, 0, 0, 0, 0, 0]
+            ),
+            0
+        );
+        let [read_fd, write_fd]: [libc::c_int; 2] = read_struct(&memory, PIPE_FDS);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_close,
+                [read_fd as u64, 0, 0, 0, 0, 0]
+            ),
+            0
+        );
+        let read_info = |memory: &mut GuestMemory, state: &mut LoadedStaticElf| {
+            let result = syscall_result(
+                memory,
+                state,
+                libc::SYS_read,
+                [signal_fd as u64, INFO, 128, 0, 0, 0],
+            );
+            (result == 128).then(|| read_struct::<libc::signalfd_siginfo>(memory, INFO))
+        };
+        for (number, args) in [
+            (libc::SYS_write, [write_fd as u64, DATA, 1, 0, 0, 0]),
+            (libc::SYS_writev, [write_fd as u64, IOV, 1, 0, 0, 0]),
+            (
+                libc::SYS_pwritev2,
+                [write_fd as u64, IOV, 1, u64::MAX, u64::MAX, 0],
+            ),
+        ] {
+            assert_eq!(
+                syscall_result(&mut memory, &mut state, number, args),
+                -i64::from(libc::EPIPE),
+                "syscall {number}",
+            );
+            let info = read_info(&mut memory, &mut state).expect("SIGPIPE was raised");
+            assert_eq!(info.ssi_signo, libc::SIGPIPE as u32);
+            assert_eq!(info.ssi_code, libc::SI_USER);
+            assert_eq!(info.ssi_pid, pid as u32);
+            assert_eq!(info.ssi_uid, 0);
+            assert!(
+                read_info(&mut memory, &mut state).is_none(),
+                "one signal per write"
+            );
+        }
+
+        // The writer's own SIGPIPE and a kill(2)'d process SIGPIPE are both
+        // pending, on the thread and on the process, and a signalfd returns
+        // both records.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_write,
+                [write_fd as u64, DATA, 1, 0, 0, 0]
+            ),
+            -i64::from(libc::EPIPE),
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_kill,
+                [pid as u64, libc::SIGPIPE as u64, 0, 0, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_read,
+                [signal_fd as u64, INFO, 256, 0, 0, 0],
+            ),
+            256
+        );
+        for index in 0..2_u64 {
+            let info: libc::signalfd_siginfo = read_struct(&memory, INFO + 128 * index);
+            assert_eq!(
+                (info.ssi_signo, info.ssi_code, info.ssi_pid),
+                (libc::SIGPIPE as u32, libc::SI_USER, pid as u32),
+                "record {index}",
+            );
+        }
+        assert!(read_info(&mut memory, &mut state).is_none());
+
+        // Ignored and unblocked: discarded, the write still fails.
+        let mut action = [0_u8; KERNEL_SIGACTION_SIZE];
+        action[..8].copy_from_slice(&(libc::SIG_IGN as u64).to_ne_bytes());
+        memory.write(ACTION, &action).unwrap();
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_rt_sigaction,
+                [
+                    libc::SIGPIPE as u64,
+                    ACTION,
+                    0,
+                    KERNEL_SIGSET_SIZE as u64,
+                    0,
+                    0
+                ],
+            ),
+            0
+        );
+        state.thread_signals.lock().blocked.remove(libc::SIGPIPE);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_write,
+                [write_fd as u64, DATA, 1, 0, 0, 0]
+            ),
+            -i64::from(libc::EPIPE),
+        );
+        assert!(read_info(&mut memory, &mut state).is_none());
+    }
+
     /// rt_sigqueueinfo and rt_tgsigqueueinfo queue the caller's siginfo
     /// (https://man7.org/linux/man-pages/man2/rt_sigqueueinfo.2.html): a
     /// blocked SIGUSR1 reads back from a signalfd with the caller's SI_QUEUE
@@ -62583,7 +62835,6 @@ mod tests {
             (-1_i32, libc::SIGUSR1, libc::ESRCH),
             (-7, libc::SIGUSR1, libc::ESRCH),
             (1, libc::SIGCHLD, libc::ENOSYS),
-            (1, libc::SIGPIPE, libc::ENOSYS),
             (1, libc::SIGRTMIN(), libc::ENOSYS),
         ] {
             let mut state = test_state(&dir.0);
@@ -63783,7 +64034,6 @@ mod tests {
             (1, 7, libc::SIGKILL, -libc::ENOSYS),
             (1, 7, libc::SIGSTOP, -libc::ENOSYS),
             (1, 7, libc::SIGCHLD, -libc::ENOSYS),
-            (1, 7, libc::SIGPIPE, -libc::ENOSYS),
             (1, 7, libc::SIGRTMIN(), -libc::ENOSYS),
             (1, 7, 65, -libc::EINVAL),
             (0, 7, libc::SIGUSR1, -libc::EINVAL),
