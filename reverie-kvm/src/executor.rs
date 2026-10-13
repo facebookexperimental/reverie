@@ -576,48 +576,69 @@ fn execute_basic_syscall_dispatch(
     let new_shared_file = number == libc::SYS_mmap as u64
         && args[3] & libc::MAP_ANONYMOUS as u64 == 0
         && args[3] & libc::MAP_SHARED as u64 != 0;
-    if number == libc::SYS_mmap as u64 && (new_shared_file || owner.contains_shared_file()) {
+    if number == libc::SYS_mmap as u64 && (new_shared_file || owner.contains_retained_shared()) {
         return match mmap_with_shared_files(memory, state, args, output.is_some(), transaction) {
             Ok(result) => continue_with(result),
             Err(error) => SyscallAction::Failure(error),
         };
     }
-    // The shared-file metadata is by physical address; the munmap range is a
+    // The shared-view metadata is by physical address; the munmap range is a
     // user address (a window's, in Linux's layout).
-    if number == libc::SYS_munmap as u64 && owner.user_range_contains_shared_file(args[0], args[1])
+    if number == libc::SYS_munmap as u64
+        && owner.user_range_contains_retained_shared(args[0], args[1])
     {
         return match munmap_shared_file(&owner, args[0], args[1], transaction) {
             Ok(result) => continue_with(result),
             Err(error) => SyscallAction::Failure(error),
         };
     }
-    let touches_file_remap = number == libc::SYS_mremap as u64
-        && shared_file::remap_requires_shared_capability(&owner, state, args);
+    // Each check runs once for any retained shared view and once for an
+    // ordinary file alone, which names the refusal.
+    let touches_remap = |contains: fn(&GuestMemory, u64, usize) -> bool| {
+        number == libc::SYS_mremap as u64
+            && shared_file::remap_requires_shared_capability(&owner, state, args, contains)
+    };
     // Growth needs no check here: brk refuses growth that reaches any
     // mapping, a shared file view included, before it changes anything, and
     // returns the old break as Linux does.
-    let touches_file_brk = number == libc::SYS_brk as u64
-        && args[0] >= BOOT_RESERVED_END.max(state.min_break)
-        && args[0] < state.program_break
-        && {
-            // Shrinking retires mappings. Check the exact page-rounded
-            // interval used by brk, before its legacy errno adapter could
-            // hide a shared-file capability refusal as the old break value.
-            match (
-                align_up(args[0], PAGE_SIZE),
-                align_up(state.program_break, PAGE_SIZE),
-            ) {
-                (Some(start), Some(end)) if end > start => {
-                    owner.user_range_contains_shared_file(start, end - start)
+    let touches_brk = |contains: fn(&GuestMemory, u64, usize) -> bool| {
+        number == libc::SYS_brk as u64
+            && args[0] >= BOOT_RESERVED_END.max(state.min_break)
+            && args[0] < state.program_break
+            && {
+                // Shrinking retires mappings. Check the exact page-rounded
+                // interval used by brk, before its legacy errno adapter could
+                // hide a shared-file capability refusal as the old break value.
+                match (
+                    align_up(args[0], PAGE_SIZE),
+                    align_up(state.program_break, PAGE_SIZE),
+                ) {
+                    (Some(start), Some(end)) if end > start => owner
+                        .user_range_to_guest(start, end - start)
+                        .is_some_and(|physical| {
+                            contains(
+                                &owner,
+                                physical,
+                                (end - start).try_into().unwrap_or(usize::MAX),
+                            )
+                        }),
+                    _ => false,
                 }
-                _ => false,
             }
-        };
+    };
+    let touches_file_remap = touches_remap(GuestMemory::range_contains_retained_shared);
+    let touches_file_brk = touches_brk(GuestMemory::range_contains_retained_shared);
     if touches_file_remap || touches_file_brk {
+        let ordinary_file = touches_remap(GuestMemory::range_contains_shared_file)
+            || touches_brk(GuestMemory::range_contains_shared_file);
         drop(transaction);
         return SyscallAction::Failure(crate::Error::SharedFileCapability {
             operation: if touches_file_remap { "mremap" } else { "brk" },
-            reason: "this layout operation intersects an ordinary shared-file view",
+            reason: if ordinary_file {
+                "this layout operation intersects an ordinary shared-file view"
+            } else {
+                "this layout operation intersects a fork-shared anonymous view"
+            },
         });
     }
     let action = execute_basic_syscall_inner(
@@ -19773,7 +19794,7 @@ fn mremap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]
     };
     // Refuse a destination the remap below would refuse, before any byte is
     // copied or zeroed.
-    if memory.range_contains_shared_file(destination, new_length_usize) {
+    if memory.range_contains_retained_shared(destination, new_length_usize) {
         return negative_errno(libc::EFAULT);
     }
     let Ok(reservation) = memory.reserve_region(destination, new_length, RegionKind::Mmap) else {
@@ -53636,6 +53657,140 @@ mod tests {
         memory.write(moved, b"replaced").unwrap();
         assert_eq!(dontneed(&mut memory, &mut state, moved, PAGE_SIZE), 0);
         assert_eq!(page_bytes(&memory, moved), [0; 8]);
+    }
+
+    /// Linux backs `MAP_SHARED | MAP_ANONYMOUS` with one shmem object that a
+    /// forked child shares with its parent: a store by either process after
+    /// the fork is visible to the other. Private anonymous memory is copied.
+    #[test]
+    fn shared_anonymous_memory_stays_shared_with_a_forked_child() {
+        let (_root, mut state, mut memory) = madvise_memory(12);
+        let shared = madvise_map(
+            &mut memory,
+            &mut state,
+            libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+            -1,
+            2,
+        );
+        let private = madvise_map(
+            &mut memory,
+            &mut state,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            1,
+        );
+        memory.write(shared, b"prefork!").unwrap();
+        memory.write(private, b"private!").unwrap();
+
+        let mut child = memory.snapshot().unwrap();
+        assert_eq!(&page_bytes(&child, shared), b"prefork!");
+        assert_eq!(&page_bytes(&child, private), b"private!");
+
+        // Parent to child, and child to parent, on both pages of the mapping.
+        memory.write(shared, b"parent!!").unwrap();
+        assert_eq!(&page_bytes(&child, shared), b"parent!!");
+        child.write(shared + PAGE_SIZE, b"child!!!").unwrap();
+        assert_eq!(&page_bytes(&memory, shared + PAGE_SIZE), b"child!!!");
+
+        // Private anonymous memory stays a private copy in each direction.
+        memory.write(private, b"parentpv").unwrap();
+        child.write(private, b"childpv!").unwrap();
+        assert_eq!(&page_bytes(&memory, private), b"parentpv");
+        assert_eq!(&page_bytes(&child, private), b"childpv!");
+
+        // A grandchild joins the same object.
+        let grandchild = child.snapshot().unwrap();
+        memory.write(shared, b"third!!!").unwrap();
+        assert_eq!(&page_bytes(&grandchild, shared), b"third!!!");
+        assert_eq!(&page_bytes(&child, shared), b"third!!!");
+
+        // Unmapping in one process leaves the object intact for the others,
+        // and the freed parent page no longer aliases it.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_munmap,
+                [shared, 2 * PAGE_SIZE, 0, 0, 0, 0],
+            ),
+            0
+        );
+        assert_eq!(&page_bytes(&child, shared), b"third!!!");
+        assert_eq!(&page_bytes(&grandchild, shared + PAGE_SIZE), b"child!!!");
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_mmap,
+                [
+                    shared,
+                    PAGE_SIZE,
+                    (libc::PROT_READ | libc::PROT_WRITE) as u64,
+                    (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED) as u64,
+                    -1_i32 as u64,
+                    0,
+                ],
+            ),
+            shared as i64
+        );
+        assert_eq!(page_bytes(&memory, shared), [0; 8]);
+        memory.write(shared, b"reused!!").unwrap();
+        assert_eq!(&page_bytes(&child, shared), b"third!!!");
+        assert_eq!(&page_bytes(&grandchild, shared), b"third!!!");
+
+        // A new shared anonymous mapping over an inherited one is a new object:
+        // the child's later fork shares it, and the grandchild keeps the old.
+        assert_eq!(
+            syscall_result(
+                &mut child,
+                &mut state,
+                libc::SYS_mmap,
+                [
+                    shared,
+                    PAGE_SIZE,
+                    (libc::PROT_READ | libc::PROT_WRITE) as u64,
+                    (libc::MAP_SHARED | libc::MAP_ANONYMOUS | libc::MAP_FIXED) as u64,
+                    -1_i32 as u64,
+                    0,
+                ],
+            ),
+            shared as i64
+        );
+        assert_eq!(page_bytes(&child, shared), [0; 8]);
+        assert_eq!(&page_bytes(&grandchild, shared), b"third!!!");
+        child.write(shared, b"newobj!!").unwrap();
+        let second = child.snapshot().unwrap();
+        child.write(shared, b"newobj2!").unwrap();
+        assert_eq!(&page_bytes(&second, shared), b"newobj2!");
+        assert_eq!(&page_bytes(&grandchild, shared), b"third!!!");
+        assert_eq!(&page_bytes(&memory, shared), b"reused!!");
+    }
+
+    /// Sharing the object needs the forking address space quiescent. With
+    /// another live participant, the fork refuses by name instead of handing
+    /// the child a private copy, and the parent's memory is unchanged.
+    #[test]
+    fn shared_anonymous_fork_refuses_with_another_live_participant() {
+        let (_root, mut state, mut memory) = madvise_memory(4);
+        let shared = madvise_map(
+            &mut memory,
+            &mut state,
+            libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+            -1,
+            1,
+        );
+        memory.write(shared, b"prefork!").unwrap();
+        let _forking = memory.entry_gate().register().unwrap();
+        let _sibling = memory.entry_gate().register().unwrap();
+        match memory.snapshot() {
+            Err(crate::Error::SharedFileCapability { operation, .. }) => {
+                assert_eq!(operation, "fork with shared anonymous memory");
+            }
+            Err(other) => panic!("expected the shared anonymous fork refusal, got {other}"),
+            Ok(_) => panic!("fork with a live sibling copied shared anonymous memory"),
+        }
+        assert_eq!(memory.separately_backed_pages(), 0);
+        assert_eq!(&page_bytes(&memory, shared), b"prefork!");
     }
 
     #[test]

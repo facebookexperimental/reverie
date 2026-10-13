@@ -11689,6 +11689,7 @@ fn repair_prctl_required_kvm_is_not_optional() {
         "msync_lifecycle::shared_coherence_and_mapping_lifetime_match_native",
         "shared_file_fork_settled_visibility_close_reuse_and_private_cow_match_native",
         "shared_file_fork_clear_tid_records_native_and_checks_kvm_last_owner",
+        "shared_anonymous_fork_shares_one_object_across_fork_unmap_and_exec_like_native",
         "pdeathsig::unchanged_six_check_state_matches_native_controlled",
         "pdeathsig::direct_host_and_unopted_control_preserve_nonzero_refusal",
         "pdeathsig::creator_thread_death_and_clear_match_native_shared_pending",
@@ -21525,6 +21526,72 @@ fn shared_file_fork_settled_visibility_close_reuse_and_private_cow_match_native(
         assert_eq!(stderr, native.stderr, "mode={name}");
         assert_eq!(stdout, native.stdout, "mode={name}");
         eprintln!("shared-file-fork completed {name}: child=0 syncs=2");
+    }
+}
+
+#[test]
+fn shared_anonymous_fork_shares_one_object_across_fork_unmap_and_exec_like_native() {
+    const TEST: &str =
+        "shared_anonymous_fork_shares_one_object_across_fork_unmap_and_exec_like_native";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "shared-anonymous-fork",
+        include_str!("fixtures/shared_anonymous_fork.c"),
+    );
+    let image = std::fs::read(&program).unwrap();
+    let native = std::process::Command::new(&program)
+        .current_dir(&directory.0)
+        .output()
+        .unwrap();
+    assert_eq!(native.status.code(), Some(0), "{native:?}");
+    assert!(native.stderr.is_empty(), "{native:?}");
+    assert_eq!(
+        native.stdout,
+        b"shared anonymous fork child=ok grandchild=ok cow=ok unmap=ok exec=ok\n"
+    );
+    for (name, ownership) in [
+        ("direct", None),
+        ("host", Some(ThreadOwnership::Host)),
+        ("tool", Some(ThreadOwnership::Tool)),
+    ] {
+        let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+        backend
+            .install_static_elf_with_context(
+                &image,
+                &[program.to_str().unwrap()],
+                &[],
+                &directory.0,
+            )
+            .unwrap();
+        let (code, stdout, stderr) = if let Some(ownership) = ownership {
+            backend.set_thread_ownership(ownership);
+            let (trace, code, stdout, stderr) = futures::executor::block_on(
+                backend.run_static_elf_with_tool::<StraceTool>((), true),
+            )
+            .unwrap();
+            // The exec is proven by the exec child's zero status, which only
+            // the new image can return.
+            assert_eq!(
+                trace
+                    .syscalls()
+                    .iter()
+                    .filter(|name| name.as_str() == "fork")
+                    .count(),
+                3,
+                "ownership={ownership:?}: code={code} stdout={stdout:?} stderr={stderr:?}"
+            );
+            (code, stdout, stderr)
+        } else {
+            backend.run_static_elf_captured().unwrap()
+        };
+        assert_eq!(code, 0, "mode={name}: stdout={stdout:?} stderr={stderr:?}");
+        assert_eq!(stderr, native.stderr, "mode={name}");
+        assert_eq!(stdout, native.stdout, "mode={name}");
+        eprintln!("shared-anonymous-fork completed {name}: forks=3");
     }
 }
 

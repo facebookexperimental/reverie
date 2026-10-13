@@ -140,15 +140,19 @@ pub(super) fn mmap_with_shared_files(
         return Ok(negative_errno(libc::ENOMEM));
     };
     let ordinary_shared = !is_anonymous && is_shared;
-    let replaces_file = memory.range_contains_shared_file(address, length);
-    if is_anonymous && is_shared && replaces_file {
+    if is_anonymous && is_shared && memory.range_contains_shared_file(address, length) {
         // Retiring the last ordinary file releases its single-vCPU domain.
-        // A shared anonymous replacement would then need separate fork-sharing
-        // ownership; a private replacement must not silently stand in for it.
+        // This bounded path does not establish that replacing a file view by
+        // shared anonymous memory preserves every guarantee of that domain.
         return Err(unsupported_mmap(
             "shared anonymous replacement requires independent fork-sharing ownership",
         ));
     }
+    // Replacing a fork-shared anonymous view by shared anonymous memory gets
+    // fresh private backing marked shared; the next fork moves it into its own
+    // shmem object, as for a new shared anonymous mapping (see
+    // `GuestMemory::share_anonymous_memory_for_fork`).
+    let replaces_file = memory.range_contains_retained_shared(address, length);
     if !ordinary_shared && !replaces_file {
         // This branch cannot zero an outgoing file view. Keep the existing
         // private/anonymous personality, including its flag and errno rules.
@@ -290,7 +294,12 @@ pub(super) fn mmap_with_shared_files(
             },
         )?;
     }
-    memory.record_file_pages(address, length as u64, kind.file_offset());
+    memory.record_page_backing(
+        address,
+        length as u64,
+        kind.file_offset(),
+        is_anonymous && is_shared,
+    );
     state.mmap_next = cursors.mmap_next;
     Ok(memory.physical_to_user(address).unwrap_or(address) as i64)
 }
@@ -301,6 +310,7 @@ pub(super) fn remap_requires_shared_capability(
     memory: &GuestMemory,
     state: &LoadedStaticElf,
     args: &[u64; 6],
+    contains: fn(&GuestMemory, u64, usize) -> bool,
 ) -> bool {
     let Some(old_length) = align_up(args[1], PAGE_SIZE) else {
         return false;
@@ -345,9 +355,8 @@ pub(super) fn remap_requires_shared_capability(
         }
         destination = Some(start);
     }
-    memory.range_contains_shared_file(source, old_length as usize)
-        || destination
-            .is_some_and(|start| memory.range_contains_shared_file(start, new_length as usize))
+    contains(memory, source, old_length as usize)
+        || destination.is_some_and(|start| contains(memory, start, new_length as usize))
 }
 
 #[cfg(test)]

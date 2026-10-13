@@ -122,8 +122,27 @@ pub(crate) struct DontneedPlan {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BackingKind {
+    /// Memory private to one address space: the arena itself, or a separately
+    /// retained private page.
     Fixed,
-    OrdinaryFile { max_writable: bool },
+    /// The shmem object behind `MAP_SHARED | MAP_ANONYMOUS` once a fork has
+    /// made it reachable from more than one address space. Each holder maps
+    /// the same backend-owned memfd, so a store through one is visible to all,
+    /// as with Linux's shmem object. The guest cannot reach or truncate this
+    /// file, so it is accessed like fixed RAM.
+    SharedAnonymous,
+    OrdinaryFile {
+        max_writable: bool,
+    },
+}
+
+impl BackingKind {
+    /// Whether this backing outlives its mapping in this address space and may
+    /// be shared with another: such a page cannot be zeroed, discarded or
+    /// moved in place, only replaced by a physical publication.
+    fn retained_shared(self) -> bool {
+        !matches!(self, Self::Fixed)
+    }
 }
 
 /// How a user copyout treats a destination that is not wholly writable, and
@@ -172,6 +191,14 @@ impl Backing {
             kind: BackingKind::Fixed,
         })
     }
+
+    /// A zero-filled shmem object for shared anonymous memory.
+    fn new_shared_anonymous(length: usize) -> io::Result<Self> {
+        Ok(Self {
+            kind: BackingKind::SharedAnonymous,
+            ..Self::new(length)?
+        })
+    }
 }
 
 /// An owned range of a fixed-size backing, independent of any mmap view.
@@ -196,7 +223,11 @@ impl BackingSlice {
         libc::off_t::try_from(offset).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "backing offset exceeds off_t")
         })?;
-        if backing.kind == BackingKind::Fixed && end > backing.length {
+        if matches!(
+            backing.kind,
+            BackingKind::Fixed | BackingKind::SharedAnonymous
+        ) && end > backing.length
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "backing slice exceeds its backing",
@@ -1239,8 +1270,10 @@ impl GuestMemory {
         const COPY_CHUNK: usize = 1024 * 1024;
 
         self.check_copy_failure()?;
-        let _allocation = self.allocation_guard();
-        if self.contains_shared_file() {
+        // Shared anonymous memory becomes a separately retained object before
+        // it is inherited, so the child shares it rather than copying it.
+        let _allocation = self.share_anonymous_memory_for_fork()?;
+        if self.contains_retained_shared() {
             return self.snapshot_with_shared_files(_allocation);
         }
         if self.entry_gate().single_member_domain_active() {
@@ -1589,7 +1622,7 @@ impl GuestMemory {
     /// memory with ordinary-file views alone (that refusal is already
     /// recorded), so their pages keep their user addresses.
     pub(crate) fn clear_user_layout(&self) {
-        if self.contains_shared_file() {
+        if self.contains_retained_shared() {
             return;
         }
         let mut state = self
@@ -1668,6 +1701,18 @@ impl GuestMemory {
             })
     }
 
+    /// Whether the user range `[address, address + length)` holds a retained
+    /// shared page: an ordinary file, or fork-shared anonymous memory.
+    pub(crate) fn user_range_contains_retained_shared(&self, address: u64, length: u64) -> bool {
+        self.user_range_to_guest(address, length)
+            .is_some_and(|physical| {
+                self.range_contains_retained_shared(
+                    physical,
+                    length.try_into().unwrap_or(usize::MAX),
+                )
+            })
+    }
+
     /// Whether `[address, address + length)` is one contiguous range of user
     /// addresses, mapped or not.
     pub(crate) fn user_range_is_addressable(&self, address: u64, length: u64) -> bool {
@@ -1686,10 +1731,10 @@ impl GuestMemory {
 
     // TODO-HUMAN-REVIEW(PR-132): Review the host-side KVM user mapping API.
     pub(crate) fn clear_user_access(&self) {
-        if self.contains_shared_file() {
+        if self.contains_retained_shared() {
             self.capture_shared_file_error(Error::SharedFileCapability {
                 operation: "clear user access",
-                reason: "ordinary-file views must retire before reset",
+                reason: "ordinary-file and shared anonymous views must retire before reset",
             });
             return;
         }
@@ -1772,10 +1817,10 @@ impl GuestMemory {
 
     // TODO-HUMAN-REVIEW(PR-132): Review the host-side KVM user mapping API.
     pub(crate) fn unmap_user_range(&self, guest_address: u64, length: u64) -> Result<()> {
-        if self.range_contains_shared_file(guest_address, length as usize) {
+        if self.range_contains_retained_shared(guest_address, length as usize) {
             return Err(Error::SharedFileCapability {
                 operation: "metadata-only unmap",
-                reason: "ordinary-file backing requires physical private replacement",
+                reason: "ordinary-file and shared anonymous backing require physical private replacement",
             });
         }
         let Some((first_page, last_page)) = self.checked_page_range(guest_address, length)? else {
@@ -2043,12 +2088,12 @@ impl GuestMemory {
         new_address: u64,
         new_length: u64,
     ) -> Result<()> {
-        if self.range_contains_shared_file(old_address, old_length as usize)
-            || self.range_contains_shared_file(new_address, new_length as usize)
+        if self.range_contains_retained_shared(old_address, old_length as usize)
+            || self.range_contains_retained_shared(new_address, new_length as usize)
         {
             return Err(Error::SharedFileCapability {
                 operation: "memory remap",
-                reason: "ordinary-file source or destination is not supported by the private-copy remapper",
+                reason: "ordinary-file or fork-shared anonymous source or destination is not supported by the private-copy remapper",
             });
         }
         let Some((old_first, old_last)) = self.checked_page_range(old_address, old_length)? else {
@@ -2318,7 +2363,7 @@ impl GuestMemory {
                 BackingKind::OrdinaryFile { .. } => {
                     self.copy_file_chunk(chunk, local, true, address, source.len(), copied)?
                 }
-                BackingKind::Fixed => unsafe {
+                BackingKind::Fixed | BackingKind::SharedAnonymous => unsafe {
                     std::ptr::copy_nonoverlapping(local, chunk.mapping.as_ptr(), chunk.length);
                 },
             }
@@ -2382,7 +2427,7 @@ impl GuestMemory {
                         zeroed,
                     )?;
                 }
-                BackingKind::Fixed => unsafe {
+                BackingKind::Fixed | BackingKind::SharedAnonymous => unsafe {
                     std::ptr::write_bytes(chunk.mapping.as_ptr(), 0, chunk.length);
                 },
             }
@@ -2421,11 +2466,12 @@ impl GuestMemory {
         let chunks = self.mapping.host_chunks(offset, length);
         if chunks
             .iter()
-            .any(|chunk| matches!(chunk.backing.kind, BackingKind::OrdinaryFile { .. }))
+            .any(|chunk| chunk.backing.kind.retained_shared())
         {
+            // Discarding would zero the shared object for every other holder.
             return Err(Error::SharedFileCapability {
                 operation: "discard pages",
-                reason: "ordinary-file views must be physically retired before reset",
+                reason: "ordinary-file and shared anonymous views must be physically retired before reset",
             });
         }
         let _guard = self
@@ -3360,10 +3406,18 @@ impl MemoryAccess for GuestMemory {
 }
 
 fn write_backing(backing: &Backing, bytes: &[u8]) -> io::Result<()> {
+    write_backing_at(backing, 0, bytes)
+}
+
+fn write_backing_at(backing: &Backing, start: usize, bytes: &[u8]) -> io::Result<()> {
     let mut written = 0;
     while written < bytes.len() {
-        let offset = libc::off_t::try_from(written)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "backing offset overflow"))?;
+        let offset = start
+            .checked_add(written)
+            .and_then(|offset| libc::off_t::try_from(offset).ok())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "backing offset overflow")
+            })?;
         // SAFETY: backing owns a writable memfd for at least bytes.len()
         // bytes, and this live slice supplies the remaining initialized input.
         let result = unsafe {
