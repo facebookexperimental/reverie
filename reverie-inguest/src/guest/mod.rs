@@ -22,6 +22,8 @@ pub mod clock;
 pub mod context;
 pub mod continuation;
 pub mod event;
+#[cfg(feature = "exec-private-init")]
+pub mod exec_private;
 #[cfg(feature = "coordinator-rpc")]
 pub mod host;
 pub mod installed_stack;

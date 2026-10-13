@@ -62,7 +62,7 @@ impl SyscallEvent {
     /// gate; the caller must be on a guest syscall path.
     pub unsafe fn forward(&mut self) -> i64 {
         let result = unsafe {
-            crate::trap::raw_syscall6_with_result(self.number, self.args, self.guest_pkru)
+            crate::trap::physical_guest_syscall6(self.number, self.args, self.guest_pkru)
         };
         // Permission effects survive negative errno and later Tool result
         // transformation. Private injection never calls this operation.

@@ -22,6 +22,8 @@ pub mod fixed_arena_fixture;
 #[cfg(feature = "allocator-fixture")]
 #[doc(hidden)]
 pub mod generic_fixture;
+#[cfg(feature = "exec-private-init")]
+mod initial_image_stats;
 mod interior_entry;
 mod patch_alloc;
 #[cfg(feature = "allocator-fixture")]
@@ -35,6 +37,10 @@ mod straddler;
 mod syscall_fallback;
 
 pub use backend::COORDINATOR_ENV;
+#[cfg(feature = "exec-private-init")]
+pub use backend::InitialImageStatsCollector;
+#[cfg(feature = "exec-private-init")]
+pub use backend::InitialImageStatsServer;
 pub use backend::LiteinstBackend;
 pub use backend::PreloadBootstrap;
 pub use backend::STATS_COORDINATOR_ENV;
@@ -93,10 +99,20 @@ pub use runtime::site_patching_from_env_value;
 pub use runtime::tool_output_fd;
 pub use straddler::STRADDLER_STALENESS_TICKS_ENV;
 pub use straddler::straddler_staleness_from_env_value;
+#[cfg(feature = "exec-private-init")]
+pub use tool_host::InstalledInitialImage;
+#[cfg(feature = "exec-private-init")]
+pub use tool_host::PreparedInitialImage;
 pub use tool_host::blocking_global_rpc;
+#[cfg(feature = "exec-private-init")]
+pub use tool_host::initialize_initial_image_lifecycle;
 pub use tool_host::install_tool;
 pub use tool_host::install_tool_from_bootstrap;
+#[cfg(feature = "exec-private-init")]
+pub use tool_host::install_tool_initial_image;
 pub use tool_host::install_tool_quiescent;
+#[cfg(feature = "exec-private-init")]
+pub use tool_host::prepare_tool_initial_image;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-87): Review the inherited compatibility event channel.

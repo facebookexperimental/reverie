@@ -55,6 +55,10 @@ use crate::tool_host::drive_ready;
 use crate::tool_host::drive_tool_syscall;
 use crate::trap::raw_syscall6;
 
+#[cfg(feature = "exec-private-init")]
+#[path = "image_guest.rs"]
+mod image_guest;
+
 /// The services a [`ToolHost`] needs from the backend that owns the trap and
 /// hook paths.
 pub trait HostRuntime: Send + Sync + 'static {
@@ -116,7 +120,7 @@ fn perform_pkey_alloc(event: &mut SyscallEvent, number: i64, args: [u64; 6]) -> 
     if !crate::trap::pkru_present() {
         // Installation established that PKRU instructions are unavailable.
         // Keep Linux's allocation answer through the ordinary scalar gate.
-        return Some(unsafe { raw_syscall6(number, args) });
+        return Some(unsafe { crate::trap::physical_guest_syscall6(number, args, None) }.result);
     }
     let Some(guest_pkru) = event.guest_pkru else {
         // A hook or instruction placeholder has no owned permission image.
@@ -126,7 +130,7 @@ fn perform_pkey_alloc(event: &mut SyscallEvent, number: i64, args: [u64; 6]) -> 
     // SAFETY: installation established OSPKE, and this live event owns the
     // guest's saved PKRU. Allocation has scalar operands and preserves the
     // helper's storage; the gate restores callback rights before Rust resumes.
-    let result = unsafe { crate::trap::raw_syscall6_with_result(number, args, Some(guest_pkru)) };
+    let result = unsafe { crate::trap::physical_guest_syscall6(number, args, Some(guest_pkru)) };
     // Retain the actual effect before scalar errno or Tool result handling.
     event.guest_pkru = result.pkru;
     Some(result.result)
@@ -228,6 +232,109 @@ where
             states: SpinMutex::new(HashMap::new()),
             runtime,
         }
+    }
+
+    /// Bind this actual installed host to its authenticated InitialImage.
+    ///
+    /// # Safety
+    /// The backend must call this only on its stable, installed ToolHost,
+    /// before controller installation, using the control and same live RPC
+    /// connection consumed by that installation. The host may not move or be
+    /// replaced afterwards. Binding an independently constructed host would
+    /// not establish installed-handler provenance. The installed Tool's guest
+    /// memory effects must preserve Rust's memory invariants, as on dispatch.
+    #[cfg(feature = "exec-private-init")]
+    pub unsafe fn bind_initial_image_control(
+        &self,
+        control: &super::exec_private::InitialImageControl,
+    ) -> io::Result<()> {
+        control.bind_lifecycle_host(core::ptr::from_ref(self) as usize)
+    }
+
+    /// Run this installed InitialImage's real thread-start and post-exec
+    /// callbacks before any guest instruction. This creates no syscall event
+    /// or register snapshot. Unsupported lifecycle operations are retained
+    /// even when the Tool ignores their returned error.
+    #[cfg(feature = "exec-private-init")]
+    pub fn initialize_initial_image_lifecycle(
+        &self,
+        control: &super::exec_private::InitialImageControl,
+    ) -> io::Result<()> {
+        let permit = control.begin_lifecycle(core::ptr::from_ref(self) as usize)?;
+        let _scratch_scope = DispatchScratchScope::enter();
+        let tid = raw_pid(libc::SYS_gettid);
+        if tid != self.root_pid {
+            return Err(io::Error::other("InitialImage host root identity differs"));
+        }
+        let tool_slot = self.tool.try_lock().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "InitialImage Tool callback is active",
+            )
+        })?;
+        let tool = tool_slot
+            .as_ref()
+            .ok_or_else(|| io::Error::other("InitialImage Tool is absent"))?;
+        let mut states = self.states.try_lock().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "InitialImage state dispatch is active",
+            )
+        })?;
+        if states.contains_key(&tid.as_raw()) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "InitialImage thread state already exists",
+            ));
+        }
+        let mut state = tool.init_thread_state(tid, None);
+        let tail = TailResult::default();
+        {
+            let mut guest = image_guest::ImageGuest::<T, R>::new(
+                tid,
+                &mut state,
+                &self.rpc,
+                &self.runtime,
+                self.cpuid_interception,
+                &tail,
+                control,
+            );
+            match drive_callback(tool.handle_thread_start(&mut guest), &tail) {
+                CallbackOutcome::Ready(Ok(())) => {}
+                CallbackOutcome::Ready(Err(error)) => {
+                    return Err(match error {
+                        Error::Errno(errno) => io::Error::from_raw_os_error(errno.into_raw()),
+                        other => io::Error::other(describe_reverie_error(&other)),
+                    });
+                }
+                CallbackOutcome::Exit { .. } | CallbackOutcome::Unsupported(_) => {
+                    return Err(io::Error::other(
+                        "InitialImage thread-start transition refused",
+                    ));
+                }
+            }
+            guest.check_refusal()?;
+            match drive_callback(tool.handle_post_exec(&mut guest), &tail) {
+                CallbackOutcome::Ready(Ok(())) => {}
+                CallbackOutcome::Ready(Err(error)) => {
+                    return Err(io::Error::from_raw_os_error(error.into_raw()));
+                }
+                CallbackOutcome::Exit { .. } | CallbackOutcome::Unsupported(_) => {
+                    return Err(io::Error::other(
+                        "InitialImage post-exec transition refused",
+                    ));
+                }
+            }
+            guest.check_refusal()?;
+        }
+        // Publish completed state before the owner records completion. A failed
+        // revalidation removes it and permanently poisons the affine attempt.
+        states.insert(tid.as_raw(), state);
+        if let Err(error) = permit.complete() {
+            states.remove(&tid.as_raw());
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Runs one guest syscall through the Tool and sets `event.result`.
@@ -457,7 +564,10 @@ where
                     // the guest's saved PKRU (see stripped_signal_mask).
                     let mut stripped_args = args;
                     stripped_args[1] = (&raw const mask) as u64;
-                    event.result = unsafe { raw_syscall6(number, stripped_args) };
+                    event.result = unsafe {
+                        crate::trap::physical_guest_syscall6(number, stripped_args, None)
+                    }
+                    .result;
                 }
             }
             return;
@@ -2680,7 +2790,7 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
             raw_args[1] = mask as *const u64 as u64;
         }
 
-        let result = unsafe { raw_syscall6(number, raw_args) };
+        let result = unsafe { crate::trap::physical_guest_syscall6(number, raw_args, None) }.result;
         Errno::from_ret(result as usize).map(|value| value as i64)
     }
 
@@ -2808,11 +2918,13 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
         } else {
             let value = match stripped_signal_mask(self.runtime, number, args) {
                 Err(error) => -i64::from(error.into_raw()),
-                Ok(None) => unsafe { raw_syscall6(number, args) },
+                Ok(None) => {
+                    unsafe { crate::trap::physical_guest_syscall6(number, args, None) }.result
+                }
                 Ok(Some(mask)) => {
                     let mut args = args;
                     args[1] = (&raw const mask) as u64;
-                    unsafe { raw_syscall6(number, args) }
+                    unsafe { crate::trap::physical_guest_syscall6(number, args, None) }.result
                 }
             };
             self.tail.set_result(value);

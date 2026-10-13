@@ -65,6 +65,7 @@
 
 mod blocking_client;
 pub mod codec;
+pub mod initial_image;
 
 mod client;
 mod envelope;
@@ -78,6 +79,7 @@ mod server;
 pub mod mapped;
 
 pub use blocking_client::BlockingRpcClient;
+pub use blocking_client::InitialImageClient;
 pub use client::RpcClient;
 pub use envelope::RequestEnvelope;
 pub use error::RpcError;

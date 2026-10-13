@@ -24,6 +24,16 @@ trait ToolHandler: Send + Sync {
     /// The installed Tool's coordinator connection, as a
     /// `CoordinatorRpc<T::GlobalState>`; see [`blocking_global_rpc`].
     fn rpc(&self) -> &dyn std::any::Any;
+    #[cfg(feature = "exec-private-init")]
+    fn bind_initial_image(
+        &self,
+        control: &reverie_inguest::guest::exec_private::InitialImageControl,
+    ) -> io::Result<()>;
+    #[cfg(feature = "exec-private-init")]
+    fn initialize_initial_image_lifecycle(
+        &self,
+        control: &reverie_inguest::guest::exec_private::InitialImageControl,
+    ) -> io::Result<()>;
 }
 
 impl<T: Tool + 'static> ToolHandler for ToolHost<T, LiteinstRuntime> {
@@ -50,6 +60,24 @@ impl<T: Tool + 'static> ToolHandler for ToolHost<T, LiteinstRuntime> {
 
     fn rpc(&self) -> &dyn std::any::Any {
         ToolHost::rpc(self)
+    }
+
+    #[cfg(feature = "exec-private-init")]
+    fn bind_initial_image(
+        &self,
+        control: &reverie_inguest::guest::exec_private::InitialImageControl,
+    ) -> io::Result<()> {
+        // SAFETY: called only after this stable Box is in HANDLER, by the
+        // InitialImage installer which consumed the authenticated live client.
+        unsafe { ToolHost::bind_initial_image_control(self, control) }
+    }
+
+    #[cfg(feature = "exec-private-init")]
+    fn initialize_initial_image_lifecycle(
+        &self,
+        control: &reverie_inguest::guest::exec_private::InitialImageControl,
+    ) -> io::Result<()> {
+        ToolHost::initialize_initial_image_lifecycle(self, control)
     }
 }
 
@@ -158,6 +186,8 @@ where
             coordinator.as_ref(),
             true,
             runtime::PatchPublication::Concurrent,
+            #[cfg(feature = "exec-private-init")]
+            None,
         )
     }
 }
@@ -185,6 +215,8 @@ where
             coordinator.as_ref(),
             true,
             runtime::PatchPublication::Quiescent,
+            #[cfg(feature = "exec-private-init")]
+            None,
         )
     }
 }
@@ -210,7 +242,232 @@ where
             coordinator.as_ref(),
             false,
             runtime::PatchPublication::Concurrent,
+            #[cfg(feature = "exec-private-init")]
+            None,
         )
+    }
+}
+
+/// Authenticated client and one native control prepared before Detcore setup.
+/// This affine owner must be consumed by the actual Tool installer.
+#[cfg(feature = "exec-private-init")]
+pub struct PreparedInitialImage<T: Tool> {
+    // Fields drop in declaration order: abandon before any generic Config or
+    // client destructor can run, allocate, block, or panic.
+    fatal: reverie_inguest::guest::exec_private::InitialImageAbortGuard,
+    client: reverie_rpc_transport::InitialImageClient<T::GlobalState>,
+    control: reverie_inguest::guest::exec_private::InitialImageControl,
+}
+
+/// Installed InitialImage, retaining fatal ownership through eager lifecycle.
+#[cfg(feature = "exec-private-init")]
+pub struct InstalledInitialImage {
+    fatal: reverie_inguest::guest::exec_private::InitialImageAbortGuard,
+    control: reverie_inguest::guest::exec_private::InitialImageControl,
+}
+
+#[cfg(feature = "exec-private-init")]
+impl InstalledInitialImage {
+    /// Complete all existing native frontend and lifecycle checks exactly once.
+    /// Any error terminates the owned image; successful return permits only the
+    /// native runner's existing handover, not an independent Guest entry.
+    pub fn finish(self) -> io::Result<()> {
+        self.fatal.finish(&self.control)
+    }
+}
+
+/// Prepare authenticated fixed gates before caller-context Detcore setup.
+/// Ordinary preload initialization does not use this entry.
+///
+/// # Safety
+/// The consumed client must have redeemed the launching coordinator's one-use
+/// authorization for this exact watched image/filter lineage. Native control,
+/// private loader and mapping provenance must satisfy
+/// `publish_authenticated_control`. No guest code may have run. The Tool's
+/// config must not require RCB time, preemption, threads, forks or exec yet.
+#[cfg(feature = "exec-private-init")]
+pub unsafe fn prepare_tool_initial_image<T: Tool>(
+    client: reverie_rpc_transport::InitialImageClient<T::GlobalState>,
+    native: *mut reverie_inguest::guest::exec_private::NativeControl,
+) -> io::Result<PreparedInitialImage<T>> {
+    let fatal = unsafe { reverie_inguest::guest::exec_private::InitialImageAbortGuard::arm() };
+    let control =
+        unsafe { reverie_inguest::guest::exec_private::publish_authenticated_control(native)? };
+    Ok(PreparedInitialImage {
+        client,
+        control,
+        fatal,
+    })
+}
+
+/// Install the actual Tool using the same authenticated client and native owner.
+/// The caller must finish DETLOG/OFD setup, run
+/// [`initialize_initial_image_lifecycle`], then consume the installed owner's
+/// `finish` before the runner can resume the guest. No second adoption occurs.
+///
+/// # Safety
+/// The prepared native image must still be in its exclusive initialization
+/// phase on the private Tool FS/stack. No Guest code may have run.
+#[cfg(feature = "exec-private-init")]
+pub unsafe fn install_tool_initial_image<T>(
+    coordinator: impl AsRef<Path>,
+    prepared: PreparedInitialImage<T>,
+) -> io::Result<InstalledInitialImage>
+where
+    T: Tool + 'static,
+{
+    let PreparedInitialImage {
+        client,
+        control,
+        fatal,
+    } = prepared;
+    unsafe {
+        install_tool_inner::<T>(
+            coordinator.as_ref(),
+            false,
+            runtime::PatchPublication::Quiescent,
+            Some((client, &control)),
+        )?;
+    }
+    Ok(InstalledInitialImage { control, fatal })
+}
+
+/// Run genuine eager lifecycle on the actual installed InitialImage Tool.
+/// Call after DETLOG/shared-OFD setup and before `InitialImageControl::finish`.
+/// An error permanently refuses this initialization; the explicit native
+/// initializer must terminate instead of resuming guest code. This does not
+/// enter Guest, authenticate a new image or create another coordinator client.
+#[cfg(feature = "exec-private-init")]
+pub fn initialize_initial_image_lifecycle(image: &InstalledInitialImage) -> io::Result<()> {
+    let control = &image.control;
+    let handler = HANDLER
+        .get()
+        .ok_or_else(|| io::Error::other("InitialImage Tool is not installed"))?;
+    handler.initialize_initial_image_lifecycle(control)
+}
+
+#[cfg(feature = "exec-private-init")]
+fn initial_vdso_mprotect_result(result: i64, restoring: bool) -> Result<(), reverie::Errno> {
+    if result == 0 {
+        return Ok(());
+    }
+    if restoring {
+        // RX restoration failed while the actual kernel vDSO is NX. Do not
+        // allocate, format, log or unwind before the owned fixed terminal gate.
+        unsafe {
+            reverie_inguest::guest::exec_private::initialization_failed(core::ptr::null_mut())
+        }
+    }
+    Err(reverie::Errno::new(result.wrapping_neg() as i32))
+}
+
+#[cfg(feature = "exec-private-init")]
+unsafe fn patch_initial_image_vdso(
+    subscriptions: &reverie::Subscription,
+    control: &reverie_inguest::guest::exec_private::InitialImageControl,
+) -> Result<(), reverie::Error> {
+    control.check_initial_vdso_context()?;
+    let mut owned_extent = None;
+    let mut step = 0_u8;
+    // SAFETY: the same authenticated control/fatal owner spans this call.
+    // Guest has not run; bootstrap blocks asynchronous signals. The callback
+    // admits only the qualified immutable extent and the RW -> RX sequence,
+    // through the already adopted Tool raw gate, and cannot unwind under NX.
+    unsafe {
+        reverie_ptrace::patch_current_vdso_trapping_owned(
+            subscriptions,
+            |address, len, protection| {
+                let restoring = step == 1;
+                if step == 0
+                    && owned_extent.is_none()
+                    && protection == libc::PROT_READ | libc::PROT_WRITE
+                {
+                    owned_extent = Some((address, len));
+                } else if !restoring
+                    || owned_extent != Some((address, len))
+                    || protection != libc::PROT_READ | libc::PROT_EXEC
+                {
+                    reverie_inguest::guest::exec_private::initialization_failed(
+                        core::ptr::null_mut(),
+                    );
+                }
+                let result = raw_syscall6(
+                    libc::SYS_mprotect,
+                    [address as u64, len as u64, protection as u64, 0, 0, 0],
+                );
+                initial_vdso_mprotect_result(result, restoring)?;
+                step = if restoring { 2 } else { 1 };
+                Ok(())
+            },
+        )?;
+    }
+    control.check_initial_vdso_context()?;
+    Ok(())
+}
+
+#[cfg(all(test, feature = "exec-private-init"))]
+mod initial_vdso_tests {
+    use super::*;
+
+    #[test]
+    fn failed_initial_vdso_rx_terminates_before_owner_drop_or_error_formatting() {
+        // A component fixture owns an actual fixed terminal gate and actual
+        // kernel vDSO. It does not redeem InitialImage authorization or prove a
+        // native frontend. Shared progress proves RW succeeded and RX was
+        // attempted; a returned error or panic must exit 94, not pass via Drop.
+        let progress = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_SHARED,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(progress, libc::MAP_FAILED);
+        let progress = progress.cast::<u64>();
+        unsafe { progress.write_volatile(0) };
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            if unsafe { reverie_inguest::trap::prepare_fixed_gates() }.is_err() {
+                unsafe { libc::_exit(95) };
+            }
+            let _fatal =
+                unsafe { reverie_inguest::guest::exec_private::InitialImageAbortGuard::arm() };
+            // The fatal guard is outside catch_unwind: a panic cannot turn
+            // into the expected terminal status by unwinding this owner.
+            let _ = std::panic::catch_unwind(|| unsafe {
+                reverie_ptrace::patch_current_vdso_trapping_owned(
+                    &reverie::Subscription::all(),
+                    |address, len, protection| {
+                        if protection == libc::PROT_READ | libc::PROT_EXEC {
+                            progress.write_volatile(2);
+                            initial_vdso_mprotect_result(-(libc::EIO as i64), true)
+                        } else {
+                            let result = raw_syscall6(
+                                libc::SYS_mprotect,
+                                [address as u64, len as u64, protection as u64, 0, 0, 0],
+                            );
+                            initial_vdso_mprotect_result(result, false)?;
+                            progress.write_volatile(1);
+                            Ok(())
+                        }
+                    },
+                )
+            });
+            // Never drop the owner here. Only the production result helper's
+            // direct fixed terminal call may produce the expected exit 127.
+            unsafe { libc::_exit(94) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        let reached = unsafe { progress.read_volatile() };
+        assert_eq!(unsafe { libc::munmap(progress.cast(), 4096) }, 0);
+        assert!(libc::WIFEXITED(status), "child wait status {status}");
+        assert_eq!(libc::WEXITSTATUS(status), 127);
+        assert_eq!(reached, 2);
     }
 }
 
@@ -218,6 +475,10 @@ unsafe fn install_tool_inner<T>(
     coordinator: &Path,
     remove_legacy_environment: bool,
     publication: runtime::PatchPublication,
+    #[cfg(feature = "exec-private-init")] initial: Option<(
+        reverie_rpc_transport::InitialImageClient<T::GlobalState>,
+        &reverie_inguest::guest::exec_private::InitialImageControl,
+    )>,
 ) -> io::Result<()>
 where
     T: Tool + 'static,
@@ -233,11 +494,16 @@ where
     // runtime does not read the Tool's state as code addresses either.
     let _private_allocations = reverie_inguest::guest::alloc::enter_dispatch();
     crate::patch_alloc::preflight_allocator()?;
+    #[cfg(feature = "exec-private-init")]
+    let private_initial = initial.is_some();
+    #[cfg(not(feature = "exec-private-init"))]
+    let private_initial = false;
+
     #[cfg(feature = "fixed-syscall-gates")]
     let mut fixed_install = FixedGateInstallation { complete: false };
     #[cfg(feature = "fixed-syscall-gates")]
     unsafe {
-        if reverie_inguest::guest::sigalrm::seccomp_filter_count() != Some(0) {
+        if !private_initial && reverie_inguest::guest::sigalrm::seccomp_filter_count() != Some(0) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "fixed syscall gates refuse an inherited or unreadable seccomp filter state",
@@ -245,13 +511,53 @@ where
         }
         // All runtime signal actions and their filter must select the same
         // fixed page. Prepare it before any callback or handler is published.
-        reverie_inguest::trap::prepare_fixed_gates()?;
+        if !private_initial {
+            reverie_inguest::trap::prepare_fixed_gates()?;
+        }
     }
     crate::syscall_fallback::initialize()?;
+    #[cfg(feature = "exec-private-init")]
+    let (rpc, initial_control) = match initial {
+        Some((client, control)) => (
+            CoordinatorRpc::<T::GlobalState>::from_live_client(
+                coordinator,
+                client.into_client(),
+                runtime::replace_coordinator_fd,
+            )?,
+            Some(control),
+        ),
+        None => (
+            CoordinatorRpc::<T::GlobalState>::connect(
+                coordinator,
+                runtime::replace_coordinator_fd,
+            )?,
+            None,
+        ),
+    };
+    #[cfg(not(feature = "exec-private-init"))]
     let rpc =
         CoordinatorRpc::<T::GlobalState>::connect(coordinator, runtime::replace_coordinator_fd)?;
     runtime::reserve_coordinator_fd(rpc.raw_fd())?;
-    let stats =
+    let stats = if private_initial {
+        #[cfg(feature = "exec-private-init")]
+        {
+            let control = initial_control.ok_or_else(|| {
+                io::Error::other("InitialImage statistics requires authenticated control")
+            })?;
+            // The existing narrow context check requires this same published
+            // control, initial thread, Tool FS, phase 2 and installation 0.
+            // The caller retains its fatal owner across collector setup.
+            control.check_initial_vdso_context()?;
+            let endpoint = crate::initial_image_stats::initial_image_stats_endpoint(coordinator)?;
+            let stats = crate::stats::initialize_guest_stats(&endpoint)?;
+            control.check_initial_vdso_context()?;
+            stats
+        }
+        #[cfg(not(feature = "exec-private-init"))]
+        {
+            crate::stats::GuestStatsHooks::DISABLED
+        }
+    } else {
         if let Some(stats_coordinator) = std::env::var_os(crate::backend::STATS_COORDINATOR_ENV) {
             let stats = crate::stats::initialize_guest_stats(Path::new(&stats_coordinator))?;
             // SAFETY: tool installation runs before application-created threads.
@@ -259,7 +565,8 @@ where
             stats
         } else {
             crate::stats::GuestStatsHooks::DISABLED
-        };
+        }
+    };
     // Complete the new fixed callback pool and route publication before the
     // guest counter starts. Later installation consumes only this proof;
     // allocating the pool there would charge Tool setup to guest progress.
@@ -273,12 +580,23 @@ where
         rdtsc: subscriptions.has_rdtsc(),
     };
     runtime::preflight_instruction_faulting(instruction_subscriptions)?;
-    let site_patching = runtime::site_patching_from_env_value(
-        std::env::var_os(runtime::SITE_PATCHING_ENV).as_deref(),
-    )?;
+    let site_patching = if private_initial {
+        false
+    } else {
+        runtime::site_patching_from_env_value(
+            std::env::var_os(runtime::SITE_PATCHING_ENV).as_deref(),
+        )?
+    };
     // With site patching off, the vDSO gets ptrace's full trapping stubs and no
     // hooks, so its fast paths reach the Tool through the SIGSYS fallback too.
-    let vdso_sites = if site_patching {
+    #[cfg(feature = "exec-private-init")]
+    let initial_vdso =
+        initial_control.map(|control| unsafe { patch_initial_image_vdso(&subscriptions, control) });
+    #[cfg(not(feature = "exec-private-init"))]
+    let initial_vdso: Option<Result<(), reverie::Error>> = None;
+    let vdso_sites = if let Some(result) = initial_vdso {
+        result.map(|()| Vec::new())
+    } else if site_patching {
         reverie_ptrace::patch_current_vdso(&subscriptions)
     } else {
         reverie_ptrace::patch_current_vdso_trapping(&subscriptions).map(|()| Vec::new())
@@ -286,6 +604,16 @@ where
     .map_err(|error| {
         io::Error::other(reverie_inguest::guest::host::describe_reverie_error(&error))
     })?;
+    #[cfg(feature = "exec-private-init")]
+    let _signal_state = if let Some(control) = initial_control {
+        control.prepare_signal_state(instruction_subscriptions)?;
+        None
+    } else {
+        Some(runtime::prepare_guest_signal_state(
+            instruction_subscriptions,
+        )?)
+    };
+    #[cfg(not(feature = "exec-private-init"))]
     let _signal_state = runtime::prepare_guest_signal_state(instruction_subscriptions)?;
     let syscall_subscriptions = subscriptions.iter_syscalls().collect();
     if remove_legacy_environment {
@@ -305,6 +633,13 @@ where
         .map_err(|_| {
             io::Error::new(io::ErrorKind::AlreadyExists, "Reverie tool installed twice")
         })?;
+    #[cfg(feature = "exec-private-init")]
+    if let Some(control) = initial_control {
+        HANDLER
+            .get()
+            .ok_or_else(|| io::Error::other("InitialImage installed handler is absent"))?
+            .bind_initial_image(control)?;
+    }
     let result = runtime::initialize_reverie_tool(
         stats,
         publication,
@@ -312,6 +647,8 @@ where
         site_patching,
         &vdso_sites,
         prepared_callbacks,
+        #[cfg(feature = "exec-private-init")]
+        initial_control,
     );
     #[cfg(feature = "fixed-syscall-gates")]
     {

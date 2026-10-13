@@ -29,6 +29,9 @@ allocator-fixture = []
 preload-constructor = []
 # Explicit FullTool-only fixed syscall/restorer ABI; off by default.
 fixed-syscall-gates = []
+# Private GNU loader InitialImage experiment; no successor exec admission.
+exec-private-init = ["fixed-syscall-gates"]
+
 # Synchronous coordinator RPC client, wire-compatible with the async
 # `reverie-rpc-transport` `RpcServer<G>` (u32-BE length prefix + bincode2
 # `config::legacy`). Opt-in so the default cdylib stays a lean libc-only .so.

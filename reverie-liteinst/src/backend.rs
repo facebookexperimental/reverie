@@ -36,6 +36,8 @@ use reverie_rpc_transport::ConnectionAdmission;
 use reverie_rpc_transport::ConnectionMonitor;
 use reverie_rpc_transport::ExitReporter;
 use reverie_rpc_transport::RpcError;
+#[cfg(feature = "exec-private-init")]
+use reverie_rpc_transport::RpcIssueMonitor;
 use reverie_rpc_transport::RpcServer;
 
 /// Environment variable naming the tool-specific preload DSO for a backend run.
@@ -51,6 +53,81 @@ const PRELOAD_BOOTSTRAP_MAGIC: &[u8; 16] = b"REVERIE-LI-V1\0\0\0";
 const PRELOAD_BOOTSTRAP_HEADER_BYTES: usize = PRELOAD_BOOTSTRAP_MAGIC.len() + 4;
 const PRELOAD_BOOTSTRAP_MAX_BYTES: usize = 4096;
 const RPC_CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Typed statistics server for an authenticated private InitialImage launch.
+///
+/// The launching coordinator must create the run directory exclusively with
+/// mode 0700, retain the genuine launch birth, and supply same-birth admission.
+/// The relative endpoint requires the verified launch cwd and mount view to
+/// remain unchanged through the process's terminal statistics submission.
+#[cfg(feature = "exec-private-init")]
+pub struct InitialImageStatsServer {
+    server: RpcServer<crate::stats::LiteinstStatsGlobal>,
+    issues: RpcIssueMonitor,
+}
+
+/// Consuming owner of the actual InitialImage statistics collected by the server.
+#[cfg(feature = "exec-private-init")]
+pub struct InitialImageStatsCollector {
+    global: Arc<crate::stats::LiteinstStatsGlobal>,
+}
+
+#[cfg(feature = "exec-private-init")]
+impl InitialImageStatsServer {
+    /// Bind the fixed companion of the genuine Tool RPC endpoint.
+    ///
+    /// Binding never replaces an existing directory entry. Admission and
+    /// retained connection issues are mandatory before any connection serves.
+    pub fn bind(
+        tool_rpc: &Path,
+        owned_run_directory: &Path,
+        admission: Arc<dyn ConnectionAdmission>,
+    ) -> Result<(Self, InitialImageStatsCollector), RpcError> {
+        let endpoint = crate::initial_image_stats::initial_image_stats_endpoint(tool_rpc)?;
+        crate::initial_image_stats::check_owned_directory(
+            tool_rpc,
+            &endpoint,
+            owned_run_directory,
+        )?;
+        let global = Arc::new(crate::stats::LiteinstStatsGlobal::default());
+        let mut server = RpcServer::bind_exclusive(&endpoint, global.clone(), ())?;
+        server.set_connection_admission(admission);
+        let issues = server.retain_connection_issues();
+        Ok((
+            Self { server, issues },
+            InitialImageStatsCollector { global },
+        ))
+    }
+
+    /// Observe actual accepted connection lifetime through teardown.
+    pub fn connection_monitor(&self) -> ConnectionMonitor {
+        self.server.connection_monitor()
+    }
+
+    /// Retained connection failures, including admission and cancellation.
+    pub fn issue_monitor(&self) -> RpcIssueMonitor {
+        self.issues.clone()
+    }
+
+    /// Serve the existing typed statistics protocol until explicitly stopped.
+    pub async fn serve(self) -> Result<(), RpcError> {
+        self.server.serve().await
+    }
+}
+
+#[cfg(feature = "exec-private-init")]
+impl InitialImageStatsCollector {
+    /// Consume the actual source after clean connection/server teardown.
+    ///
+    /// Callers must reject retained issues and active connections, finish the
+    /// physical watcher drain, and abort and join the server before this call.
+    /// Live owners are an error under the ordinary bounded unwrap contract.
+    pub async fn into_source(self) -> io::Result<crate::LiteinstBackendStatsSource> {
+        Ok(unwrap_global_after_connections(self.global)
+            .await?
+            .into_source())
+    }
+}
 
 // TODO-HUMAN-REVIEW(PR-139): Review the public inherited preload bootstrap contract.
 /// Coordinator path and tool-specific bytes consumed by a preload constructor.
@@ -1061,6 +1138,300 @@ fn tool_preload_path() -> io::Result<PathBuf> {
             io::ErrorKind::NotFound,
             format!("{TOOL_PRELOAD_ENV}={} is not a file", path.display()),
         ))
+    }
+}
+
+#[cfg(all(test, feature = "exec-private-init"))]
+mod initial_stats_tests {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::AtomicUsize;
+
+    use reverie::Tid;
+    use reverie_rpc_transport::Admitted;
+    use reverie_rpc_transport::RpcClient;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct TestAdmission {
+        calls: AtomicUsize,
+        refuse: bool,
+    }
+
+    impl ConnectionAdmission for TestAdmission {
+        fn admit(&self, _peer: OwnedFd) -> io::Result<Admitted> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if self.refuse {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "test refusal",
+                ));
+            }
+            // A transport component fixture, not a same-birth authenticator.
+            Ok(Admitted {
+                process_id: std::process::id() as i32,
+            })
+        }
+    }
+
+    fn directory() -> tempfile::TempDir {
+        let directory = tempfile::Builder::new()
+            .prefix("reverie-initial-stats-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        directory
+    }
+
+    async fn stop_server(
+        task: tokio::task::JoinHandle<Result<(), RpcError>>,
+        issues: &RpcIssueMonitor,
+    ) {
+        issues.planned_shutdown();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn initial_stats_bind_rejects_wrong_parent_mode_symlink_and_existing_entry() {
+        let owned = directory();
+        let other = directory();
+        let tool_rpc = owned.path().join("rpc.sock");
+        let stats_rpc = owned.path().join("stats.sock");
+        let admission = Arc::new(TestAdmission::default());
+        assert!(InitialImageStatsServer::bind(&tool_rpc, other.path(), admission.clone()).is_err());
+        assert!(!stats_rpc.exists());
+
+        std::fs::set_permissions(owned.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(InitialImageStatsServer::bind(&tool_rpc, owned.path(), admission.clone()).is_err());
+        std::fs::set_permissions(owned.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let alias = other.path().join("alias");
+        std::os::unix::fs::symlink(owned.path(), &alias).unwrap();
+        assert!(InitialImageStatsServer::bind(&tool_rpc, &alias, admission.clone()).is_err());
+        assert!(!stats_rpc.exists());
+
+        let bytes = b"owned existing entry\0\xff";
+        std::fs::write(&stats_rpc, bytes).unwrap();
+        let before = std::fs::symlink_metadata(&stats_rpc).unwrap();
+        match InitialImageStatsServer::bind(&tool_rpc, owned.path(), admission) {
+            Err(RpcError::Io(error)) => assert_eq!(error.raw_os_error(), Some(libc::EADDRINUSE)),
+            Err(error) => panic!("unexpected occupied companion error: {error}"),
+            Ok(_) => panic!("statistics wrapper replaced an existing entry"),
+        }
+        let after = std::fs::symlink_metadata(&stats_rpc).unwrap();
+        assert_eq!(
+            (after.dev(), after.ino(), after.mode()),
+            (before.dev(), before.ino(), before.mode())
+        );
+        assert_eq!(std::fs::read(&stats_rpc).unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn initial_stats_source_refuses_live_server_owners() {
+        let directory = directory();
+        let tool_rpc = directory.path().join("rpc.sock");
+        let (server, collector) = InitialImageStatsServer::bind(
+            &tool_rpc,
+            directory.path(),
+            Arc::new(TestAdmission::default()),
+        )
+        .unwrap();
+        let error = match collector.into_source().await {
+            Err(error) => error,
+            Ok(_) => panic!("statistics source escaped a live server owner"),
+        };
+        assert!(error.to_string().contains("still has owners"));
+        drop(server);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn initial_stats_connection_must_finish_before_clean_source_teardown() {
+        let directory = directory();
+        let tool_rpc = directory.path().join("rpc.sock");
+        let endpoint = crate::initial_image_stats::initial_image_stats_endpoint(&tool_rpc).unwrap();
+        let admission = Arc::new(TestAdmission::default());
+        let (server, collector) =
+            InitialImageStatsServer::bind(&tool_rpc, directory.path(), admission.clone()).unwrap();
+        let connections = server.connection_monitor();
+        let issues = server.issue_monitor();
+        let task = tokio::spawn(server.serve());
+        let client = RpcClient::<crate::stats::LiteinstStatsGlobal>::connect(
+            &endpoint,
+            Tid::from_raw(std::process::id() as i32),
+        )
+        .await
+        .unwrap();
+        assert_eq!(admission.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(connections.active_connections(), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), connections.wait_for_idle())
+                .await
+                .is_err()
+        );
+        assert_eq!(connections.active_connections(), 1);
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(2), connections.wait_for_idle())
+            .await
+            .unwrap();
+        assert!(issues.snapshot().is_empty());
+        stop_server(task, &issues).await;
+        assert_eq!(connections.active_connections(), 0);
+        assert!(issues.snapshot().is_empty());
+        assert_eq!(
+            collector
+                .into_source()
+                .await
+                .unwrap()
+                .snapshot()
+                .process_reports(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_stats_admission_failure_is_retained_through_teardown() {
+        let directory = directory();
+        let tool_rpc = directory.path().join("rpc.sock");
+        let endpoint = crate::initial_image_stats::initial_image_stats_endpoint(&tool_rpc).unwrap();
+        let admission = Arc::new(TestAdmission {
+            refuse: true,
+            ..Default::default()
+        });
+        let (server, collector) =
+            InitialImageStatsServer::bind(&tool_rpc, directory.path(), admission.clone()).unwrap();
+        let connections = server.connection_monitor();
+        let issues = server.issue_monitor();
+        let task = tokio::spawn(server.serve());
+        assert!(
+            RpcClient::<crate::stats::LiteinstStatsGlobal>::connect(
+                &endpoint,
+                Tid::from_raw(std::process::id() as i32),
+            )
+            .await
+            .is_err()
+        );
+        tokio::time::timeout(Duration::from_secs(2), issues.failed())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), connections.wait_for_idle())
+            .await
+            .unwrap();
+        assert_eq!(admission.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(issues.snapshot().len(), 1);
+        stop_server(task, &issues).await;
+        assert_eq!(connections.active_connections(), 0);
+        assert_eq!(
+            issues.snapshot().len(),
+            1,
+            "failure cannot disappear during cancellation"
+        );
+        assert_eq!(
+            collector
+                .into_source()
+                .await
+                .unwrap()
+                .snapshot()
+                .process_reports(),
+            0
+        );
+    }
+
+    #[test]
+    fn initial_stats_real_collector_reports_and_drains() {
+        const CHILD_REPORTS: &str = "REVERIE_COMPONENT_INITIAL_STATS_REPORTS";
+        const TEST: &str =
+            "backend::initial_stats_tests::initial_stats_real_collector_reports_and_drains";
+        let Some(reports) = std::env::var_os(CHILD_REPORTS) else {
+            // Isolate the real process-wide OnceLock. Missing, one, and duplicate
+            // reports all traverse the actual collector and typed transport.
+            for reports in [0, 1, 2] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", TEST, "--test-threads=1"])
+                    .env(CHILD_REPORTS, reports.to_string())
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "report case {reports}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        let reports: u64 = reports.to_str().unwrap().parse().unwrap();
+        assert!(reports <= 2);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let directory = directory();
+                let tool_rpc = directory.path().join("rpc.sock");
+                let endpoint =
+                    crate::initial_image_stats::initial_image_stats_endpoint(&tool_rpc).unwrap();
+                let admission = Arc::new(TestAdmission::default());
+                let (server, collector) =
+                    InitialImageStatsServer::bind(&tool_rpc, directory.path(), admission.clone())
+                        .unwrap();
+                let connections = server.connection_monitor();
+                let issues = server.issue_monitor();
+                let task = tokio::spawn(server.serve());
+                assert!(!crate::guest_stats_enabled());
+                let hooks = crate::stats::initialize_guest_stats(&endpoint).unwrap();
+                hooks.record_path(crate::LiteinstDispatchPath::InGuestPhysicalSigsys);
+                hooks.record_path(crate::LiteinstDispatchPath::InGuestPhysicalSigsys);
+                hooks.record_path(crate::LiteinstDispatchPath::PatchingDisabledFallback);
+                tokio::task::spawn_blocking(move || {
+                    for _ in 0..reports {
+                        crate::runtime::submit_process_stats(
+                            Tid::from_raw(std::process::id() as i32),
+                            hooks,
+                        )
+                        .unwrap();
+                    }
+                })
+                .await
+                .unwrap();
+                tokio::time::timeout(Duration::from_secs(2), connections.wait_for_idle())
+                    .await
+                    .unwrap();
+                assert_eq!(connections.active_connections(), 0);
+                assert!(issues.snapshot().is_empty());
+                stop_server(task, &issues).await;
+                assert_eq!(connections.active_connections(), 0);
+                assert!(issues.snapshot().is_empty());
+                assert_eq!(admission.calls.load(Ordering::Relaxed) as u64, reports);
+                let source = collector.into_source().await.unwrap();
+                let snapshot = source.snapshot();
+                assert_eq!(snapshot.process_reports(), reports);
+                assert_eq!(snapshot.patch_shapes().patched_rips(), 0);
+                assert_eq!(
+                    snapshot
+                        .dispatch_paths()
+                        .count(&crate::LiteinstDispatchPath::DirectHook),
+                    0
+                );
+                assert_eq!(
+                    snapshot
+                        .dispatch_paths()
+                        .count(&crate::LiteinstDispatchPath::PtraceInstallation),
+                    0
+                );
+                assert_eq!(
+                    snapshot
+                        .dispatch_paths()
+                        .count(&crate::LiteinstDispatchPath::InGuestPhysicalSigsys),
+                    reports * 2
+                );
+                assert_eq!(
+                    snapshot
+                        .dispatch_paths()
+                        .count(&crate::LiteinstDispatchPath::PatchingDisabledFallback),
+                    reports
+                );
+            });
     }
 }
 

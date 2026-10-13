@@ -86,6 +86,46 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
         self.fd.load(Ordering::Acquire)
     }
 
+    /// Adopt a live blocking client without reconnecting or duplicating its fd.
+    ///
+    /// This transfers connection ownership only; it does not authenticate a
+    /// client or confer InitialImage authorization. The genuine initializer
+    /// must explicitly complete `connect_initial_image` first. The normal
+    /// ToolHost installation still reserves/protects the actual descriptor.
+    /// An inherited client whose stamped TID belongs to the parent is refused;
+    /// later supported forks keep the ordinary lazy reconnect protocol.
+    pub fn from_live_client(
+        path: impl AsRef<Path>,
+        client: BlockingRpcClient<G>,
+        on_reconnect: ReconnectHook,
+    ) -> io::Result<Self> {
+        let pid = current_id(libc::SYS_getpid)?;
+        let tid = current_id(libc::SYS_gettid)?;
+        if client.tid() != tid {
+            return Err(io::Error::other(
+                "live coordinator client belongs to another thread",
+            ));
+        }
+        let fd = client.as_raw_fd();
+        let valid = unsafe {
+            raw_syscall6(
+                libc::SYS_fcntl,
+                [fd as u64, libc::F_GETFD as u64, 0, 0, 0, 0],
+            )
+        };
+        if fd < 0 || valid < 0 {
+            return Err(io::Error::other("live coordinator descriptor is invalid"));
+        }
+        let config = client.config().clone();
+        Ok(Self {
+            connection: SpinMutex::new(RpcConnection { pid, client }),
+            config,
+            path: path.as_ref().to_path_buf(),
+            fd: AtomicI32::new(fd),
+            on_reconnect,
+        })
+    }
+
     /// Connect before installing seccomp and decode the coordinator config.
     /// `on_reconnect` runs when a forked child reconnects; see
     /// [`ReconnectHook`].

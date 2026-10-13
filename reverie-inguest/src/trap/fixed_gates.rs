@@ -291,6 +291,43 @@ unsafe fn prepare_with_sealer(sealer: unsafe fn(u64) -> i64) -> io::Result<()> {
     Ok(())
 }
 
+// InitialImage alone: its trusted launcher owns the existing filter/page.
+// This function verifies physical bytes/protection, not launcher authority.
+#[cfg(feature = "exec-private-init")]
+pub(super) unsafe fn adopt_authenticated_initial_page() -> io::Result<()> {
+    if published()
+        || PREPARING
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+    {
+        return Err(io::Error::other("fixed gate adoption is not a fresh image"));
+    }
+    let _preparing = Preparing;
+    let rx = unsafe {
+        crate::guest::support::scan_own_maps(|line| {
+            let line = core::str::from_utf8(line).ok()?;
+            let mut fields = line.split_ascii_whitespace();
+            let (first, end) = fields.next()?.split_once('-')?;
+            let first = u64::from_str_radix(first, 16).ok()?;
+            let end = u64::from_str_radix(end, 16).ok()?;
+            let permissions = fields.next()?;
+            (first <= FIXED_GATE_BASE && FIXED_GATE_BASE < end)
+                .then_some(end >= FIXED_GATE_BASE + FIXED_GATE_BYTES && permissions == "r-xp")
+        })
+    };
+    if rx != Some(true) {
+        return Err(io::Error::other("adopted fixed gate is not private RX"));
+    }
+    let bytes = template()?;
+    for (offset, expected) in bytes.iter().enumerate() {
+        if unsafe { ((FIXED_GATE_BASE as *const u8).add(offset)).read_volatile() } != *expected {
+            return Err(io::Error::other("adopted fixed gate bytes differ"));
+        }
+    }
+    reverie_inguest_fixed_gates_published.store(1, Ordering::Release);
+    Ok(())
+}
+
 pub(super) unsafe fn scalar(number: i64, args: [u64; 6]) -> i64 {
     unsafe { scalar3_or6(number, args[0], args[1], args[2], args[3], args[4], args[5]) }
 }

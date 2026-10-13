@@ -535,6 +535,8 @@ pub(crate) fn initialize_from_selected_value(tool_value: Option<&OsStr>) -> io::
         InstructionSubscriptions::default(),
         &[],
         None,
+        #[cfg(feature = "exec-private-init")]
+        None,
     )
 }
 
@@ -545,33 +547,51 @@ pub(crate) fn initialize_reverie_tool(
     site_patching: bool,
     vdso_sites: &[reverie_ptrace::VdsoSyscallSite],
     prepared_callbacks: PreparedCallbacks,
+    #[cfg(feature = "exec-private-init")] initial: Option<
+        &reverie_inguest::guest::exec_private::InitialImageControl,
+    >,
 ) -> io::Result<()> {
-    let stage_stream = match std::env::var_os(IN_GUEST_STAGE_STREAM_ENV).as_deref() {
-        None => false,
-        Some(value) if value == OsStr::new("0") => false,
-        Some(value) if value == OsStr::new("1") => true,
-        Some(value) => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("unsupported {IN_GUEST_STAGE_STREAM_ENV} value {value:?}"),
-            ));
+    #[cfg(feature = "exec-private-init")]
+    let private_initial = initial.is_some();
+    #[cfg(not(feature = "exec-private-init"))]
+    let private_initial = false;
+    let stage_stream = if private_initial {
+        false
+    } else {
+        match std::env::var_os(IN_GUEST_STAGE_STREAM_ENV).as_deref() {
+            None => false,
+            Some(value) if value == OsStr::new("0") => false,
+            Some(value) if value == OsStr::new("1") => true,
+            Some(value) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unsupported {IN_GUEST_STAGE_STREAM_ENV} value {value:?}"),
+                ));
+            }
         }
     };
     reverie_inguest::guest::support::set_stage_stream(stage_stream);
-    let process_forks_allowed = match std::env::var_os(PROCESS_FORK_ENV).as_deref() {
-        None => true,
-        Some(value) if value == OsStr::new("1") => true,
-        Some(value) if value == OsStr::new("0") => false,
-        Some(value) => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("unsupported {PROCESS_FORK_ENV} value {value:?}"),
-            ));
+    let process_forks_allowed = if private_initial {
+        false
+    } else {
+        match std::env::var_os(PROCESS_FORK_ENV).as_deref() {
+            None => true,
+            Some(value) if value == OsStr::new("1") => true,
+            Some(value) if value == OsStr::new("0") => false,
+            Some(value) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unsupported {PROCESS_FORK_ENV} value {value:?}"),
+                ));
+            }
         }
     };
     set_process_forks_allowed(process_forks_allowed);
-    let sigalrm_handlers =
-        sigalrm_handlers_from_env_value(std::env::var_os(SIGALRM_HANDLERS_ENV).as_deref())?;
+    let sigalrm_handlers = if private_initial {
+        false
+    } else {
+        sigalrm_handlers_from_env_value(std::env::var_os(SIGALRM_HANDLERS_ENV).as_deref())?
+    };
     debug_assert!(site_patching || vdso_sites.is_empty());
     SITE_PATCHING_ENABLED.store(site_patching, Ordering::Release);
     TOOL_MODE.store(TOOL_REVERIE, Ordering::Release);
@@ -600,6 +620,8 @@ pub(crate) fn initialize_reverie_tool(
         instructions,
         vdso_sites,
         Some(prepared_callbacks),
+        #[cfg(feature = "exec-private-init")]
+        initial,
     )?;
     if admitted {
         // Once the runtime's own filter is in place: see
@@ -635,6 +657,9 @@ fn install_runtime(
     instructions: InstructionSubscriptions,
     vdso_sites: &[reverie_ptrace::VdsoSyscallSite],
     _prepared_callbacks: Option<PreparedCallbacks>,
+    #[cfg(feature = "exec-private-init")] initial: Option<
+        &reverie_inguest::guest::exec_private::InitialImageControl,
+    >,
 ) -> io::Result<()> {
     #[cfg(feature = "fixed-syscall-gates")]
     {
@@ -657,6 +682,16 @@ fn install_runtime(
     install_vdso_sites(vdso_sites)?;
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-254): Review launcher-selected RuntimeConfig at the install seam.
+    #[cfg(feature = "exec-private-init")]
+    let config = if initial.is_some() {
+        reverie_inguest::lifecycle::RuntimeConfig {
+            use_alt_stack: true,
+            restrict_signal_return: true,
+        }
+    } else {
+        runtime_config_from_env()?
+    };
+    #[cfg(not(feature = "exec-private-init"))]
     let config = runtime_config_from_env()?;
     // SAFETY: LiteInst's seam functions are the code this runtime's own
     // SIGSEGV handler ran before the handler moved to reverie-inguest: they
@@ -669,19 +704,27 @@ fn install_runtime(
             config.use_alt_stack,
         )
     }?;
+    // The authenticated route reuses its inherited filter and atomically
+    // replaces the bootstrap frontend; ordinary installation still adds its
+    // own filter after publishing the same dispatcher.
+    let dispatcher =
+        Box::new(unsafe { InGuestDispatcher::new(LiteinstSeam::new(stats, publication)) });
+    #[cfg(feature = "exec-private-init")]
+    if let Some(initial) = initial {
+        let inherited = initial
+            .controller(reverie_inguest::guest::tool_region::StackBacking::ToolRegion(region));
+        unsafe {
+            reverie_inguest::install(dispatcher, &inherited, &config)?;
+        }
+    } else {
+        unsafe {
+            reverie_inguest::install(dispatcher, &controller, &config)?;
+        }
+    }
+    #[cfg(not(feature = "exec-private-init"))]
     unsafe {
-        reverie_inguest::install(
-            // SAFETY (InGuestDispatcher::new): registered only through this
-            // install, whose SIGSYS handler hands it genuine trapped events;
-            // LiteInst never passes trap events to it any other way.
-            Box::new(InGuestDispatcher::new(LiteinstSeam::new(
-                stats,
-                publication,
-            ))),
-            &controller,
-            &config,
-        )
-    }?;
+        reverie_inguest::install(dispatcher, &controller, &config)?;
+    }
     enable_instruction_faulting(instructions)
 }
 

@@ -50,6 +50,35 @@ pub struct BlockingRpcClient<G: GlobalTool, S = UnixStream> {
     _phantom: PhantomData<fn() -> G>,
 }
 
+/// An owned client that completed the explicit InitialImage transport exchange.
+///
+/// Private fields prevent constructing this from an ordinary RPC client. This
+/// records the acknowledgement and raw Config digest checks on its owned
+/// stream; it does not prove the launcher's authorization policy is sound.
+/// Fork/exec successors cannot inherit this as a new launch authorization.
+pub struct InitialImageClient<G: GlobalTool, S = UnixStream> {
+    client: BlockingRpcClient<G, S>,
+}
+
+impl<G: GlobalTool, S> InitialImageClient<G, S> {
+    /// Configuration decoded only after the independently expected hash matched.
+    pub fn config(&self) -> &G::Config {
+        &self.client.config
+    }
+
+    /// Transfer the same live connection into the normal RPC owner.
+    /// This consumes the InitialImage handle without reconnecting or duplicating.
+    pub fn into_client(self) -> BlockingRpcClient<G, S> {
+        self.client
+    }
+}
+
+impl<G: GlobalTool, S: AsRawFd> AsRawFd for InitialImageClient<G, S> {
+    fn as_raw_fd(&self) -> RawFd {
+        self.client.as_raw_fd()
+    }
+}
+
 // TODO-HUMAN-REVIEW(PR-212): Review raw descriptor exposure for in-guest
 // runtimes that must hide coordinator transport descriptors from the guest.
 impl<G: GlobalTool, S: AsRawFd> AsRawFd for BlockingRpcClient<G, S> {
@@ -93,6 +122,41 @@ where
     /// Connect and synchronously receive the coordinator's config handshake.
     pub fn connect(path: impl AsRef<Path>, tid: Tid) -> Result<Self, RpcError> {
         Self::from_connected_stream(UnixStream::connect(path)?, tid)
+    }
+
+    /// Redeem InitialImage authorization and receive Config on the same socket.
+    ///
+    /// `expected_config_digest` must come independently from the authenticated
+    /// launch inputs. Neither the server's acknowledgement nor the subsequent
+    /// Config supplies authority for this value. Raw Config bytes are checked
+    /// before deserialization. Ordinary connect and fork reconnect do not use
+    /// or inherit this exchange.
+    pub fn connect_initial_image(
+        path: impl AsRef<Path>,
+        tid: Tid,
+        redemption: &[u8],
+        expected_config_digest: crate::initial_image::ConfigDigest,
+    ) -> Result<InitialImageClient<G>, RpcError> {
+        let request = crate::initial_image::encode_redemption(redemption)?;
+        let mut stream = UnixStream::connect(path)?;
+        write_message(&mut stream, &request)?;
+        let acknowledgement = read_message(&mut stream, crate::initial_image::MAX_FRAME_LEN)?;
+        crate::initial_image::check_ack(&acknowledgement, expected_config_digest)?;
+        let config_bytes = read_message(&mut stream, DEFAULT_MAX_FRAME_LEN)?;
+        if crate::initial_image::config_digest(&config_bytes) != expected_config_digest {
+            return Err(crate::initial_image::invalid(
+                "InitialImage raw config digest mismatch",
+            ));
+        }
+        let config = decode(&config_bytes)?;
+        Ok(InitialImageClient {
+            client: Self {
+                tid,
+                config,
+                stream: Mutex::new(stream),
+                _phantom: PhantomData,
+            },
+        })
     }
 }
 

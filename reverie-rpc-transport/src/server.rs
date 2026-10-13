@@ -41,6 +41,7 @@ use crate::codec::read_message;
 use crate::codec::write_message;
 use crate::envelope::RequestEnvelope;
 use crate::error::RpcError;
+use crate::initial_image::InitialImageAdmission;
 
 /// `SO_PEERPIDFD` (Linux 6.5): a pidfd for the process that connected the
 /// socket. Defined here because the libc crate exports it only from its
@@ -157,6 +158,13 @@ pub struct RpcServer<G: GlobalTool> {
     connections: ConnectionMonitor,
     issues: Option<RpcIssueMonitor>,
     admission: Option<Arc<dyn ConnectionAdmission>>,
+    initial_image: Option<InitialImageSetup>,
+}
+
+#[derive(Clone)]
+struct InitialImageSetup {
+    admission: Arc<dyn InitialImageAdmission>,
+    config_bytes: Arc<Vec<u8>>,
 }
 
 /// Actual connection failures, retained independently of the serving task.
@@ -358,6 +366,33 @@ where
         Self::bind_inner(path, global, config, None, None)
     }
 
+    /// Bind a new coordinator without removing any existing directory entry.
+    ///
+    /// An occupied path returns the kernel's bind error unchanged, even if
+    /// the entry appeared after a caller's absence check. Failed binds do not
+    /// construct a server or clean up the path. Successful servers use the
+    /// same owned-path cleanup as [`Self::bind`].
+    pub fn bind_exclusive(
+        path: impl AsRef<Path>,
+        global: Arc<G>,
+        config: G::Config,
+    ) -> Result<Self, RpcError> {
+        let path = path.as_ref().to_path_buf();
+        let listener = UnixListener::bind(&path)?;
+        Ok(Self {
+            global,
+            config,
+            listener,
+            path,
+            readiness: None,
+            connection_readiness: None,
+            connections: ConnectionMonitor::new(),
+            issues: None,
+            admission: None,
+            initial_image: None,
+        })
+    }
+
     // TODO-HUMAN-REVIEW(PR-128): Review the externally shared fallback-readiness boundary.
     /// Binds a coordinator and marks `readiness` after the first complete
     /// guest request arrives.
@@ -407,6 +442,7 @@ where
             connections: ConnectionMonitor::new(),
             issues: None,
             admission: None,
+            initial_image: None,
         })
     }
 
@@ -414,6 +450,32 @@ where
     /// see [`ConnectionAdmission`].
     pub fn set_connection_admission(&mut self, admission: Arc<dyn ConnectionAdmission>) {
         self.admission = Some(admission);
+    }
+
+    /// Require InitialImage redemption on every connection to this server.
+    ///
+    /// The normal process admission/watcher and retained issue monitor must
+    /// already be configured. There is no protocol detection or ordinary
+    /// fallback. This initial slice does not admit successor exec, fork or
+    /// thread transactions; an ordinary fork reconnect to this server fails
+    /// closed. Unconfigured legacy servers retain their config-first protocol.
+    /// Config is canonically encoded once here and those immutable bytes are
+    /// used for every digest and config frame on this server. The hook
+    /// implements launcher policy; transport does not authenticate it.
+    pub fn set_initial_image_admission(
+        &mut self,
+        admission: Arc<dyn InitialImageAdmission>,
+    ) -> Result<(), RpcError> {
+        if self.admission.is_none() || self.issues.is_none() {
+            return Err(crate::initial_image::invalid(
+                "InitialImage requires process admission and retained connection issues",
+            ));
+        }
+        self.initial_image = Some(InitialImageSetup {
+            admission,
+            config_bytes: Arc::new(encode(&self.config)?),
+        });
+        Ok(())
     }
 
     /// The filesystem path this coordinator is listening on. Guests connect
@@ -485,10 +547,24 @@ where
             };
             let retain_issues = self.issues.is_some();
             let admission = self.admission.clone();
+            let initial_image = self.initial_image.clone();
             connections.spawn(async move {
                 let _connection_guard = connection_guard;
                 let future = async move {
+                    let mut stream = stream;
                     let admitted = admit_connection(admission.as_ref(), &stream)?;
+                    let config_bytes = match initial_image {
+                        Some(hook) => Some(
+                            initial_image_handshake(
+                                &mut stream,
+                                admitted,
+                                hook.admission.as_ref(),
+                                hook.config_bytes,
+                            )
+                            .await?,
+                        ),
+                        None => None,
+                    };
                     serve_connection_inner(
                         global,
                         config,
@@ -496,6 +572,7 @@ where
                         readiness,
                         connection_readiness,
                         admitted,
+                        config_bytes,
                     )
                     .await
                 };
@@ -527,18 +604,62 @@ where
     /// Accept and fully serve exactly one connection on the current task. This
     /// is primarily useful for tests and for single-guest scenarios.
     pub async fn serve_one(&self) -> Result<(), RpcError> {
-        let (stream, _addr) = self.listener.accept().await?;
+        let (mut stream, _addr) = self.listener.accept().await?;
         let _connection_guard = self.connections.connected();
-        let admitted = admit_connection(self.admission.as_ref(), &stream)?;
-        serve_connection_inner(
-            self.global.clone(),
-            self.config.clone(),
-            stream,
-            self.readiness.clone(),
-            self.connection_readiness.clone(),
-            admitted,
-        )
-        .await
+        // Legacy serve_one retains its original error-return behavior. The
+        // explicit InitialImage path also retains every admission/redemption
+        // failure independently of this task, including missing redemption EOF.
+        let monitor = self.initial_image.as_ref().and(self.issues.clone());
+        if let Some(monitor) = &monitor {
+            monitor.reserve()?;
+        }
+        let mut guard = IssueGuard {
+            monitor,
+            connection: 1,
+            completed: false,
+        };
+        let result = async {
+            let admitted = admit_connection(self.admission.as_ref(), &stream)?;
+            let config = self.config.clone();
+            let config_bytes = match &self.initial_image {
+                Some(hook) => Some(
+                    initial_image_handshake(
+                        &mut stream,
+                        admitted,
+                        hook.admission.as_ref(),
+                        hook.config_bytes.clone(),
+                    )
+                    .await?,
+                ),
+                None => None,
+            };
+            serve_connection_inner(
+                self.global.clone(),
+                config,
+                stream,
+                self.readiness.clone(),
+                self.connection_readiness.clone(),
+                admitted,
+                config_bytes,
+            )
+            .await
+        }
+        .await;
+        match result {
+            Err(error) if guard.monitor.is_some() => {
+                let error = Arc::new(error);
+                guard.completed = true;
+                guard.monitor.as_ref().unwrap().record(
+                    guard.connection,
+                    ConnectionFailure::Transport(error.clone()),
+                );
+                Err(RpcError::Io(std::io::Error::other(error)))
+            }
+            other => {
+                guard.complete(Ok(()));
+                other
+            }
+        }
     }
 }
 
@@ -571,7 +692,7 @@ pub async fn serve_connection<G>(
 where
     G: GlobalTool,
 {
-    serve_connection_inner(global, config, stream, None, None, None).await
+    serve_connection_inner(global, config, stream, None, None, None, None).await
 }
 
 /// Serve an independently owned asynchronous byte stream using the same
@@ -589,7 +710,33 @@ where
     G: GlobalTool,
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    serve_connection_inner(global, config, stream, None, None, None).await
+    serve_connection_inner(global, config, stream, None, None, None, None).await
+}
+
+/// Admission has already installed the normal process watch. A second pidfd
+/// comes from this exact socket; the watcher continues owning its first one.
+async fn initial_image_handshake(
+    stream: &mut UnixStream,
+    admitted: Option<Admitted>,
+    hook: &dyn InitialImageAdmission,
+    config_bytes: Arc<Vec<u8>>,
+) -> Result<Arc<Vec<u8>>, RpcError> {
+    let admitted = admitted.ok_or_else(|| {
+        crate::initial_image::invalid("InitialImage connection has no watched process admission")
+    })?;
+    let peer = peer_pidfd(stream)?;
+    let request = read_message(stream, crate::initial_image::MAX_FRAME_LEN)
+        .await
+        .map_err(|error| match error {
+            RpcError::Closed => crate::initial_image::invalid("InitialImage redemption is missing"),
+            other => other,
+        })?;
+    let redemption = crate::initial_image::decode_redemption(&request)?;
+    let digest = crate::initial_image::config_digest(&config_bytes);
+    hook.redeem(peer, admitted, redemption, digest)?;
+    let ack = crate::initial_image::encode_ack(digest);
+    write_message(stream, &ack).await?;
+    Ok(config_bytes)
 }
 
 async fn serve_connection_inner<G, S>(
@@ -599,6 +746,7 @@ async fn serve_connection_inner<G, S>(
     readiness: Option<Arc<AtomicBool>>,
     connection_readiness: Option<Arc<AtomicBool>>,
     mut admitted: Option<Admitted>,
+    config_bytes: Option<Arc<Vec<u8>>>,
 ) -> Result<(), RpcError>
 where
     G: GlobalTool,
@@ -611,7 +759,10 @@ where
     // passing a `&Request`/`&Response` into an async fn. Holding such a borrow
     // across an await would make this future non-`Send` and break
     // `tokio::spawn`.
-    let config_bytes = encode(&config)?;
+    let config_bytes = match &config_bytes {
+        Some(bytes) => std::borrow::Cow::Borrowed(bytes.as_slice()),
+        None => std::borrow::Cow::Owned(encode(&config)?),
+    };
     write_message(&mut stream, &config_bytes).await?;
     if let Some(readiness) = &connection_readiness {
         readiness.store(true, Ordering::Release);
@@ -650,6 +801,156 @@ where
 // connection error so a coordinator operator can see it.
 fn tracing_disconnect(e: &RpcError) {
     eprintln!("reverie-rpc-transport: guest connection ended with error: {e}");
+}
+
+#[cfg(test)]
+mod exclusive_bind_tests {
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::atomic::AtomicU64;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct EmptyGlobal;
+
+    #[reverie::global_tool]
+    impl GlobalTool for EmptyGlobal {
+        type Request = ();
+        type Response = ();
+        type Config = ();
+
+        async fn receive_rpc(&self, _from: reverie::Tid, _request: ()) {}
+    }
+
+    struct Directory(PathBuf);
+
+    impl Directory {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = PathBuf::from(format!(
+                "/tmp/reverie-rpc-new-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn socket(&self) -> PathBuf {
+            self.0.join("rpc.sock")
+        }
+    }
+
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    fn identity(path: &Path) -> (u64, u64, u32) {
+        let entry = std::fs::symlink_metadata(path).unwrap();
+        (entry.dev(), entry.ino(), entry.mode())
+    }
+
+    fn expect_occupied(path: &Path) {
+        match RpcServer::bind_exclusive(path, Arc::new(EmptyGlobal), ()) {
+            Err(RpcError::Io(error)) => {
+                assert_eq!(error.raw_os_error(), Some(libc::EADDRINUSE));
+            }
+            Err(error) => panic!("unexpected exclusive bind error: {error}"),
+            Ok(_) => panic!("exclusive bind replaced an occupied entry"),
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_stats_exclusive_bind_preserves_regular_file() {
+        let directory = Directory::new();
+        let path = directory.socket();
+        let bytes = b"existing file\0with exact bytes\xff";
+        std::fs::write(&path, bytes).unwrap();
+        let before = identity(&path);
+        expect_occupied(&path);
+        assert_eq!(identity(&path), before);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn initial_stats_exclusive_bind_preserves_symlink_and_target() {
+        let directory = Directory::new();
+        let path = directory.socket();
+        let target = directory.0.join("target");
+        let bytes = b"untouched symlink target\0\xfe";
+        std::fs::write(&target, bytes).unwrap();
+        std::os::unix::fs::symlink("target", &path).unwrap();
+        let before = identity(&path);
+        let target_before = identity(&target);
+        let link_before = std::fs::read_link(&path).unwrap();
+        expect_occupied(&path);
+        assert_eq!(identity(&path), before);
+        assert_eq!(std::fs::read_link(&path).unwrap(), link_before);
+        assert_eq!(identity(&target), target_before);
+        assert_eq!(std::fs::read(&target).unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn initial_stats_exclusive_bind_preserves_existing_live_socket() {
+        let directory = Directory::new();
+        let path = directory.socket();
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let before = identity(&path);
+        expect_occupied(&path);
+        assert_eq!(identity(&path), before);
+        let _client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        let (_accepted, _) = listener.accept().unwrap();
+        assert_eq!(identity(&path), before);
+    }
+
+    #[tokio::test]
+    async fn initial_stats_exclusive_bind_preserves_entry_created_after_absence_check() {
+        let directory = Directory::new();
+        let path = directory.socket();
+        assert_eq!(
+            std::fs::symlink_metadata(&path).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        // Deterministically occupy the named check/bind window.
+        let bytes = b"created after the absence check";
+        std::fs::write(&path, bytes).unwrap();
+        let before = identity(&path);
+        expect_occupied(&path);
+        assert_eq!(identity(&path), before);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn initial_stats_exclusive_bind_cleanup_and_ordinary_replacement_are_preserved() {
+        let directory = Directory::new();
+        let path = directory.socket();
+        let server = RpcServer::bind_exclusive(&path, Arc::new(EmptyGlobal), ()).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_socket()
+        );
+        drop(server);
+        assert_eq!(
+            std::fs::symlink_metadata(&path).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+
+        std::fs::write(&path, b"ordinary bind still replaces this stale entry").unwrap();
+        let server = RpcServer::bind(&path, Arc::new(EmptyGlobal), ()).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_socket()
+        );
+        drop(server);
+        assert!(!path.exists());
+    }
 }
 
 #[cfg(test)]

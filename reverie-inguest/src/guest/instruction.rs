@@ -178,6 +178,13 @@ pub fn preflight_instruction_faulting(subscriptions: InstructionSubscriptions) -
     // controls. Keep inherited asynchronous handlers from running application
     // CPUID/RDTSC during that bounded window, and restore the caller's exact
     // signal mask on every return path.
+    #[cfg(feature = "exec-private-init")]
+    let all_signals = if super::exec_private::active() {
+        !(1_u64 << (libc::SIGSYS - 1))
+    } else {
+        u64::MAX
+    };
+    #[cfg(not(feature = "exec-private-init"))]
     let all_signals = u64::MAX;
     let mut previous_mask = 0;
     let masked = unsafe {
@@ -669,17 +676,27 @@ pub unsafe fn install_instruction_signal_handler(
     }
     INSTRUCTION_FAULT_SEAM.store(ptr::from_ref(seam).cast_mut(), Ordering::Release);
 
+    #[cfg(feature = "exec-private-init")]
+    let handler = if super::exec_private::active() {
+        // Discover PKRU before selecting either private bridge. SIGSEGV is
+        // installed before SIGSYS; the latter's discovery would be too late.
+        super::exec_private::signal_entry(true, crate::trap::prepare_private_signal_features()?)
+    } else {
+        instruction_sigsegv_handler
+    };
+    #[cfg(not(feature = "exec-private-init"))]
+    let handler = instruction_sigsegv_handler;
     // Through the runtime's private restorer, like the SIGSYS handler.
     unsafe {
         crate::signal::install_runtime_handler(
             libc::SIGSEGV,
-            instruction_sigsegv_handler,
+            handler,
             if on_alt_stack { libc::SA_ONSTACK } else { 0 },
         )
     }
 }
 
-unsafe extern "C" fn instruction_sigsegv_handler(
+pub(crate) unsafe extern "C" fn instruction_sigsegv_handler(
     signal: libc::c_int,
     info: *mut libc::siginfo_t,
     context: *mut libc::c_void,
@@ -718,7 +735,11 @@ unsafe extern "C" fn instruction_sigsegv_handler(
     // but its backing pages are shared; child publication would let the parent
     // reuse and overwrite the same slot. Execute at the private native helper
     // and advance the faulting context instead.
-    if tool_callback_active() {
+    #[cfg(feature = "exec-private-init")]
+    let private = super::exec_private::private_instruction(address);
+    #[cfg(not(feature = "exec-private-init"))]
+    let private = false;
+    if tool_callback_active() || private {
         let context = unsafe { &mut *raw_context.cast::<libc::ucontext_t>() };
         unsafe { execute_nested_fault_natively(kind, context, expected.len()) };
         return;
@@ -769,7 +790,11 @@ unsafe fn emulate_unpatchable_instruction(
         emit_in_guest_stage(b"instruction-sigsegv-unsubscribed");
         unsafe { deliver_default_sigsegv() };
     }
-    if tool_callback_active() {
+    #[cfg(feature = "exec-private-init")]
+    let private = super::exec_private::private_instruction(address);
+    #[cfg(not(feature = "exec-private-init"))]
+    let private = false;
+    if tool_callback_active() || private {
         let context = unsafe { &mut *raw_context.cast::<libc::ucontext_t>() };
         unsafe { execute_nested_fault_natively(kind, context, expected.len()) };
         return;

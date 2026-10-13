@@ -95,6 +95,12 @@ pub unsafe fn prepare_fixed_gates() -> io::Result<()> {
 pub fn pkru_present() -> bool {
     pkru::present()
 }
+
+#[cfg(feature = "exec-private-init")]
+pub(crate) fn prepare_private_signal_features() -> io::Result<bool> {
+    frame::initialize()?;
+    pkru::initialize()
+}
 const SYS_SECCOMP_CODE: libc::c_int = 1;
 
 core::arch::global_asm!(
@@ -365,6 +371,25 @@ pub unsafe fn raw_syscall6_with_result(
     }
 }
 
+/// Execute a physical guest operation using the guest's native thread state.
+/// Bookkeeping syscalls keep using [`raw_syscall6`] and retain Tool FS.
+///
+/// # Safety
+/// The same storage, operation and PKRU requirements as
+/// [`raw_syscall6_with_result`] apply. An authenticated private-loader runtime
+/// additionally requires its ordinary Tool callback phase.
+pub unsafe fn physical_guest_syscall6(
+    number: i64,
+    args: [u64; 6],
+    pkru: Option<u32>,
+) -> NativeSyscallResult {
+    #[cfg(feature = "exec-private-init")]
+    if crate::guest::exec_private::active() {
+        return unsafe { crate::guest::exec_private::physical_syscall(number, args, pkru) };
+    }
+    unsafe { raw_syscall6_with_result(number, args, pkru) }
+}
+
 /// The address range of the trusted gate, for building the seccomp filter.
 pub fn trusted_gate() -> TrustedGate {
     #[cfg(feature = "fixed-syscall-gates")]
@@ -539,6 +564,11 @@ pub(crate) unsafe extern "C" fn sigsys_handler(
         unsafe { exit_now(126) };
     }
 
+    #[cfg(feature = "exec-private-init")]
+    if unsafe { crate::guest::exec_private::relay_private_signal(signal_number, info, context) } {
+        return;
+    }
+
     // Reentrancy guard: a trapped syscall inside the handler is a bug (the
     // dispatcher must use the trusted gate). Fail closed rather than recurse.
     if IN_HANDLER.get() {
@@ -676,6 +706,12 @@ pub unsafe fn install_handler_with_backing(
         reverie_inguest_sigsys_pkru
     } else {
         sigsys_handler
+    };
+    #[cfg(feature = "exec-private-init")]
+    let handler = if crate::guest::exec_private::active() {
+        crate::guest::exec_private::signal_entry(false, ospke)
+    } else {
+        handler
     };
     if use_alt_stack {
         unsafe { signal::install_alt_stack_with_backing(backing)? };
@@ -1141,4 +1177,9 @@ mod tests {
             "{output:?}"
         );
     }
+}
+
+#[cfg(feature = "exec-private-init")]
+pub(crate) unsafe fn adopt_authenticated_initial_gate() -> io::Result<()> {
+    unsafe { fixed_gates::adopt_authenticated_initial_page() }
 }

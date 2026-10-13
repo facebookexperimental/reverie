@@ -110,3 +110,5 @@ pub use vdso::VdsoSyscallSite;
 pub use vdso::patch_current_vdso;
 #[cfg(target_arch = "x86_64")]
 pub use vdso::patch_current_vdso_trapping;
+#[cfg(target_arch = "x86_64")]
+pub use vdso::patch_current_vdso_trapping_owned;

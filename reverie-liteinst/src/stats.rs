@@ -500,12 +500,14 @@ fn enabled_record_inherited_entry(
 static ENABLED_STATS_PROBES: AtomicU64 = AtomicU64::new(0);
 
 /// Whether this process image's runtime collects the statistics it reports at
-/// exit: true once the in-guest Tool host found the statistics coordinator
-/// ([`crate::STATS_COORDINATOR_ENV`]) in the environment during installation
-/// and started collecting. A Tool host whose coordinator asked for statistics
-/// can check this after installation returns: the variable is read from the
-/// guest environment, which guest code that ran before the runtime could have
-/// changed, and an image that collects nothing reports nothing at exit.
+/// exit: true once the in-guest Tool host initializes the actual collector.
+/// Ordinary installations select its endpoint from
+/// [`crate::STATS_COORDINATOR_ENV`]; guest code that ran before installation
+/// could have changed that variable. Authenticated private InitialImage setup
+/// uses the fixed companion of its genuine coordinator endpoint, without an
+/// environment fallback. A Tool can check this after installation returns;
+/// the host must still require the actual terminal report and clean RPC drain.
+/// An image that collects nothing reports nothing at exit.
 pub fn guest_stats_enabled() -> bool {
     GUEST_STATS.get().is_some()
 }

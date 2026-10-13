@@ -22,6 +22,7 @@ bincode = { version = "2", features = ["serde"] }
 libc = "0.2.186"
 reverie = { version = "0.4.1", path = "../reverie", package = "reverie-core" }
 serde = { version = "1.0.219", features = ["derive"] }
+sha2 = "0.10.9"
 thiserror = "2.0.18"
 tokio = { version = "1.52.4", features = ["io-util", "net", "rt", "sync", "macros"] }
 

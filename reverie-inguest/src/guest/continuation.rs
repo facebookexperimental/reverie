@@ -444,6 +444,8 @@ fn prepare_signal_for(
     );
     frame.set_pkru(owner.saved.pkru().map(|_| 0))?;
     owner.entries += 1;
+    #[cfg(feature = "exec-private-init")]
+    super::exec_private::callback_prepared();
     Ok(Some(entry))
 }
 
@@ -646,6 +648,8 @@ pub fn complete(frame: &mut SignalFrame<'_>) -> Result<bool, FrameError> {
     owner.completions += 1;
     owner.phase = Phase::Idle;
     PENDING.set(None);
+    #[cfg(feature = "exec-private-init")]
+    super::exec_private::guest_completed();
     Ok(true)
 }
 
@@ -880,4 +884,9 @@ mod tests {
         owner.context.instruction_pointer = u64::MAX - 1;
         assert!(commit_context(&mut owner, 3).is_err());
     }
+}
+
+#[cfg(feature = "exec-private-init")]
+pub(crate) fn is_completion_address(address: u64) -> bool {
+    address == core::ptr::addr_of!(fallback_completion_return) as usize as u64
 }

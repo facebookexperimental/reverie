@@ -24,6 +24,9 @@ allocator-fixture = ["reverie-inguest/allocator-fixture"]
 # Native-exec prerequisite. Only the FullTool installation route is admitted;
 # successor exec itself remains refused until its bootstrap is implemented.
 fixed-syscall-gates = ["reverie-inguest/fixed-syscall-gates"]
+# Private GNU loader InitialImage experiment; no successor exec admission.
+exec-private-init = ["fixed-syscall-gates", "reverie-inguest/exec-private-init"]
+
 
 [[bin]]
 name = "reverie-liteinst-allocator-host-control"

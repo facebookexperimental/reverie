@@ -708,7 +708,7 @@ pub fn mapping_change_refused(number: i64, args: [u64; 6]) -> bool {
         number,
         args,
         &facts,
-        super::tool_region::published_owner().is_some(),
+        owned_mapping_guard_active(),
         crate::trap::fixed_gate_region(),
     )
 }
@@ -721,7 +721,7 @@ pub fn mapping_change_refused(number: i64, args: [u64; 6]) -> bool {
 /// This protects only the finite mapping-operation inventory below. It does
 /// not prevent CPU stores, kernel buffer writes or entry into trusted gates.
 pub fn mapping_change_result(number: i64, args: [u64; 6]) -> Option<i64> {
-    let owner = super::tool_region::published_owner().is_some();
+    let owner = owned_mapping_guard_active();
     let fixed_region = crate::trap::fixed_gate_region();
     if number == libc::SYS_brk && args[0] != 0 && (owner || fixed_region.is_some()) {
         // SAFETY: brk(0) observes the current break and changes no mapping.
@@ -817,9 +817,21 @@ fn break_change_in(
     }
 }
 
+fn owned_mapping_guard_active() -> bool {
+    #[cfg(feature = "exec-private-init")]
+    if super::exec_private::active() {
+        return true;
+    }
+    super::tool_region::published_owner().is_some()
+}
+
 fn owner_overlaps(start: u64, length: u64) -> bool {
     if length == 0 {
         return false;
+    }
+    #[cfg(feature = "exec-private-init")]
+    if super::exec_private::overlaps_private(start, length) {
+        return true;
     }
     let first = start & !(PAGE_SIZE - 1);
     let end = start.saturating_add(length);

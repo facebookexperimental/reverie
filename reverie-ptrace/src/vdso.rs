@@ -103,6 +103,11 @@ fn vdso_replacements(
 ) -> Result<Vec<(&'static VdsoEntry, &'static [u8])>, Error> {
     static REPORTED: LazyLock<Mutex<BTreeSet<String>>> = LazyLock::new(Default::default);
     let (replacements, report) = replacements_from(vdso_table, subscriptions, &REPORTED)?;
+    report_native_entries(report);
+    Ok(replacements)
+}
+
+fn report_native_entries(report: Option<NativeReport>) {
     match report {
         Some(NativeReport::First(native)) => warn!(
             "vDSO entry points left native because the tool does not subscribe to their \
@@ -111,7 +116,6 @@ fn vdso_replacements(
         Some(NativeReport::Repeat(native)) => debug!("vDSO entry points left native: {native}"),
         None => {}
     }
-    Ok(replacements)
 }
 
 /// The entry points to replace, each with its stub, and the report of those
@@ -235,6 +239,197 @@ pub fn patch_current_vdso(subscriptions: &Subscription) -> Result<Vec<VdsoSyscal
 #[cfg(target_arch = "x86_64")]
 pub fn patch_current_vdso_trapping(subscriptions: &Subscription) -> Result<(), Error> {
     rewrite_current_vdso(subscriptions, false).map(drop)
+}
+
+/// Rewrite the actual kernel vDSO with trapping stubs through an owned
+/// permission operation, without a writable/executable interval.
+///
+/// This is for an authenticated, exclusive initial-image initializer whose
+/// raw syscall gate is already usable. It qualifies exactly one private RX
+/// `[vdso]` against `/proc/self/auxv`, snapshots and classifies that image, and
+/// preflights all stubs and padding before calling `permission`. The operation
+/// is called only for the same immutable extent, first with READ|WRITE, then
+/// with READ|EXEC. The full image, mapping identity and kernel auxiliary-vector
+/// entry are checked again after RX restoration. Missing vDSO is an error even
+/// when no entries are selected.
+///
+/// Ordinary in-guest callers should use [`patch_current_vdso_trapping`].
+///
+/// # Safety
+/// No other thread or guest code may run, remap or use the vDSO during this
+/// operation. The caller must own an authenticated initialization context and
+/// keep a fatal guard armed through verified readiness: every error, panic or
+/// abandonment must prevent guest entry. `permission` must perform exactly
+/// the requested current-process mprotect through that context's owned gate,
+/// without allocation, logging or unwinding while the vDSO lacks EXEC. A
+/// failed RX restoration must terminate directly before formatting an error.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn patch_current_vdso_trapping_owned(
+    subscriptions: &Subscription,
+    permission: impl FnMut(usize, usize, libc::c_int) -> Result<(), Errno>,
+) -> Result<(), Error> {
+    // SAFETY: the caller supplies the exclusive initial-image ownership and
+    // permission operation required by the shared body.
+    unsafe { rewrite_initial_vdso(subscriptions, read_qualified_current_vdso, permission) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct QualifiedCurrentVdso {
+    mapping: procfs::process::MemoryMap,
+    start: usize,
+    len: usize,
+}
+
+/// Qualification is independent of libc's getauxval, whose private Tool auxv
+/// need not contain the guest's AT_SYSINFO_EHDR.
+#[cfg(target_arch = "x86_64")]
+fn qualify_current_vdso(
+    maps: &[procfs::process::MemoryMap],
+    sysinfo_ehdr: Option<u64>,
+) -> Result<QualifiedCurrentVdso, Error> {
+    use procfs::process::MMPermissions;
+
+    let mut candidates = maps
+        .iter()
+        .filter(|map| map.pathname == procfs::process::MMapPath::Vdso);
+    let mapping = candidates.next().ok_or(Errno::ENOENT)?;
+    if candidates.next().is_some()
+        || mapping.perms != MMPermissions::READ | MMPermissions::EXECUTE | MMPermissions::PRIVATE
+        || sysinfo_ehdr != Some(mapping.address.0)
+    {
+        return Err(Errno::EINVAL.into());
+    }
+    let start = usize::try_from(mapping.address.0).map_err(|_| Errno::EOVERFLOW)?;
+    let len = mapping
+        .address
+        .1
+        .checked_sub(mapping.address.0)
+        .and_then(|len| usize::try_from(len).ok())
+        .ok_or(Errno::EOVERFLOW)?;
+    // Linux x86-64 uses 4096-byte pages. Avoid a libc query of the private
+    // Tool auxiliary vector when qualifying the actual kernel mapping.
+    if start == 0 || len == 0 || start % 4096 != 0 || len % 4096 != 0 {
+        return Err(Errno::EINVAL.into());
+    }
+    if len > isize::MAX as usize || start.checked_add(len).is_none() {
+        return Err(Errno::EOVERFLOW.into());
+    }
+    Ok(QualifiedCurrentVdso {
+        mapping: mapping.clone(),
+        start,
+        len,
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+fn read_qualified_current_vdso() -> Result<QualifiedCurrentVdso, Error> {
+    // Process::myself opens /proc/self; neither maps nor auxv uses an
+    // interposable getpid/getauxval or another process's image.
+    let process = procfs::process::Process::myself().map_err(|_| Errno::EIO)?;
+    let maps = process.maps().map_err(|_| Errno::EIO)?;
+    let auxv = process.auxv().map_err(|_| Errno::EIO)?;
+    qualify_current_vdso(&maps.0, auxv.get(&libc::AT_SYSINFO_EHDR).copied())
+}
+
+#[cfg(target_arch = "x86_64")]
+struct TrappingVdsoWrite {
+    address: usize,
+    bytes: Vec<u8>,
+}
+
+#[cfg(target_arch = "x86_64")]
+struct TrappingVdsoPlan {
+    writes: Vec<TrappingVdsoWrite>,
+    expected: Vec<u8>,
+}
+
+/// All arithmetic, selections, buffers and padding are finished while the
+/// source mapping is still RX. The NX interval consumes only raw write records.
+#[cfg(target_arch = "x86_64")]
+fn plan_trapping_vdso_writes(
+    extent: &QualifiedCurrentVdso,
+    table: &VdsoTable,
+    source: &[u8],
+    subscriptions: &Subscription,
+) -> Result<TrappingVdsoPlan, Error> {
+    if table.mapping_len != extent.len as u64 || source.len() != extent.len {
+        return Err(Errno::EINVAL.into());
+    }
+    let (replacements, report) = select_replacements(table, subscriptions, &Mutex::default());
+    report_native_entries(report);
+    let mut writes = Vec::with_capacity(replacements.len());
+    let mut expected = source.to_vec();
+    let mut previous_end = 0;
+    for (entry, stub) in replacements {
+        if stub.len() > entry.size {
+            return Err(Errno::EINVAL.into());
+        }
+        let offset = usize::try_from(entry.offset).map_err(|_| Errno::EOVERFLOW)?;
+        let patch_len = entry.patch_len(stub.len());
+        let end = offset.checked_add(patch_len).ok_or(Errno::EOVERFLOW)?;
+        if patch_len > entry.size || offset < previous_end || end > extent.len {
+            return Err(Errno::EINVAL.into());
+        }
+        let address = extent.start.checked_add(offset).ok_or(Errno::EOVERFLOW)?;
+        let mut bytes = vec![PATCH_FILL; patch_len];
+        bytes[..stub.len()].copy_from_slice(stub);
+        expected[offset..end].copy_from_slice(&bytes);
+        writes.push(TrappingVdsoWrite { address, bytes });
+        previous_end = end;
+    }
+    Ok(TrappingVdsoPlan { writes, expected })
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn rewrite_initial_vdso(
+    subscriptions: &Subscription,
+    mut current: impl FnMut() -> Result<QualifiedCurrentVdso, Error>,
+    mut permission: impl FnMut(usize, usize, libc::c_int) -> Result<(), Errno>,
+) -> Result<(), Error> {
+    let extent = current()?;
+    // SAFETY: qualification found the actual kernel's readable vDSO; the
+    // caller owns the only thread and prevents remapping for the entire call.
+    let source =
+        unsafe { std::slice::from_raw_parts(extent.start as *const u8, extent.len) }.to_vec();
+    let entries = vdso_exports(&source)
+        .and_then(|exports| classify_vdso_exports(&exports))
+        .map_err(|reason| Error::from(std::io::Error::other(reason)))?;
+    let table = VdsoTable {
+        mapping_len: source.len() as u64,
+        entries,
+    };
+    let plan = plan_trapping_vdso_writes(&extent, &table, &source, subscriptions)?;
+    if current()? != extent
+        || unsafe { std::slice::from_raw_parts(extent.start as *const u8, extent.len) } != source
+    {
+        return Err(Errno::EINVAL.into());
+    }
+    if plan.writes.is_empty() {
+        return Ok(());
+    }
+
+    permission(extent.start, extent.len, libc::PROT_READ | libc::PROT_WRITE)?;
+    // No allocation, logging, assertions, checked indexing or fallible work
+    // occurs here. Each immutable record was bounded against this extent.
+    for write in &plan.writes {
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                write.bytes.as_ptr(),
+                write.address as *mut u8,
+                write.bytes.len(),
+            );
+        }
+    }
+    permission(extent.start, extent.len, libc::PROT_READ | libc::PROT_EXEC)?;
+
+    if current()? != extent
+        || unsafe { std::slice::from_raw_parts(extent.start as *const u8, extent.len) }
+            != plan.expected
+    {
+        return Err(Errno::EINVAL.into());
+    }
+    Ok(())
 }
 
 /// Shared body of [`patch_current_vdso`] (`hooked`) and
@@ -367,6 +562,359 @@ fn own_mprotect(address: usize, len: usize, protection: libc::c_int) -> Result<(
     #[cfg(not(target_arch = "x86_64"))]
     Errno::result(unsafe { libc::mprotect(address as *mut libc::c_void, len, protection) })
         .map(drop)
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod initial_vdso_tests {
+    use super::*;
+
+    fn isolated(body: fn()) {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            let status = if std::panic::catch_unwind(body).is_ok() {
+                0
+            } else {
+                125
+            };
+            unsafe { libc::_exit(status) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status), "child wait status {status}");
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    fn snapshot(extent: &QualifiedCurrentVdso) -> Vec<u8> {
+        // These component fixtures own the fork child's only running thread
+        // and keep its actual kernel vDSO mapped throughout each test.
+        unsafe { std::slice::from_raw_parts(extent.start as *const u8, extent.len) }.to_vec()
+    }
+
+    #[test]
+    fn owned_trapping_preserves_kernel_extent_and_exact_canonical_bytes() {
+        isolated(|| {
+            let extent = read_qualified_current_vdso().unwrap();
+            let original = snapshot(&extent);
+            let entries = classify_vdso_exports(&vdso_exports(&original).unwrap()).unwrap();
+            let mut expected = original.clone();
+            let mut selected = 0;
+            for entry in &entries {
+                if let Some(stub) = entry.replacement(&Subscription::all()) {
+                    let offset = entry.offset as usize;
+                    let end = offset + entry.patch_len(stub.len());
+                    expected[offset..offset + stub.len()].copy_from_slice(stub);
+                    expected[offset + stub.len()..end].fill(PATCH_FILL);
+                    selected += 1;
+                }
+            }
+            assert!(selected > 0);
+            assert_ne!(expected, original);
+            let mut calls = [(0, 0, 0); 2];
+            let mut count = 0;
+            // Component ownership is a fork child, not authenticated native
+            // execution. Exercise the same body with a raw permission operation.
+            unsafe {
+                rewrite_initial_vdso(
+                    &Subscription::all(),
+                    read_qualified_current_vdso,
+                    |a, n, p| {
+                        if count == calls.len() {
+                            return Err(Errno::EINVAL);
+                        }
+                        calls[count] = (a, n, p);
+                        count += 1;
+                        own_mprotect(a, n, p)
+                    },
+                )
+            }
+            .unwrap();
+            assert_eq!(count, 2);
+            assert_eq!(
+                calls,
+                [
+                    (extent.start, extent.len, libc::PROT_READ | libc::PROT_WRITE),
+                    (extent.start, extent.len, libc::PROT_READ | libc::PROT_EXEC),
+                ]
+            );
+            assert_eq!(read_qualified_current_vdso().unwrap(), extent);
+            assert_eq!(snapshot(&extent), expected);
+        });
+    }
+
+    #[test]
+    fn owned_trapping_rw_refusal_leaves_original_rx_image() {
+        isolated(|| {
+            let extent = read_qualified_current_vdso().unwrap();
+            let original = snapshot(&extent);
+            let mut calls = 0;
+            let result = unsafe {
+                rewrite_initial_vdso(
+                    &Subscription::all(),
+                    read_qualified_current_vdso,
+                    |a, n, p| {
+                        assert_eq!((a, n), (extent.start, extent.len));
+                        assert_eq!(p, libc::PROT_READ | libc::PROT_WRITE);
+                        calls += 1;
+                        Err(Errno::EPERM)
+                    },
+                )
+            };
+            assert!(matches!(result, Err(Error::Errno(Errno::EPERM))));
+            assert_eq!(calls, 1);
+            assert_eq!(read_qualified_current_vdso().unwrap(), extent);
+            assert_eq!(snapshot(&extent), original);
+        });
+    }
+
+    #[test]
+    fn owned_trapping_bad_map_or_kernel_auxv_never_calls_permission() {
+        isolated(|| {
+            use procfs::process::MMPermissions;
+
+            let extent = read_qualified_current_vdso().unwrap();
+            let original = snapshot(&extent);
+            for mutation in 0..12 {
+                let mut maps = vec![extent.mapping.clone()];
+                let mut auxv = Some(extent.mapping.address.0);
+                match mutation {
+                    0 => maps.clear(),
+                    1 => maps.push(extent.mapping.clone()),
+                    2 => auxv = None,
+                    3 => auxv = Some(extent.mapping.address.0 + 4096),
+                    4 => maps[0].perms |= MMPermissions::WRITE,
+                    5 => {
+                        maps[0].perms.remove(MMPermissions::PRIVATE);
+                        maps[0].perms.insert(MMPermissions::SHARED);
+                    }
+                    6 => maps[0].perms.remove(MMPermissions::EXECUTE),
+                    7 => {
+                        maps[0].address = (0, 4096);
+                        auxv = Some(0);
+                    }
+                    8 => maps[0].address.1 = maps[0].address.0,
+                    9 => {
+                        maps[0].address.0 += 1;
+                        auxv = Some(maps[0].address.0);
+                    }
+                    10 => maps[0].address.1 -= 1,
+                    11 => maps[0].address.1 = maps[0].address.0 - 4096,
+                    _ => unreachable!(),
+                }
+                let mut calls = 0;
+                let result = unsafe {
+                    rewrite_initial_vdso(
+                        &Subscription::all(),
+                        || qualify_current_vdso(&maps, auxv),
+                        |_, _, _| {
+                            calls += 1;
+                            Err(Errno::EPERM)
+                        },
+                    )
+                };
+                assert!(result.is_err(), "qualification mutation {mutation}");
+                assert_eq!(calls, 0, "qualification mutation {mutation}");
+                assert_eq!(read_qualified_current_vdso().unwrap(), extent);
+                assert_eq!(snapshot(&extent), original);
+            }
+            // The selected initial-image path requires an actual vDSO even
+            // when this particular Tool subscribes to no syscalls.
+            let mut calls = 0;
+            assert!(
+                unsafe {
+                    rewrite_initial_vdso(
+                        &Subscription::none(),
+                        || qualify_current_vdso(&[], None),
+                        |_, _, _| {
+                            calls += 1;
+                            Err(Errno::EPERM)
+                        },
+                    )
+                }
+                .is_err()
+            );
+            assert_eq!(calls, 0);
+        });
+    }
+
+    #[test]
+    fn owned_trapping_rechecks_full_source_and_mapping_before_rw() {
+        isolated(|| {
+            let extent = read_qualified_current_vdso().unwrap();
+            let original = snapshot(&extent);
+            let tail = extent.start + extent.len - 1;
+            let changed = original[original.len() - 1] ^ 0x80;
+            let mut reads = 0;
+            let mut calls = 0;
+            let result = unsafe {
+                rewrite_initial_vdso(
+                    &Subscription::all(),
+                    || {
+                        reads += 1;
+                        if reads == 2 {
+                            own_mprotect(
+                                extent.start,
+                                extent.len,
+                                libc::PROT_READ | libc::PROT_WRITE,
+                            )?;
+                            core::ptr::write(tail as *mut u8, changed);
+                            own_mprotect(
+                                extent.start,
+                                extent.len,
+                                libc::PROT_READ | libc::PROT_EXEC,
+                            )?;
+                        }
+                        read_qualified_current_vdso()
+                    },
+                    |_, _, _| {
+                        calls += 1;
+                        Err(Errno::EPERM)
+                    },
+                )
+            };
+            assert!(result.is_err());
+            assert_eq!(calls, 0);
+            // Restore only the component fixture's injected source drift.
+            own_mprotect(extent.start, extent.len, libc::PROT_READ | libc::PROT_WRITE).unwrap();
+            unsafe { core::ptr::write(tail as *mut u8, original[original.len() - 1]) };
+            own_mprotect(extent.start, extent.len, libc::PROT_READ | libc::PROT_EXEC).unwrap();
+            assert_eq!(snapshot(&extent), original);
+
+            let mut reads = 0;
+            let result = unsafe {
+                rewrite_initial_vdso(
+                    &Subscription::all(),
+                    || {
+                        reads += 1;
+                        let mut observed = read_qualified_current_vdso()?;
+                        if reads == 2 {
+                            observed.mapping.inode ^= 1;
+                        }
+                        Ok(observed)
+                    },
+                    |_, _, _| {
+                        calls += 1;
+                        Err(Errno::EPERM)
+                    },
+                )
+            };
+            assert!(result.is_err());
+            assert_eq!(calls, 0);
+            assert_eq!(snapshot(&extent), original);
+            assert_eq!(read_qualified_current_vdso().unwrap(), extent);
+        });
+    }
+
+    #[test]
+    fn owned_trapping_readback_refuses_full_image_corruption() {
+        isolated(|| {
+            let extent = read_qualified_current_vdso().unwrap();
+            let original = snapshot(&extent);
+            let tail = extent.start + extent.len - 1;
+            let changed = original[original.len() - 1] ^ 0x80;
+            let mut calls = 0;
+            let result = unsafe {
+                rewrite_initial_vdso(
+                    &Subscription::all(),
+                    read_qualified_current_vdso,
+                    |a, n, p| {
+                        calls += 1;
+                        if p == libc::PROT_READ | libc::PROT_EXEC {
+                            // The raw writes finished; corrupt an otherwise
+                            // untouched byte before RX to test the full readback.
+                            core::ptr::write(tail as *mut u8, changed);
+                        }
+                        own_mprotect(a, n, p)
+                    },
+                )
+            };
+            assert!(matches!(result, Err(Error::Errno(Errno::EINVAL))));
+            assert_eq!(calls, 2);
+            assert_eq!(read_qualified_current_vdso().unwrap(), extent);
+            assert_ne!(snapshot(&extent), original);
+        });
+    }
+
+    #[test]
+    fn owned_trapping_readback_requalifies_kernel_auxv() {
+        isolated(|| {
+            let extent = read_qualified_current_vdso().unwrap();
+            let mut reads = 0;
+            let mut calls = 0;
+            let result = unsafe {
+                rewrite_initial_vdso(
+                    &Subscription::all(),
+                    || {
+                        reads += 1;
+                        let actual = read_qualified_current_vdso()?;
+                        if reads == 3 {
+                            qualify_current_vdso(&[actual.mapping], None)
+                        } else {
+                            Ok(actual)
+                        }
+                    },
+                    |a, n, p| {
+                        calls += 1;
+                        own_mprotect(a, n, p)
+                    },
+                )
+            };
+            assert!(result.is_err());
+            assert_eq!((reads, calls), (3, 2));
+            assert_eq!(read_qualified_current_vdso().unwrap(), extent);
+        });
+    }
+
+    #[test]
+    fn owned_trapping_plan_refuses_extent_overflow_and_out_of_range_padding() {
+        isolated(|| {
+            let extent = read_qualified_current_vdso().unwrap();
+            let original = snapshot(&extent);
+            let entries = classify_vdso_exports(&vdso_exports(&original).unwrap()).unwrap();
+            let table = VdsoTable {
+                mapping_len: extent.len as u64,
+                entries,
+            };
+            assert!(
+                !plan_trapping_vdso_writes(&extent, &table, &original, &Subscription::all())
+                    .unwrap()
+                    .writes
+                    .is_empty()
+            );
+            let selected = table
+                .entries
+                .iter()
+                .find(|entry| entry.replacement(&Subscription::all()).is_some())
+                .unwrap();
+            for mutation in 0..6 {
+                let mut bad = VdsoTable {
+                    mapping_len: table.mapping_len,
+                    entries: vec![selected.clone()],
+                };
+                match mutation {
+                    0 => bad.mapping_len += 4096,
+                    1 => bad.entries[0].offset = u64::MAX,
+                    2 => bad.entries[0].offset = extent.len as u64 - 1,
+                    3 => bad.entries[0].size = 1,
+                    4 => bad.entries[0].symbol_size = usize::MAX,
+                    5 => bad.entries.push(bad.entries[0].clone()),
+                    _ => unreachable!(),
+                }
+                assert!(
+                    plan_trapping_vdso_writes(&extent, &bad, &original, &Subscription::all())
+                        .is_err(),
+                    "plan mutation {mutation}"
+                );
+                assert_eq!(snapshot(&extent), original);
+                assert_eq!(read_qualified_current_vdso().unwrap(), extent);
+            }
+            let oversized = procfs::process::MemoryMap {
+                address: (4096, (isize::MAX as u64) + 4097),
+                ..extent.mapping.clone()
+            };
+            assert!(qualify_current_vdso(&[oversized], Some(4096)).is_err());
+        });
+    }
 }
 
 /// Describes a procfs error without the C library's errno message: an I/O
