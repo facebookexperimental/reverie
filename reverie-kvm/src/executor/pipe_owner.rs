@@ -74,6 +74,16 @@ impl PipeOwner {
         Ok(())
     }
 
+    pub(super) fn set_nonblocking(&self, host_fd: RawFd, value: libc::c_int) -> i64 {
+        let Ok(_configuration) = self.configuration.lock() else {
+            return negative_errno(libc::ENOSYS);
+        };
+        // Serialize with owner admission, F_SETFL and export across all aliases.
+        // Guest input was copied before this leaf lock. FIONBIO cannot enable
+        // fasync or overwrite unrelated flags with a stale F_GETFL snapshot.
+        set_fd_nonblocking(host_fd, value)
+    }
+
     pub(super) fn set_flags(&self, host_fd: RawFd, flags: i32) -> i64 {
         let Ok(configuration) = self.configuration.lock() else {
             return negative_errno(libc::ENOSYS);

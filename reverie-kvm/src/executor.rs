@@ -15557,6 +15557,9 @@ fn ioctl(
     if args[1] as u32 == libc::FIONREAD as u32 {
         return pipe_fionread(memory, state, guest_fd, host_fd, args[2], capture_output);
     }
+    if args[1] as u32 == libc::FIONBIO as u32 {
+        return fionbio(memory, state, guest_fd, host_fd, args[2]);
+    }
     match args[1] as libc::c_ulong {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-229): Review virtual FIOCLEX/FIONCLEX descriptor flags.
@@ -15601,6 +15604,44 @@ fn ioctl(
         ),
         _ => negative_errno(libc::ENOTTY),
     }
+}
+
+fn fionbio(
+    memory: &GuestMemory,
+    state: &LoadedStaticElf,
+    guest_fd: libc::c_int,
+    host_fd: RawFd,
+    address: u64,
+) -> i64 {
+    // Linux rejects O_PATH before copying the one input int.
+    let flags = match fd_status_flags(host_fd) {
+        Ok(flags) => flags,
+        Err(error) => return error,
+    };
+    if flags & libc::O_PATH != 0 {
+        return negative_errno(libc::EBADF);
+    }
+    let value = match read_guest_struct::<libc::c_int>(memory, address) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if value == 0 && signalfd_mask(state, guest_fd).is_some() {
+        // Keep F_SETFL's virtual-signalfd policy: scheduler-owned blocking
+        // waits are unsupported. Refuse before changing any alias's flags.
+        return negative_errno(libc::ENOSYS);
+    }
+    if let Some(owner) = state.pipe_owners.get(&guest_fd) {
+        owner.set_nonblocking(host_fd, value)
+    } else {
+        set_fd_nonblocking(host_fd, value)
+    }
+}
+
+fn set_fd_nonblocking(host_fd: RawFd, value: libc::c_int) -> i64 {
+    // SAFETY: host_fd is pinned by the caller's file-table transaction, and
+    // value is readable supervisor storage for one int. Native FIONBIO changes
+    // only O_NONBLOCK atomically, preserving other shared-description flags.
+    zero_or_errno(unsafe { libc::ioctl(host_fd, libc::FIONBIO, &value) })
 }
 
 /// Size of the kernel `struct termios` returned by `TCGETS`: four 4-byte mode
@@ -18444,6 +18485,10 @@ fn close(state: &mut LoadedStaticElf, raw_fd: u64) -> i64 {
     // register. The guest table uses c_int keys, so preserve those exact bits.
     let fd = raw_fd as libc::c_int;
     if let Some(retired) = state.remove_file(fd) {
+        // A removed guest stdio slot must not revive the supervisor stream.
+        if (0..=2).contains(&fd) {
+            state.closed_standard_fds.insert(fd);
+        }
         state.cloexec_fds.remove(&fd);
         state.random_device_fds.remove(&fd);
         replace_signalfd_mask(state, fd, None);
@@ -21939,6 +21984,7 @@ mod tests {
     include!("../tests/support/executor_terminal_tests.rs");
     include!("executor/parent_death_tests.rs");
     include!("executor/pipe_owner_tests.rs");
+    include!("executor/ioctl_nonblocking_tests.rs");
     include!("executor/syncfs_tests.rs");
     include!("executor/shared_file_tests.rs");
     include!("executor/read_zero_cancel_tests.rs");
