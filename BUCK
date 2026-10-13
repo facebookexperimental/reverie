@@ -303,6 +303,7 @@ rust_library(
         "fbsource//third-party/rust:bincode",
         "fbsource//third-party/rust:libc",
         "fbsource//third-party/rust:serde",
+        "fbsource//third-party/rust:sha2",
         "fbsource//third-party/rust:thiserror",
         "fbsource//third-party/rust:tokio",
         ":reverie",
