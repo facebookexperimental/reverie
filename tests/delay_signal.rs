@@ -14,6 +14,8 @@
 //! NB: restarted syscalls should not count, as syscall
 //! returning ERESTARTSYS could be automatically restarted
 
+#![cfg(not(sanitized))]
+
 use nix::sys::signal;
 use nix::sys::signal::Signal;
 use reverie::Error;

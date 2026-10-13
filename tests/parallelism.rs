@@ -7,6 +7,9 @@
  */
 
 //! Tests for parallelism and concurrency
+
+#![cfg(not(sanitized))]
+
 use reverie::Error;
 use reverie::GlobalTool;
 use reverie::Guest;
@@ -72,7 +75,6 @@ impl Tool for TestTool {
 
 /// A test to interleave writes on memory.
 #[test]
-#[cfg(not(sanitized))]
 pub fn delay_childprint_test() {
     use std::os::fd::BorrowedFd;
 
@@ -128,7 +130,6 @@ impl Tool for TestTool2 {
     }
 }
 
-#[cfg(not(sanitized))]
 fn kill_blocked_child() {
     use std::sync::Arc;
     use std::sync::Barrier;
@@ -156,7 +157,6 @@ fn kill_blocked_child() {
 /// Test where handle_syscall_event blocks a child thread forever. The
 /// expectation is that calling `exit_group` will cancel the
 /// `handle_syscall_event` future.
-#[cfg(not(sanitized))]
 #[test]
 pub fn test_kill_blocked_child() {
     use reverie::ExitStatus;

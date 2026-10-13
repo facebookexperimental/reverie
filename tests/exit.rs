@@ -8,6 +8,8 @@
 
 //! Tests surrounding exit logic.
 
+#![cfg(not(sanitized))]
+
 use std::sync::Mutex;
 
 use reverie::Error;
@@ -76,7 +78,6 @@ impl Tool for InjectExitTool {
     }
 }
 
-#[cfg(not(sanitized))]
 #[test]
 fn smoke() {
     use reverie_ptrace::testing::test_fn;
