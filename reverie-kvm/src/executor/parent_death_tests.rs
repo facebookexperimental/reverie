@@ -134,7 +134,7 @@ fn pdeath_creator_thread_exit_publishes_process_si_user_once() {
 }
 
 fn pdeath_zero_probe(executor: &ElfExecutor, tgid: Option<i32>, tid: i32) -> i64 {
-    result_of(send_thread_signal(&executor.state, tgid, tid, 0))
+    result_of(send_thread_signal(&executor.state, tgid, tid, 0, None))
 }
 
 fn pdeath_existence_marker(executor: &ElfExecutor, boundary: reverie::SignalBoundaryReceipt)
@@ -163,7 +163,7 @@ fn pdeath_signal_zero_waits_for_publication_without_reviving_delivery() {
         reverie::SignalBoundaryOutcome::Terminated { group: false, wait_status: exit.status.into_raw() } };
     assert!(child.state.task_lifecycle.lock().unwrap().get(2).is_none());
     assert!(creator.signal_task_identity().is_none(), "existence is not live admission");
-    assert_eq!(result_of(send_thread_signal(&child.state, Some(1), 2, libc::SIGUSR1)),
+    assert_eq!(result_of(send_thread_signal(&child.state, Some(1), 2, libc::SIGUSR1, None)),
         -i64::from(libc::ESRCH), "existence never authorizes delivery");
     for request in [
         SyscallRequest::new(libc::SYS_tgkill as u64, [1, 2, 0, 0, 0, 0]),

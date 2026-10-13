@@ -55,6 +55,7 @@ use crate::signal::KernelSigaction;
 use crate::signal::KernelSigset;
 #[cfg(any(test, feature = "native-test-support"))]
 use crate::signal::ProcessSignalState;
+use crate::signal::SIGINFO_SIZE;
 use crate::signal::SS_AUTODISARM;
 #[cfg(any(test, feature = "native-test-support"))]
 use crate::signal::SharedThreadSignalState;
@@ -1311,6 +1312,11 @@ fn execute_basic_syscall_inner(
     {
         // AUTONOMOUS-BOT-IMPLEMENTED
         return kill_signal(state, number, args);
+    } else if number == libc::SYS_rt_sigqueueinfo as u64
+        || number == libc::SYS_rt_tgsigqueueinfo as u64
+    {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        return sigqueueinfo(memory, state, number, args);
     } else if number == libc::SYS_close as u64 {
         close(state, args[0])
     } else if number == libc::SYS_close_range as u64 {
@@ -5163,6 +5169,10 @@ impl ElfExecutor {
             | (libc::SI_TKILL, reverie::SignalTarget::Thread { .. })
             | (libc::SI_TIMER, reverie::SignalTarget::Process { .. }) => true,
             (libc::SI_KERNEL, reverie::SignalTarget::Process { .. }) => signal == libc::SIGALRM,
+            // A caller-supplied rt_sigqueueinfo/rt_tgsigqueueinfo record
+            // (Linux's SIL_RT layout, e.g. SI_QUEUE), which `sigqueueinfo`
+            // checked against Linux's rules when the guest queued it.
+            (code, _) if code < 0 && !matches!(code, libc::SI_TKILL | libc::SI_TIMER) => true,
             _ => false,
         };
         if signal > 31
@@ -6221,6 +6231,8 @@ impl ElfExecutor {
                     | libc::SYS_sync_file_range
                     | libc::SYS_syncfs
                     | libc::SYS_tgkill
+                    | libc::SYS_rt_sigqueueinfo
+                    | libc::SYS_rt_tgsigqueueinfo
                     | libc::SYS_time
                     | libc::SYS_timerfd_create
                     | libc::SYS_timerfd_gettime
@@ -13237,6 +13249,14 @@ fn encode_signalfd_siginfo(event: reverie::SignalEvent) -> [u8; SIGNALFD_RECORD_
         info.ssi_status = i32::from_ne_bytes(raw[24..28].try_into().expect("siginfo child status"));
         info.ssi_utime = u64::from_ne_bytes(raw[32..40].try_into().expect("siginfo child utime"));
         info.ssi_stime = u64::from_ne_bytes(raw[40..48].try_into().expect("siginfo child stime"));
+    } else if info.ssi_code < 0 && !matches!(info.ssi_code, libc::SI_TKILL | libc::SI_SIGIO) {
+        // Linux's SIL_RT layout, which sigqueue(3) and rt_sigqueueinfo use:
+        // the sender's pid and uid, then the sigval (signalfd_copyinfo).
+        info.ssi_pid = u32::from_ne_bytes(raw[16..20].try_into().expect("siginfo pid"));
+        info.ssi_uid = u32::from_ne_bytes(raw[20..24].try_into().expect("siginfo uid"));
+        let value = u64::from_ne_bytes(raw[24..32].try_into().expect("siginfo value"));
+        info.ssi_ptr = value;
+        info.ssi_int = value as i32;
     } else {
         // SI_USER, SI_TKILL, and the accepted SIGALRM/SI_KERNEL producer use
         // the kill-style pid/uid arm of siginfo_t.
@@ -21209,6 +21229,82 @@ pub(crate) enum SignalDisposition {
 /// signals use the named receiver's private queue and return boundary.
 // TODO-HUMAN-REVIEW(#95): Review self-signal termination and the default-disposition table.
 fn kill_signal(state: &mut LoadedStaticElf, number: u64, args: &[u64; 6]) -> SyscallAction {
+    send_signal(state, number, args, None)
+}
+
+/// The size of Linux's `kernel_siginfo`: the part of a caller's `siginfo_t`
+/// that `rt_sigqueueinfo` copies in. The rest of the 128-byte record is
+/// delivered as zeros.
+const KERNEL_SIGINFO_SIZE: usize = 48;
+
+// TODO-HUMAN-REVIEW(PR-1018): Review caller-supplied siginfo delivery.
+/// Emulates `rt_sigqueueinfo` and `rt_tgsigqueueinfo` on the `kill` and
+/// `tgkill` delivery path, carrying the caller's `siginfo_t` instead of the
+/// record those calls build. Linux's own checks come first, in its order
+/// (`kernel/signal.c`): the record is copied in (`EFAULT`) and its `si_signo`
+/// set to the signal argument; `rt_tgsigqueueinfo` needs positive ids
+/// (`EINVAL`); and a caller may supply a kernel or `tkill` code
+/// (`si_code >= 0` or `SI_TKILL`) only when the id it names is its own tid
+/// (`EPERM`). Every delivery `kill_signal` refuses (another process,
+/// real-time queues, `SIGCHLD`/`SIGPIPE`, stop signals) stays refused.
+fn sigqueueinfo(
+    memory: &GuestMemory,
+    state: &mut LoadedStaticElf,
+    number: u64,
+    args: &[u64; 6],
+) -> SyscallAction {
+    let thread_directed = number == libc::SYS_rt_tgsigqueueinfo as u64;
+    let (signal_argument, info_address) = if thread_directed {
+        (args[2], args[3])
+    } else {
+        (args[1], args[2])
+    };
+    let copied = match read_guest_bytes::<KERNEL_SIGINFO_SIZE>(memory, info_address) {
+        Ok(copied) => copied,
+        Err(error) => return continue_with(error),
+    };
+    let mut info = [0; SIGINFO_SIZE];
+    info[..KERNEL_SIGINFO_SIZE].copy_from_slice(&copied);
+    // The kernel stores the int signal argument over the caller's si_signo.
+    info[0..4].copy_from_slice(&(signal_argument as i32).to_ne_bytes());
+    let named = if thread_directed {
+        let (tgid, tid) = (args[0] as libc::pid_t, args[1] as libc::pid_t);
+        if tgid <= 0 || tid <= 0 {
+            return continue_with(negative_errno(libc::EINVAL));
+        }
+        tid
+    } else {
+        // kill_proc_info looks the pid up as a single process: zero and the
+        // negative group forms of kill(2) name nothing here.
+        let pid = args[0] as libc::pid_t;
+        if pid <= 0 {
+            return continue_with(negative_errno(libc::ESRCH));
+        }
+        pid
+    };
+    let code = i32::from_ne_bytes(info[8..12].try_into().expect("siginfo code"));
+    if (code >= 0 || code == libc::SI_TKILL) && named != state.tid {
+        return continue_with(negative_errno(libc::EPERM));
+    }
+    let (number, args) = if thread_directed {
+        (
+            libc::SYS_tgkill as u64,
+            [args[0], args[1], args[2], 0, 0, 0],
+        )
+    } else {
+        (libc::SYS_kill as u64, [args[0], args[1], 0, 0, 0, 0])
+    };
+    send_signal(state, number, &args, Some(info))
+}
+
+/// `kill_signal`, delivering `info` when given instead of the record `kill`
+/// or `tgkill` builds.
+fn send_signal(
+    state: &mut LoadedStaticElf,
+    number: u64,
+    args: &[u64; 6],
+    info: Option<[u8; SIGINFO_SIZE]>,
+) -> SyscallAction {
     let transaction = state.signal_transaction.clone();
     let _transaction = transaction.lock().unwrap_or_else(|p| p.into_inner());
     let is_kill = number == libc::SYS_kill as u64;
@@ -21238,7 +21334,7 @@ fn kill_signal(state: &mut LoadedStaticElf, number: u64, args: &[u64; 6]) -> Sys
     }
 
     if !is_kill {
-        return send_thread_signal(state, tgid, target, signal);
+        return send_thread_signal(state, tgid, target, signal, info);
     }
 
     let targets_self = {
@@ -21376,10 +21472,16 @@ fn kill_signal(state: &mut LoadedStaticElf, number: u64, args: &[u64; 6]) -> Sys
     // immediately applies its disposition in the plain loop, while the Tool
     // loop first gets exactly one structured hook invocation (as ptrace does
     // at a signal-delivery stop). A blocked event simply remains pending.
-    let event = if is_kill {
-        event_for_process(signal, state.pid)
-    } else {
-        event_for_thread(signal, state.pid, state.tid)
+    let event = match (info, is_kill) {
+        (Some(info), true) => reverie::SignalEvent::new(
+            signal,
+            info,
+            reverie::SignalTarget::Process {
+                pid: reverie::Pid::from_raw(state.pid),
+            },
+        ),
+        (None, true) => event_for_process(signal, state.pid),
+        (_, false) => event_for_thread(signal, state.pid, state.tid),
     };
     let event = match event {
         Ok(event) => event,
@@ -21399,6 +21501,7 @@ fn send_thread_signal(
     tgid: Option<libc::pid_t>,
     target: libc::pid_t,
     signal: libc::c_int,
+    info: Option<[u8; SIGINFO_SIZE]>,
 ) -> SyscallAction {
     if target <= 0 || tgid.is_some_and(|tgid| tgid <= 0) {
         return continue_with(negative_errno(libc::EINVAL));
@@ -21464,7 +21567,18 @@ fn send_thread_signal(
         {
             return continue_with(0);
         }
-        let event = match event_for_thread(signal, state.pid, target) {
+        let event = match info {
+            Some(info) => reverie::SignalEvent::new(
+                signal,
+                info,
+                reverie::SignalTarget::Thread {
+                    pid: reverie::Pid::from_raw(state.pid),
+                    tid: reverie::Pid::from_raw(target),
+                },
+            ),
+            None => event_for_thread(signal, state.pid, target),
+        };
+        let event = match event {
             Ok(event) => event,
             Err(errno) => return continue_with(negative_errno(errno.into_raw())),
         };
@@ -50872,6 +50986,133 @@ mod tests {
         );
     }
 
+    /// rt_sigqueueinfo and rt_tgsigqueueinfo queue the caller's siginfo
+    /// (https://man7.org/linux/man-pages/man2/rt_sigqueueinfo.2.html): a
+    /// blocked SIGUSR1 reads back from a signalfd with the caller's SI_QUEUE
+    /// code and value, and si_signo is the signal argument. Linux's argument
+    /// checks come first and in its order.
+    #[test]
+    fn sigqueueinfo_queues_the_callers_siginfo() {
+        const MASK: u64 = 0x100;
+        const SENT: u64 = 0x200;
+        const INFO: u64 = 0x300;
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let (pid, tid) = (state.pid, state.tid);
+        test_block_signal(&mut state, libc::SIGUSR1);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let mut mask = KernelSigset::default();
+        mask.insert(libc::SIGUSR1);
+        memory.write(MASK, &mask.to_bytes()).unwrap();
+        let signal_fd = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_signalfd4,
+            [
+                u64::MAX,
+                MASK,
+                KERNEL_SIGSET_SIZE as u64,
+                (libc::SFD_CLOEXEC | libc::SFD_NONBLOCK) as u64,
+                0,
+                0,
+            ],
+        );
+        assert_eq!(signal_fd, 3);
+        let write_info = |memory: &mut GuestMemory, signo: i32, code: i32, value: i32| {
+            let mut info = [0_u8; SIGINFO_SIZE];
+            info[0..4].copy_from_slice(&signo.to_ne_bytes());
+            info[8..12].copy_from_slice(&code.to_ne_bytes());
+            info[16..20].copy_from_slice(&pid.to_ne_bytes());
+            info[24..28].copy_from_slice(&value.to_ne_bytes());
+            memory.write(SENT, &info).unwrap();
+        };
+        let read_info = |memory: &mut GuestMemory, state: &mut LoadedStaticElf| {
+            assert_eq!(
+                syscall_result(
+                    memory,
+                    state,
+                    libc::SYS_read,
+                    [signal_fd as u64, INFO, 128, 0, 0, 0],
+                ),
+                128,
+            );
+            read_struct::<libc::signalfd_siginfo>(memory, INFO)
+        };
+        let sigusr1 = libc::SIGUSR1 as u64;
+
+        // The thread form; si_signo is overwritten with the argument.
+        write_info(&mut memory, 0, libc::SI_QUEUE, 42);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_rt_tgsigqueueinfo,
+                [pid as u64, tid as u64, sigusr1, SENT, 0, 0],
+            ),
+            0,
+        );
+        let info = read_info(&mut memory, &mut state);
+        assert_eq!(info.ssi_signo, libc::SIGUSR1 as u32);
+        assert_eq!(info.ssi_code, libc::SI_QUEUE);
+        assert_eq!(info.ssi_pid, pid as u32);
+        assert_eq!(info.ssi_int, 42);
+
+        // The process form.
+        write_info(&mut memory, libc::SIGUSR1, libc::SI_QUEUE, 7);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_rt_sigqueueinfo,
+                [pid as u64, sigusr1, SENT, 0, 0, 0],
+            ),
+            0,
+        );
+        let info = read_info(&mut memory, &mut state);
+        assert_eq!((info.ssi_code, info.ssi_int), (libc::SI_QUEUE, 7));
+
+        // A kernel code (SI_USER is 0) only toward the caller's own tid.
+        write_info(&mut memory, libc::SIGUSR1, libc::SI_USER, 0);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_rt_tgsigqueueinfo,
+                [pid as u64, (tid + 1000) as u64, sigusr1, SENT, 0, 0],
+            ),
+            -i64::from(libc::EPERM),
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_rt_tgsigqueueinfo,
+                [0, tid as u64, sigusr1, SENT, 0, 0],
+            ),
+            -i64::from(libc::EINVAL),
+        );
+        write_info(&mut memory, libc::SIGUSR1, libc::SI_QUEUE, 0);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_rt_sigqueueinfo,
+                [0, sigusr1, SENT, 0, 0, 0],
+            ),
+            -i64::from(libc::ESRCH),
+        );
+        // The record is copied in before anything else is checked.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_rt_tgsigqueueinfo,
+                [0, 0, sigusr1, PAGE_SIZE - 8, 0, 0],
+            ),
+            -i64::from(libc::EFAULT),
+        );
+    }
+
     #[test]
     fn consuming_signal_refreshes_distinct_and_duplicated_signalfd_readiness() {
         const MASK: u64 = 0x100;
@@ -62960,13 +63201,16 @@ mod tests {
     }
 
     #[test]
-    fn deferred_signal_accepts_timer_provenance_but_rejects_faults_and_queues() {
+    fn deferred_signal_accepts_timer_and_queue_provenance_but_rejects_faults() {
         let dir = TestDir::new();
         for (signal, code) in [
             (libc::SIGALRM, libc::SI_KERNEL),
             (libc::SIGUSR1, libc::SI_TIMER),
             (libc::SIGUSR1, libc::SI_USER),
             (libc::SIGUSR1, libc::SI_TKILL),
+            // A guest's own rt_sigqueueinfo record, handed back by a Tool.
+            (libc::SIGUSR1, libc::SI_QUEUE),
+            (libc::SIGUSR1, libc::SI_MESGQ),
         ] {
             let mut executor = ElfExecutor::new(test_state(&dir.0), false);
             let pid = executor.state.pid;
@@ -62996,8 +63240,6 @@ mod tests {
             (libc::SIGSTOP, libc::SI_USER),
             (libc::SIGUSR1, libc::SI_KERNEL),
             (libc::SIGSEGV, 1), // SEGV_MAPERR is a positive synchronous code.
-            (libc::SIGUSR1, libc::SI_QUEUE),
-            (libc::SIGUSR1, libc::SI_MESGQ),
         ] {
             let mut executor = ElfExecutor::new(test_state(&dir.0), false);
             let pid = executor.state.pid;

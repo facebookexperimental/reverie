@@ -617,6 +617,12 @@ fn injection_can_be_nonreturning(request: &SyscallRequest) -> bool {
             request.args()[1] == libc::SIGKILL as u64
         }
         number if number == libc::SYS_tgkill as u64 => request.args()[2] == libc::SIGKILL as u64,
+        number if number == libc::SYS_rt_sigqueueinfo as u64 => {
+            request.args()[1] == libc::SIGKILL as u64
+        }
+        number if number == libc::SYS_rt_tgsigqueueinfo as u64 => {
+            request.args()[2] == libc::SIGKILL as u64
+        }
         _ => false,
     }
 }
@@ -646,6 +652,8 @@ fn signal_request_requires_return_frame(request: &SyscallRequest) -> bool {
             request.args()[1]
         }
         number if number == libc::SYS_tgkill as u64 => request.args()[2],
+        number if number == libc::SYS_rt_sigqueueinfo as u64 => request.args()[1],
+        number if number == libc::SYS_rt_tgsigqueueinfo as u64 => request.args()[2],
         _ => 0,
     };
     // Signal zero is an existence/permission probe and cannot create pending
