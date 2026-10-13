@@ -55,8 +55,9 @@ static inline int32_t host_identity_for_guest_entries(
   if (identity <= 0)
     return identity;
 
-  /* A guest virtual ID wins even when an earlier entry has the same numeric
-   * host ID. */
+  /* A guest virtual ID wins even when an entry has the same numeric host ID:
+   * the guest is never shown a known host ID (see
+   * `guest_view_of_host_entries`), so a number it names is virtual first. */
   for (i = 0; i < count; ++i) {
     if (identities[i].virtual_id == identity)
       return identities[i].host;
@@ -91,9 +92,16 @@ static inline int32_t host_identity_for_virtual_entries(
 }
 
 /* How the client's `virtualize_host_identity` shows host ID `host` to the
- * guest, as getpgrp, getpgid and getsid report it: a host ID that is
- * numerically one of the guest's virtual IDs is shown unchanged, any other
- * known host ID as its virtual ID, and an unknown one unchanged. */
+ * guest, as wait4, waitid, getpgrp, getpgid and getsid report it: a known host
+ * ID as its virtual ID, always, and an unknown one unchanged unless that
+ * number is also one of the guest's virtual IDs, in which case it is shown as
+ * 0, the way Linux shows an ID from outside the caller's PID namespace.
+ *
+ * The two number spaces overlap whenever the run has its own PID namespace:
+ * there, host IDs are small too. So no host ID may be recognised by its value
+ * alone, and no host ID may be shown under a number that names another guest
+ * task. Applying this to a value that is already virtual is therefore wrong,
+ * and callers translate each host result exactly once. */
 static inline int32_t guest_view_of_host_entries(
     const virtual_identity_t* identities,
     size_t count,
@@ -103,12 +111,12 @@ static inline int32_t guest_view_of_host_entries(
   if (host <= 0)
     return host;
   for (i = 0; i < count; ++i) {
-    if (identities[i].virtual_id == host)
-      return host;
-  }
-  for (i = 0; i < count; ++i) {
     if (identities[i].host == host)
       return identities[i].virtual_id;
+  }
+  for (i = 0; i < count; ++i) {
+    if (identities[i].virtual_id == host)
+      return 0;
   }
   return host;
 }
@@ -151,9 +159,9 @@ typedef struct {
  * a group whose leader has exited while members remain. So a group is either
  * the caller's own group, numbered as getpgrp shows it (this includes a group
  * led from outside the guest, such as the launcher's, which the guest sees
- * under its raw host ID, even where that number collides with a virtual ID),
- * or a virtual ID, translated like a task's; the kernel then decides as it
- * does natively. Anything else becomes `FCNTL_OWNER_IMPOSSIBLE_PID`, so the
+ * under its raw host ID unless that number is also a virtual ID, when it sees
+ * 0 and cannot name it, as across a PID namespace), or a virtual ID,
+ * translated like a task's; the kernel then decides as it does natively. Anything else becomes `FCNTL_OWNER_IMPOSSIBLE_PID`, so the
  * kernel reports ESRCH whatever host tasks and groups exist. */
 static inline bool translate_fcntl_owner_entries(
     const virtual_identity_t* identities,
@@ -182,32 +190,22 @@ static inline bool translate_fcntl_owner_entries(
 
 /* The guest's number for host owner `host` of kind `type`, the inverse of
  * `translate_fcntl_owner_entries` so that an owner read back and set again
- * names the same task or group: the caller's own group as getpgrp shows it,
- * any other known task or group by its virtual ID (one-to-one, unlike the
- * getpgrp view, which keeps a host ID that collides with a virtual ID), and
- * an unknown owner unchanged.
+ * names the same task or group. That is the getpgrp view whatever the kind:
+ * it shows every known task or group by its virtual ID, one-to-one, so the
+ * caller's own group reads back under the number that sets it.
  *
- * One case has no inverse: when getpgrp shows the caller's own group under a
- * number that is also another task's virtual ID, the guest sees one number
- * for two groups, and that number names the caller's group. */
+ * An owner the guest has no number for, one from outside the guest whose host
+ * ID is also a virtual ID, reads back as 0, as Linux's F_GETOWN reports an
+ * owner outside the caller's PID namespace; setting 0 clears the owner. */
 static inline int32_t guest_owner_for_host_entries(
     const virtual_identity_t* identities,
     size_t count,
     const fcntl_group_view_t* groups,
     int32_t type,
     int32_t host) {
-  size_t i;
-
-  if (host <= 0)
-    return host;
-  if (type == FCNTL_OWNER_PGRP && groups->caller_group > 0 &&
-      host == groups->caller_group)
-    return guest_view_of_host_entries(identities, count, host);
-  for (i = 0; i < count; ++i) {
-    if (identities[i].host == host)
-      return identities[i].virtual_id;
-  }
-  return host;
+  (void)groups;
+  (void)type;
+  return guest_view_of_host_entries(identities, count, host);
 }
 
 /* `F_SETOWN`'s encoding of a host owner, as the guest sees it. */

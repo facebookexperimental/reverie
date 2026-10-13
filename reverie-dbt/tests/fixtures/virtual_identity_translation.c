@@ -271,26 +271,29 @@ int main(void) {
     return 14;
 
   /* Collision: the launcher's group is host 3, numerically also the guest's
-   * virtual ID 3 (host 1004). getpgrp shows the caller's group raw as 3, so -3
-   * must reach host group 3, not host 1004; the process 3 is still task 3. */
+   * virtual ID 3 (host 1004). getpgrp shows the caller's group as 0, as Linux
+   * shows a group from outside the caller's PID namespace, because 3 names
+   * task 3: -3 reaches task 3's group, host 1004, and never host group 3. */
   fcntl_group_view_t collision = {3};
-  if (expect_setown(owners, owner_count, &collision, -3, -3, true) != 0 ||
+  if (guest_view_of_host_entries(owners, owner_count, 3) != 0 ||
+      expect_setown(owners, owner_count, &collision, -3, -1004, true) != 0 ||
       expect_owner_ex(
-          owners, owner_count, &collision, FCNTL_OWNER_PGRP, 3, 3, true) != 0 ||
+          owners, owner_count, &collision, FCNTL_OWNER_PGRP, 3, 1004, true) !=
+          0 ||
       expect_setown(owners, owner_count, &collision, 3, 1004, true) != 0)
     return 15;
 
   /* A guest-led group whose host ID collides with a virtual ID. In the first
-   * table host 4 (virtual task 3) leads a group, but 4 is also virtual task
-   * 4's ID, so getpgrp shows that group as 4: the caller in it names it -4
-   * and reaches host group 4, not task 4's host 100. Task 3's own number
-   * still names task 3's host ID. */
-  fcntl_group_view_t shown_raw = {4};
-  if (guest_view_of_host_entries(identities, count, 4) != 4 ||
+   * table host 4 (virtual task 3) leads a group, and 4 is also virtual task
+   * 4's ID. A known host ID is always shown as its virtual ID, so getpgrp
+   * shows that group as 3: the caller in it names it -3 and reaches host
+   * group 4, while -4 names task 4's host 100. */
+  fcntl_group_view_t guest_led = {4};
+  if (guest_view_of_host_entries(identities, count, 4) != 3 ||
       guest_view_of_host_entries(identities, count, 100) != 4 ||
       guest_view_of_host_entries(identities, count, 500) != 500 ||
-      expect_setown(identities, count, &shown_raw, -4, -4, true) != 0 ||
-      expect_setown(identities, count, &shown_raw, -3, -4, true) != 0)
+      expect_setown(identities, count, &guest_led, -3, -4, true) != 0 ||
+      expect_setown(identities, count, &guest_led, -4, -100, true) != 0)
     return 16;
 
   /* Read-back inverts the setter. Host and virtual IDs overlap here: virtual
@@ -315,29 +318,47 @@ int main(void) {
     return 17;
 
   /* The other tables round-trip too: the caller's own group, other tasks and
-   * groups, a group led from outside the guest, the launcher's group shown
-   * raw on a collision with virtual ID 3, and no owner at all. */
+   * groups, a group led from outside the guest, task 3 and its group while
+   * the launcher's group collides with virtual ID 3, and no owner at all. */
   if (expect_round_trip(owners, owner_count, &own, -1004) != 0 ||
       expect_round_trip(owners, owner_count, &own, -1100) != 0 ||
       expect_round_trip(owners, owner_count, &own, 1100) != 0 ||
       expect_round_trip(owners, owner_count, &inherited, -500) != 0 ||
       expect_round_trip(owners, owner_count, &inherited, -1004) != 0 ||
-      expect_round_trip(owners, owner_count, &collision, -3) != 0 ||
+      expect_round_trip(owners, owner_count, &collision, -1004) != 0 ||
       expect_round_trip(owners, owner_count, &collision, 1004) != 0 ||
-      expect_readback(owners, owner_count, &collision, -3, -3) != 0 ||
       expect_readback(owners, owner_count, &own, 0, 0) != 0)
     return 18;
 
-  /* The documented residual: getpgrp shows the caller's group under a number
-   * that is also another task's virtual ID, so that task's group has no
-   * number of its own in the guest's view and its read-back names the
-   * caller's group. Here the caller's group (host 4) shows as 4, task 4's ID
-   * (host 100); and on the launcher collision the caller's group (host 3)
-   * shows as 3, task 3's ID (host 1004). */
-  if (expect_readback(identities, count, &shown_raw, -100, -4) != 0 ||
-      expect_round_trip(identities, count, &shown_raw, -4) != 0 ||
-      expect_readback(owners, owner_count, &collision, -1004, -3) != 0)
+  /* Every group the guest has a number for has its own number: task 4's group
+   * (host 100) reads back as -4 and the caller's group (host 4) as -3, and
+   * both survive being set again. The one owner without a number is the
+   * launcher's group on a collision, which reads back as 0, as Linux's
+   * F_GETOWN reports an owner outside the caller's PID namespace. */
+  if (expect_readback(identities, count, &guest_led, -100, -4) != 0 ||
+      expect_readback(identities, count, &guest_led, -4, -3) != 0 ||
+      expect_round_trip(identities, count, &guest_led, -100) != 0 ||
+      expect_round_trip(identities, count, &guest_led, -4) != 0 ||
+      expect_readback(owners, owner_count, &collision, -1004, -3) != 0 ||
+      expect_readback(owners, owner_count, &collision, -3, 0) != 0)
     return 19;
+
+  /* The run's own PID namespace: host and virtual IDs are both small and
+   * overlap. Here virtual task 5 is host 11 and virtual task 11 is host 20,
+   * the shape that made wait4 report host 11 as if it were task 11. A known
+   * host ID is always its virtual ID; an unknown host ID that is also a
+   * virtual ID is 0, never that other task; any other unknown one stays. */
+  const virtual_identity_t namespace_ids[] = {
+      {.host = 11, .virtual_id = 5},
+      {.host = 20, .virtual_id = 11},
+  };
+  if (guest_view_of_host_entries(namespace_ids, 2, 11) != 5 ||
+      guest_view_of_host_entries(namespace_ids, 2, 20) != 11 ||
+      guest_view_of_host_entries(namespace_ids, 2, 5) != 0 ||
+      guest_view_of_host_entries(namespace_ids, 2, 7) != 7 ||
+      expect_translation(namespace_ids, 2, 5, 11) != 0 ||
+      expect_translation(namespace_ids, 2, 11, 20) != 0)
+    return 20;
 
   return 0;
 }

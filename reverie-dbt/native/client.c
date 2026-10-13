@@ -1547,23 +1547,6 @@ static void remember_virtual_identity(int32_t host, int32_t virtual_id) {
   virtual_identity_unlock();
 }
 
-static int32_t virtual_identity_for_host(int32_t host) {
-  int32_t result = host;
-  size_t i;
-  if (host <= 0)
-    return host;
-
-  virtual_identity_lock();
-  for (i = 0; i < virtual_identity_state->count; ++i) {
-    if (virtual_identity_state->identities[i].host == host) {
-      result = virtual_identity_state->identities[i].virtual_id;
-      break;
-    }
-  }
-  virtual_identity_unlock();
-  return result;
-}
-
 static bool lookup_virtual_identity(int32_t host, int32_t* virtual_id) {
   size_t i;
   bool found = false;
@@ -1596,26 +1579,22 @@ static int32_t host_identity_for_guest(int32_t identity) {
   return result;
 }
 
-static bool is_known_virtual_identity(int32_t value) {
-  size_t i;
-  bool found = false;
+/* The guest's view of host ID `value` (see `guest_view_of_host_entries`).
+ * Call it once per host result: a virtual ID is not a host ID, and since the
+ * two number spaces overlap in the run's own PID namespace, translating a
+ * virtual ID again can turn it into another task's. */
+static int32_t virtualize_host_identity(int32_t value) {
+  int32_t result;
   if (value <= 0)
-    return false;
+    return value;
 
   virtual_identity_lock();
-  for (i = 0; i < virtual_identity_state->count; ++i) {
-    if (virtual_identity_state->identities[i].virtual_id == value) {
-      found = true;
-      break;
-    }
-  }
+  result = guest_view_of_host_entries(
+      virtual_identity_state->identities,
+      virtual_identity_state->count,
+      value);
   virtual_identity_unlock();
-  return found;
-}
-
-static int32_t virtualize_host_identity(int32_t value) {
-  return is_known_virtual_identity(value) ? value
-                                          : virtual_identity_for_host(value);
+  return result;
 }
 
 typedef struct {
@@ -2680,11 +2659,10 @@ unknown_identity_error(uintptr_t context, int sysnum, const uint64_t* args) {
   return sysnum == SYS_wait4 || sysnum == SYS_waitid ? -ECHILD : -ESRCH;
 }
 
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-106): map host PID/TID results back to virtual IDs.
-// RESIDUAL: getpgid/getsid results absent from the identity table (an untracked
-// host group/session leader) fall through to the raw host value and leak it.
-static int64_t virtualize_identity_result(
+/* The calling task's own identities, which the runtime keeps in virtual form.
+ * Unlike the host-result mapping below, this is safe to apply to a result
+ * that is already in the guest's view. */
+static int64_t own_identity_result(
     prototype_counters_t* counters,
     int sysnum,
     int64_t result) {
@@ -2697,6 +2675,28 @@ static int64_t virtualize_identity_result(
       return counters->virtual_ppid;
     case SYS_gettid:
       return counters->virtual_tid;
+    default:
+      return result;
+  }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-106): map host PID/TID results back to virtual IDs.
+// RESIDUAL: getpgid/getsid results absent from the identity table (an untracked
+// host group/session leader) fall through to the raw host value and leak it,
+// unless that value is also a virtual ID, which is shown as 0.
+/* `result` must be the kernel's host result: see `virtualize_host_identity`. */
+static int64_t virtualize_identity_result(
+    prototype_counters_t* counters,
+    int sysnum,
+    int64_t result) {
+  if (result <= 0)
+    return result;
+  switch (sysnum) {
+    case SYS_getpid:
+    case SYS_getppid:
+    case SYS_gettid:
+      return own_identity_result(counters, sysnum, result);
     case SYS_fork:
     case SYS_vfork:
     case SYS_clone:
@@ -4443,14 +4443,13 @@ static void post_syscall(void* drcontext, int sysnum) {
     }
   }
 
-  syscall_result = virtualize_identity_result(counters, sysnum, syscall_result);
+  /* Translate the host result once. A clone result replaced by its virtual
+   * child above is already in the guest's view. */
+  if (completed_virtual_child == 0)
+    syscall_result =
+        virtualize_identity_result(counters, sysnum, syscall_result);
   if (syscall_result != host_syscall_result)
     dr_syscall_set_result(drcontext, (reg_t)syscall_result);
-
-  if (sysnum == SYS_wait4 && syscall_result > 0) {
-    syscall_result = virtualize_host_identity((int32_t)syscall_result);
-    dr_syscall_set_result(drcontext, (reg_t)syscall_result);
-  }
 
   if (sysnum == SYS_waitid) {
     siginfo_t info;
@@ -5282,7 +5281,10 @@ static bool pre_syscall(void* drcontext, int sysnum) {
     // short-I/O semantics.
     // Detcore owns blocking retries and logs the completed I/O result. Preserve
     // that result, including EAGAIN and short transfers, without native retries.
-    result = virtualize_identity_result(counters, sysnum, result);
+    // Detcore reached the kernel through `invoke_syscall`, which already put
+    // host identities in the guest's view, so only the caller's own
+    // identities are restated here.
+    result = own_identity_result(counters, sysnum, result);
     dr_syscall_set_result(drcontext, (reg_t)result);
     return false;
   }
