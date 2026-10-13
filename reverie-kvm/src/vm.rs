@@ -4507,24 +4507,28 @@ impl KvmBackend {
         syscall_frame_address: u64,
         interrupted: kvm_bindings::kvm_regs,
     ) -> Result<bool> {
-        loop {
+        let delivered = loop {
             let Some(pending) = executor
                 .take_pending_signal_for_delivery()
                 .map_err(|errno| Error::Reverie(errno.into()))?
             else {
-                return Ok(false);
+                break false;
             };
 
             if executor.signal_disposition(pending.event.signal()) == SignalDisposition::Ignore {
                 continue;
             }
-            return self.deliver_selected_signal_from_registers(
+            break self.deliver_selected_signal_from_registers(
                 executor,
                 syscall_frame_address,
                 interrupted,
                 pending,
-            );
+            )?;
+        };
+        if !delivered {
+            executor.restore_saved_signal_mask();
         }
+        Ok(delivered)
     }
 
     pub(crate) fn deliver_selected_signal_from_registers(
@@ -4639,8 +4643,9 @@ impl KvmBackend {
         } else {
             XsaveImage::from_kvm(&self.vcpu.get_xsave()?)
         };
-        let mut mcontext =
-            Sigcontext::from_kvm(interrupted, layout.xsave_address, executor.signal_mask());
+        // A temporary-mask call's saved mask, else the current one.
+        let saved_mask = executor.frame_signal_mask();
+        let mut mcontext = Sigcontext::from_kvm(interrupted, layout.xsave_address, saved_mask);
         if let Some(fault) = fault {
             mcontext.cs = fault.code_segment;
             mcontext.ss = fault.stack_segment;
@@ -4655,7 +4660,7 @@ impl KvmBackend {
                 link: 0,
                 stack: altstack,
                 mcontext,
-                sigmask: executor.signal_mask(),
+                sigmask: saved_mask,
             },
             siginfo: pending.event.siginfo(),
         };

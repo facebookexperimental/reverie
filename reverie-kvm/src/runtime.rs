@@ -6292,6 +6292,11 @@ impl KvmBackend {
                             pending,
                         )?;
                     }
+                    if !delivered {
+                        // No handler frame saved a temporary-mask call's
+                        // mask, so put it back (`restore_saved_sigmask`).
+                        executor.restore_saved_signal_mask();
+                    }
                     pending_exit = pending_exit.or_else(|| executor.take_exit());
                     signal_boundary_outcome = if let Some(exit) = pending_exit {
                         exit.signal_boundary_outcome()

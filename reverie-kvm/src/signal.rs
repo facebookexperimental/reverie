@@ -524,6 +524,12 @@ pub(crate) struct ThreadSignalState {
     /// just as a ptrace signal-delivery stop does. Plain execution discards an
     /// unblocked ignored signal when it is generated.
     pub(crate) observe_ignored: bool,
+    /// Linux's `saved_sigmask` with `TIF_RESTORE_SIGMASK`: the thread's own
+    /// mask while a call that installed a temporary one (`rt_sigsuspend`, a
+    /// masked `pselect6`) returns to deliver a signal under it. The signal
+    /// frame saves this mask, so `rt_sigreturn` restores it; a boundary that
+    /// delivers no handler restores it directly.
+    pub(crate) saved_sigmask: Option<KernelSigset>,
     /// Admission identity, never reconstructed from a possibly reused numeric TID.
     pub(crate) dequeue_identity: Option<reverie::SignalTaskIdentity>,
     pub(crate) dequeue_wake: SignalDequeueWake,
@@ -536,6 +542,7 @@ impl ThreadSignalState {
             altstack: self.altstack,
             pending: StandardPendingSignals::default(),
             observe_ignored: self.observe_ignored,
+            saved_sigmask: None,
             dequeue_identity: None,
             dequeue_wake: SignalDequeueWake::default(),
         }
@@ -547,6 +554,7 @@ impl ThreadSignalState {
             altstack: None,
             pending: StandardPendingSignals::default(),
             observe_ignored: self.observe_ignored,
+            saved_sigmask: None,
             dequeue_identity: None,
             dequeue_wake: SignalDequeueWake::default(),
         }
@@ -558,6 +566,7 @@ impl ThreadSignalState {
             altstack: None,
             pending: self.pending.clone(),
             observe_ignored: self.observe_ignored,
+            saved_sigmask: None,
             dequeue_identity: self.dequeue_identity,
             dequeue_wake: self.dequeue_wake.clone(),
         }
