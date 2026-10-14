@@ -330,8 +330,10 @@ struct State {
     copies: usize,
     retained_operands: usize,
     failure: Option<Arc<PendingFailure>>,
-    sender: Option<oneshot::Sender<()>>,
-    changed: Change,
+    /// The change future. Its fields are private to [`change`], so every
+    /// subscriber must go through [`change::ChangeFuture::subscribe`], which
+    /// marks the future taken; a direct clone cannot compile.
+    change: change::ChangeFuture,
     // Completed once, by the first change notification after a failure is
     // recorded (`EntryGate::subscribe_failure`). A failure is never cleared.
     failed_sender: Option<oneshot::Sender<()>>,
@@ -342,9 +344,6 @@ struct State {
     /// always makes a FUTEX_WAKE syscall, and nearly every change (a copy's
     /// retirement, an entry's acknowledgement) happens with nobody waiting.
     blocked_copiers: usize,
-    /// Whether anyone took the current `changed` future since it was armed.
-    /// Only then does a change allocate the next one and complete this one.
-    change_subscribed: bool,
     owner_notifications: Vec<owner::OwnerNotification>,
     retired_origins: Vec<EntryOrigin>,
     /// Set, under this lock, right after `failure` is first recorded; shared
@@ -355,6 +354,56 @@ struct State {
     copy_waits: usize,
     #[cfg(test)]
     copy_waiters: Vec<std::thread::ThreadId>,
+}
+
+/// The gate's change future, with its fields private to this module.
+mod change {
+    use futures::FutureExt;
+    use futures::channel::oneshot;
+
+    use super::Change;
+
+    pub(super) struct ChangeFuture {
+        sender: Option<oneshot::Sender<()>>,
+        changed: Change,
+        /// Whether anyone took `changed` since it was armed. Only then does a
+        /// change allocate the next future and complete this one.
+        taken: bool,
+    }
+
+    impl ChangeFuture {
+        pub(super) fn new() -> Self {
+            let (sender, receiver) = oneshot::channel();
+            Self {
+                sender: Some(sender),
+                changed: receiver.shared(),
+                taken: false,
+            }
+        }
+
+        /// The current future, marked taken so the next change completes it.
+        /// The caller holds the gate lock and has just checked the state.
+        pub(super) fn subscribe(&mut self) -> Change {
+            self.taken = true;
+            self.changed.clone()
+        }
+
+        /// For a change: if the current future was taken, arm a new one and
+        /// return the old sender for `notify` to complete; otherwise nothing.
+        pub(super) fn rearm_if_taken(&mut self) -> Option<oneshot::Sender<()>> {
+            if !std::mem::take(&mut self.taken) {
+                return None;
+            }
+            let (sender, receiver) = oneshot::channel();
+            self.changed = receiver.shared();
+            self.sender.replace(sender)
+        }
+
+        #[cfg(test)]
+        pub(super) fn taken(&self) -> bool {
+            self.taken
+        }
+    }
 }
 
 struct ChangeSignal {
@@ -423,17 +472,10 @@ impl State {
     ///
     /// Both wake paths are skipped when nobody can be waiting, which is the
     /// common case. No wakeup is lost: a parked copy registers in
-    /// `blocked_copiers`, and a subscriber sets `change_subscribed`, under
+    /// `blocked_copiers`, and a subscriber marks the change future taken, under
     /// this same lock before it waits, so every later change sees it.
     fn changed(&mut self) -> ChangeSignal {
-        let sender = if self.change_subscribed {
-            self.change_subscribed = false;
-            let (sender, receiver) = oneshot::channel();
-            self.changed = receiver.shared();
-            self.sender.replace(sender)
-        } else {
-            None
-        };
+        let sender = self.change.rearm_if_taken();
         ChangeSignal {
             sender,
             failed: if self.failure.is_some() {
@@ -450,8 +492,7 @@ impl State {
     /// The current change future, marked as taken so the next change
     /// completes it. Every subscriber goes through here, under the lock.
     fn subscribe(&mut self) -> Change {
-        self.change_subscribed = true;
-        self.changed.clone()
+        self.change.subscribe()
     }
 
     fn stopped(&self) -> bool {
@@ -560,7 +601,6 @@ impl EntryGate {
     }
 
     pub(crate) fn new() -> Arc<Self> {
-        let (sender, receiver) = oneshot::channel();
         let (failed_sender, failed) = oneshot::channel();
         let failure_recorded = Arc::new(std::sync::atomic::AtomicBool::new(false));
         Arc::new(Self {
@@ -577,13 +617,11 @@ impl EntryGate {
                 copies: 0,
                 retained_operands: 0,
                 failure: None,
-                sender: Some(sender),
-                changed: receiver.shared(),
+                change: change::ChangeFuture::new(),
                 failed_sender: Some(failed_sender),
                 failed: failed.shared(),
                 copy_changed: Arc::new(Condvar::new()),
                 blocked_copiers: 0,
-                change_subscribed: false,
                 owner_notifications: Vec::new(),
                 retired_origins: Vec::new(),
                 failure_recorded: failure_recorded.clone(),
@@ -2351,13 +2389,13 @@ mod tests {
         notify(signal);
         // A subscription arms exactly the next change.
         let changed = gate.subscribe();
-        assert!(gate.state.lock().unwrap().change_subscribed);
+        assert!(gate.state.lock().unwrap().change.taken());
         let signal = gate.state.lock().unwrap().changed();
         assert!(signal.sender.is_some());
         assert!(signal.copies.is_none());
         notify(signal);
         assert!(changed.now_or_never().is_some());
-        assert!(!gate.state.lock().unwrap().change_subscribed);
+        assert!(!gate.state.lock().unwrap().change.taken());
         let signal = gate.state.lock().unwrap().changed();
         assert!(signal.sender.is_none());
         notify(signal);
