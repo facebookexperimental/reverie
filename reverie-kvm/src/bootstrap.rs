@@ -838,9 +838,9 @@ pub(crate) fn install_user_windows(memory: &mut GuestMemory) -> Result<()> {
 //
 // Deterministic kernel version advertised by the vDSO note. Encoded as
 // `(major << 16) | (minor << 8) | patch`, this is `LINUX_VERSION_CODE` for the
-// "6.0.0" release the KVM backend reports through `uname(2)`, `/proc/version`,
-// and `/proc/sys/kernel/osrelease` (see reverie-kvm/src/executor.rs). Keeping
-// the value fixed preserves determinism regardless of the real host kernel.
+// "6.0.0" release the KVM backend reports through `uname(2)` (see
+// reverie-kvm/src/executor.rs). Keeping the value fixed preserves determinism
+// regardless of the real host kernel.
 const GUEST_LINUX_VERSION_MAJOR: u32 = 6;
 const GUEST_LINUX_VERSION_MINOR: u32 = 0;
 const GUEST_LINUX_VERSION_PATCH: u32 = 0;

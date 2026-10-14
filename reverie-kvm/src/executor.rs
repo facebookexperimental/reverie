@@ -17586,23 +17586,26 @@ fn canonical_fd_path(fd: RawFd) -> Result<std::path::PathBuf, i64> {
 const SYNTHETIC_DEV_MAJOR: u32 = 0;
 const SYNTHETIC_PROC_DEV_MINOR: u32 = 0xff01;
 const SYNTHETIC_GUEST_FD_DEV_MINOR: u32 = 0xff02;
+// Provenance of removed renderings: /proc/version, /proc/filesystems,
+// /proc/meminfo, /proc/vmstat and /proc/sys/kernel/osrelease are rendered by
+// Detcore on every backend (https://github.com/rrnewton/hermit/issues/4213).
+// The KVM copies removed here were marked AUTONOMOUS-BOT-IMPLEMENTED and
+// carried TODO-HUMAN-REVIEW(PR-231) (meminfo parity with Hermit's memory
+// persona) and TODO-HUMAN-REVIEW(PR-224) (the vmstat and osrelease surfaces
+// and their regression test); those reviews now apply to Detcore's
+// renderings.
 const SYNTHETIC_REGULAR_PROC_PATHS: &[&[u8]] = &[
     b"/proc/uptime",
     b"/proc/loadavg",
-    b"/proc/version",
-    b"/proc/filesystems",
     b"/proc/mounts",
     b"/proc/self/mounts",
     b"/proc/self/mountinfo",
     b"/proc/stat",
-    b"/proc/meminfo",
     b"/proc/cpuinfo",
     b"/proc/locks",
     b"/proc/self/stat",
     b"/proc/self/status",
     b"/proc/self/cmdline",
-    b"/proc/vmstat",
-    b"/proc/sys/kernel/osrelease",
     b"/proc/self/maps",
 ];
 
@@ -17634,12 +17637,9 @@ fn is_synthetic_proc_directory_inode(inode: u64) -> bool {
 }
 
 fn synthetic_proc_pwrite_errno(inode: u64) -> libc::c_int {
-    if [
-        b"/proc/self/cmdline".as_slice(),
-        b"/proc/sys/kernel/osrelease".as_slice(),
-    ]
-    .iter()
-    .any(|path| synthetic_proc_inode(path) == inode)
+    if [b"/proc/self/cmdline".as_slice()]
+        .iter()
+        .any(|path| synthetic_proc_inode(path) == inode)
     {
         libc::EBADF
     } else {
@@ -17743,8 +17743,6 @@ fn synthetic_proc_content(state: &LoadedStaticElf, path: &[u8]) -> Option<Vec<u8
     let content = match normalized.as_slice() {
         b"/proc/uptime" => b"0.00 0.00\n".to_vec(),
         b"/proc/loadavg" => b"0.00 0.00 0.00 1/1 1\n".to_vec(),
-        b"/proc/version" => b"Linux version 6.0.0 (reverie-kvm) #1 SMP x86_64\n".to_vec(),
-        b"/proc/filesystems" => b"nodev\tproc\nnodev\ttmpfs\n\text4\n".to_vec(),
         b"/proc/mounts" | b"/proc/self/mounts" => state.proc_mounts.mounts.clone(),
         // Absolute guest paths and owned descriptors use this same ambient
         // namespace. The Tool normalizes its real mount identities together
@@ -17759,19 +17757,6 @@ fn synthetic_proc_content(state: &LoadedStaticElf, path: &[u8]) -> Option<Vec<u8
             "processes 1\n",
             "procs_running 1\n",
             "procs_blocked 0\n",
-        )
-        .as_bytes()
-        .to_vec(),
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-231): Review parity with Hermit's configured memory persona.
-        b"/proc/meminfo" => concat!(
-            "MemTotal:         976562 kB\n",
-            "MemFree:          976562 kB\n",
-            "MemAvailable:     976562 kB\n",
-            "Buffers:               0 kB\n",
-            "Cached:                0 kB\n",
-            "SwapTotal:             0 kB\n",
-            "SwapFree:              0 kB\n",
         )
         .as_bytes()
         .to_vec(),
@@ -17796,42 +17781,6 @@ fn synthetic_proc_content(state: &LoadedStaticElf, path: &[u8]) -> Option<Vec<u8
         b"/proc/self/stat" => proc_self_stat_content(state),
         b"/proc/self/status" => proc_self_status_content(state),
         b"/proc/self/cmdline" => proc_self_cmdline_content(state),
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-224): deterministic /proc/vmstat surface so
-        // procps `vmstat` reads its counters synthetically instead of hitting
-        // the fail-closed real-procfs refusal. All counters are fixed at 0
-        // (memory is not virtualized under KVM), matching the zeroed
-        // /proc/stat and /proc/meminfo surfaces above.
-        b"/proc/vmstat" => concat!(
-            "nr_free_pages 262144\n",
-            "nr_inactive_anon 0\n",
-            "nr_active_anon 0\n",
-            "nr_inactive_file 0\n",
-            "nr_active_file 0\n",
-            "nr_unevictable 0\n",
-            "nr_mlock 0\n",
-            "nr_anon_pages 0\n",
-            "nr_mapped 0\n",
-            "nr_file_pages 0\n",
-            "nr_dirty 0\n",
-            "nr_writeback 0\n",
-            "nr_slab_reclaimable 0\n",
-            "nr_slab_unreclaimable 0\n",
-            "pgpgin 0\n",
-            "pgpgout 0\n",
-            "pswpin 0\n",
-            "pswpout 0\n",
-            "pgfault 0\n",
-            "pgmajfault 0\n",
-        )
-        .as_bytes()
-        .to_vec(),
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-224): deterministic
-        // /proc/sys/kernel/osrelease so `sysctl -n kernel.osrelease` resolves
-        // synthetically. The value matches the KVM `uname(2)` release field
-        // ("6.0.0", see fn uname) and /proc/version above.
-        b"/proc/sys/kernel/osrelease" => b"6.0.0\n".to_vec(),
         b"/proc/self/maps" => proc_self_maps_content(state),
         _ => return None,
     };
@@ -24952,30 +24901,6 @@ mod tests {
         );
         // The descriptor is no longer tracked once closed.
         assert!(state.proc_files.is_empty());
-
-        let fd = open_readonly(&mut memory, &mut state, "/proc/meminfo");
-        assert!(fd >= 0);
-        let content = read_fd_to_end(&mut memory, &mut state, fd);
-        assert!(
-            content.starts_with(b"MemTotal:"),
-            "{}",
-            String::from_utf8_lossy(&content)
-        );
-        assert!(
-            content
-                .windows(b"MemTotal:         976562 kB\n".len())
-                .any(|line| { line == b"MemTotal:         976562 kB\n" })
-        );
-        assert!(
-            content
-                .windows(b"MemFree:          976562 kB\n".len())
-                .any(|line| { line == b"MemFree:          976562 kB\n" })
-        );
-        assert!(
-            content
-                .windows(b"MemAvailable:     976562 kB\n".len())
-                .any(|line| line == b"MemAvailable:     976562 kB\n")
-        );
     }
 
     #[test]
@@ -27902,42 +27827,41 @@ mod tests {
         );
     }
 
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-224): regression coverage for the /proc/vmstat
-    // and /proc/sys/kernel/osrelease synthetic surfaces.
+    /// Detcore renders these five files on every backend (Hermit's fixed
+    /// procfs tables), so the KVM executor no longer has a copy: no synthetic
+    /// content, no synthetic inode, and a direct open from a guest that runs
+    /// without the Tool meets the real-procfs refusal instead of a second,
+    /// different rendering.
     #[test]
-    fn synthetic_proc_vmstat_and_osrelease_are_served_deterministically() {
+    fn detcore_rendered_proc_files_have_no_kvm_copy() {
         let root = TestDir::new();
-        let state = test_state(&root.0);
-
-        // /proc/vmstat is served with fixed, zeroed counters and round-trips
-        // through the deterministic-inode path table.
-        let vmstat = synthetic_proc_content(&state, b"/proc/vmstat").unwrap();
-        assert!(vmstat.starts_with(b"nr_free_pages "));
-        assert!(
-            vmstat
-                .windows(b"pgpgin 0\n".len())
-                .any(|w| w == b"pgpgin 0\n")
-        );
-        assert_eq!(
-            synthetic_proc_content(&state, b"/proc/vmstat").unwrap(),
-            vmstat,
-            "vmstat content must be stable across reads"
-        );
-        assert_eq!(
-            synthetic_proc_path_for_inode(synthetic_proc_inode(b"/proc/vmstat")),
-            Some(b"/proc/vmstat".as_slice())
-        );
-
-        // /proc/sys/kernel/osrelease matches the KVM uname(2) release field.
-        assert_eq!(
-            synthetic_proc_content(&state, b"/proc/sys/kernel/osrelease").unwrap(),
-            b"6.0.0\n"
-        );
-        assert_eq!(
-            synthetic_proc_path_for_inode(synthetic_proc_inode(b"/proc/sys/kernel/osrelease")),
-            Some(b"/proc/sys/kernel/osrelease".as_slice())
-        );
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, 0x4000).unwrap();
+        for path in [
+            "/proc/version",
+            "/proc/filesystems",
+            "/proc/meminfo",
+            "/proc/vmstat",
+            "/proc/sys/kernel/osrelease",
+        ] {
+            assert!(
+                synthetic_proc_content(&state, path.as_bytes()).is_none(),
+                "{path}"
+            );
+            assert_eq!(
+                synthetic_proc_path_for_inode(synthetic_proc_inode(path.as_bytes())),
+                None,
+                "{path}"
+            );
+            // The real-procfs backstop refuses it, as it refuses every other
+            // unlisted /proc path.
+            assert_eq!(
+                open_readonly(&mut memory, &mut state, path),
+                negative_errno(libc::EACCES),
+                "{path}"
+            );
+        }
+        assert!(state.proc_files.is_empty());
     }
 
     #[test]
@@ -57384,7 +57308,7 @@ mod tests {
             (LINK, "link"),
             (MISSING, "missing"),
             (EMPTY, ""),
-            (SYNTHETIC_PROC, "/proc/version"),
+            (SYNTHETIC_PROC, "/proc/uptime"),
         ] {
             write_c_string(&mut memory, address, value);
         }

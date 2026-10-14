@@ -3694,18 +3694,35 @@ static int enumeration(int descriptor, int guest) {
 }
 
 static int contents(int descriptor, int baseline, int guest) {
-    const char *paths[] = {"version", "sys/kernel/osrelease", "self/cmdline"};
+    const char *paths[] = {"mounts", "self/mountinfo", "self/cmdline"};
     for (unsigned index = 0; index < sizeof(paths) / sizeof(paths[0]); ++index) {
         int actual = openat(descriptor, paths[index], O_RDONLY);
         int expected = openat(baseline, paths[index], O_RDONLY);
         CHECK(actual >= 0 && expected >= 0);
-        unsigned char actual_bytes[16384], expected_bytes[16384];
-        memset(actual_bytes, 0xa5, sizeof(actual_bytes));
-        memset(expected_bytes, 0xa5, sizeof(expected_bytes));
-        ssize_t actual_size = read(actual, actual_bytes, sizeof(actual_bytes));
-        ssize_t expected_size = read(expected, expected_bytes, sizeof(expected_bytes));
-        CHECK(actual_size > 0 && actual_size < sizeof(actual_bytes));
-        CHECK(actual_size == expected_size && memcmp(actual_bytes, expected_bytes, sizeof(actual_bytes)) == 0);
+        /* Mount tables have no fixed size: read each file to EOF and
+           compare the complete contents. */
+        enum { CONTENT_BYTES = 1 << 20 };
+        unsigned char *actual_bytes = malloc(CONTENT_BYTES), *expected_bytes = malloc(CONTENT_BYTES);
+        CHECK(actual_bytes != NULL && expected_bytes != NULL);
+        size_t actual_size = 0, expected_size = 0;
+        for (;;) {
+            CHECK(actual_size < CONTENT_BYTES);
+            ssize_t got = read(actual, actual_bytes + actual_size, CONTENT_BYTES - actual_size);
+            CHECK(got >= 0);
+            if (got == 0) break;
+            actual_size += (size_t)got;
+        }
+        for (;;) {
+            CHECK(expected_size < CONTENT_BYTES);
+            ssize_t got = read(expected, expected_bytes + expected_size, CONTENT_BYTES - expected_size);
+            CHECK(got >= 0);
+            if (got == 0) break;
+            expected_size += (size_t)got;
+        }
+        CHECK(actual_size > 0);
+        CHECK(actual_size == expected_size && memcmp(actual_bytes, expected_bytes, actual_size) == 0);
+        free(actual_bytes);
+        free(expected_bytes);
         CHECK(close(actual) == 0 && close(expected) == 0);
     }
     if (guest) {
