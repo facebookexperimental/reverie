@@ -347,6 +347,10 @@ struct State {
     change_subscribed: bool,
     owner_notifications: Vec<owner::OwnerNotification>,
     retired_origins: Vec<EntryOrigin>,
+    /// Set, under this lock, right after `failure` is first recorded; shared
+    /// with [`EntryGate::failure_recorded`] so `pending_failure` can skip the
+    /// lock while no failure exists.
+    failure_recorded: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     copy_waits: usize,
     #[cfg(test)]
@@ -388,6 +392,8 @@ impl State {
         });
         self.retired_origins.push(origin);
         self.failure = Some(failure.clone());
+        self.failure_recorded
+            .store(true, std::sync::atomic::Ordering::Release);
         if let Some(operation) = &failure.operation {
             match operation.capture(failure.clone()) {
                 Ok(notification) => {
@@ -485,6 +491,11 @@ fn protocol_failure(operation: &'static str) -> Error {
 
 pub(crate) struct EntryGate {
     state: Mutex<State>,
+    /// The same flag as `State::failure_recorded`. A failure is recorded once
+    /// and never cleared, so reading false is equivalent to taking the lock
+    /// before the failure was recorded; any thread that learned of the
+    /// failure through a synchronizing operation reads true.
+    failure_recorded: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     prepare_probe: Mutex<Option<Arc<PrepareProbe>>>,
 }
@@ -551,9 +562,11 @@ impl EntryGate {
     pub(crate) fn new() -> Arc<Self> {
         let (sender, receiver) = oneshot::channel();
         let (failed_sender, failed) = oneshot::channel();
+        let failure_recorded = Arc::new(std::sync::atomic::AtomicBool::new(false));
         Arc::new(Self {
             #[cfg(test)]
             prepare_probe: Mutex::new(None),
+            failure_recorded: failure_recorded.clone(),
             state: Mutex::new(State {
                 admission: Admission::Open,
                 single_member_domain: false,
@@ -573,6 +586,7 @@ impl EntryGate {
                 change_subscribed: false,
                 owner_notifications: Vec::new(),
                 retired_origins: Vec::new(),
+                failure_recorded: failure_recorded.clone(),
                 #[cfg(test)]
                 copy_waits: 0,
                 #[cfg(test)]
@@ -612,6 +626,13 @@ impl EntryGate {
     }
 
     pub(crate) fn pending_failure(&self) -> Option<Arc<PendingFailure>> {
+        // Every guest-memory copy checks this, usually more than once.
+        if !self
+            .failure_recorded
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return None;
+        }
         self.state.lock().unwrap().failure.clone()
     }
 
