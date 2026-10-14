@@ -3161,7 +3161,7 @@ impl FileTableState {
     }
 
     fn try_from_elf(state: &LoadedStaticElf) -> std::io::Result<Self> {
-        Self::prepare_from_elf(state, false)
+        Self::prepare_from_elf(state, false, None)
     }
 
     fn same_stdin_entry(&self, state: &LoadedStaticElf) -> bool {
@@ -3172,17 +3172,34 @@ impl FileTableState {
     fn update_from_elf(&mut self, state: &LoadedStaticElf) -> std::io::Result<()> {
         let same_stdin = self.same_stdin_entry(state);
         // Stage every required clone before taking an authoritative handle.
-        // A failed clone leaves the entire previous table intact.
-        let mut next = Self::prepare_from_elf(state, same_stdin)?;
+        // A failed clone leaves the entire previous table intact. An entry
+        // unchanged since the last publication keeps the clone already
+        // published for it, as install keeps a thread's own host fd: the same
+        // entry identity is the same open description, so a fresh clone would
+        // only add a dup now and a close when the old one retires.
+        let mut next = Self::prepare_from_elf(state, same_stdin, Some(self))?;
         if same_stdin {
             next.stdin = self.stdin.take();
+        }
+        for &fd in state.files.keys() {
+            next.files.entry(fd).or_insert_with(|| {
+                self.files
+                    .remove(&fd)
+                    .expect("an unchanged entry has its published clone")
+            });
         }
         let retired = std::mem::replace(self, next);
         retired.retire(&state.file_retirement);
         Ok(())
     }
 
-    fn prepare_from_elf(state: &LoadedStaticElf, preserve_stdin: bool) -> std::io::Result<Self> {
+    /// The table for `state`. With `published`, entries whose identity
+    /// matches its own are left out of `files` for the caller to move over.
+    fn prepare_from_elf(
+        state: &LoadedStaticElf,
+        preserve_stdin: bool,
+        published: Option<&Self>,
+    ) -> std::io::Result<Self> {
         let stdin = if preserve_stdin {
             None
         } else {
@@ -3195,6 +3212,16 @@ impl FileTableState {
         let files = state
             .files
             .iter()
+            .filter(|&(fd, _)| {
+                !published.is_some_and(|published| {
+                    published.files.contains_key(fd)
+                        && state
+                            .fd_entry_ids
+                            .get(fd)
+                            .zip(published.fd_entry_ids.get(fd))
+                            .is_some_and(|(current, previous)| Arc::ptr_eq(current, previous))
+                })
+            })
             .map(|(&fd, file)| Ok((fd, state.file_retirement.stage_clone(file)?)))
             .collect::<std::io::Result<std::collections::BTreeMap<_, _>>>()?;
         Ok(Self {
@@ -23085,6 +23112,7 @@ mod tests {
     include!("child_exit_signal_tests.rs");
     include!("process_alarm_signal_tests.rs");
     include!("signal_dequeue_tests.rs");
+    include!("executor/file_table_publish_tests.rs");
 
     #[test]
     fn legacy_readonly_arch_output_stays_accessible_while_scalar_copyout_refuses() {
