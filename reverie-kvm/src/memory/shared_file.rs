@@ -64,6 +64,10 @@ impl Drop for AllocationGuard<'_> {
             if deferred.scopes != 0 {
                 return;
             }
+            self.memory
+                .mapping
+                .deferred_queued
+                .store(false, std::sync::atomic::Ordering::Release);
             (
                 std::mem::take(&mut deferred.causes),
                 std::mem::take(&mut deferred.notifications),
@@ -91,6 +95,10 @@ impl Drop for DeferredNotifications<'_> {
             if deferred.scopes != 0 || deferred.active.is_some() {
                 return;
             }
+            self.memory
+                .mapping
+                .deferred_queued
+                .store(false, std::sync::atomic::Ordering::Release);
             (
                 std::mem::take(&mut deferred.causes),
                 std::mem::take(&mut deferred.notifications),
@@ -244,6 +252,9 @@ impl GuestMemory {
                     .any(|(_, old)| Arc::ptr_eq(old, &cause))
                 {
                     deferred.causes.push((origin, cause.clone()));
+                    self.mapping
+                        .deferred_queued
+                        .store(true, std::sync::atomic::Ordering::Release);
                 }
                 return self.entry_gate().pending_failure().map_or_else(
                     || Error::SharedFailure(deferred.causes[0].1.clone()),
@@ -1186,6 +1197,13 @@ impl GuestMemory {
     }
 
     pub(super) fn deferred_failure(&self) -> Option<Arc<Error>> {
+        if !self
+            .mapping
+            .deferred_queued
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return None;
+        }
         self.mapping
             .deferred
             .lock()

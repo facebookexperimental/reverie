@@ -259,6 +259,11 @@ struct Mapping {
     entry_gate: Arc<EntryGate>,
     retirement: Mutex<Option<Box<WriteAliasMapping>>>,
     deferred: Mutex<shared_file::DeferredFailures>,
+    /// Whether `deferred.causes` is non-empty. Every change to that list
+    /// updates this under the `deferred` lock, so reading false is equivalent
+    /// to having locked while the list was empty; every guest-memory copy
+    /// checks it twice.
+    deferred_queued: std::sync::atomic::AtomicBool,
     sync_mmu: Mutex<Option<bool>>,
 }
 
@@ -1094,6 +1099,7 @@ impl GuestMemory {
                 entry_gate: EntryGate::new(),
                 retirement: Mutex::new(None),
                 deferred: Mutex::new(shared_file::DeferredFailures::default()),
+                deferred_queued: std::sync::atomic::AtomicBool::new(false),
                 sync_mmu: Mutex::new(None),
             }),
             failure_context: None,
