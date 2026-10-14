@@ -333,6 +333,14 @@ struct State {
     failed_sender: Option<oneshot::Sender<()>>,
     failed: Change,
     copy_changed: Arc<Condvar>,
+    /// Copies parked in `copy_blocking` on `copy_changed`. A change wakes the
+    /// condition variable only when one exists: Rust's futex `notify_all`
+    /// always makes a FUTEX_WAKE syscall, and nearly every change (a copy's
+    /// retirement, an entry's acknowledgement) happens with nobody waiting.
+    blocked_copiers: usize,
+    /// Whether anyone took the current `changed` future since it was armed.
+    /// Only then does a change allocate the next one and complete this one.
+    change_subscribed: bool,
     owner_notifications: Vec<owner::OwnerNotification>,
     retired_origins: Vec<EntryOrigin>,
     #[cfg(test)]
@@ -344,7 +352,8 @@ struct State {
 struct ChangeSignal {
     sender: Option<oneshot::Sender<()>>,
     failed: Option<oneshot::Sender<()>>,
-    copies: Arc<Condvar>,
+    /// Present only when a copy was parked when the change was made.
+    copies: Option<Arc<Condvar>>,
     owners: Vec<owner::OwnerNotification>,
     origins: Vec<EntryOrigin>,
 }
@@ -401,20 +410,38 @@ impl State {
 
     /// The sender is consumed only after releasing the registry lock. A
     /// subscriber taken before a recheck therefore cannot miss this change.
+    ///
+    /// Both wake paths are skipped when nobody can be waiting, which is the
+    /// common case. No wakeup is lost: a parked copy registers in
+    /// `blocked_copiers`, and a subscriber sets `change_subscribed`, under
+    /// this same lock before it waits, so every later change sees it.
     fn changed(&mut self) -> ChangeSignal {
-        let (sender, receiver) = oneshot::channel();
-        self.changed = receiver.shared();
+        let sender = if self.change_subscribed {
+            self.change_subscribed = false;
+            let (sender, receiver) = oneshot::channel();
+            self.changed = receiver.shared();
+            self.sender.replace(sender)
+        } else {
+            None
+        };
         ChangeSignal {
-            sender: self.sender.replace(sender),
+            sender,
             failed: if self.failure.is_some() {
                 self.failed_sender.take()
             } else {
                 None
             },
-            copies: self.copy_changed.clone(),
+            copies: (self.blocked_copiers != 0).then(|| self.copy_changed.clone()),
             owners: std::mem::take(&mut self.owner_notifications),
             origins: std::mem::take(&mut self.retired_origins),
         }
+    }
+
+    /// The current change future, marked as taken so the next change
+    /// completes it. Every subscriber goes through here, under the lock.
+    fn subscribe(&mut self) -> Change {
+        self.change_subscribed = true;
+        self.changed.clone()
     }
 
     fn stopped(&self) -> bool {
@@ -429,7 +456,9 @@ impl State {
 fn notify(change: ChangeSignal) {
     // Both kinds of waiter recheck the state under the registry lock. Notify
     // only after releasing it; no wake callback may run inside that lock.
-    change.copies.notify_all();
+    if let Some(copies) = change.copies {
+        copies.notify_all();
+    }
     for owner in change.owners {
         owner.notify();
     }
@@ -536,6 +565,8 @@ impl EntryGate {
                 failed_sender: Some(failed_sender),
                 failed: failed.shared(),
                 copy_changed: Arc::new(Condvar::new()),
+                blocked_copiers: 0,
+                change_subscribed: false,
                 owner_notifications: Vec::new(),
                 retired_origins: Vec::new(),
                 #[cfg(test)]
@@ -548,12 +579,12 @@ impl EntryGate {
 
     #[cfg(not(test))]
     pub(crate) fn subscribe(&self) -> Change {
-        self.state.lock().unwrap().changed.clone()
+        self.state.lock().unwrap().subscribe()
     }
 
     #[cfg(test)]
     pub(crate) fn subscribe(&self) -> ObservedChange {
-        let change = self.state.lock().unwrap().changed.clone();
+        let change = self.state.lock().unwrap().subscribe();
         let probe = self.prepare_probe.lock().unwrap().clone();
         ObservedChange {
             change,
@@ -740,7 +771,9 @@ impl EntryGate {
                 state.copy_waits += 1;
                 state.copy_waiters.push(std::thread::current().id());
             }
+            state.blocked_copiers += 1;
             state = changed.wait(state).unwrap();
+            state.blocked_copiers -= 1;
             #[cfg(test)]
             state
                 .copy_waiters
@@ -1348,7 +1381,7 @@ impl Closing {
                         published_domain: false,
                     });
                 }
-                state.changed.clone()
+                state.subscribe()
             };
             let _ = changed.await;
         }
@@ -2240,6 +2273,9 @@ mod tests {
                 assert!(std::time::Instant::now() < deadline, "copy never waited");
                 std::thread::yield_now();
             }
+            // The parked copy is registered, so the waking change carries the
+            // condition variable.
+            assert_eq!(gate.state.lock().unwrap().blocked_copiers, 1);
             assert!(matches!(
                 receiver.try_recv(),
                 Err(std::sync::mpsc::TryRecvError::Empty)
@@ -2262,7 +2298,57 @@ mod tests {
             }
             worker.join().unwrap();
             assert_eq!(gate.state.lock().unwrap().copies, 0);
+            assert_eq!(gate.state.lock().unwrap().blocked_copiers, 0);
         }
+    }
+
+    #[test]
+    fn an_unwatched_change_allocates_and_wakes_nothing() {
+        let gate = EntryGate::new();
+        // No subscriber and no parked copy: a copy's retirement, the most
+        // frequent change, neither replaces the change future nor wakes the
+        // copy condition variable.
+        drop(gate.try_copy(None).unwrap().unwrap());
+        let signal = gate.state.lock().unwrap().changed();
+        assert!(signal.sender.is_none());
+        assert!(signal.copies.is_none());
+        notify(signal);
+        // A subscription arms exactly the next change.
+        let changed = gate.subscribe();
+        assert!(gate.state.lock().unwrap().change_subscribed);
+        let signal = gate.state.lock().unwrap().changed();
+        assert!(signal.sender.is_some());
+        assert!(signal.copies.is_none());
+        notify(signal);
+        assert!(changed.now_or_never().is_some());
+        assert!(!gate.state.lock().unwrap().change_subscribed);
+        let signal = gate.state.lock().unwrap().changed();
+        assert!(signal.sender.is_none());
+        notify(signal);
+    }
+
+    #[test]
+    fn a_subscriber_taken_between_changes_sees_the_next_one() {
+        let gate = EntryGate::new();
+        // Changes nobody watched leave the current future pending...
+        drop(gate.try_copy(None).unwrap().unwrap());
+        drop(gate.try_copy(None).unwrap().unwrap());
+        let changed = gate.subscribe();
+        assert!(changed.clone().now_or_never().is_none());
+        // ...and the first change after the subscription completes it.
+        drop(gate.try_copy(None).unwrap().unwrap());
+        assert!(changed.now_or_never().is_some());
+        // A closer, which subscribes inside its own loop, still drains.
+        let copy = gate.try_copy(None).unwrap().unwrap();
+        let mut closing = Box::pin(gate.try_close().unwrap().unwrap().finish());
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(closing.as_mut().poll(&mut cx).is_pending());
+        drop(copy);
+        assert!(matches!(
+            closing.as_mut().poll(&mut cx),
+            std::task::Poll::Ready(Ok(_))
+        ));
     }
 
     #[test]
