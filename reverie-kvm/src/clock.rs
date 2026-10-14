@@ -29,6 +29,10 @@ use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
 use std::rc::Rc;
+use std::sync::atomic::AtomicPtr;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use kvm_ioctls::VcpuExit;
 use kvm_ioctls::VcpuFd;
@@ -558,9 +562,111 @@ struct CounterIdentity {
 /// `CounterIdentity::cpu` of an event that follows its task across CPUs.
 const FOLLOWS_TASK: usize = usize::MAX;
 
-fn host_tid() -> libc::pid_t {
+/// The process epoch of the cached task IDs below lives in one anonymous page
+/// marked `MADV_WIPEONFORK`. The kernel zeroes that page in every child that
+/// gets its own copy of the address space: a `fork()` child and a raw
+/// `clone()` child without `CLONE_VM` alike. That child's only thread is a new
+/// task whose inherited thread-local still names its parent's thread, and a
+/// zero epoch makes it read its task ID afresh. pthread_atfork would cover
+/// only `fork()`, and Hermit starts KVM runs in a raw `clone()` child.
+static TID_EPOCH_PAGE: AtomicPtr<AtomicU64> = AtomicPtr::new(std::ptr::null_mut());
+
+/// The source of fresh epochs, in ordinary memory: a child inherits it, so
+/// every epoch it draws is larger than any epoch its parent cached.
+static NEXT_TID_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+/// Whether the epoch page is set up: 0 not yet, 1 a thread is setting it up,
+/// 2 ready, 3 unavailable. Nothing ever waits on this. A child of a process
+/// that was mid-setup inherits 1 with no thread to finish it, and like an
+/// unavailable page, only reads its task ID uncached, which is always correct.
+static TID_EPOCH_STATE: AtomicU8 = AtomicU8::new(0);
+
+const TID_EPOCH_PAGE_BYTES: usize = 4096;
+
+/// The epoch page, set up on first use; None while it is not (yet) usable.
+fn tid_epoch_page() -> Option<&'static AtomicU64> {
+    match TID_EPOCH_STATE.load(Ordering::Acquire) {
+        2 => {}
+        0 if TID_EPOCH_STATE
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok() =>
+        {
+            // SAFETY: a fresh private anonymous mapping; no existing memory is
+            // affected. It is never unmapped once published.
+            let page = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    TID_EPOCH_PAGE_BYTES,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if page == libc::MAP_FAILED {
+                TID_EPOCH_STATE.store(3, Ordering::Release);
+                return None;
+            }
+            // SAFETY: `page` is the mapping just created, of this length.
+            if unsafe { libc::madvise(page, TID_EPOCH_PAGE_BYTES, libc::MADV_WIPEONFORK) } != 0 {
+                // SAFETY: unmapping the unpublished mapping created above.
+                unsafe { libc::munmap(page, TID_EPOCH_PAGE_BYTES) };
+                TID_EPOCH_STATE.store(3, Ordering::Release);
+                return None;
+            }
+            TID_EPOCH_PAGE.store(page.cast(), Ordering::Relaxed);
+            TID_EPOCH_STATE.store(2, Ordering::Release);
+        }
+        _ => return None,
+    }
+    // SAFETY: state 2 was stored (Release) after the pointer to a live,
+    // zero-initialized, never-unmapped page; AtomicU64 is valid for zeroes.
+    Some(unsafe { &*TID_EPOCH_PAGE.load(Ordering::Relaxed) })
+}
+
+/// This process's epoch, drawn afresh when the page reads zero (new, or wiped
+/// in a child). Threads racing to draw it agree on the first stored value.
+fn current_tid_epoch(page: &AtomicU64) -> u64 {
+    let epoch = page.load(Ordering::Acquire);
+    if epoch != 0 {
+        return epoch;
+    }
+    let fresh = NEXT_TID_EPOCH.fetch_add(1, Ordering::Relaxed);
+    match page.compare_exchange(0, fresh, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => fresh,
+        Err(winner) => winner,
+    }
+}
+
+fn gettid_uncached() -> libc::pid_t {
     // SAFETY: gettid has no pointer arguments and returns this Linux task ID.
     unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t }
+}
+
+/// This thread's Linux task ID, read once per thread and process. Every
+/// counted entry names it in the counter identity, so caching it removes a
+/// `gettid` from each guest syscall. A thread's task ID never changes; only a
+/// child created without `CLONE_VM` sees a different one, and its wiped epoch
+/// page retires every inherited cached value. (A `vfork()` or other
+/// `CLONE_VM` child shares the page; it must only exec or exit, and never
+/// enters KVM.)
+fn host_tid() -> libc::pid_t {
+    let Some(page) = tid_epoch_page() else {
+        return gettid_uncached();
+    };
+    thread_local! {
+        static CACHED: std::cell::Cell<Option<(u64, libc::pid_t)>> =
+            const { std::cell::Cell::new(None) };
+    }
+    let epoch = current_tid_epoch(page);
+    if let Some((cached_epoch, tid)) = CACHED.get()
+        && cached_epoch == epoch
+    {
+        return tid;
+    }
+    let tid = gettid_uncached();
+    CACHED.set(Some((epoch, tid)));
+    tid
 }
 
 fn current_raw_event() -> Result<u64> {
@@ -1627,6 +1733,110 @@ mod tests {
         assert!(clock.read().is_err());
         assert_eq!(clock.total, 9);
         assert!(same_affinity(&affinity().unwrap(), &original));
+    }
+
+    fn gettid() -> libc::pid_t {
+        // SAFETY: gettid has no pointer arguments.
+        unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t }
+    }
+
+    #[test]
+    fn cached_host_tid_is_each_threads_own_and_survives_fork() {
+        let mine = host_tid();
+        assert_eq!(mine, gettid());
+        assert_eq!(host_tid(), mine);
+        let other = std::thread::spawn(|| (host_tid(), gettid()))
+            .join()
+            .unwrap();
+        assert_eq!(other.0, other.1);
+        assert_ne!(other.0, mine);
+        // A fork child's only thread is a new task: it must not reuse the
+        // parent thread's cached task ID. The child does only async-signal-safe
+        // work after one thread-local read, then exits without unwinding.
+        // SAFETY: the child calls only host_tid, gettid and _exit.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            let ok = host_tid() == gettid() && host_tid() != mine;
+            // SAFETY: terminate the child immediately with the verdict.
+            unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+        }
+        let mut status = 0;
+        // SAFETY: wait for the exact child created above.
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "fork child reused a cached tid"
+        );
+        assert_eq!(host_tid(), mine);
+    }
+
+    #[test]
+    fn a_fork_child_of_a_process_setting_up_the_epoch_reads_its_tid_without_waiting() {
+        // A fork while another thread is setting up the epoch page leaves the
+        // child with the setting-up state and no thread to finish it. The
+        // child must still get its own task ID, uncached, without waiting.
+        let parent = host_tid();
+        // SAFETY: the child calls only async-signal-safe operations, an
+        // atomic store and host_tid, then _exit; alarm bounds a hang.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            unsafe { libc::alarm(5) };
+            TID_EPOCH_STATE.store(1, Ordering::SeqCst);
+            let ok = host_tid() == gettid() && host_tid() != parent;
+            // SAFETY: terminate the child immediately with the verdict.
+            unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+        }
+        let mut status = 0;
+        // SAFETY: wait for the exact child created above.
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(
+            libc::WIFEXITED(status),
+            "fork child did not exit normally (status {status:#x}); a hang ends in SIGALRM"
+        );
+        assert_eq!(libc::WEXITSTATUS(status), 0, "fork child read a wrong tid");
+    }
+
+    #[test]
+    fn a_raw_clone_child_reads_its_own_tid() {
+        // Hermit starts KVM runs in a child of a raw clone() without
+        // CLONE_VM, where no pthread_atfork handler runs. Its only thread
+        // must not reuse the cloning thread's cached task ID.
+        extern "C" fn child(parent: *mut libc::c_void) -> libc::c_int {
+            let parent = parent as usize as libc::pid_t;
+            let ok = host_tid() == gettid() && host_tid() != parent;
+            // SAFETY: terminate the child immediately with the verdict.
+            unsafe { libc::_exit(if ok { 0 } else { 1 }) }
+        }
+        let parent = host_tid();
+        assert_eq!(host_tid(), gettid());
+        let mut stack = vec![0u8; 256 * 1024];
+        // SAFETY: without CLONE_VM the child runs on its own copy of `stack`,
+        // which is 16-byte aligned at its top below, and only calls host_tid,
+        // gettid and _exit.
+        let pid = unsafe {
+            let top = stack.as_mut_ptr().add(stack.len()) as usize & !15;
+            libc::clone(
+                child,
+                top as *mut libc::c_void,
+                libc::SIGCHLD,
+                parent as usize as *mut libc::c_void,
+            )
+        };
+        assert!(pid > 0, "clone failed: {}", std::io::Error::last_os_error());
+        let mut status = 0;
+        // SAFETY: wait for the exact child created above.
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status), "status {status:#x}");
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "raw clone child reused a cached tid"
+        );
+        assert_eq!(host_tid(), parent);
     }
 }
 
