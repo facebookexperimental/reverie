@@ -3230,8 +3230,77 @@ impl FileTableState {
         })
     }
 
+    /// Whether `install` would leave `state`'s descriptor fields exactly as
+    /// they are: the same entries by identity (so every host fd is kept) and
+    /// the same descriptor facts. Reads only; allocates nothing.
+    fn installed_matches(&self, state: &LoadedStaticElf) -> bool {
+        fn same_arcs<K: Ord, V>(
+            a: &std::collections::BTreeMap<K, Arc<V>>,
+            b: &std::collections::BTreeMap<K, Arc<V>>,
+        ) -> bool {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b)
+                    .all(|((ka, va), (kb, vb))| ka == kb && Arc::ptr_eq(va, vb))
+        }
+        // Destructured without `..`, so a field added to the table fails to
+        // compile here until it is either compared or shown not to be
+        // installed.
+        let Self {
+            stdin: _,
+            stdin_entry_id: _,
+            files,
+            fd_entry_ids,
+            epoll_domain,
+            poll_table_id,
+            native_poll_fds,
+            pipe_owners,
+            random_device_fds,
+            random_device_descriptions,
+            stdout_alias_fds,
+            stderr_alias_fds,
+            cloexec_fds,
+            closed_standard_fds,
+            proc_files,
+            synthetic_proc_nofollow_fds,
+            fdinfo_files,
+            // install never writes the task's signalfd set.
+            signalfd_fds: _,
+            fd_object_inodes,
+        } = self;
+        // same_stdin_entry compares stdin and stdin_entry_id.
+        self.same_stdin_entry(state)
+            && files.keys().eq(state.files.keys())
+            && same_arcs(fd_entry_ids, &state.fd_entry_ids)
+            // install keeps a task's file only when both sides carry the same
+            // entry identity; a file without one is always reinstalled.
+            && files.keys().all(|fd| fd_entry_ids.contains_key(fd))
+            && Arc::ptr_eq(epoll_domain, &state.epoll_domain)
+            && Arc::ptr_eq(poll_table_id, &state.poll_table_id)
+            && same_arcs(native_poll_fds, &state.native_poll_fds)
+            && same_arcs(pipe_owners, &state.pipe_owners)
+            && *random_device_fds == state.random_device_fds
+            && same_arcs(random_device_descriptions, &state.random_device_descriptions)
+            && *stdout_alias_fds == state.stdout_alias_fds
+            && *stderr_alias_fds == state.stderr_alias_fds
+            && *cloexec_fds == state.cloexec_fds
+            && *closed_standard_fds == state.closed_standard_fds
+            && *proc_files == state.proc_files
+            && *synthetic_proc_nofollow_fds == state.synthetic_proc_nofollow_fds
+            && same_arcs(fdinfo_files, &state.fdinfo_files)
+            && same_arcs(fd_object_inodes, &state.fd_object_inodes)
+    }
+
     // TODO-HUMAN-REVIEW(PR-235): Review stable host-fd preservation during table sync.
     fn install(&self, state: &mut LoadedStaticElf) -> std::io::Result<()> {
+        // Every guest syscall installs the shared table, and it almost never
+        // changed. Installing over an equal state rebuilds every collection
+        // to the same contents, keeps every host fd, and retires no file; its
+        // only other effect is the retirement flush below, kept here.
+        if self.installed_matches(state) {
+            state.file_retirement.retire(std::iter::empty());
+            return Ok(());
+        }
         // Finish every required fallible clone before replacing state.
         // An unchanged entry keeps its actual host fd for epoll MOD/DEL. Inode
         // equality cannot prove this: closing and reopening a linked file keeps
@@ -26248,6 +26317,73 @@ mod tests {
         };
         replacement.inherit_process_state(state);
         assert_eq!(replacement.regular_create_directory_policy, detected);
+    }
+
+    #[test]
+    fn an_unchanged_file_table_install_keeps_state_and_a_changed_one_restores_it() {
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, state.mmap_limit as usize).unwrap();
+        let fd = open_with_flags(&mut memory, &mut state, "/proc/uptime", libc::O_PATH);
+        let shared = FileTableState::try_from_elf(&state).unwrap();
+        assert!(shared.installed_matches(&state));
+        // Installing over an equal state keeps every entry and its host fd.
+        let host_before = host_fd(&state, fd as i32);
+        shared.install(&mut state).unwrap();
+        assert!(shared.installed_matches(&state));
+        assert_eq!(host_fd(&state, fd as i32), host_before);
+        // A descriptor the table does not have makes the states differ, and
+        // a full install removes it again.
+        let copy = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_dup,
+            [fd as u64, 0, 0, 0, 0, 0],
+        );
+        assert!(copy >= 0);
+        assert!(!shared.installed_matches(&state));
+        shared.install(&mut state).unwrap();
+        assert!(shared.installed_matches(&state));
+        assert!(!state.files.contains_key(&(copy as i32)));
+        assert_eq!(host_fd(&state, fd as i32), host_before);
+        // So does a changed descriptor fact with the same entries.
+        state.cloexec_fds.insert(fd as i32);
+        assert!(!shared.installed_matches(&state));
+        shared.install(&mut state).unwrap();
+        assert!(!state.cloexec_fds.contains(&(fd as i32)));
+        assert!(shared.installed_matches(&state));
+    }
+
+    #[test]
+    fn a_file_without_an_entry_identity_is_always_reinstalled() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let a_path = root.0.join("a");
+        let b_path = root.0.join("b");
+        std::fs::write(&a_path, b"a").unwrap();
+        std::fs::write(&b_path, b"b").unwrap();
+        let inode = |file: &std::fs::File| file.metadata().unwrap().ino();
+        // A file the table holds without an entry identity on either side.
+        let fd = 9;
+        state
+            .files
+            .insert(fd, std::fs::File::open(&a_path).unwrap());
+        state.fd_entry_ids.remove(&fd);
+        let shared = FileTableState::try_from_elf(&state).unwrap();
+        let a_inode = inode(&state.files[&fd]);
+        // The task now holds a different file under the same fd. Identical
+        // (empty) identities must not count as the same entry: install puts
+        // the table's file back.
+        state
+            .files
+            .insert(fd, std::fs::File::open(&b_path).unwrap());
+        assert_ne!(inode(&state.files[&fd]), a_inode);
+        assert!(!shared.installed_matches(&state));
+        shared.install(&mut state).unwrap();
+        assert_eq!(inode(&state.files[&fd]), a_inode);
+        assert!(state.files[&fd].as_raw_fd() >= 0);
     }
 
     #[test]
