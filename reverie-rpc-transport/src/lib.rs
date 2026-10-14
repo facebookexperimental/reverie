@@ -79,7 +79,11 @@ mod server;
 pub mod mapped;
 
 pub use blocking_client::BlockingRpcClient;
+pub use blocking_client::BorrowedBlockingRpcClient;
 pub use blocking_client::InitialImageClient;
+pub use blocking_client::RpcRequest;
+pub use blocking_client::RpcResponse;
+pub use blocking_client::read_config_frame;
 pub use client::RpcClient;
 pub use envelope::RequestEnvelope;
 pub use error::RpcError;

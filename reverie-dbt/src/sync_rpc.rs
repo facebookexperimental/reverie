@@ -6,35 +6,22 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Synchronous Unix-domain-socket client for the GlobalTool RPC.
+//! DynamoRIO connection ownership over the shared blocking RPC client.
 //!
-//! The DBT guest client runs inside the (DynamoRIO-instrumented) guest process
-//! and has no async runtime, so it cannot use the tokio-based
-//! [`reverie_rpc_transport::RpcClient`]. This module provides a blocking client
-//! that is *wire-compatible* with that crate's [`reverie_rpc_transport::RpcServer`]:
+//! Background callbacks retain a thread-local Unix socket. Application callbacks
+//! use the native syscall invoker because ordinary Rust socket/TLS operations
+//! are not safe in DynamoRIO's private loader. Both paths borrow
+//! [`reverie_rpc_transport::BlockingRpcClient`] for each exchange; envelope,
+//! codec, framing, limits and partial-I/O policy live in the shared transport.
 //!
-//! * each frame is a big-endian `u32` length prefix followed by a
-//!   `bincode`(legacy)-encoded payload;
-//! * on connect the server sends exactly one `Config` frame, which we read and
-//!   discard on an ordinary RPC connection;
-//! * every request is a `RequestEnvelope` `{ from, request }` and the
-//!   response travels back bare.
+//! The current callback supplies its TID and I/O context for that borrow only.
+//! Cached connections retain descriptors, process identity and socket path,
+//! never a callback context. A fork child reconnects before its first request;
+//! inherited contended locks use the existing uncached-connection path.
 //!
-//! [`read_initial_config`] receives that same initial frame on a separate,
-//! temporary background-owned socket. It closes that socket before returning
-//! the configuration and sends no request. It does not adopt or change either
-//! application RPC connection.
-//!
-//! When [`RPC_SOCKET_ENV`] is set, a coordinator process (e.g. `hermit-cli`)
-//! owns the single shared `GlobalState`; every guest process — including every
-//! `fork(2)` child, which inherits the environment and re-connects with its own
-//! socket — routes [`reverie::GlobalRPC::send_rpc`] here, giving one shared
-//! `GlobalState` across the whole process tree. When the variable is unset,
-//! callers fall back to the in-process `GlobalState::receive_rpc`.
-//!
-//! Because the round-trip is fully synchronous, the `async fn send_rpc` that
-//! calls it resolves on its first poll, so the DBT driver's `run_ready` never
-//! spins waiting on a cross-thread wake for an RPC.
+//! [`read_initial_config`] uses a separate temporary background-owned socket.
+//! It requires an exact config payload, sends no request, and retires its FD
+//! before returning. It does not adopt an application RPC connection.
 
 use std::cell::RefCell;
 use std::fmt;
@@ -53,7 +40,17 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::TryLockError;
 
+use reverie::GlobalTool;
 use reverie::Tid;
+use reverie_rpc_transport::BlockingRpcClient;
+use reverie_rpc_transport::RpcError;
+use reverie_rpc_transport::RpcRequest;
+use reverie_rpc_transport::RpcResponse;
+#[cfg(test)]
+use reverie_rpc_transport::codec::DEFAULT_MAX_FRAME_LEN;
+use reverie_rpc_transport::codec::decode_exact;
+use reverie_rpc_transport::read_config_frame;
+#[cfg(test)]
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -65,8 +62,8 @@ use crate::SyscallInvoker;
 /// to followed exec children; the client keeps its own copy across `fork`.
 pub const RPC_SOCKET_ENV: &str = "HERMIT_DBT_RPC_SOCKET";
 
-/// Mirror of [`reverie_rpc_transport::codec::DEFAULT_MAX_FRAME_LEN`] (16 MiB).
-const MAX_FRAME_LEN: usize = 16 * (1 << 20);
+#[cfg(test)]
+const MAX_FRAME_LEN: usize = DEFAULT_MAX_FRAME_LEN;
 
 /// Primary failure while receiving an authoritative initial configuration.
 ///
@@ -202,24 +199,17 @@ pub fn read_initial_config<C: DeserializeOwned>(path: &Path) -> Result<C, Initia
 fn receive_initial_config<C: DeserializeOwned>(
     stream: &mut UnixStream,
 ) -> Result<C, InitialConfigFailure> {
-    let mut header = [0_u8; 4];
-    stream
-        .read_exact(&mut header)
-        .map_err(InitialConfigFailure::Read)?;
-    let length = u32::from_be_bytes(header) as usize;
-    if length > MAX_FRAME_LEN {
-        return Err(InitialConfigFailure::FrameTooLarge);
-    }
-    let mut payload = vec![0_u8; length];
-    stream
-        .read_exact(&mut payload)
-        .map_err(InitialConfigFailure::Read)?;
-    let (config, consumed) = bincode::serde::decode_from_slice(&payload, bincode::config::legacy())
-        .map_err(InitialConfigFailure::Decode)?;
-    if consumed != payload.len() {
-        return Err(InitialConfigFailure::TrailingBytes);
-    }
-    Ok(config)
+    let payload = read_config_frame(stream).map_err(|error| match error {
+        RpcError::Closed => InitialConfigFailure::Read(io::ErrorKind::UnexpectedEof.into()),
+        RpcError::Io(error) => InitialConfigFailure::Read(error),
+        RpcError::FrameTooLarge { .. } => InitialConfigFailure::FrameTooLarge,
+        error => InitialConfigFailure::Read(io::Error::other(error)),
+    })?;
+    decode_exact(&payload).map_err(|error| match error {
+        RpcError::Decode(error) => InitialConfigFailure::Decode(error),
+        RpcError::TrailingBytes { .. } => InitialConfigFailure::TrailingBytes,
+        error => InitialConfigFailure::Read(io::Error::other(error)),
+    })
 }
 
 fn close_initial_socket(fd: RawFd) -> io::Result<()> {
@@ -250,47 +240,6 @@ fn finish_initial_config<C>(
     }
 }
 
-/// Local mirror of `reverie_rpc_transport::envelope::RequestEnvelope`, kept here
-/// so the injected guest `.so` need not link the transport crate's async
-/// runtime. The field order and types match exactly, so the `bincode` encoding
-/// is byte-identical and the tokio server decodes it transparently.
-#[derive(Serialize)]
-struct RequestEnvelope<Req> {
-    from: Tid,
-    request: Req,
-}
-
-fn encode<T: Serialize>(value: &T) -> Vec<u8> {
-    bincode::serde::encode_to_vec(value, bincode::config::legacy())
-        .expect("reverie-dbt sync_rpc: bincode encode failed")
-}
-
-fn decode<T: DeserializeOwned>(bytes: &[u8]) -> T {
-    let (value, _consumed) = bincode::serde::decode_from_slice(bytes, bincode::config::legacy())
-        .expect("reverie-dbt sync_rpc: bincode decode failed");
-    value
-}
-
-fn write_frame(stream: &mut UnixStream, payload: &[u8]) -> std::io::Result<()> {
-    let len = u32::try_from(payload.len()).expect("reverie-dbt sync_rpc: frame too large");
-    stream.write_all(&len.to_be_bytes())?;
-    stream.write_all(payload)?;
-    stream.flush()
-}
-
-fn read_frame(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
-    let mut header = [0u8; 4];
-    stream.read_exact(&mut header)?;
-    let len = u32::from_be_bytes(header) as usize;
-    assert!(
-        len <= MAX_FRAME_LEN,
-        "reverie-dbt sync_rpc: frame length {len} exceeds {MAX_FRAME_LEN}"
-    );
-    let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf)?;
-    Ok(buf)
-}
-
 struct Connection {
     pid: u32,
     path: PathBuf,
@@ -303,7 +252,7 @@ impl Connection {
             panic!("reverie-dbt sync_rpc: failed to connect to coordinator at {path:?}: {error}")
         });
         // Consume the server's one-shot config handshake frame.
-        let _config = read_frame(&mut stream).unwrap_or_else(|error| {
+        let _config = read_config_frame(&mut stream).unwrap_or_else(|error| {
             panic!("reverie-dbt sync_rpc: failed to read config handshake: {error}")
         });
         Self {
@@ -334,11 +283,7 @@ pub fn is_active() -> bool {
 /// [`reverie_rpc_transport::RpcClient`]'s `send_rpc` — if the coordinator that
 /// owns all shared state is unreachable, since there is no meaningful way to
 /// continue a deterministic run without it.
-pub fn send_rpc<Req, Resp>(from: Tid, request: Req) -> Resp
-where
-    Req: Serialize,
-    Resp: DeserializeOwned,
-{
+pub fn send_rpc<G: GlobalTool>(from: Tid, config: &G::Config, request: G::Request) -> G::Response {
     let path = PathBuf::from(
         std::env::var_os(RPC_SOCKET_ENV)
             .expect("reverie-dbt sync_rpc: no coordinator socket configured"),
@@ -358,12 +303,9 @@ where
         let connection = slot
             .as_mut()
             .expect("reverie-dbt sync_rpc: connection initialization failed");
-        let request_bytes = encode(&RequestEnvelope { from, request });
-        write_frame(&mut connection.stream, &request_bytes)
-            .expect("reverie-dbt sync_rpc: failed to write request frame");
-        let response_bytes = read_frame(&mut connection.stream)
-            .expect("reverie-dbt sync_rpc: failed to read response frame");
-        decode(&response_bytes)
+        BlockingRpcClient::<G>::from_borrowed_stream(&mut connection.stream, from, config)
+            .try_send_rpc(request)
+            .expect("reverie-dbt: background coordinator round trip failed")
     })
 }
 
@@ -374,21 +316,19 @@ where
 /// Rust's standard Unix socket and TLS implementations are not safe inside
 /// DynamoRIO's private loader. The native client supplies `invoke_syscall` so
 /// socket I/O can follow the same application-syscall path as tool injection.
-pub fn send_rpc_from_guest<Req, Resp>(
+pub fn send_rpc_from_guest<G: GlobalTool>(
     context: usize,
     invoke_syscall: SyscallInvoker,
     from: Tid,
-    request: Req,
-) -> Resp
-where
-    Req: Serialize,
-    Resp: DeserializeOwned,
-{
+    config: &G::Config,
+    request: G::Request,
+) -> G::Response {
     let path = PathBuf::from(
         std::env::var_os(RPC_SOCKET_ENV)
             .expect("reverie-dbt sync_rpc: no coordinator socket configured"),
     );
-    let request_bytes = encode(&RequestEnvelope { from, request });
+    let request = RpcRequest::<G>::new(from, request)
+        .expect("reverie-dbt: guest coordinator request encode failed");
     let response = match GUEST_CLIENT.try_lock() {
         Ok(mut slot) => {
             let pid = std::process::id();
@@ -408,7 +348,14 @@ where
             let connection = slot
                 .as_ref()
                 .expect("reverie-dbt sync_rpc: guest connection initialization failed");
-            guest_round_trip(context, invoke_syscall, connection.fd, &request_bytes)
+            guest_round_trip::<G>(
+                context,
+                invoke_syscall,
+                connection.fd,
+                from,
+                config,
+                request,
+            )
         }
         Err(TryLockError::Poisoned(poisoned)) => {
             let mut slot = poisoned.into_inner();
@@ -418,7 +365,14 @@ where
             }
             let connection = connect_guest(context, invoke_syscall, &path, pid)
                 .expect("reverie-dbt sync_rpc: failed to recover guest connection");
-            let response = guest_round_trip(context, invoke_syscall, connection.fd, &request_bytes);
+            let response = guest_round_trip::<G>(
+                context,
+                invoke_syscall,
+                connection.fd,
+                from,
+                config,
+                request,
+            );
             *slot = Some(connection);
             response
         }
@@ -428,13 +382,24 @@ where
             // so use an uncached connection instead of waiting forever.
             let connection = connect_guest(context, invoke_syscall, &path, std::process::id())
                 .expect("reverie-dbt sync_rpc: failed to connect contended guest socket");
-            let response = guest_round_trip(context, invoke_syscall, connection.fd, &request_bytes);
+            let response = guest_round_trip::<G>(
+                context,
+                invoke_syscall,
+                connection.fd,
+                from,
+                config,
+                request,
+            );
             close_guest(context, invoke_syscall, connection.fd);
             response
         }
     }
-    .expect("reverie-dbt sync_rpc: guest coordinator round trip failed");
-    decode(&response)
+    .expect("reverie-dbt: guest coordinator round trip failed");
+    // Deserialization may run Tool code. Preserve the old boundary: release
+    // the cache lease and retire an uncached socket before invoking it.
+    response
+        .decode()
+        .expect("reverie-dbt: guest coordinator response decode failed")
 }
 
 struct GuestConnection {
@@ -492,7 +457,12 @@ fn connect_guest(
                 0,
             ],
         )?;
-        let _config = read_frame_from_guest(context, invoke_syscall, fd)?;
+        let mut stream = GuestIo {
+            context,
+            invoke_syscall,
+            fd,
+        };
+        let _config = read_config_frame(&mut stream).map_err(io::Error::other)?;
         Ok(GuestConnection {
             pid,
             path: path.to_path_buf(),
@@ -505,14 +475,71 @@ fn connect_guest(
     result
 }
 
-fn guest_round_trip(
+fn guest_round_trip<G: GlobalTool>(
     context: usize,
     invoke_syscall: SyscallInvoker,
     fd: i32,
-    request: &[u8],
-) -> std::io::Result<Vec<u8>> {
-    write_frame_from_guest(context, invoke_syscall, fd, request)?;
-    read_frame_from_guest(context, invoke_syscall, fd)
+    from: Tid,
+    config: &G::Config,
+    request: RpcRequest<G>,
+) -> Result<RpcResponse<G>, RpcError> {
+    let mut stream = GuestIo {
+        context,
+        invoke_syscall,
+        fd,
+    };
+    BlockingRpcClient::<G>::from_borrowed_stream(&mut stream, from, config)
+        .receive_response(request)
+}
+
+// A non-owning stream valid only during the current native callback. Cached
+// GuestConnection values never contain this context or an invocation callback.
+struct GuestIo {
+    context: usize,
+    invoke_syscall: SyscallInvoker,
+    fd: i32,
+}
+
+impl Read for GuestIo {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        invoke(
+            self.context,
+            self.invoke_syscall,
+            libc::SYS_read,
+            [
+                self.fd as u64,
+                bytes.as_mut_ptr() as u64,
+                bytes.len() as u64,
+                0,
+                0,
+                0,
+            ],
+        )
+        .map(|count| count as usize)
+    }
+}
+
+impl Write for GuestIo {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        invoke(
+            self.context,
+            self.invoke_syscall,
+            libc::SYS_write,
+            [
+                self.fd as u64,
+                bytes.as_ptr() as u64,
+                bytes.len() as u64,
+                0,
+                0,
+                0,
+            ],
+        )
+        .map(|count| count as usize)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn close_guest(context: usize, invoke_syscall: SyscallInvoker, fd: i32) {
@@ -565,102 +592,15 @@ fn invoke(
     }
 }
 
-fn write_all_from_guest(
-    context: usize,
-    invoke_syscall: SyscallInvoker,
-    fd: i32,
-    mut bytes: &[u8],
-) -> std::io::Result<()> {
-    while !bytes.is_empty() {
-        match invoke(
-            context,
-            invoke_syscall,
-            libc::SYS_write,
-            [
-                fd as u64,
-                bytes.as_ptr() as u64,
-                bytes.len() as u64,
-                0,
-                0,
-                0,
-            ],
-        ) {
-            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
-            Ok(written) => bytes = &bytes[written as usize..],
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
-}
-
-fn read_exact_from_guest(
-    context: usize,
-    invoke_syscall: SyscallInvoker,
-    fd: i32,
-    mut bytes: &mut [u8],
-) -> std::io::Result<()> {
-    while !bytes.is_empty() {
-        match invoke(
-            context,
-            invoke_syscall,
-            libc::SYS_read,
-            [
-                fd as u64,
-                bytes.as_mut_ptr() as u64,
-                bytes.len() as u64,
-                0,
-                0,
-                0,
-            ],
-        ) {
-            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
-            Ok(read) => {
-                let (_, remaining) = bytes.split_at_mut(read as usize);
-                bytes = remaining;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
-}
-
-fn write_frame_from_guest(
-    context: usize,
-    invoke_syscall: SyscallInvoker,
-    fd: i32,
-    payload: &[u8],
-) -> std::io::Result<()> {
-    let len = u32::try_from(payload.len()).expect("reverie-dbt sync_rpc: frame too large");
-    write_all_from_guest(context, invoke_syscall, fd, &len.to_be_bytes())?;
-    write_all_from_guest(context, invoke_syscall, fd, payload)
-}
-
-fn read_frame_from_guest(
-    context: usize,
-    invoke_syscall: SyscallInvoker,
-    fd: i32,
-) -> std::io::Result<Vec<u8>> {
-    let mut header = [0_u8; 4];
-    read_exact_from_guest(context, invoke_syscall, fd, &mut header)?;
-    let len = u32::from_be_bytes(header) as usize;
-    if len > MAX_FRAME_LEN {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("reverie-dbt sync_rpc: frame length {len} exceeds {MAX_FRAME_LEN}"),
-        ));
-    }
-    let mut payload = vec![0_u8; len];
-    read_exact_from_guest(context, invoke_syscall, fd, &mut payload)?;
-    Ok(payload)
-}
+#[cfg(test)]
+mod shared_client_tests;
 
 #[cfg(test)]
 mod initial_config_tests {
     use std::os::unix::net::UnixListener;
     use std::time::Duration;
 
+    use reverie_rpc_transport::codec::encode;
     use serde::Deserialize;
 
     use super::*;
@@ -713,13 +653,13 @@ mod initial_config_tests {
         let path = directory.path().join("config.sock");
         let listener = UnixListener::bind(&path).unwrap();
         let expected = config();
-        let payload = encode(&expected);
+        let payload = encode(&expected).unwrap();
         let server = std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
-            write_frame(&mut socket, &payload).unwrap();
+            socket.write_all(&framed(&payload)).unwrap();
             // Keep the sending half open like the real coordinator waiting
             // for a request. A reader that waits for EOF cannot finish here.
             let mut request = [0_u8; 1];
@@ -727,13 +667,13 @@ mod initial_config_tests {
         });
         let actual: Config = read_initial_config(&path).unwrap();
         assert_eq!(actual, expected);
-        assert_eq!(encode(&actual), encode(&expected));
+        assert_eq!(encode(&actual).unwrap(), encode(&expected).unwrap());
         server.join().unwrap();
     }
 
     #[test]
     fn strict_initial_frame_rejects_truncation_size_decode_and_trailing_errors() {
-        let payload = encode(&config());
+        let payload = encode(&config()).unwrap();
         let header_error = with_server::<Config>(vec![0, 0, 0]).unwrap_err();
         assert!(matches!(header_error.primary,
             Some(InitialConfigFailure::Read(ref error))

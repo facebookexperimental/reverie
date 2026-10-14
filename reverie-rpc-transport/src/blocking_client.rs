@@ -50,6 +50,53 @@ pub struct BlockingRpcClient<G: GlobalTool, S = UnixStream> {
     _phantom: PhantomData<fn() -> G>,
 }
 
+/// A callback-scoped client borrowing an already configured connection.
+///
+/// The owner keeps the socket and configuration across callbacks. The borrowed
+/// stream may bind I/O to the current instrumentation callback; neither that
+/// context nor ownership of the descriptor escapes through this client. A
+/// fresh mutex protects this borrow, never an inherited client lock.
+pub struct BorrowedBlockingRpcClient<'a, G: GlobalTool, S> {
+    tid: Tid,
+    config: &'a G::Config,
+    stream: Mutex<&'a mut S>,
+}
+
+/// A shared-codec request prepared before entering an adapter's I/O lease.
+///
+/// Preparation runs the request's `Serialize` implementation. The owned bytes
+/// include the originating TID and convey no connection or admission authority.
+pub struct RpcRequest<G: GlobalTool> {
+    bytes: Vec<u8>,
+    _phantom: PhantomData<fn() -> G>,
+}
+
+impl<G: GlobalTool> RpcRequest<G> {
+    /// Serialize the same request envelope used by the owned blocking client.
+    pub fn new(from: Tid, request: G::Request) -> Result<Self, RpcError> {
+        Ok(Self {
+            bytes: encode(&RequestEnvelope { from, request })?,
+            _phantom: PhantomData,
+        })
+    }
+}
+
+/// A complete reply whose decoding may run after a callback releases its I/O owner.
+///
+/// This contains only owned wire bytes: no stream, lock, configuration or callback
+/// borrow. Receiving it has already completed the request/response exchange.
+pub struct RpcResponse<G: GlobalTool> {
+    bytes: Vec<u8>,
+    _phantom: PhantomData<fn() -> G>,
+}
+
+impl<G: GlobalTool> RpcResponse<G> {
+    /// Decode using the shared legacy RPC codec, consuming the complete reply.
+    pub fn decode(self) -> Result<G::Response, RpcError> {
+        decode(&self.bytes)
+    }
+}
+
 /// An owned client that completed the explicit InitialImage transport exchange.
 ///
 /// Private fields prevent constructing this from an ordinary RPC client. This
@@ -119,6 +166,24 @@ impl<G> BlockingRpcClient<G>
 where
     G: GlobalTool,
 {
+    /// Borrow a connection whose initial Config frame was already consumed.
+    ///
+    /// This does not connect, read a handshake, clone configuration, or take
+    /// ownership of the stream. The caller must retain exclusive use of the
+    /// connection for the whole borrow and provide its current request TID.
+    /// This ordinary RPC view conveys no InitialImage admission authority.
+    pub fn from_borrowed_stream<'a, S: Read + Write + Send>(
+        stream: &'a mut S,
+        tid: Tid,
+        config: &'a G::Config,
+    ) -> BorrowedBlockingRpcClient<'a, G, S> {
+        BorrowedBlockingRpcClient {
+            tid,
+            config,
+            stream: Mutex::new(stream),
+        }
+    }
+
     /// Connect and synchronously receive the coordinator's config handshake.
     pub fn connect(path: impl AsRef<Path>, tid: Tid) -> Result<Self, RpcError> {
         Self::from_connected_stream(UnixStream::connect(path)?, tid)
@@ -170,7 +235,7 @@ where
     /// Deserialization happens synchronously on the caller. Keep a separate
     /// stream/client for every thread that can have an independent pending RPC.
     pub fn from_connected_stream(mut stream: S, tid: Tid) -> Result<Self, RpcError> {
-        let config_bytes = read_message(&mut stream, DEFAULT_MAX_FRAME_LEN)?;
+        let config_bytes = read_config_frame(&mut stream)?;
         let config = decode(&config_bytes)?;
         Ok(Self {
             tid,
@@ -187,18 +252,58 @@ where
 
     /// Send one request and block until the coordinator returns its response.
     pub fn try_send_rpc(&self, message: G::Request) -> Result<G::Response, RpcError> {
-        let request_bytes = encode(&RequestEnvelope {
-            from: self.tid,
-            request: message,
-        })?;
+        let request = RpcRequest::<G>::new(self.tid, message)?;
         let mut stream = self.stream.lock().map_err(|_| {
             RpcError::Io(io::Error::other(
                 "reverie-rpc-transport: blocking client mutex poisoned",
             ))
         })?;
-        write_message(&mut *stream, &request_bytes)?;
-        let response_bytes = read_message(&mut *stream, DEFAULT_MAX_FRAME_LEN)?;
-        decode(&response_bytes)
+        decode(&exchange(&mut *stream, &request.bytes)?)
+    }
+}
+
+impl<G, S> BorrowedBlockingRpcClient<'_, G, S>
+where
+    G: GlobalTool,
+    S: Read + Write + Send,
+{
+    /// Send one request through the same framing and codec as an owned client.
+    pub fn try_send_rpc(&self, message: G::Request) -> Result<G::Response, RpcError> {
+        self.receive_response(RpcRequest::new(self.tid, message)?)?
+            .decode()
+    }
+
+    /// Complete the exchange without running the response's `Deserialize` code.
+    ///
+    /// Callback adapters can release their connection lease or close a temporary
+    /// socket before decoding. Errors and panics in user deserialization then
+    /// cannot retain those adapter-owned resources.
+    pub fn receive_response(&self, request: RpcRequest<G>) -> Result<RpcResponse<G>, RpcError> {
+        let mut stream = self.stream.lock().map_err(|_| {
+            RpcError::Io(io::Error::other(
+                "reverie-rpc-transport: blocking client mutex poisoned",
+            ))
+        })?;
+        Ok(RpcResponse {
+            bytes: exchange(&mut **stream, &request.bytes)?,
+            _phantom: PhantomData,
+        })
+    }
+}
+
+#[async_trait]
+impl<G, S> GlobalRPC<G> for BorrowedBlockingRpcClient<'_, G, S>
+where
+    G: GlobalTool,
+    S: Read + Write + Send,
+{
+    async fn send_rpc(&self, message: G::Request) -> G::Response {
+        self.try_send_rpc(message)
+            .expect("reverie-rpc-transport: blocking RPC to coordinator failed")
+    }
+
+    fn config(&self) -> &G::Config {
+        self.config
     }
 }
 
@@ -214,10 +319,7 @@ impl<G: GlobalTool> BlockingRpcClient<G> {
         message: G::Request,
         mut enter: impl FnMut(RawFd) -> Scope,
     ) -> Result<G::Response, RpcError> {
-        let request_bytes = encode(&RequestEnvelope {
-            from: self.tid,
-            request: message,
-        })?;
+        let request = RpcRequest::<G>::new(self.tid, message)?;
         let mut stream = self.stream.lock().map_err(|_| {
             RpcError::Io(io::Error::other(
                 "reverie-rpc-transport: blocking client mutex poisoned",
@@ -228,11 +330,25 @@ impl<G: GlobalTool> BlockingRpcClient<G> {
                 stream: &mut stream,
                 enter: &mut enter,
             };
-            write_message(&mut io, &request_bytes)?;
-            read_message(&mut io, DEFAULT_MAX_FRAME_LEN)?
+            exchange(&mut io, &request.bytes)?
         };
         decode(&response_bytes)
     }
+}
+
+/// Consume the coordinator's single initial configuration frame.
+///
+/// Some instrumentation engines obtain authoritative configuration separately
+/// and keep only connection ownership between callbacks. They still consume
+/// this frame using the same limits, partial-I/O and EOF handling as the owned
+/// blocking client. Strict consumers can apply [`crate::codec::decode_exact`].
+pub fn read_config_frame(stream: &mut impl Read) -> Result<Vec<u8>, RpcError> {
+    read_message(stream, DEFAULT_MAX_FRAME_LEN)
+}
+
+fn exchange(stream: &mut (impl Read + Write), request_bytes: &[u8]) -> Result<Vec<u8>, RpcError> {
+    write_message(stream, request_bytes)?;
+    read_message(stream, DEFAULT_MAX_FRAME_LEN)
 }
 
 #[async_trait]
@@ -317,6 +433,9 @@ fn read_message(stream: &mut impl Read, max_len: usize) -> Result<Vec<u8>, RpcEr
 
 #[cfg(test)]
 mod io_scope_tests;
+
+#[cfg(test)]
+mod borrowed_tests;
 
 #[cfg(test)]
 mod into_parts_tests {

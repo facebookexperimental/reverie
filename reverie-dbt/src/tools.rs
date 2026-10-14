@@ -2159,10 +2159,11 @@ fn dispatch_counter2(
     )?;
     if let Some(report) = report {
         if crate::sync_rpc::is_active() {
-            crate::sync_rpc::send_rpc_from_guest::<_, ()>(
+            crate::sync_rpc::send_rpc_from_guest::<Counter2Global>(
                 context,
                 invoke_syscall,
                 Pid::from_raw(tid),
+                &(),
                 report,
             );
         } else {

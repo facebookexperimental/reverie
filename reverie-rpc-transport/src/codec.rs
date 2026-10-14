@@ -137,6 +137,24 @@ where
     Ok(value)
 }
 
+/// Deserialize exactly one value, refusing unconsumed bytes in its frame.
+///
+/// Startup configuration consumers use this when accepting a prefix would
+/// silently discard part of the authoritative configuration. Ordinary RPC
+/// decoding retains its existing behavior in [`decode`].
+pub fn decode_exact<T>(bytes: &[u8]) -> Result<T, RpcError>
+where
+    T: DeserializeOwned,
+{
+    let (value, consumed) = bincode::serde::decode_from_slice(bytes, bincode::config::legacy())?;
+    if consumed != bytes.len() {
+        return Err(RpcError::TrailingBytes {
+            remaining: bytes.len() - consumed,
+        });
+    }
+    Ok(value)
+}
+
 /// Write `payload` as one length-prefixed frame and flush.
 pub async fn write_message<W>(writer: &mut W, payload: &[u8]) -> Result<(), RpcError>
 where
@@ -333,6 +351,22 @@ mod tests {
         assert!(matches!(
             decode_exact_bounded::<String, 32>(&declared_length),
             Err(RpcError::Decode(bincode::error::DecodeError::LimitExceeded))
+        ));
+    }
+
+    #[test]
+    fn strict_decode_checks_consumed_bytes_without_changing_ordinary_rpc() {
+        let mut bytes = encode(&73_u64).unwrap();
+        assert_eq!(decode_exact::<u64>(&bytes).unwrap(), 73);
+        bytes.extend_from_slice(&[4, 9]);
+        assert_eq!(decode::<u64>(&bytes).unwrap(), 73);
+        assert!(matches!(
+            decode_exact::<u64>(&bytes),
+            Err(RpcError::TrailingBytes { remaining: 2 })
+        ));
+        assert!(matches!(
+            decode_exact::<u64>(&bytes[..3]),
+            Err(RpcError::Decode(_))
         ));
     }
 

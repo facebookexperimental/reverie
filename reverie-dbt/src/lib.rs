@@ -528,9 +528,15 @@ where
         if crate::sync_rpc::is_active() {
             match self.guest_rpc {
                 Some((context, invoke_syscall)) => {
-                    crate::sync_rpc::send_rpc_from_guest(context, invoke_syscall, self.tid, message)
+                    crate::sync_rpc::send_rpc_from_guest::<T::GlobalState>(
+                        context,
+                        invoke_syscall,
+                        self.tid,
+                        self.config,
+                        message,
+                    )
                 }
-                None => crate::sync_rpc::send_rpc(self.tid, message),
+                None => crate::sync_rpc::send_rpc::<T::GlobalState>(self.tid, self.config, message),
             }
         } else {
             self.global_state.receive_rpc(self.tid, message).await
@@ -556,10 +562,11 @@ where
         // See `DbtGlobal::send_rpc`: prefer the cross-process coordinator when
         // one is configured, so fork/exec children share one GlobalState.
         if crate::sync_rpc::is_active() {
-            crate::sync_rpc::send_rpc_from_guest(
+            crate::sync_rpc::send_rpc_from_guest::<T::GlobalState>(
                 self.context,
                 self.invoke_syscall,
                 self.tid,
+                self.config,
                 message,
             )
         } else {
