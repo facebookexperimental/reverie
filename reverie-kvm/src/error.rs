@@ -410,6 +410,10 @@ pub enum Error {
     #[error("KVM userspace hypercall exits are not supported")]
     HypercallExitUnsupported,
 
+    /// The host kernel lacks `KVM_CAP_IMMEDIATE_EXIT` (Linux 4.11).
+    #[error("KVM immediate_exit is not supported")]
+    ImmediateExitUnsupported,
+
     /// The virtual CPU exposes neither the Intel nor AMD hypercall instruction.
     #[error("the virtual CPU exposes neither vmcall nor vmmcall")]
     HypercallInstructionUnsupported,

@@ -152,7 +152,7 @@ fn make_backend(tracked: bool) -> (KvmBackend, Arc<EntryGate>, Arc<RunProbe>) {
 
 fn assert_runs(probe: &RunProbe, tracked: bool, runs: usize, masks: usize) {
     let read = |value: &AtomicUsize| value.load(Ordering::SeqCst);
-    assert_eq!(read(&probe.prepare.mask_installs), masks);
+    assert_eq!(read(&probe.prepare.activations), masks);
     assert_eq!(read(&probe.untracked_runs), if tracked { 0 } else { runs });
     assert_eq!(read(&probe.tracked_runs), if tracked { runs } else { 0 });
     assert_eq!(read(&probe.clock_begins), if tracked { runs } else { 0 });
@@ -239,6 +239,8 @@ fn assert_member(gate: &EntryGate, id: CleanupIdentity, activity: Activity) {
 
 /// A closer's send: exactly one instance per recorded kick, as `try_close`
 /// sends. An entry refuses any instance beyond its recorded kicks.
+/// A thread-directed send to the calling thread is delivered before it
+/// returns, since every entry leaves signal 64 unblocked.
 fn send_one(thread: libc::pthread_t, sends: &AtomicUsize) -> std::io::Result<()> {
     let result = unsafe { libc::pthread_kill(thread, 64) };
     if result != 0 {
@@ -286,6 +288,10 @@ enum Race {
 fn race_case(kind: Race, blocked: bool, tracked: bool) {
     let restore = RestoreMask::install(blocked);
     let original = mask_bits();
+    let entered = original & !(1_u64 << 63);
+    // Instances this thread took before this case; each case adds its kick.
+    let base = signal::delivered_for_test();
+    let kicked = u64::from(kind != Race::Withdrawn);
     let pthread = unsafe { libc::pthread_self() };
     let (mut backend, gate, probe) = make_backend(tracked);
     let pending = Arc::new(PendingClose::default());
@@ -313,12 +319,12 @@ fn race_case(kind: Race, blocked: bool, tracked: bool) {
         .prepare
         .on_cleanup(CleanupPhase::BeforeWithdraw, move |id| {
             assert_eq!(id.run, 1);
-            assert_eq!(mask_bits(), original | (1_u64 << 63));
+            assert_eq!(mask_bits(), entered);
             assert!(
                 !pending_reserved(),
                 "the explicit early pending observation must be empty"
             );
-            assert_eq!(signal::HANDLER_ENTRIES.load(Ordering::Relaxed), 0);
+            assert_eq!(signal::delivered_for_test(), base);
             assert_runs(&before_probe.upgrade().unwrap(), tracked, 1, 1);
             assert_member(&before_gate, id, Activity::Running(pthread));
             before_phases
@@ -334,7 +340,8 @@ fn race_case(kind: Race, blocked: bool, tracked: bool) {
                         })
                         .unwrap()
                         .unwrap();
-                    assert!(pending_reserved());
+                    assert!(!pending_reserved());
+                    assert_eq!(signal::delivered_for_test(), base + 1);
                     before_pending.store(close);
                 }
                 Race::Withdrawn => {}
@@ -377,7 +384,7 @@ fn race_case(kind: Race, blocked: bool, tracked: bool) {
         .prepare
         .on_cleanup(CleanupPhase::AfterWithdraw, move |id| {
             assert_member(&after_gate, id, Activity::Retiring);
-            assert_eq!(mask_bits(), original | (1_u64 << 63));
+            assert_eq!(mask_bits(), entered);
             after_phases
                 .lock()
                 .unwrap()
@@ -393,6 +400,7 @@ fn race_case(kind: Race, blocked: bool, tracked: bool) {
                         .unwrap();
                     after_pending.store(close);
                     assert!(!pending_reserved());
+                    assert_eq!(signal::delivered_for_test(), base);
                     assert_eq!(after_sends.load(Ordering::SeqCst), 0);
                 }
                 Race::Serialized => {
@@ -402,11 +410,20 @@ fn race_case(kind: Race, blocked: bool, tracked: bool) {
                             .recv_timeout(WAIT)
                             .expect("sender did not finish after actual withdrawal contention"),
                     );
-                    assert!(pending_reserved());
+                    // The instance is delivered or still pending, never lost.
+                    // Read pending first: delivery is the only transition, so
+                    // an instance not pending then is already counted.
+                    let pending_then = pending_reserved();
+                    let delivered_now = signal::delivered_for_test();
+                    if pending_then {
+                        assert!(delivered_now == base || delivered_now == base + 1);
+                    } else {
+                        assert_eq!(delivered_now, base + 1);
+                    }
                     assert_eq!(after_sends.load(Ordering::SeqCst), 1);
                 }
                 Race::LateSend => {
-                    assert!(pending_reserved());
+                    assert_eq!(signal::delivered_for_test(), base + 1);
                 }
             }
             after_pending.assert_pending();
@@ -418,16 +435,12 @@ fn race_case(kind: Race, blocked: bool, tracked: bool) {
         .prepare
         .on_cleanup(CleanupPhase::BeforeAcknowledge, move |id| {
             assert_member(&ack_gate, id, Activity::Retiring);
-            assert_eq!(mask_bits(), original | (1_u64 << 63));
+            assert_eq!(mask_bits(), entered);
             assert!(
                 !pending_reserved(),
-                "mandatory final drain left a queued signal"
+                "kicked cleanup left a recorded kick undelivered"
             );
-            assert_eq!(
-                signal::HANDLER_ENTRIES.load(Ordering::Relaxed),
-                0,
-                "restoring an unblocked mask delivered a control signal instead of draining it"
-            );
+            assert_eq!(signal::delivered_for_test(), base + kicked);
             ack_phases
                 .lock()
                 .unwrap()
@@ -438,8 +451,8 @@ fn race_case(kind: Race, blocked: bool, tracked: bool) {
                 .store(ack_pending.wake.0.load(Ordering::SeqCst), Ordering::SeqCst);
         });
     assert!(matches!(backend.vcpu.run().unwrap(), Some(VcpuExit::Hlt)));
-    assert_eq!(mask_bits(), original | (1_u64 << 63));
-    assert_eq!(signal::HANDLER_ENTRIES.load(Ordering::Relaxed), 0);
+    assert_eq!(mask_bits(), entered);
+    assert_eq!(signal::delivered_for_test(), base + kicked);
     let expected_id = phases.lock().unwrap()[0].1;
     assert_eq!(
         *phases.lock().unwrap(),
@@ -464,6 +477,10 @@ fn race_case(kind: Race, blocked: bool, tracked: bool) {
     }
     assert_runs(&probe, tracked, 1, 1);
     drop(closed);
+    assert_eq!(
+        probe.prepare.kicked_cleanups.load(Ordering::SeqCst),
+        kicked as usize
+    );
     // A fresh close after the old generation is acknowledged cannot target it.
     let old_target_calls = AtomicUsize::new(0);
     let closed = gate
@@ -484,10 +501,11 @@ fn race_case(kind: Race, blocked: bool, tracked: bool) {
         assert_eq!(backend.vcpu.read_clock().unwrap(), 0);
     }
 
+    // The kick's immediate_exit was cleared, so this entry runs the guest.
     rewind(&mut backend);
     assert!(matches!(backend.vcpu.run().unwrap(), Some(VcpuExit::Hlt)));
     assert_eq!(sentinel(&backend), 2);
-    assert_eq!(mask_bits(), original | (1_u64 << 63));
+    assert_eq!(mask_bits(), entered);
     assert!(!pending_reserved());
     assert_runs(&probe, tracked, 2, 2);
     assert_member(
@@ -512,13 +530,13 @@ fn race_case(kind: Race, blocked: bool, tracked: bool) {
         if tracked {
             assert_eq!(backend.vcpu.read_clock().unwrap(), 0);
         }
-        assert_eq!(mask_bits(), other_mask | (1_u64 << 63));
+        assert_eq!(mask_bits(), other_mask & !(1_u64 << 63));
         assert!(!pending_reserved());
         drop(restore);
         backend
     });
     let backend = other.join().unwrap();
-    assert_eq!(mask_bits(), original | (1_u64 << 63));
+    assert_eq!(mask_bits(), entered);
     assert_runs(&probe, tracked, 3, 3);
     assert_member(
         &gate,
@@ -528,7 +546,7 @@ fn race_case(kind: Race, blocked: bool, tracked: bool) {
         },
         Activity::Stopped,
     );
-    assert_eq!(signal::HANDLER_ENTRIES.load(Ordering::Relaxed), 0);
+    assert_eq!(signal::delivered_for_test(), base + kicked);
     assert_eq!(
         contentions.load(Ordering::SeqCst),
         usize::from(kind == Race::Serialized)
@@ -553,17 +571,22 @@ fn count_identity(error: &Error, target: &Arc<Error>) -> usize {
     }
 }
 
+/// `selected[0]` fails the entry's signal setup, before activation;
+/// `selected[1]` fails a kicked entry's signal cleanup after its real
+/// accounting.
 fn error_case(blocked: bool, tracked: bool, selected: [bool; 2]) {
     let restore = RestoreMask::install(blocked);
     let original = mask_bits();
+    let entered = original & !(1_u64 << 63);
+    let base = signal::delivered_for_test();
     let (mut backend, gate, probe) = make_backend(tracked);
     let errors = [
         Arc::new(failure(
-            "install KVM temporary signal mask",
+            "unblock reserved host signal",
             std::io::Error::from_raw_os_error(libc::EACCES),
         )),
         Arc::new(failure(
-            "drain reserved host signal",
+            "account reserved host signal",
             std::io::Error::from_raw_os_error(libc::EIO),
         )),
     ];
@@ -575,12 +598,12 @@ fn error_case(blocked: bool, tracked: bool, selected: [bool; 2]) {
     probe
         .prepare
         .on_cleanup(CleanupPhase::BeforeWithdraw, move |id| {
-            assert_eq!(mask_bits(), original | (1_u64 << 63));
+            assert_eq!(mask_bits(), entered);
             assert!(!pending_reserved());
-            // The fault-control producer queues real signals while masked. The
+            // The fault-control producer records three kicks as a closer does
+            // and sends their real instances to this thread. The
             // sender/withdrawal authorization is covered by the separate race
-            // controls; this case isolates safe drain despite a reported error.
-            // It records its sends as a closer does, so the drain runs.
+            // controls; this case isolates the cleanup's error composition.
             if selected[1] {
                 before_gate
                     .state
@@ -593,7 +616,7 @@ fn error_case(blocked: bool, tracked: bool, selected: [bool; 2]) {
                 let sends = AtomicUsize::new(0);
                 send_three(unsafe { libc::pthread_self() }, &sends).unwrap();
                 assert_eq!(sends.load(Ordering::SeqCst), 3);
-                assert!(pending_reserved());
+                assert_eq!(signal::delivered_for_test(), base + 3);
             }
             before_phases
                 .lock()
@@ -619,15 +642,18 @@ fn error_case(blocked: bool, tracked: bool, selected: [bool; 2]) {
             assert_member(&ack_gate, id, Activity::Retiring);
             assert_eq!(
                 mask_bits(),
-                original | (1_u64 << 63),
-                "fault seam must keep only signal 64 blocked"
+                entered,
+                "fault seam must leave only signal 64 unblocked"
             );
             assert!(
                 !pending_reserved(),
-                "fault seam must retain actual complete drain"
+                "fault seam must retain the real delivery accounting"
             );
-            assert_eq!(signal::HANDLER_ENTRIES.load(Ordering::Relaxed), 0);
-            assert_eq!(ack_gate.pending_failure().is_some(), selected[0]);
+            assert_eq!(
+                signal::delivered_for_test(),
+                base + 3 * u64::from(selected[1])
+            );
+            assert!(ack_gate.pending_failure().is_none());
             ack_phases
                 .lock()
                 .unwrap()
@@ -644,24 +670,33 @@ fn error_case(blocked: bool, tracked: bool, selected: [bool; 2]) {
     );
     let error = match backend.vcpu.run() {
         Err(error) => error,
-        Ok(_) => panic!("reported mask failure admitted a successful exit"),
+        Ok(_) => panic!("reported signal failure admitted a successful exit"),
     };
     assert!(wake.0.load(Ordering::SeqCst) > 0);
     assert!(matches!(
         changed.as_mut().poll(&mut Context::from_waker(&waker)),
         Poll::Ready(Ok(()))
     ));
-    let id = phases.lock().unwrap()[0].1;
-    assert_eq!(id.run, 1);
-    assert_eq!(
-        *phases.lock().unwrap(),
-        vec![
-            (CleanupPhase::BeforeWithdraw, id),
-            (CleanupPhase::AfterWithdraw, id),
-            (CleanupPhase::BeforeAcknowledge, id),
-        ]
-    );
-    assert_member(&gate, id, Activity::Stopped);
+    if selected[0] {
+        // Setup failed before a RunEntry existed: no cleanup phase ran.
+        assert!(phases.lock().unwrap().is_empty());
+        let state = gate.state.lock().unwrap();
+        let member = state.members.values().next().unwrap();
+        assert_eq!(member.run, 1);
+        assert_eq!(member.activity, Activity::Stopped);
+    } else {
+        let id = phases.lock().unwrap()[0].1;
+        assert_eq!(id.run, 1);
+        assert_eq!(
+            *phases.lock().unwrap(),
+            vec![
+                (CleanupPhase::BeforeWithdraw, id),
+                (CleanupPhase::AfterWithdraw, id),
+                (CleanupPhase::BeforeAcknowledge, id),
+            ]
+        );
+        assert_member(&gate, id, Activity::Stopped);
+    }
     let pending = gate.pending_failure().unwrap();
     let retained = pending.error();
     for index in 0..2 {
@@ -686,12 +721,15 @@ fn error_case(blocked: bool, tracked: bool, selected: [bool; 2]) {
     assert!(
         matches!(error.primary(), Error::EntryControl { source, .. } if source.raw_os_error() == Some(expected_errno))
     );
-    assert_eq!(mask_bits(), original | (1_u64 << 63));
+    // A setup failure precedes the unblock; a cleanup failure leaves the
+    // unblocked mask every entry leaves.
+    assert_eq!(mask_bits(), if selected[0] { original } else { entered });
     assert!(!pending_reserved());
-    assert_runs(&probe, tracked, usize::from(!selected[0]), 1);
+    let ran = usize::from(!selected[0]);
+    assert_runs(&probe, tracked, ran, ran);
     // The failed gate cannot be reopened by an apparent successful retirement.
     assert!(backend.vcpu.run().is_err());
-    assert_runs(&probe, tracked, usize::from(!selected[0]), 1);
+    assert_runs(&probe, tracked, ran, ran);
     assert!(gate.admit_operation().is_err());
     assert!(gate.register().is_err());
     assert!(gate.try_copy(None).is_err());
@@ -703,24 +741,27 @@ fn error_case(blocked: bool, tracked: bool, selected: [bool; 2]) {
     drop(guard);
     drop(backend);
     assert!(gate.state.lock().unwrap().members.is_empty());
-    // A separate actual vCPU on this host thread must not find a stale signal
-    // or a stranded mask, even though the old Mapping remains terminal.
+    // A separate actual vCPU on this host thread must not find an unexplained
+    // instance, even though the old Mapping remains terminal.
     let (mut fresh, fresh_gate, fresh_probe) = make_backend(tracked);
     assert!(matches!(fresh.vcpu.run().unwrap(), Some(VcpuExit::Hlt)));
     assert_eq!(sentinel(&fresh), 1);
     assert_runs(&fresh_probe, tracked, 1, 1);
-    assert_eq!(mask_bits(), original | (1_u64 << 63));
+    assert_eq!(mask_bits(), entered);
     assert!(!pending_reserved());
-    assert_eq!(signal::HANDLER_ENTRIES.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        signal::delivered_for_test(),
+        base + 3 * u64::from(selected[1])
+    );
     drop(fresh);
     assert!(fresh_gate.state.lock().unwrap().members.is_empty());
     drop(restore);
 }
 
 #[test]
-fn late_kick_after_successful_exit_is_drained_before_acknowledgement() {
+fn late_kick_after_successful_exit_is_accounted_before_acknowledgement() {
     isolated(
-        "entry::cleanup_tests::late_kick_after_successful_exit_is_drained_before_acknowledgement",
+        "entry::cleanup_tests::late_kick_after_successful_exit_is_accounted_before_acknowledgement",
         |blocked| {
             for tracked in [false, true] {
                 race_case(Race::LateSend, blocked, tracked);
@@ -742,9 +783,9 @@ fn withdrawn_real_entry_has_no_sender_until_final_cleanup_acknowledges() {
 }
 
 #[test]
-fn real_withdrawal_waits_for_serialized_sender_and_drains_its_kick() {
+fn real_withdrawal_waits_for_serialized_sender_and_accounts_its_kick() {
     isolated(
-        "entry::cleanup_tests::real_withdrawal_waits_for_serialized_sender_and_drains_its_kick",
+        "entry::cleanup_tests::real_withdrawal_waits_for_serialized_sender_and_accounts_its_kick",
         |blocked| {
             for tracked in [false, true] {
                 race_case(Race::Serialized, blocked, tracked);
@@ -754,12 +795,14 @@ fn real_withdrawal_waits_for_serialized_sender_and_drains_its_kick() {
 }
 
 #[test]
-fn mask_operation_errors_poison_after_safe_real_cleanup_and_preserve_causes() {
+fn signal_operation_errors_poison_after_safe_real_cleanup_and_preserve_causes() {
     isolated(
-        "entry::cleanup_tests::mask_operation_errors_poison_after_safe_real_cleanup_and_preserve_causes",
+        "entry::cleanup_tests::signal_operation_errors_poison_after_safe_real_cleanup_and_preserve_causes",
         |blocked| {
             for tracked in [false, true] {
-                for selected in [[true, false], [false, true], [true, true]] {
+                // A setup failure leaves no cleanup to fail, so the two
+                // seams cannot both fire in one entry.
+                for selected in [[true, false], [false, true]] {
                     error_case(blocked, tracked, selected);
                 }
             }

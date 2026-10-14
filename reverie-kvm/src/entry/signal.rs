@@ -9,23 +9,41 @@
 //! The embedding process reserves Linux signal 64 for KVM entry control.
 //! SIGURG remains the independent worker-cancellation signal.
 //!
-//! Signal 64 is blocked on a vCPU thread from its first entry on and stays
-//! blocked: only `KVM_RUN` unblocks it, through the per-vCPU KVM signal mask.
-//! An entry therefore costs one `pthread_sigmask` (which also reads the thread
-//! mask) and reissues `KVM_SET_SIGNAL_MASK` only when that mask has changed.
+//! A closer interrupts a running vCPU by sending signal 64 to its thread, and
+//! the thread's handler stops the vCPU as QEMU's and Firecracker's do. Signal
+//! 64 is unblocked on a vCPU thread from its first entry on. The handler
+//! counts the delivery and, while an entry is published on the thread, sets
+//! that vCPU's `kvm_run.immediate_exit` byte. An instance arriving inside
+//! `KVM_RUN` ends it with EINTR. One arriving after the entry's signal setup
+//! but before `KVM_RUN` runs the handler outside it, and `immediate_exit` then
+//! makes `KVM_RUN` return EINTR without entering the guest. `KVM_RUN`
+//! therefore runs under the thread's own signal mask, with no KVM signal mask
+//! to keep in sync, and an entry issues no host syscall besides `KVM_RUN`.
 //!
-//! An instance already pending when an entry starts has no sender and
-//! refuses the entry before `KVM_RUN`. After that, an entry drains the signal
-//! only after a closer recorded a kick or `KVM_RUN` failed. Signal 64 is
-//! deliverable inside `KVM_RUN`, so an instance arriving while it runs makes
-//! it fail with EINTR, and the drain refuses any instance beyond the recorded
-//! kicks. An unrecorded instance that arrives after an exit stays pending,
-//! because the signal is blocked, and refuses the thread's next entry.
+//! Each thread counts the instances its handler took and the kicks closers
+//! recorded against its entries, and the two must agree. An entry refuses to
+//! start if more instances arrived than kicks were recorded: one had no
+//! sender. A kicked entry's cleanup first makes sure every recorded kick has
+//! been delivered, then refuses any instance beyond them, and refuses a kick
+//! that was never delivered (signal 64 blocked again on this thread).
+//!
+//! Two consequences belong to the embedding contract. A foreign signal 64 is
+//! not left pending: the handler takes it at once, which can interrupt a host
+//! call this thread is making, and the thread's next entry refuses. And code
+//! that blocks signal 64 again on a vCPU thread breaks prompt interruption:
+//! a kick then cannot end a `KVM_RUN` that is already running. Entries
+//! re-check that signal 64 is unblocked every [`RECHECK_ENTRIES`] entries and
+//! refuse if it was blocked again, which bounds how long that can go unseen
+//! without a per-entry system call.
 
+use std::cell::Cell;
 use std::marker::PhantomData;
-use std::os::fd::AsRawFd;
 use std::rc::Rc;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicPtr;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use kvm_ioctls::VcpuFd;
 
@@ -34,18 +52,50 @@ use super::protocol_failure;
 use crate::Result;
 
 const SIGNAL: libc::c_int = 64;
-// _IOW(KVMIO, 0x8b, struct kvm_signal_mask). The fixed header is four
-// bytes; the eight-byte sigset is the struct's flexible-array payload.
-const KVM_SET_SIGNAL_MASK: libc::c_ulong = 0x4004_ae8b;
 
-#[cfg(test)]
-pub(super) static HANDLER_ENTRIES: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    /// Instances of the reserved signal that this thread's handler has taken.
+    static DELIVERED: AtomicU64 = const { AtomicU64::new(0) };
+    /// Kicks that closers recorded against this thread's finished entries.
+    static RECORDED: Cell<u64> = const { Cell::new(0) };
+    /// The participant whose entry last unblocked the reserved signal here.
+    static UNBLOCKED_FOR: Cell<u64> = const { Cell::new(0) };
+    /// Entries since this thread last unblocked or re-checked the signal.
+    static SINCE_CHECK: Cell<u32> = const { Cell::new(0) };
+    /// The `immediate_exit` byte of the vCPU whose entry is published on this
+    /// thread, or null. Only this thread and its signal handler touch it.
+    static PUBLISHED_EXIT: AtomicPtr<u8> = const { AtomicPtr::new(std::ptr::null_mut()) };
+}
+
+/// How many entries of one participant on one thread may pass before the next
+/// re-checks that signal 64 is still unblocked: one system call per this many
+/// entries.
+pub(super) const RECHECK_ENTRIES: u32 = 1024;
 
 extern "C" fn interrupt(_signal: libc::c_int) {
-    // x86-64's native atomic increment performs no allocation or locking.
-    #[cfg(test)]
-    HANDLER_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // A const-initialized thread local without a destructor, in a crate linked
+    // into an executable, is a plain initial-exec TLS access: no allocation,
+    // locking or lazy registration. These are single atomic instructions.
+    DELIVERED.with(|delivered| delivered.fetch_add(1, Ordering::Relaxed));
+    let published = PUBLISHED_EXIT.with(|exit| exit.load(Ordering::Relaxed));
+    if !published.is_null() {
+        // SAFETY: an entry publishes the byte only while its vCPU's kvm_run
+        // mapping is alive, and unpublishes it on this same thread first.
+        unsafe { AtomicU8::from_ptr(published) }.store(1, Ordering::Relaxed);
+    }
+}
+
+fn delivered() -> u64 {
+    DELIVERED.with(|delivered| delivered.load(Ordering::Relaxed))
+}
+
+static NEXT_PARTICIPANT_KEY: AtomicU64 = AtomicU64::new(1);
+
+/// A process-unique key for one participant. Its first entry on a thread
+/// unblocks the reserved signal there, so a vCPU that moves to another thread,
+/// or a new vCPU on a thread whose mask was replaced, unblocks it again.
+pub(super) fn participant_key() -> u64 {
+    NEXT_PARTICIPANT_KEY.fetch_add(1, Ordering::Relaxed)
 }
 
 fn last_error(operation: &'static str) -> crate::Error {
@@ -62,7 +112,7 @@ fn install_handler() -> Result<()> {
     static INSTALL: OnceLock<std::result::Result<usize, i32>> = OnceLock::new();
     let result = INSTALL.get_or_init(|| {
         // SAFETY: the supplied action storage is initialized and lives through
-        // each call. The handler performs no work, allocation or locking.
+        // each call. The handler performs no allocation or locking.
         unsafe {
             let mut old: libc::sigaction = std::mem::zeroed();
             if libc::sigaction(SIGNAL, std::ptr::null(), &mut old) != 0 {
@@ -75,6 +125,9 @@ fn install_handler() -> Result<()> {
             }
             let mut action: libc::sigaction = std::mem::zeroed();
             action.sa_sigaction = interrupt as *const () as usize;
+            // A kick that lands outside KVM_RUN must not fail an unrelated
+            // restartable host syscall on the vCPU thread.
+            action.sa_flags = libc::SA_RESTART;
             libc::sigemptyset(&mut action.sa_mask);
             if libc::sigaction(SIGNAL, &action, std::ptr::null_mut()) != 0 {
                 return Err(std::io::Error::last_os_error()
@@ -82,7 +135,7 @@ fn install_handler() -> Result<()> {
                     .unwrap_or(libc::EIO));
             }
             // Retain the exact address passed to the kernel. In optimized
-            // builds the linker may fold this empty handler with another empty
+            // builds the linker may fold this handler with another identical
             // handler, while separate function-pointer materializations still
             // name distinct symbols. Re-evaluating `interrupt as usize` below
             // can therefore reject the disposition we just installed.
@@ -101,9 +154,8 @@ fn install_handler() -> Result<()> {
     // A default-disposition check cannot exclude a future foreign owner. The
     // lifetime reservation is an embedding contract; detect a visible change
     // at each thread's first entry rather than silently replacing a library's
-    // handler. A change after that is not seen on that thread. The handler
-    // never runs in this protocol anyway: the signal is blocked outside
-    // KVM_RUN and drained before the thread unblocks it.
+    // handler. A change after that is not seen on that thread; its kicks would
+    // then go uncounted, which a kicked entry's cleanup refuses.
     unsafe {
         let mut current: libc::sigaction = std::mem::zeroed();
         if libc::sigaction(SIGNAL, std::ptr::null(), &mut current) != 0 {
@@ -128,189 +180,190 @@ fn only_reserved_signal() -> libc::sigset_t {
     }
 }
 
-/// The KVM_RUN mask for a thread whose own mask is `saved`: the same signals,
-/// except that the reserved signal is always deliverable inside `KVM_RUN`.
-fn kvm_mask_bits(saved: &libc::sigset_t) -> Result<u64> {
-    let mut bits = 0u64;
-    for signal in 1..=64 {
-        // SAFETY: saved is a valid libc sigset and the queried number is valid.
-        match unsafe { libc::sigismember(saved, signal) } {
-            0 => {}
-            1 => bits |= 1u64 << (signal - 1),
-            _ => return Err(last_error("read saved signal mask")),
+/// Unblock the reserved signal for `key`'s first entry on this thread, and
+/// again every [`RECHECK_ENTRIES`] entries after that. Linux delivers an
+/// instance already pending here before the call returns, so the entry's
+/// check that follows counts it. A re-check that finds the signal blocked
+/// again by someone else refuses.
+fn unblock(key: u64) -> Result<()> {
+    let same = UNBLOCKED_FOR.get() == key;
+    if same {
+        let since = SINCE_CHECK.get() + 1;
+        if since < RECHECK_ENTRIES {
+            SINCE_CHECK.set(since);
+            return Ok(());
         }
     }
-    Ok(bits & !(1u64 << (SIGNAL - 1)))
+    let set = only_reserved_signal();
+    // SAFETY: both sets are valid storage; the change affects only this thread.
+    let mut previous = unsafe { std::mem::zeroed() };
+    let error = unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, &mut previous) };
+    if error != 0 {
+        return Err(failure(
+            "unblock reserved host signal",
+            std::io::Error::from_raw_os_error(error),
+        ));
+    }
+    UNBLOCKED_FOR.set(key);
+    SINCE_CHECK.set(0);
+    // SAFETY: previous is the libc sigset pthread_sigmask just wrote.
+    if same && unsafe { libc::sigismember(&previous, SIGNAL) } == 1 {
+        return Err(protocol_failure(
+            "reserved host signal blocked again on a vCPU thread",
+        ));
+    }
+    Ok(())
 }
 
-fn ioctl_mask(bits: u64) -> [u8; 12] {
-    let mut bytes = [0; 12];
-    bytes[..4].copy_from_slice(&8u32.to_ne_bytes());
-    bytes[4..].copy_from_slice(&bits.to_ne_bytes());
-    bytes
+/// Return to user space through the kernel once. Linux delivers every pending
+/// unblocked signal before a system call returns, so after this the handler
+/// has taken each instance that was queued for this thread before the call.
+fn deliver_pending() {
+    // SAFETY: getppid has no arguments and no memory effects. It is a real
+    // system call (no vDSO entry), which is all this needs.
+    unsafe { libc::syscall(libc::SYS_getppid) };
 }
 
-/// The KVM_RUN signal mask last installed on one vCPU. KVM keeps a vCPU's mask
-/// until it is replaced, so it is owned next to the vCPU fd and starts empty:
-/// a new vCPU has no mask, and its first entry must install one.
-#[derive(Debug, Default)]
-pub(crate) struct InstalledMask(Option<u64>);
+/// The `immediate_exit` byte of one vCPU's shared `kvm_run` page, which the
+/// kick handler sets so that a kick landing before `KVM_RUN` still keeps the
+/// guest from running.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ImmediateExit(std::ptr::NonNull<u8>);
 
-/// One entry's view of the thread mask. The reserved signal stays blocked
-/// after the entry; [`Mask::finish`] only drains instances sent during it.
-pub(super) struct Mask {
-    saved: libc::sigset_t,
+// SAFETY: the byte is accessed only on the thread running an entry for its
+// vCPU: by that thread's signal handler while the entry is published, and by
+// the entry's cleanup after unpublishing. Both use single-byte atomics, and the
+// kernel reads the byte with READ_ONCE at each KVM_RUN. kvm-ioctls'
+// VcpuFd::run forms a `&mut kvm_run` over the mapped page after KVM_RUN
+// returns, and a late handler run can store this byte while it exists. That
+// is the store Firecracker makes through kvm-ioctls from the same handler
+// position, kvm-ioctls never touches immediate_exit through that reference,
+// and the kernel itself writes this page. Moving the value between threads
+// moves only the address.
+unsafe impl Send for ImmediateExit {}
+// SAFETY: as for Send; a shared reference permits only copying the address.
+unsafe impl Sync for ImmediateExit {}
+
+impl ImmediateExit {
+    /// # Safety
+    ///
+    /// The vCPU's `kvm_run` mapping must outlive every entry prepared with the
+    /// result. The mapping's address does not change when the fd moves.
+    pub(crate) unsafe fn new(fd: &mut VcpuFd) -> Self {
+        Self(std::ptr::NonNull::from(
+            &mut fd.get_kvm_run().immediate_exit,
+        ))
+    }
+
+    fn clear(self) {
+        // SAFETY: the byte lives in the vCPU's mapped kvm_run page, which the
+        // caller's entry keeps alive; see the Send impl for its accesses.
+        unsafe { AtomicU8::from_ptr(self.0.as_ptr()) }.store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get(self) -> bool {
+        // SAFETY: as for clear.
+        unsafe { AtomicU8::from_ptr(self.0.as_ptr()) }.load(Ordering::Relaxed) != 0
+    }
+}
+
+/// One entry's reserved-signal accounting on its own thread. While it lives,
+/// the handler stops the entry's vCPU.
+pub(super) struct Control {
+    immediate_exit: Option<ImmediateExit>,
     _same_thread: PhantomData<Rc<()>>,
 }
 
-impl Mask {
-    pub(super) fn block() -> Result<Self> {
-        install_handler()?;
-        let set = only_reserved_signal();
-        // SAFETY: the mask and saved-mask storage are valid. pthread_sigmask
-        // affects only this thread, whose guard is deliberately not Send.
-        // After the thread's first entry the signal is already blocked, and
-        // this call only reads the current mask for the KVM_RUN mask.
-        let mut saved = unsafe { std::mem::zeroed() };
-        let error = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut saved) };
-        if error != 0 {
-            return Err(failure(
-                "block reserved host signal",
-                std::io::Error::from_raw_os_error(error),
-            ));
-        }
-        // No gate sender can know this thread until entry publication, and
-        // the previous entry drained every instance a closer sent to it. An
-        // already pending instance therefore has no legitimate sender. This
-        // check stays even though the drain also counts instances: at the
-        // pending-signal limit, an unrecorded instance can exist only as a
-        // pending bit, which a later recorded kick's queued instance absorbs,
-        // so the drain could not tell them apart.
-        let check = (|| {
-            let mut pending = unsafe { std::mem::zeroed() };
-            if unsafe { libc::sigpending(&mut pending) } != 0 {
-                return Err(last_error("query pending reserved host signal"));
-            }
-            if unsafe { libc::sigismember(&pending, SIGNAL) } != 0 {
-                return Err(protocol_failure(
-                    "unexplained reserved host signal before entry",
-                ));
-            }
-            Ok(())
-        })();
-        if let Err(error) = check {
-            // This signal was not sent by us. Do not synchronously consume it:
-            // put back the mask this call found, which leaves it pending.
-            let cleanup = restore(&saved);
-            return Err(match cleanup {
-                Ok(()) => error,
-                Err(cleanup) => error.with_cleanup(vec![cleanup]),
-            });
-        }
-        Ok(Self {
-            saved,
-            _same_thread: PhantomData,
-        })
-    }
-
-    /// Make `installed` this entry's KVM_RUN mask. Returns whether the ioctl
-    /// was issued; an unchanged mask is already installed on this vCPU.
-    pub(super) fn install(&self, fd: &VcpuFd, installed: &mut InstalledMask) -> Result<bool> {
+impl Control {
+    /// `immediate_exit` belongs to the vCPU this entry runs; tests that run
+    /// no vCPU pass None.
+    pub(super) fn arm(key: u64, immediate_exit: Option<ImmediateExit>) -> Result<Self> {
         #[cfg(test)]
         if let Some(error) = fault::take(0) {
-            // Inject before the ioctl. The enclosing real RunEntry must still
-            // withdraw, finish its actual mask, poison and acknowledge.
-            installed.0 = None;
             return Err(crate::Error::SharedFailure(error));
         }
-        let bits = kvm_mask_bits(&self.saved)?;
-        if installed.0 == Some(bits) {
-            return Ok(false);
+        install_handler()?;
+        unblock(key)?;
+        // Publish first: from here on any instance, a kick or a stray, stops
+        // this vCPU's next KVM_RUN before it enters the guest. The fence keeps
+        // the compiler from moving the count read above the publication, so an
+        // instance either is counted below or finds the vCPU published.
+        let exit = immediate_exit.map_or(std::ptr::null_mut(), |exit| exit.0.as_ptr());
+        PUBLISHED_EXIT.with(|published| published.store(exit, Ordering::Relaxed));
+        std::sync::atomic::compiler_fence(Ordering::SeqCst);
+        let mut control = Self {
+            immediate_exit,
+            _same_thread: PhantomData,
+        };
+        // Every instance a closer sent to an earlier entry was delivered and
+        // counted before that entry acknowledged, and no closer can know this
+        // entry before it is published. An extra instance has no sender.
+        if delivered() != RECORDED.get() {
+            control.unpublish();
+            return Err(protocol_failure(
+                "unexplained reserved host signal before entry",
+            ));
         }
-        // A failed ioctl leaves the vCPU's mask unknown.
-        installed.0 = None;
-        let bytes = ioctl_mask(bits);
-        // SAFETY: Linux copies the four-byte length followed immediately by
-        // eight mask bytes. There is no padded u64 field or unaligned reference.
-        // fd is live, and the kernel only reads this buffer during the ioctl.
-        if unsafe { libc::ioctl(fd.as_raw_fd(), KVM_SET_SIGNAL_MASK, bytes.as_ptr()) } != 0 {
-            return Err(last_error("install KVM temporary signal mask"));
-        }
-        installed.0 = Some(bits);
-        Ok(true)
+        Ok(control)
     }
 
-    /// Returns how many instances it consumed.
-    fn drain(&self) -> Result<usize> {
+    /// Stop the handler from touching this entry's vCPU, then clear any
+    /// immediate_exit it set so the vCPU's next KVM_RUN enters the guest.
+    /// The handler runs on this thread, so it either finished before the
+    /// unpublish or sees null after it; the fence keeps the clear after it.
+    fn unpublish(&mut self) {
+        PUBLISHED_EXIT.with(|published| published.store(std::ptr::null_mut(), Ordering::Relaxed));
+        std::sync::atomic::compiler_fence(Ordering::SeqCst);
+        if let Some(exit) = self.immediate_exit.take() {
+            exit.clear();
+        }
+    }
+
+    /// The registry must have withdrawn the send target before this call;
+    /// `kicks` is what withdrawal reported. Every recorded send completed
+    /// under the registry lock, so each successful one is pending for this
+    /// thread or already delivered (the signal is real-time, so instances do
+    /// not merge). A send that failed after being counted has already failed
+    /// the gate. Returns whether the entry was kicked.
+    pub(super) fn finish(mut self, kicks: usize) -> Result<bool> {
         #[cfg(test)]
         if let Some(error) = fault::take(1) {
             // The one-shot is removed before recursion. Perform the real
-            // operation for host safety, then exercise its error composition.
-            let actual = self.drain();
+            // accounting, then exercise its error composition.
+            let actual = self.finish(kicks);
             let injected = crate::Error::SharedFailure(error);
             return Err(match actual {
                 Ok(_) => injected,
                 Err(actual) => injected.with_cleanup(vec![actual]),
             });
         }
-        let set = only_reserved_signal();
-        let timeout = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        let mut drained = 0;
-        loop {
-            // SAFETY: the mask and timespec are live; no siginfo is requested.
-            // The reserved signal stays blocked on this thread through drain.
-            let signal = unsafe { libc::sigtimedwait(&set, std::ptr::null_mut(), &timeout) };
-            if signal == SIGNAL {
-                drained += 1;
-                continue;
-            }
-            if signal != -1 {
-                return Err(protocol_failure("drain returned an unrequested signal"));
-            }
-            match std::io::Error::last_os_error().raw_os_error() {
-                Some(libc::EINTR) => continue,
-                Some(libc::EAGAIN) => return Ok(drained),
-                _ => return Err(last_error("drain reserved host signal")),
-            }
+        let kicked = kicks != 0;
+        if kicked {
+            RECORDED.set(RECORDED.get().saturating_add(kicks as u64));
+            // Always, even when the counts already agree: a stray delivered
+            // during the entry could stand in for a kick still in flight,
+            // which would otherwise land later in an unrelated host call.
+            deliver_pending();
         }
-    }
-
-    /// The registry must have withdrawn the send target before this call;
-    /// `kicks` is what withdrawal reported. Every recorded send completed
-    /// under the registry lock, so each successful one queued its instance
-    /// before withdrawal (the signal is real-time, so instances do not
-    /// merge). A send that failed after being counted has already failed the
-    /// gate. Draining more instances than recorded kicks means one had no
-    /// recorded sender. The
-    /// reserved signal stays blocked, so nothing sent after the drain can be
-    /// delivered outside a later entry's `KVM_RUN`. Returns whether it drained.
-    pub(super) fn finish(self, kicks: usize, run: super::RunOutcome) -> Result<bool> {
-        if kicks == 0 && run == super::RunOutcome::Exited {
-            return Ok(false);
-        }
-        let drained = self.drain()?;
-        if drained > kicks {
+        self.unpublish();
+        let (delivered, recorded) = (delivered(), RECORDED.get());
+        if delivered > recorded {
             return Err(protocol_failure(
                 "unexplained reserved host signal during entry",
             ));
         }
-        Ok(true)
+        if delivered < recorded {
+            return Err(protocol_failure("recorded kick was not delivered"));
+        }
+        Ok(kicked)
     }
 }
 
-fn restore(saved: &libc::sigset_t) -> Result<()> {
-    // SAFETY: saved is this same thread's complete libc sigset.
-    let error = unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, saved, std::ptr::null_mut()) };
-    if error == 0 {
-        Ok(())
-    } else {
-        Err(failure(
-            "restore host signal mask",
-            std::io::Error::from_raw_os_error(error),
-        ))
+impl Drop for Control {
+    fn drop(&mut self) {
+        // Idempotent; finish already did this on every ordinary path.
+        self.unpublish();
     }
 }
 
@@ -383,6 +436,20 @@ pub(super) mod fault {
     }
 }
 
+/// Instances this thread's handler has taken, for tests.
+#[cfg(test)]
+pub(crate) fn delivered_for_test() -> u64 {
+    delivered()
+}
+
+/// Treat every instance delivered to this thread so far as explained. A test
+/// that deliberately sends an unrecorded instance calls this before the
+/// thread's next entry, as it would otherwise refuse every later entry.
+#[cfg(test)]
+pub(crate) fn accept_delivered_for_test() {
+    RECORDED.set(delivered());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,23 +477,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn kernel_mask_uses_the_flexible_array_offset() {
-        let mut saved = only_reserved_signal();
-        unsafe {
-            assert_eq!(libc::sigaddset(&mut saved, libc::SIGHUP), 0);
-            assert_eq!(libc::sigaddset(&mut saved, libc::SIGUSR1), 0);
-            assert_eq!(libc::sigaddset(&mut saved, libc::SIGURG), 0);
+    fn operation(error: &crate::Error) -> &'static str {
+        match error.primary() {
+            crate::Error::EntryControl { operation, .. } => operation,
+            other => panic!("not an entry-control error: {other:?}"),
         }
-        let bytes = ioctl_mask(kvm_mask_bits(&saved).unwrap());
-        assert_eq!(bytes.len(), 12);
-        assert_eq!(u32::from_ne_bytes(bytes[0..4].try_into().unwrap()), 8);
-        let bits = u64::from_ne_bytes(bytes[4..12].try_into().unwrap());
-        assert_eq!(
-            bits,
-            1 | (1 << (libc::SIGUSR1 - 1)) | (1 << (libc::SIGURG - 1))
-        );
-        assert_eq!(bits & (1u64 << 63), 0);
     }
 
     extern "C" fn foreign_handler(_: i32) {}
@@ -435,8 +490,8 @@ mod tests {
     fn reserved_signal_protocol() {
         const CHILD: &str = "REVERIE_KVM_ENTRY_SIGNAL_CHILD";
         let Ok(case) = std::env::var(CHILD) else {
-            // Disposition ownership and unexplained pending signals are tested
-            // in fresh processes. They must not alter the parallel test runner.
+            // Disposition ownership and unexplained signals are tested in
+            // fresh processes. They must not alter the parallel test runner.
             for case in [
                 "blocked",
                 "unblocked",
@@ -445,6 +500,7 @@ mod tests {
                 "ignored",
                 "foreign",
                 "replaced",
+                "reblocked",
             ] {
                 let output = std::process::Command::new(std::env::current_exe().unwrap())
                     .args([
@@ -476,7 +532,7 @@ mod tests {
                 libc::sigemptyset(&mut action.sa_mask);
                 assert_eq!(libc::sigaction(SIGNAL, &action, std::ptr::null_mut()), 0);
             }
-            let error = match Mask::block() {
+            let error = match Control::arm(participant_key(), None) {
                 Err(error) => error,
                 Ok(_) => panic!("replaced another signal owner"),
             };
@@ -491,10 +547,8 @@ mod tests {
             return;
         }
         if case == "replaced" {
-            Mask::block()
-                .unwrap()
-                .finish(0, super::super::RunOutcome::Exited)
-                .unwrap();
+            let key = participant_key();
+            Control::arm(key, None).unwrap().finish(0).unwrap();
             unsafe {
                 let mut action: libc::sigaction = std::mem::zeroed();
                 action.sa_sigaction = foreign_handler as *const () as usize;
@@ -503,28 +557,46 @@ mod tests {
             }
             // The disposition is checked at each thread's first entry. This
             // thread already passed it; a new thread's first entry refuses.
-            Mask::block()
-                .unwrap()
-                .finish(0, super::super::RunOutcome::Exited)
-                .unwrap();
-            let error = std::thread::spawn(|| match Mask::block() {
+            Control::arm(key, None).unwrap().finish(0).unwrap();
+            let error = std::thread::spawn(move || match Control::arm(key, None) {
                 Err(error) => error,
                 Ok(_) => panic!("accepted a replacement signal owner"),
             })
             .join()
             .unwrap();
-            assert!(matches!(
-                error.primary(),
-                crate::Error::EntryControl {
-                    operation: "reserved host signal disposition changed",
-                    ..
-                }
-            ));
+            assert_eq!(
+                operation(&error),
+                "reserved host signal disposition changed"
+            );
             unsafe {
                 let mut action: libc::sigaction = std::mem::zeroed();
                 assert_eq!(libc::sigaction(SIGNAL, std::ptr::null(), &mut action), 0);
                 assert_eq!(action.sa_sigaction, foreign_handler as *const () as usize);
             }
+            return;
+        }
+        if case == "reblocked" {
+            let key = participant_key();
+            Control::arm(key, None).unwrap().finish(0).unwrap();
+            // Something else blocks signal 64 again on this vCPU thread.
+            unsafe {
+                libc::pthread_sigmask(
+                    libc::SIG_BLOCK,
+                    &only_reserved_signal(),
+                    std::ptr::null_mut(),
+                );
+            }
+            // Entries inside the re-check window issue no system call and do
+            // not see it; the entry that re-checks refuses, and leaves the
+            // signal unblocked again.
+            for _ in 1..RECHECK_ENTRIES {
+                Control::arm(key, None).unwrap().finish(0).unwrap();
+            }
+            assert_eq!(
+                operation(&Control::arm(key, None).err().unwrap()),
+                "reserved host signal blocked again on a vCPU thread"
+            );
+            assert!(!contains(&current_mask(), SIGNAL));
             return;
         }
         let mut original = current_mask();
@@ -542,14 +614,22 @@ mod tests {
             );
         }
         if case == "overflowed" {
-            // An ordinary entry installs the handler and blocks signal 64.
-            Mask::block()
+            // An ordinary entry installs the handler; the caller's mask still
+            // blocks signal 64 for the next participant on this thread.
+            Control::arm(participant_key(), None)
                 .unwrap()
-                .finish(0, super::super::RunOutcome::Exited)
+                .finish(0)
                 .unwrap();
+            unsafe {
+                libc::pthread_sigmask(
+                    libc::SIG_BLOCK,
+                    &only_reserved_signal(),
+                    std::ptr::null_mut(),
+                );
+            }
             // At the pending-signal limit, a stray SI_USER instance can exist
-            // only as a pending bit, which a later kick's queued instance
-            // would absorb. The pre-entry check must still see it.
+            // only as a pending bit. The next participant's first entry
+            // unblocks it, counts its delivery and refuses.
             unsafe {
                 let mut old: libc::rlimit = std::mem::zeroed();
                 assert_eq!(libc::getrlimit(libc::RLIMIT_SIGPENDING, &mut old), 0);
@@ -572,27 +652,37 @@ mod tests {
                 assert_eq!(sent, 0, "{}", std::io::Error::last_os_error());
             }
             assert!(pending(SIGNAL));
-            let error = match Mask::block() {
+            let before = delivered();
+            let error = match Control::arm(participant_key(), None) {
                 Err(error) => error,
-                Ok(_) => panic!("accepted an unexplained pending signal at the limit"),
+                Ok(_) => panic!("accepted an unexplained signal at the limit"),
             };
-            assert!(matches!(
-                error.primary(),
-                crate::Error::EntryControl {
-                    operation: "unexplained reserved host signal before entry",
-                    ..
-                }
-            ));
-            assert!(pending(SIGNAL), "refusal consumed an unexplained signal");
+            assert_eq!(
+                operation(&error),
+                "unexplained reserved host signal before entry"
+            );
+            assert_eq!(delivered(), before + 1);
+            assert!(!pending(SIGNAL));
             return;
         }
         if case == "pending" {
+            // Queued while the caller blocks signal 64, before any entry.
             unsafe {
                 assert_eq!(libc::pthread_kill(libc::pthread_self(), SIGNAL), 0);
             }
-            assert!(Mask::block().is_err());
-            assert!(pending(SIGNAL), "refusal consumed an unexplained signal");
-            assert!(contains(&current_mask(), SIGNAL));
+            assert!(pending(SIGNAL));
+            let error = match Control::arm(participant_key(), None) {
+                Err(error) => error,
+                Ok(_) => panic!("accepted an unexplained pending signal"),
+            };
+            assert_eq!(
+                operation(&error),
+                "unexplained reserved host signal before entry"
+            );
+            assert_eq!(delivered(), 1);
+            assert!(!contains(&current_mask(), SIGNAL));
+            // Refusal is sticky until the instance is explained.
+            assert!(Control::arm(participant_key(), None).is_err());
             return;
         }
         let send = |count: usize| {
@@ -602,76 +692,77 @@ mod tests {
                 }
             }
         };
-        // Instances sent after setup stand in for kicks during the entry.
-        let mask = Mask::block().unwrap();
-        assert!(contains(&current_mask(), SIGNAL));
+        let key = participant_key();
+        // Instances sent after setup stand in for kicks during the entry. A
+        // thread-directed signal to the calling thread is delivered before
+        // pthread_kill returns, now that the entry unblocked it.
+        let control = Control::arm(key, None).unwrap();
+        assert!(!contains(&current_mask(), SIGNAL));
         send(3);
         unsafe {
             assert_eq!(libc::pthread_kill(libc::pthread_self(), libc::SIGURG), 0);
         }
-        assert!(pending(SIGNAL));
-        // Three recorded kicks drain their three queued instances.
-        mask.finish(3, super::super::RunOutcome::Exited).unwrap();
-        assert!(!pending(SIGNAL));
+        assert_eq!(delivered(), 3);
+        // Three recorded kicks explain their three instances.
+        assert!(control.finish(3).unwrap());
         assert!(pending(libc::SIGURG), "entry cleanup consumed cancellation");
-        // The reserved signal stays blocked after the entry; nothing else moves.
+        // Only signal 64 moved, and it stays unblocked after the entry.
         let after = current_mask();
         for signal in 1..=64 {
             assert_eq!(
                 contains(&after, signal),
-                signal == SIGNAL || contains(&original, signal),
+                signal != SIGNAL && contains(&original, signal),
                 "signal {signal}"
             );
         }
-        // An exited entry with no recorded kick does not drain, and the next
-        // entry refuses the instance before KVM_RUN, leaving it pending.
-        let mask = Mask::block().unwrap();
+        // An unkicked entry issues nothing and accepts.
+        assert!(!Control::arm(key, None).unwrap().finish(0).unwrap());
+        // An instance during an entry that no closer kicked is refused at
+        // its cleanup, and keeps refusing the thread's next entry.
+        let control = Control::arm(key, None).unwrap();
         send(1);
-        mask.finish(0, super::super::RunOutcome::Exited).unwrap();
-        assert!(pending(SIGNAL));
-        let error = match Mask::block() {
-            Err(error) => error,
-            Ok(_) => panic!("accepted an instance left by an undrained entry"),
-        };
-        assert!(matches!(
-            error.primary(),
-            crate::Error::EntryControl {
-                operation: "unexplained reserved host signal before entry",
-                ..
-            }
-        ));
-        assert!(pending(SIGNAL));
+        assert_eq!(
+            operation(&control.finish(0).unwrap_err()),
+            "unexplained reserved host signal during entry"
+        );
+        assert_eq!(
+            operation(&Control::arm(key, None).err().unwrap()),
+            "unexplained reserved host signal before entry"
+        );
+        accept_delivered_for_test();
+        // An instance beyond the recorded kicks has no sender: one kick with
+        // two instances is refused.
+        let control = Control::arm(key, None).unwrap();
+        send(2);
+        assert_eq!(
+            operation(&control.finish(1).unwrap_err()),
+            "unexplained reserved host signal during entry"
+        );
+        accept_delivered_for_test();
+        // A kick that cannot be delivered, because something blocked signal
+        // 64 on this thread again, is refused rather than presumed handled.
+        let control = Control::arm(key, None).unwrap();
         unsafe {
-            let set = only_reserved_signal();
-            let timeout = libc::timespec {
-                tv_sec: 0,
-                tv_nsec: 0,
-            };
-            assert_eq!(
-                libc::sigtimedwait(&set, std::ptr::null_mut(), &timeout),
-                SIGNAL
+            libc::pthread_sigmask(
+                libc::SIG_BLOCK,
+                &only_reserved_signal(),
+                std::ptr::null_mut(),
             );
         }
-        // An instance beyond the recorded kicks has no sender: one kick with
-        // two queued instances drains both and refuses the entry.
-        let mask = Mask::block().unwrap();
-        send(2);
-        let error = mask
-            .finish(1, super::super::RunOutcome::Failed)
-            .expect_err("an unrecorded instance hid behind a recorded kick");
-        assert!(matches!(
-            error.primary(),
-            crate::Error::EntryControl {
-                operation: "unexplained reserved host signal during entry",
-                ..
-            }
-        ));
+        send(1);
+        assert_eq!(
+            operation(&control.finish(1).unwrap_err()),
+            "recorded kick was not delivered"
+        );
+        assert!(pending(SIGNAL));
+        // A new participant on this thread unblocks it again, which
+        // delivers the kick and squares the accounting.
+        assert!(
+            !Control::arm(participant_key(), None)
+                .unwrap()
+                .finish(0)
+                .unwrap()
+        );
         assert!(!pending(SIGNAL));
-        // A failed run drains even with no recorded kick; with nothing
-        // queued, it accepts.
-        Mask::block()
-            .unwrap()
-            .finish(0, super::super::RunOutcome::Failed)
-            .unwrap();
     }
 }

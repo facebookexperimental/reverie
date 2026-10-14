@@ -44,7 +44,6 @@ use crate::Error;
 use crate::Result;
 use crate::entry::Participant;
 use crate::entry::RunEntry;
-use crate::entry::RunOutcome;
 use crate::entry::owner::OperationOrigin;
 use crate::failure::FailureContext;
 use crate::memory::GuestMemory;
@@ -151,8 +150,8 @@ pub(crate) struct CountedVcpu {
     /// `set_msrs`, ...). `run` takes `&mut self`, so no raw borrow taken before
     /// an exit can still be alive after it.
     synced_exit: std::sync::atomic::AtomicBool,
-    /// The KVM_RUN signal mask installed on `fd`.
-    installed_mask: crate::entry::InstalledMask,
+    /// `fd`'s `kvm_run.immediate_exit` byte, which the kick handler sets.
+    immediate_exit: crate::entry::ImmediateExit,
     participant: Participant,
     // Keep the Mapping alive independently of the backend field's drop order.
     memory: GuestMemory,
@@ -187,11 +186,14 @@ impl CountedVcpu {
             fd.set_sync_valid_reg(kvm_ioctls::SyncReg::Register);
             fd.set_sync_valid_reg(kvm_ioctls::SyncReg::SystemRegister);
         }
+        // SAFETY: this struct owns fd, whose kvm_run mapping therefore
+        // outlives every entry `run` prepares; moving fd does not move it.
+        let immediate_exit = unsafe { crate::entry::ImmediateExit::new(&mut fd) };
         Ok(Self {
             fd,
             sync_regs,
             synced_exit: std::sync::atomic::AtomicBool::new(false),
-            installed_mask: Default::default(),
+            immediate_exit,
             participant,
             memory,
             clock: GuestClock::default(),
@@ -322,7 +324,7 @@ impl CountedVcpu {
 
     /// None means admission was closed: no clock interval or KVM_RUN occurred.
     /// The caller retains its prepared continuation and waits outside this
-    /// method, with no signal-mask, CPU-affinity or borrowed-exit guard alive.
+    /// method, with no entry, CPU-affinity or borrowed-exit guard alive.
     pub(crate) fn run(&mut self) -> Result<Option<VcpuExit<'_>>> {
         #[cfg(test)]
         if let Some(probe) = &self.run_probe {
@@ -332,10 +334,10 @@ impl CountedVcpu {
         self.synced_exit
             .store(false, std::sync::atomic::Ordering::Relaxed);
         // Declare entry first: unwinding must retire the clock and restore CPU
-        // affinity before entry withdraws its target and drains the mask.
+        // affinity before entry withdraws its target and checks its signals.
         let Some(entry) = self
             .participant
-            .prepare(&self.fd, &mut self.installed_mask)
+            .prepare(Some(self.immediate_exit))
             .map_err(|failure| failure.error())?
         else {
             return Ok(None);
@@ -395,21 +397,19 @@ fn finish_entry<T>(result: Result<T>, entry: RunEntry<'_>) -> Result<T> {
         // An actual ioctl error, including EINTR, retains the caller's existing
         // policy when clock and entry cleanup succeeded. Do not poison a whole
         // address space merely because KVM_RUN was interrupted.
-        Err(Error::Kvm(error)) => match entry.finish(Ok(()), RunOutcome::Failed) {
+        Err(Error::Kvm(error)) => match entry.finish(Ok(())) {
             Ok(()) => Err(Error::Kvm(error)),
             Err(failure) => Err(failure.error().with_cleanup(vec![Error::Kvm(error)])),
         },
         // A failed clock interval cannot publish trustworthy guest progress.
         // Stop every participant and callback copy in this Mapping while the
         // issuing owner retains and publishes the typed terminal failure.
-        Err(error) => match entry.finish(Err(error), RunOutcome::Failed) {
+        Err(error) => match entry.finish(Err(error)) {
             Err(failure) => Err(failure.error()),
             Ok(()) => unreachable!("failed clock setup or cleanup admitted success"),
         },
         Ok(exit) => {
-            entry
-                .finish(Ok(()), RunOutcome::Exited)
-                .map_err(|failure| failure.error())?;
+            entry.finish(Ok(())).map_err(|failure| failure.error())?;
             Ok(exit)
         }
     }

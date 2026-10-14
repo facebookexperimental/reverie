@@ -35,12 +35,16 @@ use crate::failure::FailureContext;
 pub(crate) mod driver;
 pub(crate) mod owner;
 mod signal;
-pub(crate) use signal::InstalledMask;
+pub(crate) use signal::ImmediateExit;
+#[cfg(test)]
+pub(crate) use signal::accept_delivered_for_test;
+#[cfg(test)]
+pub(crate) use signal::delivered_for_test;
 
 #[cfg(feature = "native-test-support")]
 pub(crate) fn check_reserved_signal_handler() -> crate::Result<()> {
-    signal::Mask::block()?
-        .finish(0, RunOutcome::Failed)
+    signal::Control::arm(signal::participant_key(), None)?
+        .finish(0)
         .map(drop)
 }
 
@@ -86,19 +90,16 @@ pub(crate) struct CleanupIdentity {
 #[cfg(test)]
 type CleanupHook = Box<dyn FnOnce(CleanupIdentity) + Send>;
 
-/// Observations of actual admission, mask installation and receiver polling.
+/// Observations of actual admission, activation and receiver polling.
 /// Test controllers arm this only after ordinary driver setup has completed.
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct PrepareProbe {
     pub(crate) armed: std::sync::atomic::AtomicBool,
-    pub(crate) mask_installs: std::sync::atomic::AtomicUsize,
-    /// `KVM_SET_SIGNAL_MASK` ioctls actually issued; an entry whose thread
-    /// mask is unchanged reuses the vCPU's installed mask.
-    pub(crate) mask_ioctls: std::sync::atomic::AtomicUsize,
-    /// Entry cleanups that drained the reserved signal: only after a
-    /// recorded kick or a failed `KVM_RUN`.
-    pub(crate) drains: std::sync::atomic::AtomicUsize,
+    /// Entries that passed the final admission check under the registry lock.
+    pub(crate) activations: std::sync::atomic::AtomicUsize,
+    /// Entry cleanups that found a recorded kick.
+    pub(crate) kicked_cleanups: std::sync::atomic::AtomicUsize,
     pub(crate) closed_admissions: std::sync::atomic::AtomicUsize,
     pub(crate) closed_waits: std::sync::atomic::AtomicUsize,
     pub(crate) pending_subscriptions: std::sync::atomic::AtomicUsize,
@@ -742,6 +743,7 @@ impl EntryGate {
                         Ok(Participant {
                             gate: self.clone(),
                             id,
+                            key: signal::participant_key(),
                             #[cfg(test)]
                             prepare_probe: None,
                         })
@@ -957,8 +959,7 @@ impl EntryGate {
         let send_error = catch_unwind(AssertUnwindSafe(|| {
             state.members.values_mut().find_map(|member| {
                 if let Activity::Running(thread) = member.activity {
-                    // Record before sending: the entry drains only after a
-                    // recorded kick or a failed KVM_RUN, and refuses any
+                    // Record before sending: the entry's cleanup refuses any
                     // instance beyond the kicks recorded.
                     member.kicks = member.kicks.saturating_add(1);
                     send(thread).err()
@@ -995,6 +996,8 @@ impl EntryGate {
 pub(crate) struct Participant {
     gate: Arc<EntryGate>,
     id: u64,
+    /// Process-unique; see [`signal::participant_key`].
+    key: u64,
     #[cfg(test)]
     prepare_probe: Option<Arc<PrepareProbe>>,
 }
@@ -1042,13 +1045,15 @@ impl Participant {
         }))
     }
 
+    /// `immediate_exit` belongs to the vCPU this entry runs; tests that run
+    /// no vCPU pass None.
     pub(crate) fn prepare(
         &mut self,
-        fd: &kvm_ioctls::VcpuFd,
-        installed: &mut InstalledMask,
+        immediate_exit: Option<ImmediateExit>,
     ) -> GateResult<Option<RunEntry<'_>>> {
         #[cfg(test)]
         let probe = self.prepare_probe.clone();
+        let key = self.key;
         let Some(mut entry) = self.try_enter()? else {
             #[cfg(test)]
             if let Some(probe) = &probe {
@@ -1056,48 +1061,39 @@ impl Participant {
             }
             return Ok(None);
         };
-        let mask = match signal::Mask::block() {
-            Ok(mask) => mask,
+        let control = match signal::Control::arm(key, immediate_exit) {
+            Ok(control) => control,
             Err(error) => {
                 entry.withdraw();
                 entry.acknowledge(Err(error))?;
-                unreachable!("failed mask setup acknowledged successfully");
+                unreachable!("failed signal setup acknowledged successfully");
             }
         };
         let mut guard = RunEntry {
             entry: Some(entry),
-            mask: Some(mask),
+            control: Some(control),
         };
-        // The test hook runs after mask blocking and outside the registry lock.
-        // The real final admission check and mask ioctl remain together below.
+        // The test hook runs after signal setup and outside the registry lock.
+        // The real final admission check and publication remain together below.
         #[cfg(test)]
         if let Some(probe) = &probe {
             probe.activate_hook();
         }
-        let admitted = guard.entry.as_mut().unwrap().activate(|| {
-            #[cfg(test)]
-            if let Some(probe) = &probe {
-                probe.increment(&probe.mask_installs);
-            }
-            let issued = guard.mask.as_ref().unwrap().install(fd, installed)?;
-            #[cfg(test)]
-            if let (true, Some(probe)) = (issued, &probe) {
-                probe.increment(&probe.mask_ioctls);
-            }
-            #[cfg(not(test))]
-            let _ = issued;
-            Ok(())
-        });
+        let admitted = guard.entry.as_mut().unwrap().activate();
+        #[cfg(test)]
+        if let (Ok(true), Some(probe)) = (&admitted, &probe) {
+            probe.increment(&probe.activations);
+        }
         match admitted {
             Ok(true) => Ok(Some(guard)),
             Ok(false) => {
                 // Never Running, so no closer sent to it and no KVM_RUN ran.
-                guard.finish(Ok(()), RunOutcome::Exited)?;
+                guard.finish(Ok(()))?;
                 Ok(None)
             }
             Err(error) => {
-                // Retain a mask cleanup error alongside the original failure.
-                let _ = guard.finish(Ok(()), RunOutcome::Failed);
+                // Retain a cleanup error alongside the original failure.
+                let _ = guard.finish(Ok(()));
                 Err(error)
             }
         }
@@ -1128,7 +1124,7 @@ impl Drop for Participant {
 }
 
 /// This guard cannot move between pthreads and must not cross an async suspension.
-/// Its caller owns signal blocking/draining and clock cleanup. A lost guard
+/// Its caller owns signal accounting and clock cleanup. A lost guard
 /// leaves failed accounting; it cannot manufacture a successful fence.
 pub(crate) struct Entry<'a> {
     participant: &'a mut Participant,
@@ -1139,13 +1135,9 @@ pub(crate) struct Entry<'a> {
 }
 
 impl Entry<'_> {
-    /// The final open check, KVM mask installation, and target publication
-    /// occur under the registry lock. The supplied function must be only the
-    /// synchronous ioctl; it must not invoke Tool code or wait for admission.
-    pub(crate) fn activate(
-        &mut self,
-        install_mask: impl FnOnce() -> crate::Result<()>,
-    ) -> GateResult<bool> {
+    /// The final open check and target publication occur under the registry
+    /// lock.
+    pub(crate) fn activate(&mut self) -> GateResult<bool> {
         let mut state = self.participant.gate.state.lock().unwrap();
         state.check()?;
         let member = state.members.get(&self.participant.id).unwrap();
@@ -1154,29 +1146,6 @@ impl Entry<'_> {
         assert_eq!(state.generation, self.generation);
         if state.admission != Admission::Open {
             return Ok(false);
-        }
-        let installed = catch_unwind(AssertUnwindSafe(install_mask));
-        let installed = match installed {
-            Ok(result) => result,
-            Err(payload) => {
-                let origin = state.members[&self.participant.id].origin.clone();
-                state.fail(
-                    origin,
-                    protocol_failure("install KVM temporary signal mask unwound"),
-                );
-                let sender = state.changed();
-                drop(state);
-                notify(sender);
-                resume_unwind(payload);
-            }
-        };
-        if let Err(error) = installed {
-            let origin = state.members[&self.participant.id].origin.clone();
-            let error = state.fail(origin, error);
-            let sender = state.changed();
-            drop(state);
-            notify(sender);
-            return Err(error);
         }
         let member = state.members.get_mut(&self.participant.id).unwrap();
         // SAFETY: this guard remains on the current thread until withdrawal
@@ -1187,8 +1156,8 @@ impl Entry<'_> {
         Ok(true)
     }
 
-    /// Must precede the final drain. A closer cannot send after this returns.
-    /// Retirement stays counted through the caller's mask drain. Returns
+    /// Must precede signal cleanup. A closer cannot send after this returns.
+    /// Retirement stays counted through the caller's signal cleanup. Returns
     /// how many times a closer sent the reserved signal to this entry.
     pub(crate) fn withdraw(&mut self) -> usize {
         #[cfg(test)]
@@ -1227,7 +1196,7 @@ impl Entry<'_> {
         std::mem::take(&mut member.kicks)
     }
 
-    /// Called only after clock cleanup, withdrawal and final drain.
+    /// Called only after clock cleanup, withdrawal and signal cleanup.
     pub(crate) fn acknowledge(mut self, cleanup: crate::Result<()>) -> GateResult<()> {
         let mut state = self.participant.gate.state.lock().unwrap();
         let member = state.members.get_mut(&self.participant.id).unwrap();
@@ -1265,33 +1234,20 @@ impl Drop for Entry<'_> {
     }
 }
 
-/// How the entry's `KVM_RUN` ended, which decides whether its cleanup must
-/// drain the reserved signal.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RunOutcome {
-    /// `KVM_RUN` returned an exit, or never ran. An instance arriving while
-    /// it ran would have made it fail with EINTR, so cleanup drains only a
-    /// recorded kick. An unrecorded instance that arrives after the exit stays
-    /// pending (the signal is blocked) and refuses this thread's next entry.
-    Exited,
-    /// `KVM_RUN` failed (EINTR included), setup failed, or the entry unwound.
-    /// An instance may be queued that no closer recorded.
-    Failed,
-}
-
-/// Owns the same-thread mask from setup through final withdrawal and drain.
-/// CountedVcpu must finish its clock interval before calling finish.
+/// Owns the same-thread signal accounting from setup through final
+/// withdrawal. CountedVcpu must finish its clock interval before calling
+/// finish.
 pub(crate) struct RunEntry<'a> {
     entry: Option<Entry<'a>>,
-    mask: Option<signal::Mask>,
+    control: Option<signal::Control>,
 }
 
 impl RunEntry<'_> {
-    pub(crate) fn finish(mut self, clock: crate::Result<()>, run: RunOutcome) -> GateResult<()> {
-        self.cleanup(clock, run)
+    pub(crate) fn finish(mut self, clock: crate::Result<()>) -> GateResult<()> {
+        self.cleanup(clock)
     }
 
-    fn cleanup(&mut self, clock: crate::Result<()>, run: RunOutcome) -> GateResult<()> {
+    fn cleanup(&mut self, clock: crate::Result<()>) -> GateResult<()> {
         let mut entry = self.entry.take().unwrap();
         #[cfg(test)]
         let probe = entry.participant.prepare_probe.clone();
@@ -1309,14 +1265,13 @@ impl RunEntry<'_> {
         if let Some(probe) = &probe {
             probe.cleanup_hook(CleanupPhase::AfterWithdraw, identity);
         }
-        let mask = self.mask.take().unwrap().finish(kicks, run);
-        // Every error comes from draining, so anything but Ok(false) drained.
+        let signal = self.control.take().unwrap().finish(kicks);
         #[cfg(test)]
-        if let (false, Some(probe)) = (matches!(mask, Ok(false)), &probe) {
-            probe.increment(&probe.drains);
+        if let (true, Some(probe)) = (kicks != 0, &probe) {
+            probe.increment(&probe.kicked_cleanups);
         }
-        let mask = mask.map(drop);
-        let cleanup = match (clock, mask) {
+        let signal = signal.map(drop);
+        let cleanup = match (clock, signal) {
             (Ok(()), result) | (result, Ok(())) => result,
             (Err(primary), Err(cleanup)) => Err(primary.with_cleanup(vec![cleanup])),
         };
@@ -1331,10 +1286,9 @@ impl RunEntry<'_> {
 impl Drop for RunEntry<'_> {
     fn drop(&mut self) {
         if self.entry.is_some() {
-            let _ = self.cleanup(
-                Err(protocol_failure("guest entry unwound or was abandoned")),
-                RunOutcome::Failed,
-            );
+            let _ = self.cleanup(Err(protocol_failure(
+                "guest entry unwound or was abandoned",
+            )));
         }
     }
 }
@@ -1732,7 +1686,7 @@ mod tests {
         assert_quiescent_refusal_is_quiet(&gate);
         // This only records this thread's identity. The quiescent operation
         // must never send its reserved signal to the unmasked test thread.
-        assert!(entry.activate(|| Ok(())).unwrap());
+        assert!(entry.activate().unwrap());
         assert_quiescent_refusal_is_quiet(&gate);
         entry.withdraw();
         assert_quiescent_refusal_is_quiet(&gate);
@@ -2057,7 +2011,7 @@ mod tests {
 
         drop(gate.try_copy(None).unwrap().unwrap());
         let mut entry = participant.try_enter().unwrap().unwrap();
-        assert!(entry.activate(|| Ok(())).unwrap());
+        assert!(entry.activate().unwrap());
         entry.withdraw();
         entry.acknowledge(Ok(())).unwrap();
         assert!(
@@ -2472,11 +2426,7 @@ mod tests {
         let close = gate.try_close().unwrap().unwrap();
         let mut closed = pin!(close.finish());
         assert!(poll(closed.as_mut()).is_pending());
-        assert!(
-            !entry
-                .activate(|| panic!("closed entry installed a KVM mask"))
-                .unwrap()
-        );
+        assert!(!entry.activate().unwrap());
         drop(copy);
         assert!(poll(closed.as_mut()).is_pending());
         entry.withdraw();
@@ -2494,7 +2444,7 @@ mod tests {
         let gate = EntryGate::new();
         let mut participant = gate.register().unwrap();
         let mut entry = participant.try_enter().unwrap().unwrap();
-        assert!(entry.activate(|| Ok(())).unwrap());
+        assert!(entry.activate().unwrap());
         entry.withdraw();
         let close = gate
             .try_close_with(|_| panic!("sent to an already withdrawn target"))
@@ -2512,7 +2462,7 @@ mod tests {
         let mut participant = gate.register().unwrap();
         let id = participant.id;
         let mut entry = participant.try_enter().unwrap().unwrap();
-        assert!(entry.activate(|| Ok(())).unwrap());
+        assert!(entry.activate().unwrap());
         let changed = gate.subscribe();
         let failure =
             match gate.try_close_with(|_| Err(std::io::Error::from_raw_os_error(libc::ESRCH))) {
@@ -2559,7 +2509,7 @@ mod tests {
         let mut participant = gate.register().unwrap();
         let id = participant.id;
         let mut entry = participant.try_enter().unwrap().unwrap();
-        assert!(entry.activate(|| Ok(())).unwrap());
+        assert!(entry.activate().unwrap());
         drop(entry);
         drop(participant);
         let state = gate.state.lock().unwrap();
@@ -2611,27 +2561,23 @@ mod tests {
 
         const CHILD: &str = "REVERIE_KVM_ENTRY_UNWIND_CHILD";
         let Ok(case) = std::env::var(CHILD) else {
-            let mut failures = Vec::new();
-            for case in ["mask", "send"] {
-                let output = std::process::Command::new(std::env::current_exe().unwrap())
-                    .args([
-                        "--exact",
-                        "entry::tests::unwinding_control_operations_preserve_cleanup_and_failure",
-                        "--nocapture",
-                    ])
-                    .env(CHILD, case)
-                    .output()
-                    .unwrap();
-                if !output.status.success() {
-                    failures.push(format!(
-                        "{case}: status={}\n{}{}",
-                        output.status,
-                        String::from_utf8_lossy(&output.stdout),
-                        String::from_utf8_lossy(&output.stderr)
-                    ));
-                }
-            }
-            assert!(failures.is_empty(), "{}", failures.join("\n"));
+            // The one control kicks its own thread; run it in a fresh process.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "entry::tests::unwinding_control_operations_preserve_cleanup_and_failure",
+                    "--nocapture",
+                ])
+                .env(CHILD, "send")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "send: status={}\n{}{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
             return;
         };
 
@@ -2650,8 +2596,8 @@ mod tests {
         }
 
         if case == "send" {
-            // Leave signal 64 blocked in the original mask, so a missed drain
-            // cannot disappear through the handler when that mask is restored.
+            // Start with signal 64 blocked: the entry's setup unblocks it, so
+            // the kick below reaches the handler and is counted.
             unsafe {
                 let mut reserved: libc::sigset_t = std::mem::zeroed();
                 assert_eq!(libc::sigemptyset(&mut reserved), 0);
@@ -2676,23 +2622,19 @@ mod tests {
         let id = participant.id;
         let changed = gate.subscribe();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let key = participant.key;
             let entry = participant.try_enter().unwrap().unwrap();
-            let mask = signal::Mask::block().unwrap();
+            let control = signal::Control::arm(key, None).unwrap();
             let mut guard = RunEntry {
                 entry: Some(entry),
-                mask: Some(mask),
+                control: Some(control),
             };
             match case.as_str() {
-                "mask" => {
-                    let _ = guard.entry.as_mut().unwrap().activate(|| {
-                        panic!("mask operation unwound");
-                    });
-                }
                 "send" => {
-                    assert!(guard.entry.as_mut().unwrap().activate(|| Ok(())).unwrap());
+                    assert!(guard.entry.as_mut().unwrap().activate().unwrap());
                     let _ = gate.try_close_with(|thread| {
-                        // Queue a real control signal before the injected unwind.
-                        // Its drain must finish before the original mask returns.
+                        // Deliver a real control signal before the injected
+                        // unwind. Cleanup must still account for it.
                         assert_eq!(unsafe { libc::pthread_kill(thread, 64) }, 0);
                         panic!("send operation unwound");
                     });
@@ -2702,16 +2644,16 @@ mod tests {
             panic!("injected operation did not unwind");
         }));
         let payload = outcome.expect_err("operation panic was swallowed");
-        let expected = if case == "mask" {
-            "mask operation unwound"
-        } else {
-            "send operation unwound"
-        };
-        assert_eq!(payload.downcast_ref::<&str>().copied(), Some(expected));
-        // The reserved signal stays blocked after any entry; nothing else moves.
+        assert_eq!(
+            payload.downcast_ref::<&str>().copied(),
+            Some("send operation unwound")
+        );
+        assert_eq!(signal::delivered_for_test(), 1);
+        // The reserved signal stays unblocked after any entry; nothing else
+        // moves.
         assert_eq!(
             mask_bits(),
-            original_mask | (1 << 63),
+            original_mask & !(1 << 63),
             "unwind changed the host mask"
         );
         assert!(
@@ -2723,18 +2665,13 @@ mod tests {
             "unwind lost the failure wake"
         );
         let pending = gate.pending_failure().unwrap();
-        let operation = if case == "mask" {
-            assert!(Arc::ptr_eq(
-                &pending.origin.as_ref().unwrap().run.upgrade().unwrap(),
-                &run
-            ));
-            "install KVM temporary signal mask unwound"
-        } else {
-            "interrupt running vCPU unwound"
-        };
-        assert!(
-            matches!(pending.error().primary(), Error::EntryControl { operation: actual, .. } if *actual == operation)
-        );
+        assert!(matches!(
+            pending.error().primary(),
+            Error::EntryControl {
+                operation: "interrupt running vCPU unwound",
+                ..
+            }
+        ));
         let Error::WithCleanup { cleanup, .. } = pending.error() else {
             panic!("unwind cleanup cause was lost");
         };
@@ -2754,12 +2691,12 @@ mod tests {
         assert!(participant.try_enter().is_err());
         assert!(gate.try_copy(None).is_err());
         assert!(gate.try_close().is_err());
-        // A second mask guard's drain finds no stale queued control signal.
-        signal::Mask::block()
+        // A later entry on this thread finds the kick explained.
+        signal::Control::arm(participant.key, None)
             .unwrap()
-            .finish(0, RunOutcome::Failed)
+            .finish(0)
             .unwrap();
-        assert_eq!(mask_bits(), original_mask | (1 << 63));
+        assert_eq!(mask_bits(), original_mask & !(1 << 63));
         drop(participant);
         assert!(gate.state.lock().unwrap().members.is_empty());
     }
@@ -2819,8 +2756,9 @@ mod tests {
 
         let gate = EntryGate::new();
         let mut participant = gate.register().unwrap();
-        let mut installed = InstalledMask::default();
-        let entry = participant.prepare(&vcpu, &mut installed).unwrap().unwrap();
+        // SAFETY: vcpu outlives every entry prepared below.
+        let immediate_exit = unsafe { ImmediateExit::new(&mut vcpu) };
+        let entry = participant.prepare(Some(immediate_exit)).unwrap().unwrap();
         let controller_gate = gate.clone();
         let observer_memory = memory.clone();
         let (close_acquired, close_observed) = std::sync::mpsc::channel();
@@ -2850,23 +2788,22 @@ mod tests {
             close_observed.try_recv(),
             Err(std::sync::mpsc::TryRecvError::Empty)
         ));
-        entry.finish(Ok(()), RunOutcome::Failed).unwrap();
+        // The kick's handler set immediate_exit; cleanup clears it for the
+        // next run.
+        assert!(immediate_exit.get());
+        entry.finish(Ok(())).unwrap();
+        assert!(!immediate_exit.get());
         close_observed
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
         let closed = controller.join().unwrap();
-        assert!(
-            participant
-                .prepare(&vcpu, &mut installed)
-                .unwrap()
-                .is_none()
-        );
+        assert!(participant.prepare(Some(immediate_exit)).unwrap().is_none());
         drop(closed);
         participant
-            .prepare(&vcpu, &mut installed)
+            .prepare(Some(immediate_exit))
             .unwrap()
             .unwrap()
-            .finish(Ok(()), RunOutcome::Exited)
+            .finish(Ok(()))
             .unwrap();
         drop(vcpu);
         drop(vm);

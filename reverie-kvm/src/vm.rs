@@ -1775,6 +1775,11 @@ impl KvmBackend {
         if !vm.check_extension(Cap::ExitHypercall) {
             return Err(Error::HypercallExitUnsupported);
         }
+        // A closer relies on kvm_run.immediate_exit to stop a vCPU whose
+        // thread took the reserved signal just before KVM_RUN.
+        if !vm.check_extension(Cap::ImmediateExit) {
+            return Err(Error::ImmediateExitUnsupported);
+        }
         // Serialize the capability record with physical publication. A file
         // image created before attachment requires synchronous invalidation;
         // a private image can still attach on a host lacking this capability,

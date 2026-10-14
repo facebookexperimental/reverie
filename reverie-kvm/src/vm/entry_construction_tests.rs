@@ -220,7 +220,7 @@ mod entry_construction_tests {
             let load = |counter: &std::sync::atomic::AtomicUsize| counter.load(Ordering::SeqCst);
             assert_eq!(load(&probe.untracked_runs), if tracked { 0 } else { 2 });
             assert_eq!(load(&probe.tracked_runs), if tracked { 2 } else { 0 });
-            assert_eq!(load(&probe.prepare.mask_installs), 2);
+            assert_eq!(load(&probe.prepare.activations), 2);
             assert_eq!(load(&probe.clock_begins), if tracked { 2 } else { 0 });
             assert_eq!(load(&probe.intervals_created), if tracked { 2 } else { 0 });
             let registers = child.vcpu.get_regs().unwrap();

@@ -351,7 +351,7 @@ pub(crate) mod entry_action_tests {
             &probe.tracked_runs,
             &probe.clock_begins,
             &probe.intervals_created,
-            &probe.prepare.mask_installs,
+            &probe.prepare.activations,
         ] {
             assert_eq!(counter.load(Ordering::SeqCst), 0);
         }
@@ -584,7 +584,7 @@ pub(crate) mod entry_action_tests {
             stages.assert_exact(&completed);
             assert_eq!(run_probe.tracked_runs.load(Ordering::SeqCst), 1);
             assert_eq!(run_probe.untracked_runs.load(Ordering::SeqCst), 0);
-            assert_eq!(run_probe.prepare.mask_installs.load(Ordering::SeqCst), 1);
+            assert_eq!(run_probe.prepare.activations.load(Ordering::SeqCst), 1);
             assert_eq!(run_probe.clock_begins.load(Ordering::SeqCst), 1);
             assert_eq!(run_probe.intervals_created.load(Ordering::SeqCst), 1);
             assert_eq!(exits.snapshot().count(crate::stats::KvmExitReason::Hlt), 1);
