@@ -2041,7 +2041,7 @@ mod tests {
         });
         let bound = Duration::from_secs(3);
         let mut progress = Vec::new();
-        for byte in [b'A', b'B'] {
+        for byte in *b"AB" {
             let sent = producer.write_all(&[byte]);
             let echoed = receive.recv_timeout(bound);
             let complete = sent.is_ok() && matches!(echoed, Ok(Ok(value)) if value == byte);

@@ -719,6 +719,11 @@ pub unsafe fn install_handler_with_backing(
     unsafe { signal::install_sigsys_handler(handler, use_alt_stack) }
 }
 
+#[cfg(feature = "exec-private-init")]
+pub(crate) unsafe fn adopt_authenticated_initial_gate() -> io::Result<()> {
+    unsafe { fixed_gates::adopt_authenticated_initial_page() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1177,9 +1182,4 @@ mod tests {
             "{output:?}"
         );
     }
-}
-
-#[cfg(feature = "exec-private-init")]
-pub(crate) unsafe fn adopt_authenticated_initial_gate() -> io::Result<()> {
-    unsafe { fixed_gates::adopt_authenticated_initial_page() }
 }

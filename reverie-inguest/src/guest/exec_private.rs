@@ -766,6 +766,460 @@ pub(super) fn mark_lifecycle_test_frontend_installed(owner: &InitialImageControl
     owner.installation.store(2, Ordering::Release);
 }
 
+// Extents describe private native mappings, not guest ld.so or guest DSOs.
+// Reuse the existing complete effective-range operation inventory, including
+// huge-page rounding and Linux brk return semantics, through owner_overlaps.
+pub(crate) fn overlaps_private(start: u64, length: u64) -> bool {
+    let control = control_pointer();
+    if control.is_null() || length == 0 {
+        return false;
+    }
+    let lo = start & !4095;
+    let hi = start.saturating_add(length);
+    let overlaps = |first, end| lo < end && first < hi;
+    if overlaps(0x5000_0000_0000, 0x5000_0008_0000)
+        || overlaps(0x5300_0000_0000, 0x5300_0012_0000)
+        || overlaps(0x5400_0000_0000, 0x5400_0080_0000)
+    {
+        return true;
+    }
+    unsafe {
+        let count = (&raw const (*control).private_map_count).read_volatile();
+        if count > 64 {
+            terminal();
+        }
+        for i in 0..count as usize {
+            let item = (&raw const (*control).maps).cast::<PrivateMap>().add(i);
+            let first = (&raw const (*item).lo).read_volatile();
+            let end = (&raw const (*item).hi).read_volatile();
+            if overlaps(first, end) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// One authenticated InitialImage's native handover. Not constructible from a
+/// configuration flag, memfd seal or filter count alone.
+pub struct InitialImageControl {
+    control: usize,
+    // 0 fresh, 1 installation attempted, 2 actual installation completed,
+    // 3 final verification attempted, 4 ready. Failure never reopens a state.
+    installation: AtomicUsize,
+    region: core::sync::atomic::AtomicPtr<super::tool_region::ToolRegion>,
+    installed_host: AtomicUsize,
+    // 0 not started, 1 permit live, 2 callbacks completed, 3 refused/abandoned.
+    // Neither a returned error nor dropping a permit reopens initialization.
+    lifecycle: AtomicUsize,
+}
+impl InitialImageControl {
+    fn new(control: usize) -> Self {
+        Self {
+            control,
+            installation: AtomicUsize::new(0),
+            region: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+            installed_host: AtomicUsize::new(0),
+            lifecycle: AtomicUsize::new(0),
+        }
+    }
+
+    /// Check the authenticated initial Tool context before and after its one
+    /// bounded vDSO rewrite, before any frontend or installed host is published.
+    /// This grants no mapping or syscall exemption.
+    pub fn check_initial_vdso_context(&self) -> io::Result<()> {
+        if self.installation.load(Ordering::Acquire) != 0
+            || self.installed_host.load(Ordering::Acquire) != 0
+            || self.lifecycle.load(Ordering::Acquire) != 0
+        {
+            return Err(io::Error::other(
+                "InitialImage vDSO rewrite is outside initial installation",
+            ));
+        }
+        self.check_initial_thread()
+    }
+
+    /// Bind the actual stable installed ToolHost, before frontend installation.
+    /// Only the backend's installed-handler bridge may supply this address.
+    pub(super) fn bind_lifecycle_host(&self, host: usize) -> io::Result<()> {
+        if host == 0 || self.installation.load(Ordering::Acquire) != 0 {
+            return Err(io::Error::other(
+                "InitialImage host binding is out of order",
+            ));
+        }
+        self.check_initial_thread()?;
+        self.installed_host
+            .compare_exchange(0, host, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| io::Error::other("InitialImage host was bound twice"))?;
+        Ok(())
+    }
+
+    pub(super) fn begin_lifecycle(&self, host: usize) -> io::Result<InitialLifecyclePermit<'_>> {
+        if self
+            .lifecycle
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            self.lifecycle.store(3, Ordering::Release);
+            return Err(io::Error::other(
+                "InitialImage lifecycle was attempted twice",
+            ));
+        }
+        let permit = InitialLifecyclePermit {
+            owner: self,
+            host,
+            completed: false,
+            _same_thread: core::marker::PhantomData,
+        };
+        if self.installation.load(Ordering::Acquire) != 2
+            || host == 0
+            || self.installed_host.load(Ordering::Acquire) != host
+        {
+            return Err(io::Error::other(
+                "InitialImage lifecycle lacks its installed host/frontend",
+            ));
+        }
+        self.check_initial_thread()?;
+        Ok(permit)
+    }
+
+    fn check_initial_thread(&self) -> io::Result<()> {
+        if self.control == 0
+            || reverie_inguest_private_exec_control.load(Ordering::Acquire) != self.control
+        {
+            return Err(io::Error::other("InitialImage native owner differs"));
+        }
+        let control = self.control as *const NativeControl;
+        let read = |p: *const u64| unsafe { p.read_volatile() };
+        let tid = unsafe { crate::trap::raw_syscall6(libc::SYS_gettid, [0; 6]) };
+        let pid = unsafe { crate::trap::raw_syscall6(libc::SYS_getpid, [0; 6]) };
+        let mut fs = 0_u64;
+        let rc = unsafe {
+            crate::trap::raw_syscall6(
+                libc::SYS_arch_prctl,
+                [0x1003, (&raw mut fs) as u64, 0, 0, 0, 0],
+            )
+        };
+        if read(unsafe { &raw const (*control).phase }) != 2
+            || read(unsafe { &raw const (*control).runtime_ready }) != 0
+            || tid <= 0
+            || pid != tid
+            || tid as u64 != read(unsafe { &raw const (*control).native_tid })
+            || rc != 0
+            || fs == 0
+            || fs != read(unsafe { &raw const (*control).tool_fs })
+        {
+            return Err(io::Error::other(
+                "InitialImage lifecycle Tool FS/process/phase differs",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "coordinator-rpc")]
+    pub(super) fn terminate_lifecycle(&self) -> ! {
+        self.lifecycle.store(3, Ordering::Release);
+        // The private constructor has already authenticated and adopted the
+        // surviving fixed gate. No diagnostic I/O can precede this exit.
+        unsafe { initialization_failed(self.control as *mut NativeControl) }
+    }
+    /// Select the already installed filter while replacing its owned frontend.
+    /// The backing must belong to this initializer's fixed Tool region.
+    pub fn controller(
+        &self,
+        backing: super::tool_region::StackBacking,
+    ) -> impl crate::lifecycle::LifecycleController {
+        InitialImageController {
+            owner: self,
+            backing,
+        }
+    }
+    /// Save the real guest resume mask; keep bootstrap SIGSYS usable and
+    /// inherited asynchronous signals blocked until native final resume.
+    pub fn prepare_signal_state(
+        &self,
+        instructions: super::instruction::InstructionSubscriptions,
+    ) -> io::Result<()> {
+        let control = self.control as *mut NativeControl;
+        unsafe {
+            verify_bootstrap_signal(control)?;
+        }
+        let mut reserved = 1_u64 << (libc::SIGSYS - 1);
+        if instructions.cpuid || instructions.rdtsc {
+            reserved |= 1_u64 << (libc::SIGSEGV - 1);
+        }
+        unsafe {
+            let mask = (&raw const (*control).kernel_mask).read_volatile() & !reserved;
+            (&raw mut (*control).guest_resume_mask).write_volatile(mask);
+        }
+        for signal in 1..=64 {
+            if matches!(signal, libc::SIGKILL | libc::SIGSTOP | libc::SIGSYS) {
+                continue;
+            }
+            let mut action = crate::signal::KernelSigaction::default();
+            unsafe { crate::signal::raw_sigaction(signal, None, Some(&mut action)) }
+                .map_err(io::Error::from_raw_os_error)?;
+            if action.handler != libc::SIG_DFL as u64 && action.handler != libc::SIG_IGN as u64 {
+                unsafe {
+                    crate::signal::raw_sigaction(
+                        signal,
+                        Some(&crate::signal::KernelSigaction::default()),
+                        None,
+                    )
+                }
+                .map_err(io::Error::from_raw_os_error)?;
+            }
+        }
+        Ok(())
+    }
+    /// Mark genuine Detcore installation complete. This does not itself enter
+    /// Guest; only the native runner restores registrations, FS, mask and RSP.
+    pub fn finish(&self) -> io::Result<()> {
+        self.installation
+            .compare_exchange(2, 3, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| io::Error::other("private frontend installation did not complete once"))?;
+        if self.installed_host.load(Ordering::Acquire) == 0
+            || self.lifecycle.load(Ordering::Acquire) != 2
+        {
+            self.lifecycle.store(3, Ordering::Release);
+            return Err(io::Error::other(
+                "InitialImage installed-host lifecycle did not complete",
+            ));
+        }
+        let control = self.control as *mut NativeControl;
+        if !crate::trap::has_dispatcher()
+            || !crate::trap::signal_return_restricted()
+            || unsafe { (&raw const (*control).phase).read_volatile() } != 2
+            || unsafe { (&raw const (*control).runtime_ready).read_volatile() } != 0
+        {
+            return Err(io::Error::other("private Tool frontend is incomplete"));
+        }
+        let region = self.region.load(Ordering::Acquire);
+        let region = unsafe { region.as_ref() }
+            .ok_or_else(|| io::Error::other("private frontend has no owned signal stack"))?;
+        unsafe { verify_final_frontend(control, region)? };
+        unsafe {
+            (&raw mut (*control).runtime_ready).write_volatile(1);
+        }
+        self.installation.store(4, Ordering::Release);
+        Ok(())
+    }
+}
+
+/// A single synchronous lifecycle attempt on the installed host and native
+/// thread. Not exported: only the core host can mark successful completion.
+pub(super) struct InitialLifecyclePermit<'a> {
+    owner: &'a InitialImageControl,
+    host: usize,
+    completed: bool,
+    _same_thread: core::marker::PhantomData<*mut ()>,
+}
+
+impl InitialLifecyclePermit<'_> {
+    pub(super) fn complete(mut self) -> io::Result<()> {
+        if self.owner.installation.load(Ordering::Acquire) != 2
+            || self.owner.installed_host.load(Ordering::Acquire) != self.host
+        {
+            return Err(io::Error::other("InitialImage lifecycle owner changed"));
+        }
+        self.owner.check_initial_thread()?;
+        self.owner
+            .lifecycle
+            .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| io::Error::other("InitialImage lifecycle was refused"))?;
+        self.completed = true;
+        Ok(())
+    }
+}
+
+impl Drop for InitialLifecyclePermit<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.owner.lifecycle.store(3, Ordering::Release);
+        }
+    }
+}
+
+struct InitialImageController<'a> {
+    owner: &'a InitialImageControl,
+    backing: super::tool_region::StackBacking,
+}
+impl crate::lifecycle::LifecycleController for InitialImageController<'_> {
+    fn name(&self) -> &'static str {
+        "authenticated-initial-image"
+    }
+    unsafe fn install(&self, config: &crate::lifecycle::RuntimeConfig) -> io::Result<()> {
+        self.owner
+            .installation
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| io::Error::other("private frontend installation attempted twice"))?;
+        let super::tool_region::StackBacking::ToolRegion(region) = self.backing else {
+            return Err(io::Error::other(
+                "private frontend requires owned signal stack backing",
+            ));
+        };
+        if !config.use_alt_stack || !config.restrict_signal_return || !crate::trap::has_dispatcher()
+        {
+            return Err(io::Error::other("invalid private frontend handover"));
+        }
+        unsafe {
+            verify_bootstrap_signal(self.owner.control as *mut NativeControl)?;
+        }
+        // Prepare frame/PKRU/owned stack before the final single raw action
+        // replacement. Bootstrap SIGSYS remains usable throughout preparation.
+        unsafe {
+            crate::trap::install_handler_with_backing(true, self.backing)?;
+        }
+        crate::trap::set_signal_return_restricted();
+        // No new seccomp filter: the authenticated inherited one is the owner.
+        let unblocked = super::signal::reserved_signal_mask();
+        unsafe { crate::signal::raw_sigprocmask(libc::SIG_UNBLOCK, Some(&unblocked), None) }
+            .map_err(io::Error::from_raw_os_error)?;
+        self.owner
+            .region
+            .store(core::ptr::from_ref(region).cast_mut(), Ordering::Release);
+        self.owner.installation.store(2, Ordering::Release);
+        Ok(())
+    }
+}
+unsafe fn verify_final_frontend(
+    control: *mut NativeControl,
+    region: &'static super::tool_region::ToolRegion,
+) -> io::Result<()> {
+    let mut fs = 0_u64;
+    let tid = unsafe { crate::trap::raw_syscall6(libc::SYS_gettid, [0; 6]) };
+    let pid = unsafe { crate::trap::raw_syscall6(libc::SYS_getpid, [0; 6]) };
+    let rc = unsafe {
+        crate::trap::raw_syscall6(
+            libc::SYS_arch_prctl,
+            [0x1003, (&raw mut fs) as u64, 0, 0, 0, 0],
+        )
+    };
+    if rc != 0
+        || fs != unsafe { (&raw const (*control).tool_fs).read_volatile() }
+        || tid <= 0
+        || tid != pid
+        || tid as u64 != unsafe { (&raw const (*control).native_tid).read_volatile() }
+        || unsafe { super::sigalrm::seccomp_filter_count() } != Some(1)
+    {
+        return Err(io::Error::other(
+            "private final Tool FS/process/filter differs",
+        ));
+    }
+    let reserved = super::signal::reserved_signal_mask();
+    let unmaskable = (1_u64 << (libc::SIGKILL - 1)) | (1_u64 << (libc::SIGSTOP - 1));
+    let mut mask = 0_u64;
+    unsafe { crate::signal::raw_sigprocmask(libc::SIG_SETMASK, None, Some(&mut mask)) }
+        .map_err(io::Error::from_raw_os_error)?;
+    if mask != !(reserved | unmaskable) {
+        return Err(io::Error::other(
+            "private final startup signal mask differs",
+        ));
+    }
+    for (signal, instruction) in [(libc::SIGSYS, false), (libc::SIGSEGV, true)] {
+        if reserved & (1_u64 << (signal - 1)) == 0 {
+            continue;
+        }
+        let mut action = crate::signal::KernelSigaction::default();
+        unsafe { crate::signal::raw_sigaction(signal, None, Some(&mut action)) }
+            .map_err(io::Error::from_raw_os_error)?;
+        if action.handler
+            != signal_entry(instruction, crate::trap::pkru_present()) as *const () as u64
+            || action.restorer != crate::trap::FIXED_SIGNAL_RESTORER_ENTRY
+            || action.flags
+                != (libc::SA_SIGINFO | libc::SA_ONSTACK | crate::signal::SA_RESTORER) as u64
+            || action.mask != 0
+        {
+            return Err(io::Error::other(
+                "private final runtime signal action differs",
+            ));
+        }
+    }
+    let owned = region
+        .registered_alternate_stack()
+        .ok_or_else(|| io::Error::other("private final owned signal stack is unpublished"))?;
+    let mut stack: libc::stack_t = unsafe { core::mem::zeroed() };
+    let rc = unsafe {
+        crate::trap::raw_syscall6(
+            libc::SYS_sigaltstack,
+            [0, (&raw mut stack) as u64, 0, 0, 0, 0],
+        )
+    };
+    if rc != 0
+        || stack.ss_flags != 0
+        || stack.ss_sp as usize != owned.bottom
+        || owned.top.checked_sub(owned.bottom) != Some(stack.ss_size)
+    {
+        return Err(io::Error::other(
+            "private final runtime alternate stack differs",
+        ));
+    }
+    Ok(())
+}
+unsafe fn verify_bootstrap_signal(control: *mut NativeControl) -> io::Result<()> {
+    let read = |field: *const u64| unsafe { field.read_volatile() };
+    let tid = unsafe { crate::trap::raw_syscall6(libc::SYS_gettid, [0; 6]) };
+    let pid = unsafe { crate::trap::raw_syscall6(libc::SYS_getpid, [0; 6]) };
+    if tid <= 0
+        || tid != pid
+        || tid as u64 != read(unsafe { &raw const (*control).native_tid })
+        || read(unsafe { &raw const (*control).phase }) != 2
+        || unsafe { super::sigalrm::seccomp_filter_count() } != Some(1)
+    {
+        return Err(io::Error::other(
+            "private bootstrap process/filter identity differs",
+        ));
+    }
+    let mut fs = 0_u64;
+    let rc = unsafe {
+        crate::trap::raw_syscall6(
+            libc::SYS_arch_prctl,
+            [0x1003, (&raw mut fs) as u64, 0, 0, 0, 0],
+        )
+    };
+    if rc != 0 || fs != read(unsafe { &raw const (*control).tool_fs }) {
+        return Err(io::Error::other("private Tool FS differs at handover"));
+    }
+    let mut mask = 0_u64;
+    unsafe { crate::signal::raw_sigprocmask(libc::SIG_SETMASK, None, Some(&mut mask)) }
+        .map_err(io::Error::from_raw_os_error)?;
+    let forced = 1_u64 << (libc::SIGSYS - 1);
+    let unmaskable = (1_u64 << (libc::SIGKILL - 1)) | (1_u64 << (libc::SIGSTOP - 1));
+    if mask != !(forced | unmaskable) {
+        return Err(io::Error::other("private bootstrap startup mask differs"));
+    }
+    let mut action = crate::signal::KernelSigaction::default();
+    unsafe { crate::signal::raw_sigaction(libc::SIGSYS, None, Some(&mut action)) }
+        .map_err(io::Error::from_raw_os_error)?;
+    if action.handler != read(unsafe { &raw const (*control).bootstrap_handler })
+        || action.restorer != crate::trap::FIXED_SIGNAL_RESTORER_ENTRY
+        || action.restorer != read(unsafe { &raw const (*control).bootstrap_restorer })
+        || action.mask != 0
+        || action.flags != (libc::SA_SIGINFO | libc::SA_ONSTACK | crate::signal::SA_RESTORER) as u64
+    {
+        return Err(io::Error::other(
+            "private bootstrap SIGSYS ownership differs",
+        ));
+    }
+    let mut stack: libc::stack_t = unsafe { core::mem::zeroed() };
+    let rc = unsafe {
+        crate::trap::raw_syscall6(
+            libc::SYS_sigaltstack,
+            [0, (&raw mut stack) as u64, 0, 0, 0, 0],
+        )
+    };
+    let first = read(unsafe { &raw const (*control).bootstrap_stack_base });
+    let end = read(unsafe { &raw const (*control).bootstrap_stack_end });
+    if rc != 0
+        || stack.ss_flags != 0
+        || stack.ss_sp as u64 != first
+        || end.checked_sub(first) != Some(stack.ss_size as u64)
+    {
+        return Err(io::Error::other("private bootstrap signal stack differs"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1429,458 +1883,4 @@ mod tests {
             0,
         );
     }
-}
-
-// Extents describe private native mappings, not guest ld.so or guest DSOs.
-// Reuse the existing complete effective-range operation inventory, including
-// huge-page rounding and Linux brk return semantics, through owner_overlaps.
-pub(crate) fn overlaps_private(start: u64, length: u64) -> bool {
-    let control = control_pointer();
-    if control.is_null() || length == 0 {
-        return false;
-    }
-    let lo = start & !4095;
-    let hi = start.saturating_add(length);
-    let overlaps = |first, end| lo < end && first < hi;
-    if overlaps(0x5000_0000_0000, 0x5000_0008_0000)
-        || overlaps(0x5300_0000_0000, 0x5300_0012_0000)
-        || overlaps(0x5400_0000_0000, 0x5400_0080_0000)
-    {
-        return true;
-    }
-    unsafe {
-        let count = (&raw const (*control).private_map_count).read_volatile();
-        if count > 64 {
-            terminal();
-        }
-        for i in 0..count as usize {
-            let item = (&raw const (*control).maps).cast::<PrivateMap>().add(i);
-            let first = (&raw const (*item).lo).read_volatile();
-            let end = (&raw const (*item).hi).read_volatile();
-            if overlaps(first, end) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// One authenticated InitialImage's native handover. Not constructible from a
-/// configuration flag, memfd seal or filter count alone.
-pub struct InitialImageControl {
-    control: usize,
-    // 0 fresh, 1 installation attempted, 2 actual installation completed,
-    // 3 final verification attempted, 4 ready. Failure never reopens a state.
-    installation: AtomicUsize,
-    region: core::sync::atomic::AtomicPtr<super::tool_region::ToolRegion>,
-    installed_host: AtomicUsize,
-    // 0 not started, 1 permit live, 2 callbacks completed, 3 refused/abandoned.
-    // Neither a returned error nor dropping a permit reopens initialization.
-    lifecycle: AtomicUsize,
-}
-impl InitialImageControl {
-    fn new(control: usize) -> Self {
-        Self {
-            control,
-            installation: AtomicUsize::new(0),
-            region: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-            installed_host: AtomicUsize::new(0),
-            lifecycle: AtomicUsize::new(0),
-        }
-    }
-
-    /// Check the authenticated initial Tool context before and after its one
-    /// bounded vDSO rewrite, before any frontend or installed host is published.
-    /// This grants no mapping or syscall exemption.
-    pub fn check_initial_vdso_context(&self) -> io::Result<()> {
-        if self.installation.load(Ordering::Acquire) != 0
-            || self.installed_host.load(Ordering::Acquire) != 0
-            || self.lifecycle.load(Ordering::Acquire) != 0
-        {
-            return Err(io::Error::other(
-                "InitialImage vDSO rewrite is outside initial installation",
-            ));
-        }
-        self.check_initial_thread()
-    }
-
-    /// Bind the actual stable installed ToolHost, before frontend installation.
-    /// Only the backend's installed-handler bridge may supply this address.
-    pub(super) fn bind_lifecycle_host(&self, host: usize) -> io::Result<()> {
-        if host == 0 || self.installation.load(Ordering::Acquire) != 0 {
-            return Err(io::Error::other(
-                "InitialImage host binding is out of order",
-            ));
-        }
-        self.check_initial_thread()?;
-        self.installed_host
-            .compare_exchange(0, host, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| io::Error::other("InitialImage host was bound twice"))?;
-        Ok(())
-    }
-
-    pub(super) fn begin_lifecycle(&self, host: usize) -> io::Result<InitialLifecyclePermit<'_>> {
-        if self
-            .lifecycle
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            self.lifecycle.store(3, Ordering::Release);
-            return Err(io::Error::other(
-                "InitialImage lifecycle was attempted twice",
-            ));
-        }
-        let permit = InitialLifecyclePermit {
-            owner: self,
-            host,
-            completed: false,
-            _same_thread: core::marker::PhantomData,
-        };
-        if self.installation.load(Ordering::Acquire) != 2
-            || host == 0
-            || self.installed_host.load(Ordering::Acquire) != host
-        {
-            return Err(io::Error::other(
-                "InitialImage lifecycle lacks its installed host/frontend",
-            ));
-        }
-        self.check_initial_thread()?;
-        Ok(permit)
-    }
-
-    fn check_initial_thread(&self) -> io::Result<()> {
-        if self.control == 0
-            || reverie_inguest_private_exec_control.load(Ordering::Acquire) != self.control
-        {
-            return Err(io::Error::other("InitialImage native owner differs"));
-        }
-        let control = self.control as *const NativeControl;
-        let read = |p: *const u64| unsafe { p.read_volatile() };
-        let tid = unsafe { crate::trap::raw_syscall6(libc::SYS_gettid, [0; 6]) };
-        let pid = unsafe { crate::trap::raw_syscall6(libc::SYS_getpid, [0; 6]) };
-        let mut fs = 0_u64;
-        let rc = unsafe {
-            crate::trap::raw_syscall6(
-                libc::SYS_arch_prctl,
-                [0x1003, (&raw mut fs) as u64, 0, 0, 0, 0],
-            )
-        };
-        if read(unsafe { &raw const (*control).phase }) != 2
-            || read(unsafe { &raw const (*control).runtime_ready }) != 0
-            || tid <= 0
-            || pid != tid
-            || tid as u64 != read(unsafe { &raw const (*control).native_tid })
-            || rc != 0
-            || fs == 0
-            || fs != read(unsafe { &raw const (*control).tool_fs })
-        {
-            return Err(io::Error::other(
-                "InitialImage lifecycle Tool FS/process/phase differs",
-            ));
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "coordinator-rpc")]
-    pub(super) fn terminate_lifecycle(&self) -> ! {
-        self.lifecycle.store(3, Ordering::Release);
-        // The private constructor has already authenticated and adopted the
-        // surviving fixed gate. No diagnostic I/O can precede this exit.
-        unsafe { initialization_failed(self.control as *mut NativeControl) }
-    }
-    /// Select the already installed filter while replacing its owned frontend.
-    /// The backing must belong to this initializer's fixed Tool region.
-    pub fn controller(
-        &self,
-        backing: super::tool_region::StackBacking,
-    ) -> impl crate::lifecycle::LifecycleController {
-        InitialImageController {
-            owner: self,
-            backing,
-        }
-    }
-    /// Save the real guest resume mask; keep bootstrap SIGSYS usable and
-    /// inherited asynchronous signals blocked until native final resume.
-    pub fn prepare_signal_state(
-        &self,
-        instructions: super::instruction::InstructionSubscriptions,
-    ) -> io::Result<()> {
-        let control = self.control as *mut NativeControl;
-        unsafe {
-            verify_bootstrap_signal(control)?;
-        }
-        let mut reserved = 1_u64 << (libc::SIGSYS - 1);
-        if instructions.cpuid || instructions.rdtsc {
-            reserved |= 1_u64 << (libc::SIGSEGV - 1);
-        }
-        unsafe {
-            let mask = (&raw const (*control).kernel_mask).read_volatile() & !reserved;
-            (&raw mut (*control).guest_resume_mask).write_volatile(mask);
-        }
-        for signal in 1..=64 {
-            if matches!(signal, libc::SIGKILL | libc::SIGSTOP | libc::SIGSYS) {
-                continue;
-            }
-            let mut action = crate::signal::KernelSigaction::default();
-            unsafe { crate::signal::raw_sigaction(signal, None, Some(&mut action)) }
-                .map_err(io::Error::from_raw_os_error)?;
-            if action.handler != libc::SIG_DFL as u64 && action.handler != libc::SIG_IGN as u64 {
-                unsafe {
-                    crate::signal::raw_sigaction(
-                        signal,
-                        Some(&crate::signal::KernelSigaction::default()),
-                        None,
-                    )
-                }
-                .map_err(io::Error::from_raw_os_error)?;
-            }
-        }
-        Ok(())
-    }
-    /// Mark genuine Detcore installation complete. This does not itself enter
-    /// Guest; only the native runner restores registrations, FS, mask and RSP.
-    pub fn finish(&self) -> io::Result<()> {
-        self.installation
-            .compare_exchange(2, 3, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| io::Error::other("private frontend installation did not complete once"))?;
-        if self.installed_host.load(Ordering::Acquire) == 0
-            || self.lifecycle.load(Ordering::Acquire) != 2
-        {
-            self.lifecycle.store(3, Ordering::Release);
-            return Err(io::Error::other(
-                "InitialImage installed-host lifecycle did not complete",
-            ));
-        }
-        let control = self.control as *mut NativeControl;
-        if !crate::trap::has_dispatcher()
-            || !crate::trap::signal_return_restricted()
-            || unsafe { (&raw const (*control).phase).read_volatile() } != 2
-            || unsafe { (&raw const (*control).runtime_ready).read_volatile() } != 0
-        {
-            return Err(io::Error::other("private Tool frontend is incomplete"));
-        }
-        let region = self.region.load(Ordering::Acquire);
-        let region = unsafe { region.as_ref() }
-            .ok_or_else(|| io::Error::other("private frontend has no owned signal stack"))?;
-        unsafe { verify_final_frontend(control, region)? };
-        unsafe {
-            (&raw mut (*control).runtime_ready).write_volatile(1);
-        }
-        self.installation.store(4, Ordering::Release);
-        Ok(())
-    }
-}
-
-/// A single synchronous lifecycle attempt on the installed host and native
-/// thread. Not exported: only the core host can mark successful completion.
-pub(super) struct InitialLifecyclePermit<'a> {
-    owner: &'a InitialImageControl,
-    host: usize,
-    completed: bool,
-    _same_thread: core::marker::PhantomData<*mut ()>,
-}
-
-impl InitialLifecyclePermit<'_> {
-    pub(super) fn complete(mut self) -> io::Result<()> {
-        if self.owner.installation.load(Ordering::Acquire) != 2
-            || self.owner.installed_host.load(Ordering::Acquire) != self.host
-        {
-            return Err(io::Error::other("InitialImage lifecycle owner changed"));
-        }
-        self.owner.check_initial_thread()?;
-        self.owner
-            .lifecycle
-            .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| io::Error::other("InitialImage lifecycle was refused"))?;
-        self.completed = true;
-        Ok(())
-    }
-}
-
-impl Drop for InitialLifecyclePermit<'_> {
-    fn drop(&mut self) {
-        if !self.completed {
-            self.owner.lifecycle.store(3, Ordering::Release);
-        }
-    }
-}
-
-struct InitialImageController<'a> {
-    owner: &'a InitialImageControl,
-    backing: super::tool_region::StackBacking,
-}
-impl crate::lifecycle::LifecycleController for InitialImageController<'_> {
-    fn name(&self) -> &'static str {
-        "authenticated-initial-image"
-    }
-    unsafe fn install(&self, config: &crate::lifecycle::RuntimeConfig) -> io::Result<()> {
-        self.owner
-            .installation
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| io::Error::other("private frontend installation attempted twice"))?;
-        let super::tool_region::StackBacking::ToolRegion(region) = self.backing else {
-            return Err(io::Error::other(
-                "private frontend requires owned signal stack backing",
-            ));
-        };
-        if !config.use_alt_stack || !config.restrict_signal_return || !crate::trap::has_dispatcher()
-        {
-            return Err(io::Error::other("invalid private frontend handover"));
-        }
-        unsafe {
-            verify_bootstrap_signal(self.owner.control as *mut NativeControl)?;
-        }
-        // Prepare frame/PKRU/owned stack before the final single raw action
-        // replacement. Bootstrap SIGSYS remains usable throughout preparation.
-        unsafe {
-            crate::trap::install_handler_with_backing(true, self.backing)?;
-        }
-        crate::trap::set_signal_return_restricted();
-        // No new seccomp filter: the authenticated inherited one is the owner.
-        let unblocked = super::signal::reserved_signal_mask();
-        unsafe { crate::signal::raw_sigprocmask(libc::SIG_UNBLOCK, Some(&unblocked), None) }
-            .map_err(io::Error::from_raw_os_error)?;
-        self.owner
-            .region
-            .store(core::ptr::from_ref(region).cast_mut(), Ordering::Release);
-        self.owner.installation.store(2, Ordering::Release);
-        Ok(())
-    }
-}
-unsafe fn verify_final_frontend(
-    control: *mut NativeControl,
-    region: &'static super::tool_region::ToolRegion,
-) -> io::Result<()> {
-    let mut fs = 0_u64;
-    let tid = unsafe { crate::trap::raw_syscall6(libc::SYS_gettid, [0; 6]) };
-    let pid = unsafe { crate::trap::raw_syscall6(libc::SYS_getpid, [0; 6]) };
-    let rc = unsafe {
-        crate::trap::raw_syscall6(
-            libc::SYS_arch_prctl,
-            [0x1003, (&raw mut fs) as u64, 0, 0, 0, 0],
-        )
-    };
-    if rc != 0
-        || fs != unsafe { (&raw const (*control).tool_fs).read_volatile() }
-        || tid <= 0
-        || tid != pid
-        || tid as u64 != unsafe { (&raw const (*control).native_tid).read_volatile() }
-        || unsafe { super::sigalrm::seccomp_filter_count() } != Some(1)
-    {
-        return Err(io::Error::other(
-            "private final Tool FS/process/filter differs",
-        ));
-    }
-    let reserved = super::signal::reserved_signal_mask();
-    let unmaskable = (1_u64 << (libc::SIGKILL - 1)) | (1_u64 << (libc::SIGSTOP - 1));
-    let mut mask = 0_u64;
-    unsafe { crate::signal::raw_sigprocmask(libc::SIG_SETMASK, None, Some(&mut mask)) }
-        .map_err(io::Error::from_raw_os_error)?;
-    if mask != !(reserved | unmaskable) {
-        return Err(io::Error::other(
-            "private final startup signal mask differs",
-        ));
-    }
-    for (signal, instruction) in [(libc::SIGSYS, false), (libc::SIGSEGV, true)] {
-        if reserved & (1_u64 << (signal - 1)) == 0 {
-            continue;
-        }
-        let mut action = crate::signal::KernelSigaction::default();
-        unsafe { crate::signal::raw_sigaction(signal, None, Some(&mut action)) }
-            .map_err(io::Error::from_raw_os_error)?;
-        if action.handler
-            != signal_entry(instruction, crate::trap::pkru_present()) as *const () as u64
-            || action.restorer != crate::trap::FIXED_SIGNAL_RESTORER_ENTRY
-            || action.flags
-                != (libc::SA_SIGINFO | libc::SA_ONSTACK | crate::signal::SA_RESTORER) as u64
-            || action.mask != 0
-        {
-            return Err(io::Error::other(
-                "private final runtime signal action differs",
-            ));
-        }
-    }
-    let owned = region
-        .registered_alternate_stack()
-        .ok_or_else(|| io::Error::other("private final owned signal stack is unpublished"))?;
-    let mut stack: libc::stack_t = unsafe { core::mem::zeroed() };
-    let rc = unsafe {
-        crate::trap::raw_syscall6(
-            libc::SYS_sigaltstack,
-            [0, (&raw mut stack) as u64, 0, 0, 0, 0],
-        )
-    };
-    if rc != 0
-        || stack.ss_flags != 0
-        || stack.ss_sp as usize != owned.bottom
-        || owned.top.checked_sub(owned.bottom) != Some(stack.ss_size)
-    {
-        return Err(io::Error::other(
-            "private final runtime alternate stack differs",
-        ));
-    }
-    Ok(())
-}
-unsafe fn verify_bootstrap_signal(control: *mut NativeControl) -> io::Result<()> {
-    let read = |field: *const u64| unsafe { field.read_volatile() };
-    let tid = unsafe { crate::trap::raw_syscall6(libc::SYS_gettid, [0; 6]) };
-    let pid = unsafe { crate::trap::raw_syscall6(libc::SYS_getpid, [0; 6]) };
-    if tid <= 0
-        || tid != pid
-        || tid as u64 != read(unsafe { &raw const (*control).native_tid })
-        || read(unsafe { &raw const (*control).phase }) != 2
-        || unsafe { super::sigalrm::seccomp_filter_count() } != Some(1)
-    {
-        return Err(io::Error::other(
-            "private bootstrap process/filter identity differs",
-        ));
-    }
-    let mut fs = 0_u64;
-    let rc = unsafe {
-        crate::trap::raw_syscall6(
-            libc::SYS_arch_prctl,
-            [0x1003, (&raw mut fs) as u64, 0, 0, 0, 0],
-        )
-    };
-    if rc != 0 || fs != read(unsafe { &raw const (*control).tool_fs }) {
-        return Err(io::Error::other("private Tool FS differs at handover"));
-    }
-    let mut mask = 0_u64;
-    unsafe { crate::signal::raw_sigprocmask(libc::SIG_SETMASK, None, Some(&mut mask)) }
-        .map_err(io::Error::from_raw_os_error)?;
-    let forced = 1_u64 << (libc::SIGSYS - 1);
-    let unmaskable = (1_u64 << (libc::SIGKILL - 1)) | (1_u64 << (libc::SIGSTOP - 1));
-    if mask != !(forced | unmaskable) {
-        return Err(io::Error::other("private bootstrap startup mask differs"));
-    }
-    let mut action = crate::signal::KernelSigaction::default();
-    unsafe { crate::signal::raw_sigaction(libc::SIGSYS, None, Some(&mut action)) }
-        .map_err(io::Error::from_raw_os_error)?;
-    if action.handler != read(unsafe { &raw const (*control).bootstrap_handler })
-        || action.restorer != crate::trap::FIXED_SIGNAL_RESTORER_ENTRY
-        || action.restorer != read(unsafe { &raw const (*control).bootstrap_restorer })
-        || action.mask != 0
-        || action.flags != (libc::SA_SIGINFO | libc::SA_ONSTACK | crate::signal::SA_RESTORER) as u64
-    {
-        return Err(io::Error::other(
-            "private bootstrap SIGSYS ownership differs",
-        ));
-    }
-    let mut stack: libc::stack_t = unsafe { core::mem::zeroed() };
-    let rc = unsafe {
-        crate::trap::raw_syscall6(
-            libc::SYS_sigaltstack,
-            [0, (&raw mut stack) as u64, 0, 0, 0, 0],
-        )
-    };
-    let first = read(unsafe { &raw const (*control).bootstrap_stack_base });
-    let end = read(unsafe { &raw const (*control).bootstrap_stack_end });
-    if rc != 0
-        || stack.ss_flags != 0
-        || stack.ss_sp as u64 != first
-        || end.checked_sub(first) != Some(stack.ss_size as u64)
-    {
-        return Err(io::Error::other("private bootstrap signal stack differs"));
-    }
-    Ok(())
 }

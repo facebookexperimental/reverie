@@ -750,6 +750,11 @@ fallback_completion_return:
     getpid = const libc::SYS_getpid,
 );
 
+#[cfg(feature = "exec-private-init")]
+pub(crate) fn is_completion_address(address: u64) -> bool {
+    address == core::ptr::addr_of!(fallback_completion_return) as usize as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -884,9 +889,4 @@ mod tests {
         owner.context.instruction_pointer = u64::MAX - 1;
         assert!(commit_context(&mut owner, 3).is_err());
     }
-}
-
-#[cfg(feature = "exec-private-init")]
-pub(crate) fn is_completion_address(address: u64) -> bool {
-    address == core::ptr::addr_of!(fallback_completion_return) as usize as u64
 }
