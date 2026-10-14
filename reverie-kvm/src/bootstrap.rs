@@ -370,25 +370,37 @@ pub(crate) fn process_syscall_return_registers(
     result: i64,
     stack_pointer: Option<u64>,
 ) -> Result<kvm_bindings::kvm_regs> {
-    let return_rip = read_u64(
-        memory,
-        frame_word_address_u64(syscall_frame_address, RETURN_RIP_WORD),
+    // One guest-memory copy for the whole span, words 1 through
+    // SAVED_RBX_WORD: each copy is admitted against the entry gate, and nine
+    // separate word reads cost a quarter of a KVM guest syscall.
+    const FIRST: usize = 1;
+    const LAST: usize = SAVED_RBX_WORD;
+    const _: () = assert!(
+        FIRST <= RETURN_RIP_WORD
+            && RETURN_RIP_WORD <= LAST
+            && FIRST <= RETURN_FLAGS_WORD
+            && RETURN_FLAGS_WORD <= LAST
+            && 6 <= LAST
+    );
+    let mut frame = [0u8; (LAST - FIRST + 1) * std::mem::size_of::<u64>()];
+    memory.read_raw(
+        frame_word_address_u64(syscall_frame_address, FIRST),
+        &mut frame,
     )?;
-    let return_flags = read_u64(
-        memory,
-        frame_word_address_u64(syscall_frame_address, RETURN_FLAGS_WORD),
-    )?;
+    let word = |index: usize| {
+        let start = (index - FIRST) * std::mem::size_of::<u64>();
+        u64::from_le_bytes(frame[start..start + 8].try_into().unwrap())
+    };
+    let return_rip = word(RETURN_RIP_WORD);
+    let return_flags = word(RETURN_FLAGS_WORD);
     registers.rax = result as u64;
-    registers.rdi = read_u64(memory, frame_word_address_u64(syscall_frame_address, 1))?;
-    registers.rsi = read_u64(memory, frame_word_address_u64(syscall_frame_address, 2))?;
-    registers.rdx = read_u64(memory, frame_word_address_u64(syscall_frame_address, 3))?;
-    registers.r10 = read_u64(memory, frame_word_address_u64(syscall_frame_address, 4))?;
-    registers.r8 = read_u64(memory, frame_word_address_u64(syscall_frame_address, 5))?;
-    registers.r9 = read_u64(memory, frame_word_address_u64(syscall_frame_address, 6))?;
-    registers.rbx = read_u64(
-        memory,
-        frame_word_address_u64(syscall_frame_address, SAVED_RBX_WORD),
-    )?;
+    registers.rdi = word(1);
+    registers.rsi = word(2);
+    registers.rdx = word(3);
+    registers.r10 = word(4);
+    registers.r8 = word(5);
+    registers.r9 = word(6);
+    registers.rbx = word(SAVED_RBX_WORD);
     registers.rcx = return_rip;
     registers.r11 = return_flags;
     registers.rip = return_rip;
