@@ -5305,6 +5305,171 @@ mod tests {
         assert_eq!(result, Ok(true));
     }
 
+    #[test]
+    fn fresh_nested_tmpfs_creates_its_requested_target_and_keeps_flags() {
+        if crate::test_runs_in_own_process() {
+            return;
+        }
+        use std::os::unix::fs::MetadataExt;
+
+        let outer = tempfile::tempdir().unwrap();
+        let nested = outer.path().join("new-parent/nested");
+        let marker = outer.path().join("host-marker");
+        std::fs::write(&marker, b"must be covered").unwrap();
+        let parent_namespace = std::fs::metadata("/proc/self/ns/mnt").unwrap();
+        let parent_namespace = (parent_namespace.dev(), parent_namespace.ino());
+        let observed = nested.clone();
+        let flags = super::super::mount::MountFlags::MS_NOSUID
+            | super::super::mount::MountFlags::MS_NODEV
+            | super::super::mount::MountFlags::MS_NOEXEC;
+
+        let result = Container::new()
+            .unshare(Namespace::USER | Namespace::MOUNT)
+            .map_root()
+            .mount(Mount::new("/").rprivate())
+            .mount(Mount::tmpfs(outer.path()))
+            .mount(Mount::tmpfs(&nested).touch_target().flags(flags))
+            .run(move || {
+                let namespace = std::fs::metadata("/proc/self/ns/mnt").unwrap();
+                let directory = std::fs::File::open(&observed).unwrap();
+                let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+                assert_eq!(
+                    unsafe { libc::fstatfs(directory.as_raw_fd(), filesystem.as_mut_ptr()) },
+                    0
+                );
+                let filesystem = unsafe { filesystem.assume_init() };
+                let mounted = nix::sys::statvfs::statvfs(&observed).unwrap();
+                let required = nix::sys::statvfs::FsFlags::ST_NOSUID
+                    | nix::sys::statvfs::FsFlags::ST_NODEV
+                    | nix::sys::statvfs::FsFlags::ST_NOEXEC;
+                (
+                    (namespace.dev(), namespace.ino()) != parent_namespace,
+                    !marker.exists(),
+                    observed.is_dir(),
+                    filesystem.f_type == libc::TMPFS_MAGIC,
+                    mounted.flags().contains(required),
+                    !mounted
+                        .flags()
+                        .contains(nix::sys::statvfs::FsFlags::ST_RDONLY),
+                )
+            });
+
+        assert_eq!(result, Ok((true, true, true, true, true, true)));
+        assert!(
+            !nested.exists(),
+            "child creation must stay in its fresh tmpfs"
+        );
+    }
+
+    #[test]
+    fn fresh_nested_tmpfs_without_touch_refuses_a_missing_target() {
+        if crate::test_runs_in_own_process() {
+            return;
+        }
+        let outer = tempfile::tempdir().unwrap();
+        let nested = outer.path().join("missing");
+        let result = Container::new()
+            .unshare(Namespace::USER | Namespace::MOUNT)
+            .map_root()
+            .mount(Mount::new("/").rprivate())
+            .mount(Mount::tmpfs(outer.path()))
+            .mount(Mount::tmpfs(&nested))
+            .run(|| 42);
+
+        assert_eq!(
+            result,
+            Err(RunError::Spawn(Error::new(Errno::ENOENT, Context::Mount)))
+        );
+        assert!(!nested.exists());
+    }
+
+    #[test]
+    fn fresh_tmpfs_touch_refuses_a_regular_file_target() {
+        if crate::test_runs_in_own_process() {
+            return;
+        }
+        let source = tempfile::NamedTempFile::new().unwrap();
+        let outer = tempfile::tempdir().unwrap();
+        let target = outer.path().join("file");
+        let result = Container::new()
+            .unshare(Namespace::USER | Namespace::MOUNT)
+            .map_root()
+            .mount(Mount::new("/").rprivate())
+            .mount(Mount::tmpfs(outer.path()))
+            .mount(Mount::bind(source.path(), &target).touch_target())
+            .mount(Mount::tmpfs(&target).touch_target())
+            .run(|| 42);
+
+        assert_eq!(
+            result,
+            Err(RunError::Spawn(Error::new(Errno::ENOTDIR, Context::Mount)))
+        );
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn fresh_tmpfs_touch_refuses_symlink_parents_without_creating_through_them() {
+        if crate::test_runs_in_own_process() {
+            return;
+        }
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("destination");
+        let link = parent.path().join("link");
+        std::fs::create_dir(&destination).unwrap();
+        std::os::unix::fs::symlink(&destination, &link).unwrap();
+        let target = link.join("missing");
+        let observed = destination.join("missing");
+        let result = Container::new()
+            .unshare(Namespace::USER | Namespace::MOUNT)
+            .map_root()
+            .mount(Mount::new("/").rprivate())
+            .run(move || {
+                let result = Mount::tmpfs(&target).touch_target().mount();
+                (result, observed.exists())
+            });
+
+        assert_eq!(result, Ok((Err(Errno::ELOOP), false)));
+        assert!(!destination.join("missing").exists());
+    }
+
+    #[test]
+    fn tmpfs_touch_does_not_create_targets_for_other_mount_operations() {
+        if crate::test_runs_in_own_process() {
+            return;
+        }
+        use super::super::mount::MountFlags;
+
+        let outer = tempfile::tempdir().unwrap();
+        let target = outer.path().join("missing");
+        let result = Container::new()
+            .unshare(Namespace::USER | Namespace::MOUNT)
+            .map_root()
+            .mount(Mount::new("/").rprivate())
+            .mount(Mount::tmpfs(outer.path()))
+            .run(move || {
+                for flag in [
+                    MountFlags::MS_BIND,
+                    MountFlags::MS_MOVE,
+                    MountFlags::MS_REMOUNT,
+                    MountFlags::MS_SHARED,
+                    MountFlags::MS_PRIVATE,
+                    MountFlags::MS_SLAVE,
+                    MountFlags::MS_UNBINDABLE,
+                    MountFlags::MS_REC,
+                ] {
+                    let result = Mount::tmpfs(&target).touch_target().flags(flag).mount();
+                    assert!(
+                        result.is_err(),
+                        "missing target unexpectedly mounted: {flag:?}"
+                    );
+                    assert!(!target.exists(), "operation created a target: {flag:?}");
+                }
+                true
+            });
+
+        assert_eq!(result, Ok(true));
+    }
+
     /// A read-only bind of a source on a `nosuid`/`nodev` filesystem must work.
     ///
     /// ⚠️ REGRESSION TEST FOR A WHOLE LOST VALIDATE ARM, not a corner case.

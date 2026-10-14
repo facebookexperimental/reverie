@@ -22,6 +22,8 @@ use std::sync::atomic::Ordering;
 use syscalls::Errno;
 
 use super::fd::Fd;
+use super::mount::BIND_RESTRICTIONS;
+use super::mount::MountFlags;
 
 const RETIRED: i32 = -1;
 const LEASED: i32 = -2;
@@ -206,12 +208,12 @@ pub(super) struct SourceLease<'a> {
 
 impl SourceLease<'_> {
     pub(super) fn reopen(&self) -> Result<Fd, Errno> {
-        self.validate(self.descriptor, false)?;
+        self.validate(self.descriptor, MountFlags::empty())?;
         let reopened = Fd::open_c(
             self.source.path.as_ptr(),
             libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )?;
-        self.validate(reopened.as_raw_fd(), false)?;
+        self.validate(reopened.as_raw_fd(), MountFlags::empty())?;
         if !current_namespace_contains_mount(mount_id(reopened.as_raw_fd())?)? {
             return Err(Errno::EXDEV);
         }
@@ -222,10 +224,22 @@ impl SourceLease<'_> {
         self.source.identity
     }
 
-    pub(super) fn validate(&self, descriptor: i32, readonly: bool) -> Result<(), Errno> {
+    pub(super) fn validate(&self, descriptor: i32, restrictions: MountFlags) -> Result<(), Errno> {
+        if !(restrictions - BIND_RESTRICTIONS).is_empty() {
+            return Err(Errno::EINVAL);
+        }
         let actual = SourceIdentity::read(descriptor)?;
-        let expected_flags =
-            self.source.identity.flags | if readonly { libc::ST_RDONLY } else { 0 };
+        let mut expected_flags = self.source.identity.flags;
+        for (flag, probe) in [
+            (MountFlags::MS_RDONLY, libc::ST_RDONLY),
+            (MountFlags::MS_NOSUID, libc::ST_NOSUID),
+            (MountFlags::MS_NODEV, libc::ST_NODEV),
+            (MountFlags::MS_NOEXEC, libc::ST_NOEXEC),
+        ] {
+            if restrictions.contains(flag) {
+                expected_flags |= probe;
+            }
+        }
         if !self.source.identity.same_object(actual) || actual.flags != expected_flags {
             return Err(Errno::ESTALE);
         }
@@ -540,6 +554,123 @@ mod tests {
         // Container::run has completed actual waitpid before returning.
         for (source, descriptor) in sources.iter().zip(descriptors) {
             assert!(SourceIdentity::read(descriptor).is_ok());
+            assert!(source.lease().unwrap().reopen().is_ok());
+        }
+    }
+
+    #[test]
+    fn checked_socket_bind_adds_restrictions_without_changing_source_policy() {
+        if crate::test_runs_in_own_process() {
+            return;
+        }
+        use std::io::Read;
+        use std::io::Write;
+        use std::os::unix::net::UnixListener;
+        use std::os::unix::net::UnixStream;
+
+        for source_readonly in [false, true] {
+            let backing = tempfile::tempdir_in("/tmp").unwrap();
+            let directory = backing.path().join("source");
+            fs::create_dir(&directory).unwrap();
+            let socket = directory.join("channel");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let mut outer = isolated_mounts();
+            if source_readonly {
+                outer.mount(Mount::bind(&directory, &directory).readonly());
+            }
+            outer
+                .run(|| {
+                    let source = PinnedMountSource::open(&socket).unwrap();
+                    let expected = source.inner.identity;
+                    if source_readonly {
+                        assert_ne!(expected.flags & libc::ST_RDONLY, 0);
+                    }
+                    for readonly in [false, true] {
+                        let target =
+                            backing
+                                .path()
+                                .join(if readonly { "ro/socket" } else { "rw/socket" });
+                        let mut mount = Mount::bind_pinned(&source, &target)
+                            .flags(
+                                MountFlags::MS_NOSUID
+                                    | MountFlags::MS_NODEV
+                                    | MountFlags::MS_NOEXEC,
+                            )
+                            .touch_target();
+                        if readonly {
+                            mount = mount.readonly();
+                        }
+                        isolated_mounts()
+                            .mount(mount)
+                            .run(|| {
+                                let destination = Fd::open(
+                                    &target,
+                                    libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                                )
+                                .unwrap();
+                                let actual = SourceIdentity::read(destination.as_raw_fd()).unwrap();
+                                assert!(expected.same_object(actual));
+                                assert_eq!(
+                                    actual.flags,
+                                    expected.flags
+                                        | libc::ST_NOSUID
+                                        | libc::ST_NODEV
+                                        | libc::ST_NOEXEC
+                                        | if readonly { libc::ST_RDONLY } else { 0 }
+                                );
+                                let mut stream = UnixStream::connect(&target).unwrap();
+                                stream.write_all(b"pinned").unwrap();
+                                let (mut accepted, _) = listener.accept().unwrap();
+                                let mut bytes = [0; 6];
+                                accepted.read_exact(&mut bytes).unwrap();
+                                assert_eq!(&bytes, b"pinned");
+                                assert_eq!(
+                                    SourceIdentity::read(
+                                        source.lease().unwrap().reopen().unwrap().as_raw_fd()
+                                    )
+                                    .unwrap(),
+                                    expected
+                                );
+                            })
+                            .unwrap();
+                        assert_eq!(
+                            SourceIdentity::read(
+                                source.lease().unwrap().reopen().unwrap().as_raw_fd()
+                            )
+                            .unwrap(),
+                            expected
+                        );
+                    }
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn checked_bind_rejects_unsupported_flags_before_creating_target() {
+        let backing = tempfile::tempdir_in("/tmp").unwrap();
+        let source_path = backing.path().join("source");
+        fs::write(&source_path, b"input").unwrap();
+        let source = PinnedMountSource::open(&source_path).unwrap();
+        for flag in [
+            MountFlags::MS_REMOUNT,
+            MountFlags::MS_MOVE,
+            MountFlags::MS_PRIVATE,
+            MountFlags::MS_SHARED,
+            MountFlags::MS_SLAVE,
+            MountFlags::MS_UNBINDABLE,
+            MountFlags::MS_SYNCHRONOUS,
+        ] {
+            let target = backing.path().join("absent/target");
+            assert_eq!(
+                Mount::bind_pinned(&source, &target)
+                    .readonly()
+                    .flags(flag)
+                    .touch_target()
+                    .mount(),
+                Err(Errno::EINVAL)
+            );
+            assert!(!target.parent().unwrap().exists());
             assert!(source.lease().unwrap().reopen().is_ok());
         }
     }

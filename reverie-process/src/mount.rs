@@ -28,6 +28,15 @@ use super::fd::touch_path;
 use super::pinned_mount::PinnedMountSource;
 use super::pinned_mount::descriptor_path;
 
+/// Additional restrictions on the top mount of a checked bind. Recursive
+/// binds retain the existing policy of their descendant mounts.
+pub(super) const BIND_RESTRICTIONS: MountFlags = MountFlags::from_bits_retain(
+    MountFlags::MS_RDONLY.bits()
+        | MountFlags::MS_NOSUID.bits()
+        | MountFlags::MS_NODEV.bits()
+        | MountFlags::MS_NOEXEC.bits(),
+);
+
 /// A mount.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Mount {
@@ -254,8 +263,12 @@ impl Mount {
             .map(|s| Path::new(OsStr::from_bytes(s.to_bytes())))
     }
 
-    /// Indicates that the target of a bind mount should be created
-    /// automatically.
+    /// Creates a missing target for a bind mount or a new tmpfs mount.
+    ///
+    /// New tmpfs targets must be absolute directories with no symlink path
+    /// components. Creation happens after preceding mounts, so a nested target
+    /// can live in a fresh filesystem. Tmpfs remount, move, recursive and
+    /// propagation operations do not create targets. Bind behavior is unchanged.
     pub fn touch_target(mut self) -> Self {
         self.touch_target = true;
         self
@@ -454,7 +467,7 @@ impl Mount {
     }
 
     fn mount_pinned(&self, source: &PinnedMountSource) -> Result<(), Errno> {
-        let allowed = MountFlags::MS_BIND | MountFlags::MS_REC | MountFlags::MS_RDONLY;
+        let allowed = MountFlags::MS_BIND | MountFlags::MS_REC | BIND_RESTRICTIONS;
         if !self.flags.contains(MountFlags::MS_BIND)
             || !(self.flags - allowed).is_empty()
             || self.fstype.is_some()
@@ -484,14 +497,16 @@ impl Mount {
             self.target_ptr(),
             libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )?;
-        lease.validate(destination.as_raw_fd(), false)?;
-        if self.flags.contains(MountFlags::MS_RDONLY) {
+        lease.validate(destination.as_raw_fd(), MountFlags::empty())?;
+        let restrictions = self.flags & BIND_RESTRICTIONS;
+        if !restrictions.is_empty() {
             // Use the destination descriptor so a bound symlink's referent is
             // never mistaken for the mount being sealed.
             let mut path = [0; 64];
             let path = descriptor_path(b"/proc/self/fd/", destination.as_raw_fd(), &mut path)?;
-            let mut flags = MountFlags::MS_BIND | MountFlags::MS_REMOUNT | MountFlags::MS_RDONLY;
+            let mut flags = MountFlags::MS_BIND | MountFlags::MS_REMOUNT | restrictions;
             for (probe, flag) in [
+                (libc::ST_RDONLY, MountFlags::MS_RDONLY),
                 (libc::ST_NOSUID, MountFlags::MS_NOSUID),
                 (libc::ST_NODEV, MountFlags::MS_NODEV),
                 (libc::ST_NOEXEC, MountFlags::MS_NOEXEC),
@@ -513,10 +528,7 @@ impl Mount {
                 )
             })?;
         }
-        lease.validate(
-            destination.as_raw_fd(),
-            self.flags.contains(MountFlags::MS_RDONLY),
-        )?;
+        lease.validate(destination.as_raw_fd(), restrictions)?;
         // The final bound link was checked through its nofollow descriptor.
         // Parent components must still be directories, including for links.
         self.verify_pinned_target(None, false)?;
@@ -596,6 +608,25 @@ impl Mount {
         }
         if let Some(source) = &self.pinned_source {
             return self.mount_pinned(source);
+        }
+        let other_operations = MountFlags::MS_BIND
+            | MountFlags::MS_REMOUNT
+            | MountFlags::MS_MOVE
+            | MountFlags::MS_SHARED
+            | MountFlags::MS_PRIVATE
+            | MountFlags::MS_SLAVE
+            | MountFlags::MS_UNBINDABLE
+            | MountFlags::MS_REC;
+        if self.touch_target
+            && self
+                .fstype
+                .as_ref()
+                .is_some_and(|fstype| fstype.as_bytes() == b"tmpfs")
+            && !self.flags.intersects(other_operations)
+        {
+            // The same allocation-free nofollow checks used for pinned targets
+            // refuse links and non-directories before and after creation.
+            self.prepare_pinned_target(true)?;
         }
         // NOTE: Although we can't allocate here, we can safely *modify* `self`.
         // When this function is called, we have forked virtual memory and any
