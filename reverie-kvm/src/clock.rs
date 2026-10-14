@@ -778,6 +778,159 @@ struct CounterBinding {
     enabled: bool,
     /// Set by another binding on this host task that disabled this event.
     displaced: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The event's user page, when Linux maps one: reads then take no syscall.
+    page: Option<UserPage>,
+}
+
+/// An event's first mmap page. While the event is on a hardware counter, Linux
+/// publishes the counter's index and the offset from its raw value there, with
+/// the enabled and running times, under a sequence lock. The calling task then
+/// reads the count with `rdpmc` and the times from the TSC, exactly as the
+/// kernel's own read would report them, without a `read` syscall.
+///
+/// One limitation is inherited from the documented recipe. If root changes
+/// `/sys/bus/event_source/devices/cpu/rdpmc` from 1 to 0 while a run is in
+/// progress, Linux revokes user `rdpmc` at once but leaves `cap_user_rdpmc`
+/// set on existing events, so the next `rdpmc` faults and the process dies
+/// with SIGSEGV. It fails loudly; it never returns a wrong count.
+struct UserPage(std::ptr::NonNull<perf::perf_event_mmap_page>);
+
+// SAFETY: the page is a read-only shared mapping with no thread affinity. This
+// process only reads it, through volatile loads that take no reference, and
+// unmaps it once when dropped; sharing `&UserPage` therefore races nothing
+// but Linux's own writes, which the sequence lock covers.
+unsafe impl Send for UserPage {}
+unsafe impl Sync for UserPage {}
+
+const USER_PAGE_BYTES: usize = 4096;
+
+/// A read that keeps racing an update of the page falls back to `read`.
+const USER_READ_ATTEMPTS: usize = 8;
+
+/// `perf_event_mmap_page::capabilities` bits (include/uapi/linux/perf_event.h).
+const CAP_USER_RDPMC: u64 = 1 << 2;
+const CAP_USER_TIME: u64 = 1 << 3;
+const CAP_USER_TIME_SHORT: u64 = 1 << 5;
+
+impl UserPage {
+    fn map(fd: &OwnedFd) -> Option<Self> {
+        // SAFETY: a fresh read-only shared mapping of this live perf event's
+        // first page; no existing memory is affected.
+        let page = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                USER_PAGE_BYTES,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        if page == libc::MAP_FAILED {
+            return None;
+        }
+        std::ptr::NonNull::new(page.cast()).map(Self)
+    }
+
+    /// The event's current count and times, read in user space, or None when
+    /// Linux does not allow that right now: the event is not on a hardware
+    /// counter (disabled, displaced, or not yet scheduled), the page lacks the
+    /// rdpmc or time capability, or every attempt raced an update. The caller
+    /// then reads through the syscall, which is always exact.
+    ///
+    /// This is the algorithm documented for `perf_event_mmap_page` in
+    /// include/uapi/linux/perf_event.h. A torn snapshot is never returned: the
+    /// sequence lock must be unchanged across all loads and the `rdpmc`.
+    fn read(&self) -> Option<CounterRead> {
+        let page = self.0.as_ptr();
+        // SAFETY (all loads below): `page` is this live mapping, and Linux
+        // writes these fields concurrently, so each is a volatile load.
+        macro_rules! load {
+            ($field:ident) => {
+                unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*page).$field)) }
+            };
+        }
+        for _ in 0..USER_READ_ATTEMPTS {
+            let sequence = load!(lock);
+            std::sync::atomic::compiler_fence(Ordering::SeqCst);
+            let capabilities = unsafe {
+                std::ptr::read_volatile(std::ptr::addr_of!((*page).__bindgen_anon_1.capabilities))
+            };
+            let index = load!(index);
+            let width = u32::from(load!(pmc_width));
+            if capabilities & CAP_USER_RDPMC == 0
+                || capabilities & CAP_USER_TIME == 0
+                || index == 0
+                || !(1..=64).contains(&width)
+            {
+                return None;
+            }
+            let offset = load!(offset);
+            let enabled = load!(time_enabled);
+            let running = load!(time_running);
+            let shift = u32::from(load!(time_shift));
+            let mult = u64::from(load!(time_mult));
+            let time_offset = load!(time_offset);
+            // SAFETY: rdtsc has no preconditions.
+            let mut cycles = unsafe { std::arch::x86_64::_rdtsc() };
+            if capabilities & CAP_USER_TIME_SHORT != 0 {
+                let base = load!(time_cycles);
+                cycles = base.wrapping_add(cycles.wrapping_sub(base) & load!(time_mask));
+            }
+            if shift >= 64 {
+                return None;
+            }
+            let quotient = cycles >> shift;
+            let remainder = cycles & ((1u64 << shift) - 1);
+            let delta = time_offset
+                .wrapping_add(quotient.wrapping_mul(mult))
+                .wrapping_add(remainder.wrapping_mul(mult) >> shift);
+            let (low, high): (u32, u32);
+            // SAFETY: Linux reported user rdpmc for counter `index - 1` under
+            // this sequence; a counter that moved is caught by the recheck.
+            unsafe {
+                std::arch::asm!(
+                    "rdpmc",
+                    in("ecx") index - 1,
+                    out("eax") low,
+                    out("edx") high,
+                    options(nostack, preserves_flags),
+                );
+            }
+            let raw = (u64::from(high) << 32) | u64::from(low);
+            // Sign-extend the counter's `width` bits, as the kernel does.
+            let pmc = ((raw << (64 - width)) as i64) >> (64 - width);
+            std::sync::atomic::compiler_fence(Ordering::SeqCst);
+            if load!(lock) == sequence {
+                return Some(CounterRead {
+                    value: offset.wrapping_add(pmc) as u64,
+                    enabled: enabled.wrapping_add(delta),
+                    running: running.wrapping_add(delta),
+                });
+            }
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+impl UserPage {
+    /// Whether Linux grants this page user `rdpmc` and user time.
+    fn allows_user_read(&self) -> bool {
+        let page = self.0.as_ptr();
+        // SAFETY: a volatile load from this live mapping.
+        let capabilities = unsafe {
+            std::ptr::read_volatile(std::ptr::addr_of!((*page).__bindgen_anon_1.capabilities))
+        };
+        capabilities & CAP_USER_RDPMC != 0 && capabilities & CAP_USER_TIME != 0
+    }
+}
+
+impl Drop for UserPage {
+    fn drop(&mut self) {
+        // SAFETY: unmapping exactly the mapping created by `map`.
+        unsafe { libc::munmap(self.0.as_ptr().cast(), USER_PAGE_BYTES) };
+    }
 }
 
 impl CounterBinding {
@@ -825,7 +978,9 @@ impl CounterBinding {
             last_end: CounterRead::default(),
             enabled: false,
             displaced: Default::default(),
+            page: None,
         };
+        binding.page = UserPage::map(&binding.fd);
         binding.previous = binding.read()?;
         binding.last_end = binding.previous;
         if binding.previous.value != 0 {
@@ -889,6 +1044,13 @@ impl CounterBinding {
     }
 
     fn read(&self) -> Result<CounterRead> {
+        if let Some(read) = self.page.as_ref().and_then(UserPage::read) {
+            return Ok(read);
+        }
+        self.read_syscall()
+    }
+
+    fn read_syscall(&self) -> Result<CounterRead> {
         let mut value = CounterRead::default();
         // SAFETY: the event's read_format is exactly these three native u64s.
         let count = unsafe {
@@ -1185,6 +1347,109 @@ mod tests {
             last_end: CounterRead::default(),
             enabled: false,
             displaced: Default::default(),
+            page: None,
+        }
+    }
+
+    /// A pinned host event on this task counting branches, in user mode only
+    /// when `count_user`; otherwise it counts nothing, as a guest-only event
+    /// does while its host task runs host code.
+    fn host_branch_event(count_user: bool) -> OwnedFd {
+        let mut attr = perf::perf_event_attr {
+            type_: perf::PERF_TYPE_HARDWARE,
+            size: std::mem::size_of::<perf::perf_event_attr>() as u32,
+            config: perf::PERF_COUNT_HW_BRANCH_INSTRUCTIONS as u64,
+            read_format: (perf::PERF_FORMAT_TOTAL_TIME_ENABLED
+                | perf::PERF_FORMAT_TOTAL_TIME_RUNNING) as u64,
+            ..Default::default()
+        };
+        attr.set_disabled(1);
+        attr.set_pinned(1);
+        attr.set_exclude_kernel(1);
+        attr.set_exclude_hv(1);
+        attr.set_exclude_user(u64::from(!count_user));
+        // SAFETY: a non-sampling event for this task on any CPU.
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_perf_event_open,
+                &attr,
+                0,
+                -1,
+                -1,
+                perf::PERF_FLAG_FD_CLOEXEC,
+            )
+        };
+        assert!(
+            fd >= 0,
+            "perf_event_open: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: a newly owned descriptor.
+        unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) }
+    }
+
+    fn syscall_read(fd: &OwnedFd) -> CounterRead {
+        let mut value = CounterRead::default();
+        // SAFETY: the event's read_format is exactly these three u64s.
+        let count = unsafe {
+            libc::read(
+                fd.as_raw_fd(),
+                std::ptr::from_mut(&mut value).cast(),
+                std::mem::size_of::<CounterRead>(),
+            )
+        };
+        assert_eq!(count as usize, std::mem::size_of::<CounterRead>());
+        value
+    }
+
+    #[test]
+    fn user_page_reads_agree_with_the_read_syscall() {
+        for count_user in [false, true] {
+            let fd = host_branch_event(count_user);
+            let page = UserPage::map(&fd).expect("perf user page");
+            // A disabled event is on no hardware counter: no user read.
+            assert!(page.read().is_none());
+            // SAFETY: the descriptor is a live perf event.
+            assert!(unsafe { ioctls::ENABLE(fd.as_raw_fd(), 0) } >= 0);
+            if !page.allows_user_read() {
+                // The designed fallback: every read takes read(2).
+                println!("user counter read: NOT EXECUTED; this host grants no user rdpmc or time");
+                return;
+            }
+            let mut sink = 0u64;
+            for i in 0..10_000u64 {
+                if std::hint::black_box(i) % 3 == 0 {
+                    sink += 1;
+                }
+            }
+            std::hint::black_box(sink);
+            let before = page.read().expect("user read of an active event");
+            let syscall = syscall_read(&fd);
+            let after = page.read().expect("user read of an active event");
+            if count_user {
+                // Exact up to the user branches between the three reads.
+                assert!(before.value > 10_000, "{before:?}");
+                assert!(before.value <= syscall.value, "{before:?} {syscall:?}");
+                assert!(syscall.value <= after.value, "{syscall:?} {after:?}");
+                assert!(after.value - before.value < 10_000, "{before:?} {after:?}");
+            } else {
+                assert_eq!(before.value, 0);
+                assert_eq!(syscall.value, 0);
+                assert_eq!(after.value, 0);
+            }
+            // The residency check compares enabled - running; both reads
+            // must report the same gap (zero for an always-scheduled event).
+            assert_eq!(
+                before.enabled - before.running,
+                syscall.enabled - syscall.running
+            );
+            assert_eq!(
+                after.enabled - after.running,
+                syscall.enabled - syscall.running
+            );
+            // SAFETY: the descriptor is a live perf event.
+            assert!(unsafe { ioctls::DISABLE(fd.as_raw_fd(), 0) } >= 0);
+            assert!(page.read().is_none());
         }
     }
 

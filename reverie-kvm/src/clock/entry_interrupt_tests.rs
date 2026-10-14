@@ -365,6 +365,31 @@ fn migrating_host_task_keeps_exact_finite_program_branch_total() {
         "the vCPU task never ran on a second CPU: {observed:?}"
     );
     assert_eq!(backend.vcpu.read_clock().unwrap(), u64::from(BRANCHES));
+    // The event stays enabled on this task between entries, so its count is
+    // read in user space when Linux allows it. On each CPU the task is moved
+    // to, the user read must equal read(2) exactly: the count (which includes
+    // every guest branch since the event opened) and the residency gap.
+    let binding = backend.vcpu.clock.binding.as_ref().unwrap();
+    let page = binding.page.as_ref().expect("perf user page");
+    if page.allows_user_read() {
+        for &cpu in &permitted[..2] {
+            let mut set = unsafe { std::mem::zeroed() };
+            unsafe { libc::CPU_SET(cpu, &mut set) };
+            set_affinity(&set).unwrap();
+            let user = page.read().expect("user read of the enabled event");
+            let syscall = binding.read_syscall().unwrap();
+            assert!(user.value >= u64::from(BRANCHES), "{user:?}");
+            assert_eq!(user.value, syscall.value, "cpu {cpu}");
+            assert_eq!(
+                user.enabled - user.running,
+                syscall.enabled - syscall.running,
+                "cpu {cpu}"
+            );
+        }
+    } else {
+        println!("clock migration user read: NOT EXECUTED; no user rdpmc or time");
+    }
+    set_affinity(&original).unwrap();
     assert!(same_affinity(&affinity().unwrap(), &original));
 }
 
