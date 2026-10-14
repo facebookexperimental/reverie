@@ -401,7 +401,8 @@ fn synced_registers_match_kvm_and_never_go_stale() {
     changed.rax = 0x1234_5678;
     backend.vcpu.set_regs(&changed).unwrap();
     assert_eq!(backend.vcpu.get_regs().unwrap().rax, 0x1234_5678);
-    // A nonzero synced interrupt bitmap is never returned from the copy.
+    // This backend injects no interrupt, so KVM synced an empty bitmap here.
+    // a_nonzero_synced_interrupt_bitmap_is_read_from_kvm covers a stale bit.
     assert!(
         synced_special
             .interrupt_bitmap
@@ -409,6 +410,30 @@ fn synced_registers_match_kvm_and_never_go_stale() {
             .all(|word| *word == 0)
     );
     println!("synced registers: matched KVM_GET_REGS/SREGS and followed a raw write");
+}
+
+#[test]
+fn a_nonzero_synced_interrupt_bitmap_is_read_from_kvm() {
+    let mut backend =
+        crate::KvmBackend::new(16 * 1024 * 1024).expect("synced registers require /dev/kvm");
+    install_counted_program(&mut backend, &finite_program(1 << 10));
+    reaches_getpid(&mut backend.vcpu);
+    if !backend.vcpu.sync_regs {
+        println!("synced bitmap: NOT EXECUTED; KVM lacks KVM_CAP_SYNC_REGS here");
+        return;
+    }
+    // KVM sets bits in the synced interrupt bitmap at an exit and never clears
+    // them. Leave a stale bit there while the synced copy is still current:
+    // the field is reached directly, so no Deref retires the copy.
+    backend.vcpu.fd.sync_regs_mut().sregs.interrupt_bitmap[0] = 1;
+    assert!(backend.vcpu.synced_exit.load(Ordering::Relaxed));
+    // The read must come from KVM_GET_SREGS, which reports no pending
+    // interrupt, rather than return the stale synced bit.
+    let special = backend.vcpu.get_sregs().unwrap();
+    assert_eq!(special.interrupt_bitmap, [0; 4]);
+    assert_eq!(special.cs, backend.vcpu.fd.sync_regs().sregs.cs);
+    backend.vcpu.fd.sync_regs_mut().sregs.interrupt_bitmap[0] = 0;
+    println!("synced bitmap: a stale nonzero bitmap was read from KVM");
 }
 
 fn change_sigurg(how: libc::c_int) {
