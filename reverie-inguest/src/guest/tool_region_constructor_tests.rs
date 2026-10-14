@@ -9,7 +9,6 @@
 //! Isolated native mechanism controls, not actual Detcore constructor credit.
 
 use core::mem::offset_of;
-use core::mem::size_of_val;
 use core::sync::atomic::AtomicUsize;
 
 use super::super::constructor::*;
@@ -84,7 +83,10 @@ fn scalar_query_reports_samples_without_initializing_absent_owner() {
         "constructor::scalar_query_reports_samples_without_initializing_absent_owner",
         || {
             let mut bytes = [u64::MAX; 16];
-            assert_eq!(size_of::<ConstructorStackRecord>(), size_of_val(&bytes));
+            assert_eq!(
+                size_of::<ConstructorStackRecord>(),
+                core::mem::size_of_val(&bytes)
+            );
             assert_eq!(
                 unsafe { reverie_inguest_constructor_stack_query(bytes.as_mut_ptr().cast()) },
                 -1
