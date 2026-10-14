@@ -38,6 +38,27 @@ fn run_fixture(name: &str, client_argument: &str) -> Output {
 }
 
 fn run_fixture_with_env(name: &str, client_argument: &str, env: &[(&str, &str)]) -> Output {
+    run_fixture_under(name, client_argument, env, "")
+}
+
+/// [`run_fixture_with_env`] in a fresh user and PID namespace, where the
+/// guest's host IDs are small numbers that equal virtual IDs the client
+/// allocates.
+fn run_fixture_in_pid_namespace(name: &str, client_argument: &str, env: &[(&str, &str)]) -> Output {
+    run_fixture_under(
+        name,
+        client_argument,
+        env,
+        "unshare --user --map-root-user --pid --fork --mount-proc ",
+    )
+}
+
+fn run_fixture_under(
+    name: &str,
+    client_argument: &str,
+    env: &[(&str, &str)],
+    launcher_prefix: &str,
+) -> Output {
     let directory = tempfile::tempdir().expect("fixture tempdir");
     let fixture = compile_fixture(directory.path(), name);
     // A broken startup gate can prevent the guest from handling even SIGALRM.
@@ -46,7 +67,9 @@ fn run_fixture_with_env(name: &str, client_argument: &str, env: &[(&str, &str)])
     let launcher = directory.path().join("bounded-drrun");
     std::fs::write(
         &launcher,
-        b"#!/bin/sh\nexec timeout --signal=TERM --kill-after=2s 10s \"$REVERIE_DBT_TEST_DRRUN\" \"$@\"\n",
+        format!(
+            "#!/bin/sh\nexec timeout --signal=TERM --kill-after=2s 10s {launcher_prefix}\"$REVERIE_DBT_TEST_DRRUN\" \"$@\"\n"
+        ),
     )
     .expect("write bounded launcher");
     std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))
@@ -190,7 +213,10 @@ fn clone_settid_words_hold_the_virtual_tid() {
 /// `clone_settid_words_hold_the_virtual_tid`), and Linux marks only words
 /// naming the dying thread's host TID, so the client rewrites them just before
 /// the native exit or exec, and back if the exec fails (Claude reviews of
-/// https://github.com/rrnewton/reverie/pull/1020). A SIGKILLed owner runs no
+/// https://github.com/rrnewton/reverie/pull/1020). A non-leader exec caller's
+/// own words naming the thread group ID are rewritten to the host one too, as
+/// Linux walks that caller's list under it, and back if its exec fails
+/// (https://github.com/rrnewton/reverie/issues/1052). A SIGKILLed owner runs no
 /// client code, so its mutex is not marked: the pinned ETIMEDOUT flips when
 /// https://github.com/rrnewton/hermit/issues/4239 is fixed.
 #[test]
@@ -198,12 +224,69 @@ fn clone_settid_words_hold_the_virtual_tid() {
 fn a_dead_robust_mutex_owner_is_marked_owner_dead() {
     let output = run_fixture("robust_owner_death", "-test-wait-for-background");
     assert!(output.status.success(), "guest failed: {output:?}");
-    assert_eq!(
-        output.stdout,
-        b"robust fork_child=1 thread=1 exit_group_thread=1 waited_thread=1 \
-          exec_child=1 exec_killed_thread=1 failed_exec=1 sigkill=ETIMEDOUT \
-          walk_stop=1\n"
-    );
+    assert_eq!(output.stdout, ROBUST_OWNER_DEATH_OUTPUT);
+    for (first, expected) in [
+        (
+            "failed-exec",
+            &b"robust first_failed_exec=1 id_overlap=0\n"[..],
+        ),
+        ("exec", &b"robust first_exec=ETIMEDOUT id_overlap=0\n"[..]),
+    ] {
+        let output = run_fixture_with_env(
+            "robust_owner_death",
+            "-test-wait-for-background",
+            &[("ROBUST_OWNER_DEATH_FIRST", first)],
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(expected),
+            "{first}"
+        );
+        assert!(output.status.success(), "{first}: guest failed: {output:?}");
+    }
+}
+
+const ROBUST_OWNER_DEATH_OUTPUT: &[u8] =
+    b"robust fork_child=1 thread=1 exit_group_thread=1 waited_thread=1 \
+      exec_child=1 exec_killed_thread=1 failed_exec=1 sigkill=ETIMEDOUT \
+      walk_stop=1 tgid_exec=1 tgid_failed_exec=1\n";
+
+/// The same cases in a fresh PID namespace, and two more that a process runs
+/// as the first thing it does (`ROBUST_OWNER_DEATH_FIRST`). There the client's
+/// virtual IDs and the kernel's host IDs are equal small numbers: the first
+/// worker's host TID is its process's virtual PID, which each run checks
+/// (`id_overlap=1`). A rewrite that matched the output of another rewrite would
+/// then corrupt that worker's own word: its unlock after a failed exec would
+/// get EPERM, and its successful exec would have Linux mark a word Linux
+/// leaves alone (Codex review of
+/// https://github.com/rrnewton/reverie/pull/1053). Each word is rewritten at
+/// most once, by the owner the guest gave it, and a failed exec restores
+/// exactly the words rewritten.
+#[test]
+#[ignore = "requires a built DynamoRIO, the reverie-dbt native client and unprivileged user namespaces; run explicitly with --ignored"]
+fn a_dead_robust_mutex_owner_is_marked_owner_dead_in_a_pid_namespace() {
+    let all = run_fixture_in_pid_namespace("robust_owner_death", "-test-wait-for-background", &[]);
+    assert!(all.status.success(), "guest failed: {all:?}");
+    assert_eq!(all.stdout, ROBUST_OWNER_DEATH_OUTPUT);
+    for (first, expected) in [
+        (
+            "failed-exec",
+            &b"robust first_failed_exec=1 id_overlap=1\n"[..],
+        ),
+        ("exec", &b"robust first_exec=ETIMEDOUT id_overlap=1\n"[..]),
+    ] {
+        let output = run_fixture_in_pid_namespace(
+            "robust_owner_death",
+            "-test-wait-for-background",
+            &[("ROBUST_OWNER_DEATH_FIRST", first)],
+        );
+        assert!(output.status.success(), "{first}: guest failed: {output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(expected),
+            "{first}"
+        );
+    }
 }
 
 /// The native client's atomic guest-word compare-and-exchange, which Detcore

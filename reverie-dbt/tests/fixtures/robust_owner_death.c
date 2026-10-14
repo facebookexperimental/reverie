@@ -36,8 +36,34 @@
  *    second word must keep the thread's TID: neither marked nor rewritten.
  *    The same list without the misaligned entry is marked (Claude re-check of
  *    https://github.com/rrnewton/reverie/pull/1020).
+ * 10. tgid_exec: in a forked child, a second thread locks a process-shared
+ *    mutex, sets its owner field to the thread group ID (as a hand-written
+ *    lock may), and execs. de_thread gives that caller the thread group ID
+ *    before Linux walks its list, so Linux marks the word
+ *    (https://github.com/rrnewton/reverie/issues/1052).
+ * 11. tgid_failed_exec: the same, but the exec fails, so the owner field must
+ *    name the thread group ID again afterwards, as the guest left it.
  *
- * Each later lock in cases 1 to 3, 5, 6 and 8 waits at most one second:
+ * With ROBUST_OWNER_DEATH_FIRST set, the process instead runs one case as the
+ * first thing it does, so that its worker is the first thread it creates. In
+ * a fresh PID namespace that worker's host TID equals the process's virtual
+ * PID, which catches a rewrite that matches the output of another rewrite
+ * (Codex review of https://github.com/rrnewton/reverie/pull/1053). Each case
+ * prints id_overlap: whether the two IDs were equal.
+ * - failed-exec: the worker locks a mutex of its own (the owner field names
+ *   its TID) and its exec fails: the field must be unchanged and the unlock
+ *   must succeed.
+ * - exec: a forked child waits on a process-shared mutex that the worker
+ *   locks before it execs this program again. de_thread gives the worker the
+ *   thread group ID before Linux walks its list, so Linux leaves a word
+ *   naming the worker's old TID alone, and the child's lock times out. Once
+ *   the new image has told the child (through an inherited pipe) that the
+ *   exec is complete, the word must still be unmarked and must not name the
+ *   thread group's host ID (the child's host parent ID, from /proc):
+ *   rewriting the worker's TID and then that output as the group's virtual
+ *   ID would have Linux mark it.
+ *
+ * Each later lock in cases 1 to 3, 5, 6, 8 and 10 waits at most one second:
  * ETIMEDOUT means the owner's death was missed. Case 4 blocks; a missed wake
  * hangs it until the test's timeout. */
 
@@ -49,6 +75,7 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>
 #include <sys/mman.h>
@@ -126,6 +153,188 @@ static void* lock_until_told(void* argument) {
   return (void*)(long)pthread_mutex_unlock(held_mutex);
 }
 
+static void* lock_as_group_and_exec(void* argument) {
+  (void)argument;
+  pthread_mutex_lock(held_mutex);
+  _Atomic uint32_t* word = (_Atomic uint32_t*)&held_mutex->__data.__lock;
+  uint32_t value = atomic_load(word);
+  while (!atomic_compare_exchange_strong(
+      word, &value, (value & ~FUTEX_TID_MASK) | (uint32_t)getpid())) {
+  }
+  execl("/bin/true", "true", (char*)NULL);
+  _exit(3);
+  return NULL;
+}
+
+static void* lock_as_group_and_fail_exec(void* argument) {
+  (void)argument;
+  pthread_mutex_t* mine = make_mutex(0);
+  pthread_mutex_lock(mine);
+  _Atomic uint32_t* word = (_Atomic uint32_t*)&mine->__data.__lock;
+  uint32_t value = atomic_load(word);
+  uint32_t as_group = (value & ~FUTEX_TID_MASK) | (uint32_t)getpid();
+  while (!atomic_compare_exchange_strong(word, &value, as_group)) {
+    as_group = (value & ~FUTEX_TID_MASK) | (uint32_t)getpid();
+  }
+  execl("/nonexistent/robust-owner-death", "missing", (char*)NULL);
+  _exit(atomic_load(word) == as_group ? 0 : 1);
+  return NULL;
+}
+
+/* A field ("Pid" or "PPid") of the calling thread's /proc status, which
+ * holds host IDs. */
+static int host_status_id(const char* field) {
+  int id = -1;
+  char format[16];
+  snprintf(format, sizeof(format), "%s: %%d", field);
+  FILE* status = fopen("/proc/thread-self/status", "r");
+  if (status != NULL) {
+    char line[256];
+    while (fgets(line, sizeof(line), status) != NULL) {
+      if (strncmp(line, field, strlen(field)) == 0 && line[strlen(field)] == ':')
+        sscanf(line, format, &id);
+    }
+    fclose(status);
+  }
+  return id;
+}
+
+/* Whether the calling thread's host TID equals the process's virtual PID. */
+static int id_overlap(void) {
+  return host_status_id("Pid") == getpid();
+}
+
+static const char* self_path;
+static _Atomic int* first_locked;
+static _Atomic int* first_waiter_ready;
+static char first_exec_done_fd[16];
+
+static void* first_failed_exec(void* argument) {
+  (void)argument;
+  int overlap = id_overlap();
+  pthread_mutex_t* mine = make_mutex(0);
+  pthread_mutex_lock(mine);
+  _Atomic uint32_t* word = (_Atomic uint32_t*)&mine->__data.__lock;
+  uint32_t before = atomic_load(word);
+  execl("/nonexistent/robust-owner-death", "missing", (char*)NULL);
+  int kept = atomic_load(word) == before &&
+      (before & FUTEX_TID_MASK) == (uint32_t)syscall(SYS_gettid);
+  int unlocked = pthread_mutex_unlock(mine) == 0;
+  printf(
+      "robust first_failed_exec=%d id_overlap=%d\n", kept && unlocked, overlap);
+  fflush(stdout);
+  _exit(kept && unlocked ? 0 : 1);
+  return NULL;
+}
+
+static void* first_exec(void* argument) {
+  (void)argument;
+  int overlap = id_overlap();
+  pthread_mutex_lock(held_mutex);
+  atomic_store(first_locked, 1);
+  while (!atomic_load(first_waiter_ready))
+    sched_yield();
+  execl(
+      self_path,
+      self_path,
+      "after-exec",
+      overlap ? "1" : "0",
+      first_exec_done_fd,
+      (char*)NULL);
+  _exit(3);
+  return NULL;
+}
+
+static int run_first(const char* which) {
+  pthread_t worker;
+  if (strcmp(which, "failed-exec") == 0) {
+    if (pthread_create(&worker, NULL, first_failed_exec, NULL) != 0)
+      return 2;
+    pthread_join(worker, NULL);
+    return 1;
+  }
+  if (strcmp(which, "exec") != 0)
+    return 2;
+  held_mutex = make_mutex(1);
+  _Atomic int* flags = mmap(
+      NULL,
+      2 * sizeof(*flags),
+      PROT_READ | PROT_WRITE,
+      MAP_SHARED | MAP_ANONYMOUS,
+      -1,
+      0);
+  if (flags == MAP_FAILED)
+    return 2;
+  first_locked = &flags[0];
+  first_waiter_ready = &flags[1];
+  int done[2];
+  if (pipe(done) != 0)
+    return 2;
+  snprintf(first_exec_done_fd, sizeof(first_exec_done_fd), "%d", done[1]);
+  // The worker is created first, so that it is the process's first thread.
+  if (pthread_create(&worker, NULL, first_exec, NULL) != 0)
+    return 2;
+  while (!atomic_load(first_locked))
+    sched_yield();
+  pid_t waiter = fork();
+  if (waiter == 0) {
+    uint32_t host_group = (uint32_t)host_status_id("PPid");
+    close(done[1]);
+    atomic_store(first_waiter_ready, 1);
+    int result = lock_within_a_second(held_mutex);
+    char byte;
+    if (read(done[0], &byte, 1) != 1)
+      _exit(2);
+    uint32_t word =
+        __atomic_load_n(&held_mutex->__data.__lock, __ATOMIC_SEQ_CST);
+    if (result == EOWNERDEAD || (word & FUTEX_OWNER_DIED) != 0)
+      _exit(1);
+    if ((word & FUTEX_TID_MASK) == host_group)
+      _exit(3);
+    _exit(result == ETIMEDOUT ? 0 : 2);
+  }
+  if (waiter < 0)
+    return 2;
+  for (;;)
+    pause();
+}
+
+/* The image first_exec execs: tell the waiter the exec is complete, then
+ * report what it found. */
+static int after_first_exec(const char* overlap, const char* done_fd) {
+  if (write(atoi(done_fd), "x", 1) != 1)
+    return 2;
+  int status;
+  if (wait(&status) < 0)
+    return 2;
+  int code = WIFEXITED(status) ? WEXITSTATUS(status) : 2;
+  printf(
+      "robust first_exec=%s id_overlap=%s\n",
+      code == 0       ? "ETIMEDOUT"
+          : code == 1 ? "EOWNERDEAD"
+          : code == 3 ? "the-word-names-the-host-group"
+                      : "other",
+      overlap);
+  return code == 0 ? 0 : 1;
+}
+
+static int tgid_failed_exec(void) {
+  pid_t child = fork();
+  if (child == 0) {
+    pthread_t caller;
+    if (pthread_create(&caller, NULL, lock_as_group_and_fail_exec, NULL) != 0)
+      _exit(2);
+    for (;;)
+      pause();
+  }
+  int status;
+  if (child < 0 || waitpid(child, &status, 0) != child) {
+    perror("fork");
+    _exit(1);
+  }
+  return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
 /* Runs `how` in a forked child holding a fresh process-shared mutex, then
  * returns the parent's later lock result. */
 static int child_dies(int how) {
@@ -133,6 +342,13 @@ static int child_dies(int how) {
   atomic_store(&held, 0);
   pid_t child = fork();
   if (child == 0) {
+    if (how == 10) {
+      pthread_t caller;
+      if (pthread_create(&caller, NULL, lock_as_group_and_exec, NULL) != 0)
+        _exit(2);
+      for (;;)
+        pause();
+    }
     if (how == 6) {
       pthread_t holder;
       if (pthread_create(&holder, NULL, lock_and_stay, NULL) != 0)
@@ -248,7 +464,13 @@ static const char* lock_result_name(int result) {
                               : "other";
 }
 
-int main(void) {
+int main(int argc, char** argv) {
+  self_path = argv[0];
+  if (argc == 4 && strcmp(argv[1], "after-exec") == 0)
+    return after_first_exec(argv[2], argv[3]);
+  const char* first = getenv("ROBUST_OWNER_DEATH_FIRST");
+  if (first != NULL)
+    return run_first(first);
   pthread_mutex_t* forked_mutex = make_mutex(1);
   pid_t child = fork();
   if (child == 0) {
@@ -303,11 +525,13 @@ int main(void) {
   int failed = failed_exec();
   int sigkill = child_dies(8);
   int walk_stop = walk_stops_at_a_misaligned_word();
+  int tgid_exec = child_dies(10);
+  int tgid_failed = tgid_failed_exec();
 
   printf(
       "robust fork_child=%d thread=%d exit_group_thread=%d waited_thread=%d "
       "exec_child=%d exec_killed_thread=%d failed_exec=%d sigkill=%s "
-      "walk_stop=%d\n",
+      "walk_stop=%d tgid_exec=%d tgid_failed_exec=%d\n",
       fork_child == EOWNERDEAD,
       exited_thread == EOWNERDEAD,
       exit_group_thread == EOWNERDEAD,
@@ -316,11 +540,13 @@ int main(void) {
       exec_killed_thread == EOWNERDEAD,
       failed,
       lock_result_name(sigkill),
-      walk_stop);
+      walk_stop,
+      tgid_exec == EOWNERDEAD,
+      tgid_failed);
   return fork_child == EOWNERDEAD && exited_thread == EOWNERDEAD &&
           exit_group_thread == EOWNERDEAD && waited_thread == EOWNERDEAD &&
           exec_child == EOWNERDEAD && exec_killed_thread == EOWNERDEAD &&
-          failed && walk_stop
+          failed && walk_stop && tgid_exec == EOWNERDEAD && tgid_failed
       ? 0
       : 1;
 }

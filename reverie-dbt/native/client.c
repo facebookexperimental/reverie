@@ -99,6 +99,13 @@ typedef struct {
 } dbt_signal_event_t;
 _Static_assert(sizeof(dbt_signal_event_t) == 200, "DBT signal ABI size");
 
+/* One robust owner word rewritten by `translate_process_robust_lists`. */
+struct robust_owner_rewrite {
+  uintptr_t address;
+  uint32_t original_owner;
+  uint32_t translated_owner;
+};
+
 typedef struct {
   uint64_t branches;
   uint64_t observed_syscalls;
@@ -183,6 +190,12 @@ typedef struct {
   // the only events from which DynamoRIO recovers a client write to a page it
   // made read-only (`runtime_compare_exchange_u32`).
   bool in_syscall_event;
+  // The owner words this thread's last exec or exit_group pass rewrote, each
+  // with the owner it named before, so that a failed exec restores exactly
+  // those words (`translate_process_robust_lists`).
+  struct robust_owner_rewrite* robust_rewrites;
+  size_t robust_rewrite_count;
+  size_t robust_rewrite_capacity;
 } prototype_counters_t;
 
 #define VIRTUAL_ROOT_PID INT32_C(3)
@@ -538,6 +551,7 @@ static void complete_runtime_thread_exit(
 static void translate_process_robust_lists(
     void* drcontext,
     prototype_counters_t* counters,
+    bool exec,
     bool restore);
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-84): Review isolation-aware process-group termination.
@@ -3490,7 +3504,7 @@ invoke_syscall(uintptr_t context, int64_t sysnum, const uint64_t* args) {
     return result;
   if (is_exec_syscall((int)sysnum)) {
     require_evidence_flush(EVIDENCE_FRAME_EXEC);
-    translate_process_robust_lists((void*)context, counters, false);
+    translate_process_robust_lists((void*)context, counters, true, false);
   }
   if (sysnum == SYS_exit || sysnum == SYS_exit_group)
     complete_runtime_thread_exit(
@@ -3501,7 +3515,7 @@ invoke_syscall(uintptr_t context, int64_t sysnum, const uint64_t* args) {
   result = invoke_raw_syscall(context, sysnum, translated);
   if (is_exec_syscall((int)sysnum) && result < 0) {
     require_evidence_flush(EVIDENCE_FRAME_EXEC_CANCEL);
-    translate_process_robust_lists((void*)context, counters, true);
+    translate_process_robust_lists((void*)context, counters, true, true);
   }
   if (reject_opened_proc_mem(context, (int)sysnum, result))
     return -EPERM;
@@ -4587,7 +4601,7 @@ static void post_syscall(void* drcontext, int sysnum) {
   if (is_exec_syscall(sysnum) && evidence_is_enabled())
     require_evidence_flush(EVIDENCE_FRAME_EXEC_CANCEL);
   if (is_exec_syscall(sysnum))
-    translate_process_robust_lists(drcontext, counters, true);
+    translate_process_robust_lists(drcontext, counters, true, true);
 
   if (has_copied_runtime() &&
       (!runtime_uses_external_global() || is_copied_vfork_process()))
@@ -5383,7 +5397,7 @@ static bool pre_syscall(void* drcontext, int sysnum) {
         drcontext, counters, sysnum, args, false);
     if (execute && is_exec_syscall(sysnum)) {
       require_evidence_flush(EVIDENCE_FRAME_EXEC);
-      translate_process_robust_lists(drcontext, counters, false);
+      translate_process_robust_lists(drcontext, counters, true, false);
     }
     return execute;
   }
@@ -5505,7 +5519,7 @@ static bool pre_syscall(void* drcontext, int sysnum) {
         drcontext, counters, sysnum, args, true);
     if (execute && is_exec_syscall(sysnum)) {
       require_evidence_flush(EVIDENCE_FRAME_EXEC);
-      translate_process_robust_lists(drcontext, counters, false);
+      translate_process_robust_lists(drcontext, counters, true, false);
     }
     return execute;
   }
@@ -5528,7 +5542,7 @@ static bool pre_syscall(void* drcontext, int sysnum) {
       drcontext, counters, sysnum, args, false);
   if (execute && is_exec_syscall(sysnum)) {
     require_evidence_flush(EVIDENCE_FRAME_EXEC);
-    translate_process_robust_lists(drcontext, counters, false);
+    translate_process_robust_lists(drcontext, counters, true, false);
   }
   return execute;
 }
@@ -5851,8 +5865,61 @@ static int32_t runtime_compare_exchange_u32(
   return 0;
 }
 
-/* Rewrites the robust futex word at `word_address` to name `to_tid` when it
- * names `from_tid`, keeping its other bits. The store is a compare-and-swap,
+/* An owner rewrite: a word naming `from` is made to name `to`. */
+typedef struct {
+  int32_t from;
+  int32_t to;
+} robust_owner_mapping_t;
+
+static bool robust_owner_rewritten(
+    const prototype_counters_t* counters,
+    uintptr_t word_address) {
+  for (size_t i = 0; i < counters->robust_rewrite_count; ++i) {
+    if (counters->robust_rewrites[i].address == word_address)
+      return true;
+  }
+  return false;
+}
+
+static void record_robust_owner_rewrite(
+    void* drcontext,
+    prototype_counters_t* counters,
+    uintptr_t word_address,
+    uint32_t original_owner,
+    uint32_t translated_owner) {
+  if (counters->robust_rewrite_count == counters->robust_rewrite_capacity) {
+    size_t capacity = counters->robust_rewrite_capacity == 0
+        ? 64
+        : 2 * counters->robust_rewrite_capacity;
+    struct robust_owner_rewrite* grown = (struct robust_owner_rewrite*)
+        dr_thread_alloc(drcontext, capacity * sizeof(*grown));
+    if (counters->robust_rewrite_count != 0)
+      memcpy(
+          grown,
+          counters->robust_rewrites,
+          counters->robust_rewrite_count * sizeof(*grown));
+    if (counters->robust_rewrites != NULL)
+      dr_thread_free(
+          drcontext,
+          counters->robust_rewrites,
+          counters->robust_rewrite_capacity * sizeof(*grown));
+    counters->robust_rewrites = grown;
+    counters->robust_rewrite_capacity = capacity;
+  }
+  counters->robust_rewrites[counters->robust_rewrite_count++] =
+      (struct robust_owner_rewrite){
+          word_address, original_owner, translated_owner};
+}
+
+/* Rewrites the robust futex word at `word_address` to name the `to` of the
+ * first of the `count` mappings whose `from` it names, keeping its other
+ * bits. Each word is classified once, by the owner it names when read: the
+ * output of one mapping is never matched against another, which matters
+ * because host and virtual IDs can be equal numbers (in a fresh PID
+ * namespace, a caller's host TID can be its group's virtual ID). With
+ * `counters`, a word this pass already rewrote, reached again through another
+ * list entry, is left alone, and each rewrite is recorded with the owner it
+ * replaced for `restore_robust_owners`. The store is a compare-and-swap,
  * retried as Linux's handle_futex_death retries its own, so a FUTEX_WAITERS
  * bit that a concurrent locker sets between the read and the store is kept,
  * and Linux's walk still wakes that locker. Returns false where
@@ -5860,39 +5927,87 @@ static int32_t runtime_compare_exchange_u32(
  * word. */
 static bool translate_robust_owner(
     uintptr_t word_address,
-    int32_t from_tid,
-    int32_t to_tid) {
+    const robust_owner_mapping_t* mappings,
+    size_t count,
+    void* drcontext,
+    prototype_counters_t* counters) {
   uint32_t value;
   if (word_address % sizeof(value) != 0 ||
       !read_app((const void*)word_address, &value, sizeof(value)))
     return false;
+  if (counters != NULL && robust_owner_rewritten(counters, word_address))
+    return true;
   for (;;) {
-    if ((value & FUTEX_TID_MASK) != (uint32_t)from_tid)
+    uint32_t owner = value & FUTEX_TID_MASK;
+    const robust_owner_mapping_t* mapping = NULL;
+    for (size_t i = 0; i < count; ++i) {
+      if ((uint32_t)mappings[i].from == owner) {
+        mapping = &mappings[i];
+        break;
+      }
+    }
+    if (mapping == NULL)
       return true;
-    uint32_t translated = (value & ~(uint32_t)FUTEX_TID_MASK) |
-        ((uint32_t)to_tid & FUTEX_TID_MASK);
+    uint32_t to = (uint32_t)mapping->to & FUTEX_TID_MASK;
+    uint32_t translated = (value & ~(uint32_t)FUTEX_TID_MASK) | to;
     uint32_t observed;
     if (runtime_compare_exchange_u32(
             word_address, value, translated, &observed) != 0)
       return false;
-    if (observed == value)
+    if (observed == value) {
+      if (counters != NULL)
+        record_robust_owner_rewrite(
+            drcontext, counters, word_address, owner, to);
       return true;
+    }
     value = observed;
   }
 }
 
+/* Undoes the rewrites `counters` recorded, newest first: each word that still
+ * names the owner it was rewritten to names its original owner again, with
+ * its other bits kept. A word whose owner changed since is left as it is. */
+static void restore_robust_owners(prototype_counters_t* counters) {
+  for (size_t i = counters->robust_rewrite_count; i-- > 0;) {
+    const struct robust_owner_rewrite* rewrite = &counters->robust_rewrites[i];
+    uint32_t value;
+    if (!read_app((const void*)rewrite->address, &value, sizeof(value)))
+      continue;
+    while ((value & FUTEX_TID_MASK) == rewrite->translated_owner) {
+      uint32_t restored =
+          (value & ~(uint32_t)FUTEX_TID_MASK) | rewrite->original_owner;
+      uint32_t observed;
+      if (runtime_compare_exchange_u32(
+              rewrite->address, value, restored, &observed) != 0 ||
+          observed == value)
+        break;
+      value = observed;
+    }
+  }
+  counters->robust_rewrite_count = 0;
+}
+
 /* Walks the robust list of `list_tid`, a host TID in this process, as Linux's
  * exit_robust_list walks it: in its order and within its bound, ending where
- * it ends, the pending slot last. Rewrites each owner word naming `from_tid`
- * to name `to_tid`. */
+ * it ends, the pending slot last. Rewrites each owner word as
+ * `translate_robust_owner` does, with the given mappings less any that would
+ * change nothing (at most two are used). */
 static void translate_robust_list(
     int32_t list_tid,
-    int32_t from_tid,
-    int32_t to_tid) {
+    const robust_owner_mapping_t* given,
+    size_t given_count,
+    void* drcontext,
+    prototype_counters_t* counters) {
   uintptr_t head_address = 0;
   size_t length = 0;
   dbt_robust_list_head_t head;
-  if (from_tid <= 0 || to_tid <= 0 || from_tid == to_tid)
+  robust_owner_mapping_t mappings[2];
+  size_t count = 0;
+  for (size_t i = 0; i < given_count && count < 2; ++i) {
+    if (given[i].from > 0 && given[i].to > 0 && given[i].from != given[i].to)
+      mappings[count++] = given[i];
+  }
+  if (count == 0)
     return;
   if (syscall(SYS_get_robust_list, list_tid, &head_address, &length) != 0 ||
       head_address == 0 || length != sizeof(head) ||
@@ -5906,7 +6021,8 @@ static void translate_robust_list(
     uintptr_t next = 0;
     bool fetched = read_app((const void*)entry, &next, sizeof(next));
     if (entry != pending &&
-        !translate_robust_owner(entry + offset, from_tid, to_tid))
+        !translate_robust_owner(
+            entry + offset, mappings, count, drcontext, counters))
       return;
     if (!fetched)
       return;
@@ -5915,7 +6031,8 @@ static void translate_robust_list(
       break;
   }
   if (pending != 0)
-    translate_robust_owner(pending + offset, from_tid, to_tid);
+    translate_robust_owner(
+        pending + offset, mappings, count, drcontext, counters);
 }
 
 /* As a thread exits, Linux walks its robust list and marks FUTEX_OWNER_DIED,
@@ -5933,7 +6050,15 @@ static void translate_robust_list_owners(
     void* drcontext,
     int32_t host_tid,
     int32_t virtual_tid) {
-  translate_robust_list(host_tid, virtual_tid, host_tid);
+  // Only for a thread of this process. DynamoRIO also runs this for the
+  // threads a forked child copied from its parent but does not have; there
+  // host_tid names the parent's thread, whose list (in memory the child may
+  // share) is the parent's to rewrite (Codex review of
+  // https://github.com/rrnewton/reverie/pull/1053).
+  if (syscall(SYS_tgkill, (int32_t)dr_get_process_id(), host_tid, 0) != 0)
+    return;
+  robust_owner_mapping_t mapping = {virtual_tid, host_tid};
+  translate_robust_list(host_tid, &mapping, 1, drcontext, NULL);
 }
 
 /* An exec and an exit_group kill every other thread of the process, and
@@ -5943,8 +6068,13 @@ static void translate_robust_list_owners(
  * (Linux also walks the execing thread's own list, in exec_mm_release.) So
  * just before an exec or exit_group, rewrite the owner words of every thread
  * of this process from its virtual TID to its host TID, and if an exec fails
- * (`restore`), rewrite them back. The other threads are the identity table's
- * host TIDs that tgkill(pid, tid, 0) finds in this thread group. Until the
+ * (`restore`), rewrite back exactly the words this pass rewrote. The other threads are the identity table's
+ * host TIDs that tgkill(pid, tid, 0) finds in this thread group. An exec by a
+ * thread that is not the leader also rewrites the caller's own words that name
+ * the virtual thread group ID to the host one: de_thread gives that caller the
+ * leader's TID (exchange_tids) before exec_mm_release walks its list, so Linux
+ * compares the caller's words with the host thread group ID
+ * (https://github.com/rrnewton/reverie/issues/1052). Until the
  * call returns or the process is gone, a thread of this process that runs
  * and unlocks a robust mutex it holds gets EPERM from glibc, whose owner
  * check compares the word with the virtual TID; a mutex it locks in that
@@ -5952,18 +6082,28 @@ static void translate_robust_list_owners(
 static void translate_process_robust_lists(
     void* drcontext,
     prototype_counters_t* counters,
+    bool exec,
     bool restore) {
-  if (restore && !counters->process_robust_lists_translated)
+  if (restore) {
+    if (counters->process_robust_lists_translated)
+      restore_robust_owners(counters);
+    counters->process_robust_lists_translated = false;
     return;
+  }
+  counters->robust_rewrite_count = 0;
   int32_t self = (int32_t)dr_get_thread_id(drcontext);
   int32_t pid = (int32_t)dr_get_process_id();
   int32_t self_virtual = 0;
   if (!lookup_virtual_identity(self, &self_virtual))
     self_virtual = counters->virtual_tid;
-  if (restore)
-    translate_robust_list(self, self, self_virtual);
-  else
-    translate_robust_list(self, self_virtual, self);
+  // One pass with both of the caller's mappings, so that each word is
+  // classified once by the owner the guest gave it (Codex review of
+  // https://github.com/rrnewton/reverie/pull/1053).
+  robust_owner_mapping_t own[2] = {{self_virtual, self}, {0, 0}};
+  int32_t group_virtual = 0;
+  if (exec && self != pid && lookup_virtual_identity(pid, &group_virtual))
+    own[1] = (robust_owner_mapping_t){group_virtual, pid};
+  translate_robust_list(self, own, 2, drcontext, counters);
 
   size_t size = MAX_VIRTUAL_IDENTITIES * sizeof(virtual_identity_t);
   virtual_identity_t* identities = (virtual_identity_t*)dr_global_alloc(size);
@@ -5977,13 +6117,11 @@ static void translate_process_robust_lists(
     int32_t virtual_id = identities[i].virtual_id;
     if (host <= 0 || host == self || syscall(SYS_tgkill, pid, host, 0) != 0)
       continue;
-    if (restore)
-      translate_robust_list(host, host, virtual_id);
-    else
-      translate_robust_list(host, virtual_id, host);
+    robust_owner_mapping_t mapping = {virtual_id, host};
+    translate_robust_list(host, &mapping, 1, drcontext, counters);
   }
   dr_global_free(identities, size);
-  counters->process_robust_lists_translated = !restore;
+  counters->process_robust_lists_translated = true;
 }
 
 static void complete_runtime_thread_exit(
@@ -5996,7 +6134,7 @@ static void complete_runtime_thread_exit(
     return;
   counters->runtime_thread_exit_called = 1;
   if (exit_group)
-    translate_process_robust_lists(drcontext, counters, false);
+    translate_process_robust_lists(drcontext, counters, false, false);
   {
     int32_t host_tid = (int32_t)dr_get_thread_id(drcontext);
     int32_t virtual_tid = 0;
@@ -6037,6 +6175,12 @@ static void thread_exit(void* drcontext) {
       if (counters->preempt_mcontext != NULL)
         dr_thread_free(
             drcontext, counters->preempt_mcontext, sizeof(dr_mcontext_t));
+      if (counters->robust_rewrites != NULL)
+        dr_thread_free(
+            drcontext,
+            counters->robust_rewrites,
+            counters->robust_rewrite_capacity *
+                sizeof(*counters->robust_rewrites));
       dr_thread_free(drcontext, counters, sizeof(*counters));
     }
   }
