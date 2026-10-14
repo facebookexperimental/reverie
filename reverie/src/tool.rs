@@ -132,6 +132,18 @@ pub trait GlobalTool: Send + Sync + Default {
         Default::default()
     }
 
+    /// Offer the actual launcher-created input before sharing this run's global
+    /// state or starting any guest hook. The default does not need the binding.
+    ///
+    /// The launcher prepares this temporary read-end lease before global-state
+    /// initialization, so installing it introduces no fallible startup work.
+    /// A Tool that uses it consumes the
+    /// binding only for the registered root's initial image, validating the
+    /// installed endpoint before marking its open-file description. It must not
+    /// grant the fact to inherited/unknown FIFOs or later reconnects, and must
+    /// release the lease at that handoff (or startup failure), not at run end.
+    fn install_inherited_input(&mut self, _input: crate::InheritedInputLease) {}
+
     /// Install one run-scoped backend capability before the first guest hook.
     /// The default preserves backend-owned selection. A Tool may reject a
     /// missing capability here. A Tool whose

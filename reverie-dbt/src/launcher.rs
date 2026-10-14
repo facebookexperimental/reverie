@@ -636,7 +636,19 @@ impl DbtRunner {
             .prefix("reverie-dbt-")
             .tempdir_in("/tmp")?;
         let socket = directory.path().join("coordinator.sock");
-        let mut global = Arc::new(G::init_global_state(&config).await);
+        let inherited_input = match &input {
+            CoordinatedInput::Reader(_) => Some(reverie::InheritedInput::pipe(libc::STDIN_FILENO)?),
+            CoordinatedInput::Null | CoordinatedInput::Inherit => None,
+        };
+        let input_lease = inherited_input
+            .as_ref()
+            .map(reverie::InheritedInput::lease)
+            .transpose()?;
+        let mut global = G::init_global_state(&config).await;
+        if let Some(input) = input_lease {
+            global.install_inherited_input(input);
+        }
+        let mut global = Arc::new(global);
         let requested = Arc::new(AtomicBool::new(false));
         let server = RpcServer::bind_with_readiness(
             &socket,
@@ -663,6 +675,7 @@ impl DbtRunner {
         };
         let mut command = runner.command(guest, environment);
         command.env(crate::sync_rpc::RPC_SOCKET_ENV, &socket);
+        let mut input_writer = None;
         match &input {
             CoordinatedInput::Null => {
                 command.stdin(Stdio::null());
@@ -671,16 +684,27 @@ impl DbtRunner {
                 command.stdin(Stdio::inherit());
             }
             CoordinatedInput::Reader(_) => {
-                command.stdin(Stdio::piped());
+                let (reader, writer) = inherited_input
+                    .expect("Reader input was prepared")
+                    .into_reader_and_writer();
+                command.stdin(Stdio::from(reader));
+                input_writer = Some(writer);
             }
         }
         if capture_output {
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
         }
         let child = runner.spawn_command(&mut command)?;
+        // A reusable Command retains a caller-supplied Stdio owner after spawn.
+        // Keep no parent reader beyond the Tool's temporary initial-image lease.
+        drop(command);
         let wait = tokio::task::spawn_blocking(move || match input {
             CoordinatedInput::Reader(input) => runner
-                .wait_with_output_and_detached_reader(child, input)
+                .wait_with_output_and_input_writer(
+                    child,
+                    input,
+                    input_writer.expect("Reader writer was retained"),
+                )
                 .map(ChildWait::Output),
             CoordinatedInput::Null | CoordinatedInput::Inherit if capture_output => {
                 runner.wait_with_output(child).map(ChildWait::Output)
@@ -885,15 +909,27 @@ impl DbtRunner {
     fn wait_with_output_and_detached_reader<R>(
         &self,
         mut child: Child,
-        mut input: R,
+        input: R,
     ) -> io::Result<Output>
     where
         R: Read + Send + 'static,
     {
-        let mut stdin = child.stdin.take().ok_or_else(|| {
+        let stdin = child.stdin.take().ok_or_else(|| {
             io::Error::new(io::ErrorKind::BrokenPipe, "failed to open DBT guest stdin")
         })?;
+        self.wait_with_output_and_input_writer(child, input, stdin)
+    }
 
+    fn wait_with_output_and_input_writer<R, W>(
+        &self,
+        child: Child,
+        mut input: R,
+        mut stdin: W,
+    ) -> io::Result<Output>
+    where
+        R: Read + Send + 'static,
+        W: io::Write + Send + 'static,
+    {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-84): Review detaching a source-blocked input pump at child exit.
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
@@ -1597,6 +1633,7 @@ fn duplicate_to_diagnostic_fd(source: libc::c_int) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    mod inherited_input;
     use std::io::Seek as _;
     use std::os::unix::process::ExitStatusExt as _;
 

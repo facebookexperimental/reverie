@@ -63,6 +63,7 @@ mod error;
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub mod glibc_symbol;
 mod guest;
+mod inherited_input;
 #[cfg(target_arch = "x86_64")]
 pub mod pmu;
 mod process_signal_control;
@@ -88,6 +89,7 @@ pub use capabilities::*;
 pub use dispatch_stats::*;
 pub use error::*;
 pub use guest::*;
+pub use inherited_input::*;
 pub use process::ExitStatus;
 pub use process::Pid;
 #[cfg(target_arch = "x86_64")]
