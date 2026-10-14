@@ -463,6 +463,10 @@ async fn legacy_group_cleanup_captures_newchild_before_parent_commit() {
         Pid::from_raw(unsafe { libc::getpid() }),
         "actual fork-event parent differs from the real wait parent"
     );
+    // Retain the selected wait owner before consuming newborn: a Native
+    // notifier can retire the child after CONT, before a fresh explicit
+    // wait could authenticate through its retained proc directory.
+    let child_waits = newborn.waits.clone();
     newborn.signal().unwrap();
     let child_exit = tokio::time::timeout_at(deadline.into(), newborn.into_exit())
         .await
@@ -471,10 +475,7 @@ async fn legacy_group_cleanup_captures_newchild_before_parent_commit() {
     assert_eq!(
         tokio::time::timeout_at(
             deadline.into(),
-            child_exit
-                .resume(None)
-                .unwrap()
-                .wait_owned_on_ptracer_thread()
+            child_waits.wait_running(child_exit.resume(None).unwrap())
         )
         .await
         .unwrap()
