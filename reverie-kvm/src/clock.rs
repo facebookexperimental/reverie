@@ -137,6 +137,15 @@ impl HypercallProbe {
 /// access does not: VcpuFd::run can only be called inside this module.
 pub(crate) struct CountedVcpu {
     fd: VcpuFd,
+    /// KVM copies the general and special registers into the shared
+    /// `kvm_run` page on every exit (`KVM_CAP_SYNC_REGS`).
+    sync_regs: bool,
+    /// The synced copy is current: the last `KVM_RUN` returned an exit and
+    /// nothing has borrowed the raw fd since. Every [`Deref`] clears it,
+    /// because the raw fd can change registers (`set_regs`, `set_sregs`,
+    /// `set_msrs`, ...). `run` takes `&mut self`, so no raw borrow taken before
+    /// an exit can still be alive after it.
+    synced_exit: std::sync::atomic::AtomicBool,
     participant: Participant,
     // Keep the Mapping alive independently of the backend field's drop order.
     memory: GuestMemory,
@@ -155,18 +164,26 @@ impl Deref for CountedVcpu {
         if let Some(probe) = &self.run_probe {
             probe.prepare.increment(&probe.shared_fd_accesses);
         }
+        self.synced_exit
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         &self.fd
     }
 }
 
 impl CountedVcpu {
-    pub(crate) fn new(fd: VcpuFd, memory: GuestMemory) -> Result<Self> {
+    pub(crate) fn new(mut fd: VcpuFd, memory: GuestMemory, sync_regs: bool) -> Result<Self> {
         let participant = memory
             .entry_gate()
             .register()
             .map_err(|failure| failure.error())?;
+        if sync_regs {
+            fd.set_sync_valid_reg(kvm_ioctls::SyncReg::Register);
+            fd.set_sync_valid_reg(kvm_ioctls::SyncReg::SystemRegister);
+        }
         Ok(Self {
             fd,
+            sync_regs,
+            synced_exit: std::sync::atomic::AtomicBool::new(false),
             participant,
             memory,
             clock: GuestClock::default(),
@@ -189,6 +206,51 @@ impl CountedVcpu {
         HypercallProbe {
             run_address: std::ptr::from_mut(self.fd.get_kvm_run()) as usize,
         }
+    }
+
+    /// The guest's general registers. After an exit this reads KVM's synced
+    /// copy without an ioctl; otherwise, or after any raw fd access, it asks
+    /// KVM (`KVM_GET_REGS`).
+    pub(crate) fn get_regs(
+        &self,
+    ) -> std::result::Result<kvm_bindings::kvm_regs, kvm_ioctls::Error> {
+        // Both paths read the fd's register state (its kvm_run page or an
+        // ioctl), so the probe counts them as shared-fd accesses, as a raw
+        // `Deref` read was counted before.
+        #[cfg(test)]
+        if let Some(probe) = &self.run_probe {
+            probe.prepare.increment(&probe.shared_fd_accesses);
+        }
+        if self.synced_exit.load(std::sync::atomic::Ordering::Relaxed) {
+            Ok(self.fd.sync_regs().regs)
+        } else {
+            self.fd.get_regs()
+        }
+    }
+
+    /// The guest's special registers, from the synced copy as for
+    /// [`Self::get_regs`] (`KVM_GET_SREGS` otherwise).
+    pub(crate) fn get_sregs(
+        &self,
+    ) -> std::result::Result<kvm_bindings::kvm_sregs, kvm_ioctls::Error> {
+        // Both paths read the fd's register state (its kvm_run page or an
+        // ioctl), so the probe counts them as shared-fd accesses, as a raw
+        // `Deref` read was counted before.
+        #[cfg(test)]
+        if let Some(probe) = &self.run_probe {
+            probe.prepare.increment(&probe.shared_fd_accesses);
+        }
+        if self.synced_exit.load(std::sync::atomic::Ordering::Relaxed) {
+            let special = self.fd.sync_regs().sregs;
+            // KVM sets bits in the synced interrupt bitmap but never clears
+            // them (measured on Linux 7.1.3), while KVM_GET_SREGS reports the
+            // pending bitmap. This backend injects no interrupt, so the bitmap
+            // is zero; should one ever be set, ask KVM rather than return it.
+            if special.interrupt_bitmap.iter().all(|word| *word == 0) {
+                return Ok(special);
+            }
+        }
+        self.fd.get_sregs()
     }
 
     pub(crate) fn set_failure_context(&mut self, origin: Option<FailureContext>) {
@@ -258,6 +320,9 @@ impl CountedVcpu {
         if let Some(probe) = &self.run_probe {
             probe.run_hook();
         }
+        // The synced copy describes the previous exit only until this entry.
+        self.synced_exit
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         // Declare entry first: unwinding must retire the clock and restore CPU
         // affinity before entry withdraws its target and restores the mask.
         let Some(entry) = self
@@ -281,7 +346,12 @@ impl CountedVcpu {
             if let Some(probe) = &self.run_probe {
                 probe.prepare.increment(&probe.untracked_runs);
             }
-            return finish_entry(self.fd.run().map_err(Error::Kvm), entry).map(Some);
+            let exit = finish_entry(self.fd.run().map_err(Error::Kvm), entry);
+            if exit.is_ok() && self.sync_regs {
+                self.synced_exit
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            return exit.map(Some);
         }
         let interval = match self.clock.begin() {
             Ok(interval) => interval,
@@ -303,7 +373,12 @@ impl CountedVcpu {
                 hook(&self.clock);
             }
         }
-        finish_entry(result, entry).map(Some)
+        let exit = finish_entry(result, entry);
+        if exit.is_ok() && self.sync_regs {
+            self.synced_exit
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        exit.map(Some)
     }
 }
 

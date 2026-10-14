@@ -1622,6 +1622,8 @@ impl KvmBackend {
 
 struct InitializedKvmResources {
     vcpu: VcpuFd,
+    /// KVM can copy general and special registers into `kvm_run` on exit.
+    sync_regs: bool,
     vm: VmFd,
     kvm: Kvm,
     hypercall_instruction: [u8; 3],
@@ -1807,8 +1809,13 @@ impl KvmBackend {
 
         let vcpu = vm.create_vcpu(0)?;
         vcpu.set_cpuid2(&cpuid)?;
+        let wanted = kvm_bindings::KVM_SYNC_X86_REGS | kvm_bindings::KVM_SYNC_X86_SREGS;
+        // A negative result is a failed probe, not a mask.
+        let offered = vm.check_extension_int(Cap::SyncRegs);
+        let sync_regs = offered > 0 && (offered as u32) & wanted == wanted;
         Ok(InitializedKvmResources {
             vcpu,
+            sync_regs,
             vm,
             kvm,
             hypercall_instruction,
@@ -1825,6 +1832,7 @@ impl KvmBackend {
         let mut attempts = 0;
         let InitializedKvmResources {
             vcpu,
+            sync_regs,
             vm,
             kvm,
             hypercall_instruction,
@@ -1838,7 +1846,7 @@ impl KvmBackend {
             }
         };
         Ok(Self {
-            vcpu: crate::clock::CountedVcpu::new(vcpu, memory.clone())?,
+            vcpu: crate::clock::CountedVcpu::new(vcpu, memory.clone(), sync_regs)?,
             vm,
             memory,
             _kvm: kvm,

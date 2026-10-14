@@ -373,3 +373,39 @@ fn pinned_entries_keep_exact_finite_program_branch_total() {
     assert!(!binding.enabled);
     assert!(same_affinity(&affinity().unwrap(), &original));
 }
+
+#[test]
+fn synced_registers_match_kvm_and_never_go_stale() {
+    let mut backend =
+        crate::KvmBackend::new(16 * 1024 * 1024).expect("synced registers require /dev/kvm");
+    install_counted_program(&mut backend, &finite_program(1 << 10));
+    reaches_getpid(&mut backend.vcpu);
+    if !backend.vcpu.sync_regs {
+        println!("synced registers: NOT EXECUTED; KVM lacks KVM_CAP_SYNC_REGS here");
+        return;
+    }
+    // After the exit the reads come from kvm_run, and reading keeps them current.
+    assert!(backend.vcpu.synced_exit.load(Ordering::Relaxed));
+    let synced = backend.vcpu.get_regs().unwrap();
+    let synced_special = backend.vcpu.get_sregs().unwrap();
+    assert!(backend.vcpu.synced_exit.load(Ordering::Relaxed));
+    // The ioctl agrees. Borrowing the raw fd retires the synced copy.
+    let raw: &kvm_ioctls::VcpuFd = &backend.vcpu;
+    assert_eq!(raw.get_regs().unwrap(), synced);
+    assert_eq!(raw.get_sregs().unwrap(), synced_special);
+    assert!(!backend.vcpu.synced_exit.load(Ordering::Relaxed));
+    // A write through the raw fd is what a later read returns, not the
+    // stale synced copy of the exit.
+    let mut changed = synced;
+    changed.rax = 0x1234_5678;
+    backend.vcpu.set_regs(&changed).unwrap();
+    assert_eq!(backend.vcpu.get_regs().unwrap().rax, 0x1234_5678);
+    // A nonzero synced interrupt bitmap is never returned from the copy.
+    assert!(
+        synced_special
+            .interrupt_bitmap
+            .iter()
+            .all(|word| *word == 0)
+    );
+    println!("synced registers: matched KVM_GET_REGS/SREGS and followed a raw write");
+}
