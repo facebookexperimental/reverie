@@ -27,6 +27,8 @@ pub mod exec_private;
 #[cfg(feature = "coordinator-rpc")]
 pub mod host;
 pub mod installed_stack;
+#[cfg(feature = "coordinator-rpc")]
+pub mod installed_tool;
 pub mod instruction;
 pub mod protect;
 pub mod restorer;

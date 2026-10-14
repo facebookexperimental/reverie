@@ -244,7 +244,7 @@ where
     /// not establish installed-handler provenance. The installed Tool's guest
     /// memory effects must preserve Rust's memory invariants, as on dispatch.
     #[cfg(feature = "exec-private-init")]
-    pub unsafe fn bind_initial_image_control(
+    pub(super) unsafe fn bind_initial_image_control(
         &self,
         control: &super::exec_private::InitialImageControl,
     ) -> io::Result<()> {
@@ -256,7 +256,7 @@ where
     /// or register snapshot. Unsupported lifecycle operations are retained
     /// even when the Tool ignores their returned error.
     #[cfg(feature = "exec-private-init")]
-    pub fn initialize_initial_image_lifecycle(
+    pub(super) fn initialize_initial_image_lifecycle(
         &self,
         control: &super::exec_private::InitialImageControl,
     ) -> io::Result<()> {

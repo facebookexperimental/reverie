@@ -5,6 +5,9 @@ reverie_liteinst::declare_legacy_scoped_tool_allocator!();
 #[path = "lifecycle_guest/mapping_routes.rs"]
 mod mapping_routes;
 
+#[path = "lifecycle_guest/shared_handler.rs"]
+mod shared_handler;
+
 use core::arch::global_asm;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
@@ -2809,6 +2812,14 @@ fn main() {
     let mut arguments = std::env::args_os();
     let _program = arguments.next();
     let mode = arguments.next().expect("missing lifecycle fixture mode");
+    if mode == "shared-handler-owner" || mode == "shared-handler-duplicate" {
+        assert!(
+            arguments.next().is_none(),
+            "unexpected shared-handler argument"
+        );
+        shared_handler::run(mode == "shared-handler-duplicate");
+        return;
+    }
     #[cfg(feature = "allocator-fixture")]
     if mode == "mapping-routes" {
         let route = arguments.next().expect("missing mapping route");

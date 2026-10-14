@@ -685,7 +685,7 @@ const CONTENT_WORKSPACE_FILES: [&str; 6] = [
 ];
 // Reviewed literal expectations, not hashes generated from the current checkout
 // or bytes embedded after a runtime edit. The qualifier self-hash is separate.
-const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 14] = [
+const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 18] = [
     (
         "Cargo.toml",
         869,
@@ -755,6 +755,26 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 14] = [
         "reverie-inguest/src/guest/tool_region_keyed.rs",
         24192,
         "57ee407899e8650f1ef79714c8548cc82065a070e99fa92b2080a42874c5ca3a",
+    ),
+    (
+        "reverie-inguest/src/guest/installed_tool.rs",
+        12722,
+        "f8cb33453c26321f185ca115beddb802e6f69e8d713230357377291b2daa0c4e",
+    ),
+    (
+        "reverie-inguest/src/guest/mod.rs",
+        1419,
+        "f7b5eefa17f2d61297a6e055f61b3be9228b747ddd3fc5bf383f55d754f76af0",
+    ),
+    (
+        "reverie-inguest/src/guest/host.rs",
+        137898,
+        "394b20f58ecd7bde0f4b86d40bc28c320a07b948795dd9e84625655157485481",
+    ),
+    (
+        "reverie-liteinst/src/tool_host.rs",
+        26591,
+        "fd4b3aa7ef7386e3cc27eb4d0baa950d3ba20c8dc6ca4aca8a4c1ffd8104f492",
     ),
 ];
 fn content_catalog_matches(relative: &str, size: u64, digest: &str) -> Result<()> {
@@ -25505,7 +25525,7 @@ mod tests {
         let rv_two = cargo_two.join(suffix);
         // Current compiled bytes are inputs only. Each must independently match
         // the fixed reviewed length/digest catalog before any positive is earned.
-        let compiled_files: [(&str, &[u8]); 15] = [
+        let compiled_files: [(&str, &[u8]); 19] = [
             ("Cargo.toml", include_bytes!("../Cargo.toml")),
             (
                 "reverie-liteinst-artifact/Cargo.toml",
@@ -25559,6 +25579,22 @@ mod tests {
                 "reverie-inguest/src/guest/tool_region_keyed.rs",
                 include_bytes!("../reverie-inguest/src/guest/tool_region_keyed.rs"),
             ),
+            (
+                "reverie-inguest/src/guest/installed_tool.rs",
+                include_bytes!("../reverie-inguest/src/guest/installed_tool.rs"),
+            ),
+            (
+                "reverie-inguest/src/guest/mod.rs",
+                include_bytes!("../reverie-inguest/src/guest/mod.rs"),
+            ),
+            (
+                "reverie-inguest/src/guest/host.rs",
+                include_bytes!("../reverie-inguest/src/guest/host.rs"),
+            ),
+            (
+                "reverie-liteinst/src/tool_host.rs",
+                include_bytes!("../reverie-liteinst/src/tool_host.rs"),
+            ),
             ("scripts/m1_artifact.rs", include_bytes!("m1_artifact.rs")),
         ];
         for rv in [&rv_one, &rv_two] {
@@ -25568,7 +25604,7 @@ mod tests {
             }
         }
         let (rv_inventory, _) = content_reverie_inventory(&rv_one).unwrap();
-        assert_eq!(rv_inventory.len(), 15);
+        assert_eq!(rv_inventory.len(), 19);
         assert!(
             rv_inventory
                 .windows(2)

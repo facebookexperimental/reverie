@@ -12,74 +12,12 @@ use reverie::Tool;
 use reverie_inguest::guest::context::RegisterContext;
 use reverie_inguest::guest::host::HostRuntime;
 use reverie_inguest::guest::host::ToolHost;
+use reverie_inguest::guest::installed_tool;
 use reverie_inguest::trap::raw_syscall6;
 
 use crate::rpc::CoordinatorRpc;
 use crate::runtime;
 use crate::runtime::SyscallEvent;
-
-trait ToolHandler: Send + Sync {
-    fn dispatch(&self, event: &mut SyscallEvent);
-    fn dispatch_instruction(&self, kind: runtime::InstructionEventKind, context: &mut HookContext);
-    /// The installed Tool's coordinator connection, as a
-    /// `CoordinatorRpc<T::GlobalState>`; see [`blocking_global_rpc`].
-    fn rpc(&self) -> &dyn std::any::Any;
-    #[cfg(feature = "exec-private-init")]
-    fn bind_initial_image(
-        &self,
-        control: &reverie_inguest::guest::exec_private::InitialImageControl,
-    ) -> io::Result<()>;
-    #[cfg(feature = "exec-private-init")]
-    fn initialize_initial_image_lifecycle(
-        &self,
-        control: &reverie_inguest::guest::exec_private::InitialImageControl,
-    ) -> io::Result<()>;
-}
-
-impl<T: Tool + 'static> ToolHandler for ToolHost<T, LiteinstRuntime> {
-    fn dispatch(&self, event: &mut SyscallEvent) {
-        // SAFETY: the runtime calls this only from a guest thread's trap, hook
-        // or continuation path, with `event.context` either 0 or the address
-        // of the HookContext that path saved on its own stack (same layout as
-        // RegisterContext, checked below), live and unshared for the call.
-        // The Tool is the one install_tool installed, and its injections act
-        // on the guest it instruments.
-        unsafe { ToolHost::dispatch(self, event) };
-    }
-
-    fn dispatch_instruction(&self, kind: runtime::InstructionEventKind, context: &mut HookContext) {
-        // SAFETY: HookContext and RegisterContext have the same layout
-        // (checked below), and the reference is unique for the call. The
-        // runtime calls this only from the hook or continuation that
-        // intercepted the instruction, with its saved registers; the Tool is
-        // the one install_tool installed, and its injections act on the guest
-        // it instruments.
-        let context = unsafe { &mut *(context as *mut HookContext).cast::<RegisterContext>() };
-        unsafe { ToolHost::dispatch_instruction(self, kind, context) };
-    }
-
-    fn rpc(&self) -> &dyn std::any::Any {
-        ToolHost::rpc(self)
-    }
-
-    #[cfg(feature = "exec-private-init")]
-    fn bind_initial_image(
-        &self,
-        control: &reverie_inguest::guest::exec_private::InitialImageControl,
-    ) -> io::Result<()> {
-        // SAFETY: called only after this stable Box is in HANDLER, by the
-        // InitialImage installer which consumed the authenticated live client.
-        unsafe { ToolHost::bind_initial_image_control(self, control) }
-    }
-
-    #[cfg(feature = "exec-private-init")]
-    fn initialize_initial_image_lifecycle(
-        &self,
-        control: &reverie_inguest::guest::exec_private::InitialImageControl,
-    ) -> io::Result<()> {
-        ToolHost::initialize_initial_image_lifecycle(self, control)
-    }
-}
 
 // The trampolines and the fallback continuation save a HookContext; the host
 // reads it as a RegisterContext.
@@ -156,8 +94,6 @@ impl HostRuntime for LiteinstRuntime {
         runtime::reserved_signal_mask()
     }
 }
-
-static HANDLER: std::sync::OnceLock<Box<dyn ToolHandler>> = std::sync::OnceLock::new();
 
 // TODO-HUMAN-REVIEW(PR-127): Review generic in-guest Tool hosting.
 /// Install a concrete Reverie tool in this guest and connect it to its coordinator.
@@ -326,7 +262,7 @@ where
             coordinator.as_ref(),
             false,
             runtime::PatchPublication::Quiescent,
-            Some((client, &control)),
+            Some((client, &control, &fatal)),
         )?;
     }
     Ok(InstalledInitialImage { control, fatal })
@@ -339,11 +275,10 @@ where
 /// enter Guest, authenticate a new image or create another coordinator client.
 #[cfg(feature = "exec-private-init")]
 pub fn initialize_initial_image_lifecycle(image: &InstalledInitialImage) -> io::Result<()> {
-    let control = &image.control;
-    let handler = HANDLER
-        .get()
-        .ok_or_else(|| io::Error::other("InitialImage Tool is not installed"))?;
-    handler.initialize_initial_image_lifecycle(control)
+    // SAFETY: these borrows belong to the same private affine installed owner.
+    // Its live fatal guard spans the already bound host/frontend and this real
+    // eager lifecycle; the caller completes DETLOG/OFD setup before finish.
+    unsafe { installed_tool::initialize_initial_image_lifecycle(&image.control, &image.fatal) }
 }
 
 #[cfg(feature = "exec-private-init")]
@@ -478,6 +413,7 @@ unsafe fn install_tool_inner<T>(
     #[cfg(feature = "exec-private-init")] initial: Option<(
         reverie_rpc_transport::InitialImageClient<T::GlobalState>,
         &reverie_inguest::guest::exec_private::InitialImageControl,
+        &reverie_inguest::guest::exec_private::InitialImageAbortGuard,
     )>,
 ) -> io::Result<()>
 where
@@ -517,14 +453,14 @@ where
     }
     crate::syscall_fallback::initialize()?;
     #[cfg(feature = "exec-private-init")]
-    let (rpc, initial_control) = match initial {
-        Some((client, control)) => (
+    let (rpc, initial_owner) = match initial {
+        Some((client, control, fatal)) => (
             CoordinatorRpc::<T::GlobalState>::from_live_client(
                 coordinator,
                 client.into_client(),
                 runtime::replace_coordinator_fd,
             )?,
-            Some(control),
+            Some((control, fatal)),
         ),
         None => (
             CoordinatorRpc::<T::GlobalState>::connect(
@@ -534,6 +470,8 @@ where
             None,
         ),
     };
+    #[cfg(feature = "exec-private-init")]
+    let initial_control = initial_owner.map(|(control, _fatal)| control);
     #[cfg(not(feature = "exec-private-init"))]
     let rpc =
         CoordinatorRpc::<T::GlobalState>::connect(coordinator, runtime::replace_coordinator_fd)?;
@@ -621,24 +559,27 @@ where
         unsafe { std::env::remove_var(crate::backend::COORDINATOR_ENV) };
     }
     let tool = T::new(pid, rpc.config());
-    HANDLER
-        .set(Box::new(ToolHost::<T, LiteinstRuntime>::new(
-            tool,
-            rpc,
-            pid,
-            syscall_subscriptions,
-            instruction_subscriptions.cpuid,
-            LiteinstRuntime { stats },
-        )))
-        .map_err(|_| {
-            io::Error::new(io::ErrorKind::AlreadyExists, "Reverie tool installed twice")
-        })?;
+    let host = ToolHost::<T, LiteinstRuntime>::new(
+        tool,
+        rpc,
+        pid,
+        syscall_subscriptions,
+        instruction_subscriptions.cpuid,
+        LiteinstRuntime { stats },
+    );
+    // SAFETY: this is the same installer publication point, after actual
+    // allocator/setup/client/subscription admission and before activation.
     #[cfg(feature = "exec-private-init")]
-    if let Some(control) = initial_control {
-        HANDLER
-            .get()
-            .ok_or_else(|| io::Error::other("InitialImage installed handler is absent"))?
-            .bind_initial_image(control)?;
+    unsafe {
+        if let Some((control, fatal)) = initial_owner {
+            installed_tool::publish_initial_tool(host, control, fatal)?;
+        } else {
+            installed_tool::publish_tool(host)?;
+        }
+    }
+    #[cfg(not(feature = "exec-private-init"))]
+    unsafe {
+        installed_tool::publish_tool(host)?;
     }
     let result = runtime::initialize_reverie_tool(
         stats,
@@ -678,68 +619,18 @@ impl Drop for FixedGateInstallation {
     }
 }
 
-/// Sends `request` to the coordinator's global state and waits for its
-/// response, from the installed Tool's own synchronous code running inside a
-/// Tool callback but outside the callback's own `send_rpc`: for example from
-/// a synchronous method a callback calls, where no [`reverie::Guest`] is at
-/// hand. Inside a callback the runtime's own syscalls are not intercepted.
-/// Guest code outside a callback cannot use this: its syscalls on the
-/// coordinator connection are guest syscalls, which the runtime refuses. It uses the process's one existing
-/// coordinator connection, so it reconnects after a fork exactly as callbacks
-/// do, and it adds no descriptor.
-///
-/// Fails, without sending, when no Tool is installed in this process, when
-/// `G` is not the installed Tool's global state, or when another request of
-/// this process is in flight on the connection (re-entry, which waiting would
-/// deadlock). It also fails, with ESRCH, while the running callback has
-/// staged an injection that ends the guest (an exit, or a SIGKILL of the
-/// guest itself) and goes on regardless, as every effect of such a callback
-/// is refused; the exit callbacks that follow can use it.
-pub fn blocking_global_rpc<G: reverie::GlobalTool + 'static>(
-    request: G::Request,
-) -> io::Result<G::Response> {
-    if reverie_inguest::guest::host::callback_ending_staged() {
-        return Err(io::Error::from_raw_os_error(libc::ESRCH));
-    }
-    let handler = HANDLER
-        .get()
-        .ok_or_else(|| io::Error::other("no in-guest Tool is installed in this process"))?;
-    let rpc = handler
-        .rpc()
-        .downcast_ref::<CoordinatorRpc<G>>()
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "the requested global state is not the installed Tool's",
-            )
-        })?;
-    rpc.send_blocking_unless_in_flight(request).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "another coordinator request of this process is in flight",
-        )
-    })
-}
+pub use installed_tool::blocking_global_rpc;
 
 pub(crate) fn dispatch(event: &mut SyscallEvent) {
-    match HANDLER.get() {
-        Some(handler) => handler.dispatch(event),
-        None => event.result = -i64::from(libc::ENOSYS),
-    }
+    // SAFETY: only LI's genuine intercepted paths reach this private wrapper,
+    // retaining their actual event/frame, rights, RCB and callback protection.
+    unsafe { installed_tool::dispatch(event) };
 }
 
 pub(crate) fn dispatch_instruction(kind: runtime::InstructionEventKind, context: &mut HookContext) {
-    match HANDLER.get() {
-        Some(handler) => handler.dispatch_instruction(kind, context),
-        None => fatal(126),
-    }
-}
-
-fn fatal(status: i32) -> ! {
-    unsafe {
-        let _ = raw_syscall6(libc::SYS_exit_group, [status as u64, 0, 0, 0, 0, 0]);
-    }
-    loop {
-        core::hint::spin_loop();
-    }
+    // SAFETY: HookContext and RegisterContext have identical layout (all
+    // fields checked above). LI supplies the unique saved frame of this actual
+    // intercepted instruction under its existing native/accounting guards.
+    let context = unsafe { &mut *(context as *mut HookContext).cast::<RegisterContext>() };
+    unsafe { installed_tool::dispatch_instruction(kind, context) };
 }

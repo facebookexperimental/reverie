@@ -21,6 +21,155 @@ use reverie_liteinst::LiteinstDispatchPath;
 use reverie_liteinst::SITE_PATCHING_ENV;
 use reverie_liteinst::TOOL_PRELOAD_ENV;
 
+// These controls use the fully installed lifecycle executable, never a
+// pre-activation fabricated dispatch or a parallel registry.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct SharedHandlerRequest {
+    tag: u64,
+    reenter: bool,
+}
+
+#[derive(Default)]
+struct SharedHandlerGlobal {
+    requests: std::sync::Mutex<Vec<(i32, u64)>>,
+}
+
+#[reverie::global_tool]
+impl GlobalTool for SharedHandlerGlobal {
+    type Request = SharedHandlerRequest;
+    type Response = (i32, u64, u64);
+    type Config = ();
+
+    async fn receive_rpc(&self, from: Tid, request: SharedHandlerRequest) -> (i32, u64, u64) {
+        let mut requests = self.requests.lock().unwrap();
+        requests.push((from.as_raw(), request.tag));
+        (from.as_raw(), requests.len() as u64, request.tag)
+    }
+}
+
+#[derive(Default)]
+struct SharedHandlerCoordinatorTool;
+
+#[reverie::tool]
+impl Tool for SharedHandlerCoordinatorTool {
+    type GlobalState = SharedHandlerGlobal;
+    type ThreadState = ();
+
+    fn subscriptions(_config: &()) -> Subscription {
+        [Sysno::getpid].into_iter().collect()
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        _guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        panic!(
+            "host dispatch is not installed guest dispatch: {:?}",
+            syscall.number()
+        );
+    }
+}
+
+/// Counts actual accepted ordinary RPC connections from their SO_PEERPIDFD.
+/// This observes connection ownership; it is not native InitialImage admission.
+#[derive(Default)]
+struct SharedHandlerAdmission {
+    peers: std::sync::Mutex<Vec<i32>>,
+}
+
+impl reverie_rpc_transport::ConnectionAdmission for SharedHandlerAdmission {
+    fn admit(
+        &self,
+        peer: std::os::fd::OwnedFd,
+    ) -> std::io::Result<reverie_rpc_transport::Admitted> {
+        use std::os::fd::AsRawFd;
+        let fdinfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", peer.as_raw_fd()))?;
+        let pid = fdinfo
+            .lines()
+            .find_map(|line| line.strip_prefix("Pid:"))
+            .ok_or_else(|| std::io::Error::other("actual peer pidfd has no Pid"))?
+            .trim()
+            .parse::<i32>()
+            .map_err(std::io::Error::other)?;
+        if pid <= 0 {
+            return Err(std::io::Error::other("actual peer pidfd is not live"));
+        }
+        self.peers.lock().unwrap().push(pid);
+        Ok(reverie_rpc_transport::Admitted { process_id: pid })
+    }
+}
+
+async fn run_shared_handler_control(
+    mode: &str,
+) -> (std::process::Output, SharedHandlerGlobal, Vec<i32>) {
+    let (_preload_directory, preload) = compile_noop_preload();
+    let admission = std::sync::Arc::new(SharedHandlerAdmission::default());
+    let (result, global) = tokio::time::timeout(
+        Duration::from_secs(10),
+        LiteinstBackend::with_connection_admission(
+            admission.clone(),
+            LiteinstBackend::run_with_output_and_preload::<SharedHandlerCoordinatorTool>(
+                guest_command(mode),
+                (),
+                preload,
+            ),
+        ),
+    )
+    .await
+    .expect("shared-handler installed control hung")
+    .unwrap();
+    let peers = admission.peers.lock().unwrap().clone();
+    (result, global, peers)
+}
+
+fn assert_shared_handler_owner(result: &std::process::Output, global: &SharedHandlerGlobal) {
+    assert_eq!(
+        result.stdout,
+        b"shared handler: callbacks=2 owner=stable LI=2 shared=2 wrong-global=4 reentry=2 outer=1\n",
+        "{result:?}",
+    );
+    assert!(result.stderr.is_empty(), "{result:?}");
+    let requests = global.requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        5,
+        "wrong-global/reentrant requests must not send: {requests:?}"
+    );
+    let source = requests[0].0;
+    assert!(source > 0);
+    assert_eq!(
+        *requests,
+        [1001, 2001, 3001, 1002, 2002].map(|tag| (source, tag)),
+        "both accessors must observe the actual same sender and request order",
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn installed_shared_and_liteinst_accessors_retain_the_real_tool_and_rpc_owner() {
+    let (result, global, peers) = run_shared_handler_control("shared-handler-owner").await;
+    assert_eq!(result.status.code(), Some(0), "{result:?}");
+    assert_shared_handler_owner(&result, &global);
+    let source = global.requests.lock().unwrap()[0].0;
+    assert_eq!(
+        peers,
+        [source],
+        "the actual owner uses one accepted RPC connection"
+    );
+}
+
+#[cfg(feature = "fixed-syscall-gates")]
+#[tokio::test(flavor = "current_thread")]
+async fn whole_fixed_install_duplicate_is_terminal_after_actual_first_owner_observations() {
+    let (result, global, peers) = run_shared_handler_control("shared-handler-duplicate").await;
+    assert_eq!(result.status.code(), Some(127), "{result:?}");
+    assert_shared_handler_owner(&result, &global);
+    let source = global.requests.lock().unwrap()[0].0;
+    assert_eq!(peers.first(), Some(&source));
+    // A later duplicate attempt may connect before its terminal refusal.
+    // Do not claim it reached registry rejection or constructed nothing.
+}
+
 const RPC_GETPID: u64 = 1;
 const RPC_CLOCK_GETTIME: u64 = 2;
 const RPC_GETTIMEOFDAY: u64 = 3;
