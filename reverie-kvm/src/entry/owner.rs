@@ -117,14 +117,27 @@ struct OwnerData {
     callbacks: BTreeSet<u64>,
     pending: Vec<Arc<PendingFailure>>,
     change: Change,
+    /// Whether anyone took the current `change` receiver since it was armed.
+    /// Only then does a change complete it and arm the next one: nearly every
+    /// change (a callback scope's end, on every guest syscall) has no watcher,
+    /// and arming allocates a channel and a shared future.
+    change_subscribed: bool,
 }
 
 impl OwnerData {
     fn changed(&mut self) -> OwnerNotification {
+        let previous = std::mem::take(&mut self.change_subscribed)
+            .then(|| std::mem::replace(&mut self.change, Change::new()));
         OwnerNotification {
-            previous: Some(std::mem::replace(&mut self.change, Change::new())),
+            previous,
             keepalive: None,
         }
+    }
+
+    /// Every subscriber goes through here, so the next change completes it.
+    fn subscribe(&mut self) -> OwnerSubscription {
+        self.change_subscribed = true;
+        self.change.receiver.clone()
     }
 }
 
@@ -166,6 +179,7 @@ impl DriverScope {
                     callbacks: BTreeSet::new(),
                     pending: Vec::new(),
                     change: Change::new(),
+                    change_subscribed: false,
                 }),
             })),
         }
@@ -225,7 +239,7 @@ impl DriverOwner {
     /// Subscribe before rechecking pending causes or lifecycle. Readiness,
     /// including a disconnected sender, authorizes only that recheck.
     pub(crate) fn subscribe(&self) -> OwnerSubscription {
-        self.state.data.lock().unwrap().change.receiver.clone()
+        self.state.data.lock().unwrap().subscribe()
     }
 
     pub(crate) fn pending(&self) -> Vec<Arc<PendingFailure>> {
@@ -394,7 +408,7 @@ impl OperationOrigin {
     pub(crate) fn subscribe(&self) -> Option<OwnerSubscription> {
         self.owner
             .upgrade()
-            .map(|owner| owner.data.lock().unwrap().change.receiver.clone())
+            .map(|owner| owner.data.lock().unwrap().subscribe())
     }
 
     pub(crate) fn lifecycle(&self) -> DriverLifecycle {
@@ -549,6 +563,47 @@ mod tests {
 
     fn poll<F: Future>(future: Pin<&mut F>, waker: &Waker) -> Poll<F::Output> {
         future.poll(&mut Context::from_waker(waker))
+    }
+
+    #[test]
+    fn an_unwatched_owner_change_arms_and_completes_nothing() {
+        let scope = DriverScope::new();
+        let owner = scope.owner();
+        let origin = owner.origin();
+        // Read the armed receiver directly, which does not subscribe.
+        let armed = owner.state.data.lock().unwrap().change.receiver.clone();
+        let notification = origin.capture(cause()).unwrap();
+        assert!(
+            notification.previous.is_none(),
+            "an unwatched change was armed"
+        );
+        notification.notify();
+        let data = owner.state.data.lock().unwrap();
+        assert!(futures::future::Shared::ptr_eq(
+            &armed,
+            &data.change.receiver
+        ));
+        assert!(!data.change_subscribed);
+        drop(data);
+        assert!(armed.peek().is_none(), "an unwatched change completed");
+        drop(scope.retire());
+    }
+
+    #[test]
+    fn an_owner_subscriber_taken_between_changes_sees_the_next_one() {
+        let scope = DriverScope::new();
+        let owner = scope.owner();
+        let origin = owner.origin();
+        origin.capture(cause()).unwrap().notify();
+        let mut subscription = Box::pin(owner.subscribe());
+        let waker = futures::task::noop_waker();
+        assert!(poll(subscription.as_mut(), &waker).is_pending());
+        let notification = origin.capture(cause()).unwrap();
+        assert!(notification.previous.is_some());
+        notification.notify();
+        assert!(poll(subscription.as_mut(), &waker).is_ready());
+        assert!(!owner.state.data.lock().unwrap().change_subscribed);
+        drop(scope.retire());
     }
 
     #[test]
