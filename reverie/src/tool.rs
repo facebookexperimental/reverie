@@ -177,8 +177,27 @@ pub trait GlobalTool: Send + Sync + Default {
         true
     }
 
+    /// Whether the backend may skip a user-return boundary at which nothing
+    /// could be delivered, without calling
+    /// [`Self::authorize_backend_signal_boundary`]. Such a boundary is one
+    /// where the task holds no reserved permit and the backend's own state
+    /// shows no pending signal that the task's mask leaves unblocked, no
+    /// recorded dequeue or dequeue failure to report, no signalfd readiness to
+    /// refresh, and no parked ledger. A skipped boundary also has no
+    /// [`Self::on_backend_signal_boundary`] receipt.
+    ///
+    /// Return `true` only if authorization never publishes a signal or
+    /// otherwise changes what that boundary would select, and if the Tool
+    /// does not depend on being asked at every boundary; the answer must not
+    /// change during a run. The default `false` authorizes every boundary.
+    fn skip_empty_signal_boundaries(&self) -> bool {
+        false
+    }
+
     /// Authorize the current real user-return boundary. The backend calls
     /// this outside signal locks; host callback arrival is not authorization.
+    /// See [`Self::skip_empty_signal_boundaries`] for the boundaries a Tool
+    /// may let the backend skip.
     fn authorize_backend_signal_boundary(
         &self,
         _task: crate::SignalTaskIdentity,

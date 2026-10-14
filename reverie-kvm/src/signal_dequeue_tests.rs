@@ -728,3 +728,90 @@ fn signal_dequeue_full_journal_failure_retains_partial_read_and_every_removal() 
     assert_eq!(pending.dequeue_sequence, 64);
     assert!(pending.dequeue_journal.is_empty());
 }
+
+/// signal_boundary_is_empty lets the KVM runtime skip a whole signal boundary.
+/// Whenever it answers true, the full selection must take nothing and change
+/// nothing; each state that would make the full boundary select, fail, refresh
+/// readiness or flush must answer false.
+#[test]
+fn an_empty_signal_boundary_selects_and_changes_nothing() {
+    fn assert_empty_boundary_is_a_noop(executor: &mut ElfExecutor) {
+        assert!(executor.signal_boundary_is_empty());
+        let before = process_alarm_snapshot(executor);
+        assert_eq!(executor.take_pending_signal_for_delivery(), Ok(None));
+        assert_eq!(process_alarm_snapshot(executor), before);
+        assert_eq!(executor.signal_dequeue_front(), None);
+    }
+    let root = TestDir::new();
+
+    // Nothing pending.
+    let mut executor = ElfExecutor::new(test_state(&root.0), false);
+    executor.enable_signal_dequeues();
+    assert_empty_boundary_is_a_noop(&mut executor);
+
+    // Pending only while blocked, in both domains: not eligible, so empty
+    // until the mask opens.
+    let thread_event =
+        event_for_thread(libc::SIGUSR1, executor.state.pid, executor.state.tid).unwrap();
+    test_block_signal(&mut executor.state, libc::SIGUSR1);
+    test_block_signal(&mut executor.state, libc::SIGALRM);
+    executor.defer_signal_delivery(thread_event).unwrap();
+    assert!(matches!(
+        executor.queue_process_alarm_signal(process_alarm_event(executor.state.pid)),
+        reverie::ProcessAlarmSignalOutcome::Accepted(_)
+    ));
+    assert!(!executor.has_eligible_pending_signal());
+    assert_empty_boundary_is_a_noop(&mut executor);
+
+    // An unblocked thread-pending signal is selectable.
+    executor
+        .state
+        .thread_signals
+        .lock()
+        .blocked
+        .remove(libc::SIGUSR1);
+    assert!(!executor.signal_boundary_is_empty());
+    // An unblocked process-shared signal is selectable.
+    test_block_signal(&mut executor.state, libc::SIGUSR1);
+    assert!(executor.signal_boundary_is_empty());
+    executor
+        .state
+        .thread_signals
+        .lock()
+        .blocked
+        .remove(libc::SIGALRM);
+    assert!(!executor.signal_boundary_is_empty());
+
+    // A journaled dequeue of this thread's must be flushed by the boundary.
+    let taken = executor.take_pending_signal_for_delivery().unwrap().unwrap();
+    assert_eq!(taken.event.signal(), libc::SIGALRM);
+    let effect = executor.signal_dequeue_front().unwrap();
+    assert!(!executor.has_eligible_pending_signal());
+    assert!(!executor.signal_boundary_is_empty());
+    executor.acknowledge_signal_dequeue(effect).unwrap();
+    assert_empty_boundary_is_a_noop(&mut executor);
+
+    // A stored dequeue failure must surface through the boundary.
+    executor.state.signal_dequeue_failure = Some(reverie::syscalls::Errno::EIO);
+    assert!(!executor.signal_boundary_is_empty());
+    assert_eq!(
+        executor.take_pending_signal_for_delivery(),
+        Err(reverie::syscalls::Errno::EIO)
+    );
+    executor.state.signal_dequeue_failure = None;
+    assert_empty_boundary_is_a_noop(&mut executor);
+
+    // A parked ledger can refuse the boundary's effect reservation.
+    let site = executor.begin_signal_callback().unwrap();
+    executor.retain_parked_effects(site).unwrap();
+    assert!(!executor.signal_boundary_is_empty());
+
+    // An installed signalfd has readiness that the boundary refreshes, even
+    // with nothing pending.
+    let mut executor = ElfExecutor::new(test_state(&root.0), false);
+    let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+    assert!(executor.signal_boundary_is_empty());
+    process_alarm_signalfd(&mut executor, &mut memory);
+    assert!(!executor.has_eligible_pending_signal());
+    assert!(!executor.signal_boundary_is_empty());
+}

@@ -1647,6 +1647,10 @@ impl KvmBackend {
         self.entry_driver.clone()
     }
 
+    pub(crate) fn entry_driver_ref(&self) -> Option<&crate::entry::owner::DriverOwner> {
+        self.entry_driver.as_ref()
+    }
+
     pub(crate) fn set_operation_origin(
         &mut self,
         origin: Option<crate::entry::owner::OperationOrigin>,
@@ -12030,6 +12034,7 @@ mod tests {
 
     include!("vm/public_tool_panic_tests.rs");
     include!("vm/kept_failure_wait_tests.rs");
+    include!("vm/empty_signal_boundary_tests.rs");
     include!("vm/instruction_callback_panic_tests.rs");
 }
 

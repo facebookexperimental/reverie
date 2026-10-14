@@ -5018,6 +5018,13 @@ impl KvmBackend {
             let identity = executor.signal_task_identity().ok_or_else(|| {
                 Error::UnexpectedVcpuExit("signal return lost task generation".to_owned())
             })?;
+            // Most syscall returns have nothing to deliver. When the Tool
+            // allows it, skip the permit round trip and the locked selection
+            // at a boundary that provably selects nothing and changes nothing;
+            // see signal_boundary_is_empty.
+            if global_state.skip_empty_signal_boundaries() && executor.signal_boundary_is_empty() {
+                return Ok(CallbackOutcome::Completed(None));
+            }
             let permit = global_state
                 .authorize_backend_signal_boundary(identity)
                 .map_err(Error::Reverie)?;

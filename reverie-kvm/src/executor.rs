@@ -7100,6 +7100,44 @@ impl ElfExecutor {
         Ok(pending)
     }
 
+    /// Reports that this thread's next signal boundary can neither select a
+    /// signal nor fail nor change signal state. There is no stored dequeue
+    /// failure, no parked ledger whose effect reservation could refuse, no
+    /// signalfd whose readiness the boundary would refresh, no journaled
+    /// dequeue of this thread's to flush, and no pending signal that the
+    /// current mask leaves unblocked. Then take_pending_signal_for_delivery
+    /// returns no signal and leaves every signal structure as it found it, and
+    /// a delivery permit authorized only for that call would be consumed with
+    /// no effect, so the caller may skip the whole boundary.
+    ///
+    /// Every input is this thread's own state or state that other tasks change
+    /// only during their own serial turns, so the answer is the one the full
+    /// boundary would reach at this point of the same turn.
+    pub(crate) fn signal_boundary_is_empty(&self) -> bool {
+        if self.state.signal_dequeue_failure.is_some() || self.parked_signals.is_some() {
+            return false;
+        }
+        let owner = self.admitted_signal_identity();
+        let process = self
+            .state
+            .process_signals
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if !process.signalfd_masks.is_empty()
+            || process
+                .dequeue_journal
+                .iter()
+                .any(|entry| entry.owner == owner)
+        {
+            return false;
+        }
+        let generations = &process.pending_generations;
+        let thread = self.state.thread_signals.lock();
+        let blocked = thread.blocked;
+        !thread.pending.any_eligible(blocked, generations)
+            && !process.shared_pending.any_eligible(blocked, generations)
+    }
+
     /// Reports current unblocked pending state without selecting a signal or
     /// requiring a delivery permit.
     pub(crate) fn has_eligible_pending_signal(&self) -> bool {
@@ -7366,6 +7404,11 @@ impl ElfExecutor {
     }
 
     fn take_exit_with_parent_death(&mut self, guest_death: bool) -> Option<ProcessExit> {
+        // The syscall loop asks after every guest syscall, and there is
+        // almost never an exit. The status is this executor's own field, so
+        // it can be read without the signal transaction; when there is none,
+        // the locked path below would return None without changing anything.
+        self.exit_status?;
         let transaction = self.state.signal_transaction.clone();
         let _transaction = transaction.lock().unwrap_or_else(|p| p.into_inner());
         let status = self.exit_status.take()?;

@@ -1173,6 +1173,10 @@ impl GuestMemory {
         self.mapping.entry_gate.clone()
     }
 
+    pub(crate) fn entry_gate_ref(&self) -> &Arc<EntryGate> {
+        &self.mapping.entry_gate
+    }
+
     #[cfg(test)]
     pub(crate) fn test_mapping_owners(&self) -> impl Fn() -> usize + Send + Sync + 'static + use<> {
         let mapping = Arc::downgrade(&self.mapping);
