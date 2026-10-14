@@ -1294,7 +1294,7 @@ impl<'a, T: Tool> KvmGuest<'a, T> {
 
     fn check_ordinary_operation(&self) -> Result<()> {
         self.entry_watch
-            .check_operation(self.memory.entry_origin().operation.as_ref())
+            .check_operation(self.memory.operation_origin())
     }
 
     async fn admit_ordinary_operation(&self) {
@@ -5860,9 +5860,12 @@ impl KvmBackend {
                 unsafe {
                     (return_slot as *mut u64).write(0);
                 }
-                let userspace =
-                    process_syscall_return_registers(&memory, registers, frame_address, 0, None)?;
-                executor.set_current_user_stack_pointer(userspace.rsp);
+                // The trampoline does not move RSP, and the return registers
+                // keep it when no stack pointer is supplied, so the guest's
+                // user stack pointer is the exit's RSP. Rebuilding the whole
+                // return register file here only to read that field cost a
+                // second admitted copy of the frame read_from just copied.
+                executor.set_current_user_stack_pointer(registers.rsp);
                 if request.number() == libc::SYS_rt_sigreturn as u64 {
                     // `rt_sigreturn` is backend-owned: its apparent syscall result
                     // is the register file restored from the guest frame, not an

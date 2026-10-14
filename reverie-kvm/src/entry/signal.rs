@@ -240,6 +240,18 @@ pub(crate) struct ImmediateExit(std::ptr::NonNull<u8>);
 // position, kvm-ioctls never touches immediate_exit through that reference,
 // and the kernel itself writes this page. Moving the value between threads
 // moves only the address.
+//
+// That late store is reachable only through a kick sent after KVM_RUN
+// returned, and EntryGate::try_close, the only sender, has no production
+// caller; or through a foreign signal 64, which breaks the embedding contract
+// and makes the thread's next entry refuse. PRECONDITION for the first
+// production caller of try_close
+// (https://github.com/rrnewton/reverie/issues/1051): first remove this
+// aliasing, either with a raw-provenance kvm_run accessor (in kvm-ioctls or a
+// fork) so exit decoding never holds `&mut kvm_run` over this byte, or by
+// issuing KVM_RUN here and decoding the exits it uses from raw pointers; and
+// bound the closer's wait so a kick that never takes effect fails loudly with
+// a typed error.
 unsafe impl Send for ImmediateExit {}
 // SAFETY: as for Send; a shared reference permits only copying the address.
 unsafe impl Sync for ImmediateExit {}

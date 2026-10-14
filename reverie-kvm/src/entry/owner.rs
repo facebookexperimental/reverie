@@ -144,6 +144,13 @@ impl OwnerData {
 struct DriverState {
     witness: Arc<RetirementWitness>,
     data: Mutex<OwnerData>,
+    /// Whether `data.pending` is nonempty. Written under the `data` mutex
+    /// with every change to `pending`, so [`DriverOwner::pending`], which
+    /// every entry and callback checks and which is nearly always empty,
+    /// can skip the mutex. A check that reads false is ordered before any
+    /// capture still in progress, as it would be had it taken the mutex
+    /// first.
+    has_pending: AtomicBool,
 }
 
 /// One lexical guard per actual invocation/worker. Clone DriverOwner, not this.
@@ -181,6 +188,7 @@ impl DriverScope {
                     change: Change::new(),
                     change_subscribed: false,
                 }),
+                has_pending: AtomicBool::new(false),
             })),
         }
     }
@@ -204,6 +212,7 @@ impl DriverScope {
         };
         state.witness.close(lifecycle);
         let pending = std::mem::take(&mut data.pending);
+        state.has_pending.store(false, Ordering::Release);
         let notification = data.changed();
         drop(data);
         DriverRetirement {
@@ -243,13 +252,18 @@ impl DriverOwner {
     }
 
     pub(crate) fn pending(&self) -> Vec<Arc<PendingFailure>> {
+        if !self.state.has_pending.load(Ordering::Acquire) {
+            return Vec::new();
+        }
         self.state.data.lock().unwrap().pending.clone()
     }
 
     /// Transfer obligations to this driver's outer error path, not a peer.
     #[cfg(test)]
     pub(crate) fn take_pending(&self) -> Vec<Arc<PendingFailure>> {
-        std::mem::take(&mut self.state.data.lock().unwrap().pending)
+        let mut data = self.state.data.lock().unwrap();
+        self.state.has_pending.store(false, Ordering::Release);
+        std::mem::take(&mut data.pending)
     }
 
     pub(crate) fn origin(&self) -> OperationOrigin {
@@ -527,6 +541,7 @@ impl OperationOrigin {
             }
         } else {
             data.pending.push(failure);
+            owner.has_pending.store(true, Ordering::Release);
             data.changed()
         };
         drop(data);

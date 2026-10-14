@@ -341,6 +341,52 @@ struct HostChunk {
     backing: Arc<Backing>,
 }
 
+/// The host chunks of one guest range. Nearly every copy (a syscall frame,
+/// a result word) falls within one page, so that case stays off the heap.
+enum HostChunks {
+    One([HostChunk; 1]),
+    Many(Vec<HostChunk>),
+}
+
+impl std::ops::Deref for HostChunks {
+    type Target = [HostChunk];
+
+    fn deref(&self) -> &[HostChunk] {
+        match self {
+            Self::One(chunk) => chunk,
+            Self::Many(chunks) => chunks,
+        }
+    }
+}
+
+impl IntoIterator for HostChunks {
+    type Item = HostChunk;
+    type IntoIter = HostChunksIter;
+
+    fn into_iter(self) -> HostChunksIter {
+        match self {
+            Self::One(chunk) => HostChunksIter::One(chunk.into_iter()),
+            Self::Many(chunks) => HostChunksIter::Many(chunks.into_iter()),
+        }
+    }
+}
+
+enum HostChunksIter {
+    One(std::array::IntoIter<HostChunk, 1>),
+    Many(std::vec::IntoIter<HostChunk>),
+}
+
+impl Iterator for HostChunksIter {
+    type Item = HostChunk;
+
+    fn next(&mut self) -> Option<HostChunk> {
+        match self {
+            Self::One(chunks) => chunks.next(),
+            Self::Many(chunks) => chunks.next(),
+        }
+    }
+}
+
 /// Compatibility placement for the current fixed physical arena. Coverage is
 /// independent of reservations and user-copy permissions: a covered hole is
 /// still RAM, and reserving it does not make it accessible to user copies.
@@ -1144,6 +1190,11 @@ impl GuestMemory {
         self.operation_origin = origin;
     }
 
+    /// The issuing operation alone, without cloning the whole origin.
+    pub(crate) fn operation_origin(&self) -> Option<&OperationOrigin> {
+        self.operation_origin.as_ref()
+    }
+
     pub(crate) fn entry_origin(&self) -> EntryOrigin {
         EntryOrigin {
             failure: self.failure_context.clone(),
@@ -1155,7 +1206,7 @@ impl GuestMemory {
         self.check_copy_failure()?;
         self.mapping
             .entry_gate
-            .copy_blocking(self.entry_origin())
+            .copy_blocking_lazy(|| self.entry_origin())
             .map(|copy| MemoryCopyAccess::new(self, copy))
             .map_err(|failure| failure.error())
     }
@@ -1197,7 +1248,7 @@ impl GuestMemory {
         let Some(copy) = self
             .mapping
             .entry_gate
-            .try_copy(self.entry_origin())
+            .try_copy_lazy(|| self.entry_origin())
             .map_err(|failure| failure.error())?
         else {
             return Ok(None);
@@ -2313,7 +2364,7 @@ impl GuestMemory {
         let Some(copy) = self
             .mapping
             .entry_gate
-            .try_copy(self.entry_origin())
+            .try_copy_lazy(|| self.entry_origin())
             .map_err(|failure| failure.error())?
         else {
             return Ok(None);
@@ -2721,7 +2772,7 @@ impl UserMemory {
             self.memory
                 .mapping
                 .entry_gate
-                .retain_operand(copy)
+                .retain_operand_with(copy, || self.memory.entry_origin())
                 .map_err(|failure| failure.error())
         })?;
         let mut alias = UserWriteAlias {
@@ -2930,7 +2981,7 @@ impl UserMemory {
             .memory
             .mapping
             .entry_gate
-            .retain_operand(copy)
+            .retain_operand_with(copy, || self.memory.entry_origin())
             .map_err(|failure| failure.error())?;
         Ok(HostMemoryOperand {
             _memory: self.memory.clone(),
@@ -3558,7 +3609,7 @@ impl Mapping {
     /// Resolve a validated relative range into exact live mmap pointers. Once a
     /// page has been replaced, no Rust operation may cross that mapping
     /// boundary with a pointer derived from the original whole-arena mmap.
-    fn host_chunks(&self, offset: usize, length: usize) -> Vec<HostChunk> {
+    fn host_chunks(&self, offset: usize, length: usize) -> HostChunks {
         let state = self
             .address_space
             .lock()
@@ -3573,29 +3624,27 @@ impl Mapping {
         state: &AddressSpaceState,
         offset: usize,
         length: usize,
-    ) -> Vec<HostChunk> {
+    ) -> HostChunks {
         let end = offset
             .checked_add(length)
             .expect("validated guest-memory range cannot overflow");
         debug_assert!(end <= self.slice.length);
         if length == 0 {
-            return Vec::new();
+            return HostChunks::Many(Vec::new());
         }
 
         if state.backing_pages.is_empty() {
             // SAFETY: no page of the original whole-range mmap has ever been
             // replaced, and the validated range remains within that mapping.
             let mapping = unsafe { NonNull::new_unchecked(self.mapping.as_ptr().add(offset)) };
-            return vec![HostChunk {
+            return HostChunks::One([HostChunk {
                 mapping,
                 length,
                 backing: self.slice.backing.clone(),
-            }];
+            }]);
         }
 
-        let mut chunks = Vec::with_capacity(length.div_ceil(PAGE_SIZE) + 1);
-        let mut cursor = offset;
-        while cursor < end {
+        let chunk_at = |cursor: usize| {
             let relative_page = cursor / PAGE_SIZE;
             let within_page = cursor % PAGE_SIZE;
             let chunk_length = (PAGE_SIZE - within_page).min(end - cursor);
@@ -3610,14 +3659,25 @@ impl Mapping {
             // SAFETY: page_start is the exact live pointer for this page and
             // chunk_length cannot cross the page boundary.
             let mapping = unsafe { NonNull::new_unchecked(page_start.as_ptr().add(within_page)) };
-            chunks.push(HostChunk {
+            HostChunk {
                 mapping,
                 length: chunk_length,
                 backing,
-            });
-            cursor += chunk_length;
+            }
+        };
+        let first = chunk_at(offset);
+        if first.length == length {
+            return HostChunks::One([first]);
         }
-        chunks
+        let mut chunks = Vec::with_capacity(length.div_ceil(PAGE_SIZE) + 1);
+        let mut cursor = offset + first.length;
+        chunks.push(first);
+        while cursor < end {
+            let chunk = chunk_at(cursor);
+            cursor += chunk.length;
+            chunks.push(chunk);
+        }
+        HostChunks::Many(chunks)
     }
 }
 
@@ -4852,6 +4912,35 @@ mod tests {
                 run.primary().is_none(),
                 "memory helpers must capture, never publish"
             );
+        }
+
+        #[test]
+        fn queued_lazy_copy_retirement_keeps_its_issuing_context_alive() {
+            // Alias A defers notifications while alias B, which alone owns a
+            // FailureContext, completes a copy. B's retirement is queued past
+            // its borrow. If B then drops its context, the queued retirement
+            // must still keep it alive, so it is destroyed only on delivery,
+            // after A's scope ends, never while A still holds its locks.
+            let deferring = GuestMemory::new(BASE, PAGE_SIZE).unwrap();
+            let mut issuer = deferring.clone();
+            let global = Arc::new(());
+            let run = crate::failure::RunFailure::new(&global);
+            issuer.set_failure_context(Some(FailureContext::new(
+                run.clone(),
+                reverie::Pid::from_raw(3),
+                reverie::Pid::from_raw(5),
+            )));
+            let alone = Arc::strong_count(&run);
+            let scope = deferring.defer_notifications();
+            issuer.read_raw(BASE, &mut [0; 8]).unwrap();
+            issuer.set_failure_context(None);
+            assert_eq!(
+                Arc::strong_count(&run),
+                alone,
+                "the queued retirement released its issuing context"
+            );
+            drop(scope);
+            assert_eq!(Arc::strong_count(&run), alone - 1);
         }
 
         #[test]

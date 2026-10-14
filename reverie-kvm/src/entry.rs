@@ -814,6 +814,7 @@ impl EntryGate {
         }))
     }
 
+    #[cfg(test)]
     pub(crate) fn try_copy(
         self: &Arc<Self>,
         origin: impl Into<EntryOrigin>,
@@ -823,7 +824,24 @@ impl EntryGate {
         if state.admission != Admission::Open {
             return Ok(None);
         }
-        self.admit_copy(state, origin.into()).map(Some)
+        self.admit_copy(state, Origin::<fn() -> EntryOrigin>::Stored(origin.into()))
+            .map(Some)
+    }
+
+    /// As `try_copy`, for an issuer that can rebuild its origin on
+    /// demand. The copy stores no origin, so admitting it clones nothing;
+    /// `origin` runs only to attribute a failure, and every failure path of
+    /// the returned copy must be given it again (see [`CopyAccess::lazy`]).
+    pub(crate) fn try_copy_lazy(
+        self: &Arc<Self>,
+        origin: impl FnOnce() -> EntryOrigin,
+    ) -> GateResult<Option<CopyAccess>> {
+        let state = self.state.lock().unwrap();
+        state.check()?;
+        if state.admission != Admission::Open {
+            return Ok(None);
+        }
+        self.admit_copy(state, Origin::Lazy(origin)).map(Some)
     }
 
     /// Synchronous memory APIs wait without holding address-state or backing
@@ -833,7 +851,22 @@ impl EntryGate {
         self: &Arc<Self>,
         origin: impl Into<EntryOrigin>,
     ) -> GateResult<CopyAccess> {
-        let origin = origin.into();
+        self.copy_blocking_origin(Origin::<fn() -> EntryOrigin>::Stored(origin.into()))
+    }
+
+    /// As [`Self::copy_blocking`], with the origin rebuilt only on failure;
+    /// see [`Self::try_copy_lazy`].
+    pub(crate) fn copy_blocking_lazy(
+        self: &Arc<Self>,
+        origin: impl FnOnce() -> EntryOrigin,
+    ) -> GateResult<CopyAccess> {
+        self.copy_blocking_origin(Origin::Lazy(origin))
+    }
+
+    fn copy_blocking_origin(
+        self: &Arc<Self>,
+        origin: Origin<impl FnOnce() -> EntryOrigin>,
+    ) -> GateResult<CopyAccess> {
         let mut state = self.state.lock().unwrap();
         loop {
             state.check()?;
@@ -859,19 +892,24 @@ impl EntryGate {
     fn admit_copy(
         self: &Arc<Self>,
         mut state: MutexGuard<'_, State>,
-        origin: EntryOrigin,
+        origin: Origin<impl FnOnce() -> EntryOrigin>,
     ) -> GateResult<CopyAccess> {
         let Some(copies) = state.copies.checked_add(1) else {
-            let failure = state.fail(origin, protocol_failure("copy accounting exhausted"));
+            let failure = state.fail(origin.get(), protocol_failure("copy accounting exhausted"));
             let sender = state.changed();
             drop(state);
             notify(sender);
             return Err(failure);
         };
         state.copies = copies;
+        let (origin, lazy) = match origin {
+            Origin::Stored(origin) => (origin, false),
+            Origin::Lazy(_) => (EntryOrigin::default(), true),
+        };
         Ok(CopyAccess {
             gate: self.clone(),
             origin,
+            lazy,
             generation: state.generation,
             retired: false,
         })
@@ -881,18 +919,31 @@ impl EntryGate {
     /// waits only for short copies, so ordinary unchanged fences do not wait on
     /// a blocking kernel operation. Mapping publication checks this count and
     /// fails before changing the backing image.
+    #[cfg(test)]
     pub(crate) fn retain_operand(
         self: &Arc<Self>,
         copy: &CopyAccess,
+    ) -> GateResult<RetainedOperand> {
+        assert!(!copy.lazy, "a lazily admitted copy must supply its origin");
+        self.retain_operand_with(copy, || copy.origin.clone())
+    }
+
+    /// As `retain_operand`, for a lazily admitted copy, whose origin
+    /// the retained operand keeps for its own failure paths.
+    pub(crate) fn retain_operand_with(
+        self: &Arc<Self>,
+        copy: &CopyAccess,
+        origin: impl FnOnce() -> EntryOrigin,
     ) -> GateResult<RetainedOperand> {
         assert!(Arc::ptr_eq(self, &copy.gate));
         let mut state = self.state.lock().unwrap();
         state.check()?;
         assert!(state.copies != 0, "retained operand requires a live copy");
         assert_eq!(state.generation, copy.generation);
+        let origin = origin();
         let Some(retained_operands) = state.retained_operands.checked_add(1) else {
             let failure = state.fail(
-                copy.origin.clone(),
+                origin,
                 protocol_failure("retained host operand accounting exhausted"),
             );
             let sender = state.changed();
@@ -903,7 +954,7 @@ impl EntryGate {
         state.retained_operands = retained_operands;
         Ok(RetainedOperand {
             gate: self.clone(),
-            origin: copy.origin.clone(),
+            origin,
             generation: copy.generation,
         })
     }
@@ -1296,29 +1347,67 @@ impl Drop for RunEntry<'_> {
 pub(crate) struct CopyAccess {
     gate: Arc<EntryGate>,
     origin: EntryOrigin,
+    /// Admitted with [`EntryGate::try_copy_lazy`] or
+    /// [`EntryGate::copy_blocking_lazy`]: `origin` is empty, and the issuer
+    /// supplies the real one to [`Self::retire_deferred_with`] and
+    /// [`EntryGate::retain_operand_with`].
+    lazy: bool,
     generation: MappingGeneration,
     retired: bool,
+}
+
+/// A copy's issuing context, either owned by the copy or rebuilt by its
+/// issuer only when a failure must be attributed.
+enum Origin<F> {
+    Stored(EntryOrigin),
+    Lazy(F),
+}
+
+impl<F: FnOnce() -> EntryOrigin> Origin<F> {
+    fn get(self) -> EntryOrigin {
+        match self {
+            Self::Stored(origin) => origin,
+            Self::Lazy(origin) => origin(),
+        }
+    }
 }
 
 impl CopyAccess {
     /// Retire the actual access now, while deferring every notification and
     /// the issuing context's destruction until the caller releases its locks.
     /// The returned token owns no memory or allocation transaction.
-    pub(crate) fn retire_deferred(mut self) -> CopyRetirement {
-        let change = self.retire();
+    #[cfg(test)]
+    pub(crate) fn retire_deferred(self) -> CopyRetirement {
+        assert!(!self.lazy, "a lazily admitted copy must supply its origin");
+        self.retire_deferred_with(|| unreachable!("a stored origin is used"))
+    }
+
+    /// As `retire_deferred`, with `origin` attributing an unwinding
+    /// retirement of a lazily admitted copy.
+    pub(crate) fn retire_deferred_with(
+        mut self,
+        origin: impl FnOnce() -> EntryOrigin,
+    ) -> CopyRetirement {
+        let change = self.retire(origin);
         CopyRetirement {
             change: Some(change),
             origin: Some(std::mem::take(&mut self.origin)),
+            lazy: self.lazy,
             _gate: self.gate.clone(),
         }
     }
 
-    fn retire(&mut self) -> ChangeSignal {
+    fn retire(&mut self, origin: impl FnOnce() -> EntryOrigin) -> ChangeSignal {
         assert!(!self.retired, "copy retired twice");
         {
             let mut state = self.gate.state.lock().unwrap();
             if std::thread::panicking() {
-                state.fail(self.origin.clone(), protocol_failure("host copy unwound"));
+                let origin = if self.lazy {
+                    origin()
+                } else {
+                    self.origin.clone()
+                };
+                state.fail(origin, protocol_failure("host copy unwound"));
             }
             state.copies = state.copies.checked_sub(1).expect("copy retired twice");
             self.retired = true;
@@ -1330,7 +1419,13 @@ impl CopyAccess {
 impl Drop for CopyAccess {
     fn drop(&mut self) {
         if !self.retired {
-            notify(self.retire());
+            // A lazily admitted copy is owned by an issuer that retires it
+            // with its origin; this fallback has only the empty one.
+            debug_assert!(
+                !self.lazy || std::thread::panicking(),
+                "a lazily admitted copy was dropped without its issuer's retirement"
+            );
+            notify(self.retire(EntryOrigin::default));
         }
     }
 }
@@ -1341,6 +1436,9 @@ impl Drop for CopyAccess {
 pub(crate) struct CopyRetirement {
     change: Option<ChangeSignal>,
     origin: Option<EntryOrigin>,
+    /// Retired from a lazily admitted copy, so `origin` is empty until
+    /// [`Self::keep_issuer`] supplies it.
+    lazy: bool,
     _gate: Arc<EntryGate>,
 }
 
@@ -1353,6 +1451,18 @@ impl std::fmt::Debug for CopyRetirement {
 }
 
 impl CopyRetirement {
+    /// A retirement queued beyond its issuer's borrow must keep the issuing
+    /// context alive until it is delivered, as an eagerly admitted copy's
+    /// stored origin does: destroying a last FailureContext can wake its
+    /// subscriber synchronously, which must not happen while the queue's
+    /// owner still holds its locks. A lazily admitted copy stored nothing,
+    /// so its issuer supplies the origin here; an eager copy already has it.
+    pub(crate) fn keep_issuer(&mut self, origin: impl FnOnce() -> EntryOrigin) {
+        if std::mem::take(&mut self.lazy) {
+            self.origin = Some(origin());
+        }
+    }
+
     pub(crate) fn notify(mut self) {
         self.notify_pending();
     }
