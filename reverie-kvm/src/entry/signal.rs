@@ -13,6 +13,14 @@
 //! blocked: only `KVM_RUN` unblocks it, through the per-vCPU KVM signal mask.
 //! An entry therefore costs one `pthread_sigmask` (which also reads the thread
 //! mask) and reissues `KVM_SET_SIGNAL_MASK` only when that mask has changed.
+//!
+//! An instance already pending when an entry starts has no sender and
+//! refuses the entry before `KVM_RUN`. After that, an entry drains the signal
+//! only after a closer recorded a kick or `KVM_RUN` failed. Signal 64 is
+//! deliverable inside `KVM_RUN`, so an instance arriving while it runs makes
+//! it fail with EINTR, and the drain refuses any instance beyond the recorded
+//! kicks. An unrecorded instance that arrives after an exit stays pending,
+//! because the signal is blocked, and refuses the thread's next entry.
 
 use std::marker::PhantomData;
 use std::os::fd::AsRawFd;
@@ -45,6 +53,12 @@ fn last_error(operation: &'static str) -> crate::Error {
 }
 
 fn install_handler() -> Result<()> {
+    thread_local! {
+        static VERIFIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if VERIFIED.get() {
+        return Ok(());
+    }
     static INSTALL: OnceLock<std::result::Result<usize, i32>> = OnceLock::new();
     let result = INSTALL.get_or_init(|| {
         // SAFETY: the supplied action storage is initialized and lives through
@@ -86,7 +100,10 @@ fn install_handler() -> Result<()> {
     };
     // A default-disposition check cannot exclude a future foreign owner. The
     // lifetime reservation is an embedding contract; detect a visible change
-    // rather than silently replacing a library's handler on later entries.
+    // at each thread's first entry rather than silently replacing a library's
+    // handler. A change after that is not seen on that thread. The handler
+    // never runs in this protocol anyway: the signal is blocked outside
+    // KVM_RUN and drained before the thread unblocks it.
     unsafe {
         let mut current: libc::sigaction = std::mem::zeroed();
         if libc::sigaction(SIGNAL, std::ptr::null(), &mut current) != 0 {
@@ -96,6 +113,7 @@ fn install_handler() -> Result<()> {
             return Err(protocol_failure("reserved host signal disposition changed"));
         }
     }
+    VERIFIED.set(true);
     Ok(())
 }
 
@@ -162,8 +180,12 @@ impl Mask {
             ));
         }
         // No gate sender can know this thread until entry publication, and
-        // the previous entry drained every instance sent to it. An already
-        // pending instance therefore has no legitimate sender.
+        // the previous entry drained every instance a closer sent to it. An
+        // already pending instance therefore has no legitimate sender. This
+        // check stays even though the drain also counts instances: at the
+        // pending-signal limit, an unrecorded instance can exist only as a
+        // pending bit, which a later recorded kick's queued instance absorbs,
+        // so the drain could not tell them apart.
         let check = (|| {
             let mut pending = unsafe { std::mem::zeroed() };
             if unsafe { libc::sigpending(&mut pending) } != 0 {
@@ -218,7 +240,8 @@ impl Mask {
         Ok(true)
     }
 
-    fn drain(&self) -> Result<()> {
+    /// Returns how many instances it consumed.
+    fn drain(&self) -> Result<usize> {
         #[cfg(test)]
         if let Some(error) = fault::take(1) {
             // The one-shot is removed before recursion. Perform the real
@@ -226,7 +249,7 @@ impl Mask {
             let actual = self.drain();
             let injected = crate::Error::SharedFailure(error);
             return Err(match actual {
-                Ok(()) => injected,
+                Ok(_) => injected,
                 Err(actual) => injected.with_cleanup(vec![actual]),
             });
         }
@@ -235,11 +258,13 @@ impl Mask {
             tv_sec: 0,
             tv_nsec: 0,
         };
+        let mut drained = 0;
         loop {
             // SAFETY: the mask and timespec are live; no siginfo is requested.
             // The reserved signal stays blocked on this thread through drain.
             let signal = unsafe { libc::sigtimedwait(&set, std::ptr::null_mut(), &timeout) };
             if signal == SIGNAL {
+                drained += 1;
                 continue;
             }
             if signal != -1 {
@@ -247,17 +272,32 @@ impl Mask {
             }
             match std::io::Error::last_os_error().raw_os_error() {
                 Some(libc::EINTR) => continue,
-                Some(libc::EAGAIN) => return Ok(()),
+                Some(libc::EAGAIN) => return Ok(drained),
                 _ => return Err(last_error("drain reserved host signal")),
             }
         }
     }
 
-    /// The registry must have withdrawn the send target before this call.
-    /// The reserved signal stays blocked, so nothing sent after the drain can
-    /// be delivered outside a later entry's `KVM_RUN`.
-    pub(super) fn finish(self) -> Result<()> {
-        self.drain()
+    /// The registry must have withdrawn the send target before this call;
+    /// `kicks` is what withdrawal reported. Every recorded send completed
+    /// under the registry lock, so each successful one queued its instance
+    /// before withdrawal (the signal is real-time, so instances do not
+    /// merge). A send that failed after being counted has already failed the
+    /// gate. Draining more instances than recorded kicks means one had no
+    /// recorded sender. The
+    /// reserved signal stays blocked, so nothing sent after the drain can be
+    /// delivered outside a later entry's `KVM_RUN`. Returns whether it drained.
+    pub(super) fn finish(self, kicks: usize, run: super::RunOutcome) -> Result<bool> {
+        if kicks == 0 && run == super::RunOutcome::Exited {
+            return Ok(false);
+        }
+        let drained = self.drain()?;
+        if drained > kicks {
+            return Err(protocol_failure(
+                "unexplained reserved host signal during entry",
+            ));
+        }
+        Ok(true)
     }
 }
 
@@ -401,6 +441,7 @@ mod tests {
                 "blocked",
                 "unblocked",
                 "pending",
+                "overflowed",
                 "ignored",
                 "foreign",
                 "replaced",
@@ -450,17 +491,28 @@ mod tests {
             return;
         }
         if case == "replaced" {
-            Mask::block().unwrap().finish().unwrap();
+            Mask::block()
+                .unwrap()
+                .finish(0, super::super::RunOutcome::Exited)
+                .unwrap();
             unsafe {
                 let mut action: libc::sigaction = std::mem::zeroed();
                 action.sa_sigaction = foreign_handler as *const () as usize;
                 libc::sigemptyset(&mut action.sa_mask);
                 assert_eq!(libc::sigaction(SIGNAL, &action, std::ptr::null_mut()), 0);
             }
-            let error = match Mask::block() {
+            // The disposition is checked at each thread's first entry. This
+            // thread already passed it; a new thread's first entry refuses.
+            Mask::block()
+                .unwrap()
+                .finish(0, super::super::RunOutcome::Exited)
+                .unwrap();
+            let error = std::thread::spawn(|| match Mask::block() {
                 Err(error) => error,
                 Ok(_) => panic!("accepted a replacement signal owner"),
-            };
+            })
+            .join()
+            .unwrap();
             assert!(matches!(
                 error.primary(),
                 crate::Error::EntryControl {
@@ -489,6 +541,51 @@ mod tests {
                 0
             );
         }
+        if case == "overflowed" {
+            // An ordinary entry installs the handler and blocks signal 64.
+            Mask::block()
+                .unwrap()
+                .finish(0, super::super::RunOutcome::Exited)
+                .unwrap();
+            // At the pending-signal limit, a stray SI_USER instance can exist
+            // only as a pending bit, which a later kick's queued instance
+            // would absorb. The pre-entry check must still see it.
+            unsafe {
+                let mut old: libc::rlimit = std::mem::zeroed();
+                assert_eq!(libc::getrlimit(libc::RLIMIT_SIGPENDING, &mut old), 0);
+                let exhausted = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: old.rlim_max,
+                };
+                assert_eq!(libc::setrlimit(libc::RLIMIT_SIGPENDING, &exhausted), 0);
+                let mut info: libc::siginfo_t = std::mem::zeroed();
+                info.si_signo = SIGNAL;
+                info.si_code = libc::SI_USER;
+                let sent = libc::syscall(
+                    libc::SYS_rt_tgsigqueueinfo,
+                    libc::getpid(),
+                    libc::syscall(libc::SYS_gettid),
+                    SIGNAL,
+                    &info as *const libc::siginfo_t,
+                );
+                assert_eq!(libc::setrlimit(libc::RLIMIT_SIGPENDING, &old), 0);
+                assert_eq!(sent, 0, "{}", std::io::Error::last_os_error());
+            }
+            assert!(pending(SIGNAL));
+            let error = match Mask::block() {
+                Err(error) => error,
+                Ok(_) => panic!("accepted an unexplained pending signal at the limit"),
+            };
+            assert!(matches!(
+                error.primary(),
+                crate::Error::EntryControl {
+                    operation: "unexplained reserved host signal before entry",
+                    ..
+                }
+            ));
+            assert!(pending(SIGNAL), "refusal consumed an unexplained signal");
+            return;
+        }
         if case == "pending" {
             unsafe {
                 assert_eq!(libc::pthread_kill(libc::pthread_self(), SIGNAL), 0);
@@ -498,18 +595,23 @@ mod tests {
             assert!(contains(&current_mask(), SIGNAL));
             return;
         }
+        let send = |count: usize| {
+            for _ in 0..count {
+                unsafe {
+                    assert_eq!(libc::pthread_kill(libc::pthread_self(), SIGNAL), 0);
+                }
+            }
+        };
+        // Instances sent after setup stand in for kicks during the entry.
         let mask = Mask::block().unwrap();
         assert!(contains(&current_mask(), SIGNAL));
-        for _ in 0..3 {
-            unsafe {
-                assert_eq!(libc::pthread_kill(libc::pthread_self(), SIGNAL), 0);
-            }
-        }
+        send(3);
         unsafe {
             assert_eq!(libc::pthread_kill(libc::pthread_self(), libc::SIGURG), 0);
         }
         assert!(pending(SIGNAL));
-        mask.finish().unwrap();
+        // Three recorded kicks drain their three queued instances.
+        mask.finish(3, super::super::RunOutcome::Exited).unwrap();
         assert!(!pending(SIGNAL));
         assert!(pending(libc::SIGURG), "entry cleanup consumed cancellation");
         // The reserved signal stays blocked after the entry; nothing else moves.
@@ -521,7 +623,55 @@ mod tests {
                 "signal {signal}"
             );
         }
-        // A new entry must not observe a stale queued gate signal.
-        Mask::block().unwrap().finish().unwrap();
+        // An exited entry with no recorded kick does not drain, and the next
+        // entry refuses the instance before KVM_RUN, leaving it pending.
+        let mask = Mask::block().unwrap();
+        send(1);
+        mask.finish(0, super::super::RunOutcome::Exited).unwrap();
+        assert!(pending(SIGNAL));
+        let error = match Mask::block() {
+            Err(error) => error,
+            Ok(_) => panic!("accepted an instance left by an undrained entry"),
+        };
+        assert!(matches!(
+            error.primary(),
+            crate::Error::EntryControl {
+                operation: "unexplained reserved host signal before entry",
+                ..
+            }
+        ));
+        assert!(pending(SIGNAL));
+        unsafe {
+            let set = only_reserved_signal();
+            let timeout = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            assert_eq!(
+                libc::sigtimedwait(&set, std::ptr::null_mut(), &timeout),
+                SIGNAL
+            );
+        }
+        // An instance beyond the recorded kicks has no sender: one kick with
+        // two queued instances drains both and refuses the entry.
+        let mask = Mask::block().unwrap();
+        send(2);
+        let error = mask
+            .finish(1, super::super::RunOutcome::Failed)
+            .expect_err("an unrecorded instance hid behind a recorded kick");
+        assert!(matches!(
+            error.primary(),
+            crate::Error::EntryControl {
+                operation: "unexplained reserved host signal during entry",
+                ..
+            }
+        ));
+        assert!(!pending(SIGNAL));
+        // A failed run drains even with no recorded kick; with nothing
+        // queued, it accepts.
+        Mask::block()
+            .unwrap()
+            .finish(0, super::super::RunOutcome::Failed)
+            .unwrap();
     }
 }

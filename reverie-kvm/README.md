@@ -20,8 +20,11 @@ The embedding process must reserve Linux real-time signal 64 exclusively for
 the backend. On first vCPU entry, the backend installs a process-wide handler;
 it does not restore that handler when a backend is dropped. Other libraries
 must not send this signal or replace its handler for the rest of the process's
-lifetime. An existing handler or `SIG_IGN` prevents entry. A changed handler or
-an unexplained pending instance before a later entry also causes an error.
+lifetime. An existing handler or `SIG_IGN` prevents entry. A changed handler is
+detected at each thread's first entry (not at that thread's later entries). An
+unexplained pending instance before an entry causes an error, and so does an
+instance no closer sent that interrupts an entry's `KVM_RUN`, even one queued
+alongside a closer's kick.
 These checks detect visible conflicts; they do not coordinate ownership with
 another signal user. Signal 64 stays blocked on a thread from its first vCPU
 entry on: KVM unblocks it only inside `KVM_RUN`, through the vCPU's signal mask,

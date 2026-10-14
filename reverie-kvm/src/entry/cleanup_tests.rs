@@ -237,6 +237,17 @@ fn assert_member(gate: &EntryGate, id: CleanupIdentity, activity: Activity) {
     assert_eq!(member.activity, activity);
 }
 
+/// A closer's send: exactly one instance per recorded kick, as `try_close`
+/// sends. An entry refuses any instance beyond its recorded kicks.
+fn send_one(thread: libc::pthread_t, sends: &AtomicUsize) -> std::io::Result<()> {
+    let result = unsafe { libc::pthread_kill(thread, 64) };
+    if result != 0 {
+        return Err(std::io::Error::from_raw_os_error(result));
+    }
+    sends.fetch_add(1, Ordering::SeqCst);
+    Ok(())
+}
+
 fn send_three(thread: libc::pthread_t, sends: &AtomicUsize) -> std::io::Result<()> {
     for _ in 0..3 {
         let result = unsafe { libc::pthread_kill(thread, 64) };
@@ -319,7 +330,7 @@ fn race_case(kind: Race, blocked: bool, tracked: bool) {
                     let close = before_gate
                         .try_close_with(|target| {
                             assert_eq!(target, pthread);
-                            send_three(target, &before_sends)
+                            send_one(target, &before_sends)
                         })
                         .unwrap()
                         .unwrap();
@@ -342,7 +353,7 @@ fn race_case(kind: Race, blocked: bool, tracked: bool) {
                                 attempt_receiver.recv_timeout(WAIT).expect(
                                     "real withdrawal did not encounter the held sender mutex",
                                 );
-                                send_three(target, &sends)
+                                send_one(target, &sends)
                             })
                             .unwrap()
                             .unwrap();
@@ -392,7 +403,7 @@ fn race_case(kind: Race, blocked: bool, tracked: bool) {
                             .expect("sender did not finish after actual withdrawal contention"),
                     );
                     assert!(pending_reserved());
-                    assert_eq!(after_sends.load(Ordering::SeqCst), 3);
+                    assert_eq!(after_sends.load(Ordering::SeqCst), 1);
                 }
                 Race::LateSend => {
                     assert!(pending_reserved());
@@ -446,7 +457,7 @@ fn race_case(kind: Race, blocked: bool, tracked: bool) {
     );
     assert_eq!(
         sends.load(Ordering::SeqCst),
-        if kind == Race::Withdrawn { 0 } else { 3 }
+        if kind == Race::Withdrawn { 0 } else { 1 }
     );
     if let Some(sender) = sender_handle.lock().unwrap().take() {
         sender.join().unwrap();
@@ -560,6 +571,7 @@ fn error_case(blocked: bool, tracked: bool, selected: [bool; 2]) {
     let guard = signal::fault::Guard::arm(configured);
     let phases = Arc::new(Mutex::new(Vec::new()));
     let before_phases = phases.clone();
+    let before_gate = gate.clone();
     probe
         .prepare
         .on_cleanup(CleanupPhase::BeforeWithdraw, move |id| {
@@ -568,7 +580,16 @@ fn error_case(blocked: bool, tracked: bool, selected: [bool; 2]) {
             // The fault-control producer queues real signals while masked. The
             // sender/withdrawal authorization is covered by the separate race
             // controls; this case isolates safe drain despite a reported error.
+            // It records its sends as a closer does, so the drain runs.
             if selected[1] {
+                before_gate
+                    .state
+                    .lock()
+                    .unwrap()
+                    .members
+                    .get_mut(&id.participant)
+                    .unwrap()
+                    .kicks = 3;
                 let sends = AtomicUsize::new(0);
                 send_three(unsafe { libc::pthread_self() }, &sends).unwrap();
                 assert_eq!(sends.load(Ordering::SeqCst), 3);

@@ -44,6 +44,7 @@ use crate::Error;
 use crate::Result;
 use crate::entry::Participant;
 use crate::entry::RunEntry;
+use crate::entry::RunOutcome;
 use crate::entry::owner::OperationOrigin;
 use crate::failure::FailureContext;
 use crate::memory::GuestMemory;
@@ -394,19 +395,21 @@ fn finish_entry<T>(result: Result<T>, entry: RunEntry<'_>) -> Result<T> {
         // An actual ioctl error, including EINTR, retains the caller's existing
         // policy when clock and entry cleanup succeeded. Do not poison a whole
         // address space merely because KVM_RUN was interrupted.
-        Err(Error::Kvm(error)) => match entry.finish(Ok(())) {
+        Err(Error::Kvm(error)) => match entry.finish(Ok(()), RunOutcome::Failed) {
             Ok(()) => Err(Error::Kvm(error)),
             Err(failure) => Err(failure.error().with_cleanup(vec![Error::Kvm(error)])),
         },
         // A failed clock interval cannot publish trustworthy guest progress.
         // Stop every participant and callback copy in this Mapping while the
         // issuing owner retains and publishes the typed terminal failure.
-        Err(error) => match entry.finish(Err(error)) {
+        Err(error) => match entry.finish(Err(error), RunOutcome::Failed) {
             Err(failure) => Err(failure.error()),
             Ok(()) => unreachable!("failed clock setup or cleanup admitted success"),
         },
         Ok(exit) => {
-            entry.finish(Ok(())).map_err(|failure| failure.error())?;
+            entry
+                .finish(Ok(()), RunOutcome::Exited)
+                .map_err(|failure| failure.error())?;
             Ok(exit)
         }
     }
