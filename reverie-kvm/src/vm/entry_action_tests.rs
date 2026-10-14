@@ -455,7 +455,7 @@ pub(crate) mod entry_action_tests {
                         process_state: tool.clone(),
                         thread_state: &parent_state,
                         global_state: Some(log.clone()),
-                        config: (),
+                        config: &(),
                         subscriptions: reverie::Subscription::none(),
                         pending_child_starts: starts.clone(),
                     },

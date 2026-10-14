@@ -3552,10 +3552,10 @@ impl KvmBackend {
                         "forked KVM Tool process requires shared global state".to_owned(),
                     )
                 })?;
-                let child_tool = Arc::new(T::new(child_pid, &context.config));
+                let child_tool = Arc::new(T::new(child_pid, context.config));
                 let child_thread_state = child_tool
                     .init_thread_state(child_pid, Some((context.tid, context.thread_state)));
-                let config = context.config;
+                let config = context.config.clone();
                 let subscriptions = context.subscriptions;
                 let pending_child_starts = context.pending_child_starts;
                 let raw_child_pid = child.pid;
@@ -3871,7 +3871,7 @@ impl KvmBackend {
                         "KVM CLONE_THREAD worker requires shared global state".to_owned(),
                     )
                 })?;
-                let config = context.config;
+                let config = context.config.clone();
                 let subscriptions = context.subscriptions;
 
                 self.vcpu.set_regs(&parent_registers)?;
@@ -7855,7 +7855,7 @@ mod tests {
                         tid: Pid::from_raw(1),
                         thread_state: &(),
                         global_state: Some(Arc::new(crate::StraceLog::default())),
-                        config: (),
+                        config: &(),
                         subscriptions: reverie::Subscription::none(),
                         pending_child_starts: starts.clone(),
                     };
@@ -8863,7 +8863,7 @@ mod tests {
                     tid: Pid::from_raw(1),
                     thread_state: &(),
                     global_state: (!missing_global).then(|| Arc::new(crate::StraceLog::default())),
-                    config: (),
+                    config: &(),
                     subscriptions: reverie::Subscription::none(),
                     pending_child_starts: starts.clone(),
                 };
@@ -9269,7 +9269,7 @@ mod tests {
             tid: Pid::from_raw(1),
             thread_state: &(),
             global_state: Some(log.clone()),
-            config: fail_callback,
+            config: &fail_callback,
             subscriptions: reverie::Subscription::none(),
             pending_child_starts: starts.clone(),
         };
@@ -9835,7 +9835,7 @@ mod tests {
                     tid: Pid::from_raw(1),
                     thread_state: &1,
                     global_state: Some(global.clone()),
-                    config: (),
+                    config: &(),
                     subscriptions: reverie::Subscription::none(),
                     pending_child_starts: starts.clone(),
                 };
@@ -10394,7 +10394,7 @@ mod tests {
             tid: Pid::from_raw(1),
             thread_state: &thread_state,
             global_state: Some(global_state),
-            config: (),
+            config: &(),
             subscriptions: reverie::Subscription::none(),
             pending_child_starts: starts.clone(),
         };

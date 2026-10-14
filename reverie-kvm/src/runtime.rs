@@ -305,7 +305,8 @@ pub(crate) struct ToolContext<'a, T: Tool> {
     pub(crate) thread_state: &'a T::ThreadState,
     // TODO-HUMAN-REVIEW(PR-235): Review shared GlobalTool ownership across KVM forks.
     pub(crate) global_state: Option<Arc<T::GlobalState>>,
-    pub(crate) config: <T::GlobalState as GlobalTool>::Config,
+    /// Borrowed: only a fork or clone that starts a worker needs its own copy.
+    pub(crate) config: &'a <T::GlobalState as GlobalTool>::Config,
     pub(crate) subscriptions: Subscription,
     // TODO-HUMAN-REVIEW(PR-235): Review child release on parent handler suspension.
     pub(crate) pending_child_starts: SharedChildStarts,
@@ -1649,7 +1650,7 @@ impl<T: Tool> Guest<T> for KvmGuest<'_, T> {
                 process_state: self.process_state.clone(),
                 thread_state: self.thread_state,
                 global_state: self.shared_global_state.clone(),
-                config: self.config.clone(),
+                config: self.config,
                 subscriptions: self.subscriptions.clone(),
                 pending_child_starts: self.pending_child_starts.clone(),
             };
@@ -2106,6 +2107,57 @@ fn finish_handler_scratch<T>(
             error.with_cleanup(hidden.err().into_iter().collect()),
         )),
         outcome => hidden.map(|()| outcome),
+    }
+}
+
+/// Constant-time membership in a [`Subscription`]'s syscalls. `Subscription`
+/// offers only iteration, and scanning its whole syscall set on every guest
+/// syscall cost about 2.5% of a KVM guest syscall. Built once per loop.
+struct SubscribedSyscalls {
+    bits: [u64; 16],
+    /// Numbers past the bitmap, kept so membership never depends on its size.
+    wide: Vec<reverie::syscalls::Sysno>,
+}
+
+impl SubscribedSyscalls {
+    fn new(subscriptions: &Subscription) -> Self {
+        let mut bits = [0u64; 16];
+        let mut wide = Vec::new();
+        for number in subscriptions.iter_syscalls() {
+            match usize::try_from(number.id()) {
+                Ok(index) if index < bits.len() * 64 => bits[index / 64] |= 1 << (index % 64),
+                _ => wide.push(number),
+            }
+        }
+        Self { bits, wide }
+    }
+
+    fn contains(&self, number: reverie::syscalls::Sysno) -> bool {
+        match usize::try_from(number.id()) {
+            Ok(index) if index < self.bits.len() * 64 => {
+                self.bits[index / 64] & (1 << (index % 64)) != 0
+            }
+            _ => self.wide.contains(&number),
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn subscribed_syscalls_agree_with_the_subscription_for_every_number() {
+    use reverie::syscalls::Sysno;
+    let mut some = Subscription::none();
+    some.syscalls([Sysno::read, Sysno::getppid, Sysno::execve, Sysno::clone3]);
+    for subscription in [Subscription::all(), Subscription::none(), some] {
+        let fast = SubscribedSyscalls::new(&subscription);
+        // `Sysno::iter()` stops before `Sysno::last()`; check that one too.
+        for number in Sysno::iter().chain(std::iter::once(Sysno::last())) {
+            assert_eq!(
+                fast.contains(number),
+                subscription.iter_syscalls().any(|other| other == number),
+                "{number}"
+            );
+        }
     }
 }
 
@@ -4378,6 +4430,7 @@ impl KvmBackend {
         let entry_scope = self.start_entry_driver();
         let tool = Arc::new(T::new(pid, &config));
         let subscriptions = T::subscriptions(&config);
+        let subscribed_syscalls = SubscribedSyscalls::new(&subscriptions);
         let mut thread_state = tool.init_thread_state(pid, None);
         let memory = self.memory.clone();
         let auxv = Vec::new();
@@ -4492,9 +4545,7 @@ impl KvmBackend {
                         let registers = self.vcpu.get_regs()?;
                         let request = SyscallRequest::read_from(&memory, frame_address)?;
                         let syscall = request.into_syscall()?;
-                        let subscribed = subscriptions
-                            .iter_syscalls()
-                            .any(|number| number == syscall.number());
+                        let subscribed = subscribed_syscalls.contains(syscall.number());
                         let result = if subscribed {
                             // Same `ERESTARTSYS` restart protocol as the
                             // process-syscall path below; see
@@ -5474,6 +5525,7 @@ impl KvmBackend {
             // Read once so the per-syscall classifier can borrow it while `self` is
             // borrowed elsewhere in the loop body.
             let thread_ownership = self.thread_ownership;
+            let subscribed_syscalls = SubscribedSyscalls::new(subscriptions);
             loop {
                 self.check_entry_owner()?;
                 #[cfg(test)]
@@ -5908,10 +5960,7 @@ impl KvmBackend {
                 let backend_owned = is_backend_owned_syscall(request.number(), thread_ownership)
                     && !executor.is_random_device_read(&request)
                     && !executor.is_tool_visible_read(&request);
-                let subscribed = !backend_owned
-                    && subscriptions
-                        .iter_syscalls()
-                        .any(|number| number == syscall.number());
+                let subscribed = !backend_owned && subscribed_syscalls.contains(syscall.number());
                 let (
                     mut result,
                     handler_replaced_image,
@@ -6213,7 +6262,7 @@ impl KvmBackend {
                         process_state: tool.clone(),
                         thread_state: &thread_state,
                         global_state: Some(global_state.clone()),
-                        config: config.clone(),
+                        config,
                         subscriptions: subscriptions.clone(),
                         pending_child_starts: pending_child_starts.clone(),
                     };
