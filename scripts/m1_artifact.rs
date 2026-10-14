@@ -16130,8 +16130,13 @@ fn qualify_allocator_tls_boundary_in_source_context(
         == FixedImageKind::Detcore
     {
         require(
-            allocation_bytes.len() == 241 && matches!(cell.address, 0x98 | 0xa0 | 0xd8 | 0xe0),
-            "Detcore validate allocation/TLS shape differs",
+            allocation_bytes.len() == 241
+                && matches!(cell.address, 0x98 | 0xa0 | 0xd8 | 0xe0 | 0x128),
+            format!(
+                "Detcore validate allocation/TLS shape differs: allocation length {}, cell offset {:#x}",
+                allocation_bytes.len(),
+                cell.address
+            ),
         )?;
         let module = fixed_rip_target(allocation, allocation_bytes, 54, 58)?;
         let plt = fixed_rip_target(allocation, allocation_bytes, 59, 63)?;
@@ -16931,7 +16936,7 @@ fn validate_fixed_backing_evidence_in_source_context(
                     matches!(tls.tls_cell.address, 0x40 | 0x48 | 0x80 | 0x88)
                 }
                 FixedImageKind::Detcore => {
-                    matches!(tls.tls_cell.address, 0x98 | 0xa0 | 0xd8 | 0xe0)
+                    matches!(tls.tls_cell.address, 0x98 | 0xa0 | 0xd8 | 0xe0 | 0x128)
                 }
             }
             && tls.tls_cell.size == 8
@@ -17002,7 +17007,7 @@ fn validate_fixed_backing_evidence_in_source_context(
         (None, None, None) => {
             let extent = match (image_kind, tls.tls_cell.address) {
                 (FixedImageKind::Standalone, 0x40 | 0x80) => Some(186),
-                (FixedImageKind::Detcore, 0x98 | 0xd8) => Some(241),
+                (FixedImageKind::Detcore, 0x98 | 0xd8 | 0x128) => Some(241),
                 _ => None,
             };
             if let Some(extent) = extent {
@@ -20241,6 +20246,96 @@ const DETCORE_VALIDATE_TEMPLATES: &[DetcoreValidateTemplate] = &[
     DetcoreValidateTemplate {
         role: "fixed_tls_fn_once",
         hex: "50488d3de0951800e823191300488d80d800000059c3",
+        operands: &[
+            DetcoreValidateOperand {
+                displacement: 4,
+                next: 8,
+                key: "fixed_publication_tls_descriptor",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 9,
+                next: 13,
+                key: "fixed_tls_get_addr_plt",
+                got: false,
+            },
+        ],
+        transfers: &[(8, 1)],
+    },
+    // Actual Hermit main 2cd56771 0x128 TLS cohort at 0x7c3550.
+    // Whole 241 bytes, SHA256 ab3dfbbc1ef307c33a2e7cab465a25a5e041f0d92afe6c05163ea787a11a086b.
+    DetcoreValidateTemplate {
+        role: "fixed_patch_alloc",
+        hex: "41574156415453504889d34989f6ff154c2d1a004885c0747c4989c44c8b782041f6c7070f85a50000004d85ff0f84b1000000488d3d46ea1900e8111214004883b82801000000745d498b542410498b07498d76ff49f7de31c94889c74801d772354801f772304c21f74989f84929d072504901d8410f92c14981f801000002410f93c24508ca750ef04d0fb10775ca4889f9eb0231c94889c84883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff25ce2c1a00488d3d0f071700ff1589ef1900488d1532071700bf080000004c89feff1584071a00488d3d1d071700ff150f161a00",
+        operands: &[
+            DetcoreValidateOperand {
+                displacement: 16,
+                next: 20,
+                key: "fixed_arena_backing",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 54,
+                next: 58,
+                key: "fixed_publication_tls_descriptor",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 59,
+                next: 63,
+                key: "fixed_tls_get_addr_plt",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 190,
+                next: 194,
+                key: "fixed_tool_alloc",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 197,
+                next: 201,
+                key: "fixed_detcore_validate_fixed_patch_alloc_194_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 203,
+                next: 207,
+                key: "fixed_heap_panic_sub_overflow",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 210,
+                next: 214,
+                key: "fixed_detcore_validate_fixed_patch_alloc_207_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 224,
+                next: 228,
+                key: "fixed_heap_panic_misaligned",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 231,
+                next: 235,
+                key: "fixed_detcore_validate_fixed_patch_alloc_228_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 237,
+                next: 241,
+                key: "fixed_panic_null_reference",
+                got: true,
+            },
+        ],
+        transfers: &[(14, 0), (58, 2), (188, 3), (201, 5), (222, 7), (235, 9)],
+    },
+    // Actual Hermit main 2cd56771 0x128 TLS cohort at 0x7c38e0.
+    // Whole 22 bytes, SHA256 371427cc22cd9daf3549e1ab38b7e3038419a688694792744860f58cd7e7564a.
+    DetcoreValidateTemplate {
+        role: "fixed_tls_fn_once",
+        hex: "50488d3de8e61900e8b30e1400488d802801000059c3",
         operands: &[
             DetcoreValidateOperand {
                 displacement: 4,
@@ -34397,6 +34492,31 @@ mod tests {
                 8581136,
                 &[(7328650, 8581136), (7329512, 8581136)],
             ),
+            // Actual Hermit main 2cd56771 Detcore validate DSO; same eight-byte local cell after Tokio TLS.
+            (
+                FixedImageKind::Detcore,
+                0x128,
+                &[
+                    (
+                        "fixed_patch_alloc",
+                        "_RNvXs3_NtCs22Vri3UnsgW_16reverie_liteinst11patch_allocNtB5_26FixedPrivatePatchAllocatorNtNtNtCslgNvMROPpVL_4core5alloc6global11GlobalAlloc5alloc",
+                        0x7c3550,
+                        241,
+                        "ab3dfbbc1ef307c33a2e7cab465a25a5e041f0d92afe6c05163ea787a11a086b",
+                    ),
+                    (
+                        "fixed_tls_fn_once",
+                        "_RNvYNCNKNvNtCs22Vri3UnsgW_16reverie_liteinst11patch_alloc18INSTALLATION_DEPTH0s_0INtNtNtCslgNvMROPpVL_4core3ops8function6FnOnceTINtNtB1o_6option6OptionQIB23_INtNtB1o_4cell4CelljEEEEE9call_onceBa_.llvm.1145063538693114464",
+                        0x7c38e0,
+                        22,
+                        "371427cc22cd9daf3549e1ab38b7e3038419a688694792744860f58cd7e7564a",
+                    ),
+                ],
+                None,
+                0x961fd0,
+                0x9047a0,
+                &[(0x7c358a, 0x9047a0), (0x7c38e8, 0x9047a0)],
+            ),
         ];
         for &(kind, offset, chain, key, module, plt, calls) in profiles {
             let mut sample = backing.clone();
@@ -34451,6 +34571,20 @@ mod tests {
                 validate_fixed_backing_evidence_in_source_context(b, kind)
             };
             check(&sample).unwrap();
+            if kind == FixedImageKind::Detcore && offset == 0x128 {
+                let mut extra = sample.clone();
+                let getter = extra.tls_boundary.local_chain["fixed_tls_fn_once"].clone();
+                let hash = extra.tls_boundary.function_sha256["fixed_tls_fn_once"].clone();
+                extra
+                    .tls_boundary
+                    .local_chain
+                    .insert("fixed_tls_cell_getter".into(), getter);
+                extra
+                    .tls_boundary
+                    .function_sha256
+                    .insert("fixed_tls_cell_getter".into(), hash);
+                assert!(check(&extra).is_err(), "profile0x128 extra TLS chain role");
+            }
             for mutation in 0..10 {
                 let mut bad = sample.clone();
                 let tls = &mut bad.tls_boundary;
@@ -41270,6 +41404,10 @@ mod tests {
         context.insert("rv:reverie-liteinst/src/patch_alloc.rs".to_owned(),fixed_hex("2f6275696c642f2e636172676f2f6769742f636865636b6f7574732f726576657269652d326663373730663761396338303830332f666334623438642f726576657269652d6c697465696e73742f7372632f70617463685f616c6c6f632e7273"));
         let mapping_context = detcore_validate_control_context("b0dc3d1");
         let event_context = detcore_validate_control_context("6cbe1b7");
+        // Unit-only synthetic filename context; actual producer qualification
+        // independently joins its measured Cargo source filenames.
+        // Existing normal/mapping/event fixture contexts stay unchanged.
+        let runtime_tls_context = detcore_validate_control_context("d60812b");
         type DetcoreTemplateCase<'a> = (usize, u64, &'a [(&'a str, u64)], &'a [(u64, u64)], u64);
         let cases: &[DetcoreTemplateCase<'_>] = &[
             (
@@ -41986,9 +42124,54 @@ mod tests {
                 &[],
                 216,
             ),
+            (
+                40,
+                0x7c3550,
+                &[
+                    ("fixed_arena_backing", 0x7f7d60),
+                    ("fixed_publication_tls_descriptor", 0x961fd0),
+                    ("fixed_tls_get_addr_plt", 0x9047a0),
+                    ("fixed_tool_alloc", 0x7f7f70),
+                    (
+                        "fixed_detcore_validate_fixed_patch_alloc_194_data",
+                        0x933d28,
+                    ),
+                    ("fixed_heap_panic_sub_overflow", 0x8f9f20),
+                    (
+                        "fixed_detcore_validate_fixed_patch_alloc_207_data",
+                        0x933d58,
+                    ),
+                    ("fixed_heap_panic_misaligned", 0x8f9267),
+                    (
+                        "fixed_detcore_validate_fixed_patch_alloc_228_data",
+                        0x933d58,
+                    ),
+                    ("fixed_panic_null_reference", 0x8f924e),
+                ],
+                &[
+                    (0x9662b0, 0x7f7d60),
+                    (0x9662e0, 0x7f7f70),
+                    (0x9625a8, 0x8f9f20),
+                    (0x963db8, 0x8f9267),
+                    (0x964c50, 0x8f924e),
+                ],
+                0x128,
+            ),
+            (
+                41,
+                0x7c38e0,
+                &[
+                    ("fixed_publication_tls_descriptor", 0x961fd0),
+                    ("fixed_tls_get_addr_plt", 0x9047a0),
+                ],
+                &[],
+                0x128,
+            ),
         ];
         for &(index, address, input_targets, input_got, tls) in cases {
-            let context = if index >= 36 {
+            let context = if index >= 40 {
+                runtime_tls_context.clone()
+            } else if index >= 36 {
                 event_context.clone()
             } else if index >= 31 {
                 mapping_context.clone()
@@ -42173,6 +42356,15 @@ mod tests {
             }
             if t.role == "fixed_patch_alloc" || t.role == "fixed_tls_fn_once" {
                 assert!(check(&bytes, &targets, &got, &readonly, &context, tls ^ 0x40).is_err());
+                for wrong_tls in [0x98, 0xa0, 0xd8, 0xe0, 0x128] {
+                    if wrong_tls != tls {
+                        assert!(
+                            check(&bytes, &targets, &got, &readonly, &context, wrong_tls).is_err(),
+                            "{} admits foreign Detcore TLS cell {wrong_tls:#x}",
+                            t.role
+                        );
+                    }
+                }
             }
             for spec in specs {
                 let address = targets[spec.key];
