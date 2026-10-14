@@ -78,9 +78,14 @@ impl InotifyCookieTable {
 }
 
 fn host_fd_is_inotify(host_fd: RawFd) -> Result<bool, i64> {
+    host_fd_mode_is_inotify(host_fd, fd_mode(host_fd)?)
+}
+
+/// [`host_fd_is_inotify`] with the descriptor's mode already in hand.
+fn host_fd_mode_is_inotify(host_fd: RawFd, mode: libc::mode_t) -> Result<bool, i64> {
     // Anonymous-inode descriptors have no file type bits. Only those need the
     // name check, so ordinary files pay one fstat.
-    if fd_mode(host_fd)? & libc::S_IFMT != 0 {
+    if mode & libc::S_IFMT != 0 {
         return Ok(false);
     }
     let target = canonical_fd_path(host_fd)?;

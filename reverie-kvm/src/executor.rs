@@ -9118,10 +9118,17 @@ fn read(
     if let Err(error) = ensure_read_capable(file) {
         return Ok(error);
     }
-    if let Err(error) = ensure_readable(file) {
-        return Ok(error);
-    }
     let host_fd = file.as_raw_fd();
+    // ensure_readable without its second access-mode query, which
+    // ensure_read_capable just made. The mode also serves the inotify probe
+    // below, so this read makes one fstat where it made two.
+    let mode = match fd_mode(host_fd) {
+        Ok(mode) => mode,
+        Err(error) => return Ok(error),
+    };
+    if mode & libc::S_IFMT == libc::S_IFDIR {
+        return Ok(negative_errno(libc::EISDIR));
+    }
     if let Some(result) = signalfd_read(memory, state, fd, args[1], requested_length) {
         return Ok(result);
     }
@@ -9131,7 +9138,7 @@ fn read(
     if requested_length == 0 {
         return Ok(0);
     }
-    match host_fd_is_inotify(host_fd) {
+    match host_fd_mode_is_inotify(host_fd, mode) {
         // Linux's readv calls inotify's read once with the same buffer and
         // count, so the staged readv path applies scalar read semantics.
         Ok(true) => {
@@ -49637,6 +49644,7 @@ mod tests {
     ];
 
     include!("executor/read_zero_refusal_tests.rs");
+    include!("executor/descriptor_check_order_tests.rs");
 
     fn read_zero_memory() -> GuestMemory {
         let mut memory = GuestMemory::new(0, 2 * PAGE_SIZE as usize).unwrap();
