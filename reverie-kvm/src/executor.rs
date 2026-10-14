@@ -5011,6 +5011,11 @@ impl ElfExecutor {
         self.exit_status.is_some()
     }
 
+    /// The status of a pending exit that ends the whole thread group.
+    pub(crate) fn pending_group_exit_status(&self) -> Option<ExitStatus> {
+        self.exit_status.filter(|_| self.exit_group)
+    }
+
     pub(crate) fn is_thread_group_leader(&self) -> bool {
         self.state.tid == self.state.pid
     }

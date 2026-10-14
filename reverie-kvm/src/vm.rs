@@ -4876,6 +4876,15 @@ impl KvmBackend {
         };
         #[cfg(test)]
         clear_tid_diagnostic::woke(operand.address(), _wake_result, wake_errno);
+        // A test can widen the window in which a woken joiner runs before
+        // this dying task finishes exiting.
+        #[cfg(test)]
+        {
+            let delay = DELAY_AFTER_CLEAR_TID_WAKE_MS.load(Ordering::Relaxed);
+            if delay != 0 {
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+            }
+        }
     }
 
     pub(crate) fn restore_rt_sigreturn(
@@ -5165,6 +5174,7 @@ impl KvmBackend {
                             }
                         }
                         if executor.has_pending_exit() {
+                            self.publish_pending_group_exit(executor);
                             self.discard_process_clear_tid_at_signal_return(executor);
                             self.clear_registered_worker_tid_before_exit(executor);
                         }
@@ -5215,6 +5225,7 @@ impl KvmBackend {
                     executor.prepare_captured_trap(fault.event.signal());
                     self.deliver_user_trap(executor, &fault, fault.pending())?;
                     if executor.has_pending_exit() {
+                        self.publish_pending_group_exit(executor);
                         self.discard_process_clear_tid_at_signal_return(executor);
                         self.clear_registered_worker_tid_before_exit(executor);
                     }
@@ -5297,12 +5308,14 @@ impl KvmBackend {
     ) -> Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
         executor.retire_current_thread(exit.status, exit.group);
         executor.check_parent_death_failure()?;
-        self.clear_registered_worker_tid_before_exit(executor);
-        executor.finish_terminal_cleanup().await?;
-        self.release_stdin_on_exit();
+        // Publish a group exit before the clear_child_tid wake below; see
+        // publish_pending_group_exit.
         if exit.group {
             self.request_guest_thread_group_exit(exit.status);
         }
+        self.clear_registered_worker_tid_before_exit(executor);
+        executor.finish_terminal_cleanup().await?;
+        self.release_stdin_on_exit();
         // Best-effort writes and Errno adapters can conceal a captured cause.
         // An inline child must hand that cause back to its enclosing callback
         // before cancellation or a physical join can depend on destruction.
@@ -5459,6 +5472,17 @@ impl KvmBackend {
 
     pub(crate) fn request_guest_thread_group_exit(&self, status: ExitStatus) {
         self.thread_group.request_exit_group(status);
+    }
+
+    /// Linux makes a fatal signal's group exit visible to every sibling
+    /// (SIGNAL_GROUP_EXIT, then zap_other_threads) before the dying task's
+    /// mm_release stores and wakes its clear_child_tid word. A joiner woken
+    /// by that wake must therefore find the group exit at its next syscall
+    /// boundary instead of running one more syscall. Publish it first.
+    fn publish_pending_group_exit(&self, executor: &ElfExecutor) {
+        if let Some(status) = executor.pending_group_exit_status() {
+            self.request_guest_thread_group_exit(status);
+        }
     }
 
     // TODO-HUMAN-REVIEW(PR-172): Review signal-driven KVM worker cancellation.
@@ -5954,6 +5978,13 @@ pub(crate) fn clear_tid_and_wake(memory: &mut GuestMemory, address: Option<u64>)
     };
     #[cfg(test)]
     clear_tid_diagnostic::woke(operand.address(), _wake_result, wake_errno);
+    #[cfg(test)]
+    {
+        let delay = DELAY_AFTER_CLEAR_TID_WAKE_MS.load(Ordering::Relaxed);
+        if delay != 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay));
+        }
+    }
 }
 
 fn supported_hypercall_instruction(cpuid: &CpuId) -> Result<[u8; 3]> {
@@ -12105,3 +12136,12 @@ mod entry_owner_tests;
 #[cfg(test)]
 #[path = "vm/exec_wait_tests.rs"]
 mod exec_wait_tests;
+
+/// Milliseconds a dying task sleeps after its clear_child_tid wake (tests).
+#[cfg(test)]
+static DELAY_AFTER_CLEAR_TID_WAKE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+#[path = "vm/group_exit_order_tests.rs"]
+mod group_exit_order_tests;
