@@ -30,6 +30,8 @@
 //! the [`fmt::Display`] output, so the rendered snapshot is reproducible.
 
 use std::fmt;
+use std::io;
+use std::path::Path;
 
 use reverie::BackendStatsSnapshot;
 use reverie::BackendStatsSource;
@@ -404,6 +406,86 @@ impl DbtTranslationStats {
     /// copied runtime after vfork).
     pub const fn process_images_without_stats(&self) -> u64 {
         self.process_images_without_stats
+    }
+}
+
+/// The exact statistics artifact observed after a physical DBT run.
+///
+/// This is completion data, not a verdict: a caller may need to process the
+/// guest status, clean up its GlobalTool, or reject incomplete execution
+/// evidence before interpreting statistics. Missing, unreadable, present-empty
+/// and malformed records remain distinct. Raw records retain their byte order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DbtStatsCapture {
+    /// No instrumented image created the statistics file.
+    Missing,
+    /// The file could not be read. This does not replace the physical result.
+    Unreadable {
+        /// The original filesystem error's display text.
+        message: String,
+        /// The original OS error number, when available.
+        raw_os_error: Option<i32>,
+    },
+    /// Exact file contents, including an empty or malformed stream.
+    Records(Vec<u8>),
+}
+
+impl DbtStatsCapture {
+    /// Read a completed artifact, including a caller-retained saved run.
+    ///
+    /// The physical launcher calls this only after reaping the followed tree.
+    /// No missing file is manufactured into a present, measured zero record.
+    pub fn read(path: &Path) -> Self {
+        match std::fs::read(path) {
+            Ok(bytes) => Self::Records(bytes),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Self::Missing,
+            Err(error) => Self::Unreadable {
+                message: error.to_string(),
+                raw_os_error: error.raw_os_error(),
+            },
+        }
+    }
+
+    /// Borrow the exact captured bytes without decoding or copying them.
+    pub fn records(&self) -> io::Result<&[u8]> {
+        match self {
+            Self::Records(bytes) => Ok(bytes),
+            Self::Missing => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "DBT statistics were missing",
+            )),
+            Self::Unreadable {
+                message,
+                raw_os_error,
+            } => Err(match raw_os_error {
+                Some(code) => io::Error::from_raw_os_error(*code),
+                None => io::Error::other(message.clone()),
+            }),
+        }
+    }
+
+    /// Decode the captured records using the shared wire-format owner.
+    ///
+    /// Present-empty records yield an empty snapshot; callers that require
+    /// execution evidence must reject that explicitly. Missing and malformed
+    /// records are errors, and the original bytes remain available afterward.
+    pub fn snapshot(&self) -> io::Result<DbtBackendStatsSnapshot> {
+        let mut aggregator = DbtBackendStatsAggregator::new();
+        aggregator
+            .absorb_wire_stream(self.records()?)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        Ok(aggregator.snapshot())
+    }
+
+    // Preserve the original optional instrumentation API's missing-file policy.
+    // Strict consumers use the presence-aware capture instead of this projection.
+    pub(crate) fn legacy_source(self) -> io::Result<DbtBackendStatsSource> {
+        let snapshot = if matches!(self, Self::Missing) {
+            DbtBackendStatsAggregator::new().snapshot()
+        } else {
+            self.snapshot()?
+        };
+        Ok(DbtBackendStatsSource::from_snapshot(snapshot))
     }
 }
 

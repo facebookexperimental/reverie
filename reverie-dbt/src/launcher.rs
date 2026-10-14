@@ -36,8 +36,8 @@ use reverie::BackendStatsRequest;
 use reverie::GlobalTool;
 use reverie_rpc_transport::RpcServer;
 
-use crate::backend_stats::DbtBackendStatsAggregator;
 use crate::backend_stats::DbtBackendStatsSource;
+use crate::backend_stats::DbtStatsCapture;
 use crate::evidence::DbtEvidenceLogLevel;
 use crate::evidence::EvidenceSession;
 
@@ -665,10 +665,8 @@ impl DbtRunner {
         // process environment after fork.
         let mut runner = self.clone().client_argument("-external-global");
         let stats_sink = if stats.is_enabled() {
-            let sink = StatsSink::new()?;
-            for argument in sink.client_arguments() {
-                runner = runner.client_argument(argument);
-            }
+            let sink = DbtStatsSink::new()?;
+            runner = sink.configure(runner);
             Some(sink)
         } else {
             None
@@ -1163,25 +1161,53 @@ fn combine_status_and_evidence(
 /// file (see `native/client.c`). A shared path with append-mode opens (O_APPEND)
 /// keeps concurrent appends atomic and side-steps the drrun -> guest exec fd
 /// inheritance problem the diagnostic fd works around. After the whole tree is
-/// reaped, [`StatsSink::drain`] decodes and commutatively aggregates every
-/// record into one snapshot.
-struct StatsSink {
+/// reaped, [`Self::capture`] retains the exact artifact; [`DbtStatsCapture::snapshot`]
+/// decodes and commutatively aggregates its records.
+pub struct DbtStatsSink {
     // Owns the temporary directory; dropping it removes the backing file. Held
     // until after `drain` reads the records.
     _directory: tempfile::TempDir,
     path: PathBuf,
 }
 
-impl StatsSink {
-    fn new() -> io::Result<Self> {
-        let directory = tempfile::Builder::new()
-            .prefix("reverie-dbt-stats-")
-            .tempdir()?;
+impl DbtStatsSink {
+    /// Allocate using this launcher's existing prefix and the caller's TMPDIR.
+    pub fn new() -> io::Result<Self> {
+        Self::with_prefix("reverie-dbt-stats-")
+    }
+
+    /// Allocate with a caller's existing visible name prefix and TMPDIR.
+    ///
+    /// A caller entering a private filesystem can declare a bind of
+    /// [`Self::directory`] before launch, keeping this owner until completion.
+    pub fn with_prefix(prefix: &str) -> io::Result<Self> {
+        let directory = tempfile::Builder::new().prefix(prefix).tempdir()?;
         let path = directory.path().join("records.bin");
         Ok(Self {
             _directory: directory,
             path,
         })
+    }
+
+    /// Borrow the backing directory for an existing container mount declaration.
+    pub fn directory(&self) -> &Path {
+        self._directory.path()
+    }
+
+    /// Configure the native client to append its records to this owned sink.
+    pub fn configure(&self, mut runner: DbtRunner) -> DbtRunner {
+        for argument in self.client_arguments() {
+            runner = runner.client_argument(argument);
+        }
+        runner
+    }
+
+    /// Read exact records after the caller has reaped the followed process tree.
+    ///
+    /// This consumes and removes the sink. Read failures remain completion data
+    /// so the caller can preserve its guest-result and evidence-error precedence.
+    pub fn capture(self) -> DbtStatsCapture {
+        DbtStatsCapture::read(&self.path)
     }
 
     /// The `-stats_path <path>` client arguments passed to the native client.
@@ -1197,18 +1223,9 @@ impl StatsSink {
     /// A missing file means no instrumented image reported (for example the
     /// guest died before `event_exit`); that yields an empty snapshot rather
     /// than an error. A present but malformed or truncated stream is a hard
-    /// error, matching [`DbtBackendStatsAggregator::absorb_wire_stream`].
+    /// error, matching [`crate::backend_stats::DbtBackendStatsAggregator::absorb_wire_stream`].
     fn drain(self) -> io::Result<DbtBackendStatsSource> {
-        let bytes = match std::fs::read(&self.path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
-            Err(error) => return Err(error),
-        };
-        let mut aggregator = DbtBackendStatsAggregator::new();
-        aggregator
-            .absorb_wire_stream(&bytes)
-            .map_err(|error| io::Error::other(error.to_string()))?;
-        Ok(aggregator.into_source())
+        self.capture().legacy_source()
     }
 }
 
@@ -1634,6 +1651,7 @@ fn duplicate_to_diagnostic_fd(source: libc::c_int) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     mod inherited_input;
+    mod stats_capture;
     use std::io::Seek as _;
     use std::os::unix::process::ExitStatusExt as _;
 
@@ -2539,7 +2557,7 @@ mod tests {
         for (test_failure, expected_code, expected_failures) in
             [(false, Some(0), 0), (true, Some(101), 1)]
         {
-            let sink = StatsSink::new().unwrap();
+            let sink = DbtStatsSink::new().unwrap();
             let [flag, path] = sink.client_arguments();
             let mut runner = DbtRunner::from_env()
                 .expect("DYNAMORIO_HOME and REVERIE_DBT_CLIENT must select the live native client")
@@ -2667,7 +2685,7 @@ mod tests {
 
     #[test]
     fn stats_sink_passes_the_records_path_to_the_client() {
-        let sink = StatsSink::new().unwrap();
+        let sink = DbtStatsSink::new().unwrap();
         let arguments = sink.client_arguments();
         assert_eq!(arguments[0], OsStr::new("-stats_path"));
         assert_eq!(arguments[1], sink.path.clone().into_os_string());
@@ -2676,7 +2694,7 @@ mod tests {
 
     #[test]
     fn stats_sink_drain_of_missing_file_yields_an_empty_snapshot() {
-        let sink = StatsSink::new().unwrap();
+        let sink = DbtStatsSink::new().unwrap();
         // No image ever wrote the file (e.g. the guest died before event_exit).
         assert!(!sink.path.exists());
         let source = sink.drain().unwrap();
@@ -2691,7 +2709,7 @@ mod tests {
         use crate::backend_stats::DbtProcessRecord;
         use crate::backend_stats::DbtRuntimeKind;
 
-        let sink = StatsSink::new().unwrap();
+        let sink = DbtStatsSink::new().unwrap();
 
         // One image with DynamoRIO translation stats present.
         append_record(
@@ -2755,7 +2773,7 @@ mod tests {
     fn stats_sink_drain_of_a_truncated_stream_is_an_error() {
         use std::io::Write as _;
 
-        let sink = StatsSink::new().unwrap();
+        let sink = DbtStatsSink::new().unwrap();
         let encoded =
             crate::backend_stats::encode_process_record(&crate::backend_stats::DbtProcessRecord {
                 branches: 42,
