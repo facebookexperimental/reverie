@@ -144,7 +144,8 @@ mod entry_race_tests {
             // This was a final-activation refusal, not the earlier try_enter
             // refusal counted by closed_admissions.
             assert_eq!(count(&probe.prepare.closed_admissions), 0);
-            assert_eq!(mask_bits(), before);
+            // Signal 64 stays blocked after the first entry setup.
+            assert_eq!(mask_bits(), before | (1_u64 << 63));
             let closing = pending.lock().unwrap().take().unwrap();
             let closed = closing
                 .now_or_never()
@@ -169,7 +170,8 @@ mod entry_race_tests {
             assert!(backend.vcpu.run().unwrap().is_none());
             assert_no_entry(&probe);
             assert_eq!(count(&probe.prepare.closed_admissions), 1);
-            assert_eq!(mask_bits(), before);
+            // Signal 64 stays blocked after the first entry setup.
+            assert_eq!(mask_bits(), before | (1_u64 << 63));
             drop(closed);
             backend.memory.read_raw(0x2000, &mut value).unwrap();
             assert_eq!(value, [0]);
@@ -179,11 +181,13 @@ mod entry_race_tests {
             assert_eq!(count(&hook_calls), 1);
             assert_eq!(count(&probe.shared_fd_accesses), 0);
             assert_eq!(count(&probe.prepare.mask_installs), 1);
+            assert_eq!(count(&probe.prepare.mask_ioctls), 1);
             assert_eq!(count(&probe.untracked_runs), usize::from(!tracked));
             assert_eq!(count(&probe.tracked_runs), usize::from(tracked));
             assert_eq!(count(&probe.clock_begins), usize::from(tracked));
             assert_eq!(count(&probe.intervals_created), usize::from(tracked));
-            assert_eq!(mask_bits(), before);
+            // Signal 64 stays blocked after the first entry setup.
+            assert_eq!(mask_bits(), before | (1_u64 << 63));
             drop(backend);
             drop(restore);
             assert_eq!(mask_bits(), original_mask);

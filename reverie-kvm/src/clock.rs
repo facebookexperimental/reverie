@@ -146,6 +146,8 @@ pub(crate) struct CountedVcpu {
     /// `set_msrs`, ...). `run` takes `&mut self`, so no raw borrow taken before
     /// an exit can still be alive after it.
     synced_exit: std::sync::atomic::AtomicBool,
+    /// The KVM_RUN signal mask installed on `fd`.
+    installed_mask: crate::entry::InstalledMask,
     participant: Participant,
     // Keep the Mapping alive independently of the backend field's drop order.
     memory: GuestMemory,
@@ -184,6 +186,7 @@ impl CountedVcpu {
             fd,
             sync_regs,
             synced_exit: std::sync::atomic::AtomicBool::new(false),
+            installed_mask: Default::default(),
             participant,
             memory,
             clock: GuestClock::default(),
@@ -324,10 +327,10 @@ impl CountedVcpu {
         self.synced_exit
             .store(false, std::sync::atomic::Ordering::Relaxed);
         // Declare entry first: unwinding must retire the clock and restore CPU
-        // affinity before entry withdraws its target and restores the mask.
+        // affinity before entry withdraws its target and drains the mask.
         let Some(entry) = self
             .participant
-            .prepare(&self.fd)
+            .prepare(&self.fd, &mut self.installed_mask)
             .map_err(|failure| failure.error())?
         else {
             return Ok(None);

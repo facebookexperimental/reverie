@@ -407,7 +407,7 @@ fn race_case(kind: Race, blocked: bool, tracked: bool) {
         .prepare
         .on_cleanup(CleanupPhase::BeforeAcknowledge, move |id| {
             assert_member(&ack_gate, id, Activity::Retiring);
-            assert_eq!(mask_bits(), original);
+            assert_eq!(mask_bits(), original | (1_u64 << 63));
             assert!(
                 !pending_reserved(),
                 "mandatory final drain left a queued signal"
@@ -427,7 +427,7 @@ fn race_case(kind: Race, blocked: bool, tracked: bool) {
                 .store(ack_pending.wake.0.load(Ordering::SeqCst), Ordering::SeqCst);
         });
     assert!(matches!(backend.vcpu.run().unwrap(), Some(VcpuExit::Hlt)));
-    assert_eq!(mask_bits(), original);
+    assert_eq!(mask_bits(), original | (1_u64 << 63));
     assert_eq!(signal::HANDLER_ENTRIES.load(Ordering::Relaxed), 0);
     let expected_id = phases.lock().unwrap()[0].1;
     assert_eq!(
@@ -476,7 +476,7 @@ fn race_case(kind: Race, blocked: bool, tracked: bool) {
     rewind(&mut backend);
     assert!(matches!(backend.vcpu.run().unwrap(), Some(VcpuExit::Hlt)));
     assert_eq!(sentinel(&backend), 2);
-    assert_eq!(mask_bits(), original);
+    assert_eq!(mask_bits(), original | (1_u64 << 63));
     assert!(!pending_reserved());
     assert_runs(&probe, tracked, 2, 2);
     assert_member(
@@ -501,13 +501,13 @@ fn race_case(kind: Race, blocked: bool, tracked: bool) {
         if tracked {
             assert_eq!(backend.vcpu.read_clock().unwrap(), 0);
         }
-        assert_eq!(mask_bits(), other_mask);
+        assert_eq!(mask_bits(), other_mask | (1_u64 << 63));
         assert!(!pending_reserved());
         drop(restore);
         backend
     });
     let backend = other.join().unwrap();
-    assert_eq!(mask_bits(), original);
+    assert_eq!(mask_bits(), original | (1_u64 << 63));
     assert_runs(&probe, tracked, 3, 3);
     assert_member(
         &gate,
@@ -542,7 +542,7 @@ fn count_identity(error: &Error, target: &Arc<Error>) -> usize {
     }
 }
 
-fn error_case(blocked: bool, tracked: bool, selected: [bool; 3]) {
+fn error_case(blocked: bool, tracked: bool, selected: [bool; 2]) {
     let restore = RestoreMask::install(blocked);
     let original = mask_bits();
     let (mut backend, gate, probe) = make_backend(tracked);
@@ -554,10 +554,6 @@ fn error_case(blocked: bool, tracked: bool, selected: [bool; 3]) {
         Arc::new(failure(
             "drain reserved host signal",
             std::io::Error::from_raw_os_error(libc::EIO),
-        )),
-        Arc::new(failure(
-            "restore host signal mask",
-            std::io::Error::from_raw_os_error(libc::EPERM),
         )),
     ];
     let configured = std::array::from_fn(|index| selected[index].then(|| errors[index].clone()));
@@ -572,7 +568,7 @@ fn error_case(blocked: bool, tracked: bool, selected: [bool; 3]) {
             // The fault-control producer queues real signals while masked. The
             // sender/withdrawal authorization is covered by the separate race
             // controls; this case isolates safe drain despite a reported error.
-            if selected[1] || selected[2] {
+            if selected[1] {
                 let sends = AtomicUsize::new(0);
                 send_three(unsafe { libc::pthread_self() }, &sends).unwrap();
                 assert_eq!(sends.load(Ordering::SeqCst), 3);
@@ -602,8 +598,8 @@ fn error_case(blocked: bool, tracked: bool, selected: [bool; 3]) {
             assert_member(&ack_gate, id, Activity::Retiring);
             assert_eq!(
                 mask_bits(),
-                original,
-                "fault seam must retain actual safe restoration"
+                original | (1_u64 << 63),
+                "fault seam must keep only signal 64 blocked"
             );
             assert!(
                 !pending_reserved(),
@@ -647,7 +643,7 @@ fn error_case(blocked: bool, tracked: bool, selected: [bool; 3]) {
     assert_member(&gate, id, Activity::Stopped);
     let pending = gate.pending_failure().unwrap();
     let retained = pending.error();
-    for index in 0..3 {
+    for index in 0..2 {
         assert_eq!(
             count_identity(&error, &errors[index]),
             usize::from(selected[index]),
@@ -665,11 +661,11 @@ fn error_case(blocked: bool, tracked: bool, selected: [bool; 3]) {
     }
     let primary = selected.iter().position(|enabled| *enabled).unwrap();
     assert!(error.retains_primary(&errors[primary]));
-    let expected_errno = [libc::EACCES, libc::EIO, libc::EPERM][primary];
+    let expected_errno = [libc::EACCES, libc::EIO][primary];
     assert!(
         matches!(error.primary(), Error::EntryControl { source, .. } if source.raw_os_error() == Some(expected_errno))
     );
-    assert_eq!(mask_bits(), original);
+    assert_eq!(mask_bits(), original | (1_u64 << 63));
     assert!(!pending_reserved());
     assert_runs(&probe, tracked, usize::from(!selected[0]), 1);
     // The failed gate cannot be reopened by an apparent successful retirement.
@@ -692,7 +688,7 @@ fn error_case(blocked: bool, tracked: bool, selected: [bool; 3]) {
     assert!(matches!(fresh.vcpu.run().unwrap(), Some(VcpuExit::Hlt)));
     assert_eq!(sentinel(&fresh), 1);
     assert_runs(&fresh_probe, tracked, 1, 1);
-    assert_eq!(mask_bits(), original);
+    assert_eq!(mask_bits(), original | (1_u64 << 63));
     assert!(!pending_reserved());
     assert_eq!(signal::HANDLER_ENTRIES.load(Ordering::Relaxed), 0);
     drop(fresh);
@@ -742,13 +738,7 @@ fn mask_operation_errors_poison_after_safe_real_cleanup_and_preserve_causes() {
         "entry::cleanup_tests::mask_operation_errors_poison_after_safe_real_cleanup_and_preserve_causes",
         |blocked| {
             for tracked in [false, true] {
-                for selected in [
-                    [true, false, false],
-                    [false, true, false],
-                    [false, false, true],
-                    [false, true, true],
-                    [true, true, true],
-                ] {
+                for selected in [[true, false], [false, true], [true, true]] {
                     error_case(blocked, tracked, selected);
                 }
             }

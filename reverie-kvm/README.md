@@ -23,9 +23,14 @@ must not send this signal or replace its handler for the rest of the process's
 lifetime. An existing handler or `SIG_IGN` prevents entry. A changed handler or
 an unexplained pending instance before a later entry also causes an error.
 These checks detect visible conflicts; they do not coordinate ownership with
-another signal user. Each entry restores the calling thread's original signal
-mask after draining its own notifications. The existing `SIGURG` worker
-cancellation mechanism remains separate and unchanged.
+another signal user. Signal 64 stays blocked on a thread from its first vCPU
+entry on: KVM unblocks it only inside `KVM_RUN`, through the vCPU's signal mask,
+and each entry drains its own notifications before it returns. Threads that
+such a thread creates, and host processes it spawns, inherit signal 64 blocked:
+Rust's `Command` and `posix_spawn` keep the parent's signal mask across exec.
+Neither this crate nor Hermit's Detcore spawns a host process from a vCPU
+thread. The existing `SIGURG` worker cancellation mechanism remains separate
+and unchanged.
 
 The private entry gate also stops every participant and callback memory copy
 sharing a Mapping when clock-interval setup or cleanup fails. That interval

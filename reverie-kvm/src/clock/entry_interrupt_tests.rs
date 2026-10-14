@@ -110,7 +110,8 @@ fn reserved_signal_after_activation_prevents_actual_ioctl_guest_progress() {
             usize::from(!tracked)
         );
         assert_eq!(backend.vcpu.get_regs().unwrap(), registers);
-        assert_eq!(mask_bits(), saved_mask);
+        // Signal 64 stays blocked after an entry; nothing else moves.
+        assert_eq!(mask_bits(), saved_mask | (1 << 63));
         assert!(same_affinity(&affinity().unwrap(), &saved_affinity));
         assert!(!reserved_pending());
         assert!(gate.pending_failure().is_none());
@@ -249,7 +250,7 @@ fn running_reserved_kick_retains_exact_finite_program_branch_total() {
     });
     let retained = observed.lock().unwrap().unwrap();
     assert_eq!(backend.vcpu.read_clock().unwrap(), retained);
-    assert_eq!(mask_bits(), saved_mask);
+    assert_eq!(mask_bits(), saved_mask | (1 << 63));
     assert!(same_affinity(&affinity().unwrap(), &saved_affinity));
     assert!(!reserved_pending());
     let closed = futures::executor::block_on(closing.lock().unwrap().take().unwrap()).unwrap();
@@ -408,4 +409,81 @@ fn synced_registers_match_kvm_and_never_go_stale() {
             .all(|word| *word == 0)
     );
     println!("synced registers: matched KVM_GET_REGS/SREGS and followed a raw write");
+}
+
+fn change_sigurg(how: libc::c_int) {
+    // SAFETY: the set is initialized before pthread_sigmask reads it, and the
+    // change affects only this test thread.
+    unsafe {
+        let mut set = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGURG);
+        assert_eq!(libc::pthread_sigmask(how, &set, std::ptr::null_mut()), 0);
+    }
+}
+
+#[test]
+fn kvm_signal_mask_is_reissued_only_when_the_thread_mask_changes() {
+    const SIGURG_BIT: u64 = 1 << (libc::SIGURG - 1);
+    let saved_mask = mask_bits();
+    let mut backend =
+        crate::KvmBackend::new(0x10000).expect("entry mask control requires /dev/kvm");
+    // inc byte ptr [0x2000]; hlt. Each entry restarts it on the same vCPU,
+    // whose installed KVM mask is what this test observes.
+    backend
+        .install_real_mode_program(PROGRAM, &[0xfe, 0x06, 0x00, 0x20, 0xf4])
+        .unwrap();
+    backend.memory.write_raw(MARKER, &[0]).unwrap();
+    let start = backend.vcpu.get_regs().unwrap();
+    let mut entries = 0u8;
+    let mut enter = |backend: &mut crate::KvmBackend| {
+        backend.vcpu.set_regs(&start).unwrap();
+        assert!(matches!(backend.vcpu.run().unwrap(), Some(VcpuExit::Hlt)));
+        entries += 1;
+        let mut marker = [0];
+        backend.memory.read_raw(MARKER, &mut marker).unwrap();
+        assert_eq!(marker[0], entries);
+    };
+    let probe = Arc::new(RunProbe::default());
+    backend.vcpu.set_run_probe(probe.clone());
+    probe.arm();
+    let ioctls = || probe.prepare.mask_ioctls.load(Ordering::SeqCst);
+    change_sigurg(libc::SIG_UNBLOCK);
+    // The first entry installs this vCPU's mask; unchanged entries reuse it.
+    for _ in 0..3 {
+        enter(&mut backend);
+        assert_eq!(ioctls(), 1);
+    }
+    assert_eq!(probe.prepare.mask_installs.load(Ordering::SeqCst), 3);
+    // Signal 64 stays blocked between entries; nothing else changed.
+    assert_eq!(mask_bits(), (saved_mask & !SIGURG_BIT) | (1 << 63));
+    // A changed thread mask reaches KVM before the next KVM_RUN. A pending
+    // SIGURG that the thread blocks stays out of the entry; with the stale
+    // installed mask it would end KVM_RUN with EINTR instead.
+    change_sigurg(libc::SIG_BLOCK);
+    // SAFETY: a thread-directed signal to this live test thread.
+    assert_eq!(
+        unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGURG) },
+        0
+    );
+    enter(&mut backend);
+    assert_eq!(ioctls(), 2);
+    enter(&mut backend);
+    assert_eq!(ioctls(), 2);
+    // Unblocking delivers or discards the pending SIGURG on this thread only.
+    change_sigurg(libc::SIG_UNBLOCK);
+    // SAFETY: restore this thread's complete original mask.
+    unsafe {
+        let mut mask = std::mem::zeroed();
+        libc::sigemptyset(&mut mask);
+        for signal in 1..=64 {
+            if saved_mask & (1 << (signal - 1)) != 0 {
+                libc::sigaddset(&mut mask, signal);
+            }
+        }
+        assert_eq!(
+            libc::pthread_sigmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut()),
+            0
+        );
+    }
 }

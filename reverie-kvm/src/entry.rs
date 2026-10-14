@@ -35,6 +35,7 @@ use crate::failure::FailureContext;
 pub(crate) mod driver;
 pub(crate) mod owner;
 mod signal;
+pub(crate) use signal::InstalledMask;
 
 #[cfg(feature = "native-test-support")]
 pub(crate) fn check_reserved_signal_handler() -> crate::Result<()> {
@@ -90,6 +91,9 @@ type CleanupHook = Box<dyn FnOnce(CleanupIdentity) + Send>;
 pub(crate) struct PrepareProbe {
     pub(crate) armed: std::sync::atomic::AtomicBool,
     pub(crate) mask_installs: std::sync::atomic::AtomicUsize,
+    /// `KVM_SET_SIGNAL_MASK` ioctls actually issued; an entry whose thread
+    /// mask is unchanged reuses the vCPU's installed mask.
+    pub(crate) mask_ioctls: std::sync::atomic::AtomicUsize,
     pub(crate) closed_admissions: std::sync::atomic::AtomicUsize,
     pub(crate) closed_waits: std::sync::atomic::AtomicUsize,
     pub(crate) pending_subscriptions: std::sync::atomic::AtomicUsize,
@@ -965,7 +969,11 @@ impl Participant {
         }))
     }
 
-    pub(crate) fn prepare(&mut self, fd: &kvm_ioctls::VcpuFd) -> GateResult<Option<RunEntry<'_>>> {
+    pub(crate) fn prepare(
+        &mut self,
+        fd: &kvm_ioctls::VcpuFd,
+        installed: &mut InstalledMask,
+    ) -> GateResult<Option<RunEntry<'_>>> {
         #[cfg(test)]
         let probe = self.prepare_probe.clone();
         let Some(mut entry) = self.try_enter()? else {
@@ -998,7 +1006,14 @@ impl Participant {
             if let Some(probe) = &probe {
                 probe.increment(&probe.mask_installs);
             }
-            guard.mask.as_ref().unwrap().install(fd)
+            let issued = guard.mask.as_ref().unwrap().install(fd, installed)?;
+            #[cfg(test)]
+            if let (true, Some(probe)) = (issued, &probe) {
+                probe.increment(&probe.mask_ioctls);
+            }
+            #[cfg(not(test))]
+            let _ = issued;
+            Ok(())
         });
         match admitted {
             Ok(true) => Ok(Some(guard)),
@@ -1039,7 +1054,7 @@ impl Drop for Participant {
 }
 
 /// This guard cannot move between pthreads and must not cross an async suspension.
-/// Its caller owns signal blocking/restoration and clock cleanup. A lost guard
+/// Its caller owns signal blocking/draining and clock cleanup. A lost guard
 /// leaves failed accounting; it cannot manufacture a successful fence.
 pub(crate) struct Entry<'a> {
     participant: &'a mut Participant,
@@ -1099,7 +1114,7 @@ impl Entry<'_> {
     }
 
     /// Must precede the final drain. A closer cannot send after this returns.
-    /// Retirement stays counted through the caller's mask restoration.
+    /// Retirement stays counted through the caller's mask drain.
     pub(crate) fn withdraw(&mut self) {
         #[cfg(test)]
         let mut state = {
@@ -1136,7 +1151,7 @@ impl Entry<'_> {
         member.activity = Activity::Retiring;
     }
 
-    /// Called only after clock cleanup, withdrawal, final drain and restoration.
+    /// Called only after clock cleanup, withdrawal and final drain.
     pub(crate) fn acknowledge(mut self, cleanup: crate::Result<()>) -> GateResult<()> {
         let mut state = self.participant.gate.state.lock().unwrap();
         let member = state.members.get_mut(&self.participant.id).unwrap();
@@ -1174,7 +1189,7 @@ impl Drop for Entry<'_> {
     }
 }
 
-/// Owns the same-thread mask from setup through final withdrawal/drain/restore.
+/// Owns the same-thread mask from setup through final withdrawal and drain.
 /// CountedVcpu must finish its clock interval before calling finish.
 pub(crate) struct RunEntry<'a> {
     entry: Option<Entry<'a>>,
@@ -2596,7 +2611,12 @@ mod tests {
             "send operation unwound"
         };
         assert_eq!(payload.downcast_ref::<&str>().copied(), Some(expected));
-        assert_eq!(mask_bits(), original_mask, "unwind changed the host mask");
+        // The reserved signal stays blocked after any entry; nothing else moves.
+        assert_eq!(
+            mask_bits(),
+            original_mask | (1 << 63),
+            "unwind changed the host mask"
+        );
         assert!(
             !gate.state.is_poisoned(),
             "cleanup would panic on registry lock"
@@ -2639,7 +2659,7 @@ mod tests {
         assert!(gate.try_close().is_err());
         // A second mask guard refuses a stale queued control signal.
         signal::Mask::block().unwrap().finish().unwrap();
-        assert_eq!(mask_bits(), original_mask);
+        assert_eq!(mask_bits(), original_mask | (1 << 63));
         drop(participant);
         assert!(gate.state.lock().unwrap().members.is_empty());
     }
@@ -2699,7 +2719,8 @@ mod tests {
 
         let gate = EntryGate::new();
         let mut participant = gate.register().unwrap();
-        let entry = participant.prepare(&vcpu).unwrap().unwrap();
+        let mut installed = InstalledMask::default();
+        let entry = participant.prepare(&vcpu, &mut installed).unwrap().unwrap();
         let controller_gate = gate.clone();
         let observer_memory = memory.clone();
         let (close_acquired, close_observed) = std::sync::mpsc::channel();
@@ -2734,10 +2755,15 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
         let closed = controller.join().unwrap();
-        assert!(participant.prepare(&vcpu).unwrap().is_none());
+        assert!(
+            participant
+                .prepare(&vcpu, &mut installed)
+                .unwrap()
+                .is_none()
+        );
         drop(closed);
         participant
-            .prepare(&vcpu)
+            .prepare(&vcpu, &mut installed)
             .unwrap()
             .unwrap()
             .finish(Ok(()))

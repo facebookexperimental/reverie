@@ -255,7 +255,10 @@ mod entry_eintr_tests {
         backend
             .run(|_, _| panic!("finite HLT fixture invoked a syscall"))
             .unwrap();
-        assert_eq!(mask_bytes(&current_mask()), caller_mask);
+        // This thread's first entry leaves signal 64 blocked; nothing else moves.
+        let mut expected = caller_mask;
+        expected[7] |= 0x80;
+        assert_eq!(mask_bytes(&current_mask()), expected);
         assert_eq!(probe.untracked_runs.load(Ordering::SeqCst), 2);
         assert_eq!(probe.prepare.mask_installs.load(Ordering::SeqCst), 2);
         assert_eq!(probe.tracked_runs.load(Ordering::SeqCst), 0);

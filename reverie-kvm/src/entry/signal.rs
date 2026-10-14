@@ -8,6 +8,11 @@
 
 //! The embedding process reserves Linux signal 64 for KVM entry control.
 //! SIGURG remains the independent worker-cancellation signal.
+//!
+//! Signal 64 is blocked on a vCPU thread from its first entry on and stays
+//! blocked: only `KVM_RUN` unblocks it, through the per-vCPU KVM signal mask.
+//! An entry therefore costs one `pthread_sigmask` (which also reads the thread
+//! mask) and reissues `KVM_SET_SIGNAL_MASK` only when that mask has changed.
 
 use std::marker::PhantomData;
 use std::os::fd::AsRawFd;
@@ -105,7 +110,9 @@ fn only_reserved_signal() -> libc::sigset_t {
     }
 }
 
-fn ioctl_mask(saved: &libc::sigset_t) -> Result<[u8; 12]> {
+/// The KVM_RUN mask for a thread whose own mask is `saved`: the same signals,
+/// except that the reserved signal is always deliverable inside `KVM_RUN`.
+fn kvm_mask_bits(saved: &libc::sigset_t) -> Result<u64> {
     let mut bits = 0u64;
     for signal in 1..=64 {
         // SAFETY: saved is a valid libc sigset and the queried number is valid.
@@ -115,16 +122,26 @@ fn ioctl_mask(saved: &libc::sigset_t) -> Result<[u8; 12]> {
             _ => return Err(last_error("read saved signal mask")),
         }
     }
-    bits &= !(1u64 << (SIGNAL - 1));
+    Ok(bits & !(1u64 << (SIGNAL - 1)))
+}
+
+fn ioctl_mask(bits: u64) -> [u8; 12] {
     let mut bytes = [0; 12];
     bytes[..4].copy_from_slice(&8u32.to_ne_bytes());
     bytes[4..].copy_from_slice(&bits.to_ne_bytes());
-    Ok(bytes)
+    bytes
 }
 
+/// The KVM_RUN signal mask last installed on one vCPU. KVM keeps a vCPU's mask
+/// until it is replaced, so it is owned next to the vCPU fd and starts empty:
+/// a new vCPU has no mask, and its first entry must install one.
+#[derive(Debug, Default)]
+pub(crate) struct InstalledMask(Option<u64>);
+
+/// One entry's view of the thread mask. The reserved signal stays blocked
+/// after the entry; [`Mask::finish`] only drains instances sent during it.
 pub(super) struct Mask {
     saved: libc::sigset_t,
-    finished: bool,
     _same_thread: PhantomData<Rc<()>>,
 }
 
@@ -134,6 +151,8 @@ impl Mask {
         let set = only_reserved_signal();
         // SAFETY: the mask and saved-mask storage are valid. pthread_sigmask
         // affects only this thread, whose guard is deliberately not Send.
+        // After the thread's first entry the signal is already blocked, and
+        // this call only reads the current mask for the KVM_RUN mask.
         let mut saved = unsafe { std::mem::zeroed() };
         let error = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut saved) };
         if error != 0 {
@@ -142,14 +161,10 @@ impl Mask {
                 std::io::Error::from_raw_os_error(error),
             ));
         }
-        let mut mask = Self {
-            saved,
-            finished: false,
-            _same_thread: PhantomData,
-        };
+        // No gate sender can know this thread until entry publication, and
+        // the previous entry drained every instance sent to it. An already
+        // pending instance therefore has no legitimate sender.
         let check = (|| {
-            // No gate sender can know this thread until entry publication.
-            // An already pending instance therefore has no legitimate sender.
             let mut pending = unsafe { std::mem::zeroed() };
             if unsafe { libc::sigpending(&mut pending) } != 0 {
                 return Err(last_error("query pending reserved host signal"));
@@ -162,32 +177,45 @@ impl Mask {
             Ok(())
         })();
         if let Err(error) = check {
-            // This signal was not sent by us. Do not synchronously consume it.
-            let cleanup = mask.restore();
-            mask.finished = true;
+            // This signal was not sent by us. Do not synchronously consume it:
+            // put back the mask this call found, which leaves it pending.
+            let cleanup = restore(&saved);
             return Err(match cleanup {
                 Ok(()) => error,
                 Err(cleanup) => error.with_cleanup(vec![cleanup]),
             });
         }
-        Ok(mask)
+        Ok(Self {
+            saved,
+            _same_thread: PhantomData,
+        })
     }
 
-    pub(super) fn install(&self, fd: &VcpuFd) -> Result<()> {
+    /// Make `installed` this entry's KVM_RUN mask. Returns whether the ioctl
+    /// was issued; an unchanged mask is already installed on this vCPU.
+    pub(super) fn install(&self, fd: &VcpuFd, installed: &mut InstalledMask) -> Result<bool> {
         #[cfg(test)]
         if let Some(error) = fault::take(0) {
             // Inject before the ioctl. The enclosing real RunEntry must still
             // withdraw, finish its actual mask, poison and acknowledge.
+            installed.0 = None;
             return Err(crate::Error::SharedFailure(error));
         }
-        let bytes = ioctl_mask(&self.saved)?;
+        let bits = kvm_mask_bits(&self.saved)?;
+        if installed.0 == Some(bits) {
+            return Ok(false);
+        }
+        // A failed ioctl leaves the vCPU's mask unknown.
+        installed.0 = None;
+        let bytes = ioctl_mask(bits);
         // SAFETY: Linux copies the four-byte length followed immediately by
         // eight mask bytes. There is no padded u64 field or unaligned reference.
         // fd is live, and the kernel only reads this buffer during the ioctl.
         if unsafe { libc::ioctl(fd.as_raw_fd(), KVM_SET_SIGNAL_MASK, bytes.as_ptr()) } != 0 {
             return Err(last_error("install KVM temporary signal mask"));
         }
-        Ok(())
+        installed.0 = Some(bits);
+        Ok(true)
     }
 
     fn drain(&self) -> Result<()> {
@@ -225,51 +253,24 @@ impl Mask {
         }
     }
 
-    fn restore(&self) -> Result<()> {
-        #[cfg(test)]
-        if let Some(error) = fault::take(2) {
-            // The one-shot is removed before recursion. Perform the real
-            // operation for host safety, then exercise its error composition.
-            let actual = self.restore();
-            let injected = crate::Error::SharedFailure(error);
-            return Err(match actual {
-                Ok(()) => injected,
-                Err(actual) => injected.with_cleanup(vec![actual]),
-            });
-        }
-        // SAFETY: saved is this same thread's complete original libc sigset.
-        let error =
-            unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &self.saved, std::ptr::null_mut()) };
-        if error == 0 {
-            Ok(())
-        } else {
-            Err(failure(
-                "restore host signal mask",
-                std::io::Error::from_raw_os_error(error),
-            ))
-        }
-    }
-
     /// The registry must have withdrawn the send target before this call.
-    pub(super) fn finish(mut self) -> Result<()> {
-        let drain = self.drain();
-        let restore = self.restore();
-        self.finished = true;
-        match (drain, restore) {
-            (Ok(()), result) | (result, Ok(())) => result,
-            (Err(primary), Err(cleanup)) => Err(primary.with_cleanup(vec![cleanup])),
-        }
+    /// The reserved signal stays blocked, so nothing sent after the drain can
+    /// be delivered outside a later entry's `KVM_RUN`.
+    pub(super) fn finish(self) -> Result<()> {
+        self.drain()
     }
 }
 
-impl Drop for Mask {
-    fn drop(&mut self) {
-        if !self.finished {
-            // The owning RunEntry normally performs both operations and keeps
-            // their errors. This fallback only prevents an unwind from leaving
-            // an avoidably changed thread mask; it does not acknowledge entry.
-            let _ = self.restore();
-        }
+fn restore(saved: &libc::sigset_t) -> Result<()> {
+    // SAFETY: saved is this same thread's complete libc sigset.
+    let error = unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, saved, std::ptr::null_mut()) };
+    if error == 0 {
+        Ok(())
+    } else {
+        Err(failure(
+            "restore host signal mask",
+            std::io::Error::from_raw_os_error(error),
+        ))
     }
 }
 
@@ -287,8 +288,8 @@ pub(super) mod fault {
     }
 
     pub(in crate::entry) struct Probe {
-        errors: [Option<Arc<crate::Error>>; 3],
-        pub(in crate::entry) consumed: [AtomicUsize; 3],
+        errors: [Option<Arc<crate::Error>>; 2],
+        pub(in crate::entry) consumed: [AtomicUsize; 2],
     }
 
     pub(in crate::entry) struct Guard {
@@ -298,7 +299,7 @@ pub(super) mod fault {
     }
 
     impl Guard {
-        pub(in crate::entry) fn arm(errors: [Option<Arc<crate::Error>>; 3]) -> Self {
+        pub(in crate::entry) fn arm(errors: [Option<Arc<crate::Error>>; 2]) -> Self {
             let probe = Arc::new(Probe {
                 errors,
                 consumed: std::array::from_fn(|_| AtomicUsize::new(0)),
@@ -377,7 +378,7 @@ mod tests {
             assert_eq!(libc::sigaddset(&mut saved, libc::SIGUSR1), 0);
             assert_eq!(libc::sigaddset(&mut saved, libc::SIGURG), 0);
         }
-        let bytes = ioctl_mask(&saved).unwrap();
+        let bytes = ioctl_mask(kvm_mask_bits(&saved).unwrap());
         assert_eq!(bytes.len(), 12);
         assert_eq!(u32::from_ne_bytes(bytes[0..4].try_into().unwrap()), 8);
         let bits = u64::from_ne_bytes(bytes[4..12].try_into().unwrap());
@@ -511,11 +512,12 @@ mod tests {
         mask.finish().unwrap();
         assert!(!pending(SIGNAL));
         assert!(pending(libc::SIGURG), "entry cleanup consumed cancellation");
-        let restored = current_mask();
+        // The reserved signal stays blocked after the entry; nothing else moves.
+        let after = current_mask();
         for signal in 1..=64 {
             assert_eq!(
-                contains(&restored, signal),
-                contains(&original, signal),
+                contains(&after, signal),
+                signal == SIGNAL || contains(&original, signal),
                 "signal {signal}"
             );
         }
