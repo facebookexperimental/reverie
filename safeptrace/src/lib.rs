@@ -34,6 +34,8 @@ mod waitid;
 
 use core::mem::MaybeUninit;
 use std::fmt;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use nix::sys::ptrace;
 // Re-exports so that nothing else needs to depend on `nix`.
@@ -1287,8 +1289,10 @@ impl Stopped {
         self.getregset(libc::NT_PRFPREG)
     }
 
-    /// Sets the floating point registers.
+    /// Sets the floating point registers. Fails with `EPERM` once
+    /// [`forbid_fpu_register_writes`] has been called.
     pub fn setfpregs(&self, regs: &FpRegs) -> Result<(), Error> {
+        check_fpu_register_write()?;
         self.setregset(libc::NT_PRFPREG, regs)
     }
 
@@ -1324,10 +1328,12 @@ impl Stopped {
     }
 
     /// Restores a complete x86 XSAVE state previously returned by
-    /// [`Stopped::getxstate`].
+    /// [`Stopped::getxstate`]. Fails with `EPERM` once
+    /// [`forbid_fpu_register_writes`] has been called.
     // TODO-HUMAN-REVIEW(PR-270): Review complete ptrace XSTATE preservation API.
     #[cfg(target_arch = "x86_64")]
     pub fn setxstate(&self, state: &XState) -> Result<(), Error> {
+        check_fpu_register_write()?;
         let iov = libc::iovec {
             iov_base: state.0.as_ptr() as *mut libc::c_void,
             iov_len: state.0.len(),
@@ -2205,6 +2211,41 @@ pub fn traceme_and_stop() -> Result<(), Errno> {
 /// and [`Stopped::setsiginfo_bytes`].
 pub const SIGINFO_BYTES: usize = 128;
 
+static FPU_REGISTER_WRITES_FORBIDDEN: AtomicBool = AtomicBool::new(false);
+
+/// Makes every later [`Stopped::setfpregs`] and [`Stopped::setxstate`] in this
+/// process fail with `EPERM`. It cannot be undone.
+///
+/// A tool calls this when a write to a tracee's floating-point or extended
+/// state would void a guarantee it gives. Hermit's x86-64-v3 CPU profile
+/// qualifies a host on the in-use bits a guest's own XSAVE reads, and the
+/// kernel's regset write forces some of those bits
+/// (<https://github.com/rrnewton/hermit/issues/4243>). The check sits at this
+/// layer, where every such write passes, so a caller added later cannot bypass
+/// it.
+///
+/// A caller that writes several register sets can be left part way: the
+/// gdbstub's `G` packet writes the general registers before the FP registers,
+/// so after this call such a packet is partly applied before it fails with
+/// EPERM. Hermit refuses `--gdbserver` under that profile, so it never reaches
+/// this.
+pub fn forbid_fpu_register_writes() {
+    FPU_REGISTER_WRITES_FORBIDDEN.store(true, Ordering::SeqCst);
+}
+
+/// Whether [`forbid_fpu_register_writes`] has been called in this process.
+pub fn fpu_register_writes_forbidden() -> bool {
+    FPU_REGISTER_WRITES_FORBIDDEN.load(Ordering::SeqCst)
+}
+
+fn check_fpu_register_write() -> Result<(), Error> {
+    if fpu_register_writes_forbidden() {
+        Err(Error::Errno(Errno::EPERM))
+    } else {
+        Ok(())
+    }
+}
+
 /// These tests are meant to test this API but also to show how ptrace works.
 #[cfg(test)]
 mod test {
@@ -2276,6 +2317,38 @@ mod test {
                 unsafe { ::libc::_exit(exit_code) };
             }
         }
+    }
+
+    #[test]
+    fn fpu_register_writes_fail_once_forbidden() -> Result<(), Box<dyn std::error::Error + 'static>>
+    {
+        // No other test in this binary writes FP registers, so forbidding them
+        // process-wide here does not disturb one.
+        let (pid, tracee) = trace(|| 0, Options::PTRACE_O_EXITKILL)?;
+        let fpregs = tracee.getfpregs()?;
+        tracee.setfpregs(&fpregs)?;
+        #[cfg(target_arch = "x86_64")]
+        let xstate = tracee.getxstate()?;
+        #[cfg(target_arch = "x86_64")]
+        tracee.setxstate(&xstate)?;
+        forbid_fpu_register_writes();
+        assert!(fpu_register_writes_forbidden());
+        assert!(matches!(
+            tracee.setfpregs(&fpregs),
+            Err(Error::Errno(Errno::EPERM))
+        ));
+        #[cfg(target_arch = "x86_64")]
+        assert!(matches!(
+            tracee.setxstate(&xstate),
+            Err(Error::Errno(Errno::EPERM))
+        ));
+        // Reads are unaffected.
+        tracee.getfpregs()?;
+        assert_eq!(
+            tracee.resume(None)?.wait()?,
+            Wait::Exited(pid, ExitStatus::Exited(0))
+        );
+        Ok(())
     }
 
     #[test]
