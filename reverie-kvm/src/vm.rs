@@ -2474,9 +2474,14 @@ impl KvmBackend {
         capture: impl Fn(&Self, &crate::memory::RawMemoryRead<'_>) -> Result<T>,
     ) -> Result<Option<T>> {
         let gate = self.memory.entry_gate();
+        // The first attempt subscribes to nothing: it nearly always reads at
+        // once, and subscribing to the gate's change marks it taken, so its
+        // next change would allocate a fresh channel. If it cannot read, the
+        // loop goes around once more with both subscriptions taken before
+        // the same checks, so a change after those checks still wakes it.
+        let mut subscribe = false;
         loop {
-            let changed = gate.subscribe();
-            let cancelled = self.entry_cancellation();
+            let subscriptions = subscribe.then(|| (gate.subscribe(), self.entry_cancellation()));
             gate.admit_operation().map_err(|failure| failure.error())?;
             if stop.as_mut().now_or_never().is_some() {
                 return Err(Error::RunAborted);
@@ -2487,6 +2492,10 @@ impl KvmBackend {
             if let Some(value) = self.memory.try_read_with(|access| capture(self, access))? {
                 return Ok(Some(value));
             }
+            let Some((changed, cancelled)) = subscriptions else {
+                subscribe = true;
+                continue;
+            };
             match futures::future::select(
                 futures::future::select(changed, cancelled),
                 stop.as_mut(),
@@ -12020,6 +12029,7 @@ mod tests {
     }
 
     include!("vm/public_tool_panic_tests.rs");
+    include!("vm/kept_failure_wait_tests.rs");
     include!("vm/instruction_callback_panic_tests.rs");
 }
 

@@ -2445,13 +2445,27 @@ async fn drive_handler_completion_inner<T>(
     // future, including an inline RPC that was pending when failure arrived.
     let mut future = Box::pin(future);
     let mut failure = Box::pin(failure);
-    let private_watch = watch.clone();
-    let mut private_failure = Box::pin(async move {
-        match private_watch {
-            Some(watch) => watch.wait().await,
-            None => std::future::pending::<()>().await,
-        }
-    });
+    // The driver watch's wake is registered only once the callback suspends.
+    // Most callbacks complete on their first poll, and registering subscribes
+    // to the gate's failure and the owner's change channel, which costs a
+    // subscription, a waker registration and, at the owner's next change, a
+    // fresh channel. Its sticky state is still checked before and after the
+    // callback's first poll, exactly as before.
+    let mut private_failure: Option<Pin<Box<dyn Future<Output = ()> + Send>>> = None;
+    let register_private_wake =
+        |private_failure: &mut Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+         context: &mut std::task::Context<'_>| {
+            let private_failure = private_failure.get_or_insert_with(|| {
+                let watch = watch.clone();
+                Box::pin(async move {
+                    match watch {
+                        Some(watch) => watch.wait().await,
+                        None => std::future::pending::<()>().await,
+                    }
+                })
+            });
+            let _ = private_failure.as_mut().poll(context);
+        };
     let mut selected = None;
     let mut select = |outcome| {
         selected = Some(outcome);
@@ -2460,8 +2474,11 @@ async fn drive_handler_completion_inner<T>(
     // This driver only borrows the callback. Its caught poll cannot destroy the
     // callback allocation or an outcome already moved out of the signal slot.
     let caught = catch_owned_future(poll_fn(|context| {
-        // Register the private wake before rechecking the sticky obligation.
-        let _ = private_failure.as_mut().poll(context);
+        // Once registered, renew the private wake before rechecking the
+        // sticky obligation: this poll may carry a new waker.
+        if private_failure.is_some() {
+            register_private_wake(&mut private_failure, context);
+        }
         if let Some(error) = watch.as_ref().and_then(|watch| watch.check().err()) {
             let prior = handler_signal
                 .lock()
@@ -2516,6 +2533,11 @@ async fn drive_handler_completion_inner<T>(
         match result {
             Poll::Ready(result) => select(HandlerOutcome::Returned(result)),
             Poll::Pending => {
+                // Register the private wake before the sticky recheck below,
+                // so a failure published after that recheck still wakes us.
+                if private_failure.is_none() {
+                    register_private_wake(&mut private_failure, context);
+                }
                 if matches!(failure_order, HandlerFailureOrder::AfterReadyCleanup)
                     && failure.as_mut().poll(context).is_ready()
                 {
@@ -5249,6 +5271,16 @@ impl KvmBackend {
         }
         let tool_stack_top = self.tool_stack_top();
         let failure_subscription = self.failure_subscription(executor.is_traced_tree_root());
+        // One failure wait for every Tool callback this thread runs. Building
+        // one takes the GlobalTool's failure waiter (Detcore locks its
+        // scheduler for it) and two subscriptions, once per guest syscall;
+        // polling a kept one only renews its waker. It stays Ready once it
+        // has fired, so every later callback still sees the failure first.
+        // It is destroyed under a catch after the execution completes.
+        let mut callback_failure = crate::failure::StickyFailure::new(Box::pin(wait_for_failure(
+            global_state.as_ref(),
+            failure_subscription.clone(),
+        )));
         let mut _registration = None;
         let mut auxv = executor.auxv().to_vec();
         // Clones share the MAP_SHARED guest mapping; a mutable handle lets the
@@ -5526,6 +5558,14 @@ impl KvmBackend {
             // borrowed elsewhere in the loop body.
             let thread_ownership = self.thread_ownership;
             let subscribed_syscalls = SubscribedSyscalls::new(subscriptions);
+            // Only a closed gate or a cancellation makes vcpu.run() return
+            // None, and only then does this loop need a wake. Subscribing to
+            // the gate marks its change future taken, so its next change (this
+            // vCPU's own exit) would allocate a fresh channel. So an entry
+            // subscribes only after an attempt found admission closed, and then
+            // takes both subscriptions before the same checks, until an entry
+            // succeeds: a change after those checks still wakes it.
+            let mut subscribe_entry_wait = false;
             loop {
                 self.check_entry_owner()?;
                 #[cfg(test)]
@@ -5533,8 +5573,8 @@ impl KvmBackend {
                     entry_wait_observation::Site::ToolMain,
                     entry_wait_observation::Boundary::BeforeSubscription,
                 );
-                let changed = memory.entry_gate().subscribe();
-                let cancelled = self.entry_cancellation();
+                let entry_wait = subscribe_entry_wait
+                    .then(|| (memory.entry_gate().subscribe(), self.entry_cancellation()));
                 #[cfg(test)]
                 entry_wait_observation::observe(
                     entry_wait_observation::Site::ToolMain,
@@ -5544,10 +5584,7 @@ impl KvmBackend {
                     .entry_gate()
                     .admit_operation()
                     .map_err(|failure| failure.error())?;
-                if wait_for_failure(global_state.as_ref(), failure_subscription.clone())
-                    .now_or_never()
-                    .is_some()
-                {
+                if Pin::new(&mut callback_failure).now_or_never().is_some() {
                     return Err(Error::RunAborted);
                 }
                 if let Some(status) = self.guest_thread_group_exit_status() {
@@ -5561,15 +5598,18 @@ impl KvmBackend {
                     return Ok(self.cancelled_tool_thread_status(executor));
                 }
                 let vcpu_exit = match self.vcpu.run() {
-                    Ok(Some(exit)) => exit,
+                    Ok(Some(exit)) => {
+                        subscribe_entry_wait = false;
+                        exit
+                    }
                     Ok(None) => {
-                        let stop = pin!(wait_for_failure(
-                            global_state.as_ref(),
-                            failure_subscription.clone()
-                        ));
+                        let Some((changed, cancelled)) = entry_wait else {
+                            subscribe_entry_wait = true;
+                            continue;
+                        };
                         let _ = futures::future::select(
                             futures::future::select(changed, cancelled),
-                            stop,
+                            Pin::new(&mut callback_failure),
                         )
                         .await;
                         continue;
@@ -5982,15 +6022,13 @@ impl KvmBackend {
                         self.check_entry_owner()?;
                         expose_tool_scratch(&memory, tool_stack_top)?;
                         let boundary = {
-                            let mut stop = pin!(wait_for_failure(
-                                global_state.as_ref(),
-                                failure_subscription.clone(),
-                            ));
+                            let stop = Pin::new(&mut callback_failure);
+                            let stop: Pin<&mut (dyn Future<Output = ()> + Send)> = stop;
                             CompletedSyscallBoundary::capture_admitted(
                                 self,
                                 frame_address,
                                 None,
-                                stop.as_mut(),
+                                stop,
                             )
                             .await?
                         };
@@ -6038,10 +6076,7 @@ impl KvmBackend {
                                 || tool.handle_syscall_event(&mut guest, syscall),
                                 handler_signal,
                                 pending_child_starts.clone(),
-                                wait_for_failure(
-                                    global_state.as_ref(),
-                                    failure_subscription.clone(),
-                                ),
+                                Pin::new(&mut callback_failure),
                                 callback_watch.clone(),
                             )
                             .await
@@ -6449,7 +6484,16 @@ impl KvmBackend {
                 }
             }
         };
-        let caught = crate::failure::owned_future::catch_owned_future(execution).await;
+        let mut caught = crate::failure::owned_future::catch_owned_future(execution).await;
+        // The kept failure wait outlived every callback that borrowed it.
+        // Destroy it under a catch, as each callback's own wait was: a
+        // GlobalTool's wait future may panic when dropped, and that panic
+        // must join the execution's panics rather than discard its outcome.
+        if let Err(payload) =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(callback_failure)))
+        {
+            caught.panics.push(payload);
+        }
         let outcome: Result<ToolProcessExit> =
             self.finish_tool_execution_completion(caught, "Tool execution");
         self.restore_entry_origin();

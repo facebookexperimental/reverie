@@ -202,4 +202,73 @@ mod entry_race_tests {
     fn tracked_final_activation_close_restores_mask_and_rechecks_next_close() {
         late_close_case(true);
     }
+
+    /// A boundary capture whose first attempt finds the gate closed must
+    /// subscribe before rechecking and then park, and reopening the gate
+    /// must wake it. The first attempt takes no subscription, so this is the
+    /// retry boundary: a reopen after the subscribed recheck still wakes it.
+    #[test]
+    fn a_boundary_capture_on_a_closed_gate_wakes_when_the_gate_reopens() {
+        #[derive(Default)]
+        struct Wakes(AtomicUsize);
+        impl futures::task::ArcWake for Wakes {
+            fn wake_by_ref(arc: &Arc<Self>) {
+                arc.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let mut backend =
+            KvmBackend::new(0x10000).expect("boundary capture control requires /dev/kvm");
+        backend
+            .install_syscall(
+                0x1000,
+                0x2000,
+                SyscallRequest::new(libc::SYS_getpid as u64, [0; 6]),
+            )
+            .unwrap();
+        let gate = backend.memory.entry_gate();
+        let closed = gate
+            .try_close()
+            .unwrap()
+            .unwrap()
+            .finish()
+            .now_or_never()
+            .expect("an idle gate closes at once")
+            .unwrap();
+        let wakes = Arc::new(Wakes::default());
+        let waker = futures::task::waker(wakes.clone());
+        let mut context = Context::from_waker(&waker);
+        let mut stop = std::pin::pin!(std::future::pending::<()>());
+        let stop: Pin<&mut (dyn Future<Output = ()> + Send)> = stop.as_mut();
+        let mut capture = Box::pin(CompletedSyscallBoundary::capture_admitted(
+            &mut backend,
+            0x2000,
+            None,
+            stop,
+        ));
+        assert!(
+            capture.as_mut().poll(&mut context).is_pending(),
+            "a capture read through a closed gate"
+        );
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+        drop(closed);
+        assert!(
+            wakes.0.load(Ordering::SeqCst) > 0,
+            "reopening the gate did not wake the parked capture"
+        );
+        // The woken capture is admitted and runs its read. This vCPU never
+        // ran, so the read finds no syscall boundary and refuses with that
+        // typed error, which only the admitted read can produce. Pending would
+        // mean the wake was lost; RunAborted would mean the stop fired.
+        match capture.as_mut().poll(&mut context) {
+            std::task::Poll::Ready(Err(Error::UnexpectedVcpuExit(message)))
+                if message.starts_with("syscall boundary RIP") => {}
+            std::task::Poll::Ready(other) => {
+                panic!("capture after reopen: {:?}", other.map(|b| b.is_some()))
+            }
+            std::task::Poll::Pending => {
+                panic!("a woken capture did not read after the gate reopened")
+            }
+        }
+    }
 }
