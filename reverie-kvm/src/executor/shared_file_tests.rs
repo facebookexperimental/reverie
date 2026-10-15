@@ -1708,10 +1708,12 @@ mod shared_file_dispatch_tests {
 
     /// A MAP_FIXED file mapping whose read fails after the first chunk has
     /// replaced the old range must not leave it accessible with changed bytes:
-    /// Linux keeps the old mapping or unmaps it. Host /proc/self/mem is a
-    /// regular file whose read past the host's mapped range fails with EIO,
-    /// so the first 64 KiB chunk reads and the second fails after the
-    /// reservation.
+    /// Linux leaves such a range unmapped: once the old contents are gone, a
+    /// failed MAP_FIXED mmap completes the munmap and leaves a gap
+    /// (mm/vma.c, vms_abort_munmap_vmas), and reverie-kvm's zero_lazily has
+    /// destroyed them by then. Host /proc/self/mem is a regular file whose
+    /// read of an empty memfd mapping, past its end, fails with EIO, so the
+    /// first 64 KiB chunk reads and the second fails after the reservation.
     #[test]
     fn a_fixed_file_mapping_whose_read_fails_mid_stream_leaves_no_partial_range() {
         const CHUNK: usize = 64 * 1024;
@@ -1729,12 +1731,26 @@ mod shared_file_dispatch_tests {
         assert_ne!(host, libc::MAP_FAILED);
         // SAFETY: the first chunk is mapped and writable.
         unsafe { std::ptr::write_bytes(host as *mut u8, 0x5c, CHUNK) };
-        // SAFETY: unmaps the second half of this test's own mapping, so a
-        // read of it through /proc/self/mem fails.
-        assert_eq!(
-            unsafe { libc::munmap((host as usize + CHUNK) as *mut _, CHUNK) },
-            0
-        );
+        // An empty memfd mapped over the second half: a read of it through
+        // /proc/self/mem is past the memfd's end and fails, and the address
+        // stays occupied, so no mapping another test thread makes can land
+        // there and make the read succeed.
+        // SAFETY: the fixed name is nul-terminated; the fd is owned at once.
+        let raw = unsafe { libc::memfd_create(c"eio-hole".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(raw >= 0, "memfd_create: {}", std::io::Error::last_os_error());
+        let hole = unsafe { std::fs::File::from_raw_fd(raw) };
+        // SAFETY: replaces the second half of this test's own mapping.
+        let mapped = unsafe {
+            libc::mmap(
+                (host as usize + CHUNK) as *mut _,
+                CHUNK,
+                libc::PROT_READ,
+                libc::MAP_SHARED | libc::MAP_FIXED,
+                hole.as_raw_fd(),
+                0,
+            )
+        };
+        assert_eq!(mapped as usize, host as usize + CHUNK);
         let mut f = Fixture::with_linux_layout();
         let mem = std::fs::File::open("/proc/self/mem").unwrap();
         assert!(mem.metadata().unwrap().is_file());
@@ -1772,34 +1788,25 @@ mod shared_file_dispatch_tests {
             ],
         );
         assert_eq!(result, -(libc::EIO as i64));
-        // Either the old mapping is intact, or, as munmap leaves it, every
-        // page of the range is released.
-        let mut bytes = vec![0xff; length as usize];
-        let pages = (0..length).step_by(PAGE_SIZE as usize);
-        match f.memory.user().read(user, &mut bytes) {
-            Ok(()) => {
-                assert!(
-                    bytes.iter().all(|byte| *byte == 0xab),
-                    "a failed MAP_FIXED mmap left the range accessible with changed bytes"
-                );
-                for page in pages {
-                    assert_eq!(
-                        f.memory.reservation_kind(physical + page),
-                        Some(RegionKind::Mmap)
-                    );
-                }
-            }
-            Err(_) => {
-                for page in pages {
-                    assert_eq!(
-                        f.memory.reservation_kind(physical + page),
-                        None,
-                        "page {page:#x} of the failed mapping is still reserved"
-                    );
-                }
-            }
+        // As munmap leaves it: every page is unreserved, and refuses both a
+        // read and a write.
+        let mut byte = [0u8; 1];
+        for page in (0..length).step_by(PAGE_SIZE as usize) {
+            assert_eq!(
+                f.memory.reservation_kind(physical + page),
+                None,
+                "page {page:#x} of the failed mapping is still reserved"
+            );
+            assert!(
+                f.memory.user().read(user + page, &mut byte).is_err(),
+                "page {page:#x} of the failed mapping is still readable"
+            );
+            assert!(
+                f.memory.user().write(user + page, &byte).is_err(),
+                "page {page:#x} of the failed mapping is still writable"
+            );
         }
-        // SAFETY: the first half of the host mapping is still mapped.
-        unsafe { libc::munmap(host, CHUNK) };
+        // SAFETY: both halves are this test's own mappings.
+        unsafe { libc::munmap(host, 2 * CHUNK) };
     }
 }
