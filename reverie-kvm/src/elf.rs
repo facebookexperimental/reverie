@@ -312,7 +312,7 @@ pub(crate) enum IdentityTimestamps {
     /// the carrier rather than of any guest-visible file.
     VirtualFile,
     /// A synthetic `/proc` snapshot carrier, such as the one for
-    /// `/proc/uptime`. It reports timestamp 0, like every synthetic `/proc`
+    /// `/proc/stat`. It reports timestamp 0, like every synthetic `/proc`
     /// file.
     ProcSnapshot,
 }

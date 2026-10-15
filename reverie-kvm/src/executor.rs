@@ -10940,9 +10940,6 @@ fn open_file(
             if path == b"/dev/random" { 8 } else { 9 },
         );
     }
-    if path == b"/proc/uptime" {
-        return open_virtual_file(state, b"0.00 0.00\n", flags, guest_cloexec);
-    }
     if path == b"/proc/self/loginuid" {
         return open_virtual_file(state, b"0", flags, guest_cloexec);
     }
@@ -17746,7 +17743,7 @@ fn canonical_fd_path(fd: RawFd) -> Result<std::path::PathBuf, i64> {
 //
 // Real procfs is refused (see `ensure_not_procfs`) because its contents are
 // host-specific and would break `--verify`. To still support programs that read
-// a few well-known /proc files (uptime, diagnostics, self-inspection), a small
+// a few well-known /proc files (diagnostics, self-inspection), a small
 // allowlist uses backend-owned storage. Most contents are fixed; mount files
 // retain the actual namespace snapshot for Tool normalization, and fdinfo uses
 // its own observation/seq state. Fixed files retain ordinary memfd I/O. `fstat`,
@@ -17765,9 +17762,10 @@ const SYNTHETIC_GUEST_FD_DEV_MINOR: u32 = 0xff02;
 // persona) and TODO-HUMAN-REVIEW(PR-224) (the vmstat and osrelease surfaces
 // and their regression test); those reviews now apply to Detcore's
 // renderings. /proc/loadavg followed, once Detcore rendered it as a fixed
-// file; its KVM copy carried no marker.
+// file; its KVM copy carried no marker. /proc/uptime followed, once Detcore
+// rendered it with its snapshot taken at the first read; its KVM copies (this
+// table's entry and a dead open-path special case) carried no marker.
 const SYNTHETIC_REGULAR_PROC_PATHS: &[&[u8]] = &[
-    b"/proc/uptime",
     b"/proc/mounts",
     b"/proc/self/mounts",
     b"/proc/self/mountinfo",
@@ -17912,7 +17910,6 @@ fn normalize_proc_path(state: &LoadedStaticElf, path: &[u8]) -> Option<Vec<u8>> 
 fn synthetic_proc_content(state: &LoadedStaticElf, path: &[u8]) -> Option<Vec<u8>> {
     let normalized = normalize_proc_path(state, path)?;
     let content = match normalized.as_slice() {
-        b"/proc/uptime" => b"0.00 0.00\n".to_vec(),
         b"/proc/mounts" | b"/proc/self/mounts" => state.proc_mounts.mounts.clone(),
         // Absolute guest paths and owned descriptors use this same ambient
         // namespace. The Tool normalizes its real mount identities together
@@ -22998,6 +22995,20 @@ mod tests {
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;
 
+    /// The fixed synthetic /proc/stat, the regular procfs file these tests
+    /// open where they need a fixed, KVM-rendered snapshot.
+    const SYSTEM_STAT_CONTENT: &[u8] = concat!(
+        "cpu  0 0 0 0 0 0 0 0 0 0\n",
+        "cpu0 0 0 0 0 0 0 0 0 0 0\n",
+        "intr 0\n",
+        "ctxt 0\n",
+        "btime 0\n",
+        "processes 1\n",
+        "procs_running 1\n",
+        "procs_blocked 0\n",
+    )
+    .as_bytes();
+
     /// An entry records each fact from its first successful probe and reuses
     /// it; a failing probe is not recorded, so it runs again and reports the
     /// same error.
@@ -24940,10 +24951,10 @@ mod tests {
         let mut memory = GuestMemory::new(0, 0x4000).unwrap();
 
         // Four live guest descriptors: 3, 4, 5, 6.
-        let low = open_readonly(&mut memory, &mut state, "/proc/uptime");
-        let mid = open_readonly(&mut memory, &mut state, "/proc/uptime");
-        let high = open_readonly(&mut memory, &mut state, "/proc/uptime");
-        let direct = open_readonly(&mut memory, &mut state, "/proc/uptime");
+        let low = open_readonly(&mut memory, &mut state, "/proc/stat");
+        let mid = open_readonly(&mut memory, &mut state, "/proc/stat");
+        let high = open_readonly(&mut memory, &mut state, "/proc/stat");
+        let direct = open_readonly(&mut memory, &mut state, "/proc/stat");
         assert_eq!([low, mid, high, direct], [3, 4, 5, 6]);
 
         // close consumes only the low descriptor word and removes the complete
@@ -25000,8 +25011,8 @@ mod tests {
         let mut state = test_state(&root.0);
         let mut memory = GuestMemory::new(0, 0x4000).unwrap();
 
-        let low = open_readonly(&mut memory, &mut state, "/proc/uptime");
-        let high = open_readonly(&mut memory, &mut state, "/proc/uptime");
+        let low = open_readonly(&mut memory, &mut state, "/proc/stat");
+        let high = open_readonly(&mut memory, &mut state, "/proc/stat");
         assert_eq!([low, high], [3, 4]);
 
         // Bounds are compared after truncation. Raw u64 ordering says the last
@@ -25237,9 +25248,12 @@ mod tests {
         let mut state = test_state(&root.0);
         let mut memory = GuestMemory::new(0, 0x4000).unwrap();
 
-        let fd = open_readonly(&mut memory, &mut state, "/proc/uptime");
-        assert!(fd >= 0, "open /proc/uptime failed: {fd}");
-        assert_eq!(read_fd_to_end(&mut memory, &mut state, fd), b"0.00 0.00\n");
+        let fd = open_readonly(&mut memory, &mut state, "/proc/stat");
+        assert!(fd >= 0, "open /proc/stat failed: {fd}");
+        assert_eq!(
+            read_fd_to_end(&mut memory, &mut state, fd),
+            SYSTEM_STAT_CONTENT
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -25261,7 +25275,7 @@ mod tests {
         let root = TestDir::new();
         let mut state = test_state(&root.0);
         let mut memory = GuestMemory::new(0, state.mmap_limit as usize).unwrap();
-        write_c_string(&mut memory, PATH, "/proc/uptime");
+        write_c_string(&mut memory, PATH, "/proc/stat");
         let fd = syscall_result(
             &mut memory,
             &mut state,
@@ -25362,7 +25376,7 @@ mod tests {
             negative_errno(libc::EACCES)
         );
 
-        let expected = b"0.00 0.00\n";
+        let expected = SYSTEM_STAT_CONTENT;
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -25461,7 +25475,7 @@ mod tests {
         let root = TestDir::new();
         let mut state = test_state(&root.0);
         let mut memory = GuestMemory::new(0, state.mmap_limit as usize).unwrap();
-        write_c_string(&mut memory, PATH, "/proc/uptime");
+        write_c_string(&mut memory, PATH, "/proc/stat");
         let fd = syscall_result(
             &mut memory,
             &mut state,
@@ -25554,7 +25568,7 @@ mod tests {
             libc::O_PATH | libc::O_DIRECTORY,
         ] {
             assert_eq!(
-                open_with_flags(&mut memory, &mut state, "/proc/uptime", flags),
+                open_with_flags(&mut memory, &mut state, "/proc/stat", flags),
                 negative_errno(libc::ENOTDIR),
                 "O_DIRECTORY precedence for flags {flags:#x}"
             );
@@ -25564,7 +25578,7 @@ mod tests {
                 open_with_flags(
                     &mut memory,
                     &mut state,
-                    "/proc/uptime",
+                    "/proc/stat",
                     access | libc::O_TRUNC,
                 ),
                 negative_errno(libc::EACCES),
@@ -25575,7 +25589,7 @@ mod tests {
             open_with_flags(
                 &mut memory,
                 &mut state,
-                "/proc/uptime",
+                "/proc/stat",
                 libc::O_RDONLY | libc::O_DIRECT,
             ),
             negative_errno(libc::EINVAL)
@@ -25585,7 +25599,7 @@ mod tests {
         let fd = open_with_flags(
             &mut memory,
             &mut state,
-            "/proc/uptime",
+            "/proc/stat",
             libc::O_RDONLY | retained,
         );
         assert_eq!(fd, 3);
@@ -25601,7 +25615,7 @@ mod tests {
         let fd = open_with_flags(
             &mut memory,
             &mut state,
-            "/proc/uptime",
+            "/proc/stat",
             libc::O_RDONLY | libc::O_NOFOLLOW,
         );
         assert_eq!(fd, 3);
@@ -25621,7 +25635,7 @@ mod tests {
         let fd = open_with_flags(
             &mut memory,
             &mut state,
-            "/proc/uptime",
+            "/proc/stat",
             libc::O_RDONLY | libc::O_DSYNC,
         );
         assert_eq!(fd, 3);
@@ -25640,7 +25654,7 @@ mod tests {
             | libc::O_APPEND
             | libc::O_SYNC
             | libc::O_NONBLOCK;
-        let fd = open_with_flags(&mut memory, &mut state, "/proc/uptime", ignored_with_path);
+        let fd = open_with_flags(&mut memory, &mut state, "/proc/stat", ignored_with_path);
         assert_eq!(fd, 3);
         let observed = syscall_result(
             &mut memory,
@@ -25656,7 +25670,7 @@ mod tests {
         let nofollow = open_with_flags(
             &mut memory,
             &mut state,
-            "/proc/uptime",
+            "/proc/stat",
             ignored_with_path | libc::O_NOFOLLOW,
         );
         assert_eq!(nofollow, 3);
@@ -25727,7 +25741,7 @@ mod tests {
         let cloexec_nofollow = open_with_flags(
             &mut memory,
             &mut state,
-            "/proc/uptime",
+            "/proc/stat",
             libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         );
         assert_eq!(cloexec_nofollow, 5);
@@ -25819,7 +25833,7 @@ mod tests {
         let mut state = test_state(&root.0);
         let mut memory = GuestMemory::new(0, state.mmap_limit as usize).unwrap();
         let ordinary = open_with_flags(&mut memory, &mut state, "ordinary", libc::O_RDONLY);
-        let proc_file = open_readonly(&mut memory, &mut state, "/proc/uptime");
+        let proc_file = open_readonly(&mut memory, &mut state, "/proc/stat");
         assert_eq!((ordinary, proc_file), (3, 4));
 
         let private_tmpfile = (libc::O_TMPFILE & !libc::O_DIRECTORY) as libc::c_int;
@@ -25871,7 +25885,7 @@ mod tests {
         }
 
         for path in [
-            "/proc/uptime".to_owned(),
+            "/proc/stat".to_owned(),
             format!("/proc/self/fdinfo/{ordinary}"),
             format!("/proc/self/fd/{proc_file}"),
         ] {
@@ -26319,7 +26333,7 @@ mod tests {
         let exclusive = plain | libc::O_EXCL as u64;
         let nofollow = plain | libc::O_NOFOLLOW as u64;
 
-        for path in [b"/proc/uptime".as_slice(), b"/proc/mounts"] {
+        for path in [b"/proc/stat".as_slice(), b"/proc/mounts"] {
             for flags in [
                 plain,
                 exclusive,
@@ -26390,13 +26404,13 @@ mod tests {
         for (policy, path, flags, expected) in [
             (
                 RegularCreateDirectoryPolicy::EarlyEinval,
-                "/proc/uptime",
+                "/proc/stat",
                 plain,
                 libc::EINVAL,
             ),
             (
                 RegularCreateDirectoryPolicy::EarlyEinval,
-                "/proc/uptime",
+                "/proc/stat",
                 exclusive,
                 libc::EINVAL,
             ),
@@ -26408,13 +26422,13 @@ mod tests {
             ),
             (
                 RegularCreateDirectoryPolicy::LegacyLookup,
-                "/proc/uptime",
+                "/proc/stat",
                 plain,
                 libc::ENOTDIR,
             ),
             (
                 RegularCreateDirectoryPolicy::LegacyLookup,
-                "/proc/uptime",
+                "/proc/stat",
                 exclusive,
                 libc::EEXIST,
             ),
@@ -26497,7 +26511,7 @@ mod tests {
         state.regular_create_directory_policy = RegularCreateDirectoryPolicy::EarlyEinval;
         let mut memory = GuestMemory::new(0, state.mmap_limit as usize).unwrap();
         let ordinary = open_with_flags(&mut memory, &mut state, "ordinary", libc::O_RDONLY);
-        let proc_file = open_readonly(&mut memory, &mut state, "/proc/uptime");
+        let proc_file = open_readonly(&mut memory, &mut state, "/proc/stat");
         assert_eq!((ordinary, proc_file), (3, 4));
 
         let early = [
@@ -26546,7 +26560,7 @@ mod tests {
             );
         }
         for path in [
-            "/proc/uptime".to_owned(),
+            "/proc/stat".to_owned(),
             format!("/proc/self/fdinfo/{ordinary}"),
             format!("/proc/self/fd/{proc_file}"),
         ] {
@@ -26599,7 +26613,7 @@ mod tests {
         let root = TestDir::new();
         let mut state = test_state(&root.0);
         let mut memory = GuestMemory::new(0, state.mmap_limit as usize).unwrap();
-        let fd = open_with_flags(&mut memory, &mut state, "/proc/uptime", libc::O_PATH);
+        let fd = open_with_flags(&mut memory, &mut state, "/proc/stat", libc::O_PATH);
         let shared = FileTableState::try_from_elf(&state).unwrap();
         assert!(shared.installed_matches(&state));
         // Installing over an equal state keeps every entry and its host fd.
@@ -26669,10 +26683,10 @@ mod tests {
         let marked = open_with_flags(
             &mut memory,
             &mut state,
-            "/proc/uptime",
+            "/proc/stat",
             libc::O_PATH | libc::O_NOFOLLOW,
         );
-        let unmarked = open_with_flags(&mut memory, &mut state, "/proc/uptime", libc::O_PATH);
+        let unmarked = open_with_flags(&mut memory, &mut state, "/proc/stat", libc::O_PATH);
         assert_eq!((marked, unmarked), (3, 4));
 
         let marked_copy = syscall_result(
@@ -26764,7 +26778,7 @@ mod tests {
         assert!(!state.files.contains_key(&next_fd));
         state.synthetic_proc_nofollow_fds.insert(next_fd);
 
-        let fd = open_with_flags(&mut memory, &mut state, "/proc/uptime", libc::O_RDONLY);
+        let fd = open_with_flags(&mut memory, &mut state, "/proc/stat", libc::O_RDONLY);
         assert_eq!(fd, i64::from(next_fd));
         assert!(state.proc_files.contains_key(&next_fd));
         assert!(
@@ -26790,7 +26804,7 @@ mod tests {
         let root = TestDir::new();
         let mut state = test_state(&root.0);
         let mut memory = GuestMemory::new(0, state.mmap_limit as usize).unwrap();
-        write_c_string(&mut memory, PATH, "/proc/uptime");
+        write_c_string(&mut memory, PATH, "/proc/stat");
         let fd = syscall_result(
             &mut memory,
             &mut state,
@@ -26842,7 +26856,7 @@ mod tests {
         );
         let mut shared_offset = [0; 3];
         memory.read(BUFFER, &mut shared_offset).unwrap();
-        assert_eq!(&shared_offset, b"00 ");
+        assert_eq!(&shared_offset, b"u  ");
 
         write_c_string(&mut memory, PATH, &format!("/proc/self/fd/{fd}"));
         let reopened = syscall_result(
@@ -26870,7 +26884,7 @@ mod tests {
         );
         let mut fresh_offset = [0; 2];
         memory.read(BUFFER, &mut fresh_offset).unwrap();
-        assert_eq!(&fresh_offset, b"0.");
+        assert_eq!(&fresh_offset, b"cp");
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -26993,11 +27007,11 @@ mod tests {
         );
         state
             .proc_files
-            .insert(3, synthetic_proc_inode(b"/proc/uptime"));
+            .insert(3, synthetic_proc_inode(b"/proc/stat"));
         let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
         write_c_string(&mut memory, PATH, "/proc/self/fd/3");
 
-        let native_source = std::fs::File::open("/proc/uptime").unwrap();
+        let native_source = std::fs::File::open("/proc/stat").unwrap();
         let native_procfd = format!("/proc/self/fd/{}", native_source.as_raw_fd());
         // SAFETY: geteuid has no arguments or memory-safety preconditions.
         if unsafe { libc::geteuid() } != 0 {
@@ -27672,7 +27686,7 @@ mod tests {
             [1, 0, 0, 0, 0, 0],
         );
         assert!(alias >= 3);
-        let proc_file = open_readonly(&mut memory, &mut state, "/proc/uptime");
+        let proc_file = open_readonly(&mut memory, &mut state, "/proc/stat");
         let proc_root = open_readonly(&mut memory, &mut state, "/proc");
         assert!(proc_file >= 3 && proc_root >= 3);
 
@@ -27717,13 +27731,13 @@ mod tests {
                 (stat.st_dev, stat.st_ino),
                 (
                     synthetic_dev(SYNTHETIC_PROC_DEV_MINOR),
-                    synthetic_proc_inode(b"/proc/uptime")
+                    synthetic_proc_inode(b"/proc/stat")
                 )
             );
             assert_eq!(stat.st_mode, libc::S_IFREG | 0o444);
             assert_eq!(
                 (stat.st_size, stat.st_uid, stat.st_gid, stat.st_mtime),
-                (b"0.00 0.00\n".len() as libc::off_t, 0, 0, 0)
+                (SYSTEM_STAT_CONTENT.len() as libc::off_t, 0, 0, 0)
             );
 
             let sentinel = [0xa5; std::mem::size_of::<libc::statfs>()];
@@ -27951,7 +27965,7 @@ mod tests {
         let mut memory = GuestMemory::new(0, 0x4000).unwrap();
 
         // fstat of an open synthetic descriptor reports synthesized identity.
-        let fd = open_readonly(&mut memory, &mut state, "/proc/uptime");
+        let fd = open_readonly(&mut memory, &mut state, "/proc/stat");
         let stat_address = 0x1000;
         assert_eq!(
             syscall_result(
@@ -27964,14 +27978,14 @@ mod tests {
         );
         let stat: libc::stat = read_struct(&memory, stat_address);
         assert_eq!(stat.st_mode, libc::S_IFREG | 0o444);
-        assert_eq!(stat.st_ino, synthetic_proc_inode(b"/proc/uptime"));
+        assert_eq!(stat.st_ino, synthetic_proc_inode(b"/proc/stat"));
         assert_eq!(stat.st_dev, synthetic_dev(SYNTHETIC_PROC_DEV_MINOR));
-        assert_eq!(stat.st_size, b"0.00 0.00\n".len() as libc::off_t);
+        assert_eq!(stat.st_size, SYSTEM_STAT_CONTENT.len() as libc::off_t);
         assert_eq!(stat.st_uid, 0);
         assert_eq!(stat.st_mtime, 0);
 
         // A path-addressed newfstatat yields the identical synthetic identity.
-        write_c_string(&mut memory, 0x100, "/proc/uptime");
+        write_c_string(&mut memory, 0x100, "/proc/stat");
         let path_stat_address = 0x1200;
         assert_eq!(
             syscall_result(
@@ -28129,7 +28143,7 @@ mod tests {
         let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
 
         // A writable open of a synthetic file is refused.
-        write_c_string(&mut memory, 0x100, "/proc/uptime");
+        write_c_string(&mut memory, 0x100, "/proc/stat");
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -28164,7 +28178,7 @@ mod tests {
         assert!(synthetic_proc_content(&state, b"/proc/self/smaps").is_none());
         assert!(synthetic_proc_content(&state, b"/etc/passwd").is_none());
 
-        let fd = open_readonly(&mut memory, &mut state, "/proc/uptime");
+        let fd = open_readonly(&mut memory, &mut state, "/proc/stat");
         assert!(fd >= 0);
         assert_eq!(
             syscall_result(
@@ -28177,7 +28191,7 @@ mod tests {
         );
     }
 
-    /// Detcore renders these six files on every backend (Hermit's fixed
+    /// Detcore renders these seven files on every backend (Hermit's fixed
     /// procfs tables), so the KVM executor no longer has a copy: no synthetic
     /// content, no synthetic inode, and a direct open from a guest that runs
     /// without the Tool meets the real-procfs refusal instead of a second,
@@ -28194,6 +28208,7 @@ mod tests {
             "/proc/vmstat",
             "/proc/sys/kernel/osrelease",
             "/proc/loadavg",
+            "/proc/uptime",
         ] {
             assert!(
                 synthetic_proc_content(&state, path.as_bytes()).is_none(),
@@ -42445,7 +42460,7 @@ mod tests {
     }
 
     fn fdinfo_content_unsupported_targets(fixture: &mut FdinfoFixture) -> Vec<(&'static str, i64)> {
-        let synthetic_proc = fixture.open("/proc/uptime", libc::O_RDONLY);
+        let synthetic_proc = fixture.open("/proc/stat", libc::O_RDONLY);
         let random = fixture.open("/dev/urandom", libc::O_RDONLY);
         fixture.memory.write(0x300, &0_u64.to_ne_bytes()).unwrap();
         let signalfd = fixture.call(
@@ -45554,7 +45569,7 @@ mod tests {
             }
         }
 
-        let proc_fd = open_readonly(&mut memory, &mut state, "/proc/uptime");
+        let proc_fd = open_readonly(&mut memory, &mut state, "/proc/stat");
         assert!(proc_fd >= 0);
         assert_eq!(
             syscall_result(
@@ -46455,7 +46470,7 @@ mod tests {
     fn host_metadata_timestamps_keep_virtual_files_fixed_through_every_alias() {
         const LOGINUID_ADDRESS: u64 = 0x100;
         const FREQUENCY_ADDRESS: u64 = 0x140;
-        const UPTIME_ADDRESS: u64 = 0x180;
+        const SYSTEM_STAT_ADDRESS: u64 = 0x180;
         const PAIR_FDS: u64 = 0x1c0;
         const REOPEN_ADDRESS: u64 = 0x340;
         const SEND_SEGMENT: u64 = 0x400;
@@ -46477,7 +46492,7 @@ mod tests {
             FREQUENCY_ADDRESS,
             "/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq",
         );
-        write_c_string(&mut memory, UPTIME_ADDRESS, "/proc/uptime");
+        write_c_string(&mut memory, SYSTEM_STAT_ADDRESS, "/proc/stat");
 
         let open = |memory: &mut GuestMemory, state: &mut LoadedStaticElf, path: u64| {
             let fd = syscall_result(
@@ -46491,9 +46506,9 @@ mod tests {
         };
         let loginuid = open(&mut memory, &mut state, LOGINUID_ADDRESS);
         let frequency = open(&mut memory, &mut state, FREQUENCY_ADDRESS);
-        let uptime = open(&mut memory, &mut state, UPTIME_ADDRESS);
+        let system_stat = open(&mut memory, &mut state, SYSTEM_STAT_ADDRESS);
         // loginuid and the CPU frequency are the backend's virtual files;
-        // uptime is a synthetic /proc file.
+        // /proc/stat is a synthetic /proc file.
         for fd in [loginuid, frequency] {
             assert_eq!(
                 state.fd_object_inodes[&fd].timestamps,
@@ -46501,7 +46516,7 @@ mod tests {
             );
         }
         assert_eq!(
-            state.fd_object_inodes[&uptime].timestamps,
+            state.fd_object_inodes[&system_stat].timestamps,
             IdentityTimestamps::ProcSnapshot
         );
 
@@ -46518,7 +46533,7 @@ mod tests {
                 DETERMINISTIC_METADATA_SECONDS,
                 "cpu0 scaling_cur_freq",
             ),
-            (uptime, 0, "/proc/uptime"),
+            (system_stat, 0, "/proc/stat"),
         ];
         let mut aliases = Vec::new();
         for (fd, fixed, name) in carriers {
@@ -47016,7 +47031,7 @@ mod tests {
 
     #[test]
     fn host_metadata_timestamps_keep_received_proc_snapshots_at_the_epoch() {
-        const UPTIME_ADDRESS: u64 = 0x100;
+        const SYSTEM_STAT_ADDRESS: u64 = 0x100;
 
         for host_metadata_timestamps in [false, true] {
             let root = TestDir::new();
@@ -47037,27 +47052,27 @@ mod tests {
                 "setting off"
             };
             let mut memory = GuestMemory::new(0, 0x4000).unwrap();
-            write_c_string(&mut memory, UPTIME_ADDRESS, "/proc/uptime");
-            let uptime = syscall_result(
+            write_c_string(&mut memory, SYSTEM_STAT_ADDRESS, "/proc/stat");
+            let system_stat = syscall_result(
                 &mut memory,
                 &mut state,
                 libc::SYS_openat,
                 [
                     libc::AT_FDCWD as u64,
-                    UPTIME_ADDRESS,
+                    SYSTEM_STAT_ADDRESS,
                     libc::O_RDONLY as u64,
                     0,
                     0,
                     0,
                 ],
             );
-            assert!(uptime >= 0, "open /proc/uptime failed: {uptime}");
-            let uptime = uptime as libc::c_int;
+            assert!(system_stat >= 0, "open /proc/stat failed: {system_stat}");
+            let system_stat = system_stat as libc::c_int;
             let [sender, receiver] = guest_datagram_pair(&mut memory, &mut state);
 
             // Received while the sender's descriptor is still open.
             assert_eq!(
-                send_guest_rights(&mut memory, &mut state, sender, &[uptime]),
+                send_guest_rights(&mut memory, &mut state, sender, &[system_stat]),
                 1
             );
             let (result, _, received) =
@@ -47069,7 +47084,7 @@ mod tests {
                 &mut state,
                 received[0],
                 fixed,
-                &format!("{setting}: /proc/uptime received while the sender is open"),
+                &format!("{setting}: /proc/stat received while the sender is open"),
             );
             let duplicate = syscall_result(
                 &mut memory,
@@ -47083,15 +47098,15 @@ mod tests {
                 &mut state,
                 duplicate as libc::c_int,
                 fixed,
-                &format!("{setting}: a dup of the received /proc/uptime"),
+                &format!("{setting}: a dup of the received /proc/stat"),
             );
 
             // Received after every other descriptor for it has closed.
             assert_eq!(
-                send_guest_rights(&mut memory, &mut state, sender, &[uptime]),
+                send_guest_rights(&mut memory, &mut state, sender, &[system_stat]),
                 1
             );
-            for fd in [uptime, received[0], duplicate as libc::c_int] {
+            for fd in [system_stat, received[0], duplicate as libc::c_int] {
                 guest_close(&mut memory, &mut state, fd);
             }
             let (result, _, late) =
@@ -47103,7 +47118,7 @@ mod tests {
                 &mut state,
                 late[0],
                 fixed,
-                &format!("{setting}: /proc/uptime received after the sender closed"),
+                &format!("{setting}: /proc/stat received after the sender closed"),
             );
             let mut child = state.try_clone_for_fork(2).unwrap();
             assert_fixed_descriptor_timestamps(
@@ -47111,7 +47126,7 @@ mod tests {
                 &mut child,
                 late[0],
                 fixed,
-                &format!("{setting}: the received /proc/uptime in a forked child"),
+                &format!("{setting}: the received /proc/stat in a forked child"),
             );
 
             // An O_PATH snapshot cannot report its seals itself; received after
@@ -47122,17 +47137,14 @@ mod tests {
                 libc::SYS_openat,
                 [
                     libc::AT_FDCWD as u64,
-                    UPTIME_ADDRESS,
+                    SYSTEM_STAT_ADDRESS,
                     (libc::O_PATH | libc::O_CLOEXEC) as u64,
                     0,
                     0,
                     0,
                 ],
             );
-            assert!(
-                path_only >= 0,
-                "O_PATH open /proc/uptime failed: {path_only}"
-            );
+            assert!(path_only >= 0, "O_PATH open /proc/stat failed: {path_only}");
             let path_only = path_only as libc::c_int;
             assert_eq!(
                 send_guest_rights(&mut memory, &mut state, sender, &[path_only]),
@@ -47148,7 +47160,7 @@ mod tests {
                 &mut state,
                 received_path[0],
                 fixed,
-                &format!("{setting}: an O_PATH /proc/uptime received after the sender closed"),
+                &format!("{setting}: an O_PATH /proc/stat received after the sender closed"),
             );
         }
     }
@@ -47321,7 +47333,7 @@ mod tests {
     #[test]
     fn host_metadata_timestamps_refuse_mode_changes_that_would_hide_a_carrier() {
         const LOGINUID_ADDRESS: u64 = 0x100;
-        const UPTIME_ADDRESS: u64 = 0x180;
+        const SYSTEM_STAT_ADDRESS: u64 = 0x180;
         const FREQUENCY_ADDRESS: u64 = 0x200;
         const EMPTY_ADDRESS: u64 = 0x2c0;
         const LINK_ADDRESS: u64 = 0x300;
@@ -47337,7 +47349,7 @@ mod tests {
             state.host_metadata_timestamps = host_metadata_timestamps;
             let mut memory = GuestMemory::new(0, 0x4000).unwrap();
             write_c_string(&mut memory, LOGINUID_ADDRESS, "/proc/self/loginuid");
-            write_c_string(&mut memory, UPTIME_ADDRESS, "/proc/uptime");
+            write_c_string(&mut memory, SYSTEM_STAT_ADDRESS, "/proc/stat");
             write_c_string(
                 &mut memory,
                 FREQUENCY_ADDRESS,
@@ -47367,12 +47379,12 @@ mod tests {
             let frequency = open(&mut memory, &mut state, FREQUENCY_ADDRESS, libc::O_RDONLY);
             // A /proc snapshot received after its sender closed has no
             // proc_files entry, only its snapshot identity.
-            let uptime = open(&mut memory, &mut state, UPTIME_ADDRESS, libc::O_RDONLY);
+            let system_stat = open(&mut memory, &mut state, SYSTEM_STAT_ADDRESS, libc::O_RDONLY);
             assert_eq!(
-                send_guest_rights(&mut memory, &mut state, sender, &[uptime]),
+                send_guest_rights(&mut memory, &mut state, sender, &[system_stat]),
                 1
             );
-            guest_close(&mut memory, &mut state, uptime);
+            guest_close(&mut memory, &mut state, system_stat);
             let (result, _, snapshot) =
                 receive_guest_rights(&mut memory, &mut state, receiver, RIGHTS_CONTROL_CAPACITY);
             assert_eq!(result, 1);
@@ -47391,7 +47403,7 @@ mod tests {
                     DETERMINISTIC_METADATA_SECONDS,
                     "cpu0 scaling_cur_freq",
                 ),
-                (snapshot, 0, "a received /proc/uptime"),
+                (snapshot, 0, "a received /proc/stat"),
             ] {
                 if !host_metadata_timestamps {
                     assert_eq!(
@@ -47898,7 +47910,7 @@ mod tests {
         const TEST: &str =
             "executor::tests::received_o_path_carriers_keep_their_class_when_descriptors_run_out";
         const LOGINUID_ADDRESS: u64 = 0x100;
-        const UPTIME_ADDRESS: u64 = 0x180;
+        const SYSTEM_STAT_ADDRESS: u64 = 0x180;
         if !in_descriptor_exhaustion_child(TEST) {
             return;
         }
@@ -47908,11 +47920,11 @@ mod tests {
         state.host_metadata_timestamps = true;
         let mut memory = GuestMemory::new(0, 0x4000).unwrap();
         write_c_string(&mut memory, LOGINUID_ADDRESS, "/proc/self/loginuid");
-        write_c_string(&mut memory, UPTIME_ADDRESS, "/proc/uptime");
+        write_c_string(&mut memory, SYSTEM_STAT_ADDRESS, "/proc/stat");
         let mut carriers = Vec::new();
         for (path, class) in [
             (LOGINUID_ADDRESS, IdentityTimestamps::VirtualFile),
-            (UPTIME_ADDRESS, IdentityTimestamps::ProcSnapshot),
+            (SYSTEM_STAT_ADDRESS, IdentityTimestamps::ProcSnapshot),
         ] {
             let fd = syscall_result(
                 &mut memory,
@@ -58011,7 +58023,7 @@ mod tests {
             (LINK, "link"),
             (MISSING, "missing"),
             (EMPTY, ""),
-            (SYNTHETIC_PROC, "/proc/uptime"),
+            (SYNTHETIC_PROC, "/proc/stat"),
         ] {
             write_c_string(&mut memory, address, value);
         }
@@ -58824,7 +58836,7 @@ mod tests {
         let mut memory = GuestMemory::new(0, 2 * PAGE_SIZE as usize).unwrap();
         let proc_directory_fd = open_readonly(&mut memory, &mut state, "/proc");
         assert!(proc_directory_fd >= 0);
-        let proc_file_fd = open_readonly(&mut memory, &mut state, "/proc/uptime");
+        let proc_file_fd = open_readonly(&mut memory, &mut state, "/proc/stat");
         assert!(proc_file_fd >= 0);
         write_c_string(&mut memory, EMPTY, "");
         write_c_string(&mut memory, CHILD, "child/");
