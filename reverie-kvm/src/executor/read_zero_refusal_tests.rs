@@ -79,7 +79,7 @@ mod read_zero_refusal_tests {
                         };
                         assert_eq!(retained.as_raw_fd(), raw);
                         assert_eq!(file_status_flags(retained).unwrap(), flags);
-                        assert_eq!(state.fd_entry_ids, entries);
+                        assert!(same_entries(&state.fd_entry_ids, &entries));
                         assert_read_zero_canaries(&memory);
                     }
                 }
@@ -127,14 +127,14 @@ mod read_zero_refusal_tests {
                         assert_eq!(flags & libc::O_NONBLOCK != 0, nonblocking);
                         assert_eq!(file_mode(&file).unwrap() & libc::S_IFMT, libc::S_IFSOCK);
                         let mut state = test_state(&std::env::current_dir().unwrap());
-                        let entry_id = Arc::new(());
                         let fd = if inherited {
                             state.stdin = Some(file);
-                            state.stdin_entry_id = entry_id.clone();
+                            state.stdin_entry_id = Arc::new(());
                             0
                         } else {
                             state.files.insert(3, file);
-                            state.fd_entry_ids.insert(3, entry_id.clone());
+                            state.fd_entry_ids
+                                .insert(3, Arc::new(crate::elf::FdEntry::default()));
                             3
                         };
                         let entries = state.fd_entry_ids.clone();

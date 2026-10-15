@@ -2381,7 +2381,7 @@ pub(crate) struct FileTableState {
     stdin: Option<std::fs::File>,
     stdin_entry_id: Arc<()>,
     files: std::collections::BTreeMap<i32, std::fs::File>,
-    fd_entry_ids: std::collections::BTreeMap<i32, Arc<()>>,
+    fd_entry_ids: std::collections::BTreeMap<i32, Arc<crate::elf::FdEntry>>,
     epoll_domain: Arc<Mutex<EpollDomain>>,
     poll_table_id: Arc<NativePollTable>,
     native_poll_fds: std::collections::BTreeMap<i32, Arc<NativePollBinding>>,
@@ -8271,6 +8271,39 @@ fn ensure_readable_fd(fd: RawFd) -> Result<(), i64> {
     Ok(())
 }
 
+/// `ensure_writable`, with the access mode recorded on `entry` when there is
+/// one (it cannot change for the entry's description).
+fn ensure_writable_entry(
+    entry: Option<&crate::elf::FdEntry>,
+    file: &std::fs::File,
+) -> Result<(), i64> {
+    let Some(entry) = entry else {
+        return ensure_writable(file);
+    };
+    let flags = entry.access(|| file_status_flags(file))?;
+    if flags & libc::O_PATH != 0 || flags & libc::O_ACCMODE == libc::O_RDONLY {
+        Err(negative_errno(libc::EBADF))
+    } else {
+        Ok(())
+    }
+}
+
+/// `ensure_read_capable`, with the access mode and the read-capability probe
+/// recorded on `entry` when there is one.
+fn ensure_read_capable_entry(
+    entry: Option<&crate::elf::FdEntry>,
+    file: &std::fs::File,
+) -> Result<(), i64> {
+    let Some(entry) = entry else {
+        return ensure_read_capable(file);
+    };
+    let flags = entry.access(|| file_status_flags(file))?;
+    if flags & libc::O_PATH != 0 || flags & libc::O_ACCMODE == libc::O_WRONLY {
+        return Err(negative_errno(libc::EBADF));
+    }
+    entry.read_capable(|| read_capability_probe(file))
+}
+
 fn ensure_writable(file: &std::fs::File) -> Result<(), i64> {
     ensure_writable_fd(file.as_raw_fd())
 }
@@ -8445,6 +8478,10 @@ fn resolve_exec_shebang(
 
 fn ensure_read_capable(file: &std::fs::File) -> Result<(), i64> {
     ensure_read_access(file)?;
+    read_capability_probe(file)
+}
+
+fn read_capability_probe(file: &std::fs::File) -> Result<(), i64> {
     // A zero-iovec readv tests FMODE_CAN_READ without consuming input or
     // invoking the descriptor's file-specific read implementation.
     let result = unsafe { libc::readv(file.as_raw_fd(), std::ptr::null::<libc::iovec>(), 0) };
@@ -8479,8 +8516,12 @@ fn write(
     } else {
         state.files.get(&fd)
     };
+    let entry = (!standard)
+        .then(|| state.fd_entry_ids.get(&fd))
+        .flatten()
+        .map(|entry| &**entry);
     if let Some(descriptor) = descriptor
-        && let Err(error) = ensure_writable(descriptor)
+        && let Err(error) = ensure_writable_entry(entry, descriptor)
     {
         return error;
     }
@@ -9179,14 +9220,19 @@ fn read(
         }
         return Ok(host_read_zero(file.as_raw_fd(), args[1]));
     }
-    if let Err(error) = ensure_read_capable(file) {
+    let entry = state.fd_entry_ids.get(&fd).map(|entry| &**entry);
+    if let Err(error) = ensure_read_capable_entry(entry, file) {
         return Ok(error);
     }
     let host_fd = file.as_raw_fd();
     // ensure_readable without its second access-mode query, which
-    // ensure_read_capable just made. The mode also serves the inotify probe
-    // below, so this read makes one fstat where it made two.
-    let mode = match fd_mode(host_fd) {
+    // ensure_read_capable just made. The file type also serves the inotify
+    // probe below; it is recorded on the entry, so a later read of this
+    // description makes no fstat.
+    let mode = match entry.map_or_else(
+        || fd_mode(host_fd),
+        |entry| entry.file_type(|| fd_mode(host_fd)),
+    ) {
         Ok(mode) => mode,
         Err(error) => return Ok(error),
     };
@@ -22879,6 +22925,113 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;
+
+    /// An entry records each fact from its first successful probe and reuses
+    /// it; a failing probe is not recorded, so it runs again and reports the
+    /// same error.
+    #[test]
+    fn a_descriptor_entry_records_only_successful_probes() {
+        use std::cell::Cell;
+        let entry = crate::elf::FdEntry::default();
+        let probes = Cell::new(0);
+        let failing = || {
+            probes.set(probes.get() + 1);
+            Err(negative_errno(libc::EBADF))
+        };
+        for _ in 0..2 {
+            assert_eq!(entry.access(failing), Err(negative_errno(libc::EBADF)));
+        }
+        assert_eq!(probes.get(), 2, "a failed access probe was recorded");
+        let flags = || {
+            probes.set(probes.get() + 1);
+            Ok(libc::O_WRONLY | libc::O_NONBLOCK | libc::O_APPEND)
+        };
+        for _ in 0..3 {
+            // Only the access mode and O_PATH bits are kept: O_NONBLOCK and
+            // O_APPEND can change with F_SETFL.
+            assert_eq!(entry.access(flags), Ok(libc::O_WRONLY));
+        }
+        assert_eq!(probes.get(), 3, "the access probe ran again");
+        let mode = || {
+            probes.set(probes.get() + 1);
+            Ok(libc::S_IFIFO | 0o600)
+        };
+        for _ in 0..3 {
+            assert_eq!(entry.file_type(mode), Ok(libc::S_IFIFO));
+        }
+        assert_eq!(probes.get(), 4, "the file type probe ran again");
+        let refused = || {
+            probes.set(probes.get() + 1);
+            Err(negative_errno(libc::EINVAL))
+        };
+        assert_eq!(
+            entry.read_capable(refused),
+            Err(negative_errno(libc::EINVAL))
+        );
+        let capable = || {
+            probes.set(probes.get() + 1);
+            Ok(())
+        };
+        for _ in 0..3 {
+            assert_eq!(entry.read_capable(capable), Ok(()));
+        }
+        assert_eq!(probes.get(), 6, "the read-capability probe ran again");
+    }
+
+    /// Replacing a descriptor installs a new entry, so facts recorded for the
+    /// old description do not answer for the new one: a write-only pipe end
+    /// replaced by its read end refuses writes, and a read through the
+    /// replacement probes again.
+    #[test]
+    fn a_replaced_descriptor_does_not_keep_the_old_descriptions_facts() {
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut fds = [-1; 2];
+        // SAFETY: fds has room for both descriptors.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        // SAFETY: pipe2 returned two owned descriptors.
+        let (read_end, write_end) = unsafe {
+            (
+                std::fs::File::from_raw_fd(fds[0]),
+                std::fs::File::from_raw_fd(fds[1]),
+            )
+        };
+        let read_copy = read_end.try_clone().unwrap();
+        state.insert_file(7, write_end);
+        let entry = state.fd_entry_ids[&7].clone();
+        assert_eq!(
+            ensure_writable_entry(Some(&entry), &state.files[&7]),
+            Ok(())
+        );
+        assert_eq!(
+            ensure_read_capable_entry(Some(&entry), &state.files[&7]),
+            Err(negative_errno(libc::EBADF))
+        );
+        drop(state.insert_file(7, read_copy));
+        let replacement = state.fd_entry_ids[&7].clone();
+        assert!(!Arc::ptr_eq(&entry, &replacement));
+        assert_eq!(
+            ensure_writable_entry(Some(&replacement), &state.files[&7]),
+            Err(negative_errno(libc::EBADF))
+        );
+        assert_eq!(
+            ensure_read_capable_entry(Some(&replacement), &state.files[&7]),
+            Ok(())
+        );
+        drop(read_end);
+    }
+
+    /// Whether two descriptor-entry tables name the same entries: the same
+    /// descriptors, each with the very same entry (not merely an equal one).
+    pub(super) fn same_entries(
+        a: &std::collections::BTreeMap<i32, Arc<crate::elf::FdEntry>>,
+        b: &std::collections::BTreeMap<i32, Arc<crate::elf::FdEntry>>,
+    ) -> bool {
+        a.len() == b.len()
+            && a.iter()
+                .zip(b)
+                .all(|((fd, a), (other, b))| fd == other && Arc::ptr_eq(a, b))
+    }
 
     use reverie::syscalls::AddrMut;
     use reverie::syscalls::MemoryAccess;
@@ -50785,7 +50938,7 @@ mod tests {
                                 state.files.get(&3)
                             };
                             assert_eq!(retained.map(AsRawFd::as_raw_fd), raw);
-                            assert_eq!(state.fd_entry_ids, entry_ids);
+                            assert!(same_entries(&state.fd_entry_ids, &entry_ids));
                             assert_read_zero_canaries(&memory);
                             registry.teardown_result().unwrap();
                             registry.rearm_after_exec();

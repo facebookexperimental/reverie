@@ -861,6 +861,64 @@ impl Drop for StagedFile {
     }
 }
 
+/// A guest descriptor entry: its identity in the file table (replaced by
+/// every insertion, see [`LoadedStaticElf::insert_file`]), and what probing
+/// its open file description has shown. Each fact is a property Linux fixes
+/// when the description is opened, so it holds for as long as this entry
+/// stands: the access mode and `O_PATH` (`F_GETFL`), the file type
+/// (`fstat`), and whether the description can be read at all
+/// (`FMODE_CAN_READ`, which a zero-iovec `readv` tests). Each is recorded
+/// only from a successful probe; a failing probe is repeated, so its error
+/// is reported as before.
+#[derive(Debug, Default)]
+pub(crate) struct FdEntry {
+    access: std::sync::OnceLock<libc::c_int>,
+    file_type: std::sync::OnceLock<libc::mode_t>,
+    read_capable: std::sync::OnceLock<()>,
+}
+
+impl FdEntry {
+    /// The access mode and `O_PATH` bits of `F_GETFL` (`probe`) for this
+    /// entry's host descriptor.
+    pub(crate) fn access(
+        &self,
+        probe: impl FnOnce() -> std::result::Result<libc::c_int, i64>,
+    ) -> std::result::Result<libc::c_int, i64> {
+        if let Some(access) = self.access.get() {
+            return Ok(*access);
+        }
+        let access = probe()? & (libc::O_ACCMODE | libc::O_PATH);
+        Ok(*self.access.get_or_init(|| access))
+    }
+
+    /// The file type bits (`S_IFMT`) of `fstat` (`probe`) for this entry's
+    /// host descriptor.
+    pub(crate) fn file_type(
+        &self,
+        probe: impl FnOnce() -> std::result::Result<libc::mode_t, i64>,
+    ) -> std::result::Result<libc::mode_t, i64> {
+        if let Some(file_type) = self.file_type.get() {
+            return Ok(*file_type);
+        }
+        let file_type = probe()? & libc::S_IFMT;
+        Ok(*self.file_type.get_or_init(|| file_type))
+    }
+
+    /// Runs the read-capability `probe` unless it has already succeeded for
+    /// this entry.
+    pub(crate) fn read_capable(
+        &self,
+        probe: impl FnOnce() -> std::result::Result<(), i64>,
+    ) -> std::result::Result<(), i64> {
+        if self.read_capable.get().is_some() {
+            return Ok(());
+        }
+        probe()?;
+        self.read_capable.get_or_init(|| ());
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct LoadedStaticElf {
     pub entry_point: u64,
@@ -1018,7 +1076,7 @@ pub(crate) struct LoadedStaticElf {
     /// Identity of each descriptor entry, independent of its filesystem object.
     /// Insertion, including a dup destination, creates a new identity. Table
     /// snapshots and fork copies retain it so unchanged host handles stay stable.
-    pub fd_entry_ids: std::collections::BTreeMap<i32, std::sync::Arc<()>>,
+    pub fd_entry_ids: std::collections::BTreeMap<i32, std::sync::Arc<FdEntry>>,
     pub(crate) epoll_domain: std::sync::Arc<std::sync::Mutex<crate::executor::EpollDomain>>,
     pub(crate) poll_table_id: std::sync::Arc<crate::executor::NativePollTable>,
     pub(crate) native_poll_fds:
@@ -1093,7 +1151,8 @@ impl LoadedStaticElf {
         if fd == libc::STDIN_FILENO {
             retired.extend(self.take_stdin());
         }
-        self.fd_entry_ids.insert(fd, std::sync::Arc::new(()));
+        self.fd_entry_ids
+            .insert(fd, std::sync::Arc::new(FdEntry::default()));
         retired
     }
 

@@ -44,7 +44,7 @@ struct ReadZeroEntry {
     raw: i32,
     status_flags: i32,
     descriptor_flags: i32,
-    entry: Arc<()>,
+    entry: Arc<crate::elf::FdEntry>,
     object: Option<Arc<GuestFileIdentity>>,
     cloexec: bool,
     closed_standard: bool,
