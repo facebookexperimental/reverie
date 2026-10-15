@@ -20026,6 +20026,52 @@ pub(crate) fn place_mapping(
     })
 }
 
+/// Linux x86-64's TASK_SIZE with four-level paging: the end of the user
+/// address space a fixed mapping must fit below.
+const TASK_SIZE: u64 = 0x7fff_ffff_f000;
+
+/// `__get_unmapped_area`'s refusals of a fixed mapping (MAP_FIXED or
+/// MAP_FIXED_NOREPLACE) of page-aligned `length` at `address`, in its order:
+/// a range past TASK_SIZE (ENOMEM), then an unaligned address (EINVAL).
+pub(crate) fn fixed_mapping_address_error(fixed: bool, address: u64, length: u64) -> Option<i32> {
+    if !fixed {
+        return None;
+    }
+    if length > TASK_SIZE || address > TASK_SIZE - length {
+        return Some(libc::ENOMEM);
+    }
+    (!address.is_multiple_of(PAGE_SIZE)).then_some(libc::EINVAL)
+}
+
+/// MAP_FIXED_NOREPLACE's refusals once the range is known to be one KVM can
+/// back, before the limits of KVM's own allocator: a file mapping's bad or
+/// `O_PATH` descriptor (EBADF, which Linux looks up first); any page of the
+/// physical range `address..end` already mapped (`find_vma_intersection`,
+/// EEXIST), a stack page above the mapping range included; then
+/// MAP_SHARED_VALIDATE, which refuses MAP_FIXED_NOREPLACE as a flag outside
+/// `LEGACY_MAP_MASK` (EOPNOTSUPP).
+pub(crate) fn noreplace_error(
+    memory: &GuestMemory,
+    state: &LoadedStaticElf,
+    args: &[u64; 6],
+    address: u64,
+    end: u64,
+) -> Option<i32> {
+    if args[3] & libc::MAP_ANONYMOUS as u64 == 0 {
+        let Some(file) = state.files.get(&(args[4] as libc::c_int)) else {
+            return Some(libc::EBADF);
+        };
+        if file_status_flags(file).is_ok_and(|status| status & libc::O_PATH != 0) {
+            return Some(libc::EBADF);
+        }
+    }
+    if memory.find_unmapped_user_range(address, end, end - address) != Some(address) {
+        return Some(libc::EEXIST);
+    }
+    (args[3] & libc::MAP_TYPE as u64 == libc::MAP_SHARED_VALIDATE as u64)
+        .then_some(libc::EOPNOTSUPP)
+}
+
 fn mmap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
     if args[3] & libc::MAP_ANONYMOUS as u64 == 0
         && let Some(random) = state.random_device_descriptions.get(&(args[4] as i32))
@@ -20050,12 +20096,16 @@ fn mmap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) 
     let Some(length) = align_up(args[1], PAGE_SIZE) else {
         return negative_errno(libc::ENOMEM);
     };
-    let fixed = flags & libc::MAP_FIXED as u64 != 0;
-    if fixed && !args[0].is_multiple_of(PAGE_SIZE) {
-        return negative_errno(libc::EINVAL);
-    }
+    // MAP_FIXED_NOREPLACE maps exactly at the address, as MAP_FIXED does,
+    // but fails with EEXIST rather than replace anything there (do_mmap).
+    let noreplace = flags & libc::MAP_FIXED_NOREPLACE as u64 != 0;
+    let fixed = flags & libc::MAP_FIXED as u64 != 0 || noreplace;
+    // x86-64's sys_mmap refuses an unaligned offset before anything else.
     if !is_anonymous && !args[5].is_multiple_of(PAGE_SIZE) {
         return negative_errno(libc::EINVAL);
+    }
+    if let Some(errno) = fixed_mapping_address_error(fixed, args[0], length) {
+        return negative_errno(errno);
     }
     if !is_anonymous && signalfd_mask(state, args[4] as libc::c_int).is_some() {
         // Do not expose the non-mappable eventfd carrier's ESPIPE result.
@@ -20090,6 +20140,9 @@ fn mmap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) 
     let Some(end) = address.checked_add(length) else {
         return negative_errno(libc::ENOMEM);
     };
+    if noreplace && let Some(errno) = noreplace_error(memory, state, args, address, end) {
+        return negative_errno(errno);
+    }
     if address < BOOT_RESERVED_END || end > state.mmap_limit {
         return negative_errno(libc::ENOMEM);
     }
@@ -55617,6 +55670,89 @@ mod tests {
         memory.write(moved, b"replaced").unwrap();
         assert_eq!(dontneed(&mut memory, &mut state, moved, PAGE_SIZE), 0);
         assert_eq!(page_bytes(&memory, moved), [0; 8]);
+    }
+
+    /// MAP_FIXED_NOREPLACE maps exactly at a vacant address and fails with
+    /// EEXIST over any mapped page, keeping that mapping, as Linux's do_mmap
+    /// does (https://github.com/rrnewton/hermit/issues/4428). It was taken as
+    /// a hint, and an occupied range got a mapping elsewhere.
+    #[test]
+    fn map_fixed_noreplace_refuses_an_occupied_range_and_maps_a_vacant_one() {
+        let (_root, mut state, mut memory) = madvise_memory(12);
+        let noreplace =
+            (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE) as u64;
+        let map_at = |memory: &mut GuestMemory, state: &mut LoadedStaticElf, address, pages| {
+            syscall_result(
+                memory,
+                state,
+                libc::SYS_mmap,
+                [
+                    address,
+                    pages * PAGE_SIZE,
+                    (libc::PROT_READ | libc::PROT_WRITE) as u64,
+                    noreplace,
+                    -1_i32 as u64,
+                    0,
+                ],
+            )
+        };
+        let mapped = madvise_map(
+            &mut memory,
+            &mut state,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            2,
+        );
+        memory.write(mapped, b"occupied").unwrap();
+        // The whole range, and a range that only overlaps its second page.
+        assert_eq!(
+            map_at(&mut memory, &mut state, mapped, 2),
+            negative_errno(libc::EEXIST)
+        );
+        assert_eq!(
+            map_at(&mut memory, &mut state, mapped + PAGE_SIZE, 2),
+            negative_errno(libc::EEXIST)
+        );
+        assert_eq!(&page_bytes(&memory, mapped), b"occupied");
+        // Past TASK_SIZE is ENOMEM before an unaligned address's EINVAL.
+        assert_eq!(
+            map_at(&mut memory, &mut state, 0x4000_0000_0000_0001, 1),
+            negative_errno(libc::ENOMEM)
+        );
+        // A file mapping with a bad descriptor is EBADF before the overlap.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_mmap,
+                [
+                    mapped,
+                    PAGE_SIZE,
+                    libc::PROT_READ as u64,
+                    (libc::MAP_PRIVATE | libc::MAP_FIXED_NOREPLACE) as u64,
+                    999,
+                    0,
+                ],
+            ),
+            negative_errno(libc::EBADF)
+        );
+        // Unaligned, as for MAP_FIXED.
+        assert_eq!(
+            map_at(&mut memory, &mut state, mapped + 1, 1),
+            negative_errno(libc::EINVAL)
+        );
+        // Vacant: mapped exactly there.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_munmap,
+                [mapped, 2 * PAGE_SIZE, 0, 0, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(map_at(&mut memory, &mut state, mapped, 2), mapped as i64);
+        assert_eq!(page_bytes(&memory, mapped), [0; 8]);
     }
 
     /// Linux backs `MAP_SHARED | MAP_ANONYMOUS` with one shmem object that a
