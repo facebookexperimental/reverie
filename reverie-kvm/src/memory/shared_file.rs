@@ -2223,17 +2223,46 @@ mod tests {
         }
     }
 
-    /// `zero_lazily` states that its range holds no retained shared view;
-    /// the assertion fires before the refusing, poisoning discard is reached
+    /// `zero_lazily` refuses a range that holds a retained shared view, in
+    /// every build, before the poisoning discard is reached: the file is
+    /// unchanged, the entry gate stays clear, and memory stays usable
     /// (https://github.com/rrnewton/reverie/issues/1058).
     #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "zero_lazily over a retained shared view")]
     fn zero_lazily_refuses_a_retained_shared_view_before_discarding() {
         let memory = fixture(2);
         let file = file(1);
         install(&memory, &file, BASE, 1, 0);
-        let _ = memory.zero_lazily(BASE, 2 * PAGE_SIZE);
+        let before = bytes(&file, 0, PAGE_SIZE);
+        assert!(matches!(
+            memory.zero_lazily(BASE, 2 * PAGE_SIZE),
+            Err(Error::SharedFileCapability { .. })
+        ));
+        assert!(memory.entry_gate().pending_failure().is_none());
+        assert_eq!(bytes(&file, 0, PAGE_SIZE), before);
+        memory.zero_raw(BASE + P, PAGE_SIZE).unwrap();
+    }
+
+    /// The same refusal at 2 MiB, where zero_lazily would otherwise discard:
+    /// one ordinary-file page inside a 2 MiB range is refused, unchanged and
+    /// unpoisoned, in debug and release builds
+    /// (https://github.com/rrnewton/reverie/issues/1058).
+    #[test]
+    fn zero_lazily_refuses_a_retained_shared_view_at_lazy_size() {
+        let pages = crate::memory::LAZY_ZERO_MIN_BYTES / PAGE_SIZE + 4;
+        let memory = fixture(pages);
+        let file = file(1);
+        install(&memory, &file, BASE + 4 * P, 1, 0);
+        let before = bytes(&file, 0, PAGE_SIZE);
+        assert!(matches!(
+            memory.zero_lazily(BASE, crate::memory::LAZY_ZERO_MIN_BYTES),
+            Err(Error::SharedFileCapability {
+                operation: "zero lazily",
+                ..
+            })
+        ));
+        assert!(memory.entry_gate().pending_failure().is_none());
+        assert_eq!(bytes(&file, 0, PAGE_SIZE), before);
+        memory.zero_raw(BASE, PAGE_SIZE).unwrap();
     }
 
     #[test]

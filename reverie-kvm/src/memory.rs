@@ -2517,17 +2517,21 @@ impl GuestMemory {
     /// rounds of a 256 KiB mapping took 2.67 s of CPU written and 3.75 s
     /// discarded (https://github.com/rrnewton/reverie/issues/1058).
     ///
-    /// The range must not hold a retained shared view (an ordinary-file or
-    /// shared anonymous mapping). Such views are retired by publication, and
-    /// both discarding and writing zeros would zero the shared object for
-    /// every other holder; [`Self::discard_pages`] refuses them and poisons
-    /// this memory's entry gate. mmap and munmap send ranges that hold one to
-    /// the shared-file paths before they get here.
+    /// A range that holds a retained shared view (an ordinary-file or shared
+    /// anonymous mapping) is refused with [`Error::SharedFileCapability`] and
+    /// nothing is changed. Such views are retired by publication, and both
+    /// discarding and writing zeros would zero the shared object for every
+    /// other holder; [`Self::discard_pages`] refuses them too, but inside its
+    /// copy access, which poisons this memory's entry gate. mmap and munmap
+    /// send ranges that hold one to the shared-file paths before they get
+    /// here, so the refusal is a guard, not a path either takes.
     pub(crate) fn zero_lazily(&self, guest_address: u64, length: usize) -> Result<()> {
-        debug_assert!(
-            !self.range_contains_retained_shared(guest_address, length),
-            "zero_lazily over a retained shared view at {guest_address:#x}+{length:#x}"
-        );
+        if self.range_contains_retained_shared(guest_address, length) {
+            return Err(Error::SharedFileCapability {
+                operation: "zero lazily",
+                reason: "the range holds a retained shared view, which only publication retires",
+            });
+        }
         if length >= LAZY_ZERO_MIN_BYTES
             && guest_address.is_multiple_of(PAGE_SIZE as u64)
             && length.is_multiple_of(PAGE_SIZE)
