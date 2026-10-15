@@ -5191,6 +5191,31 @@ impl<L: Tool + 'static> TracedTask<L> {
         if !group_stop {
             self.take_reported_requeue(sig);
         }
+        // A SIGILL at the `ud2` after the untraced `syscall` of the private
+        // page is a guest's own call through it: Reverie's injections step
+        // that `syscall` in `step_private_syscall` and take their stops there,
+        // so none reaches this point. The call was invisible to the Tool and
+        // has already taken effect. End the run with a named failure instead
+        // of delivering the SIGILL, which a handler or a forked child could use
+        // to keep the result (https://github.com/rrnewton/reverie/issues/1064).
+        if sig.as_nix() == Some(Signal::SIGILL) && !group_stop {
+            let address = task.getregs()?.ip();
+            if address == (cp::TRAMPOLINE_BASE + cp::SYSCALL_INSTR_SIZE) as u64 {
+                self.fatal_session().fail_at(
+                    BackendFailure {
+                        pid: self.pid(),
+                        tid: self.tid(),
+                        phase: "guest syscall through the untraced private-page stub",
+                    },
+                    anyhow::Error::new(crate::UntracedStubSyscall {
+                        tid: self.tid().as_raw(),
+                        address,
+                    })
+                    .into(),
+                );
+                return Err(Errno::ECANCELED.into());
+            }
+        }
         let result = match sig.as_nix() {
             Some(Signal::SIGSEGV) => self.handle_sigsegv(task).await?,
             Some(Signal::SIGSTOP) => self.handle_sigstop(task).await?,

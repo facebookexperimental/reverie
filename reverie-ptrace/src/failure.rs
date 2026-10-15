@@ -542,3 +542,27 @@ mod tests {
         assert!(Arc::ptr_eq(&projection.failure.primary, &snapshot.primary));
     }
 }
+
+/// A guest made a syscall through the untraced `syscall` of Reverie's private
+/// page, outside any injection, and took the SIGILL of the `ud2` after it.
+///
+/// Reverie's seccomp filter lets every syscall issued from that instruction
+/// through untraced, because Reverie's own injections need it, and the page is
+/// at a fixed, public address. Reverie's injections single-step that `syscall`
+/// and never reach the `ud2`, so a SIGILL there is the guest's own call, which
+/// no tool saw. The call has already taken effect; Reverie ends the run rather
+/// than deliver the SIGILL, which a handler or a forked child could otherwise
+/// use to keep the result and continue
+/// (<https://github.com/rrnewton/reverie/issues/1064>).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "the guest made a syscall through Reverie's untraced private-page stub \
+     (thread {tid}, instruction {address:#x}), which no tool sees; the run is \
+     ended instead of continuing without it"
+)]
+pub struct UntracedStubSyscall {
+    /// The thread that made the call.
+    pub tid: i32,
+    /// The address of the `ud2` it faulted on.
+    pub address: u64,
+}
