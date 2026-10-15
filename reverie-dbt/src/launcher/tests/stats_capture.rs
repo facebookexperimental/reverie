@@ -75,6 +75,59 @@ fn stats_capture_distinguishes_missing_and_empty_and_cleans_its_directory() {
 }
 
 #[test]
+fn stats_capture_uses_the_guest_address_without_sharing_host_ownership() {
+    let sinks = [DbtStatsSink::new().unwrap(), DbtStatsSink::new().unwrap()];
+    let directories = sinks.each_ref().map(|sink| sink.directory().to_owned());
+    assert_ne!(directories[0], directories[1]);
+    let guest_directory = Path::new("/tmp/.hermit-dbt-stats-0");
+    let records = [19, 29].map(|branches| {
+        encode_process_record(&DbtProcessRecord {
+            branches,
+            syscalls: 7,
+            rewritten: 2,
+            ..Default::default()
+        })
+    });
+
+    for (sink, bytes) in sinks.iter().zip(&records) {
+        let configured = sink.configure_at(
+            runner().client_argument("existing-argument"),
+            guest_directory,
+        );
+        assert_eq!(
+            configured.client_arguments,
+            vec![
+                OsString::from("existing-argument"),
+                OsString::from("-stats_path"),
+                guest_directory.join("records.bin").into_os_string(),
+            ]
+        );
+        assert_ne!(sink.directory(), guest_directory);
+        assert_eq!(sink.path.parent(), Some(sink.directory()));
+        // The caller's mapping changes the client's address, not this owner's
+        // capture location. Distinct live runs still have distinct backing files.
+        std::fs::write(&sink.path, bytes).unwrap();
+    }
+
+    let [first, second] = sinks;
+    let first = first.capture();
+    assert!(!directories[0].exists());
+    assert!(directories[1].is_dir());
+    assert_eq!(std::fs::read(&second.path).unwrap(), records[1]);
+    let second = second.capture();
+    assert!(!directories[1].exists());
+    for ((capture, bytes), branches) in [first, second].iter().zip(&records).zip([19, 29]) {
+        assert_eq!(capture.records().unwrap(), bytes);
+        let snapshot = capture.snapshot().unwrap();
+        assert_eq!(snapshot.process_images(), 1);
+        assert_eq!(snapshot.counted_branches(), branches);
+        assert_eq!(snapshot.intercepted_syscalls(), 7);
+        assert_eq!(snapshot.rewritten_syscalls(), 2);
+        assert_eq!(capture.records().unwrap(), bytes);
+    }
+}
+
+#[test]
 fn stats_capture_retains_exact_record_order_after_decoding_and_cleanup() {
     let sink = DbtStatsSink::new().unwrap();
     let directory = sink.path.parent().unwrap().to_owned();

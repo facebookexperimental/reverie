@@ -1195,8 +1195,17 @@ impl DbtStatsSink {
     }
 
     /// Configure the native client to append its records to this owned sink.
-    pub fn configure(&self, mut runner: DbtRunner) -> DbtRunner {
-        for argument in self.client_arguments() {
+    pub fn configure(&self, runner: DbtRunner) -> DbtRunner {
+        self.configure_at(runner, self.directory())
+    }
+
+    /// Configure the client using this sink's directory as seen by the guest.
+    ///
+    /// The caller must make `guest_directory` refer to [`Self::directory`] in
+    /// the guest's filesystem. This only changes the client argument: the sink
+    /// still owns and reads its unique host path until [`Self::capture`].
+    pub fn configure_at(&self, mut runner: DbtRunner, guest_directory: &Path) -> DbtRunner {
+        for argument in self.client_arguments(guest_directory) {
             runner = runner.client_argument(argument);
         }
         runner
@@ -1211,10 +1220,14 @@ impl DbtStatsSink {
     }
 
     /// The `-stats_path <path>` client arguments passed to the native client.
-    fn client_arguments(&self) -> [OsString; 2] {
+    fn client_arguments(&self, directory: &Path) -> [OsString; 2] {
+        let filename = self
+            .path
+            .file_name()
+            .expect("the owned stats path has a filename");
         [
             OsString::from("-stats_path"),
-            self.path.clone().into_os_string(),
+            directory.join(filename).into_os_string(),
         ]
     }
 
@@ -2558,7 +2571,7 @@ mod tests {
             [(false, Some(0), 0), (true, Some(101), 1)]
         {
             let sink = DbtStatsSink::new().unwrap();
-            let [flag, path] = sink.client_arguments();
+            let [flag, path] = sink.client_arguments(sink.directory());
             let mut runner = DbtRunner::from_env()
                 .expect("DYNAMORIO_HOME and REVERIE_DBT_CLIENT must select the live native client")
                 .client_argument(flag)
@@ -2686,7 +2699,7 @@ mod tests {
     #[test]
     fn stats_sink_passes_the_records_path_to_the_client() {
         let sink = DbtStatsSink::new().unwrap();
-        let arguments = sink.client_arguments();
+        let arguments = sink.client_arguments(sink.directory());
         assert_eq!(arguments[0], OsStr::new("-stats_path"));
         assert_eq!(arguments[1], sink.path.clone().into_os_string());
         assert_eq!(arguments[1], sink.path.as_os_str());
