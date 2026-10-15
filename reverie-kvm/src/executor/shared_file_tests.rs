@@ -1664,4 +1664,142 @@ mod shared_file_dispatch_tests {
             "the shared page lost its contents"
         );
     }
+
+    /// A private mapping of a file larger than one read chunk is streamed
+    /// into guest memory chunk by chunk: its bytes are exact, from offset 0
+    /// and from a page offset, and the tail past the end of the file is zero
+    /// (https://github.com/rrnewton/reverie/issues/1063).
+    #[test]
+    fn a_private_file_mapping_spanning_several_read_chunks_is_byte_exact() {
+        let file_len: usize = 200 * 1024 + 100;
+        let contents: Vec<u8> = (0..file_len)
+            .map(|i| (i.wrapping_mul(31).wrapping_add(7)) as u8)
+            .collect();
+        for offset in [0, PAGE_SIZE] {
+            let mut f = Fixture::with_linux_layout();
+            std::fs::write(&f.path, &contents).unwrap();
+            let fd = f.open(false);
+            let length = 256 * 1024u64;
+            let user = syscall_result(
+                &mut f.memory,
+                &mut f.state,
+                libc::SYS_mmap,
+                [
+                    0,
+                    length,
+                    libc::PROT_READ as u64,
+                    libc::MAP_PRIVATE as u64,
+                    fd as u64,
+                    offset,
+                ],
+            );
+            assert!(user > 0, "offset {offset}: mmap returned {user}");
+            let physical = f.memory.user_range_to_guest(user as u64, length).unwrap();
+            let mut bytes = vec![0xff; length as usize];
+            f.memory.read_raw(physical, &mut bytes).unwrap();
+            let expected = &contents[offset as usize..];
+            assert_eq!(&bytes[..expected.len()], expected, "offset {offset}");
+            assert!(
+                bytes[expected.len()..].iter().all(|byte| *byte == 0),
+                "offset {offset}: the tail past the end of the file is not zero"
+            );
+        }
+    }
+
+    /// A MAP_FIXED file mapping whose read fails after the first chunk has
+    /// replaced the old range must not leave it accessible with changed bytes:
+    /// Linux keeps the old mapping or unmaps it. Host /proc/self/mem is a
+    /// regular file whose read past the host's mapped range fails with EIO,
+    /// so the first 64 KiB chunk reads and the second fails after the
+    /// reservation.
+    #[test]
+    fn a_fixed_file_mapping_whose_read_fails_mid_stream_leaves_no_partial_range() {
+        const CHUNK: usize = 64 * 1024;
+        // SAFETY: an anonymous host mapping owned by this test.
+        let host = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                2 * CHUNK,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(host, libc::MAP_FAILED);
+        // SAFETY: the first chunk is mapped and writable.
+        unsafe { std::ptr::write_bytes(host as *mut u8, 0x5c, CHUNK) };
+        // SAFETY: unmaps the second half of this test's own mapping, so a
+        // read of it through /proc/self/mem fails.
+        assert_eq!(
+            unsafe { libc::munmap((host as usize + CHUNK) as *mut _, CHUNK) },
+            0
+        );
+        let mut f = Fixture::with_linux_layout();
+        let mem = std::fs::File::open("/proc/self/mem").unwrap();
+        assert!(mem.metadata().unwrap().is_file());
+        let fd = insert_file_with_flags(&mut f.state, mem, false, None);
+        let length = (2 * CHUNK) as u64;
+        let user = syscall_result(
+            &mut f.memory,
+            &mut f.state,
+            libc::SYS_mmap,
+            [
+                0,
+                length,
+                (libc::PROT_READ | libc::PROT_WRITE) as u64,
+                (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS) as u64,
+                (-1i64) as u64,
+                0,
+            ],
+        );
+        assert!(user > 0, "anonymous mmap returned {user}");
+        let user = user as u64;
+        f.memory.user().write(user, &vec![0xab; length as usize]).unwrap();
+        let physical = f.memory.user_range_to_guest(user, length).unwrap();
+        assert_eq!(f.memory.reservation_kind(physical), Some(RegionKind::Mmap));
+        let result = syscall_result(
+            &mut f.memory,
+            &mut f.state,
+            libc::SYS_mmap,
+            [
+                user,
+                length,
+                libc::PROT_READ as u64,
+                (libc::MAP_PRIVATE | libc::MAP_FIXED) as u64,
+                fd as u64,
+                host as u64,
+            ],
+        );
+        assert_eq!(result, -(libc::EIO as i64));
+        // Either the old mapping is intact, or, as munmap leaves it, every
+        // page of the range is released.
+        let mut bytes = vec![0xff; length as usize];
+        let pages = (0..length).step_by(PAGE_SIZE as usize);
+        match f.memory.user().read(user, &mut bytes) {
+            Ok(()) => {
+                assert!(
+                    bytes.iter().all(|byte| *byte == 0xab),
+                    "a failed MAP_FIXED mmap left the range accessible with changed bytes"
+                );
+                for page in pages {
+                    assert_eq!(
+                        f.memory.reservation_kind(physical + page),
+                        Some(RegionKind::Mmap)
+                    );
+                }
+            }
+            Err(_) => {
+                for page in pages {
+                    assert_eq!(
+                        f.memory.reservation_kind(physical + page),
+                        None,
+                        "page {page:#x} of the failed mapping is still reserved"
+                    );
+                }
+            }
+        }
+        // SAFETY: the first half of the host mapping is still mapped.
+        unsafe { libc::munmap(host, CHUNK) };
+    }
 }

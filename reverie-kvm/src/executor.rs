@@ -20178,18 +20178,18 @@ fn mmap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) 
                 }
             }
         }
-        let mut bytes = vec![0; length];
-        let mut count = 0;
-        while count < length {
-            #[cfg(test)]
-            entry_host_wait_tests::observe_mmap_file_read();
-            match file.read_at(&mut bytes[count..], args[5].saturating_add(count as u64)) {
-                Ok(0) => break,
-                Ok(read) => count += read,
-                Err(error) => return io_error(error),
-            }
-        }
-        Some(bytes)
+        // Only the first chunk is read before the reservation. The rest is
+        // streamed below, so the host never holds a copy of the whole range
+        // beside the one in guest memory
+        // (https://github.com/rrnewton/reverie/issues/1063).
+        let mut first = vec![0; length.min(MMAP_FILE_CHUNK)];
+        let read = match read_file_range(file, &mut first, args[5]) {
+            Ok(read) => read,
+            Err(error) => return io_error(error),
+        };
+        let reached_end = read < first.len();
+        first.truncate(read);
+        Some((file, first, reached_end))
     } else if args[4] as i32 != -1 {
         return negative_errno(libc::EINVAL);
     } else {
@@ -20202,10 +20202,60 @@ fn mmap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) 
     if memory.zero_lazily(address, length).is_err() {
         return negative_errno(libc::ENOMEM);
     }
-    if let Some(bytes) = file_bytes
-        && memory.write_raw(address, &bytes).is_err()
-    {
-        return negative_errno(libc::EFAULT);
+    if let Some((file, first, reached_end)) = file_bytes {
+        if memory.write_raw(address, &first).is_err() {
+            return abandon_mapping(
+                memory,
+                reservation,
+                address,
+                length,
+                negative_errno(libc::EFAULT),
+            );
+        }
+        // The rest of the range, one chunk at a time. Every read_at runs
+        // outside admission, so the unchanged-mapping fence never waits for
+        // file I/O; each chunk is then written with one short admitted copy.
+        // Bytes past the end of the file stay zero.
+        if !reached_end {
+            let mut buffer = vec![0; MMAP_FILE_CHUNK];
+            let mut done = first.len();
+            while done < length {
+                let want = (length - done).min(MMAP_FILE_CHUNK);
+                let read = match read_file_range(
+                    file,
+                    &mut buffer[..want],
+                    args[5].saturating_add(done as u64),
+                ) {
+                    Ok(read) => read,
+                    Err(error) => {
+                        return abandon_mapping(
+                            memory,
+                            reservation,
+                            address,
+                            length,
+                            io_error(error),
+                        );
+                    }
+                };
+                if read != 0
+                    && memory
+                        .write_raw(address + done as u64, &buffer[..read])
+                        .is_err()
+                {
+                    return abandon_mapping(
+                        memory,
+                        reservation,
+                        address,
+                        length,
+                        negative_errno(libc::EFAULT),
+                    );
+                }
+                done += read;
+                if read < want {
+                    break;
+                }
+            }
+        }
     }
     if memory
         .map_user_permissions(
@@ -20216,7 +20266,13 @@ fn mmap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) 
         )
         .is_err()
     {
-        return negative_errno(libc::ENOMEM);
+        return abandon_mapping(
+            memory,
+            reservation,
+            address,
+            length,
+            negative_errno(libc::ENOMEM),
+        );
     }
 
     reservation.commit();
@@ -20230,6 +20286,48 @@ fn mmap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) 
         state.mmap_next = state.mmap_next.max(end);
     }
     memory.physical_to_user(address).unwrap_or(address) as i64
+}
+
+/// Fails an mmap after its reservation, returning `result`.
+///
+/// By then the range has been zeroed and perhaps partly written from a file,
+/// and for a MAP_FIXED mapping that range was the guest's old mapping.
+/// Dropping the reservation would restore its ownership metadata but leave
+/// the old mapping accessible with changed bytes, which Linux never produces:
+/// a failed mmap leaves the old mapping intact or unmapped. So the range is
+/// committed and then unmapped, as munmap leaves it
+/// (https://github.com/rrnewton/reverie/pull/1066).
+fn abandon_mapping(
+    memory: &GuestMemory,
+    reservation: crate::memory::PendingReservation,
+    address: u64,
+    length: usize,
+    result: i64,
+) -> i64 {
+    reservation.commit();
+    let _ = memory.zero_lazily(address, length);
+    let _ = memory.unmap_user_range(address, length as u64);
+    result
+}
+
+/// The host buffer a regular file's mmap is read through: the first chunk
+/// before the reservation, then one chunk per admitted copy.
+const MMAP_FILE_CHUNK: usize = 64 * 1024;
+
+/// Fills `buffer` from `file` at `offset`, stopping early only at end of file.
+/// Returns the bytes read.
+fn read_file_range(file: &std::fs::File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    let mut count = 0;
+    while count < buffer.len() {
+        #[cfg(test)]
+        entry_host_wait_tests::observe_mmap_file_read();
+        match file.read_at(&mut buffer[count..], offset.saturating_add(count as u64)) {
+            Ok(0) => break,
+            Ok(read) => count += read,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(count)
 }
 
 fn munmap(memory: &mut GuestMemory, address: u64, length: u64) -> i64 {

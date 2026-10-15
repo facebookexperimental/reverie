@@ -724,3 +724,100 @@ fn allocation_held_mmap_file_read_does_not_hold_unchanged_mapping_fence() {
     drop(memory);
     assert_eq!(owners(), 0);
 }
+
+/// The streamed twin of the test above: every file read after the reservation
+/// also runs outside admission, so the unchanged-mapping fence closes at once
+/// while any of them blocks.
+#[test]
+fn streamed_mmap_file_reads_do_not_hold_unchanged_mapping_fence() {
+    const CHUNK: usize = 64 * 1024;
+    let mut state = native_loaded_state(std::path::Path::new("/"));
+    state.mmap_limit = state.mmap_base + 4 * CHUNK as u64;
+    let expected_address = state.mmap_base;
+    let memory = GuestMemory::new(0, state.mmap_limit as usize).unwrap();
+    memory.enable_user_access();
+    let len = 3 * CHUNK + 100;
+    let expected: Vec<u8> = (0..len).map(|i| (i * 17 + 3) as u8).collect();
+    // SAFETY: the fixed name is nul-terminated. A successful returned fd is
+    // immediately owned by File.
+    let raw = unsafe { libc::memfd_create(c"entry-mmap-stream".as_ptr(), libc::MFD_CLOEXEC) };
+    assert!(
+        raw >= 0,
+        "memfd_create: {}",
+        std::io::Error::last_os_error()
+    );
+    let mut file = unsafe { std::fs::File::from_raw_fd(raw) };
+    file.write_all(&expected).unwrap();
+    let fd = insert_file_with_flags(&mut state, file, false, None);
+    let gate = memory.entry_gate();
+    let mut reading_memory = memory.clone();
+    let (prepared, preparation) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let length = (4 * CHUNK) as u64;
+    let handle = std::thread::spawn(move || {
+        let reads = AtomicUsize::new(0);
+        let _observer = MmapObserverGuard::install(Rc::new(move || {
+            // The first read precedes the reservation; block every later one.
+            if reads.fetch_add(1, Ordering::SeqCst) >= 1 {
+                prepared.send(()).unwrap();
+                released.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+        }));
+        match execute_basic_syscall(
+            &mut reading_memory,
+            &mut state,
+            &SyscallRequest::new(
+                libc::SYS_mmap as u64,
+                [
+                    0,
+                    length,
+                    libc::PROT_READ as u64,
+                    libc::MAP_PRIVATE as u64,
+                    fd as u64,
+                    0,
+                ],
+            ),
+        ) {
+            SyscallAction::Continue {
+                result,
+                segment: None,
+            } => result,
+            _ => panic!("mmap did not retain its ordinary syscall disposition"),
+        }
+    });
+    let mut blocked = 0;
+    loop {
+        match preparation.recv_timeout(Duration::from_millis(500)) {
+            Ok(()) => {
+                blocked += 1;
+                assert_eq!(
+                    gate.test_state().copies,
+                    0,
+                    "streamed read {blocked} ran under admission"
+                );
+                let closed = gate
+                    .try_close()
+                    .unwrap()
+                    .unwrap()
+                    .finish()
+                    .now_or_never()
+                    .expect("fence waited for a streamed file read")
+                    .unwrap();
+                assert!(gate.test_state().closed);
+                drop(closed);
+                release.send(()).unwrap();
+            }
+            Err(_) if handle.is_finished() => break,
+            Err(_) => {}
+        }
+    }
+    let result = handle.join().unwrap();
+    // The 2 * 64 KiB + 100 bytes after the first chunk take at least three reads.
+    assert!(blocked >= 3, "only {blocked} streamed reads blocked");
+    assert_eq!(result, expected_address as i64);
+    let mut actual = vec![0xff; length as usize];
+    memory.user().read(expected_address, &mut actual).unwrap();
+    assert_eq!(&actual[..len], &expected[..]);
+    assert!(actual[len..].iter().all(|byte| *byte == 0));
+    assert!(gate.pending_failure().is_none());
+}
