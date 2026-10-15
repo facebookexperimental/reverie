@@ -946,3 +946,97 @@ fn private_admission_preserves_already_selected_nonlocal_disposition() {
     assert!(retirement.result.is_ok());
     retirement.notification.notify();
 }
+
+/// A kept RPC failure wait whose answers the test scripts.
+struct ScriptedRpcFailure(Mutex<std::collections::VecDeque<FailureCheck>>);
+impl ScriptedRpcFailure {
+    fn answer(&self, checks: &[FailureCheck]) {
+        let mut script = self.0.lock().unwrap();
+        assert!(script.is_empty(), "an earlier answer went unused");
+        script.extend(checks);
+    }
+}
+impl crate::failure::RpcFailure for ScriptedRpcFailure {
+    fn listen(&self) -> usize {
+        0
+    }
+    fn poll_failure(&self, _: usize, _: &mut Context<'_>) -> FailureCheck {
+        self.0
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("an unscripted failure check")
+    }
+    fn unlisten(&self, _: usize) {}
+}
+
+/// An RPC whose failure check is Unknown (the kept wait was being polled
+/// elsewhere) does not poll its response, and a response that completed
+/// before an Unknown check is held, not returned, until a check is Clear.
+/// A Failed check after that drops it.
+fn rpc_unknown_failure_check(then: FailureCheck) {
+    let fixture = Fixture::new();
+    let signal = Arc::new(Mutex::new(None));
+    let tool = Arc::new(ProbeTool::default());
+    let mut executor = fixture.executor();
+    let mut state = ();
+    let subscriptions = Subscription::none();
+    let scripted = ScriptedRpcFailure(Mutex::default());
+    let guest = KvmGuest::new(
+        Pid::from_raw(17),
+        Pid::from_raw(17),
+        tool,
+        fixture.memory.clone(),
+        &[],
+        unsafe { std::mem::zeroed() },
+        &mut state,
+        &mut executor,
+        fixture.global.as_ref(),
+        Some(fixture.global.clone()),
+        &(),
+        &subscriptions,
+        signal.clone(),
+        Arc::new(Mutex::new(Vec::new())),
+        BASE + TOOL_STACK_SIZE,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .with_rpc_failure(&scripted);
+    let mut rpc = Box::pin(guest.send_rpc(()));
+    let mut context = Context::from_waker(Waker::noop());
+    let polls = &fixture.global.counts.rpc_polls;
+    scripted.answer(&[FailureCheck::Unknown]);
+    assert!(rpc.as_mut().poll(&mut context).is_pending());
+    assert_eq!(polls.load(Ordering::SeqCst), 0, "polled after Unknown");
+    scripted.answer(&[FailureCheck::Clear, FailureCheck::Unknown]);
+    assert!(rpc.as_mut().poll(&mut context).is_pending());
+    assert_eq!(polls.load(Ordering::SeqCst), 1);
+    scripted.answer(&[then]);
+    let result = rpc.as_mut().poll(&mut context);
+    assert_eq!(
+        polls.load(Ordering::SeqCst),
+        1,
+        "a completed response repolled"
+    );
+    match then {
+        FailureCheck::Clear => assert_eq!(result, Poll::Ready(41)),
+        FailureCheck::Failed => {
+            assert!(result.is_pending(), "a response returned after a failure");
+            assert!(signal.lock().unwrap().is_some());
+        }
+        FailureCheck::Unknown => unreachable!(),
+    }
+    drop(rpc);
+    drop(guest);
+    drop(fixture.callback);
+    fixture.scope.retire().notification.notify();
+}
+
+#[test]
+fn rpc_waits_out_an_unknown_failure_check_then_returns_its_response() {
+    rpc_unknown_failure_check(FailureCheck::Clear);
+}
+
+#[test]
+fn rpc_drops_a_held_response_when_the_next_check_finds_a_failure() {
+    rpc_unknown_failure_check(FailureCheck::Failed);
+}

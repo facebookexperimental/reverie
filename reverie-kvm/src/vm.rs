@@ -12034,6 +12034,7 @@ mod tests {
 
     include!("vm/public_tool_panic_tests.rs");
     include!("vm/kept_failure_wait_tests.rs");
+    include!("vm/kept_rpc_failure_tests.rs");
     include!("vm/empty_signal_boundary_tests.rs");
     include!("vm/instruction_callback_panic_tests.rs");
 }

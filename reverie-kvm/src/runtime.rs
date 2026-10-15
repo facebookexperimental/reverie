@@ -61,6 +61,7 @@ use crate::executor::ProcessAction;
 use crate::executor::ProcessExit;
 use crate::executor::RunAdmission;
 use crate::executor::conventional_exit_code;
+use crate::failure::FailureCheck;
 use crate::failure::FailureContext;
 use crate::failure::RunFailure;
 use crate::failure::wait_for_failure;
@@ -1228,6 +1229,9 @@ struct KvmGuest<'a, T: Tool> {
     // The typed refusal of this handler's most recent injection, if the
     // backend declined it as unsupported. Every injection replaces it.
     unsupported_refusal: Option<reverie::UnsupportedRefusal>,
+    // The thread's kept failure wait for RPCs, where the caller keeps one
+    // (the ordinary syscall callback); otherwise each RPC builds its own.
+    rpc_failure: Option<&'a dyn crate::failure::RpcFailure>,
 }
 
 impl<'a, T: Tool> KvmGuest<'a, T> {
@@ -1273,7 +1277,16 @@ impl<'a, T: Tool> KvmGuest<'a, T> {
             notifying_dequeue: false,
             entry_watch,
             unsupported_refusal: None,
+            rpc_failure: None,
         }
+    }
+
+    /// Lend this handle the thread's kept RPC failure wait. It must watch the
+    /// same failures a per-RPC wait would: the run-wide subscription and the
+    /// GlobalTool's backend failure (see `wait_for_failure`).
+    fn with_rpc_failure(mut self, failure: &'a dyn crate::failure::RpcFailure) -> Self {
+        self.rpc_failure = Some(failure);
+        self
     }
 
     /// Preserve a previously selected nonlocal disposition. Its outer owner
@@ -1352,35 +1365,68 @@ impl<T: Tool> GlobalRPC<T::GlobalState> for KvmGuest<'_, T> {
         self.admit_ordinary_operation().await;
         let response = {
             let mut private_failure = pin!(self.entry_watch.wait());
+            // Built but never polled when the thread lends its kept wait: an
+            // unpolled async fn has taken no waiter and made no subscription.
             let mut failure = pin!(wait_for_failure(
                 self.global_state,
-                self.executor.failure_subscription(),
+                self.rpc_failure
+                    .is_none()
+                    .then(|| self.executor.failure_subscription())
+                    .flatten(),
             ));
+            let listener = self
+                .rpc_failure
+                .map(crate::failure::RpcFailureListener::new);
+            let mut failure_check = |context: &mut std::task::Context<'_>| match &listener {
+                Some(kept) => kept.poll(context),
+                None if failure.as_mut().poll(context).is_ready() => FailureCheck::Failed,
+                None => FailureCheck::Clear,
+            };
             // Admission precedes construction: an implementation of receive_rpc
             // can perform work before returning its future.
             let mut response = pin!(self.global_state.receive_rpc(self.tid, message));
+            // A response that completed while the failure check was Unknown,
+            // held until a later check is Clear.
+            let mut completed = None;
             poll_fn(|context| {
                 let _ = private_failure.as_mut().poll(context);
                 if let Err(error) = self.check_ordinary_operation() {
                     self.signal_ordinary_failure(error);
                     return Poll::Ready(None);
                 }
-                if failure.as_mut().poll(context).is_ready() {
-                    self.signal_ordinary_failure(Error::RunAborted);
-                    return Poll::Ready(None);
+                match failure_check(context) {
+                    FailureCheck::Failed => {
+                        self.signal_ordinary_failure(Error::RunAborted);
+                        return Poll::Ready(None);
+                    }
+                    // Woken when the wait is released; until then a failure
+                    // may already be published, so the response waits.
+                    FailureCheck::Unknown => return Poll::Pending,
+                    FailureCheck::Clear => {}
                 }
-                let result = response.as_mut().poll(context);
-                if let Err(error) = self.check_ordinary_operation() {
-                    // Retain the cause before dropping a ready response: its
-                    // destructor can unwind into the existing outer catcher.
-                    self.signal_ordinary_failure(error);
-                    return Poll::Ready(None);
+                if completed.is_none() {
+                    if let Poll::Ready(result) = response.as_mut().poll(context) {
+                        completed = Some(result);
+                    }
+                    if let Err(error) = self.check_ordinary_operation() {
+                        // Retain the cause before dropping a ready response: its
+                        // destructor can unwind into the existing outer catcher.
+                        self.signal_ordinary_failure(error);
+                        return Poll::Ready(None);
+                    }
+                    match failure_check(context) {
+                        FailureCheck::Failed => {
+                            self.signal_ordinary_failure(Error::RunAborted);
+                            return Poll::Ready(None);
+                        }
+                        FailureCheck::Unknown => return Poll::Pending,
+                        FailureCheck::Clear => {}
+                    }
                 }
-                if failure.as_mut().poll(context).is_ready() {
-                    self.signal_ordinary_failure(Error::RunAborted);
-                    return Poll::Ready(None);
+                match completed.take() {
+                    Some(result) => Poll::Ready(Some(result)),
+                    None => Poll::Pending,
                 }
-                result.map(Some)
             })
             .await
         };
@@ -5288,6 +5334,16 @@ impl KvmBackend {
             global_state.as_ref(),
             failure_subscription.clone(),
         )));
+        // One failure wait for every RPC those callbacks send, likewise kept.
+        // Not the callbacks' wait: an RPC watches the run-wide subscription
+        // (StaticElfSyscallExecutor::failure_subscription), where a process
+        // other than the traced tree's root drives on its process scope.
+        let rpc_failure = crate::failure::KeptRpcFailure::new(Box::pin(wait_for_failure(
+            global_state.as_ref(),
+            self.tool_failure
+                .as_ref()
+                .map(|failure| failure.run.subscribe()),
+        )));
         let mut _registration = None;
         let mut auxv = executor.auxv().to_vec();
         // Clones share the MAP_SHARED guest mapping; a mutable handle lets the
@@ -6078,7 +6134,8 @@ impl KvmBackend {
                                 pending_child_starts.clone(),
                                 tool_stack_top,
                                 stack_checked_out.clone(),
-                            );
+                            )
+                            .with_rpc_failure(&rpc_failure);
                             drive_entry_handler_completion_from(
                                 || tool.handle_syscall_event(&mut guest, syscall),
                                 handler_signal,
@@ -6498,6 +6555,12 @@ impl KvmBackend {
         // must join the execution's panics rather than discard its outcome.
         if let Err(payload) =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(callback_failure)))
+        {
+            caught.panics.push(payload);
+        }
+        // Likewise the kept RPC failure wait.
+        if let Err(payload) =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(rpc_failure)))
         {
             caught.panics.push(payload);
         }
