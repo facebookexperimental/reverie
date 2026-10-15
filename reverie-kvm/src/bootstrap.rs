@@ -6,6 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::cell::Cell;
+
 use kvm_bindings::Msrs;
 use kvm_bindings::kvm_fpu;
 use kvm_bindings::kvm_msr_entry;
@@ -512,14 +514,45 @@ pub(crate) fn syscall_hypercall_address(
     syscall_trampoline_address: u64,
     syscall_frame_address: u64,
 ) -> u64 {
+    let (offset, _) = trampoline_hypercall(hypercall_instruction, syscall_frame_address);
+    syscall_trampoline_address
+        .checked_add(offset as u64)
+        .expect("syscall hypercall address must not overflow")
+}
+
+/// [`trampoline_hypercall`]'s inputs: the hypercall instruction and the
+/// syscall frame address.
+type TrampolineKey = ([u8; 3], u64);
+/// [`trampoline_hypercall`]'s result: the hypercall's offset and the byte
+/// after it.
+type TrampolineHypercall = (usize, u8);
+
+thread_local! {
+    /// The last [`trampoline_hypercall`] on this thread. Every guest syscall
+    /// asks for it (its completed boundary, and parking), always with the
+    /// same thread's inputs, and computing it builds the whole trampoline.
+    static LAST_TRAMPOLINE_HYPERCALL: Cell<Option<(TrampolineKey, TrampolineHypercall)>> =
+        const { Cell::new(None) };
+}
+
+/// The offset of the hypercall in the syscall trampoline for these inputs,
+/// and the trampoline byte just after it (the return a parked thread's halt
+/// replaces). Memoized per thread: a pure function of its inputs.
+fn trampoline_hypercall(hypercall_instruction: [u8; 3], syscall_frame_address: u64) -> (usize, u8) {
+    let key = (hypercall_instruction, syscall_frame_address);
+    if let Some((last, result)) = LAST_TRAMPOLINE_HYPERCALL.get()
+        && last == key
+    {
+        return result;
+    }
     let trampoline = syscall_trampoline(hypercall_instruction, syscall_frame_address);
     let offset = trampoline
         .windows(hypercall_instruction.len())
         .position(|window| window == hypercall_instruction)
         .expect("syscall trampoline must contain its hypercall");
-    syscall_trampoline_address
-        .checked_add(offset as u64)
-        .expect("syscall hypercall address must not overflow")
+    let result = (offset, trampoline[offset + hypercall_instruction.len()]);
+    LAST_TRAMPOLINE_HYPERCALL.set(Some((key, result)));
+    result
 }
 
 /// The async owner retains its parking stage when admission is closed. This
@@ -547,18 +580,12 @@ fn syscall_return_park_byte(
     syscall_frame_address: u64,
     park: bool,
 ) -> (u64, u8) {
-    let trampoline = syscall_trampoline(hypercall_instruction, syscall_frame_address);
-    let return_offset = (syscall_hypercall_address(
-        hypercall_instruction,
-        syscall_trampoline_address,
-        syscall_frame_address,
-    ) - syscall_trampoline_address) as usize
-        + hypercall_instruction.len();
-    let byte = if park {
-        0xf4
-    } else {
-        trampoline[return_offset]
-    };
+    let (offset, return_byte) = trampoline_hypercall(hypercall_instruction, syscall_frame_address);
+    syscall_trampoline_address
+        .checked_add(offset as u64)
+        .expect("syscall hypercall address must not overflow");
+    let return_offset = offset + hypercall_instruction.len();
+    let byte = if park { 0xf4 } else { return_byte };
     (syscall_trampoline_address + return_offset as u64, byte)
 }
 
@@ -1058,6 +1085,60 @@ fn frame_word_address_u64(syscall_frame_address: u64, word: usize) -> u64 {
 mod tests {
     use super::*;
     use crate::SyscallRequest;
+
+    /// The memoized hypercall offset and return byte equal a fresh build of
+    /// the trampoline for every input, including after the inputs change
+    /// back and forth on one thread.
+    #[test]
+    fn memoized_trampoline_hypercall_matches_a_fresh_build() {
+        let fresh = |instruction: [u8; 3], frame: u64, trampoline_address: u64, park: bool| {
+            let code = syscall_trampoline(instruction, frame);
+            let offset = code
+                .windows(instruction.len())
+                .position(|window| window == instruction)
+                .unwrap();
+            let return_offset = offset + instruction.len();
+            let byte = if park { 0xf4 } else { code[return_offset] };
+            (
+                trampoline_address + offset as u64,
+                (trampoline_address + return_offset as u64, byte),
+            )
+        };
+        let vmcall = [0x0f, 0x01, 0xc1];
+        let vmmcall = [0x0f, 0x01, 0xd9];
+        let inputs = [
+            (vmcall, 0x7000, 0x5000),
+            (vmmcall, 0x7000, 0x5000),
+            (vmcall, 0x9_1000, 0x8_2000),
+            (vmcall, 0x7000, 0x5000),
+            (vmmcall, 0x9_1000, 0x6000),
+            (vmmcall, 0x9_1000, 0x6000),
+            // This frame address's bytes contain VMCALL, so the first window
+            // equal to it lies inside an earlier immediate: a memo that
+            // ignored the frame address would return the usual offset.
+            (vmcall, 0x00c1_010f, 0x5000),
+            (vmcall, 0x7000, 0x5000),
+        ];
+        // The trampoline address is not part of the memo: the same key at two
+        // trampoline addresses, back to back, gives two addresses.
+        assert_eq!(
+            syscall_hypercall_address(vmcall, 0x5000, 0x7000) + 0x1000,
+            syscall_hypercall_address(vmcall, 0x6000, 0x7000)
+        );
+        for (instruction, frame, trampoline_address) in inputs {
+            for park in [false, true] {
+                let (hypercall, park_byte) = fresh(instruction, frame, trampoline_address, park);
+                assert_eq!(
+                    syscall_hypercall_address(instruction, trampoline_address, frame),
+                    hypercall
+                );
+                assert_eq!(
+                    syscall_return_park_byte(instruction, trampoline_address, frame, park),
+                    park_byte
+                );
+            }
+        }
+    }
 
     #[test]
     fn trampoline_preserves_syscall_return_state() {
