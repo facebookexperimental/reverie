@@ -1345,4 +1345,113 @@ mod shared_file_dispatch_tests {
         assert!(f.memory.entry_gate().pending_failure().is_none());
         assert_eq!(std::fs::read(&f.path).unwrap(), expected);
     }
+
+    /// Host pages of guest-physical `[physical, physical + length)` that are
+    /// resident, by mincore over the fixture's host mapping (guest base 0).
+    fn resident_pages(memory: &GuestMemory, physical: u64, length: u64) -> usize {
+        let host = memory.host_address() + physical;
+        let mut residency = vec![0u8; (length / PAGE_SIZE) as usize];
+        // SAFETY: the range lies in the fixture's live guest-memory mapping,
+        // and `residency` has one byte per page of it.
+        let result = unsafe {
+            libc::mincore(
+                host as *mut libc::c_void,
+                length as usize,
+                residency.as_mut_ptr(),
+            )
+        };
+        assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+        residency.iter().filter(|page| *page & 1 != 0).count()
+    }
+
+    /// An anonymous PROT_NONE MAP_NORESERVE reservation reads as zeros
+    /// without becoming resident in the host, as on Linux, and munmap gives
+    /// back the pages a guest touched. Writing zeros over a new mapping made
+    /// every reserved byte resident, so V8's 512 MiB reservations cost their
+    /// whole size (https://github.com/rrnewton/hermit/issues/4366).
+    #[test]
+    fn an_anonymous_reservation_is_zero_without_becoming_resident() {
+        const LENGTH: u64 = crate::memory::LAZY_ZERO_MIN_BYTES as u64;
+        let mut f = Fixture::with_linux_layout();
+        let flags = (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE) as u64;
+        let user = syscall_result(
+            &mut f.memory,
+            &mut f.state,
+            libc::SYS_mmap,
+            [0, LENGTH, libc::PROT_NONE as u64, flags, u64::MAX, 0],
+        );
+        assert!(user > 0, "mmap returned {user}");
+        let physical = f
+            .memory
+            .user_range_to_guest(user as u64, LENGTH)
+            .unwrap();
+        // The fixture wrote 0xa5 over all of guest memory, so every page of
+        // this range was resident before the reservation.
+        assert_eq!(resident_pages(&f.memory, physical, LENGTH), 0);
+        let mut bytes = vec![0xff; LENGTH as usize];
+        f.memory.read_raw(physical, &mut bytes).unwrap();
+        assert!(bytes.iter().all(|byte| *byte == 0));
+        assert_eq!(
+            syscall_result(
+                &mut f.memory,
+                &mut f.state,
+                libc::SYS_munmap,
+                [user as u64, LENGTH, 0, 0, 0, 0],
+            ),
+            0
+        );
+        assert_eq!(resident_pages(&f.memory, physical, LENGTH), 0);
+    }
+
+    /// A MAP_FIXED anonymous mapping over live data reads as zeros, both a
+    /// small one (written with zeros) and a large one (discarded). Checked on
+    /// its own, so a mapping that is discarded without being zeroed fails
+    /// here rather than at a residency check.
+    #[test]
+    fn a_fixed_anonymous_mapping_over_live_data_reads_as_zeros() {
+        for length in [4 * PAGE_SIZE, crate::memory::LAZY_ZERO_MIN_BYTES as u64] {
+            fixed_anonymous_mapping_over_live_data_reads_as_zeros(length);
+        }
+    }
+
+    fn fixed_anonymous_mapping_over_live_data_reads_as_zeros(length: u64) {
+        let mut f = Fixture::with_linux_layout();
+        let private = (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS) as u64;
+        let read_write = (libc::PROT_READ | libc::PROT_WRITE) as u64;
+        let user = syscall_result(
+            &mut f.memory,
+            &mut f.state,
+            libc::SYS_mmap,
+            [0, length, read_write, private, u64::MAX, 0],
+        );
+        assert!(user > 0, "mmap returned {user}");
+        let physical = f
+            .memory
+            .user_range_to_guest(user as u64, length)
+            .unwrap();
+        f.memory
+            .write_raw(physical, &vec![0x3c; length as usize])
+            .unwrap();
+        let fixed = syscall_result(
+            &mut f.memory,
+            &mut f.state,
+            libc::SYS_mmap,
+            [
+                user as u64,
+                length,
+                libc::PROT_READ as u64,
+                private | libc::MAP_FIXED as u64,
+                u64::MAX,
+                0,
+            ],
+        );
+        assert_eq!(fixed, user);
+        let physical = f
+            .memory
+            .user_range_to_guest(user as u64, length)
+            .unwrap();
+        let mut bytes = vec![0xff; length as usize];
+        f.memory.read_raw(physical, &mut bytes).unwrap();
+        assert!(bytes.iter().all(|byte| *byte == 0));
+    }
 }

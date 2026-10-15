@@ -20103,7 +20103,7 @@ fn mmap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) 
     let Ok(reservation) = memory.reserve_region(address, length as u64, RegionKind::Mmap) else {
         return negative_errno(libc::ENOMEM);
     };
-    if memory.zero_raw(address, length).is_err() {
+    if memory.zero_lazily(address, length).is_err() {
         return negative_errno(libc::ENOMEM);
     }
     if let Some(bytes) = file_bytes
@@ -20154,7 +20154,7 @@ fn munmap(memory: &mut GuestMemory, address: u64, length: u64) -> i64 {
     let Some(address) = memory.user_range_to_guest(address, length as u64) else {
         return negative_errno(libc::EINVAL);
     };
-    match memory.zero_raw(address, length) {
+    match memory.zero_lazily(address, length) {
         Ok(()) => match memory.unmap_user_range(address, length as u64) {
             Ok(()) => 0,
             Err(_) => negative_errno(libc::EINVAL),

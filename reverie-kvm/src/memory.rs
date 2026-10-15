@@ -1074,6 +1074,10 @@ unsafe impl Send for Mapping {}
 // backing's mutex before dereferencing fixed RAM or issuing a contained file copy.
 unsafe impl Sync for Mapping {}
 
+/// The shortest range [`GuestMemory::zero_lazily`] discards rather than
+/// writes: one large page.
+pub(crate) const LAZY_ZERO_MIN_BYTES: usize = 2 * 1024 * 1024;
+
 impl GuestMemory {
     /// Allocates a shared, memfd-backed mapping for a guest-physical address range.
     pub fn new(guest_base: u64, size: usize) -> Result<Self> {
@@ -2496,6 +2500,42 @@ impl GuestMemory {
         }
         debug_assert_eq!(zeroed, length);
         Ok(())
+    }
+
+    /// Zeroes `[guest_address, guest_address + length)` as [`Self::zero_raw`]
+    /// does, but discards whole pages with [`Self::discard_pages`] instead of
+    /// writing them, so a range the guest never touches again costs the host
+    /// no memory. Linux only reserves address space for a new anonymous
+    /// mapping; writing zeros over it made every reserved byte resident, so a
+    /// runtime's large PROT_NONE reservations cost their full size.
+    ///
+    /// A range shorter than [`LAZY_ZERO_MIN_BYTES`], or not whole pages, is
+    /// written with zeros: a page discarded here is refaulted on its next
+    /// touch, and for a small mapping the guest maps, touches and unmaps over
+    /// and over (as malloc above glibc's mmap threshold does) that refault
+    /// costs more than rewriting the resident page. Measured under KVM, 5000
+    /// rounds of a 256 KiB mapping took 2.67 s of CPU written and 3.75 s
+    /// discarded (https://github.com/rrnewton/reverie/issues/1058).
+    ///
+    /// The range must not hold a retained shared view (an ordinary-file or
+    /// shared anonymous mapping). Such views are retired by publication, and
+    /// both discarding and writing zeros would zero the shared object for
+    /// every other holder; [`Self::discard_pages`] refuses them and poisons
+    /// this memory's entry gate. mmap and munmap send ranges that hold one to
+    /// the shared-file paths before they get here.
+    pub(crate) fn zero_lazily(&self, guest_address: u64, length: usize) -> Result<()> {
+        debug_assert!(
+            !self.range_contains_retained_shared(guest_address, length),
+            "zero_lazily over a retained shared view at {guest_address:#x}+{length:#x}"
+        );
+        if length >= LAZY_ZERO_MIN_BYTES
+            && guest_address.is_multiple_of(PAGE_SIZE as u64)
+            && length.is_multiple_of(PAGE_SIZE)
+        {
+            self.discard_pages(guest_address, length)
+        } else {
+            self.zero_raw(guest_address, length)
+        }
     }
 
     /// Discards complete host pages while preserving this mapping's identity.

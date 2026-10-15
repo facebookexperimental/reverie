@@ -2223,6 +2223,19 @@ mod tests {
         }
     }
 
+    /// `zero_lazily` states that its range holds no retained shared view;
+    /// the assertion fires before the refusing, poisoning discard is reached
+    /// (https://github.com/rrnewton/reverie/issues/1058).
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "zero_lazily over a retained shared view")]
+    fn zero_lazily_refuses_a_retained_shared_view_before_discarding() {
+        let memory = fixture(2);
+        let file = file(1);
+        install(&memory, &file, BASE, 1, 0);
+        let _ = memory.zero_lazily(BASE, 2 * PAGE_SIZE);
+    }
+
     #[test]
     fn failed_fixed_publication_never_unmaps_foreign_target() {
         for target_page in [0, 1, 2] {
