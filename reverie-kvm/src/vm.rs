@@ -6,6 +6,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#![allow(
+    unexpected_cfgs,
+    reason = "`fbcode_build` is supplied by the internal Buck build"
+)]
+
 use std::fs::File;
 use std::future::Future;
 use std::os::fd::AsRawFd;
@@ -8138,6 +8143,10 @@ mod tests {
         check_fatal_page_zero_registration(true, true);
     }
 
+    #[cfg_attr(
+        fbcode_build,
+        ignore = "fbsource-disabled: sandcastle-env: needs /dev/kvm and exact PMU branch counts"
+    )]
     #[test]
     fn page_fault_action_restores_complete_stopped_context() {
         for thread in [false, true] {

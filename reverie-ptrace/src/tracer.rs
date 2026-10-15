@@ -8,6 +8,11 @@
 
 //! `Tracer` type, plus ways to spawn it and retrieve its output.
 
+#![allow(
+    unexpected_cfgs,
+    reason = "`fbcode_build` is supplied by the internal Buck build"
+)]
+
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -10488,6 +10493,10 @@ mod tests {
     /// same address. Initialization must still fail with the kill, and its
     /// page population must not reach the replacement. Runs in a fresh user
     /// and PID namespace, where the PID can be reused exactly.
+    #[cfg_attr(
+        fbcode_build,
+        ignore = "fbsource-disabled: sandcastle-env: needs mount(2) in a fresh user and PID namespace"
+    )]
     #[tokio::test(flavor = "current_thread")]
     async fn preinit_page_population_never_writes_a_replacement() {
         if std::env::var_os(POPULATE_REUSE_INNER).is_none() {
@@ -10627,6 +10636,10 @@ mod tests {
     /// its injection must not reach the replacement: its registers must be
     /// unchanged. Runs in a fresh user and PID namespace, where the PID can be
     /// reused exactly.
+    #[cfg_attr(
+        fbcode_build,
+        ignore = "fbsource-disabled: sandcastle-env: needs mount(2) in a fresh user and PID namespace"
+    )]
     #[tokio::test(flavor = "current_thread")]
     async fn preinit_injection_never_reaches_a_replacement() {
         if std::env::var_os(INJECTION_REUSE_INNER).is_none() {

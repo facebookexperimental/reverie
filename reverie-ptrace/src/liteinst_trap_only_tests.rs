@@ -12,6 +12,11 @@
 //! that `record_wait` sees). Stops consumed inside `inject`, `tail_inject` or
 //! single-step paths are not recorded.
 
+#![allow(
+    unexpected_cfgs,
+    reason = "`fbcode_build` is supplied by the internal Buck build"
+)]
+
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
@@ -471,6 +476,10 @@ fn run_arm_in_fresh_pid_namespace(test_name: &str, arm: &str) -> String {
 /// not consume a PID or otherwise perturb the guest. Each arm runs in its own
 /// fresh PID namespace, so PID values are compared exactly: root, children,
 /// getpid/fork/vfork/wait4 results, and every other syscall return value.
+#[cfg_attr(
+    fbcode_build,
+    ignore = "fbsource-disabled: sandcastle-env: needs mount(2) in a fresh user and PID namespace"
+)]
 #[test]
 fn trap_only_matches_plain_ptrace_pid_for_pid_in_a_fresh_pid_namespace() {
     if let Ok(arm) = std::env::var(NAMESPACE_ARM_ENV) {

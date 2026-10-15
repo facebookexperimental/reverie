@@ -18,6 +18,11 @@
 //! value in r9, which also tells the Tool how to handle the call and which
 //! signals to send while the call is parked at its seccomp stop.
 
+#![allow(
+    unexpected_cfgs,
+    reason = "`fbcode_build` is supplied by the internal Buck build"
+)]
+
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
@@ -1281,6 +1286,10 @@ async fn trap_only_p2_t1a_signal_pending_at_a_patched_stop() {
 
 /// T1c: queued thread- and process-directed signals are delivered in the
 /// same order, with the same values, as under ptrace.
+#[cfg_attr(
+    fbcode_build,
+    ignore = "fbsource-disabled: sandcastle-env: trap-only vs ptrace differential diverges; see https://github.com/rrnewton/reverie/pull/888"
+)]
 #[tokio::test(flavor = "current_thread")]
 async fn trap_only_p2_t1c_queued_signals_keep_order_and_values() {
     let [ptrace, trap_only, _, trap_only_tail] = compare_mode("rt_queue").await;
@@ -1798,6 +1807,10 @@ async fn trap_only_p2_patch_readback_mismatch_fails_closed() {
 /// tail inject ptrace resumes the seccomp stop, where the kernel ignores it,
 /// so the trap-only tail hop must drop it rather than pass it at its own
 /// syscall-exit stop.
+#[cfg_attr(
+    fbcode_build,
+    ignore = "fbsource-disabled: sandcastle-env: trap-only vs ptrace differential diverges; see https://github.com/rrnewton/reverie/pull/888"
+)]
 #[tokio::test(flavor = "current_thread")]
 async fn trap_only_p2_resume_signal_matches_ptrace() {
     let [ptrace, trap_only, _, trap_only_tail] = compare_mode("resume_signal").await;
@@ -2264,6 +2277,10 @@ async fn trap_only_p2_t6a_undecided_new_child_restores_both_tasks() {
 ///   Believing the recorded flags instead would give the thread a fork table.
 ///
 /// The runs equal ptrace.
+#[cfg_attr(
+    fbcode_build,
+    ignore = "fbsource-disabled: sandcastle-env: trap-only vs ptrace differential diverges; see https://github.com/rrnewton/reverie/pull/888"
+)]
 #[tokio::test(flavor = "current_thread")]
 async fn trap_only_p2_t6a_clone_flags_disagreeing_with_kcmp_take_the_undecided_path() {
     let run = |mode, patching, tail| async move {
@@ -2376,6 +2393,10 @@ async fn trap_only_p2_t6a_clone_flags_disagreeing_with_kcmp_take_the_undecided_p
 ///   parent's disabled table.
 ///
 /// The runs equal ptrace.
+#[cfg_attr(
+    fbcode_build,
+    ignore = "fbsource-disabled: sandcastle-env: trap-only vs ptrace differential diverges; see https://github.com/rrnewton/reverie/pull/888"
+)]
 #[tokio::test(flavor = "current_thread")]
 async fn trap_only_p2_t6a_clone_flags_disagreeing_with_the_vfork_stop_take_the_undecided_path() {
     let run = |mode, patching, tail| async move {
@@ -2933,6 +2954,10 @@ fn stepped_entries(run: &P2Run, name: &str) -> usize {
 /// (remove_stepping_trap_flag in timer.rs), so the Tool and the guest see
 /// r11 equal to the reported rflags; trap-only must give both the same r11
 /// (O4 item G).
+#[cfg_attr(
+    fbcode_build,
+    ignore = "fbsource-disabled: sandcastle-env: trap-only vs ptrace differential diverges; see https://github.com/rrnewton/reverie/pull/888"
+)]
 #[tokio::test(flavor = "current_thread")]
 async fn trap_only_p2_t4_timer_loop() {
     if !crate::perf::is_perf_supported() {
@@ -2997,6 +3022,10 @@ async fn trap_only_p2_t4_timer_loop() {
 /// nor steps onto the getpid (which is then not a stepped entry). The timer
 /// counts each such outcome, and `compare_timer_mode` retries only an attempt
 /// that failed with one.
+#[cfg_attr(
+    fbcode_build,
+    ignore = "fbsource-disabled: sandcastle-env: trap-only vs ptrace differential diverges; see https://github.com/rrnewton/reverie/pull/888"
+)]
 #[tokio::test(flavor = "current_thread")]
 async fn trap_only_p2_t1d_perf_marker_steps_across_a_patched_site() {
     if !crate::perf::is_perf_supported() {

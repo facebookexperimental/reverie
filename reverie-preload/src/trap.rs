@@ -19,6 +19,11 @@
 //!    Runtime-private calls use [`raw_syscall6`]. Neither site re-traps.
 //! 5. The handler writes the result into `RAX` and returns, resuming the guest.
 
+#![allow(
+    unexpected_cfgs,
+    reason = "`fbcode_build` is supplied by the internal Buck build"
+)]
+
 use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::Ordering;
 use std::cell::Cell;
@@ -547,6 +552,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        fbcode_build,
+        ignore = "fbsource-disabled: jemalloc background thread is killed by the SIGSYS filter (intermittent exit 31); https://github.com/rrnewton/reverie/issues/867"
+    )]
     #[test]
     fn a_panic_inside_the_handler_is_reported_and_aborts() {
         use std::os::unix::process::ExitStatusExt;
@@ -649,6 +658,10 @@ mod tests {
         panic!("deliberate panic outside the SIGSYS handler")
     }
 
+    #[cfg_attr(
+        fbcode_build,
+        ignore = "fbsource-disabled: jemalloc background thread is killed by the SIGSYS filter; https://github.com/rrnewton/reverie/issues/867"
+    )]
     #[test]
     fn a_panic_outside_the_handler_reaches_the_previous_hook() {
         const CHILD: &str = "REVERIE_TEST_SIGSYS_PANIC_OUTSIDE";

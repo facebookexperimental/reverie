@@ -6,6 +6,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#![allow(
+    unexpected_cfgs,
+    reason = "`fbcode_build` is supplied by the internal Buck build"
+)]
+
 // Real CPUID Tool dispatch controls. All guest fixtures are loader-free unless
 // a test explicitly installs an executable image for its exec transition.
 use reverie::CpuIdResult;
@@ -190,6 +195,10 @@ fn run_cpuid(code: &[u8], config: (bool, u8), ownership: ThreadOwnership) -> (Cp
     (log, status)
 }
 
+#[cfg_attr(
+    fbcode_build,
+    ignore = "fbsource-disabled: sandcastle-env: needs /dev/kvm and exact PMU branch counts"
+)]
 #[test]
 fn cpuid_tool_returns_exact_full_registers_flags_stack_and_one_rpc_per_instruction() {
     for prefix in [
@@ -540,6 +549,10 @@ fn cpuid_dispatch_survives_real_fork_and_same_pid_exec() {
     );
 }
 
+#[cfg_attr(
+    fbcode_build,
+    ignore = "fbsource-disabled: sandcastle-env: needs /dev/kvm and exact PMU branch counts"
+)]
 #[test]
 fn cpuid_and_both_timestamp_forms_share_one_real_dispatcher_without_cross_charges() {
     let mut code = Vec::new();

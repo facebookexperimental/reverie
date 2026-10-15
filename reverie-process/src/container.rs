@@ -6,6 +6,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#![allow(
+    unexpected_cfgs,
+    reason = "`fbcode_build` is supplied by the internal Buck build"
+)]
+
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ffi::CString;
@@ -5266,6 +5271,10 @@ mod tests {
         );
     }
 
+    #[cfg_attr(
+        fbcode_build,
+        ignore = "fbsource-disabled: sandcastle-env: needs mount(2) in a fresh user and PID namespace"
+    )]
     #[test]
     fn test_directory_is_available_after_mount() {
         if crate::test_runs_in_own_process() {

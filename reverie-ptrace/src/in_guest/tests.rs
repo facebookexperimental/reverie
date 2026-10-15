@@ -6,6 +6,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#![allow(
+    unexpected_cfgs,
+    reason = "`fbcode_build` is supplied by the internal Buck build"
+)]
+
 use std::os::fd::AsRawFd;
 
 use super::*;
@@ -185,6 +190,10 @@ unsafe fn native_gate(number: i64, arguments: [u64; 6]) -> i64 {
     result
 }
 
+#[cfg_attr(
+    fbcode_build,
+    ignore = "fbsource-disabled: sandcastle-env: needs exact PMU branch counts"
+)]
 #[test]
 fn hardware_paused_clock_preserves_exact_branch_trajectory() {
     std::thread::spawn(|| {

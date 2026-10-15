@@ -6,6 +6,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#![allow(
+    unexpected_cfgs,
+    reason = "`fbcode_build` is supplied by the internal Buck build"
+)]
+
 use std::ffi::CStr;
 use std::ffi::CString;
 use std::future::Future;
@@ -38539,6 +38544,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        fbcode_build,
+        ignore = "fbsource-disabled: sandcastle-env: native read(2) ordering differs on the EdenFS test cwd"
+    )]
     #[test]
     fn read_zero_count_descriptor_errors_match_native_ordering() {
         let directory = TestDir::new();
@@ -38952,6 +38961,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        fbcode_build,
+        ignore = "fbsource-disabled: sandcastle-env: native read(2) ordering differs on the EdenFS test cwd"
+    )]
     #[test]
     fn read_zero_count_numeric_address_policy_preserves_endpoint_ordering() {
         // These are literal expectations for the existing four-level guest

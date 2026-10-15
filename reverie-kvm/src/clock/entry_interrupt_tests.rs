@@ -6,6 +6,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#![allow(
+    unexpected_cfgs,
+    reason = "`fbcode_build` is supplied by the internal Buck build"
+)]
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -175,6 +180,10 @@ fn reaches_getpid(vcpu: &mut CountedVcpu) {
     }
 }
 
+#[cfg_attr(
+    fbcode_build,
+    ignore = "fbsource-disabled: sandcastle-env: needs exact PMU branch counts"
+)]
 #[test]
 fn running_reserved_kick_retains_exact_finite_program_branch_total() {
     const BRANCHES: u32 = 1 << 28;

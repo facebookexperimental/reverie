@@ -156,6 +156,11 @@
 //!   only in the siginfo or number of SIGSTOP delivery stops: see
 //!   `trap_only_reraise_stops`.
 
+#![allow(
+    unexpected_cfgs,
+    reason = "`fbcode_build` is supplied by the internal Buck build"
+)]
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
@@ -2205,6 +2210,10 @@ mod tests {
     /// the probe; the two PIDs must be consecutive. A control arm that forks
     /// an ordinary child in between shows that one taken PID is visible.
     #[cfg(target_arch = "x86_64")]
+    #[cfg_attr(
+        fbcode_build,
+        ignore = "fbsource-disabled: sandcastle-env: needs mount(2) in a fresh user and PID namespace"
+    )]
     #[test]
     fn filtered_probe_takes_no_pid_in_a_fresh_pid_namespace() {
         fn fork_and_reap() -> libc::pid_t {
