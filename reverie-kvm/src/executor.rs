@@ -20505,10 +20505,29 @@ fn madvise(memory: &GuestMemory, args: &[u64; 6]) -> i64 {
     if plan.private_file {
         return negative_errno(libc::ENOSYS);
     }
+    // Linux drops private anonymous pages, which then read as zeros. Zero
+    // each run of physically contiguous pages with zero_lazily, so a large run
+    // (node drops its whole 512 MiB V8 reservation) is discarded rather than
+    // written and made resident (https://github.com/rrnewton/reverie/issues/1058).
+    let mut run: Option<(u64, u64)> = None;
     for page in plan.private_anonymous {
-        if memory.zero_raw(page, PAGE_SIZE as usize).is_err() {
-            return negative_errno(libc::EFAULT);
+        match run {
+            Some((start, length)) if start + length == page => {
+                run = Some((start, length + PAGE_SIZE));
+            }
+            _ => {
+                if let Some((start, length)) = run.replace((page, PAGE_SIZE))
+                    && memory.zero_lazily(start, length as usize).is_err()
+                {
+                    return negative_errno(libc::EFAULT);
+                }
+            }
         }
+    }
+    if let Some((start, length)) = run
+        && memory.zero_lazily(start, length as usize).is_err()
+    {
+        return negative_errno(libc::EFAULT);
     }
     if plan.unmapped {
         negative_errno(libc::ENOMEM)

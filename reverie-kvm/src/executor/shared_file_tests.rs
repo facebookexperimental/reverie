@@ -1454,4 +1454,111 @@ mod shared_file_dispatch_tests {
         f.memory.read_raw(physical, &mut bytes).unwrap();
         assert!(bytes.iter().all(|byte| *byte == 0));
     }
+
+    /// MADV_DONTNEED over private anonymous pages leaves them reading as
+    /// zeros; a large run is discarded, so it is no longer resident, and a
+    /// small run is written. Node drops its whole 512 MiB V8 reservation
+    /// this way (https://github.com/rrnewton/reverie/issues/1058).
+    #[test]
+    fn dontneed_drops_private_anonymous_pages_without_writing_large_runs() {
+        for (length, resident_after) in [
+            (crate::memory::LAZY_ZERO_MIN_BYTES as u64, Some(0)),
+            (4 * PAGE_SIZE, None),
+        ] {
+            let mut f = Fixture::with_linux_layout();
+            let private = (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS) as u64;
+            let read_write = (libc::PROT_READ | libc::PROT_WRITE) as u64;
+            let user = syscall_result(
+                &mut f.memory,
+                &mut f.state,
+                libc::SYS_mmap,
+                [0, length, read_write, private, u64::MAX, 0],
+            );
+            assert!(user > 0, "mmap returned {user}");
+            let physical = f.memory.user_range_to_guest(user as u64, length).unwrap();
+            f.memory
+                .write_raw(physical, &vec![0x6b; length as usize])
+                .unwrap();
+            assert_eq!(
+                syscall_result(
+                    &mut f.memory,
+                    &mut f.state,
+                    libc::SYS_madvise,
+                    [user as u64, length, libc::MADV_DONTNEED as u64, 0, 0, 0],
+                ),
+                0
+            );
+            if let Some(expected) = resident_after {
+                assert_eq!(resident_pages(&f.memory, physical, length), expected);
+            }
+            let mut bytes = vec![0xff; length as usize];
+            f.memory.read_raw(physical, &mut bytes).unwrap();
+            assert!(bytes.iter().all(|byte| *byte == 0), "{length} bytes");
+        }
+    }
+
+    /// MADV_DONTNEED over [2 MiB private | one MAP_SHARED anonymous page |
+    /// 2 MiB private] drops both private runs, leaving neither resident, and
+    /// keeps the shared page, whose contents Linux keeps: a run must never
+    /// span a page that is not private anonymous. Residency is checked before
+    /// the bytes are read back, since reading a discarded page makes it
+    /// resident again (https://github.com/rrnewton/reverie/issues/1058).
+    #[test]
+    fn dontneed_keeps_a_shared_page_between_two_lazy_private_runs() {
+        let mut f = Fixture::with_linux_layout();
+        let big = crate::memory::LAZY_ZERO_MIN_BYTES as u64;
+        let total = 2 * big + PAGE_SIZE;
+        let private = (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS) as u64;
+        let shared = (libc::MAP_SHARED | libc::MAP_ANONYMOUS | libc::MAP_FIXED) as u64;
+        let read_write = (libc::PROT_READ | libc::PROT_WRITE) as u64;
+        let user = syscall_result(
+            &mut f.memory,
+            &mut f.state,
+            libc::SYS_mmap,
+            [0, total, read_write, private, u64::MAX, 0],
+        );
+        assert!(user > 0, "mmap returned {user}");
+        let user = user as u64;
+        assert_eq!(
+            syscall_result(
+                &mut f.memory,
+                &mut f.state,
+                libc::SYS_mmap,
+                [user + big, PAGE_SIZE, read_write, shared, u64::MAX, 0],
+            ) as u64,
+            user + big
+        );
+        let physical = f.memory.user_range_to_guest(user, total).unwrap();
+        f.memory
+            .write_raw(physical, &vec![0x6b; total as usize])
+            .unwrap();
+        assert_eq!(
+            syscall_result(
+                &mut f.memory,
+                &mut f.state,
+                libc::SYS_madvise,
+                [user, total, libc::MADV_DONTNEED as u64, 0, 0, 0],
+            ),
+            0
+        );
+        assert_eq!(resident_pages(&f.memory, physical, big), 0);
+        assert_eq!(
+            resident_pages(&f.memory, physical + big + PAGE_SIZE, big),
+            0
+        );
+        let mut low = vec![0xff; big as usize];
+        f.memory.read_raw(physical, &mut low).unwrap();
+        let mut high = vec![0xff; big as usize];
+        f.memory
+            .read_raw(physical + big + PAGE_SIZE, &mut high)
+            .unwrap();
+        let mut middle = vec![0; PAGE_SIZE as usize];
+        f.memory.read_raw(physical + big, &mut middle).unwrap();
+        assert!(low.iter().all(|byte| *byte == 0));
+        assert!(high.iter().all(|byte| *byte == 0));
+        assert!(
+            middle.iter().all(|byte| *byte == 0x6b),
+            "the shared page lost its contents"
+        );
+    }
 }
