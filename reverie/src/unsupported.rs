@@ -20,6 +20,10 @@ pub enum UnsupportedOperation {
     /// the new image and left every thread of the group, the old image and
     /// the address space in place.
     NonLeaderExec,
+    /// The installed in-guest native exec route declined its owned dispatch,
+    /// original operation, live cut or controlled successor launch chain.
+    /// No replacement image ran; ordinary exec preparation can roll back.
+    NativeExec,
 }
 
 /// A backend's refusal of an injected syscall that it cannot perform, as

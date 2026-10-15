@@ -30,6 +30,14 @@ pub mod installed_stack;
 #[cfg(feature = "coordinator-rpc")]
 pub mod installed_tool;
 pub mod instruction;
+#[cfg(feature = "exec-native-injection")]
+pub mod native_exec;
+#[cfg(feature = "exec-native-injection")]
+pub mod native_exec_arguments;
+#[cfg(feature = "exec-native-injection")]
+pub mod native_exec_fds;
+#[cfg(feature = "exec-native-injection")]
+pub mod native_exec_mappings;
 pub mod protect;
 pub mod restorer;
 #[cfg(feature = "coordinator-rpc")]

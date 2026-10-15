@@ -235,12 +235,82 @@ impl Drop for CallbackStack {
     }
 }
 
+/// Kernel-frame observation bound to one actual running fallback. This does
+/// not grant exec authorization or supply watched-birth/target proof.
+#[cfg(feature = "exec-native-injection")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeExecResumeReceipt {
+    owner: usize,
+    tid: i64,
+    generation: u64,
+    mask: u64,
+    number: i64,
+    args: [u64; 6],
+    instruction: u64,
+    pkru: Option<u32>,
+}
+
+#[cfg(feature = "exec-native-injection")]
+impl NativeExecResumeReceipt {
+    /// Exact guest uc_sigmask captured before the first genuine rt_sigreturn.
+    pub fn signal_mask(&self) -> u64 {
+        self.mask
+    }
+    /// Actual continuation generation, not a ticket capability.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub(crate) fn recheck(&self, event: &super::event::SyscallEvent) -> bool {
+        native_exec_resume_receipt(event).as_ref() == Some(self)
+    }
+}
+
+/// Observe only the actual running syscall continuation and captured resume
+/// mask. No whole-owner/context reference is formed: the Tool already owns a
+/// mutable borrow of the disjoint context field for this callback.
+#[cfg(feature = "exec-native-injection")]
+pub fn native_exec_resume_receipt(
+    event: &super::event::SyscallEvent,
+) -> Option<NativeExecResumeReceipt> {
+    if !matches!(event.dispatch, super::event::SyscallDispatch::Fallback) {
+        return None;
+    }
+    let pointer = OWNER.get();
+    if pointer.is_null() {
+        return None;
+    }
+    let pending = PENDING.get()?;
+    // Retained storage, exclusively owned by this thread; disjoint fields.
+    let receipt = unsafe { (&raw const (*pointer).native_exec_resume).read() }?;
+    let phase = unsafe { (&raw const (*pointer).phase).read() };
+    let tid = unsafe { (&raw const (*pointer).owner_tid).read() };
+    let generation = unsafe { (&raw const (*pointer).generation).read() };
+    if phase != Phase::Running
+        || tid != current_tid()
+        || receipt.tid != tid
+        || receipt.owner != pointer as usize
+        || receipt.generation != generation
+        || pending.kind != PendingKind::Syscall
+        || pending.instruction != receipt.instruction
+        || event.context != unsafe { (&raw const (*pointer).context) as usize }
+        || event.number != receipt.number
+        || event.args != receipt.args
+        || event.instruction_pointer != receipt.instruction
+        || event.guest_pkru != receipt.pkru
+    {
+        return None;
+    }
+    Some(receipt)
+}
+
 struct Continuation {
     stack: CallbackStack,
     saved: SavedState,
     context: RegisterContext,
     owner_tid: i64,
     generation: u64,
+    #[cfg(feature = "exec-native-injection")]
+    native_exec_resume: Option<NativeExecResumeReceipt>,
     phase: Phase,
     entries: u64,
     callbacks: u64,
@@ -305,6 +375,8 @@ pub fn initialize_with_stack_backing(backing: StackBacking) -> io::Result<()> {
             context: RegisterContext::default(),
             owner_tid: current_tid(),
             generation: 0,
+            #[cfg(feature = "exec-native-injection")]
+            native_exec_resume: None,
             phase: Phase::Idle,
             entries: 0,
             callbacks: 0,
@@ -435,6 +507,29 @@ fn prepare_signal_for(
         return Err(FrameError);
     }
     owner.context = context_from_image(&owner.saved, instruction);
+    #[cfg(feature = "exec-native-injection")]
+    {
+        // SavedState has no mask. Only the kernel uc_sigmask is the desired
+        // guest resume mask, before the first genuine rt_sigreturn.
+        owner.native_exec_resume =
+            (request.kind == PendingKind::Syscall).then_some(NativeExecResumeReceipt {
+                owner: pointer as usize,
+                tid: owner.owner_tid,
+                generation: owner.generation,
+                mask: frame.signal_mask(),
+                number: owner.context.rax as i64,
+                args: [
+                    owner.context.rdi,
+                    owner.context.rsi,
+                    owner.context.rdx,
+                    owner.context.r10,
+                    owner.context.r8,
+                    owner.context.r9,
+                ],
+                instruction,
+                pkru: owner.saved.pkru(),
+            });
+    }
     owner.phase = Phase::Captured;
     frame.set_register(libc::REG_RSP as usize, (owner.stack.top & !15) as i64);
     frame.set_register(libc::REG_RDI as usize, pointer as i64);
@@ -516,6 +611,10 @@ pub fn rebind_fork_child() {
     if !pointer.is_null() {
         unsafe {
             (*pointer).owner_tid = current_tid();
+            #[cfg(feature = "exec-native-injection")]
+            {
+                (*pointer).native_exec_resume = None;
+            }
             // The entry/callback happened in the parent. The child inherits
             // its active image but physically receives only its completion.
             (*pointer).entries = 0;
@@ -755,6 +854,67 @@ pub(crate) fn is_completion_address(address: u64) -> bool {
     address == core::ptr::addr_of!(fallback_completion_return) as usize as u64
 }
 
+/// Test-only violations against an already captured genuine running event.
+/// No receipt or mask is fabricated; each owner mutation is restored exactly.
+#[cfg(all(test, feature = "exec-native-injection"))]
+pub(crate) fn native_exec_test_binding_controls(event: &super::event::SyscallEvent) {
+    use super::event::SyscallDispatch;
+    let receipt = native_exec_resume_receipt(event).expect("genuine running receipt");
+    for index in 0..6 {
+        let mut changed = *event;
+        changed.args[index] ^= 1;
+        assert!(
+            native_exec_resume_receipt(&changed).is_none(),
+            "argument {index}"
+        );
+    }
+    for index in 0..6 {
+        let mut changed = *event;
+        match index {
+            0 => changed.number ^= 1,
+            1 => changed.context ^= 8,
+            2 => changed.instruction_pointer ^= 1,
+            3 => changed.dispatch = SyscallDispatch::Trap,
+            4 => changed.dispatch = SyscallDispatch::InstalledHook,
+            5 => changed.guest_pkru = changed.guest_pkru.map(|v| v ^ 1).or(Some(1)),
+            _ => unreachable!(),
+        }
+        assert!(native_exec_resume_receipt(&changed).is_none());
+    }
+    let pointer = OWNER.get();
+    unsafe {
+        let generation = (&raw const (*pointer).generation).read();
+        (&raw mut (*pointer).generation).write(generation.checked_add(1).unwrap());
+        assert!(!receipt.recheck(event));
+        (&raw mut (*pointer).generation).write(generation);
+        let phase = (&raw const (*pointer).phase).read();
+        for other in [Phase::Idle, Phase::Captured, Phase::ReadyToReturn] {
+            (&raw mut (*pointer).phase).write(other);
+            assert!(native_exec_resume_receipt(event).is_none());
+        }
+        (&raw mut (*pointer).phase).write(phase);
+        let tid = (&raw const (*pointer).owner_tid).read();
+        (&raw mut (*pointer).owner_tid).write(tid.checked_add(1).unwrap());
+        assert!(native_exec_resume_receipt(event).is_none());
+        (&raw mut (*pointer).owner_tid).write(tid);
+    }
+    let pending = PENDING.get();
+    PENDING.set(None);
+    assert!(native_exec_resume_receipt(event).is_none());
+    PENDING.set(Some(Pending {
+        instruction: event.instruction_pointer,
+        kind: PendingKind::Instruction(InstructionEventKind::Cpuid),
+    }));
+    assert!(native_exec_resume_receipt(event).is_none());
+    PENDING.set(Some(Pending {
+        instruction: event.instruction_pointer ^ 1,
+        kind: PendingKind::Syscall,
+    }));
+    assert!(native_exec_resume_receipt(event).is_none());
+    PENDING.set(pending);
+    assert_eq!(native_exec_resume_receipt(event), Some(receipt));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -878,6 +1038,8 @@ mod tests {
             context: RegisterContext::default(),
             owner_tid: current_tid(),
             generation: 0,
+            #[cfg(feature = "exec-native-injection")]
+            native_exec_resume: None,
             phase: Phase::Idle,
             entries: 0,
             callbacks: 0,

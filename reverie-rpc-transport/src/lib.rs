@@ -66,6 +66,7 @@
 mod blocking_client;
 pub mod codec;
 pub mod initial_image;
+pub mod successor;
 
 mod client;
 mod envelope;
@@ -83,6 +84,7 @@ pub use blocking_client::BorrowedBlockingRpcClient;
 pub use blocking_client::InitialImageClient;
 pub use blocking_client::RpcRequest;
 pub use blocking_client::RpcResponse;
+pub use blocking_client::SuccessorClient;
 pub use blocking_client::read_config_frame;
 pub use client::RpcClient;
 pub use envelope::RequestEnvelope;

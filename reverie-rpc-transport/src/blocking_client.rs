@@ -107,6 +107,43 @@ pub struct InitialImageClient<G: GlobalTool, S = UnixStream> {
     client: BlockingRpcClient<G, S>,
 }
 
+/// Owned explicit successor exchange, preserving the same RPC connection.
+///
+/// Construction requires the acknowledged expected digests and exact raw
+/// Config/state frames. This does not attest the admission hook's policy.
+pub struct SuccessorClient<G: GlobalTool, S = UnixStream> {
+    client: BlockingRpcClient<G, S>,
+    state: crate::successor::VerifiedSuccessorState,
+}
+
+impl<G: GlobalTool, S> SuccessorClient<G, S> {
+    /// Config decoded only after both raw frame digests have matched.
+    pub fn config(&self) -> &G::Config {
+        &self.client.config
+    }
+
+    /// The checked opaque state; its typed consumer must decode exactly.
+    pub fn state(&self) -> &crate::successor::VerifiedSuccessorState {
+        &self.state
+    }
+
+    /// Transfer the same live stream and checked state without reconnecting.
+    pub fn into_parts(
+        self,
+    ) -> (
+        BlockingRpcClient<G, S>,
+        crate::successor::VerifiedSuccessorState,
+    ) {
+        (self.client, self.state)
+    }
+}
+
+impl<G: GlobalTool, S: AsRawFd> AsRawFd for SuccessorClient<G, S> {
+    fn as_raw_fd(&self) -> RawFd {
+        self.client.as_raw_fd()
+    }
+}
+
 impl<G: GlobalTool, S> InitialImageClient<G, S> {
     /// Configuration decoded only after the independently expected hash matched.
     pub fn config(&self) -> &G::Config {
@@ -184,6 +221,25 @@ where
         }
     }
 
+    /// Redeem an explicit one-use successor ticket on the configured native
+    /// image endpoint. Expected digests must come from the protected admitted
+    /// input, independently of this connection's response. There is no
+    /// InitialImage or ordinary-connect fallback.
+    pub fn connect_successor(
+        path: impl AsRef<Path>,
+        tid: Tid,
+        request: crate::successor::SuccessorRequest<'_>,
+    ) -> Result<SuccessorClient<G>, RpcError> {
+        // Preserve validation before the ordinary connection side effect.
+        let request_bytes = crate::successor::encode_redemption(request)?;
+        Self::successor_from_encoded_request(
+            UnixStream::connect(path)?,
+            tid,
+            request,
+            request_bytes,
+        )
+    }
+
     /// Connect and synchronously receive the coordinator's config handshake.
     pub fn connect(path: impl AsRef<Path>, tid: Tid) -> Result<Self, RpcError> {
         Self::from_connected_stream(UnixStream::connect(path)?, tid)
@@ -202,8 +258,43 @@ where
         redemption: &[u8],
         expected_config_digest: crate::initial_image::ConfigDigest,
     ) -> Result<InitialImageClient<G>, RpcError> {
+        // Preserve validation before the ordinary connection side effect.
         let request = crate::initial_image::encode_redemption(redemption)?;
-        let mut stream = UnixStream::connect(path)?;
+        Self::initial_image_from_encoded_request(
+            UnixStream::connect(path)?,
+            tid,
+            request,
+            expected_config_digest,
+        )
+    }
+}
+
+impl<G, S> BlockingRpcClient<G, S>
+where
+    G: GlobalTool,
+    S: Read + Write + Send,
+{
+    /// Redeem InitialImage authorization on the supplied owned connection.
+    ///
+    /// This runs the same framing, exact acknowledgement and independently
+    /// expected Config digest checks as `connect_initial_image`. The stream is
+    /// retained through installation; supplying it grants no admission authority.
+    pub fn initial_image_from_connected_stream(
+        stream: S,
+        tid: Tid,
+        redemption: &[u8],
+        expected_config_digest: crate::initial_image::ConfigDigest,
+    ) -> Result<InitialImageClient<G, S>, RpcError> {
+        let request = crate::initial_image::encode_redemption(redemption)?;
+        Self::initial_image_from_encoded_request(stream, tid, request, expected_config_digest)
+    }
+
+    fn initial_image_from_encoded_request(
+        mut stream: S,
+        tid: Tid,
+        request: Vec<u8>,
+        expected_config_digest: crate::initial_image::ConfigDigest,
+    ) -> Result<InitialImageClient<G, S>, RpcError> {
         write_message(&mut stream, &request)?;
         let acknowledgement = read_message(&mut stream, crate::initial_image::MAX_FRAME_LEN)?;
         crate::initial_image::check_ack(&acknowledgement, expected_config_digest)?;
@@ -223,13 +314,52 @@ where
             },
         })
     }
-}
 
-impl<G, S> BlockingRpcClient<G, S>
-where
-    G: GlobalTool,
-    S: Read + Write + Send,
-{
+    /// Redeem a successor ticket on the supplied owned connection.
+    ///
+    /// The exact acknowledgement, raw Config digest and bounded verified
+    /// successor state use the existing shared exchange. There is no ordinary
+    /// or InitialImage fallback, reconnect or independently constructed client.
+    pub fn successor_from_connected_stream(
+        stream: S,
+        tid: Tid,
+        request: crate::successor::SuccessorRequest<'_>,
+    ) -> Result<SuccessorClient<G, S>, RpcError> {
+        let request_bytes = crate::successor::encode_redemption(request)?;
+        Self::successor_from_encoded_request(stream, tid, request, request_bytes)
+    }
+
+    fn successor_from_encoded_request(
+        mut stream: S,
+        tid: Tid,
+        request: crate::successor::SuccessorRequest<'_>,
+        request_bytes: Vec<u8>,
+    ) -> Result<SuccessorClient<G, S>, RpcError> {
+        write_message(&mut stream, &request_bytes)?;
+        let acknowledgement = read_message(&mut stream, crate::successor::MAX_CONTROL_LEN)?;
+        crate::successor::check_ack(&acknowledgement, request)?;
+        let config_bytes = read_message(&mut stream, DEFAULT_MAX_FRAME_LEN)?;
+        if crate::initial_image::config_digest(&config_bytes) != request.expected.config {
+            return Err(crate::successor::invalid(
+                "successor raw Config digest differs",
+            ));
+        }
+        let state_bytes = read_message(&mut stream, crate::successor::MAX_STATE_LEN)?;
+        let state =
+            crate::successor::VerifiedSuccessorState::from_checked_frame(request, state_bytes)?;
+        let config =
+            crate::codec::decode_exact_bounded::<G::Config, DEFAULT_MAX_FRAME_LEN>(&config_bytes)?;
+        Ok(SuccessorClient {
+            client: Self {
+                tid,
+                config,
+                stream: Mutex::new(stream),
+                _phantom: PhantomData,
+            },
+            state,
+        })
+    }
+
     /// Receive the config handshake from an already connected byte stream.
     ///
     /// Deserialization happens synchronously on the caller. Keep a separate
@@ -430,6 +560,9 @@ fn read_message(stream: &mut impl Read, max_len: usize) -> Result<Vec<u8>, RpcEr
     stream.read_exact(&mut payload)?;
     Ok(payload)
 }
+
+#[cfg(test)]
+mod connected_image_tests;
 
 #[cfg(test)]
 mod io_scope_tests;

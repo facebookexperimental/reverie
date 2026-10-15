@@ -13,6 +13,8 @@ use reverie_inguest::guest::context::RegisterContext;
 use reverie_inguest::guest::host::HostRuntime;
 use reverie_inguest::guest::host::ToolHost;
 use reverie_inguest::guest::installed_tool;
+#[cfg(feature = "exec-private-init")]
+use reverie_inguest::guest::rpc::GuestRpcStream;
 use reverie_inguest::trap::raw_syscall6;
 
 use crate::rpc::CoordinatorRpc;
@@ -53,6 +55,8 @@ const _: () = {
 /// LiteInst's services for the in-guest Tool host.
 struct LiteinstRuntime {
     stats: crate::stats::GuestStatsHooks,
+    #[cfg(feature = "exec-native-injection")]
+    no_rcb: bool,
 }
 
 impl HostRuntime for LiteinstRuntime {
@@ -83,6 +87,13 @@ impl HostRuntime for LiteinstRuntime {
     }
 
     fn read_clock(&self) -> io::Result<u64> {
+        #[cfg(feature = "exec-native-injection")]
+        if self.no_rcb {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "native first-domain RCB clock is unsupported",
+            ));
+        }
         runtime::read_guest_rcb_clock()
     }
 
@@ -124,6 +135,10 @@ where
             runtime::PatchPublication::Concurrent,
             #[cfg(feature = "exec-private-init")]
             None,
+            #[cfg(feature = "exec-native-injection")]
+            None,
+            #[cfg(feature = "exec-native-injection")]
+            false,
         )
     }
 }
@@ -153,6 +168,10 @@ where
             runtime::PatchPublication::Quiescent,
             #[cfg(feature = "exec-private-init")]
             None,
+            #[cfg(feature = "exec-native-injection")]
+            None,
+            #[cfg(feature = "exec-native-injection")]
+            false,
         )
     }
 }
@@ -180,8 +199,59 @@ where
             runtime::PatchPublication::Concurrent,
             #[cfg(feature = "exec-private-init")]
             None,
+            #[cfg(feature = "exec-native-injection")]
+            None,
+            #[cfg(feature = "exec-native-injection")]
+            false,
         )
     }
+}
+
+#[cfg(feature = "exec-private-init")]
+#[derive(Clone, Copy)]
+pub(crate) enum PrivateImageControl<'a> {
+    Initial(&'a reverie_inguest::guest::exec_private::InitialImageControl),
+    #[cfg(feature = "exec-native-injection")]
+    Successor(&'a reverie_inguest::guest::exec_private::SuccessorImageControl),
+}
+
+#[cfg(feature = "exec-private-init")]
+impl PrivateImageControl<'_> {
+    fn check_vdso_context(self) -> io::Result<()> {
+        match self {
+            Self::Initial(control) => control.check_initial_vdso_context(),
+            #[cfg(feature = "exec-native-injection")]
+            Self::Successor(control) => control.check_successor_vdso_context(),
+        }
+    }
+
+    fn prepare_signal_state(
+        self,
+        instructions: runtime::InstructionSubscriptions,
+    ) -> io::Result<()> {
+        match self {
+            Self::Initial(control) => control.prepare_signal_state(instructions),
+            #[cfg(feature = "exec-native-injection")]
+            Self::Successor(control) => control.prepare_signal_state(instructions),
+        }
+    }
+}
+
+#[cfg(feature = "exec-private-init")]
+enum ImageInstall<'a, T: Tool> {
+    Initial(
+        reverie_rpc_transport::InitialImageClient<T::GlobalState, GuestRpcStream>,
+        &'a reverie_inguest::guest::exec_private::InitialImageControl,
+        &'a reverie_inguest::guest::exec_private::InitialImageAbortGuard,
+    ),
+    #[cfg(feature = "exec-native-injection")]
+    Successor {
+        client: reverie_rpc_transport::BlockingRpcClient<T::GlobalState, GuestRpcStream>,
+        control: &'a reverie_inguest::guest::exec_private::SuccessorImageControl,
+        tool: T,
+        state: T::ThreadState,
+        consumer: &'a mut dyn NativeSuccessorConsumer<T>,
+    },
 }
 
 /// Authenticated client and one native control prepared before Detcore setup.
@@ -191,7 +261,7 @@ pub struct PreparedInitialImage<T: Tool> {
     // Fields drop in declaration order: abandon before any generic Config or
     // client destructor can run, allocate, block, or panic.
     fatal: reverie_inguest::guest::exec_private::InitialImageAbortGuard,
-    client: reverie_rpc_transport::InitialImageClient<T::GlobalState>,
+    client: reverie_rpc_transport::InitialImageClient<T::GlobalState, GuestRpcStream>,
     control: reverie_inguest::guest::exec_private::InitialImageControl,
 }
 
@@ -223,7 +293,7 @@ impl InstalledInitialImage {
 /// config must not require RCB time, preemption, threads, forks or exec yet.
 #[cfg(feature = "exec-private-init")]
 pub unsafe fn prepare_tool_initial_image<T: Tool>(
-    client: reverie_rpc_transport::InitialImageClient<T::GlobalState>,
+    client: reverie_rpc_transport::InitialImageClient<T::GlobalState, GuestRpcStream>,
     native: *mut reverie_inguest::guest::exec_private::NativeControl,
 ) -> io::Result<PreparedInitialImage<T>> {
     let fatal = unsafe { reverie_inguest::guest::exec_private::InitialImageAbortGuard::arm() };
@@ -262,10 +332,289 @@ where
             coordinator.as_ref(),
             false,
             runtime::PatchPublication::Quiescent,
-            Some((client, &control, &fatal)),
+            Some(ImageInstall::Initial(client, &control, &fatal)),
+            #[cfg(feature = "exec-native-injection")]
+            None,
+            #[cfg(feature = "exec-native-injection")]
+            false,
         )?;
     }
     Ok(InstalledInitialImage { control, fatal })
+}
+
+/// Trusted consumer for an actual admitted native successor image.
+///
+/// # Safety
+/// The implementation must retain real watched-birth/Issued/kernel-exec and
+/// immutable bootstrap/allocator/Config/source-closure authority. Qualification
+/// must inspect the same actual Config and reject every PMU/RCB/preemption/time,
+/// thread/fork, guest-handler or site-patching requirement outside this first
+/// domain; skipping PMU setup never disables a requested feature. Decode must
+/// consume the full bounded authenticated composite exactly, validate every
+/// Tool/thread/runtime/Config/cut identity, and return the actual saved Tool and
+/// thread state. Neither digests nor request IDs create capability.
+/// Restore must use actual fresh collectors and checked sequence once, refuse
+/// existing activity, and prove the genuine DETLOG cut before any observer or
+/// guest work. Complete must send the real typed CompleteNativeExec on the
+/// provided installed RPC, retain consumption on error, and return only the
+/// exact received response binding. No local matching value or boolean is ACK.
+/// Trusted qualification, decode/restore and Tool setup must not unwind or
+/// permit guest/observer work. Tool/Config/state teardown during failed native
+/// setup must not mutate physical/runtime ownership or unwind; ordinary Tool
+/// installation contracts remain unchanged. Explicit returned failures take
+/// the fixed terminal edge before installer-owned teardown.
+/// Destruction after successful finish must not invalidate retained mappings,
+/// FDs, frontend or launch authority; hand off such ownership before returning.
+#[cfg(feature = "exec-native-injection")]
+pub unsafe trait NativeSuccessorConsumer<T: Tool>: Send {
+    fn qualify_config(
+        &self,
+        config: &<T::GlobalState as reverie::GlobalTool>::Config,
+    ) -> io::Result<()>;
+
+    fn decode_verified(
+        &mut self,
+        config: &<T::GlobalState as reverie::GlobalTool>::Config,
+        state: &reverie_rpc_transport::successor::VerifiedSuccessorState,
+        binding: reverie_inguest::guest::exec_private::SuccessorBinding,
+    ) -> io::Result<(T, T::ThreadState)>;
+
+    fn restore_fresh_runtime(
+        &mut self,
+        binding: reverie_inguest::guest::exec_private::SuccessorBinding,
+    ) -> io::Result<()>;
+
+    fn complete(
+        &mut self,
+        rpc: &CoordinatorRpc<T::GlobalState>,
+        binding: reverie_inguest::guest::exec_private::SuccessorBinding,
+    ) -> io::Result<reverie_inguest::guest::exec_private::SuccessorBinding>;
+}
+
+#[cfg(feature = "exec-native-injection")]
+fn require_native_success<V>(result: io::Result<V>) -> V {
+    match result {
+        Ok(value) => value,
+        Err(_) => unsafe {
+            // Native initialization cannot return to generic owned teardown
+            // after a failed authenticated operation. The fixed terminal gate
+            // is owned before these explicit entry points are invoked.
+            reverie_inguest::guest::exec_private::initialization_failed(core::ptr::null_mut())
+        },
+    }
+}
+
+#[cfg(feature = "exec-native-injection")]
+struct SuccessorAbortGuard {
+    active: bool,
+}
+
+#[cfg(feature = "exec-native-injection")]
+impl Drop for SuccessorAbortGuard {
+    fn drop(&mut self) {
+        if self.active {
+            // SAFETY: only authenticated native preparation constructs this
+            // guard, owning the actual inherited fixed terminal gate.
+            unsafe {
+                reverie_inguest::guest::exec_private::initialization_failed(core::ptr::null_mut())
+            }
+        }
+    }
+}
+
+/// One affine authenticated successor, with its complete decoded Tool/state.
+#[cfg(feature = "exec-native-injection")]
+pub struct PreparedSuccessorImage<T: Tool> {
+    // Terminal before generic client, Tool/state, consumer or control drops.
+    fatal: SuccessorAbortGuard,
+    client: reverie_rpc_transport::BlockingRpcClient<T::GlobalState, GuestRpcStream>,
+    tool: T,
+    state: T::ThreadState,
+    consumer: Box<dyn NativeSuccessorConsumer<T>>,
+    control: reverie_inguest::guest::exec_private::SuccessorImageControl,
+}
+
+/// Actual installed successor retaining fatal ownership until exact completion.
+#[cfg(feature = "exec-native-injection")]
+pub struct InstalledSuccessorImage<T: Tool> {
+    fatal: SuccessorAbortGuard,
+    consumer: Box<dyn NativeSuccessorConsumer<T>>,
+    control: reverie_inguest::guest::exec_private::SuccessorImageControl,
+}
+
+#[cfg(feature = "exec-native-injection")]
+impl<T: Tool + 'static> InstalledSuccessorImage<T> {
+    /// Run the real post-exec once on actual restored Tool/state. Guest/observer
+    /// work remains forbidden; the entry must be the actual native resume.
+    pub fn run_post_exec_before_loader(
+        &self,
+        entry: &mut reverie_inguest::guest::exec_private::ImageGuestEntry,
+    ) -> io::Result<()> {
+        // SAFETY: this affine installed successor retains the actual control,
+        // entry/fatal ownership and exclusive pre-loader interval.
+        unsafe { installed_tool::run_successor_post_exec(entry, &self.control) }
+    }
+
+    /// Consume after the real lifecycle and exact received completion ACK.
+    /// Existing physical control checks run before and after the exchange.
+    ///
+    /// # Safety
+    /// Retain the native bootstrap/leases and exclude guest/observer work until
+    /// successful return and the runner's existing native handover. The unsafe
+    /// consumer must satisfy its real completion and resource-handoff contract.
+    pub unsafe fn finish(mut self) -> io::Result<()> {
+        unsafe {
+            installed_tool::finish_successor_image::<T::GlobalState>(
+                &self.control,
+                |rpc, binding| self.consumer.complete(rpc, binding),
+            )?;
+        }
+        self.fatal.active = false;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "exec-native-injection")]
+fn check_successor_binding(
+    state: &reverie_rpc_transport::successor::VerifiedSuccessorState,
+    binding: reverie_inguest::guest::exec_private::SuccessorBinding,
+) -> io::Result<()> {
+    if binding.generation == 0
+        || binding.ticket == [0; 32]
+        || binding.state == [0; 32]
+        || binding.config == [0; 32]
+        || state.ticket_digest() != binding.ticket
+        || state.expected().state != binding.state
+        || state.expected().config != binding.config
+    {
+        return Err(io::Error::other(
+            "successor admitted transport binding differs",
+        ));
+    }
+    Ok(())
+}
+
+/// Decode a genuinely redeemed successor before publishing its native control.
+///
+/// # Safety
+/// The actual SuccessorClient and independent binding must name this genuine
+/// successful kernel exec and retained watched birth. The inherited fixed
+/// terminal gate, private loader/Tool FS/control extents and fresh allocator
+/// must already be authenticated; no guest code may have run. The consumer
+/// must uphold every unsafe trait contract. Errors or abandonment are terminal.
+#[cfg(feature = "exec-native-injection")]
+pub unsafe fn prepare_tool_successor_image<T: Tool + 'static>(
+    client: reverie_rpc_transport::SuccessorClient<T::GlobalState, GuestRpcStream>,
+    native: *mut reverie_inguest::guest::exec_private::NativeControl,
+    binding: reverie_inguest::guest::exec_private::SuccessorBinding,
+    mut consumer: Box<dyn NativeSuccessorConsumer<T>>,
+) -> io::Result<PreparedSuccessorImage<T>> {
+    let fatal = SuccessorAbortGuard { active: true };
+    let _private_allocations = reverie_inguest::guest::alloc::enter_dispatch();
+    require_native_success(crate::patch_alloc::preflight_allocator());
+    require_native_success(check_successor_binding(client.state(), binding));
+    require_native_success(consumer.qualify_config(client.config()));
+    let (tool, state) =
+        require_native_success(consumer.decode_verified(client.config(), client.state(), binding));
+    let control = require_native_success(unsafe {
+        reverie_inguest::guest::exec_private::publish_authenticated_successor_control(
+            native, binding,
+        )
+    });
+    let (client, verified) = client.into_parts();
+    drop(verified);
+    Ok(PreparedSuccessorImage {
+        fatal,
+        client,
+        tool,
+        state,
+        consumer,
+        control,
+    })
+}
+
+/// Install the actual native successor Tool/frontend from the prepared image.
+/// Real post-exec and finish remain mandatory before loader entry.
+///
+/// # Safety
+/// Keep the authenticated exclusive private Tool FS/stack/bootstrap interval;
+/// no guest, handler or observer work may run. The driver must retain genuine
+/// native authority and satisfy its unsafe contracts, without reacquiring the
+/// host's Tool/state locks. The runtime consumer owns exact fresh restoration.
+#[cfg(feature = "exec-native-injection")]
+pub unsafe fn install_tool_successor_image<T: Tool + 'static>(
+    coordinator: impl AsRef<Path>,
+    prepared: PreparedSuccessorImage<T>,
+    driver: std::sync::Arc<dyn reverie_inguest::guest::native_exec::NativeExecDriver<T>>,
+) -> io::Result<InstalledSuccessorImage<T>> {
+    // Keep the affine prepared owner intact while trusted qualification runs.
+    let _private_allocations = reverie_inguest::guest::alloc::enter_dispatch();
+    require_native_success(prepared.consumer.qualify_config(prepared.client.config()));
+    let PreparedSuccessorImage {
+        fatal,
+        client,
+        tool,
+        state,
+        mut consumer,
+        control,
+    } = prepared;
+    unsafe {
+        install_tool_inner::<T>(
+            coordinator.as_ref(),
+            false,
+            runtime::PatchPublication::Quiescent,
+            Some(ImageInstall::Successor {
+                client,
+                control: &control,
+                tool,
+                state,
+                consumer: &mut *consumer,
+            }),
+            Some(driver),
+            true,
+        )?;
+    }
+    Ok(InstalledSuccessorImage {
+        fatal,
+        consumer,
+        control,
+    })
+}
+
+/// Install an authenticated initial image with its concrete native exec driver
+/// before the first dispatch. Ordinary InitialImage installation is unchanged.
+///
+/// # Safety
+/// All InitialImage and NativeExecDriver contracts apply. `qualify` must inspect
+/// this same actual Config and explicitly reject unsupported PMU/RCB/time,
+/// preemption, threads/forks, guest handlers and site-patching requirements
+/// before PMU initialization is skipped. It must not disable requested features
+/// or accept a synthetic Config. Retain real native birth/launch authority.
+#[cfg(feature = "exec-native-injection")]
+pub unsafe fn install_tool_initial_image_with_native_exec<T: Tool + 'static>(
+    coordinator: impl AsRef<Path>,
+    prepared: PreparedInitialImage<T>,
+    driver: std::sync::Arc<dyn reverie_inguest::guest::native_exec::NativeExecDriver<T>>,
+    qualify: impl FnOnce(&<T::GlobalState as reverie::GlobalTool>::Config) -> io::Result<()>,
+) -> io::Result<InstalledInitialImage> {
+    let PreparedInitialImage {
+        fatal,
+        client,
+        control,
+    } = prepared;
+    let _private_allocations = reverie_inguest::guest::alloc::enter_dispatch();
+    require_native_success(qualify(client.config()));
+    unsafe {
+        install_tool_inner::<T>(
+            coordinator.as_ref(),
+            false,
+            runtime::PatchPublication::Quiescent,
+            Some(ImageInstall::Initial(client, &control, &fatal)),
+            Some(driver),
+            true,
+        )?;
+    }
+    Ok(InstalledInitialImage { fatal, control })
 }
 
 /// Run genuine eager lifecycle on the actual installed InitialImage Tool.
@@ -299,9 +648,9 @@ fn initial_vdso_mprotect_result(result: i64, restoring: bool) -> Result<(), reve
 #[cfg(feature = "exec-private-init")]
 unsafe fn patch_initial_image_vdso(
     subscriptions: &reverie::Subscription,
-    control: &reverie_inguest::guest::exec_private::InitialImageControl,
+    control: PrivateImageControl<'_>,
 ) -> Result<(), reverie::Error> {
-    control.check_initial_vdso_context()?;
+    control.check_vdso_context()?;
     let mut owned_extent = None;
     let mut step = 0_u8;
     // SAFETY: the same authenticated control/fatal owner spans this call.
@@ -336,7 +685,7 @@ unsafe fn patch_initial_image_vdso(
             },
         )?;
     }
-    control.check_initial_vdso_context()?;
+    control.check_vdso_context()?;
     Ok(())
 }
 
@@ -410,15 +759,30 @@ unsafe fn install_tool_inner<T>(
     coordinator: &Path,
     remove_legacy_environment: bool,
     publication: runtime::PatchPublication,
-    #[cfg(feature = "exec-private-init")] initial: Option<(
-        reverie_rpc_transport::InitialImageClient<T::GlobalState>,
-        &reverie_inguest::guest::exec_private::InitialImageControl,
-        &reverie_inguest::guest::exec_private::InitialImageAbortGuard,
-    )>,
+    #[cfg(feature = "exec-private-init")] initial: Option<ImageInstall<'_, T>>,
+    #[cfg(feature = "exec-native-injection")] native_driver: Option<
+        std::sync::Arc<dyn reverie_inguest::guest::native_exec::NativeExecDriver<T>>,
+    >,
+    #[cfg(feature = "exec-native-injection")] skip_pmu: bool,
 ) -> io::Result<()>
 where
     T: Tool + 'static,
 {
+    macro_rules! install_try {
+        ($operation:expr) => {
+            match $operation {
+                Ok(value) => value,
+                Err(error) => {
+                    #[cfg(feature = "exec-native-injection")]
+                    if skip_pmu {
+                        require_native_success::<()>(Err(error));
+                        unreachable!();
+                    }
+                    return Err(error);
+                }
+            }
+        };
+    }
     // Everything installation allocates (the coordinator's configuration,
     // the Tool, the runtime's /proc/self/maps snapshots and site tables)
     // lives in the runtime's private Tool heap, never in the guest's own
@@ -429,7 +793,7 @@ where
     // is anonymous memory, so the entry census of the object that links this
     // runtime does not read the Tool's state as code addresses either.
     let _private_allocations = reverie_inguest::guest::alloc::enter_dispatch();
-    crate::patch_alloc::preflight_allocator()?;
+    install_try!(crate::patch_alloc::preflight_allocator());
     #[cfg(feature = "exec-private-init")]
     let private_initial = initial.is_some();
     #[cfg(not(feature = "exec-private-init"))]
@@ -448,47 +812,79 @@ where
         // All runtime signal actions and their filter must select the same
         // fixed page. Prepare it before any callback or handler is published.
         if !private_initial {
-            reverie_inguest::trap::prepare_fixed_gates()?;
+            install_try!(reverie_inguest::trap::prepare_fixed_gates());
         }
     }
-    crate::syscall_fallback::initialize()?;
+    install_try!(crate::syscall_fallback::initialize());
+    #[cfg(feature = "exec-native-injection")]
+    let mut restored_tool = None;
+    #[cfg(feature = "exec-native-injection")]
+    let mut restored_state = None;
+    #[cfg(feature = "exec-native-injection")]
+    let mut runtime_restore: Option<Box<dyn FnOnce() -> io::Result<()> + '_>> = None;
     #[cfg(feature = "exec-private-init")]
-    let (rpc, initial_owner) = match initial {
-        Some((client, control, fatal)) => (
-            CoordinatorRpc::<T::GlobalState>::from_live_client(
+    let (rpc, initial_control, initial_fatal) = match initial {
+        Some(ImageInstall::Initial(client, control, fatal)) => (
+            install_try!(CoordinatorRpc::<T::GlobalState>::from_live_client(
                 coordinator,
                 client.into_client(),
                 runtime::replace_coordinator_fd,
-            )?,
-            Some((control, fatal)),
+            )),
+            Some(PrivateImageControl::Initial(control)),
+            Some(fatal),
         ),
+        #[cfg(feature = "exec-native-injection")]
+        Some(ImageInstall::Successor {
+            client,
+            control,
+            tool,
+            state,
+            consumer,
+        }) => {
+            let binding = control.binding();
+            restored_tool = Some(tool);
+            restored_state = Some(state);
+            runtime_restore = Some(Box::new(move || consumer.restore_fresh_runtime(binding)));
+            (
+                install_try!(CoordinatorRpc::<T::GlobalState>::from_live_client(
+                    coordinator,
+                    client,
+                    runtime::replace_coordinator_fd,
+                )),
+                Some(PrivateImageControl::Successor(control)),
+                None,
+            )
+        }
         None => (
-            CoordinatorRpc::<T::GlobalState>::connect(
+            install_try!(CoordinatorRpc::<T::GlobalState>::connect(
                 coordinator,
                 runtime::replace_coordinator_fd,
-            )?,
+            )),
+            None,
             None,
         ),
     };
-    #[cfg(feature = "exec-private-init")]
-    let initial_control = initial_owner.map(|(control, _fatal)| control);
     #[cfg(not(feature = "exec-private-init"))]
-    let rpc =
-        CoordinatorRpc::<T::GlobalState>::connect(coordinator, runtime::replace_coordinator_fd)?;
-    runtime::reserve_coordinator_fd(rpc.raw_fd())?;
+    let rpc = install_try!(CoordinatorRpc::<T::GlobalState>::connect(
+        coordinator,
+        runtime::replace_coordinator_fd
+    ));
+    install_try!(runtime::reserve_coordinator_fd(rpc.raw_fd()));
     let stats = if private_initial {
         #[cfg(feature = "exec-private-init")]
         {
-            let control = initial_control.ok_or_else(|| {
+            let control = install_try!(initial_control.ok_or_else(|| {
                 io::Error::other("InitialImage statistics requires authenticated control")
-            })?;
+            }));
             // The existing narrow context check requires this same published
             // control, initial thread, Tool FS, phase 2 and installation 0.
             // The caller retains its fatal owner across collector setup.
-            control.check_initial_vdso_context()?;
-            let endpoint = crate::initial_image_stats::initial_image_stats_endpoint(coordinator)?;
-            let stats = crate::stats::initialize_guest_stats(&endpoint)?;
-            control.check_initial_vdso_context()?;
+            install_try!(control.check_vdso_context());
+            let endpoint = install_try!(crate::initial_image_stats::initial_image_stats_endpoint(
+                coordinator
+            ));
+            let stats = install_try!(crate::stats::initialize_guest_stats(&endpoint));
+            install_try!(control.check_vdso_context());
             stats
         }
         #[cfg(not(feature = "exec-private-init"))]
@@ -497,7 +893,9 @@ where
         }
     } else {
         if let Some(stats_coordinator) = std::env::var_os(crate::backend::STATS_COORDINATOR_ENV) {
-            let stats = crate::stats::initialize_guest_stats(Path::new(&stats_coordinator))?;
+            let stats = install_try!(crate::stats::initialize_guest_stats(Path::new(
+                &stats_coordinator
+            )));
             // SAFETY: tool installation runs before application-created threads.
             unsafe { std::env::remove_var(crate::backend::STATS_COORDINATOR_ENV) };
             stats
@@ -508,8 +906,13 @@ where
     // Complete the new fixed callback pool and route publication before the
     // guest counter starts. Later installation consumes only this proof;
     // allocating the pool there would charge Tool setup to guest progress.
-    let prepared_callbacks = runtime::prepare_installed_callbacks()?;
-    runtime::initialize_rcb_clock()?;
+    let prepared_callbacks = install_try!(runtime::prepare_installed_callbacks());
+    #[cfg(feature = "exec-native-injection")]
+    if !skip_pmu {
+        install_try!(runtime::initialize_rcb_clock());
+    }
+    #[cfg(not(feature = "exec-native-injection"))]
+    install_try!(runtime::initialize_rcb_clock());
     // The raw syscall, not libc's interposable getpid.
     let pid = Pid::from_raw(unsafe { raw_syscall6(libc::SYS_getpid, [0; 6]) } as i32);
     let subscriptions = T::subscriptions(rpc.config());
@@ -517,13 +920,15 @@ where
         cpuid: subscriptions.has_cpuid(),
         rdtsc: subscriptions.has_rdtsc(),
     };
-    runtime::preflight_instruction_faulting(instruction_subscriptions)?;
+    install_try!(runtime::preflight_instruction_faulting(
+        instruction_subscriptions
+    ));
     let site_patching = if private_initial {
         false
     } else {
-        runtime::site_patching_from_env_value(
+        install_try!(runtime::site_patching_from_env_value(
             std::env::var_os(runtime::SITE_PATCHING_ENV).as_deref(),
-        )?
+        ))
     };
     // With site patching off, the vDSO gets ptrace's full trapping stubs and no
     // hooks, so its fast paths reach the Tool through the SIGSYS fallback too.
@@ -532,32 +937,42 @@ where
         initial_control.map(|control| unsafe { patch_initial_image_vdso(&subscriptions, control) });
     #[cfg(not(feature = "exec-private-init"))]
     let initial_vdso: Option<Result<(), reverie::Error>> = None;
-    let vdso_sites = if let Some(result) = initial_vdso {
-        result.map(|()| Vec::new())
-    } else if site_patching {
-        reverie::vdso::patch_current_vdso(&subscriptions)
-    } else {
-        reverie::vdso::patch_current_vdso_trapping(&subscriptions).map(|()| Vec::new())
-    }
-    .map_err(|error| {
-        io::Error::other(reverie_inguest::guest::host::describe_reverie_error(&error))
-    })?;
+    let vdso_sites = install_try!(
+        (if let Some(result) = initial_vdso {
+            result.map(|()| Vec::new())
+        } else if site_patching {
+            reverie::vdso::patch_current_vdso(&subscriptions)
+        } else {
+            reverie::vdso::patch_current_vdso_trapping(&subscriptions).map(|()| Vec::new())
+        })
+        .map_err(|error| {
+            io::Error::other(reverie_inguest::guest::host::describe_reverie_error(&error))
+        })
+    );
     #[cfg(feature = "exec-private-init")]
     let _signal_state = if let Some(control) = initial_control {
-        control.prepare_signal_state(instruction_subscriptions)?;
+        install_try!(control.prepare_signal_state(instruction_subscriptions));
         None
     } else {
-        Some(runtime::prepare_guest_signal_state(
+        Some(install_try!(runtime::prepare_guest_signal_state(
             instruction_subscriptions,
-        )?)
+        )))
     };
     #[cfg(not(feature = "exec-private-init"))]
-    let _signal_state = runtime::prepare_guest_signal_state(instruction_subscriptions)?;
+    let _signal_state = install_try!(runtime::prepare_guest_signal_state(
+        instruction_subscriptions
+    ));
     let syscall_subscriptions = subscriptions.iter_syscalls().collect();
     if remove_legacy_environment {
         // SAFETY: legacy tool installation runs before application-created threads.
         unsafe { std::env::remove_var(crate::backend::COORDINATOR_ENV) };
     }
+    #[cfg(feature = "exec-native-injection")]
+    let tool = match restored_tool {
+        Some(tool) => tool,
+        None => T::new(pid, rpc.config()),
+    };
+    #[cfg(not(feature = "exec-native-injection"))]
     let tool = T::new(pid, rpc.config());
     let host = ToolHost::<T, LiteinstRuntime>::new(
         tool,
@@ -565,16 +980,45 @@ where
         pid,
         syscall_subscriptions,
         instruction_subscriptions.cpuid,
-        LiteinstRuntime { stats },
+        LiteinstRuntime {
+            stats,
+            #[cfg(feature = "exec-native-injection")]
+            no_rcb: skip_pmu,
+        },
     );
-    // SAFETY: this is the same installer publication point, after actual
-    // allocator/setup/client/subscription admission and before activation.
+    #[cfg(feature = "exec-native-injection")]
+    let host = {
+        let mut host = host;
+        if let Some(driver) = native_driver {
+            // SAFETY: only the explicitly authenticated native entry supplies
+            // this concrete driver, before publication or any dispatch.
+            unsafe {
+                install_try!(host.install_native_exec_driver(driver));
+            }
+        }
+        host
+    };
+    // SAFETY: preserve one shared installed owner and the actual same private
+    // control/client/fatal lineage; ordinary publication arity is unchanged.
     #[cfg(feature = "exec-private-init")]
     unsafe {
-        if let Some((control, fatal)) = initial_owner {
-            installed_tool::publish_initial_tool(host, control, fatal)?;
-        } else {
-            installed_tool::publish_tool(host)?;
+        match initial_control {
+            Some(PrivateImageControl::Initial(control)) => {
+                let fatal = install_try!(initial_fatal.ok_or_else(|| io::Error::other(
+                    "InitialImage installer lacks its fatal owner"
+                )));
+                install_try!(installed_tool::publish_initial_tool(host, control, fatal));
+            }
+            #[cfg(feature = "exec-native-injection")]
+            Some(PrivateImageControl::Successor(control)) => {
+                let state = install_try!(restored_state.take().ok_or_else(|| io::Error::other(
+                    "successor installer lacks authenticated pending Tool state"
+                )));
+                install_try!(installed_tool::publish_successor_tool(host, state, control));
+            }
+            None => {
+                install_try!(installed_tool::publish_tool(host));
+            }
         }
     }
     #[cfg(not(feature = "exec-private-init"))]
@@ -589,11 +1033,29 @@ where
         &vdso_sites,
         prepared_callbacks,
         #[cfg(feature = "exec-private-init")]
-        initial_control,
+        initial_control.map(|control| runtime::PrivateRuntimeImage {
+            control,
+            #[cfg(feature = "exec-native-injection")]
+            preparation: if skip_pmu {
+                // The native entry has qualified the actual private image and
+                // its no-patching Config. Ordinary/legacy installation retains
+                // all existing patcher preparation, even in feature-on builds.
+                runtime::InstrumentationPreparation::NativeTrapOnly
+            } else {
+                runtime::InstrumentationPreparation::Patcher
+            },
+            #[cfg(feature = "exec-native-injection")]
+            before_frontend: runtime_restore,
+        }),
     );
     #[cfg(feature = "fixed-syscall-gates")]
     {
         fixed_install.complete = result.is_ok();
+    }
+    #[cfg(feature = "exec-native-injection")]
+    if skip_pmu {
+        require_native_success(result);
+        return Ok(());
     }
     result
 }

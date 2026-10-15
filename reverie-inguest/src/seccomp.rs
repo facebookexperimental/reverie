@@ -159,6 +159,95 @@ impl SeccompFilter {
         Ok(Self { program })
     }
 
+    /// Build the distinct native first-domain inherited filter.
+    ///
+    /// The 46-instruction prefix denies namespace changes, process creation,
+    /// x32 entry and filter stacking even at trusted gates. The unchanged
+    /// exact 23-instruction signal-return/two-gate suffix follows it. This is
+    /// one installed filter with a new identity, never the ordinary 23 recipe.
+    #[cfg(feature = "exec-native-injection")]
+    pub fn for_native_exec_domain() -> io::Result<Self> {
+        let mut prefix = vec![
+            stmt(BPF_LD_W_ABS, SECCOMP_DATA_ARCH_OFFSET),
+            jump(BPF_JMP_JEQ_K, AUDIT_ARCH_X86_64, 1, 0),
+            stmt(BPF_RET_K, SECCOMP_RET_KILL_PROCESS),
+            stmt(BPF_LD_W_ABS, SECCOMP_DATA_NR_OFFSET),
+            jump(0x45, 0x4000_0000, 0, 1),
+            stmt(BPF_RET_K, 0x0005_0000 | libc::EPERM as u32),
+        ];
+        for number in [
+            libc::SYS_unshare,
+            libc::SYS_setns,
+            libc::SYS_mount,
+            libc::SYS_umount2,
+            libc::SYS_pivot_root,
+            libc::SYS_chroot,
+            libc::SYS_open_tree,
+            libc::SYS_move_mount,
+            libc::SYS_fsopen,
+            libc::SYS_fsconfig,
+            libc::SYS_fsmount,
+            libc::SYS_fspick,
+            libc::SYS_mount_setattr,
+            libc::SYS_clone,
+            libc::SYS_clone3,
+            libc::SYS_fork,
+            libc::SYS_vfork,
+            libc::SYS_seccomp,
+        ] {
+            prefix.extend([
+                jump(BPF_JMP_JEQ_K, number as u32, 0, 1),
+                stmt(BPF_RET_K, 0x0005_0000 | libc::EPERM as u32),
+            ]);
+        }
+        prefix.extend([
+            jump(BPF_JMP_JEQ_K, libc::SYS_prctl as u32, 0, 3),
+            stmt(BPF_LD_W_ABS, 16), // Low word of actual prctl arg0.
+            jump(BPF_JMP_JEQ_K, libc::PR_SET_SECCOMP as u32, 0, 1),
+            stmt(BPF_RET_K, 0x0005_0000 | libc::EPERM as u32),
+        ]);
+        assert_eq!(prefix.len(), 46);
+        let suffix = Self::for_trusted_gates_with_signal_return(
+            TrustedGate {
+                syscall_ip: 0x5000_0000_0080,
+                return_ip: 0x5000_0000_0082,
+            },
+            TrustedGate {
+                syscall_ip: 0x5000_0000_0200,
+                return_ip: 0x5000_0000_0202,
+            },
+            Some(0x5000_0000_030b),
+        )?;
+        assert_eq!(suffix.program.len(), 23);
+        prefix.extend(suffix.program);
+        assert_eq!(prefix.len(), 69);
+        Ok(Self { program: prefix })
+    }
+
+    /// Canonical little-endian bytes of the distinct native filter recipe.
+    /// Content comparison is not authority to install or attest a filter.
+    #[cfg(feature = "exec-native-injection")]
+    pub fn native_exec_recipe_bytes() -> io::Result<[u8; 69 * 8]> {
+        let filter = Self::for_native_exec_domain()?;
+        let mut bytes = [0; 69 * 8];
+        for (chunk, instruction) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(&filter.program) {
+            chunk[..2].copy_from_slice(&instruction.code.to_le_bytes());
+            chunk[2] = instruction.jt;
+            chunk[3] = instruction.jf;
+            chunk[4..].copy_from_slice(&instruction.k.to_le_bytes());
+        }
+        Ok(bytes)
+    }
+
+    #[cfg(feature = "exec-native-injection")]
+    pub(crate) fn native_program(&mut self) -> libc::sock_fprog {
+        // Only a prebuilt exact native recipe is passed by the child owner.
+        libc::sock_fprog {
+            len: self.program.len() as u16,
+            filter: self.program.as_mut_ptr(),
+        }
+    }
+
     /// The number of BPF instructions in the program.
     pub fn len(&self) -> usize {
         self.program.len()

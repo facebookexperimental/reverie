@@ -217,6 +217,18 @@ impl<'signal> SignalFrame<'signal> {
         Ok(frame)
     }
 
+    /// Test-only access to the same genuine SIGSYS frame validator.
+    /// # Safety
+    /// Exactly the from_raw contract: actual kernel-created SA_SIGINFO pointers,
+    /// exclusive context/FP access and enabled runtime memory permissions.
+    #[cfg(all(test, feature = "exec-native-injection"))]
+    pub(crate) unsafe fn native_exec_test_sigsys_frame(
+        context: *mut libc::c_void,
+        info: *const libc::siginfo_t,
+    ) -> Result<Self, FrameError> {
+        unsafe { Self::from_raw(context, info) }
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(liteinst-late-code-cpuid): Review the kernel-fault frame provenance check.
     /// Borrow the frame of a kernel-forced `SIGSEGV`, such as the general

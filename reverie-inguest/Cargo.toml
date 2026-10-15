@@ -34,6 +34,14 @@ launcher = ["coordinator-rpc", "dep:tempfile", "dep:tokio", "dep:tracing"]
 fixed-syscall-gates = []
 # Private GNU loader InitialImage experiment; no successor exec admission.
 exec-private-init = ["fixed-syscall-gates"]
+# Inactive continuity for the actual shared scalar collector.
+native-exec-state = ["coordinator-rpc"]
+# Real collector test adapters; only cross-crate dev dependencies enable this.
+native-exec-state-fixture = ["native-exec-state"]
+# Inactive successor lifecycle component; no exec consumer or admission.
+exec-private-successor = ["exec-private-init", "coordinator-rpc"]
+# Inactive installer-only original-dispatch native exec injection seam.
+exec-native-injection = ["exec-private-successor", "dep:sha2"]
 
 # Synchronous coordinator RPC client, wire-compatible with the async
 # `reverie-rpc-transport` `RpcServer<G>` (u32-BE length prefix + bincode2
@@ -43,6 +51,7 @@ coordinator-rpc = ["dep:serde", "dep:bincode", "dep:reverie", "dep:reverie-rpc-t
 rcb-clock = ["dep:reverie", "dep:reverie-ptrace"]
 
 [dependencies]
+sha2 = { version = "0.10.9", optional = true }
 libc = "0.2.186"
 serde = { version = "1.0.219", features = ["derive"], optional = true }
 bincode = { version = "2", features = ["serde"], optional = true }

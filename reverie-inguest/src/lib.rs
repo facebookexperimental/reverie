@@ -65,6 +65,8 @@ pub mod initial_image_stats;
 #[cfg(feature = "launcher")]
 pub mod launcher;
 pub mod lifecycle;
+#[cfg(feature = "exec-native-injection")]
+pub mod native_exec_sources;
 pub mod seccomp;
 pub mod signal;
 #[cfg(feature = "coordinator-rpc")]

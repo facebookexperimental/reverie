@@ -472,8 +472,11 @@ mod tests {
             }
             requests
         });
-        let client =
-            reverie_rpc_transport::BlockingRpcClient::from_connected_stream(client, tid).unwrap();
+        let client = reverie_rpc_transport::BlockingRpcClient::from_connected_stream(
+            crate::guest::rpc::GuestRpcStream::from(client),
+            tid,
+        )
+        .unwrap();
         let rpc = CoordinatorRpc::from_live_client("unused-lifecycle-test", client, |_, _| {
             panic!("test lifecycle must retain its original connection")
         })

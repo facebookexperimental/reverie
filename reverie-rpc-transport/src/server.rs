@@ -42,6 +42,7 @@ use crate::codec::write_message;
 use crate::envelope::RequestEnvelope;
 use crate::error::RpcError;
 use crate::initial_image::InitialImageAdmission;
+use crate::successor::SuccessorAdmission;
 
 /// `SO_PEERPIDFD` (Linux 6.5): a pidfd for the process that connected the
 /// socket. Defined here because the libc crate exports it only from its
@@ -153,18 +154,37 @@ pub struct RpcServer<G: GlobalTool> {
     config: G::Config,
     listener: UnixListener,
     path: PathBuf,
+    cleanup_path: bool,
     readiness: Option<Arc<AtomicBool>>,
     connection_readiness: Option<Arc<AtomicBool>>,
     connections: ConnectionMonitor,
     issues: Option<RpcIssueMonitor>,
     admission: Option<Arc<dyn ConnectionAdmission>>,
     initial_image: Option<InitialImageSetup>,
+    native_successor: Option<Arc<dyn SuccessorAdmission>>,
 }
 
 #[derive(Clone)]
 struct InitialImageSetup {
     admission: Arc<dyn InitialImageAdmission>,
     config_bytes: Arc<Vec<u8>>,
+}
+
+struct HandshakeFrames {
+    config: Arc<Vec<u8>>,
+    successor_state: Option<Vec<u8>>,
+    strict_sender: bool,
+    native_image: Option<crate::successor::NativeImageConnection>,
+}
+
+/// Per-connection state retained by the same serving future, not a new owner.
+#[derive(Default)]
+struct ConnectionSetup {
+    readiness: Option<Arc<AtomicBool>>,
+    connection_readiness: Option<Arc<AtomicBool>>,
+    admitted: Option<Admitted>,
+    handshake: Option<HandshakeFrames>,
+    native_close: Option<Arc<dyn SuccessorAdmission>>,
 }
 
 /// Actual connection failures, retained independently of the serving task.
@@ -384,12 +404,55 @@ where
             config,
             listener,
             path,
+            cleanup_path: true,
             readiness: None,
             connection_readiness: None,
             connections: ConnectionMonitor::new(),
             issues: None,
             admission: None,
             initial_image: None,
+            native_successor: None,
+        })
+    }
+
+    /// Consume an already-bound ordinary listener without unlinking/rebinding.
+    ///
+    /// This preserves the exact listener FD and filesystem socket inode for a
+    /// common container's retained mount source. Call only inside the actual
+    /// Tokio reactor, after its common namespace setup; the caller bound the
+    /// listener before workers existed and owns its path/directory through all
+    /// connection drains. This server closes the listener but deliberately
+    /// leaves path retirement to that original owner.
+    pub fn from_prebound(
+        listener: std::os::unix::net::UnixListener,
+        global: Arc<G>,
+        config: G::Config,
+    ) -> Result<Self, RpcError> {
+        let path = listener
+            .local_addr()?
+            .as_pathname()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "prebound RPC listener has no filesystem path",
+                )
+            })?
+            .to_path_buf();
+        listener.set_nonblocking(true)?;
+        let listener = UnixListener::from_std(listener)?;
+        Ok(Self {
+            global,
+            config,
+            listener,
+            path,
+            cleanup_path: false,
+            readiness: None,
+            connection_readiness: None,
+            connections: ConnectionMonitor::new(),
+            issues: None,
+            admission: None,
+            initial_image: None,
+            native_successor: None,
         })
     }
 
@@ -437,12 +500,14 @@ where
             config,
             listener,
             path,
+            cleanup_path: true,
             readiness,
             connection_readiness,
             connections: ConnectionMonitor::new(),
             issues: None,
             admission: None,
             initial_image: None,
+            native_successor: None,
         })
     }
 
@@ -475,6 +540,24 @@ where
             admission,
             config_bytes: Arc::new(encode(&self.config)?),
         });
+        self.native_successor = None;
+        Ok(())
+    }
+
+    /// Explicitly serve both InitialImage and successor-v1 requests.
+    ///
+    /// Both hooks are launcher-owned policies, with the same actual process
+    /// watcher and retained issue monitor required by InitialImage admission.
+    /// Only the two configured magics/versions are accepted; there is no
+    /// config-first fallback. Each RPC sender stays bound to its accepted
+    /// socket's admitted process for the lifetime of this single-thread route.
+    pub fn set_native_image_admission(
+        &mut self,
+        initial: Arc<dyn InitialImageAdmission>,
+        successor: Arc<dyn SuccessorAdmission>,
+    ) -> Result<(), RpcError> {
+        self.set_initial_image_admission(initial)?;
+        self.native_successor = Some(successor);
         Ok(())
     }
 
@@ -520,85 +603,110 @@ where
     /// Per-connection errors are not fatal to the server: a guest that
     /// disconnects (cleanly or otherwise) simply ends its own task.
     pub async fn serve(self) -> Result<(), RpcError> {
+        self.serve_until(std::future::pending()).await
+    }
+
+    /// Serve until explicit owner shutdown, then cancel and join every owned
+    /// connection before returning. Listener errors take the same joined path.
+    /// Cancelling this future itself still uses JoinSet's abort-on-drop; callers
+    /// needing completion must retain and await this cooperative owner.
+    pub async fn serve_until<F>(self, shutdown: F) -> Result<(), RpcError>
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        tokio::pin!(shutdown);
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-170): Review connection cancellation on server shutdown.
         let mut connections = tokio::task::JoinSet::new();
         let mut connection = 0usize;
-        loop {
-            let (stream, _addr) = tokio::select! {
-                result = self.listener.accept() => result?,
-                _ = connections.join_next(), if !connections.is_empty() => continue,
-            };
-            connection = connection
-                .checked_add(1)
-                .ok_or_else(|| std::io::Error::other("RPC connection identity exhausted"))?;
-            let global = self.global.clone();
-            let config = self.config.clone();
-            let readiness = self.readiness.clone();
-            let connection_readiness = self.connection_readiness.clone();
-            let connection_guard = self.connections.connected();
-            if let Some(issues) = &self.issues {
-                issues.reserve()?;
-            }
-            let mut issue_guard = IssueGuard {
-                monitor: self.issues.clone(),
-                connection,
-                completed: false,
-            };
-            let retain_issues = self.issues.is_some();
-            let admission = self.admission.clone();
-            let initial_image = self.initial_image.clone();
-            connections.spawn(async move {
-                let _connection_guard = connection_guard;
-                let future = async move {
-                    let mut stream = stream;
-                    let admitted = admit_connection(admission.as_ref(), &stream)?;
-                    let config_bytes = match initial_image {
-                        Some(hook) => Some(
-                            initial_image_handshake(
-                                &mut stream,
-                                admitted,
-                                hook.admission.as_ref(),
-                                hook.config_bytes,
-                            )
-                            .await?,
-                        ),
-                        None => None,
-                    };
-                    serve_connection_inner(
-                        global,
-                        config,
-                        stream,
-                        readiness,
-                        connection_readiness,
-                        admitted,
-                        config_bytes,
-                    )
-                    .await
+        let result = async {
+            loop {
+                let (stream, _addr) = tokio::select! {
+                    biased;
+                    () = &mut shutdown => return Ok(()),
+                    result = self.listener.accept() => result?,
+                    _ = connections.join_next(), if !connections.is_empty() => continue,
                 };
-                if retain_issues {
-                    let mut future = std::pin::pin!(future);
-                    let result = std::future::poll_fn(|context| {
-                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            std::future::Future::poll(future.as_mut(), context)
-                        })) {
-                            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
-                            Ok(std::task::Poll::Ready(result)) => {
-                                std::task::Poll::Ready(Ok(result))
-                            }
-                            Err(payload) => std::task::Poll::Ready(Err(payload)),
-                        }
-                    })
-                    .await;
-                    match result {
-                        Ok(result) => issue_guard.complete(result),
-                        Err(payload) => issue_guard.panic(payload),
-                    }
-                } else {
-                    issue_guard.complete(future.await);
+                connection = connection
+                    .checked_add(1)
+                    .ok_or_else(|| std::io::Error::other("RPC connection identity exhausted"))?;
+                let global = self.global.clone();
+                let config = self.config.clone();
+                let readiness = self.readiness.clone();
+                let connection_readiness = self.connection_readiness.clone();
+                let connection_guard = self.connections.connected();
+                if let Some(issues) = &self.issues {
+                    issues.reserve()?;
                 }
-            });
+                let mut issue_guard = IssueGuard {
+                    monitor: self.issues.clone(),
+                    connection,
+                    completed: false,
+                };
+                let retain_issues = self.issues.is_some();
+                let admission = self.admission.clone();
+                let initial_image = self.initial_image.clone();
+                let native_successor = self.native_successor.clone();
+                connections.spawn(async move {
+                    let _connection_guard = connection_guard;
+                    let future = async move {
+                        let mut stream = stream;
+                        let admitted = admit_connection(admission.as_ref(), &stream)?;
+                        let config_bytes = match initial_image {
+                            Some(hook) => Some(
+                                image_handshake(
+                                    &mut stream,
+                                    admitted,
+                                    &hook,
+                                    native_successor.as_deref(),
+                                )
+                                .await?,
+                            ),
+                            None => None,
+                        };
+                        serve_connection_inner(
+                            global,
+                            config,
+                            stream,
+                            ConnectionSetup {
+                                readiness,
+                                connection_readiness,
+                                admitted,
+                                handshake: config_bytes,
+                                native_close: native_successor,
+                            },
+                        )
+                        .await
+                    };
+                    if retain_issues {
+                        let mut future = std::pin::pin!(future);
+                        let result =
+                            std::future::poll_fn(|context| {
+                                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    std::future::Future::poll(future.as_mut(), context)
+                                })) {
+                                    Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+                                    Ok(std::task::Poll::Ready(result)) => {
+                                        std::task::Poll::Ready(Ok(result))
+                                    }
+                                    Err(payload) => std::task::Poll::Ready(Err(payload)),
+                                }
+                            })
+                            .await;
+                        match result {
+                            Ok(result) => issue_guard.complete(result),
+                            Err(payload) => issue_guard.panic(payload),
+                        }
+                    } else {
+                        issue_guard.complete(future.await);
+                    }
+                });
+            }
         }
+        .await;
+        connections.abort_all();
+        while connections.join_next().await.is_some() {}
+        result
     }
 
     /// Accept and fully serve exactly one connection on the current task. This
@@ -623,11 +731,11 @@ where
             let config = self.config.clone();
             let config_bytes = match &self.initial_image {
                 Some(hook) => Some(
-                    initial_image_handshake(
+                    image_handshake(
                         &mut stream,
                         admitted,
-                        hook.admission.as_ref(),
-                        hook.config_bytes.clone(),
+                        hook,
+                        self.native_successor.as_deref(),
                     )
                     .await?,
                 ),
@@ -637,10 +745,13 @@ where
                 self.global.clone(),
                 config,
                 stream,
-                self.readiness.clone(),
-                self.connection_readiness.clone(),
-                admitted,
-                config_bytes,
+                ConnectionSetup {
+                    readiness: self.readiness.clone(),
+                    connection_readiness: self.connection_readiness.clone(),
+                    admitted,
+                    handshake: config_bytes,
+                    native_close: self.native_successor.clone(),
+                },
             )
             .await
         }
@@ -677,7 +788,9 @@ impl Drop for ConnectionGuard {
 
 impl<G: GlobalTool> Drop for RpcServer<G> {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if self.cleanup_path {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -692,7 +805,7 @@ pub async fn serve_connection<G>(
 where
     G: GlobalTool,
 {
-    serve_connection_inner(global, config, stream, None, None, None, None).await
+    serve_connection_inner(global, config, stream, ConnectionSetup::default()).await
 }
 
 /// Serve an independently owned asynchronous byte stream using the same
@@ -710,11 +823,77 @@ where
     G: GlobalTool,
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    serve_connection_inner(global, config, stream, None, None, None, None).await
+    serve_connection_inner(global, config, stream, ConnectionSetup::default()).await
 }
 
 /// Admission has already installed the normal process watch. A second pidfd
 /// comes from this exact socket; the watcher continues owning its first one.
+async fn image_handshake(
+    stream: &mut UnixStream,
+    admitted: Option<Admitted>,
+    initial: &InitialImageSetup,
+    successor: Option<&dyn SuccessorAdmission>,
+) -> Result<HandshakeFrames, RpcError> {
+    let Some(successor) = successor else {
+        return Ok(HandshakeFrames {
+            config: initial_image_handshake(
+                stream,
+                admitted,
+                initial.admission.as_ref(),
+                initial.config_bytes.clone(),
+            )
+            .await?,
+            successor_state: None,
+            strict_sender: false,
+            native_image: None,
+        });
+    };
+    let admitted = admitted.ok_or_else(|| {
+        crate::successor::invalid("native image connection has no watched process admission")
+    })?;
+    let peer = peer_pidfd(stream)?;
+    let request = read_message(stream, crate::successor::MAX_CONTROL_LEN)
+        .await
+        .map_err(|error| match error {
+            RpcError::Closed => crate::successor::invalid("native image redemption is missing"),
+            other => other,
+        })?;
+    let digest = crate::initial_image::config_digest(&initial.config_bytes);
+    let (successor_state, native_image) =
+        if request.starts_with(&crate::initial_image::REQUEST_MAGIC) {
+            let redemption = crate::initial_image::decode_redemption(&request)?;
+            initial
+                .admission
+                .redeem(peer, admitted, redemption, digest)?;
+            write_message(stream, &crate::initial_image::encode_ack(digest)).await?;
+            (None, crate::successor::NativeImageConnection::Initial)
+        } else {
+            // The exact successor decoder refuses every unknown magic/version,
+            // malformed length, empty ticket and trailing byte. Never fall back.
+            let redemption = crate::successor::decode_redemption(&request)?;
+            if redemption.expected.config != digest {
+                return Err(crate::successor::invalid(
+                    "successor expected Config differs from run",
+                ));
+            }
+            let state = successor.redeem(peer, admitted, redemption)?;
+            crate::successor::check_state(&state, redemption.expected.state)?;
+            write_message(stream, &crate::successor::encode_ack(redemption)).await?;
+            (
+                Some(state),
+                crate::successor::NativeImageConnection::Successor {
+                    ticket: redemption.ticket.to_vec(),
+                },
+            )
+        };
+    Ok(HandshakeFrames {
+        config: initial.config_bytes.clone(),
+        successor_state,
+        strict_sender: true,
+        native_image: Some(native_image),
+    })
+}
+
 async fn initial_image_handshake(
     stream: &mut UnixStream,
     admitted: Option<Admitted>,
@@ -743,15 +922,19 @@ async fn serve_connection_inner<G, S>(
     global: Arc<G>,
     config: G::Config,
     mut stream: S,
-    readiness: Option<Arc<AtomicBool>>,
-    connection_readiness: Option<Arc<AtomicBool>>,
-    mut admitted: Option<Admitted>,
-    config_bytes: Option<Arc<Vec<u8>>>,
+    setup: ConnectionSetup,
 ) -> Result<(), RpcError>
 where
     G: GlobalTool,
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    let ConnectionSetup {
+        readiness,
+        connection_readiness,
+        mut admitted,
+        handshake,
+        native_close,
+    } = setup;
     // space (it is a separate process), so the coordinator sends it first.
     //
     // NOTE: `G::Request`/`G::Response` are `Send` but not `Sync`, so we always
@@ -759,11 +942,20 @@ where
     // passing a `&Request`/`&Response` into an async fn. Holding such a borrow
     // across an await would make this future non-`Send` and break
     // `tokio::spawn`.
-    let config_bytes = match &config_bytes {
-        Some(bytes) => std::borrow::Cow::Borrowed(bytes.as_slice()),
+    let config_bytes = match &handshake {
+        Some(frames) => std::borrow::Cow::Borrowed(frames.config.as_slice()),
         None => std::borrow::Cow::Owned(encode(&config)?),
     };
     write_message(&mut stream, &config_bytes).await?;
+    if let Some(state) = handshake
+        .as_ref()
+        .and_then(|frames| frames.successor_state.as_ref())
+    {
+        write_message(&mut stream, state).await?;
+    }
+    let strict_sender = handshake
+        .as_ref()
+        .is_some_and(|frames| frames.strict_sender);
     if let Some(readiness) = &connection_readiness {
         readiness.store(true, Ordering::Release);
     }
@@ -771,18 +963,43 @@ where
     loop {
         let request_bytes = match read_message(&mut stream, DEFAULT_MAX_FRAME_LEN).await {
             Ok(bytes) => bytes,
-            Err(RpcError::Closed) => return Ok(()),
+            Err(RpcError::Closed) => {
+                if strict_sender {
+                    let hook = native_close.as_ref().ok_or_else(|| {
+                        crate::successor::invalid("native stream lost its lifecycle owner")
+                    })?;
+                    let image = handshake
+                        .as_ref()
+                        .and_then(|frames| frames.native_image.as_ref())
+                        .ok_or_else(|| {
+                            crate::successor::invalid("native stream lost its image incarnation")
+                        })?;
+                    hook.connection_closed(
+                        admitted.ok_or_else(|| {
+                            crate::successor::invalid("native stream lost its watched sender")
+                        })?,
+                        image,
+                    )?;
+                }
+                return Ok(());
+            }
             Err(e) => return Err(e),
         };
         let RequestEnvelope { from, request } =
             decode::<RequestEnvelope<G::Request>>(&request_bytes)?;
-        // An admitted connection's first request must come from the admitted
-        // process: a guest process is single-threaded, and a forked child
-        // reconnects before it sends anything, so its first sender is itself.
-        if let Some(Admitted { process_id }) = admitted.take() {
+        // Combined native-image admission binds every RPC sender to this
+        // accepted process. Legacy/InitialImage-only admission retains its
+        // first-request check; a forked child reconnects before sending.
+        let request_owner = if strict_sender {
+            admitted
+        } else {
+            admitted.take()
+        };
+        if let Some(Admitted { process_id }) = request_owner {
             if from.as_raw() != process_id {
+                let which = if strict_sender { "a" } else { "its first" };
                 return Err(RpcError::Io(std::io::Error::other(format!(
-                    "connection admitted for process {process_id} sent its first request as {}",
+                    "connection admitted for process {process_id} sent {which} request as {}",
                     from.as_raw()
                 ))));
             }

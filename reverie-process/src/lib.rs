@@ -85,12 +85,24 @@ pub use stdio::ChildStdout;
 pub use stdio::Stdio;
 use syscalls::Errno;
 
+/// Trusted terminal execution entry using the command's exact prepared vectors.
+///
+/// Successful kernel exec never returns. An entry must also terminate through
+/// its own admitted gate on failure; it cannot return into the ordinary spawn
+/// error path after publishing an inherited filter.
+pub type TerminalExecve = unsafe extern "C" fn(
+    *const libc::c_char,
+    *const *const libc::c_char,
+    *const *const libc::c_char,
+) -> !;
+
 /// A builder for spawning a process.
 // See the builder.rs for documentation of each field.
 pub struct Command {
     program: CString,
     args: util::CStringArray,
     pre_exec: Vec<Box<dyn FnMut() -> Result<(), Errno> + Send + Sync>>,
+    terminal_execve: Option<TerminalExecve>,
     container: Container,
 }
 
@@ -139,6 +151,12 @@ impl Command {
     /// seccomp filters, pseudoterminals, and CPU affinity.
     pub fn try_into_std(self) -> io::Result<std::process::Command> {
         let blockers = self.container.std_conversion_blockers();
+        if self.terminal_execve.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot convert a command with a terminal execution entry",
+            ));
+        }
         if !blockers.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -175,9 +193,14 @@ impl Command {
             program,
             args,
             pre_exec,
+            terminal_execve,
             container,
         } = self;
 
+        assert!(
+            terminal_execve.is_none(),
+            "terminal entry requires the native command owner"
+        );
         let mut result = std::process::Command::new(OsStr::from_bytes(program.to_bytes()));
         result.args(
             args.iter()

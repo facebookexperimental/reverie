@@ -383,6 +383,131 @@ impl GuestStatsCollector {
     }
 }
 
+#[cfg(feature = "native-exec-state")]
+impl GuestStatsCollector {
+    fn native_counters(&self) -> [&AtomicU64; 11] {
+        [
+            &self.in_guest_sigsys,
+            &self.in_guest_nested_sigsys,
+            &self.in_guest_nested_hook,
+            &self.in_guest_physical_sigsys,
+            &self.fallback_completion_sigsys,
+            &self.cacheline_straddler_fallback,
+            &self.unpatchable_or_other_fallback,
+            &self.fallback_refusal,
+            &self.inherited_sigsys,
+            &self.inherited_hooks,
+            &self.patching_disabled_fallback,
+        ]
+    }
+}
+
+/// Read the actual eleven shared collector counters without resetting them.
+#[doc(hidden)]
+#[cfg(feature = "native-exec-state")]
+pub fn native_exec_stats() -> Result<[u64; 11], native_exec::StateError> {
+    let collector = GUEST_STATS
+        .get()
+        .ok_or(native_exec::StateError::MissingCollector)?;
+    Ok(collector
+        .native_counters()
+        .map(|counter| counter.load(Ordering::Acquire)))
+}
+
+/// Compare the final actual shared scalar cut at each atomic.
+#[doc(hidden)]
+#[cfg(feature = "native-exec-state")]
+pub fn check_native_exec_stats(expected: &[u64; 11]) -> Result<(), native_exec::StateError> {
+    use native_exec::StateError;
+    let collector = GUEST_STATS.get().ok_or(StateError::MissingCollector)?;
+    // Compare directly at each actual atomic, avoiding a bulk local-array
+    // comparator that could introduce a libc/memcmp call at the final edge.
+    for (counter, expected) in collector.native_counters().into_iter().zip(expected) {
+        if counter.load(Ordering::Acquire) != *expected {
+            return Err(StateError::Changed);
+        }
+    }
+    Ok(())
+}
+
+// The caller preflights the entire fresh image and exclusively owns its cut.
+// No endpoint is replaced; the authenticated fresh collector remains the one
+// that performs the existing single terminal report.
+/// Store the exact validated scalar set into the actual fresh collector.
+///
+/// # Safety
+/// The caller must own the authenticated exclusive fresh runtime and preflight
+/// every scalar/fallback/cut check before the first store; no producers may run.
+#[doc(hidden)]
+#[cfg(feature = "native-exec-state")]
+pub unsafe fn restore_native_exec_stats(values: &[u64; 11]) {
+    let collector = GUEST_STATS
+        .get()
+        .expect("native restoration preflight checked collector");
+    for (counter, value) in collector.native_counters().into_iter().zip(values) {
+        counter.store(*value, Ordering::Release);
+    }
+}
+
+/// Immutable observation of the actual shared collector for cross-crate tests.
+#[doc(hidden)]
+#[cfg(feature = "native-exec-state-fixture")]
+pub struct NativeExecCollectorObservation {
+    report: LiteinstProcessStats,
+}
+
+#[cfg(feature = "native-exec-state-fixture")]
+impl NativeExecCollectorObservation {
+    /// Actual dispatch path counters, with the existing normalization.
+    pub fn paths(&self) -> &CounterSnapshot<LiteinstDispatchPath> {
+        &self.report.paths
+    }
+
+    /// Actual inherited entries.
+    pub fn inherited(&self) -> InheritedEntries {
+        self.report.inherited
+    }
+
+    /// Recorded site observations; native scalar collection does not add sites.
+    pub fn sites(&self) -> &[LiteinstProcessSiteStats] {
+        &self.report.sites
+    }
+}
+
+/// Observe the actual shared collector without changing or resetting counters.
+#[doc(hidden)]
+#[cfg(feature = "native-exec-state-fixture")]
+pub fn native_exec_report_test() -> NativeExecCollectorObservation {
+    let collector = GUEST_STATS.get().unwrap();
+    NativeExecCollectorObservation {
+        report: LiteinstProcessStats {
+            paths: collector.snapshot(0),
+            sites: Vec::new(),
+            inherited: collector.inherited_entries(),
+        },
+    }
+}
+
+/// Seed the real counter in an exclusively owned test process.
+///
+/// # Safety
+/// Only an isolated test child may call this before admitting any runtime work.
+/// The caller must exclude every collector producer and consumer until the
+/// test observation finishes. This does not grant native image authority.
+#[doc(hidden)]
+#[cfg(feature = "native-exec-state-fixture")]
+pub unsafe fn seed_native_exec_counter_test(value: u64) {
+    GUEST_STATS
+        .get()
+        .unwrap()
+        .in_guest_sigsys
+        .store(value, Ordering::Release);
+}
+
+#[doc(hidden)]
+#[cfg(feature = "native-exec-state")]
+pub mod native_exec;
+
 static GUEST_STATS: OnceLock<GuestStatsCollector> = OnceLock::new();
 
 /// Opaque adapter for the installed frontend to record and submit statistics.
@@ -452,6 +577,8 @@ impl GuestStatsHooks {
         let Some(stats) = self.collector else {
             return Ok(());
         };
+        #[cfg(feature = "native-exec-state")]
+        native_exec::CONTINUITY.note_activity();
         let paths = stats.snapshot(direct_hooks);
         let inherited = stats.inherited_entries();
         let client = BlockingRpcClient::<LiteinstStatsGlobal>::connect(&stats.coordinator, tid)
@@ -486,13 +613,18 @@ fn enabled_record_path(
 ) {
     #[cfg(test)]
     ENABLED_STATS_PROBES.fetch_add(1, Ordering::Relaxed);
-    collector
+    let counter = collector
         .expect("enabled stats dispatch requires a collector")
-        .counter(path)
-        .fetch_add(1, Ordering::Relaxed);
+        .counter(path);
+    #[cfg(feature = "native-exec-state")]
+    native_exec::CONTINUITY.increment(counter, true);
+    #[cfg(not(feature = "native-exec-state"))]
+    counter.fetch_add(1, Ordering::Relaxed);
 }
 
 fn enabled_reset_after_fork(collector: Option<&'static GuestStatsCollector>) {
+    #[cfg(feature = "native-exec-state")]
+    native_exec::CONTINUITY.note_activity();
     #[cfg(test)]
     ENABLED_STATS_PROBES.fetch_add(1, Ordering::Relaxed);
     collector
@@ -505,11 +637,14 @@ fn enabled_record_inherited_entry(
     entry: InheritedEntry,
 ) {
     let collector = collector.expect("enabled stats dispatch requires a collector");
-    match entry {
+    let counter = match entry {
         InheritedEntry::Sigsys => &collector.inherited_sigsys,
         InheritedEntry::Hook => &collector.inherited_hooks,
-    }
-    .fetch_add(1, Ordering::Relaxed);
+    };
+    #[cfg(feature = "native-exec-state")]
+    native_exec::CONTINUITY.increment(counter, false);
+    #[cfg(not(feature = "native-exec-state"))]
+    counter.fetch_add(1, Ordering::Relaxed);
 }
 
 #[cfg(test)]

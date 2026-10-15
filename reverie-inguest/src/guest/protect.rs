@@ -25,6 +25,13 @@ use crate::guest::signal::signal_action_supported;
 use crate::trap::raw_syscall6;
 
 static COORDINATOR_FD: AtomicI32 = AtomicI32::new(-1);
+
+#[cfg(feature = "exec-native-injection")]
+pub(super) fn coordinator_fd() -> Option<libc::c_int> {
+    let fd = COORDINATOR_FD.load(Ordering::Acquire);
+    (fd >= 0).then_some(fd)
+}
+
 /// An output descriptor the in-guest Tool owns; see [`reserve_tool_output_fd`].
 static TOOL_OUTPUT_FD: AtomicI32 = AtomicI32::new(-1);
 /// The lowest number the Tool output socket takes. The coordinator connection,
@@ -235,8 +242,13 @@ pub fn protect_runtime_control(event: &mut SyscallEvent) -> bool {
 /// The runtime-owned descriptors a syscall is kept from, sorted: the
 /// coordinator connection, and for guest syscalls also the Tool output socket.
 /// Returns the array and how many of its leading entries are in use.
-fn protected_descriptors(guest_syscall: bool) -> ([u64; 2], usize) {
-    let mut protected = [u64::MAX; 2];
+#[cfg(feature = "exec-native-injection")]
+const PROTECTED_FD_CAPACITY: usize = 9;
+#[cfg(not(feature = "exec-native-injection"))]
+const PROTECTED_FD_CAPACITY: usize = 2;
+
+fn protected_descriptors(guest_syscall: bool) -> ([u64; PROTECTED_FD_CAPACITY], usize) {
+    let mut protected = [u64::MAX; PROTECTED_FD_CAPACITY];
     let mut count = 0;
     let slots: &[&AtomicI32] = if guest_syscall {
         &[&COORDINATOR_FD, &TOOL_OUTPUT_FD]
@@ -249,6 +261,10 @@ fn protected_descriptors(guest_syscall: bool) -> ([u64; 2], usize) {
             protected[count] = fd as u64;
             count += 1;
         }
+    }
+    #[cfg(feature = "exec-native-injection")]
+    if guest_syscall {
+        super::native_exec_fds::append_protected(&mut protected, &mut count);
     }
     protected[..count].sort_unstable();
     (protected, count)

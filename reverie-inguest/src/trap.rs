@@ -724,6 +724,28 @@ pub(crate) unsafe fn adopt_authenticated_initial_gate() -> io::Result<()> {
     unsafe { fixed_gates::adopt_authenticated_initial_page() }
 }
 
+/// Verify the controlled native bootstrap's physical page without publication.
+///
+/// # Safety
+/// The caller owns the actual inherited qualified gate/filter and excludes
+/// Guest execution, workers and mapping changes. This proves neither admission
+/// nor permission to publish a Tool or native control.
+#[cfg(all(feature = "exec-private-init", feature = "coordinator-rpc"))]
+pub(crate) unsafe fn verify_native_io_gate() -> io::Result<()> {
+    unsafe { fixed_gates::verify_initial_page() }
+}
+
+/// Use the inherited scalar mechanism even while its selector is unpublished.
+///
+/// # Safety
+/// A checked native I/O scope must retain the real qualified RX page/filter,
+/// original task/private FS and valid scalar arguments/return stack. No Guest
+/// may invoke this mechanism, and it supplies no image admission authority.
+#[cfg(all(feature = "exec-private-init", feature = "coordinator-rpc"))]
+pub(crate) unsafe fn native_io_syscall(number: i64, args: [u64; 6]) -> i64 {
+    unsafe { fixed_gates::scalar(number, args) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -683,6 +683,30 @@ const CONTENT_WORKSPACE_FILES: [&str; 6] = [
     "liteinst-runtime-build/build.rs",
     "liteinst-runtime-build/artifact.rs",
 ];
+const CONTENT_DETCORE_WORKSPACE_FILES: [&str; 10] = [
+    "liteinst-runtime-build/Cargo.toml",
+    "liteinst-runtime-build/Cargo.lock",
+    "liteinst-runtime-build/runtime/Cargo.toml",
+    "liteinst-runtime-build/runtime/src/lib.rs",
+    "liteinst-runtime-build/build.rs",
+    "liteinst-runtime-build/artifact.rs",
+    "Cargo.toml",
+    "Cargo.lock",
+    "detcore-liteinst/Cargo.toml",
+    "detcore-liteinst/src/lib.rs",
+];
+fn content_workspace_files(image_kind: FixedImageKind) -> &'static [&'static str] {
+    match image_kind {
+        FixedImageKind::Standalone => &CONTENT_WORKSPACE_FILES,
+        FixedImageKind::Detcore => &CONTENT_DETCORE_WORKSPACE_FILES,
+    }
+}
+fn content_manifest_relative(image_kind: FixedImageKind) -> &'static str {
+    match image_kind {
+        FixedImageKind::Standalone => "liteinst-runtime-build/Cargo.toml",
+        FixedImageKind::Detcore => "Cargo.toml",
+    }
+}
 // Reviewed literal expectations, not hashes generated from the current checkout
 // or bytes embedded after a runtime edit. The qualifier self-hash is separate.
 const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 18] = [
@@ -698,23 +722,23 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 18] = [
     ),
     (
         "reverie-inguest/Cargo.toml",
-        3632,
-        "78d28077ec79b06cff7598c8959176a77b0a8448ecab9e491f00b7766dd8a13f",
+        4184,
+        "a2bc6bbd170549052717d66fd91397304a74748d4111e1886a24d463455da0d7",
     ),
     (
         "reverie-inguest/src/lib.rs",
-        11447,
-        "19a694f0ca9c913c018506081df234044607b85b5988b2f15bd737e5af342792",
+        11518,
+        "627736cc953928e8f20f76fad6c95377ededfa201746e88a208ac304c1a4652c",
     ),
     (
         "reverie-liteinst/Cargo.toml",
-        4360,
-        "ce1338ee4a354993f8eb782624e130830943ba6cf2c36e3a7103d97cf2d215c0",
+        5104,
+        "4ee40b5b0e542231436fca83c578be3b64fb9e9be529960d12b1b561e3541276",
     ),
     (
         "reverie-liteinst/src/lib.rs",
-        22672,
-        "4d4107d4a0629221ef54ac7e1631b7d071833f89cc4aa87c6b9c48193e7d80a8",
+        23282,
+        "a6f8554749d5d3387c253e45a66b3556e8a10240a47cc51ef1c00e19df8914f9",
     ),
     (
         "reverie-liteinst-preload/Cargo.toml",
@@ -758,25 +782,32 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 18] = [
     ),
     (
         "reverie-inguest/src/guest/installed_tool.rs",
-        12722,
-        "f8cb33453c26321f185ca115beddb802e6f69e8d713230357377291b2daa0c4e",
+        16500,
+        "fb58dc4b05489cced3634130c9a20c305527a1f82f6d7190b2d91ca37f5a2cff",
     ),
     (
         "reverie-inguest/src/guest/mod.rs",
-        1419,
-        "f7b5eefa17f2d61297a6e055f61b3be9228b747ddd3fc5bf383f55d754f76af0",
+        1694,
+        "999b5441c7869e6b63ae41e0a159e951bd5a484feb59c71430c1e75e5b49ecf5",
     ),
     (
         "reverie-inguest/src/guest/host.rs",
-        137898,
-        "394b20f58ecd7bde0f4b86d40bc28c320a07b948795dd9e84625655157485481",
+        154190,
+        "025f9496f0f1318b7e890132d8ebfa7188f8054ac20a7f8b52cf477e1068fef1",
     ),
     (
         "reverie-liteinst/src/tool_host.rs",
-        26591,
-        "fd4b3aa7ef7386e3cc27eb4d0baa950d3ba20c8dc6ca4aca8a4c1ffd8104f492",
+        45225,
+        "6d4f9fc9663ad61a348b585548b3104d904132a0fa2704717d015025ca33aeb5",
     ),
 ];
+// Native Detcore's fixed-gate publication ordering is a separately declared
+// source premise. The ordinary Standalone cohort and Location roles stay frozen.
+const CONTENT_DETCORE_FIXED_GATE: (&str, u64, &str) = (
+    "reverie-inguest/src/trap/fixed_gates.rs",
+    28338,
+    "5d062d8cedd22d5e1d29674a358fcee6eccba24a46540cc2ada193c052f4e4b3",
+);
 fn content_catalog_matches(relative: &str, size: u64, digest: &str) -> Result<()> {
     require(
         CONTENT_REVERIE_CATALOG
@@ -821,13 +852,17 @@ fn declared_inventory_sha256(inventory: &[DeclaredSourceFile]) -> Result<String>
         &serde_json::to_vec(inventory).map_err(|e| e.to_string())?,
     ))
 }
-fn content_reverie_inventory(
+fn content_reverie_inventory_for_image(
     root: &Path,
+    image_kind: FixedImageKind,
 ) -> Result<(Vec<DeclaredSourceFile>, BTreeMap<String, FileIdentity>)> {
     let mut relatives: Vec<_> = CONTENT_REVERIE_CATALOG
         .iter()
         .map(|entry| entry.0)
         .collect();
+    if image_kind == FixedImageKind::Detcore {
+        relatives.push(CONTENT_DETCORE_FIXED_GATE.0);
+    }
     relatives.push("scripts/m1_artifact.rs");
     let (inventory, files) = declared_inventory(root, &relatives)?;
     for entry in &inventory {
@@ -836,11 +871,24 @@ fn content_reverie_inventory(
                 entry.sha256 == qualifier_source_sha256(),
                 "declared qualifier source differs from compiled host qualifier",
             )?;
+        } else if entry.relative == CONTENT_DETCORE_FIXED_GATE.0 {
+            require(
+                image_kind == FixedImageKind::Detcore
+                    && entry.size == CONTENT_DETCORE_FIXED_GATE.1
+                    && entry.sha256 == CONTENT_DETCORE_FIXED_GATE.2,
+                "declared Detcore fixed-gate source differs from reviewed catalog",
+            )?;
         } else {
             content_catalog_matches(&entry.relative, entry.size, &entry.sha256)?;
         }
     }
     Ok((inventory, files))
+}
+#[cfg(test)]
+fn content_reverie_inventory(
+    root: &Path,
+) -> Result<(Vec<DeclaredSourceFile>, BTreeMap<String, FileIdentity>)> {
+    content_reverie_inventory_for_image(root, FixedImageKind::Standalone)
 }
 fn clean_absolute_source_root(root: &Path) -> Result<()> {
     let normalized: PathBuf = root.components().collect();
@@ -918,6 +966,7 @@ impl CompilerRootBinding {
     }
 }
 fn verify_declared_content(
+    image_kind: FixedImageKind,
     (workspace_root, workspace_inventory, workspace_sha256): (&Path, &[DeclaredSourceFile], &str),
     (reverie_root, reverie_inventory, reverie_sha256): (&Path, &[DeclaredSourceFile], &str),
     compiler_root: &CompilerRootBinding,
@@ -927,8 +976,9 @@ fn verify_declared_content(
         compiler_root.canonical_root.as_os_str() == reverie_root.as_os_str(),
         "declared compiler root differs from Reverie inventory root",
     )?;
-    let (current_workspace, _) = declared_inventory(workspace_root, &CONTENT_WORKSPACE_FILES)?;
-    let (current_reverie, _) = content_reverie_inventory(reverie_root)?;
+    let (current_workspace, _) =
+        declared_inventory(workspace_root, content_workspace_files(image_kind))?;
+    let (current_reverie, _) = content_reverie_inventory_for_image(reverie_root, image_kind)?;
     require(
         current_workspace == workspace_inventory
             && declared_inventory_sha256(&current_workspace)? == workspace_sha256,
@@ -1315,6 +1365,149 @@ fn content_manifest_and_lock_pin(metadata: &Value, root: &Path, source: &str) ->
     }
     Ok(())
 }
+// Runtime and producer are separate locked Cargo graphs. Neither may stand
+// in for the other, and they must identify the same actual compiler checkout.
+fn content_root_binding(metadata: &Value, pin: &str) -> Result<CompilerRootBinding> {
+    let selected: Vec<_> = metadata["packages"]
+        .as_array()
+        .ok_or("content metadata packages missing")?
+        .iter()
+        .filter(|p| p["name"] == "reverie-inguest")
+        .collect();
+    require(
+        selected.len() == 1,
+        "one compiled reverie-inguest source required",
+    )?;
+    let raw_manifest = selected[0]["manifest_path"]
+        .as_str()
+        .ok_or("content dependency manifest missing")?;
+    let logical_root = raw_manifest
+        .strip_suffix("/reverie-inguest/Cargo.toml")
+        .ok_or("content dependency manifest has wrong suffix")?;
+    CompilerRootBinding::resolve(Path::new(logical_root), pin)
+}
+fn content_same_root(runtime: &CompilerRootBinding, producer: &CompilerRootBinding) -> Result<()> {
+    runtime.verify()?;
+    producer.verify()?;
+    require(
+        runtime == producer,
+        "runtime and producer compiler roots differ",
+    )
+}
+fn content_detcore_manifest_and_lock_pin(
+    metadata: &Value,
+    root: &Path,
+    source: &str,
+) -> Result<()> {
+    require(
+        metadata["workspace_root"].as_str() == root.to_str(),
+        "content Detcore workspace root differs",
+    )?;
+    let selected: Vec<_> = metadata["packages"]
+        .as_array()
+        .ok_or("content Detcore metadata packages missing")?
+        .iter()
+        .filter(|p| p["name"] == "detcore-liteinst")
+        .collect();
+    require(
+        selected.len() == 1
+            && selected[0]["manifest_path"].as_str()
+                == root.join("detcore-liteinst/Cargo.toml").to_str()
+            && selected[0]["version"] == "0.4.0"
+            && selected[0]["source"].is_null(),
+        "content Detcore leaf manifest/version/source differs",
+    )?;
+    for (name, rename, optional) in [
+        ("reverie-core", Some("reverie"), false),
+        ("reverie-inguest", None, false),
+        ("reverie-liteinst", None, false),
+        ("reverie-rpc-transport", None, true),
+    ] {
+        let dependencies: Vec<_> = selected[0]["dependencies"]
+            .as_array()
+            .ok_or("content Detcore dependencies missing")?
+            .iter()
+            .filter(|d| d["name"] == name)
+            .collect();
+        require(
+            dependencies.len() == 1
+                && dependencies[0]["source"].as_str() == source.rsplit_once('#').map(|s| s.0)
+                && dependencies[0]["kind"].is_null()
+                && dependencies[0]["rename"].as_str() == rename
+                && (rename.is_some() || dependencies[0]["rename"].is_null())
+                && dependencies[0]["path"].is_null()
+                && dependencies[0]["target"].is_null()
+                && dependencies[0]["optional"].as_bool() == Some(optional),
+            format!("content Detcore dependency differs from independent full pin: {name}"),
+        )?;
+    }
+    let lock = fs::read_to_string(root.join("Cargo.lock")).map_err(|e| e.to_string())?;
+    for name in [
+        "reverie-core",
+        "reverie-inguest",
+        "reverie-liteinst",
+        "reverie-rpc-transport",
+    ] {
+        let name_line = format!("name = \"{name}\"");
+        let entries: Vec<_> = lock
+            .split("[[package]]")
+            .filter(|entry| entry.lines().any(|line| line == name_line))
+            .collect();
+        let source_line = format!("source = \"{source}\"");
+        require(
+            entries.len() == 1
+                && entries[0]
+                    .lines()
+                    .filter(|line| line.starts_with("source = "))
+                    .collect::<Vec<_>>()
+                    == [source_line.as_str()]
+                && entries[0]
+                    .lines()
+                    .filter(|line| line.starts_with("version = "))
+                    .collect::<Vec<_>>()
+                    == ["version = \"0.4.1\""],
+            format!("content Detcore lock source/version differs: {name}"),
+        )?;
+    }
+    let local: Vec<_> = lock
+        .split("[[package]]")
+        .filter(|entry| {
+            entry
+                .lines()
+                .any(|line| line == "name = \"detcore-liteinst\"")
+        })
+        .collect();
+    require(
+        local.len() == 1
+            && !local[0].lines().any(|line| line.starts_with("source = "))
+            && local[0]
+                .lines()
+                .filter(|line| line.starts_with("version = "))
+                .collect::<Vec<_>>()
+                == ["version = \"0.4.0\""],
+        "content Detcore local lock entry differs",
+    )
+}
+fn content_compiler_manifest_path(
+    image_kind: FixedImageKind,
+    workspace_root: &Path,
+    leaf_manifest: &Path,
+    compiler_root: &CompilerRootBinding,
+) -> Result<PathBuf> {
+    let logical = match image_kind {
+        FixedImageKind::Standalone => {
+            compiler_root.source_path("reverie-liteinst-preload/Cargo.toml")?
+        }
+        FixedImageKind::Detcore => {
+            exact_source_file(workspace_root, "detcore-liteinst/Cargo.toml")?.path
+        }
+    };
+    require(
+        real_file(&logical)?.as_os_str() == leaf_manifest.as_os_str(),
+        "compiler manifest does not match verified canonical package",
+    )?;
+    Ok(logical)
+}
 // Only filename() supplies this helper's identity from its private verified record.
 fn compiled_role_filename(
     layout: CompiledSourceLayout,
@@ -1492,6 +1685,9 @@ impl VerifiedCompiledSources {
             .into_iter()
             .map(str::to_owned)
             .collect();
+        if expected.image_kind == FixedImageKind::Detcore {
+            relatives.insert(CONTENT_DETCORE_FIXED_GATE.0.to_owned());
+        }
         for package in packages
             .values()
             .filter(|p| p.manifest.starts_with(&rv_root))
@@ -1546,16 +1742,15 @@ impl VerifiedCompiledSources {
         verified.verify_unchanged(runner)?;
         Ok(verified)
     }
-    /// Explicit standalone source-copy authority. It never catches a Git error
+    /// Explicit closed-profile Hermit source-copy authority. It never catches a Git error
     /// or accepts caller-supplied metadata, inventories or compiler mappings.
     pub fn resolve_content(
         expected: &CompiledSourceExpectation<'_>,
         runner: &mut Runner,
     ) -> Result<Self> {
         require(
-            expected.layout == CompiledSourceLayout::HermitGit
-                && expected.image_kind == FixedImageKind::Standalone,
-            "declared content factory supports only standalone Hermit builds",
+            expected.layout == CompiledSourceLayout::HermitGit,
+            "declared content factory supports only closed Hermit image profiles",
         )?;
         require(
             source_pin_is_full(expected.reverie_pin),
@@ -1578,9 +1773,9 @@ impl VerifiedCompiledSources {
             "compiled source workspace is not canonical",
         )?;
         let (workspace_inventory, workspace_files) =
-            declared_inventory(&root, &CONTENT_WORKSPACE_FILES)?;
+            declared_inventory(&root, content_workspace_files(expected.image_kind))?;
         let manifest = workspace_files
-            .get("liteinst-runtime-build/Cargo.toml")
+            .get(content_manifest_relative(expected.image_kind))
             .ok_or("declared build manifest missing")?
             .clone();
         require(
@@ -1609,26 +1804,43 @@ impl VerifiedCompiledSources {
             "git+https://github.com/rrnewton/reverie.git?rev={0}#{0}",
             expected.reverie_pin
         );
-        content_manifest_and_lock_pin(&metadata, &root, &source)?;
-        let selected: Vec<_> = metadata["packages"]
-            .as_array()
-            .ok_or("content metadata packages missing")?
-            .iter()
-            .filter(|p| p["name"] == "reverie-inguest")
-            .collect();
-        require(
-            selected.len() == 1,
-            "one compiled reverie-inguest source required",
-        )?;
-        let raw_manifest = selected[0]["manifest_path"]
-            .as_str()
-            .ok_or("content dependency manifest missing")?;
-        let logical_root = raw_manifest
-            .strip_suffix("/reverie-inguest/Cargo.toml")
-            .ok_or("content dependency manifest has wrong suffix")?;
-        let binding = CompilerRootBinding::resolve(Path::new(logical_root), expected.reverie_pin)?;
+        let binding = content_root_binding(&metadata, expected.reverie_pin)?;
+        let producer_metadata = match expected.image_kind {
+            FixedImageKind::Standalone => None,
+            FixedImageKind::Detcore => {
+                content_detcore_manifest_and_lock_pin(&metadata, &root, &source)?;
+                let producer_manifest = workspace_files
+                    .get("liteinst-runtime-build/Cargo.toml")
+                    .ok_or("declared producer manifest missing")?;
+                let output = runner.run(
+                    "cargo",
+                    &[
+                        "metadata".into(),
+                        "--locked".into(),
+                        "--offline".into(),
+                        "--format-version=1".into(),
+                        "--manifest-path".into(),
+                        producer_manifest
+                            .path
+                            .to_str()
+                            .ok_or("producer manifest is not UTF-8")?
+                            .into(),
+                    ],
+                    &root,
+                )?;
+                let producer: Value = serde_json::from_slice(&output)
+                    .map_err(|e| format!("fresh producer source metadata: {e}"))?;
+                content_same_root(
+                    &binding,
+                    &content_root_binding(&producer, expected.reverie_pin)?,
+                )?;
+                Some(producer)
+            }
+        };
+        let producer_metadata = producer_metadata.as_ref().unwrap_or(&metadata);
+        content_manifest_and_lock_pin(producer_metadata, &root, &source)?;
         let (reverie_inventory, reverie_files) =
-            content_reverie_inventory(&binding.canonical_root)?;
+            content_reverie_inventory_for_image(&binding.canonical_root, expected.image_kind)?;
         let mut packages = BTreeMap::new();
         for (name, target, kind) in [
             (
@@ -1650,13 +1862,37 @@ impl VerifiedCompiledSources {
         ] {
             packages.insert(
                 name.into(),
-                content_package(&metadata, name, target, kind, &binding, &source)?,
+                content_package(
+                    if name == "reverie-liteinst-preload" || name == "reverie-liteinst-artifact" {
+                        producer_metadata
+                    } else {
+                        &metadata
+                    },
+                    name,
+                    target,
+                    kind,
+                    &binding,
+                    &source,
+                )?,
             );
         }
-        let leaf = packages
-            .get("reverie-liteinst-preload")
-            .ok_or("content leaf missing")?
-            .clone();
+        let leaf = match expected.image_kind {
+            FixedImageKind::Standalone => packages
+                .get("reverie-liteinst-preload")
+                .ok_or("content leaf missing")?
+                .clone(),
+            FixedImageKind::Detcore => {
+                let leaf = compiled_leaf_package(
+                    &metadata,
+                    &root,
+                    &binding.canonical_root,
+                    Some(&source),
+                    FixedImageKind::Detcore,
+                )?;
+                packages.insert(leaf.name.clone(), leaf.clone());
+                leaf
+            }
+        };
         let files = workspace_files
             .into_iter()
             .map(|(path, file)| (format!("workspace:{path}"), file))
@@ -1703,12 +1939,12 @@ impl VerifiedCompiledSources {
         match &self.record.authority {
             CompiledSourceAuthority::Git { .. } => Ok(self.record.leaf.manifest.clone()),
             CompiledSourceAuthority::DeclaredContent { compiler_root, .. } => {
-                let logical = compiler_root.source_path("reverie-liteinst-preload/Cargo.toml")?;
-                require(
-                    real_file(&logical)?.as_os_str() == self.record.leaf.manifest.as_os_str(),
-                    "compiler manifest does not match verified canonical package",
-                )?;
-                Ok(logical)
+                content_compiler_manifest_path(
+                    self.record.image_kind,
+                    &self.record.workspace_root,
+                    &self.record.leaf.manifest,
+                    compiler_root,
+                )
             }
         }
     }
@@ -1744,6 +1980,7 @@ impl VerifiedCompiledSources {
         } = &self.record.authority
         {
             verify_declared_content(
+                self.record.image_kind,
                 (
                     &self.record.workspace_root,
                     workspace_inventory,
@@ -2089,6 +2326,9 @@ const DIRECT_TLS_CENSUS_POLICY: &str =
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AllocatorBackingEvidence {
+    /// Actual native fixed-wrapper proof; absent for the unchanged legacy route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_native_syscalls: Option<FixedNativeSyscallsEvidence>,
     pub fixed_arena_version: u32,
     pub descriptor: AllocatorDescriptorEvidence,
     /// The compiler global is a ZST: identity comes from its actual four shims
@@ -2341,6 +2581,25 @@ pub struct DetcoreConstructorQualification {
     pub objdump_disassembly: FileIdentity,
 }
 
+/// Actual explicit native entry qualification. This deliberately has no
+/// init-array admission or runtime receipt fields. It cannot substitute for the
+/// ordinary constructor proof or for the consumer's physical launch proof.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DetcoreNativeEntryQualification {
+    pub artifact: FileIdentity,
+    pub allocator_backing: AllocatorBackingEvidence,
+    pub native_entry: SymbolEvidence,
+    pub native_entry_sha256: String,
+    pub generic_bootstrap: GenericBootstrapEvidence,
+    pub needed: Vec<String>,
+    pub required_versions: Vec<String>,
+    pub readelf_versions: FileIdentity,
+    pub readelf_symbols_relocations: FileIdentity,
+    pub objdump_disassembly: FileIdentity,
+    pub observation: String,
+}
+
 /// Exact protected Detcore root and Constructor-origin native route.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2354,6 +2613,9 @@ pub struct DetcoreConstructorEvidence {
     pub native_gate_owner: SymbolEvidence,
     pub native_gate_return: SymbolEvidence,
     pub native_gate_offset: u64,
+    /// Independently qualified fixed selector; absent only on the legacy route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_native_gate: Option<FixedNativeGateEvidence>,
     pub initializing_guard: u64,
     pub function_sha256: BTreeMap<String, String>,
     pub body_materialization: u64,
@@ -2447,6 +2709,9 @@ pub struct StandaloneConstructorEvidence {
     pub native_gate_owner: SymbolEvidence,
     pub native_gate_return: SymbolEvidence,
     pub native_gate_offset: u64,
+    /// Independently qualified fixed selector; absent only on the legacy route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_native_gate: Option<FixedNativeGateEvidence>,
     /// Actual independently selected preparation roles; never a body dispatch edge.
     pub preparation_helpers: BTreeMap<String, SymbolEvidence>,
     pub prepare_helper_transfers: Vec<ConstructorTransfer>,
@@ -2493,6 +2758,9 @@ pub struct GenericBootstrapEvidence {
     pub native_gate_owner: SymbolEvidence,
     pub native_gate_return: SymbolEvidence,
     pub native_gate_offset: u64,
+    /// Independently qualified fixed selector; absent only on the legacy route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_native_gate: Option<FixedNativeGateEvidence>,
     pub initializing_guard: u64,
     pub function_sha256: BTreeMap<String, String>,
     pub body_materialization: u64,
@@ -16810,6 +17078,7 @@ fn validate_fixed_backing_evidence_in_source_context(
     backing: &AllocatorBackingEvidence,
     image_kind: FixedImageKind,
 ) -> Result<()> {
+    validate_fixed_native_syscall_evidence(backing, image_kind)?;
     require(
         backing.fixed_arena_version == FIXED_ARENA_VERSION
             && backing.descriptor.version == 1
@@ -17157,6 +17426,9 @@ fn qualify_fixed_allocator_in_source_context(
             "Detcore validate needs independently verified compiled sources",
         )?;
     }
+    if image_kind == FixedImageKind::Standalone {
+        require_legacy_standalone_gate(elf)?;
+    }
     let descriptor = allocator_descriptor(elf, bytes)?;
     require(
         descriptor.mode == AllocatorBackingMode::Fixed,
@@ -17176,6 +17448,9 @@ fn qualify_fixed_allocator_in_source_context(
     )?;
     let disassembly = gate_view.as_str();
     let mut roles = fixed_role_symbols(elf)?;
+    if image_kind == FixedImageKind::Detcore {
+        add_fixed_native_owner(elf, &mut roles)?;
+    }
     if image_kind == FixedImageKind::Standalone {
         fixed_select_heap_equal_cohort(elf, bytes, code, got, &mut roles)?;
     }
@@ -17200,11 +17475,11 @@ fn qualify_fixed_allocator_in_source_context(
     let context = fixed_machine_context(
         (elf, bytes),
         code,
-        &roles,
+        got,
         &shims,
         &fixed_backing_record,
         &tls,
-        (image_kind, sources),
+        (image_kind, sources, &roles),
     )?;
     let closure = qualify_fixed_operation_closure(
         elf,
@@ -17322,7 +17597,15 @@ fn qualify_fixed_allocator_in_source_context(
         let role = resolved_preparation_role(name).unwrap();
         if matches!(role, "from_native" | "publish") || owned_fixed_setup_role(role) {
             let instructions = constructor_instructions(disassembly, symbol.st_value)?;
-            let (transfers, edges) = preparation_transfers(&instructions, got, &allowed)?;
+            let function = symbol_evidence(name, symbol);
+            let (transfers, edges) = fixed_setup_preparation_transfers(
+                role,
+                &function,
+                &instructions,
+                got,
+                &allowed,
+                context.native_syscalls.as_ref(),
+            )?;
             owned_setup_transfers.insert(role.to_owned(), transfers);
             owned_setup_got_edges.extend(edges);
         }
@@ -17361,6 +17644,7 @@ fn qualify_fixed_allocator_in_source_context(
         })
         .collect::<Result<_>>()?;
     let evidence = AllocatorBackingEvidence {
+        fixed_native_syscalls: context.native_syscalls.map(|native| native.evidence),
         fixed_arena_version: FIXED_ARENA_VERSION,
         descriptor,
         compiler_global_type: "reverie_liteinst::patch_alloc::FixedPrivatePatchAllocator"
@@ -20744,6 +21028,8 @@ fn fixed_detcore_compiled_filenames(
 const FIXED_GUARD_CONTRACT: &str =
     "valid_globalalloc_layout_live_same_owner_pointer_intact_locked_metadata_no_foreign_unwind";
 struct FixedMachineContext {
+    // Only the actual ELF factory constructs this private witness.
+    native_syscalls: Option<FixedNativeSyscallContext>,
     compiled_filenames: BTreeMap<String, Vec<u8>>,
     targets: BTreeMap<String, u64>,
     readonly: BTreeMap<u64, Vec<u8>>,
@@ -20878,12 +21164,21 @@ fn fixed_named_selection_object(
 fn fixed_machine_context(
     (elf, bytes): (&Elf<'_>, &[u8]),
     code: &BTreeMap<u64, Vec<u8>>,
-    roles: &BTreeMap<String, sym::Sym>,
+    got: &BTreeMap<u64, u64>,
     shims: &BTreeMap<String, sym::Sym>,
     record: &ImmutableAllocatorObject,
     tls: &AllocatorTlsBoundary,
-    (image_kind, sources): (FixedImageKind, Option<&VerifiedCompiledSources>),
+    (image_kind, sources, roles): (
+        FixedImageKind,
+        Option<&VerifiedCompiledSources>,
+        &BTreeMap<String, sym::Sym>,
+    ),
 ) -> Result<FixedMachineContext> {
+    let native_syscalls = if image_kind == FixedImageKind::Detcore {
+        qualify_fixed_native_syscalls(elf, bytes, code, got, roles)?
+    } else {
+        None
+    };
     let compiled_filenames = fixed_detcore_compiled_filenames(image_kind, sources)?;
     let mut targets: BTreeMap<_, _> = roles
         .iter()
@@ -20949,6 +21244,14 @@ fn fixed_machine_context(
             let actual = code
                 .get(&symbol.st_value)
                 .ok_or("Detcore role lacks whole code")?;
+            if native_syscalls
+                .as_ref()
+                .is_some_and(|native| native.evidence.wrappers.contains_key(role))
+            {
+                // The factory checked this complete native body and both
+                // operands. It cannot masquerade as an old template index.
+                continue;
+            }
             if !DETCORE_VALIDATE_TEMPLATES.iter().any(|t| t.role == role) {
                 continue;
             }
@@ -21092,6 +21395,7 @@ fn fixed_machine_context(
         }
     }
     Ok(FixedMachineContext {
+        native_syscalls,
         compiled_filenames,
         targets,
         readonly,
@@ -21280,10 +21584,16 @@ pub struct FixedGuardedTerminal {
 }
 // A witness exists only after a complete typed recipe and actual transfer census.
 // It is private and derived again during physical ELF requalification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuthenticatedDetcoreOperationKind {
+    ValidateTemplate(usize),
+    NativeFixedSyscall3,
+    NativeFixedSyscall6,
+}
 struct AuthenticatedDetcoreOperation {
     role: String,
     address: u64,
-    template_index: usize,
+    kind: AuthenticatedDetcoreOperationKind,
     edges: Vec<ConstructorTransfer>,
 }
 
@@ -21309,7 +21619,7 @@ fn fixed_detcore_qualified_operation(
     Ok(AuthenticatedDetcoreOperation {
         role: role.into(),
         address,
-        template_index: recipe.template_index,
+        kind: AuthenticatedDetcoreOperationKind::ValidateTemplate(recipe.template_index),
         edges: recipe.edges,
     })
 }
@@ -21347,21 +21657,23 @@ fn fixed_detcore_publication_cohort(
             "aliased Detcore publication roles",
         )?;
         require(
-            (witness.template_index == old || witness.template_index == new)
-                && DETCORE_VALIDATE_TEMPLATES[witness.template_index].role == role,
+            matches!(witness.kind, AuthenticatedDetcoreOperationKind::ValidateTemplate(index)
+                if (index == old || index == new) && DETCORE_VALIDATE_TEMPLATES[index].role == role),
             "unknown authenticated Detcore publication variant",
         )?;
     }
-    let old = DETCORE_PUBLICATION_COHORT
-        .iter()
-        .all(|(role, index, _)| witnesses[*role].template_index == *index);
-    let new = DETCORE_PUBLICATION_COHORT
-        .iter()
-        .all(|(role, _, index)| witnesses[*role].template_index == *index);
+    let old = DETCORE_PUBLICATION_COHORT.iter().all(|(role, index, _)| {
+        witnesses[*role].kind == AuthenticatedDetcoreOperationKind::ValidateTemplate(*index)
+    });
+    let new = DETCORE_PUBLICATION_COHORT.iter().all(|(role, _, index)| {
+        witnesses[*role].kind == AuthenticatedDetcoreOperationKind::ValidateTemplate(*index)
+    });
     let keyed_normal = DETCORE_PUBLICATION_COHORT
         .iter()
         .zip([31, 32, 33, 18, 11])
-        .all(|((role, _, _), index)| witnesses[*role].template_index == index);
+        .all(|((role, _, _), index)| {
+            witnesses[*role].kind == AuthenticatedDetcoreOperationKind::ValidateTemplate(index)
+        });
     require(
         old || new || keyed_normal,
         "mixed authenticated Detcore publication family",
@@ -21593,6 +21905,17 @@ fn qualify_fixed_operation_closure(
             );
         }
     }
+    if let Some(native) = &context.native_syscalls {
+        // Both finite branches need their own actual instruction census even
+        // when one wrapper is not on the compiler operation's shortest path.
+        pending.extend(
+            native
+                .evidence
+                .wrappers
+                .values()
+                .map(|w| w.function.address),
+        );
+    }
     let mut done = BTreeSet::new();
     let mut transfers = BTreeMap::new();
     let mut guarded = BTreeMap::new();
@@ -21629,6 +21952,46 @@ fn qualify_fixed_operation_closure(
         let mut chosen = None;
         let mut errors = Vec::new();
         for (role, symbol) in aliases {
+            if let Some(native) = &context.native_syscalls {
+                if role == FIXED_NATIVE_OWNER {
+                    require(
+                        symbol.st_value == native.evidence.owner.address
+                            && symbol.st_size == native.evidence.owner.size,
+                        "native fixed owner loses its selected complete identity",
+                    )?;
+                    fixed_native_owner_census(actual, &instructions, &native.evidence)?;
+                    chosen = Some((role.clone(), vec![native.evidence.page_transfer.clone()]));
+                    break;
+                }
+                if let Some(wrapper) = native.evidence.wrappers.get(role) {
+                    let edges = vec![
+                        wrapper.fixed_transfer.clone(),
+                        wrapper.legacy_transfer.clone(),
+                    ];
+                    fixed_census_transfers(&instructions, address, actual, &edges, got, false)?;
+                    let kind = if role == FIXED_NATIVE_RAW6 {
+                        AuthenticatedDetcoreOperationKind::NativeFixedSyscall6
+                    } else {
+                        AuthenticatedDetcoreOperationKind::NativeFixedSyscall3
+                    };
+                    require(
+                        detcore_witnesses
+                            .insert(
+                                role.clone(),
+                                AuthenticatedDetcoreOperation {
+                                    role: role.clone(),
+                                    address,
+                                    kind,
+                                    edges: edges.clone(),
+                                },
+                            )
+                            .is_none(),
+                        "duplicate native syscall witness",
+                    )?;
+                    chosen = Some((role.clone(), edges));
+                    break;
+                }
+            }
             if image_kind == FixedImageKind::Detcore && address != trusted.st_value {
                 match fixed_detcore_qualified_operation(
                     role,
@@ -21738,8 +22101,15 @@ fn qualify_fixed_operation_closure(
                 errors.join("; ")
             )
         })?;
-        fixed_census_transfers(&instructions, address, actual, &edges, got, internal_switch)
-            .map_err(|error| format!("Fixed role {role} at {address:#x}: {error}"))?;
+        let native_leaf = context.native_syscalls.as_ref().filter(|native| {
+            role == FIXED_NATIVE_OWNER && address == native.evidence.owner.address
+        });
+        if let Some(native) = native_leaf {
+            fixed_native_owner_census(actual, &instructions, &native.evidence)?;
+        } else {
+            fixed_census_transfers(&instructions, address, actual, &edges, got, internal_switch)
+                .map_err(|error| format!("Fixed role {role} at {address:#x}: {error}"))?;
+        }
         let normal_return_witness = if image_kind == FixedImageKind::Standalone {
             fixed_normal_return_qualified_operation(
                 &role,
@@ -21761,6 +22131,13 @@ fn qualify_fixed_operation_closure(
             )?;
         }
         for edge in &edges {
+            if let Some(native) = native_leaf {
+                require(
+                    edge == &native.evidence.page_transfer && edges.len() == 1,
+                    "native fixed owner has an unqualified leaf transfer",
+                )?;
+                continue;
+            }
             if edge.target == tls.plt_address {
                 require(
                     tls.callsites.iter().any(|actual| actual == edge),
@@ -22045,6 +22422,1060 @@ fn private_function(elf: &Elf<'_>, name: &str) -> Result<sym::Sym> {
     Ok(first)
 }
 
+const FIXED_NATIVE_SELECTOR: &str =
+    "_RNvNtNtNtCs_15reverie_inguest5guest11tool_region11constructor11native_gate";
+const FIXED_NATIVE_PUBLICATION: &str = "reverie_inguest_fixed_gates_published";
+const FIXED_NATIVE_TEMPLATE: &str = "reverie_inguest_fixed_gate_template";
+const FIXED_NATIVE_TEMPLATE_END: &str = "reverie_inguest_fixed_gate_template_end";
+const FIXED_NATIVE_ENTRY: u64 = 0x5000_0000_007c;
+const FIXED_NATIVE_SELECTOR_HEX: &str =
+    "f30f1efa488b0d00000000e30d49bb7c0000000050000041ffe3e900000000";
+
+/// Complete actual selector/data evidence, not publication or page installation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FixedNativeGateEvidence {
+    pub version: u32,
+    pub selector: SymbolEvidence,
+    pub selector_sha256: String,
+    pub publication: SymbolEvidence,
+    pub publication_storage: String,
+    pub publication_read_instruction: u64,
+    pub unpublished_transfer: ConstructorTransfer,
+    pub published_transfer_instruction: u64,
+    pub fixed_entry: u64,
+    pub template_symbol: SymbolEvidence,
+    pub template_bytes: FixedReadonlyEvidence,
+}
+impl FixedNativeGateEvidence {
+    /// Compare the actual qualifier's page record to a successfully compiled
+    /// bootstrap page. This shape/equality check grants no ELF/runtime authority.
+    pub fn verify_bootstrap_page_digest(&self, actual_gate_digest: &[u8; 32]) -> Result<()> {
+        require(
+            self.version == 1
+                && self.fixed_entry == FIXED_NATIVE_ENTRY
+                && self.template_symbol.size == 4096
+                && self.template_bytes.size == 4096
+                && self.template_symbol.address == self.template_bytes.address
+                && self.template_bytes.file_address.is_none()
+                && self.template_bytes.file_sha256.is_none()
+                && self.template_bytes.relative_pointer_slot.is_none(),
+            "fixed native page record version/address/shape differs",
+        )?;
+        require(
+            fixed_native_digest(&self.template_bytes.sha256)? == *actual_gate_digest,
+            "fixed native DSO and compiled bootstrap page digests differ",
+        )
+    }
+}
+fn fixed_native_digest(hex: &str) -> Result<[u8; 32]> {
+    require(
+        hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()),
+        "fixed native digest is not a complete SHA256",
+    )?;
+    let mut result = [0_u8; 32];
+    for (index, word) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+        result[index] =
+            u8::from_str_radix(std::str::from_utf8(word).map_err(|e| e.to_string())?, 16)
+                .map_err(|e| e.to_string())?;
+    }
+    Ok(result)
+}
+fn fixed_native_selector_name(name: &str) -> bool {
+    // Count malformed LLVM-suffixed definitions too, before checking their
+    // shape. A third/zero-sized/dynamic candidate cannot vanish in a filter.
+    canonical_rust_symbol(name.split(".llvm.").next().unwrap())
+        .is_some_and(|name| name == FIXED_NATIVE_SELECTOR)
+}
+// Native roles additionally bind their symbol's declared file-backed code
+// section to the whole actual RX load span. Loader bytes alone cannot make an
+// unrelated/non-file section index authentic source-role metadata.
+fn fixed_native_function_section(elf: &Elf<'_>, symbol: &sym::Sym) -> Result<()> {
+    require(
+        symbol.st_shndx > section_header::SHN_UNDEF as usize
+            && symbol.st_shndx < section_header::SHN_LORESERVE as usize,
+        "native function has an undefined/reserved section index",
+    )?;
+    let section = elf
+        .section_headers
+        .get(symbol.st_shndx)
+        .ok_or("native function section index is absent/reserved")?;
+    let end = symbol
+        .st_value
+        .checked_add(symbol.st_size)
+        .ok_or("native function extent overflow")?;
+    let section_end = section
+        .sh_addr
+        .checked_add(section.sh_size)
+        .ok_or("native function section address extent overflow")?;
+    let section_file_end = section
+        .sh_offset
+        .checked_add(section.sh_size)
+        .ok_or("native function section file extent overflow")?;
+    require(
+        symbol.st_size != 0
+            && section.sh_type == section_header::SHT_PROGBITS
+            && section.sh_flags
+                & u64::from(
+                    section_header::SHF_ALLOC
+                        | section_header::SHF_EXECINSTR
+                        | section_header::SHF_WRITE
+                        | section_header::SHF_TLS,
+                )
+                == u64::from(section_header::SHF_ALLOC | section_header::SHF_EXECINSTR)
+            && symbol.st_value >= section.sh_addr
+            && end <= section_end,
+        "native function is not wholly in its declared file-backed executable section",
+    )?;
+    let section_offset = section
+        .sh_offset
+        .checked_add(symbol.st_value - section.sh_addr)
+        .ok_or("native function section file offset overflow")?;
+    let section_symbol_end = section_offset
+        .checked_add(symbol.st_size)
+        .ok_or("native function section file range overflow")?;
+    require(
+        section_symbol_end <= section_file_end,
+        "native function escapes its complete section file span",
+    )?;
+    let page_start = symbol.st_value & !4095;
+    let page_end = end
+        .checked_add(4095)
+        .ok_or("native function pages overflow")?
+        & !4095;
+    let mut mappings = Vec::new();
+    for mapping in elf
+        .program_headers
+        .iter()
+        .filter(|p| p.p_type == program_header::PT_LOAD)
+    {
+        let memory_end = mapping
+            .p_vaddr
+            .checked_add(mapping.p_memsz)
+            .ok_or("native function load memory range overflow")?;
+        let mapped_page_end = memory_end
+            .checked_add(4095)
+            .ok_or("native function load pages overflow")?
+            & !4095;
+        if (mapping.p_vaddr & !4095) < page_end && mapped_page_end > page_start {
+            mappings.push(mapping);
+        }
+    }
+    require(
+        mappings.len() == 1,
+        "native function section lacks its unique actual page mapping",
+    )?;
+    let mapping = mappings[0];
+    let file_virtual_end = mapping
+        .p_vaddr
+        .checked_add(mapping.p_filesz)
+        .ok_or("native function load file address range overflow")?;
+    let file_end = mapping
+        .p_offset
+        .checked_add(mapping.p_filesz)
+        .ok_or("native function load file offset range overflow")?;
+    require(
+        mapping.p_flags == program_header::PF_R | program_header::PF_X
+            && mapping.p_filesz <= mapping.p_memsz
+            && mapping.p_offset % 4096 == mapping.p_vaddr % 4096
+            && symbol.st_value >= mapping.p_vaddr
+            && end <= file_virtual_end,
+        "native function section does not match its whole file-backed RX load",
+    )?;
+    let load_offset = mapping
+        .p_offset
+        .checked_add(symbol.st_value - mapping.p_vaddr)
+        .ok_or("native function load file offset overflow")?;
+    let load_symbol_end = load_offset
+        .checked_add(symbol.st_size)
+        .ok_or("native function load file span overflow")?;
+    require(
+        section_offset == load_offset
+            && section_symbol_end == load_symbol_end
+            && load_symbol_end <= file_end,
+        "native function section and actual RX file offsets differ",
+    )
+}
+fn fixed_native_selector_symbol(elf: &Elf<'_>) -> Result<Option<sym::Sym>> {
+    let raw: Vec<_> = elf
+        .syms
+        .iter()
+        .filter(|s| {
+            elf.strtab
+                .get_at(s.st_name)
+                .is_some_and(fixed_native_selector_name)
+        })
+        .collect();
+    let dynamic = elf.dynsyms.iter().any(|s| {
+        elf.dynstrtab
+            .get_at(s.st_name)
+            .is_some_and(fixed_native_selector_name)
+    });
+    if raw.is_empty() && !dynamic {
+        return Ok(None);
+    }
+    require(
+        raw.len() == 1 && !dynamic,
+        "fixed native selector raw census is ambiguous/dynamic",
+    )?;
+    let selected = raw[0];
+    require(
+        elf.strtab
+            .get_at(selected.st_name)
+            .and_then(canonical_rust_symbol)
+            .as_deref()
+            == Some(FIXED_NATIVE_SELECTOR)
+            && selected.st_bind() == sym::STB_LOCAL
+            && selected.st_visibility() == sym::STV_HIDDEN
+            && selected.st_size == 31
+            && executable_symbol(elf, &selected),
+        "fixed native selector is not its unique complete local hidden function",
+    )?;
+    fixed_native_function_section(elf, &selected)?;
+    fixed_native_no_alias(elf, &selected, None)?;
+    Ok(Some(selected))
+}
+fn fixed_native_named_symbol(elf: &Elf<'_>, name: &str) -> Result<sym::Sym> {
+    let raw: Vec<_> = elf
+        .syms
+        .iter()
+        .filter(|s| elf.strtab.get_at(s.st_name) == Some(name))
+        .collect();
+    require(
+        raw.len() == 1
+            && !elf
+                .dynsyms
+                .iter()
+                .any(|s| elf.dynstrtab.get_at(s.st_name) == Some(name)),
+        format!("fixed native object/label {name} has ambiguous/dynamic raw identity"),
+    )?;
+    let selected = raw[0];
+    require(
+        selected.st_shndx != section_header::SHN_UNDEF as usize
+            && selected.st_bind() == sym::STB_LOCAL
+            && selected.st_visibility() == sym::STV_HIDDEN,
+        format!("fixed native object/label {name} is not local hidden defined storage"),
+    )?;
+    Ok(selected)
+}
+fn fixed_native_no_alias(
+    elf: &Elf<'_>,
+    selected: &sym::Sym,
+    allowed_end: Option<&str>,
+) -> Result<()> {
+    let end = selected
+        .st_value
+        .checked_add(selected.st_size)
+        .ok_or("fixed native extent overflow")?;
+    let selected_name = elf
+        .strtab
+        .get_at(selected.st_name)
+        .ok_or("fixed native symbol lacks name")?;
+    for (name, other) in elf
+        .syms
+        .iter()
+        .map(|s| (elf.strtab.get_at(s.st_name), s))
+        .chain(
+            elf.dynsyms
+                .iter()
+                .map(|s| (elf.dynstrtab.get_at(s.st_name), s)),
+        )
+    {
+        if other.st_shndx == section_header::SHN_UNDEF as usize
+            || !matches!(
+                other.st_type(),
+                sym::STT_FUNC
+                    | sym::STT_OBJECT
+                    | sym::STT_TLS
+                    | sym::STT_NOTYPE
+                    | sym::STT_GNU_IFUNC
+            )
+            || name == Some(selected_name)
+            || (allowed_end.is_some()
+                && name == allowed_end
+                && other.st_value == end
+                && other.st_size == 0)
+        {
+            continue;
+        }
+        let other_end = other
+            .st_value
+            .checked_add(other.st_size)
+            .ok_or("fixed native alias overflow")?;
+        require(
+            if other.st_size == 0 {
+                other.st_value < selected.st_value || other.st_value >= end
+            } else {
+                other_end <= selected.st_value || other.st_value >= end
+            },
+            "fixed native role has a conflicting entry/storage alias",
+        )?;
+    }
+    Ok(())
+}
+fn add_fixed_native_selector(
+    elf: &Elf<'_>,
+    symbols: &mut BTreeMap<String, sym::Sym>,
+) -> Result<()> {
+    if let Some(selector) = fixed_native_selector_symbol(elf)? {
+        require(
+            symbols
+                .insert(FIXED_NATIVE_SELECTOR.into(), selector)
+                .is_none(),
+            "duplicate fixed native role",
+        )?;
+    }
+    Ok(())
+}
+fn fixed_native_publication(elf: &Elf<'_>) -> Result<sym::Sym> {
+    let object = fixed_native_named_symbol(elf, FIXED_NATIVE_PUBLICATION)?;
+    require(
+        object.st_type() == sym::STT_OBJECT && object.st_size == 8 && object.st_value % 8 == 0,
+        "fixed native publication type/size/alignment differs",
+    )?;
+    fixed_native_no_alias(elf, &object, None)?;
+    let end = object
+        .st_value
+        .checked_add(8)
+        .ok_or("fixed publication extent overflow")?;
+    let section = elf
+        .section_headers
+        .get(object.st_shndx)
+        .ok_or("fixed publication section absent")?;
+    require(
+        section.sh_type == section_header::SHT_NOBITS
+            && section.sh_flags == (section_header::SHF_ALLOC | section_header::SHF_WRITE) as u64
+            && elf.shdr_strtab.get_at(section.sh_name) == Some(".bss")
+            && object.st_value >= section.sh_addr
+            && section
+                .sh_addr
+                .checked_add(section.sh_size)
+                .is_some_and(|hi| end <= hi),
+        "fixed publication is not complete non-TLS BSS storage",
+    )?;
+    let loads: Vec<_> = elf
+        .program_headers
+        .iter()
+        .filter(|p| {
+            p.p_type == program_header::PT_LOAD
+                && object.st_value >= p.p_vaddr
+                && p.p_vaddr.checked_add(p.p_memsz).is_some_and(|hi| end <= hi)
+        })
+        .collect();
+    require(
+        loads.len() == 1
+            && loads[0].p_flags == program_header::PF_R | program_header::PF_W
+            && loads[0]
+                .p_vaddr
+                .checked_add(loads[0].p_filesz)
+                .is_some_and(|lo| object.st_value >= lo),
+        "fixed publication is not loader-zero-initialized RW/non-X memory",
+    )?;
+    require(
+        elf.program_headers
+            .iter()
+            .filter(|p| p.p_type == program_header::PT_GNU_RELRO)
+            .all(|p| {
+                p.p_vaddr
+                    .checked_add(p.p_memsz)
+                    .is_some_and(|hi| (p.p_vaddr & !4095) >= end || (hi & !4095) <= object.st_value)
+            }),
+        "fixed publication becomes readonly after relocation",
+    )?;
+    require(
+        extent_writers(elf, object.st_value, 8)?.is_empty(),
+        "loader writes fixed publication storage",
+    )?;
+    Ok(object)
+}
+fn qualify_fixed_native_gate(
+    elf: &Elf<'_>,
+    bytes: &[u8],
+    code: &BTreeMap<u64, Vec<u8>>,
+    legacy_gate: u64,
+) -> Result<Option<FixedNativeGateEvidence>> {
+    let Some(selector) = fixed_native_selector_symbol(elf)? else {
+        return Ok(None);
+    };
+    authenticate_loader_metadata(elf, bytes)?;
+    let actual = proof_function_bytes(
+        elf,
+        bytes,
+        &BTreeMap::from([(selector.st_value, selector.st_size)]),
+    )?;
+    let selector_bytes = actual
+        .get(&selector.st_value)
+        .ok_or("fixed selector bytes absent")?;
+    require(
+        code.get(&selector.st_value) == Some(selector_bytes),
+        "fixed selector is absent/changed in complete proof scope",
+    )?;
+    let owner = private_function(elf, CONSTRUCTOR_GATE_OWNER)?;
+    let gate = constructor_interior_label(elf, CONSTRUCTOR_GATE, &owner)?;
+    let ret = constructor_interior_label(elf, CONSTRUCTOR_GATE_RETURN, &owner)?;
+    constructor_gate_operands(
+        code.get(&owner.st_value)
+            .ok_or("legacy gate owner scope absent")?,
+        gate.st_value - owner.st_value,
+        ret.st_value - owner.st_value,
+    )?;
+    require(
+        gate.st_value == legacy_gate,
+        "fixed route lost the independently qualified legacy gate",
+    )?;
+    let publication = fixed_native_publication(elf)?;
+    fixed_whole_recipe(
+        selector.st_value,
+        selector_bytes,
+        FIXED_NATIVE_SELECTOR_HEX,
+        &[(7, 11, publication.st_value), (27, 31, legacy_gate)],
+    )?;
+    let template = fixed_native_named_symbol(elf, FIXED_NATIVE_TEMPLATE)?;
+    require(
+        template.st_type() == sym::STT_OBJECT
+            && template.st_size == 4096
+            && template.st_value % 4096 == 0,
+        "fixed native template type/extent/alignment differs",
+    )?;
+    fixed_native_no_alias(elf, &template, Some(FIXED_NATIVE_TEMPLATE_END))?;
+    let template_end = fixed_native_named_symbol(elf, FIXED_NATIVE_TEMPLATE_END)?;
+    require(
+        template_end.st_type() == sym::STT_NOTYPE
+            && template_end.st_size == 0
+            && template_end.st_value
+                == template
+                    .st_value
+                    .checked_add(4096)
+                    .ok_or("fixed page end overflow")?
+            && template_end.st_shndx == template.st_shndx,
+        "fixed native template end label differs",
+    )?;
+    let (mapping, offset) = unique_file_mapping(elf, bytes, template.st_value, 4096)?;
+    let section = elf
+        .section_headers
+        .get(template.st_shndx)
+        .ok_or("fixed native template section absent")?;
+    require(
+        mapping.p_flags == program_header::PF_R
+            && section.sh_type == section_header::SHT_PROGBITS
+            && section.sh_flags == section_header::SHF_ALLOC as u64
+            && template.st_value >= section.sh_addr
+            && section
+                .sh_addr
+                .checked_add(section.sh_size)
+                .is_some_and(|hi| template_end.st_value <= hi)
+            && section
+                .sh_offset
+                .checked_add(template.st_value - section.sh_addr)
+                == Some(offset as u64),
+        "fixed native template section/file/readonly mapping join differs",
+    )?;
+    require(
+        extent_writers(elf, template.st_value, 4096)?.is_empty(),
+        "loader writes fixed native template",
+    )?;
+    let page = &bytes[offset..offset + 4096];
+    require(
+        page.get(0x7c..0x85) == Some(&[0xf3, 0x0f, 0x1e, 0xfa, 0x0f, 0x05, 0x41, 0xff, 0xe4]),
+        "fixed native page ABI interval differs",
+    )?;
+    let selector_name = elf
+        .strtab
+        .get_at(selector.st_name)
+        .ok_or("fixed selector name absent")?;
+    Ok(Some(FixedNativeGateEvidence {
+        version: 1,
+        selector: symbol_evidence(selector_name, &selector),
+        selector_sha256: sha256(selector_bytes),
+        publication: symbol_evidence(FIXED_NATIVE_PUBLICATION, &publication),
+        publication_storage: "zero_initialized_nobits".into(),
+        publication_read_instruction: selector
+            .st_value
+            .checked_add(4)
+            .ok_or("fixed publication read overflow")?,
+        unpublished_transfer: ConstructorTransfer {
+            instruction: selector
+                .st_value
+                .checked_add(26)
+                .ok_or("fixed transfer overflow")?,
+            target: legacy_gate,
+            local_got_slot: None,
+        },
+        published_transfer_instruction: selector
+            .st_value
+            .checked_add(23)
+            .ok_or("fixed transfer overflow")?,
+        fixed_entry: FIXED_NATIVE_ENTRY,
+        template_symbol: symbol_evidence(FIXED_NATIVE_TEMPLATE, &template),
+        template_bytes: FixedReadonlyEvidence {
+            address: template.st_value,
+            size: 4096,
+            sha256: sha256(page),
+            file_address: None,
+            file_sha256: None,
+            relative_pointer_slot: None,
+        },
+    }))
+}
+const FIXED_NATIVE_OWNER: &str = "reverie_inguest_fixed_trusted_syscall";
+const FIXED_NATIVE_RAW6: &str = "_RNvNtCs_15reverie_inguest4trap12raw_syscall6";
+const FIXED_NATIVE_RAW3: &str = "_RNvNtCs_15reverie_inguest4trap12raw_syscall3";
+const FIXED_NATIVE_RAW6_HEX: &str = "50488b05e0fd2300488b004885c07426488b06488b5608488b4e104c8b46184c8b4e20488b7628488934244889c6ff152440240059c3488b06488b5608488b4e104c8b46184c8b4e20488b7628488934244889c6ff150640240059c3";
+const FIXED_NATIVE_RAW3_HEX: &str = "50488b0520fe2300488b004885c0741648c70424000000004531c04531c9ff157440240059c348c70424000000004531c04531c9ff156640240059c3";
+const FIXED_NATIVE_OWNER_HEX: &str = "f30f1efa41544c8d25240000004889f84889f74889d64889ca4d89c24d89c84c8b4c241049bb7c0000000050000041ffe3f30f1efa415cc3";
+
+/// One whole native syscall wrapper, including both publication branches.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FixedNativeSyscallEvidence {
+    pub function: SymbolEvidence,
+    pub function_sha256: String,
+    pub publication_instruction: u64,
+    pub publication_slot: u64,
+    pub zero_branch_instruction: u64,
+    pub zero_branch_target: u64,
+    pub fixed_transfer: ConstructorTransfer,
+    pub legacy_transfer: ConstructorTransfer,
+}
+/// Actual finite native wrapper cohort, joined to the single selector/page record.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FixedNativeSyscallsEvidence {
+    pub version: u32,
+    pub publication_address: u64,
+    pub template_sha256: String,
+    pub wrappers: BTreeMap<String, FixedNativeSyscallEvidence>,
+    pub owner: SymbolEvidence,
+    pub owner_sha256: String,
+    pub continuation: u64,
+    pub page_transfer: ConstructorTransfer,
+}
+// No public evidence record or caller-provided role map can construct this
+// witness: the actual ELF factory below reopens all code/data/loader bytes.
+struct FixedNativeSyscallContext {
+    evidence: FixedNativeSyscallsEvidence,
+}
+fn fixed_native_function_symbol(elf: &Elf<'_>, canonical: &str, size: u64) -> Result<sym::Sym> {
+    let matches = |name: &str| {
+        let base = name.split(".llvm.").next().unwrap();
+        base == canonical || canonical_rust_symbol(base).as_deref() == Some(canonical)
+    };
+    let raw: Vec<_> = elf
+        .syms
+        .iter()
+        .filter(|s| elf.strtab.get_at(s.st_name).is_some_and(matches))
+        .collect();
+    require(
+        raw.len() == 1
+            && !elf
+                .dynsyms
+                .iter()
+                .any(|s| elf.dynstrtab.get_at(s.st_name).is_some_and(matches)),
+        "native fixed function raw census is ambiguous/dynamic",
+    )?;
+    let symbol = raw[0];
+    let name = elf
+        .strtab
+        .get_at(symbol.st_name)
+        .ok_or("native fixed function name absent")?;
+    require(
+        (name == canonical || canonical_rust_symbol(name).as_deref() == Some(canonical))
+            && symbol.st_bind() == sym::STB_LOCAL
+            && symbol.st_visibility() == sym::STV_HIDDEN
+            && symbol.st_size == size
+            && executable_symbol(elf, &symbol),
+        "native fixed function lacks its exact local hidden whole extent",
+    )?;
+    fixed_native_function_section(elf, &symbol)?;
+    fixed_native_no_alias(elf, &symbol, None)?;
+    Ok(symbol)
+}
+fn require_legacy_standalone_gate(elf: &Elf<'_>) -> Result<()> {
+    require(
+        fixed_native_selector_symbol(elf)?.is_none(),
+        "Standalone fixed selector lacks the declared Detcore publication source profile",
+    )
+}
+fn add_fixed_native_owner(elf: &Elf<'_>, symbols: &mut BTreeMap<String, sym::Sym>) -> Result<()> {
+    if fixed_native_selector_symbol(elf)?.is_some() {
+        let owner = fixed_native_function_symbol(elf, FIXED_NATIVE_OWNER, 56)?;
+        require(
+            symbols.insert(FIXED_NATIVE_OWNER.into(), owner).is_none(),
+            "duplicate native fixed owner role",
+        )?;
+    }
+    Ok(())
+}
+fn fixed_native_publication_slot(
+    elf: &Elf<'_>,
+    bytes: &[u8],
+    slot: u64,
+    publication: u64,
+) -> Result<()> {
+    require(
+        slot.is_multiple_of(8)
+            && elf.program_headers.iter().any(|p| {
+                p.p_type == program_header::PT_GNU_RELRO
+                    && slot >= p.p_vaddr
+                    && p.p_vaddr.checked_add(p.p_memsz).is_some_and(|end| {
+                        slot.checked_add(8).is_some_and(|hi| hi <= (end & !4095))
+                    })
+            }),
+        "native publication pointer is not complete aligned RELRO storage",
+    )?;
+    let (mapping, _) = unique_file_mapping(elf, bytes, slot, 8)?;
+    require(
+        mapping.p_flags & (program_header::PF_R | program_header::PF_X) == program_header::PF_R,
+        "native pointer slot has executable/nonreadable storage",
+    )?;
+    readonly_loaded_bytes(elf, bytes, slot, 8)?;
+    let writers = extent_writers(elf, slot, 8)?;
+    require(
+        writers.len() == 1
+            && writers[0].r_offset == slot
+            && writers[0].r_type == reloc::R_X86_64_RELATIVE
+            && writers[0].r_sym == 0
+            && writers[0]
+                .r_addend
+                .is_some_and(|addend| addend >= 0 && addend as u64 == publication),
+        "native publication pointer lacks its sole exact object RELATIVE writer",
+    )
+}
+struct FixedNativePublicationRead {
+    instruction: u64,
+    slot: u64,
+    object: u64,
+}
+fn fixed_native_publication_read(
+    elf: &Elf<'_>,
+    bytes: &[u8],
+    address: u64,
+    actual: &[u8],
+    gate: &FixedNativeGateEvidence,
+) -> Result<FixedNativePublicationRead> {
+    let slot = fixed_rip_target(address, actual, 4, 8)?;
+    fixed_native_publication_slot(elf, bytes, slot, gate.publication.address)?;
+    Ok(FixedNativePublicationRead {
+        instruction: address.checked_add(1).ok_or("native data read overflow")?,
+        slot,
+        object: gate.publication.address,
+    })
+}
+fn fixed_native_wrapper(
+    (elf, bytes): (&Elf<'_>, &[u8]),
+    (actual, symbol): (&[u8], &sym::Sym),
+    gate: &FixedNativeGateEvidence,
+    (owner, legacy): (&sym::Sym, &sym::Sym),
+    got: &BTreeMap<u64, u64>,
+    role: &str,
+) -> Result<FixedNativeSyscallEvidence> {
+    let (hex, fixed_displacement, fixed_next, legacy_displacement, legacy_next, zero_target) =
+        match role {
+            FIXED_NATIVE_RAW6 => (FIXED_NATIVE_RAW6_HEX, 0x30, 0x34, 0x56, 0x5a, 0x36),
+            "fixed_scalar_syscall" => (FIXED_NATIVE_RAW3_HEX, 0x20, 0x24, 0x36, 0x3a, 0x26),
+            _ => return Err("unknown native fixed syscall role".into()),
+        };
+    require(
+        fixed_template_shape(
+            actual,
+            &fixed_hex(hex),
+            [4, fixed_displacement, legacy_displacement].into_iter(),
+        ),
+        "native fixed syscall whole marshal/branch/return recipe differs",
+    )?;
+    let data_read = fixed_native_publication_read(elf, bytes, symbol.st_value, actual, gate)?;
+    require(
+        data_read.object == gate.publication.address,
+        "native data read loses its actual publication object",
+    )?;
+    let fixed_slot = fixed_rip_target(symbol.st_value, actual, fixed_displacement, fixed_next)?;
+    let legacy_slot = fixed_rip_target(symbol.st_value, actual, legacy_displacement, legacy_next)?;
+    // The publication pointer never enters the function-only GOT map.
+    for (slot, target) in [(fixed_slot, owner.st_value), (legacy_slot, legacy.st_value)] {
+        // Same existing local-function RELATIVE route, with the complete writer
+        // census retained rather than relying on a map's last insertion.
+        fixed_native_publication_slot(elf, bytes, slot, target)?;
+    }
+    require(
+        got.get(&fixed_slot) == Some(&owner.st_value)
+            && got.get(&legacy_slot) == Some(&legacy.st_value),
+        "native syscall CALL slots do not reach exact fixed/legacy owner starts",
+    )?;
+    let address = symbol.st_value;
+    Ok(FixedNativeSyscallEvidence {
+        function: symbol_evidence(elf.strtab.get_at(symbol.st_name).unwrap(), symbol),
+        function_sha256: sha256(actual),
+        publication_instruction: data_read.instruction,
+        publication_slot: data_read.slot,
+        zero_branch_instruction: address.checked_add(14).ok_or("native branch overflow")?,
+        zero_branch_target: address
+            .checked_add(zero_target)
+            .ok_or("native zero target overflow")?,
+        fixed_transfer: ConstructorTransfer {
+            instruction: address
+                .checked_add(fixed_displacement as u64 - 2)
+                .ok_or("native CALL overflow")?,
+            target: owner.st_value,
+            local_got_slot: Some(fixed_slot),
+        },
+        legacy_transfer: ConstructorTransfer {
+            instruction: address
+                .checked_add(legacy_displacement as u64 - 2)
+                .ok_or("native CALL overflow")?,
+            target: legacy.st_value,
+            local_got_slot: Some(legacy_slot),
+        },
+    })
+}
+fn qualify_fixed_native_syscalls(
+    elf: &Elf<'_>,
+    bytes: &[u8],
+    code: &BTreeMap<u64, Vec<u8>>,
+    got: &BTreeMap<u64, u64>,
+    roles: &BTreeMap<String, sym::Sym>,
+) -> Result<Option<FixedNativeSyscallContext>> {
+    let legacy = private_function(elf, CONSTRUCTOR_GATE_OWNER)?;
+    let gate_ip = constructor_interior_label(elf, CONSTRUCTOR_GATE, &legacy)?;
+    let Some(gate) = qualify_fixed_native_gate(elf, bytes, code, gate_ip.st_value)? else {
+        // The old templates will still reject an unsupported native-sized body.
+        return Ok(None);
+    };
+    let owner = fixed_native_function_symbol(elf, FIXED_NATIVE_OWNER, 56)?;
+    let raw6 = fixed_native_function_symbol(elf, FIXED_NATIVE_RAW6, 92)?;
+    let raw3 = fixed_native_function_symbol(elf, FIXED_NATIVE_RAW3, 60)?;
+    for (role, selected) in [
+        (FIXED_NATIVE_OWNER, owner),
+        (FIXED_NATIVE_RAW6, raw6),
+        ("fixed_scalar_syscall", raw3),
+    ] {
+        require(
+            roles.get(role) == Some(&selected),
+            "native syscall cohort loses its actual selected role",
+        )?;
+    }
+    let actual = proof_function_bytes(
+        elf,
+        bytes,
+        &BTreeMap::from([
+            (owner.st_value, 56),
+            (raw6.st_value, 92),
+            (raw3.st_value, 60),
+        ]),
+    )?;
+    for (address, body) in &actual {
+        require(
+            code.get(address) == Some(body),
+            "native syscall lacks complete unchanged proof bytes",
+        )?;
+    }
+    let owner_bytes = &actual[&owner.st_value];
+    let continuation = owner
+        .st_value
+        .checked_add(0x31)
+        .ok_or("native continuation overflow")?;
+    fixed_whole_recipe(
+        owner.st_value,
+        owner_bytes,
+        FIXED_NATIVE_OWNER_HEX,
+        &[(9, 13, continuation)],
+    )?;
+    let authenticated_got = local_got_targets(elf, bytes)?;
+    let mut wrappers = BTreeMap::new();
+    for (role, symbol) in [(FIXED_NATIVE_RAW6, raw6), ("fixed_scalar_syscall", raw3)] {
+        let record = fixed_native_wrapper(
+            (elf, bytes),
+            (&actual[&symbol.st_value], &symbol),
+            &gate,
+            (&owner, &legacy),
+            &authenticated_got,
+            role,
+        )?;
+        for edge in [&record.fixed_transfer, &record.legacy_transfer] {
+            require(
+                edge.local_got_slot
+                    .is_some_and(|slot| got.get(&slot) == Some(&edge.target)),
+                "retained function GOT evidence differs from actual native slots",
+            )?;
+        }
+        wrappers.insert(role.into(), record);
+    }
+    Ok(Some(FixedNativeSyscallContext {
+        evidence: FixedNativeSyscallsEvidence {
+            version: 1,
+            publication_address: gate.publication.address,
+            template_sha256: gate.template_bytes.sha256,
+            wrappers,
+            owner: symbol_evidence(FIXED_NATIVE_OWNER, &owner),
+            owner_sha256: sha256(owner_bytes),
+            continuation,
+            page_transfer: ConstructorTransfer {
+                instruction: owner
+                    .st_value
+                    .checked_add(0x2e)
+                    .ok_or("native page transfer overflow")?,
+                target: gate.fixed_entry,
+                local_got_slot: None,
+            },
+        },
+    }))
+}
+fn fixed_native_owner_census(
+    actual: &[u8],
+    instructions: &[EncodedConstructorInstruction],
+    record: &FixedNativeSyscallsEvidence,
+) -> Result<()> {
+    let offsets = [0, 4, 6, 13, 16, 19, 22, 25, 28, 31, 36, 46, 49, 53, 55, 56];
+    require(
+        actual.len() == 56
+            && sha256(actual) == record.owner_sha256
+            && instructions.len() == offsets.len() - 1,
+        "native fixed owner census extent/hash/instruction count differs",
+    )?;
+    for (instruction, pair) in instructions.iter().zip(offsets.windows(2)) {
+        require(
+            record.owner.address.checked_add(pair[0] as u64) == Some(instruction.address)
+                && instruction.bytes == actual[pair[0]..pair[1]],
+            "native fixed owner whole instruction cursor/bytes differ",
+        )?;
+    }
+    require(
+        instructions[11].bytes == [0x41, 0xff, 0xe3]
+            && record.page_transfer.instruction == instructions[11].address
+            && record.page_transfer.target == FIXED_NATIVE_ENTRY
+            && record.page_transfer.local_got_slot.is_none()
+            && record.owner.address.checked_add(49) == Some(record.continuation),
+        "native fixed owner loses its unique authenticated page leaf/continuation",
+    )
+}
+/// Only a fully qualified native scalar wrapper can extend its own setup
+/// census with the independently proved fixed owner. Other preparation roles
+/// retain the original helper set and complete instruction scanner.
+fn fixed_setup_preparation_transfers(
+    role: &str,
+    function: &SymbolEvidence,
+    instructions: &[EncodedConstructorInstruction],
+    got: &BTreeMap<u64, u64>,
+    helpers: &BTreeSet<u64>,
+    native: Option<&FixedNativeSyscallContext>,
+) -> Result<(Vec<ConstructorTransfer>, Vec<GotEdge>)> {
+    let Some(native) = native.filter(|_| role == "fixed_scalar_syscall") else {
+        return preparation_transfers(instructions, got, helpers);
+    };
+    let wrapper = native
+        .evidence
+        .wrappers
+        .get(role)
+        .ok_or("native scalar setup lacks independently qualified wrapper")?;
+    let actual: Vec<u8> = instructions
+        .iter()
+        .flat_map(|i| i.bytes.iter().copied())
+        .collect();
+    require(
+        function == &wrapper.function
+            && instructions.first().map(|i| i.address) == Some(function.address)
+            && actual.len() as u64 == function.size
+            && sha256(&actual) == wrapper.function_sha256,
+        "native scalar setup loses its independently qualified whole function",
+    )?;
+    let mut allowed = helpers.clone();
+    allowed.insert(native.evidence.owner.address);
+    let (transfers, edges) = preparation_transfers(instructions, got, &allowed)?;
+    require(
+        transfers
+            == [
+                wrapper.fixed_transfer.clone(),
+                wrapper.legacy_transfer.clone(),
+            ]
+            && edges == fixed_native_wrapper_got_edges(wrapper)?,
+        "native scalar setup census differs from its qualified fixed/legacy transfers",
+    )?;
+    Ok((transfers, edges))
+}
+
+fn fixed_native_wrapper_got_edges(wrapper: &FixedNativeSyscallEvidence) -> Result<Vec<GotEdge>> {
+    [&wrapper.fixed_transfer, &wrapper.legacy_transfer]
+        .into_iter()
+        .map(|transfer| {
+            Ok(GotEdge {
+                source_function: wrapper.function.address,
+                instruction: transfer.instruction,
+                slot: transfer
+                    .local_got_slot
+                    .ok_or("native wrapper transfer lost its GOT slot")?,
+                target_function: transfer.target,
+            })
+        })
+        .collect()
+}
+
+fn validate_fixed_native_syscall_evidence(
+    backing: &AllocatorBackingEvidence,
+    image: FixedImageKind,
+) -> Result<()> {
+    let Some(record) = &backing.fixed_native_syscalls else {
+        return require(
+            !backing.functions.contains_key(FIXED_NATIVE_OWNER),
+            "native fixed function evidence was stripped",
+        );
+    };
+    require(
+        image == FixedImageKind::Detcore
+            && record.version == 1
+            && record
+                .wrappers
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>()
+                == BTreeSet::from([FIXED_NATIVE_RAW6, "fixed_scalar_syscall"])
+            && backing.functions.get(FIXED_NATIVE_OWNER) == Some(&record.owner)
+            && backing.function_sha256.get(FIXED_NATIVE_OWNER) == Some(&record.owner_sha256)
+            && record.owner.name == FIXED_NATIVE_OWNER
+            && record.owner.size == 56
+            && record.owner.binding == sym::STB_LOCAL
+            && record.owner.visibility == sym::STV_HIDDEN
+            && record.owner.address.checked_add(49) == Some(record.continuation)
+            && record.owner.address.checked_add(46) == Some(record.page_transfer.instruction)
+            && record.page_transfer.target == FIXED_NATIVE_ENTRY
+            && record.page_transfer.local_got_slot.is_none()
+            && backing.allocator_transfers.get(FIXED_NATIVE_OWNER)
+                == Some(&vec![record.page_transfer.clone()]),
+        "native fixed syscall evidence version/owner/leaf identity differs",
+    )?;
+    fixed_native_digest(&record.owner_sha256)?;
+    fixed_native_digest(&record.template_sha256)?;
+    for (role, canonical, size, fixed_pc, legacy_pc, zero_target) in [
+        (FIXED_NATIVE_RAW6, FIXED_NATIVE_RAW6, 92, 46, 84, 54),
+        ("fixed_scalar_syscall", FIXED_NATIVE_RAW3, 60, 30, 52, 38),
+    ] {
+        let wrapper = &record.wrappers[role];
+        let function = &wrapper.function;
+        fixed_native_digest(&wrapper.function_sha256)?;
+        require(
+            backing.functions.get(role) == Some(function)
+                && backing.function_sha256.get(role) == Some(&wrapper.function_sha256)
+                && canonical_rust_symbol(&function.name).as_deref() == Some(canonical)
+                && function.size == size
+                && function.binding == sym::STB_LOCAL
+                && function.visibility == sym::STV_HIDDEN
+                && function.address.checked_add(1) == Some(wrapper.publication_instruction)
+                && wrapper.publication_slot != 0
+                && wrapper.publication_slot % 8 == 0
+                && function.address.checked_add(14) == Some(wrapper.zero_branch_instruction)
+                && function.address.checked_add(zero_target) == Some(wrapper.zero_branch_target)
+                && function.address.checked_add(fixed_pc)
+                    == Some(wrapper.fixed_transfer.instruction)
+                && function.address.checked_add(legacy_pc)
+                    == Some(wrapper.legacy_transfer.instruction)
+                && wrapper.fixed_transfer.target == record.owner.address
+                && wrapper.fixed_transfer.local_got_slot.is_some()
+                && wrapper.legacy_transfer.local_got_slot.is_some()
+                && wrapper.legacy_transfer.target != record.owner.address
+                && backing.allocator_transfers.get(role)
+                    == Some(&vec![
+                        wrapper.fixed_transfer.clone(),
+                        wrapper.legacy_transfer.clone(),
+                    ]),
+            "native fixed wrapper loses exact role/hash/branch/data/transfer joins",
+        )?;
+        let legacy = backing
+            .functions
+            .values()
+            .find(|function| function.name == CONSTRUCTOR_GATE_OWNER)
+            .ok_or("native wrapper legacy owner evidence absent")?;
+        require(
+            wrapper.legacy_transfer.target == legacy.address,
+            "native wrapper legacy transfer loses complete owner start",
+        )?;
+        if role == "fixed_scalar_syscall" {
+            let end = function
+                .address
+                .checked_add(function.size)
+                .ok_or("native scalar setup extent overflows")?;
+            // Join both source attribution and instruction ownership. A forged
+            // source must not hide an extra record at an actual scalar CALL.
+            let owned_edges: Vec<_> = backing
+                .owned_setup_got_edges
+                .iter()
+                .filter(|edge| {
+                    edge.source_function == function.address
+                        || (function.address..end).contains(&edge.instruction)
+                })
+                .cloned()
+                .collect();
+            require(
+                backing.owned_setup_transfers.get(role)
+                    == Some(&vec![
+                        wrapper.fixed_transfer.clone(),
+                        wrapper.legacy_transfer.clone(),
+                    ])
+                    && owned_edges == fixed_native_wrapper_got_edges(wrapper)?,
+                "native scalar owned setup loses its exact transfer/GOT census",
+            )?;
+        }
+    }
+    Ok(())
+}
+fn join_fixed_native_syscalls(
+    backing: &AllocatorBackingEvidence,
+    gate: Option<&FixedNativeGateEvidence>,
+) -> Result<()> {
+    match (&backing.fixed_native_syscalls, gate) {
+        (None, None) => Ok(()),
+        (Some(record), Some(gate)) => require(
+            record.publication_address == gate.publication.address
+                && record.template_sha256 == gate.template_bytes.sha256
+                && record.page_transfer.target == gate.fixed_entry,
+            "native wrappers and selector do not share one publication/page context",
+        ),
+        _ => Err("native wrapper/selector feature cohort is incomplete".into()),
+    }
+}
+
+fn native_bridge_gate_address(
+    fixed: Option<&FixedNativeGateEvidence>,
+    legacy: &SymbolEvidence,
+) -> Result<u64> {
+    let Some(fixed) = fixed else {
+        return Ok(legacy.address);
+    };
+    fixed.verify_bootstrap_page_digest(&fixed_native_digest(&fixed.template_bytes.sha256)?)?;
+    fixed_native_digest(&fixed.selector_sha256)?;
+    require(
+        fixed.selector.size == 31
+            && fixed.selector.binding == sym::STB_LOCAL
+            && fixed.selector.visibility == sym::STV_HIDDEN
+            && canonical_rust_symbol(&fixed.selector.name).as_deref()
+                == Some(FIXED_NATIVE_SELECTOR)
+            && fixed.publication_storage == "zero_initialized_nobits"
+            && fixed.publication.name == FIXED_NATIVE_PUBLICATION
+            && fixed.publication.size == 8
+            && fixed.publication.binding == sym::STB_LOCAL
+            && fixed.publication.visibility == sym::STV_HIDDEN
+            && fixed.publication_read_instruction
+                == fixed
+                    .selector
+                    .address
+                    .checked_add(4)
+                    .ok_or("fixed read overflow")?
+            && fixed.published_transfer_instruction
+                == fixed
+                    .selector
+                    .address
+                    .checked_add(23)
+                    .ok_or("fixed transfer overflow")?
+            && fixed.unpublished_transfer.instruction
+                == fixed
+                    .selector
+                    .address
+                    .checked_add(26)
+                    .ok_or("fixed transfer overflow")?
+            && fixed.unpublished_transfer.target == legacy.address
+            && fixed.unpublished_transfer.local_got_slot.is_none(),
+        "fixed native serialized route identity differs",
+    )?;
+    Ok(fixed.selector.address)
+}
+
 fn private_constructor_binding(binding: u8, visibility: u8) -> bool {
     binding == sym::STB_LOCAL || matches!(visibility, sym::STV_HIDDEN | sym::STV_INTERNAL)
 }
@@ -22062,6 +23493,7 @@ fn unique_standalone_slot(root_slots: &[u64], generic_slots: &[u64]) -> Result<u
 }
 
 fn standalone_symbols(elf: &Elf<'_>) -> Result<BTreeMap<String, sym::Sym>> {
+    require_legacy_standalone_gate(elf)?;
     let mut symbols = BTreeMap::new();
     for name in [
         STANDALONE_ROOT,
@@ -22077,6 +23509,8 @@ fn standalone_symbols(elf: &Elf<'_>) -> Result<BTreeMap<String, sym::Sym>> {
     // Whole private typed owner helpers remain source-bound preparation roles.
     // They confer no supplied-body target or compiler-frame dispatch proof.
     symbols.extend(preparation_symbols(elf)?);
+    add_fixed_native_selector(elf, &mut symbols)?;
+    add_fixed_native_owner(elf, &mut symbols)?;
     // This cannot be inferred from an rlib/no_mangle declaration. Require the
     // actual public dynamic export even when the real leaf no longer calls it.
     symbols.insert(
@@ -22169,6 +23603,8 @@ fn detcore_symbols(elf: &Elf<'_>) -> Result<BTreeMap<String, sym::Sym>> {
         symbols.insert(name.to_owned(), function);
     }
     symbols.extend(preparation_symbols(elf)?);
+    add_fixed_native_selector(elf, &mut symbols)?;
+    add_fixed_native_owner(elf, &mut symbols)?;
     require_disjoint_bootstrap_roles(&symbols)?;
     Ok(symbols)
 }
@@ -22210,6 +23646,29 @@ fn detcore_init_slot(
                 .checked_add(function.st_size)
                 .ok_or("generic native role extent overflow")?,
         ));
+    }
+    if let Some(selector) = fixed_native_selector_symbol(elf)? {
+        ranges.push((
+            selector.st_value,
+            selector
+                .st_value
+                .checked_add(selector.st_size)
+                .ok_or("fixed selector range overflow")?,
+        ));
+        for (canonical, size) in [
+            (FIXED_NATIVE_OWNER, 56),
+            (FIXED_NATIVE_RAW6, 92),
+            (FIXED_NATIVE_RAW3, 60),
+        ] {
+            let function = fixed_native_function_symbol(elf, canonical, size)?;
+            ranges.push((
+                function.st_value,
+                function
+                    .st_value
+                    .checked_add(size)
+                    .ok_or("fixed native registration range overflow")?,
+            ));
+        }
     }
     detcore_loader_registration(elf, bytes, root, &ranges)
 }
@@ -22404,6 +23863,8 @@ fn generic_symbols(elf: &Elf<'_>) -> Result<BTreeMap<String, sym::Sym>> {
         private_function(elf, CONSTRUCTOR_GATE_OWNER)?,
     );
     symbols.extend(preparation_symbols(elf)?);
+    add_fixed_native_selector(elf, &mut symbols)?;
+    add_fixed_native_owner(elf, &mut symbols)?;
     // Roles must own distinct complete functions. Alias names or overlapping
     // ranges cannot manufacture a bridge, body or adoption operand route.
     require_disjoint_bootstrap_roles(&symbols)?;
@@ -23075,6 +24536,9 @@ const MAX_OBJDUMP_BYTES: usize = 64 * 1024 * 1024;
 /// allocator graphs. Scope is derived from the ELF, not a receipt or a successful
 /// path: unchosen alternatives remain part of the required byte evidence.
 fn proof_functions(elf: &Elf<'_>, initializer_name: &str) -> Result<BTreeMap<u64, u64>> {
+    if initializer_name == STANDALONE_ROOT {
+        require_legacy_standalone_gate(elf)?;
+    }
     let mut addresses: BTreeSet<_> = elf
         .syms
         .iter()
@@ -23132,6 +24596,7 @@ fn proof_functions(elf: &Elf<'_>, initializer_name: &str) -> Result<BTreeMap<u64
 /// The standalone constructor scope is independent of diagnostic M1 exports,
 /// but retains every private constructor and generic bootstrap role.
 fn constructor_proof_functions(elf: &Elf<'_>) -> Result<BTreeMap<u64, u64>> {
+    require_legacy_standalone_gate(elf)?;
     let addresses = combined_bootstrap_symbols(elf)?
         .values()
         .map(|s| s.st_value)
@@ -24009,7 +25474,10 @@ fn preparation_transfers(
                 .ok_or("prepare call GOT is unresolved/preemptible")?;
             require(
                 helpers.contains(&target),
-                "prepare GOT target lacks exact private helper role",
+                format!(
+                    "prepare GOT target lacks exact private helper role: function {first:#x}, instruction {:#x}, slot {slot:#x}, target {target:#x}",
+                    instruction.address,
+                ),
             )?;
             transfers.push(ConstructorTransfer {
                 instruction: instruction.address,
@@ -24112,6 +25580,11 @@ fn qualify_standalone_constructor(
         gate_label.st_value - gate_owner.st_value,
         gate_return.st_value - gate_owner.st_value,
     )?;
+    let fixed_native_gate = qualify_fixed_native_gate(elf, bytes, code, gate_label.st_value)?;
+    let bridge_gate = native_bridge_gate_address(
+        fixed_native_gate.as_ref(),
+        &symbol_evidence(CONSTRUCTOR_GATE, &gate_label),
+    )?;
     let preparation_helpers = preparation_symbols(elf)?;
     let initializing: Vec<_> = elf
         .syms
@@ -24148,7 +25621,7 @@ fn qualify_standalone_constructor(
         &code[&address(CONSTRUCTOR_BRIDGE)],
         address(CONSTRUCTOR_BRIDGE),
         initializing[0].st_value,
-        gate_label.st_value,
+        bridge_gate,
         address(CONSTRUCTOR_ADOPTION),
     )?;
     let prepare_instructions =
@@ -24177,7 +25650,7 @@ fn qualify_standalone_constructor(
         bridge: symbol(CONSTRUCTOR_BRIDGE), native_dispatch_version: NATIVE_DISPATCH_VERSION, prepare: symbol(CONSTRUCTOR_ADOPTION),
         native_gate: symbol_evidence(CONSTRUCTOR_GATE, &gate_label), native_gate_owner: symbol(CONSTRUCTOR_GATE_OWNER),
         native_gate_return: symbol_evidence(CONSTRUCTOR_GATE_RETURN, &gate_return),
-        native_gate_offset: gate_label.st_value - gate_owner.st_value, preparation_helpers, prepare_helper_transfers, prepare_helper_edges,
+        native_gate_offset: gate_label.st_value - gate_owner.st_value, fixed_native_gate, preparation_helpers, prepare_helper_transfers, prepare_helper_edges,
         function_sha256, environ_got_slot: prefix.environ, selector_address: prefix.selector,
         active_body_materialization: prefix.materialization, active_bridge_transfer: prefix.active,
         inert_resolver_transfer: prefix.inert, body_initializer_call, body_resolver_transfer,
@@ -24196,7 +25669,7 @@ fn qualify_standalone_constructor(
 
 fn qualify_detcore_constructor_route(
     elf: &Elf<'_>,
-    _bytes: &[u8],
+    bytes: &[u8],
     code: &BTreeMap<u64, Vec<u8>>,
     disassembly: &str,
     got: &BTreeMap<u64, u64>,
@@ -24217,6 +25690,11 @@ fn qualify_detcore_constructor_route(
         &code[&gate_owner.st_value],
         gate_label.st_value - gate_owner.st_value,
         gate_return.st_value - gate_owner.st_value,
+    )?;
+    let fixed_native_gate = qualify_fixed_native_gate(elf, bytes, code, gate_label.st_value)?;
+    let bridge_gate = native_bridge_gate_address(
+        fixed_native_gate.as_ref(),
+        &symbol_evidence(CONSTRUCTOR_GATE, &gate_label),
     )?;
     let preparation_helpers = preparation_symbols(elf)?;
     // The native election must use the same actual single-byte local guard;
@@ -24256,7 +25734,7 @@ fn qualify_detcore_constructor_route(
         &code[&address(CONSTRUCTOR_BRIDGE)],
         address(CONSTRUCTOR_BRIDGE),
         initializing_guard,
-        gate_label.st_value,
+        bridge_gate,
         address(CONSTRUCTOR_ADOPTION),
     )?;
     let prepare_instructions =
@@ -24288,7 +25766,7 @@ fn qualify_detcore_constructor_route(
         native_gate: symbol_evidence(CONSTRUCTOR_GATE, &gate_label),
         native_gate_owner: symbol(CONSTRUCTOR_GATE_OWNER),
         native_gate_return: symbol_evidence(CONSTRUCTOR_GATE_RETURN, &gate_return),
-        native_gate_offset: gate_label.st_value - gate_owner.st_value,
+        native_gate_offset: gate_label.st_value - gate_owner.st_value, fixed_native_gate,
         initializing_guard,
         function_sha256,
         body_materialization,
@@ -24329,19 +25807,39 @@ fn qualify_generic_bootstrap(
     let symbols = generic_symbols(elf)?;
     let symbol = |name| symbol_evidence(name, &symbols[name]);
     let address = |name| symbols[name].st_value;
-    generic_no_init_registration(
-        elf,
-        bytes,
-        &[
-            GENERIC_INITIALIZER,
-            GENERIC_BODY,
-            GENERIC_BRIDGE,
-            GENERIC_ADOPTION,
-        ]
-        .map(&address)
-        .into_iter()
-        .collect(),
-    )?;
+    let mut registration_roles: BTreeSet<_> = [
+        GENERIC_INITIALIZER,
+        GENERIC_BODY,
+        GENERIC_BRIDGE,
+        GENERIC_ADOPTION,
+    ]
+    .map(&address)
+    .into_iter()
+    .collect();
+    if let Some(selector) = fixed_native_selector_symbol(elf)? {
+        registration_roles.extend(
+            selector.st_value
+                ..selector
+                    .st_value
+                    .checked_add(selector.st_size)
+                    .ok_or("fixed selector range overflow")?,
+        );
+        for (canonical, size) in [
+            (FIXED_NATIVE_OWNER, 56),
+            (FIXED_NATIVE_RAW6, 92),
+            (FIXED_NATIVE_RAW3, 60),
+        ] {
+            let function = fixed_native_function_symbol(elf, canonical, size)?;
+            registration_roles.extend(
+                function.st_value
+                    ..function
+                        .st_value
+                        .checked_add(size)
+                        .ok_or("fixed syscall registration range overflow")?,
+            );
+        }
+    }
+    generic_no_init_registration(elf, bytes, &registration_roles)?;
     let (body_materialization, entry_bridge_transfer) = generic_entry_prefix(
         &code[&address(GENERIC_INITIALIZER)],
         address(GENERIC_INITIALIZER),
@@ -24355,6 +25853,11 @@ fn qualify_generic_bootstrap(
         &code[&gate_owner.st_value],
         gate_label.st_value - gate_owner.st_value,
         gate_return.st_value - gate_owner.st_value,
+    )?;
+    let fixed_native_gate = qualify_fixed_native_gate(elf, bytes, code, gate_label.st_value)?;
+    let bridge_gate = native_bridge_gate_address(
+        fixed_native_gate.as_ref(),
+        &symbol_evidence(CONSTRUCTOR_GATE, &gate_label),
     )?;
     let preparation_helpers = preparation_symbols(elf)?;
     // The native election must use the same actual single-byte local guard;
@@ -24394,7 +25897,7 @@ fn qualify_generic_bootstrap(
         &code[&address(GENERIC_BRIDGE)],
         address(GENERIC_BRIDGE),
         initializing_guard,
-        gate_label.st_value,
+        bridge_gate,
         address(GENERIC_ADOPTION),
     )?;
     let prepare_instructions = constructor_instructions(disassembly, address(GENERIC_ADOPTION))?;
@@ -24425,7 +25928,7 @@ fn qualify_generic_bootstrap(
         native_gate: symbol_evidence(CONSTRUCTOR_GATE, &gate_label),
         native_gate_owner: symbol(CONSTRUCTOR_GATE_OWNER),
         native_gate_return: symbol_evidence(CONSTRUCTOR_GATE_RETURN, &gate_return),
-        native_gate_offset: gate_label.st_value - gate_owner.st_value,
+        native_gate_offset: gate_label.st_value - gate_owner.st_value, fixed_native_gate,
         initializing_guard,
         function_sha256,
         body_materialization,
@@ -24717,6 +26220,7 @@ fn qualify_constructor_in_source_context(
     let artifact = FileIdentity::read(path)?;
     let bytes = fs::read(&artifact.path).map_err(|e| e.to_string())?;
     let elf = Elf::parse(&bytes).map_err(|e| format!("parse actual runtime ELF: {e}"))?;
+    require_legacy_standalone_gate(&elf)?;
     authenticate_loader_metadata(&elf, &bytes)?;
     let scope = constructor_proof_functions(&elf)?;
     let evidence =
@@ -24846,6 +26350,10 @@ fn qualify_detcore_constructor_from_evidence_in_source_context(
         FixedImageKind::Detcore,
         sources,
     )?;
+    join_fixed_native_syscalls(
+        &allocator_backing,
+        generic_bootstrap.fixed_native_gate.as_ref(),
+    )?;
     artifact.verify()?;
     Ok(DetcoreConstructorQualification {
         artifact,
@@ -24860,6 +26368,260 @@ fn qualify_detcore_constructor_from_evidence_in_source_context(
         readelf_versions,
         readelf_symbols_relocations,
         objdump_disassembly,
+    })
+}
+
+const DETCORE_NATIVE_ENTRY: &str = "detcore_liteinst_exec_initialize";
+
+fn detcore_native_entry(elf: &Elf<'_>) -> Result<sym::Sym> {
+    let (_, entry) = export(elf, DETCORE_NATIVE_ENTRY)?;
+    require(
+        entry.st_bind() == sym::STB_GLOBAL
+            && entry.st_visibility() == sym::STV_PROTECTED
+            && entry.st_size > 0
+            && entry.st_size <= MAX_OBJDUMP_BYTES as u64,
+        "native entry must be a strong protected bounded actual function",
+    )?;
+    let statics: Vec<_> = elf
+        .syms
+        .iter()
+        .filter(|s| elf.strtab.get_at(s.st_name) == Some(DETCORE_NATIVE_ENTRY))
+        .collect();
+    // Each caller independently resolves the exact name in its own string
+    // table. st_name is a table-local offset, not part of the definition's
+    // identity across .symtab and .dynsym. Compare every other field exactly.
+    let same_definition = |symbol: &sym::Sym| {
+        let mut normalized = *symbol;
+        normalized.st_name = entry.st_name;
+        normalized == entry
+    };
+    require(
+        statics.len() == 1 && same_definition(&statics[0]) && executable_symbol(elf, &entry),
+        "native entry static/dynamic identities disagree",
+    )?;
+    let end = entry
+        .st_value
+        .checked_add(entry.st_size)
+        .ok_or("native entry extent overflow")?;
+    for (name, symbol) in elf
+        .syms
+        .iter()
+        .map(|s| (elf.strtab.get_at(s.st_name), s))
+        .chain(
+            elf.dynsyms
+                .iter()
+                .map(|s| (elf.dynstrtab.get_at(s.st_name), s)),
+        )
+    {
+        if symbol.st_type() != sym::STT_FUNC
+            || symbol.st_shndx == section_header::SHN_UNDEF as usize
+        {
+            continue;
+        }
+        let hi = symbol
+            .st_value
+            .checked_add(symbol.st_size)
+            .ok_or("native function alias overflow")?;
+        // A zero size is an unspecified extent, not proof that a defined
+        // function symbol cannot enter this function's bytes.
+        let starts_in_entry = entry.st_value <= symbol.st_value && symbol.st_value < end;
+        if starts_in_entry || symbol.st_value < end && entry.st_value < hi {
+            require(
+                name == Some(DETCORE_NATIVE_ENTRY) && same_definition(&symbol),
+                "native entry has a conflicting function alias",
+            )?;
+        }
+    }
+    Ok(entry)
+}
+
+/// Resolve all actual loader slots, including relocations, before proving that
+/// none names any byte inside the explicit or retained ordinary entry roles.
+/// Ordinary constructor qualification and all its checks remain unchanged.
+fn native_no_loader_registration(
+    elf: &Elf<'_>,
+    bytes: &[u8],
+    ranges: &BTreeMap<u64, u64>,
+) -> Result<()> {
+    require(
+        !ranges.is_empty(),
+        "native registration proof has no role ranges",
+    )?;
+    let mut ends = Vec::new();
+    for (&lo, &size) in ranges {
+        require(size > 0, "native registration proof has empty role")?;
+        ends.push((
+            lo,
+            lo.checked_add(size).ok_or("native role extent overflow")?,
+        ));
+    }
+    let overlaps = |target: u64| ends.iter().any(|&(lo, hi)| lo <= target && target < hi);
+    generic_no_init_registration(elf, bytes, &ranges.keys().copied().collect())?;
+    require(
+        !elf.syms.iter().any(|s| {
+            elf.strtab
+                .get_at(s.st_name)
+                .is_some_and(|name| name.contains("DETCORE_LITEINST_INIT"))
+        }),
+        "native image retains ordinary Detcore constructor registration object",
+    )?;
+    let dynamic = elf
+        .dynamic
+        .as_ref()
+        .ok_or("native image lacks dynamic metadata")?;
+    for tag in [
+        goblin::elf::dynamic::DT_INIT,
+        goblin::elf::dynamic::DT_PREINIT_ARRAY,
+        goblin::elf::dynamic::DT_PREINIT_ARRAYSZ,
+    ] {
+        let values: Vec<_> = dynamic.dyns.iter().filter(|d| d.d_tag == tag).collect();
+        require(values.len() <= 1, "duplicate native init/preinit tags")?;
+        require(
+            values.iter().all(|d| {
+                if tag == goblin::elf::dynamic::DT_INIT {
+                    !overlaps(d.d_val)
+                } else {
+                    d.d_val == 0
+                }
+            }),
+            "native entry role registered in init/preinit",
+        )?;
+    }
+    // The preceding exact generic registration check authenticates the unique
+    // actual array section, dynamic tags and every supported whole-slot writer.
+    let section = elf
+        .section_headers
+        .iter()
+        .find(|s| s.sh_type == section_header::SHT_INIT_ARRAY)
+        .ok_or("native image has no actual init_array")?;
+    let entries = init_array_bytes(elf, bytes, section)?;
+    readonly_loaded_bytes(elf, bytes, section.sh_addr, entries.len())?;
+    for (index, entry) in entries.as_chunks::<8>().0.iter().enumerate() {
+        let slot = section
+            .sh_addr
+            .checked_add(
+                (index as u64)
+                    .checked_mul(8)
+                    .ok_or("native init slot index overflow")?,
+            )
+            .ok_or("native init slot overflow")?;
+        let raw = u64::from_le_bytes(*entry);
+        let writers = extent_writers(elf, slot, 8)?;
+        require(
+            writers.len() <= 1
+                && writers.iter().all(|r| {
+                    r.r_offset == slot
+                        && descriptor_relocation_width(elf, r).is_ok_and(|width| width == 8)
+                }),
+            "native init slot has partial/overlapping writers",
+        )?;
+        let target = if let Some(writer) = writers.first() {
+            let addend = writer
+                .r_addend
+                .ok_or("native init slot needs explicit addend")?;
+            if writer.r_type == reloc::R_X86_64_RELATIVE && writer.r_sym == 0 {
+                u64::try_from(addend).map_err(|_| "negative native init target")?
+            } else if writer.r_type == reloc::R_X86_64_64 {
+                let symbol = elf
+                    .dynsyms
+                    .get(writer.r_sym)
+                    .filter(|s| s.st_shndx != section_header::SHN_UNDEF as usize)
+                    .ok_or("unresolved native init target")?;
+                symbol
+                    .st_value
+                    .checked_add_signed(addend)
+                    .ok_or("native init target overflow")?
+            } else {
+                return Err("unsupported native init relocation".to_owned());
+            }
+        } else {
+            raw
+        };
+        require(
+            !overlaps(target),
+            "loader slot names an interior native/ordinary entry role",
+        )?;
+    }
+    Ok(())
+}
+
+/// Qualify this distinct explicit native entry against actual compiled sources
+/// and actual ELF/tool output. No ordinary init_array success is reused as
+/// native admission; the physical bootstrap, final state and consumer remain
+/// independently required. Complete entry bytes are retained, not a claimed
+/// proof of every imported Rust callee or of an executed native transition.
+pub fn qualify_detcore_native_entry_with_sources(
+    path: &Path,
+    runner: &mut Runner,
+    sources: &VerifiedCompiledSources,
+) -> Result<DetcoreNativeEntryQualification> {
+    sources.require_image(DETCORE_ROOT)?;
+    sources.verify_unchanged(runner)?;
+    let artifact = FileIdentity::read(path)?;
+    let bytes = fs::read(&artifact.path).map_err(|e| e.to_string())?;
+    let elf = Elf::parse(&bytes).map_err(|e| format!("parse native Detcore ELF: {e}"))?;
+    authenticate_loader_metadata(&elf, &bytes)?;
+    let native_entry = detcore_native_entry(&elf)?;
+    let mut scope = detcore_proof_functions(&elf)?;
+    require(
+        scope
+            .insert(native_entry.st_value, native_entry.st_size)
+            .is_none(),
+        "explicit native entry aliases a retained proof role",
+    )?;
+    native_no_loader_registration(&elf, &bytes, &scope)?;
+    let evidence = collect_proof_evidence(
+        &artifact,
+        &elf,
+        &bytes,
+        DETCORE_NATIVE_ENTRY,
+        &scope,
+        runner,
+    )?;
+    let (version_text, disassembly) = retained_tool_text(
+        &evidence.readelf_versions,
+        &evidence.readelf_symbols_relocations,
+        &evidence.objdump_disassembly,
+    )?;
+    let required_versions = qualify_portability(&elf, &version_text)?;
+    let expected_bytes = proof_function_bytes(&elf, &bytes, &scope)?;
+    verify_constructor_complete_bytes(&elf, DETCORE_NATIVE_ENTRY, &disassembly, &expected_bytes)?;
+    let got_targets = local_got_targets(&elf, &bytes)?;
+    let generic_bootstrap =
+        qualify_generic_bootstrap(&elf, &bytes, &expected_bytes, &disassembly, &got_targets)?;
+    require(
+        generic_bootstrap.fixed_native_gate.is_some(),
+        "explicit native entry lacks its qualified fixed selector route",
+    )?;
+    let allocator_backing = qualify_fixed_allocator_in_source_context(
+        &elf,
+        &bytes,
+        &expected_bytes,
+        &disassembly,
+        &got_targets,
+        FixedImageKind::Detcore,
+        Some(sources),
+    )?;
+    require(
+        allocator_backing.fixed_native_syscalls.is_some(),
+        "explicit native entry lacks its full native syscall cohort",
+    )?;
+    join_fixed_native_syscalls(
+        &allocator_backing,
+        generic_bootstrap.fixed_native_gate.as_ref(),
+    )?;
+    sources.verify_unchanged(runner)?;
+    artifact.verify()?;
+    Ok(DetcoreNativeEntryQualification {
+        artifact, allocator_backing,
+        native_entry: symbol_evidence(DETCORE_NATIVE_ENTRY, &native_entry),
+        native_entry_sha256: sha256(&expected_bytes[&native_entry.st_value]),
+        generic_bootstrap,
+        needed: elf.libraries.iter().map(|s| (*s).to_owned()).collect(), required_versions,
+        readelf_versions: evidence.readelf_versions,
+        readelf_symbols_relocations: evidence.readelf_symbols_relocations,
+        objdump_disassembly: evidence.objdump_disassembly,
+        observation: "Actual protected explicit native entry, static/dynamic identity, complete file-backed RX bytes with no runtime relocation writer, absent direct/interior loader registration, unchanged fixed allocator/TLS/layout/readonly/generic bootstrap checks. The compiled native Rust body and imported callees remain source premises; bootstrap control ownership, original arguments, actual tracked resume frame, final counters/masks/FDs and physical transition are consumer/runtime obligations. No ordinary constructor, runtime receipt, readiness or executed transition credit.".to_owned(),
     })
 }
 
@@ -24971,6 +26733,7 @@ fn qualify_constructor_from_evidence_in_source_context(
     let artifact = FileIdentity::read(path)?;
     let bytes = fs::read(&artifact.path).map_err(|e| e.to_string())?;
     let elf = Elf::parse(&bytes).map_err(|e| format!("parse actual runtime ELF: {e}"))?;
+    require_legacy_standalone_gate(&elf)?;
     authenticate_loader_metadata(&elf, &bytes)?;
     let required_versions = qualify_portability(&elf, &version_text)?;
     let initializer = private_function(&elf, STANDALONE_ROOT)?;
@@ -24992,6 +26755,10 @@ fn qualify_constructor_from_evidence_in_source_context(
         &got_targets,
         FixedImageKind::Standalone,
         sources,
+    )?;
+    join_fixed_native_syscalls(
+        &allocator_backing,
+        generic_bootstrap.fixed_native_gate.as_ref(),
     )?;
     artifact.verify()?;
     Ok(ConstructorQualification {
@@ -25249,6 +27016,10 @@ fn qualify_elf_from_evidence_in_source_context(
         },
         sources,
     )?;
+    join_fixed_native_syscalls(
+        &allocator_backing,
+        generic_bootstrap.fixed_native_gate.as_ref(),
+    )?;
     artifact.verify()?;
     Ok(ElfQualification {
         detcore_constructor,
@@ -25340,6 +27111,14 @@ pub fn verify_runtime_receipt(
         } else {
             FixedImageKind::Standalone
         },
+    )?;
+    join_fixed_native_syscalls(
+        &receipt.qualification.allocator_backing,
+        receipt
+            .qualification
+            .generic_bootstrap
+            .fixed_native_gate
+            .as_ref(),
     )?;
     if let Some(sources) = expected.compiled_sources {
         sources.require_image(expected.initializer)?;
@@ -25509,7 +27288,11 @@ pub fn verify_runtime_receipt(
             && generic.entry_bridge_transfer.local_got_slot.is_none()
             && generic.bridge_prepare_call.target == generic.prepare.address
             && generic.bridge_prepare_call.local_got_slot.is_none()
-            && generic.terminal_exit_transfer.target == generic.native_gate.address
+            && generic.terminal_exit_transfer.target
+                == native_bridge_gate_address(
+                    generic.fixed_native_gate.as_ref(),
+                    &generic.native_gate,
+                )?
             && generic.terminal_exit_transfer.local_got_slot.is_none()
             && generic.bootstrap_record == GENERIC_RECORD
             && generic.bootstrap_bottom == CONSTRUCTOR_BOTTOM
@@ -25620,7 +27403,7 @@ mod tests {
         let rv_two = cargo_two.join(suffix);
         // Current compiled bytes are inputs only. Each must independently match
         // the fixed reviewed length/digest catalog before any positive is earned.
-        let compiled_files: [(&str, &[u8]); 19] = [
+        let compiled_files: [(&str, &[u8]); 20] = [
             ("Cargo.toml", include_bytes!("../Cargo.toml")),
             (
                 "reverie-liteinst-artifact/Cargo.toml",
@@ -25690,6 +27473,10 @@ mod tests {
                 "reverie-liteinst/src/tool_host.rs",
                 include_bytes!("../reverie-liteinst/src/tool_host.rs"),
             ),
+            (
+                "reverie-inguest/src/trap/fixed_gates.rs",
+                include_bytes!("../reverie-inguest/src/trap/fixed_gates.rs"),
+            ),
             ("scripts/m1_artifact.rs", include_bytes!("m1_artifact.rs")),
         ];
         for rv in [&rv_one, &rv_two] {
@@ -25700,6 +27487,36 @@ mod tests {
         }
         let (rv_inventory, _) = content_reverie_inventory(&rv_one).unwrap();
         assert_eq!(rv_inventory.len(), 19);
+        let (detcore_inventory, _) =
+            content_reverie_inventory_for_image(&rv_one, FixedImageKind::Detcore).unwrap();
+        assert_eq!(detcore_inventory.len(), 20);
+        assert_eq!(
+            content_reverie_inventory_for_image(&rv_two, FixedImageKind::Detcore)
+                .unwrap()
+                .0,
+            detcore_inventory,
+        );
+        let fixed_source = rv_one.join(CONTENT_DETCORE_FIXED_GATE.0);
+        let fixed_bytes = fs::read(&fixed_source).unwrap();
+        let mut changed = fixed_bytes.clone();
+        changed[0] ^= 1;
+        fs::write(&fixed_source, &changed).unwrap();
+        assert!(content_reverie_inventory_for_image(&rv_one, FixedImageKind::Detcore).is_err());
+        assert_eq!(content_reverie_inventory(&rv_one).unwrap().0, rv_inventory);
+        fs::remove_file(&fixed_source).unwrap();
+        assert!(content_reverie_inventory_for_image(&rv_one, FixedImageKind::Detcore).is_err());
+        assert_eq!(content_reverie_inventory(&rv_one).unwrap().0, rv_inventory);
+        symlink(rv_two.join(CONTENT_DETCORE_FIXED_GATE.0), &fixed_source).unwrap();
+        assert!(content_reverie_inventory_for_image(&rv_one, FixedImageKind::Detcore).is_err());
+        fs::remove_file(&fixed_source).unwrap();
+        fs::write(&fixed_source, fixed_bytes).unwrap();
+        assert_eq!(
+            content_reverie_inventory_for_image(&rv_one, FixedImageKind::Detcore)
+                .unwrap()
+                .0,
+            detcore_inventory
+        );
+
         assert!(
             rv_inventory
                 .windows(2)
@@ -25957,6 +27774,7 @@ mod tests {
         let workspace_digest = declared_inventory_sha256(&workspace_inventory).unwrap();
         let verify = || {
             verify_declared_content(
+                FixedImageKind::Standalone,
                 (&root, &workspace_inventory, &workspace_digest),
                 (&rv_one, &rv_inventory, &rv_digest),
                 &binding,
@@ -25996,6 +27814,8 @@ mod tests {
         fs::rename(&moved, &checkout).unwrap();
         verify().unwrap();
 
+        detcore_content_profile_controls(&root, &rv_one, &rv_two, &binding, &source);
+
         let authority = CompiledSourceAuthority::DeclaredContent {
             workspace_inventory,
             workspace_sha256: workspace_digest,
@@ -26013,6 +27833,353 @@ mod tests {
         unknown["reverie_inventory"][0]["unknown"] = serde_json::json!(true);
         assert!(serde_json::from_value::<CompiledSourceAuthority>(unknown).is_err());
         drop(owned);
+    }
+    // Data controls on an actual gitless source-copy fixture. Metadata shapes
+    // here refute the production predicates; they never manufacture verified
+    // compiler authority or replace either factory's fresh Cargo commands.
+    fn detcore_content_profile_controls(
+        root: &Path,
+        rv_one: &Path,
+        rv_two: &Path,
+        binding: &CompilerRootBinding,
+        source: &str,
+    ) {
+        use std::os::unix::fs::symlink;
+        assert!(!root.join(".git").exists());
+        assert_eq!(
+            content_workspace_files(FixedImageKind::Standalone),
+            CONTENT_WORKSPACE_FILES
+        );
+        assert_eq!(content_workspace_files(FixedImageKind::Detcore).len(), 10);
+        assert_eq!(
+            content_manifest_relative(FixedImageKind::Standalone),
+            "liteinst-runtime-build/Cargo.toml"
+        );
+        assert_eq!(
+            content_manifest_relative(FixedImageKind::Detcore),
+            "Cargo.toml"
+        );
+        for relative in [
+            "Cargo.toml",
+            "Cargo.lock",
+            "detcore-liteinst/Cargo.toml",
+            "detcore-liteinst/src/lib.rs",
+        ] {
+            fs::create_dir_all(root.join(relative).parent().unwrap()).unwrap();
+            fs::write(
+                root.join(relative),
+                format!("declared Detcore {relative}\n"),
+            )
+            .unwrap();
+        }
+        let lock = root.join("Cargo.lock");
+        let lock_bytes = [
+            "reverie-core",
+            "reverie-inguest",
+            "reverie-liteinst",
+            "reverie-rpc-transport",
+        ]
+        .into_iter()
+        .map(|name| {
+            format!("[[package]]\nname = \"{name}\"\nversion = \"0.4.1\"\nsource = \"{source}\"\n")
+        })
+        .chain(["[[package]]\nname = \"detcore-liteinst\"\nversion = \"0.4.0\"\n".into()])
+        .collect::<String>();
+        fs::write(&lock, &lock_bytes).unwrap();
+        let dependencies = [
+            ("reverie-core", Some("reverie"), false),
+            ("reverie-inguest", None, false),
+            ("reverie-liteinst", None, false),
+            ("reverie-rpc-transport", None, true),
+        ]
+        .into_iter()
+        .map(|(name, rename, optional)| {
+            serde_json::json!({
+                "name": name, "source":source.rsplit_once('#').unwrap().0,
+                "kind":null, "rename":rename, "path":null, "target":null, "optional":optional
+            })
+        })
+        .collect::<Vec<_>>();
+        let runtime = serde_json::json!({"workspace_root":root,"packages":[{
+            "name":"detcore-liteinst", "version":"0.4.0",
+            "id":format!("path+file://{}#0.4.0",root.join("detcore-liteinst").display()),
+            "source":null,"manifest_path":root.join("detcore-liteinst/Cargo.toml"),
+            "dependencies":dependencies,"targets":[{"name":"detcore_liteinst","kind":["cdylib"],
+                "crate_types":["cdylib"],"src_path":root.join("detcore-liteinst/src/lib.rs")}]
+        }]});
+        content_detcore_manifest_and_lock_pin(&runtime, root, source).unwrap();
+        // These invoke the genuine factory, and must refuse before metadata;
+        // no synthetic JSON can become VerifiedCompiledSources authority.
+        let mut refused_runner = Runner::new(
+            root.join("factory-refusals"),
+            Duration::from_secs(10),
+            1 << 20,
+        )
+        .unwrap();
+        let pin = source.rsplit_once('#').unwrap().1;
+        for (image_kind, manifest) in [
+            (
+                FixedImageKind::Detcore,
+                root.join("detcore-liteinst/Cargo.toml"),
+            ),
+            (
+                FixedImageKind::Detcore,
+                root.join("liteinst-runtime-build/Cargo.toml"),
+            ),
+            (FixedImageKind::Standalone, root.join("Cargo.toml")),
+        ] {
+            let refused = VerifiedCompiledSources::resolve_content(
+                &CompiledSourceExpectation {
+                    layout: CompiledSourceLayout::HermitGit,
+                    image_kind,
+                    workspace_root: root,
+                    manifest: &manifest,
+                    reverie_pin: pin,
+                },
+                &mut refused_runner,
+            )
+            .err()
+            .expect("wrong explicit build-root manifest must refuse");
+            assert!(refused.contains("explicit build root"), "{refused}");
+            assert_eq!(
+                refused_runner.serial, 0,
+                "no metadata from a wrong build root"
+            );
+        }
+        let leaf = compiled_leaf_package(
+            &runtime,
+            root,
+            rv_one,
+            Some(source),
+            FixedImageKind::Detcore,
+        )
+        .unwrap();
+        assert_eq!(leaf.name, "detcore-liteinst");
+        assert_eq!(leaf.manifest, root.join("detcore-liteinst/Cargo.toml"));
+        assert_eq!(
+            content_compiler_manifest_path(FixedImageKind::Detcore, root, &leaf.manifest, binding)
+                .unwrap(),
+            leaf.manifest
+        );
+        assert!(
+            content_compiler_manifest_path(
+                FixedImageKind::Standalone,
+                root,
+                &leaf.manifest,
+                binding
+            )
+            .is_err()
+        );
+        assert!(
+            content_compiler_manifest_path(
+                FixedImageKind::Detcore,
+                root,
+                &rv_one.join("reverie-liteinst-preload/Cargo.toml"),
+                binding
+            )
+            .is_err()
+        );
+        assert!(
+            compiled_leaf_package(
+                &runtime,
+                root,
+                rv_one,
+                Some(source),
+                FixedImageKind::Standalone
+            )
+            .is_err()
+        );
+        assert!(
+            content_detcore_manifest_and_lock_pin(
+                &serde_json::json!({"packages":[]}),
+                root,
+                source
+            )
+            .is_err()
+        );
+        for (field, value) in [
+            ("name", serde_json::json!("reverie-liteinst-preload")),
+            ("version", serde_json::json!("0.4.1")),
+            ("source", serde_json::json!(source)),
+            (
+                "manifest_path",
+                serde_json::json!(format!("{}/detcore-liteinst/./Cargo.toml", root.display())),
+            ),
+            ("manifest_path", serde_json::json!(root.join("Cargo.toml"))),
+        ] {
+            let mut bad = runtime.clone();
+            bad["packages"][0][field] = value;
+            assert!(
+                content_detcore_manifest_and_lock_pin(&bad, root, source).is_err(),
+                "Detcore {field}"
+            );
+        }
+        for (field, value) in [
+            ("id", serde_json::json!("same-name-wrong-local-package")),
+            (
+                "id",
+                serde_json::json!(format!(
+                    "path+file://{}#0.4.0",
+                    root.join("elsewhere/detcore-liteinst").display()
+                )),
+            ),
+        ] {
+            let mut bad = runtime.clone();
+            bad["packages"][0][field] = value;
+            assert!(
+                compiled_leaf_package(&bad, root, rv_one, Some(source), FixedImageKind::Detcore)
+                    .is_err()
+            );
+        }
+        for (field, value) in [
+            ("name", serde_json::json!("preload")),
+            ("kind", serde_json::json!(["rlib"])),
+            ("crate_types", serde_json::json!(["rlib"])),
+            (
+                "src_path",
+                serde_json::json!(format!("{}/detcore-liteinst/src/./lib.rs", root.display())),
+            ),
+        ] {
+            let mut bad = runtime.clone();
+            bad["packages"][0]["targets"][0][field] = value;
+            assert!(
+                compiled_leaf_package(&bad, root, rv_one, Some(source), FixedImageKind::Detcore)
+                    .is_err(),
+                "Detcore target {field}"
+            );
+        }
+        let mut bad = runtime.clone();
+        bad["workspace_root"] = serde_json::json!(rv_one);
+        assert!(content_detcore_manifest_and_lock_pin(&bad, root, source).is_err());
+        let mut duplicate = runtime.clone();
+        duplicate["packages"]
+            .as_array_mut()
+            .unwrap()
+            .push(runtime["packages"][0].clone());
+        assert!(content_detcore_manifest_and_lock_pin(&duplicate, root, source).is_err());
+        for index in 0..4 {
+            for (field, value) in [
+                ("name", serde_json::json!("lookalike")),
+                (
+                    "source",
+                    serde_json::json!("git+https://github.com/rrnewton/reverie.git?rev=wrong"),
+                ),
+                ("kind", serde_json::json!("build")),
+                ("rename", serde_json::json!("other")),
+                ("path", serde_json::json!(rv_one)),
+                ("target", serde_json::json!("cfg(unix)")),
+                ("optional", serde_json::json!(index != 3)),
+            ] {
+                let mut bad = runtime.clone();
+                bad["packages"][0]["dependencies"][index][field] = value;
+                assert!(
+                    content_detcore_manifest_and_lock_pin(&bad, root, source).is_err(),
+                    "Detcore dependency {index}/{field}"
+                );
+            }
+        }
+        for wrong in [
+            String::new(),
+            lock_bytes.replacen("name = \"reverie-core\"", "name = \"lookalike\"", 1),
+            lock_bytes.replacen("?rev=", "?rev=wrong", 1),
+            lock_bytes.replacen('#', "#wrong", 1),
+            lock_bytes.replacen("version = \"0.4.1\"", "version = \"0.4.0\"", 1),
+            lock_bytes.replacen("name = \"detcore-liteinst\"", "name = \"lookalike\"", 1),
+            lock_bytes.replacen("version = \"0.4.0\"", "version = \"0.4.1\"", 1),
+            format!("{lock_bytes}{lock_bytes}"),
+            format!("{lock_bytes}source = \"{source}\"\n"),
+        ] {
+            fs::write(&lock, wrong).unwrap();
+            assert!(content_detcore_manifest_and_lock_pin(&runtime, root, source).is_err());
+            fs::write(&lock, &lock_bytes).unwrap();
+            content_detcore_manifest_and_lock_pin(&runtime, root, source).unwrap();
+        }
+        // Both independently selected real-root bindings must join. Equal
+        // source bytes in another checkout do not authorize its compiler path.
+        let graph = |root: &Path| serde_json::json!({"packages":[{"name":"reverie-inguest","manifest_path":root.join("reverie-inguest/Cargo.toml")}]});
+        // The alias fixture above explicitly supplies its synthetic Cargo home
+        // to resolve_cargo_home; it is not this test process's CARGO_HOME.
+        // These independent graph controls instead name the canonical roots.
+        let runtime_binding = content_root_binding(&graph(&binding.canonical_root), pin).unwrap();
+        let producer_binding = content_root_binding(&graph(&binding.canonical_root), pin).unwrap();
+        content_same_root(&runtime_binding, &producer_binding).unwrap();
+        let other = content_root_binding(&graph(rv_two), pin).unwrap();
+        assert!(content_same_root(&runtime_binding, &other).is_err());
+        assert!(content_root_binding(&serde_json::json!({"packages":[]}), pin).is_err());
+        let (workspace_inventory, _) =
+            declared_inventory(root, content_workspace_files(FixedImageKind::Detcore)).unwrap();
+        let digest = declared_inventory_sha256(&workspace_inventory).unwrap();
+        let (rv_inventory, _) =
+            content_reverie_inventory_for_image(rv_one, FixedImageKind::Detcore).unwrap();
+        let rv_digest = declared_inventory_sha256(&rv_inventory).unwrap();
+        let verify = || {
+            verify_declared_content(
+                FixedImageKind::Detcore,
+                (root, &workspace_inventory, &digest),
+                (rv_one, &rv_inventory, &rv_digest),
+                binding,
+            )
+        };
+        verify().unwrap();
+        let standalone_inventory = content_reverie_inventory(rv_one).unwrap().0;
+        assert!(
+            verify_declared_content(
+                FixedImageKind::Detcore,
+                (root, &workspace_inventory, &digest),
+                (
+                    rv_one,
+                    &standalone_inventory,
+                    &declared_inventory_sha256(&standalone_inventory).unwrap()
+                ),
+                binding,
+            )
+            .unwrap_err()
+            .contains("Reverie content changed")
+        );
+        assert!(
+            verify_declared_content(
+                FixedImageKind::Standalone,
+                (root, &workspace_inventory, &digest),
+                (rv_one, &rv_inventory, &rv_digest),
+                binding
+            )
+            .is_err()
+        );
+        for relative in [
+            "Cargo.toml",
+            "Cargo.lock",
+            "detcore-liteinst/Cargo.toml",
+            "detcore-liteinst/src/lib.rs",
+        ] {
+            let path = root.join(relative);
+            let original = fs::read(&path).unwrap();
+            fs::write(&path, b"changed after Detcore resolution").unwrap();
+            assert!(
+                verify().unwrap_err().contains("workspace content changed"),
+                "{relative}"
+            );
+            fs::write(&path, &original).unwrap();
+            verify().unwrap();
+            fs::remove_file(&path).unwrap();
+            assert!(verify().is_err());
+            let elsewhere = root.join("aliased-input");
+            fs::write(&elsewhere, &original).unwrap();
+            symlink(&elsewhere, &path).unwrap();
+            assert!(verify().is_err());
+            fs::remove_file(&path).unwrap();
+            fs::remove_file(&elsewhere).unwrap();
+            fs::write(&path, original).unwrap();
+            verify().unwrap();
+        }
+        let producer_lock = root.join("liteinst-runtime-build/Cargo.lock");
+        let original = fs::read(&producer_lock).unwrap();
+        fs::write(&producer_lock, b"producer-only pin change").unwrap();
+        // The runtime graph itself still passes, but the retained shared
+        // ten-file authority must reject the independently changed producer.
+        content_detcore_manifest_and_lock_pin(&runtime, root, source).unwrap();
+        assert!(verify().is_err());
+        fs::write(&producer_lock, original).unwrap();
+        verify().unwrap();
     }
     // Nested in missing_build_finished_is_a_failed_current_artifact_selection.
     // Exercise the production identity predicates with uniquely owned inputs.
@@ -33534,6 +35701,7 @@ mod tests {
             );
         }
         let backing = AllocatorBackingEvidence {
+            fixed_native_syscalls: None,
             fixed_arena_version: 1,
             descriptor: AllocatorDescriptorEvidence {
                 symbol: SymbolEvidence {
@@ -33774,6 +35942,7 @@ mod tests {
         fixed_tls_direct_schema_controls(&backing);
         fixed_tls_direct_census_controls();
         let value = serde_json::to_value(&backing).unwrap();
+        assert!(value.get("fixed_native_syscalls").is_none());
         for field in [
             "fixed_arena_version",
             "descriptor",
@@ -33869,6 +36038,7 @@ mod tests {
         let mut unknown = value;
         unknown["legacy_exemption"] = serde_json::json!(true);
         assert!(serde_json::from_value::<AllocatorBackingEvidence>(unknown).is_err());
+        fixed_native_syscall_controls(&backing);
     }
 
     // Physical mini-ELF census controls only: no verified-source fabrication,
@@ -34985,6 +37155,118 @@ mod tests {
                 );
             }
         }
+        // Separate explicit-native controls use actual encoded ELF tables;
+        // they are not a constructor or a runtime admission fixture.
+        let mut native = bytes.clone();
+        let names = format!("\0{DETCORE_NATIVE_ENTRY}\0neighbor_alias\0");
+        native[0x500..0x500 + names.len()].copy_from_slice(names.as_bytes());
+        put(&mut native, 0x338, 8, names.len() as u64);
+        put(&mut native, 0xc60, 8, names.len() as u64);
+        put(&mut native, 0x430, 4, DETCORE_NATIVE_ENTRY.len() as u64 + 2);
+        put(&mut native, 0x710, 8, 0x1150);
+        let native_ranges = BTreeMap::from([(ROOT, 16), (GENERIC, 16)]);
+        let native_check = |image: &[u8]| -> Result<()> {
+            let elf = Elf::parse(image).map_err(|e| e.to_string())?;
+            detcore_native_entry(&elf)?;
+            native_no_loader_registration(&elf, image, &native_ranges)
+        };
+        native_check(&native).expect("explicit native export has no loader registration");
+        // Actual ELF producers use independent string tables with different
+        // offsets for the same symbol name. Keep the shared-table control too.
+        let mut separate_names = native.clone();
+        let prefix = "\0static-only\0";
+        let static_names = format!("{prefix}{DETCORE_NATIVE_ENTRY}\0neighbor_alias\0");
+        separate_names[0xd00..0xd00 + static_names.len()].copy_from_slice(static_names.as_bytes());
+        put(&mut separate_names, 0xc58, 8, 0xd00);
+        put(&mut separate_names, 0xc60, 8, static_names.len() as u64);
+        put(&mut separate_names, 0xa18, 4, prefix.len() as u64);
+        let parsed = Elf::parse(&separate_names).unwrap();
+        assert_ne!(
+            parsed.syms.get(1).unwrap().st_name,
+            parsed.dynsyms.get(1).unwrap().st_name,
+        );
+        native_check(&separate_names)
+            .expect("independent string tables name the identical native definition");
+        for static_alias in [false, true] {
+            let mut alias = separate_names.clone();
+            let slot = if static_alias {
+                let neighbor = alias[0x430..0x448].to_vec();
+                alias[0xa30..0xa48].copy_from_slice(&neighbor);
+                put(&mut alias, 0xc20, 8, 72);
+                put(
+                    &mut alias,
+                    0xa30,
+                    4,
+                    (prefix.len() + DETCORE_NATIVE_ENTRY.len() + 1) as u64,
+                );
+                0xa30
+            } else {
+                0x430
+            };
+            put(&mut alias, slot + 16, 8, 0);
+            // A zero-sized function outside the entry remains unrelated.
+            native_check(&alias).expect("unrelated zero-sized function symbol");
+            for address in [ROOT, ROOT + 1, ROOT + 15] {
+                let mut bad = alias.clone();
+                put(&mut bad, slot + 8, 8, address);
+                assert!(
+                    native_check(&bad).is_err(),
+                    "zero-sized native alias: static={static_alias}, address={address:#x}"
+                );
+            }
+        }
+        for (offset, width, value) in [
+            (0xa18, 4, 1), // A different name at a valid static string offset.
+            (0xa1c, 1, u64::from((sym::STB_WEAK << 4) | sym::STT_FUNC)),
+            (
+                0xa1c,
+                1,
+                u64::from((sym::STB_GLOBAL << 4) | sym::STT_OBJECT),
+            ),
+            (0xa1d, 1, u64::from(sym::STV_PROTECTED) | 0x80),
+            (0xa1e, 2, 2),
+            (0xa20, 8, ROOT + 1),
+            (0xa28, 8, 15),
+            (0x438, 8, ROOT), // Another name still cannot alias the entry.
+        ] {
+            let mut bad = separate_names.clone();
+            put(&mut bad, offset, width, value);
+            assert!(
+                native_check(&bad).is_err(),
+                "native cross-table definition mutation {offset:#x}"
+            );
+        }
+        for (offset, width, value) in [
+            (0x41d, 1, u64::from(sym::STV_DEFAULT)),
+            (0xa1d, 1, u64::from(sym::STV_DEFAULT)),
+            (0x41c, 1, u64::from((sym::STB_WEAK << 4) | sym::STT_FUNC)),
+            (0x428, 8, 0),
+            (0xa28, 8, 15),
+            (0x438, 8, ROOT),
+            (0x700, 8, SLOT + 1),
+            (0x708, 8, u64::from(reloc::R_X86_64_GLOB_DAT)),
+            (68, 4, 7),
+            (0x3a0, 8, goblin::elf::dynamic::DT_PREINIT_ARRAY),
+        ] {
+            let mut bad = native.clone();
+            put(&mut bad, offset, width, value);
+            assert!(
+                native_check(&bad).is_err(),
+                "native export/registration mutation {offset:#x}"
+            );
+        }
+        for (lo, size) in &native_ranges {
+            for target in [*lo, *lo + 1, *lo + size - 1] {
+                for offset in [0x710, 0x3a8] {
+                    let mut bad = native.clone();
+                    put(&mut bad, offset, 8, target);
+                    assert!(
+                        native_check(&bad).is_err(),
+                        "native direct/interior loader registration"
+                    );
+                }
+            }
+        }
         // Whole native entry shape: same semantic LEA/JMP recipe, distinct protected root binding.
         let mut prefix = fixed_hex("f30f1efa488d3d00000000e900000000");
         prefix[7..11].copy_from_slice(&(GENERIC as i32 - (ROOT as i32 + 11)).to_le_bytes());
@@ -35717,7 +37999,1411 @@ mod tests {
         }
     }
 
+    // Real physical miniature ELF, not receipt/model authority. The selected
+    // RX code, BSS publication, readonly page and canonical loader metadata all
+    // flow through the same actual-byte qualifier as the production route.
+    fn fixed_native_gate_fixture() -> Vec<u8> {
+        fn put(bytes: &mut [u8], offset: usize, width: usize, value: u64) {
+            bytes[offset..offset + width].copy_from_slice(&value.to_le_bytes()[..width]);
+        }
+        fn relative(bytes: &mut [u8], at: usize, next: u64, target: u64) {
+            let delta = i32::try_from(target as i64 - next as i64).unwrap();
+            bytes[at..at + 4].copy_from_slice(&delta.to_le_bytes());
+        }
+
+        let mut bytes = vec![0_u8; 0x9000];
+        bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        for (offset, width, value) in [
+            (16, 2, 3),
+            (18, 2, 62),
+            (20, 4, 1),
+            (32, 8, 64),
+            (40, 8, 0x8000),
+            (52, 2, 64),
+            (54, 2, 56),
+            (56, 2, 7),
+            (58, 2, 64),
+            (60, 2, 12),
+            (62, 2, 10),
+        ] {
+            put(&mut bytes, offset, width, value);
+        }
+        for (index, kind, flags, start, file, memory) in [
+            (0, 1, 4, 0, 0x1000, 0x1000),
+            (1, 1, 5, 0x1000, 0x1000, 0x1000),
+            (2, 1, 4, 0x2000, 0x2000, 0x2000),
+            (3, 1, 6, 0x5000, 0x1000, 0x2000),
+            (4, 0x6474e552, 4, 0x5000, 0x1000, 0x1000),
+            (5, 2, 6, 0x5100, 12 * 16, 12 * 16),
+            (6, 6, 4, 64, 7 * 56, 7 * 56),
+        ] {
+            let row = 64 + index * 56;
+            for (offset, width, value) in [
+                (0, 4, kind),
+                (4, 4, flags),
+                (8, 8, start),
+                (16, 8, start),
+                (24, 8, start),
+                (32, 8, file),
+                (40, 8, memory),
+                (48, 8, if kind == 1 { 4096 } else { 8 }),
+            ] {
+                put(&mut bytes, row + offset, width, value);
+            }
+        }
+        let selector_name = FIXED_NATIVE_SELECTOR.replace("Cs_", "Cs1_");
+        let symbols = [
+            (selector_name.as_str(), 2, 2, 1, 0x1100, 31),
+            (FIXED_NATIVE_PUBLICATION, 1, 2, 3, 0x6100, 8),
+            (FIXED_NATIVE_TEMPLATE, 1, 2, 2, 0x2000, 4096),
+            (FIXED_NATIVE_TEMPLATE_END, 0, 2, 2, 0x3000, 0),
+            (CONSTRUCTOR_GATE_OWNER, 2, 2, 1, 0x1200, 44),
+            (CONSTRUCTOR_GATE, 0, 2, 1, 0x1220, 0),
+            (CONSTRUCTOR_GATE_RETURN, 0, 2, 1, 0x1222, 0),
+            ("spare-native-control", 0, 0, 0, 0, 0),
+        ];
+        let mut strings = vec![0];
+        for (index, (name, info, other, section, address, size)) in symbols.into_iter().enumerate()
+        {
+            let row = 0x3700 + (index + 1) * 24;
+            for (offset, width, value) in [
+                (0, 4, strings.len() as u64),
+                (4, 1, info),
+                (5, 1, other),
+                (6, 2, section),
+                (8, 8, address),
+                (16, 8, size),
+            ] {
+                put(&mut bytes, row + offset, width, value);
+            }
+            strings.extend_from_slice(name.as_bytes());
+            strings.push(0);
+        }
+        bytes[0x3100..0x3100 + strings.len()].copy_from_slice(&strings);
+        // A named undefined dynamic control, allowing a real dynamic-role
+        // mutation without changing table extents or hash representation.
+        let spare = 0x3700 + 8 * 24;
+        let spare_name: [u8; 4] = bytes[spare..spare + 4].try_into().unwrap();
+        bytes[0x3418..0x341c].copy_from_slice(&spare_name);
+        for (index, value) in [1, 2, 1, 0, 0].into_iter().enumerate() {
+            put(&mut bytes, 0x3500 + index * 4, 4, value);
+        }
+        for (index, (tag, value)) in [
+            (5, 0x3100),
+            (10, strings.len() as u64),
+            (6, 0x3400),
+            (11, 24),
+            (4, 0x3500),
+            (7, 0x3600),
+            (8, 24),
+            (9, 24),
+            (30, 8),
+            (25, 0x5200),
+            (27, 8),
+            (0, 0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            put(&mut bytes, 0x5100 + index * 16, 8, tag);
+            put(&mut bytes, 0x5108 + index * 16, 8, value);
+        }
+        put(&mut bytes, 0x3600, 8, 0x5000);
+        put(&mut bytes, 0x3608, 8, 8); // sole ordinary RELATIVE writer
+        let mut names = vec![0];
+        for (index, name, kind, flags, address, offset, size, link, entry, align) in [
+            (1, ".text", 1, 6, 0x1000, 0x1000, 0x1000, 0, 0, 16),
+            (2, ".rodata", 1, 2, 0x2000, 0x2000, 0x2000, 0, 0, 4096),
+            (3, ".bss", 8, 3, 0x6000, 0x6000, 0x1000, 0, 0, 8),
+            (
+                4,
+                ".dynstr",
+                3,
+                2,
+                0x3100,
+                0x3100,
+                strings.len() as u64,
+                0,
+                0,
+                1,
+            ),
+            (5, ".dynsym", 11, 2, 0x3400, 0x3400, 48, 4, 24, 8),
+            (6, ".hash", 5, 2, 0x3500, 0x3500, 20, 5, 4, 4),
+            (7, ".rela.dyn", 4, 2, 0x3600, 0x3600, 24, 5, 24, 8),
+            (8, ".dynamic", 6, 3, 0x5100, 0x5100, 12 * 16, 4, 16, 8),
+            (9, ".symtab", 2, 0, 0, 0x3700, 9 * 24, 4, 24, 8),
+            (10, ".shstrtab", 3, 0, 0, 0x3900, 256, 0, 0, 1),
+            (11, ".init_array", 14, 3, 0x5200, 0x5200, 8, 0, 8, 8),
+        ] {
+            let row = 0x8000 + index * 64;
+            for (at, width, value) in [
+                (0, 4, names.len() as u64),
+                (4, 4, kind),
+                (8, 8, flags),
+                (16, 8, address),
+                (24, 8, offset),
+                (32, 8, size),
+                (40, 4, link),
+                (48, 8, align),
+                (56, 8, entry),
+            ] {
+                put(&mut bytes, row + at, width, value);
+            }
+            names.extend_from_slice(name.as_bytes());
+            names.push(0);
+        }
+        bytes[0x3900..0x3900 + names.len()].copy_from_slice(&names);
+        bytes[0x1100..0x111f].copy_from_slice(&fixed_hex(FIXED_NATIVE_SELECTOR_HEX));
+        relative(&mut bytes, 0x1107, 0x110b, 0x6100);
+        relative(&mut bytes, 0x111b, 0x111f, 0x1220);
+        bytes[0x1200..0x122c].copy_from_slice(CONSTRUCTOR_GATE_OWNER_BYTES);
+        bytes[0x2000..0x3000].fill(0xcc);
+        bytes[0x207c..0x2085]
+            .copy_from_slice(&[0xf3, 0x0f, 0x1e, 0xfa, 0x0f, 0x05, 0x41, 0xff, 0xe4]);
+        bytes
+    }
+    fn fixed_native_syscall_controls(baseline: &AllocatorBackingEvidence) {
+        fn put(bytes: &mut [u8], offset: usize, width: usize, value: u64) {
+            bytes[offset..offset + width].copy_from_slice(&value.to_le_bytes()[..width]);
+        }
+        fn relative(bytes: &mut [u8], at: usize, next: u64, target: u64) {
+            bytes[at..at + 4].copy_from_slice(
+                &i32::try_from(target as i64 - next as i64)
+                    .unwrap()
+                    .to_le_bytes(),
+            );
+        }
+        fn fixture(shift: u64) -> Vec<u8> {
+            let mut bytes = fixed_native_gate_fixture();
+            let old_strings =
+                u64::from_le_bytes(bytes[0x5118..0x5120].try_into().unwrap()) as usize;
+            let mut strings = bytes[0x3100..0x3100 + old_strings].to_vec();
+            for (index, name, address, size) in [
+                (9, FIXED_NATIVE_OWNER.to_owned(), 0x1300 + shift, 56),
+                (
+                    10,
+                    FIXED_NATIVE_RAW6.replace("Cs_", "Cs1_"),
+                    0x1400 + shift,
+                    92,
+                ),
+                (
+                    11,
+                    FIXED_NATIVE_RAW3.replace("Cs_", "Cs1_"),
+                    0x1500 + shift,
+                    60,
+                ),
+            ] {
+                let row = 0x3700 + index * 24;
+                for (at, width, value) in [
+                    (0, 4, strings.len() as u64),
+                    (4, 1, 2),
+                    (5, 1, 2),
+                    (6, 2, 1),
+                    (8, 8, address),
+                    (16, 8, size),
+                ] {
+                    put(&mut bytes, row + at, width, value);
+                }
+                strings.extend_from_slice(name.as_bytes());
+                strings.push(0);
+            }
+            assert!(0x3100 + strings.len() <= 0x3400);
+            bytes[0x3100..0x3100 + strings.len()].copy_from_slice(&strings);
+            put(&mut bytes, 0x5118, 8, strings.len() as u64);
+            put(&mut bytes, 0x8120, 8, strings.len() as u64); // actual dynstr extent
+            put(&mut bytes, 0x8260, 8, 12 * 24); // actual symtab extent
+            for (index, target) in [0x6100, 0x1300 + shift, 0x1200].into_iter().enumerate() {
+                let row = 0x3600 + index * 24;
+                put(&mut bytes, row, 8, 0x5000 + index as u64 * 8);
+                put(&mut bytes, row + 8, 8, 8);
+                put(&mut bytes, row + 16, 8, target);
+            }
+            put(&mut bytes, 0x5168, 8, 72); // DT_RELASZ
+            put(&mut bytes, 0x81e0, 8, 72); // SHT_RELA size
+            for (address, hex) in [
+                (0x1300 + shift, FIXED_NATIVE_OWNER_HEX),
+                (0x1400 + shift, FIXED_NATIVE_RAW6_HEX),
+                (0x1500 + shift, FIXED_NATIVE_RAW3_HEX),
+            ] {
+                let body = fixed_hex(hex);
+                bytes[address as usize..address as usize + body.len()].copy_from_slice(&body);
+            }
+            relative(
+                &mut bytes,
+                (0x1309 + shift) as usize,
+                0x130d + shift,
+                0x1331 + shift,
+            );
+            for (address, fixed_disp, fixed_next, legacy_disp, legacy_next) in [
+                (0x1400 + shift, 0x30, 0x34, 0x56, 0x5a),
+                (0x1500 + shift, 0x20, 0x24, 0x36, 0x3a),
+            ] {
+                relative(&mut bytes, (address + 4) as usize, address + 8, 0x5000);
+                relative(
+                    &mut bytes,
+                    (address + fixed_disp) as usize,
+                    address + fixed_next,
+                    0x5008,
+                );
+                relative(
+                    &mut bytes,
+                    (address + legacy_disp) as usize,
+                    address + legacy_next,
+                    0x5010,
+                );
+            }
+            bytes
+        }
+        type NativeFixtureInputs = (
+            BTreeMap<String, sym::Sym>,
+            BTreeMap<u64, Vec<u8>>,
+            BTreeMap<u64, u64>,
+        );
+        fn inputs(bytes: &[u8]) -> Result<NativeFixtureInputs> {
+            let elf = Elf::parse(bytes).map_err(|e| e.to_string())?;
+            let mut roles = BTreeMap::from([
+                (
+                    FIXED_NATIVE_RAW6.into(),
+                    fixed_native_function_symbol(&elf, FIXED_NATIVE_RAW6, 92)?,
+                ),
+                (
+                    "fixed_scalar_syscall".into(),
+                    fixed_native_function_symbol(&elf, FIXED_NATIVE_RAW3, 60)?,
+                ),
+                (
+                    CONSTRUCTOR_GATE_OWNER.into(),
+                    private_function(&elf, CONSTRUCTOR_GATE_OWNER)?,
+                ),
+            ]);
+            add_fixed_native_selector(&elf, &mut roles)?;
+            add_fixed_native_owner(&elf, &mut roles)?;
+            let ranges =
+                selected_function_ranges(&elf, roles.values().map(|s| s.st_value).collect())?;
+            Ok((
+                roles,
+                proof_function_bytes(&elf, bytes, &ranges)?,
+                local_got_targets(&elf, bytes)?,
+            ))
+        }
+        fn qualify(bytes: &[u8]) -> Result<FixedNativeSyscallContext> {
+            let elf = Elf::parse(bytes).map_err(|e| e.to_string())?;
+            let (roles, code, got) = inputs(bytes)?;
+            qualify_fixed_native_syscalls(&elf, bytes, &code, &got, &roles)?
+                .ok_or("native cohort absent".into())
+        }
+        fn instructions(
+            address: u64,
+            body: &[u8],
+            offsets: &[usize],
+        ) -> Vec<EncodedConstructorInstruction> {
+            offsets
+                .windows(2)
+                .map(|p| EncodedConstructorInstruction {
+                    address: address + p[0] as u64,
+                    bytes: body[p[0]..p[1]].to_vec(),
+                })
+                .collect()
+        }
+        let bytes = fixture(0);
+        let native = qualify(&bytes).unwrap();
+        let record = &native.evidence;
+        assert_eq!(record.wrappers.len(), 2);
+        assert_eq!(record.owner.address, 0x1300);
+        assert_eq!(record.page_transfer.instruction, 0x132e);
+        assert_eq!(record.continuation, 0x1331);
+        assert_eq!(record.publication_address, 0x6100);
+        let relocated = qualify(&fixture(0x100)).unwrap();
+        assert_eq!(relocated.evidence.owner.address, 0x1400);
+        assert_ne!(
+            relocated.evidence.wrappers[FIXED_NATIVE_RAW6].function_sha256,
+            record.wrappers[FIXED_NATIVE_RAW6].function_sha256
+        );
+        let mut reordered = bytes.clone();
+        let row: [u8; 24] = reordered[0x37f0..0x3808].try_into().unwrap();
+        reordered.copy_within(0x3808..0x3820, 0x37f0);
+        reordered[0x3808..0x3820].copy_from_slice(&row);
+        assert_eq!(qualify(&reordered).unwrap().evidence, *record);
+        // A malformed third matching raw definition cannot disappear under
+        // canonicalization, size or executable filtering.
+        for canonical in [FIXED_NATIVE_RAW6, FIXED_NATIVE_RAW3] {
+            let mut bad = bytes.clone();
+            let len = u64::from_le_bytes(bad[0x5118..0x5120].try_into().unwrap()) as usize;
+            let name = format!("{}.llvm.invalid", canonical.replace("Cs_", "Cs1_"));
+            assert!(0x3100 + len + name.len() + 1 < 0x3400);
+            bad[0x3100 + len..0x3100 + len + name.len()].copy_from_slice(name.as_bytes());
+            put(&mut bad, 0x37c0, 4, len as u64);
+            put(&mut bad, 0x37c4, 1, 2);
+            put(&mut bad, 0x37c6, 2, 1);
+            put(&mut bad, 0x37c8, 8, 0x1700);
+            put(&mut bad, 0x37d0, 8, 0);
+            let size = (len + name.len() + 1) as u64;
+            put(&mut bad, 0x5118, 8, size);
+            put(&mut bad, 0x8120, 8, size);
+            assert!(qualify(&bad).is_err());
+        }
+        for (row, address, template) in [(0x37f0, 0x1400, 13), (0x3808, 0x1500, 26)] {
+            let mut mixed = bytes.clone();
+            let old = fixed_hex(DETCORE_VALIDATE_TEMPLATES[template].hex);
+            mixed[address..address + old.len()].copy_from_slice(&old);
+            put(&mut mixed, row + 16, 8, old.len() as u64);
+            assert!(qualify(&mixed).is_err());
+        }
+        // Actual RX code at a different file offset proves the join uses ELF
+        // bias rather than the identity layout of the original miniature.
+        let mut nonidentity = bytes.clone();
+        nonidentity.copy_within(0x1000..0x2000, 0x7000);
+        put(&mut nonidentity, 64 + 56 + 8, 8, 0x7000);
+        put(&mut nonidentity, 0x8058, 8, 0x7000);
+        assert_eq!(qualify(&nonidentity).unwrap().evidence, *record);
+        // Reserved symbol indexes remain invalid even when genuine extended
+        // section-count encoding makes each numeric index an in-bounds AX row.
+        // This does not admit extended symbol indexes into the native domain.
+        let count = section_header::SHN_XINDEX as usize + 1;
+        let mut oversized = bytes.clone();
+        oversized.resize(0x8000 + count * 64, 0);
+        put(&mut oversized, 60, 2, 0);
+        put(&mut oversized, 0x8020, 8, count as u64);
+        for index in [
+            section_header::SHN_LORESERVE,
+            section_header::SHN_ABS,
+            section_header::SHN_COMMON,
+            section_header::SHN_XINDEX,
+        ] {
+            oversized.copy_within(0x8040..0x8080, 0x8000 + index as usize * 64);
+        }
+        let large_elf = Elf::parse(&oversized).unwrap();
+        assert_eq!(large_elf.section_headers.len(), count);
+        assert_eq!(qualify(&oversized).unwrap().evidence, *record);
+        for row in [0x3718, 0x37d8, 0x37f0, 0x3808] {
+            for index in [
+                section_header::SHN_LORESERVE,
+                section_header::SHN_ABS,
+                section_header::SHN_COMMON,
+                section_header::SHN_XINDEX,
+            ] {
+                let mut bad = oversized.clone();
+                put(&mut bad, row + 6, 2, u64::from(index));
+                let parsed = Elf::parse(&bad).unwrap();
+                assert_eq!(
+                    parsed.section_headers[index as usize],
+                    parsed.section_headers[1],
+                );
+                assert!(
+                    qualify(&bad).is_err(),
+                    "accepted in-bounds reserved native section index {index:#x} at {row:#x}",
+                );
+            }
+        }
+        for (at, value) in [
+            (0x8048, 2),
+            (0x8048, 7),
+            (0x8048, 0x406),
+            (0x8050, 0x1001),
+            (0x8050, u64::MAX),
+            (0x8058, 0x1001),
+            (0x8058, u64::MAX),
+            (0x8060, 0x100),
+            (0x8060, u64::MAX),
+        ] {
+            let mut bad = bytes.clone();
+            put(&mut bad, at, 8, value);
+            assert!(
+                qualify(&bad).is_err(),
+                "accepted native section field {at:#x} = {value:#x}"
+            );
+        }
+        let (roles, code, got) = inputs(&bytes).unwrap();
+        let elf = Elf::parse(&bytes).unwrap();
+        let gate = qualify_fixed_native_gate(&elf, &bytes, &code, 0x1220)
+            .unwrap()
+            .unwrap();
+        assert!(require_legacy_standalone_gate(&elf).is_err());
+        assert!(standalone_symbols(&elf).is_err());
+        assert!(constructor_proof_functions(&elf).is_err());
+        assert!(proof_functions(&elf, STANDALONE_ROOT).is_err());
+        // Selector absence restores the source-domain check, not native proof.
+        let mut ordinary = bytes.clone();
+        put(&mut ordinary, 0x3718, 4, 0);
+        assert!(require_legacy_standalone_gate(&Elf::parse(&ordinary).unwrap()).is_ok());
+        assert!(qualify(&ordinary).is_err());
+        for (role, offsets) in [
+            (
+                FIXED_NATIVE_RAW6,
+                vec![
+                    0, 1, 8, 11, 14, 16, 19, 23, 27, 31, 35, 39, 43, 46, 52, 53, 54, 57, 61, 65,
+                    69, 73, 77, 81, 84, 90, 91, 92,
+                ],
+            ),
+            (
+                "fixed_scalar_syscall",
+                vec![
+                    0, 1, 8, 11, 14, 16, 24, 27, 30, 36, 37, 38, 46, 49, 52, 58, 59, 60,
+                ],
+            ),
+        ] {
+            let w = &record.wrappers[role];
+            let body = &code[&w.function.address];
+            let ins = instructions(w.function.address, body, &offsets);
+            let edges = vec![w.fixed_transfer.clone(), w.legacy_transfer.clone()];
+            fixed_census_transfers(&ins, w.function.address, body, &edges, &got, false).unwrap();
+            if role == "fixed_scalar_syscall" {
+                let helpers = BTreeSet::from([0x1200]);
+                // The real gate11 failure: ordinary preparation does not confer
+                // the independently qualified fixed owner's target authority.
+                assert!(preparation_transfers(&ins, &got, &helpers).is_err());
+                let observed = fixed_setup_preparation_transfers(
+                    role,
+                    &w.function,
+                    &ins,
+                    &got,
+                    &helpers,
+                    Some(&native),
+                )
+                .unwrap();
+                assert_eq!(observed.0, edges);
+                assert_eq!(
+                    observed.1,
+                    vec![
+                        GotEdge {
+                            source_function: 0x1500,
+                            instruction: 0x151e,
+                            slot: 0x5008,
+                            target_function: 0x1300
+                        },
+                        GotEdge {
+                            source_function: 0x1500,
+                            instruction: 0x1534,
+                            slot: 0x5010,
+                            target_function: 0x1200
+                        },
+                    ]
+                );
+                assert_eq!(helpers, BTreeSet::from([0x1200]));
+                assert!(
+                    fixed_setup_preparation_transfers(
+                        role,
+                        &w.function,
+                        &ins,
+                        &got,
+                        &helpers,
+                        None,
+                    )
+                    .is_err()
+                );
+                for wrong_role in ["from_native", "fixed_arena_setup", FIXED_NATIVE_RAW6] {
+                    assert!(
+                        fixed_setup_preparation_transfers(
+                            wrong_role,
+                            &w.function,
+                            &ins,
+                            &got,
+                            &helpers,
+                            Some(&native),
+                        )
+                        .is_err()
+                    );
+                }
+                for mutation in 0..5 {
+                    let mut wrong = w.function.clone();
+                    match mutation {
+                        0 => wrong.name.push_str(".other"),
+                        1 => wrong.address += 1,
+                        2 => wrong.size -= 1,
+                        3 => wrong.binding = sym::STB_GLOBAL,
+                        _ => wrong.visibility = sym::STV_DEFAULT,
+                    }
+                    assert!(
+                        fixed_setup_preparation_transfers(
+                            role,
+                            &wrong,
+                            &ins,
+                            &got,
+                            &helpers,
+                            Some(&native),
+                        )
+                        .is_err()
+                    );
+                }
+                // Whole bytes and starting PC stay bound even when all control
+                // edges would otherwise retain their original identities.
+                for mutation in 0..7 {
+                    let mut changed = ins.clone();
+                    match mutation {
+                        0 => changed[0].bytes[0] ^= 1, // same-length non-transfer
+                        1 => changed[0].address += 1,
+                        2 => {
+                            changed.pop();
+                        }
+                        3 => {
+                            changed.remove(1);
+                        }
+                        4 => changed.push(EncodedConstructorInstruction {
+                            address: 0x153c,
+                            bytes: vec![0x90],
+                        }),
+                        5 => changed[8].bytes = vec![0xff, 0xd0], // register CALL
+                        _ => changed[8].bytes = vec![0x0f, 0x05], // raw SYSCALL
+                    }
+                    assert!(
+                        fixed_setup_preparation_transfers(
+                            role,
+                            &w.function,
+                            &changed,
+                            &got,
+                            &helpers,
+                            Some(&native),
+                        )
+                        .is_err(),
+                        "accepted scalar setup instruction mutation {mutation}"
+                    );
+                }
+                for target in [0x1301, 0x1800, 0x1200] {
+                    let mut changed_got = got.clone();
+                    changed_got.insert(0x5008, target);
+                    assert!(
+                        fixed_setup_preparation_transfers(
+                            role,
+                            &w.function,
+                            &ins,
+                            &changed_got,
+                            &helpers,
+                            Some(&native),
+                        )
+                        .is_err()
+                    );
+                }
+                let mut missing_got = got.clone();
+                missing_got.remove(&0x5008);
+                assert!(
+                    fixed_setup_preparation_transfers(
+                        role,
+                        &w.function,
+                        &ins,
+                        &missing_got,
+                        &helpers,
+                        Some(&native),
+                    )
+                    .is_err()
+                );
+                // Another slot resolving the same complete target is not the
+                // qualified wrapper's actual CALL, despite equal target names.
+                let mut alternate = ins.clone();
+                alternate[8].bytes[2..6]
+                    .copy_from_slice(&i32::try_from(0x5030_i64 - 0x1524).unwrap().to_le_bytes());
+                let mut alternate_got = got.clone();
+                alternate_got.insert(0x5030, 0x1300);
+                assert!(
+                    fixed_setup_preparation_transfers(
+                        role,
+                        &w.function,
+                        &alternate,
+                        &alternate_got,
+                        &helpers,
+                        Some(&native),
+                    )
+                    .is_err()
+                );
+                // An unrelated context must not change ordinary preparation
+                // acceptance or produce different retained transfer evidence.
+                let mut call = vec![0xff, 0x15];
+                call.extend_from_slice(&i32::try_from(0x5010_i64 - 0x1806).unwrap().to_le_bytes());
+                let ordinary = vec![
+                    EncodedConstructorInstruction {
+                        address: 0x1800,
+                        bytes: call,
+                    },
+                    EncodedConstructorInstruction {
+                        address: 0x1806,
+                        bytes: vec![0xc3],
+                    },
+                ];
+                let legacy = preparation_transfers(&ordinary, &got, &helpers).unwrap();
+                for context in [None, Some(&native)] {
+                    assert_eq!(
+                        fixed_setup_preparation_transfers(
+                            "from_native",
+                            &w.function,
+                            &ordinary,
+                            &got,
+                            &helpers,
+                            context,
+                        )
+                        .unwrap(),
+                        legacy
+                    );
+                }
+            }
+            for bad_edges in [
+                vec![],
+                vec![edges[0].clone()],
+                vec![edges[0].clone(), edges[0].clone()],
+                vec![edges[1].clone(), edges[1].clone()],
+            ] {
+                assert!(
+                    fixed_census_transfers(&ins, w.function.address, body, &bad_edges, &got, false)
+                        .is_err()
+                );
+            }
+            let mut gap = ins.clone();
+            gap.remove(1);
+            assert!(
+                fixed_census_transfers(&gap, w.function.address, body, &edges, &got, false)
+                    .is_err()
+            );
+        }
+        let owner_ins = instructions(
+            0x1300,
+            &code[&0x1300],
+            &[0, 4, 6, 13, 16, 19, 22, 25, 28, 31, 36, 46, 49, 53, 55, 56],
+        );
+        fixed_native_owner_census(&code[&0x1300], &owner_ins, record).unwrap();
+        let mut missing = owner_ins.clone();
+        missing.remove(11);
+        assert!(fixed_native_owner_census(&code[&0x1300], &missing, record).is_err());
+        let mut changed = owner_ins.clone();
+        changed[11].bytes[0] ^= 1;
+        assert!(fixed_native_owner_census(&code[&0x1300], &changed, record).is_err());
+        for address in [0x1300, 0x1400, 0x1500] {
+            let mut absent = code.clone();
+            absent.remove(&address);
+            assert!(qualify_fixed_native_syscalls(&elf, &bytes, &absent, &got, &roles).is_err());
+            let mut retained = code.clone();
+            retained.get_mut(&address).unwrap()[0] ^= 1;
+            assert!(qualify_fixed_native_syscalls(&elf, &bytes, &retained, &got, &roles).is_err());
+        }
+        let mut incomplete = roles.clone();
+        incomplete.remove(FIXED_NATIVE_OWNER);
+        assert!(qualify_fixed_native_syscalls(&elf, &bytes, &code, &got, &incomplete).is_err());
+        let mut wrong_got = got.clone();
+        wrong_got.insert(0x5008, 0x1301);
+        assert!(qualify_fixed_native_syscalls(&elf, &bytes, &code, &wrong_got, &roles).is_err());
+        // Every literal byte and each masked operand remains sensitive. Changed
+        // physical bytes are re-collected; hash mismatch is not the refusal.
+        for (address, size) in [(0x1300, 56), (0x1400, 92), (0x1500, 60)] {
+            for offset in 0..size {
+                let mut bad = bytes.clone();
+                bad[address + offset] ^= 1;
+                assert!(
+                    qualify(&bad).is_err(),
+                    "native body accepted byte {address:#x}+{offset:#x}"
+                );
+            }
+        }
+        // Full raw static/dynamic census, non-RX, extent, symbol type and binding.
+        for row in [0x37d8, 0x37f0, 0x3808] {
+            for (at, width, value) in [
+                (4, 1, 1),
+                (4, 1, 0x12),
+                (5, 1, 0),
+                (6, 2, 2),
+                (16, 8, 0),
+                (16, 8, 1),
+                (8, 8, u64::MAX),
+            ] {
+                let mut bad = bytes.clone();
+                put(&mut bad, row + at, width, value);
+                assert!(
+                    qualify(&bad).is_err(),
+                    "accepted native symbol metadata row {row:#x} +{at:#x}, width {width}, value {value:#x}"
+                );
+            }
+            let mut duplicate = bytes.clone();
+            duplicate.copy_within(row..row + 24, 0x37c0);
+            assert!(qualify(&duplicate).is_err());
+            let mut dynamic = bytes.clone();
+            dynamic.copy_within(row..row + 24, 0x3418);
+            assert!(qualify(&dynamic).is_err());
+            let mut alias = bytes.clone();
+            put(&mut alias, 0x37c4, 1, 2);
+            put(&mut alias, 0x37c6, 2, 1);
+            let start = u64::from_le_bytes(bytes[row + 8..row + 16].try_into().unwrap());
+            put(&mut alias, 0x37c8, 8, start + 1);
+            put(&mut alias, 0x37d0, 8, 0);
+            assert!(qualify(&alias).is_err());
+        }
+        // Both publication and function pointer routes authenticate the entire
+        // writer extent, exact addend and full protected slot mapping.
+        for row in [0x3600, 0x3618, 0x3630] {
+            for (at, value) in [
+                (0, 0x5001),
+                (8, 1),
+                (8, 6),
+                (8, (1_u64 << 32) | 8),
+                (16, 0x6101),
+                (16, u64::MAX),
+            ] {
+                let mut bad = bytes.clone();
+                put(&mut bad, row + at, 8, value);
+                assert!(qualify(&bad).is_err());
+            }
+            let mut duplicate = bytes.clone();
+            duplicate.copy_within(row..row + 24, 0x3648);
+            put(&mut duplicate, 0x5168, 8, 96);
+            put(&mut duplicate, 0x81e0, 8, 96);
+            assert!(qualify(&duplicate).is_err());
+        }
+        for (at, width, value) in [
+            (0x3734, 1, 2),
+            (0x3736, 2, 2),
+            (0x3740, 8, 7),
+            (64 + 4 * 56 + 40, 8, 0xff8),
+            (64 + 56 + 4, 4, 4),
+        ] {
+            let mut bad = bytes.clone();
+            put(&mut bad, at, width, value);
+            assert!(qualify(&bad).is_err());
+        }
+        // Actual loader registration to each new start/interior is refused by
+        // the same native range checker, with complete fixed owner coverage.
+        let scope =
+            selected_function_ranges(&elf, roles.values().map(|s| s.st_value).collect()).unwrap();
+        let registration_roles: BTreeSet<_> = scope
+            .iter()
+            .flat_map(|(&start, &size)| start..start + size)
+            .collect();
+        for address in [0x1300, 0x1301, 0x1400, 0x1401, 0x1500, 0x1501] {
+            let mut bad = bytes.clone();
+            put(&mut bad, 0x5200, 8, address);
+            assert!(
+                native_no_loader_registration(&Elf::parse(&bad).unwrap(), &bad, &scope).is_err()
+            );
+            assert!(
+                generic_no_init_registration(&Elf::parse(&bad).unwrap(), &bad, &registration_roles)
+                    .is_err()
+            );
+        }
+        // Preserve the original forty-entry index contract: neither new native
+        // wrapper can be credited as its old validate shape.
+        assert_eq!(DETCORE_VALIDATE_TEMPLATES[13].role, FIXED_NATIVE_RAW6);
+        assert_eq!(fixed_hex(DETCORE_VALIDATE_TEMPLATES[13].hex).len(), 39);
+        assert_eq!(DETCORE_VALIDATE_TEMPLATES[26].role, "fixed_scalar_syscall");
+        assert_eq!(fixed_hex(DETCORE_VALIDATE_TEMPLATES[26].hex).len(), 23);
+        assert!(!fixed_template_shape(
+            &code[&0x1400],
+            &fixed_hex(DETCORE_VALIDATE_TEMPLATES[13].hex),
+            [33].into_iter()
+        ));
+        assert!(!fixed_template_shape(
+            &code[&0x1500],
+            &fixed_hex(DETCORE_VALIDATE_TEMPLATES[26].hex),
+            [17].into_iter()
+        ));
+        // Structural serialization is distinct from actual ELF qualification.
+        let encoded = serde_json::to_value(record).unwrap();
+        assert_eq!(
+            serde_json::from_value::<FixedNativeSyscallsEvidence>(encoded.clone()).unwrap(),
+            *record
+        );
+        let mut unknown = encoded.clone();
+        unknown["unknown"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<FixedNativeSyscallsEvidence>(unknown).is_err());
+        let mut backing = baseline.clone();
+        backing.fixed_native_syscalls = Some(record.clone());
+        for (role, w) in &record.wrappers {
+            backing.functions.insert(role.clone(), w.function.clone());
+            backing
+                .function_sha256
+                .insert(role.clone(), w.function_sha256.clone());
+            backing.allocator_transfers.insert(
+                role.clone(),
+                vec![w.fixed_transfer.clone(), w.legacy_transfer.clone()],
+            );
+        }
+        backing
+            .functions
+            .insert(FIXED_NATIVE_OWNER.into(), record.owner.clone());
+        backing
+            .function_sha256
+            .insert(FIXED_NATIVE_OWNER.into(), record.owner_sha256.clone());
+        backing.allocator_transfers.insert(
+            FIXED_NATIVE_OWNER.into(),
+            vec![record.page_transfer.clone()],
+        );
+        backing.functions.insert(
+            CONSTRUCTOR_GATE_OWNER.into(),
+            symbol_evidence(CONSTRUCTOR_GATE_OWNER, &roles[CONSTRUCTOR_GATE_OWNER]),
+        );
+        // Independently retain the miniature ELF's scalar CALL operands. These
+        // literal addresses/slots come from fixture(0), not a validator-produced
+        // setup list; actual qualification above separately binds the record.
+        let scalar = &record.wrappers["fixed_scalar_syscall"];
+        assert_eq!(scalar.function.address, 0x1500);
+        let scalar_setup = vec![
+            ConstructorTransfer {
+                instruction: 0x151e,
+                target: 0x1300,
+                local_got_slot: Some(0x5008),
+            },
+            ConstructorTransfer {
+                instruction: 0x1534,
+                target: 0x1200,
+                local_got_slot: Some(0x5010),
+            },
+        ];
+        assert_eq!(
+            scalar_setup,
+            vec![
+                scalar.fixed_transfer.clone(),
+                scalar.legacy_transfer.clone()
+            ]
+        );
+        backing
+            .owned_setup_transfers
+            .insert("fixed_scalar_syscall".into(), scalar_setup);
+        // A structural ordinary edge whose source AND instruction lie outside
+        // the scalar's [0x1500, 0x153c) extent must survive the finite join. This
+        // does not claim a physically emitted ordinary route or ELF admission.
+        let unrelated_ordinary = GotEdge {
+            source_function: 0x1800,
+            instruction: 0x1810,
+            slot: 0x5020,
+            target_function: 0x1200,
+        };
+        backing.owned_setup_got_edges.extend([
+            unrelated_ordinary.clone(),
+            GotEdge {
+                source_function: 0x1500,
+                instruction: 0x151e,
+                slot: 0x5008,
+                target_function: 0x1300,
+            },
+            GotEdge {
+                source_function: 0x1500,
+                instruction: 0x1534,
+                slot: 0x5010,
+                target_function: 0x1200,
+            },
+        ]);
+        validate_fixed_native_syscall_evidence(&backing, FixedImageKind::Detcore).unwrap();
+        // Retained evidence is not allowed to omit or forge either actual
+        // scalar branch. On the pre-fix checker these assertions are genuinely
+        // red because validate_fixed_native_syscall_evidence ignores both
+        // owned_setup collections; the existing positive above still passes.
+        #[derive(Clone, Copy, Debug)]
+        enum RetainedSetupMutation {
+            RemoveTransferMap,
+            RemoveTransfer(usize),
+            TransferInstruction(usize),
+            TransferSlot(usize),
+            TransferTarget(usize),
+            DuplicateTransfer(usize),
+            ReorderTransfers,
+            RemoveScalarGot,
+            RemoveGot(usize),
+            GotSource(usize),
+            GotInstruction(usize),
+            GotSlot(usize),
+            GotTarget(usize),
+            DuplicateGot(usize),
+            ReorderGot,
+            ForgedSourceDuplicateAtActualInstruction(usize),
+            ScalarSourceWithForeignInstruction,
+        }
+        for mutation in [
+            RetainedSetupMutation::RemoveTransferMap,
+            RetainedSetupMutation::RemoveTransfer(0),
+            RetainedSetupMutation::RemoveTransfer(1),
+            RetainedSetupMutation::TransferInstruction(0),
+            RetainedSetupMutation::TransferInstruction(1),
+            RetainedSetupMutation::TransferSlot(0),
+            RetainedSetupMutation::TransferSlot(1),
+            RetainedSetupMutation::TransferTarget(0),
+            RetainedSetupMutation::TransferTarget(1),
+            RetainedSetupMutation::DuplicateTransfer(0),
+            RetainedSetupMutation::DuplicateTransfer(1),
+            RetainedSetupMutation::ReorderTransfers,
+            RetainedSetupMutation::RemoveScalarGot,
+            RetainedSetupMutation::RemoveGot(0),
+            RetainedSetupMutation::RemoveGot(1),
+            RetainedSetupMutation::GotSource(0),
+            RetainedSetupMutation::GotSource(1),
+            RetainedSetupMutation::GotInstruction(0),
+            RetainedSetupMutation::GotInstruction(1),
+            RetainedSetupMutation::GotSlot(0),
+            RetainedSetupMutation::GotSlot(1),
+            RetainedSetupMutation::GotTarget(0),
+            RetainedSetupMutation::GotTarget(1),
+            RetainedSetupMutation::DuplicateGot(0),
+            RetainedSetupMutation::DuplicateGot(1),
+            RetainedSetupMutation::ReorderGot,
+            RetainedSetupMutation::ForgedSourceDuplicateAtActualInstruction(0),
+            RetainedSetupMutation::ForgedSourceDuplicateAtActualInstruction(1),
+            RetainedSetupMutation::ScalarSourceWithForeignInstruction,
+        ] {
+            let mut bad = backing.clone();
+            match mutation {
+                RetainedSetupMutation::RemoveTransferMap => {
+                    bad.owned_setup_transfers.remove("fixed_scalar_syscall");
+                }
+                RetainedSetupMutation::RemoveTransfer(index) => {
+                    bad.owned_setup_transfers
+                        .get_mut("fixed_scalar_syscall")
+                        .unwrap()
+                        .remove(index);
+                }
+                RetainedSetupMutation::TransferInstruction(index) => {
+                    bad.owned_setup_transfers
+                        .get_mut("fixed_scalar_syscall")
+                        .unwrap()[index]
+                        .instruction += 1;
+                }
+                RetainedSetupMutation::TransferSlot(index) => {
+                    bad.owned_setup_transfers
+                        .get_mut("fixed_scalar_syscall")
+                        .unwrap()[index]
+                        .local_got_slot = None;
+                }
+                RetainedSetupMutation::TransferTarget(index) => {
+                    bad.owned_setup_transfers
+                        .get_mut("fixed_scalar_syscall")
+                        .unwrap()[index]
+                        .target += 1;
+                }
+                RetainedSetupMutation::DuplicateTransfer(index) => {
+                    let transfers = bad
+                        .owned_setup_transfers
+                        .get_mut("fixed_scalar_syscall")
+                        .unwrap();
+                    transfers.push(transfers[index].clone());
+                }
+                RetainedSetupMutation::ReorderTransfers => {
+                    bad.owned_setup_transfers
+                        .get_mut("fixed_scalar_syscall")
+                        .unwrap()
+                        .swap(0, 1);
+                }
+                RetainedSetupMutation::RemoveScalarGot => {
+                    bad.owned_setup_got_edges = vec![unrelated_ordinary.clone()];
+                }
+                RetainedSetupMutation::RemoveGot(index) => {
+                    bad.owned_setup_got_edges.remove(1 + index);
+                }
+                RetainedSetupMutation::GotSource(index) => {
+                    bad.owned_setup_got_edges[1 + index].source_function += 1;
+                }
+                RetainedSetupMutation::GotInstruction(index) => {
+                    bad.owned_setup_got_edges[1 + index].instruction += 1;
+                }
+                RetainedSetupMutation::GotSlot(index) => {
+                    bad.owned_setup_got_edges[1 + index].slot += 8;
+                }
+                RetainedSetupMutation::GotTarget(index) => {
+                    bad.owned_setup_got_edges[1 + index].target_function += 1;
+                }
+                RetainedSetupMutation::DuplicateGot(index) => {
+                    let duplicate = bad.owned_setup_got_edges[1 + index].clone();
+                    bad.owned_setup_got_edges.push(duplicate);
+                }
+                RetainedSetupMutation::ReorderGot => {
+                    bad.owned_setup_got_edges.swap(1, 2);
+                }
+                RetainedSetupMutation::ForgedSourceDuplicateAtActualInstruction(index) => {
+                    // Keep the genuine edge and append an extra forged source
+                    // at the exact genuine scalar CALL IP. A source-only filter
+                    // would discard this extra row and incorrectly accept it.
+                    let mut forged = bad.owned_setup_got_edges[1 + index].clone();
+                    forged.source_function = 0x1800;
+                    bad.owned_setup_got_edges.push(forged);
+                }
+                RetainedSetupMutation::ScalarSourceWithForeignInstruction => {
+                    // Conversely, a scalar-sourced extra row outside its actual
+                    // extent must not disappear under an instruction-only join.
+                    let mut forged = unrelated_ordinary.clone();
+                    forged.source_function = 0x1500;
+                    bad.owned_setup_got_edges.push(forged);
+                }
+            }
+            assert!(
+                validate_fixed_native_syscall_evidence(&bad, FixedImageKind::Detcore).is_err(),
+                "accepted retained scalar setup mutation {mutation:?}"
+            );
+        }
+        assert!(
+            validate_fixed_native_syscall_evidence(&backing, FixedImageKind::Standalone).is_err()
+        );
+        join_fixed_native_syscalls(&backing, Some(&gate)).unwrap();
+        assert!(join_fixed_native_syscalls(&backing, None).is_err());
+        let mut stripped = backing.clone();
+        stripped.fixed_native_syscalls = None;
+        assert!(
+            validate_fixed_native_syscall_evidence(&stripped, FixedImageKind::Detcore).is_err()
+        );
+        assert!(join_fixed_native_syscalls(&stripped, Some(&gate)).is_err());
+        for mutation in 0..12 {
+            let mut bad = backing.clone();
+            let r = bad.fixed_native_syscalls.as_mut().unwrap();
+            match mutation {
+                0 => r.version = 2,
+                1 => r.owner_sha256 = "x".repeat(64),
+                2 => r.continuation += 1,
+                3 => r.page_transfer.target += 1,
+                4 => r.page_transfer.instruction += 1,
+                5 => {
+                    r.wrappers.remove(FIXED_NATIVE_RAW6);
+                }
+                6 => r.owner.address += 1,
+                7 => {
+                    r.wrappers
+                        .get_mut(FIXED_NATIVE_RAW6)
+                        .unwrap()
+                        .zero_branch_target += 1
+                }
+                8 => {
+                    r.wrappers
+                        .get_mut(FIXED_NATIVE_RAW6)
+                        .unwrap()
+                        .publication_slot += 1
+                }
+                9 => {
+                    r.wrappers
+                        .get_mut(FIXED_NATIVE_RAW6)
+                        .unwrap()
+                        .fixed_transfer
+                        .target += 1
+                }
+                10 => {
+                    r.wrappers
+                        .get_mut(FIXED_NATIVE_RAW6)
+                        .unwrap()
+                        .legacy_transfer
+                        .instruction += 1
+                }
+                _ => {
+                    r.wrappers
+                        .get_mut(FIXED_NATIVE_RAW6)
+                        .unwrap()
+                        .function_sha256 = "f".repeat(64)
+                }
+            }
+            assert!(validate_fixed_native_syscall_evidence(&bad, FixedImageKind::Detcore).is_err());
+        }
+        for mutation in 0..2 {
+            let mut bad = backing.clone();
+            let r = bad.fixed_native_syscalls.as_mut().unwrap();
+            if mutation == 0 {
+                r.publication_address += 8;
+            } else {
+                r.template_sha256 = "f".repeat(64);
+            }
+            assert!(join_fixed_native_syscalls(&bad, Some(&gate)).is_err());
+        }
+    }
+
+    fn fixed_native_gate_controls() -> FixedNativeGateEvidence {
+        fn put(bytes: &mut [u8], offset: usize, width: usize, value: u64) {
+            bytes[offset..offset + width].copy_from_slice(&value.to_le_bytes()[..width]);
+        }
+        fn relative(bytes: &mut [u8], at: usize, next: u64, target: u64) {
+            let delta = i32::try_from(target as i64 - next as i64).unwrap();
+            bytes[at..at + 4].copy_from_slice(&delta.to_le_bytes());
+        }
+
+        fn qualify(bytes: &[u8]) -> Result<FixedNativeGateEvidence> {
+            let elf = Elf::parse(bytes).map_err(|e| e.to_string())?;
+            let mut roles = BTreeMap::from([(
+                CONSTRUCTOR_GATE_OWNER.into(),
+                private_function(&elf, CONSTRUCTOR_GATE_OWNER)?,
+            )]);
+            add_fixed_native_selector(&elf, &mut roles)?;
+            require_disjoint_bootstrap_roles(&roles)?;
+            let ranges =
+                selected_function_ranges(&elf, roles.values().map(|s| s.st_value).collect())?;
+            require(
+                ranges.get(&0x1100) == Some(&31),
+                "physical fixture lost selector scope",
+            )?;
+            let code = proof_function_bytes(&elf, bytes, &ranges)?;
+            qualify_fixed_native_gate(&elf, bytes, &code, 0x1220)?
+                .ok_or("missing fixed physical route".into())
+        }
+        let bytes = fixed_native_gate_fixture();
+        let record = qualify(&bytes).unwrap();
+        assert_eq!(record.selector.address, 0x1100);
+        assert_eq!(record.publication.address, 0x6100);
+        assert_eq!(record.unpublished_transfer.target, 0x1220);
+        assert_eq!(record.fixed_entry, FIXED_NATIVE_ENTRY);
+        assert_eq!(record.template_bytes.size, 4096);
+        let page_digest = fixed_native_digest(&record.template_bytes.sha256).unwrap();
+        record.verify_bootstrap_page_digest(&page_digest).unwrap();
+        let elf = Elf::parse(&bytes).unwrap();
+        let legacy = symbol_evidence(
+            CONSTRUCTOR_GATE,
+            &constructor_interior_label(
+                &elf,
+                CONSTRUCTOR_GATE,
+                &private_function(&elf, CONSTRUCTOR_GATE_OWNER).unwrap(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            native_bridge_gate_address(Some(&record), &legacy).unwrap(),
+            0x1100
+        );
+        assert_eq!(native_bridge_gate_address(None, &legacy).unwrap(), 0x1220);
+        for origin in [
+            NativeDispatchOrigin::Constructor,
+            NativeDispatchOrigin::ExplicitGeneric,
+        ] {
+            let mut bridge = native_template(origin);
+            let mut fields = vec![
+                (0x34, 0x9000, 0x38),
+                (0x71, 0x1100, 0x75),
+                (0xab, 0x1100, 0xaf),
+                (0xd9, 0x1100, 0xdd),
+                (0x186, 0x1100, 0x18a),
+                (0x1bc, 0x1100, 0x1c0),
+                (0x1e0, 0xb000, 0x1e4),
+                (0x219, 0x9000, 0x21e),
+            ];
+            match origin {
+                NativeDispatchOrigin::Constructor => {
+                    fields.extend([(0x29f, 0x1100, 0x2a3), (0x2b9, 0x1100, 0x2bd)])
+                }
+                NativeDispatchOrigin::ExplicitGeneric => fields.push((0x293, 0x1100, 0x297)),
+            }
+            for (offset, target, next) in fields {
+                relative(&mut bridge, offset, 0x7000 + next, target);
+            }
+            let admitted = native_dispatch_bridge(
+                &bridge,
+                0x7000,
+                0x9000,
+                native_bridge_gate_address(Some(&record), &legacy).unwrap(),
+                0xb000,
+                origin,
+            )
+            .unwrap();
+            assert_eq!(admitted.terminal_exit.target, record.selector.address);
+            assert!(
+                native_dispatch_bridge(&bridge, 0x7000, 0x9000, legacy.address, 0xb000, origin)
+                    .is_err()
+            );
+        }
+        let scope = BTreeMap::from([
+            (0x1100, bytes[0x1100..0x111f].to_vec()),
+            (0x1200, CONSTRUCTOR_GATE_OWNER_BYTES.to_vec()),
+        ]);
+        let mut omitted = scope.clone();
+        omitted.remove(&0x1100);
+        assert!(qualify_fixed_native_gate(&elf, &bytes, &omitted, 0x1220).is_err());
+        let mut changed = scope.clone();
+        changed.get_mut(&0x1100).unwrap()[0] ^= 1;
+        assert!(qualify_fixed_native_gate(&elf, &bytes, &changed, 0x1220).is_err());
+        assert!(qualify_fixed_native_gate(&elf, &bytes, &scope, 0x1221).is_err());
+        let registration_roles: BTreeSet<_> = (0x1100..0x111f).collect();
+        generic_no_init_registration(&elf, &bytes, &registration_roles).unwrap();
+        let mut registered = bytes.clone();
+        put(&mut registered, 0x3600, 8, 0x5200);
+        put(&mut registered, 0x3610, 8, 0x1101);
+        let registered_elf = Elf::parse(&registered).unwrap();
+        assert!(
+            generic_no_init_registration(&registered_elf, &registered, &registration_roles)
+                .is_err()
+        );
+        // Exact legacy None is still derived only by complete raw absence.
+        let mut legacy_only = bytes.clone();
+        put(&mut legacy_only, 0x3700 + 24, 4, 0);
+        assert!(
+            fixed_native_selector_symbol(&Elf::parse(&legacy_only).unwrap())
+                .unwrap()
+                .is_none()
+        );
+        for offset in 0x1100..0x111f {
+            let mut bad = bytes.clone();
+            bad[offset] ^= 1;
+            assert!(qualify(&bad).is_err(), "accepted selector byte {offset:#x}");
+        }
+        for offset in 0x207c..0x2085 {
+            let mut bad = bytes.clone();
+            bad[offset] ^= 1;
+            assert!(
+                qualify(&bad).is_err(),
+                "accepted native page ABI byte {offset:#x}"
+            );
+        }
+        // All other template bytes are retained by the full-page digest; a
+        // changed physical padding byte is not a new semantic recipe pass.
+        let mut bad_page = bytes.clone();
+        bad_page[0x2fff] ^= 1;
+        let different = qualify(&bad_page).unwrap();
+        assert_ne!(
+            different.template_bytes.sha256,
+            record.template_bytes.sha256
+        );
+        assert!(
+            different
+                .verify_bootstrap_page_digest(&page_digest)
+                .is_err()
+        );
+        for target in [0x1100, 0x111e, 0x6100, 0x6107, 0x2000, 0x2fff] {
+            let mut bad = bytes.clone();
+            put(&mut bad, 0x3600, 8, target);
+            assert!(qualify(&bad).is_err(), "accepted loader writer {target:#x}");
+        }
+        for (at, width, value) in [
+            (0x371c, 1, 0x12),
+            (0x371d, 1, 0),
+            (0x3728, 8, 0),
+            (0x3728, 8, 30),
+            (0x3728, 8, 32),
+            (0x371c, 1, 1),
+            (0x3720, 8, u64::MAX),
+            (0x3734, 1, 6),
+            (0x3738, 8, 0x6101),
+            (0x3740, 8, 7),
+            (0x3736, 2, 2),
+            (0x8044, 4, 8), // actual text section becomes NOBITS
+            (64 + 56 + 4, 4, 4),
+            (64 + 56 + 4, 4, 7),
+            (64 + 3 * 56 + 4, 4, 4),
+            (64 + 3 * 56 + 32, 8, 0x2000),
+            (0x8000 + 3 * 64 + 4, 4, 1),
+            (0x8000 + 3 * 64 + 8, 8, 0x403),
+            (0x3758, 8, 4095),
+            (0x3750, 8, 0x2001),
+            (0x3750, 8, 0x2100),
+            (0x8000 + 2 * 64 + 8, 8, 3),
+            (64 + 2 * 56 + 4, 4, 5),
+            (0x3768, 8, 0x3001),
+            (0x3766, 2, 1),
+        ] {
+            let mut bad = bytes.clone();
+            put(&mut bad, at, width, value);
+            assert!(
+                qualify(&bad).is_err(),
+                "accepted physical metadata mutation {at:#x}"
+            );
+        }
+        // Duplicate/malformed raw, alias and dynamic rows are refused before
+        // function/size filtering can discard the offending definition.
+        for info in [0, 1, 2, 0x12] {
+            let mut duplicate = bytes.clone();
+            duplicate[0x37c0..0x37c0 + 24].copy_from_slice(&bytes[0x3718..0x3730]);
+            put(&mut duplicate, 0x37c4, 1, info);
+            put(&mut duplicate, 0x37d0, 8, 0);
+            assert!(qualify(&duplicate).is_err());
+        }
+        let mut alias = bytes.clone();
+        put(&mut alias, 0x37c4, 1, 2);
+        put(&mut alias, 0x37c6, 2, 1);
+        put(&mut alias, 0x37c8, 8, 0x1101);
+        put(&mut alias, 0x37d0, 8, 1);
+        assert!(qualify(&alias).is_err());
+        let mut dynamic = bytes.clone();
+        dynamic[0x3418..0x3430].copy_from_slice(&bytes[0x3718..0x3730]);
+        assert!(qualify(&dynamic).is_err());
+        let mut malformed = bytes.clone();
+        let start = u32::from_le_bytes(bytes[0x3718..0x371c].try_into().unwrap()) as usize + 0x3100;
+        let end = bytes[start..].iter().position(|b| *b == 0).unwrap() + start;
+        // Use reserved string tail; same canonical path plus invalid LLVM suffix.
+        let name = format!(
+            "{}.llvm.bad",
+            std::str::from_utf8(&bytes[start..end]).unwrap()
+        );
+        malformed[0x3300..0x3300 + name.len()].copy_from_slice(name.as_bytes());
+        // A separate selector census can observe this raw spelling without
+        // manufacturing authenticated loader metadata for the changed string.
+        put(&mut malformed, 0x3718, 4, 0x200);
+        let string_size = (0x200 + name.len() + 1) as u64;
+        put(&mut malformed, 0x8120, 8, string_size);
+        put(&mut malformed, 0x5118, 8, string_size);
+        assert!(fixed_native_selector_name(&name));
+        assert!(fixed_native_selector_symbol(&Elf::parse(&malformed).unwrap()).is_err());
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(
+            serde_json::from_value::<FixedNativeGateEvidence>(value.clone()).unwrap(),
+            record
+        );
+        for required in [
+            "version",
+            "selector",
+            "selector_sha256",
+            "publication",
+            "publication_storage",
+            "publication_read_instruction",
+            "unpublished_transfer",
+            "published_transfer_instruction",
+            "fixed_entry",
+            "template_symbol",
+            "template_bytes",
+        ] {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(required);
+            assert!(serde_json::from_value::<FixedNativeGateEvidence>(missing).is_err());
+        }
+        let mut unknown = value;
+        unknown["legacy_gate"] = serde_json::json!(0x1100);
+        assert!(serde_json::from_value::<FixedNativeGateEvidence>(unknown).is_err());
+        for (field, value) in [
+            ("version", serde_json::json!(2)),
+            ("fixed_entry", serde_json::json!(0x5000_0000_007du64)),
+        ] {
+            let mut bad = serde_json::to_value(&record).unwrap();
+            bad[field] = value;
+            let bad: FixedNativeGateEvidence = serde_json::from_value(bad).unwrap();
+            assert!(bad.verify_bootstrap_page_digest(&page_digest).is_err());
+        }
+        for (field, value) in [
+            ("file_address", serde_json::json!(0x2000)),
+            (
+                "file_sha256",
+                serde_json::json!(record.template_bytes.sha256),
+            ),
+            ("relative_pointer_slot", serde_json::json!(0x2000)),
+        ] {
+            let mut bad = serde_json::to_value(&record).unwrap();
+            bad["template_bytes"][field] = value;
+            let bad: FixedNativeGateEvidence = serde_json::from_value(bad).unwrap();
+            assert!(bad.verify_bootstrap_page_digest(&page_digest).is_err());
+        }
+        for digest in [
+            String::new(),
+            "0".repeat(63),
+            "0".repeat(65),
+            "g".repeat(64),
+            "é".repeat(32),
+            "0".repeat(64),
+        ] {
+            let mut bad = record.clone();
+            bad.template_bytes.sha256 = digest;
+            assert!(bad.verify_bootstrap_page_digest(&page_digest).is_err());
+        }
+        for (symbol, size, address) in [
+            (true, 4095, 0x2000),
+            (false, 4095, 0x2000),
+            (true, 4096, 0x2001),
+            (false, 4096, 0x2001),
+        ] {
+            let mut bad = record.clone();
+            if symbol {
+                bad.template_symbol.size = size;
+                bad.template_symbol.address = address;
+            } else {
+                bad.template_bytes.size = size as usize;
+                bad.template_bytes.address = address;
+            }
+            assert!(bad.verify_bootstrap_page_digest(&page_digest).is_err());
+        }
+        let mut wrong = page_digest;
+        wrong[0] ^= 1;
+        assert!(record.verify_bootstrap_page_digest(&wrong).is_err());
+        for edit in 0..5 {
+            let mut bad = record.clone();
+            match edit {
+                0 => bad.publication_storage = "legacy".into(),
+                1 => bad.unpublished_transfer.target += 1,
+                2 => bad.unpublished_transfer.local_got_slot = Some(0x5000),
+                3 => bad.published_transfer_instruction += 1,
+                _ => bad.selector_sha256 = "x".repeat(64),
+            }
+            assert!(native_bridge_gate_address(Some(&bad), &legacy).is_err());
+            assert_ne!(qualify(&bytes).unwrap(), bad); // actual requalification
+        }
+        record
+    }
+
     fn native_dispatch_schema_controls() {
+        let fixed_record = fixed_native_gate_controls();
         let symbol = SymbolEvidence {
             name: "synthetic-parser-only".to_owned(),
             address: 0x1000,
@@ -35740,6 +39426,7 @@ mod tests {
             native_gate_owner: symbol.clone(),
             native_gate_return: symbol,
             native_gate_offset: 0,
+            fixed_native_gate: None,
             initializing_guard: 0,
             function_sha256: BTreeMap::new(),
             body_materialization: 0,
@@ -35770,6 +39457,22 @@ mod tests {
                 .to_owned(),
         };
         let encoded = serde_json::to_value(&proof).unwrap();
+        assert!(encoded.get("fixed_native_gate").is_none());
+        let mut fixed_proof = proof.clone();
+        fixed_proof.fixed_native_gate = Some(fixed_record);
+        let mut fixed_encoded = serde_json::to_value(&fixed_proof).unwrap();
+        assert_eq!(
+            serde_json::from_value::<GenericBootstrapEvidence>(fixed_encoded.clone()).unwrap(),
+            fixed_proof
+        );
+        fixed_encoded
+            .as_object_mut()
+            .unwrap()
+            .remove("fixed_native_gate");
+        let stripped: GenericBootstrapEvidence = serde_json::from_value(fixed_encoded).unwrap();
+        assert_eq!(stripped, proof);
+        assert_ne!(stripped, fixed_proof); // complete actual-record equality is required
+
         assert_eq!(
             serde_json::from_value::<GenericBootstrapEvidence>(encoded.clone()).unwrap(),
             proof
@@ -42620,7 +46323,10 @@ mod tests {
                 false,
             )
             .unwrap_or_else(|error| panic!("individual graph mask{mask} {role}: {error}"));
-            assert_eq!(witness.template_index, index);
+            assert_eq!(
+                witness.kind,
+                AuthenticatedDetcoreOperationKind::ValidateTemplate(index)
+            );
             transfers.insert(role.into(), witness.edges.clone());
             witnesses.insert(role.into(), witness);
             // Source-register, payload, receiver and span literals remain real
@@ -42942,7 +46648,10 @@ mod tests {
             };
             let witness =
                 qualify(&bytes).unwrap_or_else(|error| panic!("retained normal {role}: {error}"));
-            assert_eq!(witness.template_index, index);
+            assert_eq!(
+                witness.kind,
+                AuthenticatedDetcoreOperationKind::ValidateTemplate(index)
+            );
             for byte in 0..bytes.len() {
                 for bit in 0..8 {
                     let mut bad = bytes.clone();

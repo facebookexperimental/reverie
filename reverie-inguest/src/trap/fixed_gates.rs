@@ -30,10 +30,17 @@ const _: () = {
 };
 static PREPARING: AtomicBool = AtomicBool::new(false);
 
+// Keep the actual fixed-feature raw wrapper private to its qualified image.
+core::arch::global_asm!(
+    ".hidden {raw6}",
+    raw6 = sym super::raw_syscall6,
+);
+
 core::arch::global_asm!(
     r#"
     .hidden reverie_inguest_fixed_gates_published
-    .section .rodata.reverie_inguest_fixed_gate_template,"a",@progbits
+    // Keep unrelated string/retention flags from the linker's .rodata.* collection.
+    .section .reverie_inguest_fixed_gate_template,"a",@progbits
     .balign 4096
     .global reverie_inguest_fixed_gate_template
     .hidden reverie_inguest_fixed_gate_template
@@ -303,6 +310,15 @@ pub(super) unsafe fn adopt_authenticated_initial_page() -> io::Result<()> {
         return Err(io::Error::other("fixed gate adoption is not a fresh image"));
     }
     let _preparing = Preparing;
+    unsafe { verify_initial_page()? };
+    reverie_inguest_fixed_gates_published.store(1, Ordering::Release);
+    Ok(())
+}
+
+// Physical mechanism only. The controlled bootstrap owns this mapping and
+// filter before admission; checking it does not publish either runtime owner.
+#[cfg(feature = "exec-private-init")]
+pub(super) unsafe fn verify_initial_page() -> io::Result<()> {
     let rx = unsafe {
         crate::guest::support::scan_own_maps(|line| {
             let line = core::str::from_utf8(line).ok()?;
@@ -324,7 +340,6 @@ pub(super) unsafe fn adopt_authenticated_initial_page() -> io::Result<()> {
             return Err(io::Error::other("adopted fixed gate bytes differ"));
         }
     }
-    reverie_inguest_fixed_gates_published.store(1, Ordering::Release);
     Ok(())
 }
 

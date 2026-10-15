@@ -13,6 +13,7 @@ use core::sync::atomic::AtomicI32;
 use core::sync::atomic::Ordering;
 use std::io;
 use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -23,6 +24,16 @@ use reverie_rpc_transport::BlockingRpcClient;
 
 use crate::sync::SpinMutex;
 use crate::trap::raw_syscall6;
+
+mod stream;
+pub use stream::GuestRpcStream;
+
+#[cfg(feature = "exec-private-successor")]
+mod native;
+#[cfg(feature = "exec-private-successor")]
+pub use native::NativeFrameError;
+#[cfg(feature = "exec-private-successor")]
+pub use native::NativeFrameReply;
 
 /// Set in a freshly forked child by [`note_fork_in_child`]. The guest RPC hot
 /// path consults this flag instead of issuing a `getpid` syscall on every hop,
@@ -56,7 +67,7 @@ pub fn note_fork_in_child() {
 
 struct RpcConnection<G: GlobalTool> {
     pid: Pid,
-    client: BlockingRpcClient<G>,
+    client: BlockingRpcClient<G, GuestRpcStream>,
 }
 
 // TODO-HUMAN-REVIEW(PR-326): Review the common blocking
@@ -72,6 +83,8 @@ pub struct CoordinatorRpc<G: GlobalTool> {
     path: PathBuf,
     fd: AtomicI32,
     on_reconnect: ReconnectHook,
+    #[cfg(feature = "exec-private-successor")]
+    native_failed: AtomicBool,
 }
 
 /// Called when a forked child replaces its inherited connection with its own,
@@ -96,7 +109,7 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
     /// later supported forks keep the ordinary lazy reconnect protocol.
     pub fn from_live_client(
         path: impl AsRef<Path>,
-        client: BlockingRpcClient<G>,
+        client: BlockingRpcClient<G, GuestRpcStream>,
         on_reconnect: ReconnectHook,
     ) -> io::Result<Self> {
         let pid = current_id(libc::SYS_getpid)?;
@@ -123,6 +136,8 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
             path: path.as_ref().to_path_buf(),
             fd: AtomicI32::new(fd),
             on_reconnect,
+            #[cfg(feature = "exec-private-successor")]
+            native_failed: AtomicBool::new(false),
         })
     }
 
@@ -133,7 +148,7 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
         let path = path.as_ref().to_path_buf();
         let pid = current_id(libc::SYS_getpid)?;
         let tid = current_id(libc::SYS_gettid)?;
-        let client: BlockingRpcClient<G> = BlockingRpcClient::connect(&path, tid)
+        let client = connect_ordinary::<G>(&path, tid)
             .map_err(|error| io::Error::other(describe_rpc_error(&error)))?;
         let config = client.config().clone();
         let fd = client.as_raw_fd();
@@ -143,6 +158,8 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
             path,
             fd: AtomicI32::new(fd),
             on_reconnect,
+            #[cfg(feature = "exec-private-successor")]
+            native_failed: AtomicBool::new(false),
         })
     }
 }
@@ -174,16 +191,26 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
         mut connection: crate::sync::SpinGuard<'_, RpcConnection<G>>,
         message: G::Request,
     ) -> G::Response {
+        #[cfg(feature = "exec-private-successor")]
+        if self.native_failed.load(Ordering::Acquire) {
+            rpc_fatal(123);
+        }
         // Fork detection without a per-hop syscall: the common round-trip only
         // reads the atfork flag. It is set exclusively in a freshly forked
         // child, so `getpid`/`gettid` are issued only when a fork has actually
         // happened and the inherited connection may still belong to the parent.
         if FORKED_SINCE_LAST_RPC.swap(false, Ordering::AcqRel) {
+            // Both installed private domains already refuse fork/thread. A
+            // retained native stream can never reconnect as ordinary I/O.
+            #[cfg(feature = "exec-private-init")]
+            if super::exec_private::active() {
+                rpc_fatal(123);
+            }
             let pid = current_id(libc::SYS_getpid).unwrap_or_else(|_| rpc_fatal(122));
             if connection.pid != pid {
                 let tid = current_id(libc::SYS_gettid).unwrap_or_else(|_| rpc_fatal(122));
                 let client =
-                    BlockingRpcClient::connect(&self.path, tid).unwrap_or_else(|_| rpc_fatal(123));
+                    connect_ordinary::<G>(&self.path, tid).unwrap_or_else(|_| rpc_fatal(123));
                 let new_fd = client.as_raw_fd();
                 let old_fd = self.fd.swap(new_fd, Ordering::AcqRel);
                 (self.on_reconnect)(old_fd, new_fd).unwrap_or_else(|_| rpc_fatal(123));
@@ -218,6 +245,13 @@ pub fn describe_rpc_error(error: &reverie_rpc_transport::RpcError) -> String {
         ),
         other => other.to_string(),
     }
+}
+
+fn connect_ordinary<G: GlobalTool>(
+    path: &Path,
+    tid: Pid,
+) -> Result<BlockingRpcClient<G, GuestRpcStream>, reverie_rpc_transport::RpcError> {
+    BlockingRpcClient::from_connected_stream(GuestRpcStream::from(UnixStream::connect(path)?), tid)
 }
 
 fn current_id(number: i64) -> io::Result<Pid> {

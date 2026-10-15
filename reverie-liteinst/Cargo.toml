@@ -26,6 +26,12 @@ allocator-fixture = ["reverie-inguest/allocator-fixture"]
 fixed-syscall-gates = ["reverie-inguest/fixed-syscall-gates"]
 # Private GNU loader InitialImage experiment; no successor exec admission.
 exec-private-init = ["fixed-syscall-gates", "reverie-inguest/exec-private-init"]
+# Inactive bounded native statistics transfer; no existing caller enables it.
+native-exec-state = ["exec-private-init", "reverie-inguest/native-exec-state"]
+# Inactive explicit successor installer; ordinary entry points stay unchanged.
+exec-private-successor = ["exec-private-init", "native-exec-state", "reverie-inguest/exec-private-successor"]
+# Explicit authenticated driver installation; no constructor or environment activation.
+exec-native-injection = ["exec-private-successor", "reverie-inguest/exec-native-injection"]
 
 
 [[bin]]
@@ -60,6 +66,8 @@ tempfile = "3.27.0"
 tracing = "0.1.41"
 
 [dev-dependencies]
+# Cross-crate tests inspect the actual shared collector without exposing fields.
+reverie-inguest = { version = "0.4.1", path = "../reverie-inguest", default-features = false, features = ["native-exec-state-fixture"] }
 goblin = "=0.10.7"
 safeptrace = { version = "0.4.1", path = "../safeptrace" }
 sha2 = "0.10.9"

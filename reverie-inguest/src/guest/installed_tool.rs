@@ -36,6 +36,12 @@ trait ToolHandler: Send + Sync {
         context: &mut RegisterContext,
     );
     fn rpc(&self) -> &dyn std::any::Any;
+    #[cfg(feature = "exec-private-successor")]
+    fn run_successor_post_exec(
+        &self,
+        entry: &mut super::exec_private::ImageGuestEntry,
+        control: &super::exec_private::SuccessorImageControl,
+    ) -> io::Result<()>;
     #[cfg(feature = "exec-private-init")]
     unsafe fn bind_initial_image(&self, control: &InitialImageControl) -> io::Result<()>;
     #[cfg(feature = "exec-private-init")]
@@ -61,6 +67,15 @@ impl<T: Tool + 'static, R: HostRuntime> ToolHandler for ToolHost<T, R> {
 
     fn rpc(&self) -> &dyn std::any::Any {
         ToolHost::rpc(self)
+    }
+
+    #[cfg(feature = "exec-private-successor")]
+    fn run_successor_post_exec(
+        &self,
+        entry: &mut super::exec_private::ImageGuestEntry,
+        control: &super::exec_private::SuccessorImageControl,
+    ) -> io::Result<()> {
+        ToolHost::run_post_exec_before_loader(self, entry, control)
     }
 
     #[cfg(feature = "exec-private-init")]
@@ -147,6 +162,77 @@ pub unsafe fn initialize_initial_image_lifecycle(
         .get()
         .ok_or_else(|| io::Error::other("InitialImage Tool is not installed"))?;
     handler.initialize_initial_image_lifecycle(control)
+}
+
+/// Publish and restore the actual admitted successor on the one stable owner.
+///
+/// # Safety
+/// All publish_tool premises apply. The same redeemed client, decoded Tool and
+/// prepared thread state must belong to control's authentic watched native exec.
+/// The installer must retain its actual fatal owner and exclusive Tool FS/stack
+/// interval through publication, frontend, post_exec and completion. No Guest,
+/// observer or handler work may run; a typed control is not admission proof.
+#[cfg(feature = "exec-private-successor")]
+pub unsafe fn publish_successor_tool<T: Tool + 'static, R: HostRuntime>(
+    host: ToolHost<T, R>,
+    state: T::ThreadState,
+    control: &super::exec_private::SuccessorImageControl,
+) -> io::Result<()> {
+    let host = Box::new(host);
+    let stable_host = core::ptr::from_ref(&*host);
+    if let Err(unpublished) = HANDLER.set(host) {
+        // The genuine native owner must terminate before generic rejected-host
+        // teardown; never drop it or resume Guest after duplicate publication.
+        let _retained = core::mem::ManuallyDrop::new(unpublished);
+        unsafe { super::exec_private::initialization_failed(core::ptr::null_mut()) };
+    }
+    // SAFETY: the successful one Box publication retains this exact allocation.
+    let host = unsafe { &*stable_host };
+    unsafe {
+        host.bind_successor_image_control(control)?;
+        host.restore_prepared_exec_state(state, control)
+    }
+}
+
+/// Run the restored Tool's real post_exec through the one installed owner.
+///
+/// # Safety
+/// This is the same genuine successor/fatal/entry lineage published above,
+/// before loader/Guest entry, with actual kernel/frontend and thread ownership.
+/// It is not a synthetic frame or a pre-activation dispatch API.
+#[cfg(feature = "exec-private-successor")]
+pub unsafe fn run_successor_post_exec(
+    entry: &mut super::exec_private::ImageGuestEntry,
+    control: &super::exec_private::SuccessorImageControl,
+) -> io::Result<()> {
+    HANDLER
+        .get()
+        .ok_or_else(|| io::Error::other("successor Tool is not installed"))?
+        .run_successor_post_exec(entry, control)
+}
+
+/// Finish through the actual installed RPC owner and one completion closure.
+///
+/// # Safety
+/// The caller retains this authentic affine successor and its fatal ownership,
+/// excludes Guest/observer work, and supplies the genuine typed completion
+/// exchange and resource handoff. All SuccessorImageControl::finish premises
+/// apply. Local matching values or a boolean are not a received host ACK.
+#[cfg(feature = "exec-private-successor")]
+pub unsafe fn finish_successor_image<G: reverie::GlobalTool + 'static>(
+    control: &super::exec_private::SuccessorImageControl,
+    complete: impl FnOnce(
+        &CoordinatorRpc<G>,
+        super::exec_private::SuccessorBinding,
+    ) -> io::Result<super::exec_private::SuccessorBinding>,
+) -> io::Result<()> {
+    let rpc = HANDLER
+        .get()
+        .ok_or_else(|| io::Error::other("successor Tool is not installed"))?
+        .rpc()
+        .downcast_ref::<CoordinatorRpc<G>>()
+        .ok_or_else(|| io::Error::other("successor installed RPC type differs"))?;
+    unsafe { control.finish(|binding| complete(rpc, binding)) }
 }
 
 /// Dispatch an actual intercepted syscall to this process's installed Tool.

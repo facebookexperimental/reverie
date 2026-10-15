@@ -4,6 +4,11 @@
 //! capability report. Engine-specific frontend selection is separate from
 //! extracting this shared launch mechanism.
 
+#[cfg(feature = "exec-native-injection")]
+pub mod native;
+#[cfg(feature = "exec-native-injection")]
+pub mod native_frontend;
+
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::future::Future;
@@ -86,6 +91,38 @@ impl InitialImageStatsServer {
         )?;
         let global = Arc::new(crate::stats::LiteinstStatsGlobal::default());
         let mut server = RpcServer::bind_exclusive(&endpoint, global.clone(), ())?;
+        server.set_connection_admission(admission);
+        let issues = server.retain_connection_issues();
+        Ok((
+            Self { server, issues },
+            InitialImageStatsCollector { global },
+        ))
+    }
+
+    /// Consume the unchanged prebound statistics endpoint and create the one
+    /// real typed collector after common namespace setup. The caller retains
+    /// the endpoint's owned directory through physical reap and server drain;
+    /// neither this adapter nor the RPC factory unlinks or rebinds its inode.
+    pub fn from_prebound(
+        listener: std::os::unix::net::UnixListener,
+        tool_rpc: &Path,
+        owned_run_directory: &Path,
+        admission: Arc<dyn ConnectionAdmission>,
+    ) -> Result<(Self, InitialImageStatsCollector), RpcError> {
+        let endpoint = crate::initial_image_stats::initial_image_stats_endpoint(tool_rpc)?;
+        crate::initial_image_stats::check_owned_directory(
+            tool_rpc,
+            &endpoint,
+            owned_run_directory,
+        )?;
+        if listener.local_addr()?.as_pathname() != Some(endpoint.as_path()) {
+            return Err(RpcError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "prebound statistics endpoint differs from Tool companion",
+            )));
+        }
+        let global = Arc::new(crate::stats::LiteinstStatsGlobal::default());
+        let mut server = RpcServer::from_prebound(listener, global.clone(), ())?;
         server.set_connection_admission(admission);
         let issues = server.retain_connection_issues();
         Ok((
@@ -647,17 +684,27 @@ where
     // owns the per-connection JoinSet, so aborting it also releases every
     // outstanding connection and its GlobalTool Arc.
     let mut serving = tokio::task::JoinSet::new();
-    serving.spawn(server.serve());
+    let mut shutdown = Vec::new();
+    let (send, receive) = tokio::sync::oneshot::channel();
+    shutdown.push(send);
+    serving.spawn(server.serve_until(async {
+        let _ = receive.await;
+    }));
     if let Some(stats_server) = stats_server {
-        serving.spawn(stats_server.serve());
+        let (send, receive) = tokio::sync::oneshot::channel();
+        shutdown.push(send);
+        serving.spawn(stats_server.serve_until(async {
+            let _ = receive.await;
+        }));
     }
 
-    serve_rpc_tasks_until_with_timeout(
+    serve_rpc_tasks_until_with_timeout_and_shutdown(
         serving,
         connection_monitors,
         completion,
         failure,
         drain_timeout,
+        shutdown,
     )
     .await
 }
@@ -688,8 +735,9 @@ fn rpc_server_stopped(
 /// during the drain, and wins over a completion that is ready at the same time.
 /// Returning drops the servers and so every guest connection; the caller kills
 /// any guest that remains.
+#[cfg(test)]
 async fn serve_rpc_tasks_until_with_timeout<F, T, B>(
-    mut serving: tokio::task::JoinSet<Result<(), RpcError>>,
+    serving: tokio::task::JoinSet<Result<(), RpcError>>,
     connection_monitors: Vec<ConnectionMonitor>,
     completion: F,
     failure: B,
@@ -699,84 +747,116 @@ where
     F: Future<Output = io::Result<T>>,
     B: Future<Output = ()>,
 {
+    serve_rpc_tasks_until_with_timeout_and_shutdown(
+        serving,
+        connection_monitors,
+        completion,
+        failure,
+        drain_timeout,
+        Vec::new(),
+    )
+    .await
+}
+
+async fn serve_rpc_tasks_until_with_timeout_and_shutdown<F, T, B>(
+    mut serving: tokio::task::JoinSet<Result<(), RpcError>>,
+    connection_monitors: Vec<ConnectionMonitor>,
+    completion: F,
+    failure: B,
+    drain_timeout: Duration,
+    shutdown: Vec<tokio::sync::oneshot::Sender<()>>,
+) -> io::Result<T>
+where
+    F: Future<Output = io::Result<T>>,
+    B: Future<Output = ()>,
+{
     tokio::pin!(completion);
     tokio::pin!(failure);
-
+    let mut failed = false;
+    let mut drain_required = false;
     let mut result = tokio::select! {
         biased;
-        () = &mut failure => return Err(backend_failure_error()),
-        result = &mut completion => result,
-        result = serving.join_next() => return Err(rpc_server_stopped(result)),
+        () = &mut failure => { failed = true; Err(backend_failure_error()) },
+        result = &mut completion => { drain_required = true; result },
+        stopped = serving.join_next() => Err(rpc_server_stopped(stopped)),
     };
-
-    // A fork child inherits the parent's connected socket. If it later needs
-    // its own identity, the client opens the replacement before dropping the
-    // inherited descriptor. Consequently this count cannot transiently reach
-    // zero while a supported descendant still owns coordinator state. Block
-    // on last-close notifications instead of keeping this task runnable, but
-    // fail closed after a finite interval if a descriptor is leaked.
-    let drain = async {
+    if drain_required {
+        // Existing last-close rule and finite bound are unchanged. Every arm
+        // now reaches the same joined teardown, retaining the original error.
+        let drain = async {
+            for monitor in &connection_monitors {
+                monitor.wait_for_idle().await;
+            }
+        };
+        tokio::pin!(drain);
+        let drain_error = tokio::select! {
+            biased;
+            () = &mut failure => { failed = true; None },
+            stopped = serving.join_next() => Some(rpc_server_stopped(stopped)),
+            outcome = tokio::time::timeout(drain_timeout, &mut drain) => {
+                outcome.err().map(|_| {
+                    let active = connection_monitors.iter().map(ConnectionMonitor::active_connections).sum::<usize>();
+                    io::Error::new(io::ErrorKind::TimedOut, format!(
+                        "LiteInst coordinator retained {active} active RPC connection(s) for {}ms after guest exit", drain_timeout.as_millis()
+                    ))
+                })
+            },
+        };
+        if !failed {
+            failed = std::future::poll_fn(|context| {
+                std::task::Poll::Ready(failure.as_mut().poll(context).is_ready())
+            })
+            .await;
+        }
+        if result.is_ok() {
+            if failed {
+                result = Err(backend_failure_error());
+            } else if let Some(error) = drain_error {
+                result = Err(error);
+            }
+        } else if failed {
+            tracing::warn!("a backend failure was reported; preserving guest completion error");
+        } else if let Some(error) = drain_error {
+            tracing::warn!("{error}; preserving guest completion error");
+        }
+    }
+    let cooperative = !shutdown.is_empty();
+    if cooperative {
+        for sender in shutdown {
+            let _ = sender.send(());
+        }
+    } else {
+        // Task-only fixtures retain the same cancellation route; actual
+        // servers use serve_until, which joins its own connection tasks.
+        serving.abort_all();
+    }
+    while let Some(stopped) = serving.join_next().await {
+        let error = match stopped {
+            Err(error) if error.is_cancelled() => None,
+            Ok(Ok(())) if cooperative => None,
+            stopped => Some(rpc_server_stopped(Some(stopped))),
+        };
+        if result.is_ok()
+            && !failed
+            && let Some(error) = error
+        {
+            result = Err(error);
+        }
+    }
+    // Even the task-only cancellation route must wait for nested connection
+    // destruction; returning while it still owns a GlobalState Arc is unsafe
+    // for force_exit/cancel/cleanup. A missing last-close is a terminal error.
+    let joined = tokio::time::timeout(drain_timeout, async {
         for monitor in &connection_monitors {
             monitor.wait_for_idle().await;
         }
-    };
-    tokio::pin!(drain);
-    let mut failed = false;
-    let drain_result = tokio::select! {
-        biased;
-        () = &mut failure => {
-            failed = true;
-            Ok(())
-        }
-        result = serving.join_next() => return Err(rpc_server_stopped(result)),
-        result = tokio::time::timeout(drain_timeout, &mut drain) => result,
-    };
-    // A failure published in the same instant the drain ended still fails the
-    // run. `failure` has not completed here unless `failed` is set, so it is
-    // polled at most once more.
-    if !failed {
-        failed = std::future::poll_fn(|context| {
-            std::task::Poll::Ready(failure.as_mut().poll(context).is_ready())
-        })
-        .await;
-    }
-    if failed {
-        if result.is_ok() {
-            result = Err(backend_failure_error());
-        } else {
-            tracing::warn!("a backend failure was reported; preserving guest completion error");
-        }
-    } else if drain_result.is_err() {
-        let active_connections = connection_monitors
-            .iter()
-            .map(ConnectionMonitor::active_connections)
-            .sum::<usize>();
-        let timeout_message = format!(
-            "LiteInst coordinator retained {active_connections} active RPC connection(s) for {}ms after guest exit",
-            drain_timeout.as_millis()
-        );
-        if result.is_ok() {
-            result = Err(io::Error::new(io::ErrorKind::TimedOut, timeout_message));
-        } else {
-            tracing::warn!("{timeout_message}; preserving guest completion error");
-        }
-    }
-
-    serving.abort_all();
-    while let Some(server_result) = serving.join_next().await {
-        match server_result {
-            Err(error) if error.is_cancelled() => {}
-            // A selected backend failure is the run's terminal error; a server
-            // that also stopped while the loop shut down does not replace it.
-            _ if failed => {}
-            Ok(Ok(())) => {
-                return Err(io::Error::other(
-                    "LiteInst coordinator stopped unexpectedly",
-                ));
-            }
-            Ok(Err(error)) => return Err(io::Error::other(error.to_string())),
-            Err(error) => return Err(io::Error::other(error.to_string())),
-        }
+    })
+    .await;
+    if joined.is_err() && result.is_ok() {
+        result = Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "RPC cancellation did not release every connection",
+        ));
     }
     result
 }
@@ -1603,6 +1683,7 @@ mod tests {
             .await
             .expect("a backend failure did not end the serve loop");
         assert_backend_failure(result);
+        assert_eq!(case.monitor.active_connections(), 0);
         let _ = case.complete.send(());
         let _ = case.release_client.send(());
         case.client.await.unwrap();
@@ -1705,6 +1786,78 @@ mod tests {
             .expect("the serve loop hung");
         assert_backend_failure(result);
         drop(directory);
+    }
+
+    /// A backend failure raised by a failed completion must retain both the
+    /// original completion error and the existing diagnostic through teardown.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_backend_failure_preserves_completion_error_and_diagnostic() {
+        let directory = short_socket_tempdir();
+        let socket = directory.path().join("coordinator.sock");
+        let server = RpcServer::bind(&socket, Arc::new(MultiClientGlobal::default()), 41).unwrap();
+        let monitor = server.connection_monitor();
+        let (connected_tx, connected_rx) = tokio::sync::oneshot::channel();
+        let (fail_tx, fail_rx) = tokio::sync::oneshot::channel();
+        let captured_logs = Arc::new(Mutex::new(Vec::new()));
+        let writer_logs = captured_logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_writer(move || CapturedLogWriter(writer_logs.clone()))
+            .finish();
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        let client = tokio::spawn(async move {
+            let _client = reverie_rpc_transport::RpcClient::<MultiClientGlobal>::connect(
+                &socket,
+                Tid::from_raw(608),
+            )
+            .await
+            .unwrap();
+            connected_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let completion = async move {
+            connected_rx
+                .await
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            // The failure first becomes ready within the completion's poll,
+            // after the initial biased failure arm has already been pending.
+            fail_tx.send(()).unwrap();
+            Err::<(), _>(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "guest completion failed before RPC drain",
+            ))
+        };
+        let failure = async move {
+            let _ = fail_rx.await;
+        };
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            serve_rpc_until_with_timeout(
+                server,
+                None,
+                vec![monitor.clone()],
+                completion,
+                failure,
+                Duration::from_millis(25),
+            ),
+        )
+        .await
+        .expect("a backend failure left the coordinator teardown unbounded")
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "guest completion failed before RPC drain"
+        );
+        assert_eq!(monitor.active_connections(), 0);
+        let logs = String::from_utf8(captured_logs.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("a backend failure was reported; preserving guest completion error"));
+
+        client.abort();
+        let _ = client.await;
     }
 
     #[tokio::test(flavor = "current_thread")]

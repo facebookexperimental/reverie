@@ -210,8 +210,17 @@ impl Command {
     /// Only returns if an error occurs, thus it is only possible for it to
     /// return an error.
     fn do_exec(&mut self, context: &ChildContext, env: &CStringArray) -> Error {
+        // Refuse before child setup can publish an irreversible filter.
+        if self.terminal_execve.is_some() && !self.program.to_bytes().starts_with(b"/") {
+            return Error::new(Errno::EINVAL, Context::Exec);
+        }
         if let Err(err) = self.container.setup(context, &mut self.pre_exec) {
             return err;
+        }
+        if let Some(entry) = self.terminal_execve {
+            // SAFETY: installer supplied the trusted terminal entry. The
+            // actual prepared vectors are borrowed unchanged until exec.
+            unsafe { entry(self.program.as_ptr(), self.args.as_ptr(), env.as_ptr()) }
         }
 
         Error::result(

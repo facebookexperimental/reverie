@@ -58,6 +58,12 @@ use crate::trap::raw_syscall6;
 #[cfg(feature = "exec-private-init")]
 #[path = "image_guest.rs"]
 mod image_guest;
+#[cfg(all(test, feature = "exec-native-injection"))]
+#[path = "native_exec_tests.rs"]
+mod native_exec_tests;
+#[cfg(feature = "exec-private-successor")]
+#[path = "successor_image_guest.rs"]
+mod successor_image_guest;
 
 /// The services a [`ToolHost`] needs from the backend that owns the trap and
 /// hook paths.
@@ -172,6 +178,23 @@ pub struct ToolHost<T: Tool, R: HostRuntime> {
     cpuid_interception: bool,
     states: SpinMutex<HashMap<i32, T::ThreadState>>,
     runtime: R,
+    #[cfg(feature = "exec-private-successor")]
+    prepared_exec: SpinMutex<Option<PreparedExecState<T>>>,
+    #[cfg(feature = "exec-native-injection")]
+    native_exec_driver: Option<std::sync::Arc<dyn super::native_exec::NativeExecDriver<T>>>,
+}
+
+#[cfg(feature = "exec-private-successor")]
+enum PreparedExecPhase {
+    Pending,
+    Failed,
+    Complete,
+}
+#[cfg(feature = "exec-private-successor")]
+struct PreparedExecState<T: Tool> {
+    state: T::ThreadState,
+    binding: super::exec_private::SuccessorBinding,
+    phase: PreparedExecPhase,
 }
 
 impl<T: Tool, R: HostRuntime> ToolHost<T, R> {
@@ -189,6 +212,16 @@ impl<T: Tool, R: HostRuntime> ToolHost<T, R> {
     /// dispatch currently holding the state lock, is refused without replacing
     /// anything. No production backend calls this inactive input seam.
     pub fn restore_current_thread_state(&self, state: T::ThreadState) -> io::Result<()> {
+        #[cfg(feature = "exec-private-successor")]
+        if self
+            .prepared_exec
+            .try_lock()
+            .is_none_or(|pending| pending.is_some())
+        {
+            return Err(io::Error::other(
+                "successor lifecycle state is not complete",
+            ));
+        }
         let _allocation_scope = super::alloc::enter_dispatch();
         let tid = raw_pid(libc::SYS_gettid).as_raw();
         let mut states = self.states.try_lock().ok_or_else(|| {
@@ -231,7 +264,186 @@ where
             cpuid_interception,
             states: SpinMutex::new(HashMap::new()),
             runtime,
+            #[cfg(feature = "exec-private-successor")]
+            prepared_exec: SpinMutex::new(None),
+            #[cfg(feature = "exec-native-injection")]
+            native_exec_driver: None,
         }
+    }
+
+    /// Install the inactive native exec driver exactly once, before dispatch.
+    ///
+    /// # Safety
+    /// Only the authenticated experimental installer may call this. It must
+    /// own the actual native main-thread/birth/immutable launch authority and
+    /// vouch for every unsafe driver/session/provision contract. No guest
+    /// Config, environment or request is installation authority. The driver
+    /// must not reacquire this host's Tool/state locks during its callbacks.
+    #[cfg(feature = "exec-native-injection")]
+    pub unsafe fn install_native_exec_driver(
+        &mut self,
+        driver: std::sync::Arc<dyn super::native_exec::NativeExecDriver<T>>,
+    ) -> io::Result<()> {
+        if self.native_exec_driver.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "native exec driver already installed",
+            ));
+        }
+        let states = self.states.try_lock().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::WouldBlock, "Tool state dispatch is active")
+        })?;
+        if !states.is_empty() {
+            return Err(io::Error::other(
+                "native exec driver installation follows dispatch",
+            ));
+        }
+        drop(states);
+        self.native_exec_driver = Some(driver);
+        Ok(())
+    }
+
+    /// Bind the actual stable installed successor host before its frontend.
+    ///
+    /// # Safety
+    /// The backend must supply its published stable handler, the same admitted
+    /// RPC/Tool/control and exact restored successor binding. The host must not
+    /// move or be replaced. Guest memory effects must preserve Rust invariants.
+    #[cfg(feature = "exec-private-successor")]
+    pub unsafe fn bind_successor_image_control(
+        &self,
+        control: &super::exec_private::SuccessorImageControl,
+    ) -> io::Result<()> {
+        control.bind_lifecycle_host(core::ptr::from_ref(self) as usize)
+    }
+
+    /// Attach the exact authenticated prepared state as ExecPending. This
+    /// neither creates thread state nor calls startup/post-exec callbacks.
+    ///
+    /// # Safety
+    /// The same installer must have decoded/validated this state from the
+    /// admitted successor snapshot with all runtime/Config/cut checks. A
+    /// matching digest alone does not prove correct Tool-state restoration.
+    #[cfg(feature = "exec-private-successor")]
+    pub unsafe fn restore_prepared_exec_state(
+        &self,
+        state: T::ThreadState,
+        control: &super::exec_private::SuccessorImageControl,
+    ) -> io::Result<()> {
+        control.begin_restore(core::ptr::from_ref(self) as usize)?;
+        let result = (|| {
+            let _allocation_scope = super::alloc::enter_dispatch();
+            if self.root_pid != raw_pid(libc::SYS_gettid)
+                || self.root_pid != raw_pid(libc::SYS_getpid)
+            {
+                return Err(io::Error::other("successor host root identity differs"));
+            }
+            let states = self.states.try_lock().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "successor state dispatch is active",
+                )
+            })?;
+            let mut pending = self.prepared_exec.try_lock().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::WouldBlock, "successor restoration is active")
+            })?;
+            if !states.is_empty() || pending.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "successor thread state already exists",
+                ));
+            }
+            *pending = Some(PreparedExecState {
+                state,
+                binding: control.binding(),
+                phase: PreparedExecPhase::Pending,
+            });
+            control.restore_completed();
+            Ok(())
+        })();
+        if result.is_err() {
+            control.restore_failed();
+        }
+        result
+    }
+
+    /// Run exactly the real post-exec on the restored Tool/state before loader
+    /// entry. There is no thread_start, init_thread_state or syscall callback.
+    #[cfg(feature = "exec-private-successor")]
+    pub fn run_post_exec_before_loader(
+        &self,
+        entry: &mut super::exec_private::ImageGuestEntry,
+        control: &super::exec_private::SuccessorImageControl,
+    ) -> io::Result<()> {
+        let permit = control.begin_post_exec(core::ptr::from_ref(self) as usize, entry)?;
+        let _scratch_scope = DispatchScratchScope::enter();
+        let tid = raw_pid(libc::SYS_gettid);
+        if tid != self.root_pid {
+            return Err(io::Error::other("successor host root identity differs"));
+        }
+        let tool_slot = self.tool.try_lock().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "successor Tool callback is active",
+            )
+        })?;
+        let tool = tool_slot
+            .as_ref()
+            .ok_or_else(|| io::Error::other("successor Tool is absent"))?;
+        let mut states = self.states.try_lock().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "successor state dispatch is active",
+            )
+        })?;
+        let mut pending = self.prepared_exec.try_lock().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::WouldBlock, "successor post-exec is active")
+        })?;
+        let restored = pending
+            .as_mut()
+            .ok_or_else(|| io::Error::other("successor state is absent"))?;
+        if !states.is_empty()
+            || !matches!(restored.phase, PreparedExecPhase::Pending)
+            || restored.binding != control.binding()
+        {
+            return Err(io::Error::other("successor ExecPending binding differs"));
+        }
+        // Mark failed before invoking untrusted hook code, including unwind.
+        restored.phase = PreparedExecPhase::Failed;
+        let tail = TailResult::default();
+        {
+            let mut guest = successor_image_guest::SuccessorImageGuest::<T, R>::new(
+                tid,
+                &mut restored.state,
+                self,
+                &tail,
+                permit.injection_permit(),
+                entry,
+            );
+            #[cfg(feature = "exec-native-injection")]
+            if let Some(driver) = &self.native_exec_driver {
+                let mode = guest.signal_control_mode();
+                let actual = guest.signal_task_identity();
+                driver.bind_post_exec_state(guest.thread_state_mut(), mode, actual)?;
+            }
+            match drive_callback(tool.handle_post_exec(&mut guest), &tail) {
+                CallbackOutcome::Ready(Ok(())) => {}
+                CallbackOutcome::Ready(Err(error)) => {
+                    return Err(io::Error::from_raw_os_error(error.into_raw()));
+                }
+                CallbackOutcome::Exit { .. } | CallbackOutcome::Unsupported(_) => {
+                    return Err(io::Error::other("successor post-exec transition refused"));
+                }
+            }
+            guest.check_refusal()?;
+        }
+        permit.complete()?;
+        restored.phase = PreparedExecPhase::Complete;
+        // ExecComplete publication uses the same restored state. Dispatch now
+        // observes an existing state and cannot repeat either startup hook.
+        let completed = pending.take().expect("owned successor state");
+        states.insert(tid.as_raw(), completed.state);
+        Ok(())
     }
 
     /// Bind this actual installed host to its authenticated InitialImage.
@@ -288,6 +500,10 @@ where
             ));
         }
         let mut state = tool.init_thread_state(tid, None);
+        #[cfg(feature = "exec-native-injection")]
+        if let Some(driver) = &self.native_exec_driver {
+            driver.bind_initial_state(tool, &mut state, tid.as_raw())?;
+        }
         let tail = TailResult::default();
         {
             let mut guest = image_guest::ImageGuest::<T, R>::new(
@@ -314,6 +530,12 @@ where
                 }
             }
             guest.check_refusal()?;
+            #[cfg(feature = "exec-native-injection")]
+            if let Some(driver) = &self.native_exec_driver {
+                let mode = guest.signal_control_mode();
+                let actual = guest.signal_task_identity();
+                driver.bind_post_exec_state(guest.thread_state_mut(), mode, actual)?;
+            }
             match drive_callback(tool.handle_post_exec(&mut guest), &tail) {
                 CallbackOutcome::Ready(Ok(())) => {}
                 CallbackOutcome::Ready(Err(error)) => {
@@ -354,7 +576,18 @@ where
     /// its injections must not break Rust's memory invariants for any memory
     /// they touch.
     pub unsafe fn dispatch(&self, event: &mut SyscallEvent) {
+        #[cfg(feature = "exec-private-successor")]
+        if self
+            .prepared_exec
+            .try_lock()
+            .is_none_or(|pending| pending.is_some())
+        {
+            unsafe { super::exec_private::initialization_failed(core::ptr::null_mut()) }
+        }
+
         let _scratch_scope = DispatchScratchScope::enter();
+        #[cfg(feature = "exec-native-injection")]
+        let original_event = *event;
         let tid = raw_pid(libc::SYS_gettid);
         let pid = raw_pid(libc::SYS_getpid);
         let ppid = (pid != self.root_pid).then(|| raw_pid(libc::SYS_getppid));
@@ -385,25 +618,35 @@ where
             staged_signals: Vec::new(),
             staged_signal_delivery: false,
             in_syscall_handler: false,
+            #[cfg(feature = "exec-native-injection")]
+            exec: None,
+            #[cfg(feature = "exec-native-injection")]
+            mapping_driver: self.native_exec_driver.as_deref(),
+            #[cfg(feature = "exec-native-injection")]
+            unsupported_refusal: None,
         };
 
         if is_new {
             match callback_result(drive_callback(tool.handle_thread_start(&mut guest), &tail)) {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => tool_fatal(124, &error),
-                Err(ending) => finish_ending(
-                    &mut tool_slot,
-                    &mut states,
-                    &self.rpc,
-                    &self.runtime,
-                    (tid, pid),
-                    ending,
-                ),
+                Err(ending) => {
+                    drop(guest);
+                    finish_ending(
+                        &mut tool_slot,
+                        &mut states,
+                        &self.rpc,
+                        &self.runtime,
+                        (tid, pid),
+                        ending,
+                    )
+                }
             }
             // A signal the thread-start callback sent is delivered before the
             // next callback runs, as a tracer delivers it when the thread
             // resumes.
             if let Some(ending) = deliver_staged_signals(tool, &mut guest) {
+                drop(guest);
                 finish_ending(
                     &mut tool_slot,
                     &mut states,
@@ -432,18 +675,22 @@ where
                 Ok(Ok(())) => {}
                 // handle_post_exec returns Errno; tool_fatal expects reverie::Error.
                 Ok(Err(error)) => tool_fatal(124, &Error::from(error)),
-                Err(ending) => finish_ending(
-                    &mut tool_slot,
-                    &mut states,
-                    &self.rpc,
-                    &self.runtime,
-                    (tid, pid),
-                    ending,
-                ),
+                Err(ending) => {
+                    drop(guest);
+                    finish_ending(
+                        &mut tool_slot,
+                        &mut states,
+                        &self.rpc,
+                        &self.runtime,
+                        (tid, pid),
+                        ending,
+                    )
+                }
             }
         }
         // A signal the post-exec callback sent.
         if let Some(ending) = deliver_staged_signals(tool, &mut guest) {
+            drop(guest);
             finish_ending(
                 &mut tool_slot,
                 &mut states,
@@ -465,6 +712,11 @@ where
             let number = guest.event.number;
             let args = guest.event.args;
             let guest_pkru = guest.event.guest_pkru;
+            #[cfg(feature = "exec-native-injection")]
+            if let Err(error) = guest.check_native_mapping(number, args) {
+                guest.event.result = -i64::from(error.into_raw());
+                return;
+            }
             if is_plain_fork(number, args) {
                 guest.prepare_fork_parent_state();
                 let result = forward_plain_fork(number, args, Some(&mut guest.event.guest_pkru));
@@ -486,10 +738,11 @@ where
                         },
                     );
                 } else {
-                    event.result = result;
+                    guest.event.result = result;
                 }
                 return;
             } else if is_exit_syscall(number) {
+                drop(guest);
                 finish_tool_exit(
                     &mut tool_slot,
                     &mut states,
@@ -497,6 +750,8 @@ where
                     &self.runtime,
                     ToolExitContext::exit_syscall(tid, pid, number, args),
                 );
+                event.result = unsafe { event.forward() };
+                return;
             } else if !guest_filter_admitted()
                 && let Some(signal) = unsafe { self_directed_fatal_signal(number, args) }
             {
@@ -518,6 +773,7 @@ where
                     signal,
                 });
                 if let Some(ending) = deliver_staged_signals(tool, &mut guest) {
+                    drop(guest);
                     finish_ending(
                         &mut tool_slot,
                         &mut states,
@@ -529,34 +785,34 @@ where
                 }
                 return;
             } else if let Some(error) = injected_syscall_guard(&self.runtime, number, args) {
-                event.result = -i64::from(error.into_raw());
+                guest.event.result = -i64::from(error.into_raw());
                 return;
             } else if let Some(result) = super::restorer::mapping_change_result(number, args) {
-                event.result = result;
+                guest.event.result = result;
                 return;
             } else if let Some(result) =
                 unsafe { super::protect::protect_forwarded_descriptor_change(number, args) }
             {
                 // A close or close_range the runtime left for dispatch, of a
                 // Tool that does not subscribe to it: protected here instead.
-                event.result = result;
+                guest.event.result = result;
                 return;
             }
             if let Some(result) = virtual_signal_call(&self.runtime, guest_pkru, args, number, args)
             {
-                event.result = result;
+                guest.event.result = result;
                 return;
             }
-            if let Some(result) = perform_pkey_alloc(event, number, args) {
-                event.result = result;
+            if let Some(result) = perform_pkey_alloc(guest.event, number, args) {
+                guest.event.result = result;
                 return;
             }
             // This is the original unsubscribed guest operation. Private
             // inject/tail_inject below keep caller rights except for the
             // scalar pkey allocation handled above.
             match stripped_signal_mask(&self.runtime, number, args) {
-                Err(error) => event.result = -i64::from(error.into_raw()),
-                Ok(None) => event.result = unsafe { event.forward() },
+                Err(error) => guest.event.result = -i64::from(error.into_raw()),
+                Ok(None) => guest.event.result = unsafe { guest.event.forward() },
                 Ok(Some(mask)) => {
                     // The stripped copy is runtime-private, so the call runs
                     // through the ordinary raw gate, as on inject and
@@ -564,7 +820,7 @@ where
                     // the guest's saved PKRU (see stripped_signal_mask).
                     let mut stripped_args = args;
                     stripped_args[1] = (&raw const mask) as u64;
-                    event.result = unsafe {
+                    guest.event.result = unsafe {
                         crate::trap::physical_guest_syscall6(number, stripped_args, None)
                     }
                     .result;
@@ -582,6 +838,22 @@ where
         // the ERESTARTSYS restart protocol (Reverie #362) so it cannot
         // drift between the in-guest backends; this host maps each terminal
         // outcome onto its own per-thread lifecycle (exit/fork-child) state.
+        #[cfg(feature = "exec-native-injection")]
+        if let Some(driver) = self.native_exec_driver.as_ref() {
+            let mut site = guest.native_exec_site();
+            // Capture belongs immediately before this actual handler; it is
+            // not a native authorization for thread-start/post-exec callbacks.
+            site.in_handler = true;
+            site.main_tid = self.root_pid.as_raw();
+            guest.exec = Some(super::native_exec::ExecInjection::capture(
+                tool,
+                driver,
+                (&original_event, guest.event),
+                &site,
+                &*guest.state,
+                &self.rpc,
+            ));
+        }
         guest.in_syscall_handler = true;
         let driven = drive_tool_syscall(tool, &mut guest, syscall, &tail);
         guest.in_syscall_handler = false;
@@ -593,6 +865,7 @@ where
                 // the handler has run to its end, as a tracer delivers a
                 // signal held during an injection when the handler returns.
                 if let Some(ending) = deliver_staged_signals(tool, &mut guest) {
+                    drop(guest);
                     finish_ending(
                         &mut tool_slot,
                         &mut states,
@@ -608,6 +881,7 @@ where
                 // (`InGuest::inject`), which ended the handler there, as a
                 // tracer's injection of it ends the guest at once. Signals it
                 // held before are never delivered.
+                drop(guest);
                 finish_ending(
                     &mut tool_slot,
                     &mut states,
@@ -620,6 +894,7 @@ where
             DrivenSyscall::Exit { number, args } => {
                 // A signal the handler held before its exit is not delivered:
                 // the exit ends the process first.
+                drop(guest);
                 finish_tool_exit(
                     &mut tool_slot,
                     &mut states,
@@ -674,6 +949,15 @@ where
         kind: InstructionEventKind,
         context: &mut RegisterContext,
     ) {
+        #[cfg(feature = "exec-private-successor")]
+        if self
+            .prepared_exec
+            .try_lock()
+            .is_none_or(|pending| pending.is_some())
+        {
+            unsafe { super::exec_private::initialization_failed(core::ptr::null_mut()) }
+        }
+
         let _scratch_scope = DispatchScratchScope::enter();
         let tid = raw_pid(libc::SYS_gettid);
         let pid = raw_pid(libc::SYS_getpid);
@@ -709,21 +993,31 @@ where
             staged_signals: Vec::new(),
             staged_signal_delivery: false,
             in_syscall_handler: false,
+            #[cfg(feature = "exec-native-injection")]
+            exec: None,
+            #[cfg(feature = "exec-native-injection")]
+            mapping_driver: self.native_exec_driver.as_deref(),
+            #[cfg(feature = "exec-native-injection")]
+            unsupported_refusal: None,
         };
         if is_new {
             match callback_result(drive_callback(tool.handle_thread_start(&mut guest), &tail)) {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => tool_fatal(124, &error),
-                Err(ending) => finish_ending(
-                    &mut tool_slot,
-                    &mut states,
-                    &self.rpc,
-                    &self.runtime,
-                    (tid, pid),
-                    ending,
-                ),
+                Err(ending) => {
+                    drop(guest);
+                    finish_ending(
+                        &mut tool_slot,
+                        &mut states,
+                        &self.rpc,
+                        &self.runtime,
+                        (tid, pid),
+                        ending,
+                    )
+                }
             }
             if let Some(ending) = deliver_staged_signals(tool, &mut guest) {
+                drop(guest);
                 finish_ending(
                     &mut tool_slot,
                     &mut states,
@@ -738,17 +1032,21 @@ where
             match callback_result(drive_callback(tool.handle_post_exec(&mut guest), &tail)) {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => tool_fatal(124, &Error::from(error)),
-                Err(ending) => finish_ending(
-                    &mut tool_slot,
-                    &mut states,
-                    &self.rpc,
-                    &self.runtime,
-                    (tid, pid),
-                    ending,
-                ),
+                Err(ending) => {
+                    drop(guest);
+                    finish_ending(
+                        &mut tool_slot,
+                        &mut states,
+                        &self.rpc,
+                        &self.runtime,
+                        (tid, pid),
+                        ending,
+                    )
+                }
             }
         }
         if let Some(ending) = deliver_staged_signals(tool, &mut guest) {
+            drop(guest);
             finish_ending(
                 &mut tool_slot,
                 &mut states,
@@ -769,14 +1067,17 @@ where
                     Ok(result) => {
                         result.unwrap_or_else(|error| tool_fatal(125, &Error::from(error)))
                     }
-                    Err(ending) => finish_ending(
-                        &mut tool_slot,
-                        &mut states,
-                        &self.rpc,
-                        &self.runtime,
-                        (tid, pid),
-                        ending,
-                    ),
+                    Err(ending) => {
+                        drop(guest);
+                        finish_ending(
+                            &mut tool_slot,
+                            &mut states,
+                            &self.rpc,
+                            &self.runtime,
+                            (tid, pid),
+                            ending,
+                        )
+                    }
                 };
                 context.rax = u64::from(result.eax);
                 context.rbx = u64::from(result.ebx);
@@ -794,14 +1095,17 @@ where
                     Ok(result) => {
                         result.unwrap_or_else(|error| tool_fatal(125, &Error::from(error)))
                     }
-                    Err(ending) => finish_ending(
-                        &mut tool_slot,
-                        &mut states,
-                        &self.rpc,
-                        &self.runtime,
-                        (tid, pid),
-                        ending,
-                    ),
+                    Err(ending) => {
+                        drop(guest);
+                        finish_ending(
+                            &mut tool_slot,
+                            &mut states,
+                            &self.rpc,
+                            &self.runtime,
+                            (tid, pid),
+                            ending,
+                        )
+                    }
                 };
                 context.rax = result.tsc as u32 as u64;
                 context.rdx = result.tsc.checked_shr(32).unwrap_or(0);
@@ -813,6 +1117,7 @@ where
         // The instruction callback can send the guest a signal that ends it;
         // it then ends before the instruction completes.
         if let Some(ending) = deliver_staged_signals(tool, &mut guest) {
+            drop(guest);
             finish_ending(
                 &mut tool_slot,
                 &mut states,
@@ -881,6 +1186,12 @@ fn finish_fork_child<T: Tool, R: HostRuntime>(
         staged_signals: Vec::new(),
         staged_signal_delivery: false,
         in_syscall_handler: false,
+        #[cfg(feature = "exec-native-injection")]
+        exec: None,
+        #[cfg(feature = "exec-native-injection")]
+        mapping_driver: None,
+        #[cfg(feature = "exec-native-injection")]
+        unsupported_refusal: None,
     };
     match callback_result(drive_callback(
         tool.handle_thread_start(&mut child_guest),
@@ -888,16 +1199,20 @@ fn finish_fork_child<T: Tool, R: HostRuntime>(
     )) {
         Ok(Ok(())) => {}
         Ok(Err(error)) => tool_fatal(124, &error),
-        Err(ending) => finish_ending(
-            tool_slot,
-            states,
-            rpc,
-            runtime,
-            (child_tid, child_pid),
-            ending,
-        ),
+        Err(ending) => {
+            drop(child_guest);
+            finish_ending(
+                tool_slot,
+                states,
+                rpc,
+                runtime,
+                (child_tid, child_pid),
+                ending,
+            )
+        }
     }
     if let Some(ending) = deliver_staged_signals(tool, &mut child_guest) {
+        drop(child_guest);
         finish_ending(
             tool_slot,
             states,
@@ -1380,9 +1695,45 @@ struct InGuest<'a, T: Tool, R: HostRuntime> {
     /// Whether the Tool callback running is a syscall handler, the only
     /// callback whose `tail_inject` resolves a guest syscall.
     in_syscall_handler: bool,
+    #[cfg(feature = "exec-native-injection")]
+    exec: Option<super::native_exec::ExecInjection<'a, T>>,
+    #[cfg(feature = "exec-native-injection")]
+    mapping_driver: Option<&'a dyn super::native_exec::NativeExecDriver<T>>,
+    #[cfg(feature = "exec-native-injection")]
+    unsupported_refusal: Option<reverie::UnsupportedRefusal>,
 }
 
 impl<T: Tool, R: HostRuntime> InGuest<'_, T, R> {
+    #[cfg(feature = "exec-native-injection")]
+    fn native_exec_site(&self) -> super::native_exec::ExecSite {
+        super::native_exec::ExecSite {
+            tid: self.tid.as_raw(),
+            pid: self.pid.as_raw(),
+            main_tid: self
+                .exec
+                .as_ref()
+                .map_or(self.pid.as_raw(), |exec| exec.main_tid()),
+            in_handler: self.in_syscall_handler,
+            staged_signals: !self.staged_signals.is_empty(),
+            ending: self.tail.ending(),
+            signal_delivery: self.staged_signal_delivery,
+            guest_filter: guest_filter_admitted(),
+            guest_signal_mode: super::sigalrm::admitted(),
+            fork_state: self.fork_parent_state.is_some(),
+        }
+    }
+
+    #[cfg(feature = "exec-native-injection")]
+    fn check_native_mapping(&mut self, number: i64, args: [u64; 6]) -> Result<(), Errno> {
+        if let Some(driver) = self.mapping_driver
+            && let Err(refusal) = driver.check_mapping(number, args)
+        {
+            self.unsupported_refusal = Some(refusal);
+            return Err(refusal.errno);
+        }
+        Ok(())
+    }
+
     /// Materialize the parent view while every synchronization owner still
     /// exists. A raw process fork can otherwise copy a locked Tool-state mutex
     /// into the child after its owning thread disappeared. Round-tripping via
@@ -2682,7 +3033,22 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
 
     async fn daemonize(&mut self) {}
 
+    fn take_unsupported_refusal(&mut self) -> Option<reverie::UnsupportedRefusal> {
+        #[cfg(feature = "exec-native-injection")]
+        {
+            self.unsupported_refusal.take()
+        }
+        #[cfg(not(feature = "exec-native-injection"))]
+        {
+            None
+        }
+    }
+
     async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
+        #[cfg(feature = "exec-native-injection")]
+        {
+            self.unsupported_refusal = None;
+        }
         if self.tail.ending() {
             // The guest is ending (an exit or a SIGKILL of itself was staged,
             // perhaps in a future the Tool abandoned): no further call is
@@ -2735,6 +3101,33 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
             }
             return Err(Errno::EOPNOTSUPP);
         }
+        #[cfg(feature = "exec-native-injection")]
+        if super::native_exec::is_exec(number) {
+            let site = self.native_exec_site();
+            if let Some(exec) = self.exec.as_mut() {
+                let result = exec.inject(
+                    (number, raw_args),
+                    self.event,
+                    &site,
+                    &*self.state,
+                    self.rpc,
+                );
+                return match result {
+                    Ok(returned) => {
+                        // Preserve the real kernel permission effect on errno.
+                        // The captured OriginalExec remains immutable authority.
+                        self.event.guest_pkru = returned.pkru;
+                        Err(returned.errno) // genuine kernel errno, no refusal tag
+                    }
+                    Err(refusal) => {
+                        self.unsupported_refusal = Some(refusal);
+                        Err(refusal.errno)
+                    }
+                };
+            }
+        }
+        #[cfg(feature = "exec-native-injection")]
+        self.check_native_mapping(number, raw_args)?;
         self.refuse_filter_while_staging(number, raw_args);
         if let Some(error) = injected_syscall_guard(self.runtime, number, raw_args) {
             return Err(error);
@@ -2832,6 +3225,10 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
     }
 
     async fn tail_inject<S: SyscallInfo>(&mut self, syscall: S) -> Never {
+        #[cfg(feature = "exec-native-injection")]
+        {
+            self.unsupported_refusal = None;
+        }
         if self.tail.ending() {
             // As in `inject`: the guest is ending, so nothing is made.
             return std::future::pending().await;
@@ -2846,6 +3243,11 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
             syscall_args.arg5 as u64,
         ];
         let number = number.id() as i64;
+        #[cfg(feature = "exec-native-injection")]
+        if let Err(error) = self.check_native_mapping(number, args) {
+            self.tail.set_result(-i64::from(error.into_raw()));
+            return std::future::pending().await;
+        }
         self.refuse_filter_while_staging(number, args);
         refuse_creation_outside_handler(number, self.in_syscall_handler);
         let ends_guest = is_exit_syscall(number)

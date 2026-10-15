@@ -25,6 +25,8 @@ pub mod generic_fixture;
 #[cfg(feature = "exec-private-init")]
 mod initial_image_stats;
 mod interior_entry;
+#[cfg(feature = "native-exec-state")]
+pub mod native_exec_state;
 mod patch_alloc;
 #[cfg(feature = "allocator-fixture")]
 #[doc(hidden)]
@@ -101,8 +103,14 @@ pub use straddler::STRADDLER_STALENESS_TICKS_ENV;
 pub use straddler::straddler_staleness_from_env_value;
 #[cfg(feature = "exec-private-init")]
 pub use tool_host::InstalledInitialImage;
+#[cfg(feature = "exec-native-injection")]
+pub use tool_host::InstalledSuccessorImage;
+#[cfg(feature = "exec-native-injection")]
+pub use tool_host::NativeSuccessorConsumer;
 #[cfg(feature = "exec-private-init")]
 pub use tool_host::PreparedInitialImage;
+#[cfg(feature = "exec-native-injection")]
+pub use tool_host::PreparedSuccessorImage;
 pub use tool_host::blocking_global_rpc;
 #[cfg(feature = "exec-private-init")]
 pub use tool_host::initialize_initial_image_lifecycle;
@@ -110,9 +118,15 @@ pub use tool_host::install_tool;
 pub use tool_host::install_tool_from_bootstrap;
 #[cfg(feature = "exec-private-init")]
 pub use tool_host::install_tool_initial_image;
+#[cfg(feature = "exec-native-injection")]
+pub use tool_host::install_tool_initial_image_with_native_exec;
 pub use tool_host::install_tool_quiescent;
+#[cfg(feature = "exec-native-injection")]
+pub use tool_host::install_tool_successor_image;
 #[cfg(feature = "exec-private-init")]
 pub use tool_host::prepare_tool_initial_image;
+#[cfg(feature = "exec-native-injection")]
+pub use tool_host::prepare_tool_successor_image;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-87): Review the inherited compatibility event channel.

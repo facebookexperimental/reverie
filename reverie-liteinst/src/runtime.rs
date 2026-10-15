@@ -540,6 +540,25 @@ pub(crate) fn initialize_from_selected_value(tool_value: Option<&OsStr>) -> io::
     )
 }
 
+// Ordinary and legacy images retain the patcher's full preparation. The
+// authenticated no-patching native installer alone selects the trap-only
+// resource path; this selection does not confer any native image authority.
+#[derive(Clone, Copy)]
+pub(crate) enum InstrumentationPreparation {
+    Patcher,
+    #[cfg(feature = "exec-native-injection")]
+    NativeTrapOnly,
+}
+
+#[cfg(feature = "exec-private-init")]
+pub(crate) struct PrivateRuntimeImage<'a> {
+    pub(crate) control: crate::tool_host::PrivateImageControl<'a>,
+    #[cfg(feature = "exec-native-injection")]
+    pub(crate) preparation: InstrumentationPreparation,
+    #[cfg(feature = "exec-native-injection")]
+    pub(crate) before_frontend: Option<Box<dyn FnOnce() -> io::Result<()> + 'a>>,
+}
+
 pub(crate) fn initialize_reverie_tool(
     stats: crate::stats::GuestStatsHooks,
     publication: PatchPublication,
@@ -547,9 +566,7 @@ pub(crate) fn initialize_reverie_tool(
     site_patching: bool,
     vdso_sites: &[reverie::vdso::VdsoSyscallSite],
     prepared_callbacks: PreparedCallbacks,
-    #[cfg(feature = "exec-private-init")] initial: Option<
-        &reverie_inguest::guest::exec_private::InitialImageControl,
-    >,
+    #[cfg(feature = "exec-private-init")] initial: Option<PrivateRuntimeImage<'_>>,
 ) -> io::Result<()> {
     #[cfg(feature = "exec-private-init")]
     let private_initial = initial.is_some();
@@ -657,9 +674,7 @@ fn install_runtime(
     instructions: InstructionSubscriptions,
     vdso_sites: &[reverie::vdso::VdsoSyscallSite],
     _prepared_callbacks: Option<PreparedCallbacks>,
-    #[cfg(feature = "exec-private-init")] initial: Option<
-        &reverie_inguest::guest::exec_private::InitialImageControl,
-    >,
+    #[cfg(feature = "exec-private-init")] initial: Option<PrivateRuntimeImage<'_>>,
 ) -> io::Result<()> {
     #[cfg(feature = "fixed-syscall-gates")]
     {
@@ -678,8 +693,39 @@ fn install_runtime(
         reverie_inguest::guest::tool_region::StackBacking::ToolRegion(region),
     );
     PATCH_PUBLICATION.store(publication as u8, Ordering::Release);
-    prepare_instrumentation()?;
+    #[cfg(feature = "exec-native-injection")]
+    let preparation = initial
+        .as_ref()
+        .map_or(InstrumentationPreparation::Patcher, |image| {
+            image.preparation
+        });
+    #[cfg(not(feature = "exec-native-injection"))]
+    let preparation = InstrumentationPreparation::Patcher;
+    #[cfg(feature = "exec-native-injection")]
+    if matches!(preparation, InstrumentationPreparation::NativeTrapOnly)
+        && (SITE_PATCHING_ENABLED.load(Ordering::Acquire) || !vdso_sites.is_empty())
+    {
+        return Err(io::Error::other(
+            "native trap preparation requires patching off and no vDSO hooks",
+        ));
+    }
+    prepare_instrumentation(preparation)?;
     install_vdso_sites(vdso_sites)?;
+    #[cfg(feature = "exec-native-injection")]
+    let (initial, before_frontend) = match initial {
+        Some(image) => (Some(image.control), image.before_frontend),
+        None => (None, None),
+    };
+    #[cfg(all(feature = "exec-private-init", not(feature = "exec-native-injection")))]
+    let initial = initial.map(|image| image.control);
+    #[cfg(feature = "exec-native-injection")]
+    if let Some(restore) = before_frontend {
+        // Fresh actual collectors and site tables now exist. Consume the
+        // authenticated runtime/sequence restore once, before instruction
+        // frontend/dispatcher publication and before guest or observer work.
+        // Existing private guard-router preparation above remains unchanged.
+        restore()?;
+    }
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-254): Review launcher-selected RuntimeConfig at the install seam.
     #[cfg(feature = "exec-private-init")]
@@ -711,10 +757,24 @@ fn install_runtime(
         Box::new(unsafe { InGuestDispatcher::new(LiteinstSeam::new(stats, publication)) });
     #[cfg(feature = "exec-private-init")]
     if let Some(initial) = initial {
-        let inherited = initial
-            .controller(reverie_inguest::guest::tool_region::StackBacking::ToolRegion(region));
-        unsafe {
-            reverie_inguest::install(dispatcher, &inherited, &config)?;
+        match initial {
+            crate::tool_host::PrivateImageControl::Initial(initial) => {
+                let inherited = initial.controller(
+                    reverie_inguest::guest::tool_region::StackBacking::ToolRegion(region),
+                );
+                unsafe {
+                    reverie_inguest::install(dispatcher, &inherited, &config)?;
+                }
+            }
+            #[cfg(feature = "exec-native-injection")]
+            crate::tool_host::PrivateImageControl::Successor(successor) => {
+                let inherited = successor.controller(
+                    reverie_inguest::guest::tool_region::StackBacking::ToolRegion(region),
+                );
+                unsafe {
+                    reverie_inguest::install(dispatcher, &inherited, &config)?;
+                }
+            }
         }
     } else {
         unsafe {
@@ -963,7 +1023,7 @@ fn discover_arena_aliases(
     }
 }
 
-fn prepare_instrumentation() -> io::Result<()> {
+fn prepare_instrumentation(preparation: InstrumentationPreparation) -> io::Result<()> {
     crate::straddler::initialize_from_environment()?;
     // Initialization retains the guard router for modes that may publish
     // concurrently. Its SIGTRAP handler is installed through the runtime's
@@ -973,7 +1033,7 @@ fn prepare_instrumentation() -> io::Result<()> {
     // installed, and the callbacks below meet `GuardSignalRuntime`'s contract.
     unsafe { prepare_live_patching_with_signal_runtime(GUARD_SIGNAL_RUNTIME) }
         .map_err(|error| io::Error::other(error.to_string()))?;
-    prepare_instrumentation_state()
+    prepare_instrumentation_state(preparation)
 }
 
 /// LiteInst2's guard-router signal operations, done with the runtime's raw
@@ -1082,7 +1142,7 @@ unsafe fn restore_guard_default_action(
     unsafe { reverie_inguest::signal::raw_raise(signal) }
 }
 
-fn prepare_instrumentation_state() -> io::Result<()> {
+fn prepare_instrumentation_state(_preparation: InstrumentationPreparation) -> io::Result<()> {
     let page_size = reverie_inguest::guest::support::page_size()?;
     PAGE_SIZE.store(page_size, Ordering::Release);
 
@@ -1093,6 +1153,20 @@ fn prepare_instrumentation_state() -> io::Result<()> {
     SITES
         .set(sites)
         .map_err(|_| io::Error::other("LiteInst site registry initialized twice"))?;
+
+    #[cfg(feature = "exec-native-injection")]
+    match _preparation {
+        InstrumentationPreparation::Patcher => {}
+        InstrumentationPreparation::NativeTrapOnly => {
+            // No site can be patched in this admitted native domain. Retain
+            // the same zeroed site registry for accounting/cut validation,
+            // but never create unused executable memfd aliases that would
+            // violate the independently checked closed native image graph.
+            return ARENAS
+                .set(Vec::new())
+                .map_err(|_| io::Error::other("LiteInst arenas initialized twice"));
+        }
+    }
 
     let maps = std::fs::read_to_string("/proc/self/maps")?;
     let objects = parse_runtime_maps(&maps);
@@ -1320,6 +1394,9 @@ pub(crate) fn site_counts(address: u64) -> (u64, u64) {
 /// not tracked per-number. Sized to cover the whole current table with headroom.
 const TRACKED_SYSCALLS: usize = 512;
 
+#[cfg(feature = "native-exec-state")]
+const _: () = assert!(TRACKED_SYSCALLS == crate::native_exec_state::FALLBACK_BUCKETS);
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-249): Review public fallback-surface observability counters.
 /// Total and per-syscall counts for trapped sites without an installed hook
@@ -1339,10 +1416,16 @@ impl FallbackCounters {
     }
 
     fn record(&self, number: i64) {
+        #[cfg(feature = "native-exec-state")]
+        crate::native_exec_state::increment(&self.total, false);
+        #[cfg(not(feature = "native-exec-state"))]
         self.total.fetch_add(1, Ordering::Relaxed);
         if let Ok(index) = usize::try_from(number)
             && index < TRACKED_SYSCALLS
         {
+            #[cfg(feature = "native-exec-state")]
+            crate::native_exec_state::increment(&self.by_number[index], false);
+            #[cfg(not(feature = "native-exec-state"))]
             self.by_number[index].fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -1371,6 +1454,118 @@ impl FallbackCounters {
 /// Process-wide counters used by the installed runtime.
 static FALLBACK_COUNTERS: FallbackCounters = FallbackCounters::new();
 static FALLBACK_REFUSALS: FallbackCounters = FallbackCounters::new();
+
+#[cfg(feature = "native-exec-state")]
+pub(crate) fn native_exec_site_cut() -> Result<(), crate::native_exec_state::StateError> {
+    use crate::native_exec_state::StateError;
+    if TOOL_MODE.load(Ordering::Acquire) != TOOL_REVERIE
+        || SITE_PATCHING_ENABLED.load(Ordering::Acquire)
+        || INSTALL_HELD.load(Ordering::Acquire)
+    {
+        return Err(StateError::UnsupportedSites);
+    }
+    let sites = SITES.get().ok_or(StateError::MissingRuntime)?;
+    for slot in sites.iter() {
+        if slot.address.load(Ordering::Acquire) != 0
+            || slot.state.load(Ordering::Acquire) != 0
+            || !slot.hook.load(Ordering::Acquire).is_null()
+            || !slot.adapter.load(Ordering::Acquire).is_null()
+            || slot.mapping_end.load(Ordering::Acquire) != 0
+            || slot.trap_count.load(Ordering::Acquire) != 0
+            || slot.hook_count.load(Ordering::Acquire) != 0
+            || slot.instruction_len.load(Ordering::Acquire) != 0
+            || slot.straddle_prefix.load(Ordering::Acquire) != 0
+            || slot.publication_attempted.load(Ordering::Acquire)
+            || slot.original_word.load(Ordering::Acquire) != 0
+            || slot.published_word.load(Ordering::Acquire) != 0
+            || slot.words_recorded.load(Ordering::Acquire)
+        {
+            return Err(StateError::UnsupportedSites);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "native-exec-state")]
+pub(crate) fn native_exec_fallbacks() -> [crate::native_exec_state::FallbackState; 2] {
+    [&FALLBACK_COUNTERS, &FALLBACK_REFUSALS].map(|collector| {
+        crate::native_exec_state::FallbackState {
+            total: collector.total.load(Ordering::Acquire),
+            by_number: std::array::from_fn(|index| {
+                collector.by_number[index].load(Ordering::Acquire)
+            }),
+        }
+    })
+}
+
+#[cfg(feature = "native-exec-state")]
+pub(crate) fn check_native_exec_fallbacks(
+    expected: &[crate::native_exec_state::FallbackState; 2],
+) -> Result<(), crate::native_exec_state::StateError> {
+    use crate::native_exec_state::StateError;
+    for (collector, expected) in [&FALLBACK_COUNTERS, &FALLBACK_REFUSALS]
+        .into_iter()
+        .zip(expected)
+    {
+        if collector.total.load(Ordering::Acquire) != expected.total {
+            return Err(StateError::Changed);
+        }
+        for (counter, expected) in collector.by_number.iter().zip(&expected.by_number) {
+            if counter.load(Ordering::Acquire) != *expected {
+                return Err(StateError::Changed);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "native-exec-state")]
+pub(crate) fn restore_native_exec_fallbacks(values: &[crate::native_exec_state::FallbackState; 2]) {
+    for (collector, values) in [&FALLBACK_COUNTERS, &FALLBACK_REFUSALS]
+        .into_iter()
+        .zip(values)
+    {
+        collector.total.store(values.total, Ordering::Release);
+        for (counter, value) in collector.by_number.iter().zip(&values.by_number) {
+            counter.store(*value, Ordering::Release);
+        }
+    }
+}
+
+// Test setup uses genuine process-global collectors/site slots, but models the
+// install selector only. It is not an installed guest runtime or native credit.
+#[cfg(all(test, feature = "native-exec-state"))]
+pub(crate) fn prepare_native_exec_state_test() {
+    TOOL_MODE.store(TOOL_REVERIE, Ordering::Release);
+    SITE_PATCHING_ENABLED.store(false, Ordering::Release);
+    assert!(
+        SITES
+            .set(
+                (0..MAX_PATCH_SITES)
+                    .map(|_| SiteSlot::new())
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice()
+            )
+            .is_ok()
+    );
+}
+#[cfg(all(test, feature = "native-exec-state"))]
+pub(crate) fn contaminate_native_exec_state_test() {
+    SITES.get().unwrap()[0]
+        .publication_attempted
+        .store(true, Ordering::Release);
+}
+
+#[cfg(all(test, feature = "native-exec-state"))]
+pub(crate) fn record_native_exec_refusal_test(number: i64) {
+    FALLBACK_REFUSALS.record(number);
+}
+
+#[cfg(all(test, feature = "native-exec-state"))]
+pub(crate) fn seed_native_exec_fallback_test(value: u64) {
+    FALLBACK_COUNTERS.total.store(value, Ordering::Release);
+    FALLBACK_COUNTERS.by_number[511].store(value, Ordering::Release);
+}
 
 /// Record that one syscall reached fallback dispatch without an installed hook.
 ///
@@ -1439,6 +1634,8 @@ fn reset_site_observability(sites: &[SiteSlot]) {
 }
 
 pub(crate) fn reset_fallback_observability() {
+    #[cfg(feature = "native-exec-state")]
+    crate::native_exec_state::note_activity();
     // AUTONOMOUS-BOT-IMPLEMENTED
     FALLBACK_COUNTERS.reset();
     FALLBACK_REFUSALS.reset();
@@ -2902,13 +3099,24 @@ unsafe fn process_syscall(event: &mut SyscallEvent) {
     let tool_mode = TOOL_MODE.load(Ordering::Relaxed);
     // AUTONOMOUS-BOT-IMPLEMENTED
     if matches!(event.number, libc::SYS_execve | libc::SYS_execveat) {
-        event.result = -i64::from(libc::ENOTSUP);
-        if tool_mode != TOOL_REVERIE {
-            unsafe {
-                trace_event(event, Some(event.result));
+        // This observes only a native fallback callback and selects the same
+        // shared ToolHost. It grants no exec authority: its installed driver,
+        // original cut and injection guards still decide the operation.
+        #[cfg(feature = "exec-native-injection")]
+        let native_callback = tool_mode == TOOL_REVERIE
+            && matches!(event.dispatch, SyscallDispatch::Fallback)
+            && reverie_inguest::guest::exec_private::callback_native_tid().is_some();
+        #[cfg(not(feature = "exec-native-injection"))]
+        let native_callback = false;
+        if !native_callback {
+            event.result = -i64::from(libc::ENOTSUP);
+            if tool_mode != TOOL_REVERIE {
+                unsafe {
+                    trace_event(event, Some(event.result));
+                }
             }
+            return;
         }
-        return;
     }
     if tool_mode == TOOL_REVERIE && protect_runtime_control(event) {
         return;
@@ -3315,6 +3523,433 @@ mod tests {
 
     use super::SITE_PATCHING_ENABLED;
     use super::site_patching_enabled;
+
+    // These component controls run the production process_syscall -> installed
+    // ToolHost route. Private control publication is modeled; no driver, native
+    // admission, real SIGSYS/fallback frame or kernel exec is supplied.
+    #[cfg(feature = "exec-native-injection")]
+    mod native_exec_routing_fixture {
+        use std::collections::HashSet;
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        use std::sync::Arc;
+        use std::sync::Mutex;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        use reverie::Guest;
+        use reverie::Pid;
+        use reverie::syscalls::Syscall;
+        use reverie::syscalls::SyscallInfo;
+        use reverie::syscalls::Sysno;
+        use reverie_inguest::guest::event::SyscallDispatch;
+        use reverie_inguest::guest::exec_private::NativeControl;
+        use reverie_inguest::guest::host::ToolHost;
+        use reverie_inguest::guest::rpc::CoordinatorRpc;
+        use reverie_inguest::guest::rpc::GuestRpcStream;
+
+        unsafe extern "C" {
+            // This is the existing protected-control publication, not a new
+            // production fixture or admission entry point.
+            static reverie_inguest_private_exec_control: AtomicUsize;
+        }
+
+        #[derive(Default)]
+        struct RoutingGlobal;
+
+        #[reverie::global_tool]
+        impl reverie::GlobalTool for RoutingGlobal {
+            type Request = ();
+            type Response = ();
+            type Config = u64;
+
+            async fn receive_rpc(&self, _from: Pid, _message: ()) {
+                panic!("routing/no-driver injection must not issue an RPC");
+            }
+        }
+
+        #[derive(Default)]
+        struct RoutingTool {
+            seen: Arc<Mutex<Vec<i64>>>,
+        }
+
+        #[reverie::tool]
+        impl reverie::Tool for RoutingTool {
+            type GlobalState = RoutingGlobal;
+            type ThreadState = ();
+
+            async fn handle_syscall_event<G: Guest<Self>>(
+                &self,
+                guest: &mut G,
+                syscall: Syscall,
+            ) -> Result<i64, reverie::Error> {
+                let number = i64::from(syscall.number().id());
+                assert!(matches!(number, libc::SYS_execve | libc::SYS_execveat));
+                let (_, args) = syscall.into_parts();
+                assert_eq!(
+                    [
+                        args.arg0, args.arg1, args.arg2, args.arg3, args.arg4, args.arg5
+                    ],
+                    [0; 6],
+                    "the original operation must reach the real Tool unchanged"
+                );
+                self.seen.lock().unwrap().push(number);
+                // There is deliberately no native driver. A raw kernel call
+                // with these NULL arguments would return EFAULT, not ENOTSUP.
+                let errno = guest.inject(syscall).await.unwrap_err();
+                assert_eq!(errno, reverie::Errno::EOPNOTSUPP);
+                assert_eq!(guest.take_unsupported_refusal(), None);
+                Ok(-i64::from(errno.into_raw()))
+            }
+        }
+
+        struct RoutingRuntime;
+
+        impl reverie_inguest::guest::host::HostRuntime for RoutingRuntime {
+            fn fork_child_rebind(&self) {
+                panic!("routing dispatch must not fork");
+            }
+            fn emit_stage(&self, _stage: &[u8]) {}
+            fn fork_child_reset(&self, _event: &super::super::SyscallEvent) {
+                panic!("routing dispatch must not fork");
+            }
+            fn cpuid_interception_enabled(&self) -> bool {
+                false
+            }
+            fn exit_process_stats(&self, _tid: Pid) -> std::io::Result<()> {
+                panic!("routing dispatch must not exit");
+            }
+            fn read_clock(&self) -> std::io::Result<u64> {
+                panic!("routing dispatch must not read a branch clock");
+            }
+            fn signal_action_supported(&self, number: i64, args: [u64; 6]) -> bool {
+                reverie_inguest::guest::signal::signal_action_supported(number, args)
+            }
+            fn reserved_signal_mask(&self) -> u64 {
+                1_u64 << (libc::SIGSYS - 1)
+            }
+        }
+
+        struct ModeledControl {
+            native: Box<NativeControl>,
+            previous: usize,
+        }
+
+        impl ModeledControl {
+            fn new(case: &str, tid: i32) -> Self {
+                // All NativeControl fields are integer storage. Its exact ABI
+                // size/alignment and this prefix match exec_private.rs and
+                // private-control.h. This models publication only; it neither
+                // runs a native initializer nor fabricates launch authority.
+                assert_eq!(core::mem::size_of::<NativeControl>(), 3520);
+                assert_eq!(core::mem::align_of::<NativeControl>(), 64);
+                let mut native = Box::new(unsafe { core::mem::zeroed::<NativeControl>() });
+                let mut fs = 0_u64;
+                assert_eq!(
+                    unsafe {
+                        reverie_inguest::trap::raw_syscall6(
+                            libc::SYS_arch_prctl,
+                            [0x1003, (&raw mut fs) as u64, 0, 0, 0, 0],
+                        )
+                    },
+                    0
+                );
+                let phase = match case {
+                    "phase2" => 2,
+                    "phase3" => 3,
+                    "phase6" => 6,
+                    _ => 4,
+                };
+                let fields = [
+                    (0, 1), // ABI version
+                    (1, core::mem::size_of::<NativeControl>() as u64),
+                    (2, phase),
+                    (4, if case == "wrong-fs" { fs ^ 8 } else { fs }),
+                    (9, u64::from(case != "not-ready")),
+                    (15, (tid + i32::from(case == "wrong-tid")) as u64),
+                    (46, 3), // Modeled ready callback after restoration.
+                ];
+                for (index, value) in fields {
+                    unsafe {
+                        (&raw mut *native)
+                            .cast::<u64>()
+                            .add(index)
+                            .write_volatile(value);
+                    }
+                }
+                let previous = unsafe {
+                    reverie_inguest_private_exec_control
+                        .swap((&raw mut *native) as usize, Ordering::AcqRel)
+                };
+                assert_eq!(previous, 0, "isolated child already published a control");
+                Self { native, previous }
+            }
+        }
+
+        impl Drop for ModeledControl {
+            fn drop(&mut self) {
+                let pointer = (&raw mut *self.native) as usize;
+                assert_eq!(
+                    unsafe {
+                        reverie_inguest_private_exec_control.swap(self.previous, Ordering::AcqRel)
+                    },
+                    pointer,
+                    "restore publication before retiring its owned storage"
+                );
+            }
+        }
+
+        pub(super) fn run(positive: bool) {
+            let cases: &[&str] = if positive {
+                &["native"]
+            } else {
+                &[
+                    "no-control",
+                    "passthrough",
+                    "compat",
+                    "strace",
+                    "phase2",
+                    "phase3",
+                    "phase6",
+                    "not-ready",
+                    "wrong-tid",
+                    "wrong-fs",
+                    "trap",
+                    "installed-hook",
+                ]
+            };
+            for case in cases {
+                // A fork child is the real process leader, unlike a libtest
+                // worker thread. It also owns isolated publication/host state.
+                let child = unsafe { libc::fork() };
+                assert!(child >= 0);
+                if child == 0 {
+                    let status = if std::panic::catch_unwind(|| run_case(positive, case)).is_ok() {
+                        0
+                    } else {
+                        125
+                    };
+                    unsafe { libc::_exit(status) };
+                }
+                let mut status = 0;
+                assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+                assert!(libc::WIFEXITED(status), "case={case}: status={status:#x}");
+                assert_eq!(libc::WEXITSTATUS(status), 0, "case={case}: child failed");
+            }
+        }
+
+        fn run_case(positive: bool, case: &str) {
+            assert_eq!(positive, case == "native");
+            let tid = unsafe { reverie_inguest::trap::raw_syscall6(libc::SYS_gettid, [0; 6]) };
+            assert_eq!(tid, unsafe {
+                reverie_inguest::trap::raw_syscall6(libc::SYS_getpid, [0; 6])
+            });
+            let tid = i32::try_from(tid).unwrap();
+            let (stream, mut peer) = UnixStream::pair().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let config = reverie_rpc_transport::codec::encode(&902_u64).unwrap();
+            peer.write_all(&(config.len() as u32).to_be_bytes())
+                .unwrap();
+            peer.write_all(&config).unwrap();
+            let client = reverie_rpc_transport::BlockingRpcClient::<RoutingGlobal, _>::from_connected_stream(
+                GuestRpcStream::from(stream), Pid::from_raw(tid),
+            ).unwrap();
+            let rpc =
+                CoordinatorRpc::from_live_client("unused-routing-component", client, |_, _| {
+                    panic!("routing component must not reconnect")
+                })
+                .unwrap();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let host = ToolHost::new(
+                RoutingTool { seen: seen.clone() },
+                rpc,
+                Pid::from_raw(tid),
+                HashSet::from([Sysno::execve, Sysno::execveat]),
+                false,
+                RoutingRuntime,
+            );
+            // Publish one real shared host with no native exec driver. The
+            // private-control state below is a modeled observation fixture.
+            unsafe { reverie_inguest::guest::installed_tool::publish_tool(host) }.unwrap();
+            let control = (case != "no-control").then(|| ModeledControl::new(case, tid));
+            let expected_callback = !matches!(
+                case,
+                "no-control"
+                    | "phase2"
+                    | "phase3"
+                    | "phase6"
+                    | "not-ready"
+                    | "wrong-tid"
+                    | "wrong-fs"
+            );
+            assert_eq!(
+                reverie_inguest::guest::exec_private::callback_native_tid(),
+                expected_callback.then_some(tid),
+                "case={case}: independently verify the actual observation predicate"
+            );
+            super::super::TOOL_MODE.store(
+                match case {
+                    "passthrough" => 0,
+                    "compat" => super::super::TOOL_COMPAT,
+                    "strace" => super::super::TOOL_STRACE,
+                    _ => super::super::TOOL_REVERIE,
+                },
+                Ordering::Release,
+            );
+            super::super::EVENT_FD.store(libc::STDERR_FILENO, Ordering::Release);
+            super::super::EVENT_COOKIE.store(0, Ordering::Release);
+            for (index, number) in [libc::SYS_execve, libc::SYS_execveat]
+                .into_iter()
+                .enumerate()
+            {
+                let mut event = super::super::SyscallEvent {
+                    number,
+                    args: [0; 6],
+                    instruction_pointer: 0,
+                    result: super::super::UNSET_RESULT,
+                    context: 0,
+                    dispatch: match case {
+                        "trap" => SyscallDispatch::Trap,
+                        "installed-hook" => SyscallDispatch::InstalledHook,
+                        _ => SyscallDispatch::Fallback,
+                    },
+                    guest_pkru: None,
+                };
+                // Exercise the exact production routing function. No test
+                // dispatcher, route predicate mirror or physical exec leaf.
+                unsafe { super::super::process_syscall(&mut event) };
+                assert_eq!(event.result, -i64::from(libc::EOPNOTSUPP));
+                let actual = seen.lock().unwrap();
+                if positive {
+                    assert_eq!(
+                        actual.as_slice(),
+                        &[libc::SYS_execve, libc::SYS_execveat][..=index],
+                        "case={case}: production routing did not reach the real Tool handler"
+                    );
+                } else {
+                    assert!(
+                        actual.is_empty(),
+                        "case={case}: pre-Tool exec refusal bypassed"
+                    );
+                }
+            }
+            drop(control); // Unpublish before fixture storage retirement.
+            // No request may have been emitted through the retained real RPC.
+            peer.set_nonblocking(true).unwrap();
+            let mut byte = [0_u8; 1];
+            assert_eq!(
+                std::io::Read::read(&mut peer, &mut byte)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "exec-native-injection")]
+    fn native_exec_fallback_reaches_shared_tool_handler_without_granting_exec() {
+        native_exec_routing_fixture::run(true);
+    }
+
+    #[test]
+    #[cfg(feature = "exec-native-injection")]
+    fn ordinary_and_noncallback_exec_keep_pre_tool_refusal() {
+        native_exec_routing_fixture::run(false);
+    }
+
+    #[test]
+    #[cfg(feature = "exec-native-injection")]
+    fn native_preparation_has_no_executable_arena_and_patcher_keeps_real_aliases() {
+        const CHILD: &str = "REVERIE_LITEINST_PREPARATION_TEST_CHILD";
+        let Some(mode) = std::env::var_os(CHILD) else {
+            for mode in ["native", "patcher"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "runtime::tests::native_preparation_has_no_executable_arena_and_patcher_keeps_real_aliases",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env(CHILD, mode)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{mode}: {output:?}");
+                assert!(
+                    String::from_utf8(output.stdout)
+                        .unwrap()
+                        .contains("1 passed"),
+                    "the exact preparation child must execute"
+                );
+            }
+            return;
+        };
+        let preparation = match mode.to_str().unwrap() {
+            "native" => super::InstrumentationPreparation::NativeTrapOnly,
+            "patcher" => super::InstrumentationPreparation::Patcher,
+            _ => panic!("unknown preparation child"),
+        };
+        // Run the same resource-preparation function the actual installer
+        // calls, in a fresh process. This does not invent a native control,
+        // install a frontend, or claim native launch authority.
+        let before = super::read_runtime_maps().unwrap();
+        super::prepare_instrumentation_state(preparation).unwrap();
+        let after = super::read_runtime_maps().unwrap();
+        let before_exec = before
+            .iter()
+            .filter(|map| map.executable)
+            .collect::<Vec<_>>();
+        let after_exec = after
+            .iter()
+            .filter(|map| map.executable)
+            .collect::<Vec<_>>();
+        let arenas = super::ARENAS.get().unwrap();
+        assert_eq!(SITES.get().unwrap().len(), MAX_PATCH_SITES);
+        assert!(SITES.get().unwrap().iter().all(|site| {
+            site.address.load(Ordering::Acquire) == 0
+                && site.state.load(Ordering::Acquire) == 0
+                && !site.publication_attempted.load(Ordering::Acquire)
+                && site.hook.load(Ordering::Acquire).is_null()
+                && site.adapter.load(Ordering::Acquire).is_null()
+        }));
+        match preparation {
+            super::InstrumentationPreparation::NativeTrapOnly => {
+                assert!(arenas.is_empty());
+                assert_eq!(
+                    after_exec, before_exec,
+                    "native preparation added executable code"
+                );
+            }
+            super::InstrumentationPreparation::Patcher => {
+                assert!(
+                    !arenas.is_empty(),
+                    "ordinary patcher still requires real arenas"
+                );
+                let added = after_exec
+                    .iter()
+                    .filter(|map| !before_exec.contains(map))
+                    .collect::<Vec<_>>();
+                assert_eq!(added.len(), arenas.len());
+                for executable in added {
+                    assert_ne!(executable.inode, 0);
+                    assert!(!executable.writable);
+                    assert!(
+                        after.iter().any(|writable| {
+                            writable.writable
+                                && !writable.executable
+                                && writable.device == executable.device
+                                && writable.inode == executable.inode
+                        }),
+                        "patch arena lost its actual RW/RX identity join"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn site_patching_enabled_reports_the_captured_setting() {
