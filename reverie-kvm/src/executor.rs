@@ -17718,10 +17718,10 @@ const SYNTHETIC_GUEST_FD_DEV_MINOR: u32 = 0xff02;
 // carried TODO-HUMAN-REVIEW(PR-231) (meminfo parity with Hermit's memory
 // persona) and TODO-HUMAN-REVIEW(PR-224) (the vmstat and osrelease surfaces
 // and their regression test); those reviews now apply to Detcore's
-// renderings.
+// renderings. /proc/loadavg followed, once Detcore rendered it as a fixed
+// file; its KVM copy carried no marker.
 const SYNTHETIC_REGULAR_PROC_PATHS: &[&[u8]] = &[
     b"/proc/uptime",
-    b"/proc/loadavg",
     b"/proc/mounts",
     b"/proc/self/mounts",
     b"/proc/self/mountinfo",
@@ -17867,7 +17867,6 @@ fn synthetic_proc_content(state: &LoadedStaticElf, path: &[u8]) -> Option<Vec<u8
     let normalized = normalize_proc_path(state, path)?;
     let content = match normalized.as_slice() {
         b"/proc/uptime" => b"0.00 0.00\n".to_vec(),
-        b"/proc/loadavg" => b"0.00 0.00 0.00 1/1 1\n".to_vec(),
         b"/proc/mounts" | b"/proc/self/mounts" => state.proc_mounts.mounts.clone(),
         // Absolute guest paths and owned descriptors use this same ambient
         // namespace. The Tool normalizes its real mount identities together
@@ -27953,7 +27952,7 @@ mod tests {
         );
     }
 
-    /// Detcore renders these five files on every backend (Hermit's fixed
+    /// Detcore renders these six files on every backend (Hermit's fixed
     /// procfs tables), so the KVM executor no longer has a copy: no synthetic
     /// content, no synthetic inode, and a direct open from a guest that runs
     /// without the Tool meets the real-procfs refusal instead of a second,
@@ -27969,6 +27968,7 @@ mod tests {
             "/proc/meminfo",
             "/proc/vmstat",
             "/proc/sys/kernel/osrelease",
+            "/proc/loadavg",
         ] {
             assert!(
                 synthetic_proc_content(&state, path.as_bytes()).is_none(),
