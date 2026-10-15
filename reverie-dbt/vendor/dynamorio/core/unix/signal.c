@@ -3012,6 +3012,58 @@ signal_injection_permitted(dcontext_t *dcontext, int sysnum)
 }
 
 bool
+signal_begin_injected_sigpipe(dcontext_t *dcontext, int sysnum, int guest_pid)
+{
+#if defined(LINUX) && defined(X86_64)
+    thread_sig_info_t *info = (thread_sig_info_t *)dcontext->signal_field;
+    if (guest_pid <= 0 || info->injected_sigpipe_guest_pid != 0)
+        return false;
+    switch (sysnum) {
+    case SYS_write:
+    case SYS_writev:
+    case SYS_pwrite64:
+    case SYS_pwritev:
+    case SYS_pwritev2: break;
+    default: return false;
+    }
+    kernel_sigset_t physical;
+    /* Query, do not change, the physical mask. This boundary also lets an
+     * already kernel-pending unblocked SIGPIPE arrive before attribution starts.
+     * App blocking is separately emulated by the existing DR signal owner. */
+    if (sigprocmask_syscall(SIG_SETMASK, NULL, &physical, sizeof(physical)) != 0 ||
+        kernel_sigismember(&physical, SIGPIPE))
+        return false;
+    info->injected_sigpipe_host_pid = get_process_id();
+    info->injected_sigpipe_guest_pid = guest_pid;
+    return true;
+#else
+    return false;
+#endif
+}
+
+void
+signal_end_injected_sigpipe(dcontext_t *dcontext)
+{
+    thread_sig_info_t *info = (thread_sig_info_t *)dcontext->signal_field;
+    info->injected_sigpipe_guest_pid = 0;
+    info->injected_sigpipe_host_pid = 0;
+}
+
+static int
+injected_sigpipe_identity(thread_sig_info_t *info, int sig,
+                          const sigcontext_t *sc, const kernel_siginfo_t *si)
+{
+#if defined(LINUX) && defined(X86_64)
+    if (info->injected_sigpipe_guest_pid > 0 && sig == SIGPIPE &&
+        sc->SC_XIP == (ptr_uint_t)dynamorio_sigpipe_syscall_return &&
+        (ptr_int_t)sc->SC_RETURN_REG == -EPIPE && si->si_code == SI_USER &&
+        si->si_pid == info->injected_sigpipe_host_pid)
+        return info->injected_sigpipe_guest_pid;
+#endif
+    return 0;
+}
+
+bool
 signal_begin_injected_sigsuspend(dcontext_t *dcontext)
 {
     thread_sig_info_t *info = (thread_sig_info_t *)dcontext->signal_field;
@@ -5403,6 +5455,8 @@ record_pending_signal(dcontext_t *dcontext, int sig, kernel_ucontext_t *ucxt,
     sigpending_t *pend;
     fragment_t *f = NULL;
     fragment_t wrapper;
+    const int injected_sigpipe_pid = IF_LINUX_ELSE(
+        forged ? 0 : injected_sigpipe_identity(info, sig, sc, &frame->info), 0);
 
     /* We no longer block SUSPEND_SIGNAL (i#184/PR 450670) or SIGSEGV (i#193/PR 287309).
      * But we can have re-entrancy issues in this routine if the app uses the same
@@ -5458,7 +5512,8 @@ record_pending_signal(dcontext_t *dcontext, int sig, kernel_ucontext_t *ucxt,
         LOG(THREAD, LOG_ASYNCH, 2,
             "record_pending_signal(%d at pc " PFX "): signal is currently blocked\n", sig,
             pc);
-        IF_LINUX(handled = notify_signalfd(dcontext, info, sig, frame));
+        IF_LINUX(handled = notify_signalfd(dcontext, info, sig, frame,
+                                           injected_sigpipe_pid));
 
         /* TODO i#1188: Similarly to signalfd, deliver to a sigwait-ing thread if we
          * avoid the actual sigwait syscall for handling it.
@@ -5868,6 +5923,7 @@ record_pending_signal(dcontext_t *dcontext, int sig, kernel_ucontext_t *ucxt,
              *  construct our own frame...kind of a pain.
              */
             copy_frame_to_pending(dcontext, sig, frame, access_address);
+            pend->injected_sigpipe_pid = injected_sigpipe_pid;
 
             /* i#1145: check whether we should auto-restart an interrupted syscall */
             if (at_auto_restart_syscall) {
@@ -7068,6 +7124,8 @@ commit_pending_signal(dcontext_t *dcontext, int sig, sigpending_t *pending,
         return true;
     }
     CLIENT_ASSERT(action == DR_SIGNAL_DELIVER, "invalid signal event return value");
+    if (pending->injected_sigpipe_pid > 0)
+        frame->info.si_pid = pending->injected_sigpipe_pid;
 
     kernel_sigset_t *return_mask = NULL;
 #ifdef LINUX
@@ -7261,8 +7319,10 @@ dr_signal_admission_resume(void *drcontext, uint64 token, int delivery_signal,
         memcpy(&selected, replacement, sizeof(selected));
         if (selected.si_signo != sig)
             return false;
-        if (delivery_signal == sig)
+        if (delivery_signal == sig) {
             pending->rt_frame.info = selected;
+            pending->injected_sigpipe_pid = 0;
+        }
     }
     /* The native commit has the same short pending-heap exclusion as ordinary
      * delivery, including its unwritable-stack failure path. No Tool code or

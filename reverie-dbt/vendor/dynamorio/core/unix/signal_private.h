@@ -352,6 +352,9 @@ typedef struct _sigpending_t {
     bool use_sigcontext;
     /* Was this unblocked at receive time? */
     bool unblocked_at_receipt;
+    /* Optional projection for this fresh EPIPE receipt only. The frame stays
+     * authentic for client policy; explicit replacement clears this fact. */
+    int injected_sigpipe_pid;
     struct _sigpending_t *next;
     /* The detached pending allocation owns both continuations. Keep the ordinary
      * context out of thread_sig_info_t: clone_record_t copies that structure onto
@@ -527,6 +530,10 @@ typedef struct _thread_sig_info_t {
     sigpending_t *admission_return;
     uint64 admission_token;
     int admission_signal;
+    /* Scoped to a private returning write syscall, never a runtime write.
+     * Plain integers: receipt must not call a locking client identity map. */
+    int injected_sigpipe_guest_pid;
+    int injected_sigpipe_host_pid;
     bool admission_pre_mask_valid;
     kernel_sigset_t admission_pre_mask;
     bool admission_in_sigsuspend;
@@ -734,7 +741,7 @@ signalfd_thread_exit(dcontext_t *dcontext, thread_sig_info_t *info);
 
 bool
 notify_signalfd(dcontext_t *dcontext, thread_sig_info_t *info, int sig,
-                sigframe_rt_t *frame);
+                sigframe_rt_t *frame, int injected_sigpipe_pid);
 
 void
 check_signals_pending(dcontext_t *dcontext, thread_sig_info_t *info);

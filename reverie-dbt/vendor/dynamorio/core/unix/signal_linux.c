@@ -484,7 +484,7 @@ handle_pre_signalfd(dcontext_t *dcontext, int fd, kernel_sigset_t *mask, size_t 
 
 bool
 notify_signalfd(dcontext_t *dcontext, thread_sig_info_t *info, int sig,
-                sigframe_rt_t *frame)
+                sigframe_rt_t *frame, int injected_sigpipe_pid)
 {
     sigfd_pipe_t *pipe = info->signalfd[sig];
     if (pipe != NULL) {
@@ -501,7 +501,8 @@ notify_signalfd(dcontext_t *dcontext, thread_sig_info_t *info, int sig,
         towrite.ssi_signo = sig;
         towrite.ssi_errno = frame->info.si_errno;
         towrite.ssi_code = frame->info.si_code;
-        towrite.ssi_pid = frame->info.si_pid;
+        towrite.ssi_pid = injected_sigpipe_pid > 0 ? injected_sigpipe_pid
+                                                  : frame->info.si_pid;
         towrite.ssi_uid = frame->info.si_uid;
         towrite.ssi_fd = frame->info.si_fd;
         towrite.ssi_band = frame->info.si_band;

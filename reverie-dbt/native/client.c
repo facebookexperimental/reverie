@@ -2513,8 +2513,15 @@ invoke_raw_syscall(uintptr_t context, int64_t sysnum, const uint64_t* args) {
   reg_t raw_args[6];
   for (int i = 0; i < 6; ++i) raw_args[i] = (reg_t)args[i];
   dr_syscall_invoke_result_t invocation;
-  if (!dr_invoke_syscall_as_app_with_result(
-          (void*)context, (int)sysnum, 6, raw_args, &invocation)) {
+  /* Resolve outside signal receipt: the existing map owns identity, and its
+   * lock is not async-signal-safe. DR attributes only this write's fresh EPIPE
+   * receipt; queued payloads and explicit Tool replacements remain untouched. */
+  int32_t sigpipe_pid = 0;
+  if (sysnum == SYS_write || sysnum == SYS_writev || sysnum == SYS_pwrite64 ||
+      sysnum == SYS_pwritev || sysnum == SYS_pwritev2)
+    sigpipe_pid = virtualize_host_identity(dr_get_process_id());
+  if (!dr_invoke_syscall_as_app_with_result_and_sigpipe_identity(
+          (void*)context, (int)sysnum, 6, raw_args, sigpipe_pid, &invocation)) {
     dr_fprintf(diagnostic_file,
                "reverie-dbt: returning syscall injection ownership refused\n");
     exit_runtime_tree(101);

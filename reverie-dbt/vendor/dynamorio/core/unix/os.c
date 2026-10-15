@@ -5988,11 +5988,10 @@ dr_invoke_syscall_as_app(void *drcontext, int sysnum, int arg_count, ...)
 }
 
 #ifdef LINUX
-DR_API
-bool
-dr_invoke_syscall_as_app_with_result(void *drcontext, int sysnum, int arg_count,
-                                    const reg_t *args,
-                                    dr_syscall_invoke_result_t *result)
+static bool
+invoke_syscall_as_app_with_result(void *drcontext, int sysnum, int arg_count,
+                                  const reg_t *args, int guest_process_id,
+                                  dr_syscall_invoke_result_t *result)
 {
     dcontext_t *dcontext = (dcontext_t *)drcontext;
     if (dcontext == NULL || dcontext == GLOBAL_DCONTEXT ||
@@ -6027,11 +6026,19 @@ dr_invoke_syscall_as_app_with_result(void *drcontext, int sysnum, int arg_count,
          * Executing the original varargs here bypasses those substitutions. */
         for (int i = 0; i < arg_count; ++i)
             actual_args[i] = sys_param(dcontext, i);
-        result->value = suspend ? signal_wait_injected_sigsuspend(dcontext)
-                                : dynamorio_syscall(dcontext->sys_num, arg_count,
-                                                    actual_args[0], actual_args[1],
-                                                    actual_args[2], actual_args[3],
-                                                    actual_args[4], actual_args[5]);
+#    ifdef X86_64
+        bool sigpipe = signal_begin_injected_sigpipe(dcontext, dcontext->sys_num,
+                                                     guest_process_id);
+        if (sigpipe) {
+            result->value = dynamorio_sigpipe_syscall(dcontext->sys_num, actual_args);
+            signal_end_injected_sigpipe(dcontext);
+        } else
+#    endif
+            result->value = suspend ? signal_wait_injected_sigsuspend(dcontext)
+                                    : dynamorio_syscall(dcontext->sys_num, arg_count,
+                                                        actual_args[0], actual_args[1],
+                                                        actual_args[2], actual_args[3],
+                                                        actual_args[4], actual_args[5]);
         MCXT_SYSCALL_RES(mc) = result->value;
         post_system_call(dcontext);
     }
@@ -6052,6 +6059,26 @@ dr_invoke_syscall_as_app_with_result(void *drcontext, int sysnum, int arg_count,
     MCXT_SYSCALL_RES(mc) = saved_result;
     MCXT_SYSNUM_REG(mc) = saved_sysnum;
     return true;
+}
+
+DR_API
+bool
+dr_invoke_syscall_as_app_with_result(void *drcontext, int sysnum, int arg_count,
+                                    const reg_t *args,
+                                    dr_syscall_invoke_result_t *result)
+{
+    return invoke_syscall_as_app_with_result(drcontext, sysnum, arg_count, args, 0,
+                                             result);
+}
+
+DR_API
+bool
+dr_invoke_syscall_as_app_with_result_and_sigpipe_identity(
+    void *drcontext, int sysnum, int arg_count, const reg_t *args,
+    int guest_process_id, dr_syscall_invoke_result_t *result)
+{
+    return invoke_syscall_as_app_with_result(drcontext, sysnum, arg_count, args,
+                                             guest_process_id, result);
 }
 #endif
 

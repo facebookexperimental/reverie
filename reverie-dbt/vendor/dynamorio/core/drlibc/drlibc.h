@@ -72,6 +72,12 @@ dynamorio_mach_syscall(uint sysnum, uint num_args, ...);
 #    else
 ptr_int_t
 dynamorio_syscall(uint sysnum, uint num_args, ...);
+#        if defined(LINUX) && defined(X86_64)
+ptr_int_t
+dynamorio_sigpipe_syscall(uint sysnum, const reg_t args[6]);
+void
+dynamorio_sigpipe_syscall_return(void);
+#        endif
 /* Wrapper for clone().
  * N.B. func must not return.
  * On x86 (32 and 64-bit) this supports passing NULL for newsp which is just

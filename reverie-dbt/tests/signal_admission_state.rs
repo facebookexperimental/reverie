@@ -264,3 +264,57 @@ fn owned_signal_preserves_native_fp_restart_and_masks() {
     assert!(stdout.contains("returning injections entries=1 completions=1"));
     assert!(stdout.contains("signals=1 admissions=1 commits=1 restart_contexts=0"));
 }
+
+#[test]
+fn injected_sigpipe_projects_only_fresh_epipe_and_preserves_replacements() {
+    let directory = tempfile::tempdir().expect("SIGPIPE fixture directory");
+    let source =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/signal_admission_state");
+    let cmake = std::env::var_os("CMAKE").unwrap_or_else(|| "cmake".into());
+    bounded(
+        Command::new(&cmake)
+            .arg("-S")
+            .arg(source)
+            .arg("-B")
+            .arg(directory.path())
+            .arg("-DCMAKE_BUILD_TYPE=Release")
+            .arg(format!(
+                "-DDynamoRIO_DIR={}",
+                reverie_dbt::bundled_dynamorio_cmake_dir().display()
+            )),
+    );
+    bounded(
+        Command::new(&cmake)
+            .arg("--build")
+            .arg(directory.path())
+            .args([
+                "--parallel",
+                "2",
+                "--target",
+                "signal_admission_sigpipe_client",
+                "signal_admission_sigpipe_guest",
+            ]),
+    );
+    let guest = directory.path().join("signal_admission_sigpipe_guest");
+    let client = directory
+        .path()
+        .join("libsignal_admission_sigpipe_client.so");
+    bounded(Command::new(&guest).arg("native"));
+    for mode in ["project", "replace"] {
+        let output = bounded(
+            Command::new(reverie_dbt::bundled_drrun_path())
+                .arg("-c")
+                .arg(&client)
+                .arg(mode)
+                .arg("--")
+                .arg(&guest)
+                .arg(mode),
+        );
+        let stdout = String::from_utf8(output.stdout).expect("SIGPIPE fixture stdout");
+        assert!(
+            stdout
+                .contains("SIGPIPE guest: EPIPE handler/read/readv and queued collision preserved")
+        );
+        assert!(stdout.contains("SIGPIPE client: raw admissions=5 commits=5"));
+    }
+}

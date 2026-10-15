@@ -196,6 +196,29 @@ syscall_success:
         ret
         END_FUNC(dynamorio_syscall)
 
+# if defined(LINUX) && defined(X64)
+/* Returning application injection with a unique receipt PC. Internal DR writes
+ * use dynamorio_syscall and cannot acquire this injection's SIGPIPE identity.
+ * Signature: dynamorio_sigpipe_syscall(sysnum, pointer_to_six_args).
+ */
+        DECLARE_FUNC(dynamorio_sigpipe_syscall)
+GLOBAL_LABEL(dynamorio_sigpipe_syscall:)
+        mov      rax, ARG1
+        mov      r11, ARG2
+        mov      rdi, [r11]
+        mov      rsi, [r11 + 8]
+        mov      rdx, [r11 + 16]
+        mov      r10, [r11 + 24]
+        mov      r8, [r11 + 32]
+        mov      r9, [r11 + 40]
+        syscall
+        DECLARE_FUNC(dynamorio_sigpipe_syscall_return)
+GLOBAL_LABEL(dynamorio_sigpipe_syscall_return:)
+        ret
+        END_FUNC(dynamorio_sigpipe_syscall_return)
+        END_FUNC(dynamorio_sigpipe_syscall)
+# endif
+
 # ifdef MACOS
 /* Mach dep syscall invocation.
  * Signature: dynamorio_mach_dep_syscall(sysnum, num_args, arg1, arg2, ...)

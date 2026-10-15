@@ -382,6 +382,10 @@ bool
 signal_begin_injected_sigsuspend(dcontext_t *dcontext);
 bool
 signal_injection_permitted(dcontext_t *dcontext, int sysnum);
+bool
+signal_begin_injected_sigpipe(dcontext_t *dcontext, int sysnum, int guest_pid);
+void
+signal_end_injected_sigpipe(dcontext_t *dcontext);
 reg_t
 signal_wait_injected_sigsuspend(dcontext_t *dcontext);
 struct _dr_syscall_invoke_result_t;
