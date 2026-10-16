@@ -45,9 +45,16 @@ use crate::elf::initialize_regular_create_directory_policy;
 use crate::elf::load_static_elf_with_execfn;
 use crate::elf::resolve_executable_path;
 use crate::memory::AllocationCursors;
-use crate::memory::HostMemoryOperand;
 use crate::memory::MMAP_BASE;
 use crate::memory::RegionKind;
+use crate::provider_memory::Access;
+use crate::provider_memory::AddressSpace;
+use crate::provider_memory::Discarded;
+use crate::provider_memory::GuestMemoryAccess;
+use crate::provider_memory::LentOperand;
+use crate::provider_memory::LentOperandMut;
+use crate::provider_memory::MapError;
+use crate::provider_memory::RangeState;
 use crate::signal::GuestStack;
 use crate::signal::KERNEL_SIGACTION_SIZE;
 use crate::signal::KERNEL_SIGSET_SIZE;
@@ -1349,7 +1356,7 @@ fn execute_basic_syscall_inner(
 }
 
 // TODO-HUMAN-REVIEW(PR-172): Review host-backed futex address and timeout translation.
-fn futex(memory: &GuestMemory, args: &[u64; 6]) -> i64 {
+fn futex<M: GuestMemoryAccess>(memory: &M, args: &[u64; 6]) -> i64 {
     let operation = args[1] as libc::c_int;
     let command = operation & libc::FUTEX_CMD_MASK;
     // sys_futex imports and validates timeout-bearing commands before
@@ -1448,7 +1455,7 @@ fn futex(memory: &GuestMemory, args: &[u64; 6]) -> i64 {
         }
         match guest_host_address(memory, args[4], std::mem::size_of::<u32>()) {
             Ok(operand) => {
-                let address = operand.address();
+                let address = operand.host_address();
                 second_operand = Some(operand);
                 address
             }
@@ -1466,7 +1473,7 @@ fn futex(memory: &GuestMemory, args: &[u64; 6]) -> i64 {
     let result = unsafe {
         libc::syscall(
             libc::SYS_futex,
-            uaddr.address(),
+            uaddr.host_address(),
             operation,
             args[2] as u32,
             fourth,
@@ -1541,14 +1548,13 @@ fn get_robust_list(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u6
     0
 }
 
-fn guest_host_address(
-    memory: &GuestMemory,
+fn guest_host_address<M: GuestMemoryAccess>(
+    memory: &M,
     guest_address: u64,
     length: usize,
-) -> Result<HostMemoryOperand, i64> {
+) -> Result<M::Lent, i64> {
     memory
-        .user()
-        .host_operand(guest_address, length)
+        .lend(guest_address, length)
         .map_err(|_| negative_errno(libc::EFAULT))
 }
 
@@ -2795,7 +2801,7 @@ impl FdinfoTarget {
 }
 
 impl FdinfoDescription {
-    fn read(&self, memory: &mut GuestMemory, args: &[u64; 6], positioned: bool) -> i64 {
+    fn read<M: GuestMemoryAccess>(&self, memory: &mut M, args: &[u64; 6], positioned: bool) -> i64 {
         let Ok(count) = usize::try_from(args[2]) else {
             return negative_errno(libc::EINVAL);
         };
@@ -2818,7 +2824,6 @@ impl FdinfoDescription {
             || self.observe(),
             |bytes| {
                 memory
-                    .user()
                     .copy_to_user_prefix(args[1], bytes)
                     .map_err(|_| negative_errno(libc::EFAULT))
             },
@@ -8791,11 +8796,15 @@ fn host_write(fd: RawFd, bytes: &[u8]) -> i64 {
     }
 }
 
-fn prepare_host_read(memory: &GuestMemory, address: u64, length: usize) -> Result<Vec<u8>, i64> {
+fn prepare_host_read<M: GuestMemoryAccess + AddressSpace>(
+    memory: &M,
+    address: u64,
+    length: usize,
+) -> Result<Vec<u8>, i64> {
     if !range_is_valid(memory, address, length as u64) {
         return Err(negative_errno(libc::EFAULT));
     }
-    let Ok(writable) = memory.user().user_accessible_prefix(address, length) else {
+    let Ok(writable) = memory.accessible_prefix(address, length, Access::Read) else {
         return Err(negative_errno(libc::EFAULT));
     };
     if writable == 0 && length != 0 {
@@ -9271,7 +9280,11 @@ fn read(
     Ok(host_read(memory, host_fd, args[1], length))
 }
 
-fn pread64(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+fn pread64<M: GuestMemoryAccess + AddressSpace>(
+    memory: &mut M,
+    state: &LoadedStaticElf,
+    args: &[u64; 6],
+) -> i64 {
     if (args[3] as libc::off_t) < 0 {
         return negative_errno(libc::EINVAL);
     }
@@ -9296,7 +9309,7 @@ fn pread64(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -
     if !range_is_valid(memory, args[1], length as u64) {
         return negative_errno(libc::EFAULT);
     }
-    let Ok(writable) = memory.user().user_accessible_prefix(args[1], length) else {
+    let Ok(writable) = memory.accessible_prefix(args[1], length, Access::Read) else {
         return negative_errno(libc::EFAULT);
     };
     if writable == 0 {
@@ -9304,7 +9317,7 @@ fn pread64(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -
     }
     let mut bytes = vec![0; writable];
     match file.read_at(&mut bytes, args[3]) {
-        Ok(count) => match memory.user().write(args[1], &bytes[..count]) {
+        Ok(count) => match memory.write_exact(args[1], &bytes[..count]) {
             Ok(()) => count as i64,
             Err(_) => negative_errno(libc::EFAULT),
         },
@@ -10008,8 +10021,8 @@ fn vectored_io(
     staged_vectored_transfer(memory, state, number, host_fd, &guest_iovecs, args, reading)
 }
 
-fn staged_vectored_transfer(
-    memory: &mut GuestMemory,
+fn staged_vectored_transfer<M: GuestMemoryAccess + AddressSpace>(
+    memory: &mut M,
     state: &LoadedStaticElf,
     number: libc::c_long,
     host_fd: RawFd,
@@ -10041,13 +10054,9 @@ fn staged_vectored_transfer(
     let mut staged_vectors = Vec::with_capacity(guest_iovecs.len());
     for vector in guest_iovecs {
         let prefix = if reading {
-            memory
-                .user()
-                .user_writable_prefix(vector.base, vector.length)
+            memory.accessible_prefix(vector.base, vector.length, Access::Write)
         } else {
-            memory
-                .user()
-                .user_accessible_prefix(vector.base, vector.length)
+            memory.accessible_prefix(vector.base, vector.length, Access::Read)
         }
         .unwrap_or(0);
         let mut staged = match StagedIoVector::new(*vector, prefix, staging_alignment) {
@@ -10056,8 +10065,7 @@ fn staged_vectored_transfer(
         };
         if prefix != 0
             && memory
-                .user()
-                .read(vector.base, staged.accessible_slice_mut(prefix))
+                .read_exact(vector.base, staged.accessible_slice_mut(prefix))
                 .is_err()
         {
             return negative_errno(libc::EFAULT);
@@ -10094,8 +10102,7 @@ fn staged_vectored_transfer(
             let copied = transferred.min(vector.accessible_length);
             if copied != 0
                 && memory
-                    .user()
-                    .write(vector.guest.base, vector.accessible_slice(copied))
+                    .write_exact(vector.guest.base, vector.accessible_slice(copied))
                     .is_err()
             {
                 return negative_errno(libc::EFAULT);
@@ -10116,8 +10123,7 @@ fn staged_vectored_transfer(
         for vector in &staged_vectors {
             if vector.accessible_length != 0
                 && memory
-                    .user()
-                    .write(
+                    .write_exact(
                         vector.guest.base,
                         vector.accessible_slice(vector.accessible_length),
                     )
@@ -12700,8 +12706,8 @@ fn ppoll(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> 
     poll_with_timeout(memory, state, args, timeout)
 }
 
-fn poll_with_timeout(
-    memory: &mut GuestMemory,
+fn poll_with_timeout<M: GuestMemoryAccess>(
+    memory: &mut M,
     state: &LoadedStaticElf,
     args: &[u64; 6],
     timeout: libc::c_int,
@@ -12733,7 +12739,7 @@ fn poll_with_timeout(
         let bytes = unsafe {
             std::slice::from_raw_parts_mut(poll_fds.as_mut_ptr().cast::<u8>(), byte_length)
         };
-        if memory.user().read(args[0], bytes).is_err() {
+        if memory.read_exact(args[0], bytes).is_err() {
             return negative_errno(libc::EFAULT);
         }
     }
@@ -12814,11 +12820,7 @@ fn poll_with_timeout(
         let Some(address) = args[0].checked_add(offset as u64) else {
             return negative_errno(libc::EFAULT);
         };
-        if memory
-            .user()
-            .put_user_i16(address, poll_fd.revents)
-            .is_err()
-        {
+        if memory.put_user_i16(address, poll_fd.revents).is_err() {
             return negative_errno(libc::EFAULT);
         }
     }
@@ -13064,7 +13066,7 @@ fn epoll_pwait2_missing_fd(output: u64, raw_count: u64) -> i64 {
 /// Immediate, unmasked readiness for a proven native eventfd interest set.
 /// Unknown/imported/nested/escaped descriptions and changed registration
 /// bindings remain unsupported; this is not general epoll virtualization.
-fn epoll_pwait2(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+fn epoll_pwait2<M: GuestMemoryAccess>(memory: &M, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
     // Linux fs/eventpoll.c copies/validates timeout before mask and descriptors.
     let zero_timeout = if args[3] == 0 {
         false
@@ -13083,7 +13085,7 @@ fn epoll_pwait2(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) 
             return negative_errno(libc::EINVAL);
         }
         let mut mask = [0; KERNEL_SIGSET_SIZE];
-        if memory.user().read(args[4], &mut mask).is_err() {
+        if memory.read_exact(args[4], &mut mask).is_err() {
             return negative_errno(libc::EFAULT);
         }
     }
@@ -13122,8 +13124,7 @@ fn epoll_pwait2(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) 
     };
     // Construction and finalization can notify reentrant wakers. Neither may
     // run under the provenance domain or an outer file-table transaction.
-    let user = memory.user();
-    let alias = match user.writable_alias(args[1], capacity * event_size) {
+    let alias = match memory.lend_mut(args[1], capacity * event_size) {
         Ok(alias) => alias,
         Err(_) => return negative_errno(libc::EFAULT),
     };
@@ -13150,7 +13151,7 @@ fn epoll_pwait2(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) 
                     libc::syscall(
                         libc::SYS_epoll_pwait2,
                         fd,
-                        alias.address(),
+                        alias.host_pointer(),
                         host_count as libc::c_int,
                         &timeout,
                         std::ptr::null::<libc::sigset_t>(),
@@ -14498,8 +14499,8 @@ enum SocketNameOperation {
     Peer,
 }
 
-fn socket_name(
-    memory: &mut GuestMemory,
+fn socket_name<M: GuestMemoryAccess>(
+    memory: &mut M,
     state: &LoadedStaticElf,
     args: &[u64; 6],
     operation: SocketNameOperation,
@@ -14557,7 +14558,6 @@ fn socket_name(
     // The length is a scalar put_user, followed by a possibly partial
     // copy_to_user. Neither may write through a guest read-only page.
     if memory
-        .user()
         .put_user_i32(args[2], returned_length as i32)
         .is_err()
     {
@@ -14568,7 +14568,6 @@ fn socket_name(
     }
     if copy_length != 0
         && memory
-            .user()
             .copy_to_user(
                 args[1],
                 // SAFETY: address is initialized and copy_length is bounded by
@@ -14841,7 +14840,11 @@ fn sendto(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64
 }
 
 // TODO-HUMAN-REVIEW(PR-218): Review bounded recvfrom buffer and peer-address copyback semantics.
-fn recvfrom(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+fn recvfrom<M: GuestMemoryAccess + AddressSpace>(
+    memory: &mut M,
+    state: &LoadedStaticElf,
+    args: &[u64; 6],
+) -> i64 {
     let Ok(fd) = libc::c_int::try_from(args[0]) else {
         return negative_errno(libc::EBADF);
     };
@@ -14858,7 +14861,7 @@ fn recvfrom(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) 
         return negative_errno(libc::EFAULT);
     }
     let length = requested_length.min(MAX_HOST_IO);
-    let Ok(writable) = memory.user().user_accessible_prefix(args[1], length) else {
+    let Ok(writable) = memory.accessible_prefix(args[1], length, Access::Read) else {
         return negative_errno(libc::EFAULT);
     };
     if writable == 0 && requested_length != 0 {
@@ -14910,7 +14913,7 @@ fn recvfrom(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) 
         return io_error(std::io::Error::last_os_error());
     }
     let copy_length = (result as usize).min(bytes.len());
-    if copy_length != 0 && memory.user().write(args[1], &bytes[..copy_length]).is_err() {
+    if copy_length != 0 && memory.write_exact(args[1], &bytes[..copy_length]).is_err() {
         return negative_errno(libc::EFAULT);
     }
 
@@ -14927,7 +14930,7 @@ fn recvfrom(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) 
                     address_copy_length,
                 )
             };
-            if memory.user().write(args[4], address_bytes).is_err() {
+            if memory.write_exact(args[4], address_bytes).is_err() {
                 return negative_errno(libc::EFAULT);
             }
         }
@@ -16012,8 +16015,8 @@ fn recvmmsg(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 
 // General FIONREAD support was withdrawn in 345681e44bf9d07f8c9f52138ce2682633adfffe:
 // SCM_RIGHTS does not retain synthetic proc-file semantics. Only an actual host
 // pipe/FIFO can use this operation without that missing descriptor metadata.
-fn pipe_fionread(
-    memory: &GuestMemory,
+fn pipe_fionread<M: GuestMemoryAccess>(
+    memory: &M,
     state: &LoadedStaticElf,
     guest_fd: libc::c_int,
     host_fd: libc::c_int,
@@ -16059,7 +16062,7 @@ fn pipe_fionread(
     if unsafe { libc::ioctl(host_fd, libc::FIONREAD, &mut count) } != 0 {
         return io_error(std::io::Error::last_os_error());
     }
-    if memory.user().put_user_i32(address, count).is_err() {
+    if memory.put_user_i32(address, count).is_err() {
         return negative_errno(libc::EFAULT);
     }
     0
@@ -16204,7 +16207,7 @@ fn forward_terminal_ioctl(
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#54): Confirm the fixed root-plus-overflow-group KVM persona.
-fn getgroups(memory: &mut GuestMemory, args: &[u64; 6]) -> i64 {
+fn getgroups<M: GuestMemoryAccess>(memory: &mut M, args: &[u64; 6]) -> i64 {
     let size = args[0] as libc::c_int;
     if size < 0 {
         return negative_errno(libc::EINVAL);
@@ -16222,17 +16225,17 @@ fn getgroups(memory: &mut GuestMemory, args: &[u64; 6]) -> i64 {
     for group in GUEST_SUPPLEMENTARY_GROUPS {
         bytes.extend_from_slice(&group.to_ne_bytes());
     }
-    match memory.user().write(args[1], &bytes) {
+    match memory.write_exact(args[1], &bytes) {
         Ok(()) => i64::from(count),
         Err(_) => negative_errno(libc::EFAULT),
     }
 }
 
 // TODO-HUMAN-REVIEW(PR-145): Review fixed-root saved-ID output and fault ordering.
-fn get_fixed_root_ids(memory: &mut GuestMemory, args: &[u64; 6]) -> i64 {
+fn get_fixed_root_ids<M: GuestMemoryAccess>(memory: &mut M, args: &[u64; 6]) -> i64 {
     let root_id = libc::uid_t::from(0_u8).to_ne_bytes();
     for address in &args[..3] {
-        if memory.user().write(*address, &root_id).is_err() {
+        if memory.write_exact(*address, &root_id).is_err() {
             return negative_errno(libc::EFAULT);
         }
     }
@@ -18674,7 +18677,11 @@ fn synthetic_guest_fd_symlink_statx(guest_fd: libc::c_int) -> libc::statx {
     stat
 }
 
-fn getdents64(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+fn getdents64<M: GuestMemoryAccess>(
+    memory: &mut M,
+    state: &LoadedStaticElf,
+    args: &[u64; 6],
+) -> i64 {
     // Linux consumes both descriptor and count as unsigned 32-bit arguments.
     // Narrow count before applying our host I/O cap: high register bits must
     // not turn a zero or undersized Linux buffer into a 16 MiB request.
@@ -18697,8 +18704,7 @@ fn getdents64(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]
     // Let the kernel write through a protected shared alias. A snapshot/copyback
     // would clobber concurrent guest writes to untouched padding or the tail,
     // including when EOF produces no output at all.
-    let user = memory.user();
-    let alias = match user.writable_alias(args[1], length) {
+    let alias = match memory.lend_mut(args[1], length) {
         Ok(alias) => alias,
         // Construction finalizes ownership and releases memory locks before
         // publishing any infrastructure failure to the gate. The driver must
@@ -18712,7 +18718,7 @@ fn getdents64(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]
         libc::syscall(
             libc::SYS_getdents64,
             file.as_raw_fd(),
-            alias.address(),
+            alias.host_pointer(),
             length,
         )
     };
@@ -19211,12 +19217,15 @@ fn arch_prctl(
 // launchers can inspect and mutate their persona without touching supervisor
 // credentials.
 // TODO-HUMAN-REVIEW(PR-181): Review deterministic capability prctls.
-fn prctl(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
+fn prctl<M: GuestMemoryAccess>(
+    memory: &mut M,
+    state: &mut LoadedStaticElf,
+    args: &[u64; 6],
+) -> i64 {
     match args[0] {
         // TODO-HUMAN-REVIEW(PR-537): Review deterministic task-name state and lifecycle.
         option if option == libc::PR_SET_NAME as u64 => set_prctl_name(memory, state, args[1]),
         option if option == libc::PR_GET_NAME as u64 => memory
-            .user()
             .copy_to_user(args[1], &state.thread_name)
             .map_or_else(|_| negative_errno(libc::EFAULT), |_| 0),
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -19248,7 +19257,6 @@ fn prctl(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6])
                 .parent_death_signal(caller);
             match signal {
                 Ok(signal) => memory
-                    .user()
                     .put_user_i32(args[1], signal)
                     .map_or_else(|_| negative_errno(libc::EFAULT), |_| 0),
                 Err(errno) => negative_errno(errno.into_raw()),
@@ -19336,14 +19344,18 @@ fn prctl(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6])
     }
 }
 
-fn set_prctl_name(memory: &GuestMemory, state: &mut LoadedStaticElf, address: u64) -> i64 {
+fn set_prctl_name<M: GuestMemoryAccess>(
+    memory: &M,
+    state: &mut LoadedStaticElf,
+    address: u64,
+) -> i64 {
     let mut name = [0; TASK_COMM_LEN];
     for (offset, slot) in name[..TASK_COMM_LEN - 1].iter_mut().enumerate() {
         let Some(address) = address.checked_add(offset as u64) else {
             return negative_errno(libc::EFAULT);
         };
         let mut byte = [0];
-        if memory.user().read(address, &mut byte).is_err() {
+        if memory.read_exact(address, &mut byte).is_err() {
             return negative_errno(libc::EFAULT);
         }
         if byte[0] == 0 {
@@ -19391,7 +19403,7 @@ fn prctl_cap_ambient(state: &mut LoadedStaticElf, operation: u64, capability: u6
 }
 
 // TODO-HUMAN-REVIEW(PR-181): Review the virtual capability ABI and masks.
-fn capget(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+fn capget<M: GuestMemoryAccess>(memory: &mut M, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
     if args[0] == 0 {
         return negative_errno(libc::EFAULT);
     }
@@ -19400,8 +19412,7 @@ fn capget(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) ->
     };
     if version != LINUX_CAPABILITY_VERSION_3 {
         if memory
-            .user()
-            .write(args[0], &LINUX_CAPABILITY_VERSION_3.to_ne_bytes())
+            .write_exact(args[0], &LINUX_CAPABILITY_VERSION_3.to_ne_bytes())
             .is_err()
         {
             return negative_errno(libc::EFAULT);
@@ -19423,14 +19434,14 @@ fn capget(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) ->
         state.capability_permitted,
         state.capability_inheritable,
     );
-    match memory.user().write(args[1], &bytes) {
+    match memory.write_exact(args[1], &bytes) {
         Ok(()) => 0,
         Err(_) => negative_errno(libc::EFAULT),
     }
 }
 
 // TODO-HUMAN-REVIEW(PR-181): Review deterministic capability mutation.
-fn capset(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
+fn capset<M: GuestMemoryAccess>(memory: &M, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
     if args[0] == 0 || args[1] == 0 {
         return negative_errno(libc::EFAULT);
     }
@@ -19459,9 +19470,12 @@ fn capset(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) ->
     0
 }
 
-fn read_capability_header(memory: &GuestMemory, address: u64) -> Result<(u32, i32), ()> {
+fn read_capability_header<M: GuestMemoryAccess>(
+    memory: &M,
+    address: u64,
+) -> Result<(u32, i32), ()> {
     let mut bytes = [0; 8];
-    memory.user().read(address, &mut bytes).map_err(|_| ())?;
+    memory.read_exact(address, &mut bytes).map_err(|_| ())?;
     Ok((
         u32::from_ne_bytes(bytes[..4].try_into().expect("capability version size")),
         i32::from_ne_bytes(bytes[4..].try_into().expect("capability pid size")),
@@ -19490,9 +19504,12 @@ fn capability_data_bytes(effective: u64, permitted: u64, inheritable: u64) -> [u
     bytes
 }
 
-fn read_capability_data(memory: &GuestMemory, address: u64) -> Result<(u64, u64, u64), ()> {
+fn read_capability_data<M: GuestMemoryAccess>(
+    memory: &M,
+    address: u64,
+) -> Result<(u64, u64, u64), ()> {
     let mut bytes = [0; 24];
-    memory.user().read(address, &mut bytes).map_err(|_| ())?;
+    memory.read_exact(address, &mut bytes).map_err(|_| ())?;
     let field = |index: usize| {
         u64::from(u32::from_ne_bytes(
             bytes[index * 4..index * 4 + 4]
@@ -20330,29 +20347,19 @@ fn read_file_range(file: &std::fs::File, buffer: &mut [u8], offset: u64) -> std:
     Ok(count)
 }
 
-fn munmap(memory: &mut GuestMemory, address: u64, length: u64) -> i64 {
+fn munmap<M: AddressSpace>(memory: &mut M, address: u64, length: u64) -> i64 {
     let Some(length) = align_up(length, PAGE_SIZE) else {
         return negative_errno(libc::EINVAL);
     };
-    if address < BOOT_RESERVED_END
+    if address < memory.layout().reserved_end
         || !address.is_multiple_of(PAGE_SIZE)
         || length == 0
         || !range_is_valid(memory, address, length)
     {
         return negative_errno(libc::EINVAL);
     }
-    let Ok(length) = usize::try_from(length) else {
-        return negative_errno(libc::EINVAL);
-    };
-    // The bookkeeping below is by physical address.
-    let Some(address) = memory.user_range_to_guest(address, length as u64) else {
-        return negative_errno(libc::EINVAL);
-    };
-    match memory.zero_lazily(address, length) {
-        Ok(()) => match memory.unmap_user_range(address, length as u64) {
-            Ok(()) => 0,
-            Err(_) => negative_errno(libc::EINVAL),
-        },
+    match memory.unmap(address, length) {
+        Ok(()) => 0,
         Err(_) => negative_errno(libc::EINVAL),
     }
 }
@@ -20429,7 +20436,7 @@ mod shared_file;
 use shared_file::mmap_with_shared_files;
 
 // TODO-HUMAN-REVIEW(PR-132): Review KVM mprotect user-copy enforcement.
-fn mprotect(memory: &GuestMemory, args: &[u64; 6]) -> i64 {
+fn mprotect<M: AddressSpace>(memory: &M, args: &[u64; 6]) -> i64 {
     let address = args[0];
     let requested_length = args[1];
     let protection = args[2];
@@ -20443,38 +20450,16 @@ fn mprotect(memory: &GuestMemory, args: &[u64; 6]) -> i64 {
     let Some(length) = align_up(requested_length, PAGE_SIZE) else {
         return negative_errno(libc::ENOMEM);
     };
-    // The bookkeeping below is by physical address.
-    let Some(address) = memory.user_range_to_guest(address, length) else {
-        return negative_errno(libc::ENOMEM);
-    };
-    if !memory.user_range_is_mapped(address, length) {
-        return negative_errno(libc::ENOMEM);
-    }
-    if protection & libc::PROT_EXEC as u64 != 0
-        && memory.range_contains_shared_file(address, length as usize)
-    {
-        // A metadata-only permission upgrade cannot establish the file's
-        // mount noexec policy. Preserve the same named domain as mmap; the
-        // allocation owner publishes this cause only after it unlocks.
-        let _ = memory.capture_shared_file_error(crate::Error::SharedFileCapability {
-            operation: "mprotect",
-            reason: "executable ordinary shared-file mappings are not implemented",
-        });
-        return negative_errno(libc::EIO);
-    }
-    if protection & libc::PROT_WRITE as u64 != 0
-        && !memory.file_write_permitted(address, length as usize)
-    {
-        return negative_errno(libc::EACCES);
-    }
-    match memory.map_user_permissions(
-        address,
-        length,
-        protection != libc::PROT_NONE as u64,
-        protection & libc::PROT_WRITE as u64 != 0,
-    ) {
+    // The protection bits were validated above, so they fit a c_int.
+    match memory.protect(address, length, protection as libc::c_int) {
         Ok(()) => 0,
-        Err(_) => negative_errno(libc::ENOMEM),
+        // An executable ordinary shared-file mapping: the refusal is already
+        // recorded as the run's typed capability failure.
+        Err(MapError::Unsupported) => negative_errno(libc::EIO),
+        Err(MapError::AccessDenied) => negative_errno(libc::EACCES),
+        Err(MapError::Unaddressable | MapError::NotMapped | MapError::Failed) => {
+            negative_errno(libc::ENOMEM)
+        }
     }
 }
 
@@ -20629,7 +20614,7 @@ fn mremap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]
 /// changes. As in Linux (mm/madvise.c), the advice applies to the mapped parts
 /// of a range with holes, which then reports ENOMEM. Other advice only
 /// validates the range.
-fn madvise(memory: &GuestMemory, args: &[u64; 6]) -> i64 {
+fn madvise<M: AddressSpace>(memory: &M, args: &[u64; 6]) -> i64 {
     if args[2] as libc::c_int != libc::MADV_DONTNEED {
         return validate_range(memory, args[0], args[1]);
     }
@@ -20649,42 +20634,17 @@ fn madvise(memory: &GuestMemory, args: &[u64; 6]) -> i64 {
     if length == 0 {
         return 0;
     }
-    let plan = memory.dontneed_plan(start, length);
-    if plan.private_file {
-        return negative_errno(libc::ENOSYS);
-    }
-    // Linux drops private anonymous pages, which then read as zeros. Zero
-    // each run of physically contiguous pages with zero_lazily, so a large run
-    // (node drops its whole 512 MiB V8 reservation) is discarded rather than
-    // written and made resident (https://github.com/rrnewton/reverie/issues/1058).
-    let mut run: Option<(u64, u64)> = None;
-    for page in plan.private_anonymous {
-        match run {
-            Some((start, length)) if start + length == page => {
-                run = Some((start, length + PAGE_SIZE));
-            }
-            _ => {
-                if let Some((start, length)) = run.replace((page, PAGE_SIZE))
-                    && memory.zero_lazily(start, length as usize).is_err()
-                {
-                    return negative_errno(libc::EFAULT);
-                }
-            }
-        }
-    }
-    if let Some((start, length)) = run
-        && memory.zero_lazily(start, length as usize).is_err()
-    {
-        return negative_errno(libc::EFAULT);
-    }
-    if plan.unmapped {
-        negative_errno(libc::ENOMEM)
-    } else {
-        0
+    // Linux drops private anonymous pages, which then read as zeros.
+    match memory.discard(start, length) {
+        Ok(Discarded { had_holes: true }) => negative_errno(libc::ENOMEM),
+        Ok(Discarded { had_holes: false }) => 0,
+        // A private copy of a regular file would have to be read again.
+        Err(MapError::Unsupported) => negative_errno(libc::ENOSYS),
+        Err(_) => negative_errno(libc::EFAULT),
     }
 }
 
-fn validate_range(memory: &GuestMemory, address: u64, length: u64) -> i64 {
+fn validate_range<M: AddressSpace>(memory: &M, address: u64, length: u64) -> i64 {
     if length == 0 || !range_is_valid(memory, address, length) {
         negative_errno(libc::EINVAL)
     } else {
@@ -20693,7 +20653,7 @@ fn validate_range(memory: &GuestMemory, address: u64, length: u64) -> i64 {
 }
 
 // TODO-HUMAN-REVIEW(PR-145): Review flat guest-memory munlock validation semantics.
-fn munlock_guest_range(memory: &GuestMemory, address: u64, length: u64) -> i64 {
+fn munlock_guest_range<M: AddressSpace>(memory: &M, address: u64, length: u64) -> i64 {
     let page_start = address & !(PAGE_SIZE - 1);
     let page_offset = address - page_start;
     let page_length =
@@ -20708,18 +20668,17 @@ fn munlock_guest_range(memory: &GuestMemory, address: u64, length: u64) -> i64 {
     0
 }
 
-fn mincore(memory: &mut GuestMemory, args: &[u64; 6]) -> i64 {
+fn mincore<M: GuestMemoryAccess + AddressSpace>(memory: &mut M, args: &[u64; 6]) -> i64 {
     let address = args[0];
     let length = args[1];
     if length == 0 || !address.is_multiple_of(PAGE_SIZE) || !range_is_valid(memory, address, length)
     {
         return negative_errno(libc::EINVAL);
     }
-    let Some(address) = memory.user_range_to_guest(address, length) else {
-        return negative_errno(libc::EINVAL);
-    };
-    if !memory.user_range_is_mapped(address, length) {
-        return negative_errno(libc::ENOMEM);
+    match memory.query(address, length) {
+        RangeState::Mapped => {}
+        RangeState::Unaddressable => return negative_errno(libc::EINVAL),
+        RangeState::Unmapped | RangeState::Mixed => return negative_errno(libc::ENOMEM),
     }
     let Some(page_count) = length.checked_add(PAGE_SIZE - 1).map(|n| n / PAGE_SIZE) else {
         return negative_errno(libc::ENOMEM);
@@ -20728,13 +20687,13 @@ fn mincore(memory: &mut GuestMemory, args: &[u64; 6]) -> i64 {
         return negative_errno(libc::ENOMEM);
     };
     let residency = vec![1_u8; page_count];
-    match memory.user().write(args[2], &residency) {
+    match memory.write_exact(args[2], &residency) {
         Ok(()) => 0,
         Err(_) => negative_errno(libc::EFAULT),
     }
 }
 
-fn getcpu(memory: &mut GuestMemory, args: &[u64; 6]) -> i64 {
+fn getcpu<M: GuestMemoryAccess>(memory: &mut M, args: &[u64; 6]) -> i64 {
     if args[0] != 0 {
         let result = write_struct(memory, args[0], &0_u32);
         if result != 0 {
@@ -20747,7 +20706,11 @@ fn getcpu(memory: &mut GuestMemory, args: &[u64; 6]) -> i64 {
     0
 }
 
-fn sched_getaffinity(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+fn sched_getaffinity<M: GuestMemoryAccess>(
+    memory: &mut M,
+    state: &LoadedStaticElf,
+    args: &[u64; 6],
+) -> i64 {
     let requested_pid = args[0] as i64;
     if requested_pid != 0 && requested_pid != i64::from(state.pid) {
         return negative_errno(libc::ESRCH);
@@ -20761,7 +20724,7 @@ fn sched_getaffinity(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[
     }
     let mut mask = [0_u8; MASK_BYTES];
     mask[0] = 1;
-    match memory.user().write(args[2], &mask) {
+    match memory.write_exact(args[2], &mask) {
         Ok(()) => MASK_BYTES as i64,
         Err(_) => negative_errno(libc::EFAULT),
     }
@@ -20799,21 +20762,24 @@ fn sched_target_result(state: &LoadedStaticElf, pid: libc::c_int) -> Result<(), 
 }
 
 // TODO-HUMAN-REVIEW(PR-119): Review guest sched_param memory validation.
-fn read_sched_param(memory: &GuestMemory, address: u64) -> Result<libc::c_int, i64> {
+fn read_sched_param<M: GuestMemoryAccess>(memory: &M, address: u64) -> Result<libc::c_int, i64> {
     if address == 0 {
         return Err(negative_errno(libc::EINVAL));
     }
     let mut priority = [0; std::mem::size_of::<libc::c_int>()];
     memory
-        .user()
-        .read(address, &mut priority)
+        .read_exact(address, &mut priority)
         .map_err(|_| negative_errno(libc::EFAULT))?;
     Ok(libc::c_int::from_ne_bytes(priority))
 }
 
 // TODO-HUMAN-REVIEW(PR-119): Review guest sched_param output validation.
-fn write_sched_param(memory: &mut GuestMemory, address: u64, priority: libc::c_int) -> i64 {
-    match memory.user().write(address, &priority.to_ne_bytes()) {
+fn write_sched_param<M: GuestMemoryAccess>(
+    memory: &mut M,
+    address: u64,
+    priority: libc::c_int,
+) -> i64 {
+    match memory.write_exact(address, &priority.to_ne_bytes()) {
         Ok(()) => 0,
         Err(_) => negative_errno(libc::EFAULT),
     }
@@ -20876,7 +20842,11 @@ fn sched_getscheduler(state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
 
 // TODO-HUMAN-REVIEW(PR-110): Review virtual sched_setscheduler behavior.
 // TODO-HUMAN-REVIEW(PR-119): Review stateful scheduler mutation and errno ordering.
-fn sched_setscheduler(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
+fn sched_setscheduler<M: GuestMemoryAccess>(
+    memory: &M,
+    state: &mut LoadedStaticElf,
+    args: &[u64; 6],
+) -> i64 {
     let pid = match sched_pid_value(args[0]) {
         Ok(pid) => pid,
         Err(error) => return error,
@@ -20904,7 +20874,11 @@ fn sched_setscheduler(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &
 
 // TODO-HUMAN-REVIEW(PR-110): Review virtual sched_getparam behavior.
 // TODO-HUMAN-REVIEW(PR-119): Review scheduler parameter query errno ordering.
-fn sched_getparam(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+fn sched_getparam<M: GuestMemoryAccess>(
+    memory: &mut M,
+    state: &LoadedStaticElf,
+    args: &[u64; 6],
+) -> i64 {
     let pid = match sched_pid_value(args[0]) {
         Ok(pid) => pid,
         Err(error) => return error,
@@ -20920,7 +20894,11 @@ fn sched_getparam(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64
 
 // TODO-HUMAN-REVIEW(PR-110): Review virtual sched_setparam behavior.
 // TODO-HUMAN-REVIEW(PR-119): Review scheduler parameter mutation errno ordering.
-fn sched_setparam(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
+fn sched_setparam<M: GuestMemoryAccess>(
+    memory: &M,
+    state: &mut LoadedStaticElf,
+    args: &[u64; 6],
+) -> i64 {
     let pid = match sched_pid_value(args[0]) {
         Ok(pid) => pid,
         Err(error) => return error,
@@ -21050,7 +21028,11 @@ fn setpriority(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
 }
 
 // TODO-HUMAN-REVIEW(PR-92): Review bounded sched_getattr ABI writes.
-fn sched_getattr(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+fn sched_getattr<M: GuestMemoryAccess>(
+    memory: &mut M,
+    state: &LoadedStaticElf,
+    args: &[u64; 6],
+) -> i64 {
     let size = args[2] as u32 as usize;
     if !(48..=PAGE_SIZE as usize).contains(&size) || args[3] as u32 != 0 {
         return negative_errno(libc::EINVAL);
@@ -21074,15 +21056,15 @@ fn sched_getattr(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64;
     // SAFETY: attr is initialized repr(C) data and length is bounded to it.
     let bytes =
         unsafe { std::slice::from_raw_parts((&attr as *const SchedAttr).cast::<u8>(), length) };
-    match memory.user().write(args[1], bytes) {
+    match memory.write_exact(args[1], bytes) {
         Ok(()) => 0,
         Err(_) => negative_errno(libc::EFAULT),
     }
 }
 
 // TODO-HUMAN-REVIEW(PR-180): Review virtual-TID random stream separation.
-fn getrandom(
-    memory: &mut GuestMemory,
+fn getrandom<M: GuestMemoryAccess>(
+    memory: &mut M,
     state: &mut LoadedStaticElf,
     address: u64,
     length: u64,
@@ -21104,7 +21086,7 @@ fn getrandom(
         17,
         0x5a,
     );
-    match memory.user().write(address, &bytes) {
+    match memory.write_exact(address, &bytes) {
         Ok(()) => {
             state.getrandom_offset = next_offset;
             length as i64
@@ -21183,11 +21165,11 @@ fn deterministic_random_device_byte(seed: u64, index: u64) -> u8 {
 // their sleep requests, but do not block the supervisor on host wall time;
 // subscribed root-process sleeps continue to use Detcore's time model.
 // TODO-HUMAN-REVIEW(PR-182): Review nonblocking KVM child sleeps.
-fn nanosleep(memory: &GuestMemory, args: &[u64; 6]) -> i64 {
+fn nanosleep<M: GuestMemoryAccess>(memory: &M, args: &[u64; 6]) -> i64 {
     validate_sleep_request(memory, args[0])
 }
 
-fn clock_nanosleep(memory: &GuestMemory, args: &[u64; 6]) -> i64 {
+fn clock_nanosleep<M: GuestMemoryAccess>(memory: &M, args: &[u64; 6]) -> i64 {
     let clock_id = args[0] as libc::clockid_t;
     if clock_id == libc::CLOCK_THREAD_CPUTIME_ID {
         return negative_errno(libc::EOPNOTSUPP);
@@ -21205,7 +21187,7 @@ fn clock_nanosleep(memory: &GuestMemory, args: &[u64; 6]) -> i64 {
     validate_sleep_request(memory, args[2])
 }
 
-fn validate_sleep_request(memory: &GuestMemory, address: u64) -> i64 {
+fn validate_sleep_request<M: GuestMemoryAccess>(memory: &M, address: u64) -> i64 {
     if address == 0 {
         return negative_errno(libc::EFAULT);
     }
@@ -21220,7 +21202,11 @@ fn validate_sleep_request(memory: &GuestMemory, address: u64) -> i64 {
     }
 }
 
-fn clock_gettime(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
+fn clock_gettime<M: GuestMemoryAccess>(
+    memory: &mut M,
+    state: &mut LoadedStaticElf,
+    args: &[u64; 6],
+) -> i64 {
     let nanoseconds = state.logical_clock_ns;
     let time = libc::timespec {
         tv_sec: (nanoseconds / 1_000_000_000) as libc::time_t,
@@ -21239,21 +21225,19 @@ fn clock_gettime(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[
 /// store returns EFAULT, leaving an already stored `tv_sec` in place. `tz` is
 /// then copied with `copy_to_user`, which stores the writable prefix before
 /// it faults.
-fn gettimeofday(memory: &mut GuestMemory, args: &[u64; 6]) -> i64 {
+fn gettimeofday<M: GuestMemoryAccess>(memory: &mut M, args: &[u64; 6]) -> i64 {
     const TV_USEC_OFFSET: u64 = std::mem::offset_of!(libc::timeval, tv_usec) as u64;
     if args[0] != 0 {
-        let user = memory.user();
-        let stored = user.store_user_u64(args[0], 0).is_ok()
+        let stored = memory.put_user_u64(args[0], 0).is_ok()
             && args[0]
                 .checked_add(TV_USEC_OFFSET)
-                .is_some_and(|tv_usec| user.store_user_u64(tv_usec, 0).is_ok());
+                .is_some_and(|tv_usec| memory.put_user_u64(tv_usec, 0).is_ok());
         if !stored {
             return negative_errno(libc::EFAULT);
         }
     }
     if args[1] != 0
         && memory
-            .user()
             .copy_to_user(args[1], &[0; std::mem::size_of::<libc::c_int>() * 2])
             .is_err()
     {
@@ -21269,9 +21253,9 @@ fn gettimeofday(memory: &mut GuestMemory, args: &[u64; 6]) -> i64 {
 /// `tloc` when it is not null. As Linux's `put_user`, the store writes all
 /// eight bytes or none, only to writable pages (shared-file pages included),
 /// and a failed store returns EFAULT. Reading the clock does not advance it.
-fn time(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+fn time<M: GuestMemoryAccess>(memory: &mut M, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
     let seconds = state.logical_clock_ns / 1_000_000_000;
-    if args[0] != 0 && memory.user().store_user_u64(args[0], seconds).is_err() {
+    if args[0] != 0 && memory.put_user_u64(args[0], seconds).is_err() {
         return negative_errno(libc::EFAULT);
     }
     seconds as i64
@@ -21453,7 +21437,7 @@ fn personality(state: &mut LoadedStaticElf, raw: u64) -> i64 {
     i64::from(previous)
 }
 
-fn uname(memory: &mut GuestMemory, state: &LoadedStaticElf, address: u64) -> i64 {
+fn uname<M: GuestMemoryAccess>(memory: &mut M, state: &LoadedStaticElf, address: u64) -> i64 {
     // Linux's UNAME26 rule maps a 6.0.0 release to 2.6.(0 + 60).
     // Keep this transformation tied to the existing lower virtual release.
     let release: &[u8] = if state.linux_personality & PERSONALITY_UNAME26 != 0 {
@@ -21479,7 +21463,7 @@ fn uname(memory: &mut GuestMemory, state: &LoadedStaticElf, address: u64) -> i64
     write_bytes(memory, address, &utsname)
 }
 
-fn prlimit64(memory: &mut GuestMemory, args: &[u64; 6]) -> i64 {
+fn prlimit64<M: GuestMemoryAccess>(memory: &mut M, args: &[u64; 6]) -> i64 {
     if args[2] != 0 {
         return negative_errno(libc::EPERM);
     }
@@ -22554,8 +22538,8 @@ fn waitid_options_supported(raw: u64) -> bool {
     options & libc::WEXITED != 0 && options & !allowed == 0
 }
 
-fn finish_waitid(
-    memory: &GuestMemory,
+fn finish_waitid<M: GuestMemoryAccess>(
+    memory: &M,
     args: &[u64; 6],
     event: Option<&GuestWaitidSiginfo>,
     result: i64,
@@ -22566,7 +22550,6 @@ fn finish_waitid(
         let size = std::mem::size_of::<libc::rusage>();
         if validate_guest_iovec_address(args[4], size).is_err()
             || memory
-                .user()
                 .copy_to_user(args[4], &[0; std::mem::size_of::<libc::rusage>()])
                 .is_err()
         {
@@ -22597,9 +22580,7 @@ fn finish_waitid(
         // Stop before a scalar crosses the architectural guard: earlier fields
         // remain, and the failing scalar, padding and tail stay untouched.
         let address = args[2] + offset;
-        if address + 4 > X86_64_GUEST_USER_LIMIT
-            || memory.user().put_user_i32(address, value).is_err()
-        {
+        if address + 4 > X86_64_GUEST_USER_LIMIT || memory.put_user_i32(address, value).is_err() {
             return negative_errno(libc::EFAULT);
         }
     }
@@ -22692,18 +22673,18 @@ fn waitid(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]
     waitid_result(memory, state, args).expect("raw waitid fixture has a coherent family ledger")
 }
 
-fn write_u64(memory: &mut GuestMemory, address: u64, value: u64) -> i64 {
+fn write_u64<M: GuestMemoryAccess>(memory: &mut M, address: u64, value: u64) -> i64 {
     write_bytes(memory, address, &value.to_le_bytes())
 }
 
-fn write_bytes(memory: &mut GuestMemory, address: u64, bytes: &[u8]) -> i64 {
-    match memory.user().write(address, bytes) {
+fn write_bytes<M: GuestMemoryAccess>(memory: &mut M, address: u64, bytes: &[u8]) -> i64 {
+    match memory.write_exact(address, bytes) {
         Ok(()) => 0,
         Err(_) => negative_errno(libc::EFAULT),
     }
 }
 
-fn write_struct<T>(memory: &mut GuestMemory, address: u64, value: &T) -> i64 {
+fn write_struct<T>(memory: &mut impl GuestMemoryAccess, address: u64, value: &T) -> i64 {
     // SAFETY: Linux ABI structs are initialized plain data. The byte view is
     // bounded to value and copied into guest memory before value is dropped.
     let bytes = unsafe {
@@ -22715,16 +22696,18 @@ fn write_struct<T>(memory: &mut GuestMemory, address: u64, value: &T) -> i64 {
     write_bytes(memory, address, bytes)
 }
 
-fn read_guest_bytes<const N: usize>(memory: &GuestMemory, address: u64) -> Result<[u8; N], i64> {
+fn read_guest_bytes<const N: usize>(
+    memory: &impl GuestMemoryAccess,
+    address: u64,
+) -> Result<[u8; N], i64> {
     let mut bytes = [0; N];
     memory
-        .user()
-        .read(address, &mut bytes)
+        .read_exact(address, &mut bytes)
         .map_err(|_| negative_errno(libc::EFAULT))?;
     Ok(bytes)
 }
 
-fn read_guest_struct<T>(memory: &GuestMemory, address: u64) -> Result<T, i64> {
+fn read_guest_struct<T>(memory: &impl GuestMemoryAccess, address: u64) -> Result<T, i64> {
     let mut value = std::mem::MaybeUninit::<T>::zeroed();
     // SAFETY: value is writable for exactly size_of::<T>() bytes and is not
     // observed until guest memory has initialized the complete byte range.
@@ -22732,8 +22715,7 @@ fn read_guest_struct<T>(memory: &GuestMemory, address: u64) -> Result<T, i64> {
         std::slice::from_raw_parts_mut(value.as_mut_ptr().cast::<u8>(), std::mem::size_of::<T>())
     };
     memory
-        .user()
-        .read(address, bytes)
+        .read_exact(address, bytes)
         .map_err(|_| negative_errno(libc::EFAULT))?;
     // SAFETY: the entire plain-data Linux ABI value was initialized above.
     Ok(unsafe { value.assume_init() })
@@ -22772,8 +22754,8 @@ fn read_c_string_errno(error: ReadCStringError) -> i64 {
     }
 }
 
-fn read_c_string(
-    memory: &GuestMemory,
+fn read_c_string<M: GuestMemoryAccess>(
+    memory: &M,
     address: u64,
     limit: usize,
 ) -> Result<Vec<u8>, ReadCStringError> {
@@ -22784,8 +22766,7 @@ fn read_c_string(
             .ok_or(ReadCStringError::Fault)?;
         let mut byte = [0];
         memory
-            .user()
-            .read(address, &mut byte)
+            .read_exact(address, &mut byte)
             .map_err(|_| ReadCStringError::Fault)?;
         if byte[0] == 0 {
             return Ok(result);
@@ -22845,7 +22826,11 @@ struct CloneRequest {
     tls: Option<u64>,
 }
 
-fn read_clone3(memory: &GuestMemory, address: u64, size: u64) -> Result<CloneRequest, i64> {
+fn read_clone3<M: GuestMemoryAccess>(
+    memory: &M,
+    address: u64,
+    size: u64,
+) -> Result<CloneRequest, i64> {
     const REQUIRED_SIZE: usize = 64;
     const MAX_SIZE: usize = 88;
 
@@ -22860,14 +22845,12 @@ fn read_clone3(memory: &GuestMemory, address: u64, size: u64) -> Result<CloneReq
     }
     let mut bytes = [0; MAX_SIZE];
     memory
-        .user()
-        .read(address, &mut bytes[..size.min(MAX_SIZE)])
+        .read_exact(address, &mut bytes[..size.min(MAX_SIZE)])
         .map_err(|_| negative_errno(libc::EFAULT))?;
     if size > MAX_SIZE {
         let mut extension = vec![0; size - MAX_SIZE];
         memory
-            .user()
-            .read(address + MAX_SIZE as u64, &mut extension)
+            .read_exact(address + MAX_SIZE as u64, &mut extension)
             .map_err(|_| negative_errno(libc::EFAULT))?;
         if extension.iter().any(|byte| *byte != 0) {
             return Err(negative_errno(libc::E2BIG));
@@ -22908,7 +22891,7 @@ fn read_clone3(memory: &GuestMemory, address: u64, size: u64) -> Result<CloneReq
     })
 }
 
-fn read_string_array(memory: &GuestMemory, address: u64) -> Result<Vec<String>, i64> {
+fn read_string_array<M: GuestMemoryAccess>(memory: &M, address: u64) -> Result<Vec<String>, i64> {
     const MAX_ENTRIES: usize = 4096;
     const MAX_STRING_BYTES: usize = 128 * 1024;
 
@@ -22923,8 +22906,7 @@ fn read_string_array(memory: &GuestMemory, address: u64) -> Result<Vec<String>, 
             .ok_or_else(|| negative_errno(libc::EFAULT))?;
         let mut pointer = [0; 8];
         memory
-            .user()
-            .read(pointer_address, &mut pointer)
+            .read_exact(pointer_address, &mut pointer)
             .map_err(|_| negative_errno(libc::EFAULT))?;
         let pointer = u64::from_le_bytes(pointer);
         if pointer == 0 {
@@ -22945,8 +22927,8 @@ fn read_string_array(memory: &GuestMemory, address: u64) -> Result<Vec<String>, 
 /// Whether `[address, address + length)` is one contiguous range of user
 /// addresses (mapped or not), including the stack window at the top of the
 /// user address space.
-fn range_is_valid(memory: &GuestMemory, address: u64, length: u64) -> bool {
-    memory.user_range_is_addressable(address, length)
+fn range_is_valid<M: AddressSpace>(memory: &M, address: u64, length: u64) -> bool {
+    memory.is_addressable(address, length)
 }
 
 fn align_up(value: u64, alignment: u64) -> Option<u64> {
