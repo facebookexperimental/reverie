@@ -55,6 +55,12 @@ int main(void) {
   if (invalid_again != -1 || errno != EINVAL)
     return 7;
 
+  errno = 0;
+  long invalid_newpid = syscall(
+      SYS_clone, CLONE_NEWPID | CLONE_SIGHAND | SIGCHLD, 0, 0, 0, 0);
+  if (invalid_newpid != -1 || errno != EINVAL)
+    return 9;
+
   if (!finish_child((pid_t)syscall(SYS_fork)))
     return 2;
   if (!finish_child((pid_t)syscall(SYS_clone, SIGCHLD, 0, 0, 0, 0)))

@@ -125,7 +125,7 @@ int main(void) {
 
   pid_t virtual_self = (pid_t)syscall(SYS_getpid);
   pid_t host_self = proc_self_pid();
-  if (virtual_self <= 0 || host_self <= 0 || virtual_self == host_self)
+  if (virtual_self <= 0 || host_self <= 0 || virtual_self != host_self)
     return 2;
 
   errno = 0;
@@ -168,7 +168,7 @@ int main(void) {
     child_identity.host_pid = proc_self_pid();
     if (!install_signal_handler() || child_identity.virtual_pid <= 0 ||
         child_identity.host_pid <= 0 ||
-        child_identity.virtual_pid == child_identity.host_pid ||
+        child_identity.virtual_pid != child_identity.host_pid ||
         !write_exact(child_ready[1], &child_identity, sizeof(child_identity)) ||
         !read_exact(child_release[0], &byte, sizeof(byte)) || !signal_seen)
       _exit(10);
@@ -180,7 +180,7 @@ int main(void) {
   close(child_release[0]);
   if (!read_exact(child_ready[0], &child_identity, sizeof(child_identity)) ||
       child_identity.virtual_pid != virtual_child ||
-      child_identity.host_pid == virtual_child ||
+      child_identity.host_pid != virtual_child ||
       child_identity.host_pid == host_self) {
     (void)write_exact(child_release[1], &byte, sizeof(byte));
     return 11;

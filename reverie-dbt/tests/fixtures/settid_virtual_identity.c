@@ -41,6 +41,42 @@ static pid_t child_word = -1;
 static pid_t clone3_parent_word = -1;
 static pid_t clone3_child_word = -1;
 
+/* A standalone native client does not rewrite procfs readlink payloads. These
+ * kernel witnesses deliberately bypass every getter/clone/SETTID projection.
+ * Shared fixture output survives the separate address spaces of process clones;
+ * it is observation data, not a runtime identity map.
+ */
+struct kernel_witness {
+  pid_t process;
+  pid_t child;
+  pid_t child_word;
+  pid_t cloned3;
+  pid_t clone3_word;
+};
+static struct kernel_witness* kernel;
+static char thread_kernel_path[64];
+static long thread_kernel_path_length = -1;
+static const char thread_self_path[] = "/proc/thread-self";
+
+static pid_t tid_from_kernel_path(const char* path, pid_t expected_pid) {
+  int pid = -1;
+  int tid = -1;
+  char extra;
+  if (sscanf(path, "%d/task/%d%c", &pid, &tid, &extra) != 2 ||
+      pid <= 0 || tid <= 0 || (expected_pid > 0 && pid != expected_pid))
+    return -1;
+  return (pid_t)tid;
+}
+
+static pid_t kernel_tid(void) {
+  char path[64];
+  ssize_t size = readlink(thread_self_path, path, sizeof(path) - 1);
+  if (size <= 0 || (size_t)size >= sizeof(path) - 1)
+    return -1;
+  path[size] = '\0';
+  return tid_from_kernel_path(path, 0);
+}
+
 /* struct clone_args from linux/sched.h, up to exit_signal. */
 struct settid_clone_args {
   uint64_t flags;
@@ -55,6 +91,7 @@ struct settid_clone_args {
 
 static int exit_child(void* argument) {
   (void)argument;
+  kernel->process = kernel_tid();
   return 0;
 }
 
@@ -71,8 +108,11 @@ static long clone_recording_thread(void) {
       0);
   if (stack == MAP_FAILED)
     return -1;
-  uintptr_t* child_stack = (uintptr_t*)((char*)stack + stack_size) - 2;
+  uintptr_t* child_stack = (uintptr_t*)((char*)stack + stack_size) - 4;
   child_stack[0] = (uintptr_t)&thread_seen;
+  child_stack[1] = (uintptr_t)thread_self_path;
+  child_stack[2] = (uintptr_t)thread_kernel_path;
+  child_stack[3] = (uintptr_t)&thread_kernel_path_length;
   const unsigned long flags = CLONE_VM | CLONE_FS | CLONE_FILES |
       CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM | CLONE_PARENT_SETTID |
       CLONE_CHILD_CLEARTID;
@@ -83,6 +123,14 @@ static long clone_recording_thread(void) {
       "syscall\n\t"
       "test %%rax, %%rax\n\t"
       "jnz 1f\n\t"
+      /* readlink's kernel payload is independent of the following gettid. */
+      "mov $89, %%eax\n\t"
+      "mov 8(%%rsp), %%rdi\n\t"
+      "mov 16(%%rsp), %%rsi\n\t"
+      "mov $63, %%edx\n\t"
+      "syscall\n\t"
+      "mov 24(%%rsp), %%rdi\n\t"
+      "mov %%rax, (%%rdi)\n\t"
       "mov $186, %%eax\n\t"
       "syscall\n\t"
       "mov (%%rsp), %%rdi\n\t"
@@ -105,6 +153,8 @@ static long clone_recording_thread(void) {
 
 static int check_child_word(void* argument) {
   (void)argument;
+  kernel->child = kernel_tid();
+  kernel->child_word = child_word;
   return child_word == getpid() ? 0 : 1;
 }
 
@@ -118,6 +168,16 @@ static char* new_stack(void) {
 }
 
 int main(void) {
+  kernel = mmap(
+      NULL, sizeof(*kernel), PROT_READ | PROT_WRITE,
+      MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+  if (kernel == MAP_FAILED) {
+    perror("kernel witness mmap");
+    return 1;
+  }
+  pid_t root_kernel = kernel_tid();
+  int root_kernel_ok = root_kernel > 0 && getpid() == root_kernel &&
+      syscall(SYS_gettid) == root_kernel;
   pid_t process = clone(
       exit_child,
       new_stack(),
@@ -159,8 +219,11 @@ int main(void) {
       .exit_signal = SIGCHLD,
   };
   pid_t cloned3 = (pid_t)syscall(SYS_clone3, &clone3_args, sizeof(clone3_args));
-  if (cloned3 == 0)
+  if (cloned3 == 0) {
+    kernel->cloned3 = kernel_tid();
+    kernel->clone3_word = clone3_child_word;
     _exit(clone3_child_word == getpid() ? 0 : 1);
+  }
   int clone3_status = 0;
   if (cloned3 < 0 || waitpid(cloned3, &clone3_status, 0) != cloned3) {
     perror("clone3");
@@ -179,6 +242,26 @@ int main(void) {
       thread_ok,
       child_ok,
       clone3_ok);
+  pid_t thread_kernel = -1;
+  if (thread_kernel_path_length > 0 && thread_kernel_path_length < 63)
+    thread_kernel = tid_from_kernel_path(thread_kernel_path, root_kernel);
+  int kernel_ok = root_kernel_ok && kernel->process > 0 &&
+      process == kernel->process && parent_word == kernel->process &&
+      thread_kernel > 0 && thread == thread_kernel &&
+      thread_word == thread_kernel && seen == thread_kernel &&
+      kernel->child > 0 && forked == kernel->child &&
+      kernel->child_word == kernel->child && kernel->cloned3 > 0 &&
+      cloned3 == kernel->cloned3 && clone3_parent_word == kernel->cloned3 &&
+      kernel->clone3_word == kernel->cloned3;
+  if (!kernel_ok) {
+    fprintf(
+        stderr,
+        "kernel identity mismatch: root=%d process=%d/%d thread=%d/%d "
+        "child=%d/%d clone3=%d/%d\n",
+        root_kernel_ok, (int)process, (int)kernel->process,
+        (int)thread, (int)thread_kernel, (int)forked, (int)kernel->child,
+        (int)cloned3, (int)kernel->cloned3);
+  }
   if (!parent_ok || !thread_ok || !child_ok || !clone3_ok) {
     fprintf(
         stderr,
@@ -190,5 +273,5 @@ int main(void) {
         (int)seen);
     return 1;
   }
-  return 0;
+  return kernel_ok ? 0 : 1;
 }

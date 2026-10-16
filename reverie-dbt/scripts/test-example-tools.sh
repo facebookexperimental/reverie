@@ -158,9 +158,9 @@ grep -Eq '^BACKTRACE ok=1 frames=[0-9]+ top=0x[0-9a-f]+$' "$tmpdir/err" \
 echo "PASS: backtrace (in-process frame-pointer walk of the guest stack at getpid)"
 
 run_tool HERMIT_DBT_NOOP "$identity_policy_guest"
-grep -q '^pid=3 ppid=1 tid=3 internal_fds=open$' "$tmpdir/out" \
-  || fail "noop: deferred syscall bypassed virtual identity or private descriptor policy"
-echo "PASS: deferred syscall preserves virtual identity and private descriptors"
+grep -q '^identities=kernel internal_fds=open$' "$tmpdir/out" \
+  || fail "noop: deferred syscall bypassed kernel identity or private descriptor policy"
+echo "PASS: deferred syscall preserves kernel identity and private descriptors"
 
 run_tool HERMIT_DBT_NOOP "$fork_pthread_guest"
 grep -q '^fork-pthread-race=64$' "$tmpdir/out" \

@@ -13,10 +13,14 @@
 #include <stdio.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include "kernel_task_identity.h"
+
+static kernel_task_identity_t kernel;
 
 static void* observe_identity(void* argument) {
   pid_t* observed = argument;
   *observed = (pid_t)syscall(SYS_gettid);
+  kernel = kernel_task_identity();
   return NULL;
 }
 
@@ -33,9 +37,10 @@ int main(void) {
     return 2;
   if (pthread_join(thread, NULL) != 0)
     return 3;
-  if (observed != 5)
+  if (observed != kernel.tid || kernel.pid != (pid_t)syscall(SYS_getpid) ||
+      observed <= 0 || observed == kernel.pid)
     return 4;
 
-  printf("failed-thread-clone=ok tid=%d\n", observed);
+  puts("failed-thread-clone=ok");
   return 0;
 }

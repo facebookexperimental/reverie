@@ -10,10 +10,10 @@ use std::path::Path;
 use std::process::Command;
 
 #[test]
-fn virtual_identity_is_preferred_over_host_identity() {
+fn task_birth_publication_and_raw_owner_screen_preserve_their_contracts() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let source = manifest.join("tests/fixtures/virtual_identity_translation.c");
-    let binary = Path::new(env!("CARGO_TARGET_TMPDIR")).join("virtual_identity_translation");
+    let source = manifest.join("tests/fixtures/task_membership.c");
+    let binary = Path::new(env!("CARGO_TARGET_TMPDIR")).join("task_membership");
     let compile = Command::new(std::env::var("CC").unwrap_or_else(|_| "cc".into()))
         .args(["-std=c11", "-Wall", "-Wextra", "-Werror"])
         .arg("-I")
@@ -35,7 +35,7 @@ fn virtual_identity_is_preferred_over_host_identity() {
         .unwrap_or_else(|error| panic!("failed to run {}: {error}", binary.display()));
     assert!(
         output.status.success(),
-        "virtual identity translation fixture failed with {:?}:\nstdout:\n{}\nstderr:\n{}",
+        "task membership fixture failed with {:?}:\nstdout:\n{}\nstderr:\n{}",
         output.status.code(),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)

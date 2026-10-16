@@ -27,9 +27,9 @@
  *    hold a mutex while the main thread's exec fails; both unlocks must still
  *    succeed afterwards.
  * 8. sigkill: a forked child locks a process-shared mutex and is SIGKILLed.
- *    Printed as the later lock's result rather than checked, because DBT does
- *    not mark this case yet
- *    (https://github.com/rrnewton/hermit/issues/4239).
+ *    Printed as the later lock's result and checked by the Rust test, including
+ *    the former translated-owner gap in
+ *    https://github.com/rrnewton/hermit/issues/4239.
  * 9. walk_stop: a thread registers its own two-entry robust list, whose first
  *    entry has a misaligned owner word and whose second names the thread's
  *    TID, and exits. Linux stops the walk at the misaligned word, so the
@@ -46,10 +46,9 @@
  *
  * With ROBUST_OWNER_DEATH_FIRST set, the process instead runs one case as the
  * first thing it does, so that its worker is the first thread it creates. In
- * a fresh PID namespace that worker's host TID equals the process's virtual
- * PID, which catches a rewrite that matches the output of another rewrite
- * (Codex review of https://github.com/rrnewton/reverie/pull/1053). Each case
- * prints id_overlap: whether the two IDs were equal.
+ * a fresh PID namespace this also checks the process whose kernel PID is one.
+ * The worker's TID must remain distinct from its process ID. Each case prints
+ * id_overlap: whether the two IDs were equal.
  * - failed-exec: the worker locks a mutex of its own (the owner field names
  *   its TID) and its exec fails: the field must be unchanged and the unlock
  *   must succeed.

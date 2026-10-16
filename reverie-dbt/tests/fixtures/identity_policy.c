@@ -17,10 +17,12 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <string.h>
+#include "kernel_task_identity.h"
 
 enum {
   RANGE_FIRST_FD = 196,
-  VIRTUAL_IDENTITY_FD = 197,
+  TASK_STATE_FD = 197,
   DBT_DIAGNOSTIC_FD = 198,
   RANGE_LAST_FD = 199,
 };
@@ -36,7 +38,7 @@ enum {
 #define P_PIDFD ((idtype_t)3)
 #endif
 
-static int pidfd_targets_virtual_child(void) {
+static int pidfd_targets_child(void) {
   _Atomic int* gate = mmap(
       NULL,
       sizeof(*gate),
@@ -118,7 +120,7 @@ static int close_range_preserves_internal_descriptors(void) {
   if (syscall(SYS_close_range, RANGE_FIRST_FD, RANGE_LAST_FD, unknown_flag) !=
           -1 ||
       errno != EINVAL || fd_flags(RANGE_FIRST_FD) < 0 ||
-      fd_flags(VIRTUAL_IDENTITY_FD) < 0 || fd_flags(DBT_DIAGNOSTIC_FD) < 0 ||
+      fd_flags(TASK_STATE_FD) < 0 || fd_flags(DBT_DIAGNOSTIC_FD) < 0 ||
       fd_flags(RANGE_LAST_FD) < 0)
     return 2;
 
@@ -128,7 +130,7 @@ static int close_range_preserves_internal_descriptors(void) {
     return 4;
   if (fd_flags(RANGE_LAST_FD) >= 0 || errno != EBADF)
     return 5;
-  if (fd_flags(VIRTUAL_IDENTITY_FD) < 0 || fd_flags(DBT_DIAGNOSTIC_FD) < 0)
+  if (fd_flags(TASK_STATE_FD) < 0 || fd_flags(DBT_DIAGNOSTIC_FD) < 0)
     return 6;
 
   if (install_range_neighbor_fds() != 0)
@@ -140,7 +142,7 @@ static int close_range_preserves_internal_descriptors(void) {
           CLOSE_RANGE_CLOEXEC) != 0)
     return 8;
   int first_flags = fd_flags(RANGE_FIRST_FD);
-  int identity_flags = fd_flags(VIRTUAL_IDENTITY_FD);
+  int identity_flags = fd_flags(TASK_STATE_FD);
   int diagnostic_flags = fd_flags(DBT_DIAGNOSTIC_FD);
   int last_flags = fd_flags(RANGE_LAST_FD);
   if (first_flags < 0 || identity_flags < 0 || diagnostic_flags < 0 ||
@@ -162,19 +164,19 @@ static int close_range_preserves_internal_descriptors(void) {
     return 12;
   if (fd_flags(RANGE_LAST_FD) >= 0 || errno != EBADF)
     return 13;
-  if (fd_flags(VIRTUAL_IDENTITY_FD) < 0 || fd_flags(DBT_DIAGNOSTIC_FD) < 0)
+  if (fd_flags(TASK_STATE_FD) < 0 || fd_flags(DBT_DIAGNOSTIC_FD) < 0)
     return 14;
 
   // The runtime's own descriptors are not open as far as the guest knows: a
   // close or F_SETFD of one fails with EBADF, as for any number not open, and
   // the descriptor itself survives.
   errno = 0;
-  if (close(VIRTUAL_IDENTITY_FD) != -1 || errno != EBADF)
+  if (close(TASK_STATE_FD) != -1 || errno != EBADF)
     return 16;
   errno = 0;
   if (fcntl(DBT_DIAGNOSTIC_FD, F_SETFD, 0) != -1 || errno != EBADF)
     return 17;
-  if (fd_flags(VIRTUAL_IDENTITY_FD) < 0 || fd_flags(DBT_DIAGNOSTIC_FD) < 0)
+  if (fd_flags(TASK_STATE_FD) < 0 || fd_flags(DBT_DIAGNOSTIC_FD) < 0)
     return 18;
   return 0;
 #else
@@ -182,6 +184,20 @@ static int close_range_preserves_internal_descriptors(void) {
 #endif
 }
 
+static pid_t kernel_parent_pid(void) {
+  FILE* status = fopen("/proc/self/status", "r");
+  if (status == NULL)
+    return -1;
+  char line[256];
+  int parent = -1;
+  while (fgets(line, sizeof(line), status) != NULL)
+    if (strncmp(line, "PPid:", 5) == 0)
+      (void)sscanf(line, "PPid: %d", &parent);
+  fclose(status);
+  return (pid_t)parent;
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-154): Review deferred DBT identity and private-fd
 // policy.
 int main(void) {
@@ -192,20 +208,22 @@ int main(void) {
   // Not open as far as the guest knows: the close fails, and the descriptor
   // survives.
   errno = 0;
-  if (syscall(SYS_close, VIRTUAL_IDENTITY_FD) != -1 || errno != EBADF)
+  if (syscall(SYS_close, TASK_STATE_FD) != -1 || errno != EBADF)
     return 1;
   errno = 0;
-  if (fcntl(VIRTUAL_IDENTITY_FD, F_GETFD) < 0)
+  if (fcntl(TASK_STATE_FD, F_GETFD) < 0)
     return 2;
-  if (pid != 3 || ppid != 1 || tid != 3)
+  kernel_task_identity_t kernel = kernel_task_identity();
+  if (pid <= 0 || pid != kernel.pid || tid != kernel.tid || tid != pid ||
+      ppid != kernel_parent_pid())
     return 3;
-  if (pidfd_targets_virtual_child() != 0)
+  if (pidfd_targets_child() != 0)
     return 4;
   if (pidfd_preserves_identity_and_flag_validation_order() != 0)
     return 5;
   if (close_range_preserves_internal_descriptors() != 0)
     return 6;
 
-  printf("pid=%ld ppid=%ld tid=%ld internal_fds=open\n", pid, ppid, tid);
+  puts("identities=kernel internal_fds=open");
   return 0;
 }

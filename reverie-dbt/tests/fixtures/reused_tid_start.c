@@ -11,16 +11,19 @@
 #include <stdio.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include "kernel_task_identity.h"
 
 typedef struct {
   pid_t pid;
   pid_t tid;
+  kernel_task_identity_t kernel;
 } observed_identity_t;
 
 static void* observe_identity(void* argument) {
   observed_identity_t* observed = argument;
   observed->pid = (pid_t)syscall(SYS_getpid);
   observed->tid = (pid_t)syscall(SYS_gettid);
+  observed->kernel = kernel_task_identity();
   return NULL;
 }
 
@@ -32,9 +35,11 @@ int main(void) {
     return 1;
   if (pthread_join(thread, NULL) != 0)
     return 2;
-  if (observed.pid != 3 || observed.tid != 4)
+  if (observed.pid != (pid_t)syscall(SYS_getpid) ||
+      observed.pid != observed.kernel.pid || observed.tid != observed.kernel.tid ||
+      observed.tid <= 0 || observed.tid == observed.pid)
     return 3;
 
-  printf("reused-tid-start=ok tid=%d\n", observed.tid);
+  puts("reused-tid-start=ok");
   return 0;
 }

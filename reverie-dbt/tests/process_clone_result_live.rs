@@ -89,6 +89,7 @@ fn process_clone_result_delivery_matches_the_public_contract() {
     let mut expected = vec![
         (libc::SYS_clone, -libc::EINVAL as i64),
         (libc::SYS_clone, -libc::EINVAL as i64),
+        (libc::SYS_clone, -libc::EINVAL as i64),
         (libc::SYS_fork, 1),
         (libc::SYS_fork, 0),
         (libc::SYS_clone, 1),

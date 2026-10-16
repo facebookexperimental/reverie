@@ -139,6 +139,11 @@ static NOOP_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(NOOP_ENV));
 static TEST_REWRITE_EXIT_ENABLED: LazyLock<bool> =
     LazyLock::new(|| env_flag(TEST_REWRITE_EXIT_ENV));
 static TEST_SET_REG_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(TEST_SET_REG_ENV));
+// The existing explicit test Tool also checks a mixed injection route without
+// changing its register/completed-result sentinel mode selected by `1`.
+static TEST_RETURNING_GETTID: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var_os(TEST_SET_REG_ENV).is_some_and(|value| value == OsStr::new("returning-gettid"))
+});
 static TEST_COMPARE_EXCHANGE_ENABLED: LazyLock<bool> =
     LazyLock::new(|| env_flag(TEST_COMPARE_EXCHANGE_ENV));
 static TEST_PPID_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(TEST_PPID_ENV));
@@ -505,6 +510,10 @@ impl Tool for RewriteExitTool {
 /// `set_reg_probe` fixture, which loads a different value and reads it back).
 const SET_REG_SENTINEL: u64 = 0xDEAD_BEEF_CAFE_F00D;
 
+// Test request handled only by the already-selected SetRegTool. It leaves the
+// completed-result sentinel probe below independent of the injection oracle.
+const KERNEL_IDENTITY_PRCTL: u64 = 0x4b49_4421;
+
 /// Regression tool that exercises the DBT `Guest::set_regs` path: on the guest's
 /// `getpid`, overwrite the callee-saved `r15` register with [`SET_REG_SENTINEL`]
 /// via `set_regs`, then suppress the syscall. Because `r15` is preserved across
@@ -527,6 +536,39 @@ impl Tool for SetRegTool {
         guest: &mut G,
         syscall: Syscall,
     ) -> Result<i64, Error> {
+        if *TEST_RETURNING_GETTID {
+            return if syscall.number() == Sysno::gettid {
+                Ok(guest.inject(syscall).await?)
+            } else {
+                guest.tail_inject(syscall).await
+            };
+        }
+        let (number, args) = syscall.into_parts();
+        if number == Sysno::prctl && args.arg0 as u64 == KERNEL_IDENTITY_PRCTL {
+            let (query, adapter) = match args.arg1 as i64 {
+                libc::SYS_getpid => (Sysno::getpid, Some(i64::from(guest.pid().as_raw()))),
+                // Guest::ppid is traced-tree membership: the root has None.
+                libc::SYS_getppid => (Sysno::getppid, None),
+                libc::SYS_gettid => (Sysno::gettid, Some(i64::from(guest.tid().as_raw()))),
+                _ => return Err(reverie::syscalls::Errno::EINVAL.into()),
+            };
+            // This Tool is running on the application callback thread. A raw
+            // client syscall bypasses invoke_syscall and the native ID mapper;
+            // it is not a query performed by the background runtime helper.
+            let kernel = unsafe { libc::syscall(args.arg1 as libc::c_long) };
+            let injected = guest
+                .inject(Syscall::from_raw(query, SyscallArgs::new(0, 0, 0, 0, 0, 0)))
+                .await?;
+            let adapter_field = adapter.map_or_else(|| "none".to_owned(), |id| id.to_string());
+            emit_line(&format!(
+                "reverie-dbt-test: kernel-identity sysnum={} kernel={kernel} injected={injected} adapter={adapter_field}",
+                args.arg1,
+            ));
+            if kernel <= 0 || injected != kernel || adapter.is_some_and(|id| id != kernel) {
+                return Err(reverie::syscalls::Errno::EIO.into());
+            }
+            return Ok(injected);
+        }
         match syscall.number() {
             Sysno::getpid => {
                 let mut regs = guest.regs().await;
