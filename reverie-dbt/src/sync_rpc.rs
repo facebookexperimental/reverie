@@ -39,6 +39,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::TryLockError;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use reverie::GlobalTool;
 use reverie::Tid;
@@ -329,7 +331,7 @@ pub fn send_rpc_from_guest<G: GlobalTool>(
     );
     let request = RpcRequest::<G>::new(from, request)
         .expect("reverie-dbt: guest coordinator request encode failed");
-    let response = match GUEST_CLIENT.try_lock() {
+    let response = match GUEST_CLIENT.connection.try_lock() {
         Ok(mut slot) => {
             let pid = std::process::id();
             let must_connect = !matches!(
@@ -337,13 +339,9 @@ pub fn send_rpc_from_guest<G: GlobalTool>(
                 Some(connection) if connection.pid == pid && connection.path == path
             );
             if must_connect {
-                if let Some(connection) = slot.take() {
-                    close_guest(context, invoke_syscall, connection.fd);
-                }
-                *slot = Some(
-                    connect_guest(context, invoke_syscall, &path, pid)
-                        .expect("reverie-dbt sync_rpc: failed to connect guest socket"),
-                );
+                GUEST_CLIENT
+                    .replace(&mut slot, context, invoke_syscall, &path, pid)
+                    .expect("reverie-dbt sync_rpc: failed to connect guest socket");
             }
             let connection = slot
                 .as_ref()
@@ -360,21 +358,18 @@ pub fn send_rpc_from_guest<G: GlobalTool>(
         Err(TryLockError::Poisoned(poisoned)) => {
             let mut slot = poisoned.into_inner();
             let pid = std::process::id();
-            if let Some(connection) = slot.take() {
-                close_guest(context, invoke_syscall, connection.fd);
-            }
-            let connection = connect_guest(context, invoke_syscall, &path, pid)
+            GUEST_CLIENT
+                .replace(&mut slot, context, invoke_syscall, &path, pid)
                 .expect("reverie-dbt sync_rpc: failed to recover guest connection");
-            let response = guest_round_trip::<G>(
+            let connection = slot.as_ref().expect("recovered guest connection");
+            guest_round_trip::<G>(
                 context,
                 invoke_syscall,
                 connection.fd,
                 from,
                 config,
                 request,
-            );
-            *slot = Some(connection);
-            response
+            )
         }
         Err(TryLockError::WouldBlock) => {
             // A fork child can inherit this mutex while another parent thread
@@ -408,7 +403,133 @@ struct GuestConnection {
     fd: i32,
 }
 
-static GUEST_CLIENT: Mutex<Option<GuestConnection>> = Mutex::new(None);
+// This owner retains a raw descriptor because closing it requires the current
+// application's native invocation context, which must never be cached. Once
+// published, its descriptor NUMBER stays occupied until exec/process exit.
+// Reconnects atomically replace the socket at that same number; no old Drop
+// owner may close the replacement. A private fork copy refreshes the PID fact.
+struct GuestClient {
+    connection: Mutex<Option<GuestConnection>>,
+    primary: AtomicU64,
+}
+
+impl GuestClient {
+    const fn new() -> Self {
+        Self {
+            connection: Mutex::new(None),
+            primary: AtomicU64::new(0),
+        }
+    }
+
+    fn descriptor(&self, pid: u32) -> Option<i32> {
+        let fact = self.primary.load(Ordering::Acquire);
+        (pid != 0 && fact >> 32 == u64::from(pid)).then_some(fact as u32 as i32)
+    }
+
+    fn replace(
+        &self,
+        slot: &mut Option<GuestConnection>,
+        context: usize,
+        invoke_syscall: SyscallInvoker,
+        path: &Path,
+        pid: u32,
+    ) -> io::Result<()> {
+        let mut replacement = connect_guest(context, invoke_syscall, path, pid)?;
+        if let Some(old) = slot.as_ref() {
+            // The exchange mutex excludes users of the primary socket. The
+            // old number stays owned even when connect/handshake/dup3 fails;
+            // independent pending/release exchanges use different sockets.
+            let installed = invoke(
+                context,
+                invoke_syscall,
+                libc::SYS_dup3,
+                [
+                    replacement.fd as u64,
+                    old.fd as u64,
+                    libc::O_CLOEXEC as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            );
+            close_guest(context, invoke_syscall, replacement.fd);
+            installed?;
+            replacement.fd = old.fd;
+        }
+        let fd = replacement.fd;
+        *slot = Some(replacement);
+        self.primary.store(
+            (u64::from(pid) << 32) | u64::from(fd as u32),
+            Ordering::Release,
+        );
+        Ok(())
+    }
+}
+
+static GUEST_CLIENT: GuestClient = GuestClient::new();
+
+/// Prepares a configured primary connection before an admitted Tool entry.
+/// No coordinator means the standalone/mock Tool keeps its no-RPC behavior.
+pub(crate) fn prepare_guest(
+    context: usize,
+    invoke_syscall: SyscallInvoker,
+    pid: u32,
+) -> io::Result<()> {
+    let Some(path) = std::env::var_os(RPC_SOCKET_ENV) else {
+        return Ok(());
+    };
+    if GUEST_CLIENT.descriptor(pid).is_some() {
+        return Ok(());
+    }
+    let mut slot = match GUEST_CLIENT.connection.try_lock() {
+        Ok(slot) => slot,
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        // A fork can inherit a permanently held lock. Keep the existing
+        // independent-RPC fallback, never wait on an inherited owner lease.
+        Err(TryLockError::WouldBlock) => return Ok(()),
+    };
+    if GUEST_CLIENT.descriptor(pid).is_none() {
+        GUEST_CLIENT.replace(&mut slot, context, invoke_syscall, Path::new(&path), pid)?;
+    }
+    Ok(())
+}
+
+/// Shared A4 operation semantics over this connection owner's actual FD fact.
+/// Descriptor changes reach the Tool for accounting, then are protected at
+/// injection/forwarding. The stable fact can be read during a pending RPC.
+pub(crate) fn protect_guest_operation(
+    context: usize,
+    invoke_syscall: SyscallInvoker,
+    pid: u32,
+    number: i64,
+    args: &[u64; 6],
+    before_tool: bool,
+) -> Option<i64> {
+    use reverie::syscalls::reserved_fds;
+    let fd = GUEST_CLIENT.descriptor(pid)? as u64;
+    if before_tool && matches!(number, libc::SYS_close | libc::SYS_close_range) {
+        return None;
+    }
+    if number == libc::SYS_close && reserved_fds::descriptor_arg(args, 0) == fd {
+        Some(-i64::from(libc::EBADF))
+    } else if number == libc::SYS_close_range && reserved_fds::close_range_covers(args, &[fd]) {
+        // This is the Tool's physical operation on guest-owned descriptors;
+        // the connection owner holds only the one descriptor being spared.
+        Some(unsafe {
+            reserved_fds::close_range_sparing(args, &[fd], |number, args| {
+                invoke_syscall(context, number, args.as_ptr())
+            })
+        })
+    } else if let Some(result) = reserved_fds::epoll_wait_result(number, args, fd) {
+        Some(result)
+    } else if reserved_fds::names_descriptor(number, args, fd)
+        || reserved_fds::socket_call_names_descriptor(number, args, fd)
+    {
+        Some(-i64::from(libc::EBADF))
+    } else {
+        None
+    }
+}
 
 fn connect_guest(
     context: usize,
@@ -430,15 +551,16 @@ fn connect_guest(
         ],
     )? as i32;
     let result = (|| {
-        // The private connection must not occupy a guest's closed stdin,
-        // stdout or stderr. Keep CLOEXEC and release that slot before any
-        // guest syscall can observe the cached connection.
-        if fd <= libc::STDERR_FILENO {
+        // Use A4's reserved range without overwriting an inherited guest FD.
+        // Release the temporary low slot before any Tool hook can inject a
+        // guest allocation. Concurrent uncached RPC creation remains a
+        // temporary-allocation boundary, not an atomic high-FD socket API.
+        if fd < 1024 {
             let relocated = invoke(
                 context,
                 invoke_syscall,
                 libc::SYS_fcntl,
-                [fd as u64, libc::F_DUPFD_CLOEXEC as u64, 3, 0, 0, 0],
+                [fd as u64, libc::F_DUPFD_CLOEXEC as u64, 1024, 0, 0, 0],
             )? as i32;
             close_guest(context, invoke_syscall, fd);
             fd = relocated;
@@ -802,7 +924,7 @@ mod tests {
         fn new(allocated_fd: i32) -> Self {
             Self {
                 allocated_fd,
-                duplicate_result: 9,
+                duplicate_result: 1024,
                 connect_result: 0,
                 calls: Vec::new(),
             }
@@ -845,19 +967,23 @@ mod tests {
     }
 
     #[test]
-    fn private_rpc_socket_leaves_closed_stdio_available() {
-        for allocated_fd in 0..=3 {
+    fn private_rpc_socket_leaves_guest_descriptor_range_available() {
+        for allocated_fd in [0, 1, 2, 3, 1023, 1024] {
             let mut probe = SocketProbe::new(allocated_fd);
             let connection = probe.connect().unwrap();
-            let expected_fd = if allocated_fd < 3 { 9 } else { allocated_fd };
+            let expected_fd = if allocated_fd < 1024 {
+                1024
+            } else {
+                allocated_fd
+            };
             assert_eq!(connection.fd, expected_fd);
             let duplicates = probe.arguments(libc::SYS_fcntl);
             let closes = probe.arguments(libc::SYS_close);
-            if allocated_fd < 3 {
+            if allocated_fd < 1024 {
                 assert_eq!(duplicates.len(), 1);
                 assert_eq!(
                     duplicates[0][..3],
-                    [allocated_fd as u64, libc::F_DUPFD_CLOEXEC as u64, 3]
+                    [allocated_fd as u64, libc::F_DUPFD_CLOEXEC as u64, 1024]
                 );
                 assert_eq!(closes.len(), 1);
                 assert_eq!(closes[0][0], allocated_fd as u64);
@@ -885,6 +1011,27 @@ mod tests {
     }
 
     #[test]
+    fn failed_primary_preparation_publishes_no_descriptor_fact() {
+        let owner = GuestClient::new();
+        let mut slot = None;
+        let mut probe = SocketProbe::new(3);
+        probe.duplicate_result = -i64::from(libc::EMFILE);
+        let error = owner
+            .replace(
+                &mut slot,
+                &mut probe as *mut SocketProbe as usize,
+                socket_syscall,
+                Path::new("/test-coordinator"),
+                123,
+            )
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EMFILE));
+        assert!(slot.is_none());
+        assert_eq!(owner.descriptor(123), None);
+        assert_eq!(probe.arguments(libc::SYS_close), [[3, 0, 0, 0, 0, 0]]);
+    }
+
+    #[test]
     fn private_rpc_connect_failure_closes_original_and_duplicate_once() {
         let mut probe = SocketProbe::new(2);
         probe.connect_result = -i64::from(libc::ECONNREFUSED);
@@ -893,6 +1040,6 @@ mod tests {
         let closes = probe.arguments(libc::SYS_close);
         assert_eq!(closes.len(), 2);
         assert_eq!(closes[0][0], 2);
-        assert_eq!(closes[1][0], 9);
+        assert_eq!(closes[1][0], 1024);
     }
 }

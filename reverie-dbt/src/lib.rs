@@ -726,6 +726,16 @@ where
             args.arg4 as u64,
             args.arg5 as u64,
         ];
+        if let Some(result) = sync_rpc::protect_guest_operation(
+            self.context,
+            self.invoke_syscall,
+            self.pid.as_raw() as u32,
+            number.id() as i64,
+            &args,
+            false,
+        ) {
+            return Errno::from_ret(result as usize).map(|value| value as i64);
+        }
         // The native bridge classifies this as an injected syscall: clone
         // identity bookkeeping still completes synchronously, while the
         // original-syscall post-event latch remains disarmed because the raw
@@ -1155,6 +1165,7 @@ pub fn run_tool_thread_start<T: Tool>(
     read_registers: RegisterReader,
     write_registers: RegisterWriter,
 ) -> Result<(), Error> {
+    sync_rpc::prepare_guest(context, invoke_syscall, pid.as_raw() as u32)?;
     let mut guest = DbtGuest::new(
         context,
         tid,
@@ -1368,6 +1379,10 @@ fn run_tool_syscall_inner<T: Tool>(
     write_registers: RegisterWriter,
     read_memory: Option<MemoryReader>,
 ) -> Result<DbtSyscallOutcome, Error> {
+    sync_rpc::prepare_guest(context, invoke_syscall, pid.as_raw() as u32)?;
+    if let Some(result) = protect_tool_syscall(context, invoke_syscall, pid, syscall, true) {
+        return Ok(DbtSyscallOutcome::Suppress(result));
+    }
     let mut guest = DbtGuest::new(
         context,
         tid,
@@ -1392,11 +1407,39 @@ fn run_tool_syscall_inner<T: Tool>(
             .take()
             .expect("tool handler suspended without a tail-inject result")
         {
-            TailInjectAction::ExecuteOriginal(syscall) => {
-                Ok(DbtSyscallOutcome::ExecuteOriginal(syscall))
-            }
+            TailInjectAction::ExecuteOriginal(syscall) => Ok(
+                match protect_tool_syscall(context, invoke_syscall, pid, syscall, false) {
+                    Some(result) => DbtSyscallOutcome::Suppress(result),
+                    None => DbtSyscallOutcome::ExecuteOriginal(syscall),
+                },
+            ),
         },
     }
+}
+
+fn protect_tool_syscall(
+    context: usize,
+    invoke_syscall: SyscallInvoker,
+    pid: Pid,
+    syscall: Syscall,
+    before_tool: bool,
+) -> Option<i64> {
+    let (number, args) = syscall.into_parts();
+    sync_rpc::protect_guest_operation(
+        context,
+        invoke_syscall,
+        pid.as_raw() as u32,
+        number.id() as i64,
+        &[
+            args.arg0 as u64,
+            args.arg1 as u64,
+            args.arg2 as u64,
+            args.arg3 as u64,
+            args.arg4 as u64,
+            args.arg5 as u64,
+        ],
+        before_tool,
+    )
 }
 
 /// Drives the shared Tool signal hook from an exclusively owned native continuation.
@@ -1421,6 +1464,7 @@ pub fn run_tool_signal_with_memory_reader<T: Tool>(
     write_registers: RegisterWriter,
     read_memory: MemoryReader,
 ) -> Result<DbtSignalOutcome, Error> {
+    sync_rpc::prepare_guest(context, invoke_syscall, pid.as_raw() as u32)?;
     let signal = Signal::try_from(event.signal).map_err(|_| Errno::EINVAL)?;
     if event.reserved != 0
         || i32::from_ne_bytes(event.signal_info[..4].try_into().unwrap()) != event.signal
@@ -1538,12 +1582,15 @@ static TOTAL_REWRITTEN: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "prototype-runtime")]
 static IMAGE_GENERATION: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "prototype-runtime")]
+static READY_IMAGE_GENERATION: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "prototype-runtime")]
 static PROCESS_CLONE_RESULT_PROBE: AtomicBool = AtomicBool::new(false);
 
 /// Begins a new DynamoRIO application image and returns its generation.
 #[cfg(feature = "prototype-runtime")]
 #[unsafe(no_mangle)]
 pub extern "C" fn reverie_dbt_runtime_image_init() -> u64 {
+    READY_IMAGE_GENERATION.store(0, Ordering::Release);
     IMAGE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
 }
 
@@ -1873,7 +1920,27 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
         TOTAL_SYSCALLS.fetch_add(1, Ordering::Relaxed);
         tools::set_emitter(emit);
 
+        // Preparation is a runtime prerequisite, not a guest syscall error.
+        // Do this before any Tool mapping that converts its own error to EIO.
+        if let Err(error) = sync_rpc::prepare_guest(context as usize, invoke_syscall, pid as u32) {
+            tools::emit_line(&format!(
+                "reverie-dbt: application RPC preparation refused: {error}"
+            ));
+            return -1;
+        }
+
         let raw_args = unsafe { std::slice::from_raw_parts(args, 6) };
+        if let Some(value) = sync_rpc::protect_guest_operation(
+            context as usize,
+            invoke_syscall,
+            pid as u32,
+            sysnum,
+            unsafe { &*args.cast::<[u64; 6]>() },
+            true,
+        ) {
+            unsafe { result.write(value) };
+            return 1;
+        }
 
         if tools::recorder_enabled() {
             return unsafe {
@@ -2047,7 +2114,30 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
 
     // `catch_unwind` cannot actually catch under DR; a genuine panic aborts
     // before reaching here. An error means "leave the syscall unchanged".
-    handled.unwrap_or_default()
+    let action = handled.unwrap_or_default();
+    // Cover the prototype's unhandled/original route too. Tool paths leave
+    // close/close_range accounting to their handler and protect forwarding.
+    if matches!(action, 0 | 2) {
+        let (number, arguments) = if action == 0 {
+            (sysnum, unsafe { &*args.cast::<[u64; 6]>() })
+        } else {
+            (unsafe { deferred_sysnum.read() }, unsafe {
+                &*deferred_args.cast::<[u64; 6]>()
+            })
+        };
+        if let Some(value) = sync_rpc::protect_guest_operation(
+            context as usize,
+            invoke_syscall,
+            pid as u32,
+            number,
+            arguments,
+            false,
+        ) {
+            unsafe { result.write(value) };
+            return 1;
+        }
+    }
+    action
 }
 
 /// Initializes the built-in prototype runtime through the admitted startup bridge.
@@ -2074,6 +2164,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v3(
     if argument.is_null() {
         return 1;
     }
+    let generation = IMAGE_GENERATION.load(Ordering::Acquire);
     let callbacks = unsafe { &*(argument as *const DbtRuntimeCallbacks) };
     let control = std::env::var_os(sync_rpc::RPC_SOCKET_ENV);
     if let Err(error) = prototype_initial_config(native_mode, control.as_deref()) {
@@ -2087,6 +2178,11 @@ pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v3(
         std::env::var_os("REVERIE_DBT_TEST_PROCESS_CLONE_RESULTS").is_some(),
         Ordering::Release,
     );
+    // The helper's DynamoRIO bootstrap (including temporary maps FDs) has
+    // finished before this callback. Config receipt retired its own socket.
+    // Only this prototype publishes here; Detcore owns its distinct READY
+    // boundary while its background scheduler remains active.
+    READY_IMAGE_GENERATION.store(generation, Ordering::Release);
     0
 }
 
@@ -2259,8 +2355,10 @@ pub extern "C" fn reverie_dbt_runtime_process_exit() {
 /// Reports whether the built-in prototype runtime is ready for callbacks.
 #[cfg(feature = "prototype-runtime")]
 #[unsafe(no_mangle)]
-pub extern "C" fn reverie_dbt_runtime_ready(_image_generation: u64) -> i32 {
-    1
+pub extern "C" fn reverie_dbt_runtime_ready(image_generation: u64) -> i32 {
+    i32::from(
+        image_generation != 0 && READY_IMAGE_GENERATION.load(Ordering::Acquire) == image_generation,
+    )
 }
 
 /// Returns the name of the built-in DBT runtime for native summary evidence.
