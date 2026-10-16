@@ -12,15 +12,20 @@ the check fails. A row that no longer describes what a backend does fails too.
   `native` observes the program with plain ptrace syscall stops, with no
   Reverie. The in-guest backends (LiteInst, in-guest-trap, e9patch) host the
   recorder in the example preload, `libreverie_examples.so`, which selects it
-  by name. A backend that cannot host the tool refuses by name (`REFUSED:`):
-  DBT and SaBRe have no generic tool host.
+  by name. DBT hosts it in reverie-dbt's prototype runtime and needs the
+  DynamoRIO client (`reverie-dbt/scripts/build-client.sh`, found beside the
+  recorder or through `REVERIE_DBT_CLIENT`), with the tool's GlobalState in
+  the recorder, served to the program's processes over a socket. A backend
+  that cannot host the tool refuses by name (`REFUSED:`): SaBRe has no generic
+  tool host yet.
 - `../backend.rs`: the run-time backend selector the tools share.
 - `compare.rs` (binary `reverie-e2e-compare`): runs each program of `corpus.tsv` natively twice (an unstable
   native baseline is its own verdict) and on each backend, compares call by
   call, and checks every verdict other than `match` against
   `expected-mismatches.tsv`. An in-guest tool starts at its preload's
   constructor, after the loader's calls, at the start and after each
-  `execve`: for those backends the comparator first moves the native record
+  `execve`, and DBT's starts after the `execve` that starts the program: for
+  those backends the comparator first moves the native record
   to where the backend's next calls appear by name, then compares exactly.
 
 The ledger is measured in Hermit's pinned validation root, where Hermit's
@@ -30,6 +35,7 @@ the environment-independent part (`../tests/recorder.rs`).
 
 ```text
 cargo build -p reverie-examples --lib --bin recorder --bin reverie-e2e-compare
+reverie-dbt/scripts/build-client.sh
 target/debug/reverie-e2e-compare \
     --recorder target/debug/recorder \
     --backends ptrace,kvm,liteinst,in-guest-trap,e9patch,dbt,sabre \

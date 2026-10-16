@@ -16,9 +16,12 @@ python3	ptrace	mismatch	rt_sigprocmask=ok -> getrandom=ok	https://github.com/rrn
 # for it yet.
 *	sabre	refused	*	https://github.com/rrnewton/hermit/issues/4485
 # DBT hosts the recorder in reverie-dbt's prototype runtime (REVERIE_DBT_TOOL), its GlobalState in the
-# launcher. DynamoRIO holds a descriptor the program sees, so its first open returns 4 where Linux returns
-# 3, the first difference on every program (later, rseq answers ENOSYS: DynamoRIO runs with -disable_rseq).
-*	dbt	mismatch	openat=3 -> openat=4	https://github.com/rrnewton/hermit/issues/4485
+# launcher. The runtime's connection to that GlobalState is a socket in the program's descriptor table,
+# made on first use (reverie-dbt sync_rpc.rs, connect_guest), so the program's first open usually returns
+# 4 where Linux returns 3. Not always: in 1 of about 115 DBT cells in the pinned root (sha256-true) the
+# program saw descriptor 3 free throughout, and the first difference was the next one, rseq answering
+# ENOSYS (DynamoRIO runs with -disable_rseq). Hence two signatures.
+*	dbt	mismatch	openat=3 -> openat=4 || rseq=ok -> rseq=ENOSYS	https://github.com/rrnewton/hermit/issues/4485
 # LiteInst and in-guest-trap host the recorder in the example preload; the comparator aligns their
 # records after the loader's calls, which an in-guest tool cannot see (compare.rs, LATE_START). Then:
 # the tool does not see one brk call (the first difference on most programs); the preload's two

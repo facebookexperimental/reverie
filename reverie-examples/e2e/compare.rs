@@ -30,9 +30,11 @@
 //! `no_result` (the run failed).
 //!
 //! Ledger rows: `cell<TAB>backend<TAB>verdict<TAB>signature<TAB>issue`, `*`
-//! for any cell or signature. Every verdict other than `match` needs a row,
-//! and every row naming a cell and backend that ran must match its verdict:
-//! an unexpected difference and a stale row both fail.
+//! for any cell or signature. A signature may list alternatives separated by
+//! ` || `, for a first difference that varies between runs; the ledger's
+//! comment above the row says why. Every verdict other than `match` needs a
+//! row, and every row naming a cell and backend that ran must match its
+//! verdict: an unexpected difference and a stale row both fail.
 
 use std::fs;
 use std::path::Path;
@@ -304,11 +306,19 @@ fn read_ledger(path: &Path) -> Vec<Row> {
         .collect()
 }
 
+/// Separates the signatures a ledger row accepts, for a first difference that
+/// varies between runs.
+const SIGNATURE_ALTERNATIVES: &str = " || ";
+
 fn row_matches(row: &Row, cell: &str, backend: &str, outcome: &Outcome) -> bool {
     (row.cell == "*" || row.cell == cell)
         && row.backend == backend
         && row.verdict == outcome.verdict
-        && (row.signature == "*" || row.signature == outcome.signature)
+        && (row.signature == "*"
+            || row
+                .signature
+                .split(SIGNATURE_ALTERNATIVES)
+                .any(|signature| signature == outcome.signature))
 }
 
 fn main() {
