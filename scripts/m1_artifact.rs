@@ -709,7 +709,7 @@ fn content_manifest_relative(image_kind: FixedImageKind) -> &'static str {
 }
 // Reviewed literal expectations, not hashes generated from the current checkout
 // or bytes embedded after a runtime edit. The qualifier self-hash is separate.
-const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 18] = [
+const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 21] = [
     (
         "Cargo.toml",
         897,
@@ -722,13 +722,28 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 18] = [
     ),
     (
         "reverie-inguest/Cargo.toml",
-        4184,
-        "a2bc6bbd170549052717d66fd91397304a74748d4111e1886a24d463455da0d7",
+        4271,
+        "e2bf8c1cdfc4fde6272bc000be8361478d39e41a23f28914b53ffd9ef03579f5",
     ),
     (
         "reverie-inguest/src/lib.rs",
-        11540,
-        "89fbed346c4d3e0af9e4717a21136e9ad9ebcb1eb918e35b6f718570385af4b5",
+        11558,
+        "e9307dfc7e9f2d7395cbb33d36ff4a955fc6ca581565fb638305c98a77435224",
+    ),
+    (
+        "reverie-syscalls/Cargo.toml",
+        1180,
+        "4bb224234d1b8ab61e9b2f8bd426bcbca9802bb92bf86b8c7abcffb988cbb605",
+    ),
+    (
+        "reverie-syscalls/src/lib.rs",
+        1145,
+        "b762c98d9cf3a8898e72be4fbc15f3997705c207613182661c429c99704d6ba6",
+    ),
+    (
+        "reverie-syscalls/src/reserved_fds.rs",
+        16820,
+        "ce489a529546ec85eafe842232f623c6393e3ccf2fd2b82c7bfaef828805f451",
     ),
     (
         "reverie-liteinst/Cargo.toml",
@@ -1343,6 +1358,7 @@ fn content_manifest_and_lock_pin(metadata: &Value, root: &Path, source: &str) ->
         .map_err(|e| e.to_string())?;
     for name in [
         "reverie-inguest",
+        "reverie-syscalls",
         "reverie-liteinst",
         "reverie-liteinst-preload",
         "reverie-liteinst-artifact",
@@ -1848,6 +1864,7 @@ impl VerifiedCompiledSources {
                 "reverie_inguest",
                 &["cdylib", "rlib"][..],
             ),
+            ("reverie-syscalls", "reverie_syscalls", &["lib"][..]),
             ("reverie-liteinst", "reverie_liteinst", &["rlib"][..]),
             (
                 "reverie-liteinst-preload",
@@ -27560,7 +27577,7 @@ mod tests {
         let rv_two = cargo_two.join(suffix);
         // Current compiled bytes are inputs only. Each must independently match
         // the fixed reviewed length/digest catalog before any positive is earned.
-        let compiled_files: [(&str, &[u8]); 20] = [
+        let compiled_files: [(&str, &[u8]); 23] = [
             ("Cargo.toml", include_bytes!("../Cargo.toml")),
             (
                 "reverie-liteinst-artifact/Cargo.toml",
@@ -27573,6 +27590,18 @@ mod tests {
             (
                 "reverie-inguest/src/lib.rs",
                 include_bytes!("../reverie-inguest/src/lib.rs"),
+            ),
+            (
+                "reverie-syscalls/Cargo.toml",
+                include_bytes!("../reverie-syscalls/Cargo.toml"),
+            ),
+            (
+                "reverie-syscalls/src/lib.rs",
+                include_bytes!("../reverie-syscalls/src/lib.rs"),
+            ),
+            (
+                "reverie-syscalls/src/reserved_fds.rs",
+                include_bytes!("../reverie-syscalls/src/reserved_fds.rs"),
             ),
             (
                 "reverie-liteinst/Cargo.toml",
@@ -27643,10 +27672,10 @@ mod tests {
             }
         }
         let (rv_inventory, _) = content_reverie_inventory(&rv_one).unwrap();
-        assert_eq!(rv_inventory.len(), 19);
+        assert_eq!(rv_inventory.len(), 22);
         let (detcore_inventory, _) =
             content_reverie_inventory_for_image(&rv_one, FixedImageKind::Detcore).unwrap();
-        assert_eq!(detcore_inventory.len(), 20);
+        assert_eq!(detcore_inventory.len(), 23);
         assert_eq!(
             content_reverie_inventory_for_image(&rv_two, FixedImageKind::Detcore)
                 .unwrap()
@@ -27776,6 +27805,7 @@ mod tests {
                 "reverie_inguest",
                 &["cdylib", "rlib"][..],
             ),
+            ("reverie-syscalls", "reverie_syscalls", &["lib"][..]),
             ("reverie-liteinst", "reverie_liteinst", &["rlib"][..]),
             (
                 "reverie-liteinst-preload",
@@ -27869,6 +27899,7 @@ mod tests {
         let lock = root.join("liteinst-runtime-build/Cargo.lock");
         let lock_bytes = [
             "reverie-inguest",
+            "reverie-syscalls",
             "reverie-liteinst",
             "reverie-liteinst-preload",
             "reverie-liteinst-artifact",

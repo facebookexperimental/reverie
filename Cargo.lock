@@ -1568,6 +1568,7 @@ dependencies = [
  "reverie-core",
  "reverie-ptrace",
  "reverie-rpc-transport",
+ "reverie-syscalls",
  "serde",
  "sha2",
  "tempfile",

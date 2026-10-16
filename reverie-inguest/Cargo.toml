@@ -45,7 +45,7 @@ exec-native-injection = ["exec-private-successor", "dep:sha2"]
 
 # Synchronous coordinator RPC client, wire-compatible with the async
 # `reverie-rpc-transport` `RpcServer<G>` (u32-BE length prefix + bincode2
-# `config::legacy`). Opt-in so the default cdylib stays a lean libc-only .so.
+# `config::legacy`). Opt-in so the default cdylib does not include the coordinator transport.
 coordinator-rpc = ["dep:serde", "dep:bincode", "dep:reverie", "dep:reverie-rpc-transport"]
 # The in-guest RCB clock, built on reverie-ptrace's in-process branch counter.
 rcb-clock = ["dep:reverie", "dep:reverie-ptrace"]
@@ -53,6 +53,7 @@ rcb-clock = ["dep:reverie", "dep:reverie-ptrace"]
 [dependencies]
 sha2 = { version = "0.10.9", optional = true }
 libc = "0.2.186"
+reverie-syscalls = { version = "0.4.1", path = "../reverie-syscalls" }
 serde = { version = "1.0.219", features = ["derive"], optional = true }
 bincode = { version = "2", features = ["serde"], optional = true }
 reverie = { version = "0.4.1", path = "../reverie", optional = true, package = "reverie-core" }

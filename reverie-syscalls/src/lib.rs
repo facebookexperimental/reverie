@@ -24,6 +24,8 @@ mod macros;
 mod args;
 mod display;
 mod raw;
+#[cfg(target_arch = "x86_64")]
+pub mod reserved_fds;
 mod syscalls;
 
 // Re-export the only things that might be needed from the syscalls crate
