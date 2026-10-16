@@ -622,7 +622,6 @@ where
             exec: None,
             #[cfg(feature = "exec-native-injection")]
             mapping_driver: self.native_exec_driver.as_deref(),
-            #[cfg(feature = "exec-native-injection")]
             unsupported_refusal: None,
         };
 
@@ -997,7 +996,6 @@ where
             exec: None,
             #[cfg(feature = "exec-native-injection")]
             mapping_driver: self.native_exec_driver.as_deref(),
-            #[cfg(feature = "exec-native-injection")]
             unsupported_refusal: None,
         };
         if is_new {
@@ -1190,7 +1188,6 @@ fn finish_fork_child<T: Tool, R: HostRuntime>(
         exec: None,
         #[cfg(feature = "exec-native-injection")]
         mapping_driver: None,
-        #[cfg(feature = "exec-native-injection")]
         unsupported_refusal: None,
     };
     match callback_result(drive_callback(
@@ -1699,7 +1696,8 @@ struct InGuest<'a, T: Tool, R: HostRuntime> {
     exec: Option<super::native_exec::ExecInjection<'a, T>>,
     #[cfg(feature = "exec-native-injection")]
     mapping_driver: Option<&'a dyn super::native_exec::NativeExecDriver<T>>,
-    #[cfg(feature = "exec-native-injection")]
+    /// The typed refusal of the last injection, if the backend refused it
+    /// ([`reverie::Guest::take_unsupported_refusal`]).
     unsupported_refusal: Option<reverie::UnsupportedRefusal>,
 }
 
@@ -3034,21 +3032,11 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
     async fn daemonize(&mut self) {}
 
     fn take_unsupported_refusal(&mut self) -> Option<reverie::UnsupportedRefusal> {
-        #[cfg(feature = "exec-native-injection")]
-        {
-            self.unsupported_refusal.take()
-        }
-        #[cfg(not(feature = "exec-native-injection"))]
-        {
-            None
-        }
+        self.unsupported_refusal.take()
     }
 
     async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
-        #[cfg(feature = "exec-native-injection")]
-        {
-            self.unsupported_refusal = None;
-        }
+        self.unsupported_refusal = None;
         if self.tail.ending() {
             // The guest is ending (an exit or a SIGKILL of itself was staged,
             // perhaps in a future the Tool abandoned): no further call is
@@ -3085,6 +3073,15 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
 
         // AUTONOMOUS-BOT-IMPLEMENTED
         if matches!(number, libc::SYS_clone | libc::SYS_clone3 | libc::SYS_vfork) {
+            // A typed refusal, so the Tool can tell this from a clone that
+            // Linux failed: the in-guest runtime runs one thread of the guest
+            // and has no thread or vfork-child creation to forward.
+            self.unsupported_refusal = Some(reverie::UnsupportedRefusal::new(
+                reverie::UnsupportedOperation::ThreadCreation,
+                Errno::EOPNOTSUPP,
+                "the in-guest backend cannot create a thread or a vfork child: \
+                 clone, clone3 and vfork other than a plain fork are not forwarded",
+            ));
             const MESSAGE: &[u8] = b"reverie-liteinst: clone injection requires ptrace fallback\n";
             unsafe {
                 let _ = raw_syscall6(
@@ -3225,10 +3222,7 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
     }
 
     async fn tail_inject<S: SyscallInfo>(&mut self, syscall: S) -> Never {
-        #[cfg(feature = "exec-native-injection")]
-        {
-            self.unsupported_refusal = None;
-        }
+        self.unsupported_refusal = None;
         if self.tail.ending() {
             // As in `inject`: the guest is ending, so nothing is made.
             return std::future::pending().await;

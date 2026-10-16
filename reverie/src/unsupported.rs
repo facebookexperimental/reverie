@@ -24,6 +24,10 @@ pub enum UnsupportedOperation {
     /// original operation, live cut or controlled successor launch chain.
     /// No replacement image ran; ordinary exec preparation can roll back.
     NativeExec,
+    /// `clone`, `clone3` or `vfork` that would create a thread or a vfork
+    /// child, on a backend that runs one thread of the guest and cannot add
+    /// another. No child was created and the caller runs on unchanged.
+    ThreadCreation,
 }
 
 /// A backend's refusal of an injected syscall that it cannot perform, as
