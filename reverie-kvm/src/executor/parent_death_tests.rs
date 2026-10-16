@@ -460,6 +460,17 @@ fn pdeath_enrolled_raw_waits_refuse_before_effect_and_capture_remains_supported(
         let mut bytes = [0; 32]; memory.read(0x100, &mut bytes).unwrap();
         assert_eq!(bytes, [0x7b; 32]);
     }
+    // Direct injection of flock is not a parent-death refusal: a valid lock
+    // operation is the typed Flock refusal, everything else the kernel's.
+    for (fd, operation) in [(1_u64, libc::LOCK_EX), (1, libc::LOCK_SH), (999, libc::LOCK_EX), (1, 0), (1, 32)] {
+        let request = SyscallRequest::new(libc::SYS_flock as u64, [fd, operation as u64, 0, 0, 0, 0]);
+        let refused = fd == 1 && matches!(operation, libc::LOCK_EX | libc::LOCK_SH);
+        // SAFETY: fd -1 names no description.
+        let expected = if refused { negative_errno(libc::ENOSYS) } else { zero_or_errno(unsafe { libc::flock(-1, operation) }) };
+        assert_eq!(executor.execute_checked(&request, &memory).unwrap(), expected, "fd {fd} operation {operation:#x}");
+        assert_eq!(executor.take_unsupported_refusal().map(|refusal| refusal.operation),
+            refused.then_some(reverie::UnsupportedOperation::Flock));
+    }
     assert_eq!(executor.execute(&SyscallRequest::new(libc::SYS_write as u64, [1, 0x100, 4, 0, 0, 0]), &memory), 4);
     let (stdout, stderr) = executor.take_output();
     assert_eq!(stdout, [0x7b; 4]); assert!(stderr.is_empty());
@@ -725,6 +736,16 @@ fn pdeath_original_preflight_is_exact_uncached_and_preserves_zero_readiness() {
     ] {
         assert!(matches!(executor.parent_death_original_syscall_preflight(site, &request, Some(request), false),
             Err(crate::Error::ParentDeathSignal { errno: libc::ENOSYS, .. })));
+    }
+    // flock can never wait on this backend (every valid lock operation is a
+    // typed refusal), so enrollment admits every form; the Flock refusal and
+    // kernel validation then answer it.
+    for operation in [libc::LOCK_SH, libc::LOCK_EX, 0, 32, 32 | libc::LOCK_EX] {
+        for fd in [1_u64, 999] {
+            let request = SyscallRequest::new(libc::SYS_flock as u64, [fd, operation as u64, 0, 0, 0, 0]);
+            assert_eq!(executor.parent_death_original_syscall_preflight(site, &request, Some(request), false).unwrap(),
+                reverie::ParentDeathSyscallAdmission::Admitted, "fd {fd} operation {operation:#x}");
+        }
     }
     let pause = SyscallRequest::new(libc::SYS_pause as u64, [0; 6]);
     assert!(executor.parent_death_original_syscall_preflight(site, &pause, Some(pause), false).is_err());

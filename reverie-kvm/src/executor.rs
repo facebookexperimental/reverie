@@ -130,6 +130,38 @@ fn nonleader_exec_refusal(result: i64, tid: i32, pid: i32) -> Option<reverie::Un
     })
 }
 
+/// Diagnostic carried by this backend's typed refusal of `flock`.
+pub(crate) const FLOCK_REFUSAL: &str =
+    "KVM flock is unsupported: no host lock can follow the guest description's lifetime";
+
+/// Whether `operation` is a valid `flock(2)` lock operation, which the kernel
+/// would apply to the descriptor's open file description: exactly `LOCK_SH`,
+/// `LOCK_EX` or `LOCK_UN`, optionally with `LOCK_NB`. Anything else is a
+/// malformed operation (EINVAL) or the ignored legacy `LOCK_MAND` bit (0),
+/// which the kernel answers before it looks at a descriptor.
+fn flock_takes_effect(operation: u32) -> bool {
+    matches!(
+        (operation & !(libc::LOCK_NB as u32)) as libc::c_int,
+        libc::LOCK_SH | libc::LOCK_EX | libc::LOCK_UN
+    )
+}
+
+/// The typed refusal, if any, that a `flock` result carries. Linux's flock
+/// never fails with ENOSYS, so every ENOSYS answer to a valid lock operation is
+/// this backend's own refusal; every other result carries none.
+fn flock_refusal(request: &SyscallRequest, result: i64) -> Option<reverie::UnsupportedRefusal> {
+    (request.number() == libc::SYS_flock as u64
+        && flock_takes_effect(request.args()[1] as u32)
+        && result == negative_errno(libc::ENOSYS))
+    .then(|| {
+        reverie::UnsupportedRefusal::new(
+            reverie::UnsupportedOperation::Flock,
+            reverie::Errno::ENOSYS,
+            FLOCK_REFUSAL,
+        )
+    })
+}
+
 const GUEST_NOFILE_LIMIT: libc::c_int = 1 << 20;
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-235): Review the single virtual network namespace identity.
@@ -6094,11 +6126,9 @@ impl ElfExecutor {
             libc::SYS_fcntl if matches!(args[1] as i32, libc::F_SETLKW | libc::F_OFD_SETLKW) => {
                 return Err(refusal("unsupported enrolled blocking record lock"));
             }
-            libc::SYS_flock
-                if args[1] as i32 & libc::LOCK_NB == 0 && args[1] as i32 & libc::LOCK_UN == 0 =>
-            {
-                return Err(refusal("unsupported enrolled blocking flock"));
-            }
+            // No flock reaches a host lock on this backend: every valid lock
+            // operation is refused with the typed Flock refusal and nothing
+            // else touches a description, so none can wait (see `flock`).
             libc::SYS_open | libc::SYS_openat | libc::SYS_creat => {
                 return Err(refusal(
                     "unsupported enrolled open without a nonblocking per-call capability",
@@ -8032,6 +8062,10 @@ impl ElfExecutor {
         memory: &GuestMemory,
         terminal_read: Option<&mut crate::terminal_read::ReadContext>,
     ) -> crate::Result<i64> {
+        // A refusal describes the syscall that produced it. A caller that
+        // executes without reading it (the unsubscribed direct path) must not
+        // leave it for the next caller's injection to report.
+        self.unsupported_refusal = None;
         let result = self
             .execute_checked_dispatch(request, memory, terminal_read)
             .map_err(|error| memory.capture_shared_file_error(error));
@@ -8201,6 +8235,9 @@ impl ElfExecutor {
                 let consumed_child = self.state.consumed_child_wait.take();
                 if let Some(child) = consumed_child {
                     self.state.children.acknowledge(child)?;
+                }
+                if let Some(refusal) = flock_refusal(request, result) {
+                    self.unsupported_refusal = Some(refusal);
                 }
                 Ok(result)
             }
@@ -16262,22 +16299,44 @@ fn is_credential_identity_noop_syscall(number: u64) -> bool {
 }
 
 // TODO-HUMAN-REVIEW(PR-92): Review this KVM compatibility implementation.
+/// `flock(2)`: refused for every valid lock operation, before any host effect,
+/// with ENOSYS and the typed refusal `UnsupportedOperation::Flock`.
+///
+/// This replaces a silent no-op that returned 0 without taking a lock, so two
+/// guest processes could both "hold" LOCK_EX (https://github.com/rrnewton/reverie/issues/1069).
+/// Forwarding to the host kernel is faithful only where the host open file
+/// description has the guest description's exact identity and lifetime, and
+/// in this backend it often does not:
+///
+/// - each thread of a guest process keeps private host copies of the shared
+///   descriptor table, refreshed only at that thread's later table install,
+///   so a guest's last close does not release the host lock until the
+///   siblings catch up, at host-timed points when a sibling's syscall runs in
+///   the background;
+/// - a file mapping copies bytes and keeps no reference to the description,
+///   so a lock Linux keeps through the mapping would be released early;
+/// - descriptors passed through SCM_RIGHTS are held in flight by the host
+///   kernel, invisible to the guest descriptor tables;
+/// - captured stdio and synthetic carriers (random devices, procfs snapshots)
+///   are not the guest's descriptions at all;
+/// - on network and FUSE filesystems even LOCK_NB can wait on a server.
+///
+/// Forwarding may return later only behind a trait-level single-task semantic
+/// and a regression test that a sibling thread's copy cannot delay release.
+///
+/// Validation that never touches a description still comes from the kernel:
+/// a malformed operation (EINVAL), the ignored LOCK_MAND bit (0), and EBADF for
+/// a descriptor the guest does not have. Those are answered by the host
+/// `flock(-1, operation)`, which fails its descriptor lookup before any lock
+/// code runs, so it has no lock effect on any description.
 fn flock(state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
-    let Some(host_fd) = host_fd(state, args[0] as libc::c_int) else {
-        return negative_errno(libc::EBADF);
-    };
-    let operation = args[1] as libc::c_int;
-    let base = operation & !libc::LOCK_NB;
-    if !matches!(base, libc::LOCK_SH | libc::LOCK_EX | libc::LOCK_UN)
-        || operation & !(libc::LOCK_SH | libc::LOCK_EX | libc::LOCK_UN | libc::LOCK_NB) != 0
-    {
-        return negative_errno(libc::EINVAL);
+    // The kernel's flock takes `unsigned int fd, unsigned int cmd`.
+    let operation = args[1] as u32;
+    if host_fd(state, args[0] as libc::c_int).is_some() && flock_takes_effect(operation) {
+        return negative_errno(libc::ENOSYS);
     }
-    // Detcore owns guest scheduling; host advisory locks would expose external
-    // lock ownership and can block on host wall time. A validated guest fd
-    // receives the deterministic single-process lock result.
-    let _ = host_fd;
-    0
+    // SAFETY: flock takes no pointers, and fd -1 names no description.
+    zero_or_errno(unsafe { libc::flock(-1, operation as libc::c_int) })
 }
 
 // TODO-HUMAN-REVIEW(PR-92): Review this KVM compatibility implementation.
@@ -34270,7 +34329,7 @@ mod tests {
     }
 
     #[test]
-    fn flock_and_chown_are_deterministic_for_owned_files() {
+    fn flock_is_refused_and_chown_is_deterministic_for_owned_files() {
         let root = TestDir::new();
         std::fs::write(root.0.join("f"), b"x").unwrap();
         let mut state = test_state(&root.0);
@@ -34285,7 +34344,8 @@ mod tests {
         );
         assert!(fd >= 0, "open failed: {fd}");
 
-        // flock acquire (non-blocking) and release succeed on an owned descriptor.
+        // flock is refused on an owned descriptor (see
+        // every_flock_lock_operation_is_a_typed_refusal_without_lock_effects).
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -34300,7 +34360,7 @@ mod tests {
                     0
                 ]
             ),
-            0
+            negative_errno(libc::ENOSYS)
         );
         assert_eq!(
             syscall_result(
@@ -34309,7 +34369,7 @@ mod tests {
                 libc::SYS_flock,
                 [fd as u64, libc::LOCK_UN as u64, 0, 0, 0, 0]
             ),
-            0
+            negative_errno(libc::ENOSYS)
         );
         // flock on an unknown descriptor is EBADF.
         assert_eq!(
@@ -34361,6 +34421,228 @@ mod tests {
             ),
             negative_errno(libc::EBADF)
         );
+    }
+
+    fn flock_result(
+        memory: &mut GuestMemory,
+        state: &mut LoadedStaticElf,
+        fd: i64,
+        operation: libc::c_int,
+    ) -> i64 {
+        syscall_result(
+            memory,
+            state,
+            libc::SYS_flock,
+            [fd as u64, operation as u64, 0, 0, 0, 0],
+        )
+    }
+
+    const FLOCK_LOCK_OPERATIONS: [libc::c_int; 6] = [
+        libc::LOCK_SH,
+        libc::LOCK_EX,
+        libc::LOCK_UN,
+        libc::LOCK_SH | libc::LOCK_NB,
+        libc::LOCK_EX | libc::LOCK_NB,
+        libc::LOCK_UN | libc::LOCK_NB,
+    ];
+
+    /// Every valid lock operation is refused with ENOSYS and the typed
+    /// refusal, and none reaches the host lock: an independent host open of
+    /// the same file can still take LOCK_EX afterwards, and a host lock taken
+    /// first is neither released nor reported as contended.
+    #[test]
+    fn every_flock_lock_operation_is_a_typed_refusal_without_lock_effects() {
+        let root = TestDir::new();
+        std::fs::write(root.0.join("lockfile"), b"x").unwrap();
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let mut executor = ElfExecutor::new(test_state(&root.0), false);
+        write_c_string(&mut memory, 0x100, "lockfile");
+        let open = SyscallRequest::new(
+            libc::SYS_openat as u64,
+            [libc::AT_FDCWD as u64, 0x100, libc::O_RDWR as u64, 0, 0, 0],
+        );
+        let fd = executor.execute(&open, &memory);
+        assert!(fd >= 0, "open failed: {fd}");
+        let flock = |executor: &mut ElfExecutor, operation: libc::c_int| {
+            executor.execute(
+                &SyscallRequest::new(
+                    libc::SYS_flock as u64,
+                    [fd as u64, operation as u64, 0, 0, 0, 0],
+                ),
+                &memory,
+            )
+        };
+        let probe = std::fs::File::open(root.0.join("lockfile")).unwrap();
+        let host_lock = |operation: libc::c_int| {
+            // SAFETY: flock on a descriptor this test owns.
+            zero_or_errno(unsafe { libc::flock(probe.as_raw_fd(), operation) })
+        };
+        let refusal = Some(reverie::UnsupportedRefusal::new(
+            reverie::UnsupportedOperation::Flock,
+            reverie::Errno::ENOSYS,
+            FLOCK_REFUSAL,
+        ));
+        for operation in FLOCK_LOCK_OPERATIONS {
+            assert_eq!(
+                flock(&mut executor, operation),
+                negative_errno(libc::ENOSYS),
+                "operation {operation:#x}"
+            );
+            assert_eq!(executor.take_unsupported_refusal(), refusal);
+            assert_eq!(
+                host_lock(libc::LOCK_EX | libc::LOCK_NB),
+                0,
+                "operation {operation:#x} took a host lock"
+            );
+            assert_eq!(host_lock(libc::LOCK_UN), 0);
+        }
+        // A lock someone else holds is untouched by a refused LOCK_UN, and a
+        // refused LOCK_EX|LOCK_NB reports the refusal, not the contention.
+        assert_eq!(host_lock(libc::LOCK_EX | libc::LOCK_NB), 0);
+        assert_eq!(
+            flock(&mut executor, libc::LOCK_UN),
+            negative_errno(libc::ENOSYS)
+        );
+        assert_eq!(
+            flock(&mut executor, libc::LOCK_EX | libc::LOCK_NB),
+            negative_errno(libc::ENOSYS)
+        );
+        let other = std::fs::File::open(root.0.join("lockfile")).unwrap();
+        // SAFETY: flock on a descriptor this test owns.
+        let still_held =
+            zero_or_errno(unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) });
+        assert_eq!(still_held, negative_errno(libc::EWOULDBLOCK));
+        assert_eq!(executor.take_unsupported_refusal(), refusal);
+    }
+
+    /// The unsubscribed direct path executes a syscall without reading its
+    /// refusal. That refusal must not survive into the next execute, where an
+    /// injection would read it and misreport an unrelated failure as a flock
+    /// refusal.
+    #[test]
+    fn an_unread_flock_refusal_does_not_survive_into_the_next_execute() {
+        let root = TestDir::new();
+        std::fs::write(root.0.join("lockfile"), b"x").unwrap();
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let mut executor = ElfExecutor::new(test_state(&root.0), false);
+        write_c_string(&mut memory, 0x100, "lockfile");
+        let fd = executor.execute(
+            &SyscallRequest::new(
+                libc::SYS_openat as u64,
+                [libc::AT_FDCWD as u64, 0x100, libc::O_RDONLY as u64, 0, 0, 0],
+            ),
+            &memory,
+        );
+        assert!(fd >= 0, "open failed: {fd}");
+        assert_eq!(
+            executor.execute(
+                &SyscallRequest::new(
+                    libc::SYS_flock as u64,
+                    [
+                        fd as u64,
+                        (libc::LOCK_EX | libc::LOCK_NB) as u64,
+                        0,
+                        0,
+                        0,
+                        0
+                    ],
+                ),
+                &memory,
+            ),
+            negative_errno(libc::ENOSYS)
+        );
+        // Not read: the next execute, a failing one, must not inherit it.
+        assert_eq!(
+            executor.execute(
+                &SyscallRequest::new(libc::SYS_close as u64, [999, 0, 0, 0, 0, 0]),
+                &memory,
+            ),
+            negative_errno(libc::EBADF)
+        );
+        assert_eq!(executor.take_unsupported_refusal(), None);
+    }
+
+    /// Validation that never touches a description is the kernel's, compared
+    /// here against native calls rather than a hard-coded order: malformed
+    /// operations, the ignored LOCK_MAND bit, and a descriptor the guest does
+    /// not have. None of these is a refusal.
+    #[test]
+    fn flock_operand_validation_matches_the_host_kernel() {
+        let root = TestDir::new();
+        std::fs::write(root.0.join("lockfile"), b"x").unwrap();
+        let native = std::fs::File::open(root.0.join("lockfile")).unwrap();
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let mut executor = ElfExecutor::new(test_state(&root.0), false);
+        write_c_string(&mut memory, 0x100, "lockfile");
+        let fd = executor.execute(
+            &SyscallRequest::new(
+                libc::SYS_openat as u64,
+                [libc::AT_FDCWD as u64, 0x100, libc::O_RDONLY as u64, 0, 0, 0],
+            ),
+            &memory,
+        );
+        assert!(fd >= 0, "open failed: {fd}");
+        const LOCK_MAND: libc::c_int = 32;
+        for operation in [
+            0,
+            libc::LOCK_SH | libc::LOCK_EX,
+            libc::LOCK_NB,
+            libc::LOCK_EX | libc::LOCK_NB | 0x100,
+            LOCK_MAND,
+            LOCK_MAND | libc::LOCK_EX,
+        ] {
+            // SAFETY: flock on a descriptor this test owns; these operations
+            // are answered before the kernel applies any lock.
+            let expected = zero_or_errno(unsafe { libc::flock(native.as_raw_fd(), operation) });
+            // SAFETY: fd -1 names no description.
+            let expected_bad = zero_or_errno(unsafe { libc::flock(-1, operation) });
+            for (guest_fd, want) in [(fd, expected), (999, expected_bad)] {
+                assert_eq!(
+                    executor.execute(
+                        &SyscallRequest::new(
+                            libc::SYS_flock as u64,
+                            [guest_fd as u64, operation as u64, 0, 0, 0, 0],
+                        ),
+                        &memory,
+                    ),
+                    want,
+                    "operation {operation:#x} on guest fd {guest_fd}"
+                );
+                assert_eq!(executor.take_unsupported_refusal(), None);
+            }
+        }
+        for operation in FLOCK_LOCK_OPERATIONS {
+            // SAFETY: fd -1 names no description.
+            let expected_bad = zero_or_errno(unsafe { libc::flock(-1, operation) });
+            assert_eq!(
+                executor.execute(
+                    &SyscallRequest::new(
+                        libc::SYS_flock as u64,
+                        [999, operation as u64, 0, 0, 0, 0],
+                    ),
+                    &memory,
+                ),
+                expected_bad,
+                "valid operation {operation:#x} on a descriptor the guest does not have"
+            );
+            assert_eq!(executor.take_unsupported_refusal(), None);
+        }
+    }
+
+    /// Captured standard output is a supervisor description: the refusal must
+    /// not reach it.
+    #[test]
+    fn flock_on_standard_output_is_refused_without_reaching_the_supervisor() {
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        for operation in FLOCK_LOCK_OPERATIONS {
+            assert_eq!(
+                flock_result(&mut memory, &mut state, 1, operation),
+                negative_errno(libc::ENOSYS),
+                "operation {operation:#x}"
+            );
+        }
     }
 
     #[test]

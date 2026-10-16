@@ -837,3 +837,60 @@ fn random_carrier_fixed_range_errors_precede_alignment() {
         ),
     ]);
 }
+
+/// Random-device carriers, including O_PATH ones and their dup aliases, take
+/// the common flock policy: every valid lock operation is refused (ENOSYS),
+/// and malformed operations and LOCK_MAND get the kernel's own answers.
+#[test]
+fn random_carrier_flock_takes_the_common_refusal_and_validation() {
+    const LOCK_MAND: libc::c_int = 32;
+    let root = TestDir::new();
+    let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+    for mode in [libc::O_RDONLY, libc::O_WRONLY, libc::O_PATH] {
+        let mut state = test_state(&root.0);
+        let fd = open_with_flags(&mut memory, &mut state, "/dev/urandom", mode);
+        assert!(fd >= 0, "mode {mode:#x}: {fd}");
+        let alias = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_dup,
+            [fd as u64, 0, 0, 0, 0, 0],
+        );
+        assert!(alias >= 0);
+        for guest_fd in [fd, alias] {
+            for operation in [
+                libc::LOCK_SH,
+                libc::LOCK_EX,
+                libc::LOCK_UN,
+                libc::LOCK_SH | libc::LOCK_NB,
+                libc::LOCK_EX | libc::LOCK_NB,
+                libc::LOCK_UN | libc::LOCK_NB,
+            ] {
+                assert_eq!(
+                    syscall_result(
+                        &mut memory,
+                        &mut state,
+                        libc::SYS_flock,
+                        [guest_fd as u64, operation as u64, 0, 0, 0, 0],
+                    ),
+                    negative_errno(libc::ENOSYS),
+                    "mode {mode:#x} fd {guest_fd} operation {operation:#x}"
+                );
+            }
+            for operation in [0, libc::LOCK_SH | libc::LOCK_EX, LOCK_MAND, LOCK_MAND | libc::LOCK_EX] {
+                // SAFETY: fd -1 names no description.
+                let expected = zero_or_errno(unsafe { libc::flock(-1, operation) });
+                assert_eq!(
+                    syscall_result(
+                        &mut memory,
+                        &mut state,
+                        libc::SYS_flock,
+                        [guest_fd as u64, operation as u64, 0, 0, 0, 0],
+                    ),
+                    expected,
+                    "mode {mode:#x} fd {guest_fd} operation {operation:#x}"
+                );
+            }
+        }
+    }
+}

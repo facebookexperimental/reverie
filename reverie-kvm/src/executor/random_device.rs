@@ -121,7 +121,6 @@ fn random_device_early(
         libc::SYS_lseek
         | libc::SYS_fchmod
         | libc::SYS_fchown
-        | libc::SYS_flock
         | libc::SYS_ioctl
         | libc::SYS_flistxattr
             if path =>
