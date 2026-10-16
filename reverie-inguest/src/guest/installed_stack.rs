@@ -413,8 +413,13 @@ mod ordinary_gate_byte_controls {
             arg4: u64,
             arg5: u64,
         ) -> i64;
+        // A static, as `tests` declares this symbol: two declarations of one
+        // symbol with different types made LLVM rename the second to
+        // `reverie_inguest_installed_callback_entry_end.1`, which nothing
+        // defines, so the lib tests failed to link without
+        // fixed-syscall-gates, the feature that compiles this module out.
         #[link_name = "reverie_inguest_installed_callback_entry_end"]
-        fn installed_entry_end();
+        static installed_entry_end: u8;
     }
 
     #[test]
@@ -432,7 +437,7 @@ mod ordinary_gate_byte_controls {
         let actual = unsafe { core::slice::from_raw_parts(owner as *const u8, expected.len()) };
         assert_eq!(actual, expected);
         assert_eq!(native_gate as *const () as usize - owner, 0x20);
-        let end = installed_entry_end as *const () as usize;
+        let end = (&raw const installed_entry_end) as usize;
         let jump = unsafe { core::slice::from_raw_parts((end - 11) as *const u8, 5) };
         assert_eq!(jump[0], 0xe9);
         let displacement = i32::from_le_bytes(jump[1..].try_into().unwrap());

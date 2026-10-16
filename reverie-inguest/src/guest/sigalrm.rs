@@ -663,6 +663,8 @@ static PREPARED_FLAGS: AtomicU64 = AtomicU64::new(0);
 static PREPARED_ACTION_MASK: AtomicU64 = AtomicU64::new(0);
 static PREPARED_SAVED_MASK: AtomicU64 = AtomicU64::new(0);
 static PREPARED_ACTIVATION_BASE: AtomicU64 = AtomicU64::new(0);
+/// Only [`prepare_delivery`] draws a nonce.
+#[cfg(feature = "coordinator-rpc")]
 static NEXT_NONCE: AtomicU64 = AtomicU64::new(1);
 /// The mask the next completion marker installs in its fresh frame (the
 /// delivery window), while `WINDOW_OPEN`.
@@ -699,6 +701,10 @@ pub fn activation_mask(base: u64, action_mask: u64) -> u64 {
 /// Only from a guest call's own turn, in a fallback dispatch whose completion
 /// marker will follow. The event must be an already-selected SIGALRM for this
 /// receiver; target selection remains the caller's responsibility.
+// Behind coordinator-rpc, the feature that brings in the `reverie` crate whose
+// `SignalEvent` it takes; its only caller, the coordinator host, is behind it
+// too.
+#[cfg(feature = "coordinator-rpc")]
 pub unsafe fn prepare_delivery(event: reverie::SignalEvent, reserved: u64) -> Result<(), i32> {
     if !handled() || PREPARED.load(Ordering::Acquire) || WINDOW_OPEN.load(Ordering::Acquire) {
         return Err(libc::EINVAL);
@@ -842,6 +848,7 @@ static ENTRY_DELIVERY: AtomicBool = AtomicBool::new(false);
 /// # Safety
 ///
 /// As [`prepare_delivery`]; the caller must not run the syscall.
+#[cfg(feature = "coordinator-rpc")]
 pub unsafe fn prepare_delivery_before_syscall(
     event: reverie::SignalEvent,
     reserved: u64,
