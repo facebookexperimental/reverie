@@ -34,40 +34,18 @@ struct Args {
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let log_guard = args.common.init_tracing();
-    if args.backend == backend::BackendKind::E9patch {
-        // SAFETY: no other thread runs yet; the runtime starts below.
-        unsafe { backend::use_bundled_e9patch() };
-    }
-    let preload_path = args.preload.clone().or_else(|| {
-        std::env::current_exe()
-            .ok()
-            .and_then(|executable| backend::default_preload_path(&executable))
-    });
-    let preload = preload_path.as_deref().map(|path| backend::Preload {
-        tool: "counter2",
-        path,
-    });
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-    let run = runtime
-        .block_on(backend::run::<CounterLocal>(
-            args.backend,
-            &args.common,
-            (),
-            preload,
-        ))
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
-    if let Some((stdout, stderr)) = &run.captured {
-        use std::io::Write as _;
-        std::io::stdout().write_all(stdout)?;
-        std::io::stderr().write_all(stderr)?;
-    }
+    let run = backend::run_blocking::<CounterLocal>(
+        args.backend,
+        &args.common,
+        (),
+        "counter2",
+        args.preload.clone(),
+    )?;
     let (total, processes, threads) = run.global_state.totals();
     eprintln!(
         " [counter tool] Total system calls in process tree: {}, from {} processes, {} thread(s).",
         total, processes, threads
     );
     drop(log_guard);
-    std::process::exit(run.exit_code)
+    run.status.raise_or_exit()
 }

@@ -31,15 +31,15 @@ crate-type = ["cdylib", "rlib"]
 
 [[bin]]
 name = "chaos"
-path = "chaos.rs"
+path = "chaos_launcher.rs"
 
 [[bin]]
 name = "chrome_trace"
-path = "chrome-trace/main.rs"
+path = "chrome-trace/launcher.rs"
 
 [[bin]]
 name = "chunky_print"
-path = "chunky_print.rs"
+path = "chunky_print_launcher.rs"
 
 [[bin]]
 name = "counter1"
@@ -51,7 +51,7 @@ path = "counter2.rs"
 
 [[bin]]
 name = "debug"
-path = "debug.rs"
+path = "debug_launcher.rs"
 
 [[bin]]
 name = "noop"
@@ -83,7 +83,7 @@ path = "strace/main.rs"
 
 [[bin]]
 name = "strace_minimal"
-path = "strace_minimal.rs"
+path = "strace_minimal_launcher.rs"
 
 [dependencies]
 anyhow = "1.0.103"

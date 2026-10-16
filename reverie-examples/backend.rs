@@ -18,6 +18,11 @@
 //! caller passes, so a tool runs there only once its name is in that
 //! selector.
 
+// `#[path]`-included by each example tool's binary; each uses a different
+// subset (a launcher calls `run_blocking`, the recorder `run`), so an item
+// unused in one binary's build is used in another's.
+#![allow(dead_code)]
+
 use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::ffi::OsStr;
@@ -53,6 +58,8 @@ pub enum BackendKind {
 
 /// How a tool's run ended.
 pub struct Run<G> {
+    /// How the program ended, as `raise_or_exit` passes it on.
+    pub status: ExitStatus,
     /// The program's exit code, or 128 plus the signal that ended it.
     pub exit_code: i32,
     /// The tool's global state at the end.
@@ -177,6 +184,48 @@ where
     }
 }
 
+/// What a tool's launcher does with [`run`]: point e9patch at its bundled
+/// tools (before any thread starts), find the example preload (`preload`, or
+/// `libreverie_examples.so` beside this binary), run the program under `T` on
+/// `backend` in a new runtime, and pass on the output the backend captured.
+/// `tool` is the name the example preload knows `T` by.
+pub fn run_blocking<T>(
+    backend: BackendKind,
+    args: &CommonToolArguments,
+    config: <T::GlobalState as GlobalTool>::Config,
+    tool: &str,
+    preload: Option<PathBuf>,
+) -> anyhow::Result<Run<T::GlobalState>>
+where
+    T: Tool + 'static,
+    T::ThreadState: 'static,
+    T::GlobalState: 'static,
+    <T::GlobalState as GlobalTool>::Config: 'static,
+{
+    if backend == BackendKind::E9patch {
+        // SAFETY: no other thread runs yet; the runtime starts below.
+        unsafe { use_bundled_e9patch() };
+    }
+    let preload = preload.or_else(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|executable| default_preload_path(&executable))
+    });
+    let preload = preload.as_deref().map(|path| Preload { tool, path });
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let run = runtime
+        .block_on(run::<T>(backend, args, config, preload))
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    if let Some((stdout, stderr)) = &run.captured {
+        use std::io::Write as _;
+        std::io::stdout().write_all(stdout)?;
+        std::io::stderr().write_all(stderr)?;
+    }
+    Ok(run)
+}
+
 async fn run_in_guest<T>(
     backend: BackendKind,
     args: &CommonToolArguments,
@@ -187,7 +236,7 @@ where
     T: Tool + 'static,
 {
     let tool = preload.tool.as_bytes().to_vec();
-    let (exit_code, stdout, stderr, global_state) = match backend {
+    let (status, stdout, stderr, global_state) = match backend {
         BackendKind::Liteinst | BackendKind::InGuestTrap => {
             let mut command: reverie::process::Command = args.clone().into();
             // in-guest-trap is LiteInst with no site patched: every syscall
@@ -210,11 +259,8 @@ where
                 )
                 .await?;
             use std::os::unix::process::ExitStatusExt as _;
-            let status = output.status;
-            let exit_code = status
-                .code()
-                .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
-            (exit_code, output.stdout, output.stderr, global_state)
+            let status = ExitStatus::from_raw(output.status.into_raw());
+            (status, output.stdout, output.stderr, global_state)
         }
         BackendKind::E9patch => {
             let command: reverie::process::Command = args.clone().into();
@@ -226,17 +272,13 @@ where
                     tool,
                 )
                 .await?;
-            (
-                exit_code(output.status),
-                output.stdout,
-                output.stderr,
-                global_state,
-            )
+            (output.status, output.stdout, output.stderr, global_state)
         }
         _ => unreachable!("{backend:?} is not an in-guest backend"),
     };
     Ok(Run {
-        exit_code,
+        status,
+        exit_code: exit_code(status),
         global_state,
         captured: Some((stdout, stderr)),
     })
@@ -255,6 +297,7 @@ where
         .await?;
     let (status, global_state) = tracer.wait().await?;
     Ok(Run {
+        status,
         exit_code: exit_code(status),
         global_state,
         captured: None,
@@ -305,6 +348,7 @@ where
         .await
         .map_err(|error| anyhow::anyhow!("KVM run: {error}"))?;
     Ok(Run {
+        status: ExitStatus::Exited(exit_code),
         exit_code,
         global_state,
         captured: None,
