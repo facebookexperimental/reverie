@@ -1298,6 +1298,7 @@ mod initial_stats_tests {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicU64;
     use std::time::Duration;
