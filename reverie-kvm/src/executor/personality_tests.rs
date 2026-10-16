@@ -25,6 +25,42 @@ fn test_personality_uname(
     bytes
 }
 
+/// The host's release, and the release the host kernel reports with the
+/// UNAME26 personality, read in a forked child so that this process's own
+/// personality is untouched.
+fn host_releases() -> ([u8; 65], [u8; 65]) {
+    // SAFETY: zero is a valid utsname, and the pointer names a live one.
+    let mut host = unsafe { std::mem::zeroed::<libc::utsname>() };
+    assert_eq!(unsafe { libc::uname(&mut host) }, 0);
+    let mut fds = [0; 2];
+    // SAFETY: fds names two live ints.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    // SAFETY: the child makes only async-signal-safe calls before _exit.
+    let child = unsafe { libc::fork() };
+    assert!(child >= 0);
+    if child == 0 {
+        unsafe {
+            let current = libc::personality(0xffff_ffff) as libc::c_ulong;
+            libc::personality(current | 0x0002_0000);
+            let mut compatible = std::mem::zeroed::<libc::utsname>();
+            libc::uname(&mut compatible);
+            libc::write(fds[1], compatible.release.as_ptr().cast(), 65);
+            libc::_exit(0);
+        }
+    }
+    let mut compatible = [0u8; 65];
+    // SAFETY: the buffer is 65 writable bytes.
+    assert_eq!(unsafe { libc::read(fds[0], compatible.as_mut_ptr().cast(), 65) }, 65);
+    let mut status = 0;
+    // SAFETY: child is this process's child.
+    assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+    unsafe {
+        libc::close(fds[0]);
+        libc::close(fds[1]);
+    }
+    (host.release.map(|c| c as u8), compatible)
+}
+
 #[test]
 fn personality_fixed_profile_round_trip_uses_low_word_and_refuses_unmodeled_flags() {
     const HIGH_WORD: u64 = 0xcafe_babe_0000_0000;
@@ -86,17 +122,15 @@ fn personality_fixed_profile_uname26_changes_release_and_restores_it() {
         test_personality_call(&mut memory, &mut state, TEST_PERSONALITY_QUERY),
         TEST_FIXED_PERSONALITY as i64,
     );
+    let (host_release, host_compatible_release) = host_releases();
     let baseline = test_personality_uname(&mut memory, &mut state);
-    let mut expected_release = [0; 65];
-    expected_release[..5].copy_from_slice(b"6.0.0");
-    assert_eq!(baseline[2 * 65..3 * 65], expected_release);
+    assert_eq!(baseline[2 * 65..3 * 65], host_release);
     assert_eq!(
         test_personality_call(&mut memory, &mut state, TEST_UNAME26_PERSONALITY),
         TEST_FIXED_PERSONALITY as i64,
     );
     let mut compatible = baseline;
-    compatible[2 * 65..3 * 65].fill(0);
-    compatible[2 * 65..2 * 65 + 6].copy_from_slice(b"2.6.60");
+    compatible[2 * 65..3 * 65].copy_from_slice(&host_compatible_release);
     assert_eq!(test_personality_uname(&mut memory, &mut state), compatible);
     for address in [u64::MAX, PAGE_SIZE - (65 * 6 - 1)] {
         assert_eq!(

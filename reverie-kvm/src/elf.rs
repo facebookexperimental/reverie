@@ -996,10 +996,6 @@ pub(crate) struct LoadedStaticElf {
     /// the caller asks for another numbering (Hermit asks for its ptrace
     /// reference's). Shared by the whole run: forks and exec keep it.
     pub ids_per_task: i32,
-    /// Position in this task's deterministic getrandom byte stream. A new
-    /// fork/thread starts at zero under its own virtual TID; exec preserves
-    /// the caller's position. Only successful copyout advances the stream.
-    pub getrandom_offset: u64,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(https://github.com/rrnewton/reverie/issues/924):
     // Review host metadata timestamps for Tool runs.
@@ -1241,7 +1237,6 @@ impl LoadedStaticElf {
             linux_personality: self.linux_personality,
             random_seed: self.random_seed,
             ids_per_task: self.ids_per_task,
-            getrandom_offset: 0,
             host_metadata_timestamps: self.host_metadata_timestamps,
             thread_name: self.thread_name,
             thread_group_leader_name: std::sync::Arc::new(std::sync::Mutex::new(self.thread_name)),
@@ -1494,7 +1489,6 @@ impl LoadedStaticElf {
         self.linux_personality = previous.linux_personality;
         self.random_seed = previous.random_seed;
         self.ids_per_task = previous.ids_per_task;
-        self.getrandom_offset = previous.getrandom_offset;
         self.host_metadata_timestamps = previous.host_metadata_timestamps;
         // `thread_name` intentionally remains the replacement image's name.
         self.thp_disabled = thp_disabled;
@@ -2040,7 +2034,6 @@ fn load_executable(
         linux_personality: LINUX_FIXED_PERSONALITY,
         random_seed: 0,
         ids_per_task: reverie::task_ids::LINUX_IDS_PER_TASK,
-        getrandom_offset: 0,
         host_metadata_timestamps: false,
         thread_name,
         thread_group_leader_name: std::sync::Arc::new(std::sync::Mutex::new(thread_name)),

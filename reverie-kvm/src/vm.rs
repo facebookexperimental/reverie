@@ -2198,8 +2198,7 @@ impl KvmBackend {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-228): Review the KVM random-seed configuration API.
-    /// Configure the deterministic seed used by getrandom and virtual random devices.
-    /// Configuring an installed image starts its getrandom stream at byte zero.
+    /// Configure the deterministic seed used by the virtual random devices.
     pub fn set_random_seed(&mut self, seed: u64) -> Result<()> {
         AbandonedRuns::admit(&self.abandoned_runs)?;
         let loaded = self
@@ -2207,7 +2206,6 @@ impl KvmBackend {
             .as_mut()
             .ok_or(Error::StaticElfNotInstalled)?;
         loaded.random_seed = seed;
-        loaded.getrandom_offset = 0;
         Ok(())
     }
 

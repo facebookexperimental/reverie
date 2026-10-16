@@ -1357,7 +1357,7 @@ fn execute_basic_syscall_inner(
             _ => negative_errno(libc::EINVAL),
         }
     } else if number == libc::SYS_getrandom as u64 {
-        getrandom(&mut ProviderMemory(memory), state, args[0], args[1])
+        getrandom(&mut ProviderMemory(memory), args[0], args[1], args[2])
     } else if number == libc::SYS_clock_gettime as u64 {
         clock_gettime(&mut ProviderMemory(memory), args)
     } else if number == libc::SYS_nanosleep as u64 {
@@ -21239,84 +21239,54 @@ fn sched_getattr<M: GuestMemoryAccess<Error = crate::Error>>(
 }
 
 // TODO-HUMAN-REVIEW(PR-180): Review virtual-TID random stream separation.
+/// `getrandom(2)` from the host, in bounded chunks: each chunk is the host's
+/// own call with the guest's flags (which the host validates), copied to the
+/// guest whole or not at all. A chunk whose copy faults ends the call with
+/// the earlier chunks' count, or EFAULT when there were none (Linux would
+/// also count the faulting chunk's writable prefix). Detcore answers
+/// getrandom itself and never injects it.
 fn getrandom<M: GuestMemoryAccess<Error = crate::Error>>(
     memory: &mut M,
-    state: &mut LoadedStaticElf,
     address: u64,
     length: u64,
+    flags: u64,
 ) -> i64 {
-    let Ok(length) = usize::try_from(length) else {
-        return negative_errno(libc::EINVAL);
-    };
-    if length > MAX_HOST_IO {
-        return negative_errno(libc::E2BIG);
-    }
-    let Some(next_offset) = state.getrandom_offset.checked_add(length as u64) else {
-        return negative_errno(libc::EOVERFLOW);
-    };
-    let bytes = deterministic_random_bytes(
-        state.tid,
-        state.random_seed,
-        state.getrandom_offset,
-        length,
-        17,
-        0x5a,
-    );
-    match memory.write_exact(address, &bytes) {
-        Ok(()) => {
-            state.getrandom_offset = next_offset;
-            length as i64
+    const CHUNK: usize = 1 << 20;
+    let flags = flags as libc::c_uint;
+    // Linux caps one call at INT_MAX bytes.
+    let total = usize::try_from(length)
+        .unwrap_or(usize::MAX)
+        .min(libc::c_int::MAX as usize);
+    let mut chunk = vec![0u8; total.clamp(1, CHUNK)];
+    let mut done = 0;
+    loop {
+        let request = (total - done).min(chunk.len());
+        // SAFETY: the pointer names `request` writable bytes of `chunk`.
+        let got = unsafe { libc::getrandom(chunk.as_mut_ptr().cast(), request, flags) };
+        if got < 0 {
+            return if done > 0 {
+                done as i64
+            } else {
+                io_error(std::io::Error::last_os_error())
+            };
         }
-        Err(_) => negative_errno(libc::EFAULT),
+        let got = got as usize;
+        if got > 0
+            && memory
+                .write_exact(address + done as u64, &chunk[..got])
+                .is_err()
+        {
+            return if done > 0 {
+                done as i64
+            } else {
+                negative_errno(libc::EFAULT)
+            };
+        }
+        done += got;
+        if done == total || got < request {
+            return done as i64;
+        }
     }
-}
-
-fn deterministic_random_bytes(
-    tid: i32,
-    seed: u64,
-    offset: u64,
-    length: usize,
-    byte_stride: u8,
-    first_byte: u8,
-) -> Vec<u8> {
-    const BLOCK_DOMAIN: u64 = 0xd1b5_4a32_d192_ed03;
-    const SEED_DOMAIN: u64 = 0xa076_1d64_78bd_642f;
-    // Preserve the first 256 bytes for seed zero. The odd multiplier gives
-    // every 32-bit virtual TID a distinct eight-byte salt at a fixed position.
-    let thread_stream = u64::from(tid as u32)
-        .wrapping_sub(1)
-        .wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    let seed_stream = deterministic_random_salt(seed, SEED_DOMAIN);
-    let mut block = offset / 256;
-    let mut stream = thread_stream ^ seed_stream ^ deterministic_random_salt(block, BLOCK_DOMAIN);
-    (0..length)
-        .map(|index| {
-            // The caller checks the complete range before generation. Use the
-            // absolute position so splitting a read never changes its bytes.
-            let index = offset + index as u64;
-            if index / 256 != block {
-                block = index / 256;
-                stream =
-                    thread_stream ^ seed_stream ^ deterministic_random_salt(block, BLOCK_DOMAIN);
-            }
-            let stream_byte = stream.rotate_right(((index % 8) * 8) as u32) as u8;
-            (index as u8)
-                .wrapping_mul(byte_stride)
-                .wrapping_add(first_byte)
-                ^ stream_byte
-        })
-        .collect()
-}
-
-fn deterministic_random_salt(value: u64, domain: u64) -> u64 {
-    // SplitMix64's bijective finalizer, with separate domains for the seed and
-    // byte block. Normalization maps zero to zero without losing bijectivity.
-    fn mix(mut value: u64) -> u64 {
-        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        value ^ (value >> 31)
-    }
-    mix(value.wrapping_add(domain)) ^ mix(domain)
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -21669,34 +21639,64 @@ fn personality(state: &mut LoadedStaticElf, raw: u64) -> i64 {
     i64::from(previous)
 }
 
+/// `uname(2)` from the host, with Linux's UNAME26 rule applied to the
+/// release when the guest set that personality (which this backend keeps
+/// itself): `override_release` reports `2.6.<60 + minor>` followed by the
+/// rest of the release. Detcore answers the kernel fields itself and passes
+/// the rest (`machine`, and `nodename` and `domainname` in a UTS namespace)
+/// through.
 fn uname<M: GuestMemoryAccess<Error = crate::Error>>(
     memory: &mut M,
     state: &LoadedStaticElf,
     address: u64,
 ) -> i64 {
-    // Linux's UNAME26 rule maps a 6.0.0 release to 2.6.(0 + 60).
-    // Keep this transformation tied to the existing lower virtual release.
-    let release: &[u8] = if state.linux_personality & PERSONALITY_UNAME26 != 0 {
-        b"2.6.60"
-    } else {
-        b"6.0.0"
-    };
-    let mut utsname = [0; 65 * 6];
-    for (index, value) in [
-        b"Linux".as_slice(),
-        b"reverie-kvm".as_slice(),
-        release,
-        b"#1".as_slice(),
-        b"x86_64".as_slice(),
-        b"(none)".as_slice(),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let start = index * 65;
-        utsname[start..start + value.len()].copy_from_slice(value);
+    // SAFETY: zero is a valid utsname, and the pointer names a live one.
+    let mut host = unsafe { std::mem::zeroed::<libc::utsname>() };
+    if unsafe { libc::uname(&mut host) } != 0 {
+        return io_error(std::io::Error::last_os_error());
     }
-    write_bytes(memory, address, &utsname)
+    if state.linux_personality & PERSONALITY_UNAME26 != 0 {
+        host.release = uname26_release(&host.release);
+    }
+    write_struct(memory, address, &host)
+}
+
+/// Linux's `override_release` for UNAME26: `2.6.<60 + patchlevel>` and then
+/// the release from its third dot or first character that is neither a
+/// digit nor a dot.
+fn uname26_release(release: &[libc::c_char; 65]) -> [libc::c_char; 65] {
+    let bytes: Vec<u8> = release
+        .iter()
+        .map(|&c| c as u8)
+        .take_while(|&b| b != 0)
+        .collect();
+    let mut dots = 0;
+    let mut rest = bytes.len();
+    for (index, &byte) in bytes.iter().enumerate() {
+        if byte == b'.' {
+            dots += 1;
+            if dots >= 3 {
+                rest = index;
+                break;
+            }
+        } else if !byte.is_ascii_digit() {
+            rest = index;
+            break;
+        }
+    }
+    let patchlevel: u32 = std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|text| text.split('.').nth(1))
+        .and_then(|minor| minor.parse().ok())
+        .unwrap_or(0);
+    let mut text = format!("2.6.{}", 60 + patchlevel).into_bytes();
+    text.extend_from_slice(&bytes[rest..]);
+    text.truncate(64);
+    let mut out = [0 as libc::c_char; 65];
+    for (slot, byte) in out.iter_mut().zip(text) {
+        *slot = byte as libc::c_char;
+    }
+    out
 }
 
 fn prlimit64<M: GuestMemoryAccess<Error = crate::Error>>(memory: &mut M, args: &[u64; 6]) -> i64 {
@@ -23294,7 +23294,6 @@ pub(crate) fn native_loaded_state(cwd: &std::path::Path) -> LoadedStaticElf {
         linux_personality: crate::elf::LINUX_FIXED_PERSONALITY,
         random_seed: 0,
         ids_per_task: reverie::task_ids::LINUX_IDS_PER_TASK,
-        getrandom_offset: 0,
         host_metadata_timestamps: false,
         thread_name: *b"test\0\0\0\0\0\0\0\0\0\0\0\0",
         thread_group_leader_name: Arc::new(Mutex::new(*b"test\0\0\0\0\0\0\0\0\0\0\0\0")),
@@ -63485,245 +63484,46 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_getrandom_repeats_per_thread_and_separates_threads() {
-        let memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
-        let mut first_state = test_state(Path::new("/"));
-        let mut second_state = test_state(Path::new("/"));
-        let mut worker_state = test_state(Path::new("/"));
-        worker_state.tid = 2;
+    fn getrandom_fills_from_the_host_and_the_host_validates_flags() {
+        const BUFFER: u64 = 0x100;
+        const SENTINEL: [u8; 64] = [0xa5; 64];
 
-        assert_eq!(
-            getrandom(&mut ProviderMemory(&memory), &mut first_state, 0x100, 32),
-            32
-        );
-        let mut first = [0; 32];
-        memory.read(0x100, &mut first).unwrap();
-
-        // Repeatability applies to fresh equal states. Repeating a completed
-        // call on one state must advance, or tempfile collision retries cycle.
-        assert_eq!(
-            getrandom(&mut ProviderMemory(&memory), &mut second_state, 0x200, 32),
-            32
-        );
-        let mut second = [0; 32];
-        memory.read(0x200, &mut second).unwrap();
-        assert_eq!(first, second);
-
-        assert_eq!(
-            getrandom(&mut ProviderMemory(&memory), &mut worker_state, 0x300, 32),
-            32
-        );
-        let mut worker = [0; 32];
-        memory.read(0x300, &mut worker).unwrap();
-        assert_ne!(first, worker);
-    }
-
-    fn read_deterministic_getrandom(
-        memory: &mut GuestMemory,
-        state: &mut LoadedStaticElf,
-        length: usize,
-    ) -> Vec<u8> {
-        assert_eq!(
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let mut getrandom = |memory: &mut GuestMemory, address: u64, length: u64, flags: u64| {
             syscall_result(
                 memory,
-                state,
+                &mut state,
                 libc::SYS_getrandom,
-                [0x100, length as u64, 0, 0, 0, 0],
-            ),
-            length as i64
-        );
-        let mut bytes = vec![0; length];
-        memory.read(0x100, &mut bytes).unwrap();
-        bytes
-    }
+                [address, length, flags, 0, 0, 0],
+            )
+        };
 
-    #[test]
-    fn deterministic_getrandom_advances_beyond_the_initial_block() {
-        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
-        let mut state = test_state(Path::new("/"));
-        let mut refills = std::collections::BTreeSet::new();
-        let mut bytes = Vec::new();
-        for _ in 0..128 {
-            let refill = read_deterministic_getrandom(&mut memory, &mut state, 8);
-            assert!(
-                refills.insert(refill.clone()),
-                "short refill cycle returned"
-            );
-            bytes.extend(refill);
-        }
-        let baseline: Vec<_> = (0..256)
-            .map(|index| (index as u8).wrapping_mul(17).wrapping_add(0x5a))
-            .collect();
-        assert_eq!(&bytes[..256], baseline.as_slice());
-        assert_ne!(&bytes[..256], &bytes[256..512]);
-        assert_eq!(state.getrandom_offset, 1024);
-    }
-
-    #[test]
-    fn deterministic_getrandom_is_independent_of_request_partition() {
-        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
-        let mut whole = test_state(Path::new("/"));
-        let mut split = test_state(Path::new("/"));
-        whole.random_seed = 17;
-        split.random_seed = 17;
-        whole.tid = 37;
-        split.tid = 37;
-        let expected = read_deterministic_getrandom(&mut memory, &mut whole, 1024);
-        let mut actual = Vec::new();
-        for length in [1, 7, 31, 217, 3, 509, 256] {
-            actual.extend(read_deterministic_getrandom(
-                &mut memory,
-                &mut split,
-                length,
-            ));
-        }
-        assert_eq!(actual, expected);
-        assert_eq!(split.getrandom_offset, whole.getrandom_offset);
-        assert_eq!(split.getrandom_offset, 1024);
-    }
-
-    #[test]
-    fn deterministic_getrandom_repeats_seeded_states_and_separates_seed_and_tid() {
-        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
-        let mut streams = std::collections::BTreeSet::new();
-        for seed in [0, 17, u64::MAX] {
-            for tid in [1, 2, 257] {
-                let mut first = test_state(Path::new("/"));
-                let mut second = test_state(Path::new("/"));
-                first.random_seed = seed;
-                second.random_seed = seed;
-                first.tid = tid;
-                second.tid = tid;
-                let bytes = read_deterministic_getrandom(&mut memory, &mut first, 512);
-                assert_eq!(
-                    bytes,
-                    read_deterministic_getrandom(&mut memory, &mut second, 512)
-                );
-                assert!(streams.insert(bytes));
-            }
-        }
-    }
-
-    #[test]
-    fn deterministic_getrandom_fork_and_thread_streams_leave_parent_unchanged() {
-        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
-        let mut initial = test_state(Path::new("/"));
-        initial.random_seed = 17;
-        let mut parent = ElfExecutor::new(initial, false);
-        let first = read_deterministic_getrandom(&mut memory, &mut parent.state, 64);
-        let mut forked = parent.fork_child(2, false, false).unwrap();
-        let mut thread = parent.thread_child(3).unwrap();
-        assert_eq!(parent.state.getrandom_offset, 64);
-        let mut child_streams = Vec::new();
-        for child in [&mut forked, &mut thread] {
-            assert_eq!(child.state.random_seed, 17);
-            assert_eq!(child.state.getrandom_offset, 0);
-            let mut fresh = test_state(Path::new("/"));
-            fresh.random_seed = 17;
-            fresh.tid = child.state.tid;
-            let bytes = read_deterministic_getrandom(&mut memory, &mut child.state, 64);
-            assert_eq!(
-                bytes,
-                read_deterministic_getrandom(&mut memory, &mut fresh, 64)
-            );
-            assert_ne!(bytes, first);
-            child_streams.push(bytes);
-            assert_eq!(parent.state.getrandom_offset, 64);
-        }
-        assert_ne!(child_streams[0], child_streams[1]);
-        let next = read_deterministic_getrandom(&mut memory, &mut parent.state, 64);
-        let mut fresh = test_state(Path::new("/"));
-        fresh.random_seed = 17;
-        let expected = read_deterministic_getrandom(&mut memory, &mut fresh, 128);
-        assert_eq!(first, expected[..64]);
-        assert_eq!(next, expected[64..]);
-    }
-
-    #[test]
-    fn deterministic_getrandom_exec_preserves_seed_and_stream_position() {
-        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
-        let mut previous = test_state(Path::new("/"));
-        previous.random_seed = 91;
-        let prefix = read_deterministic_getrandom(&mut memory, &mut previous, 333);
-        let mut replacement = test_state(Path::new("/"));
-        replacement.inherit_process_state(previous);
-        assert_eq!(replacement.random_seed, 91);
-        assert_eq!(replacement.getrandom_offset, 333);
-        let next = read_deterministic_getrandom(&mut memory, &mut replacement, 48);
-        let mut fresh = test_state(Path::new("/"));
-        fresh.random_seed = 91;
-        let expected = read_deterministic_getrandom(&mut memory, &mut fresh, 381);
-        assert_eq!(prefix, expected[..333]);
-        assert_eq!(next, expected[333..]);
-    }
-
-    #[test]
-    fn deterministic_getrandom_empty_and_failed_requests_do_not_advance() {
-        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
-        let mut state = test_state(Path::new("/"));
-        let first = read_deterministic_getrandom(&mut memory, &mut state, 17);
+        memory.write(BUFFER, &SENTINEL).unwrap();
+        assert_eq!(getrandom(&mut memory, BUFFER, 64, 0), 64);
+        assert_ne!(read_struct::<[u8; 64]>(&memory, BUFFER), SENTINEL);
         assert_eq!(
-            getrandom(&mut ProviderMemory(&memory), &mut state, 0x100, 0),
-            0
+            getrandom(&mut memory, BUFFER, 16, libc::GRND_NONBLOCK as u64),
+            16
         );
-        assert_eq!(state.getrandom_offset, 17);
+        assert_eq!(getrandom(&mut memory, BUFFER, 0, 0), 0);
+        // The host rejects an unknown flag, before any byte is written.
+        memory.write(BUFFER, &SENTINEL).unwrap();
         assert_eq!(
-            getrandom(&mut ProviderMemory(&memory), &mut state, PAGE_SIZE - 4, 8),
+            getrandom(&mut memory, BUFFER, 16, 0x80),
+            negative_errno(libc::EINVAL)
+        );
+        assert_eq!(read_struct::<[u8; 64]>(&memory, BUFFER), SENTINEL);
+        assert_eq!(
+            getrandom(&mut memory, u64::MAX, 16, 0),
             negative_errno(libc::EFAULT)
         );
-        assert_eq!(state.getrandom_offset, 17);
+        // A request larger than memory fills nothing it cannot store.
         assert_eq!(
-            getrandom(
-                &mut ProviderMemory(&memory),
-                &mut state,
-                0x100,
-                MAX_HOST_IO as u64
-            ),
+            getrandom(&mut memory, PAGE_SIZE - 8, 16, 0),
             negative_errno(libc::EFAULT)
         );
-        assert_eq!(state.getrandom_offset, 17);
-        assert_eq!(
-            getrandom(
-                &mut ProviderMemory(&memory),
-                &mut state,
-                0x100,
-                MAX_HOST_IO as u64 + 1
-            ),
-            negative_errno(libc::E2BIG)
-        );
-        assert_eq!(state.getrandom_offset, 17);
-        let next = read_deterministic_getrandom(&mut memory, &mut state, 8);
-        let mut fresh = test_state(Path::new("/"));
-        let expected = read_deterministic_getrandom(&mut memory, &mut fresh, 25);
-        assert_eq!(first, expected[..17]);
-        assert_eq!(next, expected[17..]);
-
-        state.getrandom_offset = u64::MAX - 8;
-        let last = read_deterministic_getrandom(&mut memory, &mut state, 8);
-        assert_eq!(state.getrandom_offset, u64::MAX);
-        assert_eq!(
-            getrandom(&mut ProviderMemory(&memory), &mut state, 0x100, 0),
-            0
-        );
-        assert_eq!(state.getrandom_offset, u64::MAX);
-        assert_eq!(
-            getrandom(&mut ProviderMemory(&memory), &mut state, 0x100, 1),
-            negative_errno(libc::EOVERFLOW)
-        );
-        assert_eq!(state.getrandom_offset, u64::MAX);
-        let mut unchanged = [0; 8];
-        memory.read(0x100, &mut unchanged).unwrap();
-        assert_eq!(unchanged.as_slice(), last.as_slice());
-        assert_eq!(
-            getrandom(
-                &mut ProviderMemory(&memory),
-                &mut state,
-                0x100,
-                MAX_HOST_IO as u64 + 1
-            ),
-            negative_errno(libc::E2BIG)
-        );
-        assert_eq!(state.getrandom_offset, u64::MAX);
     }
 
     #[test]
