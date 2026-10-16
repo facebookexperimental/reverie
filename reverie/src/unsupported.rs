@@ -40,6 +40,11 @@ pub enum UnsupportedOperation {
     /// another process. A backend that refuses it queued no signal and
     /// changed no signal state; the refusal's diagnostic names the reason.
     Signal,
+    /// `setsid` or `setpgid`, on a backend that keeps no process groups or
+    /// sessions a guest can change. A backend that refuses changed none. A
+    /// tool that models process groups itself may keep its own answer, as no
+    /// kernel state is left to disagree with it.
+    ProcessGroups,
 }
 
 /// A backend's refusal of an injected syscall that it cannot perform, as

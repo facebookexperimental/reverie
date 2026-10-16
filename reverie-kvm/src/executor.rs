@@ -174,6 +174,30 @@ fn signal_refusal_record(
         })
 }
 
+/// Diagnostic carried by this backend's typed refusal of `setsid` and
+/// `setpgid`.
+pub(crate) const PROCESS_GROUP_REFUSAL: &str = "KVM keeps no process groups or sessions a guest can change: setsid and setpgid are unsupported";
+
+/// The typed refusal, if any, that a `setsid` or `setpgid` result carries.
+/// Linux never fails either with ENOSYS, so every ENOSYS answer is this
+/// backend's own refusal; every other result carries none.
+fn process_group_refusal(
+    request: &SyscallRequest,
+    result: i64,
+) -> Option<reverie::UnsupportedRefusal> {
+    (matches!(
+        request.number(),
+        n if n == libc::SYS_setsid as u64 || n == libc::SYS_setpgid as u64
+    ) && result == negative_errno(libc::ENOSYS))
+    .then(|| {
+        reverie::UnsupportedRefusal::new(
+            reverie::UnsupportedOperation::ProcessGroups,
+            reverie::Errno::ENOSYS,
+            PROCESS_GROUP_REFUSAL,
+        )
+    })
+}
+
 const GUEST_NOFILE_LIMIT: libc::c_int = 1 << 20;
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-235): Review the single virtual network namespace identity.
@@ -8262,7 +8286,9 @@ impl ElfExecutor {
                 if let Some(child) = consumed_child {
                     self.state.children.acknowledge(child)?;
                 }
-                if let Some(refusal) = flock_refusal(request, result) {
+                if let Some(refusal) = flock_refusal(request, result)
+                    .or_else(|| process_group_refusal(request, result))
+                {
                     self.unsupported_refusal = Some(refusal);
                 }
                 if let Some(refusal) =
@@ -34655,6 +34681,39 @@ mod tests {
         libc::LOCK_EX | libc::LOCK_NB,
         libc::LOCK_UN | libc::LOCK_NB,
     ];
+
+    /// setsid and setpgid are refused with ENOSYS and the typed refusal
+    /// `UnsupportedOperation::ProcessGroups`, which no other result carries.
+    #[test]
+    fn setsid_and_setpgid_are_typed_process_group_refusals() {
+        let root = TestDir::new();
+        let memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let mut executor = ElfExecutor::new(test_state(&root.0), false);
+        let refusal = Some(reverie::UnsupportedRefusal::new(
+            reverie::UnsupportedOperation::ProcessGroups,
+            reverie::Errno::ENOSYS,
+            PROCESS_GROUP_REFUSAL,
+        ));
+        for (number, args) in [(libc::SYS_setsid, [0; 6]), (libc::SYS_setpgid, [0; 6])] {
+            assert_eq!(
+                executor.execute(&SyscallRequest::new(number as u64, args), &memory),
+                negative_errno(libc::ENOSYS),
+                "syscall {number}"
+            );
+            assert_eq!(
+                executor.take_unsupported_refusal(),
+                refusal,
+                "syscall {number}"
+            );
+        }
+        assert!(
+            executor.execute(
+                &SyscallRequest::new(libc::SYS_getpgrp as u64, [0; 6]),
+                &memory
+            ) > 0
+        );
+        assert_eq!(executor.take_unsupported_refusal(), None);
+    }
 
     /// Every valid lock operation is refused with ENOSYS and the typed
     /// refusal, and none reaches the host lock: an independent host open of
