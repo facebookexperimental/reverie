@@ -17922,11 +17922,14 @@ const SYNTHETIC_GUEST_FD_DEV_MINOR: u32 = 0xff02;
 // table's entry and a dead open-path special case) carried no marker.
 // /proc/stat followed, once Detcore rendered it from a fixed template plus
 // virtual time; its KVM copy (this table's entry) carried no marker.
+// /proc/cpuinfo followed, once Detcore rendered it from its virtual CPUID
+// table wherever CPUID is virtualized and the backend can deliver the guest's
+// CPUID instruction to the Tool, as KVM always can; its KVM copy (this table's
+// entry, a fixed "reverie-kvm virtual CPU" block) carried no marker.
 const SYNTHETIC_REGULAR_PROC_PATHS: &[&[u8]] = &[
     b"/proc/mounts",
     b"/proc/self/mounts",
     b"/proc/self/mountinfo",
-    b"/proc/cpuinfo",
     b"/proc/locks",
     b"/proc/self/stat",
     b"/proc/self/status",
@@ -18071,23 +18074,6 @@ fn synthetic_proc_content(state: &LoadedStaticElf, path: &[u8]) -> Option<Vec<u8
         // namespace. The Tool normalizes its real mount identities together
         // with the raw identities returned by ordinary fdinfo observations.
         b"/proc/self/mountinfo" => state.proc_mounts.mountinfo.clone(),
-        b"/proc/cpuinfo" => concat!(
-            "processor\t: 0\n",
-            "vendor_id\t: GenuineIntel\n",
-            "cpu family\t: 6\n",
-            "model\t\t: 0\n",
-            "model name\t: reverie-kvm virtual CPU\n",
-            "cpu MHz\t\t: 1000.000\n",
-            "cache size\t: 0 KB\n",
-            "physical id\t: 0\n",
-            "siblings\t: 1\n",
-            "core id\t\t: 0\n",
-            "cpu cores\t: 1\n",
-            "flags\t\t: fpu\n",
-            "\n",
-        )
-        .as_bytes()
-        .to_vec(),
         b"/proc/locks" => proc_locks_content(state),
         b"/proc/self/stat" => proc_self_stat_content(state),
         b"/proc/self/status" => proc_self_status_content(state),
@@ -28205,19 +28191,34 @@ mod tests {
         let stat: libc::stat = read_struct(&memory, stat_address);
         assert_eq!(stat.st_mode, libc::S_IFDIR | 0o555);
 
-        write_c_string(&mut memory, 0x100, "cpuinfo");
-        let cpuinfo_fd = syscall_result(
+        write_c_string(&mut memory, 0x100, "self/status");
+        let status_fd = syscall_result(
             &mut memory,
             &mut state,
             libc::SYS_openat,
             [proc_fd as u64, 0x100, libc::O_RDONLY as u64, 0, 0, 0],
         );
-        assert!(cpuinfo_fd >= 0, "openat cpuinfo failed: {cpuinfo_fd}");
-        let content = read_fd_to_end(&mut memory, &mut state, cpuinfo_fd);
+        assert!(status_fd >= 0, "openat self/status failed: {status_fd}");
+        let status = read_fd_to_end(&mut memory, &mut state, status_fd);
         assert!(
-            content.starts_with(b"processor\t: 0\n"),
+            status.starts_with(b"Name:\ttest\n"),
             "{}",
-            String::from_utf8_lossy(&content)
+            String::from_utf8_lossy(&status)
+        );
+
+        // A one-component name below the directory resolves too.
+        write_c_string(&mut memory, 0x100, "mounts");
+        let mounts_fd = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_openat,
+            [proc_fd as u64, 0x100, libc::O_RDONLY as u64, 0, 0, 0],
+        );
+        assert!(mounts_fd >= 0, "openat mounts failed: {mounts_fd}");
+        let expected_mounts = state.proc_mounts.mounts.clone();
+        assert_eq!(
+            read_fd_to_end(&mut memory, &mut state, mounts_fd),
+            expected_mounts
         );
 
         write_c_string(&mut memory, 0x100, "self/maps");
@@ -28241,6 +28242,20 @@ mod tests {
             ),
             negative_errno(libc::ENOENT),
             "unlisted relative proc path leaked through"
+        );
+
+        // A file Detcore renders has no copy here, so a relative open that
+        // reaches this executor anyway fails closed like any unlisted name.
+        write_c_string(&mut memory, 0x100, "cpuinfo");
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_openat,
+                [proc_fd as u64, 0x100, libc::O_RDONLY as u64, 0, 0, 0],
+            ),
+            negative_errno(libc::ENOENT),
+            "relative cpuinfo below the synthetic /proc directory"
         );
 
         assert_eq!(
@@ -28535,11 +28550,14 @@ mod tests {
         );
     }
 
-    /// Detcore renders these eight files on every backend (Hermit's fixed
-    /// procfs tables), so the KVM executor no longer has a copy: no synthetic
-    /// content, no synthetic inode, and a direct open from a guest that runs
-    /// without the Tool meets the real-procfs refusal instead of a second,
-    /// different rendering.
+    /// Detcore renders these nine files, so the KVM executor no longer has a
+    /// copy: no synthetic content, no synthetic inode, and a direct open from
+    /// a guest that runs without the Tool meets the real-procfs refusal
+    /// instead of a second, different rendering. The first eight come from
+    /// Hermit's fixed procfs tables on every backend; /proc/cpuinfo comes from
+    /// Detcore's virtual CPUID table wherever CPUID is virtualized and the
+    /// backend can deliver the guest's CPUID instruction to the Tool, as KVM
+    /// always can.
     #[test]
     fn detcore_rendered_proc_files_have_no_kvm_copy() {
         let root = TestDir::new();
@@ -28554,6 +28572,7 @@ mod tests {
             "/proc/loadavg",
             "/proc/uptime",
             "/proc/stat",
+            "/proc/cpuinfo",
         ] {
             assert!(
                 synthetic_proc_content(&state, path.as_bytes()).is_none(),
