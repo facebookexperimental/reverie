@@ -76,6 +76,7 @@ mod error;
 /// Ordered capture for trusted cooperating processes using socket lifetime endpoints.
 #[cfg(target_os = "linux")]
 pub mod guest_log;
+mod peer_identity;
 mod server;
 
 #[cfg(target_os = "linux")]

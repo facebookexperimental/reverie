@@ -17,6 +17,7 @@ use reverie_syscalls::Syscall;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::ConnectionIdentity;
 use crate::ExitStatus;
 use crate::Pid;
 use crate::Signal;
@@ -368,6 +369,24 @@ pub trait GlobalTool: Send + Sync + Default {
     /// The terminal transition in `report_backend_failure` must also make
     /// cleanup possible for requests that were admitted but did not complete.
     async fn receive_rpc(&self, _from: Tid, _message: Self::Request) -> Self::Response;
+
+    /// [`GlobalTool::receive_rpc`] for a request that arrived on a connection
+    /// whose opening process the transport identified, for a coordinator that
+    /// asked for that (`reverie_rpc_transport::RpcServer::require_connection_identity`).
+    /// `identity` names the process that opened the connection; see
+    /// [`ConnectionIdentity`] for what it does and does not prove.
+    ///
+    /// The default ignores `identity` and forwards to
+    /// [`GlobalTool::receive_rpc`], so a tool that does not use it behaves as
+    /// before.
+    async fn receive_rpc_with_identity(
+        &self,
+        from: Tid,
+        message: Self::Request,
+        _identity: ConnectionIdentity,
+    ) -> Self::Response {
+        self.receive_rpc(from, message).await
+    }
 
     /// Reports a fatal backend failure before cleanup can wait on another Tool
     /// callback. This is a failed run, not a guest exit, signal, or RPC reply.
