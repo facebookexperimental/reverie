@@ -2602,6 +2602,35 @@ static int64_t close_range_preserving_internal_descriptors(
 }
 #endif
 
+// The runtime's own descriptors, the identity memfd (fd 197) and the
+// diagnostic file (fd 198), are not open as far as the guest knows: the rule
+// every in-process backend shares (reverie_inguest::reserved_fds). This C
+// client is still that rule's fourth copy, covering only the calls below;
+// other calls naming 197 or 198 are not yet checked.
+static bool is_internal_descriptor(int fd) {
+  return fd == VIRTUAL_IDENTITY_FD || fd == DBT_DIAGNOSTIC_FD;
+}
+
+// A guest dup2/dup3 onto 197 or 198: Linux would succeed, giving the guest a
+// copy at that number, and this client cannot yet move its own descriptor
+// out of the way. A fail-closed run (Hermit's default) therefore ends with the
+// policy-refusal status Detcore's own refusals use (HERMIT_POLICY_REFUSAL_EXIT,
+// 122), naming the call; a run that allows unsupported syscalls gets EBADF.
+static int64_t refuse_dup_onto_internal_descriptor(int sysnum, int target) {
+  if (!runtime_callbacks_page.value.panic_on_unsupported_syscalls)
+    return -EBADF;
+  dr_fprintf(
+      diagnostic_file,
+      "reverie-dbt: refusing %s onto descriptor %d, which the DBT runtime "
+      "owns; moving it out of the guest's way is not implemented\n",
+      sysnum == SYS_dup2 ? "dup2" : "dup3",
+      target);
+  // Through exit_runtime_tree, so the protected evidence records that the run
+  // ended here rather than finding its outcome missing.
+  exit_runtime_tree(122);
+  return -EBADF;
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-106): keep the identity memfd (fd 197) and diagnostic fd
 // (198) alive across close/fcntl(F_SETFD)/dup2/dup3 in copied children.
@@ -2611,9 +2640,9 @@ static bool preserve_internal_descriptors(
     const uint64_t* args,
     int64_t* result) {
   int fd = (int)args[0];
-  if (sysnum == SYS_close &&
-      (fd == VIRTUAL_IDENTITY_FD || fd == DBT_DIAGNOSTIC_FD)) {
-    *result = 0;
+  // A close of a number the guest does not have open fails, as on Linux.
+  if (sysnum == SYS_close && is_internal_descriptor(fd)) {
+    *result = -EBADF;
     return true;
   }
 #ifdef SYS_close_range
@@ -2628,16 +2657,14 @@ static bool preserve_internal_descriptors(
     }
   }
 #endif
-  if (sysnum == SYS_fcntl &&
-      (fd == VIRTUAL_IDENTITY_FD || fd == DBT_DIAGNOSTIC_FD) &&
+  if (sysnum == SYS_fcntl && is_internal_descriptor(fd) &&
       args[1] == F_SETFD) {
-    *result = 0;
+    *result = -EBADF;
     return true;
   }
   if ((sysnum == SYS_dup2 || sysnum == SYS_dup3) &&
-      ((int)args[1] == VIRTUAL_IDENTITY_FD ||
-       (int)args[1] == DBT_DIAGNOSTIC_FD)) {
-    *result = (int64_t)args[1];
+      is_internal_descriptor((int)args[1])) {
+    *result = refuse_dup_onto_internal_descriptor(sysnum, (int)args[1]);
     return true;
   }
   return false;

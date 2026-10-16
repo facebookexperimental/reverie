@@ -164,6 +164,18 @@ static int close_range_preserves_internal_descriptors(void) {
     return 13;
   if (fd_flags(VIRTUAL_IDENTITY_FD) < 0 || fd_flags(DBT_DIAGNOSTIC_FD) < 0)
     return 14;
+
+  // The runtime's own descriptors are not open as far as the guest knows: a
+  // close or F_SETFD of one fails with EBADF, as for any number not open, and
+  // the descriptor itself survives.
+  errno = 0;
+  if (close(VIRTUAL_IDENTITY_FD) != -1 || errno != EBADF)
+    return 16;
+  errno = 0;
+  if (fcntl(DBT_DIAGNOSTIC_FD, F_SETFD, 0) != -1 || errno != EBADF)
+    return 17;
+  if (fd_flags(VIRTUAL_IDENTITY_FD) < 0 || fd_flags(DBT_DIAGNOSTIC_FD) < 0)
+    return 18;
   return 0;
 #else
   return 15;
@@ -177,7 +189,10 @@ int main(void) {
   long ppid = syscall(SYS_getppid);
   long tid = syscall(SYS_gettid);
 
-  if (syscall(SYS_close, VIRTUAL_IDENTITY_FD) != 0)
+  // Not open as far as the guest knows: the close fails, and the descriptor
+  // survives.
+  errno = 0;
+  if (syscall(SYS_close, VIRTUAL_IDENTITY_FD) != -1 || errno != EBADF)
     return 1;
   errno = 0;
   if (fcntl(VIRTUAL_IDENTITY_FD, F_GETFD) < 0)
