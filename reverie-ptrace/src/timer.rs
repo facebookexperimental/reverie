@@ -5510,7 +5510,7 @@ mod tests {
     fn amd_epyc_9d85_uses_reduced_skid_margin() {
         let config = PmuConfig::from_family_model(0x1A, 0x11);
         assert_eq!(config.raw_rcb_event(), 0x5100d1);
-        assert_eq!(config.skid_margin(), 1_000);
+        assert_eq!(config.skid_margin(), 2_000);
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -5628,7 +5628,7 @@ mod tests {
         use super::DEFAULT_SKID_LATENCY_BUDGET_NS;
         use super::LARGEST_TABLE_SKID_MARGIN;
 
-        // EPYC 9D85: skid margin 1000.
+        // EPYC 9D85: skid margin 2000.
         let config = PmuConfig::from_family_model(0x1A, 0x11);
         assert_eq!(
             config.skid_latency_budget_ns(),
@@ -5646,14 +5646,14 @@ mod tests {
             4_801
         );
         // A low rate takes the skid margin, a high one the first stage's.
-        assert_eq!(config.second_stage_margin(100_000, Some(1_000_000)), 1_000);
+        assert_eq!(config.second_stage_margin(100_000, Some(1_000_000)), 2_000);
         assert_eq!(
             config.second_stage_margin(100_000_000, Some(1_000_000)),
             LARGEST_TABLE_SKID_MARGIN
         );
         // Without a time, or with none elapsed, it is the skid margin.
-        assert_eq!(config.second_stage_margin(8_000_000, None), 1_000);
-        assert_eq!(config.second_stage_margin(8_000_000, Some(0)), 1_000);
+        assert_eq!(config.second_stage_margin(8_000_000, None), 2_000);
+        assert_eq!(config.second_stage_margin(8_000_000, Some(0)), 2_000);
         // No overflow in the product.
         assert_eq!(
             config.second_stage_margin(u64::MAX, Some(1)),
@@ -5699,14 +5699,14 @@ mod tests {
     #[test]
     fn skid_overshoot_marker_has_canonical_shape() {
         use super::SKID_OVERSHOOT_MARKER;
-        // EPYC 9D85: skid margin 1000. Overshoot of 33_500 (the measured
+        // EPYC 9D85: skid margin 2000. Overshoot of 33_500 (the measured
         // baseline outlier) landing 500 RCB past a target of 33_000.
         let config = PmuConfig::from_family_model(0x1A, 0x11);
         let line = config.format_skid_overshoot_marker(33_500, 33_000);
         assert_eq!(
             line,
             format!(
-                "{} rcb_actual=33500 rcb_target=33000 skid_margin=1000 overshoot=500",
+                "{} rcb_actual=33500 rcb_target=33000 skid_margin=2000 overshoot=500",
                 SKID_OVERSHOOT_MARKER
             )
         );
@@ -5739,7 +5739,7 @@ mod tests {
         let _ = reverie::take_skid_overshoot_count();
 
         // The exact CPU is irrelevant to the decision, which keys only on
-        // `actual > target`; use EPYC 9D85 (default margin 1000).
+        // `actual > target`; use EPYC 9D85 (default margin 2000).
         let config = PmuConfig::from_family_model(0x1A, 0x11);
 
         // --- Negative bracket: a non-overshoot must record nothing. ---
