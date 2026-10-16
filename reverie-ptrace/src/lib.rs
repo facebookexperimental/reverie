@@ -52,7 +52,6 @@ mod failure;
 mod gdbstub;
 mod in_guest;
 mod injected_syscall;
-pub mod liteinst_census;
 mod perf;
 mod poll_on_wake;
 pub mod regs;

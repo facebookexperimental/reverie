@@ -346,7 +346,6 @@ rust_library(
         "fbsource//third-party/rust:tracing",
         ":reverie",
         ":reverie-inguest",
-        ":reverie-ptrace",
         ":reverie-rpc-transport",
     ],
 )

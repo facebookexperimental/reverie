@@ -37,11 +37,10 @@
 //! check that the whole instructions it displaces end at or before the site's
 //! [`SiteEntries::limit`].
 //!
-//! The census lives here, not in reverie-liteinst, so that the ptrace tracer
-//! can build it from the tracee's memory. Built inside the tracee, it retired
-//! about 12.9 million conditional branches for glibc 2.34's `libc.so.6`, and a
-//! Hermit guest's virtual clock would count every one of them. The in-guest
-//! LiteInst runtime still builds it itself when no tracer is present.
+//! The in-guest LiteInst runtime builds the census itself. It lived in
+//! reverie-ptrace while the ptrace tracer built it from the tracee's memory
+//! for ptrace-hosted LiteInst, which no longer exists; reverie-ptrace did not
+//! use it (step A10 of <https://github.com/rrnewton/hermit/issues/4485>).
 //!
 //! Residuals: a branch from code that has no unwind information is found only
 //! if the decode of that code happens to align. A code address that is held
@@ -733,11 +732,6 @@ struct Site {
     limit: u64,
 }
 
-/// The entry limit that the ptrace tracer passes to the installation helper
-/// for a site its census refused. A real limit lies after its site, so it is
-/// never 0.
-pub const REFUSED_ENTRY_LIMIT: u64 = 0;
-
 /// What a census knows about one `syscall` site.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SiteEntries {
@@ -915,6 +909,7 @@ impl Census {
 
     /// Returns the address of every `syscall` instruction the census found,
     /// in ascending order.
+    #[cfg(test)]
     pub fn site_addresses(&self) -> impl Iterator<Item = u64> + '_ {
         self.sites.iter().map(|site| site.address)
     }

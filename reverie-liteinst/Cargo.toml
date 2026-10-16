@@ -58,7 +58,6 @@ libc = "0.2.186"
 liteinst2 = { version = "0.1.0", git = "https://github.com/rrnewton/liteinst2", rev = "d64dc833418a4c265803645653b8f597d0f25060" }
 reverie = { version = "0.4.1", path = "../reverie", package = "reverie-core" }
 reverie-inguest = { version = "0.4.1", path = "../reverie-inguest", default-features = false, features = ["coordinator-rpc", "rcb-clock", "launcher"] }
-reverie-ptrace = { version = "0.4.1", path = "../reverie-ptrace" }
 reverie-rpc-transport = { version = "0.4.1", path = "../reverie-rpc-transport" }
 serde = { version = "1.0.219", features = ["derive"] }
 tokio = { version = "1.52.4", features = ["macros", "net", "rt", "time"] }

@@ -1,21 +1,20 @@
 //! The entry proof for a LiteInst jump patch
 //! (<https://github.com/rrnewton/reverie/issues/812>).
 //!
-//! [`reverie_ptrace::liteinst_census`] lists, for each `syscall` site of a
-//! loaded object, the lowest known control-transfer entry after it. This
-//! module checks a live scan of the bytes a patch would displace against that
-//! entry. Under ptrace the tracer builds the census from the tracee's memory
-//! and passes the entry to the installation helper; without a tracer the
-//! runtime builds the census itself from an [`ObjectImage`].
+//! [`crate::liteinst_census`] lists, for each `syscall` site of a loaded
+//! object, the lowest known control-transfer entry after it. This module
+//! checks a live scan of the bytes a patch would displace against that entry.
+//! The runtime builds the census itself from an [`ObjectImage`].
 
 use iced_x86::Mnemonic;
 use liteinst2::patcher::NEAR_JUMP_BYTES;
 use liteinst2::scanner::ScannedInstruction;
-pub(crate) use reverie_ptrace::liteinst_census::Census;
-pub(crate) use reverie_ptrace::liteinst_census::CensusError;
-pub(crate) use reverie_ptrace::liteinst_census::Refusal;
-use reverie_ptrace::liteinst_census::Segment;
-pub(crate) use reverie_ptrace::liteinst_census::SiteEntries;
+
+pub(crate) use crate::liteinst_census::Census;
+pub(crate) use crate::liteinst_census::CensusError;
+pub(crate) use crate::liteinst_census::Refusal;
+use crate::liteinst_census::Segment;
+pub(crate) use crate::liteinst_census::SiteEntries;
 
 /// Where a loaded object was mapped when LiteInst initialized.
 #[derive(Debug, Eq, PartialEq)]

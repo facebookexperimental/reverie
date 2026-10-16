@@ -25,6 +25,7 @@ pub mod generic_fixture;
 #[cfg(feature = "exec-private-init")]
 mod initial_image_stats;
 mod interior_entry;
+mod liteinst_census;
 #[cfg(feature = "native-exec-state")]
 pub mod native_exec_state;
 mod patch_alloc;
