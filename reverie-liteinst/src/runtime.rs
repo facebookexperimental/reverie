@@ -353,8 +353,11 @@ pub const PROCESS_FORK_ENV: &str = "REVERIE_LITEINST_PROCESS_FORK";
 /// `syscall`s. Subscribed `cpuid`, `rdtsc`, and `rdtscp` instructions are
 /// covered too: no instruction site is claimed or patched, and each one is
 /// emulated through the same fallback continuation, as for late code.
-/// Any other value is rejected. The variable is not removed, so the guest can
-/// read it in its environment. Only an in-guest Reverie Tool (the
+/// Any other value is rejected. A launcher that sends tool data (the
+/// `*_preload_data` entry points) moves the variable from the command into the
+/// sealed bootstrap, which the runtime prefers: the guest neither sees it nor
+/// can change it. Otherwise the runtime reads it from the environment, and it
+/// stays there for the guest to read. Only an in-guest Reverie Tool (the
 /// `install_tool` family) honors `0`. When the runtime is selected from the
 /// environment, the built-in, `strace`, and `compat` runtimes do not take
 /// this selector (the built-ins never patch syscall sites; the others always
@@ -364,6 +367,10 @@ pub const SITE_PATCHING_ENV: &str = "REVERIE_LITEINST_SITE_PATCHING";
 const SITE_PATCHING_ENV_C: &CStr = c"REVERIE_LITEINST_SITE_PATCHING";
 const _: () = assert!(const_bytes_eq(
     SITE_PATCHING_ENV_C.to_bytes(),
+    SITE_PATCHING_ENV.as_bytes()
+));
+const _: () = assert!(const_bytes_eq(
+    reverie_inguest::bootstrap::SITE_PATCHING_ENV.as_bytes(),
     SITE_PATCHING_ENV.as_bytes()
 ));
 

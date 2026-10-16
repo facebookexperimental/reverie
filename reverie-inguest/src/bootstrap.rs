@@ -30,6 +30,11 @@ pub const TOOL_PRELOAD_ENV: &str = "REVERIE_LITEINST_TOOL_PRELOAD";
 pub const COORDINATOR_ENV: &str = "REVERIE_LITEINST_COORDINATOR";
 /// Environment variable naming the optional, stats-only coordinator socket.
 pub const STATS_COORDINATOR_ENV: &str = "REVERIE_LITEINST_STATS_COORDINATOR";
+/// Environment variable selecting whether an in-guest Tool patches syscall
+/// sites (reverie-liteinst's `SITE_PATCHING_ENV`). A launcher that sends tool
+/// data moves it from the command into the bootstrap (version 3), so the
+/// runtime honors it and the guest does not see it.
+pub const SITE_PATCHING_ENV: &str = "REVERIE_LITEINST_SITE_PATCHING";
 
 const PRELOAD_BOOTSTRAP_MAGIC: &[u8; 16] = b"REVERIE-LI-V1\0\0\0";
 const PRELOAD_BOOTSTRAP_HEADER_BYTES: usize = PRELOAD_BOOTSTRAP_MAGIC.len() + 4;
@@ -38,10 +43,25 @@ const PRELOAD_BOOTSTRAP_HEADER_BYTES: usize = PRELOAD_BOOTSTRAP_MAGIC.len() + 4;
 /// kernel copies it onto the initial stack and into `/proc/self/environ`.
 const PRELOAD_BOOTSTRAP_MAGIC_V2: &[u8; 16] = b"REVERIE-LI-V2\0\0\0";
 const PRELOAD_BOOTSTRAP_HEADER_BYTES_V2: usize = PRELOAD_BOOTSTRAP_MAGIC_V2.len() + 6;
+/// Version 3 adds the site-patching selection, as one byte after the three
+/// lengths: 0 unset, 1 on, 2 off. Its statistics path may be empty (none).
+const PRELOAD_BOOTSTRAP_MAGIC_V3: &[u8; 16] = b"REVERIE-LI-V3\0\0\0";
+const PRELOAD_BOOTSTRAP_HEADER_BYTES_V3: usize = PRELOAD_BOOTSTRAP_MAGIC_V3.len() + 7;
 const PRELOAD_BOOTSTRAP_MAX_BYTES: usize = 4096;
 
 /// The statistics coordinator named by the bootstrap this process image took.
 static BOOTSTRAP_STATS_COORDINATOR: OnceLock<PathBuf> = OnceLock::new();
+
+/// The site-patching selection of the bootstrap this process image took.
+static BOOTSTRAP_SITE_PATCHING: OnceLock<bool> = OnceLock::new();
+
+/// Whether the bootstrap this process image took with
+/// [`take_preload_bootstrap`] selected syscall-site patching on (`true`) or
+/// off (`false`); `None` when it said nothing. The Tool host prefers it to
+/// [`SITE_PATCHING_ENV`].
+pub fn bootstrap_site_patching() -> Option<bool> {
+    BOOTSTRAP_SITE_PATCHING.get().copied()
+}
 
 /// The statistics coordinator's path from the bootstrap this process image
 /// took with [`take_preload_bootstrap`], if the launcher sent one. The Tool
@@ -60,6 +80,8 @@ pub struct PreloadBootstrap {
     /// Unix-domain socket path for the statistics coordinator, when the run
     /// collects statistics.
     pub stats_coordinator: Option<PathBuf>,
+    /// The launcher's site-patching selection, when it made one.
+    pub site_patching: Option<bool>,
 }
 
 // TODO-HUMAN-REVIEW(PR-139): Review the public inherited preload bootstrap consumer.
@@ -94,6 +116,9 @@ pub unsafe fn take_preload_bootstrap() -> io::Result<Option<PreloadBootstrap>> {
             let (_fd, bootstrap) = found.pop().unwrap();
             if let Some(stats) = &bootstrap.stats_coordinator {
                 let _ = BOOTSTRAP_STATS_COORDINATOR.set(stats.clone());
+            }
+            if let Some(site_patching) = bootstrap.site_patching {
+                let _ = BOOTSTRAP_SITE_PATCHING.set(site_patching);
             }
             Ok(Some(bootstrap))
         }
@@ -156,11 +181,14 @@ pub(crate) fn read_preload_bootstrap(fd: libc::c_int) -> io::Result<Option<Prelo
         return Ok(None);
     }
     let magic = packet.get(..PRELOAD_BOOTSTRAP_MAGIC.len());
-    let (header, version_2) = if magic == Some(PRELOAD_BOOTSTRAP_MAGIC) {
-        (PRELOAD_BOOTSTRAP_HEADER_BYTES, false)
+    let (header, version) = if magic == Some(PRELOAD_BOOTSTRAP_MAGIC) {
+        (PRELOAD_BOOTSTRAP_HEADER_BYTES, 1)
     } else if magic == Some(PRELOAD_BOOTSTRAP_MAGIC_V2) && size >= PRELOAD_BOOTSTRAP_HEADER_BYTES_V2
     {
-        (PRELOAD_BOOTSTRAP_HEADER_BYTES_V2, true)
+        (PRELOAD_BOOTSTRAP_HEADER_BYTES_V2, 2)
+    } else if magic == Some(PRELOAD_BOOTSTRAP_MAGIC_V3) && size >= PRELOAD_BOOTSTRAP_HEADER_BYTES_V3
+    {
+        (PRELOAD_BOOTSTRAP_HEADER_BYTES_V3, 3)
     } else {
         return Ok(None);
     };
@@ -169,36 +197,48 @@ pub(crate) fn read_preload_bootstrap(fd: libc::c_int) -> io::Result<Option<Prelo
     let length =
         |index: usize| u16::from_le_bytes([lengths[2 * index], lengths[2 * index + 1]]) as usize;
     let path_len = length(0);
-    let (stats_len, data_len) = if version_2 {
-        (length(1), length(2))
-    } else {
+    let (stats_len, data_len) = if version == 1 {
         (0, length(1))
+    } else {
+        (length(1), length(2))
+    };
+    let invalid = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid LiteInst preload bootstrap lengths",
+        )
+    };
+    let site_patching = match (version, lengths.get(6)) {
+        (3, Some(0)) | (1 | 2, None) => None,
+        (3, Some(1)) => Some(true),
+        (3, Some(2)) => Some(false),
+        _ => return Err(invalid()),
     };
     if packet.len() != header + path_len + stats_len + data_len
         || path_len == 0
-        || (version_2 && stats_len == 0)
+        || (version == 2 && stats_len == 0)
     {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid LiteInst preload bootstrap lengths",
-        ));
+        return Err(invalid());
     }
     let path_end = header + path_len;
     let stats_end = path_end + stats_len;
     Ok(Some(PreloadBootstrap {
         coordinator: PathBuf::from(OsString::from_vec(packet[header..path_end].to_vec())),
         tool_data: packet[stats_end..].to_vec(),
-        stats_coordinator: version_2
+        stats_coordinator: (stats_len > 0)
             .then(|| PathBuf::from(OsString::from_vec(packet[path_end..stats_end].to_vec()))),
+        site_patching,
     }))
 }
 
 /// The sealed bootstrap naming the Tool coordinator, and the statistics
-/// coordinator too (version 2) when `stats` is given.
+/// coordinator too (version 2) when `stats` is given, and the site-patching
+/// selection (version 3) when `site_patching` is given.
 #[cfg(feature = "launcher")]
 pub(crate) fn create_preload_bootstrap(
     coordinator: &Path,
     stats: Option<&Path>,
+    site_patching: Option<bool>,
     tool_data: &[u8],
 ) -> io::Result<OwnedFd> {
     let path = coordinator.as_os_str().as_bytes();
@@ -216,13 +256,29 @@ pub(crate) fn create_preload_bootstrap(
     })?;
     let stats = stats.map(|stats| stats.as_os_str().as_bytes());
     let mut packet = Vec::with_capacity(
-        PRELOAD_BOOTSTRAP_HEADER_BYTES_V2
+        PRELOAD_BOOTSTRAP_HEADER_BYTES_V3
             + path.len()
             + stats.map_or(0, <[u8]>::len)
             + tool_data.len(),
     );
-    match stats {
-        Some(stats) => {
+    match (stats, site_patching) {
+        (stats, Some(site_patching)) => {
+            let stats = stats.unwrap_or_default();
+            let stats_len = u16::try_from(stats.len()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "LiteInst statistics coordinator path exceeds the bootstrap limit",
+                )
+            })?;
+            packet.extend_from_slice(PRELOAD_BOOTSTRAP_MAGIC_V3);
+            packet.extend_from_slice(&path_len.to_le_bytes());
+            packet.extend_from_slice(&stats_len.to_le_bytes());
+            packet.extend_from_slice(&data_len.to_le_bytes());
+            packet.push(if site_patching { 1 } else { 2 });
+            packet.extend_from_slice(path);
+            packet.extend_from_slice(stats);
+        }
+        (Some(stats), None) => {
             let stats_len = u16::try_from(stats.len())
                 .ok()
                 .filter(|length| *length > 0)
@@ -239,7 +295,7 @@ pub(crate) fn create_preload_bootstrap(
             packet.extend_from_slice(path);
             packet.extend_from_slice(stats);
         }
-        None => {
+        (None, None) => {
             packet.extend_from_slice(PRELOAD_BOOTSTRAP_MAGIC);
             packet.extend_from_slice(&path_len.to_le_bytes());
             packet.extend_from_slice(&data_len.to_le_bytes());

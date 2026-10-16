@@ -927,8 +927,13 @@ where
     install_try!(runtime::preflight_instruction_faulting(
         instruction_subscriptions
     ));
+    // A launcher that sends tool data puts the selection in the bootstrap,
+    // which guest code cannot change; the environment is the selector for
+    // launchers that do not.
     let site_patching = if private_initial {
         false
+    } else if let Some(site_patching) = reverie_inguest::bootstrap::bootstrap_site_patching() {
+        site_patching
     } else {
         install_try!(runtime::site_patching_from_env_value(
             std::env::var_os(runtime::SITE_PATCHING_ENV).as_deref(),

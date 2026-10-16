@@ -44,6 +44,7 @@ use reverie_rpc_transport::RpcIssueMonitor;
 use reverie_rpc_transport::RpcServer;
 
 use crate::bootstrap::COORDINATOR_ENV;
+use crate::bootstrap::SITE_PATCHING_ENV;
 use crate::bootstrap::STATS_COORDINATOR_ENV;
 use crate::bootstrap::TOOL_PRELOAD_ENV;
 use crate::bootstrap::create_preload_bootstrap;
@@ -539,6 +540,20 @@ fn effective_command_env(command: &Command, key: &OsStr) -> Option<OsString> {
     command.get_captured_envs().remove(key)
 }
 
+/// The command's [`SITE_PATCHING_ENV`] selection: `1` on, `0` off, unset
+/// none. Any other value is refused here, as the runtime would refuse it.
+fn command_site_patching(command: &Command) -> io::Result<Option<bool>> {
+    match effective_command_env(command, OsStr::new(SITE_PATCHING_ENV)) {
+        None => Ok(None),
+        Some(value) if value == OsStr::new("1") => Ok(Some(true)),
+        Some(value) if value == OsStr::new("0") => Ok(Some(false)),
+        Some(value) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported {SITE_PATCHING_ENV} value {value:?}"),
+        )),
+    }
+}
+
 fn configure_in_guest_command_preload(command: &mut Command, preload: PathBuf) {
     let mut ld_preload = preload.into_os_string();
     if let Some(existing) =
@@ -970,13 +985,23 @@ where
 
     let wait = match tool_data {
         Some(tool_data) => {
+            // The site-patching selection the caller set on the command goes
+            // in the bootstrap: the runtime honors it, and the guest neither
+            // sees it in its environment nor can change it there.
+            let site_patching = command_site_patching(&command)?;
             let mut child_command = command.try_into_std()?;
             disable_address_space_randomization(&mut child_command);
             // The statistics coordinator travels in the bootstrap with the
             // Tool coordinator, not in the guest's environment.
             child_command.env_remove(STATS_COORDINATOR_ENV);
+            child_command.env_remove(SITE_PATCHING_ENV);
 
-            let bootstrap = create_preload_bootstrap(&socket, stats_socket.as_deref(), &tool_data)?;
+            let bootstrap = create_preload_bootstrap(
+                &socket,
+                stats_socket.as_deref(),
+                site_patching,
+                &tool_data,
+            )?;
             let bootstrap_fd = bootstrap.as_raw_fd();
             unsafe {
                 child_command.pre_exec(move || {
@@ -2051,7 +2076,7 @@ mod tests {
         let expected = b"REVERIE-LI-V1\0\0\0\x0f\0\x03\0/tmp/raw-\xff.sock\0\xff*";
         let coordinator = PathBuf::from(OsString::from_vec(b"/tmp/raw-\xff.sock".to_vec()));
         let data = b"\0\xff*";
-        let fd = create_preload_bootstrap(&coordinator, None, data).unwrap();
+        let fd = create_preload_bootstrap(&coordinator, None, None, data).unwrap();
         let mut actual = [0u8; 128];
         let count =
             unsafe { libc::pread(fd.as_raw_fd(), actual.as_mut_ptr().cast(), actual.len(), 0) };
@@ -2067,7 +2092,7 @@ mod tests {
         let expected_v2 =
             b"REVERIE-LI-V2\0\0\0\x0f\0\x0b\0\x03\0/tmp/raw-\xff.sock/tmp/s.sock\0\xff*";
         let stats = PathBuf::from("/tmp/s.sock");
-        let fd = create_preload_bootstrap(&coordinator, Some(&stats), data).unwrap();
+        let fd = create_preload_bootstrap(&coordinator, Some(&stats), None, data).unwrap();
         let count =
             unsafe { libc::pread(fd.as_raw_fd(), actual.as_mut_ptr().cast(), actual.len(), 0) };
         assert_eq!(count, expected_v2.len() as isize);
@@ -2076,6 +2101,26 @@ mod tests {
         assert_eq!(decoded.coordinator, coordinator);
         assert_eq!(decoded.stats_coordinator, Some(stats));
         assert_eq!(decoded.tool_data, data);
+        assert_eq!(decoded.site_patching, None);
+
+        // Version 3 adds the site-patching selection (2: off) after the
+        // lengths; its statistics path may be empty.
+        let expected_v3 = b"REVERIE-LI-V3\0\0\0\x0f\0\0\0\x03\0\x02/tmp/raw-\xff.sock\0\xff*";
+        let fd = create_preload_bootstrap(&coordinator, None, Some(false), data).unwrap();
+        let count =
+            unsafe { libc::pread(fd.as_raw_fd(), actual.as_mut_ptr().cast(), actual.len(), 0) };
+        assert_eq!(count, expected_v3.len() as isize);
+        assert_eq!(&actual[..expected_v3.len()], expected_v3);
+        let decoded = read_preload_bootstrap(fd.as_raw_fd()).unwrap().unwrap();
+        assert_eq!(decoded.coordinator, coordinator);
+        assert_eq!(decoded.stats_coordinator, None);
+        assert_eq!(decoded.site_patching, Some(false));
+        assert_eq!(decoded.tool_data, data);
+        let fd = create_preload_bootstrap(&coordinator, Some(Path::new("/s")), Some(true), data)
+            .unwrap();
+        let decoded = read_preload_bootstrap(fd.as_raw_fd()).unwrap().unwrap();
+        assert_eq!(decoded.stats_coordinator.as_deref(), Some(Path::new("/s")));
+        assert_eq!(decoded.site_patching, Some(true));
 
         let unsealed = fixture(expected, false);
         assert!(
@@ -2100,7 +2145,7 @@ mod tests {
             error.to_string(),
             "invalid LiteInst preload bootstrap lengths"
         );
-        let oversized = create_preload_bootstrap(&coordinator, None, &[0; 4096])
+        let oversized = create_preload_bootstrap(&coordinator, None, None, &[0; 4096])
             .err()
             .unwrap();
         assert_eq!(oversized.kind(), io::ErrorKind::InvalidInput);
@@ -2123,7 +2168,7 @@ mod tests {
             ),
         ];
         for (coordinator, tool_data) in &expected {
-            let bootstrap = create_preload_bootstrap(coordinator, None, tool_data).unwrap();
+            let bootstrap = create_preload_bootstrap(coordinator, None, None, tool_data).unwrap();
             std::mem::forget(bootstrap);
         }
         let open = open_test_bootstraps().unwrap();
