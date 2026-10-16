@@ -12,9 +12,16 @@ sh-pipe	ptrace	mismatch	rt_sigreturn=ok -> exit_group=?	https://github.com/rrnew
 grep-passwd	ptrace	mismatch	read=4092 -> read=4018	https://github.com/rrnewton/hermit/issues/4485
 # ptrace: python3's startup makes four fewer calls (rt_sigprocmask, mmap, mmap, rt_sigprocmask); cause not identified.
 python3	ptrace	mismatch	rt_sigprocmask=ok -> getrandom=ok	https://github.com/rrnewton/hermit/issues/4485
-# SaBRe loads one plugin of its own: the runner (reverie-examples/backend.rs) has no generic tool host
-# for it yet.
-*	sabre	refused	*	https://github.com/rrnewton/hermit/issues/4485
+# SaBRe hosts the recorder in experimental/reverie-sabre-strace's example-tool plugin (REVERIE_SABRE_TOOL),
+# its GlobalState in the launcher; the comparator aligns its records after the loader's calls (compare.rs,
+# LATE_START). The plugin's connection to that GlobalState is a socket in the program's descriptor table
+# (descriptor 3), so the program's first open returns 4 where Linux returns 3. sort installs a handler for
+# SIGSTKFLT, which reverie-sabre keeps for its controlled exit (callbacks.rs, CONTROLLED_EXIT_SIGNAL) and
+# refuses with EINVAL.
+*	sabre	mismatch	openat=3 -> openat=4	https://github.com/rrnewton/hermit/issues/4485
+tar-hostname	sabre	mismatch	creat=3 -> creat=4	https://github.com/rrnewton/hermit/issues/4485
+python3	sabre	mismatch	open=3 -> open=4	https://github.com/rrnewton/hermit/issues/4485
+sort-passwd	sabre	mismatch	rt_sigaction=ok -> rt_sigaction=EINVAL	https://github.com/rrnewton/hermit/issues/4485
 # DBT hosts the recorder in reverie-dbt's prototype runtime (REVERIE_DBT_TOOL), its GlobalState in the
 # launcher. The runtime's connection to that GlobalState is a socket in the program's descriptor table,
 # made on first use (reverie-dbt sync_rpc.rs, connect_guest), so the program's first open usually returns

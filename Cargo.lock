@@ -1531,6 +1531,7 @@ dependencies = [
  "reverie-core",
  "reverie-dbt",
  "reverie-e9patch",
+ "reverie-host",
  "reverie-kvm",
  "reverie-liteinst",
  "reverie-ptrace",
@@ -1548,8 +1549,10 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "dirs",
+ "reverie-core",
  "reverie-process",
  "reverie-rpc",
+ "reverie-rpc-transport",
  "serde",
  "tempfile",
  "tokio",

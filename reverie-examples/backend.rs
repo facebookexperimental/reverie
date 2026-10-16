@@ -16,8 +16,10 @@
 //! `libreverie_examples.so` (`src/lib.rs`), selects the tool by the name the
 //! caller passes. DBT's prototype runtime (reverie-dbt) selects a tool it
 //! compiles in by the same name (`reverie_dbt::TOOL_ENV`), and the tool's
-//! GlobalState lives here, served over DBT's coordinator socket. SaBRe has no
-//! generic tool host yet.
+//! GlobalState lives here, served over DBT's coordinator socket. SaBRe's
+//! plugin for the example tools (experimental/reverie-sabre-strace) selects a
+//! tool by the same name, and its GlobalState lives here too
+//! (`reverie_host::run_with_global_state`).
 
 // `#[path]`-included by each example tool's binary; each uses a different
 // subset (a launcher calls `run_blocking`, the recorder `run`), so an item
@@ -32,6 +34,7 @@ use std::os::fd::FromRawFd;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use reverie::ExitStatus;
 use reverie::GlobalTool;
@@ -185,9 +188,12 @@ where
             })?;
             run_dbt::<T>(args, config, preload.tool).await
         }
-        BackendKind::Sabre => Err(RunError::Refused(format!(
-            "the {backend:?} backend loads one plugin of its own and has no generic tool host"
-        ))),
+        BackendKind::Sabre => {
+            let preload = preload.ok_or_else(|| {
+                RunError::Refused("the SaBRe backend hosts a tool only by name".to_owned())
+            })?;
+            run_sabre::<T>(args, config, preload.tool).await
+        }
     }
 }
 
@@ -340,6 +346,66 @@ where
         exit_code: exit_code(status),
         global_state,
         captured: Some((output.stdout, output.stderr)),
+    })
+}
+
+/// The environment variable by which SaBRe's example-tool plugin
+/// (experimental/reverie-sabre-strace) selects the tool it runs.
+const SABRE_TOOL_ENV: &str = "REVERIE_SABRE_TOOL";
+
+/// The file the environment variable `variable` names, or the file `name`
+/// beside this binary.
+fn named_or_beside(variable: &str, name: &str) -> Option<PathBuf> {
+    let path = match std::env::var_os(variable) {
+        Some(path) => PathBuf::from(path),
+        None => std::env::current_exe().ok()?.parent()?.join(name),
+    };
+    path.is_file().then_some(path)
+}
+
+async fn run_sabre<T>(
+    args: &CommonToolArguments,
+    config: <T::GlobalState as GlobalTool>::Config,
+    tool: &str,
+) -> Result<Run<T::GlobalState>, RunError>
+where
+    T: Tool + 'static,
+    T::GlobalState: 'static,
+{
+    let sabre = named_or_beside("SABRE_BINARY", "sabre").ok_or_else(|| {
+        RunError::Refused(
+            "the SaBRe loader was not found: set SABRE_BINARY, or put sabre beside this binary \
+             (`reverie-sabre-strace --print-sabre` names the one reverie-sabre built)"
+                .to_owned(),
+        )
+    })?;
+    let plugin =
+        named_or_beside("SABRE_PLUGIN", "libreverie_sabre_strace_plugin.so").ok_or_else(|| {
+            RunError::Refused(
+                "the SaBRe example-tool plugin was not found: set SABRE_PLUGIN, or build \
+                 reverie-sabre-strace beside this binary"
+                    .to_owned(),
+            )
+        })?;
+    let mut command: reverie::process::Command = args.clone().into();
+    command.env(SABRE_TOOL_ENV, tool);
+    let global = Arc::new(<T::GlobalState as GlobalTool>::init_global_state(&config).await);
+    let status = reverie_host::run_with_global_state(
+        command,
+        Some(sabre),
+        Some(plugin),
+        global.clone(),
+        config,
+    )
+    .await?;
+    let global_state = Arc::try_unwrap(global).map_err(|_| {
+        anyhow::anyhow!("a SaBRe guest process still holds the tool's global state")
+    })?;
+    Ok(Run {
+        status,
+        exit_code: exit_code(status),
+        global_state,
+        captured: None,
     })
 }
 

@@ -104,17 +104,20 @@ impl GlobalTool for Recorded {
     async fn receive_rpc(&self, _from: Pid, event: Event) {
         let mut events = self.events.lock().unwrap();
         // A returning `execve` replaces its pending record, the thread's last.
-        if event.outcome != Outcome::Pending
-            && let Some(pending) = events
-                .iter_mut()
-                .rev()
-                .find(|e| e.tid == event.tid)
-                .filter(|e| e.outcome == Outcome::Pending && e.sysno == event.sysno)
-        {
-            pending.outcome = event.outcome;
-            return;
+        // (No let chain: SaBRe's plugin includes this file in edition 2021.)
+        let pending = (event.outcome != Outcome::Pending)
+            .then(|| {
+                events
+                    .iter_mut()
+                    .rev()
+                    .find(|e| e.tid == event.tid)
+                    .filter(|e| e.outcome == Outcome::Pending && e.sysno == event.sysno)
+            })
+            .flatten();
+        match pending {
+            Some(pending) => pending.outcome = event.outcome,
+            None => events.push(event),
         }
-        events.push(event);
     }
 }
 

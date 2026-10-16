@@ -28,6 +28,9 @@ mod counter2_exact;
 #[path = "../../../reverie-examples/debug.rs"]
 mod debug_exact;
 #[allow(dead_code)]
+#[path = "../../../reverie-examples/recorder_tool.rs"]
+mod recorder_exact;
+#[allow(dead_code)]
 #[path = "../../../reverie-examples/strace_minimal.rs"]
 mod strace_minimal_exact;
 
@@ -51,6 +54,7 @@ use counter1_exact::CounterLocal as ExactCounter1Tool;
 pub(super) use counter2_exact::CounterGlobal as ExactCounter2Global;
 use counter2_exact::CounterLocal as ExactCounter2Tool;
 use debug_exact::DebugTool as ExactDebugTool;
+use recorder_exact::Recorder as ExactRecorderTool;
 use reverie::Error;
 use reverie::GlobalTool;
 use reverie::Guest;
@@ -145,6 +149,9 @@ pub(super) enum ToolKind {
     Counter2Exact,
     /// Forward syscalls without tool-specific work.
     Noop,
+    /// Record every syscall's result in the launcher's GlobalState
+    /// (reverie-examples/recorder_tool.rs); needs the launcher's coordinator.
+    Recorder,
 }
 
 impl ToolKind {
@@ -174,6 +181,7 @@ impl ToolKind {
             Some(value) if value == "counter2" => Self::Counter2,
             Some(value) if value == "counter2-exact" => Self::Counter2Exact,
             Some(value) if value == "noop" => Self::Noop,
+            Some(value) if value == "recorder" => Self::Recorder,
             Some(value) if value == "strace" => Self::Strace,
             Some(value) if value == "strace-minimal" => Self::StraceMinimal,
             None => Self::Strace,
@@ -383,6 +391,7 @@ pub(crate) enum SharedAdapter {
     Counter2ExactLocal(ReverieAdapter<ExactCounter2Tool>),
     Counter2ExactRemote(RemoteReverieAdapter<ExactCounter2Tool>),
     Noop(ReverieAdapter<NoopTool>),
+    Recorder(RemoteReverieAdapter<ExactRecorderTool>),
 }
 
 impl SharedAdapter {
@@ -473,6 +482,22 @@ impl SharedAdapter {
                 },
             ),
             ToolKind::Noop => Self::Noop(ReverieAdapter::new(NoopTool, (), ())),
+            // The record is the launcher's GlobalState; a process-local copy
+            // would be lost, so there is no fallback.
+            ToolKind::Recorder => match coordinator_socket() {
+                None => refuse(format_args!(
+                    "the recorder keeps its record in the launcher, and {COUNTER_RPC_SOCKET_ENV} \
+                     names no coordinator"
+                )),
+                Some(path) => match RemoteReverieAdapter::connect(&path) {
+                    Ok(adapter) => Self::Recorder(adapter),
+                    Err(error) => refuse(format_args!(
+                        "the recorder keeps its record in the launcher, and its coordinator {} \
+                         is unavailable ({error})",
+                        path.display()
+                    )),
+                },
+            },
         }
     }
 
@@ -520,6 +545,7 @@ impl SharedAdapter {
             Self::Counter2ExactLocal(adapter) => adapter.handle_syscall(syscall),
             Self::Counter2ExactRemote(adapter) => adapter.handle_syscall(syscall),
             Self::Noop(adapter) => adapter.handle_syscall(syscall),
+            Self::Recorder(adapter) => adapter.handle_syscall(syscall),
         }
     }
 
@@ -558,6 +584,7 @@ impl SharedAdapter {
                 adapter.handle_syscall_with_inject(syscall, inject)
             }
             Self::Noop(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
+            Self::Recorder(adapter) => adapter.handle_syscall_with_inject(syscall, inject),
         }
     }
 
@@ -581,6 +608,7 @@ impl SharedAdapter {
             Self::Counter2ExactLocal(adapter) => adapter.handle_thread_start(thread_id),
             Self::Counter2ExactRemote(adapter) => adapter.handle_thread_start(thread_id),
             Self::Noop(adapter) => adapter.handle_thread_start(thread_id),
+            Self::Recorder(adapter) => adapter.handle_thread_start(thread_id),
         }
     }
 
@@ -607,6 +635,7 @@ impl SharedAdapter {
             Self::Counter2ExactLocal(adapter) => adapter.handle_thread_exit(thread_id),
             Self::Counter2ExactRemote(adapter) => adapter.handle_thread_exit(thread_id),
             Self::Noop(adapter) => adapter.handle_thread_exit(thread_id),
+            Self::Recorder(adapter) => adapter.handle_thread_exit(thread_id),
         }
     }
 
@@ -630,6 +659,7 @@ impl SharedAdapter {
             Self::Counter2ExactLocal(adapter) => adapter.handle_post_exec(),
             Self::Counter2ExactRemote(adapter) => adapter.handle_post_exec(),
             Self::Noop(adapter) => adapter.handle_post_exec(),
+            Self::Recorder(adapter) => adapter.handle_post_exec(),
         }
     }
 
@@ -648,6 +678,13 @@ where
 {
     let tool = T::new(Pid::from_raw(unsafe { libc::getpid() }), &config);
     ReverieAdapter::new(tool, T::GlobalState::default(), config)
+}
+
+/// End this guest process before it runs: the selected tool cannot run here.
+fn refuse(reason: std::fmt::Arguments<'_>) -> ! {
+    nostd_print::eprintln!("reverie-sabre: REFUSED: {reason}");
+    // SAFETY: ends the process; nothing of the guest has run yet.
+    unsafe { libc::_exit(127) }
 }
 
 fn coordinator_fallback(tool: &str, path: &std::path::Path, error: &impl std::fmt::Display) {
@@ -688,6 +725,7 @@ mod tests {
             ("counter1", ToolKind::Counter1),
             ("counter2", ToolKind::Counter2),
             ("noop", ToolKind::Noop),
+            ("recorder", ToolKind::Recorder),
         ] {
             assert_eq!(
                 ToolKind::remember(&OnceLock::new(), Some(OsStr::new(name))),

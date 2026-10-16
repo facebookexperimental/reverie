@@ -113,10 +113,11 @@ fn first_difference(native: &Record, backend: &Record) -> Option<String> {
 
 /// The backends whose tool starts after the program does: the in-guest
 /// backends at their preload's constructor, after the dynamic loader's calls,
-/// and DBT after the `execve` that starts the program, which runs before
-/// DynamoRIO takes over. They cannot see those calls, at the start and again
-/// after each successful `execve`.
-const LATE_START: &[&str] = &["liteinst", "in-guest-trap", "e9patch", "dbt"];
+/// SaBRe once its loader has loaded the program and the plugin, and DBT after
+/// the `execve` that starts the program, which runs before DynamoRIO takes
+/// over. They cannot see those calls, at the start and again after each
+/// successful `execve`.
+const LATE_START: &[&str] = &["liteinst", "in-guest-trap", "e9patch", "dbt", "sabre"];
 
 /// How many calls, by name, place a late-starting backend's record in the
 /// native one.
