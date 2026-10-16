@@ -59,51 +59,6 @@ rust_library(
     ],
 )
 
-# The loader is a separate freestanding executable, not a linked C library.
-# Cargo's build.rs performs this same compile for the public workspace.
-fb_native.genrule(
-    name = "reverie-elf-loader-template",
-    srcs = [
-        "reverie-elf-loader/loader/entry.S",
-        "reverie-elf-loader/loader/loader.c",
-        "reverie-elf-loader/loader/loader.ld",
-    ],
-    out = "loader.elf",
-    cmd = "cc -std=c11 -O2 -Wall -Wextra -Werror -ffreestanding -nostdlib -static -fno-pie -no-pie -fno-stack-protector -fno-builtin -fno-asynchronous-unwind-tables -fno-unwind-tables -Wl,--build-id=none -Wl,-T,\"$SRCDIR/reverie-elf-loader/loader/loader.ld\" \"$SRCDIR/reverie-elf-loader/loader/loader.c\" \"$SRCDIR/reverie-elf-loader/loader/entry.S\" -o \"$OUT\"",
-)
-
-fb_native.genrule(
-    name = "reverie-elf-loader-stack-guard-control",
-    srcs = ["reverie-elf-loader/loader/loader.c"],
-    out = "stack-guard-control",
-    cmd = "cc -std=c11 -O2 -Wall -Wextra -Werror -fno-builtin -fno-pie -no-pie -DLOADER_STACK_GUARD_CONTROL \"$SRCDIR/reverie-elf-loader/loader/loader.c\" -o \"$OUT\"",
-)
-
-rust_library(
-    name = "reverie-elf-loader",
-    srcs = glob(["reverie-elf-loader/src/**/*.rs"]),
-    env = {
-        "ELF_LOADER_TEMPLATE": "$(location :reverie-elf-loader-template)",
-    },
-    test_env = {
-        # The macro's test_env replaces env rather than extending it.
-        "ELF_LOADER_TEMPLATE": "$(location :reverie-elf-loader-template)",
-        "ELF_LOADER_STACK_GUARD_CONTROL": "$(location :reverie-elf-loader-stack-guard-control)",
-    },
-    autocargo = {
-        "cargo_toml_config": {
-            "package": dict(_PUBLIC_CRATE_METADATA, documentation = "https://docs.rs/reverie-elf-loader", build = "build.rs", description = "Standalone, unwired x86-64 Linux ELF start preparation and freestanding loader"),
-        },
-        "cargo_toml_dir": "reverie-elf-loader",
-    },
-    test_deps = [
-        "fbsource//third-party/rust:sha2",
-    ],
-    deps = [
-        "fbsource//third-party/rust:libc",
-    ],
-)
-
 # NOTE: This crate should not depend on any other Reverie crate. It should
 # remain a generic way of spawning processes.
 rust_library(
