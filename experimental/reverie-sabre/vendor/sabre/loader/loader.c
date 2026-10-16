@@ -12,6 +12,7 @@
 #ifdef __x86_64__
 #include <asm/processor-flags.h>
 #endif
+#include <dirent.h>
 #include <dlfcn.h>
 #include <err.h>
 #include <fcntl.h>
@@ -305,13 +306,126 @@ static int parse_shebang(const char *client_path,
   return 1;
 }
 
+/* A launch specification: how a launcher runs a client under SaBRe without
+ * putting SaBRe on the client's command line or in its environment. The
+ * kernel then builds the client's initial stack, /proc/self/cmdline and
+ * /proc/self/environ from the client's own argv and environment, as for an
+ * exec of the client itself.
+ *
+ * The launcher passes an inherited, sealed memfd holding SBR_LAUNCH_MAGIC
+ * followed by NUL-terminated strings: the plugin path, the client path, then
+ * any number of NAME=VALUE settings, ended by an empty string. The client
+ * path names an ELF image: the launcher resolves a script's interpreter
+ * first, as the kernel would, and passes the argv the kernel would give it.
+ * The settings go to the plugin as its arguments after its path: SaBRe
+ * loads the plugin into the client's own libc, so SaBRe's environment would
+ * not reach it, and the client's would reach the guest.
+ */
+#define SBR_LAUNCH_MAGIC "SABRE-LAUNCH-V1"
+#define SBR_LAUNCH_MAX_BYTES (64 * 1024)
+
+struct launch_spec {
+  char *bytes;
+  const char *plugin;
+  const char *client;
+  char **settings; /* NULL-terminated */
+  int setting_count;
+};
+
+static bool read_launch_spec(struct launch_spec *spec) {
+  DIR *directory = opendir("/proc/self/fd");
+  if (directory == NULL)
+    err(EXIT_FAILURE, "cannot list descriptors for a launch specification");
+  int found = -1;
+  struct dirent *entry;
+  while ((entry = readdir(directory)) != NULL) {
+    char *end = NULL;
+    long fd = strtol(entry->d_name, &end, 10);
+    if (end == entry->d_name || *end != '\0' || fd <= STDERR_FILENO ||
+        fd == dirfd(directory))
+      continue;
+    char magic[sizeof(SBR_LAUNCH_MAGIC)];
+    struct stat metadata;
+    if (fstat((int)fd, &metadata) != 0 || !S_ISREG(metadata.st_mode) ||
+        pread((int)fd, magic, sizeof(magic), 0) != (ssize_t)sizeof(magic) ||
+        memcmp(magic, SBR_LAUNCH_MAGIC, sizeof(magic)) != 0)
+      continue;
+    if (found >= 0)
+      errx(EXIT_FAILURE, "more than one launch specification");
+    found = (int)fd;
+  }
+  closedir(directory);
+  if (found < 0)
+    return false;
+
+  int seals = fcntl(found, F_GET_SEALS);
+  struct stat metadata;
+  if (seals < 0 ||
+      (seals & (F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW)) !=
+          (F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW) ||
+      fstat(found, &metadata) != 0 || metadata.st_size <= 0 ||
+      metadata.st_size > SBR_LAUNCH_MAX_BYTES)
+    errx(EXIT_FAILURE, "launch specification is not a sealed, bounded file");
+  size_t size = (size_t)metadata.st_size;
+  char *bytes = malloc(size + 1);
+  if (bytes == NULL || pread(found, bytes, size, 0) != (ssize_t)size)
+    errx(EXIT_FAILURE, "cannot read the launch specification");
+  close(found);
+  bytes[size] = '\0';
+
+  /* Walk the strings after the magic; every one must end inside the file. */
+  size_t at = sizeof(SBR_LAUNCH_MAGIC);
+  const char *strings[2] = {NULL, NULL};
+  /* Each setting takes at least two bytes, so this bounds their number. */
+  char **settings = calloc(size / 2 + 1, sizeof(*settings));
+  if (settings == NULL)
+    err(EXIT_FAILURE, "cannot allocate launch specification settings");
+  int setting_count = 0;
+  for (int index = 0;; ++index) {
+    if (at >= size)
+      errx(EXIT_FAILURE, "launch specification is truncated");
+    const char *value = bytes + at;
+    size_t length = strnlen(value, size - at);
+    if (at + length >= size)
+      errx(EXIT_FAILURE, "launch specification string is unterminated");
+    at += length + 1;
+    if (index < 2) {
+      if (length == 0)
+        errx(EXIT_FAILURE, "launch specification lacks a plugin or client");
+      strings[index] = value;
+      continue;
+    }
+    if (length == 0)
+      break;
+    if (strchr(value, '=') == NULL || value[0] == '=')
+      errx(EXIT_FAILURE, "launch specification setting is not NAME=VALUE");
+    if (strncmp(value, SBR_BOOTSTRAP_ENV "=", sizeof(SBR_BOOTSTRAP_ENV)) == 0) {
+      sbr_bootstrap_option_from_launch(value + sizeof(SBR_BOOTSTRAP_ENV));
+      continue;
+    }
+    settings[setting_count++] = (char *)value;
+  }
+  if (at != size)
+    errx(EXIT_FAILURE, "launch specification has trailing bytes");
+  spec->bytes = bytes;
+  spec->plugin = strings[0];
+  spec->client = strings[1];
+  spec->settings = settings;
+  spec->setting_count = setting_count;
+  return true;
+}
+
 // Returns the address of entry point and also populates a pointer
 // for the top of the new stack
 void load(int argc, char *argv[], void **new_entry, void **new_stack_top) {
-  sbr_bootstrap_configure();
+  /* The bytes stay allocated: the plugin's arguments point into them. */
+  static struct launch_spec launch;
+  bool launched = read_launch_spec(&launch);
+  if (!launched)
+    sbr_bootstrap_configure();
   int process_argc = argc;
   char **process_argv = argv;
-  if (argc < 4) {
+  if (!launched && argc < 4) {
     print_usage();
     exit(EXIT_FAILURE);
   }
@@ -360,57 +474,83 @@ void load(int argc, char *argv[], void **new_entry, void **new_stack_top) {
     }
   }
 
-  char *rv = realpath(argv[0], abs_sabre_path);
-  assert(rv != NULL);
+  const char *client_path;
+  char *rv;
+  if (launched) {
+    /* The client's own argv, untouched: the kernel exec'd SaBRe with it. */
+    rv = realpath("/proc/self/exe", abs_sabre_path);
+    assert(rv != NULL);
+    if (access(launch.plugin, F_OK) == -1)
+      errx(EXIT_FAILURE, "Failed to find plugin file at: %s.", launch.plugin);
+    rv = realpath(launch.plugin, abs_plugin_path);
+    assert(rv != NULL);
+    client_path = launch.client;
+    setup_sbr_premain(&register_function_intercepts);
+    plugin_argc = 1 + launch.setting_count;
+    plugin_argv = (char **)malloc(sizeof(char *) * (plugin_argc + 1));
+    plugin_argv[0] = abs_plugin_path;
+    memcpy(plugin_argv + 1, launch.settings,
+           sizeof(char *) * (launch.setting_count + 1));
+    static char unused_path[BINPRM_BUF_SIZE];
+    static char unused_arg[BINPRM_BUF_SIZE];
+    if (parse_shebang(client_path, unused_path, unused_arg) > 0)
+      errx(EXIT_FAILURE,
+           "launch specification client %s is a script; the launcher resolves "
+           "its interpreter",
+           client_path);
+  } else {
+    rv = realpath(argv[0], abs_sabre_path);
+    assert(rv != NULL);
 
-  // Drop irrelevant args before passing them to the init
-  --argc;
-  ++argv;
+    // Drop irrelevant args before passing them to the init
+    --argc;
+    ++argv;
 
-  // Get the absolute path of the plugin so we can add it as DT_NEEDED
-  // dependency in the client's elf file.
-  if (access(argv[0], F_OK) == -1) {
-    errx(EXIT_FAILURE, "Failed to find plugin file at: %s.", argv[0]);
-  }
-  rv = realpath(argv[0], abs_plugin_path);
-  assert(rv != NULL);
+    // Get the absolute path of the plugin so we can add it as DT_NEEDED
+    // dependency in the client's elf file.
+    if (access(argv[0], F_OK) == -1) {
+      errx(EXIT_FAILURE, "Failed to find plugin file at: %s.", argv[0]);
+    }
+    rv = realpath(argv[0], abs_plugin_path);
+    assert(rv != NULL);
 
-  // Find client's path. It should be right after `--`.
-  size_t client_path_idx = find_client_path_idx(argv);
-  const char *client_path = argv[client_path_idx];
+    // Find client's path. It should be right after `--`.
+    size_t client_path_idx = find_client_path_idx(argv);
+    client_path = argv[client_path_idx];
 
-  setup_sbr_premain(&register_function_intercepts);
+    setup_sbr_premain(&register_function_intercepts);
 
-  // Separate client and plugin arguments.
-  plugin_argc = client_path_idx - 1;
-  char *client_separator = argv[plugin_argc];
-  argv[plugin_argc] = NULL;
-  plugin_argv = (char **)malloc(sizeof(char *) * (plugin_argc + 1));
-  memcpy(plugin_argv, argv, sizeof(char *) * (plugin_argc + 1));
-  argv[plugin_argc] = client_separator;
+    // Separate client and plugin arguments.
+    plugin_argc = client_path_idx - 1;
+    char *client_separator = argv[plugin_argc];
+    argv[plugin_argc] = NULL;
+    plugin_argv = (char **)malloc(sizeof(char *) * (plugin_argc + 1));
+    memcpy(plugin_argv, argv, sizeof(char *) * (plugin_argc + 1));
+    argv[plugin_argc] = client_separator;
 
-  // Skip plugin arguments
-  argv += client_path_idx;
-  argc -= client_path_idx;
+    // Skip plugin arguments
+    argv += client_path_idx;
+    argc -= client_path_idx;
 
-  // Check if our client_path is a script with a shebang line, and if yes, parse
-  // it.
-  // We need these vars static as we will return from this function.
-  static char shebang_path[BINPRM_BUF_SIZE];
-  static char shebang_arg[BINPRM_BUF_SIZE];
-  int shebang_tokens_found =
-      parse_shebang(client_path, shebang_path, shebang_arg);
+    // Check if our client_path is a script with a shebang line, and if yes, parse
+    // it.
+    // We need these vars static as we will return from this function.
+    static char shebang_path[BINPRM_BUF_SIZE];
+    static char shebang_arg[BINPRM_BUF_SIZE];
+    int shebang_tokens_found =
+        parse_shebang(client_path, shebang_path, shebang_arg);
 
-  if (shebang_tokens_found > 0) {
-    // Let's use the plugin slots on argv, as we don't need them anymore.
-    argv -= shebang_tokens_found;
-    argc += shebang_tokens_found;
+    if (shebang_tokens_found > 0) {
+      // Let's use the plugin slots on argv, as we don't need them anymore.
+      argv -= shebang_tokens_found;
+      argc += shebang_tokens_found;
 
-    argv[0] = shebang_path;
-    client_path = shebang_path;
+      argv[0] = shebang_path;
+      client_path = shebang_path;
 
-    if (shebang_tokens_found == 2)
-      argv[1] = shebang_arg;
+      if (shebang_tokens_found == 2)
+        argv[1] = shebang_arg;
+    }
   }
 
   // Mask out loader and plugin
@@ -457,7 +597,28 @@ void load(int argc, char *argv[], void **new_entry, void **new_stack_top) {
       errx(EXIT_FAILURE, "loader bootstrap does not support static images");
 #ifdef __x86_64__
     if (first_region(abs_plugin_path) == 0)
+    {
+      if (launched) {
+        /* A static client restarts SaBRe under the dynamic linker in the
+         * legacy form (`plugin settings -- client args`), which carries SaBRe
+         * and the settings on its command line as before.
+         */
+        int count = launch.setting_count;
+        char **legacy = calloc((size_t)argc + (size_t)count + 4,
+                               sizeof(*legacy));
+        if (legacy == NULL)
+          err(EXIT_FAILURE, "Failed to allocate static client arguments");
+        legacy[0] = abs_sabre_path;
+        legacy[1] = abs_plugin_path;
+        memcpy(legacy + 2, launch.settings, sizeof(char *) * (size_t)count);
+        legacy[count + 2] = "--";
+        legacy[count + 3] = (char *)client_path;
+        for (int i = 1; i < argc; ++i)
+          legacy[count + i + 3] = argv[i];
+        reexec_static_client_with_plugin(argc + count + 3, legacy);
+      }
       reexec_static_client_with_plugin(process_argc, process_argv);
+    }
 #else
     errx(EXIT_FAILURE, "Static clients are unsupported on this architecture");
 #endif

@@ -189,7 +189,7 @@ const KCMP_FILES: libc::c_int = 2;
 
 /// The adopted socket's number and the identity the coordinator passed for it.
 fn adopt() -> Option<(RawFd, (u64, u64))> {
-    std::env::var_os(TOOL_OUTPUT_ENV)?;
+    paths::private_env(TOOL_OUTPUT_ENV)?;
     REQUESTED.store(true, SeqCst);
     paths::cache_tool_env();
     // SAFETY: plugin initialization runs before guest threads exist.

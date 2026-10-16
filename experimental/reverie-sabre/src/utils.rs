@@ -111,16 +111,20 @@ fn collect_exec_arguments(
 
 /// Re-enter SaBRe around a new guest image so the plugin remains active.
 ///
-/// SaBRe expects `sabre plugin.so -- program args...`. The kernel still reads
-/// the guest's strings and environment directly, while `process_vm_readv`
-/// safely copies only the argv pointer list needed to prepend the loader.
+/// SaBRe runs with the new image's own argv and environment, untouched, so the
+/// kernel builds that image's initial stack, `/proc/self/cmdline` and
+/// `/proc/self/environ` as for an exec of the image itself. The plugin and
+/// image paths and the plugin's settings travel in a sealed launch
+/// specification ([`crate::launch`]) that the loader reads and closes; a
+/// script is resolved to its interpreter here, with the argv the kernel would
+/// give it. `process_vm_readv` safely copies only the argv and envp pointer
+/// lists; the kernel reads the strings themselves.
 pub fn sys_execve(
     filename: *const libc::c_char,
     argv: *const *const libc::c_char,
     envp: *const *const libc::c_char,
 ) -> Result<usize, Errno> {
-    // Ask the kernel to validate the pathname before constructing SaBRe's
-    // argv. This also prevents a null filename from truncating the new list.
+    // Ask the kernel to validate the pathname before reading it.
     unsafe { syscall!(Sysno::access, filename as usize, libc::F_OK as usize)? };
 
     // SaBRe is the kernel-visible executable, so a native exec of
@@ -131,14 +135,12 @@ pub fn sys_execve(
 
     let arguments = collect_exec_arguments(argv)?;
     let environment = collect_exec_arguments(envp)?;
-    let sabre = paths::sabre_path().as_ptr();
-    let mut new_argv = Vec::with_capacity(arguments.len() + 5);
-    new_argv.push(sabre);
-    new_argv.push(paths::plugin_path().as_ptr());
-    new_argv.push(c"--".as_ptr());
-    new_argv.push(filename.as_ptr());
-    new_argv.extend(arguments.into_iter().skip(1));
-    new_argv.push(core::ptr::null());
+    let arguments: Vec<&CStr> = arguments
+        .iter()
+        .map(|argument| unsafe { CStr::from_ptr(*argument) })
+        .collect();
+    let (image, new_argv) =
+        crate::launch::resolve_script(filename, &arguments, &read_first_bytes(filename));
 
     // Preserve reserved tool settings even when the guest deliberately
     // supplies an empty environment. Individual tools consume their own
@@ -148,25 +150,56 @@ pub fn sys_execve(
     let tool_environment = paths::tool_env();
     let tool_output = crate::tool_output::exec_env_entry();
     let tool_output_prefix = format!("{}=", crate::tool_output::TOOL_OUTPUT_ENV);
-    let mut new_env = Vec::with_capacity(environment.len() + tool_environment.len() + 2);
-    new_env.extend(
-        tool_environment
-            .iter()
-            .filter(|entry| !entry.to_bytes().starts_with(tool_output_prefix.as_bytes()))
-            .map(|entry| entry.as_ptr()),
-    );
-    new_env.extend(tool_output.as_ref().map(|entry| entry.as_ptr()));
-    new_env.extend(environment);
-    new_env.push(core::ptr::null());
+    let mut settings: Vec<&[u8]> = tool_environment
+        .iter()
+        .map(|entry| entry.to_bytes())
+        .filter(|entry| !entry.starts_with(tool_output_prefix.as_bytes()))
+        .collect();
+    settings.extend(tool_output.as_ref().map(|entry| entry.to_bytes()));
+    let spec =
+        crate::launch::spec_bytes(paths::plugin_path().to_bytes(), image.to_bytes(), &settings)
+            .ok_or(Errno::E2BIG)?;
+    let spec = crate::launch::spec_fd(&spec)
+        .map_err(|error| Errno::new(error.raw_os_error().unwrap_or(libc::EIO)))?;
 
-    unsafe {
+    let mut argv_pointers: Vec<*const libc::c_char> =
+        new_argv.iter().map(|argument| argument.as_ptr()).collect();
+    argv_pointers.push(core::ptr::null());
+    let mut envp_pointers = environment;
+    envp_pointers.push(core::ptr::null());
+
+    let sabre = paths::sabre_path().as_ptr();
+    let result = unsafe {
         syscall3(
             Sysno::execve,
             sabre as usize,
-            new_argv.as_ptr() as usize,
-            new_env.as_ptr() as usize,
+            argv_pointers.as_ptr() as usize,
+            envp_pointers.as_ptr() as usize,
         )
-    }
+    };
+    // Only a failed exec returns; the specification is the old image's to close.
+    drop(spec);
+    result
+}
+
+/// The first bytes of the file at `path`, enough for its `#!` line; empty when
+/// it cannot be read, which leaves the loader to report the image.
+fn read_first_bytes(path: &CStr) -> Vec<u8> {
+    let Ok(fd) = (unsafe {
+        syscall!(
+            Sysno::openat,
+            libc::AT_FDCWD as usize,
+            path.as_ptr() as usize,
+            (libc::O_RDONLY | libc::O_CLOEXEC) as usize
+        )
+    }) else {
+        return Vec::new();
+    };
+    let mut bytes = vec![0u8; 256];
+    let read = unsafe { syscall!(Sysno::read, fd, bytes.as_mut_ptr() as usize, bytes.len()) };
+    let _ = unsafe { syscall!(Sysno::close, fd) };
+    bytes.truncate(read.unwrap_or(0));
+    bytes
 }
 
 /// `execveat(2)` under SaBRe.

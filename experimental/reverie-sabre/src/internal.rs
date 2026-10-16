@@ -68,6 +68,13 @@ pub fn sbr_init<T: ToolGlobal>(
         // setup can call an intercepted libc function.
         register_detours::<T>(fn_icept_reg);
 
+        // The plugin path is the first argument; settings from a launch
+        // specification follow it, and stats reads one of them.
+        paths::set_plugin_path(**argv);
+        *argc -= 1;
+        *argv = (*argv).wrapping_add(1);
+        paths::take_launch_settings(argc, argv);
+
         stats::init_guest_stats();
         *vdso_callback = Some(callbacks::handle_vdso::<T>);
         *syscall_handler = Some(callbacks::handle_syscall::<T>);
@@ -77,13 +84,7 @@ pub fn sbr_init<T: ToolGlobal>(
         paths::set_sabre_path(sabre_path);
         paths::set_client_path(client_path);
 
-        // The plugin path is the first argument.
-        paths::set_plugin_path(**argv);
-
         signal::register_central_handler::<T>();
-
-        *argc -= 1;
-        *argv = (*argv).wrapping_add(1);
     }
 }
 

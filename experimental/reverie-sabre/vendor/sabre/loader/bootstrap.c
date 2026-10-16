@@ -15,6 +15,17 @@ static bool requested;
 static bool image_bound;
 static bool state_taken;
 static bool continuation_enabled;
+static bool option_on_stack = true;
+
+void sbr_bootstrap_option_from_launch(const char *value) {
+  if (strcmp(value, "1") != 0)
+    errx(EXIT_FAILURE, "invalid " SBR_BOOTSTRAP_ENV);
+#ifndef __x86_64__
+  errx(EXIT_FAILURE, "loader bootstrap requires x86-64");
+#endif
+  option_on_stack = false;
+  requested = true;
+}
 
 /* A protocol violation is not an errno that guest libc may ignore or handle
  * by trying another path. This can run before client TLS and libc
@@ -115,6 +126,8 @@ void sbr_bootstrap_image(void *stack, void *entry) {
    * the original string too: the kernel's raw /proc/self/environ range still
    * contains it after the pointer array has been compacted.
    */
+  if (!option_on_stack)
+    goto request;
   uintptr_t *words = stack;
   uintptr_t *env = words + 1 + words[0] + 1;
   uintptr_t *option = NULL;
@@ -137,6 +150,7 @@ void sbr_bootstrap_image(void *stack, void *entry) {
   memset((char *)*option, 0, strlen((char *)*option));
   memmove(option, option + 1, (char *)end - (char *)(option + 1));
 
+request:;
   long result =
       sbr_bootstrap_request_v1(SBR_BOOTSTRAP_IMAGE, (unsigned long)stack,
                                (unsigned long)entry, SBR_BOOTSTRAP_VERSION, 0);

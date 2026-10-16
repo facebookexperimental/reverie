@@ -8,6 +8,8 @@
 
 //! Typed SaBRe patch-shape and slow-path statistics.
 
+pub mod launch;
+
 use std::fmt;
 use std::io;
 use std::mem::size_of;

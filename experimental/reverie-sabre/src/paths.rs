@@ -8,9 +8,11 @@
 
 use std::ffi::CStr;
 use std::ffi::CString;
+use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt;
 use std::ptr;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 
 /// Path to the sabre executable. Needed for intercepting syscalls after execve.
@@ -24,6 +26,11 @@ static mut CLIENT_PATH: *const libc::c_char = core::ptr::null();
 
 /// Private tool settings preserved across loader-mediated execve.
 static TOOL_ENV: OnceLock<Vec<CString>> = OnceLock::new();
+
+/// Private tool settings the loader passed as plugin arguments, `NAME=VALUE`
+/// after the plugin path, from a launch specification. They are read before the
+/// environment and never enter it, so the guest cannot see them.
+static LAUNCH_SETTINGS: Mutex<Vec<(OsString, OsString)>> = Mutex::new(Vec::new());
 
 unsafe extern "C" {
     static mut environ: *mut *mut libc::c_char;
@@ -50,6 +57,45 @@ pub(super) unsafe fn set_client_path(path: *const libc::c_char) {
     CLIENT_PATH = path;
 }
 
+/// Consumes the leading `REVERIE_SABRE_*=VALUE` plugin arguments, the settings
+/// the loader passed from a launch specification.
+///
+/// # Safety
+/// `argc` and `argv` must be the loader's plugin argument count and vector,
+/// after the plugin path; call this only during plugin initialization.
+pub(super) unsafe fn take_launch_settings(argc: *mut i32, argv: *mut *mut *mut libc::c_char) {
+    let mut settings = LAUNCH_SETTINGS.lock().unwrap();
+    while unsafe { *argc } > 0 {
+        let argument = unsafe { CStr::from_ptr(**argv) }.to_bytes();
+        let Some(separator) = argument.iter().position(|byte| *byte == b'=') else {
+            break;
+        };
+        if !argument.starts_with(b"REVERIE_SABRE_") {
+            break;
+        }
+        let (key, value) = (&argument[..separator], &argument[separator + 1..]);
+        settings.push((
+            OsStr::from_bytes(key).to_os_string(),
+            OsStr::from_bytes(value).to_os_string(),
+        ));
+        unsafe {
+            *argc -= 1;
+            *argv = (*argv).wrapping_add(1);
+        }
+    }
+}
+
+/// Reads a private setting without consuming it: the launch specification's
+/// value, or else the environment's.
+pub(super) fn private_env(key: &str) -> Option<OsString> {
+    let settings = LAUNCH_SETTINGS.lock().unwrap();
+    settings
+        .iter()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value.clone())
+        .or_else(|| std::env::var_os(key))
+}
+
 /// Takes a reserved private setting and erases its original environment bytes.
 ///
 /// Removing an entry from libc's environment does not remove the bytes exposed by
@@ -65,7 +111,16 @@ pub unsafe fn take_private_env(key: &str) -> Option<OsString> {
         key.as_bytes().starts_with(b"REVERIE_SABRE_"),
         "private SaBRe settings must use the REVERIE_SABRE_ namespace"
     );
-    let value = std::env::var_os(key)?;
+    let launched = {
+        let mut settings = LAUNCH_SETTINGS.lock().unwrap();
+        settings
+            .iter()
+            .position(|(name, _)| name == key)
+            .map(|index| settings.remove(index).1)
+    };
+    let Some(value) = std::env::var_os(key) else {
+        return launched;
+    };
     let mut prefix = key.as_bytes().to_vec();
     prefix.push(b'=');
 
@@ -92,14 +147,21 @@ pub unsafe fn take_private_env(key: &str) -> Option<OsString> {
         }
     }
 
-    Some(value)
+    Some(launched.unwrap_or(value))
 }
 
 /// Cache reserved tool settings before a guest can replace its environment.
 pub(super) fn cache_tool_env() {
     TOOL_ENV.get_or_init(|| {
-        std::env::vars_os()
-            .filter(|(key, _)| key.as_os_str().as_bytes().starts_with(b"REVERIE_SABRE_"))
+        let launched = LAUNCH_SETTINGS.lock().unwrap().clone();
+        let inherited = std::env::vars_os().filter(|(key, _)| {
+            key.as_os_str().as_bytes().starts_with(b"REVERIE_SABRE_")
+                && !launched.iter().any(|(name, _)| name == key)
+        });
+        launched
+            .iter()
+            .cloned()
+            .chain(inherited)
             .map(|(key, value)| {
                 let mut entry = key.as_os_str().as_bytes().to_vec();
                 entry.push(b'=');
@@ -172,5 +234,34 @@ mod tests {
                 .any(|window| window == secret.as_bytes()),
             "private setting remained visible in /proc/self/environ"
         );
+    }
+
+    #[test]
+    fn launch_settings_reach_the_plugin_and_not_the_environment() {
+        const KEY: &str = "REVERIE_SABRE_TEST_LAUNCH_SETTING";
+        let arguments = [
+            CString::new(format!("{KEY}=launched")).unwrap(),
+            CString::new("--plugin-option").unwrap(),
+        ];
+        let mut pointers: Vec<*mut libc::c_char> = arguments
+            .iter()
+            .map(|argument| argument.as_ptr().cast_mut())
+            .collect();
+        pointers.push(ptr::null_mut());
+        let mut argc = 2;
+        let mut argv = pointers.as_mut_ptr();
+
+        unsafe { take_launch_settings(&mut argc, &mut argv) };
+
+        // Only the setting is consumed; a plugin's own option stays.
+        assert_eq!(argc, 1);
+        assert_eq!(unsafe { CStr::from_ptr(*argv) }, c"--plugin-option");
+        assert!(std::env::var_os(KEY).is_none());
+        assert_eq!(private_env(KEY).as_deref(), Some(OsStr::new("launched")));
+        assert_eq!(
+            unsafe { take_private_env(KEY) }.as_deref(),
+            Some(OsStr::new("launched"))
+        );
+        assert_eq!(private_env(KEY), None);
     }
 }

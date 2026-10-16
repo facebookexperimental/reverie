@@ -51,6 +51,11 @@ typedef long (*sbr_bootstrap_take_fn)(void *, size_t);
 typedef int (*sbr_bootstrap_install_fn)(sbr_bootstrap_take_fn);
 
 void sbr_bootstrap_configure(void);
+/* The bootstrap option arrived in a launch specification rather than in the
+ * initial environment, so there is no stack entry to consume. VALUE is the
+ * option's value, which must be "1" as in the environment. It is not put in
+ * SaBRe's environment, where the plugin would carry it into exec'd images. */
+void sbr_bootstrap_option_from_launch(const char *value);
 bool sbr_bootstrap_enabled(void);
 void sbr_bootstrap_image(void *stack, void *entry);
 long sbr_bootstrap_getrandom(long buffer, long length, long flags,

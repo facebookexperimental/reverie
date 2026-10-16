@@ -14,6 +14,7 @@ mod callbacks;
 pub mod ffi;
 #[doc(hidden)]
 pub mod internal;
+pub use reverie_sabre_stats::launch;
 mod paths;
 mod protected_files;
 mod reverie_adapter;
