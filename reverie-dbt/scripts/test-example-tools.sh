@@ -167,54 +167,35 @@ grep -q '^fork-pthread-race=64$' "$tmpdir/out" \
   || fail "noop: pthread consumed a concurrent process-clone identity"
 echo "PASS: process-clone identity handoff excludes concurrent pthreads"
 
-# Copied children (forked processes) run no Rust Tool, so the native virtual
-# clock / virtual resource policy is their only determinism layer. Exercise
-# libc's patched-vDSO path repeatedly in the parent, a forked child, an execed
-# child (new client image + vDSO module load), and the parent again. The ordered
-# reads must be one strictly increasing 1us-stride sequence. The fixture then
-# releases two execed children from a barrier and lets both read without a
-# waitpid between them. Which child receives each timestamp may vary, so the
-# combined values are sorted before checking that they are all distinct, have no
-# gaps, and retain the same 1us stride. This brackets both sides: it accepts the
-# continuous baseline, while a private child clock, exec-time reset, frozen
-# value, rounded value, duplicate value, or first-sample-only match fails.
+# The client keeps no clock or resource-limit table: a runtime that declines
+# clock and rlimit calls leaves them to the host, and the prototype runtime's
+# forwarding tools do. Exercise libc's patched-vDSO path in the parent, a forked
+# child, an execed child (new client image + vDSO module load), the parent
+# again and two concurrent execed children. Every process must read the host's
+# monotonic clock (each ordered sequence strictly increasing) and the host's
+# RLIMIT_NOFILE. That is the root's limit after DynamoRIO reserves its own
+# descriptors (96 below the native value when measured), so every process must
+# report the root's value rather than a fixed table's.
 run_default_runtime "$fork_clock_resource_guest"
+root_nofile=$(sed -n 's/^parent-before_nofile=//p' "$tmpdir/out")
+[[ -n $root_nofile ]] || fail "default runtime: fork/exec clock fixture printed no rlimit"
 awk -F= '
   /^(parent-before|fork-child|exec-child|parent-after)_mono_ns\[[0-3]\]=[0-9]+$/ {
     value = $2 + 0
     count += 1
-    if (count > 1 && value - previous != 1000)
-      bad_delta = 1
+    if (count > 1 && value <= previous)
+      not_increasing = 1
     previous = value
   }
-  END { exit !(count == 16 && bad_delta == 0) }
+  END { exit !(count == 16 && not_increasing == 0) }
 ' "$tmpdir/out" \
-  || fail "default runtime: vDSO clock did not evolve continuously across fork/exec"
-grep -q '^fork-child_nofile=1048576$' "$tmpdir/out" \
-  || fail "default runtime: forked child read a real host rlimit instead of the virtual limit"
-grep -q '^exec-child_nofile=1048576$' "$tmpdir/out" \
-  || fail "default runtime: execed child read a real host rlimit instead of the virtual limit"
-grep -q '^parent-after_nofile=1048576$' "$tmpdir/out" \
-  || fail "default runtime: root process rlimit is not virtualized"
-[[ $(grep -Ec '^concurrent-child-a_mono_ns\[[0-3]\]=[0-9]+$' "$tmpdir/out") -eq 4 ]] \
-  || fail "default runtime: first concurrent client image did not report four clock reads"
-[[ $(grep -Ec '^concurrent-child-b_mono_ns\[[0-3]\]=[0-9]+$' "$tmpdir/out") -eq 4 ]] \
-  || fail "default runtime: second concurrent client image did not report four clock reads"
-awk -F= \
-  '/^concurrent-child-[ab]_mono_ns\[[0-3]\]=[0-9]+$/ { print $2 }' \
-  "$tmpdir/out" | sort -n >"$tmpdir/concurrent-clock-values"
-awk '
-  NR == 1 { previous = $1; count = 1; next }
-  {
-    count += 1
-    if ($1 - previous != 1000)
-      bad_delta = 1
-    previous = $1
-  }
-  END { exit !(count == 8 && bad_delta == 0) }
-' "$tmpdir/concurrent-clock-values" \
-  || fail "default runtime: concurrent client images did not share one contiguous clock"
-echo "PASS: vDSO clock advances continuously across fork/exec and concurrent client images; rlimits stay virtualized"
+  || fail "default runtime: the host clock did not advance across fork/exec"
+for process in parent-before fork-child exec-child parent-after \
+  concurrent-child-a concurrent-child-b; do
+  grep -qx "${process}_nofile=$root_nofile" "$tmpdir/out" \
+    || fail "default runtime: $process did not read the host RLIMIT_NOFILE"
+done
+echo "PASS: clock and rlimit calls reach the host across fork/exec and concurrent client images"
 
 # noop: pure passthrough — guest output must be intact, no tool output.
 run_tool HERMIT_DBT_NOOP

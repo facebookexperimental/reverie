@@ -222,13 +222,6 @@ typedef struct {
   uint64_t magic;
   atomic_flag lock;
   _Atomic int32_t next_virtual_id;
-  /* One clock for the whole copied process tree. The state mapping is shared
-   * across fork/clone and its descriptor survives exec, so every client image
-   * advances the same fine-grained timeline instead of restarting a private
-   * COW copy at the fork point. */
-  // AUTONOMOUS-BOT-IMPLEMENTED
-  // TODO-HUMAN-REVIEW(PR-shared-dbi-clock): Review shared continuous DBI time.
-  _Atomic uint64_t virtual_time_ns;
   size_t process_control_count;
   process_control_t process_controls[MAX_VIRTUAL_IDENTITIES];
   _Atomic bool thread_clone_process_exit_test_exercised;
@@ -1330,7 +1323,6 @@ static void initialize_virtual_identity_state(bool external_global) {
   virtual_identity_state->magic = VIRTUAL_IDENTITY_MAGIC;
   atomic_flag_clear(&virtual_identity_state->lock);
   atomic_init(&virtual_identity_state->next_virtual_id, VIRTUAL_ROOT_PID + 1);
-  atomic_init(&virtual_identity_state->virtual_time_ns, UINT64_C(1000000000));
   atomic_init(
       &virtual_identity_state->thread_clone_process_exit_test_exercised, false);
   virtual_identity_state->initial_stdin_valid =
@@ -1618,15 +1610,6 @@ static int32_t virtualize_host_identity(int32_t value) {
   virtual_identity_unlock();
   return result;
 }
-
-typedef struct {
-  uint64_t rlim_cur;
-  uint64_t rlim_max;
-} virtual_rlimit_t;
-
-#define VIRTUAL_RLIMIT_COUNT ((size_t)RLIMIT_RTTIME + 1)
-static virtual_rlimit_t virtual_limits[VIRTUAL_RLIMIT_COUNT];
-static void* resource_lock;
 
 static bool read_app(const void* address, void* value, size_t size);
 static bool write_app(void* address, const void* value, size_t size);
@@ -3638,145 +3621,6 @@ write_memory(uintptr_t address, const uint8_t* value, size_t size) {
   return total;
 }
 
-static void init_virtual_limits(void) {
-  for (size_t resource = 0; resource < VIRTUAL_RLIMIT_COUNT; ++resource)
-    virtual_limits[resource] = (virtual_rlimit_t){UINT64_MAX, UINT64_MAX};
-
-  virtual_limits[RLIMIT_STACK] =
-      (virtual_rlimit_t){UINT64_C(8388608), UINT64_MAX};
-  virtual_limits[RLIMIT_NPROC] =
-      (virtual_rlimit_t){UINT64_C(1000000), UINT64_C(1000000)};
-  virtual_limits[RLIMIT_NOFILE] =
-      (virtual_rlimit_t){UINT64_C(1048576), UINT64_C(1048576)};
-  virtual_limits[RLIMIT_MEMLOCK] =
-      (virtual_rlimit_t){UINT64_C(67108864), UINT64_C(67108864)};
-  virtual_limits[RLIMIT_SIGPENDING] =
-      (virtual_rlimit_t){UINT64_C(1000000), UINT64_C(1000000)};
-  virtual_limits[RLIMIT_MSGQUEUE] =
-      (virtual_rlimit_t){UINT64_C(819200), UINT64_C(819200)};
-  virtual_limits[RLIMIT_NICE] = (virtual_rlimit_t){0, 0};
-  virtual_limits[RLIMIT_RTPRIO] = (virtual_rlimit_t){0, 0};
-}
-
-static bool
-handle_virtual_resource(int sysnum, const uint64_t* args, int64_t* result) {
-  bool is_get = sysnum == SYS_getrlimit;
-  bool is_set = sysnum == SYS_setrlimit;
-  bool is_prlimit = sysnum == SYS_prlimit64;
-  if (!is_get && !is_set && !is_prlimit)
-    return false;
-
-  if (is_prlimit && args[0] != 0 &&
-      (process_id_t)args[0] != dr_get_process_id()) {
-    *result = -ESRCH;
-    return true;
-  }
-
-  uint64_t resource = is_prlimit ? args[1] : args[0];
-  if (resource >= VIRTUAL_RLIMIT_COUNT) {
-    *result = -EINVAL;
-    return true;
-  }
-
-  const void* new_address =
-      (const void*)(uintptr_t)(is_set ? args[1] : (is_prlimit ? args[2] : 0));
-  void* old_address =
-      (void*)(uintptr_t)(is_get ? args[1] : (is_prlimit ? args[3] : 0));
-  virtual_rlimit_t requested;
-  bool has_requested = new_address != NULL;
-  if ((is_set && !has_requested) ||
-      (has_requested &&
-       !read_app(new_address, &requested, sizeof(requested)))) {
-    *result = -EFAULT;
-    return true;
-  }
-  if (is_get && old_address == NULL) {
-    *result = -EFAULT;
-    return true;
-  }
-
-  dr_mutex_lock(resource_lock);
-  virtual_rlimit_t current = virtual_limits[resource];
-  if (has_requested && requested.rlim_cur > requested.rlim_max) {
-    dr_mutex_unlock(resource_lock);
-    *result = -EINVAL;
-    return true;
-  }
-  if (has_requested && requested.rlim_max > current.rlim_max) {
-    dr_mutex_unlock(resource_lock);
-    *result = -EPERM;
-    return true;
-  }
-  if (old_address != NULL &&
-      !write_app(old_address, &current, sizeof(current))) {
-    dr_mutex_unlock(resource_lock);
-    *result = -EFAULT;
-    return true;
-  }
-  if (has_requested)
-    virtual_limits[resource] = requested;
-  dr_mutex_unlock(resource_lock);
-  *result = 0;
-  return true;
-}
-
-static bool clock_supported(clockid_t clockid) {
-  switch (clockid) {
-    case CLOCK_REALTIME:
-    case CLOCK_MONOTONIC:
-    case CLOCK_PROCESS_CPUTIME_ID:
-    case CLOCK_THREAD_CPUTIME_ID:
-    case (clockid_t)-6:
-    case (clockid_t)-2:
-#ifdef CLOCK_MONOTONIC_RAW
-    case CLOCK_MONOTONIC_RAW:
-#endif
-#ifdef CLOCK_REALTIME_COARSE
-    case CLOCK_REALTIME_COARSE:
-#endif
-#ifdef CLOCK_MONOTONIC_COARSE
-    case CLOCK_MONOTONIC_COARSE:
-#endif
-#ifdef CLOCK_BOOTTIME
-    case CLOCK_BOOTTIME:
-#endif
-#ifdef CLOCK_REALTIME_ALARM
-    case CLOCK_REALTIME_ALARM:
-#endif
-#ifdef CLOCK_BOOTTIME_ALARM
-    case CLOCK_BOOTTIME_ALARM:
-#endif
-#ifdef CLOCK_TAI
-    case CLOCK_TAI:
-#endif
-      return true;
-    default:
-      return false;
-  }
-}
-
-static bool is_process_cpu_clock(clockid_t clockid) {
-  return clockid == CLOCK_PROCESS_CPUTIME_ID || clockid == (clockid_t)-6;
-}
-
-static bool is_thread_cpu_clock(clockid_t clockid) {
-  return clockid == CLOCK_THREAD_CPUTIME_ID || clockid == (clockid_t)-2;
-}
-
-static uint64_t observe_virtual_time(void) {
-  return atomic_fetch_add_explicit(
-      &virtual_identity_state->virtual_time_ns,
-      UINT64_C(1000),
-      memory_order_seq_cst);
-}
-
-static struct timespec virtual_timespec(uint64_t nanoseconds) {
-  return (struct timespec){
-      .tv_sec = (time_t)(nanoseconds / UINT64_C(1000000000)),
-      .tv_nsec = (long)(nanoseconds % UINT64_C(1000000000)),
-  };
-}
-
 static bool read_app(const void* address, void* value, size_t size) {
   size_t bytes_read = 0;
   return address != NULL && dr_safe_read(address, size, value, &bytes_read) &&
@@ -3788,163 +3632,6 @@ static bool write_app(void* address, const void* value, size_t size) {
   return address != NULL &&
       dr_safe_write(address, size, value, &bytes_written) &&
       bytes_written == size;
-}
-
-static bool timespec_nanoseconds(
-    const struct timespec* value,
-    uint64_t* nanoseconds) {
-  if (value->tv_sec < 0 || value->tv_nsec < 0 || value->tv_nsec >= 1000000000L)
-    return false;
-  if ((uint64_t)value->tv_sec >
-      (UINT64_MAX - (uint64_t)value->tv_nsec) / UINT64_C(1000000000))
-    return false;
-  *nanoseconds =
-      (uint64_t)value->tv_sec * UINT64_C(1000000000) + (uint64_t)value->tv_nsec;
-  return true;
-}
-
-static void advance_virtual_time(uint64_t nanoseconds, bool absolute) {
-  if (!absolute) {
-    atomic_fetch_add_explicit(
-        &virtual_identity_state->virtual_time_ns,
-        nanoseconds,
-        memory_order_seq_cst);
-    return;
-  }
-
-  uint64_t current = atomic_load_explicit(
-      &virtual_identity_state->virtual_time_ns, memory_order_seq_cst);
-  while (current < nanoseconds &&
-         !atomic_compare_exchange_weak_explicit(
-             &virtual_identity_state->virtual_time_ns,
-             &current,
-             nanoseconds,
-             memory_order_seq_cst,
-             memory_order_seq_cst)) {
-  }
-}
-
-static bool handle_virtual_clock(
-    uintptr_t context,
-    int sysnum,
-    const uint64_t* args,
-    int64_t* result) {
-  switch (sysnum) {
-    case SYS_clock_gettime: {
-      clockid_t clockid = (clockid_t)args[0];
-      if (!clock_supported(clockid)) {
-        *result = -EINVAL;
-        return true;
-      }
-      struct timespec value = virtual_timespec(observe_virtual_time());
-      *result = write_app((void*)(uintptr_t)args[1], &value, sizeof(value))
-          ? 0
-          : -EFAULT;
-      return true;
-    }
-    case SYS_clock_getres: {
-      clockid_t clockid = (clockid_t)args[0];
-      if (!clock_supported(clockid)) {
-        *result = -EINVAL;
-        return true;
-      }
-      if (args[1] == 0) {
-        *result = 0;
-        return true;
-      }
-      const struct timespec resolution = {.tv_sec = 0, .tv_nsec = 1000};
-      *result =
-          write_app((void*)(uintptr_t)args[1], &resolution, sizeof(resolution))
-          ? 0
-          : -EFAULT;
-      return true;
-    }
-    case SYS_clock_nanosleep: {
-      clockid_t clockid = (clockid_t)args[0];
-      int flags = (int)args[1];
-      if (!clock_supported(clockid) || is_thread_cpu_clock(clockid) ||
-          (flags & ~TIMER_ABSTIME) != 0) {
-        *result = -EINVAL;
-        return true;
-      }
-
-      /* Preserve real blocking so peer threads and signals can make progress.
-       */
-      if (flags == 0 && !is_process_cpu_clock(clockid))
-        return false;
-
-      struct timespec request;
-      uint64_t nanoseconds;
-      if (!read_app(
-              (const void*)(uintptr_t)args[2], &request, sizeof(request))) {
-        *result = -EFAULT;
-        return true;
-      }
-      if (!timespec_nanoseconds(&request, &nanoseconds)) {
-        *result = -EINVAL;
-        return true;
-      }
-      if (is_process_cpu_clock(clockid)) {
-        advance_virtual_time(nanoseconds, (flags & TIMER_ABSTIME) != 0);
-        *result = 0;
-        return true;
-      }
-
-      uint64_t current = atomic_load_explicit(
-          &virtual_identity_state->virtual_time_ns, memory_order_seq_cst);
-      uint64_t delay = nanoseconds > current ? nanoseconds - current : 0;
-      struct timespec relative = virtual_timespec(delay);
-      const uint64_t sleep_args[6] = {
-          (uint64_t)(uintptr_t)&relative,
-          0,
-      };
-      *result = invoke_syscall(context, SYS_nanosleep, sleep_args);
-      if (*result == 0)
-        advance_virtual_time(nanoseconds, true);
-      return true;
-    }
-    case SYS_clock_settime:
-      *result = clock_supported((clockid_t)args[0]) ? -EPERM : -EINVAL;
-      return true;
-    case SYS_gettimeofday: {
-      uint64_t nanoseconds = observe_virtual_time();
-      if (args[0] != 0) {
-        const struct timeval value = {
-            .tv_sec = (time_t)(nanoseconds / UINT64_C(1000000000)),
-            .tv_usec = (suseconds_t)((nanoseconds % UINT64_C(1000000000)) /
-                                     UINT64_C(1000)),
-        };
-        if (!write_app((void*)(uintptr_t)args[0], &value, sizeof(value))) {
-          *result = -EFAULT;
-          return true;
-        }
-      }
-      if (args[1] != 0) {
-        const struct timezone timezone = {0};
-        if (!write_app(
-                (void*)(uintptr_t)args[1], &timezone, sizeof(timezone))) {
-          *result = -EFAULT;
-          return true;
-        }
-      }
-      *result = 0;
-      return true;
-    }
-#ifdef SYS_time
-    case SYS_time: {
-      time_t seconds = (time_t)(observe_virtual_time() / UINT64_C(1000000000));
-      if (args[0] != 0 &&
-          !write_app((void*)(uintptr_t)args[0], &seconds, sizeof(seconds))) {
-        *result = -EFAULT;
-        return true;
-      }
-      *result = (int64_t)seconds;
-      return true;
-    }
-#endif
-    default:
-      return false;
-  }
 }
 
 // Overwrite `address` inside the vDSO `module` with `code` and flush any cached
@@ -4104,8 +3791,8 @@ static void replace_vdso_entry(
 // with a tiny `mov $sysnum, %eax; syscall; ret` thunk. glibc's vDSO fast path
 // then issues a real, trapped syscall instead of reading the raw host TSC, so
 // the call flows through pre_syscall() where the external Detcore tool
-// virtualizes it (and the prototype runtime still services it via
-// handle_virtual_clock()). This mirrors reverie-ptrace/src/vdso.rs, whose vDSO
+// virtualizes it (the prototype runtime lets it reach the host). This mirrors
+// reverie-ptrace/src/vdso.rs, whose vDSO
 // neutralization is why the ptrace backend already reports the deterministic
 // epoch; the previous drwrap_skip_call() path answered from the base-zero
 // prototype clock and never reached the real tool, so `date` printed 1970
@@ -5377,22 +5064,11 @@ static bool pre_syscall(void* drcontext, int sysnum) {
       dr_syscall_set_result(drcontext, (reg_t)result);
       return false;
     }
-    /* A copied child runs no Rust Tool (reverie_dbt_runtime_copied_syscall
-     * declined above), so the native virtual clock and virtual resource limits
-     * are its only determinism layer for time and rlimits. Apply the same
-     * fallbacks the root process gets below, otherwise a forked child would
-     * read real host time (clock_gettime/gettimeofday/time) and real host
-     * rlimits (getrlimit/setrlimit/prlimit64), diverging run to run while the
-     * root stays virtualized. This runs after the fail-closed
-     * unsupported-syscall check, so it never resurrects a rejected syscall. */
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-ratchet12): Review copied-child clock/resource
-    // virtualization.
-    if (handle_virtual_clock((uintptr_t)drcontext, sysnum, args, &result) ||
-        handle_virtual_resource(sysnum, args, &result)) {
-      dr_syscall_set_result(drcontext, (reg_t)result);
-      return false;
-    }
+    /* The client keeps no clock or resource-limit table of its own. A copied
+     * child runs no Rust Tool, so its clock and rlimit calls are the
+     * runtime's to decide in reverie_dbt_runtime_copied_syscall above:
+     * Detcore's runtime refuses them by name, and the prototype runtime lets
+     * them reach the host as its forwarding tools do. */
     if (sysnum == SYS_exit || sysnum == SYS_exit_group)
       complete_runtime_thread_exit(
           counters, drcontext, sysnum == SYS_exit, sysnum == SYS_exit_group);
@@ -5525,17 +5201,9 @@ static bool pre_syscall(void* drcontext, int sysnum) {
     return execute;
   }
 
-  /* Prototype runtimes can decline these calls; external Tools such as
-   * Detcore own their complete syscall policy and handle them above. */
-  if (handle_virtual_clock((uintptr_t)drcontext, sysnum, args, &result) ||
-      handle_virtual_resource(sysnum, args, &result)) {
-    counters->branches =
-        atomic_load_explicit(&branch_count, memory_order_relaxed);
-    counters->observed_syscalls += 1;
-    counters->rewritten_syscalls += 1;
-    dr_syscall_set_result(drcontext, (reg_t)result);
-    return false;
-  }
+  /* A runtime that declines a call leaves it to the host. The client keeps
+   * no clock or resource-limit table: under Hermit, Detcore owns the
+   * complete syscall policy and answers these above. */
   if (sysnum == SYS_exit || sysnum == SYS_exit_group)
     complete_runtime_thread_exit(
         counters, drcontext, sysnum == SYS_exit, sysnum == SYS_exit_group);
@@ -6365,7 +6033,6 @@ static void event_exit(void) {
     dr_mutex_destroy(evidence_lock);
     evidence_lock = NULL;
   }
-  dr_mutex_destroy(resource_lock);
   drwrap_exit();
   drx_exit();
   drmgr_unregister_tls_field(compat_gateway_index);
@@ -6725,9 +6392,6 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
       &image_generation,
       reverie_dbt_runtime_image_init(),
       memory_order_release);
-  resource_lock = dr_mutex_create();
-  DR_ASSERT(resource_lock != NULL);
-  init_virtual_limits();
 
   for (int i = 1; i < argc; ++i) {
     if (strcmp(argv[i], "-summary") == 0)
