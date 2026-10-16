@@ -141,8 +141,36 @@ mod tests {
 
     use super::*;
 
+    const ARCH_GET_CPUID: libc::c_int = 0x1011;
+    const ARCH_SET_CPUID: libc::c_int = 0x1012;
+
+    /// True if this host can trap CPUID, which the ptrace backend needs to
+    /// serve the tool's table instead of the real CPU's. AMD hosts report the
+    /// state but reject the trap before Linux 6.17.
+    fn cpuid_faulting_supported() -> bool {
+        // SAFETY: `arch_prctl(ARCH_GET_CPUID)` takes no pointer arguments and
+        // only reads the calling thread's CPUID-faulting state.
+        let previous = unsafe { libc::syscall(libc::SYS_arch_prctl, ARCH_GET_CPUID, 0) };
+        if previous < 0 {
+            return false;
+        }
+        // SAFETY: `arch_prctl(ARCH_SET_CPUID)` takes no pointer arguments and
+        // only writes the calling thread's CPUID-faulting state. CPUID faults
+        // in this thread until the state is restored below, and neither this
+        // function nor the restore executes the instruction.
+        if unsafe { libc::syscall(libc::SYS_arch_prctl, ARCH_SET_CPUID, 0) } != 0 {
+            return false;
+        }
+        // SAFETY: as above, writing back the state read before the probe.
+        unsafe { libc::syscall(libc::SYS_arch_prctl, ARCH_SET_CPUID, previous) == 0 }
+    }
+
     #[test]
     fn run_guest_func_cpuid_intercepted_test() {
+        if !cpuid_faulting_supported() {
+            eprintln!("skipping: this host does not support CPUID faulting");
+            return;
+        }
         check_fn::<LocalState, _>(|| {
             let cpuid = raw_cpuid::CpuId::new();
             let feature = cpuid.get_feature_info();
