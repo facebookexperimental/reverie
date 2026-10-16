@@ -205,13 +205,14 @@ fn guest_stack_owner_cell(force_legacy: bool) {
     let flag = stack.token.flag.clone();
     assert!(flag.load(Ordering::SeqCst));
     assert_eq!(
-        stack.task.generation(),
+        stack.task.stopped().generation(),
         generation,
         "Guest::stack must retain the original Event generation"
     );
     assert!(
         stack
             .task
+            .stopped()
             .terminal_cleanup()
             .same_generation(&original.terminal_cleanup())
     );
@@ -261,7 +262,7 @@ fn guest_stack_owner_cell(force_legacy: bool) {
         !refused.load(Ordering::SeqCst),
         "constructor refusal must release its token"
     );
-    assert_eq!(stack.task.generation(), generation);
+    assert_eq!(stack.task.stopped().generation(), generation);
     assert!(
         flag.load(Ordering::SeqCst),
         "foreign refusal must not release the live owner's checkout"

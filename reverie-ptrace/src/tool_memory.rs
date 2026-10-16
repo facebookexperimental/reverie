@@ -18,10 +18,17 @@
 //! is refused before any access: that page is read-and-execute, so a native
 //! write there fails too, and a forced one could replace the `ud2` that
 //! guards the untraced stub (https://github.com/rrnewton/reverie/issues/1064).
+//!
+//! A scalar the kernel would publish with `put_user` (at most eight bytes) is
+//! one store: on a fault nothing is written. A copy that crosses into a
+//! non-writable page would instead leave its writable prefix behind, so
+//! [`ToolMemory::write_value`] checks every page of such a scalar first.
 
 use std::io;
+use std::mem;
 
 use reverie::Errno;
+use reverie::Pid;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::MemoryAccess;
@@ -39,6 +46,45 @@ impl ToolMemory {
     pub(crate) fn new(stopped: Stopped) -> Self {
         Self(stopped)
     }
+
+    pub(crate) fn pid(&self) -> Pid {
+        self.0.pid()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stopped(&self) -> &Stopped {
+        &self.0
+    }
+
+    /// Whether every page of `[address, address + length)` is mapped writable.
+    fn pages_writable(&self, address: usize, length: usize) -> Result<bool, Errno> {
+        let end = address.checked_add(length).ok_or(Errno::EFAULT)?;
+        let maps = procfs::process::Process::new(self.0.pid().as_raw())
+            .and_then(|process| process.maps())
+            .map_err(|_| Errno::EFAULT)?;
+        let mut page = address & !(PAGE_SIZE - 1);
+        while page < end {
+            let page_start = page as u64;
+            let writable = maps.iter().any(|map| {
+                map.address.0 <= page_start
+                    && page_start < map.address.1
+                    && map.perms.contains(procfs::process::MMPermissions::WRITE)
+            });
+            if !writable {
+                return Ok(false);
+            }
+            page += PAGE_SIZE;
+        }
+        Ok(true)
+    }
+}
+
+const PAGE_SIZE: usize = 4096;
+/// The largest value the kernel publishes with one `put_user` store.
+const PUT_USER_MAX: usize = 8;
+
+fn crosses_page(address: usize, length: usize) -> bool {
+    length > 1 && (address & (PAGE_SIZE - 1)) + length > PAGE_SIZE
 }
 
 /// Whether `[address, address + length)` overlaps Reverie's private page.
@@ -127,6 +173,30 @@ impl MemoryAccess for ToolMemory {
         refuse_private_page_write(addr.as_raw(), buf.len())?;
         self.0.write_with_user_access(addr, buf)
     }
+
+    /// A value of at most eight bytes is published as `put_user` publishes
+    /// it: entirely, or not at all with `EFAULT`. Within one page the copy is
+    /// already all-or-nothing. Across a page boundary every page is checked
+    /// first, so a writable prefix is never left behind. Larger values keep
+    /// `copy_to_user`'s prefix semantics.
+    fn write_value<'a, A, T>(&mut self, addr: A, value: &T) -> Result<(), Errno>
+    where
+        A: Into<AddrMut<'a, T>>,
+        T: Sized + 'a,
+    {
+        let addr = addr.into().cast::<u8>();
+        // SAFETY: `value` is a live `T`, viewed as its `size_of::<T>()` bytes.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(value as *const T as *const u8, mem::size_of::<T>())
+        };
+        if bytes.len() <= PUT_USER_MAX && crosses_page(addr.as_raw(), bytes.len()) {
+            refuse_private_page_write(addr.as_raw(), bytes.len())?;
+            if !self.pages_writable(addr.as_raw(), bytes.len())? {
+                return Err(Errno::EFAULT);
+            }
+        }
+        self.write_exact(addr, bytes)
+    }
 }
 
 #[cfg(test)]
@@ -144,5 +214,14 @@ mod tests {
         assert!(!overlaps_private_page(end, 8));
         assert!(!overlaps_private_page(start, 0));
         assert!(overlaps_private_page(usize::MAX - 3, 8));
+    }
+
+    #[test]
+    fn page_crossing_is_exact() {
+        assert!(!crosses_page(PAGE_SIZE - 8, 8));
+        assert!(crosses_page(PAGE_SIZE - 4, 8));
+        assert!(crosses_page(PAGE_SIZE - 1, 2));
+        assert!(!crosses_page(PAGE_SIZE - 1, 1));
+        assert!(!crosses_page(PAGE_SIZE, 8));
     }
 }
