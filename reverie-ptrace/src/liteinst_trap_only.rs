@@ -821,6 +821,12 @@ pub(crate) struct ReraisedStop {
     pub(crate) info: libc::siginfo_t,
 }
 
+// SAFETY: The pointers in `info` are addresses in the tracee, copied from
+// PTRACE_GETSIGINFO. The tracer never dereferences them; it only hands the
+// siginfo back to PTRACE_SETSIGINFO, so it is plain data on this side.
+unsafe impl Send for ReraisedStop {}
+unsafe impl Sync for ReraisedStop {}
+
 impl std::fmt::Debug for ReraisedStop {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReraisedStop")

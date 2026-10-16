@@ -220,6 +220,12 @@ struct DeferredStops {
     count: usize,
 }
 
+// SAFETY: The pointers in the siginfos are addresses in the tracee, copied
+// from PTRACE_GETSIGINFO. The tracer never dereferences them; it only hands
+// the siginfo back to PTRACE_SETSIGINFO, so it is plain data on this side.
+unsafe impl Send for DeferredStops {}
+unsafe impl Sync for DeferredStops {}
+
 impl DeferredStops {
     /// Defers one SIGSTOP; returns its queue and whether its siginfo was
     /// kept (the queue's first).
@@ -1043,31 +1049,35 @@ impl<L: Tool + 'static> TracedTask<L> {
                             },
                         ));
                     }
-                    let info = match task.getsiginfo() {
-                        Ok(info) => info,
-                        // A non-seized tracee's group stop looks like a
-                        // signal-delivery stop, but has no siginfo.
-                        Err(TraceError::Errno(Errno::EINVAL)) => {
-                            return Err(self.trap_only_failure(
-                                "trap-only hop",
-                                TrapOnlyFailure::HopUnexpectedStop {
-                                    phase: "H2 slot stop",
-                                    site,
-                                    stop: format!(
-                                        "SIGSTOP group stop (PTRACE_GETSIGINFO EINVAL) at rip {:#x}",
-                                        regs.rip
-                                    ),
-                                },
-                            ));
-                        }
-                        Err(error) => return Err(error),
-                    };
-                    let (queue, kept) = deferred.defer(info);
-                    self.trap_only_record(format!(
-                        "slot SIGSTOP deferred code={} queue={queue}{}",
-                        info.si_code,
-                        if kept { "" } else { " (coalesced)" }
-                    ));
+                    // Scoped so that the siginfo, which is not Send, is not
+                    // held across the await below.
+                    {
+                        let info = match task.getsiginfo() {
+                            Ok(info) => info,
+                            // A non-seized tracee's group stop looks like a
+                            // signal-delivery stop, but has no siginfo.
+                            Err(TraceError::Errno(Errno::EINVAL)) => {
+                                return Err(self.trap_only_failure(
+                                    "trap-only hop",
+                                    TrapOnlyFailure::HopUnexpectedStop {
+                                        phase: "H2 slot stop",
+                                        site,
+                                        stop: format!(
+                                            "SIGSTOP group stop (PTRACE_GETSIGINFO EINVAL) at rip {:#x}",
+                                            regs.rip
+                                        ),
+                                    },
+                                ));
+                            }
+                            Err(error) => return Err(error),
+                        };
+                        let (queue, kept) = deferred.defer(info);
+                        self.trap_only_record(format!(
+                            "slot SIGSTOP deferred code={} queue={queue}{}",
+                            info.si_code,
+                            if kept { "" } else { " (coalesced)" }
+                        ));
+                    }
                     wait = self.resume_stopped(task, None)?.next_state().await?;
                     self.arm_liteinst_wait(&wait);
                 }

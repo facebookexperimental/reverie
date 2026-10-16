@@ -2504,38 +2504,43 @@ impl TimerImpl {
         observe: &mut (dyn FnMut(&Wait) -> Result<(), TraceError> + Send),
     ) -> Result<Stopped, HandleFailure> {
         self.recheck_kept_programming();
-        let signal = task.getsiginfo()?;
-        #[cfg(test)]
-        EXEC_SIGNAL_OBSERVATIONS.with(|slot| {
-            if let Some(observed) = slot.borrow().as_ref() {
-                observed.lock().unwrap().push((
-                    self.guest_tid.as_raw(),
-                    signal.si_signo,
-                    signal.si_code,
-                    unsafe { signal.si_pid() },
-                    self.read_clock(),
-                    self.timer_status == EventStatus::Cancelled,
-                    self.send_artificial_signal,
-                ));
+        // Scoped so that the siginfo, which is not Send, is not held across
+        // the await below.
+        let controller = {
+            let signal = task.getsiginfo()?;
+            #[cfg(test)]
+            EXEC_SIGNAL_OBSERVATIONS.with(|slot| {
+                if let Some(observed) = slot.borrow().as_ref() {
+                    observed.lock().unwrap().push((
+                        self.guest_tid.as_raw(),
+                        signal.si_signo,
+                        signal.si_code,
+                        unsafe { signal.si_pid() },
+                        self.read_clock(),
+                        self.timer_status == EventStatus::Cancelled,
+                        self.send_artificial_signal,
+                    ));
+                }
+            });
+            #[cfg(test)]
+            if let Some(hook) = CONTROLLER_QUERY_EDGE.with(|slot| slot.borrow_mut().take()) {
+                hook(&task);
             }
-        });
-        #[cfg(test)]
-        if let Some(hook) = CONTROLLER_QUERY_EDGE.with(|slot| slot.borrow_mut().take()) {
-            hook(&task);
-        }
-        let controller = self.controller_artificial_signal(&signal)?;
-        if !self.generated_signal(&signal, controller) {
-            warn!(
-                ?signal,
-                "Passed a signal that wasn't for this timer, likely indicating a bug!",
-            );
-            return Err(HandleFailure::ImproperSignal(task));
-        }
-        if self.owns_overflow_signal(&signal) {
-            // Otherwise a later injected syscall could mistake a guest signal
-            // for this notification.
-            self.mark_overflows_consumed();
-        }
+            let controller = self.controller_artificial_signal(&signal)?;
+            if !self.generated_signal(&signal, controller) {
+                warn!(
+                    ?signal,
+                    "Passed a signal that wasn't for this timer, likely indicating a bug!",
+                );
+                return Err(HandleFailure::ImproperSignal(task));
+            }
+            if self.owns_overflow_signal(&signal) {
+                // Otherwise a later injected syscall could mistake a guest signal
+                // for this notification.
+                self.mark_overflows_consumed();
+            }
+            controller
+        };
 
         if controller {
             self.artificial_signal_sent = false;
