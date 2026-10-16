@@ -202,19 +202,6 @@ pub struct BackendCapabilities {
     /// the guest's `rt_sigaction` fails and nothing is published.
     pub virtualizes_guest_sigalrm: bool,
 
-    /// The tool's guest memory implements
-    /// [`MemoryAccess::compare_exchange_u32`](reverie_syscalls::MemoryAccess::compare_exchange_u32)
-    /// for guest words on pages the guest can write, so the tool can change a
-    /// guest futex word atomically, as Linux does; a word the guest cannot
-    /// write gives `EFAULT`, as Linux's own store would. The exchange is
-    /// atomic against other guest threads, but its check that the page is
-    /// writable is not, so a tool runs it while no other guest thread runs. Where
-    /// [`Self::runs_exit_robust_list`] is false, a tool that models robust-futex
-    /// owner death can then mark an owner word `FUTEX_OWNER_DIED` itself before
-    /// it wakes a modeled waiter, instead of depending on when the kernel's
-    /// own cleanup runs.
-    pub supports_guest_memory_compare_exchange: bool,
-
     /// At a syscall stop the backend hands the kernel's signal delivery a
     /// restart errno (such as `ERESTARTNOHAND`), which the kernel turns into
     /// `EINTR` or a restart as Linux does, and it reports a thread's signal
@@ -265,7 +252,6 @@ impl BackendCapabilities {
         provides_process_signal_control: false,
         emulates_child_waits: false,
         virtualizes_guest_sigalrm: false,
-        supports_guest_memory_compare_exchange: false,
         supports_blocked_wait_signal_interruption: true,
         delivers_preemption_timer_events: true,
         runs_guest_code_between_injections: false,
@@ -322,7 +308,6 @@ impl BackendCapabilities {
         requires_thread_directed_process_signals: true,
         supports_parked_write_signal_interruption: false,
         reports_child_exit_publication: false,
-        supports_guest_memory_compare_exchange: true,
         supports_blocked_wait_signal_interruption: false,
         delivers_preemption_timer_events: false,
         ..Self::PTRACE
@@ -383,7 +368,6 @@ mod tests {
             "provides_process_signal_control": false,
             "emulates_child_waits": false,
             "virtualizes_guest_sigalrm": false,
-            "supports_guest_memory_compare_exchange": false,
             "supports_blocked_wait_signal_interruption": true,
             "delivers_preemption_timer_events": true,
             "runs_guest_code_between_injections": false,
@@ -469,7 +453,6 @@ mod tests {
                 "requires_thread_directed_process_signals": true,
                 "supports_parked_write_signal_interruption": false,
                 "reports_child_exit_publication": false,
-                "supports_guest_memory_compare_exchange": true,
                 "supports_blocked_wait_signal_interruption": false,
                 "delivers_preemption_timer_events": false,
             }))
