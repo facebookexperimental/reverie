@@ -892,7 +892,11 @@ where
             crate::stats::GuestStatsHooks::DISABLED
         }
     } else {
-        if let Some(stats_coordinator) = std::env::var_os(crate::backend::STATS_COORDINATOR_ENV) {
+        if let Some(stats_coordinator) = reverie_inguest::bootstrap::bootstrap_stats_coordinator() {
+            install_try!(crate::stats::initialize_guest_stats(stats_coordinator))
+        } else if let Some(stats_coordinator) =
+            std::env::var_os(crate::backend::STATS_COORDINATOR_ENV)
+        {
             let stats = install_try!(crate::stats::initialize_guest_stats(Path::new(
                 &stats_coordinator
             )));

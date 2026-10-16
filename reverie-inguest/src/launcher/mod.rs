@@ -972,12 +972,11 @@ where
         Some(tool_data) => {
             let mut child_command = command.try_into_std()?;
             disable_address_space_randomization(&mut child_command);
+            // The statistics coordinator travels in the bootstrap with the
+            // Tool coordinator, not in the guest's environment.
             child_command.env_remove(STATS_COORDINATOR_ENV);
-            if let Some(stats_socket) = &stats_socket {
-                child_command.env(STATS_COORDINATOR_ENV, stats_socket);
-            }
 
-            let bootstrap = create_preload_bootstrap(&socket, &tool_data)?;
+            let bootstrap = create_preload_bootstrap(&socket, stats_socket.as_deref(), &tool_data)?;
             let bootstrap_fd = bootstrap.as_raw_fd();
             unsafe {
                 child_command.pre_exec(move || {
@@ -2052,7 +2051,7 @@ mod tests {
         let expected = b"REVERIE-LI-V1\0\0\0\x0f\0\x03\0/tmp/raw-\xff.sock\0\xff*";
         let coordinator = PathBuf::from(OsString::from_vec(b"/tmp/raw-\xff.sock".to_vec()));
         let data = b"\0\xff*";
-        let fd = create_preload_bootstrap(&coordinator, data).unwrap();
+        let fd = create_preload_bootstrap(&coordinator, None, data).unwrap();
         let mut actual = [0u8; 128];
         let count =
             unsafe { libc::pread(fd.as_raw_fd(), actual.as_mut_ptr().cast(), actual.len(), 0) };
@@ -2060,6 +2059,22 @@ mod tests {
         assert_eq!(&actual[..expected.len()], expected);
         let decoded = read_preload_bootstrap(fd.as_raw_fd()).unwrap().unwrap();
         assert_eq!(decoded.coordinator, coordinator);
+        assert_eq!(decoded.tool_data, data);
+        assert_eq!(decoded.stats_coordinator, None);
+
+        // Version 2 names the statistics coordinator too, after the Tool
+        // coordinator; a frozen literal again.
+        let expected_v2 =
+            b"REVERIE-LI-V2\0\0\0\x0f\0\x0b\0\x03\0/tmp/raw-\xff.sock/tmp/s.sock\0\xff*";
+        let stats = PathBuf::from("/tmp/s.sock");
+        let fd = create_preload_bootstrap(&coordinator, Some(&stats), data).unwrap();
+        let count =
+            unsafe { libc::pread(fd.as_raw_fd(), actual.as_mut_ptr().cast(), actual.len(), 0) };
+        assert_eq!(count, expected_v2.len() as isize);
+        assert_eq!(&actual[..expected_v2.len()], expected_v2);
+        let decoded = read_preload_bootstrap(fd.as_raw_fd()).unwrap().unwrap();
+        assert_eq!(decoded.coordinator, coordinator);
+        assert_eq!(decoded.stats_coordinator, Some(stats));
         assert_eq!(decoded.tool_data, data);
 
         let unsealed = fixture(expected, false);
@@ -2085,7 +2100,7 @@ mod tests {
             error.to_string(),
             "invalid LiteInst preload bootstrap lengths"
         );
-        let oversized = create_preload_bootstrap(&coordinator, &[0; 4096])
+        let oversized = create_preload_bootstrap(&coordinator, None, &[0; 4096])
             .err()
             .unwrap();
         assert_eq!(oversized.kind(), io::ErrorKind::InvalidInput);
@@ -2108,7 +2123,7 @@ mod tests {
             ),
         ];
         for (coordinator, tool_data) in &expected {
-            let bootstrap = create_preload_bootstrap(coordinator, tool_data).unwrap();
+            let bootstrap = create_preload_bootstrap(coordinator, None, tool_data).unwrap();
             std::mem::forget(bootstrap);
         }
         let open = open_test_bootstraps().unwrap();
