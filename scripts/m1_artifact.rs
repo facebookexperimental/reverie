@@ -3965,6 +3965,53 @@ fn extent_writers(elf: &Elf<'_>, address: u64, length: usize) -> Result<Vec<relo
         .collect())
 }
 
+// One immutable ELF pass may reuse the fully validated writer list. Creation
+// still checks every relocation, including writers outside all queried ranges.
+struct LoaderWriterIndex<'elf, 'bytes> {
+    elf: &'elf Elf<'bytes>,
+    writers: Vec<LoaderWriter>,
+}
+
+impl<'elf, 'bytes> LoaderWriterIndex<'elf, 'bytes> {
+    fn new(elf: &'elf Elf<'bytes>) -> Result<Self> {
+        Ok(Self {
+            elf,
+            writers: loader_writers(elf)?,
+        })
+    }
+
+    fn extent(&self, address: u64, length: usize) -> Result<Vec<reloc::Reloc>> {
+        let end = address
+            .checked_add(length as u64)
+            .ok_or("selected writer extent overflows")?;
+        require(length != 0, "empty selected writer extent")?;
+        Ok(self
+            .writers
+            .iter()
+            .filter(|writer| writer.relocation.r_offset < end && writer.end > address)
+            .map(|writer| writer.relocation)
+            .collect())
+    }
+
+    fn no_data_relocation(
+        &self,
+        address: u64,
+        length: usize,
+        permitted: Option<u64>,
+    ) -> Result<()> {
+        let end = address
+            .checked_add(length as u64)
+            .ok_or("Fixed data relocation extent overflow")?;
+        fixed_require_no_data_relocation(
+            self.elf,
+            address,
+            end,
+            permitted,
+            &self.extent(address, length)?,
+        )
+    }
+}
+
 // Count actual rounded PT_LOAD mappings, not deduplicated file offsets. A
 // second partial-page mapping can replace the page containing the selected
 // bytes even when it does not contain their nominal virtual address range.
@@ -8726,8 +8773,24 @@ fn fixed_no_data_relocation(
     let end = address
         .checked_add(length as u64)
         .ok_or("Fixed data relocation extent overflow")?;
-    for r in extent_writers(elf, address, length)? {
-        let width = descriptor_relocation_width(elf, &r)?;
+    fixed_require_no_data_relocation(
+        elf,
+        address,
+        end,
+        permitted,
+        &extent_writers(elf, address, length)?,
+    )
+}
+
+fn fixed_require_no_data_relocation(
+    elf: &Elf<'_>,
+    address: u64,
+    end: u64,
+    permitted: Option<u64>,
+    writers: &[reloc::Reloc],
+) -> Result<()> {
+    for r in writers {
+        let width = descriptor_relocation_width(elf, r)?;
         let relocation_end = r
             .r_offset
             .checked_add(width)
@@ -18593,7 +18656,7 @@ fn detcore_validate_readonly_recipe(
 // derives `address` from the matching whole-code operand. Do not replace it
 // with merely inserting the recipe's expected bytes into readonly.
 fn detcore_validate_bind_readonly(
-    (elf, bytes): (&Elf<'_>, &[u8]),
+    (elf, bytes, writers): (&Elf<'_>, &[u8], &LoaderWriterIndex<'_, '_>),
     spec: &DetcoreValidateDataSpec,
     address: u64,
     context: &BTreeMap<String, Vec<u8>>,
@@ -18616,17 +18679,17 @@ fn detcore_validate_bind_readonly(
     let mut file_address = None;
     let mut file_hash = None;
     if let Some(filename) = filename {
-        fixed_no_data_relocation(elf, address, 24, Some(address))?;
-        let writers = extent_writers(elf, address, 24)?;
+        writers.no_data_relocation(address, 24, Some(address))?;
+        let at_location = writers.extent(address, 24)?;
         require(
-            writers.len() == 1
-                && writers[0].r_offset == address
-                && writers[0].r_type == reloc::R_X86_64_RELATIVE
-                && writers[0].r_sym == 0,
+            at_location.len() == 1
+                && at_location[0].r_offset == address
+                && at_location[0].r_type == reloc::R_X86_64_RELATIVE
+                && at_location[0].r_sym == 0,
             "Location lacks sole exact RELATIVE writer",
         )?;
         let file = u64::try_from(
-            writers[0]
+            at_location[0]
                 .r_addend
                 .ok_or("Location needs explicit addend")?,
         )
@@ -18636,13 +18699,13 @@ fn detcore_validate_bind_readonly(
             actual_file == filename,
             "whole physical source filename differs",
         )?;
-        fixed_no_data_relocation(elf, file, filename.len(), None)?;
+        writers.no_data_relocation(file, filename.len(), None)?;
         targets.insert(format!("{}_file", spec.key), file);
         fixed_insert_readonly(readonly, file, actual_file)?;
         file_address = Some(file);
         file_hash = Some(sha256(actual_file));
     } else {
-        fixed_no_data_relocation(elf, address, actual.len(), None)?;
+        writers.no_data_relocation(address, actual.len(), None)?;
     }
     fixed_insert_readonly(readonly, address, actual)?;
     targets.insert(spec.key.into(), address);
@@ -21333,6 +21396,7 @@ fn fixed_machine_context(
         symbol_evidence(elf.strtab.get_at(marker.st_name).unwrap(), &marker),
     );
     if image_kind == FixedImageKind::Detcore {
+        let writers = LoaderWriterIndex::new(elf)?;
         for (role, symbol) in roles {
             let actual = code
                 .get(&symbol.st_value)
@@ -21372,7 +21436,7 @@ fn fixed_machine_context(
                     let address =
                         fixed_rip_target(symbol.st_value, actual, op.displacement, op.next)?;
                     detcore_validate_bind_readonly(
-                        (elf, bytes),
+                        (elf, bytes, &writers),
                         spec,
                         address,
                         &compiled_filenames,
@@ -33758,6 +33822,80 @@ mod tests {
         assert_eq!(
             proof_function_bytes(&elf, &base, &functions).unwrap()[&0x1200],
             base[0x1200..0x1210]
+        );
+        let index = LoaderWriterIndex::new(&elf).unwrap();
+        for (address, length, offsets) in [
+            (0x3000, 8, vec![0x3000]),
+            (0x3007, 2, vec![0x3000]),
+            (0x3008, 8, vec![]),
+            (0x2fff, 1, vec![]),
+            (0x2fff, 2, vec![0x3000]),
+            (0x3100, 8, vec![0x3100]),
+        ] {
+            let actual = index.extent(address, length).unwrap();
+            assert_eq!(
+                actual.iter().map(|r| r.r_offset).collect::<Vec<_>>(),
+                offsets
+            );
+            let fresh = extent_writers(&elf, address, length).unwrap();
+            assert_eq!(actual, fresh);
+        }
+        assert_eq!(
+            index.extent(0x3000, 0).unwrap_err(),
+            "empty selected writer extent"
+        );
+        assert_eq!(
+            index.extent(u64::MAX, 2).unwrap_err(),
+            "selected writer extent overflows"
+        );
+        index.no_data_relocation(0x3000, 8, Some(0x3000)).unwrap();
+        index.no_data_relocation(0x3008, 8, None).unwrap();
+        assert!(index.no_data_relocation(0x3000, 8, None).is_err());
+        assert!(index.no_data_relocation(0x3004, 8, Some(0x3004)).is_err());
+        let mut unrelated = base.clone();
+        writer(&mut unrelated, 0, 0x3900, reloc::R_X86_64_RELATIVE, 0);
+        let parsed = Elf::parse(&unrelated).unwrap();
+        let unrelated_index = LoaderWriterIndex::new(&parsed).unwrap();
+        assert_eq!(
+            unrelated_index.extent(0x3000, 8).unwrap(),
+            index.extent(0x3000, 8).unwrap()
+        );
+        assert_eq!(
+            unrelated_index.extent(0x3900, 8).unwrap()[0].r_offset,
+            0x3900
+        );
+        // Queries target the first writer; malformed writers elsewhere must
+        // still refuse before any range can earn cached-list evidence.
+        for (address, kind, expected) in [
+            (
+                0x3104,
+                reloc::R_X86_64_RELATIVE,
+                "runtime relocation writer intervals overlap",
+            ),
+            (
+                0x3900,
+                u32::MAX,
+                "unsupported runtime relocation width for descriptor immutability",
+            ),
+            (
+                u64::MAX - 3,
+                reloc::R_X86_64_RELATIVE,
+                "runtime relocation writer extent overflows",
+            ),
+        ] {
+            let mut bad = base.clone();
+            writer(&mut bad, 0, address, kind, 0);
+            let parsed = Elf::parse(&bad).unwrap();
+            assert_eq!(LoaderWriterIndex::new(&parsed).err().unwrap(), expected);
+            assert_eq!(extent_writers(&parsed, 0x3000, 8).unwrap_err(), expected);
+        }
+        let mut relr = base.clone();
+        put(&mut relr, 0x34e0, 8, 36);
+        put(&mut relr, 0x34e8, 8, 0x4c00);
+        let parsed = Elf::parse(&relr).unwrap();
+        assert_eq!(
+            LoaderWriterIndex::new(&parsed).err().unwrap(),
+            "packed DT_RELR writes are not decoded for loaded-byte authentication"
         );
         let root = elf.syms.get(1).unwrap();
         assert_eq!(init_array_slot(&elf, &base, 0, &root).unwrap().0, 0x3100);
