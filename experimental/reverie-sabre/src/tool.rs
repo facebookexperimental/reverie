@@ -215,13 +215,7 @@ impl SyscallExt for Syscall {
         let (sysno, args) = self.into_parts();
 
         // Some syscalls need to be handled in a special way.
-        if sysno == Sysno::readlink {
-            utils::sys_readlink(
-                args.arg0 as *const libc::c_char,
-                args.arg1 as *mut libc::c_char,
-                args.arg2,
-            )
-        } else if sysno == Sysno::execve {
+        if sysno == Sysno::execve {
             utils::sys_execve(
                 args.arg0 as *const libc::c_char,
                 args.arg1 as *const *const libc::c_char,

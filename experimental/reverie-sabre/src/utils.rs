@@ -19,35 +19,6 @@ use super::paths;
 use super::signal;
 use crate::callbacks::CONTROLLED_EXIT_SIGNAL;
 
-/// `readlink` needs to be handled in a special way. If we're trying to read
-/// `/proc/self/exe`, then we can't return the path to the sabre executable. We
-/// need to replace it with the path to the real binary.
-///
-/// NOTE: This doesn't handle numerous other cases such as:
-///  1. Using `readlinkat(-100, "/proc/self/exe", ...)`
-///  2. Using `readlinkat(dir_fd, "exe", ...)`
-///  3. Using `readlink("/proc/{pid}/exe", ...)`
-pub fn sys_readlink(
-    path: *const libc::c_char,
-    buf: *mut libc::c_char,
-    bufsize: usize,
-) -> Result<usize, Errno> {
-    if unsafe { CStr::from_ptr(path) }.to_bytes() == b"/proc/self/exe" {
-        if buf.is_null() {
-            return Err(Errno::EFAULT);
-        }
-
-        let client_path = paths::client_path();
-        let len = client_path.to_bytes().len().min(bufsize);
-
-        unsafe { core::ptr::copy_nonoverlapping(client_path.as_ptr(), buf, len) };
-
-        Ok(len)
-    } else {
-        unsafe { syscall3(Sysno::readlink, path as usize, buf as usize, bufsize) }
-    }
-}
-
 const MAX_EXEC_ARG_POINTERS: usize = 1 << 18;
 
 fn exec_filename<'a>(filename: &'a CStr, client_path: &'a CStr) -> &'a CStr {
@@ -129,8 +100,9 @@ pub fn sys_execve(
 
     // SaBRe is the kernel-visible executable, so a native exec of
     // /proc/self/exe would otherwise re-enter the loader with SaBRe itself as
-    // the client. Preserve the guest-visible meaning already used by
-    // sys_readlink and execute the current client image instead.
+    // the client. Execute the current client image instead, the image the
+    // guest's /proc/self/exe names (a tool answers that link itself; Hermit's
+    // Detcore does from the image it records at each exec).
     let filename = exec_filename(unsafe { CStr::from_ptr(filename) }, paths::client_path());
 
     let arguments = collect_exec_arguments(argv)?;
