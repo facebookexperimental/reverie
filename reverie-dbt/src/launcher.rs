@@ -771,8 +771,9 @@ impl DbtRunner {
             && let Err(error) = evidence.publish_root(child.id())
         {
             if self.manages_process_group() {
-                let _ = terminate_process_group(child.id() as i32);
-                let _ = wait_for_process_group_no_live_members(child.id() as i32);
+                let _ = child.kill();
+                let _ = wait_for_exit_without_reaping(child.id());
+                let _ = terminate_run(child.id() as i32);
             } else {
                 let _ = child.kill();
             }
@@ -795,19 +796,13 @@ impl DbtRunner {
         if !self.manages_process_group() {
             child.wait()
         } else {
-            let process_group = child.id() as i32;
             let observed = wait_for_exit_without_reaping(child.id());
-            let terminated = if observed.is_ok() {
-                terminate_process_group(process_group)
-            } else {
-                Ok(())
-            };
-            let emptied = match (&observed, &terminated) {
-                (Ok(()), Ok(())) => wait_for_process_group_no_live_members(process_group),
-                _ => Ok(()),
+            let terminated = match &observed {
+                Ok(()) => terminate_run(child.id() as i32),
+                Err(_) => Ok(()),
             };
             let status = child.wait();
-            match (observed.and(terminated).and(emptied), status) {
+            match (observed.and(terminated), status) {
                 (Ok(()), status) => status,
                 (Err(error), _) => Err(error),
             }
@@ -946,8 +941,9 @@ impl DbtRunner {
 
     fn terminate_and_reap(&self, child: &mut Child) {
         if self.manages_process_group() {
-            let _ = terminate_process_group(child.id() as i32);
-            let _ = wait_for_process_group_no_live_members(child.id() as i32);
+            let _ = child.kill();
+            let _ = wait_for_exit_without_reaping(child.id());
+            let _ = terminate_run(child.id() as i32);
         }
         let _ = child.wait();
         let _ = self.finish_evidence(false);
@@ -993,7 +989,18 @@ impl DbtRunner {
         }
         command.args(&self.client_arguments);
         if self.evidence.is_some() || self.isolated_process_group {
-            command.arg("-isolated-process-group");
+            // The client finds the run's root from this pid (the process whose
+            // parent is this one), whatever process groups or sessions the
+            // guest makes.
+            command
+                .arg("-launcher-pid")
+                .arg(std::process::id().to_string());
+            // Outside a PID namespace of its own the run is contained by its
+            // process group (`terminate_run`), which the client then keeps
+            // the guest from leaving.
+            if !is_namespace_init() {
+                command.arg("-contain-by-process-group");
+            }
         }
         if self.summary {
             command.arg("-summary");
@@ -1032,7 +1039,9 @@ impl DbtRunner {
             }
         }
         command.env(HIDE_ENV_PREFIXES_ENV, PRIVATE_ENV_PREFIX);
-        if self.manages_process_group() {
+        // A PID namespace's init contains the run by the namespace
+        // (`terminate_run`); elsewhere the run gets its own process group.
+        if self.manages_process_group() && !is_namespace_init() {
             command.process_group(0);
         }
 
@@ -1462,6 +1471,91 @@ fn wait_for_exit_without_reaping(pid: u32) -> io::Result<()> {
     }
 }
 
+/// Whether this process is the init of its PID namespace (pid 1), as Hermit's
+/// container init is: then the namespace holds only the run.
+fn is_namespace_init() -> bool {
+    std::process::id() == 1
+}
+
+/// Kill every process of the run but its root, which has exited and is not
+/// yet reaped, and wait until none is left.
+///
+/// As a PID namespace's init, by the namespace: `kill(-1)` kills every
+/// process in it but this one, and each becomes this process's child to reap,
+/// whatever process group or session the guest put it in (`setsid`,
+/// `setpgid`), so none escapes. Elsewhere, by the run's own process group.
+fn terminate_run(root: i32) -> io::Result<()> {
+    if !is_namespace_init() {
+        terminate_process_group(root)?;
+        return wait_for_process_group_no_live_members(root);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        // Its result is not the test of an empty namespace: the root, a
+        // zombie kept for the caller to reap, still counts as signalled.
+        // SAFETY: from a namespace init, -1 names every other process of the
+        // namespace.
+        unsafe { libc::kill(-1, libc::SIGKILL) };
+        let mut left = false;
+        for (pid, state) in own_children()? {
+            if pid == root {
+                continue;
+            }
+            left = true;
+            if matches!(state, 'Z' | 'X') {
+                // SAFETY: reaps exactly this exited child.
+                unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+            }
+        }
+        // Every process of the namespace descends from its init, and one
+        // whose parent dies becomes the init's child, so no child but the
+        // root means no process of the run is left.
+        if !left {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "DBT containment: the run's processes did not die within 5 s",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// This process's children, each with its state, from `/proc/<pid>/stat`.
+fn own_children() -> io::Result<Vec<(i32, char)>> {
+    let me = std::process::id() as i32;
+    let mut children = Vec::new();
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some(after_name) = stat.rsplit_once(')').map(|(_, tail)| tail.trim_start()) else {
+            continue;
+        };
+        let mut fields = after_name.split_ascii_whitespace();
+        let (Some(state), Some(parent)) = (
+            fields.next().and_then(|field| field.chars().next()),
+            fields.next().and_then(|field| field.parse::<i32>().ok()),
+        ) else {
+            continue;
+        };
+        if parent == me {
+            children.push((pid, state));
+        }
+    }
+    Ok(children)
+}
+
 fn terminate_process_group(process_group: i32) -> io::Result<()> {
     // SAFETY: the launcher created a distinct process group whose id is the
     // still-unreaped child pid. The negative id targets only that group.
@@ -1836,7 +1930,7 @@ mod tests {
         assert!(
             !cleanup_only
                 .get_args()
-                .any(|argument| argument == OsStr::new("-isolated-process-group"))
+                .any(|argument| argument == OsStr::new("-launcher-pid"))
         );
     }
 
@@ -1869,7 +1963,9 @@ mod tests {
                 "-diagnostic_fd",
                 "198",
                 "-panic-on-unsupported-syscalls",
-                "-isolated-process-group",
+                "-launcher-pid",
+                &std::process::id().to_string(),
+                "-contain-by-process-group",
                 "--",
                 "/bin/true",
             ]

@@ -514,13 +514,57 @@ static void translate_process_robust_lists(
     bool restore);
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-84): Review isolation-aware process-group termination.
+// The run's root: the launcher's child, which execs drrun into the guest.
+// Found from the launcher's pid by walking parents (`launch_root_below`), so it
+// does not depend on the guest's process groups or sessions. The name is
+// historical: it was the launch process group, whose id was the root's pid.
 static process_id_t runtime_process_group;
+// Whether the launcher contains the run by its process group, which a guest's
+// setsid or setpgid would leave (`-contain-by-process-group`).
+static bool contain_by_process_group;
+
+// The parent of `pid`, from /proc/<pid>/stat, or 0 where it cannot be read.
+static process_id_t parent_of(process_id_t pid) {
+  char path[64];
+  char buffer[512];
+  dr_snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0)
+    return 0;
+  ssize_t length = read(fd, buffer, sizeof(buffer) - 1);
+  close(fd);
+  if (length <= 0)
+    return 0;
+  buffer[length] = '\0';
+  // The name is in parentheses and may hold anything; the state and the
+  // parent follow the last ')'.
+  char* tail = strrchr(buffer, ')');
+  int parent = 0;
+  char state = 0;
+  if (tail == NULL || dr_sscanf(tail + 1, " %c %d", &state, &parent) != 2)
+    return 0;
+  return (process_id_t)parent;
+}
+
+// The run's root: this process or the ancestor of it whose parent is the
+// launcher, or whose parent is outside this PID namespace (0). A process the
+// launcher adopted after its parent exited is its own root here; the launcher
+// drains it when the run's root exits.
+static process_id_t launch_root_below(process_id_t launcher) {
+  process_id_t pid = dr_get_process_id();
+  for (int depth = 0; depth < 4096; depth++) {
+    process_id_t parent = parent_of(pid);
+    if (parent == 0 || parent == launcher)
+      return pid;
+    pid = parent;
+  }
+  return 0;
+}
 static void exit_runtime_tree(int exit_code) {
   mark_backend_failure();
   // A copied child cannot kill its own process group and then run DynamoRIO
-  // cleanup. Kill the launch-group leader instead; the out-of-group launcher
-  // reaps it and terminates the remaining isolated group after preserving its
-  // exit status.
+  // cleanup. Kill the run's root instead; the launcher reaps it and
+  // terminates the rest of the run after preserving its exit status.
   if (runtime_process_group != 0 &&
       runtime_process_group != dr_get_process_id())
     kill((pid_t)runtime_process_group, SIGKILL);
@@ -4924,7 +4968,11 @@ static bool pre_syscall(void* drcontext, int sysnum) {
   // TODO-HUMAN-REVIEW(PR-84): Review process-group mutation refusal in isolated
   // runtimes. Group containment does not rely on mutable gateway bytes: copied
   // runtimes reject the ambiguous i386 raw numbers even if gateway proof races.
-  if (runtime_process_group != 0 &&
+  // Only where the launcher contains the run by its process group: as a PID
+  // namespace's init (Hermit's container) it contains the run by the
+  // namespace, so a guest's setsid and setpgid go to the Tool like any other
+  // call (slice B3a-4c of https://github.com/rrnewton/hermit/issues/4266).
+  if (contain_by_process_group &&
       (sysnum == SYS_setsid || sysnum == SYS_setpgid ||
        (has_copied_runtime() &&
         (sysnum == X86_32_SYS_SETPGID || sysnum == X86_32_SYS_SETSID)))) {
@@ -6434,8 +6482,13 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
         strcmp(argv[i], "-test-backend-failure-sender-lookup-miss") == 0 ||
         strcmp(argv[i], "-test-compare-exchange") == 0) {
       /* Used only by native lifecycle regression tests. */
-    } else if (strcmp(argv[i], "-isolated-process-group") == 0)
-      runtime_process_group = (process_id_t)getpgrp();
+    } else if (strcmp(argv[i], "-launcher-pid") == 0) {
+      unsigned long long launcher = 0;
+      DR_ASSERT(++i < argc);
+      DR_ASSERT(dr_sscanf(argv[i], "%llu", &launcher) == 1);
+      runtime_process_group = launch_root_below((process_id_t)launcher);
+    } else if (strcmp(argv[i], "-contain-by-process-group") == 0)
+      contain_by_process_group = true;
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-dbi-preempt): Review branch-count preemption
     // argument.

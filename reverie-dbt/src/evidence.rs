@@ -1361,11 +1361,30 @@ fn is_isolated_process_group_member(process: ProcessKey, root_pid: u32) -> bool 
     stat.start_time == process.start_time && stat.process_group == root_pid as i32
 }
 
+/// Whether `process` is a process of the run that lost its parent and was
+/// adopted by this process: where the launcher is its PID namespace's init,
+/// the namespace holds only the run, so every orphan of the run becomes its
+/// child, whatever process group or session the guest put it in.
+fn is_reparented_run_process(process: ProcessKey, root: ProcessKey) -> bool {
+    let Ok(stat) = process_stat(process.pid) else {
+        return false;
+    };
+    stat.start_time == process.start_time
+        && process.pid != root.pid
+        && stat.parent == std::process::id()
+        && process.start_time >= root.start_time
+}
+
 fn initial_peer_is_admissible(process: ProcessKey, root: ProcessKey) -> bool {
-    // Evidence mode forces a dedicated process group and the native client
-    // rejects setpgid/setsid. Descendants inherit that group, and reparenting
-    // does not change it; pid+starttime prevents reuse from inheriting admission.
-    is_process_descendant(process, root) || is_isolated_process_group_member(process, root.pid)
+    // A process of the run is the root's descendant. Once its parent exited:
+    // where the launcher is its PID namespace's init (as under Hermit), it is
+    // the launcher's child, whatever process group or session the guest put
+    // it in; elsewhere the launcher put the run in a dedicated process group,
+    // which reparenting does not change. pid+starttime prevents reuse from
+    // inheriting admission.
+    is_process_descendant(process, root)
+        || (std::process::id() == 1 && is_reparented_run_process(process, root))
+        || is_isolated_process_group_member(process, root.pid)
 }
 
 fn publish(output: &mut File, collected: CollectedEvidence) -> io::Result<()> {
@@ -2576,6 +2595,59 @@ mod tests {
             .absorb(FRAME_FINAL, root, 3, &[FINAL_GUEST_COMPLETED])
             .unwrap();
         collector.finish().unwrap();
+    }
+
+    /// A process of the run that left its process group and session and
+    /// whose parent exited is recognised as the run's once this process has
+    /// adopted it, as a PID namespace init adopts every orphan.
+    #[test]
+    fn an_adopted_orphan_that_left_its_session_is_the_runs() {
+        use std::io::BufRead as _;
+        use std::process::Command;
+        use std::process::Stdio;
+
+        // SAFETY: prctl with integer arguments only. This test's process
+        // adopts orphans as an init would.
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+            0
+        );
+        let mut root_child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "setsid sleep 30 >/dev/null 2>&1 & echo $!; sleep 0.1; exit 0",
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let root = ProcessKey {
+            pid: root_child.id(),
+            start_time: process_start_time(root_child.id()).unwrap(),
+        };
+        let mut pid_line = String::new();
+        std::io::BufReader::new(root_child.stdout.take().unwrap())
+            .read_line(&mut pid_line)
+            .unwrap();
+        let orphan_pid: u32 = pid_line.trim().parse().unwrap();
+        let orphan = ProcessKey {
+            pid: orphan_pid,
+            start_time: process_start_time(orphan_pid).unwrap(),
+        };
+        root_child.wait().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !is_reparented_run_process(orphan, root) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(is_reparented_run_process(orphan, root));
+        assert!(!is_isolated_process_group_member(orphan, root.pid));
+        // A process that was not the run's: this one.
+        let me = ProcessKey {
+            pid: std::process::id(),
+            start_time: process_start_time(std::process::id()).unwrap(),
+        };
+        assert!(!is_reparented_run_process(me, root));
+        // SAFETY: a positive pid names exactly the orphan.
+        unsafe { libc::kill(orphan_pid as i32, libc::SIGKILL) };
     }
 
     #[test]
