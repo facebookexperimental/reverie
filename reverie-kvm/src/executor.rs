@@ -203,7 +203,6 @@ const GUEST_NOFILE_LIMIT: libc::c_int = 1 << 20;
 // TODO-HUMAN-REVIEW(PR-235): Review the single virtual network namespace identity.
 const GUEST_NETNS_COOKIE: u64 = 1;
 const ROBUST_LIST_HEAD_SIZE: u64 = 3 * std::mem::size_of::<u64>() as u64;
-const MEMBARRIER_SUPPORTED: libc::c_int = 0x1;
 // prctl(2) PR_CAPBSET_READ option; the deterministic container runs the guest as
 // root with the full capability bounding set up to a fixed CAP_LAST_CAP so the
 // answer is host-independent.
@@ -1351,10 +1350,22 @@ fn execute_basic_syscall_inner(
         // AUTONOMOUS-BOT-IMPLEMENTED
         ioprio_set(state, args)
     } else if number == libc::SYS_membarrier as u64 {
-        match (args[0] as libc::c_int, args[1] as libc::c_uint) {
-            (0, 0) => i64::from(MEMBARRIER_SUPPORTED),
-            (1, 0) => 0,
-            _ => negative_errno(libc::EINVAL),
+        // The host's membarrier, every command: the guest's threads are host
+        // threads of this process. Detcore answers membarrier itself and
+        // never injects it.
+        // SAFETY: membarrier takes no pointer.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_membarrier,
+                args[0] as libc::c_int,
+                args[1] as libc::c_uint,
+                args[2] as libc::c_int,
+            )
+        };
+        if result < 0 {
+            io_error(std::io::Error::last_os_error())
+        } else {
+            result
         }
     } else if number == libc::SYS_getrandom as u64 {
         getrandom(&mut ProviderMemory(memory), args[0], args[1], args[2])
@@ -20866,39 +20877,61 @@ fn mincore<M: GuestMemoryAccess<Error = crate::Error> + AddressSpace>(
     }
 }
 
+/// `getcpu(2)` from the host: the CPU and node the calling host thread is on.
+/// Detcore answers getcpu itself and never injects it.
 fn getcpu<M: GuestMemoryAccess<Error = crate::Error>>(memory: &mut M, args: &[u64; 6]) -> i64 {
+    let mut cpu = 0_u32;
+    let mut node = 0_u32;
+    // SAFETY: both pointers name live host u32s; the cache argument is unused.
+    if unsafe { libc::syscall(libc::SYS_getcpu, &mut cpu, &mut node, 0_usize) } != 0 {
+        return io_error(std::io::Error::last_os_error());
+    }
     if args[0] != 0 {
-        let result = write_struct(memory, args[0], &0_u32);
+        let result = write_struct(memory, args[0], &cpu);
         if result != 0 {
             return result;
         }
     }
     if args[1] != 0 {
-        return write_struct(memory, args[1], &0_u32);
+        return write_struct(memory, args[1], &node);
     }
     0
 }
 
+/// `sched_getaffinity(2)` from the host for the calling task. Another guest
+/// pid would name a different host process by its number, so it is answered
+/// ESRCH, as for a task that does not exist. Detcore answers
+/// sched_getaffinity itself and never injects it.
 fn sched_getaffinity<M: GuestMemoryAccess<Error = crate::Error>>(
     memory: &mut M,
     state: &LoadedStaticElf,
     args: &[u64; 6],
 ) -> i64 {
-    let requested_pid = args[0] as i64;
-    if requested_pid != 0 && requested_pid != i64::from(state.pid) {
+    // Large enough for any host CPU mask (Linux's NR_CPUS is at most 8192).
+    const MAX_MASK_BYTES: usize = 8192 / 8;
+    let requested_pid = args[0] as libc::pid_t;
+    if requested_pid != 0 && requested_pid != state.pid {
         return negative_errno(libc::ESRCH);
     }
-    const MASK_BYTES: usize = std::mem::size_of::<libc::c_ulong>();
-    let Ok(capacity) = usize::try_from(args[1]) else {
-        return negative_errno(libc::EINVAL);
-    };
-    if capacity < MASK_BYTES {
+    let length = args[1] as libc::c_uint as usize;
+    if !length.is_multiple_of(std::mem::size_of::<libc::c_ulong>()) {
         return negative_errno(libc::EINVAL);
     }
-    let mut mask = [0_u8; MASK_BYTES];
-    mask[0] = 1;
-    match memory.write_exact(args[2], &mask) {
-        Ok(()) => MASK_BYTES as i64,
+    let mut mask = vec![0_u8; length.min(MAX_MASK_BYTES)];
+    // SAFETY: the pointer names `mask.len()` writable host bytes.
+    let returned = unsafe {
+        libc::syscall(
+            libc::SYS_sched_getaffinity,
+            0,
+            mask.len(),
+            mask.as_mut_ptr(),
+        )
+    };
+    if returned < 0 {
+        return io_error(std::io::Error::last_os_error());
+    }
+    match memory.write_exact(args[2], &mask[..returned as usize]) {
+        Ok(()) => returned,
         Err(_) => negative_errno(libc::EFAULT),
     }
 }
@@ -62065,7 +62098,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_residency_and_cpu_topology_are_deterministic() {
+    fn memory_residency_is_deterministic_and_cpu_topology_is_the_hosts() {
         const VECTOR: u64 = 4 * PAGE_SIZE;
         const CPU: u64 = 0x100;
         const NODE: u64 = 0x108;
@@ -62194,6 +62227,8 @@ mod tests {
             ),
             negative_errno(libc::EINVAL)
         );
+        // getcpu, sched_getaffinity and membarrier are the host's: compare
+        // each answer with the host's own call with the same arguments.
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -62203,81 +62238,48 @@ mod tests {
             ),
             0
         );
-        assert_eq!(read_struct::<u32>(&memory, CPU), 0);
-        assert_eq!(read_struct::<u32>(&memory, NODE), 0);
+        // SAFETY: sysconf takes no pointer.
+        let cpus = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_CONF) } as u32;
+        assert!(read_struct::<u32>(&memory, CPU) < cpus);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_getcpu,
+                [u64::MAX, 0, 0, 0, 0, 0]
+            ),
+            negative_errno(libc::EFAULT)
+        );
+
+        let mut host_mask = [0_u8; 1024];
+        // SAFETY: the pointer names 1024 writable bytes.
+        let host_length = unsafe {
+            libc::syscall(
+                libc::SYS_sched_getaffinity,
+                0,
+                host_mask.len(),
+                host_mask.as_mut_ptr(),
+            )
+        };
+        assert!(host_length > 0);
         assert_eq!(
             syscall_result(
                 &mut memory,
                 &mut state,
                 libc::SYS_sched_getaffinity,
-                [0, 8, AFFINITY, 0, 0, 0],
+                [0, 1024, AFFINITY, 0, 0, 0],
             ),
-            8
+            host_length
         );
-        assert_eq!(
-            read_guest_bytes::<8>(&ProviderMemory(&memory), AFFINITY).unwrap(),
-            [1, 0, 0, 0, 0, 0, 0, 0]
-        );
+        let mut guest_mask = vec![0_u8; host_length as usize];
+        memory.read(AFFINITY, &mut guest_mask).unwrap();
+        assert_eq!(guest_mask, host_mask[..host_length as usize]);
         assert_eq!(
             syscall_result(
                 &mut memory,
                 &mut state,
-                libc::SYS_membarrier,
-                [0, 0, 0, 0, 0, 0],
-            ),
-            i64::from(MEMBARRIER_SUPPORTED)
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_membarrier,
-                [0, 0, 123, 0, 0, 0],
-            ),
-            i64::from(MEMBARRIER_SUPPORTED)
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_membarrier,
-                [1_u64 << 32, 1_u64 << 32, 123, 0, 0, 0],
-            ),
-            i64::from(MEMBARRIER_SUPPORTED)
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_membarrier,
-                [1, 0, 0, 0, 0, 0],
-            ),
-            0
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_membarrier,
-                [1, 0, 123, 0, 0, 0],
-            ),
-            0
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_membarrier,
-                [(1_u64 << 32) | 1, 1_u64 << 32, 123, 0, 0, 0],
-            ),
-            0
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_membarrier,
-                [3, 0, 0, 0, 0, 0],
+                libc::SYS_sched_getaffinity,
+                [0, 1023, AFFINITY, 0, 0, 0],
             ),
             negative_errno(libc::EINVAL)
         );
@@ -62285,20 +62287,48 @@ mod tests {
             syscall_result(
                 &mut memory,
                 &mut state,
-                libc::SYS_membarrier,
-                [0, 1, 0, 0, 0, 0],
+                libc::SYS_sched_getaffinity,
+                [12345, 1024, AFFINITY, 0, 0, 0],
             ),
-            negative_errno(libc::EINVAL)
+            negative_errno(libc::ESRCH)
         );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_membarrier,
-                [1 << 20, 0, 0, 0, 0, 0],
-            ),
-            negative_errno(libc::EINVAL)
-        );
+
+        let host_membarrier = |args: [u64; 3]| {
+            // SAFETY: membarrier takes no pointer.
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_membarrier,
+                    args[0] as libc::c_int,
+                    args[1] as libc::c_uint,
+                    args[2] as libc::c_int,
+                )
+            };
+            if result < 0 {
+                -i64::from(std::io::Error::last_os_error().raw_os_error().unwrap())
+            } else {
+                result
+            }
+        };
+        for args in [
+            [0, 0, 0],
+            [0, 0, 123],
+            [1_u64 << 32, 1_u64 << 32, 123],
+            [1, 0, 0],
+            [3, 0, 0],
+            [0, 1, 0],
+            [1 << 20, 0, 0],
+        ] {
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_membarrier,
+                    [args[0], args[1], args[2], 0, 0, 0],
+                ),
+                host_membarrier(args),
+                "{args:?}"
+            );
+        }
     }
 
     include!("wait4_copyout_tests.rs");
