@@ -2606,8 +2606,48 @@ mod tests {
         use std::process::Command;
         use std::process::Stdio;
 
+        /// Restores the test process's child-subreaper setting, and kills and
+        /// reaps the orphan it adopted, however the test ends.
+        struct Adoption {
+            previous: libc::c_int,
+            orphan: Option<i32>,
+        }
+        impl Drop for Adoption {
+            fn drop(&mut self) {
+                if let Some(orphan) = self.orphan {
+                    // SAFETY: a positive pid names exactly the orphan, which
+                    // this process adopted, so it is this process's child to
+                    // reap.
+                    unsafe {
+                        libc::kill(orphan, libc::SIGKILL);
+                        libc::waitpid(orphan, std::ptr::null_mut(), 0);
+                    }
+                }
+                // SAFETY: prctl with integer arguments only.
+                unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, self.previous, 0, 0, 0) };
+            }
+        }
+
+        let mut previous: libc::c_int = 0;
+        // SAFETY: PR_GET_CHILD_SUBREAPER writes one int through the pointer.
+        assert_eq!(
+            unsafe {
+                libc::prctl(
+                    libc::PR_GET_CHILD_SUBREAPER,
+                    &mut previous as *mut libc::c_int,
+                    0,
+                    0,
+                    0,
+                )
+            },
+            0
+        );
+        let mut adoption = Adoption {
+            previous,
+            orphan: None,
+        };
         // SAFETY: prctl with integer arguments only. This test's process
-        // adopts orphans as an init would.
+        // adopts orphans as an init would, until `adoption` is dropped.
         assert_eq!(
             unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
             0
@@ -2629,6 +2669,7 @@ mod tests {
             .read_line(&mut pid_line)
             .unwrap();
         let orphan_pid: u32 = pid_line.trim().parse().unwrap();
+        adoption.orphan = Some(orphan_pid as i32);
         let orphan = ProcessKey {
             pid: orphan_pid,
             start_time: process_start_time(orphan_pid).unwrap(),
@@ -2646,8 +2687,7 @@ mod tests {
             start_time: process_start_time(std::process::id()).unwrap(),
         };
         assert!(!is_reparented_run_process(me, root));
-        // SAFETY: a positive pid names exactly the orphan.
-        unsafe { libc::kill(orphan_pid as i32, libc::SIGKILL) };
+        drop(adoption);
     }
 
     #[test]
