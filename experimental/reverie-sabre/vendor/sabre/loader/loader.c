@@ -319,7 +319,9 @@ static int parse_shebang(const char *client_path,
  * first, as the kernel would, and passes the argv the kernel would give it.
  * The settings go to the plugin as its arguments after its path: SaBRe
  * loads the plugin into the client's own libc, so SaBRe's environment would
- * not reach it, and the client's would reach the guest.
+ * not reach it, and the client's would reach the guest. The loader also
+ * reads its own two: the bootstrap option, which it consumes, and the stats
+ * descriptor, which it shares with the plugin.
  */
 #define SBR_LAUNCH_MAGIC "SABRE-LAUNCH-V1"
 #define SBR_LAUNCH_MAX_BYTES (64 * 1024)
@@ -403,6 +405,12 @@ static bool read_launch_spec(struct launch_spec *spec) {
       sbr_bootstrap_option_from_launch(value + sizeof(SBR_BOOTSTRAP_ENV));
       continue;
     }
+    /* The loader counts patches and dispatches on the same stats page as the
+     * plugin, so both get this setting. */
+    if (strncmp(value, SBR_BACKEND_STATS_ENV "=",
+                sizeof(SBR_BACKEND_STATS_ENV)) == 0)
+      sbr_backend_stats_option_from_launch(value +
+                                           sizeof(SBR_BACKEND_STATS_ENV));
     settings[setting_count++] = (char *)value;
   }
   if (at != size)

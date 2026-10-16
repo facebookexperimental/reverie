@@ -61,6 +61,9 @@ struct sbr_backend_stats {
 };
 
 void sbr_backend_stats_init(void);
+/* The stats descriptor setting from a launch specification, which does not
+ * put it in SaBRe's environment. Call before sbr_backend_stats_init. */
+void sbr_backend_stats_option_from_launch(const char *value);
 void sbr_backend_stats_record_patch(void *rip, unsigned instruction_length,
                                     enum sbr_patch_route route);
 void sbr_backend_stats_record_slow_path(enum sbr_slow_path path);

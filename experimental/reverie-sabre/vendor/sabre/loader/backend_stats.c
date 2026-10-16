@@ -24,14 +24,20 @@ struct rewrite_sigill_site {
 };
 
 static struct sbr_backend_stats *stats;
+static const char *launch_value;
 static struct rewrite_sigill_site *rewrite_sigill_sites;
 
 static void increment(uint64_t *counter) {
   __atomic_fetch_add(counter, UINT64_C(1), __ATOMIC_RELAXED);
 }
 
+void sbr_backend_stats_option_from_launch(const char *value) {
+  launch_value = value;
+}
+
 void sbr_backend_stats_init(void) {
-  const char *value = getenv(SBR_BACKEND_STATS_ENV);
+  const char *value =
+      launch_value != NULL ? launch_value : getenv(SBR_BACKEND_STATS_ENV);
   if (value == NULL)
     return;
 
