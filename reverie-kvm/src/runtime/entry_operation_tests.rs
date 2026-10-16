@@ -353,7 +353,11 @@ struct ProbeExecutor {
     ledger: Vec<reverie::SignalDequeue>,
 }
 impl LinuxProvider for ProbeExecutor {
-    fn execute(&mut self, request: &SyscallRequest, _: &GuestMemory) -> Result<ProviderOutcome> {
+    type Memory = GuestMemory;
+    type Error = crate::Error;
+
+    fn execute(&mut self, request: &ProviderRequest, _: &GuestMemory) -> Result<ProviderOutcome> {
+        let request = SyscallRequest::from_provider(request);
         assert_eq!(request.number(), libc::SYS_close as u64);
         assert_eq!(request.args()[0], 9);
         self.counts.dispatches.fetch_add(1, Ordering::SeqCst);

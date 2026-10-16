@@ -624,7 +624,7 @@ fn pdeath_stale_registration_get_and_frozen_receiver_do_not_target_reused_pid() 
     }
     assert_eq!(child.state.task_lifecycle.lock().unwrap().set_parent_death_signal(stale, u64::MAX), Err(reverie::syscalls::Errno::EINVAL));
     memory.write(0x100, &[0x5a; 8]).unwrap();
-    assert_eq!(super::prctl(&mut memory, &mut child.state,
+    assert_eq!(super::prctl(&mut ProviderMemory(&memory), &mut child.state,
         &[libc::PR_GET_PDEATHSIG as u64, 0x100, 0, 0, 0, 0]), -i64::from(libc::ESRCH));
     let mut bytes = [0; 8]; memory.read(0x100, &mut bytes).unwrap(); assert_eq!(bytes, [0x5a; 8]);
     let boundary = reverie::SignalBoundaryReceipt { permit, outcome:

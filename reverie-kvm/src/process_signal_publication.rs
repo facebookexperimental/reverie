@@ -4213,7 +4213,14 @@ mod tests {
             iov_base: RIGHTS_BYTE as *mut libc::c_void,
             iov_len: 1,
         };
-        assert_eq!(super::super::write_struct(memory, RIGHTS_IOV, &iov), 0);
+        assert_eq!(
+            super::super::write_struct(
+                &mut crate::provider_memory::ProviderMemory(memory),
+                RIGHTS_IOV,
+                &iov
+            ),
+            0
+        );
         // SAFETY: an all-zero msghdr is a valid empty header.
         let mut header: libc::msghdr = unsafe { std::mem::zeroed() };
         header.msg_iov = RIGHTS_IOV as *mut libc::iovec;
@@ -4221,7 +4228,11 @@ mod tests {
         header.msg_control = RIGHTS_CONTROL as *mut libc::c_void;
         header.msg_controllen = control_length;
         assert_eq!(
-            super::super::write_struct(memory, RIGHTS_HEADER, &header),
+            super::super::write_struct(
+                &mut crate::provider_memory::ProviderMemory(memory),
+                RIGHTS_HEADER,
+                &header
+            ),
             0
         );
     }

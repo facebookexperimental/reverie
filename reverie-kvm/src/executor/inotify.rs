@@ -243,7 +243,7 @@ fn inotify_add_watch(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64;
     if let Err(error) = inotify_add_watch_preflight(host_fd, mask, libc::ENOENT) {
         return error;
     }
-    let path = match read_c_string(memory, args[1], libc::PATH_MAX as usize) {
+    let path = match read_c_string(&ProviderMemory(memory), args[1], libc::PATH_MAX as usize) {
         Ok(path) if !path.is_empty() => path,
         Ok(_) => return negative_errno(libc::ENOENT),
         Err(error) => return read_c_string_errno(error),

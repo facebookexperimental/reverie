@@ -18,6 +18,7 @@ members = [
     "reverie-e9patch",
     "reverie-examples",
     "reverie-kvm",
+    "reverie-linux-provider",
     "reverie-liteinst",
     "reverie-liteinst-artifact",
     "reverie-liteinst-preload",

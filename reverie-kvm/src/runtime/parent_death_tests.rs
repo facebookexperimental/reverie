@@ -184,7 +184,9 @@ fn initial_exec_preflight_requires_original_context_and_keeps_enrollment_after_r
         assert!(
             matches!(
                 <StaticElfSyscallExecutor<'_> as LinuxProvider>::execute(
-                    &mut e, &original, &memory
+                    &mut e,
+                    original.as_provider(),
+                    &memory
                 ),
                 Err(crate::Error::ParentDeathSignal { .. })
             ),
@@ -253,8 +255,12 @@ fn default_preflight_refuses_but_live_unopted_static_executor_continues() {
         assert_eq!(<StaticElfSyscallExecutor<'_> as LinuxEmuSignalControl>::parent_death_syscall_preflight(
             &e, original.into_syscall().unwrap()).unwrap(), reverie::ParentDeathSyscallAdmission::Unenrolled);
         assert_eq!(
-            <StaticElfSyscallExecutor<'_> as LinuxProvider>::execute(&mut e, &original, &memory)
-                .unwrap(),
+            <StaticElfSyscallExecutor<'_> as LinuxProvider>::execute(
+                &mut e,
+                original.as_provider(),
+                &memory
+            )
+            .unwrap(),
             ProviderOutcome::Return(0)
         );
     }

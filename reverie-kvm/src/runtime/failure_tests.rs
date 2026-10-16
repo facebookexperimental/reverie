@@ -139,7 +139,10 @@ impl Tool for RpcTool {
 
 struct NoGuestExecution;
 impl LinuxProvider for NoGuestExecution {
-    fn execute(&mut self, _: &SyscallRequest, _: &GuestMemory) -> Result<ProviderOutcome> {
+    type Memory = GuestMemory;
+    type Error = crate::Error;
+
+    fn execute(&mut self, _: &ProviderRequest, _: &GuestMemory) -> Result<ProviderOutcome> {
         panic!("native RPC control continued guest execution")
     }
 }

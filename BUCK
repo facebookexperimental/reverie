@@ -350,6 +350,21 @@ rust_library(
     ],
 )
 
+rust_library(
+    name = "reverie-linux-provider",
+    srcs = glob(["reverie-linux-provider/src/**/*.rs"]),
+    autocargo = {
+        "cargo_toml_config": {
+            "package": dict(_PUBLIC_CRATE_METADATA, documentation = "https://docs.rs/reverie-linux-provider"),
+        },
+        "cargo_toml_dir": "reverie-linux-provider",
+    },
+    deps = [
+        "fbsource//third-party/rust:libc",
+        ":reverie",
+    ],
+)
+
 fb_native.cxx_library(
     name = "reverie-kvm-terminal-read",
     srcs = ["reverie-kvm/src/terminal_read.c"],
@@ -384,6 +399,7 @@ rust_library(
         "fbsource//third-party/rust:thiserror",
         ":reverie",
         ":reverie-kvm-terminal-read",
+        ":reverie-linux-provider",
     ],
 )
 

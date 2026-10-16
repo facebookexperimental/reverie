@@ -21,7 +21,10 @@ impl Tool for AdapterTool {
 }
 struct RefusingExecutor;
 impl LinuxProvider for RefusingExecutor {
-    fn execute(&mut self, _: &SyscallRequest, _: &GuestMemory) -> Result<ProviderOutcome> {
+    type Memory = GuestMemory;
+    type Error = crate::Error;
+
+    fn execute(&mut self, _: &ProviderRequest, _: &GuestMemory) -> Result<ProviderOutcome> {
         panic!("terminal cancellation executed a syscall")
     }
 }
@@ -61,11 +64,15 @@ fn terminal_read_injection_keeps_nonreturning_cancellation_and_typed_failures() 
         wrapped: usize,
     }
     impl LinuxProvider for ReadExecutor {
+        type Memory = GuestMemory;
+        type Error = crate::Error;
+
         fn execute(
             &mut self,
-            request: &SyscallRequest,
+            request: &ProviderRequest,
             _: &GuestMemory,
         ) -> Result<ProviderOutcome> {
+            let request = SyscallRequest::from_provider(request);
             assert_eq!(request.number(), libc::SYS_read as u64);
             assert_eq!(request.args()[..3], [0, 0, 0]);
             self.result
@@ -702,11 +709,15 @@ fn wait_group_exit_injection_is_nonreturning_and_failure_still_wins() {
         wrapped: usize,
     }
     impl LinuxProvider for WaitExecutor {
+        type Memory = GuestMemory;
+        type Error = crate::Error;
+
         fn execute(
             &mut self,
-            request: &SyscallRequest,
+            request: &ProviderRequest,
             _: &GuestMemory,
         ) -> Result<ProviderOutcome> {
+            let request = SyscallRequest::from_provider(request);
             assert_eq!(request.number(), libc::SYS_waitid as u64);
             if let Some(failure) = self.fail.take() {
                 failure.publish();

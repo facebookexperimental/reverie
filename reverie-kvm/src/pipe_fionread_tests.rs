@@ -178,7 +178,7 @@ fn pipe_fionread_capture_objects_and_unavailable_identity_are_refused() {
         assert_eq!(unsafe { libc::close(2) }, 0);
         assert_eq!(
             pipe_fionread(
-                &memory,
+                &ProviderMemory(&memory),
                 &executor.state,
                 10,
                 executor.state.files[&10].as_raw_fd(),

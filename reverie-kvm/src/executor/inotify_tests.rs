@@ -65,7 +65,7 @@ mod inotify_tests {
     fn set_path(memory: &mut GuestMemory, path: &[u8]) {
         let mut bytes = path.to_vec();
         bytes.push(0);
-        assert_eq!(write_bytes(memory, PATH, &bytes), 0);
+        assert_eq!(write_bytes(&mut ProviderMemory(memory), PATH, &bytes), 0);
     }
 
     fn create(state: &mut LoadedStaticElf, memory: &mut GuestMemory) -> i64 {
@@ -245,7 +245,7 @@ mod inotify_tests {
             negative_errno(libc::ENOSYS)
         );
         assert_ne!(fd_status_flags(host).unwrap() & libc::O_NONBLOCK, 0);
-        assert_eq!(write_struct(&mut memory, BUFFER, &0_i32), 0);
+        assert_eq!(write_struct(&mut ProviderMemory(&memory), BUFFER, &0_i32), 0);
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -266,7 +266,7 @@ mod inotify_tests {
             ),
             0
         );
-        assert_eq!(write_struct(&mut memory, BUFFER, &1_i32), 0);
+        assert_eq!(write_struct(&mut ProviderMemory(&memory), BUFFER, &1_i32), 0);
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -291,7 +291,7 @@ mod inotify_tests {
             iov_base: BUFFER as *mut libc::c_void,
             iov_len: 64,
         };
-        assert_eq!(write_struct(&mut memory, PATH, &iovec), 0);
+        assert_eq!(write_struct(&mut ProviderMemory(&memory), PATH, &iovec), 0);
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -690,7 +690,7 @@ mod inotify_tests {
             iov_base: BUFFER as *mut libc::c_void,
             iov_len: 4096,
         };
-        assert_eq!(write_struct(&mut memory, PATH, &iovec), 0);
+        assert_eq!(write_struct(&mut ProviderMemory(&memory), PATH, &iovec), 0);
         let count = syscall_result(
             &mut memory,
             &mut state,

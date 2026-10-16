@@ -54,6 +54,7 @@ use crate::provider_memory::GuestMemoryAccess;
 use crate::provider_memory::LentOperand;
 use crate::provider_memory::LentOperandMut;
 use crate::provider_memory::MapError;
+use crate::provider_memory::ProviderMemory;
 use crate::provider_memory::RangeState;
 use crate::signal::GuestStack;
 use crate::signal::KERNEL_SIGACTION_SIZE;
@@ -503,7 +504,7 @@ pub(crate) fn is_thread_clone_request(request: &SyscallRequest, memory: &GuestMe
     }
     if request.number() == libc::SYS_clone3 as u64 {
         let args = request.args();
-        return read_clone3(memory, args[0], args[1])
+        return read_clone3(&ProviderMemory(memory), args[0], args[1])
             .is_ok_and(|clone| clone.flags & libc::CLONE_THREAD as u64 != 0);
     }
     false
@@ -793,7 +794,7 @@ fn execute_basic_syscall_inner(
         // AUTONOMOUS-BOT-IMPLEMENTED
         vectored_io(memory, state, args, libc::SYS_pwritev2, output)
     } else if number == libc::SYS_pread64 as u64 {
-        pread64(memory, state, args)
+        pread64(&mut ProviderMemory(memory), state, args)
     } else if number == libc::SYS_pwrite64 as u64 {
         pwrite64(memory, state, args)
     } else if number == libc::SYS_sendfile as u64 {
@@ -851,7 +852,7 @@ fn execute_basic_syscall_inner(
         // AUTONOMOUS-BOT-IMPLEMENTED
         epoll_wait(memory, state, args, true)
     } else if number == libc::SYS_epoll_pwait2 as u64 {
-        let result = epoll_pwait2(memory, state, args);
+        let result = epoll_pwait2(&ProviderMemory(memory), state, args);
         // Alias infrastructure failure is terminal, even after successful
         // kernel I/O. Forward the already-published cause without poisoning a
         // second time or presenting its transport errno as a guest result.
@@ -933,7 +934,7 @@ fn execute_basic_syscall_inner(
         sendto(memory, state, args)
     } else if number == libc::SYS_recvfrom as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        recvfrom(memory, state, args)
+        recvfrom(&mut ProviderMemory(memory), state, args)
     } else if number == libc::SYS_sendmsg as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         sendmsg(memory, state, args)
@@ -1078,7 +1079,7 @@ fn execute_basic_syscall_inner(
         // AUTONOMOUS-BOT-IMPLEMENTED
         fchdir(state, args)
     } else if number == libc::SYS_getdents64 as u64 {
-        getdents64(memory, state, args)
+        getdents64(&mut ProviderMemory(memory), state, args)
     } else if number == libc::SYS_getpid as u64 {
         i64::from(state.pid)
     } else if number == libc::SYS_gettid as u64 {
@@ -1112,7 +1113,7 @@ fn execute_basic_syscall_inner(
         0
     } else if number == libc::SYS_getresuid as u64 || number == libc::SYS_getresgid as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        get_fixed_root_ids(memory, args)
+        get_fixed_root_ids(&mut ProviderMemory(memory), args)
     } else if is_credential_identity_noop_syscall(number) {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(rrnewton/reverie#354): the credential-setting
@@ -1129,13 +1130,13 @@ fn execute_basic_syscall_inner(
         // record/replay.
         0
     } else if number == libc::SYS_getgroups as u64 {
-        getgroups(memory, args)
+        getgroups(&mut ProviderMemory(memory), args)
     } else if number == libc::SYS_capget as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        capget(memory, state, args)
+        capget(&mut ProviderMemory(memory), state, args)
     } else if number == libc::SYS_capset as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        capset(memory, state, args)
+        capset(&ProviderMemory(memory), state, args)
     } else if number == libc::SYS_flock as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         flock(state, args)
@@ -1210,7 +1211,7 @@ fn execute_basic_syscall_inner(
         return arch_prctl(memory, state, args);
     } else if number == libc::SYS_prctl as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        prctl(memory, state, args)
+        prctl(&mut ProviderMemory(memory), state, args)
     } else if number == libc::SYS_getxattr as u64
         || number == libc::SYS_lgetxattr as u64
         || number == libc::SYS_fgetxattr as u64
@@ -1236,7 +1237,7 @@ fn execute_basic_syscall_inner(
     } else if number == libc::SYS_mmap as u64 {
         mmap(memory, state, args)
     } else if number == libc::SYS_munmap as u64 {
-        munmap(memory, args[0], args[1])
+        munmap(&mut ProviderMemory(memory), args[0], args[1])
     } else if number == libc::SYS_msync as u64 {
         match msync(memory, args) {
             Ok(result) => result,
@@ -1246,37 +1247,37 @@ fn execute_basic_syscall_inner(
         mremap(memory, state, args)
     } else if number == libc::SYS_mprotect as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        mprotect(memory, args)
+        mprotect(&ProviderMemory(memory), args)
     } else if number == libc::SYS_madvise as u64 {
-        madvise(memory, args)
+        madvise(&ProviderMemory(memory), args)
     } else if number == libc::SYS_munlock as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        munlock_guest_range(memory, args[0], args[1])
+        munlock_guest_range(&ProviderMemory(memory), args[0], args[1])
     } else if number == libc::SYS_munlockall as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-145): Review the deterministic no-op unlock-all model.
         0
     } else if number == libc::SYS_mincore as u64 {
-        mincore(memory, args)
+        mincore(&mut ProviderMemory(memory), args)
     } else if number == libc::SYS_getcpu as u64 {
-        getcpu(memory, args)
+        getcpu(&mut ProviderMemory(memory), args)
     } else if number == libc::SYS_sched_getaffinity as u64 {
-        sched_getaffinity(memory, state, args)
+        sched_getaffinity(&mut ProviderMemory(memory), state, args)
     } else if number == libc::SYS_sched_getscheduler as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         sched_getscheduler(state, args)
     } else if number == libc::SYS_sched_setscheduler as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        sched_setscheduler(memory, state, args)
+        sched_setscheduler(&ProviderMemory(memory), state, args)
     } else if number == libc::SYS_sched_getparam as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        sched_getparam(memory, state, args)
+        sched_getparam(&mut ProviderMemory(memory), state, args)
     } else if number == libc::SYS_sched_setparam as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        sched_setparam(memory, state, args)
+        sched_setparam(&ProviderMemory(memory), state, args)
     } else if number == libc::SYS_sched_getattr as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        sched_getattr(memory, state, args)
+        sched_getattr(&mut ProviderMemory(memory), state, args)
     } else if number == libc::SYS_sched_get_priority_min as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         sched_priority_bound(args[0], false)
@@ -1302,22 +1303,22 @@ fn execute_basic_syscall_inner(
             _ => negative_errno(libc::EINVAL),
         }
     } else if number == libc::SYS_getrandom as u64 {
-        getrandom(memory, state, args[0], args[1])
+        getrandom(&mut ProviderMemory(memory), state, args[0], args[1])
     } else if number == libc::SYS_clock_gettime as u64 {
-        clock_gettime(memory, state, args)
+        clock_gettime(&mut ProviderMemory(memory), state, args)
     } else if number == libc::SYS_nanosleep as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        nanosleep(memory, args)
+        nanosleep(&ProviderMemory(memory), args)
     } else if number == libc::SYS_clock_nanosleep as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        clock_nanosleep(memory, args)
+        clock_nanosleep(&ProviderMemory(memory), args)
     } else if number == libc::SYS_gettimeofday as u64 {
-        gettimeofday(memory, args)
+        gettimeofday(&mut ProviderMemory(memory), args)
     } else if number == libc::SYS_time as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3765):
         // Review KVM time(2) dispatch.
-        time(memory, state, args)
+        time(&mut ProviderMemory(memory), state, args)
     } else if number == libc::SYS_readlink as u64 {
         readlink(memory, state, args, capture_metadata)
     } else if number == libc::SYS_readlinkat as u64 {
@@ -1327,9 +1328,9 @@ fn execute_basic_syscall_inner(
         // AUTONOMOUS-BOT-IMPLEMENTED
         personality(state, args[0])
     } else if number == libc::SYS_uname as u64 {
-        uname(memory, state, args[0])
+        uname(&mut ProviderMemory(memory), state, args[0])
     } else if number == libc::SYS_prlimit64 as u64 {
-        prlimit64(memory, args)
+        prlimit64(&mut ProviderMemory(memory), args)
     } else if number == libc::SYS_rt_sigaction as u64 {
         rt_sigaction(memory, state, args)
     } else if number == libc::SYS_rt_sigprocmask as u64 {
@@ -1363,7 +1364,7 @@ fn execute_basic_syscall_inner(
         close_range(state, args)
     } else if number == libc::SYS_futex as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        futex(memory, args)
+        futex(&ProviderMemory(memory), args)
     } else if number == libc::SYS_rseq as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-172): Review deterministic rseq feature refusal.
@@ -1388,7 +1389,7 @@ fn execute_basic_syscall_inner(
 }
 
 // TODO-HUMAN-REVIEW(PR-172): Review host-backed futex address and timeout translation.
-fn futex<M: GuestMemoryAccess>(memory: &M, args: &[u64; 6]) -> i64 {
+fn futex<M: GuestMemoryAccess<Error = crate::Error>>(memory: &M, args: &[u64; 6]) -> i64 {
     let operation = args[1] as libc::c_int;
     let command = operation & libc::FUTEX_CMD_MASK;
     // sys_futex imports and validates timeout-bearing commands before
@@ -1571,16 +1572,22 @@ fn get_robust_list(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u6
 
     // Linux resolves and authorizes the target first, then writes the fixed
     // header size before the head pointer. Preserve that partial-copy ordering.
-    if args[2] == 0 || write_u64(memory, args[2], ROBUST_LIST_HEAD_SIZE) != 0 {
+    if args[2] == 0 || write_u64(&mut ProviderMemory(memory), args[2], ROBUST_LIST_HEAD_SIZE) != 0 {
         return negative_errno(libc::EFAULT);
     }
-    if args[1] == 0 || write_u64(memory, args[1], target.robust_list_head) != 0 {
+    if args[1] == 0
+        || write_u64(
+            &mut ProviderMemory(memory),
+            args[1],
+            target.robust_list_head,
+        ) != 0
+    {
         return negative_errno(libc::EFAULT);
     }
     0
 }
 
-fn guest_host_address<M: GuestMemoryAccess>(
+fn guest_host_address<M: GuestMemoryAccess<Error = crate::Error>>(
     memory: &M,
     guest_address: u64,
     length: usize,
@@ -2833,7 +2840,12 @@ impl FdinfoTarget {
 }
 
 impl FdinfoDescription {
-    fn read<M: GuestMemoryAccess>(&self, memory: &mut M, args: &[u64; 6], positioned: bool) -> i64 {
+    fn read<M: GuestMemoryAccess<Error = crate::Error>>(
+        &self,
+        memory: &mut M,
+        args: &[u64; 6],
+        positioned: bool,
+    ) -> i64 {
         let Ok(count) = usize::try_from(args[2]) else {
             return negative_errno(libc::EINVAL);
         };
@@ -3714,35 +3726,37 @@ impl ElfExecutor {
             ));
         }
         if number == libc::SYS_clone3 as u64 {
-            return Some(match read_clone3(memory, args[0], args[1]) {
-                Ok(request) if request.flags & libc::CLONE_THREAD as u64 != 0 => self
-                    .prepare_thread(
-                        request.flags,
-                        request.child_stack,
-                        request.parent_tid,
-                        request.child_tid,
-                        request.tls,
-                    ),
-                Ok(request) => match validate_process_clone_flags(request.flags) {
+            return Some(
+                match read_clone3(&ProviderMemory(memory), args[0], args[1]) {
+                    Ok(request) if request.flags & libc::CLONE_THREAD as u64 != 0 => self
+                        .prepare_thread(
+                            request.flags,
+                            request.child_stack,
+                            request.parent_tid,
+                            request.child_tid,
+                            request.tls,
+                        ),
+                    Ok(request) => match validate_process_clone_flags(request.flags) {
+                        Err(error) => error,
+                        Ok(())
+                            if request.flags & PROCESS_CLONE_TID_FLAGS != 0
+                                || request.parent_tid.is_some()
+                                || request.child_tid.is_some() =>
+                        {
+                            negative_errno(libc::ENOTSUP)
+                        }
+                        Ok(()) => self.prepare_fork(
+                            request.child_stack,
+                            None,
+                            None,
+                            None,
+                            request.flags & CLONE_CLEAR_SIGHAND != 0,
+                            request.flags & libc::CLONE_VM as u64 != 0,
+                        ),
+                    },
                     Err(error) => error,
-                    Ok(())
-                        if request.flags & PROCESS_CLONE_TID_FLAGS != 0
-                            || request.parent_tid.is_some()
-                            || request.child_tid.is_some() =>
-                    {
-                        negative_errno(libc::ENOTSUP)
-                    }
-                    Ok(()) => self.prepare_fork(
-                        request.child_stack,
-                        None,
-                        None,
-                        None,
-                        request.flags & CLONE_CLEAR_SIGHAND != 0,
-                        request.flags & libc::CLONE_VM as u64 != 0,
-                    ),
                 },
-                Err(error) => error,
-            });
+            );
         }
         if number == libc::SYS_execve as u64 || number == libc::SYS_execveat as u64 {
             return Some(self.prepare_exec(memory, request, None));
@@ -3936,17 +3950,17 @@ impl ElfExecutor {
             // reading the guest pointer again would reopen a TOCTOU window.
             Vec::new()
         } else {
-            match read_c_string(memory, path_address, 4096) {
+            match read_c_string(&ProviderMemory(memory), path_address, 4096) {
                 Ok(path) if !path.is_empty() => path,
                 Ok(_) => return negative_errno(libc::ENOENT),
                 Err(error) => return read_c_string_errno(error),
             }
         };
-        let argv = match read_string_array(memory, argv_address) {
+        let argv = match read_string_array(&ProviderMemory(memory), argv_address) {
             Ok(argv) => argv,
             Err(error) => return error,
         };
-        let envp = match read_string_array(memory, envp_address) {
+        let envp = match read_string_array(&ProviderMemory(memory), envp_address) {
             Ok(envp) => envp,
             Err(error) => return error,
         };
@@ -5060,7 +5074,7 @@ impl ElfExecutor {
                         Ok(pid) => Some(pid),
                         Err(_) => {
                             return Some(Ok(finish_waitid(
-                                memory,
+                                &ProviderMemory(memory),
                                 args,
                                 None,
                                 negative_errno(libc::ECHILD),
@@ -5070,7 +5084,7 @@ impl ElfExecutor {
                     libc::P_ALL | libc::P_PGID => None,
                     _ => {
                         return Some(Ok(finish_waitid(
-                            memory,
+                            &ProviderMemory(memory),
                             args,
                             None,
                             negative_errno(libc::EINVAL),
@@ -5889,7 +5903,7 @@ impl ElfExecutor {
         let memory = self.address_space.as_ref().ok_or_else(|| {
             Self::parent_death_exec_error("enrolled exec has no bound address space")
         })?;
-        let alias = read_c_string(memory, path_address, 4096)
+        let alias = read_c_string(&ProviderMemory(memory), path_address, 4096)
             .map_err(|_| Self::parent_death_exec_error("enrolled exec alias is not readable"))?;
         if guest_proc_exe_path(&self.state, &alias) != Some(true) {
             return Err(Self::parent_death_exec_error(
@@ -8113,7 +8127,7 @@ impl ElfExecutor {
             if number == libc::SYS_clone3 as u64 {
                 // Read once: the checked flags must be the flags actually used
                 // to create the ProcessAction, not a second mutable copyin.
-                let clone = match read_clone3(memory, args[0], args[1]) {
+                let clone = match read_clone3(&ProviderMemory(memory), args[0], args[1]) {
                     Ok(clone) => clone,
                     Err(error) => return Ok(error),
                 };
@@ -8833,7 +8847,7 @@ fn host_write(fd: RawFd, bytes: &[u8]) -> i64 {
     }
 }
 
-fn prepare_host_read<M: GuestMemoryAccess + AddressSpace>(
+fn prepare_host_read<M: GuestMemoryAccess<Error = crate::Error> + AddressSpace>(
     memory: &M,
     address: u64,
     length: usize,
@@ -8987,7 +9001,7 @@ fn host_read_zero(fd: RawFd, address: u64) -> i64 {
 }
 
 fn host_read(memory: &mut GuestMemory, fd: RawFd, address: u64, length: usize) -> i64 {
-    let mut bytes = match prepare_host_read(memory, address, length) {
+    let mut bytes = match prepare_host_read(&ProviderMemory(memory), address, length) {
         Ok(bytes) => bytes,
         Err(error) => return error,
     };
@@ -9025,7 +9039,7 @@ fn prepare_random_device_read(
         let requested = usize::try_from(args[2]).map_err(|_| negative_errno(libc::EINVAL))?;
         ensure_read_capable(file)?;
         ensure_readable(file)?;
-        if !range_is_valid(memory, args[1], args[2]) {
+        if !range_is_valid(&ProviderMemory(memory), args[1], args[2]) {
             return Err(negative_errno(libc::EFAULT));
         }
         let length = requested.min(MAX_HOST_IO);
@@ -9196,7 +9210,7 @@ fn read(
     // Linux consumes only the low 32-bit descriptor word.
     let fd = args[0] as libc::c_int;
     if let Some(description) = state.fdinfo_files.get(&fd).cloned() {
-        return Ok(description.read(memory, args, false));
+        return Ok(description.read(&mut ProviderMemory(memory), args, false));
     }
     let Ok(requested_length) = usize::try_from(args[2]) else {
         return Ok(negative_errno(libc::EINVAL));
@@ -9233,7 +9247,7 @@ fn read(
         if let Err(error) = ensure_read_capable(stdin) {
             return Ok(error);
         }
-        if !range_is_valid(memory, args[1], args[2]) {
+        if !range_is_valid(&ProviderMemory(memory), args[1], args[2]) {
             return Ok(negative_errno(libc::EFAULT));
         }
         return Ok(host_read(memory, stdin.as_raw_fd(), args[1], length));
@@ -9288,7 +9302,7 @@ fn read(
     if let Some(result) = signalfd_read(memory, state, fd, args[1], requested_length) {
         return Ok(result);
     }
-    if !range_is_valid(memory, args[1], args[2]) {
+    if !range_is_valid(&ProviderMemory(memory), args[1], args[2]) {
         return Ok(negative_errno(libc::EFAULT));
     }
     if requested_length == 0 {
@@ -9299,7 +9313,7 @@ fn read(
         // count, so the staged readv path applies scalar read semantics.
         Ok(true) => {
             return Ok(staged_vectored_transfer(
-                memory,
+                &mut ProviderMemory(memory),
                 state,
                 libc::SYS_readv,
                 host_fd,
@@ -9317,7 +9331,7 @@ fn read(
     Ok(host_read(memory, host_fd, args[1], length))
 }
 
-fn pread64<M: GuestMemoryAccess + AddressSpace>(
+fn pread64<M: GuestMemoryAccess<Error = crate::Error> + AddressSpace>(
     memory: &mut M,
     state: &LoadedStaticElf,
     args: &[u64; 6],
@@ -9707,7 +9721,7 @@ fn decode_guest_iovecs(
         else {
             return Err(negative_errno(libc::EFAULT));
         };
-        let entry: libc::iovec = read_guest_struct(memory, entry_address)?;
+        let entry: libc::iovec = read_guest_struct(&ProviderMemory(memory), entry_address)?;
         // Reject each signed-length overflow as soon as its structure has
         // been copied, before reading the next structure. Data addresses are
         // checked only after all structures and signed lengths are imported.
@@ -10055,10 +10069,18 @@ fn vectored_io(
             return negative_errno(libc::EOPNOTSUPP);
         }
     }
-    staged_vectored_transfer(memory, state, number, host_fd, &guest_iovecs, args, reading)
+    staged_vectored_transfer(
+        &mut ProviderMemory(memory),
+        state,
+        number,
+        host_fd,
+        &guest_iovecs,
+        args,
+        reading,
+    )
 }
 
-fn staged_vectored_transfer<M: GuestMemoryAccess + AddressSpace>(
+fn staged_vectored_transfer<M: GuestMemoryAccess<Error = crate::Error> + AddressSpace>(
     memory: &mut M,
     state: &LoadedStaticElf,
     number: libc::c_long,
@@ -10215,7 +10237,7 @@ fn resolve_sendfile_input(
 }
 
 fn read_sendfile_offset(memory: &GuestMemory, offset_ptr: u64) -> Result<libc::off_t, i64> {
-    if !range_is_valid(memory, offset_ptr, 8) {
+    if !range_is_valid(&ProviderMemory(memory), offset_ptr, 8) {
         return Err(negative_errno(libc::EFAULT));
     }
     let mut raw = [0u8; 8];
@@ -10540,7 +10562,7 @@ fn memfd_create(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 
     // The kernel bounds the name at 249 bytes (excluding NUL) and prepends
     // "memfd:"; read a little past that so an over-long name reaches the host,
     // which returns EINVAL just as a native call would.
-    let name = match read_c_string(memory, args[0], 256) {
+    let name = match read_c_string(&ProviderMemory(memory), args[0], 256) {
         Ok(name) => name,
         Err(error) => return read_c_string_errno(error),
     };
@@ -10632,7 +10654,7 @@ fn truncate(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i
     if length < 0 {
         return negative_errno(libc::EINVAL);
     }
-    let path = match read_c_string(memory, args[0], 4096) {
+    let path = match read_c_string(&ProviderMemory(memory), args[0], 4096) {
         Ok(path) if !path.is_empty() => path,
         Ok(_) => return negative_errno(libc::ENOENT),
         Err(error) => return read_c_string_errno(error),
@@ -10864,7 +10886,7 @@ fn open_file(
     {
         return negative_errno(libc::EINVAL);
     }
-    let path = match read_c_string(memory, path_address, 4096) {
+    let path = match read_c_string(&ProviderMemory(memory), path_address, 4096) {
         Ok(path) => path,
         Err(error) => return read_c_string_errno(error),
     };
@@ -12365,7 +12387,7 @@ fn pselect6(
     let sigmask_argument = if args[5] == 0 {
         None
     } else {
-        match read_guest_struct::<Pselect6SigmaskArg>(memory, args[5]) {
+        match read_guest_struct::<Pselect6SigmaskArg>(&ProviderMemory(memory), args[5]) {
             Ok(argument) => Some(argument),
             Err(error) => return error,
         }
@@ -12374,7 +12396,7 @@ fn pselect6(
     // do_pselect reads and validates the timeout before inspecting the inner
     // signal-mask pointer or size. NULL means an unsupported infinite wait.
     let zero_timeout = if args[4] != 0 {
-        let timeout = match read_guest_struct::<libc::timespec>(memory, args[4]) {
+        let timeout = match read_guest_struct::<libc::timespec>(&ProviderMemory(memory), args[4]) {
             Ok(timeout) => timeout,
             Err(error) => return error,
         };
@@ -12575,7 +12597,7 @@ fn select(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) ->
     }
 
     if args[4] != 0 {
-        let timeout = match read_guest_struct::<libc::timeval>(memory, args[4]) {
+        let timeout = match read_guest_struct::<libc::timeval>(&ProviderMemory(memory), args[4]) {
             Ok(timeout) => timeout,
             Err(error) => return error,
         };
@@ -12664,7 +12686,7 @@ fn select(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) ->
             tv_sec: 0,
             tv_usec: 0,
         };
-        if write_struct(memory, args[4], &timeout) != 0 {
+        if write_struct(&mut ProviderMemory(memory), args[4], &timeout) != 0 {
             return negative_errno(libc::EFAULT);
         }
     }
@@ -12685,7 +12707,7 @@ fn fd_set_insert(set: &mut [u64], fd: libc::c_int) {
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-92): Review guest descriptor translation and deterministic nonblocking poll semantics.
 fn poll(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
-    poll_with_timeout(memory, state, args, 0)
+    poll_with_timeout(&mut ProviderMemory(memory), state, args, 0)
 }
 
 // TODO-HUMAN-REVIEW(PR-172): Review host-blocking KVM ppoll timeout and signal-mask semantics.
@@ -12697,7 +12719,7 @@ fn ppoll(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> 
     let timeout = if args[2] == 0 {
         -1
     } else {
-        let timeout = match read_guest_struct::<libc::timespec>(memory, args[2]) {
+        let timeout = match read_guest_struct::<libc::timespec>(&ProviderMemory(memory), args[2]) {
             Ok(timeout) => timeout,
             Err(error) => return error,
         };
@@ -12734,16 +12756,16 @@ fn ppoll(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> 
         // instantaneous poll, so a plain non-blocking poll reproduces the kernel
         // result: a ready descriptor returns its count exactly as the unmasked
         // path would, and a poll/read error propagates unchanged.
-        let ready = poll_with_timeout(memory, state, args, 0);
+        let ready = poll_with_timeout(&mut ProviderMemory(memory), state, args, 0);
         if ready == 0 {
             return negative_errno(libc::ENOSYS);
         }
         return ready;
     }
-    poll_with_timeout(memory, state, args, timeout)
+    poll_with_timeout(&mut ProviderMemory(memory), state, args, timeout)
 }
 
-fn poll_with_timeout<M: GuestMemoryAccess>(
+fn poll_with_timeout<M: GuestMemoryAccess<Error = crate::Error>>(
     memory: &mut M,
     state: &LoadedStaticElf,
     args: &[u64; 6],
@@ -12917,7 +12939,7 @@ fn epoll_ctl(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> 
     let mut event = if operation == libc::EPOLL_CTL_DEL {
         libc::epoll_event { events: 0, u64: 0 }
     } else {
-        match read_guest_struct::<libc::epoll_event>(memory, args[3]) {
+        match read_guest_struct::<libc::epoll_event>(&ProviderMemory(memory), args[3]) {
             Ok(event) => event,
             Err(error) => return error,
         }
@@ -13103,7 +13125,11 @@ fn epoll_pwait2_missing_fd(output: u64, raw_count: u64) -> i64 {
 /// Immediate, unmasked readiness for a proven native eventfd interest set.
 /// Unknown/imported/nested/escaped descriptions and changed registration
 /// bindings remain unsupported; this is not general epoll virtualization.
-fn epoll_pwait2<M: GuestMemoryAccess>(memory: &M, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+fn epoll_pwait2<M: GuestMemoryAccess<Error = crate::Error>>(
+    memory: &M,
+    state: &LoadedStaticElf,
+    args: &[u64; 6],
+) -> i64 {
     // Linux fs/eventpoll.c copies/validates timeout before mask and descriptors.
     let zero_timeout = if args[3] == 0 {
         false
@@ -13352,7 +13378,7 @@ fn signalfd(
     if args[2] != KERNEL_SIGSET_SIZE as u64 {
         return negative_errno(libc::EINVAL);
     }
-    let mut mask = match read_guest_bytes::<KERNEL_SIGSET_SIZE>(memory, args[1]) {
+    let mut mask = match read_guest_bytes::<KERNEL_SIGSET_SIZE>(&ProviderMemory(memory), args[1]) {
         Ok(mask) => KernelSigset::from_bytes(mask),
         Err(error) => return error,
     };
@@ -14011,7 +14037,7 @@ fn timerfd_settime(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u6
     let Ok(flags) = libc::c_int::try_from(args[1]) else {
         return negative_errno(libc::EINVAL);
     };
-    let new_value = match read_guest_struct::<libc::itimerspec>(memory, args[2]) {
+    let new_value = match read_guest_struct::<libc::itimerspec>(&ProviderMemory(memory), args[2]) {
         Ok(value) => value,
         Err(error) => return error,
     };
@@ -14036,7 +14062,7 @@ fn timerfd_settime(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u6
         return io_error(std::io::Error::last_os_error());
     }
     if args[3] != 0 {
-        return write_struct(memory, args[3], &old_value);
+        return write_struct(&mut ProviderMemory(memory), args[3], &old_value);
     }
     0
 }
@@ -14060,7 +14086,7 @@ fn timerfd_gettime(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u6
     if unsafe { libc::timerfd_gettime(host_fd, &mut current) } != 0 {
         return io_error(std::io::Error::last_os_error());
     }
-    write_struct(memory, args[1], &current)
+    write_struct(&mut ProviderMemory(memory), args[1], &current)
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -14268,7 +14294,8 @@ fn getsockopt(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]
     if args[4] == 0 {
         return negative_errno(libc::EFAULT);
     }
-    let Ok(mut length) = read_guest_struct::<libc::socklen_t>(memory, args[4]) else {
+    let Ok(mut length) = read_guest_struct::<libc::socklen_t>(&ProviderMemory(memory), args[4])
+    else {
         return negative_errno(libc::EFAULT);
     };
     let capacity = length as usize;
@@ -14313,7 +14340,7 @@ fn getsockopt(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]
         if copy_length != 0 && memory.user().write(args[3], &value[..copy_length]).is_err() {
             return negative_errno(libc::EFAULT);
         }
-        return write_struct(memory, args[4], &length);
+        return write_struct(&mut ProviderMemory(memory), args[4], &length);
     }
 
     if args[1] as libc::c_int != libc::SOL_SOCKET {
@@ -14348,7 +14375,7 @@ fn getsockopt(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]
             return negative_errno(libc::EFAULT);
         }
         let result_length = copy_length as libc::socklen_t;
-        return write_struct(memory, args[4], &result_length);
+        return write_struct(&mut ProviderMemory(memory), args[4], &result_length);
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -14363,7 +14390,7 @@ fn getsockopt(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]
             return negative_errno(libc::EFAULT);
         }
         let result_length = copy_length as libc::socklen_t;
-        return write_struct(memory, args[4], &result_length);
+        return write_struct(&mut ProviderMemory(memory), args[4], &result_length);
     }
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-345): Hermit exposes a single virtual CPU, so
@@ -14405,7 +14432,7 @@ fn getsockopt(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]
         {
             return negative_errno(libc::EFAULT);
         }
-        return write_struct(memory, args[4], &length);
+        return write_struct(&mut ProviderMemory(memory), args[4], &length);
     }
 
     // SO_ERROR reads and clears the socket's pending error, as the kernel
@@ -14521,13 +14548,23 @@ fn listen(state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
 
 // TODO-HUMAN-REVIEW(PR-213): Review bounded getsockname copyback semantics.
 fn getsockname(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
-    socket_name(memory, state, args, SocketNameOperation::Local)
+    socket_name(
+        &mut ProviderMemory(memory),
+        state,
+        args,
+        SocketNameOperation::Local,
+    )
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(kvm-socket-parity): Review peer-name error and copyout ordering.
 fn getpeername(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
-    socket_name(memory, state, args, SocketNameOperation::Peer)
+    socket_name(
+        &mut ProviderMemory(memory),
+        state,
+        args,
+        SocketNameOperation::Peer,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -14536,7 +14573,7 @@ enum SocketNameOperation {
     Peer,
 }
 
-fn socket_name<M: GuestMemoryAccess>(
+fn socket_name<M: GuestMemoryAccess<Error = crate::Error>>(
     memory: &mut M,
     state: &LoadedStaticElf,
     args: &[u64; 6],
@@ -14648,7 +14685,7 @@ fn accept_socket(
         if args[2] == 0 {
             return Err(negative_errno(libc::EFAULT));
         }
-        let capacity = read_guest_struct::<libc::socklen_t>(memory, args[2])
+        let capacity = read_guest_struct::<libc::socklen_t>(&ProviderMemory(memory), args[2])
             .map_err(|_| negative_errno(libc::EFAULT))?;
         length = length.min(capacity);
         capacity as usize
@@ -14694,7 +14731,7 @@ fn accept_socket(
                 return Err(negative_errno(libc::EFAULT));
             }
         }
-        let result = write_struct(memory, args[2], &length);
+        let result = write_struct(&mut ProviderMemory(memory), args[2], &length);
         if result < 0 {
             return Err(result);
         }
@@ -14877,7 +14914,7 @@ fn sendto(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64
 }
 
 // TODO-HUMAN-REVIEW(PR-218): Review bounded recvfrom buffer and peer-address copyback semantics.
-fn recvfrom<M: GuestMemoryAccess + AddressSpace>(
+fn recvfrom<M: GuestMemoryAccess<Error = crate::Error> + AddressSpace>(
     memory: &mut M,
     state: &LoadedStaticElf,
     args: &[u64; 6],
@@ -15420,7 +15457,7 @@ fn sendmsg(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i6
     if args[1] == 0 {
         return negative_errno(libc::EFAULT);
     }
-    let message: libc::msghdr = match read_guest_struct(memory, args[1]) {
+    let message: libc::msghdr = match read_guest_struct(&ProviderMemory(memory), args[1]) {
         Ok(message) => message,
         Err(error) => return error,
     };
@@ -15440,7 +15477,7 @@ fn sendmsg(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i6
         else {
             return negative_errno(libc::EFAULT);
         };
-        let iov: libc::iovec = match read_guest_struct(memory, iov_address) {
+        let iov: libc::iovec = match read_guest_struct(&ProviderMemory(memory), iov_address) {
             Ok(iov) => iov,
             Err(error) => return error,
         };
@@ -15560,12 +15597,13 @@ fn recvmsg(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6
     if message_address == 0 {
         return negative_errno(libc::EFAULT);
     }
-    let mut message: libc::msghdr = match read_guest_struct(memory, message_address) {
-        Ok(message) => message,
-        Err(error) => return error,
-    };
+    let mut message: libc::msghdr =
+        match read_guest_struct(&ProviderMemory(memory), message_address) {
+            Ok(message) => message,
+            Err(error) => return error,
+        };
     // Validate the final header copyout before consuming a datagram.
-    if write_struct(memory, message_address, &message) != 0 {
+    if write_struct(&mut ProviderMemory(memory), message_address, &message) != 0 {
         return negative_errno(libc::EFAULT);
     }
 
@@ -15585,7 +15623,7 @@ fn recvmsg(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6
         else {
             return negative_errno(libc::EFAULT);
         };
-        let iov: libc::iovec = match read_guest_struct(memory, iov_address) {
+        let iov: libc::iovec = match read_guest_struct(&ProviderMemory(memory), iov_address) {
             Ok(iov) => iov,
             Err(error) => return error,
         };
@@ -15750,7 +15788,7 @@ fn recvmsg(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6
     if stripped_unsupported {
         message.msg_flags |= libc::MSG_CTRUNC;
     }
-    if write_struct(memory, message_address, &message) != 0 {
+    if write_struct(&mut ProviderMemory(memory), message_address, &message) != 0 {
         rollback_received_rights(state, &installed);
         return negative_errno(libc::EFAULT);
     }
@@ -15787,16 +15825,17 @@ fn recvmmsg(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 
                 delivered as i64
             };
         };
-        let mut message: libc::mmsghdr = match read_guest_struct(memory, message_address) {
-            Ok(message) => message,
-            Err(error) => {
-                return if delivered == 0 {
-                    error
-                } else {
-                    delivered as i64
-                };
-            }
-        };
+        let mut message: libc::mmsghdr =
+            match read_guest_struct(&ProviderMemory(memory), message_address) {
+                Ok(message) => message,
+                Err(error) => {
+                    return if delivered == 0 {
+                        error
+                    } else {
+                        delivered as i64
+                    };
+                }
+            };
         let iov_count = message.msg_hdr.msg_iovlen;
         if iov_count > libc::UIO_MAXIOV as usize {
             return if delivered == 0 {
@@ -15819,7 +15858,7 @@ fn recvmmsg(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 
                     delivered as i64
                 };
             };
-            let iov: libc::iovec = match read_guest_struct(memory, iov_address) {
+            let iov: libc::iovec = match read_guest_struct(&ProviderMemory(memory), iov_address) {
                 Ok(iov) => iov,
                 Err(error) => {
                     return if delivered == 0 {
@@ -16036,7 +16075,7 @@ fn recvmmsg(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 
             message.msg_hdr.msg_flags |= libc::MSG_CTRUNC;
         }
         message.msg_len = received as libc::c_uint;
-        if write_struct(memory, message_address, &message) != 0 {
+        if write_struct(&mut ProviderMemory(memory), message_address, &message) != 0 {
             rollback_received_rights(state, &installed);
             return if delivered == 0 {
                 negative_errno(libc::EFAULT)
@@ -16052,7 +16091,7 @@ fn recvmmsg(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 
 // General FIONREAD support was withdrawn in 345681e44bf9d07f8c9f52138ce2682633adfffe:
 // SCM_RIGHTS does not retain synthetic proc-file semantics. Only an actual host
 // pipe/FIFO can use this operation without that missing descriptor metadata.
-fn pipe_fionread<M: GuestMemoryAccess>(
+fn pipe_fionread<M: GuestMemoryAccess<Error = crate::Error>>(
     memory: &M,
     state: &LoadedStaticElf,
     guest_fd: libc::c_int,
@@ -16119,7 +16158,14 @@ fn ioctl(
     // Linux ioctl takes an unsigned-int command even on the 64-bit syscall ABI.
     // Keep this limited support independent of the other ioctl dispatch arms.
     if args[1] as u32 == libc::FIONREAD as u32 {
-        return pipe_fionread(memory, state, guest_fd, host_fd, args[2], capture_output);
+        return pipe_fionread(
+            &ProviderMemory(memory),
+            state,
+            guest_fd,
+            host_fd,
+            args[2],
+            capture_output,
+        );
     }
     if args[1] as u32 == libc::FIONBIO as u32 {
         return fionbio(memory, state, guest_fd, host_fd, args[2]);
@@ -16185,7 +16231,7 @@ fn fionbio(
     if flags & libc::O_PATH != 0 {
         return negative_errno(libc::EBADF);
     }
-    let value = match read_guest_struct::<libc::c_int>(memory, address) {
+    let value = match read_guest_struct::<libc::c_int>(&ProviderMemory(memory), address) {
         Ok(value) => value,
         Err(error) => return error,
     };
@@ -16239,12 +16285,12 @@ fn forward_terminal_ioctl(
     if ret < 0 {
         return io_error(std::io::Error::last_os_error());
     }
-    write_bytes(memory, out_addr, &buf)
+    write_bytes(&mut ProviderMemory(memory), out_addr, &buf)
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#54): Confirm the fixed root-plus-overflow-group KVM persona.
-fn getgroups<M: GuestMemoryAccess>(memory: &mut M, args: &[u64; 6]) -> i64 {
+fn getgroups<M: GuestMemoryAccess<Error = crate::Error>>(memory: &mut M, args: &[u64; 6]) -> i64 {
     let size = args[0] as libc::c_int;
     if size < 0 {
         return negative_errno(libc::EINVAL);
@@ -16269,7 +16315,10 @@ fn getgroups<M: GuestMemoryAccess>(memory: &mut M, args: &[u64; 6]) -> i64 {
 }
 
 // TODO-HUMAN-REVIEW(PR-145): Review fixed-root saved-ID output and fault ordering.
-fn get_fixed_root_ids<M: GuestMemoryAccess>(memory: &mut M, args: &[u64; 6]) -> i64 {
+fn get_fixed_root_ids<M: GuestMemoryAccess<Error = crate::Error>>(
+    memory: &mut M,
+    args: &[u64; 6],
+) -> i64 {
     let root_id = libc::uid_t::from(0_u8).to_ne_bytes();
     for address in &args[..3] {
         if memory.write_exact(*address, &root_id).is_err() {
@@ -16360,7 +16409,7 @@ fn fchownat(
     if flags & !allowed != 0 {
         return negative_errno(libc::EINVAL);
     }
-    let path = match read_c_string(memory, path_address, 4096) {
+    let path = match read_c_string(&ProviderMemory(memory), path_address, 4096) {
         Ok(path) => path,
         Err(error) => return read_c_string_errno(error),
     };
@@ -16390,7 +16439,7 @@ fn path_xattr_list(
     args: &[u64; 6],
     no_follow: bool,
 ) -> i64 {
-    let path = match read_c_string(memory, args[0], 4096) {
+    let path = match read_c_string(&ProviderMemory(memory), args[0], 4096) {
         Ok(path) if !path.is_empty() => path,
         Ok(_) => return negative_errno(libc::ENOENT),
         Err(error) => return read_c_string_errno(error),
@@ -16421,7 +16470,7 @@ fn fstat(
     // Linux descriptor lookup consumes only the low 32-bit word.
     let fd = args[0] as libc::c_int;
     match guest_object_stat(state, fd, capture) {
-        Ok(stat) => write_struct(memory, args[1], &stat),
+        Ok(stat) => write_struct(&mut ProviderMemory(memory), args[1], &stat),
         Err(error) => error,
     }
 }
@@ -16529,7 +16578,7 @@ fn fstatat_impl(
     flags: libc::c_int,
     capture: Option<CaptureMetadata>,
 ) -> i64 {
-    let path = match read_c_string(memory, path_address, 4096) {
+    let path = match read_c_string(&ProviderMemory(memory), path_address, 4096) {
         Ok(path) => path,
         Err(error) => return read_c_string_errno(error),
     };
@@ -16552,7 +16601,7 @@ fn fstatat_impl(
         }
         let path = format!("/proc/{tid}/fdinfo/{fd}");
         return write_struct(
-            memory,
+            &mut ProviderMemory(memory),
             output_address,
             &synthetic_proc_stat(synthetic_proc_inode(path.as_bytes()), 0),
         );
@@ -16567,7 +16616,7 @@ fn fstatat_impl(
             synthetic_proc_inode(&normalized),
             synthetic_proc_path_size(&normalized, &content),
         );
-        return write_struct(memory, output_address, &stat);
+        return write_struct(&mut ProviderMemory(memory), output_address, &stat);
     }
 
     let guest_path = match guest_fd_metadata(state, &path, flags & libc::AT_SYMLINK_NOFOLLOW != 0) {
@@ -16578,7 +16627,7 @@ fn fstatat_impl(
         && metadata.no_follow
     {
         let stat = synthetic_guest_fd_symlink_stat(metadata.guest_fd);
-        return write_struct(memory, output_address, &stat);
+        return write_struct(&mut ProviderMemory(memory), output_address, &stat);
     }
     let descriptor = guest_path
         .map(|metadata| metadata.guest_fd)
@@ -16588,7 +16637,7 @@ fn fstatat_impl(
         && let Some(alias) = output_alias(state, fd)
     {
         return write_struct(
-            memory,
+            &mut ProviderMemory(memory),
             output_address,
             &synthetic_captured_output_stat(capture.identity(alias)),
         );
@@ -16657,7 +16706,7 @@ fn fstatat_impl(
     if executable.is_some() {
         copy_executable_stat(memory, state, output_address, &stat)
     } else {
-        write_struct(memory, output_address, &stat)
+        write_struct(&mut ProviderMemory(memory), output_address, &stat)
     }
 }
 
@@ -16715,7 +16764,7 @@ fn statx(
     args: &[u64; 6],
     capture: Option<CaptureMetadata>,
 ) -> i64 {
-    let path = match read_c_string(memory, args[1], 4096) {
+    let path = match read_c_string(&ProviderMemory(memory), args[1], 4096) {
         Ok(path) => path,
         Err(error) => return read_c_string_errno(error),
     };
@@ -16747,7 +16796,7 @@ fn statx(
         }
         let path = format!("/proc/{tid}/fdinfo/{fd}");
         return write_struct(
-            memory,
+            &mut ProviderMemory(memory),
             args[4],
             &synthetic_proc_statx(synthetic_proc_inode(path.as_bytes()), 0),
         );
@@ -16761,7 +16810,7 @@ fn statx(
                 synthetic_proc_inode(&normalized),
                 synthetic_proc_path_size(&normalized, &content) as u64,
             );
-            return write_struct(memory, args[4], &stx);
+            return write_struct(&mut ProviderMemory(memory), args[4], &stx);
         }
     } else if let Some(&inode) = state.proc_files.get(&(args[0] as libc::c_int)) {
         // AT_EMPTY_PATH statx of a synthetic /proc descriptor: report the memfd's
@@ -16779,7 +16828,7 @@ fn statx(
             None => return negative_errno(libc::EBADF),
         };
         let stx = synthetic_proc_statx(inode, size);
-        return write_struct(memory, args[4], &stx);
+        return write_struct(&mut ProviderMemory(memory), args[4], &stx);
     }
 
     let guest_path = match guest_fd_metadata(state, &path, flags & libc::AT_SYMLINK_NOFOLLOW != 0) {
@@ -16790,7 +16839,7 @@ fn statx(
         && metadata.no_follow
     {
         let stat = synthetic_guest_fd_symlink_statx(metadata.guest_fd);
-        return write_struct(memory, args[4], &stat);
+        return write_struct(&mut ProviderMemory(memory), args[4], &stat);
     }
     let descriptor = guest_path.map(|metadata| metadata.guest_fd).or_else(|| {
         (path.is_empty() && args[0] as libc::c_int != libc::AT_FDCWD)
@@ -16809,7 +16858,7 @@ fn statx(
             return negative_errno(libc::EINVAL);
         }
         return write_struct(
-            memory,
+            &mut ProviderMemory(memory),
             args[4],
             &synthetic_captured_output_statx(capture.identity(alias)),
         );
@@ -16863,7 +16912,7 @@ fn statx(
     } else {
         sanitize_host_statx_timestamps(state, &mut stat);
     }
-    write_struct(memory, args[4], &stat)
+    write_struct(&mut ProviderMemory(memory), args[4], &stat)
 }
 
 // TODO-HUMAN-REVIEW(PR-92): Review this KVM compatibility implementation.
@@ -16922,7 +16971,7 @@ fn sanitize_host_statx_timestamps(state: &LoadedStaticElf, stat: &mut libc::stat
 
 // TODO-HUMAN-REVIEW(PR-114): Review guest descriptor path resolution for statfs.
 fn statfs(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
-    let path = match read_c_string(memory, args[0], 4096) {
+    let path = match read_c_string(&ProviderMemory(memory), args[0], 4096) {
         Ok(path) if !path.is_empty() => path,
         Ok(_) => return negative_errno(libc::ENOENT),
         Err(error) => return read_c_string_errno(error),
@@ -16973,7 +17022,7 @@ fn fstatfs_host(memory: &mut GuestMemory, host_fd: RawFd, output: u64) -> i64 {
     // detcore/src/syscalls/files.rs::canonicalize_statfs_buf, so both statfs()
     // and fstatfs() present the same stable, deterministic view.
     canonicalize_statfs(&mut stat);
-    write_struct(memory, output, &stat)
+    write_struct(&mut ProviderMemory(memory), output, &stat)
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -17061,7 +17110,7 @@ fn faccessat_impl(
     if flags & !allowed_flags != 0 {
         return negative_errno(libc::EINVAL);
     }
-    let path = match read_c_string(memory, path_address, 4096) {
+    let path = match read_c_string(&ProviderMemory(memory), path_address, 4096) {
         Ok(path) => path,
         Err(error) => return read_c_string_errno(error),
     };
@@ -17131,7 +17180,8 @@ fn read_path_at(
     address: u64,
     allow_empty: bool,
 ) -> Result<(RawFd, CString), i64> {
-    let path = read_c_string(memory, address, 4096).map_err(read_c_string_errno)?;
+    let path =
+        read_c_string(&ProviderMemory(memory), address, 4096).map_err(read_c_string_errno)?;
     if path.is_empty() && !allow_empty {
         return Err(negative_errno(libc::ENOENT));
     }
@@ -17337,7 +17387,7 @@ fn symlink_at(
     new_guest_dirfd: libc::c_int,
     new_path_address: u64,
 ) -> i64 {
-    let target = match read_c_string(memory, target_address, 4096) {
+    let target = match read_c_string(&ProviderMemory(memory), target_address, 4096) {
         Ok(target) => match CString::new(target) {
             Ok(target) => target,
             Err(_) => return negative_errno(libc::EINVAL),
@@ -17433,7 +17483,7 @@ fn fchmodat(
     // EACCES. A run with the setting off keeps the EACCES it always had.
     if allow_empty && state.host_metadata_timestamps && state.proc_files.contains_key(&guest_dirfd)
     {
-        match read_c_string(memory, path_address, 4096) {
+        match read_c_string(&ProviderMemory(memory), path_address, 4096) {
             Ok(path) if path.is_empty() => return negative_errno(libc::EPERM),
             Ok(_) => {}
             Err(error) => return read_c_string_errno(error),
@@ -17549,7 +17599,7 @@ fn utimensat(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> 
     let requested_times = if args[2] == 0 {
         None
     } else {
-        match read_guest_struct::<[libc::timespec; 2]>(memory, args[2]) {
+        match read_guest_struct::<[libc::timespec; 2]>(&ProviderMemory(memory), args[2]) {
             Ok(times) => Some(times),
             Err(error) => return error,
         }
@@ -17690,7 +17740,7 @@ fn getcwd(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) ->
 // canonicalize `state.cwd` from that handle so `getcwd` returns a stable, real
 // host path -- deterministic given the same external filesystem.
 fn chdir(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
-    let path = match read_c_string(memory, args[0], 4096) {
+    let path = match read_c_string(&ProviderMemory(memory), args[0], 4096) {
         Ok(path) => path,
         Err(error) => return read_c_string_errno(error),
     };
@@ -18736,7 +18786,7 @@ fn synthetic_guest_fd_symlink_statx(guest_fd: libc::c_int) -> libc::statx {
     stat
 }
 
-fn getdents64<M: GuestMemoryAccess>(
+fn getdents64<M: GuestMemoryAccess<Error = crate::Error>>(
     memory: &mut M,
     state: &LoadedStaticElf,
     args: &[u64; 6],
@@ -18971,7 +19021,8 @@ fn fcntl(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> 
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-211): Review KVM advisory-lock forwarding.
         command @ (libc::F_SETLK | libc::F_SETLKW | libc::F_OFD_SETLK | libc::F_OFD_SETLKW) => {
-            let mut lock = match read_guest_struct::<libc::flock>(memory, args[2]) {
+            let mut lock = match read_guest_struct::<libc::flock>(&ProviderMemory(memory), args[2])
+            {
                 Ok(lock) => lock,
                 Err(error) => return error,
             };
@@ -19001,7 +19052,8 @@ fn fcntl(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> 
         // fcntl(2) does. A conflicting holder is an OFD lock, which Linux
         // reports with l_pid -1, so a guest F_GETLK never sees a host pid.
         command @ (libc::F_GETLK | libc::F_OFD_GETLK) => {
-            let mut lock = match read_guest_struct::<libc::flock>(memory, args[2]) {
+            let mut lock = match read_guest_struct::<libc::flock>(&ProviderMemory(memory), args[2])
+            {
                 Ok(lock) => lock,
                 Err(error) => return error,
             };
@@ -19249,7 +19301,8 @@ fn arch_prctl(
 ) -> SyscallAction {
     match args[0] {
         ARCH_SET_FS | ARCH_SET_GS
-            if args[1] < memory.guest_end() || range_is_valid(memory, args[1], 1) =>
+            if args[1] < memory.guest_end()
+                || range_is_valid(&ProviderMemory(memory), args[1], 1) =>
         {
             let (base, segment) = if args[0] == ARCH_SET_FS {
                 state.fs_base = args[1];
@@ -19264,8 +19317,16 @@ fn arch_prctl(
             }
         }
         ARCH_SET_FS | ARCH_SET_GS => continue_with(negative_errno(libc::EPERM)),
-        ARCH_GET_FS => continue_with(write_u64(memory, args[1], state.fs_base)),
-        ARCH_GET_GS => continue_with(write_u64(memory, args[1], state.gs_base)),
+        ARCH_GET_FS => continue_with(write_u64(
+            &mut ProviderMemory(memory),
+            args[1],
+            state.fs_base,
+        )),
+        ARCH_GET_GS => continue_with(write_u64(
+            &mut ProviderMemory(memory),
+            args[1],
+            state.gs_base,
+        )),
         _ => continue_with(negative_errno(libc::EINVAL)),
     }
 }
@@ -19276,7 +19337,7 @@ fn arch_prctl(
 // launchers can inspect and mutate their persona without touching supervisor
 // credentials.
 // TODO-HUMAN-REVIEW(PR-181): Review deterministic capability prctls.
-fn prctl<M: GuestMemoryAccess>(
+fn prctl<M: GuestMemoryAccess<Error = crate::Error>>(
     memory: &mut M,
     state: &mut LoadedStaticElf,
     args: &[u64; 6],
@@ -19403,7 +19464,7 @@ fn prctl<M: GuestMemoryAccess>(
     }
 }
 
-fn set_prctl_name<M: GuestMemoryAccess>(
+fn set_prctl_name<M: GuestMemoryAccess<Error = crate::Error>>(
     memory: &M,
     state: &mut LoadedStaticElf,
     address: u64,
@@ -19462,7 +19523,11 @@ fn prctl_cap_ambient(state: &mut LoadedStaticElf, operation: u64, capability: u6
 }
 
 // TODO-HUMAN-REVIEW(PR-181): Review the virtual capability ABI and masks.
-fn capget<M: GuestMemoryAccess>(memory: &mut M, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+fn capget<M: GuestMemoryAccess<Error = crate::Error>>(
+    memory: &mut M,
+    state: &LoadedStaticElf,
+    args: &[u64; 6],
+) -> i64 {
     if args[0] == 0 {
         return negative_errno(libc::EFAULT);
     }
@@ -19500,7 +19565,11 @@ fn capget<M: GuestMemoryAccess>(memory: &mut M, state: &LoadedStaticElf, args: &
 }
 
 // TODO-HUMAN-REVIEW(PR-181): Review deterministic capability mutation.
-fn capset<M: GuestMemoryAccess>(memory: &M, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
+fn capset<M: GuestMemoryAccess<Error = crate::Error>>(
+    memory: &M,
+    state: &mut LoadedStaticElf,
+    args: &[u64; 6],
+) -> i64 {
     if args[0] == 0 || args[1] == 0 {
         return negative_errno(libc::EFAULT);
     }
@@ -19529,7 +19598,7 @@ fn capset<M: GuestMemoryAccess>(memory: &M, state: &mut LoadedStaticElf, args: &
     0
 }
 
-fn read_capability_header<M: GuestMemoryAccess>(
+fn read_capability_header<M: GuestMemoryAccess<Error = crate::Error>>(
     memory: &M,
     address: u64,
 ) -> Result<(u32, i32), ()> {
@@ -19563,7 +19632,7 @@ fn capability_data_bytes(effective: u64, permitted: u64, inheritable: u64) -> [u
     bytes
 }
 
-fn read_capability_data<M: GuestMemoryAccess>(
+fn read_capability_data<M: GuestMemoryAccess<Error = crate::Error>>(
     memory: &M,
     address: u64,
 ) -> Result<(u64, u64, u64), ()> {
@@ -19610,7 +19679,7 @@ fn validate_xattr_target_and_name(
         };
         XattrTarget::Fd(fd)
     } else {
-        let path = match read_c_string(memory, args[0], 4096) {
+        let path = match read_c_string(&ProviderMemory(memory), args[0], 4096) {
             Ok(path) => path,
             Err(error) => return Err(read_c_string_errno(error)),
         };
@@ -19627,7 +19696,7 @@ fn validate_xattr_target_and_name(
         }
     };
 
-    match read_c_string(memory, args[1], 256) {
+    match read_c_string(&ProviderMemory(memory), args[1], 256) {
         Ok(name) if name.is_empty() => Err(negative_errno(libc::ERANGE)),
         Ok(name) => {
             let empty_namespace =
@@ -20467,7 +20536,7 @@ fn munmap_shared_file(
     if address < BOOT_RESERVED_END
         || !address.is_multiple_of(PAGE_SIZE)
         || length == 0
-        || !range_is_valid(memory, address, length)
+        || !range_is_valid(&ProviderMemory(memory), address, length)
     {
         return Ok(negative_errno(libc::EINVAL));
     }
@@ -20727,7 +20796,10 @@ fn munlock_guest_range<M: AddressSpace>(memory: &M, address: u64, length: u64) -
     0
 }
 
-fn mincore<M: GuestMemoryAccess + AddressSpace>(memory: &mut M, args: &[u64; 6]) -> i64 {
+fn mincore<M: GuestMemoryAccess<Error = crate::Error> + AddressSpace>(
+    memory: &mut M,
+    args: &[u64; 6],
+) -> i64 {
     let address = args[0];
     let length = args[1];
     if length == 0 || !address.is_multiple_of(PAGE_SIZE) || !range_is_valid(memory, address, length)
@@ -20752,7 +20824,7 @@ fn mincore<M: GuestMemoryAccess + AddressSpace>(memory: &mut M, args: &[u64; 6])
     }
 }
 
-fn getcpu<M: GuestMemoryAccess>(memory: &mut M, args: &[u64; 6]) -> i64 {
+fn getcpu<M: GuestMemoryAccess<Error = crate::Error>>(memory: &mut M, args: &[u64; 6]) -> i64 {
     if args[0] != 0 {
         let result = write_struct(memory, args[0], &0_u32);
         if result != 0 {
@@ -20765,7 +20837,7 @@ fn getcpu<M: GuestMemoryAccess>(memory: &mut M, args: &[u64; 6]) -> i64 {
     0
 }
 
-fn sched_getaffinity<M: GuestMemoryAccess>(
+fn sched_getaffinity<M: GuestMemoryAccess<Error = crate::Error>>(
     memory: &mut M,
     state: &LoadedStaticElf,
     args: &[u64; 6],
@@ -20821,7 +20893,10 @@ fn sched_target_result(state: &LoadedStaticElf, pid: libc::c_int) -> Result<(), 
 }
 
 // TODO-HUMAN-REVIEW(PR-119): Review guest sched_param memory validation.
-fn read_sched_param<M: GuestMemoryAccess>(memory: &M, address: u64) -> Result<libc::c_int, i64> {
+fn read_sched_param<M: GuestMemoryAccess<Error = crate::Error>>(
+    memory: &M,
+    address: u64,
+) -> Result<libc::c_int, i64> {
     if address == 0 {
         return Err(negative_errno(libc::EINVAL));
     }
@@ -20833,7 +20908,7 @@ fn read_sched_param<M: GuestMemoryAccess>(memory: &M, address: u64) -> Result<li
 }
 
 // TODO-HUMAN-REVIEW(PR-119): Review guest sched_param output validation.
-fn write_sched_param<M: GuestMemoryAccess>(
+fn write_sched_param<M: GuestMemoryAccess<Error = crate::Error>>(
     memory: &mut M,
     address: u64,
     priority: libc::c_int,
@@ -20901,7 +20976,7 @@ fn sched_getscheduler(state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
 
 // TODO-HUMAN-REVIEW(PR-110): Review virtual sched_setscheduler behavior.
 // TODO-HUMAN-REVIEW(PR-119): Review stateful scheduler mutation and errno ordering.
-fn sched_setscheduler<M: GuestMemoryAccess>(
+fn sched_setscheduler<M: GuestMemoryAccess<Error = crate::Error>>(
     memory: &M,
     state: &mut LoadedStaticElf,
     args: &[u64; 6],
@@ -20933,7 +21008,7 @@ fn sched_setscheduler<M: GuestMemoryAccess>(
 
 // TODO-HUMAN-REVIEW(PR-110): Review virtual sched_getparam behavior.
 // TODO-HUMAN-REVIEW(PR-119): Review scheduler parameter query errno ordering.
-fn sched_getparam<M: GuestMemoryAccess>(
+fn sched_getparam<M: GuestMemoryAccess<Error = crate::Error>>(
     memory: &mut M,
     state: &LoadedStaticElf,
     args: &[u64; 6],
@@ -20953,7 +21028,7 @@ fn sched_getparam<M: GuestMemoryAccess>(
 
 // TODO-HUMAN-REVIEW(PR-110): Review virtual sched_setparam behavior.
 // TODO-HUMAN-REVIEW(PR-119): Review scheduler parameter mutation errno ordering.
-fn sched_setparam<M: GuestMemoryAccess>(
+fn sched_setparam<M: GuestMemoryAccess<Error = crate::Error>>(
     memory: &M,
     state: &mut LoadedStaticElf,
     args: &[u64; 6],
@@ -21087,7 +21162,7 @@ fn setpriority(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
 }
 
 // TODO-HUMAN-REVIEW(PR-92): Review bounded sched_getattr ABI writes.
-fn sched_getattr<M: GuestMemoryAccess>(
+fn sched_getattr<M: GuestMemoryAccess<Error = crate::Error>>(
     memory: &mut M,
     state: &LoadedStaticElf,
     args: &[u64; 6],
@@ -21122,7 +21197,7 @@ fn sched_getattr<M: GuestMemoryAccess>(
 }
 
 // TODO-HUMAN-REVIEW(PR-180): Review virtual-TID random stream separation.
-fn getrandom<M: GuestMemoryAccess>(
+fn getrandom<M: GuestMemoryAccess<Error = crate::Error>>(
     memory: &mut M,
     state: &mut LoadedStaticElf,
     address: u64,
@@ -21224,11 +21299,11 @@ fn deterministic_random_device_byte(seed: u64, index: u64) -> u8 {
 // their sleep requests, but do not block the supervisor on host wall time;
 // subscribed root-process sleeps continue to use Detcore's time model.
 // TODO-HUMAN-REVIEW(PR-182): Review nonblocking KVM child sleeps.
-fn nanosleep<M: GuestMemoryAccess>(memory: &M, args: &[u64; 6]) -> i64 {
+fn nanosleep<M: GuestMemoryAccess<Error = crate::Error>>(memory: &M, args: &[u64; 6]) -> i64 {
     validate_sleep_request(memory, args[0])
 }
 
-fn clock_nanosleep<M: GuestMemoryAccess>(memory: &M, args: &[u64; 6]) -> i64 {
+fn clock_nanosleep<M: GuestMemoryAccess<Error = crate::Error>>(memory: &M, args: &[u64; 6]) -> i64 {
     let clock_id = args[0] as libc::clockid_t;
     if clock_id == libc::CLOCK_THREAD_CPUTIME_ID {
         return negative_errno(libc::EOPNOTSUPP);
@@ -21246,7 +21321,10 @@ fn clock_nanosleep<M: GuestMemoryAccess>(memory: &M, args: &[u64; 6]) -> i64 {
     validate_sleep_request(memory, args[2])
 }
 
-fn validate_sleep_request<M: GuestMemoryAccess>(memory: &M, address: u64) -> i64 {
+fn validate_sleep_request<M: GuestMemoryAccess<Error = crate::Error>>(
+    memory: &M,
+    address: u64,
+) -> i64 {
     if address == 0 {
         return negative_errno(libc::EFAULT);
     }
@@ -21261,7 +21339,7 @@ fn validate_sleep_request<M: GuestMemoryAccess>(memory: &M, address: u64) -> i64
     }
 }
 
-fn clock_gettime<M: GuestMemoryAccess>(
+fn clock_gettime<M: GuestMemoryAccess<Error = crate::Error>>(
     memory: &mut M,
     state: &mut LoadedStaticElf,
     args: &[u64; 6],
@@ -21284,7 +21362,10 @@ fn clock_gettime<M: GuestMemoryAccess>(
 /// store returns EFAULT, leaving an already stored `tv_sec` in place. `tz` is
 /// then copied with `copy_to_user`, which stores the writable prefix before
 /// it faults.
-fn gettimeofday<M: GuestMemoryAccess>(memory: &mut M, args: &[u64; 6]) -> i64 {
+fn gettimeofday<M: GuestMemoryAccess<Error = crate::Error>>(
+    memory: &mut M,
+    args: &[u64; 6],
+) -> i64 {
     const TV_USEC_OFFSET: u64 = std::mem::offset_of!(libc::timeval, tv_usec) as u64;
     if args[0] != 0 {
         let stored = memory.put_user_u64(args[0], 0).is_ok()
@@ -21312,7 +21393,11 @@ fn gettimeofday<M: GuestMemoryAccess>(memory: &mut M, args: &[u64; 6]) -> i64 {
 /// `tloc` when it is not null. As Linux's `put_user`, the store writes all
 /// eight bytes or none, only to writable pages (shared-file pages included),
 /// and a failed store returns EFAULT. Reading the clock does not advance it.
-fn time<M: GuestMemoryAccess>(memory: &mut M, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+fn time<M: GuestMemoryAccess<Error = crate::Error>>(
+    memory: &mut M,
+    state: &LoadedStaticElf,
+    args: &[u64; 6],
+) -> i64 {
     let seconds = state.logical_clock_ns / 1_000_000_000;
     if args[0] != 0 && memory.put_user_u64(args[0], seconds).is_err() {
         return negative_errno(libc::EFAULT);
@@ -21366,7 +21451,7 @@ fn readlink_at_impl(
     raw_capacity: u64,
     capture: Option<CaptureMetadata>,
 ) -> i64 {
-    let path = match read_c_string(memory, path_address, 4096) {
+    let path = match read_c_string(&ProviderMemory(memory), path_address, 4096) {
         Ok(path) => path,
         Err(error) => return read_c_string_errno(error),
     };
@@ -21496,7 +21581,11 @@ fn personality(state: &mut LoadedStaticElf, raw: u64) -> i64 {
     i64::from(previous)
 }
 
-fn uname<M: GuestMemoryAccess>(memory: &mut M, state: &LoadedStaticElf, address: u64) -> i64 {
+fn uname<M: GuestMemoryAccess<Error = crate::Error>>(
+    memory: &mut M,
+    state: &LoadedStaticElf,
+    address: u64,
+) -> i64 {
     // Linux's UNAME26 rule maps a 6.0.0 release to 2.6.(0 + 60).
     // Keep this transformation tied to the existing lower virtual release.
     let release: &[u8] = if state.linux_personality & PERSONALITY_UNAME26 != 0 {
@@ -21522,7 +21611,7 @@ fn uname<M: GuestMemoryAccess>(memory: &mut M, state: &LoadedStaticElf, address:
     write_bytes(memory, address, &utsname)
 }
 
-fn prlimit64<M: GuestMemoryAccess>(memory: &mut M, args: &[u64; 6]) -> i64 {
+fn prlimit64<M: GuestMemoryAccess<Error = crate::Error>>(memory: &mut M, args: &[u64; 6]) -> i64 {
     if args[2] != 0 {
         return negative_errno(libc::EPERM);
     }
@@ -21555,7 +21644,7 @@ fn rt_sigaction(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u
     let mut action = if args[1] == 0 {
         None
     } else {
-        match read_guest_bytes::<KERNEL_SIGACTION_SIZE>(memory, args[1]) {
+        match read_guest_bytes::<KERNEL_SIGACTION_SIZE>(&ProviderMemory(memory), args[1]) {
             Ok(action) => Some(KernelSigaction::decode(action)),
             Err(error) => return error,
         }
@@ -21638,7 +21727,7 @@ fn rt_sigaction(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u
         }
     }
     if args[2] != 0 {
-        return write_bytes(memory, args[2], &previous.encode());
+        return write_bytes(&mut ProviderMemory(memory), args[2], &previous.encode());
     }
     0
 }
@@ -21654,8 +21743,10 @@ fn prospective_sigprocmask(
     if args[1] == 0 {
         return Ok(None);
     }
-    let requested =
-        KernelSigset::from_bytes(read_guest_bytes::<KERNEL_SIGSET_SIZE>(memory, args[1])?);
+    let requested = KernelSigset::from_bytes(read_guest_bytes::<KERNEL_SIGSET_SIZE>(
+        &ProviderMemory(memory),
+        args[1],
+    )?);
     let mut next = current;
     match args[0] as libc::c_int {
         libc::SIG_BLOCK => next.union_with(requested),
@@ -21677,7 +21768,7 @@ fn rt_sigprocmask(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &
         Err(error) => return error,
     }
     if args[2] != 0 {
-        return write_bytes(memory, args[2], &previous.to_bytes());
+        return write_bytes(&mut ProviderMemory(memory), args[2], &previous.to_bytes());
     }
     0
 }
@@ -21770,10 +21861,11 @@ fn sigqueueinfo(
     } else {
         (args[1], args[2])
     };
-    let copied = match read_guest_bytes::<KERNEL_SIGINFO_SIZE>(memory, info_address) {
-        Ok(copied) => copied,
-        Err(error) => return continue_with(error),
-    };
+    let copied =
+        match read_guest_bytes::<KERNEL_SIGINFO_SIZE>(&ProviderMemory(memory), info_address) {
+            Ok(copied) => copied,
+            Err(error) => return continue_with(error),
+        };
     let mut info = [0; SIGINFO_SIZE];
     info[..KERNEL_SIGINFO_SIZE].copy_from_slice(&copied);
     // The kernel stores the int signal argument over the caller's si_signo.
@@ -22242,7 +22334,7 @@ fn sigaltstack(
     let requested = if args[0] == 0 {
         None
     } else {
-        let stack = match read_guest_bytes::<24>(memory, args[0]) {
+        let stack = match read_guest_bytes::<24>(&ProviderMemory(memory), args[0]) {
             Ok(stack) => GuestStack::decode(stack),
             Err(error) => return error,
         };
@@ -22264,10 +22356,10 @@ fn sigaltstack(
             if on_stack {
                 previous.flags |= libc::SS_ONSTACK;
             }
-            return write_bytes(memory, args[1], &previous.encode());
+            return write_bytes(&mut ProviderMemory(memory), args[1], &previous.encode());
         }
         return write_bytes(
-            memory,
+            &mut ProviderMemory(memory),
             args[1],
             &GuestStack {
                 sp: 0,
@@ -22301,7 +22393,7 @@ fn rt_sigtimedwait(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: 
     if args[3] != KERNEL_SIGSET_SIZE as u64 {
         return negative_errno(libc::EINVAL);
     }
-    let mut set = match read_guest_bytes::<KERNEL_SIGSET_SIZE>(memory, args[0]) {
+    let mut set = match read_guest_bytes::<KERNEL_SIGSET_SIZE>(&ProviderMemory(memory), args[0]) {
         Ok(set) => KernelSigset::from_bytes(set),
         Err(error) => return error,
     };
@@ -22318,11 +22410,15 @@ fn rt_sigtimedwait(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: 
     }
     // Preserve all event metadata rather than synthesizing a second siginfo.
     if args[1] != 0 {
-        if !range_is_valid(memory, args[1], reverie::SIGNAL_INFO_SIZE as u64) {
+        if !range_is_valid(
+            &ProviderMemory(memory),
+            args[1],
+            reverie::SIGNAL_INFO_SIZE as u64,
+        ) {
             return negative_errno(libc::EFAULT);
         }
         let info = event.siginfo();
-        let written = write_bytes(memory, args[1], &info);
+        let written = write_bytes(&mut ProviderMemory(memory), args[1], &info);
         if written < 0 {
             return written;
         }
@@ -22415,7 +22511,7 @@ fn rt_sigsuspend(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6])
     if args[1] != KERNEL_SIGSET_SIZE as u64 {
         return negative_errno(libc::EINVAL);
     }
-    let mask = match read_guest_bytes::<KERNEL_SIGSET_SIZE>(memory, args[0]) {
+    let mask = match read_guest_bytes::<KERNEL_SIGSET_SIZE>(&ProviderMemory(memory), args[0]) {
         Ok(mask) => KernelSigset::from_bytes(mask),
         Err(error) => return error,
     };
@@ -22597,7 +22693,7 @@ fn waitid_options_supported(raw: u64) -> bool {
     options & libc::WEXITED != 0 && options & !allowed == 0
 }
 
-fn finish_waitid<M: GuestMemoryAccess>(
+fn finish_waitid<M: GuestMemoryAccess<Error = crate::Error>>(
     memory: &M,
     args: &[u64; 6],
     event: Option<&GuestWaitidSiginfo>,
@@ -22655,7 +22751,7 @@ fn waitid_result(
 ) -> crate::Result<i64> {
     if !waitid_options_supported(args[3]) {
         return Ok(finish_waitid(
-            memory,
+            &ProviderMemory(memory),
             args,
             None,
             negative_errno(libc::EINVAL),
@@ -22666,7 +22762,7 @@ fn waitid_result(
             Ok(pid) => Some(pid),
             Err(_) => {
                 return Ok(finish_waitid(
-                    memory,
+                    &ProviderMemory(memory),
                     args,
                     None,
                     negative_errno(libc::ECHILD),
@@ -22676,7 +22772,7 @@ fn waitid_result(
         libc::P_ALL | libc::P_PGID => None,
         _ => {
             return Ok(finish_waitid(
-                memory,
+                &ProviderMemory(memory),
                 args,
                 None,
                 negative_errno(libc::EINVAL),
@@ -22691,10 +22787,12 @@ fn waitid_result(
     )? {
         ChildWaitSelection::Ready(selected) => selected,
         ChildWaitSelection::ParentTerminated => return parent_terminated_wait(state),
-        ChildWaitSelection::Pending => return Ok(finish_waitid(memory, args, None, 0)),
+        ChildWaitSelection::Pending => {
+            return Ok(finish_waitid(&ProviderMemory(memory), args, None, 0));
+        }
         ChildWaitSelection::NoChild => {
             return Ok(finish_waitid(
-                memory,
+                &ProviderMemory(memory),
                 args,
                 None,
                 negative_errno(libc::ECHILD),
@@ -22724,7 +22822,7 @@ fn waitid_result(
         _si_stime: 0,
         _padding: [0; std::mem::size_of::<libc::siginfo_t>() - 48],
     };
-    Ok(finish_waitid(memory, args, Some(&info), 0))
+    Ok(finish_waitid(&ProviderMemory(memory), args, Some(&info), 0))
 }
 
 #[cfg(test)]
@@ -22732,18 +22830,30 @@ fn waitid(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]
     waitid_result(memory, state, args).expect("raw waitid fixture has a coherent family ledger")
 }
 
-fn write_u64<M: GuestMemoryAccess>(memory: &mut M, address: u64, value: u64) -> i64 {
+fn write_u64<M: GuestMemoryAccess<Error = crate::Error>>(
+    memory: &mut M,
+    address: u64,
+    value: u64,
+) -> i64 {
     write_bytes(memory, address, &value.to_le_bytes())
 }
 
-fn write_bytes<M: GuestMemoryAccess>(memory: &mut M, address: u64, bytes: &[u8]) -> i64 {
+fn write_bytes<M: GuestMemoryAccess<Error = crate::Error>>(
+    memory: &mut M,
+    address: u64,
+    bytes: &[u8],
+) -> i64 {
     match memory.write_exact(address, bytes) {
         Ok(()) => 0,
         Err(_) => negative_errno(libc::EFAULT),
     }
 }
 
-fn write_struct<T>(memory: &mut impl GuestMemoryAccess, address: u64, value: &T) -> i64 {
+fn write_struct<T>(
+    memory: &mut impl GuestMemoryAccess<Error = crate::Error>,
+    address: u64,
+    value: &T,
+) -> i64 {
     // SAFETY: Linux ABI structs are initialized plain data. The byte view is
     // bounded to value and copied into guest memory before value is dropped.
     let bytes = unsafe {
@@ -22756,7 +22866,7 @@ fn write_struct<T>(memory: &mut impl GuestMemoryAccess, address: u64, value: &T)
 }
 
 fn read_guest_bytes<const N: usize>(
-    memory: &impl GuestMemoryAccess,
+    memory: &impl GuestMemoryAccess<Error = crate::Error>,
     address: u64,
 ) -> Result<[u8; N], i64> {
     let mut bytes = [0; N];
@@ -22766,7 +22876,10 @@ fn read_guest_bytes<const N: usize>(
     Ok(bytes)
 }
 
-fn read_guest_struct<T>(memory: &impl GuestMemoryAccess, address: u64) -> Result<T, i64> {
+fn read_guest_struct<T>(
+    memory: &impl GuestMemoryAccess<Error = crate::Error>,
+    address: u64,
+) -> Result<T, i64> {
     let mut value = std::mem::MaybeUninit::<T>::zeroed();
     // SAFETY: value is writable for exactly size_of::<T>() bytes and is not
     // observed until guest memory has initialized the complete byte range.
@@ -22813,7 +22926,7 @@ fn read_c_string_errno(error: ReadCStringError) -> i64 {
     }
 }
 
-fn read_c_string<M: GuestMemoryAccess>(
+fn read_c_string<M: GuestMemoryAccess<Error = crate::Error>>(
     memory: &M,
     address: u64,
     limit: usize,
@@ -22885,7 +22998,7 @@ struct CloneRequest {
     tls: Option<u64>,
 }
 
-fn read_clone3<M: GuestMemoryAccess>(
+fn read_clone3<M: GuestMemoryAccess<Error = crate::Error>>(
     memory: &M,
     address: u64,
     size: u64,
@@ -22950,7 +23063,10 @@ fn read_clone3<M: GuestMemoryAccess>(
     })
 }
 
-fn read_string_array<M: GuestMemoryAccess>(memory: &M, address: u64) -> Result<Vec<String>, i64> {
+fn read_string_array<M: GuestMemoryAccess<Error = crate::Error>>(
+    memory: &M,
+    address: u64,
+) -> Result<Vec<String>, i64> {
     const MAX_ENTRIES: usize = 4096;
     const MAX_STRING_BYTES: usize = 128 * 1024;
 
@@ -23733,17 +23849,23 @@ mod tests {
         // An unreadable timeout still faults during the outer syscall import.
         // A misaligned second futex word is rejected before mapping access.
         assert_eq!(
-            futex(&memory, &[WORD, libc::FUTEX_WAIT as u64, 0, 1, 0, 0]),
+            futex(
+                &ProviderMemory(&memory),
+                &[WORD, libc::FUTEX_WAIT as u64, 0, 1, 0, 0]
+            ),
             negative_errno(libc::EFAULT)
         );
         assert_eq!(
-            futex(&memory, &[WORD, libc::FUTEX_CMP_REQUEUE as u64, 0, 1, 1, 0]),
+            futex(
+                &ProviderMemory(&memory),
+                &[WORD, libc::FUTEX_CMP_REQUEUE as u64, 0, 1, 1, 0]
+            ),
             negative_errno(libc::EINVAL)
         );
         let waiting_memory = memory.clone();
         let waiter = std::thread::spawn(move || {
             futex(
-                &waiting_memory,
+                &ProviderMemory(&waiting_memory),
                 &[WORD, libc::FUTEX_WAIT as u64, 0, TIMEOUT, 0, 0],
             )
         });
@@ -23752,7 +23874,7 @@ mod tests {
             // Count one is deliberately outside guest coverage: it must not
             // become a pointer. A return of one proves a real queued waiter.
             let moved = futex(
-                &memory,
+                &ProviderMemory(&memory),
                 &[WORD, libc::FUTEX_CMP_REQUEUE as u64, 0, 1, SECOND, 0],
             );
             assert!(moved == 0 || moved == 1, "requeue returned {moved}");
@@ -23787,7 +23909,10 @@ mod tests {
             Some(RegionKind::Mmap)
         );
         assert_eq!(
-            futex(&memory, &[SECOND, libc::FUTEX_WAKE as u64, 1, 0, 0, 0]),
+            futex(
+                &ProviderMemory(&memory),
+                &[SECOND, libc::FUTEX_WAKE as u64, 1, 0, 0, 0]
+            ),
             1
         );
         assert_eq!(waiter.join().unwrap(), 0);
@@ -24167,13 +24292,19 @@ mod tests {
                 iov_base: 0x400_usize as *mut libc::c_void,
                 iov_len: 128,
             };
-            assert_eq!(write_struct(&mut memory, 0x200, &vector), 0);
+            assert_eq!(
+                write_struct(&mut ProviderMemory(&memory), 0x200, &vector),
+                0
+            );
             let mut guest_message: libc::msghdr = unsafe { std::mem::zeroed() };
             guest_message.msg_iov = 0x200_usize as *mut libc::iovec;
             guest_message.msg_iovlen = 1;
             guest_message.msg_control = 0x800_usize as *mut libc::c_void;
             guest_message.msg_controllen = 128;
-            assert_eq!(write_struct(&mut memory, 0x100, &guest_message), 0);
+            assert_eq!(
+                write_struct(&mut ProviderMemory(&memory), 0x100, &guest_message),
+                0
+            );
             let mut expected = [0; 0x1000];
             memory.read(0, &mut expected).unwrap();
             expected[0x400] = b'x';
@@ -24247,8 +24378,8 @@ mod tests {
     }
 
     fn prctl(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
-        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
-        super::prctl(&mut memory, state, args)
+        let memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        super::prctl(&mut ProviderMemory(&memory), state, args)
     }
 
     fn test_signal_action(
@@ -24434,7 +24565,7 @@ mod tests {
             };
             assert_eq!(
                 write_struct(
-                    memory,
+                    &mut ProviderMemory(memory),
                     address + (index * std::mem::size_of::<libc::iovec>()) as u64,
                     &entry
                 ),
@@ -28693,7 +28824,7 @@ mod tests {
         state.files.insert(4, dst_off);
 
         const OFF: u64 = 0x100;
-        write_struct(&mut memory, OFF, &2i64);
+        write_struct(&mut ProviderMemory(&memory), OFF, &2i64);
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -28764,7 +28895,7 @@ mod tests {
                 .unwrap(),
         );
         let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
-        write_struct(&mut memory, OFFSET, &0i64);
+        write_struct(&mut ProviderMemory(&memory), OFFSET, &0i64);
 
         // Exercise each sendfile descriptor decoder independently while using
         // the same ordinary regular-file routing as an unadorned syscall.
@@ -29185,7 +29316,7 @@ mod tests {
                     .unwrap()
                     .seek(std::io::SeekFrom::Start(1))
                     .unwrap();
-                write_struct(&mut memory, 0x100, &2_i64);
+                write_struct(&mut ProviderMemory(&memory), 0x100, &2_i64);
                 let result = syscall_result(
                     &mut memory,
                     &mut state,
@@ -29252,7 +29383,7 @@ mod tests {
                 ("null", 0, 2, 2, libc::EBADF),
                 ("null zero count", 0, 2, 0, libc::EBADF),
             ] {
-                write_struct(&mut memory, OFFSET, &offset);
+                write_struct(&mut ProviderMemory(&memory), OFFSET, &offset);
                 let result = syscall_result(
                     &mut memory,
                     &mut state,
@@ -29414,7 +29545,7 @@ mod tests {
                     ("null signed count bit", 0, 2, 1_u64 << 63, libc::EINVAL),
                     ("null unsigned count maximum", 0, 2, u64::MAX, libc::EINVAL),
                 ] {
-                    write_struct(&mut memory, OFFSET, &offset);
+                    write_struct(&mut ProviderMemory(&memory), OFFSET, &offset);
                     let result = syscall_result(
                         &mut memory,
                         &mut state,
@@ -29483,7 +29614,7 @@ mod tests {
                 for (offset, count) in
                     [(-1_i64, 2), (i64::MIN, 2), (i64::MAX, 1), (i64::MAX - 1, 2)]
                 {
-                    write_struct(&mut memory, 0x100, &offset);
+                    write_struct(&mut ProviderMemory(&memory), 0x100, &offset);
                     assert_eq!(
                         syscall_result(
                             &mut memory,
@@ -29634,7 +29765,7 @@ mod tests {
                                     .write_all(&[sentinel])
                                     .unwrap();
                             }
-                            write_struct(&mut memory, OFFSET, &offset);
+                            write_struct(&mut ProviderMemory(&memory), OFFSET, &offset);
                             let result = syscall_result(
                                 &mut memory,
                                 &mut state,
@@ -29760,7 +29891,7 @@ mod tests {
                 (INACCESSIBLE, 2, 2, libc::EFAULT),
                 (INACCESSIBLE, 2, 0, libc::EFAULT),
             ] {
-                write_struct(&mut memory, OFFSET, &offset);
+                write_struct(&mut ProviderMemory(&memory), OFFSET, &offset);
                 assert_eq!(
                     syscall_result(
                         &mut memory,
@@ -29937,7 +30068,7 @@ mod tests {
                                 .write_all(&[sentinel])
                                 .unwrap();
                         }
-                        write_struct(&mut memory, OFFSET, &offset);
+                        write_struct(&mut ProviderMemory(&memory), OFFSET, &offset);
                         let expected = if pointer == INACCESSIBLE {
                             libc::EFAULT
                         } else if backing == "pipe read end" && pointer != 0 {
@@ -30051,7 +30182,7 @@ mod tests {
                     (0, 2, u64::MAX, libc::EBADF),
                     (0xffff_ffff_ffff_f000, 2, 0, libc::EFAULT),
                 ] {
-                    write_struct(&mut memory, 0x200, &offset);
+                    write_struct(&mut ProviderMemory(&memory), 0x200, &offset);
                     assert_eq!(
                         syscall_result(
                             &mut memory,
@@ -30109,7 +30240,7 @@ mod tests {
                     .unwrap()
                     .seek(std::io::SeekFrom::Start(1))
                     .unwrap();
-                write_struct(&mut memory, 0x100, &2_i64);
+                write_struct(&mut ProviderMemory(&memory), 0x100, &2_i64);
                 for (offset, count) in [(0x100, 3), (0, 2)] {
                     assert_eq!(
                         sendfile(
@@ -30340,7 +30471,7 @@ mod tests {
             // zero, so translation must not pass a caller's stale value.
             l_pid: 1234,
         };
-        assert_eq!(write_struct(&mut memory, LOCK, &lock), 0);
+        assert_eq!(write_struct(&mut ProviderMemory(&memory), LOCK, &lock), 0);
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -30357,7 +30488,7 @@ mod tests {
             locks
         );
         lock.l_pid = 0;
-        assert_eq!(write_struct(&mut memory, LOCK, &lock), 0);
+        assert_eq!(write_struct(&mut ProviderMemory(&memory), LOCK, &lock), 0);
         let conflict = syscall_result(
             &mut memory,
             &mut state,
@@ -30370,7 +30501,7 @@ mod tests {
         );
 
         lock.l_type = libc::F_UNLCK as libc::c_short;
-        assert_eq!(write_struct(&mut memory, LOCK, &lock), 0);
+        assert_eq!(write_struct(&mut ProviderMemory(&memory), LOCK, &lock), 0);
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -30420,14 +30551,22 @@ mod tests {
             )
         };
         assert_eq!(
-            write_struct(&mut memory, LOCK, &lock(libc::F_WRLCK, 0, 100, 0)),
+            write_struct(
+                &mut ProviderMemory(&memory),
+                LOCK,
+                &lock(libc::F_WRLCK, 0, 100, 0)
+            ),
             0
         );
         assert_eq!(fcntl(&mut memory, &mut state, 3, libc::F_SETLK), 0);
 
         // Outside the locked range: Linux answers F_UNLCK and leaves the rest.
         assert_eq!(
-            write_struct(&mut memory, LOCK, &lock(libc::F_WRLCK, 200, 50, 1234)),
+            write_struct(
+                &mut ProviderMemory(&memory),
+                LOCK,
+                &lock(libc::F_WRLCK, 200, 50, 1234)
+            ),
             0
         );
         assert_eq!(fcntl(&mut memory, &mut state, 4, libc::F_GETLK), 0);
@@ -30437,7 +30576,11 @@ mod tests {
         // Overlapping, through another open description: the holder's range,
         // with l_pid -1 (an OFD holder), never a host pid.
         assert_eq!(
-            write_struct(&mut memory, LOCK, &lock(libc::F_RDLCK, 50, 10, 0)),
+            write_struct(
+                &mut ProviderMemory(&memory),
+                LOCK,
+                &lock(libc::F_RDLCK, 50, 10, 0)
+            ),
             0
         );
         assert_eq!(fcntl(&mut memory, &mut state, 4, libc::F_GETLK), 0);
@@ -30454,7 +30597,11 @@ mod tests {
 
         // The holder's own description does not conflict with itself.
         assert_eq!(
-            write_struct(&mut memory, LOCK, &lock(libc::F_WRLCK, 50, 10, 0)),
+            write_struct(
+                &mut ProviderMemory(&memory),
+                LOCK,
+                &lock(libc::F_WRLCK, 50, 10, 0)
+            ),
             0
         );
         assert_eq!(fcntl(&mut memory, &mut state, 3, libc::F_OFD_GETLK), 0);
@@ -30497,8 +30644,8 @@ mod tests {
         memory.write(BUF_A, b"foo").unwrap();
         memory.write(BUF_B, b"barbaz").unwrap();
         const IOV: u64 = 0x300;
-        write_struct(&mut memory, IOV, &[BUF_A, 3u64]);
-        write_struct(&mut memory, IOV + 16, &[BUF_B, 6u64]);
+        write_struct(&mut ProviderMemory(&memory), IOV, &[BUF_A, 3u64]);
+        write_struct(&mut ProviderMemory(&memory), IOV + 16, &[BUF_B, 6u64]);
 
         // writev gathers both iovecs into the pipe.
         assert_eq!(
@@ -30515,8 +30662,8 @@ mod tests {
         const RBUF_A: u64 = 0x400;
         const RBUF_B: u64 = 0x410;
         const RIOV: u64 = 0x500;
-        write_struct(&mut memory, RIOV, &[RBUF_A, 4u64]);
-        write_struct(&mut memory, RIOV + 16, &[RBUF_B, 5u64]);
+        write_struct(&mut ProviderMemory(&memory), RIOV, &[RBUF_A, 4u64]);
+        write_struct(&mut ProviderMemory(&memory), RIOV + 16, &[RBUF_B, 5u64]);
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -34785,7 +34932,10 @@ mod tests {
             events: libc::POLLIN,
             revents: 0,
         };
-        assert_eq!(write_struct(&mut memory, POLL_FD, &poll_fd), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), POLL_FD, &poll_fd),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -34800,7 +34950,7 @@ mod tests {
         assert_eq!(poll_fd.revents, 0);
         assert_eq!(
             write_struct(
-                &mut memory,
+                &mut ProviderMemory(&memory),
                 POLL_TIMEOUT,
                 &libc::timespec {
                     tv_sec: 0,
@@ -34833,7 +34983,10 @@ mod tests {
             events: libc::POLLIN,
             revents: 0,
         };
-        assert_eq!(write_struct(&mut memory, POLL_FD, &poll_fd), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), POLL_FD, &poll_fd),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -34846,7 +34999,10 @@ mod tests {
         let poll_fd: libc::pollfd = read_struct(&memory, POLL_FD);
         assert_eq!(poll_fd.fd, pipe_fds[0]);
         assert_eq!(poll_fd.revents, libc::POLLIN);
-        assert_eq!(write_struct(&mut memory, POLL_FD, &poll_fd), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), POLL_FD, &poll_fd),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -34966,7 +35122,10 @@ mod tests {
                 memory
                     .write_raw(0, &vec![0xa5; PAGE_SIZE as usize])
                     .unwrap();
-                assert_eq!(write_struct(&mut memory, TIMEOUT, &[0_i64; 2]), 0);
+                assert_eq!(
+                    write_struct(&mut ProviderMemory(&memory), TIMEOUT, &[0_i64; 2]),
+                    0
+                );
                 let descriptors = [
                     libc::pollfd {
                         fd: -7,
@@ -34985,7 +35144,10 @@ mod tests {
                         revents: 0x3456,
                     },
                 ];
-                assert_eq!(write_struct(&mut memory, POLL_FDS, &descriptors), 0);
+                assert_eq!(
+                    write_struct(&mut ProviderMemory(&memory), POLL_FDS, &descriptors),
+                    0
+                );
                 let mut original = vec![0; PAGE_SIZE as usize];
                 memory.read_raw(0, &mut original).unwrap();
                 memory
@@ -35071,10 +35233,13 @@ mod tests {
                 memory
                     .write_raw(0, &vec![0xa5; (2 * PAGE_SIZE) as usize])
                     .unwrap();
-                assert_eq!(write_struct(&mut memory, TIMEOUT, &[0_i64; 2]), 0);
+                assert_eq!(
+                    write_struct(&mut ProviderMemory(&memory), TIMEOUT, &[0_i64; 2]),
+                    0
+                );
                 assert_eq!(
                     write_struct(
-                        &mut memory,
+                        &mut ProviderMemory(&memory),
                         POLL_FD,
                         &libc::pollfd {
                             fd: READY_FD,
@@ -35289,11 +35454,17 @@ mod tests {
             tv_sec: 5,
             tv_nsec: 0,
         };
-        assert_eq!(write_struct(&mut memory, POLL_TIMEOUT, &long_timeout), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), POLL_TIMEOUT, &long_timeout),
+            0
+        );
 
         // Masked ppoll on a ready descriptor returns the ready count. Before this
         // fix the masked branch returned ENOSYS unconditionally.
-        assert_eq!(write_struct(&mut memory, POLL_FD, &readable), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), POLL_FD, &readable),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -35320,7 +35491,10 @@ mod tests {
         // presence: with the mask read removed the descriptor is still ready and
         // the call would return 1, so this assertion fails closed and pins the
         // EFAULT path in place.
-        assert_eq!(write_struct(&mut memory, POLL_FD, &readable), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), POLL_FD, &readable),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -35339,7 +35513,10 @@ mod tests {
         );
 
         // A wrong sigset size is rejected before any polling.
-        assert_eq!(write_struct(&mut memory, POLL_FD, &readable), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), POLL_FD, &readable),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -35362,8 +35539,14 @@ mod tests {
             tv_sec: 0,
             tv_nsec: 1_000_000_000,
         };
-        assert_eq!(write_struct(&mut memory, POLL_TIMEOUT, &bad_timeout), 0);
-        assert_eq!(write_struct(&mut memory, POLL_FD, &readable), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), POLL_TIMEOUT, &bad_timeout),
+            0
+        );
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), POLL_FD, &readable),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -35399,10 +35582,16 @@ mod tests {
             tv_sec: 0,
             tv_nsec: 1_000_000,
         };
-        assert_eq!(write_struct(&mut memory, POLL_TIMEOUT, &short_timeout), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), POLL_TIMEOUT, &short_timeout),
+            0
+        );
 
         // Masked ppoll that would block fails closed with ENOSYS.
-        assert_eq!(write_struct(&mut memory, POLL_FD, &readable), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), POLL_FD, &readable),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -35422,7 +35611,10 @@ mod tests {
 
         // The unmasked path on the same empty descriptor times out (0), never
         // ENOSYS -- only the masked path fails closed.
-        assert_eq!(write_struct(&mut memory, POLL_FD, &readable), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), POLL_FD, &readable),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -35499,7 +35691,10 @@ mod tests {
             tv_sec: 0,
             tv_nsec: 1_000_000_000,
         };
-        assert_eq!(write_struct(&mut memory, TIMEOUT, &malformed_timeout), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), TIMEOUT, &malformed_timeout),
+            0
+        );
 
         // The complete outer wrapper is copied before even an invalid timeout
         // is inspected. Cover both a wholly inaccessible wrapper and a split
@@ -35531,7 +35726,10 @@ mod tests {
             sigmask: SIGNAL_MASK,
             sigsetsize: 0,
         };
-        assert_eq!(write_struct(&mut memory, OUTER, &bad_size), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), OUTER, &bad_size),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -35547,24 +35745,8 @@ mod tests {
             sigmask: BAD_ADDRESS,
             sigsetsize: KERNEL_SIGSET_SIZE as u64,
         };
-        assert_eq!(write_struct(&mut memory, OUTER, &inaccessible_mask), 0);
         assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_pselect6,
-                [0, 0, 0, 0, TIMEOUT, OUTER],
-            ),
-            negative_errno(libc::EINVAL)
-        );
-
-        assert_eq!(write_struct(&mut memory, TIMEOUT, &valid_timeout), 0);
-        let wrong_size_and_inaccessible = Pselect6SigmaskArg {
-            sigmask: BAD_ADDRESS,
-            sigsetsize: (KERNEL_SIGSET_SIZE - 1) as u64,
-        };
-        assert_eq!(
-            write_struct(&mut memory, OUTER, &wrong_size_and_inaccessible),
+            write_struct(&mut ProviderMemory(&memory), OUTER, &inaccessible_mask),
             0
         );
         assert_eq!(
@@ -35576,7 +35758,36 @@ mod tests {
             ),
             negative_errno(libc::EINVAL)
         );
-        assert_eq!(write_struct(&mut memory, OUTER, &inaccessible_mask), 0);
+
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), TIMEOUT, &valid_timeout),
+            0
+        );
+        let wrong_size_and_inaccessible = Pselect6SigmaskArg {
+            sigmask: BAD_ADDRESS,
+            sigsetsize: (KERNEL_SIGSET_SIZE - 1) as u64,
+        };
+        assert_eq!(
+            write_struct(
+                &mut ProviderMemory(&memory),
+                OUTER,
+                &wrong_size_and_inaccessible
+            ),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_pselect6,
+                [0, 0, 0, 0, TIMEOUT, OUTER],
+            ),
+            negative_errno(libc::EINVAL)
+        );
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), OUTER, &inaccessible_mask),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -35593,7 +35804,10 @@ mod tests {
             sigmask: 0,
             sigsetsize: u64::MAX,
         };
-        assert_eq!(write_struct(&mut memory, OUTER, &null_mask_bad_size), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), OUTER, &null_mask_bad_size),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -35685,7 +35899,10 @@ mod tests {
             sigmask: SIGNAL_MASK,
             sigsetsize: KERNEL_SIGSET_SIZE as u64,
         };
-        assert_eq!(write_struct(&mut memory, OUTER, &valid_mask), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), OUTER, &valid_mask),
+            0
+        );
         assert_result_without_mutation(
             &mut memory,
             &mut state,
@@ -35696,7 +35913,7 @@ mod tests {
         assert_refused_without_mutation(&mut memory, &mut state, [0, 0, 0, 0, 0, 0]);
         assert_eq!(
             write_struct(
-                &mut memory,
+                &mut ProviderMemory(&memory),
                 TIMEOUT,
                 &libc::timespec {
                     tv_sec: 0,
@@ -35746,7 +35963,8 @@ mod tests {
         // The outer wrapper is input-only. Translate its inner pointer into a
         // disjoint native wrapper, leaving the arena's bytes comparable in full.
         let outer = if args[5] != 0 && args[5] + 16 <= SocketQueryCopyoutBuffer::LENGTH as u64 {
-            let outer: Pselect6SigmaskArg = read_guest_struct(&buffer.guest, args[5]).unwrap();
+            let outer: Pselect6SigmaskArg =
+                read_guest_struct(&ProviderMemory(&buffer.guest), args[5]).unwrap();
             Some(Pselect6SigmaskArg {
                 sigmask: pointer(outer.sigmask),
                 ..outer
@@ -36090,7 +36308,7 @@ mod tests {
         let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
         assert_eq!(
             write_struct(
-                &mut memory,
+                &mut ProviderMemory(&memory),
                 TIMEOUT,
                 &libc::timespec {
                     tv_sec: 0,
@@ -36599,7 +36817,7 @@ mod tests {
         memory.write(MASK, &mask.to_bytes()).unwrap();
         assert_eq!(
             write_struct(
-                &mut memory,
+                &mut ProviderMemory(&memory),
                 TIMEOUT,
                 &libc::timespec {
                     tv_sec: 0,
@@ -36722,7 +36940,7 @@ mod tests {
                 let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
                 assert_eq!(
                     write_struct(
-                        &mut memory,
+                        &mut ProviderMemory(&memory),
                         TIMEOUT,
                         &libc::timespec {
                             tv_sec: 0,
@@ -36817,7 +37035,10 @@ mod tests {
 
         let mut state = test_state(&root.0);
         let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
-        assert_eq!(write_struct(&mut memory, ADDRESS, &address), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), ADDRESS, &address),
+            0
+        );
         let server = syscall_result(
             &mut memory,
             &mut state,
@@ -36892,7 +37113,10 @@ mod tests {
             sun_path: [0; 108],
         };
         let request_length = std::mem::offset_of!(libc::sockaddr_un, sun_path);
-        assert_eq!(write_struct(&mut memory, ADDRESS, &request), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), ADDRESS, &request),
+            0
+        );
 
         for socket_type in [libc::SOCK_STREAM, libc::SOCK_DGRAM, libc::SOCK_SEQPACKET] {
             let fd = syscall_result(
@@ -36915,7 +37139,10 @@ mod tests {
             );
 
             let capacity = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
-            assert_eq!(write_struct(&mut memory, OBSERVED_LEN, &capacity), 0);
+            assert_eq!(
+                write_struct(&mut ProviderMemory(&memory), OBSERVED_LEN, &capacity),
+                0
+            );
             assert_eq!(
                 syscall_result(
                     &mut memory,
@@ -36985,7 +37212,10 @@ mod tests {
         let address_length = std::mem::offset_of!(libc::sockaddr_un, sun_path) + path.len() + 1;
 
         let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
-        assert_eq!(write_struct(&mut memory, ADDRESS, &address), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), ADDRESS, &address),
+            0
+        );
         let mut executor = ElfExecutor::new(test_state(&root.0), false);
         let server = executor.execute(
             &SyscallRequest::new(
@@ -37083,8 +37313,14 @@ mod tests {
             },
             sin_zero: [0; 8],
         };
-        assert_eq!(write_struct(&mut memory, BIND_ADDRESS, &address), 0);
-        assert_eq!(write_struct(&mut memory, REUSE_ADDRESS, &1_i32), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), BIND_ADDRESS, &address),
+            0
+        );
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), REUSE_ADDRESS, &1_i32),
+            0
+        );
 
         let socket_fd = syscall_result(
             &mut memory,
@@ -37159,7 +37395,10 @@ mod tests {
             0
         );
         let address_length = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-        assert_eq!(write_struct(&mut memory, RESULT_LENGTH, &address_length), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), RESULT_LENGTH, &address_length),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -37231,11 +37470,17 @@ mod tests {
         };
 
         let root = TestDir::new();
-        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
         if domain == libc::AF_INET {
-            assert_eq!(write_struct(&mut memory, BIND_ADDRESS, &loopback_v4), 0);
+            assert_eq!(
+                write_struct(&mut ProviderMemory(&memory), BIND_ADDRESS, &loopback_v4),
+                0
+            );
         } else {
-            assert_eq!(write_struct(&mut memory, BIND_ADDRESS, &loopback_v6), 0);
+            assert_eq!(
+                write_struct(&mut ProviderMemory(&memory), BIND_ADDRESS, &loopback_v6),
+                0
+            );
         }
         let mut executor = ElfExecutor::new(test_state(&root.0), false);
 
@@ -37268,7 +37513,11 @@ mod tests {
         // Learn the host-assigned ephemeral port and reuse getsockname's exact
         // (network byte order) port for the client's connect target.
         assert_eq!(
-            write_struct(&mut memory, NAME_LENGTH, &(sockaddr_len as libc::socklen_t)),
+            write_struct(
+                &mut ProviderMemory(&memory),
+                NAME_LENGTH,
+                &(sockaddr_len as libc::socklen_t)
+            ),
             0
         );
         assert_eq!(
@@ -37289,7 +37538,11 @@ mod tests {
                 ..loopback_v4
             };
             assert_eq!(
-                write_struct(&mut memory, CONNECT_ADDRESS, &connect_address),
+                write_struct(
+                    &mut ProviderMemory(&memory),
+                    CONNECT_ADDRESS,
+                    &connect_address
+                ),
                 0
             );
         } else {
@@ -37300,7 +37553,11 @@ mod tests {
                 ..loopback_v6
             };
             assert_eq!(
-                write_struct(&mut memory, CONNECT_ADDRESS, &connect_address),
+                write_struct(
+                    &mut ProviderMemory(&memory),
+                    CONNECT_ADDRESS,
+                    &connect_address
+                ),
                 0
             );
         }
@@ -37333,7 +37590,10 @@ mod tests {
         assert_eq!(accepted, 5);
 
         // Move one datagram to prove the accepted connection is live.
-        assert_eq!(write_struct(&mut memory, PAYLOAD, b"ping\0"), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), PAYLOAD, b"ping\0"),
+            0
+        );
         assert_eq!(
             executor.execute(
                 &SyscallRequest::new(
@@ -37442,8 +37702,11 @@ mod tests {
         };
 
         let root = TestDir::new();
-        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
-        assert_eq!(write_struct(&mut memory, BIND_ADDRESS, &loopback), 0);
+        let memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), BIND_ADDRESS, &loopback),
+            0
+        );
         let mut executor = ElfExecutor::new(test_state(&root.0), false);
 
         // Establish a live AF_INET loopback connection (depends on the connect
@@ -37475,7 +37738,11 @@ mod tests {
             0
         );
         assert_eq!(
-            write_struct(&mut memory, NAME_LENGTH, &(sockaddr_len as libc::socklen_t)),
+            write_struct(
+                &mut ProviderMemory(&memory),
+                NAME_LENGTH,
+                &(sockaddr_len as libc::socklen_t)
+            ),
             0
         );
         assert_eq!(
@@ -37495,7 +37762,11 @@ mod tests {
             ..loopback
         };
         assert_eq!(
-            write_struct(&mut memory, CONNECT_ADDRESS, &connect_address),
+            write_struct(
+                &mut ProviderMemory(&memory),
+                CONNECT_ADDRESS,
+                &connect_address
+            ),
             0
         );
         let client = executor.execute(
@@ -37526,7 +37797,11 @@ mod tests {
         // established client socket forwards to the host, then canonicalizes.
         let info_size = std::mem::size_of::<libc::tcp_info>();
         assert_eq!(
-            write_struct(&mut memory, INFO_LENGTH, &(info_size as libc::socklen_t)),
+            write_struct(
+                &mut ProviderMemory(&memory),
+                INFO_LENGTH,
+                &(info_size as libc::socklen_t)
+            ),
             0
         );
         assert_eq!(
@@ -37589,7 +37864,10 @@ mod tests {
         let mut address = unsafe { std::mem::zeroed::<libc::sockaddr_nl>() };
         address.nl_family = libc::AF_NETLINK as libc::sa_family_t;
         address.nl_pid = PORT_ID;
-        assert_eq!(write_struct(&mut memory, BIND_ADDRESS, &address), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), BIND_ADDRESS, &address),
+            0
+        );
 
         let socket_fd = syscall_result(
             &mut memory,
@@ -37623,7 +37901,10 @@ mod tests {
         );
 
         let result_length = std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
-        assert_eq!(write_struct(&mut memory, RESULT_LENGTH, &result_length), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), RESULT_LENGTH, &result_length),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -37655,7 +37936,10 @@ mod tests {
         );
         assert_eq!(socket_fd, 3);
 
-        assert_eq!(write_struct(&mut memory, RESULT_LENGTH, &0_u32), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), RESULT_LENGTH, &0_u32),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -37676,7 +37960,10 @@ mod tests {
 
         for capacity in 1_u32..=3 {
             memory.write(RESULT, &[0xa5; 8]).unwrap();
-            assert_eq!(write_struct(&mut memory, RESULT_LENGTH, &capacity), 0);
+            assert_eq!(
+                write_struct(&mut ProviderMemory(&memory), RESULT_LENGTH, &capacity),
+                0
+            );
             assert_eq!(
                 syscall_result(
                     &mut memory,
@@ -37708,7 +37995,10 @@ mod tests {
         }
 
         let full_length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-        assert_eq!(write_struct(&mut memory, RESULT_LENGTH, &full_length), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), RESULT_LENGTH, &full_length),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -37735,7 +38025,10 @@ mod tests {
         );
 
         memory.write(RESULT, &[0xa5; 8]).unwrap();
-        assert_eq!(write_struct(&mut memory, RESULT_LENGTH, &8_u32), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), RESULT_LENGTH, &8_u32),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -37759,7 +38052,10 @@ mod tests {
         assert_eq!(&observed[4..], &[0xa5; 4]);
 
         let invalid_length = u32::MAX;
-        assert_eq!(write_struct(&mut memory, RESULT_LENGTH, &invalid_length), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), RESULT_LENGTH, &invalid_length),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -37807,9 +38103,15 @@ mod tests {
             raw_fd: u64,
             option: libc::c_int,
         ) -> libc::c_int {
-            assert_eq!(write_struct(memory, VALUE, &0x5a5a_5a5a_i32), 0);
+            assert_eq!(
+                write_struct(&mut ProviderMemory(memory), VALUE, &0x5a5a_5a5a_i32),
+                0
+            );
             let length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-            assert_eq!(write_struct(memory, LENGTH, &length), 0);
+            assert_eq!(
+                write_struct(&mut ProviderMemory(memory), LENGTH, &length),
+                0
+            );
             assert_eq!(
                 syscall_result(
                     memory,
@@ -37843,7 +38145,7 @@ mod tests {
             value: libc::c_int,
             raw_length: u64,
         ) {
-            assert_eq!(write_struct(memory, VALUE, &value), 0);
+            assert_eq!(write_struct(&mut ProviderMemory(memory), VALUE, &value), 0);
             assert_eq!(
                 syscall_result(
                     memory,
@@ -38037,7 +38339,7 @@ mod tests {
             1
         );
 
-        assert_eq!(write_struct(&mut memory, VALUE, &4_u32), 0);
+        assert_eq!(write_struct(&mut ProviderMemory(&memory), VALUE, &4_u32), 0);
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -38063,8 +38365,14 @@ mod tests {
         for unsupported in [libc::SO_RCVBUF, libc::SO_SNDBUF] {
             let sentinel = 0x5a5a_5a5a_i32;
             let length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-            assert_eq!(write_struct(&mut memory, VALUE, &sentinel), 0);
-            assert_eq!(write_struct(&mut memory, LENGTH, &length), 0);
+            assert_eq!(
+                write_struct(&mut ProviderMemory(&memory), VALUE, &sentinel),
+                0
+            );
+            assert_eq!(
+                write_struct(&mut ProviderMemory(&memory), LENGTH, &length),
+                0
+            );
             assert_eq!(
                 syscall_result(
                     &mut memory,
@@ -38127,7 +38435,10 @@ mod tests {
         );
 
         let full_length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-        assert_eq!(write_struct(&mut memory, LENGTH, &full_length), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), LENGTH, &full_length),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -38220,8 +38531,11 @@ mod tests {
         ) {
             for number in CALLS {
                 memory.write(VALUE, &[0xa5; 128]).unwrap();
-                assert_eq!(write_struct(memory, VALUE, &1_i32), 0);
-                assert_eq!(write_struct(memory, LENGTH, &128_u32), 0);
+                assert_eq!(write_struct(&mut ProviderMemory(memory), VALUE, &1_i32), 0);
+                assert_eq!(
+                    write_struct(&mut ProviderMemory(memory), LENGTH, &128_u32),
+                    0
+                );
                 let args = arguments(number, fd, VALUE, LENGTH);
                 let result = if let Some(output) = output.as_deref_mut() {
                     syscall_result_with_output(memory, state, output, number, args)
@@ -38263,7 +38577,7 @@ mod tests {
             // The same labelled descriptor is a real socket without capture.
             // This prevents an ambient pipe from making the refusal pass.
             assert_real_socket(&mut memory, &mut state, None, HIGH_WORD | fd as u64);
-            assert_eq!(write_struct(&mut memory, VALUE, &0_i32), 0);
+            assert_eq!(write_struct(&mut ProviderMemory(&memory), VALUE, &0_i32), 0);
             assert_eq!(
                 syscall_result(
                     &mut memory,
@@ -38300,8 +38614,11 @@ mod tests {
                         (VALUE, u64::MAX),
                     ] {
                         memory.write(VALUE, &[0xa5; 0x200]).unwrap();
-                        assert_eq!(write_struct(&mut memory, VALUE, &1_i32), 0);
-                        assert_eq!(write_struct(&mut memory, LENGTH, &128_u32), 0);
+                        assert_eq!(write_struct(&mut ProviderMemory(&memory), VALUE, &1_i32), 0);
+                        assert_eq!(
+                            write_struct(&mut ProviderMemory(&memory), LENGTH, &128_u32),
+                            0
+                        );
                         let mut before = [0; 0x200];
                         memory.read(VALUE, &mut before).unwrap();
                         assert_eq!(
@@ -38405,7 +38722,10 @@ mod tests {
         let unnamed_length = std::mem::size_of::<libc::sa_family_t>() as libc::socklen_t;
 
         for number in [libc::SYS_getsockname, libc::SYS_getpeername] {
-            assert_eq!(write_struct(&mut memory, LENGTH, &0_u32), 0);
+            assert_eq!(
+                write_struct(&mut ProviderMemory(&memory), LENGTH, &0_u32),
+                0
+            );
             assert_eq!(
                 syscall_result(
                     &mut memory,
@@ -38421,7 +38741,10 @@ mod tests {
             );
 
             memory.write(ADDRESS, &[0xa5; 8]).unwrap();
-            assert_eq!(write_struct(&mut memory, LENGTH, &1_u32), 0);
+            assert_eq!(
+                write_struct(&mut ProviderMemory(&memory), LENGTH, &1_u32),
+                0
+            );
             assert_eq!(
                 syscall_result(
                     &mut memory,
@@ -38440,7 +38763,10 @@ mod tests {
                 unnamed_length
             );
 
-            assert_eq!(write_struct(&mut memory, OVERLAP, &4_u32), 0);
+            assert_eq!(
+                write_struct(&mut ProviderMemory(&memory), OVERLAP, &4_u32),
+                0
+            );
             assert_eq!(
                 syscall_result(
                     &mut memory,
@@ -38456,7 +38782,10 @@ mod tests {
                 "address copy must follow the overlapping length copy"
             );
 
-            assert_eq!(write_struct(&mut memory, LENGTH, &(i32::MAX as u32)), 0);
+            assert_eq!(
+                write_struct(&mut ProviderMemory(&memory), LENGTH, &(i32::MAX as u32)),
+                0
+            );
             assert_eq!(
                 syscall_result(
                     &mut memory,
@@ -38472,7 +38801,10 @@ mod tests {
             );
 
             for invalid_length in [0x8000_0000_u32, u32::MAX] {
-                assert_eq!(write_struct(&mut memory, LENGTH, &invalid_length), 0);
+                assert_eq!(
+                    write_struct(&mut ProviderMemory(&memory), LENGTH, &invalid_length),
+                    0
+                );
                 assert_eq!(
                     syscall_result(
                         &mut memory,
@@ -38486,7 +38818,10 @@ mod tests {
             }
         }
 
-        assert_eq!(write_struct(&mut memory, LENGTH, &4_u32), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), LENGTH, &4_u32),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -38544,7 +38879,10 @@ mod tests {
             negative_errno(libc::ENOTCONN)
         );
 
-        assert_eq!(write_struct(&mut memory, LENGTH, &unnamed_length), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), LENGTH, &unnamed_length),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -38571,7 +38909,10 @@ mod tests {
             unsafe { std::fs::File::from_raw_fd(std::os::fd::IntoRawFd::into_raw_fd(client)) };
         let client = insert_file_with_flags(&mut state, client, false, None) as i32;
         let inet_length = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-        assert_eq!(write_struct(&mut memory, LENGTH, &inet_length), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), LENGTH, &inet_length),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -38581,7 +38922,10 @@ mod tests {
             ),
             0
         );
-        assert_eq!(write_struct(&mut memory, LENGTH, &inet_length), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), LENGTH, &inet_length),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -38936,9 +39280,15 @@ mod tests {
 
         // Pre-load a non-zero sentinel to prove the handler overwrites whatever
         // host CPU id the kernel reports with a canonical virtual CPU 0.
-        assert_eq!(write_struct(&mut memory, RESULT, &0x5a5a_5a5a_i32), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), RESULT, &0x5a5a_5a5a_i32),
+            0
+        );
         let full_length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-        assert_eq!(write_struct(&mut memory, RESULT_LENGTH, &full_length), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), RESULT_LENGTH, &full_length),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -39013,7 +39363,10 @@ mod tests {
             sin_zero: [0; 8],
         };
         let address_length = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-        assert_eq!(write_struct(&mut memory, BIND_ADDRESS, &loopback), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), BIND_ADDRESS, &loopback),
+            0
+        );
 
         // Receiver socket, bound to an ephemeral loopback port.
         let receiver = syscall_result(
@@ -39041,7 +39394,10 @@ mod tests {
         );
 
         // Recover the kernel-assigned port so the sender can target it.
-        assert_eq!(write_struct(&mut memory, NAME_LENGTH, &address_length), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), NAME_LENGTH, &address_length),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -39063,7 +39419,10 @@ mod tests {
             },
             sin_zero: [0; 8],
         };
-        assert_eq!(write_struct(&mut memory, DEST_ADDRESS, &destination), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), DEST_ADDRESS, &destination),
+            0
+        );
 
         // Sender socket delivers a datagram to the receiver over loopback.
         let sender = syscall_result(
@@ -39106,8 +39465,14 @@ mod tests {
         // The datagram was processed on some host CPU, yet the option must read
         // back a canonical virtual CPU 0, matching detcore's handle_getsockopt.
         let cpu_length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-        assert_eq!(write_struct(&mut memory, OPT_RESULT, &0x5a5a_5a5a_i32), 0);
-        assert_eq!(write_struct(&mut memory, OPT_LENGTH, &cpu_length), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), OPT_RESULT, &0x5a5a_5a5a_i32),
+            0
+        );
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), OPT_LENGTH, &cpu_length),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -39138,7 +39503,10 @@ mod tests {
 
         fn cookie(memory: &mut GuestMemory, state: &mut LoadedStaticElf, fd: libc::c_int) -> u64 {
             let full_length = std::mem::size_of::<u64>() as libc::socklen_t;
-            assert_eq!(write_struct(memory, RESULT_LENGTH, &full_length), 0);
+            assert_eq!(
+                write_struct(&mut ProviderMemory(memory), RESULT_LENGTH, &full_length),
+                0
+            );
             assert_eq!(
                 syscall_result(
                     memory,
@@ -39199,7 +39567,10 @@ mod tests {
 
         fn cookie(memory: &mut GuestMemory, state: &mut LoadedStaticElf, fd: libc::c_int) -> u64 {
             let full_length = std::mem::size_of::<u64>() as libc::socklen_t;
-            assert_eq!(write_struct(memory, RESULT_LENGTH, &full_length), 0);
+            assert_eq!(
+                write_struct(&mut ProviderMemory(memory), RESULT_LENGTH, &full_length),
+                0
+            );
             assert_eq!(
                 syscall_result(
                     memory,
@@ -39370,7 +39741,7 @@ mod tests {
         memory.write(READ_SET, &read_bit.to_ne_bytes()).unwrap();
         assert_eq!(
             write_struct(
-                &mut memory,
+                &mut ProviderMemory(&memory),
                 TIMEOUT,
                 &libc::timeval {
                     tv_sec: 5,
@@ -39496,7 +39867,10 @@ mod tests {
                         iov_base: PAYLOAD as usize as *mut _,
                         iov_len: 6,
                     };
-                    assert_eq!(write_struct(&mut memory, SEND_IOV, &send_iov), 0);
+                    assert_eq!(
+                        write_struct(&mut ProviderMemory(&memory), SEND_IOV, &send_iov),
+                        0
+                    );
                     let control = rights_control(&pipes);
                     memory.write(SEND_CONTROL, &control).unwrap();
                     let mut send: libc::msghdr = unsafe { std::mem::zeroed() };
@@ -39506,7 +39880,7 @@ mod tests {
                         send.msg_control = SEND_CONTROL as usize as *mut _;
                         send.msg_controllen = control.len();
                     }
-                    assert_eq!(write_struct(&mut memory, SEND, &send), 0);
+                    assert_eq!(write_struct(&mut ProviderMemory(&memory), SEND, &send), 0);
                     assert_eq!(
                         syscall_result(
                             &mut memory,
@@ -39534,7 +39908,10 @@ mod tests {
                             iov_base: (OUTPUT + index * 0x80) as usize as *mut _,
                             iov_len: if index == 0 && short_payload { 3 } else { 8 },
                         };
-                        assert_eq!(write_struct(&mut memory, iov_address, &iov), 0);
+                        assert_eq!(
+                            write_struct(&mut ProviderMemory(&memory), iov_address, &iov),
+                            0
+                        );
                         let mut message: libc::mmsghdr = unsafe { std::mem::zeroed() };
                         message.msg_hdr.msg_iov = iov_address as usize as *mut _;
                         message.msg_hdr.msg_iovlen = 1;
@@ -39551,7 +39928,10 @@ mod tests {
                         }
                         let address =
                             MESSAGES + index * std::mem::size_of::<libc::mmsghdr>() as u64;
-                        assert_eq!(write_struct(&mut memory, address, &message), 0);
+                        assert_eq!(
+                            write_struct(&mut ProviderMemory(&memory), address, &message),
+                            0
+                        );
                         if index == 2 {
                             third_before = vec![0; std::mem::size_of::<libc::mmsghdr>()];
                             memory.read(address, &mut third_before).unwrap();
@@ -39597,7 +39977,7 @@ mod tests {
                         assert_eq!(second.msg_hdr.msg_flags, cloexec, "{case:?}");
                         assert_eq!(second.msg_hdr.msg_controllen, 0);
                         assert_eq!(
-                            read_guest_bytes::<6>(&memory, OUTPUT + 0x80).unwrap(),
+                            read_guest_bytes::<6>(&ProviderMemory(&memory), OUTPUT + 0x80).unwrap(),
                             *b"abcdef"
                         );
                         let mut third_after = vec![0; third_before.len()];
@@ -39665,7 +40045,10 @@ mod tests {
                             ),
                             1
                         );
-                        assert_eq!(read_guest_bytes::<1>(&memory, OUTPUT).unwrap(), *b"a");
+                        assert_eq!(
+                            read_guest_bytes::<1>(&ProviderMemory(&memory), OUTPUT).unwrap(),
+                            *b"a"
+                        );
                     }
                     for fd in received {
                         assert_eq!(
@@ -39798,7 +40181,10 @@ mod tests {
                 iov_base: buffer_address as usize as *mut libc::c_void,
                 iov_len: 32,
             };
-            assert_eq!(write_struct(&mut memory, iov_address, &iov), 0);
+            assert_eq!(
+                write_struct(&mut ProviderMemory(&memory), iov_address, &iov),
+                0
+            );
             let mut message = unsafe { std::mem::zeroed::<libc::mmsghdr>() };
             message.msg_hdr.msg_iov = iov_address as usize as *mut libc::iovec;
             message.msg_hdr.msg_iovlen = 1;
@@ -39808,7 +40194,7 @@ mod tests {
             }
             assert_eq!(
                 write_struct(
-                    &mut memory,
+                    &mut ProviderMemory(&memory),
                     MESSAGES + (index * std::mem::size_of::<libc::mmsghdr>()) as u64,
                     &message,
                 ),
@@ -39842,11 +40228,11 @@ mod tests {
         assert_eq!(first.msg_hdr.msg_flags, 0);
         assert_eq!(second.msg_hdr.msg_flags, 0);
         assert_eq!(
-            read_guest_bytes::<5>(&memory, FIRST_BUFFER).unwrap(),
+            read_guest_bytes::<5>(&ProviderMemory(&memory), FIRST_BUFFER).unwrap(),
             *b"hello"
         );
         assert_eq!(
-            read_guest_bytes::<6>(&memory, SECOND_BUFFER).unwrap(),
+            read_guest_bytes::<6>(&ProviderMemory(&memory), SECOND_BUFFER).unwrap(),
             *b"world!"
         );
         let mut control = vec![0; first.msg_hdr.msg_controllen];
@@ -39864,7 +40250,10 @@ mod tests {
             ),
             1
         );
-        assert_eq!(read_guest_bytes::<1>(&memory, PIPE_RESULT).unwrap(), *b"x");
+        assert_eq!(
+            read_guest_bytes::<1>(&ProviderMemory(&memory), PIPE_RESULT).unwrap(),
+            *b"x"
+        );
     }
 
     #[test]
@@ -39935,7 +40324,7 @@ mod tests {
         for (index, iov) in send_iovs.iter().enumerate() {
             assert_eq!(
                 write_struct(
-                    &mut memory,
+                    &mut ProviderMemory(&memory),
                     SEND_IOV + (index * std::mem::size_of::<libc::iovec>()) as u64,
                     iov,
                 ),
@@ -39949,7 +40338,10 @@ mod tests {
         memory.write(SEND_CONTROL, &send_control).unwrap();
         send_msg.msg_control = SEND_CONTROL as usize as *mut libc::c_void;
         send_msg.msg_controllen = send_control.len();
-        assert_eq!(write_struct(&mut memory, SEND_MSG, &send_msg), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), SEND_MSG, &send_msg),
+            0
+        );
 
         assert_eq!(
             syscall_result(
@@ -39976,7 +40368,7 @@ mod tests {
         for (index, iov) in recv_iovs.iter().enumerate() {
             assert_eq!(
                 write_struct(
-                    &mut memory,
+                    &mut ProviderMemory(&memory),
                     RECV_IOV + (index * std::mem::size_of::<libc::iovec>()) as u64,
                     iov,
                 ),
@@ -39989,7 +40381,10 @@ mod tests {
         recv_msg.msg_iovlen = 2;
         recv_msg.msg_control = RECV_CONTROL as usize as *mut libc::c_void;
         recv_msg.msg_controllen = 64;
-        assert_eq!(write_struct(&mut memory, RECV_MSG, &recv_msg), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), RECV_MSG, &recv_msg),
+            0
+        );
 
         assert_eq!(
             syscall_result(
@@ -40011,11 +40406,11 @@ mod tests {
         // The payload reassembles across the two independent recv segments,
         // proving the iovec scatter/gather translation is faithful.
         assert_eq!(
-            read_guest_bytes::<6>(&memory, RECV_SEG0).unwrap(),
+            read_guest_bytes::<6>(&ProviderMemory(&memory), RECV_SEG0).unwrap(),
             *b"hello "
         );
         assert_eq!(
-            read_guest_bytes::<6>(&memory, RECV_SEG1).unwrap(),
+            read_guest_bytes::<6>(&ProviderMemory(&memory), RECV_SEG1).unwrap(),
             *b"world!"
         );
 
@@ -40050,7 +40445,10 @@ mod tests {
             ),
             1
         );
-        assert_eq!(read_guest_bytes::<1>(&memory, PIPE_RESULT).unwrap(), *b"a");
+        assert_eq!(
+            read_guest_bytes::<1>(&ProviderMemory(&memory), PIPE_RESULT).unwrap(),
+            *b"a"
+        );
         memory.write(PIPE_PAYLOAD, b"b").unwrap();
         assert_eq!(
             syscall_result(
@@ -40070,7 +40468,10 @@ mod tests {
             ),
             1
         );
-        assert_eq!(read_guest_bytes::<1>(&memory, PIPE_RESULT).unwrap(), *b"b");
+        assert_eq!(
+            read_guest_bytes::<1>(&ProviderMemory(&memory), PIPE_RESULT).unwrap(),
+            *b"b"
+        );
 
         let forked = state.try_clone_for_fork(2).unwrap();
         assert!(received_fds.iter().all(|fd| forked.files.contains_key(fd)));
@@ -40121,7 +40522,10 @@ mod tests {
             iov_base: PAYLOAD as usize as *mut libc::c_void,
             iov_len: 1,
         };
-        assert_eq!(write_struct(&mut memory, SEND_IOV, &send_iov), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), SEND_IOV, &send_iov),
+            0
+        );
         let mut send_message = unsafe { std::mem::zeroed::<libc::msghdr>() };
         send_message.msg_iov = SEND_IOV as usize as *mut libc::iovec;
         send_message.msg_iovlen = 1;
@@ -40130,7 +40534,10 @@ mod tests {
         let invalid_right = rights_control(&[99]);
         memory.write(SEND_CONTROL, &invalid_right).unwrap();
         send_message.msg_controllen = invalid_right.len();
-        assert_eq!(write_struct(&mut memory, SEND_MSG, &send_message), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), SEND_MSG, &send_message),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -40144,7 +40551,10 @@ mod tests {
         let malformed_right = control_message(libc::SOL_SOCKET, libc::SCM_RIGHTS, &[0]);
         memory.write(SEND_CONTROL, &malformed_right).unwrap();
         send_message.msg_controllen = malformed_right.len();
-        assert_eq!(write_struct(&mut memory, SEND_MSG, &send_message), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), SEND_MSG, &send_message),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -40162,7 +40572,10 @@ mod tests {
         );
         memory.write(SEND_CONTROL, &credentials).unwrap();
         send_message.msg_controllen = credentials.len();
-        assert_eq!(write_struct(&mut memory, SEND_MSG, &send_message), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), SEND_MSG, &send_message),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -40199,7 +40612,10 @@ mod tests {
             let control = rights_control(&[donated as libc::c_int]);
             memory.write(SEND_CONTROL, &control).unwrap();
             send_message.msg_controllen = control.len();
-            assert_eq!(write_struct(&mut memory, SEND_MSG, &send_message), 0);
+            assert_eq!(
+                write_struct(&mut ProviderMemory(&memory), SEND_MSG, &send_message),
+                0
+            );
             let files_before = state.files.keys().copied().collect::<Vec<_>>();
             let masks_before = state.process_signals.lock().unwrap().signalfd_masks.clone();
             assert_eq!(
@@ -40221,7 +40637,9 @@ mod tests {
                 masks_before,
             );
             assert_eq!(
-                control_rights(&read_guest_bytes::<24>(&memory, SEND_CONTROL).unwrap()),
+                control_rights(
+                    &read_guest_bytes::<24>(&ProviderMemory(&memory), SEND_CONTROL).unwrap()
+                ),
                 [donated as libc::c_int],
                 "the guest control buffer is not rewritten",
             );
@@ -40233,11 +40651,17 @@ mod tests {
             iov_base: RECV_BUFFER as usize as *mut libc::c_void,
             iov_len: 1,
         };
-        assert_eq!(write_struct(&mut memory, RECV_IOV, &recv_iov), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), RECV_IOV, &recv_iov),
+            0
+        );
         let mut recv_message = unsafe { std::mem::zeroed::<libc::msghdr>() };
         recv_message.msg_iov = RECV_IOV as usize as *mut libc::iovec;
         recv_message.msg_iovlen = 1;
-        assert_eq!(write_struct(&mut memory, RECV_MSG, &recv_message), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), RECV_MSG, &recv_message),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -40370,7 +40794,7 @@ mod tests {
             0
         );
         let socket_fds: [libc::c_int; 2] = read_struct(&memory, PAIR_FDS);
-        assert_eq!(write_struct(&mut memory, ONE, &1_i32), 0);
+        assert_eq!(write_struct(&mut ProviderMemory(&memory), ONE, &1_i32), 0);
         for option in [libc::SO_PASSCRED, libc::SO_TIMESTAMPNS] {
             assert_eq!(
                 syscall_result(
@@ -40404,14 +40828,20 @@ mod tests {
             iov_base: RECV_BUFFER as usize as *mut libc::c_void,
             iov_len: 1,
         };
-        assert_eq!(write_struct(&mut memory, RECV_IOV, &recv_iov), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), RECV_IOV, &recv_iov),
+            0
+        );
         memory.write(RECV_CONTROL, &[0xa5; 256]).unwrap();
         let mut recv_message = unsafe { std::mem::zeroed::<libc::msghdr>() };
         recv_message.msg_iov = RECV_IOV as usize as *mut libc::iovec;
         recv_message.msg_iovlen = 1;
         recv_message.msg_control = RECV_CONTROL as usize as *mut libc::c_void;
         recv_message.msg_controllen = 256;
-        assert_eq!(write_struct(&mut memory, RECV_MSG, &recv_message), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), RECV_MSG, &recv_message),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -40495,7 +40925,10 @@ mod tests {
             iov_base: PAYLOAD as usize as *mut libc::c_void,
             iov_len: 1,
         };
-        assert_eq!(write_struct(&mut memory, SEND_IOV, &send_iov), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), SEND_IOV, &send_iov),
+            0
+        );
         let send_control = rights_control(&pipe_fds);
         memory.write(SEND_CONTROL, &send_control).unwrap();
         let mut send_message = unsafe { std::mem::zeroed::<libc::msghdr>() };
@@ -40503,7 +40936,10 @@ mod tests {
         send_message.msg_iovlen = 1;
         send_message.msg_control = SEND_CONTROL as usize as *mut libc::c_void;
         send_message.msg_controllen = send_control.len();
-        assert_eq!(write_struct(&mut memory, SEND_MSG, &send_message), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), SEND_MSG, &send_message),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -40518,7 +40954,10 @@ mod tests {
             iov_base: RECV_BUFFER as usize as *mut libc::c_void,
             iov_len: 1,
         };
-        assert_eq!(write_struct(&mut memory, RECV_IOV, &recv_iov), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), RECV_IOV, &recv_iov),
+            0
+        );
         let mut recv_message = unsafe { std::mem::zeroed::<libc::msghdr>() };
         recv_message.msg_iov = RECV_IOV as usize as *mut libc::iovec;
         recv_message.msg_iovlen = 1;
@@ -40526,7 +40965,10 @@ mod tests {
         // Header plus one fd, deliberately omitting trailing alignment space.
         recv_message.msg_controllen = cmsg_align(std::mem::size_of::<libc::cmsghdr>()).unwrap()
             + std::mem::size_of::<libc::c_int>();
-        assert_eq!(write_struct(&mut memory, RECV_MSG, &recv_message), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), RECV_MSG, &recv_message),
+            0
+        );
         let files_before = state.files.len();
         assert_eq!(
             syscall_result(
@@ -40586,7 +41028,10 @@ mod tests {
             events: libc::EPOLLIN as u32,
             u64: event_fd as u64,
         };
-        assert_eq!(write_struct(&mut memory, EVENTS, &event), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), EVENTS, &event),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -40621,7 +41066,10 @@ mod tests {
             events: (libc::EPOLLIN | libc::EPOLLONESHOT) as u32,
             u64: 99,
         };
-        assert_eq!(write_struct(&mut memory, EVENTS, &modified), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), EVENTS, &modified),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -41407,7 +41855,10 @@ mod tests {
             ),
             1
         );
-        assert_eq!(read_guest_bytes::<1>(&memory, BUFFER).unwrap(), *b"a");
+        assert_eq!(
+            read_guest_bytes::<1>(&ProviderMemory(&memory), BUFFER).unwrap(),
+            *b"a"
+        );
 
         write_c_string(&mut memory, PATH, "/proc/thread-self/fd/3");
         let reopened = syscall_result(
@@ -41436,7 +41887,7 @@ mod tests {
             1
         );
         assert_eq!(
-            read_guest_bytes::<1>(&memory, BUFFER).unwrap(),
+            read_guest_bytes::<1>(&ProviderMemory(&memory), BUFFER).unwrap(),
             *b"a",
             "the reopened file description starts at an independent offset"
         );
@@ -41449,7 +41900,10 @@ mod tests {
             ),
             1
         );
-        assert_eq!(read_guest_bytes::<1>(&memory, BUFFER).unwrap(), *b"b");
+        assert_eq!(
+            read_guest_bytes::<1>(&ProviderMemory(&memory), BUFFER).unwrap(),
+            *b"b"
+        );
 
         write_c_string(&mut memory, PATH, "/proc/self/fd/3");
         assert_eq!(
@@ -41738,7 +42192,7 @@ mod tests {
         assert!(ep >= 3 && event > ep);
         assert_eq!(
             write_struct(
-                &mut f.memory,
+                &mut ProviderMemory(&f.memory),
                 0x200,
                 &libc::epoll_event {
                     events: libc::EPOLLIN as u32,
@@ -42050,7 +42504,7 @@ mod tests {
         // is not permitted to consume the seeded pending events in this test.
         assert_eq!(
             epoll_pwait2(
-                &f.memory,
+                &ProviderMemory(&f.memory),
                 &f.executor.state,
                 &[ep as u64, 0x300, 2, 0x100, 0, 0]
             ),
@@ -42066,7 +42520,7 @@ mod tests {
         ] {
             assert_eq!(
                 epoll_pwait2(
-                    &f.memory,
+                    &ProviderMemory(&f.memory),
                     &f.executor.state,
                     &[ep as u64, 0x300, 2, timeout, mask, size]
                 ),
@@ -42076,14 +42530,14 @@ mod tests {
         f.memory.write(0x100, &1_i64.to_ne_bytes()).unwrap();
         assert_eq!(
             epoll_pwait2(
-                &f.memory,
+                &ProviderMemory(&f.memory),
                 &f.executor.state,
                 &[ep as u64, 0x300, 2, 0x100, 0, 0]
             ),
             negative_errno(libc::ENOSYS)
         );
         assert_eq!(
-            read_guest_bytes::<24>(&f.memory, 0x300).unwrap(),
+            read_guest_bytes::<24>(&ProviderMemory(&f.memory), 0x300).unwrap(),
             [0xa5; 24]
         );
         assert_eq!(*f.executor.state.process_signals.lock().unwrap(), process);
@@ -42125,7 +42579,7 @@ mod tests {
             f.memory.write(0x600, b"x").unwrap();
             assert_eq!(
                 write_struct(
-                    &mut f.memory,
+                    &mut ProviderMemory(&f.memory),
                     0x700,
                     &libc::iovec {
                         iov_base: 0x600_usize as *mut libc::c_void,
@@ -42139,7 +42593,10 @@ mod tests {
             message.msg_iovlen = 1;
             message.msg_control = 0x500_usize as *mut libc::c_void;
             message.msg_controllen = control.len();
-            assert_eq!(write_struct(&mut f.memory, 0x800, &message), 0);
+            assert_eq!(
+                write_struct(&mut ProviderMemory(&f.memory), 0x800, &message),
+                0
+            );
             assert_eq!(
                 f.call(
                     libc::SYS_sendmsg,
@@ -42154,12 +42611,14 @@ mod tests {
                     negative_errno(libc::ENOSYS)
                 );
                 assert_eq!(
-                    read_guest_bytes::<24>(&f.memory, 0x300).unwrap(),
+                    read_guest_bytes::<24>(&ProviderMemory(&f.memory), 0x300).unwrap(),
                     [0xa5; 24]
                 );
             }
             assert_eq!(
-                read_guest_bytes::<24>(&f.memory, 0x500).unwrap().as_slice(),
+                read_guest_bytes::<24>(&ProviderMemory(&f.memory), 0x500)
+                    .unwrap()
+                    .as_slice(),
                 control.as_slice()
             );
             if export_event {
@@ -42212,7 +42671,7 @@ mod tests {
         );
         assert_eq!(
             epoll_pwait2(
-                &f.memory,
+                &ProviderMemory(&f.memory),
                 &f.executor.state,
                 &[other as u64, 0x300, 1, 0x100, 0, 0]
             ),
@@ -42236,7 +42695,7 @@ mod tests {
         );
         assert_eq!(
             epoll_pwait2(
-                &f.memory,
+                &ProviderMemory(&f.memory),
                 &f.executor.state,
                 &[nested as u64, 0x300, 1, 0x100, 0, 0]
             ),
@@ -42652,7 +43111,7 @@ mod tests {
         memory.write(0x100, &[0; 16]).unwrap();
         assert_eq!(
             write_struct(
-                &mut memory,
+                &mut ProviderMemory(&memory),
                 0x200,
                 &libc::epoll_event {
                     events: libc::EPOLLIN as u32,
@@ -42816,7 +43275,7 @@ mod tests {
             .is_err()
         );
         assert_eq!(
-            read_guest_bytes::<24>(&f.memory, 0x300).unwrap(),
+            read_guest_bytes::<24>(&ProviderMemory(&f.memory), 0x300).unwrap(),
             [0xa5; 24]
         );
     }
@@ -43514,7 +43973,10 @@ mod tests {
                 events: libc::EPOLLIN as u32,
                 u64: 71,
             };
-            assert_eq!(write_struct(&mut f.memory, PAGE_SIZE, &event), 0);
+            assert_eq!(
+                write_struct(&mut ProviderMemory(&f.memory), PAGE_SIZE, &event),
+                0
+            );
             assert_eq!(
                 f.call(
                     libc::SYS_epoll_ctl,
@@ -43536,7 +43998,10 @@ mod tests {
                 events: (libc::EPOLLIN | libc::EPOLLONESHOT) as u32,
                 u64: 72,
             };
-            assert_eq!(write_struct(&mut f.memory, PAGE_SIZE, &modified), 0);
+            assert_eq!(
+                write_struct(&mut ProviderMemory(&f.memory), PAGE_SIZE, &modified),
+                0
+            );
             // execute() installs the shared table before epoll_ctl reaches the
             // host. This is the decisive ADD -> synchronization -> MOD oracle.
             assert_eq!(
@@ -43599,7 +44064,10 @@ mod tests {
                 ),
                 0
             );
-            assert_eq!(write_struct(&mut f.memory, PAGE_SIZE, &modified), 0);
+            assert_eq!(
+                write_struct(&mut ProviderMemory(&f.memory), PAGE_SIZE, &modified),
+                0
+            );
             assert_eq!(
                 f.call(
                     libc::SYS_epoll_ctl,
@@ -44086,7 +44554,10 @@ mod tests {
                 *destination = *source as libc::c_char;
             }
             let length = std::mem::offset_of!(libc::sockaddr_un, sun_path) + path.len() + 1;
-            assert_eq!(write_struct(&mut f.memory, 0x100, &address), 0);
+            assert_eq!(
+                write_struct(&mut ProviderMemory(&f.memory), 0x100, &address),
+                0
+            );
             let server = f.call(
                 libc::SYS_socket,
                 [libc::AF_UNIX as u64, libc::SOCK_STREAM as u64, 0, 0, 0, 0],
@@ -44266,7 +44737,8 @@ mod tests {
             f.call(libc::SYS_fstat, [target as u64, PAGE_SIZE, 0, 0, 0, 0]),
             0
         );
-        let original_stat = read_guest_struct::<libc::stat>(&f.memory, PAGE_SIZE).unwrap();
+        let original_stat =
+            read_guest_struct::<libc::stat>(&ProviderMemory(&f.memory), PAGE_SIZE).unwrap();
         let alias = f.call(libc::SYS_dup, [target as u64, 0, 0, 0, 0, 0]);
         assert!(alias > target, "retained dup: {alias}");
         // Confirm that the alias initially shares the original description.
@@ -44333,12 +44805,14 @@ mod tests {
             f.call(libc::SYS_fstat, [target as u64, PAGE_SIZE, 0, 0, 0, 0]),
             0
         );
-        let target_stat = read_guest_struct::<libc::stat>(&f.memory, PAGE_SIZE).unwrap();
+        let target_stat =
+            read_guest_struct::<libc::stat>(&ProviderMemory(&f.memory), PAGE_SIZE).unwrap();
         assert_eq!(
             f.call(libc::SYS_fstat, [alias as u64, PAGE_SIZE, 0, 0, 0, 0]),
             0
         );
-        let alias_stat = read_guest_struct::<libc::stat>(&f.memory, PAGE_SIZE).unwrap();
+        let alias_stat =
+            read_guest_struct::<libc::stat>(&ProviderMemory(&f.memory), PAGE_SIZE).unwrap();
         let target_flags = f.call(
             libc::SYS_fcntl,
             [target as u64, libc::F_GETFL as u64, 0, 0, 0, 0],
@@ -44448,7 +44922,10 @@ mod tests {
             events: libc::EPOLLIN as u32,
             u64: 71,
         };
-        assert_eq!(write_struct(&mut f.memory, PAGE_SIZE, &registration), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&f.memory), PAGE_SIZE, &registration),
+            0
+        );
         assert_eq!(
             f.call(
                 libc::SYS_epoll_ctl,
@@ -45453,13 +45930,15 @@ mod tests {
             f.memory.read(PAGE_SIZE, &mut bytes).unwrap();
             assert_eq!(bytes, format!("/proc/1/fdinfo/{target}").as_bytes());
             assert_eq!(f.call(libc::SYS_lstat, [0x100, PAGE_SIZE, 0, 0, 0, 0]), 0);
-            let link = read_guest_struct::<libc::stat>(&f.memory, PAGE_SIZE).unwrap();
+            let link =
+                read_guest_struct::<libc::stat>(&ProviderMemory(&f.memory), PAGE_SIZE).unwrap();
             assert_eq!(link.st_mode & libc::S_IFMT, libc::S_IFLNK);
             assert_eq!(
                 f.call(libc::SYS_fstat, [fd as u64, PAGE_SIZE, 0, 0, 0, 0]),
                 0
             );
-            let stat = read_guest_struct::<libc::stat>(&f.memory, PAGE_SIZE).unwrap();
+            let stat =
+                read_guest_struct::<libc::stat>(&ProviderMemory(&f.memory), PAGE_SIZE).unwrap();
             assert_eq!(stat.st_size, 0);
             assert_eq!(stat.st_mode & libc::S_IFMT, libc::S_IFREG);
             assert_eq!(
@@ -45502,7 +45981,10 @@ mod tests {
             iov_base: PAGE_SIZE as *mut libc::c_void,
             iov_len: 64,
         };
-        assert_eq!(write_struct(&mut f.memory, 0x200, &vector), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&f.memory), 0x200, &vector),
+            0
+        );
         assert_eq!(
             f.call(libc::SYS_readv, [info as u64, 0x200, 1, 0, 0, 0]),
             negative_errno(libc::ENOSYS)
@@ -45512,7 +45994,7 @@ mod tests {
             .write(0x100, CString::new(path).unwrap().as_bytes_with_nul())
             .unwrap();
         assert_eq!(f.call(libc::SYS_stat, [0x100, PAGE_SIZE, 0, 0, 0, 0]), 0);
-        let stat = read_guest_struct::<libc::stat>(&f.memory, PAGE_SIZE).unwrap();
+        let stat = read_guest_struct::<libc::stat>(&ProviderMemory(&f.memory), PAGE_SIZE).unwrap();
         assert_eq!(stat.st_size, 0);
         assert_eq!(
             stat.st_ino,
@@ -46402,7 +46884,10 @@ mod tests {
                 negative_errno(libc::EFAULT)
             );
             assert_eq!(read_struct::<u32>(&memory, REAL), 0);
-            assert_eq!(read_guest_bytes::<4>(&memory, SAVED).unwrap(), [0xa5; 4]);
+            assert_eq!(
+                read_guest_bytes::<4>(&ProviderMemory(&memory), SAVED).unwrap(),
+                [0xa5; 4]
+            );
 
             memory.write(EFFECTIVE, &[0xa5; 4]).unwrap();
             memory.write(SAVED, &[0xa5; 4]).unwrap();
@@ -46416,10 +46901,13 @@ mod tests {
                 negative_errno(libc::EFAULT)
             );
             assert_eq!(
-                read_guest_bytes::<4>(&memory, EFFECTIVE).unwrap(),
+                read_guest_bytes::<4>(&ProviderMemory(&memory), EFFECTIVE).unwrap(),
                 [0xa5; 4]
             );
-            assert_eq!(read_guest_bytes::<4>(&memory, SAVED).unwrap(), [0xa5; 4]);
+            assert_eq!(
+                read_guest_bytes::<4>(&ProviderMemory(&memory), SAVED).unwrap(),
+                [0xa5; 4]
+            );
         }
     }
 
@@ -46448,7 +46936,7 @@ mod tests {
         write_c_string(&mut memory, EMPTY_ADDRESS, "");
         assert_eq!(
             write_struct(
-                &mut memory,
+                &mut ProviderMemory(&memory),
                 TIMES_ADDRESS,
                 &[
                     libc::timespec {
@@ -46975,7 +47463,10 @@ mod tests {
             iov_base: SEND_SEGMENT as usize as *mut libc::c_void,
             iov_len: 1,
         };
-        assert_eq!(write_struct(&mut memory, SEND_IOV, &send_iov), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), SEND_IOV, &send_iov),
+            0
+        );
         let send_control = rights_control(&[loginuid]);
         memory.write(SEND_CONTROL, &send_control).unwrap();
         // SAFETY: libc::msghdr is plain data; a zeroed value is valid.
@@ -46984,7 +47475,10 @@ mod tests {
         send_msg.msg_iovlen = 1;
         send_msg.msg_control = SEND_CONTROL as usize as *mut libc::c_void;
         send_msg.msg_controllen = send_control.len();
-        assert_eq!(write_struct(&mut memory, SEND_MSG, &send_msg), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), SEND_MSG, &send_msg),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -47019,7 +47513,10 @@ mod tests {
             iov_base: RECV_SEGMENT as usize as *mut libc::c_void,
             iov_len: 1,
         };
-        assert_eq!(write_struct(&mut memory, RECV_IOV, &recv_iov), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), RECV_IOV, &recv_iov),
+            0
+        );
         memory.write(RECV_CONTROL, &[0_u8; 64]).unwrap();
         // SAFETY: libc::msghdr is plain data; a zeroed value is valid.
         let mut recv_msg = unsafe { std::mem::zeroed::<libc::msghdr>() };
@@ -47027,7 +47524,10 @@ mod tests {
         recv_msg.msg_iovlen = 1;
         recv_msg.msg_control = RECV_CONTROL as usize as *mut libc::c_void;
         recv_msg.msg_controllen = 64;
-        assert_eq!(write_struct(&mut memory, RECV_MSG, &recv_msg), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), RECV_MSG, &recv_msg),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -47115,7 +47615,10 @@ mod tests {
             iov_base: RIGHTS_SEGMENT as usize as *mut libc::c_void,
             iov_len: 1,
         };
-        assert_eq!(write_struct(memory, RIGHTS_IOV, &iov), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(memory), RIGHTS_IOV, &iov),
+            0
+        );
         let control = rights_control(fds);
         assert!(control.len() <= RIGHTS_CONTROL_CAPACITY);
         memory.write(RIGHTS_CONTROL, &control).unwrap();
@@ -47125,7 +47628,10 @@ mod tests {
         message.msg_iovlen = 1;
         message.msg_control = RIGHTS_CONTROL as usize as *mut libc::c_void;
         message.msg_controllen = control.len();
-        assert_eq!(write_struct(memory, RIGHTS_MSG, &message), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(memory), RIGHTS_MSG, &message),
+            0
+        );
         syscall_result(
             memory,
             state,
@@ -47148,7 +47654,10 @@ mod tests {
             iov_base: RIGHTS_SEGMENT as usize as *mut libc::c_void,
             iov_len: 1,
         };
-        assert_eq!(write_struct(memory, RIGHTS_IOV, &iov), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(memory), RIGHTS_IOV, &iov),
+            0
+        );
         memory
             .write(RIGHTS_CONTROL, &[0_u8; RIGHTS_CONTROL_CAPACITY])
             .unwrap();
@@ -47160,7 +47669,10 @@ mod tests {
             message.msg_control = RIGHTS_CONTROL as usize as *mut libc::c_void;
         }
         message.msg_controllen = capacity;
-        assert_eq!(write_struct(memory, RIGHTS_MSG, &message), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(memory), RIGHTS_MSG, &message),
+            0
+        );
         let result = syscall_result(
             memory,
             state,
@@ -48950,7 +49462,7 @@ mod tests {
         state.files.insert(1, duplicate.try_clone().unwrap());
         let length = fault.pages() * PAGE_SIZE as usize;
         let sentinel = vec![0xa5; length];
-        let mut memory = GuestMemory::new(0, length).unwrap();
+        let memory = GuestMemory::new(0, length).unwrap();
         memory.write_raw(0, &sentinel).unwrap();
         if case != Case::CleanupAtEof {
             for page in (0..fault.pages()).step_by(2) {
@@ -49009,7 +49521,11 @@ mod tests {
         let before = directory.stream_position().unwrap();
         assert_eq!(duplicate.stream_position().unwrap(), before);
         fault.arm();
-        let transport = getdents64(&mut memory, &state, &[0, 0, length as u64, 0, 0, 0]);
+        let transport = getdents64(
+            &mut ProviderMemory(&memory),
+            &state,
+            &[0, 0, length as u64, 0, 0, 0],
+        );
         let snapshots = getdents64_alias_ledger(&fault);
         let expected_cursor = if fault.case().setup_succeeds() {
             native_cursor
@@ -49052,7 +49568,11 @@ mod tests {
             let native_eof_cursor = native.stream_position().unwrap();
             memory.write_raw(length as u64 - 1, b"x").unwrap();
             assert_eq!(
-                getdents64(&mut memory, &state, &[1, 0, length as u64, 0, 0, 0]),
+                getdents64(
+                    &mut ProviderMemory(&memory),
+                    &state,
+                    &[1, 0, length as u64, 0, 0, 0]
+                ),
                 0
             );
             assert_eq!(directory.stream_position().unwrap(), native_eof_cursor);
@@ -49099,7 +49619,11 @@ mod tests {
         assert_eq!(getdents64_alias_cause_owners(&refused), cause_owners);
         // A second dispatch must stop at the sticky gate before directory I/O.
         assert_eq!(
-            getdents64(&mut memory, &state, &[1, 0, length as u64, 0, 0, 0]),
+            getdents64(
+                &mut ProviderMemory(&memory),
+                &state,
+                &[1, 0, length as u64, 0, 0, 0]
+            ),
             negative_errno(libc::EFAULT)
         );
         assert_eq!(directory.stream_position().unwrap(), expected_cursor);
@@ -50699,11 +51223,12 @@ mod tests {
                         8
                     );
                     assert_eq!(
-                        read_guest_bytes::<8>(&memory, READ_ZERO_BUFFER).unwrap(),
+                        read_guest_bytes::<8>(&ProviderMemory(&memory), READ_ZERO_BUFFER).unwrap(),
                         9_u64.to_ne_bytes()
                     );
                     assert_eq!(
-                        read_guest_bytes::<8>(&memory, READ_ZERO_BUFFER + 8).unwrap(),
+                        read_guest_bytes::<8>(&ProviderMemory(&memory), READ_ZERO_BUFFER + 8)
+                            .unwrap(),
                         [0x5a; 8]
                     );
                     assert_eq!(
@@ -50816,7 +51341,8 @@ mod tests {
                         let mut actual = [0x5a; 16];
                         actual[..expected.len()].copy_from_slice(expected);
                         assert_eq!(
-                            read_guest_bytes::<16>(&memory, READ_ZERO_BUFFER).unwrap(),
+                            read_guest_bytes::<16>(&ProviderMemory(&memory), READ_ZERO_BUFFER)
+                                .unwrap(),
                             actual
                         );
                         if !pipe {
@@ -51007,11 +51533,11 @@ mod tests {
                 8
             );
             assert_eq!(
-                read_guest_bytes::<8>(&memory, READ_ZERO_BUFFER).unwrap(),
+                read_guest_bytes::<8>(&ProviderMemory(&memory), READ_ZERO_BUFFER).unwrap(),
                 9_u64.to_ne_bytes()
             );
             assert_eq!(
-                read_guest_bytes::<8>(&memory, READ_ZERO_BUFFER + 8).unwrap(),
+                read_guest_bytes::<8>(&ProviderMemory(&memory), READ_ZERO_BUFFER + 8).unwrap(),
                 [0x5a; 8]
             );
             assert_eq!(
@@ -51095,7 +51621,7 @@ mod tests {
                 16
             );
             assert_eq!(
-                read_guest_bytes::<16>(&memory, READ_ZERO_BUFFER)
+                read_guest_bytes::<16>(&ProviderMemory(&memory), READ_ZERO_BUFFER)
                     .unwrap()
                     .as_slice(),
                 expected
@@ -51134,11 +51660,11 @@ mod tests {
             8
         );
         assert_eq!(
-            read_guest_bytes::<8>(&f.memory, READ_ZERO_BUFFER).unwrap(),
+            read_guest_bytes::<8>(&ProviderMemory(&f.memory), READ_ZERO_BUFFER).unwrap(),
             *b"pos:\t37\n"
         );
         assert_eq!(
-            read_guest_bytes::<8>(&f.memory, READ_ZERO_BUFFER + 8).unwrap(),
+            read_guest_bytes::<8>(&ProviderMemory(&f.memory), READ_ZERO_BUFFER + 8).unwrap(),
             [0x5a; 8]
         );
         assert_eq!(f.seek(info, 0, libc::SEEK_CUR), 8);
@@ -51849,7 +52375,10 @@ mod tests {
             events: libc::POLLIN,
             revents: 0,
         };
-        assert_eq!(write_struct(&mut memory, POLL_FD, &poll_fd), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), POLL_FD, &poll_fd),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -51937,7 +52466,7 @@ mod tests {
                 tv_nsec: 1,
             },
         };
-        assert_eq!(write_struct(&mut memory, TIMER, &timer), 0);
+        assert_eq!(write_struct(&mut ProviderMemory(&memory), TIMER, &timer), 0);
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -51960,7 +52489,10 @@ mod tests {
             events: libc::POLLIN,
             revents: 0,
         };
-        assert_eq!(write_struct(&mut memory, POLL_FD, &poll_fd), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), POLL_FD, &poll_fd),
+            0
+        );
         // The one-shot timerfd was armed with an absolute expiration in the past
         // (`it_value` one nanosecond after the monotonic epoch), so
         // `timerfd_settime` marks it expired and the timer *will* fire. The
@@ -52085,7 +52617,10 @@ mod tests {
             events: libc::POLLIN,
             revents: 0,
         };
-        assert_eq!(write_struct(&mut memory, POLL_FD, &poll_fd), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), POLL_FD, &poll_fd),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -52105,7 +52640,10 @@ mod tests {
             ),
             0
         );
-        assert_eq!(write_struct(&mut memory, POLL_FD, &poll_fd), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), POLL_FD, &poll_fd),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -52143,7 +52681,10 @@ mod tests {
             events: libc::POLLIN,
             revents: 0,
         };
-        assert_eq!(write_struct(&mut memory, POLL_FD, &poll_fd), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), POLL_FD, &poll_fd),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -52179,7 +52720,7 @@ mod tests {
             iov_base: DATA as *mut libc::c_void,
             iov_len: 1,
         };
-        assert_eq!(write_struct(&mut memory, IOV, &iov), 0);
+        assert_eq!(write_struct(&mut ProviderMemory(&memory), IOV, &iov), 0);
         test_block_signal(&mut state, libc::SIGPIPE);
         let signal_fd = syscall_result(
             &mut memory,
@@ -52500,9 +53041,9 @@ mod tests {
                 events: libc::POLLIN,
                 revents: 0,
             };
-            write_struct(memory, POLL_FDS, &first_poll);
+            write_struct(&mut ProviderMemory(memory), POLL_FDS, &first_poll);
             write_struct(
-                memory,
+                &mut ProviderMemory(memory),
                 POLL_FDS + std::mem::size_of::<libc::pollfd>() as u64,
                 &second_poll,
             );
@@ -52663,7 +53204,7 @@ mod tests {
                 };
                 assert_eq!(
                     write_struct(
-                        memory,
+                        &mut ProviderMemory(memory),
                         POLL_FDS + index as u64 * std::mem::size_of::<libc::pollfd>() as u64,
                         &descriptor,
                     ),
@@ -52802,7 +53343,10 @@ mod tests {
             events: libc::POLLIN,
             revents: 0,
         };
-        assert_eq!(write_struct(&mut memory, POLL_FD, &poll_fd), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), POLL_FD, &poll_fd),
+            0
+        );
         assert_eq!(
             leader.execute(
                 &SyscallRequest::new(libc::SYS_poll as u64, [POLL_FD, 1, 0, 0, 0, 0]),
@@ -53043,7 +53587,11 @@ mod tests {
         .enumerate()
         {
             assert_eq!(
-                write_struct(&mut memory, IOVEC + index as u64 * 16, &vector),
+                write_struct(
+                    &mut ProviderMemory(&memory),
+                    IOVEC + index as u64 * 16,
+                    &vector
+                ),
                 0
             );
         }
@@ -53077,7 +53625,7 @@ mod tests {
             iov_base: OUTPUT as *mut _,
             iov_len: 128,
         };
-        assert_eq!(write_struct(&mut memory, IOVEC, &one), 0);
+        assert_eq!(write_struct(&mut ProviderMemory(&memory), IOVEC, &one), 0);
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -53228,7 +53776,10 @@ mod tests {
                 iov_base: OUTPUT as *mut _,
                 iov_len: SIGNALFD_RECORD_SIZE,
             };
-            assert_eq!(write_struct(&mut memory, IOVEC, &vector), 0);
+            assert_eq!(
+                write_struct(&mut ProviderMemory(&memory), IOVEC, &vector),
+                0
+            );
             let pid = state.pid;
             assert_eq!(
                 result_of(kill_signal(
@@ -53371,7 +53922,7 @@ mod tests {
             iov_base: OUTPUT as *mut _,
             iov_len: 127,
         };
-        assert_eq!(write_struct(&mut memory, IOVEC, &short), 0);
+        assert_eq!(write_struct(&mut ProviderMemory(&memory), IOVEC, &short), 0);
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -53428,7 +53979,10 @@ mod tests {
             iov_base: boundary as *mut _,
             iov_len: 256,
         };
-        assert_eq!(write_struct(&mut memory, IOVEC, &crossing), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), IOVEC, &crossing),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -53453,7 +54007,10 @@ mod tests {
             iov_base: (memory.guest_end() + PAGE_SIZE) as *mut libc::c_void,
             iov_len: SIGNALFD_RECORD_SIZE,
         };
-        assert_eq!(write_struct(&mut memory, IOVEC, &outside_guest_mapping), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), IOVEC, &outside_guest_mapping),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -53478,7 +54035,10 @@ mod tests {
             iov_base: (1_u64 << 47) as *mut libc::c_void,
             iov_len: SIGNALFD_RECORD_SIZE,
         };
-        assert_eq!(write_struct(&mut memory, IOVEC, &outside_user_range), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), IOVEC, &outside_user_range),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -53647,7 +54207,7 @@ mod tests {
         let host = host_fd(&state, signal_fd as libc::c_int).unwrap();
         assert_ne!(fd_status_flags(host).unwrap() & libc::O_NONBLOCK, 0);
         // FIONBIO through another alias makes every alias nonblocking again.
-        assert_eq!(write_struct(&mut memory, VALUE, &1_i32), 0);
+        assert_eq!(write_struct(&mut ProviderMemory(&memory), VALUE, &1_i32), 0);
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -53730,9 +54290,15 @@ mod tests {
                 tv_nsec: 0,
             }),
         ] {
-            assert_eq!(write_struct(&mut memory, POLL_FD, &untouched), 0);
+            assert_eq!(
+                write_struct(&mut ProviderMemory(&memory), POLL_FD, &untouched),
+                0
+            );
             let timeout_address = if let Some(timeout) = timeout {
-                assert_eq!(write_struct(&mut memory, TIMEOUT, &timeout), 0);
+                assert_eq!(
+                    write_struct(&mut ProviderMemory(&memory), TIMEOUT, &timeout),
+                    0
+                );
                 TIMEOUT
             } else {
                 0
@@ -53756,12 +54322,18 @@ mod tests {
             tv_sec: 0,
             tv_nsec: 0,
         };
-        assert_eq!(write_struct(&mut memory, TIMEOUT, &zero_timeout), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), TIMEOUT, &zero_timeout),
+            0
+        );
         let empty = libc::pollfd {
             revents: 0,
             ..untouched
         };
-        assert_eq!(write_struct(&mut memory, POLL_FD, &empty), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), POLL_FD, &empty),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -53782,7 +54354,10 @@ mod tests {
             )),
             0,
         );
-        assert_eq!(write_struct(&mut memory, POLL_FD, &empty), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), POLL_FD, &empty),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -53795,7 +54370,10 @@ mod tests {
         let ready: libc::pollfd = read_struct(&memory, POLL_FD);
         assert_eq!(ready.fd, alias as libc::c_int);
         assert_ne!(ready.revents & libc::POLLIN, 0);
-        assert_eq!(write_struct(&mut memory, POLL_FD, &empty), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), POLL_FD, &empty),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -53819,7 +54397,10 @@ mod tests {
             events: libc::EPOLLIN as u32,
             u64: 0x1234,
         };
-        assert_eq!(write_struct(&mut memory, EPOLL_EVENT, &event), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), EPOLL_EVENT, &event),
+            0
+        );
         for target in [signal_fd, alias] {
             assert_eq!(
                 syscall_result(
@@ -53928,7 +54509,7 @@ mod tests {
         for (index, vector) in vectors.iter().enumerate() {
             assert_eq!(
                 write_struct(
-                    &mut memory,
+                    &mut ProviderMemory(&memory),
                     IOVEC + (index * std::mem::size_of::<libc::iovec>()) as u64,
                     vector,
                 ),
@@ -53988,7 +54569,10 @@ mod tests {
             events: libc::POLLIN,
             revents: libc::POLLPRI,
         };
-        assert_eq!(write_struct(&mut memory, POLL_FD, &pollin), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), POLL_FD, &pollin),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -54017,7 +54601,10 @@ mod tests {
             events: libc::POLLOUT,
             revents: libc::POLLPRI,
         };
-        assert_eq!(write_struct(&mut memory, POLL_FD, &pollout), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), POLL_FD, &pollout),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -54037,7 +54624,10 @@ mod tests {
             tv_sec: 0,
             tv_usec: 0,
         };
-        assert_eq!(write_struct(&mut memory, TIMEVAL, &zero_timeval), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), TIMEVAL, &zero_timeval),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -54053,9 +54643,15 @@ mod tests {
             tv_sec: 60,
             tv_nsec: 0,
         };
-        assert_eq!(write_struct(&mut memory, TIMESPEC, &long_timeout), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), TIMESPEC, &long_timeout),
+            0
+        );
         for timeout_address in [TIMESPEC, 0] {
-            assert_eq!(write_struct(&mut memory, POLL_FD, &pollout), 0);
+            assert_eq!(
+                write_struct(&mut ProviderMemory(&memory), POLL_FD, &pollout),
+                0
+            );
             let started = std::time::Instant::now();
             assert_eq!(
                 syscall_result(
@@ -54087,7 +54683,10 @@ mod tests {
             events: libc::POLLIN | libc::POLLOUT,
             revents: 0,
         };
-        assert_eq!(write_struct(&mut memory, POLL_FD, &readable), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), POLL_FD, &readable),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -54121,7 +54720,10 @@ mod tests {
             events: libc::POLLOUT,
             revents: 0,
         };
-        assert_eq!(write_struct(&mut memory, POLL_FD, &event_pollout), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), POLL_FD, &event_pollout),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -54262,7 +54864,10 @@ mod tests {
             iov_base: boundary as *mut libc::c_void,
             iov_len: 128,
         };
-        assert_eq!(write_struct(&mut memory, IOVEC, &crossing), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), IOVEC, &crossing),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -54286,7 +54891,10 @@ mod tests {
             iov_base: VALID_INFO as *mut libc::c_void,
             iov_len: 64,
         };
-        assert_eq!(write_struct(&mut memory, IOVEC, &truncated), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), IOVEC, &truncated),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -54504,7 +55112,8 @@ mod tests {
             ),
             0,
         );
-        let pending = KernelSigset::from_bytes(read_guest_bytes(&memory, OUTPUT).unwrap());
+        let pending =
+            KernelSigset::from_bytes(read_guest_bytes(&ProviderMemory(&memory), OUTPUT).unwrap());
         assert!(pending.contains(libc::SIGUSR1));
         assert!(pending.contains(libc::SIGUSR2));
 
@@ -54518,7 +55127,8 @@ mod tests {
             ),
             0,
         );
-        let pending = KernelSigset::from_bytes(read_guest_bytes(&memory, OUTPUT).unwrap());
+        let pending =
+            KernelSigset::from_bytes(read_guest_bytes(&ProviderMemory(&memory), OUTPUT).unwrap());
         assert!(pending.contains(libc::SIGUSR1));
         assert!(!pending.contains(libc::SIGUSR2));
     }
@@ -54606,7 +55216,10 @@ mod tests {
             events: libc::POLLIN,
             revents: 0,
         };
-        assert_eq!(write_struct(&mut memory, POLL_FD, &poll_fd), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), POLL_FD, &poll_fd),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -54631,7 +55244,10 @@ mod tests {
             ),
             0,
         );
-        assert_eq!(write_struct(&mut memory, POLL_FD, &poll_fd), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), POLL_FD, &poll_fd),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -54717,7 +55333,8 @@ mod tests {
             0,
         );
         assert!(
-            !KernelSigset::from_bytes(read_guest_bytes(&memory, PENDING).unwrap()).contains(signal),
+            !KernelSigset::from_bytes(read_guest_bytes(&ProviderMemory(&memory), PENDING).unwrap())
+                .contains(signal),
             "the sibling's stale row must not be observable through rt_sigpending",
         );
         assert_eq!(
@@ -54747,7 +55364,8 @@ mod tests {
             0,
         );
         assert!(
-            KernelSigset::from_bytes(read_guest_bytes(&memory, PENDING).unwrap()).contains(signal)
+            KernelSigset::from_bytes(read_guest_bytes(&ProviderMemory(&memory), PENDING).unwrap())
+                .contains(signal)
         );
 
         memory.write(ACTION, &custom_action(0x5000)).unwrap();
@@ -55119,7 +55737,7 @@ mod tests {
         test_catch_signal(&state, libc::SIGUSR1);
         assert_eq!(
             write_struct(
-                &mut memory,
+                &mut ProviderMemory(&memory),
                 TIMEOUT,
                 &libc::timespec {
                     tv_sec: 0,
@@ -55130,7 +55748,7 @@ mod tests {
         );
         assert_eq!(
             write_struct(
-                &mut memory,
+                &mut ProviderMemory(&memory),
                 OUTER,
                 &Pselect6SigmaskArg {
                     sigmask: MASK,
@@ -57819,7 +58437,7 @@ mod tests {
         let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
         assert_eq!(
             write_struct(
-                &mut memory,
+                &mut ProviderMemory(&memory),
                 REQUEST,
                 &libc::timespec {
                     tv_sec: 60,
@@ -57892,7 +58510,7 @@ mod tests {
         );
         assert_eq!(
             write_struct(
-                &mut memory,
+                &mut ProviderMemory(&memory),
                 REQUEST,
                 &libc::timespec {
                     tv_sec: -1,
@@ -57912,7 +58530,7 @@ mod tests {
         );
         assert_eq!(
             write_struct(
-                &mut memory,
+                &mut ProviderMemory(&memory),
                 REQUEST,
                 &libc::timespec {
                     tv_sec: 0,
@@ -58183,10 +58801,13 @@ mod tests {
             tv_sec: 0,
             tv_nsec: libc::UTIME_OMIT,
         };
-        assert_eq!(write_struct(&mut memory, OMIT_TIMES, &omit), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), OMIT_TIMES, &omit),
+            0
+        );
         assert_eq!(
             write_struct(
-                &mut memory,
+                &mut ProviderMemory(&memory),
                 OMIT_TIMES + std::mem::size_of::<libc::timespec>() as u64,
                 &omit,
             ),
@@ -59539,7 +60160,7 @@ mod tests {
                 ),
                 0
             );
-            let nofile = read_guest_bytes::<16>(&memory, 0x200).unwrap();
+            let nofile = read_guest_bytes::<16>(&ProviderMemory(&memory), 0x200).unwrap();
             assert_eq!(
                 u64::from_le_bytes(nofile[..8].try_into().unwrap()),
                 GUEST_NOFILE_LIMIT as u64
@@ -59750,7 +60371,8 @@ mod tests {
             0
         );
         assert_eq!(
-            read_guest_bytes::<KERNEL_SIGACTION_SIZE>(&memory, OLD_ACTION).unwrap(),
+            read_guest_bytes::<KERNEL_SIGACTION_SIZE>(&ProviderMemory(&memory), OLD_ACTION)
+                .unwrap(),
             [0; KERNEL_SIGACTION_SIZE]
         );
         assert_eq!(
@@ -59770,7 +60392,8 @@ mod tests {
             0
         );
         assert_eq!(
-            read_guest_bytes::<KERNEL_SIGACTION_SIZE>(&memory, OLD_ACTION).unwrap(),
+            read_guest_bytes::<KERNEL_SIGACTION_SIZE>(&ProviderMemory(&memory), OLD_ACTION)
+                .unwrap(),
             expected_action
         );
         assert_eq!(
@@ -59824,7 +60447,7 @@ mod tests {
         );
         assert_eq!(test_blocked_mask(&state), [0; KERNEL_SIGSET_SIZE]);
         assert_eq!(
-            read_guest_bytes::<KERNEL_SIGSET_SIZE>(&memory, OLD_MASK).unwrap(),
+            read_guest_bytes::<KERNEL_SIGSET_SIZE>(&ProviderMemory(&memory), OLD_MASK).unwrap(),
             [0x33; KERNEL_SIGSET_SIZE],
             "invalid how must not copy the old mask"
         );
@@ -59845,7 +60468,7 @@ mod tests {
             0
         );
         assert_eq!(
-            read_guest_bytes::<KERNEL_SIGSET_SIZE>(&memory, OLD_MASK).unwrap(),
+            read_guest_bytes::<KERNEL_SIGSET_SIZE>(&ProviderMemory(&memory), OLD_MASK).unwrap(),
             [0; KERNEL_SIGSET_SIZE]
         );
         assert_eq!(
@@ -59886,7 +60509,10 @@ mod tests {
             flags: 0,
             size: libc::MINSIGSTKSZ as u64,
         };
-        assert_eq!(write_bytes(&mut memory, ALT_STACK, &stack.encode()), 0);
+        assert_eq!(
+            write_bytes(&mut ProviderMemory(&memory), ALT_STACK, &stack.encode()),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -59896,14 +60522,19 @@ mod tests {
             ),
             0
         );
-        let previous = GuestStack::decode(read_guest_bytes::<24>(&memory, OLD_ALT_STACK).unwrap());
+        let previous = GuestStack::decode(
+            read_guest_bytes::<24>(&ProviderMemory(&memory), OLD_ALT_STACK).unwrap(),
+        );
         assert_eq!(previous.flags, libc::SS_DISABLE);
         let disabled = GuestStack {
             sp: u64::MAX,
             flags: libc::SS_DISABLE,
             size: u64::MAX,
         };
-        assert_eq!(write_bytes(&mut memory, ALT_STACK, &disabled.encode()), 0);
+        assert_eq!(
+            write_bytes(&mut ProviderMemory(&memory), ALT_STACK, &disabled.encode()),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -59926,8 +60557,9 @@ mod tests {
             ),
             0
         );
-        let disabled_query =
-            GuestStack::decode(read_guest_bytes::<24>(&memory, OLD_ALT_STACK).unwrap());
+        let disabled_query = GuestStack::decode(
+            read_guest_bytes::<24>(&ProviderMemory(&memory), OLD_ALT_STACK).unwrap(),
+        );
         assert_eq!(disabled_query.sp, 0);
         assert_eq!(disabled_query.flags, libc::SS_DISABLE);
         assert_eq!(disabled_query.size, 0);
@@ -60029,7 +60661,8 @@ mod tests {
                 ),
                 0,
             );
-            let queried = GuestStack::decode(read_guest_bytes::<24>(&memory, OLD).unwrap());
+            let queried =
+                GuestStack::decode(read_guest_bytes::<24>(&ProviderMemory(&memory), OLD).unwrap());
             assert_eq!(
                 queried.flags & libc::SS_ONSTACK != 0,
                 on_stack,
@@ -60092,7 +60725,7 @@ mod tests {
         );
         assert_eq!(state.thread_signals.lock().altstack, Some(overflowing));
         assert_eq!(
-            GuestStack::decode(read_guest_bytes::<24>(&memory, OLD).unwrap()),
+            GuestStack::decode(read_guest_bytes::<24>(&ProviderMemory(&memory), OLD).unwrap()),
             GuestStack {
                 sp: 0,
                 flags: libc::SS_DISABLE,
@@ -60108,7 +60741,8 @@ mod tests {
             ),
             0,
         );
-        let observed = GuestStack::decode(read_guest_bytes::<24>(&memory, OLD).unwrap());
+        let observed =
+            GuestStack::decode(read_guest_bytes::<24>(&ProviderMemory(&memory), OLD).unwrap());
         assert_eq!(observed.sp, overflowing.sp);
         assert_eq!(observed.size, overflowing.size);
         assert_eq!(observed.flags, libc::SS_ONSTACK);
@@ -61227,7 +61861,10 @@ mod tests {
             ),
             0
         );
-        assert_eq!(read_guest_bytes::<2>(&memory, VECTOR).unwrap(), [1, 1]);
+        assert_eq!(
+            read_guest_bytes::<2>(&ProviderMemory(&memory), VECTOR).unwrap(),
+            [1, 1]
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -61267,7 +61904,7 @@ mod tests {
             8
         );
         assert_eq!(
-            read_guest_bytes::<8>(&memory, AFFINITY).unwrap(),
+            read_guest_bytes::<8>(&ProviderMemory(&memory), AFFINITY).unwrap(),
             [1, 0, 0, 0, 0, 0, 0, 0]
         );
         assert_eq!(
@@ -62537,24 +63174,33 @@ mod tests {
 
     #[test]
     fn deterministic_getrandom_repeats_per_thread_and_separates_threads() {
-        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
         let mut first_state = test_state(Path::new("/"));
         let mut second_state = test_state(Path::new("/"));
         let mut worker_state = test_state(Path::new("/"));
         worker_state.tid = 2;
 
-        assert_eq!(getrandom(&mut memory, &mut first_state, 0x100, 32), 32);
+        assert_eq!(
+            getrandom(&mut ProviderMemory(&memory), &mut first_state, 0x100, 32),
+            32
+        );
         let mut first = [0; 32];
         memory.read(0x100, &mut first).unwrap();
 
         // Repeatability applies to fresh equal states. Repeating a completed
         // call on one state must advance, or tempfile collision retries cycle.
-        assert_eq!(getrandom(&mut memory, &mut second_state, 0x200, 32), 32);
+        assert_eq!(
+            getrandom(&mut ProviderMemory(&memory), &mut second_state, 0x200, 32),
+            32
+        );
         let mut second = [0; 32];
         memory.read(0x200, &mut second).unwrap();
         assert_eq!(first, second);
 
-        assert_eq!(getrandom(&mut memory, &mut worker_state, 0x300, 32), 32);
+        assert_eq!(
+            getrandom(&mut ProviderMemory(&memory), &mut worker_state, 0x300, 32),
+            32
+        );
         let mut worker = [0; 32];
         memory.read(0x300, &mut worker).unwrap();
         assert_ne!(first, worker);
@@ -62704,20 +63350,33 @@ mod tests {
         let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
         let mut state = test_state(Path::new("/"));
         let first = read_deterministic_getrandom(&mut memory, &mut state, 17);
-        assert_eq!(getrandom(&mut memory, &mut state, 0x100, 0), 0);
+        assert_eq!(
+            getrandom(&mut ProviderMemory(&memory), &mut state, 0x100, 0),
+            0
+        );
         assert_eq!(state.getrandom_offset, 17);
         assert_eq!(
-            getrandom(&mut memory, &mut state, PAGE_SIZE - 4, 8),
+            getrandom(&mut ProviderMemory(&memory), &mut state, PAGE_SIZE - 4, 8),
             negative_errno(libc::EFAULT)
         );
         assert_eq!(state.getrandom_offset, 17);
         assert_eq!(
-            getrandom(&mut memory, &mut state, 0x100, MAX_HOST_IO as u64),
+            getrandom(
+                &mut ProviderMemory(&memory),
+                &mut state,
+                0x100,
+                MAX_HOST_IO as u64
+            ),
             negative_errno(libc::EFAULT)
         );
         assert_eq!(state.getrandom_offset, 17);
         assert_eq!(
-            getrandom(&mut memory, &mut state, 0x100, MAX_HOST_IO as u64 + 1),
+            getrandom(
+                &mut ProviderMemory(&memory),
+                &mut state,
+                0x100,
+                MAX_HOST_IO as u64 + 1
+            ),
             negative_errno(libc::E2BIG)
         );
         assert_eq!(state.getrandom_offset, 17);
@@ -62730,10 +63389,13 @@ mod tests {
         state.getrandom_offset = u64::MAX - 8;
         let last = read_deterministic_getrandom(&mut memory, &mut state, 8);
         assert_eq!(state.getrandom_offset, u64::MAX);
-        assert_eq!(getrandom(&mut memory, &mut state, 0x100, 0), 0);
+        assert_eq!(
+            getrandom(&mut ProviderMemory(&memory), &mut state, 0x100, 0),
+            0
+        );
         assert_eq!(state.getrandom_offset, u64::MAX);
         assert_eq!(
-            getrandom(&mut memory, &mut state, 0x100, 1),
+            getrandom(&mut ProviderMemory(&memory), &mut state, 0x100, 1),
             negative_errno(libc::EOVERFLOW)
         );
         assert_eq!(state.getrandom_offset, u64::MAX);
@@ -62741,7 +63403,12 @@ mod tests {
         memory.read(0x100, &mut unchanged).unwrap();
         assert_eq!(unchanged.as_slice(), last.as_slice());
         assert_eq!(
-            getrandom(&mut memory, &mut state, 0x100, MAX_HOST_IO as u64 + 1),
+            getrandom(
+                &mut ProviderMemory(&memory),
+                &mut state,
+                0x100,
+                MAX_HOST_IO as u64 + 1
+            ),
             negative_errno(libc::E2BIG)
         );
         assert_eq!(state.getrandom_offset, u64::MAX);
@@ -66343,7 +67010,7 @@ mod tests {
         memory.write(CHILD_INPUT, b"child\0").unwrap();
         assert_eq!(
             super::prctl(
-                &mut memory,
+                &mut ProviderMemory(&memory),
                 &mut sibling.state,
                 &[libc::PR_SET_NAME as u64, CHILD_INPUT, 0, 0, 0, 0],
             ),
@@ -66364,7 +67031,7 @@ mod tests {
         memory.write(INPUT, &[0xff, b'\n', b'\\', b'L', 0]).unwrap();
         assert_eq!(
             super::prctl(
-                &mut memory,
+                &mut ProviderMemory(&memory),
                 &mut leader.state,
                 &[libc::PR_SET_NAME as u64, INPUT, 0, 0, 0, 0],
             ),
@@ -66619,18 +67286,39 @@ mod tests {
         };
 
         write_header(&mut memory, 0, 0);
-        assert_eq!(capget(&mut memory, &state, &[HEADER, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(
+            capget(
+                &mut ProviderMemory(&memory),
+                &state,
+                &[HEADER, 0, 0, 0, 0, 0]
+            ),
+            0
+        );
         let mut version = [0; 4];
         memory.read(HEADER, &mut version).unwrap();
         assert_eq!(u32::from_ne_bytes(version), LINUX_CAPABILITY_VERSION_3);
 
         write_header(&mut memory, LINUX_CAPABILITY_VERSION_3, state.pid);
-        assert_eq!(capget(&mut memory, &state, &[HEADER, DATA, 0, 0, 0, 0]), 0);
+        assert_eq!(
+            capget(
+                &mut ProviderMemory(&memory),
+                &state,
+                &[HEADER, DATA, 0, 0, 0, 0]
+            ),
+            0
+        );
         let reduced = GUEST_CAPABILITY_MASK & !(1_u64 << CAP_SYS_TIME);
         memory
             .write(DATA, &capability_data_bytes(reduced, reduced, 1))
             .unwrap();
-        assert_eq!(capset(&memory, &mut state, &[HEADER, DATA, 0, 0, 0, 0]), 0);
+        assert_eq!(
+            capset(
+                &ProviderMemory(&memory),
+                &mut state,
+                &[HEADER, DATA, 0, 0, 0, 0]
+            ),
+            0
+        );
         assert_eq!(state.capability_effective, reduced);
         assert_eq!(state.capability_permitted, reduced);
         assert_eq!(state.capability_inheritable, 1);
@@ -66647,12 +67335,26 @@ mod tests {
         memory
             .write(DATA, &capability_data_bytes(reduced, reduced, 0))
             .unwrap();
-        assert_eq!(capset(&memory, &mut state, &[HEADER, DATA, 0, 0, 0, 0]), 0);
+        assert_eq!(
+            capset(
+                &ProviderMemory(&memory),
+                &mut state,
+                &[HEADER, DATA, 0, 0, 0, 0]
+            ),
+            0
+        );
         assert_eq!(state.capability_ambient, 0);
         memory
             .write(DATA, &capability_data_bytes(reduced, reduced, 1))
             .unwrap();
-        assert_eq!(capset(&memory, &mut state, &[HEADER, DATA, 0, 0, 0, 0]), 0);
+        assert_eq!(
+            capset(
+                &ProviderMemory(&memory),
+                &mut state,
+                &[HEADER, DATA, 0, 0, 0, 0]
+            ),
+            0
+        );
         assert_eq!(
             prctl_cap_ambient(&mut state, libc::PR_CAP_AMBIENT_RAISE as u64, 0),
             0

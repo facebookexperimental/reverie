@@ -3164,13 +3164,8 @@ impl UserMemory {
     /// writability check and the exchange run under one copy admission and
     /// one address-space lock, as a permission-aware copyout does. A word on
     /// truncate-capable file backing is refused as an atomic scalar store is.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "no executor handler performs a guest compare-exchange yet; futex words still go to the host kernel"
-        )
-    )]
+    /// No executor handler performs a guest compare-exchange yet; futex words
+    /// still go to the host kernel.
     pub(crate) fn compare_exchange_u32(
         &self,
         guest_address: u64,

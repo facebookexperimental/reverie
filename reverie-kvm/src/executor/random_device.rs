@@ -184,7 +184,7 @@ fn random_device_lock(
     command: i32,
     address: u64,
 ) -> crate::Result<i64> {
-    let imported = read_guest_struct::<libc::flock>(memory, address);
+    let imported = read_guest_struct::<libc::flock>(&ProviderMemory(memory), address);
     check_random_copy_failure(memory)?;
     let lock = match imported {
         Ok(lock) => lock,
@@ -473,7 +473,7 @@ fn random_path_xattr(
     if setting && args[4] as i32 & !(libc::XATTR_CREATE | libc::XATTR_REPLACE) != 0 {
         return Ok(negative_errno(libc::EINVAL));
     }
-    let imported = read_c_string(memory, args[1], 256);
+    let imported = read_c_string(&ProviderMemory(memory), args[1], 256);
     check_random_copy_failure(memory)?;
     match imported {
         Ok(name) if name.is_empty() => return Ok(negative_errno(libc::ERANGE)),

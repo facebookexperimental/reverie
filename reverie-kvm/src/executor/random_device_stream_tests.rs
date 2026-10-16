@@ -860,7 +860,7 @@ fn random_device_stream_scm_rights_refuses_entire_message_before_effects() {
             message.msg_iovlen = 1;
             message.msg_control = 0x300 as *mut libc::c_void;
             message.msg_controllen = control.len();
-            assert_eq!(write_struct(&mut memory, 0x400, &message), 0);
+            assert_eq!(write_struct(&mut ProviderMemory(&memory), 0x400, &message), 0);
             let entries = state.files.keys().copied().collect::<Vec<_>>();
             assert_eq!(
                 syscall_result(
@@ -897,7 +897,7 @@ fn random_device_stream_scm_rights_refuses_entire_message_before_effects() {
     message.msg_iovlen = 1;
     message.msg_control = 0x300 as *mut libc::c_void;
     message.msg_controllen = control.len();
-    assert_eq!(write_struct(&mut memory, 0x400, &message), 0);
+    assert_eq!(write_struct(&mut ProviderMemory(&memory), 0x400, &message), 0);
     assert_eq!(
         syscall_result(
             &mut memory,

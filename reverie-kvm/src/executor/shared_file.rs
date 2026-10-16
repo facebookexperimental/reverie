@@ -334,7 +334,7 @@ pub(super) fn remap_requires_shared_capability(
         || !args[0].is_multiple_of(PAGE_SIZE)
         || flags & !allowed != 0
         || (fixed && flags & libc::MREMAP_MAYMOVE as u64 == 0)
-        || !range_is_valid(memory, args[0], old_length)
+        || !range_is_valid(&ProviderMemory(memory), args[0], old_length)
     {
         return false;
     }
