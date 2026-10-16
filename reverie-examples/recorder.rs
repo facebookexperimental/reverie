@@ -1,0 +1,254 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+//! Run a program under the pass-through recorder (`recorder_tool.rs`) on a
+//! chosen backend, or natively, and write every syscall it made with the
+//! result it got, in a form that compares across backends and with native
+//! Linux (`reverie-examples/e2e/compare.rs`).
+//!
+//! `--backend native` records the same with plain ptrace syscall stops, with
+//! no Reverie at all. A backend that cannot host the recorder refuses by
+//! name: the record is not written and the refusal is the last line of
+//! stderr, starting `REFUSED:`.
+
+use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::path::Path;
+use std::path::PathBuf;
+
+use clap::Parser;
+use reverie::syscalls::Sysno;
+
+#[path = "backend.rs"]
+mod backend;
+#[path = "recorder_tool.rs"]
+mod recorder_tool;
+
+use backend::BackendKind;
+use recorder_tool::Outcome;
+use recorder_tool::Recorder;
+use recorder_tool::Report;
+use recorder_tool::report;
+use recorder_tool::reverie_events;
+
+/// Where to run the program.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Target {
+    /// Natively, observed with plain ptrace syscall stops.
+    Native,
+    Ptrace,
+    Kvm,
+    Liteinst,
+    InGuestTrap,
+    E9patch,
+    Dbt,
+    Sabre,
+}
+
+/// Run PROGRAM under the pass-through recorder on BACKEND and write its
+/// syscalls and their results to OUTPUT.
+#[derive(Debug, Parser)]
+struct Opts {
+    #[clap(long, value_enum)]
+    backend: Target,
+    /// Where to write the record (stdout is the program's).
+    #[clap(long)]
+    output: PathBuf,
+    #[clap(value_name = "PROGRAM")]
+    program: PathBuf,
+    #[clap(
+        value_name = "ARGS",
+        trailing_var_arg = true,
+        allow_hyphen_values = true
+    )]
+    args: Vec<OsString>,
+}
+
+/// Run `program` natively, observing its syscalls with plain ptrace (no
+/// Reverie): a syscall-stop at each entry and exit only reads registers, so
+/// the program gets the results Linux gives it.
+fn run_native(program: &Path, args: &[OsString]) -> anyhow::Result<Report> {
+    use std::collections::BTreeSet;
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::ffi::OsStringExt;
+
+    use nix::sys::ptrace;
+    use nix::sys::signal::Signal;
+    use nix::sys::wait::WaitPidFlag;
+    use nix::sys::wait::WaitStatus;
+    use nix::sys::wait::waitpid;
+    use nix::unistd::ForkResult;
+    use nix::unistd::Pid as NixPid;
+
+    let argv = std::iter::once(program.as_os_str())
+        .chain(args.iter().map(OsString::as_os_str))
+        .map(|arg| CString::new(arg.as_bytes()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let path = CString::new(program.as_os_str().as_bytes())?;
+    // The environment in name order, as reverie-process's `Command` passes
+    // it to a ptrace or KVM guest, so that the order, which a program can
+    // see, is not a difference between the launchers.
+    let mut environment = std::env::vars_os().collect::<Vec<_>>();
+    environment.sort();
+    let envp = environment
+        .into_iter()
+        .map(|(key, value)| {
+            let mut entry = key.into_vec();
+            entry.push(b'=');
+            entry.extend(value.into_vec());
+            CString::new(entry)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    // SAFETY: the child only calls async-signal-safe functions before exec.
+    let child = match unsafe { nix::unistd::fork() }? {
+        ForkResult::Child => {
+            // The Rust runtime ignores SIGPIPE; a program starts with the
+            // default, as reverie-ptrace's and the shell's children do.
+            // SAFETY: resetting a disposition in the forked child.
+            let _ = unsafe {
+                nix::sys::signal::signal(Signal::SIGPIPE, nix::sys::signal::SigHandler::SigDfl)
+            };
+            let _ = ptrace::traceme();
+            let _ = nix::sys::signal::raise(Signal::SIGSTOP);
+            let _ = nix::unistd::execve(&path, &argv, &envp);
+            // SAFETY: exiting the forked child without unwinding.
+            unsafe { libc::_exit(127) };
+        }
+        ForkResult::Parent { child } => child,
+    };
+    waitpid(child, None)?;
+    ptrace::setoptions(
+        child,
+        ptrace::Options::PTRACE_O_TRACESYSGOOD
+            | ptrace::Options::PTRACE_O_TRACEFORK
+            | ptrace::Options::PTRACE_O_TRACEVFORK
+            | ptrace::Options::PTRACE_O_TRACECLONE
+            | ptrace::Options::PTRACE_O_TRACEEXEC
+            | ptrace::Options::PTRACE_O_EXITKILL,
+    )?;
+    ptrace::syscall(child, None)?;
+
+    let mut events = Vec::new();
+    // The call each thread is in, from its entry stop to its exit stop.
+    let mut entered: BTreeMap<i32, i64> = BTreeMap::new();
+    // New threads, whose first stop is the SIGSTOP that starts them traced.
+    let mut starting: BTreeSet<i32> = BTreeSet::new();
+    let mut exit_code = -1;
+    loop {
+        let status = match waitpid(NixPid::from_raw(-1), Some(WaitPidFlag::__WALL)) {
+            Ok(status) => status,
+            Err(nix::errno::Errno::ECHILD) => break,
+            Err(error) => return Err(error.into()),
+        };
+        match status {
+            WaitStatus::PtraceSyscall(pid) => {
+                let tid = pid.as_raw();
+                let regs = ptrace::getregs(pid)?;
+                match entered.remove(&tid) {
+                    None => {
+                        let sysno = regs.orig_rax as i64;
+                        if sysno == libc::SYS_exit || sysno == libc::SYS_exit_group {
+                            events.push((tid, sysno, Outcome::NoReturn));
+                        } else {
+                            entered.insert(tid, sysno);
+                        }
+                    }
+                    Some(sysno) => {
+                        let value = regs.rax as i64;
+                        let outcome = if (-4095..0).contains(&value) {
+                            Outcome::Errno(-value as i32)
+                        } else {
+                            Outcome::Value(value)
+                        };
+                        events.push((tid, sysno, outcome));
+                    }
+                }
+                let _ = ptrace::syscall(pid, None);
+            }
+            WaitStatus::PtraceEvent(pid, _, event) => {
+                if (event == libc::PTRACE_EVENT_FORK
+                    || event == libc::PTRACE_EVENT_VFORK
+                    || event == libc::PTRACE_EVENT_CLONE)
+                    && let Ok(new) = ptrace::getevent(pid)
+                {
+                    starting.insert(new as i32);
+                }
+                let _ = ptrace::syscall(pid, None);
+            }
+            WaitStatus::Stopped(pid, signal) => {
+                let tid = pid.as_raw();
+                let deliver = if signal == Signal::SIGSTOP && starting.remove(&tid) {
+                    None
+                } else {
+                    Some(signal)
+                };
+                let _ = ptrace::syscall(pid, deliver);
+            }
+            WaitStatus::Exited(pid, code) => {
+                if let Some(sysno) = entered.remove(&pid.as_raw()) {
+                    events.push((pid.as_raw(), sysno, Outcome::NoReturn));
+                }
+                if pid == child {
+                    exit_code = code;
+                }
+            }
+            WaitStatus::Signaled(pid, signal, _) if pid == child => {
+                exit_code = 128 + signal as i32;
+            }
+            _ => {}
+        }
+    }
+    let events = events
+        .into_iter()
+        .map(|(tid, sysno, outcome)| {
+            let name = Sysno::from(sysno as i32).name().to_owned();
+            (tid, name, outcome)
+        })
+        .collect();
+    Ok(report(exit_code, events))
+}
+
+fn reverie_backend(target: Target) -> BackendKind {
+    match target {
+        Target::Native => unreachable!("native runs without Reverie"),
+        Target::Ptrace => BackendKind::Ptrace,
+        Target::Kvm => BackendKind::Kvm,
+        Target::Liteinst => BackendKind::Liteinst,
+        Target::InGuestTrap => BackendKind::InGuestTrap,
+        Target::E9patch => BackendKind::E9patch,
+        Target::Dbt => BackendKind::Dbt,
+        Target::Sabre => BackendKind::Sabre,
+    }
+}
+
+fn main() -> anyhow::Result<()> {
+    let opts = Opts::parse();
+    let report = if opts.backend == Target::Native {
+        run_native(&opts.program, &opts.args)?
+    } else {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        let run = runtime.block_on(backend::run::<Recorder>(
+            reverie_backend(opts.backend),
+            &opts.program,
+            &opts.args,
+            (),
+        ));
+        match run {
+            Ok(run) => {
+                let events = run.global_state.events.into_inner().unwrap();
+                report(run.exit_code, reverie_events(events))
+            }
+            Err(error) => anyhow::bail!("{error}"),
+        }
+    };
+    std::fs::write(&opts.output, report.text())?;
+    Ok(())
+}
