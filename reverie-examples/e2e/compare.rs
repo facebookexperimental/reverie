@@ -109,10 +109,12 @@ fn first_difference(native: &Record, backend: &Record) -> Option<String> {
     (native.exit != backend.exit).then(|| format!("exit: {} -> {}", native.exit, backend.exit))
 }
 
-/// The backends whose tool runs in the program, from its preload's
-/// constructor: they cannot see the calls the dynamic loader makes before it,
-/// at the start and again after each successful `execve`.
-const LATE_START: &[&str] = &["liteinst", "in-guest-trap", "e9patch"];
+/// The backends whose tool starts after the program does: the in-guest
+/// backends at their preload's constructor, after the dynamic loader's calls,
+/// and DBT after the `execve` that starts the program, which runs before
+/// DynamoRIO takes over. They cannot see those calls, at the start and again
+/// after each successful `execve`.
+const LATE_START: &[&str] = &["liteinst", "in-guest-trap", "e9patch", "dbt"];
 
 /// How many calls, by name, place a late-starting backend's record in the
 /// native one.

@@ -45,6 +45,10 @@
 mod counter1_exact;
 #[path = "../../reverie-examples/counter2_tool.rs"]
 mod counter2_exact;
+// The runtime hosts the tool; the record's text form is the launcher's.
+#[allow(dead_code)]
+#[path = "../../reverie-examples/recorder_tool.rs"]
+pub(crate) mod recorder_exact;
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -117,6 +121,62 @@ const CHAOS_NO_RECV_ENV: &str = "HERMIT_DBT_CHAOS_NO_RECV";
 const CHAOS_INTERRUPT_ENV: &str = "HERMIT_DBT_CHAOS_INTERRUPT";
 const COUNTER1_EXACT_ENV: &str = "HERMIT_DBT_COUNTER1_EXACT";
 const COUNTER2_EXACT_ENV: &str = "HERMIT_DBT_COUNTER2_EXACT";
+
+use crate::TOOL_ENV;
+
+/// A shared example tool the runtime hosts by name ([`TOOL_ENV`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HostedTool {
+    Counter1,
+    Counter2,
+    Recorder,
+}
+
+impl HostedTool {
+    /// The tool [`TOOL_ENV`] names. counter2 is not among them: its exit hooks
+    /// send their totals to the GlobalState from the process-exit callback,
+    /// which the prototype runtime cannot route to the launcher's coordinator
+    /// yet (it crashes there), so it runs only uncoordinated, through
+    /// `HERMIT_DBT_COUNTER2_EXACT`.
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "counter1" => Some(Self::Counter1),
+            recorder_exact::NAME => Some(Self::Recorder),
+            _ => None,
+        }
+    }
+}
+
+/// The hosted tool [`TOOL_ENV`] (or its two older flags) names. An unknown
+/// name ends the run by name rather than running no tool.
+static HOSTED_TOOL: LazyLock<Option<HostedTool>> = LazyLock::new(|| {
+    if let Some(name) = std::env::var_os(TOOL_ENV) {
+        let name = name.to_string_lossy();
+        return Some(HostedTool::from_name(&name).unwrap_or_else(|| {
+            let line = format!(
+                "reverie-dbt: REFUSED: {TOOL_ENV}={name:?} names no tool the prototype runtime hosts with a coordinator (counter1, recorder)\n"
+            );
+            // This can run before DynamoRIO's emit callback is installed, so
+            // write to the program's stderr, which the launcher captures.
+            if !emit_raw(&EMITTER, line.as_bytes()) {
+                // SAFETY: writes a live buffer to descriptor 2.
+                unsafe { libc::write(2, line.as_ptr().cast(), line.len()) };
+            }
+            std::process::exit(127)
+        }));
+    }
+    if env_flag(COUNTER1_EXACT_ENV) {
+        Some(HostedTool::Counter1)
+    } else if env_flag(COUNTER2_EXACT_ENV) {
+        Some(HostedTool::Counter2)
+    } else {
+        None
+    }
+});
+
+pub(crate) fn hosted_tool() -> Option<HostedTool> {
+    *HOSTED_TOOL
+}
 
 fn env_flag(name: &str) -> bool {
     std::env::var_os(name).is_some_and(|value| {
@@ -214,11 +274,13 @@ fn chrome_now_us() -> u64 {
         .unwrap_or_default()
         .as_micros() as u64
 }
-static COUNTER1_EXACT_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(COUNTER1_EXACT_ENV));
 static COUNTER1_EXACT_TOOL: LazyLock<ExactCounter1Tool> = LazyLock::new(ExactCounter1Tool::default);
 static COUNTER1_EXACT_GLOBAL: LazyLock<ExactCounter1Global> =
     LazyLock::new(ExactCounter1Global::default);
-static COUNTER2_EXACT_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(COUNTER2_EXACT_ENV));
+static RECORDER_TOOL: LazyLock<recorder_exact::Recorder> =
+    LazyLock::new(recorder_exact::Recorder::default);
+static RECORDER_GLOBAL: LazyLock<recorder_exact::Recorded> =
+    LazyLock::new(recorder_exact::Recorded::default);
 static COUNTER2_EXACT_TOOL: LazyLock<ExactCounter2Tool> = LazyLock::new(|| {
     <ExactCounter2Tool as Tool>::new(reverie::Pid::from_raw(unsafe { libc::getpid() }), &())
         .with_thread_exit_reporter(|tid, syscalls| {
@@ -266,7 +328,7 @@ fn emit_raw(slot: &AtomicUsize, bytes: &[u8]) -> bool {
 
 /// Whether the exact backend-neutral counter1 tool is selected.
 pub(crate) fn counter1_exact_enabled() -> bool {
-    *COUNTER1_EXACT_ENABLED
+    hosted_tool() == Some(HostedTool::Counter1)
 }
 
 /// Exact counter1 process-local tool instance.
@@ -289,7 +351,23 @@ pub(crate) fn emit_counter1_exact_summary() {
 
 /// Whether the exact backend-neutral counter2 tool is selected.
 pub(crate) fn counter2_exact_enabled() -> bool {
-    *COUNTER2_EXACT_ENABLED
+    hosted_tool() == Some(HostedTool::Counter2)
+}
+
+/// Whether the shared pass-through recorder is selected.
+pub(crate) fn recorder_enabled() -> bool {
+    hosted_tool() == Some(HostedTool::Recorder)
+}
+
+/// The recorder's process-local tool instance.
+pub(crate) fn recorder_tool() -> &'static recorder_exact::Recorder {
+    &RECORDER_TOOL
+}
+
+/// The recorder's in-process GlobalState, used only without a coordinator; with
+/// one (`DbtRunner::output_with_global`), every event goes to the launcher's.
+pub(crate) fn recorder_global() -> &'static recorder_exact::Recorded {
+    &RECORDER_GLOBAL
 }
 
 /// Exact counter2 process-local tool instance.

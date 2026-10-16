@@ -12,10 +12,13 @@ sh-pipe	ptrace	mismatch	rt_sigreturn=ok -> exit_group=?	https://github.com/rrnew
 grep-passwd	ptrace	mismatch	read=4092 -> read=4018	https://github.com/rrnewton/hermit/issues/4485
 # ptrace: python3's startup makes four fewer calls (rt_sigprocmask, mmap, mmap, rt_sigprocmask); cause not identified.
 python3	ptrace	mismatch	rt_sigprocmask=ok -> getrandom=ok	https://github.com/rrnewton/hermit/issues/4485
-# DBT and SaBRe load one runtime or plugin of their own: the runner (reverie-examples/backend.rs) has no
-# generic tool host for them.
+# SaBRe loads one plugin of its own: the runner (reverie-examples/backend.rs) has no generic tool host
+# for it yet.
 *	sabre	refused	*	https://github.com/rrnewton/hermit/issues/4485
-*	dbt	refused	*	https://github.com/rrnewton/hermit/issues/4485
+# DBT hosts the recorder in reverie-dbt's prototype runtime (REVERIE_DBT_TOOL), its GlobalState in the
+# launcher. DynamoRIO holds a descriptor the program sees, so its first open returns 4 where Linux returns
+# 3, the first difference on every program (later, rseq answers ENOSYS: DynamoRIO runs with -disable_rseq).
+*	dbt	mismatch	openat=3 -> openat=4	https://github.com/rrnewton/hermit/issues/4485
 # LiteInst and in-guest-trap host the recorder in the example preload; the comparator aligns their
 # records after the loader's calls, which an in-guest tool cannot see (compare.rs, LATE_START). Then:
 # the tool does not see one brk call (the first difference on most programs); the preload's two

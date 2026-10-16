@@ -144,6 +144,15 @@ impl Tool for Recorder {
                 guest.send_rpc(event(Outcome::NoReturn)).await;
                 guest.tail_inject(syscall).await
             }
+            Syscall::RtSigreturn(_) => {
+                // It never returns to its caller: it restores the context the
+                // signal interrupted. A backend that runs the tool inside the
+                // program (DBT) cannot do that from an injection, so it goes
+                // back as the program's own call. Its result is the restored
+                // context's, which Linux reports as success.
+                guest.send_rpc(event(Outcome::Pending)).await;
+                guest.tail_inject(syscall).await
+            }
             Syscall::Execve(_) | Syscall::Execveat(_) => {
                 // A successful `execve` does not come back here.
                 guest.send_rpc(event(Outcome::Pending)).await;

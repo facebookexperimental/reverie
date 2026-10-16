@@ -10,13 +10,14 @@
 //! backend's public entry point, so that the same tool and the same program
 //! can be compared across backends (`reverie-examples/e2e/`).
 //!
-//! A backend either runs the tool or refuses by name ([`RunError::Refused`]):
-//! DBT and SaBRe load one runtime or plugin of their own and have no generic
-//! tool host yet. The in-guest backends (LiteInst, in-guest-trap, e9patch)
-//! host a tool through a preload that compiles it in: the example preload,
+//! A backend either runs the tool or refuses by name ([`RunError::Refused`]).
+//! The in-guest backends (LiteInst, in-guest-trap, e9patch) host a tool
+//! through a preload that compiles it in: the example preload,
 //! `libreverie_examples.so` (`src/lib.rs`), selects the tool by the name the
-//! caller passes, so a tool runs there only once its name is in that
-//! selector.
+//! caller passes. DBT's prototype runtime (reverie-dbt) selects a tool it
+//! compiles in by the same name (`reverie_dbt::TOOL_ENV`), and the tool's
+//! GlobalState lives here, served over DBT's coordinator socket. SaBRe has no
+//! generic tool host yet.
 
 // `#[path]`-included by each example tool's binary; each uses a different
 // subset (a launcher calls `run_blocking`, the recorder `run`), so an item
@@ -178,8 +179,14 @@ where
             })?;
             run_in_guest::<T>(backend, args, config, preload).await
         }
-        BackendKind::Dbt | BackendKind::Sabre => Err(RunError::Refused(format!(
-            "the {backend:?} backend loads one runtime of its own and has no generic tool host"
+        BackendKind::Dbt => {
+            let preload = preload.ok_or_else(|| {
+                RunError::Refused("the DBT backend hosts a tool only by name".to_owned())
+            })?;
+            run_dbt::<T>(args, config, preload.tool).await
+        }
+        BackendKind::Sabre => Err(RunError::Refused(format!(
+            "the {backend:?} backend loads one plugin of its own and has no generic tool host"
         ))),
     }
 }
@@ -281,6 +288,58 @@ where
         exit_code: exit_code(status),
         global_state,
         captured: Some((stdout, stderr)),
+    })
+}
+
+/// The DBT client, `libreverie_dbt_client.so` built against reverie-dbt's
+/// prototype runtime (`reverie-dbt/scripts/build-client.sh`): the
+/// `REVERIE_DBT_CLIENT` the environment names, or the one beside this binary.
+fn dbt_client() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("REVERIE_DBT_CLIENT") {
+        return Some(PathBuf::from(path));
+    }
+    let executable = std::env::current_exe().ok()?;
+    let path = executable
+        .parent()?
+        .join("reverie-dbt-native/libreverie_dbt_client.so");
+    path.is_file().then_some(path)
+}
+
+async fn run_dbt<T>(
+    args: &CommonToolArguments,
+    config: <T::GlobalState as GlobalTool>::Config,
+    tool: &str,
+) -> Result<Run<T::GlobalState>, RunError>
+where
+    T: Tool + 'static,
+    T::GlobalState: 'static,
+{
+    let client = dbt_client().ok_or_else(|| {
+        RunError::Refused(
+            "the DBT client was not found: set REVERIE_DBT_CLIENT, or build it with \
+             reverie-dbt/scripts/build-client.sh"
+                .to_owned(),
+        )
+    })?;
+    let runner = reverie_dbt::DbtRunner::new(reverie_dbt::bundled_drrun_path(), client)?;
+    let mut command = std::process::Command::new(&args.program);
+    command.args(&args.program_args);
+    if args.no_host_envs {
+        command.env_clear();
+        command.env("PATH", "/bin/:/usr/bin");
+    }
+    command.envs(args.envs.iter().cloned());
+    command.env(reverie_dbt::TOOL_ENV, tool);
+    let (output, global_state) = runner
+        .output_with_global::<T::GlobalState>(&command, config)
+        .await?;
+    use std::os::unix::process::ExitStatusExt as _;
+    let status = ExitStatus::from_raw(output.status.into_raw());
+    Ok(Run {
+        status,
+        exit_code: exit_code(status),
+        global_state,
+        captured: Some((output.stdout, output.stderr)),
     })
 }
 

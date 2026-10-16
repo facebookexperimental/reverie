@@ -25,6 +25,15 @@ pub mod sync_rpc;
 #[cfg(feature = "prototype-runtime")]
 mod tools;
 
+/// Names the shared example tool (reverie-examples) the prototype runtime
+/// hosts, as the example preload names it: `counter1` or `recorder`. The
+/// launcher holds the tool's GlobalState and serves it over the coordinator
+/// socket ([`DbtRunner::output_with_global`]). Any other name ends the run by
+/// name. `HERMIT_DBT_COUNTER1_EXACT` and `HERMIT_DBT_COUNTER2_EXACT` select
+/// `counter1` and `counter2` as before, with the runtime's own in-process
+/// GlobalState.
+pub const TOOL_ENV: &str = "REVERIE_DBT_TOOL";
+
 use std::ffi::c_void;
 use std::future::Future;
 use std::path::Path;
@@ -1866,53 +1875,44 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
 
         let raw_args = unsafe { std::slice::from_raw_parts(args, 6) };
 
+        if tools::recorder_enabled() {
+            return unsafe {
+                pre_syscall_with_unit_tool(
+                    tools::recorder_tool(),
+                    tools::recorder_global(),
+                    context,
+                    tid,
+                    pid,
+                    sysnum,
+                    raw_args,
+                    branches,
+                    result,
+                    deferred_sysnum,
+                    deferred_args,
+                    invoke_syscall,
+                    read_registers,
+                    write_registers,
+                )
+            };
+        }
         if tools::counter1_exact_enabled() {
-            let syscall = Syscall::from_raw(
-                Sysno::from(sysnum as i32),
-                SyscallArgs::new(
-                    raw_args[0] as usize,
-                    raw_args[1] as usize,
-                    raw_args[2] as usize,
-                    raw_args[3] as usize,
-                    raw_args[4] as usize,
-                    raw_args[5] as usize,
-                ),
-            );
-            let mut thread_state = ();
-            let outcome = run_tool_syscall(
-                tools::counter1_exact_tool(),
-                context as usize,
-                Pid::from_raw(tid),
-                Pid::from_raw(pid),
-                branches,
-                &mut thread_state,
-                tools::counter1_exact_global(),
-                &(),
-                syscall,
-                invoke_syscall,
-                read_registers,
-                write_registers,
-            );
-            return match outcome {
-                Ok(DbtSyscallOutcome::ExecuteOriginal(syscall)) => {
-                    unsafe { write_deferred_syscall(syscall, deferred_sysnum, deferred_args) };
-                    2
-                }
-                Ok(DbtSyscallOutcome::Suppress(value)) => {
-                    unsafe { result.write(value) };
-                    TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
-                    1
-                }
-                Err(Error::Errno(errno)) => {
-                    unsafe { result.write(-(errno.into_raw() as i64)) };
-                    TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
-                    1
-                }
-                Err(_) => {
-                    unsafe { result.write(-(Errno::EIO.into_raw() as i64)) };
-                    TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
-                    1
-                }
+            return unsafe {
+                pre_syscall_with_unit_tool(
+                    tools::counter1_exact_tool(),
+                    tools::counter1_exact_global(),
+                    context,
+                    tid,
+                    pid,
+                    sysnum,
+                    raw_args,
+                    branches,
+                    result,
+                    deferred_sysnum,
+                    deferred_args,
+                    invoke_syscall,
+                    read_registers,
+                    write_registers,
+                )
             };
         }
 
@@ -2157,6 +2157,85 @@ fn refuse_legacy_background_init(emitter: Option<RuntimeEmitter>) -> ! {
 }
 
 // TODO-HUMAN-REVIEW(PR-66): Confirm process-exit callback ownership semantics.
+/// One syscall through a hosted tool whose thread state is `()` (counter1,
+/// the recorder): the dispatch `reverie_dbt_runtime_pre_syscall` returns, as
+/// that function documents its result.
+///
+/// # Safety
+///
+/// The pointers are `reverie_dbt_runtime_pre_syscall`'s, valid for this call.
+#[cfg(feature = "prototype-runtime")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn pre_syscall_with_unit_tool<T>(
+    tool: &T,
+    global: &T::GlobalState,
+    context: *mut c_void,
+    tid: i32,
+    pid: i32,
+    sysnum: i64,
+    raw_args: &[u64],
+    branches: u64,
+    result: *mut i64,
+    deferred_sysnum: *mut i64,
+    deferred_args: *mut u64,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
+    write_registers: RegisterWriter,
+) -> i32
+where
+    T: Tool<ThreadState = ()>,
+    <T::GlobalState as GlobalTool>::Config: Default,
+{
+    let syscall = Syscall::from_raw(
+        Sysno::from(sysnum as i32),
+        SyscallArgs::new(
+            raw_args[0] as usize,
+            raw_args[1] as usize,
+            raw_args[2] as usize,
+            raw_args[3] as usize,
+            raw_args[4] as usize,
+            raw_args[5] as usize,
+        ),
+    );
+    let mut thread_state = ();
+    let config = Default::default();
+    let outcome = run_tool_syscall(
+        tool,
+        context as usize,
+        Pid::from_raw(tid),
+        Pid::from_raw(pid),
+        branches,
+        &mut thread_state,
+        global,
+        &config,
+        syscall,
+        invoke_syscall,
+        read_registers,
+        write_registers,
+    );
+    match outcome {
+        Ok(DbtSyscallOutcome::ExecuteOriginal(syscall)) => {
+            unsafe { write_deferred_syscall(syscall, deferred_sysnum, deferred_args) };
+            2
+        }
+        Ok(DbtSyscallOutcome::Suppress(value)) => {
+            unsafe { result.write(value) };
+            TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+            1
+        }
+        Err(Error::Errno(errno)) => {
+            unsafe { result.write(-(errno.into_raw() as i64)) };
+            TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+            1
+        }
+        Err(_) => {
+            unsafe { result.write(-(Errno::EIO.into_raw() as i64)) };
+            TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+            1
+        }
+    }
+}
+
 /// Handles process exit for the built-in synchronous prototype runtime.
 #[cfg(feature = "prototype-runtime")]
 #[unsafe(no_mangle)]
@@ -2188,7 +2267,9 @@ pub extern "C" fn reverie_dbt_runtime_ready(_image_generation: u64) -> i32 {
 #[cfg(feature = "prototype-runtime")]
 #[unsafe(no_mangle)]
 pub extern "C" fn reverie_dbt_runtime_name() -> *const libc::c_char {
-    if tools::counter1_exact_enabled() {
+    if tools::recorder_enabled() {
+        c"Recorder".as_ptr()
+    } else if tools::counter1_exact_enabled() {
         c"Counter1".as_ptr()
     } else if tools::counter2_exact_enabled() {
         c"CounterLocal".as_ptr()

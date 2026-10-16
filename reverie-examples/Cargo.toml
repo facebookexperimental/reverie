@@ -12,7 +12,8 @@
 # validation. Keep the internal target synchronized before the next export.
 # The cross-backend end-to-end check (reverie-examples/e2e/) adds the OSS-only
 # recorder and reverie-e2e-compare binaries and the recorder's nix dependency.
-# counter1 and counter2 take --backend, which replaces the OSS-only
+# The reverie-dbt dependency (DbtRunner, without its prototype runtime) runs the
+# tools on DBT. counter1 and counter2 take --backend, which replaces the OSS-only
 # reverie-kvm-counter1/2 and reverie-e9patch-counter2 launchers.
 # Keep the internal target synchronized before the next export.
 
@@ -91,6 +92,7 @@ clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "w
 libc = "0.2.186"
 nix = { version = "0.30.1", features = ["ptrace", "signal"] }
 reverie = { version = "0.4.0", path = "../reverie", package = "reverie-core" }
+reverie-dbt = { version = "0.4.0", path = "../reverie-dbt", default-features = false }
 reverie-e9patch = { version = "0.4.0", path = "../reverie-e9patch", default-features = false }
 reverie-kvm = { version = "0.4.0", path = "../reverie-kvm" }
 reverie-liteinst = { version = "0.4.0", path = "../reverie-liteinst", default-features = false }
