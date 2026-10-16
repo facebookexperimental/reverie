@@ -3212,7 +3212,7 @@ mod tests {
         assert!(stale < original);
 
         let prepare = source
-            .split_once("static bool prepare_clone_identity(")
+            .split_once("static bool prepare_clone_birth(")
             .unwrap()
             .1
             .split_once("static int32_t complete_clone_birth")
