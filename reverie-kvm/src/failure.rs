@@ -35,6 +35,7 @@ use reverie::GlobalTool;
 use reverie::Pid;
 
 use crate::Error;
+use crate::error::ErrorExt;
 
 pub(crate) type FailureSubscription = Shared<oneshot::Receiver<()>>;
 

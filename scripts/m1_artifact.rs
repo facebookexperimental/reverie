@@ -712,8 +712,8 @@ fn content_manifest_relative(image_kind: FixedImageKind) -> &'static str {
 const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 18] = [
     (
         "Cargo.toml",
-        873,
-        "e078175b3f523e725ece5adf62cb7d282ab3dcbad74dbadf360b0ba4defddc1a",
+        897,
+        "d3cbec1921c78c917234f677ea97798abd1772198ae55244dbd3ec4bc9a1e65c",
     ),
     (
         "reverie-liteinst-artifact/Cargo.toml",

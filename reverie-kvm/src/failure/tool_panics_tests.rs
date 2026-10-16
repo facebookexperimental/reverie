@@ -21,6 +21,7 @@ use reverie::Pid;
 
 use super::ToolPanics;
 use crate::Error;
+use crate::error::ErrorExt;
 use crate::failure::FailureContext;
 use crate::failure::RunFailure;
 use crate::failure::owned_future::CaughtFuture;

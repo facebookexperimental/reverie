@@ -50,6 +50,8 @@ use kvm_ioctls::VcpuFd;
 use super::failure;
 use super::protocol_failure;
 use crate::Result;
+#[cfg(test)]
+use crate::error::ErrorExt;
 
 const SIGNAL: libc::c_int = 64;
 

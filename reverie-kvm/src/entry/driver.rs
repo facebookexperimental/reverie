@@ -22,6 +22,7 @@ use super::owner::DriverOwner;
 use super::owner::DriverScope;
 use crate::Error;
 use crate::Result;
+use crate::error::ErrorExt;
 use crate::failure::references_shared_error;
 use crate::vm::KvmBackend;
 

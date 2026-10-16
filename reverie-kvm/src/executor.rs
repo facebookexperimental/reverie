@@ -44,6 +44,7 @@ use crate::elf::TASK_COMM_LEN;
 use crate::elf::initialize_regular_create_directory_policy;
 use crate::elf::load_static_elf_with_execfn;
 use crate::elf::resolve_executable_path;
+use crate::error::ErrorExt;
 use crate::memory::AllocationCursors;
 use crate::memory::MMAP_BASE;
 use crate::memory::RegionKind;
@@ -98,16 +99,8 @@ const MAX_HOST_IO: usize = 16 * 1024 * 1024;
 const MAX_CAPTURED_OUTPUT: usize = 64 * 1024 * 1024;
 const PAGE_SIZE: u64 = 4096;
 const MAX_RW_COUNT: usize = (i32::MAX as usize) & !(PAGE_SIZE as usize - 1);
-/// The guest's user address limit, which the executor's range checks
-/// enforce.
-pub(crate) const X86_64_GUEST_USER_LIMIT: u64 = (1_u64 << 47) - PAGE_SIZE;
-/// The range rule `KvmGuest` reports as `Guest::user_address_limit`: the
-/// executor's limit, and its vectored-I/O import (`decode_guest_iovecs`)
-/// shortens a lone vector to `MAX_RW_COUNT` before checking it.
-pub(crate) const GUEST_USER_ADDRESS_LIMIT: reverie::UserAddressLimit = reverie::UserAddressLimit {
-    max_end: X86_64_GUEST_USER_LIMIT,
-    caps_single_vector: true,
-};
+pub(crate) use reverie_kvm_core::layout::GUEST_USER_ADDRESS_LIMIT;
+pub(crate) use reverie_kvm_core::layout::X86_64_GUEST_USER_LIMIT;
 /// Diagnostic carried by this backend's typed refusal of an exec from a thread
 /// that is not its group's leader.
 pub(crate) const NONLEADER_EXEC_REFUSAL: &str = "KVM nonleader exec is unsupported";

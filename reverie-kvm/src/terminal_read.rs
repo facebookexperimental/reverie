@@ -38,6 +38,7 @@ use crate::Error;
 use crate::Result;
 use crate::SyscallRequest;
 use crate::entry::driver::EntryDriverWatch;
+use crate::error::ErrorExt;
 use crate::failure::owned_future::CaughtFuture;
 use crate::failure::owned_future::PanicPayload;
 use crate::failure::tool_panics::ToolPanics;

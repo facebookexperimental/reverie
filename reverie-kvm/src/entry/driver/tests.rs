@@ -16,6 +16,7 @@ use reverie::Pid;
 
 use super::*;
 use crate::entry::EntryOrigin;
+use crate::error::ErrorExt;
 use crate::failure::FailureContext;
 use crate::failure::RunFailure;
 

@@ -13,6 +13,7 @@ use std::cell::Cell;
 use std::sync::atomic::AtomicUsize;
 
 use super::*;
+use crate::error::ErrorExt;
 use crate::failure::owned_future::CaughtFuture;
 use crate::failure::owned_future::PanicPayload;
 use crate::failure::tool_panics::ToolPanics;

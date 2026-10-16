@@ -13,6 +13,7 @@ use kvm_bindings::kvm_fpu;
 use kvm_bindings::kvm_msr_entry;
 use kvm_bindings::kvm_segment;
 use kvm_ioctls::VcpuFd;
+pub(crate) use reverie_kvm_core::layout::*;
 
 use crate::Error;
 use crate::GuestMemory;
@@ -27,71 +28,6 @@ use crate::syscall::RETURN_R11_WORD;
 use crate::syscall::RETURN_RCX_WORD;
 use crate::syscall::RETURN_RIP_WORD;
 use crate::syscall::SAVED_RBX_WORD;
-
-const PAGE_SIZE: u64 = 4096;
-const LARGE_PAGE_SIZE: u64 = 2 * 1024 * 1024;
-const PAGE_DIRECTORY_SPAN: u64 = 1024 * 1024 * 1024;
-const PAGE_DIRECTORY_ADDRESSES: [u64; 3] = [0x4000, 0x9000, 0xe000];
-const FIRST_PAGE_TABLE_ADDRESS: u64 = 0;
-const MAX_IDENTITY_MAP: u64 = PAGE_DIRECTORY_SPAN * PAGE_DIRECTORY_ADDRESSES.len() as u64;
-
-const GDT_ADDRESS: u64 = 0x1000;
-const PML4_ADDRESS: u64 = 0x2000;
-const PDPT_ADDRESS: u64 = 0x3000;
-pub(crate) const SYSCALL_TRAMPOLINE_ADDRESS: u64 = 0x5000;
-pub(crate) const SYSCALL_FRAME_ADDRESS: u64 = 0x6000;
-pub(crate) const PROGRAM_HEADERS_ADDRESS: u64 = 0x7000;
-const TSS_ADDRESS: u64 = 0x8000;
-const IDT_ADDRESS: u64 = 0xa000;
-const EXCEPTION_STUB_ADDRESS: u64 = 0xb000;
-const EXCEPTION_STACK_BOTTOM: u64 = 0xc000;
-const EXCEPTION_STACK_TOP: u64 = 0xd000;
-pub(crate) const TOOL_STACK_TOP: u64 = 0xe000;
-pub(crate) const TOOL_STACK_SIZE: u64 = PAGE_SIZE;
-// Includes the 0xe000..0xf000 third page directory and 160 private
-// trampoline/frame pairs used by concurrent KVM guest threads.
-// AUTONOMOUS-BOT-IMPLEMENTED: Reserve transport slots for savevm worker pools.
-// TODO-HUMAN-REVIEW(PR-173): Review the bounded per-thread transport layout.
-pub(crate) const THREAD_SYSCALL_AREA_START: u64 = 0xf000;
-pub(crate) const THREAD_SYSCALL_AREA_STRIDE: u64 = 2 * PAGE_SIZE;
-pub(crate) const MAX_GUEST_THREADS: u64 = 160;
-// AUTONOMOUS-BOT-IMPLEMENTED: Provide a kernel-note vDSO for glibc os-version discovery.
-// TODO-HUMAN-REVIEW(PR-266): Review the guest vDSO placement and note contents.
-// A single read-only page holding the canonical vDSO
-// (`reverie::vdso::canonical_vdso_image`), the image every backend maps in
-// place of the host kernel's. glibc's loader reaches it through
-// `AT_SYSINFO_EHDR`, reads its kernel-version note (`_dl_discover_osversion`)
-// instead of calling `uname(2)`, and looks up its functions, each a stub that
-// issues the syscall. The page sits inside the boot-reserved region (below
-// `BOOT_RESERVED_END`), so guest brk/mmap never allocate over it and the
-// user-memory zeroing leaves it intact. It is covered by the identity map
-// (present + user, executable), so the guest reads and runs it directly
-// without an executor round-trip.
-pub(crate) const VDSO_ADDRESS: u64 =
-    THREAD_SYSCALL_AREA_START + THREAD_SYSCALL_AREA_STRIDE * MAX_GUEST_THREADS;
-// Keep the established syscall-transport and vDSO addresses unchanged. Each
-// worker gets one Tool scratch page after the vDSO, indexed by the same slot
-// that owns its private syscall transport.
-pub(crate) const THREAD_TOOL_STACK_AREA_START: u64 = VDSO_ADDRESS + PAGE_SIZE;
-// The pool of page-table pages that map the user windows (`install_user_windows`):
-// the stack window below TASK_SIZE, the mmap window below mmap_base, a PIE
-// main image's window at ELF_ET_DYN_BASE, and the split of an identity large
-// page that straddles the identity limit. 15 pages keep BOOT_RESERVED_END below
-// 2 MiB, where images load.
-const WINDOW_TABLE_POOL_ADDRESS: u64 =
-    THREAD_TOOL_STACK_AREA_START + TOOL_STACK_SIZE * MAX_GUEST_THREADS;
-const WINDOW_TABLE_POOL_PAGES: u64 = 15;
-pub(crate) const BOOT_RESERVED_END: u64 =
-    WINDOW_TABLE_POOL_ADDRESS + WINDOW_TABLE_POOL_PAGES * PAGE_SIZE;
-const _: () = {
-    assert!(TOOL_STACK_TOP <= THREAD_SYSCALL_AREA_START);
-    assert!(
-        THREAD_SYSCALL_AREA_START + THREAD_SYSCALL_AREA_STRIDE * MAX_GUEST_THREADS <= VDSO_ADDRESS
-    );
-    assert!(VDSO_ADDRESS + PAGE_SIZE <= THREAD_TOOL_STACK_AREA_START);
-    assert!(VDSO_ADDRESS == reverie::vdso::CANONICAL_VDSO_ADDRESS);
-    assert!(reverie::vdso::CANONICAL_VDSO_SIZE <= PAGE_SIZE);
-};
 
 /// Returns the exclusive upper address of the Tool scratch page assigned to a
 /// guest thread's transport slot.

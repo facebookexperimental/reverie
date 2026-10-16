@@ -1701,6 +1701,7 @@ mod tests {
     use super::*;
     use crate::GuestMemory;
     use crate::SyscallRequest;
+    use crate::error::ErrorExt;
     use crate::signal::KernelSigaction;
     use crate::signal::KernelSigset;
 

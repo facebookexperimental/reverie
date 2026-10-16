@@ -30,6 +30,7 @@ use futures::channel::oneshot;
 use futures::future::Shared;
 
 use crate::Error;
+use crate::error::ErrorExt;
 use crate::failure::FailureContext;
 
 pub(crate) mod driver;

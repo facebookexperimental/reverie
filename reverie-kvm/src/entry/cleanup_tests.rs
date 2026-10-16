@@ -19,6 +19,7 @@ use kvm_ioctls::VcpuExit;
 
 use super::*;
 use crate::clock::RunProbe;
+use crate::error::ErrorExt;
 use crate::vm::KvmBackend;
 
 const WAIT: Duration = Duration::from_secs(5);

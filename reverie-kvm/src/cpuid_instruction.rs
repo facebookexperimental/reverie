@@ -17,6 +17,7 @@ use reverie::CpuIdResult;
 
 use crate::Error;
 use crate::Result;
+use crate::error::ErrorExt;
 
 const PLATFORM_INFO: u32 = 0xce;
 const MISC_FEATURES_ENABLES: u32 = 0x140;

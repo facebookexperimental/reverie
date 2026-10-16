@@ -45,6 +45,7 @@ use crate::Result;
 use crate::entry::Participant;
 use crate::entry::RunEntry;
 use crate::entry::owner::OperationOrigin;
+use crate::error::ErrorExt;
 use crate::failure::FailureContext;
 use crate::memory::GuestMemory;
 

@@ -77,6 +77,7 @@ use crate::elf::initial_thread_name;
 use crate::elf::load_static_elf;
 use crate::elf::load_static_elf_file;
 use crate::elf::load_static_elf_with_execfn;
+use crate::error::ErrorExt;
 use crate::executor::AbandonedRuns;
 use crate::executor::CapturedOutput;
 #[cfg(test)]

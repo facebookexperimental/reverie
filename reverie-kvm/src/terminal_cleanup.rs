@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use futures::task::AtomicWaker;
 
+use crate::error::ErrorExt;
 use crate::executor::AbandonedRuns;
 use crate::executor::ChildThread;
 use crate::executor::DroppedRunReaper;

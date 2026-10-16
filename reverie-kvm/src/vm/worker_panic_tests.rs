@@ -21,6 +21,7 @@ use std::task::Poll;
 use std::time::Duration;
 
 use super::*;
+use crate::error::ErrorExt;
 use crate::failure::FailureContext;
 use crate::failure::RunFailure;
 use crate::failure::owned_future::PanicPayload;

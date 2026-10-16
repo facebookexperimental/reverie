@@ -51,6 +51,7 @@ use crate::bootstrap::process_syscall_return_registers;
 use crate::bootstrap::set_user_segment_base;
 use crate::bootstrap::stage_process_signal_return;
 use crate::bootstrap::stage_process_syscall_return;
+use crate::error::ErrorExt;
 use crate::executor::ChildStartCancellation;
 #[cfg(test)]
 use crate::executor::ChildStartCommand;

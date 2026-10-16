@@ -1404,6 +1404,7 @@ mod tests {
     use reverie::syscalls::AddrSliceMut;
 
     use super::*;
+    use crate::error::ErrorExt;
 
     const BASE: u64 = 0x10000;
     const P: u64 = PAGE_SIZE as u64;

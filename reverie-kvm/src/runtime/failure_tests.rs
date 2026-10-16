@@ -13,6 +13,7 @@ use std::time::Instant;
 use futures::channel::oneshot;
 
 use super::*;
+use crate::error::ErrorExt;
 use crate::vm::GuestThreadGroup;
 
 #[derive(Default)]

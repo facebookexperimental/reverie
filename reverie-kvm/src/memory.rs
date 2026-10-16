@@ -32,6 +32,7 @@ use crate::entry::EntryOrigin;
 use crate::entry::MappingGeneration;
 use crate::entry::RetainedOperand;
 use crate::entry::owner::OperationOrigin;
+use crate::error::ErrorExt;
 use crate::failure::FailureContext;
 
 const PAGE_SIZE: usize = 4096;

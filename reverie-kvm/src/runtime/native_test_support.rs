@@ -15,6 +15,7 @@
 use futures::future::BoxFuture;
 
 use super::*;
+use crate::error::ErrorExt;
 use crate::executor::ChildCompletionSlot;
 use crate::executor::ChildStartCommand;
 use crate::executor::ChildThread;
