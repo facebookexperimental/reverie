@@ -15,10 +15,11 @@
 //! The split is step 2 of the minimal provider seam
 //! (<https://github.com/rrnewton/hermit/issues/4485>, epic
 //! <https://github.com/rrnewton/hermit/issues/4492>); step U6a moved the core
-//! to its own crate, and step E1 moved it into Reverie's core. The KVM
-//! backend's injection adapter (`GuestSyscallExecutor` in `runtime.rs`) used
-//! to be one 38-method trait mixing three different things. It is now split
-//! by meaning:
+//! to its own crate, step E1 moved it into Reverie's core, and step E2a made
+//! its `execute` an `async` method (implemented in `#[reverie::provider]`
+//! blocks). The KVM backend's injection adapter (`GuestSyscallExecutor` in
+//! `runtime.rs`) used to be one 38-method trait mixing three different
+//! things. It is now split by meaning:
 //!
 //! - [`LinuxProvider`]: what any kernel that executes Linux syscalls for a
 //!   guest can answer, whether it is today's emulator, the host kernel, or a

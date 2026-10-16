@@ -42,8 +42,8 @@
 //!    backend; the [`Backend`] trait spells out exactly what any alternative
 //!    backend must provide.
 //!
-//! The [`provider`] module defines the interface of the Linux syscall
-//! provider beneath a backend's `Guest::inject`: the
+//! The [`provider`](mod@provider) module defines the interface of the Linux
+//! syscall provider beneath a backend's `Guest::inject`: the
 //! [`provider::LinuxProvider`] trait and the memory interfaces it uses. Today
 //! only the KVM backend implements and calls it; see the module documentation.
 //!
@@ -138,6 +138,13 @@ pub use async_trait::async_trait as global_tool;
 /// NOTE: This is just an alias for `async_trait` for now, but may be extended in
 /// the future.
 pub use async_trait::async_trait as backend;
+/// Required for `impl LinuxProvider for MyProvider` blocks, because
+/// [`provider::LinuxProvider::execute`] is an `async` trait method.
+///
+/// NOTE: This is just an alias for `async_trait` for now, as `tool` and
+/// `backend` are. The module of the same name, [`provider`](mod@provider),
+/// defines the trait.
+pub use async_trait::async_trait as provider;
 // Reexport nix Signal type.
 pub use nix::sys::signal::Signal;
 /// CPUID result.

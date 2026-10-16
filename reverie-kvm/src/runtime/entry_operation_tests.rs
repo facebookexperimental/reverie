@@ -352,11 +352,16 @@ struct ProbeExecutor {
     pending_dequeue: bool,
     ledger: Vec<reverie::SignalDequeue>,
 }
+#[reverie::provider]
 impl LinuxProvider for ProbeExecutor {
     type Memory = GuestMemory;
     type Error = crate::Error;
 
-    fn execute(&mut self, request: &ProviderRequest, _: &GuestMemory) -> Result<ProviderOutcome> {
+    async fn execute(
+        &mut self,
+        request: &ProviderRequest,
+        _: &GuestMemory,
+    ) -> Result<ProviderOutcome> {
         let request = SyscallRequest::from_provider(request);
         assert_eq!(request.number(), libc::SYS_close as u64);
         assert_eq!(request.args()[0], 9);

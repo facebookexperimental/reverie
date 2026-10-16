@@ -105,10 +105,37 @@ pub enum ProviderOutcome {
 /// provider per run, concurrency, the error model and the determinism
 /// obligations). This trait is not generic over the Tool: creating Tool state
 /// for a new child is backend work.
+///
+/// [`LinuxProvider::execute`] is an `async` method, so an implementation is
+/// written inside a `#[reverie::provider]` block (an alias of
+/// `async_trait`, as `#[reverie::tool]` is):
+///
+/// ```ignore
+/// #[reverie::provider]
+/// impl LinuxProvider for MyProvider {
+///     type Memory = MyMemory;
+///     type Error = MyError;
+///
+///     async fn execute(
+///         &mut self,
+///         request: &SyscallRequest,
+///         memory: &MyMemory,
+///     ) -> Result<ProviderOutcome, MyError> {
+///         // ...
+///     }
+/// }
+/// ```
+///
+/// The trait stays dyn-compatible: a backend may call it through
+/// `&mut dyn LinuxProvider<Memory = _, Error = _>`.
+#[async_trait::async_trait]
 pub trait LinuxProvider: Send + Sync {
     /// The issuing task's guest memory as the backend hands it to the
     /// provider for one call.
-    type Memory: ?Sized;
+    ///
+    /// It is [`Sync`] because [`LinuxProvider::execute`]'s future holds a
+    /// shared reference to it and must itself be [`Send`].
+    type Memory: ?Sized + Sync;
     /// A broken backend or provider invariant that ends the run.
     type Error;
 
@@ -123,6 +150,20 @@ pub trait LinuxProvider: Send + Sync {
     /// admission checks, on the issuing task's host thread (see the module
     /// documentation's concurrency rule for what may run at the same time).
     ///
+    /// The method is `async` because a provider whose kernel is the host
+    /// kernel may have to wait for the guest task itself to run the call, as
+    /// the ptrace backend waits for a tracee stop. The returned future is
+    /// [`Send`], because the backend awaits it inside `Guest::inject`, whose
+    /// future is `Send` ([`Guest`](crate::Guest) is a `Send` trait with `Send`
+    /// futures). That is why [`LinuxProvider::Memory`] must be [`Sync`]: the
+    /// future holds `&Self::Memory`. This is unlike
+    /// [`Backend::run`](crate::Backend::run), whose future need not be `Send`. The backend polls the future on the issuing
+    /// task's host thread. A provider that never awaits completes on the first
+    /// poll, so making the method `async` adds no suspension point to it. A
+    /// provider that does await must assume the backend can drop the future at
+    /// any of its await points, and must not leave its own state half
+    /// committed across one.
+    ///
     /// - `Ok(ProviderOutcome::Return(-errno))` is a Linux error and is
     ///   returned to the Tool as that errno.
     /// - `Err` is a broken invariant that ends the run; the backend must not
@@ -135,7 +176,7 @@ pub trait LinuxProvider: Send + Sync {
     /// - A request the provider does not implement is answered as the module
     ///   documentation's error model says, with a typed refusal recorded for
     ///   [`LinuxProvider::take_unsupported_refusal`].
-    fn execute(
+    async fn execute(
         &mut self,
         request: &SyscallRequest,
         memory: &Self::Memory,

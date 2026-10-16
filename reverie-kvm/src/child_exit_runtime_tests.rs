@@ -28,11 +28,12 @@ struct QueueExecutor {
     outcome: ChildExitSignalOutcome,
     calls: usize,
 }
+#[reverie::provider]
 impl LinuxProvider for QueueExecutor {
     type Memory = GuestMemory;
     type Error = crate::Error;
 
-    fn execute(&mut self, _: &ProviderRequest, _: &GuestMemory) -> Result<ProviderOutcome> {
+    async fn execute(&mut self, _: &ProviderRequest, _: &GuestMemory) -> Result<ProviderOutcome> {
         panic!("queue operation executed a guest syscall")
     }
 }

@@ -21,11 +21,12 @@ impl Tool for AdapterTool {
     type ThreadState = Box<()>;
 }
 struct RefusingExecutor;
+#[reverie::provider]
 impl LinuxProvider for RefusingExecutor {
     type Memory = GuestMemory;
     type Error = crate::Error;
 
-    fn execute(&mut self, _: &ProviderRequest, _: &GuestMemory) -> Result<ProviderOutcome> {
+    async fn execute(&mut self, _: &ProviderRequest, _: &GuestMemory) -> Result<ProviderOutcome> {
         panic!("terminal cancellation executed a syscall")
     }
 }
@@ -64,11 +65,12 @@ fn terminal_read_injection_keeps_nonreturning_cancellation_and_typed_failures() 
         completions: usize,
         wrapped: usize,
     }
+    #[reverie::provider]
     impl LinuxProvider for ReadExecutor {
         type Memory = GuestMemory;
         type Error = crate::Error;
 
-        fn execute(
+        async fn execute(
             &mut self,
             request: &ProviderRequest,
             _: &GuestMemory,
@@ -709,11 +711,12 @@ fn wait_group_exit_injection_is_nonreturning_and_failure_still_wins() {
         fail: Option<FailurePublication>,
         wrapped: usize,
     }
+    #[reverie::provider]
     impl LinuxProvider for WaitExecutor {
         type Memory = GuestMemory;
         type Error = crate::Error;
 
-        fn execute(
+        async fn execute(
             &mut self,
             request: &ProviderRequest,
             _: &GuestMemory,

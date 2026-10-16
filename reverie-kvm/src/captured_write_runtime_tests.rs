@@ -27,11 +27,12 @@ impl Tool for Upper {
 }
 
 struct Unsupported;
+#[reverie::provider]
 impl LinuxProvider for Unsupported {
     type Memory = GuestMemory;
     type Error = crate::Error;
 
-    fn execute(&mut self, _: &ProviderRequest, _: &GuestMemory) -> Result<ProviderOutcome> {
+    async fn execute(&mut self, _: &ProviderRequest, _: &GuestMemory) -> Result<ProviderOutcome> {
         panic!("capability query executed a syscall")
     }
 }
@@ -50,11 +51,12 @@ struct Capable {
     site: CallbackSignalSite,
     queries: AtomicU64,
 }
+#[reverie::provider]
 impl LinuxProvider for Capable {
     type Memory = GuestMemory;
     type Error = crate::Error;
 
-    fn execute(&mut self, _: &ProviderRequest, _: &GuestMemory) -> Result<ProviderOutcome> {
+    async fn execute(&mut self, _: &ProviderRequest, _: &GuestMemory) -> Result<ProviderOutcome> {
         panic!("capability query executed a syscall")
     }
 }

@@ -399,11 +399,12 @@ struct DirectSyscallExecutor<'a> {
 /// the executor's signal parking protocol and reports no heap. That is what
 /// it has always answered; it shows that `KvmGuest::inject` works with a
 /// provider other than the static-ELF executor.
+#[reverie::provider]
 impl LinuxProvider for DirectSyscallExecutor<'_> {
     type Memory = GuestMemory;
     type Error = crate::Error;
 
-    fn execute(
+    async fn execute(
         &mut self,
         request: &ProviderRequest,
         memory: &GuestMemory,
@@ -631,6 +632,10 @@ impl Drop for StaticElfSyscallExecutor<'_> {
 ///   provider-neutral per-call context, because
 ///   [`crate::provider_memory::GuestMemoryAccess`] lends operands through a
 ///   generic associated type and so cannot yet be a trait object.
+/// - `execute` never awaits. It runs the executor synchronously on the
+///   vCPU's host thread, which a blocking read still blocks, exactly as when
+///   the method was synchronous, and so its future completes on the first
+///   poll.
 /// - Only `Return` is produced. A staged segment base, process action
 ///   (fork, clone, exec) or exit is left in the executor's side channels and
 ///   consumed after `execute` by `complete_injection` and the vCPU loop.
@@ -657,11 +662,12 @@ impl Drop for StaticElfSyscallExecutor<'_> {
 ///   own clock, random source, uname and credentials) instead of taking them
 ///   from the Tool. That deviates from the provider contract and is
 ///   scheduled for deletion, not for preservation.
+#[reverie::provider]
 impl LinuxProvider for StaticElfSyscallExecutor<'_> {
     type Memory = GuestMemory;
     type Error = crate::Error;
 
-    fn execute(
+    async fn execute(
         &mut self,
         request: &ProviderRequest,
         memory: &GuestMemory,
@@ -1652,10 +1658,13 @@ impl<T: Tool> Guest<T> for KvmGuest<'_, T> {
             return std::future::pending().await;
         }
         self.admit_ordinary_operation().await;
-        // The syscall itself goes only through the run's Linux provider.
+        // The syscall itself goes only through the run's Linux provider. Its
+        // `execute` future is awaited at once; today's providers never await
+        // inside it, so it completes on its first poll.
         let provider: &mut dyn LinuxProvider<Memory = GuestMemory, Error = Error> =
             &mut *self.executor;
-        let raw = match provider.execute(request.as_provider(), &self.memory) {
+        let outcome = provider.execute(request.as_provider(), &self.memory).await;
+        let raw = match outcome {
             Ok(ProviderOutcome::Return(raw)) => {
                 self.unsupported_refusal = provider.take_unsupported_refusal();
                 raw
@@ -7304,11 +7313,16 @@ mod tests {
 
     struct FailingSyscallExecutor;
 
+    #[reverie::provider]
     impl LinuxProvider for FailingSyscallExecutor {
         type Memory = GuestMemory;
         type Error = crate::Error;
 
-        fn execute(&mut self, _: &ProviderRequest, _: &GuestMemory) -> Result<ProviderOutcome> {
+        async fn execute(
+            &mut self,
+            _: &ProviderRequest,
+            _: &GuestMemory,
+        ) -> Result<ProviderOutcome> {
             Err(Error::FamilyWaitLedgerMismatch {
                 parent: reverie::SignalProcessId {
                     tgid: Pid::from_raw(1),
@@ -7331,11 +7345,12 @@ mod tests {
         }
     }
 
+    #[reverie::provider]
     impl LinuxProvider for SideEffectingExecutor {
         type Memory = GuestMemory;
         type Error = crate::Error;
 
-        fn execute(
+        async fn execute(
             &mut self,
             request: &ProviderRequest,
             _memory: &GuestMemory,
@@ -7404,11 +7419,12 @@ mod tests {
         state: TailInjectionSideEffects,
     }
 
+    #[reverie::provider]
     impl LinuxProvider for PermissiveSideEffectingExecutor {
         type Memory = GuestMemory;
         type Error = crate::Error;
 
-        fn execute(
+        async fn execute(
             &mut self,
             request: &ProviderRequest,
             _memory: &GuestMemory,
@@ -7518,11 +7534,16 @@ mod tests {
         "test provider refusal",
     );
 
+    #[reverie::provider]
     impl LinuxProvider for RefusingThenSupportingProvider {
         type Memory = GuestMemory;
         type Error = crate::Error;
 
-        fn execute(&mut self, _: &ProviderRequest, _: &GuestMemory) -> Result<ProviderOutcome> {
+        async fn execute(
+            &mut self,
+            _: &ProviderRequest,
+            _: &GuestMemory,
+        ) -> Result<ProviderOutcome> {
             self.executed += 1;
             if self.executed == 1 {
                 self.refusal = Some(TEST_REFUSAL);

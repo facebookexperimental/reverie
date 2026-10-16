@@ -80,11 +80,12 @@ struct NoInstructions<'a> {
     executor: &'a ElfExecutor,
     failure: FailureContext,
 }
+#[reverie::provider]
 impl LinuxProvider for NoInstructions<'_> {
     type Memory = GuestMemory;
     type Error = crate::Error;
 
-    fn execute(&mut self, _: &ProviderRequest, _: &GuestMemory) -> Result<ProviderOutcome> {
+    async fn execute(&mut self, _: &ProviderRequest, _: &GuestMemory) -> Result<ProviderOutcome> {
         panic!("native Tool control must not inject a guest instruction")
     }
 }
