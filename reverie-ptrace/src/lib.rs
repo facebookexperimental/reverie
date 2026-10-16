@@ -55,6 +55,8 @@ mod injected_syscall;
 mod perf;
 mod poll_on_wake;
 pub mod regs;
+#[cfg(all(test, target_arch = "x86_64"))]
+mod signal_action_boundary_tests;
 mod stack;
 mod stats;
 mod task;
