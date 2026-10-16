@@ -12,11 +12,58 @@ sh-pipe	ptrace	mismatch	rt_sigreturn=ok -> exit_group=?	https://github.com/rrnew
 grep-passwd	ptrace	mismatch	read=4092 -> read=4018	https://github.com/rrnewton/hermit/issues/4485
 # ptrace: python3's startup makes four fewer calls (rt_sigprocmask, mmap, mmap, rt_sigprocmask); cause not identified.
 python3	ptrace	mismatch	rt_sigprocmask=ok -> getrandom=ok	https://github.com/rrnewton/hermit/issues/4485
-# The recorder runner (reverie-examples/backend.rs) hosts no tool on these yet: DBT and SaBRe load one
-# runtime of their own; LiteInst, in-guest-trap and e9patch host a tool only through a preload that
-# compiles it in, which the runner does not drive yet.
-*	e9patch	refused	*	https://github.com/rrnewton/hermit/issues/4485
+# DBT and SaBRe load one runtime or plugin of their own: the runner (reverie-examples/backend.rs) has no
+# generic tool host for them.
 *	sabre	refused	*	https://github.com/rrnewton/hermit/issues/4485
 *	dbt	refused	*	https://github.com/rrnewton/hermit/issues/4485
-*	liteinst	refused	*	https://github.com/rrnewton/hermit/issues/4485
-*	in-guest-trap	refused	*	https://github.com/rrnewton/hermit/issues/4485
+# LiteInst and in-guest-trap host the recorder in the example preload; the comparator aligns their
+# records after the loader's calls, which an in-guest tool cannot see (compare.rs, LATE_START). Then:
+# the tool does not see one brk call (the first difference on most programs); the preload's two
+# descriptors move the program's (openat/creat=3 -> 5); awk's and perl's first visible calls do not
+# appear in the native record in order (no aligned start).
+echo	liteinst	mismatch	brk=ok -> fstat=ok	https://github.com/rrnewton/hermit/issues/4485
+cat-hostname	liteinst	mismatch	brk=ok -> fstat=ok	https://github.com/rrnewton/hermit/issues/4485
+ls-root	liteinst	mismatch	brk=ok -> ioctl=ENOTTY	https://github.com/rrnewton/hermit/issues/4485
+stat-root	liteinst	mismatch	brk=ok -> statx=ok	https://github.com/rrnewton/hermit/issues/4485
+uname	liteinst	mismatch	brk=ok -> uname=ok	https://github.com/rrnewton/hermit/issues/4485
+sh-builtin	liteinst	mismatch	brk=ok -> getresuid=ok	https://github.com/rrnewton/hermit/issues/4485
+sh-fork	liteinst	mismatch	brk=ok -> getresuid=ok	https://github.com/rrnewton/hermit/issues/4485
+head-zero	liteinst	mismatch	brk=ok -> openat=5	https://github.com/rrnewton/hermit/issues/4485
+sort-passwd	liteinst	mismatch	brk=ok -> rt_sigaction=ok	https://github.com/rrnewton/hermit/issues/4485
+grep-passwd	liteinst	mismatch	openat=3 -> openat=5	https://github.com/rrnewton/hermit/issues/4485
+sha256-true	liteinst	mismatch	brk=ok -> openat=5	https://github.com/rrnewton/hermit/issues/4485
+dd-zero	liteinst	mismatch	rt_sigaction=ok -> openat=5	https://github.com/rrnewton/hermit/issues/4485
+seq	liteinst	mismatch	brk=ok -> write=8192	https://github.com/rrnewton/hermit/issues/4485
+sleep	liteinst	mismatch	brk=ok -> clock_nanosleep=ok	https://github.com/rrnewton/hermit/issues/4485
+find-etc	liteinst	mismatch	openat=3 -> openat=5	https://github.com/rrnewton/hermit/issues/4485
+tar-hostname	liteinst	mismatch	creat=3 -> creat=5	https://github.com/rrnewton/hermit/issues/4485
+gzip-hostname	liteinst	mismatch	brk=ok -> getresuid=ok	https://github.com/rrnewton/hermit/issues/4485
+awk	liteinst	mismatch	(no aligned start) -> geteuid=ok	https://github.com/rrnewton/hermit/issues/4485
+perl	liteinst	mismatch	(no aligned start) -> rt_sigaction=ok	https://github.com/rrnewton/hermit/issues/4485
+python3	liteinst	mismatch	openat=3 -> openat=5	https://github.com/rrnewton/hermit/issues/4485
+sh-pipe	liteinst	mismatch	brk=ok -> getresuid=ok	https://github.com/rrnewton/hermit/issues/4485
+echo	in-guest-trap	mismatch	brk=ok -> fstat=ok	https://github.com/rrnewton/hermit/issues/4485
+cat-hostname	in-guest-trap	mismatch	brk=ok -> fstat=ok	https://github.com/rrnewton/hermit/issues/4485
+ls-root	in-guest-trap	mismatch	brk=ok -> ioctl=ENOTTY	https://github.com/rrnewton/hermit/issues/4485
+stat-root	in-guest-trap	mismatch	brk=ok -> statx=ok	https://github.com/rrnewton/hermit/issues/4485
+uname	in-guest-trap	mismatch	brk=ok -> uname=ok	https://github.com/rrnewton/hermit/issues/4485
+sh-builtin	in-guest-trap	mismatch	brk=ok -> getresuid=ok	https://github.com/rrnewton/hermit/issues/4485
+sh-fork	in-guest-trap	mismatch	brk=ok -> getresuid=ok	https://github.com/rrnewton/hermit/issues/4485
+head-zero	in-guest-trap	mismatch	brk=ok -> openat=5	https://github.com/rrnewton/hermit/issues/4485
+sort-passwd	in-guest-trap	mismatch	brk=ok -> rt_sigaction=ok	https://github.com/rrnewton/hermit/issues/4485
+grep-passwd	in-guest-trap	mismatch	openat=3 -> openat=5	https://github.com/rrnewton/hermit/issues/4485
+sha256-true	in-guest-trap	mismatch	brk=ok -> openat=5	https://github.com/rrnewton/hermit/issues/4485
+dd-zero	in-guest-trap	mismatch	rt_sigaction=ok -> openat=5	https://github.com/rrnewton/hermit/issues/4485
+seq	in-guest-trap	mismatch	brk=ok -> write=8192	https://github.com/rrnewton/hermit/issues/4485
+sleep	in-guest-trap	mismatch	brk=ok -> clock_nanosleep=ok	https://github.com/rrnewton/hermit/issues/4485
+find-etc	in-guest-trap	mismatch	openat=3 -> openat=5	https://github.com/rrnewton/hermit/issues/4485
+tar-hostname	in-guest-trap	mismatch	creat=3 -> creat=5	https://github.com/rrnewton/hermit/issues/4485
+gzip-hostname	in-guest-trap	mismatch	brk=ok -> getresuid=ok	https://github.com/rrnewton/hermit/issues/4485
+awk	in-guest-trap	mismatch	(no aligned start) -> geteuid=ok	https://github.com/rrnewton/hermit/issues/4485
+perl	in-guest-trap	mismatch	(no aligned start) -> rt_sigaction=ok	https://github.com/rrnewton/hermit/issues/4485
+python3	in-guest-trap	mismatch	openat=3 -> openat=5	https://github.com/rrnewton/hermit/issues/4485
+sh-pipe	in-guest-trap	mismatch	brk=ok -> getresuid=ok	https://github.com/rrnewton/hermit/issues/4485
+# e9patch's direct path hosts a tool only in a program whose own executable makes syscalls; the corpus's
+# programs make theirs through libc (and gzip is a script).
+*	e9patch	no_result	recorder exit status: 1: Error: direct e9patch Tool hosting requires at least one recovered syscall site	https://github.com/rrnewton/hermit/issues/4485
+gzip-hostname	e9patch	no_result	recorder exit status: 1: Error: direct e9patch Tool hosting requires an ELF main executable	https://github.com/rrnewton/hermit/issues/4485

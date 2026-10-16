@@ -53,6 +53,41 @@ fn ptrace_records_what_native_linux_returns() {
     }
 }
 
+/// The in-guest backends host the recorder in the example preload; a program
+/// whose calls all come after the loader records as natively.
+#[test]
+fn in_guest_backends_host_the_recorder_in_the_example_preload() {
+    let directory = tempfile::tempdir().unwrap();
+    for program in [&["/bin/true"][..], &["/bin/false"]] {
+        let native = directory.path().join("native");
+        let output = record("native", program, &native);
+        assert!(output.status.success(), "native {program:?}");
+        let native = std::fs::read_to_string(&native).unwrap();
+        for backend in ["liteinst", "in-guest-trap"] {
+            let path = directory.path().join(backend);
+            let output = record(backend, program, &path);
+            assert!(
+                output.status.success(),
+                "{backend} {program:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let got = std::fs::read_to_string(&path).unwrap();
+            // The loader's calls come before the preload's constructor, so
+            // the backend's record is the end of the native one.
+            let (exit, calls) = got.split_once("\nthread 0\n").unwrap();
+            assert_eq!(
+                exit,
+                native.lines().next().unwrap(),
+                "{backend} {program:?}"
+            );
+            assert!(
+                native.ends_with(calls) && !calls.is_empty(),
+                "{backend} {program:?}:\n{got}\nnative:\n{native}"
+            );
+        }
+    }
+}
+
 #[test]
 fn a_backend_without_a_generic_tool_host_refuses_by_name() {
     let directory = tempfile::tempdir().unwrap();

@@ -1,9 +1,3 @@
-#!/usr/bin/env -S rust-script --force
-//! ```cargo
-//! [package]
-//! edition = "2024"
-//! ```
-
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  * All rights reserved.
@@ -19,7 +13,7 @@
 //! the ledger with its issue or failing this check.
 //!
 //! ```text
-//! rust-script reverie-examples/e2e/compare.rs \
+//! target/debug/reverie-e2e-compare \
 //!     --recorder target/debug/recorder \
 //!     --backends ptrace,kvm,dbt,liteinst,in-guest-trap,sabre,e9patch \
 //!     --corpus reverie-examples/e2e/corpus.tsv \
@@ -103,6 +97,98 @@ fn first_difference(native: &Record, backend: &Record) -> Option<String> {
             let a = expected.get(index).map_or("(end)", String::as_str);
             let b = got.get(index).map_or("(end)", String::as_str);
             return Some(format!("thread {thread} call {index}: {a} -> {b}"));
+        }
+    }
+    if native.threads.len() != backend.threads.len() {
+        return Some(format!(
+            "threads: {} -> {}",
+            native.threads.len(),
+            backend.threads.len()
+        ));
+    }
+    (native.exit != backend.exit).then(|| format!("exit: {} -> {}", native.exit, backend.exit))
+}
+
+/// The backends whose tool runs in the program, from its preload's
+/// constructor: they cannot see the calls the dynamic loader makes before it,
+/// at the start and again after each successful `execve`.
+const LATE_START: &[&str] = &["liteinst", "in-guest-trap", "e9patch"];
+
+/// How many calls, by name, place a late-starting backend's record in the
+/// native one.
+const ALIGNMENT_CALLS: usize = 8;
+
+fn call_name(call: &str) -> &str {
+    call.split_once('=').map_or(call, |(name, _)| name)
+}
+
+/// The first difference between the native record and the record of a
+/// backend in [`LATE_START`]. At the start of the first thread and after each
+/// successful `execve`, the native calls the backend could not see are
+/// skipped: the native record moves forward to the first place where the
+/// longest run of the backend's next call names (at most [`ALIGNMENT_CALLS`],
+/// at least two; names only, as descriptor numbers can differ) appears. From
+/// there every call is compared exactly, as for any backend, so a call the
+/// backend missed after its start is a difference.
+fn first_late_start_difference(native: &Record, backend: &Record) -> Option<String> {
+    for (thread, (expected, got)) in native.threads.iter().zip(&backend.threads).enumerate() {
+        let (mut i, mut j) = (0, 0);
+        let mut align = thread == 0;
+        loop {
+            if align {
+                // The longest run of the backend's next call names, from
+                // ALIGNMENT_CALLS down to two (one would place it anywhere),
+                // found in the native record; its first place there.
+                let found = (2..=(got.len() - j).min(ALIGNMENT_CALLS))
+                    .rev()
+                    .find_map(|window| {
+                        let names: Vec<&str> =
+                            got[j..j + window].iter().map(|c| call_name(c)).collect();
+                        (i..=expected.len().saturating_sub(window)).find(|&k| {
+                            expected[k..k + window]
+                                .iter()
+                                .map(|c| call_name(c))
+                                .eq(names.iter().copied())
+                        })
+                    });
+                // A single call left (an exec'd program whose tool saw only
+                // its `exit_group`) is the thread's last: its last place.
+                let found = found.or_else(|| {
+                    (got.len() - j == 1)
+                        .then(|| {
+                            expected[i..]
+                                .iter()
+                                .rposition(|c| call_name(c) == call_name(&got[j]))
+                                .map(|k| i + k)
+                        })
+                        .flatten()
+                });
+                match found {
+                    Some(k) => i = k,
+                    None if got.len() == j => {}
+                    None => {
+                        let b = got.get(j).map_or("(end)", String::as_str);
+                        return Some(format!(
+                            "thread {thread} call {i}: (no aligned start) -> {b}"
+                        ));
+                    }
+                }
+            }
+            match (expected.get(i), got.get(j)) {
+                (None, None) => break,
+                (Some(a), Some(b)) if a == b => {
+                    align = a == "execve=ok";
+                    i += 1;
+                    j += 1;
+                }
+                (a, b) => {
+                    return Some(format!(
+                        "thread {thread} call {i}: {} -> {}",
+                        a.map_or("(end)", String::as_str),
+                        b.map_or("(end)", String::as_str)
+                    ));
+                }
+            }
         }
     }
     if native.threads.len() != backend.threads.len() {
@@ -281,7 +367,11 @@ fn main() {
                         cell,
                         &dir.join(format!("{backend}.txt")),
                     ) {
-                        Ok(got) => match first_difference(&native, &got) {
+                        Ok(got) => match if LATE_START.contains(&backend.as_str()) {
+                            first_late_start_difference(&native, &got)
+                        } else {
+                            first_difference(&native, &got)
+                        } {
                             None => Outcome {
                                 verdict: "match",
                                 signature: String::new(),

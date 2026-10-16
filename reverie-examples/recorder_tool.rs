@@ -35,6 +35,10 @@ use reverie::syscalls::Sysno;
 use serde::Deserialize;
 use serde::Serialize;
 
+/// The name the example preload's selector knows the recorder by
+/// (`src/lib.rs`), for the in-guest backends.
+pub const NAME: &str = "recorder";
+
 /// The syscalls whose exact return value is compared: byte counts, offsets
 /// and descriptor numbers, which native Linux gives the same in every run.
 pub const EXACT: &[&str] = &[

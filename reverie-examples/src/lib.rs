@@ -47,6 +47,9 @@ mod counter2;
 #[path = "../noop.rs"]
 mod noop;
 #[allow(dead_code)]
+#[path = "../recorder_tool.rs"]
+mod recorder_tool;
+#[allow(dead_code)]
 #[path = "../strace/main.rs"]
 pub(crate) mod strace;
 #[allow(dead_code)]
@@ -228,6 +231,11 @@ unsafe extern "C" fn initialize(
                     &bootstrap.coordinator,
                 )
             },
+            recorder_tool::NAME => unsafe {
+                reverie_e9patch::install_tool_from_bootstrap::<recorder_tool::Recorder>(
+                    &bootstrap.coordinator,
+                )
+            },
             other => fail(&format!("unknown e9patch bootstrap tool {other:?}")),
         };
         if let Err(error) = result {
@@ -296,6 +304,9 @@ unsafe extern "C" fn initialize(
         },
         "noop" => unsafe {
             reverie_liteinst::install_tool_from_bootstrap::<noop::NoopTool>(&socket)
+        },
+        recorder_tool::NAME => unsafe {
+            reverie_liteinst::install_tool_from_bootstrap::<recorder_tool::Recorder>(&socket)
         },
         other => fail(&format!("unknown example tool {other:?}")),
     };
