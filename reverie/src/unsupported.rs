@@ -35,6 +35,11 @@ pub enum UnsupportedOperation {
     /// lifetime to the guest's description, so that a forwarded host lock
     /// would be held or released at the wrong time.
     Flock,
+    /// A signal delivery (`kill`, `tkill`, `tgkill`, `rt_sigqueueinfo` or
+    /// `rt_tgsigqueueinfo`) the backend cannot perform, for example to
+    /// another process. A backend that refuses it queued no signal and
+    /// changed no signal state; the refusal's diagnostic names the reason.
+    Signal,
 }
 
 /// A backend's refusal of an injected syscall that it cannot perform, as

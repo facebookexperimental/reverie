@@ -156,6 +156,24 @@ fn flock_refusal(request: &SyscallRequest, result: i64) -> Option<reverie::Unsup
     })
 }
 
+/// The typed refusal for a signal syscall the backend refused (`reason`, set
+/// by `refuse_signal`) when it answered ENOSYS. Linux's signal syscalls
+/// never return ENOSYS, so the answer cannot be mistaken for a kernel one.
+fn signal_refusal_record(
+    reason: Option<&'static str>,
+    result: i64,
+) -> Option<reverie::UnsupportedRefusal> {
+    reason
+        .filter(|_| result == negative_errno(libc::ENOSYS))
+        .map(|reason| {
+            reverie::UnsupportedRefusal::new(
+                reverie::UnsupportedOperation::Signal,
+                reverie::Errno::ENOSYS,
+                reason,
+            )
+        })
+}
+
 const GUEST_NOFILE_LIMIT: libc::c_int = 1 << 20;
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-235): Review the single virtual network namespace identity.
@@ -8073,6 +8091,7 @@ impl ElfExecutor {
         // executes without reading it (the unsubscribed direct path) must not
         // leave it for the next caller's injection to report.
         self.unsupported_refusal = None;
+        self.state.signal_refusal = None;
         let result = self
             .execute_checked_dispatch(request, memory, terminal_read)
             .map_err(|error| memory.capture_shared_file_error(error));
@@ -8244,6 +8263,11 @@ impl ElfExecutor {
                     self.state.children.acknowledge(child)?;
                 }
                 if let Some(refusal) = flock_refusal(request, result) {
+                    self.unsupported_refusal = Some(refusal);
+                }
+                if let Some(refusal) =
+                    signal_refusal_record(self.state.signal_refusal.take(), result)
+                {
                     self.unsupported_refusal = Some(refusal);
                 }
                 Ok(result)
@@ -21824,7 +21848,47 @@ pub(crate) enum SignalDisposition {
 /// signals use the named receiver's private queue and return boundary.
 // TODO-HUMAN-REVIEW(#95): Review self-signal termination and the default-disposition table.
 fn kill_signal(state: &mut LoadedStaticElf, number: u64, args: &[u64; 6]) -> SyscallAction {
-    send_signal(state, number, args, None)
+    let mut refusal = None;
+    let action = send_signal(state, number, args, None, &mut refusal);
+    state.signal_refusal = refusal;
+    action
+}
+
+/// Why this backend refused a signal delivery (`kill`, `tkill`, `tgkill`,
+/// `rt_sigqueueinfo`, `rt_tgsigqueueinfo`). Each is the diagnostic of the
+/// typed refusal `UnsupportedOperation::Signal`; the refused call queued
+/// nothing and changed no signal state.
+struct SignalRefusal;
+
+impl SignalRefusal {
+    const OTHER_PROCESS: &'static str =
+        "KVM signal delivery refused: KVM cannot deliver a signal to another process";
+    const GROUP: &'static str = "KVM signal delivery refused: KVM cannot deliver a signal to \
+         a process group with other members";
+    const ALL: &'static str =
+        "KVM signal delivery refused: KVM cannot deliver kill(-1) to other processes";
+    const INIT: &'static str = "KVM signal delivery refused: KVM cannot deliver a signal to \
+         the synthesized namespace init";
+    const REALTIME_OR_SIGCHLD: &'static str =
+        "KVM signal delivery refused: KVM cannot send real-time signals or SIGCHLD";
+    const STOP: &'static str = "KVM signal delivery refused: KVM cannot send a stop signal";
+    const THREADED_PROCESS: &'static str = "KVM signal delivery refused: KVM cannot choose the \
+         recipient of a process-directed signal in a process with several threads";
+    const SIGKILL_SIBLING: &'static str =
+        "KVM signal delivery refused: KVM cannot send SIGKILL to a sibling thread";
+    const SIBLING_UNAVAILABLE: &'static str = "KVM signal delivery refused: KVM cannot reach \
+         the target thread's signal state";
+    const EXIT_STATUS: &'static str = "KVM signal delivery refused: KVM cannot represent this \
+         signal's terminating status";
+}
+
+/// Refuses a signal delivery with ENOSYS, recording why. Linux's signal
+/// syscalls never fail with ENOSYS, so the executor reports every such answer
+/// as the typed refusal `UnsupportedOperation::Signal` (see
+/// `signal_refusal_record`).
+fn refuse_signal(refusal: &mut Option<&'static str>, reason: &'static str) -> SyscallAction {
+    *refusal = Some(reason);
+    continue_with(negative_errno(libc::ENOSYS))
 }
 
 /// The size of Linux's `kernel_siginfo`: the part of a caller's `siginfo_t`
@@ -21890,7 +21954,10 @@ fn sigqueueinfo(
     } else {
         (libc::SYS_kill as u64, [args[0], args[1], 0, 0, 0, 0])
     };
-    send_signal(state, number, &args, Some(info))
+    let mut refusal = None;
+    let action = send_signal(state, number, &args, Some(info), &mut refusal);
+    state.signal_refusal = refusal;
+    action
 }
 
 /// `kill_signal`, delivering `info` when given instead of the record `kill`
@@ -21900,6 +21967,7 @@ fn send_signal(
     number: u64,
     args: &[u64; 6],
     info: Option<[u8; SIGINFO_SIZE]>,
+    refusal: &mut Option<&'static str>,
 ) -> SyscallAction {
     let transaction = state.signal_transaction.clone();
     let _transaction = transaction.lock().unwrap_or_else(|p| p.into_inner());
@@ -21930,7 +21998,7 @@ fn send_signal(
     }
 
     if !is_kill {
-        return send_thread_signal(state, tgid, target, signal, info);
+        return send_thread_signal(state, tgid, target, signal, info, refusal);
     }
 
     let targets_self = {
@@ -21959,7 +22027,7 @@ fn send_signal(
                     return continue_with(0);
                 }
                 if members.as_slice() != [state.pid] {
-                    return continue_with(negative_errno(libc::ENOSYS));
+                    return refuse_signal(refusal, SignalRefusal::GROUP);
                 }
                 true
             }
@@ -21973,11 +22041,11 @@ fn send_signal(
                 if eligible == 0 {
                     return continue_with(negative_errno(libc::ESRCH));
                 }
-                return continue_with(if signal == 0 {
-                    0
+                return if signal == 0 {
+                    continue_with(0)
                 } else {
-                    negative_errno(libc::ENOSYS)
-                });
+                    refuse_signal(refusal, SignalRefusal::ALL)
+                };
             }
             target if target < -1 => {
                 let Some(group) = target.checked_abs() else {
@@ -21994,7 +22062,7 @@ fn send_signal(
                     return continue_with(0);
                 }
                 if members.as_slice() != [state.pid] {
-                    return continue_with(negative_errno(libc::ENOSYS));
+                    return refuse_signal(refusal, SignalRefusal::GROUP);
                 }
                 true
             }
@@ -22003,21 +22071,21 @@ fn send_signal(
             // namespace init (`getppid() == 1`), so a liveness probe must find
             // that init. Delivering a signal to it is not modeled.
             crate::vm::CONTAINER_INIT_PID if synthesized_init => {
-                return continue_with(if signal == 0 {
-                    0
+                return if signal == 0 {
+                    continue_with(0)
                 } else {
-                    negative_errno(libc::ENOSYS)
-                });
+                    refuse_signal(refusal, SignalRefusal::INIT)
+                };
             }
             _ if !processes.iter().any(|(tgid, _)| *tgid == target) => {
                 return continue_with(negative_errno(libc::ESRCH));
             }
             _ => {
-                return continue_with(if signal == 0 {
-                    0
+                return if signal == 0 {
+                    continue_with(0)
                 } else {
-                    negative_errno(libc::ENOSYS)
-                });
+                    refuse_signal(refusal, SignalRefusal::OTHER_PROCESS)
+                };
             }
         }
     };
@@ -22036,18 +22104,18 @@ fn send_signal(
     // SIGPIPE is an ordinary signal here, as a broken-pipe write raises it
     // (`raise_guest_sigpipe`).
     if signal > 31 || signal == libc::SIGCHLD {
-        return continue_with(negative_errno(libc::ENOSYS));
+        return refuse_signal(refusal, SignalRefusal::REALTIME_OR_SIGCHLD);
     }
 
     // SIGKILL can never be caught, blocked, or ignored.
     if signal == libc::SIGKILL {
         return terminating_signal_status(signal, process_dumpable(state))
             .map(SyscallAction::Exit)
-            .unwrap_or_else(|| continue_with(negative_errno(libc::ENOSYS)));
+            .unwrap_or_else(|| refuse_signal(refusal, SignalRefusal::EXIT_STATUS));
     }
 
     match signal_disposition(state, signal) {
-        SignalDisposition::Stop => return continue_with(negative_errno(libc::ENOSYS)),
+        SignalDisposition::Stop => return refuse_signal(refusal, SignalRefusal::STOP),
         SignalDisposition::Ignore | SignalDisposition::Terminate | SignalDisposition::Handled => {}
     }
 
@@ -22063,7 +22131,7 @@ fn send_signal(
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .has_live_sibling(state.tid, state.pid)
     {
-        return continue_with(negative_errno(libc::ENOSYS));
+        return refuse_signal(refusal, SignalRefusal::THREADED_PROCESS);
     }
 
     // Queue even an unblocked default-fatal signal. The same return boundary
@@ -22100,6 +22168,7 @@ fn send_thread_signal(
     target: libc::pid_t,
     signal: libc::c_int,
     info: Option<[u8; SIGINFO_SIZE]>,
+    refusal: &mut Option<&'static str>,
 ) -> SyscallAction {
     if target <= 0 || tgid.is_some_and(|tgid| tgid <= 0) {
         return continue_with(negative_errno(libc::EINVAL));
@@ -22123,27 +22192,27 @@ fn send_thread_signal(
             return continue_with(negative_errno(libc::ESRCH));
         }
         if task.tgid != state.pid {
-            return continue_with(negative_errno(libc::ENOSYS));
+            return refuse_signal(refusal, SignalRefusal::OTHER_PROCESS);
         }
         if signal > 31 || signal == libc::SIGCHLD {
-            return continue_with(negative_errno(libc::ENOSYS));
+            return refuse_signal(refusal, SignalRefusal::REALTIME_OR_SIGCHLD);
         }
         if signal == libc::SIGKILL {
             // A sibling may be parked outside any return boundary. Queuing
             // SIGKILL there would falsely promise actual group cancellation.
             if target != state.tid {
-                return continue_with(negative_errno(libc::ENOSYS));
+                return refuse_signal(refusal, SignalRefusal::SIGKILL_SIBLING);
             }
             return terminating_signal_status(signal, task.dumpable)
                 .map(SyscallAction::Exit)
-                .unwrap_or_else(|| continue_with(negative_errno(libc::ENOSYS)));
+                .unwrap_or_else(|| refuse_signal(refusal, SignalRefusal::EXIT_STATUS));
         }
         let target_signals = if target == state.tid {
             // Loader-level self-signal callers need no borrowed sibling handle.
             state.thread_signals.clone()
         } else {
             let Some(target_signals) = lifecycle.signal_target(target) else {
-                return continue_with(negative_errno(libc::ENOSYS));
+                return refuse_signal(refusal, SignalRefusal::SIBLING_UNAVAILABLE);
             };
             target_signals
         };
@@ -22156,7 +22225,7 @@ fn send_thread_signal(
             signal,
         );
         if disposition == SignalDisposition::Stop {
-            return continue_with(negative_errno(libc::ENOSYS));
+            return refuse_signal(refusal, SignalRefusal::STOP);
         }
         let mut target_signals = target_signals.lock();
         if disposition == SignalDisposition::Ignore
@@ -23181,6 +23250,7 @@ pub(crate) fn native_loaded_state(cwd: &std::path::Path) -> LoadedStaticElf {
         )),
         files: std::collections::BTreeMap::new(),
         file_retirement: crate::elf::FileRetirement::default(),
+        signal_refusal: None,
         pipe_owners: Default::default(),
         fd_entry_ids: std::collections::BTreeMap::new(),
         epoll_domain: Default::default(),
@@ -34653,6 +34723,99 @@ mod tests {
             zero_or_errno(unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) });
         assert_eq!(still_held, negative_errno(libc::EWOULDBLOCK));
         assert_eq!(executor.take_unsupported_refusal(), refusal);
+    }
+
+    /// Every signal delivery this backend refuses (here: to another process,
+    /// to every other process, a real-time signal) answers ENOSYS with the
+    /// typed refusal `UnsupportedOperation::Signal` naming the reason, for
+    /// kill, tgkill and rt_sigqueueinfo alike. The deliveries it supports (a
+    /// liveness probe of another process, signals to itself) are unchanged
+    /// and record no refusal.
+    #[test]
+    fn refused_signal_deliveries_are_typed_refusals_and_supported_ones_are_unchanged() {
+        const INFO: u64 = 0x100;
+        let root = TestDir::new();
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let mut leader = ElfExecutor::new(test_state(&root.0), false);
+        let child = leader
+            .fork_child(leader.state.pid + 1, false, false)
+            .unwrap();
+        let (pid, child_pid) = (leader.state.pid, child.state.pid);
+        let mut info = [0_u8; 128];
+        info[8..12].copy_from_slice(&(-1_i32).to_ne_bytes()); // SI_QUEUE
+        memory.write(INFO, &info).unwrap();
+        let refusal = |reason: &'static str| {
+            Some(reverie::UnsupportedRefusal::new(
+                reverie::UnsupportedOperation::Signal,
+                reverie::Errno::ENOSYS,
+                reason,
+            ))
+        };
+        let cases: [(
+            libc::c_long,
+            [u64; 6],
+            i64,
+            Option<reverie::UnsupportedRefusal>,
+        ); 8] = [
+            (libc::SYS_kill, [child_pid as u64, 0, 0, 0, 0, 0], 0, None),
+            (
+                libc::SYS_kill,
+                [child_pid as u64, libc::SIGKILL as u64, 0, 0, 0, 0],
+                negative_errno(libc::ENOSYS),
+                refusal(SignalRefusal::OTHER_PROCESS),
+            ),
+            (
+                libc::SYS_tgkill,
+                [
+                    child_pid as u64,
+                    child_pid as u64,
+                    libc::SIGTERM as u64,
+                    0,
+                    0,
+                    0,
+                ],
+                negative_errno(libc::ENOSYS),
+                refusal(SignalRefusal::OTHER_PROCESS),
+            ),
+            (
+                libc::SYS_rt_sigqueueinfo,
+                [child_pid as u64, libc::SIGUSR1 as u64, INFO, 0, 0, 0],
+                negative_errno(libc::ENOSYS),
+                refusal(SignalRefusal::OTHER_PROCESS),
+            ),
+            (
+                libc::SYS_kill,
+                [(-1_i64) as u64, libc::SIGTERM as u64, 0, 0, 0, 0],
+                negative_errno(libc::ENOSYS),
+                refusal(SignalRefusal::ALL),
+            ),
+            (
+                libc::SYS_kill,
+                [pid as u64, 34, 0, 0, 0, 0],
+                negative_errno(libc::ENOSYS),
+                refusal(SignalRefusal::REALTIME_OR_SIGCHLD),
+            ),
+            (
+                libc::SYS_kill,
+                [pid as u64, libc::SIGURG as u64, 0, 0, 0, 0],
+                0,
+                None,
+            ),
+            (libc::SYS_kill, [pid as u64, 0, 0, 0, 0, 0], 0, None),
+        ];
+        for (number, args, expected, recorded) in cases {
+            assert_eq!(
+                leader.execute(&SyscallRequest::new(number as u64, args), &memory),
+                expected,
+                "syscall {number} {args:?}"
+            );
+            assert_eq!(
+                leader.take_unsupported_refusal(),
+                recorded,
+                "syscall {number} {args:?}"
+            );
+        }
+        drop(child);
     }
 
     /// The unsubscribed direct path executes a syscall without reading its

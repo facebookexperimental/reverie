@@ -1123,6 +1123,11 @@ pub(crate) struct LoadedStaticElf {
     // registry contains only weak references keyed by unexposed host identity.
     pub fd_object_inodes: std::collections::BTreeMap<i32, std::sync::Arc<GuestFileIdentity>>,
     pub file_identity_table: std::sync::Arc<std::sync::Mutex<GuestFileIdentityTable>>,
+    /// Why the signal syscall just executed was refused with ENOSYS, if it
+    /// was. Set by the signal-sending path and taken by the executor at the
+    /// same syscall boundary, which turns it into the typed refusal
+    /// `UnsupportedOperation::Signal`. Never carried across fork or exec.
+    pub(crate) signal_refusal: Option<&'static str>,
 }
 
 impl LoadedStaticElf {
@@ -1283,6 +1288,7 @@ impl LoadedStaticElf {
                 .map(|(fd, file)| (fd, file.into_file()))
                 .collect(),
             file_retirement: FileRetirement::default(),
+            signal_refusal: None,
             pipe_owners: self.pipe_owners.clone(),
             fd_entry_ids: self.fd_entry_ids.clone(),
             epoll_domain: self.epoll_domain.clone(),
@@ -2069,6 +2075,7 @@ fn load_executable(
         ))),
         files: std::collections::BTreeMap::new(),
         file_retirement: FileRetirement::default(),
+        signal_refusal: None,
         pipe_owners: Default::default(),
         fd_entry_ids: std::collections::BTreeMap::new(),
         epoll_domain: Default::default(),
