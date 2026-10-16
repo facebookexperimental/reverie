@@ -1700,3 +1700,58 @@ fn a_shared_alias_is_not_patched_under_a_private_continuation_site() {
         );
     }
 }
+
+// This is Tool-selected full-event fidelity, not a Linux arbitrary-padding
+// comparison or a claim that the legacy mask/action owner has migrated.
+#[test]
+fn deferred_sigalrm_preserves_full_event_at_completion_and_before_syscall() {
+    let expected_info = |seed: u8| {
+        let mut bytes: [u8; 128] =
+            core::array::from_fn(|index| (index as u8).wrapping_mul(17).wrapping_add(seed));
+        bytes[..4].copy_from_slice(&libc::SIGALRM.to_ne_bytes());
+        bytes[4..8].copy_from_slice(&73_i32.to_ne_bytes());
+        bytes[8..12].copy_from_slice(&libc::SI_QUEUE.to_ne_bytes());
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    let mut failures = Vec::new();
+    for mode in ["completion", "entry"] {
+        let mut expected = String::new();
+        for (round, seed) in [0x31, 0xa7].into_iter().enumerate() {
+            let count = round + 1;
+            expected.push_str(&format!(
+                "full-event {mode} round={round} siginfo={}\nfull-event {mode} round={round} registers=preserved runs={count} handlers={count} replacement=EINVAL\n",
+                expected_info(seed),
+            ));
+        }
+        expected.push_str(&format!("full-event {mode} complete\n"));
+        for on_alt_stack in [true, false] {
+            let output = late_code_guest(
+                &format!("sigalrm-full-event-{mode}"),
+                &[],
+                on_alt_stack,
+                |command| {
+                    command
+                        .env(reverie_liteinst::SITE_PATCHING_ENV, "0")
+                        .env(reverie_liteinst::SIGALRM_HANDLERS_ENV, "1");
+                },
+            );
+            // Keep all four actual outcomes on the red run. There is no
+            // unavailable/skip success path, timeout increase or byte filter.
+            eprintln!("full-event {mode} alt_stack={on_alt_stack}: {output:?}");
+            if !output.status.success()
+                || output.stdout != expected.as_bytes()
+                || !output.stderr.is_empty()
+            {
+                failures.push(format!("{mode} alt_stack={on_alt_stack}: {output:?}"));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "full-event fidelity failures:\n{}",
+        failures.join("\n")
+    );
+}

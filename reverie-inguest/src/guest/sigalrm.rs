@@ -655,6 +655,9 @@ pub const DELIVERY_LOST_STATUS: i32 = 115;
 
 static PREPARED: AtomicBool = AtomicBool::new(false);
 static PREPARED_NONCE: AtomicU64 = AtomicU64::new(0);
+// Selected Tool metadata belongs to the same one-use activation as the action
+// and masks. It is distinct from the private SI_QUEUE nonce packet below.
+static PREPARED_SIGINFO: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
 static PREPARED_HANDLER: AtomicU64 = AtomicU64::new(0);
 static PREPARED_FLAGS: AtomicU64 = AtomicU64::new(0);
 static PREPARED_ACTION_MASK: AtomicU64 = AtomicU64::new(0);
@@ -666,9 +669,8 @@ static NEXT_NONCE: AtomicU64 = AtomicU64::new(1);
 static WINDOW_MASK: AtomicU64 = AtomicU64::new(0);
 static WINDOW_OPEN: AtomicBool = AtomicBool::new(false);
 
-/// `SI_QUEUE` and `SI_KERNEL` from Linux's siginfo codes.
+/// `SI_QUEUE` from Linux's siginfo codes, used only by the private transport.
 const SI_QUEUE: i32 = -1;
-const SI_KERNEL: i32 = 0x80;
 
 /// The window mask for a thread whose virtual mask is `virtual_mask`: the
 /// physical mask without SIGALRM, so the queued instance is delivered as soon
@@ -684,7 +686,8 @@ pub fn activation_mask(base: u64, action_mask: u64) -> u64 {
 }
 
 /// Prepare one SIGALRM delivery at the current syscall's completion (design
-/// section 4, steps 4 to 7): snapshot the virtual action and masks, check that
+/// section 4, steps 4 to 7): retain the selected event's full siginfo alongside
+/// the virtual action and masks, check that
 /// no physical SIGALRM is pending, queue the runtime's own instance (blocked
 /// by the physical mask, so only queued), and open the window the completion
 /// marker installs. EINVAL when no guest handler is installed or a delivery is
@@ -694,8 +697,9 @@ pub fn activation_mask(base: u64, action_mask: u64) -> u64 {
 /// # Safety
 ///
 /// Only from a guest call's own turn, in a fallback dispatch whose completion
-/// marker will follow.
-pub unsafe fn prepare_delivery(reserved: u64) -> Result<(), i32> {
+/// marker will follow. The event must be an already-selected SIGALRM for this
+/// receiver; target selection remains the caller's responsibility.
+pub unsafe fn prepare_delivery(event: reverie::SignalEvent, reserved: u64) -> Result<(), i32> {
     if !handled() || PREPARED.load(Ordering::Acquire) || WINDOW_OPEN.load(Ordering::Acquire) {
         return Err(libc::EINVAL);
     }
@@ -711,6 +715,12 @@ pub unsafe fn prepare_delivery(reserved: u64) -> Result<(), i32> {
     PREPARED_SAVED_MASK.store(current, Ordering::Release);
     PREPARED_ACTIVATION_BASE.store(current, Ordering::Release);
     PREPARED_NONCE.store(nonce, Ordering::Release);
+    // All admission checks precede this write: a rejected replacement must
+    // leave the already prepared event untouched. PREPARED publishes all words.
+    let selected = event.siginfo();
+    for (slot, bytes) in PREPARED_SIGINFO.iter().zip(selected.as_chunks::<8>().0) {
+        slot.store(u64::from_ne_bytes(*bytes), Ordering::Relaxed);
+    }
     let pid = unsafe { raw_syscall6(libc::SYS_getpid, [0; 6]) };
     let uid = unsafe { raw_syscall6(libc::SYS_getuid, [0; 6]) };
     let mut info = [0_u8; 128];
@@ -832,8 +842,11 @@ static ENTRY_DELIVERY: AtomicBool = AtomicBool::new(false);
 /// # Safety
 ///
 /// As [`prepare_delivery`]; the caller must not run the syscall.
-pub unsafe fn prepare_delivery_before_syscall(reserved: u64) -> Result<(), i32> {
-    unsafe { prepare_delivery(reserved) }?;
+pub unsafe fn prepare_delivery_before_syscall(
+    event: reverie::SignalEvent,
+    reserved: u64,
+) -> Result<(), i32> {
+    unsafe { prepare_delivery(event, reserved) }?;
     ENTRY_DELIVERY.store(true, Ordering::Release);
     Ok(())
 }
@@ -942,7 +955,7 @@ fn read_pkru() -> u32 {
 /// It runs only the delivery the runtime prepared: the instance must carry
 /// `SI_QUEUE`, this process's pid and the prepared nonce, or the process
 /// ends before any guest code runs. It then shows the guest Linux's view:
-/// `SI_KERNEL` siginfo, the saved-return mask in `uc_sigmask`, a disabled
+/// the Tool-selected full siginfo, the saved-return mask in `uc_sigmask`, a disabled
 /// alternate stack in `uc_stack`, and the activation mask as its virtual mask;
 /// calls the guest's handler; and on its return takes `uc_sigmask` (which the
 /// guest may have edited) as the virtual mask, puts the physical mask and the
@@ -977,16 +990,24 @@ unsafe extern "C" fn sigalrm_trampoline(
     let action_mask = PREPARED_ACTION_MASK.load(Ordering::Acquire);
     let saved = PREPARED_SAVED_MASK.load(Ordering::Acquire);
     let base = PREPARED_ACTIVATION_BASE.load(Ordering::Acquire);
+    let mut selected = [0_u8; 128];
+    for (bytes, slot) in selected
+        .as_chunks_mut::<8>()
+        .0
+        .iter_mut()
+        .zip(&PREPARED_SIGINFO)
+    {
+        bytes.copy_from_slice(&slot.load(Ordering::Relaxed).to_ne_bytes());
+    }
     // The rights the kernel entered this handler with; restored when the
     // guest's handler returns.
     let ospke = crate::trap::pkru_present();
     let rights = if ospke { read_pkru() } else { 0 };
     let context = context.cast::<u8>();
     unsafe {
-        // Linux's siginfo for an expired ITIMER_REAL: SI_KERNEL, all else 0.
-        let bytes = info.cast::<u8>();
-        core::ptr::write_bytes(bytes.add(4), 0, 128 - 4);
-        bytes.add(8).cast::<i32>().write_unaligned(SI_KERNEL);
+        // Authentication consumed the private transport. Expose only the
+        // already selected metadata, including its original signal code.
+        core::ptr::copy_nonoverlapping(selected.as_ptr(), info.cast::<u8>(), selected.len());
     }
     let runtime_stack =
         unsafe { core::ptr::read_unaligned(context.add(UC_STACK_OFFSET).cast::<[u8; 24]>()) };

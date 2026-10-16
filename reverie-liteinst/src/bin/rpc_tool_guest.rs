@@ -168,6 +168,35 @@ static BEFORE_MARKER_RUNS: AtomicU64 = AtomicU64::new(0);
 /// The entry delivery's result, as the Tool saw it (0 or a negative errno).
 static ENTRY_DELIVERY_RESULT: AtomicI64 = AtomicI64::new(1);
 
+// Full-event fidelity uses the same CounterTool, callback and physical delivery
+// owner as the canonical timer controls, with disjoint fixture-only markers.
+const FULL_EVENT_COMPLETION_MARKER: usize = 0x515b;
+const FULL_EVENT_ENTRY_MARKER: usize = 0x515c;
+const FULL_EVENT_COMPLETION_RESULT: i64 = 0x534731;
+static FULL_EVENT_ENTRY_ARMED: AtomicBool = AtomicBool::new(false);
+static FULL_EVENT_CALLBACKS: AtomicU64 = AtomicU64::new(0);
+static FULL_EVENT_RUNS: AtomicU64 = AtomicU64::new(0);
+static FULL_EVENT_REJECTIONS: AtomicU64 = AtomicU64::new(0);
+static FULL_EVENT_HANDLERS: AtomicU64 = AtomicU64::new(0);
+static FULL_EVENT_HANDLER_RUNS: AtomicU64 = AtomicU64::new(u64::MAX);
+static FULL_EVENT_INFO: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+static FULL_EVENT_EXPECTED_REGS: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
+static FULL_EVENT_OBSERVED_REGS: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
+static FULL_EVENT_SAVED_MASK: AtomicU64 = AtomicU64::new(0);
+static FULL_EVENT_OLDMASK: AtomicU64 = AtomicU64::new(0);
+static FULL_EVENT_ACTIVE_MASK: AtomicU64 = AtomicU64::new(0);
+static FULL_EVENT_STACK: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Deliberately Tool-selected bytes, not a claim about Linux-generated padding.
+fn full_event_bytes(round: usize) -> [u8; 128] {
+    let seed = [0x31_u8, 0xa7_u8][round];
+    let mut bytes = core::array::from_fn(|index| (index as u8).wrapping_mul(17).wrapping_add(seed));
+    bytes[0..4].copy_from_slice(&libc::SIGALRM.to_ne_bytes());
+    bytes[4..8].copy_from_slice(&73_i32.to_ne_bytes());
+    bytes[8..12].copy_from_slice(&libc::SI_QUEUE.to_ne_bytes());
+    bytes
+}
+
 /// [`CounterTool`]'s exit status if a guest `rt_sigreturn` ever reaches it.
 const TOOL_SAW_SIGRETURN_STATUS: i32 = 118;
 
@@ -187,6 +216,94 @@ impl Tool for CounterTool {
             unsafe { reverie_inguest::guest::support::exit_now(TOOL_SAW_SIGRETURN_STATUS) };
         }
         let marker = syscall.into_parts().1.arg0;
+        if syscall.number() == Sysno::getppid
+            && matches!(
+                marker,
+                FULL_EVENT_COMPLETION_MARKER | FULL_EVENT_ENTRY_MARKER
+            )
+        {
+            FULL_EVENT_CALLBACKS.fetch_add(1, Ordering::SeqCst);
+            let at_entry = marker == FULL_EVENT_ENTRY_MARKER;
+            if at_entry && !FULL_EVENT_ENTRY_ARMED.swap(false, Ordering::SeqCst) {
+                // Resumed from the actual signal frame: run the original call
+                // once, preserving its number and all six arguments.
+                FULL_EVENT_RUNS.fetch_add(1, Ordering::SeqCst);
+                return Ok(guest.inject(syscall).await?);
+            }
+            let round = syscall.into_parts().1.arg1;
+            assert!(round < 2);
+            let regs = guest.regs().await;
+            assert_eq!(regs.rax, libc::SYS_getppid as u64);
+            assert_eq!(regs.rdi, marker as u64);
+            assert_eq!(regs.rsi, round as u64);
+            assert_ne!(regs.rsp, 0, "a real guest register image is required");
+            let result = FULL_EVENT_COMPLETION_RESULT + round as i64;
+            // Linux x86-64 gregs[0..18]: compare the real captured syscall
+            // image, not Rust callback-local registers. RCX/R11 are already
+            // hardware syscall clobbers, not their pre-instruction values.
+            let projected = [
+                regs.r8,
+                regs.r9,
+                regs.r10,
+                regs.r11,
+                regs.r12,
+                regs.r13,
+                regs.r14,
+                regs.r15,
+                regs.rdi,
+                regs.rsi,
+                regs.rbp,
+                regs.rbx,
+                regs.rdx,
+                if at_entry { regs.rax } else { result as u64 },
+                regs.rcx,
+                regs.rsp,
+                if at_entry {
+                    regs.rip
+                } else {
+                    regs.rip.checked_add(2).unwrap()
+                },
+                regs.eflags,
+            ];
+            for (slot, value) in FULL_EVENT_EXPECTED_REGS.iter().zip(projected) {
+                slot.store(value, Ordering::SeqCst);
+            }
+            let event = |which| {
+                reverie::SignalEvent::new(
+                    libc::SIGALRM,
+                    full_event_bytes(which),
+                    reverie::SignalTarget::Process { pid: guest.pid() },
+                )
+                .unwrap()
+            };
+            let first = event(round);
+            let replacement = event(1 - round);
+            if at_entry {
+                guest.defer_signal_delivery_before_syscall(first).await?;
+            } else {
+                guest.defer_signal_delivery(first).await?;
+            }
+            let rejected = if at_entry {
+                guest
+                    .defer_signal_delivery_before_syscall(replacement)
+                    .await
+            } else {
+                guest.defer_signal_delivery(replacement).await
+            };
+            assert!(
+                matches!(rejected,
+                Err(Error::Errno(errno)) if errno.into_raw() == libc::EINVAL),
+                "a second preparation must fail without replacing the first payload"
+            );
+            FULL_EVENT_REJECTIONS.fetch_add(1, Ordering::SeqCst);
+            if at_entry {
+                // The real entry-delivery continuation must discard this
+                // value, restore the original image and restart the call.
+                return Ok(-i64::from(libc::EHWPOISON));
+            }
+            FULL_EVENT_RUNS.fetch_add(1, Ordering::SeqCst);
+            return Ok(result);
+        }
         if syscall.number() == Sysno::getppid && marker == DELIVER_SIGALRM_BEFORE_MARKER {
             if ENTRY_DELIVERY_ARMED.swap(false, Ordering::SeqCst) {
                 let mut info = [0_u8; 128];
@@ -2143,6 +2260,180 @@ fn sigalrm_entry_delivery_guest(path: &Path) {
     println!("sigalrm-entry-delivery-ok");
 }
 
+// Capture only fixed storage in the real SA_SIGINFO handler. Formatting and
+// all assertions run after it returns; no fake context or direct trampoline call.
+unsafe extern "C" fn full_event_sigalrm_handler(
+    _signal: libc::c_int,
+    info: *mut libc::siginfo_t,
+    context: *mut libc::c_void,
+) {
+    for (index, slot) in FULL_EVENT_INFO.iter().enumerate() {
+        let word = unsafe {
+            info.cast::<u8>()
+                .add(index * 8)
+                .cast::<u64>()
+                .read_unaligned()
+        };
+        slot.store(word, Ordering::SeqCst);
+    }
+    let frame = unsafe { &*context.cast::<libc::ucontext_t>() };
+    for (slot, value) in FULL_EVENT_OBSERVED_REGS
+        .iter()
+        .zip(&frame.uc_mcontext.gregs[..18])
+    {
+        slot.store(*value as u64, Ordering::SeqCst);
+    }
+    FULL_EVENT_OLDMASK.store(
+        frame.uc_mcontext.gregs[libc::REG_OLDMASK as usize] as u64,
+        Ordering::SeqCst,
+    );
+    FULL_EVENT_SAVED_MASK.store(
+        unsafe { context.cast::<u8>().add(296).cast::<u64>().read_unaligned() },
+        Ordering::SeqCst,
+    );
+    for (index, slot) in FULL_EVENT_STACK.iter().enumerate() {
+        slot.store(
+            unsafe {
+                context
+                    .cast::<u8>()
+                    .add(16 + index * 8)
+                    .cast::<u64>()
+                    .read_unaligned()
+            },
+            Ordering::SeqCst,
+        );
+    }
+    FULL_EVENT_HANDLER_RUNS.store(FULL_EVENT_RUNS.load(Ordering::SeqCst), Ordering::SeqCst);
+    let mut active = 0_u64;
+    unsafe {
+        libc::syscall(
+            libc::SYS_rt_sigprocmask,
+            libc::SIG_BLOCK,
+            core::ptr::null::<u64>(),
+            &mut active as *mut u64,
+            8,
+        )
+    };
+    FULL_EVENT_ACTIVE_MASK.store(active, Ordering::SeqCst);
+    FULL_EVENT_HANDLERS.fetch_add(1, Ordering::SeqCst);
+}
+
+/// The current single-thread self-process delivery domain only. The two
+/// distinct payloads and rejected replacements use the existing physical
+/// SI_QUEUE/nonce transport; that transport is never the expected payload.
+fn sigalrm_full_event_guest(path: &Path, at_entry: bool) {
+    let ppid = i64::from(unsafe { libc::getppid() });
+    unsafe { reverie_liteinst::install_tool::<CounterTool>(path) }.unwrap();
+    assert_eq!(core::mem::size_of::<libc::siginfo_t>(), 128);
+    let alarm = 1_u64 << (libc::SIGALRM - 1);
+    let usr1 = 1_u64 << (libc::SIGUSR1 - 1);
+    let usr2 = 1_u64 << (libc::SIGUSR2 - 1);
+    let mut pending = 0_u64;
+    assert_eq!(
+        unsafe {
+            reverie_inguest::trap::raw_syscall6(
+                libc::SYS_rt_sigpending,
+                [(&raw mut pending) as u64, 8, 0, 0, 0, 0],
+            )
+        },
+        0
+    );
+    assert_eq!(
+        pending & alarm,
+        0,
+        "fixture requires no physical SIGALRM pending"
+    );
+    let mut action: libc::sigaction = unsafe { core::mem::zeroed() };
+    action.sa_sigaction = full_event_sigalrm_handler as *const () as usize;
+    action.sa_flags = libc::SA_SIGINFO;
+    unsafe { libc::sigaddset(&mut action.sa_mask, libc::SIGUSR2) };
+    sigalrm_sigaction(&action).unwrap();
+    guest_mask_call(libc::SIG_SETMASK, Some(usr1));
+    let mode = if at_entry { "entry" } else { "completion" };
+    let marker = if at_entry {
+        FULL_EVENT_ENTRY_MARKER
+    } else {
+        FULL_EVENT_COMPLETION_MARKER
+    };
+    let mut observed = [[0_u8; 128]; 2];
+    for (round, info) in observed.iter_mut().enumerate() {
+        FULL_EVENT_ENTRY_ARMED.store(true, Ordering::SeqCst);
+        let returned = unsafe { libc::syscall(libc::SYS_getppid, marker, round) };
+        // Print actual bytes before the independent register/mask/order
+        // assertions, so a setup failure is distinguishable from payload loss.
+        for (chunk, slot) in info.as_chunks_mut::<8>().0.iter_mut().zip(&FULL_EVENT_INFO) {
+            chunk.copy_from_slice(&slot.load(Ordering::SeqCst).to_ne_bytes());
+        }
+        print!("full-event {mode} round={round} siginfo=");
+        for byte in info.iter() {
+            print!("{byte:02x}");
+        }
+        println!();
+        assert_eq!(
+            returned,
+            if at_entry {
+                ppid
+            } else {
+                FULL_EVENT_COMPLETION_RESULT + round as i64
+            },
+            "the original call result must reach the guest exactly once"
+        );
+        let count = round as u64 + 1;
+        assert_eq!(FULL_EVENT_RUNS.load(Ordering::SeqCst), count);
+        assert_eq!(FULL_EVENT_HANDLERS.load(Ordering::SeqCst), count);
+        assert_eq!(FULL_EVENT_REJECTIONS.load(Ordering::SeqCst), count);
+        assert_eq!(
+            FULL_EVENT_CALLBACKS.load(Ordering::SeqCst),
+            count * if at_entry { 2 } else { 1 }
+        );
+        assert_eq!(
+            FULL_EVENT_HANDLER_RUNS.load(Ordering::SeqCst),
+            if at_entry { count - 1 } else { count }
+        );
+        let expected_regs = FULL_EVENT_EXPECTED_REGS
+            .each_ref()
+            .map(|slot| slot.load(Ordering::SeqCst));
+        let actual_regs = FULL_EVENT_OBSERVED_REGS
+            .each_ref()
+            .map(|slot| slot.load(Ordering::SeqCst));
+        assert_eq!(
+            actual_regs, expected_regs,
+            "actual {mode} ucontext projection round={round}"
+        );
+        assert_eq!(FULL_EVENT_SAVED_MASK.load(Ordering::SeqCst), usr1);
+        assert_eq!(FULL_EVENT_OLDMASK.load(Ordering::SeqCst), usr1);
+        assert_eq!(
+            FULL_EVENT_ACTIVE_MASK.load(Ordering::SeqCst),
+            usr1 | usr2 | alarm
+        );
+        let mut stack = [0_u8; 24];
+        for (chunk, slot) in stack
+            .as_chunks_mut::<8>()
+            .0
+            .iter_mut()
+            .zip(&FULL_EVENT_STACK)
+        {
+            chunk.copy_from_slice(&slot.load(Ordering::SeqCst).to_ne_bytes());
+        }
+        assert_eq!(
+            stack,
+            reverie_inguest::guest::sigalrm::disabled_stack_bytes()
+        );
+        assert_eq!(guest_mask_call(libc::SIG_BLOCK, None), usr1);
+        assert_eq!(physical_mask(), usr1 | alarm);
+        println!(
+            "full-event {mode} round={round} registers=preserved runs={count} handlers={count} replacement=EINVAL"
+        );
+    }
+    // Retain both full byte observations before the intended baseline failure.
+    assert_eq!(
+        observed,
+        [full_event_bytes(0), full_event_bytes(1)],
+        "supplied full128 bytes must survive both deliveries and rejected replacements"
+    );
+    println!("full-event {mode} complete");
+}
+
 unsafe extern "C" fn one_argument_sigalrm_handler(_signal: libc::c_int) {
     ONE_ARGUMENT_DELIVERED.fetch_add(1, Ordering::SeqCst);
 }
@@ -3129,6 +3420,8 @@ fn main() {
         Some("sigalrm-inherited-filter") => sigalrm_inherited_filter_guest(Path::new(&path)),
         Some("sigalrm-pkey-before-install") => sigalrm_pkey_before_install_guest(Path::new(&path)),
         Some("sigalrm-delivery") => sigalrm_delivery_guest(Path::new(&path)),
+        Some("sigalrm-full-event-completion") => sigalrm_full_event_guest(Path::new(&path), false),
+        Some("sigalrm-full-event-entry") => sigalrm_full_event_guest(Path::new(&path), true),
         Some("sigalrm-stack-edit") => sigalrm_stack_edit_guest(Path::new(&path)),
         Some("sigalrm-entry-delivery") => sigalrm_entry_delivery_guest(Path::new(&path)),
         Some("sigalrm-entry-mask") => sigalrm_entry_frame_guest(Path::new(&path), false),

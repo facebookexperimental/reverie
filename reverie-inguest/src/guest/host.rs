@@ -3196,7 +3196,7 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
             return Err(Errno::ENOSYS.into());
         }
         // SAFETY: inside the guest call's own turn, in its dispatch.
-        unsafe { super::sigalrm::prepare_delivery(self.runtime.reserved_signal_mask()) }
+        unsafe { super::sigalrm::prepare_delivery(event, self.runtime.reserved_signal_mask()) }
             .map_err(|errno| Error::Errno(Errno::new(errno)))
     }
 
@@ -3216,7 +3216,10 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
         // SAFETY: inside the guest call's own turn, in its dispatch; the Tool
         // does not run the syscall.
         unsafe {
-            super::sigalrm::prepare_delivery_before_syscall(self.runtime.reserved_signal_mask())
+            super::sigalrm::prepare_delivery_before_syscall(
+                event,
+                self.runtime.reserved_signal_mask(),
+            )
         }
         .map_err(|errno| Error::Errno(Errno::new(errno)))
     }
