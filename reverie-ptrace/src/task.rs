@@ -707,6 +707,44 @@ fn status_unfiltered(status: &str) -> bool {
         .is_some_and(|mode| mode.trim() == "0")
 }
 
+/// The mask `Guest::set_blocked_signals` writes for a requested `mask` over
+/// the thread's `old` one: the request, except that the signals no injection
+/// shields (`NEVER_SHIELDED`) keep their bits from `old`. So the call never
+/// blocks SIGTRAP or the timer signal for the guest, and never unblocks one
+/// the guest blocked itself; putting `old` back restores it exactly.
+fn mask_keeping_never_shielded(mask: u64, old: u64) -> u64 {
+    (mask & !NEVER_SHIELDED) | (old & NEVER_SHIELDED)
+}
+
+/// Whether `Guest::set_blocked_signals` may change the mask at the current
+/// stop, given the callback state: only in `Tool::handle_syscall_event`
+/// (`in_syscall_callback`), outside a frame-mode event (`frame_mode`), whose
+/// registers live in an e9tool frame rather than the stopped thread, and
+/// outside a signal callback (`in_signal_callback`, which a held signal's
+/// callback also sets), and only on a tracer thread that no seccomp filter
+/// may restrict (`seccomp_filtered`), as for the temporary shield.
+fn may_set_blocked_signals(
+    in_syscall_callback: bool,
+    frame_mode: bool,
+    in_signal_callback: bool,
+    seccomp_filtered: bool,
+) -> bool {
+    in_syscall_callback && !frame_mode && !in_signal_callback && !seccomp_filtered
+}
+
+/// `Guest::set_blocked_signals`'s answer to a ptrace mask request that
+/// failed with `error`: the thread is gone, or the request failed with an
+/// errno and left the mask as it was (`mask_unknown` false) or unknown.
+fn mask_change_failure(error: TraceError, mask_unknown: bool) -> reverie::MaskChangeRefused {
+    match error {
+        TraceError::Died(_) => reverie::MaskChangeRefused::Gone,
+        TraceError::Errno(errno) => reverie::MaskChangeRefused::Failed {
+            errno,
+            mask_unknown,
+        },
+    }
+}
+
 /// `si_code` of a SIGSYS raised by a seccomp filter's `SECCOMP_RET_TRAP`.
 const SYS_SECCOMP: libc::c_int = 1;
 
@@ -2555,6 +2593,10 @@ pub struct TracedTask<L: Tool> {
     /// Whether `Tool::handle_signal_event` is running (`report_signal`).
     in_signal_callback: bool,
 
+    /// Whether `Tool::handle_syscall_event` is running for this thread, the
+    /// only callback in which `Guest::set_blocked_signals` changes the mask.
+    in_syscall_callback: bool,
+
     /// The signal the running `Tool::handle_signal_event` reports, and its
     /// siginfo when its stop recorded one (`Guest::signal_info`).
     reported_signal: Option<(AnySignal, Option<SiginfoBytes>)>,
@@ -2834,6 +2876,7 @@ impl<L: Tool> TracedTask<L> {
             latest_injection_stop: None,
             last_injection_ran: true,
             in_signal_callback: false,
+            in_syscall_callback: false,
             signal_callback_replaced_restart_block: false,
             signal_callback_guest_restart_block: false,
             in_held_signal_callback: false,
@@ -2913,6 +2956,7 @@ impl<L: Tool> TracedTask<L> {
             latest_injection_stop: None,
             last_injection_ran: true,
             in_signal_callback: false,
+            in_syscall_callback: false,
             signal_callback_replaced_restart_block: false,
             signal_callback_guest_restart_block: false,
             in_held_signal_callback: false,
@@ -2989,6 +3033,7 @@ impl<L: Tool> TracedTask<L> {
             latest_injection_stop: None,
             last_injection_ran: true,
             in_signal_callback: false,
+            in_syscall_callback: false,
             signal_callback_replaced_restart_block: false,
             signal_callback_guest_restart_block: false,
             in_held_signal_callback: false,
@@ -4404,6 +4449,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             self.injected_syscall_frame = Some(frame_address);
             self.pending_syscall = Some((nr, args));
 
+            self.in_syscall_callback = true;
             let retval = cancellable(self.cancel_handler.clone(), async {
                 self.process_state
                     .clone()
@@ -4411,6 +4457,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                     .await
             })
             .await;
+            self.in_syscall_callback = false;
 
             let retval = match retval {
                 Some(Err(error)) => match error.into_errno() {
@@ -5668,6 +5715,8 @@ impl<L: Tool + 'static> TracedTask<L> {
                     .tracee_context(tid, "wait after rt_sigreturn");
             }
             self.pending_syscall = Some((nr, args));
+
+            self.in_syscall_callback = true;
             let retval = cancellable(self.cancel_handler.clone(), async {
                 self.process_state
                     .clone()
@@ -5675,6 +5724,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                     .await
             })
             .await;
+            self.in_syscall_callback = false;
 
             let retval = match retval {
                 Some(Err(error)) if !matches!(error, reverie::Error::Errno(_)) => {
@@ -9201,6 +9251,64 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
         }
     }
 
+    /// `PTRACE_SETSIGMASK` on the stopped thread. Every refusal comes before
+    /// the write: outside a syscall callback, in a frame-mode event or a
+    /// signal callback, or on a tracer thread a seccomp filter may restrict
+    /// (`may_set_blocked_signals`); and when `PTRACE_GETSIGMASK` differs from
+    /// procfs `SigBlk`, which means a mask-swapping syscall's temporary mask
+    /// is in effect with its restore pending (`TIF_RESTORE_SIGMASK`): a ptrace
+    /// mask write would discard that restore, so the signal the temporary mask
+    /// admits would no longer be delivered under it. When the two agree, a
+    /// pending restore would put back the mask already in effect, so
+    /// discarding it changes nothing the guest can see. The written mask is
+    /// read back; if it is not the one written, the old one is written again
+    /// and the call fails, saying whether that succeeded.
+    async fn set_blocked_signals(&mut self, mask: u64) -> Result<u64, reverie::MaskChangeRefused> {
+        if !may_set_blocked_signals(
+            self.in_syscall_callback,
+            self.injected_syscall_frame.is_some(),
+            self.in_signal_callback || self.in_held_signal_callback,
+            thread_may_be_seccomp_filtered(),
+        ) {
+            return Err(reverie::MaskChangeRefused::Unsupported);
+        }
+        let task = self.assume_stopped();
+        let old = task
+            .getsigmask()
+            .map_err(|error| mask_change_failure(error, false))?;
+        let effective =
+            blocked_signal_mask(self.tid()).map_err(|error| mask_change_failure(error, false))?;
+        if effective != old {
+            return Err(reverie::MaskChangeRefused::RestorePending {
+                saved: old,
+                effective,
+            });
+        }
+        let new = mask_keeping_never_shielded(mask, old);
+        task.setsigmask(new)
+            .map_err(|error| mask_change_failure(error, false))?;
+        let written = task
+            .getsigmask()
+            .map_err(|error| mask_change_failure(error, true))?;
+        if written == new {
+            return Ok(old);
+        }
+        // The kernel stored another mask than the one written. Put the old one
+        // back and say whether that took.
+        let restored = task.setsigmask(old).and_then(|()| task.getsigmask());
+        Err(match restored {
+            Ok(mask) if mask == old => reverie::MaskChangeRefused::Failed {
+                errno: Errno::EIO,
+                mask_unknown: false,
+            },
+            Ok(_) => reverie::MaskChangeRefused::Failed {
+                errno: Errno::EIO,
+                mask_unknown: true,
+            },
+            Err(error) => mask_change_failure(error, true),
+        })
+    }
+
     async fn set_regs(&mut self, regs: libc::user_regs_struct) -> Result<(), reverie::Error> {
         let task = self.assume_stopped();
 
@@ -9474,6 +9582,44 @@ mod exec_owner_tests;
 
 #[cfg(test)]
 mod tests {
+    /// `set_blocked_signals` never adds SIGTRAP or the timer signal and never
+    /// clears a guest's own block of them, so restoring `old` is exact.
+    #[test]
+    fn set_blocked_signals_keeps_the_never_shielded_bits_of_the_old_mask() {
+        use super::NEVER_SHIELDED;
+        use super::mask_keeping_never_shielded;
+        let bit = |signal: i32| 1u64 << (signal - 1);
+        let trap = bit(libc::SIGTRAP);
+        let timer = bit(reverie::PERF_EVENT_SIGNAL as i32);
+        let usr1 = bit(libc::SIGUSR1);
+        // A full request over a mask that blocks neither: neither is added.
+        let new = mask_keeping_never_shielded(!0, usr1);
+        assert_eq!(new & (trap | timer), 0);
+        assert_eq!(new, !NEVER_SHIELDED);
+        // The guest blocks both itself: a request that clears every bit keeps them.
+        let old = trap | timer | usr1;
+        assert_eq!(mask_keeping_never_shielded(0, old), trap | timer);
+        // A full request keeps them as well, and restoring `old` is exact.
+        let new = mask_keeping_never_shielded(!0, old);
+        assert_eq!(new & (trap | timer), trap | timer);
+        assert_eq!(mask_keeping_never_shielded(old, new), old);
+        // SIGKILL and SIGSTOP, which the kernel ignores, are never written.
+        let unblockable = bit(libc::SIGKILL) | bit(libc::SIGSTOP);
+        assert_eq!(mask_keeping_never_shielded(!0, 0) & unblockable, 0);
+    }
+
+    /// The mask changes only in a syscall callback, outside a frame-mode event
+    /// and a signal callback, on a tracer thread no seccomp filter restricts.
+    #[test]
+    fn set_blocked_signals_is_refused_outside_a_plain_syscall_callback() {
+        use super::may_set_blocked_signals;
+        assert!(may_set_blocked_signals(true, false, false, false));
+        assert!(!may_set_blocked_signals(false, false, false, false));
+        assert!(!may_set_blocked_signals(true, true, false, false));
+        assert!(!may_set_blocked_signals(true, false, true, false));
+        assert!(!may_set_blocked_signals(true, false, false, true));
+    }
+
     #[test]
     fn a_timer_is_notified_after_a_return_only_through_a_known_open_mask() {
         use reverie::SigreturnFrame;

@@ -54,6 +54,48 @@ pub struct DetlogMemoryRegion {
     pub end: u64,
 }
 
+/// Why [`Guest::set_blocked_signals`] changed nothing, or could not confirm
+/// the change it made.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    thiserror::Error,
+    serde::Serialize,
+    serde::Deserialize
+)]
+pub enum MaskChangeRefused {
+    /// The backend cannot change the mask at this stop. Nothing was changed.
+    #[error("the backend cannot set the blocked-signal mask at this stop")]
+    Unsupported,
+    /// A mask-swapping syscall's temporary mask (`effective`) is in effect and
+    /// its restore of `saved` is pending; changing the mask would discard that
+    /// restore. Nothing was changed.
+    #[error("a temporary signal mask {effective:#x} is in effect, restoring {saved:#x}")]
+    RestorePending {
+        /// The mask the pending restore would put back.
+        saved: u64,
+        /// The mask the kernel dequeues under now.
+        effective: u64,
+    },
+    /// The thread is gone. Nothing will resume it.
+    #[error("the thread is gone")]
+    Gone,
+    /// The change failed with `errno`. When `mask_unknown` is false, the
+    /// mask is the one before the call; otherwise putting it back failed too,
+    /// and the thread's mask is unknown.
+    #[error("setting the blocked-signal mask failed ({errno}); mask unknown: {mask_unknown}")]
+    Failed {
+        /// The error that stopped the change, or the one that stopped putting
+        /// the old mask back.
+        errno: Errno,
+        /// Whether the thread's mask may be neither the old nor the new one.
+        mask_unknown: bool,
+    },
+}
+
 /// A representation of a guest task (thread).
 #[async_trait]
 pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
@@ -557,6 +599,32 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
         })
     }
 
+    /// Sets the stopped thread's blocked-signal mask to `mask`, without
+    /// running any guest code, and returns the mask it replaced. Bit `n - 1`
+    /// stands for signal `n`.
+    ///
+    /// No instruction runs, so no pending signal is dequeued: every signal
+    /// pending when this is called is still pending afterwards, and is
+    /// delivered by the kernel, in its own order, once the guest runs with a
+    /// mask that admits it. The caller owns putting the returned mask back
+    /// before the guest resumes.
+    ///
+    /// The signals a backend needs for itself (on ptrace: SIGTRAP and the
+    /// timer signal, besides SIGKILL and SIGSTOP, which cannot be blocked) are
+    /// never added, and a guest's own block of them is kept: their bits in the
+    /// new mask are those of the replaced one. Putting the returned mask back
+    /// therefore restores exactly the mask that was there.
+    ///
+    /// Every refusal happens before anything is changed. A backend refuses
+    /// ([`MaskChangeRefused::Unsupported`]) outside the stops where it can
+    /// make the change atomically, and when the thread runs under a
+    /// mask-swapping syscall's temporary mask whose restore is still pending
+    /// ([`MaskChangeRefused::RestorePending`]): changing the mask then would
+    /// discard that restore. The default refuses always and changes nothing.
+    async fn set_blocked_signals(&mut self, _mask: u64) -> Result<u64, MaskChangeRefused> {
+        Err(MaskChangeRefused::Unsupported)
+    }
+
     /// Like [`Guest::inject`], but will retry the syscall if `EINTR` or
     /// `ERESTARTSYS` are returned.
     ///
@@ -980,6 +1048,10 @@ where
         context: crate::ParkedSignalFailureContext,
     ) -> Result<Never, crate::SignalObservationFailure> {
         self.inner.cancel_parked_signal(context).await
+    }
+
+    async fn set_blocked_signals(&mut self, mask: u64) -> Result<u64, MaskChangeRefused> {
+        self.inner.set_blocked_signals(mask).await
     }
 
     fn set_timer(&mut self, sched: TimerSchedule) -> Result<(), Error> {
