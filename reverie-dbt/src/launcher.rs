@@ -1963,6 +1963,81 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    #[ignore = "requires built DynamoRIO and native client; run explicitly with --ignored"]
+    async fn queued_launch_readiness_survives_coordinator_cancellation() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("coordinator.sock");
+        let requested = Arc::new(AtomicBool::new(false));
+        let server = RpcServer::bind_with_readiness(
+            &socket,
+            Arc::new(crate::Counter2Global::default()),
+            (),
+            Arc::clone(&requested),
+        )
+        .unwrap();
+        let evidence = tempfile::tempfile().unwrap();
+        let runner = DbtRunner::from_env()
+            .expect("DYNAMORIO_HOME and REVERIE_DBT_CLIENT must select the live native client")
+            .evidence_file(&evidence)
+            .unwrap()
+            .defer_evidence_finish()
+            .terminate_process_group_on_exit(true)
+            .client_argument("-external-global");
+        let mut guest = Command::new("/bin/echo");
+        guest
+            .arg("application-started")
+            .env("HERMIT_DBT_COUNTER2", "1");
+        let mut command = runner.command(&guest, None);
+        command
+            .env(crate::sync_rpc::RPC_SOCKET_ENV, &socket)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = runner.spawn_command(&mut command).unwrap();
+        let pid = child.id() as i32;
+        drop(command);
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let (done, completed) = std::sync::mpsc::channel();
+        let waiting_runner = runner.clone();
+        let waiter = std::thread::spawn(move || {
+            let _ = done.send(waiting_runner.wait_with_output(child, Some(sender)));
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while receiver.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // Observe successful send without consuming readiness. This is the
+        // window after setup succeeds but before run_with_global serves RPC.
+        let readiness_queued = !receiver.is_empty();
+        drop(receiver);
+        drop(server);
+        let result = completed.recv_timeout(std::time::Duration::from_secs(10));
+        if result.is_err() {
+            // Bound a regression without allowing cleanup to make it pass.
+            terminate_process_group(pid).unwrap();
+        }
+        waiter.join().unwrap();
+        assert!(readiness_queued, "launch readiness was not queued");
+        let output = result
+            .expect("cancelled coordinator left its guest running")
+            .unwrap();
+        assert_eq!(output.status.signal(), Some(libc::SIGKILL), "{output:?}");
+        assert!(output.stdout.is_empty(), "application ran: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("reverie-dbt: startup refused:"),
+            "the real initial-config request did not refuse startup: {output:?}"
+        );
+        assert!(!requested.load(Ordering::Acquire));
+        assert!(runner.finish_deferred_evidence(output.status).is_err());
+        let waited = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+        assert_eq!(waited, -1);
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+
     fn write_executable_script(path: &Path, contents: &[u8]) {
         use std::os::unix::fs::PermissionsExt as _;
 
