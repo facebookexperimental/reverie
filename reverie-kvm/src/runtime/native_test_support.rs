@@ -79,27 +79,38 @@ struct NoInstructions<'a> {
     executor: &'a ElfExecutor,
     failure: FailureContext,
 }
-impl<T: Tool> GuestSyscallExecutor<T> for NoInstructions<'_> {
-    fn parent_pid(&self) -> Option<Pid> {
-        self.executor.parent_pid()
+impl LinuxProvider for NoInstructions<'_> {
+    fn execute(&mut self, _: &SyscallRequest, _: &GuestMemory) -> Result<ProviderOutcome> {
+        panic!("native Tool control must not inject a guest instruction")
     }
+}
+
+impl LinuxEmuSignalControl for NoInstructions<'_> {
     fn signal_task_identity(&self) -> Option<reverie::SignalTaskIdentity> {
         self.executor.signal_task_identity()
     }
+
     // Native callbacks answer Guest::signal_control_mode from the same shared
     // registry the production adapter reads, so they cannot disagree with the
     // mode the root owner installed.
     fn signal_controlled(&self) -> bool {
         self.executor.signal_controlled()
     }
+}
+
+impl LinuxEmuMemoryMap for NoInstructions<'_> {}
+
+impl<T: Tool> GuestSyscallExecutor<T> for NoInstructions<'_> {
+    fn traced_parent(&self) -> Option<Pid> {
+        self.executor.parent_pid()
+    }
+
     fn failure_subscription(&self) -> Option<crate::failure::FailureSubscription> {
         Some(self.failure.run.subscribe())
     }
+
     fn read_clock(&self) -> Result<u64> {
         panic!("native Tool control must disable guest clock operations")
-    }
-    fn execute(&mut self, _: &SyscallRequest, _: &GuestMemory) -> Result<i64> {
-        panic!("native Tool control must not inject a guest instruction")
     }
 }
 

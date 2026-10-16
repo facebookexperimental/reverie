@@ -138,12 +138,19 @@ impl Tool for RpcTool {
 }
 
 struct NoGuestExecution;
+impl LinuxProvider for NoGuestExecution {
+    fn execute(&mut self, _: &SyscallRequest, _: &GuestMemory) -> Result<ProviderOutcome> {
+        panic!("native RPC control continued guest execution")
+    }
+}
+
+impl LinuxEmuSignalControl for NoGuestExecution {}
+
+impl LinuxEmuMemoryMap for NoGuestExecution {}
+
 impl GuestSyscallExecutor<RpcTool> for NoGuestExecution {
     fn read_clock(&self) -> Result<u64> {
         panic!("native RPC control read a guest clock")
-    }
-    fn execute(&mut self, _: &SyscallRequest, _: &GuestMemory) -> Result<i64> {
-        panic!("native RPC control continued guest execution")
     }
 }
 

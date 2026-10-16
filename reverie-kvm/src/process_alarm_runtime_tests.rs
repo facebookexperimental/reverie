@@ -29,6 +29,26 @@ struct QueueExecutor {
     outcome: ProcessAlarmSignalOutcome,
     calls: usize,
 }
+impl LinuxProvider for QueueExecutor {
+    fn execute(&mut self, _: &SyscallRequest, _: &GuestMemory) -> Result<ProviderOutcome> {
+        panic!("queue operation executed a guest syscall")
+    }
+}
+
+impl LinuxEmuSignalControl for QueueExecutor {
+    fn defer_signal_delivery(&mut self, _: SignalEvent) -> std::result::Result<(), Errno> {
+        panic!("queue operation used private signal deferral")
+    }
+
+    fn queue_process_alarm_signal(&mut self, event: SignalEvent) -> ProcessAlarmSignalOutcome {
+        assert_eq!(event, self.expected);
+        self.calls += 1;
+        self.outcome
+    }
+}
+
+impl LinuxEmuMemoryMap for QueueExecutor {}
+
 impl GuestSyscallExecutor<AdapterTool> for QueueExecutor {
     fn read_clock(&self) -> Result<u64> {
         Err(Error::GuestClock(
@@ -36,17 +56,6 @@ impl GuestSyscallExecutor<AdapterTool> for QueueExecutor {
         ))
     }
 
-    fn execute(&mut self, _: &SyscallRequest, _: &GuestMemory) -> Result<i64> {
-        panic!("queue operation executed a guest syscall")
-    }
-    fn defer_signal_delivery(&mut self, _: SignalEvent) -> std::result::Result<(), Errno> {
-        panic!("queue operation used private signal deferral")
-    }
-    fn queue_process_alarm_signal(&mut self, event: SignalEvent) -> ProcessAlarmSignalOutcome {
-        assert_eq!(event, self.expected);
-        self.calls += 1;
-        self.outcome
-    }
     fn complete_injection<'a>(
         &'a mut self,
         _: ToolContext<'a, AdapterTool>,
@@ -166,12 +175,19 @@ fn process_alarm_signal_into_guest_forwards_complete_outcomes_without_guest_effe
 }
 
 struct UnsupportedExecutor;
+impl LinuxProvider for UnsupportedExecutor {
+    fn execute(&mut self, _: &SyscallRequest, _: &GuestMemory) -> Result<ProviderOutcome> {
+        panic!("refusal executed a guest syscall")
+    }
+}
+
+impl LinuxEmuSignalControl for UnsupportedExecutor {}
+
+impl LinuxEmuMemoryMap for UnsupportedExecutor {}
+
 impl GuestSyscallExecutor<AdapterTool> for UnsupportedExecutor {
     fn read_clock(&self) -> Result<u64> {
         panic!("refusal read a guest counter")
-    }
-    fn execute(&mut self, _: &SyscallRequest, _: &GuestMemory) -> Result<i64> {
-        panic!("refusal executed a guest syscall")
     }
 }
 

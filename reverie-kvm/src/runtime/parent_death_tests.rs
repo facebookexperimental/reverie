@@ -146,7 +146,7 @@ fn initial_exec_preflight_requires_original_context_and_keeps_enrollment_after_r
             polled_read_attempt: None,
             process_completed: &mut completed,
         };
-        assert_eq!(<StaticElfSyscallExecutor<'_> as GuestSyscallExecutor<()>>::parent_death_syscall_preflight(
+        assert_eq!(<StaticElfSyscallExecutor<'_> as LinuxEmuSignalControl>::parent_death_syscall_preflight(
             &e, original.into_syscall().unwrap()).unwrap(), reverie::ParentDeathSyscallAdmission::Unenrolled);
     }
     assert_eq!(
@@ -179,11 +179,11 @@ fn initial_exec_preflight_requires_original_context_and_keeps_enrollment_after_r
             polled_read_attempt: None,
             process_completed: &mut completed,
         };
-        assert!(<StaticElfSyscallExecutor<'_> as GuestSyscallExecutor<()>>::parent_death_syscall_preflight(
+        assert!(<StaticElfSyscallExecutor<'_> as LinuxEmuSignalControl>::parent_death_syscall_preflight(
             &e, original.into_syscall().unwrap()).is_err(), "missing original is not an unenrolled proof");
         assert!(
             matches!(
-                <StaticElfSyscallExecutor<'_> as GuestSyscallExecutor<()>>::execute(
+                <StaticElfSyscallExecutor<'_> as LinuxProvider>::execute(
                     &mut e, &original, &memory
                 ),
                 Err(crate::Error::ParentDeathSignal { .. })
@@ -194,14 +194,14 @@ fn initial_exec_preflight_requires_original_context_and_keeps_enrollment_after_r
         e.process_context =
             ProcessExecutionContext::SyscallBoundary(CompletedSyscallBoundary::for_test());
         e.original_syscall = Some(original);
-        assert!(<StaticElfSyscallExecutor<'_> as GuestSyscallExecutor<()>>::parent_death_syscall_preflight(
+        assert!(<StaticElfSyscallExecutor<'_> as LinuxEmuSignalControl>::parent_death_syscall_preflight(
             &e, original.into_syscall().unwrap()).is_err(), "raw original exec without retained image is not authority");
         let ordinary = SyscallRequest::new(libc::SYS_getuid as u64, [0; 6]);
         e.original_syscall = Some(ordinary);
-        assert_eq!(<StaticElfSyscallExecutor<'_> as GuestSyscallExecutor<()>>::parent_death_syscall_preflight(
+        assert_eq!(<StaticElfSyscallExecutor<'_> as LinuxEmuSignalControl>::parent_death_syscall_preflight(
             &e, ordinary.into_syscall().unwrap()).unwrap(), reverie::ParentDeathSyscallAdmission::Admitted);
         e.last_result = Some(0);
-        assert!(<StaticElfSyscallExecutor<'_> as GuestSyscallExecutor<()>>::parent_death_syscall_preflight(
+        assert!(<StaticElfSyscallExecutor<'_> as LinuxEmuSignalControl>::parent_death_syscall_preflight(
             &e, ordinary.into_syscall().unwrap()).is_err(), "completed injection invalidates original-call proof");
     }
     // Ordinary exec reaches ImageReplaced, not a second synthetic initial
@@ -250,14 +250,12 @@ fn default_preflight_refuses_but_live_unopted_static_executor_continues() {
             polled_read_attempt: None,
             process_completed: &mut completed,
         };
-        assert_eq!(<StaticElfSyscallExecutor<'_> as GuestSyscallExecutor<()>>::parent_death_syscall_preflight(
+        assert_eq!(<StaticElfSyscallExecutor<'_> as LinuxEmuSignalControl>::parent_death_syscall_preflight(
             &e, original.into_syscall().unwrap()).unwrap(), reverie::ParentDeathSyscallAdmission::Unenrolled);
         assert_eq!(
-            <StaticElfSyscallExecutor<'_> as GuestSyscallExecutor<()>>::execute(
-                &mut e, &original, &memory
-            )
-            .unwrap(),
-            0
+            <StaticElfSyscallExecutor<'_> as LinuxProvider>::execute(&mut e, &original, &memory)
+                .unwrap(),
+            ProviderOutcome::Return(0)
         );
     }
     for (signal, expected) in [(0, 0), (libc::SIGUSR1, -i64::from(libc::ENOSYS))] {
@@ -280,7 +278,7 @@ fn default_preflight_refuses_but_live_unopted_static_executor_continues() {
         vcpu: &backend.vcpu,
     };
     assert!(matches!(
-        <DirectSyscallExecutor<'_> as GuestSyscallExecutor<()>>::parent_death_syscall_preflight(
+        <DirectSyscallExecutor<'_> as LinuxEmuSignalControl>::parent_death_syscall_preflight(
             &direct,
             original.into_syscall().unwrap()
         ),
@@ -357,7 +355,7 @@ fn original_exec_callback_drop_revokes_staged_image_without_injection() {
             polled_read_attempt: None,
             process_completed: &mut completed,
         };
-        assert_eq!(<StaticElfSyscallExecutor<'_> as GuestSyscallExecutor<()>>::parent_death_syscall_preflight(
+        assert_eq!(<StaticElfSyscallExecutor<'_> as LinuxEmuSignalControl>::parent_death_syscall_preflight(
             &e, original.into_syscall().unwrap()).unwrap(), reverie::ParentDeathSyscallAdmission::Admitted);
         // Model an early Tool mode refusal/cancelled callback: no injection.
     }

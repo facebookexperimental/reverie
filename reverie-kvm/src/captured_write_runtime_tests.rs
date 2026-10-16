@@ -27,12 +27,19 @@ impl Tool for Upper {
 }
 
 struct Unsupported;
+impl LinuxProvider for Unsupported {
+    fn execute(&mut self, _: &SyscallRequest, _: &GuestMemory) -> Result<ProviderOutcome> {
+        panic!("capability query executed a syscall")
+    }
+}
+
+impl LinuxEmuSignalControl for Unsupported {}
+
+impl LinuxEmuMemoryMap for Unsupported {}
+
 impl GuestSyscallExecutor<Upper> for Unsupported {
     fn read_clock(&self) -> Result<u64> {
         panic!("capability query read a clock")
-    }
-    fn execute(&mut self, _: &SyscallRequest, _: &GuestMemory) -> Result<i64> {
-        panic!("capability query executed a syscall")
     }
 }
 struct Capable {
@@ -40,17 +47,25 @@ struct Capable {
     site: CallbackSignalSite,
     queries: AtomicU64,
 }
-impl GuestSyscallExecutor<Upper> for Capable {
-    fn read_clock(&self) -> Result<u64> {
-        panic!("capability query read a clock")
-    }
-    fn execute(&mut self, _: &SyscallRequest, _: &GuestMemory) -> Result<i64> {
+impl LinuxProvider for Capable {
+    fn execute(&mut self, _: &SyscallRequest, _: &GuestMemory) -> Result<ProviderOutcome> {
         panic!("capability query executed a syscall")
     }
+}
+
+impl LinuxEmuSignalControl for Capable {
     fn captured_write_signal_site(&self, call: Write) -> Option<CallbackSignalSite> {
         assert_eq!(call, self.call);
         self.queries.fetch_add(1, Ordering::SeqCst);
         Some(self.site)
+    }
+}
+
+impl LinuxEmuMemoryMap for Capable {}
+
+impl GuestSyscallExecutor<Upper> for Capable {
+    fn read_clock(&self) -> Result<u64> {
+        panic!("capability query read a clock")
     }
 }
 

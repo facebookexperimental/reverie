@@ -36,6 +36,7 @@ mod fdinfo;
 mod memory;
 pub mod native_exit_broker;
 mod proc_mounts;
+mod provider;
 mod provider_memory;
 mod runtime;
 mod signal;

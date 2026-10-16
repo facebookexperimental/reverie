@@ -117,6 +117,10 @@ pub(crate) mod entry_wait_observation {
     }
 }
 use crate::memory::UserMemory;
+use crate::provider::LinuxEmuMemoryMap;
+use crate::provider::LinuxEmuSignalControl;
+use crate::provider::LinuxProvider;
+use crate::provider::ProviderOutcome;
 use crate::vm::CompletedSyscallBoundary;
 use crate::vm::ProcessActionContinuation;
 use crate::vm::ProcessActionOutcome;
@@ -314,148 +318,32 @@ pub(crate) struct ToolContext<'a, T: Tool> {
 }
 
 // TODO-HUMAN-REVIEW(PR-192): Review async KVM process-action completion.
-trait GuestSyscallExecutor<T: Tool>: Send + Sync {
+/// The KVM backend's injection adapter: what `KvmGuest` needs to serve one
+/// guest callback.
+///
+/// The Linux syscall provider is reached through the supertraits:
+/// [`LinuxProvider`] is the provider-neutral core (`execute`,
+/// `take_unsupported_refusal`), and [`LinuxEmuSignalControl`] and
+/// [`LinuxEmuMemoryMap`] are today's executor's own extensions (see
+/// `provider.rs`). The methods declared here are backend mechanics, on no
+/// provider trait: the vCPU clock, CPUID interception, the run's failure
+/// subscription, the adapter's signal guard, the two injection admission
+/// checks, the traced-parent query behind `Guest::ppid`, and the completion
+/// of process actions. The trait is generic over the Tool only because
+/// `complete_injection` starts child Tool instances.
+trait GuestSyscallExecutor<T: Tool>: LinuxProvider + LinuxEmuSignalControl + LinuxEmuMemoryMap {
     fn read_clock(&self) -> Result<u64>;
 
     fn has_cpuid_interception(&self) -> bool {
         false
     }
 
-    fn execute(&mut self, request: &SyscallRequest, memory: &GuestMemory) -> Result<i64>;
-
-    /// Takes the typed refusal of the last `execute`, when the backend declined
-    /// it as an operation it cannot perform.
-    fn take_unsupported_refusal(&mut self) -> Option<reverie::UnsupportedRefusal> {
-        None
-    }
-
-    /// Reserve backend bookkeeping before executing an injected syscall.
-    /// Refusal is terminal backend failure, never an emulated syscall errno.
-    fn prepare_signal_effects(&mut self) -> std::result::Result<(), Errno> {
-        Ok(())
-    }
-
     fn failure_subscription(&self) -> Option<crate::failure::FailureSubscription> {
         None
     }
 
-    fn defer_signal_delivery(&mut self, _event: SignalEvent) -> std::result::Result<(), Errno> {
-        Err(Errno::ENOSYS)
-    }
-
-    fn queue_child_exit_signal(&mut self, _event: SignalEvent) -> reverie::ChildExitSignalOutcome {
-        reverie::ChildExitSignalOutcome::RejectedBeforeCommit {
-            kind: reverie::ChildExitSignalErrorKind::Unsupported,
-            errno: Errno::ENOSYS,
-        }
-    }
-
-    fn queue_process_alarm_signal(
-        &mut self,
-        _event: SignalEvent,
-    ) -> reverie::ProcessAlarmSignalOutcome {
-        reverie::ProcessAlarmSignalOutcome::RejectedBeforeCommit {
-            kind: reverie::ProcessAlarmSignalErrorKind::Unsupported,
-            errno: Errno::ENOSYS,
-        }
-    }
-
-    fn signal_controlled(&self) -> bool {
-        false
-    }
-    fn finish_parked_delivery(&mut self) {}
-
-    fn signal_task_identity(&self) -> Option<reverie::SignalTaskIdentity> {
-        None
-    }
-    fn begin_signal_callback(&mut self) -> Option<reverie::CallbackSignalSite> {
-        None
-    }
-    fn parked_signal_site(&self) -> Option<reverie::CallbackSignalSite> {
-        None
-    }
-    fn invalidate_polled_read_attempt(&mut self) {}
-
-    fn polled_read_signal_site(
-        &self,
-        _call: reverie::syscalls::Read,
-    ) -> Option<reverie::CallbackSignalSite> {
-        None
-    }
-    fn captured_write_signal_site(
-        &self,
-        _call: reverie::syscalls::Write,
-    ) -> Option<reverie::CallbackSignalSite> {
-        None
-    }
-    fn parent_death_syscall_preflight(
-        &self,
-        _call: reverie::syscalls::Syscall,
-    ) -> std::result::Result<reverie::ParentDeathSyscallAdmission, reverie::Error> {
-        Err(Errno::ENOSYS.into())
-    }
     fn set_signal_guard(&mut self, _guard: SignalGuard) -> SignalGuard {
         SignalGuard::Ordinary
-    }
-    fn admit_signal_observation(
-        &mut self,
-        _site: reverie::CallbackSignalSite,
-        _lease: reverie::ParkedObservationLease,
-    ) -> std::result::Result<(), Errno> {
-        Err(Errno::ENOSYS)
-    }
-    fn signal_failure_context_is_current(
-        &self,
-        _context: reverie::ParkedSignalFailureContext,
-    ) -> bool {
-        false
-    }
-    fn signal_dequeue_front(&self) -> Option<reverie::SignalDequeue> {
-        None
-    }
-    fn poll_signal_dequeue(
-        &self,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<Option<reverie::SignalDequeue>>> {
-        std::task::Poll::Ready(Ok(self.signal_dequeue_front()))
-    }
-    fn acknowledge_signal_dequeue(
-        &mut self,
-        _effect: reverie::SignalDequeue,
-    ) -> std::result::Result<(), Errno> {
-        Err(Errno::ENOSYS)
-    }
-    fn retain_signal_dequeue(&mut self, _effect: reverie::SignalDequeue) {}
-    fn retain_signal_effect_result(&mut self, _raw: Option<i64>) {}
-    fn signal_failure_context(&self) -> Option<reverie::ParkedSignalFailureContext> {
-        None
-    }
-    fn with_signal_effects(&mut self, error: Error, _raw: Option<i64>) -> Error {
-        error
-    }
-    fn take_signal_for_observation(&mut self) -> std::result::Result<Option<PendingSignal>, Errno> {
-        Err(Errno::ENOSYS)
-    }
-    fn filter_signal_replacement(
-        &mut self,
-        _event: SignalEvent,
-        _domain: crate::executor::PendingSignalDomain,
-    ) -> std::result::Result<Option<PendingSignal>, Errno> {
-        Err(Errno::ENOSYS)
-    }
-    fn signal_disposition(&self, _signal: i32) -> crate::executor::SignalDisposition {
-        crate::executor::SignalDisposition::Terminate
-    }
-    fn reserve_signal_delivery(
-        &mut self,
-        _pending: PendingSignal,
-        _id: reverie::DequeueId,
-        _fatal: bool,
-    ) -> std::result::Result<reverie::PreparedSignalToken, Errno> {
-        Err(Errno::ENOSYS)
-    }
-    fn prepared_signal_is_fatal(&self, _token: reverie::PreparedSignalToken) -> bool {
-        false
     }
 
     fn ordinary_injection_allowed(&self, _request: &SyscallRequest) -> bool {
@@ -467,15 +355,16 @@ trait GuestSyscallExecutor<T: Tool>: Send + Sync {
     }
 
     // TODO-HUMAN-REVIEW(PR-235): Review virtual process ancestry exposed to Tool handlers.
-    fn parent_pid(&self) -> Option<Pid> {
-        None
-    }
-
-    /// The brk-managed heap region `[heap_base, program_break)` of the guest,
-    /// when this executor backs a loaded static ELF. `None` for executors that
-    /// do not model a heap (e.g. the direct pass-through executor). Used to
-    /// report the guest heap region for deterministic memory-map logging.
-    fn heap_region(&self) -> Option<(u64, u64)> {
+    /// The traced parent of the issuing task: the task the Tool treats as
+    /// this task's parent in the traced process tree, reported to the Tool as
+    /// `Guest::ppid`. `None` for the Tool's root task, which is how the Tool
+    /// recognises the root, and for an adapter that tracks no tree.
+    ///
+    /// This is not Linux `getppid(2)`: the root's `getppid` is its namespace
+    /// parent (1, or 0 for the container init), and an orphan's `getppid`
+    /// changes to the reaper when it is reparented, while this query keeps
+    /// the fork-time parent, as the ptrace backend's `Guest::ppid` does.
+    fn traced_parent(&self) -> Option<Pid> {
         None
     }
 
@@ -499,13 +388,32 @@ struct DirectSyscallExecutor<'a> {
     vcpu: &'a crate::clock::CountedVcpu,
 }
 
+/// The second, trivial [`LinuxProvider`]: it passes each request to a
+/// caller-supplied [`SyscallExecutor`] and returns its raw result. It models
+/// no process ancestry and records no refusals, and it takes every
+/// [`LinuxEmuSignalControl`] and [`LinuxEmuMemoryMap`] default, so it refuses
+/// the executor's signal parking protocol and reports no heap. That is what
+/// it has always answered; it shows that `KvmGuest::inject` works with a
+/// provider other than the static-ELF executor.
+impl LinuxProvider for DirectSyscallExecutor<'_> {
+    fn execute(
+        &mut self,
+        request: &SyscallRequest,
+        memory: &GuestMemory,
+    ) -> Result<ProviderOutcome> {
+        Ok(ProviderOutcome::Return(
+            self.executor.execute(request, memory),
+        ))
+    }
+}
+
+impl LinuxEmuSignalControl for DirectSyscallExecutor<'_> {}
+
+impl LinuxEmuMemoryMap for DirectSyscallExecutor<'_> {}
+
 impl<T: Tool> GuestSyscallExecutor<T> for DirectSyscallExecutor<'_> {
     fn read_clock(&self) -> Result<u64> {
         self.vcpu.read_clock()
-    }
-
-    fn execute(&mut self, request: &SyscallRequest, memory: &GuestMemory) -> Result<i64> {
-        Ok(self.executor.execute(request, memory))
     }
 }
 
@@ -702,29 +610,51 @@ impl Drop for StaticElfSyscallExecutor<'_> {
     }
 }
 
-impl<T> GuestSyscallExecutor<T> for StaticElfSyscallExecutor<'_>
-where
-    T: Tool + 'static,
-    T::ThreadState: 'static,
-    T::GlobalState: 'static,
-    <T::GlobalState as GlobalTool>::Config: 'static,
-{
-    fn read_clock(&self) -> Result<u64> {
-        self.backend.vcpu.read_clock()
-    }
-
-    fn has_cpuid_interception(&self) -> bool {
-        self.backend.has_cpuid_interception()
-    }
-
-    fn failure_subscription(&self) -> Option<crate::failure::FailureSubscription> {
-        self.backend
-            .tool_failure
-            .as_ref()
-            .map(|failure| failure.run.subscribe())
-    }
-
-    fn execute(&mut self, request: &SyscallRequest, memory: &GuestMemory) -> Result<i64> {
+/// Today's executor (LinuxEmu) as the run's [`LinuxProvider`].
+///
+/// KVM- and executor-specific facts that the provider-neutral trait does not
+/// state:
+///
+/// - This adapter is the short-lived per-callback handle; the provider state
+///   is the run's [`ElfExecutor`] state it borrows. The executor's lock order
+///   is file table, then transaction, then lifecycle, then process, then
+///   thread.
+/// - `memory` is the KVM guest arena ([`GuestMemory`]) rather than a
+///   provider-neutral per-call context, because
+///   [`crate::provider_memory::GuestMemoryAccess`] lends operands through a
+///   generic associated type and so cannot yet be a trait object.
+/// - Only `Return` is produced. A staged segment base, process action
+///   (fork, clone, exec) or exit is left in the executor's side channels and
+///   consumed after `execute` by `complete_injection` and the vCPU loop.
+/// - `execute` still performs three backend admission checks before the
+///   executor sees the request (the signal guard and prepared-signal state,
+///   the lifecycle signal-mask preflight, and whether the callback context
+///   can carry an injected signal), and it completes the synthetic initial
+///   exec itself. The first and third answer a refused injection with
+///   `-ENOSYS`; the signal-mask preflight answers `-ENOSYS` when the new mask
+///   would make a pending signal deliverable, and otherwise may return the
+///   real errno `rt_sigprocmask` gives for its arguments (for example
+///   `-EFAULT` or `-EINVAL`). None of them records a refusal. Only the first
+///   is duplicated by `KvmGuest::inject`'s ordinary admission check, as a
+///   fail-closed backstop. Moving them to the backend side is left to a later
+///   step so that this one changes no result.
+/// - The executor does not yet meet the error model's refusal rule. It
+///   records a typed refusal for one case only, `execve`/`execveat` from a
+///   thread that is not the thread-group leader. About 128 other unsupported
+///   requests (the unsupported-syscall fallback, `rseq`, unsupported `fcntl`
+///   commands and `prctl` options, among others) answer a bare `-ENOSYS`
+///   without a refusal, as do the admission checks above. An absent refusal
+///   therefore does not establish that a request was supported.
+/// - The executor still produces some values for determinism itself (its
+///   own clock, random source, uname and credentials) instead of taking them
+///   from the Tool. That deviates from the provider contract and is
+///   scheduled for deletion, not for preservation.
+impl LinuxProvider for StaticElfSyscallExecutor<'_> {
+    fn execute(
+        &mut self,
+        request: &SyscallRequest,
+        memory: &GuestMemory,
+    ) -> Result<ProviderOutcome> {
         self.polled_read_attempt = None;
         // A refusal left by a syscall the guest issued without an injection
         // describes that syscall, not this one.
@@ -734,7 +664,9 @@ where
             // production executor fail-closed as well: a future Guest caller
             // must not execute an irreversible transition and only then learn
             // that SignalBoundary cannot resume its Tool hook.
-            return Ok(-(i64::from(Errno::ENOSYS.into_raw())));
+            return Ok(ProviderOutcome::Return(
+                -(i64::from(Errno::ENOSYS.into_raw())),
+            ));
         }
         if matches!(
             self.process_context,
@@ -743,14 +675,16 @@ where
             .executor
             .lifecycle_signal_mask_preflight(request, memory)
         {
-            return Ok(result);
+            return Ok(ProviderOutcome::Return(result));
         }
         if !self.process_context.injected_signal_allowed(request) {
             // A successful injected self-signal would become pending, but a
             // lifecycle callback has no transported userspace context in which
             // to run the structured hook or build a signal frame. Refuse before
             // mutating pending state instead of delaying it to another syscall.
-            return Ok(-(i64::from(Errno::ENOSYS.into_raw())));
+            return Ok(ProviderOutcome::Return(
+                -(i64::from(Errno::ENOSYS.into_raw())),
+            ));
         }
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-233): Review synthetic initial exec completion.
@@ -767,20 +701,22 @@ where
             }
             self.last_result = Some(0);
             self.process_context = ProcessExecutionContext::InitialExecCompleted;
-            return Ok(0);
+            return Ok(ProviderOutcome::Return(0));
         }
         let result = self
             .backend
             .execute_static_elf_syscall(self.executor, request, memory)?;
         self.last_result = Some(result);
         self.polled_read_attempt = Some((*request, result));
-        Ok(result)
+        Ok(ProviderOutcome::Return(result))
     }
 
     fn take_unsupported_refusal(&mut self) -> Option<reverie::UnsupportedRefusal> {
         self.executor.take_unsupported_refusal()
     }
+}
 
+impl LinuxEmuSignalControl for StaticElfSyscallExecutor<'_> {
     fn prepare_signal_effects(&mut self) -> std::result::Result<(), Errno> {
         self.executor.reserve_signal_effects(64)
     }
@@ -862,6 +798,7 @@ where
     fn signal_controlled(&self) -> bool {
         self.executor.signal_controlled()
     }
+
     fn finish_parked_delivery(&mut self) {
         self.executor.finish_parked_delivery();
     }
@@ -869,6 +806,7 @@ where
     fn signal_task_identity(&self) -> Option<reverie::SignalTaskIdentity> {
         self.executor.signal_task_identity()
     }
+
     fn begin_signal_callback(&mut self) -> Option<reverie::CallbackSignalSite> {
         // Only the driver's dequeue/structured-signal reborrows supply a site.
         // They consume the same operation's ledger, rather than beginning a
@@ -890,9 +828,11 @@ where
         // A continuation does not acquire original-syscall parked admission.
         self.current_parked_site()
     }
+
     fn parked_signal_site(&self) -> Option<reverie::CallbackSignalSite> {
         self.current_parked_site()
     }
+
     fn invalidate_polled_read_attempt(&mut self) {
         self.polled_read_attempt = None;
     }
@@ -911,6 +851,7 @@ where
         }
         self.current_parked_site()
     }
+
     fn captured_write_signal_site(
         &self,
         call: reverie::syscalls::Write,
@@ -928,6 +869,7 @@ where
         let fd = request.args()[0] as libc::c_int;
         self.executor.captured_write_site(site, fd)
     }
+
     fn parent_death_syscall_preflight(
         &self,
         call: reverie::syscalls::Syscall,
@@ -964,9 +906,7 @@ where
             )
             .map_err(|error| reverie::Error::Tool(error.into()))
     }
-    fn set_signal_guard(&mut self, guard: SignalGuard) -> SignalGuard {
-        std::mem::replace(&mut self.signal_guard, guard)
-    }
+
     fn admit_signal_observation(
         &mut self,
         site: reverie::CallbackSignalSite,
@@ -974,6 +914,7 @@ where
     ) -> std::result::Result<(), Errno> {
         self.executor.admit_signal_observation(site, lease)
     }
+
     fn signal_failure_context_is_current(
         &self,
         context: reverie::ParkedSignalFailureContext,
@@ -982,21 +923,26 @@ where
             && !*self.process_completed
             && self.executor.signal_failure_context_is_current(context)
     }
+
     fn signal_dequeue_front(&self) -> Option<reverie::SignalDequeue> {
         self.executor.signal_dequeue_front()
     }
+
     fn poll_signal_dequeue(
         &self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<Option<reverie::SignalDequeue>>> {
         self.executor.poll_signal_dequeue(cx)
     }
+
     fn retain_signal_dequeue(&mut self, effect: reverie::SignalDequeue) {
         self.executor.retain_signal_dequeue(effect);
     }
+
     fn retain_signal_effect_result(&mut self, raw: Option<i64>) {
         self.executor.retain_signal_effect_result(raw);
     }
+
     fn acknowledge_signal_dequeue(
         &mut self,
         effect: reverie::SignalDequeue,
@@ -1006,16 +952,20 @@ where
             .mark_signal_dequeue_acknowledged(effect.sequence);
         Ok(())
     }
+
     fn signal_failure_context(&self) -> Option<reverie::ParkedSignalFailureContext> {
         self.executor.signal_failure_context()
     }
+
     fn with_signal_effects(&mut self, error: Error, raw: Option<i64>) -> Error {
         self.executor.with_signal_effects(error, raw)
     }
+
     fn take_signal_for_observation(&mut self) -> std::result::Result<Option<PendingSignal>, Errno> {
         self.executor.reserve_signal_effects(1)?;
         self.executor.take_pending_signal_for_delivery()
     }
+
     fn filter_signal_replacement(
         &mut self,
         event: SignalEvent,
@@ -1024,9 +974,11 @@ where
         self.executor
             .prepare_filtered_signal_delivery(event, domain)
     }
+
     fn signal_disposition(&self, signal: i32) -> crate::executor::SignalDisposition {
         self.executor.signal_disposition(signal)
     }
+
     fn reserve_signal_delivery(
         &mut self,
         pending: PendingSignal,
@@ -1035,10 +987,48 @@ where
     ) -> std::result::Result<reverie::PreparedSignalToken, Errno> {
         self.executor.reserve_signal_delivery(pending, id, fatal)
     }
+
     fn prepared_signal_is_fatal(&self, token: reverie::PreparedSignalToken) -> bool {
         self.callback_site == Some(token.site)
             && !*self.process_completed
             && self.executor.prepared_signal_is_fatal(token)
+    }
+}
+
+impl LinuxEmuMemoryMap for StaticElfSyscallExecutor<'_> {
+    fn heap_region(&self) -> Option<(u64, u64)> {
+        Some(self.executor.heap_region())
+    }
+}
+
+impl<T> GuestSyscallExecutor<T> for StaticElfSyscallExecutor<'_>
+where
+    T: Tool + 'static,
+    T::ThreadState: 'static,
+    T::GlobalState: 'static,
+    <T::GlobalState as GlobalTool>::Config: 'static,
+{
+    fn read_clock(&self) -> Result<u64> {
+        self.backend.vcpu.read_clock()
+    }
+
+    fn has_cpuid_interception(&self) -> bool {
+        self.backend.has_cpuid_interception()
+    }
+
+    fn failure_subscription(&self) -> Option<crate::failure::FailureSubscription> {
+        self.backend
+            .tool_failure
+            .as_ref()
+            .map(|failure| failure.run.subscribe())
+    }
+
+    fn set_signal_guard(&mut self, guard: SignalGuard) -> SignalGuard {
+        std::mem::replace(&mut self.signal_guard, guard)
+    }
+
+    fn traced_parent(&self) -> Option<Pid> {
+        self.executor.parent_pid()
     }
 
     fn ordinary_injection_allowed(&self, request: &SyscallRequest) -> bool {
@@ -1049,14 +1039,6 @@ where
         self.signal_guard == SignalGuard::Ordinary
             && !self.executor.has_prepared_signal()
             && self.process_context.tail_injection_allowed(request)
-    }
-
-    fn parent_pid(&self) -> Option<Pid> {
-        self.executor.parent_pid()
-    }
-
-    fn heap_region(&self) -> Option<(u64, u64)> {
-        Some(self.executor.heap_region())
     }
 
     fn complete_injection<'a>(
@@ -1463,7 +1445,7 @@ impl<T: Tool> Guest<T> for KvmGuest<'_, T> {
     }
 
     fn ppid(&self) -> Option<Pid> {
-        self.executor.parent_pid()
+        self.executor.traced_parent()
     }
 
     // The KVM bootstrap builds page tables and loads the image from the host;
@@ -1658,9 +1640,11 @@ impl<T: Tool> Guest<T> for KvmGuest<'_, T> {
             return std::future::pending().await;
         }
         self.admit_ordinary_operation().await;
-        let raw = match self.executor.execute(&request, &self.memory) {
-            Ok(raw) => {
-                self.unsupported_refusal = self.executor.take_unsupported_refusal();
+        // The syscall itself goes only through the run's Linux provider.
+        let provider: &mut dyn LinuxProvider = &mut *self.executor;
+        let raw = match provider.execute(&request, &self.memory) {
+            Ok(ProviderOutcome::Return(raw)) => {
+                self.unsupported_refusal = provider.take_unsupported_refusal();
                 raw
             }
             Err(Error::ChildWaitGroupExit { status }) => {
@@ -7304,14 +7288,8 @@ mod tests {
 
     struct FailingSyscallExecutor;
 
-    impl GuestSyscallExecutor<crate::StraceTool> for FailingSyscallExecutor {
-        fn read_clock(&self) -> Result<u64> {
-            Err(Error::GuestClock(
-                "failing executor has no guest counter".into(),
-            ))
-        }
-
-        fn execute(&mut self, _: &SyscallRequest, _: &GuestMemory) -> Result<i64> {
+    impl LinuxProvider for FailingSyscallExecutor {
+        fn execute(&mut self, _: &SyscallRequest, _: &GuestMemory) -> Result<ProviderOutcome> {
             Err(Error::FamilyWaitLedgerMismatch {
                 parent: reverie::SignalProcessId {
                     tgid: Pid::from_raw(1),
@@ -7322,14 +7300,24 @@ mod tests {
         }
     }
 
-    impl GuestSyscallExecutor<crate::StraceTool> for SideEffectingExecutor {
+    impl LinuxEmuSignalControl for FailingSyscallExecutor {}
+
+    impl LinuxEmuMemoryMap for FailingSyscallExecutor {}
+
+    impl GuestSyscallExecutor<crate::StraceTool> for FailingSyscallExecutor {
         fn read_clock(&self) -> Result<u64> {
             Err(Error::GuestClock(
-                "side-effect test has no guest counter".into(),
+                "failing executor has no guest counter".into(),
             ))
         }
+    }
 
-        fn execute(&mut self, request: &SyscallRequest, _memory: &GuestMemory) -> Result<i64> {
+    impl LinuxProvider for SideEffectingExecutor {
+        fn execute(
+            &mut self,
+            request: &SyscallRequest,
+            _memory: &GuestMemory,
+        ) -> Result<ProviderOutcome> {
             match request.number() as libc::c_long {
                 libc::SYS_write => self.state.output_bytes += request.args()[2] as usize,
                 libc::SYS_pipe2 => self.state.descriptors += 2,
@@ -7348,7 +7336,19 @@ mod tests {
                 libc::SYS_exit | libc::SYS_exit_group => self.state.exited = true,
                 number => panic!("unexpected side-effect probe syscall {number}"),
             }
-            Ok(0)
+            Ok(ProviderOutcome::Return(0))
+        }
+    }
+
+    impl LinuxEmuSignalControl for SideEffectingExecutor {}
+
+    impl LinuxEmuMemoryMap for SideEffectingExecutor {}
+
+    impl GuestSyscallExecutor<crate::StraceTool> for SideEffectingExecutor {
+        fn read_clock(&self) -> Result<u64> {
+            Err(Error::GuestClock(
+                "side-effect test has no guest counter".into(),
+            ))
         }
 
         fn ordinary_injection_allowed(&self, request: &SyscallRequest) -> bool {
@@ -7381,14 +7381,12 @@ mod tests {
         state: TailInjectionSideEffects,
     }
 
-    impl GuestSyscallExecutor<crate::StraceTool> for PermissiveSideEffectingExecutor {
-        fn read_clock(&self) -> Result<u64> {
-            Err(Error::GuestClock(
-                "side-effect test has no guest counter".into(),
-            ))
-        }
-
-        fn execute(&mut self, request: &SyscallRequest, _memory: &GuestMemory) -> Result<i64> {
+    impl LinuxProvider for PermissiveSideEffectingExecutor {
+        fn execute(
+            &mut self,
+            request: &SyscallRequest,
+            _memory: &GuestMemory,
+        ) -> Result<ProviderOutcome> {
             match request.number() as libc::c_long {
                 libc::SYS_execve | libc::SYS_execveat => {
                     self.state.address_space_generation += 1;
@@ -7400,7 +7398,19 @@ mod tests {
                 libc::SYS_exit | libc::SYS_exit_group => self.state.exited = true,
                 number => panic!("unexpected nonreturning probe syscall {number}"),
             }
-            Ok(0)
+            Ok(ProviderOutcome::Return(0))
+        }
+    }
+
+    impl LinuxEmuSignalControl for PermissiveSideEffectingExecutor {}
+
+    impl LinuxEmuMemoryMap for PermissiveSideEffectingExecutor {}
+
+    impl GuestSyscallExecutor<crate::StraceTool> for PermissiveSideEffectingExecutor {
+        fn read_clock(&self) -> Result<u64> {
+            Err(Error::GuestClock(
+                "side-effect test has no guest counter".into(),
+            ))
         }
 
         fn complete_injection<'a>(
@@ -7465,6 +7475,101 @@ mod tests {
                 child_pid: 2,
             }) if parent.tgid == Pid::from_raw(1) && parent.generation == 7
         ));
+    }
+
+    /// A provider whose first `execute` is refused with a typed refusal and
+    /// whose second succeeds without one.
+    #[derive(Default)]
+    struct RefusingThenSupportingProvider {
+        executed: usize,
+        refusal: Option<reverie::UnsupportedRefusal>,
+    }
+
+    const TEST_REFUSAL: reverie::UnsupportedRefusal = reverie::UnsupportedRefusal::new(
+        reverie::UnsupportedOperation::NonLeaderExec,
+        Errno::ENOSYS,
+        "test provider refusal",
+    );
+
+    impl LinuxProvider for RefusingThenSupportingProvider {
+        fn execute(&mut self, _: &SyscallRequest, _: &GuestMemory) -> Result<ProviderOutcome> {
+            self.executed += 1;
+            if self.executed == 1 {
+                self.refusal = Some(TEST_REFUSAL);
+                Ok(ProviderOutcome::Return(-i64::from(libc::ENOSYS)))
+            } else {
+                Ok(ProviderOutcome::Return(0))
+            }
+        }
+
+        fn take_unsupported_refusal(&mut self) -> Option<reverie::UnsupportedRefusal> {
+            self.refusal.take()
+        }
+    }
+
+    impl LinuxEmuSignalControl for RefusingThenSupportingProvider {}
+
+    impl LinuxEmuMemoryMap for RefusingThenSupportingProvider {}
+
+    impl GuestSyscallExecutor<crate::StraceTool> for RefusingThenSupportingProvider {
+        fn read_clock(&self) -> Result<u64> {
+            Err(Error::GuestClock(
+                "refusal test has no guest counter".into(),
+            ))
+        }
+    }
+
+    #[test]
+    fn inject_reads_the_refusal_through_the_provider_override() {
+        let memory = GuestMemory::new(0, STACK_CAPACITY).unwrap();
+        let auxv = [];
+        let mut thread_state = ();
+        let global_state = crate::StraceLog::default();
+        let config = ();
+        let subscriptions = Subscription::none();
+        let handler_signal = Arc::new(Mutex::new(None));
+        let pending_child_starts = Arc::new(Mutex::new(Vec::new()));
+        let mut executor = RefusingThenSupportingProvider::default();
+        let mut guest = KvmGuest::<crate::StraceTool>::new(
+            Pid::from_raw(1),
+            Pid::from_raw(1),
+            Arc::new(crate::StraceTool),
+            memory,
+            &auxv,
+            // SAFETY: the test does not inspect any register field.
+            unsafe { std::mem::zeroed() },
+            &mut thread_state,
+            &mut executor,
+            &global_state,
+            None,
+            &config,
+            &subscriptions,
+            handler_signal,
+            pending_child_starts,
+            crate::bootstrap::TOOL_STACK_TOP,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let syscall = || {
+            SyscallRequest::new(libc::SYS_getpid as u64, [0; 6])
+                .into_syscall()
+                .unwrap()
+        };
+        // The default `take_unsupported_refusal` answers None, so seeing the
+        // refusal proves inject reached the override through the provider.
+        assert_eq!(
+            futures::executor::block_on(guest.inject(syscall())),
+            Err(Errno::ENOSYS)
+        );
+        assert_eq!(
+            Guest::take_unsupported_refusal(&mut guest),
+            Some(TEST_REFUSAL)
+        );
+        assert_eq!(Guest::take_unsupported_refusal(&mut guest), None);
+        // A later injection without a refusal replaces nothing stale.
+        assert_eq!(futures::executor::block_on(guest.inject(syscall())), Ok(0));
+        assert_eq!(Guest::take_unsupported_refusal(&mut guest), None);
+        drop(guest);
+        assert_eq!(executor.executed, 2);
     }
 
     #[test]

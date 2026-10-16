@@ -352,45 +352,31 @@ struct ProbeExecutor {
     pending_dequeue: bool,
     ledger: Vec<reverie::SignalDequeue>,
 }
-impl GuestSyscallExecutor<ProbeTool> for ProbeExecutor {
-    fn read_clock(&self) -> Result<u64> {
-        Ok(1)
-    }
-    fn failure_subscription(&self) -> Option<crate::failure::FailureSubscription> {
-        Some(self.failure.run.subscribe())
-    }
-    fn invalidate_polled_read_attempt(&mut self) {
-        self.counts.invalidations.fetch_add(1, Ordering::SeqCst);
-    }
-    fn prepare_signal_effects(&mut self) -> std::result::Result<(), Errno> {
-        self.counts.preparations.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
-    fn execute(&mut self, request: &SyscallRequest, _: &GuestMemory) -> Result<i64> {
+impl LinuxProvider for ProbeExecutor {
+    fn execute(&mut self, request: &SyscallRequest, _: &GuestMemory) -> Result<ProviderOutcome> {
         assert_eq!(request.number(), libc::SYS_close as u64);
         assert_eq!(request.args()[0], 9);
         self.counts.dispatches.fetch_add(1, Ordering::SeqCst);
         self.counts.effects.fetch_add(1, Ordering::SeqCst);
-        Ok(0)
+        Ok(ProviderOutcome::Return(0))
     }
-    fn complete_injection<'a>(
-        &'a mut self,
-        _: ToolContext<'a, ProbeTool>,
-    ) -> Pin<Box<dyn Future<Output = Result<InjectionCompletion>> + Send + 'a>>
-    where
-        ProbeTool: 'a,
-    {
-        self.counts.completions.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async {
-            Ok(InjectionCompletion::Returns {
-                syscall_result: None,
-            })
-        })
+}
+
+impl LinuxEmuSignalControl for ProbeExecutor {
+    fn invalidate_polled_read_attempt(&mut self) {
+        self.counts.invalidations.fetch_add(1, Ordering::SeqCst);
     }
+
+    fn prepare_signal_effects(&mut self) -> std::result::Result<(), Errno> {
+        self.counts.preparations.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
     fn defer_signal_delivery(&mut self, _: SignalEvent) -> std::result::Result<(), Errno> {
         self.counts.effects.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
+
     fn queue_child_exit_signal(&mut self, _: SignalEvent) -> reverie::ChildExitSignalOutcome {
         self.counts.effects.fetch_add(1, Ordering::SeqCst);
         reverie::ChildExitSignalOutcome::RejectedBeforeCommit {
@@ -398,6 +384,7 @@ impl GuestSyscallExecutor<ProbeTool> for ProbeExecutor {
             errno: Errno::ENOSYS,
         }
     }
+
     fn queue_process_alarm_signal(&mut self, _: SignalEvent) -> reverie::ProcessAlarmSignalOutcome {
         self.counts.effects.fetch_add(1, Ordering::SeqCst);
         reverie::ProcessAlarmSignalOutcome::RejectedBeforeCommit {
@@ -405,9 +392,11 @@ impl GuestSyscallExecutor<ProbeTool> for ProbeExecutor {
             errno: Errno::ENOSYS,
         }
     }
+
     fn parked_signal_site(&self) -> Option<reverie::CallbackSignalSite> {
         Some(site())
     }
+
     fn admit_signal_observation(
         &mut self,
         actual: reverie::CallbackSignalSite,
@@ -416,6 +405,7 @@ impl GuestSyscallExecutor<ProbeTool> for ProbeExecutor {
         assert_eq!(actual, site());
         Ok(())
     }
+
     fn take_signal_for_observation(&mut self) -> std::result::Result<Option<PendingSignal>, Errno> {
         self.counts.signal_removals.fetch_add(1, Ordering::SeqCst);
         self.pending_dequeue = true;
@@ -424,12 +414,15 @@ impl GuestSyscallExecutor<ProbeTool> for ProbeExecutor {
             domain: crate::executor::PendingSignalDomain::Process,
         }))
     }
+
     fn signal_dequeue_front(&self) -> Option<reverie::SignalDequeue> {
         self.pending_dequeue.then(dequeue)
     }
+
     fn retain_signal_dequeue(&mut self, effect: reverie::SignalDequeue) {
         self.ledger.push(effect);
     }
+
     fn acknowledge_signal_dequeue(
         &mut self,
         effect: reverie::SignalDequeue,
@@ -441,6 +434,7 @@ impl GuestSyscallExecutor<ProbeTool> for ProbeExecutor {
             .fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
+
     fn filter_signal_replacement(
         &mut self,
         event: SignalEvent,
@@ -449,6 +443,7 @@ impl GuestSyscallExecutor<ProbeTool> for ProbeExecutor {
         self.counts.signal_filters.fetch_add(1, Ordering::SeqCst);
         Ok(Some(PendingSignal { event, domain }))
     }
+
     fn reserve_signal_delivery(
         &mut self,
         _: PendingSignal,
@@ -463,6 +458,7 @@ impl GuestSyscallExecutor<ProbeTool> for ProbeExecutor {
             selection_nonce: 23,
         })
     }
+
     fn with_signal_effects(&mut self, cause: Error, raw_result: Option<i64>) -> Error {
         Error::SignalEffects {
             cause: Arc::new(cause),
@@ -472,6 +468,33 @@ impl GuestSyscallExecutor<ProbeTool> for ProbeExecutor {
             raw_result,
             context: None,
         }
+    }
+}
+
+impl LinuxEmuMemoryMap for ProbeExecutor {}
+
+impl GuestSyscallExecutor<ProbeTool> for ProbeExecutor {
+    fn read_clock(&self) -> Result<u64> {
+        Ok(1)
+    }
+
+    fn failure_subscription(&self) -> Option<crate::failure::FailureSubscription> {
+        Some(self.failure.run.subscribe())
+    }
+
+    fn complete_injection<'a>(
+        &'a mut self,
+        _: ToolContext<'a, ProbeTool>,
+    ) -> Pin<Box<dyn Future<Output = Result<InjectionCompletion>> + Send + 'a>>
+    where
+        ProbeTool: 'a,
+    {
+        self.counts.completions.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {
+            Ok(InjectionCompletion::Returns {
+                syscall_result: None,
+            })
+        })
     }
 }
 

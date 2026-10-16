@@ -20,6 +20,16 @@ impl Tool for AdapterTool {
     type ThreadState = Box<()>;
 }
 struct RefusingExecutor;
+impl LinuxProvider for RefusingExecutor {
+    fn execute(&mut self, _: &SyscallRequest, _: &GuestMemory) -> Result<ProviderOutcome> {
+        panic!("terminal cancellation executed a syscall")
+    }
+}
+
+impl LinuxEmuSignalControl for RefusingExecutor {}
+
+impl LinuxEmuMemoryMap for RefusingExecutor {}
+
 impl GuestSyscallExecutor<AdapterTool> for RefusingExecutor {
     fn read_clock(&self) -> Result<u64> {
         Err(Error::GuestClock(
@@ -27,12 +37,10 @@ impl GuestSyscallExecutor<AdapterTool> for RefusingExecutor {
         ))
     }
 
-    fn execute(&mut self, _: &SyscallRequest, _: &GuestMemory) -> Result<i64> {
-        panic!("terminal cancellation executed a syscall")
-    }
     fn tail_injection_allowed(&self, _request: &SyscallRequest) -> bool {
         false
     }
+
     fn complete_injection<'a>(
         &'a mut self,
         _: ToolContext<'a, AdapterTool>,
@@ -52,23 +60,40 @@ fn terminal_read_injection_keeps_nonreturning_cancellation_and_typed_failures() 
         completions: usize,
         wrapped: usize,
     }
-    impl GuestSyscallExecutor<LowerTool> for ReadExecutor {
-        fn read_clock(&self) -> Result<u64> {
-            panic!("read cancellation requested a guest clock")
-        }
-        fn execute(&mut self, request: &SyscallRequest, _: &GuestMemory) -> Result<i64> {
+    impl LinuxProvider for ReadExecutor {
+        fn execute(
+            &mut self,
+            request: &SyscallRequest,
+            _: &GuestMemory,
+        ) -> Result<ProviderOutcome> {
             assert_eq!(request.number(), libc::SYS_read as u64);
             assert_eq!(request.args()[..3], [0, 0, 0]);
-            self.result.take().expect("terminal read was retried")
+            self.result
+                .take()
+                .expect("terminal read was retried")
+                .map(ProviderOutcome::Return)
         }
+    }
+
+    impl LinuxEmuSignalControl for ReadExecutor {
         fn signal_failure_context(&self) -> Option<reverie::ParkedSignalFailureContext> {
             self.parked
         }
+
         fn with_signal_effects(&mut self, error: Error, raw: Option<i64>) -> Error {
             assert_eq!(raw, None);
             self.wrapped += 1;
             error
         }
+    }
+
+    impl LinuxEmuMemoryMap for ReadExecutor {}
+
+    impl GuestSyscallExecutor<LowerTool> for ReadExecutor {
+        fn read_clock(&self) -> Result<u64> {
+            panic!("read cancellation requested a guest clock")
+        }
+
         fn complete_injection<'a>(
             &'a mut self,
             _: ToolContext<'a, LowerTool>,
@@ -676,11 +701,12 @@ fn wait_group_exit_injection_is_nonreturning_and_failure_still_wins() {
         fail: Option<FailurePublication>,
         wrapped: usize,
     }
-    impl GuestSyscallExecutor<LowerTool> for WaitExecutor {
-        fn read_clock(&self) -> Result<u64> {
-            panic!("terminal wait requested a guest clock")
-        }
-        fn execute(&mut self, request: &SyscallRequest, _: &GuestMemory) -> Result<i64> {
+    impl LinuxProvider for WaitExecutor {
+        fn execute(
+            &mut self,
+            request: &SyscallRequest,
+            _: &GuestMemory,
+        ) -> Result<ProviderOutcome> {
             assert_eq!(request.number(), libc::SYS_waitid as u64);
             if let Some(failure) = self.fail.take() {
                 failure.publish();
@@ -689,13 +715,26 @@ fn wait_group_exit_injection_is_nonreturning_and_failure_still_wins() {
                 status: self.status,
             })
         }
+    }
+
+    impl LinuxEmuSignalControl for WaitExecutor {
         fn signal_failure_context(&self) -> Option<reverie::ParkedSignalFailureContext> {
             Some(self.parked)
         }
+
         fn with_signal_effects(&mut self, error: Error, _: Option<i64>) -> Error {
             self.wrapped += 1;
             error
         }
+    }
+
+    impl LinuxEmuMemoryMap for WaitExecutor {}
+
+    impl GuestSyscallExecutor<LowerTool> for WaitExecutor {
+        fn read_clock(&self) -> Result<u64> {
+            panic!("terminal wait requested a guest clock")
+        }
+
         fn complete_injection<'a>(
             &'a mut self,
             _: ToolContext<'a, LowerTool>,
