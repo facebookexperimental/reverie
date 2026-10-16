@@ -5480,10 +5480,8 @@ static bool pre_syscall(void* drcontext, int sysnum) {
     // short-I/O semantics.
     // Detcore owns blocking retries and logs the completed I/O result. Preserve
     // that result, including EAGAIN and short transfers, without native retries.
-    // Detcore reached the kernel through `invoke_syscall`, which already put
-    // host identities in the guest's view, so only the caller's own
-    // identities are restated here.
-    result = own_identity_result(counters, sysnum, result);
+    // A completed Tool answer is final, including own-identity getters.
+    // Suppress installs this value without further native syscall policy.
     dr_syscall_set_result(drcontext, (reg_t)result);
     return false;
   }

@@ -509,8 +509,9 @@ const SET_REG_SENTINEL: u64 = 0xDEAD_BEEF_CAFE_F00D;
 /// `getpid`, overwrite the callee-saved `r15` register with [`SET_REG_SENTINEL`]
 /// via `set_regs`, then suppress the syscall. Because `r15` is preserved across
 /// the syscall boundary, a correct `set_regs` implementation lets the guest read
-/// the sentinel back after the call returns. This is the first DBT tool to write
-/// the guest register file rather than only read it.
+/// the sentinel back after the call returns. The three own-identity getters
+/// also return distinct values so the guest can check that completed Tool
+/// results survive the native callback boundary.
 #[derive(Clone, Copy, Debug, Default)]
 struct SetRegTool;
 
@@ -531,10 +532,11 @@ impl Tool for SetRegTool {
                 let mut regs = guest.regs().await;
                 regs.r15 = SET_REG_SENTINEL;
                 guest.set_regs(regs).await?;
-                // Suppress getpid with a fixed value; the guest observes the
-                // rewritten r15 after resuming, not this return value.
+                // The guest checks both the rewritten register and this result.
                 Ok(4321)
             }
+            Sysno::getppid => Ok(4322),
+            Sysno::gettid => Ok(4323),
             _ => guest.tail_inject(syscall).await,
         }
     }
