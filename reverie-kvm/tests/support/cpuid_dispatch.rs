@@ -451,10 +451,17 @@ fn table_program(leaf: u32, subleaf: u32, values: [u32; 4]) -> Vec<u8> {
 }
 
 #[test]
-fn unsubscribed_cpuid_keeps_the_installed_table_and_indexed_xstate_policy() {
+fn unsubscribed_cpuid_reads_the_hosts_rows_and_the_frames_xstate() {
+    // Unsubscribed, the guest reads the vCPU's table: the host's rows, with
+    // leaf 0xd limited to the x87, SSE and YMM components.
+    let host = |leaf: u32, subleaf: u32| {
+        let row = core::arch::x86_64::__cpuid_count(leaf, subleaf);
+        [row.eax, row.ebx, row.ecx, row.edx]
+    };
     for (leaf, subleaf, expected) in [
-        (0x80000001, 0, [0x663, 0, 1, 0x20100800]),
-        (0xd, 1, [0; 4]),
+        (0x80000001, 0, host(0x80000001, 0)),
+        (0x80000002, 0, host(0x80000002, 0)),
+        (0xd, 2, host(0xd, 2)),
         (0xd, 17, [0; 4]),
         (0xd, 19, [0; 4]),
     ] {

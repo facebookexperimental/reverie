@@ -275,25 +275,24 @@ is rejected instead of being forwarded as an untyped request. `install_syscalls`
 builds a small guest program containing consecutive hypercalls, with one
 page-aligned frame per request, so a single KVM run can route several syscalls.
 
-## CPUID policy
+## CPUID
 
-Every vCPU receives an explicit CPUID table through `KVM_SET_CPUID2` before
-its first `KVM_RUN`. The default `CpuidPolicy::deterministic` policy replaces
-the host table with a fixed x86-64-v2 profile based on Detcore's CPUID table,
-then removes `RDRAND`, `RDSEED`, TSX, AVX-512 feature bits, and the AVX-512
-extended register state. This keeps standard and extended identity, feature,
-cache, and topology leaves independent of the KVM host. VM creation fails if
-the host lacks an instruction feature required by that baseline. Callers that
-need KVM's full host-supported table can opt into
-`CpuidPolicy::host_supported`.
+The backend keeps no CPUID profile of its own. A Tool that subscribes to
+CPUID answers every guest CPUID: the vCPU's CPL3 CPUID faulting is enabled,
+and each fault goes to `Tool::handle_cpuid_event` (under Hermit, Detcore's
+machine description, the table its `/proc/cpuinfo` is rendered from).
 
-The KVM integration test executes CPUID inside the VM and copies the resulting
-registers to guest memory. This checks the vCPU-visible table rather than only
-unit-testing the host-side mask.
+For a Tool that does not subscribe, the guest reads the vCPU's table, which
+`KVM_SET_CPUID2` installs before the first `KVM_RUN`: KVM's host-supported
+leaves with the host's own registers, so the guest reads what the same
+program reads natively. Two exceptions: KVM's hypervisor leaves stay KVM's,
+and leaf 0xd advertises only the x87, SSE and YMM components the backend's
+signal frames carry, because KVM sizes the guest's XSAVE state from it. KVM
+still computes the fields that describe the vCPU itself, such as OSXSAVE and
+the XSAVE sizes.
 
-This is a static vCPU feature policy, not a per-instruction
-`Tool::handle_cpuid_event` callback. The latter still requires the planned
-Linux execution bridge to preserve task-local callback context.
+The KVM integration tests execute CPUID inside the VM and compare the
+registers with the host's.
 
 ## Relationship to gVisor
 

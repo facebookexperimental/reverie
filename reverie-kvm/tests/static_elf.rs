@@ -8107,37 +8107,19 @@ static struct registers cpuid_xstate(uint32_t subleaf) {
   return result;
 }
 
-static int matches(struct registers actual, struct registers expected) {
-  return actual.eax == expected.eax && actual.ebx == expected.ebx &&
-         actual.ecx == expected.ecx && actual.edx == expected.edx;
-}
 
 int main(void) {
-  struct registers xstate = cpuid_xstate(0);
-  /* KVM recomputes subleaf 0 EBX from XCR0 and the host-supported component
-     layout. With x87, SSE, and AVX enabled, the guest-visible size is 0x340. */
-  if (xstate.eax != 0x00000007 || xstate.ebx != 0x00000340 ||
-      xstate.ecx != 0x00000340 || xstate.edx != 0) {
-    return 10;
-  }
-
-  static const struct {
-    uint32_t subleaf;
-    struct registers expected;
-  } cases[] = {
-      {1, {0, 0, 0, 0}},
-      {2, {0x00000100, 0x00000240, 0, 0}},
-      {17, {0, 0, 0, 0}},
-      {18, {0, 0, 0, 0}},
-      {19, {0, 0, 0, 0}},
-  };
-
-  for (uint32_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
-    if (!matches(cpuid_xstate(cases[i].subleaf), cases[i].expected)) {
-      return 11 + (int)i;
+  /* This run has no Tool, so nothing traps CPUID and the vCPU's table
+     answers: KVM's host-supported rows with the extended state limited to the
+     x87, SSE and YMM components the backend's signal frames carry. */
+  static const uint32_t subleaves[] = {0, 1, 2, 17, 18, 19};
+  for (uint32_t i = 0; i < sizeof(subleaves) / sizeof(subleaves[0]); ++i) {
+    struct registers row = cpuid_xstate(subleaves[i]);
+    if (printf("0xd.%u: %08x %08x %08x %08x\n", subleaves[i], row.eax, row.ebx,
+               row.ecx, row.edx) < 0) {
+      return 10;
     }
   }
-
   /* The executable is linked for lazy binding, so this first puts call makes
      the dynamic linker resolve its PLT entry after all CPUID checks pass. */
   if (puts("indexed xstate cpuid ok") < 0) {
@@ -8183,8 +8165,35 @@ int main(void) {
     );
 
     let executable = executable.to_str().unwrap();
+    let native = std::process::Command::new(executable)
+        .current_dir(&directory.0)
+        .output()
+        .unwrap();
+    assert!(native.status.success(), "{native:?}");
     let (stdout, stderr) = run_host_program_captured(executable, &[executable], &directory.0);
-    assert_eq!(stdout, b"indexed xstate cpuid ok\n");
+    let stdout = String::from_utf8(stdout).unwrap();
+    let native = String::from_utf8(native.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    let native_lines: Vec<&str> = native.lines().collect();
+    assert_eq!(
+        lines.len(),
+        native_lines.len(),
+        "{stdout}\nnative:\n{native}"
+    );
+    // Subleaf 0 advertises only x87, SSE and YMM; KVM recomputes EBX, the
+    // size those enabled components need, as 0x340.
+    assert!(
+        lines[0].starts_with("0xd.0: 00000007 00000340 "),
+        "{stdout}"
+    );
+    // The YMM row and the absent components' rows are the host's.
+    for index in 2..lines.len() {
+        assert_eq!(
+            lines[index], native_lines[index],
+            "{stdout}\nnative:\n{native}"
+        );
+    }
+    assert_eq!(lines.last(), Some(&"indexed xstate cpuid ok"), "{stdout}");
     assert!(stderr.is_empty());
 }
 
@@ -17515,7 +17524,7 @@ fn repeated_timestamp_reads_evolve_once_per_instruction() {
 }
 
 #[test]
-fn static_elf_unsubscribed_rdtscp_remains_guest_exception() {
+fn static_elf_unsubscribed_rdtscp_runs_as_on_the_host() {
     if !kvm_available("KVM unsubscribed RDTSCP test") {
         return;
     }
@@ -17530,13 +17539,19 @@ fn static_elf_unsubscribed_rdtscp_remains_guest_exception() {
     backend
         .install_static_elf(&image, "/bin/unsubscribed-rdtscp")
         .unwrap();
-    // The deterministic CPUID policy hides RDTSCP, so it is a genuine #UD:
-    // SIGILL kills the guest before its exit syscall and no callback runs.
+    // The vCPU's CPUID table holds the host's rows, so RDTSCP is available
+    // exactly when the host has it, as for a native program. Unsubscribed, it
+    // runs in the guest with no callback; without it, it is a genuine #UD.
+    let host_has_rdtscp = core::arch::x86_64::__cpuid(0x8000_0001).edx & (1 << 27) != 0;
     let completion = futures::executor::block_on(
         backend.run_static_elf_with_tool_completion::<TimestampTool>(false, true),
     )
     .unwrap();
-    assert_invalid_opcode_signal(completion.result.unwrap().0);
+    if host_has_rdtscp {
+        assert_eq!(completion.result.unwrap().0, ExitStatus::SUCCESS);
+    } else {
+        assert_invalid_opcode_signal(completion.result.unwrap().0);
+    }
     assert!(completion.global_state.calls().is_empty());
 }
 
@@ -17926,9 +17941,7 @@ fn timestamp_tool_preserves_results_with_host_supported_cpuid() {
     if !kvm_available("KVM host-supported timestamp profile test") {
         return;
     }
-    let mut backend =
-        KvmBackend::new_with_cpuid_policy(MEMORY_SIZE, reverie_kvm::CpuidPolicy::host_supported())
-            .unwrap();
+    let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
     backend
         .install_static_elf(
             &static_elf(&timestamp_assertion_program()),

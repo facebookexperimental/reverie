@@ -5359,6 +5359,9 @@ impl KvmBackend {
             // Each actual Tool consumer admits its own subscription before
             // any user instruction. New fork/thread vCPUs start unarmed; the
             // tool-less Host worker loop never inherits trapping without a hook.
+            // A Tool that subscribes to CPUID answers every guest CPUID; for
+            // one that does not, the vCPU's table holds the host's own rows
+            // (`vm::vcpu_cpuid`), so its guest reads what it reads natively.
             self.set_rdtsc_interception(subscriptions.has_rdtsc())?;
             self.set_cpuid_interception(subscriptions.has_cpuid())?;
             self.vcpu.track_clock()?;

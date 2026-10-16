@@ -74,7 +74,7 @@ const FIX_EFLAGS: u64 = (1 << 18)
     | (1 << 4)
     | (1 << 2)
     | (1 << 0);
-const FIXED_XFEATURES: u64 = XFEATURE_X87 | XFEATURE_SSE | XFEATURE_YMM;
+pub(crate) const FIXED_XFEATURES: u64 = XFEATURE_X87 | XFEATURE_SSE | XFEATURE_YMM;
 const MXCSR_FEATURE_MASK: u32 = 0x0000_ffbf;
 
 const FP_SW_RESERVED_OFFSET: usize = 464;

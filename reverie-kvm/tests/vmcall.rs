@@ -131,31 +131,35 @@ fn guest_program_routes_required_syscalls_via_vmcall() {
 }
 
 #[test]
-fn deterministic_cpuid_policy_is_visible_inside_vm() {
-    if !kvm_available("deterministic_cpuid_policy_is_visible_inside_vm") {
+fn host_cpuid_rows_are_visible_inside_vm() {
+    if !kvm_available("host_cpuid_rows_are_visible_inside_vm") {
         return;
     }
 
+    // No Tool traps CPUID here, so the vCPU's table answers, and it holds the
+    // host's rows: the backend keeps no CPUID profile of its own.
+    let probes: [(u32, u32); 7] = [
+        (0, 0),
+        (0x8000_0000, 0),
+        (0x8000_0001, 0),
+        (0x8000_0002, 0),
+        (0x8000_0003, 0),
+        (0x8000_0004, 0),
+        (0xd, 2),
+    ];
     let mut program = Vec::new();
-    append_cpuid_probe(&mut program, 0, 0, CPUID_RESULT_ADDRESS);
-    append_cpuid_probe(&mut program, 1, 0, CPUID_RESULT_ADDRESS + 16);
-    append_cpuid_probe(&mut program, 7, 0, CPUID_RESULT_ADDRESS + 32);
-    append_cpuid_probe(&mut program, 7, 1, CPUID_RESULT_ADDRESS + 48);
-    append_cpuid_probe(&mut program, 0xd, 0, CPUID_RESULT_ADDRESS + 64);
-    append_cpuid_probe(&mut program, 0xd, 1, CPUID_RESULT_ADDRESS + 80);
-    append_cpuid_probe(&mut program, 0xd, 2, CPUID_RESULT_ADDRESS + 96);
-    append_cpuid_probe(&mut program, 0xd, 17, CPUID_RESULT_ADDRESS + 112);
-    append_cpuid_probe(&mut program, 0xd, 18, CPUID_RESULT_ADDRESS + 128);
-    append_cpuid_probe(&mut program, 0xd, 19, CPUID_RESULT_ADDRESS + 144);
-    append_cpuid_probe(&mut program, 2, 0, CPUID_RESULT_ADDRESS + 160);
-    append_cpuid_probe(&mut program, 0x8000_0000, 0, CPUID_RESULT_ADDRESS + 176);
-    append_cpuid_probe(&mut program, 0x8000_0001, 0, CPUID_RESULT_ADDRESS + 192);
-    append_cpuid_probe(&mut program, 0x15, 0, CPUID_RESULT_ADDRESS + 208);
-    append_cpuid_probe(&mut program, 0x8000_000b, 0, CPUID_RESULT_ADDRESS + 224);
-    append_cpuid_probe(&mut program, 4, 0, CPUID_RESULT_ADDRESS + 240);
-    append_cpuid_probe(&mut program, 4, 1, CPUID_RESULT_ADDRESS + 256);
-    append_cpuid_probe(&mut program, 0xb, 0, CPUID_RESULT_ADDRESS + 272);
-    append_cpuid_probe(&mut program, 0xb, 1, CPUID_RESULT_ADDRESS + 288);
+    for (index, (leaf, subleaf)) in probes.iter().enumerate() {
+        append_cpuid_probe(
+            &mut program,
+            *leaf,
+            *subleaf,
+            CPUID_RESULT_ADDRESS + 16 * index as u16,
+        );
+    }
+    let xstate_address = CPUID_RESULT_ADDRESS + 16 * probes.len() as u16;
+    append_cpuid_probe(&mut program, 0xd, 0, xstate_address);
+    append_cpuid_probe(&mut program, 0xd, 17, xstate_address + 16);
+    append_cpuid_probe(&mut program, 0xd, 19, xstate_address + 32);
     program.push(0xf4); // hlt
 
     let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
@@ -166,86 +170,19 @@ fn deterministic_cpuid_policy_is_visible_inside_vm() {
         .run(|_, _| panic!("CPUID program must not issue a syscall"))
         .unwrap();
 
-    let vendor = read_cpuid_result(&backend, CPUID_RESULT_ADDRESS);
-    assert_eq!(vendor[0], 0x0000_000d);
-    assert_eq!(vendor[1], u32::from_le_bytes(*b"Genu"));
-    assert_eq!(vendor[2], u32::from_le_bytes(*b"ntel"));
-    assert_eq!(vendor[3], u32::from_le_bytes(*b"ineI"));
-
-    let leaf1 = read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 16);
-    assert_eq!(leaf1[0], 0x0000_0663);
-    assert_eq!(leaf1[1], 0x0000_0800);
-    assert_eq!(
-        leaf1[2],
-        bit(0) | bit(9) | bit(13) | bit(19) | bit(20) | bit(23) | bit(26) | bit(28)
-    );
-    assert_eq!(leaf1[3], 0x078b_fbfd);
-    assert_eq!(leaf1[2] & bit(30), 0, "RDRAND must be hidden");
-
-    let leaf7 = read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 32);
-    assert_eq!(leaf7, [0; 4]);
-
-    let leaf7_subleaf1 = read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 48);
-    assert_eq!(leaf7_subleaf1, [0; 4]);
-
-    let xstate = read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 64);
-    // This real-mode program runs before the long-mode bootstrap enables the
-    // YMM state in XCR0. KVM ignores the table's subleaf-0 EBX field and
-    // derives the guest-visible EBX from the currently enabled state, while
-    // ECX continues to report the fixed maximum size.
-    assert_eq!(xstate, [0x0000_0007, 0x0000_0240, 0x0000_0340, 0]);
-    assert_eq!(
-        read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 80),
-        [0; 4],
-    );
-    assert_eq!(
-        read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 96),
-        [0x0000_0100, 0x0000_0240, 0, 0],
-    );
-    for offset in [112, 128, 144] {
+    for (index, (leaf, subleaf)) in probes.iter().enumerate() {
+        let host = core::arch::x86_64::__cpuid_count(*leaf, *subleaf);
         assert_eq!(
-            read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + offset),
-            [0; 4],
+            read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 16 * index as u16),
+            [host.eax, host.ebx, host.ecx, host.edx],
+            "leaf {leaf:#x}, subleaf {subleaf}"
         );
     }
-
-    assert_eq!(
-        read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 160),
-        [0x0000_0001, 0x0000_0000, 0x0000_004d, 0x002c_307d],
-    );
-    let extended = read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 176);
-    assert_eq!(extended[0], 0x8000_000a);
-    assert_eq!(extended[1], u32::from_le_bytes(*b"Genu"));
-    assert_eq!(extended[2], u32::from_le_bytes(*b"ntel"));
-    assert_eq!(extended[3], u32::from_le_bytes(*b"ineI"));
-    assert_eq!(
-        read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 192),
-        [0x0000_0663, 0x0000_0000, 0x0000_0001, 0x2010_0800],
-    );
-    assert_eq!(
-        read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 208),
-        xstate,
-    );
-    assert_eq!(
-        read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 224),
-        xstate,
-    );
-    assert_eq!(
-        read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 240),
-        [0x0000_0120, 0x01c0_003f, 0x0000_003f, 0x0000_0001],
-    );
-    assert_eq!(
-        read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 256),
-        [0; 4],
-    );
-    assert_eq!(
-        read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 272),
-        [0x0000_0000, 0x0000_0001, 0x0000_0100, 0x0000_0001],
-    );
-    assert_eq!(
-        read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 288),
-        [0; 4],
-    );
+    // Leaf 0xd advertises only the x87, SSE and YMM components the signal
+    // frames carry, and the rows of every other component are gone.
+    assert_eq!(read_cpuid_result(&backend, xstate_address)[0] & !0x7, 0);
+    assert_eq!(read_cpuid_result(&backend, xstate_address + 16), [0; 4]);
+    assert_eq!(read_cpuid_result(&backend, xstate_address + 32), [0; 4]);
 }
 
 fn append_cpuid_probe(program: &mut Vec<u8>, leaf: u32, subleaf: u32, output: u16) {
@@ -273,10 +210,6 @@ fn read_cpuid_result(backend: &KvmBackend, address: u16) -> [u32; 4] {
     std::array::from_fn(|index| {
         u32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap())
     })
-}
-
-const fn bit(index: u32) -> u32 {
-    1 << index
 }
 
 #[derive(Default)]

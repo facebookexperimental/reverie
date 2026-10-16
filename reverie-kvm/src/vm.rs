@@ -42,7 +42,6 @@ use reverie::SignalProcessId;
 use reverie::ThreadOwnership;
 use reverie::Tool;
 
-use crate::CpuidPolicy;
 use crate::Error;
 use crate::GuestMemory;
 use crate::Result;
@@ -1506,7 +1505,6 @@ pub struct KvmBackend {
     vm: VmFd,
     pub(crate) memory: GuestMemory,
     _kvm: Kvm,
-    cpuid_policy: CpuidPolicy,
     hypercall_instruction: [u8; 3],
     syscall_trampoline_address: u64,
     pub(crate) syscall_frame_address: u64,
@@ -1580,7 +1578,6 @@ struct KvmProcessSnapshot {
     registers: kvm_regs,
     xsave: kvm_xsave,
     stdin: Option<File>,
-    cpuid_policy: CpuidPolicy,
 }
 
 struct ForkedProcess {
@@ -1745,7 +1742,8 @@ impl KvmBackend {
 
     /// Creates a VM with one vCPU and a memory slot starting at GPA zero.
     pub fn new(memory_size: usize) -> Result<Self> {
-        Self::new_with_cpuid_policy(memory_size, CpuidPolicy::default())
+        let stdin = duplicate_stdin()?;
+        Self::new_with_stdin(memory_size, stdin)
     }
 
     /// Creates a VM with an explicitly reserved supervisor standard input.
@@ -1753,28 +1751,11 @@ impl KvmBackend {
     /// Callers that initialize async runtimes before KVM should reserve stdin
     /// first so an originally closed descriptor cannot be reused internally.
     pub fn new_with_stdin(memory_size: usize, stdin: Option<File>) -> Result<Self> {
-        Self::new_with_cpuid_policy_and_stdin(memory_size, CpuidPolicy::default(), stdin)
-    }
-
-    /// Creates a VM with a caller-selected CPUID feature policy.
-    pub fn new_with_cpuid_policy(memory_size: usize, cpuid_policy: CpuidPolicy) -> Result<Self> {
-        let stdin = duplicate_stdin()?;
-        Self::new_with_cpuid_policy_and_stdin(memory_size, cpuid_policy, stdin)
-    }
-
-    fn new_with_cpuid_policy_and_stdin(
-        memory_size: usize,
-        cpuid_policy: CpuidPolicy,
-        stdin: Option<File>,
-    ) -> Result<Self> {
         let memory = GuestMemory::new(0, memory_size)?;
-        Self::new_with_memory_and_cpuid_policy(memory, cpuid_policy, stdin)
+        Self::new_with_memory(memory, stdin)
     }
 
-    fn initialize_resources(
-        memory: &GuestMemory,
-        cpuid_policy: CpuidPolicy,
-    ) -> Result<InitializedKvmResources> {
+    fn initialize_resources(memory: &GuestMemory) -> Result<InitializedKvmResources> {
         let kvm = Kvm::new()?;
         let vm = kvm.create_vm()?;
         if !vm.check_extension(Cap::ExitHypercall) {
@@ -1793,10 +1774,16 @@ impl KvmBackend {
         // this HVA: slot registration below is its first attachment to the VM.
         memory.record_kvm_sync_mmu(kvm.check_extension(Cap::SyncMmu))?;
 
-        let mut cpuid = kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)?;
+        // The vCPU gets KVM's host-supported CPUID table, with its extended
+        // state limited to the x87, SSE and YMM components the backend's
+        // signal frames carry (`signal::FIXED_XFEATURES`); with more, KVM would
+        // save state (AVX-512, PKRU) that no frame can hold. A guest never
+        // reads this table: every guest CPUID faults to the Tool, whose answer
+        // is the guest's (Detcore's machine description under Hermit, the
+        // host's by Reverie's default).
+        let cpuid = vcpu_cpuid(kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)?)?;
         // TODO-HUMAN-REVIEW(PR-129): Review host-selected private hypercall transport.
         let hypercall_instruction = supported_hypercall_instruction(&cpuid)?;
-        cpuid_policy.apply(&mut cpuid)?;
         let cap = kvm_enable_cap {
             cap: Cap::ExitHypercall as u32,
             args: [1_u64 << VMCALL_SYSCALL_TRANSPORT, 0, 0, 0],
@@ -1832,11 +1819,7 @@ impl KvmBackend {
         })
     }
 
-    fn new_with_memory_and_cpuid_policy(
-        memory: GuestMemory,
-        cpuid_policy: CpuidPolicy,
-        stdin: Option<File>,
-    ) -> Result<Self> {
+    fn new_with_memory(memory: GuestMemory, stdin: Option<File>) -> Result<Self> {
         install_worker_interrupt_handler()?;
         const INITIALIZATION_ATTEMPTS: usize = 3;
         let mut attempts = 0;
@@ -1848,7 +1831,7 @@ impl KvmBackend {
             hypercall_instruction,
         } = loop {
             attempts += 1;
-            match Self::initialize_resources(&memory, cpuid_policy) {
+            match Self::initialize_resources(&memory) {
                 Ok(resources) => break resources,
                 Err(Error::Kvm(error))
                     if error.errno() == libc::EINTR && attempts < INITIALIZATION_ATTEMPTS => {}
@@ -1860,7 +1843,6 @@ impl KvmBackend {
             vm,
             memory,
             _kvm: kvm,
-            cpuid_policy,
             hypercall_instruction,
             syscall_trampoline_address: SYSCALL_TRAMPOLINE_ADDRESS,
             syscall_frame_address: SYSCALL_FRAME_ADDRESS,
@@ -2346,18 +2328,13 @@ impl KvmBackend {
             registers: self.vcpu.get_regs()?,
             xsave: self.vcpu.get_xsave()?,
             stdin: self.clone_reserved_stdin()?,
-            cpuid_policy: self.cpuid_policy,
         })
     }
 
     fn from_process_snapshot(snapshot: KvmProcessSnapshot) -> Result<Self> {
         #[cfg(test)]
         tests::entry_action_tests::observe("fork_backend");
-        let mut child = Self::new_with_memory_and_cpuid_policy(
-            snapshot.memory,
-            snapshot.cpuid_policy,
-            snapshot.stdin,
-        )?;
+        let mut child = Self::new_with_memory(snapshot.memory, snapshot.stdin)?;
         configure_long_mode(
             &mut child.memory,
             &child.vcpu,
@@ -2377,13 +2354,12 @@ impl KvmBackend {
         registers: kvm_regs,
         xsave: kvm_xsave,
         stdin: Option<File>,
-        cpuid_policy: CpuidPolicy,
         child_tid: i32,
         thread_group: Arc<GuestThreadGroup>,
     ) -> Result<Self> {
         #[cfg(test)]
         tests::entry_action_tests::observe("thread_backend");
-        let mut child = Self::new_with_memory_and_cpuid_policy(memory, cpuid_policy, stdin)?;
+        let mut child = Self::new_with_memory(memory, stdin)?;
         child.thread_group = thread_group;
         child.is_guest_thread = true;
         let slot = child.thread_group.reserve_transport_slot(child_tid)?;
@@ -3072,7 +3048,6 @@ impl KvmBackend {
                     child_registers,
                     parent_xsave,
                     child_stdin,
-                    self.cpuid_policy,
                     child_tid,
                     self.thread_group.clone(),
                 )?;
@@ -3848,7 +3823,6 @@ impl KvmBackend {
                     child_registers,
                     parent_xsave,
                     child_stdin,
-                    self.cpuid_policy,
                     child_tid,
                     self.thread_group.clone(),
                 )?;
@@ -6006,6 +5980,47 @@ pub(crate) fn clear_tid_and_wake(memory: &mut GuestMemory, address: Option<u64>)
     }
 }
 
+/// The vCPU's CPUID table. A guest reads it only when its Tool does not
+/// subscribe to CPUID (a subscribing Tool answers every guest CPUID), and then
+/// it must read what the same program reads natively under a non-subscribing
+/// ptrace Tool: the host's rows. So every leaf KVM lists takes the host's
+/// registers, except:
+/// - KVM's own hypervisor leaves (0x4000_0000 to 0x4fff_ffff), which the host
+///   does not answer;
+/// - leaf 0xd, whose extended state is limited to `signal::FIXED_XFEATURES`,
+///   the x87, SSE and YMM components the backend's signal frames carry; KVM
+///   sizes the guest's XSAVE state from this leaf, so with more it would save
+///   state (AVX-512, PKRU) that no frame can hold.
+///
+/// KVM still computes the fields that describe the vCPU itself (OSXSAVE from
+/// the guest's CR4, the XSAVE sizes from its XCR0) when the guest reads them.
+pub(crate) fn vcpu_cpuid(supported: CpuId) -> Result<CpuId> {
+    let fixed = crate::signal::FIXED_XFEATURES;
+    let entries = supported
+        .as_slice()
+        .iter()
+        .filter(|entry| {
+            !(entry.function == 0xd && entry.index >= 2 && fixed & (1 << entry.index) == 0)
+        })
+        .map(|entry| {
+            let mut entry = *entry;
+            if !(0x4000_0000..0x5000_0000).contains(&entry.function) {
+                let host = core::arch::x86_64::__cpuid_count(entry.function, entry.index);
+                (entry.eax, entry.ebx, entry.ecx, entry.edx) =
+                    (host.eax, host.ebx, host.ecx, host.edx);
+            }
+            if entry.function == 0xd && entry.index == 0 {
+                entry.eax &= fixed as u32;
+                entry.edx &= (fixed >> 32) as u32;
+            }
+            entry
+        })
+        .collect::<Vec<_>>();
+    CpuId::from_entries(&entries).map_err(|error| {
+        Error::UnsupportedCpuidProfile(format!("KVM's CPUID table did not fit: {error:?}"))
+    })
+}
+
 fn supported_hypercall_instruction(cpuid: &CpuId) -> Result<[u8; 3]> {
     let supports_vmcall = cpuid
         .as_slice()
@@ -6666,7 +6681,6 @@ mod tests {
             input.seek(SeekFrom::Start(7)).unwrap();
             let input_observer = input.try_clone().unwrap();
             let metadata = input.metadata().unwrap();
-            let policy = CpuidPolicy::default();
             let request = Arc::new(AtomicU64::new(0));
             let acknowledgement = Arc::new(AtomicU64::new(0));
             let peer_request = request.clone();
@@ -6701,8 +6715,7 @@ mod tests {
                 Arc::as_ptr(&request) as u64,
                 Arc::as_ptr(&acknowledgement) as u64,
             );
-            let mut result =
-                KvmBackend::new_with_memory_and_cpuid_policy(memory, policy, Some(input));
+            let mut result = KvmBackend::new_with_memory(memory, Some(input));
             marker(1, 0, 0, 0);
             if acknowledgement.load(Ordering::Acquire) == 1 {
                 expected[0x10_000..0x11_000].fill(0xe7);
@@ -6730,7 +6743,6 @@ mod tests {
                         "unexpected success"
                     );
                     assert_eq!(backend.memory.host_address(), address);
-                    assert_eq!(backend.cpuid_policy, policy);
                     assert_eq!(
                         backend
                             .stdin
@@ -6762,7 +6774,6 @@ mod tests {
                     assert_eq!(error.raw_os_error(), Some(errno))
                 }
                 Err(Error::HypercallExitUnsupported) if stage == "capability" => (),
-                Err(Error::UnsupportedCpuidProfile(_)) if stage == "policy" => (),
                 Err(Error::Kvm(error)) => {
                     assert!(
                         failures >= 3 || errno != libc::EINTR,
@@ -6815,22 +6826,13 @@ mod tests {
                 drop(parent);
                 marker(5, memory.host_address(), 0, 0);
                 result = if stage == "thread-registers" {
-                    KvmBackend::from_thread_state(
-                        memory,
-                        registers,
-                        xsave,
-                        None,
-                        policy,
-                        2,
-                        group.clone(),
-                    )
+                    KvmBackend::from_thread_state(memory, registers, xsave, None, 2, group.clone())
                 } else {
                     KvmBackend::from_process_snapshot(KvmProcessSnapshot {
                         memory,
                         registers,
                         xsave,
                         stdin: None,
-                        cpuid_policy: policy,
                     })
                 };
                 marker(1, 0, 0, 0);
@@ -6996,7 +6998,6 @@ mod tests {
             let mut completed = false;
             let mut post_initialization = false;
             let mut handler_calls = 0;
-            let mut cpuid_buffer = 0;
             let mut backing = Vec::new();
             let mut registration_address = 0;
             let mut wrapper_phase = false;
@@ -7033,22 +7034,6 @@ mod tests {
                             0
                         );
                         pending = false;
-                    } else if cpuid_buffer != 0 {
-                        assert_eq!(registers.rax, 0);
-                        let entries = traced_read(tid, cpuid_buffer) as u32;
-                        assert!(entries > 0 && entries <= KVM_MAX_CPUID_ENTRIES as u32);
-                        let mut changed = false;
-                        for index in 0..entries {
-                            let entry_address = cpuid_buffer + 8 + u64::from(index) * 40;
-                            if traced_read(tid, entry_address) as u32 == 1 {
-                                let edx = traced_read(tid, entry_address + 24);
-                                traced_write(tid, entry_address + 24, edx & !(1 << 26));
-                                changed = true;
-                            }
-                        }
-                        assert!(changed);
-                        injected += 1;
-                        cpuid_buffer = 0;
                     }
                     continue;
                 }
@@ -7204,9 +7189,6 @@ mod tests {
                             "fresh CPUID scratch"
                         );
                     }
-                    if stage == "policy" {
-                        cpuid_buffer = registers.rdx;
-                    }
                 }
                 if operation == "memory" {
                     let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
@@ -7266,7 +7248,7 @@ mod tests {
             } else if wrapper_phase {
                 2
             } else if errno != libc::EINTR
-                || ["capability", "policy", "post-registers", "guest"].contains(&stage)
+                || ["capability", "post-registers", "guest"].contains(&stage)
             {
                 1
             } else {
@@ -7341,12 +7323,11 @@ mod tests {
         }
 
         #[test]
-        fn initialization_policy_and_post_commit_boundaries() {
+        fn initialization_post_commit_boundaries() {
             if !available() {
                 return;
             }
             let cases = [
-                ("policy", 1),
                 ("post-registers", 1),
                 ("guest", 0),
                 ("thread-registers", 1),
@@ -8172,7 +8153,6 @@ mod tests {
                     initial,
                     parent.vcpu.get_xsave().unwrap(),
                     None,
-                    parent.cpuid_policy,
                     2,
                     parent.thread_group.clone(),
                 )
@@ -8299,7 +8279,6 @@ mod tests {
             parent.vcpu.get_regs().unwrap(),
             parent.vcpu.get_xsave().unwrap(),
             None,
-            parent.cpuid_policy,
             2,
             parent.thread_group.clone(),
         )
@@ -10288,7 +10267,6 @@ mod tests {
                     parent.vcpu.get_regs().unwrap(),
                     parent.vcpu.get_xsave().unwrap(),
                     None,
-                    parent.cpuid_policy,
                     2001,
                     parent.thread_group.clone(),
                 )
@@ -11038,7 +11016,6 @@ mod tests {
             parent.vcpu.get_regs().unwrap(),
             parent.vcpu.get_xsave().unwrap(),
             None,
-            parent.cpuid_policy,
             7,
             group.clone(),
         )

@@ -25,7 +25,6 @@
 
 mod bootstrap;
 mod clock;
-mod cpuid;
 mod cpuid_instruction;
 mod elf;
 mod entry;
@@ -56,7 +55,6 @@ mod broker_library_tests;
 #[path = "../tests/support/alias_failure.rs"]
 mod alias_failure;
 
-pub use cpuid::CpuidPolicy;
 pub use error::Error;
 pub use memory::GuestMemory;
 pub use reverie::syscalls::Syscall;

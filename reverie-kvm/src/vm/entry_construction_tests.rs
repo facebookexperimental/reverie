@@ -66,7 +66,6 @@ mod entry_construction_tests {
             .unwrap();
         parent.memory.write_raw(data, &[0]).unwrap();
         let xsave = parent.vcpu.get_xsave().unwrap();
-        let cpuid = parent.cpuid_policy;
         let group = parent.thread_group.clone();
         let gate = parent.memory.entry_gate();
         let owners = Box::new(parent.memory.test_mapping_owners());
@@ -89,7 +88,7 @@ mod entry_construction_tests {
         let (send, receive) = mpsc::channel();
         let worker = std::thread::spawn(move || {
             let result = KvmBackend::from_thread_state(
-                memory, registers, xsave, None, cpuid, CHILD_TID, group,
+                memory, registers, xsave, None, CHILD_TID, group,
             );
             let _ = send.send(result);
         });
@@ -259,7 +258,6 @@ mod entry_construction_tests {
                 parent.vcpu.get_regs().unwrap(),
                 parent.vcpu.get_xsave().unwrap(),
                 None,
-                parent.cpuid_policy,
                 CHILD_TID + 1,
                 parent.thread_group.clone(),
             )

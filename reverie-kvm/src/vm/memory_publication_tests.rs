@@ -41,15 +41,13 @@ pub(crate) mod memory_publication_tests {
             0xbb, data_low, data_high, 0x8a, 0x07, 0xe6, 0x80, 0x8a, 0x07, 0xe6, 0x81, 0x8a, 0x07,
             0xe6, 0x82, HLT,
         ];
-        let mut first = KvmBackend::new_with_memory_and_cpuid_policy(
+        let mut first = KvmBackend::new_with_memory(
             memory.clone(),
-            CpuidPolicy::default(),
             None,
         )
         .expect("first VM requires /dev/kvm");
-        let mut second = KvmBackend::new_with_memory_and_cpuid_policy(
+        let mut second = KvmBackend::new_with_memory(
             memory.clone(),
-            CpuidPolicy::default(),
             None,
         )
         .expect("second VM requires /dev/kvm");
