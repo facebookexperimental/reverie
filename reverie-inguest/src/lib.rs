@@ -67,6 +67,7 @@ pub mod launcher;
 pub mod lifecycle;
 #[cfg(feature = "exec-native-injection")]
 pub mod native_exec_sources;
+pub mod reserved_fds;
 pub mod seccomp;
 pub mod signal;
 #[cfg(feature = "coordinator-rpc")]

@@ -22,6 +22,7 @@ use std::sync::atomic::Ordering;
 use crate::dispatch::is_fork_like;
 use crate::guest::event::SyscallEvent;
 use crate::guest::signal::signal_action_supported;
+use crate::reserved_fds;
 use crate::trap::raw_syscall6;
 
 static COORDINATOR_FD: AtomicI32 = AtomicI32::new(-1);
@@ -331,10 +332,9 @@ pub unsafe fn protect_forwarded_descriptor_change(number: i64, args: [u64; 6]) -
     if protected.is_empty() {
         return None;
     }
-    let fd = |index: usize| u64::from(args[index] as u32);
-    if number == libc::SYS_close && protected.contains(&fd(0)) {
+    if number == libc::SYS_close && protected.contains(&reserved_fds::descriptor_arg(&args, 0)) {
         Some(0)
-    } else if number == libc::SYS_close_range && protected.iter().any(|&p| fd(0) <= p && p <= fd(1))
+    } else if number == libc::SYS_close_range && reserved_fds::close_range_covers(&args, protected)
     {
         Some(unsafe { close_range_preserving_args(args, protected) })
     } else {
@@ -374,18 +374,18 @@ unsafe fn protect_runtime_descriptors_inner(
     if event.number == libc::SYS_close && protected.contains(&fd_arg(event, 0)) {
         event.result = 0;
     } else if event.number == libc::SYS_close_range
-        && protected
-            .iter()
-            .any(|&fd| fd_arg(event, 0) <= fd && fd <= fd_arg(event, 1))
+        && reserved_fds::close_range_covers(&event.args, protected)
     {
         event.result = unsafe { close_range_preserving_fds(event, protected) };
     } else if let Some(result) = protected
         .iter()
-        .find_map(|&fd| readiness_refusal(event, fd))
+        .find_map(|&fd| reserved_fds::epoll_wait_result(event.number, &event.args, fd))
     {
         event.result = result;
     } else if protected.iter().any(|&fd| {
-        syscall_targets_event_fd(event, fd) || (guest_syscall && syscall_uses_socket(event, fd))
+        syscall_targets_event_fd(event, fd)
+            || (guest_syscall
+                && reserved_fds::socket_call_names_descriptor(event.number, &event.args, fd))
     }) {
         event.result = -i64::from(libc::EBADF);
     } else {
@@ -509,183 +509,25 @@ pub unsafe fn close_range_preserving_fds(event: &SyscallEvent, preserved: &[u64]
 ///
 /// As [`close_range_preserving_fds`].
 unsafe fn close_range_preserving_args(args: [u64; 6], preserved: &[u64]) -> i64 {
-    // As `fd_arg`: the kernel reads the low 32 bits of each register.
-    let arg = |index: usize| u64::from(args[index] as u32);
-    const CLOSE_RANGE_UNSHARE: u64 = 1 << 1;
-    const CLOSE_RANGE_CLOEXEC: u64 = 1 << 2;
-
-    let first = arg(0);
-    let last = arg(1);
-    let mut flags = arg(2);
-    if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 {
-        return -i64::from(libc::EINVAL);
+    unsafe {
+        reserved_fds::close_range_sparing(&args, preserved, |number, args| {
+            raw_syscall6(number, args)
+        })
     }
-    if flags & CLOSE_RANGE_UNSHARE != 0 {
-        let result =
-            unsafe { raw_syscall6(libc::SYS_unshare, [libc::CLONE_FILES as u64, 0, 0, 0, 0, 0]) };
-        if result < 0 {
-            return result;
-        }
-        flags &= !CLOSE_RANGE_UNSHARE;
-    }
-
-    // Close each gap of [first, last] between the preserved descriptors.
-    let mut start = first;
-    for &fd in preserved {
-        if fd < start || fd > last {
-            continue;
-        }
-        if start < fd {
-            let result =
-                unsafe { raw_syscall6(libc::SYS_close_range, [start, fd - 1, flags, 0, 0, 0]) };
-            if result < 0 {
-                return result;
-            }
-        }
-        start = fd + 1;
-        if start == 0 {
-            return 0;
-        }
-    }
-    if start <= last {
-        let result = unsafe { raw_syscall6(libc::SYS_close_range, [start, last, flags, 0, 0, 0]) };
-        if result < 0 {
-            return result;
-        }
-    }
-    0
 }
 
 /// Syscall argument `index` as the kernel reads a descriptor, `close_range`
 /// bound or flags argument: the low 32 bits of the register. Comparing the full
 /// register would let `fd | 1 << 32` reach the descriptor past a protection.
 pub fn fd_arg(event: &SyscallEvent, index: usize) -> u64 {
-    u64::from(event.args[index] as u32)
+    reserved_fds::descriptor_arg(&event.args, index)
 }
 
 /// Whether `event` operates on descriptor `event_fd` through one of its
-/// descriptor arguments: reads and writes, fcntl, ioctl, dup, mmap, splice,
-/// sendfile, epoll_ctl and the other descriptor calls listed below. It does
-/// not cover the socket calls (shutdown, send/recv, setsockopt and so on),
+/// descriptor arguments, by the shared rule
+/// [`reserved_fds::names_descriptor`]. It does not cover the socket calls,
 /// close, close_range or epoll readiness; [`protect_runtime_descriptors`]
 /// checks all of those for the runtime's own descriptors.
 pub fn syscall_targets_event_fd(event: &SyscallEvent, event_fd: u64) -> bool {
-    let fd = |index| fd_arg(event, index) == event_fd;
-    match event.number {
-        libc::SYS_read
-        | libc::SYS_readv
-        | libc::SYS_pread64
-        | libc::SYS_preadv
-        | libc::SYS_preadv2
-        | libc::SYS_write
-        | libc::SYS_writev
-        | libc::SYS_pwrite64
-        | libc::SYS_pwritev
-        | libc::SYS_pwritev2
-        | libc::SYS_vmsplice
-        | libc::SYS_fcntl
-        | libc::SYS_ioctl
-        | libc::SYS_dup
-        // Operations that change, lock or describe the open file itself.
-        | libc::SYS_ftruncate
-        | libc::SYS_fallocate
-        | libc::SYS_fchmod
-        | libc::SYS_fchown
-        | libc::SYS_fsetxattr
-        | libc::SYS_fremovexattr
-        | libc::SYS_fgetxattr
-        | libc::SYS_flistxattr
-        | libc::SYS_flock
-        | libc::SYS_fsync
-        | libc::SYS_fdatasync
-        | libc::SYS_sync_file_range
-        | libc::SYS_lseek
-        | libc::SYS_fstat
-        | libc::SYS_fstatfs
-        | libc::SYS_fadvise64
-        | libc::SYS_readahead
-        | libc::SYS_getdents64
-        | libc::SYS_getdents
-        | libc::SYS_syncfs
-        | libc::SYS_fchdir
-        // Descriptors of special kinds: a runtime-owned number is not one,
-        // and to the guest it is not open at all.
-        | libc::SYS_signalfd
-        | libc::SYS_signalfd4
-        | libc::SYS_timerfd_settime
-        | libc::SYS_timerfd_gettime
-        | libc::SYS_inotify_add_watch
-        | libc::SYS_inotify_rm_watch
-        | libc::SYS_fanotify_mark
-        | libc::SYS_setns
-        | libc::SYS_pidfd_send_signal
-        | libc::SYS_pidfd_getfd
-        | libc::SYS_process_madvise
-        | libc::SYS_process_mrelease
-        | libc::SYS_finit_module
-        | libc::SYS_fsmount
-        | libc::SYS_quotactl_fd
-        | libc::SYS_landlock_add_rule
-        | libc::SYS_landlock_restrict_self => fd(0),
-        libc::SYS_sendfile => fd(0) || fd(1),
-        libc::SYS_epoll_ctl => fd(0) || fd(2),
-        // waitid(P_PIDFD, fd, ...).
-        libc::SYS_waitid => event.args[0] as u32 == 3 && fd(1),
-        // A file mapping of the descriptor.
-        libc::SYS_mmap => event.args[3] & libc::MAP_ANONYMOUS as u64 == 0 && fd(4),
-        libc::SYS_dup2 | libc::SYS_dup3 => fd(0) || fd(1),
-        libc::SYS_splice | libc::SYS_copy_file_range => fd(0) || fd(2),
-        libc::SYS_tee => fd(0) || fd(1),
-        _ => false,
-    }
-}
-
-/// Whether a guest syscall shuts down, configures, connects, or sends or
-/// receives on socket `event_fd`. Only guest syscalls are checked: the Tool's
-/// own RPC client uses these on the coordinator connection.
-fn syscall_uses_socket(event: &SyscallEvent, event_fd: u64) -> bool {
-    let fd = |index| fd_arg(event, index) == event_fd;
-    match event.number {
-        libc::SYS_shutdown
-        | libc::SYS_getsockopt
-        | libc::SYS_setsockopt
-        | libc::SYS_sendto
-        | libc::SYS_recvfrom
-        | libc::SYS_sendmsg
-        | libc::SYS_recvmsg
-        | libc::SYS_sendmmsg
-        | libc::SYS_recvmmsg
-        | libc::SYS_connect
-        | libc::SYS_bind
-        | libc::SYS_listen
-        | libc::SYS_accept
-        | libc::SYS_accept4
-        | libc::SYS_getsockname
-        | libc::SYS_getpeername => fd(0),
-        _ => false,
-    }
-}
-
-/// The result Linux gives a guest `epoll_wait`, `epoll_pwait` or
-/// `epoll_pwait2` on `event_fd`, a number the guest does not have open: `EBADF`,
-/// after Linux's own `EINVAL` check of the event count. `None` for any other
-/// call. (`poll`, `ppoll`, `select` and `pselect6` name descriptors inside guest
-/// memory, and `*at` calls use their directory argument only for some paths;
-/// checking them would cost correct programs' calls a guest-memory read, so a
-/// buggy program that passes a runtime-owned number there is a known limit.)
-fn readiness_refusal(event: &SyscallEvent, event_fd: u64) -> Option<i64> {
-    match event.number {
-        libc::SYS_epoll_wait | libc::SYS_epoll_pwait | libc::SYS_epoll_pwait2
-            if fd_arg(event, 0) == event_fd =>
-        {
-            let events = event.args[2] as i32;
-            let most = i32::MAX / core::mem::size_of::<libc::epoll_event>() as i32;
-            Some(-i64::from(if events <= 0 || events > most {
-                libc::EINVAL
-            } else {
-                libc::EBADF
-            }))
-        }
-        _ => None,
-    }
+    reserved_fds::names_descriptor(event.number, &event.args, event_fd)
 }
