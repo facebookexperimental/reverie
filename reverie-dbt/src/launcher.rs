@@ -275,7 +275,7 @@ impl DbtRunner {
     /// Runs `guest` with inherited standard streams and waits for it to exit.
     pub fn status(&self, guest: &Command) -> io::Result<ExitStatus> {
         let child = self.spawn_command(&mut self.command(guest, None))?;
-        self.wait_for_status(child)
+        self.wait_for_status(child, None)
     }
 
     /// Runs `guest` with an exact environment instead of inheriting the launcher environment.
@@ -285,7 +285,7 @@ impl DbtRunner {
         environment: &BTreeMap<OsString, OsString>,
     ) -> io::Result<ExitStatus> {
         let child = self.spawn_command(&mut self.command(guest, Some(environment)))?;
-        self.wait_for_status(child)
+        self.wait_for_status(child, None)
     }
 
     /// Runs `guest` and captures its standard output and standard error.
@@ -296,7 +296,7 @@ impl DbtRunner {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped()),
         )?;
-        self.wait_with_output(child)
+        self.wait_with_output(child, None)
     }
 
     /// Captures guest output while preserving an inherited terminal stdin.
@@ -307,7 +307,7 @@ impl DbtRunner {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped()),
         )?;
-        self.wait_with_output(child)
+        self.wait_with_output(child, None)
     }
 
     /// Runs `guest` with captured output and supplies `input` on standard input.
@@ -331,8 +331,16 @@ impl DbtRunner {
         })?;
 
         std::thread::scope(|scope| {
-            let writer = scope.spawn(move || copy_streaming_input(&mut input, &mut stdin));
-            let output = self.wait_with_output(child);
+            let writer = match std::thread::Builder::new()
+                .spawn_scoped(scope, move || copy_streaming_input(&mut input, &mut stdin))
+            {
+                Ok(writer) => writer,
+                Err(error) => {
+                    self.terminate_and_reap(&mut child);
+                    return Err(error);
+                }
+            };
+            let output = self.wait_with_output(child, None);
             let write_result = writer
                 .join()
                 .map_err(|_| io::Error::other("DBT guest stdin writer thread panicked"))?;
@@ -375,7 +383,7 @@ impl DbtRunner {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped()),
         )?;
-        self.wait_with_output(child)
+        self.wait_with_output(child, None)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -696,26 +704,39 @@ impl DbtRunner {
         // A reusable Command retains a caller-supplied Stdio owner after spawn.
         // Keep no parent reader beyond the Tool's temporary initial-image lease.
         drop(command);
+        // Do not serve the existing config handshake until all parent I/O
+        // threads exist. The guest's native helper cannot publish READY before
+        // receiving that config, including runs without protected evidence.
+        let (setup_sender, setup) = tokio::sync::oneshot::channel();
         let wait = tokio::task::spawn_blocking(move || match input {
             CoordinatedInput::Reader(input) => runner
                 .wait_with_output_and_input_writer(
                     child,
                     input,
                     input_writer.expect("Reader writer was retained"),
+                    Some(setup_sender),
                 )
                 .map(ChildWait::Output),
-            CoordinatedInput::Null | CoordinatedInput::Inherit if capture_output => {
-                runner.wait_with_output(child).map(ChildWait::Output)
-            }
-            CoordinatedInput::Null | CoordinatedInput::Inherit => {
-                runner.wait_for_status(child).map(ChildWait::Status)
-            }
+            CoordinatedInput::Null | CoordinatedInput::Inherit if capture_output => runner
+                .wait_with_output(child, Some(setup_sender))
+                .map(ChildWait::Output),
+            CoordinatedInput::Null | CoordinatedInput::Inherit => runner
+                .wait_for_status(child, Some(setup_sender))
+                .map(ChildWait::Status),
         });
-        let wait = serve_rpc_until(server, async move {
+        let completion = async move {
             wait.await
                 .map_err(|error| io::Error::other(error.to_string()))?
-        })
-        .await?;
+        };
+        if setup.await.is_err() {
+            // Setup owns cleanup before dropping its sender. Await its real
+            // error rather than starting the server or losing the child wait.
+            return match completion.await {
+                Err(error) => Err(error),
+                Ok(_) => Err(io::Error::other("DBT launch setup ended without readiness")),
+            };
+        }
+        let wait = serve_rpc_until(server, completion).await?;
         if missing_coordinator_request_is_error(requested.load(Ordering::Acquire), &wait) {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
@@ -784,7 +805,30 @@ impl DbtRunner {
         Ok(child)
     }
 
-    fn wait_for_status(&self, child: Child) -> io::Result<ExitStatus> {
+    fn finish_launch_setup(
+        &self,
+        setup: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> io::Result<()> {
+        if let Some(evidence) = &self.evidence {
+            evidence.start()?;
+        }
+        if let Some(setup) = setup {
+            setup
+                .send(())
+                .map_err(|_| io::Error::other("DBT launch owner was cancelled"))?;
+        }
+        Ok(())
+    }
+
+    fn wait_for_status(
+        &self,
+        mut child: Child,
+        setup: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> io::Result<ExitStatus> {
+        if let Err(error) = self.finish_launch_setup(setup) {
+            self.terminate_and_reap(&mut child);
+            return Err(error);
+        }
         let status = self.reap_tree(child);
         self.finish_status(status)
     }
@@ -822,7 +866,11 @@ impl DbtRunner {
         combine_status_and_evidence(status, evidence)
     }
 
-    fn wait_with_output(&self, mut child: Child) -> io::Result<Output> {
+    fn wait_with_output(
+        &self,
+        mut child: Child,
+        setup: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> io::Result<Output> {
         let mut stdout = match child.stdout.take() {
             Some(stdout) => stdout,
             None => {
@@ -853,9 +901,35 @@ impl DbtRunner {
             let stop = Arc::new(AtomicU8::new(READ_ON));
             let stdout_stop = Arc::clone(&stop);
             let stderr_stop = Arc::clone(&stop);
-            let stdout_reader = scope.spawn(move || read_cancellable(&mut stdout, &stdout_stop));
-            let stderr_reader = scope.spawn(move || read_cancellable(&mut stderr, &stderr_stop));
-            let reaped = self.reap_tree(child);
+            let stdout_reader = match std::thread::Builder::new()
+                .spawn_scoped(scope, move || read_cancellable(&mut stdout, &stdout_stop))
+            {
+                Ok(reader) => reader,
+                Err(error) => {
+                    self.terminate_and_reap(&mut child);
+                    return Err(error);
+                }
+            };
+            let stderr_reader = match std::thread::Builder::new()
+                .spawn_scoped(scope, move || read_cancellable(&mut stderr, &stderr_stop))
+            {
+                Ok(reader) => reader,
+                Err(error) => {
+                    stop.store(READ_DISCARD, Ordering::Release);
+                    self.terminate_and_reap(&mut child);
+                    let _ = stdout_reader.join();
+                    return Err(error);
+                }
+            };
+            // Input and blocking-waiter tasks, when needed, already exist.
+            // Only now release START and the coordinator config handshake.
+            let reaped = match self.finish_launch_setup(setup) {
+                Ok(()) => self.reap_tree(child),
+                Err(error) => {
+                    self.terminate_and_reap(&mut child);
+                    Err(error)
+                }
+            };
             let reap_failed = reaped.is_err();
             if reap_failed {
                 // A tree member may still hold the pipes; what was read so far
@@ -910,14 +984,15 @@ impl DbtRunner {
         let stdin = child.stdin.take().ok_or_else(|| {
             io::Error::new(io::ErrorKind::BrokenPipe, "failed to open DBT guest stdin")
         })?;
-        self.wait_with_output_and_input_writer(child, input, stdin)
+        self.wait_with_output_and_input_writer(child, input, stdin, None)
     }
 
     fn wait_with_output_and_input_writer<R, W>(
         &self,
-        child: Child,
+        mut child: Child,
         mut input: R,
         mut stdin: W,
+        setup: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> io::Result<Output>
     where
         R: Read + Send + 'static,
@@ -926,10 +1001,13 @@ impl DbtRunner {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-84): Review detaching a source-blocked input pump at child exit.
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        std::thread::spawn(move || {
+        if let Err(error) = std::thread::Builder::new().spawn(move || {
             let _ = sender.send(copy_streaming_input(&mut input, &mut stdin));
-        });
-        let output = self.wait_with_output(child)?;
+        }) {
+            self.terminate_and_reap(&mut child);
+            return Err(error);
+        }
+        let output = self.wait_with_output(child, setup)?;
         match receiver.try_recv() {
             Ok(Err(error)) if error.kind() != io::ErrorKind::BrokenPipe => Err(error),
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -944,6 +1022,8 @@ impl DbtRunner {
             let _ = child.kill();
             let _ = wait_for_exit_without_reaping(child.id());
             let _ = terminate_run(child.id() as i32);
+        } else {
+            let _ = child.kill();
         }
         let _ = child.wait();
         let _ = self.finish_evidence(false);
@@ -1850,6 +1930,36 @@ mod tests {
             isolated_process_group: false,
             terminate_process_group_on_exit: false,
             defer_evidence_finish: false,
+        }
+    }
+
+    #[test]
+    fn cancelled_launch_setup_reaps_the_owned_child() {
+        for (capture, process_group) in [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let runner = runner().terminate_process_group_on_exit(process_group);
+            let mut command = Command::new("/bin/sleep");
+            command.arg("60").process_group(0);
+            if capture {
+                command.stdout(Stdio::piped()).stderr(Stdio::piped());
+            }
+            let child = command.spawn().unwrap();
+            let pid = child.id();
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            drop(receiver);
+            let error = if capture {
+                runner.wait_with_output(child, Some(sender)).unwrap_err()
+            } else {
+                runner.wait_for_status(child, Some(sender)).unwrap_err()
+            };
+            assert!(error.to_string().contains("DBT launch owner was cancelled"));
+            // Cleanup, including reap, completes before setup failure returns.
+            let waited = unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG) };
+            assert_eq!(waited, -1);
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
         }
     }
 
@@ -3004,6 +3114,7 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let child = runner.spawn_command(&mut command).unwrap();
+        runner.finish_launch_setup(None).unwrap();
         let process_group = child.id() as i32;
         let output = child.wait_with_output().unwrap();
         wait_for_process_group_no_live_members(process_group).unwrap();
@@ -3055,6 +3166,7 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = runner.spawn_command(&mut command).unwrap();
+        runner.finish_launch_setup(None).unwrap();
         let process_group = child.id() as i32;
 
         let mut outside = Command::new(fixture);
@@ -3106,6 +3218,7 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let child = runner.spawn_command(&mut command).unwrap();
+        runner.finish_launch_setup(None).unwrap();
         let process_group = child.id() as i32;
         let output = child.wait_with_output().unwrap();
         wait_for_process_group_no_live_members(process_group).unwrap();
@@ -3151,6 +3264,7 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let child = runner.spawn_command(&mut command).unwrap();
+        runner.finish_launch_setup(None).unwrap();
         let process_group = child.id() as i32;
         let output = child.wait_with_output().unwrap();
         wait_for_process_group_no_live_members(process_group).unwrap();
@@ -3192,6 +3306,7 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let child = runner.spawn_command(&mut command).unwrap();
+        runner.finish_launch_setup(None).unwrap();
         let process_group = child.id() as i32;
         let output = child.wait_with_output().unwrap();
         wait_for_process_group_no_live_members(process_group).unwrap();
@@ -3228,6 +3343,7 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let child = runner.spawn_command(&mut command).unwrap();
+        runner.finish_launch_setup(None).unwrap();
         let process_group = child.id() as i32;
         let output = child.wait_with_output().unwrap();
         wait_for_process_group_no_live_members(process_group).unwrap();

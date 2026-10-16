@@ -371,11 +371,11 @@ pub(crate) struct EvidenceSession {
     token_hex: String,
     root_process: Arc<Mutex<Option<ProcessKey>>>,
     stop: Arc<AtomicBool>,
-    #[cfg(test)]
     acknowledgement_drops: AcknowledgementDropControl,
     lifecycle: AtomicU8,
     finish_lock: Mutex<()>,
     output: Mutex<Option<File>>,
+    pending_listener: Mutex<Option<(UnixListener, [u8; CHANNEL_TOKEN_LEN])>>,
     worker: Mutex<Option<JoinHandle<io::Result<CollectedEvidence>>>>,
     result: Mutex<Option<Result<(), String>>>,
     collector: SharedCollector,
@@ -403,36 +403,20 @@ impl EvidenceSession {
 
         let root_process = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
-        let worker_root_process = Arc::clone(&root_process);
-        let worker_stop = Arc::clone(&stop);
         let acknowledgement_drops = AcknowledgementDropControl::default();
-        let worker_acknowledgement_drops = acknowledgement_drops.clone();
         let collector = SharedCollector::new();
-        let worker_collector = collector.clone();
-        let worker = std::thread::Builder::new()
-            .name("reverie-dbt-evidence".into())
-            .spawn(move || {
-                serve(
-                    listener,
-                    token,
-                    worker_root_process,
-                    worker_stop,
-                    worker_acknowledgement_drops,
-                    worker_collector,
-                )
-            })?;
 
         Ok(Self {
             address_hex: encode_hex(address),
             token_hex: encode_hex(&token),
             root_process,
             stop,
-            #[cfg(test)]
             acknowledgement_drops,
             lifecycle: AtomicU8::new(SESSION_NEW),
             finish_lock: Mutex::new(()),
             output: Mutex::new(Some(output)),
-            worker: Mutex::new(Some(worker)),
+            pending_listener: Mutex::new(Some((listener, token))),
+            worker: Mutex::new(None),
             result: Mutex::new(None),
             collector,
             deferred_publication: Mutex::new(None),
@@ -511,6 +495,49 @@ impl EvidenceSession {
         Ok(())
     }
 
+    /// Start consuming frames after the guest and the launcher's I/O tasks exist.
+    /// The bound socket queues the client's initial START, whose acknowledgement
+    /// already precedes application execution and native helper creation.
+    pub(crate) fn start(&self) -> io::Result<()> {
+        let _finish_guard = self.finish_lock.lock().unwrap();
+        if self.lifecycle.load(Ordering::Acquire) != SESSION_RUNNING
+            || self.root_process.lock().unwrap().is_none()
+        {
+            return Err(io::Error::other(
+                "DBT evidence collector started before root publication or after finalization",
+            ));
+        }
+        let (listener, token) = self
+            .pending_listener
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "DBT evidence collector was already started",
+                )
+            })?;
+        let root_process = Arc::clone(&self.root_process);
+        let stop = Arc::clone(&self.stop);
+        let acknowledgement_drops = self.acknowledgement_drops.clone();
+        let collector = self.collector.clone();
+        let worker = std::thread::Builder::new()
+            .name("reverie-dbt-evidence".into())
+            .spawn(move || {
+                serve(
+                    listener,
+                    token,
+                    root_process,
+                    stop,
+                    acknowledgement_drops,
+                    collector,
+                )
+            })?;
+        *self.worker.lock().unwrap() = Some(worker);
+        Ok(())
+    }
+
     pub(crate) fn finish(&self, publication_allowed: bool) -> io::Result<()> {
         let _finish_guard = self.finish_lock.lock().unwrap();
         if let Some(result) = self.result.lock().unwrap().as_ref() {
@@ -538,13 +565,14 @@ impl EvidenceSession {
         let final_result =
             (|| {
                 self.stop.store(true, Ordering::Release);
+                self.pending_listener.lock().unwrap().take();
                 let worker = self.worker.lock().unwrap().take();
                 let collected = match worker {
                     Some(worker) => worker
                         .join()
                         .map_err(|_| io::Error::other("DBT evidence collector thread panicked"))?,
                     None => Err(io::Error::other(
-                        "DBT evidence collector was already consumed without a result",
+                        "DBT evidence collector never started or was consumed without a result",
                     )),
                 };
                 let mut output =
@@ -2819,6 +2847,39 @@ mod tests {
             "finalization returned the wrong error: {error}"
         );
         assert_eq!(file.metadata().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn evidence_preparation_does_not_allocate_a_collector_task() {
+        let file = tempfile::tempfile().unwrap();
+        let session = EvidenceSession::new(&file).unwrap();
+        assert!(
+            session.worker.lock().unwrap().is_none(),
+            "preparing evidence must not consume a task ID before the guest is spawned"
+        );
+        session.claim_run().unwrap();
+        assert!(session.worker.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn unstarted_evidence_is_closed_without_publication() {
+        let mut file = tempfile::tempfile().unwrap();
+        let session = EvidenceSession::new(&file).unwrap();
+        file.write_all(b"unpublished bytes").unwrap();
+        let address = session
+            .pending_listener
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .0
+            .local_addr()
+            .unwrap();
+        session.claim_run().unwrap();
+        assert!(session.start().is_err());
+        assert!(session.finish(false).is_err());
+        assert_eq!(file.metadata().unwrap().len(), 0);
+        assert!(UnixStream::connect_addr(&address).is_err());
     }
 
     #[test]
