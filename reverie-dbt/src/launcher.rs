@@ -975,6 +975,11 @@ impl DbtRunner {
         command
             .arg("-quiet")
             .arg("-disable_rseq")
+            // DynamoRIO reserves its code region at -vm_base plus a random
+            // offset (seeded from /dev/urandom), which a guest sees in
+            // /proc/self/maps and smaps: no offset, so the layout repeats.
+            // The value must be hex: DynamoRIO parses address options so.
+            .args(["-vm_max_offset", "0x0"])
             .args(["-stack_size", "2M"])
             .arg("-c")
             .arg(&self.client)
@@ -1855,6 +1860,8 @@ mod tests {
             [
                 "-quiet",
                 "-disable_rseq",
+                "-vm_max_offset",
+                "0x0",
                 "-stack_size",
                 "2M",
                 "-c",
@@ -1888,6 +1895,8 @@ mod tests {
             [
                 "-quiet",
                 "-disable_rseq",
+                "-vm_max_offset",
+                "0x0",
                 "-stack_size",
                 "2M",
                 "-c",
@@ -1926,6 +1935,8 @@ mod tests {
             [
                 OsStr::new("-quiet"),
                 OsStr::new("-disable_rseq"),
+                OsStr::new("-vm_max_offset"),
+                OsStr::new("0x0"),
                 OsStr::new("-stack_size"),
                 OsStr::new("2M"),
                 OsStr::new("-c"),
@@ -1958,6 +1969,8 @@ mod tests {
             [
                 OsStr::new("-quiet"),
                 OsStr::new("-disable_rseq"),
+                OsStr::new("-vm_max_offset"),
+                OsStr::new("0x0"),
                 OsStr::new("-stack_size"),
                 OsStr::new("2M"),
                 OsStr::new("-c"),
@@ -1990,6 +2003,8 @@ mod tests {
             [
                 OsStr::new("-quiet"),
                 OsStr::new("-disable_rseq"),
+                OsStr::new("-vm_max_offset"),
+                OsStr::new("0x0"),
                 OsStr::new("-stack_size"),
                 OsStr::new("2M"),
                 OsStr::new("-c"),
@@ -2018,8 +2033,8 @@ mod tests {
 
         let wrapped = runner().command(&guest, None);
         let args = wrapped.get_args().collect::<Vec<_>>();
-        assert_eq!(args[9], OsStr::new("/bin/sh"));
-        assert_eq!(args[10], script.as_os_str());
+        assert_eq!(args[11], OsStr::new("/bin/sh"));
+        assert_eq!(args[12], script.as_os_str());
         assert_eq!(wrapped.get_current_dir(), Some(root.path()));
     }
 
@@ -2038,8 +2053,8 @@ mod tests {
 
         let wrapped = runner().command(&guest, None);
         let args = wrapped.get_args().collect::<Vec<_>>();
-        assert_eq!(args[9], OsStr::new("/bin/sh"));
-        assert_eq!(args[10], wrapper.as_os_str());
+        assert_eq!(args[11], OsStr::new("/bin/sh"));
+        assert_eq!(args[12], wrapper.as_os_str());
     }
 
     #[test]
@@ -2055,8 +2070,8 @@ mod tests {
 
         let wrapped = runner().command(&guest, None);
         let args = wrapped.get_args().collect::<Vec<_>>();
-        assert_eq!(args[9], OsStr::new("guest-elf"));
-        assert_eq!(args[10], OsStr::new("argument"));
+        assert_eq!(args[11], OsStr::new("guest-elf"));
+        assert_eq!(args[12], OsStr::new("argument"));
     }
 
     #[test]
