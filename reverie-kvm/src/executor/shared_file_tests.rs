@@ -639,7 +639,7 @@ mod shared_file_dispatch_tests {
                 let file = std::fs::File::open(&f.path).unwrap();
                 insert_file_with_flags(&mut f.state, file, false, Some(OutputAlias::Stdout))
             } else {
-                let fd = open_readonly(&mut f.memory, &mut f.state, "/proc/stat");
+                let fd = open_readonly(&mut f.memory, &mut f.state, "/proc/self/maps");
                 assert!(fd >= 3);
                 assert!(f.state.proc_files.contains_key(&(fd as i32)));
                 fd

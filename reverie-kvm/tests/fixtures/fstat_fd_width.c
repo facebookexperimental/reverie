@@ -251,12 +251,12 @@ int main(int argc, char **argv) {
   CHECK(write(file, contents, sizeof(contents) - 1) == sizeof(contents) - 1);
   int directory = open(".", O_RDONLY | O_DIRECTORY);
   int proc_root = open("/proc", O_RDONLY | O_DIRECTORY);
-  int proc_stat = open("/proc/stat", O_RDONLY);
+  int proc_maps = open("/proc/self/maps", O_RDONLY);
   char path[64];
   CHECK(snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", file) > 0);
   int fdinfo = open(path, O_RDONLY);
   int stdout_alias = dup(STDOUT_FILENO);
-  CHECK(directory >= 0 && proc_root >= 0 && proc_stat >= 0 && fdinfo >= 0);
+  CHECK(directory >= 0 && proc_root >= 0 && proc_maps >= 0 && fdinfo >= 0);
   CHECK(stdout_alias >= 0);
   int closed = dup(file);
   CHECK(closed >= 0 && close(closed) == 0);
@@ -273,7 +273,7 @@ int main(int argc, char **argv) {
                  {"file", file, 0, 0, 0},
                  {"directory", directory, 0, 0, 1},
                  {"proc-root", proc_root, 0, 1, 1},
-                 {"proc-stat", proc_stat, 0, 1, 0},
+                 {"proc-maps", proc_maps, 0, 1, 0},
                  {"fdinfo", fdinfo, 0, 1, 0}};
   struct observation stdout_stat = {0};
   for (size_t object = 0; object < sizeof(objects) / sizeof(objects[0]); ++object) {
@@ -347,7 +347,7 @@ int main(int argc, char **argv) {
                 upper_words[upper], bad_pointer, expected);
       }
   CHECK(close(stdout_alias) == 0 && close(fdinfo) == 0);
-  CHECK(close(proc_stat) == 0 && close(proc_root) == 0);
+  CHECK(close(proc_maps) == 0 && close(proc_root) == 0);
   CHECK(close(directory) == 0 && close(file) == 0);
   return 0;
 }

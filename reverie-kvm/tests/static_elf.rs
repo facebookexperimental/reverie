@@ -3029,7 +3029,7 @@ fn real_kvm_synthetic_proc_snapshot_is_immutable_and_opath_correct() {
         libc::O_RDONLY | libc::O_CREAT | libc::O_DIRECTORY,
     );
     let create_directory = native_open_errno(
-        "/proc/stat",
+        "/proc/self/maps",
         libc::O_RDONLY | libc::O_CREAT | libc::O_DIRECTORY,
     );
     assert_eq!(create_directory, policy_error);
@@ -3104,14 +3104,7 @@ static void *failed_mapping(int descriptor, int protection, int flags) {
 
 int main(int argc, char **argv) {
     static const char expected[] =
-        "cpu  0 0 0 0 0 0 0 0 0 0\n"
-        "cpu0 0 0 0 0 0 0 0 0 0 0\n"
-        "intr 0\n"
-        "ctxt 0\n"
-        "btime 0\n"
-        "processes 1\n"
-        "procs_running 1\n"
-        "procs_blocked 0\n";
+        "7fffff800000-7ffffffff000 rw-p 00000000 00:00 0 [stack]\n";
     char actual[sizeof(expected)] = {0};
     struct stat metadata;
 
@@ -3123,7 +3116,7 @@ int main(int argc, char **argv) {
     CHECK(expected_create_directory_exclusive > 0);
     CHECK(expected_mounts_create_directory_nofollow > 0);
 
-    int descriptor = open("/proc/stat", O_RDONLY | O_CLOEXEC);
+    int descriptor = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
     CHECK(descriptor >= 0);
     CHECK((fcntl(descriptor, F_GETFL) & O_ACCMODE) == O_RDONLY);
     CHECK((fcntl(descriptor, F_GETFD) & FD_CLOEXEC) != 0);
@@ -3350,19 +3343,19 @@ int main(int argc, char **argv) {
     CHECK(close(ordinary) == 0);
     CHECK(unlink("fdinfo-target") == 0);
 
-    EXPECT_ERROR(open("/proc/stat", O_RDONLY | O_DIRECTORY), ENOTDIR);
-    EXPECT_ERROR(open("/proc/stat", O_PATH | O_DIRECTORY), ENOTDIR);
-    EXPECT_ERROR(open("/proc/stat", O_WRONLY), EACCES);
-    EXPECT_ERROR(open("/proc/stat", O_RDWR), EACCES);
-    EXPECT_ERROR(open("/proc/stat", O_RDONLY | O_TRUNC), EACCES);
-    EXPECT_ERROR(open("/proc/stat", O_RDONLY | O_DIRECT), EINVAL);
-    EXPECT_ERROR(open("/proc/stat", O_RDONLY | O_CREAT | O_EXCL, 0600), EEXIST);
-    EXPECT_ERROR(open("/proc/stat", O_WRONLY | O_CREAT | O_EXCL, 0600), EEXIST);
-    EXPECT_ERROR(open("/proc/stat", O_RDONLY | O_CREAT | O_EXCL | O_TRUNC, 0600), EEXIST);
-    EXPECT_ERROR(open("/proc/stat", O_WRONLY | O_CREAT | O_EXCL | O_DIRECT | O_NOFOLLOW, 0600), EEXIST);
-    EXPECT_ERROR(open("/proc/stat", O_RDONLY | O_CREAT | O_DIRECTORY, 0600),
+    EXPECT_ERROR(open("/proc/self/maps", O_RDONLY | O_DIRECTORY), ENOTDIR);
+    EXPECT_ERROR(open("/proc/self/maps", O_PATH | O_DIRECTORY), ENOTDIR);
+    EXPECT_ERROR(open("/proc/self/maps", O_WRONLY), EACCES);
+    EXPECT_ERROR(open("/proc/self/maps", O_RDWR), EACCES);
+    EXPECT_ERROR(open("/proc/self/maps", O_RDONLY | O_TRUNC), EACCES);
+    EXPECT_ERROR(open("/proc/self/maps", O_RDONLY | O_DIRECT), EINVAL);
+    EXPECT_ERROR(open("/proc/self/maps", O_RDONLY | O_CREAT | O_EXCL, 0600), EEXIST);
+    EXPECT_ERROR(open("/proc/self/maps", O_WRONLY | O_CREAT | O_EXCL, 0600), EEXIST);
+    EXPECT_ERROR(open("/proc/self/maps", O_RDONLY | O_CREAT | O_EXCL | O_TRUNC, 0600), EEXIST);
+    EXPECT_ERROR(open("/proc/self/maps", O_WRONLY | O_CREAT | O_EXCL | O_DIRECT | O_NOFOLLOW, 0600), EEXIST);
+    EXPECT_ERROR(open("/proc/self/maps", O_RDONLY | O_CREAT | O_DIRECTORY, 0600),
                  expected_create_directory);
-    EXPECT_ERROR(open("/proc/stat", O_RDONLY | O_CREAT | O_EXCL | O_DIRECTORY, 0600),
+    EXPECT_ERROR(open("/proc/self/maps", O_RDONLY | O_CREAT | O_EXCL | O_DIRECTORY, 0600),
                  expected_create_directory_exclusive);
     EXPECT_ERROR(open("/proc/mounts", O_RDONLY | O_CREAT | O_DIRECTORY | O_NOFOLLOW, 0600),
                  expected_mounts_create_directory_nofollow);
@@ -3370,25 +3363,25 @@ int main(int argc, char **argv) {
                       O_RDONLY | O_CREAT | O_EXCL | O_DIRECTORY | O_NOFOLLOW,
                       0600),
                  expected_create_directory_exclusive);
-    EXPECT_ERROR(open("/proc/stat", O_RDONLY | O_TMPFILE, 0600), EINVAL);
-    EXPECT_ERROR(open("/proc/stat", O_RDONLY | O_TMPFILE | O_NOFOLLOW, 0600), EINVAL);
-    EXPECT_ERROR(open("/proc/stat", O_RDONLY | O_TMPFILE | O_TRUNC, 0600), EINVAL);
-    EXPECT_ERROR(open("/proc/stat", O_RDONLY | O_TMPFILE | O_DIRECT, 0600), EINVAL);
-    EXPECT_ERROR(open("/proc/stat", O_RDONLY | O_TMPFILE | O_EXCL, 0600), EINVAL);
-    EXPECT_ERROR(open("/proc/stat", O_RDONLY | O_TMPFILE | O_NOFOLLOW | O_TRUNC | O_DIRECT | O_EXCL, 0600), EINVAL);
-    EXPECT_ERROR(open("/proc/stat", O_WRONLY | PRIVATE_TMPFILE, 0600), EINVAL);
-    EXPECT_ERROR(open("/proc/stat", O_WRONLY | O_TMPFILE | O_CREAT, 0600), EINVAL);
-    EXPECT_ERROR(open("/proc/stat", O_RDWR | O_TMPFILE | O_CREAT, 0600), EINVAL);
-    EXPECT_ERROR(open("/proc/stat", O_ACCMODE | O_TMPFILE | O_CREAT, 0600), EINVAL);
-    EXPECT_ERROR(open("/proc/stat", O_WRONLY | O_TMPFILE, 0600), ENOTDIR);
-    EXPECT_ERROR(open("/proc/stat", O_RDWR | O_TMPFILE, 0600), ENOTDIR);
-    EXPECT_ERROR(open("/proc/stat", O_ACCMODE | O_TMPFILE, 0600), ENOTDIR);
-    EXPECT_ERROR(open("/proc/stat", O_PATH | O_TMPFILE, 0600), ENOTDIR);
-    EXPECT_ERROR(open("/proc/stat", O_PATH | O_TMPFILE | O_NOFOLLOW | O_TRUNC | O_DIRECT | O_EXCL, 0600), ENOTDIR);
-    int ignored_create = open("/proc/stat", O_PATH | O_CREAT | O_EXCL, 0600);
+    EXPECT_ERROR(open("/proc/self/maps", O_RDONLY | O_TMPFILE, 0600), EINVAL);
+    EXPECT_ERROR(open("/proc/self/maps", O_RDONLY | O_TMPFILE | O_NOFOLLOW, 0600), EINVAL);
+    EXPECT_ERROR(open("/proc/self/maps", O_RDONLY | O_TMPFILE | O_TRUNC, 0600), EINVAL);
+    EXPECT_ERROR(open("/proc/self/maps", O_RDONLY | O_TMPFILE | O_DIRECT, 0600), EINVAL);
+    EXPECT_ERROR(open("/proc/self/maps", O_RDONLY | O_TMPFILE | O_EXCL, 0600), EINVAL);
+    EXPECT_ERROR(open("/proc/self/maps", O_RDONLY | O_TMPFILE | O_NOFOLLOW | O_TRUNC | O_DIRECT | O_EXCL, 0600), EINVAL);
+    EXPECT_ERROR(open("/proc/self/maps", O_WRONLY | PRIVATE_TMPFILE, 0600), EINVAL);
+    EXPECT_ERROR(open("/proc/self/maps", O_WRONLY | O_TMPFILE | O_CREAT, 0600), EINVAL);
+    EXPECT_ERROR(open("/proc/self/maps", O_RDWR | O_TMPFILE | O_CREAT, 0600), EINVAL);
+    EXPECT_ERROR(open("/proc/self/maps", O_ACCMODE | O_TMPFILE | O_CREAT, 0600), EINVAL);
+    EXPECT_ERROR(open("/proc/self/maps", O_WRONLY | O_TMPFILE, 0600), ENOTDIR);
+    EXPECT_ERROR(open("/proc/self/maps", O_RDWR | O_TMPFILE, 0600), ENOTDIR);
+    EXPECT_ERROR(open("/proc/self/maps", O_ACCMODE | O_TMPFILE, 0600), ENOTDIR);
+    EXPECT_ERROR(open("/proc/self/maps", O_PATH | O_TMPFILE, 0600), ENOTDIR);
+    EXPECT_ERROR(open("/proc/self/maps", O_PATH | O_TMPFILE | O_NOFOLLOW | O_TRUNC | O_DIRECT | O_EXCL, 0600), ENOTDIR);
+    int ignored_create = open("/proc/self/maps", O_PATH | O_CREAT | O_EXCL, 0600);
     CHECK(ignored_create >= 0 && (fcntl(ignored_create, F_GETFL) & O_PATH) != 0);
     CHECK(close(ignored_create) == 0);
-    int regular_nofollow = open("/proc/stat", O_RDONLY | O_NOFOLLOW);
+    int regular_nofollow = open("/proc/self/maps", O_RDONLY | O_NOFOLLOW);
     CHECK(regular_nofollow >= 0);
     CHECK((fcntl(regular_nofollow, F_GETFL) & O_NOFOLLOW) != 0);
     CHECK(close(regular_nofollow) == 0);
@@ -3400,14 +3393,14 @@ int main(int argc, char **argv) {
     EXPECT_ERROR(open("/proc/mounts", O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600), EEXIST);
     EXPECT_ERROR(open("/proc/mounts", O_RDONLY | O_DIRECTORY | O_NOFOLLOW), ENOTDIR);
     EXPECT_ERROR(open("/proc/mounts", O_PATH | O_DIRECTORY | O_NOFOLLOW), ENOTDIR);
-    int status = open("/proc/stat", O_RDONLY | O_NONBLOCK | O_APPEND | O_SYNC);
+    int status = open("/proc/self/maps", O_RDONLY | O_NONBLOCK | O_APPEND | O_SYNC);
     CHECK(status >= 0);
     CHECK((fcntl(status, F_GETFL) & (O_NONBLOCK | O_APPEND | O_SYNC)) ==
           (O_NONBLOCK | O_APPEND | O_SYNC));
     CHECK(close(status) == 0);
 
     int path = open(
-        "/proc/stat",
+        "/proc/self/maps",
         O_PATH | O_CLOEXEC | O_TRUNC | O_DIRECT | O_APPEND | O_SYNC | O_NONBLOCK
     );
     CHECK(path >= 0);
@@ -3423,7 +3416,7 @@ int main(int argc, char **argv) {
     mapping = failed_mapping(path, PROT_READ, MAP_PRIVATE);
     CHECK(mapping == MAP_FAILED && errno == EBADF);
 
-    int nofollow = open("/proc/stat", O_PATH | O_NOFOLLOW);
+    int nofollow = open("/proc/self/maps", O_PATH | O_NOFOLLOW);
     CHECK(nofollow >= 0);
     CHECK((fcntl(nofollow, F_GETFL) & (O_PATH | O_NOFOLLOW)) == (O_PATH | O_NOFOLLOW));
     CHECK(fstat(nofollow, &metadata) == 0 && S_ISREG(metadata.st_mode));
@@ -21260,7 +21253,7 @@ fn fstat_and_fstatfs_consume_low_descriptor_words_on_kvm() {
                     "file",
                     "directory",
                     "proc-root",
-                    "proc-stat",
+                    "proc-maps",
                     "fdinfo",
                 ][..],
             ),
