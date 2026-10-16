@@ -188,6 +188,61 @@ const OVERTAKEN_WITH_NOTIFICATION_QUEUED_KEPT: usize = 1024;
 pub(crate) static SECOND_STAGES_ARMED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// How far one step toward a precise event's target runs the guest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StepUnit {
+    /// One instruction (`PTRACE_SINGLESTEP`).
+    Instruction,
+    /// Up to and including the next taken branch (`PTRACE_SINGLEBLOCK`).
+    /// Only taken when the decoded bound shows the block cannot reach the
+    /// target (see [`TimerImpl::step_unit`]).
+    #[cfg(target_arch = "x86_64")]
+    Block,
+}
+
+/// Steps of each unit taken toward precise event targets, and lookups in the
+/// block bound cache, for tests and measurement.
+pub(crate) static INSTRUCTION_STEPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static BLOCK_STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static BLOCK_BOUND_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static BLOCK_BOUND_MISSES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// When set to `0`, every step toward a precise event's target is a single
+/// instruction step, as before block steps existed. Any other value, or none,
+/// leaves block steps on. For measurement and as an escape hatch.
+pub const BLOCK_STEP_ENV: &str = "REVERIE_BLOCK_STEP";
+
+/// When set (to anything), every hit in the block bound cache re-reads the
+/// guest's code and decodes it again, and panics if the result differs from
+/// the cached one. A debug mode: a wrong entry would be a determinism bug.
+pub const BLOCK_STEP_VERIFY_CACHE_ENV: &str = "REVERIE_BLOCK_STEP_VERIFY_CACHE";
+
+/// Timers single step every step toward a precise target while this is set,
+/// as with `REVERIE_BLOCK_STEP=0`, for tests that compare the two.
+pub(crate) static BLOCK_STEPS_OFF_FOR_TESTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Every hit in the block bound cache is checked against a fresh decode while
+/// this is set, as with [`BLOCK_STEP_VERIFY_CACHE_ENV`], for tests.
+pub(crate) static VERIFY_BLOCK_BOUNDS_FOR_TESTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn block_steps_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var(BLOCK_STEP_ENV).map_or(true, |v| v.trim() != "0"))
+        && !BLOCK_STEPS_OFF_FOR_TESTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn verify_block_bound_cache() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(BLOCK_STEP_VERIFY_CACHE_ENV).is_some())
+        || VERIFY_BLOCK_BOUNDS_FOR_TESTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Timer signals whose signal-delivery stop found their event cancelled, and
 /// which were discarded there, for tests.
 pub(crate) static CANCELLED_TIMER_SIGNALS_DISCARDED: std::sync::atomic::AtomicU64 =
@@ -1390,7 +1445,7 @@ impl Timer {
     pub(crate) async fn handle_signal(
         &mut self,
         task: Stopped,
-        step: &mut (dyn FnMut(Stopped) -> Result<Running, TraceError> + Send),
+        step: &mut (dyn FnMut(Stopped, StepUnit) -> Result<Running, TraceError> + Send),
         observe: &mut (dyn FnMut(&Wait) -> Result<(), TraceError> + Send),
         waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
@@ -1410,7 +1465,7 @@ impl Timer {
         &mut self,
         task: Stopped,
         unfinished: Unfinished,
-        step: &mut (dyn FnMut(Stopped) -> Result<Running, TraceError> + Send),
+        step: &mut (dyn FnMut(Stopped, StepUnit) -> Result<Running, TraceError> + Send),
         observe: &mut (dyn FnMut(&Wait) -> Result<(), TraceError> + Send),
         waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
@@ -1545,6 +1600,9 @@ struct TimerImpl {
     /// The programming of the active precise event's first stage, if it is
     /// staged and that programming's notification has not been delivered.
     first_stage: Option<FirstStage>,
+    /// Decoded block bounds by code address (see [`BlockBounds`]).
+    #[cfg(target_arch = "x86_64")]
+    block_bounds: BlockBounds,
 
     initial_command: InitialCommand,
 
@@ -1943,6 +2001,8 @@ impl TimerImpl {
             programming_overflowed: false,
             event_margin: get_pmu_config().skid_margin(),
             first_stage: None,
+            #[cfg(target_arch = "x86_64")]
+            block_bounds: BlockBounds::default(),
             initial_command: if initial_command {
                 InitialCommand::WaitingForExec
             } else {
@@ -2696,7 +2756,7 @@ impl TimerImpl {
         &mut self,
         task: Stopped,
         unfinished: Unfinished,
-        step: &mut (dyn FnMut(Stopped) -> Result<Running, TraceError> + Send),
+        step: &mut (dyn FnMut(Stopped, StepUnit) -> Result<Running, TraceError> + Send),
         observe: &mut (dyn FnMut(&Wait) -> Result<(), TraceError> + Send),
         waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
@@ -2876,7 +2936,7 @@ impl TimerImpl {
     async fn handle_signal(
         &mut self,
         task: Stopped,
-        step: &mut (dyn FnMut(Stopped) -> Result<Running, TraceError> + Send),
+        step: &mut (dyn FnMut(Stopped, StepUnit) -> Result<Running, TraceError> + Send),
         observe: &mut (dyn FnMut(&Wait) -> Result<(), TraceError> + Send),
         waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
@@ -2955,7 +3015,7 @@ impl TimerImpl {
     async fn deliver(
         &mut self,
         task: Stopped,
-        step: &mut (dyn FnMut(Stopped) -> Result<Running, TraceError> + Send),
+        step: &mut (dyn FnMut(Stopped, StepUnit) -> Result<Running, TraceError> + Send),
         observe: &mut (dyn FnMut(&Wait) -> Result<(), TraceError> + Send),
         waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
@@ -3032,7 +3092,7 @@ impl TimerImpl {
         task: Stopped,
         mut current: ClockCounter,
         target_instr: u64,
-        step: &mut (dyn FnMut(Stopped) -> Result<Running, TraceError> + Send),
+        step: &mut (dyn FnMut(Stopped, StepUnit) -> Result<Running, TraceError> + Send),
         observe: &mut (dyn FnMut(&Wait) -> Result<(), TraceError> + Send),
         waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
@@ -3080,6 +3140,9 @@ impl TimerImpl {
         // interrupted has run, so a TF that Linux set for stepping is hidden.
         #[cfg(target_arch = "x86_64")]
         let mut guest_trap_flag = regs.eflags & TRAP_FLAG != 0;
+        // Steps of each unit this approach takes, for the log.
+        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
+        let (mut instruction_steps, mut block_steps) = (0u64, 0u64);
         loop {
             if !current
                 .is_behind(target_rcb, target_instr)
@@ -3101,7 +3164,30 @@ impl TimerImpl {
                 rax: regs.rax,
                 clock: self.read_clock(),
             };
-            let wait = step(task)?.next_state_with_owner(waits).await?;
+            #[cfg(target_arch = "x86_64")]
+            let unit = self.step_unit(
+                &task,
+                &regs,
+                &start,
+                guest_trap_flag,
+                current.rcbs(),
+                target_rcb,
+            );
+            #[cfg(not(target_arch = "x86_64"))]
+            let unit = StepUnit::Instruction;
+            match unit {
+                StepUnit::Instruction => {
+                    instruction_steps += 1;
+                    &INSTRUCTION_STEPS
+                }
+                #[cfg(target_arch = "x86_64")]
+                StepUnit::Block => {
+                    block_steps += 1;
+                    &BLOCK_STEPS
+                }
+            }
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let wait = step(task, unit)?.next_state_with_owner(waits).await?;
             observe(&wait)?;
             task = match wait {
                 // a successful single step results in SIGTRAP stop
@@ -3139,6 +3225,7 @@ impl TimerImpl {
                         match remove_stepping_trap_flag(&mut new_task, &start, guest_trap_flag) {
                             Ok((_, regs)) => {
                                 let clock = self.read_clock();
+                                block_step_reached_target(unit, clock, target_rcb);
                                 if regs.rip != start.rip || clock != start.clock {
                                     current.single_step_with_clock(clock);
                                 }
@@ -3172,9 +3259,65 @@ impl TimerImpl {
                 (guest_trap_flag, regs) =
                     remove_stepping_trap_flag(&mut task, &start, guest_trap_flag)?;
             }
-            current.single_step_with_clock(self.read_clock());
+            let clock = self.read_clock();
+            if block_step_reached_target(unit, clock, target_rcb) {
+                // Delivered at the observed counter, as a late notification
+                // is; the marker makes the run fail closed.
+                return Ok(task);
+            }
+            current.single_step_with_clock(clock);
         }
+        debug!(
+            "Timer reached its target {} with {} block steps and {} single steps",
+            current, block_steps, instruction_steps
+        );
         Ok(task)
+    }
+
+    /// The unit of the next step from `start`, `clock` RCBs into a precise
+    /// event whose target is `target_rcb`.
+    ///
+    /// A block step runs the guest up to and including the next taken
+    /// branch, so it retires at most the conditional branches in the
+    /// straight-line code from rip to the first unconditional near jump,
+    /// call or return: a taken conditional branch ends the block early, and
+    /// one that is not taken falls through. That is the decoded bound (see
+    /// [`decode_block_bound`]). The step is a block step only if the bound
+    /// is below the RCBs left to the target, so that the block cannot reach
+    /// it: the counter then stays short of the target, and the last stretch
+    /// is single stepped exactly as before, to the same delivery point.
+    /// This holds whatever the processor's RCB event counts, taken
+    /// conditional branches only or all of them, since the bound counts
+    /// every conditional branch the block may retire.
+    ///
+    /// Everything else is single stepped: a guest that has set TF itself,
+    /// a step that restarts a syscall or starts at an instruction whose
+    /// stepped TF needs repair ([`FlagsInstruction`]), code that is not
+    /// 64-bit, and a bound that does not decode (see
+    /// [`decode_block_bound`] for what it refuses).
+    #[cfg(target_arch = "x86_64")]
+    fn step_unit(
+        &mut self,
+        task: &Stopped,
+        regs: &Regs,
+        start: &StepStart,
+        guest_trap_flag: bool,
+        clock: u64,
+        target_rcb: u64,
+    ) -> StepUnit {
+        if !block_steps_enabled()
+            || guest_trap_flag
+            || start.instruction != FlagsInstruction::Other
+            || regs.orig_rax as i32 != -1
+            || regs.cs != USER64_CS
+            || clock >= target_rcb
+        {
+            return StepUnit::Instruction;
+        }
+        match self.block_bounds.bound(task, regs.rip) {
+            Some(branches) if u64::from(branches) < target_rcb - clock => StepUnit::Block,
+            _ => StepUnit::Instruction,
+        }
     }
 
     /// Imagine our skid margin is 50 RCBs, and we set the timer for 5 RCBs.
@@ -3189,6 +3332,223 @@ impl TimerImpl {
             .disable()
             .expect("Must be able to disable timer before stepping");
         self.overflow_period = None;
+    }
+}
+
+/// Whether a block step left the counter at `clock`, at or past the precise
+/// target `target_rcb`, which the decoded bound rules out. If it did, the
+/// delivery point may be passed, so this is recorded as a skid overshoot,
+/// with its marker, and the run fails closed as for a late notification.
+fn block_step_reached_target(unit: StepUnit, clock: u64, target_rcb: u64) -> bool {
+    if unit == StepUnit::Instruction || clock < target_rcb {
+        return false;
+    }
+    warn!(
+        "A block step reached the precise timer target {} (clock {}), which its decoded bound \
+         rules out; delivering the timer event at the observed counter",
+        target_rcb, clock
+    );
+    get_pmu_config().emit_skid_overshoot_marker(clock, target_rcb);
+    reverie::record_skid_overshoot();
+    true
+}
+
+/// The code segment selector of 64-bit user code on x86-64 Linux
+/// (`__USER_CS`). Other code, such as 32-bit compatibility code, is single
+/// stepped.
+#[cfg(target_arch = "x86_64")]
+const USER64_CS: u64 = 0x33;
+
+/// How many bytes of code from rip a block bound decodes at most. The bytes
+/// sit in a buffer aligned to twice this, so they never include the byte just
+/// below a multiple of 4 GiB of the buffer's own address, where iced-x86
+/// 1.21.0 overflows (see `decode_each` in reverie-liteinst's census,
+/// <https://github.com/rrnewton/reverie/issues/855>).
+#[cfg(target_arch = "x86_64")]
+const BLOCK_WINDOW: usize = 512;
+
+#[cfg(target_arch = "x86_64")]
+#[repr(C, align(1024))]
+struct CodeWindow([u8; 2 * BLOCK_WINDOW]);
+
+/// What one block step from an address can retire, decoded from its code.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BlockBound {
+    /// The most conditional branches one block step can retire, or `None` if
+    /// it must be single stepped.
+    branches: Option<u32>,
+    /// How many bytes from the address decided it, or `None` if the decoded
+    /// window ran out first (the bound is then `None`).
+    decided_by: Option<usize>,
+}
+
+/// Decodes the straight-line 64-bit code in `code`, whose first byte is at
+/// `ip`, up to the first instruction that ends a block step for certain: a
+/// near unconditional jump, call or return. A block step from `ip` runs at
+/// most that far, so it retires at most the conditional branches before it
+/// (`Jcc`, `JrCXZ` and `LOOPcc`, each counted whether or not it is taken).
+///
+/// The bound is `None`, and the step a single step, if the code has, before
+/// that instruction, anything a block step must not run without the single
+/// step's own handling: an instruction whose stepped TF Linux or
+/// [`remove_stepping_trap_flag`] must repair (`pushf`, `popf`, `iret`,
+/// `uiret`, `syscall`, `sysenter`, a load of SS), an interrupt or exception
+/// instruction (`int`, `int3`, `ud2`, ...), a far transfer, a transactional
+/// region instruction, or bytes that do not decode. It is `None` too if the
+/// window ends first. Only a bound decided by whole decoded instructions has
+/// `decided_by`, and only such a bound is cached.
+#[cfg(target_arch = "x86_64")]
+fn decode_block_bound(ip: u64, code: &[u8]) -> BlockBound {
+    use iced_x86::Decoder;
+    use iced_x86::DecoderOptions;
+    use iced_x86::FlowControl;
+    use iced_x86::Instruction;
+    use iced_x86::Mnemonic;
+    use iced_x86::Register;
+
+    let refused = |decided_by: usize| BlockBound {
+        branches: None,
+        decided_by: Some(decided_by),
+    };
+    let mut decoder = Decoder::with_ip(64, code, ip, DecoderOptions::NONE);
+    let mut instruction = Instruction::default();
+    let mut branches = 0u32;
+    while decoder.can_decode() {
+        decoder.decode_out(&mut instruction);
+        let decided_by = decoder.position();
+        if instruction.is_invalid() {
+            // Not cached: how many bytes the decoder examined to refuse
+            // them, or to run out of them, is not its position.
+            return BlockBound {
+                branches: None,
+                decided_by: None,
+            };
+        }
+        let repaired = matches!(
+            instruction.mnemonic(),
+            Mnemonic::Pushf
+                | Mnemonic::Pushfd
+                | Mnemonic::Pushfq
+                | Mnemonic::Popf
+                | Mnemonic::Popfd
+                | Mnemonic::Popfq
+                | Mnemonic::Iret
+                | Mnemonic::Iretd
+                | Mnemonic::Iretq
+                | Mnemonic::Uiret
+                | Mnemonic::Syscall
+                | Mnemonic::Sysenter
+                | Mnemonic::Sysexit
+                | Mnemonic::Sysexitq
+                | Mnemonic::Sysret
+                | Mnemonic::Sysretq
+                | Mnemonic::Lss
+                | Mnemonic::Retf
+        ) || (matches!(instruction.mnemonic(), Mnemonic::Mov | Mnemonic::Pop)
+            && instruction.op0_register() == Register::SS)
+            || instruction.is_jmp_far()
+            || instruction.is_jmp_far_indirect()
+            || instruction.is_call_far()
+            || instruction.is_call_far_indirect();
+        if repaired {
+            return refused(decided_by);
+        }
+        match instruction.flow_control() {
+            FlowControl::Next => {}
+            FlowControl::ConditionalBranch => branches += 1,
+            FlowControl::UnconditionalBranch
+            | FlowControl::IndirectBranch
+            | FlowControl::Call
+            | FlowControl::IndirectCall
+            | FlowControl::Return => {
+                return BlockBound {
+                    branches: Some(branches),
+                    decided_by: Some(decided_by),
+                };
+            }
+            FlowControl::Interrupt | FlowControl::Exception | FlowControl::XbeginXabortXend => {
+                return refused(decided_by);
+            }
+        }
+    }
+    BlockBound {
+        branches: None,
+        decided_by: None,
+    }
+}
+
+/// Reads up to `buf.len()` bytes of guest code at `addr`, and returns how
+/// many it read: fewer where the code is unmapped or unreadable.
+#[cfg(target_arch = "x86_64")]
+fn read_code(task: &Stopped, addr: u64, buf: &mut [u8]) -> usize {
+    match Addr::<u8>::from_raw(addr as usize) {
+        Some(addr) => task.read(addr, buf).unwrap_or(0),
+        None => 0,
+    }
+}
+
+/// Decoded block bounds by code address, for one guest thread.
+///
+/// An entry keeps the exact code bytes that decided it, and a lookup reads
+/// those bytes from the guest again and uses the entry only if they are
+/// unchanged. The bound depends on nothing but those bytes and the address,
+/// so an entry can never be stale, whatever changed the code or the
+/// mappings meanwhile (munmap, mprotect, mremap, mmap, exec, a write through
+/// /proc, process_vm_writev or PTRACE_POKETEXT, or a patcher's), without
+/// relying on observing any of them. A hit saves the decode, not the read.
+/// [`BLOCK_STEP_VERIFY_CACHE_ENV`] checks each hit against a fresh decode.
+#[cfg(target_arch = "x86_64")]
+#[derive(Default)]
+struct BlockBounds {
+    entries: std::collections::HashMap<u64, (Box<[u8]>, Option<u32>)>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl std::fmt::Debug for BlockBounds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockBounds")
+            .field("entries", &self.entries.len())
+            .finish()
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl BlockBounds {
+    /// Entries kept before the cache starts over.
+    const CAPACITY: usize = 4096;
+
+    /// The bound of a block step from `rip` (see [`decode_block_bound`]).
+    fn bound(&mut self, task: &Stopped, rip: u64) -> Option<u32> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut window = CodeWindow([0; 2 * BLOCK_WINDOW]);
+        if let Some((code, branches)) = self.entries.get(&rip) {
+            let current = &mut window.0[..code.len()];
+            if read_code(task, rip, current) == code.len() && *current == **code {
+                BLOCK_BOUND_HITS.fetch_add(1, Relaxed);
+                if verify_block_bound_cache() {
+                    let mut fresh = CodeWindow([0; 2 * BLOCK_WINDOW]);
+                    let len = read_code(task, rip, &mut fresh.0[..BLOCK_WINDOW]);
+                    let decoded = decode_block_bound(rip, &fresh.0[..len]).branches;
+                    assert_eq!(
+                        decoded, *branches,
+                        "the block bound cached for {rip:#x} differs from a fresh decode"
+                    );
+                }
+                return *branches;
+            }
+        }
+        BLOCK_BOUND_MISSES.fetch_add(1, Relaxed);
+        let len = read_code(task, rip, &mut window.0[..BLOCK_WINDOW]);
+        let bound = decode_block_bound(rip, &window.0[..len]);
+        if let Some(decided_by) = bound.decided_by {
+            if self.entries.len() >= Self::CAPACITY {
+                self.entries.clear();
+            }
+            self.entries
+                .insert(rip, (window.0[..decided_by].into(), bound.branches));
+        }
+        bound.branches
     }
 }
 
@@ -3709,6 +4069,8 @@ mod tests {
                 programming_overflowed: false,
                 event_margin: get_pmu_config().skid_margin(),
                 first_stage: None,
+                #[cfg(target_arch = "x86_64")]
+                block_bounds: BlockBounds::default(),
                 initial_command: InitialCommand::Ordinary,
                 held_initial_event: Some(event),
                 interrupted: None,
@@ -5639,5 +6001,109 @@ mod tests {
                 "rip {rip:#x}"
             );
         }
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod block_bound_tests {
+    use super::BLOCK_WINDOW;
+    use super::BlockBound;
+    use super::CodeWindow;
+    use super::decode_block_bound;
+
+    const IP: u64 = 0x40_1000;
+
+    /// The bound of `code`, decoded from an aligned window as `BlockBounds`
+    /// does.
+    fn bound(code: &[u8]) -> BlockBound {
+        let mut window = CodeWindow([0; 2 * BLOCK_WINDOW]);
+        window.0[..code.len()].copy_from_slice(code);
+        decode_block_bound(IP, &window.0[..code.len()])
+    }
+
+    fn bounded(branches: u32, len: usize) -> BlockBound {
+        BlockBound {
+            branches: Some(branches),
+            decided_by: Some(len),
+        }
+    }
+
+    fn refused(len: usize) -> BlockBound {
+        BlockBound {
+            branches: None,
+            decided_by: Some(len),
+        }
+    }
+
+    const UNDECIDED: BlockBound = BlockBound {
+        branches: None,
+        decided_by: None,
+    };
+
+    #[test]
+    fn counts_every_conditional_branch_before_the_first_unconditional_transfer() {
+        // jne +0; je +0; jmp rel8
+        assert_eq!(bound(&[0x75, 0x00, 0x74, 0x00, 0xeb, 0xfe]), bounded(2, 6));
+        // cmp eax, 1; jl rel32; ret
+        assert_eq!(
+            bound(&[0x83, 0xf8, 0x01, 0x0f, 0x8c, 0, 0, 0, 0, 0xc3]),
+            bounded(1, 10)
+        );
+        // jrcxz, loop, loopne: conditional too.
+        assert_eq!(
+            bound(&[0xe3, 0x00, 0xe2, 0x00, 0xe0, 0x00, 0xc3]),
+            bounded(3, 7)
+        );
+        // A near call, an indirect jump and an indirect call end the block.
+        assert_eq!(bound(&[0x90, 0xe8, 0, 0, 0, 0]), bounded(0, 6));
+        assert_eq!(bound(&[0x75, 0x00, 0xff, 0xe0]), bounded(1, 4));
+        assert_eq!(bound(&[0xff, 0xd0]), bounded(0, 2));
+        // Code past the end of the block is not read.
+        assert_eq!(bound(&[0xc3, 0x0f, 0x05]), bounded(0, 1));
+    }
+
+    #[test]
+    fn refuses_instructions_whose_single_step_handling_a_block_step_would_skip() {
+        for (name, code) in [
+            ("pushfq", &[0x9c][..]),
+            ("popfq", &[0x9d]),
+            ("iretq", &[0x48, 0xcf]),
+            ("syscall", &[0x0f, 0x05]),
+            ("sysenter", &[0x0f, 0x34]),
+            ("mov ss, ax", &[0x8e, 0xd0]),
+            ("int3", &[0xcc]),
+            ("int 0x80", &[0xcd, 0x80]),
+            ("ud2", &[0x0f, 0x0b]),
+            ("retf", &[0xcb]),
+            ("jmp far [rax]", &[0xff, 0x28]),
+            ("call far [rax]", &[0xff, 0x18]),
+            ("xbegin", &[0xc7, 0xf8, 0, 0, 0, 0]),
+            ("uiret", &[0xf3, 0x0f, 0x01, 0xec]),
+        ] {
+            // After a not-taken branch, so it is reached in the block.
+            let mut padded = vec![0x75, 0x00];
+            padded.extend_from_slice(code);
+            padded.push(0xc3);
+            assert_eq!(bound(&padded), refused(2 + code.len()), "{name}");
+        }
+    }
+
+    #[test]
+    fn code_that_does_not_reach_a_transfer_is_undecided() {
+        assert_eq!(bound(&[0x90; 16]), UNDECIDED);
+        // An instruction cut off by the end of the code.
+        assert_eq!(bound(&[0x90, 0x0f]), UNDECIDED);
+        assert_eq!(bound(&[]), UNDECIDED);
+    }
+
+    #[test]
+    fn bytes_that_do_not_decode_are_refused_uncached() {
+        // 0x06 (push es) is invalid in 64-bit mode.
+        assert_eq!(bound(&[0x90, 0x06, 0xc3]), UNDECIDED);
+    }
+
+    #[test]
+    fn a_full_window_without_a_transfer_is_undecided() {
+        assert_eq!(bound(&[0x90; BLOCK_WINDOW]), UNDECIDED);
     }
 }

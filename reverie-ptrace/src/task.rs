@@ -100,6 +100,7 @@ use crate::regs::RegAccess;
 use crate::stack::GuestStack;
 use crate::timer::HandleFailure;
 use crate::timer::OwnNotification;
+use crate::timer::StepUnit;
 use crate::timer::Timer;
 use crate::timer::TimerEventRequest;
 use crate::timer::Unfinished;
@@ -4020,7 +4021,14 @@ impl<L: Tool + 'static> TracedTask<L> {
         let held_root_stop = armer
             .as_ref()
             .map(|armer| Arc::clone(&armer.held_root_stop));
-        let mut step = move |task| RootStopLease::new(task, held_root_stop.clone()).step(None);
+        let mut step = move |task, unit| {
+            let lease = RootStopLease::new(task, held_root_stop.clone());
+            match unit {
+                StepUnit::Instruction => lease.step(None),
+                #[cfg(target_arch = "x86_64")]
+                StepUnit::Block => lease.block_step(),
+            }
+        };
         let newborn_owner = self.global_state.newborn_owner();
         let mut observe = |wait: &Wait| {
             if let Wait::Stopped(task, event) = wait {

@@ -550,6 +550,12 @@ impl Event {
 
 /// `ptrace(request, pid, 0, sig)` for a resuming request, with the signal as a
 /// raw number so that one `nix` cannot name can be delivered.
+/// `PTRACE_SINGLEBLOCK` (arch/x86/include/uapi/asm/ptrace-abi.h), which the
+/// libc crate does not define. Linux accepts it on every x86-64 processor
+/// (`arch_has_block_step`).
+#[cfg(target_arch = "x86_64")]
+const PTRACE_SINGLEBLOCK: libc::c_uint = 33;
+
 fn ptrace_resume_raw(request: libc::c_uint, pid: Pid, sig: i32) -> Result<(), Errno> {
     Errno::result(unsafe {
         libc::ptrace(
@@ -1444,6 +1450,25 @@ impl Stopped {
     pub fn step_raw(self, sig: i32) -> Result<Running, Error> {
         self.1
             .on_held_tid(|| ptrace_resume_raw(libc::PTRACE_SINGLESTEP, self.0, sig))
+            .map_err(|err| self.map_err(err))?;
+        Ok(self.into_running())
+    }
+
+    /// Runs the process until it next takes a branch, with
+    /// `PTRACE_SINGLEBLOCK`, delivering no signal.
+    ///
+    /// x86 traps after each taken branch (jump, call, return, or conditional
+    /// branch that is taken) when the trap flag is set with DEBUGCTL.BTF, and
+    /// Linux reports the stop as a single step's: SIGTRAP with TRAP_TRACE.
+    /// The step can end earlier, at any stop a single step would also meet
+    /// (a signal, a syscall or seccomp stop, a fault), but never later than
+    /// just past the first taken branch. Conditional branches that are not
+    /// taken do not end it. A processor or hypervisor that ignores BTF steps
+    /// a single instruction instead, which is earlier still.
+    #[cfg(target_arch = "x86_64")]
+    pub fn block_step(self) -> Result<Running, Error> {
+        self.1
+            .on_held_tid(|| ptrace_resume_raw(PTRACE_SINGLEBLOCK, self.0, 0))
             .map_err(|err| self.map_err(err))?;
         Ok(self.into_running())
     }

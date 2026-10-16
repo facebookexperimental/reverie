@@ -2306,6 +2306,13 @@ impl RootStopLease {
         self.take_for_transition()?.syscall(signal)
     }
 
+    /// Runs the stopped root until it next takes a branch
+    /// (`Stopped::block_step`), delivering no signal.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn block_step(mut self) -> Result<Running, TraceError> {
+        self.take_for_transition()?.block_step()
+    }
+
     /// `resume` for a signal that may be one nix cannot name.
     pub(crate) fn resume_any(
         self,

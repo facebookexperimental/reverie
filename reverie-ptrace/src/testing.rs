@@ -89,6 +89,58 @@ pub fn precise_timer_second_stages_armed() -> u64 {
     crate::timer::SECOND_STAGES_ARMED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The steps this process's timers have taken toward precise event targets,
+/// and the lookups in their block bound caches, so far.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PreciseTimerSteps {
+    /// Single instruction steps (`PTRACE_SINGLESTEP`).
+    pub instruction: u64,
+    /// Block steps (`PTRACE_SINGLEBLOCK`).
+    pub block: u64,
+    /// Block bounds found in the cache, with their code unchanged.
+    pub bound_hits: u64,
+    /// Block bounds decoded afresh.
+    pub bound_misses: u64,
+}
+
+impl std::ops::Sub for PreciseTimerSteps {
+    type Output = Self;
+    fn sub(self, earlier: Self) -> Self {
+        Self {
+            instruction: self.instruction - earlier.instruction,
+            block: self.block - earlier.block,
+            bound_hits: self.bound_hits - earlier.bound_hits,
+            bound_misses: self.bound_misses - earlier.bound_misses,
+        }
+    }
+}
+
+/// See [`PreciseTimerSteps`].
+pub fn precise_timer_steps() -> PreciseTimerSteps {
+    use std::sync::atomic::Ordering::Relaxed;
+    PreciseTimerSteps {
+        instruction: crate::timer::INSTRUCTION_STEPS.load(Relaxed),
+        block: crate::timer::BLOCK_STEPS.load(Relaxed),
+        bound_hits: crate::timer::BLOCK_BOUND_HITS.load(Relaxed),
+        bound_misses: crate::timer::BLOCK_BOUND_MISSES.load(Relaxed),
+    }
+}
+
+/// Makes this process's timers take block steps toward precise targets where
+/// the decoded bound allows (`enabled`, the default), or only single
+/// instruction steps, as `REVERIE_BLOCK_STEP=0` does. For a test that compares
+/// the two in one process; it affects every timer in the process.
+pub fn set_block_steps(enabled: bool) {
+    crate::timer::BLOCK_STEPS_OFF_FOR_TESTS.store(!enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Makes every hit in this process's block bound caches re-read and decode
+/// the guest's code again, and panic if that differs from the cached bound,
+/// as `REVERIE_BLOCK_STEP_VERIFY_CACHE` does.
+pub fn verify_block_bound_cache() {
+    crate::timer::VERIFY_BLOCK_BOUNDS_FOR_TESTS.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub use crate::timer::KeptProgramming;
 
 /// Makes the timers of this process check, from now on, at every disregarded
