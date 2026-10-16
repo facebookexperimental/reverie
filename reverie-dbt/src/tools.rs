@@ -623,7 +623,10 @@ impl Tool for SetRegTool {
         }
         let (number, args) = syscall.into_parts();
         if number == Sysno::prctl && args.arg0 as u64 == KERNEL_IDENTITY_PRCTL {
-            if matches!(args.arg1 as i64, libc::SYS_getpgid | libc::SYS_getsid) {
+            if matches!(
+                args.arg1 as i64,
+                libc::SYS_getpgid | libc::SYS_getsid | libc::SYS_sched_getscheduler
+            ) {
                 let target = args.arg2 as libc::pid_t;
                 // This independent kernel observation runs on the application
                 // callback thread and bypasses the native membership screen.

@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Read-only group/session queries can name live tasks outside the DBT client.
+//! Read-only group/session/policy queries can name live tasks outside the DBT client.
 
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -58,21 +58,31 @@ fn compare_with_linux(mode: &str) {
 
     // This is the test parent's ordinary child, never instrumented or entered
     // in the DBT client's membership. EOF is withheld until all queries finish.
-    // Its separate group and session make target-to-self substitutions observable.
+    // Its separate group, session and policy make target-to-self substitutions observable.
     let mut holder = Command::new("/bin/cat");
     holder
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    // SAFETY: setsid is async-signal-safe; the child calls no Rust code that
+    // SAFETY: setsid and the raw scheduler syscall are async-signal-safe; the child
+    // calls no Rust code that
     // allocates or acquires locks between fork and exec.
     unsafe {
         holder.pre_exec(|| {
             if libc::setsid() == -1 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(())
+                return Err(std::io::Error::last_os_error());
             }
+            let parameter = libc::sched_param { sched_priority: 0 };
+            if libc::syscall(
+                libc::SYS_sched_setscheduler,
+                0,
+                libc::SCHED_BATCH,
+                &parameter,
+            ) == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
         });
     }
     let mut child = HeldChild(holder.spawn().expect("hold ordinary unregistered child"));
@@ -80,18 +90,30 @@ fn compare_with_linux(mode: &str) {
     // SAFETY: these read-only queries name our live child.
     let pgid = unsafe { libc::getpgid(pid) };
     let sid = unsafe { libc::getsid(pid) };
+    let policy = unsafe { libc::sched_getscheduler(pid) };
     assert_eq!(pgid, pid, "held child must lead its own group");
     assert_eq!(sid, pid, "held child must lead its own session");
-    let arguments = [pid.to_string(), pgid.to_string(), sid.to_string()];
+    assert_eq!(policy, libc::SCHED_BATCH, "held child must use SCHED_BATCH");
+    let arguments = [
+        pid.to_string(),
+        pgid.to_string(),
+        sid.to_string(),
+        policy.to_string(),
+    ];
     let expected = format!(
         "getpgid live={pgid} errno=0\ngetpgid zero-is-self=1\n\
          getpgid negative rc=-1 errno={}\ngetpgid absent rc=-1 errno={}\n\
          getsid live={sid} errno=0\ngetsid zero-is-self=1\n\
          getsid negative rc=-1 errno={}\ngetsid absent rc=-1 errno={}\n\
+         sched_getscheduler live={policy} errno=0\nsched_getscheduler zero-is-self=1\n\
+         sched_getscheduler negative rc=-1 errno={}\n\
+         sched_getscheduler absent rc=-1 errno={}\n\
          group-session-getters=ok\n",
         libc::ESRCH,
         libc::ESRCH,
         libc::ESRCH,
+        libc::ESRCH,
+        libc::EINVAL,
         libc::ESRCH,
     );
     let native = Command::new(&fixture)
@@ -109,8 +131,29 @@ fn compare_with_linux(mode: &str) {
     guest
         .arg(mode)
         .args(&arguments)
-        .env_remove("HERMIT_DBT_NOOP")
-        .env_remove("HERMIT_DBT_TEST_SET_REG");
+        .env_remove(reverie_dbt::TOOL_ENV);
+    // The named registry selector takes precedence over the legacy selectors.
+    // Select exactly the route whose native injection contract this test checks.
+    for selector in [
+        "HERMIT_DBT_TEST_REWRITE_EXIT",
+        "HERMIT_DBT_TEST_INJECT_INVALID_CLONE",
+        "HERMIT_DBT_TEST_SET_REG",
+        "HERMIT_DBT_TEST_COMPARE_EXCHANGE",
+        "HERMIT_DBT_TEST_PPID",
+        "HERMIT_DBT_TEST_BACKTRACE",
+        "HERMIT_DBT_STRACE",
+        "HERMIT_DBT_SYSCALL_HISTOGRAM",
+        "HERMIT_DBT_COUNTER1",
+        "HERMIT_DBT_COUNTER2",
+        "HERMIT_DBT_CHUNKY_PRINT",
+        "HERMIT_DBT_CHROME_TRACE",
+        "HERMIT_DBT_CHAOS",
+        "HERMIT_DBT_NOOP",
+        "HERMIT_DBT_COUNTER1_EXACT",
+        "HERMIT_DBT_COUNTER2_EXACT",
+    ] {
+        guest.env_remove(selector);
+    }
     match mode {
         "tail" => {
             guest.env("HERMIT_DBT_NOOP", "1");
@@ -135,7 +178,7 @@ fn compare_with_linux(mode: &str) {
             .lines()
             .filter_map(|line| line.strip_prefix("reverie-dbt-test: kernel-group-query "))
             .collect();
-        assert_eq!(rows.len(), 10, "missing returning observations: {output:?}");
+        assert_eq!(rows.len(), 15, "missing returning observations: {output:?}");
         for row in rows {
             let fields: Vec<_> = row.split_whitespace().collect();
             assert_eq!(fields.len(), 4, "malformed kernel observation: {row}");

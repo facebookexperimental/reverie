@@ -24,19 +24,20 @@ static long query(long number, long target) {
 }
 
 int main(int argc, char** argv) {
-  if (argc != 5)
+  if (argc != 6)
     return 2;
   returning = strcmp(argv[1], "returning") == 0;
   long target = strtol(argv[2], NULL, 10);
-  long expected[] = {strtol(argv[3], NULL, 10), strtol(argv[4], NULL, 10)};
+  long expected[] = {strtol(argv[3], NULL, 10), strtol(argv[4], NULL, 10),
+                     strtol(argv[5], NULL, 10)};
   long me = returning ? prctl(0x4b494421, (long)SYS_getpid, 0L, 0L, 0L) : getpid();
   if (me <= 0 || target <= 0 || target == me)
     return 3;
 
-  const long numbers[] = {SYS_getpgid, SYS_getsid};
-  const char* names[] = {"getpgid", "getsid"};
+  const long numbers[] = {SYS_getpgid, SYS_getsid, SYS_sched_getscheduler};
+  const char* names[] = {"getpgid", "getsid", "sched_getscheduler"};
   int failed = 0;
-  for (unsigned int i = 0; i < 2; ++i) {
+  for (unsigned int i = 0; i < 3; ++i) {
     errno = 0;
     long live = query(numbers[i], target);
     int live_errno = errno;
@@ -48,8 +49,8 @@ int main(int argc, char** argv) {
     int zero_is_self = zero >= 0 && zero == self;
     printf("%s zero-is-self=%d\n", names[i], zero_is_self);
     failed |= !zero_is_self;
-    // The held child leads a different group and session. A mistaken substitution
-    // of target 0 must not satisfy the positive-target oracle.
+    // The held child has a different group, session and scheduling policy.
+    // Substituting target 0 must not satisfy the positive-target oracle.
     failed |= zero == expected[i];
 
     const long invalid[] = {-1, INT_MAX};
@@ -59,7 +60,10 @@ int main(int argc, char** argv) {
       long rc = query(numbers[i], invalid[j]);
       int error = errno;
       printf("%s %s rc=%ld errno=%d\n", names[i], labels[j], rc, error);
-      failed |= rc != -1 || error != ESRCH;
+      int expected_error = numbers[i] == SYS_sched_getscheduler && j == 0
+                               ? EINVAL
+                               : ESRCH;
+      failed |= rc != -1 || error != expected_error;
     }
   }
   if (failed)
