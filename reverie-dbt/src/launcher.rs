@@ -2885,6 +2885,121 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires built DynamoRIO and native client; run explicitly with --ignored"]
+    fn a_copied_failure_publishes_its_record_before_root_termination() {
+        use crate::backend_stats::DbtProcessRecord;
+        use crate::backend_stats::WIRE_RECORD_LEN;
+        use crate::backend_stats::decode_process_record;
+
+        let directory = tempfile::tempdir().unwrap();
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/evidence_vfork_open_exec.c");
+        let fixture = directory.path().join("copied-terminal-failure");
+        let compiler = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+        assert!(
+            Command::new(compiler)
+                .args(["-std=gnu11", "-O2", "-Wall", "-Wextra", "-Werror"])
+                .arg(source)
+                .arg("-o")
+                .arg(&fixture)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        // First force cleanup omission, then check ordinary termination does
+        // not append a second record. Neither run can rely on event_exit.
+        for skip_cleanup in [true, false] {
+            let sink = DbtStatsSink::new().unwrap();
+            let [flag, path] = sink.client_arguments(sink.directory());
+            let mut runner = DbtRunner::from_env()
+                .unwrap()
+                .isolated_process_group(true)
+                .client_argument(flag)
+                .client_argument(path)
+                .client_argument("-test-copied-backend-failure");
+            if skip_cleanup {
+                runner = runner.client_argument("-test-skip-terminal-cleanup");
+            }
+            let mut guest = Command::new(&fixture);
+            guest.arg("terminal-failure").env_remove(crate::TOOL_ENV);
+            for selector in [
+                "HERMIT_DBT_TEST_REWRITE_EXIT",
+                "HERMIT_DBT_TEST_INJECT_INVALID_CLONE",
+                "HERMIT_DBT_TEST_SET_REG",
+                "HERMIT_DBT_TEST_COMPARE_EXCHANGE",
+                "HERMIT_DBT_TEST_PPID",
+                "HERMIT_DBT_TEST_BACKTRACE",
+                "HERMIT_DBT_STRACE",
+                "HERMIT_DBT_SYSCALL_HISTOGRAM",
+                "HERMIT_DBT_COUNTER1",
+                "HERMIT_DBT_COUNTER2",
+                "HERMIT_DBT_CHUNKY_PRINT",
+                "HERMIT_DBT_CHROME_TRACE",
+                "HERMIT_DBT_CHAOS",
+                "HERMIT_DBT_NOOP",
+                "HERMIT_DBT_COUNTER1_EXACT",
+                "HERMIT_DBT_COUNTER2_EXACT",
+            ] {
+                guest.env_remove(selector);
+            }
+            let output = runner.output(&guest).unwrap();
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("unsupported syscall 145 in copied child"),
+                "{output:?}"
+            );
+            eprintln!("forced copied failure: skip_cleanup={skip_cleanup} {output:?}");
+            assert_eq!(output.status.signal(), Some(libc::SIGKILL), "{output:?}");
+            assert_eq!(
+                output.stdout.len(),
+                12,
+                "identity only, no after-call marker: {output:?}"
+            );
+            let identities: Vec<_> = output
+                .stdout
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| i32::from_ne_bytes(*bytes))
+                .collect();
+            assert!(identities[0] > 0);
+            assert_ne!(identities[0], identities[1]);
+            assert_eq!(identities[1], identities[2]);
+            let capture = sink.capture();
+            let bytes = capture
+                .records()
+                .expect("failure must be published before root termination");
+            assert_eq!(
+                bytes.len(),
+                WIRE_RECORD_LEN,
+                "exactly one failing child record"
+            );
+            let (record, consumed) = decode_process_record(bytes).unwrap();
+            assert_eq!(consumed, bytes.len());
+            assert_eq!(
+                record,
+                DbtProcessRecord {
+                    backend_failure: true,
+                    image_generation: record.image_generation,
+                    process_identity: identities[0] as u64,
+                    parent_identity: identities[1] as u64,
+                    ..Default::default()
+                }
+            );
+            let snapshot = capture.snapshot().unwrap();
+            assert_eq!(snapshot.process_images(), 1);
+            assert_eq!(snapshot.backend_failures(), 1);
+            eprintln!(
+                "copied terminal record: skip_cleanup={skip_cleanup} pid={} ppid={} bytes={}",
+                identities[0],
+                identities[1],
+                bytes.len()
+            );
+        }
+    }
+
+    #[test]
     fn a_failed_run_keeps_its_error_and_carries_its_output() {
         let original = io::Error::new(io::ErrorKind::InvalidData, "evidence failed");
         let error = DbtFailedRunOutput::attach(original, b"out".to_vec(), b"why\n".to_vec());

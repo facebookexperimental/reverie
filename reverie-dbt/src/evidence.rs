@@ -3158,6 +3158,21 @@ mod tests {
         assert!(
             exit_runtime_tree.find("mark_backend_failure();").unwrap()
                 < exit_runtime_tree
+                    .find("terminate_runtime_tree(exit_code);")
+                    .unwrap()
+        );
+        let terminate_runtime_tree = source
+            .split_once("static void terminate_runtime_tree(int exit_code) {")
+            .unwrap()
+            .1
+            .split_once("static void exit_runtime_tree(int exit_code) {")
+            .unwrap()
+            .0;
+        assert!(
+            terminate_runtime_tree
+                .find("kill((pid_t)runtime_process_group, SIGKILL);")
+                .unwrap()
+                < terminate_runtime_tree
                     .find("dr_exit_process(exit_code);")
                     .unwrap()
         );

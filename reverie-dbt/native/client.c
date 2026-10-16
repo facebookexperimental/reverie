@@ -182,6 +182,9 @@ typedef struct {
   int32_t kernel_pid;
   int32_t birth_token;
   bool root_process;
+  // 0: unclaimed, 1: appending, 2: append attempt finished (including error).
+  // The existing birth owner is shared by threads, never by another process.
+  _Atomic uint32_t terminal_stats_state;
   _Atomic uint64_t pending_thread_clones;
   _Atomic uint64_t image_epoch;
   _Atomic uint64_t finished_helper_epoch;
@@ -189,6 +192,7 @@ typedef struct {
   int32_t helper_pid;
   uint64_t helper_start_time;
 } process_control_t;
+_Static_assert(sizeof(process_control_t) == 56, "shared process control layout");
 
 typedef struct {
   uint64_t magic;
@@ -415,6 +419,8 @@ static bool test_kill_announced_child;
 static bool test_thread_exit_evidence;
 static bool test_leave_process_clone_result_pending;
 static bool test_backend_failure;
+static bool test_copied_backend_failure;
+static bool test_skip_terminal_cleanup;
 static bool test_backend_failure_sender_lookup_miss;
 static bool test_compare_exchange;
 static atomic_flag compare_exchange_self_tested = ATOMIC_FLAG_INIT;
@@ -435,7 +441,8 @@ static _Atomic bool test_reused_tid_exercised;
 static _Atomic bool test_reused_tid_waited;
 // Typed backend-statistics sink path. When the launcher passes
 // `-stats_path <path>`, each real runtime image appends exactly one fixed-size
-// binary record to this file at `event_exit`, using DynamoRIO's own
+// binary record to this file at `event_exit` (or before terminating the tree
+// for a copied syscall refusal), using DynamoRIO's own
 // append-mode file I/O (O_APPEND, so concurrent process images append their
 // 144-byte records atomically without interleaving). The launcher decodes and
 // commutatively aggregates every record in the process tree (see
@@ -476,6 +483,7 @@ static bool has_copied_runtime(void);
 static bool is_copied_vfork_process(void);
 static void finalize_runtime_process(void);
 static void mark_backend_failure(void);
+static void publish_copied_terminal_stats(process_control_t* process);
 static void complete_runtime_thread_exit(
     prototype_counters_t* counters,
     void* drcontext,
@@ -529,15 +537,40 @@ static process_id_t launch_root_below(process_id_t launcher) {
   }
   return 0;
 }
-static void exit_runtime_tree(int exit_code) {
-  mark_backend_failure();
+static void terminate_runtime_tree(int exit_code) {
   // A copied child cannot kill its own process group and then run DynamoRIO
   // cleanup. Kill the run's root instead; the launcher reaps it and
   // terminates the rest of the run after preserving its exit status.
   if (runtime_process_group != 0 &&
       runtime_process_group != dr_get_process_id())
     kill((pid_t)runtime_process_group, SIGKILL);
+  // The live terminal-record regression deliberately removes event_exit from
+  // the failing copied child's execution. It must publish before killing root.
+  if (test_skip_terminal_cleanup && has_copied_runtime())
+    syscall(SYS_exit_group, exit_code);
   dr_exit_process(exit_code);
+}
+
+static void exit_runtime_tree(int exit_code) {
+  mark_backend_failure();
+  terminate_runtime_tree(exit_code);
+}
+
+// Only called from the normal copied syscall callback, after admission and
+// callback locks have been released. The stats sink's DR file I/O is not an
+// async-signal-safe operation and does not belong in arbitrary fatal contexts.
+static void exit_copied_syscall_failure(process_control_t* process) {
+  mark_backend_failure();
+  // Uncontained runs can keep their parent alive; retain their existing
+  // event_exit publication and DR cleanup. Only root termination races that
+  // cleanup and needs the early record.
+  if (runtime_process_group != 0 &&
+      runtime_process_group != dr_get_process_id()) {
+    publish_copied_terminal_stats(process);
+    if (test_copied_backend_failure)
+      publish_copied_terminal_stats(process); // Exercise idempotent publication.
+  }
+  terminate_runtime_tree(101);
 }
 
 #define EVIDENCE_CHANNEL_HEADER_LEN 80
@@ -1430,6 +1463,7 @@ static process_control_t* process_control_for(int32_t kernel_pid) {
   entry->birth_token = birth_token;
   entry->root_process = kernel_pid == task_state->root_pid &&
       birth_token == task_state->root_birth_token;
+  atomic_init(&entry->terminal_stats_state, 0);
   atomic_init(&entry->pending_thread_clones, 0);
   atomic_init(&entry->image_epoch, 0);
   atomic_init(&entry->finished_helper_epoch, 0);
@@ -1437,6 +1471,26 @@ static process_control_t* process_control_for(int32_t kernel_pid) {
   entry->helper_start_time = 0;
   task_state_unlock();
   return entry;
+}
+
+// Cleanup may run for an early failure without a prepared process owner. Do
+// not create an entry or recursively enter the fatal path in that case.
+static process_control_t* existing_process_control(int32_t kernel_pid) {
+  int32_t birth_token;
+  if (task_state == NULL ||
+      !lookup_task_birth(kernel_pid, &birth_token) || birth_token <= 0)
+    return NULL;
+  process_control_t* found = NULL;
+  task_state_lock();
+  for (size_t i = 0; i < task_state->process_control_count; ++i) {
+    process_control_t* entry = &task_state->process_controls[i];
+    if (entry->kernel_pid == kernel_pid && entry->birth_token == birth_token) {
+      found = entry;
+      break;
+    }
+  }
+  task_state_unlock();
+  return found;
 }
 
 static _Atomic uint64_t* pending_thread_clones_for(int32_t kernel_pid) {
@@ -4774,10 +4828,18 @@ static bool pre_syscall(void* drcontext, int sysnum) {
   if (has_copied_runtime() &&
       (!runtime_uses_external_global() || is_copied_vfork_process() ||
        copied_vfork_clone)) {
+    // Prepare the real process's birth owner before entering the callback. A
+    // vfork/CLONE_VM child cannot use the inherited runtime_process_control.
+    process_control_t* process = NULL;
+    if (runtime_process_group != 0 &&
+        runtime_process_group != dr_get_process_id())
+      process = process_control_for((int32_t)dr_get_process_id());
     evidence_callback_enter();
     int32_t copied_action =
         reverie_dbt_runtime_copied_syscall((int64_t)sysnum, args);
     evidence_callback_leave();
+    if (test_copied_backend_failure && sysnum == SYS_sched_getscheduler)
+      copied_action = 1;
     // Negative actions are deterministic errno values synthesized by the
     // copied-child policy. They avoid executing a host-dependent syscall while
     // preserving the error that the instrumented root observes.
@@ -4790,7 +4852,7 @@ static bool pre_syscall(void* drcontext, int sysnum) {
           diagnostic_file,
           "detcore-dbt: unsupported syscall %d in copied child\n",
           sysnum);
-      exit_runtime_tree(101);
+      exit_copied_syscall_failure(process);
       return false;
     }
     if (copied_action == 2) {
@@ -5331,9 +5393,7 @@ static void stats_put_u64_le(unsigned char* out, uint64_t value) {
 }
 
 // Emits one fixed-size stats record for this runtime image to `stats_path`.
-// Called only for a real runtime owner (never a copied/vfork runtime), so the
-// totals read here belong to exactly this process image. The file is opened
-// per-image in append mode and the whole record is written by a single
+// The file is opened per-image in append mode and the whole record is written by a single
 // dr_write_file, so concurrent images append their 144-byte records atomically
 // without interleaving.
 // Appends this image's record to the run's stats file. A copied (pre-exec)
@@ -5377,10 +5437,15 @@ static void emit_stats_record(bool include_counters) {
   size_t offset = 24;
   stats_put_u64_le(record + offset, generation);
   offset += 8;
-  stats_put_u64_le(record + offset, (uint64_t)(uint32_t)runtime_process_id);
+  stats_put_u64_le(
+      record + offset,
+      (uint64_t)(uint32_t)(include_counters ? runtime_process_id
+                                          : (int32_t)dr_get_process_id()));
   offset += 8;
   stats_put_u64_le(
-      record + offset, (uint64_t)(uint32_t)runtime_parent_process_id);
+      record + offset,
+      (uint64_t)(uint32_t)(include_counters ? runtime_parent_process_id
+                                          : (int32_t)dr_get_parent_id()));
   offset += 8;
   stats_put_u64_le(record + offset, branches);
   offset += 8;
@@ -5439,6 +5504,30 @@ static void emit_stats_record(bool include_counters) {
   dr_close_file(stats_file);
 }
 
+static void publish_copied_terminal_stats(process_control_t* process) {
+  if (stats_path[0] == 0)
+    return;
+  uint32_t expected = 0;
+  if (atomic_compare_exchange_strong_explicit(
+          &process->terminal_stats_state, &expected, 1,
+          memory_order_acq_rel, memory_order_acquire)) {
+    emit_stats_record(false);
+    // Even a short/failed append completes the attempt. Retrying could
+    // interleave records; the decoder must refuse a missing or partial stream.
+    atomic_store_explicit(&process->terminal_stats_state, 2, memory_order_release);
+    return;
+  }
+  // Another failing thread must not kill the root before the publisher has
+  // finished. Bound the wait; a stalled transport is itself a loud failure.
+  for (int attempt = 0; attempt < 1000; ++attempt) {
+    if (atomic_load_explicit(&process->terminal_stats_state, memory_order_acquire) == 2)
+      return;
+    dr_sleep(1);
+  }
+  dr_fprintf(diagnostic_file,
+      "reverie-dbt: terminal failure stats publication did not finish\n");
+}
+
 static void event_exit(void) {
   if (namespace_admission_refused)
     return;
@@ -5474,8 +5563,13 @@ static void event_exit(void) {
     if (!has_copied_runtime())
       emit_stats_record(true);
     else if (atomic_load_explicit(
-                 &runtime_backend_failure, memory_order_acquire))
-      emit_stats_record(false);
+                 &runtime_backend_failure, memory_order_acquire)) {
+      process_control_t* process =
+          existing_process_control((int32_t)dr_get_process_id());
+      if (process == NULL || atomic_load_explicit(
+              &process->terminal_stats_state, memory_order_acquire) == 0)
+        emit_stats_record(false);
+    }
   }
   if (unsupported_report_file != INVALID_FILE) {
     dr_close_file(unsupported_report_file);
@@ -5719,6 +5813,10 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
       test_leave_process_clone_result_pending = true;
     else if (strcmp(argv[i], "-test-backend-failure") == 0)
       test_backend_failure = true;
+    else if (strcmp(argv[i], "-test-copied-backend-failure") == 0)
+      test_copied_backend_failure = true;
+    else if (strcmp(argv[i], "-test-skip-terminal-cleanup") == 0)
+      test_skip_terminal_cleanup = true;
     else if (strcmp(argv[i], "-test-backend-failure-sender-lookup-miss") == 0)
       test_backend_failure_sender_lookup_miss = true;
     else if (strcmp(argv[i], "-test-compare-exchange") == 0)
