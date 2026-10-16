@@ -15,7 +15,6 @@ fn process_alarm_event(pid: i32) -> reverie::SignalEvent {
 
 #[derive(Debug, Eq, PartialEq)]
 struct ProcessAlarmSnapshot {
-    logical_clock_ns: u64,
     process: crate::signal::ProcessSignalState,
     thread: crate::signal::ThreadSignalState,
     readiness: Vec<(i32, Option<i16>)>,
@@ -43,7 +42,6 @@ fn process_alarm_snapshot(executor: &ElfExecutor) -> ProcessAlarmSnapshot {
         })
         .collect();
     ProcessAlarmSnapshot {
-        logical_clock_ns: executor.state.logical_clock_ns,
         process,
         thread,
         readiness,

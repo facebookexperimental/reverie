@@ -2498,7 +2498,6 @@ mod tests {
                     }
                 );
                 assert_eq!(*executor.state.thread_signals.lock(), before_thread);
-                assert_eq!(executor.state.logical_clock_ns, 0);
                 assert_eq!(
                     executor
                         .state

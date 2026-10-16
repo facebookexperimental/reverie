@@ -1402,7 +1402,6 @@ mod shared_file_dispatch_tests {
     #[test]
     fn gettimeofday_and_time_store_into_a_writable_shared_file_mapping() {
         let mut f = Fixture::new();
-        f.state.logical_clock_ns = 9_000_000_000;
         let private = f.private();
         let fd = f.open(true);
         let shared = f.shared(fd, 0, 0, true);
@@ -1412,28 +1411,46 @@ mod shared_file_dispatch_tests {
         };
 
         f.memory.write_raw(shared - 16, &[0xa5; 16]).unwrap();
-        assert_eq!(call(&mut f, libc::SYS_time, shared + 0x10, 0), 9);
+        let first = call(&mut f, libc::SYS_time, shared + 0x10, 0);
+        assert!(first > 1_000_000_000);
         assert_eq!(
             call(&mut f, libc::SYS_gettimeofday, shared + 0x100, shared + 0x200),
             0
         );
         // tv_sec on the private page, tv_usec on the shared page.
         assert_eq!(call(&mut f, libc::SYS_gettimeofday, shared - 8, 0), 0);
+        let tv_sec_low = read_struct::<[u8; 4]>(&f.memory, shared - 8);
         // tloc straddles the private page and the shared page.
-        assert_eq!(call(&mut f, libc::SYS_time, shared - 4, 0), 9);
+        let second = call(&mut f, libc::SYS_time, shared - 4, 0);
+        assert!(second >= first);
         assert!(f.memory.entry_gate().pending_failure().is_none());
 
-        let seconds = 9_u64.to_ne_bytes();
+        // The file holds what the calls stored: the host's values, in the
+        // same places a store of fixed values would have put them.
+        let file = std::fs::read(&f.path).unwrap();
+        let word = |offset: usize| u64::from_ne_bytes(file[offset..offset + 8].try_into().unwrap());
+        let second_bytes = (second as u64).to_ne_bytes();
+        assert_eq!(file[..4], second_bytes[4..]);
+        assert_eq!(file[4..8], [0; 4], "tv_usec's high half");
+        assert_eq!(word(0x10), first as u64);
+        assert!(word(0x100) >= first as u64 && word(0x100) <= second as u64);
+        assert!(word(0x108) < 1_000_000);
+        let mut zone = [0 as libc::c_int; 2];
+        // SAFETY: a null tv is allowed; the pointer names two live ints.
+        assert_eq!(
+            unsafe { libc::syscall(libc::SYS_gettimeofday, 0, zone.as_mut_ptr()) },
+            0
+        );
+        assert_eq!(file[0x200..0x204], zone[0].to_ne_bytes());
+        assert_eq!(file[0x204..0x208], zone[1].to_ne_bytes());
         let mut expected = f.expected.clone();
-        expected[..4].copy_from_slice(&seconds[4..]);
-        expected[4..8].fill(0);
-        expected[0x10..0x18].copy_from_slice(&seconds);
-        expected[0x100..0x110].fill(0);
-        expected[0x200..0x208].fill(0);
-        assert_eq!(std::fs::read(&f.path).unwrap(), expected);
+        for range in [0..8, 0x10..0x18, 0x100..0x110, 0x200..0x208] {
+            expected[range.clone()].copy_from_slice(&file[range]);
+        }
+        assert_eq!(file, expected, "nothing else in the file changed");
         assert_eq!(read_struct::<[u8; 8]>(&f.memory, shared - 16), [0xa5; 8]);
-        assert_eq!(read_struct::<[u8; 4]>(&f.memory, shared - 8), [0; 4]);
-        assert_eq!(read_struct::<[u8; 4]>(&f.memory, shared - 4)[..], seconds[..4]);
+        assert_eq!(read_struct::<[u8; 4]>(&f.memory, shared - 8), tv_sec_low);
+        assert_eq!(read_struct::<[u8; 4]>(&f.memory, shared - 4)[..], second_bytes[..4]);
 
         // A read-only shared mapping of the same file: EFAULT, nothing stored.
         let read_only = f.shared(fd, shared + PAGE_SIZE, 0, false);

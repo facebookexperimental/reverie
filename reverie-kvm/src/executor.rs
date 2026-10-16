@@ -1359,20 +1359,15 @@ fn execute_basic_syscall_inner(
     } else if number == libc::SYS_getrandom as u64 {
         getrandom(&mut ProviderMemory(memory), state, args[0], args[1])
     } else if number == libc::SYS_clock_gettime as u64 {
-        clock_gettime(&mut ProviderMemory(memory), state, args)
+        clock_gettime(&mut ProviderMemory(memory), args)
     } else if number == libc::SYS_nanosleep as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        nanosleep(&ProviderMemory(memory), args)
+        nanosleep(&mut ProviderMemory(memory), args)
     } else if number == libc::SYS_clock_nanosleep as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        clock_nanosleep(&ProviderMemory(memory), args)
+        clock_nanosleep(&mut ProviderMemory(memory), args)
     } else if number == libc::SYS_gettimeofday as u64 {
         gettimeofday(&mut ProviderMemory(memory), args)
     } else if number == libc::SYS_time as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3765):
-        // Review KVM time(2) dispatch.
-        time(&mut ProviderMemory(memory), state, args)
+        time(&mut ProviderMemory(memory), args)
     } else if number == libc::SYS_readlink as u64 {
         readlink(memory, state, args, capture_metadata)
     } else if number == libc::SYS_readlinkat as u64 {
@@ -21342,111 +21337,157 @@ fn deterministic_random_device_byte(seed: u64, index: u64) -> u8 {
         ^ seed_byte
 }
 
-// Child processes and guest workers bypass Detcore's virtual scheduler. Validate
-// their sleep requests, but do not block the supervisor on host wall time;
-// subscribed root-process sleeps continue to use Detcore's time model.
-// TODO-HUMAN-REVIEW(PR-182): Review nonblocking KVM child sleeps.
-fn nanosleep<M: GuestMemoryAccess<Error = crate::Error>>(memory: &M, args: &[u64; 6]) -> i64 {
-    validate_sleep_request(memory, args[0])
+// The time family goes to the host clock and host sleeps, as Linux answers the
+// guest's host process. Detcore answers all of it on every backend: with
+// virtual time it never injects these calls, and without it, it injects
+// gettimeofday, time and clock_gettime to read the host clock, which is what
+// these forwards return (ai_docs/2026-10-16-a2-kvm-keep-in-detcore-proof.md in
+// the dev-hermit workspace).
+
+/// Whether `clock_id` names a clock by itself, rather than a process, thread or
+/// descriptor by its host-side number, which is not the guest's: a negative
+/// id encodes a pid (CPU-time clocks) or a descriptor (posix clocks), and is
+/// refused with Linux's answer for a clock id that names nothing.
+fn host_clock_id(clock_id: libc::clockid_t) -> Result<libc::clockid_t, i64> {
+    if clock_id < 0 {
+        Err(negative_errno(libc::EINVAL))
+    } else {
+        Ok(clock_id)
+    }
 }
 
-fn clock_nanosleep<M: GuestMemoryAccess<Error = crate::Error>>(memory: &M, args: &[u64; 6]) -> i64 {
-    let clock_id = args[0] as libc::clockid_t;
-    if clock_id == libc::CLOCK_THREAD_CPUTIME_ID {
-        return negative_errno(libc::EOPNOTSUPP);
-    }
-    if !matches!(
-        clock_id,
-        libc::CLOCK_REALTIME
-            | libc::CLOCK_MONOTONIC
-            | libc::CLOCK_PROCESS_CPUTIME_ID
-            | libc::CLOCK_BOOTTIME
-            | libc::CLOCK_TAI
-    ) {
-        return negative_errno(libc::EINVAL);
-    }
-    validate_sleep_request(memory, args[2])
+fn nanosleep<M: GuestMemoryAccess<Error = crate::Error>>(memory: &mut M, args: &[u64; 6]) -> i64 {
+    host_sleep(memory, None, 0, args[0], args[1])
 }
 
-fn validate_sleep_request<M: GuestMemoryAccess<Error = crate::Error>>(
-    memory: &M,
-    address: u64,
+fn clock_nanosleep<M: GuestMemoryAccess<Error = crate::Error>>(
+    memory: &mut M,
+    args: &[u64; 6],
 ) -> i64 {
-    if address == 0 {
+    let clock_id = match host_clock_id(args[0] as libc::clockid_t) {
+        Ok(clock_id) => clock_id,
+        Err(error) => return error,
+    };
+    host_sleep(
+        memory,
+        Some(clock_id),
+        args[1] as libc::c_int,
+        args[2],
+        args[3],
+    )
+}
+
+/// `nanosleep(2)` (no clock) or `clock_nanosleep(2)` on the host. The request
+/// is read from the guest first (EFAULT if it cannot be); the remainder is
+/// stored only where Linux stores it, after an interrupted relative sleep.
+fn host_sleep<M: GuestMemoryAccess<Error = crate::Error>>(
+    memory: &mut M,
+    clock_id: Option<libc::clockid_t>,
+    flags: libc::c_int,
+    request_address: u64,
+    remainder_address: u64,
+) -> i64 {
+    if request_address == 0 {
         return negative_errno(libc::EFAULT);
     }
-    let request = match read_guest_struct::<libc::timespec>(memory, address) {
+    let request = match read_guest_struct::<libc::timespec>(memory, request_address) {
         Ok(request) => request,
         Err(error) => return error,
     };
-    if request.tv_sec < 0 || !(0..1_000_000_000).contains(&request.tv_nsec) {
-        negative_errno(libc::EINVAL)
-    } else {
-        0
+    let mut remainder = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: both pointers name live host timespecs for the call's duration.
+    let result = unsafe {
+        match clock_id {
+            None => libc::syscall(libc::SYS_nanosleep, &request, &mut remainder),
+            Some(clock_id) => libc::syscall(
+                libc::SYS_clock_nanosleep,
+                clock_id,
+                flags,
+                &request,
+                &mut remainder,
+            ),
+        }
+    };
+    if result == 0 {
+        return 0;
     }
+    let error = std::io::Error::last_os_error();
+    let interrupted_relative = error.raw_os_error() == Some(libc::EINTR)
+        && flags & libc::TIMER_ABSTIME == 0
+        && remainder_address != 0;
+    if interrupted_relative && write_struct(memory, remainder_address, &remainder) != 0 {
+        return negative_errno(libc::EFAULT);
+    }
+    io_error(error)
 }
 
 fn clock_gettime<M: GuestMemoryAccess<Error = crate::Error>>(
     memory: &mut M,
-    state: &mut LoadedStaticElf,
     args: &[u64; 6],
 ) -> i64 {
-    let nanoseconds = state.logical_clock_ns;
-    let time = libc::timespec {
-        tv_sec: (nanoseconds / 1_000_000_000) as libc::time_t,
-        tv_nsec: (nanoseconds % 1_000_000_000) as libc::c_long,
+    let clock_id = match host_clock_id(args[0] as libc::clockid_t) {
+        Ok(clock_id) => clock_id,
+        Err(error) => return error,
     };
-    let result = write_struct(memory, args[1], &time);
-    if result == 0 {
-        state.logical_clock_ns = state.logical_clock_ns.saturating_add(1);
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: the pointer names a live host timespec.
+    if unsafe { libc::clock_gettime(clock_id, &mut time) } != 0 {
+        return io_error(std::io::Error::last_os_error());
     }
-    result
+    write_struct(memory, args[1], &time)
 }
 
-/// `gettimeofday(2)`, storing zeros for both outputs. As Linux, `tv_sec` and
-/// then `tv_usec` are each stored with `put_user` (all eight bytes or none,
-/// writable pages only, shared-file pages included), and the first failed
-/// store returns EFAULT, leaving an already stored `tv_sec` in place. `tz` is
-/// then copied with `copy_to_user`, which stores the writable prefix before
-/// it faults.
+/// `gettimeofday(2)` from the host. As Linux, `tv_sec` and then `tv_usec` are
+/// each stored with `put_user` (all eight bytes or none, writable pages only,
+/// shared-file pages included), and the first failed store returns EFAULT,
+/// leaving an already stored `tv_sec` in place. `tz` is then copied with
+/// `copy_to_user`, which stores the writable prefix before it faults.
 fn gettimeofday<M: GuestMemoryAccess<Error = crate::Error>>(
     memory: &mut M,
     args: &[u64; 6],
 ) -> i64 {
     const TV_USEC_OFFSET: u64 = std::mem::offset_of!(libc::timeval, tv_usec) as u64;
+    let mut time = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
+    let mut zone = [0 as libc::c_int; 2];
+    // SAFETY: both pointers name live host storage of the kernel's layouts.
+    if unsafe { libc::syscall(libc::SYS_gettimeofday, &mut time, zone.as_mut_ptr()) } != 0 {
+        return io_error(std::io::Error::last_os_error());
+    }
     if args[0] != 0 {
-        let stored = memory.put_user_u64(args[0], 0).is_ok()
+        let stored = memory.put_user_u64(args[0], time.tv_sec as u64).is_ok()
             && args[0]
                 .checked_add(TV_USEC_OFFSET)
-                .is_some_and(|tv_usec| memory.put_user_u64(tv_usec, 0).is_ok());
+                .is_some_and(|tv_usec| memory.put_user_u64(tv_usec, time.tv_usec as u64).is_ok());
         if !stored {
             return negative_errno(libc::EFAULT);
         }
     }
-    if args[1] != 0
-        && memory
-            .copy_to_user(args[1], &[0; std::mem::size_of::<libc::c_int>() * 2])
-            .is_err()
-    {
-        return negative_errno(libc::EFAULT);
+    if args[1] != 0 {
+        let zone = [zone[0].to_ne_bytes(), zone[1].to_ne_bytes()].concat();
+        if memory.copy_to_user(args[1], &zone).is_err() {
+            return negative_errno(libc::EFAULT);
+        }
     }
     0
 }
 
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3765):
-// Review KVM time(2): logical seconds and the whole-or-nothing tloc store.
-/// `time(2)`: the private logical clock's whole seconds, also stored at
-/// `tloc` when it is not null. As Linux's `put_user`, the store writes all
-/// eight bytes or none, only to writable pages (shared-file pages included),
-/// and a failed store returns EFAULT. Reading the clock does not advance it.
-fn time<M: GuestMemoryAccess<Error = crate::Error>>(
-    memory: &mut M,
-    state: &LoadedStaticElf,
-    args: &[u64; 6],
-) -> i64 {
-    let seconds = state.logical_clock_ns / 1_000_000_000;
-    if args[0] != 0 && memory.put_user_u64(args[0], seconds).is_err() {
+/// `time(2)` from the host clock, also stored at `tloc` when it is not null.
+/// As Linux's `put_user`, the store writes all eight bytes or none, only to
+/// writable pages (shared-file pages included), and a failed store returns
+/// EFAULT.
+fn time<M: GuestMemoryAccess<Error = crate::Error>>(memory: &mut M, args: &[u64; 6]) -> i64 {
+    // SAFETY: a null tloc asks only for the value.
+    let seconds = unsafe { libc::time(std::ptr::null_mut()) };
+    if args[0] != 0 && memory.put_user_u64(args[0], seconds as u64).is_err() {
         return negative_errno(libc::EFAULT);
     }
     seconds as i64
@@ -23249,7 +23290,6 @@ pub(crate) fn native_loaded_state(cwd: &std::path::Path) -> LoadedStaticElf {
         ppid: 0,
         orphan_reaper_pid: Arc::new(AtomicI32::new(0)),
         is_traced_tree_root: true,
-        logical_clock_ns: 0,
         umask: 0o022,
         linux_personality: crate::elf::LINUX_FIXED_PERSONALITY,
         random_seed: 0,
@@ -24675,28 +24715,51 @@ mod tests {
         PathBuf::from(std::ffi::OsString::from_vec(bytes))
     }
 
+    fn host_clock(clock_id: libc::clockid_t) -> libc::timespec {
+        let mut time = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: the pointer names a live timespec.
+        assert_eq!(unsafe { libc::clock_gettime(clock_id, &mut time) }, 0);
+        time
+    }
+
+    fn host_timezone() -> [libc::c_int; 2] {
+        let mut zone = [0 as libc::c_int; 2];
+        // SAFETY: a null tv is allowed; the pointer names two live ints.
+        assert_eq!(
+            unsafe { libc::syscall(libc::SYS_gettimeofday, 0, zone.as_mut_ptr()) },
+            0
+        );
+        zone
+    }
+
     #[test]
-    fn clock_gettime_advances_private_logical_clock_after_successful_write() {
+    fn clock_gettime_reads_the_host_clock() {
         const TIME: u64 = 0x100;
 
         let root = TestDir::new();
         let mut state = test_state(&root.0);
         let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
 
-        for expected_nanoseconds in [0, 1] {
-            assert_eq!(
-                syscall_result(
-                    &mut memory,
-                    &mut state,
-                    libc::SYS_clock_gettime,
-                    [libc::CLOCK_MONOTONIC as u64, TIME, 0, 0, 0, 0],
-                ),
-                0
-            );
-            let time: libc::timespec = read_struct(&memory, TIME);
-            assert_eq!(time.tv_sec, 0);
-            assert_eq!(time.tv_nsec, expected_nanoseconds);
-        }
+        let as_tuple = |time: libc::timespec| (time.tv_sec, time.tv_nsec);
+        let before = as_tuple(host_clock(libc::CLOCK_MONOTONIC));
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_clock_gettime,
+                [libc::CLOCK_MONOTONIC as u64, TIME, 0, 0, 0, 0],
+            ),
+            0
+        );
+        let guest = as_tuple(read_struct::<libc::timespec>(&memory, TIME));
+        let after = as_tuple(host_clock(libc::CLOCK_MONOTONIC));
+        assert!(
+            before <= guest && guest <= after,
+            "{before:?} {guest:?} {after:?}"
+        );
 
         assert_eq!(
             syscall_result(
@@ -24707,35 +24770,45 @@ mod tests {
             ),
             negative_errno(libc::EFAULT)
         );
-        assert_eq!(state.logical_clock_ns, 2);
+        // A clock id that names a pid or a descriptor by its host-side number
+        // is refused.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_clock_gettime,
+                [(-6_i64) as u64, TIME, 0, 0, 0, 0],
+            ),
+            negative_errno(libc::EINVAL)
+        );
     }
 
     #[test]
-    fn time_returns_logical_seconds_and_stores_them_whole_or_not_at_all() {
+    fn time_returns_host_seconds_and_stores_them_whole_or_not_at_all() {
         const TLOC: u64 = 0x100;
         const SENTINEL: [u8; 8] = [0xa5; 8];
 
         let root = TestDir::new();
         let mut state = test_state(&root.0);
-        state.logical_clock_ns = 3_999_999_999;
         let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
 
-        assert_eq!(
-            syscall_result(&mut memory, &mut state, libc::SYS_time, [0; 6]),
-            3
+        let before = host_clock(libc::CLOCK_REALTIME).tv_sec;
+        let seconds = syscall_result(&mut memory, &mut state, libc::SYS_time, [0; 6]);
+        let after = host_clock(libc::CLOCK_REALTIME).tv_sec;
+        assert!(
+            before <= seconds && seconds <= after,
+            "{before} {seconds} {after}"
         );
 
         memory.write(TLOC, &SENTINEL).unwrap();
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_time,
-                [TLOC, 0, 0, 0, 0, 0]
-            ),
-            3
+        let stored = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_time,
+            [TLOC, 0, 0, 0, 0, 0],
         );
-        assert_eq!(read_struct::<u64>(&memory, TLOC), 3);
+        assert!(stored >= seconds);
+        assert_eq!(read_struct::<u64>(&memory, TLOC), stored as u64);
 
         // A `tloc` whose last four bytes lie past the end of memory faults
         // without storing its first four.
@@ -24761,9 +24834,6 @@ mod tests {
             ),
             negative_errno(libc::EFAULT)
         );
-
-        // Reading the clock does not advance it.
-        assert_eq!(state.logical_clock_ns, 3_999_999_999);
     }
 
     #[test]
@@ -58527,7 +58597,6 @@ mod tests {
 
         let root = TestDir::new();
         let mut state = test_state(&root.0);
-        state.logical_clock_ns = 7_000_000_000;
         let mut memory = GuestMemory::new(0, 4 * PAGE_SIZE as usize).unwrap();
         memory.enable_user_access();
         memory.map_user_range(0, 2 * PAGE_SIZE, false).unwrap();
@@ -58543,6 +58612,14 @@ mod tests {
             syscall_result(memory, &mut state, number, [a0, a1, 0, 0, 0, 0])
         };
         let bytes = |memory: &GuestMemory, address: u64| read_struct::<[u8; 8]>(memory, address);
+        // A stored tv_sec is the host's, well past 2001; a stored tv_usec is
+        // below a second.
+        let host_seconds = |memory: &GuestMemory, address: u64| {
+            read_struct::<u64>(memory, address) > 1_000_000_000
+        };
+        let microseconds =
+            |memory: &GuestMemory, address: u64| read_struct::<u64>(memory, address) < 1_000_000;
+        let zone = host_timezone();
         let efault = negative_errno(libc::EFAULT);
 
         // time(2): a read-only tloc, and one whose last four bytes are
@@ -58559,8 +58636,12 @@ mod tests {
             assert_eq!(bytes(&memory, READ_ONLY + 0x100), [0; 8], "{tloc:#x}");
         }
         reset(&mut memory);
-        assert_eq!(call(&mut memory, libc::SYS_time, READ_ONLY - 8, 0), 7);
-        assert_eq!(bytes(&memory, READ_ONLY - 8), 7_u64.to_ne_bytes());
+        let seconds = call(&mut memory, libc::SYS_time, READ_ONLY - 8, 0);
+        assert!(seconds > 1_000_000_000);
+        assert_eq!(
+            bytes(&memory, READ_ONLY - 8),
+            (seconds as u64).to_ne_bytes()
+        );
 
         // gettimeofday(2): a read-only tv faults before tz is looked at, with
         // nothing stored, whether tz is valid, unmapped or null.
@@ -58582,7 +58663,7 @@ mod tests {
             call(&mut memory, libc::SYS_gettimeofday, READ_ONLY - 8, TIMEZONE),
             efault
         );
-        assert_eq!(bytes(&memory, READ_ONLY - 8), [0; 8]);
+        assert!(host_seconds(&memory, READ_ONLY - 8));
         assert_eq!(bytes(&memory, READ_ONLY), [0xa5; 8]);
         assert_eq!(bytes(&memory, TIMEZONE), [0xa5; 8]);
 
@@ -58606,8 +58687,8 @@ mod tests {
             ),
             efault
         );
-        assert_eq!(bytes(&memory, READ_ONLY - 16), [0; 8]);
-        assert_eq!(bytes(&memory, READ_ONLY - 8), [0; 8]);
+        assert!(host_seconds(&memory, READ_ONLY - 16));
+        assert!(microseconds(&memory, READ_ONLY - 8));
         assert_eq!(bytes(&memory, READ_ONLY), [0xa5; 8]);
 
         // A tz whose second half is read-only keeps its writable first half.
@@ -58616,13 +58697,12 @@ mod tests {
             call(&mut memory, libc::SYS_gettimeofday, 0, READ_ONLY - 4),
             efault
         );
-        assert_eq!(
-            bytes(&memory, READ_ONLY - 8),
-            [0xa5, 0xa5, 0xa5, 0xa5, 0, 0, 0, 0]
-        );
+        let mut expected = [0xa5; 8];
+        expected[4..].copy_from_slice(&zone[0].to_ne_bytes());
+        assert_eq!(bytes(&memory, READ_ONLY - 8), expected);
         assert_eq!(bytes(&memory, READ_ONLY), [0xa5; 8]);
 
-        // Every output writable: zeros everywhere, success.
+        // Every output writable: the host's values everywhere, success.
         reset(&mut memory);
         assert_eq!(
             call(
@@ -58633,20 +58713,20 @@ mod tests {
             ),
             0
         );
-        assert_eq!(bytes(&memory, READ_ONLY - 16), [0; 8]);
-        assert_eq!(bytes(&memory, READ_ONLY - 8), [0; 8]);
-        assert_eq!(bytes(&memory, TIMEZONE), [0; 8]);
-        assert_eq!(state.logical_clock_ns, 7_000_000_000);
+        assert!(host_seconds(&memory, READ_ONLY - 16));
+        assert!(microseconds(&memory, READ_ONLY - 8));
+        assert_eq!(read_struct::<[libc::c_int; 2]>(&memory, TIMEZONE), zone);
     }
 
     #[test]
-    fn gettimeofday_is_deterministic_and_validates_outputs() {
+    fn gettimeofday_reads_the_host_clock_and_validates_outputs() {
         const TIMEVAL: u64 = 0x100;
         const TIMEZONE: u64 = 0x200;
 
         let root = TestDir::new();
         let mut state = test_state(&root.0);
         let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let before = host_clock(libc::CLOCK_REALTIME).tv_sec;
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -58656,10 +58736,12 @@ mod tests {
             ),
             0
         );
+        let after = host_clock(libc::CLOCK_REALTIME).tv_sec;
         let timeval: libc::timeval = read_struct(&memory, TIMEVAL);
-        assert_eq!((timeval.tv_sec, timeval.tv_usec), (0, 0));
+        assert!(before <= timeval.tv_sec && timeval.tv_sec <= after);
+        assert!((0..1_000_000).contains(&timeval.tv_usec));
         let timezone: [libc::c_int; 2] = read_struct(&memory, TIMEZONE);
-        assert_eq!(timezone, [0, 0]);
+        assert_eq!(timezone, host_timezone());
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -58681,67 +58763,60 @@ mod tests {
     }
 
     #[test]
-    fn child_sleep_syscalls_validate_requests_without_host_waiting() {
+    fn sleep_syscalls_are_host_sleeps() {
         const REQUEST: u64 = 0x100;
 
         let root = TestDir::new();
         let mut state = test_state(&root.0);
         let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
-        assert_eq!(
-            write_struct(
-                &mut ProviderMemory(&memory),
-                REQUEST,
-                &libc::timespec {
-                    tv_sec: 60,
-                    tv_nsec: 123,
-                },
-            ),
-            0
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_nanosleep,
-                [REQUEST, u64::MAX, 0, 0, 0, 0],
-            ),
-            0
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_clock_nanosleep,
-                [libc::CLOCK_REALTIME as u64, 0, REQUEST, u64::MAX, 0, 0,],
-            ),
-            0
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_clock_nanosleep,
-                [
-                    libc::CLOCK_MONOTONIC as u64,
-                    libc::TIMER_ABSTIME as u64,
+        let request = |memory: &GuestMemory, tv_sec, tv_nsec| {
+            assert_eq!(
+                write_struct(
+                    &mut ProviderMemory(memory),
                     REQUEST,
-                    0,
-                    0,
-                    0,
-                ],
-            ),
-            0
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_clock_nanosleep,
-                [libc::CLOCK_PROCESS_CPUTIME_ID as u64, 0, REQUEST, 0, 0, 0,],
-            ),
-            0
-        );
+                    &libc::timespec { tv_sec, tv_nsec },
+                ),
+                0
+            );
+        };
+        // One microsecond, relative, and an absolute deadline long past.
+        request(&memory, 0, 1_000);
+        for args in [
+            [libc::SYS_nanosleep as u64, REQUEST, u64::MAX, 0],
+            [
+                libc::SYS_clock_nanosleep as u64,
+                libc::CLOCK_REALTIME as u64,
+                0,
+                REQUEST,
+            ],
+            [
+                libc::SYS_clock_nanosleep as u64,
+                libc::CLOCK_MONOTONIC as u64,
+                libc::TIMER_ABSTIME as u64,
+                REQUEST,
+            ],
+            // A CPU-time clock advances only while the process runs, so its
+            // deadline is absolute (already passed), not a relative wait.
+            [
+                libc::SYS_clock_nanosleep as u64,
+                libc::CLOCK_PROCESS_CPUTIME_ID as u64,
+                libc::TIMER_ABSTIME as u64,
+                REQUEST,
+            ],
+        ] {
+            let call_args = if args[0] == libc::SYS_nanosleep as u64 {
+                [args[1], args[2], 0, 0, 0, 0]
+            } else {
+                [args[1], args[2], args[3], 0, 0, 0]
+            };
+            assert_eq!(
+                syscall_result(&mut memory, &mut state, args[0] as libc::c_long, call_args),
+                0,
+                "{args:?}"
+            );
+        }
 
+        // An unreadable request faults before any sleep.
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -58760,46 +58835,31 @@ mod tests {
             ),
             negative_errno(libc::EFAULT)
         );
-        assert_eq!(
-            write_struct(
-                &mut ProviderMemory(&memory),
-                REQUEST,
-                &libc::timespec {
-                    tv_sec: -1,
-                    tv_nsec: 0,
-                },
-            ),
-            0
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_nanosleep,
-                [REQUEST, 0, 0, 0, 0, 0],
-            ),
-            negative_errno(libc::EINVAL)
-        );
-        assert_eq!(
-            write_struct(
-                &mut ProviderMemory(&memory),
-                REQUEST,
-                &libc::timespec {
-                    tv_sec: 0,
-                    tv_nsec: 1_000_000_000,
-                },
-            ),
-            0
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_clock_nanosleep,
-                [libc::CLOCK_REALTIME as u64, 0, REQUEST, 0, 0, 0],
-            ),
-            negative_errno(libc::EINVAL)
-        );
+        // The host kernel validates the request and the clock.
+        for (tv_sec, tv_nsec) in [(-1, 0), (0, 1_000_000_000)] {
+            request(&memory, tv_sec, tv_nsec);
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_nanosleep,
+                    [REQUEST, 0, 0, 0, 0, 0],
+                ),
+                negative_errno(libc::EINVAL)
+            );
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_clock_nanosleep,
+                    [libc::CLOCK_REALTIME as u64, 0, REQUEST, 0, 0, 0],
+                ),
+                negative_errno(libc::EINVAL)
+            );
+        }
+        request(&memory, 0, 1_000);
+        // A clock id that names a pid or a descriptor by its host-side number
+        // is refused.
         assert_eq!(
             syscall_result(
                 &mut memory,

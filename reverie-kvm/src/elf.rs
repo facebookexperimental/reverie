@@ -984,11 +984,6 @@ pub(crate) struct LoadedStaticElf {
     /// the traced process tree", and `Guest::is_root_process` is derived from it,
     /// so conflating the two makes the root guest invisible to the tool.
     pub is_traced_tree_root: bool,
-    // Direct KVM workers do not participate in Detcore's virtual clock. Keep a
-    // private logical clock so repeated observations advance deterministically
-    // without making host thread scheduling observable.
-    // TODO-HUMAN-REVIEW(PR-221): Review direct-worker logical clock semantics.
-    pub logical_clock_ns: u64,
     pub umask: libc::mode_t,
     /// Per-task ELF64 Linux personality. Only UNAME26 can change within the
     /// fixed ADDR_NO_RANDOMIZE layout. Fork and clone copy it by value; ordinary
@@ -1242,7 +1237,6 @@ impl LoadedStaticElf {
             orphan_reaper_pid: std::sync::Arc::new(AtomicI32::new(0)),
             // A guest-created child always has a traced parent: this process.
             is_traced_tree_root: false,
-            logical_clock_ns: self.logical_clock_ns,
             umask: self.umask,
             linux_personality: self.linux_personality,
             random_seed: self.random_seed,
@@ -1495,7 +1489,6 @@ impl LoadedStaticElf {
         self.orphan_reaper_pid = previous.orphan_reaper_pid;
         // `execve` replaces the image, never the position in the process tree.
         self.is_traced_tree_root = previous.is_traced_tree_root;
-        self.logical_clock_ns = previous.logical_clock_ns;
         self.signal_dequeue_failure = previous.signal_dequeue_failure;
         self.umask = previous.umask;
         self.linux_personality = previous.linux_personality;
@@ -2043,7 +2036,6 @@ fn load_executable(
         // `KvmBackend::set_root_pid` may later renumber `pid`/`tid`/`ppid`; it
         // must not change this.
         is_traced_tree_root: true,
-        logical_clock_ns: 0,
         umask: 0o022,
         linux_personality: LINUX_FIXED_PERSONALITY,
         random_seed: 0,
