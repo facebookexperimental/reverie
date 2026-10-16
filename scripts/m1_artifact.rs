@@ -712,8 +712,8 @@ fn content_manifest_relative(image_kind: FixedImageKind) -> &'static str {
 const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 18] = [
     (
         "Cargo.toml",
-        869,
-        "bf6c6108361a52f1c2e3fef0976edc700b9c9f780b3699130b2e690b058b99a4",
+        843,
+        "ed80dd847597538dbc70d7dfc9ba9c83622a24af46ea5b379d946f7e3ef1d3f9",
     ),
     (
         "reverie-liteinst-artifact/Cargo.toml",
@@ -727,18 +727,18 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 18] = [
     ),
     (
         "reverie-inguest/src/lib.rs",
-        11518,
-        "627736cc953928e8f20f76fad6c95377ededfa201746e88a208ac304c1a4652c",
+        11540,
+        "89fbed346c4d3e0af9e4717a21136e9ad9ebcb1eb918e35b6f718570385af4b5",
     ),
     (
         "reverie-liteinst/Cargo.toml",
-        5104,
-        "4ee40b5b0e542231436fca83c578be3b64fb9e9be529960d12b1b561e3541276",
+        5037,
+        "5765cdc0fb376e9bb969281c9f22b9f6892aa4c933479c347348c1ddcf4993fd",
     ),
     (
         "reverie-liteinst/src/lib.rs",
-        23282,
-        "a6f8554749d5d3387c253e45a66b3556e8a10240a47cc51ef1c00e19df8914f9",
+        23303,
+        "7c1363a338def1d00f83fff72605fd11ed7ef4cdbf7fd3630ce800530a360aed",
     ),
     (
         "reverie-liteinst-preload/Cargo.toml",
@@ -792,8 +792,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 18] = [
     ),
     (
         "reverie-inguest/src/guest/host.rs",
-        154190,
-        "025f9496f0f1318b7e890132d8ebfa7188f8054ac20a7f8b52cf477e1068fef1",
+        154385,
+        "2b17c442418f34a91a03ba85dd7b6d6e5f5d2b596456f6c73ddb48422729d81a",
     ),
     (
         "reverie-liteinst/src/tool_host.rs",
