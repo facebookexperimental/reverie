@@ -144,10 +144,6 @@ pub struct BackendCapabilities {
     /// capabilities that `prctl` reads and changes.
     pub virtualizes_capability_prctls: bool,
 
-    /// The backend installs a deterministic CPUID policy itself, without
-    /// trapping CPUID instructions to the tool.
-    pub virtualizes_cpuid: bool,
-
     /// The backend implements guest-visible `madvise` semantics, so the tool
     /// may forward an `madvise` call to it.
     pub supports_madvise: bool,
@@ -245,7 +241,6 @@ impl BackendCapabilities {
         supports_parked_write_signal_interruption: true,
         defers_vfork_child_registration: false,
         virtualizes_capability_prctls: false,
-        virtualizes_cpuid: false,
         supports_madvise: true,
         supports_madv_dontneed: true,
         reports_child_exit_publication: true,
@@ -360,7 +355,6 @@ mod tests {
             "supports_parked_write_signal_interruption": true,
             "defers_vfork_child_registration": false,
             "virtualizes_capability_prctls": false,
-            "virtualizes_cpuid": false,
             "supports_madvise": true,
             "supports_madv_dontneed": true,
             "reports_child_exit_publication": true,
