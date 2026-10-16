@@ -3123,6 +3123,18 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
                 };
             }
         }
+        if matches!(number, libc::SYS_execve | libc::SYS_execveat) {
+            // A typed refusal, so the Tool can tell this from an exec that
+            // Linux failed: without an installed native exec route the
+            // in-guest runtime has no way to replace the process image.
+            self.unsupported_refusal = Some(reverie::UnsupportedRefusal::new(
+                reverie::UnsupportedOperation::Exec,
+                Errno::EOPNOTSUPP,
+                "the in-guest backend cannot replace the process image: execve and execveat \
+                 are not forwarded",
+            ));
+            return Err(Errno::EOPNOTSUPP);
+        }
         #[cfg(feature = "exec-native-injection")]
         self.check_native_mapping(number, raw_args)?;
         self.refuse_filter_while_staging(number, raw_args);

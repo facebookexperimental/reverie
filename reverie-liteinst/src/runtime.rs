@@ -3108,12 +3108,15 @@ unsafe fn process_syscall(event: &mut SyscallEvent) {
             && reverie_inguest::guest::exec_private::callback_native_tid().is_some();
         #[cfg(not(feature = "exec-native-injection"))]
         let native_callback = false;
-        if !native_callback {
+        // In Tool mode the Tool decides: it injects the exec, and the host
+        // refuses one it cannot run with a typed refusal
+        // (`UnsupportedOperation::Exec`), which the Tool can end the run on.
+        // Answering ENOTSUP here instead gave the guest an errno Linux never
+        // returns for a valid exec, with nothing reported.
+        if !native_callback && tool_mode != TOOL_REVERIE {
             event.result = -i64::from(libc::ENOTSUP);
-            if tool_mode != TOOL_REVERIE {
-                unsafe {
-                    trace_event(event, Some(event.result));
-                }
+            unsafe {
+                trace_event(event, Some(event.result));
             }
             return;
         }
@@ -3596,10 +3599,17 @@ mod tests {
                 );
                 self.seen.lock().unwrap().push(number);
                 // There is deliberately no native driver. A raw kernel call
-                // with these NULL arguments would return EFAULT, not ENOTSUP.
+                // with these NULL arguments would return EFAULT, not ENOTSUP:
+                // the host refuses the exec, typed, so the Tool can tell it
+                // from a failure Linux reported.
                 let errno = guest.inject(syscall).await.unwrap_err();
                 assert_eq!(errno, reverie::Errno::EOPNOTSUPP);
-                assert_eq!(guest.take_unsupported_refusal(), None);
+                assert_eq!(
+                    guest
+                        .take_unsupported_refusal()
+                        .map(|refusal| refusal.operation),
+                    Some(reverie::UnsupportedOperation::Exec)
+                );
                 Ok(-i64::from(errno.into_raw()))
             }
         }
@@ -3824,7 +3834,11 @@ mod tests {
                 unsafe { super::super::process_syscall(&mut event) };
                 assert_eq!(event.result, -i64::from(libc::EOPNOTSUPP));
                 let actual = seen.lock().unwrap();
-                if positive {
+                // Every Tool-mode exec reaches the Tool, which decides; only
+                // the passthrough, compatibility and strace modes, which have
+                // no Tool, refuse before it.
+                let reaches_tool = !matches!(case, "passthrough" | "compat" | "strace");
+                if reaches_tool {
                     assert_eq!(
                         actual.as_slice(),
                         &[libc::SYS_execve, libc::SYS_execveat][..=index],
@@ -3858,7 +3872,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "exec-native-injection")]
-    fn ordinary_and_noncallback_exec_keep_pre_tool_refusal() {
+    fn noncallback_exec_reaches_the_tool_and_toolless_modes_refuse_before_it() {
         native_exec_routing_fixture::run(false);
     }
 

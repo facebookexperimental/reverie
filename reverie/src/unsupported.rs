@@ -45,6 +45,9 @@ pub enum UnsupportedOperation {
     /// tool that models process groups itself may keep its own answer, as no
     /// kernel state is left to disagree with it.
     ProcessGroups,
+    /// `execve` or `execveat` on a backend that cannot replace the process
+    /// image at all. No replacement image ran; the caller runs on unchanged.
+    Exec,
 }
 
 /// A backend's refusal of an injected syscall that it cannot perform, as
