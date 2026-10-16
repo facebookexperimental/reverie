@@ -218,6 +218,13 @@ fn run_native(program: &Path, args: &[OsString]) -> anyhow::Result<Report> {
     Ok(report(exit_code, events))
 }
 
+fn utf8(value: &std::ffi::OsStr) -> anyhow::Result<String> {
+    value
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("non-UTF-8 program or argument {value:?}"))
+}
+
 fn reverie_backend(target: Target) -> BackendKind {
     match target {
         Target::Native => unreachable!("native runs without Reverie"),
@@ -252,10 +259,22 @@ fn main() -> anyhow::Result<()> {
             tool: recorder_tool::NAME,
             path,
         });
+        // The host's environment, as for a native run.
+        let common = reverie_util::CommonToolArguments {
+            log_file: None,
+            no_host_envs: false,
+            envs: Vec::new(),
+            trace_syscalls: false,
+            program: utf8(opts.program.as_os_str())?,
+            program_args: opts
+                .args
+                .iter()
+                .map(|arg| utf8(arg))
+                .collect::<anyhow::Result<_>>()?,
+        };
         let run = runtime.block_on(backend::run::<Recorder>(
             reverie_backend(opts.backend),
-            &opts.program,
-            &opts.args,
+            &common,
             (),
             preload,
         ));

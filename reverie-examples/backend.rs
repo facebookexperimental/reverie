@@ -18,13 +18,19 @@
 //! caller passes, so a tool runs there only once its name is in that
 //! selector.
 
-use std::ffi::OsString;
+use std::collections::BTreeMap;
+use std::ffi::CString;
+use std::ffi::OsStr;
+use std::io;
 use std::os::fd::FromRawFd;
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
+use std::path::PathBuf;
 
 use reverie::ExitStatus;
 use reverie::GlobalTool;
 use reverie::Tool;
+use reverie_util::CommonToolArguments;
 
 /// A Reverie backend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -138,12 +144,12 @@ pub fn exit_code(status: ExitStatus) -> i32 {
     }
 }
 
-/// Run `program` with `args` under the tool `T` on `backend`. The in-guest
-/// backends need `preload`, which must compile `T` in under `preload.tool`.
+/// Run the program `args` names, with its arguments and environment, under
+/// the tool `T` on `backend`. The in-guest backends need `preload`, which must
+/// compile `T` in under `preload.tool`.
 pub async fn run<T>(
     backend: BackendKind,
-    program: &Path,
-    args: &[OsString],
+    args: &CommonToolArguments,
     config: <T::GlobalState as GlobalTool>::Config,
     preload: Option<Preload<'_>>,
 ) -> Result<Run<T::GlobalState>, RunError>
@@ -154,8 +160,8 @@ where
     <T::GlobalState as GlobalTool>::Config: 'static,
 {
     match backend {
-        BackendKind::Ptrace => run_ptrace::<T>(program, args, config).await,
-        BackendKind::Kvm => run_kvm::<T>(program, args, config).await,
+        BackendKind::Ptrace => run_ptrace::<T>(args, config).await,
+        BackendKind::Kvm => run_kvm::<T>(args, config).await,
         BackendKind::Liteinst | BackendKind::InGuestTrap | BackendKind::E9patch => {
             let preload = preload.ok_or_else(|| {
                 RunError::Refused(format!(
@@ -163,7 +169,7 @@ where
                      it in, and none was found (libreverie_examples.so)"
                 ))
             })?;
-            run_in_guest::<T>(backend, program, args, config, preload).await
+            run_in_guest::<T>(backend, args, config, preload).await
         }
         BackendKind::Dbt | BackendKind::Sabre => Err(RunError::Refused(format!(
             "the {backend:?} backend loads one runtime of its own and has no generic tool host"
@@ -173,8 +179,7 @@ where
 
 async fn run_in_guest<T>(
     backend: BackendKind,
-    program: &Path,
-    args: &[OsString],
+    args: &CommonToolArguments,
     config: <T::GlobalState as GlobalTool>::Config,
     preload: Preload<'_>,
 ) -> Result<Run<T::GlobalState>, RunError>
@@ -184,8 +189,7 @@ where
     let tool = preload.tool.as_bytes().to_vec();
     let (exit_code, stdout, stderr, global_state) = match backend {
         BackendKind::Liteinst | BackendKind::InGuestTrap => {
-            let mut command = reverie::process::Command::new(program);
-            command.args(args);
+            let mut command: reverie::process::Command = args.clone().into();
             // in-guest-trap is LiteInst with no site patched: every syscall
             // traps (as `reverie_liteinst::set_guest_site_patching` spells it
             // for a std command).
@@ -213,8 +217,7 @@ where
             (exit_code, output.stdout, output.stderr, global_state)
         }
         BackendKind::E9patch => {
-            let mut command = reverie::process::Command::new(program);
-            command.args(args);
+            let command: reverie::process::Command = args.clone().into();
             let (output, global_state) =
                 reverie_e9patch::E9patchBackend::run_direct_with_output_and_preload_data::<T>(
                     command,
@@ -240,16 +243,13 @@ where
 }
 
 async fn run_ptrace<T>(
-    program: &Path,
-    args: &[OsString],
+    args: &CommonToolArguments,
     config: <T::GlobalState as GlobalTool>::Config,
 ) -> Result<Run<T::GlobalState>, RunError>
 where
     T: Tool + 'static,
 {
-    let mut command = reverie::process::Command::new(program);
-    command.args(args);
-    let tracer = reverie_ptrace::TracerBuilder::<T>::new(command)
+    let tracer = reverie_ptrace::TracerBuilder::<T>::new(args.clone().into())
         .config(config)
         .spawn()
         .await?;
@@ -262,8 +262,7 @@ where
 }
 
 async fn run_kvm<T>(
-    program: &Path,
-    args: &[OsString],
+    args: &CommonToolArguments,
     config: <T::GlobalState as GlobalTool>::Config,
 ) -> Result<Run<T::GlobalState>, RunError>
 where
@@ -272,21 +271,21 @@ where
     T::GlobalState: 'static,
     <T::GlobalState as GlobalTool>::Config: 'static,
 {
-    use anyhow::Context as _;
-    let image = std::fs::read(program).with_context(|| format!("reading {program:?}"))?;
     let cwd = std::env::current_dir()?;
-    let mut argv = vec![program.to_str().context("non-UTF-8 program")?.to_owned()];
-    for arg in args {
-        argv.push(arg.to_str().context("non-UTF-8 argument")?.to_owned());
-    }
+    let environment = guest_environment(args)?;
+    let program = resolve_program(&args.program, &environment, &cwd)?;
+    let image = std::fs::read(&program)?;
+    let mut argv = Vec::with_capacity(args.program_args.len() + 1);
+    argv.push(args.program.clone());
+    argv.extend(args.program_args.iter().cloned());
+    let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
     // In name order, as reverie-process's `Command` passes the environment to
     // a ptrace guest, so that the order, which a program can see, is not a
     // difference between the backends.
-    let mut envp = std::env::vars()
+    let envp = environment
+        .into_iter()
         .map(|(key, value)| format!("{key}={value}"))
         .collect::<Vec<_>>();
-    envp.sort();
-    let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
     let envp = envp.iter().map(String::as_str).collect::<Vec<_>>();
     // The guest gets this process's standard input as its descriptor 0, as a
     // ptrace guest does.
@@ -296,8 +295,9 @@ where
     let stdin = (stdin >= 0).then(|| unsafe { std::fs::File::from_raw_fd(stdin) });
     let mut backend = reverie_kvm::KvmBackend::new_with_stdin(1 << 30, stdin)
         .map_err(|error| anyhow::anyhow!("reverie-kvm: {error}"))?;
+    // The program's name, as the caller spelled it, is its AT_EXECFN.
     backend
-        .install_static_elf_with_exec_context(&image, program.as_os_str(), &argv, &envp, &cwd)
+        .install_static_elf_with_exec_context(&image, OsStr::new(&args.program), &argv, &envp, &cwd)
         .map_err(|error| anyhow::anyhow!("loading {program:?} into KVM: {error}"))?;
     drop(image);
     let (global_state, exit_code, _stdout, _stderr) = backend
@@ -309,4 +309,111 @@ where
         global_state,
         captured: None,
     })
+}
+
+/// The guest environment: the host's, or only a PATH with `--no-host-envs`,
+/// plus each `--env`.
+fn guest_environment(args: &CommonToolArguments) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut environment = if args.no_host_envs {
+        BTreeMap::from([("PATH".to_string(), "/bin:/usr/bin".to_string())])
+    } else {
+        let mut environment = BTreeMap::new();
+        for (key, value) in std::env::vars_os() {
+            let key = key.into_string().map_err(|_| {
+                anyhow::anyhow!("the KVM backend cannot pass a non-UTF-8 environment key")
+            })?;
+            let value = value.into_string().map_err(|_| {
+                anyhow::anyhow!(
+                    "the KVM backend cannot pass a non-UTF-8 environment value for {key:?}"
+                )
+            })?;
+            environment.insert(key, value);
+        }
+        environment
+    };
+    environment.extend(args.envs.iter().cloned());
+    Ok(environment)
+}
+
+fn resolve_program(
+    program: &str,
+    environment: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> io::Result<PathBuf> {
+    if program.contains('/') {
+        let path = Path::new(program);
+        let candidate = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            cwd.join(path)
+        };
+        return require_executable(candidate.canonicalize()?);
+    }
+
+    let search_path = environment
+        .get("PATH")
+        .map(String::as_str)
+        .unwrap_or("/usr/local/bin:/usr/bin:/bin");
+    let mut permission_error = None;
+    for directory in std::env::split_paths(OsStr::new(search_path)) {
+        let directory = if directory.is_absolute() {
+            directory
+        } else {
+            cwd.join(directory)
+        };
+        let candidate = directory.join(program);
+        if candidate.is_file() {
+            match require_executable(candidate.canonicalize()?) {
+                Ok(candidate) => return Ok(candidate),
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                    permission_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    if let Some(error) = permission_error {
+        Err(error)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("cannot resolve executable {program:?} in PATH"),
+        ))
+    }
+}
+
+fn require_executable(path: PathBuf) -> io::Result<PathBuf> {
+    let metadata = path.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("executable path is not a regular file: {}", path.display()),
+        ));
+    }
+    let path_bytes = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("executable path contains a NUL byte: {}", path.display()),
+        )
+    })?;
+    let accessible = unsafe {
+        libc::faccessat(
+            libc::AT_FDCWD,
+            path_bytes.as_ptr(),
+            libc::X_OK,
+            libc::AT_EACCESS,
+        )
+    };
+    if accessible != 0 {
+        let error = io::Error::last_os_error();
+        return Err(io::Error::new(
+            error.kind(),
+            format!(
+                "executable path is not executable: {}: {error}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(path)
 }

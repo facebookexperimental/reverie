@@ -233,7 +233,10 @@ def backend_command(
         if not Path("/dev/kvm").exists():
             fail("/dev/kvm is unavailable")
         return [
-            str(require_file(target / "reverie-kvm-counter2", "KVM counter2")),
+            str(require_file(target / "counter2", "counter2")),
+            "--backend",
+            "kvm",
+            "--",
             str(artifact),
             *arguments,
         ]
@@ -278,7 +281,9 @@ def backend_command(
         ]
     if backend == "e9patch":
         return [
-            str(require_file(target / "reverie-e9patch-counter2", "e9patch counter2")),
+            str(require_file(target / "counter2", "counter2")),
+            "--backend",
+            "e9patch",
             "--",
             str(artifact),
             *arguments,

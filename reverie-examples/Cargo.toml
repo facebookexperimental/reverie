@@ -12,6 +12,8 @@
 # validation. Keep the internal target synchronized before the next export.
 # The cross-backend end-to-end check (reverie-examples/e2e/) adds the OSS-only
 # recorder and reverie-e2e-compare binaries and the recorder's nix dependency.
+# counter1 and counter2 take --backend, which replaces the OSS-only
+# reverie-kvm-counter1/2 and reverie-e9patch-counter2 launchers.
 # Keep the internal target synchronized before the next export.
 
 [package]
@@ -46,18 +48,6 @@ path = "counter1.rs"
 [[bin]]
 name = "counter2"
 path = "counter2.rs"
-
-[[bin]]
-name = "reverie-kvm-counter1"
-path = "kvm_counter1.rs"
-
-[[bin]]
-name = "reverie-kvm-counter2"
-path = "kvm_counter2.rs"
-
-[[bin]]
-name = "reverie-e9patch-counter2"
-path = "e9patch_counter2.rs"
 
 [[bin]]
 name = "debug"

@@ -10,7 +10,7 @@
 //! prototype `Guest` runner.
 
 // This module is a superset toolbox `#[path]`-included by several example bins
-// (`counter1`, `noop`, `kvm_counter1`, `kvm_counter2`). Each consumer uses a
+// (`counter1`, `noop`). Each consumer uses a
 // different subset of the helpers, so items that are unused in one bin's build
 // are legitimately used in another. Allow dead code at the module level rather
 // than annotating every helper for each consumer.
