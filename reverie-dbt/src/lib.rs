@@ -231,7 +231,9 @@ pub type RuntimeIdler = unsafe extern "C" fn();
 /// the native owned signal continuation.
 /// Version 8 appends [`DbtRuntimeCallbacks::compare_exchange_u32`], growing the
 /// callback layout from 48 to 56 bytes.
-pub const DBT_RUNTIME_ABI_VERSION: u32 = 8;
+/// Version 9 also requires `reverie_dbt_runtime_cpuid`: the native client no
+/// longer answers CPUID from a table of its own, it asks the runtime's tool.
+pub const DBT_RUNTIME_ABI_VERSION: u32 = 9;
 
 /// Initialized native execution mode supplied by the version-6 startup bridge.
 ///
@@ -352,6 +354,41 @@ pub unsafe extern "C" fn reverie_dbt_runtime_rdtsc(
     _aux: *mut u32,
 ) -> i32 {
     0
+}
+
+/// Answers a guest `cpuid` for `leaf` and `subleaf` (ABI version 9): 1 with
+/// `registers` written as EAX, EBX, ECX and EDX, negative on failure, which
+/// ends the run.
+///
+/// The prototype tools observe syscalls and do not describe a machine, so this
+/// runtime answers what Reverie's default `Tool::handle_cpuid_event` answers:
+/// the host's CPUID. A runtime whose tool owns the machine description
+/// (Detcore, in hermit) answers from that description instead.
+///
+/// # Safety
+///
+/// `registers` must be valid for writing four `u32`s; the other arguments are
+/// never dereferenced.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "prototype-runtime")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reverie_dbt_runtime_cpuid(
+    _context: *mut c_void,
+    _counters: *mut PrototypeCounters,
+    _tid: i32,
+    _pid: i32,
+    _branches: u64,
+    leaf: u32,
+    subleaf: u32,
+    _invoke_syscall: SyscallInvoker,
+    _read_registers: RegisterReader,
+    _write_registers: RegisterWriter,
+    _emit: tools::Emitter,
+    registers: *mut [u32; 4],
+) -> i32 {
+    let result = core::arch::x86_64::__cpuid_count(leaf, subleaf);
+    unsafe { registers.write([result.eax, result.ebx, result.ecx, result.edx]) };
+    1
 }
 
 /// Reports the exact callback-structure size for the current ABI version.
@@ -607,6 +644,13 @@ where
     // syscalls, and this backend has no begin/ready runtime window.
     fn is_backend_runtime_bootstrap(&self) -> bool {
         false
+    }
+
+    // The native client rewrites every application CPUID into a call to
+    // `reverie_dbt_runtime_cpuid` (ABI version 9), which the runtime answers
+    // through its Tool's `handle_cpuid_event`.
+    fn has_cpuid_interception(&self) -> bool {
+        true
     }
 
     fn memory(&self) -> Self::Memory {
@@ -2409,7 +2453,7 @@ mod tests {
 
     #[test]
     fn startup_abi_preserves_layout_and_requires_initialized_native_mode() {
-        assert_eq!(reverie_dbt_runtime_abi_version(), 8);
+        assert_eq!(reverie_dbt_runtime_abi_version(), 9);
         assert_eq!(std::mem::size_of::<DbtSignalEvent>(), 200);
         assert_eq!(std::mem::align_of::<DbtSignalEvent>(), 8);
         assert_eq!(reverie_dbt_runtime_callbacks_size(), 56);

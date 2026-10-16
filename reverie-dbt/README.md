@@ -5,8 +5,11 @@ native DynamoRIO client:
 
 - inserts an atomic 64-bit counter update before every application branch via
   DynamoRIO's `drx` instruction-rewriting helper;
-- replaces application `CPUID` instructions with Hermit's deterministic CPU
-  identity, masking RDRAND, RDSEED, TSX, and AVX-512 features;
+- replaces application `CPUID` instructions with a call into the runtime,
+  which answers through its Tool's `handle_cpuid_event`. The client keeps no
+  CPU table: under Hermit the answer is Detcore's machine description, the
+  same one `/proc/cpuinfo` is rendered from, and the standalone prototype
+  runtime forwards the host's answer;
 - receives all application syscall entry events without ptrace;
 - disables guest ASLR so non-fixed mappings remain stable;
 - routes `open`/`openat`/`creat`, `read`/`write`/`close`, the legacy and modern

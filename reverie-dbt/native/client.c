@@ -243,60 +243,9 @@ typedef struct {
   virtual_identity_t identities[MAX_VIRTUAL_IDENTITIES];
 } virtual_identity_state_t;
 
-typedef struct {
-  uint32_t eax;
-  uint32_t ebx;
-  uint32_t ecx;
-  uint32_t edx;
-} cpuid_result_t;
-
-#define CPUID_RESULT(a, b, c, d) {(a), (b), (c), (d)}
-#define ARRAY_SIZE(array) (sizeof(array) / sizeof((array)[0]))
-#define BIT32(bit) (UINT32_C(1) << (bit))
 #define X32_SYSCALL_BIT UINT32_C(0x40000000)
 #define X86_32_SYS_SETPGID 57
 #define X86_32_SYS_SETSID 66
-
-/* Keep these base values and indexed-leaf behavior aligned with Detcore's
- * synthetic CPU identity. DBT-specific feature masks are applied below. */
-static const cpuid_result_t basic_cpuid[] = {
-    CPUID_RESULT(0x0000000D, 0x756E6547, 0x6C65746E, 0x49656E69),
-    CPUID_RESULT(0x00000663, 0x00000800, 0x90B82201, 0x078BFBFD),
-    CPUID_RESULT(0x00000001, 0x00000000, 0x0000004D, 0x002C307D),
-    CPUID_RESULT(0x00000000, 0x00000000, 0x00000000, 0x00000000),
-    CPUID_RESULT(0x00000120, 0x01C0003F, 0x0000003F, 0x00000001),
-    CPUID_RESULT(0x00000000, 0x00000000, 0x00000003, 0x00000000),
-    CPUID_RESULT(0x00000000, 0x00000000, 0x00000000, 0x00000000),
-    CPUID_RESULT(0x00000000, 0x00180FB9, 0x00000000, 0x00000000),
-    CPUID_RESULT(0x00000000, 0x00000000, 0x00000000, 0x00000000),
-    CPUID_RESULT(0x00000000, 0x00000000, 0x00000000, 0x00000000),
-    CPUID_RESULT(0x00000000, 0x00000000, 0x00000000, 0x00000000),
-    CPUID_RESULT(0x00000000, 0x00000001, 0x00000100, 0x00000001),
-    CPUID_RESULT(0x00000000, 0x00000000, 0x00000000, 0x00000000),
-    CPUID_RESULT(0x00000000, 0x00000000, 0x00000000, 0x00000000),
-};
-
-static const cpuid_result_t extended_cpuid[] = {
-    CPUID_RESULT(0x8000000A, 0x756E6547, 0x6C65746E, 0x49656E69),
-    CPUID_RESULT(0x00000663, 0x00000000, 0x00000001, 0x20100800),
-    CPUID_RESULT(0x554D4551, 0x72695620, 0x6C617574, 0x55504320),
-    CPUID_RESULT(0x72657620, 0x6E6F6973, 0x352E3220, 0x0000002B),
-    CPUID_RESULT(0x00000000, 0x00000000, 0x00000000, 0x00000000),
-    CPUID_RESULT(0x01FF01FF, 0x01FF01FF, 0x40020140, 0x40020140),
-    CPUID_RESULT(0x00000000, 0x42004200, 0x02008140, 0x00808140),
-    CPUID_RESULT(0x00000000, 0x00000000, 0x00000000, 0x00000000),
-    CPUID_RESULT(0x00003028, 0x00000000, 0x00000000, 0x00000000),
-    CPUID_RESULT(0x00000000, 0x00000000, 0x00000000, 0x00000000),
-    CPUID_RESULT(0x00000000, 0x00000000, 0x00000000, 0x00000000),
-};
-
-#define LEAF7_EBX_TSX (BIT32(4) | BIT32(11))
-#define LEAF7_EBX_AVX512                                                   \
-  (BIT32(16) | BIT32(17) | BIT32(21) | BIT32(26) | BIT32(27) | BIT32(28) | \
-   BIT32(30) | BIT32(31))
-#define LEAF7_ECX_AVX512 \
-  (BIT32(1) | BIT32(6) | BIT32(11) | BIT32(12) | BIT32(14))
-#define LEAF7_EDX_AVX512 (BIT32(2) | BIT32(3) | BIT32(8) | BIT32(23))
 
 // Emits a pre-formatted line of tool output through DynamoRIO's own I/O. The
 // simple observation tools (syscall histogram, strace) call back through this
@@ -304,7 +253,7 @@ static const cpuid_result_t extended_cpuid[] = {
 // exit, and app-level writes re-enter the syscall interception path.
 typedef void (*reverie_emit_fn_t)(const char* buf, size_t len);
 typedef void (*reverie_idle_fn_t)(void);
-#define REVERIE_DBT_RUNTIME_ABI_VERSION 8u
+#define REVERIE_DBT_RUNTIME_ABI_VERSION 9u
 #define REVERIE_DBT_STARTUP_STANDALONE 1u
 #define REVERIE_DBT_STARTUP_COORDINATED 2u
 // TODO-HUMAN-REVIEW(PR-162): Review the additive stdout-emit runtime callback
@@ -455,6 +404,23 @@ extern int32_t reverie_dbt_runtime_rdtsc(
     reverie_emit_fn_t emit,
     uint64_t* tsc,
     uint32_t* aux);
+// Answers one cpuid for leaf and subleaf: 1 with registers[0..3] written as
+// EAX, EBX, ECX and EDX, negative on failure (ABI version 9). The client has no
+// CPUID table of its own; under Detcore the answer is Detcore's machine
+// description, the one /proc/cpuinfo is rendered from.
+extern int32_t reverie_dbt_runtime_cpuid(
+    void* context,
+    prototype_counters_t* counters,
+    int32_t tid,
+    int32_t pid,
+    uint64_t branches,
+    uint32_t leaf,
+    uint32_t subleaf,
+    syscall_invoker_t invoke_syscall,
+    register_reader_t read_registers,
+    register_writer_t write_registers,
+    reverie_emit_fn_t emit,
+    uint32_t registers[4]);
 extern const char* reverie_dbt_runtime_name(void);
 extern uint8_t reverie_dbt_runtime_kind_code(void);
 extern void reverie_dbt_runtime_totals(
@@ -1665,49 +1631,6 @@ static void* resource_lock;
 static bool read_app(const void* address, void* value, size_t size);
 static bool write_app(void* address, const void* value, size_t size);
 
-static bool cpuid_leaf_uses_subleaf(uint32_t leaf) {
-  return leaf == UINT32_C(0x04) || leaf == UINT32_C(0x07) ||
-      leaf == UINT32_C(0x0b) || leaf == UINT32_C(0x0d);
-}
-
-static cpuid_result_t deterministic_cpuid(uint32_t leaf, uint32_t subleaf) {
-  cpuid_result_t result = {0};
-
-  if (leaf < ARRAY_SIZE(basic_cpuid)) {
-    result = basic_cpuid[leaf];
-  } else if (
-      leaf >= UINT32_C(0x80000000) &&
-      leaf - UINT32_C(0x80000000) < ARRAY_SIZE(extended_cpuid)) {
-    result = extended_cpuid[leaf - UINT32_C(0x80000000)];
-  }
-
-  if (subleaf != 0 && cpuid_leaf_uses_subleaf(leaf))
-    return (cpuid_result_t){0};
-  if (leaf == 1)
-    result.ecx &= ~BIT32(30); /* RDRAND */
-  if (leaf == 7) {
-    result.ebx &= ~(LEAF7_EBX_TSX | BIT32(18) | LEAF7_EBX_AVX512);
-    result.ecx &= ~LEAF7_ECX_AVX512;
-    result.edx &= ~LEAF7_EDX_AVX512;
-  }
-  return result;
-}
-
-static void emulate_cpuid(void) {
-  void* drcontext = dr_get_current_drcontext();
-  dr_mcontext_t registers = {sizeof(registers), DR_MC_INTEGER};
-  cpuid_result_t result;
-
-  DR_ASSERT(dr_get_mcontext(drcontext, &registers));
-  result =
-      deterministic_cpuid((uint32_t)registers.xax, (uint32_t)registers.xcx);
-  registers.xax = result.eax;
-  registers.xbx = result.ebx;
-  registers.xcx = result.ecx;
-  registers.xdx = result.edx;
-  DR_ASSERT(dr_set_mcontext(drcontext, &registers));
-}
-
 static dr_emit_flags_t rewrite_cpuid(
     void* drcontext,
     void* tag,
@@ -1802,6 +1725,59 @@ static uint64_t guest_tsc(void* drcontext, bool with_aux, uint32_t* aux) {
     }
   }
   return next_virtual_tsc();
+}
+
+// Emulate cpuid by asking the runtime's tool, as guest_tsc asks it for the
+// TSC. A copied child runs no runtime, so it has no machine description to
+// answer from; its CPUID is refused by name rather than answered from a
+// second table.
+static void emulate_cpuid(void) {
+  void* drcontext = dr_get_current_drcontext();
+  dr_mcontext_t registers = {sizeof(registers), DR_MC_INTEGER};
+  uint32_t result[4] = {0};
+  int32_t answered = -1;
+
+  DR_ASSERT(dr_get_mcontext(drcontext, &registers));
+  if (!has_copied_runtime() ||
+      (runtime_uses_external_global() && !is_copied_vfork_process())) {
+    prototype_counters_t* counters = (prototype_counters_t*)drmgr_get_tls_field(
+        drcontext, thread_state_index);
+    DR_ASSERT(counters != NULL);
+    if (!has_copied_runtime())
+      ensure_runtime_background();
+    while (!reverie_dbt_runtime_ready(
+        atomic_load_explicit(&image_generation, memory_order_acquire)))
+      dr_sleep(1);
+    evidence_callback_enter();
+    answered = reverie_dbt_runtime_cpuid(
+        drcontext,
+        counters,
+        (int32_t)dr_get_thread_id(drcontext),
+        (int32_t)dr_get_process_id(),
+        atomic_load_explicit(&branch_count, memory_order_relaxed),
+        (uint32_t)registers.xax,
+        (uint32_t)registers.xcx,
+        invoke_syscall,
+        read_registers,
+        write_registers,
+        reverie_dbt_emit,
+        result);
+    evidence_callback_leave();
+  } else {
+    dr_fprintf(
+        diagnostic_file,
+        "reverie-dbt: refusing cpuid in a copied child, which runs no runtime "
+        "to answer it from the machine description\n");
+  }
+  if (answered != 1) {
+    exit_runtime_tree(101);
+    return;
+  }
+  registers.xax = result[0];
+  registers.xbx = result[1];
+  registers.xcx = result[2];
+  registers.xdx = result[3];
+  DR_ASSERT(dr_set_mcontext(drcontext, &registers));
 }
 
 // Emulate rdtsc: return the 64-bit TSC in EDX:EAX, leaving all other
