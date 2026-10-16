@@ -81,7 +81,6 @@ pub fn names_descriptor(number: i64, args: &[u64; 6], fd: u64) -> bool {
         | libc::SYS_fanotify_mark
         | libc::SYS_setns
         | libc::SYS_pidfd_send_signal
-        | libc::SYS_pidfd_getfd
         | libc::SYS_process_madvise
         | libc::SYS_process_mrelease
         | libc::SYS_finit_module
@@ -98,8 +97,44 @@ pub fn names_descriptor(number: i64, args: &[u64; 6], fd: u64) -> bool {
         libc::SYS_dup2 | libc::SYS_dup3 => is(0) || is(1),
         libc::SYS_splice | libc::SYS_copy_file_range => is(0) || is(2),
         libc::SYS_tee => is(0) || is(1),
+        // The pidfd, and the number it copies from the target's table, which
+        // aliases a reserved descriptor when the target is this process or a
+        // fork of it.
+        libc::SYS_pidfd_getfd => is(0) || is(1),
+        // Calls whose descriptor argument is always one.
+        libc::SYS_io_uring_enter | libc::SYS_io_uring_register | libc::SYS_fsconfig => is(0),
+        // `*at` calls that act on the directory descriptor itself when given
+        // `AT_EMPTY_PATH` (glibc's `fstat` is `newfstatat(fd, "", ...,
+        // AT_EMPTY_PATH)`), or `utimensat` with a null path. Without either
+        // the descriptor is used only for a relative path, which would take a
+        // guest-memory read to tell from an absolute one, so those calls are
+        // not checked and run as Linux runs them.
+        libc::SYS_newfstatat | libc::SYS_fchmodat2 => empty_path(args[3]) && is(0),
+        libc::SYS_statx | libc::SYS_open_tree => empty_path(args[2]) && is(0),
+        libc::SYS_execveat
+        | libc::SYS_fchownat
+        | libc::SYS_linkat
+        | libc::SYS_name_to_handle_at => empty_path(args[4]) && is(0),
+        libc::SYS_faccessat2 => empty_path(args[3]) && is(0),
+        libc::SYS_utimensat => args[1] == 0 && is(0),
+        // fspick(FSPICK_EMPTY_PATH); move_mount(MOVE_MOUNT_F_EMPTY_PATH) for
+        // its source and MOVE_MOUNT_T_EMPTY_PATH for its target.
+        libc::SYS_fspick => args[2] & FSPICK_EMPTY_PATH != 0 && is(0),
+        libc::SYS_move_mount => {
+            (args[4] & MOVE_MOUNT_F_EMPTY_PATH != 0 && is(0))
+                || (args[4] & MOVE_MOUNT_T_EMPTY_PATH != 0 && is(2))
+        }
         _ => false,
     }
+}
+
+const FSPICK_EMPTY_PATH: u64 = 0x8;
+const MOVE_MOUNT_F_EMPTY_PATH: u64 = 0x4;
+const MOVE_MOUNT_T_EMPTY_PATH: u64 = 0x40;
+
+/// Whether `*at` flags `flags` hold `AT_EMPTY_PATH`.
+fn empty_path(flags: u64) -> bool {
+    flags & libc::AT_EMPTY_PATH as u64 != 0
 }
 
 /// Whether syscall `number` shuts down, configures, connects, or sends or
@@ -299,6 +334,65 @@ mod tests {
         ];
         assert!(names_descriptor(libc::SYS_mmap, &file, 7));
         assert!(!names_descriptor(libc::SYS_mmap, &anonymous, 7));
+    }
+
+    #[test]
+    fn an_at_call_names_its_descriptor_only_when_it_acts_on_it() {
+        let empty = libc::AT_EMPTY_PATH as u64;
+        // glibc's fstat.
+        assert!(names_descriptor(
+            libc::SYS_newfstatat,
+            &[9, 0, 0, empty, 0, 0],
+            9
+        ));
+        // A path relative to, or ignoring, the descriptor: run as Linux runs it.
+        assert!(!names_descriptor(
+            libc::SYS_newfstatat,
+            &[9, 0, 0, 0, 0, 0],
+            9
+        ));
+        assert!(!names_descriptor(libc::SYS_openat, &[9, 0, 0, 0, 0, 0], 9));
+        assert!(names_descriptor(
+            libc::SYS_statx,
+            &[9, 0, empty, 0, 0, 0],
+            9
+        ));
+        assert!(names_descriptor(
+            libc::SYS_execveat,
+            &[9, 0, 0, 0, empty, 0],
+            9
+        ));
+        assert!(names_descriptor(
+            libc::SYS_utimensat,
+            &[9, 0, 0, 0, 0, 0],
+            9
+        ));
+        assert!(!names_descriptor(
+            libc::SYS_utimensat,
+            &[9, 0x1000, 0, 0, 0, 0],
+            9
+        ));
+        assert!(names_descriptor(
+            libc::SYS_move_mount,
+            &[0, 0, 9, 0, 0x40, 0],
+            9
+        ));
+        assert!(!names_descriptor(
+            libc::SYS_move_mount,
+            &[0, 0, 9, 0, 0x4, 0],
+            9
+        ));
+        assert!(names_descriptor(
+            libc::SYS_io_uring_enter,
+            &[9, 0, 0, 0, 0, 0],
+            9
+        ));
+        // pidfd_getfd's copied number.
+        assert!(names_descriptor(
+            libc::SYS_pidfd_getfd,
+            &[3, 9, 0, 0, 0, 0],
+            9
+        ));
     }
 
     #[test]

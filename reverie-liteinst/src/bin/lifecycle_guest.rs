@@ -1980,7 +1980,9 @@ fn tool_output_fd(reserved: libc::c_int, peer: libc::c_int) {
     let before = link();
     let errno = || std::io::Error::last_os_error().raw_os_error();
     unsafe {
-        assert_eq!(libc::close(reserved), 0);
+        // Not open as far as the guest knows: close fails as on such a number.
+        assert_eq!(libc::close(reserved), -1);
+        assert_eq!(errno(), Some(libc::EBADF));
         assert_eq!(libc::write(reserved, b"guest".as_ptr().cast(), 5), -1);
         assert_eq!(errno(), Some(libc::EBADF));
         assert_eq!(libc::fcntl(reserved, libc::F_GETFD), -1);
@@ -2012,7 +2014,8 @@ fn tool_output_fd(reserved: libc::c_int, peer: libc::c_int) {
             -1
         );
         assert_eq!(errno(), Some(libc::EBADF));
-        assert_eq!(libc::syscall(libc::SYS_close, aliased), 0);
+        assert_eq!(libc::syscall(libc::SYS_close, aliased), -1);
+        assert_eq!(errno(), Some(libc::EBADF));
         // Operations on the file itself.
         assert_eq!(libc::ftruncate(reserved, 0), -1);
         assert_eq!(errno(), Some(libc::EBADF));

@@ -3269,9 +3269,9 @@ unsafe fn protect_compatibility_event_channel(event: &mut SyscallEvent) -> bool 
     let event_fd = EVENT_FD.load(Ordering::Acquire) as u64;
 
     if event.number == libc::SYS_close && fd_arg(event, 0) == event_fd {
-        // The descriptor is controller-owned and intentionally invisible to
-        // guest descriptor lifecycle management.
-        event.result = 0;
+        // The descriptor is controller-owned and invisible to the guest: it
+        // is not open as far as the guest knows.
+        event.result = -i64::from(libc::EBADF);
     } else if event.number == libc::SYS_close_range
         && fd_arg(event, 0) <= event_fd
         && event_fd <= fd_arg(event, 1)

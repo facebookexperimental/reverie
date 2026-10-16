@@ -10,8 +10,9 @@
 //! (the coordinator connection and the Tool's reserved output socket) and the
 //! process controls it relies on (forking when the launcher forbids it, signal
 //! actions and alternate stacks). A guest syscall that would reach one fails
-//! as Linux would fail it on a descriptor or control the guest does not have,
-//! or, for `close` and `close_range`, succeeds without touching it.
+//! as Linux would fail it on a descriptor or control the guest does not have
+//! (`close` included, with `EBADF`), and a `close_range` over one closes the
+//! rest of its range without touching it.
 
 use std::io;
 use std::sync::OnceLock;
@@ -84,10 +85,10 @@ pub fn replace_coordinator_fd(old: libc::c_int, new: libc::c_int) -> io::Result<
 /// one end of a socket pair its log records go to), to a reserved number at or
 /// above 1025 (1024 stays the coordinator connection's), closes `fd`, and
 /// returns the reserved number. From then on the runtime keeps the guest
-/// away from it exactly as it does from the coordinator connection: a guest
-/// `close` of it reports success and does nothing, a `close_range` over it
-/// spares it, and a guest `read`, `write`, `shutdown`, `send`, `setsockopt` or
-/// other descriptor operation on it fails with `EBADF`. A guest `dup2`/`dup3`
+/// away from it exactly as it does from the coordinator connection: a
+/// `close_range` over it spares it, and a guest `close`, `read`, `write`,
+/// `shutdown`, `send`, `setsockopt` or other descriptor operation on it fails
+/// with `EBADF`, as on a number the guest does not have open. A guest `dup2`/`dup3`
 /// onto its number succeeds as it would if the number were free: the runtime
 /// first moves the socket to another free number at or above 1025, so the Tool
 /// must read the current number from [`tool_output_fd`] for each use. Tool code
@@ -311,8 +312,8 @@ pub unsafe fn protect_runtime_descriptors_before_tool(event: &mut SyscallEvent) 
 /// A guest `close` or `close_range` that a Tool forwards after
 /// [`protect_runtime_descriptors_before_tool`] left it to the Tool: the same
 /// protection, applied at physical execution. A `close` of a protected
-/// descriptor returns 0 without closing it; a `close_range` over one closes
-/// the rest of its range. Returns the result to give the Tool instead of
+/// descriptor fails with `EBADF` without closing it; a `close_range` over one
+/// closes the rest of its range. Returns the result to give the Tool instead of
 /// running the call, or `None` to run the call as asked.
 ///
 /// # Safety
@@ -333,7 +334,7 @@ pub unsafe fn protect_forwarded_descriptor_change(number: i64, args: [u64; 6]) -
         return None;
     }
     if number == libc::SYS_close && protected.contains(&reserved_fds::descriptor_arg(&args, 0)) {
-        Some(0)
+        Some(-i64::from(libc::EBADF))
     } else if number == libc::SYS_close_range && reserved_fds::close_range_covers(&args, protected)
     {
         Some(unsafe { close_range_preserving_args(args, protected) })
@@ -372,7 +373,7 @@ unsafe fn protect_runtime_descriptors_inner(
         }
     }
     if event.number == libc::SYS_close && protected.contains(&fd_arg(event, 0)) {
-        event.result = 0;
+        event.result = -i64::from(libc::EBADF);
     } else if event.number == libc::SYS_close_range
         && reserved_fds::close_range_covers(&event.args, protected)
     {

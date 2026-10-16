@@ -18,7 +18,6 @@ use std::sync::atomic::Ordering::Acquire;
 
 use parking_lot::Mutex;
 use syscalls::Sysno;
-use syscalls::SysnoSet;
 
 struct ProtectedFiles {
     // We have to use Vec here to ensure `new` can be a const fn, which is
@@ -242,117 +241,34 @@ pub(crate) fn sys_close_range(
     }
 }
 
-/// All of these syscalls take the input file descriptor as the first argument.
-/// Some syscalls, like mmap, don't conform to this pattern and need to be
-/// handled in a special way.
-static FD_ARG0_SYSCALLS: SysnoSet = SysnoSet::new(&[
-    Sysno::close,
-    Sysno::dup,
-    Sysno::dup2,
-    Sysno::openat,
-    Sysno::fstat,
-    Sysno::read,
-    Sysno::write,
-    Sysno::lseek,
-    Sysno::ioctl,
-    Sysno::pread64,
-    Sysno::pwrite64,
-    Sysno::readv,
-    Sysno::writev,
-    Sysno::connect,
-    Sysno::accept,
-    Sysno::sendto,
-    Sysno::recvfrom,
-    Sysno::sendmsg,
-    Sysno::recvmsg,
-    Sysno::shutdown,
-    Sysno::bind,
-    Sysno::listen,
-    Sysno::getsockname,
-    Sysno::getpeername,
-    Sysno::getsockopt,
-    Sysno::fcntl,
-    Sysno::flock,
-    Sysno::fsync,
-    Sysno::fdatasync,
-    Sysno::ftruncate,
-    Sysno::getdents,
-    Sysno::getdents64,
-    Sysno::fchdir,
-    Sysno::fchmod,
-    Sysno::fchown,
-    Sysno::fstatfs,
-    Sysno::readahead,
-    Sysno::fsetxattr,
-    Sysno::fgetxattr,
-    Sysno::flistxattr,
-    Sysno::fremovexattr,
-    Sysno::fadvise64,
-    Sysno::epoll_wait,
-    Sysno::epoll_ctl,
-    Sysno::inotify_add_watch,
-    Sysno::inotify_rm_watch,
-    Sysno::mkdirat,
-    Sysno::mknodat,
-    Sysno::fchownat,
-    Sysno::futimesat,
-    Sysno::newfstatat,
-    Sysno::unlinkat,
-    Sysno::renameat,
-    Sysno::linkat,
-    Sysno::readlinkat,
-    Sysno::fchmodat,
-    Sysno::faccessat,
-    Sysno::sync_file_range,
-    Sysno::vmsplice,
-    Sysno::utimensat,
-    Sysno::epoll_pwait,
-    Sysno::signalfd,
-    Sysno::fallocate,
-    Sysno::timerfd_settime,
-    Sysno::timerfd_gettime,
-    Sysno::accept4,
-    Sysno::signalfd4,
-    Sysno::dup3,
-    Sysno::preadv,
-    Sysno::pwritev,
-    Sysno::recvmmsg,
-    Sysno::fanotify_mark,
-    Sysno::name_to_handle_at,
-    Sysno::open_by_handle_at,
-    Sysno::syncfs,
-    Sysno::sendmmsg,
-    Sysno::setns,
-    Sysno::finit_module,
-    Sysno::renameat2,
-    Sysno::kexec_file_load,
-    Sysno::execveat,
-    Sysno::preadv2,
-    Sysno::pwritev2,
-    Sysno::statx,
-    Sysno::pidfd_send_signal,
-    Sysno::io_uring_enter,
-    Sysno::io_uring_register,
-    Sysno::open_tree,
-    Sysno::move_mount,
-    Sysno::fsconfig,
-    Sysno::fsmount,
-    Sysno::fspick,
-    Sysno::openat2,
-    Sysno::pidfd_getfd,
-]);
-
-/// Syscalls whose second argument names a descriptor: the dup target, and
-/// `pidfd_getfd`'s descriptor in the target process. A guest that takes a copy
-/// of a protected descriptor through a pidfd of itself (or of a forked child,
-/// which holds it at the same number) would hold an unprotected alias of it.
-static FD_ARG1_SYSCALLS: SysnoSet = SysnoSet::new(&[Sysno::dup2, Sysno::dup3, Sysno::pidfd_getfd]);
-
-/// Returns true if the given syscall operates on a protected file descriptor.
-pub fn uses_protected_fd(sysno: Sysno, arg0: usize, arg1: usize) -> bool {
-    (FD_ARG0_SYSCALLS.contains(sysno) && is_protected(&(arg0 as i32)))
-        || (FD_ARG1_SYSCALLS.contains(sysno) && is_protected(&(arg1 as i32)))
+/// The result a guest syscall gets when it names a protected descriptor, by
+/// the rule every in-process backend shares ([`reverie_inguest::reserved_fds`]):
+/// to the guest a protected descriptor is not open, so a `close` of it or any
+/// call that names it fails with `EBADF`, after Linux's own `EINVAL` check of
+/// `epoll_wait`'s event count. `None` when the call names none. A `*at` call
+/// whose path is absolute does not use its directory descriptor, so it is not
+/// refused. `close_range` and a `dup2`/`dup3` onto the Tool output socket's
+/// number are handled before this is asked.
+pub fn protected_fd_result(sysno: Sysno, args: &[u64; 6]) -> Option<i64> {
+    use reverie_inguest::reserved_fds;
+    let number = i64::from(sysno.id());
+    protected_files()
+        .lock()
+        .files
+        .iter()
+        .filter_map(|fd| u32::try_from(*fd).ok().map(u64::from))
+        .find_map(|fd| {
+            if let Some(result) = reserved_fds::epoll_wait_result(number, args, fd) {
+                return Some(result);
+            }
+            let closes = number == libc::SYS_close && reserved_fds::descriptor_arg(args, 0) == fd;
+            (closes
+                || reserved_fds::names_descriptor(number, args, fd)
+                || reserved_fds::socket_call_names_descriptor(number, args, fd))
+            .then_some(-i64::from(libc::EBADF))
+        })
 }
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -384,16 +300,15 @@ mod tests {
         let mut fds = [0; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
         protect_raw_fd(fds[0]);
-        assert!(uses_protected_fd(
-            Sysno::pidfd_getfd,
-            usize::MAX,
-            fds[0] as usize
-        ));
-        assert!(!uses_protected_fd(
-            Sysno::pidfd_getfd,
-            usize::MAX,
-            fds[1] as usize
-        ));
+        let ebadf = Some(-i64::from(libc::EBADF));
+        assert_eq!(
+            protected_fd_result(Sysno::pidfd_getfd, &[u64::MAX, fds[0] as u64, 0, 0, 0, 0]),
+            ebadf
+        );
+        assert_eq!(
+            protected_fd_result(Sysno::pidfd_getfd, &[u64::MAX, fds[1] as u64, 0, 0, 0, 0]),
+            None
+        );
         unprotect_raw_fd(fds[0]);
         unsafe {
             libc::close(fds[0]);
@@ -508,7 +423,10 @@ mod tests {
         let protected = protect_with(|| Ok::<RawFd, std::convert::Infallible>(fd)).unwrap();
 
         assert!(is_protected(&fd));
-        assert!(uses_protected_fd(Sysno::close, fd as usize, 0));
+        assert_eq!(
+            protected_fd_result(Sysno::close, &[fd as u64, 0, 0, 0, 0, 0]),
+            Some(-i64::from(libc::EBADF))
+        );
 
         drop(protected);
         assert!(

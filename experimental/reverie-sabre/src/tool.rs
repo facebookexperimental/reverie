@@ -261,11 +261,16 @@ impl SyscallExt for Syscall {
             Ok(0)
         } else if sysno == Sysno::close_range {
             protected_files::sys_close_range(args.arg0, args.arg1, args.arg2)
-        } else if uses_protected_fd(sysno, args.arg0, args.arg1, args.arg2) {
-            // If this syscall operates on a protected file descriptor, we
-            // should return EBADF to indicate that the file descriptor isn't
-            // opened (even if it really is).
-            Err(Errno::EBADF)
+        } else if let Some(result) = protected_fd_result(
+            sysno,
+            [
+                args.arg0, args.arg1, args.arg2, args.arg3, args.arg4, args.arg5,
+            ]
+            .map(|arg| arg as u64),
+        ) {
+            // To the guest a protected descriptor is not open, even if it
+            // really is.
+            Err(Errno::new(-result as i32))
         } else {
             syscall!(
                 sysno, args.arg0, args.arg1, args.arg2, args.arg3, args.arg4, args.arg5
@@ -274,18 +279,23 @@ impl SyscallExt for Syscall {
     }
 }
 
-/// Whether a guest syscall reaches a protected descriptor, and so fails with
-/// `EBADF`. A `dup2`/`dup3` onto the tool-output socket's number first moves
-/// the socket, so the guest's call runs as it would on a free number; one the
-/// kernel fails anyway runs natively, without touching the socket.
-fn uses_protected_fd(sysno: Sysno, arg0: usize, arg1: usize, arg2: usize) -> bool {
+/// The result of a guest syscall that reaches a protected descriptor
+/// ([`protected_files::protected_fd_result`]), or `None` to run it. A
+/// `dup2`/`dup3` onto the tool-output socket's number first moves the socket,
+/// so the guest's call runs as it would on a free number; one the kernel fails
+/// anyway runs natively, without touching the socket.
+fn protected_fd_result(sysno: Sysno, args: [u64; 6]) -> Option<i64> {
     if sysno == Sysno::dup2 || sysno == Sysno::dup3 {
-        let flags = if sysno == Sysno::dup3 { arg2 } else { 0 };
-        if tool_output::before_guest_dup_onto(arg0 as i32, arg1 as i32, flags)
+        let flags = if sysno == Sysno::dup3 {
+            args[2] as usize
+        } else {
+            0
+        };
+        if tool_output::before_guest_dup_onto(args[0] as i32, args[1] as i32, flags)
             == tool_output::GuestDup::Native
         {
-            return false;
+            return None;
         }
     }
-    protected_files::uses_protected_fd(sysno, arg0, arg1)
+    protected_files::protected_fd_result(sysno, &args)
 }

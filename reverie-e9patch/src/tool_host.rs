@@ -637,10 +637,9 @@ fn forward_nested_tool_syscall(event: &mut SyscallEvent, coordinator_fd: libc::c
 // TODO-HUMAN-REVIEW(PR-269): Review coordinator-channel
 // descriptor virtualization.
 /// Keeps `event` away from the coordinator connection by the rule every
-/// in-process backend shares ([`reserved_fds`]): a `close` of it returns 0
-/// without closing it, a `close_range` over it closes the rest of its range,
-/// and any other call naming it fails with `EBADF`, as on a descriptor the
-/// guest does not have. The socket calls (send, recv, shutdown and the like)
+/// in-process backend shares ([`reserved_fds`]): a `close_range` over it
+/// closes the rest of its range, and a `close` or any other call naming it
+/// fails with `EBADF`, as on a descriptor the guest does not have. The socket calls (send, recv, shutdown and the like)
 /// are refused for guest syscalls only (`guest_syscall`): the Tool's own client
 /// uses the connection through them. Returns whether `event` was handled here.
 fn protect_coordinator_channel(
@@ -652,7 +651,7 @@ fn protect_coordinator_channel(
     let number = event.number();
     let args = event.args();
     if number == libc::SYS_close && reserved_fds::descriptor_arg(&args, 0) == fd {
-        event.set_result(0);
+        event.fail(libc::EBADF);
     } else if number == libc::SYS_close_range && reserved_fds::close_range_covers(&args, &[fd]) {
         event.set_result(close_range_preserving_fd(args, fd));
     } else if let Some(result) = reserved_fds::epoll_wait_result(number, &args, fd) {
