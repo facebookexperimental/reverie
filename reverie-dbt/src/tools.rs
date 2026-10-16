@@ -545,6 +545,32 @@ impl Tool for SetRegTool {
         }
         let (number, args) = syscall.into_parts();
         if number == Sysno::prctl && args.arg0 as u64 == KERNEL_IDENTITY_PRCTL {
+            if matches!(args.arg1 as i64, libc::SYS_getpgid | libc::SYS_getsid) {
+                let target = args.arg2 as libc::pid_t;
+                // This independent kernel observation runs on the application
+                // callback thread and bypasses the native membership screen.
+                let kernel = unsafe { libc::syscall(args.arg1 as libc::c_long, target) };
+                let kernel = if kernel == -1 {
+                    -i64::from(std::io::Error::last_os_error().raw_os_error().unwrap())
+                } else {
+                    kernel
+                };
+                let injected = guest
+                    .inject(Syscall::from_raw(
+                        Sysno::from(args.arg1 as i32),
+                        SyscallArgs::new(args.arg2, 0, 0, 0, 0, 0),
+                    ))
+                    .await
+                    .unwrap_or_else(|errno| -i64::from(errno.into_raw()));
+                emit_line(&format!(
+                    "reverie-dbt-test: kernel-group-query sysnum={} target={target} kernel={kernel} injected={injected}",
+                    args.arg1,
+                ));
+                if injected != kernel {
+                    return Err(reverie::syscalls::Errno::EIO.into());
+                }
+                return Ok(injected);
+            }
             let (query, adapter) = match args.arg1 as i64 {
                 libc::SYS_getpid => (Sysno::getpid, Some(i64::from(guest.pid().as_raw()))),
                 // Guest::ppid is traced-tree membership: the root has None.
