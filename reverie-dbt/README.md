@@ -8,19 +8,13 @@ native DynamoRIO client:
 - replaces application `CPUID` instructions with Hermit's deterministic CPU
   identity, masking RDRAND, RDSEED, TSX, and AVX-512 features;
 - receives all application syscall entry events without ptrace;
-- rewrites every host-derived `uname` field (including `nodename` and `version`)
-  and zero-port `bind` calls with Hermit's deterministic values;
 - disables guest ASLR so non-fixed mappings remain stable;
-- substitutes minimal stable snapshots for volatile `/proc` views;
-- derives `getrandom` and random-device bytes from Hermit's configured RNG seed
-  using a layout-independent stream (indexed by seed and position, not by the
-  destination address), and follows random descriptors across the `read`/`pread`/
-  `readv`/`preadv` family and `dup`/`fcntl(F_DUPFD)` duplication;
-- virtualizes `getrusage` and `sysinfo` process metadata;
 - routes `open`/`openat`/`creat`, `read`/`write`/`close`, the legacy and modern
-  stat variants, `lseek`, and `access`/`faccessat`/`faccessat2` through the Rust
-  `PrototypeTool` and `Guest::inject`, returning the injected result while
-  suppressing the original syscall;
+  stat variants, `lseek`, `access`/`faccessat`/`faccessat2` and a few others
+  through a forwarding Rust tool (`PrototypeTool`) and `Guest::inject`,
+  returning the injected result while suppressing the original syscall. The
+  tool counts these calls and changes none of them: determinism is Detcore's
+  job, reached through Hermit's runtime, not this standalone one's;
 - launches shebang programs through their interpreter while preserving the exact
   guest environment; and
 - optionally reports process totals when the application exits.
