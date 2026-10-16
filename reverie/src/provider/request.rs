@@ -8,7 +8,7 @@
 
 //! The raw syscall request a provider executes.
 
-use reverie::syscalls::SyscallInfo;
+use crate::syscalls::SyscallInfo;
 
 /// A Linux syscall request transported from guest to host memory.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

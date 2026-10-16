@@ -377,7 +377,6 @@ rust_library(
         "cargo_toml_dir": "reverie-linux-provider",
     },
     deps = [
-        "fbsource//third-party/rust:libc",
         ":reverie",
     ],
 )
@@ -417,7 +416,6 @@ rust_library(
         ":reverie",
         ":reverie-kvm-core",
         ":reverie-kvm-terminal-read",
-        ":reverie-linux-provider",
     ],
 )
 

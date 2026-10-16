@@ -1590,7 +1590,6 @@ dependencies = [
  "perf-event-open-sys",
  "reverie-core",
  "reverie-kvm-core",
- "reverie-linux-provider",
  "serde",
  "thiserror 2.0.21",
 ]
@@ -1609,7 +1608,6 @@ dependencies = [
 name = "reverie-linux-provider"
 version = "0.4.1"
 dependencies = [
- "libc",
  "reverie-core",
 ]
 

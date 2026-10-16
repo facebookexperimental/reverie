@@ -15,5 +15,4 @@ keywords = ["linux", "instrumentation", "hermit"]
 categories = ["development-tools::debugging", "os::linux-apis"]
 
 [dependencies]
-libc = "0.2.186"
 reverie = { version = "0.4.1", path = "../reverie", package = "reverie-core" }

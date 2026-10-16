@@ -42,6 +42,11 @@
 //!    backend; the [`Backend`] trait spells out exactly what any alternative
 //!    backend must provide.
 //!
+//! The [`provider`] module defines the interface of the Linux syscall
+//! provider beneath a backend's `Guest::inject`: the
+//! [`provider::LinuxProvider`] trait and the memory interfaces it uses. Today
+//! only the KVM backend implements and calls it; see the module documentation.
+//!
 //! For examples of usage, please see the [`reverie-examples`][] folder.
 //!
 //! See also [`README.md`][] for a high-level overview of Reverie.
@@ -67,6 +72,7 @@ mod inherited_input;
 #[cfg(target_arch = "x86_64")]
 pub mod pmu;
 mod process_signal_control;
+pub mod provider;
 #[cfg(target_arch = "x86_64")]
 mod rdtsc;
 mod regs;

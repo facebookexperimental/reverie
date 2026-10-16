@@ -26,7 +26,6 @@ libc = "0.2.186"
 perf-event-open-sys = "5.0"
 reverie = { version = "0.4.1", path = "../reverie", package = "reverie-core" }
 reverie-kvm-core = { version = "0.4.1", path = "../reverie-kvm-core" }
-reverie-linux-provider = { version = "0.4.1", path = "../reverie-linux-provider" }
 thiserror = "2.0.18"
 
 [dev-dependencies]

@@ -8,24 +8,25 @@
 
 //! reverie-kvm's implementation of the provider memory interfaces
 //! ([`GuestMemoryAccess`] and [`AddressSpace`], defined with their contracts
-//! in the reverie-linux-provider crate) for the KVM guest arena
+//! in Reverie's core as `reverie::provider`) for the KVM guest arena
 //! ([`GuestMemory`]).
 //!
 //! The traits are step U1 of the minimal provider seam
 //! (<https://github.com/rrnewton/hermit/issues/4485>, epic
-//! <https://github.com/rrnewton/hermit/issues/4492>) and moved to their own
-//! crate in step U6a. The syscall executor's handlers are generic over them
-//! with the error type fixed to [`crate::Error`].
+//! <https://github.com/rrnewton/hermit/issues/4492>), moved to their own
+//! crate in step U6a and into Reverie's core in step E1. The syscall
+//! executor's handlers are generic over them with the error type fixed to
+//! [`crate::Error`].
 
-pub(crate) use reverie_linux_provider::Access;
-pub(crate) use reverie_linux_provider::AddressSpace;
-pub(crate) use reverie_linux_provider::Discarded;
-pub(crate) use reverie_linux_provider::GuestMemoryAccess;
-pub(crate) use reverie_linux_provider::LentOperand;
-pub(crate) use reverie_linux_provider::LentOperandMut;
-pub(crate) use reverie_linux_provider::MapError;
-pub(crate) use reverie_linux_provider::RangeState;
-pub(crate) use reverie_linux_provider::UserLayout;
+pub(crate) use reverie::provider::Access;
+pub(crate) use reverie::provider::AddressSpace;
+pub(crate) use reverie::provider::Discarded;
+pub(crate) use reverie::provider::GuestMemoryAccess;
+pub(crate) use reverie::provider::LentOperand;
+pub(crate) use reverie::provider::LentOperandMut;
+pub(crate) use reverie::provider::MapError;
+pub(crate) use reverie::provider::RangeState;
+pub(crate) use reverie::provider::UserLayout;
 
 use crate::GuestMemory;
 use crate::Result;

@@ -8,16 +8,17 @@
 
 //! The Linux syscall provider under `Guest::inject`, as reverie-kvm uses it:
 //! the provider-neutral core [`LinuxProvider`] (with [`ProviderOutcome`]),
-//! defined with its rules in the reverie-linux-provider crate, and the
+//! defined with its rules in Reverie's core as `reverie::provider`, and the
 //! LinuxEmu-specific extensions [`LinuxEmuSignalControl`] and
 //! [`LinuxEmuMemoryMap`] that today's executor still needs.
 //!
 //! The split is step 2 of the minimal provider seam
 //! (<https://github.com/rrnewton/hermit/issues/4485>, epic
 //! <https://github.com/rrnewton/hermit/issues/4492>); step U6a moved the core
-//! to its own crate. The KVM backend's injection adapter
-//! (`GuestSyscallExecutor` in `runtime.rs`) used to be one 38-method trait
-//! mixing three different things. It is now split by meaning:
+//! to its own crate, and step E1 moved it into Reverie's core. The KVM
+//! backend's injection adapter (`GuestSyscallExecutor` in `runtime.rs`) used
+//! to be one 38-method trait mixing three different things. It is now split
+//! by meaning:
 //!
 //! - [`LinuxProvider`]: what any kernel that executes Linux syscalls for a
 //!   guest can answer, whether it is today's emulator, the host kernel, or a
@@ -39,13 +40,13 @@
 //! The two extension traits are crate-private; nothing in Reverie's public
 //! `Tool`, `Guest` or backend contract changes. The rules every provider is
 //! held to (one provider per run, concurrency, the error model and the
-//! determinism obligations) are stated on the reverie-linux-provider crate.
+//! determinism obligations) are stated on the `reverie::provider` module.
 
 use reverie::SignalEvent;
+pub(crate) use reverie::provider::LinuxProvider;
+pub(crate) use reverie::provider::ProviderOutcome;
+pub(crate) use reverie::provider::SyscallRequest as ProviderRequest;
 use reverie::syscalls::Errno;
-pub(crate) use reverie_linux_provider::LinuxProvider;
-pub(crate) use reverie_linux_provider::ProviderOutcome;
-pub(crate) use reverie_linux_provider::SyscallRequest as ProviderRequest;
 
 use crate::Error;
 #[cfg(doc)]

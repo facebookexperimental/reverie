@@ -196,7 +196,7 @@ pub trait GuestMemoryAccess {
 
     /// The `access_ok` rule the syscall layer applies before any copy: the
     /// end of the user address space and Linux's single-vector clamp.
-    fn user_address_limit(&self) -> reverie::UserAddressLimit;
+    fn user_address_limit(&self) -> crate::UserAddressLimit;
 }
 
 /// The mapping state of a guest user range, as [`AddressSpace::query`]

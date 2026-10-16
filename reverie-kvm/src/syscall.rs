@@ -35,13 +35,13 @@ pub(crate) const FRAME_SIZE: usize = WORD_SIZE * FRAME_WORDS;
 /// A Linux syscall request transported from guest to host memory.
 ///
 /// Since step U6a of the provider seam this wraps the provider-neutral
-/// [`reverie_linux_provider::SyscallRequest`] (`repr(transparent)`), so the
+/// [`reverie::provider::SyscallRequest`] (`repr(transparent)`), so the
 /// backend hands a request to a provider by reference, with no copy, while
 /// reverie-kvm's public API stays inherent and unchanged. `Debug` prints the
 /// wrapped request, which has the same name and fields as before.
 #[derive(Clone, Copy, Eq, PartialEq)]
 #[repr(transparent)]
-pub struct SyscallRequest(reverie_linux_provider::SyscallRequest);
+pub struct SyscallRequest(reverie::provider::SyscallRequest);
 
 impl std::fmt::Debug for SyscallRequest {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -52,14 +52,12 @@ impl std::fmt::Debug for SyscallRequest {
 impl SyscallRequest {
     /// Creates a request from a Linux syscall number and its six ABI arguments.
     pub const fn new(number: u64, args: [u64; 6]) -> Self {
-        Self(reverie_linux_provider::SyscallRequest::new(number, args))
+        Self(reverie::provider::SyscallRequest::new(number, args))
     }
 
     /// Creates a transport request from a shared Reverie syscall.
     pub fn from_syscall<S: SyscallInfo>(syscall: S) -> Self {
-        Self(reverie_linux_provider::SyscallRequest::from_syscall(
-            syscall,
-        ))
+        Self(reverie::provider::SyscallRequest::from_syscall(syscall))
     }
 
     /// Returns the Linux syscall number.
@@ -73,15 +71,15 @@ impl SyscallRequest {
     }
 
     /// The provider-neutral request this wraps, for a provider call.
-    pub(crate) const fn as_provider(&self) -> &reverie_linux_provider::SyscallRequest {
+    pub(crate) const fn as_provider(&self) -> &reverie::provider::SyscallRequest {
         &self.0
     }
 
     /// Views a provider-neutral request as reverie-kvm's request, without a
     /// copy.
-    pub(crate) fn from_provider(request: &reverie_linux_provider::SyscallRequest) -> &Self {
+    pub(crate) fn from_provider(request: &reverie::provider::SyscallRequest) -> &Self {
         // SAFETY: `SyscallRequest` is `repr(transparent)` over
-        // `reverie_linux_provider::SyscallRequest`, so both have the same
+        // `reverie::provider::SyscallRequest`, so both have the same
         // layout and alignment, and the returned reference borrows `request`.
         unsafe { &*std::ptr::from_ref(request).cast::<Self>() }
     }
