@@ -8945,7 +8945,7 @@ impl<L: Tool + 'static> TracedTask<L> {
 
 #[async_trait]
 impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
-    type Memory = Stopped;
+    type Memory = crate::tool_memory::ToolMemory;
     type Stack = GuestStack;
 
     fn signal_info(&self) -> Option<[u8; reverie::SIGNAL_INFO_SIZE]> {
@@ -8999,7 +8999,7 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
     }
 
     fn memory(&self) -> Self::Memory {
-        self.assume_stopped()
+        crate::tool_memory::ToolMemory::new(self.assume_stopped())
     }
 
     async fn regs(&mut self) -> libc::user_regs_struct {
