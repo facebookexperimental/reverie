@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Read-only group/session/policy/priority queries can name live tasks outside the DBT client.
+//! Read-only group/session/policy/priority/parameter queries can name live tasks outside the DBT client.
 
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -51,6 +51,30 @@ fn raw_priority(which: libc::c_long, who: libc::c_long) -> i64 {
     } else {
         result
     }
+}
+
+const PARAMETER_SENTINEL: u32 = 0x1357_9bdf;
+
+fn raw_parameter(target: libc::c_long, pointer_kind: usize) -> (i64, u32) {
+    assert_eq!(std::mem::size_of::<libc::sched_param>(), 4);
+    let mut output = [0x2468_ace0_u32, PARAMETER_SENTINEL, 0xfdb9_7531];
+    let address = match pointer_kind {
+        0 => &mut output[1] as *mut u32,
+        1 => std::ptr::null_mut(),
+        2 => std::ptr::without_provenance_mut::<u32>(1),
+        _ => unreachable!(),
+    };
+    // The output is independent of every fixture and returning-injection buffer.
+    // NULL and address 1 remain literal Linux error controls.
+    let result = unsafe { libc::syscall(libc::SYS_sched_getparam, target, address) };
+    let result = if result == -1 {
+        -i64::from(std::io::Error::last_os_error().raw_os_error().unwrap())
+    } else {
+        result
+    };
+    assert_eq!(output[0], 0x2468_ace0);
+    assert_eq!(output[2], 0xfdb9_7531);
+    (result, output[1])
 }
 
 fn compare_with_linux(mode: &str) {
@@ -137,7 +161,19 @@ fn compare_with_linux(mode: &str) {
     );
     // nice19 can make self and target equal. Do not require value-based target
     // discrimination: the live target and exact raw arguments are the witness.
-    let arguments = [
+    let parameter_targets = [0, own_pid, i64::from(pid), i64::from(i32::MAX), -1, 0, 0];
+    let pointer_kinds = [0, 0, 0, 0, 0, 1, 2];
+    let parameter_values: Vec<_> = parameter_targets
+        .iter()
+        .zip(pointer_kinds)
+        .map(|(&target, pointer_kind)| raw_parameter(target, pointer_kind))
+        .collect();
+    assert_eq!(
+        parameter_values[2],
+        (0, 0),
+        "held SCHED_BATCH target must write all four bytes"
+    );
+    let mut arguments = vec![
         pid.to_string(),
         pgid.to_string(),
         sid.to_string(),
@@ -145,6 +181,10 @@ fn compare_with_linux(mode: &str) {
         priority_values[2].to_string(),
         priority_values[0].to_string(),
     ];
+    for &(result, bytes) in &parameter_values {
+        arguments.push(result.to_string());
+        arguments.push(format!("{bytes:08x}"));
+    }
     let mut expected = format!(
         "getpgid live={pgid} errno=0\ngetpgid zero-is-self=1\n\
          getpgid negative rc=-1 errno={}\ngetpgid absent rc=-1 errno={}\n\
@@ -173,6 +213,13 @@ fn compare_with_linux(mode: &str) {
     for (label, &value) in priority_labels.iter().zip(&priority_values) {
         let (rc, error) = if value < 0 { (-1, -value) } else { (value, 0) };
         expected.push_str(&format!("getpriority {label} rc={rc} errno={error}\n"));
+    }
+    let parameter_labels = ["zero", "self", "live", "absent", "negative", "null", "bad"];
+    for (label, &(value, bytes)) in parameter_labels.iter().zip(&parameter_values) {
+        let (rc, error) = if value < 0 { (-1, -value) } else { (value, 0) };
+        expected.push_str(&format!(
+            "sched_getparam {label} rc={rc} errno={error} bytes={bytes:08x} canaries=1\n"
+        ));
     }
     expected.push_str("group-session-getters=ok\n");
     let native = Command::new(&fixture)
@@ -281,6 +328,45 @@ fn compare_with_linux(mode: &str) {
             assert_eq!(fields[2], format!("who={}", guest_cases[index].1));
             assert_eq!(fields[3], format!("kernel={}", priority_values[index]));
             assert_eq!(fields[4], format!("injected={}", priority_values[index]));
+        }
+        let mut guest_parameter_targets = parameter_targets;
+        guest_parameter_targets[1] = guest_pid;
+        let parameter_rows: Vec<_> = stderr
+            .lines()
+            .filter_map(|line| line.strip_prefix("reverie-dbt-test: kernel-parameter-query "))
+            .collect();
+        assert_eq!(
+            parameter_rows.len(),
+            7,
+            "missing parameter observations: {output:?}"
+        );
+        for (index, row) in parameter_rows.iter().enumerate() {
+            let fields: Vec<_> = row.split_whitespace().collect();
+            assert_eq!(fields.len(), 9, "malformed parameter observation: {row}");
+            let pointer = match pointer_kinds[index] {
+                0 => "valid",
+                1 => "null",
+                2 => "bad",
+                _ => unreachable!(),
+            };
+            let (result, bytes) = parameter_values[index];
+            let (before, after) = if pointer_kinds[index] == 0 {
+                (format!("{PARAMETER_SENTINEL:08x}"), format!("{bytes:08x}"))
+            } else {
+                ("unaddressed".to_owned(), "unaddressed".to_owned())
+            };
+            assert_eq!(fields[0], format!("sysnum={}", libc::SYS_sched_getparam));
+            assert_eq!(
+                fields[1],
+                format!("target={}", guest_parameter_targets[index])
+            );
+            assert_eq!(fields[2], format!("pointer={pointer}"));
+            assert_eq!(fields[3], format!("kernel={result}"));
+            assert_eq!(fields[4], format!("injected={result}"));
+            assert_eq!(fields[5], format!("kernel_bytes={bytes:08x}"));
+            assert_eq!(fields[6], format!("guest_before={before}"));
+            assert_eq!(fields[7], format!("guest_after={after}"));
+            assert_eq!(fields[8], "kernel_canaries=1");
         }
     }
 }

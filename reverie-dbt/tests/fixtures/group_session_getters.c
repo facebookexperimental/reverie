@@ -8,6 +8,8 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <limits.h>
+#include <sched.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +17,8 @@
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+
+_Static_assert(sizeof(struct sched_param) == 4, "x86_64 sched_param oracle");
 
 static int returning;
 
@@ -30,8 +34,14 @@ static long priority_query(long which, long who) {
   return syscall(SYS_getpriority, which, who);
 }
 
+static long parameter_query(long target, struct sched_param* parameter) {
+  if (returning)
+    return prctl(0x4b494421, (long)SYS_sched_getparam, target, (long)parameter, 0L);
+  return syscall(SYS_sched_getparam, target, parameter);
+}
+
 int main(int argc, char** argv) {
-  if (argc != 8)
+  if (argc != 22)
     return 2;
   returning = strcmp(argv[1], "returning") == 0;
   long target = strtol(argv[2], NULL, 10);
@@ -93,6 +103,34 @@ int main(int argc, char** argv) {
     long expected_rc = priority_expected[i] < 0 ? -1 : priority_expected[i];
     int expected_error = priority_expected[i] < 0 ? (int)-priority_expected[i] : 0;
     failed |= rc != expected_rc || error != expected_error;
+  }
+  const long parameter_targets[] = {0, me, target, INT_MAX, -1, 0, 0};
+  const char* parameter_labels[] = {"zero", "self", "live", "absent", "negative", "null", "bad"};
+  for (unsigned int i = 0; i < 7; ++i) {
+    struct {
+      uint32_t before;
+      struct sched_param parameter;
+      uint32_t after;
+    } output = {UINT32_C(0x2468ace0), {0x13579bdf}, UINT32_C(0xfdb97531)};
+    struct sched_param* address =
+        i == 5 ? NULL : i == 6 ? (struct sched_param*)(uintptr_t)1 : &output.parameter;
+    errno = 0;
+    long rc = parameter_query(parameter_targets[i], address);
+    int error = errno;
+    uint32_t bytes;
+    memcpy(&bytes, &output.parameter, sizeof(bytes));
+    int canaries = output.before == UINT32_C(0x2468ace0) &&
+        output.after == UINT32_C(0xfdb97531);
+    printf("sched_getparam %s rc=%ld errno=%d bytes=%08x canaries=%d\n",
+           parameter_labels[i], rc, error, (unsigned int)bytes, canaries);
+    // Expected return/bytes come from a separate raw Linux observation. Never
+    // run that observation into this buffer before testing the injected call.
+    long raw_expected = strtol(argv[8 + 2 * i], NULL, 10);
+    uint32_t expected_bytes = (uint32_t)strtoul(argv[9 + 2 * i], NULL, 16);
+    long expected_rc = raw_expected < 0 ? -1 : raw_expected;
+    int expected_error = raw_expected < 0 ? (int)-raw_expected : 0;
+    failed |= rc != expected_rc || error != expected_error ||
+        bytes != expected_bytes || !canaries;
   }
   if (failed)
     return 1;

@@ -2671,7 +2671,6 @@ static bool validate_task_arguments(int sysnum, uint64_t* args) {
     case SYS_wait4:
     case SYS_sched_getaffinity:
     case SYS_sched_setaffinity:
-    case SYS_sched_getparam:
     case SYS_sched_setparam:
     case SYS_sched_setscheduler:
       return validate_task_argument(&args[0]);

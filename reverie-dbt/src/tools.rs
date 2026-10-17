@@ -623,6 +623,59 @@ impl Tool for SetRegTool {
         }
         let (number, args) = syscall.into_parts();
         if number == Sysno::prctl && args.arg0 as u64 == KERNEL_IDENTITY_PRCTL {
+            if args.arg1 as i64 == libc::SYS_sched_getparam {
+                let target = args.arg2 as libc::c_long;
+                let pointer = match args.arg3 {
+                    0 => "null",
+                    1 => "bad",
+                    _ => "valid",
+                };
+                // A separate reset kernel buffer prevents a successful native
+                // write from masking an injected error or missing output write.
+                let mut kernel_output = [0x2468_ace0_u32, 0x1357_9bdf, 0xfdb9_7531];
+                let kernel_address = if pointer == "valid" {
+                    (&mut kernel_output[1] as *mut u32) as usize
+                } else {
+                    args.arg3
+                };
+                let guest_before = if pointer == "valid" {
+                    let value: u32 = guest.memory().read_value(Addr::from(args.arg3))?;
+                    format!("{value:08x}")
+                } else {
+                    "unaddressed".to_owned()
+                };
+                // NULL and address 1 remain literal kernel error probes; the
+                // observer never reads either invalid guest address.
+                let kernel =
+                    unsafe { libc::syscall(libc::SYS_sched_getparam, target, kernel_address) };
+                let kernel = if kernel == -1 {
+                    -i64::from(std::io::Error::last_os_error().raw_os_error().unwrap())
+                } else {
+                    kernel
+                };
+                let injected = guest
+                    .inject(Syscall::from_raw(
+                        Sysno::sched_getparam,
+                        SyscallArgs::new(args.arg2, args.arg3, 0, 0, 0, 0),
+                    ))
+                    .await
+                    .unwrap_or_else(|errno| -i64::from(errno.into_raw()));
+                let guest_after = if pointer == "valid" {
+                    let value: u32 = guest.memory().read_value(Addr::from(args.arg3))?;
+                    format!("{value:08x}")
+                } else {
+                    "unaddressed".to_owned()
+                };
+                let kernel_canaries =
+                    u8::from(kernel_output[0] == 0x2468_ace0 && kernel_output[2] == 0xfdb9_7531);
+                emit_line(&format!(
+                    "reverie-dbt-test: kernel-parameter-query sysnum={} target={target} pointer={pointer} kernel={kernel} injected={injected} kernel_bytes={:08x} guest_before={guest_before} guest_after={guest_after} kernel_canaries={kernel_canaries}",
+                    args.arg1, kernel_output[1],
+                ));
+                // Retain the actual result so the C fixture can accumulate and
+                // report every tuple even when the held live target is refused.
+                return Ok(injected);
+            }
             if args.arg1 as i64 == libc::SYS_getpriority {
                 let which = args.arg2 as libc::c_long;
                 let who = args.arg3 as libc::c_long;
