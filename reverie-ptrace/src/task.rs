@@ -134,6 +134,8 @@ fn observe_ready_thread_state<T: Tool>(
         })
 }
 
+mod host_linux;
+
 #[cfg(test)]
 mod thread_state_ready_tests;
 
@@ -8484,8 +8486,20 @@ impl<L: Tool + 'static> TracedTask<L> {
         }
     }
 
+    /// Runs an injection through ptrace's [`LinuxProvider`], the host kernel
+    /// ([`host_linux::HostLinux`]), which runs it in this stopped tracee with
+    /// [`Self::inner_inject`].
+    ///
+    /// [`LinuxProvider`]: reverie::provider::LinuxProvider
     async fn do_inject(&mut self, nr: Sysno, args: SyscallArgs) -> Result<i64, Errno> {
-        match self.inner_inject(nr, args).await {
+        use reverie::provider::LinuxProvider;
+        let request = host_linux::request(nr, args);
+        let tid = self.tid();
+        let outcome = host_linux::HostLinux::<L>::new()
+            .execute(tid, &request, self)
+            .await
+            .and_then(host_linux::guest_result);
+        match outcome {
             Ok(ret) => ret,
             Err(err) => self.abort(Err(err)).await,
         }
