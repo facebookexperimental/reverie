@@ -136,10 +136,7 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for SuccessorImageGuest<'a, T, R> {
     // Guest::auxv's ordinary implementation reads this actual process's
     // kernel auxv. Private GNU getauxval is deliberately not used.
     fn memory(&self) -> Self::Memory {
-        GuestMemory {
-            local: LocalMemory::new(),
-            tail: self.tail,
-        }
+        GuestMemory::new(self.tail)
     }
 
     fn thread_state_mut(&mut self) -> &mut T::ThreadState {

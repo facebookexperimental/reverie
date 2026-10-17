@@ -56,6 +56,7 @@ rcb-clock = ["dep:reverie", "dep:reverie-ptrace"]
 [dependencies]
 sha2 = { version = "0.10.9", optional = true }
 libc = "0.2.186"
+syscalls = "0.6.18"
 reverie-syscalls = { version = "0.4.1", path = "../reverie-syscalls" }
 serde = { version = "1.0.219", features = ["derive"], optional = true }
 bincode = { version = "2", features = ["serde"], optional = true }

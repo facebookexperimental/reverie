@@ -46,6 +46,7 @@ use super::signal::core_dump_expected;
 use super::signal::current_pending_set;
 use super::signal::self_directed_fatal_signal;
 use super::signal::signal_ends_process_now;
+use super::support::tool_callback_active;
 use crate::sync::SpinMutex;
 use crate::tool_host::CallbackOutcome;
 use crate::tool_host::DrivenSyscall;
@@ -2857,17 +2858,28 @@ fn stripped_signal_mask(
 ///
 /// Every handle carries its dispatch's [`TailResult`], so once a callback has
 /// staged an injection that ends the guest (an exit, or a SIGKILL of the
-/// guest itself), every read and write through any handle of that dispatch,
+/// guest itself), every primitive copy through any handle of that dispatch,
 /// one obtained before the injection included, fails with ESRCH, as a
 /// tracer's access to a tracee its injection killed fails, and copies
 /// nothing. A handle cannot outlive its dispatch, so the exit callbacks,
 /// which have no [`Guest`], never hold one.
+/// Empty exact-copy helpers can return without invoking a primitive, as with
+/// the other [`MemoryAccess`] implementations.
 pub struct GuestMemory<'a> {
     local: LocalMemory,
     tail: &'a TailResult,
 }
 
 impl GuestMemory<'_> {
+    fn new(tail: &TailResult) -> GuestMemory<'_> {
+        GuestMemory {
+            // SAFETY: the immutable executor below forwards one syscall with
+            // unchanged arguments and result, synchronously on this thread.
+            local: unsafe { LocalMemory::with_syscall_executor(memory_syscall) },
+            tail,
+        }
+    }
+
     fn check(&self) -> Result<(), Errno> {
         if self.tail.ending() {
             Err(Errno::ESRCH)
@@ -2877,8 +2889,23 @@ impl GuestMemory<'_> {
     }
 }
 
-// Every other `MemoryAccess` method is built on these, so each passes the
-// same check; the native-user write keeps its default refusal.
+/// Route runtime memory operations through the existing admitted instruction
+/// only inside an actual Tool callback. Initial/successor lifecycle work and
+/// callers outside that scope keep ordinary syscall interception.
+unsafe fn memory_syscall(number: Sysno, args: [usize; 6]) -> Result<usize, Errno> {
+    if tool_callback_active() {
+        // SAFETY: LocalMemory retains its numeric iovec arrays and borrowed
+        // buffers for this synchronous call. This grants no callback scope and
+        // changes neither the syscall operands nor the kernel result.
+        let result = unsafe { raw_syscall6(number as i64, args.map(|arg| arg as u64)) };
+        Errno::from_ret(result as usize)
+    } else {
+        unsafe { syscalls::syscall6(number, args[0], args[1], args[2], args[3], args[4], args[5]) }
+    }
+}
+
+// The primitives pass the same ending check. Exact-copy helpers may shortcut
+// empty buffers without invoking one; the native-user write stays unsupported.
 impl MemoryAccess for GuestMemory<'_> {
     fn read_vectored(
         &self,
@@ -2946,10 +2973,7 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
     }
 
     fn memory(&self) -> Self::Memory {
-        GuestMemory {
-            local: LocalMemory::new(),
-            tail: self.tail,
-        }
+        GuestMemory::new(self.tail)
     }
 
     fn thread_state_mut(&mut self) -> &mut T::ThreadState {
@@ -3751,26 +3775,88 @@ mod tests {
     #[test]
     fn guest_memory_is_refused_once_the_guest_is_ending() {
         let tail = TailResult::default();
-        let mut before = GuestMemory {
-            local: LocalMemory::new(),
-            tail: &tail,
-        };
+        let mut before = GuestMemory::new(&tail);
         let mut word = 0_u64;
         let address = AddrMut::from_raw(&raw mut word as usize).unwrap();
         before.write_value(address, &1_u64).unwrap();
         assert_eq!(word, 1);
         tail.set_exit(libc::SYS_exit_group, [0; 6]);
         assert_eq!(before.write_value(address, &2_u64), Err(Errno::ESRCH));
-        let mut after = GuestMemory {
-            local: LocalMemory::new(),
-            tail: &tail,
-        };
+        let mut after = GuestMemory::new(&tail);
         assert_eq!(after.write_value(address, &3_u64), Err(Errno::ESRCH));
         assert_eq!(
             before.read_value::<_, u64>(Addr::from_raw(&raw const word as usize).unwrap()),
             Err(Errno::ESRCH)
         );
         assert_eq!(word, 1);
+        // Primitives retain ESRCH even for empty buffers. The trait's empty
+        // exact-copy shortcuts do not call a primitive and remain successful.
+        assert_eq!(
+            before.read(Addr::from_raw(address.as_raw()).unwrap(), &mut []),
+            Err(Errno::ESRCH)
+        );
+        assert_eq!(after.write(address.cast(), &[]), Err(Errno::ESRCH));
+        assert_eq!(before.read_vectored(&[], &mut []), Err(Errno::ESRCH));
+        assert_eq!(after.write_vectored(&[], &mut []), Err(Errno::ESRCH));
+        assert_eq!(
+            before.read_exact(Addr::from_raw(address.as_raw()).unwrap(), &mut []),
+            Ok(())
+        );
+        assert_eq!(after.write_exact(address.cast(), &[]), Ok(()));
+    }
+
+    /// A memory handle alone grants no private-gate authority. The real filter
+    /// must still trap its ordinary syscall when no Tool callback is active.
+    #[test]
+    fn guest_memory_outside_callback_still_reaches_interception() {
+        assert!(!tool_callback_active()); // Initialize callback TLS before fork.
+        let mut filter =
+            crate::seccomp::SeccompFilter::for_trusted_gate(crate::trap::trusted_gate()).unwrap();
+        let tail = TailResult::default();
+        let memory = GuestMemory::new(&tail);
+        let source = [0x5a_u8; 8];
+        let address = Addr::from_ptr(source.as_ptr()).unwrap();
+        let mut destination = [0_u8; 8];
+        let mut action: libc::sigaction = unsafe { core::mem::zeroed() };
+        action.sa_sigaction = libc::SIG_DFL;
+        let mut unblock: libc::sigset_t = unsafe { core::mem::zeroed() };
+        assert_eq!(unsafe { libc::sigemptyset(&mut action.sa_mask) }, 0);
+        assert_eq!(unsafe { libc::sigemptyset(&mut unblock) }, 0);
+        assert_eq!(unsafe { libc::sigaddset(&mut unblock, libc::SIGSYS) }, 0);
+        let no_core = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            // Prepare storage before fork, and leave through the raw exit path
+            // on setup failure rather than unwinding or running destructors.
+            unsafe {
+                if libc::setrlimit(libc::RLIMIT_CORE, &no_core) != 0
+                    || libc::sigaction(libc::SIGSYS, &action, core::ptr::null_mut()) != 0
+                    || libc::sigprocmask(libc::SIG_UNBLOCK, &unblock, core::ptr::null_mut()) != 0
+                {
+                    super::super::support::exit_now(101);
+                }
+                let pid = raw_syscall6(libc::SYS_getpid, [0; 6]);
+                if pid <= 0 || filter.install().is_err() {
+                    super::super::support::exit_now(102);
+                }
+                if raw_syscall6(libc::SYS_getpid, [0; 6]) != pid {
+                    super::super::support::exit_now(103);
+                }
+                // With no handler, the first ordinary memory syscall must
+                // terminate with SIGSYS. An unconditional private gate would
+                // return here and fail the parent's exact signal assertion.
+                let _ = memory.read(address, &mut destination);
+                super::super::support::exit_now(104);
+            }
+        }
+        assert!(child > 0);
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFSIGNALED(status), "child status {status}");
+        assert_eq!(libc::WTERMSIG(status), libc::SIGSYS, "{status}");
     }
 
     /// A read's address conversion is the caller's code, and runs before the
@@ -3791,10 +3877,7 @@ mod tests {
             }
         }
         let tail = TailResult::default();
-        let memory = GuestMemory {
-            local: LocalMemory::new(),
-            tail: &tail,
-        };
+        let memory = GuestMemory::new(&tail);
         let word = 0x5a5a_u64;
         let mut buffer = [0_u8; 8];
         let read = memory.read(

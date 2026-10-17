@@ -2828,6 +2828,7 @@ fn main() {
         && matches!(
             mode,
             "shared-handler-rpc-io"
+                | "shared-handler-memory-io"
                 | "shared-handler-outside-shared"
                 | "shared-handler-outside-liteinst"
         )

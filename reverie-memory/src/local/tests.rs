@@ -609,3 +609,6 @@ fn user_access_empty_invalid_and_wrapping_addresses_are_bounded() {
         }
     }
 }
+
+#[path = "executor_tests.rs"]
+mod executor_tests;

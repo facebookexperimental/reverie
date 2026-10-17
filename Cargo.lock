@@ -1571,6 +1571,7 @@ dependencies = [
  "reverie-syscalls",
  "serde",
  "sha2",
+ "syscalls",
  "tempfile",
  "tokio",
  "tracing",
