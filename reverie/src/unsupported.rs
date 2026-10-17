@@ -55,6 +55,12 @@ pub enum UnsupportedOperation {
     /// the calling task. A backend that refuses it changed no scheduling
     /// state and read none.
     Scheduling,
+    /// `rt_sigaction` installing a handler, or `SIG_IGN`, for a signal the
+    /// backend reserves for its own use, so the guest's disposition could not
+    /// take effect. A backend that refuses changed no disposition; resetting
+    /// the signal to `SIG_DFL` is not refused. The refusal's diagnostic names
+    /// the signal and its use.
+    ReservedSignal,
 }
 
 /// A backend's refusal of an injected syscall that it cannot perform, as
