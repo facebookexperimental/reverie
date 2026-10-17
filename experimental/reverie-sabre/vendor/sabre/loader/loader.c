@@ -428,6 +428,16 @@ static bool read_launch_spec(struct launch_spec *spec) {
 void load(int argc, char *argv[], void **new_entry, void **new_stack_top) {
   /* The bytes stay allocated: the plugin's arguments point into them. */
   static struct launch_spec launch;
+  // There 2 mallocs in memory because SaBRe loads 2 libcs (one for SaBRe) and
+  // one for the client (which is intercepted). These two mallocs will overlap
+  // their arenas as malloc uses brk(NULL) to initialize its arena, and this
+  // brk(NULL) will always return the same pointer. To avoid this we force
+  // SaBRe's malloc to completely skip the arena initialization and keep objects
+  // into separate mmap() pages. This of course comes with a small performance
+  // decrease, and the potential to OOM if we allocate too many items. It comes
+  // first: reading the launch specification allocates (opendir).
+  int ret = mallopt(M_MMAP_THRESHOLD, 0);
+  assert(ret == 1);
   bool launched = read_launch_spec(&launch);
   if (!launched)
     sbr_bootstrap_configure();
@@ -438,15 +448,6 @@ void load(int argc, char *argv[], void **new_entry, void **new_stack_top) {
     exit(EXIT_FAILURE);
   }
 
-  // There 2 mallocs in memory because SaBRe loads 2 libcs (one for SaBRe) and
-  // one for the client (which is intercepted). These two mallocs will overlap
-  // their arenas as malloc uses brk(NULL) to initialize its arena, and this
-  // brk(NULL) will always return the same pointer. To avoid this we force
-  // SaBRe's malloc to completely skip the arena initialization and keep objects
-  // into separate mmap() pages. This of course comes with a small performance
-  // decrease, and the potential to OOM if we allocate too many items.
-  int ret = mallopt(M_MMAP_THRESHOLD, 0);
-  assert(ret == 1);
   sbr_backend_stats_init();
 
   stack_val_t *argv_null = (stack_val_t *)&argv[argc];
