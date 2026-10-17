@@ -10,6 +10,7 @@
 
 #include <limits.h>
 
+#include "compiler.h"
 #include "plugins/sbr_api_defs.h"
 
 #define MAX_ICEPT_RECORDS 50
@@ -32,6 +33,8 @@ extern int registered_icept_cnt;
 extern sbr_fn_icept_local_struct intercept_records[MAX_ICEPT_RECORDS];
 extern sbr_icept_vdso_callback_fn vdso_callback;
 extern sbr_sc_handler_fn plugin_sc_handler;
+/* Hidden like the loader's other new internals (loader/rewriter.h). */
+extern attribute_hidden sbr_routed_sc_handler_fn plugin_routed_sc_handler;
 #ifdef __NX_INTERCEPT_RDTSC
 extern sbr_rdtsc_handler_fn plugin_rdtsc_handler;
 #endif

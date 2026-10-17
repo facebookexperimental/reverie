@@ -650,8 +650,13 @@ static long route_post_arm(enum sbr_dispatch_route route, long sc_no, long arg1,
    * already in its domain; leave it there when the call returns. */
   bool was_plugin = calling_from_plugin();
   enter_plugin();
-  long rc = plugin_sc_handler(sc_no, arg1, arg2, arg3, arg4, arg5, arg6,
-                              wrapper_sp);
+  /* A plugin that takes the route learns whether wrapper_sp is a genuine
+   * trampoline frame or the SIGILL handler's stand-in. */
+  long rc = plugin_routed_sc_handler != NULL
+                ? plugin_routed_sc_handler((long)route, sc_no, arg1, arg2,
+                                           arg3, arg4, arg5, arg6, wrapper_sp)
+                : plugin_sc_handler(sc_no, arg1, arg2, arg3, arg4, arg5, arg6,
+                                    wrapper_sp);
   if (!was_plugin)
     exit_plugin();
   return rc;

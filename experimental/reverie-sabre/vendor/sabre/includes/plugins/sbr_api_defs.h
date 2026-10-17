@@ -45,6 +45,16 @@ typedef struct sbr_fn_icept {
 typedef long (*sbr_sc_handler_fn)(long, long, long, long, long, long, long,
                                   void *);
 
+/* Optional plugin export "reverie_sabre_routed_syscall_v1", used only once the
+ * plugin's reverie_sabre_post_arm_routing_v1 report has turned post-arm
+ * routing on: the loader then calls it instead of the sbr_init handler, with
+ * the route first. The route is the loader's enum sbr_dispatch_route as a
+ * plain integer (0: a rewritten site's jump trampoline, with a genuine
+ * syscall_stackframe; 1: the SIGILL handler for a UD0 marker, whose frame is
+ * a stand-in). A plugin converts it explicitly and refuses any other value. */
+typedef long (*sbr_routed_sc_handler_fn)(long route, long, long, long, long,
+                                         long, long, long, void *);
+
 #ifdef __NX_INTERCEPT_RDTSC
 // Signature for the RDTSC handler
 typedef long (*sbr_rdtsc_handler_fn)();
