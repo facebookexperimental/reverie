@@ -774,6 +774,9 @@ impl LinuxProvider for StaticElfSyscallExecutor<'_> {
             self.process_context = ProcessExecutionContext::InitialExecCompleted;
             return Ok(ProviderOutcome::Return(0));
         }
+        // Whether an action was already staged before this call, by an earlier
+        // call whose completion did not run.
+        let action_staged_before = self.executor.has_process_action();
         let result = self
             .backend
             .execute_static_elf_syscall(self.executor, request, memory);
@@ -785,13 +788,18 @@ impl LinuxProvider for StaticElfSyscallExecutor<'_> {
         };
         self.last_result = Some(result);
         self.polled_read_attempt = Some((*request, result));
-        // A successful call that left a process action staged reports it as a
-        // Process outcome. The action itself stays in the executor, and
-        // complete_injection takes it from there exactly where it always has,
-        // so on any path where completion does not run (an early return, an
-        // error, or a dropped callback) the action keeps the executor's
-        // lifecycle. See StagedProcessAction.
-        if raw_to_result(result).is_ok() && self.executor.has_process_action() {
+        // A successful call that staged a process action (none was staged
+        // before it, one is now) reports it as a Process outcome. The action
+        // itself stays in the executor, and complete_injection takes it from
+        // there exactly where it always has, so on any path where completion
+        // does not run (an early return, an error, or a dropped callback) the
+        // action keeps the executor's lifecycle. An action staged by an
+        // earlier call produces no token; completion still takes it, as before.
+        // See StagedProcessAction.
+        if raw_to_result(result).is_ok()
+            && !action_staged_before
+            && self.executor.has_process_action()
+        {
             return Ok(ProviderOutcome::Process {
                 result,
                 plan: StagedProcessAction::staged(),
@@ -1151,8 +1159,12 @@ where
             }
             let action = self.executor.take_process_action();
             if plan.is_some() && action.is_none() {
-                // The token says this call staged an action, and nothing can
-                // run between the call and here to take it.
+                // The token says this call staged an action. Nothing can take
+                // it between the call and here: the only code that runs in
+                // between is the Tool's signal-dequeue notification, and
+                // signal_injection_allowed refuses any injection made under
+                // SignalGuard::DequeueNotification before it reaches the
+                // executor.
                 return Err(Error::UnexpectedVcpuExit(
                     "KVM staged process action vanished before completion".to_owned(),
                 ));

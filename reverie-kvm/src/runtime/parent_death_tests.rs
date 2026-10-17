@@ -258,8 +258,7 @@ fn default_preflight_refuses_but_live_unopted_static_executor_continues() {
         };
         assert_eq!(<StaticElfSyscallExecutor<'_> as LinuxEmuSignalControl>::parent_death_syscall_preflight(
             &e, original.into_syscall().unwrap()).unwrap(), reverie::ParentDeathSyscallAdmission::Unenrolled);
-        // ProviderOutcome<ProcessAction> is not PartialEq, so match.
-        assert!(matches!(
+        assert_eq!(
             futures::executor::block_on({
                 let task = reverie::Pid::from_raw(e.executor.task_tid());
                 <StaticElfSyscallExecutor<'_> as LinuxProvider>::execute(
@@ -271,7 +270,7 @@ fn default_preflight_refuses_but_live_unopted_static_executor_continues() {
             })
             .unwrap(),
             ProviderOutcome::Return(0)
-        ));
+        );
     }
     for (signal, expected) in [(0, 0), (libc::SIGUSR1, -i64::from(libc::ENOSYS))] {
         assert_eq!(
@@ -433,8 +432,7 @@ fn provider_refuses_a_task_other_than_its_executors_before_any_effect() {
             ));
         assert!(
             matches!(refused, Err(crate::Error::UnexpectedVcpuExit(_))),
-            "a call for another task must be refused as a broken invariant: {:?}",
-            refused.as_ref().err()
+            "a call for another task must be refused as a broken invariant: {refused:?}"
         );
         assert!(
             !e.executor.has_pending_exit(),
@@ -444,7 +442,7 @@ fn provider_refuses_a_task_other_than_its_executors_before_any_effect() {
         assert_eq!(e.polled_read_attempt, Some(retained));
         let pending = e.executor.take_unsupported_refusal();
         // Control: the same request for the adapter's own task runs.
-        assert!(matches!(
+        assert_eq!(
             futures::executor::block_on(<StaticElfSyscallExecutor<'_> as LinuxProvider>::execute(
                 &mut e,
                 own,
@@ -453,7 +451,7 @@ fn provider_refuses_a_task_other_than_its_executors_before_any_effect() {
             ))
             .unwrap(),
             ProviderOutcome::Return(0)
-        ));
+        );
         assert!(e.executor.has_pending_exit());
         pending
     };

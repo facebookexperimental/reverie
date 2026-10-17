@@ -118,9 +118,14 @@ pub enum ProviderOutcome<Plan> {
     /// The call succeeded with `result` and the provider staged a process
     /// action that the backend must carry out before the call completes: a
     /// child created by `fork`, `vfork`, `clone` or `clone3`, or an exec.
-    /// `result` is always a successful (nonnegative) result. The backend
-    /// carries out `plan` exactly once, and the call's final result is what
-    /// the backend's completion of the plan reports.
+    /// `result` is always a successful (nonnegative) result, and the call's
+    /// final result is what the backend's completion reports. A plan that
+    /// fully describes the action is carried out at most once. A plan that
+    /// is only a token for an action the provider keeps staged may be
+    /// deferred or dropped without completing the action, which then stays
+    /// with the provider, and the provider may let the backend complete an
+    /// action for which it issued no token (for example one staged by an
+    /// earlier call).
     Process {
         /// The raw successful result the provider computed.
         result: i64,

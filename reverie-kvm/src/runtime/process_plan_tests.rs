@@ -204,3 +204,136 @@ fn an_action_staged_before_an_injection_failure_stays_in_the_executor() {
         "the failed injection's staged action must stay in the executor"
     );
 }
+
+/// Only the call that staged an action reports `Process`. A fork stays
+/// staged (its completion has not run), and a later successful call reports
+/// `Return`. Completion would still take the earlier action, as before.
+#[test]
+fn a_later_call_does_not_report_an_action_an_earlier_call_staged() {
+    let mut backend = KvmBackend::new(0x10000).expect("process plan tests require /dev/kvm");
+    let mut executor = native_executor();
+    let mut memory = GuestMemory::new(0, 4096).unwrap();
+    let task = Pid::from_raw(executor.task_tid());
+    let mut completed = false;
+    let mut e = StaticElfSyscallExecutor {
+        backend: &mut backend,
+        executor: &mut executor,
+        memory: memory.clone(),
+        process_context: ProcessExecutionContext::SyscallBoundary(
+            CompletedSyscallBoundary::for_test(),
+        ),
+        callback_site: None,
+        original_syscall: None,
+        signal_guard: SignalGuard::Ordinary,
+        last_result: None,
+        polled_read_attempt: None,
+        process_completed: &mut completed,
+    };
+    let forked =
+        futures::executor::block_on(<StaticElfSyscallExecutor<'_> as LinuxProvider>::execute(
+            &mut e,
+            task,
+            fork().as_provider(),
+            &mut memory,
+        ))
+        .unwrap();
+    assert!(
+        matches!(forked, ProviderOutcome::Process { result, .. } if result > 0),
+        "{forked:?}"
+    );
+    let getpid = SyscallRequest::new(libc::SYS_getpid as u64, [0; 6]);
+    let later =
+        futures::executor::block_on(<StaticElfSyscallExecutor<'_> as LinuxProvider>::execute(
+            &mut e,
+            task,
+            getpid.as_provider(),
+            &mut memory,
+        ))
+        .unwrap();
+    assert!(
+        matches!(later, ProviderOutcome::Return(pid) if pid > 0),
+        "{later:?}"
+    );
+    assert!(e.executor.has_process_action());
+}
+
+/// A provider that breaks the contract: it reports a process action with a
+/// failed result.
+struct FailedProcess;
+
+#[reverie::provider]
+impl LinuxProvider for FailedProcess {
+    type Context = GuestMemory;
+    type Plan = crate::executor::StagedProcessAction;
+    type Error = crate::Error;
+
+    async fn execute(
+        &mut self,
+        _task: reverie::Tid,
+        _: &ProviderRequest,
+        _: &mut GuestMemory,
+    ) -> Result<ProviderOutcome> {
+        Ok(ProviderOutcome::Process {
+            result: -i64::from(libc::EINVAL),
+            plan: crate::executor::StagedProcessAction::staged(),
+        })
+    }
+}
+
+impl LinuxEmuSignalControl for FailedProcess {}
+
+impl LinuxEmuMemoryMap for FailedProcess {}
+
+impl GuestSyscallExecutor<crate::StraceTool> for FailedProcess {
+    fn read_clock(&self) -> Result<u64> {
+        panic!("the failed-process control requested a guest clock")
+    }
+}
+
+/// `KvmGuest::inject` treats a `Process` outcome with a failed result as a
+/// broken provider invariant: the handler ends with a run error instead of
+/// completing a process action or returning the errno.
+#[test]
+fn a_process_outcome_with_a_failed_result_is_a_run_error() {
+    let mut provider = FailedProcess;
+    let tool = Arc::new(crate::StraceTool);
+    let global = Arc::new(crate::StraceLog::default());
+    let mut state = ();
+    let subscriptions = Subscription::none();
+    let signal = Arc::new(Mutex::new(None));
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let mut guest = KvmGuest::<crate::StraceTool>::new(
+        Pid::from_raw(1),
+        Pid::from_raw(1),
+        tool,
+        GuestMemory::new(0, STACK_CAPACITY).unwrap(),
+        &[],
+        // This mock has no vCPU and never accesses registers.
+        unsafe { std::mem::zeroed() },
+        &mut state,
+        &mut provider,
+        global.as_ref(),
+        Some(global.clone()),
+        &(),
+        &subscriptions,
+        signal.clone(),
+        starts.clone(),
+        crate::bootstrap::TOOL_STACK_TOP,
+        Arc::new(AtomicBool::new(false)),
+    );
+    let getpid = SyscallRequest::new(libc::SYS_getpid as u64, [0; 6])
+        .into_syscall()
+        .unwrap();
+    let outcome = futures::executor::block_on(drive_handler(
+        guest.inject(getpid),
+        signal,
+        starts,
+        std::future::pending(),
+    ));
+    match outcome {
+        HandlerOutcome::RuntimeError(Error::UnexpectedVcpuExit(message)) => {
+            assert!(message.contains("process action with result"), "{message}")
+        }
+        _ => panic!("a Process outcome with a failed result must end the run"),
+    }
+}
