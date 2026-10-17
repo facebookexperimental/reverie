@@ -32,6 +32,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 
 #define section_hashfn(n) jhash(n, strlen(n), 0) & (sectionhash_size - 1)
@@ -796,13 +797,19 @@ static GElf_Sym find_ld_symbol(const char *ld_path, const char *fn_name) {
     ld_orig_path = copy_string(ld_path);
     _nx_debug_printf("searching for external debug info for %s\n", ld_path);
     ld_debug_path = debuginfo_lookup_external(ld_orig_path);
-    assert(ld_debug_path != NULL && "We couldn't find ld symbols");
+    if (ld_debug_path == NULL)
+      _nx_fatal_printf("refused: SaBRe cannot find %s in the dynamic linker "
+                       "%s: it is not in its symbol table, and it has no "
+                       "external debug information\n",
+                       fn_name, ld_path);
   }
 
   if (find_ld_symbol_in(ld_debug_path, fn_name, &gsym)) {
     return gsym;
   }
-  assert(false && "We couldn't find one specific ld symbol");
+  _nx_fatal_printf("refused: SaBRe cannot find %s in the dynamic linker %s or "
+                   "its debug information %s\n",
+                   fn_name, ld_path, ld_debug_path);
 }
 
 static bool find_intercept_target(struct library *lib, int record,
@@ -820,6 +827,57 @@ static bool find_intercept_target(struct library *lib, int record,
   return false;
 }
 
+/* The file of the client's dynamic linker (device and inode), and how many
+ * "ld" intercepts were installed once it was known. Kept small on purpose:
+ * the loader's own mappings are visible to the guest in /proc/self/maps, and
+ * a path buffer here grew its bss by a page. */
+static bool dynamic_linker_known;
+static dev_t dynamic_linker_dev;
+static ino_t dynamic_linker_ino;
+static int dynamic_linker_intercepts;
+
+void sbr_rewriter_expect_dynamic_linker(int fd, const char *path) {
+  /* The open descriptor, not the path: the file the loader actually mapped,
+   * whatever the path names by now. Each mapping is then matched by stat()
+   * of its /proc/self/maps path, not by the device and inode that file
+   * prints, which on an overlay filesystem can be the underlying layer's. */
+  struct stat file;
+  if (fstat(fd, &file) != 0)
+    _nx_fatal_printf("refused: SaBRe cannot stat the dynamic linker %s\n",
+                     path);
+  dynamic_linker_dev = file.st_dev;
+  dynamic_linker_ino = file.st_ino;
+  dynamic_linker_known = true;
+  dynamic_linker_intercepts = 0;
+}
+
+/* Whether `lib` is a mapping of the client's dynamic linker. A mapping whose
+ * path cannot be checked is not. */
+static bool is_dynamic_linker(const struct library *lib) {
+  struct stat file;
+  return stat(lib->pathname, &file) == 0 && file.st_dev == dynamic_linker_dev &&
+         file.st_ino == dynamic_linker_ino;
+}
+
+bool sbr_rewriter_dynamic_linker_intercepted(void) {
+  int expected = 0;
+  for (int i = 0; i < registered_icept_cnt; ++i)
+    if (!strcmp(intercept_records[i].lib_name, "ld"))
+      ++expected;
+  return expected > 0 && dynamic_linker_intercepts == expected;
+}
+
+/* Whether intercept record `i` applies to `lib`. Once the client's dynamic
+ * linker is known, "ld" records apply to that file only: another object named
+ * like a dynamic linker that defines the same functions would otherwise
+ * overwrite the saved real functions. */
+static bool record_applies(int i, const struct library *lib) {
+  if (!lib_name_match(intercept_records[i].lib_name, lib->pathname))
+    return false;
+  return strcmp(intercept_records[i].lib_name, "ld") != 0 ||
+         !dynamic_linker_known || is_dynamic_linker(lib);
+}
+
 static void reject_overlapping_intercepts(struct library *lib) {
   // Different declared names can resolve to one entry in this object. Reject
   // that ambiguity before rewriting detour entry bytes or invoking a callback.
@@ -827,12 +885,11 @@ static void reject_overlapping_intercepts(struct library *lib) {
   // set would incorrectly suppress a new mapping that reused an old address.
   for (int i = 0; i < registered_icept_cnt; ++i) {
     GElf_Sym target;
-    if (!lib_name_match(intercept_records[i].lib_name, lib->pathname) ||
-        !find_intercept_target(lib, i, &target))
+    if (!record_applies(i, lib) || !find_intercept_target(lib, i, &target))
       continue;
     for (int j = 0; j < i; ++j) {
       GElf_Sym earlier;
-      if (lib_name_match(intercept_records[j].lib_name, lib->pathname) &&
+      if (record_applies(j, lib) &&
           find_intercept_target(lib, j, &earlier) &&
           earlier.st_value == target.st_value)
         _nx_fatal_printf("overlapping function intercept target\n");
@@ -851,7 +908,7 @@ static void patch_funcs(struct library *lib, int first, int end,
   char *extra_space = NULL;
 
   for (int i = first; i < end; ++i) {
-    if (lib_name_match(intercept_records[i].lib_name, lib->pathname)) {
+    if (record_applies(i, lib)) {
       _nx_debug_printf("patching intercepts: %s\n", lib->pathname);
       struct section *scn = section_find(lib->section_hash, ".text");
       _nx_debug_printf(".text section %p\n", scn);
@@ -878,6 +935,9 @@ static void patch_funcs(struct library *lib, int first, int end,
                         intercept_records[i].callback,
                         intercept_records[i].copy_first_stack_arg, &extra_space,
                         &extra_len, tls);
+        if (!strcmp(intercept_records[i].lib_name, "ld") &&
+            dynamic_linker_known)
+          ++dynamic_linker_intercepts;
       }
     }
   }

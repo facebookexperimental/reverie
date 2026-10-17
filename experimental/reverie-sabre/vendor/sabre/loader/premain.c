@@ -514,6 +514,11 @@ static void_void_fn vdso_guard_icept_callback(void_void_fn r_clock_gettime) {
   return (void_void_fn)sabre_clock_gettime;
 }
 
+bool sbr_premain_installed(void) {
+  return real_dl_init != NULL && real_dl_map_object_deps != NULL &&
+         real_dl_map_object != NULL;
+}
+
 void setup_sbr_premain(sbr_icept_reg_fn fn_icept_reg) {
   sbr_fn_icept_struct premain = {.lib_name = "ld",
                                  .fn_name = "_dl_init",

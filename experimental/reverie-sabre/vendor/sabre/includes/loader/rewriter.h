@@ -76,4 +76,13 @@ attribute_hidden void sbr_rewriter_option_from_launch(const char *value);
  * so the loader refuses "raw" unless the plugin reports post-arm routing. */
 attribute_hidden bool sbr_rewriter_short_sites_raw(void);
 
+/* Names the client's dynamic linker (its PT_INTERP, open as `fd`, which the
+ * loader mapped it from) before ld.so is rewritten. From then on "ld"
+ * intercepts are installed only in mappings of exactly that file, never in
+ * another object that merely has a dynamic linker's name; afterwards, whether
+ * every registered one was. */
+attribute_hidden void sbr_rewriter_expect_dynamic_linker(int fd,
+                                                         const char *path);
+attribute_hidden bool sbr_rewriter_dynamic_linker_intercepted(void);
+
 #endif /* LIBRARY_H_ */

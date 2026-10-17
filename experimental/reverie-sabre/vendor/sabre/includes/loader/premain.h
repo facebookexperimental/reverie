@@ -30,6 +30,9 @@ void setup_sbr_premain(sbr_icept_reg_fn);
 /* Whether the plugin at `path` defines reverie_sabre_post_arm_routing_v1
  * (whatever it will report). */
 attribute_hidden bool sbr_plugin_defines_post_arm_report(const char *path);
+/* Whether rewriting ld.so installed the three intercepts the plugin's start
+ * depends on (_dl_init, _dl_map_object_deps, _dl_map_object). */
+attribute_hidden bool sbr_premain_installed(void);
 void init_sbr_static_plugin(void);
 
 #endif /* !PREMAIN_H */

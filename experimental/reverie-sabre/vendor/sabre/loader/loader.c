@@ -620,10 +620,20 @@ void load(int argc, char *argv[], void **new_entry, void **new_stack_top) {
       _nx_fatal_printf("Failed to get ELF header from file\n");
 
     entry = elfld_load_elf(interp_fd, &ehdr, pagesize, NULL, NULL, NULL);
+    sbr_rewriter_expect_dynamic_linker(interp_fd, interp);
     close(interp_fd);
 
     const char *libs[] = {"ld", NULL};
     memorymaps_rewrite_all(libs, client_path, true);
+    /* Without these the plugin is never added or started, and the client
+     * would run with no plugin at all. They must be in the client's own
+     * dynamic linker. */
+    if (!sbr_premain_installed() || !sbr_rewriter_dynamic_linker_intercepted())
+      errx(EXIT_FAILURE,
+           "refused: SaBRe could not install its dynamic-linker intercepts "
+           "(_dl_init, _dl_map_object_deps, _dl_map_object) in %s, so its "
+           "plugin would never start",
+           interp);
   } else {
     if (sbr_bootstrap_enabled())
       errx(EXIT_FAILURE, "loader bootstrap does not support static images");
