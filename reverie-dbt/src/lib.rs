@@ -34,6 +34,7 @@ mod tools;
 /// GlobalState.
 pub const TOOL_ENV: &str = "REVERIE_DBT_TOOL";
 
+#[cfg(any(feature = "prototype-runtime", test))]
 use std::ffi::c_void;
 use std::future::Future;
 use std::path::Path;
@@ -43,6 +44,7 @@ use std::sync::Mutex;
 #[cfg(feature = "prototype-runtime")]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicI32;
+#[cfg(feature = "prototype-runtime")]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::task::Context;

@@ -118,6 +118,16 @@ fn run_native(program: &Path, args: &[OsString]) -> anyhow::Result<Report> {
             let _ = unsafe {
                 nix::sys::signal::signal(Signal::SIGPIPE, nix::sys::signal::SigHandler::SigDfl)
             };
+            // Without address-space randomization, as reverie-ptrace starts
+            // its guests: a randomized heap start changes how often a
+            // program grows its heap (brk), a difference no backend made.
+            // SAFETY: personality(2) in the forked child, before exec.
+            unsafe {
+                let current = libc::personality(0xffff_ffff);
+                if current != -1 {
+                    libc::personality((current as libc::c_ulong) | 0x0004_0000);
+                }
+            }
             let _ = ptrace::traceme();
             let _ = nix::sys::signal::raise(Signal::SIGSTOP);
             let _ = nix::unistd::execve(&path, &argv, &envp);

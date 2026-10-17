@@ -780,6 +780,10 @@ run_test_check "Test regular workspace cases" cargo test --workspace --all-featu
 export -n REVERIE_LITEINST_PRELOAD REVERIE_LITEINST_TEST_RUNTIME_MANIFEST \
     REVERIE_LITEINST_ALLOCATOR_GUEST REVERIE_LITEINST_ALLOCATOR_GUEST_MANIFEST
 run_test_check "Documentation tests" cargo test --workspace --doc
+# Every backend this host has, against the ledger for its environment; a
+# backend whose inputs are missing is refused by name, and a host with no
+# ledger gets its verdicts reported, not judged (reverie-examples/e2e/README.md).
+run_check "Reverie-layer cross-backend e2e" "$ROOT_DIR/reverie-examples/e2e/run.sh"
 run_check "Clippy" cargo clippy --workspace --all-targets --all-features -- -D warnings
 run_check "Rustfmt" cargo fmt --all -- --check
 

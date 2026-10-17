@@ -17,9 +17,13 @@
 //!     --recorder target/debug/recorder \
 //!     --backends ptrace,kvm,dbt,liteinst,in-guest-trap,sabre,e9patch \
 //!     --corpus reverie-examples/e2e/corpus.tsv \
-//!     --expected reverie-examples/e2e/expected-mismatches.tsv \
+//!     --expected reverie-examples/e2e/ledgers/<environment>.tsv \
 //!     --artifacts target/e2e
 //! ```
+//!
+//! (`run.sh` builds what this needs and picks the ledger.) `--report-only`
+//! prints the verdicts without judging them, with no ledger; `--write-ledger
+//! FILE` also writes every verdict other than `match` as a ledger row.
 //!
 //! Each program runs natively twice (plain ptrace syscall stops); if the runs
 //! disagree, the program has no stable baseline (`unstable`). Each backend's
@@ -45,6 +49,16 @@ use std::time::Duration;
 use std::time::Instant;
 
 const TIMEOUT: Duration = Duration::from_secs(300);
+
+/// The sanitizer settings reverie-ptrace adds to its guest's environment
+/// (tracer.rs). Every recorder run gets them, so the ptrace guest's
+/// environment is the native one. The number of variables decides when a
+/// shell grows its heap: without them, `sh -c` recorded an extra brk on ptrace
+/// alone when 36 or 37 variables were added to a session's environment.
+const PTRACE_ENVIRONMENT: [(&str, &str); 2] = [
+    ("ASAN_OPTIONS", "detect_leaks=0"),
+    ("LSAN_OPTIONS", "detect_leaks=0"),
+];
 
 struct Cell {
     name: String,
@@ -229,6 +243,7 @@ fn record(
         fs::File::create(output.with_extension("stdout")).map_err(|e| (false, e.to_string()))?;
     let _ = fs::remove_file(output);
     let mut child = Command::new(recorder)
+        .envs(PTRACE_ENVIRONMENT)
         .arg("--backend")
         .arg(backend)
         .arg("--output")
@@ -322,18 +337,28 @@ fn row_matches(row: &Row, cell: &str, backend: &str, outcome: &Outcome) -> bool 
                 .any(|signature| signature == outcome.signature))
 }
 
+/// The issue a measured row links until its own issue is filed.
+const TRACKING_ISSUE: &str = "https://github.com/rrnewton/hermit/issues/4485";
+
 fn main() {
     let mut recorder = None;
     let mut backends = Vec::new();
     let mut corpus = None;
     let mut expected = None;
     let mut artifacts = None;
+    let mut report_only = false;
+    let mut write_ledger = None;
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
+        if flag == "--report-only" {
+            report_only = true;
+            continue;
+        }
         let value = args
             .next()
             .unwrap_or_else(|| panic!("{flag} needs a value"));
         match flag.as_str() {
+            "--write-ledger" => write_ledger = Some(PathBuf::from(value)),
             "--recorder" => recorder = Some(PathBuf::from(value)),
             "--backends" => backends = value.split(',').map(str::to_owned).collect(),
             "--corpus" => corpus = Some(PathBuf::from(value)),
@@ -344,7 +369,13 @@ fn main() {
     }
     let recorder = recorder.expect("--recorder");
     let cells = read_corpus(&corpus.expect("--corpus"));
-    let ledger = read_ledger(&expected.expect("--expected"));
+    // A report-only run judges nothing: it has no ledger, or ignores one.
+    let ledger = if report_only {
+        Vec::new()
+    } else {
+        read_ledger(&expected.expect("--expected (or --report-only)"))
+    };
+    let mut measured = Vec::new();
     let artifacts = artifacts.expect("--artifacts");
     fs::create_dir_all(&artifacts).expect("artifacts directory");
     assert!(!backends.is_empty(), "--backends names none");
@@ -411,6 +442,14 @@ fn main() {
             }
         }
         for (backend, outcome) in results {
+            if outcome.verdict != "match" {
+                measured.push(format!(
+                    "{}\t{backend}\t{}\t{}\t{TRACKING_ISSUE}",
+                    cell.name,
+                    outcome.verdict,
+                    outcome.signature.replace(['\t', '\n'], " ")
+                ));
+            }
             ran.push((cell.name.clone(), backend.clone()));
             *counts
                 .entry((backend.clone(), outcome.verdict))
@@ -424,6 +463,7 @@ fn main() {
                     format!("EXPECTED {}", ledger[index].issue)
                 }
                 ("match", None) => String::new(),
+                (_, None) if report_only => "REPORTED".to_owned(),
                 (_, None) => {
                     unexpected += 1;
                     "UNEXPECTED".to_owned()
@@ -458,6 +498,21 @@ fn main() {
         cells.len(),
         backends.len()
     );
+    if let Some(path) = write_ledger {
+        let header = "# cell<TAB>backend<TAB>verdict<TAB>signature<TAB>issue (full URL), measured by \
+                      --write-ledger; add a comment above each group naming its defect.\n";
+        fs::write(&path, format!("{header}{}\n", measured.join("\n")))
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        println!(
+            "reverie e2e: wrote {} ledger rows to {}",
+            measured.len(),
+            path.display()
+        );
+    }
+    if report_only {
+        println!("reverie e2e: report only; nothing was judged");
+        return;
+    }
     if unexpected > 0 || stale > 0 {
         std::process::exit(1);
     }

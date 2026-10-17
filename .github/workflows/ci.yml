@@ -123,6 +123,11 @@ jobs:
       run: cargo clippy --workspace --all-targets --all-features
     - name: Format
       run: cargo fmt --all -- --check
+    # The cross-backend check on every backend that needs no device. A hosted
+    # runner's environment has no ledger, so its verdicts are reported, not
+    # judged (reverie-examples/e2e/README.md).
+    - name: Reverie-layer cross-backend e2e (no device)
+      run: reverie-examples/e2e/run.sh --backends ptrace,liteinst,in-guest-trap,e9patch,dbt,sabre
     - name: Restore hosted-runner namespace restriction
       if: ${{ always() && steps.userns.outputs.restore_required == 'true' }}
       timeout-minutes: 1
@@ -262,3 +267,8 @@ jobs:
         kill "$watchdog" 2>/dev/null || true
         wait "$watchdog" 2>/dev/null || true
         exit "$status"
+    # The cross-backend check on KVM, which needs /dev/kvm (refused by name
+    # without it). Without a ledger for the runner's environment its verdicts
+    # are reported, not judged (reverie-examples/e2e/README.md).
+    - name: Reverie-layer cross-backend e2e (KVM)
+      run: reverie-examples/e2e/run.sh --backends kvm

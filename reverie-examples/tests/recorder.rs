@@ -17,8 +17,13 @@ use std::process::Command;
 
 use reverie::GlobalTool;
 
+/// Every run gets the sanitizer settings reverie-ptrace adds to its guest's
+/// environment (tracer.rs), so that ptrace's guest has the native one: the
+/// number of variables decides when `sh -c` grows its heap.
 fn record(backend: &str, program: &[&str], output: &Path) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_recorder"))
+        .env("ASAN_OPTIONS", "detect_leaks=0")
+        .env("LSAN_OPTIONS", "detect_leaks=0")
         .args(["--backend", backend, "--output"])
         .arg(output)
         .args(program)
