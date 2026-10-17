@@ -98,6 +98,12 @@ static void register_function_intercept(const sbr_fn_icept_struct *r_struct,
   if (calling_from_plugin != NULL && enter_intercept_loader_tls(&context))
     tls = &context;
 #endif
+  /* Registering an intercept patches code, and the loader's patching syscalls
+   * would reach the plugin's trap path once post-arm routing is on. Checked
+   * after the switch to the loader's TLS, which errx needs. */
+  if (sbr_post_arm_routing())
+    errx(EXIT_FAILURE,
+         "SaBRe: function intercept registered after post-arm routing");
   assert(strlen(r_struct->lib_name) < MAX_ICEPT_STRLEN);
   assert(strlen(r_struct->fn_name) < MAX_ICEPT_STRLEN);
 

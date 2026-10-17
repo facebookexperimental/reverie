@@ -134,6 +134,26 @@ static sbr_bootstrap_install_fn find_continuation_installer(const char *path,
   return (void *)(base + symbol.st_value);
 }
 
+/* Optional ABI, looked up like the continuation installer. A plugin that will
+ * arm its own trap path for every syscall the loader did not rewrite reports
+ * it from this function, which must make no syscall: the loader calls it once,
+ * after sbr_init and before post_load, and from a nonzero report on routes
+ * every rewritten-site call to the plugin (ld_sc_handler.c). A plugin without
+ * the symbol, or one that reports zero, keeps the existing routing. */
+typedef int (*sbr_post_arm_routing_fn)(void);
+static sbr_post_arm_routing_fn find_post_arm_routing(const char *path,
+                                                     uintptr_t base) {
+  bool valid = false;
+  GElf_Sym symbol =
+      find_elf_symbol(path, "reverie_sabre_post_arm_routing_v1", &valid);
+  if (!valid || symbol.st_shndx == SHN_UNDEF ||
+      symbol.st_shndx >= SHN_LORESERVE ||
+      GELF_ST_TYPE(symbol.st_info) != STT_FUNC || symbol.st_value == 0 ||
+      symbol.st_value > UINTPTR_MAX - base)
+    return NULL;
+  return (void *)(base + symbol.st_value);
+}
+
 // This is currently a huge and unstable hack. We intercept the loader in order
 // to edit the internal representation of its link-map. More specifically we edit
 // the preinit_array loaded from the client's elf file, by prepending our shim
@@ -187,6 +207,10 @@ static void init_sbr_plugin(bool switch_client_tls) {
   sym_addr = addr_of_elf_symbol(abs_plugin_path, "is_vdso_ready", &valid);
   assert(valid == true && "No symbol 'is_vdso_ready'");
   is_vdso_ready = (void *)lib_base + sym_addr;
+  /* Resolved here, with the loader's own TLS, like every other plugin symbol;
+   * called after sbr_init. */
+  sbr_post_arm_routing_fn post_arm_routing =
+      find_post_arm_routing(abs_plugin_path, lib_base);
 
   if (switch_client_tls)
     load_client_tls();
@@ -227,6 +251,15 @@ static void init_sbr_plugin(bool switch_client_tls) {
 #endif
               &post_load, abs_sabre_path, abs_client_path);
 
+  if (post_arm_routing != NULL && post_arm_routing() != 0) {
+    /* A static client's loader still rewrites its images and installs its
+     * SIGILL handler natively after this point (loader.c); refuse rather
+     * than let those syscalls reach the plugin's trap path. */
+    if (!switch_client_tls)
+      errx(EXIT_FAILURE, "SaBRe: post-arm routing does not support static "
+                         "clients");
+    sbr_enable_post_arm_routing();
+  }
   if (post_load != NULL)
     post_load(!switch_client_tls);
 

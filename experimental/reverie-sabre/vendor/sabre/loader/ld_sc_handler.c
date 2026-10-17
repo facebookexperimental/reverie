@@ -628,9 +628,41 @@ __attribute__((noreturn)) static void limit_change_before_plugin(void) {
   __builtin_unreachable();
 }
 
+/* Set at most once, from the plugin's reverie_sabre_post_arm_routing_v1 report
+ * (see premain.c), before the plugin's post_load arms its own trap path for
+ * every syscall the loader did not rewrite. From then on the loader executes
+ * no syscall for a rewritten site itself: a native syscall from the loader
+ * would reach that trap path like any other unrewritten syscall. Every call,
+ * including one the plugin makes, ARCH_SET_FS and a thread clone, is the
+ * plugin's to handle. Until then routing is exactly the pre-existing split in
+ * route_syscall below, which is unchanged. */
+static bool post_arm_routing = false;
+
+void sbr_enable_post_arm_routing(void) { post_arm_routing = true; }
+
+bool sbr_post_arm_routing(void) { return post_arm_routing; }
+
+static long route_post_arm(enum sbr_dispatch_route route, long sc_no, long arg1,
+                           long arg2, long arg3, long arg4, long arg5,
+                           long arg6, void *wrapper_sp) {
+  sbr_backend_stats_record_dispatch(route);
+  /* The plugin's own call through a rewritten site arrives here while it is
+   * already in its domain; leave it there when the call returns. */
+  bool was_plugin = calling_from_plugin();
+  enter_plugin();
+  long rc = plugin_sc_handler(sc_no, arg1, arg2, arg3, arg4, arg5, arg6,
+                              wrapper_sp);
+  if (!was_plugin)
+    exit_plugin();
+  return rc;
+}
+
 static long route_syscall(enum sbr_dispatch_route route, long sc_no, long arg1,
                           long arg2, long arg3, long arg4, long arg5, long arg6,
                           void *wrapper_sp) {
+  if (post_arm_routing)
+    return route_post_arm(route, sc_no, arg1, arg2, arg3, arg4, arg5, arg6,
+                          wrapper_sp);
   // TODO(andronat): the following if code can be optimized by completely avoid
   // calling real_syscall if we carefully refactor handle_syscall.S
   // TODO(andronat): calling_from_plugin can be optimized if we somehow copy the

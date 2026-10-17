@@ -31,6 +31,8 @@ long runtime_sigill_syscall_router(long, long, long, long, long, long, long,
 #if defined(__NX_INTERCEPT_RDTSC) && defined(__x86_64__)
 long runtime_rdtsc_router(void);
 #endif
+void sbr_enable_post_arm_routing(void);
+bool sbr_post_arm_routing(void);
 void_void_fn ld_vdso_callback(long, void_void_fn);
 void setup_plugin_vdso(sbr_icept_vdso_callback_fn);
 
