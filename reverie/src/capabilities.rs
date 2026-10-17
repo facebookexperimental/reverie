@@ -229,6 +229,26 @@ pub struct BackendCapabilities {
     /// copy. A backend whose tool runs outside the guest shares one copy
     /// without promoting, and reports false.
     pub promotes_open_files_before_native_lifecycle: bool,
+
+    /// For a Tool for which [`Tool::observes_sigreturns`](crate::Tool::observes_sigreturns)
+    /// holds, the backend calls [`Tool::handle_sigreturn`](crate::Tool::handle_sigreturn)
+    /// once for every guest `rt_sigreturn` made through the x86-64 syscall
+    /// ABI, before it runs. Four are not reported:
+    /// - an x32-ABI `rt_sigreturn`;
+    /// - one the guest makes from the backend's own private page;
+    /// - one that a seccomp filter of higher precedence than the backend's
+    ///   (the guest's own, or one the guest inherited) turns into a
+    ///   `SECCOMP_RET_USER_NOTIF` notification, which another thread can
+    ///   answer with `SECCOMP_USER_NOTIF_FLAG_CONTINUE` so that the call runs
+    ///   without a stop;
+    /// - every one while a debugger (the ptrace backend's gdbserver) is
+    ///   attached, whose single-step into the call a report's stop would
+    ///   interrupt.
+    ///
+    /// A tool that follows handler returns from these reports must therefore
+    /// still fail closed when the kernel's state disagrees with what the
+    /// reports predict.
+    pub reports_sigreturns: bool,
 }
 
 impl BackendCapabilities {
@@ -260,11 +280,19 @@ impl BackendCapabilities {
         delivers_preemption_timer_events: true,
         runs_guest_code_between_injections: false,
         promotes_open_files_before_native_lifecycle: false,
+        // The report reads an x86-64 signal frame.
+        reports_sigreturns: cfg!(target_arch = "x86_64"),
     };
 
     /// `reverie-e9patch`: the guest is rewritten ahead of time and then run
-    /// under the ptrace tracer, so its run-time facts are ptrace's.
-    pub const E9PATCH: Self = Self::PTRACE;
+    /// under the ptrace tracer, so its run-time facts are ptrace's, except
+    /// that a rewritten `rt_sigreturn` site runs the call without a seccomp
+    /// stop (an injected trap, or the ahead-of-time dispatcher's direct tail
+    /// execution), so it does not report sigreturns.
+    pub const E9PATCH: Self = Self {
+        reports_sigreturns: false,
+        ..Self::PTRACE
+    };
 
     /// `reverie-liteinst` with its in-guest runtime: the tool runs in the
     /// guest, with no ptrace exit-group teardown behind it.
@@ -279,6 +307,7 @@ impl BackendCapabilities {
         delivers_preemption_timer_events: false,
         runs_guest_code_between_injections: true,
         promotes_open_files_before_native_lifecycle: true,
+        reports_sigreturns: false,
         ..Self::PTRACE
     };
 
@@ -300,6 +329,7 @@ impl BackendCapabilities {
         supports_blocked_wait_signal_interruption: false,
         delivers_preemption_timer_events: false,
         runs_guest_code_between_injections: true,
+        reports_sigreturns: false,
         ..Self::PTRACE
     };
 
@@ -317,6 +347,7 @@ impl BackendCapabilities {
         supports_blocked_wait_signal_interruption: false,
         delivers_preemption_timer_events: false,
         promotes_open_files_before_native_lifecycle: true,
+        reports_sigreturns: false,
         ..Self::PTRACE
     };
 
@@ -332,6 +363,7 @@ impl BackendCapabilities {
         reports_child_exit_publication: false,
         supports_blocked_wait_signal_interruption: false,
         delivers_preemption_timer_events: false,
+        reports_sigreturns: false,
         ..Self::PTRACE
     };
 }
@@ -375,12 +407,22 @@ mod tests {
             "delivers_preemption_timer_events": true,
             "runs_guest_code_between_injections": false,
             "promotes_open_files_before_native_lifecycle": false,
+            "reports_sigreturns": cfg!(target_arch = "x86_64"),
         })
     }
 
     /// The ptrace table with `changes` applied; every key in `changes` must
     /// already exist and must actually change, so a table cannot list a no-op.
-    fn ptrace_with(changes: serde_json::Value) -> serde_json::Value {
+    /// Off x86-64 ptrace does not report sigreturns either, so there a
+    /// `reports_sigreturns: false` change is the no-op it would be, and is
+    /// dropped.
+    fn ptrace_with(mut changes: serde_json::Value) -> serde_json::Value {
+        if !cfg!(target_arch = "x86_64") {
+            changes
+                .as_object_mut()
+                .unwrap()
+                .remove("reports_sigreturns");
+        }
         let mut table = ptrace_table();
         for (key, value) in changes.as_object().unwrap() {
             let slot = table
@@ -398,8 +440,13 @@ mod tests {
     }
 
     #[test]
-    fn e9patch_capabilities_are_ptraces() {
-        assert_eq!(table(BackendCapabilities::E9PATCH), ptrace_table());
+    fn e9patch_capabilities_are_ptraces_but_for_sigreturn_reports() {
+        assert_eq!(
+            table(BackendCapabilities::E9PATCH),
+            ptrace_with(serde_json::json!({
+                "reports_sigreturns": false,
+            }))
+        );
     }
 
     #[test]
@@ -417,6 +464,7 @@ mod tests {
                 "delivers_preemption_timer_events": false,
                 "runs_guest_code_between_injections": true,
                 "promotes_open_files_before_native_lifecycle": true,
+                "reports_sigreturns": false,
             }))
         );
     }
@@ -441,6 +489,7 @@ mod tests {
                 "supports_blocked_wait_signal_interruption": false,
                 "delivers_preemption_timer_events": false,
                 "runs_guest_code_between_injections": true,
+                "reports_sigreturns": false,
             }))
         );
     }
@@ -461,6 +510,7 @@ mod tests {
                 "supports_blocked_wait_signal_interruption": false,
                 "delivers_preemption_timer_events": false,
                 "promotes_open_files_before_native_lifecycle": true,
+                "reports_sigreturns": false,
             }))
         );
     }
@@ -479,6 +529,7 @@ mod tests {
                 "reports_child_exit_publication": false,
                 "supports_blocked_wait_signal_interruption": false,
                 "delivers_preemption_timer_events": false,
+                "reports_sigreturns": false,
             }))
         );
     }

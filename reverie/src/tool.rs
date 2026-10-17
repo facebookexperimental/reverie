@@ -877,6 +877,33 @@ pub trait Tool: Send + Sync + Default {
         true
     }
 
+    /// Whether this Tool wants every guest `rt_sigreturn` reported to
+    /// [`Tool::handle_sigreturn`], known from configuration alone. A backend
+    /// whose capabilities say it reports sigreturns
+    /// ([`BackendCapabilities::reports_sigreturns`](crate::BackendCapabilities::reports_sigreturns))
+    /// then reports each one, except those the capability names; the ptrace
+    /// backend stops at each guest `rt_sigreturn` only for such a Tool, and
+    /// not while its gdbserver is attached. The default wants none, so a
+    /// backend adds no stop.
+    fn observes_sigreturns(_config: &<Self::GlobalState as GlobalTool>::Config) -> bool {
+        false
+    }
+
+    /// Records one guest `rt_sigreturn` before it runs, for a Tool for which
+    /// [`Tool::observes_sigreturns`] holds, on a backend that reports
+    /// sigreturns. The backend then carries the call out exactly as it would
+    /// without the hook.
+    ///
+    /// The hook can only record: it gets the calling thread's state and the
+    /// report, and no access to the guest, so it cannot inject a syscall or
+    /// change the guest's registers or memory.
+    fn handle_sigreturn(
+        &self,
+        _thread_state: &mut Self::ThreadState,
+        _report: crate::SigreturnReport,
+    ) {
+    }
+
     /// Admits acknowledgment of real KVM pending removals before thread start.
     /// Other Tools retain their existing pending-state behavior by default.
     ///

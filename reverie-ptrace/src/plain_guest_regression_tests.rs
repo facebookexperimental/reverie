@@ -580,7 +580,20 @@ struct GuestConfig {
     tail: bool,
     /// Leaves getuid unsubscribed, so the subscription is partial.
     partial: bool,
+    /// Observes sigreturns (`Tool::observes_sigreturns`), recording each
+    /// report in `SIGRETURN_REPORTS`.
+    sigreturns: bool,
 }
+
+/// The `rt_sigreturn` reports the regression Tool was given, as (thread,
+/// frame). Only the tests that observe sigreturns add to it, each while
+/// holding `SIGRETURN_TESTS`.
+static SIGRETURN_REPORTS: Mutex<Vec<(i32, reverie::SigreturnFrame)>> = Mutex::new(Vec::new());
+
+/// Held by each test that observes sigreturns for its whole run, so that
+/// tests run in one process (plain `cargo test`) never share
+/// `SIGRETURN_REPORTS`.
+static SIGRETURN_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Default)]
 struct GuestLog(Mutex<Vec<(Pid, String)>>);
@@ -919,6 +932,17 @@ impl Tool for GuestTool {
         subscription
     }
 
+    fn observes_sigreturns(config: &GuestConfig) -> bool {
+        config.sigreturns
+    }
+
+    fn handle_sigreturn(&self, _thread_state: &mut (), report: reverie::SigreturnReport) {
+        SIGRETURN_REPORTS
+            .lock()
+            .unwrap()
+            .push((report.tid().as_raw(), report.frame()));
+    }
+
     async fn handle_thread_start<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Error> {
         let tid = guest.tid();
         STEP_BASE
@@ -1255,6 +1279,8 @@ struct GuestOptions {
     /// `TP_ORDER` in the guest's environment (see the fixture's
     /// `order_delay`).
     order: Option<&'static str>,
+    /// Observes sigreturns (`GuestConfig::sigreturns`).
+    sigreturns: bool,
 }
 
 async fn run_guest_options(mode: &str, options: GuestOptions) -> Result<GuestRun, Error> {
@@ -1269,6 +1295,7 @@ async fn run_guest_options(mode: &str, options: GuestOptions) -> Result<GuestRun
         .config(GuestConfig {
             tail: options.tail,
             partial: options.partial,
+            sigreturns: options.sigreturns,
         })
         .backend_stats(BackendStatsRequest::ENABLED)
         .final_resume_signal_for_test(resume_recorder(resumes.clone()))
@@ -1959,6 +1986,91 @@ async fn rt_sigreturn_to_the_private_page_return_keeps_the_frame() {
             "slot-ret getpid after pid=1",
             "slot-ret after site bytes 0f 05",
         ],
+    );
+}
+
+/// The guest's `rt_sigreturn` is reported, before it runs, to a Tool that
+/// observes sigreturns, with the mask its frame installs, and the call still
+/// runs exactly as before: the `sigreturn` mode's handler adds SIGUSR2 to its
+/// frame's mask, so both returns report SIGUSR2 blocked and SIGUSR1 not, and
+/// the guest sees the same mask and registers as without the hook. A frame
+/// on an unmapped page is reported as unmapped, and one on a PROT_NONE page,
+/// which ptrace itself could read but the guest cannot, as protected; the
+/// kernel forces SIGSEGV in both, as without the opt-in. A Tool that does not
+/// observe sigreturns is told of none.
+#[tokio::test(flavor = "current_thread")]
+async fn sigreturn_reports_carry_the_mask_each_frame_installs() {
+    let usr1 = 1u64 << (libc::SIGUSR1 - 1);
+    let usr2 = 1u64 << (libc::SIGUSR2 - 1);
+    let observing = GuestOptions {
+        sigreturns: true,
+        ..Default::default()
+    };
+    let _serial = SIGRETURN_TESTS.lock().await;
+    let take = || std::mem::take(&mut *SIGRETURN_REPORTS.lock().unwrap());
+    take();
+
+    let run = run_guest_options("sigreturn", observing)
+        .await
+        .expect("sigreturn run");
+    assert_report_has(
+        &run,
+        &[
+            "sigreturn 0: sig=10 code=-6 value=-1 ",
+            "after sigreturn usr1-blocked=0 usr2-blocked=1",
+            "sigreturn again 0: sig=10 code=-6 value=-1 ",
+        ],
+    );
+    let reports = take();
+    assert_eq!(
+        reports.len(),
+        2,
+        "one report per handler return: {reports:?}"
+    );
+    for (_, frame) in &reports {
+        let reverie::SigreturnFrame::Readable { mask } = *frame else {
+            panic!("the frame is readable: {frame:?}");
+        };
+        assert_eq!(mask & (usr1 | usr2), usr2, "frame mask {mask:#x}");
+    }
+
+    let plain = run_guest_options("sigreturn", GuestOptions::default())
+        .await
+        .expect("sigreturn run without the opt-in");
+    assert_report_has(&plain, &["after sigreturn usr1-blocked=0 usr2-blocked=1"]);
+    assert_eq!(take(), [], "a Tool that does not observe sigreturns");
+
+    let bad = run_guest_options("sigreturn_bad_frame", observing)
+        .await
+        .expect("bad-frame run");
+    assert_report_has(
+        &bad,
+        &["bad-frame SIGSEGV code=128 rip-next=1 rax=0 bytes after 0f 05"],
+    );
+    let reports = take();
+    assert!(
+        reports
+            .iter()
+            .any(|(_, frame)| *frame == reverie::SigreturnFrame::Unmapped),
+        "the frame on an unmapped page is reported as unmapped: {reports:?}"
+    );
+
+    let prot_none = run_guest_options("sigreturn_prot_none_frame", observing)
+        .await
+        .expect("PROT_NONE-frame run");
+    let plain_prot_none = run_guest_options("sigreturn_prot_none_frame", GuestOptions::default())
+        .await
+        .expect("PROT_NONE-frame run without the opt-in");
+    assert_eq!(
+        prot_none.report, plain_prot_none.report,
+        "the guest sees no difference"
+    );
+    let reports = take();
+    assert!(
+        reports
+            .iter()
+            .any(|(_, frame)| *frame == reverie::SigreturnFrame::Protected),
+        "a PROT_NONE frame is reported as protected: {reports:?}"
     );
 }
 
@@ -2742,10 +2854,27 @@ fn panic_text(panic: &(dyn std::any::Any + Send)) -> String {
 /// every attempt fails, each with such an outcome, the test fails too,
 /// reporting that it measured nothing.
 async fn timer_mode_runs(mode: &str, check: impl Fn(&[GuestRun; 2])) -> [GuestRun; 2] {
+    timer_mode_runs_with(mode, GuestOptions::default(), check).await
+}
+
+/// [`timer_mode_runs`] with `options` beyond the mode and the Tool shape.
+async fn timer_mode_runs_with(
+    mode: &str,
+    options: GuestOptions,
+    check: impl Fn(&[GuestRun; 2]),
+) -> [GuestRun; 2] {
+    let shaped = |tail| GuestOptions { tail, ..options };
     let mut failures = Vec::new();
     for attempt in 1..=TIMER_ATTEMPTS {
         let _ = crate::timer::take_host_timed_timer_events();
-        let runs = [run_guest(mode, false).await, run_guest(mode, true).await];
+        let runs = [
+            run_guest_options(mode, shaped(false))
+                .await
+                .unwrap_or_else(|error| panic!("{mode} failed: {error}")),
+            run_guest_options(mode, shaped(true))
+                .await
+                .unwrap_or_else(|error| panic!("{mode} failed: {error}")),
+        ];
         let host_timed = crate::timer::take_host_timed_timer_events();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             for run in &runs {
@@ -2925,6 +3054,64 @@ async fn a_counting_timer_survives_an_untraced_number_and_a_handler_return() {
         })
         .await;
     }
+}
+
+/// A Tool that observes sigreturns makes each handler return a stop that the
+/// Tool does not see as an event, and the stop keeps an armed timer as an
+/// injected-trap `rt_sigreturn` does: far from its target the event survives,
+/// and within the keep margin (10005 branches) it is cancelled, where the
+/// guest's clock alone decides. `timer_far_sigreturn` arms its timer 30001
+/// branches before the handler returns: the same single timer event fires as
+/// without the opt-in. `timer_hop_sigreturn` arms it 3001 branches out: the
+/// event fires without the opt-in and is cancelled with it. Both handler
+/// returns are reported, one per run.
+#[tokio::test(flavor = "current_thread")]
+async fn a_reported_handler_return_keeps_a_timer_unless_within_the_keep_margin() {
+    if !crate::perf::is_perf_supported() {
+        eprintln!("skipping: perf counters are not supported here");
+        return;
+    }
+    let observing = GuestOptions {
+        sigreturns: true,
+        ..Default::default()
+    };
+    let _serial = SIGRETURN_TESTS.lock().await;
+    SIGRETURN_REPORTS.lock().unwrap().clear();
+    // Each attempt's check takes the reports its two runs made (a retried
+    // attempt's check takes its own): one handler return per run when
+    // observing, none otherwise.
+    let reports_per_attempt = |expected: usize| {
+        let reports = std::mem::take(&mut *SIGRETURN_REPORTS.lock().unwrap());
+        assert_eq!(reports.len(), expected, "{reports:?}");
+    };
+    let one_event = |line: &'static str, reports: usize| {
+        move |runs: &[GuestRun; 2]| {
+            reports_per_attempt(reports);
+            for run in runs {
+                assert_eq!(timer_events(run).len(), 1, "{:#?}", run.all_events());
+                assert_report_has(run, &[line]);
+            }
+        }
+    };
+    let far = "timer far sigreturn getpid=1 bytes after 0f 05";
+    let plain = timer_mode_runs("timer_far_sigreturn", one_event(far, 0)).await;
+    let observed = timer_mode_runs_with("timer_far_sigreturn", observing, one_event(far, 2)).await;
+    for (plain, observed) in plain.iter().zip(&observed) {
+        assert_eq!(timer_events(plain), timer_events(observed));
+    }
+    let near = "timer hop sigreturn getpid=1 bytes after 0f 05";
+    timer_mode_runs_with("timer_hop_sigreturn", observing, |runs| {
+        reports_per_attempt(2);
+        for run in runs {
+            assert_eq!(
+                timer_events(run),
+                Vec::<&String>::new(),
+                "within the keep margin"
+            );
+            assert_report_has(run, &[near]);
+        }
+    })
+    .await;
 }
 
 /// Every Tool-visible stop cancels an armed counting-phase timer, both a

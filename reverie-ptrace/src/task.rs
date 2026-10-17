@@ -1081,6 +1081,45 @@ fn callback_observation_decision(
     }
 }
 
+/// The offset of `uc_sigmask` in the x86-64 kernel `ucontext` that
+/// `rt_sigreturn` restores: after uc_flags (8), uc_link (8), uc_stack (24) and
+/// uc_mcontext (256 bytes). `uc_flags` is at offset 0.
+#[cfg(target_arch = "x86_64")]
+const UC_SIGMASK_OFFSET: u64 = 8 + 8 + 24 + 256;
+
+/// What of the `rt_sigreturn` frame at stack pointer `sp` can be read: see
+/// [`TracedTask::report_sigreturn`].
+#[cfg(target_arch = "x86_64")]
+fn sigreturn_frame(task: &Stopped, sp: u64) -> reverie::SigreturnFrame {
+    let mut words = [0u64; 2];
+    let mut protected = false;
+    for (word, offset) in words.iter_mut().zip([0, UC_SIGMASK_OFFSET]) {
+        let Some(address) = sp
+            .checked_add(offset)
+            .and_then(|address| usize::try_from(address).ok())
+            .and_then(Addr::<u8>::from_raw)
+        else {
+            return reverie::SigreturnFrame::Unmapped;
+        };
+        let mut bytes = [0u8; 8];
+        if task
+            .read_exact_with_user_access(address, &mut bytes)
+            .is_ok()
+        {
+            *word = u64::from_ne_bytes(bytes);
+        } else if task.read_value(address.cast::<u64>()).is_ok() {
+            protected = true;
+        } else {
+            return reverie::SigreturnFrame::Unmapped;
+        }
+    }
+    if protected {
+        reverie::SigreturnFrame::Protected
+    } else {
+        reverie::SigreturnFrame::Readable { mask: words[1] }
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 fn read_injected_frame(task: &Stopped, address: usize) -> Result<InjectedSyscallFrame, TraceError> {
     let address = Addr::from_raw(address).ok_or(Errno::EFAULT)?;
@@ -2135,6 +2174,13 @@ struct GlobalState<G: GlobalTool> {
     /// Events the tool is subscripted (like interception)
     subscriptions: Arc<Subscription>,
 
+    /// Whether the guest's own `rt_sigreturn` is reported to
+    /// `Tool::handle_sigreturn`: the Tool observes sigreturns and no
+    /// gdbserver is attached. A gdbserver's single-step into the call would
+    /// otherwise be interrupted by the report's seccomp stop. The seccomp
+    /// filter traces `rt_sigreturn` under the same rule (`seccomp_filter`).
+    reports_sigreturns: bool,
+
     /// guests are sequentialized already (by detcore for example), gdbserver
     /// should avoid sequentialize threads.
     sequentialized_guest: Arc<bool>,
@@ -2326,6 +2372,7 @@ impl<G: GlobalTool> Clone for GlobalState<G> {
             cfg: self.cfg.clone(),
             gs_ref: self.gs_ref.clone(),
             subscriptions: self.subscriptions.clone(),
+            reports_sigreturns: self.reports_sigreturns,
             sequentialized_guest: self.sequentialized_guest.clone(),
             injected_syscall_trap: self.injected_syscall_trap.clone(),
             fatal_session: self.fatal_session.clone(),
@@ -2700,10 +2747,14 @@ impl<L: Tool> TracedTask<L> {
     {
         let process_state = Arc::new(L::new(tid, &cfg));
         let fatal_session = Arc::new(FatalSession::new(&gs_ref, tid));
+        // The report reads an x86-64 signal frame (`report_sigreturn`).
+        let reports_sigreturns =
+            cfg!(target_arch = "x86_64") && L::observes_sigreturns(&cfg) && gdbserver.is_none();
         let global_state = GlobalState {
             gs_ref,
             cfg,
             subscriptions: Arc::new(options.events.clone()),
+            reports_sigreturns,
             sequentialized_guest: Arc::new(
                 gdbserver
                     .as_ref()
@@ -4179,6 +4230,21 @@ impl<L: Tool + 'static> TracedTask<L> {
         None
     }
 
+    /// Reports to `Tool::handle_sigreturn` the guest's `rt_sigreturn` about
+    /// to run with stack pointer `sp`. x86-64 `rt_sigreturn` reads its frame
+    /// at `sp - 8`, so the frame's `ucontext`, whose `uc_flags` word comes
+    /// first, starts at `sp`. Each word is read with the guest's own access
+    /// rights (`process_vm_readv`). A word that read fails on is read again
+    /// with ptrace's forced access (`PTRACE_PEEKDATA`), which reads any
+    /// mapped page whatever its protection: if that succeeds the word is
+    /// mapped but protected, otherwise it is unmapped.
+    #[cfg(target_arch = "x86_64")]
+    fn report_sigreturn(&mut self, task: &Stopped, sp: u64) {
+        let report = reverie::SigreturnReport::new(self.tid(), sp, sigreturn_frame(task, sp));
+        let tool = self.process_state.clone();
+        tool.handle_sigreturn(&mut self.thread_state, report);
+    }
+
     // TODO-HUMAN-REVIEW(PR-103): Review rewritten rt_sigreturn tail execution.
     #[cfg(target_arch = "x86_64")]
     async fn resume_injected_rt_sigreturn(
@@ -4215,7 +4281,9 @@ impl<L: Tool + 'static> TracedTask<L> {
         let (nr, args) = syscall.into_parts();
         // AUTONOMOUS-BOT-IMPLEMENTED
         if nr == Sysno::rt_sigreturn {
-            // The trap makes no Tool callback. More than the keep margin
+            // The trap makes no Tool callback, `Tool::handle_sigreturn`
+            // included: an injected-trap site is e9patch's, whose
+            // capabilities say it does not report sigreturns. More than the keep margin
             // (`PmuConfig::keep_margin`) short of a precise event's target,
             // before the programming can pass its period on any supported
             // processor, it leaves the timer event as it was, and the
@@ -5512,8 +5580,49 @@ impl<L: Tool + 'static> TracedTask<L> {
                 target: "reverie_ptrace::syscall",
                 "intercepting guest syscall"
             );
+            // Reverie's filter traces rt_sigreturn only where it is reported
+            // (`GlobalState::reports_sigreturns`). Any other traced
+            // rt_sigreturn, which only a guest's own filter can trace, goes
+            // to `handle_syscall_event` as before.
+            #[cfg(target_arch = "x86_64")]
+            let sigreturn = nr == Sysno::rt_sigreturn && self.global_state.reports_sigreturns;
+            #[cfg(not(target_arch = "x86_64"))]
+            let sigreturn = false;
+            if sigreturn {
+                // The Tool does not see this stop as an event and cannot ask
+                // for a timer here, so the stop keeps the timer event as an
+                // injected-trap rt_sigreturn does (`handle_injected_syscall`):
+                // it is cancelled only within `PmuConfig::keep_margin` of its
+                // target, where the guest's clock alone decides.
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let sp = task
+                        .getregs()
+                        .tracee_context(tid, "read rt_sigreturn registers")?
+                        .rsp;
+                    self.report_sigreturn(&task, sp);
+                    self.timer
+                        .disregard_stop_before_period()
+                        .map_err(TraceError::from)
+                        .tracee_context(tid, "keep the timer across rt_sigreturn")?;
+                }
+                self.ordinary_continuation()?;
+                self.ordinary_trace_continuation()?;
+                self.timer.finalize_requests();
+                // With nothing pending, the guest's own call is neither
+                // skipped nor given a result: it runs untouched on this
+                // resume. Linux ignores a signal handed to a resume from a
+                // ptrace event stop such as this seccomp stop, so a signal
+                // held for the resume stays held for the guest's next stop,
+                // as `handle_unsubscribed_mapping_syscall` leaves it.
+                return self
+                    .resume_stopped(task, None)
+                    .tracee_context(tid, "resume rt_sigreturn")?
+                    .next_state_with_owner(&self.ptracer_waits)
+                    .await
+                    .tracee_context(tid, "wait after rt_sigreturn");
+            }
             self.pending_syscall = Some((nr, args));
-
             let retval = cancellable(self.cancel_handler.clone(), async {
                 self.process_state
                     .clone()

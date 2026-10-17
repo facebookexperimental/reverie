@@ -1767,18 +1767,21 @@ static void mode_timer_cancel(void) {
   say("timer cancel site=%d ordinary=%d\n", site == pid, ordinary == pid);
 }
 
+/* The distance, in branches, at which timer_hop_handler arms its timer. */
+static volatile long timer_hop_distance = PM_BRANCHES + 1;
+
 static void timer_hop_handler(int sig, siginfo_t* si, void* uc_) {
   (void)sig;
   (void)si;
   (void)uc_;
-  SITEM(SYS_getppid, 0, 0, 0, 0, PM_BRANCHES + 1, ARM_TIMER);
+  SITEM(SYS_getppid, 0, 0, 0, 0, timer_hop_distance, ARM_TIMER);
 }
 
 /* The same timer, armed at the site's getppid inside a signal handler
  * whose restorer runs rt_sigreturn through that same warmed site, before
  * the branch loop in which the timer fires (three
  * times the armed distance, for the reason given at mode_timer_hop_unknown). */
-static void mode_timer_hop_sigreturn(void) {
+static void timer_hop_sigreturn(const char* label) {
   warm();
   struct {
     void* handler;
@@ -1796,14 +1799,23 @@ static void mode_timer_hop_sigreturn(void) {
   long tid = syscall(SYS_gettid);
   if (syscall(SYS_tgkill, pid, tid, SIGUSR1) != 0)
     die("tgkill");
-  for (volatile int j = 0; j < 3 * PM_BRANCHES; j++)
+  for (volatile long j = 0; j < 3 * timer_hop_distance; j++)
     ;
   long g = SITE(SYS_getpid, 0, 0, 0, 0, 0);
   unsigned char* p = (unsigned char*)tp_site;
-  say("timer hop sigreturn getpid=%d bytes after %02x %02x\n",
-      g == pid,
-      p[0],
-      p[1]);
+  say("%s getpid=%d bytes after %02x %02x\n", label, g == pid, p[0], p[1]);
+}
+
+static void mode_timer_hop_sigreturn(void) {
+  timer_hop_sigreturn("timer hop sigreturn");
+}
+
+/* As mode_timer_hop_sigreturn, with the timer armed 30001 branches out:
+ * more than three times reverie-ptrace's keep margin (10005), so a stop at
+ * the handler's rt_sigreturn finds the guest far from the timer's target. */
+static void mode_timer_far_sigreturn(void) {
+  timer_hop_distance = 10 * PM_BRANCHES + 1;
+  timer_hop_sigreturn("timer far sigreturn");
 }
 
 /* Under a partial subscription (the Tool does not subscribe to getuid). */
@@ -2665,6 +2677,8 @@ int main(int argc, char** argv) {
     mode_timer_hop_unknown();
   else if (!strcmp(m, "timer_hop_sigreturn"))
     mode_timer_hop_sigreturn();
+  else if (!strcmp(m, "timer_far_sigreturn"))
+    mode_timer_far_sigreturn();
   else if (!strcmp(m, "sigreturn_slot_ret"))
     mode_sigreturn_slot_ret();
   else if (!strcmp(m, "sigreturn_bad_frame"))

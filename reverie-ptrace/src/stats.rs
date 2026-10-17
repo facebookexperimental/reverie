@@ -116,7 +116,9 @@ impl PtraceBackendStatsSnapshot {
     ///
     /// These are included in [`Self::seccomp_stops`], because each one costs
     /// a stop like any other; this count says how many of them never reached
-    /// the Tool.
+    /// the Tool. The stop at a guest `rt_sigreturn` reported to
+    /// `Tool::handle_sigreturn` is counted in [`Self::seccomp_stops`] and not
+    /// here, although `Tool::handle_syscall_event` never sees it.
     pub const fn internal_seccomp_stops(&self) -> u64 {
         self.internal_seccomp_stops
     }

@@ -93,7 +93,7 @@ fn run(program: &[Insn], nr: u32, arch: u32, ip: u64) -> u32 {
 #[test]
 fn plain_filter_for_all_syscalls_is_byte_identical_to_the_capture() {
     assert_eq!(
-        render(&seccomp_filter(&Subscription::all())),
+        render(&seccomp_filter(&Subscription::all(), false)),
         fixture_body(include_str!(
             "../tests/fixtures/ptrace_seccomp_filter_all_syscalls.txt"
         ))
@@ -106,7 +106,7 @@ fn plain_filter_for_all_syscalls_is_byte_identical_to_the_capture() {
 #[test]
 fn plain_filter_for_no_syscalls_is_byte_identical_to_the_capture() {
     assert_eq!(
-        render(&seccomp_filter(&Subscription::none())),
+        render(&seccomp_filter(&Subscription::none(), false)),
         fixture_body(include_str!(
             "../tests/fixtures/ptrace_seccomp_filter_no_syscalls.txt"
         ))
@@ -137,7 +137,7 @@ fn filter_decodes_as_specified() {
         0x1_7100_0006,
     ];
     for events in [Subscription::all(), Subscription::none()] {
-        let filter = insns(&seccomp_filter(&events));
+        let filter = insns(&seccomp_filter(&events, false));
         for nr in numbers {
             for ip in ips {
                 assert_eq!(
@@ -151,10 +151,10 @@ fn filter_decodes_as_specified() {
             }
         }
     }
-    let all = insns(&seccomp_filter(&Subscription::all()));
+    let all = insns(&seccomp_filter(&Subscription::all(), false));
     assert_eq!(run(&all, 39, AUDIT_ARCH_X86_64, 0x40_1000), RET_TRACE);
     assert_eq!(run(&all, 15, AUDIT_ARCH_X86_64, 0x40_1000), RET_ALLOW);
-    let none = insns(&seccomp_filter(&Subscription::none()));
+    let none = insns(&seccomp_filter(&Subscription::none(), false));
     assert_eq!(run(&none, 39, AUDIT_ARCH_X86_64, 0x40_1000), RET_ALLOW);
 }
 
@@ -241,7 +241,7 @@ fn kernel_verdict(filter: &Filter, ip: u64) -> u32 {
 /// `0x7100_0006` and addresses above the range in the same 4 GiB half.
 #[test]
 fn plain_ip_range_verdicts_match_the_kernel_witness() {
-    let filter = seccomp_filter(&Subscription::all());
+    let filter = seccomp_filter(&Subscription::all(), false);
     let all = insns(&filter);
     let mut rows = Vec::new();
     for ip in [
@@ -278,7 +278,7 @@ fn plain_ip_range_verdicts_match_the_kernel_witness() {
 /// trap-only slot rule test.)
 #[test]
 fn kernel_allows_every_ip_under_the_filter_for_no_syscalls() {
-    let filter = seccomp_filter(&Subscription::none());
+    let filter = seccomp_filter(&Subscription::none(), false);
     let program = insns(&filter);
     let mut rows = Vec::new();
     for ip in [
@@ -307,7 +307,7 @@ fn kernel_allows_every_ip_under_the_filter_for_no_syscalls() {
 /// deleted trap-only I386 route test.)
 #[test]
 fn kernel_kills_an_i386_syscall_with_sigsys() {
-    let filter = seccomp_filter(&Subscription::none());
+    let filter = seccomp_filter(&Subscription::none(), false);
     // SAFETY: the child only makes raw syscalls and exits.
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0, "fork failed");

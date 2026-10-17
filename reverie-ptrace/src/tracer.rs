@@ -3892,8 +3892,10 @@ async fn postspawn<L: Tool + 'static>(
 }
 
 /// Creates the seccomp filter. This lets us control which syscalls are traced
-/// and which ones are allowed through.
-fn seccomp_filter(events: &Subscription) -> seccomp::Filter {
+/// and which ones are allowed through. `observes_sigreturns` is
+/// [`Tool::observes_sigreturns`]: the guest's own `rt_sigreturn` is traced
+/// only then.
+fn seccomp_filter(events: &Subscription, observes_sigreturns: bool) -> seccomp::Filter {
     use reverie::process::seccomp::Action;
 
     seccomp::FilterBuilder::new()
@@ -3905,11 +3907,21 @@ fn seccomp_filter(events: &Subscription) -> seccomp::Filter {
                 .iter_syscalls()
                 .map(|syscall| (syscall, Action::Trace(0))),
         )
-        // rt_sigreturn must execute from Reverie's private page while restoring
-        // a signal frame. restart_syscall deliberately has no unconditional
-        // override: like every ordinary syscall, it is traced exactly when the
-        // Tool subscribes to it and otherwise falls through to the Allow default.
-        .syscall(Sysno::rt_sigreturn, Action::Allow)
+        // The guest's rt_sigreturn is never shown to handle_syscall_event. It
+        // is traced only to report it to Tool::handle_sigreturn, and Reverie's
+        // own, run from its private page, is allowed by the ip_range rule
+        // below, which seccomp checks first. restart_syscall deliberately has
+        // no unconditional override: like every ordinary syscall, it is traced
+        // exactly when the Tool subscribes to it and otherwise falls through
+        // to the Allow default.
+        .syscall(
+            Sysno::rt_sigreturn,
+            if observes_sigreturns {
+                Action::Trace(0)
+            } else {
+                Action::Allow
+            },
+        )
         // Allow untraced syscalls through without tracing them.
         .ip_range(
             (cp::TRAMPOLINE_BASE + cp::SYSCALL_INSTR_SIZE) as u64,
@@ -4166,7 +4178,14 @@ impl<T: Tool + 'static> TracerBuilder<T> {
             });
         }
 
-        command.seccomp(seccomp_filter(&events));
+        // As `GlobalState::reports_sigreturns`: x86-64 only, and not while a
+        // gdbserver is attached.
+        command.seccomp(seccomp_filter(
+            &events,
+            cfg!(target_arch = "x86_64")
+                && T::observes_sigreturns(&config)
+                && self.gdbserver.is_none(),
+        ));
 
         // Command::spawn holds the launch lock from the child's first pipe
         // until clone returns, and not while it waits for the child to start
@@ -4343,7 +4362,10 @@ where
     let events = L::subscriptions(&config);
     let gref = Arc::new(global_state);
 
-    let seccomp_filter = seccomp_filter(&events);
+    let seccomp_filter = seccomp_filter(
+        &events,
+        cfg!(target_arch = "x86_64") && L::observes_sigreturns(&config),
+    );
 
     // While the pipes are made, no transient open of another thread may be
     // in flight: its descriptor would take a number from the pipes' budget.

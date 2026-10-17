@@ -95,6 +95,69 @@ impl UnreportedSignal {
     }
 }
 
+/// What the backend could read of the two frame words x86-64 `rt_sigreturn`
+/// reads before it installs the frame's mask: `uc_flags` and `uc_sigmask`
+/// (`arch/x86/kernel/signal_64.c`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SigreturnFrame {
+    /// The guest's own access rights read both words; `mask` is the frame's
+    /// `uc_sigmask`. A protection key that the guest's PKRU denies is not
+    /// seen by such a read (it is a remote read), so the kernel's read can
+    /// still fault on a `Readable` frame.
+    Readable {
+        /// The frame's `uc_sigmask` word.
+        mask: u64,
+    },
+    /// A word is not mapped: the kernel's read faults.
+    Unmapped,
+    /// Both words are mapped, but the guest's own access rights could not
+    /// read one of them. Whether the kernel's read faults then depends on the
+    /// mapping's protection, which the backend does not model: a `PROT_NONE`
+    /// page faults, while a write-only page is readable on x86. A tracer
+    /// whose own read is refused outright (a seccomp profile on the tracer
+    /// that denies `process_vm_readv`, say) reports every frame this way.
+    Protected,
+}
+
+/// One guest `rt_sigreturn`, as [`crate::Tool::handle_sigreturn`] sees it
+/// before the call runs: the thread that makes it, its stack pointer, and
+/// what the backend could read of the frame. The report is raw mechanism:
+/// whether Linux installs the frame's mask is the Tool's to decide.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SigreturnReport {
+    tid: Tid,
+    stack_pointer: u64,
+    frame: SigreturnFrame,
+}
+
+impl SigreturnReport {
+    /// Describes an `rt_sigreturn` by thread `tid` at `stack_pointer`, whose
+    /// frame read as `frame`.
+    pub const fn new(tid: Tid, stack_pointer: u64, frame: SigreturnFrame) -> Self {
+        Self {
+            tid,
+            stack_pointer,
+            frame,
+        }
+    }
+
+    /// The thread that makes the call.
+    pub const fn tid(&self) -> Tid {
+        self.tid
+    }
+
+    /// The stack pointer at the call. On x86-64 the frame the call reads
+    /// starts 8 bytes below it, and its `ucontext` starts at it.
+    pub const fn stack_pointer(&self) -> u64 {
+        self.stack_pointer
+    }
+
+    /// What the backend could read of the frame.
+    pub const fn frame(&self) -> SigreturnFrame {
+        self.frame
+    }
+}
+
 /// Receiver state after accepting one process-directed child-exit event.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ChildExitSignalDisposition {
