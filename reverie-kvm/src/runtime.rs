@@ -8298,3 +8298,7 @@ mod parent_death_tests;
 #[cfg(test)]
 #[path = "runtime/process_plan_tests.rs"]
 mod process_plan_tests;
+
+#[cfg(test)]
+#[path = "runtime/segment_slot_tests.rs"]
+mod segment_slot_tests;
