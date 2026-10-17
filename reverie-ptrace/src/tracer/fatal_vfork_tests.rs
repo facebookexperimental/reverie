@@ -353,7 +353,8 @@ mod fatal_vfork_tests {
                 .unwrap_or(Duration::from_secs(3));
         let controlled = std::env::var(ROLE).as_deref() == Ok("tracer");
         let _observations = controlled.then(FatalReapObservationScope::new);
-        let sentinel = controlled.then(|| fork_paused_child(deadline));
+        let sentinel_child = controlled.then(|| fork_paused_child(deadline));
+        let sentinel = sentinel_child.as_ref().map(PausedChild::pid);
         let sentinel_identity = sentinel.map(untraced_process_identity);
         if controlled {
             let channel =

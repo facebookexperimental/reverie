@@ -133,7 +133,8 @@ mod fatal_namespace_timer_tests {
         let marker_log = Arc::new(StdMutex::new(Vec::new()));
         crate::timer::EXEC_SIGNAL_OBSERVATIONS
             .with(|slot| *slot.borrow_mut() = Some(marker_log.clone()));
-        let sentinel = fork_paused_child(deadline);
+        let sentinel_child = fork_paused_child(deadline);
+        let sentinel = sentinel_child.pid();
         let sentinel_identity = untraced_process_identity(sentinel);
         let mut command = Command::new(payload());
         command

@@ -5013,7 +5013,8 @@ mod tests {
         let _observations = FatalReapObservationScope::new();
         let words = FatalWords::new();
         let address = words.0 as usize;
-        let sentinel = fork_paused_child(deadline);
+        let sentinel_child = fork_paused_child(deadline);
+        let sentinel = sentinel_child.pid();
         let sentinel_identity = untraced_process_identity(sentinel);
         let tracer = spawn_fn_with_config::<FatalTool, _>(
             move || {
@@ -7764,7 +7765,8 @@ mod tests {
         let address = words.0 as usize;
         pause.waiting_word.store(address, Ordering::SeqCst);
         crate::task::FATAL_FORK_PAUSE.with(|slot| *slot.borrow_mut() = Some(pause.clone()));
-        let sentinel = fork_paused_child(Instant::now() + Duration::from_millis(100));
+        let sentinel_child = fork_paused_child(Instant::now() + Duration::from_millis(100));
+        let sentinel = sentinel_child.pid();
         let sentinel_identity = untraced_process_identity(sentinel);
         let tracer = spawn_fn_with_config::<FatalTool, _>(
             move || {
@@ -8784,7 +8786,8 @@ mod tests {
                 "FIFO discriminator must retain CLOEXEC across fork",
             ));
         }
-        let pid = fork_paused_child(predicate_deadline);
+        // FifoSentinel reaps the child itself, also on unwind.
+        let pid = fork_paused_child(predicate_deadline).into_pid();
         let mut sentinel = FifoSentinel {
             pid,
             pidfd: None,
@@ -8910,9 +8913,154 @@ mod tests {
     }
 
     // The caller's existing absolute deadline stays authoritative. Simple
-    // identity fixtures use an explicit new 100 ms setup-only deadline.
-    fn fork_paused_child(deadline: Instant) -> Pid {
-        try_fork_paused_child(deadline, 0).expect("sentinel descriptor setup refused")
+    // identity fixtures use an explicit new 100 ms setup-only deadline. The
+    // child is owned from the moment it exists ([`PausedChild`]).
+    fn fork_paused_child(deadline: Instant) -> PausedChild {
+        PausedChild::new(
+            try_fork_paused_child(deadline, 0).expect("sentinel descriptor setup refused"),
+        )
+    }
+
+    /// A paused child this test process forked (`fork_paused_child`). Dropped,
+    /// also during a panic's unwind, it kills and reaps the child unless the
+    /// test already reaped it, so a test that fails before its own teardown
+    /// leaves no process behind; otherwise the child is reparented when the
+    /// test process exits and pauses for ever.
+    ///
+    /// Taking ownership cannot panic: the pidfd is opened without unwrapping.
+    /// The kill goes through that pidfd, which names this child and no
+    /// process that later reuses its pid, and finds a child already reaped
+    /// (ESRCH); without one the child is left in place, with a diagnostic.
+    /// Only this child's pid is waited for, and only after the pidfd showed
+    /// it unreaped, so another child's status is never taken. A copy
+    /// inherited by a process forked from the test (a guest that unwinds)
+    /// does nothing.
+    struct PausedChild {
+        pid: Pid,
+        pidfd: Option<OwnedFd>,
+        owner: u32,
+    }
+
+    impl PausedChild {
+        fn new(pid: Pid) -> Self {
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid.as_raw(), 0) };
+            Self {
+                pid,
+                pidfd: (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd as i32) }),
+                owner: std::process::id(),
+            }
+        }
+
+        fn pid(&self) -> Pid {
+            self.pid
+        }
+
+        /// Hands the child to an owner that reaps it itself.
+        fn into_pid(self) -> Pid {
+            let mut this = std::mem::ManuallyDrop::new(self);
+            drop(this.pidfd.take());
+            this.pid
+        }
+
+        /// Kills the child if it is still this process's unreaped child,
+        /// through its pidfd; returns whether it was. Without a pidfd that
+        /// accepts the signal it leaves the child alone and says so: the
+        /// numeric pid could by then name another child of this process.
+        fn kill_if_unreaped(&self) -> bool {
+            let Some(pidfd) = &self.pidfd else {
+                cleanup_unconfirmed(self.pid, "no pidfd names it");
+                return false;
+            };
+            let sent = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    pidfd.as_raw_fd(),
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            };
+            if sent == 0 {
+                return true;
+            }
+            match Errno::last() {
+                // Already reaped by the test.
+                Errno::ESRCH => {}
+                errno => cleanup_unconfirmed(self.pid, &format!("pidfd kill failed: {errno}")),
+            }
+            false
+        }
+    }
+
+    /// One stderr line for a paused child left in place; never panics, so it
+    /// cannot abort a test that is already unwinding.
+    fn cleanup_unconfirmed(pid: Pid, why: &str) {
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
+            "PAUSED_CHILD_CLEANUP_UNCONFIRMED: pid {pid}: {why}"
+        );
+    }
+
+    impl Drop for PausedChild {
+        fn drop(&mut self) {
+            if std::process::id() != self.owner || !self.kill_if_unreaped() {
+                return;
+            }
+            // A killed child is reaped at once; the bound only keeps a
+            // broken one from holding the test.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let reaped = unsafe {
+                    libc::waitpid(self.pid.as_raw(), std::ptr::null_mut(), libc::WNOHANG)
+                };
+                if reaped == self.pid.as_raw() {
+                    return;
+                }
+                let errno = Errno::last();
+                if reaped == -1 && errno == Errno::ECHILD {
+                    return;
+                }
+                if reaped == -1 && errno != Errno::EINTR {
+                    cleanup_unconfirmed(self.pid, &format!("wait failed: {errno}"));
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    cleanup_unconfirmed(self.pid, "not reaped within 2 s");
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    /// A paused child does not outlive a test that panics before its own
+    /// teardown: its owner kills and reaps it during the unwind.
+    #[test]
+    fn a_paused_child_does_not_outlive_a_test_that_panics() {
+        let mut child = None;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let owned = fork_paused_child(Instant::now() + Duration::from_millis(100));
+            child = Some(untraced_process_identity(owned.pid()));
+            panic!("the test fails before its own teardown");
+        }));
+        assert!(outcome.is_err());
+        let child = child.expect("the child was created");
+        let survived = child.same_process();
+        let waited =
+            unsafe { libc::waitpid(child.tid.as_raw(), std::ptr::null_mut(), libc::WNOHANG) };
+        let errno = Errno::last();
+        if survived {
+            // Never leave the child of a failed check behind either.
+            let _ = child.send_signal(Signal::SIGKILL);
+            unsafe { libc::waitpid(child.tid.as_raw(), std::ptr::null_mut(), 0) };
+        }
+        assert!(!survived, "the paused child survived its test");
+        assert_eq!(
+            (waited, errno),
+            (-1, Errno::ECHILD),
+            "the paused child was reaped"
+        );
     }
 
     #[derive(Debug)]
@@ -10007,14 +10155,22 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_pre_exec_childs_exit_during_first_initialization_is_filtered() {
         let mut command = Command::new("/bin/true");
-        // SAFETY: the callback only forks; the child closes the descriptors
-        // it inherited and waits. It must close the spawn's close-on-exec
+        // SAFETY: the callback only forks; the child asks to die with its
+        // parent, closes the descriptors it inherited and waits. It must close the spawn's close-on-exec
         // status pipe, which it would otherwise hold open, never exec'ing,
         // and the spawn would wait on it forever: where `close_range` fails,
         // it closes each descriptor up to its limit.
         unsafe {
             command.pre_exec(|| {
+                let parent = libc::getpid();
                 if libc::fork() == 0 {
+                    // Untraced: dies with its parent, so a failed spawn does
+                    // not leave it paused for ever.
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0
+                        || libc::getppid() != parent
+                    {
+                        libc::_exit(0);
+                    }
                     if libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) != 0 {
                         let mut limit: libc::rlimit = std::mem::zeroed();
                         let max = if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
@@ -10785,14 +10941,16 @@ mod tests {
 
     #[test]
     fn stale_pidfd_identity_never_signals_reused_numeric_pid() {
-        let old_pid = fork_paused_child(Instant::now() + Duration::from_millis(100));
+        let old = fork_paused_child(Instant::now() + Duration::from_millis(100));
+        let old_pid = old.pid();
         let mut identity = untraced_process_identity(old_pid);
         identity
             .send_signal(Signal::SIGKILL)
             .expect("kill old child");
         Running::new(old_pid).wait().expect("reap old child");
 
-        let unrelated_pid = fork_paused_child(Instant::now() + Duration::from_millis(100));
+        let unrelated = fork_paused_child(Instant::now() + Duration::from_millis(100));
+        let unrelated_pid = unrelated.pid();
         identity.tid = unrelated_pid;
         assert_eq!(identity.send_signal(Signal::SIGKILL), Err(Errno::ESRCH));
         assert_eq!(unsafe { libc::kill(unrelated_pid.as_raw(), 0) }, 0);
@@ -10805,7 +10963,8 @@ mod tests {
 
     #[test]
     fn tracee_generation_survives_zombie_until_real_reap() {
-        let pid = fork_paused_child(Instant::now() + Duration::from_millis(100));
+        let child = fork_paused_child(Instant::now() + Duration::from_millis(100));
+        let pid = child.pid();
         let identity = untraced_process_identity(pid);
         identity
             .send_signal(Signal::SIGKILL)
