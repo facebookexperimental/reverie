@@ -91,10 +91,9 @@ pub use request::SyscallRequest;
 ///
 /// [`ProviderOutcome::Cancelled`] and [`ProviderOutcome::ThreadGroupExited`]
 /// produce no syscall result at all: the call never returns to the issuing
-/// task. The remaining outcomes (a segment-base effect for
-/// `arch_prctl(ARCH_SET_FS/GS)` and an exit) are added in a later step. Until
-/// then an implementation reports them to its backend outside this trait,
-/// after `execute` returns `Return` with the call's raw result.
+/// task. The remaining outcome, an exit, is added in a later step. Until then
+/// an implementation reports it to its backend outside this trait, after
+/// `execute` returns `Return` with the call's raw result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderOutcome<Plan> {
     /// The raw Linux result: a nonnegative value, or `-errno` for a Linux
@@ -132,6 +131,30 @@ pub enum ProviderOutcome<Plan> {
         /// The provider's description of the process action.
         plan: Plan,
     },
+    /// The call succeeded with `result` and set the issuing task's FS or GS
+    /// segment base to `base` (`arch_prctl(ARCH_SET_FS)` or `ARCH_SET_GS`).
+    /// The provider's own record of the base is already updated. The backend
+    /// makes the task's CPU state use `base` before the task next runs in user
+    /// mode. Until then a later base set for the same register of the same
+    /// task replaces this one, and an exec of the task discards it.
+    SegmentBase {
+        /// The raw successful result the provider computed.
+        result: i64,
+        /// Which segment register's base was set.
+        register: SegmentRegister,
+        /// The new base address.
+        base: u64,
+    },
+}
+
+/// A segment register whose base a task can set
+/// ([`ProviderOutcome::SegmentBase`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SegmentRegister {
+    /// The FS register, which x86-64 Linux uses for thread-local storage.
+    Fs,
+    /// The GS register.
+    Gs,
 }
 
 /// Executes Linux syscalls on behalf of guest tasks: the provider-neutral core
@@ -230,6 +253,8 @@ pub trait LinuxProvider: Send + Sync {
     /// - `Ok(ProviderOutcome::Process { result, plan })` is a successful call
     ///   whose process action the backend carries out before the call
     ///   completes.
+    /// - `Ok(ProviderOutcome::SegmentBase { .. })` is a successful call that
+    ///   set a segment base the backend must apply.
     /// - `Ok(ProviderOutcome::Cancelled)` and
     ///   `Ok(ProviderOutcome::ThreadGroupExited { .. })` produce no syscall
     ///   result; see [`ProviderOutcome`].

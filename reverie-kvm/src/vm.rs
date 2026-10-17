@@ -1552,6 +1552,22 @@ pub struct KvmBackend {
     // Public runs that never returned, with every child host thread their
     // roots still own. Once one exists, no run or image is admitted.
     pub(crate) abandoned_runs: Arc<Mutex<AbandonedRuns>>,
+    /// The FS or GS base staged during the current guest callback and applied
+    /// to the vCPU at the next return to the guest. A later staged base
+    /// replaces an earlier one, an exec discards it, and a new task lifetime
+    /// on this backend (an installed image, or a run's new root executor)
+    /// starts with it empty, as each new executor's slot did. It was the
+    /// executor's `pending_segment` until provider step E2e; the rule is
+    /// unchanged.
+    ///
+    /// Known deviation, kept on purpose so that E2e changes no behaviour: the
+    /// slot is shared by both registers. So a callback that sets FS and then
+    /// GS applies only the GS base to the vCPU, although the provider records
+    /// both. The provider contract (`ProviderOutcome::SegmentBase`) is per
+    /// register; KVM's fix is a separate, behaviour-changing commit, drafted
+    /// as an issue in the dev-hermit parent
+    /// (pending-issue-reverie-kvm-segment-slot.md).
+    pending_segment: Option<(SegmentBase, u64)>,
 }
 
 struct CompletedToolPanic {
@@ -1872,6 +1888,7 @@ impl KvmBackend {
             ids_per_task: reverie::task_ids::LINUX_IDS_PER_TASK,
             exit_collector: None,
             abandoned_runs: Arc::default(),
+            pending_segment: None,
         })
     }
 
@@ -2169,6 +2186,9 @@ impl KvmBackend {
         )?;
         self.memory.enable_user_access();
         self.static_elf = Some(loaded);
+        // A new image starts a new task lifetime: nothing staged for an
+        // earlier one survives (on the base it died with that executor).
+        self.pending_segment = None;
         self.vcpu.new_elf_guest();
         Ok(())
     }
@@ -2441,7 +2461,36 @@ impl KvmBackend {
         )?;
         self.memory.enable_user_access();
         executor.replace_after_exec(loaded);
+        // An exec discards a base staged for the old image, as
+        // replace_after_exec discards the executor's.
+        self.pending_segment = None;
         Ok(())
+    }
+
+    /// Stages an FS or GS base for the next return to the guest. A later base
+    /// replaces an earlier one; `None` leaves the slot as it is.
+    pub(crate) fn stage_segment(&mut self, segment: Option<(SegmentBase, u64)>) {
+        if segment.is_some() {
+            self.pending_segment = segment;
+        }
+    }
+
+    /// Moves a base the executor staged during a direct call (one that did
+    /// not go through the provider trait) into the backend's slot. Called
+    /// after every such call, before any reader.
+    pub(crate) fn harvest_segment(&mut self, executor: &mut ElfExecutor) {
+        self.stage_segment(executor.take_segment());
+    }
+
+    /// Takes the staged base, to apply it to the vCPU.
+    pub(crate) fn take_pending_segment(&mut self) -> Option<(SegmentBase, u64)> {
+        self.pending_segment.take()
+    }
+
+    /// Discards any staged base when a new task lifetime begins on this
+    /// backend, as a new executor's slot started empty.
+    pub(crate) fn clear_pending_segment(&mut self) {
+        self.pending_segment = None;
     }
 
     /// Capture one complete parent read state only after admission. The owned
@@ -4983,6 +5032,8 @@ impl KvmBackend {
     fn run_admitted_static_elf(&mut self) -> Result<i32> {
         self.admit_host_metadata_timestamps(false)?;
         let loaded = self.static_elf.take().ok_or(Error::StaticElfNotInstalled)?;
+        // A new root executor starts with an empty segment slot.
+        self.pending_segment = None;
         let mut executor = ElfExecutor::with_output(loaded, None);
         let result = self.run_static_elf_process(&mut executor);
         let (status, _, _) = result.map_err(|error| self.finish_direct_process_error(error))?;
@@ -5003,6 +5054,8 @@ impl KvmBackend {
         // executor/child cleanup, including early-return and unwind paths.
         let capture_owner = self.prepare_captured_output(true)?;
         let loaded = self.static_elf.take().ok_or(Error::StaticElfNotInstalled)?;
+        // A new root executor starts with an empty segment slot.
+        self.pending_segment = None;
         let mut executor = ElfExecutor::with_output(loaded, capture_owner.clone());
         let result = self.run_static_elf_process(&mut executor);
         let (status, stdout, stderr) =
@@ -5199,8 +5252,9 @@ impl KvmBackend {
                                 Err(error) => return Err(error),
                             };
                         SyscallRequest::write_result(&mut self.memory, frame_address, result)?;
+                        self.harvest_segment(executor);
                         (
-                            executor.take_segment(),
+                            self.take_pending_segment(),
                             executor.take_process_action(),
                             Some((frame_address, result)),
                         )

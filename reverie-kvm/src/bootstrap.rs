@@ -90,6 +90,24 @@ pub(crate) enum SegmentBase {
     Gs,
 }
 
+impl From<SegmentBase> for reverie::provider::SegmentRegister {
+    fn from(segment: SegmentBase) -> Self {
+        match segment {
+            SegmentBase::Fs => Self::Fs,
+            SegmentBase::Gs => Self::Gs,
+        }
+    }
+}
+
+impl From<reverie::provider::SegmentRegister> for SegmentBase {
+    fn from(register: reverie::provider::SegmentRegister) -> Self {
+        match register {
+            reverie::provider::SegmentRegister::Fs => Self::Fs,
+            reverie::provider::SegmentRegister::Gs => Self::Gs,
+        }
+    }
+}
+
 pub(crate) fn configure_long_mode(
     memory: &mut GuestMemory,
     vcpu: &VcpuFd,

@@ -46,6 +46,7 @@ use crate::KvmBackend;
 use crate::Result;
 use crate::SyscallRequest;
 use crate::VMCALL_SYSCALL_TRANSPORT;
+use crate::bootstrap::SegmentBase;
 use crate::bootstrap::TOOL_STACK_SIZE;
 use crate::bootstrap::process_syscall_return_registers;
 use crate::bootstrap::set_user_segment_base;
@@ -361,6 +362,15 @@ trait GuestSyscallExecutor<T: Tool>:
         true
     }
 
+    /// Stages a segment base that a provider's `SegmentBase` outcome
+    /// reported, for the next return to the guest. An adapter that cannot
+    /// apply one refuses: it ends the run rather than dropping the base.
+    fn stage_segment(&mut self, _segment: SegmentBase, _base: u64) -> Result<()> {
+        Err(Error::UnexpectedVcpuExit(
+            "this KVM adapter cannot apply a segment base".to_owned(),
+        ))
+    }
+
     // TODO-HUMAN-REVIEW(PR-235): Review virtual process ancestry exposed to Tool handlers.
     /// The traced parent of the issuing task: the task the Tool treats as
     /// this task's parent in the traced process tree, reported to the Tool as
@@ -664,17 +674,20 @@ fn provider_disposition(error: Error) -> Result<ProviderOutcome> {
 ///   vCPU's host thread, which a blocking read still blocks, exactly as when
 ///   the method was synchronous, and so its future completes on the first
 ///   poll.
-/// - `Return`, `Process`, `Cancelled` and `ThreadGroupExited` are produced.
-///   `Process` reports that a successful call left a process action (fork,
-///   clone, exec) staged in the executor. `complete_injection` takes it from
-///   there and carries it out, and on any path that does not complete the
-///   action keeps the executor's lifecycle. `Cancelled` and
-///   `ThreadGroupExited` come from the executor's dispositional errors
-///   through [`provider_disposition`]. A staged segment base or exit is still
-///   left in the executor's side channels, consumed after `execute` by the
-///   vCPU loop. The vCPU loop's own direct executor calls (an unsubscribed
-///   syscall, and runs with no Tool) still take process actions from the
-///   executor themselves.
+/// - `Return`, `Process`, `SegmentBase`, `Cancelled` and `ThreadGroupExited`
+///   are produced. `Process` reports that a successful call left a process
+///   action (fork, clone, exec) staged in the executor. `complete_injection`
+///   takes it from there and carries it out, and on any path that does not
+///   complete the action keeps the executor's lifecycle. `SegmentBase`
+///   carries the FS/GS base `arch_prctl` set; `KvmGuest::inject` stages it in
+///   the backend's slot through `GuestSyscallExecutor::stage_segment`, and
+///   the vCPU loop applies it. `Cancelled` and `ThreadGroupExited` come from
+///   the executor's dispositional errors through [`provider_disposition`]. A
+///   staged exit is still left in the executor's side channel, consumed
+///   after `execute` by the vCPU loop. The vCPU loop's own direct executor
+///   calls (an unsubscribed syscall, and runs with no Tool) still take
+///   process actions from the executor themselves, and move any staged base
+///   into the backend's slot with `KvmBackend::harvest_segment`.
 /// - `execute` still performs three backend admission checks before the
 ///   executor sees the request (the signal guard and prepared-signal state,
 ///   the lifecycle signal-mask preflight, and whether the callback context
@@ -788,6 +801,19 @@ impl LinuxProvider for StaticElfSyscallExecutor<'_> {
         };
         self.last_result = Some(result);
         self.polled_read_attempt = Some((*request, result));
+        // A base staged by arch_prctl goes to the backend in the outcome: the
+        // backend used to read it from the executor later in the same
+        // callback, and no call reaches the executor in between. Only a
+        // successful call stages one, and no call that stages one also stages
+        // a process action; an action staged by an earlier call stays in the
+        // executor either way, and complete_injection takes it as before.
+        if let Some((segment, base)) = self.executor.take_segment() {
+            return Ok(ProviderOutcome::SegmentBase {
+                result,
+                register: segment.into(),
+                base,
+            });
+        }
         // A successful call that staged a process action (none was staged
         // before it, one is now) reports it as a Process outcome. The action
         // itself stays in the executor, and complete_injection takes it from
@@ -1136,6 +1162,11 @@ where
         self.signal_guard == SignalGuard::Ordinary
             && !self.executor.has_prepared_signal()
             && self.process_context.tail_injection_allowed(request)
+    }
+
+    fn stage_segment(&mut self, segment: SegmentBase, base: u64) -> Result<()> {
+        self.backend.stage_segment(Some((segment, base)));
+        Ok(())
     }
 
     fn complete_injection<'a>(
@@ -1775,6 +1806,27 @@ impl<T: Tool> Guest<T> for KvmGuest<'_, T> {
                     return std::future::pending().await;
                 }
                 (result, Some(plan))
+            }
+            Ok(ProviderOutcome::SegmentBase {
+                result,
+                register,
+                base,
+            }) => {
+                self.unsupported_refusal = provider.take_unsupported_refusal();
+                if raw_to_result(result).is_err() {
+                    // The provider contract: a segment base accompanies only a
+                    // successful result. The static-ELF adapter reports one
+                    // only then, so this is a broken invariant.
+                    self.signal_handler(HandlerSignal::RuntimeError(Error::UnexpectedVcpuExit(
+                        format!("KVM provider returned a segment base with result {result}"),
+                    )));
+                    return std::future::pending().await;
+                }
+                if let Err(error) = self.executor.stage_segment(register.into(), base) {
+                    self.signal_handler(HandlerSignal::RuntimeError(error));
+                    return std::future::pending().await;
+                }
+                (result, None)
             }
             Ok(ProviderOutcome::ThreadGroupExited { status }) => {
                 // The group exit is already committed, not a request to cancel
@@ -4977,6 +5029,8 @@ impl KvmBackend {
         // Keep this root owner until the later executor and its workers retire.
         let capture_owner = self.prepare_captured_output(capture_output)?;
         let mut loaded = self.static_elf.take().ok_or(Error::StaticElfNotInstalled)?;
+        // A new root executor starts with an empty segment slot.
+        self.clear_pending_segment();
         // Output capture replaces stdout and stderr with the executor's pipes,
         // but an explicitly configured stdin remains the guest's input. Use
         // /dev/null only when the caller supplied no stdin, matching
@@ -5723,7 +5777,7 @@ impl KvmBackend {
                 }
             }
 
-            if let Some((segment, address)) = executor.take_segment() {
+            if let Some((segment, address)) = self.take_pending_segment() {
                 set_user_segment_base(&self.vcpu, segment, address)?;
             }
             if let Some(exit) = executor.take_exit() {
@@ -5977,7 +6031,7 @@ impl KvmBackend {
                                         .to_owned(),
                                 ));
                             }
-                            if let Some((segment, address)) = executor.take_segment() {
+                            if let Some((segment, address)) = self.take_pending_segment() {
                                 set_user_segment_base(&self.vcpu, segment, address)?;
                             }
                             self.resume_tool_instruction(boundary, value)?;
@@ -6023,7 +6077,7 @@ impl KvmBackend {
                                 return self.retired_tool_thread_status(executor);
                             }
                         };
-                        if let Some((segment, address)) = executor.take_segment() {
+                        if let Some((segment, address)) = self.take_pending_segment() {
                             set_user_segment_base(&self.vcpu, segment, address)?;
                         }
                         if pending.is_some() && !executor.has_pending_exit() {
@@ -6124,7 +6178,7 @@ impl KvmBackend {
                                 return self.retired_tool_thread_status(executor);
                             }
                         };
-                        if let Some((segment, address)) = executor.take_segment() {
+                        if let Some((segment, address)) = self.take_pending_segment() {
                             set_user_segment_base(&self.vcpu, segment, address)?;
                         }
                         signal_exit = executor.take_exit();
@@ -6415,6 +6469,9 @@ impl KvmBackend {
                         }
                         Err(error) => return Err(executor.with_signal_effects(error, None)),
                     };
+                    // A direct call, not through the provider: move any base it
+                    // staged into the backend's slot before anything reads it.
+                    self.harvest_segment(executor);
                     flush_pending_signal_effects_with_tool(
                         self,
                         executor,
@@ -6447,7 +6504,7 @@ impl KvmBackend {
                 // The ring0 trampoline reads the result from the frame and then
                 // SYSRETs, so the hypercall return slot is unused here.
                 SyscallRequest::write_result(&mut memory, frame_address, result)?;
-                let pending_segment = executor.take_segment();
+                let pending_segment = self.take_pending_segment();
                 let mut pending_exit = executor.take_exit();
                 let pending_process = executor.take_process_action();
 
@@ -6555,7 +6612,7 @@ impl KvmBackend {
                         return Err(error);
                     }
                 }
-                if let Some((segment, address)) = executor.take_segment() {
+                if let Some((segment, address)) = self.take_pending_segment() {
                     set_user_segment_base(&self.vcpu, segment, address)?;
                 }
                 let mut signal_boundary_outcome = reverie::SignalBoundaryOutcome::NoHandler;
@@ -6597,7 +6654,7 @@ impl KvmBackend {
                             return self.retired_tool_thread_status(executor);
                         }
                     };
-                    if let Some((segment, address)) = executor.take_segment() {
+                    if let Some((segment, address)) = self.take_pending_segment() {
                         set_user_segment_base(&self.vcpu, segment, address)?;
                     }
                     pending_exit = pending_exit.or_else(|| executor.take_exit());
