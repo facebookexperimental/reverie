@@ -1547,6 +1547,47 @@ fn compiled_role_filename(
 }
 impl VerifiedCompiledSources {
     pub fn resolve(expected: &CompiledSourceExpectation<'_>, runner: &mut Runner) -> Result<Self> {
+        let verified = Self::resolve_candidate(expected, runner)?;
+        verified.verify_unchanged(runner)?;
+        Ok(verified)
+    }
+
+    /// Run the two fixture consumers' receipt-only qualification before closing
+    /// its independently resolved sources. This test-only helper coalesces the
+    /// intermediate resolution close with the close after receipt qualification;
+    /// ordinary callers of `resolve` retain their existing closing check.
+    ///
+    /// The audited body must not launch a guest or publish success. It receives
+    /// no runner, cannot reset the closing deadline, and may only return owned
+    /// results. No result escapes before the source close succeeds. Both phases
+    /// of a fixture still resolve fresh Cargo metadata and perform the full ELF
+    /// proof; no source authority or cached proof crosses guest execution.
+    #[cfg(test)]
+    pub(crate) fn with_resolved<T>(
+        expected: &CompiledSourceExpectation<'_>,
+        runner: &mut Runner,
+        body: impl FnOnce(&Self) -> Result<T>,
+    ) -> Result<(T, CompiledSources)> {
+        let candidate = Self::resolve_candidate(expected, runner)?;
+        let result = body(&candidate);
+        // Do not propagate the body's error before closing. The fixture's
+        // ordinary failure path must check the same source boundary as success.
+        let closed = candidate.verify_unchanged(runner);
+        match (result, closed) {
+            (Ok(value), Ok(())) => Ok((value, candidate.record)),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(close)) => Err(format!(
+                "{error}; compiled source transaction close failed: {close}"
+            )),
+        }
+    }
+
+    // Only the closed public factory and the audited test transaction above
+    // can construct this context. Neither returns it before a successful close.
+    fn resolve_candidate(
+        expected: &CompiledSourceExpectation<'_>,
+        runner: &mut Runner,
+    ) -> Result<Self> {
         require(
             source_pin_is_full(expected.reverie_pin),
             "compiled source requires an independent full Reverie pin",
@@ -1754,9 +1795,7 @@ impl VerifiedCompiledSources {
             files,
             leaf,
         };
-        let verified = Self { record };
-        verified.verify_unchanged(runner)?;
-        Ok(verified)
+        Ok(Self { record })
     }
     /// Explicit closed-profile Hermit source-copy authority. It never catches a Git error
     /// or accepts caller-supplied metadata, inventories or compiler mappings.
@@ -28427,6 +28466,32 @@ mod tests {
         ] {
             assert!(!source_pin_is_full(wrong), "{wrong}");
         }
+        // An invalid source request must not enter the test-only receipt body.
+        // This does not manufacture source authority: the real factory refuses
+        // before any Cargo/Git command or callback can run.
+        let mut runner = Runner::new(
+            root.join("refused-transaction-logs"),
+            Duration::from_secs(5),
+            8192,
+        )
+        .unwrap();
+        let refused = VerifiedCompiledSources::with_resolved(
+            &CompiledSourceExpectation {
+                layout: CompiledSourceLayout::ReverieWorkspace,
+                image_kind: FixedImageKind::Standalone,
+                workspace_root: &root,
+                manifest: &root.join("Cargo.toml"),
+                reverie_pin: "short",
+            },
+            &mut runner,
+            |_| -> Result<()> { panic!("invalid source request reached the receipt body") },
+        )
+        .expect_err("invalid source transaction must refuse");
+        assert_eq!(
+            refused,
+            "compiled source requires an independent full Reverie pin"
+        );
+        assert!(runner.commands.is_empty());
         let source = format!("git+https://github.com/rrnewton/reverie.git?rev={pin}#{pin}");
         let git_id = |name: &str| {
             format!("git+https://github.com/rrnewton/reverie.git?rev={pin}#{name}@0.4.1")
