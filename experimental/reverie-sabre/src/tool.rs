@@ -248,11 +248,6 @@ impl SyscallExt for Syscall {
         // TODO-HUMAN-REVIEW(PR-175): Review atomic rt_sigsuspend wake preservation.
         } else if sysno == Sysno::rt_sigsuspend {
             utils::sys_rt_sigsuspend(args.arg0 as *const _, args.arg1)
-        } else if sysno == Sysno::close && args.arg0 == libc::STDERR_FILENO as usize {
-            // Prevent stderr from getting closed. We need this for logging
-            // purposes.
-            // FIXME: All logging should go through the global state instead.
-            Ok(0)
         } else if sysno == Sysno::close_range {
             protected_files::sys_close_range(args.arg0, args.arg1, args.arg2)
         } else if let Some(result) = protected_fd_result(
