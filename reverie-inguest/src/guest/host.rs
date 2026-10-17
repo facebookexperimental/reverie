@@ -2875,7 +2875,7 @@ impl GuestMemory<'_> {
         GuestMemory {
             // SAFETY: the immutable executor below forwards one syscall with
             // unchanged arguments and result, synchronously on this thread.
-            local: unsafe { LocalMemory::with_syscall_executor(memory_syscall) },
+            local: unsafe { LocalMemory::with_syscall_executor(runtime_tool_syscall) },
             tail,
         }
     }
@@ -2889,14 +2889,14 @@ impl GuestMemory<'_> {
     }
 }
 
-/// Route runtime memory operations through the existing admitted instruction
+/// Route Tool-owned operations through the existing admitted instruction
 /// only inside an actual Tool callback. Initial/successor lifecycle work and
 /// callers outside that scope keep ordinary syscall interception.
-unsafe fn memory_syscall(number: Sysno, args: [usize; 6]) -> Result<usize, Errno> {
+unsafe fn runtime_tool_syscall(number: Sysno, args: [usize; 6]) -> Result<usize, Errno> {
     if tool_callback_active() {
-        // SAFETY: LocalMemory retains its numeric iovec arrays and borrowed
-        // buffers for this synchronous call. This grants no callback scope and
-        // changes neither the syscall operands nor the kernel result.
+        // SAFETY: the caller retains valid Tool-owned operands for this
+        // synchronous call. This grants no callback scope and changes neither
+        // the syscall operands nor the kernel result.
         let result = unsafe { raw_syscall6(number as i64, args.map(|arg| arg as u64)) };
         Errno::from_ret(result as usize)
     } else {
@@ -2974,6 +2974,12 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
 
     fn memory(&self) -> Self::Memory {
         GuestMemory::new(self.tail)
+    }
+
+    unsafe fn tool_syscall(&self, number: Sysno, args: [usize; 6]) -> Result<usize, Errno> {
+        // SAFETY: Guest::tool_syscall's caller vouches for these Tool-owned
+        // operands; the adapter preserves them and grants no callback scope.
+        unsafe { runtime_tool_syscall(number, args) }
     }
 
     fn thread_state_mut(&mut self) -> &mut T::ThreadState {
@@ -3526,6 +3532,151 @@ fn fatal(status: i32) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ToolSyscallRuntime;
+    impl HostRuntime for ToolSyscallRuntime {
+        fn fork_child_rebind(&self) {
+            panic!("test does not dispatch fork")
+        }
+        fn emit_stage(&self, _stage: &[u8]) {}
+        fn fork_child_reset(&self, _event: &SyscallEvent) {
+            panic!("test does not dispatch fork")
+        }
+        fn cpuid_interception_enabled(&self) -> bool {
+            false
+        }
+        fn exit_process_stats(&self, _tid: Pid) -> io::Result<()> {
+            panic!("test does not dispatch exit")
+        }
+        fn read_clock(&self) -> io::Result<u64> {
+            panic!("test does not read a clock")
+        }
+        fn signal_action_supported(&self, _number: i64, _args: [u64; 6]) -> bool {
+            false
+        }
+        fn reserved_signal_mask(&self) -> u64 {
+            1_u64 << (libc::SIGSYS - 1)
+        }
+    }
+
+    /// A public Guest method alone grants no callback authority. The fresh
+    /// subprocess avoids allocating Rust between fork and exec and installs the
+    /// real filter with default SIGSYS disposition, without a Tool callback,
+    /// fabricated guard, handler, or extra syscall allowance.
+    #[test]
+    fn tool_syscall_outside_callback_still_reaches_interception() {
+        use std::io::Write;
+        use std::os::unix::process::ExitStatusExt;
+        const CHILD: &str = "REVERIE_TOOL_SYSCALL_TEST_CHILD";
+        const TEST: &str =
+            "guest::host::tests::tool_syscall_outside_callback_still_reaches_interception";
+        const READY: &[u8] = b"tool-syscall-outside-ready\n";
+        if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(TEST)) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(CHILD, TEST)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.signal(), Some(libc::SIGSYS), "{output:?}");
+            assert_eq!(output.stderr, READY, "{output:?}");
+            return;
+        }
+
+        assert!(!tool_callback_active());
+        let mut filter =
+            crate::seccomp::SeccompFilter::for_trusted_gate(crate::trap::trusted_gate()).unwrap();
+        // Prewrite the actual config handshake; no server thread or pending
+        // RPC survives installation. No operation below may send an RPC.
+        let (client, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let config = reverie_rpc_transport::codec::encode(&()).unwrap();
+        peer.write_all(&(config.len() as u32).to_be_bytes())
+            .unwrap();
+        peer.write_all(&config).unwrap();
+        let client = reverie_rpc_transport::BlockingRpcClient::<(), _>::from_connected_stream(
+            super::super::rpc::GuestRpcStream::from(client),
+            raw_pid(libc::SYS_gettid),
+        )
+        .unwrap();
+        let rpc = CoordinatorRpc::from_live_client("unused-tool-syscall-test", client, |_, _| {
+            panic!("Tool syscall test must not reconnect")
+        })
+        .unwrap();
+        let mut event = SyscallEvent {
+            number: libc::SYS_getpid,
+            args: [0; 6],
+            instruction_pointer: 0,
+            result: 0,
+            context: 0,
+            dispatch: SyscallDispatch::InstalledHook,
+            guest_pkru: None,
+        };
+        let tail = TailResult::default();
+        let mut state = ();
+        let tid = raw_pid(libc::SYS_gettid);
+        let guest = InGuest::<(), _> {
+            event: &mut event,
+            tid,
+            pid: raw_pid(libc::SYS_getpid),
+            ppid: None,
+            state: &mut state,
+            rpc: &rpc,
+            tail: &tail,
+            cpuid_interception: false,
+            fork_parent_state: None,
+            runtime: &ToolSyscallRuntime,
+            staged_signals: Vec::new(),
+            staged_signal_delivery: false,
+            in_syscall_handler: false,
+            #[cfg(feature = "exec-native-injection")]
+            exec: None,
+            #[cfg(feature = "exec-native-injection")]
+            mapping_driver: None,
+            unsupported_refusal: None,
+        };
+        let mut action: libc::sigaction = unsafe { core::mem::zeroed() };
+        action.sa_sigaction = libc::SIG_DFL;
+        let mut unblock: libc::sigset_t = unsafe { core::mem::zeroed() };
+        assert_eq!(unsafe { libc::sigemptyset(&mut action.sa_mask) }, 0);
+        assert_eq!(unsafe { libc::sigemptyset(&mut unblock) }, 0);
+        assert_eq!(unsafe { libc::sigaddset(&mut unblock, libc::SIGSYS) }, 0);
+        let no_core = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        unsafe {
+            if libc::setrlimit(libc::RLIMIT_CORE, &no_core) != 0
+                || libc::sigaction(libc::SIGSYS, &action, core::ptr::null_mut()) != 0
+                || libc::sigprocmask(libc::SIG_UNBLOCK, &unblock, core::ptr::null_mut()) != 0
+                || filter.install().is_err()
+            {
+                super::super::support::exit_now(117);
+            }
+            if raw_syscall6(libc::SYS_getpid, [0; 6]) != i64::from(guest.pid.as_raw()) {
+                super::super::support::exit_now(119);
+            }
+            if raw_syscall6(
+                libc::SYS_write,
+                [
+                    libc::STDERR_FILENO as u64,
+                    READY.as_ptr() as u64,
+                    READY.len() as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            ) != READY.len() as i64
+            {
+                super::super::support::exit_now(120);
+            }
+            // SAFETY: getpid has no pointer or descriptor effects. No active
+            // callback means the method must still use an intercepted site.
+            let _ = guest.tool_syscall(Sysno::getpid, [0; 6]);
+            super::super::support::exit_now(118);
+        }
+    }
 
     /// A Reverie error that carries an operating-system error, directly or in
     /// a Tool error's causes, is described by kind and number, never by the C

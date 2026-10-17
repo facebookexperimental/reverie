@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use reverie_syscalls::Errno;
 use reverie_syscalls::MemoryAccess;
 use reverie_syscalls::SyscallInfo;
+use reverie_syscalls::Sysno;
 
 use crate::Never;
 use crate::Pid;
@@ -154,6 +155,26 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     /// Returns a representation of the address space associated with this guest
     /// thread.
     fn memory(&self) -> Self::Memory;
+
+    /// Execute one synchronous syscall on behalf of the Tool, on the calling
+    /// operating-system thread. This is a host operation, not guest injection:
+    /// the syscall number, six arguments, result and errno pass through unchanged.
+    /// The executor adds no allocation, lock, RPC, callback dispatch, retry or
+    /// caching, and retains no pointers after returning to the original stack.
+    /// Normal syscall interception and kernel-delivered signals still apply.
+    ///
+    /// # Safety
+    ///
+    /// The caller must supply valid Tool-owned addresses and physical file
+    /// descriptors, with every memory access and other syscall effect respecting
+    /// Rust's invariants. Guest addresses and logical descriptors must first be
+    /// resolved by their owning abstractions. The call must return normally on
+    /// this thread and stack: replacement-stack clone, `rt_sigreturn`, and other
+    /// operations that invalidate the calling Rust context are not supported.
+    /// Kernel-delivered signals and an `EINTR` result retain their normal meaning.
+    unsafe fn tool_syscall(&self, number: Sysno, args: [usize; 6]) -> Result<usize, Errno> {
+        unsafe { syscalls::syscall6(number, args[0], args[1], args[2], args[3], args[4], args[5]) }
+    }
 
     /// Returns a mutable reference to thread state.
     fn thread_state_mut(&mut self) -> &mut T::ThreadState;
@@ -814,6 +835,11 @@ where
 
     fn memory(&self) -> Self::Memory {
         self.inner.memory()
+    }
+
+    unsafe fn tool_syscall(&self, number: Sysno, args: [usize; 6]) -> Result<usize, Errno> {
+        // SAFETY: forwarding preserves the caller's syscall and safety obligations.
+        unsafe { self.inner.tool_syscall(number, args) }
     }
 
     fn thread_state_mut(&mut self) -> &mut L::ThreadState {

@@ -145,6 +145,32 @@ impl<T: Tool<GlobalState = (), ThreadState = ()>> Guest<T> for TestGuest {
     }
 }
 
+/// Reuse this file's existing Guest fake without overriding the new mechanism,
+/// so the native default remains covered when a backend adds its own override.
+#[test]
+fn tool_syscall_default_preserves_native_success_and_errno() {
+    let guest = TestGuest::default();
+    // SAFETY: getpid has no pointer effects, and -1 is an invalid physical fd.
+    unsafe {
+        assert_eq!(
+            <TestGuest as Guest<()>>::tool_syscall(
+                &guest,
+                reverie::syscalls::Sysno::getpid,
+                [0; 6]
+            ),
+            Ok(libc::getpid() as usize),
+        );
+        assert_eq!(
+            <TestGuest as Guest<()>>::tool_syscall(
+                &guest,
+                reverie::syscalls::Sysno::close,
+                [usize::MAX, 0, 0, 0, 0, 0],
+            ),
+            Err(Errno::EBADF),
+        );
+    }
+}
+
 struct LegacyTool {
     response: Option<Signal>,
     calls: AtomicUsize,

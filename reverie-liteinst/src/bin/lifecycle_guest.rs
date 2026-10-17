@@ -2829,6 +2829,7 @@ fn main() {
             mode,
             "shared-handler-rpc-io"
                 | "shared-handler-memory-io"
+                | "shared-handler-tool-syscall"
                 | "shared-handler-outside-shared"
                 | "shared-handler-outside-liteinst"
         )

@@ -14,6 +14,10 @@ mod rpc_io;
 #[path = "shared_handler/memory_io.rs"]
 mod memory_io;
 
+#[cfg(feature = "rpc-io-fixture")]
+#[path = "shared_handler/tool_syscall.rs"]
+mod tool_syscall;
+
 static REENTRY_CHECKS: AtomicU64 = AtomicU64::new(0);
 static TOOL_ADDRESS: AtomicUsize = AtomicUsize::new(0);
 
@@ -110,6 +114,8 @@ impl Tool for SharedTool {
         rpc_io::check_actual_callback(count);
         #[cfg(feature = "rpc-io-fixture")]
         memory_io::check_actual_callback(guest, count);
+        #[cfg(feature = "rpc-io-fixture")]
+        tool_syscall::check_actual_callback(guest, count);
 
         let source = guest.tid().as_raw();
         let legacy = reverie_liteinst::blocking_global_rpc::<SharedGlobal>(SharedRequest {
@@ -169,6 +175,8 @@ pub(super) fn run(duplicate: bool) {
     rpc_io::after_actual_callbacks();
     #[cfg(feature = "rpc-io-fixture")]
     memory_io::after_actual_callbacks();
+    #[cfg(feature = "rpc-io-fixture")]
+    tool_syscall::after_actual_callbacks();
     if duplicate {
         // First-owner observations are complete before the terminal attempt.
         // The inherited-filter guard may refuse before registry publication;
@@ -182,6 +190,8 @@ pub(super) fn run(duplicate: bool) {
 pub(super) fn run_rpc_io(mode: &str) {
     if mode == "shared-handler-memory-io" {
         memory_io::run();
+    } else if mode == "shared-handler-tool-syscall" {
+        tool_syscall::run();
     } else {
         rpc_io::run(mode);
     }

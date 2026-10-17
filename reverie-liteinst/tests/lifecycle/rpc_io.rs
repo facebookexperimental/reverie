@@ -148,3 +148,48 @@ async fn guest_memory_copies_in_an_actual_callback_do_not_reenter_sigsys() {
     assert_eq!(*admission.peers.lock().unwrap(), [source]);
     assert_eq!(stats.snapshot().process_reports(), 1, "{stats}");
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn tool_syscall_in_an_actual_callback_uses_the_private_gate() {
+    let (_preload_directory, preload) = compile_noop_preload();
+    let admission = std::sync::Arc::new(SharedHandlerAdmission::default());
+    let mut command = guest_command("shared-handler-tool-syscall");
+    command.env(SITE_PATCHING_ENV, "0");
+    let (result, observations) =
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            LiteinstBackend::with_rpc_issues_for_test(LiteinstBackend::with_connection_admission(
+                admission.clone(),
+                LiteinstBackend::run_with_output_and_preload_and_stats::<
+                    SharedHandlerCoordinatorTool,
+                >(command, (), preload),
+            )),
+        )
+        .await
+        .expect("actual callback Tool syscall controls hung");
+    let (output, global, stats) = result.expect("actual installed launcher must complete");
+    assert_joined_without_rpc_issues(&observations);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_eq!(
+        output.stdout,
+        concat!(
+            "tool syscall: actual_callback=1 libc_nested=1\n",
+            "shared handler: callbacks=2 owner=stable LI=2 shared=2 wrong-global=4 reentry=2 outer=1\n",
+            "tool syscall: calls=4 nested=0 errno=EBADF link=matched stat=matched\n",
+        )
+        .as_bytes(),
+        "{output:?}",
+    );
+    let requests = global.requests.lock().unwrap();
+    assert_eq!(requests.len(), 5, "{requests:?}");
+    let source = requests[0].0;
+    assert!(source > 0);
+    assert_eq!(
+        *requests,
+        [1001, 2001, 3001, 1002, 2002].map(|tag| (source, tag)),
+        "Tool syscall controls must preserve the actual owner's request sequence",
+    );
+    assert_eq!(*admission.peers.lock().unwrap(), [source]);
+    assert_eq!(stats.snapshot().process_reports(), 1, "{stats}");
+}
