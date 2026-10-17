@@ -64,8 +64,13 @@ void sbr_backend_stats_init(void);
 /* The stats descriptor setting from a launch specification, which does not
  * put it in SaBRe's environment. Call before sbr_backend_stats_init. */
 void sbr_backend_stats_option_from_launch(const char *value);
-void sbr_backend_stats_record_patch(void *rip, unsigned instruction_length,
-                                    enum sbr_patch_route route);
+/* Records a patched syscall instruction that starts at `instruction`. A
+ * SIGILL-marker patch also names its marker's address, which is the address
+ * the SIGILL handler sees; NULL for any other route. */
+void sbr_backend_stats_record_patch(void *instruction,
+                                    unsigned instruction_length,
+                                    enum sbr_patch_route route,
+                                    const void *marker);
 void sbr_backend_stats_record_slow_path(enum sbr_slow_path path);
 void sbr_backend_stats_record_dispatch(enum sbr_dispatch_route route);
 bool sbr_backend_stats_is_rewrite_sigill_site(const void *rip);

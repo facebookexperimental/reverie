@@ -65,13 +65,16 @@ void sbr_backend_stats_init(void) {
     _nx_fatal_printf("incompatible SaBRe backend stats descriptor\n");
 }
 
-void sbr_backend_stats_record_patch(void *rip, unsigned instruction_length,
-                                    enum sbr_patch_route route) {
+void sbr_backend_stats_record_patch(void *instruction,
+                                    unsigned instruction_length,
+                                    enum sbr_patch_route route,
+                                    const void *marker) {
   if (stats == NULL)
     return;
   if (instruction_length == 0 ||
       instruction_length > SBR_BACKEND_STATS_BUCKETS ||
-      route >= SBR_PATCH_ROUTE_COUNT)
+      route >= SBR_PATCH_ROUTE_COUNT ||
+      (route == SBR_PATCH_REWRITE_SIGILL_MARKER) != (marker != NULL))
     _nx_fatal_printf("invalid SaBRe patch statistics record\n");
 
   increment(&stats->candidate_rips);
@@ -79,7 +82,7 @@ void sbr_backend_stats_record_patch(void *rip, unsigned instruction_length,
   increment(&stats->classified_candidates);
   increment(&stats->instruction_lengths[instruction_length - 1]);
 
-  uintptr_t offset = (uintptr_t)rip & (uintptr_t)63;
+  uintptr_t offset = (uintptr_t)instruction & (uintptr_t)63;
   if (offset + instruction_length > 64) {
     unsigned prefix = 64 - offset;
     increment(&stats->cacheline_straddlers);
@@ -93,7 +96,7 @@ void sbr_backend_stats_record_patch(void *rip, unsigned instruction_length,
     struct rewrite_sigill_site *site = malloc(sizeof(*site));
     if (site == NULL)
       _nx_fatal_printf("failed to retain SaBRe SIGILL patch identity\n");
-    site->rip = rip;
+    site->rip = marker;
     do {
       site->next = __atomic_load_n(&rewrite_sigill_sites, __ATOMIC_ACQUIRE);
     } while (!__atomic_compare_exchange_n(&rewrite_sigill_sites, &site->next,

@@ -49,6 +49,21 @@ static bool rdtscp_prefixes_supported(const char *start, const char *mod_rm) {
 }
 #endif
 
+// SYSCALL's encoding is 0F 05; the decoder reports any legacy or REX
+// prefixes in front of it as part of one instruction of the same opcode,
+// however many there are. Only an encoding the CPU executes as a SYSCALL is
+// rewritten: one longer than the architectural 15-byte limit faults natively
+// (#GP), and LOCK makes it #UD, so either is left as it is.
+#define X86_MAX_INSTRUCTION_BYTES 15
+static bool syscall_executes_natively(const char *addr, int len) {
+  if (len > X86_MAX_INSTRUCTION_BYTES)
+    return false;
+  for (int k = 0; k < len - 2; ++k)
+    if ((unsigned char)addr[k] == 0xF0)
+      return false;
+  return true;
+}
+
 static void patch_syscalls_in_func(struct library *lib, char *start, char *end,
                                    char **extra_space, int *extra_len,
                                    bool loader) {
@@ -115,7 +130,8 @@ static void patch_syscalls_in_func(struct library *lib, char *start, char *end,
     bool is_rdtsc = false;
     bool is_rdtscp = false;
 #endif
-    if (code[i].insn == 0x0F05 /* SYSCALL */
+    if ((code[i].insn == 0x0F05 &&
+         syscall_executes_natively(code[i].addr, code[i].len)) /* SYSCALL */
 #ifdef __NX_INTERCEPT_RDTSC
         || ((is_rdtsc = (code[i].insn == 0x0F31)) /* RDTSC */ && !loader)
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -269,10 +285,22 @@ static void patch_syscalls_in_func(struct library *lib, char *start, char *end,
         } else
 #endif
         {
-          memcpy(code[i].addr, "\x0F\xFF" /* UD0 */, 2);
+          // The SIGILL handler resumes two bytes past the marker. For a
+          // prefixed SYSCALL (for example REX.W 0F 05) the marker therefore
+          // replaces the final 0F 05 and the prefixes become NOPs, so the
+          // guest resumes exactly after the instruction. The site the handler
+          // recognizes is the marker's own address; the patch's shape is the
+          // original instruction's.
+          char *marker = code[i].addr;
+          if (code[i].insn == 0x0F05 && code[i].len > 2) {
+            memset(code[i].addr, 0x90, code[i].len - 2);
+            marker = code[i].addr + code[i].len - 2;
+          }
+          memcpy(marker, "\x0F\xFF" /* UD0 */, 2);
           if (code[i].insn == 0x0F05)
             sbr_backend_stats_record_patch(code[i].addr, code[i].len,
-                                           SBR_PATCH_REWRITE_SIGILL_MARKER);
+                                           SBR_PATCH_REWRITE_SIGILL_MARKER,
+                                           marker);
           goto replaced;
         }
       }
@@ -375,7 +403,7 @@ static void patch_syscalls_in_func(struct library *lib, char *start, char *end,
       *(int *)(code[first].addr + 1) = dest - (code[first].addr + 5);
       if (code[i].insn == 0x0F05)
         sbr_backend_stats_record_patch(code[i].addr, code[i].len,
-                                       SBR_PATCH_JUMP_TRAMPOLINE);
+                                       SBR_PATCH_JUMP_TRAMPOLINE, NULL);
       _nx_debug_printf("patched %s at %p (scratch space at %p)\n",
                        (is_rdtscp ? "rdtscp"
                                   : (is_rdtsc ? "rdtsc" : "syscall")),
