@@ -217,14 +217,17 @@ pub struct BackendCapabilities {
     pub runs_guest_code_between_injections: bool,
 
     /// The tool runs inside each guest process, and before every native fork,
-    /// process-copying clone or exec the backend's runtime performs for a
-    /// guest, it promotes the open-file descriptions whose model must stay one
-    /// copy to the tool's shared global state, and carries the promoted ones
-    /// across exec as survivors. A tool may then keep such a description's
-    /// model (a timerfd's virtual-time expirations, say) inside the guest:
-    /// every process that shares the description reaches the same copy. A
-    /// backend whose tool runs outside the guest shares one copy without
-    /// promoting, and reports false.
+    /// process-copying clone or exec the backend performs for a guest, the
+    /// open-file descriptions whose model must stay one copy are promoted to
+    /// the tool's shared global state, and the promoted ones survive exec.
+    /// Either the backend's runtime promotes them itself, because it performs
+    /// those calls natively without the tool's handler (DBT), or the backend
+    /// performs every such call only from the tool's handler for it, so the
+    /// handler promotes first (in-guest LiteInst). A tool may then keep such a
+    /// description's model (a timerfd's virtual-time expirations, say) inside
+    /// the guest: every process that shares the description reaches the same
+    /// copy. A backend whose tool runs outside the guest shares one copy
+    /// without promoting, and reports false.
     pub promotes_open_files_before_native_lifecycle: bool,
 }
 
@@ -275,6 +278,7 @@ impl BackendCapabilities {
         supports_blocked_wait_signal_interruption: false,
         delivers_preemption_timer_events: false,
         runs_guest_code_between_injections: true,
+        promotes_open_files_before_native_lifecycle: true,
         ..Self::PTRACE
     };
 
@@ -412,6 +416,7 @@ mod tests {
                 "supports_blocked_wait_signal_interruption": false,
                 "delivers_preemption_timer_events": false,
                 "runs_guest_code_between_injections": true,
+                "promotes_open_files_before_native_lifecycle": true,
             }))
         );
     }
