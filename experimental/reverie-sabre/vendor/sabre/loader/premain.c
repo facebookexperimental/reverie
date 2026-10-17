@@ -477,7 +477,8 @@ void sbr_dl_map_object_deps(struct ld_link_map *map,
 void *sbr_dl_map_object(struct link_map *loader, const char *name, int type,
                         int trace_mode, int mode, Lmid_t nsid, void *scope) {
   if (sbr_preinit_done)
-    real_dl_map_object(loader, name, type, trace_mode, mode, nsid, scope);
+    return real_dl_map_object(loader, name, type, trace_mode, mode, nsid,
+                              scope);
 
   static int counter = 0;
   if (ready_to_inject_plugin) {
