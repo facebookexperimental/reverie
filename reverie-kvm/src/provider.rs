@@ -46,7 +46,11 @@
 
 use reverie::SignalEvent;
 pub(crate) use reverie::provider::LinuxProvider;
-pub(crate) use reverie::provider::ProviderOutcome;
+/// The provider outcome as reverie-kvm uses it: its process-action plan is
+/// the executor's
+/// [`StagedProcessAction`](crate::executor::StagedProcessAction) token.
+pub(crate) type ProviderOutcome =
+    reverie::provider::ProviderOutcome<crate::executor::StagedProcessAction>;
 pub(crate) use reverie::provider::SyscallRequest as ProviderRequest;
 use reverie::syscalls::Errno;
 

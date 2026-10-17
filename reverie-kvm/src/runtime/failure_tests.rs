@@ -142,6 +142,7 @@ struct NoGuestExecution;
 #[reverie::provider]
 impl LinuxProvider for NoGuestExecution {
     type Context = GuestMemory;
+    type Plan = crate::executor::StagedProcessAction;
     type Error = crate::Error;
 
     async fn execute(

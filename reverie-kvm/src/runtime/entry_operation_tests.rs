@@ -355,6 +355,7 @@ struct ProbeExecutor {
 #[reverie::provider]
 impl LinuxProvider for ProbeExecutor {
     type Context = GuestMemory;
+    type Plan = crate::executor::StagedProcessAction;
     type Error = crate::Error;
 
     async fn execute(
@@ -495,6 +496,7 @@ impl GuestSyscallExecutor<ProbeTool> for ProbeExecutor {
     fn complete_injection<'a>(
         &'a mut self,
         _: ToolContext<'a, ProbeTool>,
+        _plan: Option<crate::executor::StagedProcessAction>,
     ) -> Pin<Box<dyn Future<Output = Result<InjectionCompletion>> + Send + 'a>>
     where
         ProbeTool: 'a,

@@ -86,15 +86,17 @@ pub use request::SyscallRequest;
 /// Effects are already committed to the provider's state when the outcome is
 /// returned.
 ///
+/// `Plan` is the provider's own description of a process action the backend
+/// must carry out ([`LinuxProvider::Plan`]).
+///
 /// [`ProviderOutcome::Cancelled`] and [`ProviderOutcome::ThreadGroupExited`]
 /// produce no syscall result at all: the call never returns to the issuing
 /// task. The remaining outcomes (a segment-base effect for
-/// `arch_prctl(ARCH_SET_FS/GS)`, a child created by
-/// `fork`/`vfork`/`clone`/`clone3`, an exec, and an exit) are added in a later
-/// step. Until then an implementation reports them to its backend outside this
-/// trait, after `execute` returns `Return` with the call's raw result.
+/// `arch_prctl(ARCH_SET_FS/GS)` and an exit) are added in a later step. Until
+/// then an implementation reports them to its backend outside this trait,
+/// after `execute` returns `Return` with the call's raw result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProviderOutcome {
+pub enum ProviderOutcome<Plan> {
     /// The raw Linux result: a nonnegative value, or `-errno` for a Linux
     /// error.
     Return(i64),
@@ -112,6 +114,18 @@ pub enum ProviderOutcome {
     ThreadGroupExited {
         /// The committed thread-group exit status.
         status: crate::ExitStatus,
+    },
+    /// The call succeeded with `result` and the provider staged a process
+    /// action that the backend must carry out before the call completes: a
+    /// child created by `fork`, `vfork`, `clone` or `clone3`, or an exec.
+    /// `result` is always a successful (nonnegative) result. The backend
+    /// carries out `plan` exactly once, and the call's final result is what
+    /// the backend's completion of the plan reports.
+    Process {
+        /// The raw successful result the provider computed.
+        result: i64,
+        /// The provider's description of the process action.
+        plan: Plan,
     },
 }
 
@@ -131,6 +145,7 @@ pub enum ProviderOutcome {
 /// #[reverie::provider]
 /// impl LinuxProvider for MyProvider {
 ///     type Context = MyContext;
+///     type Plan = MyPlan;
 ///     type Error = MyError;
 ///
 ///     async fn execute(
@@ -138,14 +153,14 @@ pub enum ProviderOutcome {
 ///         task: reverie::Tid,
 ///         request: &SyscallRequest,
 ///         cx: &mut MyContext,
-///     ) -> Result<ProviderOutcome, MyError> {
+///     ) -> Result<ProviderOutcome<MyPlan>, MyError> {
 ///         // ...
 ///     }
 /// }
 /// ```
 ///
 /// The trait stays dyn-compatible: a backend may call it through
-/// `&mut dyn LinuxProvider<Context = _, Error = _>`.
+/// `&mut dyn LinuxProvider<Context = _, Plan = _, Error = _>`.
 #[async_trait::async_trait]
 pub trait LinuxProvider: Send + Sync {
     /// The backend's per-call context: what the provider needs from the
@@ -162,6 +177,14 @@ pub trait LinuxProvider: Send + Sync {
     /// `&mut Self::Context` and must itself be `Send` (see the method's
     /// documentation).
     type Context: ?Sized + Send;
+    /// The provider's plan for a process action (a child or an exec) that the
+    /// backend carries out, returned in [`ProviderOutcome::Process`]: either
+    /// a full description, or a token for an action the provider keeps
+    /// staged until the backend completes it. Its shape is the provider's
+    /// own, because what a provider needs the backend to do differs between
+    /// kernels. It is [`Send`] because the backend holds it across awaits in
+    /// a `Send` future.
+    type Plan: Send;
     /// A broken backend or provider invariant that ends the run.
     type Error;
 
@@ -199,6 +222,9 @@ pub trait LinuxProvider: Send + Sync {
     ///
     /// - `Ok(ProviderOutcome::Return(-errno))` is a Linux error and is
     ///   returned to the Tool as that errno.
+    /// - `Ok(ProviderOutcome::Process { result, plan })` is a successful call
+    ///   whose process action the backend carries out before the call
+    ///   completes.
     /// - `Ok(ProviderOutcome::Cancelled)` and
     ///   `Ok(ProviderOutcome::ThreadGroupExited { .. })` produce no syscall
     ///   result; see [`ProviderOutcome`].
@@ -212,7 +238,7 @@ pub trait LinuxProvider: Send + Sync {
         task: crate::Tid,
         request: &SyscallRequest,
         cx: &mut Self::Context,
-    ) -> Result<ProviderOutcome, Self::Error>;
+    ) -> Result<ProviderOutcome<Self::Plan>, Self::Error>;
 
     /// Takes the typed refusal recorded by the last [`LinuxProvider::execute`],
     /// when the provider declined that request as an operation it does not

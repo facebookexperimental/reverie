@@ -32,6 +32,7 @@ struct QueueExecutor {
 #[reverie::provider]
 impl LinuxProvider for QueueExecutor {
     type Context = GuestMemory;
+    type Plan = crate::executor::StagedProcessAction;
     type Error = crate::Error;
 
     async fn execute(
@@ -68,6 +69,7 @@ impl GuestSyscallExecutor<AdapterTool> for QueueExecutor {
     fn complete_injection<'a>(
         &'a mut self,
         _: ToolContext<'a, AdapterTool>,
+        _plan: Option<crate::executor::StagedProcessAction>,
     ) -> Pin<Box<dyn Future<Output = Result<InjectionCompletion>> + Send + 'a>>
     where
         AdapterTool: 'a,
@@ -187,6 +189,7 @@ struct UnsupportedExecutor;
 #[reverie::provider]
 impl LinuxProvider for UnsupportedExecutor {
     type Context = GuestMemory;
+    type Plan = crate::executor::StagedProcessAction;
     type Error = crate::Error;
 
     async fn execute(

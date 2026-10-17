@@ -24,6 +24,7 @@ struct RefusingExecutor;
 #[reverie::provider]
 impl LinuxProvider for RefusingExecutor {
     type Context = GuestMemory;
+    type Plan = crate::executor::StagedProcessAction;
     type Error = crate::Error;
 
     async fn execute(
@@ -54,6 +55,7 @@ impl GuestSyscallExecutor<AdapterTool> for RefusingExecutor {
     fn complete_injection<'a>(
         &'a mut self,
         _: ToolContext<'a, AdapterTool>,
+        _plan: Option<crate::executor::StagedProcessAction>,
     ) -> Pin<Box<dyn Future<Output = Result<InjectionCompletion>> + Send + 'a>>
     where
         AdapterTool: 'a,
@@ -73,6 +75,7 @@ fn terminal_read_injection_keeps_nonreturning_cancellation_and_typed_failures() 
     #[reverie::provider]
     impl LinuxProvider for ReadExecutor {
         type Context = GuestMemory;
+        type Plan = crate::executor::StagedProcessAction;
         type Error = crate::Error;
 
         async fn execute(
@@ -114,6 +117,7 @@ fn terminal_read_injection_keeps_nonreturning_cancellation_and_typed_failures() 
         fn complete_injection<'a>(
             &'a mut self,
             _: ToolContext<'a, LowerTool>,
+            _plan: Option<crate::executor::StagedProcessAction>,
         ) -> Pin<Box<dyn Future<Output = Result<InjectionCompletion>> + Send + 'a>>
         where
             LowerTool: 'a,
@@ -721,6 +725,7 @@ fn wait_group_exit_injection_is_nonreturning_and_failure_still_wins() {
     #[reverie::provider]
     impl LinuxProvider for WaitExecutor {
         type Context = GuestMemory;
+        type Plan = crate::executor::StagedProcessAction;
         type Error = crate::Error;
 
         async fn execute(
@@ -761,6 +766,7 @@ fn wait_group_exit_injection_is_nonreturning_and_failure_still_wins() {
         fn complete_injection<'a>(
             &'a mut self,
             _: ToolContext<'a, LowerTool>,
+            _plan: Option<crate::executor::StagedProcessAction>,
         ) -> Pin<Box<dyn Future<Output = Result<InjectionCompletion>> + Send + 'a>>
         where
             LowerTool: 'a,

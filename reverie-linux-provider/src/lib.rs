@@ -18,9 +18,11 @@
 //! The re-export does not preserve the old trait signature. Since provider
 //! step E2a, [`LinuxProvider::execute`] is an `async` method. Since step E2b
 //! it takes the issuing task and a `&mut` per-call context, whose type
-//! [`LinuxProvider::Context`] replaces `Memory` and must be `Send`. An
-//! implementer therefore also needs the `reverie` crate, for its
-//! `#[reverie::provider]` attribute, or the `async_trait` crate directly,
-//! because this crate re-exports neither attribute.
+//! [`LinuxProvider::Context`] replaces `Memory` and must be `Send`. Since
+//! step E2d, [`ProviderOutcome`] is generic over the provider's
+//! [`LinuxProvider::Plan`]. An implementer therefore also needs the
+//! `reverie` crate, for its `#[reverie::provider]` attribute, or the
+//! `async_trait` crate directly, because this crate re-exports neither
+//! attribute.
 
 pub use reverie::provider::*;

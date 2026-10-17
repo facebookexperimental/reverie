@@ -427,6 +427,25 @@ impl CapturedOutput {
     }
 }
 
+/// The plan today's executor reports in `ProviderOutcome::Process`: a
+/// token saying that a successful call staged a [`ProcessAction`] in the
+/// executor. The action itself stays in the executor until the backend's
+/// completion takes it with [`ElfExecutor::take_process_action`]. So on every
+/// path where completion does not run (an early return, an error, or a
+/// cancelled or dropped callback) the action keeps the executor's lifecycle:
+/// a later reader can still carry it out, and terminal cleanup releases its
+/// files in the executor's order. The token is deliberately neither `Clone`
+/// nor `Copy`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct StagedProcessAction(());
+
+impl StagedProcessAction {
+    /// Only the executor's provider adapter reports a staged action.
+    pub(crate) fn staged() -> Self {
+        Self(())
+    }
+}
+
 pub(crate) enum ProcessAction {
     Fork {
         child_pid: i32,
@@ -5186,6 +5205,11 @@ impl ElfExecutor {
 
     pub(crate) fn take_process_action(&mut self) -> Option<ProcessAction> {
         self.process_action.take()
+    }
+
+    /// Whether a process action is staged, without taking it.
+    pub(crate) fn has_process_action(&self) -> bool {
+        self.process_action.is_some()
     }
 
     // TODO-HUMAN-REVIEW(PR-156): Review non-returning exit injection state.
