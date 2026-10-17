@@ -2696,7 +2696,6 @@ static bool validate_task_arguments(int sysnum, uint64_t* args) {
       return args[0] != P_PID || validate_task_argument(&args[1]);
     case SYS_prlimit64:
       return args[0] == 0 || validate_task_argument(&args[0]);
-    case SYS_getpriority:
     case SYS_setpriority:
       return args[0] != PRIO_PROCESS || args[1] == 0 ||
           validate_task_argument(&args[1]);

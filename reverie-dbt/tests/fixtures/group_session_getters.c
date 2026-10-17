@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -23,8 +24,14 @@ static long query(long number, long target) {
   return syscall(number, target);
 }
 
+static long priority_query(long which, long who) {
+  if (returning)
+    return prctl(0x4b494421, (long)SYS_getpriority, which, who, 0L);
+  return syscall(SYS_getpriority, which, who);
+}
+
 int main(int argc, char** argv) {
-  if (argc != 6)
+  if (argc != 8)
     return 2;
   returning = strcmp(argv[1], "returning") == 0;
   long target = strtol(argv[2], NULL, 10);
@@ -65,6 +72,27 @@ int main(int argc, char** argv) {
                                : ESRCH;
       failed |= rc != -1 || error != expected_error;
     }
+  }
+  const long priority_which[] = {
+      PRIO_PROCESS, PRIO_PROCESS, PRIO_PROCESS, PRIO_PROCESS,
+      PRIO_PROCESS, -1, 3, 999};
+  const long priority_who[] = {0, me, target, INT_MAX, -1, 0, target, INT_MAX};
+  const char* priority_labels[] = {
+      "zero", "self", "live", "absent", "negative",
+      "invalid-negative-zero", "invalid-three-live", "invalid-999-absent"};
+  long live_priority = strtol(argv[6], NULL, 10);
+  long self_priority = strtol(argv[7], NULL, 10);
+  const long priority_expected[] = {
+      self_priority, self_priority, live_priority, -ESRCH,
+      -ESRCH, -EINVAL, -EINVAL, -EINVAL};
+  for (unsigned int i = 0; i < 8; ++i) {
+    errno = 0;
+    long rc = priority_query(priority_which[i], priority_who[i]);
+    int error = errno;
+    printf("getpriority %s rc=%ld errno=%d\n", priority_labels[i], rc, error);
+    long expected_rc = priority_expected[i] < 0 ? -1 : priority_expected[i];
+    int expected_error = priority_expected[i] < 0 ? (int)-priority_expected[i] : 0;
+    failed |= rc != expected_rc || error != expected_error;
   }
   if (failed)
     return 1;

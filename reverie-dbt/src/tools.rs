@@ -623,6 +623,33 @@ impl Tool for SetRegTool {
         }
         let (number, args) = syscall.into_parts();
         if number == Sysno::prctl && args.arg0 as u64 == KERNEL_IDENTITY_PRCTL {
+            if args.arg1 as i64 == libc::SYS_getpriority {
+                let which = args.arg2 as libc::c_long;
+                let who = args.arg3 as libc::c_long;
+                // Observe the same two raw arguments on the application
+                // callback thread, independently of native target admission.
+                let kernel = unsafe { libc::syscall(libc::SYS_getpriority, which, who) };
+                let kernel = if kernel == -1 {
+                    -i64::from(std::io::Error::last_os_error().raw_os_error().unwrap())
+                } else {
+                    kernel
+                };
+                let injected = guest
+                    .inject(Syscall::from_raw(
+                        Sysno::getpriority,
+                        SyscallArgs::new(args.arg2, args.arg3, 0, 0, 0, 0),
+                    ))
+                    .await
+                    .unwrap_or_else(|errno| -i64::from(errno.into_raw()));
+                emit_line(&format!(
+                    "reverie-dbt-test: kernel-priority-query sysnum={} which={which} who={who} kernel={kernel} injected={injected}",
+                    args.arg1,
+                ));
+                // The fixture accumulates failures across the complete matrix;
+                // the host test also checks each kernel/injected witness. Keep
+                // the actual result so one red target cannot hide later rows.
+                return Ok(injected);
+            }
             if matches!(
                 args.arg1 as i64,
                 libc::SYS_getpgid | libc::SYS_getsid | libc::SYS_sched_getscheduler
