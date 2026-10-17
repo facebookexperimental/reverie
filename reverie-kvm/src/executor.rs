@@ -5202,6 +5202,11 @@ impl ElfExecutor {
         self.state.tid == self.state.pid
     }
 
+    /// The tid of the task this executor runs, as the Tool sees it.
+    pub(crate) fn task_tid(&self) -> i32 {
+        self.state.tid
+    }
+
     pub(crate) fn replace_after_exec(&mut self, state: LoadedStaticElf) {
         let _retirement = self.state.file_retirement.hold();
         let file_table = self.file_table.clone();

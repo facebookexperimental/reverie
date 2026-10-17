@@ -354,13 +354,14 @@ struct ProbeExecutor {
 }
 #[reverie::provider]
 impl LinuxProvider for ProbeExecutor {
-    type Memory = GuestMemory;
+    type Context = GuestMemory;
     type Error = crate::Error;
 
     async fn execute(
         &mut self,
+        _task: reverie::Tid,
         request: &ProviderRequest,
-        _: &GuestMemory,
+        _: &mut GuestMemory,
     ) -> Result<ProviderOutcome> {
         let request = SyscallRequest::from_provider(request);
         assert_eq!(request.number(), libc::SYS_close as u64);

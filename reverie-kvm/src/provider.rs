@@ -15,9 +15,10 @@
 //! The split is step 2 of the minimal provider seam
 //! (<https://github.com/rrnewton/hermit/issues/4485>, epic
 //! <https://github.com/rrnewton/hermit/issues/4492>); step U6a moved the core
-//! to its own crate, step E1 moved it into Reverie's core, and step E2a made
-//! its `execute` an `async` method (implemented in `#[reverie::provider]`
-//! blocks). The KVM backend's injection adapter (`GuestSyscallExecutor` in
+//! to its own crate, step E1 moved it into Reverie's core, step E2a made its
+//! `execute` an `async` method (implemented in `#[reverie::provider]` blocks),
+//! and step E2b gave `execute` the issuing task and a `&mut` per-call context.
+//! The KVM backend's injection adapter (`GuestSyscallExecutor` in
 //! `runtime.rs`) used to be one 38-method trait mixing three different
 //! things. It is now split by meaning:
 //!
@@ -25,8 +26,8 @@
 //!   guest can answer, whether it is today's emulator, the host kernel, or a
 //!   foreign user-space kernel. `KvmGuest::inject` (and `tail_inject`, which
 //!   injects through it) executes the syscall only through this trait, with
-//!   the provider's memory and error types fixed to [`GuestMemory`] and
-//!   [`Error`].
+//!   the provider's per-call context and error types fixed to [`GuestMemory`]
+//!   and [`Error`].
 //! - [`LinuxEmuSignalControl`] and [`LinuxEmuMemoryMap`]: the signal parking
 //!   and receipt protocol and the brk-heap query of today's executor. They
 //!   name the executor's own ledgers and tokens, so another provider could only

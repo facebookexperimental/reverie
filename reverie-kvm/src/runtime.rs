@@ -334,7 +334,7 @@ pub(crate) struct ToolContext<'a, T: Tool> {
 /// of process actions. The trait is generic over the Tool only because
 /// `complete_injection` starts child Tool instances.
 trait GuestSyscallExecutor<T: Tool>:
-    LinuxProvider<Memory = GuestMemory, Error = Error> + LinuxEmuSignalControl + LinuxEmuMemoryMap
+    LinuxProvider<Context = GuestMemory, Error = Error> + LinuxEmuSignalControl + LinuxEmuMemoryMap
 {
     fn read_clock(&self) -> Result<u64>;
 
@@ -398,16 +398,18 @@ struct DirectSyscallExecutor<'a> {
 /// [`LinuxEmuSignalControl`] and [`LinuxEmuMemoryMap`] default, so it refuses
 /// the executor's signal parking protocol and reports no heap. That is what
 /// it has always answered; it shows that `KvmGuest::inject` works with a
-/// provider other than the static-ELF executor.
+/// provider other than the static-ELF executor. It is bound to no task
+/// table, so it does not check the issuing task it is given.
 #[reverie::provider]
 impl LinuxProvider for DirectSyscallExecutor<'_> {
-    type Memory = GuestMemory;
+    type Context = GuestMemory;
     type Error = crate::Error;
 
     async fn execute(
         &mut self,
+        _task: reverie::Tid,
         request: &ProviderRequest,
-        memory: &GuestMemory,
+        memory: &mut GuestMemory,
     ) -> Result<ProviderOutcome> {
         let request = SyscallRequest::from_provider(request);
         Ok(ProviderOutcome::Return(
@@ -628,10 +630,14 @@ impl Drop for StaticElfSyscallExecutor<'_> {
 ///   is the run's [`ElfExecutor`] state it borrows. The executor's lock order
 ///   is file table, then transaction, then lifecycle, then process, then
 ///   thread.
-/// - `memory` is the KVM guest arena ([`GuestMemory`]) rather than a
-///   provider-neutral per-call context, because
+/// - The per-call context is the KVM guest arena ([`GuestMemory`]) itself
+///   rather than a provider-neutral context object, because
 ///   [`crate::provider_memory::GuestMemoryAccess`] lends operands through a
-///   generic associated type and so cannot yet be a trait object.
+///   generic associated type and so cannot yet be a trait object. The
+///   executor only reads it through a shared reborrow.
+/// - The adapter is bound to one task's executor. `execute` checks that the
+///   issuing task is that executor's task and returns an error otherwise,
+///   before it changes any state.
 /// - `execute` never awaits. It runs the executor synchronously on the
 ///   vCPU's host thread, which a blocking read still blocks, exactly as when
 ///   the method was synchronous, and so its future completes on the first
@@ -664,14 +670,30 @@ impl Drop for StaticElfSyscallExecutor<'_> {
 ///   scheduled for deletion, not for preservation.
 #[reverie::provider]
 impl LinuxProvider for StaticElfSyscallExecutor<'_> {
-    type Memory = GuestMemory;
+    type Context = GuestMemory;
     type Error = crate::Error;
 
     async fn execute(
         &mut self,
+        task: reverie::Tid,
         request: &ProviderRequest,
-        memory: &GuestMemory,
+        memory: &mut GuestMemory,
     ) -> Result<ProviderOutcome> {
+        // This adapter is bound to one task's executor, so a call for any
+        // other task is a broken backend invariant, never a syscall result.
+        // Every KvmGuest is built with the tid its executor was created with
+        // (root, fork and vfork children, and thread children), and an
+        // executor's tid never changes afterwards: exec keeps it, and a
+        // non-leader exec, where Linux would change the tid, is refused in
+        // ElfExecutor before any process action. Whoever implements that
+        // exec must move both ids together, or this check fails loudly.
+        if task.as_raw() != self.executor.task_tid() {
+            return Err(crate::Error::UnexpectedVcpuExit(format!(
+                "KVM provider called for task {} on the executor of task {}",
+                task.as_raw(),
+                self.executor.task_tid(),
+            )));
+        }
         let request = SyscallRequest::from_provider(request);
         self.polled_read_attempt = None;
         // A refusal left by a syscall the guest issued without an injection
@@ -1661,9 +1683,11 @@ impl<T: Tool> Guest<T> for KvmGuest<'_, T> {
         // The syscall itself goes only through the run's Linux provider. Its
         // `execute` future is awaited at once; today's providers never await
         // inside it, so it completes on its first poll.
-        let provider: &mut dyn LinuxProvider<Memory = GuestMemory, Error = Error> =
+        let provider: &mut dyn LinuxProvider<Context = GuestMemory, Error = Error> =
             &mut *self.executor;
-        let outcome = provider.execute(request.as_provider(), &self.memory).await;
+        let outcome = provider
+            .execute(self.tid, request.as_provider(), &mut self.memory)
+            .await;
         let raw = match outcome {
             Ok(ProviderOutcome::Return(raw)) => {
                 self.unsupported_refusal = provider.take_unsupported_refusal();
@@ -7315,13 +7339,14 @@ mod tests {
 
     #[reverie::provider]
     impl LinuxProvider for FailingSyscallExecutor {
-        type Memory = GuestMemory;
+        type Context = GuestMemory;
         type Error = crate::Error;
 
         async fn execute(
             &mut self,
+            _task: reverie::Tid,
             _: &ProviderRequest,
-            _: &GuestMemory,
+            _: &mut GuestMemory,
         ) -> Result<ProviderOutcome> {
             Err(Error::FamilyWaitLedgerMismatch {
                 parent: reverie::SignalProcessId {
@@ -7347,13 +7372,14 @@ mod tests {
 
     #[reverie::provider]
     impl LinuxProvider for SideEffectingExecutor {
-        type Memory = GuestMemory;
+        type Context = GuestMemory;
         type Error = crate::Error;
 
         async fn execute(
             &mut self,
+            _task: reverie::Tid,
             request: &ProviderRequest,
-            _memory: &GuestMemory,
+            _memory: &mut GuestMemory,
         ) -> Result<ProviderOutcome> {
             let request = SyscallRequest::from_provider(request);
             match request.number() as libc::c_long {
@@ -7421,13 +7447,14 @@ mod tests {
 
     #[reverie::provider]
     impl LinuxProvider for PermissiveSideEffectingExecutor {
-        type Memory = GuestMemory;
+        type Context = GuestMemory;
         type Error = crate::Error;
 
         async fn execute(
             &mut self,
+            _task: reverie::Tid,
             request: &ProviderRequest,
-            _memory: &GuestMemory,
+            _memory: &mut GuestMemory,
         ) -> Result<ProviderOutcome> {
             let request = SyscallRequest::from_provider(request);
             match request.number() as libc::c_long {
@@ -7536,13 +7563,14 @@ mod tests {
 
     #[reverie::provider]
     impl LinuxProvider for RefusingThenSupportingProvider {
-        type Memory = GuestMemory;
+        type Context = GuestMemory;
         type Error = crate::Error;
 
         async fn execute(
             &mut self,
+            _task: reverie::Tid,
             _: &ProviderRequest,
-            _: &GuestMemory,
+            _: &mut GuestMemory,
         ) -> Result<ProviderOutcome> {
             self.executed += 1;
             if self.executed == 1 {

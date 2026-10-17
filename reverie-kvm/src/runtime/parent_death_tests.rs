@@ -128,7 +128,7 @@ fn initial_exec_preflight_requires_original_context_and_keeps_enrollment_after_r
     let mut executor = cleanup.executor(executor());
     let _run = adopt(&executor);
     executor.enable_signal_dequeues();
-    let memory = GuestMemory::new(0, 4096).unwrap();
+    let mut memory = GuestMemory::new(0, 4096).unwrap();
     executor.bind_address_space(&memory);
     let mut completed = false;
     let original = SyscallRequest::new(libc::SYS_execve as u64, [0x100, 0x200, 0x300, 0, 0, 0]);
@@ -183,13 +183,15 @@ fn initial_exec_preflight_requires_original_context_and_keeps_enrollment_after_r
             &e, original.into_syscall().unwrap()).is_err(), "missing original is not an unenrolled proof");
         assert!(
             matches!(
-                futures::executor::block_on(
+                futures::executor::block_on({
+                    let task = reverie::Pid::from_raw(e.executor.task_tid());
                     <StaticElfSyscallExecutor<'_> as LinuxProvider>::execute(
                         &mut e,
+                        task,
                         original.as_provider(),
-                        &memory
+                        &mut memory,
                     )
-                ),
+                }),
                 Err(crate::Error::ParentDeathSignal { .. })
             ),
             "injection cannot bypass the enrolled synthetic-initial refusal"
@@ -235,7 +237,7 @@ fn initial_exec_preflight_requires_original_context_and_keeps_enrollment_after_r
 fn default_preflight_refuses_but_live_unopted_static_executor_continues() {
     let mut backend = KvmBackend::new(0x10000).expect("preflight control requires /dev/kvm");
     let mut executor = executor();
-    let memory = GuestMemory::new(0, 4096).unwrap();
+    let mut memory = GuestMemory::new(0, 4096).unwrap();
     let mut completed = false;
     let original = SyscallRequest::new(libc::SYS_getuid as u64, [0; 6]);
     let site = executor.begin_signal_callback().unwrap();
@@ -257,11 +259,15 @@ fn default_preflight_refuses_but_live_unopted_static_executor_continues() {
         assert_eq!(<StaticElfSyscallExecutor<'_> as LinuxEmuSignalControl>::parent_death_syscall_preflight(
             &e, original.into_syscall().unwrap()).unwrap(), reverie::ParentDeathSyscallAdmission::Unenrolled);
         assert_eq!(
-            futures::executor::block_on(<StaticElfSyscallExecutor<'_> as LinuxProvider>::execute(
-                &mut e,
-                original.as_provider(),
-                &memory
-            ))
+            futures::executor::block_on({
+                let task = reverie::Pid::from_raw(e.executor.task_tid());
+                <StaticElfSyscallExecutor<'_> as LinuxProvider>::execute(
+                    &mut e,
+                    task,
+                    original.as_provider(),
+                    &mut memory,
+                )
+            })
             .unwrap(),
             ProviderOutcome::Return(0)
         );
@@ -381,4 +387,77 @@ fn original_exec_callback_drop_revokes_staged_image_without_injection() {
         Err(crate::Error::ParentDeathSignal { .. })
     ));
     assert!(!completed);
+}
+
+/// The provider adapter is bound to one task. A call naming another task is
+/// a broken backend invariant: `execute` returns `UnexpectedVcpuExit` before
+/// it changes anything. The syscall does not run, the adapter's retained
+/// result and polled-read pair are untouched, and a refusal the executor
+/// recorded earlier is still pending. The same request for the right task
+/// then runs, which shows the guard, not the request, stopped the first call.
+#[test]
+fn provider_refuses_a_task_other_than_its_executors_before_any_effect() {
+    let mut backend = KvmBackend::new(0x10000).expect("tid guard control requires /dev/kvm");
+    let mut executor = executor();
+    let mut memory = GuestMemory::new(0, 4096).unwrap();
+    // A refusal recorded by an earlier, uninjected syscall.
+    let setsid = SyscallRequest::new(libc::SYS_setsid as u64, [0; 6]);
+    assert_eq!(executor.execute(&setsid, &memory), -i64::from(libc::ENOSYS));
+    let own = reverie::Pid::from_raw(executor.task_tid());
+    let other = reverie::Pid::from_raw(executor.task_tid() + 1);
+    let exit_group = SyscallRequest::new(libc::SYS_exit_group as u64, [7, 0, 0, 0, 0, 0]);
+    let retained = (SyscallRequest::new(libc::SYS_getpid as u64, [0; 6]), 11);
+    let mut completed = false;
+    let pending = {
+        let mut e = StaticElfSyscallExecutor {
+            backend: &mut backend,
+            executor: &mut executor,
+            memory: memory.clone(),
+            process_context: ProcessExecutionContext::SyscallBoundary(
+                CompletedSyscallBoundary::for_test(),
+            ),
+            callback_site: None,
+            original_syscall: None,
+            signal_guard: SignalGuard::Ordinary,
+            last_result: Some(5),
+            polled_read_attempt: Some(retained),
+            process_completed: &mut completed,
+        };
+        let refused =
+            futures::executor::block_on(<StaticElfSyscallExecutor<'_> as LinuxProvider>::execute(
+                &mut e,
+                other,
+                exit_group.as_provider(),
+                &mut memory,
+            ));
+        assert!(
+            matches!(refused, Err(crate::Error::UnexpectedVcpuExit(_))),
+            "a call for another task must be refused as a broken invariant: {refused:?}"
+        );
+        assert!(
+            !e.executor.has_pending_exit(),
+            "the refused exit_group must not have run"
+        );
+        assert_eq!(e.last_result, Some(5));
+        assert_eq!(e.polled_read_attempt, Some(retained));
+        let pending = e.executor.take_unsupported_refusal();
+        // Control: the same request for the adapter's own task runs.
+        assert_eq!(
+            futures::executor::block_on(<StaticElfSyscallExecutor<'_> as LinuxProvider>::execute(
+                &mut e,
+                own,
+                exit_group.as_provider(),
+                &mut memory,
+            ))
+            .unwrap(),
+            ProviderOutcome::Return(0)
+        );
+        assert!(e.executor.has_pending_exit());
+        pending
+    };
+    // The refusal that was pending is the earlier setsid's, unconsumed.
+    assert!(pending.is_some());
+    let mut fresh = self::executor();
+    assert_eq!(fresh.execute(&setsid, &memory), -i64::from(libc::ENOSYS));
+    assert_eq!(pending, fresh.take_unsupported_refusal());
 }

@@ -141,10 +141,15 @@ impl Tool for RpcTool {
 struct NoGuestExecution;
 #[reverie::provider]
 impl LinuxProvider for NoGuestExecution {
-    type Memory = GuestMemory;
+    type Context = GuestMemory;
     type Error = crate::Error;
 
-    async fn execute(&mut self, _: &ProviderRequest, _: &GuestMemory) -> Result<ProviderOutcome> {
+    async fn execute(
+        &mut self,
+        _: reverie::Tid,
+        _: &ProviderRequest,
+        _: &mut GuestMemory,
+    ) -> Result<ProviderOutcome> {
         panic!("native RPC control continued guest execution")
     }
 }

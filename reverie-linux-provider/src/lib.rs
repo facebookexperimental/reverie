@@ -16,10 +16,11 @@
 //! It will then be deleted (<https://github.com/rrnewton/hermit/issues/4485>).
 //!
 //! The re-export does not preserve the old trait signature. Since provider
-//! step E2a, [`LinuxProvider::execute`] is an `async` method and
-//! [`LinuxProvider::Memory`] must be `Sync`. An implementer therefore also
-//! needs the `reverie` crate, for its `#[reverie::provider]` attribute, or
-//! the `async_trait` crate directly, because this crate re-exports neither
-//! attribute.
+//! step E2a, [`LinuxProvider::execute`] is an `async` method. Since step E2b
+//! it takes the issuing task and a `&mut` per-call context, whose type
+//! [`LinuxProvider::Context`] replaces `Memory` and must be `Send`. An
+//! implementer therefore also needs the `reverie` crate, for its
+//! `#[reverie::provider]` attribute, or the `async_trait` crate directly,
+//! because this crate re-exports neither attribute.
 
 pub use reverie::provider::*;

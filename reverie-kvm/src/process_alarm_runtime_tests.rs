@@ -31,10 +31,15 @@ struct QueueExecutor {
 }
 #[reverie::provider]
 impl LinuxProvider for QueueExecutor {
-    type Memory = GuestMemory;
+    type Context = GuestMemory;
     type Error = crate::Error;
 
-    async fn execute(&mut self, _: &ProviderRequest, _: &GuestMemory) -> Result<ProviderOutcome> {
+    async fn execute(
+        &mut self,
+        _: reverie::Tid,
+        _: &ProviderRequest,
+        _: &mut GuestMemory,
+    ) -> Result<ProviderOutcome> {
         panic!("queue operation executed a guest syscall")
     }
 }
@@ -181,10 +186,15 @@ fn process_alarm_signal_into_guest_forwards_complete_outcomes_without_guest_effe
 struct UnsupportedExecutor;
 #[reverie::provider]
 impl LinuxProvider for UnsupportedExecutor {
-    type Memory = GuestMemory;
+    type Context = GuestMemory;
     type Error = crate::Error;
 
-    async fn execute(&mut self, _: &ProviderRequest, _: &GuestMemory) -> Result<ProviderOutcome> {
+    async fn execute(
+        &mut self,
+        _: reverie::Tid,
+        _: &ProviderRequest,
+        _: &mut GuestMemory,
+    ) -> Result<ProviderOutcome> {
         panic!("refusal executed a guest syscall")
     }
 }
