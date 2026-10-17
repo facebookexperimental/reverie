@@ -147,6 +147,24 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
         false
     }
 
+    /// The guest's stack pointer at the current image's first instruction:
+    /// the address of `argc`, above which the kernel (or a loader standing
+    /// in for it) laid out `argv`, `envp` and the auxiliary vector. `Some`
+    /// only when the backend observed that stack pointer itself, at the exec
+    /// stop or the image's entry, before any guest instruction ran; a task
+    /// forked or cloned from such an image reports the same value, as it
+    /// shares that image. `None` where the backend did not observe it, for
+    /// example where the post-exec callback runs only at the image's first
+    /// syscall, by which point the stack pointer has moved.
+    ///
+    /// A Tool that reads the initial stack through `Guest::memory` must take
+    /// its address from here and never from `regs()` in the post-exec
+    /// callback, which on some backends is not the image's first
+    /// instruction.
+    fn initial_stack_pointer(&self) -> Option<u64> {
+        None
+    }
+
     /// Reads and returns the auxv table for this process.
     fn auxv(&self) -> Auxv {
         Auxv::new(self.pid()).expect("failed to read auxv table")

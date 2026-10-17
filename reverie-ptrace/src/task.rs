@@ -2477,6 +2477,11 @@ pub struct TracedTask<L: Tool> {
     /// True if we can intercept CPUID, false otherwise.
     has_cpuid_interception: bool,
 
+    /// The stack pointer the current image started with, recorded at its
+    /// exec stop (`Guest::initial_stack_pointer`). Tasks forked or cloned
+    /// from the image share it.
+    initial_stack_pointer: Option<u64>,
+
     /// Original call still owned by the current syscall callback. Only an
     /// ordinary, unconverted seccomp callback owns a kernel entry to skip;
     /// an injected frame and an already-skipped call are logical operations.
@@ -2791,6 +2796,7 @@ impl<L: Tool> TracedTask<L> {
             ordinary_exec: Arc::new(StdMutex::new(HashMap::new())),
             command_bootstrap: options.command_bootstrap,
             has_cpuid_interception: false,
+            initial_stack_pointer: None,
             pending_syscall: None,
             injected_syscall_frame: None,
             injected_tail_result: None,
@@ -2873,6 +2879,7 @@ impl<L: Tool> TracedTask<L> {
             ordinary_exec: self.ordinary_exec.clone(),
             command_bootstrap: false,
             has_cpuid_interception: self.has_cpuid_interception,
+            initial_stack_pointer: self.initial_stack_pointer,
             pending_syscall: None,
             injected_syscall_frame: None,
             injected_tail_result: None,
@@ -2948,6 +2955,7 @@ impl<L: Tool> TracedTask<L> {
             ordinary_exec: Arc::new(StdMutex::new(HashMap::new())),
             command_bootstrap: false,
             has_cpuid_interception: self.has_cpuid_interception,
+            initial_stack_pointer: self.initial_stack_pointer,
             pending_syscall: None,
             injected_syscall_frame: None,
             injected_tail_result: None,
@@ -3637,6 +3645,14 @@ impl<L: Tool + 'static> TracedTask<L> {
 
         // Restore registers after adding our temporary injection state.
         remove_injection_state(&mut task, regs, prev_state)?;
+        // At the exec stop no instruction of the new image has run: its stack
+        // pointer is the one it starts with, at argc.
+        if place == PreinitPlace::AtExec {
+            // A register is 32 bits wide on aarch64's `Reg`, 64 on x86_64.
+            #[allow(clippy::useless_conversion)]
+            let stack = u64::from(regs.stack_ptr());
+            self.initial_stack_pointer = Some(stack);
+        }
 
         if vdso::is_patch_required(&self.global_state.subscriptions) {
             let subscriptions = self.global_state.subscriptions.clone();
@@ -9126,6 +9142,10 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
 
     fn is_command_bootstrap(&self) -> bool {
         self.command_bootstrap
+    }
+
+    fn initial_stack_pointer(&self) -> Option<u64> {
+        self.initial_stack_pointer
     }
 
     fn memory(&self) -> Self::Memory {

@@ -8376,6 +8376,94 @@ fn tool_receives_post_exec_with_guest_auxv() {
     assert_eq!(random, POST_EXEC_RANDOM);
 }
 
+/// What `InitialStackTool`'s post-exec hook saw: the reported initial stack
+/// pointer, the registers' stack pointer, argc read at the reported address,
+/// and the first byte of argv[0] there.
+#[derive(Default)]
+struct InitialStackLog {
+    seen: Mutex<Vec<InitialStackSeen>>,
+}
+
+/// The reported initial stack pointer, the registers' stack pointer, argc,
+/// and argv[0]'s first byte.
+type InitialStackSeen = (Option<u64>, u64, u64, u8);
+
+#[reverie::global_tool]
+impl GlobalTool for InitialStackLog {
+    type Request = InitialStackSeen;
+    type Response = ();
+    type Config = ();
+
+    async fn receive_rpc(&self, _from: Pid, seen: InitialStackSeen) {
+        self.seen
+            .lock()
+            .expect("initial stack log lock poisoned")
+            .push(seen);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct InitialStackTool;
+
+#[reverie::tool]
+impl Tool for InitialStackTool {
+    type GlobalState = InitialStackLog;
+    type ThreadState = ();
+
+    async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
+        let reported = guest.initial_stack_pointer();
+        let rsp = guest.regs().await.rsp;
+        let (argc, first) = match reported {
+            Some(stack) => {
+                let argc: u64 = guest
+                    .memory()
+                    .read_value(AddrMut::<u64>::from_raw(stack as usize).ok_or(Errno::EFAULT)?)?;
+                let argv0: u64 = guest.memory().read_value(
+                    AddrMut::<u64>::from_raw(stack as usize + 8).ok_or(Errno::EFAULT)?,
+                )?;
+                let first: u8 = guest
+                    .memory()
+                    .read_value(AddrMut::<u8>::from_raw(argv0 as usize).ok_or(Errno::EFAULT)?)?;
+                (argc, first)
+            }
+            None => (0, 0),
+        };
+        guest.send_rpc((reported, rsp, argc, first)).await;
+        Ok(())
+    }
+}
+
+/// The KVM loader builds the image's initial stack itself and reports its
+/// stack pointer (`Guest::initial_stack_pointer`): at the post-exec hook, which
+/// runs before the entry point, it is the registers' stack pointer, and argc
+/// and argv[0] are there.
+#[test]
+fn post_exec_reports_the_loaders_initial_stack_pointer() {
+    if !kvm_available("initial stack pointer test") {
+        return;
+    }
+    let code = [
+        0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax, SYS_exit_group
+        0x31, 0xff, // xor edi, edi
+        0x0f, 0x05, // syscall
+        0x0f, 0x0b, // ud2
+    ];
+    let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+    backend
+        .install_static_elf_with_args(&static_elf(&code), &["prog", "one", "two"], &[])
+        .unwrap();
+    let (log, exit_code, _, _) =
+        futures::executor::block_on(backend.run_static_elf_with_tool::<InitialStackTool>((), true))
+            .unwrap();
+    assert_eq!(exit_code, 0);
+    let seen = log.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    let (reported, rsp, argc, first) = seen[0];
+    assert_eq!(reported, Some(rsp));
+    assert_eq!(argc, 3);
+    assert_eq!(first, b'p');
+}
+
 #[test]
 fn lifecycle_callbacks_refuse_deferred_signal_without_a_syscall_frame() {
     if !kvm_available("lifecycle signal-boundary test") {
