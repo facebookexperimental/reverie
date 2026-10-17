@@ -86,16 +86,33 @@ pub use request::SyscallRequest;
 /// Effects are already committed to the provider's state when the outcome is
 /// returned.
 ///
-/// Only [`ProviderOutcome::Return`] exists so far. The remaining outcomes (a
-/// segment-base effect for `arch_prctl(ARCH_SET_FS/GS)`, a child created by
+/// [`ProviderOutcome::Cancelled`] and [`ProviderOutcome::ThreadGroupExited`]
+/// produce no syscall result at all: the call never returns to the issuing
+/// task. The remaining outcomes (a segment-base effect for
+/// `arch_prctl(ARCH_SET_FS/GS)`, a child created by
 /// `fork`/`vfork`/`clone`/`clone3`, an exec, and an exit) are added in a later
-/// step; until then an implementation reports them to its backend outside this
+/// step. Until then an implementation reports them to its backend outside this
 /// trait, after `execute` returns `Return` with the call's raw result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderOutcome {
     /// The raw Linux result: a nonnegative value, or `-errno` for a Linux
     /// error.
     Return(i64),
+    /// A blocking call was cancelled because the issuing task was retired
+    /// or cancelled (for example a read of inherited standard input). There is
+    /// no result. The backend must neither fabricate one nor resume the
+    /// Tool's handler, and it ends the issuing task's handler without a
+    /// result.
+    Cancelled,
+    /// The call observed that the issuing task's thread group has already
+    /// exited with `status`, an exit the provider committed before or during
+    /// the call (for example a child wait interrupted by a sibling's
+    /// `exit_group`). There is no result. The backend ends the handler and
+    /// reports the group exit with this status.
+    ThreadGroupExited {
+        /// The committed thread-group exit status.
+        status: crate::ExitStatus,
+    },
 }
 
 /// Executes Linux syscalls on behalf of guest tasks: the provider-neutral core
@@ -182,13 +199,11 @@ pub trait LinuxProvider: Send + Sync {
     ///
     /// - `Ok(ProviderOutcome::Return(-errno))` is a Linux error and is
     ///   returned to the Tool as that errno.
+    /// - `Ok(ProviderOutcome::Cancelled)` and
+    ///   `Ok(ProviderOutcome::ThreadGroupExited { .. })` produce no syscall
+    ///   result; see [`ProviderOutcome`].
     /// - `Err` is a broken invariant that ends the run; the backend must not
-    ///   turn it into a guest-visible errno. Until [`ProviderOutcome`] carries
-    ///   exits and interruptions, two errors are dispositions rather than
-    ///   failures: a thread-group exit the provider already committed, and a
-    ///   blocking read that was cancelled and must produce no syscall result
-    ///   (in reverie-kvm, `Error::ChildWaitGroupExit` and
-    ///   `Error::TerminalReadCancelled`).
+    ///   turn it into a guest-visible errno.
     /// - A request the provider does not implement is answered as the module
     ///   documentation's error model says, with a typed refusal recorded for
     ///   [`LinuxProvider::take_unsupported_refusal`].

@@ -84,10 +84,11 @@ fn terminal_read_injection_keeps_nonreturning_cancellation_and_typed_failures() 
             let request = SyscallRequest::from_provider(request);
             assert_eq!(request.number(), libc::SYS_read as u64);
             assert_eq!(request.args()[..3], [0, 0, 0]);
-            self.result
-                .take()
-                .expect("terminal read was retried")
-                .map(ProviderOutcome::Return)
+            // The production adapter's conversion, so these cases exercise it.
+            match self.result.take().expect("terminal read was retried") {
+                Ok(raw) => Ok(ProviderOutcome::Return(raw)),
+                Err(error) => provider_disposition(error),
+            }
         }
     }
 
@@ -733,7 +734,7 @@ fn wait_group_exit_injection_is_nonreturning_and_failure_still_wins() {
             if let Some(failure) = self.fail.take() {
                 failure.publish();
             }
-            Err(Error::ChildWaitGroupExit {
+            provider_disposition(Error::ChildWaitGroupExit {
                 status: self.status,
             })
         }

@@ -621,6 +621,23 @@ impl Drop for StaticElfSyscallExecutor<'_> {
     }
 }
 
+/// Converts the executor's two dispositional errors into the provider
+/// outcomes that replaced them: a cancelled blocking read
+/// ([`Error::TerminalReadCancelled`]) becomes [`ProviderOutcome::Cancelled`],
+/// and a child wait that observed its own thread group's committed exit
+/// ([`Error::ChildWaitGroupExit`]) becomes
+/// [`ProviderOutcome::ThreadGroupExited`]. Only the exact, unwrapped variants
+/// convert. Any other error is returned unchanged, including one of these two
+/// wrapped with cleanup errors, which `KvmGuest::inject` reports as a run
+/// failure as it always has.
+fn provider_disposition(error: Error) -> Result<ProviderOutcome> {
+    match error {
+        Error::TerminalReadCancelled => Ok(ProviderOutcome::Cancelled),
+        Error::ChildWaitGroupExit { status } => Ok(ProviderOutcome::ThreadGroupExited { status }),
+        error => Err(error),
+    }
+}
+
 /// Today's executor (LinuxEmu) as the run's [`LinuxProvider`].
 ///
 /// KVM- and executor-specific facts that the provider-neutral trait does not
@@ -642,8 +659,10 @@ impl Drop for StaticElfSyscallExecutor<'_> {
 ///   vCPU's host thread, which a blocking read still blocks, exactly as when
 ///   the method was synchronous, and so its future completes on the first
 ///   poll.
-/// - Only `Return` is produced. A staged segment base, process action
-///   (fork, clone, exec) or exit is left in the executor's side channels and
+/// - `Return`, `Cancelled` and `ThreadGroupExited` are produced; the last two
+///   come from the executor's dispositional errors through
+///   [`provider_disposition`]. A staged segment base, process action (fork,
+///   clone, exec) or exit is still left in the executor's side channels and
 ///   consumed after `execute` by `complete_injection` and the vCPU loop.
 /// - `execute` still performs three backend admission checks before the
 ///   executor sees the request (the signal guard and prepared-signal state,
@@ -745,7 +764,13 @@ impl LinuxProvider for StaticElfSyscallExecutor<'_> {
         }
         let result = self
             .backend
-            .execute_static_elf_syscall(self.executor, request, memory)?;
+            .execute_static_elf_syscall(self.executor, request, memory);
+        let result = match result {
+            Ok(result) => result,
+            // As before, neither a disposition nor an error records a result
+            // or a polled-read attempt.
+            Err(error) => return provider_disposition(error),
+        };
         self.last_result = Some(result);
         self.polled_read_attempt = Some((*request, result));
         Ok(ProviderOutcome::Return(result))
@@ -1693,7 +1718,7 @@ impl<T: Tool> Guest<T> for KvmGuest<'_, T> {
                 self.unsupported_refusal = provider.take_unsupported_refusal();
                 raw
             }
-            Err(Error::ChildWaitGroupExit { status }) => {
+            Ok(ProviderOutcome::ThreadGroupExited { status }) => {
                 // The group exit is already committed, not a request to cancel
                 // an ordinary callback. Preserve its status across owned future
                 // destruction and terminal signal-boundary settlement.
@@ -1701,7 +1726,7 @@ impl<T: Tool> Guest<T> for KvmGuest<'_, T> {
                 return std::future::pending().await;
             }
 
-            Err(Error::TerminalReadCancelled) => {
+            Ok(ProviderOutcome::Cancelled) => {
                 // Reuse the existing nonreturning cancellation disposition,
                 // including parked/dequeue ownership. No syscall result or
                 // signal-effect wrapper may be manufactured for this read.
@@ -6725,6 +6750,31 @@ mod tests {
 
     fn synthetic_initial_exec() -> SyscallRequest {
         SyscallRequest::new(libc::SYS_execve as u64, [0x100, 0x200, 0x300, 0, 0, 0])
+    }
+
+    /// Only the two exact dispositional errors become provider outcomes. A
+    /// wrapped one, and every other error, stays an error, so
+    /// `KvmGuest::inject` keeps reporting it as a run failure.
+    #[test]
+    fn provider_disposition_converts_only_the_two_unwrapped_dispositions() {
+        assert!(matches!(
+            provider_disposition(Error::TerminalReadCancelled),
+            Ok(ProviderOutcome::Cancelled)
+        ));
+        let status = reverie::ExitStatus::Exited(3);
+        assert!(matches!(
+            provider_disposition(Error::ChildWaitGroupExit { status }),
+            Ok(ProviderOutcome::ThreadGroupExited { status: actual }) if actual == status
+        ));
+        assert!(matches!(
+            provider_disposition(Error::RunAborted),
+            Err(Error::RunAborted)
+        ));
+        let wrapped = Error::TerminalReadCancelled.with_cleanup(vec![Error::RunAborted]);
+        assert!(matches!(
+            provider_disposition(wrapped),
+            Err(Error::WithCleanup { .. })
+        ));
     }
 
     /// The live stack region is the run of accessible pages from rsp upward: up
