@@ -623,6 +623,87 @@ impl Tool for SetRegTool {
         }
         let (number, args) = syscall.into_parts();
         if number == Sysno::prctl && args.arg0 as u64 == KERNEL_IDENTITY_PRCTL {
+            if args.arg1 as i64 == libc::SYS_sched_getaffinity {
+                const CAPACITY: usize = 128;
+                let target = args.arg2 as libc::c_long;
+                let length = args.arg3;
+                if length > CAPACITY {
+                    return Err(reverie::syscalls::Errno::EINVAL.into());
+                }
+                let pointer = match args.arg4 {
+                    0 => "null",
+                    1 => "bad",
+                    _ => "valid",
+                };
+                let hex = |bytes: &[u8]| -> String {
+                    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+                    bytes
+                        .iter()
+                        .flat_map(|&byte| {
+                            [
+                                DIGITS[(byte >> 4) as usize] as char,
+                                DIGITS[(byte & 15) as usize] as char,
+                            ]
+                        })
+                        .collect()
+                };
+                // Independent native storage, with all capacity bytes and both
+                // canaries reset before the syscall. Retain its raw byte count.
+                let mut kernel_output = [0x7f_u8; CAPACITY + 16];
+                kernel_output[..8].fill(0xa5);
+                kernel_output[CAPACITY + 8..].fill(0x5a);
+                let kernel_address = if pointer == "valid" {
+                    kernel_output.as_mut_ptr().wrapping_add(8) as usize
+                } else {
+                    args.arg4
+                };
+                let guest_before = if pointer == "valid" {
+                    let mut bytes = [0_u8; CAPACITY];
+                    guest
+                        .memory()
+                        .read_exact(Addr::from(args.arg4), &mut bytes)?;
+                    hex(&bytes)
+                } else {
+                    "unaddressed".to_owned()
+                };
+                // NULL/address1 are passed literally to both calls and never
+                // dereferenced by this observer.
+                let kernel = unsafe {
+                    libc::syscall(libc::SYS_sched_getaffinity, target, length, kernel_address)
+                };
+                let kernel = if kernel == -1 {
+                    -i64::from(std::io::Error::last_os_error().raw_os_error().unwrap())
+                } else {
+                    kernel
+                };
+                let injected = guest
+                    .inject(Syscall::from_raw(
+                        Sysno::sched_getaffinity,
+                        SyscallArgs::new(args.arg2, args.arg3, args.arg4, 0, 0, 0),
+                    ))
+                    .await
+                    .unwrap_or_else(|errno| -i64::from(errno.into_raw()));
+                let guest_after = if pointer == "valid" {
+                    let mut bytes = [0_u8; CAPACITY];
+                    guest
+                        .memory()
+                        .read_exact(Addr::from(args.arg4), &mut bytes)?;
+                    hex(&bytes)
+                } else {
+                    "unaddressed".to_owned()
+                };
+                let kernel_canaries = u8::from(
+                    kernel_output[..8] == [0xa5; 8] && kernel_output[CAPACITY + 8..] == [0x5a; 8],
+                );
+                emit_line(&format!(
+                    "reverie-dbt-test: kernel-affinity-query sysnum={} target={target} len={length} pointer={pointer} kernel={kernel} injected={injected} kernel_mask={} guest_before={guest_before} guest_after={guest_after} kernel_canaries={kernel_canaries}",
+                    args.arg1,
+                    hex(&kernel_output[8..CAPACITY + 8]),
+                ));
+                // Return the real result so the complete C matrix remains
+                // visible even when membership admission rejects the live PID.
+                return Ok(injected);
+            }
             if args.arg1 as i64 == libc::SYS_sched_getparam {
                 let target = args.arg2 as libc::c_long;
                 let pointer = match args.arg3 {

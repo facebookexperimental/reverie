@@ -20,6 +20,8 @@
 
 _Static_assert(sizeof(struct sched_param) == 4, "x86_64 sched_param oracle");
 
+#define AFFINITY_CAPACITY 128
+
 static int returning;
 
 static long query(long number, long target) {
@@ -40,8 +42,14 @@ static long parameter_query(long target, struct sched_param* parameter) {
   return syscall(SYS_sched_getparam, target, parameter);
 }
 
+static long affinity_query(long target, size_t length, unsigned char* mask) {
+  if (returning)
+    return prctl(0x4b494421, (long)SYS_sched_getaffinity, target, (long)length, (long)mask);
+  return syscall(SYS_sched_getaffinity, target, length, mask);
+}
+
 int main(int argc, char** argv) {
-  if (argc != 22)
+  if (argc != 40)
     return 2;
   returning = strcmp(argv[1], "returning") == 0;
   long target = strtol(argv[2], NULL, 10);
@@ -131,6 +139,42 @@ int main(int argc, char** argv) {
     int expected_error = raw_expected < 0 ? (int)-raw_expected : 0;
     failed |= rc != expected_rc || error != expected_error ||
         bytes != expected_bytes || !canaries;
+  }
+  const long affinity_targets[] = {0, me, target, INT_MAX, -1, 0, 0, 0, 0};
+  const size_t affinity_lengths[] = {
+      AFFINITY_CAPACITY, AFFINITY_CAPACITY, AFFINITY_CAPACITY,
+      AFFINITY_CAPACITY, AFFINITY_CAPACITY, 0, 1, AFFINITY_CAPACITY, AFFINITY_CAPACITY};
+  const char* affinity_labels[] = {
+      "zero", "self", "live", "absent", "negative", "zero-size", "one-byte", "null", "bad"};
+  for (unsigned int i = 0; i < 9; ++i) {
+    unsigned char output[AFFINITY_CAPACITY + 16];
+    memset(output, 0x7f, sizeof(output));
+    memset(output, 0xa5, 8);
+    memset(output + AFFINITY_CAPACITY + 8, 0x5a, 8);
+    unsigned char* address = i == 7 ? NULL : i == 8 ? (unsigned char*)(uintptr_t)1 : output + 8;
+    errno = 0;
+    long rc = affinity_query(affinity_targets[i], affinity_lengths[i], address);
+    int error = errno;
+    int canaries = 1;
+    for (unsigned int j = 0; j < 8; ++j)
+      canaries &= output[j] == 0xa5 && output[AFFINITY_CAPACITY + 8 + j] == 0x5a;
+    const char digits[] = "0123456789abcdef";
+    char mask[AFFINITY_CAPACITY * 2 + 1];
+    for (unsigned int j = 0; j < AFFINITY_CAPACITY; ++j) {
+      mask[2 * j] = digits[output[8 + j] >> 4];
+      mask[2 * j + 1] = digits[output[8 + j] & 15];
+    }
+    mask[AFFINITY_CAPACITY * 2] = '\0';
+    printf("sched_getaffinity %s len=%zu rc=%ld errno=%d mask=%s canaries=%d\n",
+           affinity_labels[i], affinity_lengths[i], rc, error, mask, canaries);
+    // Exact host-measured raw byte count and all capacity bytes, including the
+    // untouched suffix. Kernel and guest observations never share this buffer.
+    long raw_expected = strtol(argv[22 + 2 * i], NULL, 10);
+    const char* expected_mask = argv[23 + 2 * i];
+    long expected_rc = raw_expected < 0 ? -1 : raw_expected;
+    int expected_error = raw_expected < 0 ? (int)-raw_expected : 0;
+    failed |= rc != expected_rc || error != expected_error || !canaries ||
+        strlen(expected_mask) != AFFINITY_CAPACITY * 2 || strcmp(mask, expected_mask) != 0;
   }
   if (failed)
     return 1;

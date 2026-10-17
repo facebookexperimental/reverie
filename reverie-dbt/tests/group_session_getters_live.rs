@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Read-only group/session/policy/priority/parameter queries can name live tasks outside the DBT client.
+//! Read-only task queries can name live tasks outside the DBT client.
 
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -75,6 +75,48 @@ fn raw_parameter(target: libc::c_long, pointer_kind: usize) -> (i64, u32) {
     assert_eq!(output[0], 0x2468_ace0);
     assert_eq!(output[2], 0xfdb9_7531);
     (result, output[1])
+}
+
+const AFFINITY_CAPACITY: usize = 128;
+
+fn affinity_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    bytes
+        .iter()
+        .flat_map(|&byte| {
+            [
+                DIGITS[(byte >> 4) as usize] as char,
+                DIGITS[(byte & 15) as usize] as char,
+            ]
+        })
+        .collect()
+}
+
+fn raw_affinity(
+    target: libc::c_long,
+    length: usize,
+    pointer_kind: usize,
+) -> (i64, [u8; AFFINITY_CAPACITY]) {
+    let mut output = [0x7f_u8; AFFINITY_CAPACITY + 16];
+    output[..8].fill(0xa5);
+    output[AFFINITY_CAPACITY + 8..].fill(0x5a);
+    let address = match pointer_kind {
+        0 => output.as_mut_ptr().wrapping_add(8),
+        1 => std::ptr::null_mut(),
+        2 => std::ptr::without_provenance_mut::<u8>(1),
+        _ => unreachable!(),
+    };
+    // Keep the raw byte-count return; libc sched_getaffinity would normalize
+    // success to zero. This storage never aliases any guest/Tool output.
+    let result = unsafe { libc::syscall(libc::SYS_sched_getaffinity, target, length, address) };
+    let result = if result == -1 {
+        -i64::from(std::io::Error::last_os_error().raw_os_error().unwrap())
+    } else {
+        result
+    };
+    assert_eq!(&output[..8], &[0xa5; 8]);
+    assert_eq!(&output[AFFINITY_CAPACITY + 8..], &[0x5a; 8]);
+    (result, output[8..AFFINITY_CAPACITY + 8].try_into().unwrap())
 }
 
 fn compare_with_linux(mode: &str) {
@@ -173,6 +215,49 @@ fn compare_with_linux(mode: &str) {
         (0, 0),
         "held SCHED_BATCH target must write all four bytes"
     );
+    let affinity_targets = [
+        0,
+        own_pid,
+        i64::from(pid),
+        i64::from(i32::MAX),
+        -1,
+        0,
+        0,
+        0,
+        0,
+    ];
+    let affinity_lengths = [
+        AFFINITY_CAPACITY,
+        AFFINITY_CAPACITY,
+        AFFINITY_CAPACITY,
+        AFFINITY_CAPACITY,
+        AFFINITY_CAPACITY,
+        0,
+        1,
+        AFFINITY_CAPACITY,
+        AFFINITY_CAPACITY,
+    ];
+    let affinity_pointers = [0, 0, 0, 0, 0, 0, 0, 1, 2];
+    let affinity_values: Vec<_> = affinity_targets
+        .iter()
+        .zip(affinity_lengths)
+        .zip(affinity_pointers)
+        .map(|((&target, length), pointer)| raw_affinity(target, length, pointer))
+        .collect();
+    for &(result, bytes) in &affinity_values[..3] {
+        assert!(
+            result > 0 && result as usize <= AFFINITY_CAPACITY,
+            "native affinity setup requires a successful bounded buffer, got {result}"
+        );
+        assert!(
+            bytes[..result as usize].iter().any(|&byte| byte != 0),
+            "native allowed mask must be nonempty"
+        );
+        assert!(
+            bytes[result as usize..].iter().all(|&byte| byte == 0x7f),
+            "native unwritten suffix changed"
+        );
+    }
     let mut arguments = vec![
         pid.to_string(),
         pgid.to_string(),
@@ -184,6 +269,10 @@ fn compare_with_linux(mode: &str) {
     for &(result, bytes) in &parameter_values {
         arguments.push(result.to_string());
         arguments.push(format!("{bytes:08x}"));
+    }
+    for (result, bytes) in &affinity_values {
+        arguments.push(result.to_string());
+        arguments.push(affinity_hex(bytes));
     }
     let mut expected = format!(
         "getpgid live={pgid} errno=0\ngetpgid zero-is-self=1\n\
@@ -219,6 +308,30 @@ fn compare_with_linux(mode: &str) {
         let (rc, error) = if value < 0 { (-1, -value) } else { (value, 0) };
         expected.push_str(&format!(
             "sched_getparam {label} rc={rc} errno={error} bytes={bytes:08x} canaries=1\n"
+        ));
+    }
+    let affinity_labels = [
+        "zero",
+        "self",
+        "live",
+        "absent",
+        "negative",
+        "zero-size",
+        "one-byte",
+        "null",
+        "bad",
+    ];
+    for (index, (label, (value, bytes))) in affinity_labels.iter().zip(&affinity_values).enumerate()
+    {
+        let (rc, error) = if *value < 0 {
+            (-1, -*value)
+        } else {
+            (*value, 0)
+        };
+        expected.push_str(&format!(
+            "sched_getaffinity {label} len={} rc={rc} errno={error} mask={} canaries=1\n",
+            affinity_lengths[index],
+            affinity_hex(bytes)
         ));
     }
     expected.push_str("group-session-getters=ok\n");
@@ -367,6 +480,49 @@ fn compare_with_linux(mode: &str) {
             assert_eq!(fields[6], format!("guest_before={before}"));
             assert_eq!(fields[7], format!("guest_after={after}"));
             assert_eq!(fields[8], "kernel_canaries=1");
+        }
+        let mut guest_affinity_targets = affinity_targets;
+        guest_affinity_targets[1] = guest_pid;
+        let affinity_rows: Vec<_> = stderr
+            .lines()
+            .filter_map(|line| line.strip_prefix("reverie-dbt-test: kernel-affinity-query "))
+            .collect();
+        assert_eq!(
+            affinity_rows.len(),
+            9,
+            "missing affinity observations: {output:?}"
+        );
+        for (index, row) in affinity_rows.iter().enumerate() {
+            let fields: Vec<_> = row.split_whitespace().collect();
+            assert_eq!(fields.len(), 10, "malformed affinity observation: {row}");
+            let pointer = match affinity_pointers[index] {
+                0 => "valid",
+                1 => "null",
+                2 => "bad",
+                _ => unreachable!(),
+            };
+            let (result, bytes) = &affinity_values[index];
+            let (before, after) = if affinity_pointers[index] == 0 {
+                (
+                    affinity_hex(&[0x7f; AFFINITY_CAPACITY]),
+                    affinity_hex(bytes),
+                )
+            } else {
+                ("unaddressed".to_owned(), "unaddressed".to_owned())
+            };
+            assert_eq!(fields[0], format!("sysnum={}", libc::SYS_sched_getaffinity));
+            assert_eq!(
+                fields[1],
+                format!("target={}", guest_affinity_targets[index])
+            );
+            assert_eq!(fields[2], format!("len={}", affinity_lengths[index]));
+            assert_eq!(fields[3], format!("pointer={pointer}"));
+            assert_eq!(fields[4], format!("kernel={result}"));
+            assert_eq!(fields[5], format!("injected={result}"));
+            assert_eq!(fields[6], format!("kernel_mask={}", affinity_hex(bytes)));
+            assert_eq!(fields[7], format!("guest_before={before}"));
+            assert_eq!(fields[8], format!("guest_after={after}"));
+            assert_eq!(fields[9], "kernel_canaries=1");
         }
     }
 }
