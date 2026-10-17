@@ -35,3 +35,9 @@ cc = "1.0"
 cc = "1.0"
 tempfile = "3.27.0"
 tokio = { version = "1.52.4", features = ["net", "rt"] }
+
+[features]
+# SaBRe's entry into the shared in-guest runtime's saved-register entry
+# (shared_entry::dispatch_rewritten_syscall). Off by default: the plugin
+# links the shared runtime's RCB clock only from the SaBRe switch on.
+shared-entry = ["reverie-inguest/rcb-clock"]

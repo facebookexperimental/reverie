@@ -19,6 +19,7 @@ mod paths;
 mod protected_files;
 mod reverie_adapter;
 mod rpc;
+pub mod shared_entry;
 mod signal;
 mod slot_map;
 pub mod stats;
