@@ -21,8 +21,8 @@ use crate::rpc::CoordinatorRpc;
 use crate::runtime;
 use crate::runtime::SyscallEvent;
 
-// The trampolines and the fallback continuation save a HookContext; the host
-// reads it as a RegisterContext.
+// Patched trampolines save HookContext; the shared entry reads RegisterContext.
+// The shared fallback continuation already owns RegisterContext.
 const _: () = {
     use core::mem::align_of;
     use core::mem::offset_of;
@@ -1096,12 +1096,4 @@ pub(crate) fn dispatch(event: &mut SyscallEvent) {
     // SAFETY: only LI's genuine intercepted paths reach this private wrapper,
     // retaining their actual event/frame, rights, RCB and callback protection.
     unsafe { installed_tool::dispatch(event) };
-}
-
-pub(crate) fn dispatch_instruction(kind: runtime::InstructionEventKind, context: &mut HookContext) {
-    // SAFETY: HookContext and RegisterContext have identical layout (all
-    // fields checked above). LI supplies the unique saved frame of this actual
-    // intercepted instruction under its existing native/accounting guards.
-    let context = unsafe { &mut *(context as *mut HookContext).cast::<RegisterContext>() };
-    unsafe { installed_tool::dispatch_instruction(kind, context) };
 }

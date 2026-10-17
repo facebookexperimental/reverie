@@ -797,8 +797,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 21] = [
     ),
     (
         "reverie-inguest/src/guest/installed_tool.rs",
-        16500,
-        "fb58dc4b05489cced3634130c9a20c305527a1f82f6d7190b2d91ca37f5a2cff",
+        24461,
+        "fa24f79b0a15bbbdc3e140e3685b308df6e2e7c646ca34926ba0a51cec683168",
     ),
     (
         "reverie-inguest/src/guest/mod.rs",
@@ -812,8 +812,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 21] = [
     ),
     (
         "reverie-liteinst/src/tool_host.rs",
-        45734,
-        "ce0b9d0bf8b0eecb343f4d1860aba361147d4104da622c0811c667c00f313dd6",
+        45275,
+        "a5c6a0cb44d0a1cb328916dcf42bffb6cac766ad2215bf6e6b43d85024e5ae42",
     ),
 ];
 // Native Detcore's fixed-gate publication ordering is a separately declared

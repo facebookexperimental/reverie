@@ -9,7 +9,8 @@
 //! The process's one installed in-guest Tool and its coordinator connection.
 //!
 //! Backends retain interception, installation admission and runtime activation.
-//! This owner only publishes the existing ToolHost and delegates real entries.
+//! This owner publishes the existing ToolHost and shares the saved-register
+//! entry bridge used by patched jumps and the signal continuation.
 
 use std::io;
 use std::sync::OnceLock;
@@ -266,6 +267,184 @@ pub unsafe fn dispatch_instruction(kind: InstructionEventKind, context: &mut Reg
     let handler = instruction_handler();
     // SAFETY: the caller establishes this instruction's actual provenance.
     unsafe { handler.dispatch_instruction(kind, context) };
+}
+
+/// Run an intercepted instruction from its actual saved register context.
+///
+/// Both a patched jump and the signal continuation use this entry. It retains
+/// the same RCB/callback extent and native instruction bypass for nested Tool
+/// work; completion and instruction-pointer advancement stay with the caller.
+///
+/// # Safety
+/// The caller must be on the genuine intercepted guest thread, after runtime
+/// activation, with the correct installed Tool and instruction subscriptions.
+/// `context` must be its unique live saved frame with the actual guest rights,
+/// used by nobody else until return. The caller retains the required Tool
+/// stack/TLS and native-transfer invariants; effects must preserve Rust memory
+/// invariants. A synthetic frame or callback guard supplies no entry authority.
+#[cfg(feature = "rcb-clock")]
+pub unsafe fn dispatch_saved_instruction(
+    context: *mut RegisterContext,
+    kind: InstructionEventKind,
+) {
+    use super::clock::enter_rcb_handler;
+    use super::clock::leave_rcb_handler;
+    use super::instruction::execute_native_instruction;
+    use super::instruction::set_instruction_native;
+    use super::support::ToolCallbackGuard;
+    use super::support::emit_in_guest_stage;
+    use super::support::exit_now;
+    use super::support::tool_callback_active;
+
+    if context.is_null() || enter_rcb_handler().is_err() {
+        unsafe { exit_now(122) };
+    }
+    let context = unsafe { &mut *context };
+    if unsafe { set_instruction_native(kind, true) }.is_err() {
+        unsafe { exit_now(122) };
+    }
+    // A previously patched instruction still jumps here while native faulting
+    // is enabled. Re-entering the Tool would deadlock on its already-held lock,
+    // so execute the instruction at a private, never-patched site instead.
+    if tool_callback_active() {
+        emit_in_guest_stage(match kind {
+            InstructionEventKind::Cpuid => b"nested-instruction-native-cpuid",
+            InstructionEventKind::Rdtsc => b"nested-instruction-native-rdtsc",
+            InstructionEventKind::Rdtscp => b"nested-instruction-native-rdtscp",
+        });
+        unsafe { execute_native_instruction(kind, context) };
+        if unsafe { set_instruction_native(kind, false) }.is_err() || leave_rcb_handler().is_err() {
+            unsafe { exit_now(122) };
+        }
+        return;
+    }
+    {
+        let _tool_callback = ToolCallbackGuard::enter();
+        unsafe { dispatch_instruction(kind, context) };
+    }
+    if unsafe { set_instruction_native(kind, false) }.is_err() || leave_rcb_handler().is_err() {
+        unsafe { exit_now(122) };
+    }
+}
+
+/// Dispatch an intercepted syscall and write its result into the saved frame.
+///
+/// This is the common ordinary-context entry for patched jumps and the signal
+/// continuation. It owns event construction, accounting, callback scope and
+/// register/PKRU writeback, not installation, site accounting or completion.
+/// `process` retains the existing entry's protections and Tool/mode dispatch;
+/// its normal mapping observation remains inside that callback. The separate
+/// mapping observer runs only through the nested-Tool forwarding path.
+///
+/// # Safety
+/// The caller must supply the genuine intercepted guest thread's unique live
+/// `context`, after runtime activation on the required Tool stack/TLS. `number`
+/// and `dispatch` must describe that actual entry; `guest_pkru`, when present,
+/// must belong to its genuine interrupted state, never an older signal frame.
+/// `process` and both observers must belong to this installed runtime, preserve
+/// its existing protections and Rust memory invariants, and retain no event or
+/// frame reference. `process` receives a unique live `SyscallEvent` pointer,
+/// cast to `c_void`, and must perform the synchronous original dispatch;
+/// observers must not dispatch or manufacture callback authority. The caller
+/// retains native-transfer and completion ownership. This entry's guards do not
+/// authenticate arbitrary pointers or authorize pre-activation dispatch.
+#[cfg(feature = "rcb-clock")]
+pub unsafe fn dispatch_saved_syscall(
+    context: *mut RegisterContext,
+    number: Option<i64>,
+    dispatch: super::event::SyscallDispatch,
+    guest_pkru: Option<&mut Option<u32>>,
+    process: unsafe extern "C" fn(*mut core::ffi::c_void),
+    observe_nested_mapping: fn(&SyscallEvent),
+    observe_fallback: Option<fn(&SyscallEvent)>,
+) {
+    use super::clock::enter_rcb_handler;
+    use super::clock::leave_rcb_handler;
+    use super::event::SyscallDispatch;
+    use super::support::ToolCallbackGuard;
+    use super::support::exit_now;
+    use super::support::tool_callback_active;
+    use super::trap_dispatch::forward_nested_tool_syscall;
+
+    const UNSET_RESULT: i64 = i64::MIN;
+    if context.is_null() {
+        unsafe {
+            exit_now(122);
+        }
+    }
+    if enter_rcb_handler().is_err() {
+        unsafe { exit_now(122) };
+    }
+    // SAFETY: the intercepted entry supplies its unique mutable saved frame.
+    let context_pointer = context as usize;
+    let context = unsafe { &mut *context };
+    let mut event = SyscallEvent {
+        number: number.unwrap_or(context.rax as i64),
+        args: [
+            context.rdi,
+            context.rsi,
+            context.rdx,
+            context.r10,
+            context.r8,
+            context.r9,
+        ],
+        instruction_pointer: context.instruction_pointer,
+        result: UNSET_RESULT,
+        context: context_pointer,
+        dispatch,
+        // Fallback supplies its owned genuine entry. Installed hooks still
+        // need independent provenance; never borrow a stale signal's rights.
+        guest_pkru: guest_pkru.as_ref().and_then(|value| **value),
+    };
+    if matches!(dispatch, SyscallDispatch::Fallback)
+        && let Some(observe) = observe_fallback
+    {
+        // The RCB boundary already excludes Tool work. This observer sees
+        // the actual entry; it cannot create or retain a dispatch.
+        observe(&event);
+    }
+    // A site patched for another syscall (glibc's `syscall()` wrapper) can
+    // carry the guest's own `rt_sigreturn` here without a trap; refuse it as
+    // the SIGSYS handler does a trapped one.
+    if crate::trap::is_rt_sigreturn(event.number) && crate::trap::signal_return_restricted() {
+        unsafe { crate::trap::refuse_guest_signal_return() };
+    }
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-133): Review guarded installed-hook bypass for Tool-internal syscalls.
+    if tool_callback_active() {
+        // SAFETY: a genuine hook entry made while a Tool callback is active on
+        // this thread: the callback's own syscall, which may run natively.
+        unsafe { forward_nested_tool_syscall(&mut event, observe_nested_mapping) };
+        context.rax = event.result as u64;
+        context.rcx = context.instruction_pointer.saturating_add(2);
+        context.r11 = context.rflags;
+        if let Some(output) = guest_pkru {
+            *output = event.guest_pkru;
+        }
+        if leave_rcb_handler().is_err() {
+            unsafe { exit_now(122) };
+        }
+        return;
+    }
+    {
+        let _tool_callback = ToolCallbackGuard::enter();
+        // SAFETY: this unique local event remains live until the synchronous
+        // C-ABI callback returns. Preserve its existing abort-on-unwind boundary;
+        // the callback retains neither this pointer nor the saved frame.
+        unsafe { process((&raw mut event).cast::<core::ffi::c_void>()) };
+    }
+    if event.result == UNSET_RESULT {
+        event.result = -i64::from(libc::ENOSYS);
+    }
+    context.rax = event.result as u64;
+    context.rcx = context.instruction_pointer.saturating_add(2);
+    context.r11 = context.rflags;
+    if let Some(output) = guest_pkru {
+        *output = event.guest_pkru;
+    }
+    if leave_rcb_handler().is_err() {
+        unsafe { exit_now(122) };
+    }
 }
 
 fn instruction_handler() -> &'static dyn ToolHandler {

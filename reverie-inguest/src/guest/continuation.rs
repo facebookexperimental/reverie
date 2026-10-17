@@ -341,6 +341,36 @@ pub unsafe fn register_handlers(handlers: ContinuationHandlers) -> io::Result<()
     })
 }
 
+/// Register one runtime's handlers once, then prepare each calling thread.
+///
+/// The caller retains its registration cache. Another runtime's cache still
+/// encounters the existing process-wide registry's `AlreadyExists` refusal.
+/// Only registration is cached: pending-call and backing checks run on every
+/// invocation, and an initialization failure does not poison registration.
+///
+/// # Safety
+/// The requirements of [`register_handlers`] apply. `registration` must always
+/// identify the same process-lifetime handler pair; a successful cache must
+/// never be reused for a different pair or a different runtime owner. Call in
+/// ordinary initialization context before this thread can enter a continuation.
+pub unsafe fn initialize_registered(
+    registration: &OnceLock<Result<(), io::ErrorKind>>,
+    handlers: ContinuationHandlers,
+    backing: StackBacking,
+) -> io::Result<()> {
+    let result = registration.get_or_init(|| {
+        // SAFETY: the caller binds this cache permanently to these handlers.
+        unsafe { register_handlers(handlers) }.map_err(|error| error.kind())
+    });
+    if let Err(kind) = result {
+        return Err(io::Error::new(
+            *kind,
+            "the in-guest continuation's handlers are registered by another backend",
+        ));
+    }
+    initialize_with_stack_backing(backing)
+}
+
 /// Prepares this thread's continuation (its owned stack and saved-state
 /// buffer). Call after [`register_handlers`] and before the first trap can
 /// reach [`prepare_signal`] or [`prepare_instruction_signal`]; fails if no
@@ -988,6 +1018,79 @@ mod tests {
         syscall: no_syscall,
         instruction: no_instruction,
     };
+
+    #[test]
+    fn registration_cache_keeps_one_owner_and_per_thread_initialization() {
+        const CHILD: &str = "REVERIE_CONTINUATION_REGISTRATION_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // A fresh process isolates the real, never-reset handler registry
+            // from tests which deliberately share their first registration.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "guest::continuation::tests::registration_cache_keeps_one_owner_and_per_thread_initialization",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(
+                String::from_utf8(output.stdout)
+                    .unwrap()
+                    .contains("registration ownership checked")
+            );
+            return;
+        }
+
+        let owner = OnceLock::new();
+        let initialize_owner = || unsafe {
+            // SAFETY: this cache always denotes the same inert test handlers;
+            // these tests prepare storage but never execute a continuation.
+            initialize_registered(&owner, HANDLERS_FOR_TESTS, StackBacking::Legacy)
+        };
+        initialize_owner().unwrap();
+        let first_stack = OWNER.get() as usize;
+        assert_ne!(first_stack, 0);
+        initialize_owner().unwrap();
+        assert_eq!(OWNER.get() as usize, first_stack);
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    assert!(OWNER.get().is_null());
+                    initialize_owner().unwrap();
+                    assert!(READY.get());
+                    assert_ne!(OWNER.get() as usize, 0);
+                    assert_ne!(OWNER.get() as usize, first_stack);
+                })
+                .join()
+                .unwrap();
+        });
+        assert!(prepare(0x1000).is_some());
+        assert_eq!(
+            initialize_owner().unwrap_err().to_string(),
+            "a syscall continuation is still active"
+        );
+        assert_eq!(PENDING.get().unwrap().instruction, 0x1000);
+        PENDING.set(None);
+        initialize_owner().unwrap();
+
+        let other_owner = OnceLock::new();
+        for _ in 0..2 {
+            // Even the same callback addresses cannot replace the first
+            // runtime's ownership using a different registration cache.
+            let error = unsafe {
+                initialize_registered(&other_owner, HANDLERS_FOR_TESTS, StackBacking::Legacy)
+            }
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+            assert_eq!(
+                error.to_string(),
+                "the in-guest continuation's handlers are registered by another backend"
+            );
+        }
+        println!("registration ownership checked");
+    }
 
     #[test]
     fn pending_continuation_refuses_reentry_without_overwriting() {

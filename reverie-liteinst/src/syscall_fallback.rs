@@ -6,7 +6,6 @@
 use std::io;
 use std::sync::OnceLock;
 
-use liteinst2::trampoline::HookContext;
 use reverie_inguest::guest::context::RegisterContext;
 use reverie_inguest::guest::continuation;
 pub(crate) use reverie_inguest::guest::continuation::rebind_fork_child;
@@ -21,37 +20,27 @@ static REGISTRATION: OnceLock<Result<(), io::ErrorKind>> = OnceLock::new();
 /// (once per process) and prepares this thread's continuation.
 pub(crate) fn initialize() -> io::Result<()> {
     let region = reverie_inguest::guest::tool_region::ToolRegion::reserve()?;
-    let registration = REGISTRATION.get_or_init(|| {
-        // SAFETY: both handlers only pass the continuation's register block
-        // on to the runtime's dispatch, which uses it for the call and keeps
-        // nothing.
-        unsafe {
-            continuation::register_handlers(continuation::ContinuationHandlers {
+    // SAFETY: this one cache always denotes these same dispatch functions.
+    // They synchronously use the continuation's genuine saved register block
+    // and interrupted PKRU, preserving the shared entry's safety contract.
+    unsafe {
+        continuation::initialize_registered(
+            &REGISTRATION,
+            continuation::ContinuationHandlers {
                 syscall: dispatch_syscall,
                 instruction: dispatch_instruction,
-            })
-        }
-        .map_err(|error| error.kind())
-    });
-    if let Err(kind) = registration {
-        return Err(io::Error::new(
-            *kind,
-            "the in-guest continuation's handlers are registered by another backend",
-        ));
+            },
+            reverie_inguest::guest::tool_region::StackBacking::ToolRegion(region),
+        )
     }
-    continuation::initialize_with_stack_backing(
-        reverie_inguest::guest::tool_region::StackBacking::ToolRegion(region),
-    )
 }
 
-// HookContext and RegisterContext have the same layout (checked in
-// tool_host.rs), so the continuation's context is passed on by a cast.
 unsafe fn dispatch_syscall(context: *mut RegisterContext, pkru: &mut Option<u32>) {
-    unsafe { crate::runtime::dispatch_fallback_context(context.cast::<HookContext>(), pkru) };
+    unsafe { crate::runtime::dispatch_fallback_context(context, pkru) };
 }
 
 unsafe fn dispatch_instruction(context: *mut RegisterContext, kind: InstructionEventKind) {
-    unsafe { crate::runtime::dispatch_fallback_instruction(context.cast::<HookContext>(), kind) };
+    unsafe { reverie_inguest::guest::installed_tool::dispatch_saved_instruction(context, kind) };
 }
 
 /// Diagnostic observations for the current thread's owned continuation.

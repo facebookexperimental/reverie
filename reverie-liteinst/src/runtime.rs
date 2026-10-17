@@ -121,11 +121,9 @@ pub(crate) use reverie_inguest::guest::instruction::cpuid_interception_enabled;
 use reverie_inguest::guest::instruction::decode_instruction;
 use reverie_inguest::guest::instruction::deliver_default_sigsegv;
 use reverie_inguest::guest::instruction::enable_instruction_faulting;
-use reverie_inguest::guest::instruction::execute_native_instruction;
 use reverie_inguest::guest::instruction::install_instruction_signal_handler;
 pub(crate) use reverie_inguest::guest::instruction::preflight_instruction_faulting;
 use reverie_inguest::guest::instruction::set_all_instruction_native;
-use reverie_inguest::guest::instruction::set_instruction_native;
 use reverie_inguest::guest::protect::close_range_preserving_fds;
 use reverie_inguest::guest::protect::fd_arg;
 use reverie_inguest::guest::protect::protect_runtime_control;
@@ -141,7 +139,6 @@ pub(crate) use reverie_inguest::guest::signal::reserved_signal_mask;
 pub(crate) use reverie_inguest::guest::signal::signal_action_supported;
 use reverie_inguest::guest::support::IN_GUEST_STAGE_WRITE_FAILURE_STATUS;
 pub(crate) use reverie_inguest::guest::support::StackLine;
-pub(crate) use reverie_inguest::guest::support::ToolCallbackGuard;
 pub(crate) use reverie_inguest::guest::support::emit_in_guest_stage;
 pub(crate) use reverie_inguest::guest::support::exit_now;
 pub(crate) use reverie_inguest::guest::support::read_own_bytes;
@@ -151,7 +148,6 @@ use reverie_inguest::guest::trap_dispatch::InGuestDispatcher;
 use reverie_inguest::guest::trap_dispatch::SitePatch;
 use reverie_inguest::guest::trap_dispatch::TrapPath;
 use reverie_inguest::guest::trap_dispatch::TrapSeam;
-use reverie_inguest::guest::trap_dispatch::forward_nested_tool_syscall;
 
 struct RuntimeArena {
     mapping_start: u64,
@@ -2634,54 +2630,11 @@ unsafe fn installed_instruction_hook(context: *mut HookContext, kind: Instructio
     {
         record_hook_entry(site);
     }
-    unsafe { dispatch_instruction_context(context, kind) };
-}
-
-/// Run the Tool's callback for a CPUID/RDTSC/RDTSCP whose fault had no
-/// patchable site, from the owned fallback continuation in ordinary context.
-/// It is the installed hook's dispatch without a site hook entry to count;
-/// the continuation advances RIP past the instruction on completion.
-pub(crate) unsafe fn dispatch_fallback_instruction(
-    context: *mut HookContext,
-    kind: InstructionEventKind,
-) {
-    unsafe { dispatch_instruction_context(context, kind) };
-}
-
-unsafe fn dispatch_instruction_context(context: *mut HookContext, kind: InstructionEventKind) {
-    if context.is_null() || enter_rcb_handler().is_err() {
-        unsafe { exit_now(122) };
-    }
-    let context = unsafe { &mut *context };
-    if unsafe { set_instruction_native(kind, true) }.is_err() {
-        unsafe { exit_now(122) };
-    }
-    // A previously patched instruction still jumps here while native faulting
-    // is enabled. Re-entering the Tool would deadlock on its already-held lock,
-    // so execute the instruction at a private, never-patched site instead.
-    if tool_callback_active() {
-        emit_in_guest_stage(match kind {
-            InstructionEventKind::Cpuid => b"nested-instruction-native-cpuid",
-            InstructionEventKind::Rdtsc => b"nested-instruction-native-rdtsc",
-            InstructionEventKind::Rdtscp => b"nested-instruction-native-rdtscp",
-        });
-        // HookContext and RegisterContext have the same layout (checked in
-        // tool_host.rs).
-        unsafe {
-            execute_native_instruction(kind, &mut *ptr::from_mut(context).cast::<RegisterContext>())
-        };
-        if unsafe { set_instruction_native(kind, false) }.is_err() || leave_rcb_handler().is_err() {
-            unsafe { exit_now(122) };
-        }
-        return;
-    }
-    {
-        let _tool_callback = ToolCallbackGuard::enter();
-        crate::tool_host::dispatch_instruction(kind, context);
-    }
-    if unsafe { set_instruction_native(kind, false) }.is_err() || leave_rcb_handler().is_err() {
-        unsafe { exit_now(122) };
-    }
+    // SAFETY: HookContext/RegisterContext layouts are asserted in tool_host;
+    // this is the actual intercepted instruction's unique saved frame.
+    unsafe {
+        reverie_inguest::guest::installed_tool::dispatch_saved_instruction(context.cast(), kind)
+    };
 }
 
 unsafe extern "C" fn installed_cpuid_hook(context: *mut HookContext) {
@@ -2702,7 +2655,11 @@ unsafe fn installed_syscall_hook_for(context: *mut HookContext, number: Option<i
     {
         record_hook_entry(site);
     }
-    unsafe { dispatch_syscall_context(context, number, SyscallDispatch::InstalledHook, None) };
+    // SAFETY: tool_host checks every HookContext/RegisterContext field; the
+    // installed hook owns this genuine saved frame for the synchronous call.
+    unsafe {
+        dispatch_syscall_context(context.cast(), number, SyscallDispatch::InstalledHook, None)
+    };
 }
 
 /// Counts one entry through a patched site's hook. An entry the Tool's own
@@ -2716,97 +2673,42 @@ fn record_hook_entry(site: &SiteSlot) {
     }
 }
 
-pub(crate) unsafe fn dispatch_fallback_context(context: *mut HookContext, pkru: &mut Option<u32>) {
+pub(crate) unsafe fn dispatch_fallback_context(
+    context: *mut RegisterContext,
+    pkru: &mut Option<u32>,
+) {
     unsafe { dispatch_syscall_context(context, None, SyscallDispatch::Fallback, Some(pkru)) };
 }
 
 unsafe fn dispatch_syscall_context(
-    context: *mut HookContext,
+    context: *mut RegisterContext,
     number: Option<i64>,
     dispatch: SyscallDispatch,
     guest_pkru: Option<&mut Option<u32>>,
 ) {
-    if context.is_null() {
-        unsafe {
-            exit_now(122);
-        }
-    }
-    if enter_rcb_handler().is_err() {
-        unsafe { exit_now(122) };
-    }
-    // SAFETY: generated LiteInst code passes a unique mutable saved frame.
-    let context_pointer = context as usize;
-    let context = unsafe { &mut *context };
-    let mut event = SyscallEvent {
-        number: number.unwrap_or(context.rax as i64),
-        args: [
-            context.rdi,
-            context.rsi,
-            context.rdx,
-            context.r10,
-            context.r8,
-            context.r9,
-        ],
-        instruction_pointer: context.instruction_pointer,
-        result: UNSET_RESULT,
-        context: context_pointer,
-        dispatch,
-        // Fallback supplies its owned genuine entry. Installed hooks still
-        // need independent provenance; never borrow a stale signal's rights.
-        guest_pkru: guest_pkru.as_ref().and_then(|value| **value),
-    };
     #[cfg(feature = "allocator-fixture")]
-    if matches!(dispatch, SyscallDispatch::Fallback) {
-        // The RCB handler boundary above has already excluded Tool work.
-        // Observe this real dispatch only; the fixture cannot prepare one.
+    let observe_fallback: Option<fn(&SyscallEvent)> = Some(|event| {
         crate::stack_fixture::record_fallback(
             event.number as usize,
             event.instruction_pointer as usize,
         );
-    }
-    // A site patched for another syscall (glibc's `syscall()` wrapper) can
-    // carry the guest's own `rt_sigreturn` here without a trap; refuse it as
-    // the SIGSYS handler does a trapped one.
-    if reverie_inguest::trap::is_rt_sigreturn(event.number)
-        && reverie_inguest::trap::signal_return_restricted()
-    {
-        unsafe { reverie_inguest::trap::refuse_guest_signal_return() };
-    }
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-133): Review guarded installed-hook bypass for Tool-internal syscalls.
-    if tool_callback_active() {
-        // SAFETY: a genuine hook entry made while a Tool callback is active on
-        // this thread: the callback's own syscall, which may run natively.
-        unsafe { forward_nested_tool_syscall(&mut event, observe_mapping_generation) };
-        context.rax = event.result as u64;
-        context.rcx = context.instruction_pointer.saturating_add(2);
-        context.r11 = context.rflags;
-        if let Some(output) = guest_pkru {
-            *output = event.guest_pkru;
-        }
-        if leave_rcb_handler().is_err() {
-            unsafe { exit_now(122) };
-        }
-        return;
-    }
-    {
-        let _tool_callback = ToolCallbackGuard::enter();
-        // SAFETY: this unique local event remains live until the synchronous
-        // trampoline returns; the trampoline does not retain its pointer.
-        unsafe { tool_trampoline((&raw mut event).cast::<core::ffi::c_void>()) };
-    }
-    if event.result == UNSET_RESULT {
-        event.result = -i64::from(libc::ENOSYS);
-    }
-    context.rax = event.result as u64;
-    context.rcx = context.instruction_pointer.saturating_add(2);
-    context.r11 = context.rflags;
-    if let Some(output) = guest_pkru {
-        *output = event.guest_pkru;
-    }
-    if leave_rcb_handler().is_err() {
-        unsafe { exit_now(122) };
-    }
+    });
+    #[cfg(not(feature = "allocator-fixture"))]
+    let observe_fallback = None;
+    // SAFETY: both callers retain the genuine installed/continued entry and
+    // unique frame. Keep the current mode/protection/normal mapping callback;
+    // the shared bridge invokes it within the original guard/RCB extent.
+    unsafe {
+        reverie_inguest::guest::installed_tool::dispatch_saved_syscall(
+            context,
+            number,
+            dispatch,
+            guest_pkru,
+            tool_trampoline,
+            observe_mapping_generation,
+            observe_fallback,
+        )
+    };
 }
 
 unsafe extern "C" fn installed_syscall_hook(context: *mut HookContext) {
