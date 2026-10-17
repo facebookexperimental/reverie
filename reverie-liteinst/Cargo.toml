@@ -21,6 +21,8 @@ default = []
 preload-constructor = []
 # Exposes a fixed test ABI in the actual runtime without changing its allocator.
 allocator-fixture = ["reverie-inguest/allocator-fixture"]
+# Installed RPC mechanism regressions, absent from ordinary binary builds.
+rpc-io-fixture = ["reverie-inguest/rpc-io-fixture"]
 # Native-exec prerequisite. Only the FullTool installation route is admitted;
 # successor exec itself remains refused until its bootstrap is implemented.
 fixed-syscall-gates = ["reverie-inguest/fixed-syscall-gates"]

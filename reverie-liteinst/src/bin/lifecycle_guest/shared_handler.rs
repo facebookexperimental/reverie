@@ -6,6 +6,10 @@ use serde::ser::SerializeStruct;
 
 use super::*;
 
+#[cfg(feature = "rpc-io-fixture")]
+#[path = "shared_handler/rpc_io.rs"]
+mod rpc_io;
+
 static REENTRY_CHECKS: AtomicU64 = AtomicU64::new(0);
 static TOOL_ADDRESS: AtomicUsize = AtomicUsize::new(0);
 
@@ -73,6 +77,12 @@ impl Tool for SharedTool {
     type ThreadState = u64;
 
     fn subscriptions(_config: &()) -> Subscription {
+        #[cfg(feature = "rpc-io-fixture")]
+        if rpc_io::subscribe_socket_controls() {
+            return [Sysno::getpid, Sysno::sendto, Sysno::recvfrom]
+                .into_iter()
+                .collect();
+        }
         [Sysno::getpid].into_iter().collect()
     }
 
@@ -81,6 +91,8 @@ impl Tool for SharedTool {
         guest: &mut G,
         syscall: Syscall,
     ) -> Result<i64, Error> {
+        #[cfg(feature = "rpc-io-fixture")]
+        rpc_io::refuse_unexpected_socket_callback(syscall.number());
         assert_eq!(syscall.number(), Sysno::getpid);
         let address = core::ptr::from_ref(self) as usize;
         let _ = TOOL_ADDRESS.compare_exchange(0, address, Ordering::Relaxed, Ordering::Relaxed);
@@ -89,6 +101,9 @@ impl Tool for SharedTool {
         *guest.thread_state_mut() += 1;
         assert_eq!(*guest.thread_state(), count);
         assert!(count <= 2, "unexpected extra callback");
+
+        #[cfg(feature = "rpc-io-fixture")]
+        rpc_io::check_actual_callback(count);
 
         let source = guest.tid().as_raw();
         let legacy = reverie_liteinst::blocking_global_rpc::<SharedGlobal>(SharedRequest {
@@ -144,6 +159,8 @@ pub(super) fn run(duplicate: bool) {
         "shared handler: callbacks=2 owner=stable LI=2 shared=2 wrong-global=4 reentry=2 outer=1"
     );
     std::io::stdout().flush().unwrap();
+    #[cfg(feature = "rpc-io-fixture")]
+    rpc_io::after_actual_callbacks();
     if duplicate {
         // First-owner observations are complete before the terminal attempt.
         // The inherited-filter guard may refuse before registry publication;
@@ -151,4 +168,9 @@ pub(super) fn run(duplicate: bool) {
         unsafe { reverie_liteinst::install_tool_quiescent::<SharedTool>(&coordinator) }.unwrap();
         panic!("whole duplicate installation returned");
     }
+}
+
+#[cfg(feature = "rpc-io-fixture")]
+pub(super) fn run_rpc_io(mode: &str) {
+    rpc_io::run(mode);
 }

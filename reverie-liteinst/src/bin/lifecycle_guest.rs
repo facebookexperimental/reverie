@@ -2823,6 +2823,19 @@ fn main() {
         shared_handler::run(mode == "shared-handler-duplicate");
         return;
     }
+    #[cfg(feature = "rpc-io-fixture")]
+    if let Some(mode) = mode.to_str()
+        && matches!(
+            mode,
+            "shared-handler-rpc-io"
+                | "shared-handler-outside-shared"
+                | "shared-handler-outside-liteinst"
+        )
+    {
+        assert!(arguments.next().is_none(), "unexpected RPC I/O argument");
+        shared_handler::run_rpc_io(mode);
+        return;
+    }
     #[cfg(feature = "allocator-fixture")]
     if mode == "mapping-routes" {
         let route = arguments.next().expect("missing mapping route");

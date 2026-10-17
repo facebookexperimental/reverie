@@ -176,7 +176,50 @@ tokio::task_local! {
     static CONNECTION_ADMISSION: Arc<dyn ConnectionAdmission>;
 }
 
+#[cfg(feature = "rpc-io-fixture")]
+struct RpcLaunchIssueCaptureForTest {
+    connections: ConnectionMonitor,
+    issues: reverie_rpc_transport::RpcIssueMonitor,
+}
+
+#[cfg(feature = "rpc-io-fixture")]
+tokio::task_local! {
+    static RPC_ISSUES_FOR_TEST: Arc<std::sync::Mutex<Vec<RpcLaunchIssueCaptureForTest>>>;
+}
+
+/// Immutable observations from an actual ordinary launcher's Tool RPC server.
+#[doc(hidden)]
+#[cfg(feature = "rpc-io-fixture")]
+#[derive(Debug)]
+pub struct RpcLaunchObservationForTest {
+    pub active_connections: usize,
+    pub issues: Vec<reverie_rpc_transport::ConnectionIssue>,
+}
+
 impl PreloadBackend {
+    /// Observe actual Tool servers after `future` returns, without exposing
+    /// cancellation or planned-shutdown controls. Tests must require a completed
+    /// successful launcher result as well as zero active connections and issues;
+    /// a cancelled or timed-out future cannot establish a clean joined drain.
+    #[doc(hidden)]
+    #[cfg(feature = "rpc-io-fixture")]
+    pub async fn with_rpc_issues_for_test<F: Future>(
+        future: F,
+    ) -> (F::Output, Vec<RpcLaunchObservationForTest>) {
+        let captures = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let result = RPC_ISSUES_FOR_TEST.scope(captures.clone(), future).await;
+        let observations = captures
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|capture| RpcLaunchObservationForTest {
+                active_connections: capture.connections.active_connections(),
+                issues: capture.issues.snapshot(),
+            })
+            .collect();
+        (result, observations)
+    }
+
     /// Runs `future` so that every LiteInst run it starts admits each guest
     /// connection to its coordinator through `admission` before serving it:
     /// the admission receives the connecting process's pidfd before the
@@ -969,6 +1012,14 @@ where
         admission.attach_exit_reporter(Arc::new(GlobalExitReporter(Arc::downgrade(&global))));
         server.set_connection_admission(admission);
     }
+    #[cfg(feature = "rpc-io-fixture")]
+    let _ = RPC_ISSUES_FOR_TEST.try_with(|captures| {
+        let issues = server.retain_connection_issues();
+        captures.lock().unwrap().push(RpcLaunchIssueCaptureForTest {
+            connections: server.connection_monitor(),
+            issues,
+        });
+    });
     let mut connection_monitors = vec![server.connection_monitor()];
     let (stats_global, stats_server, stats_socket) = if stats_request.is_enabled() {
         let socket = directory.path().join("stats.sock");

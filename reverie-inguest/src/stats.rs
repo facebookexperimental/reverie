@@ -449,6 +449,20 @@ pub unsafe fn restore_native_exec_stats(values: &[u64; 11]) {
     }
 }
 
+/// Read one actual dispatcher counter without allocation, reset, or a syscall.
+///
+/// The fixture must enable statistics before taking a measurement. Missing
+/// collection and paths not owned by the shared dispatcher are test errors.
+#[doc(hidden)]
+#[cfg(feature = "rpc-io-fixture")]
+pub fn rpc_io_counter_test(path: LiteinstDispatchPath) -> u64 {
+    GUEST_STATS
+        .get()
+        .expect("RPC I/O fixture requires initialized statistics")
+        .counter(path)
+        .load(Ordering::Relaxed)
+}
+
 /// Immutable observation of the actual shared collector for cross-crate tests.
 #[doc(hidden)]
 #[cfg(feature = "native-exec-state-fixture")]

@@ -21,6 +21,10 @@ use reverie_liteinst::LiteinstDispatchPath;
 use reverie_liteinst::SITE_PATCHING_ENV;
 use reverie_liteinst::TOOL_PRELOAD_ENV;
 
+#[cfg(feature = "rpc-io-fixture")]
+#[path = "lifecycle/rpc_io.rs"]
+mod rpc_io;
+
 // These controls use the fully installed lifecycle executable, never a
 // pre-activation fabricated dispatch or a parallel registry.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]

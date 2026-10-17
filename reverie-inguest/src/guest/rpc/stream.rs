@@ -16,6 +16,9 @@ use std::path::Path;
 use crate::guest::exec_private::NativeControl;
 #[cfg(feature = "exec-private-init")]
 use crate::guest::exec_private::NativeGateIoBinding;
+use crate::guest::support::raw_result;
+use crate::guest::support::tool_callback_active;
+use crate::trap::raw_syscall6;
 
 /// One socket retained by the shared client; this adds no wire/admission owner.
 pub enum GuestRpcStream {
@@ -124,6 +127,26 @@ impl AsRawFd for GuestRpcStream {
 impl Read for GuestRpcStream {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         match self {
+            Self::Ordinary(stream) if tool_callback_active() => {
+                // SAFETY: this is the runtime-owned socket and a live borrowed
+                // buffer during a real Tool callback. Use its private gate so
+                // the runtime's own I/O does not recursively raise SIGSYS.
+                // Preserve one kernel attempt even for an empty buffer.
+                let result = unsafe {
+                    raw_syscall6(
+                        libc::SYS_recvfrom,
+                        [
+                            stream.as_raw_fd() as u64,
+                            buffer.as_mut_ptr() as u64,
+                            buffer.len() as u64,
+                            0,
+                            0,
+                            0,
+                        ],
+                    )
+                };
+                raw_result(result).map(|count| count as usize)
+            }
             Self::Ordinary(stream) => stream.read(buffer),
             #[cfg(feature = "exec-private-init")]
             Self::Native(stream) => stream.read(buffer),
@@ -134,6 +157,27 @@ impl Read for GuestRpcStream {
 impl Write for GuestRpcStream {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         match self {
+            Self::Ordinary(stream) if tool_callback_active() => {
+                // SAFETY: the owned socket and borrowed bytes stay live for
+                // this synchronous Tool call. Match UnixStream's MSG_NOSIGNAL
+                // and short/error results; the shared framing owns retries.
+                let result = unsafe {
+                    raw_syscall6(
+                        libc::SYS_sendto,
+                        [
+                            stream.as_raw_fd() as u64,
+                            buffer.as_ptr() as u64,
+                            buffer.len() as u64,
+                            libc::MSG_NOSIGNAL as u64,
+                            0,
+                            0,
+                        ],
+                    )
+                };
+                raw_result(result).map(|count| count as usize)
+            }
+            // Outside a callback, libc must still reach guest interception:
+            // a guest cannot use the installed accessor's protected socket.
             Self::Ordinary(stream) => stream.write(buffer),
             #[cfg(feature = "exec-private-init")]
             Self::Native(stream) => stream.write(buffer),
@@ -259,5 +303,139 @@ mod tests {
         drop(peer);
         assert_eq!(stream.read(&mut second).unwrap(), 0);
         assert_eq!(stream.read(&mut []).unwrap(), 0);
+    }
+
+    /// This guard exercises return/error semantics only. The installed
+    /// lifecycle fixture separately proves actual callback provenance and
+    /// the presence or absence of SIGSYS with the real filter installed.
+    fn callback_io<T>(operation: impl FnOnce() -> T) -> T {
+        let _callback = crate::guest::support::ToolCallbackGuard::enter();
+        operation()
+    }
+
+    #[test]
+    fn callback_socket_keeps_short_io_empty_calls_and_kernel_errors() {
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let fd = socket.as_raw_fd();
+        let mut adapter = GuestRpcStream::from(socket);
+        assert_eq!(adapter.as_raw_fd(), fd);
+
+        // recvfrom with length zero still reaches the kernel: without input,
+        // Linux reports EAGAIN on a nonblocking stream instead of success.
+        let empty = callback_io(|| adapter.read(&mut []));
+        assert_eq!(empty.unwrap_err().raw_os_error(), Some(libc::EAGAIN));
+        assert_eq!(callback_io(|| adapter.write(&[])).unwrap(), 0);
+        peer.write_all(b"abc").unwrap();
+        let mut bytes = [0; 8];
+        assert_eq!(callback_io(|| adapter.read(&mut [])).unwrap(), 0);
+        assert_eq!(callback_io(|| adapter.read(&mut bytes[..2])).unwrap(), 2);
+        assert_eq!(&bytes[..2], b"ab");
+        assert_eq!(callback_io(|| adapter.read(&mut bytes)).unwrap(), 1);
+        assert_eq!(bytes[0], b'c');
+        assert_eq!(
+            callback_io(|| adapter.read(&mut bytes))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EAGAIN),
+        );
+        assert_eq!(callback_io(|| adapter.write(b"reply")).unwrap(), 5);
+        let mut reply = [0; 5];
+        peer.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"reply");
+        callback_io(|| adapter.flush()).unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+        assert_eq!(callback_io(|| adapter.read(&mut bytes)).unwrap(), 0);
+        drop(peer);
+        assert_eq!(
+            callback_io(|| adapter.write(&[]))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EPIPE),
+        );
+        assert_eq!(
+            callback_io(|| adapter.write(b"x"))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EPIPE),
+        );
+        assert_eq!(adapter.as_raw_fd(), fd);
+    }
+
+    #[test]
+    fn callback_socket_returns_short_writes_without_retrying() {
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let buffer_size: libc::c_int = 4096;
+        // SAFETY: live socket, valid value and its exact length.
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    (&raw const buffer_size).cast(),
+                    core::mem::size_of_val(&buffer_size) as _,
+                )
+            },
+            0
+        );
+        let mut adapter = GuestRpcStream::from(socket);
+        let payload = [42; 65536];
+        let written = callback_io(|| adapter.write(&payload)).unwrap();
+        assert!(written > 0 && written < payload.len(), "{written}");
+        assert_eq!(
+            callback_io(|| adapter.write(&payload))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EAGAIN),
+        );
+        let mut received = vec![0; written];
+        peer.read_exact(&mut received).unwrap();
+        assert_eq!(&received, &payload[..written]);
+    }
+
+    #[test]
+    fn callback_socket_does_not_raise_sigpipe() {
+        const CHILD: &str = "REVERIE_RPC_SOCKET_SIGPIPE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            // This is an isolated child, not the multi-threaded test runner.
+            // SAFETY: setting SIG_DFL does not install a Rust signal handler.
+            assert_ne!(
+                unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) },
+                libc::SIG_ERR
+            );
+            let (socket, peer) = UnixStream::pair().unwrap();
+            let mut adapter = GuestRpcStream::from(socket);
+            drop(peer);
+            assert_eq!(
+                callback_io(|| adapter.write(b"x"))
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EPIPE),
+            );
+            return;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "guest::rpc::stream::tests::callback_socket_does_not_raise_sigpipe",
+            ])
+            .env(CHILD, "1")
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success(), "{status}");
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                let status = child.wait().unwrap();
+                panic!("SIGPIPE control exceeded its bound: {status}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }
