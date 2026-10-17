@@ -665,3 +665,100 @@ fn a_thread_start_callback_is_refused() {
         assert_eq!(start[2], start[0], "nothing changed");
     }
 }
+
+/// What both exec tools do in `handle_post_exec`: ask for the full mask,
+/// with the replacement image's SigBlk before and after.
+async fn post_exec_request<T: Tool<GlobalState = Log>, G: Guest<T>>(guest: &mut G) {
+    let tid = guest.tid();
+    guest.send_rpc(proc_masks(tid)).await;
+    let answer = guest.set_blocked_signals(!0).await;
+    guest.send_rpc(Seen::Set(answer)).await;
+    guest.send_rpc(proc_masks(tid)).await;
+}
+
+/// Injects the guest's `execve` from its syscall callback. A successful exec
+/// never returns there, and the replacement image gets `handle_post_exec`.
+#[derive(Clone, Copy, Debug, Default)]
+struct InjectedExecTool;
+
+#[reverie::tool]
+impl Tool for InjectedExecTool {
+    type GlobalState = Log;
+    type ThreadState = ();
+
+    fn subscriptions(_config: &()) -> Subscription {
+        let mut subscription = Subscription::none();
+        subscription.syscall(Sysno::execve);
+        subscription
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        Ok(guest.inject(syscall).await?)
+    }
+
+    async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
+        post_exec_request::<Self, G>(guest).await;
+        Ok(())
+    }
+}
+
+/// The control: the `execve` is passed on with the default tail injection.
+#[derive(Clone, Copy, Debug, Default)]
+struct TailExecTool;
+
+#[reverie::tool]
+impl Tool for TailExecTool {
+    type GlobalState = Log;
+    type ThreadState = ();
+
+    fn subscriptions(_config: &()) -> Subscription {
+        let mut subscription = Subscription::none();
+        subscription.syscall(Sysno::execve);
+        subscription
+    }
+
+    async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
+        post_exec_request::<Self, G>(guest).await;
+        Ok(())
+    }
+}
+
+fn exec_true() {
+    // SAFETY: execl with NUL-terminated strings and a NULL terminator.
+    unsafe {
+        libc::execl(
+            c"/bin/true".as_ptr(),
+            c"true".as_ptr(),
+            std::ptr::null::<libc::c_char>(),
+        );
+    }
+    panic!("exec failed: {}", std::io::Error::last_os_error());
+}
+
+fn assert_post_exec_refused(seen: &[Seen]) {
+    assert_eq!(seen.len(), 3, "one post-exec request: {seen:?}");
+    assert_eq!(seen[1], Seen::Set(Err(MaskChangeRefused::Unsupported)));
+    assert_eq!(seen[2], seen[0], "nothing changed");
+}
+
+/// A syscall callback that injected a successful exec never resumes, so the
+/// replacement image's post-exec callback is outside it, and the call is
+/// refused there with nothing changed (Codex review of
+/// https://github.com/rrnewton/reverie/pull/1083, P2).
+#[test]
+fn an_injected_exec_refuses_in_post_exec() {
+    assert_post_exec_refused(&run_guest_under::<InjectedExecTool>(
+        "injected exec",
+        exec_true,
+    ));
+}
+
+/// The control: after a tail-injected exec, the post-exec callback is refused.
+#[test]
+fn a_tail_injected_exec_refuses_in_post_exec() {
+    assert_post_exec_refused(&run_guest_under::<TailExecTool>("tail exec", exec_true));
+}

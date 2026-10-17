@@ -54,8 +54,9 @@ pub struct DetlogMemoryRegion {
     pub end: u64,
 }
 
-/// Why [`Guest::set_blocked_signals`] changed nothing, or could not confirm
-/// the change it made.
+/// Why [`Guest::set_blocked_signals`] did not set the mask. `Unsupported` and
+/// `RestorePending` are refusals made before anything changed; `Gone` and
+/// `Failed` can follow a write.
 #[derive(
     Debug,
     Clone,
@@ -83,13 +84,14 @@ pub enum MaskChangeRefused {
     /// The thread is gone. Nothing will resume it.
     #[error("the thread is gone")]
     Gone,
-    /// The change failed with `errno`. When `mask_unknown` is false, the
-    /// mask is the one before the call; otherwise putting it back failed too,
-    /// and the thread's mask is unknown.
+    /// The change failed with `errno`, possibly after the new mask was
+    /// written. The backend then tried to put the old mask back: when
+    /// `mask_unknown` is false, the thread's mask is the one before the call;
+    /// when it is true, the mask could not be confirmed, and the caller must
+    /// not resume the guest as if it were known.
     #[error("setting the blocked-signal mask failed ({errno}); mask unknown: {mask_unknown}")]
     Failed {
-        /// The error that stopped the change, or the one that stopped putting
-        /// the old mask back.
+        /// The error that stopped the change.
         errno: Errno,
         /// Whether the thread's mask may be neither the old nor the new one.
         mask_unknown: bool,
@@ -620,12 +622,15 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     /// new mask are those of the replaced one. Putting the returned mask back
     /// therefore restores exactly the mask that was there.
     ///
-    /// Every refusal happens before anything is changed. A backend refuses
+    /// Both refusals happen before anything is changed. A backend refuses
     /// ([`MaskChangeRefused::Unsupported`]) outside the stops where it can
     /// make the change atomically, and when the thread runs under a
     /// mask-swapping syscall's temporary mask whose restore is still pending
     /// ([`MaskChangeRefused::RestorePending`]): changing the mask then would
     /// discard that restore. The default refuses always and changes nothing.
+    /// A failure after the write is reported as [`MaskChangeRefused::Failed`],
+    /// which says whether the old mask could be put back, or as
+    /// [`MaskChangeRefused::Gone`].
     async fn set_blocked_signals(&mut self, _mask: u64) -> Result<u64, MaskChangeRefused> {
         Err(MaskChangeRefused::Unsupported)
     }

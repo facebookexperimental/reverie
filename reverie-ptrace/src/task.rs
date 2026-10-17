@@ -5420,6 +5420,11 @@ impl<L: Tool + 'static> TracedTask<L> {
         // callbacks' injections: a held callback's injections keep the
         // guest's return register.
         self.in_signal_callback = false;
+        // Likewise a syscall callback that injected the exec never resumes:
+        // the post-exec callbacks run for the replacement image, outside it,
+        // so `Guest::set_blocked_signals` refuses there (Codex review of
+        // https://github.com/rrnewton/reverie/pull/1083, P2).
+        self.in_syscall_callback = false;
         self.reported_signal = None;
         self.replacement_signal_info = None;
         self.in_held_signal_callback = false;
@@ -9251,8 +9256,8 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
         }
     }
 
-    /// `PTRACE_SETSIGMASK` on the stopped thread. Every refusal comes before
-    /// the write: outside a syscall callback, in a frame-mode event or a
+    /// `PTRACE_SETSIGMASK` on the stopped thread. Both refusals come before
+    /// the write (`Unsupported`, `RestorePending`): outside a syscall callback, in a frame-mode event or a
     /// signal callback, or on a tracer thread a seccomp filter may restrict
     /// (`may_set_blocked_signals`); and when `PTRACE_GETSIGMASK` differs from
     /// procfs `SigBlk`, which means a mask-swapping syscall's temporary mask
@@ -9261,8 +9266,9 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
     /// admits would no longer be delivered under it. When the two agree, a
     /// pending restore would put back the mask already in effect, so
     /// discarding it changes nothing the guest can see. The written mask is
-    /// read back; if it is not the one written, the old one is written again
-    /// and the call fails, saying whether that succeeded.
+    /// read back; if it is not the one written, or cannot be read, the old
+    /// one is written again and the call fails (`Failed`), saying whether the
+    /// mask is the old one again.
     async fn set_blocked_signals(&mut self, mask: u64) -> Result<u64, reverie::MaskChangeRefused> {
         if !may_set_blocked_signals(
             self.in_syscall_callback,
@@ -9291,25 +9297,26 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
         let new = mask_keeping_never_shielded(mask, old);
         task.setsigmask(new)
             .map_err(|error| mask_change_failure(error, false))?;
-        let written = task
-            .getsigmask()
-            .map_err(|error| mask_change_failure(error, true))?;
-        if written == new {
-            return Ok(old);
-        }
-        // The kernel stored another mask than the one written. Put the old one
-        // back and say whether that took.
+        // From here on the write may have taken effect, so a failure puts
+        // the old mask back and says whether that took.
+        let errno = match task.getsigmask() {
+            Ok(written) if written == new => return Ok(old),
+            // The kernel stored another mask than the one written.
+            Ok(_) => Errno::EIO,
+            Err(TraceError::Died(_)) => return Err(reverie::MaskChangeRefused::Gone),
+            Err(TraceError::Errno(errno)) => errno,
+        };
         let restored = task.setsigmask(old).and_then(|()| task.getsigmask());
         Err(match restored {
-            Ok(mask) if mask == old => reverie::MaskChangeRefused::Failed {
-                errno: Errno::EIO,
-                mask_unknown: false,
+            Ok(mask) => reverie::MaskChangeRefused::Failed {
+                errno,
+                mask_unknown: mask != old,
             },
-            Ok(_) => reverie::MaskChangeRefused::Failed {
-                errno: Errno::EIO,
+            Err(TraceError::Died(_)) => reverie::MaskChangeRefused::Gone,
+            Err(TraceError::Errno(_)) => reverie::MaskChangeRefused::Failed {
+                errno,
                 mask_unknown: true,
             },
-            Err(error) => mask_change_failure(error, true),
         })
     }
 
