@@ -477,7 +477,15 @@ fn run_model(mode: usize, original_execve: bool, installed: bool, source: Syscal
     );
     if !installed {
         assert_eq!(errno, Errno::EOPNOTSUPP);
-        assert_eq!(refusal, None);
+        assert_eq!(
+            refusal,
+            Some(reverie::UnsupportedRefusal::new(
+                reverie::UnsupportedOperation::Exec,
+                Errno::EOPNOTSUPP,
+                "the in-guest backend cannot replace the process image: execve and execveat \
+                 are not forwarded",
+            ))
+        );
         assert!(
             unsafe {
                 host.install_native_exec_driver(Arc::new(ModelDriver {
@@ -573,7 +581,7 @@ fn mock_driver_exact_original_and_detcore_normalization_borrow_real_state_before
     isolated(|| run_model(1, false, true, SyscallDispatch::Trap), 0);
 }
 #[test]
-fn mock_driver_default_absent_keeps_the_existing_untagged_exec_refusal() {
+fn mock_driver_default_absent_reports_the_named_exec_refusal() {
     isolated(|| run_model(0, false, false, SyscallDispatch::Fallback), 0);
 }
 #[test]

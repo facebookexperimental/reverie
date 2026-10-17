@@ -1077,7 +1077,7 @@ mod tests {
                 assert!(unsafe {
                     super::super::protect::protect_runtime_descriptors(&mut ev, true)
                 });
-                assert_eq!(ev.result, 0);
+                assert_eq!(ev.result, -i64::from(libc::EBADF));
                 assert_eq!(FdIdentity::read(fd).unwrap(), original);
             }
             let (extra, _peer) = UnixStream::pair().unwrap();
@@ -1136,11 +1136,13 @@ mod tests {
                     FdIdentity::read(fd).unwrap().descriptor_flags,
                     libc::FD_CLOEXEC
                 );
+                let original = FdIdentity::read(fd).unwrap();
                 let mut ev = event(libc::SYS_close, fd as u64);
                 assert!(unsafe {
                     super::super::protect::protect_runtime_descriptors(&mut ev, true)
                 });
-                assert_eq!(ev.result, 0);
+                assert_eq!(ev.result, -i64::from(libc::EBADF));
+                assert_eq!(FdIdentity::read(fd).unwrap(), original);
             }
             unsafe { lease.install(fds) }.unwrap();
             lease.revalidate().unwrap();
