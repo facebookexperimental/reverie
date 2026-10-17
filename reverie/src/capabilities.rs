@@ -215,6 +215,17 @@ pub struct BackendCapabilities {
     /// Linux. A tool must then not make two injected calls that need a
     /// descriptor number to stay unchanged between them.
     pub runs_guest_code_between_injections: bool,
+
+    /// The tool runs inside each guest process, and before every native fork,
+    /// process-copying clone or exec the backend's runtime performs for a
+    /// guest, it promotes the open-file descriptions whose model must stay one
+    /// copy to the tool's shared global state, and carries the promoted ones
+    /// across exec as survivors. A tool may then keep such a description's
+    /// model (a timerfd's virtual-time expirations, say) inside the guest:
+    /// every process that shares the description reaches the same copy. A
+    /// backend whose tool runs outside the guest shares one copy without
+    /// promoting, and reports false.
+    pub promotes_open_files_before_native_lifecycle: bool,
 }
 
 impl BackendCapabilities {
@@ -245,6 +256,7 @@ impl BackendCapabilities {
         supports_blocked_wait_signal_interruption: true,
         delivers_preemption_timer_events: true,
         runs_guest_code_between_injections: false,
+        promotes_open_files_before_native_lifecycle: false,
     };
 
     /// `reverie-e9patch`: the guest is rewritten ahead of time and then run
@@ -300,6 +312,7 @@ impl BackendCapabilities {
         reports_child_exit_publication: false,
         supports_blocked_wait_signal_interruption: false,
         delivers_preemption_timer_events: false,
+        promotes_open_files_before_native_lifecycle: true,
         ..Self::PTRACE
     };
 
@@ -357,6 +370,7 @@ mod tests {
             "supports_blocked_wait_signal_interruption": true,
             "delivers_preemption_timer_events": true,
             "runs_guest_code_between_injections": false,
+            "promotes_open_files_before_native_lifecycle": false,
         })
     }
 
@@ -441,6 +455,7 @@ mod tests {
                 "reports_child_exit_publication": false,
                 "supports_blocked_wait_signal_interruption": false,
                 "delivers_preemption_timer_events": false,
+                "promotes_open_files_before_native_lifecycle": true,
             }))
         );
     }
