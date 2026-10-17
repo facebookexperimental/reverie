@@ -31,6 +31,21 @@
 
 #define TRAMPOLINE_MAX_DISTANCE (1536 << 20)
 
+static bool short_syscall_sites_raw;
+
+void sbr_rewriter_option_from_launch(const char *value) {
+  if (strcmp(value, "raw") == 0)
+    short_syscall_sites_raw = true;
+  else if (strcmp(value, "marker") == 0)
+    short_syscall_sites_raw = false;
+  else
+    _nx_fatal_printf("refused: invalid %s value \"%s\" (expected \"marker\" "
+                     "or \"raw\")\n",
+                     SBR_SHORT_SYSCALL_SITES_ENV, value);
+}
+
+bool sbr_rewriter_short_sites_raw(void) { return short_syscall_sites_raw; }
+
 #ifdef __NX_INTERCEPT_RDTSC
 static bool rdtscp_prefixes_supported(const char *start, const char *mod_rm) {
   if (mod_rm < start + 2 || (unsigned char)mod_rm[-2] != 0x0F ||
@@ -290,7 +305,10 @@ static void patch_syscalls_in_func(struct library *lib, char *start, char *end,
           // replaces the final 0F 05 and the prefixes become NOPs, so the
           // guest resumes exactly after the instruction. The site the handler
           // recognizes is the marker's own address; the patch's shape is the
-          // original instruction's.
+          // original instruction's. Under the "raw" launch setting the site
+          // is left as it is instead.
+          if (code[i].insn == 0x0F05 && short_syscall_sites_raw)
+            goto replaced;
           char *marker = code[i].addr;
           if (code[i].insn == 0x0F05 && code[i].len > 2) {
             memset(code[i].addr, 0x90, code[i].len - 2);

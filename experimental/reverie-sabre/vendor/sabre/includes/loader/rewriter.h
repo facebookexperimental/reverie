@@ -61,4 +61,19 @@ struct intercept_tls_context;
 void memorymaps_patch_intercept(int index,
                                 const struct intercept_tls_context *tls);
 
+/* The launch setting that decides what the rewriter does with a SYSCALL at a
+ * site too short for a jump rewrite: "marker" (the default) writes the UD0
+ * marker the loader's SIGILL handler dispatches; "raw" leaves the instruction
+ * as it is, for a runtime that traps unrewritten syscalls itself. The loader
+ * consumes it; the plugin does not see it. */
+#define SBR_SHORT_SYSCALL_SITES_ENV "REVERIE_SABRE_SHORT_SYSCALL_SITES"
+/* Loader-internal (hidden): the loader links with -rdynamic, and a new
+ * dynamic symbol would grow its first segment, moving the mappings a guest
+ * sees in /proc/self/maps. */
+attribute_hidden void sbr_rewriter_option_from_launch(const char *value);
+/* Whether the launch chose "raw". A raw short site is monitored only by a
+ * plugin whose own trap path takes every syscall the rewriter left as it is,
+ * so the loader refuses "raw" unless the plugin reports post-arm routing. */
+attribute_hidden bool sbr_rewriter_short_sites_raw(void);
+
 #endif /* LIBRARY_H_ */

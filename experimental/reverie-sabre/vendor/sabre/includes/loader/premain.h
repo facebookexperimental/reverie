@@ -8,6 +8,7 @@
 #ifndef PREMAIN_H
 #define PREMAIN_H
 
+#include "compiler.h"
 #include "plugins/sbr_api_defs.h"
 
 // Copied from:
@@ -26,6 +27,9 @@ struct ld_link_map {
 };
 
 void setup_sbr_premain(sbr_icept_reg_fn);
+/* Whether the plugin at `path` defines reverie_sabre_post_arm_routing_v1
+ * (whatever it will report). */
+attribute_hidden bool sbr_plugin_defines_post_arm_report(const char *path);
 void init_sbr_static_plugin(void);
 
 #endif /* !PREMAIN_H */

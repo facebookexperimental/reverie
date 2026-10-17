@@ -326,7 +326,8 @@ static int parse_shebang(const char *client_path,
  * The settings go to the plugin as its arguments after its path: SaBRe
  * loads the plugin into the client's own libc, so SaBRe's environment would
  * not reach it, and the client's would reach the guest. The loader also
- * reads its own two: the bootstrap option, which it consumes, and the stats
+ * reads its own three: the bootstrap option and the short-site setting
+ * (SBR_SHORT_SYSCALL_SITES_ENV), which it consumes, and the stats
  * descriptor, which it shares with the plugin.
  */
 #define SBR_LAUNCH_MAGIC "SABRE-LAUNCH-V1"
@@ -409,6 +410,12 @@ static bool read_launch_spec(struct launch_spec *spec) {
       errx(EXIT_FAILURE, "launch specification setting is not NAME=VALUE");
     if (strncmp(value, SBR_BOOTSTRAP_ENV "=", sizeof(SBR_BOOTSTRAP_ENV)) == 0) {
       sbr_bootstrap_option_from_launch(value + sizeof(SBR_BOOTSTRAP_ENV));
+      continue;
+    }
+    if (strncmp(value, SBR_SHORT_SYSCALL_SITES_ENV "=",
+                sizeof(SBR_SHORT_SYSCALL_SITES_ENV)) == 0) {
+      sbr_rewriter_option_from_launch(value +
+                                      sizeof(SBR_SHORT_SYSCALL_SITES_ENV));
       continue;
     }
     /* The loader counts patches and dispatches on the same stats page as the
@@ -499,6 +506,16 @@ void load(int argc, char *argv[], void **new_entry, void **new_stack_top) {
       errx(EXIT_FAILURE, "Failed to find plugin file at: %s.", launch.plugin);
     rv = realpath(launch.plugin, abs_plugin_path);
     assert(rv != NULL);
+    /* Refused before the client is even loaded, so none of its code runs.
+     * A plugin that defines the report but returns zero can only be refused
+     * after its sbr_init (premain.c), before the client's constructors and
+     * main; a client with preinit functions is refused before those run. */
+    if (sbr_rewriter_short_sites_raw() &&
+        !sbr_plugin_defines_post_arm_report(abs_plugin_path))
+      errx(EXIT_FAILURE,
+           "refused: %s=raw needs a plugin that reports post-arm routing "
+           "(reverie_sabre_post_arm_routing_v1), and %s does not define it",
+           SBR_SHORT_SYSCALL_SITES_ENV, abs_plugin_path);
     client_path = launch.client;
     setup_sbr_premain(&register_function_intercepts);
     plugin_argc = 1 + launch.setting_count;

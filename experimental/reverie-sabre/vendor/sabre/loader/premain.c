@@ -154,10 +154,14 @@ static sbr_post_arm_routing_fn find_post_arm_routing(const char *path,
   return (void *)(base + symbol.st_value);
 }
 
+bool sbr_plugin_defines_post_arm_report(const char *path) {
+  return find_post_arm_routing(path, 0) != NULL;
+}
+
 // This is currently a huge and unstable hack. We intercept the loader in order
 // to edit the internal representation of its link-map. More specifically we edit
-// the preinit_array loaded from the client's elf file, by prepending our shim
-// in this array. The advantage of function calls made by the .preinit_array is
+// the preinit_array loaded from the client's elf file, by appending our shim
+// to this array. The advantage of function calls made by the .preinit_array is
 // that we can safely use arbitrary function calls to client libraries as GOT
 // and all that jazz is ready.
 // TODO(andronat): Write a tests that check client always gets client argv.
@@ -251,7 +255,17 @@ static void init_sbr_plugin(bool switch_client_tls) {
 #endif
               &post_load, abs_sabre_path, abs_client_path);
 
-  if (post_arm_routing != NULL && post_arm_routing() != 0) {
+  bool post_arm = post_arm_routing != NULL && post_arm_routing() != 0;
+  /* The rewriter has already left this run's short syscall sites as they
+   * are. Only a plugin that arms its own trap path for every unrewritten
+   * syscall sees them; with any other they would run unmonitored. */
+  if (sbr_rewriter_short_sites_raw() && !post_arm)
+    errx(EXIT_FAILURE,
+         "refused: %s=raw needs a plugin that reports post-arm routing "
+         "(reverie_sabre_post_arm_routing_v1); its short syscall sites would "
+         "otherwise run unmonitored",
+         SBR_SHORT_SYSCALL_SITES_ENV);
+  if (post_arm) {
     /* A static client's loader still rewrites its images and installs its
      * SIGILL handler natively after this point (loader.c); refuse rather
      * than let those syscalls reach the plugin's trap path. */
@@ -311,6 +325,18 @@ void sbr_dl_init(struct ld_link_map *main_map, int ac, char **av, char **e) {
 
   ElfW(Dyn) *preinit_array_p = main_map->l_info[DT_PREINIT_ARRAY];
   ElfW(Dyn) *preinit_array_size_p = main_map->l_info[DT_PREINIT_ARRAYSZ];
+  /* The plugin's start is appended to this array, so the client's own
+   * preinit functions would run first, before the plugin arms its trap path,
+   * and their short syscall sites were left raw. Refuse, as the in-guest
+   * runtime refuses such clients, before ld.so runs any of them. */
+  if (sbr_rewriter_short_sites_raw() && preinit_array_p != NULL &&
+      preinit_array_size_p != NULL && preinit_array_size_p->d_un.d_val > 0) {
+    load_sabre_tls();
+    errx(EXIT_FAILURE,
+         "refused: %s=raw: the client has a DT_PREINIT_ARRAY, whose functions "
+         "would run before the plugin arms its trap path",
+         SBR_SHORT_SYSCALL_SITES_ENV);
+  }
   if (preinit_array_p != NULL) {
     // Get the current size of preinit_array. Default is 0.
     new_dyn_entries[1].d_un.d_val = preinit_array_size_p->d_un.d_val;

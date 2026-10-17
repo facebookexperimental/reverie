@@ -1,4 +1,7 @@
-/* Answers every getppid that reaches it with 2^30, above any process ID. */
+/* Answers every getppid that reaches it with 2^30, above any process ID.
+ * Built with POST_ARM it also reports post-arm routing, so the loader sends
+ * it every rewritten-site call (it arms no trap path of its own); built with
+ * POST_ARM_ZERO it defines the report but returns zero. */
 #define _GNU_SOURCE
 #include <stddef.h>
 #include <sys/syscall.h>
@@ -12,6 +15,16 @@ static long handler(long nr, long a, long b, long c, long d, long e, long f,
     return 1L << 30;
   return real_syscall(nr, a, b, c, d, e, f);
 }
+
+#if defined(POST_ARM) || defined(POST_ARM_ZERO)
+int reverie_sabre_post_arm_routing_v1(void) {
+#ifdef POST_ARM_ZERO
+  return 0;
+#else
+  return 1;
+#endif
+}
+#endif
 
 #ifdef __NX_INTERCEPT_RDTSC
 static long rdtsc(void) {
