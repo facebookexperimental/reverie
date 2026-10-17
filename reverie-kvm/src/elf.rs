@@ -82,7 +82,6 @@ const STATIC_BRK_HEADROOM: u64 = 1024 * 1024;
 /// off (x86-64 ELF_ET_DYN_BASE), before rounding to the image's alignment.
 const PIE_BASE: u64 = 0x5555_5555_4000;
 const INTERPRETED_BRK_HEADROOM: u64 = 4 * 1024 * 1024;
-const IOPRIO_CLASS_SHIFT: u32 = 13;
 pub(crate) const GUEST_CAPABILITY_MASK: u64 = (1_u64 << 41) - 1;
 const PROC_SUPER_MAGIC: libc::c_long = 0x9fa0;
 const POLICY_OPEN_EINTR_ATTEMPTS: usize = 16;
@@ -1030,13 +1029,6 @@ pub(crate) struct LoadedStaticElf {
     pub capability_ambient: u64,
     // TODO-HUMAN-REVIEW(PR-235): Review virtual dumpability lifecycle semantics.
     pub dumpable: bool,
-    // TODO-HUMAN-REVIEW(PR-92): Review virtual nice process state.
-    pub nice: libc::c_int,
-    // TODO-HUMAN-REVIEW(PR-119): Review virtual scheduler/ioprio process state.
-    pub sched_policy: libc::c_int,
-    pub sched_priority: libc::c_int,
-    pub sched_reset_on_fork: bool,
-    pub ioprio: libc::c_int,
     /// Dispositions and process-pending signals shared by a thread group.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-235): Review process-local virtual signalfd state.
@@ -1119,6 +1111,11 @@ pub(crate) struct LoadedStaticElf {
     /// same syscall boundary, which turns it into the typed refusal
     /// `UnsupportedOperation::Signal`. Never carried across fork or exec.
     pub(crate) signal_refusal: Option<&'static str>,
+    /// Why the scheduling, priority or I/O-priority call just executed was
+    /// refused with ENOSYS, if it was; the executor takes it at the same
+    /// syscall boundary as the typed refusal `UnsupportedOperation::Scheduling`.
+    /// Never carried across fork or exec.
+    pub(crate) scheduling_refusal: Option<&'static str>,
 }
 
 impl LoadedStaticElf {
@@ -1185,9 +1182,6 @@ impl LoadedStaticElf {
 
     pub(crate) fn try_clone_for_fork_locked(&self, child_pid: i32) -> Result<Self> {
         // TODO-HUMAN-REVIEW(PR-136): Review shared file identity inheritance across fork.
-        // TODO-HUMAN-REVIEW(PR-119): Review scheduler reset and ioprio fork inheritance.
-        let reset_realtime = self.sched_reset_on_fork
-            && matches!(self.sched_policy, libc::SCHED_FIFO | libc::SCHED_RR);
         let files = self
             .files
             .iter()
@@ -1250,23 +1244,6 @@ impl LoadedStaticElf {
             capability_bounding: self.capability_bounding,
             capability_ambient: self.capability_ambient,
             dumpable: self.dumpable,
-            nice: self.nice,
-            sched_policy: if reset_realtime {
-                libc::SCHED_OTHER
-            } else {
-                self.sched_policy
-            },
-            sched_priority: if reset_realtime {
-                0
-            } else {
-                self.sched_priority
-            },
-            sched_reset_on_fork: false,
-            ioprio: if self.ioprio >> IOPRIO_CLASS_SHIFT == 0 {
-                0
-            } else {
-                self.ioprio
-            },
             process_signals: std::sync::Arc::new(std::sync::Mutex::new(process_signals)),
             signal_transaction: Default::default(),
             thread_signals: self.thread_signals.for_fork(),
@@ -1278,6 +1255,7 @@ impl LoadedStaticElf {
                 .collect(),
             file_retirement: FileRetirement::default(),
             signal_refusal: None,
+            scheduling_refusal: None,
             pipe_owners: self.pipe_owners.clone(),
             fd_entry_ids: self.fd_entry_ids.clone(),
             epoll_domain: self.epoll_domain.clone(),
@@ -1500,12 +1478,6 @@ impl LoadedStaticElf {
         self.capability_ambient =
             previous.capability_ambient & self.capability_permitted & self.capability_inheritable;
         self.dumpable = true;
-        self.nice = previous.nice;
-        // TODO-HUMAN-REVIEW(PR-119): Review scheduler and ioprio exec inheritance.
-        self.sched_policy = previous.sched_policy;
-        self.sched_priority = previous.sched_priority;
-        self.sched_reset_on_fork = previous.sched_reset_on_fork;
-        self.ioprio = previous.ioprio;
         self.process_signals = std::sync::Arc::new(std::sync::Mutex::new(process_signals));
         self.signal_transaction = previous.signal_transaction;
         self.thread_signals = thread_signals;
@@ -2045,12 +2017,6 @@ fn load_executable(
         capability_bounding: GUEST_CAPABILITY_MASK,
         capability_ambient: 0,
         dumpable: true,
-        nice: 0,
-        // TODO-HUMAN-REVIEW(PR-119): Review default virtual scheduler and ioprio state.
-        sched_policy: libc::SCHED_OTHER,
-        sched_priority: 0,
-        sched_reset_on_fork: false,
-        ioprio: 0,
         process_signals: std::sync::Arc::new(std::sync::Mutex::new(ProcessSignalState::default())),
         signal_transaction: Default::default(),
         thread_signals: SharedThreadSignalState::default(),
@@ -2061,6 +2027,7 @@ fn load_executable(
         files: std::collections::BTreeMap::new(),
         file_retirement: FileRetirement::default(),
         signal_refusal: None,
+        scheduling_refusal: None,
         pipe_owners: Default::default(),
         fd_entry_ids: std::collections::BTreeMap::new(),
         epoll_domain: Default::default(),

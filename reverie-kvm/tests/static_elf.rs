@@ -5765,6 +5765,90 @@ fn static_elf_forks_execs_and_waits_for_child() {
     assert!(stderr.is_empty());
 }
 
+/// setpriority reaches the host for the calling task, whose host thread a
+/// forked child's thread inherits, as Linux's fork inherits the nice value:
+/// the guest lowers its own nice value to 19, forks, and the child exits with
+/// its getpriority answer (raw 20 - nice = 1), which the parent passes on.
+/// Run without a tool and with one that injects every call, each on a fresh
+/// thread whose nice value starts as the test process's.
+#[test]
+fn forked_child_inherits_the_nice_value_set_on_the_host() {
+    match Kvm::new() {
+        Ok(_) => {}
+        Err(error) if kvm_is_unavailable(&error) => {
+            eprintln!("skipping KVM nice inheritance test: cannot open /dev/kvm: {error}");
+            return;
+        }
+        Err(error) => panic!("failed to probe /dev/kvm: {error}"),
+    }
+    let mut root = vec![
+        0x31, 0xff, // xor edi, edi (PRIO_PROCESS)
+        0x31, 0xf6, // xor esi, esi (the caller)
+        0xba, 0x13, 0x00, 0x00, 0x00, // mov edx, 19
+        0xb8, 0x8d, 0x00, 0x00, 0x00, // mov eax, SYS_setpriority
+        0x0f, 0x05, // syscall
+        0xb8, 0x39, 0x00, 0x00, 0x00, // mov eax, SYS_fork
+        0x0f, 0x05, // syscall
+        0x85, 0xc0, // test eax, eax
+        0x74, 0x00, // jz child
+    ];
+    let child_jump = root.len() - 1;
+    root.extend_from_slice(&[
+        0x89, 0xc7, // mov edi, eax
+        0x48, 0x83, 0xec, 0x10, // sub rsp, 16
+        0x48, 0x89, 0xe6, // mov rsi, rsp
+        0x31, 0xd2, // xor edx, edx
+        0x45, 0x31, 0xd2, // xor r10d, r10d
+        0xb8, 0x3d, 0x00, 0x00, 0x00, // mov eax, SYS_wait4
+        0x0f, 0x05, // syscall
+        0x8b, 0x3c, 0x24, // mov edi, dword ptr [rsp]
+        0xc1, 0xef, 0x08, // shr edi, 8
+        0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax, SYS_exit_group
+        0x0f, 0x05, // syscall
+        0x0f, 0x0b, // ud2
+    ]);
+    root[child_jump] = u8::try_from(root.len() - (child_jump + 1)).unwrap();
+    root.extend_from_slice(&[
+        0x31, 0xff, // xor edi, edi (PRIO_PROCESS)
+        0x31, 0xf6, // xor esi, esi (the caller)
+        0xb8, 0x8c, 0x00, 0x00, 0x00, // mov eax, SYS_getpriority
+        0x0f, 0x05, // syscall
+        0x89, 0xc7, // mov edi, eax
+        0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax, SYS_exit_group
+        0x0f, 0x05, // syscall
+        0x0f, 0x0b, // ud2
+    ]);
+    let image = static_elf(&root);
+    // SAFETY: getpriority takes no pointer.
+    let starting = unsafe { libc::syscall(libc::SYS_getpriority, libc::PRIO_PROCESS, 0) };
+    assert_ne!(starting, 1, "the test must start below nice 19");
+
+    let tool_less = image.clone();
+    let code = std::thread::spawn(move || {
+        let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+        backend
+            .install_static_elf(&tool_less, "/bin/nice-fork-test")
+            .unwrap();
+        backend.run_static_elf_captured().unwrap().0
+    })
+    .join()
+    .unwrap();
+    assert_eq!(code, 1, "without a tool");
+
+    let code = std::thread::spawn(move || {
+        let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+        backend
+            .install_static_elf(&image, "/bin/nice-fork-test")
+            .unwrap();
+        futures::executor::block_on(backend.run_static_elf_with_tool::<StraceTool>((), true))
+            .unwrap()
+            .1
+    })
+    .join()
+    .unwrap();
+    assert_eq!(code, 1, "with a tool");
+}
+
 #[test]
 fn static_elf_self_abort_terminates_instead_of_faulting() {
     // Regression: glibc abort() writes its diagnostic, then raises SIGABRT via

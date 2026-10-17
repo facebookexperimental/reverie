@@ -48,6 +48,13 @@ pub enum UnsupportedOperation {
     /// `execve` or `execveat` on a backend that cannot replace the process
     /// image at all. No replacement image ran; the caller runs on unchanged.
     Exec,
+    /// A scheduling, priority or I/O-priority call (`setpriority`,
+    /// `getpriority`, the `sched_set*` and `sched_get*` calls that name a
+    /// task, `ioprio_set` or `ioprio_get`) for a task other than the caller,
+    /// a process group or a user, on a backend that can perform it only for
+    /// the calling task. A backend that refuses it changed no scheduling
+    /// state and read none.
+    Scheduling,
 }
 
 /// A backend's refusal of an injected syscall that it cannot perform, as

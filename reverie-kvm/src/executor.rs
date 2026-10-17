@@ -174,6 +174,25 @@ fn signal_refusal_record(
         })
 }
 
+/// The typed refusal for a scheduling, priority or I/O-priority call the
+/// backend refused (`reason`, set by `refuse_scheduling`) when it answered
+/// ENOSYS. Linux never answers these calls with ENOSYS, so the answer cannot
+/// be mistaken for a kernel one.
+fn scheduling_refusal_record(
+    reason: Option<&'static str>,
+    result: i64,
+) -> Option<reverie::UnsupportedRefusal> {
+    reason
+        .filter(|_| result == negative_errno(libc::ENOSYS))
+        .map(|reason| {
+            reverie::UnsupportedRefusal::new(
+                reverie::UnsupportedOperation::Scheduling,
+                reverie::Errno::ENOSYS,
+                reason,
+            )
+        })
+}
+
 /// Diagnostic carried by this backend's typed refusal of `setsid` and
 /// `setpgid`.
 pub(crate) const PROCESS_GROUP_REFUSAL: &str = "KVM keeps no process groups or sessions a guest can change: setsid and setpgid are unsupported";
@@ -1331,12 +1350,15 @@ fn execute_basic_syscall_inner(
     } else if number == libc::SYS_sched_getattr as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         sched_getattr(&mut ProviderMemory(memory), state, args)
+    } else if number == libc::SYS_sched_setattr as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        sched_setattr(&mut ProviderMemory(memory), state, args)
     } else if number == libc::SYS_sched_get_priority_min as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        sched_priority_bound(args[0], false)
+        sched_priority_bound(libc::SYS_sched_get_priority_min, args[0])
     } else if number == libc::SYS_sched_get_priority_max as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        sched_priority_bound(args[0], true)
+        sched_priority_bound(libc::SYS_sched_get_priority_max, args[0])
     } else if number == libc::SYS_getpriority as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         getpriority(state, args)
@@ -6428,6 +6450,7 @@ impl ElfExecutor {
                     | libc::SYS_sched_getattr
                     | libc::SYS_sched_getparam
                     | libc::SYS_sched_getscheduler
+                    | libc::SYS_sched_setattr
                     | libc::SYS_sched_setparam
                     | libc::SYS_sched_setscheduler
                     | libc::SYS_sched_yield
@@ -8328,6 +8351,11 @@ impl ElfExecutor {
                 }
                 if let Some(refusal) =
                     signal_refusal_record(self.state.signal_refusal.take(), result)
+                {
+                    self.unsupported_refusal = Some(refusal);
+                }
+                if let Some(refusal) =
+                    scheduling_refusal_record(self.state.scheduling_refusal.take(), result)
                 {
                     self.unsupported_refusal = Some(refusal);
                 }
@@ -20936,339 +20964,398 @@ fn sched_getaffinity<M: GuestMemoryAccess<Error = crate::Error>>(
     }
 }
 
-// SCHED_RESET_ON_FORK may be ORed into the policy passed to sched_setscheduler.
-const SCHED_RESET_ON_FORK: libc::c_int = 0x4000_0000;
-const SCHED_DEADLINE: libc::c_int = 6;
-const SCHED_EXT: libc::c_int = 7;
-const IOPRIO_WHO_PROCESS: libc::c_int = 1;
-const IOPRIO_WHO_PGRP: libc::c_int = 2;
-const IOPRIO_WHO_USER: libc::c_int = 3;
-const IOPRIO_CLASS_SHIFT: libc::c_int = 13;
-const IOPRIO_CLASS_RT: libc::c_int = 1;
-const IOPRIO_CLASS_BE: libc::c_int = 2;
-const IOPRIO_CLASS_IDLE: libc::c_int = 3;
-const IOPRIO_LEVEL_MASK: libc::c_int = 0x7;
+/// Diagnostic carried by this backend's typed refusal of a scheduling,
+/// priority or I/O-priority call that names a task other than its caller.
+pub(crate) const SCHEDULING_REFUSAL: &str = "KVM scheduling calls reach the host only for the \
+     calling task: another task, a process group or a user would name host tasks that are not \
+     the guest's";
 
-// TODO-HUMAN-REVIEW(PR-119): Review guest scheduler pid validation and lookup.
-fn sched_pid_value(raw_pid: u64) -> Result<libc::c_int, i64> {
-    let pid = raw_pid as u32 as libc::c_int;
+/// Whom a scheduling, priority or I/O-priority call names. Each guest task
+/// runs on its own host thread, so the host's target 0 (the calling thread)
+/// is the guest's calling task, and the host thread's scheduling state is
+/// the task's: a forked task's thread is created by its parent's and
+/// inherits it as Linux's fork does, and exec keeps the thread.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SchedulingTarget {
+    /// The calling task (0 or its own tid): forwarded with the target 0.
+    Caller,
+    /// A target Linux rejects without naming any task (a negative pid, or an
+    /// unknown selector): forwarded unchanged, so the host answers it.
+    Unchanged,
+    /// Another task, a process group or a user: refused, since the guest's
+    /// numbers would name the wrong host tasks.
+    Refused,
+}
+
+/// The target of a call whose first argument is a pid (the sched_* family).
+fn sched_pid_target(state: &LoadedStaticElf, raw_pid: u64) -> SchedulingTarget {
+    let pid = raw_pid as u32 as libc::pid_t;
     if pid < 0 {
-        Err(negative_errno(libc::EINVAL))
+        SchedulingTarget::Unchanged
+    } else if pid == 0 || pid == state.tid {
+        SchedulingTarget::Caller
     } else {
-        Ok(pid)
+        SchedulingTarget::Refused
     }
 }
 
-fn sched_target_result(state: &LoadedStaticElf, pid: libc::c_int) -> Result<(), i64> {
-    if pid == 0 || pid == state.pid {
-        Ok(())
+/// The target of a `(which, who)` call: getpriority/setpriority with
+/// `PRIO_PROCESS`, `PRIO_PGRP` and `PRIO_USER`, or ioprio_get/ioprio_set with
+/// `IOPRIO_WHO_PROCESS`, `IOPRIO_WHO_PGRP` and `IOPRIO_WHO_USER`, which share
+/// the values 0, 1 and 2 shifted by one: `process` is the selector naming a
+/// single task. A negative `who` names no task (Linux answers ESRCH).
+fn selector_target(
+    state: &LoadedStaticElf,
+    raw_which: u64,
+    raw_who: u64,
+    process: libc::c_int,
+) -> SchedulingTarget {
+    let which = raw_which as u32 as libc::c_int;
+    let who = raw_who as u32 as libc::c_int;
+    if which == process {
+        if who < 0 {
+            SchedulingTarget::Unchanged
+        } else if who == 0 || who == state.tid {
+            SchedulingTarget::Caller
+        } else {
+            SchedulingTarget::Refused
+        }
+    } else if which == process + 1 || which == process + 2 {
+        SchedulingTarget::Refused
     } else {
-        Err(negative_errno(libc::ESRCH))
+        SchedulingTarget::Unchanged
     }
 }
 
-// TODO-HUMAN-REVIEW(PR-119): Review guest sched_param memory validation.
-fn read_sched_param<M: GuestMemoryAccess<Error = crate::Error>>(
-    memory: &M,
-    address: u64,
-) -> Result<libc::c_int, i64> {
-    if address == 0 {
-        return Err(negative_errno(libc::EINVAL));
-    }
-    let mut priority = [0; std::mem::size_of::<libc::c_int>()];
-    memory
-        .read_exact(address, &mut priority)
-        .map_err(|_| negative_errno(libc::EFAULT))?;
-    Ok(libc::c_int::from_ne_bytes(priority))
+const IOPRIO_WHO_PROCESS: libc::c_int = 1;
+
+/// Refuses a scheduling call with ENOSYS, recording why. Linux's scheduling
+/// calls never fail with ENOSYS, so the executor reports every such answer
+/// as the typed refusal `UnsupportedOperation::Scheduling` (see
+/// `scheduling_refusal_record`).
+fn refuse_scheduling(state: &mut LoadedStaticElf) -> i64 {
+    state.scheduling_refusal = Some(SCHEDULING_REFUSAL);
+    negative_errno(libc::ENOSYS)
 }
 
-// TODO-HUMAN-REVIEW(PR-119): Review guest sched_param output validation.
-fn write_sched_param<M: GuestMemoryAccess<Error = crate::Error>>(
-    memory: &mut M,
-    address: u64,
-    priority: libc::c_int,
-) -> i64 {
-    match memory.write_exact(address, &priority.to_ne_bytes()) {
-        Ok(()) => 0,
-        Err(_) => negative_errno(libc::EFAULT),
+/// The host's answer to `number` with `args`, as a raw result or a negative
+/// errno.
+fn host_scheduling_call(number: libc::c_long, args: [usize; 4]) -> i64 {
+    // SAFETY: every pointer argument is null, faults (a staged protected
+    // page), or names a live staged host operand of the size the call reads
+    // or writes; no call here takes any other pointer.
+    let result = unsafe { libc::syscall(number, args[0], args[1], args[2], args[3]) };
+    if result < 0 {
+        io_error(std::io::Error::last_os_error())
+    } else {
+        result
     }
 }
 
-// TODO-HUMAN-REVIEW(PR-119): Review settable policy and priority validation.
-fn sched_policy_settable(policy: libc::c_int) -> bool {
-    matches!(
-        policy,
-        libc::SCHED_OTHER
-            | libc::SCHED_FIFO
-            | libc::SCHED_RR
-            | libc::SCHED_BATCH
-            | libc::SCHED_IDLE
+/// A guest operand of `length` bytes at `address`, staged in host memory with
+/// the guest's accessibility for `access`: its accessible prefix holds the
+/// guest's bytes and the rest is protected, so the host kernel reports
+/// EFAULT, in its own order, where Linux would. A null guest pointer stays
+/// null, so the host answers it as Linux does.
+struct StagedOperand {
+    staged: Option<StagedIoVector>,
+}
+
+impl StagedOperand {
+    fn new<M: GuestMemoryAccess<Error = crate::Error>>(
+        memory: &M,
+        address: u64,
+        length: usize,
+        access: Access,
+    ) -> Result<Self, i64> {
+        if address == 0 {
+            return Ok(Self { staged: None });
+        }
+        let prefix = memory
+            .accessible_prefix(address, length, access)
+            .unwrap_or(0);
+        let mut staged = StagedIoVector::new(
+            GuestIoVec {
+                base: address,
+                length,
+            },
+            prefix,
+            PAGE_SIZE as usize,
+        )?;
+        if prefix != 0
+            && memory
+                .read_exact(address, staged.accessible_slice_mut(prefix))
+                .is_err()
+        {
+            return Err(negative_errno(libc::EFAULT));
+        }
+        Ok(Self {
+            staged: Some(staged),
+        })
+    }
+
+    fn host_address(&mut self) -> usize {
+        self.staged
+            .as_mut()
+            .map_or(0, |staged| staged.host_iovec().iov_base as usize)
+    }
+
+    /// The first `length` staged bytes, if they are accessible.
+    fn bytes(&self, length: usize) -> Option<&[u8]> {
+        self.staged
+            .as_ref()
+            .filter(|staged| length <= staged.accessible_length)
+            .map(|staged| staged.accessible_slice(length))
+    }
+
+    /// Copies the first `length` staged bytes, which the host wrote, back to
+    /// the guest.
+    fn copy_back<M: GuestMemoryAccess<Error = crate::Error>>(
+        &self,
+        memory: &mut M,
+        length: usize,
+    ) -> i64 {
+        let Some(staged) = self.staged.as_ref() else {
+            return 0;
+        };
+        if length == 0 {
+            return 0;
+        }
+        match self.bytes(length) {
+            Some(bytes) => match memory.write_exact(staged.guest.base, bytes) {
+                Ok(()) => 0,
+                Err(_) => negative_errno(libc::EFAULT),
+            },
+            None => negative_errno(libc::EFAULT),
+        }
+    }
+}
+
+/// `getpriority(2)` from the host for the calling task.
+// TODO-HUMAN-REVIEW(PR-92): Review stateful virtual nice queries.
+fn getpriority(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    match selector_target(state, args[0], args[1], libc::PRIO_PROCESS as libc::c_int) {
+        SchedulingTarget::Caller => {
+            host_scheduling_call(libc::SYS_getpriority, [args[0] as usize, 0, 0, 0])
+        }
+        SchedulingTarget::Unchanged => host_scheduling_call(
+            libc::SYS_getpriority,
+            [args[0] as usize, args[1] as usize, 0, 0],
+        ),
+        SchedulingTarget::Refused => refuse_scheduling(state),
+    }
+}
+
+/// `setpriority(2)` from the host for the calling task: its host thread's
+/// nice value, as a ptrace guest thread's own.
+// TODO-HUMAN-REVIEW(PR-92): Review stateful virtual nice mutation and clamping.
+fn setpriority(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    let who = match selector_target(state, args[0], args[1], libc::PRIO_PROCESS as libc::c_int) {
+        SchedulingTarget::Caller => 0,
+        SchedulingTarget::Unchanged => args[1] as usize,
+        SchedulingTarget::Refused => return refuse_scheduling(state),
+    };
+    host_scheduling_call(
+        libc::SYS_setpriority,
+        [args[0] as usize, who, args[2] as usize, 0],
     )
 }
 
-fn sched_priority_valid(policy: libc::c_int, priority: libc::c_int) -> bool {
-    match policy {
-        libc::SCHED_FIFO | libc::SCHED_RR => (1..=99).contains(&priority),
-        libc::SCHED_OTHER | libc::SCHED_BATCH | libc::SCHED_IDLE => priority == 0,
-        _ => false,
+/// The host pid argument for a sched_* call, or its refusal.
+fn sched_host_pid(state: &mut LoadedStaticElf, raw_pid: u64) -> Result<usize, i64> {
+    match sched_pid_target(state, raw_pid) {
+        SchedulingTarget::Caller => Ok(0),
+        SchedulingTarget::Unchanged => Ok(raw_pid as usize),
+        SchedulingTarget::Refused => Err(refuse_scheduling(state)),
     }
 }
 
 // TODO-HUMAN-REVIEW(PR-110): Review scheduler policy priority bounds.
 // TODO-HUMAN-REVIEW(PR-119): Review modern policy-bound compatibility.
-fn sched_priority_bound(policy: u64, want_max: bool) -> i64 {
-    let policy = policy as u32 as libc::c_int;
-    match policy {
-        libc::SCHED_FIFO | libc::SCHED_RR => {
-            if want_max {
-                99
-            } else {
-                1
-            }
-        }
-        libc::SCHED_OTHER | libc::SCHED_BATCH | libc::SCHED_IDLE | SCHED_DEADLINE | SCHED_EXT => 0,
-        _ => negative_errno(libc::EINVAL),
-    }
+/// `sched_get_priority_min(2)` or `sched_get_priority_max(2)` from the host.
+fn sched_priority_bound(number: libc::c_long, policy: u64) -> i64 {
+    host_scheduling_call(number, [policy as usize, 0, 0, 0])
 }
 
 // TODO-HUMAN-REVIEW(PR-110): Review virtual sched_getscheduler behavior.
 // TODO-HUMAN-REVIEW(PR-119): Review stateful scheduler query behavior.
-fn sched_getscheduler(state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
-    let pid = match sched_pid_value(args[0]) {
-        Ok(pid) => pid,
-        Err(error) => return error,
-    };
-    if let Err(error) = sched_target_result(state, pid) {
-        return error;
+/// `sched_getscheduler(2)` from the host for the calling task.
+fn sched_getscheduler(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    match sched_host_pid(state, args[0]) {
+        Ok(pid) => host_scheduling_call(libc::SYS_sched_getscheduler, [pid, 0, 0, 0]),
+        Err(refusal) => refusal,
     }
-    let reset = if state.sched_reset_on_fork {
-        SCHED_RESET_ON_FORK
-    } else {
-        0
-    };
-    i64::from(state.sched_policy | reset)
 }
+
+/// The size of Linux's `struct sched_param`, which holds one int.
+const SCHED_PARAM_SIZE: usize = std::mem::size_of::<libc::c_int>();
 
 // TODO-HUMAN-REVIEW(PR-110): Review virtual sched_setscheduler behavior.
 // TODO-HUMAN-REVIEW(PR-119): Review stateful scheduler mutation and errno ordering.
+/// `sched_setscheduler(2)` from the host for the calling task: its host
+/// thread's policy, as a ptrace guest thread's own.
 fn sched_setscheduler<M: GuestMemoryAccess<Error = crate::Error>>(
     memory: &M,
     state: &mut LoadedStaticElf,
     args: &[u64; 6],
 ) -> i64 {
-    let pid = match sched_pid_value(args[0]) {
+    let pid = match sched_host_pid(state, args[0]) {
         Ok(pid) => pid,
+        Err(refusal) => return refusal,
+    };
+    let mut param = match StagedOperand::new(memory, args[2], SCHED_PARAM_SIZE, Access::Read) {
+        Ok(param) => param,
         Err(error) => return error,
     };
-    let policy_with_flags = args[1] as u32 as libc::c_int;
-    if policy_with_flags < 0 {
-        return negative_errno(libc::EINVAL);
-    }
-    let priority = match read_sched_param(memory, args[2]) {
-        Ok(priority) => priority,
-        Err(error) => return error,
-    };
-    if let Err(error) = sched_target_result(state, pid) {
-        return error;
-    }
-    let policy = policy_with_flags & !SCHED_RESET_ON_FORK;
-    if !sched_policy_settable(policy) || !sched_priority_valid(policy, priority) {
-        return negative_errno(libc::EINVAL);
-    }
-    state.sched_policy = policy;
-    state.sched_priority = priority;
-    state.sched_reset_on_fork = policy_with_flags & SCHED_RESET_ON_FORK != 0;
-    0
+    host_scheduling_call(
+        libc::SYS_sched_setscheduler,
+        [pid, args[1] as usize, param.host_address(), 0],
+    )
 }
 
 // TODO-HUMAN-REVIEW(PR-110): Review virtual sched_getparam behavior.
 // TODO-HUMAN-REVIEW(PR-119): Review scheduler parameter query errno ordering.
+/// `sched_getparam(2)` from the host for the calling task.
 fn sched_getparam<M: GuestMemoryAccess<Error = crate::Error>>(
     memory: &mut M,
-    state: &LoadedStaticElf,
+    state: &mut LoadedStaticElf,
     args: &[u64; 6],
 ) -> i64 {
-    let pid = match sched_pid_value(args[0]) {
+    let pid = match sched_host_pid(state, args[0]) {
         Ok(pid) => pid,
+        Err(refusal) => return refusal,
+    };
+    let mut param = match StagedOperand::new(memory, args[1], SCHED_PARAM_SIZE, Access::Write) {
+        Ok(param) => param,
         Err(error) => return error,
     };
-    if args[1] == 0 {
-        return negative_errno(libc::EINVAL);
+    let result = host_scheduling_call(libc::SYS_sched_getparam, [pid, param.host_address(), 0, 0]);
+    if result < 0 {
+        return result;
     }
-    if let Err(error) = sched_target_result(state, pid) {
-        return error;
+    match param.copy_back(memory, SCHED_PARAM_SIZE) {
+        0 => result,
+        error => error,
     }
-    write_sched_param(memory, args[1], state.sched_priority)
 }
 
 // TODO-HUMAN-REVIEW(PR-110): Review virtual sched_setparam behavior.
 // TODO-HUMAN-REVIEW(PR-119): Review scheduler parameter mutation errno ordering.
+/// `sched_setparam(2)` from the host for the calling task.
 fn sched_setparam<M: GuestMemoryAccess<Error = crate::Error>>(
     memory: &M,
     state: &mut LoadedStaticElf,
     args: &[u64; 6],
 ) -> i64 {
-    let pid = match sched_pid_value(args[0]) {
+    let pid = match sched_host_pid(state, args[0]) {
         Ok(pid) => pid,
+        Err(refusal) => return refusal,
+    };
+    let mut param = match StagedOperand::new(memory, args[1], SCHED_PARAM_SIZE, Access::Read) {
+        Ok(param) => param,
         Err(error) => return error,
     };
-    let priority = match read_sched_param(memory, args[1]) {
-        Ok(priority) => priority,
+    host_scheduling_call(libc::SYS_sched_setparam, [pid, param.host_address(), 0, 0])
+}
+
+/// `sched_setattr(2)` from the host for the calling task. Linux reads the
+/// record's size and then at most a page of it, so a page is staged; when it
+/// answers E2BIG it has written the size it supports into the record's size
+/// field, which goes back to the guest as Linux's own write would (Linux
+/// ignores a failure of that write, and so does this).
+// TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/4485): Review the host-forwarded sched_setattr.
+fn sched_setattr<M: GuestMemoryAccess<Error = crate::Error>>(
+    memory: &mut M,
+    state: &mut LoadedStaticElf,
+    args: &[u64; 6],
+) -> i64 {
+    const SIZE_FIELD: usize = std::mem::size_of::<u32>();
+    let pid = match sched_host_pid(state, args[0]) {
+        Ok(pid) => pid,
+        Err(refusal) => return refusal,
+    };
+    let mut attr = match StagedOperand::new(memory, args[1], PAGE_SIZE as usize, Access::Read) {
+        Ok(attr) => attr,
         Err(error) => return error,
     };
-    if let Err(error) = sched_target_result(state, pid) {
-        return error;
+    let result = host_scheduling_call(
+        libc::SYS_sched_setattr,
+        [pid, attr.host_address(), args[2] as usize, 0],
+    );
+    if result == negative_errno(libc::E2BIG) && attr.bytes(SIZE_FIELD).is_some() {
+        let _ = attr.copy_back(memory, SIZE_FIELD);
     }
-    if !sched_priority_valid(state.sched_policy, priority) {
-        return negative_errno(libc::EINVAL);
-    }
-    state.sched_priority = priority;
-    0
+    result
 }
 
-// TODO-HUMAN-REVIEW(PR-119): Review single-process ioprio target validation.
-// Group and user selectors deterministically address the current KVM executor only;
-// this is a one-task approximation and does not claim cross-executor group updates.
-fn ioprio_target_result(state: &LoadedStaticElf, which: u64, who: u64) -> Result<(), i64> {
-    let which = which as u32 as libc::c_int;
-    let who = who as u32;
-    let target_matches = match which {
-        IOPRIO_WHO_PROCESS | IOPRIO_WHO_PGRP => who == 0 || who == state.pid as u32,
-        IOPRIO_WHO_USER => who == 0,
-        _ => return Err(negative_errno(libc::EINVAL)),
+// TODO-HUMAN-REVIEW(PR-92): Review bounded sched_getattr ABI writes.
+/// `sched_getattr(2)` from the host for the calling task. Linux writes
+/// `min(size, its record size)` bytes and stores that count in the record's
+/// size field, so that many bytes go back to the guest.
+fn sched_getattr<M: GuestMemoryAccess<Error = crate::Error>>(
+    memory: &mut M,
+    state: &mut LoadedStaticElf,
+    args: &[u64; 6],
+) -> i64 {
+    let pid = match sched_host_pid(state, args[0]) {
+        Ok(pid) => pid,
+        Err(refusal) => return refusal,
     };
-    if target_matches {
-        Ok(())
-    } else {
-        Err(negative_errno(libc::ESRCH))
+    let size = args[2] as u32 as usize;
+    let mut attr =
+        match StagedOperand::new(memory, args[1], size.min(PAGE_SIZE as usize), Access::Write) {
+            Ok(attr) => attr,
+            Err(error) => return error,
+        };
+    let result = host_scheduling_call(
+        libc::SYS_sched_getattr,
+        [pid, attr.host_address(), size, args[3] as usize],
+    );
+    if result < 0 {
+        return result;
     }
-}
-
-// TODO-HUMAN-REVIEW(PR-119): Review policy-derived effective ioprio defaults.
-fn ioprio_effective_default(state: &LoadedStaticElf) -> libc::c_int {
-    let class = match state.sched_policy {
-        libc::SCHED_IDLE => IOPRIO_CLASS_IDLE,
-        libc::SCHED_FIFO | libc::SCHED_RR | SCHED_DEADLINE => IOPRIO_CLASS_RT,
-        _ => IOPRIO_CLASS_BE,
-    };
-    (class << IOPRIO_CLASS_SHIFT) | 4
+    let written = attr
+        .bytes(std::mem::size_of::<u32>())
+        .map_or(0, |field| {
+            u32::from_ne_bytes(field.try_into().expect("four-byte size field")) as usize
+        })
+        .min(size);
+    match attr.copy_back(memory, written) {
+        0 => result,
+        error => error,
+    }
 }
 
 // TODO-HUMAN-REVIEW(PR-110): Review virtual ioprio_get behavior.
 // TODO-HUMAN-REVIEW(PR-119): Review raw versus effective ioprio query results.
-fn ioprio_get(state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
-    if let Err(error) = ioprio_target_result(state, args[0], args[1]) {
-        return error;
-    }
-    if state.ioprio >> IOPRIO_CLASS_SHIFT == 0
-        && args[0] as u32 as libc::c_int != IOPRIO_WHO_PROCESS
-    {
-        i64::from(ioprio_effective_default(state))
-    } else {
-        i64::from(state.ioprio)
+/// `ioprio_get(2)` from the host for the calling task.
+fn ioprio_get(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    match selector_target(state, args[0], args[1], IOPRIO_WHO_PROCESS) {
+        SchedulingTarget::Caller => {
+            host_scheduling_call(libc::SYS_ioprio_get, [args[0] as usize, 0, 0, 0])
+        }
+        SchedulingTarget::Unchanged => host_scheduling_call(
+            libc::SYS_ioprio_get,
+            [args[0] as usize, args[1] as usize, 0, 0],
+        ),
+        SchedulingTarget::Refused => refuse_scheduling(state),
     }
 }
 
 // TODO-HUMAN-REVIEW(PR-110): Review virtual ioprio_set behavior.
 // TODO-HUMAN-REVIEW(PR-119): Review modern class, level, and hint payload handling.
+/// `ioprio_set(2)` from the host for the calling task: its host thread's I/O
+/// priority, as a ptrace guest thread's own.
 fn ioprio_set(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
-    let ioprio = args[2] as u32 as libc::c_int;
-    if ioprio < 0 {
-        return negative_errno(libc::EINVAL);
-    }
-    let class = ioprio >> IOPRIO_CLASS_SHIFT;
-    let valid = match class {
-        0 => ioprio & IOPRIO_LEVEL_MASK == 0,
-        IOPRIO_CLASS_RT | IOPRIO_CLASS_BE | IOPRIO_CLASS_IDLE => true,
-        _ => false,
+    let who = match selector_target(state, args[0], args[1], IOPRIO_WHO_PROCESS) {
+        SchedulingTarget::Caller => 0,
+        SchedulingTarget::Unchanged => args[1] as usize,
+        SchedulingTarget::Refused => return refuse_scheduling(state),
     };
-    if !valid {
-        return negative_errno(libc::EINVAL);
-    }
-    if let Err(error) = ioprio_target_result(state, args[0], args[1]) {
-        return error;
-    }
-    state.ioprio = ioprio;
-    0
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct SchedAttr {
-    size: u32,
-    sched_policy: u32,
-    sched_flags: u64,
-    sched_nice: i32,
-    sched_priority: u32,
-    sched_runtime: u64,
-    sched_deadline: u64,
-    sched_period: u64,
-    sched_util_min: u32,
-    sched_util_max: u32,
-}
-
-// The pid/target argument must name the guest process (0 or its own pid).
-fn is_self_target(raw_pid: u64, state: &LoadedStaticElf) -> bool {
-    let pid = raw_pid as u32 as libc::pid_t;
-    pid == 0 || pid == state.pid
-}
-
-// TODO-HUMAN-REVIEW(PR-92): Review stateful virtual nice queries.
-fn getpriority(state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
-    if args[0] as u32 != libc::PRIO_PROCESS {
-        return negative_errno(libc::EINVAL);
-    }
-    if !is_self_target(args[1], state) {
-        return negative_errno(libc::ESRCH);
-    }
-    i64::from(20 - state.nice)
-}
-
-// TODO-HUMAN-REVIEW(PR-92): Review stateful virtual nice mutation and clamping.
-fn setpriority(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
-    if args[0] as u32 != libc::PRIO_PROCESS {
-        return negative_errno(libc::EINVAL);
-    }
-    if !is_self_target(args[1], state) {
-        return negative_errno(libc::ESRCH);
-    }
-    state.nice = (args[2] as u32 as libc::c_int).clamp(-20, 19);
-    0
-}
-
-// TODO-HUMAN-REVIEW(PR-92): Review bounded sched_getattr ABI writes.
-fn sched_getattr<M: GuestMemoryAccess<Error = crate::Error>>(
-    memory: &mut M,
-    state: &LoadedStaticElf,
-    args: &[u64; 6],
-) -> i64 {
-    let size = args[2] as u32 as usize;
-    if !(48..=PAGE_SIZE as usize).contains(&size) || args[3] as u32 != 0 {
-        return negative_errno(libc::EINVAL);
-    }
-    if !is_self_target(args[0], state) {
-        return negative_errno(libc::ESRCH);
-    }
-    let attr = SchedAttr {
-        size: std::mem::size_of::<SchedAttr>() as u32,
-        sched_policy: state.sched_policy as u32,
-        sched_flags: u64::from(state.sched_reset_on_fork),
-        sched_nice: state.nice,
-        sched_priority: state.sched_priority as u32,
-        sched_runtime: 2_800_000,
-        sched_deadline: 0,
-        sched_period: 0,
-        sched_util_min: 0,
-        sched_util_max: 0,
-    };
-    let length = size.min(std::mem::size_of::<SchedAttr>());
-    // SAFETY: attr is initialized repr(C) data and length is bounded to it.
-    let bytes =
-        unsafe { std::slice::from_raw_parts((&attr as *const SchedAttr).cast::<u8>(), length) };
-    match memory.write_exact(args[1], bytes) {
-        Ok(()) => 0,
-        Err(_) => negative_errno(libc::EFAULT),
-    }
+    host_scheduling_call(
+        libc::SYS_ioprio_set,
+        [args[0] as usize, who, args[2] as usize, 0],
+    )
 }
 
 // TODO-HUMAN-REVIEW(PR-180): Review virtual-TID random stream separation.
@@ -23338,11 +23425,6 @@ pub(crate) fn native_loaded_state(cwd: &std::path::Path) -> LoadedStaticElf {
         capability_bounding: GUEST_CAPABILITY_MASK,
         capability_ambient: 0,
         dumpable: true,
-        nice: 0,
-        sched_policy: libc::SCHED_OTHER,
-        sched_priority: 0,
-        sched_reset_on_fork: false,
-        ioprio: 0,
         process_signals: Arc::new(std::sync::Mutex::new(ProcessSignalState::default())),
         signal_transaction: Default::default(),
         thread_signals: SharedThreadSignalState::default(),
@@ -23353,6 +23435,7 @@ pub(crate) fn native_loaded_state(cwd: &std::path::Path) -> LoadedStaticElf {
         files: std::collections::BTreeMap::new(),
         file_retirement: crate::elf::FileRetirement::default(),
         signal_refusal: None,
+        scheduling_refusal: None,
         pipe_owners: Default::default(),
         fd_entry_ids: std::collections::BTreeMap::new(),
         epoll_domain: Default::default(),
@@ -61951,150 +62034,358 @@ mod tests {
         }
     }
 
-    #[test]
-    fn priority_and_scheduler_queries_round_trip_guest_persona() {
-        const PARAM: u64 = 0x100;
-        const ATTR: u64 = 0x200;
-        // ioprio encoding (whoami=PROCESS, class shift, IDLE class).
-        const IOPRIO_WHO_PROCESS: u64 = 1;
-        const IOPRIO_CLASS_SHIFT: u32 = 13;
-        const IOPRIO_CLASS_IDLE: u64 = 3;
+    /// The host's own answer to a scheduling call, for comparison.
+    fn host_answer(number: libc::c_long, args: [usize; 4]) -> i64 {
+        host_scheduling_call(number, args)
+    }
 
-        let root = TestDir::new();
-        let mut state = test_state(&root.0);
-        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_getpriority,
-                [libc::PRIO_PROCESS as u64, 0, 0, 0, 0, 0],
-            ),
-            20
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_setpriority,
-                [libc::PRIO_PROCESS as u64, 0, 1, 0, 0, 0],
-            ),
-            0
-        );
-        assert_eq!(state.nice, 1);
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_getpriority,
-                [libc::PRIO_PROCESS as u64, 0, 0, 0, 0, 0],
-            ),
-            19
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_ioprio_get,
-                [IOPRIO_WHO_PROCESS, 0, 0, 0, 0, 0],
-            ),
-            0
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_ioprio_set,
-                [
-                    IOPRIO_WHO_PROCESS,
-                    0,
-                    IOPRIO_CLASS_IDLE << IOPRIO_CLASS_SHIFT,
-                    0,
-                    0,
-                    0,
-                ],
-            ),
-            0
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_sched_getscheduler,
-                [0, 0, 0, 0, 0, 0],
-            ),
-            i64::from(libc::SCHED_OTHER)
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_sched_getparam,
-                [0, PARAM, 0, 0, 0, 0],
-            ),
-            0
-        );
-        assert_eq!(
-            read_struct::<libc::sched_param>(&memory, PARAM).sched_priority,
-            0
-        );
-        for size in [0, 47, PAGE_SIZE + 1] {
+    /// A 48-byte `struct sched_attr` (`SCHED_ATTR_SIZE_VER0`): size, policy,
+    /// flags, nice and priority; the deadline fields are zero.
+    fn sched_attr_bytes(size: u32, policy: u32, nice: i32) -> [u8; 48] {
+        let mut bytes = [0; 48];
+        bytes[0..4].copy_from_slice(&size.to_ne_bytes());
+        bytes[4..8].copy_from_slice(&policy.to_ne_bytes());
+        bytes[16..20].copy_from_slice(&nice.to_ne_bytes());
+        bytes
+    }
+
+    /// Every scheduling, priority and I/O-priority call for the calling task
+    /// reaches the host for the calling host thread: each answer is the
+    /// host's own, and each change shows in the host's own query. The calls
+    /// run on a thread of their own, whose scheduling state they change.
+    #[test]
+    fn scheduling_calls_for_the_calling_task_reach_the_host() {
+        std::thread::spawn(|| {
+            const PARAM: u64 = 0x100;
+            const ATTR: u64 = 0x200;
+            const UNMAPPED: u64 = 0x10_0000;
+            const IOPRIO_CLASS_BE_LEVEL_7: u64 = (2 << 13) | 7;
+            let root = TestDir::new();
+            let mut state = test_state(&root.0);
+            let tid = state.tid as u64;
+            let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+            let prio_process = libc::PRIO_PROCESS as usize;
+            let host_raw_priority = || host_answer(libc::SYS_getpriority, [prio_process, 0, 0, 0]);
+
+            // Priority: the raw (20 - nice) answer, and a lowered nice value.
+            let raw = host_raw_priority();
+            assert!((1..=40).contains(&raw), "{raw}");
+            for who in [0, tid] {
+                assert_eq!(
+                    syscall_result(
+                        &mut memory,
+                        &mut state,
+                        libc::SYS_getpriority,
+                        [libc::PRIO_PROCESS as u64, who, 0, 0, 0, 0],
+                    ),
+                    raw
+                );
+            }
+            let nice = (20 - raw + 1).min(19);
+            for who in [0, tid] {
+                assert_eq!(
+                    syscall_result(
+                        &mut memory,
+                        &mut state,
+                        libc::SYS_setpriority,
+                        [libc::PRIO_PROCESS as u64, who, nice as u64, 0, 0, 0],
+                    ),
+                    0
+                );
+                assert_eq!(host_raw_priority(), 20 - nice);
+            }
+            // A negative who names no task; the host answers it.
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_getpriority,
+                    [libc::PRIO_PROCESS as u64, u64::MAX, 0, 0, 0, 0],
+                ),
+                host_answer(libc::SYS_getpriority, [prio_process, usize::MAX, 0, 0])
+            );
+
+            // Policy and parameter.
+            memory.write(PARAM, &0_i32.to_ne_bytes()).unwrap();
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_sched_getscheduler,
+                    [0; 6],
+                ),
+                host_answer(libc::SYS_sched_getscheduler, [0; 4])
+            );
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_sched_setscheduler,
+                    [tid, libc::SCHED_BATCH as u64, PARAM, 0, 0, 0],
+                ),
+                0
+            );
+            assert_eq!(
+                host_answer(libc::SYS_sched_getscheduler, [0; 4]),
+                i64::from(libc::SCHED_BATCH)
+            );
+            for (policy, param, expected) in [
+                (999, PARAM, negative_errno(libc::EINVAL)),
+                (libc::SCHED_BATCH as u64, 0, negative_errno(libc::EINVAL)),
+                (
+                    libc::SCHED_BATCH as u64,
+                    UNMAPPED,
+                    negative_errno(libc::EFAULT),
+                ),
+            ] {
+                assert_eq!(
+                    syscall_result(
+                        &mut memory,
+                        &mut state,
+                        libc::SYS_sched_setscheduler,
+                        [0, policy, param, 0, 0, 0],
+                    ),
+                    expected,
+                    "policy {policy} param {param:#x}"
+                );
+            }
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_sched_getscheduler,
+                    [u64::MAX, 0, 0, 0, 0, 0],
+                ),
+                negative_errno(libc::EINVAL)
+            );
+            memory.write(PARAM, &7_i32.to_ne_bytes()).unwrap();
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_sched_getparam,
+                    [0, PARAM, 0, 0, 0, 0],
+                ),
+                0
+            );
+            assert_eq!(read_struct::<libc::c_int>(&memory, PARAM), 0);
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_sched_getparam,
+                    [0, 0, 0, 0, 0, 0],
+                ),
+                negative_errno(libc::EINVAL)
+            );
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_sched_setparam,
+                    [0, PARAM, 0, 0, 0, 0],
+                ),
+                0
+            );
+
+            // sched_getattr writes min(size, Linux's record size) bytes.
+            memory.write(ATTR, &[0xa5; 64]).unwrap();
             assert_eq!(
                 syscall_result(
                     &mut memory,
                     &mut state,
                     libc::SYS_sched_getattr,
-                    [0, ATTR, size, 0, 0, 0]
+                    [0, ATTR, 48, 0, 0, 0],
                 ),
-                negative_errno(libc::EINVAL)
+                0
             );
-        }
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_sched_getattr,
-                [999_999, ATTR, 48, 1, 0, 0]
-            ),
-            negative_errno(libc::EINVAL)
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_sched_getattr,
-                [999_999, ATTR, 48, 0, 0, 0]
-            ),
-            negative_errno(libc::ESRCH)
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_sched_getattr,
-                [0, ATTR, std::mem::size_of::<SchedAttr>() as u64, 0, 0, 0],
-            ),
-            0
-        );
-        let attr: SchedAttr = read_struct(&memory, ATTR);
-        assert_eq!(attr.size as usize, std::mem::size_of::<SchedAttr>());
-        assert_eq!(attr.sched_policy, libc::SCHED_OTHER as u32);
-        assert_eq!(attr.sched_priority, 0);
-        assert_eq!(attr.sched_nice, 1);
+            assert_eq!(read_struct::<u32>(&memory, ATTR), 48);
+            assert_eq!(
+                read_struct::<u32>(&memory, ATTR + 4),
+                libc::SCHED_BATCH as u32
+            );
+            assert_eq!(read_struct::<i32>(&memory, ATTR + 16), nice as i32);
+            assert_eq!(read_struct::<[u8; 16]>(&memory, ATTR + 48), [0xa5; 16]);
+            for size in [0, 47, PAGE_SIZE + 1] {
+                assert_eq!(
+                    syscall_result(
+                        &mut memory,
+                        &mut state,
+                        libc::SYS_sched_getattr,
+                        [0, ATTR, size, 0, 0, 0],
+                    ),
+                    negative_errno(libc::EINVAL),
+                    "size {size}"
+                );
+            }
 
-        memory.write(ATTR + 48, &[0xa5; 8]).unwrap();
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_sched_getattr,
-                [0, ATTR, 48, 0, 0, 0],
-            ),
-            0
-        );
-        let mut canary = [0; 8];
-        memory.read(ATTR + 48, &mut canary).unwrap();
-        assert_eq!(canary, [0xa5; 8]);
+            // sched_setattr, and its E2BIG answer, which rewrites the size.
+            memory
+                .write(
+                    ATTR,
+                    &sched_attr_bytes(48, libc::SCHED_OTHER as u32, nice as i32),
+                )
+                .unwrap();
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_sched_setattr,
+                    [0, ATTR, 0, 0, 0, 0],
+                ),
+                0
+            );
+            assert_eq!(
+                host_answer(libc::SYS_sched_getscheduler, [0; 4]),
+                i64::from(libc::SCHED_OTHER)
+            );
+            let mut host_record = sched_attr_bytes(1, libc::SCHED_OTHER as u32, nice as i32);
+            assert_eq!(
+                host_answer(
+                    libc::SYS_sched_setattr,
+                    [0, host_record.as_mut_ptr() as usize, 0, 0]
+                ),
+                negative_errno(libc::E2BIG)
+            );
+            memory
+                .write(
+                    ATTR,
+                    &sched_attr_bytes(1, libc::SCHED_OTHER as u32, nice as i32),
+                )
+                .unwrap();
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_sched_setattr,
+                    [0, ATTR, 0, 0, 0, 0],
+                ),
+                negative_errno(libc::E2BIG)
+            );
+            assert_eq!(
+                read_struct::<u32>(&memory, ATTR),
+                u32::from_ne_bytes(host_record[0..4].try_into().unwrap())
+            );
+
+            // I/O priority.
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_ioprio_get,
+                    [IOPRIO_WHO_PROCESS as u64, 0, 0, 0, 0, 0],
+                ),
+                host_answer(libc::SYS_ioprio_get, [IOPRIO_WHO_PROCESS as usize, 0, 0, 0])
+            );
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_ioprio_set,
+                    [
+                        IOPRIO_WHO_PROCESS as u64,
+                        tid,
+                        IOPRIO_CLASS_BE_LEVEL_7,
+                        0,
+                        0,
+                        0
+                    ],
+                ),
+                0
+            );
+            assert_eq!(
+                host_answer(libc::SYS_ioprio_get, [IOPRIO_WHO_PROCESS as usize, 0, 0, 0]),
+                IOPRIO_CLASS_BE_LEVEL_7 as i64
+            );
+
+            // Policy bounds.
+            for policy in [libc::SCHED_OTHER, libc::SCHED_FIFO, libc::SCHED_RR, 999] {
+                for number in [
+                    libc::SYS_sched_get_priority_min,
+                    libc::SYS_sched_get_priority_max,
+                ] {
+                    assert_eq!(
+                        syscall_result(
+                            &mut memory,
+                            &mut state,
+                            number,
+                            [policy as u64, 0, 0, 0, 0, 0],
+                        ),
+                        host_answer(number, [policy as usize, 0, 0, 0]),
+                        "syscall {number} policy {policy}"
+                    );
+                }
+            }
+            assert_eq!(state.scheduling_refusal, None);
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// A scheduling, priority or I/O-priority call for another task, a
+    /// process group or a user is refused with ENOSYS and the typed refusal
+    /// `UnsupportedOperation::Scheduling`, and changes nothing on the host:
+    /// setting the nice value of "every task of this user" leaves the
+    /// calling thread's own unchanged.
+    #[test]
+    fn scheduling_calls_for_other_tasks_are_typed_refusals() {
+        std::thread::spawn(|| {
+            const OTHER: u64 = 999_999;
+            let root = TestDir::new();
+            let memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+            let mut executor = ElfExecutor::new(test_state(&root.0), false);
+            let refusal = Some(reverie::UnsupportedRefusal::new(
+                reverie::UnsupportedOperation::Scheduling,
+                reverie::Errno::ENOSYS,
+                SCHEDULING_REFUSAL,
+            ));
+            let prio_process = libc::PRIO_PROCESS as u64;
+            let prio_pgrp = libc::PRIO_PGRP as u64;
+            let prio_user = libc::PRIO_USER as u64;
+            let ioprio_process = IOPRIO_WHO_PROCESS as u64;
+            let before = host_answer(libc::SYS_getpriority, [0; 4]);
+            for (number, args) in [
+                (libc::SYS_getpriority, [prio_process, OTHER, 0, 0, 0, 0]),
+                (libc::SYS_setpriority, [prio_process, OTHER, 19, 0, 0, 0]),
+                (libc::SYS_getpriority, [prio_pgrp, 0, 0, 0, 0, 0]),
+                (libc::SYS_setpriority, [prio_pgrp, 0, 19, 0, 0, 0]),
+                (libc::SYS_setpriority, [prio_user, 0, 19, 0, 0, 0]),
+                (libc::SYS_sched_getscheduler, [OTHER, 0, 0, 0, 0, 0]),
+                (libc::SYS_sched_setscheduler, [OTHER, 0, 0x100, 0, 0, 0]),
+                (libc::SYS_sched_getparam, [OTHER, 0x100, 0, 0, 0, 0]),
+                (libc::SYS_sched_setparam, [OTHER, 0x100, 0, 0, 0, 0]),
+                (libc::SYS_sched_getattr, [OTHER, 0x200, 48, 0, 0, 0]),
+                (libc::SYS_sched_setattr, [OTHER, 0x200, 0, 0, 0, 0]),
+                (libc::SYS_ioprio_get, [ioprio_process, OTHER, 0, 0, 0, 0]),
+                (libc::SYS_ioprio_get, [ioprio_process + 1, 0, 0, 0, 0, 0]),
+                (libc::SYS_ioprio_set, [ioprio_process + 2, 0, 0, 0, 0, 0]),
+            ] {
+                assert_eq!(
+                    executor.execute(&SyscallRequest::new(number as u64, args), &memory),
+                    negative_errno(libc::ENOSYS),
+                    "syscall {number} {args:?}"
+                );
+                assert_eq!(
+                    executor.take_unsupported_refusal(),
+                    refusal,
+                    "syscall {number} {args:?}"
+                );
+            }
+            assert_eq!(host_answer(libc::SYS_getpriority, [0; 4]), before);
+            assert_eq!(
+                executor.execute(
+                    &SyscallRequest::new(
+                        libc::SYS_getpriority as u64,
+                        [prio_process, 0, 0, 0, 0, 0]
+                    ),
+                    &memory
+                ),
+                before
+            );
+            assert_eq!(executor.take_unsupported_refusal(), None);
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]
@@ -67575,521 +67866,6 @@ mod tests {
             0,
             "setgroups must be a deterministic no-op success",
         );
-    }
-
-    #[test]
-    fn sched_priority_bounds_match_policy_class() {
-        for policy in [
-            libc::SCHED_OTHER,
-            libc::SCHED_BATCH,
-            libc::SCHED_IDLE,
-            SCHED_DEADLINE,
-            SCHED_EXT,
-        ] {
-            assert_eq!(sched_priority_bound(policy as u64, false), 0);
-            assert_eq!(sched_priority_bound(policy as u64, true), 0);
-        }
-        for policy in [libc::SCHED_FIFO, libc::SCHED_RR] {
-            assert_eq!(sched_priority_bound(policy as u64, false), 1);
-            assert_eq!(sched_priority_bound(policy as u64, true), 99);
-        }
-        assert_eq!(
-            sched_priority_bound(999, true),
-            negative_errno(libc::EINVAL)
-        );
-        assert_eq!(sched_priority_bound(1_u64 << 32, true), 0);
-    }
-
-    #[test]
-    fn scheduler_syscalls_validate_and_round_trip_virtual_state() {
-        const PARAM: u64 = 0x100;
-        const OUTPUT: u64 = 0x200;
-
-        let dir = TestDir::new();
-        let mut state = test_state(&dir.0);
-        let mut memory = GuestMemory::new(0, 0x1000).unwrap();
-
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_sched_getscheduler,
-                [0, 0, 0, 0, 0, 0]
-            ),
-            i64::from(libc::SCHED_OTHER)
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_sched_getscheduler,
-                [u64::MAX, 0, 0, 0, 0, 0]
-            ),
-            negative_errno(libc::EINVAL)
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_sched_getscheduler,
-                [999_999, 0, 0, 0, 0, 0]
-            ),
-            negative_errno(libc::ESRCH)
-        );
-
-        for number in [libc::SYS_sched_setscheduler, libc::SYS_sched_setparam] {
-            assert_eq!(
-                syscall_result(
-                    &mut memory,
-                    &mut state,
-                    number,
-                    [999_999, libc::SCHED_OTHER as u64, 0, 0, 0, 0]
-                ),
-                negative_errno(libc::EINVAL)
-            );
-        }
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_sched_getparam,
-                [999_999, 0, 0, 0, 0, 0]
-            ),
-            negative_errno(libc::EINVAL)
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_sched_setscheduler,
-                [999_999, libc::SCHED_OTHER as u64, 0x2000, 0, 0, 0]
-            ),
-            negative_errno(libc::EFAULT)
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_sched_setparam,
-                [999_999, 0x2000, 0, 0, 0, 0]
-            ),
-            negative_errno(libc::EFAULT)
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_sched_setscheduler,
-                [0, 12_345, 0x2000, 0, 0, 0]
-            ),
-            negative_errno(libc::EFAULT)
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_sched_setscheduler,
-                [0, u64::MAX, 0x2000, 0, 0, 0]
-            ),
-            negative_errno(libc::EINVAL)
-        );
-
-        for number in [libc::SYS_sched_setscheduler, libc::SYS_sched_setparam] {
-            assert_eq!(
-                syscall_result(
-                    &mut memory,
-                    &mut state,
-                    number,
-                    [0, libc::SCHED_OTHER as u64, 0, 0, 0, 0]
-                ),
-                negative_errno(libc::EINVAL)
-            );
-        }
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_sched_setscheduler,
-                [0, libc::SCHED_OTHER as u64, 0x2000, 0, 0, 0]
-            ),
-            negative_errno(libc::EFAULT)
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_sched_setparam,
-                [0, 0x2000, 0, 0, 0, 0]
-            ),
-            negative_errno(libc::EFAULT)
-        );
-        {
-            let number = libc::SYS_sched_getparam;
-            assert_eq!(
-                syscall_result(&mut memory, &mut state, number, [0, 0, 0, 0, 0, 0]),
-                negative_errno(libc::EINVAL)
-            );
-            assert_eq!(
-                syscall_result(&mut memory, &mut state, number, [0, 0x2000, 0, 0, 0, 0]),
-                negative_errno(libc::EFAULT)
-            );
-        }
-
-        memory.write(PARAM, &1_i32.to_ne_bytes()).unwrap();
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_sched_setscheduler,
-                [0, libc::SCHED_OTHER as u64, PARAM, 0, 0, 0]
-            ),
-            negative_errno(libc::EINVAL)
-        );
-        memory.write(PARAM, &0_i32.to_ne_bytes()).unwrap();
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_sched_setscheduler,
-                [0, libc::SCHED_FIFO as u64, PARAM, 0, 0, 0]
-            ),
-            negative_errno(libc::EINVAL)
-        );
-        memory.write(PARAM, &1_i32.to_ne_bytes()).unwrap();
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_sched_setscheduler,
-                [
-                    0,
-                    (libc::SCHED_FIFO | SCHED_RESET_ON_FORK) as u64,
-                    PARAM,
-                    0,
-                    0,
-                    0
-                ]
-            ),
-            0
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_sched_getscheduler,
-                [0, 0, 0, 0, 0, 0]
-            ),
-            i64::from(libc::SCHED_FIFO | SCHED_RESET_ON_FORK)
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_sched_getparam,
-                [0, OUTPUT, 0, 0, 0, 0]
-            ),
-            0
-        );
-        let mut output = [0; std::mem::size_of::<i32>()];
-        memory.read(OUTPUT, &mut output).unwrap();
-        assert_eq!(i32::from_ne_bytes(output), 1);
-
-        memory.write(PARAM, &2_i32.to_ne_bytes()).unwrap();
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_sched_setparam,
-                [0, PARAM, 0, 0, 0, 0]
-            ),
-            0
-        );
-        assert_eq!(state.sched_priority, 2);
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_sched_getparam,
-                [0, OUTPUT, 0, 0, 0, 0]
-            ),
-            0
-        );
-        memory.read(OUTPUT, &mut output).unwrap();
-        assert_eq!(i32::from_ne_bytes(output), 2);
-        memory.write(PARAM, &0_i32.to_ne_bytes()).unwrap();
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_sched_setscheduler,
-                [0, SCHED_DEADLINE as u64, PARAM, 0, 0, 0]
-            ),
-            negative_errno(libc::EINVAL)
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_sched_setscheduler,
-                [0, 12_345, PARAM, 0, 0, 0]
-            ),
-            negative_errno(libc::EINVAL)
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_sched_setscheduler,
-                [0, 1_u64 << 32, PARAM, 0, 0, 0]
-            ),
-            0
-        );
-        assert_eq!(state.sched_policy, libc::SCHED_OTHER);
-    }
-
-    #[test]
-    fn scheduler_and_ioprio_state_follow_fork_and_exec_rules() {
-        let dir = TestDir::new();
-        let mut state = test_state(&dir.0);
-        state.nice = -7;
-        state.sched_policy = libc::SCHED_FIFO;
-        state.sched_priority = 7;
-        state.sched_reset_on_fork = true;
-        state.ioprio = (IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT) | 4;
-
-        let child = state.try_clone_for_fork(2).unwrap();
-        assert_eq!(child.nice, -7);
-        assert_eq!(child.sched_policy, libc::SCHED_OTHER);
-        assert_eq!(child.sched_priority, 0);
-        assert!(!child.sched_reset_on_fork);
-        assert_eq!(child.ioprio, state.ioprio);
-
-        state.sched_reset_on_fork = false;
-        let child = state.try_clone_for_fork(3).unwrap();
-        assert_eq!(child.sched_policy, libc::SCHED_FIFO);
-        assert_eq!(child.sched_priority, 7);
-        assert!(!child.sched_reset_on_fork);
-        assert_eq!(child.ioprio, state.ioprio);
-
-        state.ioprio = 1 << 3;
-        let child = state.try_clone_for_fork(4).unwrap();
-        assert_eq!(child.ioprio, 0);
-        assert_eq!(state.ioprio, 1 << 3);
-
-        state.sched_policy = libc::SCHED_RR;
-        state.sched_priority = 9;
-        state.sched_reset_on_fork = true;
-        let expected_ioprio = state.ioprio;
-        let mut after_exec = test_state(&dir.0);
-        after_exec.inherit_process_state(state);
-        assert_eq!(after_exec.nice, -7);
-        assert_eq!(after_exec.sched_policy, libc::SCHED_RR);
-        assert_eq!(after_exec.sched_priority, 9);
-        assert!(after_exec.sched_reset_on_fork);
-        assert_eq!(after_exec.ioprio, expected_ioprio);
-    }
-
-    #[test]
-    fn ioprio_syscalls_validate_and_round_trip_virtual_state() {
-        let dir = TestDir::new();
-        let mut state = test_state(&dir.0);
-        let mut memory = GuestMemory::new(0, 0x1000).unwrap();
-        let pid = state.pid as u64;
-
-        for (which, who, expected) in [
-            (IOPRIO_WHO_PROCESS, 0, 0),
-            (
-                IOPRIO_WHO_PGRP,
-                pid,
-                (IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT) | 4,
-            ),
-            (
-                IOPRIO_WHO_USER,
-                0,
-                (IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT) | 4,
-            ),
-        ] {
-            assert_eq!(
-                syscall_result(
-                    &mut memory,
-                    &mut state,
-                    libc::SYS_ioprio_get,
-                    [which as u64, who, 0, 0, 0, 0]
-                ),
-                i64::from(expected)
-            );
-        }
-
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_ioprio_get,
-                [(1_u64 << 32) | IOPRIO_WHO_PROCESS as u64, 0, 0, 0, 0, 0]
-            ),
-            0
-        );
-        state.sched_policy = libc::SCHED_IDLE;
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_ioprio_get,
-                [IOPRIO_WHO_PGRP as u64, 0, 0, 0, 0, 0]
-            ),
-            i64::from((IOPRIO_CLASS_IDLE << IOPRIO_CLASS_SHIFT) | 4)
-        );
-        state.sched_policy = libc::SCHED_OTHER;
-
-        let best_effort = (IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT) | 4;
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_ioprio_set,
-                [
-                    IOPRIO_WHO_PROCESS as u64,
-                    0,
-                    (1_u64 << 32) | best_effort as u64,
-                    0,
-                    0,
-                    0
-                ]
-            ),
-            0
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_ioprio_get,
-                [IOPRIO_WHO_PROCESS as u64, pid, 0, 0, 0, 0]
-            ),
-            i64::from(best_effort)
-        );
-
-        let hinted_best_effort = best_effort | (1 << 3);
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_ioprio_set,
-                [
-                    IOPRIO_WHO_PROCESS as u64,
-                    0,
-                    hinted_best_effort as u64,
-                    0,
-                    0,
-                    0
-                ]
-            ),
-            0
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_ioprio_get,
-                [IOPRIO_WHO_PROCESS as u64, 0, 0, 0, 0, 0]
-            ),
-            i64::from(hinted_best_effort)
-        );
-
-        let hinted_none = 1 << 3;
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_ioprio_set,
-                [IOPRIO_WHO_PROCESS as u64, 0, hinted_none as u64, 0, 0, 0]
-            ),
-            0
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_ioprio_get,
-                [IOPRIO_WHO_PROCESS as u64, 0, 0, 0, 0, 0]
-            ),
-            i64::from(hinted_none)
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_ioprio_get,
-                [IOPRIO_WHO_PGRP as u64, 0, 0, 0, 0, 0]
-            ),
-            i64::from((IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT) | 4)
-        );
-
-        let idle = (IOPRIO_CLASS_IDLE << IOPRIO_CLASS_SHIFT) | 1;
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_ioprio_set,
-                [IOPRIO_WHO_PGRP as u64, 0, idle as u64, 0, 0, 0]
-            ),
-            0
-        );
-        assert_eq!(state.ioprio, idle);
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_ioprio_set,
-                [IOPRIO_WHO_USER as u64, 0, 0, 0, 0, 0]
-            ),
-            0
-        );
-        assert_eq!(state.ioprio, 0);
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_ioprio_get,
-                [IOPRIO_WHO_PGRP as u64, 0, 0, 0, 0, 0]
-            ),
-            i64::from((IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT) | 4)
-        );
-
-        for invalid_ioprio in [1_u64, 7_u64 << IOPRIO_CLASS_SHIFT] {
-            assert_eq!(
-                syscall_result(
-                    &mut memory,
-                    &mut state,
-                    libc::SYS_ioprio_set,
-                    [IOPRIO_WHO_PROCESS as u64, 999_999, invalid_ioprio, 0, 0, 0]
-                ),
-                negative_errno(libc::EINVAL)
-            );
-        }
-
-        for args in [
-            [99, 0, 0, 0, 0, 0],
-            [IOPRIO_WHO_PROCESS as u64, 999_999, 0, 0, 0, 0],
-            [IOPRIO_WHO_PROCESS as u64, 0, 1, 0, 0, 0],
-            [
-                IOPRIO_WHO_PROCESS as u64,
-                0,
-                7 << IOPRIO_CLASS_SHIFT,
-                0,
-                0,
-                0,
-            ],
-        ] {
-            let expected = if args[0] == IOPRIO_WHO_PROCESS as u64 && args[1] == 999_999 {
-                negative_errno(libc::ESRCH)
-            } else {
-                negative_errno(libc::EINVAL)
-            };
-            assert_eq!(
-                syscall_result(&mut memory, &mut state, libc::SYS_ioprio_set, args),
-                expected
-            );
-        }
     }
 
     #[test]
