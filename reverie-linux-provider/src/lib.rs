@@ -20,9 +20,10 @@
 //! it takes the issuing task and a `&mut` per-call context, whose type
 //! [`LinuxProvider::Context`] replaces `Memory` and must be `Send`. Since
 //! step E2d, [`ProviderOutcome`] is generic over the provider's
-//! [`LinuxProvider::Plan`]. An implementer therefore also needs the
-//! `reverie` crate, for its `#[reverie::provider]` attribute, or the
-//! `async_trait` crate directly, because this crate re-exports neither
-//! attribute.
+//! [`LinuxProvider::Plan`]. Since step E3b it has an `Interrupted` variant,
+//! so an exhaustive match on it needs an arm for that variant. Because
+//! `execute` is `async`, an implementer also needs the `reverie` crate, for
+//! its `#[reverie::provider]` attribute, or the `async_trait` crate directly;
+//! this crate re-exports neither attribute.
 
 pub use reverie::provider::*;

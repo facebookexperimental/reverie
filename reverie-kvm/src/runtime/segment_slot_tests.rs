@@ -464,3 +464,46 @@ fn a_startup_callback_base_does_not_reach_the_next_run_on_the_same_backend() {
          (the first run's staged base was {STARTUP_STALE_FS:#x})"
     );
 }
+
+/// A provider that breaks KVM's contract with an outcome only a host-kernel
+/// provider produces: a call that a signal stopped before it ran.
+struct InterruptedCall;
+
+#[reverie::provider]
+impl LinuxProvider for InterruptedCall {
+    type Context = GuestMemory;
+    type Plan = crate::executor::StagedProcessAction;
+    type Error = crate::Error;
+
+    async fn execute(
+        &mut self,
+        _task: reverie::Tid,
+        _: &ProviderRequest,
+        _: &mut GuestMemory,
+    ) -> Result<ProviderOutcome> {
+        Ok(ProviderOutcome::Interrupted)
+    }
+}
+
+impl LinuxEmuSignalControl for InterruptedCall {}
+
+impl LinuxEmuMemoryMap for InterruptedCall {}
+
+impl GuestSyscallExecutor<crate::StraceTool> for InterruptedCall {
+    fn read_clock(&self) -> Result<u64> {
+        panic!("the interrupted-call control requested a guest clock")
+    }
+}
+
+/// `KvmGuest::inject` treats `Interrupted` as a broken provider invariant:
+/// KVM's provider runs every call itself, so the handler ends with a run
+/// error rather than a fabricated `ERESTARTSYS`.
+#[test]
+fn an_interrupted_outcome_is_a_run_error_on_kvm() {
+    match inject_through(&mut InterruptedCall) {
+        HandlerOutcome::RuntimeError(Error::UnexpectedVcpuExit(message)) => {
+            assert!(message.contains("interrupted call"), "{message}")
+        }
+        _ => panic!("an Interrupted outcome must end the run on KVM"),
+    }
+}

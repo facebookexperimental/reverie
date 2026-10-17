@@ -18,6 +18,11 @@
 //! stop before running a different one, and the injected-trap frame. None of
 //! these is Linux semantics, so the provider passes only the request.
 //!
+//! [`Guest::inject_restartable`](reverie::Guest::inject_restartable) runs
+//! through it too. A call that a signal stopped before it ran comes back as
+//! [`ProviderOutcome::Interrupted`], and [`restartable`] decides from the
+//! outcome whether to run the call again.
+//!
 //! The provider is zero-sized and built at each call, so the call is
 //! dispatched statically. `execute`'s future is still boxed, because the
 //! trait is an `async_trait`: dyn compatibility is what lets KVM call its
@@ -55,24 +60,30 @@ impl<L: Tool + 'static> LinuxProvider for HostLinux<L> {
     type Plan = Infallible;
     type Error = TraceError;
 
-    /// Runs `request` in `cx`, the stopped tracee, and reports its raw Linux
-    /// result.
+    /// Runs `request` in `cx`, the stopped tracee, and reports its outcome:
+    /// [`ProviderOutcome::Interrupted`] when a signal stopped the call before
+    /// it ran, otherwise its raw Linux result.
     ///
-    /// `task` is the tracee's tid: the only caller passes `cx`'s own tid,
-    /// so the two are equal by construction. Debug builds assert it.
+    /// `task` must be the tracee's own tid, as the trait requires of a
+    /// provider bound to one task; anything else is a broken backend
+    /// invariant and returns `Err`. The only caller passes `cx`'s own tid.
     async fn execute(
         &mut self,
         task: Tid,
         request: &SyscallRequest,
         cx: &mut TracedTask<L>,
     ) -> Result<ProviderOutcome<Infallible>, TraceError> {
-        debug_assert_eq!(
-            task, cx.tid,
-            "HostLinux runs only the issuing tracee's calls"
-        );
+        if task != cx.tid {
+            tracing::error!(
+                "HostLinux was asked to run a call for tid {} in tracee {}",
+                task,
+                cx.tid
+            );
+            return Err(Errno::EPROTO.into());
+        }
         let (nr, args) = parts(request)?;
         let result = cx.inner_inject(nr, args).await?;
-        Ok(ProviderOutcome::Return(encode(result)))
+        Ok(classify(result, cx.last_injection_ran))
     }
 }
 
@@ -117,16 +128,74 @@ fn decode(raw: i64) -> Result<i64, Errno> {
     Errno::from_ret(raw as usize).map(|value| value as i64)
 }
 
+/// The outcome of an injection whose result is `result`, where `ran` is
+/// `status_to_result`'s record of whether the syscall ran
+/// (`TracedTask::last_injection_ran`, set for this injection).
+///
+/// `status_to_result` clears `ran` only where it reports a call that a signal
+/// stopped before it ran, and then its result is always `ERESTARTSYS`. The
+/// only later rewrites of an injection's result, at the two places where
+/// `untraced_syscall_with` finds a guest seccomp filter's trap, make it
+/// `ENOSYS`, a call that did not run either but was not interrupted. So a
+/// result of `ERESTARTSYS` with `ran` clear is exactly an interrupted call.
+/// Every other result, including a call that ran and returned `EINTR` or
+/// `ERESTARTSYS`, is a `Return`.
+fn classify(result: Result<i64, Errno>, ran: bool) -> ProviderOutcome<Infallible> {
+    if !ran && result == Err(Errno::ERESTARTSYS) {
+        ProviderOutcome::Interrupted
+    } else {
+        ProviderOutcome::Return(encode(result))
+    }
+}
+
 /// The `Guest::inject` result for `outcome`. `HostLinux` produces only
-/// [`ProviderOutcome::Return`]; any other outcome is a broken invariant and
-/// ends the run, as a trace error does.
+/// [`ProviderOutcome::Return`] and [`ProviderOutcome::Interrupted`]. An
+/// interrupted call is `ERESTARTSYS`, as `Guest::inject` documents for a call
+/// that a signal stopped before it ran. Any other outcome is a broken
+/// invariant and ends the run, as a trace error does.
 pub(super) fn guest_result(
     outcome: ProviderOutcome<Infallible>,
 ) -> Result<Result<i64, Errno>, TraceError> {
     match outcome {
         ProviderOutcome::Return(raw) => Ok(decode(raw)),
+        ProviderOutcome::Interrupted => Ok(Err(Errno::ERESTARTSYS)),
         _ => Err(Errno::EPROTO.into()),
     }
+}
+
+/// What `Guest::inject_restartable` does with one injection's outcome.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Restart {
+    /// Inject the call again.
+    Retry,
+    /// Return this result to the Tool.
+    Return(Result<i64, Errno>),
+}
+
+/// `Guest::inject_restartable`'s decision for `outcome`, where `held` says
+/// whether a signal is held for delivery as the guest resumes
+/// (`pending_signal`), read after the injection.
+///
+/// - An interrupted call did not run, so it is retried.
+/// - A call that ran and returned `EINTR` or `ERESTARTSYS` returns that code
+///   when a signal is held: Linux restarts the guest's syscall, or fails it
+///   with `EINTR`, as the held signal is delivered
+///   (<https://github.com/rrnewton/reverie/issues/998>). Without a held
+///   signal it is retried.
+/// - Every other result is returned.
+pub(super) fn restartable(
+    outcome: ProviderOutcome<Infallible>,
+    held: bool,
+) -> Result<Restart, TraceError> {
+    Ok(match outcome {
+        ProviderOutcome::Interrupted => Restart::Retry,
+        ProviderOutcome::Return(raw) => match decode(raw) {
+            Err(error @ (Errno::EINTR | Errno::ERESTARTSYS)) if held => Restart::Return(Err(error)),
+            Err(Errno::EINTR | Errno::ERESTARTSYS) => Restart::Retry,
+            result => Restart::Return(result),
+        },
+        _ => return Err(Errno::EPROTO.into()),
+    })
 }
 
 #[cfg(test)]
@@ -180,12 +249,16 @@ mod tests {
         assert!(parts(&SyscallRequest::new(u64::MAX, [0; 6])).is_err());
     }
 
-    /// Only `Return` is a `Guest::inject` result.
+    /// Only `Return` and `Interrupted` are `Guest::inject` results.
     #[test]
-    fn only_a_return_outcome_is_a_guest_result() {
+    fn only_a_return_or_interrupted_outcome_is_a_guest_result() {
         assert_eq!(
             guest_result(ProviderOutcome::Return(-38)).unwrap(),
             Err(Errno::ENOSYS)
+        );
+        assert_eq!(
+            guest_result(ProviderOutcome::Interrupted).unwrap(),
+            Err(Errno::ERESTARTSYS)
         );
         assert!(guest_result(ProviderOutcome::Cancelled).is_err());
         assert!(
@@ -202,5 +275,99 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    /// `Guest::inject_restartable`'s decision before provider step E3b,
+    /// from the injection's result, `TracedTask::last_injection_ran` and
+    /// whether a signal is held. It is copied from the loop it replaced.
+    fn decision_before_e3b(result: Result<i64, Errno>, ran: bool, held: bool) -> Restart {
+        match result {
+            Err(error @ (Errno::EINTR | Errno::ERESTARTSYS)) if ran && held => {
+                Restart::Return(Err(error))
+            }
+            Err(Errno::EINTR) | Err(Errno::ERESTARTSYS) => Restart::Retry,
+            result => Restart::Return(result),
+        }
+    }
+
+    /// Whether `status_to_result` and the seccomp-trap rewrite can produce
+    /// `result` with `ran`: a call that did not run reports `ERESTARTSYS`, or
+    /// `ENOSYS` after a guest seccomp trap (see `classify`).
+    fn reachable(result: Result<i64, Errno>, ran: bool) -> bool {
+        ran || result == Err(Errno::ERESTARTSYS) || result == Err(Errno::ENOSYS)
+    }
+
+    const RESULTS: [Result<i64, Errno>; 8] = [
+        Ok(0),
+        Ok(7),
+        Ok(i64::MAX),
+        Err(Errno::EINTR),
+        Err(Errno::ERESTARTSYS),
+        Err(Errno::ENOSYS),
+        Err(Errno::EAGAIN),
+        Err(Errno::ERESTARTNOHAND),
+    ];
+
+    /// The decision table of `inject_restartable`, row for row: for every
+    /// reachable result, `ran` and held-signal state, the outcome `classify`
+    /// reports leads `restartable` to the decision the loop made before E3b
+    /// from `last_injection_ran`, and `Guest::inject` returns the same
+    /// result as before.
+    #[test]
+    fn the_restart_decision_table_is_unchanged() {
+        let mut rows = 0;
+        for result in RESULTS {
+            for ran in [false, true] {
+                if !reachable(result, ran) {
+                    continue;
+                }
+                let outcome = classify(result, ran);
+                assert_eq!(
+                    guest_result(outcome).unwrap(),
+                    result,
+                    "{result:?} ran={ran}"
+                );
+                for held in [false, true] {
+                    assert_eq!(
+                        restartable(outcome, held).unwrap(),
+                        decision_before_e3b(result, ran, held),
+                        "{result:?} ran={ran} held={held}"
+                    );
+                    rows += 1;
+                }
+            }
+        }
+        // 8 results that ran and 2 that did not, each with and without a held signal.
+        assert_eq!(rows, 20);
+    }
+
+    /// Only an `ERESTARTSYS` from a call that did not run is `Interrupted`.
+    /// The same code from a call that ran stays a `Return`, as does the
+    /// `ENOSYS` of a call a guest seccomp filter trapped.
+    #[test]
+    fn only_a_call_that_did_not_run_is_interrupted() {
+        assert_eq!(
+            classify(Err(Errno::ERESTARTSYS), false),
+            ProviderOutcome::Interrupted
+        );
+        assert_eq!(
+            classify(Err(Errno::ERESTARTSYS), true),
+            ProviderOutcome::Return(-512)
+        );
+        assert_eq!(
+            classify(Err(Errno::EINTR), true),
+            ProviderOutcome::Return(-4)
+        );
+        assert_eq!(
+            classify(Err(Errno::ENOSYS), false),
+            ProviderOutcome::Return(-38)
+        );
+        assert_eq!(classify(Ok(3), true), ProviderOutcome::Return(3));
+    }
+
+    /// `restartable` refuses an outcome `HostLinux` never produces.
+    #[test]
+    fn restartable_refuses_an_outcome_host_linux_never_produces() {
+        assert!(restartable(ProviderOutcome::Cancelled, true).is_err());
     }
 }

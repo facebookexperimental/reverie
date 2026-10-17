@@ -45,7 +45,9 @@
 //! The [`provider`](mod@provider) module defines the interface of the Linux
 //! syscall provider beneath a backend's `Guest::inject`: the
 //! [`provider::LinuxProvider`] trait and the memory interfaces it uses. Today
-//! only the KVM backend implements and calls it; see the module documentation.
+//! the KVM backend, whose syscall executor is the provider, and the ptrace
+//! backend, whose provider is the host kernel, implement and call it; see the
+//! module documentation.
 //!
 //! For examples of usage, please see the [`reverie-examples`][] folder.
 //!

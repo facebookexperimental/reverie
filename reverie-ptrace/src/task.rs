@@ -2533,8 +2533,9 @@ pub struct TracedTask<L: Tool> {
 
     /// Whether the syscall of the injection that last completed ran. False
     /// when `status_to_result` reported that a signal stopped it before its
-    /// `syscall` instruction (`-ERESTARTSYS`, not run). Read by
-    /// `Guest::inject_restartable`.
+    /// `syscall` instruction (`-ERESTARTSYS`, not run). Read only by
+    /// `HostLinux::execute`, right after its injection, which reports such a
+    /// call as `ProviderOutcome::Interrupted` (`host_linux::classify`).
     last_injection_ran: bool,
 
     /// Whether `Tool::handle_signal_event` is running (`report_signal`).
@@ -8508,15 +8509,28 @@ impl<L: Tool + 'static> TracedTask<L> {
     ///
     /// [`LinuxProvider`]: reverie::provider::LinuxProvider
     async fn do_inject(&mut self, nr: Sysno, args: SyscallArgs) -> Result<i64, Errno> {
+        let outcome = self.do_inject_outcome(nr, args).await;
+        match host_linux::guest_result(outcome) {
+            Ok(ret) => ret,
+            Err(err) => self.abort(Err(err)).await,
+        }
+    }
+
+    /// The provider outcome of one injection; a broken invariant ends the
+    /// run here, as in [`Self::do_inject`].
+    async fn do_inject_outcome(
+        &mut self,
+        nr: Sysno,
+        args: SyscallArgs,
+    ) -> reverie::provider::ProviderOutcome<std::convert::Infallible> {
         use reverie::provider::LinuxProvider;
         let request = host_linux::request(nr, args);
         let tid = self.tid();
-        let outcome = host_linux::HostLinux::<L>::new()
+        match host_linux::HostLinux::<L>::new()
             .execute(tid, &request, self)
             .await
-            .and_then(host_linux::guest_result);
-        match outcome {
-            Ok(ret) => ret,
+        {
+            Ok(outcome) => outcome,
             Err(err) => self.abort(Err(err)).await,
         }
     }
@@ -9236,17 +9250,16 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
     /// syscall or fails it with `EINTR` by its handler. Without a held
     /// signal the code is retried as before, for example after a group stop
     /// or a signal the tracer consumes. A syscall that a signal stopped
-    /// before it ran is retried.
+    /// before it ran (the provider's `Interrupted` outcome) is retried. The
+    /// decision is `host_linux::restartable`.
     async fn inject_restartable<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
+        let (nr, args) = syscall.into_parts();
         loop {
-            match self.inject(syscall).await {
-                Err(error @ (Errno::EINTR | Errno::ERESTARTSYS))
-                    if self.last_injection_ran && self.pending_signal.is_some() =>
-                {
-                    return Err(error);
-                }
-                Err(Errno::EINTR) | Err(Errno::ERESTARTSYS) => continue,
-                result => return result,
+            let outcome = self.do_inject_outcome(nr, args).await;
+            match host_linux::restartable(outcome, self.pending_signal.is_some()) {
+                Ok(host_linux::Restart::Retry) => continue,
+                Ok(host_linux::Restart::Return(result)) => return result,
+                Err(err) => self.abort(Err(err)).await,
             }
         }
     }

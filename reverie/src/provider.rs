@@ -17,12 +17,14 @@
 //! epic <https://github.com/rrnewton/hermit/issues/4492>) as its own crate,
 //! reverie-linux-provider, which now only re-exports this module. It names no
 //! backend: reverie-kvm implements the memory traits for its guest arena and
-//! fixes the associated types, and today's syscall executor implements
-//! [`LinuxProvider`].
+//! fixes the associated types; reverie-kvm's syscall executor and
+//! reverie-ptrace's crate-private `HostLinux` implement [`LinuxProvider`].
 //!
-//! Being in core does not yet make it part of every backend's contract.
-//! reverie-kvm is still its only implementer and its only caller; the other
-//! backends (ptrace, DBT, in-guest/LiteInst and SaBRe) do not route
+//! Being in core does not yet make it part of every backend's contract. Two
+//! backends implement and call it. In reverie-kvm the syscall executor is the
+//! provider. In reverie-ptrace the provider is the host kernel: a
+//! crate-private `HostLinux` runs each injected call in the stopped tracee.
+//! The other backends (DBT, in-guest/LiteInst and SaBRe) do not route
 //! `Guest::inject` through it yet, and [`Backend`](crate::Backend) does not
 //! carry a provider. Those are later steps, tracked in
 //! <https://github.com/rrnewton/hermit/issues/4485>.
@@ -91,7 +93,8 @@ pub use request::SyscallRequest;
 ///
 /// [`ProviderOutcome::Cancelled`] and [`ProviderOutcome::ThreadGroupExited`]
 /// produce no syscall result at all: the call never returns to the issuing
-/// task. The remaining outcome, an exit, is added in a later step. Until then
+/// task. [`ProviderOutcome::Interrupted`] produces none either: the call did
+/// not run. The remaining outcome, an exit, is added in a later step. Until then
 /// an implementation reports it to its backend outside this trait, after
 /// `execute` returns `Return` with the call's raw result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,6 +148,17 @@ pub enum ProviderOutcome<Plan> {
         /// The new base address.
         base: u64,
     },
+    /// A signal stopped the call before it ran. The call had no effect and
+    /// there is no result. The backend may run the call again, or report
+    /// the interruption to the Tool as `ERESTARTSYS`, which is what
+    /// [`Guest::inject`](crate::Guest::inject) documents for a call that a
+    /// signal stopped before it ran.
+    ///
+    /// A call that ran and returned `-EINTR` or `-ERESTARTSYS` is a
+    /// [`ProviderOutcome::Return`], not this. Only a provider whose kernel is
+    /// the host kernel produces it, where the guest task itself runs the call
+    /// and a signal can stop the task before the syscall instruction.
+    Interrupted,
 }
 
 /// A segment register whose base a task can set
@@ -196,10 +210,9 @@ pub trait LinuxProvider: Send + Sync {
     /// for exactly one [`LinuxProvider::execute`] call, as `&mut` so that the
     /// provider may drive it. A provider never keeps it past the call.
     ///
-    /// In reverie-kvm it is the guest memory arena. For a provider whose
-    /// kernel is the host kernel it would be the backend's handle on the
-    /// stopped guest task, such as ptrace's tracee and its stop-wait owner;
-    /// that provider does not exist yet.
+    /// In reverie-kvm it is the guest memory arena. In reverie-ptrace, whose
+    /// provider is the host kernel, it is the backend's handle on the
+    /// stopped guest task: the tracee, which also owns its stop-wait.
     ///
     /// It must be [`Send`] because [`LinuxProvider::execute`]'s future holds
     /// `&mut Self::Context` and must itself be `Send` (see the method's
@@ -258,6 +271,8 @@ pub trait LinuxProvider: Send + Sync {
     /// - `Ok(ProviderOutcome::Cancelled)` and
     ///   `Ok(ProviderOutcome::ThreadGroupExited { .. })` produce no syscall
     ///   result; see [`ProviderOutcome`].
+    /// - `Ok(ProviderOutcome::Interrupted)` is a call that did not run: a
+    ///   signal stopped it first.
     /// - `Err` is a broken invariant that ends the run; the backend must not
     ///   turn it into a guest-visible errno.
     /// - A request the provider does not implement is answered as the module

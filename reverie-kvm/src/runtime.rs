@@ -1857,6 +1857,16 @@ impl<T: Tool> Guest<T> for KvmGuest<'_, T> {
                 return std::future::pending().await;
             }
 
+            Ok(ProviderOutcome::Interrupted) => {
+                // Only a provider whose kernel is the host kernel can report
+                // a call that a signal stopped before it ran. KVM's provider
+                // runs every call itself and never reports one, so this is a
+                // broken invariant.
+                self.signal_handler(HandlerSignal::RuntimeError(Error::UnexpectedVcpuExit(
+                    "KVM provider reported an interrupted call".to_owned(),
+                )));
+                return std::future::pending().await;
+            }
             Ok(ProviderOutcome::Cancelled) => {
                 // Reuse the existing nonreturning cancellation disposition,
                 // including parked/dequeue ownership. No syscall result or
