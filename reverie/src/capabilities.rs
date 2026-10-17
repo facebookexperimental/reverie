@@ -140,10 +140,6 @@ pub struct BackendCapabilities {
     /// than treat its absence as a failed clone.
     pub defers_vfork_child_registration: bool,
 
-    /// The backend virtualizes the capability bounding set and ambient
-    /// capabilities that `prctl` reads and changes.
-    pub virtualizes_capability_prctls: bool,
-
     /// The backend implements guest-visible `madvise` semantics, so the tool
     /// may forward an `madvise` call to it.
     pub supports_madvise: bool,
@@ -240,7 +236,6 @@ impl BackendCapabilities {
         requires_thread_directed_process_signals: false,
         supports_parked_write_signal_interruption: true,
         defers_vfork_child_registration: false,
-        virtualizes_capability_prctls: false,
         supports_madvise: true,
         supports_madv_dontneed: true,
         reports_child_exit_publication: true,
@@ -314,7 +309,6 @@ impl BackendCapabilities {
         needs_killed_thread_rpc_cancellation: true,
         runs_exit_robust_list: false,
         defers_vfork_child_registration: true,
-        virtualizes_capability_prctls: true,
         supports_madvise: false,
         provides_process_signal_control: true,
         emulates_child_waits: true,
@@ -354,7 +348,6 @@ mod tests {
             "requires_thread_directed_process_signals": false,
             "supports_parked_write_signal_interruption": true,
             "defers_vfork_child_registration": false,
-            "virtualizes_capability_prctls": false,
             "supports_madvise": true,
             "supports_madv_dontneed": true,
             "reports_child_exit_publication": true,
@@ -460,7 +453,6 @@ mod tests {
                 "needs_killed_thread_rpc_cancellation": true,
                 "runs_exit_robust_list": false,
                 "defers_vfork_child_registration": true,
-                "virtualizes_capability_prctls": true,
                 "supports_madvise": false,
                 "provides_process_signal_control": true,
                 "emulates_child_waits": true,
