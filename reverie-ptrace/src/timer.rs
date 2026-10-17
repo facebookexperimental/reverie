@@ -132,8 +132,17 @@ pub const SKID_MARGIN_OVERRIDE_ENV: &str = "REVERIE_SKID_MARGIN_OVERRIDE";
 /// staged precise timer event leaves room for by default (see
 /// [`PmuConfig::stages`]). Measured on AMD family 1Ah, the latency was 43 ns
 /// at the median and 185 ns at the 99th percentile, and reached about 590 ns
-/// in a noisy hour (https://github.com/rrnewton/hermit/issues/3810).
-pub const DEFAULT_SKID_LATENCY_BUDGET_NS: u64 = 600;
+/// in a noisy hour (https://github.com/rrnewton/hermit/issues/3810). The
+/// tail grows with contention for the guest's core. For a loop retiring
+/// about 2.9 RCBs per ns, the largest second-stage skid in 64 to 96
+/// notifications was 134 RCBs (about 45 ns) unloaded, 823 (about 280 ns)
+/// with the SMT sibling thrashing memory, and 1,631 (about 560 ns) with three
+/// such tasks sharing the guest's CPU. In a full validation (Hermit
+/// 856eaf1e, 2026-10-17) the same guest overran the 2,000-RCB margin three
+/// times by 41 to 837 RCBs: notifications 0.7 to 0.95 µs late. 2,000 ns is
+/// about twice that. Only a guest retiring more than 1 RCB per ns
+/// (the skid margin over this budget) gets a margin above the skid margin.
+pub const DEFAULT_SKID_LATENCY_BUDGET_NS: u64 = 2_000;
 
 /// When set to a parseable `u64`, this env var replaces
 /// [`DEFAULT_SKID_LATENCY_BUDGET_NS`] for the whole process. `0` stages no
@@ -4296,17 +4305,17 @@ mod tests {
         assert_eq!(timer.event_margin, first);
 
         // The notification finds the guest 200 RCBs past the overflow, which
-        // it reached at 8 RCBs per ns.
+        // it reached at 2 RCBs per ns.
         let clock = clock_target - first + 200;
         let rcbs = clock - stage.programmed_clock;
-        assert_eq!(rcbs % 8, 0);
-        let margin = (8 * config.skid_latency_budget_ns()).clamp(skid, first);
+        assert_eq!(rcbs % 2, 0);
+        let margin = (2 * config.skid_latency_budget_ns()).clamp(skid, first);
         let remaining = clock_target - clock;
         assert!(
             margin + SINGLESTEP_TIMEOUT_RCBS < remaining,
             "the default latency budget leaves a second stage: {margin}"
         );
-        let sample_time = stage.programmed_ns + rcbs / 8;
+        let sample_time = stage.programmed_ns + rcbs / 2;
         assert_eq!(
             timer.rearm_second_stage(stage, clock, Some(sample_time)),
             Ok(true)
@@ -5635,15 +5644,21 @@ mod tests {
             DEFAULT_SKID_LATENCY_BUDGET_NS
         );
         assert_eq!(config.first_stage_margin(), LARGEST_TABLE_SKID_MARGIN);
-        // 8 RCBs per ns, the measured rate of a dense branch loop, for 600 ns.
+        // 2 RCBs per ns for 2,000 ns.
         assert_eq!(
-            config.second_stage_margin(8_000_000, Some(1_000_000)),
-            4_800
+            config.second_stage_margin(2_000_000, Some(1_000_000)),
+            4_000
         );
         // Rounded up.
         assert_eq!(
-            config.second_stage_margin(8_000_001, Some(1_000_000)),
-            4_801
+            config.second_stage_margin(2_000_001, Some(1_000_000)),
+            4_001
+        );
+        // 8 RCBs per ns, the measured rate of a dense branch loop, would need
+        // 16,000: no closer than the first stage.
+        assert_eq!(
+            config.second_stage_margin(8_000_000, Some(1_000_000)),
+            LARGEST_TABLE_SKID_MARGIN
         );
         // A low rate takes the skid margin, a high one the first stage's.
         assert_eq!(config.second_stage_margin(100_000, Some(1_000_000)), 2_000);
