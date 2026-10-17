@@ -2377,6 +2377,9 @@ struct TlsExecutableMapping {
 }
 const DIRECT_TLS_CENSUS_POLICY: &str =
     "installation_depth_named_getter_pt_load22_raw_loader_pointers_v1";
+// Separate from the standalone v1 contract: one observed native Detcore cohort.
+const DETCORE_DIRECT_TLS_CENSUS_POLICY: &str =
+    "detcore_e8_alloc241_named_getter_pt_load22_raw_loader_pointers_v2";
 
 /// Mandatory same-ELF Fixed selection, never a name/descriptor-only admission.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -16077,7 +16080,7 @@ const FIXED_OPTIMIZED_TLS_THUNK_EVENT_ARGUMENT_HEX: &str =
 const FIXED_OPTIMIZED_PATCH_ALLOC_DIAGNOSTIC_EVENT_ARGUMENT_HEX: &str = "41574156415453504889d34989f6ff1554a00a004885c074774c8b78204d85ff746e4989c4488d3dfc9a0a00e8ef330a004883b880000000007463498b542410498b0f498d76ff49f7de31c04889cf4801d7723e4801f772394c21f74989f84929d04901d8410f92c14981f801000002410f93c24508ca75194889c8f04d0fb1074889c1b80000000075c14889f8eb0231c04883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff2596a00a00";
 const FIXED_OPTIMIZED_TLS_THUNK_DIAGNOSTIC_EVENT_ARGUMENT_HEX: &str =
     "50488d3da0980a00e893310a00488d808000000059c3";
-// Only eleven whole observed cell-access recipes are accepted. The caller must
+// Only the enumerated whole observed cell-access recipes are accepted. The caller must
 // authenticate STT_TLS/zero-fill/module identity with fixed_tls_cell and the
 // descriptor/provider joins; a synthetic SymbolEvidence is not ELF admission.
 fn fixed_tls_cell_access_recipe(
@@ -16140,6 +16143,13 @@ fn fixed_tls_cell_access_recipe(
         ),
         ("fixed_tls_fn_once", 128) => (
             FIXED_OPTIMIZED_TLS_THUNK_DIAGNOSTIC_EVENT_ARGUMENT_HEX,
+            16,
+            &[(4, 8), (9, 13)],
+        ),
+        // Retained Detcore getter recipe, also searched at every executable
+        // byte start when proving its absence. This grants no new offset.
+        ("fixed_tls_fn_once", 0xe8) => (
+            "50488d3db86b3c00e883433600488d80e800000059c3",
             16,
             &[(4, 8), (9, 13)],
         ),
@@ -16422,10 +16432,106 @@ fn derive_direct_allocation_tls_evidence(
     })
 }
 
+fn detcore_direct_tls_source_context(
+    sources: Option<&VerifiedCompiledSources>,
+) -> Result<&VerifiedCompiledSources> {
+    let sources = sources.ok_or(
+        "Detcore direct allocation TLS proof requires independently verified compiled sources",
+    )?;
+    sources.require_image(DETCORE_ROOT)?;
+    Ok(sources)
+}
+
+fn derive_detcore_direct_allocation_tls_evidence(
+    elf: &Elf<'_>,
+    bytes: &[u8],
+    cell: &SymbolEvidence,
+    module: u64,
+    plt: u64,
+    allocation_bytes: &[u8],
+    sources: Option<&VerifiedCompiledSources>,
+) -> Result<DirectAllocationTlsEvidence> {
+    let sources = detcore_direct_tls_source_context(sources)?;
+    // The complete existing Detcore operation closure still binds every actual
+    // operand/callee. This absence route additionally requires its exact e8
+    // whole allocation shape, not an arbitrary 241-byte function.
+    require(
+        cell.address == 0xe8
+            && cell.size == 8
+            && cell.binding == sym::STB_LOCAL
+            && canonical_rust_symbol(&cell.name).as_deref() == Some(FIXED_TLS_CELL_ROLE)
+            && allocation_bytes.len() == 241
+            && DETCORE_VALIDATE_TEMPLATES.iter().any(|template| {
+                template.role == "fixed_patch_alloc"
+                    && fixed_template_shape(
+                        allocation_bytes,
+                        &fixed_hex(template.hex),
+                        template.operands.iter().map(|operand| operand.displacement),
+                    )
+            }),
+        "Detcore direct TLS proof lacks its exact e8 allocation recipe",
+    )?;
+    authenticate_loader_metadata(elf, bytes)?;
+    let census = direct_tls_getter_census(elf, bytes, cell, module, plt)?;
+    require(
+        census.named_getters.is_empty()
+            && census.recipe_getters.is_empty()
+            && census.getter_pointer_slots.is_empty(),
+        "Detcore direct allocation TLS proof found a getter or raw loader pointer edge",
+    )?;
+    Ok(DirectAllocationTlsEvidence {
+        version: 2,
+        policy: DETCORE_DIRECT_TLS_CENSUS_POLICY.into(),
+        elf_sha256: sha256(bytes),
+        compiled_sources_sha256: sha256(
+            &serde_json::to_vec(sources.record()).map_err(|e| e.to_string())?,
+        ),
+        reverie_pin: sources.record().reverie_pin.clone(),
+        allocation_sha256: sha256(allocation_bytes),
+        mappings: census.mappings,
+        static_symbol_count: elf.syms.len(),
+        dynamic_symbol_count: elf.dynsyms.len(),
+        raw_names_sha256: census.raw_names_sha256,
+        loader_writer_count: census.loader_writer_count,
+        loader_writers_sha256: census.loader_writers_sha256,
+        named_getters: census.named_getters,
+        recipe_getters: census.recipe_getters,
+        getter_pointer_slots: census.getter_pointer_slots,
+    })
+}
+
 fn validate_direct_allocation_tls_evidence(
     tls: &AllocatorTlsBoundary,
     proof: &DirectAllocationTlsEvidence,
 ) -> Result<()> {
+    validate_direct_allocation_tls_evidence_in_image(tls, proof, FixedImageKind::Standalone)
+}
+
+fn validate_direct_allocation_tls_evidence_in_image(
+    tls: &AllocatorTlsBoundary,
+    proof: &DirectAllocationTlsEvidence,
+    image_kind: FixedImageKind,
+) -> Result<()> {
+    let (version, policy, cell_matches, extent, call_offset) = match image_kind {
+        FixedImageKind::Standalone => (
+            1,
+            DIRECT_TLS_CENSUS_POLICY,
+            matches!(tls.tls_cell.address, 0x40 | 0x80),
+            186,
+            0x2c,
+        ),
+        FixedImageKind::Detcore => (
+            2,
+            DETCORE_DIRECT_TLS_CENSUS_POLICY,
+            tls.tls_cell.address == 0xe8
+                && tls.tls_cell.size == 8
+                && tls.tls_cell.binding == sym::STB_LOCAL
+                && canonical_rust_symbol(&tls.tls_cell.name).as_deref()
+                    == Some(FIXED_TLS_CELL_ROLE),
+            241,
+            58,
+        ),
+    };
     let hash =
         |s: &str, length: usize| s.len() == length && s.bytes().all(|b| b.is_ascii_hexdigit());
     let allocation = tls
@@ -16433,8 +16539,8 @@ fn validate_direct_allocation_tls_evidence(
         .get("fixed_patch_alloc")
         .ok_or("direct TLS allocation role absent")?;
     require(
-        proof.version == 1
-            && proof.policy == DIRECT_TLS_CENSUS_POLICY
+        proof.version == version
+            && proof.policy == policy
             && [
                 proof.elf_sha256.as_str(),
                 proof.compiled_sources_sha256.as_str(),
@@ -16462,8 +16568,8 @@ fn validate_direct_allocation_tls_evidence(
             && proof.named_getters.is_empty()
             && proof.recipe_getters.is_empty()
             && proof.getter_pointer_slots.is_empty()
-            && matches!(tls.tls_cell.address, 0x40 | 0x80)
-            && allocation.size == 186
+            && cell_matches
+            && allocation.size == extent
             && fixed_emitted_role(&allocation.name) == Some("fixed_patch_alloc")
             && tls
                 .local_chain
@@ -16476,7 +16582,7 @@ fn validate_direct_allocation_tls_evidence(
                 == [ConstructorTransfer {
                     instruction: allocation
                         .address
-                        .checked_add(0x2c)
+                        .checked_add(call_offset)
                         .ok_or("direct TLS callsite overflows")?,
                     target: tls.plt_address,
                     local_got_slot: None,
@@ -16537,42 +16643,49 @@ fn qualify_allocator_tls_boundary_in_source_context(
             target: plt,
             local_got_slot: None,
         });
-        let (function, function_bytes) = bind("fixed_tls_fn_once")?;
-        require(
-            function_bytes.len() == 22,
-            "Detcore FnOnce whole extent differs",
-        )?;
-        let encoded = u32::from_le_bytes(function_bytes[16..20].try_into().unwrap());
-        require(
-            u64::from(encoded) == cell.address,
-            "Detcore FnOnce reads another TLS cell",
-        )?;
-        let template = DETCORE_VALIDATE_TEMPLATES
-            .iter()
-            .filter(|t| {
-                t.role == "fixed_tls_fn_once"
-                    && fixed_template_shape(
-                        function_bytes,
-                        &fixed_hex(t.hex),
-                        t.operands.iter().map(|op| op.displacement),
-                    )
-            })
-            .collect::<Vec<_>>();
-        require(
-            template.len() == 1,
-            "Detcore FnOnce unrecognized full template",
-        )?;
-        fixed_whole_recipe(
-            function,
-            function_bytes,
-            template[0].hex,
-            &[(4, 8, module), (9, 13, plt)],
-        )?;
-        callsites.push(ConstructorTransfer {
-            instruction: function + 8,
-            target: plt,
-            local_got_slot: None,
-        });
+        if roles.contains_key("fixed_tls_fn_once") {
+            let (function, function_bytes) = bind("fixed_tls_fn_once")?;
+            require(
+                function_bytes.len() == 22,
+                "Detcore FnOnce whole extent differs",
+            )?;
+            let encoded = u32::from_le_bytes(function_bytes[16..20].try_into().unwrap());
+            require(
+                u64::from(encoded) == cell.address,
+                "Detcore FnOnce reads another TLS cell",
+            )?;
+            let template = DETCORE_VALIDATE_TEMPLATES
+                .iter()
+                .filter(|t| {
+                    t.role == "fixed_tls_fn_once"
+                        && fixed_template_shape(
+                            function_bytes,
+                            &fixed_hex(t.hex),
+                            t.operands.iter().map(|op| op.displacement),
+                        )
+                })
+                .collect::<Vec<_>>();
+            require(
+                template.len() == 1,
+                "Detcore FnOnce unrecognized full template",
+            )?;
+            fixed_whole_recipe(
+                function,
+                function_bytes,
+                template[0].hex,
+                &[(4, 8, module), (9, 13, plt)],
+            )?;
+            callsites.push(ConstructorTransfer {
+                instruction: function + 8,
+                target: plt,
+                local_got_slot: None,
+            });
+        } else {
+            require(
+                cell.address == 0xe8,
+                "Detcore missing getter has no exact direct-allocation cohort",
+            )?;
+        }
         (plt, module, None, None)
     } else if allocation_bytes.len() == 186 {
         // The real optimized alloc preserves ready backing in R12 and its
@@ -16772,6 +16885,20 @@ fn qualify_allocator_tls_boundary_in_source_context(
         && !roles.contains_key("fixed_tls_fn_once")
     {
         Some(derive_direct_allocation_tls_evidence(
+            elf,
+            bytes,
+            &cell,
+            module,
+            plt,
+            allocation_bytes,
+            sources,
+        )?)
+    } else if image_kind == FixedImageKind::Detcore
+        && cell.address == 0xe8
+        && allocation_bytes.len() == 241
+        && !roles.contains_key("fixed_tls_fn_once")
+    {
+        Some(derive_detcore_direct_allocation_tls_evidence(
             elf,
             bytes,
             &cell,
@@ -17389,11 +17516,15 @@ fn validate_fixed_backing_evidence_in_source_context(
             "Fixed TLS local function-pointer chain is incomplete or mislabeled as GOT",
         )?,
         (None, None, None) if tls.direct_allocation.is_some() => {
-            require(
-                image_kind == FixedImageKind::Standalone,
-                "direct allocation TLS proof belongs only to standalone images",
-            )?;
-            validate_direct_allocation_tls_evidence(tls, tls.direct_allocation.as_ref().unwrap())?;
+            let proof = tls.direct_allocation.as_ref().unwrap();
+            match image_kind {
+                FixedImageKind::Standalone => validate_direct_allocation_tls_evidence(tls, proof)?,
+                FixedImageKind::Detcore => validate_direct_allocation_tls_evidence_in_image(
+                    tls,
+                    proof,
+                    FixedImageKind::Detcore,
+                )?,
+            }
         }
         (None, None, None) => {
             let extent = match (image_kind, tls.tls_cell.address) {
@@ -36611,6 +36742,79 @@ mod tests {
                     .is_err()
             );
         }
+        // The separate Detcore e8 route uses the SAME physical census. A
+        // missing symbol is insufficient: hidden/unnamed getters outside .text
+        // and raw loader pointers still invalidate an empty-getter proof.
+        let mut detcore = base.clone();
+        put(&mut detcore, 0x4020, 8, 0xe8);
+        let mut detcore_cell = cell.clone();
+        detcore_cell.address = 0xe8;
+        let detcore_census = |bytes: &[u8]| {
+            direct_tls_getter_census(
+                &Elf::parse(bytes).unwrap(),
+                bytes,
+                &detcore_cell,
+                0x3300,
+                0x1800,
+            )
+        };
+        let absent = detcore_census(&detcore).unwrap();
+        assert!(
+            absent.named_getters.is_empty()
+                && absent.recipe_getters.is_empty()
+                && absent.getter_pointer_slots.is_empty()
+        );
+        assert!(detcore_direct_tls_source_context(None).is_err());
+        assert!(
+            derive_detcore_direct_allocation_tls_evidence(
+                &Elf::parse(&detcore).unwrap(),
+                &detcore,
+                &detcore_cell,
+                0x3300,
+                0x1800,
+                &[],
+                None,
+            )
+            .is_err()
+        );
+        let mut thunk = fixed_hex("50488d3db86b3c00e883433600488d80e800000059c3");
+        rip(&mut thunk, 0x1500, 4, 8, 0x3300);
+        rip(&mut thunk, 0x1500, 9, 13, 0x1800);
+        let mut hidden = detcore.clone();
+        hidden[0x1500..0x1516].copy_from_slice(&thunk);
+        assert_eq!(detcore_census(&hidden).unwrap().recipe_getters, [0x1500]);
+        let mut pointer = hidden.clone();
+        for (offset, value) in [
+            (0, 0x3400),
+            (8, u64::from(reloc::R_X86_64_RELATIVE)),
+            (16, 0x1500),
+        ] {
+            put(&mut pointer, 0x4800 + offset, 8, value);
+        }
+        assert_eq!(
+            detcore_census(&pointer).unwrap().getter_pointer_slots,
+            [0x3400]
+        );
+        for (field, next, target) in [(4, 8, 0x3308), (9, 13, 0x1801)] {
+            let mut bad = hidden.clone();
+            rip(&mut bad[0x1500..0x1516], 0x1500, field, next, target);
+            assert!(
+                detcore_census(&bad).is_err(),
+                "Detcore hidden getter wrong operand"
+            );
+        }
+        // A raw dynamic getter must refuse even if all recipe bytes are absent.
+        let mut dynamic = detcore.clone();
+        for (offset, width, value) in [
+            (0, 4, 1),
+            (4, 1, u64::from(sym::STT_FUNC)),
+            (6, 2, 1),
+            (8, 8, 0x1500),
+            (16, 8, 22),
+        ] {
+            put(&mut dynamic, 0x4418 + offset, width, value);
+        }
+        assert!(detcore_census(&dynamic).is_err());
         // Actual mapping bytes participate in the record join even when a
         // change does not create a getter. An old census cannot be replayed.
         let mut changed = base.clone();
@@ -36729,6 +36933,120 @@ mod tests {
             validate_fixed_backing_evidence(&old).is_err(),
             "missing direct provenance cannot erase the old required FnOnce chain"
         );
+    }
+
+    // Structural Detcore v2 controls are not an ELF/source qualification.
+    // The retained two-role Detcore cohort stays a separate unchanged route.
+    fn fixed_detcore_tls_direct_schema_controls(retained: &AllocatorBackingEvidence) {
+        let check = |b: &AllocatorBackingEvidence| {
+            validate_fixed_backing_evidence_in_source_context(b, FixedImageKind::Detcore)
+        };
+        let mut direct = retained.clone();
+        let tls = &mut direct.tls_boundary;
+        tls.local_chain.remove("fixed_tls_fn_once").unwrap();
+        tls.function_sha256.remove("fixed_tls_fn_once").unwrap();
+        tls.callsites.truncate(1);
+        assert!(
+            check(&direct).is_err(),
+            "missing getter still requires direct provenance"
+        );
+        let allocation_sha256 = direct.tls_boundary.function_sha256["fixed_patch_alloc"].clone();
+        let mut value = serde_json::to_value(&direct).unwrap();
+        value["tls_boundary"]["direct_allocation"] = serde_json::json!({
+            "version": 2, "policy": DETCORE_DIRECT_TLS_CENSUS_POLICY,
+            "elf_sha256": "0".repeat(64), "compiled_sources_sha256": "1".repeat(64),
+            "reverie_pin": "2".repeat(40), "allocation_sha256": allocation_sha256,
+            "mappings": [{"program_header_index": 1, "file_offset": 0x1000,
+                "virtual_address": 0x1000, "file_size": 0x1000, "memory_size": 0x1000,
+                "flags": 5, "sha256": "0".repeat(64)}],
+            "static_symbol_count": 1, "dynamic_symbol_count": 1,
+            "raw_names_sha256": "0".repeat(64),
+            "loader_writer_count": 0, "loader_writers_sha256": "0".repeat(64),
+            "named_getters": [], "recipe_getters": [], "getter_pointer_slots": []
+        });
+        let decoded: AllocatorBackingEvidence = serde_json::from_value(value.clone()).unwrap();
+        check(&decoded).unwrap();
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), value);
+        assert!(
+            validate_fixed_backing_evidence(&decoded).is_err(),
+            "Detcore v2 is not standalone v1"
+        );
+        assert!(
+            validate_direct_allocation_tls_evidence(
+                &decoded.tls_boundary,
+                decoded.tls_boundary.direct_allocation.as_ref().unwrap(),
+            )
+            .is_err(),
+            "v2 cannot enter the standalone v1 validator"
+        );
+        // Wrong image/version, omitted/stale/forged joins, and any getter or
+        // pointer edge remain refusals. No empty role map is accepted alone.
+        for (field, replacement) in [
+            ("version", serde_json::json!(1)),
+            ("policy", serde_json::json!(DIRECT_TLS_CENSUS_POLICY)),
+            ("compiled_sources_sha256", serde_json::json!("")),
+            ("reverie_pin", serde_json::json!("short")),
+            ("allocation_sha256", serde_json::json!("3".repeat(64))),
+            ("mappings", serde_json::json!([])),
+            ("named_getters", serde_json::json!([0x1500])),
+            ("recipe_getters", serde_json::json!([0x1500])),
+            ("getter_pointer_slots", serde_json::json!([0x3400])),
+        ] {
+            let mut bad = value.clone();
+            bad["tls_boundary"]["direct_allocation"][field] = replacement;
+            assert!(
+                check(&serde_json::from_value(bad).unwrap()).is_err(),
+                "Detcore direct {field}"
+            );
+        }
+        for mutation in 0..11 {
+            let mut bad = decoded.clone();
+            let tls = &mut bad.tls_boundary;
+            match mutation {
+                0 => tls.tls_cell.address = 0x128,
+                1 => tls.tls_cell.size = 9,
+                2 => tls.tls_cell.binding = sym::STB_GLOBAL,
+                3 => tls.local_chain.get_mut("fixed_patch_alloc").unwrap().size = 240,
+                4 => tls.callsites[0].instruction += 1,
+                5 => tls.callsites.push(tls.callsites[0].clone()),
+                6 => tls
+                    .function_sha256
+                    .remove("fixed_patch_alloc")
+                    .map(|_| ())
+                    .unwrap(),
+                7 => tls.local_key_object = Some(1),
+                8 => tls.unisolated = false,
+                9 => {
+                    let _ = tls.local_chain.insert(
+                        "fixed_tls_fn_once".into(),
+                        retained.tls_boundary.local_chain["fixed_tls_fn_once"].clone(),
+                    );
+                }
+                10 => tls.callsites[0].target += 1,
+                _ => unreachable!(),
+            }
+            assert!(
+                check(&bad).is_err(),
+                "Detcore direct extent/role/edge {mutation}"
+            );
+        }
+        for field in [
+            "elf_sha256",
+            "compiled_sources_sha256",
+            "raw_names_sha256",
+            "loader_writers_sha256",
+        ] {
+            let mut stale = value.clone();
+            stale["tls_boundary"]["direct_allocation"][field] = serde_json::json!("3".repeat(64));
+            let stale: AllocatorBackingEvidence = serde_json::from_value(stale).unwrap();
+            assert_ne!(
+                stale, decoded,
+                "physical re-extraction must reject stale Detcore {field}"
+            );
+        }
+        let mut unknown = value;
+        unknown["tls_boundary"]["direct_allocation"]["absent"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<AllocatorBackingEvidence>(unknown).is_err());
     }
 
     // Actual observed chains used only in structural schemas. Their literal
@@ -37093,6 +37411,9 @@ mod tests {
                 validate_fixed_backing_evidence_in_source_context(b, kind)
             };
             check(&sample).unwrap();
+            if kind == FixedImageKind::Detcore && offset == 0xe8 {
+                fixed_detcore_tls_direct_schema_controls(&sample);
+            }
             if kind == FixedImageKind::Detcore && matches!(offset, 0x128 | 0xe8) {
                 let mut extra = sample.clone();
                 let getter = extra.tls_boundary.local_chain["fixed_tls_fn_once"].clone();
