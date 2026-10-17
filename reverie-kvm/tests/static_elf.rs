@@ -5771,6 +5771,11 @@ fn static_elf_forks_execs_and_waits_for_child() {
 /// its getpriority answer (raw 20 - nice = 1), which the parent passes on.
 /// Run without a tool and with one that injects every call, each on a fresh
 /// thread whose nice value starts as the test process's.
+///
+/// The test must start below nice 19, or lowering to 19 changes nothing and
+/// its precondition fails. So it fails under a harness that runs the tests
+/// with `nice -n 19` and passes at nice 0: a property of the harness's
+/// environment, not of the backend.
 #[test]
 fn forked_child_inherits_the_nice_value_set_on_the_host() {
     match Kvm::new() {
