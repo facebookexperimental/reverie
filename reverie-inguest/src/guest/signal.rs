@@ -125,18 +125,19 @@ pub fn prepare_guest_signal_state(
 /// handler would run outside the Tool's view. The handler is read from the
 /// guest's `struct sigaction` with `process_vm_readv`, so an unreadable
 /// pointer is refused rather than faulting. A new action for SIGKILL or
-/// SIGSTOP is supported whatever it holds: Linux refuses it (EINVAL, or
-/// EFAULT for an unreadable action) without changing anything, and a program
-/// may make that call to validate its signal handling.
+/// SIGSTOP, or for a number that is not a signal (0, or above 64), is
+/// supported whatever it holds: Linux refuses it (EINVAL, or EFAULT for an
+/// unreadable action) without changing anything, and a program may make that
+/// call to validate its signal handling.
 pub fn signal_action_supported(number: i64, args: [u64; 6]) -> bool {
     if number != libc::SYS_rt_sigaction || args[1] == 0 {
         return true;
     }
-    if args[0] as i32 == libc::SIGKILL || args[0] as i32 == libc::SIGSTOP {
-        return true;
-    }
     // Linux reads the signal argument as a C int.
     let signal = args[0] as i32;
+    if signal == libc::SIGKILL || signal == libc::SIGSTOP || !(1..=64).contains(&signal) {
+        return true;
+    }
     if signal == libc::SIGSYS || (signal == libc::SIGSEGV && any_instruction_subscribed()) {
         return false;
     }
@@ -983,9 +984,10 @@ mod tests {
             libc::SYS_rt_sigaction,
             [libc::SIGUSR1 as u64, 8, 0, 8, 0, 0]
         ));
-        // Linux refuses any new action for SIGKILL and SIGSTOP itself, so the
-        // call runs and the guest sees the kernel's error.
-        for signal in [libc::SIGKILL, libc::SIGSTOP] {
+        // Linux refuses any new action for SIGKILL and SIGSTOP, and for a
+        // number that is not a signal, itself, so the call runs and the guest
+        // sees the kernel's error.
+        for signal in [libc::SIGKILL, libc::SIGSTOP, 0, 65, -1] {
             assert!(signal_action_supported(
                 libc::SYS_rt_sigaction,
                 args(signal, &handler)

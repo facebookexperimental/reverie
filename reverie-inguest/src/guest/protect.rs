@@ -18,6 +18,7 @@ use std::io;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicI32;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use crate::dispatch::is_fork_like;
@@ -215,11 +216,62 @@ fn send_retirement(socket: libc::c_int, message: &[u8]) {
     }
 }
 
+/// The signals whose new action [`protect_runtime_control`] refused since the
+/// Tool last took them ([`take_refused_signal_controls`]), bit `n - 1` for
+/// signal `n`.
+static REFUSED_SIGNAL_ACTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether [`protect_runtime_control`] refused an alternate signal stack since
+/// the Tool last took the refusals.
+static REFUSED_ALTERNATE_STACK: AtomicBool = AtomicBool::new(false);
+
+/// The guest signal controls [`protect_runtime_control`] refused with `EPERM`,
+/// which the Tool never sees as calls.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RefusedSignalControls {
+    /// The signals whose new action was refused, bit `n - 1` for signal `n`.
+    pub actions: u64,
+    /// Whether an alternate signal stack was refused.
+    pub alternate_stack: bool,
+}
+
+/// Takes the guest signal controls refused in this process since the last
+/// call, so that the Tool can report them (each refusal is reported once:
+/// taking clears them). A forked child starts with its parent's record.
+pub fn take_refused_signal_controls() -> RefusedSignalControls {
+    // The Tool asks at every syscall; almost always nothing was refused.
+    if REFUSED_SIGNAL_ACTIONS.load(Ordering::Acquire) == 0
+        && !REFUSED_ALTERNATE_STACK.load(Ordering::Acquire)
+    {
+        return RefusedSignalControls::default();
+    }
+    RefusedSignalControls {
+        actions: REFUSED_SIGNAL_ACTIONS.swap(0, Ordering::AcqRel),
+        alternate_stack: REFUSED_ALTERNATE_STACK.swap(false, Ordering::AcqRel),
+    }
+}
+
+/// Records the refusal of the guest signal control `event` asked for.
+fn record_refused_signal_control(event: &SyscallEvent) {
+    if event.number == libc::SYS_sigaltstack {
+        REFUSED_ALTERNATE_STACK.store(true, Ordering::Release);
+        return;
+    }
+    // Linux reads the signal argument as a C int. A number that is not a
+    // signal is never refused (`signal_action_supported`).
+    let signal = event.args[0] as i32;
+    if (1..=64).contains(&signal) {
+        REFUSED_SIGNAL_ACTIONS.fetch_or(1 << (signal - 1), Ordering::AcqRel);
+    }
+}
+
 // TODO-HUMAN-REVIEW(PR-127): Review process-global preload safety guards.
 /// Refuses a guest syscall that would take control from the runtime: a
 /// fork-like call when process forks are not allowed (`ENOTSUP`), and a
 /// signal action [`signal_action_supported`] refuses or an alternate signal
 /// stack (`EPERM`). Returns whether `event` was refused, with its result set.
+/// A refused signal control is recorded for the Tool to report
+/// ([`take_refused_signal_controls`]).
 pub fn protect_runtime_control(event: &mut SyscallEvent) -> bool {
     let unsupported_process =
         is_fork_like(event.number) && !PROCESS_FORKS_ALLOWED.load(Ordering::Acquire);
@@ -234,6 +286,7 @@ pub fn protect_runtime_control(event: &mut SyscallEvent) -> bool {
     if unsupported_process {
         event.result = -i64::from(libc::ENOTSUP);
     } else if protected_signal {
+        record_refused_signal_control(event);
         event.result = -i64::from(libc::EPERM);
     } else {
         return false;
@@ -531,4 +584,117 @@ pub fn fd_arg(event: &SyscallEvent, index: usize) -> u64 {
 /// checks all of those for the runtime's own descriptors.
 pub fn syscall_targets_event_fd(event: &SyscallEvent, event_fd: u64) -> bool {
     reserved_fds::names_descriptor(event.number, &event.args, event_fd)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::guest::event::SyscallDispatch;
+
+    fn event(number: i64, args: [u64; 6]) -> SyscallEvent {
+        SyscallEvent {
+            number,
+            args,
+            instruction_pointer: 0x1234,
+            result: 0,
+            context: 0,
+            dispatch: SyscallDispatch::Trap,
+            guest_pkru: None,
+        }
+    }
+
+    /// A refused handler or alternate stack is recorded for the Tool, once:
+    /// taking the record clears it. A query, a default action and an
+    /// alternate-stack query are not refused and not recorded.
+    #[test]
+    fn refused_signal_controls_are_recorded_for_the_tool_once() {
+        // A struct sigaction whose handler is an address, read from this
+        // process's own memory as the runtime reads the guest's.
+        let handler: [u64; 4] = [0x4000, 0, 0, 0];
+        let default: [u64; 4] = [libc::SIG_DFL as u64, 0, 0, 0];
+        let stack = [0u64; 3];
+        let _ = take_refused_signal_controls();
+
+        let mut install = event(
+            libc::SYS_rt_sigaction,
+            [libc::SIGUSR1 as u64, handler.as_ptr() as u64, 0, 8, 0, 0],
+        );
+        assert!(protect_runtime_control(&mut install));
+        assert_eq!(install.result, -i64::from(libc::EPERM));
+        let mut alternate = event(
+            libc::SYS_sigaltstack,
+            [stack.as_ptr() as u64, 0, 0, 0, 0, 0],
+        );
+        assert!(protect_runtime_control(&mut alternate));
+        for allowed in [
+            event(
+                libc::SYS_rt_sigaction,
+                [libc::SIGUSR2 as u64, 0, 0, 8, 0, 0],
+            ),
+            // Not signals: Linux refuses them (EINVAL), so the runtime does
+            // not, and there is nothing to record.
+            event(
+                libc::SYS_rt_sigaction,
+                [0, handler.as_ptr() as u64, 0, 8, 0, 0],
+            ),
+            event(
+                libc::SYS_rt_sigaction,
+                [65, handler.as_ptr() as u64, 0, 8, 0, 0],
+            ),
+            event(
+                libc::SYS_rt_sigaction,
+                [libc::SIGUSR2 as u64, default.as_ptr() as u64, 0, 8, 0, 0],
+            ),
+            event(
+                libc::SYS_sigaltstack,
+                [0, stack.as_ptr() as u64, 0, 0, 0, 0],
+            ),
+        ] {
+            let mut allowed = allowed;
+            assert!(!protect_runtime_control(&mut allowed), "{:?}", allowed.args);
+        }
+        assert_eq!(
+            take_refused_signal_controls(),
+            RefusedSignalControls {
+                actions: 1 << (libc::SIGUSR1 - 1),
+                alternate_stack: true,
+            }
+        );
+        assert_eq!(
+            take_refused_signal_controls(),
+            RefusedSignalControls::default(),
+            "taken once"
+        );
+    }
+
+    /// The Tool's own signal controls are refused on their own path, before
+    /// `protect_runtime_control`, and are not the guest's: nothing is
+    /// recorded for them.
+    #[test]
+    fn the_tools_own_signal_controls_are_not_recorded() {
+        let handler: [u64; 4] = [0x4000, 0, 0, 0];
+        let stack = [0u64; 3];
+        let _ = take_refused_signal_controls();
+        for (number, args) in [
+            (
+                libc::SYS_rt_sigaction,
+                [libc::SIGUSR1 as u64, handler.as_ptr() as u64, 0, 8, 0, 0],
+            ),
+            (
+                libc::SYS_sigaltstack,
+                [stack.as_ptr() as u64, 0, 0, 0, 0, 0],
+            ),
+        ] {
+            let mut nested = event(number, args);
+            // SAFETY: both calls are refused before anything is forwarded.
+            unsafe {
+                crate::guest::trap_dispatch::forward_nested_tool_syscall(&mut nested, |_| {})
+            };
+            assert_eq!(nested.result, -i64::from(libc::EPERM), "{number}");
+        }
+        assert_eq!(
+            take_refused_signal_controls(),
+            RefusedSignalControls::default()
+        );
+    }
 }
