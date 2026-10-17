@@ -134,6 +134,18 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
         false
     }
 
+    /// Whether `fd` in this task's current descriptor table is owned by the
+    /// backend runtime rather than the guest application.
+    ///
+    /// This reports an actual live ownership fact, not a reserved numeric
+    /// range. A backend must not report a descriptor after releasing its slot
+    /// for application reuse, or apply another process's ownership to this
+    /// task. Tools decide how to project these facts into guest observations.
+    /// Backends without guest-resident private descriptors return false.
+    fn is_runtime_owned_fd(&self, _fd: i32) -> bool {
+        false
+    }
+
     /// Reads and returns the auxv table for this process.
     fn auxv(&self) -> Auxv {
         Auxv::new(self.pid()).expect("failed to read auxv table")
@@ -782,6 +794,10 @@ where
 
     fn is_backend_runtime_bootstrap(&self) -> bool {
         self.inner.is_backend_runtime_bootstrap()
+    }
+
+    fn is_runtime_owned_fd(&self, fd: i32) -> bool {
+        self.inner.is_runtime_owned_fd(fd)
     }
 
     fn is_main_thread(&self) -> bool {

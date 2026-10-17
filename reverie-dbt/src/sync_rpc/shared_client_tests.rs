@@ -151,6 +151,21 @@ fn exercise_both_paths() {
 
     let mut first = Callback::default();
     let mut second = Callback::default();
+    // A real application-owned high descriptor must remain available; the
+    // primary chooses another slot and publishes its physical owner before
+    // any Tool request has normalized the connection cache.
+    use std::os::fd::AsRawFd;
+    use std::os::fd::FromRawFd;
+    let application = std::fs::File::open("/dev/null").unwrap();
+    let high = unsafe { libc::fcntl(application.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 1024) };
+    assert!(high >= 1024);
+    let high = unsafe { std::os::fd::OwnedFd::from_raw_fd(high) };
+    prepare_guest(&mut first as *mut Callback as usize, invoke_callback).unwrap();
+    let prepared = GUEST_CLIENT.descriptor(std::process::id()).unwrap();
+    assert_ne!(prepared, high.as_raw_fd());
+    assert!(is_runtime_owned_fd(prepared));
+    assert!(!is_runtime_owned_fd(high.as_raw_fd()));
+    assert!(std::fs::read_link(format!("/proc/self/fd/{}", high.as_raw_fd())).is_ok());
     assert_eq!(first.send(31, 4), Response(31, 4));
     let first_calls = first.calls.len();
     assert_eq!(second.send(32, 5), Response(32, 5));
@@ -239,15 +254,15 @@ fn exercise_both_paths() {
         let _held = GUEST_CLIENT.connection.lock().unwrap();
         let args = [primary as u64, 0, 0, 0, 0, 0];
         assert_eq!(
-            protect_guest_operation(0, invoke_callback, pid, libc::SYS_close, &args, true),
+            protect_guest_operation(0, invoke_callback, libc::SYS_close, &args, true),
             None
         );
         assert_eq!(
-            protect_guest_operation(0, invoke_callback, pid, libc::SYS_close, &args, false),
+            protect_guest_operation(0, invoke_callback, libc::SYS_close, &args, false),
             Some(-i64::from(libc::EBADF))
         );
         assert_eq!(
-            protect_guest_operation(0, invoke_callback, pid, libc::SYS_read, &args, true),
+            protect_guest_operation(0, invoke_callback, libc::SYS_read, &args, true),
             Some(-i64::from(libc::EBADF))
         );
         assert_eq!(GUEST_CLIENT.descriptor(pid.wrapping_add(1)), None);

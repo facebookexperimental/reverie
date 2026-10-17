@@ -468,13 +468,17 @@ impl GuestClient {
 
 static GUEST_CLIENT: GuestClient = GuestClient::new();
 
+/// The existing primary owner's live fact, without acquiring its RPC lease.
+pub(crate) fn is_runtime_owned_fd(fd: i32) -> bool {
+    GUEST_CLIENT.descriptor(std::process::id()) == Some(fd)
+}
+
 /// Prepares a configured primary connection before an admitted Tool entry.
 /// No coordinator means the standalone/mock Tool keeps its no-RPC behavior.
-pub(crate) fn prepare_guest(
-    context: usize,
-    invoke_syscall: SyscallInvoker,
-    pid: u32,
-) -> io::Result<()> {
+pub(crate) fn prepare_guest(context: usize, invoke_syscall: SyscallInvoker) -> io::Result<()> {
+    // Tool-visible identities can be virtual; this owner and the socket
+    // handshake always name the current physical process.
+    let pid = std::process::id();
     let Some(path) = std::env::var_os(RPC_SOCKET_ENV) else {
         return Ok(());
     };
@@ -500,13 +504,12 @@ pub(crate) fn prepare_guest(
 pub(crate) fn protect_guest_operation(
     context: usize,
     invoke_syscall: SyscallInvoker,
-    pid: u32,
     number: i64,
     args: &[u64; 6],
     before_tool: bool,
 ) -> Option<i64> {
     use reverie::syscalls::reserved_fds;
-    let fd = GUEST_CLIENT.descriptor(pid)? as u64;
+    let fd = GUEST_CLIENT.descriptor(std::process::id())? as u64;
     if before_tool && matches!(number, libc::SYS_close | libc::SYS_close_range) {
         return None;
     }

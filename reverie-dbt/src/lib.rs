@@ -635,6 +635,12 @@ where
         self.pid
     }
 
+    fn is_runtime_owned_fd(&self, fd: i32) -> bool {
+        // Guest PID can be a Tool identity. The connection owner is keyed by
+        // the physical process, as in send_rpc_from_guest.
+        sync_rpc::is_runtime_owned_fd(fd)
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-ratchet11): Review the DBT in-tree parent surface.
     fn ppid(&self) -> Option<Pid> {
@@ -729,7 +735,6 @@ where
         if let Some(result) = sync_rpc::protect_guest_operation(
             self.context,
             self.invoke_syscall,
-            self.pid.as_raw() as u32,
             number.id() as i64,
             &args,
             false,
@@ -1165,7 +1170,7 @@ pub fn run_tool_thread_start<T: Tool>(
     read_registers: RegisterReader,
     write_registers: RegisterWriter,
 ) -> Result<(), Error> {
-    sync_rpc::prepare_guest(context, invoke_syscall, pid.as_raw() as u32)?;
+    sync_rpc::prepare_guest(context, invoke_syscall)?;
     let mut guest = DbtGuest::new(
         context,
         tid,
@@ -1379,8 +1384,8 @@ fn run_tool_syscall_inner<T: Tool>(
     write_registers: RegisterWriter,
     read_memory: Option<MemoryReader>,
 ) -> Result<DbtSyscallOutcome, Error> {
-    sync_rpc::prepare_guest(context, invoke_syscall, pid.as_raw() as u32)?;
-    if let Some(result) = protect_tool_syscall(context, invoke_syscall, pid, syscall, true) {
+    sync_rpc::prepare_guest(context, invoke_syscall)?;
+    if let Some(result) = protect_tool_syscall(context, invoke_syscall, syscall, true) {
         return Ok(DbtSyscallOutcome::Suppress(result));
     }
     let mut guest = DbtGuest::new(
@@ -1408,7 +1413,7 @@ fn run_tool_syscall_inner<T: Tool>(
             .expect("tool handler suspended without a tail-inject result")
         {
             TailInjectAction::ExecuteOriginal(syscall) => Ok(
-                match protect_tool_syscall(context, invoke_syscall, pid, syscall, false) {
+                match protect_tool_syscall(context, invoke_syscall, syscall, false) {
                     Some(result) => DbtSyscallOutcome::Suppress(result),
                     None => DbtSyscallOutcome::ExecuteOriginal(syscall),
                 },
@@ -1420,7 +1425,6 @@ fn run_tool_syscall_inner<T: Tool>(
 fn protect_tool_syscall(
     context: usize,
     invoke_syscall: SyscallInvoker,
-    pid: Pid,
     syscall: Syscall,
     before_tool: bool,
 ) -> Option<i64> {
@@ -1428,7 +1432,6 @@ fn protect_tool_syscall(
     sync_rpc::protect_guest_operation(
         context,
         invoke_syscall,
-        pid.as_raw() as u32,
         number.id() as i64,
         &[
             args.arg0 as u64,
@@ -1464,7 +1467,7 @@ pub fn run_tool_signal_with_memory_reader<T: Tool>(
     write_registers: RegisterWriter,
     read_memory: MemoryReader,
 ) -> Result<DbtSignalOutcome, Error> {
-    sync_rpc::prepare_guest(context, invoke_syscall, pid.as_raw() as u32)?;
+    sync_rpc::prepare_guest(context, invoke_syscall)?;
     let signal = Signal::try_from(event.signal).map_err(|_| Errno::EINVAL)?;
     if event.reserved != 0
         || i32::from_ne_bytes(event.signal_info[..4].try_into().unwrap()) != event.signal
@@ -1922,7 +1925,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
 
         // Preparation is a runtime prerequisite, not a guest syscall error.
         // Do this before any Tool mapping that converts its own error to EIO.
-        if let Err(error) = sync_rpc::prepare_guest(context as usize, invoke_syscall, pid as u32) {
+        if let Err(error) = sync_rpc::prepare_guest(context as usize, invoke_syscall) {
             tools::emit_line(&format!(
                 "reverie-dbt: application RPC preparation refused: {error}"
             ));
@@ -1933,7 +1936,6 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
         if let Some(value) = sync_rpc::protect_guest_operation(
             context as usize,
             invoke_syscall,
-            pid as u32,
             sysnum,
             unsafe { &*args.cast::<[u64; 6]>() },
             true,
@@ -2128,7 +2130,6 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
         if let Some(value) = sync_rpc::protect_guest_operation(
             context as usize,
             invoke_syscall,
-            pid as u32,
             number,
             arguments,
             false,
