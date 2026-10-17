@@ -9276,8 +9276,12 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
         let old = task
             .getsigmask()
             .map_err(|error| mask_change_failure(error, false))?;
-        let effective =
-            blocked_signal_mask(self.tid()).map_err(|error| mask_change_failure(error, false))?;
+        // A thread that died since the first read has no procfs entry, or
+        // one that is going away.
+        let effective = blocked_signal_mask(self.tid()).map_err(|error| match error {
+            TraceError::Errno(Errno::ENOENT | Errno::ESRCH) => reverie::MaskChangeRefused::Gone,
+            error => mask_change_failure(error, false),
+        })?;
         if effective != old {
             return Err(reverie::MaskChangeRefused::RestorePending {
                 saved: old,
@@ -9579,6 +9583,9 @@ mod breakpoint_word_tests {
 #[cfg(test)]
 #[path = "task_exec_owner_tests.rs"]
 mod exec_owner_tests;
+#[cfg(test)]
+#[path = "task_set_blocked_signals_tests.rs"]
+mod set_blocked_signals_tests;
 
 #[cfg(test)]
 mod tests {

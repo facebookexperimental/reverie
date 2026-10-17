@@ -607,7 +607,12 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     /// pending when this is called is still pending afterwards, and is
     /// delivered by the kernel, in its own order, once the guest runs with a
     /// mask that admits it. The caller owns putting the returned mask back
-    /// before the guest resumes.
+    /// before the guest resumes. That second call is refused under the same
+    /// rules: for example with `RestorePending` after the caller injected a
+    /// mask-swapping syscall that ended with its restore pending, or with
+    /// `Unsupported` outside a syscall callback. So a caller that blocks
+    /// must also handle a refused restore, typically by restoring another
+    /// way or by ending the run before the guest resumes.
     ///
     /// The signals a backend needs for itself (on ptrace: SIGTRAP and the
     /// timer signal, besides SIGKILL and SIGSTOP, which cannot be blocked) are

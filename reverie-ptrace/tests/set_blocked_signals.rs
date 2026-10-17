@@ -14,6 +14,7 @@
 //! (<https://github.com/rrnewton/hermit/issues/4273>).
 
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -93,22 +94,48 @@ enum Seen {
     Set(Result<u64, MaskChangeRefused>),
     /// The thread's procfs `SigBlk` and `SigPnd` at that point.
     Proc { blocked: u64, pending: u64 },
+    /// Not recorded: asks whether this is the first interception of
+    /// `MaskedWaitThenSet`, so a restarted write is answered differently.
+    Claim,
 }
 
 #[derive(Default)]
 struct Log {
     seen: Mutex<Vec<Seen>>,
+    claimed: AtomicBool,
 }
 
 #[reverie::global_tool]
 impl GlobalTool for Log {
     type Request = Seen;
-    type Response = ();
+    type Response = bool;
     type Config = ();
 
-    async fn receive_rpc(&self, _from: Pid, seen: Seen) {
+    async fn receive_rpc(&self, _from: Pid, seen: Seen) -> bool {
+        if seen == Seen::Claim {
+            return !self.claimed.swap(true, Ordering::SeqCst);
+        }
         self.seen.lock().unwrap().push(seen);
+        false
     }
+}
+
+/// The signals `set_blocked_signals` never adds or clears: SIGTRAP and the
+/// timer signal, and SIGKILL and SIGSTOP, which cannot be blocked.
+fn never_shielded() -> u64 {
+    [
+        libc::SIGTRAP,
+        reverie::PERF_EVENT_SIGNAL as i32,
+        libc::SIGKILL,
+        libc::SIGSTOP,
+    ]
+    .iter()
+    .fold(0, |set, &signal| set | bit(signal))
+}
+
+/// The whole mask a full request writes over `old`.
+fn full_over(old: u64) -> u64 {
+    !never_shielded() | (old & never_shielded())
 }
 
 /// The procfs `SigBlk` and `SigPnd` of the stopped thread `tid`.
@@ -148,8 +175,11 @@ impl Tool for MaskTool {
     ) -> Result<Option<Signal>, Errno> {
         // Refused in a signal callback, changing nothing.
         if signal == Signal::SIGURG {
+            let tid = guest.tid();
+            guest.send_rpc(proc_masks(tid)).await;
             let answer = guest.set_blocked_signals(!0).await;
             guest.send_rpc(Seen::Set(answer)).await;
+            guest.send_rpc(proc_masks(tid)).await;
         }
         Ok(Some(signal))
     }
@@ -202,6 +232,12 @@ impl Tool for MaskTool {
                 Ok(0)
             }
             Op::MaskedWaitThenSet => {
+                // Acts on the first interception only. A restart of the write,
+                // which a discarded restore would cause, gets 77, which the
+                // guest's assertion rejects at once.
+                if !guest.send_rpc(Seen::Claim).await {
+                    return Ok(77);
+                }
                 let result = guest
                     .inject(
                         Ppoll::new()
@@ -348,8 +384,21 @@ fn run_op(op: Op, unblock: u64, mask: u64) -> (isize, Option<i32>) {
     (ret, if ret < 0 { errno } else { None })
 }
 
+/// Pins the tracer's log level to warnings. `test_fn` installs a TRACE-level
+/// collector unless one is set first, and a looping guest then writes
+/// gigabytes.
+fn quiet_logs() {
+    let collector = tracing_subscriber::fmt().with_env_filter("warn").finish();
+    let _ = tracing::subscriber::set_global_default(collector);
+}
+
 fn run_guest(name: &str, guest: fn()) -> Vec<Seen> {
-    let (output, log) = test_fn::<MaskTool, _>(guest).expect(name);
+    run_guest_under::<MaskTool>(name, guest)
+}
+
+fn run_guest_under<T: Tool<GlobalState = Log> + 'static>(name: &str, guest: fn()) -> Vec<Seen> {
+    quiet_logs();
+    let (output, log) = test_fn::<T, _>(guest).expect(name);
     assert_eq!(
         output.status,
         ExitStatus::Exited(0),
@@ -485,35 +534,41 @@ fn a_pending_mask_restore_is_refused_without_a_change() {
     assert_eq!(seen[3], seen[1], "nothing changed");
 }
 
-/// SIGTRAP and the timer signal, blocked by the guest itself with SIGTRAP
+/// SIGTRAP and the timer signal, blocked by the guest itself and both
 /// pending, keep their bits through `set_blocked_signals(full)` and its
-/// restore, which is exact; SIGTRAP is still pending afterwards.
+/// restore, which is exact; both are still pending afterwards.
 #[test]
 fn guest_blocked_sigtrap_and_timer_bits_are_kept_and_restored_exactly() {
     let seen = run_guest("never-shielded bits", || {
+        let timer = reverie::PERF_EVENT_SIGNAL as i32;
         block(libc::SIGTRAP);
-        block(reverie::PERF_EVENT_SIGNAL as i32);
+        block(timer);
         send_self(libc::SIGTRAP);
+        send_self(timer);
         let before = current_mask();
         let result = run_op(Op::BlockRestore, 0, 0);
         let after = current_mask();
         let pend = pending();
-        // Take the pending SIGTRAP, so that nothing delivers it later.
-        // SAFETY: the set and timeout are fully initialized.
-        let taken = unsafe {
-            let mut set: libc::sigset_t = std::mem::zeroed();
-            libc::sigemptyset(&mut set);
-            libc::sigaddset(&mut set, libc::SIGTRAP);
-            let zero = libc::timespec {
-                tv_sec: 0,
-                tv_nsec: 0,
-            };
-            libc::sigtimedwait(&set, std::ptr::null_mut(), &zero)
+        // Take both pending signals, so that nothing delivers them later.
+        let take = |signal: i32| {
+            // SAFETY: the set and timeout are fully initialized.
+            unsafe {
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, signal);
+                let zero = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                };
+                libc::sigtimedwait(&set, std::ptr::null_mut(), &zero)
+            }
         };
+        let taken = (take(libc::SIGTRAP), take(timer));
         assert_eq!(result, (-1, Some(libc::EBADF)));
         assert_eq!(after, before);
         assert_ne!(pend & bit(libc::SIGTRAP), 0, "SIGTRAP is still pending");
-        assert_eq!(taken, libc::SIGTRAP);
+        assert_ne!(pend & bit(timer), 0, "the timer signal is still pending");
+        assert_eq!(taken, (libc::SIGTRAP, timer));
     });
     let kept = bit(libc::SIGTRAP) | bit(reverie::PERF_EVENT_SIGNAL as i32);
     let Seen::Proc {
@@ -524,12 +579,13 @@ fn guest_blocked_sigtrap_and_timer_bits_are_kept_and_restored_exactly() {
         panic!("{seen:?}");
     };
     assert_eq!(first & kept, kept);
-    assert_ne!(first_pending & bit(libc::SIGTRAP), 0);
+    assert_eq!(first_pending & kept, kept, "both pending before");
     assert_eq!(seen[1], Seen::Set(Ok(first)), "the old mask is returned");
     let Seen::Set(Ok(written)) = seen[2].clone() else {
         panic!("{seen:?}");
     };
     assert_eq!(written & kept, kept, "the block kept the guest's own bits");
+    assert_eq!(written, full_over(first), "the whole written mask");
     assert_eq!(
         seen[3], seen[0],
         "the restore is exact and SIGTRAP still pending"
@@ -543,11 +599,16 @@ fn a_full_request_adds_neither_sigtrap_nor_the_timer_signal() {
     let seen = run_guest("nothing added", || {
         assert_eq!(run_op(Op::BlockRestore, 0, 0), (-1, Some(libc::EBADF)));
     });
+    let Seen::Proc { blocked: first, .. } = seen[0] else {
+        panic!("{seen:?}");
+    };
     let Seen::Set(Ok(written)) = seen[2].clone() else {
         panic!("{seen:?}");
     };
     let never = bit(libc::SIGTRAP) | bit(reverie::PERF_EVENT_SIGNAL as i32);
+    assert_eq!(first & never, 0, "the guest blocks neither");
     assert_eq!(written & never, 0, "{seen:?}");
+    assert_eq!(written, full_over(first), "the whole written mask");
 }
 
 /// In a signal callback the call is refused and changes nothing.
@@ -560,5 +621,47 @@ fn a_signal_callback_is_refused() {
             libc::raise(libc::SIGURG);
         }
     });
-    assert_eq!(seen, vec![Seen::Set(Err(MaskChangeRefused::Unsupported))]);
+    assert_eq!(seen.len(), 3, "{seen:?}");
+    assert_eq!(seen[1], Seen::Set(Err(MaskChangeRefused::Unsupported)));
+    assert_eq!(seen[2], seen[0], "nothing changed");
+}
+
+/// A tool whose only callback is `handle_thread_start`, where it asks for the
+/// full mask.
+#[derive(Clone, Copy, Debug, Default)]
+struct ThreadStartTool;
+
+#[reverie::tool]
+impl Tool for ThreadStartTool {
+    type GlobalState = Log;
+    type ThreadState = ();
+
+    fn subscriptions(_config: &()) -> Subscription {
+        Subscription::none()
+    }
+
+    async fn handle_thread_start<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Error> {
+        let tid = guest.tid();
+        guest.send_rpc(proc_masks(tid)).await;
+        let answer = guest.set_blocked_signals(!0).await;
+        guest.send_rpc(Seen::Set(answer)).await;
+        guest.send_rpc(proc_masks(tid)).await;
+        Ok(())
+    }
+}
+
+/// Outside a syscall callback, here at a thread's start, the call is refused
+/// and changes nothing. This binds the only-in-a-syscall-callback rule
+/// through the backend's own wiring.
+#[test]
+fn a_thread_start_callback_is_refused() {
+    let seen = run_guest_under::<ThreadStartTool>("thread start", || {
+        std::thread::spawn(|| {}).join().unwrap();
+    });
+    assert!(!seen.is_empty(), "no thread start was seen");
+    assert_eq!(seen.len() % 3, 0, "{seen:?}");
+    for start in seen.chunks(3) {
+        assert_eq!(start[1], Seen::Set(Err(MaskChangeRefused::Unsupported)));
+        assert_eq!(start[2], start[0], "nothing changed");
+    }
 }
