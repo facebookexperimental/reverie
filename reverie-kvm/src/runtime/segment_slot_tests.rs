@@ -7,7 +7,8 @@
 //! and then read, through `staged_segment`, the base the vCPU loop would
 //! apply when the handler returns. They pin the rule the vCPU loop relies
 //! on: the last base set during a handler wins, and an exec before the
-//! handler's return discards it.
+//! handler's return, injected by the handler or run right after it,
+//! discards it.
 
 use super::*;
 use crate::bootstrap::SegmentBase;
@@ -128,7 +129,7 @@ fn last_fs_base_set_in_a_handler_is_the_one_staged() {
 /// right after the handler returns, through `KvmBackend::exec_process`, the
 /// function every injected exec reaches (from `complete_injection` in a
 /// lifecycle callback, and through the process-action runner at a syscall
-/// boundary); it is not an exec injected by the handler itself.
+/// boundary). The next test injects the exec from the handler itself.
 #[test]
 fn exec_process_discards_a_staged_fs_base() {
     let (mut backend, mut executor) = installed();
@@ -146,6 +147,63 @@ fn exec_process_discards_a_staged_fs_base() {
             &[],
         )
         .unwrap();
+    let staged = staged_segment(&mut backend, &mut executor);
+    assert!(staged.is_none(), "staged: {staged:?}");
+}
+
+/// `arch_prctl(ARCH_SET_FS)` and then an `execve`, both injected by one
+/// lifecycle handler. The exec completes through `complete_injection`, which
+/// replaces the image with `KvmBackend::exec_process`, and no base staged for
+/// the old image survives it. The exec names a real file holding the same
+/// minimal image, and reuses the installed image's own initial `argv` and
+/// `envp`, so every pointer it passes is on the guest's initial stack.
+#[test]
+fn an_exec_injected_in_the_handler_discards_the_fs_base_staged_before_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let image = crate::vm::minimal_test_elf(&[0xf4]);
+    let path = std::env::temp_dir().join(format!(
+        "reverie-kvm-segment-slot-exec-{}",
+        std::process::id()
+    ));
+    std::fs::write(&path, &image).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut backend = KvmBackend::new(MEMORY_SIZE).expect("segment slot tests require /dev/kvm");
+    backend
+        .install_static_elf(&image, path.to_str().unwrap())
+        .unwrap();
+    // The initial stack holds argc, then argv = [path, NULL], then
+    // envp = [NULL].
+    let stack = backend.static_elf.as_ref().unwrap().stack_pointer;
+    let stack_word = |address: u64| {
+        let mut bytes = [0_u8; 8];
+        backend.memory.user().read(address, &mut bytes).unwrap();
+        u64::from_le_bytes(bytes)
+    };
+    assert_eq!(stack_word(stack), 1, "fixture argc");
+    let argv = stack + 8;
+    let envp = stack + 24;
+    let filename = stack_word(argv);
+    let execve = SyscallRequest::new(libc::SYS_execve as u64, [filename, argv, envp, 0, 0, 0])
+        .into_syscall()
+        .unwrap();
+    let mut executor = ElfExecutor::new(backend.static_elf.take().unwrap(), false);
+    let outcome = run_handler(&mut backend, &mut executor, move |guest| {
+        Box::pin(async move {
+            assert_eq!(guest.inject(arch_prctl_set_fs(0x1000)).await, Ok(0));
+            guest.inject(execve).await
+        })
+    });
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        matches!(
+            outcome,
+            HandlerOutcome::TailInjected {
+                image_replaced: true,
+                ..
+            }
+        ),
+        "the injected exec did not replace the image"
+    );
     let staged = staged_segment(&mut backend, &mut executor);
     assert!(staged.is_none(), "staged: {staged:?}");
 }
@@ -388,6 +446,11 @@ fn a_startup_callback_base_does_not_reach_the_next_run_on_the_same_backend() {
     backend
         .install_static_elf(&crate::vm::minimal_test_elf(&exit0), "/bin/startup-fs-next")
         .unwrap();
+    // The install's own FS base (`configure_long_mode`'s user data segment,
+    // base 0). The second guest never sets FS, so the run must leave exactly
+    // this base on the vCPU.
+    let installed_fs = backend.vcpu.get_sregs().unwrap().fs.base;
+    assert_eq!(installed_fs, 0, "the install sets a zero FS base");
     let second = futures::executor::block_on(
         backend.run_static_elf_with_tool_completion::<QuietTool>((), false),
     )
@@ -395,8 +458,9 @@ fn a_startup_callback_base_does_not_reach_the_next_run_on_the_same_backend() {
     let (status, _, _) = second.result.unwrap();
     assert_eq!(status, reverie::ExitStatus::Exited(0));
     let fs = backend.vcpu.get_sregs().unwrap().fs.base;
-    assert_ne!(
-        fs, STARTUP_STALE_FS,
-        "the second run's vCPU took the first run's staged FS base"
+    assert_eq!(
+        fs, installed_fs,
+        "the second run's vCPU FS base is not the one its install set \
+         (the first run's staged base was {STARTUP_STALE_FS:#x})"
     );
 }

@@ -1565,8 +1565,8 @@ pub struct KvmBackend {
     /// GS applies only the GS base to the vCPU, although the provider records
     /// both. The provider contract (`ProviderOutcome::SegmentBase`) is per
     /// register; KVM's fix is a separate, behaviour-changing commit, drafted
-    /// as an issue in the dev-hermit parent
-    /// (pending-issue-reverie-kvm-segment-slot.md).
+    /// as an issue in the dev-hermit parent repository, at
+    /// ai_docs/evidence/kvm-kernel-trait-design-20261016/pending-issue-reverie-kvm-segment-slot.md.
     pending_segment: Option<(SegmentBase, u64)>,
 }
 
@@ -2188,7 +2188,7 @@ impl KvmBackend {
         self.static_elf = Some(loaded);
         // A new image starts a new task lifetime: nothing staged for an
         // earlier one survives (on the base it died with that executor).
-        self.pending_segment = None;
+        self.clear_pending_segment();
         self.vcpu.new_elf_guest();
         Ok(())
     }
@@ -2463,7 +2463,7 @@ impl KvmBackend {
         executor.replace_after_exec(loaded);
         // An exec discards a base staged for the old image, as
         // replace_after_exec discards the executor's.
-        self.pending_segment = None;
+        self.clear_pending_segment();
         Ok(())
     }
 
@@ -2487,8 +2487,10 @@ impl KvmBackend {
         self.pending_segment.take()
     }
 
-    /// Discards any staged base when a new task lifetime begins on this
-    /// backend, as a new executor's slot started empty.
+    /// Discards any staged base. Every clear goes through here: an installed
+    /// image and a run's new root executor (a new task lifetime on this
+    /// backend, as a new executor's slot started empty), and an exec (as
+    /// `replace_after_exec` discards the executor's).
     pub(crate) fn clear_pending_segment(&mut self) {
         self.pending_segment = None;
     }
@@ -5033,7 +5035,7 @@ impl KvmBackend {
         self.admit_host_metadata_timestamps(false)?;
         let loaded = self.static_elf.take().ok_or(Error::StaticElfNotInstalled)?;
         // A new root executor starts with an empty segment slot.
-        self.pending_segment = None;
+        self.clear_pending_segment();
         let mut executor = ElfExecutor::with_output(loaded, None);
         let result = self.run_static_elf_process(&mut executor);
         let (status, _, _) = result.map_err(|error| self.finish_direct_process_error(error))?;
@@ -5055,7 +5057,7 @@ impl KvmBackend {
         let capture_owner = self.prepare_captured_output(true)?;
         let loaded = self.static_elf.take().ok_or(Error::StaticElfNotInstalled)?;
         // A new root executor starts with an empty segment slot.
-        self.pending_segment = None;
+        self.clear_pending_segment();
         let mut executor = ElfExecutor::with_output(loaded, capture_owner.clone());
         let result = self.run_static_elf_process(&mut executor);
         let (status, stdout, stderr) =
