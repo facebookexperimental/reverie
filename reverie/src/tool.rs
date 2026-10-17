@@ -848,7 +848,7 @@ pub trait Tool: Send + Sync + Default {
     /// otherwise invisible to the Tool, so a Tool that must keep exactly one
     /// copy of a signal (for example, its own copy of one the kernel also
     /// sent) needs to see it here. Every such signal is shown, whatever its
-    /// number, siginfo or sender, including the backend's own, which Linux
+    /// number (realtime signals included), siginfo or sender, including the backend's own, which Linux
     /// does not tell apart from a guest's signal of the same number (the
     /// ptrace backend's: a SIGSTOP of a gdb freeze or of a group-stop request,
     /// and its timer's signal, SIGSTKFLT). Dropping one of those breaks the
@@ -868,9 +868,7 @@ pub trait Tool: Send + Sync + Default {
     ///  - `false`: the signal is dropped and never delivered to the guest.
     ///
     /// The default keeps every signal. A backend that never passes a signal
-    /// on unreported never calls it. A realtime signal, which
-    /// [`UnreportedSignal`](crate::UnreportedSignal) cannot name, is not
-    /// shown and is always kept.
+    /// on unreported never calls it.
     async fn filter_unreported_signal<R: GlobalRPC<Self::GlobalState>>(
         &self,
         _rpc: &R,

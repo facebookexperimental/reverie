@@ -9931,9 +9931,22 @@ mod tests {
         assert_eventually_reaped("GlobalTool failure in preinit", pid);
     }
 
-    /// The signals `RecordUnreported`'s filter was shown, as (signal,
-    /// `si_code`).
-    static RECORDED_UNREPORTED: StdMutex<Vec<(i32, i32)>> = StdMutex::new(Vec::new());
+    /// The signals `RecordUnreported`'s filter was shown, as (process,
+    /// signal number, `si_code`).
+    static RECORDED_UNREPORTED: StdMutex<Vec<(i32, i32, i32)>> = StdMutex::new(Vec::new());
+
+    /// The (signal number, `si_code`) pairs `RecordUnreported`'s filter was
+    /// shown for process `pid`, so tests sharing the record in one process
+    /// see only their own.
+    fn recorded_unreported_for(pid: Pid) -> Vec<(i32, i32)> {
+        RECORDED_UNREPORTED
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(process, _, _)| *process == pid.as_raw())
+            .map(|&(_, signal, code)| (signal, code))
+            .collect()
+    }
 
     /// A Tool whose `filter_unreported_signal` records each signal and keeps
     /// it.
@@ -9953,10 +9966,11 @@ mod tests {
             let code = signal.siginfo().map_or(0, |info| {
                 i32::from_ne_bytes(info[8..12].try_into().unwrap())
             });
-            RECORDED_UNREPORTED
-                .lock()
-                .unwrap()
-                .push((signal.signal() as i32, code));
+            RECORDED_UNREPORTED.lock().unwrap().push((
+                signal.pid().as_raw(),
+                signal.number(),
+                code,
+            ));
             true
         }
     }
@@ -9970,7 +9984,6 @@ mod tests {
     /// is pending when the special-page mmap's step runs.
     #[tokio::test(flavor = "current_thread")]
     async fn a_pre_exec_childs_exit_during_first_initialization_is_filtered() {
-        RECORDED_UNREPORTED.lock().unwrap().clear();
         let mut command = Command::new("/bin/true");
         // SAFETY: the callback only forks; the child closes the descriptors
         // it inherited and waits. It must close the spawn's close-on-exec
@@ -10032,16 +10045,67 @@ mod tests {
         .await
         .expect("spawn ends within 5 s")
         .expect("spawn");
-        assert!(acted.lock().unwrap().is_some(), "the hook killed the child");
+        let root = acted.lock().unwrap().expect("the hook killed the child");
         let (status, ()) = tokio::time::timeout(Duration::from_secs(5), tracer.wait())
             .await
             .expect("the run ends within 5 s")
             .expect("the run");
         assert_eq!(status, ExitStatus::Exited(0));
         assert_eq!(
-            *RECORDED_UNREPORTED.lock().unwrap(),
+            recorded_unreported_for(root),
             vec![(libc::SIGCHLD, libc::CLD_KILLED)],
             "the pre_exec child's exit SIGCHLD is shown to the filter once"
+        );
+    }
+
+    /// A realtime signal passed on unreported is shown to
+    /// `Tool::filter_unreported_signal` with its number, as any other signal
+    /// is (<https://github.com/rrnewton/reverie/issues/207>). As the root's
+    /// registers are saved, the hook sends it signal 40, so the special-page
+    /// mmap's step stops for it. A `pre_exec` callback makes the root ignore
+    /// signal 40: a traced thread still stops for an ignored signal, and the
+    /// kernel discards it once passed on, so `/bin/true` exits 0.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_realtime_signal_during_first_initialization_is_filtered() {
+        const REALTIME: i32 = 40;
+        let mut command = Command::new("/bin/true");
+        // SAFETY: the callback only sets one signal's disposition.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::signal(REALTIME, libc::SIG_IGN) == libc::SIG_ERR {
+                    return Err(Errno::last());
+                }
+                Ok(())
+            });
+        }
+        let (hook, signalled) = at_first_regs_saved(|pid| {
+            // SAFETY: sends a signal to the stopped tracee.
+            let sent =
+                unsafe { libc::syscall(libc::SYS_tgkill, pid.as_raw(), pid.as_raw(), REALTIME) };
+            assert_eq!(sent, 0, "signal {REALTIME} to {pid}: {}", Errno::last());
+        });
+        let tracer = tokio::time::timeout(
+            Duration::from_secs(5),
+            TracerBuilder::<RecordUnreported>::new(command)
+                .preinit_point_for_test(hook)
+                .spawn(),
+        )
+        .await
+        .expect("spawn ends within 5 s")
+        .expect("spawn");
+        let root = signalled
+            .lock()
+            .unwrap()
+            .expect("the hook signalled the root");
+        let (status, ()) = tokio::time::timeout(Duration::from_secs(5), tracer.wait())
+            .await
+            .expect("the run ends within 5 s")
+            .expect("the run");
+        assert_eq!(status, ExitStatus::Exited(0));
+        assert_eq!(
+            recorded_unreported_for(root),
+            vec![(REALTIME, libc::SI_TKILL)],
+            "the realtime signal is shown to the filter once, with its number"
         );
     }
 

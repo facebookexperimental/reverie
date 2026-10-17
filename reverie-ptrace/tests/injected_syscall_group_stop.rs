@@ -268,8 +268,9 @@ impl Tool for DropUnreportedSigchld {
             i32::from_ne_bytes(info[8..12].try_into().unwrap())
         });
         let signal = unreported.signal();
-        rpc.send_rpc(Report::Filtered(signal as i32, si_code)).await;
-        !matches!(signal, Signal::SIGCHLD | Signal::SIGSTKFLT)
+        rpc.send_rpc(Report::Filtered(unreported.number(), si_code))
+            .await;
+        !matches!(signal, Some(Signal::SIGCHLD | Signal::SIGSTKFLT))
     }
 }
 
@@ -8962,8 +8963,9 @@ impl Tool for BlockInFirstSignalHookDropUnreported {
             i32::from_ne_bytes(info[8..12].try_into().unwrap())
         });
         let signal = unreported.signal();
-        rpc.send_rpc(Report::Filtered(signal as i32, si_code)).await;
-        !matches!(signal, Signal::SIGUSR1 | Signal::SIGSYS)
+        rpc.send_rpc(Report::Filtered(unreported.number(), si_code))
+            .await;
+        !matches!(signal, Some(Signal::SIGUSR1 | Signal::SIGSYS))
     }
 }
 
@@ -9203,9 +9205,9 @@ impl Tool for QueueAndBlockSigusr1InFirstHook {
         let si_code = unreported.siginfo().map_or(0, |info| {
             i32::from_ne_bytes(info[8..12].try_into().unwrap())
         });
-        let signal = unreported.signal();
-        rpc.send_rpc(Report::Filtered(signal as i32, si_code)).await;
-        if signal != Signal::SIGUSR1 {
+        rpc.send_rpc(Report::Filtered(unreported.number(), si_code))
+            .await;
+        if unreported.signal() != Some(Signal::SIGUSR1) {
             return true;
         }
         let pid = unreported.pid().as_raw();

@@ -4913,13 +4913,12 @@ impl<L: Tool + 'static> TracedTask<L> {
     /// Tool that keeps the signals it does not own, as the hook's contract
     /// requires and its default does.
     async fn keeps_unreported_signal(&self, sig: AnySignal, info: Option<SiginfoBytes>) -> bool {
-        // `UnreportedSignal` names a signal with nix's `Signal`, which has no
-        // realtime signals; one is kept, as the hook's default keeps every
-        // signal (https://github.com/rrnewton/reverie/issues/207).
-        let Some(sig) = sig.as_nix() else {
+        // Every `AnySignal` is numbered 1 to 64, which `from_number` accepts.
+        let Some(unreported) =
+            reverie::UnreportedSignal::from_number(self.pid(), self.tid(), sig.raw(), info)
+        else {
             return true;
         };
-        let unreported = reverie::UnreportedSignal::new(self.pid(), self.tid(), sig, info);
         let keep = self
             .process_state
             .clone()

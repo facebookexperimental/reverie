@@ -21,14 +21,15 @@ pub const SIGNAL_INFO_SIZE: usize = 128;
 /// A signal that a backend is about to pass to the guest without reporting it
 /// to [`crate::Tool::handle_signal_event`], as
 /// [`crate::Tool::filter_unreported_signal`] sees it: which thread takes it,
-/// the signal, and the Linux `siginfo_t` bytes it arrived with when the
-/// backend recorded them. It is read-only metadata, so deciding about the
-/// signal cannot change the guest.
+/// the signal's number, and the Linux `siginfo_t` bytes it arrived with when
+/// the backend recorded them. The number can be a realtime signal (32 to 64),
+/// which [`crate::Signal`] cannot name. It is read-only metadata, so deciding
+/// about the signal cannot change the guest.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UnreportedSignal {
     pid: Pid,
     tid: Tid,
-    signal: crate::Signal,
+    number: i32,
     siginfo: Option<[u8; SIGNAL_INFO_SIZE]>,
 }
 
@@ -43,9 +44,28 @@ impl UnreportedSignal {
         Self {
             pid,
             tid,
-            signal,
+            number: signal as i32,
             siginfo,
         }
+    }
+
+    /// Describes the signal numbered `number` taken by thread `tid` of process
+    /// `pid`, or `None` when Linux has no such signal (it has 1 to 64).
+    pub const fn from_number(
+        pid: Pid,
+        tid: Tid,
+        number: i32,
+        siginfo: Option<[u8; SIGNAL_INFO_SIZE]>,
+    ) -> Option<Self> {
+        if number < 1 || number > 64 {
+            return None;
+        }
+        Some(Self {
+            pid,
+            tid,
+            number,
+            siginfo,
+        })
     }
 
     /// The process of the thread that takes the signal.
@@ -58,9 +78,15 @@ impl UnreportedSignal {
         self.tid
     }
 
-    /// The signal.
-    pub const fn signal(&self) -> crate::Signal {
-        self.signal
+    /// The signal's number, 1 to 64.
+    pub const fn number(&self) -> i32 {
+        self.number
+    }
+
+    /// The signal, or `None` for a realtime signal, which [`crate::Signal`]
+    /// cannot name; [`Self::number`] gives every signal.
+    pub fn signal(&self) -> Option<crate::Signal> {
+        crate::Signal::try_from(self.number).ok()
     }
 
     /// The Linux `siginfo_t` bytes the signal arrived with, when recorded.
@@ -332,5 +358,39 @@ mod tests {
             Err(Errno::EINVAL),
             "accepted an event whose signal and siginfo.si_signo disagree",
         );
+    }
+
+    #[test]
+    fn unreported_signal_names_every_linux_signal_by_number() {
+        let (pid, tid) = (Pid::from_raw(41), Pid::from_raw(42));
+        let standard = UnreportedSignal::new(pid, tid, crate::Signal::SIGUSR1, None);
+        assert_eq!(standard.number(), libc::SIGUSR1);
+        assert_eq!(standard.signal(), Some(crate::Signal::SIGUSR1));
+        assert_eq!(
+            UnreportedSignal::from_number(pid, tid, libc::SIGUSR1, None),
+            Some(standard)
+        );
+
+        let info = siginfo(40);
+        let realtime = UnreportedSignal::from_number(pid, tid, 40, Some(info)).unwrap();
+        assert_eq!(
+            (realtime.pid(), realtime.tid(), realtime.number()),
+            (pid, tid, 40)
+        );
+        assert_eq!(realtime.signal(), None, "nix cannot name a realtime signal");
+        assert_eq!(realtime.siginfo(), Some(info));
+        for edge in [1, 31, 32, 64] {
+            assert_eq!(
+                UnreportedSignal::from_number(pid, tid, edge, None).map(|s| s.number()),
+                Some(edge)
+            );
+        }
+        for invalid in [i32::MIN, -1, 0, 65, i32::MAX] {
+            assert_eq!(
+                UnreportedSignal::from_number(pid, tid, invalid, None),
+                None,
+                "accepted invalid signal {invalid}",
+            );
+        }
     }
 }
