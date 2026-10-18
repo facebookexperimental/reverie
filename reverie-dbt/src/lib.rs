@@ -674,6 +674,20 @@ where
         DbtMemory::new()
     }
 
+    // The application's own auxiliary vector, the one on its initial stack,
+    // rather than the kernel's saved copy in `/proc/<pid>/auxv` that the
+    // default reads. The kernel exec'd DynamoRIO's library, and DynamoRIO
+    // rewrites only the application's vector: the kernel's copy keeps the
+    // library's AT_ENTRY, AT_PHDR and AT_BASE, and where the application's
+    // path does not fit in the space the library's took, its AT_EXECFN points
+    // at storage DynamoRIO has cleared. Falls back to the kernel's copy where
+    // the application's cannot be read, as the default would.
+    fn auxv(&self) -> reverie::Auxv {
+        application_auxv(self.read_memory)
+            .or_else(kernel_auxv)
+            .expect("failed to read auxv table")
+    }
+
     fn thread_state_mut(&mut self) -> &mut T::ThreadState {
         self.thread_state
     }
@@ -892,6 +906,91 @@ fn read_guest_word_from_process(addr: u64) -> Option<u64> {
         Some(value)
     } else {
         None
+    }
+}
+
+/// The auxiliary vector on this process's initial stack, from the start of
+/// that stack (`startstack`, field 28 of `/proc/self/stat`, where the kernel
+/// put argc). `None` where the stat record or any word cannot be read.
+fn application_auxv(read_memory: Option<MemoryReader>) -> Option<reverie::Auxv> {
+    let stat = std::fs::read("/proc/self/stat").ok()?;
+    let fields = &stat[stat.iter().rposition(|&byte| byte == b')')? + 2..];
+    let start = std::str::from_utf8(fields.split(|&byte| byte == b' ').nth(28 - 3)?)
+        .ok()?
+        .parse::<u64>()
+        .ok()?;
+    auxv_after_initial_stack(start, |address| read_guest_word(read_memory, address))
+}
+
+/// The kernel's saved copy of this process's auxiliary vector.
+fn kernel_auxv() -> Option<reverie::Auxv> {
+    auxv_from_kernel_bytes(&std::fs::read("/proc/self/auxv").ok()?)
+}
+
+/// The auxiliary vector in `bytes`, as `/proc/<pid>/auxv` lays it out:
+/// whole key/value pairs up to a (0, 0) pair. `None` where the bytes end
+/// before that pair, whether after whole pairs or inside one, as
+/// `Auxv::new` refuses them.
+fn auxv_from_kernel_bytes(bytes: &[u8]) -> Option<reverie::Auxv> {
+    let mut entries = Vec::new();
+    for pair in bytes.chunks(16) {
+        let pair: &[u8; 16] = pair.try_into().ok()?;
+        let (key, value) = pair.split_at(8);
+        let key = u64::from_ne_bytes(key.try_into().unwrap());
+        let value = u64::from_ne_bytes(value.try_into().unwrap());
+        if key == 0 && value == 0 {
+            return Some(reverie::Auxv::from_entries(entries));
+        }
+        entries.push((key, value));
+    }
+    None
+}
+
+/// The auxiliary vector of the initial stack at `start`: argc, argc argument
+/// pointers and a null, environment pointers up to a null, then the vector's
+/// pairs up to AT_NULL (the System V x86-64 ABI's process-initialization
+/// layout). `None` where a word cannot be read or a bound is passed.
+fn auxv_after_initial_stack(
+    start: u64,
+    read_word: impl Fn(u64) -> Option<u64>,
+) -> Option<reverie::Auxv> {
+    // Linux bounds the argument and environment strings by a quarter of the
+    // stack limit; this bound only stops a walk of a corrupted stack.
+    const MOST_POINTERS: u64 = 1 << 22;
+    const MOST_ENTRIES: u64 = 256;
+    const WORD: u64 = std::mem::size_of::<u64>() as u64;
+    if start == 0 {
+        return None;
+    }
+    let argc = read_word(start)?;
+    if argc >= MOST_POINTERS {
+        return None;
+    }
+    let argv_end = start.checked_add((1 + argc) * WORD)?;
+    if read_word(argv_end)? != 0 {
+        return None;
+    }
+    let mut cursor = argv_end + WORD;
+    let mut pointers = 0;
+    while read_word(cursor)? != 0 {
+        pointers += 1;
+        if pointers == MOST_POINTERS {
+            return None;
+        }
+        cursor = cursor.checked_add(WORD)?;
+    }
+    cursor = cursor.checked_add(WORD)?;
+    let mut entries = Vec::new();
+    loop {
+        let key = read_word(cursor)?;
+        if key == libc::AT_NULL {
+            return Some(reverie::Auxv::from_entries(entries));
+        }
+        entries.push((key, read_word(cursor.checked_add(WORD)?)?));
+        if entries.len() as u64 == MOST_ENTRIES {
+            return None;
+        }
+        cursor = cursor.checked_add(2 * WORD)?;
     }
 }
 
@@ -2428,6 +2527,117 @@ pub unsafe extern "C" fn reverie_dbt_runtime_totals(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A word of `stack`, as if it started at address 0x1000.
+    fn word_of(stack: &[u64]) -> impl Fn(u64) -> Option<u64> + '_ {
+        |address| {
+            let offset = address.checked_sub(0x1000)?;
+            (offset % 8 == 0)
+                .then(|| stack.get((offset / 8) as usize).copied())
+                .flatten()
+        }
+    }
+
+    #[test]
+    fn the_auxv_follows_the_arguments_and_the_environment() {
+        let stack = [
+            2,
+            0xa0,
+            0xa8,
+            0, // argc, argv, null
+            0xb0,
+            0xb8,
+            0xc0,
+            0, // envp, null
+            libc::AT_PAGESZ,
+            4096,
+            libc::AT_EXECFN,
+            0xd0,
+            libc::AT_NULL,
+            0,
+        ];
+        let auxv = auxv_after_initial_stack(0x1000, word_of(&stack)).expect("a vector");
+        assert_eq!(auxv.len(), 2);
+        assert_eq!(auxv.at_execfn().map(|address| address.as_raw()), Some(0xd0));
+
+        let empty_environment = [0, 0, 0, libc::AT_EXECFN, 0xd0, libc::AT_NULL, 0];
+        let auxv = auxv_after_initial_stack(0x1000, word_of(&empty_environment)).expect("a vector");
+        assert_eq!(auxv.at_execfn().map(|address| address.as_raw()), Some(0xd0));
+    }
+
+    #[test]
+    fn a_stack_that_cannot_be_walked_whole_gives_no_auxv() {
+        // argv's terminator is not null.
+        let unterminated = [1, 0xa0, 0xa8, 0, 0, libc::AT_NULL, 0];
+        assert!(auxv_after_initial_stack(0x1000, word_of(&unterminated)).is_none());
+        // The stack ends before AT_NULL.
+        let cut = [0, 0, 0, libc::AT_EXECFN, 0xd0];
+        assert!(auxv_after_initial_stack(0x1000, word_of(&cut)).is_none());
+        assert!(auxv_after_initial_stack(0, word_of(&cut)).is_none());
+    }
+
+    /// `pairs` as `/proc/<pid>/auxv` bytes.
+    fn auxv_bytes(pairs: &[(u64, u64)]) -> Vec<u8> {
+        pairs
+            .iter()
+            .flat_map(|(key, value)| [key.to_ne_bytes(), value.to_ne_bytes()])
+            .flatten()
+            .collect()
+    }
+
+    #[test]
+    fn the_kernels_auxv_is_read_up_to_its_terminating_pair() {
+        let auxv = auxv_from_kernel_bytes(&auxv_bytes(&[
+            (libc::AT_PAGESZ, 4096),
+            (libc::AT_EXECFN, 0xd0),
+            (0, 0),
+        ]))
+        .expect("a whole, terminated vector");
+        assert_eq!(auxv.len(), 2);
+        assert_eq!(auxv.at_execfn().map(|address| address.as_raw()), Some(0xd0));
+    }
+
+    #[test]
+    fn an_incomplete_kernel_auxv_is_refused() {
+        assert!(auxv_from_kernel_bytes(b"").is_none(), "empty");
+        let whole = auxv_bytes(&[(libc::AT_PAGESZ, 4096), (libc::AT_EXECFN, 0xd0)]);
+        assert!(
+            auxv_from_kernel_bytes(&whole).is_none(),
+            "whole pairs without the terminating pair"
+        );
+        let mut partial = whole.clone();
+        partial.extend_from_slice(&0_u64.to_ne_bytes());
+        assert!(
+            auxv_from_kernel_bytes(&partial).is_none(),
+            "a partial pair where the terminating pair should be"
+        );
+        let cut_entry = &whole[..whole.len() - 3];
+        assert!(
+            auxv_from_kernel_bytes(cut_entry).is_none(),
+            "an entry cut inside its value"
+        );
+    }
+
+    #[test]
+    fn this_processs_initial_stack_holds_the_kernels_auxv() {
+        // Natively, the vector on the initial stack is the one the kernel
+        // saved; nothing has rewritten either.
+        let auxv = application_auxv(None).expect("this process's vector");
+        let kernel = kernel_auxv().expect("the kernel's vector");
+        assert_eq!(auxv.len(), kernel.len());
+        assert_eq!(
+            auxv.at_execfn().map(|address| address.as_raw()),
+            kernel.at_execfn().map(|address| address.as_raw())
+        );
+        assert_eq!(
+            auxv.at_random().map(|address| address.as_raw()),
+            kernel.at_random().map(|address| address.as_raw())
+        );
+        assert_eq!(
+            auxv.at_execfn().map(|address| address.as_raw()),
+            Some(unsafe { libc::getauxval(libc::AT_EXECFN) } as usize)
+        );
+    }
 
     #[derive(Default)]
     struct SignalProbe(u8);
