@@ -3080,10 +3080,23 @@ client_process_bb(dcontext_t *dcontext, build_bb_t *bb)
             }
         }
 #endif
-        /* We do not take instr_length of what the client put in, but rather
-         * the length of the translation target
+        /* A terminal app jump may translate to its own explicit target, even
+         * outside the original source region (see the check above).  That target
+         * need not be readable: execution, not fragment construction, must fault
+         * there.  Its exit is already known and has no fall-through to infer.
+         * Keep the original decoded source extent for selfmod sandboxing rather
+         * than treating the successor's instruction as part of this block.
          */
-        if (!adjusted_cur_pc) {
+        bool terminal_jump_translation =
+            xl8 != NULL && instr_is_near_ubr(last_app_instr) &&
+            opnd_is_pc(instr_get_target(last_app_instr)) &&
+            xl8 == opnd_get_pc(instr_get_target(last_app_instr)) &&
+            bb->exit_target == xl8;
+        /* For other shapes use the length of the original translation target,
+         * not instr_length of what the client put in.  Preserve the annotation
+         * and intercepted-code adjustments above.
+         */
+        if (!adjusted_cur_pc && !terminal_jump_translation) {
             bb->cur_pc = decode_next_pc(dcontext, xl8);
             LOG(THREAD, LOG_INTERP, 3, "setting cur_pc (for fall-through) to " PFX "\n",
                 bb->cur_pc);
