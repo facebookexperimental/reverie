@@ -17,8 +17,12 @@
 
 #include "elf_loading.h"
 #include "macros.h"
+#include <stdint.h>
 
 #define MAX_PHNUM 16
+/* Address space first tried above a PIE client's image for its program break
+ * (64 GiB); see elfld_load_elf. */
+#define CLIENT_BRK_HEADROOM ((size_t)1 << 36)
 
 static Elf *open_elf(const char *elf_path, int *fd) {
   if (elf_version(EV_CURRENT) == EV_NONE)
@@ -276,19 +280,71 @@ ElfW(Addr) elfld_load_elf(int fd, ElfW(Ehdr) const *ehdr, size_t pagesize,
    */
   uintptr_t mapping;
   uintptr_t hint = round_down(first_load->p_vaddr, pagesize);
-  mapping = (uintptr_t)mmap((void *)hint, span, prot_from_phdr(first_load),
-                            MAP_PRIVATE, fd,
+  /*
+   * The client's program break starts at the end of its image. The kernel
+   * puts a PIE executable far below the mmap area, so its heap has room to
+   * grow; this loader maps it with mmap, which places it directly below the
+   * last mapping made (for example one of the loader's own malloc pages, each
+   * its own mapping since M_MMAP_THRESHOLD is 0), leaving no room above the
+   * break. So for a position-independent client, reserve its page-rounded
+   * span plus headroom, map the image at the bottom of the reservation and
+   * release the rest: later top-down mappings fill that hole from its top, so
+   * the space just above the break stays free until they have used the whole
+   * headroom. The headroom starts at CLIENT_BRK_HEADROOM and halves when a
+   * reservation fails (for example under RLIMIT_AS, which counts PROT_NONE
+   * reservations too), down to one page; if even that fails, the image is
+   * mapped as before (the image's own mapping is then unlikely to fit).
+   * This relies on the default top-down mmap layout; under the legacy
+   * bottom-up layout (vm.legacy_va_layout, or an unlimited stack rlimit,
+   * which makes Linux choose it) later mappings fill the hole from its
+   * bottom, which is no worse than mapping the image directly.
+   */
+  int map_flags = MAP_PRIVATE;
+  size_t map_length = span;
+  uintptr_t image_end;
+  if (ehdr->e_type == ET_DYN && out_phdr != NULL &&
+      !__builtin_add_overflow(last_load->p_vaddr, last_load->p_memsz,
+                              &image_end) &&
+      image_end <= UINTPTR_MAX - (pagesize - 1) &&
+      round_up(image_end, pagesize) > hint) {
+    size_t image_span = round_up(image_end, pagesize) - hint;
+    for (size_t headroom = CLIENT_BRK_HEADROOM; headroom >= pagesize;
+         headroom /= 2) {
+      if (image_span > SIZE_MAX - headroom)
+        continue;
+      void *reserved =
+          mmap(NULL, image_span + headroom, PROT_NONE,
+               MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+      if (reserved == MAP_FAILED)
+        continue;
+      if (munmap((char *)reserved + image_span, headroom) != 0) {
+        /* Free the whole reservation and try a smaller one. If even that
+         * fails, stop and map the image as before. */
+        if (munmap(reserved, image_span + headroom) != 0)
+          break;
+        continue;
+      }
+      hint = (uintptr_t)reserved;
+      map_flags |= MAP_FIXED;
+      /* Cover the whole reservation, so no PROT_NONE page stays at the top
+       * when the first segment does not start on a page boundary. */
+      map_length = image_span;
+      break;
+    }
+  }
+  mapping = (uintptr_t)mmap((void *)hint, map_length,
+                            prot_from_phdr(first_load), map_flags, fd,
                             round_down(first_load->p_offset, pagesize));
+
+  if ((void *)mapping == MAP_FAILED) {
+    _nx_fatal_printf("Failed to map segment.\n");
+  }
 
   if (hint != 0 && mapping != hint) {
     _nx_fatal_printf(
         "Failed to load client on the expected memory area. This "
         "might be that SaBRe was not compiled with PIE and reserves the memory "
         "area of the client.\n");
-  }
-
-  if ((void *)mapping == MAP_FAILED) {
-    _nx_fatal_printf("Failed to map segment.\n");
   }
 
   ElfW(Addr) load_bias = mapping - round_down(first_load->p_vaddr, pagesize);
