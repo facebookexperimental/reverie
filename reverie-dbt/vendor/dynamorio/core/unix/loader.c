@@ -462,6 +462,12 @@ privload_map_flags(modload_flags_t init_flags)
     /* XXX: Keep this condition matching the check in privload_unmap_file()
      * (minus MODLOAD_NOT_PRIVLIB since non-privlibs don't reach our unmap).
      */
+    /* Reverie: no separating page after the images mapped for the app (its
+     * own, whose break starts at that page, and its interpreter) where the
+     * client answers the app's brk.
+     */
+    if (TEST(MODLOAD_IS_APP, init_flags) && getenv(DYNAMORIO_VAR_TOOL_ANSWERS_BRK) != NULL)
+        return init_flags;
     if (INTERNAL_OPTION(separate_private_bss) && !TEST(MODLOAD_NOT_PRIVLIB, init_flags)) {
         /* place an extra no-access page after .bss */
         /* XXX: update privload_early_inject call to init_emulated_brk if this changes */
@@ -1891,6 +1897,12 @@ takeover_ptrace(ptrace_stack_args_t *args)
 static void
 reserve_brk(app_pc post_app)
 {
+    /* Reverie: a client that answers the app's brk itself never uses the
+     * kernel's break nor an emulated one, so reserve neither: no emulated
+     * region, and no nudge of the kernel's break.
+     */
+    if (getenv(DYNAMORIO_VAR_TOOL_ANSWERS_BRK) != NULL)
+        return;
     /* We haven't parsed the options yet, so we rely on drinjectlib
      * setting this env var if the user passed -no_emulate_brk:
      */

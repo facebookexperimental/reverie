@@ -621,6 +621,10 @@ typedef char liststring_t[MAX_LIST_OPTION_LENGTH];
 #    define DYNAMORIO_VAR_EXECVE "DYNAMORIO_POST_EXECVE"
 #    define DYNAMORIO_VAR_EXECVE_LOGDIR "DYNAMORIO_EXECVE_LOGDIR"
 #    define DYNAMORIO_VAR_NO_EMULATE_BRK "DYNAMORIO_NO_EMULATE_BRK"
+/* Reverie: set when the client answers the app's brk itself and never uses the
+ * kernel's break, so DynamoRIO reserves nothing for it.
+ */
+#    define DYNAMORIO_VAR_TOOL_ANSWERS_BRK "DYNAMORIO_TOOL_ANSWERS_BRK"
 #    define L_IF_WIN(x) x
 
 #else /* WINDOWS */

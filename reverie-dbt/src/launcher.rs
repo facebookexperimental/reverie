@@ -50,6 +50,10 @@ const PATH_ENV: &str = "PATH";
 /// guest's initial environment (with its own `DYNAMORIO_*` variables) and passes
 /// on to the children it follows.
 const HIDE_ENV_PREFIXES_ENV: &str = "DYNAMORIO_HIDE_ENV_PREFIXES";
+/// Tells the bundled DynamoRIO that the tool answers the guest's `brk(2)`
+/// itself ([`DbtRunner::tool_answers_brk`]). A `DYNAMORIO_*` variable, so the
+/// guest never sees it.
+const TOOL_ANSWERS_BRK_ENV: &str = "DYNAMORIO_TOOL_ANSWERS_BRK";
 /// The prefix of the runtime's private environment variables, such as
 /// [`crate::sync_rpc::RPC_SOCKET_ENV`] and Hermit's Detcore configuration. The
 /// launcher has DynamoRIO hide every variable with this prefix from the guest,
@@ -88,6 +92,7 @@ pub struct DbtRunner {
     isolated_process_group: bool,
     terminate_process_group_on_exit: bool,
     defer_evidence_finish: bool,
+    tool_answers_brk: bool,
 }
 
 // A blocking socket-to-pipe splice can hold the child's stdin pipe mutex
@@ -153,12 +158,26 @@ impl DbtRunner {
             isolated_process_group: false,
             terminate_process_group_on_exit: false,
             defer_evidence_finish: false,
+            tool_answers_brk: false,
         })
     }
 
     /// Enables or disables the instrumentation summary written at process exit.
     pub fn summary(mut self, enabled: bool) -> Self {
         self.summary = enabled;
+        self
+    }
+
+    /// Declares that the tool answers the guest's `brk(2)` itself, without
+    /// the kernel's program break. DynamoRIO then reserves nothing for the
+    /// break: no region of its own to emulate it in, no nudge of the kernel's
+    /// break, and no inaccessible page after the images it maps for the app
+    /// (the guest's own, where the break starts, and its interpreter's).
+    /// Without this, DynamoRIO answers `brk` from its own emulation, and the
+    /// runner removes the variable that tells DynamoRIO otherwise from every
+    /// environment the launch would pass on.
+    pub fn tool_answers_brk(mut self, enabled: bool) -> Self {
+        self.tool_answers_brk = enabled;
         self
     }
 
@@ -1119,6 +1138,14 @@ impl DbtRunner {
             }
         }
         command.env(HIDE_ENV_PREFIXES_ENV, PRIVATE_ENV_PREFIX);
+        // DynamoRIO acts on the variable's presence, whatever its value, so
+        // without the option it is removed from whichever environment the
+        // launch would otherwise pass on: inherited, the guest's, or explicit.
+        if self.tool_answers_brk {
+            command.env(TOOL_ANSWERS_BRK_ENV, "1");
+        } else {
+            command.env_remove(TOOL_ANSWERS_BRK_ENV);
+        }
         // A PID namespace's init contains the run by the namespace
         // (`terminate_run`); elsewhere the run gets its own process group.
         if self.manages_process_group() && !is_namespace_init() {
@@ -1930,6 +1957,7 @@ mod tests {
             isolated_process_group: false,
             terminate_process_group_on_exit: false,
             defer_evidence_finish: false,
+            tool_answers_brk: false,
         }
     }
 
@@ -2374,6 +2402,140 @@ mod tests {
                 (OsStr::new("ONLY"), Some(OsStr::new("guest")))
             ]
         );
+    }
+
+    /// The environment a launch through `runner` gives drrun, as a stand-in
+    /// drrun that prints its environment reports it.
+    fn drrun_environment(
+        runner: DbtRunner,
+        guest: &Command,
+        environment: Option<&BTreeMap<OsString, OsString>>,
+    ) -> String {
+        let directory = tempfile::tempdir().expect("stand-in drrun directory");
+        let drrun = directory.path().join("drrun");
+        std::fs::write(&drrun, "#!/bin/sh\nexec /usr/bin/env\n").expect("write stand-in drrun");
+        std::fs::set_permissions(&drrun, std::fs::Permissions::from_mode(0o755))
+            .expect("make stand-in drrun executable");
+        let runner = DbtRunner { drrun, ..runner };
+        // Another test's fork can still hold the script's write descriptor
+        // for a moment after it is written (ETXTBSY).
+        let mut attempts = 0;
+        let output = loop {
+            match runner.command(guest, environment).output() {
+                Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) && attempts < 50 => {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                result => break result.expect("run the stand-in drrun"),
+            }
+        };
+        assert!(output.status.success(), "stand-in drrun: {output:?}");
+        String::from_utf8(output.stdout).expect("environment should be UTF-8")
+    }
+
+    /// The variable's line in an environment listing, if any.
+    fn answers_brk_line(environment: &str) -> Option<String> {
+        environment
+            .lines()
+            .find(|line| line.starts_with(&format!("{TOOL_ANSWERS_BRK_ENV}=")))
+            .map(str::to_owned)
+    }
+
+    const ANSWERS_BRK: &str = "DYNAMORIO_TOOL_ANSWERS_BRK=1";
+
+    #[test]
+    fn only_a_tool_that_answers_brk_tells_dynamorio_so_whatever_the_guests_environment() {
+        let off = || runner().tool_answers_brk(true).tool_answers_brk(false);
+        // DynamoRIO acts on presence, so empty and "0" count as set.
+        for value in ["", "0", "1"] {
+            let environment =
+                BTreeMap::from([(OsString::from(TOOL_ANSWERS_BRK_ENV), OsString::from(value))]);
+            let plain = Command::new("/usr/bin/true");
+            let mut guest = Command::new("/usr/bin/true");
+            guest.env(TOOL_ANSWERS_BRK_ENV, value);
+            for (label, guest, environment) in [
+                ("an explicit environment", &plain, Some(&environment)),
+                ("the guest's environment", &guest, None),
+            ] {
+                for (mode, runner) in [("default", runner()), ("turned off", off())] {
+                    assert_eq!(
+                        answers_brk_line(&drrun_environment(runner, guest, environment)),
+                        None,
+                        "{mode}, {label} carrying {value:?}"
+                    );
+                }
+                assert_eq!(
+                    answers_brk_line(&drrun_environment(
+                        runner().tool_answers_brk(true),
+                        guest,
+                        environment
+                    ))
+                    .as_deref(),
+                    Some(ANSWERS_BRK),
+                    "on, {label} carrying {value:?}"
+                );
+            }
+        }
+    }
+
+    /// Set (to any value) only in the copy of this test binary that
+    /// [`a_tool_that_does_not_answer_brk_drops_an_inherited_variable`] runs,
+    /// where it asks [`inherited_tool_answers_brk_probe`] to report.
+    const INHERITED_PROBE_ENV: &str = "REVERIE_DBT_TEST_INHERITED_ANSWERS_BRK_PROBE";
+
+    /// Reports, from a process that inherited the variable, what drrun gets
+    /// with the option off and on. Run only by
+    /// [`a_tool_that_does_not_answer_brk_drops_an_inherited_variable`].
+    #[test]
+    #[ignore = "a probe that a_tool_that_does_not_answer_brk_drops_an_inherited_variable runs in a child"]
+    fn inherited_tool_answers_brk_probe() {
+        if std::env::var_os(INHERITED_PROBE_ENV).is_none() {
+            return;
+        }
+        let guest = Command::new("/usr/bin/true");
+        for (mode, runner) in [("off", runner()), ("on", runner().tool_answers_brk(true))] {
+            let line = answers_brk_line(&drrun_environment(runner, &guest, None));
+            println!("probe {mode}: {}", line.as_deref().unwrap_or("absent"));
+        }
+    }
+
+    #[test]
+    fn a_tool_that_does_not_answer_brk_drops_an_inherited_variable() {
+        // The variable is set in a child copy of this test binary, never in
+        // this process, whose environment the parallel tests share.
+        for value in ["", "0", "1"] {
+            let output = Command::new(std::env::current_exe().expect("this test binary"))
+                .args([
+                    "--exact",
+                    "launcher::tests::inherited_tool_answers_brk_probe",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(TOOL_ANSWERS_BRK_ENV, value)
+                .env(INHERITED_PROBE_ENV, "1")
+                .output()
+                .expect("run the probe");
+            assert!(output.status.success(), "probe: {output:?}");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // libtest's own "test ... " may share the first probe line.
+            let reported = |mode: &str| {
+                let marker = format!("probe {mode}: ");
+                stdout
+                    .lines()
+                    .find_map(|line| line.split_once(&marker).map(|(_, rest)| rest.to_owned()))
+            };
+            assert_eq!(
+                reported("off").as_deref(),
+                Some("absent"),
+                "{value:?}: {stdout}"
+            );
+            assert_eq!(
+                reported("on").as_deref(),
+                Some(ANSWERS_BRK),
+                "{value:?}: {stdout}"
+            );
+        }
     }
 
     #[test]
