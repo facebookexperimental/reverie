@@ -3879,7 +3879,12 @@ async fn postspawn<L: Tool + 'static>(
     ordinary_session.capture_root(&child);
     if !ordinary_session.is_failed() {
         child = match tracer.postspawn_preinit(child).await? {
-            PostspawnPreinit::Outcome(PreinitOutcome::Ready(child)) => child,
+            // A refused initialization has published its named primary
+            // failure. The ordinary driver must still consume the owned tree;
+            // returning a bare spawn errno here would bypass that cleanup.
+            PostspawnPreinit::Outcome(
+                PreinitOutcome::Ready(child) | PreinitOutcome::Refused(child),
+            ) => child,
             PostspawnPreinit::Outcome(PreinitOutcome::Exited(pid, exit_status)) => {
                 return Err(PostspawnError::Exited { pid, exit_status });
             }
@@ -9819,14 +9824,14 @@ mod tests {
     /// Kills `/bin/true` at `point` after its exec, and requires the run to
     /// report the kill, with no task aborting on a bare errno. The points of
     /// `tracee_preinit` are hit before the exec too, so the kill is at their
-    /// second hit; the post-exec step's points are hit only after it.
+    /// second hit; the exec-return drain's points are hit only after it.
     async fn exec_preinit_killed_at<T: Tool<GlobalState = ()> + Default + 'static>(
         point: crate::task::PreinitPoint,
         mode: PreinitKillMode,
     ) -> Result<(), String> {
         use crate::task::PreinitPoint::*;
         let nth = match point {
-            ExecStopped | PostExecStepped => 1,
+            ExecStopped | PostExecDrained => 1,
             RegsSaved
             | CodeRead
             | MmapStepped
@@ -9946,8 +9951,8 @@ mod tests {
         exec_preinit_kill_vdso_writable_exited: exec_preinit_killed_at::<AllSyscallsTool>(VdsoWritable, Exited);
         exec_stopped_kill_exit_stop_vdso: exec_preinit_killed_at::<AllSyscallsTool>(ExecStopped, ExitStop);
         exec_stopped_kill_exit_stop_no_vdso: exec_preinit_killed_at::<InitFailureTool>(ExecStopped, ExitStop);
-        post_exec_stepped_kill_exited_vdso: exec_preinit_killed_at::<AllSyscallsTool>(PostExecStepped, Exited);
-        post_exec_stepped_kill_exited_no_vdso: exec_preinit_killed_at::<InitFailureTool>(PostExecStepped, Exited);
+        post_exec_drained_kill_exited_vdso: exec_preinit_killed_at::<AllSyscallsTool>(PostExecDrained, Exited);
+        post_exec_drained_kill_exited_no_vdso: exec_preinit_killed_at::<InitFailureTool>(PostExecDrained, Exited);
         postspawn_preinit_kill_regs_saved_exit_stop: postspawn_preinit_killed_at::<AllSyscallsTool>(RegsSaved, ExitStop);
         postspawn_preinit_kill_code_read_exit_stop: postspawn_preinit_killed_at::<AllSyscallsTool>(CodeRead, ExitStop);
         postspawn_preinit_kill_regs_saved_exited: postspawn_preinit_killed_at::<AllSyscallsTool>(RegsSaved, Exited);
