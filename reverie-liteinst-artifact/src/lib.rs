@@ -709,7 +709,7 @@ fn content_manifest_relative(image_kind: FixedImageKind) -> &'static str {
 }
 // Reviewed literal expectations, not hashes generated from the current checkout
 // or bytes embedded after a runtime edit. The qualifier self-hash is separate.
-const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 33] = [
+const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 21] = [
     (
         "Cargo.toml",
         897,
@@ -722,13 +722,13 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 33] = [
     ),
     (
         "reverie-inguest/Cargo.toml",
-        4554,
-        "77aa43e993063b3cc9fe8bb835016407c4821c0c7648217795570f8c83f2ac20",
+        4479,
+        "d3179a317a2adaf2096de400cb5591251bd7966e32f74ac8124684d1c6c9778d",
     ),
     (
         "reverie-inguest/src/lib.rs",
-        11580,
-        "26981c2ee6ed9503efc0d7f972b6f66d8608268d28aebda7c87e4ba965d8e384",
+        11558,
+        "e9307dfc7e9f2d7395cbb33d36ff4a955fc6ca581565fb638305c98a77435224",
     ),
     (
         "reverie-syscalls/Cargo.toml",
@@ -752,8 +752,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 33] = [
     ),
     (
         "reverie-liteinst/src/lib.rs",
-        23358,
-        "dcef268182caa4389128efbff48dbf2a2e9dc1b66c56a9ba42c864ab767d3231",
+        23303,
+        "7c1363a338def1d00f83fff72605fd11ed7ef4cdbf7fd3630ce800530a360aed",
     ),
     (
         "reverie-liteinst-preload/Cargo.toml",
@@ -807,73 +807,13 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 33] = [
     ),
     (
         "reverie-inguest/src/guest/host.rs",
-        181365,
-        "131df70b35d50552aeef6971c4aad28af871a5f9f8955c893add5a29affedc39",
-    ),
-    (
-        "reverie-inguest/src/guest/tool_install.rs",
-        21609,
-        "63f4cbfce87be7e237a4d6e148063d1521afdf09aa54742f1845163a5ae99bbb",
+        166033,
+        "f363e1cd9be23b1f0acd3a93a49e8fc5234a5e953f9aa4a798d9d8d13275648c",
     ),
     (
         "reverie-liteinst/src/tool_host.rs",
-        46669,
-        "9281dd39740041eb464162b36d84e4affb06f9bfbd65c29e2a9b2cdf49e4c323",
-    ),
-    (
-        "reverie-inguest/build.rs",
-        2588,
-        "0d225fec6de6e186da764d0303793855b7cd334401f7fc616146960aa01194a0",
-    ),
-    (
-        "reverie-inguest/src/bootstrap.rs",
-        15163,
-        "6b73cfeb64c048ce5548b0a15fd9a445a18f05ff188e0070a4fd32b760eb4859",
-    ),
-    (
-        "reverie-inguest/src/launcher/mod.rs",
-        93950,
-        "5562e64b20e1866e1de41eeed03a701c22e7e7783749026bb26d51893de0d29d",
-    ),
-    (
-        "reverie-inguest/src/initial_auxv.rs",
-        26806,
-        "97ce7692227c0b4d1c54ec716c2266a9dd9c0d88751b10343a5f9748b8dfe28a",
-    ),
-    (
-        "reverie-inguest/src/initial_auxv/launch.rs",
-        53773,
-        "6064c5fc2c6bb5eab69d9b7d056e177558f0f1947eeea232e42799f4bb11ddfb",
-    ),
-    (
-        "reverie-inguest/native_exec/seed-entry.S",
-        4657,
-        "9d5a09ad947f54019c3c34485850ed69aace40ea3548dbdf455626a1f05c7ad0",
-    ),
-    (
-        "reverie-inguest/native_exec/seed-bootstrap.c",
-        20889,
-        "bfb805dddb971e3653500ecddff857d6f23ec8e50d34b9c6f4a6ce03fda2fba9",
-    ),
-    (
-        "reverie-inguest/native_exec/seed-control.h",
-        3751,
-        "527cd2e19d84ffd4f1d2c7bd9c6cf72f0f06fdd64719f533137d627b15f153db",
-    ),
-    (
-        "reverie-inguest/native_exec/seed-bootstrap.ld",
-        2708,
-        "c4f23929a0b2f15862513e08d5547e68f610c7dbcdec95fd9dd7f14e95fa22b6",
-    ),
-    (
-        "reverie-inguest/native_exec/bootstrap-image.c",
-        7430,
-        "96878184b9d3040b9d3af4b4cbaf7046b9ede8ea823e530b48ebe242ce87178f",
-    ),
-    (
-        "reverie-inguest/native_exec/bootstrap-image.h",
-        1223,
-        "189611d996bf8ec8bfadcdeab8726dd061240ebb4dde59c7c08b919610b1bc17",
+        45394,
+        "ff8493022bebdd5e88e026b730b57a8054310425f24892c8791358c7a5db20fa",
     ),
 ];
 // Native Detcore's fixed-gate publication ordering is a separately declared
@@ -1497,7 +1437,7 @@ fn content_detcore_manifest_and_lock_pin(
         ("reverie-core", Some("reverie"), false),
         ("reverie-inguest", None, false),
         ("reverie-liteinst", None, false),
-        ("reverie-rpc-transport", None, false),
+        ("reverie-rpc-transport", None, true),
     ] {
         let dependencies: Vec<_> = selected[0]["dependencies"]
             .as_array()
@@ -21039,66 +20979,6 @@ const DETCORE_VALIDATE_TEMPLATES: &[DetcoreValidateTemplate] = &[
         ],
         transfers: &[(8, 1)],
     },
-    // Actual build05 H891a5e7c / R7de43a44 0x926df0, 330 bytes.
-    // SHA256 5c232fb51e7ada6bf91d28914786314ef5d800934d794edbde2f2547d8a9d7f4.
-    // Also observed in retained VALIDATE baseline 5fcc (H5bae083a / R3da25ef3).
-    // The fully qualified arena setup returns EAX=1 on error, EAX=0 on success;
-    // this whole-body variant compares that discriminant instead of testing AL.
-    DetcoreValidateTemplate {
-        role: "fixed_native_from_native",
-        hex: "5541574156534883ec1848bb001000000060000080f901b83000020041b8a00002004c0f44c04909d84939f00f85a90000000fb605b886180249b800f0efffff9fffff4c01c24881faffff7f000f878800000084c00f848000000089cd4989febfba0000004989f731f631d231c9e8eda800004c89fe40f6c6070f85b80000004885c04c89f77e5348394640754d48837e5001754648837e3800743f8b0683e00f83f8087535488d3d4b861802e81eadffff4c89f74885c07521ba02000000b801000000f0490fb15748750f0fb60384c0741fc7070b000000eb06c7071600000031ed40886f084883c4185b415e415f5dc348c74424080001000048c744241002090000488d7c2408e832e6ffff84c0740c4c89f741c70616000000ebc34889dfe8aa0600004c89f783f8017505418916ebae4d893eebab488d15e9b21400bf08000000ff152e991700",
-        operands: &[
-            DetcoreValidateOperand {
-                displacement: 53,
-                next: 57,
-                key: "fixed_initializing",
-                got: false,
-            },
-            DetcoreValidateOperand {
-                displacement: 111,
-                next: 115,
-                key: "fixed_scalar_syscall",
-                got: false,
-            },
-            DetcoreValidateOperand {
-                displacement: 169,
-                next: 173,
-                key: "fixed_region",
-                got: false,
-            },
-            DetcoreValidateOperand {
-                displacement: 174,
-                next: 178,
-                key: "fixed_region_publication_get",
-                got: false,
-            },
-            DetcoreValidateOperand {
-                displacement: 266,
-                next: 270,
-                key: "fixed_native_bitmap_range",
-                got: false,
-            },
-            DetcoreValidateOperand {
-                displacement: 290,
-                next: 294,
-                key: "fixed_arena_setup",
-                got: false,
-            },
-            DetcoreValidateOperand {
-                displacement: 315,
-                next: 319,
-                key: "fixed_detcore_validate_fixed_native_from_native_311_data",
-                got: false,
-            },
-            DetcoreValidateOperand {
-                displacement: 326,
-                next: 330,
-                key: "fixed_heap_panic_misaligned",
-                got: true,
-            },
-        ],
-        transfers: &[(110, 1), (173, 3), (265, 4), (289, 5), (324, 7)],
-    },
 ];
 struct DetcoreRecipeBindings<'a> {
     targets: &'a BTreeMap<String, u64>,
@@ -27867,7 +27747,7 @@ mod tests {
         let rv_two = cargo_two.join(suffix);
         // Current compiled bytes are inputs only. Each must independently match
         // the fixed reviewed length/digest catalog before any positive is earned.
-        let compiled_files: [(&str, &[u8]); 35] = [
+        let compiled_files: [(&str, &[u8]); 23] = [
             ("Cargo.toml", include_bytes!("../../Cargo.toml")),
             (
                 "reverie-liteinst-artifact/Cargo.toml",
@@ -27946,10 +27826,6 @@ mod tests {
                 include_bytes!("../../reverie-inguest/src/guest/host.rs"),
             ),
             (
-                "reverie-inguest/src/guest/tool_install.rs",
-                include_bytes!("../../reverie-inguest/src/guest/tool_install.rs"),
-            ),
-            (
                 "reverie-liteinst/src/tool_host.rs",
                 include_bytes!("../../reverie-liteinst/src/tool_host.rs"),
             ),
@@ -27961,50 +27837,6 @@ mod tests {
                 "reverie-liteinst-artifact/src/lib.rs",
                 include_bytes!("lib.rs"),
             ),
-            (
-                "reverie-inguest/build.rs",
-                include_bytes!("../../reverie-inguest/build.rs"),
-            ),
-            (
-                "reverie-inguest/src/bootstrap.rs",
-                include_bytes!("../../reverie-inguest/src/bootstrap.rs"),
-            ),
-            (
-                "reverie-inguest/src/launcher/mod.rs",
-                include_bytes!("../../reverie-inguest/src/launcher/mod.rs"),
-            ),
-            (
-                "reverie-inguest/src/initial_auxv.rs",
-                include_bytes!("../../reverie-inguest/src/initial_auxv.rs"),
-            ),
-            (
-                "reverie-inguest/src/initial_auxv/launch.rs",
-                include_bytes!("../../reverie-inguest/src/initial_auxv/launch.rs"),
-            ),
-            (
-                "reverie-inguest/native_exec/seed-entry.S",
-                include_bytes!("../../reverie-inguest/native_exec/seed-entry.S"),
-            ),
-            (
-                "reverie-inguest/native_exec/seed-bootstrap.c",
-                include_bytes!("../../reverie-inguest/native_exec/seed-bootstrap.c"),
-            ),
-            (
-                "reverie-inguest/native_exec/seed-control.h",
-                include_bytes!("../../reverie-inguest/native_exec/seed-control.h"),
-            ),
-            (
-                "reverie-inguest/native_exec/seed-bootstrap.ld",
-                include_bytes!("../../reverie-inguest/native_exec/seed-bootstrap.ld"),
-            ),
-            (
-                "reverie-inguest/native_exec/bootstrap-image.c",
-                include_bytes!("../../reverie-inguest/native_exec/bootstrap-image.c"),
-            ),
-            (
-                "reverie-inguest/native_exec/bootstrap-image.h",
-                include_bytes!("../../reverie-inguest/native_exec/bootstrap-image.h"),
-            ),
         ];
         for rv in [&rv_one, &rv_two] {
             for &(relative, bytes) in &compiled_files {
@@ -28013,10 +27845,10 @@ mod tests {
             }
         }
         let (rv_inventory, _) = content_reverie_inventory(&rv_one).unwrap();
-        assert_eq!(rv_inventory.len(), 34);
+        assert_eq!(rv_inventory.len(), 22);
         let (detcore_inventory, _) =
             content_reverie_inventory_for_image(&rv_one, FixedImageKind::Detcore).unwrap();
-        assert_eq!(detcore_inventory.len(), 35);
+        assert_eq!(detcore_inventory.len(), 23);
         assert_eq!(
             content_reverie_inventory_for_image(&rv_two, FixedImageKind::Detcore)
                 .unwrap()
@@ -28419,7 +28251,7 @@ mod tests {
             ("reverie-core", Some("reverie"), false),
             ("reverie-inguest", None, false),
             ("reverie-liteinst", None, false),
-            ("reverie-rpc-transport", None, false),
+            ("reverie-rpc-transport", None, true),
         ]
         .into_iter()
         .map(|(name, rename, optional)| {
@@ -28597,7 +28429,7 @@ mod tests {
                 ("rename", serde_json::json!("other")),
                 ("path", serde_json::json!(rv_one)),
                 ("target", serde_json::json!("cfg(unix)")),
-                ("optional", serde_json::json!(true)),
+                ("optional", serde_json::json!(index != 3)),
             ] {
                 let mut bad = runtime.clone();
                 bad["packages"][0]["dependencies"][index][field] = value;
@@ -45958,7 +45790,6 @@ mod tests {
         // independently joins its measured Cargo source filenames.
         // Existing normal/mapping/event fixture contexts stay unchanged.
         let runtime_tls_context = detcore_validate_control_context("d60812b");
-        let constructor_context = detcore_validate_control_context("7de43a4");
         type DetcoreTemplateCase<'a> = (usize, u64, &'a [(&'a str, u64)], &'a [(u64, u64)], u64);
         let cases: &[DetcoreTemplateCase<'_>] = &[
             (
@@ -46718,30 +46549,9 @@ mod tests {
                 &[],
                 0x128,
             ),
-            (
-                44,
-                0x926df0,
-                &[
-                    ("fixed_initializing", 0x2aaf4e1),
-                    ("fixed_scalar_syscall", 0x931750),
-                    ("fixed_region", 0x2aaf4e8),
-                    ("fixed_region_publication_get", 0x921bc0),
-                    ("fixed_native_bitmap_range", 0x925530),
-                    ("fixed_arena_setup", 0x9275c0),
-                    (
-                        "fixed_detcore_validate_fixed_native_from_native_311_data",
-                        0xa72218,
-                    ),
-                    ("fixed_heap_panic_misaligned", 0xa2c987),
-                ],
-                &[(0xaa0868, 0xa2c987)],
-                0xe8,
-            ),
         ];
         for &(index, address, input_targets, input_got, tls) in cases {
-            let context = if index == 44 {
-                constructor_context.clone()
-            } else if index >= 40 {
+            let context = if index >= 40 {
                 runtime_tls_context.clone()
             } else if index >= 36 {
                 event_context.clone()

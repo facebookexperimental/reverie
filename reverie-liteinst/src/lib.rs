@@ -124,7 +124,6 @@ pub use tool_host::install_tool_initial_image_with_native_exec;
 pub use tool_host::install_tool_quiescent;
 #[cfg(feature = "exec-native-injection")]
 pub use tool_host::install_tool_successor_image;
-pub use tool_host::install_tool_with_root_initializer;
 #[cfg(feature = "exec-private-init")]
 pub use tool_host::prepare_tool_initial_image;
 #[cfg(feature = "exec-native-injection")]

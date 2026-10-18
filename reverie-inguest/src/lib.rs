@@ -59,7 +59,6 @@ pub mod dispatch;
 pub mod fmt;
 pub mod fork;
 pub mod guest;
-pub mod initial_auxv;
 #[cfg(all(feature = "coordinator-rpc", feature = "exec-private-init"))]
 #[doc(hidden)]
 pub mod initial_image_stats;

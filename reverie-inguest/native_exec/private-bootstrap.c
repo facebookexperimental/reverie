@@ -13,9 +13,6 @@
 #include <sys/syscall.h>
 #include <ucontext.h>
 #include "private-control.h"
-#include "bootstrap-image.h"
-#define Image BootstrapImage
-#define equal bootstrap_equal
 
 #define PAGE UINT64_C(4096)
 #define MAX_IMAGE UINT64_C(16777216)
@@ -33,10 +30,34 @@ extern unsigned char private_boot_code_start[], private_boot_code_end[];
 extern unsigned char private_boot_data_start[], private_boot_data_end[];
 static uint64_t guest_aux[MAX_AUX * 2], guest_aux_count;
 
+struct Image {
+    uint64_t lo, hi, bias, entry, phdr, phnum, phent;
+};
 struct KernelAction {
     uint64_t handler, flags, restorer, mask;
 };
 
+/* Cover compiler-emitted memory operations too; no dependency on private libc
+ * exists before that loader has genuinely established TLS.
+ */
+__attribute__((visibility("hidden")))
+void *memset(void *to, int value, size_t count) {
+    volatile unsigned char *p = to;
+    for (size_t i = 0; i < count; ++i) p[i] = (unsigned char)value;
+    return to;
+}
+__attribute__((visibility("hidden")))
+void *memcpy(void *to, const void *from, size_t count) {
+    volatile unsigned char *d = to;
+    const volatile unsigned char *s = from;
+    for (size_t i = 0; i < count; ++i) d[i] = s[i];
+    return to;
+}
+static int equal(const void *a, const void *b, uint64_t count) {
+    const unsigned char *x = a, *y = b;
+    for (uint64_t i = 0; i < count; ++i) if (x[i] != y[i]) return 0;
+    return 1;
+}
 static long call(long nr, uint64_t a, uint64_t b, uint64_t c,
                  uint64_t d, uint64_t e, uint64_t f) {
     return private_native_syscall(nr, a, b, c, d, e, f);
@@ -118,13 +139,88 @@ static int absolute_path(const char *s, uint64_t size) {
 /* Role private=0 is exclusively the genuine GUEST loader: no ownership/code
  * records, no private-origin admission, no misclassified guest mprotect.
  */
-static void image_track(void *context, uint64_t lo, uint64_t bytes,
-                        uint64_t prot, uint64_t flags) {
-    track(context, lo, bytes, prot, flags);
-}
 static struct Image map_image(struct ExecPrivateControl *ctl, int fd, int private) {
-    const struct BootstrapImageOps ops = {call, fail, private ? image_track : 0, ctl};
-    return bootstrap_map_image(fd, &ops, 0);
+    Elf64_Ehdr h;
+    Elf64_Phdr ph[32];
+    struct stat st;
+    if (call(SYS_fstat, fd, (uint64_t)&st, 0, 0, 0, 0) ||
+        !S_ISREG(st.st_mode) || st.st_size < (long)sizeof(h) ||
+        call(SYS_pread64, fd, (uint64_t)&h, sizeof(h), 0, 0, 0) != (long)sizeof(h))
+        fail(95);
+    if (!equal(h.e_ident, ELFMAG, SELFMAG) || h.e_ident[EI_CLASS] != ELFCLASS64 ||
+        h.e_ident[EI_DATA] != ELFDATA2LSB || h.e_machine != EM_X86_64 ||
+        h.e_type != ET_DYN || h.e_phentsize != sizeof(ph[0]) ||
+        !h.e_phnum || h.e_phnum > 32 || h.e_phoff > 65536 ||
+        h.e_phoff > (uint64_t)st.st_size ||
+        (uint64_t)h.e_phnum * sizeof(ph[0]) > (uint64_t)st.st_size - h.e_phoff)
+        fail(96);
+    uint64_t bytes = h.e_phnum * sizeof(ph[0]);
+    if (call(SYS_pread64, fd, (uint64_t)ph, bytes, h.e_phoff, 0, 0) != (long)bytes)
+        fail(97);
+    uint64_t lo = UINT64_MAX, hi = 0, previous_end = 0, phdr_vaddr = UINT64_MAX;
+    int loads = 0, entry_ok = 0;
+    for (unsigned i = 0; i < h.e_phnum; ++i) if (ph[i].p_type == PT_LOAD) {
+        Elf64_Phdr *p = &ph[i];
+        if (p->p_filesz > p->p_memsz || p->p_vaddr > (1u << 30) ||
+            p->p_memsz > (1u << 30) || p->p_offset > (1u << 30) ||
+            p->p_vaddr + p->p_memsz > (1u << 30) ||
+            p->p_offset > (uint64_t)st.st_size ||
+            p->p_filesz > (uint64_t)st.st_size - p->p_offset ||
+            (p->p_vaddr & (PAGE - 1)) != (p->p_offset & (PAGE - 1)) ||
+            !p->p_memsz || (loads && down(p->p_vaddr) < previous_end) ||
+            ((p->p_flags & (PF_W | PF_X)) == (PF_W | PF_X)))
+            fail(98);
+        if (down(p->p_vaddr) < lo) lo = down(p->p_vaddr);
+        previous_end = up(p->p_vaddr + p->p_memsz);
+        if (previous_end > hi) hi = previous_end;
+        if ((p->p_flags & PF_X) && h.e_entry >= p->p_vaddr &&
+            h.e_entry < p->p_vaddr + p->p_filesz) entry_ok = 1;
+        if ((p->p_flags & PF_R) && h.e_phoff >= p->p_offset &&
+            h.e_phoff - p->p_offset <= p->p_filesz &&
+            bytes <= p->p_filesz - (h.e_phoff - p->p_offset))
+            phdr_vaddr = p->p_vaddr + (h.e_phoff - p->p_offset);
+        ++loads;
+    }
+    if (!loads || !entry_ok || hi <= lo || hi - lo > MAX_IMAGE ||
+        phdr_vaddr == UINT64_MAX) fail(99);
+    long region = call(SYS_mmap, 0, hi - lo, PROT_NONE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, (uint64_t)-1, 0);
+    if (failed(region)) fail(100);
+    uint64_t bias = (uint64_t)region - lo;
+    if (private) track(ctl, region, hi - lo, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS);
+    for (unsigned i = 0; i < h.e_phnum; ++i) if (ph[i].p_type == PT_LOAD) {
+        Elf64_Phdr *p = &ph[i];
+        uint64_t prot = ((p->p_flags & PF_R) ? PROT_READ : 0) |
+                        ((p->p_flags & PF_W) ? PROT_WRITE : 0) |
+                        ((p->p_flags & PF_X) ? PROT_EXEC : 0);
+        uint64_t start = bias + down(p->p_vaddr);
+        uint64_t file_end = bias + p->p_vaddr + p->p_filesz;
+        uint64_t mem_end = bias + p->p_vaddr + p->p_memsz;
+        if (p->p_filesz) {
+            long r = call(SYS_mmap, start, up(file_end) - start, prot,
+                          MAP_PRIVATE | MAP_FIXED, fd, down(p->p_offset));
+            if (r != (long)start) fail(101);
+            if (private) track(ctl, start, up(file_end) - start, prot, MAP_PRIVATE);
+            if (mem_end > file_end && file_end != up(file_end)) {
+                if (prot & PROT_EXEC) fail(102); /* preserve original W^X refusal */
+                if (call(SYS_mprotect, down(file_end), PAGE, prot | PROT_WRITE, 0, 0, 0))
+                    fail(103);
+                for (uint64_t a = file_end; a < up(file_end); ++a)
+                    *(unsigned char *)(uintptr_t)a = 0; /* FULL PAGE, not p_memsz */
+                if (call(SYS_mprotect, down(file_end), PAGE, prot, 0, 0, 0)) fail(104);
+            }
+        }
+        uint64_t anon = p->p_filesz ? up(file_end) : start;
+        if (up(mem_end) > anon) {
+            if (call(SYS_mmap, anon, up(mem_end) - anon, prot,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, (uint64_t)-1, 0) != (long)anon)
+                fail(105);
+            if (private) track(ctl, anon, up(mem_end) - anon, prot, MAP_PRIVATE | MAP_ANONYMOUS);
+        }
+    }
+    if (call(SYS_close, fd, 0, 0, 0, 0, 0)) fail(106);
+    return (struct Image){(uint64_t)region, (uint64_t)region + hi - lo, bias,
+                          bias + h.e_entry, bias + phdr_vaddr, h.e_phnum, h.e_phentsize};
 }
 
 static void capture_aux(uint64_t *stack) {

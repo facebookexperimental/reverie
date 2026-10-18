@@ -16,8 +16,6 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 
 use reverie::Error;
 use reverie::GlobalRPC;
@@ -168,15 +166,6 @@ impl Drop for DispatchScratchScope {
     }
 }
 
-type RootInitializer<T> = Box<
-    dyn FnOnce(
-            &<<T as Tool>::GlobalState as GlobalTool>::Config,
-            Pid,
-            &mut <T as Tool>::ThreadState,
-        ) -> io::Result<()>
-        + Send,
->;
-
 /// Hosts one Reverie Tool inside the guest process: owns the Tool, its
 /// per-thread state and its coordinator connection, and runs each guest
 /// syscall or instruction event through the Tool's handlers. The backend that
@@ -189,9 +178,6 @@ pub struct ToolHost<T: Tool, R: HostRuntime> {
     subscriptions: HashSet<Sysno>,
     cpuid_interception: bool,
     states: SpinMutex<HashMap<i32, T::ThreadState>>,
-    root_initializer: SpinMutex<Option<RootInitializer<T>>>,
-    root_initializer_installed: bool,
-    dispatch_started: AtomicBool,
     runtime: R,
     #[cfg(feature = "exec-private-successor")]
     prepared_exec: SpinMutex<Option<PreparedExecState<T>>>,
@@ -278,78 +264,12 @@ where
             subscriptions,
             cpuid_interception,
             states: SpinMutex::new(HashMap::new()),
-            root_initializer: SpinMutex::new(None),
-            root_initializer_installed: false,
-            dispatch_started: AtomicBool::new(false),
             runtime,
             #[cfg(feature = "exec-private-successor")]
             prepared_exec: SpinMutex::new(None),
             #[cfg(feature = "exec-native-injection")]
             native_exec_driver: None,
         }
-    }
-
-    /// Initialize the ordinary root's fresh thread state once, lazily, before
-    /// its thread-start and post-exec callbacks. The arguments are this host's
-    /// coordinator configuration, actual root PID and newly created state.
-    ///
-    /// Install before any dispatch or restored state. Duplicate installation is
-    /// refused even after consumption. Nonroot/fork state and restored or eager
-    /// native-image lifecycles never invoke this initializer. It confers no
-    /// native-image readiness or callback authority. An initializer error ends
-    /// dispatch before any Tool callback. It must not reenter this host or
-    /// acquire its Tool/state locks, which are held while it runs.
-    pub fn install_root_initializer(
-        &mut self,
-        initializer: impl FnOnce(
-            &<T::GlobalState as GlobalTool>::Config,
-            Pid,
-            &mut T::ThreadState,
-        ) -> io::Result<()>
-        + Send
-        + 'static,
-    ) -> io::Result<()> {
-        if self.root_initializer_installed {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "root initializer already installed",
-            ));
-        }
-        if self.dispatch_started.load(Ordering::Acquire) || !self.states.lock().is_empty() {
-            return Err(io::Error::other(
-                "root initializer installation follows dispatch or restoration",
-            ));
-        }
-        #[cfg(feature = "exec-private-successor")]
-        if self.prepared_exec.lock().is_some() {
-            return Err(io::Error::other(
-                "root initializer cannot initialize a prepared successor",
-            ));
-        }
-        #[cfg(feature = "exec-native-injection")]
-        if self.native_exec_driver.is_some() {
-            return Err(io::Error::other(
-                "root initializer cannot initialize a native image",
-            ));
-        }
-        *self.root_initializer.lock() = Some(Box::new(initializer));
-        self.root_initializer_installed = true;
-        Ok(())
-    }
-
-    fn initialize_root_thread_state(
-        &self,
-        pid: Pid,
-        tid: Pid,
-        state: &mut T::ThreadState,
-    ) -> io::Result<()> {
-        if pid == self.root_pid && tid == self.root_pid {
-            let initializer = self.root_initializer.lock().take();
-            if let Some(initializer) = initializer {
-                initializer(self.rpc.config(), pid, state)?;
-            }
-        }
-        Ok(())
     }
 
     /// Install the inactive native exec driver exactly once, before dispatch.
@@ -657,7 +577,6 @@ where
     /// its injections must not break Rust's memory invariants for any memory
     /// they touch.
     pub unsafe fn dispatch(&self, event: &mut SyscallEvent) {
-        self.dispatch_started.store(true, Ordering::Release);
         #[cfg(feature = "exec-private-successor")]
         if self
             .prepared_exec
@@ -682,12 +601,9 @@ where
         let tool = tool_slot.as_ref().unwrap_or_else(|| fatal(126));
         let mut states = self.states.lock();
         let is_new = !states.contains_key(&tid.as_raw());
-        let state = states.entry(tid.as_raw()).or_insert_with(|| {
-            let mut state = tool.init_thread_state(tid, None);
-            self.initialize_root_thread_state(pid, tid, &mut state)
-                .unwrap_or_else(|error| tool_fatal(124, &Error::Io(error)));
-            state
-        });
+        let state = states
+            .entry(tid.as_raw())
+            .or_insert_with(|| tool.init_thread_state(tid, None));
         let tail = TailResult::default();
         let mut guest = InGuest::<T, R> {
             event,
@@ -1033,7 +949,6 @@ where
         kind: InstructionEventKind,
         context: &mut RegisterContext,
     ) {
-        self.dispatch_started.store(true, Ordering::Release);
         #[cfg(feature = "exec-private-successor")]
         if self
             .prepared_exec
@@ -1051,12 +966,9 @@ where
         let tool = tool_slot.as_ref().unwrap_or_else(|| fatal(126));
         let mut states = self.states.lock();
         let is_new = !states.contains_key(&tid.as_raw());
-        let state = states.entry(tid.as_raw()).or_insert_with(|| {
-            let mut state = tool.init_thread_state(tid, None);
-            self.initialize_root_thread_state(pid, tid, &mut state)
-                .unwrap_or_else(|error| tool_fatal(124, &Error::Io(error)));
-            state
-        });
+        let state = states
+            .entry(tid.as_raw())
+            .or_insert_with(|| tool.init_thread_state(tid, None));
         let tail = TailResult::default();
         let mut event = SyscallEvent {
             number: -1,
@@ -3620,323 +3532,6 @@ fn fatal(status: i32) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[derive(Default)]
-    struct RootInitializerGlobal;
-
-    #[reverie::tool]
-    impl GlobalTool for RootInitializerGlobal {
-        type Request = ();
-        type Response = ();
-        type Config = u64;
-
-        async fn receive_rpc(&self, _from: Pid, _message: ()) {}
-    }
-
-    #[derive(Default)]
-    struct RootInitializerTool {
-        calls: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
-        initial: u64,
-        ready: u64,
-        forbid_callbacks: bool,
-    }
-
-    impl RootInitializerTool {
-        fn callback(&self, name: &'static str) {
-            if self.forbid_callbacks {
-                unsafe { libc::_exit(122) };
-            }
-            self.calls.lock().unwrap().push(name);
-        }
-    }
-
-    #[reverie::tool]
-    impl Tool for RootInitializerTool {
-        type GlobalState = RootInitializerGlobal;
-        type ThreadState = u64;
-
-        fn init_thread_state(&self, _tid: Pid, _parent: Option<(Pid, &u64)>) -> u64 {
-            self.calls.lock().unwrap().push("init");
-            0
-        }
-
-        async fn handle_thread_start<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Error> {
-            self.callback("thread-start");
-            assert_eq!(*guest.thread_state(), self.initial);
-            *guest.thread_state_mut() += 1;
-            Ok(())
-        }
-
-        async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
-            self.callback("post-exec");
-            assert_eq!(*guest.thread_state(), self.initial + 1);
-            *guest.thread_state_mut() += 1;
-            Ok(())
-        }
-
-        async fn handle_syscall_event<G: Guest<Self>>(
-            &self,
-            guest: &mut G,
-            _call: Syscall,
-        ) -> Result<i64, Error> {
-            self.callback("syscall");
-            assert_eq!(*guest.thread_state(), self.ready);
-            Ok(73)
-        }
-
-        async fn handle_rdtsc_event<G: Guest<Self>>(
-            &self,
-            guest: &mut G,
-            _request: Rdtsc,
-        ) -> Result<reverie::RdtscResult, Errno> {
-            self.callback("instruction");
-            assert_eq!(*guest.thread_state(), self.ready);
-            Ok(reverie::RdtscResult { tsc: 73, aux: None })
-        }
-    }
-
-    fn root_initializer_host(
-        tool: RootInitializerTool,
-    ) -> (
-        ToolHost<RootInitializerTool, ToolSyscallRuntime>,
-        std::os::unix::net::UnixStream,
-    ) {
-        use std::io::Write;
-        let (client, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
-        let config = reverie_rpc_transport::codec::encode(&902_u64).unwrap();
-        peer.write_all(&(config.len() as u32).to_be_bytes())
-            .unwrap();
-        peer.write_all(&config).unwrap();
-        let client = reverie_rpc_transport::BlockingRpcClient::from_connected_stream(
-            super::super::rpc::GuestRpcStream::from(client),
-            raw_pid(libc::SYS_gettid),
-        )
-        .unwrap();
-        let rpc = CoordinatorRpc::from_live_client("unused-root-initializer", client, |_, _| {
-            panic!("root initializer component test must not reconnect")
-        })
-        .unwrap();
-        (
-            ToolHost::new(
-                tool,
-                rpc,
-                raw_pid(libc::SYS_getpid),
-                HashSet::from([Sysno::getpid]),
-                false,
-                ToolSyscallRuntime,
-            ),
-            peer,
-        )
-    }
-
-    fn root_initializer_event(
-        host: &ToolHost<RootInitializerTool, ToolSyscallRuntime>,
-        instruction: bool,
-    ) {
-        if instruction {
-            let mut context = RegisterContext::default();
-            unsafe { host.dispatch_instruction(InstructionEventKind::Rdtsc, &mut context) };
-            assert_eq!(context.rax, 73);
-        } else {
-            let mut event = SyscallEvent {
-                number: libc::SYS_getpid,
-                args: [0; 6],
-                instruction_pointer: 0,
-                result: 0,
-                context: 0,
-                dispatch: SyscallDispatch::InstalledHook,
-                guest_pkru: None,
-            };
-            unsafe { host.dispatch(&mut event) };
-            assert_eq!(event.result, 73);
-        }
-    }
-
-    // Actual component dispatch needs the root's main-thread identity. Re-exec
-    // one test before forking so no other test can leave a held dispatch lock in
-    // the child. These controls do not install a frontend or claim native birth.
-    fn root_initializer_test_child(test: &str) -> bool {
-        const KEY: &str = "REVERIE_ROOT_INITIALIZER_TEST";
-        if std::env::var(KEY).ok().as_deref() == Some(test) {
-            return true;
-        }
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", test, "--nocapture", "--test-threads=1"])
-            .env(KEY, test)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{output:?}");
-        false
-    }
-
-    fn in_root_initializer_child(body: impl FnOnce(), expected: i32) {
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0);
-        if pid == 0 {
-            let status = if std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).is_ok() {
-                0
-            } else {
-                125
-            };
-            unsafe { libc::_exit(status) };
-        }
-        let mut status = 0;
-        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
-        assert!(libc::WIFEXITED(status), "{status:#x}");
-        assert_eq!(libc::WEXITSTATUS(status), expected);
-    }
-
-    #[test]
-    fn root_initializer_precedes_callbacks_once_on_both_entry_paths() {
-        if !root_initializer_test_child(
-            "guest::host::tests::root_initializer_precedes_callbacks_once_on_both_entry_paths",
-        ) {
-            return;
-        }
-        for instruction_first in [false, true] {
-            in_root_initializer_child(
-                || {
-                    let tool = RootInitializerTool {
-                        initial: 41,
-                        ready: 43,
-                        ..Default::default()
-                    };
-                    let calls = tool.calls.clone();
-                    let (mut host, _peer) = root_initializer_host(tool);
-                    let initialized_calls = calls.clone();
-                    let token = String::from("affine initializer capture");
-                    host.install_root_initializer(move |config, pid, state| {
-                        drop(token);
-                        assert_eq!(*config, 902);
-                        assert_eq!(pid, raw_pid(libc::SYS_getpid));
-                        assert_eq!(pid, raw_pid(libc::SYS_gettid));
-                        assert_eq!(*state, 0);
-                        initialized_calls.lock().unwrap().push("initializer");
-                        *state = 41;
-                        Ok(())
-                    })
-                    .unwrap();
-                    assert_eq!(
-                        host.install_root_initializer(|_, _, _| Ok(()))
-                            .unwrap_err()
-                            .kind(),
-                        io::ErrorKind::AlreadyExists
-                    );
-                    assert!(
-                        calls.lock().unwrap().is_empty(),
-                        "installation must stay lazy"
-                    );
-                    root_initializer_event(&host, instruction_first);
-                    root_initializer_event(&host, !instruction_first);
-                    assert_eq!(
-                        *calls.lock().unwrap(),
-                        [
-                            "init",
-                            "initializer",
-                            "thread-start",
-                            "post-exec",
-                            if instruction_first {
-                                "instruction"
-                            } else {
-                                "syscall"
-                            },
-                            if instruction_first {
-                                "syscall"
-                            } else {
-                                "instruction"
-                            }
-                        ]
-                    );
-                    assert_eq!(
-                        host.install_root_initializer(|_, _, _| Ok(()))
-                            .unwrap_err()
-                            .kind(),
-                        io::ErrorKind::AlreadyExists
-                    );
-                },
-                0,
-            );
-        }
-    }
-
-    #[test]
-    fn root_initializer_error_ends_both_entry_paths_before_callbacks() {
-        if !root_initializer_test_child(
-            "guest::host::tests::root_initializer_error_ends_both_entry_paths_before_callbacks",
-        ) {
-            return;
-        }
-        for instruction_first in [false, true] {
-            in_root_initializer_child(
-                || {
-                    let (mut host, _peer) = root_initializer_host(RootInitializerTool {
-                        forbid_callbacks: true,
-                        ..Default::default()
-                    });
-                    host.install_root_initializer(|_, _, _| {
-                        Err(io::Error::from_raw_os_error(libc::EIO))
-                    })
-                    .unwrap();
-                    root_initializer_event(&host, instruction_first);
-                },
-                124,
-            );
-        }
-    }
-
-    #[test]
-    fn root_initializer_ignores_fork_and_restored_state_and_refuses_late_installation() {
-        if !root_initializer_test_child(
-            "guest::host::tests::root_initializer_ignores_fork_and_restored_state_and_refuses_late_installation",
-        ) {
-            return;
-        }
-        in_root_initializer_child(
-            || {
-                let (mut host, _peer) = root_initializer_host(RootInitializerTool {
-                    ready: 1,
-                    ..Default::default()
-                });
-                host.install_root_initializer(|_, _, _| {
-                    panic!("a fork child must not consume root initialization")
-                })
-                .unwrap();
-                in_root_initializer_child(
-                    || {
-                        root_initializer_event(&host, false);
-                        assert!(host.root_initializer.lock().is_some());
-                    },
-                    0,
-                );
-                assert!(host.root_initializer.lock().is_some());
-                let (mut restored, _peer) = root_initializer_host(RootInitializerTool {
-                    ready: 43,
-                    ..Default::default()
-                });
-                let calls = restored.tool.lock().as_ref().unwrap().calls.clone();
-                restored
-                    .install_root_initializer(|_, _, _| {
-                        panic!("restoration must not create a fresh root")
-                    })
-                    .unwrap();
-                restored.restore_current_thread_state(43).unwrap();
-                root_initializer_event(&restored, false);
-                assert_eq!(*calls.lock().unwrap(), ["syscall"]);
-                assert!(restored.root_initializer.lock().is_some());
-                let (mut late, _peer) = root_initializer_host(RootInitializerTool {
-                    ready: 2,
-                    ..Default::default()
-                });
-                root_initializer_event(&late, false);
-                late.states.lock().clear();
-                assert!(
-                    late.install_root_initializer(|_, _, _| Ok(())).is_err(),
-                    "dispatch remains disqualifying after states disappear"
-                );
-            },
-            0,
-        );
-    }
 
     struct ToolSyscallRuntime;
     impl HostRuntime for ToolSyscallRuntime {

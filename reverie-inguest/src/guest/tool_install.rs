@@ -26,7 +26,6 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use reverie::GlobalRPC;
-use reverie::GlobalTool;
 use reverie::Pid;
 use reverie::Tool;
 
@@ -147,68 +146,6 @@ where
     T: Tool + 'static,
     H: PatchHost,
 {
-    unsafe {
-        install_tool_inner::<T, H, RootInitializerFn<T>>(
-            coordinator,
-            remove_coordinator_environment,
-            host,
-            None,
-        )
-    }
-}
-
-/// Install a Tool with a once-only initializer for its lazy ordinary root state.
-/// The initializer runs before thread-start and post-exec, on the shared host.
-/// It confers no native-image readiness and does not eagerly create state.
-///
-/// # Safety
-/// All requirements of [`install_tool_with`] apply. The initializer must not
-/// reenter the installed host or acquire its Tool/state locks.
-pub unsafe fn install_tool_with_root_initializer<T, H>(
-    coordinator: &Path,
-    remove_coordinator_environment: bool,
-    host: H,
-    initializer: impl FnOnce(
-        &<T::GlobalState as GlobalTool>::Config,
-        Pid,
-        &mut T::ThreadState,
-    ) -> io::Result<()>
-    + Send
-    + 'static,
-) -> io::Result<()>
-where
-    T: Tool + 'static,
-    H: PatchHost,
-{
-    unsafe {
-        install_tool_inner::<T, H, _>(
-            coordinator,
-            remove_coordinator_environment,
-            host,
-            Some(initializer),
-        )
-    }
-}
-
-type RootInitializerFn<T> = fn(
-    &<<T as Tool>::GlobalState as GlobalTool>::Config,
-    Pid,
-    &mut <T as Tool>::ThreadState,
-) -> io::Result<()>;
-
-unsafe fn install_tool_inner<T, H, F>(
-    coordinator: &Path,
-    remove_coordinator_environment: bool,
-    host: H,
-    root_initializer: Option<F>,
-) -> io::Result<()>
-where
-    T: Tool + 'static,
-    H: PatchHost,
-    F: FnOnce(&<T::GlobalState as GlobalTool>::Config, Pid, &mut T::ThreadState) -> io::Result<()>
-        + Send
-        + 'static,
-{
     // Everything installation allocates lives in the runtime's private Tool
     // heap, never in the guest's own malloc heap; see LiteInst's installer.
     let _private_allocations = crate::guest::alloc::enter_dispatch();
@@ -272,7 +209,7 @@ where
         unsafe { std::env::remove_var(crate::bootstrap::COORDINATOR_ENV) };
     }
     let tool = T::new(pid, rpc.config());
-    let mut tool_host = ToolHost::<T, H::Runtime>::new(
+    let tool_host = ToolHost::<T, H::Runtime>::new(
         tool,
         rpc,
         pid,
@@ -280,9 +217,6 @@ where
         instruction_subscriptions.cpuid,
         host.runtime(stats),
     );
-    if let Some(initializer) = root_initializer {
-        tool_host.install_root_initializer(initializer)?;
-    }
     // SAFETY: the one installing thread publishes the one host, before any
     // dispatch or controller activation.
     unsafe { installed_tool::publish_tool(tool_host)? };
