@@ -17,7 +17,7 @@
 //! instead, at every size. A Tool write that overlaps Reverie's private page
 //! is refused before any access: that page is read-and-execute, so a native
 //! write there fails too, and a forced one could replace the `ud2` that
-//! guards the untraced stub (<https://github.com/rrnewton/reverie/issues/1064>).
+//! guards the untraced stub (https://github.com/rrnewton/reverie/issues/1064).
 //!
 //! A scalar the kernel would publish with `put_user` (at most eight bytes) is
 //! one store: on a fault nothing is written. A copy that crosses into a
