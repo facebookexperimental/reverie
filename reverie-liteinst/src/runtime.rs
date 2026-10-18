@@ -1809,6 +1809,12 @@ struct InstallFailure {
     /// and every failure from the protection change onward count as touched,
     /// even where nothing may have been written.
     code_untouched: bool,
+    /// True for a failure from the jump's activation onward: part or all of
+    /// the jump may already be published, so the bytes after the instruction
+    /// are not known to be the original code. A busy lock, a missing arena, a
+    /// byte mismatch, a failed protection change and a failed patch plan are
+    /// touched but not possibly written by this attempt.
+    possibly_written: bool,
 }
 
 impl InstallFailure {
@@ -1816,6 +1822,7 @@ impl InstallFailure {
         Self {
             error,
             code_untouched: true,
+            possibly_written: false,
         }
     }
 
@@ -1823,6 +1830,15 @@ impl InstallFailure {
         Self {
             error,
             code_untouched: false,
+            possibly_written: false,
+        }
+    }
+
+    fn possibly_written(error: io::Error) -> Self {
+        Self {
+            error,
+            code_untouched: false,
+            possibly_written: true,
         }
     }
 }
@@ -1831,6 +1847,20 @@ impl From<InstallFailure> for io::Error {
     fn from(failure: InstallFailure) -> Self {
         failure.error
     }
+}
+
+/// Set, before the site is marked fallback, by an installation failure that
+/// may have published part of a jump. The installing thread then ends the
+/// guest; a thread that finds any site marked fallback after this ends it too
+/// rather than decline (see the syscall path of `LiteinstSeam`).
+static SITE_JUMP_POSSIBLY_WRITTEN: AtomicBool = AtomicBool::new(false);
+
+/// Whether a failed syscall-site installation must end the guest rather than
+/// decline: only when the jump may already be published. Every other failure
+/// left the bytes after the syscall as they were, so the trap's fallback
+/// continuation can still run it.
+fn syscall_install_failure_ends_guest(failure: &InstallFailure) -> bool {
+    failure.possibly_written
 }
 
 /// How a proposed patch relates to one other claimed site.
@@ -2315,9 +2345,21 @@ unsafe fn install_site_hook(
     // the guest's code. Record SITE_FALLBACK while the lock is still held, so
     // no later installer's neighbour check sees this site as merely
     // INSTALLING when part of a jump may already be published.
+    //
+    // Until activation starts, liteinst2 has only planned the patch and
+    // filled its trampoline in the arena; the guest's code bytes are the
+    // original, so such a failure is touched but not possibly written.
     let published_failure = |error: io::Error| {
         slot.state.store(SITE_FALLBACK, Ordering::Release);
         InstallFailure::touched(error)
+    };
+    // From activation on, part or all of the jump may be written.
+    let written_failure = |error: io::Error| {
+        // Before the site reads as fallback, so a thread waiting on it does
+        // not decline into a jump that may be published.
+        SITE_JUMP_POSSIBLY_WRITTEN.store(true, Ordering::Release);
+        slot.state.store(SITE_FALLBACK, Ordering::Release);
+        InstallFailure::possibly_written(error)
     };
     if manage_protection {
         unsafe {
@@ -2389,12 +2431,12 @@ unsafe fn install_site_hook(
         if manage_protection {
             let _ = unsafe { set_text_protection(address, libc::PROT_READ | libc::PROT_EXEC) };
         }
-        return Err(published_failure(io::Error::other(error.to_string())));
+        return Err(written_failure(io::Error::other(error.to_string())));
     }
     if manage_protection {
         unsafe {
             set_text_protection(address, libc::PROT_READ | libc::PROT_EXEC)
-                .map_err(published_failure)?;
+                .map_err(written_failure)?;
         }
     }
 
@@ -2442,6 +2484,16 @@ fn install_vdso_sites(sites: &[reverie::vdso::VdsoSyscallSite]) -> io::Result<()
             )
         }
         .map_err(|failure| {
+            if failure.possibly_written {
+                // Part of a jump may already be in the vDSO, which the guest
+                // calls without a trap. Returning the error would let a
+                // caller that tolerates a failed installation run on with
+                // it; end the process instead (no handler is installed yet).
+                emit_in_guest_stage(b"vdso-site-install-failed");
+                // SAFETY: installation runs before application threads; the
+                // process ends here.
+                unsafe { exit_now(127) };
+            }
             site.state.store(SITE_FALLBACK, Ordering::Release);
             io::Error::other(format!(
                 "failed to install LiteInst vDSO hook: {}",
@@ -2902,13 +2954,14 @@ unsafe impl TrapSeam for LiteinstSeam {
                 // just below; if that fails, the site is marked fallback and the
                 // trap refused, and this thread's CPUID/RDTSC may then run
                 // natively, unobserved, as before this change.
-                let native = unsafe { set_all_instruction_native(true) };
-                let installed = native.and_then(|()| {
+                let installed = match unsafe { set_all_instruction_native(true) } {
+                    // Nothing was attempted, so the code is the original.
+                    Err(error) => Err(InstallFailure::untouched(error)),
                     // SAFETY: the address is a genuine trap's syscall instruction
                     // (the seam's contract), in executing code; install_site_hook
                     // re-checks, under its lock, the arena, the syscall bytes, the
                     // neighbours and that no jump enters the patch window.
-                    unsafe {
+                    Ok(()) => unsafe {
                         install_site_hook(
                             instruction_pointer,
                             site,
@@ -2921,10 +2974,26 @@ unsafe impl TrapSeam for LiteinstSeam {
                             &[0x0f, 0x05],
                             true,
                         )
-                    }
-                    .map_err(io::Error::from)
-                });
+                    },
+                };
                 let restored = unsafe { set_all_instruction_native(false) };
+                if installed
+                    .as_ref()
+                    .is_err_and(syscall_install_failure_ends_guest)
+                {
+                    // A failed installation may already have published part
+                    // or all of the jump (for example, when restoring the
+                    // page's permissions fails after the patch is written).
+                    // Declining or refusing both resume the guest just past
+                    // the syscall, which could execute the jump's
+                    // displacement; end the guest, as an instruction site's
+                    // failed installation does.
+                    emit_in_guest_stage(b"sigsys-site-install-failed");
+                    // SAFETY: called from the runtime's SIGSYS dispatch, which
+                    // deliver_default_sigsegv's contract admits; the process
+                    // ends.
+                    unsafe { deliver_default_sigsegv() };
+                }
                 if restored.is_err() {
                     site.state.store(SITE_FALLBACK, Ordering::Release);
                     return SitePatch::Refuse;
@@ -2935,6 +3004,17 @@ unsafe impl TrapSeam for LiteinstSeam {
             }
             while matches!(site.state.load(Ordering::Acquire), 0 | SITE_INSTALLING) {
                 core::hint::spin_loop();
+            }
+            if site.state.load(Ordering::Acquire) == SITE_FALLBACK
+                && SITE_JUMP_POSSIBLY_WRITTEN.load(Ordering::Acquire)
+            {
+                // Another thread's installation, here or at another site, may
+                // have published part of a jump and is ending the guest; this
+                // site's fallback marking no longer proves its bytes are the
+                // original, so do not resume past the syscall either.
+                emit_in_guest_stage(b"sigsys-site-install-failed");
+                // SAFETY: as above.
+                unsafe { deliver_default_sigsegv() };
             }
             if site.state.load(Ordering::Acquire) == SITE_ACTIVE {
                 let hook = site.hook.load(Ordering::Acquire);
@@ -3433,8 +3513,29 @@ mod tests {
     use core::sync::atomic::Ordering;
     use std::ffi::OsStr;
 
+    use super::InstallFailure;
     use super::SITE_PATCHING_ENABLED;
     use super::site_patching_enabled;
+    use super::syscall_install_failure_ends_guest;
+
+    // A syscall site's failed installation declines (the trap runs through
+    // the fallback continuation) unless the jump may already be published:
+    // a busy lock, a missing arena, a byte mismatch, a failed protection
+    // change or a failed patch plan is "touched" but wrote nothing, while a
+    // failure from the jump's activation onward may have.
+    #[test]
+    fn only_a_possibly_written_syscall_site_failure_ends_the_guest() {
+        let error = || std::io::Error::other("test");
+        assert!(!syscall_install_failure_ends_guest(
+            &InstallFailure::untouched(error())
+        ));
+        assert!(!syscall_install_failure_ends_guest(
+            &InstallFailure::touched(error())
+        ));
+        assert!(syscall_install_failure_ends_guest(
+            &InstallFailure::possibly_written(error())
+        ));
+    }
 
     // These component controls run the production process_syscall -> installed
     // ToolHost route. Private control publication is modeled; no driver, native

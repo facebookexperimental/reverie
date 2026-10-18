@@ -560,10 +560,14 @@ pub unsafe fn emulate_through_continuation(
 /// when `tgkill` returns. The final exit is reached only if both controls
 /// failed.
 ///
+/// It works the same from the runtime's SIGSYS dispatch (where `SIGSEGV` may
+/// or may not be blocked), which ends the guest this way when a backend's
+/// failed site installation may have left part of a jump in the guest's code.
+///
 /// # Safety
 ///
-/// Call only from the runtime's `SIGSEGV` handler. The process ends; no
-/// destructor runs.
+/// Call only from the runtime's `SIGSEGV` handler or its SIGSYS dispatch. The
+/// process ends; no destructor runs.
 pub unsafe fn deliver_default_sigsegv() -> ! {
     let default_action = KernelSigaction::default();
     let _ = unsafe {
