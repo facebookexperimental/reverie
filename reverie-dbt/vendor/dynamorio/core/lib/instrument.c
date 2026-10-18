@@ -255,6 +255,7 @@ static callback_list_t post_syscall_callbacks = {
 static callback_list_t kernel_xfer_callbacks = {
     0,
 };
+static callback_list_t cache_context_invalidation_callbacks = { 0 };
 #ifdef WINDOWS
 static callback_list_t exception_callbacks = {
     0,
@@ -875,6 +876,7 @@ free_all_callback_lists(void)
     free_callback_list(&pre_syscall_callbacks);
     free_callback_list(&post_syscall_callbacks);
     free_callback_list(&kernel_xfer_callbacks);
+    free_callback_list(&cache_context_invalidation_callbacks);
 #ifdef WINDOWS
     free_callback_list(&exception_callbacks);
 #else
@@ -1330,6 +1332,21 @@ bool
 dr_unregister_post_syscall_event(void (*func)(void *drcontext, int sysnum))
 {
     return remove_callback(&post_syscall_callbacks, (void (*)(void))func, true);
+}
+
+void
+dr_register_cache_context_invalidation_event(
+    void (*func)(void *drcontext, app_pc source_pc, app_pc target_pc))
+{
+    add_callback(&cache_context_invalidation_callbacks, (void (*)(void))func, true);
+}
+
+bool
+dr_unregister_cache_context_invalidation_event(
+    void (*func)(void *drcontext, app_pc source_pc, app_pc target_pc))
+{
+    return remove_callback(&cache_context_invalidation_callbacks, (void (*)(void))func,
+                           true);
 }
 
 void
@@ -2147,6 +2164,17 @@ bool
 instrument_invoke_another_syscall(dcontext_t *dcontext)
 {
     return dcontext->client_data->invoke_another_syscall;
+}
+
+void
+instrument_cache_context_invalidated(dcontext_t *dcontext, app_pc source_pc,
+                                     app_pc target_pc)
+{
+    ASSERT_OWN_MUTEX(true, &thread_initexit_lock);
+    /* No cur_mc/os_cxt is installed: this is a read-only fact after replacement,
+     * not the mutable, before-transfer kernel_xfer contract. */
+    call_all(cache_context_invalidation_callbacks, int (*)(void *, app_pc, app_pc),
+             (void *)dcontext, source_pc, target_pc);
 }
 
 bool

@@ -81,6 +81,25 @@ allocated by DynamoRIO and stored in `drmgr` TLS. The Rust runtime receives
 that state through an explicit C ABI pointer, avoiding dynamic Rust TLS inside
 DynamoRIO's private loader.
 
+The native `-branch-facts` option enables a separate per-task count of completed
+original application conditional instructions from the first application
+instruction, including the interpreter and loaded modules. It is disabled by
+default because it adds instrumentation to every original conditional. The
+internal `DbtGuest::branch_fact` observation is distinct from mixed branch
+statistics and `Guest::read_clock`: it does not enable timers or change Detcore
+time, costs, or scheduling. Its equality-only owner identifies one live task
+and image; samples from different owners cannot be subtracted. A new task starts
+at zero, and a newly loaded image has a new scope. Unavailable observations are
+explicit errors rather than zero work. This interface is a mechanism prerequisite,
+not a continuous clock or a claim of PMU equivalence on every processor.
+
+With branch facts enabled, a returning syscall injection that would create a
+shared-VM child fails with a named backend error before child creation. The
+returning bridge lacks the original/tail path's child-entry machinery. Existing
+prehandler errors remain Linux errors; this refusal supplies no fabricated
+guest errno and does not silently convert a returning operation into a tail
+operation. Original and tail execution use their existing child-entry path.
+
 ## Prototype Boundaries
 
 - `DbtGuest` implements Reverie's shared `Guest` contract, local memory,

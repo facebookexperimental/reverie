@@ -117,6 +117,20 @@ _Static_assert(sizeof(private_memory_snapshot_t) == 96,
 typedef int32_t (*runtime_private_memory_t)(
     uintptr_t, const private_memory_snapshot_t*, private_memory_snapshot_t*);
 
+/* ABI-12: equality-only scope within the existing live task-state authority.
+ * Status is separate: a zeroed record never substitutes for unavailable work. */
+typedef struct {
+  uint64_t owner[5]; // table device/inode, actual process slot, image, task birth
+  uint64_t count;
+} branch_fact_t;
+_Static_assert(sizeof(branch_fact_t) == 48, "branch fact ABI size");
+typedef int32_t (*branch_fact_query_t)(uintptr_t, branch_fact_t*);
+enum {
+  BRANCH_FACT_DISABLED = 0, BRANCH_FACT_READY = 1, BRANCH_FACT_PENDING_OWNER = 2,
+  BRANCH_FACT_UNSUPPORTED = 3, BRANCH_FACT_UNKNOWN_CUT = 4,
+  BRANCH_FACT_OVERFLOW = 5, BRANCH_FACT_INVALID = 6
+};
+
 typedef struct {
   int32_t signal;
   int32_t delivered_signal;
@@ -281,7 +295,7 @@ typedef struct {
 // exit, and app-level writes re-enter the syscall interception path.
 typedef void (*reverie_emit_fn_t)(const char* buf, size_t len);
 typedef void (*reverie_idle_fn_t)(void);
-#define REVERIE_DBT_RUNTIME_ABI_VERSION 11u
+#define REVERIE_DBT_RUNTIME_ABI_VERSION 12u
 #define REVERIE_DBT_STARTUP_STANDALONE 1u
 #define REVERIE_DBT_STARTUP_COORDINATED 2u
 // TODO-HUMAN-REVIEW(PR-162): Review the additive stdout-emit runtime callback
@@ -309,12 +323,15 @@ typedef struct {
   controller_capture_control_t controller_capture_control;
   // Fixed-size current-owner query or foreign owner/version validation.
   runtime_private_memory_t runtime_private_memory;
+  branch_fact_query_t branch_fact;
 } runtime_callbacks_t;
-_Static_assert(sizeof(runtime_callbacks_t) == 72, "runtime callbacks ABI size");
+_Static_assert(sizeof(runtime_callbacks_t) == 80, "runtime callbacks ABI size");
 _Static_assert(offsetof(runtime_callbacks_t, controller_capture_control) == 56,
     "controller capture callback ABI offset");
 _Static_assert(offsetof(runtime_callbacks_t, runtime_private_memory) == 64,
     "private memory callback ABI offset");
+_Static_assert(offsetof(runtime_callbacks_t, branch_fact) == 72,
+    "branch fact callback ABI offset");
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#90): Confirm diagnostic fd ownership across exec.
 // Inherited from the launcher so guest stderr redirections cannot capture it.
@@ -1360,6 +1377,9 @@ static task_state_t* task_state;
 static uint64_t task_state_device;
 static uint64_t task_state_inode;
 static bool task_state_identity_valid;
+
+#include "branch_counter.h"
+
 static bool task_state_identity_lost;
 // Separate from the process/helper owner: CLONE_VM children share this token,
 // while a separate-VM fork receives its own existing process-control slot.
@@ -1509,11 +1529,10 @@ static void initialize_task_state(bool external_global) {
   memset(task_state, 0, sizeof(*task_state));
   task_state->magic = TASK_STATE_MAGIC;
   atomic_flag_clear(&task_state->lock);
-  atomic_init(&task_state->next_birth_token, 1);
+  atomic_init(&task_state->next_birth_token, 2);
   atomic_init(&task_state->process_control_count, 0);
   task_state->root_pid = (int32_t)dr_get_process_id();
-  task_state->root_birth_token = atomic_fetch_add_explicit(
-      &task_state->next_birth_token, 1, memory_order_relaxed);
+  task_state->root_birth_token = 1;
   task_state->tasks[0] = (task_membership_t){
       task_state->root_pid, task_state->root_birth_token};
   task_state->task_count = 1;
@@ -1585,8 +1604,12 @@ static void task_state_unlock(void) {
 }
 
 static int32_t next_birth_token(void) {
-  return atomic_fetch_add_explicit(
-      &task_state->next_birth_token, 1, memory_order_relaxed);
+  int32_t birth = task_membership_next_birth(&task_state->next_birth_token);
+  if (birth == 0) {
+    dr_fprintf(diagnostic_file, "reverie-dbt: task birth identities exhausted\n");
+    exit_runtime_tree(101);
+  }
+  return birth;
 }
 
 static bool lookup_task_birth(int32_t tid, int32_t* birth);
@@ -1734,6 +1757,79 @@ static process_control_t* process_control_for(int32_t kernel_pid) {
   return entry;
 }
 
+/* Cache the exact admitted task birth, separately from process capture's
+ * birth. Pending thread publication must finish before this lookup is trusted.
+ * Instrumentation already counts the task's prefix while binding is pending. */
+static void bind_branch_owner(void* dc, prototype_counters_t* counters,
+    process_control_t* entry) {
+  branch_counter_state_t* state = branch_counter_state(dc);
+  if (state == NULL || state->owner_valid || entry == NULL ||
+      !task_state_identity_valid || counters->kernel_tid <= 0 ||
+      counters->kernel_tid != (int32_t)dr_get_thread_id(dc) ||
+      counters->kernel_pid != (int32_t)dr_get_process_id() ||
+      entry->kernel_pid != counters->kernel_pid || entry->birth_token <= 0)
+    return;
+  if (atomic_load_explicit(&entry->pending_thread_clones, memory_order_acquire) != 0)
+    return;
+  int32_t task_birth;
+  if (!lookup_task_birth(counters->kernel_tid, &task_birth) || task_birth <= 0)
+    return;
+  size_t slot = (size_t)(entry - task_state->process_controls);
+  if (slot >= atomic_load_explicit(&task_state->process_control_count,
+          memory_order_acquire))
+    return;
+  state->owner[0] = task_state_device;
+  state->owner[1] = task_state_inode;
+  state->owner[2] = slot + 1;
+  state->owner[3] = atomic_load_explicit(&entry->image_epoch, memory_order_acquire);
+  state->owner[4] = (uint64_t)(uint32_t)task_birth;
+  state->owner_pid = counters->kernel_pid;
+  state->owner_tid = counters->kernel_tid;
+  state->owner_valid = true;
+}
+
+/* This callback is a current-thread, stable bridge observation. An in-flight
+ * instrumentation phase without its actual raw cache PC is explicitly unknown;
+ * the restore/query path can use branch_counter_effective with its real cut. */
+static int32_t query_branch_fact(uintptr_t context, branch_fact_t* out) {
+  if (out == NULL)
+    return BRANCH_FACT_INVALID;
+  memset(out, 0, sizeof(*out));
+  if (!branch_counter_enabled)
+    return BRANCH_FACT_DISABLED;
+  if (context == 0 || (void*)context != dr_get_current_drcontext())
+    return BRANCH_FACT_INVALID;
+  branch_counter_state_t* state = branch_counter_state((void*)context);
+  if (state == NULL || !state->owner_valid)
+    return BRANCH_FACT_PENDING_OWNER;
+  if (!task_state_identity_valid || task_state == NULL ||
+      state->owner_pid != (int32_t)dr_get_process_id() ||
+      state->owner_tid != (int32_t)dr_get_thread_id((void*)context) ||
+      state->owner[0] != task_state_device || state->owner[1] != task_state_inode ||
+      state->owner[2] == 0 || state->owner[4] == 0)
+    return BRANCH_FACT_INVALID;
+  size_t count = atomic_load_explicit(&task_state->process_control_count,
+      memory_order_acquire);
+  if (count > MAX_TASK_MEMBERSHIPS || state->owner[2] > count)
+    return BRANCH_FACT_INVALID;
+  const process_control_t* entry =
+      &task_state->process_controls[state->owner[2] - 1];
+  if (entry->kernel_pid != state->owner_pid || entry->birth_token <= 0 ||
+      atomic_load_explicit(&entry->image_epoch, memory_order_acquire) != state->owner[3])
+    return BRANCH_FACT_INVALID;
+  if (atomic_load_explicit(&branch_counter_unsupported, memory_order_relaxed))
+    return BRANCH_FACT_UNSUPPORTED;
+  if (state->invalid)
+    return atomic_load_explicit(&state->edge_commits, memory_order_relaxed) == UINT64_MAX
+        ? BRANCH_FACT_OVERFLOW : BRANCH_FACT_INVALID;
+  uint64_t value;
+  if (!branch_counter_effective(state, NULL, &value))
+    return BRANCH_FACT_UNKNOWN_CUT;
+  memcpy(out->owner, state->owner, sizeof(out->owner));
+  out->count = value;
+  return BRANCH_FACT_READY;
+}
+
 /* Bind before entering Rust's Tool-start hook, using the existing process
  * admission lookup. A fork copy is rebound to its own positive-PID slot; exec
  * starts with zeroed TLS and authenticates the inherited owner again. No
@@ -1744,6 +1840,7 @@ static void bind_capture_owner(prototype_counters_t* counters) {
       counters->capture_owner.birth != entry->birth_token) {
     counters->capture_owner = (capture_owner_t){entry, entry->birth_token, 0};
   }
+  bind_branch_owner(dr_get_current_drcontext(), counters, entry);
 }
 
 // Cleanup may run for an early failure without a prepared process owner. Do
@@ -2402,8 +2499,12 @@ static int32_t controller_capture_control(
 
 static int32_t ensure_task_membership(int32_t tid) {
   int32_t birth;
-  if (!lookup_task_birth(tid, &birth) || birth <= 0)
-    publish_task_birth(tid, next_birth_token(), true);
+  if (!lookup_task_birth(tid, &birth) || birth <= 0) {
+    birth = next_birth_token();
+    if (birth == 0)
+      return 0;
+    publish_task_birth(tid, birth, true);
+  }
   return tid;
 }
 
@@ -2746,6 +2847,8 @@ static void try_start_pending_thread(void) {
     return;
   }
   counters->kernel_tid = (int32_t)dr_get_thread_id(drcontext);
+  bind_branch_owner(drcontext, counters,
+      process_control_for(counters->kernel_pid));
 
   int32_t init_result = 0;
   if (!has_copied_runtime() ||
@@ -2858,6 +2961,11 @@ static void signal_admission_return(void);
 #define PREEMPT_STUB_LEN 4 /* syscall (2) + ud2 (2) */
 static byte* preempt_stub;
 static byte* signal_stub;
+static bool branch_counter_owned_stub(app_pc pc) {
+  return (signal_stub != NULL && pc >= signal_stub && pc < signal_stub + PREEMPT_STUB_LEN) ||
+      (preempt_stub != NULL && pc >= preempt_stub && pc < preempt_stub + PREEMPT_STUB_LEN);
+}
+
 
 static bool is_counted_branch(instr_t* instruction) {
   return instr_is_cbr(instruction) || instr_is_ubr(instruction) ||
@@ -3217,6 +3325,8 @@ static bool validate_task_argument(uint64_t* argument) {
   return true;
 }
 
+static void cancel_clone_birth(prototype_counters_t* counters);
+
 static int64_t
 invoke_raw_syscall(uintptr_t context, int64_t sysnum, const uint64_t* args) {
   prototype_counters_t* counters = drmgr_get_tls_field(
@@ -3230,8 +3340,27 @@ invoke_raw_syscall(uintptr_t context, int64_t sysnum, const uint64_t* args) {
   if (sysnum == SYS_write || sysnum == SYS_writev || sysnum == SYS_pwrite64 ||
       sysnum == SYS_pwritev || sysnum == SYS_pwritev2)
     sigpipe_pid = (int32_t)dr_get_process_id();
-  if (!dr_invoke_syscall_as_app_with_result_and_sigpipe_identity(
-          (void*)context, (int)sysnum, 6, raw_args, sigpipe_pid, &invocation)) {
+  dr_syscall_invoke_status_t status;
+  if (branch_counter_enabled) {
+    status = dr_invoke_syscall_as_app_with_shared_vm_guard(
+        (void*)context, (int)sysnum, 6, raw_args, sigpipe_pid, &invocation);
+  } else {
+    status = dr_invoke_syscall_as_app_with_result_and_sigpipe_identity(
+                 (void*)context, (int)sysnum, 6, raw_args, sigpipe_pid, &invocation)
+        ? DR_SYSCALL_INVOKE_COMPLETED : DR_SYSCALL_INVOKE_OWNERSHIP_REFUSED;
+  }
+  if (status == DR_SYSCALL_INVOKE_SHARED_VM_REFUSED) {
+    // No child or DR clone record exists. Cancel the already reserved native
+    // birth using its existing owner before fatal cleanup; never return an
+    // invented errno or silently change returning injection to tail injection.
+    cancel_clone_birth(counters);
+    dr_fprintf(diagnostic_file,
+        "reverie-dbt: branch facts unavailable: returning shared-VM child "
+        "entry is unsupported (syscall %d)\n", (int)sysnum);
+    exit_runtime_tree(101);
+    return -EIO; // Unreachable after the named backend failure.
+  }
+  if (status != DR_SYSCALL_INVOKE_COMPLETED) {
     dr_fprintf(diagnostic_file,
                "reverie-dbt: returning syscall injection ownership refused\n");
     exit_runtime_tree(101);
@@ -3592,9 +3721,14 @@ static bool prepare_clone_birth(
   if (!clone_identity_flags(sysnum, args, &flags))
     return false;
   DR_ASSERT(counters->pending_birth_token == 0);
+  // Exhaustion terminates before acquiring the handoff lock: no unpublished
+  // zero birth may strand that lock or become a valid-looking owner.
+  int32_t birth = next_birth_token();
+  if (birth == 0)
+    return false;
   if ((flags & CLONE_THREAD) == 0)
     acquire_clone_identity_handoff();
-  counters->pending_birth_token = next_birth_token();
+  counters->pending_birth_token = birth;
   counters->pending_clone_flags = flags;
   if ((flags & CLONE_THREAD) == 0)
     reserve_capture_admission(counters->pending_birth_token);
@@ -3651,6 +3785,22 @@ static bool prepare_clone_birth(
   return true;
 }
 
+// Cancel a reserved birth that produced no child. Exhausted/failed attempts
+// consume their serial forever; only existing admission/lock state is released.
+static void cancel_clone_birth(prototype_counters_t* counters) {
+  if (counters == NULL || counters->pending_birth_token == 0)
+    return;
+  int32_t birth = counters->pending_birth_token;
+  if ((counters->pending_clone_flags & CLONE_THREAD) != 0) {
+    finish_pending_thread_clone(counters->kernel_pid);
+  } else {
+    cancel_failed_capture_admission(birth);
+    release_clone_identity_handoff(birth);
+  }
+  counters->pending_birth_token = 0;
+  counters->pending_clone_flags = 0;
+}
+
 /* The return is a positive kernel clone result, or zero. The private birth
  * serial is consumed here and never reaches a runtime or guest PID field. */
 static int32_t complete_clone_birth(
@@ -3660,8 +3810,10 @@ static int32_t complete_clone_birth(
   uint64_t flags = counters->pending_clone_flags;
   if (birth_token == 0)
     return 0;
-  if (result < 0 && (flags & CLONE_THREAD) == 0)
-    cancel_failed_capture_admission(birth_token);
+  if (result < 0) {
+    cancel_clone_birth(counters);
+    return 0;
+  }
   if (result == 0 && !require_supported_child_pid_namespace())
     return 0;
 
@@ -3749,6 +3901,14 @@ static int32_t complete_clone_birth(
       runtime_parent_process_id = parent;
       runtime_process_id = (int32_t)dr_get_process_id();
       runtime_is_root = false;
+      /* The fork-init callback created a fresh physical counter origin. Bind
+       * its new task only after this authoritative child birth and kernel-ID
+       * publication, before returning to any child application instruction.
+       * This uses the existing process-control authority, not the copied
+       * parent's capture pointer or memory-owner alias. */
+      if (branch_counter_enabled)
+        bind_branch_owner(dr_get_current_drcontext(), counters,
+            process_control_for(counters->kernel_pid));
     }
   }
   if ((flags & CLONE_THREAD) != 0 && result != 0) {
@@ -6916,7 +7076,9 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
       memory_order_release);
 
   for (int i = 1; i < argc; ++i) {
-    if (strcmp(argv[i], "-summary") == 0)
+    if (strcmp(argv[i], "-branch-facts") == 0)
+      branch_counter_enabled = true;
+    else if (strcmp(argv[i], "-summary") == 0)
       report_summary = true;
     else if (
         strcmp(argv[i], "-diagnostic_fd") == 0 ||
@@ -7005,6 +7167,7 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
   signal_stub[3] = 0x0b;
   initialize_private_memory(preempt_stub, signal_stub, dr_page_size());
   runtime_callbacks_page.value.runtime_private_memory = runtime_private_memory;
+  runtime_callbacks_page.value.branch_fact = query_branch_fact;
   if (!run_private_memory_self_test())
     return;
 
@@ -7029,6 +7192,7 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
   if (!drmgr_init() || !drwrap_init() || !drx_init() ||
       drreg_init(&register_options) != DRREG_SUCCESS)
     DR_ASSERT(false);
+  branch_counter_register();
   cpuid_marker_note = drmgr_reserve_note_range(1);
   if (cpuid_marker_note == DRMGR_NOTE_NONE)
     DR_ASSERT(false);

@@ -993,6 +993,41 @@ bool
 dr_unregister_module_unload_event(void (*func)(void *drcontext,
                                                const module_data_t *info));
 
+DR_API
+/**
+ * Registers a read-only notification that DR has irrevocably replaced a
+ * stopped target thread's raw continuation during synchronized cache relocation
+ * or detach.  A successful queued safe-spot replacement also produces this
+ * event: it need not already be installed in the operating system.
+ *
+ * The callback runs before the target resumes and before its old cache may be
+ * reclaimed, with the target's lifetime protected by DR's synchronization locks.
+ * It may execute on another thread.  Use the supplied target drcontext to access
+ * already allocated client TLS; the executing thread's TLS is not the target's.
+ * The copied source_pc is the abandoned raw PC.  The copied target_pc is the
+ * translated application continuation, not DR's reset-exit stub.
+ *
+ * This event does not provide a mutable machine context.  The callback may only
+ * invalidate its own target-specific execution metadata.  It must not block,
+ * take client/application locks, suspend threads, flush code, redirect execution,
+ * or call dr_set_mcontext().  It must not retain pointers to callback arguments.
+ *
+ * No event is produced for a query, a failed translation/context replacement, or
+ * a signal that resumes its raw continuation.  This is not a notification of
+ * every application control transfer.  Signal delivery retains its separate
+ * kernel-transfer event; current-thread detach retires client TLS through the
+ * thread-exit event before its final native transfer.
+ */
+void
+dr_register_cache_context_invalidation_event(
+    void (*func)(void *drcontext, app_pc source_pc, app_pc target_pc));
+
+DR_API
+/** Unregisters a cache-context invalidation notification; returns false if absent. */
+bool
+dr_unregister_cache_context_invalidation_event(
+    void (*func)(void *drcontext, app_pc source_pc, app_pc target_pc));
+
 /** Identifies the type of kernel transfer for dr_register_kernel_xfer_event(). */
 typedef enum {
     DR_XFER_SIGNAL_DELIVERY,      /**< Signal delivery to application handler. */

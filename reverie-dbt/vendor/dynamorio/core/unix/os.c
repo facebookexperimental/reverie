@@ -5988,23 +5988,24 @@ dr_invoke_syscall_as_app(void *drcontext, int sysnum, int arg_count, ...)
 }
 
 #ifdef LINUX
-static bool
+static dr_syscall_invoke_status_t
 invoke_syscall_as_app_with_result(void *drcontext, int sysnum, int arg_count,
                                   const reg_t *args, int guest_process_id,
+                                  bool guard_shared_vm,
                                   dr_syscall_invoke_result_t *result)
 {
     dcontext_t *dcontext = (dcontext_t *)drcontext;
     if (dcontext == NULL || dcontext == GLOBAL_DCONTEXT ||
         dcontext != get_thread_private_dcontext() || result == NULL ||
         arg_count < 0 || arg_count > 6 || (arg_count != 0 && args == NULL))
-        return false;
+        return DR_SYSCALL_INVOKE_OWNERSHIP_REFUSED;
     priv_mcontext_t *mc = get_mcontext(dcontext);
     bool suspend = sysnum == SYS_rt_sigsuspend;
     if (!signal_injection_permitted(dcontext, sysnum))
-        return false;
+        return DR_SYSCALL_INVOKE_OWNERSHIP_REFUSED;
     if (suspend && (!dcontext->client_data->in_pre_syscall ||
                     !signal_begin_injected_sigsuspend(dcontext)))
-        return false;
+        return DR_SYSCALL_INVOKE_OWNERSHIP_REFUSED;
 
     reg_t saved_args[6], actual_args[6] = { 0 };
     reg_t saved_sysnum = MCXT_SYSNUM_REG(mc), saved_result = MCXT_SYSCALL_RES(mc);
@@ -6013,6 +6014,10 @@ invoke_syscall_as_app_with_result(void *drcontext, int sysnum, int arg_count,
                              dcontext->sys_param2, dcontext->sys_param3,
                              dcontext->sys_param4 };
     bool saved_skip = dcontext->client_data->skip_client_syscall_events;
+    bool shared_vm_refused = false;
+    bool *saved_guard = dcontext->client_data->returning_shared_vm_refused;
+    dcontext->client_data->returning_shared_vm_refused =
+        guard_shared_vm ? &shared_vm_refused : NULL;
     for (int i = 0; i < 6; ++i) {
         saved_args[i] = sys_param(dcontext, i);
         if (i < arg_count)
@@ -6058,7 +6063,13 @@ invoke_syscall_as_app_with_result(void *drcontext, int sysnum, int arg_count,
         set_syscall_param(dcontext, i, saved_args[i]);
     MCXT_SYSCALL_RES(mc) = saved_result;
     MCXT_SYSNUM_REG(mc) = saved_sysnum;
-    return true;
+    dcontext->client_data->returning_shared_vm_refused = saved_guard;
+    if (shared_vm_refused) {
+        result->value = 0;
+        result->interruption = 0;
+        return DR_SYSCALL_INVOKE_SHARED_VM_REFUSED;
+    }
+    return DR_SYSCALL_INVOKE_COMPLETED;
 }
 
 DR_API
@@ -6068,7 +6079,8 @@ dr_invoke_syscall_as_app_with_result(void *drcontext, int sysnum, int arg_count,
                                     dr_syscall_invoke_result_t *result)
 {
     return invoke_syscall_as_app_with_result(drcontext, sysnum, arg_count, args, 0,
-                                             result);
+                                             false, result) ==
+        DR_SYSCALL_INVOKE_COMPLETED;
 }
 
 DR_API
@@ -6078,7 +6090,18 @@ dr_invoke_syscall_as_app_with_result_and_sigpipe_identity(
     int guest_process_id, dr_syscall_invoke_result_t *result)
 {
     return invoke_syscall_as_app_with_result(drcontext, sysnum, arg_count, args,
-                                             guest_process_id, result);
+                                             guest_process_id, false, result) ==
+        DR_SYSCALL_INVOKE_COMPLETED;
+}
+
+DR_API
+dr_syscall_invoke_status_t
+dr_invoke_syscall_as_app_with_shared_vm_guard(
+    void *drcontext, int sysnum, int arg_count, const reg_t *args,
+    int guest_process_id, dr_syscall_invoke_result_t *result)
+{
+    return invoke_syscall_as_app_with_result(drcontext, sysnum, arg_count, args,
+                                             guest_process_id, true, result);
 }
 #endif
 
@@ -7543,6 +7566,16 @@ handle_clone_pre(dcontext_t *dcontext)
             return false;
         }
         flags = dr_clone_args->flags;
+        /* Classify only this owned full copy, after established no-child
+         * errors and before child stack/TLS setup. An earlier client read of
+         * application clone_args cannot authorize a later mutable read. */
+        if (dcontext->client_data->returning_shared_vm_refused != NULL &&
+            TEST(CLONE_VM, flags)) {
+            *dcontext->client_data->returning_shared_vm_refused = true;
+            heap_free(dcontext, dr_clone_args,
+                      app_clone_args_size HEAPACCT(ACCT_OTHER));
+            return false;
+        }
 
         /* Save for post_system_call */
         /* We need to save the pointer to the app's clone_args so that we can restore it
@@ -7566,6 +7599,11 @@ handle_clone_pre(dcontext_t *dcontext)
             dr_clone_args->stack_size);
     } else {
         flags = (uint)sys_param(dcontext, 0);
+        if (dcontext->client_data->returning_shared_vm_refused != NULL &&
+            TEST(CLONE_VM, flags)) {
+            *dcontext->client_data->returning_shared_vm_refused = true;
+            return false;
+        }
         /* Save for post_system_call.
          * Unlike clone3, here the flags are 32-bit, so truncation is okay.
          */
@@ -8115,6 +8153,13 @@ pre_system_call(dcontext_t *dcontext)
 
 #ifdef SYS_vfork
     case SYS_vfork: {
+#    ifdef LINUX
+        if (dcontext->client_data->returning_shared_vm_refused != NULL) {
+            *dcontext->client_data->returning_shared_vm_refused = true;
+            execute_syscall = false;
+            break;
+        }
+#    endif
         /* treat as if sys_clone with flags just as sys_vfork does */
         /* in /usr/src/linux/arch/i386/kernel/process.c */
         uint flags = CLONE_VFORK | CLONE_VM | SIGCHLD;

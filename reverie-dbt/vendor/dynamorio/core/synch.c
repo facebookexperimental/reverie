@@ -1675,8 +1675,10 @@ translate_from_synchall_to_dispatch(thread_record_t *tr, thread_synch_state_t sy
     /* XXX: would like to assert that suspendcount is > 0 but how? */
     ASSERT(thread_synch_successful(tr));
 
-    DEBUG_DECLARE(bool res =) thread_get_mcontext(tr, mc);
+    bool res = thread_get_mcontext(tr, mc);
     ASSERT(res);
+    if (!res)
+        goto translate_from_synchall_to_dispatch_exit;
     pre_translation = (app_pc)mc->pc;
     LOG(GLOBAL, LOG_CACHE, 2, "\trecreating address for " PFX "\n", mc->pc);
     LOG(THREAD, LOG_CACHE, 2,
@@ -1735,9 +1737,9 @@ translate_from_synchall_to_dispatch(thread_record_t *tr, thread_synch_state_t sy
             }
         });
     } else {
-        DEBUG_DECLARE(res =) translate_mcontext(tr, mc, true /*restore memory*/, NULL);
+        res = translate_mcontext(tr, mc, true /*restore memory*/, NULL);
         ASSERT(res);
-        if (!thread_synch_successful(tr) || mc->pc == 0) {
+        if (!res || !thread_synch_successful(tr) || mc->pc == 0) {
             /* Better to risk failure on accessing a freed cache than
              * to have a guaranteed crash by sending to NULL.
              * XXX: it's possible the real translation is NULL,
@@ -1821,6 +1823,9 @@ translate_from_synchall_to_dispatch(thread_record_t *tr, thread_synch_state_t sy
          * Note that a thread in check_wait_at_safe_spot() spins and will NOT be
          * at a syscall, avoiding problems there (case 5074).
          */
+        /* The setter owns mc and may free it.  Retain only the logical
+         * continuation for the after-success invalidation notification. */
+        app_pc app_continuation = (app_pc)mc->pc;
         mc->pc = (app_pc)get_reset_exit_stub(dcontext);
         /* We need to set ARM mode to match the reset exit stub. */
         IF_ARM(dr_isa_mode_t prior_mode);
@@ -1848,12 +1853,15 @@ translate_from_synchall_to_dispatch(thread_record_t *tr, thread_synch_state_t sy
         swap_peb_pointer(dcontext, false /*to app*/);
 #endif
         /* exit stub and subsequent fcache_return will save rest of state */
-        DEBUG_DECLARE(res =)
-        set_synched_thread_context(dcontext->thread_record, mc, NULL, 0,
-                                   synch_state _IF_X64((void *)mc) _IF_WINDOWS(NULL));
+        res = set_synched_thread_context(dcontext->thread_record, mc, NULL, 0,
+                                        synch_state _IF_X64((void *)mc) _IF_WINDOWS(NULL));
         ASSERT(res);
-        /* cxt is freed by set_synched_thread_context() or target thread */
+        /* cxt is freed by set_synched_thread_context() or target thread,
+         * including the failed direct-install path. */
         free_cxt = false;
+        if (res)
+            instrument_cache_context_invalidated(dcontext, pre_translation,
+                                                 app_continuation);
         /* Now that set_synched_thread_context() recorded the mode for the reset
          * exit stub, restore for the post-exit-stub execution.
          */
@@ -1997,9 +2005,11 @@ detach_set_mcontext_helper(thread_record_t *thread)
 {
     priv_mcontext_t mc;
     LOG(GLOBAL, LOG_ALL, 2, "Detach: translating " TIDFMT "\n", thread);
-    DEBUG_DECLARE(bool ok =)
-    thread_get_mcontext(thread, &mc);
+    bool ok = thread_get_mcontext(thread, &mc);
     ASSERT(ok);
+    if (!ok)
+        return;
+    app_pc raw_pc = (app_pc)mc.pc;
     /* For a thread at a syscall, we use SA_RESTART for our suspend signal,
      * so the kernel will adjust the restart point back to the syscall for us
      * where expected.  This is an artifical signal we're introducing, so an
@@ -2014,9 +2024,10 @@ detach_set_mcontext_helper(thread_record_t *thread)
         "for thread " TIDFMT "\n",
         mc.pc, *mc.pc, *(mc.pc + 1), *(mc.pc + 2), *(mc.pc + 3), *(mc.pc + 4), mc.xsp,
         thread->id);
-    DEBUG_DECLARE(ok =)
-    translate_mcontext(thread, &mc, true /*restore mem*/, NULL /*f*/);
+    ok = translate_mcontext(thread, &mc, true /*restore mem*/, NULL /*f*/);
     ASSERT(ok);
+    if (!ok)
+        return;
     if (!thread->under_dynamo_control) {
         LOG(GLOBAL, LOG_ALL, 1, "Detach : thread " TIDFMT " already running natively\n",
             thread->id);
@@ -2035,9 +2046,11 @@ detach_set_mcontext_helper(thread_record_t *thread)
      * structures for the handler, it could result in a codemod exception
      * that wouldn't happen natively!
      */
-    DEBUG_DECLARE(ok =)
-    thread_set_mcontext(thread, &mc);
+    ok = thread_set_mcontext(thread, &mc);
     ASSERT(ok);
+    if (!ok)
+        return;
+    instrument_cache_context_invalidated(thread->dcontext, raw_pc, (app_pc)mc.pc);
     /* i#249: restore app's PEB/TEB fields */
     IF_WINDOWS(restore_peb_pointer_for_thread(thread->dcontext));
     /* Put the translation into the dcontext's mcontext so the detach state

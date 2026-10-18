@@ -22,6 +22,22 @@ static void setown(int32_t group, int32_t input,
 }
 
 int main(void) {
+  /* Last identities are usable once; exhaustion cannot wrap into an earlier
+   * task's scope, and repeated failures do not rewind the allocator. */
+  _Atomic int32_t birth;
+  atomic_init(&birth, INT32_MAX - 1);
+  assert(task_membership_next_birth(&birth) == INT32_MAX - 1);
+  assert(task_membership_next_birth(&birth) == INT32_MAX);
+  assert(task_membership_next_birth(&birth) == 0);
+  assert(task_membership_next_birth(&birth) == 0);
+  assert(atomic_load(&birth) == 0);
+  atomic_store(&birth, -1);
+  assert(task_membership_next_birth(&birth) == 0);
+  assert(atomic_load(&birth) == -1);
+  atomic_store(&birth, 1);
+  assert(task_membership_next_birth(&birth) == 1);
+  assert(atomic_load(&birth) == 2);
+
   /* Unrecorded getter targets reach Linux regardless of the unused token. */
   assert(task_membership_allows_robust_query(false, 0));
   assert(task_membership_allows_robust_query(false, -1));

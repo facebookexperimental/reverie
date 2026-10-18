@@ -17,6 +17,7 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 pub mod backend_stats;
+mod branch_facts;
 pub mod counter;
 mod counter2_global;
 mod evidence;
@@ -51,6 +52,11 @@ use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
 
+pub use branch_facts::BranchFact;
+pub use branch_facts::BranchFactQuery;
+pub use branch_facts::BranchFactUnavailable;
+pub use branch_facts::NativeBranchFact;
+pub use branch_facts::install_branch_fact_query;
 pub use counter2_global::Counter2Global;
 pub use evidence::CoordinatorEvidence;
 pub use evidence::DbtEvidence;
@@ -340,7 +346,9 @@ pub type RuntimeIdler = unsafe extern "C" fn();
 /// Version 11 appends the private-memory fact query after the controller
 /// control, growing callbacks from 64 to 72 bytes. The independent historical
 /// private-memory ABI-10 layout is incompatible and is not accepted.
-pub const DBT_RUNTIME_ABI_VERSION: u32 = 11;
+/// Version 12 appends the optional image/task-scoped instruction-fact query
+/// at offset 72. It does not change the shared clock or timer contract.
+pub const DBT_RUNTIME_ABI_VERSION: u32 = 12;
 
 /// Initialized native execution mode supplied by the version-6 startup bridge.
 ///
@@ -427,6 +435,8 @@ pub struct DbtRuntimeCallbacks {
     pub controller_capture_control: ControllerCaptureControl,
     /// Copies or validates fixed native private-memory facts (ABI version 11).
     pub runtime_private_memory: RuntimePrivateMemoryQuery,
+    /// Optional original-conditional facts, separate from the mixed statistic.
+    pub branch_fact: BranchFactQuery,
 }
 
 /// Reports the exact native-client/external-runtime ABI version.
@@ -634,6 +644,12 @@ where
             signal_info: None,
             signal_info_replacement: None,
         }
+    }
+
+    /// Reads optional image/task-scoped original-conditional facts. This is
+    /// DBT-internal observation transport, not a shared clock capability.
+    pub fn branch_fact(&self) -> Result<BranchFact, BranchFactUnavailable> {
+        branch_facts::query(self.context)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1464,6 +1480,8 @@ pub fn run_tool_thread_start<T: Tool>(
         read_registers,
         write_registers,
     );
+    #[cfg(feature = "prototype-runtime")]
+    branch_facts::observe_test_bridge(&guest, "tool-thread-start", -1);
     let tail_result = Arc::clone(&guest.tail_inject_result);
     let result = run_ready(tool.handle_thread_start(&mut guest), &tail_result)
         .expect("thread-start handler unexpectedly tail-injected");
@@ -1688,6 +1706,8 @@ fn run_tool_syscall_inner<T: Tool>(
     if let Some(read_memory) = read_memory {
         guest = guest.with_memory_reader(read_memory);
     }
+    #[cfg(feature = "prototype-runtime")]
+    branch_facts::observe_test_bridge(&guest, "tool-syscall", syscall.number().id() as i64);
     let tail_result = Arc::clone(&guest.tail_inject_result);
     tail_result.clear();
     match run_ready(tool.handle_syscall_event(&mut guest, syscall), &tail_result) {
@@ -2461,6 +2481,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v3(
     install_guest_compare_exchange(callbacks.compare_exchange_u32);
     install_controller_capture_control(callbacks.controller_capture_control);
     install_runtime_private_memory(callbacks.runtime_private_memory);
+    install_branch_fact_query(callbacks.branch_fact);
     PROCESS_CLONE_RESULT_PROBE.store(
         std::env::var_os("REVERIE_DBT_TEST_PROCESS_CLONE_RESULTS").is_some(),
         Ordering::Release,
@@ -3142,11 +3163,13 @@ mod tests {
 
     #[test]
     fn startup_abi_preserves_layout_and_requires_initialized_native_mode() {
-        assert_eq!(reverie_dbt_runtime_abi_version(), 11);
+        assert_eq!(reverie_dbt_runtime_abi_version(), 12);
         assert_eq!(std::mem::size_of::<DbtSignalEvent>(), 200);
         assert_eq!(std::mem::align_of::<DbtSignalEvent>(), 8);
-        assert_eq!(reverie_dbt_runtime_callbacks_size(), 72);
-        assert_eq!(std::mem::size_of::<DbtRuntimeCallbacks>(), 72);
+        assert_eq!(reverie_dbt_runtime_callbacks_size(), 80);
+        assert_eq!(std::mem::size_of::<DbtRuntimeCallbacks>(), 80);
+        assert_eq!(std::mem::offset_of!(DbtRuntimeCallbacks, branch_fact), 72);
+        assert_eq!(std::mem::size_of::<NativeBranchFact>(), 48);
         assert_eq!(
             std::mem::offset_of!(DbtRuntimeCallbacks, controller_capture_control),
             56

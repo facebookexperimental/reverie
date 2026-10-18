@@ -416,6 +416,12 @@ typedef struct _client_data_t {
 
     /* Flag for dr_invoke_syscall_as_app(). */
     bool skip_client_syscall_events;
+#ifdef LINUX
+    /* Non-NULL only during an explicitly guarded returning invocation. The
+     * pointer names that invocation's stack-owned refusal result, not a guest
+     * errno or a general syscall policy. Nested invocations restore it. */
+    bool *returning_shared_vm_refused;
+#endif
 } client_data_t;
 
 #ifdef UNIX

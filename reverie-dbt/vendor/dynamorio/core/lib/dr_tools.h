@@ -1350,6 +1350,31 @@ dr_invoke_syscall_as_app_with_result_and_sigpipe_identity(
     void *drcontext, int sysnum, int arg_count, const reg_t *args,
     int guest_process_id, dr_syscall_invoke_result_t *result);
 
+/** Outcome of the guarded returning mechanism, separate from Linux results. */
+typedef enum {
+    DR_SYSCALL_INVOKE_COMPLETED,
+    DR_SYSCALL_INVOKE_OWNERSHIP_REFUSED,
+    DR_SYSCALL_INVOKE_SHARED_VM_REFUSED,
+} dr_syscall_invoke_status_t;
+
+DR_API
+/**
+ * The returning-injection/SIGPIPE contract above, with shared-VM child entry
+ * refused before executing the kernel syscall. This returning bridge has no
+ * child trampoline that establishes independent DR TLS. Original application
+ * execution and dr_syscall_invoke_another() do not select this guard.
+ *
+ * Classification uses the existing clone prehandler's authoritative copied
+ * arguments. In particular, its established clone3 ENOSYS, size and read errors
+ * still complete with their Linux result. A shared-VM mechanism refusal is not
+ * an errno: result is cleared, no child is created, and the client must not
+ * report a guest syscall result. Existing unguarded interfaces are unchanged.
+ */
+dr_syscall_invoke_status_t
+dr_invoke_syscall_as_app_with_shared_vm_guard(
+    void *drcontext, int sysnum, int arg_count, const reg_t *args,
+    int guest_process_id, dr_syscall_invoke_result_t *result);
+
 DR_API
 /**
  * Completes an interrupted returning injection with the final outer callback

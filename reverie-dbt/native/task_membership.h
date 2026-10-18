@@ -7,6 +7,21 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdatomic.h>
+
+/* Admission identities are never recycled, including failed clone attempts.
+ * Zero is an absorbing exhaustion state. Publication of the resulting birth
+ * supplies synchronization; the allocator only establishes uniqueness. */
+static inline int32_t task_membership_next_birth(_Atomic int32_t* cursor) {
+  int32_t current = atomic_load_explicit(cursor, memory_order_relaxed);
+  while (current > 0) {
+    const int32_t next = current == INT32_MAX ? 0 : current + 1;
+    if (atomic_compare_exchange_weak_explicit(cursor, &current, next,
+            memory_order_relaxed, memory_order_relaxed))
+      return current;
+  }
+  return 0;
+}
 
 /* A kernel-observed task and its admission transaction. birth_token is opaque:
  * it is never returned to a guest or used as a syscall's PID argument. */
