@@ -889,6 +889,26 @@ pub trait Tool: Send + Sync + Default {
         false
     }
 
+    /// Whether this Tool, known from configuration alone, enforces a
+    /// serialized-execution contract on the guest:
+    /// - at most one guest thread runs at any time, so no guest thread runs
+    ///   while the backend works on another, stopped one; and
+    /// - the guest cannot install a seccomp filter: the Tool refuses
+    ///   `seccomp(SECCOMP_SET_MODE_FILTER)` and `prctl(PR_SET_SECCOMP)`.
+    ///
+    /// The backend trusts the declaration and does not check it. The ptrace
+    /// backend keeps the guest's SIGTRAP action and mask across its own
+    /// single-steps only for such a Tool, on x86-64: that repair injects
+    /// `rt_sigaction` into a stopped thread, which a guest thread running
+    /// meanwhile could defeat, for example by installing with
+    /// `SECCOMP_FILTER_FLAG_TSYNC` a filter that kills the injected call
+    /// (<https://github.com/rrnewton/hermit/issues/4409>). The default
+    /// declares nothing, and the backend then leaves SIGTRAP as Linux's step
+    /// traps leave it.
+    fn enforces_serialized_execution(_config: &<Self::GlobalState as GlobalTool>::Config) -> bool {
+        false
+    }
+
     /// Records one guest `rt_sigreturn` before it runs, for a Tool for which
     /// [`Tool::observes_sigreturns`] holds, on a backend that reports
     /// sigreturns. The backend then carries the call out exactly as it would

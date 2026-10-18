@@ -57,6 +57,7 @@ mod poll_on_wake;
 pub mod regs;
 #[cfg(all(test, target_arch = "x86_64"))]
 mod signal_action_boundary_tests;
+mod sigtrap_state;
 mod stack;
 mod stats;
 mod task;
@@ -73,6 +74,7 @@ pub use failure::BrokenSignalApproval;
 pub use failure::CapturedPrefix;
 pub use failure::LegacyCleanupDiagnostics;
 pub use failure::LegacyFailureProjection;
+pub use failure::PendingSigtrapAtStep;
 pub use failure::PtraceCallbackDecision;
 pub use failure::PtraceCallbackDiagnostic;
 pub use failure::PtraceCallbackOutcome;

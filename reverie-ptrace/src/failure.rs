@@ -543,6 +543,28 @@ mod tests {
     }
 }
 
+/// A guest thread had SIGTRAP blocked and one pending when Reverie had to
+/// single-step it (<https://github.com/rrnewton/hermit/issues/4409>).
+///
+/// Linux reports each single-step with `force_sig(SIGTRAP)`. While SIGTRAP is
+/// blocked, that trap is absorbed into the pending one, which is consumed,
+/// and SIGTRAP's action is reset to `SIG_DFL`; while it is unblocked, the
+/// pending SIGTRAP is taken before the stepped instruction. Either way the
+/// guest's signal cannot be kept as it would be natively, so Reverie ends the
+/// run rather than continue without it.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "thread {tid} has SIGTRAP blocked with one pending, which Reverie's \
+     single-step at the {site} cannot keep; the run is ended instead of \
+     continuing without it"
+)]
+pub struct PendingSigtrapAtStep {
+    /// The thread that was to be stepped.
+    pub tid: i32,
+    /// The step that was to be made.
+    pub site: &'static str,
+}
+
 /// A guest made a syscall through the untraced `syscall` of Reverie's private
 /// page, outside any injection, and took the SIGILL of the `ud2` after it.
 ///

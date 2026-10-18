@@ -536,6 +536,13 @@ const SHAPE_EMULATE: u64 = 2;
 const SHAPE_PRIVATE: u64 = 3;
 const SHAPE_TWO_INJECTS: u64 = 4;
 const SHAPE_TWO_PRIVATE: u64 = 5;
+/// Blocks every signal with an injected `rt_sigprocmask`, injects the call,
+/// and restores the mask, as Detcore's disposition check
+/// (`block_signals_for_disposition`) brackets its calls.
+const SHAPE_BLOCK_ALL: u64 = 6;
+/// Injects a getpid first, which takes the pending syscall's place, then the
+/// call itself, which therefore runs on the private page, single-stepped.
+const SHAPE_PRIVATE_CALL: u64 = 7;
 const SEND_SIGUSR1: u64 = 0x100;
 const SEND_SIGWINCH: u64 = 0x200;
 const SEND_QUEUE: u64 = 0x400;
@@ -583,6 +590,12 @@ struct GuestConfig {
     /// Observes sigreturns (`Tool::observes_sigreturns`), recording each
     /// report in `SIGRETURN_REPORTS`.
     sigreturns: bool,
+    /// Declares a serialized-execution contract
+    /// (`Tool::enforces_serialized_execution`), as Hermit's Tool does, so that
+    /// Reverie keeps the guest's SIGTRAP state across its steps. This Tool
+    /// does not enforce it: the tests run guest threads at once, and install
+    /// guest filters, to exercise the repair beyond the contract.
+    serialized: bool,
 }
 
 /// The `rt_sigreturn` reports the regression Tool was given, as (thread,
@@ -936,6 +949,10 @@ impl Tool for GuestTool {
         config.sigreturns
     }
 
+    fn enforces_serialized_execution(config: &GuestConfig) -> bool {
+        config.serialized
+    }
+
     fn handle_sigreturn(&self, _thread_state: &mut (), report: reverie::SigreturnReport) {
         SIGRETURN_REPORTS
             .lock()
@@ -1082,6 +1099,45 @@ impl Tool for GuestTool {
                     .await;
                 Ok(first?)
             }
+            SHAPE_BLOCK_ALL => {
+                use reverie::Stack;
+                let mut stack = guest.stack().await;
+                let all: u64 = !0;
+                let all_addr = stack.push(all);
+                let old_addr = stack.reserve::<u64>();
+                let _guard = stack.commit()?;
+                let block = reverie::syscalls::RtSigprocmask::new()
+                    .with_how(libc::SIG_SETMASK)
+                    .with_set(Some(all_addr.cast()))
+                    .with_oldset(Some(old_addr.cast()))
+                    .with_sigsetsize(8);
+                guest.inject(block).await?;
+                let result = guest.inject(call).await;
+                let restore = reverie::syscalls::RtSigprocmask::new()
+                    .with_how(libc::SIG_SETMASK)
+                    .with_set(Some(reverie::syscalls::Addr::from(old_addr).cast()))
+                    .with_oldset(None)
+                    .with_sigsetsize(8);
+                guest.inject(restore).await?;
+                guest
+                    .send_rpc(format!(
+                        "syscall {name} = {} under all blocked",
+                        errno_value(&result)
+                    ))
+                    .await;
+                Ok(result?)
+            }
+            SHAPE_PRIVATE_CALL => {
+                guest.inject(reverie::syscalls::Getpid::new()).await?;
+                let result = guest.inject(call).await;
+                guest
+                    .send_rpc(format!(
+                        "syscall {name} = {} privately",
+                        errno_value(&result)
+                    ))
+                    .await;
+                Ok(result?)
+            }
             SHAPE_TWO_PRIVATE => {
                 let first = guest.inject(reverie::syscalls::Getpid::new()).await;
                 let second = guest.inject(reverie::syscalls::Getpid::new()).await;
@@ -1167,6 +1223,42 @@ impl Tool for GuestTool {
                 steps(guest.tid()),
             ))
             .await;
+        // `sigtrap_signal_callback`: inject from the callback, then resume
+        // the signal. SIGPROF injects getpid; SIGXCPU brackets it with
+        // rt_sigprocmask injections that block every signal, as Detcore's
+        // disposition check does.
+        match signal {
+            reverie::Signal::SIGPROF => {
+                let _ = guest.inject(reverie::syscalls::Getpid::new()).await;
+            }
+            reverie::Signal::SIGXCPU => {
+                use reverie::Stack;
+                let mut stack = guest.stack().await;
+                let all = stack.push(!0u64);
+                let old = stack.reserve::<u64>();
+                let _guard = stack.commit()?;
+                guest
+                    .inject(
+                        reverie::syscalls::RtSigprocmask::new()
+                            .with_how(libc::SIG_SETMASK)
+                            .with_set(Some(all.cast()))
+                            .with_oldset(Some(old.cast()))
+                            .with_sigsetsize(8),
+                    )
+                    .await?;
+                let _ = guest.inject(reverie::syscalls::Getpid::new()).await;
+                guest
+                    .inject(
+                        reverie::syscalls::RtSigprocmask::new()
+                            .with_how(libc::SIG_SETMASK)
+                            .with_set(Some(reverie::syscalls::Addr::from(old).cast()))
+                            .with_oldset(None)
+                            .with_sigsetsize(8),
+                    )
+                    .await?;
+            }
+            _ => {}
+        }
         if signal == reverie::Signal::SIGWINCH {
             // Suppressed: the interrupted call restarts.
             Ok(None)
@@ -1281,6 +1373,65 @@ struct GuestOptions {
     order: Option<&'static str>,
     /// Observes sigreturns (`GuestConfig::sigreturns`).
     sigreturns: bool,
+    /// The run's deadline, if not the default 60 s: for a mode that runs
+    /// many children.
+    deadline: Option<Duration>,
+    /// A seccomp filter returning this action for `mseal`, which the caller
+    /// installs in a `pre_exec` callback (`caller_mseal_filter`).
+    caller_mseal_filter: Option<u32>,
+    /// The Tool declares no serialized-execution contract
+    /// (`GuestConfig::serialized`), as a plain Reverie Tool: SIGTRAP is left
+    /// as at base.
+    no_serialization_contract: bool,
+}
+
+/// Installs a seccomp filter on the calling thread that returns `action` for
+/// x86_64 `mseal` (462) and allows every other call. Runs in a `pre_exec`
+/// callback, so it only makes system calls.
+fn caller_mseal_filter(action: u32) -> Result<(), Errno> {
+    const LD_W_ABS: u16 = (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16;
+    const JEQ_K: u16 = (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16;
+    const RET_K: u16 = (libc::BPF_RET | libc::BPF_K) as u16;
+    let statement = |code, k| libc::sock_filter {
+        code,
+        jt: 0,
+        jf: 0,
+        k,
+    };
+    let jump = |k, jt, jf| libc::sock_filter {
+        code: JEQ_K,
+        jt,
+        jf,
+        k,
+    };
+    let mut filter = [
+        // seccomp_data.arch
+        statement(LD_W_ABS, 4),
+        jump(0xc000_003e, 1, 0),
+        statement(RET_K, libc::SECCOMP_RET_ALLOW),
+        // seccomp_data.nr
+        statement(LD_W_ABS, 0),
+        jump(462, 0, 1),
+        statement(RET_K, action),
+        statement(RET_K, libc::SECCOMP_RET_ALLOW),
+    ];
+    let program = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_mut_ptr(),
+    };
+    // SAFETY: `program` points at `filter`, which outlives both calls.
+    unsafe {
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+            || libc::prctl(
+                libc::PR_SET_SECCOMP,
+                libc::SECCOMP_MODE_FILTER,
+                &program as *const libc::sock_fprog,
+            ) != 0
+        {
+            return Err(Errno::last());
+        }
+    }
+    Ok(())
 }
 
 async fn run_guest_options(mode: &str, options: GuestOptions) -> Result<GuestRun, Error> {
@@ -1290,12 +1441,19 @@ async fn run_guest_options(mode: &str, options: GuestOptions) -> Result<GuestRun
     if let Some(order) = options.order {
         command.env("TP_ORDER", order);
     }
+    if let Some(action) = options.caller_mseal_filter {
+        // SAFETY: the callback only makes system calls.
+        unsafe {
+            command.pre_exec(move || caller_mseal_filter(action));
+        }
+    }
     let resumes = std::sync::Arc::new(Mutex::new(Vec::new()));
     let tracer = TracerBuilder::<GuestTool>::new(command)
         .config(GuestConfig {
             tail: options.tail,
             partial: options.partial,
             sigreturns: options.sigreturns,
+            serialized: !options.no_serialization_contract,
         })
         .backend_stats(BackendStatsRequest::ENABLED)
         .final_resume_signal_for_test(resume_recorder(resumes.clone()))
@@ -1303,7 +1461,8 @@ async fn run_guest_options(mode: &str, options: GuestOptions) -> Result<GuestRun
         .spawn()
         .await?;
     let stats = tracer.backend_stats().expect("stats were requested");
-    let result = tokio::time::timeout(Duration::from_secs(60), finish_run(tracer, &stats))
+    let deadline = options.deadline.unwrap_or(Duration::from_secs(60));
+    let result = tokio::time::timeout(deadline, finish_run(tracer, &stats))
         .await
         .unwrap_or_else(|_| panic!("regression fixture mode {mode} timed out"));
     let report = std::fs::read_to_string(&report_path).unwrap_or_default();
@@ -1527,6 +1686,37 @@ async fn run_both_configurations(mode: &str) -> [GuestRun; 2] {
         assert_eq!(run.status, ExitStatus::Exited(0), "{}", run.report);
         assert!(run.report.ends_with("done\n"), "{}", run.report);
     }
+    [inject, tail]
+}
+
+/// `run_both_configurations` for a mode that runs long (many children, or
+/// thousands of injections): each run has `deadline` instead of 60 s.
+async fn run_both_configurations_within(mode: &str, deadline: Duration) -> [GuestRun; 2] {
+    run_both_configurations_with(
+        mode,
+        GuestOptions {
+            deadline: Some(deadline),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// `run_both_configurations` with `options` for each run, but its `tail`.
+async fn run_both_configurations_with(mode: &str, options: GuestOptions) -> [GuestRun; 2] {
+    let mut runs = Vec::new();
+    for tail in [false, true] {
+        let options = GuestOptions { tail, ..options };
+        let run = run_guest_options(mode, options)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("regression fixture run {mode} tail={tail} failed: {error}")
+            });
+        assert_eq!(run.status, ExitStatus::Exited(0), "{}", run.report);
+        assert!(run.report.ends_with("done\n"), "{}", run.report);
+        runs.push(run);
+    }
+    let [inject, tail]: [GuestRun; 2] = runs.try_into().unwrap_or_else(|_| unreachable!());
     [inject, tail]
 }
 
@@ -1787,16 +1977,18 @@ async fn unknown_numbers_return_enosys_without_a_tool_event() {
     }
 }
 
-/// Each Tool handler shape single-steps a fixed number of times, so the
-/// guest sees a fixed SIGTRAP disposition, mask and trap number after each:
-/// a shape that single-steps resets SIGTRAP to its default and unblocks it,
-/// and the last trap the SIGUSR1 frame records is the step's debug trap (1)
-/// instead of the syscall's (13). In the fixture's order of the shapes
-/// (exact inject, tail, emulate, private inject, two injects, two private
-/// injects) the steps are 0, 0, 1, 2, 1 and 3.
+/// Each Tool handler shape single-steps a fixed number of times. The guest's
+/// ignored and blocked SIGTRAP stays so after every shape, stepped or not
+/// (<https://github.com/rrnewton/hermit/issues/4409>;
+/// `sigtrap_state_survives_each_handler_shape` covers the other states).
+/// The last trap the SIGUSR1 frame records still differs: after a shape
+/// that single-steps it is the step's debug trap (1) instead of the
+/// syscall's (13), a documented difference. In the fixture's order of the
+/// shapes (exact inject, tail, emulate, private inject, two injects, two
+/// private injects) the steps are 0, 0, 1, 2, 1 and 3.
 #[tokio::test(flavor = "current_thread")]
 async fn sigtrap_profile_follows_each_handler_shape() {
-    let [inject, _] = run_both_configurations("sigtrap_profile").await;
+    let [inject, tail] = run_both_configurations("sigtrap_profile").await;
     eprintln!("sigtrap profile report:\n{}", inject.report);
     let mut guest_visible = Vec::new();
     for (shape, result, stepped) in [
@@ -1807,11 +1999,8 @@ async fn sigtrap_profile_follows_each_handler_shape() {
         ("two-injects", "ppid", true),
         ("two-private", "pid", true),
     ] {
-        let (disposition, blocked, trapno) = if stepped {
-            ("dfl", 0, 1)
-        } else {
-            ("ign", 1, 13)
-        };
+        let (disposition, blocked) = ("ign", 1);
+        let trapno = if stepped { 1 } else { 13 };
         guest_visible.push(format!("{shape} getppid={result}"));
         guest_visible.push(format!("{shape} sigtrap={disposition} blocked={blocked}"));
         guest_visible.push(format!(
@@ -1825,10 +2014,72 @@ async fn sigtrap_profile_follows_each_handler_shape() {
         .filter(|line| !line.starts_with("mode ") && *line != "done")
         .collect();
     assert_eq!(lines, guest_visible, "{}", inject.report);
+    // The tail configuration keeps SIGTRAP's state too; its frames and steps
+    // follow that configuration's own shapes, so only the state is compared.
+    let state = |report: &str| -> Vec<String> {
+        report
+            .lines()
+            .filter(|line| line.contains(" sigtrap="))
+            .map(str::to_owned)
+            .collect()
+    };
+    assert_eq!(
+        state(&tail.report),
+        state(&inject.report),
+        "{}",
+        tail.report
+    );
     let expected = [0, 0, 1, 2, 1, 3];
     let steps = steps_per_shape(&inject);
     eprintln!("steps per shape: {steps:?}");
     assert_eq!(steps, expected, "step profile");
+}
+
+/// A guest's SIGTRAP state survives every Tool handler shape, as it does
+/// natively (https://github.com/rrnewton/hermit/issues/4409). Linux reports
+/// each `PTRACE_SINGLESTEP` with `force_sig`, which resets a blocked or
+/// ignored SIGTRAP to `SIG_DFL` and unblocks it. Five states (ignored or
+/// caught, blocked or not, and default blocked) go through each shape, and
+/// the guest reads back the handler, the flags and `sa_mask` it set, and the
+/// mask bit. The step profile is asserted too, so the stepping shapes are
+/// known to have stepped.
+#[tokio::test(flavor = "current_thread")]
+async fn sigtrap_state_survives_each_handler_shape() {
+    let runs = run_both_configurations("sigtrap_states").await;
+    let shapes = [
+        "inject",
+        "tail",
+        "emulate",
+        "private",
+        "two-injects",
+        "two-private",
+        "block-all",
+    ];
+    let mut expected = Vec::new();
+    for (state, action, blocked) in [
+        ("ign-blocked", "ign", 1),
+        ("ign", "ign", 0),
+        ("handler-blocked", "trap_handler", 1),
+        ("handler", "trap_handler", 0),
+        ("dfl-blocked", "dfl", 1),
+    ] {
+        for shape in shapes {
+            expected.push(format!(
+                "{state} {shape} sigtrap={action} flags=0x50000000 usr2-in-mask=1 \
+                 blocked={blocked}"
+            ));
+        }
+    }
+    for run in &runs {
+        let lines: Vec<&str> = run
+            .report
+            .lines()
+            .filter(|line| !line.starts_with("mode ") && *line != "done")
+            .collect();
+        assert_eq!(lines, expected, "{}", run.report);
+    }
+    let steps = steps_per_shape(&runs[0]);
+    assert_eq!(steps, [0, 0, 1, 2, 1, 3, 4].repeat(5), "step profile");
 }
 
 /// Steps taken by each tagged call: the cumulative count at the next
@@ -3007,6 +3258,725 @@ async fn a_perf_marker_timer_steps_onto_the_next_syscall() {
     .await;
 }
 
+/// A guest's ignored or blocked SIGTRAP survives exec as it does natively
+/// (<https://github.com/rrnewton/hermit/issues/4409>). Reverie single-steps an
+/// `mmap` of its private page in every new image before the guest's first
+/// instruction (`setup_special_mmap_page`); each image reads the state its
+/// predecessor set before any Tool injection. Exec keeps `SIG_IGN` and the
+/// mask, and clears every action's flags and `sa_mask`.
+#[tokio::test(flavor = "current_thread")]
+async fn sigtrap_state_survives_reverie_preinit_at_exec() {
+    for run in run_both_configurations("sigtrap_exec").await {
+        let lines: Vec<&str> = run
+            .report
+            .lines()
+            .filter(|line| line.starts_with("exec "))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "exec ign-blocked sigtrap=ign flags=0 usr2-in-mask=0 blocked=1",
+                "exec ign sigtrap=ign flags=0 usr2-in-mask=0 blocked=0",
+                "exec dfl-blocked sigtrap=dfl flags=0 usr2-in-mask=0 blocked=1",
+            ],
+            "{}",
+            run.report
+        );
+    }
+}
+
+/// A guest's SIGTRAP state survives a guest `fork` run in place, whose parent
+/// Reverie single-steps from its clone event stop (`handle_new_task`), in
+/// both the parent and the child
+/// (<https://github.com/rrnewton/hermit/issues/4409>).
+#[tokio::test(flavor = "current_thread")]
+async fn sigtrap_state_survives_a_guest_fork() {
+    let runs = run_both_configurations("sigtrap_fork").await;
+    let mut expected = Vec::new();
+    for (state, action, blocked) in [
+        ("ign-blocked", "ign", 1),
+        ("ign", "ign", 0),
+        ("handler-blocked", "trap_handler", 1),
+    ] {
+        for who in ["child", "parent"] {
+            expected.push(format!(
+                "fork {who} {state} sigtrap={action} flags=0x50000000 usr2-in-mask=1 \
+                 blocked={blocked}"
+            ));
+        }
+    }
+    for run in &runs {
+        let lines: Vec<&str> = run
+            .report
+            .lines()
+            .filter(|line| line.starts_with("fork "))
+            .collect();
+        assert_eq!(lines, expected, "{}", run.report);
+    }
+}
+
+/// Calls that set SIGTRAP's action or the blocked mask, injected on the
+/// private page and single-stepped, leave what they set
+/// (<https://github.com/rrnewton/hermit/issues/4409>):
+/// - `rt_sigaction(SIGTRAP, act)` with SIGTRAP blocked: the trap after the
+///   call resets `act`, and the repair writes back `act`, not the action
+///   before the call; from a write-only page too, which the kernel reads;
+///   but from an inaccessible page, or one whose protection key denies
+///   access (with or without `oldact`), the call fails before installing
+///   `act`, and the repair writes back the action before the call; and with
+///   an `oldact` the kernel cannot write, it installs `act` and then fails;
+/// - `ppoll` with SIGTRAP in its temporary mask and a zero timeout: the kernel
+///   restores the guest's mask before the step's trap, which then sees
+///   SIGTRAP blocked only if the guest blocks it.
+#[tokio::test(flavor = "current_thread")]
+async fn sigtrap_state_survives_private_calls_that_set_it() {
+    // Protection keys need the CPU's and the kernel's support.
+    let pkeys = std::fs::read_to_string("/proc/cpuinfo").is_ok_and(|cpuinfo| {
+        cpuinfo
+            .lines()
+            .find(|line| line.starts_with("flags"))
+            .is_some_and(|flags| {
+                let flags: Vec<&str> = flags.split_whitespace().collect();
+                flags.contains(&"pku") && flags.contains(&"ospke")
+            })
+    });
+    let pkey_rows = if pkeys {
+        [
+            "private-sigaction-pkey dfl r=efault sigtrap=ign flags=0x50000000 usr2-in-mask=1 blocked=1",
+            "private-sigaction-pkey-oldact dfl r=efault sigtrap=ign flags=0x50000000 usr2-in-mask=1 blocked=1",
+        ]
+    } else {
+        [
+            "private-sigaction-pkey unavailable",
+            "private-sigaction-pkey-oldact unavailable",
+        ]
+    };
+    for run in run_both_configurations("sigtrap_private_calls").await {
+        let lines: Vec<&str> = run
+            .report
+            .lines()
+            .filter(|line| line.starts_with("private-"))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "private-sigaction ign sigtrap=ign flags=0x50000000 usr2-in-mask=1 blocked=1",
+                "private-sigaction handler sigtrap=trap_handler flags=0x50000000 usr2-in-mask=1 blocked=1",
+                "private-sigaction-writeonly ign sigtrap=ign flags=0x50000000 usr2-in-mask=1 blocked=1",
+                "private-sigaction-noaccess dfl r=efault sigtrap=ign flags=0x50000000 usr2-in-mask=1 blocked=1",
+                pkey_rows[0],
+                pkey_rows[1],
+                "private-sigaction-badoldact ign r=efault sigtrap=ign flags=0x50000000 usr2-in-mask=1 blocked=1",
+                "private-ppoll handler-blocked sigtrap=trap_handler flags=0x50000000 usr2-in-mask=1 blocked=1",
+                "private-ppoll ign-blocked sigtrap=ign flags=0x50000000 usr2-in-mask=1 blocked=1",
+                "private-ppoll handler sigtrap=trap_handler flags=0x50000000 usr2-in-mask=1 blocked=0",
+            ],
+            "{}",
+            run.report
+        );
+    }
+}
+
+/// A guest's SIGTRAP state survives a mask-swapping wait that a handled
+/// signal interrupts (<https://github.com/rrnewton/hermit/issues/4409>). The
+/// wait, injected on the private page, returns with its temporary mask's
+/// restore pending, so the action cannot be written back there; it is
+/// written back at the guest's next seccomp stop, before the Tool or the
+/// syscall reads it (`repair_sigtrap_at_seccomp_stop`). `rt_sigsuspend` and
+/// `ppoll`, with SIGTRAP ignored or caught, in the temporary mask or not, and
+/// blocked; both configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn sigtrap_state_survives_interrupted_waits() {
+    let mut expected = Vec::new();
+    for op in ["sigsuspend", "ppoll"] {
+        for (state, action, blocked) in [
+            ("ign", "ign", 0),
+            ("ign-tmask", "ign", 0),
+            ("handler-tmask", "trap_handler", 0),
+            ("handler-blocked", "trap_handler", 1),
+        ] {
+            expected.push(format!(
+                "wait {op} {state} r=eintr sigtrap={action} flags=0x50000000 usr2-in-mask=1 \
+                 blocked={blocked}"
+            ));
+        }
+    }
+    for run in run_both_configurations("sigtrap_interrupted_waits").await {
+        let lines: Vec<&str> = run
+            .report
+            .lines()
+            .filter(|line| line.starts_with("wait "))
+            .collect();
+        assert_eq!(lines, expected, "{}", run.report);
+    }
+}
+
+/// A repair Reverie owes for SIGTRAP never overwrites an action the guest
+/// sets itself (<https://github.com/rrnewton/hermit/issues/4409>): after a
+/// guest fork resets an ignored SIGTRAP, the guest installs a handler with a
+/// call the Tool runs in place (tail configuration) or injects exactly, and a
+/// later private injection must leave that handler. Both configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn a_sigtrap_repair_never_overwrites_the_guests_own_action() {
+    for run in run_both_configurations("sigtrap_fork_then_sigaction").await {
+        let lines: Vec<&str> = run
+            .report
+            .lines()
+            .filter(|line| line.starts_with("stale "))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "stale after-fork sigtrap=ign flags=0x50000000 usr2-in-mask=1 blocked=0",
+                "stale after-sigaction sigtrap=trap_handler flags=0x50000000 usr2-in-mask=1 blocked=0",
+                "stale after-private sigtrap=trap_handler flags=0x50000000 usr2-in-mask=1 blocked=0",
+            ],
+            "{}",
+            run.report
+        );
+    }
+}
+
+/// A guest `int3` that a precise timer single-steps, with SIGTRAP caught and
+/// blocked or ignored, resets SIGTRAP by its own `force_sig` and kills the
+/// process, as natively: Reverie neither shields that step nor repairs it
+/// (<https://github.com/rrnewton/hermit/issues/4409>). Also behind an
+/// operand-size prefix (`66 cc`), and behind REX prefixes that are not last
+/// (`48 48 cc`, `48 66 cc`), which the CPU ignores: each is an `int3` too.
+/// And an `int3` in an execute-only page, which `process_vm_readv` cannot
+/// read.
+#[tokio::test(flavor = "current_thread")]
+async fn a_guest_int3_in_a_timer_window_takes_sigtraps_default_action() {
+    if !crate::perf::is_perf_supported() {
+        eprintln!("skipping: perf counters are not supported here");
+        return;
+    }
+    let mut expected = Vec::new();
+    for encoding in ["cc", "66cc", "4848cc", "4866cc", "xo-cc"] {
+        for case in [
+            "handler-blocked-notimer",
+            "handler-blocked",
+            "ign",
+            "ign-blocked",
+        ] {
+            for c in 2..6 {
+                expected.push(format!("int3 {encoding} {case} c={c} signaled=1 sig=5"));
+            }
+        }
+    }
+    // 80 children per configuration: about 25 s quiet, and up to 85 s under
+    // a loaded host, so each run has 240 s rather than the default 60 s.
+    for run in run_both_configurations_within("sigtrap_int3_timer", Duration::from_secs(240)).await
+    {
+        let lines: Vec<&str> = run
+            .report
+            .lines()
+            .filter(|line| line.starts_with("int3 "))
+            .collect();
+        assert_eq!(lines, expected, "{}", run.report);
+    }
+}
+
+/// A blocked SIGTRAP that is pending when Reverie must single-step the
+/// thread cannot be kept, so the run ends with the named failure
+/// `PendingSigtrapAtStep` instead of losing it
+/// (<https://github.com/rrnewton/hermit/issues/4409>). Both configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn a_pending_blocked_sigtrap_at_a_step_ends_the_run_by_name() {
+    for tail in [false, true] {
+        let error = match run_guest_with("sigtrap_pending_at_step", tail).await {
+            Ok(run) => panic!(
+                "the run continued past a pending SIGTRAP (tail={tail}): {:?}\n{}",
+                run.status, run.report
+            ),
+            Err(error) => error,
+        };
+        let refusal = match &error {
+            Error::Tool(inner) => inner.downcast_ref::<crate::PendingSigtrapAtStep>(),
+            _ => None,
+        };
+        let refusal = refusal.unwrap_or_else(|| {
+            panic!("expected PendingSigtrapAtStep (tail={tail}), got {error:?}")
+        });
+        assert_eq!(refusal.site, "syscall skip", "{refusal}");
+    }
+}
+
+/// Reverie's SIGTRAP repair keeps its scratch out of guest memory
+/// (<https://github.com/rrnewton/hermit/issues/4409>): an emulated call with
+/// SIGTRAP ignored and blocked, on a one-page stack between inaccessible
+/// guard pages, 512 and 2048 bytes above the lower guard, succeeds, leaves
+/// 32 canary bytes below the stack pointer unchanged (where that address is
+/// on the page), and leaves SIGTRAP's state. Both configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn a_sigtrap_repair_touches_no_guest_stack() {
+    for run in run_both_configurations("sigtrap_tight_stack").await {
+        let lines: Vec<&str> = run
+            .report
+            .lines()
+            .filter(|line| line.starts_with("tight "))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "tight 512 r=4242 changed=-1 sigtrap=ign flags=0x50000000 usr2-in-mask=1 blocked=1",
+                "tight 2048 r=4242 changed=0 sigtrap=ign flags=0x50000000 usr2-in-mask=1 blocked=1",
+            ],
+            "{}",
+            run.report
+        );
+    }
+}
+
+/// A sibling thread that reads SIGTRAP's action after another thread's wait
+/// was interrupted, while that thread's handler runs and before it makes
+/// another syscall, reads the guest's action, not the reset `SIG_DFL`: the
+/// repair is owed by the thread group, and the sibling's own syscall stop
+/// writes it first (<https://github.com/rrnewton/hermit/issues/4409>). Both
+/// configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn a_sibling_never_reads_a_reset_sigtrap_action() {
+    let mut expected = Vec::new();
+    for op in ["sigsuspend", "ppoll"] {
+        for (state, action) in [
+            ("ign", "ign"),
+            ("ign-tmask", "ign"),
+            ("handler-tmask", "trap_handler"),
+            ("handler-blocked", "trap_handler"),
+        ] {
+            expected.push(format!("observed {op} {state} r=eintr sibling={action}"));
+        }
+    }
+    for run in run_both_configurations("sigtrap_interrupted_waits_observed").await {
+        let lines: Vec<&str> = run
+            .report
+            .lines()
+            .filter(|line| line.starts_with("observed "))
+            .collect();
+        assert_eq!(lines, expected, "{}", run.report);
+    }
+}
+
+/// The same observer as `a_sibling_never_reads_a_reset_sigtrap_action`, as
+/// another process that shares the address space and the signal actions
+/// (`CLONE_VM | CLONE_SIGHAND` without `CLONE_THREAD`): the repair is owed to
+/// the signal-action table, not to a thread group, so the observer's own
+/// syscall stop writes it first, and it reads the guest's action in every row
+/// (<https://github.com/rrnewton/hermit/issues/4409>). Both configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn a_process_sharing_the_signal_actions_never_reads_a_reset_sigtrap_action() {
+    let mut expected = Vec::new();
+    for op in ["sigsuspend", "ppoll"] {
+        for (state, action) in [
+            ("ign", "ign"),
+            ("ign-tmask", "ign"),
+            ("handler-tmask", "trap_handler"),
+            ("handler-blocked", "trap_handler"),
+        ] {
+            expected.push(format!("observed {op} {state} r=eintr sibling={action}"));
+        }
+    }
+    for run in run_both_configurations("sigtrap_interrupted_waits_observed_process").await {
+        assert_eq!(run.status, ExitStatus::Exited(0), "{}", run.report);
+        let lines: Vec<&str> = run
+            .report
+            .lines()
+            .filter(|line| line.starts_with("observed "))
+            .collect();
+        assert_eq!(lines, expected, "{}", run.report);
+    }
+}
+
+/// A caught, unblocked SIGTRAP needs no repair: no step can reset it, so a run
+/// through every handler shape makes no unstepped injection
+/// (`UNSTEPPED_INJECTIONS_FOR_TEST`) and keeps the handler.
+#[tokio::test(flavor = "current_thread")]
+async fn a_caught_unblocked_sigtrap_takes_no_repair_injection() {
+    use std::sync::atomic::Ordering;
+    let before = crate::task::UNSTEPPED_INJECTIONS_FOR_TEST.load(Ordering::SeqCst);
+    let run = run_guest("sigtrap_caught_unblocked", false).await;
+    let made = crate::task::UNSTEPPED_INJECTIONS_FOR_TEST.load(Ordering::SeqCst) - before;
+    assert_eq!(run.status, ExitStatus::Exited(0), "{}", run.report);
+    let lines: Vec<&str> = run
+        .report
+        .lines()
+        .filter(|line| line.starts_with("caught "))
+        .collect();
+    let expected: Vec<String> = (0..6)
+        .map(|shape| {
+            format!(
+                "caught shape={shape} sigtrap=trap_handler flags=0x50000000 usr2-in-mask=1 blocked=0"
+            )
+        })
+        .collect();
+    assert_eq!(lines, expected, "{}", run.report);
+    assert_eq!(made, 0, "unstepped injections");
+}
+
+/// A phase-0 limit, pinned: a guest `int3` right after a wait that a handled
+/// signal interrupted, with a caught, unblocked SIGTRAP in the wait's
+/// temporary mask, meets the reset `SIG_DFL` and kills the child. The repair
+/// is owed while the wait's mask restore is pending, and is written at the
+/// thread's next syscall or timer event, which the `int3` precedes. Natively
+/// the handler runs and the child exits 0, so this test must change when the
+/// window closes (<https://github.com/rrnewton/hermit/issues/4409>).
+#[tokio::test(flavor = "current_thread")]
+async fn an_int3_right_after_an_interrupted_wait_still_meets_the_reset_action() {
+    for run in run_both_configurations("sigtrap_int3_after_interrupted_wait").await {
+        let lines: Vec<&str> = run
+            .report
+            .lines()
+            .filter(|line| line.starts_with("after-wait "))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "after-wait sigsuspend signaled=1 sig=5 exited=-1",
+                "after-wait ppoll signaled=1 sig=5 exited=-1",
+            ],
+            "{}",
+            run.report
+        );
+    }
+}
+
+/// A Tool that injects from its signal callback, then resumes the signal,
+/// while the guest's SIGTRAP is default, ignored or caught
+/// (<https://github.com/rrnewton/hermit/issues/4409>). The repair a reset owes
+/// is never written inside the callback: its injections end at a
+/// syscall-exit stop, from which the resumed signal would be sent anew, with
+/// a made-up siginfo, and reported to the Tool again without end. The guest's
+/// handler runs exactly once with the POSIX timer's own siginfo (`SI_TIMER`,
+/// value 1234), each signal reaches the Tool exactly once, and SIGTRAP's
+/// action is the guest's afterwards. SIGPROF's callback injects getpid;
+/// SIGXCPU's brackets it with block-all `rt_sigprocmask` injections, which
+/// reset even a caught SIGTRAP. Both configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn a_signal_callback_injection_delivers_the_signal_once_and_keeps_sigtrap() {
+    let mut expected = Vec::new();
+    for signal in ["prof", "xcpu"] {
+        for (state, action) in [("dfl", "dfl"), ("ign", "ign"), ("handler", "trap_handler")] {
+            expected.push(format!(
+                "callback {signal} {state} hits=1 code=-2 value=1234 sigtrap={action}"
+            ));
+        }
+    }
+    for run in run_both_configurations("sigtrap_signal_callback").await {
+        let lines: Vec<&str> = run
+            .report
+            .lines()
+            .filter(|line| line.starts_with("callback "))
+            .collect();
+        assert_eq!(lines, expected, "{}", run.report);
+        let events = run.all_events();
+        let reports = |name: &str| {
+            events
+                .iter()
+                .filter(|event| event.starts_with(&format!("{name} ")))
+                .count()
+        };
+        assert_eq!(reports("signal SIGPROF"), 3, "{events:#?}");
+        assert_eq!(reports("signal SIGXCPU"), 3, "{events:#?}");
+    }
+}
+
+/// Phase-0 limits, pinned: the reset `SIG_DFL` is also met by another thread
+/// and by a guest handler after a signal-callback injection, not only by the
+/// interrupted thread itself
+/// (`an_int3_right_after_an_interrupted_wait_still_meets_the_reset_action`).
+/// The repair is owed to the signal-action table, and a thread's read of the
+/// action takes a syscall stop that writes it first; a delivery takes no
+/// stop. So, with a caught, unblocked SIGTRAP:
+/// - a sibling's `int3` while the interrupted thread's handler runs without a
+///   syscall kills the child when SIGTRAP was in the wait's temporary mask,
+///   and not otherwise;
+/// - an `int3` in the guest's handler of a POSIX-timer signal whose Tool
+///   callback injected block-all `rt_sigprocmask` calls (SIGXCPU) kills the
+///   child, since the repair waits for a stop outside the callback; with only
+///   a shielded `getpid` (SIGPROF) it does not.
+///
+/// Natively every child exits 0, so this test must change when the windows
+/// close (<https://github.com/rrnewton/hermit/issues/4409>). Both
+/// configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn an_int3_in_another_thread_or_after_a_callback_injection_still_meets_the_reset_action() {
+    for run in run_both_configurations("sigtrap_int3_in_the_other_windows").await {
+        let lines: Vec<&str> = run
+            .report
+            .lines()
+            .filter(|line| line.starts_with("sibling ") || line.starts_with("callback "))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "sibling sigsuspend tmask=0 signaled=0 sig=0 exited=0",
+                "sibling sigsuspend tmask=1 signaled=1 sig=5 exited=-1",
+                "sibling ppoll tmask=0 signaled=0 sig=0 exited=0",
+                "sibling ppoll tmask=1 signaled=1 sig=5 exited=-1",
+                "callback prof signaled=0 sig=0 exited=0",
+                "callback xcpu signaled=1 sig=5 exited=-1",
+            ],
+            "{}",
+            run.report
+        );
+    }
+}
+
+/// Reverie's SIGTRAP repair page is the page after the trampoline
+/// (0x71001000), mapped read-write and sealed at exec
+/// (<https://github.com/rrnewton/hermit/issues/4409>): Reverie's private range
+/// is the trampoline (`r-xp`) and that page (`rw-p`), sealed; the guest cannot
+/// map over, unmap or reprotect it (a pinned difference from native, as for
+/// the trampoline page), so a repair's writes never reach a guest page; a
+/// repair leaves the guest's mappings as they were; and a forked child keeps
+/// the seal, and its repairs too. Both configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn a_sigtrap_repair_never_writes_a_guest_page_over_reverie_scratch() {
+    for run in run_both_configurations("sigtrap_scratch_overlay").await {
+        let lines: Vec<&str> = run
+            .report
+            .lines()
+            .filter(|line| line.starts_with("overlay "))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "overlay maps 71000000-71001000 r-xp",
+                "overlay maps 71001000-71002000 rw-p",
+                "overlay parent noreplace=eexist fixed=eperm munmap=eperm mprotect=eperm sealed=1",
+                "overlay repaired maps-same=1 sigtrap=ign flags=0x50000000 usr2-in-mask=1 blocked=0",
+                "overlay child noreplace=eexist fixed=eperm munmap=eperm mprotect=eperm sealed=1",
+                "overlay child-repaired sigtrap=ign flags=0x50000000 usr2-in-mask=1 blocked=0",
+            ],
+            "{}",
+            run.report
+        );
+    }
+}
+
+/// Builds `repair_page_elf_segment.S`, a static ELF with a read-write data
+/// segment at 0x71001000, once per test binary directory, keyed by the
+/// sources (FNV-1a).
+fn repair_page_elf_segment_guest() -> &'static std::path::Path {
+    static GUEST: LazyLock<PathBuf> = LazyLock::new(|| {
+        let source = crate::tracer::tests::fixture("repair_page_elf_segment.S");
+        let script = crate::tracer::tests::fixture("repair_page_elf_segment.ld");
+        let directory = std::env::current_exe()
+            .expect("locate the test binary")
+            .parent()
+            .expect("the test binary has a directory")
+            .to_path_buf();
+        let mut text = std::fs::read(&source).expect("read the ELF segment fixture source");
+        text.extend(std::fs::read(&script).expect("read the ELF segment linker script"));
+        let hash = text.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+        let output = directory.join(format!("reverie-repair-page-elf-segment-{hash:016x}"));
+        let staging = directory.join(format!(
+            "reverie-repair-page-elf-segment-{hash:016x}.{}.tmp",
+            std::process::id()
+        ));
+        let status = std::process::Command::new("cc")
+            .args(["-nostdlib", "-static", "-no-pie", "-Wl,--build-id=none"])
+            .arg(format!("-Wl,-T,{}", script.display()))
+            .arg(&source)
+            .arg("-o")
+            .arg(&staging)
+            .status()
+            .expect("run cc");
+        assert!(
+            status.success(),
+            "cc failed to build the ELF segment fixture"
+        );
+        std::fs::rename(&staging, &output).expect("publish the ELF segment fixture");
+        output
+    });
+    &GUEST
+}
+
+/// A guest ELF segment loaded at 0x71001000, the page after the trampoline
+/// where pre-init maps Reverie's sealed SIGTRAP repair page, keeps every
+/// byte: pre-init maps the repair page with `MAP_FIXED_NOREPLACE`, so it never
+/// replaces what the new image already has there, and the address space then
+/// has no repair page (<https://github.com/rrnewton/hermit/issues/4409>). The
+/// guest checks all 4096 bytes and exits 40 if any changed. Both
+/// configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn a_guest_elf_segment_at_the_repair_page_address_keeps_every_byte() {
+    let guest = repair_page_elf_segment_guest();
+    for tail in [false, true] {
+        let tracer = TracerBuilder::<GuestTool>::new(Command::new(guest))
+            .config(GuestConfig {
+                tail,
+                partial: false,
+                sigreturns: false,
+                serialized: true,
+            })
+            .spawn()
+            .await
+            .expect("spawn the ELF segment guest");
+        let (status, _) = tokio::time::timeout(Duration::from_secs(60), tracer.wait())
+            .await
+            .expect("the ELF segment guest timed out")
+            .expect("trace the ELF segment guest");
+        assert_eq!(
+            status,
+            ExitStatus::Exited(0),
+            "tail={tail}: exit 40 means a byte of the guest's segment changed"
+        );
+    }
+}
+
+/// A sibling's ordinary find-a-hole mapping (`mmap(NULL)`, `munmap`, then
+/// `MAP_FIXED` or `MAP_FIXED_NOREPLACE` at that address) never meets a SIGTRAP
+/// repair's page, which is at Reverie's reserved address, while another
+/// thread's 4000 private injections each repair an ignored SIGTRAP: the
+/// sibling's page is never lost or changed, and its NOREPLACE never fails.
+/// In the inject configuration every read of SIGTRAP after a repair sees it
+/// ignored; the tail configuration runs the sibling's own syscalls as stepped
+/// injections, and a read while one is mid-step can see the reset, a phase-0
+/// limit, so its count is not asserted
+/// (<https://github.com/rrnewton/hermit/issues/4409>).
+#[tokio::test(flavor = "current_thread")]
+async fn a_sibling_mapping_pages_never_meets_a_sigtrap_repair_page() {
+    // 4000 repairs per run: 10 to 20 s quiet.
+    let [inject, tail] =
+        run_both_configurations_within("sigtrap_mmap_race", Duration::from_secs(240)).await;
+    for (run, is_tail) in [(inject, false), (tail, true)] {
+        let line = run
+            .report
+            .lines()
+            .find(|line| line.starts_with("race "))
+            .unwrap_or_else(|| panic!("no race line: {}", run.report));
+        eprintln!("tail={is_tail} {line}");
+        assert!(
+            line.starts_with("race reserved=0 lost=0 changed=0 eexist=0 action-bad="),
+            "{line}"
+        );
+        assert!(line.ends_with(" iters-nonzero=1"), "{line}");
+        if !is_tail {
+            assert!(line.contains(" action-bad=0 "), "{line}");
+        }
+    }
+}
+
+/// A sibling that tries to map over Reverie's sealed repair page with
+/// `MAP_FIXED`, again and again, while another thread's private injections
+/// repair an ignored SIGTRAP: the seal refuses every attempt (`EPERM`), so no
+/// repair writes a sibling's page, and the sibling's pages elsewhere never
+/// change (<https://github.com/rrnewton/hermit/issues/4409>). Both
+/// configurations.
+/// Both configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn a_sibling_can_never_map_over_the_sealed_repair_page() {
+    for run in
+        run_both_configurations_within("sigtrap_reserved_page_race", Duration::from_secs(240)).await
+    {
+        let line = run
+            .report
+            .lines()
+            .find(|line| line.starts_with("race "))
+            .unwrap_or_else(|| panic!("no race line: {}", run.report));
+        assert!(
+            line.starts_with("race reserved=1 lost=0 changed=0 eexist=0 action-bad="),
+            "{line}"
+        );
+        assert!(line.ends_with(" iters-nonzero=1 refused=all"), "{line}");
+    }
+}
+
+/// A guest's SIGTRAP state survives a precise timer's single-steps
+/// (<https://github.com/rrnewton/hermit/issues/4409>). For each of five states
+/// (ignored or caught, blocked or not, and default blocked) the timer fires
+/// once in a branch loop it single-steps the end of, and the guest reads back
+/// the handler, flags, `sa_mask` and mask bit it set, in every run. At least
+/// one run must have stepped all five sequences
+/// (`TIMER_SEQUENCES_STEPPED_FOR_TEST`).
+#[tokio::test(flavor = "current_thread")]
+async fn sigtrap_state_survives_timer_steps() {
+    use std::sync::atomic::Ordering;
+    if !crate::perf::is_perf_supported() {
+        eprintln!("skipping: perf counters are not supported here");
+        return;
+    }
+    let expected: Vec<String> = [
+        ("ign-blocked", "ign", 1),
+        ("ign", "ign", 0),
+        ("handler-blocked", "trap_handler", 1),
+        ("handler", "trap_handler", 0),
+        ("dfl-blocked", "dfl", 1),
+    ]
+    .into_iter()
+    .map(|(state, action, blocked)| {
+        format!("timer {state} sigtrap={action} flags=0x50000000 usr2-in-mask=1 blocked={blocked}")
+    })
+    .collect();
+    // Under load a timer can fire past its target and be delivered without
+    // single-steps, so a run may step fewer than all five sequences. The
+    // state must survive in every run; the runs are repeated until one has
+    // stepped all five, so that each state is shown to survive real steps.
+    const ATTEMPTS: usize = 4;
+    for attempt in 1..=ATTEMPTS {
+        let before = crate::task::TIMER_SEQUENCES_STEPPED_FOR_TEST.load(Ordering::SeqCst);
+        let run = run_guest("sigtrap_timer", false).await;
+        let stepped = crate::task::TIMER_SEQUENCES_STEPPED_FOR_TEST.load(Ordering::SeqCst) - before;
+        assert_eq!(run.status, ExitStatus::Exited(0), "{}", run.report);
+        let timers = timer_events(&run);
+        assert_eq!(timers.len(), 5, "{timers:#?}");
+        let lines: Vec<&str> = run
+            .report
+            .lines()
+            .filter(|line| line.starts_with("timer "))
+            .collect();
+        assert_eq!(lines, expected, "{}", run.report);
+        if stepped == 5 {
+            return;
+        }
+        eprintln!(
+            "attempt {attempt} of {ATTEMPTS}: {stepped} of 5 timer sequences stepped: {timers:#?}"
+        );
+    }
+    panic!("no run in {ATTEMPTS} stepped all five timer sequences");
+}
+
+/// A caught, blocked SIGTRAP survives a timer step over a guest
+/// `rt_sigreturn` whose frame blocks SIGTRAP: the step clears SIGTRAP from the
+/// frame for its trap and blocks it again after
+/// (<https://github.com/rrnewton/hermit/issues/4409>). The Tool sends SIGUSR1 at
+/// each arming call, so the timer, 1 to 8 branches out, single-steps the
+/// handler and its return; at least one step must have met such a frame
+/// (`FRAME_SHIELDS_FOR_TEST`).
+#[tokio::test(flavor = "current_thread")]
+async fn sigtrap_state_survives_a_timer_step_over_sigreturn() {
+    use std::sync::atomic::Ordering;
+    if !crate::perf::is_perf_supported() {
+        eprintln!("skipping: perf counters are not supported here");
+        return;
+    }
+    let before = crate::task::FRAME_SHIELDS_FOR_TEST.load(Ordering::SeqCst);
+    let run = run_guest("sigtrap_sigreturn_timer", false).await;
+    let shields = crate::task::FRAME_SHIELDS_FOR_TEST.load(Ordering::SeqCst) - before;
+    assert_eq!(run.status, ExitStatus::Exited(0), "{}", run.report);
+    eprintln!("sigreturn timer events: {:#?}", timer_events(&run));
+    assert!(
+        shields > 0,
+        "no timer step met a SIGTRAP-blocking rt_sigreturn frame"
+    );
+    let expected: Vec<String> = (1..=8)
+        .map(|k| {
+            format!(
+                "sigreturn k={k} sigtrap=trap_handler flags=0x50000000 usr2-in-mask=1 blocked=1"
+            )
+        })
+        .collect();
+    let lines: Vec<&str> = run
+        .report
+        .lines()
+        .filter(|line| line.starts_with("sigreturn "))
+        .collect();
+    assert_eq!(lines, expected, "{}", run.report);
+}
+
 /// A timer single-step that reaches an untraced number (500) steps over it,
 /// so it returns ENOSYS, and the timer fires once.
 #[tokio::test(flavor = "current_thread")]
@@ -3383,4 +4353,301 @@ async fn the_guest_reads_its_own_syscall_bytes() {
             "done",
         ],
     );
+}
+
+/// The lines of a fixture mode's report that begin with `prefix`, in both
+/// configurations, each run with `deadline`.
+async fn report_lines_within(mode: &str, prefix: &str, deadline: Duration) -> [Vec<String>; 2] {
+    report_lines_with(
+        mode,
+        prefix,
+        GuestOptions {
+            deadline: Some(deadline),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// `report_lines_within` with `options` for each run, but its `tail`.
+async fn report_lines_with(mode: &str, prefix: &str, options: GuestOptions) -> [Vec<String>; 2] {
+    run_both_configurations_with(mode, options)
+        .await
+        .map(|run| {
+            run.report
+                .lines()
+                .filter(|line| line.starts_with(prefix))
+                .map(str::to_owned)
+                .collect()
+        })
+}
+
+/// A guest that keeps Reverie's sealed SIGTRAP repair page out of a fork's
+/// copy (`MADV_DONTFORK`, which the seal allows on a read-write page), then
+/// forks: the child has no repair page, so Reverie never writes 0x71001000
+/// there, whether the child maps its own page there (unchanged) or nothing,
+/// and the trace goes on; the child's repair is dropped, so SIGTRAP reads
+/// `SIG_DFL` there, a phase-0 limit (natively it stays ignored)
+/// (<https://github.com/rrnewton/hermit/issues/4409>). From the Claude
+/// reviewer's witness W1 at rev 8. Both configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn a_fork_without_the_repair_page_never_has_it_written() {
+    for (mode, own, page, changed) in [
+        ("sigtrap_rv_dontfork_own", 1, 1, 0),
+        ("sigtrap_rv_dontfork_none", 0, 0, -1),
+    ] {
+        for lines in report_lines_within(mode, "rv-dontfork ", Duration::from_secs(60)).await {
+            assert_eq!(
+                lines,
+                [
+                    format!(
+                        "rv-dontfork own={own} madvise=0 child-scratch-mapped=0 own-page={page} changed={changed} sigtrap=dfl flags=0x50000000 usr2-in-mask=1 blocked=0"
+                    ),
+                    String::from("rv-dontfork child-status=0"),
+                ],
+                "{mode}"
+            );
+        }
+    }
+}
+
+/// A guest whose own seccomp filter kills, traps or refuses `mseal`, set
+/// before an exec: Reverie sets up no repair page in an image whose thread has
+/// filters of the guest's own, so it injects no `mseal`, and the exec'd image
+/// runs and exits 0, as natively (<https://github.com/rrnewton/hermit/issues/4409>).
+/// From the Claude reviewer's witness W2 at rev 8. Both configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn a_guest_seccomp_filter_against_mseal_never_meets_one() {
+    for (mode, action) in [
+        ("sigtrap_rv_seccomp_exec_kill", "0x80000000"),
+        ("sigtrap_rv_seccomp_exec_trap", "0x30000"),
+        ("sigtrap_rv_seccomp_exec_errno", "0x50001"),
+    ] {
+        for lines in report_lines_within(mode, "rv-", Duration::from_secs(60)).await {
+            assert_eq!(
+                lines,
+                [
+                    String::from("rv-exec-hello"),
+                    format!("rv-seccomp-exec action={action} exited=1 code=0 signaled=0 sig=-1"),
+                ],
+                "{mode}"
+            );
+        }
+    }
+}
+
+/// A process sharing the address space but not the signal actions
+/// (`CLONE_VM`) tries again and again to replace Reverie's sealed repair page
+/// with `MAP_FIXED`, `mremap(MREMAP_FIXED)` and `shmat(SHM_REMAP)` while the
+/// parent's 4000 private injections repair an ignored SIGTRAP: every attempt
+/// is refused, and every read sees SIGTRAP ignored
+/// (<https://github.com/rrnewton/hermit/issues/4409>). From the Claude
+/// reviewer's witness W4 at rev 8. Both configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn no_mapping_call_can_replace_the_sealed_repair_page() {
+    for lines in report_lines_within(
+        "sigtrap_rv_clonevm_replace",
+        "rv-clonevm ",
+        Duration::from_secs(240),
+    )
+    .await
+    {
+        assert_eq!(
+            lines,
+            [
+                "rv-clonevm iters-nonzero=1 refused-all=1 mapped=0 changed=0 action-bad=0 child-status=0"
+            ]
+        );
+    }
+}
+
+/// A phase-0 limit, pinned: a sibling's own `rt_sigaction(SIGTRAP,
+/// SIG_DFL)` that lands while another thread's repair is in flight is taken
+/// for the reset and overwritten with `SIG_IGN`, and stays overwritten after
+/// every injection has finished. Only for a Tool that breaks the
+/// serialization contract, as this one does by running guest threads at once
+/// (`GuestConfig::serialized`); Hermit runs one thread at a time. Natively `persistent=0`, so this test must change when
+/// the window closes (<https://github.com/rrnewton/hermit/issues/4409>). From
+/// the Claude reviewer's witness W3b at rev 8. Both configurations; a lost
+/// write is certain in the tail configuration, where the sibling's own
+/// syscalls are stepped injections, and is then always persistent.
+#[tokio::test(flavor = "current_thread")]
+async fn a_sibling_sig_dfl_during_a_repair_is_lost_a_pinned_limit() {
+    let [inject, tail] = report_lines_within(
+        "sigtrap_rv_sibling_dfl_persist",
+        "rv-sibling-dfl-persist ",
+        Duration::from_secs(240),
+    )
+    .await;
+    assert!(
+        inject == ["rv-sibling-dfl-persist found=1 persistent=1"]
+            || inject == ["rv-sibling-dfl-persist found=0 persistent=0"],
+        "{inject:?}"
+    );
+    assert_eq!(tail, ["rv-sibling-dfl-persist found=1 persistent=1"]);
+}
+
+/// A sibling thread installs, with `SECCOMP_FILTER_FLAG_TSYNC`, a filter that
+/// kills, traps or refuses `rt_sigaction` while the other thread's private
+/// injections run with SIGTRAP ignored; neither thread calls `rt_sigaction`
+/// after the install. Natively every child exits 0 for all three actions.
+///
+/// - **No serialization contract** (a plain Reverie Tool): Reverie makes no
+///   SIGTRAP repair, so no injected `rt_sigaction` can meet the filter, and
+///   every child exits 0, as natively. This is the oracle.
+/// - **A declared contract that the test Tool breaks** (guest threads run at
+///   once, and the guest installs a filter): the repair checks the thread's
+///   filters before its injections, and the install can land between that
+///   check and the repair's `rt_sigaction`, which a killing or trapping
+///   filter then ends by SIGSYS. Pinned, to show what the contract excludes:
+///   a kill is likely in the tail configuration, where every injection is
+///   stepped and repaired, and is asserted there; a refusing filter only
+///   drops the repair.
+///
+/// (<https://github.com/rrnewton/hermit/issues/4409>). From the Claude
+/// reviewer's witness T1 at rev 10 and Codex's exit-0 requirement. Both
+/// configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn a_sibling_tsync_filter_kills_no_guest_unless_the_contract_is_broken() {
+    for no_serialization_contract in [true, false] {
+        for (mode, action) in [
+            ("sigtrap_tsync_filter_kill", "0x80000000"),
+            ("sigtrap_tsync_filter_trap", "0x30000"),
+            ("sigtrap_tsync_filter_errno", "0x50001"),
+        ] {
+            let options = GuestOptions {
+                deadline: Some(Duration::from_secs(240)),
+                no_serialization_contract,
+                ..Default::default()
+            };
+            let [inject, tail] = report_lines_with(mode, "tsync-filter ", options).await;
+            for (configuration, lines) in [("inject", &inject), ("tail", &tail)] {
+                let what = format!(
+                    "{mode} {configuration} contract={}",
+                    !no_serialization_contract
+                );
+                let [line] = lines.as_slice() else {
+                    panic!("{what}: {lines:?}");
+                };
+                eprintln!("{what}: {line}");
+                let count = |key: &str| -> u32 {
+                    line.split(' ')
+                        .find_map(|field| field.strip_prefix(key))
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or_else(|| panic!("{what}: no {key} in {line:?}"))
+                };
+                assert!(
+                    line.starts_with(&format!("tsync-filter action={action} children=40 ")),
+                    "{what}: {line}"
+                );
+                let (ok, sigsys) = (count("ok="), count("sigsys="));
+                assert_eq!(count("other="), 0, "{what}: {line}");
+                assert_eq!(ok + sigsys, 40, "{what}: {line}");
+                if no_serialization_contract || mode == "sigtrap_tsync_filter_errno" {
+                    assert_eq!(sigsys, 0, "{what}: {line}");
+                } else if configuration == "tail" {
+                    assert!(sigsys > 0, "{what}: {line}");
+                }
+            }
+        }
+    }
+}
+
+/// Reverie keeps an ignored SIGTRAP across a private injection's step only
+/// for a Tool that declares a serialized-execution contract
+/// (`Tool::enforces_serialized_execution`), as Hermit's does. For a plain
+/// Reverie Tool the step's trap resets it, as at base
+/// (<https://github.com/rrnewton/hermit/issues/4409>). Both configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn the_sigtrap_repair_runs_only_under_a_declared_serialization_contract() {
+    for (no_serialization_contract, expected) in [
+        (false, "preexec-filter sigign=1"),
+        (true, "preexec-filter sigign=0"),
+    ] {
+        let options = GuestOptions {
+            no_serialization_contract,
+            ..Default::default()
+        };
+        for lines in
+            report_lines_with("sigtrap_caller_preexec_filter", "preexec-filter ", options).await
+        {
+            assert_eq!(lines, [expected], "contract={}", !no_serialization_contract);
+        }
+    }
+}
+
+/// A seccomp filter that kills, traps or refuses `mseal`, which the caller
+/// installs in a `pre_exec` callback: that callback runs before Reverie's own
+/// stops the root, and so before Reverie's launch filter is loaded: at the
+/// root's first stop the guest has the tracer's filters and the caller's, as
+/// many as a guest without filters of its own has at an exec stop. Reverie
+/// injects no `mseal` there or after the exec, and the guest exits 0, as
+/// natively. Its repair is dropped under the
+/// filter, so SIGTRAP keeps the step's reset (`sigign=0`), a phase-0 limit
+/// (natively it stays ignored) (<https://github.com/rrnewton/hermit/issues/4409>).
+/// From Codex's P2-1 at rev 9. Both configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn a_caller_seccomp_filter_against_mseal_never_meets_one() {
+    for action in [
+        libc::SECCOMP_RET_KILL_PROCESS,
+        libc::SECCOMP_RET_TRAP,
+        libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+    ] {
+        for tail in [false, true] {
+            let options = GuestOptions {
+                tail,
+                caller_mseal_filter: Some(action),
+                ..Default::default()
+            };
+            let run = run_guest_options("sigtrap_caller_preexec_filter", options)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("caller filter {action:#x} tail={tail}: run failed: {error}")
+                });
+            assert_eq!(
+                run.status,
+                ExitStatus::Exited(0),
+                "caller filter {action:#x} tail={tail}: {}",
+                run.report
+            );
+            assert_eq!(
+                run.report
+                    .lines()
+                    .filter(|line| line.starts_with("preexec-filter "))
+                    .collect::<Vec<_>>(),
+                ["preexec-filter sigign=0"],
+                "caller filter {action:#x} tail={tail}: {}",
+                run.report
+            );
+            assert!(run.report.ends_with("done\n"), "{}", run.report);
+        }
+    }
+}
+
+/// A guest whose own seccomp filter, installed after its last exec, kills,
+/// traps or refuses `rt_sigaction`: a SIGTRAP repair's own `rt_sigaction`
+/// never meets it, since Reverie writes no repair from a thread with filters
+/// of the guest's own, and a repair call that fails drops the repair rather
+/// than fail the trace. The child exits 0, as natively; its repair is dropped,
+/// so SIGTRAP keeps the step's reset there (`sigign=0`), a phase-0 limit, as
+/// at base (<https://github.com/rrnewton/hermit/issues/4409>). From the Claude
+/// reviewer's witness N1 at rev 9. Both configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn a_guest_seccomp_filter_against_rt_sigaction_never_meets_a_repair() {
+    for (mode, action) in [
+        ("sigtrap_rw9_filter_kill", "0x80000000"),
+        ("sigtrap_rw9_filter_trap", "0x30000"),
+        ("sigtrap_rw9_filter_errno", "0x50001"),
+    ] {
+        for lines in report_lines_within(mode, "rw9-", Duration::from_secs(60)).await {
+            assert_eq!(
+                lines,
+                [
+                    format!("rw9-filter-child action={action} sigign=0"),
+                    format!("rw9-filter action={action} exited=1 code=0 signaled=0 sig=-1"),
+                ],
+                "{mode}"
+            );
+        }
+    }
 }
