@@ -2654,15 +2654,20 @@ static bool preserve_internal_descriptors(
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-106): retained PID-target admission policy.
-// Residual native policy: positive task targets must be known members; unknown
-// targets retain the prior errno/impossible-target behavior. Accepted numbers
-// are unchanged. Negative group targets retain their existing pass-through.
+// Residual native policy: except for get_robust_list, positive task targets must
+// be known members; unknown targets retain the prior errno/impossible-target
+// behavior. Accepted numbers are unchanged. Negative group targets retain
+// their existing pass-through.
 // Shared ownership of helper exclusion remains separate work.
 static bool validate_task_arguments(int sysnum, uint64_t* args) {
   switch (sysnum) {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-259): Review get_robust_list target admission.
-    case SYS_get_robust_list:
+    case SYS_get_robust_list: {
+      int32_t birth = 0;
+      bool found = lookup_task_birth((int32_t)args[0], &birth);
+      return task_membership_allows_robust_query(found, birth);
+    }
     case SYS_kill:
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-453): Review pidfd_open target admission.

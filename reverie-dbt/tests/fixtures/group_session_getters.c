@@ -8,6 +8,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <limits.h>
+#include <linux/futex.h>
 #include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -16,9 +17,11 @@
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 _Static_assert(sizeof(struct sched_param) == 4, "x86_64 sched_param oracle");
+_Static_assert(sizeof(void*) == 8 && sizeof(size_t) == 8, "x86_64 robust outputs");
 
 #define AFFINITY_CAPACITY 128
 
@@ -48,8 +51,14 @@ static long affinity_query(long target, size_t length, unsigned char* mask) {
   return syscall(SYS_sched_getaffinity, target, length, mask);
 }
 
+static long robust_query(long target, void* head, void* length) {
+  if (returning)
+    return prctl(0x4b494421, (long)SYS_get_robust_list, target, (long)head, (long)length);
+  return syscall(SYS_get_robust_list, target, head, length);
+}
+
 int main(int argc, char** argv) {
-  if (argc != 40)
+  if (argc != 62)
     return 2;
   returning = strcmp(argv[1], "returning") == 0;
   long target = strtol(argv[2], NULL, 10);
@@ -175,6 +184,80 @@ int main(int argc, char** argv) {
     int expected_error = raw_expected < 0 ? (int)-raw_expected : 0;
     failed |= rc != expected_rc || error != expected_error || !canaries ||
         strlen(expected_mask) != AFFINITY_CAPACITY * 2 || strcmp(mask, expected_mask) != 0;
+  }
+  // Pointer values for self belong to this image, not to the native fixture
+  // in another process. Retain the raw words on stderr and compare the two
+  // self queries relationally; a legally NULL robust head is allowed.
+  long tid = returning ? prctl(0x4b494421, (long)SYS_gettid, 0L, 0L, 0L)
+                       : syscall(SYS_gettid);
+  struct stat pid_namespace, user_namespace;
+  if (tid != me || stat("/proc/self/ns/pid", &pid_namespace) != 0 ||
+      stat("/proc/self/ns/user", &user_namespace) != 0)
+    return 4;
+  fprintf(stderr,
+          "robust-context pid=%ld tid=%ld uid=%lu euid=%lu gid=%lu egid=%lu pidns=%llu:%llu userns=%llu:%llu\n",
+          me, tid, (unsigned long)getuid(), (unsigned long)geteuid(),
+          (unsigned long)getgid(), (unsigned long)getegid(),
+          (unsigned long long)pid_namespace.st_dev, (unsigned long long)pid_namespace.st_ino,
+          (unsigned long long)user_namespace.st_dev, (unsigned long long)user_namespace.st_ino);
+  long absent = strtol(argv[40], NULL, 10);
+  if (absent <= target || absent <= me)
+    return 5;
+  const long robust_targets[] = {0, me, target, target, target, absent, absent};
+  const char* robust_labels[] = {"zero", "self", "live", "live-bad-head", "live-bad-length", "absent", "absent-bad-both"};
+  struct robust_observation {
+    uint64_t head[3];
+    uint64_t length[3];
+    long rc;
+    int error;
+  } robust[7];
+  for (unsigned int i = 0; i < 7; ++i) {
+    struct robust_observation* row = &robust[i];
+    row->head[0] = row->length[0] = UINT64_C(0x2468ace02468ace0);
+    row->head[1] = UINT64_C(0x13579bdf13579bdf);
+    row->length[1] = UINT64_C(0xfedcba9876543210);
+    row->head[2] = row->length[2] = UINT64_C(0xfdb97531fdb97531);
+    void* head = i == 3 || i == 6 ? (void*)(uintptr_t)1 : &row->head[1];
+    void* length = i == 4 || i == 6 ? (void*)(uintptr_t)1 : &row->length[1];
+    errno = 0;
+    row->rc = robust_query(robust_targets[i], head, length);
+    row->error = errno;
+  }
+  // All seven calls have completed before checking any outcome. In particular,
+  // EFAULT can write one output before failing on the other; retain both words.
+  for (unsigned int i = 0; i < 7; ++i) {
+    const struct robust_observation* row = &robust[i];
+    int canaries = row->head[0] == UINT64_C(0x2468ace02468ace0) &&
+        row->length[0] == UINT64_C(0x2468ace02468ace0) &&
+        row->head[2] == UINT64_C(0xfdb97531fdb97531) &&
+        row->length[2] == UINT64_C(0xfdb97531fdb97531);
+    fprintf(stderr,
+            "robust-raw index=%u target=%ld rc=%ld errno=%d head=%016llx length=%016llx head_before=%016llx head_after=%016llx length_before=%016llx length_after=%016llx\n",
+            i, robust_targets[i], row->rc, row->error,
+            (unsigned long long)row->head[1], (unsigned long long)row->length[1],
+            (unsigned long long)row->head[0], (unsigned long long)row->head[2],
+            (unsigned long long)row->length[0], (unsigned long long)row->length[2]);
+    char head_text[32];
+    if (i < 2)
+      strcpy(head_text, "same-image-self");
+    else
+      snprintf(head_text, sizeof(head_text), "%016llx", (unsigned long long)row->head[1]);
+    printf("get_robust_list %s rc=%ld errno=%d head=%s length=%016llx canaries=%d\n",
+           robust_labels[i], row->rc, row->error, head_text,
+           (unsigned long long)row->length[1], canaries);
+    long raw_expected = strtol(argv[41 + 3 * i], NULL, 10);
+    uint64_t expected_head = strtoull(argv[42 + 3 * i], NULL, 16);
+    uint64_t expected_length = strtoull(argv[43 + 3 * i], NULL, 16);
+    long expected_rc = raw_expected < 0 ? -1 : raw_expected;
+    int expected_error = raw_expected < 0 ? (int)-raw_expected : 0;
+    failed |= row->rc != expected_rc || row->error != expected_error ||
+        row->length[1] != expected_length || !canaries;
+    if (i < 2)
+      failed |= row->rc != 0 || row->error != 0 ||
+          row->length[1] != sizeof(struct robust_list_head) ||
+          row->head[1] != robust[0].head[1];
+    else
+      failed |= row->head[1] != expected_head;
   }
   if (failed)
     return 1;

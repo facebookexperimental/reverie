@@ -7,10 +7,14 @@
 
 //! Read-only task queries can name live tasks outside the DBT client.
 
+use std::io::Read;
+use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Child;
 use std::process::Command;
+use std::process::Output;
 use std::process::Stdio;
 
 use reverie_dbt::DbtRunner;
@@ -119,6 +123,166 @@ fn raw_affinity(
     (result, output[8..AFFINITY_CAPACITY + 8].try_into().unwrap())
 }
 
+const ROBUST_HEAD_SENTINEL: u64 = 0x1357_9bdf_1357_9bdf;
+const ROBUST_LENGTH_SENTINEL: u64 = 0xfedc_ba98_7654_3210;
+const ROBUST_BEFORE: u64 = 0x2468_ace0_2468_ace0;
+const ROBUST_AFTER: u64 = 0xfdb9_7531_fdb9_7531;
+const ROBUST_BAD_HEAD: [bool; 7] = [false, false, false, true, false, false, true];
+const ROBUST_BAD_LENGTH: [bool; 7] = [false, false, false, false, true, false, true];
+const ROBUST_LABELS: [&str; 7] = [
+    "zero",
+    "self",
+    "live",
+    "live-bad-head",
+    "live-bad-length",
+    "absent",
+    "absent-bad-both",
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RobustObservation {
+    raw: i64,
+    head: u64,
+    length: u64,
+}
+
+fn raw_robust(target: libc::c_long, bad_head: bool, bad_length: bool) -> RobustObservation {
+    let mut head = [ROBUST_BEFORE, ROBUST_HEAD_SENTINEL, ROBUST_AFTER];
+    let mut length = [ROBUST_BEFORE, ROBUST_LENGTH_SENTINEL, ROBUST_AFTER];
+    let head_address = if bad_head {
+        std::ptr::without_provenance_mut::<u64>(1)
+    } else {
+        &mut head[1]
+    };
+    let length_address = if bad_length {
+        std::ptr::without_provenance_mut::<u64>(1)
+    } else {
+        &mut length[1]
+    };
+    // The returned head is an opaque address in the target. Neither it nor
+    // address1 is dereferenced here. Preserve both outputs even on EFAULT.
+    let raw = unsafe {
+        libc::syscall(
+            libc::SYS_get_robust_list,
+            target,
+            head_address,
+            length_address,
+        )
+    };
+    let raw = if raw == -1 {
+        -i64::from(std::io::Error::last_os_error().raw_os_error().unwrap())
+    } else {
+        raw
+    };
+    assert_eq!(head[0], ROBUST_BEFORE);
+    assert_eq!(head[2], ROBUST_AFTER);
+    assert_eq!(length[0], ROBUST_BEFORE);
+    assert_eq!(length[2], ROBUST_AFTER);
+    RobustObservation {
+        raw,
+        head: head[1],
+        length: length[1],
+    }
+}
+
+fn observation_field<'a>(fields: &[&'a str], key: &str) -> &'a str {
+    fields
+        .iter()
+        .find_map(|field| field.strip_prefix(key))
+        .expect(key)
+}
+
+struct RobustFixtureObservation {
+    pid: i64,
+    tid: i64,
+    context: Vec<String>,
+    rows: Vec<RobustObservation>,
+}
+
+fn robust_fixture_observation(
+    output: &Output,
+    held: i64,
+    absent: i64,
+    expected: &[RobustObservation],
+) -> RobustFixtureObservation {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let contexts: Vec<_> = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("robust-context "))
+        .collect();
+    assert_eq!(
+        contexts.len(),
+        1,
+        "missing actual caller context: {output:?}"
+    );
+    let fields: Vec<_> = contexts[0].split_whitespace().collect();
+    assert_eq!(fields.len(), 8);
+    let pid: i64 = observation_field(&fields, "pid=").parse().unwrap();
+    let tid: i64 = observation_field(&fields, "tid=").parse().unwrap();
+    assert!(pid > 0 && pid != held);
+    assert_eq!(tid, pid, "the fixture must query its actual main task");
+    let targets = [0, pid, held, held, held, absent, absent];
+    let raw_rows: Vec<_> = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("robust-raw "))
+        .collect();
+    assert_eq!(
+        raw_rows.len(),
+        7,
+        "missing complete robust outcomes: {output:?}"
+    );
+    let mut rows = Vec::new();
+    for (index, row) in raw_rows.iter().enumerate() {
+        let fields: Vec<_> = row.split_whitespace().collect();
+        assert_eq!(fields.len(), 10, "malformed robust observation: {row}");
+        assert_eq!(fields[0], format!("index={index}"));
+        assert_eq!(fields[1], format!("target={}", targets[index]));
+        let rc: i64 = observation_field(&fields, "rc=").parse().unwrap();
+        let error: i64 = observation_field(&fields, "errno=").parse().unwrap();
+        let raw = if rc == -1 {
+            -error
+        } else {
+            assert_eq!(error, 0);
+            rc
+        };
+        let head = u64::from_str_radix(observation_field(&fields, "head="), 16).unwrap();
+        let length = u64::from_str_radix(observation_field(&fields, "length="), 16).unwrap();
+        assert_eq!(raw, expected[index].raw, "robust result: {row}");
+        assert_eq!(
+            length, expected[index].length,
+            "robust length output: {row}"
+        );
+        if index >= 2 {
+            assert_eq!(
+                head, expected[index].head,
+                "same held lifetime/error output: {row}"
+            );
+        }
+        for (key, value) in [
+            ("head_before=", ROBUST_BEFORE),
+            ("head_after=", ROBUST_AFTER),
+            ("length_before=", ROBUST_BEFORE),
+            ("length_after=", ROBUST_AFTER),
+        ] {
+            assert_eq!(observation_field(&fields, key), format!("{value:016x}"));
+        }
+        rows.push(RobustObservation { raw, head, length });
+    }
+    // No cross-process self pointer constant: NULL is legal, but both queries
+    // of this same task/image must succeed and return the exact same words.
+    assert_eq!(rows[0].raw, 0);
+    assert_eq!(rows[0], rows[1]);
+    RobustFixtureObservation {
+        pid,
+        tid,
+        context: fields[2..]
+            .iter()
+            .map(|field| (*field).to_owned())
+            .collect(),
+        rows,
+    }
+}
+
 fn compare_with_linux(mode: &str) {
     let directory = tempfile::tempdir().expect("fixture tempdir");
     let fixture = directory.path().join("group-session-getters");
@@ -139,7 +303,7 @@ fn compare_with_linux(mode: &str) {
     let mut holder = Command::new("/bin/cat");
     holder
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null());
     // SAFETY: setsid and the raw scheduler syscall are async-signal-safe; the child
     // calls no Rust code that
@@ -163,6 +327,24 @@ fn compare_with_linux(mode: &str) {
         });
     }
     let mut child = HeldChild(holder.spawn().expect("hold ordinary unregistered child"));
+    // An exact echo proves cat has completed libc startup before its robust
+    // registration is sampled. Keep stdin open; no timing sleep or retry.
+    child
+        .0
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"R")
+        .expect("cat readiness write");
+    let mut ready = [0_u8; 1];
+    child
+        .0
+        .stdout
+        .as_mut()
+        .unwrap()
+        .read_exact(&mut ready)
+        .expect("cat readiness echo");
+    assert_eq!(ready, *b"R");
     let pid = child.0.id() as libc::pid_t;
     // SAFETY: these read-only queries name our live child.
     let pgid = unsafe { libc::getpgid(pid) };
@@ -258,6 +440,61 @@ fn compare_with_linux(mode: &str) {
             "native unwritten suffix changed"
         );
     }
+    let own_tid = unsafe { libc::syscall(libc::SYS_gettid) };
+    let pid_max_text = std::fs::read_to_string("/proc/sys/kernel/pid_max").expect("read pid_max");
+    let pid_max: i64 = pid_max_text.trim().parse().expect("numeric pid_max");
+    let absent = pid_max
+        .checked_add(1)
+        .filter(|&pid| pid <= i64::from(i32::MAX))
+        .expect("an unavailable positive PID above measured pid_max");
+    let robust_targets = [
+        0,
+        own_tid,
+        i64::from(pid),
+        i64::from(pid),
+        i64::from(pid),
+        absent,
+        absent,
+    ];
+    let robust_values: Vec<_> = robust_targets
+        .iter()
+        .enumerate()
+        .map(|(index, &target)| {
+            raw_robust(target, ROBUST_BAD_HEAD[index], ROBUST_BAD_LENGTH[index])
+        })
+        .collect();
+    assert_eq!(
+        robust_values[0].raw, 0,
+        "native caller robust query prerequisite"
+    );
+    assert_eq!(robust_values[0], robust_values[1]);
+    assert_eq!(
+        robust_values[2].raw, 0,
+        "test-parent held-target permission prerequisite"
+    );
+    assert_eq!(
+        robust_values[5].raw,
+        -i64::from(libc::ESRCH),
+        "pid_max absence proof"
+    );
+    let held_namespaces: Vec<_> = ["pid", "user"]
+        .iter()
+        .map(|name| {
+            let metadata =
+                std::fs::metadata(format!("/proc/{pid}/ns/{name}")).expect("held namespace");
+            format!("{name}ns={}:{}", metadata.dev(), metadata.ino())
+        })
+        .collect();
+    assert!(
+        child
+            .0
+            .try_wait()
+            .expect("held target before fixtures")
+            .is_none()
+    );
+    eprintln!(
+        "{mode} robust prerequisite: target={pid} pid_max={pid_max} absent={absent} namespaces={held_namespaces:?} native={robust_values:?}"
+    );
     let mut arguments = vec![
         pid.to_string(),
         pgid.to_string(),
@@ -273,6 +510,12 @@ fn compare_with_linux(mode: &str) {
     for (result, bytes) in &affinity_values {
         arguments.push(result.to_string());
         arguments.push(affinity_hex(bytes));
+    }
+    arguments.push(absent.to_string());
+    for value in &robust_values {
+        arguments.push(value.raw.to_string());
+        arguments.push(format!("{:016x}", value.head));
+        arguments.push(format!("{:016x}", value.length));
     }
     let mut expected = format!(
         "getpgid live={pgid} errno=0\ngetpgid zero-is-self=1\n\
@@ -334,6 +577,22 @@ fn compare_with_linux(mode: &str) {
             affinity_hex(bytes)
         ));
     }
+    for (index, (label, value)) in ROBUST_LABELS.iter().zip(&robust_values).enumerate() {
+        let (rc, error) = if value.raw < 0 {
+            (-1, -value.raw)
+        } else {
+            (value.raw, 0)
+        };
+        let head = if index < 2 {
+            "same-image-self".to_owned()
+        } else {
+            format!("{:016x}", value.head)
+        };
+        expected.push_str(&format!(
+            "get_robust_list {label} rc={rc} errno={error} head={head} length={:016x} canaries=1\n",
+            value.length,
+        ));
+    }
     expected.push_str("group-session-getters=ok\n");
     let native = Command::new(&fixture)
         .arg("original")
@@ -343,6 +602,8 @@ fn compare_with_linux(mode: &str) {
     eprintln!("{mode} native: {native:?}");
     assert!(native.status.success(), "native oracle failed: {native:?}");
     assert_eq!(native.stdout, expected.as_bytes());
+    let native_robust = robust_fixture_observation(&native, i64::from(pid), absent, &robust_values);
+    assert_eq!(&native_robust.context[4..], held_namespaces);
 
     let runner = DbtRunner::from_env()
         .expect("DYNAMORIO_HOME and REVERIE_DBT_CLIENT must be set")
@@ -390,8 +651,23 @@ fn compare_with_linux(mode: &str) {
         "the independent target must stay live through every query"
     );
     eprintln!("{mode}: {output:?}");
+    assert_eq!(
+        raw_robust(i64::from(pid), false, false),
+        robust_values[2],
+        "held target's exact registration/lifetime changed during comparison"
+    );
+    assert_eq!(
+        std::fs::read_to_string("/proc/sys/kernel/pid_max").unwrap(),
+        pid_max_text
+    );
+    assert_eq!(raw_robust(absent, false, false), robust_values[5]);
     assert!(output.status.success(), "{mode} fixture failed: {output:?}");
     assert_eq!(output.stdout, native.stdout, "{mode} differs from Linux");
+    let guest_robust = robust_fixture_observation(&output, i64::from(pid), absent, &robust_values);
+    assert_eq!(guest_robust.context, native_robust.context);
+    eprintln!(
+        "{mode} robust permission scope: namespace/credential equality is supporting evidence only; returning has an exact-caller raw kernel witness, original/tail have the separately executed native oracle and no same-caller permission proof"
+    );
     if mode == "returning" {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let rows: Vec<_> = stderr
@@ -422,6 +698,7 @@ fn compare_with_linux(mode: &str) {
             .parse()
             .unwrap();
         assert!(guest_pid > 0 && guest_pid != i64::from(pid));
+        assert_eq!(guest_robust.pid, guest_pid);
         let mut guest_cases = priority_cases;
         guest_cases[1].1 = guest_pid;
         let priority_rows: Vec<_> = stderr
@@ -523,6 +800,96 @@ fn compare_with_linux(mode: &str) {
             assert_eq!(fields[7], format!("guest_before={before}"));
             assert_eq!(fields[8], format!("guest_after={after}"));
             assert_eq!(fields[9], "kernel_canaries=1");
+        }
+        let robust_rows: Vec<_> = stderr
+            .lines()
+            .filter_map(|line| line.strip_prefix("reverie-dbt-test: kernel-robust-query "))
+            .collect();
+        assert_eq!(
+            robust_rows.len(),
+            7,
+            "missing robust observations: {output:?}"
+        );
+        let targets = [
+            0,
+            guest_pid,
+            i64::from(pid),
+            i64::from(pid),
+            i64::from(pid),
+            absent,
+            absent,
+        ];
+        let guarded = |word: u64| format!("{ROBUST_BEFORE:016x}:{word:016x}:{ROBUST_AFTER:016x}");
+        for (index, row) in robust_rows.iter().enumerate() {
+            let fields: Vec<_> = row.split_whitespace().collect();
+            assert_eq!(fields.len(), 15, "malformed robust observation: {row}");
+            assert_eq!(fields[0], format!("sysnum={}", libc::SYS_get_robust_list));
+            assert_eq!(fields[1], format!("target={}", targets[index]));
+            assert_eq!(fields[2], format!("caller_pid={guest_pid}"));
+            assert_eq!(fields[3], format!("caller_tid={}", guest_robust.tid));
+            assert_eq!(
+                fields[4],
+                format!(
+                    "head_pointer={}",
+                    if ROBUST_BAD_HEAD[index] {
+                        "bad"
+                    } else {
+                        "valid"
+                    }
+                )
+            );
+            assert_eq!(
+                fields[5],
+                format!(
+                    "length_pointer={}",
+                    if ROBUST_BAD_LENGTH[index] {
+                        "bad"
+                    } else {
+                        "valid"
+                    }
+                )
+            );
+            let value = robust_values[index];
+            assert_eq!(
+                fields[6],
+                format!("kernel={}", value.raw),
+                "same-caller kernel prerequisite: {row}"
+            );
+            assert_eq!(fields[7], format!("injected={}", value.raw));
+            let kernel_head =
+                u64::from_str_radix(observation_field(&fields, "kernel_head="), 16).unwrap();
+            let kernel_length =
+                u64::from_str_radix(observation_field(&fields, "kernel_length="), 16).unwrap();
+            assert_eq!(
+                kernel_head, guest_robust.rows[index].head,
+                "actual same-task/lifetime head: {row}"
+            );
+            assert_eq!(kernel_length, guest_robust.rows[index].length);
+            let before_head = if ROBUST_BAD_HEAD[index] {
+                "unaddressed".to_owned()
+            } else {
+                guarded(ROBUST_HEAD_SENTINEL)
+            };
+            let after_head = if ROBUST_BAD_HEAD[index] {
+                "unaddressed".to_owned()
+            } else {
+                guarded(kernel_head)
+            };
+            let before_length = if ROBUST_BAD_LENGTH[index] {
+                "unaddressed".to_owned()
+            } else {
+                guarded(ROBUST_LENGTH_SENTINEL)
+            };
+            let after_length = if ROBUST_BAD_LENGTH[index] {
+                "unaddressed".to_owned()
+            } else {
+                guarded(kernel_length)
+            };
+            assert_eq!(fields[10], format!("guest_head_before={before_head}"));
+            assert_eq!(fields[11], format!("guest_head_after={after_head}"));
+            assert_eq!(fields[12], format!("guest_length_before={before_length}"));
+            assert_eq!(fields[13], format!("guest_length_after={after_length}"));
+            assert_eq!(fields[14], "kernel_canaries=1");
         }
     }
 }

@@ -623,6 +623,108 @@ impl Tool for SetRegTool {
         }
         let (number, args) = syscall.into_parts();
         if number == Sysno::prctl && args.arg0 as u64 == KERNEL_IDENTITY_PRCTL {
+            if args.arg1 as i64 == libc::SYS_get_robust_list {
+                let target = args.arg2 as libc::c_long;
+                let head_valid = args.arg3 > 1;
+                let length_valid = args.arg4 > 1;
+                // Each valid output points to the middle of its own guarded
+                // three-word fixture buffer. Address1 is passed literally and
+                // is never read by this observer.
+                let before_head: Option<[u64; 3]> = if head_valid {
+                    Some(guest.memory().read_value(Addr::from(args.arg3 - 8))?)
+                } else {
+                    None
+                };
+                let before_length: Option<[u64; 3]> = if length_valid {
+                    Some(guest.memory().read_value(Addr::from(args.arg4 - 8))?)
+                } else {
+                    None
+                };
+                let mut kernel_head = [
+                    0x2468_ace0_2468_ace0_u64,
+                    0x1357_9bdf_1357_9bdf,
+                    0xfdb9_7531_fdb9_7531,
+                ];
+                let mut kernel_length = [
+                    0x2468_ace0_2468_ace0_u64,
+                    0xfedc_ba98_7654_3210,
+                    0xfdb9_7531_fdb9_7531,
+                ];
+                let head_address = if head_valid {
+                    (&mut kernel_head[1] as *mut u64) as usize
+                } else {
+                    args.arg3
+                };
+                let length_address = if length_valid {
+                    (&mut kernel_length[1] as *mut u64) as usize
+                } else {
+                    args.arg4
+                };
+                let caller_pid = unsafe { libc::syscall(libc::SYS_getpid) };
+                let caller_tid = unsafe { libc::syscall(libc::SYS_gettid) };
+                // This query establishes permission in the actual returning
+                // callback's kernel task, not in the test-parent process.
+                // A NULL robust head is a legal successful output.
+                let kernel = unsafe {
+                    libc::syscall(
+                        libc::SYS_get_robust_list,
+                        target,
+                        head_address,
+                        length_address,
+                    )
+                };
+                let kernel = if kernel == -1 {
+                    -i64::from(std::io::Error::last_os_error().raw_os_error().unwrap())
+                } else {
+                    kernel
+                };
+                let injected = guest
+                    .inject(Syscall::from_raw(
+                        Sysno::get_robust_list,
+                        SyscallArgs::new(args.arg2, args.arg3, args.arg4, 0, 0, 0),
+                    ))
+                    .await
+                    .unwrap_or_else(|errno| -i64::from(errno.into_raw()));
+                // Read both independently after every result, including
+                // failures: Linux can complete one put_user before EFAULT.
+                let after_head: Option<[u64; 3]> = if head_valid {
+                    Some(guest.memory().read_value(Addr::from(args.arg3 - 8))?)
+                } else {
+                    None
+                };
+                let after_length: Option<[u64; 3]> = if length_valid {
+                    Some(guest.memory().read_value(Addr::from(args.arg4 - 8))?)
+                } else {
+                    None
+                };
+                let words = |value: Option<[u64; 3]>| {
+                    value.map_or_else(
+                        || "unaddressed".to_owned(),
+                        |words| format!("{:016x}:{:016x}:{:016x}", words[0], words[1], words[2]),
+                    )
+                };
+                let kernel_canaries = u8::from(
+                    kernel_head[0] == 0x2468_ace0_2468_ace0
+                        && kernel_length[0] == 0x2468_ace0_2468_ace0
+                        && kernel_head[2] == 0xfdb9_7531_fdb9_7531
+                        && kernel_length[2] == 0xfdb9_7531_fdb9_7531,
+                );
+                emit_line(&format!(
+                    "reverie-dbt-test: kernel-robust-query sysnum={} target={target} caller_pid={caller_pid} caller_tid={caller_tid} head_pointer={} length_pointer={} kernel={kernel} injected={injected} kernel_head={:016x} kernel_length={:016x} guest_head_before={} guest_head_after={} guest_length_before={} guest_length_after={} kernel_canaries={kernel_canaries}",
+                    args.arg1,
+                    if head_valid { "valid" } else { "bad" },
+                    if length_valid { "valid" } else { "bad" },
+                    kernel_head[1],
+                    kernel_length[1],
+                    words(before_head),
+                    words(after_head),
+                    words(before_length),
+                    words(after_length),
+                ));
+                // Keep the actual result: the fixture runs all seven cases
+                // before its final verdict, retaining admission/error order.
+                return Ok(injected);
+            }
             if args.arg1 as i64 == libc::SYS_sched_getaffinity {
                 const CAPACITY: usize = 128;
                 let target = args.arg2 as libc::c_long;

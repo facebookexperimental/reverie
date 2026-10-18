@@ -22,11 +22,18 @@ static void setown(int32_t group, int32_t input,
 }
 
 int main(void) {
+  /* Unrecorded getter targets reach Linux regardless of the unused token. */
+  assert(task_membership_allows_robust_query(false, 0));
+  assert(task_membership_allows_robust_query(false, -1));
+  assert(task_membership_allows_robust_query(false, 6));
+  assert(!task_membership_allows_robust_query(true, -1));
   task_membership_t task = {37, 6};
+  assert(task_membership_allows_robust_query(true, task.birth_token));
   task_membership_publish(&task, 6, false); /* parent after child autoreap */
   assert(task.tid == 37 && task.birth_token == 6);
   task_membership_publish(&task, 7, false); /* late parent cannot replace */
   assert(task.tid == 37 && task.birth_token == 6);
+  assert(task_membership_allows_robust_query(true, task.birth_token));
   task_membership_publish(&task, 5, true);  /* later kernel birth, earlier token */
   assert(task.tid == 37 && task.birth_token == 5);
   task_membership_publish(&task, 6, false);
@@ -35,9 +42,11 @@ int main(void) {
   task_membership_publish(&task, 6, false);
   assert(task.birth_token == 0);
   assert(!task_membership_contains(&task, 1, 37));
+  assert(!task_membership_allows_robust_query(true, task.birth_token));
   task_membership_publish(&task, 4, true);  /* actual later application birth */
   assert(task.tid == 37 && task.birth_token == 4);
   assert(task_membership_contains(&task, 1, 37));
+  assert(task_membership_allows_robust_query(true, task.birth_token));
   assert(task_membership_contains(tasks, count, 1004));
   assert(task_membership_contains(tasks, count, 1100));
   assert(!task_membership_contains(tasks, count, 3));

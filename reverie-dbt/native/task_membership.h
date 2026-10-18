@@ -24,6 +24,13 @@ static inline void task_membership_publish(
     task->birth_token = birth_token;
 }
 
+/* This getter retains recorded helper/tombstone restrictions, but leaves
+ * unrecorded targets to Linux. A missing entry does not prove task ownership. */
+static inline bool task_membership_allows_robust_query(
+    bool found, int32_t birth_token) {
+  return !found || birth_token > 0;
+}
+
 typedef struct { int32_t type; int32_t pid; } fcntl_owner_ex_t;
 #define FCNTL_OWNER_TID 0
 #define FCNTL_OWNER_PID 1
