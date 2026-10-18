@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/futex.h>
+#include <linux/magic.h>
 #include <linux/sched.h>
 #include <poll.h>
 #include <signal.h>
@@ -27,6 +28,7 @@
 #include <sys/time.h>
 #include <sys/un.h>
 #include <sys/user.h>
+#include <sys/vfs.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -89,6 +91,16 @@ typedef int32_t (
     *memory_compare_exchange_t)(uintptr_t, uint32_t, uint32_t, uint32_t*);
 
 typedef struct {
+  int32_t physical_pid;
+  int32_t physical_tid;
+  uint64_t procfs_device;
+  uint64_t procfs_inode;
+} controller_capture_fact_t;
+_Static_assert(sizeof(controller_capture_fact_t) == 24, "capture fact ABI size");
+typedef int32_t (*controller_capture_control_t)(
+    uintptr_t, uint32_t, controller_capture_fact_t*);
+
+typedef struct {
   int32_t signal;
   int32_t delivered_signal;
   unsigned char signal_info[128];
@@ -98,6 +110,15 @@ typedef struct {
   uint64_t deferred_args[6];
 } dbt_signal_event_t;
 _Static_assert(sizeof(dbt_signal_event_t) == 200, "DBT signal ABI size");
+
+typedef struct process_control process_control_t;
+typedef struct {
+  // Only published positive-PID slots can enter this cache. Those slots are
+  // never recycled; the birth and PID remain immutable for their lifetime.
+  process_control_t* entry;
+  int32_t birth;
+  int32_t mediated_pid;
+} capture_owner_t;
 
 typedef struct {
   uint64_t branches;
@@ -168,20 +189,26 @@ typedef struct {
   // the only events from which DynamoRIO recovers a client write to a page it
   // made read-only (`runtime_compare_exchange_u32`).
   bool in_syscall_event;
+  // Set only after the real Tool's successful thread-start hook. A fork copy
+  // retains the parent's PID, which cannot acknowledge the child's admission.
+  capture_owner_t capture_owner;
 } prototype_counters_t;
 
 #define TASK_STATE_FD 197
 #define CLIENT_THREAD_START_FAILURE_EXIT_CODE 125
 #define DBT_DIAGNOSTIC_FD 198
-#define TASK_STATE_MAGIC UINT64_C(0x5245565049443035)
+#define TASK_STATE_MAGIC UINT64_C(0x5245565049443036)
 #define MAX_TASK_MEMBERSHIPS 8192
 #define TEST_REUSED_TID_STALE 0
 #define EXEC_HELPER_RETIREMENT_TIMEOUT_MS UINT64_C(60000)
 
-typedef struct {
+struct process_control {
   int32_t kernel_pid;
   int32_t birth_token;
   bool root_process;
+  // Reserved before a process clone enters Linux; only successful Tool
+  // admission or that exact failed clone transaction retires the reservation.
+  _Atomic bool capture_pending_admission;
   // 0: unclaimed, 1: appending, 2: append attempt finished (including error).
   // The existing birth owner is shared by threads, never by another process.
   _Atomic uint32_t terminal_stats_state;
@@ -191,7 +218,7 @@ typedef struct {
   // Published by finished_helper_epoch after this helper's acknowledged FINAL.
   int32_t helper_pid;
   uint64_t helper_start_time;
-} process_control_t;
+};
 _Static_assert(sizeof(process_control_t) == 56, "shared process control layout");
 
 typedef struct {
@@ -200,7 +227,7 @@ typedef struct {
   _Atomic int32_t next_birth_token;
   int32_t root_pid;
   int32_t root_birth_token;
-  size_t process_control_count;
+  _Atomic size_t process_control_count;
   process_control_t process_controls[MAX_TASK_MEMBERSHIPS];
   _Atomic bool thread_clone_process_exit_test_exercised;
   /* The launch-time descriptor identity survives exec, unlike numeric fd 0. */
@@ -210,6 +237,10 @@ typedef struct {
    * runtimes inherit this shared flag instead of consulting Rust's post-fork
    * environment state. */
   bool external_global;
+  _Atomic bool capture_uncertain;
+  bool capture_procfs_valid;
+  uint64_t capture_procfs_device;
+  uint64_t capture_procfs_inode;
   size_t task_count;
   task_membership_t tasks[MAX_TASK_MEMBERSHIPS];
 } task_state_t;
@@ -224,7 +255,7 @@ typedef struct {
 // exit, and app-level writes re-enter the syscall interception path.
 typedef void (*reverie_emit_fn_t)(const char* buf, size_t len);
 typedef void (*reverie_idle_fn_t)(void);
-#define REVERIE_DBT_RUNTIME_ABI_VERSION 9u
+#define REVERIE_DBT_RUNTIME_ABI_VERSION 10u
 #define REVERIE_DBT_STARTUP_STANDALONE 1u
 #define REVERIE_DBT_STARTUP_COORDINATED 2u
 // TODO-HUMAN-REVIEW(PR-162): Review the additive stdout-emit runtime callback
@@ -249,6 +280,7 @@ typedef struct {
   // (`runtime_compare_exchange_u32`), the runtime's
   // MemoryAccess::compare_exchange_u32. Added in ABI version 8.
   memory_compare_exchange_t compare_exchange_u32;
+  controller_capture_control_t controller_capture_control;
 } runtime_callbacks_t;
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#90): Confirm diagnostic fd ownership across exec.
@@ -423,6 +455,9 @@ static bool test_copied_backend_failure;
 static bool test_skip_terminal_cleanup;
 static bool test_backend_failure_sender_lookup_miss;
 static bool test_compare_exchange;
+static bool test_controller_capture;
+static atomic_flag controller_capture_self_tested = ATOMIC_FLAG_INIT;
+static void run_controller_capture_self_test(void);
 static atomic_flag compare_exchange_self_tested = ATOMIC_FLAG_INIT;
 static void run_compare_exchange_self_test(void);
 static uint32_t compare_exchange_word(
@@ -1279,6 +1314,8 @@ static int32_t runtime_process_id;
 static bool runtime_is_root;
 static int32_t runtime_parent_process_id;
 static task_state_t* task_state;
+static uint64_t task_state_device;
+static uint64_t task_state_inode;
 // Private to this image, including its one background helper. Copied children
 // never start an inherited helper; their first exec claims their own record.
 static process_control_t* runtime_process_control;
@@ -1340,15 +1377,54 @@ static bool map_inherited_task_state(void) {
   if (mapping == MAP_FAILED)
     return false;
   task_state = (task_state_t*)mapping;
-  if (task_state->magic == TASK_STATE_MAGIC)
+  if (task_state->magic == TASK_STATE_MAGIC) {
+    task_state_device = (uint64_t)status.st_dev;
+    task_state_inode = (uint64_t)status.st_ino;
     return true;
+  }
   munmap(mapping, sizeof(*task_state));
   task_state = NULL;
   return false;
 }
 
+/* Authenticate the initial proc numbering view while the root has not run.
+ * Keep only object identity, never a directory capability in the guest table. */
+static void initialize_capture_procfs_view(void) {
+  struct stat root, self, numeric;
+  struct statfs filesystem;
+  char pid_name[32];
+  int root_fd = open("/proc", O_PATH | O_DIRECTORY | O_CLOEXEC);
+  if (root_fd < 0)
+    return;
+  int length = dr_snprintf(
+      pid_name, sizeof(pid_name), "%d", (int)dr_get_process_id());
+  bool valid = length > 0 && (size_t)length < sizeof(pid_name) &&
+      fstat(root_fd, &root) == 0 && S_ISDIR(root.st_mode) &&
+      fstatfs(root_fd, &filesystem) == 0 &&
+      filesystem.f_type == PROC_SUPER_MAGIC &&
+      fstatat(root_fd, "self", &self, 0) == 0 &&
+      fstatat(root_fd, pid_name, &numeric, 0) == 0 &&
+      S_ISDIR(self.st_mode) && S_ISDIR(numeric.st_mode) &&
+      self.st_dev == numeric.st_dev && self.st_ino == numeric.st_ino;
+  int closed = close(root_fd);
+  if (valid && closed == 0) {
+    task_state->capture_procfs_device = (uint64_t)root.st_dev;
+    task_state->capture_procfs_inode = (uint64_t)root.st_ino;
+    task_state->capture_procfs_valid = true;
+  }
+}
+
+static bool capture_may_initialize(bool descriptor_absent, bool followed_exec) {
+  return descriptor_absent && !followed_exec;
+}
+
 static void initialize_task_state(bool external_global) {
   int descriptor;
+  struct stat initial_descriptor;
+  bool descriptor_absent = fstat(TASK_STATE_FD, &initial_descriptor) != 0 &&
+      errno == EBADF;
+  bool initial_absence =
+      capture_may_initialize(descriptor_absent, dr_is_post_execve());
   if (map_inherited_task_state())
     return;
 
@@ -1372,6 +1448,7 @@ static void initialize_task_state(bool external_global) {
   task_state->magic = TASK_STATE_MAGIC;
   atomic_flag_clear(&task_state->lock);
   atomic_init(&task_state->next_birth_token, 1);
+  atomic_init(&task_state->process_control_count, 0);
   task_state->root_pid = (int32_t)dr_get_process_id();
   task_state->root_birth_token = atomic_fetch_add_explicit(
       &task_state->next_birth_token, 1, memory_order_relaxed);
@@ -1383,6 +1460,17 @@ static void initialize_task_state(bool external_global) {
   task_state->initial_stdin_valid =
       fstat(STDIN_FILENO, &task_state->initial_stdin) == 0;
   task_state->external_global = external_global;
+  atomic_init(&task_state->capture_uncertain, !initial_absence);
+  struct stat backing;
+  if (fstat(TASK_STATE_FD, &backing) == 0) {
+    task_state_device = (uint64_t)backing.st_dev;
+    task_state_inode = (uint64_t)backing.st_ino;
+  } else {
+    atomic_store_explicit(
+        &task_state->capture_uncertain, true, memory_order_release);
+  }
+  if (initial_absence)
+    initialize_capture_procfs_view();
 }
 
 /* Only a known new child can be checked here. Linux assigns TID 1 to a new
@@ -1438,6 +1526,107 @@ static int32_t next_birth_token(void) {
 
 static bool lookup_task_birth(int32_t tid, int32_t* birth);
 
+// Only initialize entries that have not been published in the atomic count.
+static void initialize_process_control_locked(
+    task_state_t* state, process_control_t* entry, int32_t kernel_pid,
+    int32_t birth_token, bool pending) {
+  entry->kernel_pid = kernel_pid;
+  entry->birth_token = birth_token;
+  entry->root_process = kernel_pid == state->root_pid &&
+      birth_token == state->root_birth_token;
+  atomic_init(&entry->capture_pending_admission, pending);
+  atomic_init(&entry->terminal_stats_state, 0);
+  atomic_init(&entry->pending_thread_clones, 0);
+  atomic_init(&entry->image_epoch, 0);
+  atomic_init(&entry->finished_helper_epoch, 0);
+  entry->helper_pid = 0;
+  entry->helper_start_time = 0;
+}
+
+static void capture_mark_owner_uncertain(task_state_t* state) {
+  if (state != NULL)
+    atomic_store_explicit(&state->capture_uncertain, true, memory_order_release);
+}
+
+static void capture_mark_uncertain(void) {
+  capture_mark_owner_uncertain(task_state);
+}
+
+/* These two locked operations also supply the synthetic component-test seam.
+ * The live wrappers below always use the existing shared task-state owner. */
+static void reserve_capture_admission_locked(task_state_t* state, int32_t birth) {
+  size_t count = atomic_load_explicit(
+      &state->process_control_count, memory_order_acquire);
+  if (birth <= 0 || count > MAX_TASK_MEMBERSHIPS) {
+    capture_mark_owner_uncertain(state);
+    return;
+  }
+  for (size_t i = 0; i < count; ++i) {
+    process_control_t* entry = &state->process_controls[i];
+    // Only authoritative failed creation leaves a counted slot in this state.
+    // It has never had a published PID or a cached owner. Query readers can
+    // already scan its atomics, so reuse uses stores, never atomic_init/memset.
+    if (entry->kernel_pid == 0 && !atomic_load_explicit(
+            &entry->capture_pending_admission, memory_order_acquire)) {
+      atomic_store_explicit(
+          &entry->capture_pending_admission, true, memory_order_release);
+      entry->birth_token = birth;
+      entry->root_process = false;
+      atomic_store_explicit(&entry->terminal_stats_state, 0, memory_order_relaxed);
+      atomic_store_explicit(&entry->pending_thread_clones, 0, memory_order_release);
+      atomic_store_explicit(&entry->image_epoch, 0, memory_order_relaxed);
+      atomic_store_explicit(&entry->finished_helper_epoch, 0, memory_order_relaxed);
+      entry->helper_pid = 0;
+      entry->helper_start_time = 0;
+      return;
+    }
+  }
+  if (count == MAX_TASK_MEMBERSHIPS) {
+    capture_mark_owner_uncertain(state);
+    return;
+  }
+  initialize_process_control_locked(
+      state, &state->process_controls[count], 0, birth, true);
+  // The initialized pending flag is visible before Linux can create the task.
+  atomic_store_explicit(
+      &state->process_control_count, count + 1, memory_order_release);
+}
+
+static void cancel_failed_capture_admission_locked(task_state_t* state, int32_t birth) {
+  for (size_t i = 0; i < state->process_control_count; ++i) {
+    process_control_t* entry = &state->process_controls[i];
+    if (entry->birth_token == birth) {
+      // A negative kernel clone result created no child. A conflicting
+      // publication is uncertainty, never permission to clear a live owner.
+      if (entry->kernel_pid == 0)
+        atomic_store_explicit(
+            &entry->capture_pending_admission, false, memory_order_release);
+      else
+        capture_mark_owner_uncertain(state);
+      return;
+    }
+  }
+  capture_mark_owner_uncertain(state);
+}
+
+/* The birth is reserved before Linux can create the task. Identity publication
+ * and the parent's clone return cannot discharge it. */
+static void reserve_capture_admission(int32_t birth_token) {
+  if (task_state == NULL)
+    return;
+  task_state_lock();
+  reserve_capture_admission_locked(task_state, birth_token);
+  task_state_unlock();
+}
+
+static void cancel_failed_capture_admission(int32_t birth_token) {
+  if (task_state == NULL || birth_token <= 0)
+    return;
+  task_state_lock();
+  cancel_failed_capture_admission_locked(task_state, birth_token);
+  task_state_unlock();
+}
+
 static process_control_t* process_control_for(int32_t kernel_pid) {
   int32_t birth_token;
   if (!lookup_task_birth(kernel_pid, &birth_token) || birth_token <= 0) {
@@ -1450,27 +1639,41 @@ static process_control_t* process_control_for(int32_t kernel_pid) {
   task_state_lock();
   for (size_t i = 0; i < task_state->process_control_count; ++i) {
     process_control_t* entry = &task_state->process_controls[i];
-    if (entry->kernel_pid == kernel_pid &&
-        entry->birth_token == birth_token) {
+    if (entry->birth_token == birth_token &&
+        (entry->kernel_pid == 0 || entry->kernel_pid == kernel_pid)) {
+      if (entry->kernel_pid == 0)
+        entry->kernel_pid = kernel_pid;
       task_state_unlock();
       return entry;
     }
   }
-  DR_ASSERT(task_state->process_control_count < MAX_TASK_MEMBERSHIPS);
-  process_control_t* entry = &task_state->process_controls[
-      task_state->process_control_count++];
-  entry->kernel_pid = kernel_pid;
-  entry->birth_token = birth_token;
-  entry->root_process = kernel_pid == task_state->root_pid &&
-      birth_token == task_state->root_birth_token;
-  atomic_init(&entry->terminal_stats_state, 0);
-  atomic_init(&entry->pending_thread_clones, 0);
-  atomic_init(&entry->image_epoch, 0);
-  atomic_init(&entry->finished_helper_epoch, 0);
-  entry->helper_pid = 0;
-  entry->helper_start_time = 0;
+  if (task_state->process_control_count >= MAX_TASK_MEMBERSHIPS) {
+    capture_mark_uncertain();
+    task_state_unlock();
+    dr_fprintf(diagnostic_file, "reverie-dbt: process ownership table exhausted\n");
+    exit_runtime_tree(101);
+    return NULL;
+  }
+  size_t count = atomic_load_explicit(
+      &task_state->process_control_count, memory_order_relaxed);
+  process_control_t* entry = &task_state->process_controls[count];
+  initialize_process_control_locked(task_state, entry, kernel_pid, birth_token, false);
+  atomic_store_explicit(
+      &task_state->process_control_count, count + 1, memory_order_release);
   task_state_unlock();
   return entry;
+}
+
+/* Bind before entering Rust's Tool-start hook, using the existing process
+ * admission lookup. A fork copy is rebound to its own positive-PID slot; exec
+ * starts with zeroed TLS and authenticates the inherited owner again. No
+ * capture query or successful Tool acknowledgment performs this lookup. */
+static void bind_capture_owner(prototype_counters_t* counters) {
+  process_control_t* entry = process_control_for((int32_t)dr_get_process_id());
+  if (counters->capture_owner.entry != entry ||
+      counters->capture_owner.birth != entry->birth_token) {
+    counters->capture_owner = (capture_owner_t){entry, entry->birth_token, 0};
+  }
 }
 
 // Cleanup may run for an early failure without a prepared process owner. Do
@@ -1685,6 +1888,92 @@ static bool lookup_task_birth(int32_t tid, int32_t* birth) {
   }
   task_state_unlock();
   return found;
+}
+
+static int32_t controller_capture_from_owner(
+    task_state_t* state, capture_owner_t* owner, int32_t pid, int32_t tid,
+    uint32_t operation, bool backing_valid, controller_capture_fact_t* out) {
+  memset(out, 0, sizeof(*out));
+  if (!backing_valid) {
+    capture_mark_owner_uncertain(state);
+    return 0;
+  }
+  if (state == NULL || owner == NULL || pid <= 0 || tid <= 0 || operation > 1)
+    return 0;
+  size_t count = atomic_load_explicit(
+      &state->process_control_count, memory_order_acquire);
+  if (count > MAX_TASK_MEMBERSHIPS) {
+    capture_mark_owner_uncertain(state);
+    return 0;
+  }
+  uintptr_t first = (uintptr_t)&state->process_controls[0];
+  uintptr_t address = (uintptr_t)owner->entry;
+  if (address < first || address - first >= count * sizeof(process_control_t) ||
+      (address - first) % sizeof(process_control_t) != 0 || owner->birth <= 0)
+    return 0;
+  // The cache is populated only from a positive-PID process_control_for result.
+  // Its keys are immutable; canceled pid-zero slots never escape that lookup.
+  // An inherited parent's cache cannot authenticate the child's actual PID.
+  if (owner->entry->kernel_pid != pid || owner->entry->birth_token != owner->birth)
+    return 0;
+  if (operation == 1) {
+    owner->mediated_pid = pid;
+    atomic_store_explicit(
+        &owner->entry->capture_pending_admission, false, memory_order_release);
+    return 1;
+  }
+  if (owner->mediated_pid != pid)
+    return 0;
+
+  bool pending = false;
+  for (size_t i = 0; i < count; ++i) {
+    process_control_t* entry = &state->process_controls[i];
+    pending |= atomic_load_explicit(
+        &entry->capture_pending_admission, memory_order_acquire);
+    pending |= atomic_load_explicit(
+                   &entry->pending_thread_clones, memory_order_acquire) != 0;
+  }
+  // Pending is read BEFORE sticky: a copied transition publishes uncertainty
+  // before successful Tool admission can release its pending reservation.
+  // Query runs under the shared serial guard. A new kernel task either needs
+  // that same grant or already has an unadmitted/sticky ancestor in this scan.
+  // No query/ack depends on the unrelated membership lock or a dead lock owner.
+  bool uncertain = atomic_load_explicit(
+      &state->capture_uncertain, memory_order_acquire);
+  bool certain = !pending && !uncertain && state->external_global &&
+      state->capture_procfs_valid;
+  if (certain) {
+    out->physical_pid = pid;
+    out->physical_tid = tid;
+    out->procfs_device = state->capture_procfs_device;
+    out->procfs_inode = state->capture_procfs_inode;
+  }
+  return certain;
+}
+
+static int32_t controller_capture_control(
+    uintptr_t context, uint32_t operation, controller_capture_fact_t* out) {
+  if (out == NULL)
+    return 0;
+  memset(out, 0, sizeof(*out));
+  if (context == 0 || (void*)context != dr_get_current_drcontext() ||
+      task_state == NULL || task_state->magic != TASK_STATE_MAGIC)
+    return 0;
+  prototype_counters_t* counters =
+      drmgr_get_tls_field((void*)context, thread_state_index);
+  if (counters == NULL)
+    return 0;
+  int32_t pid = (int32_t)dr_get_process_id();
+  int32_t tid = (int32_t)dr_get_thread_id((void*)context);
+  if (pid <= 0 || tid <= 0 || operation > 1)
+    return 0;
+  struct stat backing;
+  bool backing_valid = fstat(TASK_STATE_FD, &backing) == 0 &&
+      (uint64_t)backing.st_dev == task_state_device &&
+      (uint64_t)backing.st_ino == task_state_inode &&
+      backing.st_size == (off_t)sizeof(*task_state);
+  return controller_capture_from_owner(task_state, &counters->capture_owner,
+      pid, tid, operation, backing_valid, out);
 }
 
 static int32_t ensure_task_membership(int32_t tid) {
@@ -2037,6 +2326,7 @@ static void try_start_pending_thread(void) {
   int32_t init_result = 0;
   if (!has_copied_runtime() ||
       (runtime_uses_external_global() && !is_copied_vfork_process())) {
+    bind_capture_owner(counters);
     evidence_callback_enter();
     init_result = reverie_dbt_runtime_thread_init(
         counters,
@@ -2804,6 +3094,25 @@ static bool is_clone_syscall(int sysnum) {
       sysnum == SYS_clone3;
 }
 
+/* This is an observation boundary, not a syscall policy. A failed attempt
+ * remains uncertain too. Pending ordinary forks protect the interval before a
+ * copied child's first vfork fastpath reaches this permanent mark. */
+static bool capture_lifecycle_is_uncertain(int sysnum, const uint64_t* args) {
+  if (sysnum == SYS_unshare || sysnum == SYS_setns)
+    return true;
+  if (is_clone_syscall(sysnum)) {
+    uint64_t flags;
+    return !clone_identity_flags(sysnum, args, &flags) ||
+        (flags & (CLONE_VFORK | CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUSER)) != 0;
+  }
+  return false;
+}
+
+static void capture_observe_lifecycle(int sysnum, const uint64_t* args) {
+  if (capture_lifecycle_is_uncertain(sysnum, args))
+    capture_mark_uncertain();
+}
+
 typedef enum {
   /* Guest::inject observes its synchronous backend/API result after existing
    * clone birth bookkeeping. Only application syscalls have a
@@ -2853,6 +3162,7 @@ static bool prepare_clone_birth(
     const uint64_t* args,
     clone_syscall_origin_t origin) {
   uint64_t flags;
+  capture_observe_lifecycle(sysnum, args);
   if (fail_if_process_clone_result_pending(counters, sysnum))
     return false;
   if (!clone_identity_flags(sysnum, args, &flags))
@@ -2862,6 +3172,8 @@ static bool prepare_clone_birth(
     acquire_clone_identity_handoff();
   counters->pending_birth_token = next_birth_token();
   counters->pending_clone_flags = flags;
+  if ((flags & CLONE_THREAD) == 0)
+    reserve_capture_admission(counters->pending_birth_token);
   if (origin == CLONE_SYSCALL_ORIGINAL && (flags & CLONE_THREAD) == 0) {
     uint64_t child_tid_addr = 0;
     int32_t exit_signal = -1;
@@ -2924,6 +3236,8 @@ static int32_t complete_clone_birth(
   uint64_t flags = counters->pending_clone_flags;
   if (birth_token == 0)
     return 0;
+  if (result < 0 && (flags & CLONE_THREAD) == 0)
+    cancel_failed_capture_admission(birth_token);
   if (result == 0 && !require_supported_child_pid_namespace())
     return 0;
 
@@ -3364,6 +3678,7 @@ invoke_syscall(uintptr_t context, int64_t sysnum, const uint64_t* args) {
   int64_t result;
   bool is_clone;
   DR_ASSERT(counters != NULL);
+  capture_observe_lifecycle((int)sysnum, args);
   if (protect_evidence_socket_syscall(context, (int)sysnum, args, &result))
     return result;
   memcpy(translated, args, sizeof(translated));
@@ -4643,6 +4958,9 @@ static bool pre_syscall(void* drcontext, int sysnum) {
   if (test_compare_exchange &&
       !atomic_flag_test_and_set(&compare_exchange_self_tested))
     run_compare_exchange_self_test();
+  if (test_controller_capture &&
+      !atomic_flag_test_and_set(&controller_capture_self_tested))
+    run_controller_capture_self_test();
   if (test_compare_exchange && sysnum == SYS_prctl &&
       dr_syscall_get_param(drcontext, 0) ==
           COMPARE_EXCHANGE_OUTSIDE_EVENT_PRCTL) {
@@ -4773,6 +5091,8 @@ static bool pre_syscall(void* drcontext, int sysnum) {
   for (i = 0; i != 6; ++i)
     args[i] = (uint64_t)dr_syscall_get_param(drcontext, i);
 
+  capture_observe_lifecycle(sysnum, args);
+
   uint64_t copied_clone_flags = 0;
   bool copied_vfork_clone = has_copied_runtime() &&
       clone_identity_flags(sysnum, args, &copied_clone_flags) &&
@@ -4804,6 +5124,7 @@ static bool pre_syscall(void* drcontext, int sysnum) {
   if (has_copied_runtime() && runtime_uses_external_global() &&
       !copied_vfork_clone && !is_copied_vfork_process() &&
       copied_process_runtime_pid != dr_get_process_id()) {
+    bind_capture_owner(counters);
     evidence_callback_enter();
     int32_t initialized = reverie_dbt_runtime_thread_init(
         counters,
@@ -4980,6 +5301,7 @@ static bool pre_syscall(void* drcontext, int sysnum) {
     int i;
     sysnum = (int)deferred_sysnum;
     memcpy(args, deferred_args, sizeof(args));
+    capture_observe_lifecycle(sysnum, args);
     dr_syscall_set_sysnum(drcontext, sysnum);
     for (i = 0; i != 6; ++i)
       dr_syscall_set_param(drcontext, i, (reg_t)args[i]);
@@ -5130,6 +5452,210 @@ static void run_compare_exchange_self_test(void) {
   dr_nonheap_free(read_only, page);
 }
 
+/* Component controls use a private scratch owner, not synthetic live process
+ * identities. No production owner or TLS admission is substituted or reset. */
+static void reset_capture_test_owner(task_state_t* scratch, int32_t pid) {
+  memset(scratch, 0, sizeof(*scratch));
+  scratch->magic = TASK_STATE_MAGIC;
+  atomic_flag_clear(&scratch->lock);
+  atomic_init(&scratch->capture_uncertain, false);
+  atomic_init(&scratch->process_control_count, 0);
+  scratch->external_global = true;
+  scratch->capture_procfs_valid = true;
+  scratch->capture_procfs_device = 17;
+  scratch->capture_procfs_inode = 29;
+  scratch->root_pid = pid;
+  scratch->root_birth_token = 100;
+  scratch->task_count = 1;
+  scratch->tasks[0] = (task_membership_t){pid, 100};
+  initialize_process_control_locked(
+      scratch, &scratch->process_controls[0], pid, 100, false);
+  atomic_store_explicit(&scratch->process_control_count, 1, memory_order_release);
+}
+
+static bool capture_test_query(
+    task_state_t* scratch, capture_owner_t* owner, int32_t pid, bool ready) {
+  controller_capture_fact_t out;
+  memset(&out, 0xa5, sizeof(out));
+  int result = controller_capture_from_owner(scratch, owner, pid, pid, 0, true, &out);
+  if (ready)
+    return result == 1 && out.physical_pid == pid && out.physical_tid == pid &&
+        out.procfs_device == 17 && out.procfs_inode == 29;
+  controller_capture_fact_t zero = {0};
+  return result == 0 && memcmp(&out, &zero, sizeof(out)) == 0;
+}
+
+/* Failed attempts must not consume the bounded process-owner table. This
+ * also checks the full-capacity boundary without creating any kernel tasks. */
+static bool capture_test_canceled_capacity(task_state_t* scratch, int32_t pid) {
+  reset_capture_test_owner(scratch, pid);
+  capture_owner_t root = {&scratch->process_controls[0], 100, pid};
+  for (int32_t i = 0; i < MAX_TASK_MEMBERSHIPS + 1; ++i) {
+    int32_t birth = 1000 + i;
+    reserve_capture_admission_locked(scratch, birth);
+    if (atomic_load(&scratch->process_control_count) != 2 ||
+        scratch->process_controls[1].birth_token != birth ||
+        !atomic_load(&scratch->process_controls[1].capture_pending_admission))
+      return false;
+    cancel_failed_capture_admission_locked(scratch, birth);
+  }
+  if (!capture_test_query(scratch, &root, pid, true))
+    return false;
+
+  reserve_capture_admission_locked(scratch, 30000);
+  scratch->tasks[1] = (task_membership_t){pid + 1, 30000};
+  scratch->task_count = 2;
+  scratch->process_controls[1].kernel_pid = pid + 1;
+  capture_owner_t child = {&scratch->process_controls[1], 30000, 0};
+  controller_capture_fact_t out;
+  if (controller_capture_from_owner(
+          scratch, &child, pid + 1, pid + 1, 1, true, &out) != 1 ||
+      scratch->process_controls[1].kernel_pid != pid + 1 ||
+      atomic_load(&scratch->process_controls[1].capture_pending_admission))
+    return false;
+
+  for (size_t i = 2; i < MAX_TASK_MEMBERSHIPS; ++i)
+    initialize_process_control_locked(scratch, &scratch->process_controls[i],
+        pid + (int32_t)i, 40000 + (int32_t)i, false);
+  atomic_store_explicit(
+      &scratch->process_control_count, MAX_TASK_MEMBERSHIPS, memory_order_release);
+  process_control_t* pending = &scratch->process_controls[2];
+  pending->kernel_pid = 0;
+  atomic_store(&pending->capture_pending_admission, true);
+  process_control_t* published = &scratch->process_controls[3];
+  atomic_store(&published->capture_pending_admission, true);
+  atomic_store(&published->image_epoch, 73);
+  process_control_t* canceled = &scratch->process_controls[MAX_TASK_MEMBERSHIPS - 1];
+  canceled->kernel_pid = 0;
+  atomic_store(&canceled->capture_pending_admission, true);
+  cancel_failed_capture_admission_locked(scratch, canceled->birth_token);
+  reserve_capture_admission_locked(scratch, 60000);
+  bool reused = atomic_load(&scratch->process_control_count) == MAX_TASK_MEMBERSHIPS &&
+      canceled->birth_token == 60000 && canceled->kernel_pid == 0 &&
+      atomic_load(&canceled->capture_pending_admission) &&
+      scratch->process_controls[0].kernel_pid == pid &&
+      scratch->process_controls[0].birth_token == 100 &&
+      scratch->process_controls[1].kernel_pid == pid + 1 &&
+      scratch->process_controls[1].birth_token == 30000 &&
+      pending->kernel_pid == 0 && pending->birth_token == 40002 &&
+      atomic_load(&pending->capture_pending_admission) &&
+      published->kernel_pid == pid + 3 && published->birth_token == 40003 &&
+      atomic_load(&published->capture_pending_admission) &&
+      atomic_load(&published->image_epoch) == 73 &&
+      !atomic_load(&scratch->capture_uncertain);
+  // With no canceled slot left, retain every owner and withdraw certainty.
+  reserve_capture_admission_locked(scratch, 60001);
+  reused &= atomic_load(&scratch->process_control_count) == MAX_TASK_MEMBERSHIPS &&
+      canceled->birth_token == 60000 && atomic_load(&scratch->capture_uncertain);
+  cancel_failed_capture_admission_locked(scratch, 60000);
+  reserve_capture_admission_locked(scratch, 60002);
+  return reused && canceled->birth_token == 60002 &&
+      atomic_load(&canceled->capture_pending_admission) &&
+      atomic_load(&scratch->capture_uncertain);
+}
+
+static void run_controller_capture_self_test(void) {
+  const int32_t pid = 37;
+  task_state_t* scratch = dr_global_alloc(sizeof(*scratch));
+  DR_ASSERT(scratch != NULL);
+  reset_capture_test_owner(scratch, pid);
+  capture_owner_t root = {&scratch->process_controls[0], 100, 0};
+  controller_capture_fact_t out;
+  bool fresh = capture_test_query(scratch, &root, pid, false) &&
+      controller_capture_from_owner(scratch, &root, pid, pid, 1, true, &out) == 1 &&
+      capture_test_query(scratch, &root, pid, true);
+
+  reserve_capture_admission_locked(scratch, 200);
+  bool pending = capture_test_query(scratch, &root, pid, false);
+  scratch->process_controls[1].kernel_pid = pid + 1;
+  capture_owner_t child = {&scratch->process_controls[1], 201, 0};
+  bool wrong_birth = controller_capture_from_owner(
+          scratch, &child, pid + 1, pid + 1, 1, true, &out) == 0 &&
+      controller_capture_from_owner(scratch, &root, pid, pid, 1, true, &out) == 1 &&
+      atomic_load(&scratch->process_controls[1].capture_pending_admission) &&
+      capture_test_query(scratch, &root, pid, false);
+  child.birth = 200;
+  bool wrong_pid = controller_capture_from_owner(
+          scratch, &child, pid, pid, 1, true, &out) == 0 &&
+      controller_capture_from_owner(
+          scratch, &root, pid + 1, pid + 1, 1, true, &out) == 0 &&
+      atomic_load(&scratch->process_controls[1].capture_pending_admission) &&
+      capture_test_query(scratch, &root, pid, false);
+  bool admitted = controller_capture_from_owner(
+          scratch, &child, pid + 1, pid + 1, 1, true, &out) == 1 &&
+      !atomic_load(&scratch->process_controls[1].capture_pending_admission) &&
+      capture_test_query(scratch, &root, pid, true);
+
+  reserve_capture_admission_locked(scratch, 300);
+  reserve_capture_admission_locked(scratch, 400);
+  cancel_failed_capture_admission_locked(scratch, 300);
+  bool exact_failure = !atomic_load(&scratch->process_controls[2].capture_pending_admission) &&
+      atomic_load(&scratch->process_controls[3].capture_pending_admission) &&
+      capture_test_query(scratch, &root, pid, false);
+  cancel_failed_capture_admission_locked(scratch, 400);
+  exact_failure &= capture_test_query(scratch, &root, pid, true);
+
+  atomic_store(&scratch->process_controls[0].pending_thread_clones, 1);
+  bool thread_pending = capture_test_query(scratch, &root, pid, false);
+  atomic_store(&scratch->process_controls[0].pending_thread_clones, 0);
+  thread_pending &= capture_test_query(scratch, &root, pid, true);
+
+  // Hold the unrelated membership lock through BOTH operations. Old try-lock
+  // query and deferred acknowledgment fail this positive correctness control.
+  atomic_flag_test_and_set(&scratch->lock);
+  bool contention = capture_test_query(scratch, &root, pid, true);
+  root.mediated_pid = 0;
+  atomic_store(&root.entry->capture_pending_admission, true);
+  contention &= capture_test_query(scratch, &root, pid, false) &&
+      controller_capture_from_owner(scratch, &root, pid, pid, 1, true, &out) == 1 &&
+      !atomic_load(&root.entry->capture_pending_admission) &&
+      capture_test_query(scratch, &root, pid, true);
+  capture_owner_t unknown = {0};
+  contention &= capture_test_query(scratch, &unknown, pid, false);
+  // A publisher that died with an unresolved reservation remains unavailable,
+  // regardless of the held lock. There is no inferred cancellation on death.
+  atomic_store(&scratch->process_controls[2].capture_pending_admission, true);
+  contention &= capture_test_query(scratch, &root, pid, false);
+  atomic_store(&scratch->process_controls[2].capture_pending_admission, false);
+  atomic_flag_clear(&scratch->lock);
+  contention &= capture_test_query(scratch, &root, pid, true);
+
+  uint64_t arguments[6] = {CLONE_VM | CLONE_VFORK | SIGCHLD, 0, 0, 0, 0, 0};
+  if (capture_lifecycle_is_uncertain(SYS_clone, arguments))
+    capture_mark_owner_uncertain(scratch);
+  atomic_flag_test_and_set(&scratch->lock);
+  bool sticky = capture_test_query(scratch, &root, pid, false) &&
+      controller_capture_from_owner(scratch, &root, pid, pid, 1, true, &out) == 1 &&
+      capture_test_query(scratch, &root, pid, false);
+  atomic_flag_clear(&scratch->lock);
+  if (capture_lifecycle_is_uncertain(SYS_exit, arguments))
+    capture_mark_owner_uncertain(scratch);
+  sticky &= capture_test_query(scratch, &root, pid, false);
+
+  reset_capture_test_owner(scratch, pid);
+  root = (capture_owner_t){&scratch->process_controls[0], 100, pid};
+  bool lost = controller_capture_from_owner(
+          scratch, &root, pid, pid, 0, false, &out) == 0 &&
+      atomic_load(&scratch->capture_uncertain);
+  lost &= capture_test_query(scratch, &root, pid, false);
+  bool exec_loss = capture_may_initialize(true, false) &&
+      !capture_may_initialize(true, true) &&
+      !capture_may_initialize(false, false) &&
+      !capture_may_initialize(false, true);
+
+  bool capacity = capture_test_canceled_capacity(scratch, pid);
+  dr_global_free(scratch, sizeof(*scratch));
+  dr_fprintf(diagnostic_file,
+      "CONTROLLER_CAPTURE_TEST fresh=%d pending=%d wrong_birth=%d wrong_pid=%d "
+      "admitted=%d exact_failure=%d thread_pending=%d contention=%d sticky=%d "
+      "lost=%d exec_loss=%d capacity=%d\n",
+      fresh, pending, wrong_birth, wrong_pid, admitted, exact_failure,
+      thread_pending, contention, sticky, lost, exec_loss, capacity);
+  if (!(fresh && pending && wrong_birth && wrong_pid && admitted && exact_failure &&
+        thread_pending && contention && sticky && lost && exec_loss && capacity))
+    exit_runtime_tree(101);
+}
+
 /* The registered system-call events: mark the thread as inside one for
  * runtime_compare_exchange_u32, around the real handlers. */
 static void set_in_syscall_event(void* drcontext, bool value) {
@@ -5208,6 +5734,7 @@ static void thread_init(void* drcontext) {
   counters->pending_birth_token = 0;
   counters->pending_clone_flags = pending_child != 0 ? clone_flags : 0;
 
+  bind_capture_owner(counters);
   evidence_thread_enter(counters);
   evidence_callback_enter();
   evidence_emit_image_initialization();
@@ -5823,6 +6350,8 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
       test_backend_failure_sender_lookup_miss = true;
     else if (strcmp(argv[i], "-test-compare-exchange") == 0)
       test_compare_exchange = true;
+    else if (strcmp(argv[i], "-test-controller-capture") == 0)
+      test_controller_capture = true;
     else if (strcmp(argv[i], "-test-reused-tid") == 0)
       test_reused_tid = true;
     else if (strcmp(argv[i], "-test-thread-clone-process-exit") == 0)
@@ -5880,6 +6409,8 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
       &evidence_config_page, sizeof(evidence_config_page), DR_MEMPROT_READ));
   runtime_callbacks_page.value.emit_evidence =
       evidence_is_enabled() ? reverie_dbt_emit_evidence : reverie_dbt_emit;
+  runtime_callbacks_page.value.controller_capture_control =
+      controller_capture_control;
   if (!evidence_is_enabled())
     runtime_callbacks_page.value.evidence_log_level = 0;
   atomic_store_explicit(&runtime_background_state, 0, memory_order_release);

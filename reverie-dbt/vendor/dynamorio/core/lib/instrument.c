@@ -2832,6 +2832,12 @@ dr_get_process_id_from_drcontext(void *drcontext)
 }
 
 #ifdef UNIX
+DR_API bool
+dr_is_post_execve(void)
+{
+    return post_execve;
+}
+
 DR_API
 process_id_t
 dr_get_parent_id(void)

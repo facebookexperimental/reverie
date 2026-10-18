@@ -128,6 +128,17 @@ DR_API
 bool
 dr_running_under_dynamorio(void);
 
+#ifdef UNIX
+DR_API
+/**
+ * Reports whether this client image was initialized by DynamoRIO's followed
+ * exec path. This is the loader's captured fact, not a later environment read.
+ * A fork child continues its existing client image.
+ */
+bool
+dr_is_post_execve(void);
+#endif
+
 DR_API
 /** \deprecated Replaced by dr_set_process_exit_behavior() */
 void

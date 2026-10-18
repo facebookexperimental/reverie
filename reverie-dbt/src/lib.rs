@@ -115,6 +115,42 @@ pub type MemoryWriter = unsafe extern "C" fn(usize, *const u8, usize) -> usize;
 /// misaligned address, or `-EFAULT` where the word cannot be read and written.
 pub type MemoryCompareExchange = unsafe extern "C" fn(usize, u32, u32, *mut u32) -> i32;
 
+/// Fixed native representation of a controller-capture fact (ABI version 10).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NativeControllerCaptureFact {
+    physical_pid: i32,
+    physical_tid: i32,
+    procfs_device: u64,
+    procfs_inode: u64,
+}
+
+const _: () = assert!(std::mem::size_of::<NativeControllerCaptureFact>() == 24);
+
+/// Native capture control: operation 0 queries the current fact; operation 1
+/// acknowledges successful Tool thread-start admission for this exact context.
+/// Returns 1 on success and 0 on unavailable. The native callback initializes
+/// every output byte, including on failure, and never retains the context.
+pub type ControllerCaptureControl =
+    unsafe extern "C" fn(usize, u32, *mut NativeControllerCaptureFact) -> i32;
+
+static CONTROLLER_CAPTURE_CONTROL: std::sync::OnceLock<ControllerCaptureControl> =
+    std::sync::OnceLock::new();
+
+/// Installs the native capture callback during external runtime initialization.
+pub fn install_controller_capture_control(control: ControllerCaptureControl) {
+    let _ = CONTROLLER_CAPTURE_CONTROL.set(control);
+}
+
+fn acknowledge_tool_admission(context: usize) {
+    if let Some(control) = CONTROLLER_CAPTURE_CONTROL.get() {
+        let mut output = NativeControllerCaptureFact::default();
+        // A failed acknowledgment keeps capture unavailable; it does not change
+        // the Tool hook's result or allow guest execution to bypass that hook.
+        unsafe { control(context, 1, &mut output) };
+    }
+}
+
 /// The native client's compare-and-exchange, once the runtime's background
 /// initialization has installed it with [`install_guest_compare_exchange`].
 static GUEST_COMPARE_EXCHANGE: std::sync::OnceLock<MemoryCompareExchange> =
@@ -244,7 +280,9 @@ pub type RuntimeIdler = unsafe extern "C" fn();
 /// callback layout from 48 to 56 bytes.
 /// Version 9 also requires `reverie_dbt_runtime_cpuid`: the native client no
 /// longer answers CPUID from a table of its own, it asks the runtime's tool.
-pub const DBT_RUNTIME_ABI_VERSION: u32 = 9;
+/// Version 10 appends the controller-capture control, growing the callback
+/// layout from 56 to 64 bytes.
+pub const DBT_RUNTIME_ABI_VERSION: u32 = 10;
 
 /// Initialized native execution mode supplied by the version-6 startup bridge.
 ///
@@ -327,6 +365,8 @@ pub struct DbtRuntimeCallbacks {
     /// [`install_guest_compare_exchange`] so that [`DbtMemory`] offers
     /// [`MemoryAccess::compare_exchange_u32`].
     pub compare_exchange_u32: MemoryCompareExchange,
+    /// Native process-admission and proc-view facts for controller capture.
+    pub controller_capture_control: ControllerCaptureControl,
 }
 
 /// Reports the exact native-client/external-runtime ABI version.
@@ -616,6 +656,23 @@ where
         }
     }
 
+    fn try_send_rpc_sync(
+        &self,
+        message: <T::GlobalState as GlobalTool>::Request,
+    ) -> Result<<T::GlobalState as GlobalTool>::Response, <T::GlobalState as GlobalTool>::Request>
+    {
+        if !crate::sync_rpc::is_active() {
+            return Err(message);
+        }
+        Ok(crate::sync_rpc::send_rpc_from_guest::<T::GlobalState>(
+            self.context,
+            self.invoke_syscall,
+            self.tid,
+            self.config,
+            message,
+        ))
+    }
+
     fn config(&self) -> &<T::GlobalState as GlobalTool>::Config {
         self.config
     }
@@ -635,6 +692,27 @@ where
 
     fn pid(&self) -> Pid {
         self.pid
+    }
+
+    fn controller_capture_fact(&self) -> Option<reverie::ControllerCaptureFact> {
+        if !sync_rpc::is_active() {
+            return None;
+        }
+        let control = CONTROLLER_CAPTURE_CONTROL.get()?;
+        let mut fact = NativeControllerCaptureFact::default();
+        if unsafe { control(self.context, 0, &mut fact) } != 1
+            || fact.physical_pid <= 0
+            || fact.physical_tid <= 0
+            || fact.procfs_inode == 0
+        {
+            return None;
+        }
+        Some(reverie::ControllerCaptureFact {
+            physical_pid: Pid::from_raw(fact.physical_pid),
+            physical_tid: Pid::from_raw(fact.physical_tid),
+            procfs_device: fact.procfs_device,
+            procfs_inode: fact.procfs_inode,
+        })
     }
 
     fn is_runtime_owned_fd(&self, fd: i32) -> bool {
@@ -1286,8 +1364,12 @@ pub fn run_tool_thread_start<T: Tool>(
         write_registers,
     );
     let tail_result = Arc::clone(&guest.tail_inject_result);
-    run_ready(tool.handle_thread_start(&mut guest), &tail_result)
-        .expect("thread-start handler unexpectedly tail-injected")
+    let result = run_ready(tool.handle_thread_start(&mut guest), &tail_result)
+        .expect("thread-start handler unexpectedly tail-injected");
+    if result.is_ok() {
+        acknowledge_tool_admission(context);
+    }
+    result
 }
 
 /// Drives an external tool's post-exec lifecycle hook on a DBT guest.
@@ -2276,6 +2358,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v3(
     }
     tools::set_stdout_emitter(callbacks.emit_stdout);
     install_guest_compare_exchange(callbacks.compare_exchange_u32);
+    install_controller_capture_control(callbacks.controller_capture_control);
     PROCESS_CLONE_RESULT_PROBE.store(
         std::env::var_os("REVERIE_DBT_TEST_PROCESS_CLONE_RESULTS").is_some(),
         Ordering::Release,
@@ -2845,11 +2928,12 @@ mod tests {
 
     #[test]
     fn startup_abi_preserves_layout_and_requires_initialized_native_mode() {
-        assert_eq!(reverie_dbt_runtime_abi_version(), 9);
+        assert_eq!(reverie_dbt_runtime_abi_version(), 10);
         assert_eq!(std::mem::size_of::<DbtSignalEvent>(), 200);
         assert_eq!(std::mem::align_of::<DbtSignalEvent>(), 8);
-        assert_eq!(reverie_dbt_runtime_callbacks_size(), 56);
-        assert_eq!(std::mem::size_of::<DbtRuntimeCallbacks>(), 56);
+        assert_eq!(reverie_dbt_runtime_callbacks_size(), 64);
+        assert_eq!(std::mem::size_of::<DbtRuntimeCallbacks>(), 64);
+        assert_eq!(std::mem::size_of::<NativeControllerCaptureFact>(), 24);
         assert_eq!(
             DbtStartupMode::try_from(1).unwrap(),
             DbtStartupMode::Standalone

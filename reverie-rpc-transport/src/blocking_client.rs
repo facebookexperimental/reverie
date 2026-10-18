@@ -25,6 +25,7 @@ use reverie::Tid;
 
 use crate::codec::DEFAULT_MAX_FRAME_LEN;
 use crate::codec::decode;
+#[cfg(test)]
 use crate::codec::encode;
 use crate::envelope::RequestEnvelope;
 use crate::error::RpcError;
@@ -62,20 +63,110 @@ pub struct BorrowedBlockingRpcClient<'a, G: GlobalTool, S> {
     stream: Mutex<&'a mut S>,
 }
 
+// Small control exchanges retain all request/response storage on the caller's
+// stack. Large messages keep the same wire and maximum-frame semantics.
+const INLINE_FRAME_LEN: usize = 512;
+
+// Boxing the inline arm would reintroduce the allocation this storage avoids.
+#[allow(clippy::large_enum_variant)]
+enum FrameBytes {
+    Inline {
+        len: usize,
+        bytes: [u8; INLINE_FRAME_LEN],
+    },
+    Heap(Vec<u8>),
+}
+
+impl FrameBytes {
+    fn empty() -> Self {
+        Self::Inline {
+            len: 0,
+            bytes: [0; INLINE_FRAME_LEN],
+        }
+    }
+
+    fn for_read(&mut self, length: usize) -> &mut [u8] {
+        if length > INLINE_FRAME_LEN {
+            *self = Self::Heap(vec![0; length]);
+        }
+        match self {
+            Self::Inline { len, bytes } => {
+                *len = length;
+                &mut bytes[..length]
+            }
+            Self::Heap(bytes) => {
+                bytes.resize(length, 0);
+                bytes
+            }
+        }
+    }
+
+    fn into_vec(self) -> Vec<u8> {
+        match self {
+            Self::Inline { len, bytes } => bytes[..len].to_vec(),
+            Self::Heap(bytes) => bytes,
+        }
+    }
+}
+
+impl std::ops::Deref for FrameBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Inline { len, bytes } => &bytes[..*len],
+            Self::Heap(bytes) => bytes,
+        }
+    }
+}
+
+impl bincode::enc::write::Writer for FrameBytes {
+    fn write(&mut self, input: &[u8]) -> Result<(), bincode::error::EncodeError> {
+        match self {
+            Self::Inline { len, bytes } => {
+                let end =
+                    len.checked_add(input.len())
+                        .ok_or(bincode::error::EncodeError::Other(
+                            "RPC request length overflow",
+                        ))?;
+                if end <= INLINE_FRAME_LEN {
+                    bytes[*len..end].copy_from_slice(input);
+                    *len = end;
+                } else {
+                    let mut heap = Vec::with_capacity(end);
+                    heap.extend_from_slice(&bytes[..*len]);
+                    heap.extend_from_slice(input);
+                    *self = Self::Heap(heap);
+                }
+            }
+            Self::Heap(bytes) => bytes.extend_from_slice(input),
+        }
+        Ok(())
+    }
+}
+
 /// A shared-codec request prepared before entering an adapter's I/O lease.
 ///
 /// Preparation runs the request's `Serialize` implementation. The owned bytes
 /// include the originating TID and convey no connection or admission authority.
 pub struct RpcRequest<G: GlobalTool> {
-    bytes: Vec<u8>,
+    bytes: FrameBytes,
     _phantom: PhantomData<fn() -> G>,
 }
 
 impl<G: GlobalTool> RpcRequest<G> {
     /// Serialize the same request envelope used by the owned blocking client.
     pub fn new(from: Tid, request: G::Request) -> Result<Self, RpcError> {
+        let mut bytes = FrameBytes::empty();
+        // Serialize once: falling back to a Vec must not rerun a stateful
+        // user Serialize implementation.
+        bincode::serde::encode_into_writer(
+            &RequestEnvelope { from, request },
+            &mut bytes,
+            bincode::config::legacy(),
+        )?;
         Ok(Self {
-            bytes: encode(&RequestEnvelope { from, request })?,
+            bytes,
             _phantom: PhantomData,
         })
     }
@@ -86,7 +177,7 @@ impl<G: GlobalTool> RpcRequest<G> {
 /// This contains only owned wire bytes: no stream, lock, configuration or callback
 /// borrow. Receiving it has already completed the request/response exchange.
 pub struct RpcResponse<G: GlobalTool> {
-    bytes: Vec<u8>,
+    bytes: FrameBytes,
     _phantom: PhantomData<fn() -> G>,
 }
 
@@ -409,15 +500,17 @@ where
     /// socket before decoding. Errors and panics in user deserialization then
     /// cannot retain those adapter-owned resources.
     pub fn receive_response(&self, request: RpcRequest<G>) -> Result<RpcResponse<G>, RpcError> {
+        let mut response = RpcResponse {
+            bytes: FrameBytes::empty(),
+            _phantom: PhantomData,
+        };
         let mut stream = self.stream.lock().map_err(|_| {
             RpcError::Io(io::Error::other(
                 "reverie-rpc-transport: blocking client mutex poisoned",
             ))
         })?;
-        Ok(RpcResponse {
-            bytes: exchange(&mut **stream, &request.bytes)?,
-            _phantom: PhantomData,
-        })
+        exchange_into(&mut **stream, &request.bytes, &mut response.bytes)?;
+        Ok(response)
     }
 }
 
@@ -476,9 +569,25 @@ pub fn read_config_frame(stream: &mut impl Read) -> Result<Vec<u8>, RpcError> {
     read_message(stream, DEFAULT_MAX_FRAME_LEN)
 }
 
-fn exchange(stream: &mut (impl Read + Write), request_bytes: &[u8]) -> Result<Vec<u8>, RpcError> {
+fn exchange(
+    stream: &mut (impl Read + Write),
+    request_bytes: &[u8],
+) -> Result<FrameBytes, RpcError> {
+    let mut response = FrameBytes::empty();
+    exchange_into(stream, request_bytes, &mut response)?;
+    Ok(response)
+}
+
+fn exchange_into(
+    stream: &mut (impl Read + Write),
+    request_bytes: &[u8],
+    response: &mut FrameBytes,
+) -> Result<(), RpcError> {
+    // Materialize/touch the inline storage before the remote snapshot can
+    // occur. The fixed small response never allocates after this write.
+    std::hint::black_box(&mut *response);
     write_message(stream, request_bytes)?;
-    read_message(stream, DEFAULT_MAX_FRAME_LEN)
+    read_message_into(stream, DEFAULT_MAX_FRAME_LEN, response)
 }
 
 #[async_trait]
@@ -533,6 +642,16 @@ fn write_message(stream: &mut impl Write, payload: &[u8]) -> Result<(), RpcError
 }
 
 fn read_message(stream: &mut impl Read, max_len: usize) -> Result<Vec<u8>, RpcError> {
+    let mut payload = FrameBytes::empty();
+    read_message_into(stream, max_len, &mut payload)?;
+    Ok(payload.into_vec())
+}
+
+fn read_message_into(
+    stream: &mut impl Read,
+    max_len: usize,
+    payload: &mut FrameBytes,
+) -> Result<(), RpcError> {
     // Read the 4-byte length prefix in one `read` on the common path. The loop
     // only re-enters the kernel on a short read or `EINTR`, collapsing the
     // former 1-byte probe + 3-byte remainder into a single syscall per hop.
@@ -556,9 +675,8 @@ fn read_message(stream: &mut impl Read, max_len: usize) -> Result<Vec<u8>, RpcEr
         return Err(RpcError::FrameTooLarge { len, max: max_len });
     }
 
-    let mut payload = vec![0; len];
-    stream.read_exact(&mut payload)?;
-    Ok(payload)
+    stream.read_exact(payload.for_read(len))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -569,6 +687,190 @@ mod io_scope_tests;
 
 #[cfg(test)]
 mod borrowed_tests;
+
+#[cfg(test)]
+mod inline_frame_tests {
+    use std::io::Cursor;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    use serde::Deserialize;
+    use serde::Serialize;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct Fixed;
+
+    #[async_trait]
+    impl GlobalTool for Fixed {
+        type Request = (u64, bool);
+        type Response = (u64, bool);
+        type Config = ();
+
+        async fn receive_rpc(&self, _: Tid, request: Self::Request) -> Self::Response {
+            request
+        }
+    }
+
+    struct Stream {
+        input: Cursor<Vec<u8>>,
+        output: Vec<u8>,
+    }
+
+    impl Read for Stream {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            self.input.read(bytes)
+        }
+    }
+
+    impl Write for Stream {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.output.write(bytes)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn fixed_request_and_response_stay_inline_with_the_existing_wire() {
+        let from = Tid::from_raw(37);
+        let value = (0x1234_5678, true);
+        let request = RpcRequest::<Fixed>::new(from, value).unwrap();
+        assert!(matches!(&request.bytes, FrameBytes::Inline { .. }));
+        let expected = encode(&RequestEnvelope {
+            from,
+            request: value,
+        })
+        .unwrap();
+        assert_eq!(&*request.bytes, expected);
+        let mut input = Vec::new();
+        write_message(&mut input, &encode(&value).unwrap()).unwrap();
+        let mut stream = Stream {
+            input: Cursor::new(input),
+            output: Vec::with_capacity(expected.len() + 4),
+        };
+        let response = BlockingRpcClient::<Fixed>::from_borrowed_stream(&mut stream, from, &())
+            .receive_response(request)
+            .unwrap();
+        assert!(matches!(&response.bytes, FrameBytes::Inline { .. }));
+        assert_eq!(response.decode().unwrap(), value);
+        let mut expected_frame = Vec::new();
+        write_message(&mut expected_frame, &expected).unwrap();
+        assert_eq!(stream.output, expected_frame);
+    }
+
+    #[derive(Deserialize)]
+    struct Counted {
+        bytes: Vec<u8>,
+        #[serde(skip)]
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Serialize for Counted {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.bytes.serialize(serializer)
+        }
+    }
+
+    #[derive(Default)]
+    struct Large;
+
+    #[async_trait]
+    impl GlobalTool for Large {
+        type Request = Counted;
+        type Response = Vec<u8>;
+        type Config = ();
+
+        async fn receive_rpc(&self, _: Tid, request: Counted) -> Vec<u8> {
+            request.bytes
+        }
+    }
+
+    #[test]
+    fn large_frames_spill_without_repeating_serialization_or_changing_bytes() {
+        let from = Tid::from_raw(41);
+        let bytes: Vec<u8> = (0..INLINE_FRAME_LEN * 3).map(|i| i as u8).collect();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let request = RpcRequest::<Large>::new(
+            from,
+            Counted {
+                bytes: bytes.clone(),
+                calls: calls.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(&request.bytes, FrameBytes::Heap(_)));
+        assert_eq!(
+            &*request.bytes,
+            encode(&RequestEnvelope {
+                from,
+                request: &bytes
+            })
+            .unwrap()
+        );
+        let mut input = Vec::new();
+        write_message(&mut input, &encode(&bytes).unwrap()).unwrap();
+        let mut stream = Stream {
+            input: Cursor::new(input),
+            output: Vec::new(),
+        };
+        let response = BlockingRpcClient::<Large>::from_borrowed_stream(&mut stream, from, &())
+            .receive_response(request)
+            .unwrap();
+        assert!(matches!(&response.bytes, FrameBytes::Heap(_)));
+        assert_eq!(response.decode().unwrap(), bytes);
+    }
+
+    #[test]
+    fn inline_framing_keeps_closed_truncated_and_oversize_errors() {
+        let mut output = FrameBytes::empty();
+        assert!(matches!(
+            read_message_into(&mut Cursor::new([]), 16, &mut output),
+            Err(RpcError::Closed)
+        ));
+        for bytes in [&[0, 0][..], &[0, 0, 0, 2, 1][..]] {
+            assert!(
+                matches!(read_message_into(&mut Cursor::new(bytes), 16, &mut output), Err(RpcError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof)
+            );
+        }
+        assert!(matches!(
+            read_message_into(&mut Cursor::new(17_u32.to_be_bytes()), 16, &mut output),
+            Err(RpcError::FrameTooLarge { len: 17, max: 16 })
+        ));
+        assert!(matches!(output, FrameBytes::Inline { .. }));
+    }
+
+    #[test]
+    fn optional_sync_default_returns_the_original_request_without_io() {
+        let mut stream = Stream {
+            input: Cursor::new(Vec::new()),
+            output: Vec::new(),
+        };
+        let client =
+            BlockingRpcClient::<Large>::from_borrowed_stream(&mut stream, Tid::from_raw(43), &());
+        let bytes = vec![1, 2, 3];
+        let pointer = bytes.as_ptr();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let request = Counted {
+            bytes,
+            calls: calls.clone(),
+        };
+        let returned = match client.try_send_rpc_sync(request) {
+            Err(original) => original,
+            Ok(_) => panic!("default synchronous method performed an exchange"),
+        };
+        assert_eq!(returned.bytes.as_ptr(), pointer);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(stream.output.is_empty());
+        assert_eq!(stream.input.position(), 0);
+    }
+}
 
 #[cfg(test)]
 mod into_parts_tests {

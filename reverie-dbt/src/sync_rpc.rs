@@ -346,6 +346,7 @@ pub fn send_rpc_from_guest<G: GlobalTool>(
             let connection = slot
                 .as_ref()
                 .expect("reverie-dbt sync_rpc: guest connection initialization failed");
+            drop(path);
             guest_round_trip::<G>(
                 context,
                 invoke_syscall,
@@ -362,6 +363,7 @@ pub fn send_rpc_from_guest<G: GlobalTool>(
                 .replace(&mut slot, context, invoke_syscall, &path, pid)
                 .expect("reverie-dbt sync_rpc: failed to recover guest connection");
             let connection = slot.as_ref().expect("recovered guest connection");
+            drop(path);
             guest_round_trip::<G>(
                 context,
                 invoke_syscall,
@@ -377,15 +379,16 @@ pub fn send_rpc_from_guest<G: GlobalTool>(
             // so use an uncached connection instead of waiting forever.
             let connection = connect_guest(context, invoke_syscall, &path, std::process::id())
                 .expect("reverie-dbt sync_rpc: failed to connect contended guest socket");
-            let response = guest_round_trip::<G>(
-                context,
-                invoke_syscall,
-                connection.fd,
-                from,
-                config,
-                request,
-            );
-            close_guest(context, invoke_syscall, connection.fd);
+            let GuestConnection {
+                fd,
+                path: connection_path,
+                ..
+            } = connection;
+            drop(connection_path);
+            drop(path);
+            let response =
+                guest_round_trip::<G>(context, invoke_syscall, fd, from, config, request);
+            close_guest(context, invoke_syscall, fd);
             response
         }
     }

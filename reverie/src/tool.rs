@@ -1141,6 +1141,19 @@ pub trait GlobalRPC<G: GlobalTool>: Sync {
     /// blocks the current thread until a response is received.
     async fn send_rpc(&self, message: G::Request) -> G::Response;
 
+    /// Optionally complete an RPC without constructing or polling a future.
+    ///
+    /// An unsupported implementation returns the original request without
+    /// sending any part of it or changing transport admission. An implementation
+    /// returning `Ok` uses its ordinary authenticated channel and wire contract.
+    /// This does not grant a scheduler turn, promise nonallocating arbitrary
+    /// serialization, or permit a request whose completion requires this caller
+    /// to yield. Transport failures retain that implementation's normal failure
+    /// behavior; they must not be relabeled as an unsupported request.
+    fn try_send_rpc_sync(&self, message: G::Request) -> Result<G::Response, G::Request> {
+        Err(message)
+    }
+
     /// Return the read-only tool configuration
     fn config(&self) -> &G::Config;
 }

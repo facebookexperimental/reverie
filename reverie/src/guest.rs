@@ -26,6 +26,40 @@ use crate::tool::GlobalRPC;
 use crate::tool::GlobalTool;
 use crate::tool::Tool;
 
+/// Backend facts permitting a shared controller to inspect this physical task.
+///
+/// The procfs identity names the authenticated root directory of the backend's
+/// initial procfs view, not a task directory. A controller must match that view
+/// and its registered task incarnation, and exclude all other guest execution,
+/// before opening a temporary metadata descriptor. This is not itself a
+/// scheduling grant or permission to inspect an arbitrary process.
+///
+/// `Some` also attests that RPCs use an external controller and that no native
+/// child admission or copied-execution uncertainty remains. Under the shared
+/// controller's exclusive-execution guard, that certainty lasts through a
+/// non-yielding synchronous request; the caller must not inject a lifecycle or
+/// namespace operation between obtaining the fact and sending that request.
+/// The numeric fields alone convey none of this authority.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize
+)]
+pub struct ControllerCaptureFact {
+    /// Physical process ID in the authenticated procfs view.
+    pub physical_pid: Pid,
+    /// Physical thread ID in the authenticated procfs view.
+    pub physical_tid: Pid,
+    /// Device of the authenticated procfs root directory.
+    pub procfs_device: u64,
+    /// Inode of the authenticated procfs root directory.
+    pub procfs_inode: u64,
+}
+
 /// The logical kind of a guest memory region reported by
 /// [`Guest::detlog_memory_regions`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +146,17 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
 
     /// Process ID of the process containing the guest task.
     fn pid(&self) -> Pid;
+
+    /// Facts for a synchronous controller capture while this task is stopped.
+    ///
+    /// `Some` additionally certifies that no backend-native child is outside
+    /// Tool admission. It remains valid only while the caller retains its
+    /// exclusive shared execution turn and does not resume or inject a guest
+    /// lifecycle operation. Unknown ownership, lost state, or an unmediated
+    /// execution history must return `None`. Other backends default to no fact.
+    fn controller_capture_fact(&self) -> Option<ControllerCaptureFact> {
+        None
+    }
 
     /// Process ID of the parent process. Returns `None` if this is the root of
     /// the traced process tree. A return value of `None` does not necessarily
@@ -877,6 +922,14 @@ where
         self.inner.send_rpc(message).await
     }
 
+    fn try_send_rpc_sync(
+        &self,
+        message: <U::GlobalState as GlobalTool>::Request,
+    ) -> Result<<U::GlobalState as GlobalTool>::Response, <U::GlobalState as GlobalTool>::Request>
+    {
+        self.inner.try_send_rpc_sync(message)
+    }
+
     fn config(&self) -> &<U::GlobalState as GlobalTool>::Config {
         self.inner.config()
     }
@@ -899,6 +952,10 @@ where
 
     fn pid(&self) -> Pid {
         self.inner.pid()
+    }
+
+    fn controller_capture_fact(&self) -> Option<ControllerCaptureFact> {
+        self.inner.controller_capture_fact()
     }
 
     fn ppid(&self) -> Option<Pid> {
