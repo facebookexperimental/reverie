@@ -656,7 +656,24 @@ impl Tool for ThreadStartTool {
 #[test]
 fn a_thread_start_callback_is_refused() {
     let seen = run_guest_under::<ThreadStartTool>("thread start", || {
-        std::thread::spawn(|| {}).join().unwrap();
+        // A raw pthread, not `std::thread::spawn`: the guest is forked from
+        // the multithreaded test process, and a Rust std thread start can
+        // block forever on std's thread-info lock if another libtest thread
+        // held it at the fork (Claude re-check of
+        // https://github.com/rrnewton/reverie/pull/1083).
+        extern "C" fn empty(_: *mut libc::c_void) -> *mut libc::c_void {
+            std::ptr::null_mut()
+        }
+        // SAFETY: a fresh thread handle, a valid start routine, and a join
+        // of that same thread.
+        unsafe {
+            let mut thread: libc::pthread_t = 0;
+            assert_eq!(
+                libc::pthread_create(&mut thread, std::ptr::null(), empty, std::ptr::null_mut()),
+                0
+            );
+            assert_eq!(libc::pthread_join(thread, std::ptr::null_mut()), 0);
+        }
     });
     assert!(!seen.is_empty(), "no thread start was seen");
     assert_eq!(seen.len() % 3, 0, "{seen:?}");
