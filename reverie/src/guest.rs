@@ -599,6 +599,63 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
         Err(Errno::ENOSYS)
     }
 
+    /// From inside [`Tool::handle_signal_event`] (or
+    /// [`Tool::handle_raw_signal_event`]), approves the reported signal for
+    /// delivery with what Linux will do with it, as the tool computed from its
+    /// own copy of the thread's signal state: its caught action, the mask the
+    /// frame saves, the mask in effect now, the handler's mask, and what the
+    /// thread was doing ([`crate::SignalDelivery`]).
+    ///
+    /// A backend whose kernel delivers the signal (ptrace) checks the
+    /// approval against the kernel at the stop, reading only, and answers
+    /// [`crate::SignalDeliveryOutcome::Accepted`] when every check passes; the
+    /// callback then returns the signal, and the kernel delivers exactly that
+    /// instance, with masks equal to the approved ones on every checked bit;
+    /// the handler's mask holds as far as the tool's copy of the action is
+    /// right.
+    /// A check that fails answers
+    /// [`crate::SignalDeliveryOutcome::Mismatch`] naming the field, and a
+    /// point where it cannot check answers
+    /// [`crate::SignalDeliveryOutcome::Unavailable`] naming why. Neither
+    /// approves anything or changes the guest. A backend that builds the
+    /// handler's frame itself answers
+    /// [`crate::SignalDeliveryOutcome::Installed`] or
+    /// [`crate::SignalDeliveryOutcome::FrameFault`], and its callback returns
+    /// no signal. The default refuses
+    /// ([`crate::UnsupportedOperation::SignalDelivery`]) and changes nothing.
+    ///
+    /// The contract, for every backend:
+    /// - It never replaces, emulates or reorders a kernel mask-swapping
+    ///   syscall (`rt_sigsuspend`, `ppoll`, `pselect6`, `epoll_pwait`).
+    /// - It is offered only the signal instance the backend reported, from
+    ///   the callback that reports it: at that signal's own stop or at its
+    ///   held-signal report, or at a later signal-delivery stop an injection
+    ///   of that callback ended at, from which the backend resumes the
+    ///   recorded instance. A held signal whose temporary mask's restore is
+    ///   pending is not reported, so it is never offered.
+    /// - An approval is consumed at most once, by the resume of the callback
+    ///   it was made in, and only from the stop it was checked at. It must be
+    ///   the last thing the callback does before it returns the signal. An
+    ///   injection or a register write after it voids it, and a tail
+    ///   injection after it ends the run before it injects. A callback that
+    ///   made an approval and then returns anything but that signal, returns
+    ///   it after the approval was voided, or executes a program, fails
+    ///   rather than deliver something unchecked: the backend ends the run.
+    ///   [`Guest::set_signal_info`] changes neither registers nor masks and
+    ///   composes with an approval; the signal is then delivered with the
+    ///   replacement siginfo.
+    /// - After a check fails, the callback cannot approve that signal again.
+    async fn deliver_signal(
+        &mut self,
+        _delivery: crate::SignalDelivery,
+    ) -> crate::SignalDeliveryOutcome {
+        crate::SignalDeliveryOutcome::Refused(crate::UnsupportedRefusal::new(
+            crate::UnsupportedOperation::SignalDelivery,
+            Errno::ENOSYS,
+            "Guest::deliver_signal: this backend keeps its own signal delivery (the default refusal)",
+        ))
+    }
+
     /// Backend process/task lifetime identity, including at thread start.
     fn signal_task_identity(&self) -> Option<crate::SignalTaskIdentity> {
         None
@@ -1139,6 +1196,12 @@ where
     }
     fn set_signal_info(&mut self, info: [u8; crate::SIGNAL_INFO_SIZE]) -> Result<(), Errno> {
         self.inner.set_signal_info(info)
+    }
+    async fn deliver_signal(
+        &mut self,
+        delivery: crate::SignalDelivery,
+    ) -> crate::SignalDeliveryOutcome {
+        self.inner.deliver_signal(delivery).await
     }
     fn signal_task_identity(&self) -> Option<crate::SignalTaskIdentity> {
         self.inner.signal_task_identity()

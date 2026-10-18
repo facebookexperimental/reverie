@@ -69,6 +69,7 @@ mod vdso;
 
 // Shared with the transient opens in reverie-core and safeptrace.
 pub use backend::PtraceBackend;
+pub use failure::BrokenSignalApproval;
 pub use failure::CapturedPrefix;
 pub use failure::LegacyCleanupDiagnostics;
 pub use failure::LegacyFailureProjection;

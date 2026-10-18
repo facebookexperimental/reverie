@@ -61,24 +61,34 @@ pub enum UnsupportedOperation {
     /// the signal to `SIG_DFL` is not refused. The refusal's diagnostic names
     /// the signal and its use.
     ReservedSignal,
+    /// Delivering a caught signal that the tool selected and approved
+    /// ([`crate::Guest::deliver_signal`]), on a backend that does not deliver
+    /// signals that way. Nothing was delivered or changed; the backend's own
+    /// delivery path is unchanged.
+    SignalDelivery,
 }
 
-/// A backend's refusal of an injected syscall that it cannot perform, as
-/// distinct from a failure that Linux itself would report with the same
-/// errno.
+/// A backend's refusal of an injected syscall, or of a `Guest` operation,
+/// that it cannot perform, as distinct from a failure that Linux itself would
+/// report with the same errno.
 ///
 /// A backend records one when it refuses an operation that it does not
 /// implement, and [`Guest::take_unsupported_refusal`](crate::Guest::take_unsupported_refusal)
-/// reports it to the tool after the injection returns the refusal's errno.
+/// reports it to the tool after the injection returns the refusal's errno. A
+/// `Guest` operation that answers with a refusal directly, such as
+/// [`Guest::deliver_signal`](crate::Guest::deliver_signal), returns it
+/// instead, and its `errno` is the one the operation stands for (`ENOSYS`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct UnsupportedRefusal {
     /// The operation the backend refused.
     pub operation: UnsupportedOperation,
-    /// The errno the refused injection returned.
+    /// The errno the refused injection returned, or the one a refused `Guest`
+    /// operation stands for.
     pub errno: Errno,
-    /// The backend's one-line description of the refusal, naming the backend,
-    /// for the tool's diagnostics.
+    /// The backend's one-line description of the refusal, naming the backend
+    /// or, for a default trait method, the operation, for the tool's
+    /// diagnostics.
     pub diagnostic: &'static str,
 }
 

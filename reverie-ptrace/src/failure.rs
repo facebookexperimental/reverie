@@ -566,3 +566,23 @@ pub struct UntracedStubSyscall {
     /// The address of the `ud2` it faulted on.
     pub address: u64,
 }
+
+/// A Tool's signal callback approved a delivery (`Guest::deliver_signal`)
+/// and then broke the approval: an injection or a register write changed the
+/// stop the checks read, it returned another signal or none, or it executed a
+/// program. Delivering would hand the guest something the checks did not
+/// cover, and suppressing would lose an approved signal, so Reverie ends the
+/// run. It is a Tool defect.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "a signal callback approved signal {signal} for delivery to thread {tid} but {reason}; \
+     the run is ended rather than resume the guest unchecked"
+)]
+pub struct BrokenSignalApproval {
+    /// The thread the signal was approved for.
+    pub tid: i32,
+    /// The approved signal's number.
+    pub signal: i32,
+    /// How the callback broke the approval.
+    pub reason: &'static str,
+}

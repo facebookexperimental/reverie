@@ -609,19 +609,54 @@ impl TakenSignal {
 struct SignalResume {
     signal: Option<AnySignal>,
     reported: Option<TakenSignal>,
+    /// Whether the reporting callback approved the signal's delivery
+    /// (`Guest::deliver_signal`): its siginfo must then be the one its stop
+    /// recorded, so restoring it is no longer best-effort.
+    approved: bool,
     /// The siginfo the reporting callback chose for the signal
     /// (`Guest::set_signal_info`), written when the signal is resumed from a
     /// signal-delivery stop (`resume_with_signal`).
     replacement: Option<(AnySignal, SiginfoBytes)>,
 }
 
+/// A delivery that `Guest::deliver_signal` approved in the running signal
+/// callback, after every check against the kernel passed.
+#[derive(Clone, Copy, Debug)]
+struct SignalApproval {
+    /// The approved signal: the one the callback reports.
+    signal: AnySignal,
+    /// Whether an injection completed (`note_injection_stop`), or the Tool
+    /// wrote the registers (`Guest::set_regs`), after the approval. The
+    /// thread is then at another stop, or in another state, than the one the
+    /// checks read, so the approval no longer holds.
+    voided: bool,
+}
+
 /// What `Tool::handle_signal_event` left for a signal (`report_signal`).
 struct SignalVerdict {
     /// The signal to resume with, `None` if the callback suppressed it.
     signal: Option<AnySignal>,
+    /// Whether the callback approved `signal`'s delivery
+    /// (`Guest::deliver_signal`), and the approval held when it returned.
+    approved: bool,
     /// The siginfo the callback chose for its signal, with that signal
     /// (`Guest::set_signal_info`).
     replacement: Option<(AnySignal, SiginfoBytes)>,
+}
+
+/// Why a signal callback's verdict `signal` breaks the delivery it approved
+/// (`Guest::deliver_signal`), if it does: an injection after the approval
+/// voided it, or the callback returns another signal or none.
+fn approval_violation(approval: SignalApproval, signal: Option<AnySignal>) -> Option<&'static str> {
+    if approval.voided {
+        Some(
+            "an injection or a register write after the approval changed the stop it was checked at",
+        )
+    } else if signal != Some(approval.signal) {
+        Some("the callback returned another signal or none")
+    } else {
+        None
+    }
 }
 
 /// Linux's `siginfo_t` as bytes, the form a Tool reads and writes.
@@ -2605,6 +2640,15 @@ pub struct TracedTask<L: Tool> {
     /// signal (`Guest::set_signal_info`).
     replacement_signal_info: Option<(AnySignal, SiginfoBytes)>,
 
+    /// The delivery the running `Tool::handle_signal_event` approved
+    /// (`Guest::deliver_signal`), which `report_signal` enforces when the
+    /// callback returns.
+    signal_approval: Option<SignalApproval>,
+
+    /// Whether a check of `Guest::deliver_signal` failed in the running
+    /// `Tool::handle_signal_event`, after which it approves nothing more.
+    signal_delivery_mismatched: bool,
+
     /// Whether a syscall the running held-signal callback
     /// (`in_held_signal_callback`) injected, other than `restart_syscall`,
     /// returned
@@ -2870,6 +2914,8 @@ impl<L: Tool> TracedTask<L> {
             pending_signal_reported: false,
             reported_signal: None,
             replacement_signal_info: None,
+            signal_approval: None,
+            signal_delivery_mismatched: false,
             stale_private_step_trap: false,
             ptracer_waits: Arc::new(PtracerWaitOwner::default()),
             preinit_generation: None,
@@ -2950,6 +2996,8 @@ impl<L: Tool> TracedTask<L> {
             pending_signal_reported: false,
             reported_signal: None,
             replacement_signal_info: None,
+            signal_approval: None,
+            signal_delivery_mismatched: false,
             stale_private_step_trap: false,
             ptracer_waits,
             preinit_generation: None,
@@ -3027,6 +3075,8 @@ impl<L: Tool> TracedTask<L> {
             pending_signal_reported: false,
             reported_signal: None,
             replacement_signal_info: None,
+            signal_approval: None,
+            signal_delivery_mismatched: false,
             stale_private_step_trap: false,
             ptracer_waits,
             preinit_generation: None,
@@ -4934,6 +4984,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         Ok(SignalResume {
             signal: verdict.signal,
             reported: Some(taken),
+            approved: verdict.approved,
             replacement: verdict.replacement,
         })
     }
@@ -4964,6 +5015,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         SignalResume {
             signal,
             reported: None,
+            approved: false,
             replacement: None,
         }
     }
@@ -5120,16 +5172,24 @@ impl<L: Tool + 'static> TracedTask<L> {
         let SignalResume {
             signal,
             reported,
+            approved,
             replacement,
         } = resume;
         if let (Some(sig), Some(taken), Some(stop)) = (signal, reported, self.latest_injection_stop)
             && sig == taken.signal
         {
             // Main writes no siginfo here, so a failed write must not fail
-            // the resume. A task that is gone fails the resume instead.
+            // the resume. A task that is gone fails the resume instead. An
+            // approved delivery (`Guest::deliver_signal`) is of exactly the
+            // recorded instance, so for it a failed write fails the resume
+            // rather than deliver the signal with another siginfo.
             if stop.is_some()
                 && let Err(err) = task.setsiginfo(&taken.siginfo.0)
             {
+                if approved {
+                    tracing::error!("could not restore the siginfo of approved {sig:?}: {err}");
+                    return Err(err);
+                }
                 tracing::debug!("could not restore the siginfo of {sig:?}: {err}");
             }
             // An unreadable mask is counted as blocking: main reads nothing
@@ -5190,6 +5250,27 @@ impl<L: Tool + 'static> TracedTask<L> {
         }
     }
 
+    /// Ends the run for a signal callback that broke the delivery it
+    /// approved (`Guest::deliver_signal`), with a named failure, and returns
+    /// the error that stops the task.
+    fn fail_broken_approval(&self, approval: SignalApproval, reason: &'static str) -> TraceError {
+        let failure = crate::BrokenSignalApproval {
+            tid: self.tid().as_raw(),
+            signal: approval.signal.raw(),
+            reason,
+        };
+        tracing::error!("{failure}");
+        self.fatal_session().fail_at(
+            BackendFailure {
+                pid: self.pid(),
+                tid: self.tid(),
+                phase: "signal callback after an approved delivery",
+            },
+            anyhow::Error::new(failure).into(),
+        );
+        Errno::ENOTRECOVERABLE.into()
+    }
+
     /// Runs `Tool::handle_signal_event` for `sig` and returns its verdict.
     ///
     /// For a held signal (`held`, from `report_held_signal`), a returning
@@ -5210,6 +5291,8 @@ impl<L: Tool + 'static> TracedTask<L> {
         let outer = std::mem::replace(&mut self.in_signal_callback, true);
         let outer_reported = self.reported_signal.replace((sig, info));
         let outer_replacement = self.replacement_signal_info.take();
+        let outer_approval = self.signal_approval.take();
+        let outer_mismatched = std::mem::replace(&mut self.signal_delivery_mismatched, false);
         let outer_replaced =
             std::mem::replace(&mut self.signal_callback_replaced_restart_block, false);
         let outer_guest_block =
@@ -5235,16 +5318,27 @@ impl<L: Tool + 'static> TracedTask<L> {
         self.in_signal_callback = outer;
         self.reported_signal = outer_reported;
         let replacement = std::mem::replace(&mut self.replacement_signal_info, outer_replacement);
+        let approval = std::mem::replace(&mut self.signal_approval, outer_approval);
+        self.signal_delivery_mismatched = outer_mismatched;
         self.in_held_signal_callback = outer_held;
         self.signal_callback_replaced_restart_block = outer_replaced;
         self.signal_callback_guest_restart_block = outer_guest_block;
         let signal = self
             .ordinary_callback_errno("ptrace signal callback", result)
             .await?;
+        if let Some(approval) = approval
+            && let Some(reason) = approval_violation(approval, signal)
+        {
+            // A Tool defect: delivering would hand the guest something the
+            // checks did not cover, and suppressing would lose an approved
+            // signal. Neither is safe, so the guest is not resumed.
+            return Err(self.fail_broken_approval(approval, reason));
+        }
         self.ordinary_trace_continuation()?;
         self.timer.finalize_requests();
         Ok(SignalVerdict {
             signal,
+            approved: approval.is_some(),
             replacement,
         })
     }
@@ -5405,6 +5499,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                 let resume = SignalResume {
                     signal,
                     reported: taken,
+                    approved: verdict.approved,
                     replacement: verdict.replacement,
                 };
                 self.resume_with_signal(task, resume).await
@@ -5427,6 +5522,14 @@ impl<L: Tool + 'static> TracedTask<L> {
         self.in_syscall_callback = false;
         self.reported_signal = None;
         self.replacement_signal_info = None;
+        self.signal_delivery_mismatched = false;
+        if let Some(approval) = self.signal_approval.take() {
+            // The callback that approved a delivery executed a program, which
+            // never returns to it: the approved signal would be lost, and the
+            // replacement image would run on unchecked. As in `report_signal`,
+            // the guest is not resumed.
+            return Err(self.fail_broken_approval(approval, "then executed a program"));
+        }
         self.in_held_signal_callback = false;
         self.signal_callback_replaced_restart_block = false;
         self.signal_callback_guest_restart_block = false;
@@ -7021,6 +7124,18 @@ impl<L: Tool + 'static> TracedTask<L> {
                     assert!(Arc::ptr_eq(&self.process_state, &former_task.process_state));
                     self.ordinary_exec.lock().unwrap().remove(&former);
                     session.finished(&former_slot.stop);
+                    // The exec'ing thread was stopped for its whole callback,
+                    // so an approval it holds means its own signal callback
+                    // approved a delivery and then executed a program, which
+                    // never returns to it. As in `handle_exec_event`, which
+                    // that thread's own loop never reaches, the run ends: the
+                    // named failure is published, and the fatal session stops
+                    // the guest. The handover below still runs, so the old
+                    // task is retired as usual.
+                    if let Some(approval) = former_task.signal_approval.take() {
+                        let _ =
+                            former_task.fail_broken_approval(approval, "then executed a program");
+                    }
                     #[cfg(test)]
                     let timer_before = EXEC_TIMER_TRANSFERS.with(|control| {
                         control.borrow().as_ref().map(|_| {
@@ -7087,6 +7202,11 @@ impl<L: Tool + 'static> TracedTask<L> {
                     self.pending_signal_taken = None;
                     self.pending_signal_reported = false;
                     self.in_signal_callback = false;
+                    // A callback that approved a delivery and was cancelled
+                    // here, with its thread, broke nothing: Linux loses that
+                    // signal with the thread.
+                    self.signal_approval = None;
+                    self.signal_delivery_mismatched = false;
                     self.signal_callback_replaced_restart_block = false;
                     self.signal_callback_guest_restart_block = false;
                     self.in_held_signal_callback = false;
@@ -8345,6 +8465,11 @@ impl<L: Tool + 'static> TracedTask<L> {
     /// (`is_group_stop_unless_filtered`); no held signal is reported there
     /// (`report_held_signal`), and only a reported one uses the record.
     fn note_injection_stop(&mut self, wait: &Wait) -> Result<(), TraceError> {
+        // Every completed injection moves the thread off the stop an approved
+        // delivery was checked at.
+        if let Some(approval) = &mut self.signal_approval {
+            approval.voided = true;
+        }
         if let Wait::Stopped(stopped, event) = wait {
             self.latest_injection_stop = Some(match event {
                 event
@@ -8660,6 +8785,13 @@ impl<L: Tool + 'static> TracedTask<L> {
     }
 
     async fn do_tail_inject(&mut self, nr: Sysno, args: SyscallArgs) -> ! {
+        // A tail injection never returns to the signal callback that approved
+        // a delivery (`Guest::deliver_signal`), so `report_signal` would never
+        // enforce the approval. It is refused before anything runs.
+        if let Some(approval) = self.signal_approval {
+            let error = self.fail_broken_approval(approval, "then made a tail injection");
+            self.abort(Err(error)).await
+        }
         match self.inner_tail_inject(nr, args).await {
             Ok(_) => {
                 // Drop the handle_syscall_event future.
@@ -9220,6 +9352,98 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
         Ok(())
     }
 
+    /// Checks the approval at the reported signal's own delivery stop, or at
+    /// its held-signal report, with read-only requests: `PTRACE_GETSIGMASK`
+    /// (the mask the frame saves), procfs `SigBlk` (the mask in effect) and
+    /// the guest's registers (`orig_rax`, `rax`). The signal's identity is
+    /// its recorded `TakenSignal`, never a live `PTRACE_GETSIGINFO`, which
+    /// after an injection describes the injection's stop. When every check
+    /// passes the approval is recorded, and `report_signal` enforces it when
+    /// the callback returns.
+    async fn deliver_signal(
+        &mut self,
+        delivery: reverie::SignalDelivery,
+    ) -> reverie::SignalDeliveryOutcome {
+        use reverie::SignalDeliveryOutcome as Outcome;
+        use reverie::SignalDeliveryUnavailable as Unavailable;
+        let unavailable = Outcome::Unavailable;
+        let Some((reported, record)) = self.reported_signal.filter(|_| self.in_signal_callback)
+        else {
+            return unavailable(Unavailable::NotInSignalCallback);
+        };
+        if delivery.signal != reported.raw() {
+            return unavailable(Unavailable::NotTheReportedSignal {
+                reported: reported.raw(),
+            });
+        }
+        if record.is_none() {
+            return unavailable(Unavailable::NoSignalRecord);
+        }
+        if self.signal_approval.is_some() {
+            return unavailable(Unavailable::AlreadyApproved);
+        }
+        if self.signal_delivery_mismatched {
+            return unavailable(Unavailable::AfterMismatch);
+        }
+        if delivery.unchecked_mask & reverie::signal_set_bit(delivery.signal) != 0 {
+            return unavailable(Unavailable::UncheckedSignal);
+        }
+        if self.injected_syscall_frame.is_some() {
+            return unavailable(Unavailable::FrameModeStop);
+        }
+        if self.latest_injection_stop == Some(None) {
+            return unavailable(Unavailable::NotADeliveryStop);
+        }
+        if thread_may_be_seccomp_filtered() {
+            return unavailable(Unavailable::TracerFiltered);
+        }
+        if !cfg!(target_arch = "x86_64") {
+            return unavailable(Unavailable::UnsupportedArchitecture);
+        }
+        let task = self.assume_stopped();
+        let read_failure = |error: TraceError| match error {
+            TraceError::Died(_) | TraceError::Errno(Errno::ENOENT | Errno::ESRCH) => {
+                Unavailable::Gone
+            }
+            TraceError::Errno(errno) => Unavailable::Unreadable(errno),
+        };
+        let kernel = (|| -> Result<reverie::KernelDeliveryState, TraceError> {
+            let frame_mask = task.getsigmask()?;
+            let current_mask = blocked_signal_mask(self.tid())?;
+            let regs = self.read_guest_registers(&task)?;
+            Ok(reverie::KernelDeliveryState {
+                frame_mask,
+                current_mask,
+                orig_syscall: regs.orig_syscall() as i64,
+                ret: regs.ret() as i64,
+            })
+        })();
+        let kernel = match kernel {
+            Ok(kernel) => kernel,
+            Err(error) => return unavailable(read_failure(error)),
+        };
+        if kernel.current_mask & reverie::signal_set_bit(delivery.signal) != 0 {
+            return unavailable(Unavailable::BlockedAtResume);
+        }
+        match delivery.check(&kernel) {
+            Ok(()) => {
+                self.signal_approval = Some(SignalApproval {
+                    signal: reported,
+                    voided: false,
+                });
+                Outcome::Accepted
+            }
+            Err(mismatch) => {
+                self.signal_delivery_mismatched = true;
+                tracing::debug!(
+                    "[{}] signal delivery of {reported:?} does not match the kernel: {mismatch:?}",
+                    self.tid()
+                );
+                Outcome::Mismatch(mismatch)
+            }
+        }
+    }
+
     #[inline]
     fn tid(&self) -> Pid {
         self.tid
@@ -9322,6 +9546,11 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
 
     async fn set_regs(&mut self, regs: libc::user_regs_struct) -> Result<(), reverie::Error> {
         let task = self.assume_stopped();
+        // The checks of an approved delivery read these registers
+        // (`Guest::deliver_signal`); a write voids it, as an injection does.
+        if let Some(approval) = &mut self.signal_approval {
+            approval.voided = true;
+        }
 
         if self.in_held_signal_callback {
             // The registers this write replaces may hold the guest's
@@ -9587,6 +9816,9 @@ mod breakpoint_word_tests {
     }
 }
 
+#[cfg(test)]
+#[path = "task_deliver_signal_tests.rs"]
+mod deliver_signal_tests;
 #[cfg(test)]
 #[path = "task_exec_owner_tests.rs"]
 mod exec_owner_tests;
