@@ -182,6 +182,21 @@ pub trait Tool {
     /// Called when a signal of the given value is received before any handlers
     /// for that signal are evaluated
     fn handle_signal_event(&self, _signal: i32) {}
+
+    /// Called, in place of [`Tool::handle_signal_event`], when `signal`
+    /// arrives with the siginfo `info` the kernel delivered, before any
+    /// handler for it is evaluated. Returns whether the guest's action for
+    /// the signal runs: false suppresses this instance, so the guest's
+    /// handler, default action or `SIG_IGN` is not applied to it. The tool may
+    /// rewrite `info`; a guest handler then gets the rewritten siginfo.
+    ///
+    /// The default calls `handle_signal_event` and runs the guest's action,
+    /// as before this method existed.
+    fn handle_signal_event_with_info(&self, signal: i32, info: &mut libc::siginfo_t) -> bool {
+        let _ = info;
+        self.handle_signal_event(signal);
+        true
+    }
     /// This is called early on from sbr_init to get a list of functions we want
     /// to be detoured. Because this is called very early on, this function
     /// should not be doing *any* allocations or library calls.

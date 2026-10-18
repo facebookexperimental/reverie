@@ -167,6 +167,16 @@ pub struct BackendCapabilities {
     /// never schedules an exit for them.
     pub reports_child_exit_publication: bool,
 
+    /// The kernel's own child-exit `SIGCHLD` (`si_code` `CLD_EXITED`,
+    /// `CLD_KILLED` or `CLD_DUMPED`) reaches the tool's signal callback with
+    /// the siginfo the kernel gave it ([`Guest::signal_info`](crate::Guest::signal_info)),
+    /// and the callback can suppress that instance or replace its siginfo
+    /// ([`Guest::set_signal_info`](crate::Guest::set_signal_info)). A tool that
+    /// also sends its own copy of a child's exit notification can then deliver
+    /// one of the two and drop the other, as Linux delivers one `SIGCHLD` per
+    /// child exit.
+    pub reports_kernel_child_exit_signals: bool,
+
     /// The backend owns guest signal delivery: a host signal sent to a host
     /// task cannot reach a guest thread, and the backend offers a run-scoped
     /// process signal control (see
@@ -273,6 +283,7 @@ impl BackendCapabilities {
         supports_madvise: true,
         supports_madv_dontneed: true,
         reports_child_exit_publication: true,
+        reports_kernel_child_exit_signals: true,
         provides_process_signal_control: false,
         emulates_child_waits: false,
         virtualizes_guest_sigalrm: false,
@@ -302,6 +313,8 @@ impl BackendCapabilities {
         runs_exit_robust_list: false,
         supports_parked_write_signal_interruption: false,
         reports_child_exit_publication: false,
+        // Its in-guest runtime gives the tool no siginfo.
+        reports_kernel_child_exit_signals: false,
         virtualizes_guest_sigalrm: true,
         supports_blocked_wait_signal_interruption: false,
         delivers_preemption_timer_events: false,
@@ -344,6 +357,9 @@ impl BackendCapabilities {
         requires_thread_directed_process_signals: true,
         supports_parked_write_signal_interruption: false,
         reports_child_exit_publication: false,
+        // The callback gets the siginfo and can suppress or replace it, but no
+        // run has yet shown the kernel's own child-exit copy reaching it.
+        reports_kernel_child_exit_signals: false,
         supports_blocked_wait_signal_interruption: false,
         delivers_preemption_timer_events: false,
         promotes_open_files_before_native_lifecycle: true,
@@ -361,6 +377,8 @@ impl BackendCapabilities {
         provides_process_signal_control: true,
         emulates_child_waits: true,
         reports_child_exit_publication: false,
+        // No run has shown the kernel's own child-exit copy reaching the tool.
+        reports_kernel_child_exit_signals: false,
         supports_blocked_wait_signal_interruption: false,
         delivers_preemption_timer_events: false,
         reports_sigreturns: false,
@@ -400,6 +418,7 @@ mod tests {
             "supports_madvise": true,
             "supports_madv_dontneed": true,
             "reports_child_exit_publication": true,
+            "reports_kernel_child_exit_signals": true,
             "provides_process_signal_control": false,
             "emulates_child_waits": false,
             "virtualizes_guest_sigalrm": false,
@@ -459,6 +478,7 @@ mod tests {
                 "runs_exit_robust_list": false,
                 "supports_parked_write_signal_interruption": false,
                 "reports_child_exit_publication": false,
+                "reports_kernel_child_exit_signals": false,
                 "virtualizes_guest_sigalrm": true,
                 "supports_blocked_wait_signal_interruption": false,
                 "delivers_preemption_timer_events": false,
@@ -507,6 +527,7 @@ mod tests {
                 "requires_thread_directed_process_signals": true,
                 "supports_parked_write_signal_interruption": false,
                 "reports_child_exit_publication": false,
+                "reports_kernel_child_exit_signals": false,
                 "supports_blocked_wait_signal_interruption": false,
                 "delivers_preemption_timer_events": false,
                 "promotes_open_files_before_native_lifecycle": true,
@@ -527,6 +548,7 @@ mod tests {
                 "provides_process_signal_control": true,
                 "emulates_child_waits": true,
                 "reports_child_exit_publication": false,
+                "reports_kernel_child_exit_signals": false,
                 "supports_blocked_wait_signal_interruption": false,
                 "delivers_preemption_timer_events": false,
                 "reports_sigreturns": false,

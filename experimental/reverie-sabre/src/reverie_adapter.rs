@@ -544,6 +544,35 @@ where
     /// because SaBRe's central handler has usually already committed to the guest
     /// action by the time this runs.
     pub fn handle_signal(&self, signal: Signal) -> Result<Option<Signal>, Errno> {
+        self.handle_signal_reporting(signal, &mut None)
+    }
+
+    /// [`Self::handle_signal`], with the siginfo the kernel delivered the
+    /// signal with, which the tool reads through [`Guest::signal_info`]. A
+    /// replacement the tool makes ([`Guest::set_signal_info`]) is written back
+    /// to `info` when the signal is delivered.
+    pub fn handle_signal_with_info(
+        &self,
+        signal: Signal,
+        info: &mut libc::siginfo_t,
+    ) -> Result<Option<Signal>, Errno> {
+        let mut bytes = Some(siginfo_bytes(info));
+        let delivered = self.handle_signal_reporting(signal, &mut bytes)?;
+        if let (Some(_), Some(bytes)) = (delivered, bytes) {
+            // SAFETY: `siginfo_t` is plain data of exactly this size
+            // (`siginfo_bytes`).
+            *info = unsafe { std::mem::transmute_copy(&bytes) };
+        }
+        Ok(delivered)
+    }
+
+    /// Runs the tool's signal callback. `info` is the siginfo it reads, and on
+    /// return the siginfo to deliver: the tool's replacement, if it made one.
+    fn handle_signal_reporting(
+        &self,
+        signal: Signal,
+        info: &mut Option<[u8; reverie::SIGNAL_INFO_SIZE]>,
+    ) -> Result<Option<Signal>, Errno> {
         let tid = current_tid();
         let pid = current_pid();
         let state = self.thread_state(tid).map_err(remote_rpc_error)?;
@@ -562,8 +591,9 @@ where
             None,
             None,
         );
+        guest.signal_info = *info;
 
-        match poll_once(self.tool.handle_signal_event(&mut guest, signal)) {
+        let result = match poll_once(self.tool.handle_signal_event(&mut guest, signal)) {
             Poll::Ready(result) => result,
             Poll::Pending => {
                 // Same failure mode the RDTSC path guards: a tool that suspends
@@ -574,7 +604,9 @@ where
                 );
                 Err(Errno::EIO)
             }
-        }
+        };
+        *info = guest.signal_info();
+        result
     }
 
     /// Forwards a runtime-bookkept syscall through the shared tool and remote
@@ -956,6 +988,10 @@ where
     special_inject: Option<&'inject mut (dyn FnMut() -> usize + Send + Sync)>,
     child_threads: Option<ChildThreadRegistry<'state, T>>,
     tail: Option<&'state TailResult>,
+    /// The siginfo of the signal being reported, while
+    /// `Tool::handle_signal_event` runs (`Guest::signal_info`), with any
+    /// replacement the tool made (`Guest::set_signal_info`).
+    signal_info: Option<[u8; reverie::SIGNAL_INFO_SIZE]>,
 }
 
 impl<'state, 'inject, T> SabreGuest<'state, 'inject, T>
@@ -991,6 +1027,7 @@ where
             special_inject,
             child_threads,
             tail: None,
+            signal_info: None,
         }
     }
 
@@ -1075,6 +1112,19 @@ where
     // cannot attribute any delivered syscall to a runtime bootstrap.
     fn is_backend_runtime_bootstrap(&self) -> bool {
         false
+    }
+
+    fn signal_info(&self) -> Option<[u8; reverie::SIGNAL_INFO_SIZE]> {
+        self.signal_info
+    }
+
+    fn set_signal_info(&mut self, info: [u8; reverie::SIGNAL_INFO_SIZE]) -> Result<(), Errno> {
+        let original = self.signal_info.ok_or(Errno::EINVAL)?;
+        if info[..4] != original[..4] {
+            return Err(Errno::EINVAL);
+        }
+        self.signal_info = Some(info);
+        Ok(())
     }
 
     // SaBRe's guest memory access is the shared LocalMemory; the review
@@ -1479,6 +1529,13 @@ impl Stack for SabreStack {
 fn align_up(value: usize, align: usize) -> usize {
     debug_assert!(align.is_power_of_two());
     (value + align - 1) & !(align - 1)
+}
+
+/// The raw bytes of `info`, as `Guest::signal_info` reports them.
+fn siginfo_bytes(info: &libc::siginfo_t) -> [u8; reverie::SIGNAL_INFO_SIZE] {
+    const _: () = assert!(std::mem::size_of::<libc::siginfo_t>() == reverie::SIGNAL_INFO_SIZE);
+    // SAFETY: `siginfo_t` is plain data of exactly this size (checked above).
+    unsafe { std::mem::transmute_copy(info) }
 }
 
 #[cfg(test)]
@@ -1901,6 +1958,116 @@ mod tests {
         );
         drop(adapter);
 
+        assert!(server_thread.join().unwrap().is_ok());
+    }
+
+    static SIGNAL_INFOS: Mutex<Vec<Option<(i32, i32, i32)>>> = Mutex::new(Vec::new());
+
+    /// Records the signal number, `si_code` and `si_pid` its signal callback
+    /// sees through `Guest::signal_info`, suppresses a child-exit SIGCHLD, and
+    /// gives an `SI_USER` one the siginfo of child 99's exit.
+    #[derive(Default)]
+    struct SignalInfoTool;
+
+    #[reverie::tool]
+    impl ReverieTool for SignalInfoTool {
+        type GlobalState = ();
+        type ThreadState = ();
+
+        async fn handle_signal_event<G: Guest<Self>>(
+            &self,
+            guest: &mut G,
+            signal: Signal,
+        ) -> Result<Option<Signal>, Errno> {
+            let fields = guest.signal_info().map(|bytes| {
+                let field = |at: usize| i32::from_ne_bytes(bytes[at..at + 4].try_into().unwrap());
+                (field(0), field(8), field(16))
+            });
+            SIGNAL_INFOS.lock().push(fields);
+            if let (Some(mut bytes), Some((_, libc::SI_USER, _))) = (guest.signal_info(), fields) {
+                bytes[8..12].copy_from_slice(&libc::CLD_EXITED.to_ne_bytes());
+                bytes[16..20].copy_from_slice(&99i32.to_ne_bytes());
+                guest.set_signal_info(bytes).unwrap();
+                // Another signal's siginfo is refused.
+                bytes[0..4].copy_from_slice(&libc::SIGUSR1.to_ne_bytes());
+                assert_eq!(guest.set_signal_info(bytes), Err(Errno::EINVAL));
+            }
+            Ok(match fields {
+                Some((_, libc::CLD_EXITED, _)) => None,
+                _ => Some(signal),
+            })
+        }
+    }
+
+    /// A signal reported with its siginfo shows it to the tool through
+    /// `Guest::signal_info`; the tool's suppression is returned, and its
+    /// replacement siginfo is written back. One reported without it shows
+    /// none, and has none to replace.
+    #[test]
+    fn remote_adapter_reports_the_siginfo_and_the_tools_suppression() {
+        let path = std::path::Path::new("/tmp").join(format!(
+            "reverie-sabre-siginfo-{}-{}.sock",
+            std::process::id(),
+            RPC_SOCKET_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let server_path = path.clone();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+        let server_thread = thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let server =
+                        reverie_rpc_transport::RpcServer::bind(&server_path, Arc::new(()), ())
+                            .unwrap();
+                    ready_tx.send(()).unwrap();
+                    server.serve_one().await
+                })
+        });
+        ready_rx.recv().unwrap();
+        SIGNAL_INFOS.lock().clear();
+
+        let adapter = RemoteReverieAdapter::<SignalInfoTool>::connect(&path).unwrap();
+        // SAFETY: an all-zero siginfo_t is valid plain data.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        info.si_signo = libc::SIGCHLD;
+        info.si_code = libc::CLD_EXITED;
+        // `si_pid` is the first field after the three ints and their padding.
+        // SAFETY: the field is inside the zeroed siginfo_t.
+        unsafe {
+            *(std::ptr::addr_of_mut!(info) as *mut u8)
+                .add(16)
+                .cast::<i32>() = 4242;
+        }
+        assert_eq!(
+            adapter.handle_signal_with_info(Signal::SIGCHLD, &mut info),
+            Ok(None)
+        );
+        assert_eq!(info.si_code, libc::CLD_EXITED);
+        info.si_code = libc::SI_USER;
+        assert_eq!(
+            adapter.handle_signal_with_info(Signal::SIGCHLD, &mut info),
+            Ok(Some(Signal::SIGCHLD))
+        );
+        // SAFETY: `si_pid` is valid for a SIGCHLD siginfo.
+        assert_eq!(
+            (info.si_code, unsafe { info.si_pid() }),
+            (libc::CLD_EXITED, 99)
+        );
+        assert_eq!(
+            adapter.handle_signal(Signal::SIGCHLD),
+            Ok(Some(Signal::SIGCHLD))
+        );
+        assert_eq!(
+            *SIGNAL_INFOS.lock(),
+            vec![
+                Some((libc::SIGCHLD, libc::CLD_EXITED, 4242)),
+                Some((libc::SIGCHLD, libc::SI_USER, 4242)),
+                None,
+            ]
+        );
+        drop(adapter);
         assert!(server_thread.join().unwrap().is_ok());
     }
 
