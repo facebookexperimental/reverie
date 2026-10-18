@@ -38,10 +38,14 @@ pub mod native_exec_arguments;
 pub mod native_exec_fds;
 #[cfg(feature = "exec-native-injection")]
 pub mod native_exec_mappings;
+#[cfg(feature = "coordinator-rpc")]
+pub mod patcher;
 pub mod protect;
 pub mod restorer;
 #[cfg(feature = "coordinator-rpc")]
 pub mod rpc;
+#[cfg(feature = "coordinator-rpc")]
+pub mod runtime_seam;
 pub mod sigalrm;
 pub mod signal;
 pub mod support;

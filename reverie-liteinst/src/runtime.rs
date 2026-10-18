@@ -114,16 +114,15 @@ pub(crate) use reverie_inguest::guest::clock::leave_rcb_handler;
 pub(crate) use reverie_inguest::guest::clock::read_guest_rcb_clock;
 pub(crate) use reverie_inguest::guest::event::InstructionEventKind;
 use reverie_inguest::guest::instruction::FaultSite;
-use reverie_inguest::guest::instruction::InstructionFaultSeam;
 pub(crate) use reverie_inguest::guest::instruction::InstructionSubscriptions;
 use reverie_inguest::guest::instruction::PatchOutcome;
 pub(crate) use reverie_inguest::guest::instruction::cpuid_interception_enabled;
 use reverie_inguest::guest::instruction::decode_instruction;
 use reverie_inguest::guest::instruction::deliver_default_sigsegv;
 use reverie_inguest::guest::instruction::enable_instruction_faulting;
-use reverie_inguest::guest::instruction::install_instruction_signal_handler;
 pub(crate) use reverie_inguest::guest::instruction::preflight_instruction_faulting;
 use reverie_inguest::guest::instruction::set_all_instruction_native;
+use reverie_inguest::guest::patcher::Patcher;
 use reverie_inguest::guest::protect::close_range_preserving_fds;
 use reverie_inguest::guest::protect::fd_arg;
 use reverie_inguest::guest::protect::protect_runtime_control;
@@ -134,6 +133,9 @@ pub use reverie_inguest::guest::protect::reserve_tool_output_fd;
 use reverie_inguest::guest::protect::set_process_forks_allowed;
 use reverie_inguest::guest::protect::syscall_targets_event_fd;
 pub use reverie_inguest::guest::protect::tool_output_fd;
+use reverie_inguest::guest::runtime_seam::PatcherRef;
+use reverie_inguest::guest::runtime_seam::RuntimeSeam;
+use reverie_inguest::guest::runtime_seam::install_instruction_handler;
 pub(crate) use reverie_inguest::guest::signal::prepare_guest_signal_state;
 pub(crate) use reverie_inguest::guest::signal::reserved_signal_mask;
 pub(crate) use reverie_inguest::guest::signal::signal_action_supported;
@@ -742,22 +744,18 @@ fn install_runtime(
     };
     #[cfg(not(feature = "exec-private-init"))]
     let config = runtime_config_from_env()?;
-    // SAFETY: LiteInst's seam functions are the code this runtime's own
+    // SAFETY: LiteInst's patcher methods are the code this runtime's own
     // SIGSEGV handler ran before the handler moved to reverie-inguest: they
     // read the arenas and site table recorded at startup and patch a claimed
-    // site, with raw syscalls and no allocation.
+    // site, with raw syscalls, allocating only from the signal-safe patch
+    // allocator reserved at startup.
     unsafe {
-        install_instruction_signal_handler(
-            &INSTRUCTION_FAULT_SEAM,
-            instructions,
-            config.use_alt_stack,
-        )
+        install_instruction_handler(&LITEINST_PATCHER_REF, instructions, config.use_alt_stack)
     }?;
     // The authenticated route reuses its inherited filter and atomically
     // replaces the bootstrap frontend; ordinary installation still adds its
     // own filter after publishing the same dispatcher.
-    let dispatcher =
-        Box::new(unsafe { InGuestDispatcher::new(LiteinstSeam::new(stats, publication)) });
+    let dispatcher = Box::new(unsafe { InGuestDispatcher::new(LiteinstSeam::new(stats)) });
     #[cfg(feature = "exec-private-init")]
     if let Some(initial) = initial {
         match initial {
@@ -1693,7 +1691,7 @@ pub(crate) fn record_fork_child_dispatch(
             stats.record_path(crate::LiteinstDispatchPath::InGuestSigsys);
             stats.record_inherited_entry(crate::stats::InheritedEntry::Sigsys);
             if stats.is_enabled() {
-                record_enabled_fallback_stats(stats, event.instruction_pointer);
+                stats.record_path(LITEINST_PATCHER.fallback_path(event.instruction_pointer));
             }
         }
         SyscallDispatch::Trap => {}
@@ -2671,11 +2669,6 @@ unsafe fn patch_instruction_fault(
     PatchOutcome::Resume(unsafe { (*hook).trampoline().address() })
 }
 
-static INSTRUCTION_FAULT_SEAM: InstructionFaultSeam = InstructionFaultSeam {
-    locate: locate_instruction_fault,
-    patch: patch_instruction_fault,
-};
-
 unsafe fn installed_instruction_hook(context: *mut HookContext, kind: InstructionEventKind) {
     if let Some(context) = unsafe { context.as_ref() }
         && let Some(site) = find_site(context.instruction_pointer)
@@ -2800,7 +2793,7 @@ unsafe extern "C" fn unpublished_syscall_hook(context: *mut HookContext) {
     record_fallback_dispatch(event.number);
     let stats = crate::stats::GuestStatsHooks::current();
     if stats.is_enabled() {
-        record_enabled_fallback_stats(stats, event.instruction_pointer);
+        stats.record_path(LITEINST_PATCHER.fallback_path(event.instruction_pointer));
     }
     if unpublished_read_write_allowed(event.number) {
         // No ToolCallbackGuard spans guest I/O: a nested guest handler's own
@@ -2860,83 +2853,21 @@ unsafe fn locate_syscall_site(resume_address: u64) -> Option<u64> {
     None
 }
 
-type RecordFallbackStats = fn(crate::stats::GuestStatsHooks, u64);
+// LiteInst's patcher behind the shared runtime (reverie_inguest::guest::patcher):
+// the arena-based location of the syscall instruction, site and instruction
+// patching, mapping invalidation, and its per-syscall counters. The shared
+// runtime owns the dispatcher, the continuation and the statistics paths.
+struct LiteinstPatcher;
 
-struct LiteinstSeam {
-    stats: crate::stats::GuestStatsHooks,
-    record_fallback_stats: RecordFallbackStats,
-    publication: PatchPublication,
-}
-
-impl LiteinstSeam {
-    fn new(stats: crate::stats::GuestStatsHooks, publication: PatchPublication) -> Self {
-        Self {
-            stats,
-            record_fallback_stats: if stats.is_enabled() {
-                record_enabled_fallback_stats
-            } else {
-                record_disabled_fallback_stats
-            },
-            publication,
-        }
-    }
-}
-
-// LiteInst's part of the shared SIGSYS dispatcher
-// (reverie_inguest::guest::trap_dispatch): its compatibility Tools' fork and
-// wait fallbacks, the arena-based location of the syscall instruction, site
-// patching, and its counters and statistics.
-// SAFETY: intercept runs the event's syscall (through process_syscall) only
-// when it returns true; when it returns false it has run nothing.
-unsafe impl TrapSeam for LiteinstSeam {
-    fn record_path(&self, path: TrapPath) {
-        self.stats.record_path(match path {
-            TrapPath::NestedSigsys => crate::LiteinstDispatchPath::InGuestNestedSigsys,
-            TrapPath::Sigsys => crate::LiteinstDispatchPath::InGuestSigsys,
-            TrapPath::PhysicalSigsys => crate::LiteinstDispatchPath::InGuestPhysicalSigsys,
-            TrapPath::FallbackCompletion => crate::LiteinstDispatchPath::FallbackCompletionSigsys,
-            TrapPath::FallbackRefusal => crate::LiteinstDispatchPath::FallbackRefusal,
-        });
-    }
-
-    fn observe_nested(&self, event: &SyscallEvent) {
-        observe_mapping_generation(event);
-    }
-
-    fn intercept(&self, event: &mut PreloadSyscallEvent) -> bool {
-        let mode = TOOL_MODE.load(Ordering::Relaxed);
-        let args = event.args();
-        let compatibility_trap_fallback =
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            (event.number() == libc::SYS_clone && clone_is_fork_like(args[0], args[1]))
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            || event.number() == libc::SYS_wait4;
-        // TODO-HUMAN-REVIEW(PR-127): Review fork and wait libc-wrapper trap fallbacks.
-        if mode != TOOL_REVERIE && compatibility_trap_fallback {
-            let mut trapped = SyscallEvent {
-                number: event.number(),
-                args,
-                instruction_pointer: event.instruction_pointer(),
-                result: UNSET_RESULT,
-                context: 0,
-                dispatch: SyscallDispatch::Trap,
-                guest_pkru: event.guest_pkru(),
-            };
-            // SAFETY: process_syscall traces the event for the compatibility Tool
-            // and runs its syscall natively, as the safe
-            // reverie_inguest::dispatch::SyscallEvent::forward may for any event.
-            unsafe {
-                process_syscall(&mut trapped);
-            }
-            event.set_native_result(reverie_inguest::trap::NativeSyscallResult {
-                result: trapped.result,
-                pkru: trapped.guest_pkru,
-            });
-            return true;
-        }
-        false
-    }
-
+// SAFETY: a declining answer leaves the site's code unchanged.
+// - Instruction path: Emulate follows only a refusal that proved the code
+//   untouched (SITE_UNPATCHABLE) or a full site table (nothing claimed or
+//   written); every other installation failure is Failed.
+// - Syscall path: NotPatched follows patching off, an unclaimable site, a site
+//   another thread is installing or has declined, or a failed installation
+//   that cannot have written the jump; a failure that may have
+//   (InstallFailure::possibly_written) ends the guest instead.
+unsafe impl Patcher for LiteinstPatcher {
     unsafe fn syscall_site(&self, resume_address: u64) -> u64 {
         // SAFETY: a SIGSYS-delivered trap's arrival resume address follows code
         // that was just executing (the seam's contract); locate_syscall_site
@@ -2967,7 +2898,7 @@ unsafe impl TrapSeam for LiteinstSeam {
                             site,
                             installed_entries::selected().syscall,
                             SiteHookPolicy {
-                                publication: self.publication,
+                                publication: patch_publication(),
                                 entry_proof: EntryProof::Required,
                                 unpublished_read_write: unpublished_read_write_allowed(number),
                             },
@@ -3031,8 +2962,46 @@ unsafe impl TrapSeam for LiteinstSeam {
         SitePatch::NotPatched
     }
 
-    fn continuation_allowed(&self) -> bool {
-        TOOL_MODE.load(Ordering::Relaxed) == TOOL_REVERIE
+    fn fallback_path(&self, address: u64) -> crate::LiteinstDispatchPath {
+        #[cfg(test)]
+        ENABLED_FALLBACK_CLASSIFICATIONS.fetch_add(1, Ordering::Relaxed);
+        if !SITE_PATCHING_ENABLED.load(Ordering::Relaxed) {
+            return crate::LiteinstDispatchPath::PatchingDisabledFallback;
+        }
+        let straddler = find_site(address)
+            .is_some_and(|site| site.straddle_prefix.load(Ordering::Relaxed) != 0);
+        if straddler {
+            crate::LiteinstDispatchPath::CachelineStraddlerFallback
+        } else {
+            crate::LiteinstDispatchPath::UnpatchableOrOtherFallback
+        }
+    }
+
+    unsafe fn locate_instruction(
+        &self,
+        address: u64,
+        info: *const libc::siginfo_t,
+        context: *const libc::ucontext_t,
+    ) -> FaultSite {
+        // SAFETY: the shared handler's promises are this function's own: it
+        // reads the arenas and site table recorded at startup, with raw
+        // syscalls and no allocation.
+        unsafe { locate_instruction_fault(address, info, context) }
+    }
+
+    unsafe fn patch_instruction(
+        &self,
+        address: u64,
+        kind: InstructionEventKind,
+        encoding: &'static [u8],
+    ) -> PatchOutcome {
+        // SAFETY: called by the shared handler with what locate_instruction
+        // returned for this address, outside any Tool callback.
+        unsafe { patch_instruction_fault(address, kind, encoding) }
+    }
+
+    fn observe_mapping(&self, event: &SyscallEvent) {
+        observe_mapping_generation(event);
     }
 
     fn record_fallback(&self, number: i64) {
@@ -3040,35 +3009,105 @@ unsafe impl TrapSeam for LiteinstSeam {
         record_fallback_dispatch(number);
     }
 
-    fn record_continuation(&self, instruction_pointer: u64) {
-        (self.record_fallback_stats)(self.stats, instruction_pointer);
-    }
-
     fn record_refusal(&self, number: i64) {
         FALLBACK_REFUSALS.record(number);
     }
 }
 
-fn record_disabled_fallback_stats(_stats: crate::stats::GuestStatsHooks, _address: u64) {}
+static LITEINST_PATCHER: LiteinstPatcher = LiteinstPatcher;
+static LITEINST_PATCHER_REF: PatcherRef = PatcherRef(&LITEINST_PATCHER);
+
+/// The SIGSYS seam LiteInst installs: the shared runtime's seam over
+/// [`LiteinstPatcher`], plus what its strace/compat Tools still need until
+/// they leave the patcher library (layering step 4): the fork and wait
+/// fallbacks, and no continuation outside Tool mode.
+struct LiteinstSeam {
+    runtime: RuntimeSeam,
+}
+
+impl LiteinstSeam {
+    fn new(stats: crate::stats::GuestStatsHooks) -> Self {
+        Self {
+            runtime: RuntimeSeam::new(&LITEINST_PATCHER, stats),
+        }
+    }
+}
+
+// SAFETY: intercept runs the event's syscall (through process_syscall) only
+// when it returns true; when it returns false it has run nothing. Every other
+// method is the shared RuntimeSeam's, which runs no syscall.
+unsafe impl TrapSeam for LiteinstSeam {
+    fn record_path(&self, path: TrapPath) {
+        self.runtime.record_path(path);
+    }
+
+    fn observe_nested(&self, event: &SyscallEvent) {
+        self.runtime.observe_nested(event);
+    }
+
+    fn intercept(&self, event: &mut PreloadSyscallEvent) -> bool {
+        let mode = TOOL_MODE.load(Ordering::Relaxed);
+        let args = event.args();
+        let compatibility_trap_fallback =
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            (event.number() == libc::SYS_clone && clone_is_fork_like(args[0], args[1]))
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            || event.number() == libc::SYS_wait4;
+        // TODO-HUMAN-REVIEW(PR-127): Review fork and wait libc-wrapper trap fallbacks.
+        if mode != TOOL_REVERIE && compatibility_trap_fallback {
+            let mut trapped = SyscallEvent {
+                number: event.number(),
+                args,
+                instruction_pointer: event.instruction_pointer(),
+                result: UNSET_RESULT,
+                context: 0,
+                dispatch: SyscallDispatch::Trap,
+                guest_pkru: event.guest_pkru(),
+            };
+            // SAFETY: process_syscall traces the event for the compatibility Tool
+            // and runs its syscall natively, as the safe
+            // reverie_inguest::dispatch::SyscallEvent::forward may for any event.
+            unsafe {
+                process_syscall(&mut trapped);
+            }
+            event.set_native_result(reverie_inguest::trap::NativeSyscallResult {
+                result: trapped.result,
+                pkru: trapped.guest_pkru,
+            });
+            return true;
+        }
+        false
+    }
+
+    unsafe fn syscall_site(&self, resume_address: u64) -> u64 {
+        // SAFETY: the dispatcher's provenance promise is passed on unchanged.
+        unsafe { self.runtime.syscall_site(resume_address) }
+    }
+
+    unsafe fn patch_syscall_site(&self, instruction_pointer: u64, number: i64) -> SitePatch {
+        // SAFETY: the dispatcher's provenance promise is passed on unchanged.
+        unsafe { self.runtime.patch_syscall_site(instruction_pointer, number) }
+    }
+
+    fn continuation_allowed(&self) -> bool {
+        TOOL_MODE.load(Ordering::Relaxed) == TOOL_REVERIE
+    }
+
+    fn record_fallback(&self, number: i64) {
+        self.runtime.record_fallback(number);
+    }
+
+    fn record_continuation(&self, instruction_pointer: u64) {
+        self.runtime.record_continuation(instruction_pointer);
+    }
+
+    fn record_refusal(&self, number: i64) {
+        self.runtime.record_refusal(number);
+    }
+}
 
 #[cfg(test)]
 static ENABLED_FALLBACK_CLASSIFICATIONS: AtomicU64 = AtomicU64::new(0);
-
-fn record_enabled_fallback_stats(stats: crate::stats::GuestStatsHooks, address: u64) {
-    #[cfg(test)]
-    ENABLED_FALLBACK_CLASSIFICATIONS.fetch_add(1, Ordering::Relaxed);
-    if !SITE_PATCHING_ENABLED.load(Ordering::Relaxed) {
-        stats.record_path(crate::LiteinstDispatchPath::PatchingDisabledFallback);
-        return;
-    }
-    let straddler =
-        find_site(address).is_some_and(|site| site.straddle_prefix.load(Ordering::Relaxed) != 0);
-    stats.record_path(if straddler {
-        crate::LiteinstDispatchPath::CachelineStraddlerFallback
-    } else {
-        crate::LiteinstDispatchPath::UnpatchableOrOtherFallback
-    });
-}
 
 unsafe extern "C" fn tool_trampoline(event: *mut core::ffi::c_void) {
     let event = event.cast::<SyscallEvent>();
@@ -3987,6 +4026,7 @@ mod tests {
         SITE_PATCHING_ENABLED.store(previous, Ordering::Release);
     }
     use reverie_inguest::BuiltinTool;
+    use reverie_inguest::guest::trap_dispatch::TrapSeam;
 
     use super::ALT_STACK_ENV;
     use super::AsyncSignalsBlocked;
@@ -4029,12 +4069,9 @@ mod tests {
     #[test]
     fn disabled_dispatch_does_not_classify_fallback_sites() {
         let before = ENABLED_FALLBACK_CLASSIFICATIONS.load(Ordering::Relaxed);
-        let seam = LiteinstSeam::new(
-            crate::stats::GuestStatsHooks::DISABLED,
-            super::PatchPublication::Concurrent,
-        );
+        let seam = LiteinstSeam::new(crate::stats::GuestStatsHooks::DISABLED);
 
-        (seam.record_fallback_stats)(seam.stats, 0xdead_beef);
+        seam.record_continuation(0xdead_beef);
 
         assert_eq!(
             ENABLED_FALLBACK_CLASSIFICATIONS.load(Ordering::Relaxed),
