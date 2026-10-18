@@ -6,11 +6,18 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! The shared runtime's side of the patcher seam: its SIGSYS dispatcher seam
-//! ([`RuntimeSeam`]) and its instruction-fault bridge
-//! ([`install_instruction_handler`]). Both own what the runtime decides
-//! (statistics paths, nested-syscall observation, the continuation) and ask
-//! the registered [`Patcher`] only about sites and its own accounting.
+//! The shared runtime's side of the patcher seam:
+//!
+//! - its SIGSYS dispatcher seam ([`RuntimeSeam`]);
+//! - its instruction-fault bridge ([`install_instruction_handler`]);
+//! - its Tool-mode handling of a syscall that reached the runtime
+//!   ([`process_tool_syscall_with`], and [`process_tool_syscall_callback`] /
+//!   [`observe_registered_mapping`] for entries that take plain function
+//!   pointers, such as SaBRe's rewritten-site entry).
+//!
+//! All of them own what the runtime decides (statistics paths, runtime
+//! protection, Tool dispatch, the continuation) and ask the patcher only about
+//! sites, mapping changes and its own accounting.
 
 use std::io;
 use std::sync::atomic::AtomicPtr;
@@ -107,13 +114,37 @@ pub struct PatcherRef(pub &'static dyn Patcher);
 
 static NO_PATCHER: NoPatcher = NoPatcher;
 static NO_PATCHER_REF: PatcherRef = PatcherRef(&NO_PATCHER);
-static INSTRUCTION_PATCHER: AtomicPtr<PatcherRef> = AtomicPtr::new(std::ptr::null_mut());
+static REGISTERED_PATCHER: AtomicPtr<PatcherRef> = AtomicPtr::new(std::ptr::null_mut());
 
-/// The patcher the instruction-fault bridge asks, or [`NoPatcher`] when none
-/// was registered.
-fn instruction_patcher() -> &'static dyn Patcher {
+/// Registers this process's patcher, which the instruction-fault bridge and
+/// [`process_tool_syscall_callback`] / [`observe_registered_mapping`] ask.
+/// Until a patcher is registered they ask [`NoPatcher`].
+///
+/// A process has one patcher, set once: registering the same patcher again
+/// is accepted (a retried installation, or a forked child), and a different
+/// one is refused with `AlreadyExists`. So one instruction fault's location
+/// and patch questions, and every later syscall, reach the same patcher.
+pub fn register_patcher(patcher: &'static PatcherRef) -> io::Result<()> {
+    let new = std::ptr::from_ref(patcher).cast_mut();
+    match REGISTERED_PATCHER.compare_exchange(
+        std::ptr::null_mut(),
+        new,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => Ok(()),
+        Err(current) if current == new => Ok(()),
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "this process already registered a different patcher",
+        )),
+    }
+}
+
+/// This process's registered patcher, or [`NoPatcher`] when none was registered.
+pub fn registered_patcher() -> &'static dyn Patcher {
     // SAFETY: only `&'static PatcherRef`s are stored.
-    unsafe { INSTRUCTION_PATCHER.load(Ordering::Acquire).as_ref() }
+    unsafe { REGISTERED_PATCHER.load(Ordering::Acquire).as_ref() }
         .unwrap_or(&NO_PATCHER_REF)
         .0
 }
@@ -125,7 +156,7 @@ unsafe fn bridge_locate(
 ) -> FaultSite {
     // SAFETY: the handler's promises for `locate` are the patcher's for
     // `locate_instruction`.
-    unsafe { instruction_patcher().locate_instruction(address, info, context) }
+    unsafe { registered_patcher().locate_instruction(address, info, context) }
 }
 
 unsafe fn bridge_patch(
@@ -135,7 +166,7 @@ unsafe fn bridge_patch(
 ) -> PatchOutcome {
     // SAFETY: the handler's promises for `patch` are the patcher's for
     // `patch_instruction`.
-    unsafe { instruction_patcher().patch_instruction(address, kind, encoding) }
+    unsafe { registered_patcher().patch_instruction(address, kind, encoding) }
 }
 
 static INSTRUCTION_BRIDGE: InstructionFaultSeam = InstructionFaultSeam {
@@ -143,32 +174,10 @@ static INSTRUCTION_BRIDGE: InstructionFaultSeam = InstructionFaultSeam {
     patch: bridge_patch,
 };
 
-/// Sets the instruction-fault bridge's patcher, once per process: a second
-/// registration of the same patcher is accepted (a retried installation), and
-/// of a different one refused, so one fault's location and patch questions
-/// always reach the same patcher.
-fn set_instruction_patcher(patcher: &'static PatcherRef) -> io::Result<()> {
-    let new = std::ptr::from_ref(patcher).cast_mut();
-    match INSTRUCTION_PATCHER.compare_exchange(
-        std::ptr::null_mut(),
-        new,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    ) {
-        Ok(_) => Ok(()),
-        Err(current) if current == new => Ok(()),
-        Err(_) => Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "the instruction-fault bridge already has a different patcher",
-        )),
-    }
-}
-
-/// Registers `patcher` for instruction faults (once per process; see
-/// `set_instruction_patcher`) and installs the runtime's instruction fault
-/// handler for `subscriptions` (on the alternate signal stack when
-/// `on_alt_stack`). With [`NoPatcher`], every subscribed instruction is
-/// emulated through the fallback continuation.
+/// Registers `patcher` (once per process; see [`register_patcher`]) and
+/// installs the runtime's instruction fault handler for `subscriptions` (on
+/// the alternate signal stack when `on_alt_stack`). With [`NoPatcher`], every
+/// subscribed instruction is emulated through the fallback continuation.
 ///
 /// # Safety
 ///
@@ -180,7 +189,7 @@ pub unsafe fn install_instruction_handler(
     subscriptions: InstructionSubscriptions,
     on_alt_stack: bool,
 ) -> io::Result<()> {
-    set_instruction_patcher(patcher)?;
+    register_patcher(patcher)?;
     // SAFETY: the bridge's functions forward to the registered patcher, whose
     // contract matches the seam's; the caller accepts the SIGSEGV replacement.
     unsafe {
@@ -190,6 +199,61 @@ pub unsafe fn install_instruction_handler(
             on_alt_stack,
         )
     }
+}
+
+/// The runtime's Tool-mode handling of a syscall that reached it (from a
+/// patched site's hook, or a rewritten site's entry): the runtime's own
+/// control and descriptor protection, then the installed Tool, then
+/// `patcher`'s view of any mapping change.
+///
+/// # Safety
+///
+/// As [`crate::guest::installed_tool::dispatch`]: `event` is a genuine
+/// intercepted syscall of this thread, not yet run, delivered on one of the
+/// installed runtime's entries, with that entry's rights, branch-count and
+/// callback protection in effect. And as
+/// [`crate::guest::protect::protect_runtime_descriptors`]: the caller holds no
+/// live owner or borrow (`OwnedFd`, `File`, `BorrowedFd` and the like) of a
+/// descriptor the call closes or moves, other than the runtime's own
+/// protected descriptors.
+pub unsafe fn process_tool_syscall_with(event: &mut SyscallEvent, patcher: &dyn Patcher) {
+    if crate::guest::protect::protect_runtime_control(event) {
+        return;
+    }
+    // SAFETY: the caller's promises include the descriptor check's.
+    if unsafe { crate::guest::protect::protect_runtime_descriptors_before_tool(event) } {
+        return;
+    }
+    // SAFETY: as above.
+    unsafe { crate::guest::installed_tool::dispatch(event) };
+    patcher.observe_mapping(event);
+}
+
+/// [`process_tool_syscall_with`] for the registered patcher, as a plain C
+/// callback over a `*mut SyscallEvent` (the `process` argument of
+/// `installed_tool::dispatch_saved_syscall`, with the `rcb-clock` feature).
+/// A null event ends the process (exit status 123), as LiteInst's own
+/// callback does.
+///
+/// # Safety
+///
+/// `event` is null or the caller's unique live `SyscallEvent`, which meets
+/// [`process_tool_syscall_with`]'s contract, for this synchronous call.
+pub unsafe extern "C" fn process_tool_syscall_callback(event: *mut core::ffi::c_void) {
+    let event = event.cast::<SyscallEvent>();
+    if event.is_null() {
+        // SAFETY: ending the process is always allowed here.
+        unsafe { crate::guest::support::exit_now(123) }
+    }
+    // SAFETY: the caller supplies its unique live event for this call.
+    unsafe { process_tool_syscall_with(&mut *event, registered_patcher()) }
+}
+
+/// The registered patcher's view of a mapping change (the
+/// `observe_nested_mapping` argument of
+/// `installed_tool::dispatch_saved_syscall`, with the `rcb-clock` feature).
+pub fn observe_registered_mapping(event: &SyscallEvent) {
+    registered_patcher().observe_mapping(event);
 }
 
 #[cfg(test)]
@@ -345,7 +409,7 @@ mod tests {
     fn an_unregistered_instruction_bridge_declines() {
         // No test in this crate registers a patcher, so the bridge asks
         // NoPatcher: the instruction is emulated, never a missing-seam death.
-        assert!(INSTRUCTION_PATCHER.load(Ordering::Acquire).is_null());
+        assert!(REGISTERED_PATCHER.load(Ordering::Acquire).is_null());
         // SAFETY: NoPatcher reads nothing.
         let site = unsafe { bridge_locate(0x1000, std::ptr::null(), std::ptr::null()) };
         assert!(matches!(site, FaultSite::Unpatchable));

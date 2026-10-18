@@ -125,8 +125,6 @@ use reverie_inguest::guest::instruction::set_all_instruction_native;
 use reverie_inguest::guest::patcher::Patcher;
 use reverie_inguest::guest::protect::close_range_preserving_fds;
 use reverie_inguest::guest::protect::fd_arg;
-use reverie_inguest::guest::protect::protect_runtime_control;
-use reverie_inguest::guest::protect::protect_runtime_descriptors_before_tool;
 pub(crate) use reverie_inguest::guest::protect::replace_coordinator_fd;
 pub(crate) use reverie_inguest::guest::protect::reserve_coordinator_fd;
 pub use reverie_inguest::guest::protect::reserve_tool_output_fd;
@@ -136,6 +134,7 @@ pub use reverie_inguest::guest::protect::tool_output_fd;
 use reverie_inguest::guest::runtime_seam::PatcherRef;
 use reverie_inguest::guest::runtime_seam::RuntimeSeam;
 use reverie_inguest::guest::runtime_seam::install_instruction_handler;
+use reverie_inguest::guest::runtime_seam::process_tool_syscall_with;
 pub(crate) use reverie_inguest::guest::signal::prepare_guest_signal_state;
 pub(crate) use reverie_inguest::guest::signal::reserved_signal_mask;
 pub(crate) use reverie_inguest::guest::signal::signal_action_supported;
@@ -3149,15 +3148,14 @@ unsafe fn process_syscall(event: &mut SyscallEvent) {
             return;
         }
     }
-    if tool_mode == TOOL_REVERIE && protect_runtime_control(event) {
-        return;
-    }
-    if tool_mode == TOOL_REVERIE && unsafe { protect_runtime_descriptors_before_tool(event) } {
-        return;
-    }
-    if TOOL_MODE.load(Ordering::Relaxed) == TOOL_REVERIE {
-        crate::tool_host::dispatch(event);
-        observe_mapping_generation(event);
+    if tool_mode == TOOL_REVERIE {
+        // The shared runtime's Tool-mode handling: runtime control and
+        // descriptor protection, the installed Tool, then LiteInst's mapping
+        // invalidation (TOOL_MODE is stored once, at installation).
+        // SAFETY: only LiteInst's genuine intercepted paths reach
+        // process_syscall, with their event, rights, RCB and callback
+        // protection.
+        unsafe { process_tool_syscall_with(event, &LITEINST_PATCHER) };
         return;
     }
     if TOOL_MODE.load(Ordering::Relaxed) == TOOL_COMPAT

@@ -1091,9 +1091,3 @@ impl Drop for FixedGateInstallation {
 }
 
 pub use installed_tool::blocking_global_rpc;
-
-pub(crate) fn dispatch(event: &mut SyscallEvent) {
-    // SAFETY: only LI's genuine intercepted paths reach this private wrapper,
-    // retaining their actual event/frame, rights, RCB and callback protection.
-    unsafe { installed_tool::dispatch(event) };
-}
