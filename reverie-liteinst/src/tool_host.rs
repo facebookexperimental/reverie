@@ -8,6 +8,7 @@ use std::path::Path;
 use liteinst2::trampoline::HookContext;
 #[cfg(feature = "exec-private-init")]
 use reverie::GlobalRPC;
+use reverie::GlobalTool;
 use reverie::Pid;
 use reverie::Tool;
 use reverie_inguest::guest::context::RegisterContext;
@@ -150,6 +151,42 @@ where
             runtime::LiteinstPatchHost {
                 publication: runtime::PatchPublication::Concurrent,
             },
+        )
+    }
+}
+
+/// Install an ordinary Tool with a once-only initializer for its lazy root
+/// thread state, before thread-start and post-exec. The initializer receives
+/// the actual coordinator Config and root PID. It confers no callback or
+/// native InitialImage authority; errors terminate before Tool callbacks.
+/// All ordinary installation and allocator requirements of [`install_tool`]
+/// apply. This does not eagerly create state or alter callback ordering.
+///
+/// # Safety
+///
+/// All requirements of [`install_tool`] apply. The initializer must not reenter
+/// the installed Tool host or acquire its Tool/state locks.
+pub unsafe fn install_tool_with_root_initializer<T>(
+    coordinator: impl AsRef<Path>,
+    initializer: impl FnOnce(
+        &<T::GlobalState as GlobalTool>::Config,
+        Pid,
+        &mut T::ThreadState,
+    ) -> io::Result<()>
+    + Send
+    + 'static,
+) -> io::Result<()>
+where
+    T: Tool + 'static,
+{
+    unsafe {
+        reverie_inguest::guest::tool_install::install_tool_with_root_initializer::<T, _>(
+            coordinator.as_ref(),
+            true,
+            runtime::LiteinstPatchHost {
+                publication: runtime::PatchPublication::Concurrent,
+            },
+            initializer,
         )
     }
 }

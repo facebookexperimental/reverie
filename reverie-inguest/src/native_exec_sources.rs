@@ -106,6 +106,38 @@ pub fn digest() -> [u8; 32] {
             "rv/liteinst/native_exec_state.rs",
             include_bytes!("../../reverie-liteinst/src/native_exec_state.rs"),
         ),
+        ("rv/build.rs", include_bytes!("../build.rs")),
+        ("rv/bootstrap.rs", include_bytes!("bootstrap.rs")),
+        ("rv/launcher/mod.rs", include_bytes!("launcher/mod.rs")),
+        ("rv/initial_auxv.rs", include_bytes!("initial_auxv.rs")),
+        (
+            "rv/initial_auxv/launch.rs",
+            include_bytes!("initial_auxv/launch.rs"),
+        ),
+        (
+            "rv/bootstrap/seed-entry.S",
+            include_bytes!("../native_exec/seed-entry.S"),
+        ),
+        (
+            "rv/bootstrap/seed-bootstrap.c",
+            include_bytes!("../native_exec/seed-bootstrap.c"),
+        ),
+        (
+            "rv/bootstrap/seed-control.h",
+            include_bytes!("../native_exec/seed-control.h"),
+        ),
+        (
+            "rv/bootstrap/seed-bootstrap.ld",
+            include_bytes!("../native_exec/seed-bootstrap.ld"),
+        ),
+        (
+            "rv/bootstrap/bootstrap-image.c",
+            include_bytes!("../native_exec/bootstrap-image.c"),
+        ),
+        (
+            "rv/bootstrap/bootstrap-image.h",
+            include_bytes!("../native_exec/bootstrap-image.h"),
+        ),
         (
             "rv/bootstrap/private-bootstrap.c",
             include_bytes!("../native_exec/private-bootstrap.c"),

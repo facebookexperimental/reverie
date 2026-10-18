@@ -47,6 +47,10 @@ const PRELOAD_BOOTSTRAP_HEADER_BYTES_V2: usize = PRELOAD_BOOTSTRAP_MAGIC_V2.len(
 /// lengths: 0 unset, 1 on, 2 off. Its statistics path may be empty (none).
 const PRELOAD_BOOTSTRAP_MAGIC_V3: &[u8; 16] = b"REVERIE-LI-V3\0\0\0";
 const PRELOAD_BOOTSTRAP_HEADER_BYTES_V3: usize = PRELOAD_BOOTSTRAP_MAGIC_V3.len() + 7;
+// Version 4 adds a correlation token for the parent-owned initial auxv
+// channel. The token itself is not a completed write or its authority.
+const PRELOAD_BOOTSTRAP_MAGIC_V4: &[u8; 16] = b"REVERIE-LI-V4\0\0\0";
+const PRELOAD_BOOTSTRAP_HEADER_BYTES_V4: usize = PRELOAD_BOOTSTRAP_HEADER_BYTES_V3 + 64;
 const PRELOAD_BOOTSTRAP_MAX_BYTES: usize = 4096;
 
 /// The statistics coordinator named by the bootstrap this process image took.
@@ -82,6 +86,9 @@ pub struct PreloadBootstrap {
     pub stats_coordinator: Option<PathBuf>,
     /// The launcher's site-patching selection, when it made one.
     pub site_patching: Option<bool>,
+    /// The initial-image channel to redeem before installing the ordinary
+    /// Tool. A token is not state; use `initial_auxv::take_completed`.
+    pub initial_auxv: Option<crate::initial_auxv::Token>,
 }
 
 // TODO-HUMAN-REVIEW(PR-139): Review the public inherited preload bootstrap consumer.
@@ -189,6 +196,9 @@ pub(crate) fn read_preload_bootstrap(fd: libc::c_int) -> io::Result<Option<Prelo
     } else if magic == Some(PRELOAD_BOOTSTRAP_MAGIC_V3) && size >= PRELOAD_BOOTSTRAP_HEADER_BYTES_V3
     {
         (PRELOAD_BOOTSTRAP_HEADER_BYTES_V3, 3)
+    } else if magic == Some(PRELOAD_BOOTSTRAP_MAGIC_V4) && size >= PRELOAD_BOOTSTRAP_HEADER_BYTES_V4
+    {
+        (PRELOAD_BOOTSTRAP_HEADER_BYTES_V4, 4)
     } else {
         return Ok(None);
     };
@@ -209,9 +219,9 @@ pub(crate) fn read_preload_bootstrap(fd: libc::c_int) -> io::Result<Option<Prelo
         )
     };
     let site_patching = match (version, lengths.get(6)) {
-        (3, Some(0)) | (1 | 2, None) => None,
-        (3, Some(1)) => Some(true),
-        (3, Some(2)) => Some(false),
+        (3 | 4, Some(0)) | (1 | 2, None) => None,
+        (3 | 4, Some(1)) => Some(true),
+        (3 | 4, Some(2)) => Some(false),
         _ => return Err(invalid()),
     };
     if packet.len() != header + path_len + stats_len + data_len
@@ -228,6 +238,13 @@ pub(crate) fn read_preload_bootstrap(fd: libc::c_int) -> io::Result<Option<Prelo
         stats_coordinator: (stats_len > 0)
             .then(|| PathBuf::from(OsString::from_vec(packet[path_end..stats_end].to_vec()))),
         site_patching,
+        initial_auxv: if version == 4 {
+            Some(crate::initial_auxv::Token::decode(
+                &packet[PRELOAD_BOOTSTRAP_HEADER_BYTES_V3..header],
+            )?)
+        } else {
+            None
+        },
     }))
 }
 
@@ -240,6 +257,17 @@ pub(crate) fn create_preload_bootstrap(
     stats: Option<&Path>,
     site_patching: Option<bool>,
     tool_data: &[u8],
+) -> io::Result<OwnedFd> {
+    create_preload_bootstrap_with_auxv(coordinator, stats, site_patching, tool_data, None)
+}
+
+#[cfg(feature = "launcher")]
+pub(crate) fn create_preload_bootstrap_with_auxv(
+    coordinator: &Path,
+    stats: Option<&Path>,
+    site_patching: Option<bool>,
+    tool_data: &[u8],
+    initial_auxv: Option<crate::initial_auxv::Token>,
 ) -> io::Result<OwnedFd> {
     let path = coordinator.as_os_str().as_bytes();
     let path_len = u16::try_from(path.len()).map_err(|_| {
@@ -261,8 +289,29 @@ pub(crate) fn create_preload_bootstrap(
             + stats.map_or(0, <[u8]>::len)
             + tool_data.len(),
     );
-    match (stats, site_patching) {
-        (stats, Some(site_patching)) => {
+    match (stats, site_patching, initial_auxv) {
+        (stats, site_patching, Some(token)) => {
+            let stats = stats.unwrap_or_default();
+            let stats_len = u16::try_from(stats.len()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "statistics coordinator path exceeds limit",
+                )
+            })?;
+            packet.extend_from_slice(PRELOAD_BOOTSTRAP_MAGIC_V4);
+            packet.extend_from_slice(&path_len.to_le_bytes());
+            packet.extend_from_slice(&stats_len.to_le_bytes());
+            packet.extend_from_slice(&data_len.to_le_bytes());
+            packet.push(match site_patching {
+                None => 0,
+                Some(true) => 1,
+                Some(false) => 2,
+            });
+            packet.extend_from_slice(&token.encode());
+            packet.extend_from_slice(path);
+            packet.extend_from_slice(stats);
+        }
+        (stats, Some(site_patching), None) => {
             let stats = stats.unwrap_or_default();
             let stats_len = u16::try_from(stats.len()).map_err(|_| {
                 io::Error::new(
@@ -278,7 +327,7 @@ pub(crate) fn create_preload_bootstrap(
             packet.extend_from_slice(path);
             packet.extend_from_slice(stats);
         }
-        (Some(stats), None) => {
+        (Some(stats), None, None) => {
             let stats_len = u16::try_from(stats.len())
                 .ok()
                 .filter(|length| *length > 0)
@@ -295,7 +344,7 @@ pub(crate) fn create_preload_bootstrap(
             packet.extend_from_slice(path);
             packet.extend_from_slice(stats);
         }
-        (None, None) => {
+        (None, None, None) => {
             packet.extend_from_slice(PRELOAD_BOOTSTRAP_MAGIC);
             packet.extend_from_slice(&path_len.to_le_bytes());
             packet.extend_from_slice(&data_len.to_le_bytes());

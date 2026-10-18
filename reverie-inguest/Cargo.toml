@@ -32,7 +32,7 @@ rpc-io-fixture = ["coordinator-rpc"]
 preload-constructor = []
 # Host process launch/RPC lifetime owner. Guest bootstrap and typed statistics
 # remain usable without this feature; it never registers a constructor.
-launcher = ["coordinator-rpc", "dep:tempfile", "dep:tokio", "dep:tracing"]
+launcher = ["coordinator-rpc", "dep:tempfile", "dep:tokio", "dep:tracing", "dep:sha2", "dep:goblin"]
 # Explicit FullTool-only fixed syscall/restorer ABI; off by default.
 fixed-syscall-gates = []
 # Private GNU loader InitialImage experiment; no successor exec admission.
@@ -54,6 +54,7 @@ coordinator-rpc = ["dep:serde", "dep:bincode", "dep:reverie", "dep:reverie-rpc-t
 rcb-clock = ["dep:reverie", "dep:reverie-ptrace"]
 
 [dependencies]
+goblin = { version = "0.10.7", optional = true }
 sha2 = { version = "0.10.9", optional = true }
 libc = "0.2.186"
 syscalls = "0.6.18"

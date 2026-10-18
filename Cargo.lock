@@ -1563,6 +1563,7 @@ name = "reverie-inguest"
 version = "0.4.1"
 dependencies = [
  "bincode 2.0.1",
+ "goblin",
  "iced-x86",
  "libc",
  "reverie-core",

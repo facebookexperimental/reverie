@@ -48,6 +48,7 @@ use crate::bootstrap::SITE_PATCHING_ENV;
 use crate::bootstrap::STATS_COORDINATOR_ENV;
 use crate::bootstrap::TOOL_PRELOAD_ENV;
 use crate::bootstrap::create_preload_bootstrap;
+use crate::bootstrap::create_preload_bootstrap_with_auxv;
 #[cfg(test)]
 use crate::bootstrap::read_preload_bootstrap;
 #[cfg(test)]
@@ -174,6 +175,7 @@ tokio::task_local! {
     /// [`PreloadBackend::with_connection_admission`] installs on its
     /// coordinator.
     static CONNECTION_ADMISSION: Arc<dyn ConnectionAdmission>;
+    static INITIAL_AUXV: std::cell::RefCell<Option<crate::initial_auxv::launch::PendingWrite>>;
 }
 
 #[cfg(feature = "rpc-io-fixture")]
@@ -197,6 +199,19 @@ pub struct RpcLaunchObservationForTest {
 }
 
 impl PreloadBackend {
+    /// Prepare one initial-image auxv write for the launch in `future`.
+    ///
+    /// The Tool supplies the bytes and consumes the physical write's checked
+    /// facts to encode its state. This does not enable native exec or change
+    /// the ordinary Tool, syscall, patching or lifecycle configuration.
+    pub async fn with_initial_auxv<F: Future>(
+        pending: crate::initial_auxv::launch::PendingWrite,
+        future: F,
+    ) -> F::Output {
+        INITIAL_AUXV
+            .scope(std::cell::RefCell::new(Some(pending)), future)
+            .await
+    }
     /// Observe actual Tool servers after `future` returns, without exposing
     /// cancellation or planned-shutdown controls. Tests must require a completed
     /// successful launcher result as well as zero active connections and issues;
@@ -990,6 +1005,25 @@ where
     let preload = preload.canonicalize()?;
     let arg0 = command.get_arg0().to_owned();
     let program = command.find_program()?;
+    let initial_auxv = match INITIAL_AUXV.try_with(|pending| pending.borrow_mut().take()) {
+        Ok(Some(pending)) => {
+            if tool_data.is_none() {
+                return Err(io::Error::other(
+                    "initial auxv requires an ordinary preload bootstrap",
+                )
+                .into());
+            }
+            Some(crate::initial_auxv::launch::Prepared::prepare(
+                &reverie_rpc_transport::codec::encode(&config)
+                    .map_err(|error| io::Error::other(error.to_string()))?,
+                pending,
+            )?)
+        }
+        Ok(None) => {
+            return Err(io::Error::other("initial auxv launch input was already consumed").into());
+        }
+        Err(_) => None,
+    };
     command.program(program).arg0(arg0);
 
     let directory = tempfile::Builder::new()
@@ -1047,23 +1081,53 @@ where
             child_command.env_remove(STATS_COORDINATOR_ENV);
             child_command.env_remove(SITE_PATCHING_ENV);
 
-            let bootstrap = create_preload_bootstrap(
-                &socket,
-                stats_socket.as_deref(),
-                site_patching,
-                &tool_data,
-            )?;
+            let bootstrap = match initial_auxv.as_ref() {
+                Some(initial) => create_preload_bootstrap_with_auxv(
+                    &socket,
+                    stats_socket.as_deref(),
+                    site_patching,
+                    &tool_data,
+                    Some(initial.token()),
+                ),
+                None => create_preload_bootstrap(
+                    &socket,
+                    stats_socket.as_deref(),
+                    site_patching,
+                    &tool_data,
+                ),
+            }?;
             let bootstrap_fd = bootstrap.as_raw_fd();
-            unsafe {
-                child_command.pre_exec(move || {
-                    if libc::fcntl(bootstrap_fd, libc::F_SETFD, 0) == -1 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
+            if let Some(initial) = &initial_auxv {
+                initial.install(&mut child_command)?;
+            } else {
+                unsafe {
+                    child_command.pre_exec(move || {
+                        if libc::fcntl(bootstrap_fd, libc::F_SETFD, 0) == -1 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
             }
             let mut child = child_command.spawn()?;
-            drop(bootstrap);
+            let pid = child.id();
+            drop(child_command);
+            let initial = match initial_auxv {
+                Some(initial) => match initial.serve(pid, bootstrap) {
+                    Ok(initial) => Some(initial),
+                    Err(error) => {
+                        // We still own this unreaped Child, so the PID cannot
+                        // be recycled while pidfd setup is unavailable.
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(error.into());
+                    }
+                },
+                None => {
+                    drop(bootstrap);
+                    None
+                }
+            };
             let wait = tokio::task::spawn_blocking(move || {
                 if capture_output {
                     child.wait_with_output().map(ChildWait::Output)
@@ -1076,6 +1140,22 @@ where
                 stats_server,
                 connection_monitors,
                 async move {
+                    if let Some(initial) = initial
+                        && let Err(error) = initial.await
+                    {
+                        // Its pidfd guard killed this child. Reap before
+                        // reporting the failed startup to the run owner.
+                        let terminal = match wait.await {
+                            Ok(Ok(ChildWait::Status(status))) => status.to_string(),
+                            Ok(Ok(ChildWait::Output(output))) => output.status.to_string(),
+                            Ok(Err(wait_error)) => format!("wait failed: {wait_error}"),
+                            Err(wait_error) => format!("wait task failed: {wait_error}"),
+                        };
+                        return Err(io::Error::new(
+                            error.kind(),
+                            format!("{error}; initial child {terminal}"),
+                        ));
+                    }
                     wait.await
                         .map_err(|error| io::Error::other(error.to_string()))?
                 },
