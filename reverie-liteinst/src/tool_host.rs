@@ -6,17 +6,21 @@ use std::io;
 use std::path::Path;
 
 use liteinst2::trampoline::HookContext;
+#[cfg(feature = "exec-private-init")]
 use reverie::GlobalRPC;
 use reverie::Pid;
 use reverie::Tool;
 use reverie_inguest::guest::context::RegisterContext;
 use reverie_inguest::guest::host::HostRuntime;
+#[cfg(feature = "exec-private-init")]
 use reverie_inguest::guest::host::ToolHost;
 use reverie_inguest::guest::installed_tool;
 #[cfg(feature = "exec-private-init")]
 use reverie_inguest::guest::rpc::GuestRpcStream;
+#[cfg(feature = "exec-private-init")]
 use reverie_inguest::trap::raw_syscall6;
 
+#[cfg(feature = "exec-private-init")]
 use crate::rpc::CoordinatorRpc;
 use crate::runtime;
 use crate::runtime::SyscallEvent;
@@ -53,10 +57,21 @@ const _: () = {
 };
 
 /// LiteInst's services for the in-guest Tool host.
-struct LiteinstRuntime {
+pub(crate) struct LiteinstRuntime {
     stats: crate::stats::GuestStatsHooks,
     #[cfg(feature = "exec-native-injection")]
     no_rcb: bool,
+}
+
+impl LiteinstRuntime {
+    /// The services of an ordinary installation.
+    pub(crate) fn new(stats: crate::stats::GuestStatsHooks) -> Self {
+        Self {
+            stats,
+            #[cfg(feature = "exec-native-injection")]
+            no_rcb: false,
+        }
+    }
 }
 
 impl HostRuntime for LiteinstRuntime {
@@ -129,16 +144,12 @@ where
     T: Tool + 'static,
 {
     unsafe {
-        install_tool_inner::<T>(
+        reverie_inguest::guest::tool_install::install_tool_with::<T, _>(
             coordinator.as_ref(),
             true,
-            runtime::PatchPublication::Concurrent,
-            #[cfg(feature = "exec-private-init")]
-            None,
-            #[cfg(feature = "exec-native-injection")]
-            None,
-            #[cfg(feature = "exec-native-injection")]
-            false,
+            runtime::LiteinstPatchHost {
+                publication: runtime::PatchPublication::Concurrent,
+            },
         )
     }
 }
@@ -162,16 +173,12 @@ where
     T: Tool + 'static,
 {
     unsafe {
-        install_tool_inner::<T>(
+        reverie_inguest::guest::tool_install::install_tool_with::<T, _>(
             coordinator.as_ref(),
             true,
-            runtime::PatchPublication::Quiescent,
-            #[cfg(feature = "exec-private-init")]
-            None,
-            #[cfg(feature = "exec-native-injection")]
-            None,
-            #[cfg(feature = "exec-native-injection")]
-            false,
+            runtime::LiteinstPatchHost {
+                publication: runtime::PatchPublication::Quiescent,
+            },
         )
     }
 }
@@ -193,16 +200,12 @@ where
     T: Tool + 'static,
 {
     unsafe {
-        install_tool_inner::<T>(
+        reverie_inguest::guest::tool_install::install_tool_with::<T, _>(
             coordinator.as_ref(),
             false,
-            runtime::PatchPublication::Concurrent,
-            #[cfg(feature = "exec-private-init")]
-            None,
-            #[cfg(feature = "exec-native-injection")]
-            None,
-            #[cfg(feature = "exec-native-injection")]
-            false,
+            runtime::LiteinstPatchHost {
+                publication: runtime::PatchPublication::Concurrent,
+            },
         )
     }
 }
@@ -755,6 +758,9 @@ mod initial_vdso_tests {
     }
 }
 
+// The private-image installer; ordinary installation is the shared
+// `reverie_inguest::guest::tool_install::install_tool_with`.
+#[cfg(feature = "exec-private-init")]
 unsafe fn install_tool_inner<T>(
     coordinator: &Path,
     remove_legacy_environment: bool,
@@ -1071,12 +1077,12 @@ where
 
 /// A published fixed gate cannot be rolled back while an installed action or
 /// filter can still name it. A failed install must not resume guest code.
-#[cfg(feature = "fixed-syscall-gates")]
+#[cfg(all(feature = "fixed-syscall-gates", feature = "exec-private-init"))]
 struct FixedGateInstallation {
     complete: bool,
 }
 
-#[cfg(feature = "fixed-syscall-gates")]
+#[cfg(all(feature = "fixed-syscall-gates", feature = "exec-private-init"))]
 impl Drop for FixedGateInstallation {
     fn drop(&mut self) {
         if !self.complete && reverie_inguest::trap::fixed_gates_published() {

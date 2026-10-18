@@ -11,6 +11,7 @@ pub(crate) use reverie_inguest::stats::LiteinstProcessSiteStats;
 #[cfg(feature = "native-exec-state")]
 pub(crate) use reverie_inguest::stats::check_native_exec_stats;
 pub use reverie_inguest::stats::guest_stats_enabled;
+#[cfg(feature = "exec-private-init")]
 pub(crate) use reverie_inguest::stats::initialize_guest_stats;
 #[cfg(all(test, feature = "native-exec-state"))]
 pub(crate) use reverie_inguest::stats::native_exec_report_test;

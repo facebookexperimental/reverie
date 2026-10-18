@@ -109,6 +109,7 @@ static PATCH_PUBLICATION: AtomicU8 = AtomicU8::new(PatchPublication::Concurrent 
 static SITE_PATCHING_ENABLED: AtomicBool = AtomicBool::new(true);
 
 pub(crate) use reverie_inguest::guest::clock::enter_rcb_handler;
+#[cfg(feature = "exec-private-init")]
 pub(crate) use reverie_inguest::guest::clock::initialize_rcb_clock;
 pub(crate) use reverie_inguest::guest::clock::leave_rcb_handler;
 pub(crate) use reverie_inguest::guest::clock::read_guest_rcb_clock;
@@ -120,14 +121,18 @@ pub(crate) use reverie_inguest::guest::instruction::cpuid_interception_enabled;
 use reverie_inguest::guest::instruction::decode_instruction;
 use reverie_inguest::guest::instruction::deliver_default_sigsegv;
 use reverie_inguest::guest::instruction::enable_instruction_faulting;
+#[cfg(feature = "exec-private-init")]
 pub(crate) use reverie_inguest::guest::instruction::preflight_instruction_faulting;
 use reverie_inguest::guest::instruction::set_all_instruction_native;
 use reverie_inguest::guest::patcher::Patcher;
 use reverie_inguest::guest::protect::close_range_preserving_fds;
 use reverie_inguest::guest::protect::fd_arg;
+#[cfg(feature = "exec-private-init")]
 pub(crate) use reverie_inguest::guest::protect::replace_coordinator_fd;
+#[cfg(feature = "exec-private-init")]
 pub(crate) use reverie_inguest::guest::protect::reserve_coordinator_fd;
 pub use reverie_inguest::guest::protect::reserve_tool_output_fd;
+#[cfg(feature = "exec-private-init")]
 use reverie_inguest::guest::protect::set_process_forks_allowed;
 use reverie_inguest::guest::protect::syscall_targets_event_fd;
 pub use reverie_inguest::guest::protect::tool_output_fd;
@@ -135,6 +140,7 @@ use reverie_inguest::guest::runtime_seam::PatcherRef;
 use reverie_inguest::guest::runtime_seam::RuntimeSeam;
 use reverie_inguest::guest::runtime_seam::install_instruction_handler;
 use reverie_inguest::guest::runtime_seam::process_tool_syscall_with;
+#[cfg(feature = "exec-private-init")]
 pub(crate) use reverie_inguest::guest::signal::prepare_guest_signal_state;
 pub(crate) use reverie_inguest::guest::signal::reserved_signal_mask;
 pub(crate) use reverie_inguest::guest::signal::signal_action_supported;
@@ -145,6 +151,7 @@ pub(crate) use reverie_inguest::guest::support::exit_now;
 pub(crate) use reverie_inguest::guest::support::read_own_bytes;
 pub(crate) use reverie_inguest::guest::support::scan_own_maps;
 pub(crate) use reverie_inguest::guest::support::tool_callback_active;
+use reverie_inguest::guest::tool_install::PatchHost;
 use reverie_inguest::guest::trap_dispatch::InGuestDispatcher;
 use reverie_inguest::guest::trap_dispatch::SitePatch;
 use reverie_inguest::guest::trap_dispatch::TrapPath;
@@ -563,6 +570,7 @@ pub(crate) struct PrivateRuntimeImage<'a> {
     pub(crate) before_frontend: Option<Box<dyn FnOnce() -> io::Result<()> + 'a>>,
 }
 
+#[cfg(feature = "exec-private-init")]
 pub(crate) fn initialize_reverie_tool(
     stats: crate::stats::GuestStatsHooks,
     publication: PatchPublication,
@@ -579,33 +587,13 @@ pub(crate) fn initialize_reverie_tool(
     let stage_stream = if private_initial {
         false
     } else {
-        match std::env::var_os(IN_GUEST_STAGE_STREAM_ENV).as_deref() {
-            None => false,
-            Some(value) if value == OsStr::new("0") => false,
-            Some(value) if value == OsStr::new("1") => true,
-            Some(value) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unsupported {IN_GUEST_STAGE_STREAM_ENV} value {value:?}"),
-                ));
-            }
-        }
+        stage_stream_from_env()?
     };
     reverie_inguest::guest::support::set_stage_stream(stage_stream);
     let process_forks_allowed = if private_initial {
         false
     } else {
-        match std::env::var_os(PROCESS_FORK_ENV).as_deref() {
-            None => true,
-            Some(value) if value == OsStr::new("1") => true,
-            Some(value) if value == OsStr::new("0") => false,
-            Some(value) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unsupported {PROCESS_FORK_ENV} value {value:?}"),
-                ));
-            }
-        }
+        process_forks_from_env()?
     };
     set_process_forks_allowed(process_forks_allowed);
     let sigalrm_handlers = if private_initial {
@@ -652,6 +640,106 @@ pub(crate) fn initialize_reverie_tool(
         reverie_inguest::guest::sigalrm::record_runtime_stack()?;
     }
     Ok(())
+}
+
+/// [`IN_GUEST_STAGE_STREAM_ENV`]: absent or `0` is off, `1` is on.
+fn stage_stream_from_env() -> io::Result<bool> {
+    match std::env::var_os(IN_GUEST_STAGE_STREAM_ENV).as_deref() {
+        None => Ok(false),
+        Some(value) if value == OsStr::new("0") => Ok(false),
+        Some(value) if value == OsStr::new("1") => Ok(true),
+        Some(value) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported {IN_GUEST_STAGE_STREAM_ENV} value {value:?}"),
+        )),
+    }
+}
+
+/// [`PROCESS_FORK_ENV`]: absent or `1` allows process creation, `0` refuses it.
+fn process_forks_from_env() -> io::Result<bool> {
+    match std::env::var_os(PROCESS_FORK_ENV).as_deref() {
+        None => Ok(true),
+        Some(value) if value == OsStr::new("1") => Ok(true),
+        Some(value) if value == OsStr::new("0") => Ok(false),
+        Some(value) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported {PROCESS_FORK_ENV} value {value:?}"),
+        )),
+    }
+}
+
+/// LiteInst's part in the shared typed installation
+/// ([`reverie_inguest::guest::tool_install::install_tool_with`]): its
+/// allocator check, continuation handlers, hook entries and patcher
+/// preparation, its environment selectors, and its runtime services.
+pub(crate) struct LiteinstPatchHost {
+    pub(crate) publication: PatchPublication,
+}
+
+// SAFETY: LiteinstPatcher keeps the Patcher contract (see its SAFETY
+// comment). The steps below are the code LiteInst's own installer runs at the
+// same points; the only handler they install, the SIGTRAP guard router, uses
+// the runtime's raw signal operations and private restorer.
+unsafe impl PatchHost for LiteinstPatchHost {
+    type Runtime = crate::tool_host::LiteinstRuntime;
+
+    fn patcher(&self) -> &'static PatcherRef {
+        &LITEINST_PATCHER_REF
+    }
+
+    fn preflight(&self) -> io::Result<()> {
+        crate::patch_alloc::preflight_allocator()
+    }
+
+    fn initialize_continuation(&self) -> io::Result<()> {
+        crate::syscall_fallback::initialize()
+    }
+
+    fn prepare_entries(&self) -> io::Result<()> {
+        // The proof has no destructor or later use; preparation is the effect.
+        prepare_installed_callbacks().map(|_| ())
+    }
+
+    fn site_patching(&self) -> io::Result<bool> {
+        // A launcher that sends tool data puts the selection in the bootstrap,
+        // which guest code cannot change; the environment is the selector for
+        // launchers that do not.
+        match reverie_inguest::bootstrap::bootstrap_site_patching() {
+            Some(site_patching) => Ok(site_patching),
+            None => site_patching_from_env_value(std::env::var_os(SITE_PATCHING_ENV).as_deref()),
+        }
+    }
+
+    fn stage_stream(&self) -> io::Result<bool> {
+        stage_stream_from_env()
+    }
+
+    fn process_forks_allowed(&self) -> io::Result<bool> {
+        process_forks_from_env()
+    }
+
+    fn sigalrm_handlers(&self) -> io::Result<bool> {
+        sigalrm_handlers_from_env_value(std::env::var_os(SIGALRM_HANDLERS_ENV).as_deref())
+    }
+
+    fn select(&self, site_patching: bool) {
+        SITE_PATCHING_ENABLED.store(site_patching, Ordering::Release);
+        TOOL_MODE.store(TOOL_REVERIE, Ordering::Release);
+    }
+
+    fn prepare_patcher(&self, vdso_sites: &[reverie::vdso::VdsoSyscallSite]) -> io::Result<()> {
+        PATCH_PUBLICATION.store(self.publication as u8, Ordering::Release);
+        prepare_instrumentation(InstrumentationPreparation::Patcher)?;
+        install_vdso_sites(vdso_sites)
+    }
+
+    fn runtime_config(&self) -> io::Result<RuntimeConfig> {
+        runtime_config_from_env()
+    }
+
+    fn runtime(&self, stats: crate::stats::GuestStatsHooks) -> crate::tool_host::LiteinstRuntime {
+        crate::tool_host::LiteinstRuntime::new(stats)
+    }
 }
 
 /// Opts the Tool mode into guest SIGALRM handlers (signal phase 1), `1` or

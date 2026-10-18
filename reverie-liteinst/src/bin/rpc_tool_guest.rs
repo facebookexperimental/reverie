@@ -55,6 +55,8 @@ mod late_code_guest;
 
 #[path = "rpc_tool_guest/fixed_gates.rs"]
 mod fixed_gates_guest;
+#[path = "rpc_tool_guest/same_tool.rs"]
+mod same_tool_guest;
 
 const CALLS: u64 = 32;
 const TOOL_CPUID_EAX: u32 = 0x1111_1111;
@@ -3399,6 +3401,13 @@ fn main() {
         }
         Some("fixed-gate-install-failure") => fixed_gates_guest::install_failure(Path::new(&path)),
         Some("guest") => guest(Path::new(&path)),
+        Some("same-tool") => same_tool_guest::run(
+            Path::new(&path),
+            args.next()
+                .expect("installer")
+                .to_str()
+                .expect("UTF-8 installer"),
+        ),
         Some("syscall-fallback") => syscall_fallback_guest::run(Path::new(&path)),
         Some("syscall-fallback-xstate") => syscall_fallback_guest::run_xstate(Path::new(&path)),
         Some("syscall-fallback-refusal") => syscall_fallback_guest::run_refusal(),

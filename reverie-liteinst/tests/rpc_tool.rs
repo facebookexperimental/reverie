@@ -1263,6 +1263,62 @@ fn late_code_instructions_reach_the_tool_through_the_continuation() {
     }
 }
 
+// One Tool reached three ways must observe the same results (in-guest
+// layering step 2): LiteInst with site patching on, where the binary's
+// getpid site is patched and a site in an anonymous executable page (no
+// arena) is declined; LiteInst with site patching off, which declines every
+// site, as in-guest-trap runs it; and the shared runtime's installer with no
+// patcher at all. The first line is what the Tool and guest observe; the
+// second shows which route each site took.
+#[test]
+fn patched_declined_and_unpatched_sites_give_one_tool_the_same_results() {
+    const TOOL_OBSERVED: &str = "same-tool getpid=pid tool-getpid=16 rpc=16 clock=0 tool-clock=1 \
+                                 cpuid=tool tool-cpuid=1 rdtsc=tool tool-rdtsc=1";
+    let zero = "binary-site traps=0 hooks=0 anonymous-site traps=0 hooks=0";
+    let cases = [
+        (
+            "liteinst",
+            Some("1"),
+            "binary-site traps=1 hooks=8 anonymous-site traps=8 hooks=0",
+        ),
+        ("liteinst", Some("0"), zero),
+        ("no-patcher", None, zero),
+    ];
+    for on_alt_stack in [true, false] {
+        for (installer, site_patching, routes) in cases {
+            let label =
+                format!("{installer} site_patching={site_patching:?} alt_stack={on_alt_stack}");
+            let output = late_code_guest(
+                "same-tool",
+                &[std::ffi::OsStr::new(installer)],
+                on_alt_stack,
+                |command| {
+                    command.env(
+                        STRADDLER_STALENESS_TICKS_ENV,
+                        TEST_STRADDLER_STALENESS_TICKS,
+                    );
+                    if let Some(value) = site_patching {
+                        command.env(reverie_liteinst::SITE_PATCHING_ENV, value);
+                    }
+                },
+            );
+            // This control has no unmeasured outcome: every case must run,
+            // so a host that refuses CPUID/TSC faulting fails it.
+            assert!(
+                !instruction_control_refused(&output, &label),
+                "{label}: CPUID/TSC faulting is unavailable, so the same-Tool control cannot run"
+            );
+            assert!(output.status.success(), "{label}: {output:?}");
+            assert!(output.stderr.is_empty(), "{label}: {output:?}");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut lines = stdout.lines();
+            assert_eq!(lines.next(), Some(TOOL_OBSERVED), "{label}: {output:?}");
+            assert_eq!(lines.next(), Some(routes), "{label}: {output:?}");
+            assert_eq!(lines.next(), None, "{label}: {output:?}");
+        }
+    }
+}
+
 // With site patching off (the trap-only mode in-guest-trap needs), CPUID,
 // RDTSC and RDTSCP inside an arena are emulated through the continuation like
 // late code: no site is patched, and each reaches the Tool once with the same
