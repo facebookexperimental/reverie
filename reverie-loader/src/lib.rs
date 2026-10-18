@@ -20,6 +20,8 @@
 //!   optionally no TLS.
 //! - [`audit`] confines `syscall` instructions in an image's executable
 //!   segments to declared gate ranges.
+//! - [`artifact`] fixes where the loader and runtime images live and checks
+//!   a built image (validation plus audit) before it may be mapped.
 //! - [`stage`] names the loader's initialization stages as types, so a step
 //!   can only follow the step before it.
 //!
@@ -29,6 +31,7 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod artifact;
 pub mod audit;
 pub mod image;
 pub mod stage;

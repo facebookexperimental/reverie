@@ -7,9 +7,10 @@
  */
 
 //! Validation of the images the loader maps: the loader itself and Hermit's
-//! runtime. Both are linked at fixed addresses inside Hermit's reserved
-//! region, so mapping them needs no relocation and cannot move the guest's
-//! own layout.
+//! runtime. Both are linked at fixed addresses (their windows are in
+//! [`crate::artifact`]), so mapping them needs no relocation. The guest's
+//! own layout stays put only while those windows are reserved, which is the
+//! mapper's job, not this module's.
 //!
 //! [`Image::parse`] reads the ELF64 header and program headers with checked
 //! arithmetic only, and [`Image::validate`] applies a [`Policy`]. Only

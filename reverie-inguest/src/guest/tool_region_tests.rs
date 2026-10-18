@@ -481,6 +481,25 @@ fn altstack() -> libc::stack_t {
     stack
 }
 
+/// `reverie-loader` owns the windows its loader and runtime images are linked
+/// at; they must lie inside this reservation, clear of the control area, both
+/// fixed arenas with their guards, and the top guard page.
+#[test]
+fn loader_image_windows_fit_the_reservation_layout() {
+    use reverie_loader::artifact::LOADER_WINDOW;
+    use reverie_loader::artifact::RUNTIME_WINDOW;
+    use reverie_loader::artifact::TOOL_REGION;
+    assert_eq!(TOOL_REGION, BASE as u64..END as u64);
+    for window in [LOADER_WINDOW, RUNTIME_WINDOW] {
+        let first = (window.start as usize - BASE) / PAGE;
+        let end = (window.end as usize - BASE) / PAGE;
+        assert!(DATA_FIRST <= first && end <= DATA_END, "{window:x?}");
+        for band in [arena::TOOL_BAND, arena::PATCH_BAND] {
+            assert!(end <= band.0 || band.1 <= first, "{window:x?} {band:?}");
+        }
+    }
+}
+
 #[test]
 fn literal_reservation_control_and_boundary_guards() {
     isolated("literal_reservation_control_and_boundary_guards", || {

@@ -28,7 +28,8 @@ use crate::image::MAX_SEGMENTS;
 use crate::image::Segment;
 use crate::image::ValidatedImage;
 
-const SYSCALL: [u8; 2] = [0x0f, 0x05];
+/// The `syscall` instruction's encoding.
+pub(crate) const SYSCALL: [u8; 2] = [0x0f, 0x05];
 
 /// A `syscall` encoding found outside every gate range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,7 +39,8 @@ pub struct StraySyscall {
 }
 
 /// Returns the lowest-addressed `syscall` encoding in `image`'s executable
-/// mappings that does not start inside one of `gates`, or `None` if there
+/// mappings that does not lie wholly (both bytes) inside one of `gates`, or
+/// `None` if there
 /// is none. An error means the audit could not be completed, never that the
 /// image is clean.
 pub fn stray_syscall(
@@ -58,7 +60,11 @@ pub fn stray_syscall(
     // address is distinct and the order is total.
     executable.sort_unstable_by_key(|segment| segment.map(|s| s.memory.start));
 
-    let outside_gates = |address: u64| !gates.iter().any(|gate| gate.contains(&address));
+    let outside_gates = |address: u64| {
+        !gates
+            .iter()
+            .any(|gate| gate.contains(&address) && address < gate.end.saturating_sub(1))
+    };
     // The end of the previous executable mapping and its last byte.
     let mut previous: Option<(u64, u8)> = None;
     for segment in executable.iter().flatten() {
@@ -121,12 +127,18 @@ mod tests {
             &[(PT_LOAD, RX, 4096, BASE, body.len() as u64, 64)],
             &body,
         );
-        let gate = BASE + 1..BASE + 2;
+        let gate = BASE + 1..BASE + 3;
         assert_eq!(
             audit(&bytes, core::slice::from_ref(&gate)),
             Some(StraySyscall { address: BASE + 6 })
         );
-        let both = [BASE + 1..BASE + 2, BASE + 6..BASE + 7];
+        // A gate holding only the first byte does not allow the encoding.
+        let half = BASE + 6..BASE + 7;
+        assert_eq!(
+            audit(&bytes, &[gate.clone(), half]),
+            Some(StraySyscall { address: BASE + 6 })
+        );
+        let both = [BASE + 1..BASE + 3, BASE + 6..BASE + 8];
         assert_eq!(audit(&bytes, &both), None);
     }
 
@@ -160,7 +172,7 @@ mod tests {
             address: BASE + 0xfff,
         });
         assert_eq!(audit(&bytes, &[]), found);
-        let gate = BASE + 0xfff..BASE + 0x1000;
+        let gate = BASE + 0xfff..BASE + 0x1001;
         assert_eq!(audit(&bytes, core::slice::from_ref(&gate)), None);
 
         // With a page between them, nothing executes across the boundary.

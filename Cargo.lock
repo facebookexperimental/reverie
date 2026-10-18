@@ -1566,6 +1566,7 @@ dependencies = [
  "iced-x86",
  "libc",
  "reverie-core",
+ "reverie-loader",
  "reverie-ptrace",
  "reverie-rpc-transport",
  "reverie-syscalls",
