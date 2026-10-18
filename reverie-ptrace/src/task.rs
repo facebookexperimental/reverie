@@ -202,6 +202,34 @@ pub enum PreinitPlace {
     AtExec,
 }
 
+/// Failure to establish a requested interception contract. Kernel refusal and
+/// an unexpected successful reply are both failures, never reduced coverage.
+#[cfg(target_arch = "x86_64")]
+#[derive(Debug)]
+struct CpuidFaultingUnavailable {
+    place: PreinitPlace,
+    operation: &'static str,
+    result: Result<i64, Errno>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl fmt::Display for CpuidFaultingUnavailable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "ptrace-cpuid-faulting-unavailable: phase={:?} operation={} ",
+            self.place, self.operation
+        )?;
+        match self.result {
+            Ok(state) => write!(f, "observed={state}"),
+            Err(errno) => write!(f, "errno={}", errno.into_raw()),
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl std::error::Error for CpuidFaultingUnavailable {}
+
 /// The actual host threads and tracee tids whose images were canonicalized.
 /// The host separates independent libtests; the tid binds each count to its tracee.
 #[cfg(test)]
@@ -221,6 +249,9 @@ pub(crate) enum PostspawnPreinit {
 pub enum PreinitOutcome {
     /// The tracee is initialized and still stopped.
     Ready(Stopped),
+    /// Initialization published a named fatal-session failure. Keep its stop
+    /// owned until the ordinary task-tree driver completes consuming cleanup.
+    Refused(Stopped),
     /// A wait during initialization returned the tracee's final status. A
     /// SIGKILLed tracee first stops at `PTRACE_EVENT_EXIT`, but that stop is
     /// published to the exit notifier, not to the waits initialization makes,
@@ -274,12 +305,12 @@ fn memory_request<T, E: Into<TraceError>>(
 }
 
 #[cfg(test)]
-type PostExecStepForTest = Box<dyn FnOnce(Running) -> Running>;
+type PostExecReturnForTest = Box<dyn FnOnce(&Stopped, &safeptrace::SyscallInfo)>;
 
 #[cfg(test)]
 thread_local! {
     static FORCED_ESRCH: std::cell::Cell<Option<Pid>> = const { std::cell::Cell::new(None) };
-    static POST_EXEC_STEP_FOR_TEST: std::cell::RefCell<Option<PostExecStepForTest>> =
+    static POST_EXEC_RETURN_FOR_TEST: std::cell::RefCell<Option<PostExecReturnForTest>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -3019,7 +3050,7 @@ fn at_preinit_point(
     }
 }
 
-/// Test-only: where `tracee_preinit`, or the post-exec step before it, calls a
+/// Test-only: where `tracee_preinit`, or the exec-return drain before it, calls a
 /// [`PreinitPointForTest`] hook.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3039,10 +3070,10 @@ pub(crate) enum PreinitPoint {
     /// After patching the vDSO, or skipping that, before the injected
     /// `mprotect` of the trampoline page.
     TrampolineUnprotected,
-    /// At the exec stop, before the post-exec SIGTRAP step.
+    /// At the exec stop, before resuming only toward its syscall-exit stop.
     ExecStopped,
-    /// After the post-exec SIGTRAP step, before waiting for its stop.
-    PostExecStepped,
+    /// At the validated exec syscall-exit stop, before any guest instruction.
+    PostExecDrained,
 }
 
 /// The owner that must retain a decoded `Event::NewChild` before any
@@ -4178,13 +4209,41 @@ impl<L: Tool + 'static> TracedTask<L> {
     }
 
     #[cfg(target_arch = "x86_64")]
-    async fn intercept_cpuid(&mut self) -> Result<(), Errno> {
+    async fn intercept_cpuid(&mut self) -> Result<i64, Errno> {
         use reverie::syscalls::ArchPrctl;
         use reverie::syscalls::ArchPrctlCmd;
 
         self.inject_with_retry(ArchPrctl::new().with_cmd(ArchPrctlCmd::ARCH_SET_CPUID(0)))
             .await
-            .map(|_| ())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    async fn arm_cpuid(&mut self, place: PreinitPlace) -> Result<(), CpuidFaultingUnavailable> {
+        let result = self.cpuid_state().await;
+        if !matches!(result, Ok(0 | 1)) {
+            return Err(CpuidFaultingUnavailable {
+                place,
+                operation: "initial-get",
+                result,
+            });
+        }
+        let result = self.intercept_cpuid().await;
+        if result != Ok(0) {
+            return Err(CpuidFaultingUnavailable {
+                place,
+                operation: "set-disabled",
+                result,
+            });
+        }
+        let result = self.cpuid_state().await;
+        if result != Ok(0) {
+            return Err(CpuidFaultingUnavailable {
+                place,
+                operation: "verify-get",
+                result,
+            });
+        }
+        Ok(())
     }
 
     /// Perform the very first setup of a fresh tracee process:
@@ -4493,7 +4552,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         .await;
         let mut task = match outcome? {
             PreinitOutcome::Ready(task) => task,
-            exited @ PreinitOutcome::Exited(..) => return Ok(exited),
+            ended @ (PreinitOutcome::Exited(..) | PreinitOutcome::Refused(_)) => return Ok(ended),
         };
         #[cfg(test)]
         at_preinit_point(
@@ -4592,7 +4651,7 @@ impl<L: Tool + 'static> TracedTask<L> {
 
         // Reverie's sealed SIGTRAP repair page is mapped after the trampoline
         // while the new image is still single-threaded, and an
-        // ignored SIGTRAP that the exec event's, the mmap's or pre-init's
+        // ignored SIGTRAP that the mmap's or pre-init's
         // later steps reset is put back through it.
         let task = self.seal_sigtrap_scratch(task, place).await?;
         let task = if shield_sigtrap {
@@ -4601,64 +4660,42 @@ impl<L: Tool + 'static> TracedTask<L> {
             task
         };
 
-        // Try to intercept cpuid instructions on x86_64
+        // A subscription is a required contract: if the kernel cannot arm
+        // and confirm faulting, no guest continuation is permitted.
         #[cfg(target_arch = "x86_64")]
         if self.global_state.subscriptions.has_cpuid() {
-            self.has_cpuid_interception = match self.cpuid_state().await {
-                Ok(initial_state @ (0 | 1)) => match self.intercept_cpuid().await {
-                    Ok(()) => match self.cpuid_state().await {
-                        Ok(0) => true,
-                        Ok(state) => {
-                            tracing::error!(
-                                state,
-                                "ARCH_SET_CPUID succeeded but ARCH_GET_CPUID did not report the disabled state; continuing without CPUID interception"
-                            );
-                            false
-                        }
-                        Err(err) => {
-                            tracing::error!(
-                                "Unable to verify ARCH_SET_CPUID with ARCH_GET_CPUID: {}; continuing without CPUID interception",
-                                err
-                            );
-                            false
-                        }
+            self.has_cpuid_interception = false;
+            if let Err(error) = self.arm_cpuid(place).await {
+                // An injection which observes genuine death aborts to its
+                // existing owner. Do not replace a concurrent failure or a
+                // now-observed death with an unsupported-feature diagnostic.
+                if self.fatal_session().is_failed() {
+                    return Ok(PreinitOutcome::Refused(task));
+                }
+                task.getregs()?;
+                self.fatal_session().fail_at(
+                    BackendFailure {
+                        pid: self.pid(),
+                        tid: self.tid(),
+                        phase: "ptrace CPUID initialization",
                     },
-                    Err(Errno::ENODEV) => {
-                        tracing::error!(
-                            initial_state,
-                            "ARCH_GET_CPUID reported a valid state, but ARCH_SET_CPUID returned ENODEV. The kernel exposes CPUID state without hardware faulting support. On AMD hosts, use Linux 6.17+ upstream or a kernel with CPUID faulting backported; continuing without CPUID interception"
-                        );
-                        false
-                    }
-                    Err(err) => {
-                        tracing::error!(
-                            "Unable to disable CPUID after ARCH_GET_CPUID reported a valid state: {}; continuing without CPUID interception",
-                            err
-                        );
-                        false
-                    }
-                },
-                Ok(state) => {
-                    tracing::error!(
-                        state,
-                        "ARCH_GET_CPUID returned an unexpected state; continuing without CPUID interception"
+                    anyhow::Error::new(error).into(),
+                );
+                // Retain the primary refusal if restoring the saved context
+                // also fails. Cleanup owns this stopped generation either way.
+                if let Err(error) = task.setregs(&regs) {
+                    self.fatal_session().fail_at(
+                        BackendFailure {
+                            pid: self.pid(),
+                            tid: self.tid(),
+                            phase: "ptrace CPUID refusal context restoration",
+                        },
+                        anyhow::Error::new(error).into(),
                     );
-                    false
                 }
-                Err(Errno::ENODEV) => {
-                    tracing::error!(
-                        "CPUID faulting is unavailable: arch_prctl(ARCH_GET_CPUID) returned ENODEV. On AMD hosts, use Linux 6.17+ upstream or a kernel with CPUID faulting backported; continuing without CPUID interception"
-                    );
-                    false
-                }
-                Err(err) => {
-                    tracing::error!(
-                        "Unable to query CPUID faulting with arch_prctl(ARCH_GET_CPUID): {}; continuing without CPUID interception",
-                        err
-                    );
-                    false
-                }
-            };
+                return Ok(PreinitOutcome::Refused(task));
+            }
+            self.has_cpuid_interception = true;
         }
 
         // Restore registers again after we've injected syscalls so that we
@@ -6350,8 +6387,23 @@ impl<L: Tool + 'static> TracedTask<L> {
         }
     }
 
+    fn refuse_exec_return(&self, error: anyhow::Error) -> TraceError {
+        self.fatal_session().fail_at(
+            BackendFailure {
+                pid: self.pid(),
+                tid: self.tid(),
+                phase: "ptrace exec return boundary",
+            },
+            error.context("ptrace-exec-return-unobserved").into(),
+        );
+        Errno::EPROTO.into()
+    }
+
     // handle ptrace exec event
     async fn handle_exec_event(&mut self, task: Stopped) -> Result<Wait, TraceError> {
+        // Linux enables CPUID again on every successful replacement exec.
+        // This old-image fact must not survive until the new arm is verified.
+        self.has_cpuid_interception = false;
         // A signal callback that injected the exec never resumes, so the
         // replacement image runs outside it, and its state, which
         // `report_signal` would have restored, must not reach the post-exec
@@ -6392,10 +6444,15 @@ impl<L: Tool + 'static> TracedTask<L> {
 
         // TODO: Update PID? Need to write a test checking this.
 
-        // Step the tracee to get the SIGTRAP that immediately follows the
-        // PTRACE_EVENT_EXEC. We can't call `tracee_preinit` until after this
-        // because when it tries to step the tracee, it'll get this SIGTRAP
-        // signal instead.
+        // Drain the kernel's exec return, not a user instruction. Linux runs
+        // syscall-exit tracing before ordinary pending-signal delivery on this
+        // path. Keep those signals queued; searching for a later stop with
+        // CONT or SINGLESTEP could execute the first guest opcode unarmed.
+        let entry_regs = task.getregs()?;
+        #[allow(clippy::useless_conversion)]
+        let entry_ip = u64::from(entry_regs.ip());
+        #[allow(clippy::useless_conversion)]
+        let entry_sp = u64::from(entry_regs.stack_ptr());
         #[cfg(test)]
         let preinit_point = self.global_state.preinit_point_for_test.clone();
         #[cfg(test)]
@@ -6405,11 +6462,9 @@ impl<L: Tool + 'static> TracedTask<L> {
             || task.terminal_cleanup(),
             PreinitPoint::ExecStopped,
         );
-        // This step's trap must not reset an ignored or blocked SIGTRAP, which
-        // the new image keeps across exec (`sigtrap_state`): SIGTRAP is
-        // unblocked for it, and an ignored one is put back once the private
-        // page exists (`tracee_preinit`). Not under a tracer filter, which may
-        // refuse the requests (`thread_may_be_seccomp_filtered`).
+        // Retain the per-image SIGTRAP disposition/mask owner for injected
+        // pre-init steps. Draining the exec syscall below creates no user
+        // single-step trap and therefore needs no temporary mask change.
         // The table bookkeeping follows the kernel whatever this tracer
         // thread's filter state: siblings sharing the table may keep SIGTRAP.
         // Exec gives the group a table of its own, a copy of the one it used,
@@ -6433,12 +6488,10 @@ impl<L: Tool + 'static> TracedTask<L> {
                 self.set_sigtrap_repair(None);
             }
         }
-        let exec_sigtrap_shielded = if !self.keeps_sigtrap_state() {
-            false
-        } else {
+        if self.keeps_sigtrap_state() {
             // One procfs read decides for the whole exec: with SIGTRAP
-            // neither ignored nor blocked, and no repair owed, no step through
-            // the first instruction can reset it.
+            // neither ignored nor blocked, and no repair owed, the injected
+            // pre-init steps need no shielding.
             let state = ProcSignalState::read(&task)?;
             {
                 let mut tables = self.global_state.sigtrap_tables.lock().unwrap();
@@ -6454,57 +6507,71 @@ impl<L: Tool + 'static> TracedTask<L> {
             if state.sigtrap_ignored {
                 self.note_sigtrap_repair(SigtrapRepair::Ignored);
             }
-            !self.exec_sigtrap_quiet && self.shield_sigtrap_for_step(&task, "exec event")?
+        }
+        let running = self.syscall_stopped(task, None)?;
+        let wait = running.next_state_with_owner(&self.ptracer_waits).await?;
+        self.arm_liteinst_wait(&wait);
+        let (task, event) = match wait {
+            Wait::Stopped(task, event) => (task, event),
+            Wait::Exited(pid, exit_status) => return Ok(Wait::Exited(pid, exit_status)),
         };
-        let stepped = self.step_stopped(task, None)?;
+        let info = match task.getsyscallinfo() {
+            Ok(info) => info,
+            Err(safeptrace::SyscallInfoError::Trace(died @ TraceError::Died(_))) => {
+                return Err(died);
+            }
+            Err(error) => return Err(self.refuse_exec_return(anyhow::Error::new(error))),
+        };
+        #[cfg(target_arch = "x86_64")]
+        const NATIVE_AUDIT_ARCH: u32 = 0xc000_003e;
+        #[cfg(target_arch = "aarch64")]
+        const NATIVE_AUDIT_ARCH: u32 = 0xc000_00b7;
+        let returned_regs = task.getregs()?;
+        if event != Event::Syscall
+            || info.architecture != NATIVE_AUDIT_ARCH
+            || info.operation
+                != (safeptrace::SyscallInfoOp::Exit {
+                    return_value: 0,
+                    is_error: false,
+                })
+            || info.instruction_pointer != entry_ip
+            || info.stack_pointer != entry_sp
+            || returned_regs.ip() != entry_regs.ip()
+            || returned_regs.stack_ptr() != entry_regs.stack_ptr()
+            || returned_regs.ret() != 0
+        {
+            // This stop does not authorize guest execution or another resume
+            // toward an assumed exit. Retain its owned stop for fatal cleanup;
+            // do not consume or reinject a signal while guessing the phase.
+            let signal_observation = event.signal().map(|signal| {
+                (
+                    is_group_stop(&task, signal),
+                    task.getsiginfo()
+                        .map(|si| (si.si_signo, si.si_errno, si.si_code)),
+                )
+            });
+            return Err(self.refuse_exec_return(anyhow::anyhow!(
+                "expected native EXIT(0) at entry ip={entry_ip:#x} sp={entry_sp:#x}; \
+                 observed event={event:?} info={info:?} ip={:#x} sp={:#x} return={:#x} signal={signal_observation:?}",
+                returned_regs.ip(),
+                returned_regs.stack_ptr(),
+                returned_regs.ret(),
+            )));
+        }
         #[cfg(test)]
-        let stepped = match POST_EXEC_STEP_FOR_TEST.with(|slot| slot.borrow_mut().take()) {
-            Some(hook) => hook(stepped),
-            None => stepped,
-        };
+        if let Some(hook) = POST_EXEC_RETURN_FOR_TEST.with(|slot| slot.borrow_mut().take()) {
+            hook(&task, &info);
+        }
         #[cfg(test)]
         at_preinit_point(
             &preinit_point,
-            stepped.pid(),
-            || stepped.terminal_cleanup(),
-            PreinitPoint::PostExecStepped,
+            task.pid(),
+            || task.terminal_cleanup(),
+            PreinitPoint::PostExecDrained,
         );
-        // A SIGKILL at the exec stop leaves the tracee in its exit stop,
-        // which is published to the exit notifier, not to this wait. The
-        // step resumes it from there, so the wait can see it exit, as the
-        // mmap wait in `tracee_preinit` can.
-        // Keep the task's original owner/generation while filtering, as
-        // every other ordinary wait does. Generic wait_for_signal requires
-        // a native thread pidfd, even when its input retained legacy mode.
-        let mut running = stepped;
-        let (task, event) = loop {
-            match running.next_state_with_owner(&self.ptracer_waits).await? {
-                Wait::Stopped(task, event) if event == Event::Signal(Signal::SIGTRAP) => {
-                    if exec_sigtrap_shielded {
-                        let mask = sigmask(&task)?;
-                        set_sigmask(&task, mask | SIGTRAP_BIT)?;
-                    }
-                    break (task, event);
-                }
-                Wait::Stopped(task, event) => {
-                    self.arm_liteinst_root_stop(&task, &event);
-                    let signal = match event {
-                        Event::Signal(signal) => self.filter_direct_unreported(&task, signal).await,
-                        Event::RawSignal(raw) => match AnySignal::new(raw) {
-                            Some(signal) => self.filter_direct_unreported(&task, signal).await,
-                            None => None,
-                        },
-                        _ => None,
-                    };
-                    running = self.resume_stopped_any(task, signal)?;
-                }
-                Wait::Exited(pid, exit_status) => return Ok(Wait::Exited(pid, exit_status)),
-            }
-        };
-        assert_eq!(event, Event::Signal(Signal::SIGTRAP));
-        self.arm_liteinst_root_stop(&task, &event);
         let task = match self.tracee_preinit(task, PreinitPlace::AtExec).await? {
             PreinitOutcome::Ready(task) => task,
+            PreinitOutcome::Refused(_task) => return Err(Errno::ECANCELED.into()),
             PreinitOutcome::Exited(pid, exit_status) => {
                 self.exec_sigtrap_quiet = false;
                 return Ok(Wait::Exited(pid, exit_status));
