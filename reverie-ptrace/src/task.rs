@@ -1089,6 +1089,20 @@ fn callback_observation_decision(
 #[cfg(target_arch = "x86_64")]
 const UC_SIGMASK_OFFSET: u64 = 8 + 8 + 24 + 256;
 
+/// Whether the mask a reported `rt_sigreturn`'s `frame` installs is known
+/// and leaves reverie-ptrace's timer signal unblocked, so that a timer
+/// notification requested at the stop reaches the guest after the return
+/// (see [`crate::timer::Timer::disregard_sigreturn_stop`]). A frame the
+/// backend could not read may also make the kernel's read fault.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+fn timer_notified_after_return(frame: reverie::SigreturnFrame) -> bool {
+    matches!(
+        frame,
+        reverie::SigreturnFrame::Readable { mask }
+            if mask & (1 << (reverie::PERF_EVENT_SIGNAL as u32 - 1)) == 0
+    )
+}
+
 /// What of the `rt_sigreturn` frame at stack pointer `sp` can be read: see
 /// [`TracedTask::report_sigreturn`].
 #[cfg(target_arch = "x86_64")]
@@ -4258,10 +4272,12 @@ impl<L: Tool + 'static> TracedTask<L> {
     /// mapped page whatever its protection: if that succeeds the word is
     /// mapped but protected, otherwise it is unmapped.
     #[cfg(target_arch = "x86_64")]
-    fn report_sigreturn(&mut self, task: &Stopped, sp: u64) {
-        let report = reverie::SigreturnReport::new(self.tid(), sp, sigreturn_frame(task, sp));
+    fn report_sigreturn(&mut self, task: &Stopped, sp: u64) -> reverie::SigreturnFrame {
+        let frame = sigreturn_frame(task, sp);
+        let report = reverie::SigreturnReport::new(self.tid(), sp, frame);
         let tool = self.process_state.clone();
         tool.handle_sigreturn(&mut self.thread_state, report);
+        frame
     }
 
     // TODO-HUMAN-REVIEW(PR-103): Review rewritten rt_sigreturn tail execution.
@@ -5610,18 +5626,28 @@ impl<L: Tool + 'static> TracedTask<L> {
             if sigreturn {
                 // The Tool does not see this stop as an event and cannot ask
                 // for a timer here, so the stop keeps the timer event as an
-                // injected-trap rt_sigreturn does (`handle_injected_syscall`):
-                // it is cancelled only within `PmuConfig::keep_margin` of its
-                // target, where the guest's clock alone decides.
+                // injected-trap rt_sigreturn does (`handle_injected_syscall`)
+                // more than `PmuConfig::keep_margin` short of its target.
+                // Within the margin, where host timing decides whether its
+                // notification is pending, taken or lost, an undelivered
+                // precise event is cancelled and requested again at the same
+                // target, so that it still fires there, as the guest's clock
+                // alone decides, or, if a late notification let the guest
+                // pass the target, one branch after the return
+                // (`Timer::disregard_sigreturn_stop`). Only if
+                // the mask the frame installs leaves the timer's signal
+                // unblocked, since the new request's notification comes after
+                // the return; otherwise the event is cancelled, as before.
                 #[cfg(target_arch = "x86_64")]
                 {
                     let sp = task
                         .getregs()
                         .tracee_context(tid, "read rt_sigreturn registers")?
                         .rsp;
-                    self.report_sigreturn(&task, sp);
+                    let frame = self.report_sigreturn(&task, sp);
+                    let notified_after_return = timer_notified_after_return(frame);
                     self.timer
-                        .disregard_stop_before_period()
+                        .disregard_sigreturn_stop(notified_after_return)
                         .map_err(TraceError::from)
                         .tracee_context(tid, "keep the timer across rt_sigreturn")?;
                 }
@@ -9448,6 +9474,29 @@ mod exec_owner_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_timer_is_notified_after_a_return_only_through_a_known_open_mask() {
+        use reverie::SigreturnFrame;
+
+        use super::timer_notified_after_return;
+        let timer = 1u64 << (reverie::PERF_EVENT_SIGNAL as u32 - 1);
+        let usr1 = 1u64 << (libc::SIGUSR1 - 1);
+        assert!(timer_notified_after_return(SigreturnFrame::Readable {
+            mask: 0
+        }));
+        assert!(timer_notified_after_return(SigreturnFrame::Readable {
+            mask: usr1
+        }));
+        assert!(!timer_notified_after_return(SigreturnFrame::Readable {
+            mask: timer
+        }));
+        assert!(!timer_notified_after_return(SigreturnFrame::Readable {
+            mask: !0
+        }));
+        assert!(!timer_notified_after_return(SigreturnFrame::Unmapped));
+        assert!(!timer_notified_after_return(SigreturnFrame::Protected));
+    }
+
     #[test]
     fn private_step_distinguishes_not_run_ran_held_and_unexpected() {
         use super::PrivateStep;

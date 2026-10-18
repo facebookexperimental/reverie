@@ -45,7 +45,12 @@
 //! largest skid margin of any processor in the PMU table, plus the single
 //! steps of an artificial notification, so the same guest clock keeps or
 //! cancels the event on every supported processor; only a skid margin
-//! override above the table's largest moves it.
+//! override above the table's largest moves it. A reported `rt_sigreturn`
+//! (`Timer::disregard_sigreturn_stop()`) requests a precise event it would
+//! cancel, and that nothing has delivered, again, where the mask its frame
+//! installs leaves the timer's signal unblocked: at the same target if the
+//! guest is short of it, and one conditional branch after the return if a
+//! late notification let the guest pass it.
 //!
 //! Proper use of timers requires that all delivered signals of type
 //! `Timer::signal_type()` be passed through `Timer::handle_signal`, and that
@@ -1317,6 +1322,64 @@ impl Timer {
         }
     }
 
+    /// Disregards the stop at a guest `rt_sigreturn` reported to the Tool
+    /// before it runs, as [`Timer::disregard_stop_before_period`] does, except
+    /// that where that would cancel a precise event nothing has delivered
+    /// yet, the event is cancelled (see [`Timer::retire`]) and then requested
+    /// again: at the same target, if the guest's clock is still short of it,
+    /// and one conditional branch after the return if it was Scheduled and
+    /// the guest has passed its delivery point (below). Only where the mask
+    /// the frame installs leaves the timer's signal unblocked (below).
+    ///
+    /// The stop makes no Tool callback, so the Tool cannot ask for the event
+    /// again itself. Cancelled and not requested again, an event within the
+    /// keep margin of a handler return would be lost until the thread's next
+    /// Tool-observable stop, and a thread that returns from its handler and
+    /// then runs without one would never receive it. Requested again, it is
+    /// delivered at its original target, however near: closer than this
+    /// processor's skid margin the request is driven by an artificial
+    /// notification and single steps, which start once the guest's
+    /// `rt_sigreturn`, which retires no conditional branch in user mode, has
+    /// restored the interrupted context. Whether the notification was
+    /// pending, taken or lost at the stop changes nothing: every one of
+    /// those undelivered events is requested again at the same target, so
+    /// the event's delivery point is decided by the guest's clock alone, as
+    /// [`Timer::disregard_stop_before_period`] decides by cancelling.
+    ///
+    /// A Scheduled event whose delivery point the guest has passed had a
+    /// late notification: the stop records the overshoot, as there, and
+    /// requests the event one conditional branch after the return, where
+    /// without the reports the late notification would have delivered it,
+    /// at a clock host timing decided. Not requested again: an imprecise
+    /// event, which is cancelled past its period as there (Detcore requests
+    /// them only under `--imprecise-timers`); and an event at its clock
+    /// target whose instruction offset is still ahead, which is cancelled
+    /// without a recorded overshoot, as before (a request needs at least one
+    /// conditional branch, and no in-tree Tool asks for instruction
+    /// offsets).
+    ///
+    /// The new request's notification, artificial or from the PMU, reaches
+    /// the guest only after its `rt_sigreturn` has installed the frame's
+    /// mask. The caller passes `notified_after_return` true only if that
+    /// mask is known and leaves the timer's signal unblocked. Otherwise
+    /// nothing is requested again, and the stop decides exactly as
+    /// [`Timer::disregard_stop_before_period`] does: a request whose
+    /// notification stays blocked would also leave an event whose single
+    /// steps the stop ended with nothing to drive it.
+    pub(crate) fn disregard_sigreturn_stop(
+        &mut self,
+        notified_after_return: bool,
+    ) -> Result<(), Errno> {
+        match self.inner_mut_noinit() {
+            Some(timer) => {
+                let result = timer.disregard_sigreturn_stop(notified_after_return);
+                timer.check_kept_programming(result.is_ok());
+                result
+            }
+            None => Ok(()),
+        }
+    }
+
     /// Cancel pending timer notifications. This is idempotent.
     ///
     /// If there was a previous call to [`Timer::enable_interval'], this
@@ -1702,6 +1765,16 @@ enum Interruption {
     At(InterruptedSteps),
     /// The step's cleanup failed, so what it ran is unknown.
     Lost,
+}
+
+/// A precise event that a reported `rt_sigreturn` found undelivered (see
+/// [`Timer::disregard_sigreturn_stop`]).
+#[derive(Debug, Copy, Clone)]
+struct UndeliveredEvent {
+    clock_target: u64,
+    offset: u64,
+    /// It was Scheduled before the stop, not Armed with steps under way.
+    scheduled: bool,
 }
 
 /// The timer's state before it observed a stop.
@@ -2579,6 +2652,92 @@ impl TimerImpl {
             // point: steps end the programming.
             _ => self.retire(),
         }
+    }
+
+    fn disregard_sigreturn_stop(&mut self, notified_after_return: bool) -> Result<(), Errno> {
+        // Both read before the stop is disregarded, which consumes what the
+        // stop observed.
+        let past_keep_point = self.past_keep_point()?;
+        let undelivered = self
+            .undelivered_precise_event()
+            .filter(|_| notified_after_return);
+        match self.disregard_stop()? {
+            None if !past_keep_point => Ok(()),
+            _ => {
+                self.retire()?;
+                match undelivered {
+                    Some(undelivered) => self.request_again(undelivered),
+                    None => Ok(()),
+                }
+            }
+        }
+    }
+
+    /// The active precise event if nothing has delivered it: before the
+    /// latest observed stop it was still Scheduled, or it was Armed with
+    /// single steps toward it under way, or with their cleanup failed. An
+    /// Armed event the stop did not interrupt was delivered. `None` too for
+    /// an imprecise event, and for a held initial-command request.
+    fn undelivered_precise_event(&self) -> Option<UndeliveredEvent> {
+        if self.initial_command != InitialCommand::Ordinary {
+            return None;
+        }
+        let ActiveEvent::Precise {
+            clock_target,
+            offset,
+        } = self.event
+        else {
+            return None;
+        };
+        let (scheduled, interrupted) = match &self.observed {
+            Some(observed) => (
+                observed.before == EventStatus::Scheduled,
+                observed.interrupted.is_some(),
+            ),
+            None => (
+                self.timer_status == EventStatus::Scheduled,
+                self.interrupted.is_some(),
+            ),
+        };
+        (scheduled || interrupted).then_some(UndeliveredEvent {
+            clock_target,
+            offset,
+            scheduled,
+        })
+    }
+
+    /// Requests the undelivered event that the stop retired again (see
+    /// [`Timer::disregard_sigreturn_stop`]). Short of its clock target, at
+    /// the same absolute target. Past its delivery point, if it was
+    /// Scheduled, one conditional branch after the return: the notification
+    /// was late, the stop recorded the overshoot (an observed stop finds a
+    /// Scheduled event's reached delivery point, and the retire or the
+    /// disregarded stop commits it), and without the reports the late
+    /// notification would have delivered it after the return too, at a
+    /// clock that host timing decided. An Armed event's steps do not pass
+    /// its target, and one whose cleanup failed may have, unrecorded, so
+    /// neither is requested past it. Nor is an event at its clock target
+    /// whose instruction offset is still ahead: a request needs at least one
+    /// conditional branch, and no in-tree Tool asks for instruction offsets.
+    fn request_again(&mut self, undelivered: UndeliveredEvent) -> Result<(), Errno> {
+        let UndeliveredEvent {
+            clock_target,
+            offset,
+            scheduled,
+        } = undelivered;
+        let clock = self.read_clock();
+        if clock < clock_target {
+            let ticks = clock_target - clock;
+            return self.request_event(if offset == 0 {
+                TimerEventRequest::Precise(ticks)
+            } else {
+                TimerEventRequest::PreciseInstruction(ticks, offset)
+            });
+        }
+        if scheduled && target_reached(clock, clock_target, offset) {
+            return self.request_event(TimerEventRequest::Precise(1));
+        }
+        Ok(())
     }
 
     /// Checks, if the stop just disregarded kept a scheduled event whose
@@ -4941,8 +5100,111 @@ mod tests {
         assert_eq!(timer.disregard_stop_before_period(), Ok(()));
         assert_eq!(timer.timer_status, EventStatus::Cancelled);
         assert_eq!(timer.overflow_period, None);
+
+        // A reported handler return keeps the same events, and where the
+        // stop above cancels an event nothing has delivered, requests it
+        // again at the same target, with records and without.
+        let config = super::get_pmu_config();
+        let requested_again = |timer: &TimerImpl, target| {
+            assert_eq!(timer.timer_status, EventStatus::Scheduled);
+            assert_eq!(
+                timer.event,
+                super::ActiveEvent::Precise {
+                    clock_target: target,
+                    offset: 0,
+                }
+            );
+            let ticks = target - timer.read_clock();
+            let margin = if config.stages(ticks) {
+                config.first_stage_margin()
+            } else {
+                config.skid_margin()
+            };
+            let notification = ticks.saturating_sub(margin);
+            if notification <= super::SINGLESTEP_TIMEOUT_RCBS {
+                assert!(timer.send_artificial_signal);
+                assert_eq!(timer.overflow_period, None);
+            } else {
+                assert!(!timer.send_artificial_signal);
+                assert_eq!(timer.overflow_period, Some(notification));
+            }
+        };
+        for records in [true, false] {
+            if !records {
+                timer.timer.unmap_sample_records();
+            }
+            // Beyond the keep margin the event and its programming stay.
+            timer.set_status(EventStatus::Scheduled);
+            timer.prepare_notification(far).unwrap();
+            timer.event = precise(&timer, keep_margin + 100_000);
+            timer.tick_observed();
+            assert_eq!(timer.disregard_sigreturn_stop(true), Ok(()));
+            assert_eq!(timer.timer_status, EventStatus::Scheduled);
+            assert_eq!(timer.overflow_period, Some(far));
+            // Within it a Scheduled event is requested again.
+            timer.set_status(EventStatus::Scheduled);
+            timer.prepare_notification(far).unwrap();
+            let target = timer.read_clock() + keep_margin - 1_000;
+            timer.event = precise(&timer, keep_margin - 1_000);
+            timer.tick_observed();
+            assert_eq!(timer.disregard_sigreturn_stop(true), Ok(()));
+            requested_again(&timer, target);
+            // Ends the programming before this thread's own branches reach
+            // it; the clock is stopped, so the target is not reached.
+            timer.retire().unwrap();
+            // So is an Armed event whose single steps the stop interrupted.
+            let steps = InterruptedSteps {
+                steps: ClockCounter::new(PERIOD - 10, 0, PERIOD),
+                target_instr: 0,
+            };
+            timer.set_status(EventStatus::Armed);
+            timer.event = precise(&timer, 50);
+            timer.interrupted = Some(Interruption::At(steps));
+            timer.tick_observed();
+            assert_eq!(timer.disregard_sigreturn_stop(true), Ok(()));
+            requested_again(&timer, timer.read_clock() + 50);
+            timer.retire().unwrap();
+            // With the timer's signal blocked by the mask the frame installs,
+            // or that mask unknown, neither is requested again.
+            timer.set_status(EventStatus::Scheduled);
+            timer.prepare_notification(far).unwrap();
+            timer.event = precise(&timer, keep_margin - 1_000);
+            timer.tick_observed();
+            assert_eq!(timer.disregard_sigreturn_stop(false), Ok(()));
+            assert_eq!(timer.timer_status, EventStatus::Cancelled);
+            assert_eq!(timer.overflow_period, None);
+            assert!(!timer.send_artificial_signal);
+            timer.set_status(EventStatus::Armed);
+            timer.event = precise(&timer, 50);
+            timer.interrupted = Some(Interruption::At(steps));
+            timer.tick_observed();
+            assert_eq!(timer.disregard_sigreturn_stop(false), Ok(()));
+            assert_eq!(timer.timer_status, EventStatus::Cancelled);
+            assert!(!timer.send_artificial_signal);
+            // An Armed event that the stop did not interrupt was delivered,
+            // and is not requested again.
+            timer.set_status(EventStatus::Armed);
+            timer.event = precise(&timer, 50);
+            timer.tick_observed();
+            assert_eq!(timer.disregard_sigreturn_stop(true), Ok(()));
+            assert_eq!(timer.timer_status, EventStatus::Cancelled);
+            assert!(!timer.send_artificial_signal);
+            // Nor is one the guest's clock has reached, here with an
+            // instruction offset still ahead, so that the stop records no
+            // skid overshoot in the process-wide count.
+            timer.set_status(EventStatus::Scheduled);
+            timer.prepare_notification(far).unwrap();
+            timer.event = super::ActiveEvent::Precise {
+                clock_target: timer.read_clock(),
+                offset: 1,
+            };
+            timer.tick_observed();
+            assert_eq!(timer.disregard_sigreturn_stop(true), Ok(()));
+            assert_eq!(timer.timer_status, EventStatus::Cancelled);
+            assert_eq!(timer.overflow_period, None);
+            assert!(!timer.send_artificial_signal);
+        }
         timer.event = super::ActiveEvent::Imprecise { clock_min: 0 };
-        timer.timer.unmap_sample_records();
 
         assert!(take_timer_signal_now().is_none());
         unsafe {

@@ -3057,16 +3057,20 @@ async fn a_counting_timer_survives_an_untraced_number_and_a_handler_return() {
 }
 
 /// A Tool that observes sigreturns makes each handler return a stop that the
-/// Tool does not see as an event, and the stop keeps an armed timer as an
-/// injected-trap `rt_sigreturn` does: far from its target the event survives,
-/// and within the keep margin (10005 branches) it is cancelled, where the
-/// guest's clock alone decides. `timer_far_sigreturn` arms its timer 30001
-/// branches before the handler returns: the same single timer event fires as
-/// without the opt-in. `timer_hop_sigreturn` arms it 3001 branches out: the
-/// event fires without the opt-in and is cancelled with it. Both handler
-/// returns are reported, one per run.
+/// Tool does not see as an event, and the timer event fires where it fires
+/// without the opt-in. Far from its target the stop keeps the event as an
+/// injected-trap `rt_sigreturn` does; within the keep margin (10005
+/// branches), where an injected-trap return cancels it, the stop requests it
+/// again at the same target (`Timer::disregard_sigreturn_stop`).
+/// `timer_far_sigreturn` arms its timer 30001 branches before the handler
+/// returns, and `timer_hop_sigreturn` 3001: in each, the same single timer
+/// event fires, at the same instruction and clock, as without the opt-in.
+/// Only the number of single steps toward it may differ, which host timing
+/// decides. `timer_hop_sigreturn_blocked` blocks the timer's signal across
+/// the return, so the stop cannot request the event again and cancels it,
+/// as before. Each handler return is reported, one per run.
 #[tokio::test(flavor = "current_thread")]
-async fn a_reported_handler_return_keeps_a_timer_unless_within_the_keep_margin() {
+async fn a_reported_handler_return_keeps_a_timer_at_its_target() {
     if !crate::perf::is_perf_supported() {
         eprintln!("skipping: perf counters are not supported here");
         return;
@@ -3100,18 +3104,86 @@ async fn a_reported_handler_return_keeps_a_timer_unless_within_the_keep_margin()
         assert_eq!(timer_events(plain), timer_events(observed));
     }
     let near = "timer hop sigreturn getpid=1 bytes after 0f 05";
-    timer_mode_runs_with("timer_hop_sigreturn", observing, |runs| {
+    let plain = timer_mode_runs("timer_hop_sigreturn", one_event(near, 0)).await;
+    let observed = timer_mode_runs_with("timer_hop_sigreturn", observing, one_event(near, 2)).await;
+    // The instruction, clock and result register at the event, without the
+    // count of single steps.
+    let fired_at = |run: &GuestRun| -> Vec<String> {
+        timer_events(run)
+            .into_iter()
+            .map(|event| event.split(" steps=").next().unwrap().to_owned())
+            .collect()
+    };
+    for (plain, observed) in plain.iter().zip(&observed) {
+        assert_eq!(
+            fired_at(plain),
+            fired_at(observed),
+            "within the keep margin"
+        );
+    }
+    // With the timer's signal blocked by the mask the frame installs, a
+    // notification requested at the return could not arrive, so the stop
+    // cancels the event as before, and the guest still runs to its end. The
+    // stop's choice is not visible here: the next Tool-visible stop would
+    // cancel a request it made anyway. `timer_notified_after_return`'s and
+    // the timer's unit tests check the choice.
+    let blocked = "timer hop sigreturn blocked getpid=1 bytes after 0f 05";
+    timer_mode_runs_with("timer_hop_sigreturn_blocked", observing, |runs| {
         reports_per_attempt(2);
         for run in runs {
             assert_eq!(
                 timer_events(run),
                 Vec::<&String>::new(),
-                "within the keep margin"
+                "the frame blocks the timer's signal"
             );
-            assert_report_has(run, &[near]);
+            assert_report_has(run, &[blocked]);
         }
     })
     .await;
+}
+
+/// A handler that holds its timer's notification back past the target, by
+/// blocking the timer's signal, returns to a mask that unblocks it. Without
+/// the opt-in the late notification delivers the event after the return,
+/// at a clock host timing decides, with a skid-overshoot witness. With it,
+/// the reported return finds the Scheduled event past its target, records
+/// the overshoot, and requests the event one branch after the return
+/// (`Timer::disregard_sigreturn_stop`), so it still fires once rather than
+/// being lost. Each run is witnessed once.
+#[tokio::test(flavor = "current_thread")]
+async fn a_reported_handler_return_past_a_held_back_timer_still_delivers_it() {
+    if !crate::perf::is_perf_supported() {
+        eprintln!("skipping: perf counters are not supported here");
+        return;
+    }
+    let _serial = SIGRETURN_TESTS.lock().await;
+    let line = "timer late sigreturn getpid=1 bytes after 0f 05";
+    for sigreturns in [false, true] {
+        for tail in [false, true] {
+            SIGRETURN_REPORTS.lock().unwrap().clear();
+            let _ = reverie::take_skid_overshoot_count();
+            let options = GuestOptions {
+                sigreturns,
+                tail,
+                ..Default::default()
+            };
+            let run = run_guest_options("timer_late_sigreturn", options)
+                .await
+                .expect("timer_late_sigreturn run");
+            let witnesses = reverie::take_skid_overshoot_count();
+            let reports = std::mem::take(&mut *SIGRETURN_REPORTS.lock().unwrap());
+            assert_eq!(run.status, ExitStatus::Exited(0), "{}", run.report);
+            assert_report_has(&run, &[line]);
+            assert_eq!(
+                timer_events(&run).len(),
+                1,
+                "sigreturns={sigreturns} tail={tail}: {:#?}",
+                run.all_events()
+            );
+            assert_eq!(witnesses, 1, "sigreturns={sigreturns} tail={tail}");
+            assert_eq!(reports.len(), usize::from(sigreturns), "{reports:?}");
+        }
+    }
 }
 
 /// Every Tool-visible stop cancels an armed counting-phase timer, both a

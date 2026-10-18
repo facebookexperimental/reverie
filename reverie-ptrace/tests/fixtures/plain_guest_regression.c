@@ -1810,6 +1810,72 @@ static void mode_timer_hop_sigreturn(void) {
   timer_hop_sigreturn("timer hop sigreturn");
 }
 
+/* Blocks reverie-ptrace's timer signal (PERF_EVENT_SIGNAL, SIGSTKFLT) for
+ * the rest of the handler, arms the timer PM_BRANCHES + 1 branches out, and
+ * runs twice that far before returning, so that the timer's notification is
+ * held back past its target until the rt_sigreturn restores the frame's mask,
+ * which leaves the signal unblocked. */
+static void timer_late_handler(int sig, siginfo_t* si, void* uc_) {
+  (void)sig;
+  (void)si;
+  (void)uc_;
+  sigset_t set;
+  sigemptyset(&set);
+  sigaddset(&set, SIGSTKFLT);
+  if (sigprocmask(SIG_BLOCK, &set, NULL) != 0)
+    die("block SIGSTKFLT");
+  SITEM(SYS_getppid, 0, 0, 0, 0, PM_BRANCHES + 1, ARM_TIMER);
+  for (volatile long j = 0; j < 2 * PM_BRANCHES; j++)
+    ;
+}
+
+/* A handler that runs past its timer's target with the notification held
+ * back (timer_late_handler), returning through the warmed site as in
+ * timer_hop_sigreturn, then the same branch loop and getpid. */
+static void mode_timer_late_sigreturn(void) {
+  warm();
+  struct {
+    void* handler;
+    unsigned long flags;
+    void* restorer;
+    unsigned long mask;
+  } ksa = {
+      (void*)timer_late_handler,
+      SA_SIGINFO | 0x04000000 /* SA_RESTORER */,
+      (void*)tp_restorer,
+      0};
+  if (syscall(SYS_rt_sigaction, SIGUSR1, &ksa, NULL, 8) != 0)
+    die("rt_sigaction");
+  long pid = getpid();
+  long tid = syscall(SYS_gettid);
+  if (syscall(SYS_tgkill, pid, tid, SIGUSR1) != 0)
+    die("tgkill");
+  for (volatile long j = 0; j < 3 * PM_BRANCHES; j++)
+    ;
+  long g = SITE(SYS_getpid, 0, 0, 0, 0, 0);
+  unsigned char* p = (unsigned char*)tp_site;
+  say("timer late sigreturn getpid=%d bytes after %02x %02x\n",
+      g == pid,
+      p[0],
+      p[1]);
+}
+
+/* As mode_timer_hop_sigreturn, with reverie-ptrace's timer signal
+ * (PERF_EVENT_SIGNAL, SIGSTKFLT) blocked from before the signal until after
+ * the branch loop, so that the mask the handler's frame installs blocks it.
+ * A notification requested at the handler's return could not arrive before
+ * the loop ends. */
+static void mode_timer_hop_sigreturn_blocked(void) {
+  sigset_t set;
+  sigemptyset(&set);
+  sigaddset(&set, SIGSTKFLT);
+  if (sigprocmask(SIG_BLOCK, &set, NULL) != 0)
+    die("block SIGSTKFLT");
+  timer_hop_sigreturn("timer hop sigreturn blocked");
+  if (sigprocmask(SIG_UNBLOCK, &set, NULL) != 0)
+    die("unblock SIGSTKFLT");
+}
+
 /* As mode_timer_hop_sigreturn, with the timer armed 30001 branches out:
  * more than three times reverie-ptrace's keep margin (10005), so a stop at
  * the handler's rt_sigreturn finds the guest far from the timer's target. */
@@ -2677,6 +2743,10 @@ int main(int argc, char** argv) {
     mode_timer_hop_unknown();
   else if (!strcmp(m, "timer_hop_sigreturn"))
     mode_timer_hop_sigreturn();
+  else if (!strcmp(m, "timer_hop_sigreturn_blocked"))
+    mode_timer_hop_sigreturn_blocked();
+  else if (!strcmp(m, "timer_late_sigreturn"))
+    mode_timer_late_sigreturn();
   else if (!strcmp(m, "timer_far_sigreturn"))
     mode_timer_far_sigreturn();
   else if (!strcmp(m, "sigreturn_slot_ret"))
