@@ -3047,6 +3047,80 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a built DynamoRIO and native client; run explicitly with --ignored"]
+    fn private_memory_loss_injection_failure_is_a_backend_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("private_memory_exec");
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/private_memory_exec.c");
+        let compile = Command::new("cc")
+            .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
+            .arg(source)
+            .arg("-o")
+            .arg(&program)
+            .output()
+            .unwrap();
+        assert!(compile.status.success(), "{compile:?}");
+
+        // This is the explicit control-backing fault injector, not guest close
+        // admission. A real close(-1) fails without destroying the live backing.
+        let mut snapshots = Vec::new();
+        for protected in [false, true] {
+            let evidence = tempfile::tempfile().unwrap();
+            let sink = DbtStatsSink::new().unwrap();
+            let [flag, path] = sink.client_arguments(sink.directory());
+            let mut runner = DbtRunner::from_env()
+                .expect("built DynamoRIO and native client")
+                .client_argument(flag)
+                .client_argument(path)
+                .client_argument("-test-private-memory")
+                .client_argument("lost-exec-close-failure");
+            if protected {
+                runner = runner.evidence_file(&evidence).unwrap();
+            }
+            let mut command = Command::new(&program);
+            command.arg("exec");
+            let result = runner.output(&command);
+            eprintln!("private memory close failure protected={protected}: {result:?}");
+            let (stdout, stderr) = if protected {
+                let error = result.unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("DBT backend or Tool reported an internal failure"),
+                    "{error}"
+                );
+                assert_eq!(evidence.metadata().unwrap().len(), 0);
+                let output = failed_run_output(&error).expect("retained failure output");
+                (output.stdout.clone(), output.stderr.clone())
+            } else {
+                let output = result.unwrap();
+                assert_eq!(output.status.code(), Some(101), "{output:?}");
+                (output.stdout, output.stderr)
+            };
+            assert!(stdout.is_empty(), "{stdout:?}");
+            let stderr = String::from_utf8(stderr).unwrap();
+            assert_eq!(
+                stderr
+                    .matches("PRIVATE_MEMORY_TEST loss-injection-failed\n")
+                    .count(),
+                1
+            );
+            assert!(!stderr.contains("followed_exec=1"), "{stderr}");
+            let snapshot = sink.drain().unwrap().snapshot().clone();
+            eprintln!(
+                "private memory close failure protected={protected}: failures={} {snapshot}",
+                snapshot.backend_failures()
+            );
+            assert_eq!(snapshot.process_images(), 1, "{snapshot}");
+            snapshots.push(snapshot);
+        }
+        for snapshot in snapshots {
+            assert_eq!(snapshot.backend_failures(), 1, "{snapshot}");
+        }
+    }
+
+    #[test]
     #[ignore = "requires built DynamoRIO and native client; run explicitly with --ignored"]
     fn a_copied_failure_publishes_its_record_before_root_termination() {
         use crate::backend_stats::DbtProcessRecord;

@@ -3120,9 +3120,7 @@ mod tests {
         assert!(source.contains("reverie_dbt_runtime_background_init_v3("));
     }
 
-    #[test]
-    fn native_internal_exits_mark_the_final_outcome() {
-        let source = include_str!("../native/client.c");
+    fn check_native_internal_exits(source: &str) {
         let failure_marker = source
             .split_once("static void mark_backend_failure(void) {")
             .unwrap()
@@ -3188,19 +3186,111 @@ mod tests {
             background_start.contains("exit_runtime_tree(CLIENT_THREAD_START_FAILURE_EXIT_CODE);")
         );
 
-        // The other direct call is the ABI refusal before the evidence transport
-        // and exit callback exist. It cannot report a terminal outcome and must
-        // continue to fail as missing evidence.
-        assert_eq!(source.matches("dr_exit_process(").count(), 2);
+        // Enumerate every direct exit. Only termination itself and explicit
+        // startup refusals may bypass the failure-marking entry point. In
+        // particular, an active exec fault control must mark FINAL as failed.
+        let region = |start: &str, end: &str| {
+            source
+                .split_once(start)
+                .unwrap()
+                .1
+                .split_once(end)
+                .unwrap()
+                .0
+        };
+        let exec_retirement = region(
+            "static void retire_private_memory_for_exec(void) {",
+            "static int32_t runtime_private_memory(",
+        );
+        assert!(!exec_retirement.contains("dr_exit_process("));
+        assert!(exec_retirement.contains("exit_runtime_tree(101);"));
+        let startup_check = region(
+            "static bool private_memory_test_check(bool condition, const char* check) {",
+            "static bool private_memory_test_unavailable(",
+        );
+        let options = region(
+            "else if (strcmp(argv[i], \"-test-private-memory\") == 0) {",
+            "} else if (strcmp(argv[i], \"-test-compare-exchange\") == 0)",
+        );
+        for diagnostic in ["missing-mode", "invalid-mode"] {
+            let refusal = options
+                .split_once(&format!("PRIVATE_MEMORY_TEST {diagnostic}\\n"))
+                .unwrap()
+                .1
+                .split_once("return;")
+                .unwrap()
+                .0;
+            assert_eq!(refusal.matches("dr_exit_process(101);").count(), 1);
+        }
         let main = source
             .split_once("DR_EXPORT void dr_client_main")
             .unwrap()
             .1;
-        let abi_refusal = main.find("dr_exit_process(101);").unwrap();
+        let abi_refusal = main.find(NATIVE_ABI_REFUSAL).unwrap();
+        let abi_block = &main[abi_refusal..];
+        let abi_block = abi_block.split_once("\n  }\n").unwrap().0;
+        assert!(abi_block.contains("native/runtime ABI version or callback size mismatch"));
+        for (block, call, count) in [
+            (terminate_runtime_tree, "dr_exit_process(exit_code);", 1),
+            (startup_check, "dr_exit_process(101);", 1),
+            (options, "dr_exit_process(101);", 2),
+            (abi_block, "dr_exit_process(101);", 1),
+        ] {
+            assert_eq!(block.matches(call).count(), count);
+            assert_eq!(block.matches("dr_exit_process(").count(), count);
+        }
+        assert_eq!(source.matches("dr_exit_process(").count(), 5);
+
+        // Missing/invalid options and ABI refusal precede evidence setup.
+        // The startup self-test runs before the exit callback is registered.
+        // None can claim a completed terminal evidence stream.
         let evidence_initialization = main.find("initialize_evidence_transport();").unwrap();
         let exit_registration = main.find("drmgr_register_exit_event(event_exit);").unwrap();
+        let option_refusal = main.find("PRIVATE_MEMORY_TEST invalid-mode").unwrap();
+        let startup_test = main.find("run_private_memory_self_test()").unwrap();
+        assert!(option_refusal < evidence_initialization);
         assert!(abi_refusal < evidence_initialization);
         assert!(abi_refusal < exit_registration);
+        assert!(startup_test < exit_registration);
+    }
+
+    const NATIVE_ABI_REFUSAL: &str =
+        "if (runtime_abi_version != REVERIE_DBT_RUNTIME_ABI_VERSION ||";
+
+    #[test]
+    fn native_internal_exits_mark_the_final_outcome() {
+        check_native_internal_exits(include_str!("../native/client.c"));
+    }
+
+    #[test]
+    fn native_exit_guard_rejects_an_unclassified_runtime_exit() {
+        let source = include_str!("../native/client.c").replacen(
+            "static void retire_private_memory_for_exec(void) {",
+            "static void retire_private_memory_for_exec(void) {\n  dr_exit_process(101);",
+            1,
+        );
+        assert!(std::panic::catch_unwind(|| check_native_internal_exits(&source)).is_err());
+    }
+
+    #[test]
+    fn native_exit_guard_rejects_abi_refusal_after_evidence_initialization() {
+        let source = include_str!("../native/client.c");
+        let start = source.find(NATIVE_ABI_REFUSAL).unwrap();
+        let end = start
+            + source[start..]
+                .find("  DR_ASSERT(evidence_socket_seen == evidence_token_seen);")
+                .unwrap();
+        let block = &source[start..end];
+        let without = format!("{}{}", &source[..start], &source[end..]);
+        let source = without.replacen(
+            "initialize_evidence_transport();",
+            &format!("initialize_evidence_transport();\n  {block}"),
+            1,
+        );
+        // This mutation preserves all five exits and both earlier option
+        // refusals. A first-match ABI check would incorrectly accept it.
+        assert_eq!(source.matches("dr_exit_process(").count(), 5);
+        assert!(std::panic::catch_unwind(|| check_native_internal_exits(&source)).is_err());
     }
 
     #[test]

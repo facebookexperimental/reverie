@@ -500,6 +500,7 @@ enum {
 };
 static int test_private_memory;
 static bool test_private_memory_loss_injected;
+static bool test_private_memory_close_failure;
 static atomic_flag compare_exchange_self_tested = ATOMIC_FLAG_INIT;
 static void run_compare_exchange_self_test(void);
 static uint32_t compare_exchange_word(
@@ -1810,9 +1811,10 @@ static void retire_private_memory_for_exec(void) {
       !dr_is_post_execve() && !test_private_memory_loss_injected) {
     test_private_memory_loss_injected = true;
     // Explicit control-backing fault injection, not guest close semantics.
-    if (syscall(SYS_close, TASK_STATE_FD) != 0) {
+    int backing_fd = test_private_memory_close_failure ? -1 : TASK_STATE_FD;
+    if (syscall(SYS_close, backing_fd) != 0) {
       dr_fprintf(diagnostic_file, "PRIVATE_MEMORY_TEST loss-injection-failed\n");
-      dr_exit_process(101);
+      exit_runtime_tree(101);
     }
     dr_fprintf(diagnostic_file,
         "PRIVATE_MEMORY_TEST control-backing-loss-injected=1\n");
@@ -6809,7 +6811,10 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
         test_private_memory = PRIVATE_MEMORY_TEST_RETIRE;
       else if (strcmp(argv[i], "lost-exec") == 0)
         test_private_memory = PRIVATE_MEMORY_TEST_LOST_EXEC;
-      else if (strcmp(argv[i], "routes") == 0)
+      else if (strcmp(argv[i], "lost-exec-close-failure") == 0) {
+        test_private_memory = PRIVATE_MEMORY_TEST_LOST_EXEC;
+        test_private_memory_close_failure = true;
+      } else if (strcmp(argv[i], "routes") == 0)
         test_private_memory = PRIVATE_MEMORY_TEST_ROUTES;
       else {
         dr_fprintf(diagnostic_file, "PRIVATE_MEMORY_TEST invalid-mode\n");
