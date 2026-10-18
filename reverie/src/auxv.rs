@@ -138,6 +138,17 @@ impl Auxv {
             .and_then(|val| Addr::from_raw(*val as usize))
     }
 
+    /// The address of the NUL-terminated pathname the exec that started this
+    /// image was given (`AT_EXECFN`), as the guest spelled it.
+    ///
+    /// Returns `None` if the address is NULL or if `AT_EXECFN` does not exist in
+    /// the auxv table.
+    pub fn at_execfn(&self) -> Option<Addr<'_, u8>> {
+        self.map
+            .get(&libc::AT_EXECFN)
+            .and_then(|val| Addr::from_raw(*val as usize))
+    }
+
     /// The user ID of the thread.
     ///
     /// Returns `None` if the `AT_UID` does not exist in the auxv table.
@@ -185,6 +196,22 @@ mod tests {
         assert_eq!(
             map.at_random().map(|address| address.as_raw()),
             Some(0x1000),
+        );
+    }
+
+    #[test]
+    fn execfn_is_the_entrys_address_when_there_is_one() {
+        let map = Auxv::from_entries([(libc::AT_EXECFN, 0x2000)]);
+        assert_eq!(map.at_execfn().map(|addr| addr.as_raw()), Some(0x2000));
+        assert!(
+            Auxv::from_entries([(libc::AT_EXECFN, 0)])
+                .at_execfn()
+                .is_none()
+        );
+        assert!(
+            Auxv::from_entries([(libc::AT_UID, 1)])
+                .at_execfn()
+                .is_none()
         );
     }
 
