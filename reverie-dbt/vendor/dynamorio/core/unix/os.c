@@ -7665,11 +7665,60 @@ handle_clone_pre(dcontext_t *dcontext)
  * must set mcontext's register for that.
  */
 
+static void
+retire_private_reservations_for_syscall(int sysnum, const reg_t args[6])
+{
+#if defined(LINUX) && defined(X64)
+    /* Withdraw only the client's ownership fact, before any possible kernel
+     * transfer. This common path also runs for returning injections which
+     * intentionally suppress client syscall events. Never change the syscall
+     * arguments/result, and never restore authority merely because it failed. */
+    switch (sysnum) {
+    case SYS_mmap:
+        if (TEST(MAP_FIXED, args[3]))
+            heap_retire_private_reservation_overlap((byte *)args[0], args[1]);
+        break;
+    case SYS_munmap:
+        heap_retire_private_reservation_overlap((byte *)args[0], args[1]);
+        break;
+    case SYS_mremap: {
+        size_t old_size = args[1];
+        size_t new_size = args[2];
+        /* Include possible in-place expansion and zero-size alias requests. */
+        heap_retire_private_reservation_overlap((byte *)args[0], MAX(old_size, new_size));
+        if (TEST(2 /* MREMAP_FIXED */, args[3]))
+            heap_retire_private_reservation_overlap((byte *)args[4], new_size);
+        break;
+    }
+#    ifdef SYS_shmat
+    case SYS_shmat:
+        /* SHM_REMAP's length is an object property, not a syscall argument.
+         * With no authoritative extent, withdraw the bounded fact entirely. */
+        if (TEST(040000 /* SHM_REMAP */, args[2]))
+            heap_retire_private_reservations();
+        break;
+#    endif
+    default: break;
+    }
+#else
+    (void)sysnum;
+    (void)args;
+#endif
+}
+
+DR_API
+void
+dr_test_private_reservation_syscall(int sysnum, const reg_t args[6])
+{
+    /* Test the exact production dispatch/overlap/notification path without
+     * executing an unsafe kernel operation on DynamoRIO's live reservations. */
+    retire_private_reservations_for_syscall(sysnum, args);
+}
+
 /* Returns false if system call should NOT be executed (in which case,
  * post_system_call() will *not* be called!).
- * Returns true if system call should go ahead
- */
-/* XXX: split out specific handlers into separate routines
+ * Returns true if system call should go ahead.
+ * XXX: split out specific handlers into separate routines.
  */
 bool
 pre_system_call(dcontext_t *dcontext)
@@ -7690,6 +7739,13 @@ pre_system_call(dcontext_t *dcontext)
      * in syscall itself)
      */
     dcontext->sys_num = os_normalized_sysnum((int)MCXT_SYSNUM_REG(mc), NULL, dcontext);
+
+#if defined(LINUX) && defined(X64)
+    reg_t private_memory_args[6];
+    for (uint i = 0; i < 6; ++i)
+        private_memory_args[i] = sys_param(dcontext, i);
+    retire_private_reservations_for_syscall(dcontext->sys_num, private_memory_args);
+#endif
 
     RSTATS_INC(pre_syscall);
     DOSTATS({

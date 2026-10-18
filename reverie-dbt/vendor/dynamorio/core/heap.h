@@ -152,6 +152,14 @@ vmcode_get_end(void);
 void
 iterate_vmm_regions(void (*cb)(byte *region_start, byte *region_end, void *user_data),
                     void *user_data);
+size_t
+heap_private_reservations(byte **starts, size_t *sizes, size_t capacity);
+void
+heap_set_private_reservation_retirement_callback(void (*callback)(void));
+void
+heap_retire_private_reservation_overlap(byte *start, size_t size);
+void
+heap_retire_private_reservations(void);
 byte *
 vmcode_unreachable_pc(void);
 byte *

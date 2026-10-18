@@ -101,6 +101,23 @@ typedef int32_t (*controller_capture_control_t)(
     uintptr_t, uint32_t, controller_capture_fact_t*);
 
 typedef struct {
+  uint64_t start;
+  uint64_t end;
+} private_memory_range_t;
+
+typedef struct {
+  uint64_t owner[4]; // table device/inode, append-only slot, image epoch
+  uint64_t version;
+  uint32_t state; // 0: unavailable, 1: ready
+  uint32_t count;
+  private_memory_range_t ranges[3];
+} private_memory_snapshot_t;
+_Static_assert(sizeof(private_memory_snapshot_t) == 96,
+    "private memory snapshot ABI");
+typedef int32_t (*runtime_private_memory_t)(
+    uintptr_t, const private_memory_snapshot_t*, private_memory_snapshot_t*);
+
+typedef struct {
   int32_t signal;
   int32_t delivered_signal;
   unsigned char signal_info[128];
@@ -197,7 +214,8 @@ typedef struct {
 #define TASK_STATE_FD 197
 #define CLIENT_THREAD_START_FAILURE_EXIT_CODE 125
 #define DBT_DIAGNOSTIC_FD 198
-#define TASK_STATE_MAGIC UINT64_C(0x5245565049443036)
+// Layout 7 combines controller admission and private-memory image ownership.
+#define TASK_STATE_MAGIC UINT64_C(0x5245565049443037)
 #define MAX_TASK_MEMBERSHIPS 8192
 #define TEST_REUSED_TID_STALE 0
 #define EXEC_HELPER_RETIREMENT_TIMEOUT_MS UINT64_C(60000)
@@ -218,8 +236,13 @@ struct process_control {
   // Published by finished_helper_epoch after this helper's acknowledged FINAL.
   int32_t helper_pid;
   uint64_t helper_start_time;
+  // Protected by task_state->lock. Published extents belong to this exact
+  // image, not to whichever process later reuses its numeric PID.
+  private_memory_snapshot_t private_memory;
+  uint32_t memory_published;
+  uint32_t memory_retired;
 };
-_Static_assert(sizeof(process_control_t) == 56, "shared process control layout");
+_Static_assert(sizeof(process_control_t) == 160, "shared process control layout");
 
 typedef struct {
   uint64_t magic;
@@ -241,6 +264,9 @@ typedef struct {
   bool capture_procfs_valid;
   uint64_t capture_procfs_device;
   uint64_t capture_procfs_inode;
+  // Recreating an invalid inherited transport cannot restore memory authority.
+  // This withdrawal follows fork/exec with the table, not just this image.
+  bool private_memory_authority;
   size_t task_count;
   task_membership_t tasks[MAX_TASK_MEMBERSHIPS];
 } task_state_t;
@@ -255,7 +281,7 @@ typedef struct {
 // exit, and app-level writes re-enter the syscall interception path.
 typedef void (*reverie_emit_fn_t)(const char* buf, size_t len);
 typedef void (*reverie_idle_fn_t)(void);
-#define REVERIE_DBT_RUNTIME_ABI_VERSION 10u
+#define REVERIE_DBT_RUNTIME_ABI_VERSION 11u
 #define REVERIE_DBT_STARTUP_STANDALONE 1u
 #define REVERIE_DBT_STARTUP_COORDINATED 2u
 // TODO-HUMAN-REVIEW(PR-162): Review the additive stdout-emit runtime callback
@@ -281,7 +307,14 @@ typedef struct {
   // MemoryAccess::compare_exchange_u32. Added in ABI version 8.
   memory_compare_exchange_t compare_exchange_u32;
   controller_capture_control_t controller_capture_control;
+  // Fixed-size current-owner query or foreign owner/version validation.
+  runtime_private_memory_t runtime_private_memory;
 } runtime_callbacks_t;
+_Static_assert(sizeof(runtime_callbacks_t) == 72, "runtime callbacks ABI size");
+_Static_assert(offsetof(runtime_callbacks_t, controller_capture_control) == 56,
+    "controller capture callback ABI offset");
+_Static_assert(offsetof(runtime_callbacks_t, runtime_private_memory) == 64,
+    "private memory callback ABI offset");
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#90): Confirm diagnostic fd ownership across exec.
 // Inherited from the launcher so guest stderr redirections cannot capture it.
@@ -458,6 +491,15 @@ static bool test_compare_exchange;
 static bool test_controller_capture;
 static atomic_flag controller_capture_self_tested = ATOMIC_FLAG_INIT;
 static void run_controller_capture_self_test(void);
+enum {
+  PRIVATE_MEMORY_TEST_NONE,
+  PRIVATE_MEMORY_TEST_READY,
+  PRIVATE_MEMORY_TEST_RETIRE,
+  PRIVATE_MEMORY_TEST_LOST_EXEC,
+  PRIVATE_MEMORY_TEST_ROUTES,
+};
+static int test_private_memory;
+static bool test_private_memory_loss_injected;
 static atomic_flag compare_exchange_self_tested = ATOMIC_FLAG_INIT;
 static void run_compare_exchange_self_test(void);
 static uint32_t compare_exchange_word(
@@ -1316,6 +1358,13 @@ static int32_t runtime_parent_process_id;
 static task_state_t* task_state;
 static uint64_t task_state_device;
 static uint64_t task_state_inode;
+static bool task_state_identity_valid;
+static bool task_state_identity_lost;
+// Separate from the process/helper owner: CLONE_VM children share this token,
+// while a separate-VM fork receives its own existing process-control slot.
+static size_t runtime_memory_owner_slot = SIZE_MAX;
+static uint64_t runtime_memory_owner_epoch;
+static process_id_t runtime_memory_owner_pid;
 // Private to this image, including its one background helper. Copied children
 // never start an inherited helper; their first exec claims their own record.
 static process_control_t* runtime_process_control;
@@ -1364,9 +1413,17 @@ static void scrub_guest_stack_before_first_instruction(void);
 static bool map_inherited_task_state(void) {
   struct stat status;
   void* mapping;
-  if (fstat(TASK_STATE_FD, &status) != 0 ||
-      status.st_size != (off_t)sizeof(*task_state))
+  if (fstat(TASK_STATE_FD, &status) != 0) {
+    // DR records followed exec before removing its private environment marker.
+    // A missing inherited descriptor must not masquerade as a fresh root.
+    if (errno != EBADF || dr_is_post_execve())
+      task_state_identity_lost = true;
     return false;
+  }
+  if (status.st_size != (off_t)sizeof(*task_state)) {
+    task_state_identity_lost = true;
+    return false;
+  }
   mapping = mmap(
       NULL,
       sizeof(*task_state),
@@ -1374,14 +1431,18 @@ static bool map_inherited_task_state(void) {
       MAP_SHARED,
       TASK_STATE_FD,
       0);
-  if (mapping == MAP_FAILED)
+  if (mapping == MAP_FAILED) {
+    task_state_identity_lost = true;
     return false;
+  }
   task_state = (task_state_t*)mapping;
   if (task_state->magic == TASK_STATE_MAGIC) {
     task_state_device = (uint64_t)status.st_dev;
     task_state_inode = (uint64_t)status.st_ino;
+    task_state_identity_valid = task_state->private_memory_authority;
     return true;
   }
+  task_state_identity_lost = true;
   munmap(mapping, sizeof(*task_state));
   task_state = NULL;
   return false;
@@ -1461,13 +1522,16 @@ static void initialize_task_state(bool external_global) {
       fstat(STDIN_FILENO, &task_state->initial_stdin) == 0;
   task_state->external_global = external_global;
   atomic_init(&task_state->capture_uncertain, !initial_absence);
+  task_state->private_memory_authority = !task_state_identity_lost;
   struct stat backing;
   if (fstat(TASK_STATE_FD, &backing) == 0) {
     task_state_device = (uint64_t)backing.st_dev;
     task_state_inode = (uint64_t)backing.st_ino;
+    task_state_identity_valid = task_state->private_memory_authority;
   } else {
     atomic_store_explicit(
         &task_state->capture_uncertain, true, memory_order_release);
+    task_state->private_memory_authority = false;
   }
   if (initial_absence)
     initialize_capture_procfs_view();
@@ -1541,6 +1605,9 @@ static void initialize_process_control_locked(
   atomic_init(&entry->finished_helper_epoch, 0);
   entry->helper_pid = 0;
   entry->helper_start_time = 0;
+  memset(&entry->private_memory, 0, sizeof(entry->private_memory));
+  entry->memory_published = 0;
+  entry->memory_retired = 0;
 }
 
 static void capture_mark_owner_uncertain(task_state_t* state) {
@@ -1566,7 +1633,9 @@ static void reserve_capture_admission_locked(task_state_t* state, int32_t birth)
     // Only authoritative failed creation leaves a counted slot in this state.
     // It has never had a published PID or a cached owner. Query readers can
     // already scan its atomics, so reuse uses stores, never atomic_init/memset.
-    if (entry->kernel_pid == 0 && !atomic_load_explicit(
+    // A published memory token also permanently excludes a slot from reuse.
+    if (entry->kernel_pid == 0 && entry->memory_published == 0 &&
+        !atomic_load_explicit(
             &entry->capture_pending_admission, memory_order_acquire)) {
       atomic_store_explicit(
           &entry->capture_pending_admission, true, memory_order_release);
@@ -1698,6 +1767,359 @@ static process_control_t* existing_process_control(int32_t kernel_pid) {
 
 static _Atomic uint64_t* pending_thread_clones_for(int32_t kernel_pid) {
   return &process_control_for(kernel_pid)->pending_thread_clones;
+}
+
+// The vendor retirement observer can run inside DR's heap teardown. Its short
+// critical section cannot call DR (including dr_thread_yield), allocate, or
+// cross a syscall/RPC. Other users of this same lock also release it before
+// kernel clone/exec, so a copied-vfork child cannot inherit a suspended owner.
+static void private_memory_lock(void) {
+  while (atomic_flag_test_and_set_explicit(
+      &task_state->lock, memory_order_acquire))
+    __asm__ volatile("pause" ::: "memory");
+}
+
+static void retire_private_memory(void) {
+  if (task_state == NULL || runtime_memory_owner_slot == SIZE_MAX)
+    return;
+  private_memory_lock();
+  if (runtime_memory_owner_slot < task_state->process_control_count) {
+    process_control_t* entry =
+        &task_state->process_controls[runtime_memory_owner_slot];
+    if (atomic_load_explicit(&entry->image_epoch, memory_order_relaxed) ==
+        runtime_memory_owner_epoch) {
+      entry->memory_retired = 1;
+      if (entry->private_memory.state != 0) {
+        entry->private_memory.state = 0;
+        if (entry->private_memory.version != UINT64_MAX)
+          ++entry->private_memory.version;
+      }
+    }
+  }
+  task_state_unlock();
+}
+
+static void retire_private_memory_for_exec(void) {
+  // A vfork/CLONE_VM child's exec switches that child to a new mm; it does not
+  // transfer the parent's reservations. Actual old-mm releases still notify
+  // the vendor observer. A real owner exec conservatively retires even if it
+  // fails, and can only publish anew after a successful image initialization.
+  if (dr_get_process_id() == runtime_memory_owner_pid)
+    retire_private_memory();
+  if (test_private_memory == PRIVATE_MEMORY_TEST_LOST_EXEC &&
+      !dr_is_post_execve() && !test_private_memory_loss_injected) {
+    test_private_memory_loss_injected = true;
+    // Explicit control-backing fault injection, not guest close semantics.
+    if (syscall(SYS_close, TASK_STATE_FD) != 0) {
+      dr_fprintf(diagnostic_file, "PRIVATE_MEMORY_TEST loss-injection-failed\n");
+      dr_exit_process(101);
+    }
+    dr_fprintf(diagnostic_file,
+        "PRIVATE_MEMORY_TEST control-backing-loss-injected=1\n");
+  }
+}
+
+static int32_t runtime_private_memory(
+    uintptr_t context,
+    const private_memory_snapshot_t* expected,
+    private_memory_snapshot_t* out) {
+  (void)context;
+  private_memory_snapshot_t wanted = {0};
+  if (expected != NULL)
+    wanted = *expected;
+  if (out == NULL)
+    return 0;
+  memset(out, 0, sizeof(*out));
+  if (task_state == NULL || !task_state_identity_valid)
+    return 0;
+  size_t slot = expected == NULL ? runtime_memory_owner_slot : wanted.owner[2];
+  uint64_t epoch = expected == NULL ? runtime_memory_owner_epoch : wanted.owner[3];
+  if (expected != NULL &&
+      (wanted.owner[0] != task_state_device || wanted.owner[1] != task_state_inode))
+    return 0;
+  private_memory_lock();
+  bool ready = false;
+  if (slot < task_state->process_control_count) {
+    process_control_t* entry = &task_state->process_controls[slot];
+    const private_memory_snapshot_t* value = &entry->private_memory;
+    ready = entry->memory_published != 0 && entry->memory_retired == 0 &&
+        atomic_load_explicit(&entry->image_epoch, memory_order_relaxed) == epoch &&
+        value->state == 1 && value->count > 0 && value->count <= 3 &&
+        value->owner[0] == task_state_device && value->owner[1] == task_state_inode &&
+        value->owner[2] == slot && value->owner[3] == epoch &&
+        (expected == NULL || value->version == wanted.version);
+    if (ready)
+      *out = *value;
+  }
+  task_state_unlock();
+  return ready ? 1 : 0;
+}
+
+static bool private_memory_test_check(bool condition, const char* check) {
+  if (condition)
+    return true;
+  dr_fprintf(diagnostic_file, "PRIVATE_MEMORY_TEST failed=%s\n", check);
+  dr_exit_process(101);
+  return false;
+}
+
+static bool private_memory_test_unavailable(
+    const private_memory_snapshot_t* expected) {
+  private_memory_snapshot_t output;
+  const private_memory_snapshot_t zero = {0};
+  memset(&output, 0xa5, sizeof(output));
+  return runtime_private_memory(0, expected, &output) == 0 &&
+      memcmp(&output, &zero, sizeof(output)) == 0;
+}
+
+static uint32_t private_memory_test_notifications;
+
+static void count_private_memory_test_notification(void) {
+  ++private_memory_test_notifications;
+}
+
+static bool run_private_memory_route_test(
+    const private_memory_snapshot_t* current) {
+  reg_t first = current->ranges[0].start;
+  reg_t last = current->ranges[current->count - 1].end;
+  reg_t page = dr_page_size();
+  if (!private_memory_test_check(
+          page > 0 && page <= UINT64_MAX / 2 && first >= 2 * page &&
+              last <= UINT64_MAX - page,
+          "route-test-address-bounds"))
+    return false;
+  reg_t outside = first - 2 * page;
+  const struct {
+    const char* name;
+    int sysnum;
+    reg_t args[6];
+    uint32_t notifications;
+  } cases[] = {
+      {"mmap-fixed-overlap", SYS_mmap, {first, 1, 0, MAP_FIXED}, 1},
+      {"mmap-nonfixed-overlap", SYS_mmap, {first, 1}, 0},
+      {"mmap-noreplace-overlap", SYS_mmap, {first, 1, 0, MAP_FIXED_NOREPLACE}, 0},
+      {"mmap-fixed-disjoint", SYS_mmap, {outside, page, 0, MAP_FIXED}, 0},
+      {"mmap-fixed-overflow", SYS_mmap, {UINT64_MAX - 7, 16, 0, MAP_FIXED}, 1},
+      {"munmap-overlap", SYS_munmap, {first, 1}, 1},
+      {"munmap-disjoint", SYS_munmap, {outside, page}, 0},
+      {"munmap-left-adjacent", SYS_munmap, {first - page, page}, 0},
+      {"munmap-right-adjacent", SYS_munmap, {last, page}, 0},
+      {"munmap-left-crossing", SYS_munmap, {first - 1, 2}, 1},
+      {"munmap-right-crossing", SYS_munmap, {last - 1, 2}, 1},
+      {"munmap-zero", SYS_munmap, {first, 0}, 0},
+      {"munmap-overflow", SYS_munmap, {UINT64_MAX - 7, 16}, 1},
+      {"mremap-source", SYS_mremap, {first, page, page}, 1},
+      {"mremap-source-shrink", SYS_mremap, {first - page, page + 1, page}, 1},
+      {"mremap-source-growth", SYS_mremap, {first - page, page, page + 1}, 1},
+      {"mremap-zero-size-alias", SYS_mremap, {first, 0, 1}, 1},
+      {"mremap-zero-extents", SYS_mremap, {first, 0, 0}, 0},
+      {"mremap-fixed-destination", SYS_mremap,
+          {outside, page, page, MREMAP_FIXED, first}, 1},
+      {"mremap-ignored-destination", SYS_mremap,
+          {outside, page, page, 0, first}, 0},
+      {"mremap-disjoint", SYS_mremap, {outside, page, page}, 0},
+      {"mremap-source-overflow", SYS_mremap, {UINT64_MAX - 7, 16, 1}, 1},
+      {"mremap-destination-overflow", SYS_mremap,
+          {outside, 16, 16, MREMAP_FIXED, UINT64_MAX - 7}, 1},
+      {"mremap-both-overlap", SYS_mremap,
+          {first, page, page, MREMAP_FIXED, first}, 2},
+      {"mprotect-commit", SYS_mprotect, {first, page, PROT_READ | PROT_WRITE}, 0},
+      {"shmat-remap", SYS_shmat, {0, 0, SHM_REMAP}, 1},
+      {"shmat-nonremap", SYS_shmat, {0, 0, 0}, 0},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+    // No application thread runs at this initialization-only test seam. Feed
+    // the actual production dispatcher/overlap path, without a kernel call or
+    // reviving any retired authority. The existing retire mode separately
+    // checks the real observer's unavailable/zero-output publication.
+    private_memory_test_notifications = 0;
+    dr_set_private_reservation_retirement_callback(
+        count_private_memory_test_notification);
+    dr_test_private_reservation_syscall(cases[i].sysnum, cases[i].args);
+    dr_set_private_reservation_retirement_callback(retire_private_memory);
+    if (!private_memory_test_check(
+            private_memory_test_notifications == cases[i].notifications,
+            cases[i].name))
+      return false;
+    dr_fprintf(diagnostic_file,
+        "PRIVATE_MEMORY_TEST route=%s notifications=%u\n",
+        cases[i].name, private_memory_test_notifications);
+  }
+  private_memory_snapshot_t output;
+  memset(&output, 0xa5, sizeof(output));
+  if (!private_memory_test_check(
+          runtime_private_memory(0, current, &output) == 1 &&
+              memcmp(&output, current, sizeof(output)) == 0,
+          "route-test-preserves-live-token"))
+    return false;
+  dr_fprintf(diagnostic_file, "PRIVATE_MEMORY_TEST routes=27 live_token=1\n");
+  return true;
+}
+
+static bool run_private_memory_self_test(void) {
+  if (test_private_memory == PRIVATE_MEMORY_TEST_NONE)
+    return true;
+  bool followed = dr_is_post_execve();
+  if (test_private_memory == PRIVATE_MEMORY_TEST_LOST_EXEC && followed) {
+    if (!private_memory_test_check(
+            private_memory_test_unavailable(NULL), "followed-exec-unavailable"))
+      return false;
+    dr_fprintf(diagnostic_file,
+        "PRIVATE_MEMORY_TEST followed-exec-unavailable=1\n");
+    return true;
+  }
+
+  private_memory_snapshot_t current;
+  memset(&current, 0xa5, sizeof(current));
+  if (!private_memory_test_check(
+          runtime_private_memory(0, NULL, &current) == 1 &&
+              current.state == 1 && current.count > 0 && current.count <= 3 &&
+              current.version > 0,
+          "current-ready"))
+    return false;
+  for (uint32_t i = 0; i < current.count; ++i)
+    if (!private_memory_test_check(
+            current.ranges[i].start < current.ranges[i].end &&
+                (i == 0 || current.ranges[i - 1].end <= current.ranges[i].start),
+            "canonical-ranges"))
+      return false;
+  private_memory_snapshot_t output;
+  memset(&output, 0xa5, sizeof(output));
+  if (!private_memory_test_check(
+          runtime_private_memory(0, &current, &output) == 1 &&
+              memcmp(&output, &current, sizeof(output)) == 0,
+          "live-token"))
+    return false;
+  private_memory_snapshot_t wrong = current;
+  wrong.owner[0] ^= 1;
+  if (!private_memory_test_check(
+          private_memory_test_unavailable(&wrong), "wrong-owner"))
+    return false;
+  wrong = current;
+  wrong.version ^= 1;
+  if (!private_memory_test_check(
+          private_memory_test_unavailable(&wrong), "wrong-version"))
+    return false;
+  dr_fprintf(diagnostic_file,
+      "PRIVATE_MEMORY_TEST ready=1 followed_exec=%d "
+      "wrong_owner_rejected=1 wrong_version_rejected=1\n", followed ? 1 : 0);
+  if (test_private_memory == PRIVATE_MEMORY_TEST_ROUTES)
+    return run_private_memory_route_test(&current);
+  if (test_private_memory == PRIVATE_MEMORY_TEST_RETIRE) {
+    retire_private_memory();
+    if (!private_memory_test_check(
+            private_memory_test_unavailable(&current) &&
+                private_memory_test_unavailable(NULL),
+            "retired-token"))
+      return false;
+    dr_fprintf(diagnostic_file, "PRIVATE_MEMORY_TEST retired=1\n");
+  }
+  return true;
+}
+
+static bool private_ranges_contain(
+    const private_memory_snapshot_t* value, const byte* start, size_t size) {
+  uint64_t lo = (uint64_t)(uintptr_t)start;
+  if (size == 0 || lo > UINT64_MAX - size)
+    return false;
+  for (uint32_t i = 0; i < value->count; ++i)
+    if (value->ranges[i].start <= lo && lo + size <= value->ranges[i].end)
+      return true;
+  return false;
+}
+
+static void initialize_private_memory(
+    const byte* preempt, const byte* signal, size_t page_size) {
+  dr_private_reservation_t regions[3] = {0};
+  private_memory_snapshot_t value = {0};
+  size_t count = dr_get_private_reservations(regions, 3);
+  bool ready = task_state_identity_valid && count > 0 && count <= 3;
+  for (size_t i = 0; ready && i < count; ++i) {
+    uint64_t start = (uint64_t)(uintptr_t)regions[i].start;
+    if (regions[i].size == 0 || start > UINT64_MAX - regions[i].size) {
+      ready = false;
+      break;
+    }
+    value.ranges[i] = (private_memory_range_t){start, start + regions[i].size};
+    value.count++;
+  }
+  // Stable canonical ordering is part of the fixed snapshot. Validation must
+  // return exactly these extents, including zeroed unused slots.
+  for (uint32_t i = 1; i < value.count; ++i) {
+    private_memory_range_t range = value.ranges[i];
+    uint32_t j = i;
+    while (j > 0 && value.ranges[j - 1].start > range.start) {
+      value.ranges[j] = value.ranges[j - 1];
+      --j;
+    }
+    value.ranges[j] = range;
+  }
+  for (uint32_t i = 1; i < value.count; ++i)
+    if (value.ranges[i - 1].end > value.ranges[i].start)
+      ready = false;
+  ready = ready && signal != NULL &&
+      private_ranges_contain(&value, signal, page_size) &&
+      (preempt == NULL || private_ranges_contain(&value, preempt, page_size));
+  runtime_memory_owner_slot =
+      (size_t)(runtime_process_control - task_state->process_controls);
+  runtime_memory_owner_epoch = runtime_process_epoch;
+  runtime_memory_owner_pid = dr_get_process_id();
+  private_memory_lock();
+  process_control_t* entry = runtime_process_control;
+  uint64_t previous = entry->private_memory.version;
+  value.owner[0] = task_state_device;
+  value.owner[1] = task_state_inode;
+  value.owner[2] = runtime_memory_owner_slot;
+  value.owner[3] = runtime_memory_owner_epoch;
+  value.version = previous == UINT64_MAX ? UINT64_MAX : previous + 1;
+  value.state = ready && previous != UINT64_MAX ? 1 : 0;
+  entry->private_memory = value;
+  entry->memory_published = 1;
+  entry->memory_retired = value.state == 0;
+  task_state_unlock();
+  dr_set_private_reservation_retirement_callback(retire_private_memory);
+}
+
+static void rebind_private_memory_after_clone(uint64_t flags) {
+  process_id_t child = dr_get_process_id();
+  if ((flags & CLONE_VM) != 0 || child == runtime_memory_owner_pid ||
+      runtime_memory_owner_slot == SIZE_MAX)
+    return;
+  process_control_t* entry = process_control_for((int32_t)child);
+  if (entry == NULL)
+    return;
+  private_memory_lock();
+  private_memory_snapshot_t value = {0};
+  uint32_t retired = 1;
+  if (runtime_memory_owner_slot < task_state->process_control_count) {
+    process_control_t* parent =
+        &task_state->process_controls[runtime_memory_owner_slot];
+    if (atomic_load_explicit(&parent->image_epoch, memory_order_relaxed) ==
+        runtime_memory_owner_epoch) {
+      value = parent->private_memory;
+      retired = parent->memory_retired;
+    }
+  }
+  size_t child_slot = (size_t)(entry - task_state->process_controls);
+  uint64_t child_epoch =
+      atomic_load_explicit(&entry->image_epoch, memory_order_relaxed);
+  uint64_t previous = entry->private_memory.version;
+  value.owner[0] = task_state_device;
+  value.owner[1] = task_state_inode;
+  value.owner[2] = child_slot;
+  value.owner[3] = child_epoch;
+  value.version = previous == UINT64_MAX ? UINT64_MAX : previous + 1;
+  if (previous == UINT64_MAX) {
+    value.state = 0;
+    retired = 1;
+  }
+  entry->private_memory = value;
+  entry->memory_published = 1;
+  entry->memory_retired = retired;
+  runtime_memory_owner_slot = child_slot;
+  runtime_memory_owner_epoch = child_epoch;
+  runtime_memory_owner_pid = child;
+  task_state_unlock();
 }
 
 // 1 means kernel exit is complete, 0 means still pending, -1 is a failure.
@@ -3309,6 +3731,7 @@ static int32_t complete_clone_birth(
     } else {
       int32_t parent = counters->kernel_pid;
       publish_task_birth((int32_t)dr_get_process_id(), birth_token, true);
+      rebind_private_memory_after_clone(flags);
       if ((flags & CLONE_VFORK) != 0) {
         atomic_store_explicit(
             &copied_vfork_pid,
@@ -3692,6 +4115,7 @@ invoke_syscall(uintptr_t context, int64_t sysnum, const uint64_t* args) {
   if (preserve_internal_descriptors(context, (int)sysnum, translated, &result))
     return result;
   if (is_exec_syscall((int)sysnum)) {
+    retire_private_memory_for_exec();
     require_evidence_flush(EVIDENCE_FRAME_EXEC);
   }
   if (sysnum == SYS_exit || sysnum == SYS_exit_group)
@@ -4307,6 +4731,8 @@ static bool prepare_original_task_syscall(
   for (int i = 0; i != 6; ++i)
     if (admitted[i] != args[i])
       dr_syscall_set_param(drcontext, i, (reg_t)admitted[i]);
+  if (is_exec_syscall(sysnum))
+    retire_private_memory_for_exec();
   (void)prepare_clone_birth(counters, sysnum, admitted, CLONE_SYSCALL_ORIGINAL);
   return true;
 }
@@ -4330,6 +4756,7 @@ static void post_syscall(void* drcontext, int sysnum) {
         counters->pending_birth_token, true);
     publish_task_birth((int32_t)dr_get_thread_id(drcontext),
         counters->pending_birth_token, true);
+    rebind_private_memory_after_clone(counters->pending_clone_flags);
   }
 
   if (reject_opened_proc_mem(
@@ -4951,6 +5378,7 @@ static bool pre_syscall(void* drcontext, int sysnum) {
         counters->pending_birth_token, true);
     publish_task_birth((int32_t)dr_get_thread_id(drcontext),
         counters->pending_birth_token, true);
+    rebind_private_memory_after_clone(counters->pending_clone_flags);
   }
   // At the first system call rather than in thread_init: the self-test starts
   // and waits for a client thread, which cannot initialize while thread_init
@@ -5525,6 +5953,17 @@ static bool capture_test_canceled_capacity(task_state_t* scratch, int32_t pid) {
   process_control_t* published = &scratch->process_controls[3];
   atomic_store(&published->capture_pending_admission, true);
   atomic_store(&published->image_epoch, 73);
+  const private_memory_snapshot_t saved_memory = {
+      .owner = {17, 29, 3, 73}, .version = 91, .state = 1, .count = 1,
+      .ranges = {{0x1000, 0x3000}}};
+  published->private_memory = saved_memory;
+  published->memory_published = 1;
+  // An owner whose identity is unavailable still cannot donate a published
+  // memory-token slot to the canceled-create reservation pool.
+  process_control_t* memory_owner = &scratch->process_controls[4];
+  memory_owner->kernel_pid = 0;
+  memory_owner->private_memory = saved_memory;
+  memory_owner->memory_published = 1;
   process_control_t* canceled = &scratch->process_controls[MAX_TASK_MEMBERSHIPS - 1];
   canceled->kernel_pid = 0;
   atomic_store(&canceled->capture_pending_admission, true);
@@ -5542,6 +5981,11 @@ static bool capture_test_canceled_capacity(task_state_t* scratch, int32_t pid) {
       published->kernel_pid == pid + 3 && published->birth_token == 40003 &&
       atomic_load(&published->capture_pending_admission) &&
       atomic_load(&published->image_epoch) == 73 &&
+      published->memory_published == 1 && published->memory_retired == 0 &&
+      memcmp(&published->private_memory, &saved_memory, sizeof(saved_memory)) == 0 &&
+      memory_owner->kernel_pid == 0 && memory_owner->birth_token == 40004 &&
+      memory_owner->memory_published == 1 && memory_owner->memory_retired == 0 &&
+      memcmp(&memory_owner->private_memory, &saved_memory, sizeof(saved_memory)) == 0 &&
       !atomic_load(&scratch->capture_uncertain);
   // With no canceled slot left, retain every owner and withdraw certainty.
   reserve_capture_admission_locked(scratch, 60001);
@@ -5699,6 +6143,7 @@ static void thread_init(void* drcontext) {
     if (!is_thread)
       publish_task_birth((int32_t)dr_get_process_id(), pending_child, true);
     publish_task_birth(host_tid, pending_child, true);
+    rebind_private_memory_after_clone(clone_flags);
   }
   DR_ASSERT(counters != NULL);
   memset(counters, 0, sizeof(*counters));
@@ -6060,6 +6505,10 @@ static void publish_copied_terminal_stats(process_control_t* process) {
 static void event_exit(void) {
   if (namespace_admission_refused)
     return;
+  if (dr_get_process_id() == runtime_memory_owner_pid) {
+    retire_private_memory();
+    dr_set_private_reservation_retirement_callback(NULL);
+  }
   if (test_reused_tid)
     dr_fprintf(
         diagnostic_file,
@@ -6348,7 +6797,26 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
       test_skip_terminal_cleanup = true;
     else if (strcmp(argv[i], "-test-backend-failure-sender-lookup-miss") == 0)
       test_backend_failure_sender_lookup_miss = true;
-    else if (strcmp(argv[i], "-test-compare-exchange") == 0)
+    else if (strcmp(argv[i], "-test-private-memory") == 0) {
+      if (++i >= argc) {
+        dr_fprintf(diagnostic_file, "PRIVATE_MEMORY_TEST missing-mode\n");
+        dr_exit_process(101);
+        return;
+      }
+      if (strcmp(argv[i], "ready") == 0)
+        test_private_memory = PRIVATE_MEMORY_TEST_READY;
+      else if (strcmp(argv[i], "retire") == 0)
+        test_private_memory = PRIVATE_MEMORY_TEST_RETIRE;
+      else if (strcmp(argv[i], "lost-exec") == 0)
+        test_private_memory = PRIVATE_MEMORY_TEST_LOST_EXEC;
+      else if (strcmp(argv[i], "routes") == 0)
+        test_private_memory = PRIVATE_MEMORY_TEST_ROUTES;
+      else {
+        dr_fprintf(diagnostic_file, "PRIVATE_MEMORY_TEST invalid-mode\n");
+        dr_exit_process(101);
+        return;
+      }
+    } else if (strcmp(argv[i], "-test-compare-exchange") == 0)
       test_compare_exchange = true;
     else if (strcmp(argv[i], "-test-controller-capture") == 0)
       test_controller_capture = true;
@@ -6386,7 +6854,9 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
   }
   uint32_t runtime_abi_version = reverie_dbt_runtime_abi_version();
   if (test_runtime_abi_mismatch)
-    ++runtime_abi_version;
+    // Both historical ABI-10 tables had the same size but incompatible final
+    // slots. Reject version 10 even with the current runtime's correct size.
+    runtime_abi_version = 10;
   if (runtime_abi_version != REVERIE_DBT_RUNTIME_ABI_VERSION ||
       reverie_dbt_runtime_callbacks_size() != sizeof(runtime_callbacks_t)) {
     dr_fprintf(
@@ -6467,6 +6937,8 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
       /* Handled before application initialization. */
     } else if (strcmp(argv[i], "-test-runtime-abi-mismatch") == 0) {
       /* Handled before application initialization. */
+    } else if (strcmp(argv[i], "-test-private-memory") == 0) {
+      ++i; /* Mode was checked before application initialization. */
     } else if (
         strcmp(argv[i], "-test-wait-for-background") == 0 ||
         strcmp(argv[i], "-test-delay-exec-helper-exit") == 0 ||
@@ -6526,6 +6998,10 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
   signal_stub[1] = 0x05;
   signal_stub[2] = 0x0f;
   signal_stub[3] = 0x0b;
+  initialize_private_memory(preempt_stub, signal_stub, dr_page_size());
+  runtime_callbacks_page.value.runtime_private_memory = runtime_private_memory;
+  if (!run_private_memory_self_test())
+    return;
 
   if (unsupported_report_path[0] != 0) {
     unsupported_report_file =

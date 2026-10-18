@@ -132,6 +132,53 @@ pub enum MaskChangeRefused {
     },
 }
 
+/// An exclusively runtime-owned half-open interval in a guest address space.
+///
+/// These facts do not describe a complete guest VMA inventory. Tools decide
+/// how to project them into observations without hiding adjacent guest bytes.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize
+)]
+pub struct RuntimePrivateMemoryRegion {
+    /// Inclusive virtual address.
+    pub start: u64,
+    /// Exclusive virtual address.
+    pub end: u64,
+}
+
+/// A bounded set of private intervals belonging to one address-space image.
+///
+/// The opaque owner and version are meaningful only within the authenticated
+/// run that supplied them. They must not be reconstructed from a PID or an
+/// address. A Tool may retain the snapshot for a bound target, but must validate
+/// it before and after observing that target. Validation cannot silently
+/// substitute the calling task's image.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RuntimePrivateMemorySnapshot {
+    /// Backend-owned lifetime identity, opaque to the Tool.
+    pub owner: [u64; 4],
+    /// Non-reused revision of this owner's authority.
+    pub version: u64,
+    /// Exclusively owned intervals; no allocator lock is retained.
+    pub regions: Vec<RuntimePrivateMemoryRegion>,
+}
+
+/// Result from a backend that advertises private-memory ownership facts.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum RuntimePrivateMemory {
+    /// Current authoritative facts, subject to live validation.
+    Ready(RuntimePrivateMemorySnapshot),
+    /// The provider cannot establish current ownership. This is not the
+    /// absence of a provider and must not authorize a best-effort projection.
+    Unavailable,
+}
+
 /// A representation of a guest task (thread).
 #[async_trait]
 pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
@@ -233,6 +280,27 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     /// task. Tools decide how to project these facts into guest observations.
     /// Backends without guest-resident private descriptors return false.
     fn is_runtime_owned_fd(&self, _fd: i32) -> bool {
+        false
+    }
+
+    /// Reports this image's known runtime-private memory intervals.
+    ///
+    /// The default has no provider and preserves the Tool's existing behavior.
+    /// A provider must return `Some(Unavailable)` when its authority is lost,
+    /// including a retired image, rather than masquerading as this default.
+    /// Returned intervals must remain exclusively owned while their token is
+    /// valid; internal commitment/protection changes do not alter that fact.
+    fn runtime_private_memory_regions(&self) -> Option<RuntimePrivateMemory> {
+        None
+    }
+
+    /// Validates a previously supplied target's ownership snapshot in this run.
+    ///
+    /// This may be a different task's image. The backend must validate the
+    /// supplied opaque owner and version, not the caller's current addresses.
+    /// A false result forbids using the snapshot. Calls must not retain a lock
+    /// or borrowed runtime storage across subsequent Tool work.
+    fn runtime_private_memory_is_current(&self, _snapshot: &RuntimePrivateMemorySnapshot) -> bool {
         false
     }
 
@@ -972,6 +1040,14 @@ where
 
     fn is_runtime_owned_fd(&self, fd: i32) -> bool {
         self.inner.is_runtime_owned_fd(fd)
+    }
+
+    fn runtime_private_memory_regions(&self) -> Option<RuntimePrivateMemory> {
+        self.inner.runtime_private_memory_regions()
+    }
+
+    fn runtime_private_memory_is_current(&self, snapshot: &RuntimePrivateMemorySnapshot) -> bool {
+        self.inner.runtime_private_memory_is_current(snapshot)
     }
 
     fn is_main_thread(&self) -> bool {

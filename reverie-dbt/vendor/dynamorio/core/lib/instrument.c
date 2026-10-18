@@ -3519,6 +3519,30 @@ dr_memory_is_in_client(const byte *pc)
     return is_in_client_lib((app_pc)pc);
 }
 
+DR_API
+size_t
+dr_get_private_reservations(dr_private_reservation_t *regions, size_t capacity)
+{
+    if (regions == NULL || capacity < 3)
+        return 0;
+    byte *starts[3];
+    size_t sizes[3];
+    size_t count = heap_private_reservations(starts, sizes, 3);
+    memset(regions, 0, 3 * sizeof(*regions));
+    for (size_t i = 0; i < count; ++i) {
+        regions[i].start = starts[i];
+        regions[i].size = sizes[i];
+    }
+    return count;
+}
+
+DR_API
+void
+dr_set_private_reservation_retirement_callback(void (*callback)(void))
+{
+    heap_set_private_reservation_retirement_callback(callback);
+}
+
 void
 instrument_client_lib_loaded(byte *start, byte *end)
 {

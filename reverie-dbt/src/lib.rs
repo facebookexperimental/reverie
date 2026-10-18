@@ -151,6 +151,61 @@ fn acknowledge_tool_admission(context: usize) {
     }
 }
 
+/// Fixed native ownership-fact record used by ABI version 11.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NativePrivateMemorySnapshot {
+    /// Authenticated table, append-only slot and image identity.
+    pub owner: [u64; 4],
+    /// Checked non-reused authority version.
+    pub version: u64,
+    /// One means ready; zero means explicitly unavailable.
+    pub state: u32,
+    /// Number of initialized intervals, at most three.
+    pub count: u32,
+    /// Whole reservation bounds, including OS alignment padding.
+    pub ranges: [[u64; 2]; 3],
+}
+
+/// Copies current facts when `expected` is null, otherwise validates that exact
+/// target token/version. Returns one only for ready facts. Neither call retains
+/// a lock or borrowed native memory after return.
+pub type RuntimePrivateMemoryQuery = unsafe extern "C" fn(
+    usize,
+    *const NativePrivateMemorySnapshot,
+    *mut NativePrivateMemorySnapshot,
+) -> i32;
+
+static RUNTIME_PRIVATE_MEMORY: std::sync::OnceLock<RuntimePrivateMemoryQuery> =
+    std::sync::OnceLock::new();
+
+/// Installs the ABI-11 native ownership callback before any guest callback.
+pub fn install_runtime_private_memory(query: RuntimePrivateMemoryQuery) {
+    let _ = RUNTIME_PRIVATE_MEMORY.set(query);
+}
+
+fn decode_private_memory(
+    native: NativePrivateMemorySnapshot,
+) -> Option<reverie::RuntimePrivateMemorySnapshot> {
+    if native.state != 1 || native.count > 3 || native.version == 0 {
+        return None;
+    }
+    let mut regions = Vec::with_capacity(native.count as usize);
+    let mut previous_end = 0;
+    for [start, end] in native.ranges[..native.count as usize].iter().copied() {
+        if start >= end || start < previous_end {
+            return None;
+        }
+        previous_end = end;
+        regions.push(reverie::RuntimePrivateMemoryRegion { start, end });
+    }
+    Some(reverie::RuntimePrivateMemorySnapshot {
+        owner: native.owner,
+        version: native.version,
+        regions,
+    })
+}
+
 /// The native client's compare-and-exchange, once the runtime's background
 /// initialization has installed it with [`install_guest_compare_exchange`].
 static GUEST_COMPARE_EXCHANGE: std::sync::OnceLock<MemoryCompareExchange> =
@@ -282,7 +337,10 @@ pub type RuntimeIdler = unsafe extern "C" fn();
 /// longer answers CPUID from a table of its own, it asks the runtime's tool.
 /// Version 10 appends the controller-capture control, growing the callback
 /// layout from 56 to 64 bytes.
-pub const DBT_RUNTIME_ABI_VERSION: u32 = 10;
+/// Version 11 appends the private-memory fact query after the controller
+/// control, growing callbacks from 64 to 72 bytes. The independent historical
+/// private-memory ABI-10 layout is incompatible and is not accepted.
+pub const DBT_RUNTIME_ABI_VERSION: u32 = 11;
 
 /// Initialized native execution mode supplied by the version-6 startup bridge.
 ///
@@ -367,6 +425,8 @@ pub struct DbtRuntimeCallbacks {
     pub compare_exchange_u32: MemoryCompareExchange,
     /// Native process-admission and proc-view facts for controller capture.
     pub controller_capture_control: ControllerCaptureControl,
+    /// Copies or validates fixed native private-memory facts (ABI version 11).
+    pub runtime_private_memory: RuntimePrivateMemoryQuery,
 }
 
 /// Reports the exact native-client/external-runtime ABI version.
@@ -531,6 +591,7 @@ where
     read_registers: RegisterReader,
     write_registers: RegisterWriter,
     read_memory: Option<MemoryReader>,
+    runtime_private_memory: Option<RuntimePrivateMemoryQuery>,
     tail_inject_result: Arc<TailInjectResult>,
     signal_info: Option<[u8; reverie::SIGNAL_INFO_SIZE]>,
     signal_info_replacement: Option<[u8; reverie::SIGNAL_INFO_SIZE]>,
@@ -568,6 +629,7 @@ where
             read_registers,
             write_registers,
             read_memory: None,
+            runtime_private_memory: RUNTIME_PRIVATE_MEMORY.get().copied(),
             tail_inject_result: Arc::new(TailInjectResult::default()),
             signal_info: None,
             signal_info_replacement: None,
@@ -719,6 +781,45 @@ where
         // Guest PID can be a Tool identity. The connection owner is keyed by
         // the physical process, as in send_rpc_from_guest.
         sync_rpc::is_runtime_owned_fd(fd)
+    }
+
+    fn runtime_private_memory_regions(&self) -> Option<reverie::RuntimePrivateMemory> {
+        let snapshot = self.runtime_private_memory.and_then(|query| {
+            let mut native = NativePrivateMemorySnapshot::default();
+            // SAFETY: both fixed records are local; null requests current facts.
+            (unsafe { query(self.context, std::ptr::null(), &mut native) } == 1)
+                .then(|| decode_private_memory(native))
+                .flatten()
+        });
+        Some(match snapshot {
+            Some(snapshot) => reverie::RuntimePrivateMemory::Ready(snapshot),
+            None => reverie::RuntimePrivateMemory::Unavailable,
+        })
+    }
+
+    fn runtime_private_memory_is_current(
+        &self,
+        snapshot: &reverie::RuntimePrivateMemorySnapshot,
+    ) -> bool {
+        let Some(query) = self.runtime_private_memory else {
+            return false;
+        };
+        if snapshot.regions.len() > 3 {
+            return false;
+        }
+        let mut expected = NativePrivateMemorySnapshot {
+            owner: snapshot.owner,
+            version: snapshot.version,
+            state: 1,
+            count: snapshot.regions.len() as u32,
+            ..Default::default()
+        };
+        for (out, region) in expected.ranges.iter_mut().zip(&snapshot.regions) {
+            *out = [region.start, region.end];
+        }
+        let mut actual = NativePrivateMemorySnapshot::default();
+        // SAFETY: native copies fixed records only and retains neither pointer.
+        unsafe { query(self.context, &expected, &mut actual) == 1 && actual == expected }
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2359,6 +2460,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v3(
     tools::set_stdout_emitter(callbacks.emit_stdout);
     install_guest_compare_exchange(callbacks.compare_exchange_u32);
     install_controller_capture_control(callbacks.controller_capture_control);
+    install_runtime_private_memory(callbacks.runtime_private_memory);
     PROCESS_CLONE_RESULT_PROBE.store(
         std::env::var_os("REVERIE_DBT_TEST_PROCESS_CLONE_RESULTS").is_some(),
         Ordering::Release,
@@ -2722,6 +2824,118 @@ mod tests {
         );
     }
 
+    impl AsMut<PrototypeTool> for PrototypeTool {
+        fn as_mut(&mut self) -> &mut PrototypeTool {
+            self
+        }
+    }
+    impl AsRef<PrototypeCounters> for PrototypeCounters {
+        fn as_ref(&self) -> &PrototypeCounters {
+            self
+        }
+    }
+    impl AsMut<PrototypeCounters> for PrototypeCounters {
+        fn as_mut(&mut self) -> &mut PrototypeCounters {
+            self
+        }
+    }
+
+    unsafe extern "C" fn private_memory_probe(
+        _context: usize,
+        expected: *const NativePrivateMemorySnapshot,
+        out: *mut NativePrivateMemorySnapshot,
+    ) -> i32 {
+        let ready = NativePrivateMemorySnapshot {
+            owner: [10, 20, 3, 1],
+            version: 7,
+            state: 1,
+            count: 1,
+            ranges: [[0x1000, 0x3000], [0, 0], [0, 0]],
+        };
+        // SAFETY: this test obeys the fixed callback storage contract.
+        unsafe {
+            out.write(Default::default());
+            if !expected.is_null()
+                && ((*expected).owner != ready.owner || (*expected).version != ready.version)
+            {
+                return 0;
+            }
+            out.write(ready);
+        }
+        1
+    }
+
+    #[test]
+    fn private_memory_adapter_forwards_and_rejects_stale_target_facts() {
+        let mut counters = PrototypeCounters::default();
+        let mut guest: DbtGuest<'_, PrototypeTool> = DbtGuest::new(
+            0,
+            Pid::from_raw(10),
+            Pid::from_raw(10),
+            None,
+            0,
+            &mut counters,
+            &GLOBAL_STATE,
+            &CONFIG,
+            invoke,
+            read_regs,
+            write_regs_noop,
+        );
+        guest.runtime_private_memory = None;
+        assert_eq!(
+            guest.runtime_private_memory_regions(),
+            Some(reverie::RuntimePrivateMemory::Unavailable)
+        );
+        guest.runtime_private_memory = Some(private_memory_probe);
+        let Some(reverie::RuntimePrivateMemory::Ready(facts)) =
+            guest.runtime_private_memory_regions()
+        else {
+            panic!("ready provider")
+        };
+        let wrapped = guest.into_guest();
+        assert_eq!(
+            <_ as Guest<PrototypeTool>>::runtime_private_memory_regions(&wrapped),
+            Some(reverie::RuntimePrivateMemory::Ready(facts.clone())),
+        );
+        assert!(<_ as Guest<PrototypeTool>>::runtime_private_memory_is_current(&wrapped, &facts));
+        let mut stale = facts.clone();
+        stale.version += 1;
+        assert!(!<_ as Guest<PrototypeTool>>::runtime_private_memory_is_current(&wrapped, &stale));
+        stale = facts;
+        stale.owner[2] += 1;
+        assert!(!<_ as Guest<PrototypeTool>>::runtime_private_memory_is_current(&wrapped, &stale));
+    }
+
+    #[test]
+    fn private_memory_native_records_reject_invalid_intervals() {
+        let ready = NativePrivateMemorySnapshot {
+            owner: [1, 2, 3, 4],
+            version: 1,
+            state: 1,
+            count: 2,
+            ranges: [[0x1000, 0x2000], [0x3000, 0x4000], [0, 0]],
+        };
+        assert!(decode_private_memory(ready).is_some());
+        for bad in [
+            NativePrivateMemorySnapshot { state: 0, ..ready },
+            NativePrivateMemorySnapshot { count: 4, ..ready },
+            NativePrivateMemorySnapshot {
+                version: 0,
+                ..ready
+            },
+            NativePrivateMemorySnapshot {
+                ranges: [[2, 1], [3, 4], [0, 0]],
+                ..ready
+            },
+            NativePrivateMemorySnapshot {
+                ranges: [[1, 3], [2, 4], [0, 0]],
+                ..ready
+            },
+        ] {
+            assert!(decode_private_memory(bad).is_none());
+        }
+    }
+
     #[derive(Default)]
     struct SignalProbe(u8);
 
@@ -2928,12 +3142,21 @@ mod tests {
 
     #[test]
     fn startup_abi_preserves_layout_and_requires_initialized_native_mode() {
-        assert_eq!(reverie_dbt_runtime_abi_version(), 10);
+        assert_eq!(reverie_dbt_runtime_abi_version(), 11);
         assert_eq!(std::mem::size_of::<DbtSignalEvent>(), 200);
         assert_eq!(std::mem::align_of::<DbtSignalEvent>(), 8);
-        assert_eq!(reverie_dbt_runtime_callbacks_size(), 64);
-        assert_eq!(std::mem::size_of::<DbtRuntimeCallbacks>(), 64);
+        assert_eq!(reverie_dbt_runtime_callbacks_size(), 72);
+        assert_eq!(std::mem::size_of::<DbtRuntimeCallbacks>(), 72);
+        assert_eq!(
+            std::mem::offset_of!(DbtRuntimeCallbacks, controller_capture_control),
+            56
+        );
+        assert_eq!(
+            std::mem::offset_of!(DbtRuntimeCallbacks, runtime_private_memory),
+            64
+        );
         assert_eq!(std::mem::size_of::<NativeControllerCaptureFact>(), 24);
+        assert_eq!(std::mem::size_of::<NativePrivateMemorySnapshot>(), 96);
         assert_eq!(
             DbtStartupMode::try_from(1).unwrap(),
             DbtStartupMode::Standalone

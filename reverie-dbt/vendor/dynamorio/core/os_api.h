@@ -802,4 +802,44 @@ DR_API
 bool
 dr_memory_is_in_client(const byte *pc);
 
+/** One complete OS reservation owned by DynamoRIO's private heap manager. */
+typedef struct _dr_private_reservation_t {
+    byte *start;
+    size_t size;
+} dr_private_reservation_t;
+
+DR_API
+/**
+ * Copies the fixed vmheap/vmcode reservations, including alignment padding and
+ * any writable alias.  This is a bounded ownership subset, not an inventory of
+ * client images or allocations outside those reservations.  Call during client
+ * initialization, before application execution.  Returns zero if the output
+ * cannot represent the complete subset.  Does not allocate or retain a lock.
+ */
+size_t
+dr_get_private_reservations(dr_private_reservation_t *regions, size_t capacity);
+
+DR_API
+/**
+ * Installs one initialization-time observer of lost reservation authority.
+ * The callback runs before an application operation may replace/release any
+ * reservation, or before the heap manager releases a whole reservation.  It
+ * must not allocate, inject a syscall, or call back into DynamoRIO.  Internal
+ * commitment/protection changes do not notify it.  NULL removes the observer
+ * during client shutdown, before the client's code can be unloaded.
+ */
+void
+dr_set_private_reservation_retirement_callback(void (*callback)(void));
+
+#ifdef UNIX
+DR_API
+/**
+ * Regression-test seam: invoke the production normalized-syscall ownership
+ * retirement path without executing a kernel syscall.  The installed observer
+ * may run; callers must use this only during isolated client initialization.
+ */
+void
+dr_test_private_reservation_syscall(int sysnum, const reg_t args[6]);
+#endif
+
 #endif /* _DR_OS_UTILS_H_ */

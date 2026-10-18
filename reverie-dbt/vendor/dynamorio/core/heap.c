@@ -67,6 +67,24 @@
 
 extern bool vm_areas_exited;
 
+/* Set before application execution; cleared before the client is unloaded.
+ * The observer only withdraws a fixed ownership fact. It cannot call back into
+ * DR or allocate, and no DR lock is held on its behalf. */
+DECLARE_NEVERPROT_VAR(static void (*private_reservation_retirement)(void), NULL);
+
+void
+heap_set_private_reservation_retirement_callback(void (*callback)(void))
+{
+    private_reservation_retirement = callback;
+}
+
+void
+heap_retire_private_reservations(void)
+{
+    if (private_reservation_retirement != NULL)
+        private_reservation_retirement();
+}
+
 /***************************************************************************
  * we cannot use malloc in the middle of interpreting the client program
  * because we could be in the middle of interpreting malloc, which is not
@@ -1099,6 +1117,7 @@ vmm_heap_unit_exit(vm_heap_t *vmh)
 #endif
     if (free_heap) {
         heap_error_code_t error_code;
+        heap_retire_private_reservations();
         os_heap_free(vmh->alloc_start, vmh->alloc_size, &error_code);
         ASSERT(error_code == HEAP_ERROR_SUCCESS);
         if (DYNAMO_OPTION(satisfy_w_xor_x) && vmh == &heapmgt->vmcode) {
@@ -1299,6 +1318,57 @@ iterate_vmm_regions(void (*cb)(byte *region_start, byte *region_end, void *user_
               heapmgt->vmcode_writable_base +
                   (heapmgt->vmcode.end_addr - heapmgt->vmcode.start_addr),
               user_data);
+    }
+}
+
+size_t
+heap_private_reservations(byte **starts, size_t *sizes, size_t capacity)
+{
+    if (heapmgt == NULL || starts == NULL || sizes == NULL || capacity < 3)
+        return 0;
+    size_t count = 0;
+    if (heapmgt->vmheap.alloc_start != NULL) {
+        starts[count] = heapmgt->vmheap.alloc_start;
+        sizes[count++] = heapmgt->vmheap.alloc_size;
+    }
+    if (heapmgt->vmcode.alloc_start != NULL) {
+        starts[count] = heapmgt->vmcode.alloc_start;
+        sizes[count++] = heapmgt->vmcode.alloc_size;
+    }
+    if (heapmgt->vmcode_writable_alloc != NULL) {
+        starts[count] = heapmgt->vmcode_writable_alloc;
+        sizes[count++] = heapmgt->vmcode.alloc_size;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (sizes[i] == 0 || (ptr_uint_t)starts[i] > POINTER_MAX - sizes[i])
+            return 0;
+    }
+    return count;
+}
+
+void
+heap_retire_private_reservation_overlap(byte *start, size_t size)
+{
+    if (private_reservation_retirement == NULL || size == 0)
+        return;
+    ptr_uint_t lo = (ptr_uint_t)start;
+    if (lo > POINTER_MAX - size) {
+        heap_retire_private_reservations();
+        return;
+    }
+    byte *starts[3];
+    size_t sizes[3];
+    size_t count = heap_private_reservations(starts, sizes, 3);
+    if (count == 0) {
+        heap_retire_private_reservations();
+        return;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (lo < (ptr_uint_t)starts[i] + sizes[i] &&
+            (ptr_uint_t)starts[i] < lo + size) {
+            heap_retire_private_reservations();
+            return;
+        }
     }
 }
 
