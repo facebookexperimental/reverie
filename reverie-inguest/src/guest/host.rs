@@ -56,6 +56,8 @@ use crate::tool_host::drive_ready;
 use crate::tool_host::drive_tool_syscall;
 use crate::trap::raw_syscall6;
 
+#[path = "host_linux.rs"]
+mod host_linux;
 #[cfg(feature = "exec-private-init")]
 #[path = "image_guest.rs"]
 mod image_guest;
@@ -3222,7 +3224,8 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
             raw_args[1] = mask as *const u64 as u64;
         }
 
-        let result = unsafe { crate::trap::physical_guest_syscall6(number, raw_args, None) }.result;
+        // SAFETY: every admission filter above has run on exactly these arguments.
+        let result = unsafe { host_linux::forward(self.tid, number, raw_args) };
         Errno::from_ret(result as usize).map(|value| value as i64)
     }
 
@@ -3359,13 +3362,13 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
         } else {
             let value = match stripped_signal_mask(self.runtime, number, args) {
                 Err(error) => -i64::from(error.into_raw()),
-                Ok(None) => {
-                    unsafe { crate::trap::physical_guest_syscall6(number, args, None) }.result
-                }
+                // SAFETY: every admission filter above has run on exactly these arguments.
+                Ok(None) => unsafe { host_linux::forward(self.tid, number, args) },
                 Ok(Some(mask)) => {
                     let mut args = args;
                     args[1] = (&raw const mask) as u64;
-                    unsafe { crate::trap::physical_guest_syscall6(number, args, None) }.result
+                    // SAFETY: as above, with the reserved signals stripped.
+                    unsafe { host_linux::forward(self.tid, number, args) }
                 }
             };
             self.tail.set_result(value);

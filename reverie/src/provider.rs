@@ -17,14 +17,24 @@
 //! epic <https://github.com/rrnewton/hermit/issues/4492>) as its own crate,
 //! reverie-linux-provider, which now only re-exports this module. It names no
 //! backend: reverie-kvm implements the memory traits for its guest arena and
-//! fixes the associated types; reverie-kvm's syscall executor and
-//! reverie-ptrace's crate-private `HostLinux` implement [`LinuxProvider`].
+//! fixes the associated types; reverie-kvm's syscall executor and the
+//! crate-private `HostLinux` providers of reverie-ptrace and reverie-inguest
+//! implement [`LinuxProvider`].
 //!
-//! Being in core does not yet make it part of every backend's contract. Two
+//! Being in core does not yet make it part of every backend's contract. Three
 //! backends implement and call it. In reverie-kvm the syscall executor is the
 //! provider. In reverie-ptrace the provider is the host kernel: a
 //! crate-private `HostLinux` runs each injected call in the stopped tracee.
-//! The other backends (DBT, in-guest/LiteInst and SaBRe) do not route
+//! In reverie-inguest, the runtime LiteInst and in-guest-trap share, the
+//! provider is also the host kernel: the final forward of a call `InGuest`
+//! has admitted runs through a crate-private `HostLinux`, which issues the
+//! call on the guest thread itself through the runtime's trusted syscall
+//! gate. Plain fork, native exec, `pkey_alloc`, the `brk(0)` probe and the
+//! `close_range` split that protect the runtime's mappings and descriptors,
+//! and the syscalls of the runtime's virtual signal calls still reach Linux
+//! directly from the backend. Its `SuccessorImageGuest`, the feature-gated
+//! `Guest` of a native exec's successor image, does not route through the
+//! provider yet. The other backends (DBT and SaBRe) do not route
 //! `Guest::inject` through it yet, and [`Backend`](crate::Backend) does not
 //! carry a provider. Those are later steps, tracked in
 //! <https://github.com/rrnewton/hermit/issues/4485>.
@@ -212,7 +222,10 @@ pub trait LinuxProvider: Send + Sync {
     ///
     /// In reverie-kvm it is the guest memory arena. In reverie-ptrace, whose
     /// provider is the host kernel, it is the backend's handle on the
-    /// stopped guest task: the tracee, which also owns its stop-wait.
+    /// stopped guest task: the tracee, which also owns its stop-wait. In
+    /// reverie-inguest, whose provider is also the host kernel, it is a token
+    /// for the runtime's trusted syscall gate on the calling guest thread,
+    /// built only after the backend's admission filters have run.
     ///
     /// It must be [`Send`] because [`LinuxProvider::execute`]'s future holds
     /// `&mut Self::Context` and must itself be `Send` (see the method's

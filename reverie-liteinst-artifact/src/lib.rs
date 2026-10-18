@@ -709,7 +709,7 @@ fn content_manifest_relative(image_kind: FixedImageKind) -> &'static str {
 }
 // Reviewed literal expectations, not hashes generated from the current checkout
 // or bytes embedded after a runtime edit. The qualifier self-hash is separate.
-const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 21] = [
+const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 22] = [
     (
         "Cargo.toml",
         919,
@@ -807,8 +807,13 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 21] = [
     ),
     (
         "reverie-inguest/src/guest/host.rs",
-        166033,
-        "f363e1cd9be23b1f0acd3a93a49e8fc5234a5e953f9aa4a798d9d8d13275648c",
+        166229,
+        "ab4531e16cbfc5570eee75414fae3ea89e3839735e4fb9b914e0fa7a39b7d790",
+    ),
+    (
+        "reverie-inguest/src/guest/host_linux.rs",
+        24766,
+        "49d0a89ebc125001d78a28e52c473f23365f35fc63f2203db9c7075b568ccfff",
     ),
     (
         "reverie-liteinst/src/tool_host.rs",
@@ -27747,7 +27752,7 @@ mod tests {
         let rv_two = cargo_two.join(suffix);
         // Current compiled bytes are inputs only. Each must independently match
         // the fixed reviewed length/digest catalog before any positive is earned.
-        let compiled_files: [(&str, &[u8]); 23] = [
+        let compiled_files: [(&str, &[u8]); 24] = [
             ("Cargo.toml", include_bytes!("../../Cargo.toml")),
             (
                 "reverie-liteinst-artifact/Cargo.toml",
@@ -27826,6 +27831,10 @@ mod tests {
                 include_bytes!("../../reverie-inguest/src/guest/host.rs"),
             ),
             (
+                "reverie-inguest/src/guest/host_linux.rs",
+                include_bytes!("../../reverie-inguest/src/guest/host_linux.rs"),
+            ),
+            (
                 "reverie-liteinst/src/tool_host.rs",
                 include_bytes!("../../reverie-liteinst/src/tool_host.rs"),
             ),
@@ -27845,10 +27854,10 @@ mod tests {
             }
         }
         let (rv_inventory, _) = content_reverie_inventory(&rv_one).unwrap();
-        assert_eq!(rv_inventory.len(), 22);
+        assert_eq!(rv_inventory.len(), 23);
         let (detcore_inventory, _) =
             content_reverie_inventory_for_image(&rv_one, FixedImageKind::Detcore).unwrap();
-        assert_eq!(detcore_inventory.len(), 23);
+        assert_eq!(detcore_inventory.len(), 24);
         assert_eq!(
             content_reverie_inventory_for_image(&rv_two, FixedImageKind::Detcore)
                 .unwrap()

@@ -40,6 +40,10 @@ pub fn digest() -> [u8; 32] {
             include_bytes!("guest/native_exec_mappings.rs"),
         ),
         ("rv/guest/host.rs", include_bytes!("guest/host.rs")),
+        (
+            "rv/guest/host_linux.rs",
+            include_bytes!("guest/host_linux.rs"),
+        ),
         ("rv/guest/event.rs", include_bytes!("guest/event.rs")),
         ("rv/guest/rpc.rs", include_bytes!("guest/rpc.rs")),
         (
