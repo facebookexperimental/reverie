@@ -1657,6 +1657,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "reverie-loader"
+version = "0.4.1"
+
+[[package]]
 name = "reverie-memory"
 version = "0.4.1"
 dependencies = [

@@ -23,6 +23,7 @@ members = [
     "reverie-liteinst",
     "reverie-liteinst-artifact",
     "reverie-liteinst-preload",
+    "reverie-loader",
     "reverie-memory",
     "reverie-process",
     "reverie-ptrace",
