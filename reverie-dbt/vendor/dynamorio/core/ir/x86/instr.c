@@ -1526,15 +1526,29 @@ instr_cbr_taken(instr_t *instr, priv_mcontext_t *mcontext, bool pre)
     CLIENT_ASSERT(instr_is_cbr(instr), "instr_cbr_taken: instr not a cbr");
     if (instr_is_cti_loop(instr)) {
         uint opc = instr_get_opcode(instr);
+        reg_t counter = mcontext->xcx;
+        opnd_size_t counter_size = opnd_get_size(instr_get_src(instr, 1));
+        /* The address-size override selects CX/ECX rather than the full XCX.
+         * In particular JECXZ does not zero the upper half of RCX: shared-exit
+         * disambiguation must test the same decoded counter as the instruction.
+         * Apply this to both pre- and post-state LOOP predicates as well.
+         */
+        if (counter_size == OPSZ_2)
+            counter &= 0xffffU;
+        else if (counter_size == OPSZ_4)
+            counter &= 0xffffffffU;
+        else
+            CLIENT_ASSERT(counter_size == OPSZ_8,
+                          "instr_cbr_taken: invalid counter width");
         switch (opc) {
-        case OP_loop: return (mcontext->xcx != (pre ? 1U : 0U));
+        case OP_loop: return (counter != (pre ? 1U : 0U));
         case OP_loope:
             return (TEST(EFLAGS_ZF, mcontext->xflags) &&
-                    mcontext->xcx != (pre ? 1U : 0U));
+                    counter != (pre ? 1U : 0U));
         case OP_loopne:
             return (!TEST(EFLAGS_ZF, mcontext->xflags) &&
-                    mcontext->xcx != (pre ? 1U : 0U));
-        case OP_jecxz: return (mcontext->xcx == 0U);
+                    counter != (pre ? 1U : 0U));
+        case OP_jecxz: return (counter == 0U);
         default: CLIENT_ASSERT(false, "instr_cbr_taken: unknown opcode"); return false;
         }
     }
