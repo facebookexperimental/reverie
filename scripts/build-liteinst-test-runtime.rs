@@ -20,6 +20,7 @@
 mod allocator_declaration_fixture;
 mod fixed_arena_fixture;
 mod generic_bootstrap_fixture;
+#[path = "../reverie-liteinst-artifact/src/lib.rs"]
 pub mod m1_artifact;
 mod standalone_constructor_fixture;
 

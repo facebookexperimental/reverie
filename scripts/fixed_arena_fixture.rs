@@ -97,7 +97,7 @@ pub fn bind_inputs(
         "reverie-liteinst/src/patch_alloc.rs",
         "reverie-liteinst/src/allocator_fixture.rs",
         "reverie-liteinst/src/fixed_arena_fixture.rs",
-        "scripts/m1_artifact.rs",
+        "reverie-liteinst-artifact/src/lib.rs",
         "scripts/fixed_arena_fixture.rs",
     ]
     .into_iter()

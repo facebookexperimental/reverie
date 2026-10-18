@@ -98,7 +98,7 @@ pub fn sha256(bytes: &[u8]) -> String {
 /// compare it with Cargo metadata's canonical library target source, independent
 /// of the runtime artifact's package and source identity.
 pub fn qualifier_source_sha256() -> String {
-    sha256(include_bytes!("m1_artifact.rs"))
+    sha256(include_bytes!("lib.rs"))
 }
 
 pub fn file_sha256(path: &Path) -> Result<String> {
@@ -717,8 +717,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 21] = [
     ),
     (
         "reverie-liteinst-artifact/Cargo.toml",
-        533,
-        "f61d31f8d1426853ccc6516b79f49644475efb56399e125de2f3b63b5b77c4ee",
+        518,
+        "9705d81e0c342faf6a09a13f0013491624eeb70b86bc85f335f6d1778921be2e",
     ),
     (
         "reverie-inguest/Cargo.toml",
@@ -878,10 +878,10 @@ fn content_reverie_inventory_for_image(
     if image_kind == FixedImageKind::Detcore {
         relatives.push(CONTENT_DETCORE_FIXED_GATE.0);
     }
-    relatives.push("scripts/m1_artifact.rs");
+    relatives.push("reverie-liteinst-artifact/src/lib.rs");
     let (inventory, files) = declared_inventory(root, &relatives)?;
     for entry in &inventory {
-        if entry.relative == "scripts/m1_artifact.rs" {
+        if entry.relative == "reverie-liteinst-artifact/src/lib.rs" {
             require(
                 entry.sha256 == qualifier_source_sha256(),
                 "declared qualifier source differs from compiled host qualifier",
@@ -1283,8 +1283,8 @@ fn content_package(
         (
             binding
                 .logical_root
-                .join("reverie-liteinst-artifact/../scripts/m1_artifact.rs"),
-            binding.source_path("scripts/m1_artifact.rs")?,
+                .join("reverie-liteinst-artifact/src/lib.rs"),
+            binding.source_path("reverie-liteinst-artifact/src/lib.rs")?,
         )
     } else {
         let relative = format!("{name}/src/lib.rs");
@@ -4403,7 +4403,7 @@ fn fixed_backing_record(elf: &Elf<'_>, bytes: &[u8]) -> Result<ImmutableAllocato
     Ok(object)
 }
 
-// Insert into scripts/m1_artifact.rs alongside its Result/require and
+// Insert into reverie-liteinst-artifact/src/lib.rs alongside its Result/require and
 // ConstructorTransfer definitions. No runtime/ELF IO, hashing or admission here.
 // Whole bytes must already be joined to the exact complete executable symbol.
 // `got` MUST come from local_got_targets: unique R_X86_64_RELATIVE, STB_LOCAL
@@ -27748,92 +27748,95 @@ mod tests {
         // Current compiled bytes are inputs only. Each must independently match
         // the fixed reviewed length/digest catalog before any positive is earned.
         let compiled_files: [(&str, &[u8]); 23] = [
-            ("Cargo.toml", include_bytes!("../Cargo.toml")),
+            ("Cargo.toml", include_bytes!("../../Cargo.toml")),
             (
                 "reverie-liteinst-artifact/Cargo.toml",
-                include_bytes!("../reverie-liteinst-artifact/Cargo.toml"),
+                include_bytes!("../../reverie-liteinst-artifact/Cargo.toml"),
             ),
             (
                 "reverie-inguest/Cargo.toml",
-                include_bytes!("../reverie-inguest/Cargo.toml"),
+                include_bytes!("../../reverie-inguest/Cargo.toml"),
             ),
             (
                 "reverie-inguest/src/lib.rs",
-                include_bytes!("../reverie-inguest/src/lib.rs"),
+                include_bytes!("../../reverie-inguest/src/lib.rs"),
             ),
             (
                 "reverie-syscalls/Cargo.toml",
-                include_bytes!("../reverie-syscalls/Cargo.toml"),
+                include_bytes!("../../reverie-syscalls/Cargo.toml"),
             ),
             (
                 "reverie-syscalls/src/lib.rs",
-                include_bytes!("../reverie-syscalls/src/lib.rs"),
+                include_bytes!("../../reverie-syscalls/src/lib.rs"),
             ),
             (
                 "reverie-syscalls/src/reserved_fds.rs",
-                include_bytes!("../reverie-syscalls/src/reserved_fds.rs"),
+                include_bytes!("../../reverie-syscalls/src/reserved_fds.rs"),
             ),
             (
                 "reverie-liteinst/Cargo.toml",
-                include_bytes!("../reverie-liteinst/Cargo.toml"),
+                include_bytes!("../../reverie-liteinst/Cargo.toml"),
             ),
             (
                 "reverie-liteinst/src/lib.rs",
-                include_bytes!("../reverie-liteinst/src/lib.rs"),
+                include_bytes!("../../reverie-liteinst/src/lib.rs"),
             ),
             (
                 "reverie-liteinst-preload/Cargo.toml",
-                include_bytes!("../reverie-liteinst-preload/Cargo.toml"),
+                include_bytes!("../../reverie-liteinst-preload/Cargo.toml"),
             ),
             (
                 "reverie-liteinst-preload/src/lib.rs",
-                include_bytes!("../reverie-liteinst-preload/src/lib.rs"),
+                include_bytes!("../../reverie-liteinst-preload/src/lib.rs"),
             ),
             (
                 "reverie-liteinst/src/patch_alloc.rs",
-                include_bytes!("../reverie-liteinst/src/patch_alloc.rs"),
+                include_bytes!("../../reverie-liteinst/src/patch_alloc.rs"),
             ),
             (
                 "reverie-inguest/src/guest/alloc.rs",
-                include_bytes!("../reverie-inguest/src/guest/alloc.rs"),
+                include_bytes!("../../reverie-inguest/src/guest/alloc.rs"),
             ),
             (
                 "reverie-inguest/src/guest/tool_region_constructor.rs",
-                include_bytes!("../reverie-inguest/src/guest/tool_region_constructor.rs"),
+                include_bytes!("../../reverie-inguest/src/guest/tool_region_constructor.rs"),
             ),
             (
                 "reverie-inguest/src/guest/tool_region_arena.rs",
-                include_bytes!("../reverie-inguest/src/guest/tool_region_arena.rs"),
+                include_bytes!("../../reverie-inguest/src/guest/tool_region_arena.rs"),
             ),
             (
                 "reverie-inguest/src/guest/tool_region.rs",
-                include_bytes!("../reverie-inguest/src/guest/tool_region.rs"),
+                include_bytes!("../../reverie-inguest/src/guest/tool_region.rs"),
             ),
             (
                 "reverie-inguest/src/guest/tool_region_keyed.rs",
-                include_bytes!("../reverie-inguest/src/guest/tool_region_keyed.rs"),
+                include_bytes!("../../reverie-inguest/src/guest/tool_region_keyed.rs"),
             ),
             (
                 "reverie-inguest/src/guest/installed_tool.rs",
-                include_bytes!("../reverie-inguest/src/guest/installed_tool.rs"),
+                include_bytes!("../../reverie-inguest/src/guest/installed_tool.rs"),
             ),
             (
                 "reverie-inguest/src/guest/mod.rs",
-                include_bytes!("../reverie-inguest/src/guest/mod.rs"),
+                include_bytes!("../../reverie-inguest/src/guest/mod.rs"),
             ),
             (
                 "reverie-inguest/src/guest/host.rs",
-                include_bytes!("../reverie-inguest/src/guest/host.rs"),
+                include_bytes!("../../reverie-inguest/src/guest/host.rs"),
             ),
             (
                 "reverie-liteinst/src/tool_host.rs",
-                include_bytes!("../reverie-liteinst/src/tool_host.rs"),
+                include_bytes!("../../reverie-liteinst/src/tool_host.rs"),
             ),
             (
                 "reverie-inguest/src/trap/fixed_gates.rs",
-                include_bytes!("../reverie-inguest/src/trap/fixed_gates.rs"),
+                include_bytes!("../../reverie-inguest/src/trap/fixed_gates.rs"),
             ),
-            ("scripts/m1_artifact.rs", include_bytes!("m1_artifact.rs")),
+            (
+                "reverie-liteinst-artifact/src/lib.rs",
+                include_bytes!("lib.rs"),
+            ),
         ];
         for rv in [&rv_one, &rv_two] {
             for &(relative, bytes) in &compiled_files {
@@ -27902,7 +27905,7 @@ mod tests {
             fs::write(rv_one.join(relative), &bytes).unwrap();
             content_reverie_inventory(&rv_one).unwrap();
         }
-        let helper = rv_one.join("scripts/m1_artifact.rs");
+        let helper = rv_one.join("reverie-liteinst-artifact/src/lib.rs");
         let bytes = fs::read(&helper).unwrap();
         fs::write(&helper, b"changed qualifier before resolution").unwrap();
         assert!(
@@ -27989,7 +27992,7 @@ mod tests {
             ),
         ] {
             let relative_target = if name == "reverie-liteinst-artifact" {
-                "reverie-liteinst-artifact/../scripts/m1_artifact.rs".into()
+                "reverie-liteinst-artifact/src/lib.rs".into()
             } else {
                 format!("{name}/src/lib.rs")
             };

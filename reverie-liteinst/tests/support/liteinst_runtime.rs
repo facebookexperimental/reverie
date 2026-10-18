@@ -17,7 +17,7 @@ use std::sync::OnceLock;
 // Each consumer uses a subset of the shared producer/consumer APIs. Their unit
 // tests remain enrolled in every test binary that includes this module.
 #[allow(dead_code)]
-#[path = "../../../scripts/m1_artifact.rs"]
+#[path = "../../../reverie-liteinst-artifact/src/lib.rs"]
 pub mod artifact;
 #[allow(dead_code)]
 #[path = "../../../scripts/m1_contract.rs"]

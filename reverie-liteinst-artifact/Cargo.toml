@@ -10,7 +10,7 @@ publish = false
 description = "Host-only qualification of Reverie LiteInst artifacts"
 
 [lib]
-path = "../scripts/m1_artifact.rs"
+path = "src/lib.rs"
 
 [dependencies]
 goblin = "=0.10.7"
