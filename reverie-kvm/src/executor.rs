@@ -360,9 +360,8 @@ fn synthetic_proc_create_directory_errno(
             libc::EEXIST
         }
         // Linux v6.3 fs/namei.c:3543 applies LOOKUP_DIRECTORY to the resolved
-        // final dentry before may_open; this makes a nofollow /proc/mounts
-        // symlink ENOTDIR here. Without O_DIRECTORY, may_open still yields
-        // ELOOP, and O_EXCL above still yields EEXIST.
+        // final dentry before may_open, so an existing regular file is
+        // ENOTDIR here; O_EXCL above still yields EEXIST.
         RegularCreateDirectoryPolicy::LegacyLookup => libc::ENOTDIR,
     }
 }
@@ -11053,9 +11052,6 @@ fn open_file(
             {
                 return negative_errno(libc::EEXIST);
             }
-            if path == b"/proc/mounts" && flags & libc::O_NOFOLLOW as u64 != 0 {
-                return negative_errno(libc::ELOOP);
-            }
             if flags & libc::O_TRUNC as u64 != 0
                 || flags & libc::O_ACCMODE as u64 != libc::O_RDONLY as u64
             {
@@ -17989,10 +17985,15 @@ const SYNTHETIC_GUEST_FD_DEV_MINOR: u32 = 0xff02;
 // table wherever CPUID is virtualized and the backend can deliver the guest's
 // CPUID instruction to the Tool, as KVM always can; its KVM copy (this table's
 // entry, a fixed "reverie-kvm virtual CPU" block) carried no marker.
+// /proc/mounts, /proc/self/mounts and /proc/self/mountinfo followed, once
+// Detcore rendered every process's mount files from a container mount table
+// that every run has (package K slice K3). Their KVM copy was the backend's
+// own capture of its namespace's tables at image load (proc_mounts.rs), served
+// with its length as st_size, plus a /proc/mounts O_NOFOLLOW special case; its
+// regression test carried AUTONOMOUS-BOT-IMPLEMENTED and
+// TODO-HUMAN-REVIEW(PR-225) (the mountinfo surface added for df), a review
+// that now applies to Detcore's rendering.
 const SYNTHETIC_REGULAR_PROC_PATHS: &[&[u8]] = &[
-    b"/proc/mounts",
-    b"/proc/self/mounts",
-    b"/proc/self/mountinfo",
     b"/proc/locks",
     b"/proc/self/stat",
     b"/proc/self/status",
@@ -18132,11 +18133,6 @@ fn normalize_proc_path(state: &LoadedStaticElf, path: &[u8]) -> Option<Vec<u8>> 
 fn synthetic_proc_content(state: &LoadedStaticElf, path: &[u8]) -> Option<Vec<u8>> {
     let normalized = normalize_proc_path(state, path)?;
     let content = match normalized.as_slice() {
-        b"/proc/mounts" | b"/proc/self/mounts" => state.proc_mounts.mounts.clone(),
-        // Absolute guest paths and owned descriptors use this same ambient
-        // namespace. The Tool normalizes its real mount identities together
-        // with the raw identities returned by ordinary fdinfo observations.
-        b"/proc/self/mountinfo" => state.proc_mounts.mountinfo.clone(),
         b"/proc/locks" => proc_locks_content(state),
         b"/proc/self/stat" => proc_self_stat_content(state),
         b"/proc/self/status" => proc_self_status_content(state),
@@ -23455,7 +23451,6 @@ pub(crate) fn native_loaded_state(cwd: &std::path::Path) -> LoadedStaticElf {
             .expect("test KVM state requires a supported host open policy"),
         fdinfo_files: std::collections::BTreeMap::new(),
         fdinfo_table: std::sync::Weak::new(),
-        proc_mounts: Arc::new(crate::proc_mounts::ProcMountSnapshot::capture().unwrap()),
         fd_object_inodes: std::collections::BTreeMap::new(),
         file_identity_table: Arc::new(std::sync::Mutex::new(crate::elf::GuestFileIdentityTable {
             inotify_cookies: InotifyCookieTable::default(),
@@ -26619,107 +26614,86 @@ mod tests {
         // supervisor identity; compare those native rows only under non-root.
         // SAFETY: geteuid has no arguments or memory-safety preconditions.
         let supervisor_is_nonroot = unsafe { libc::geteuid() } != 0;
-        const CASES: &[(&str, libc::c_int, Option<libc::c_int>, Option<libc::c_int>)] = &[
-            (
-                "read-nofollow",
-                libc::O_RDONLY | libc::O_NOFOLLOW,
-                None,
-                Some(libc::ELOOP),
-            ),
+        const CASES: &[(&str, libc::c_int, Option<libc::c_int>)] = &[
+            ("read-nofollow", libc::O_RDONLY | libc::O_NOFOLLOW, None),
             (
                 "write-nofollow",
                 libc::O_WRONLY | libc::O_NOFOLLOW,
                 Some(libc::EACCES),
-                Some(libc::ELOOP),
             ),
             (
                 "truncate-nofollow",
                 libc::O_RDONLY | libc::O_TRUNC | libc::O_NOFOLLOW,
                 Some(libc::EACCES),
-                Some(libc::ELOOP),
             ),
             (
                 "direct-nofollow",
                 libc::O_RDONLY | libc::O_DIRECT | libc::O_NOFOLLOW,
                 Some(libc::EINVAL),
-                Some(libc::ELOOP),
             ),
             (
                 "write-direct-nofollow",
                 libc::O_WRONLY | libc::O_DIRECT | libc::O_NOFOLLOW,
                 Some(libc::EACCES),
-                Some(libc::ELOOP),
             ),
             (
                 "read-directory-nofollow",
                 libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
-                Some(libc::ENOTDIR),
                 Some(libc::ENOTDIR),
             ),
             (
                 "write-directory-nofollow",
                 libc::O_WRONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
                 Some(libc::ENOTDIR),
-                Some(libc::ENOTDIR),
             ),
             (
                 "path-directory-nofollow",
                 libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW,
-                Some(libc::ENOTDIR),
                 Some(libc::ENOTDIR),
             ),
             (
                 "readonly-tmpfile",
                 libc::O_RDONLY | libc::O_TMPFILE,
                 Some(libc::EINVAL),
-                Some(libc::EINVAL),
             ),
             (
                 "private-tmpfile-without-directory",
                 libc::O_WRONLY | (libc::O_TMPFILE & !libc::O_DIRECTORY),
-                Some(libc::EINVAL),
                 Some(libc::EINVAL),
             ),
             (
                 "writeonly-tmpfile-create",
                 libc::O_WRONLY | libc::O_TMPFILE | libc::O_CREAT,
                 Some(libc::EINVAL),
-                Some(libc::EINVAL),
             ),
             (
                 "readwrite-tmpfile-create",
                 libc::O_RDWR | libc::O_TMPFILE | libc::O_CREAT,
-                Some(libc::EINVAL),
                 Some(libc::EINVAL),
             ),
             (
                 "access-three-tmpfile-create",
                 libc::O_ACCMODE | libc::O_TMPFILE | libc::O_CREAT,
                 Some(libc::EINVAL),
-                Some(libc::EINVAL),
             ),
             (
                 "readonly-tmpfile-nofollow",
                 libc::O_RDONLY | libc::O_TMPFILE | libc::O_NOFOLLOW,
-                Some(libc::EINVAL),
                 Some(libc::EINVAL),
             ),
             (
                 "readonly-tmpfile-truncate",
                 libc::O_RDONLY | libc::O_TMPFILE | libc::O_TRUNC,
                 Some(libc::EINVAL),
-                Some(libc::EINVAL),
             ),
             (
                 "readonly-tmpfile-direct",
                 libc::O_RDONLY | libc::O_TMPFILE | libc::O_DIRECT,
                 Some(libc::EINVAL),
-                Some(libc::EINVAL),
             ),
             (
                 "readonly-tmpfile-exclusive",
                 libc::O_RDONLY | libc::O_TMPFILE | libc::O_EXCL,
-                Some(libc::EINVAL),
                 Some(libc::EINVAL),
             ),
             (
@@ -26731,30 +26705,25 @@ mod tests {
                     | libc::O_DIRECT
                     | libc::O_EXCL,
                 Some(libc::EINVAL),
-                Some(libc::EINVAL),
             ),
             (
                 "writeonly-tmpfile",
                 libc::O_WRONLY | libc::O_TMPFILE,
-                Some(libc::ENOTDIR),
                 Some(libc::ENOTDIR),
             ),
             (
                 "readwrite-tmpfile",
                 libc::O_RDWR | libc::O_TMPFILE,
                 Some(libc::ENOTDIR),
-                Some(libc::ENOTDIR),
             ),
             (
                 "access-three-tmpfile",
                 libc::O_ACCMODE | libc::O_TMPFILE,
                 Some(libc::ENOTDIR),
-                Some(libc::ENOTDIR),
             ),
             (
                 "path-tmpfile",
                 libc::O_PATH | libc::O_TMPFILE,
-                Some(libc::ENOTDIR),
                 Some(libc::ENOTDIR),
             ),
             (
@@ -26766,30 +26735,25 @@ mod tests {
                     | libc::O_DIRECT
                     | libc::O_EXCL,
                 Some(libc::ENOTDIR),
-                Some(libc::ENOTDIR),
             ),
             (
                 "create-exclusive-read",
                 libc::O_RDONLY | libc::O_CREAT | libc::O_EXCL,
-                Some(libc::EEXIST),
                 Some(libc::EEXIST),
             ),
             (
                 "create-exclusive-write",
                 libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
                 Some(libc::EEXIST),
-                Some(libc::EEXIST),
             ),
             (
                 "create-exclusive-truncate",
                 libc::O_RDONLY | libc::O_CREAT | libc::O_EXCL | libc::O_TRUNC,
                 Some(libc::EEXIST),
-                Some(libc::EEXIST),
             ),
             (
                 "create-exclusive-direct-nofollow",
                 libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_DIRECT | libc::O_NOFOLLOW,
-                Some(libc::EEXIST),
                 Some(libc::EEXIST),
             ),
             (
@@ -26800,7 +26764,6 @@ mod tests {
                     | libc::O_EXCL
                     | libc::O_TRUNC
                     | libc::O_DIRECT,
-                None,
                 None,
             ),
         ];
@@ -26826,12 +26789,7 @@ mod tests {
         let mut memory = GuestMemory::new(0, state.mmap_limit as usize).unwrap();
         for &path in SYNTHETIC_REGULAR_PROC_PATHS {
             let path = std::str::from_utf8(path).unwrap();
-            for &(label, flags, regular_error, mounts_error) in CASES {
-                let expected = if path == "/proc/mounts" {
-                    mounts_error
-                } else {
-                    regular_error
-                };
+            for &(label, flags, expected) in CASES {
                 if expected != Some(libc::EACCES) || supervisor_is_nonroot {
                     let native_error = native_open_error(path, flags);
                     assert_eq!(
@@ -26877,23 +26835,20 @@ mod tests {
         let exclusive = plain | libc::O_EXCL as u64;
         let nofollow = plain | libc::O_NOFOLLOW as u64;
 
-        for path in [b"/proc/self/maps".as_slice(), b"/proc/mounts"] {
-            for flags in [
-                plain,
-                exclusive,
-                nofollow,
-                exclusive | libc::O_NOFOLLOW as u64,
-            ] {
-                assert_eq!(
-                    synthetic_proc_create_directory_errno(
-                        RegularCreateDirectoryPolicy::EarlyEinval,
-                        flags,
-                    ),
-                    libc::EINVAL,
-                    "early policy path={} flags={flags:#x}",
-                    String::from_utf8_lossy(path)
-                );
-            }
+        for flags in [
+            plain,
+            exclusive,
+            nofollow,
+            exclusive | libc::O_NOFOLLOW as u64,
+        ] {
+            assert_eq!(
+                synthetic_proc_create_directory_errno(
+                    RegularCreateDirectoryPolicy::EarlyEinval,
+                    flags,
+                ),
+                libc::EINVAL,
+                "early policy flags={flags:#x}"
+            );
         }
 
         assert_eq!(
@@ -26960,7 +26915,7 @@ mod tests {
             ),
             (
                 RegularCreateDirectoryPolicy::EarlyEinval,
-                "/proc/mounts",
+                "/proc/self/maps",
                 nofollow,
                 libc::EINVAL,
             ),
@@ -26978,13 +26933,13 @@ mod tests {
             ),
             (
                 RegularCreateDirectoryPolicy::LegacyLookup,
-                "/proc/mounts",
+                "/proc/self/maps",
                 nofollow,
                 libc::ENOTDIR,
             ),
             (
                 RegularCreateDirectoryPolicy::LegacyLookup,
-                "/proc/mounts",
+                "/proc/self/maps",
                 exclusive | libc::O_NOFOLLOW,
                 libc::EEXIST,
             ),
@@ -26999,21 +26954,6 @@ mod tests {
                 "policy={policy:?} path={path} flags={flags:#x}"
             );
         }
-
-        let root = TestDir::new();
-        let mut state = test_state(&root.0);
-        state.regular_create_directory_policy = RegularCreateDirectoryPolicy::LegacyLookup;
-        let mut memory = GuestMemory::new(0, state.mmap_limit as usize).unwrap();
-        assert_eq!(
-            open_with_flags(
-                &mut memory,
-                &mut state,
-                "/proc/mounts",
-                libc::O_RDONLY | libc::O_NOFOLLOW,
-            ),
-            negative_errno(libc::ELOOP),
-            "without O_DIRECTORY, /proc/mounts still reaches may_open's ELOOP"
-        );
     }
 
     #[test]
@@ -28013,55 +27953,31 @@ mod tests {
         );
     }
 
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-225): regression for the /proc/self/mountinfo
-    // synthetic surface (content bytes, read path, and inode round-trip) added
-    // for df compatibility under --backend kvm.
+    /// The backend keeps no copy of the mount table: Detcore renders every
+    /// process's mount files from its container mount table
+    /// (https://github.com/rrnewton/hermit/issues/4213). An absolute open that
+    /// reaches the backend anyway is the host's procfs file, which the backend
+    /// refuses like every supervisor procfs open, rather than a copy of the
+    /// supervisor's table.
     #[test]
-    fn synthetic_proc_self_mountinfo_is_served_and_stable() {
+    fn the_backend_serves_no_mount_table() {
         let root = TestDir::new();
         let mut state = test_state(&root.0);
         let mut memory = GuestMemory::new(0, 0x4000).unwrap();
-
-        let expected = std::fs::read("/proc/self/mountinfo").unwrap();
-        assert_eq!(state.proc_mounts.mountinfo, expected);
-
-        // The raw surface represents the actual backend filesystem namespace.
-        assert_eq!(
-            synthetic_proc_content(&state, b"/proc/self/mountinfo").as_deref(),
-            Some(expected.as_slice())
-        );
-
-        // A guest read through openat yields the same bytes.
-        let fd = open_readonly(&mut memory, &mut state, "/proc/self/mountinfo");
-        assert!(fd >= 0, "open /proc/self/mountinfo failed: {fd}");
-        assert_eq!(read_fd_to_end(&mut memory, &mut state, fd), expected);
-
-        // fstat/newfstatat resolve to the same stable synthetic inode so that
-        // gnulib's fstat-then-read of the mount table stays deterministic.
-        let stat_address = 0x1000;
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_fstat,
-                [fd as u64, stat_address, 0, 0, 0, 0]
-            ),
-            0
-        );
-        let stat: libc::stat = read_struct(&memory, stat_address);
-        assert_eq!(stat.st_ino, synthetic_proc_inode(b"/proc/self/mountinfo"));
-        assert_eq!(
-            synthetic_proc_path_for_inode(stat.st_ino),
-            Some(b"/proc/self/mountinfo".as_slice())
-        );
-        assert_eq!(stat.st_size, expected.len() as libc::off_t);
-        let child = state.try_clone_for_fork(2).unwrap();
-        assert!(Arc::ptr_eq(&state.proc_mounts, &child.proc_mounts));
-        let snapshot = state.proc_mounts.clone();
-        let mut replacement = test_state(&root.0);
-        replacement.inherit_process_state(state);
-        assert!(Arc::ptr_eq(&snapshot, &replacement.proc_mounts));
+        // The guest's own numeric spelling normalizes to /proc/self.
+        let own_mountinfo = format!("/proc/{}/mountinfo", state.pid);
+        assert!(synthetic_proc_content(&state, own_mountinfo.as_bytes()).is_none());
+        for path in ["/proc/mounts", "/proc/self/mounts", "/proc/self/mountinfo"] {
+            assert!(
+                synthetic_proc_content(&state, path.as_bytes()).is_none(),
+                "{path} has a backend rendering"
+            );
+            assert_eq!(
+                open_readonly(&mut memory, &mut state, path),
+                negative_errno(libc::EACCES),
+                "{path} reached the supervisor's procfs"
+            );
+        }
     }
 
     #[test]
@@ -28421,18 +28337,18 @@ mod tests {
         );
 
         // A one-component name below the directory resolves too.
-        write_c_string(&mut memory, 0x100, "mounts");
-        let mounts_fd = syscall_result(
+        write_c_string(&mut memory, 0x100, "locks");
+        let locks_fd = syscall_result(
             &mut memory,
             &mut state,
             libc::SYS_openat,
             [proc_fd as u64, 0x100, libc::O_RDONLY as u64, 0, 0, 0],
         );
-        assert!(mounts_fd >= 0, "openat mounts failed: {mounts_fd}");
-        let expected_mounts = state.proc_mounts.mounts.clone();
+        assert!(locks_fd >= 0, "openat locks failed: {locks_fd}");
+        let expected_locks = synthetic_proc_content(&state, b"/proc/locks").unwrap();
         assert_eq!(
-            read_fd_to_end(&mut memory, &mut state, mounts_fd),
-            expected_mounts
+            read_fd_to_end(&mut memory, &mut state, locks_fd),
+            expected_locks
         );
 
         write_c_string(&mut memory, 0x100, "self/maps");
@@ -28460,17 +28376,19 @@ mod tests {
 
         // A file Detcore renders has no copy here, so a relative open that
         // reaches this executor anyway fails closed like any unlisted name.
-        write_c_string(&mut memory, 0x100, "cpuinfo");
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_openat,
-                [proc_fd as u64, 0x100, libc::O_RDONLY as u64, 0, 0, 0],
-            ),
-            negative_errno(libc::ENOENT),
-            "relative cpuinfo below the synthetic /proc directory"
-        );
+        for name in ["cpuinfo", "mounts", "self/mounts", "self/mountinfo"] {
+            write_c_string(&mut memory, 0x100, name);
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_openat,
+                    [proc_fd as u64, 0x100, libc::O_RDONLY as u64, 0, 0, 0],
+                ),
+                negative_errno(libc::ENOENT),
+                "relative {name} below the synthetic /proc directory"
+            );
+        }
 
         assert_eq!(
             syscall_result(
@@ -45946,10 +45864,8 @@ mod tests {
         f.check_object(&bytes, target, 47);
         let table = f.executor.file_table.clone();
         let generation = f.executor.task_generation;
-        let mounts = f.executor.state.proc_mounts.clone();
         f.executor.replace_after_exec(test_state(&f.root.0));
         assert!(Arc::ptr_eq(&table, &f.executor.file_table));
-        assert!(Arc::ptr_eq(&mounts, &f.executor.state.proc_mounts));
         assert_eq!(f.executor.task_generation, generation);
         assert!(f.executor.state.fdinfo_files.contains_key(&(info as i32)));
         assert!(
@@ -46286,7 +46202,7 @@ mod tests {
         );
         let target = f.open("a", libc::O_RDWR);
         let info = f.info(target);
-        for path in ["/proc/self/mountinfo", "/dev/urandom"] {
+        for path in ["/proc/self/maps", "/dev/urandom"] {
             let private = f.open(path, libc::O_RDONLY);
             assert!(private >= 0);
             assert_eq!(

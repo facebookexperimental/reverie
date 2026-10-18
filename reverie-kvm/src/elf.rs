@@ -1096,7 +1096,6 @@ pub(crate) struct LoadedStaticElf {
     /// Host-kernel ordering for O_CREAT|O_DIRECTORY on an existing regular
     /// procfs entry, established before this image can execute.
     pub regular_create_directory_policy: RegularCreateDirectoryPolicy,
-    pub proc_mounts: std::sync::Arc<crate::proc_mounts::ProcMountSnapshot>,
     pub fdinfo_files:
         std::collections::BTreeMap<i32, std::sync::Arc<crate::executor::FdinfoDescription>>,
     pub fdinfo_table: std::sync::Weak<std::sync::Mutex<crate::executor::FileTableState>>,
@@ -1276,7 +1275,6 @@ impl LoadedStaticElf {
             proc_files: self.proc_files.clone(),
             synthetic_proc_nofollow_fds: self.synthetic_proc_nofollow_fds.clone(),
             regular_create_directory_policy: self.regular_create_directory_policy,
-            proc_mounts: self.proc_mounts.clone(),
             fdinfo_files: self.fdinfo_files.clone(),
             fdinfo_table: self.fdinfo_table.clone(),
             fd_object_inodes: self.fd_object_inodes.clone(),
@@ -1500,7 +1498,6 @@ impl LoadedStaticElf {
         self.proc_files = proc_files;
         self.synthetic_proc_nofollow_fds = synthetic_proc_nofollow_fds;
         self.regular_create_directory_policy = regular_create_directory_policy;
-        self.proc_mounts = previous.proc_mounts;
         self.fdinfo_files = fdinfo_files;
         self.fdinfo_table = previous.fdinfo_table;
         self.fd_object_inodes = fd_object_inodes;
@@ -2044,7 +2041,6 @@ fn load_executable(
         proc_files: std::collections::BTreeMap::new(),
         synthetic_proc_nofollow_fds: std::collections::BTreeSet::new(),
         regular_create_directory_policy: initialize_regular_create_directory_policy()?,
-        proc_mounts: std::sync::Arc::new(crate::proc_mounts::ProcMountSnapshot::capture()?),
         fdinfo_files: std::collections::BTreeMap::new(),
         fdinfo_table: std::sync::Weak::new(),
         fd_object_inodes: std::collections::BTreeMap::new(),

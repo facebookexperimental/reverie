@@ -3695,13 +3695,12 @@ static int enumeration(int descriptor, int guest) {
 }
 
 static int contents(int descriptor, int baseline, int guest) {
-    const char *paths[] = {"mounts", "self/mountinfo", "self/cmdline"};
+    const char *paths[] = {"self/maps", "self/cmdline"};
     for (unsigned index = 0; index < sizeof(paths) / sizeof(paths[0]); ++index) {
         int actual = openat(descriptor, paths[index], O_RDONLY);
         int expected = openat(baseline, paths[index], O_RDONLY);
         CHECK(actual >= 0 && expected >= 0);
-        /* Mount tables have no fixed size: read each file to EOF and
-           compare the complete contents. */
+        /* Read each file to EOF and compare the complete contents. */
         enum { CONTENT_BYTES = 1 << 20 };
         unsigned char *actual_bytes = malloc(CONTENT_BYTES), *expected_bytes = malloc(CONTENT_BYTES);
         CHECK(actual_bytes != NULL && expected_bytes != NULL);
@@ -3727,7 +3726,8 @@ static int contents(int descriptor, int baseline, int guest) {
         CHECK(close(actual) == 0 && close(expected) == 0);
     }
     if (guest) {
-        const char *unlisted[] = {"../etc/passwd", "self/environ", "thread-self/environ", "self/task", "self/fd", "1/environ"};
+        /* The mount tables are Detcore's to render; the backend keeps no copy. */
+        const char *unlisted[] = {"../etc/passwd", "self/environ", "thread-self/environ", "self/task", "self/fd", "1/environ", "mounts", "self/mountinfo"};
         for (unsigned index = 0; index < sizeof(unlisted) / sizeof(unlisted[0]); ++index) {
             errno = 0;
             CHECK(openat(descriptor, unlisted[index], O_RDONLY) == -1 && errno == ENOENT);
