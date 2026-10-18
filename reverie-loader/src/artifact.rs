@@ -18,10 +18,13 @@
 //! windows; `reverie-inguest`'s ToolRegion tests check them against its own
 //! layout.
 //!
-//! The windows are not yet reserved in ToolRegion's page allocator, and
-//! ToolRegion's reservation does not yet accommodate images mapped before
-//! it. Both belong to the step that first maps these images (design stage
-//! 1a-ii); until then nothing maps here.
+//! The opt-in stage-1a probe maps these images inside its own fresh complete
+//! reservation and uses only its separate test runtime. The production
+//! ToolRegion page allocator does not yet reserve these windows or adopt a
+//! loader-owned reservation. Production integration must first reserve both
+//! windows and their guards, authenticate adoption without replacing live
+//! mappings, and qualify the changed allocator with M1. The probe does not
+//! satisfy that prerequisite or activate a product backend.
 //!
 //! The first page of each window is that image's syscall gate: the only page
 //! its `syscall` instructions may occupy, and so the only instruction

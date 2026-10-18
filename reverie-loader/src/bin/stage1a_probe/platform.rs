@@ -1,0 +1,335 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+//! The probe's only local-process unsafe boundary. Child setup uses raw
+//! syscalls after fork: no allocator, libc locks, destructors, or unwinding.
+
+use std::ffi::CString;
+use std::os::fd::AsFd;
+use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
+use std::os::fd::OwnedFd;
+use std::os::fd::RawFd;
+
+use safeptrace::Pid;
+use serde_json::json;
+
+use super::CleanupReport;
+
+/// Atomic clone/pidfd ownership before safeptrace acquires its generation.
+/// Once transferred, only safeptrace may wait for this child.
+pub struct PendingChild {
+    pid: Pid,
+    pidfd: OwnedFd,
+    owned: bool,
+    evidence: CleanupReport,
+    // Ptrace and child waiting stay on the OS thread that created the child.
+    _local: core::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl PendingChild {
+    pub fn pid(&self) -> Pid {
+        self.pid
+    }
+
+    pub fn transfer_to_ptracer(&mut self) {
+        self.evidence.borrow_mut()["owner"] = json!("ptracer");
+        self.owned = false;
+    }
+}
+
+impl Drop for PendingChild {
+    fn drop(&mut self) {
+        if !self.owned {
+            return;
+        }
+        // SAFETY: this retained descriptor came atomically from clone3. It
+        // names the original child even if another waiter has reaped it.
+        let result = unsafe {
+            syscall6(
+                libc::SYS_pidfd_send_signal as u64,
+                [
+                    self.pidfd.as_raw_fd() as u64,
+                    libc::SIGKILL as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        };
+        {
+            let mut evidence = self.evidence.borrow_mut();
+            evidence["kill_requested"] = json!(true);
+            evidence["kill_errno"] = if result < 0 {
+                json!(-result)
+            } else {
+                json!(null)
+            };
+        }
+        if result < 0 && result != -i64::from(libc::ESRCH) {
+            eprintln!(
+                "loader pre-registration cleanup kill failed: errno {}",
+                -result
+            );
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            use nix::sys::wait::Id;
+            use nix::sys::wait::WaitPidFlag;
+            use nix::sys::wait::WaitStatus;
+            use nix::sys::wait::waitid;
+            match waitid(
+                Id::PIDFd(self.pidfd.as_fd()),
+                WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG,
+            ) {
+                Ok(WaitStatus::Exited(_, code)) => {
+                    let mut evidence = self.evidence.borrow_mut();
+                    evidence["confirmed"] = json!(true);
+                    evidence["confirmation"] = json!("pidfd_waitid");
+                    evidence["terminal_status"] = json!({"kind":"exited", "code":code});
+                    break;
+                }
+                Ok(WaitStatus::Signaled(_, signal, core_dumped)) => {
+                    let mut evidence = self.evidence.borrow_mut();
+                    evidence["confirmed"] = json!(true);
+                    evidence["confirmation"] = json!("pidfd_waitid");
+                    evidence["terminal_status"] = json!({"kind":"signaled", "signal":signal as i32, "core_dumped":core_dumped});
+                    break;
+                }
+                Err(nix::errno::Errno::EINTR) if std::time::Instant::now() < deadline => continue,
+                Ok(WaitStatus::StillAlive) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                other => {
+                    self.evidence.borrow_mut()["wait_error"] = json!(format!("{other:?}"));
+                    eprintln!(
+                        "loader pre-registration cleanup did not confirm retirement: {other:?}"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+}
+
+#[repr(C)]
+struct CloneArgs {
+    flags: u64,
+    pidfd: u64,
+    child_tid: u64,
+    parent_tid: u64,
+    exit_signal: u64,
+    stack: u64,
+    stack_size: u64,
+    tls: u64,
+    set_tid: u64,
+    set_tid_size: u64,
+    cgroup: u64,
+}
+
+/// All pointer storage is made before fork and retained until exec or _exit.
+pub struct PreparedChild {
+    program: CString,
+    _arguments: Vec<CString>,
+    arguments: Vec<*const libc::c_char>,
+    _environment: Vec<CString>,
+    environment: Vec<*const libc::c_char>,
+    inherited: Vec<RawFd>,
+}
+
+impl PreparedChild {
+    pub fn new(arguments: &[std::ffi::OsString], inherited: Vec<RawFd>) -> Result<Self, String> {
+        use std::os::unix::ffi::OsStrExt;
+        let arguments: Vec<CString> = arguments
+            .iter()
+            .map(|a| CString::new(a.as_bytes()).map_err(|_| "argument contains NUL".to_owned()))
+            .collect::<Result<_, _>>()?;
+        let program = arguments.first().ok_or("missing guest program")?.clone();
+        let environment: Vec<CString> = std::env::vars_os()
+            .map(|(key, value)| {
+                let mut bytes = key.as_bytes().to_vec();
+                bytes.push(b'=');
+                bytes.extend_from_slice(value.as_bytes());
+                CString::new(bytes).map_err(|_| "environment contains NUL".to_owned())
+            })
+            .collect::<Result<_, _>>()?;
+        let pointers = |strings: &[CString]| {
+            strings
+                .iter()
+                .map(|s| s.as_ptr())
+                .chain([std::ptr::null()])
+                .collect()
+        };
+        Ok(Self {
+            program,
+            arguments: pointers(&arguments),
+            environment: pointers(&environment),
+            _arguments: arguments,
+            _environment: environment,
+            inherited,
+        })
+    }
+
+    pub fn fork(&self, evidence: CleanupReport) -> Result<PendingChild, std::io::Error> {
+        // SAFETY: the child uses only raw syscalls and immutable preallocated
+        // storage, then execve or exit_group. It cannot unwind or run Drop.
+        // Parent memory and all retained CString buffers remain live in both
+        // copies. No child code acquires inherited userspace locks.
+        let parent = unsafe { syscall6(libc::SYS_getpid as u64, [0; 6]) };
+        let mut pidfd = -1_i32;
+        let arguments = CloneArgs {
+            flags: libc::CLONE_PIDFD as u64,
+            pidfd: (&raw mut pidfd) as u64,
+            exit_signal: libc::SIGCHLD as u64,
+            child_tid: 0,
+            parent_tid: 0,
+            stack: 0,
+            stack_size: 0,
+            tls: 0,
+            set_tid: 0,
+            set_tid_size: 0,
+            cgroup: 0,
+        };
+        // SAFETY: no CLONE_VM and no replacement stack: fork semantics.
+        // The kernel writes an owned CLOEXEC pidfd into this live scalar in
+        // the parent. Both branches retain the preallocated child setup.
+        let child = unsafe {
+            syscall6(
+                libc::SYS_clone3 as u64,
+                [
+                    (&raw const arguments) as u64,
+                    core::mem::size_of::<CloneArgs>() as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        };
+        if child < 0 {
+            return Err(std::io::Error::from_raw_os_error(-child as i32));
+        }
+        if child == 0 {
+            // SAFETY: everything dereferenced by child_entry was prepared in
+            // this process before fork; the child never returns.
+            unsafe { self.child_entry(parent as u64) }
+        }
+        // SAFETY: successful CLONE_PIDFD transfers this fresh descriptor to
+        // this parent. It is owned exactly once; the child cannot close it.
+        let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd) };
+        {
+            let mut record = evidence.borrow_mut();
+            record["child_created"] = json!(true);
+            record["owner"] = json!("pending_pidfd");
+        }
+        Ok(PendingChild {
+            pid: Pid::from_raw(child as i32),
+            pidfd,
+            owned: true,
+            evidence,
+            _local: core::marker::PhantomData,
+        })
+    }
+
+    unsafe fn child_entry(&self, parent: u64) -> ! {
+        // SAFETY: raw scalar syscall operands; the child has not exec'd guest
+        // code. The parent-death check closes the gap before EXITKILL can be
+        // installed at the first ptrace stop.
+        unsafe {
+            if syscall6(
+                libc::SYS_prctl as u64,
+                [
+                    libc::PR_SET_PDEATHSIG as u64,
+                    libc::SIGKILL as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            ) < 0
+                || syscall6(libc::SYS_getppid as u64, [0; 6]) != parent as i64
+                || syscall6(
+                    libc::SYS_prctl as u64,
+                    [libc::PR_SET_NO_NEW_PRIVS as u64, 1, 0, 0, 0, 0],
+                ) < 0
+            {
+                exit_child();
+            }
+            for &fd in &self.inherited {
+                if syscall6(
+                    libc::SYS_fcntl as u64,
+                    [fd as u64, libc::F_SETFD as u64, 0, 0, 0, 0],
+                ) < 0
+                {
+                    exit_child();
+                }
+            }
+            if syscall6(
+                libc::SYS_ptrace as u64,
+                [libc::PTRACE_TRACEME as u64, 0, 0, 0, 0, 0],
+            ) < 0
+            {
+                exit_child();
+            }
+            let pid = syscall6(libc::SYS_getpid as u64, [0; 6]);
+            if syscall6(
+                libc::SYS_tgkill as u64,
+                [pid as u64, pid as u64, libc::SIGSTOP as u64, 0, 0, 0],
+            ) < 0
+            {
+                exit_child();
+            }
+            // The parent's first resume follows SETOPTIONS(EXITKILL|TRACEEXEC).
+            // Every pointer names immutable, NUL-terminated pre-fork storage.
+            syscall6(
+                libc::SYS_execve as u64,
+                [
+                    self.program.as_ptr() as u64,
+                    self.arguments.as_ptr() as u64,
+                    self.environment.as_ptr() as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            );
+            exit_child()
+        }
+    }
+}
+
+/// # Safety
+/// Pointer-valued arguments must satisfy the selected Linux syscall's ABI.
+#[inline(always)]
+unsafe fn syscall6(number: u64, args: [u64; 6]) -> i64 {
+    let result: i64;
+    // SAFETY: the caller owns every pointer operand. All x86-64 syscall
+    // clobbers are declared and the stack is untouched by this instruction.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") number => result,
+            in("rdi") args[0], in("rsi") args[1], in("rdx") args[2],
+            in("r10") args[3], in("r8") args[4], in("r9") args[5],
+            lateout("rcx") _, lateout("r11") _, options(nostack),
+        );
+    }
+    result
+}
+
+unsafe fn exit_child() -> ! {
+    // SAFETY: exit_group has no pointer operands and terminates this child.
+    unsafe {
+        syscall6(libc::SYS_exit_group as u64, [122, 0, 0, 0, 0, 0]);
+    }
+    // SAFETY: exit_group cannot return without a hostile external supervisor;
+    // retain a terminal trap instead of running any inherited Rust teardown.
+    unsafe {
+        core::arch::asm!("ud2", options(noreturn));
+    }
+}

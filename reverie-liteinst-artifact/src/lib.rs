@@ -712,8 +712,8 @@ fn content_manifest_relative(image_kind: FixedImageKind) -> &'static str {
 const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 21] = [
     (
         "Cargo.toml",
-        897,
-        "d3cbec1921c78c917234f677ea97798abd1772198ae55244dbd3ec4bc9a1e65c",
+        919,
+        "976d85288b5c0cc68599510d09e1055321f1068a25dfa131cd48e06fed11042d",
     ),
     (
         "reverie-liteinst-artifact/Cargo.toml",
@@ -722,8 +722,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 21] = [
     ),
     (
         "reverie-inguest/Cargo.toml",
-        4479,
-        "d3179a317a2adaf2096de400cb5591251bd7966e32f74ac8124684d1c6c9778d",
+        4546,
+        "1533c4fd2fbb9963307a3a11955e24e08273cb082049c5da006092a6423fceb8",
     ),
     (
         "reverie-inguest/src/lib.rs",

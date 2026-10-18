@@ -30,6 +30,7 @@ mod memory;
 #[cfg(feature = "notifier")]
 mod notifier;
 mod regs;
+mod syscall_info;
 mod waitid;
 
 use core::mem::MaybeUninit;
@@ -92,6 +93,9 @@ pub use crate::notifier::SupersededStopRefusal;
 #[cfg(feature = "notifier")]
 pub use crate::notifier::TerminalCleanup;
 pub use crate::regs::*;
+pub use crate::syscall_info::SyscallInfo;
+pub use crate::syscall_info::SyscallInfoError;
+pub use crate::syscall_info::SyscallInfoOp;
 use crate::waitid::IdType;
 use crate::waitid::wait_status;
 
@@ -3529,13 +3533,16 @@ mod test {
         Ok(())
     }
 
+    #[cfg(all(feature = "notifier", not(sanitized)))]
     static FIRST_SIGNAL_DELIVERIES: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
 
+    #[cfg(all(feature = "notifier", not(sanitized)))]
     extern "C" fn count_first_signal(_signal: libc::c_int) {
         FIRST_SIGNAL_DELIVERIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
+    #[cfg(all(feature = "notifier", not(sanitized)))]
     extern "C" fn ignore_target_signal(_signal: libc::c_int) {}
 
     /// `wait_for_signal` forwards a signal it passes over, named or realtime,
