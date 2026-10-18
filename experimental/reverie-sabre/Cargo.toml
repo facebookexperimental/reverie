@@ -41,3 +41,16 @@ tokio = { version = "1.52.4", features = ["net", "rt"] }
 # (shared_entry::dispatch_rewritten_syscall). Off by default: the plugin
 # links the shared runtime's RCB clock only from the SaBRe switch on.
 shared-entry = ["reverie-inguest/rcb-clock"]
+# SaBRe's plugin ABI for the shared in-guest runtime
+# (shared_runtime::shared_runtime_plugin!). Off by default: only a runtime
+# library that is loaded as the SaBRe plugin enables it.
+shared-runtime = ["shared-entry"]
+
+[[example]]
+name = "shared_runtime_plugin"
+crate-type = ["cdylib"]
+required-features = ["shared-runtime"]
+
+[[test]]
+name = "shared_runtime_plugin"
+required-features = ["shared-runtime"]

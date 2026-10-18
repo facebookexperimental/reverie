@@ -20,9 +20,11 @@
 //! continuation reports for the same site (`resume address - 2`), so the two
 //! entries agree.
 //!
-//! Nothing calls `dispatch_rewritten_syscall` (feature `shared-entry`) yet. The
-//! SaBRe switch (dev-hermit `ai_docs/2026-10-17-sabre-switch-design.md`, step
-//! 5c) makes the loader's router call it once the plugin is the shared runtime.
+//! `dispatch_rewritten_syscall` (feature `shared-entry`) is called by
+//! `shared_runtime`'s routed entry (feature `shared-runtime`), which the
+//! loader's router reaches once the plugin is the shared runtime; no Hermit
+//! launch loads that plugin until the SaBRe switch (dev-hermit
+//! `ai_docs/2026-10-17-sabre-switch-design.md`, step 5c, commit H1).
 
 use reverie_inguest::guest::context::RegisterContext;
 #[cfg(feature = "shared-entry")]
@@ -279,10 +281,35 @@ unsafe fn refuse(refusal: Refusal) -> ! {
             b"reverie-sabre: refused: a Tool changed the instruction pointer of a rewritten syscall, which SaBRe's trampoline cannot carry back to the guest\n"
         }
     };
-    // SAFETY: the runtime's trusted gate issues the write and the exit; the
-    // message is a static buffer.
+    // SAFETY: the message is a static buffer.
+    unsafe { refuse_with(message) }
+}
+
+/// Ends the guest with the refusal `message` (exit 122), written through the
+/// runtime's trusted syscall gate. Shared with `shared_runtime`.
+///
+/// # Safety
+///
+/// Always safe to call; unsafe because it issues raw syscalls.
+#[cfg(feature = "shared-entry")]
+pub(crate) unsafe fn refuse_with(message: &[u8]) -> ! {
+    // SAFETY: the runtime's trusted gate issues the write and the exit.
     unsafe {
-        let _ = reverie_inguest::trap::raw_syscall6(
+        write_stderr(message);
+        reverie_inguest::guest::support::exit_now(122)
+    }
+}
+
+/// Writes `message` to fd 2 through the runtime's trusted syscall gate.
+///
+/// # Safety
+///
+/// Always safe to call; unsafe because it issues a raw syscall.
+#[cfg(feature = "shared-entry")]
+pub(crate) unsafe fn write_stderr(message: &[u8]) {
+    // SAFETY: the buffer is valid for its length.
+    let _ = unsafe {
+        reverie_inguest::trap::raw_syscall6(
             libc::SYS_write,
             [
                 libc::STDERR_FILENO as u64,
@@ -292,9 +319,8 @@ unsafe fn refuse(refusal: Refusal) -> ! {
                 0,
                 0,
             ],
-        );
-        reverie_inguest::guest::support::exit_now(122)
-    }
+        )
+    };
 }
 
 #[cfg(test)]

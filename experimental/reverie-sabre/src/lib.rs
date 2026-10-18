@@ -20,6 +20,8 @@ mod protected_files;
 mod reverie_adapter;
 mod rpc;
 pub mod shared_entry;
+#[cfg(feature = "shared-runtime")]
+pub mod shared_runtime;
 mod signal;
 mod slot_map;
 pub mod stats;
@@ -63,11 +65,12 @@ pub fn bundled_sabre_source_dir() -> &'static std::path::Path {
 // Tracing programs that use jemalloc will hang if we allocate when jemalloc
 // calls readlinkat. Using a different allocator works around this problem.
 //
-// NOTE: Even though we set the global allocator here, anything that depends on
-// this library will use this global allocator. Thus, it will apply to all
-// tools/plugins automatically.
-#[global_allocator]
-static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+// Each plugin built with `#[sabre::tool]` selects this allocator in its own
+// crate (reverie-sabre-macros). The library no longer sets the global
+// allocator itself, so a shared in-guest runtime that is loaded as the SaBRe
+// plugin (`shared_runtime_plugin!`) keeps its own allocator.
+#[doc(hidden)]
+pub use mimalloc;
 
 #[cfg(test)]
 mod bundled_source_tests {
