@@ -1701,6 +1701,51 @@ impl Stopped {
         }
     }
 
+    /// Whether any queued signal matches `matches`, read like
+    /// `peeksiginfo_all` but 64 entries at a time with no more kept, and
+    /// stopping at the first match.
+    pub fn peeksiginfo_any<T, F>(&self, flags: T, mut matches: F) -> Result<bool, Error>
+    where
+        T: Into<Option<PeekSigInfoFlags>>,
+        F: FnMut(&libc::siginfo_t) -> bool,
+    {
+        const CHUNK: usize = 64;
+        let flags = flags.into().map_or(0, |x| x.bits());
+        let mut data = MaybeUninit::<[libc::siginfo_t; CHUNK]>::zeroed();
+        let mut off = 0u64;
+        loop {
+            let mut siginfo_args = ptrace_peeksiginfo_args {
+                off,
+                flags,
+                nr: CHUNK as u32,
+            };
+            let count = self
+                .1
+                .on_held_tid(|| {
+                    Errno::result(unsafe {
+                        libc::ptrace(
+                            libc::PTRACE_PEEKSIGINFO,
+                            self.0.as_raw(),
+                            &mut siginfo_args as *mut _,
+                            data.as_mut_ptr() as *const _ as *const libc::c_void,
+                        )
+                    })
+                })
+                .map_err(|err| self.map_err(err))? as usize;
+            if count == 0 {
+                return Ok(false);
+            }
+            // SAFETY: zero-initialized, and the kernel wrote the first `count`.
+            if unsafe { data.assume_init_ref() }[..count]
+                .iter()
+                .any(&mut matches)
+            {
+                return Ok(true);
+            }
+            off += count as u64;
+        }
+    }
+
     /// Retrieve a message about the ptrace event that just happened.
     ///
     /// It shouldn't be necessary to call this in most cases because `Event`
