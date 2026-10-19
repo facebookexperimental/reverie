@@ -6,7 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! The probe's only local-process unsafe boundary. Child setup uses raw
+//! The launcher's local-process unsafe boundary. Child setup uses raw
 //! syscalls after fork: no allocator, libc locks, destructors, or unwinding.
 
 use std::ffi::CString;
@@ -14,20 +14,21 @@ use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
-use std::os::fd::RawFd;
 
 use safeptrace::Pid;
-use serde_json::json;
 
-use super::CleanupReport;
+use super::CleanupConfirmation;
+use super::CleanupOwner;
+use super::CleanupReceipt;
+use super::CleanupWaitFailure;
 
 /// Atomic clone/pidfd ownership before safeptrace acquires its generation.
 /// Once transferred, only safeptrace may wait for this child.
-pub struct PendingChild {
+pub(super) struct PendingChild {
     pid: Pid,
     pidfd: OwnedFd,
     owned: bool,
-    evidence: CleanupReport,
+    evidence: CleanupReceipt,
     // Ptrace and child waiting stay on the OS thread that created the child.
     _local: core::marker::PhantomData<std::rc::Rc<()>>,
 }
@@ -38,13 +39,17 @@ impl PendingChild {
     }
 
     pub fn transfer_to_ptracer(&mut self) {
-        self.evidence.borrow_mut()["owner"] = json!("ptracer");
+        self.evidence.borrow_mut().owner = CleanupOwner::Ptracer;
         self.owned = false;
     }
 }
 
-impl Drop for PendingChild {
-    fn drop(&mut self) {
+impl PendingChild {
+    pub(super) fn is_owned(&self) -> bool {
+        self.owned
+    }
+
+    pub(super) fn retire(&mut self) {
         if !self.owned {
             return;
         }
@@ -65,18 +70,8 @@ impl Drop for PendingChild {
         };
         {
             let mut evidence = self.evidence.borrow_mut();
-            evidence["kill_requested"] = json!(true);
-            evidence["kill_errno"] = if result < 0 {
-                json!(-result)
-            } else {
-                json!(null)
-            };
-        }
-        if result < 0 && result != -i64::from(libc::ESRCH) {
-            eprintln!(
-                "loader pre-registration cleanup kill failed: errno {}",
-                -result
-            );
+            evidence.kill_requested = true;
+            evidence.kill_errno = (result < 0).then_some((-result) as i32);
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
@@ -90,16 +85,19 @@ impl Drop for PendingChild {
             ) {
                 Ok(WaitStatus::Exited(_, code)) => {
                     let mut evidence = self.evidence.borrow_mut();
-                    evidence["confirmed"] = json!(true);
-                    evidence["confirmation"] = json!("pidfd_waitid");
-                    evidence["terminal_status"] = json!({"kind":"exited", "code":code});
+                    self.owned = false;
+                    evidence.confirmed = true;
+                    evidence.confirmation = Some(CleanupConfirmation::PidfdWaitid);
+                    evidence.terminal_status = Some(safeptrace::ExitStatus::Exited(code));
                     break;
                 }
                 Ok(WaitStatus::Signaled(_, signal, core_dumped)) => {
                     let mut evidence = self.evidence.borrow_mut();
-                    evidence["confirmed"] = json!(true);
-                    evidence["confirmation"] = json!("pidfd_waitid");
-                    evidence["terminal_status"] = json!({"kind":"signaled", "signal":signal as i32, "core_dumped":core_dumped});
+                    self.owned = false;
+                    evidence.confirmed = true;
+                    evidence.confirmation = Some(CleanupConfirmation::PidfdWaitid);
+                    evidence.terminal_status =
+                        Some(safeptrace::ExitStatus::Signaled(signal, core_dumped));
                     break;
                 }
                 Err(nix::errno::Errno::EINTR) if std::time::Instant::now() < deadline => continue,
@@ -107,14 +105,22 @@ impl Drop for PendingChild {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
                 other => {
-                    self.evidence.borrow_mut()["wait_error"] = json!(format!("{other:?}"));
-                    eprintln!(
-                        "loader pre-registration cleanup did not confirm retirement: {other:?}"
-                    );
+                    self.evidence.borrow_mut().wait_error = Some(match other {
+                        Err(errno) => CleanupWaitFailure::Errno(errno as i32),
+                        Ok(WaitStatus::StillAlive) => CleanupWaitFailure::TimedOut,
+                        Ok(_) => CleanupWaitFailure::UnexpectedStatus,
+                    });
+
                     break;
                 }
             }
         }
+    }
+}
+
+impl Drop for PendingChild {
+    fn drop(&mut self) {
+        self.retire();
     }
 }
 
@@ -134,31 +140,76 @@ struct CloneArgs {
 }
 
 /// All pointer storage is made before fork and retained until exec or _exit.
-pub struct PreparedChild {
+pub struct PreparedExec<'fd> {
     program: CString,
     _arguments: Vec<CString>,
     arguments: Vec<*const libc::c_char>,
     _environment: Vec<CString>,
     environment: Vec<*const libc::c_char>,
-    inherited: Vec<RawFd>,
+    inherited: Vec<std::os::fd::BorrowedFd<'fd>>,
+    cwd: Option<std::fs::File>,
 }
 
-impl PreparedChild {
-    pub fn new(arguments: &[std::ffi::OsString], inherited: Vec<RawFd>) -> Result<Self, String> {
+impl<'fd> PreparedExec<'fd> {
+    /// Prepare a direct exec before clone. No PATH or shell fallback is used.
+    ///
+    /// `arguments` includes argv0, independently of `program`. Environment is
+    /// exact; stdio and other caller-owned process setup are inherited. The
+    /// optional cwd is opened now and entered by descriptor in the child.
+    /// Bootstrap descriptors remain borrowed until the physical child retires.
+    pub fn new(
+        program: &std::path::Path,
+        arguments: &[std::ffi::OsString],
+        environment: &[(std::ffi::OsString, std::ffi::OsString)],
+        cwd: Option<&std::path::Path>,
+        inherited: Vec<std::os::fd::BorrowedFd<'fd>>,
+    ) -> Result<Self, String> {
         use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        if !program.is_absolute() {
+            return Err("exec_stop_program_must_be_absolute".into());
+        }
+        if arguments.is_empty() {
+            return Err("exec_stop_missing_argv0".into());
+        }
+        if inherited.iter().any(|fd| fd.as_raw_fd() <= 2) {
+            return Err("exec_stop_bootstrap_fd_must_not_be_stdio".into());
+        }
+        let mut fd_numbers = std::collections::BTreeSet::new();
+        if inherited
+            .iter()
+            .any(|fd| !fd_numbers.insert(fd.as_raw_fd()))
+        {
+            return Err("exec_stop_duplicate_bootstrap_fd".into());
+        }
+        let program = CString::new(program.as_os_str().as_bytes())
+            .map_err(|_| "program contains NUL".to_owned())?;
         let arguments: Vec<CString> = arguments
             .iter()
             .map(|a| CString::new(a.as_bytes()).map_err(|_| "argument contains NUL".to_owned()))
             .collect::<Result<_, _>>()?;
-        let program = arguments.first().ok_or("missing guest program")?.clone();
-        let environment: Vec<CString> = std::env::vars_os()
+        let mut keys = std::collections::BTreeSet::new();
+        let environment: Vec<CString> = environment
+            .iter()
             .map(|(key, value)| {
+                if key.is_empty() || key.as_bytes().contains(&b'=') || !keys.insert(key.clone()) {
+                    return Err("invalid or duplicate environment key".to_owned());
+                }
                 let mut bytes = key.as_bytes().to_vec();
                 bytes.push(b'=');
                 bytes.extend_from_slice(value.as_bytes());
                 CString::new(bytes).map_err(|_| "environment contains NUL".to_owned())
             })
             .collect::<Result<_, _>>()?;
+        let cwd = cwd
+            .map(|path| {
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+                    .open(path)
+            })
+            .transpose()
+            .map_err(|error| format!("exec_stop_cwd: {error}"))?;
         let pointers = |strings: &[CString]| {
             strings
                 .iter()
@@ -173,10 +224,11 @@ impl PreparedChild {
             _arguments: arguments,
             _environment: environment,
             inherited,
+            cwd,
         })
     }
 
-    pub fn fork(&self, evidence: CleanupReport) -> Result<PendingChild, std::io::Error> {
+    pub(super) fn fork(&self, evidence: CleanupReceipt) -> Result<PendingChild, std::io::Error> {
         // SAFETY: the child uses only raw syscalls and immutable preallocated
         // storage, then execve or exit_group. It cannot unwind or run Drop.
         // Parent memory and all retained CString buffers remain live in both
@@ -225,8 +277,8 @@ impl PreparedChild {
         let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd) };
         {
             let mut record = evidence.borrow_mut();
-            record["child_created"] = json!(true);
-            record["owner"] = json!("pending_pidfd");
+            record.child_created = true;
+            record.owner = CleanupOwner::PendingPidfd;
         }
         Ok(PendingChild {
             pid: Pid::from_raw(child as i32),
@@ -261,7 +313,16 @@ impl PreparedChild {
             {
                 exit_child();
             }
-            for &fd in &self.inherited {
+            if let Some(cwd) = &self.cwd
+                && syscall6(
+                    libc::SYS_fchdir as u64,
+                    [cwd.as_raw_fd() as u64, 0, 0, 0, 0, 0],
+                ) < 0
+            {
+                exit_child();
+            }
+            for fd in &self.inherited {
+                let fd = fd.as_raw_fd();
                 if syscall6(
                     libc::SYS_fcntl as u64,
                     [fd as u64, libc::F_SETFD as u64, 0, 0, 0, 0],

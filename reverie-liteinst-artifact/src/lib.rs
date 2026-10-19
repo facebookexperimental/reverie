@@ -722,8 +722,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 22] = [
     ),
     (
         "reverie-inguest/Cargo.toml",
-        4546,
-        "1533c4fd2fbb9963307a3a11955e24e08273cb082049c5da006092a6423fceb8",
+        5379,
+        "4e1ecfebbe38a1b1b52577cc120738e54c483a4785054c18c2a9840e6357d288",
     ),
     (
         "reverie-inguest/src/lib.rs",

@@ -13,39 +13,39 @@
 #![deny(unsafe_code)]
 
 mod control;
-mod images;
-#[allow(unsafe_code)]
-mod platform;
 #[path = "../../../tests/fixtures/probe_protocol.rs"]
 mod protocol;
-mod trace;
-
-use std::cell::RefCell;
 use std::fs::File;
+use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::time::Duration;
 
 use images::Kind;
 use images::SealedImage;
 use protocol::*;
+use reverie_inguest::launcher::exec_stop::CleanupConfirmation;
+use reverie_inguest::launcher::exec_stop::CleanupOwner;
+use reverie_inguest::launcher::exec_stop::CleanupReceipt;
+use reverie_inguest::launcher::exec_stop::CleanupState;
+use reverie_inguest::launcher::exec_stop::ExecStop;
+use reverie_inguest::launcher::exec_stop::PreparedExec;
+use reverie_inguest::launcher::exec_stop::images;
+use reverie_inguest::launcher::exec_stop::inject as trace;
+use reverie_inguest::launcher::exec_stop::register_words;
 use reverie_loader::artifact;
 use safeptrace::Event;
 use safeptrace::ExitStatus;
-use safeptrace::Options;
 use safeptrace::Regs;
-use safeptrace::Running;
 use safeptrace::Signal;
 use safeptrace::Stopped;
 use safeptrace::SyscallInfoOp;
-use safeptrace::Wait;
 use serde_json::Value;
 use serde_json::json;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-type CleanupReport = Rc<RefCell<Value>>;
+type CleanupReport = CleanupReceipt;
 const REFUSAL_EXIT: i32 = 122;
 const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
 
@@ -58,38 +58,6 @@ enum Fault {
 struct ProbeControls<'a> {
     fault: Fault,
     pause_checkpoint: Option<&'a Path>,
-}
-
-struct ChildGuard {
-    cleanup: safeptrace::PtracerTerminalCleanup,
-    evidence: CleanupReport,
-    complete: bool,
-}
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        if !self.complete {
-            // Signal delivery, including ESRCH, is not terminal proof. Only
-            // this retained generation's actual terminal wait can confirm it.
-            let killed = self.cleanup.shared().request_sigkill();
-            {
-                let mut evidence = self.evidence.borrow_mut();
-                evidence["kill_requested"] = json!(true);
-                evidence["kill_errno"] = json!(killed.err().map(safeptrace::Errno::into_raw));
-            }
-            match self.cleanup.wait(Duration::from_secs(2)) {
-                Ok(true) => {
-                    let mut evidence = self.evidence.borrow_mut();
-                    evidence["confirmed"] = json!(true);
-                    evidence["confirmation"] = json!("safeptrace_terminal_wait");
-                }
-                result => {
-                    self.evidence.borrow_mut()["wait_error"] = json!(format!("{result:?}"));
-                    eprintln!("loader cleanup refused to confirm child retirement: {result:?}");
-                }
-            }
-        }
-    }
 }
 
 fn run(
@@ -108,72 +76,37 @@ fn run(
     let loader_image = loader.checked()?;
     let runtime_image = runtime.checked()?;
     let inherited = [loader.fd(), runtime.fd(), observations.as_raw_fd()];
-    let launch = platform::PreparedChild::new(arguments, inherited.to_vec())?;
-    let mut pending_child = launch
-        .fork(Rc::clone(&cleanup_evidence))
-        .map_err(|error| format!("loader_clone_pidfd_refused: {error}"))?;
-    let pid = pending_child.pid();
-    let running = Running::new_on_ptracer_thread(pid)?;
-    let mut guard = ChildGuard {
-        cleanup: running.terminal_cleanup_on_ptracer_thread(),
-        evidence: cleanup_evidence,
-        complete: false,
-    };
-    pending_child.transfer_to_ptracer();
-    let _ptracer_thread = running.generation().ptracer_thread_guard()?;
-    let (initial, event) = trace::stopped(running, "initial TRACEME stop")?;
-    if !matches!(event, Event::Signal(Signal::SIGSTOP)) {
-        return Err(format!("loader refused: wrong initial stop {event:?}").into());
-    }
-    initial.setoptions(
-        Options::PTRACE_O_EXITKILL | Options::PTRACE_O_TRACEEXEC | Options::PTRACE_O_TRACESYSGOOD,
+    let environment: Vec<_> = std::env::vars_os().collect();
+    let launch = PreparedExec::new(
+        Path::new(arguments.first().ok_or("missing guest program")?),
+        arguments,
+        &environment,
+        None,
+        vec![loader.as_fd(), runtime.as_fd(), observations.as_fd()],
     )?;
-    let (exec, event) = trace::stopped(initial.resume(None)?, "kernel exec event")?;
-    let at_event = exec.getregs()?;
-    let at_event_info = exec.getsyscallinfo()?;
+    let stopped = match ExecStop::spawn(launch, cleanup_evidence.clone()) {
+        Ok(stopped) => stopped,
+        Err(mut failure) => {
+            // A failed explicit cleanup keeps the original owner for retry.
+            // The outer physical runner must reject an unconfirmed receipt.
+            failure.retry_cleanup();
+            return Err(failure.to_string().into());
+        }
+    };
+    let (task, context, boundary, owner) = stopped.into_parts();
+    let pid = task.pid();
+    let entry = *context.regs();
+    let at_event = boundary.event_regs;
     report["exec_event"] = json!({
-        "event":if matches!(event, Event::Exec(_)) { "exec" } else { "unexpected" },
-        "pid":pid.as_raw(),
-        "former_tid":match &event { Event::Exec(former) => Some(former.as_raw()), _ => None },
-        "ip":at_event.rip, "sp":at_event.rsp,
-        "rax":at_event.rax, "orig_rax":at_event.orig_rax,
-        "syscall_info":syscall_info_json(&at_event_info),
+        "event":"exec", "pid":pid.as_raw(), "former_tid":boundary.former_tid.as_raw(),
+        "ip":at_event.rip, "sp":at_event.rsp, "rax":at_event.rax, "orig_rax":at_event.orig_rax,
+        "syscall_info":syscall_info_json(&boundary.event_info),
     });
-    if !matches!(event, Event::Exec(former) if former == pid) {
-        return Err(format!("loader refused: expected initial exec event, got {event:?}").into());
-    }
-    if at_event.orig_rax != libc::SYS_execve as u64 {
-        return Err("loader refused: exec event did not originate in the launcher's execve".into());
-    }
-    // Linux reports EVENT_EXEC inside execve, before its C return writes RAX.
-    // Drain only that kernel return. Unlike SINGLESTEP, this syscall-exit stop
-    // precedes every instruction of the new program and its interpreter.
-    let (task, event) = trace::stopped(exec.syscall(None)?, "exec syscall-exit drain")?;
-    let info = task.getsyscallinfo()?;
-    let entry = task.getregs()?;
     report["exec_exit"] = json!({
-        "event":if matches!(event, Event::Syscall) { "syscall" } else { "unexpected" },
-        "pid":pid.as_raw(), "ip":entry.rip, "sp":entry.rsp,
+        "event":"syscall", "pid":pid.as_raw(), "ip":entry.rip, "sp":entry.rsp,
         "rax":entry.rax, "orig_rax":entry.orig_rax,
-        "syscall_info":syscall_info_json(&info),
+        "syscall_info":syscall_info_json(&boundary.exit_info),
     });
-    if !matches!(event, Event::Syscall)
-        || info.architecture != AUDIT_ARCH_X86_64
-        || info.operation
-            != (SyscallInfoOp::Exit {
-                return_value: 0,
-                is_error: false,
-            })
-        || entry.rip != at_event.rip
-        || entry.rsp != at_event.rsp
-        || info.instruction_pointer != entry.rip
-        || info.stack_pointer != entry.rsp
-    {
-        return Err(format!(
-            "loader refused: exec return did not drain without entry progress: {info:?}"
-        )
-        .into());
-    }
     report["entry_ip"] = json!(entry.rip);
     report["entry_sp"] = json!(entry.rsp);
     report["entry_rax"] = json!(entry.rax);
@@ -181,13 +114,11 @@ fn run(
     if let Some(path) = pause_checkpoint {
         return pause_after_exec_drain(task, entry, path, report);
     }
-    let mask = task.getsigmask()?;
+    let mask = context.signal_mask();
     let reserved = (1_u64 << (libc::SIGSYS - 1)) | (1_u64 << (libc::SIGSEGV - 1));
     if mask & reserved != 0 {
         return Err("loader refused: first-image test domain has blocked SIGSYS or SIGSEGV".into());
     }
-    let xstate = task.getxstate()?;
-    let (stack_start, stack_bytes) = snapshot_stack(&task, entry.rsp)?;
     task.setsigmask(u64::MAX)?;
     let nonce = control::initialize(
         observations,
@@ -196,35 +127,35 @@ fn run(
         runtime_image.entry(),
         &inherited,
     )?;
-    let mut injector = trace::Injector::new(task, entry)?;
+    let mut injector = trace::Injector::new(task)?;
     let mapped = (|| -> Result<()> {
         injector.reserve()?;
-        injector.map_image(&loader_image, loader.fd())?;
-        injector.map_image(&runtime_image, runtime.fd())?;
+        injector.map_image(loader)?;
+        injector.map_image(runtime)?;
         let rw = libc::PROT_READ | libc::PROT_WRITE;
-        injector.map(
+        injector.map_storage(
             CONTROL_ADDRESS,
             CONTROL_BYTES as u64,
             rw,
             libc::MAP_SHARED,
-            observations.as_raw_fd(),
+            Some(observations.as_fd()),
             0,
         )?;
-        injector.map(
+        injector.map_storage(
             JOURNAL_ADDRESS,
             JOURNAL_BYTES,
             rw,
             libc::MAP_SHARED,
-            observations.as_raw_fd(),
+            Some(observations.as_fd()),
             CONTROL_BYTES as u64,
         )?;
         for (bottom, top) in [(STACK_BOTTOM, STACK_TOP), (ALTSTACK_BOTTOM, ALTSTACK_TOP)] {
-            injector.map(
+            injector.map_storage(
                 bottom,
                 top - bottom,
                 rw,
                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
+                None,
                 0,
             )?;
         }
@@ -278,51 +209,30 @@ fn run(
             }
         }
     }
-    if trace::read(&task, stack_start, stack_bytes.len())? != stack_bytes {
-        return Err("loader refused: bootstrap changed the kernel guest stack".into());
-    }
-    task.setxstate(&xstate)?;
-    task.setregs(&entry)?;
-    task.setsigmask(mask)?;
-    if register_words(&task.getregs()?) != register_words(&entry)
-        || task.getxstate()? != xstate
-        || task.getsigmask()? != mask
-    {
-        return Err("loader refused: original kernel entry context did not restore".into());
-    }
+    context.restore(&task)?;
     report["controls"] = json!(controls);
     report["ready_stop_ip"] = json!(ready_regs.rip);
     report["ready_nonce_matches"] = json!(true);
     report["stack_unchanged"] = json!(true);
-    report["stack_bytes"] = json!(stack_bytes.len());
+    report["stack_bytes"] = json!(context.stack_bytes().len());
     report["bootstrap_fds_closed"] = json!(true);
     report["pre_arm_guest_syscalls"] = json!(0);
     let running = task.detach(None)?;
     report["detached"] = json!(true);
     report["outcome"] = json!("handoff");
-    match trace::wait(running)? {
-        Wait::Exited(_, ExitStatus::Exited(code)) => report["guest_status"] = json!(code),
-        Wait::Exited(_, ExitStatus::Signaled(signal, _)) => {
-            report["guest_signal"] = json!(signal as i32)
+    let terminal = match owner.wait(running) {
+        Ok(status) => status,
+        Err(mut failure) => {
+            failure.retry_cleanup();
+            return Err(failure.to_string().into());
         }
-        Wait::Exited(_, ExitStatus::SignaledRaw(signal, _)) => {
-            report["guest_signal"] = json!(signal)
-        }
-        other => {
-            return Err(format!("loader refused: unexpected post-detach state {other:?}").into());
-        }
+    };
+    match terminal {
+        ExitStatus::Exited(code) => report["guest_status"] = json!(code),
+        ExitStatus::Signaled(signal, _) => report["guest_signal"] = json!(signal as i32),
+        ExitStatus::SignaledRaw(signal, _) => report["guest_signal"] = json!(signal),
     }
-    {
-        let mut evidence = guard.evidence.borrow_mut();
-        evidence["confirmed"] = json!(true);
-        evidence["confirmation"] = json!("normal_wait");
-        evidence["terminal_status"] = if let Some(code) = report["guest_status"].as_i64() {
-            json!({"kind":"exited", "code":code})
-        } else {
-            json!({"kind":"signaled", "signal":report["guest_signal"]})
-        };
-    }
-    guard.complete = true;
+
     Ok(())
 }
 
@@ -403,7 +313,7 @@ fn pause_after_exec_drain(
     let saved_mask = task.getsigmask()?;
     let saved_xstate = task.getxstate()?;
     task.setsigmask(u64::MAX)?;
-    let mut injector = trace::Injector::new(task, entry)?;
+    let mut injector = trace::Injector::new(task)?;
     let observed = (|| -> Result<Vec<u8>> {
         trace::write(injector.stopped_mut()?, slot, &[0xa5; 8])?;
         if injector.syscall(
@@ -709,33 +619,31 @@ fn bootstrap_until_ready(
     Err("loader refused: bootstrap stop bound exhausted".into())
 }
 
-fn snapshot_stack(task: &Stopped, rsp: u64) -> Result<(u64, Vec<u8>)> {
-    let maps = std::fs::read_to_string(format!("/proc/{}/maps", task.pid()))?;
-    let mut selected = None;
-    for line in maps.lines().filter(|line| line.ends_with("[stack]")) {
-        let span = line
-            .split_whitespace()
-            .next()
-            .ok_or("missing stack range")?;
-        let (lo, hi) = span.split_once('-').ok_or("invalid stack range")?;
-        let lo = u64::from_str_radix(lo, 16)?;
-        let hi = u64::from_str_radix(hi, 16)?;
-        if (lo..hi).contains(&rsp) {
-            if selected.is_some() || hi - lo > 16 * 1024 * 1024 {
-                return Err("loader refused: ambiguous or oversized initial stack".into());
+fn cleanup_json(state: &CleanupState) -> Value {
+    let status = state.terminal_status.map(|status| match status {
+        ExitStatus::Exited(code) => json!({"kind":"exited", "code":code}),
+        ExitStatus::Signaled(signal, core_dumped) => {
+            if state.confirmation == Some(CleanupConfirmation::PidfdWaitid) {
+                json!({"kind":"signaled", "signal":signal as i32, "core_dumped":core_dumped})
+            } else {
+                json!({"kind":"signaled", "signal":signal as i32})
             }
-            selected = Some((lo, trace::read(task, lo, (hi - lo) as usize)?));
         }
-    }
-    selected.ok_or_else(|| "loader refused: initial stack VMA not found".into())
-}
-
-fn register_words(r: &Regs) -> [u64; 27] {
-    [
-        r.r15, r.r14, r.r13, r.r12, r.rbp, r.rbx, r.r11, r.r10, r.r9, r.r8, r.rax, r.rcx, r.rdx,
-        r.rsi, r.rdi, r.orig_rax, r.rip, r.cs, r.eflags, r.rsp, r.ss, r.fs_base, r.gs_base, r.ds,
-        r.es, r.fs, r.gs,
-    ]
+        ExitStatus::SignaledRaw(signal, _) => json!({"kind":"signaled", "signal":signal}),
+    });
+    json!({
+        "child_created":state.child_created,
+        "owner":match state.owner { CleanupOwner::None=>"none", CleanupOwner::PendingPidfd=>"pending_pidfd", CleanupOwner::Ptracer=>"ptracer" },
+        "confirmed":state.confirmed,
+        "confirmation":state.confirmation.map(|value| match value {
+            CleanupConfirmation::PidfdWaitid=>"pidfd_waitid",
+            CleanupConfirmation::SafeptraceTerminalWait=>"safeptrace_terminal_wait",
+            CleanupConfirmation::NormalWait=>"normal_wait",
+        }),
+        "kill_requested":state.kill_requested, "kill_errno":state.kill_errno,
+        "wait_error":state.wait_error.map(|error| format!("{error:?}")),
+        "terminal_status":status,
+    })
 }
 
 fn main() {
@@ -770,11 +678,7 @@ fn main() {
     }
     let report_path = Path::new(&args[2]);
     let mut report = json!({"outcome":"refused", "guest_status":null, "guest_signal":null});
-    let cleanup_evidence = Rc::new(RefCell::new(json!({
-        "child_created":false, "owner":"none", "confirmed":false,
-        "confirmation":null, "kill_requested":false, "kill_errno":null,
-        "wait_error":null, "terminal_status":null,
-    })));
+    let cleanup_evidence = CleanupReceipt::default();
     report["fault_requested"] = json!(if fault == Fault::None {
         "none"
     } else {
@@ -784,7 +688,7 @@ fn main() {
     let result = (|| -> Result<()> {
         let loader = SealedImage::read(Path::new(&args[0]), Kind::Loader)?;
         let runtime = SealedImage::read(Path::new(&args[1]), Kind::Runtime)?;
-        let file = images::observation_file(CONTROL_BYTES as u64 + JOURNAL_BYTES)?;
+        let file = control::observation_file(CONTROL_BYTES as u64 + JOURNAL_BYTES)?;
         observation = Some(file);
         run(
             &loader,
@@ -795,13 +699,13 @@ fn main() {
                 fault,
                 pause_checkpoint: pause_checkpoint.as_deref(),
             },
-            Rc::clone(&cleanup_evidence),
+            cleanup_evidence.clone(),
             &mut report,
         )
     })();
     // All child guards have dropped before this snapshot, including errors
     // before safeptrace acquired the freshly created child generation.
-    report["cleanup"] = cleanup_evidence.borrow().clone();
+    report["cleanup"] = cleanup_json(&cleanup_evidence.snapshot());
     if let Err(error) = &result {
         report["refusal"] = json!(error.to_string());
         eprintln!("{error}");

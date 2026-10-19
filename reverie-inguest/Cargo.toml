@@ -33,6 +33,10 @@ preload-constructor = []
 # Host process launch/RPC lifetime owner. Guest bootstrap and typed statistics
 # remain usable without this feature; it never registers a constructor.
 launcher = ["coordinator-rpc", "dep:tempfile", "dep:tokio", "dep:tracing"]
+# First-image exec-stop mechanics; no runtime or backend activation.
+exec-stop = ["launcher", "dep:reverie-loader", "dep:safeptrace", "dep:reverie-memory", "dep:nix"]
+# Separate mechanics fixture executable and real-kernel integration tests.
+stage1a-probe = ["exec-stop", "dep:serde_json"]
 # Explicit FullTool-only fixed syscall/restorer ABI; off by default.
 fixed-syscall-gates = []
 # Private GNU loader InitialImage experiment; no successor exec admission.
@@ -54,6 +58,11 @@ coordinator-rpc = ["dep:serde", "dep:bincode", "dep:reverie", "dep:reverie-rpc-t
 rcb-clock = ["dep:reverie", "dep:reverie-ptrace"]
 
 [dependencies]
+reverie-loader = { version = "0.4.1", path = "../reverie-loader", optional = true }
+safeptrace = { version = "0.4.1", path = "../safeptrace", features = ["memory", "notifier"], optional = true }
+reverie-memory = { version = "0.4.1", path = "../reverie-memory", optional = true }
+nix = { version = "0.30.1", features = ["fs", "process", "signal"], optional = true }
+serde_json = { version = "1.0.149", optional = true }
 sha2 = { version = "0.10.9", optional = true }
 libc = "0.2.186"
 syscalls = "0.6.18"
@@ -110,3 +119,8 @@ path = "src/bin/pkey_buffers.rs"
 [[bin]]
 name = "reverie-inguest-native-syscall-result"
 path = "src/bin/native_syscall_result.rs"
+
+[[bin]]
+name = "reverie-loader-stage1a-probe"
+path = "src/bin/stage1a_probe/main.rs"
+required-features = ["stage1a-probe"]

@@ -13,7 +13,9 @@ use std::fs::File;
 use std::io::Read;
 use std::io::Seek;
 use std::io::Write;
+use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
+use std::os::fd::BorrowedFd;
 use std::os::fd::RawFd;
 use std::path::Path;
 
@@ -27,12 +29,16 @@ use reverie_loader::image::ValidatedImage;
 
 use super::Result;
 
+/// Fixed image contract; neither image may initialize TLS in this slice.
 #[derive(Clone, Copy, Debug)]
 pub enum Kind {
+    /// Fixed loader window and audited gate.
     Loader,
+    /// Fixed runtime window and audited gate, with TLS refused.
     Runtime,
 }
 
+/// Validated bytes and their immutable source descriptor, inseparable for mapping.
 pub struct SealedImage {
     file: File,
     bytes: Vec<u8>,
@@ -40,6 +46,7 @@ pub struct SealedImage {
 }
 
 impl SealedImage {
+    /// Read a bounded image once, seal its actual memfd, then validate those bytes.
     pub fn read(path: &Path, kind: Kind) -> Result<Self> {
         // The mechanics probe accepts bounded artifacts, not an unbounded
         // allocation controlled by an ELF header or a growing input file.
@@ -72,6 +79,7 @@ impl SealedImage {
         Ok(this)
     }
 
+    /// Validate the retained sealed bytes under this fixed image contract.
     pub fn checked(&self) -> Result<ValidatedImage<'_>> {
         match self.kind {
             Kind::Loader => artifact::check_loader(&self.bytes),
@@ -95,25 +103,14 @@ impl SealedImage {
         })
     }
 
+    /// Exact descriptor inherited by the child and used for image mapping.
     pub fn fd(&self) -> RawFd {
         self.file.as_raw_fd()
     }
 }
 
-/// Shared observations are writable, but cannot resize. They are not image
-/// authority and are never mapped executable. The child closes this FD before
-/// guest entry; the parent retains it to read the complete record after exit.
-pub fn observation_file(length: u64) -> Result<File> {
-    let file = File::from(memfd_create(
-        c"reverie-stage1a-observations",
-        MFdFlags::MFD_CLOEXEC | MFdFlags::MFD_ALLOW_SEALING,
-    )?);
-    file.set_len(length)?;
-    fcntl(
-        &file,
-        FcntlArg::F_ADD_SEALS(
-            SealFlag::F_SEAL_GROW | SealFlag::F_SEAL_SHRINK | SealFlag::F_SEAL_SEAL,
-        ),
-    )?;
-    Ok(file)
+impl AsFd for SealedImage {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.file.as_fd()
+    }
 }

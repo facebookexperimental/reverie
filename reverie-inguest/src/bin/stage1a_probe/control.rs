@@ -214,3 +214,23 @@ pub fn events(file: &File) -> Result<(Vec<Value>, Value)> {
         }),
     ))
 }
+
+/// Shared observations are writable, but cannot resize. They are not image
+/// authority and are never mapped executable. The child closes this FD before
+/// guest entry; the parent retains it to read the complete record after exit.
+pub fn observation_file(length: u64) -> Result<File> {
+    let file = File::from(nix::sys::memfd::memfd_create(
+        c"reverie-stage1a-observations",
+        nix::sys::memfd::MFdFlags::MFD_CLOEXEC | nix::sys::memfd::MFdFlags::MFD_ALLOW_SEALING,
+    )?);
+    file.set_len(length)?;
+    nix::fcntl::fcntl(
+        &file,
+        nix::fcntl::FcntlArg::F_ADD_SEALS(
+            nix::fcntl::SealFlag::F_SEAL_GROW
+                | nix::fcntl::SealFlag::F_SEAL_SHRINK
+                | nix::fcntl::SealFlag::F_SEAL_SEAL,
+        ),
+    )?;
+    Ok(file)
+}

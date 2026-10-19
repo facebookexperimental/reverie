@@ -147,9 +147,14 @@ fn retained_command(command: &mut Command, dir: &Path, name: &str, wall: Duratio
 }
 
 fn fixture_source(dir: &Path, name: &str) -> PathBuf {
-    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
-        .join(name);
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    // Shared with Hermit's CLI sentinel: keep one canonical guest source.
+    let fixtures = if matches!(name, "guest_cpuid.rs" | "guest_static.ld") {
+        root.join("../reverie-loader/tests/fixtures")
+    } else {
+        root.join("tests/fixtures")
+    };
+    let source = fixtures.join(name);
     let target = dir.join(name);
     fs::copy(source, &target).unwrap();
     target
@@ -1532,4 +1537,191 @@ fn exitkill_kills_and_reaps_the_stopped_child_when_only_the_probe_dies() {
     assert_eq!(evidence["post_reap_errno"], libc::ECHILD);
     assert_eq!(evidence["detached"], false);
     assert_eq!(evidence["guest_stdout_bytes"], 0);
+}
+
+#[test]
+fn explicit_request_preserves_argv0_environment_pinned_cwd_and_inherited_stdio() {
+    use std::os::unix::fs::MetadataExt;
+
+    use reverie_inguest::launcher::exec_stop::CleanupReceipt;
+    use reverie_inguest::launcher::exec_stop::ExecStop;
+    use reverie_inguest::launcher::exec_stop::PreparedExec;
+
+    let scratch = Scratch::new("explicit-command");
+    let cwd = scratch.0.join("cwd");
+    let pinned = scratch.0.join("pinned-cwd");
+    fs::create_dir(&cwd).unwrap();
+    let argv = [std::ffi::OsString::from("explicit-argv0")];
+    let environment = [("EXEC_STOP_EXPLICIT".into(), "exact-value".into())];
+    let request = PreparedExec::new(
+        Path::new("/bin/sh"),
+        &argv,
+        &environment,
+        Some(&cwd),
+        vec![],
+    )
+    .unwrap();
+    // The request pins the directory object, not a pathname reopened by child.
+    fs::rename(&cwd, &pinned).unwrap();
+    fs::create_dir(&cwd).unwrap();
+    let receipt = CleanupReceipt::default();
+    let stopped = ExecStop::spawn(request, receipt.clone()).unwrap();
+    let pid = stopped.stopped().pid();
+    assert_eq!(fs::read_link(format!("/proc/{pid}/cwd")).unwrap(), pinned);
+    for fd in 0..=2 {
+        let parent = fs::metadata(format!("/proc/self/fd/{fd}")).unwrap();
+        let child = fs::metadata(format!("/proc/{pid}/fd/{fd}")).unwrap();
+        assert_eq!(
+            (child.dev(), child.ino(), child.rdev()),
+            (parent.dev(), parent.ino(), parent.rdev())
+        );
+    }
+    let entry = stopped.entry();
+    let bytes = entry.stack_bytes();
+    let offset = usize::try_from(entry.regs().rsp - entry.stack_start()).unwrap();
+    let word = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+    let string = |address: u64| {
+        let at = usize::try_from(address - entry.stack_start()).unwrap();
+        let tail = &bytes[at..];
+        &tail[..tail.iter().position(|byte| *byte == 0).unwrap()]
+    };
+    assert_eq!(word(offset), 1);
+    assert_eq!(string(word(offset + 8)), b"explicit-argv0");
+    assert_eq!(word(offset + 16), 0);
+    assert_eq!(string(word(offset + 24)), b"EXEC_STOP_EXPLICIT=exact-value");
+    assert_eq!(word(offset + 32), 0);
+    let cleanup = stopped.cancel().unwrap();
+    assert!(cleanup.confirmed, "{cleanup:?}");
+    assert!(cleanup.kill_requested);
+    assert!(receipt.snapshot().confirmed);
+}
+
+#[test]
+fn rejected_storage_poisons_the_transaction_without_guest_release() {
+    use reverie_inguest::launcher::exec_stop::CleanupReceipt;
+    use reverie_inguest::launcher::exec_stop::ExecStop;
+    use reverie_inguest::launcher::exec_stop::PreparedExec;
+    use reverie_inguest::launcher::exec_stop::inject::Injector;
+
+    let request = PreparedExec::new(
+        Path::new("/bin/true"),
+        &["poisoned-mapping".into()],
+        &[],
+        None,
+        vec![],
+    )
+    .unwrap();
+    let receipt = CleanupReceipt::default();
+    let stopped = ExecStop::spawn(request, receipt.clone()).unwrap();
+    let (task, _context, _boundary, owner) = stopped.into_parts();
+    let mut injector = Injector::new(task).unwrap();
+    injector.reserve().unwrap();
+    assert!(
+        injector
+            .map_storage(
+                artifact::TOOL_REGION.start,
+                4096,
+                libc::PROT_EXEC,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                None,
+                0,
+            )
+            .is_err()
+    );
+    assert!(
+        injector.finish().is_err(),
+        "a rejected map must never permit a successful transaction finish"
+    );
+    let cleanup = owner.cancel().unwrap();
+    assert!(cleanup.confirmed, "{cleanup:?}");
+    assert!(cleanup.kill_requested);
+    assert!(receipt.snapshot().confirmed);
+}
+
+#[test]
+fn arbitrary_injection_cannot_share_mapping_authority() {
+    use reverie_inguest::launcher::exec_stop::CleanupReceipt;
+    use reverie_inguest::launcher::exec_stop::ExecStop;
+    use reverie_inguest::launcher::exec_stop::PreparedExec;
+    use reverie_inguest::launcher::exec_stop::inject::Injector;
+
+    for reserve_first in [false, true] {
+        let request = PreparedExec::new(
+            Path::new("/bin/true"),
+            &["disjoint-injection".into()],
+            &[],
+            None,
+            vec![],
+        )
+        .unwrap();
+        let receipt = CleanupReceipt::default();
+        let stopped = ExecStop::spawn(request, receipt.clone()).unwrap();
+        let (task, _context, _boundary, owner) = stopped.into_parts();
+        let mut injector = Injector::new(task).unwrap();
+        if reserve_first {
+            injector.reserve().unwrap();
+            let before = injector.calls.len();
+            assert!(
+                injector
+                    .syscall(
+                        libc::SYS_munmap as u64,
+                        [artifact::TOOL_REGION.start, 4096, 0, 0, 0, 0]
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                injector.calls.len(),
+                before,
+                "forbidden call was not issued"
+            );
+        } else {
+            injector.syscall(libc::SYS_getpid as u64, [0; 6]).unwrap();
+            let before = injector.calls.len();
+            assert!(injector.reserve().is_err());
+            assert_eq!(
+                injector.calls.len(),
+                before,
+                "no reservation after arbitrary call"
+            );
+        }
+        assert!(injector.finish().is_err());
+        assert!(owner.cancel().unwrap().confirmed);
+        assert!(receipt.snapshot().confirmed);
+    }
+}
+
+#[test]
+fn foreign_terminal_wait_cannot_be_reported_as_owned_retirement() {
+    use nix::sys::wait::WaitStatus;
+    use nix::sys::wait::waitpid;
+    use reverie_inguest::launcher::exec_stop::CleanupReceipt;
+    use reverie_inguest::launcher::exec_stop::ExecStop;
+    use reverie_inguest::launcher::exec_stop::PreparedExec;
+
+    let request = PreparedExec::new(
+        Path::new("/bin/true"),
+        &["foreign-wait".into()],
+        &[],
+        None,
+        vec![],
+    )
+    .unwrap();
+    let receipt = CleanupReceipt::default();
+    let stopped = ExecStop::spawn(request, receipt.clone()).unwrap();
+    let (task, _context, _boundary, owner) = stopped.into_parts();
+    let pid = task.pid();
+    owner.cancellation_handle().request_sigkill().unwrap();
+    // Deliberate fault: consume the real terminal status outside the registered
+    // generation. Retirement acknowledgment must not invent that lost proof.
+    assert!(matches!(
+        waitpid(nix::unistd::Pid::from_raw(pid.as_raw()), None).unwrap(),
+        WaitStatus::Signaled(_, nix::sys::signal::Signal::SIGKILL, _)
+    ));
+    let unresolved = owner
+        .cancel()
+        .expect_err("foreign wait is not owned terminal evidence");
+    assert!(!receipt.snapshot().confirmed);
+    assert!(receipt.snapshot().terminal_status.is_none());
+    assert!(receipt.snapshot().wait_error.is_some());
+    drop(unresolved);
 }

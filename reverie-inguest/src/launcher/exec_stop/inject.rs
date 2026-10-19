@@ -10,77 +10,44 @@
 //! authorizes replacing PROT_NONE pages. Every failure keeps the task owned by
 //! the outer cancellation guard; it never detaches a partially armed guest.
 
+use std::os::fd::AsRawFd;
+use std::os::fd::BorrowedFd;
+
 use reverie_loader::artifact::TOOL_REGION;
 use reverie_loader::image::PAGE_SIZE;
 use reverie_loader::image::ValidatedImage;
-use reverie_memory::Addr;
-use reverie_memory::AddrMut;
-use reverie_memory::MemoryAccess;
 use safeptrace::Event;
 use safeptrace::Regs;
-use safeptrace::Running;
 use safeptrace::Signal;
 use safeptrace::Stopped;
-use safeptrace::Wait;
 
 use super::Result;
-
-pub fn wait(running: Running) -> Result<Wait> {
-    Ok(running.wait_sync_on_ptracer_thread().wait()?)
-}
-
-pub fn stopped(running: Running, expected: &str) -> Result<(Stopped, Event)> {
-    match wait(running)? {
-        Wait::Stopped(task, event) => Ok((task, event)),
-        other => Err(format!("loader refused: expected {expected}, got {other:?}").into()),
-    }
-}
-
-pub fn read(task: &Stopped, address: u64, length: usize) -> Result<Vec<u8>> {
-    let mut bytes = vec![0; length];
-    task.read_exact(
-        Addr::from_raw(address as usize).ok_or("null remote address")?,
-        &mut bytes,
-    )?;
-    Ok(bytes)
-}
-
-pub fn write(task: &mut Stopped, address: u64, bytes: &[u8]) -> Result<()> {
-    let mut offset = 0;
-    while offset < bytes.len() {
-        let cursor = address
-            .checked_add(offset as u64)
-            .ok_or("remote write overflow")?;
-        let aligned = cursor & !7;
-        let first = (cursor - aligned) as usize;
-        let count = (8 - first).min(bytes.len() - offset);
-        let mut word = read(task, aligned, 8)?;
-        word[first..first + count].copy_from_slice(&bytes[offset..offset + count]);
-        // An exact eight-byte safeptrace write uses POKEDATA. Larger writes
-        // use process_vm_writev, which correctly refuses an RX page. The
-        // stopped mapping transaction needs private-page writes, not W+X.
-        task.write_exact(
-            AddrMut::from_raw(aligned as usize).ok_or("null remote address")?,
-            &word,
-        )?;
-        offset += count;
-    }
-    Ok(())
-}
+use super::images::SealedImage;
+pub use super::trace::read;
+pub use super::trace::stopped;
+pub use super::trace::wait;
+pub use super::trace::write;
 
 /// Injected syscall number, six arguments, and the observed return value.
 pub type InjectedCall = (u64, [u64; 6], u64);
 
+/// An owned stopped-task injection transaction; errors prohibit successful finish.
 pub struct Injector {
     task: Option<Stopped>,
     entry: Regs,
     original: Vec<u8>,
     reservation: bool,
+    arbitrary_syscall_used: bool,
+    poisoned: bool,
+    mapped: Vec<std::ops::Range<u64>>,
+    /// Actual completed injected calls, retained even on a later refusal.
     pub calls: Vec<InjectedCall>,
 }
 
 impl Injector {
-    pub fn new(mut task: Stopped, entry: Regs) -> Result<Self> {
+    /// Save and temporarily patch this actual stop's entry for syscall injection.
+    pub fn new(mut task: Stopped) -> Result<Self> {
+        let entry = task.getregs()?;
         let original = read(&task, entry.rip, 8)?;
         let mut injected = original.clone();
         injected[..3].copy_from_slice(&[0x0f, 0x05, 0xcc]);
@@ -90,6 +57,9 @@ impl Injector {
             entry,
             original,
             reservation: false,
+            arbitrary_syscall_used: false,
+            poisoned: false,
+            mapped: Vec::new(),
             calls: Vec::new(),
         })
     }
@@ -108,7 +78,33 @@ impl Injector {
             .ok_or_else(|| "lost stopped injection owner".into())
     }
 
+    /// Execute one tool syscall in a transaction that cannot own mappings.
+    ///
+    /// An arbitrary call could replace a reservation or a validated image fd.
+    /// Keep this diagnostic transaction disjoint from mapping authority.
     pub fn syscall(&mut self, number: u64, args: [u64; 6]) -> Result<u64> {
+        if self.reservation {
+            self.poisoned = true;
+            return Err(
+                "loader refused: arbitrary syscall during owned mapping transaction".into(),
+            );
+        }
+        self.arbitrary_syscall_used = true;
+        self.checked_syscall(number, args)
+    }
+
+    fn checked_syscall(&mut self, number: u64, args: [u64; 6]) -> Result<u64> {
+        if self.poisoned {
+            return Err("loader refused: poisoned injection transaction".into());
+        }
+        let result = self.syscall_inner(number, args);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn syscall_inner(&mut self, number: u64, args: [u64; 6]) -> Result<u64> {
         let task = self.task.take().ok_or("lost stopped injection owner")?;
         let mut regs = self.entry;
         regs.rax = number;
@@ -141,9 +137,14 @@ impl Injector {
         Ok(completed.rax)
     }
 
+    /// Acquire the complete fixed tool reservation without replacing guest pages.
     pub fn reserve(&mut self) -> Result<()> {
+        if self.reservation || self.poisoned || self.arbitrary_syscall_used {
+            self.poisoned = true;
+            return Err("loader refused: reservation transaction already used".into());
+        }
         let actual = self
-            .syscall(
+            .checked_syscall(
                 libc::SYS_mmap as u64,
                 [
                     TOOL_REGION.start,
@@ -167,6 +168,7 @@ impl Injector {
                 }
             })?;
         if actual != TOOL_REGION.start {
+            self.poisoned = true;
             return Err(
                 "loader refused: kernel did not honor the fixed no-replace reservation".into(),
             );
@@ -190,7 +192,7 @@ impl Injector {
         Ok(())
     }
 
-    pub fn map(
+    fn map_pages(
         &mut self,
         start: u64,
         length: u64,
@@ -199,11 +201,34 @@ impl Injector {
         fd: i32,
         offset: u64,
     ) -> Result<()> {
-        self.owned(start, length)?;
-        if protection & libc::PROT_WRITE != 0 && protection & libc::PROT_EXEC != 0 {
-            return Err("loader refused: writable executable mapping".into());
+        if self.poisoned {
+            return Err("loader refused: poisoned injection transaction".into());
         }
-        let actual = self.syscall(
+        let validation = (|| -> Result<()> {
+            self.owned(start, length)?;
+            let end = start.checked_add(length).ok_or("mapping overflow")?;
+            if self
+                .mapped
+                .iter()
+                .any(|range| start < range.end && range.start < end)
+            {
+                return Err("loader refused: mapping overlaps a live bootstrap mapping".into());
+            }
+            if protection & libc::PROT_WRITE != 0 && protection & libc::PROT_EXEC != 0 {
+                return Err("loader refused: writable executable mapping".into());
+            }
+            if flags & !(libc::MAP_PRIVATE | libc::MAP_SHARED | libc::MAP_ANONYMOUS) != 0
+                || (flags & (libc::MAP_PRIVATE | libc::MAP_SHARED)).count_ones() != 1
+            {
+                return Err("loader refused: unsupported bootstrap mapping flags".into());
+            }
+            Ok(())
+        })();
+        if let Err(error) = validation {
+            self.poisoned = true;
+            return Err(error);
+        }
+        let actual = self.checked_syscall(
             libc::SYS_mmap as u64,
             [
                 start,
@@ -215,12 +240,29 @@ impl Injector {
             ],
         )?;
         if actual != start {
+            self.poisoned = true;
             return Err("loader refused: mapping returned the wrong address".into());
         }
+        self.mapped.push(start..start + length);
         Ok(())
     }
 
-    pub fn map_image(&mut self, image: &ValidatedImage<'_>, fd: i32) -> Result<()> {
+    /// Map exactly the immutable descriptor whose sealed bytes were validated.
+    pub fn map_image(&mut self, image: &SealedImage) -> Result<()> {
+        if self.poisoned {
+            return Err("loader refused: poisoned injection transaction".into());
+        }
+        let result = (|| {
+            let checked = image.checked()?;
+            self.map_checked_image(&checked, image.fd())
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn map_checked_image(&mut self, image: &ValidatedImage<'_>, fd: i32) -> Result<()> {
         for segment in image.segments() {
             let pages = segment.pages().map_err(|e| format!("segment: {e:?}"))?;
             let permissions = segment.permissions;
@@ -238,7 +280,7 @@ impl Injector {
             let file_bytes = segment.file.end - segment.file.start;
             let file_pages = file_bytes.div_ceil(PAGE_SIZE) * PAGE_SIZE;
             if file_pages != 0 {
-                self.map(
+                self.map_pages(
                     pages.start,
                     file_pages,
                     protection,
@@ -249,7 +291,7 @@ impl Injector {
             }
             let memory_pages = pages.end - pages.start;
             if memory_pages > file_pages {
-                self.map(
+                self.map_pages(
                     pages.start + file_pages,
                     memory_pages - file_pages,
                     protection,
@@ -273,7 +315,58 @@ impl Injector {
         Ok(())
     }
 
+    /// Map non-executable bootstrap data/stack storage in the owned reservation.
+    /// A file-backed mapping borrows its exact descriptor for this operation;
+    /// the caller retains its launch lease through physical child retirement.
+    pub fn map_storage(
+        &mut self,
+        start: u64,
+        length: u64,
+        protection: i32,
+        flags: i32,
+        fd: Option<BorrowedFd<'_>>,
+        offset: u64,
+    ) -> Result<()> {
+        let validation = (|| -> Result<()> {
+            if protection & !(libc::PROT_READ | libc::PROT_WRITE) != 0 {
+                return Err("loader refused: bootstrap storage must not be executable".into());
+            }
+            if (flags & libc::MAP_ANONYMOUS != 0) != fd.is_none() {
+                return Err("loader refused: bootstrap storage backing mismatch".into());
+            }
+            if let Some(fd) = fd {
+                let stat = nix::sys::stat::fstat(fd)?;
+                if stat.st_size < 0
+                    || offset
+                        .checked_add(length)
+                        .is_none_or(|end| end > stat.st_size as u64)
+                {
+                    return Err("loader refused: bootstrap storage exceeds file backing".into());
+                }
+            } else if offset != 0 {
+                return Err("loader refused: anonymous bootstrap storage offset".into());
+            }
+            Ok(())
+        })();
+        if let Err(error) = validation {
+            self.poisoned = true;
+            return Err(error);
+        }
+        self.map_pages(
+            start,
+            length,
+            protection,
+            flags,
+            fd.map_or(-1, |fd| fd.as_raw_fd()),
+            offset,
+        )
+    }
+
+    /// Restore entry bytes/registers; a poisoned transaction cannot finish.
     pub fn finish(mut self) -> Result<(Stopped, Vec<InjectedCall>)> {
+        if self.poisoned {
+            return Err("loader refused: poisoned injection transaction".into());
+        }
         let mut task = self.task.take().ok_or("lost stopped owner")?;
         write(&mut task, self.entry.rip, &self.original)?;
         if read(&task, self.entry.rip, self.original.len())? != self.original {

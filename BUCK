@@ -283,11 +283,45 @@ rust_library(
 )
 
 rust_library(
+    name = "reverie-loader",
+    srcs = glob(["reverie-loader/src/**/*.rs"]),
+    autocargo = {
+        "cargo_toml_config": {
+            "package": {
+                "version": "0.4.1",
+                "description": "Hermit's in-guest loader: validation of the fixed-address loader and runtime images, and the loader's initialization stages.",
+                "publish": False,
+            },
+        },
+        "cargo_toml_dir": "reverie-loader",
+    },
+    deps = [],
+)
+
+rust_library(
     name = "reverie-inguest",
-    srcs = glob(["reverie-inguest/src/**/*.rs"]),
+    srcs = glob(
+        ["reverie-inguest/src/**/*.rs"],
+        exclude = ["reverie-inguest/src/bin/**"],
+    ),
     autocargo = {
         "cargo_toml_config": {
             "package": dict(_PUBLIC_CRATE_METADATA, documentation = "https://docs.rs/reverie-inguest"),
+            "dependencies_override": {
+                "dependencies": {
+                    "nix": {"optional": True, "features": ["fs", "process", "signal"]},
+                    "reverie-loader": {"optional": True},
+                    "reverie-memory": {"optional": True},
+                    "safeptrace": {"optional": True, "features": ["memory", "notifier"]},
+                    "tempfile": {"optional": True},
+                    "tokio": {"optional": True, "features": ["macros", "net", "rt", "time"]},
+                    "tracing": {"optional": True},
+                },
+                "dev-dependencies": {
+                    "iced-x86": {"default-features": False, "features": ["std", "decoder"]},
+                    "tokio": {"features": ["test-util"]},
+                },
+            },
             "features": {
                 "coordinator-rpc": [
                     "serde",
@@ -296,6 +330,8 @@ rust_library(
                     "reverie-rpc-transport",
                 ],
                 "default": ["preload-constructor"],
+                "exec-stop": ["launcher", "dep:reverie-loader", "dep:safeptrace", "dep:reverie-memory", "dep:nix"],
+                "launcher": ["coordinator-rpc", "dep:tempfile", "dep:tokio", "dep:tracing"],
                 "preload-constructor": [],
                 "rcb-clock": [
                     "reverie",
@@ -307,15 +343,31 @@ rust_library(
     },
     features = [
         "coordinator-rpc",
+        "exec-stop",
+        "launcher",
         "rcb-clock",
+    ],
+    test_deps = [
+        "fbsource//third-party/rust:iced-x86",
+        "fbsource//third-party/rust:tokio",
+        "fbsource//third-party/rust:tracing-subscriber",
     ],
     deps = [
         "fbsource//third-party/rust:bincode",
         "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:nix",
         "fbsource//third-party/rust:serde",
+        "fbsource//third-party/rust:syscalls",
+        "fbsource//third-party/rust:tempfile",
+        "fbsource//third-party/rust:tokio",
+        "fbsource//third-party/rust:tracing",
         ":reverie",
+        ":reverie-loader",
+        ":reverie-memory",
         ":reverie-ptrace",
         ":reverie-rpc-transport",
+        ":reverie-syscalls",
+        ":safeptrace",
     ],
 )
 

@@ -4,6 +4,10 @@
 //! capability report. Engine-specific frontend selection is separate from
 //! extracting this shared launch mechanism.
 
+/// Owned initial-image stop observations and cancellation; no production release.
+#[cfg(feature = "exec-stop")]
+pub mod exec_stop;
+
 #[cfg(feature = "exec-native-injection")]
 pub mod native;
 #[cfg(feature = "exec-native-injection")]
