@@ -4024,6 +4024,351 @@ async fn an_injected_handler_install_while_blocked_is_shielded() {
     assert_eq!(made, 0, "unstepped injections");
 }
 
+/// Runs `mode` with injections and with tail injections, with sigreturns
+/// reported, which the SIGSEGV keep needs (`GlobalState::keeps_segv_state`).
+async fn run_segv_configurations(mode: &str) -> Vec<GuestRun> {
+    let mut runs = Vec::new();
+    for tail in [false, true] {
+        let run = run_guest_options(
+            mode,
+            GuestOptions {
+                tail,
+                sigreturns: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!("regression fixture run {mode} tail={tail} failed: {error}")
+        });
+        assert_eq!(run.status, ExitStatus::Exited(0), "{}", run.report);
+        assert!(run.report.ends_with("done\n"), "{}", run.report);
+        runs.push(run);
+    }
+    runs
+}
+
+/// The SIGSEGV state lines (` sigsegv=`) of a report.
+fn segv_lines(report: &str) -> Vec<String> {
+    report
+        .lines()
+        .filter(|line| line.contains(" sigsegv="))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The SIGSEGV state lines of `mode` run natively, untraced, where neither
+/// rdtsc nor cpuid faults.
+fn native_segv_lines(mode: &str) -> Vec<String> {
+    let report = tempfile_path(&format!("plain-guest-native-{mode}"));
+    let status = std::process::Command::new(regression_guest())
+        .arg(mode)
+        .arg(&report)
+        .status()
+        .expect("run the regression fixture natively");
+    assert!(status.success(), "native {mode}: {status}");
+    let text = std::fs::read_to_string(&report).expect("read the native report");
+    assert!(text.ends_with("done\n"), "{text}");
+    segv_lines(&text)
+}
+
+/// Asserts that every traced run of `mode` reads SIGSEGV's state exactly as
+/// `expected`, and so does a native run, which shows that `expected` is
+/// Linux's own answer.
+async fn assert_segv_lines(mode: &str, expected: &[String]) -> Vec<GuestRun> {
+    assert_eq!(native_segv_lines(mode), expected, "native {mode}");
+    let runs = run_segv_configurations(mode).await;
+    for run in &runs {
+        assert_eq!(segv_lines(&run.report), expected, "{}", run.report);
+    }
+    runs
+}
+
+/// The lines `segv_states` gives where SIGSEGV's state is kept, as natively.
+fn kept_segv_states() -> Vec<String> {
+    let mut expected = Vec::new();
+    for (state, action, blocked) in [
+        ("ign", "ign", 0),
+        ("ign-blocked", "ign", 1),
+        ("handler", "segv_handler", 0),
+        ("handler-blocked", "segv_handler", 1),
+        ("dfl", "dfl", 0),
+        ("dfl-blocked", "dfl", 1),
+    ] {
+        for place in ["rdtsc", "cpuid"] {
+            expected.push(format!(
+                "{state} {place} sigsegv={action} flags=0x10000000 usr2-in-mask=1 \
+                 blocked={blocked}"
+            ));
+        }
+        expected.push(format!(
+            "{state} in-handler sigsegv={action} flags=0x10000000 usr2-in-mask=1 blocked=1"
+        ));
+        expected.push(format!(
+            "{state} after-handler sigsegv={action} flags=0x10000000 usr2-in-mask=1 \
+             blocked={blocked}"
+        ));
+    }
+    expected
+}
+
+/// A guest's SIGSEGV state survives Reverie's rdtsc and cpuid traps, as it
+/// does natively, where neither instruction faults
+/// (<https://github.com/rrnewton/hermit/issues/4485>). Linux reports each
+/// trap with `force_sig`, which resets a blocked or ignored SIGSEGV to
+/// `SIG_DFL` and unblocks it. Six states go through a trapped rdtsc, a
+/// trapped cpuid (where the CPU can fault it), a trapped rdtsc that is the
+/// first instruction of a SIGUSR1 handler whose `sa_mask` blocks SIGSEGV (the
+/// bit comes from the delivery, read through the handler's action at the
+/// trap), and a trapped rdtsc after that handler's `rt_sigreturn`, with no
+/// syscall between (the bit comes from the frame); the guest reads back the
+/// handler, the flags, `sa_mask` and the mask bit. Before this, every ignored
+/// or blocked row read `sigsegv=dfl ... blocked=0`
+/// (`without_its_preconditions_a_trapped_rdtsc_resets_sigsegv`).
+#[tokio::test(flavor = "current_thread")]
+async fn sigsegv_state_survives_rdtsc_and_cpuid_traps() {
+    let before = crate::task::SEGV_REPAIRS_FOR_TEST.with(|count| count.get());
+    let queries = crate::task::SEGV_TRAP_QUERIES_FOR_TEST.with(|count| count.get());
+    assert_segv_lines("segv_states", &kept_segv_states()).await;
+    let made = crate::task::SEGV_REPAIRS_FOR_TEST.with(|count| count.get()) - before;
+    assert!(made > 0, "no repair ran");
+    // The ignored and caught-blocked rows read the action at the trap, so the
+    // counter `a_trap_that_resets_nothing_takes_no_repair` reads counts.
+    let made = crate::task::SEGV_TRAP_QUERIES_FOR_TEST.with(|count| count.get()) - queries;
+    assert!(made > 0, "no query at a trap");
+}
+
+/// The negative control of `sigsegv_state_survives_rdtsc_and_cpuid_traps`:
+/// without a serialized-execution contract, or with sigreturns not traced
+/// (so a guest `rt_sigreturn` can change the mask unseen), Reverie keeps
+/// nothing, and each trapped rdtsc leaves Linux's reset, as before: an
+/// ignored or blocked SIGSEGV reads `SIG_DFL` and unblocked, and only an
+/// unblocked handler or default survives.
+#[tokio::test(flavor = "current_thread")]
+async fn without_its_preconditions_a_trapped_rdtsc_resets_sigsegv() {
+    let expected: Vec<String> = [
+        ("ign", "dfl"),
+        ("ign-blocked", "dfl"),
+        ("handler", "segv_handler"),
+        ("handler-blocked", "dfl"),
+        ("dfl", "dfl"),
+        ("dfl-blocked", "dfl"),
+    ]
+    .iter()
+    .map(|(state, action)| {
+        format!("{state} rdtsc sigsegv={action} flags=0x10000000 usr2-in-mask=1 blocked=0")
+    })
+    .collect();
+    for (no_serialization_contract, sigreturns) in [(true, true), (false, false)] {
+        let run = run_guest_options(
+            "segv_states",
+            GuestOptions {
+                no_serialization_contract,
+                sigreturns,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("run segv_states without the keep's preconditions");
+        assert_eq!(run.status, ExitStatus::Exited(0), "{}", run.report);
+        let rdtsc: Vec<String> = segv_lines(&run.report)
+            .into_iter()
+            .filter(|line| line.contains(" rdtsc sigsegv="))
+            .collect();
+        assert_eq!(rdtsc, expected, "{}", run.report);
+    }
+}
+
+/// A SIGSEGV handler whose first instruction is a trapped rdtsc keeps its
+/// handler and its blocked SIGSEGV, as natively: the delivery of the guest's
+/// own SIGSEGV (`raise`) blocks SIGSEGV for the handler, and the trap's forced
+/// SIGSEGV would reset the handler being run. Back from it, SIGSEGV is
+/// unblocked again.
+#[tokio::test(flavor = "current_thread")]
+async fn a_sigsegv_handler_that_traps_keeps_its_handler_and_mask() {
+    let expected = [
+        "segv-handler in-handler sigsegv=other flags=0x10000000 usr2-in-mask=1 blocked=1",
+        "segv-handler after-handler sigsegv=other flags=0x10000000 usr2-in-mask=1 blocked=0",
+    ]
+    .map(str::to_owned);
+    assert_segv_lines("segv_in_segv_handler", &expected).await;
+}
+
+/// A SIGSEGV handler with `SA_NODEFER` runs with SIGSEGV unblocked, so its
+/// trap resets nothing; one with `SA_RESETHAND` is reset to `SIG_DFL` by its
+/// own delivery and runs with SIGSEGV blocked, so its trap unblocks SIGSEGV
+/// and the default action stays. Both read as natively: the record follows
+/// the one-shot reset, and the mask bit comes from the delivery.
+#[tokio::test(flavor = "current_thread")]
+async fn sigsegv_handlers_with_nodefer_or_resethand_trap_as_natively() {
+    let expected = [
+        "nodefer in-handler sigsegv=other flags=0x50000000 usr2-in-mask=1 blocked=0",
+        "nodefer after-handler sigsegv=other flags=0x50000000 usr2-in-mask=1 blocked=0",
+        "resethand in-handler sigsegv=dfl flags=0x90000000 usr2-in-mask=1 blocked=1",
+        "resethand after-handler sigsegv=dfl flags=0x90000000 usr2-in-mask=1 blocked=0",
+    ]
+    .map(str::to_owned);
+    assert_segv_lines("segv_handler_flags", &expected).await;
+}
+
+/// A handler that a mask-swapping wait lets run traps under the wait's
+/// temporary mask, as natively. SIGSEGV is blocked, and `ppoll`'s empty
+/// temporary mask lets a pending SIGUSR1 through: its handler, with an empty
+/// `sa_mask`, runs with SIGSEGV unblocked, though the mask `ppoll` restores
+/// (which `PTRACE_GETSIGMASK` reports while the restore is pending) blocks
+/// it. Taking that mask for the handler's would block SIGSEGV in it. Back
+/// from `ppoll`, the restored mask blocks SIGSEGV.
+#[tokio::test(flavor = "current_thread")]
+async fn a_handler_under_a_temporary_mask_traps_under_that_mask() {
+    let expected = [
+        "ppoll in-handler sigsegv=dfl flags=0x10000000 usr2-in-mask=1 blocked=0",
+        "ppoll after sigsegv=dfl flags=0x10000000 usr2-in-mask=1 blocked=1",
+    ]
+    .map(str::to_owned);
+    assert_segv_lines("segv_ppoll_handler", &expected).await;
+}
+
+/// A second thread's trap on the signal-action table it shares, a fork
+/// child's on its copy, and traps after exec (an ignored SIGSEGV stays
+/// ignored, a handler becomes `SIG_DFL` with no flags or mask, and the mask
+/// is kept) and in a `clone3` child made with `CLONE_CLEAR_SIGHAND`, whose
+/// copy of the actions is flushed: each keeps SIGSEGV's state as natively.
+#[tokio::test(flavor = "current_thread")]
+async fn sigsegv_state_survives_traps_in_threads_forks_execs_and_clones() {
+    let ign = |tag: &str| format!("{tag} sigsegv=ign flags=0x10000000 usr2-in-mask=1 blocked=1");
+    assert_segv_lines(
+        "segv_thread",
+        &[
+            ign("thread rdtsc"),
+            ign("thread main-after"),
+            ign("thread main-rdtsc"),
+        ],
+    )
+    .await;
+    assert_segv_lines(
+        "segv_fork",
+        &[ign("fork child-rdtsc"), ign("fork parent-rdtsc")],
+    )
+    .await;
+    assert_segv_lines(
+        "segv_exec",
+        &[
+            "exec ign-blocked rdtsc sigsegv=ign flags=0 usr2-in-mask=0 blocked=1".to_owned(),
+            "exec handler-blocked rdtsc sigsegv=dfl flags=0 usr2-in-mask=0 blocked=1".to_owned(),
+        ],
+    )
+    .await;
+    assert_segv_lines(
+        "segv_clear_sighand",
+        &[
+            "clear-sighand child-rdtsc sigsegv=dfl flags=0 usr2-in-mask=0 blocked=1".to_owned(),
+            "clear-sighand parent-rdtsc sigsegv=segv_handler flags=0x10000000 usr2-in-mask=1 \
+             blocked=1"
+                .to_owned(),
+        ],
+    )
+    .await;
+}
+
+/// A signal handed to a resume from a stop that is not a signal-delivery
+/// stop runs no handler, and so sets no handler mask: ptrace drops a SIGUSR1
+/// passed on the resume of a seccomp stop
+/// (`a_final_resume_signal_is_sent_only_from_a_syscall_exit_stop`), so the
+/// trapped rdtsc right after the call runs with SIGSEGV unblocked, as
+/// natively, though the SIGUSR1 handler's `sa_mask` blocks it. Taking the
+/// signal as delivered would block SIGSEGV at the trap.
+#[tokio::test(flavor = "current_thread")]
+async fn a_signal_a_resume_drops_sets_no_handler_mask() {
+    let expected =
+        ["dropped after sigsegv=dfl flags=0x10000000 usr2-in-mask=1 blocked=0".to_owned()];
+    assert_segv_lines("segv_resume_signal_dropped", &expected).await;
+}
+
+/// A table a thread Reverie does not trace may use has no known SIGSEGV
+/// action. The guest ignores SIGSEGV, makes a thread sharing the actions that
+/// spins without a syscall, and traps an rdtsc. With a traced thread the
+/// ignored action is kept, as natively. With `CLONE_UNTRACED` the clone gives
+/// no new-task event, so the table is marked (`note_segv_clone_result`) and
+/// the trap leaves the reset `SIG_DFL`, as before this change: that thread's
+/// own forced signals and one-shot deliveries could change the action unseen.
+/// Run with tail injections, where the guest's clone runs from its own code
+/// and the next stop must be the new-task event; an injected clone starts its
+/// child on Reverie's private page, which an untraced child cannot leave.
+#[tokio::test(flavor = "current_thread")]
+async fn an_untraced_sharer_leaves_the_sigsegv_reset_as_before() {
+    for (mode, expected) in [
+        (
+            "segv_sharer_t",
+            "sharer traced rdtsc sigsegv=ign flags=0x10000000 usr2-in-mask=1 blocked=0",
+        ),
+        (
+            "segv_sharer_u",
+            "sharer untraced rdtsc sigsegv=dfl flags=0x10000000 usr2-in-mask=1 blocked=0",
+        ),
+    ] {
+        let native = native_segv_lines(mode);
+        assert_eq!(native.len(), 1, "{native:?}");
+        assert!(native[0].contains("sigsegv=ign"), "{native:?}");
+        let run = run_guest_options(
+            mode,
+            GuestOptions {
+                tail: true,
+                sigreturns: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{mode}: {error}"));
+        assert_eq!(run.status, ExitStatus::Exited(0), "{}", run.report);
+        assert_eq!(
+            segv_lines(&run.report),
+            [expected.to_owned()],
+            "{}",
+            run.report
+        );
+    }
+}
+
+/// A trap that resets nothing (SIGSEGV neither blocked nor ignored) costs no
+/// repair: 400 trapped rdtscs under a handler and under `SIG_DFL` make none
+/// (`SEGV_REPAIRS_FOR_TEST`) and no query (`SEGV_TRAP_QUERIES_FOR_TEST`),
+/// and the state reads as natively. With injections, which keep the action
+/// known from the guest's own rt_sigaction, the whole run's unstepped queries
+/// are bounded too.
+#[tokio::test(flavor = "current_thread")]
+async fn a_trap_that_resets_nothing_takes_no_repair() {
+    let before = crate::task::SEGV_REPAIRS_FOR_TEST.with(|count| count.get());
+    let queries = crate::task::SEGV_TRAP_QUERIES_FOR_TEST.with(|count| count.get());
+    let expected = [
+        "quiet handler sigsegv=segv_handler flags=0x10000000 usr2-in-mask=1 blocked=0",
+        "quiet dfl sigsegv=dfl flags=0x10000000 usr2-in-mask=1 blocked=0",
+    ]
+    .map(str::to_owned);
+    assert_segv_lines("segv_quiet", &expected).await;
+    let made = crate::task::SEGV_REPAIRS_FOR_TEST.with(|count| count.get()) - before;
+    assert_eq!(made, 0);
+    let made = crate::task::SEGV_TRAP_QUERIES_FOR_TEST.with(|count| count.get()) - queries;
+    assert_eq!(made, 0);
+    // With injections, a whole run makes at most three unstepped queries,
+    // none at a trap: pre-init's, in the launcher before its exec, and one
+    // after each of the mode's two rt_sigaction calls, which reads back the
+    // action they installed (`learn_segv_action`). A learning loop that
+    // repeated at every stop would exceed it.
+    let unstepped = crate::task::UNSTEPPED_INJECTIONS_FOR_TEST.with(|count| count.get());
+    let run = run_guest_options(
+        "segv_quiet",
+        GuestOptions {
+            sigreturns: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("run segv_quiet with injections");
+    assert_eq!(segv_lines(&run.report), expected, "{}", run.report);
+    let made = crate::task::UNSTEPPED_INJECTIONS_FOR_TEST.with(|count| count.get()) - unstepped;
+    assert!(made <= 3, "{made} unstepped queries");
+}
+
 /// A caught, unblocked SIGTRAP needs no repair: no step can reset it, so a run
 /// through every handler shape makes no unstepped injection
 /// (`UNSTEPPED_INJECTIONS_FOR_TEST`) and keeps the handler.

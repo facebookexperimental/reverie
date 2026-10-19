@@ -619,6 +619,380 @@ static void mode_sigtrap_states(void) {
   }
 }
 
+static void exec_self(const char* mode);
+
+static void segv_handler(int sig) {
+  (void)sig;
+}
+
+/* SIGSEGV's whole action and mask bit, as sigtrap_full_state reports
+ * SIGTRAP's. */
+static void segv_full_state(const char* tag) {
+  struct sigaction sa;
+  sigset_t set;
+  if (sigaction(SIGSEGV, NULL, &sa) != 0 ||
+      sigprocmask(SIG_SETMASK, NULL, &set) != 0)
+    die("read sigsegv state");
+  const char* disp = sa.sa_handler == SIG_IGN ? "ign"
+      : sa.sa_handler == SIG_DFL              ? "dfl"
+      : sa.sa_handler == segv_handler         ? "segv_handler"
+                                              : "other";
+  say("%s sigsegv=%s flags=%#lx usr2-in-mask=%d blocked=%d\n",
+      tag,
+      disp,
+      (unsigned long)(sa.sa_flags & (SA_RESTART | SA_NODEFER | SA_RESETHAND)),
+      sigismember(&sa.sa_mask, SIGUSR2),
+      sigismember(&set, SIGSEGV));
+}
+
+static void segv_set(void (*action)(int), int block) {
+  struct sigaction sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sa_handler = action;
+  sa.sa_flags = SA_RESTART;
+  sigemptyset(&sa.sa_mask);
+  sigaddset(&sa.sa_mask, SIGUSR2);
+  if (sigaction(SIGSEGV, &sa, NULL) != 0)
+    die("set sigsegv");
+  sigset_t set;
+  sigemptyset(&set);
+  sigaddset(&set, SIGSEGV);
+  if (sigprocmask(block ? SIG_BLOCK : SIG_UNBLOCK, &set, NULL) != 0)
+    die("mask sigsegv");
+}
+
+/* rdtsc (0) or cpuid (1), each of which the tracer traps with a SIGSEGV
+ * where it can (cpuid only where the CPU can fault it). */
+static void segv_trapped_instruction(int cpuid) {
+  if (cpuid) {
+    unsigned a = 0, b, c = 0, d;
+    __asm__ volatile("cpuid" : "+a"(a), "=b"(b), "+c"(c), "=d"(d));
+    (void)b;
+    (void)d;
+  } else {
+    unsigned lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    (void)lo;
+    (void)hi;
+  }
+}
+
+static char segv_handler_tag[64];
+
+/* A SIGUSR1 handler whose first instruction is a trapped rdtsc: SIGSEGV is
+ * in its sa_mask, so the handler runs with it blocked whatever the mask
+ * before, and no stop comes between the delivery and the trap. */
+static void segv_usr1_handler(int sig) {
+  (void)sig;
+  segv_trapped_instruction(0);
+  segv_full_state(segv_handler_tag);
+}
+
+/* Each SIGSEGV state through a trapped rdtsc, a trapped cpuid, a trapped
+ * rdtsc first thing in a handler, and a trapped rdtsc after the handler's
+ * rt_sigreturn with no syscall between. Natively neither instruction faults,
+ * so the action and the mask bit stay as they were
+ * (https://github.com/rrnewton/hermit/issues/4485). */
+static void mode_segv_states(void) {
+  static const struct {
+    const char* name;
+    void (*action)(int);
+    int block;
+  } states[] = {
+      {"ign", SIG_IGN, 0},
+      {"ign-blocked", SIG_IGN, 1},
+      {"handler", segv_handler, 0},
+      {"handler-blocked", segv_handler, 1},
+      {"dfl", SIG_DFL, 0},
+      {"dfl-blocked", SIG_DFL, 1},
+  };
+  struct sigaction usr1;
+  memset(&usr1, 0, sizeof usr1);
+  usr1.sa_handler = segv_usr1_handler;
+  sigemptyset(&usr1.sa_mask);
+  sigaddset(&usr1.sa_mask, SIGSEGV);
+  if (sigaction(SIGUSR1, &usr1, NULL) != 0)
+    die("set sigusr1");
+  for (unsigned i = 0; i < sizeof states / sizeof states[0]; i++) {
+    char tag[64];
+    for (int cpuid = 0; cpuid < 2; cpuid++) {
+      segv_set(states[i].action, states[i].block);
+      segv_trapped_instruction(cpuid);
+      snprintf(
+          tag, sizeof tag, "%s %s", states[i].name, cpuid ? "cpuid" : "rdtsc");
+      segv_full_state(tag);
+    }
+    segv_set(states[i].action, states[i].block);
+    snprintf(
+        segv_handler_tag,
+        sizeof segv_handler_tag,
+        "%s in-handler",
+        states[i].name);
+    raise(SIGUSR1);
+    segv_trapped_instruction(0);
+    snprintf(tag, sizeof tag, "%s after-handler", states[i].name);
+    segv_full_state(tag);
+  }
+}
+
+/* A SIGSEGV handler whose first instruction is a trapped rdtsc: the
+ * delivery blocks SIGSEGV for the handler (no SA_NODEFER), so the trap's
+ * forced SIGSEGV would reset the handler being run. */
+static void segv_rdtsc_handler(int sig) {
+  (void)sig;
+  segv_trapped_instruction(0);
+  segv_full_state("segv-handler in-handler");
+}
+
+static void mode_segv_in_segv_handler(void) {
+  struct sigaction sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sa_handler = segv_rdtsc_handler;
+  sa.sa_flags = SA_RESTART;
+  sigemptyset(&sa.sa_mask);
+  sigaddset(&sa.sa_mask, SIGUSR2);
+  if (sigaction(SIGSEGV, &sa, NULL) != 0)
+    die("set sigsegv");
+  raise(SIGSEGV);
+  segv_trapped_instruction(0);
+  /* The handler is not segv_handler, so it reads as "other". */
+  segv_full_state("segv-handler after-handler");
+}
+
+static const char* segv_flags_tag;
+
+static void segv_flags_handler(int sig) {
+  (void)sig;
+  segv_trapped_instruction(0);
+  segv_full_state(segv_flags_tag);
+}
+
+/* A SIGSEGV handler with SA_NODEFER, which runs with SIGSEGV unblocked, so
+ * its trap resets nothing; and one with SA_RESETHAND, whose delivery resets
+ * it to SIG_DFL before it runs with SIGSEGV blocked, so its trap unblocks
+ * SIGSEGV and resets nothing more. */
+static void mode_segv_handler_flags(void) {
+  static const struct {
+    const char* name;
+    int flags;
+  } cases[] = {
+      {"nodefer", SA_RESTART | SA_NODEFER},
+      {"resethand", SA_RESTART | SA_RESETHAND},
+  };
+  for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = segv_flags_handler;
+    sa.sa_flags = cases[i].flags;
+    sigemptyset(&sa.sa_mask);
+    sigaddset(&sa.sa_mask, SIGUSR2);
+    if (sigaction(SIGSEGV, &sa, NULL) != 0)
+      die("set sigsegv");
+    char in[64], after[64];
+    snprintf(in, sizeof in, "%s in-handler", cases[i].name);
+    snprintf(after, sizeof after, "%s after-handler", cases[i].name);
+    segv_flags_tag = in;
+    raise(SIGSEGV);
+    segv_trapped_instruction(0);
+    segv_full_state(after);
+  }
+}
+
+static void* segv_thread_main(void* arg) {
+  (void)arg;
+  segv_trapped_instruction(0);
+  segv_full_state("thread rdtsc");
+  return NULL;
+}
+
+/* A second thread's trap, on the signal-action table it shares: the
+ * thread inherits the blocked mask, and its repair is the process's. */
+static void mode_segv_thread(void) {
+  segv_set(SIG_IGN, 1);
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, segv_thread_main, NULL) != 0)
+    die("pthread_create");
+  if (pthread_join(thread, NULL) != 0)
+    die("pthread_join");
+  segv_full_state("thread main-after");
+  segv_trapped_instruction(0);
+  segv_full_state("thread main-rdtsc");
+}
+
+/* Makes a thread of this process, sharing the signal actions, that spins on
+ * its own stack and makes no syscall; with CLONE_UNTRACED (argv "untraced")
+ * the tracer never sees it. The process's exit ends it. */
+static void segv_spinning_sharer(int untraced) {
+  static char stack[16384] __attribute__((aligned(16)));
+  long flags = CLONE_VM | CLONE_SIGHAND | CLONE_THREAD | (untraced ? CLONE_UNTRACED : 0);
+  long ret;
+  register long r10 __asm__("r10") = 0;
+  register long r8 __asm__("r8") = 0;
+  __asm__ volatile(
+      "syscall\n\t"
+      "test %%rax, %%rax\n\t"
+      "jnz 1f\n\t"
+      "2: pause\n\t"
+      "jmp 2b\n\t"
+      "1:"
+      : "=a"(ret)
+      : "0"((long)SYS_clone), "D"(flags), "S"(stack + sizeof stack), "d"(0L), "r"(r10),
+        "r"(r8)
+      : "rcx", "r11", "memory");
+  if (ret < 0)
+    die("clone sharer");
+}
+
+/* An ignored SIGSEGV through a trapped rdtsc after a thread sharing the
+ * actions was made: traced (kept), or with CLONE_UNTRACED, whose thread
+ * could change the action unseen, so that Reverie leaves the reset as
+ * before. */
+static void mode_segv_sharer(void) {
+  int untraced = main_argv[1][strlen(main_argv[1]) - 1] == 'u';
+  segv_set(SIG_IGN, 0);
+  segv_spinning_sharer(untraced);
+  segv_trapped_instruction(0);
+  segv_full_state(untraced ? "sharer untraced rdtsc" : "sharer traced rdtsc");
+}
+
+/* A fork child's trap, on its copy of the actions, and the parent's. */
+static void mode_segv_fork(void) {
+  segv_set(SIG_IGN, 1);
+  pid_t child = fork();
+  if (child < 0)
+    die("fork");
+  if (child == 0) {
+    segv_trapped_instruction(0);
+    segv_full_state("fork child-rdtsc");
+    _exit(0);
+  }
+  int status;
+  if (waitpid(child, &status, 0) != child)
+    die("waitpid");
+  segv_trapped_instruction(0);
+  segv_full_state("fork parent-rdtsc");
+}
+
+/* Across exec: an ignored SIGSEGV stays ignored, a handler becomes SIG_DFL
+ * with no flags or mask, and the mask is kept. The new image traps first
+ * thing in its mode. */
+static void mode_segv_exec(void) {
+  segv_set(SIG_IGN, 1);
+  exec_self("segv_after_exec_ign");
+}
+
+static void mode_segv_after_exec_ign(void) {
+  segv_trapped_instruction(0);
+  segv_full_state("exec ign-blocked rdtsc");
+  segv_set(segv_handler, 1);
+  exec_self("segv_after_exec_handler");
+}
+
+static void mode_segv_after_exec_handler(void) {
+  segv_trapped_instruction(0);
+  segv_full_state("exec handler-blocked rdtsc");
+}
+
+/* A clone3 child made with CLONE_CLEAR_SIGHAND, whose copy of the actions
+ * is flushed: the parent's blocked handler becomes SIG_DFL with no flags or
+ * mask in the child, which keeps the blocked mask. */
+static void mode_segv_clear_sighand(void) {
+  segv_set(segv_handler, 1);
+  struct {
+    uint64_t flags, pidfd, child_tid, parent_tid, exit_signal, stack,
+        stack_size, tls;
+  } args;
+  memset(&args, 0, sizeof args);
+  args.flags = 0x100000000ULL; /* CLONE_CLEAR_SIGHAND */
+  args.exit_signal = SIGCHLD;
+  long child = syscall(SYS_clone3, &args, sizeof args);
+  if (child < 0) {
+    /* Before Linux 5.5: nothing to compare. */
+    say("clear-sighand unsupported\n");
+    return;
+  }
+  if (child == 0) {
+    segv_trapped_instruction(0);
+    segv_full_state("clear-sighand child-rdtsc");
+    _exit(0);
+  }
+  int status;
+  if (waitpid((pid_t)child, &status, 0) != child)
+    die("waitpid");
+  segv_trapped_instruction(0);
+  segv_full_state("clear-sighand parent-rdtsc");
+}
+
+/* A SIGUSR1 handler whose first instruction is a trapped rdtsc, with an
+ * empty sa_mask: it runs under ppoll's temporary mask. */
+static void segv_ppoll_handler(int sig) {
+  (void)sig;
+  segv_trapped_instruction(0);
+  segv_full_state("ppoll in-handler");
+}
+
+/* SIGSEGV blocked, and a SIGUSR1 that ppoll's empty temporary mask lets
+ * through: the handler runs with SIGSEGV unblocked, under the temporary
+ * mask, though the mask ppoll restores (which PTRACE_GETSIGMASK reports
+ * while the restore is pending) blocks it. Back from ppoll, a trapped rdtsc
+ * runs under the restored mask. */
+static void mode_segv_ppoll_handler(void) {
+  segv_set(SIG_DFL, 1);
+  struct sigaction usr1;
+  memset(&usr1, 0, sizeof usr1);
+  usr1.sa_handler = segv_ppoll_handler;
+  sigemptyset(&usr1.sa_mask);
+  if (sigaction(SIGUSR1, &usr1, NULL) != 0)
+    die("set sigusr1");
+  sigset_t block, empty;
+  sigemptyset(&block);
+  sigaddset(&block, SIGUSR1);
+  sigemptyset(&empty);
+  if (sigprocmask(SIG_BLOCK, &block, NULL) != 0)
+    die("block sigusr1");
+  raise(SIGUSR1);
+  struct timespec timeout = {5, 0};
+  int r = ppoll(NULL, 0, &timeout, &empty);
+  say("ppoll returned %d errno=%d\n", r, r < 0 ? errno : 0);
+  segv_trapped_instruction(0);
+  segv_full_state("ppoll after");
+}
+
+static void segv_dropped_handler(int sig) {
+  (void)sig;
+  segv_full_state("dropped in-handler");
+}
+
+/* A SIGUSR1 the tracer hands to its resume of a seccomp stop, where ptrace
+ * drops it: no handler runs, so the trapped rdtsc after the call runs with
+ * SIGSEGV unblocked, as natively, though the handler would block it. */
+static void mode_segv_resume_signal_dropped(void) {
+  struct sigaction usr1;
+  memset(&usr1, 0, sizeof usr1);
+  usr1.sa_handler = segv_dropped_handler;
+  sigemptyset(&usr1.sa_mask);
+  sigaddset(&usr1.sa_mask, SIGSEGV);
+  if (sigaction(SIGUSR1, &usr1, NULL) != 0)
+    die("set sigusr1");
+  segv_set(SIG_DFL, 0);
+  SITEM(SYS_getpid, 0, 0, 0, 0, 0, SHAPE_TAIL | SEND_RESUME);
+  segv_trapped_instruction(0);
+  segv_full_state("dropped after");
+}
+
+/* Many trapped rdtscs with SIGSEGV neither blocked nor ignored, which no
+ * trap resets: the repair makes no request for them. */
+static void mode_segv_quiet(void) {
+  segv_set(segv_handler, 0);
+  for (int i = 0; i < 200; i++)
+    segv_trapped_instruction(0);
+  segv_full_state("quiet handler");
+  segv_set(SIG_DFL, 0);
+  for (int i = 0; i < 200; i++)
+    segv_trapped_instruction(0);
+  segv_full_state("quiet dfl");
+}
+
 /* SIGTRAP blocked through each handler shape, with the thread named by raw
  * bytes that are not UTF-8: procfs reports the name as set, and Reverie's
  * reads of the thread's status must still parse. */
@@ -4667,6 +5041,32 @@ int main(int argc, char** argv) {
     mode_sigtrap_profile();
   else if (!strcmp(m, "sigtrap_states"))
     mode_sigtrap_states();
+  else if (!strcmp(m, "segv_states"))
+    mode_segv_states();
+  else if (!strcmp(m, "segv_in_segv_handler"))
+    mode_segv_in_segv_handler();
+  else if (!strcmp(m, "segv_handler_flags"))
+    mode_segv_handler_flags();
+  else if (!strcmp(m, "segv_thread"))
+    mode_segv_thread();
+  else if (!strcmp(m, "segv_sharer_t") || !strcmp(m, "segv_sharer_u"))
+    mode_segv_sharer();
+  else if (!strcmp(m, "segv_fork"))
+    mode_segv_fork();
+  else if (!strcmp(m, "segv_exec"))
+    mode_segv_exec();
+  else if (!strcmp(m, "segv_after_exec_ign"))
+    mode_segv_after_exec_ign();
+  else if (!strcmp(m, "segv_after_exec_handler"))
+    mode_segv_after_exec_handler();
+  else if (!strcmp(m, "segv_clear_sighand"))
+    mode_segv_clear_sighand();
+  else if (!strcmp(m, "segv_ppoll_handler"))
+    mode_segv_ppoll_handler();
+  else if (!strcmp(m, "segv_quiet"))
+    mode_segv_quiet();
+  else if (!strcmp(m, "segv_resume_signal_dropped"))
+    mode_segv_resume_signal_dropped();
   else if (!strcmp(m, "sigtrap_raw_name"))
     mode_sigtrap_raw_name();
   else if (!strcmp(m, "sigtrap_cache_flip"))
