@@ -528,6 +528,15 @@ static uint32_t compare_exchange_word(
  * that runtime_compare_exchange_u32 goes through it. */
 static _Atomic uint64_t compare_exchange_word_calls;
 static bool test_reused_tid;
+static bool test_branch_owner_admission;
+static _Atomic int test_owner_stage;
+static _Atomic int test_owner_clones;
+static _Atomic int32_t test_owner_tid;
+static _Atomic int32_t test_owner_birth;
+static _Atomic int test_owner_failures;
+static int test_owner_initializations;
+static _Atomic bool test_owner_stale_seen;
+static uint64_t test_owner_bound[5];
 static bool test_thread_clone_process_exit;
 static bool test_thread_start_write;
 static bool test_stalled_thread_start;
@@ -1759,9 +1768,11 @@ static process_control_t* process_control_for(int32_t kernel_pid) {
 
 /* Cache the exact admitted task birth, separately from process capture's
  * birth. Pending thread publication must finish before this lookup is trusted.
- * Instrumentation already counts the task's prefix while binding is pending. */
+ * Instrumentation already counts the task's prefix while binding is pending.
+ * A nonzero admitted_task_birth is supplied only by the entry gate after its
+ * existing pending-publication check and current-task membership lookup. */
 static void bind_branch_owner(void* dc, prototype_counters_t* counters,
-    process_control_t* entry) {
+    process_control_t* entry, int32_t admitted_task_birth) {
   branch_counter_state_t* state = branch_counter_state(dc);
   if (state == NULL || state->owner_valid || entry == NULL ||
       !task_state_identity_valid || counters->kernel_tid <= 0 ||
@@ -1769,10 +1780,15 @@ static void bind_branch_owner(void* dc, prototype_counters_t* counters,
       counters->kernel_pid != (int32_t)dr_get_process_id() ||
       entry->kernel_pid != counters->kernel_pid || entry->birth_token <= 0)
     return;
-  if (atomic_load_explicit(&entry->pending_thread_clones, memory_order_acquire) != 0)
-    return;
-  int32_t task_birth;
-  if (!lookup_task_birth(counters->kernel_tid, &task_birth) || task_birth <= 0)
+  int32_t task_birth = admitted_task_birth;
+  if (task_birth == 0) {
+    if (atomic_load_explicit(
+            &entry->pending_thread_clones, memory_order_acquire) != 0)
+      return;
+    if (!lookup_task_birth(counters->kernel_tid, &task_birth))
+      return;
+  }
+  if (task_birth <= 0)
     return;
   size_t slot = (size_t)(entry - task_state->process_controls);
   if (slot >= atomic_load_explicit(&task_state->process_control_count,
@@ -1830,6 +1846,8 @@ static int32_t query_branch_fact(uintptr_t context, branch_fact_t* out) {
   return BRANCH_FACT_READY;
 }
 
+#include "branch_owner_test.h"
+
 /* Bind before entering Rust's Tool-start hook, using the existing process
  * admission lookup. A fork copy is rebound to its own positive-PID slot; exec
  * starts with zeroed TLS and authenticates the inherited owner again. No
@@ -1840,7 +1858,7 @@ static void bind_capture_owner(prototype_counters_t* counters) {
       counters->capture_owner.birth != entry->birth_token) {
     counters->capture_owner = (capture_owner_t){entry, entry->birth_token, 0};
   }
-  bind_branch_owner(dr_get_current_drcontext(), counters, entry);
+  bind_branch_owner(dr_get_current_drcontext(), counters, entry, 0);
 }
 
 // Cleanup may run for an early failure without a prepared process owner. Do
@@ -2829,8 +2847,24 @@ static void try_start_pending_thread(void) {
     exit_runtime_tree(91);
     return;
   }
-  if (test_reused_tid && pending_thread_clones != 0)
+  if (test_reused_tid && pending_thread_clones != 0) {
+    if (test_branch_owner_admission &&
+        (int32_t)dr_get_thread_id(drcontext) == atomic_load(&test_owner_tid)) {
+      int32_t stale_birth;
+      if (!lookup_task_birth((int32_t)dr_get_thread_id(drcontext), &stale_birth) ||
+          stale_birth != TEST_REUSED_TID_STALE) {
+        set_pending_thread_start(counters, 2);
+        return;
+      }
+      atomic_store(&test_owner_stale_seen, true);
+      branch_fact_t fact, zero = {0};
+      int status = query_branch_fact((uintptr_t)drcontext, &fact);
+      if (status != (branch_counter_enabled ? BRANCH_FACT_PENDING_OWNER : BRANCH_FACT_DISABLED) ||
+          memcmp(&fact, &zero, sizeof(fact)) != 0)
+        atomic_fetch_add(&test_owner_failures, 1);
+    }
     atomic_store_explicit(&test_reused_tid_waited, true, memory_order_release);
+  }
   if (pending_thread_clones == 0 && !mapping_found)
     mapping_found = lookup_task_birth(
         (int32_t)dr_get_thread_id(drcontext), &published_birth_token);
@@ -2846,9 +2880,19 @@ static void try_start_pending_thread(void) {
     exit_runtime_tree(91);
     return;
   }
+  if (test_branch_owner_admission &&
+      (int32_t)dr_get_thread_id(drcontext) == atomic_load(&test_owner_tid)) {
+    if (published_birth_token != atomic_load(&test_owner_birth))
+      atomic_fetch_add(&test_owner_failures, 1);
+    atomic_store_explicit(&test_owner_stage, 1, memory_order_release);
+    test_owner_wait(2);
+  }
   counters->kernel_tid = (int32_t)dr_get_thread_id(drcontext);
+  /* This live task's birth was authenticated above after clone publication.
+   * A later sibling reservation cannot revoke that fact or recycle this live
+   * TID. Reuse it instead of rechecking unrelated pending clones. */
   bind_branch_owner(drcontext, counters,
-      process_control_for(counters->kernel_pid));
+      process_control_for(counters->kernel_pid), published_birth_token);
 
   int32_t init_result = 0;
   if (!has_copied_runtime() ||
@@ -2878,6 +2922,13 @@ static void try_start_pending_thread(void) {
         diagnostic_file, "reverie-dbt: runtime thread initialization failed\n");
     exit_runtime_tree(101);
     return;
+  }
+  if (test_branch_owner_admission && counters->kernel_tid == atomic_load(&test_owner_tid)) {
+    ++test_owner_initializations;
+    test_owner_observe("admitted-sibling-pending", 0, 1);
+    atomic_store_explicit(&test_owner_stage, 3, memory_order_release);
+    test_owner_wait(4);
+    test_owner_observe("sibling-published", 0, 0);
   }
   set_pending_thread_start(counters, 0);
 }
@@ -3760,6 +3811,17 @@ static bool prepare_clone_birth(
         pending_thread_clones_for(counters->kernel_pid),
         1,
         memory_order_acq_rel);
+    if (test_branch_owner_admission && atomic_fetch_add(&test_owner_clones, 1) == 1) {
+      branch_counter_state_t* state = branch_counter_state(dr_get_current_drcontext());
+      branch_counter_state_t before;
+      if (state != NULL)
+        memcpy(&before, state, sizeof(before));
+      bind_capture_owner(counters);
+      if (state != NULL && memcmp(&before, state, sizeof(before)) != 0)
+        atomic_fetch_add(&test_owner_failures, 1);
+      atomic_store_explicit(&test_owner_stage, 2, memory_order_release);
+      test_owner_wait(3);
+    }
     if (test_thread_clone_process_exit &&
         counters->kernel_pid != task_state->root_pid) {
       atomic_store_explicit(
@@ -3826,6 +3888,12 @@ static int32_t complete_clone_birth(
             "reverie-dbt: failed to kill announced test child\n");
         exit_runtime_tree(101);
       }
+    }
+    if (test_branch_owner_admission && (flags & CLONE_THREAD) != 0 &&
+        atomic_load(&test_owner_clones) == 1) {
+      atomic_store(&test_reused_tid_waited, false);
+      atomic_store(&test_owner_birth, birth_token);
+      atomic_store_explicit(&test_owner_tid, (int32_t)result, memory_order_release);
     }
     if (test_reused_tid && (flags & CLONE_THREAD) != 0) {
       int32_t injected = 0;
@@ -3908,7 +3976,7 @@ static int32_t complete_clone_birth(
        * parent's capture pointer or memory-owner alias. */
       if (branch_counter_enabled)
         bind_branch_owner(dr_get_current_drcontext(), counters,
-            process_control_for(counters->kernel_pid));
+            process_control_for(counters->kernel_pid), 0);
     }
   }
   if ((flags & CLONE_THREAD) != 0 && result != 0) {
@@ -3916,6 +3984,12 @@ static int32_t complete_clone_birth(
       dr_fprintf(diagnostic_file, "STALLED_THREAD_START_TEST exercised=1\n");
     else
       finish_pending_thread_clone(counters->kernel_pid);
+    if (test_branch_owner_admission && result > 0) {
+      if ((int32_t)result == atomic_load(&test_owner_tid))
+        test_owner_wait(1);
+      else
+        atomic_store_explicit(&test_owner_stage, 4, memory_order_release);
+    }
   } else if (
       (flags & CLONE_THREAD) == 0 && (result <= 0 || (flags & CLONE_VM) == 0)) {
     release_clone_identity_handoff(birth_token);
@@ -5525,6 +5599,9 @@ static void scrub_guest_stack_before_first_instruction(void) {
 }
 
 static bool pre_syscall(void* drcontext, int sysnum) {
+  if (test_branch_owner_admission && sysnum == SYS_getpid &&
+      (int32_t)dr_get_thread_id(drcontext) == atomic_load(&test_owner_tid))
+    test_owner_observe("guest-prefix", 3, 0);
   prototype_counters_t* counters =
       (prototype_counters_t*)drmgr_get_tls_field(drcontext, thread_state_index);
   DR_ASSERT(counters != NULL);
@@ -6671,6 +6748,12 @@ static void event_exit(void) {
     retire_private_memory();
     dr_set_private_reservation_retirement_callback(NULL);
   }
+  if (test_branch_owner_admission)
+    dr_fprintf(diagnostic_file,
+        "OWNER_ADMISSION complete stage=%d clones=%d initializations=%d stale=%d failures=%d\n",
+        atomic_load(&test_owner_stage), atomic_load(&test_owner_clones),
+        test_owner_initializations, atomic_load(&test_owner_stale_seen),
+        atomic_load(&test_owner_failures));
   if (test_reused_tid)
     dr_fprintf(
         diagnostic_file,
@@ -6985,7 +7068,10 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
       test_compare_exchange = true;
     else if (strcmp(argv[i], "-test-controller-capture") == 0)
       test_controller_capture = true;
-    else if (strcmp(argv[i], "-test-reused-tid") == 0)
+    else if (strcmp(argv[i], "-test-branch-owner-admission") == 0) {
+      test_branch_owner_admission = true;
+      test_reused_tid = true;
+    } else if (strcmp(argv[i], "-test-reused-tid") == 0)
       test_reused_tid = true;
     else if (strcmp(argv[i], "-test-thread-clone-process-exit") == 0)
       test_thread_clone_process_exit = true;

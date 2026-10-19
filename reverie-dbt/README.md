@@ -93,12 +93,19 @@ at zero, and a newly loaded image has a new scope. Unavailable observations are
 explicit errors rather than zero work. This interface is a mechanism prerequisite,
 not a continuous clock or a claim of PMU equivalence on every processor.
 
-With branch facts enabled, a returning syscall injection that would create a
-shared-VM child fails with a named backend error before child creation. The
-returning bridge lacks the original/tail path's child-entry machinery. Existing
-prehandler errors remain Linux errors; this refusal supplies no fabricated
+With branch facts enabled, a returning syscall injection classified by DR's
+prehandler as CLONE_VM fails with a named backend error before kernel entry.
+This includes requests that Linux might later reject. Errors already established
+by DR's prehandler remain Linux errors. The returning bridge lacks the
+original/tail path's child-entry machinery; the refusal supplies no fabricated
 guest errno and does not silently convert a returning operation into a tail
 operation. Original and tail execution use their existing child-entry path.
+
+Collection is off by default. The accompanying cache-context retirement changes
+also check failed context reads, translations, and replacements in release
+builds, returning failure instead of continuing those reset/detach paths.
+Those failure-path changes apply even when collection is disabled; focused
+retirement controls do not establish general failed-reset/detach recovery.
 
 ## Prototype Boundaries
 

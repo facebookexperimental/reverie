@@ -416,3 +416,93 @@ fn nested_pid_namespace_children_are_refused_before_child_syscall_dispatch() {
         );
     }
 }
+
+#[test]
+#[ignore = "requires built DynamoRIO/native client; run explicitly with --ignored"]
+fn admitted_branch_owner_survives_a_sibling_clone_reservation() {
+    let directory = std::env::var_os("REVERIE_DBT_TEST_ARTIFACT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| tempfile::tempdir().unwrap().keep());
+    std::fs::create_dir_all(&directory).unwrap();
+    let guest = directory.join("branch-owner-admission");
+    let source =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/branch_owner_admission.S");
+    let status = Command::new(std::env::var_os("CC").unwrap_or_else(|| "cc".into()))
+        .args(["-nostdlib", "-static", "-no-pie", "-Wl,--build-id=none"])
+        .arg(source)
+        .arg("-o")
+        .arg(&guest)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let native = Command::new("timeout")
+        .args(["--kill-after=2s", "15s"])
+        .arg(&guest)
+        .output()
+        .unwrap();
+    std::fs::write(directory.join("native.stdout"), &native.stdout).unwrap();
+    std::fs::write(directory.join("native.stderr"), &native.stderr).unwrap();
+    assert!(native.status.success(), "{native:?}");
+    assert_eq!(native.stdout, b"owner-admission=ok\n");
+    assert!(native.stderr.is_empty());
+    let launcher = directory.join("bounded-drrun");
+    std::fs::write(&launcher, "#!/bin/sh\nexec timeout --signal=TERM --kill-after=2s 20s \"$REVERIE_DBT_TEST_DRRUN\" \"$@\"\n").unwrap();
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for enabled in [true, false] {
+        let name = if enabled { "enabled" } else { "disabled" };
+        let mut command = Command::new(&guest);
+        command.env("REVERIE_DBT_TEST_DRRUN", reverie_dbt::bundled_drrun_path());
+        command.env("DYNAMORIO_CONFIGDIR", directory.join(name));
+        std::fs::create_dir(directory.join(name)).unwrap();
+        let mut runner = DbtRunner::new(
+            &launcher,
+            std::env::var_os("REVERIE_DBT_CLIENT").expect("built native client"),
+        )
+        .unwrap()
+        .client_argument("-test-branch-owner-admission");
+        if enabled {
+            runner = runner.client_argument("-branch-facts");
+        }
+        let output = runner.output(&command).unwrap();
+        std::fs::write(directory.join(format!("{name}.stdout")), &output.stdout).unwrap();
+        std::fs::write(directory.join(format!("{name}.stderr")), &output.stderr).unwrap();
+        std::fs::write(
+            directory.join(format!("{name}.status")),
+            format!("{:?}\n", output.status),
+        )
+        .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"owner-admission=ok\n");
+        let text = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            text.contains(
+                "OWNER_ADMISSION complete stage=4 clones=2 initializations=1 stale=1 failures=0"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("REUSED_TID_TEST exercised=1"), "{text}");
+        let rows: Vec<_> = text
+            .lines()
+            .filter(|l| l.starts_with("OWNER_ADMISSION phase="))
+            .collect();
+        assert_eq!(rows.len(), 3, "{text}");
+        for (row, phase, pending, count) in [
+            (rows[0], "admitted-sibling-pending", 1, 0),
+            (rows[1], "sibling-published", 0, 0),
+            (rows[2], "guest-prefix", 0, 3),
+        ] {
+            assert!(row.contains(&format!("phase={phase} ")), "{row}");
+            assert!(row.contains(&format!("pending={pending} ")), "{row}");
+            assert!(
+                row.contains(&format!("status={} ", u8::from(enabled))),
+                "{row}"
+            );
+            let value = if enabled { count } else { 0 };
+            assert!(
+                row.contains(&format!("stored={value} count={value} ")),
+                "{row}"
+            );
+            assert!(row.ends_with("immutable=1 ok=1"), "{row}");
+        }
+    }
+}
