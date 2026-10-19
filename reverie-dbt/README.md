@@ -102,10 +102,12 @@ guest errno and does not silently convert a returning operation into a tail
 operation. Original and tail execution use their existing child-entry path.
 
 Collection is off by default. The accompanying cache-context retirement changes
-also check failed context reads, translations, and replacements in release
-builds, returning failure instead of continuing those reset/detach paths.
-Those failure-path changes apply even when collection is disabled; focused
-retirement controls do not establish general failed-reset/detach recovery.
+add local release-build checks for failed context reads, translations, and
+replacements. Failures return from a helper or suppress its abandonment
+notification; the void helpers do not return failure to outer reset/detach
+callers, which continue processing. These changes also apply when collection is
+disabled; component setter controls do not establish general failed-reset/detach
+recovery.
 
 ## Prototype Boundaries
 
