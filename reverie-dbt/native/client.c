@@ -2622,8 +2622,8 @@ static uint64_t guest_tsc(void* drcontext, bool with_aux, uint32_t* aux) {
     uint32_t runtime_aux = 0;
     int32_t answered;
     DR_ASSERT(counters != NULL);
-    // The loader reads the TSC before its first syscall, which is where a
-    // runtime owner otherwise starts the runtime; start it here the same way.
+    // Fresh images start at first-block admission. Keep the existing event
+    // fallback for paths whose runtime has not been started there.
     if (!has_copied_runtime())
       ensure_runtime_background();
     while (!reverie_dbt_runtime_ready(
@@ -2838,6 +2838,7 @@ static void try_start_pending_thread(void) {
    * still describe an earlier thread that used the same host TID. */
   bool image_main = dr_get_thread_id(drcontext) == dr_get_process_id() &&
       !has_copied_runtime();
+  // A fresh image leader cannot have cloned or reused a sibling's TID yet.
   pending_thread_clones = image_main ? 0 : atomic_load_explicit(
       pending_thread_clones_for(counters->kernel_pid), memory_order_acquire);
   if (test_thread_clone_process_exit &&
@@ -2903,15 +2904,6 @@ static void try_start_pending_thread(void) {
   int32_t init_result = 0;
   if (!has_copied_runtime() ||
       (runtime_uses_external_global() && !is_copied_vfork_process())) {
-    // A fresh image enters here before any application instruction. The
-    // background helper cannot be started from DynamoRIO's thread-init event.
-    if (!has_copied_runtime())
-      ensure_runtime_background();
-    if (!reverie_dbt_runtime_ready(
-            atomic_load_explicit(&image_generation, memory_order_acquire))) {
-      set_pending_thread_start(counters, 2);
-      return;
-    }
     bind_capture_owner(counters);
     evidence_callback_enter();
     init_result = reverie_dbt_runtime_thread_init(
@@ -3011,6 +3003,16 @@ static void start_pending_thread(app_pc pc) {
       dr_get_current_drcontext(), thread_state_index);
   if (counters == NULL || counters->pending_thread_start == 0)
     return;
+  // Preserve the runtime's existing readiness wait independently of the
+  // thread-birth admission deadline. This runs after DynamoRIO thread-init,
+  // when starting the helper is allowed; copied runtimes keep their prior
+  // readiness policy.
+  if (!has_copied_runtime()) {
+    ensure_runtime_background();
+    while (!reverie_dbt_runtime_ready(
+        atomic_load_explicit(&image_generation, memory_order_acquire)))
+      dr_sleep(1);
+  }
   app_pc previous = counters->admission_pc;
   counters->admission_pc = pc;
   admit_pending_thread();
