@@ -64,6 +64,7 @@
 #define SHAPE_TWO_PRIVATE 5
 #define SHAPE_BLOCK_ALL 6
 #define SHAPE_PRIVATE_CALL 7
+#define SHAPE_PPOLL_THEN_CALL 8
 #define SEND_SIGUSR1 0x100
 #define SEND_SIGWINCH 0x200
 #define SEND_QUEUE 0x400
@@ -668,6 +669,211 @@ static void mode_sigtrap_cache_flip(void) {
     snprintf(tag, sizeof tag, "flip %s", flips[i].name);
     sigtrap_full_state(tag);
   }
+}
+
+/* SIGTRAP's bit in the hex value of status field `name` within `buf`, or -1. */
+static int status_sigtrap_bit(const char* buf, const char* name) {
+  const char* p = strstr(buf, name);
+  if (!p)
+    return -1;
+  unsigned long long v = strtoull(p + strlen(name), NULL, 16);
+  return (int)((v >> (SIGTRAP - 1)) & 1);
+}
+
+/* Each SIGTRAP state, read back from the thread's own procfs status by a read
+ * the Tool injects in each injecting shape: natively the read reports the
+ * mask the thread runs under, so a blocked SIGTRAP is in SigBlk. An injected
+ * read that the instrumentation runs with SIGTRAP unblocked reports the
+ * instrumentation's mask instead (https://github.com/rrnewton/hermit/issues/4485). */
+static void sigblk_matrix(const char* prefix) {
+  static const struct {
+    const char* name;
+    void (*action)(int);
+    int block;
+  } states[] = {
+      {"ign-blocked", SIG_IGN, 1},
+      {"ign", SIG_IGN, 0},
+      {"handler-blocked", trap_handler, 1},
+      {"handler", trap_handler, 0},
+      {"dfl-blocked", SIG_DFL, 1},
+  };
+  static const struct {
+    const char* name;
+    long shape;
+  } shapes[] = {
+      {"inject", SHAPE_INJECT},
+      {"two-injects", SHAPE_TWO_INJECTS},
+      {"private-call", SHAPE_PRIVATE_CALL},
+      {"tail", SHAPE_TAIL},
+  };
+  for (unsigned i = 0; i < sizeof states / sizeof states[0]; i++) {
+    for (unsigned j = 0; j < sizeof shapes / sizeof shapes[0]; j++) {
+      sigtrap_set(states[i].action, states[i].block);
+      char buf[4096];
+      int fd = open("/proc/thread-self/status", O_RDONLY);
+      if (fd < 0)
+        die("open /proc/thread-self/status");
+      long n = SITEM(SYS_read, fd, (long)buf, sizeof buf - 1, 0, 0, shapes[j].shape);
+      close(fd);
+      if (n <= 0)
+        die("read /proc/thread-self/status");
+      buf[n] = 0;
+      sigset_t set;
+      if (sigprocmask(SIG_SETMASK, NULL, &set) != 0)
+        die("read the mask");
+      say("%s%s %s SigBlk=%d SigIgn=%d SigCgt=%d blocked=%d\n",
+          prefix,
+          states[i].name,
+          shapes[j].name,
+          status_sigtrap_bit(buf, "SigBlk:"),
+          status_sigtrap_bit(buf, "SigIgn:"),
+          status_sigtrap_bit(buf, "SigCgt:"),
+          sigismember(&set, SIGTRAP));
+    }
+  }
+}
+
+static void mode_sigtrap_sigblk(void) {
+  for (int i = 0; i < 3; i++)
+    SITE(SYS_getppid, 0, 0, 0, 0, 0);
+  sigblk_matrix("");
+}
+
+static int parked_pipe[2];
+
+static void* parked_thread(void* arg) {
+  (void)arg;
+  char c;
+  if (read(parked_pipe[0], &c, 1) != 1)
+    die("parked read");
+  return NULL;
+}
+
+/* The same matrix while a second thread of this process is parked in a read,
+ * so that the signal-action table is shared: there Reverie keeps the step
+ * shield exactly as before injected calls ran under the guest's own mask,
+ * and a private-page read sees a blocked SIGTRAP unblocked. */
+static void mode_sigtrap_sigblk_shared(void) {
+  for (int i = 0; i < 3; i++)
+    SITE(SYS_getppid, 0, 0, 0, 0, 0);
+  if (pipe(parked_pipe) != 0)
+    die("pipe");
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, parked_thread, NULL) != 0)
+    die("pthread_create");
+  sigblk_matrix("shared ");
+  if (write(parked_pipe[1], "x", 1) != 1)
+    die("unpark");
+  if (pthread_join(thread, NULL) != 0)
+    die("pthread_join");
+}
+
+static void untraced_entry(void);
+static volatile long untraced_ret, untraced_rcx;
+static volatile int untraced_done;
+
+/* The SigBlk matrix after a CLONE_SIGHAND | CLONE_THREAD | CLONE_UNTRACED
+ * thread, which gives no new-child stop, has started spinning: it shares the
+ * signal-action table, so Reverie keeps the step shield exactly as before
+ * injected calls ran under the guest's own mask. The thread spins until the
+ * run's exit_group ends it. */
+static void mode_sigtrap_sigblk_untraced(void) {
+  for (int i = 0; i < 3; i++)
+    SITE(SYS_getppid, 0, 0, 0, 0, 0);
+  size_t size = 64 * 1024;
+  char* stack = mmap(
+      NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (stack == MAP_FAILED)
+    die("mmap stack");
+  uintptr_t* top = (uintptr_t*)(stack + size - 64);
+  top[0] = (uintptr_t)untraced_entry;
+  long flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
+      CLONE_THREAD | CLONE_SYSVSEM | CLONE_UNTRACED;
+  if (syscall(SYS_clone, flags, top, NULL, NULL, 0) <= 0)
+    die("untraced clone");
+  while (!__atomic_load_n(&untraced_done, __ATOMIC_SEQ_CST))
+    __asm__ volatile("pause");
+  sigblk_matrix("untraced ");
+}
+
+static volatile int hold_hits;
+
+static void hold_usr1(int sig) {
+  (void)sig;
+  hold_hits++;
+}
+
+/* With a second thread parked (a shared table): for each SIGTRAP state,
+ * SIGRTMIN+2 blocked and pending, then a status read the Tool handles by
+ * first injecting a ppoll whose empty temporary mask lets SIGRTMIN+2
+ * interrupt it (Reverie holds the signal, and the mask's restore is left
+ * pending), then the read itself on the private page, which runs with the
+ * realtime signals shielded until its syscall entry; SIGRTMIN+2 is
+ * unblocked after. */
+static void mode_sigtrap_ppoll_hold_then_read(void) {
+  for (int i = 0; i < 3; i++)
+    SITE(SYS_getppid, 0, 0, 0, 0, 0);
+  struct sigaction usr1;
+  memset(&usr1, 0, sizeof usr1);
+  usr1.sa_handler = hold_usr1;
+  if (sigaction(SIGRTMIN + 2, &usr1, NULL) != 0)
+    die("install SIGRTMIN+2");
+  if (pipe(parked_pipe) != 0)
+    die("pipe");
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, parked_thread, NULL) != 0)
+    die("pthread_create");
+  static const struct {
+    const char* name;
+    void (*action)(int);
+    int block;
+  } states[] = {
+      {"ign-blocked", SIG_IGN, 1},
+      {"handler-blocked", trap_handler, 1},
+      {"dfl-blocked", SIG_DFL, 1},
+      {"dfl", SIG_DFL, 0},
+  };
+  sigset_t usr1_set;
+  sigemptyset(&usr1_set);
+  sigaddset(&usr1_set, SIGRTMIN + 2);
+  for (unsigned i = 0; i < sizeof states / sizeof states[0]; i++) {
+    sigtrap_set(states[i].action, states[i].block);
+    if (sigprocmask(SIG_BLOCK, &usr1_set, NULL) != 0)
+      die("block SIGRTMIN+2");
+    hold_hits = 0;
+    raise(SIGRTMIN + 2);
+    char buf[4096];
+    int fd = open("/proc/thread-self/status", O_RDONLY);
+    if (fd < 0)
+      die("open /proc/thread-self/status");
+    long n = SITEM(SYS_read, fd, (long)buf, sizeof buf - 1, 0, 0, SHAPE_PPOLL_THEN_CALL);
+    close(fd);
+    if (sigprocmask(SIG_UNBLOCK, &usr1_set, NULL) != 0)
+      die("unblock SIGRTMIN+2");
+    char tag[64];
+    if (n <= 0) {
+      snprintf(tag, sizeof tag, "hold %s read=%ld hits=%d", states[i].name, n, hold_hits);
+      sigtrap_full_state(tag);
+      continue;
+    }
+    buf[n] = 0;
+    sigset_t set;
+    if (sigprocmask(SIG_SETMASK, NULL, &set) != 0)
+      die("read the mask");
+    say("hold %s SigBlk=%d SigIgn=%d SigCgt=%d blocked=%d hits=%d\n",
+        states[i].name,
+        status_sigtrap_bit(buf, "SigBlk:"),
+        status_sigtrap_bit(buf, "SigIgn:"),
+        status_sigtrap_bit(buf, "SigCgt:"),
+        sigismember(&set, SIGTRAP),
+        hold_hits);
+    snprintf(tag, sizeof tag, "hold %s after", states[i].name);
+    sigtrap_full_state(tag);
+  }
+  if (write(parked_pipe[1], "x", 1) != 1)
+    die("unpark");
+  if (pthread_join(thread, NULL) != 0)
+    die("pthread_join");
 }
 
 /* What a sleep's remaining time says, without its host-dependent digits.
@@ -3178,6 +3384,246 @@ static void mode_sigtrap_signal_callback(void) {
   }
 }
 
+/* A caught SIGTRAP that the guest blocks, through 200 private injections,
+ * as Detcore's polling loops run them under a mask that blocks every
+ * signal: the handler and the mask bit are the guest's afterwards. */
+static void mode_sigtrap_caught_blocked_injections(void) {
+  for (int i = 0; i < 3; i++)
+    SITE(SYS_getppid, 0, 0, 0, 0, 0);
+  sigtrap_set(trap_handler, 1);
+  for (int i = 0; i < 200; i++)
+    SITEM(SYS_getppid, 0, 0, 0, 0, 0, SHAPE_PRIVATE);
+  sigtrap_full_state("caught-blocked after 200");
+}
+
+/* A caught SIGTRAP that the guest blocks, after the guest installs a
+ * seccomp filter that refuses rt_sigaction with Reverie's repair page
+ * (0x71001000) as oldact, so that Reverie cannot read the handler a step's
+ * trap would reset, and gives up the page. The guest's own sigaction calls
+ * pass a stack address and are allowed. Through 20 private injections the
+ * handler and the mask bit must stay the guest's. */
+static void mode_sigtrap_caught_blocked_no_repair(void) {
+  for (int i = 0; i < 3; i++)
+    SITE(SYS_getppid, 0, 0, 0, 0, 0);
+  struct sock_filter f[] = {
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_rt_sigaction, 1, 0),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[2])),
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0x71001000, 1, 0),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[2]) + 4),
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 1, 0),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+  };
+  struct sock_fprog prog = {sizeof f / sizeof f[0], f};
+  if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))
+    die("no_new_privs");
+  if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog))
+    die("seccomp");
+  sigtrap_set(trap_handler, 1);
+  for (int i = 0; i < 20; i++)
+    SITEM(SYS_getppid, 0, 0, 0, 0, 0, SHAPE_PRIVATE);
+  sigtrap_full_state("no-repair after 20");
+}
+
+/* A caught SIGTRAP that the guest blocks, then a seccomp filter (allowing
+ * everything) installed by a call the Tool injects on the private page, then
+ * more private injections: Reverie gives up its repair page once the guest
+ * has a filter, so the filter-installing step and every later one must leave
+ * the handler as the guest set it. */
+static void mode_sigtrap_caught_blocked_filter_install(void) {
+  for (int i = 0; i < 3; i++)
+    SITE(SYS_getppid, 0, 0, 0, 0, 0);
+  struct sock_filter f[] = {BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)};
+  struct sock_fprog prog = {sizeof f / sizeof f[0], f};
+  if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))
+    die("no_new_privs");
+  sigtrap_set(trap_handler, 1);
+  /* Earlier private steps, before the filter. */
+  for (int i = 0; i < 3; i++)
+    SITEM(SYS_getppid, 0, 0, 0, 0, 0, SHAPE_PRIVATE);
+  long r = SITEM(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, (long)&prog, 0, 0, SHAPE_PRIVATE_CALL);
+  if (r != 0)
+    die("seccomp");
+  for (int i = 0; i < 5; i++)
+    SITEM(SYS_getppid, 0, 0, 0, 0, 0, SHAPE_PRIVATE);
+  sigtrap_full_state("filter-install after");
+}
+
+static void trap_handler2(int sig) {
+  (void)sig;
+}
+
+static int sibling_pipe[2];
+static pid_t sibling_target_tid;
+
+/* Whether thread `tid` is inside read(`fd`, ...): its procfs `syscall` shows
+ * the syscall number (0 on x86-64) and first argument of the call it is
+ * blocked in, or "running" while it runs in user space. */
+static int thread_in_read_of(pid_t tid, int fd) {
+  char path[64], buf[256];
+  snprintf(path, sizeof path, "/proc/self/task/%d/syscall", (int)tid);
+  int pfd = open(path, O_RDONLY);
+  if (pfd < 0)
+    return 0;
+  ssize_t n = read(pfd, buf, sizeof buf - 1);
+  close(pfd);
+  if (n <= 0)
+    return 0;
+  buf[n] = 0;
+  long nr = -1;
+  unsigned long arg0 = 0;
+  if (sscanf(buf, "%ld %lx", &nr, &arg0) != 2)
+    return 0;
+  return nr == SYS_read && arg0 == (unsigned long)fd;
+}
+
+static void* sibling_changes_sigtrap(void* arg) {
+  (void)arg;
+  /* Not before the main thread is blocked in its private-page read, so that
+   * the change below happens while that injected call runs. */
+  for (int i = 0; !thread_in_read_of(sibling_target_tid, sibling_pipe[0]); i++) {
+    if (i == 100000)
+      die("main thread never blocked in its read");
+    usleep(1000);
+  }
+  struct sigaction sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sa_handler = trap_handler2;
+  sa.sa_flags = SA_RESTART | SA_NODEFER;
+  sigemptyset(&sa.sa_mask);
+  sigaddset(&sa.sa_mask, SIGUSR2);
+  if (sigaction(SIGTRAP, &sa, NULL) != 0)
+    die("sibling sigaction");
+  if (write(sibling_pipe[1], "x", 1) != 1)
+    die("sibling write");
+  return NULL;
+}
+
+/* A caught SIGTRAP that this thread blocks, while a private-page read blocks
+ * on a pipe; meanwhile a sibling, once procfs shows this thread blocked in
+ * that read, installs another handler (same flags and mask) and then writes
+ * the pipe. The read's step trap resets whatever
+ * action is in force when it returns. Reverie must never write back the
+ * handler it knew before the read: that would replace the sibling's. */
+static void sibling_change_from(void (*start)(int)) {
+  for (int i = 0; i < 3; i++)
+    SITE(SYS_getppid, 0, 0, 0, 0, 0);
+  if (pipe(sibling_pipe) != 0)
+    die("pipe");
+  sigtrap_set(start, 1);
+  SITEM(SYS_getppid, 0, 0, 0, 0, 0, SHAPE_PRIVATE);
+  sibling_target_tid = (pid_t)syscall(SYS_gettid);
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, sibling_changes_sigtrap, NULL) != 0)
+    die("pthread_create");
+  char c;
+  long r = SITEM(SYS_read, sibling_pipe[0], (long)&c, 1, 0, 0, SHAPE_PRIVATE_CALL);
+  if (r != 1)
+    die("read");
+  if (pthread_join(thread, NULL) != 0)
+    die("pthread_join");
+  struct sigaction now;
+  if (sigaction(SIGTRAP, NULL, &now) != 0)
+    die("read sigtrap");
+  say("sibling-change sigtrap=%s\n",
+      now.sa_handler == trap_handler ? "stale"
+      : now.sa_handler == trap_handler2 ? "sibling"
+      : now.sa_handler == SIG_DFL ? "dfl"
+      : now.sa_handler == SIG_IGN ? "ign"
+                                  : "other");
+}
+
+static void mode_sigtrap_sibling_change_during_call(void) {
+  sibling_change_from(trap_handler);
+}
+
+/* The same, starting from a default or an ignored SIGTRAP that this thread
+ * blocks: a pinned limit, since the read's step is then not shielded. */
+static void mode_sigtrap_sibling_change_from_dfl(void) {
+  sibling_change_from(SIG_DFL);
+}
+
+static void mode_sigtrap_sibling_change_from_ign(void) {
+  sibling_change_from(SIG_IGN);
+}
+
+/* A default SIGTRAP that the guest blocks, then a handler installed by an
+ * rt_sigaction the Tool injects on the private page: natively the call
+ * installs it and nothing resets it. */
+static void mode_sigtrap_blocked_installs_handler(void) {
+  for (int i = 0; i < 3; i++)
+    SITE(SYS_getppid, 0, 0, 0, 0, 0);
+  sigtrap_set(SIG_DFL, 1);
+  struct ksigaction k = {
+      .handler = trap_handler,
+      .flags = SA_RESTART | SA_NODEFER | 0x04000000 /* SA_RESTORER */,
+      .restorer = (void (*)(void))trap_handler,
+      .mask = 1UL << (SIGUSR2 - 1),
+  };
+  long r = SITEM(SYS_rt_sigaction, SIGTRAP, (long)&k, 0, 8, 0, SHAPE_PRIVATE_CALL);
+  if (r != 0)
+    die("private rt_sigaction");
+  sigtrap_full_state("installs-handler");
+}
+
+/* A Tool's injection at a signal stop while a temporary mask's restore is
+ * pending: SIGPROF is blocked and pending, and a private-page ppoll whose
+ * temporary mask admits it returns -EINTR with the restore pending. At the
+ * SIGPROF stop the Tool's callback injects getpid (handle_signal_event);
+ * resuming the thread for it restores the saved mask first, so the getpid's
+ * trap sees SIGTRAP as the saved mask has it, not as the temporary mask did.
+ * In -topen states the saved mask blocks SIGTRAP and the temporary mask
+ * admits it; in -tshut states the reverse. Natively SIGTRAP's action and
+ * mask bit are the guest's afterwards. */
+static void mode_sigtrap_callback_restore(void) {
+  warm();
+  struct sigaction prof;
+  memset(&prof, 0, sizeof prof);
+  prof.sa_sigaction = callback_handler;
+  prof.sa_flags = SA_SIGINFO;
+  sigemptyset(&prof.sa_mask);
+  if (sigaction(SIGPROF, &prof, NULL) != 0)
+    die("install SIGPROF");
+  static const struct {
+    const char* name;
+    void (*action)(int);
+    int block;
+    int tmask;
+  } states[] = {
+      {"handler-blocked-topen", trap_handler, 1, 0},
+      {"ign-blocked-topen", SIG_IGN, 1, 0},
+      {"dfl-blocked-topen", SIG_DFL, 1, 0},
+      {"handler-tshut", trap_handler, 0, 1},
+  };
+  sigset_t prof_set;
+  sigemptyset(&prof_set);
+  sigaddset(&prof_set, SIGPROF);
+  for (unsigned i = 0; i < sizeof states / sizeof states[0]; i++) {
+    sigtrap_set(states[i].action, states[i].block);
+    if (sigprocmask(SIG_BLOCK, &prof_set, NULL) != 0)
+      die("block SIGPROF");
+    callback_hits = 0;
+    raise(SIGPROF);
+    unsigned long temporary = states[i].tmask ? 1UL << (SIGTRAP - 1) : 0;
+    struct timespec ts = {5, 0};
+    /* The call's result is not compared: the Tool's injection at the
+     * SIGPROF stop replaces it in the guest's return register, natively
+     * -EINTR, with getpid's (a separate defect). */
+    SITEM(SYS_ppoll, 0, 0, (long)&ts, (long)&temporary, 8, SHAPE_PRIVATE_CALL);
+    if (sigprocmask(SIG_UNBLOCK, &prof_set, NULL) != 0)
+      die("unblock SIGPROF");
+    char tag[64];
+    snprintf(tag, sizeof tag, "restore %s hits=%d", states[i].name, callback_hits);
+    sigtrap_full_state(tag);
+  }
+}
+
 /* A timer single-step that reaches the site carrying an untraced number
  * (500, which no syscall table knows). */
 static void mode_timer_allow(void) {
@@ -4225,6 +4671,30 @@ int main(int argc, char** argv) {
     mode_sigtrap_raw_name();
   else if (!strcmp(m, "sigtrap_cache_flip"))
     mode_sigtrap_cache_flip();
+  else if (!strcmp(m, "sigtrap_sigblk"))
+    mode_sigtrap_sigblk();
+  else if (!strcmp(m, "sigtrap_sigblk_shared"))
+    mode_sigtrap_sigblk_shared();
+  else if (!strcmp(m, "sigtrap_sigblk_untraced"))
+    mode_sigtrap_sigblk_untraced();
+  else if (!strcmp(m, "sigtrap_ppoll_hold_then_read"))
+    mode_sigtrap_ppoll_hold_then_read();
+  else if (!strcmp(m, "sigtrap_callback_restore"))
+    mode_sigtrap_callback_restore();
+  else if (!strcmp(m, "sigtrap_caught_blocked_injections"))
+    mode_sigtrap_caught_blocked_injections();
+  else if (!strcmp(m, "sigtrap_caught_blocked_no_repair"))
+    mode_sigtrap_caught_blocked_no_repair();
+  else if (!strcmp(m, "sigtrap_caught_blocked_filter_install"))
+    mode_sigtrap_caught_blocked_filter_install();
+  else if (!strcmp(m, "sigtrap_sibling_change_during_call"))
+    mode_sigtrap_sibling_change_during_call();
+  else if (!strcmp(m, "sigtrap_sibling_change_from_dfl"))
+    mode_sigtrap_sibling_change_from_dfl();
+  else if (!strcmp(m, "sigtrap_sibling_change_from_ign"))
+    mode_sigtrap_sibling_change_from_ign();
+  else if (!strcmp(m, "sigtrap_blocked_installs_handler"))
+    mode_sigtrap_blocked_installs_handler();
   else if (!strcmp(m, "sigtrap_timer"))
     mode_sigtrap_timer();
   else if (!strcmp(m, "sigtrap_interrupted_waits"))

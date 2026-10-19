@@ -18,12 +18,15 @@
 //! sees SIGTRAP blocked.
 //!
 //! The task keeps both as the guest set them in two ways:
-//! - the *shield*: SIGTRAP is unblocked for a step whose instruction does not
-//!   itself set the mask, and blocked again at the step's stop
-//!   ([`shieldable`]);
-//! - the *repair*: after a step whose trap could still reset the action (an
-//!   ignored SIGTRAP, or a step [`shieldable`] refuses), the action is written
-//!   back with an `rt_sigaction` that is never stepped.
+//! - the *shield*: SIGTRAP is unblocked for a step of Reverie's own in which
+//!   the kernel reads no mask for the guest (a syscall skip, a clone event's
+//!   return, an exec's, an instruction after an exec), and blocked again at
+//!   the step's stop;
+//! - the *repair*: after the step of a Tool's injected syscall, which runs
+//!   under the guest's own mask so that the call sees it as natively, the
+//!   mask bit is set again and the action, if the trap could have reset it,
+//!   is written back with an `rt_sigaction` that is never stepped. So is an
+//!   ignored SIGTRAP after a shielded step.
 //!
 //! This module holds the parts that need no tracee.
 
@@ -82,8 +85,9 @@ pub(crate) fn parse_sigtrap_disposition(status: &str) -> Option<(bool, bool)> {
 /// SIGTRAP's state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StepKind {
-    /// The syscall does not set the blocked mask: the shield applies.
-    Shieldable,
+    /// The syscall does not set the blocked mask: the trap sees the mask
+    /// before it.
+    KeepsMask,
     /// `rt_sigprocmask`: the trap sees the mask the call sets.
     SetsMask,
     /// A mask-swapping call: the trap sees the temporary mask if the call
@@ -106,7 +110,7 @@ pub(crate) fn step_kind(nr: Sysno, swaps_mask: bool) -> StepKind {
         Sysno::rt_sigprocmask => StepKind::SetsMask,
         Sysno::clone | Sysno::clone3 | Sysno::fork | Sysno::vfork => StepKind::Clones,
         Sysno::rt_sigreturn => StepKind::Sigreturn,
-        _ => StepKind::Shieldable,
+        _ => StepKind::KeepsMask,
     }
 }
 
@@ -181,7 +185,7 @@ mod tests {
 
     #[test]
     fn step_kinds_name_every_mask_setter_and_clone() {
-        assert_eq!(step_kind(Sysno::getppid, false), StepKind::Shieldable);
+        assert_eq!(step_kind(Sysno::getppid, false), StepKind::KeepsMask);
         assert_eq!(step_kind(Sysno::ppoll, true), StepKind::SwapsMask);
         assert_eq!(step_kind(Sysno::rt_sigprocmask, false), StepKind::SetsMask);
         for nr in [Sysno::clone, Sysno::clone3, Sysno::fork, Sysno::vfork] {
