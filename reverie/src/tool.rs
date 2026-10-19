@@ -928,6 +928,29 @@ pub trait Tool: Send + Sync + Default {
     ) {
     }
 
+    /// Records, in the taking thread's state, one signal the backend passes
+    /// on unreported, after [`Tool::filter_unreported_signal`] decided about
+    /// it: `kept` is that hook's answer. A kept signal is resumed into the
+    /// guest, and Linux then delivers it, puts it back in the queue when the
+    /// thread's mask blocks it (a later stop can take the same instance again
+    /// and pass it once more), queues a new instance with a kernel siginfo
+    /// (a syscall stop), or discards it (an ignored signal, or a ptrace event
+    /// stop or group stop); a dropped one is not resumed. So the hook sees passes, not deliveries.
+    /// The signal's
+    /// [`crate::UnreportedSignal::reason`] says why it was not reported, so
+    /// that a Tool can count what its signal callback never saw.
+    ///
+    /// The hook can only record: it gets the thread's state and the signal's
+    /// read-only description, and no access to the guest. The default
+    /// records nothing.
+    fn note_unreported_signal(
+        &self,
+        _thread_state: &mut Self::ThreadState,
+        _signal: &crate::UnreportedSignal,
+        _kept: bool,
+    ) {
+    }
+
     /// Admits acknowledgment of real KVM pending removals before thread start.
     /// Other Tools retain their existing pending-state behavior by default.
     ///

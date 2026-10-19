@@ -27,6 +27,7 @@ use reverie::Tool;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::EpollPwait;
+use reverie::syscalls::Getpid;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Ppoll;
 use reverie::syscalls::Pselect6;
@@ -35,11 +36,14 @@ use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallArgs;
 use reverie::syscalls::Sysno;
 use reverie_ptrace::testing::test_fn;
+use serde::Deserialize;
+use serde::Serialize;
 
 /// A zero-length write to this descriptor, whose buffer is a `WaitArgs`, is
 /// replaced with an injected `rt_sigprocmask(SIG_UNBLOCK, &unblock, NULL)` and
 /// then an injected 50 ms wait (`Wait`, the descriptor's offset from this
-/// one) under the temporary mask `mask`. The tool returns the wait's result.
+/// one) under the temporary mask `mask`, and, when `then_getpid` is set, an
+/// injected `getpid` after it. The tool returns the wait's result.
 const UNBLOCK_THEN_WAIT_FD: i32 = 902;
 
 /// The injected wait, by its offset from `UNBLOCK_THEN_WAIT_FD`.
@@ -89,31 +93,76 @@ struct WaitArgs {
     mask_at: u64,
     /// Where pselect6's wrapper is, when not at `wrapper` (0: at `wrapper`).
     wrapper_at: u64,
+    /// Nonzero: inject `getpid` after the wait.
+    then_getpid: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+enum Report {
+    /// An injection's result.
+    Injected(Result<i64, i32>),
+    /// A signal recorded by `Tool::note_unreported_signal`: its number, the
+    /// name of its `UnreportedSignalReason`, and whether the filter kept it.
+    Noted(i32, String, bool),
 }
 
 #[derive(Default)]
 struct Log {
     injected: Mutex<Vec<Result<i64, i32>>>,
+    noted: Mutex<Vec<(i32, String, bool)>>,
 }
 
 #[reverie::global_tool]
 impl GlobalTool for Log {
-    type Request = Result<i64, i32>;
+    type Request = Report;
     type Response = ();
     type Config = ();
 
-    async fn receive_rpc(&self, _from: Pid, result: Result<i64, i32>) {
-        self.injected.lock().unwrap().push(result);
+    async fn receive_rpc(&self, _from: Pid, report: Report) {
+        match report {
+            Report::Injected(result) => self.injected.lock().unwrap().push(result),
+            Report::Noted(signal, reason, kept) => {
+                self.noted.lock().unwrap().push((signal, reason, kept))
+            }
+        }
     }
 }
 
+/// Replaces each marker `write` (`UNBLOCK_THEN_WAIT_FD`), and records each
+/// signal passed on unreported (`Tool::note_unreported_signal`), reported
+/// when its thread exits.
 #[derive(Clone, Copy, Debug, Default)]
 struct MaskSwapTool;
 
 #[reverie::tool]
 impl Tool for MaskSwapTool {
     type GlobalState = Log;
-    type ThreadState = ();
+    /// The signals `Tool::note_unreported_signal` recorded.
+    type ThreadState = Vec<(i32, String, bool)>;
+
+    fn note_unreported_signal(
+        &self,
+        noted: &mut Self::ThreadState,
+        signal: &reverie::UnreportedSignal,
+        kept: bool,
+    ) {
+        noted.push((signal.number(), signal.reason().name().to_string(), kept));
+    }
+
+    async fn on_exit_thread<R: reverie::GlobalRPC<Self::GlobalState>>(
+        &self,
+        _tid: reverie::Tid,
+        global_state: &R,
+        noted: Self::ThreadState,
+        _exit_status: ExitStatus,
+    ) -> Result<(), Error> {
+        for (signal, reason, kept) in noted {
+            global_state
+                .send_rpc(Report::Noted(signal, reason, kept))
+                .await;
+        }
+        Ok(())
+    }
 
     fn subscriptions(_config: &()) -> Subscription {
         let mut subscription = Subscription::none();
@@ -148,7 +197,9 @@ impl Tool for MaskSwapTool {
                     .with_sigsetsize(8),
             )
             .await;
-        guest.send_rpc(unblocked.map_err(Errno::into_raw)).await;
+        guest
+            .send_rpc(Report::Injected(unblocked.map_err(Errno::into_raw)))
+            .await;
         let mask = Addr::from_raw(if args.mask_at != 0 {
             args.mask_at as usize
         } else {
@@ -220,7 +271,15 @@ impl Tool for MaskSwapTool {
                     .await
             }
         };
-        guest.send_rpc(result.map_err(Errno::into_raw)).await;
+        guest
+            .send_rpc(Report::Injected(result.map_err(Errno::into_raw)))
+            .await;
+        if args.then_getpid != 0 {
+            let pid = guest.inject(Getpid::new()).await;
+            guest
+                .send_rpc(Report::Injected(pid.map_err(Errno::into_raw)))
+                .await;
+        }
         Ok(result?)
     }
 }
@@ -352,7 +411,7 @@ fn unblock_then_wait_for(
     mask: u64,
     timeout_ms: i64,
 ) -> (isize, Option<i32>) {
-    unblock_then_wait_placed(wait, unblock, mask, timeout_ms, None)
+    unblock_then_wait_placed(wait, unblock, mask, timeout_ms, None, false)
 }
 
 /// `unblock_then_wait_for`, with the mask, and pselect6's wrapper after it,
@@ -363,6 +422,7 @@ fn unblock_then_wait_placed(
     mask: u64,
     timeout_ms: i64,
     protection: Option<libc::c_int>,
+    then_getpid: bool,
 ) -> (isize, Option<i32>) {
     let page = protection.map(|protection| {
         // SAFETY: a fresh private anonymous page, written before it is
@@ -400,6 +460,7 @@ fn unblock_then_wait_placed(
         },
         mask_at: page.unwrap_or(0),
         wrapper_at: page.map_or(0, |page| page + 16),
+        then_getpid: u64::from(then_getpid),
     };
     args.wrapper[0] = &args.mask as *const u64 as u64;
     // SAFETY: the tool replaces this zero-length write.
@@ -423,6 +484,13 @@ fn unblock_then_wait_placed(
 
 /// Runs `guest` under the tool and returns the injections' results.
 fn run_guest(name: &str, guest: fn()) -> Vec<Result<i64, i32>> {
+    run_guest_noting(name, guest).0
+}
+
+/// `run_guest`, also returning the signals passed on unreported, as
+/// `Report::Noted` carries them.
+#[allow(clippy::type_complexity)]
+fn run_guest_noting(name: &str, guest: fn()) -> (Vec<Result<i64, i32>>, Vec<(i32, String, bool)>) {
     let (output, log) = test_fn::<MaskSwapTool, _>(guest).expect(name);
     assert_eq!(
         output.status,
@@ -430,7 +498,9 @@ fn run_guest(name: &str, guest: fn()) -> Vec<Result<i64, i32>> {
         "{name}: stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    log.injected.lock().unwrap().clone()
+    let injected = log.injected.lock().unwrap().clone();
+    let noted = log.noted.lock().unwrap().clone();
+    (injected, noted)
 }
 
 /// The thread blocks SIGUSR1 and sends it to itself. The tool unblocks it
@@ -601,6 +671,47 @@ fn a_shielded_rt_sigsuspend_woken_by_another_signal_restores_the_thread_mask() {
     });
 }
 
+/// A signal held while a mask restore is pending is passed on unreported,
+/// and `Tool::note_unreported_signal` records it with that reason. SIGUSR1
+/// is pending and blocked by the thread's mask; the injected ppoll's
+/// temporary mask admits it, so the ppoll returns ERESTARTNOHAND at once,
+/// with SIGUSR1 still pending and the restore of the thread's mask pending.
+/// (The thread's own mask blocks SIGUSR1 during the step to the syscall, so
+/// it cannot stop the step before the call, and the shield, which covers
+/// signals the call's mask blocks, does not apply.) The `getpid` injected
+/// next takes SIGUSR1 at its step, under the temporary mask still in effect,
+/// and holds it; the held SIGUSR1 is passed on unreported
+/// (`HeldRestorePending`), and Linux runs its handler as after the guest's
+/// own ppoll, then restores the thread's mask, which blocks SIGUSR1 again.
+/// The guest's call returns EINTR. No host timing is involved.
+#[test]
+fn a_signal_held_while_a_mask_restore_is_pending_is_noted_as_such() {
+    let (injected, noted) = run_guest_noting("held while restore pending", || {
+        DELIVERIES.store(0, Ordering::SeqCst);
+        catch_and_block(libc::SIGUSR1, false);
+        let usr1 = bit(libc::SIGUSR1);
+        assert_eq!(
+            unblock_then_wait_placed(Wait::Ppoll, 0, 0, 500, None, true),
+            (-1, Some(libc::EINTR))
+        );
+        assert_eq!(records(), vec![libc::SIGUSR1 as i64]);
+        assert_eq!(current_mask() & usr1, usr1, "the thread's mask is restored");
+    });
+    assert_eq!(
+        injected,
+        vec![
+            Ok(0),
+            Err(Errno::ERESTARTNOHAND.into_raw()),
+            Err(Errno::ERESTARTSYS.into_raw())
+        ],
+        "the unblock (of nothing), the ppoll the pending SIGUSR1 ends, and the getpid it stops before its syscall"
+    );
+    assert_eq!(
+        noted,
+        vec![(libc::SIGUSR1, "held, restore pending".to_string(), true)]
+    );
+}
+
 /// A mask on a write-only page is valid: Linux's copy of it reads an x86
 /// write-only mapping, so the guest's own call waits under it. The injected
 /// wait is shielded as for a readable mask and times out with the signal
@@ -612,7 +723,7 @@ fn a_write_only_mask_is_shielded(wait: Wait) {
     catch_and_block(libc::SIGUSR1, false);
     let usr1 = bit(libc::SIGUSR1);
     assert_eq!(
-        unblock_then_wait_placed(wait, usr1, usr1, 50, Some(libc::PROT_WRITE)),
+        unblock_then_wait_placed(wait, usr1, usr1, 50, Some(libc::PROT_WRITE), false),
         (0, None),
         "the injected {wait:?} must time out with the signal pending"
     );
@@ -645,7 +756,7 @@ fn an_inaccessible_mask_fails_an_injected_ppoll_with_efault() {
         catch_and_block(libc::SIGUSR1, false);
         let usr1 = bit(libc::SIGUSR1);
         assert_eq!(
-            unblock_then_wait_placed(Wait::Ppoll, usr1, usr1, 50, Some(libc::PROT_NONE)),
+            unblock_then_wait_placed(Wait::Ppoll, usr1, usr1, 50, Some(libc::PROT_NONE), false),
             (-1, Some(libc::EFAULT))
         );
         assert_eq!(records(), vec![libc::SIGUSR1 as i64]);

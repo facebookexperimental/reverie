@@ -632,7 +632,11 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     ///   held-signal report, or at a later signal-delivery stop an injection
     ///   of that callback ended at, from which the backend resumes the
     ///   recorded instance. A held signal whose temporary mask's restore is
-    ///   pending is not reported, so it is never offered.
+    ///   pending is not reported, so it is never offered; the backend passes
+    ///   it on unreported, and [`Tool::note_unreported_signal`] records it
+    ///   with [`crate::UnreportedSignalReason::HeldRestorePending`] unless an
+    ///   earlier reason applies (for example, the temporary mask blocks it:
+    ///   [`crate::UnreportedSignalReason::HeldBlocked`]).
     /// - An approval is consumed at most once, by the resume of the callback
     ///   it was made in, and only from the stop it was checked at. It must be
     ///   the last thing the callback does before it returns the signal. An
@@ -654,6 +658,16 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
             Errno::ENOSYS,
             "Guest::deliver_signal: this backend keeps its own signal delivery (the default refusal)",
         ))
+    }
+
+    /// From inside [`Tool::handle_signal_event`] (or
+    /// [`Tool::handle_raw_signal_event`]), how the backend reports the signal
+    /// the callback is handling ([`crate::SignalReportPath`]): at its own
+    /// stop, or held during a Tool's injection and reported after the
+    /// callback that held it. `None` outside a signal callback, and from a
+    /// backend that does not tell (the default).
+    fn signal_report_path(&self) -> Option<crate::SignalReportPath> {
+        None
     }
 
     /// Backend process/task lifetime identity, including at thread start.
@@ -1202,6 +1216,9 @@ where
         delivery: crate::SignalDelivery,
     ) -> crate::SignalDeliveryOutcome {
         self.inner.deliver_signal(delivery).await
+    }
+    fn signal_report_path(&self) -> Option<crate::SignalReportPath> {
+        self.inner.signal_report_path()
     }
     fn signal_task_identity(&self) -> Option<crate::SignalTaskIdentity> {
         self.inner.signal_task_identity()

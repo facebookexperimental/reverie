@@ -10111,18 +10111,19 @@ mod tests {
 
     /// The signals `RecordUnreported`'s filter was shown, as (process,
     /// signal number, `si_code`).
-    static RECORDED_UNREPORTED: StdMutex<Vec<(i32, i32, i32)>> = StdMutex::new(Vec::new());
+    static RECORDED_UNREPORTED: StdMutex<Vec<(i32, i32, i32, reverie::UnreportedSignalReason)>> =
+        StdMutex::new(Vec::new());
 
-    /// The (signal number, `si_code`) pairs `RecordUnreported`'s filter was
-    /// shown for process `pid`, so tests sharing the record in one process
-    /// see only their own.
-    fn recorded_unreported_for(pid: Pid) -> Vec<(i32, i32)> {
+    /// The (signal number, `si_code`, reason) of each signal
+    /// `RecordUnreported`'s filter was shown for process `pid`, so tests
+    /// sharing the record in one process see only their own.
+    fn recorded_unreported_for(pid: Pid) -> Vec<(i32, i32, reverie::UnreportedSignalReason)> {
         RECORDED_UNREPORTED
             .lock()
             .unwrap()
             .iter()
-            .filter(|(process, _, _)| *process == pid.as_raw())
-            .map(|&(_, signal, code)| (signal, code))
+            .filter(|(process, ..)| *process == pid.as_raw())
+            .map(|&(_, signal, code, reason)| (signal, code, reason))
             .collect()
     }
 
@@ -10148,6 +10149,7 @@ mod tests {
                 signal.pid().as_raw(),
                 signal.number(),
                 code,
+                signal.reason(),
             ));
             true
         }
@@ -10239,8 +10241,12 @@ mod tests {
         assert_eq!(status, ExitStatus::Exited(0));
         assert_eq!(
             recorded_unreported_for(root),
-            vec![(libc::SIGCHLD, libc::CLD_KILLED)],
-            "the pre_exec child's exit SIGCHLD is shown to the filter once"
+            vec![(
+                libc::SIGCHLD,
+                libc::CLD_KILLED,
+                reverie::UnreportedSignalReason::DuringInitialization
+            )],
+            "the pre_exec child's exit SIGCHLD is shown to the filter once, as taken during initialization"
         );
     }
 
@@ -10290,8 +10296,12 @@ mod tests {
         assert_eq!(status, ExitStatus::Exited(0));
         assert_eq!(
             recorded_unreported_for(root),
-            vec![(REALTIME, libc::SI_TKILL)],
-            "the realtime signal is shown to the filter once, with its number"
+            vec![(
+                REALTIME,
+                libc::SI_TKILL,
+                reverie::UnreportedSignalReason::DuringInitialization
+            )],
+            "the realtime signal is shown to the filter once, with its number, as taken during initialization"
         );
     }
 

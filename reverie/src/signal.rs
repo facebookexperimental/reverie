@@ -21,31 +21,118 @@ pub const SIGNAL_INFO_SIZE: usize = 128;
 /// A signal that a backend is about to pass to the guest without reporting it
 /// to [`crate::Tool::handle_signal_event`], as
 /// [`crate::Tool::filter_unreported_signal`] sees it: which thread takes it,
-/// the signal's number, and the Linux `siginfo_t` bytes it arrived with when
-/// the backend recorded them. The number can be a realtime signal (32 to 64),
-/// which [`crate::Signal`] cannot name. It is read-only metadata, so deciding
-/// about the signal cannot change the guest.
+/// the signal's number, the Linux `siginfo_t` bytes it arrived with when
+/// the backend recorded them, and why it is not reported
+/// ([`UnreportedSignalReason`]). The number can be a realtime signal (32 to
+/// 64), which [`crate::Signal`] cannot name. It is read-only metadata, so
+/// deciding about the signal cannot change the guest.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UnreportedSignal {
     pid: Pid,
     tid: Tid,
     number: i32,
     siginfo: Option<[u8; SIGNAL_INFO_SIZE]>,
+    reason: UnreportedSignalReason,
+}
+
+/// Why a backend passes a signal to the guest without reporting it to
+/// [`crate::Tool::handle_signal_event`], so that a Tool can count what its
+/// signal callback never saw, by cause. The first three are signals taken at
+/// a stop of the backend's own stepping; the others are a signal held during
+/// a Tool's injection (the ptrace backend holds one that stops an injected
+/// syscall's step) and resumed after the callback that held it. Each names
+/// the branch the backend took, which is what it can observe: where Linux
+/// does not tell two signals of one number apart, neither does the reason.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, PartialOrd, Ord)]
+#[non_exhaustive]
+pub enum UnreportedSignalReason {
+    /// Taken while the backend initializes the guest, before its first
+    /// instruction runs.
+    DuringInitialization,
+    /// Taken while the backend steps over a syscall it skips.
+    DuringSyscallSkip,
+    /// Taken while a debugger single-steps the thread.
+    DuringDebuggerStep,
+    /// Held: SIGSTOP (the backend's own or the guest's: Linux keeps one
+    /// pending instance), whose group stop is reported instead.
+    HeldStop,
+    /// Held: a signal with the number of the backend's timer signal
+    /// (SIGSTKFLT on ptrace), whether the timer's or a guest's own.
+    HeldTimer,
+    /// Held, and resumed from a stop that is not a signal-delivery stop,
+    /// where the kernel queues it anew or drops it.
+    HeldAtNonDeliveryStop,
+    /// Held while a SIGTRAP could be claimed by another consumer (a binary
+    /// rewriter's trap, or a debugger).
+    HeldWhileTrapMayBeClaimed,
+    /// Held, and the backend's requests could be refused at this stop (a
+    /// seccomp filter on the tracer thread).
+    HeldTracerFiltered,
+    /// Held, and the thread's masks, registers or pending set could not be
+    /// read.
+    HeldUnreadable,
+    /// Held, and the thread's mask blocks it, so the kernel queues it again.
+    HeldBlocked,
+    /// Held while a mask-swapping syscall's restore of its saved mask is
+    /// pending (`rt_sigsuspend`, `ppoll`, `pselect6`, `epoll_pwait`): an
+    /// injection by the callback would let the kernel restore the saved mask
+    /// first.
+    HeldRestorePending,
+    /// Held while the guest's syscall is to restart through its restart
+    /// block, which a callback's injection could replace.
+    HeldRestartBlock,
+    /// Held, and the backend's per-number count of earlier reports is
+    /// nonzero: it counts a reported signal it resumed where the kernel puts
+    /// it back in the queue (the mask blocks it), queues a new instance (a
+    /// syscall stop) or may drop it (a ptrace event stop or a group stop),
+    /// and cannot tell which. So the instance taken now need not be one that
+    /// was reported: it can be a later signal of the same number.
+    HeldSameNumberReported,
+    /// Held, and the backend has no record of how it was taken.
+    HeldNoRecord,
+    /// Held while another signal is pending in the kernel.
+    HeldWithAnotherPending,
+}
+
+impl UnreportedSignalReason {
+    /// A short name for counters and logs.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::DuringInitialization => "during initialization",
+            Self::DuringSyscallSkip => "during a syscall skip",
+            Self::DuringDebuggerStep => "during a debugger step",
+            Self::HeldStop => "held SIGSTOP",
+            Self::HeldTimer => "held, timer signal number",
+            Self::HeldAtNonDeliveryStop => "held, not a delivery stop",
+            Self::HeldWhileTrapMayBeClaimed => "held, a trap may be claimed",
+            Self::HeldTracerFiltered => "held, tracer filtered",
+            Self::HeldUnreadable => "held, state unreadable",
+            Self::HeldBlocked => "held, blocked",
+            Self::HeldRestorePending => "held, restore pending",
+            Self::HeldRestartBlock => "held, restart block",
+            Self::HeldSameNumberReported => "held, same number reported before",
+            Self::HeldNoRecord => "held, no record",
+            Self::HeldWithAnotherPending => "held, another pending",
+        }
+    }
 }
 
 impl UnreportedSignal {
-    /// Describes `signal` taken by thread `tid` of process `pid`.
+    /// Describes `signal` taken by thread `tid` of process `pid`, passed on
+    /// unreported for `reason`.
     pub const fn new(
         pid: Pid,
         tid: Tid,
         signal: crate::Signal,
         siginfo: Option<[u8; SIGNAL_INFO_SIZE]>,
+        reason: UnreportedSignalReason,
     ) -> Self {
         Self {
             pid,
             tid,
             number: signal as i32,
             siginfo,
+            reason,
         }
     }
 
@@ -56,6 +143,7 @@ impl UnreportedSignal {
         tid: Tid,
         number: i32,
         siginfo: Option<[u8; SIGNAL_INFO_SIZE]>,
+        reason: UnreportedSignalReason,
     ) -> Option<Self> {
         if number < 1 || number > 64 {
             return None;
@@ -65,6 +153,7 @@ impl UnreportedSignal {
             tid,
             number,
             siginfo,
+            reason,
         })
     }
 
@@ -92,6 +181,11 @@ impl UnreportedSignal {
     /// The Linux `siginfo_t` bytes the signal arrived with, when recorded.
     pub const fn siginfo(&self) -> Option<[u8; SIGNAL_INFO_SIZE]> {
         self.siginfo
+    }
+
+    /// Why the backend passes the signal on unreported.
+    pub const fn reason(&self) -> UnreportedSignalReason {
+        self.reason
     }
 }
 
@@ -426,31 +520,33 @@ mod tests {
     #[test]
     fn unreported_signal_names_every_linux_signal_by_number() {
         let (pid, tid) = (Pid::from_raw(41), Pid::from_raw(42));
-        let standard = UnreportedSignal::new(pid, tid, crate::Signal::SIGUSR1, None);
+        let reason = UnreportedSignalReason::HeldBlocked;
+        let standard = UnreportedSignal::new(pid, tid, crate::Signal::SIGUSR1, None, reason);
         assert_eq!(standard.number(), libc::SIGUSR1);
         assert_eq!(standard.signal(), Some(crate::Signal::SIGUSR1));
         assert_eq!(
-            UnreportedSignal::from_number(pid, tid, libc::SIGUSR1, None),
+            UnreportedSignal::from_number(pid, tid, libc::SIGUSR1, None, reason),
             Some(standard)
         );
 
         let info = siginfo(40);
-        let realtime = UnreportedSignal::from_number(pid, tid, 40, Some(info)).unwrap();
+        let realtime = UnreportedSignal::from_number(pid, tid, 40, Some(info), reason).unwrap();
         assert_eq!(
             (realtime.pid(), realtime.tid(), realtime.number()),
             (pid, tid, 40)
         );
         assert_eq!(realtime.signal(), None, "nix cannot name a realtime signal");
         assert_eq!(realtime.siginfo(), Some(info));
+        assert_eq!(realtime.reason(), reason);
         for edge in [1, 31, 32, 64] {
             assert_eq!(
-                UnreportedSignal::from_number(pid, tid, edge, None).map(|s| s.number()),
+                UnreportedSignal::from_number(pid, tid, edge, None, reason).map(|s| s.number()),
                 Some(edge)
             );
         }
         for invalid in [i32::MIN, -1, 0, 65, i32::MAX] {
             assert_eq!(
-                UnreportedSignal::from_number(pid, tid, invalid, None),
+                UnreportedSignal::from_number(pid, tid, invalid, None, reason),
                 None,
                 "accepted invalid signal {invalid}",
             );

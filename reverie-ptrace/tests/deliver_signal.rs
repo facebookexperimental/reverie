@@ -27,6 +27,8 @@
 //! - a caught realtime signal, queued with a value, is accepted through the
 //!   raw-signal hook, and its handler gets that exact instance's value;
 //! - outside a signal callback (a syscall stop) it is unavailable;
+//! - `Guest::signal_report_path` says `Direct` at a signal's own stop,
+//!   `Held` at a held signal's report, and `None` at a syscall stop;
 //! - an injection, a register write, a tail injection or an exec after an
 //!   approval breaks it, and the run then ends with the named failure
 //!   rather than deliver what the checks did not cover.
@@ -115,6 +117,8 @@ fn suspended_delivery_of(signal: i32) -> SignalDelivery {
         current_mask: SUSPEND_TEMPORARY,
         handler_mask: action.handler_mask(SUSPEND_TEMPORARY, signal),
         unchecked_mask: 0,
+        unchecked_frame_mask: 0,
+        unchecked_current_mask: 0,
         interruption: Interruption::KernelRun {
             syscall: libc::SYS_rt_sigsuspend,
         },
@@ -152,6 +156,8 @@ fn delivery_of(signal: i32) -> SignalDelivery {
         current_mask: GUEST_MASK,
         handler_mask: action.handler_mask(GUEST_MASK, signal),
         unchecked_mask: 0,
+        unchecked_frame_mask: 0,
+        unchecked_current_mask: 0,
         interruption: Interruption::Return {
             syscall: libc::SYS_tgkill,
             result: 0,
@@ -179,6 +185,11 @@ impl Tool for DeliverTool {
         signal: Signal,
     ) -> Result<Option<Signal>, Errno> {
         let raw = signal as i32;
+        if matches!(signal, Signal::SIGUSR1 | Signal::SIGPROF) {
+            guest
+                .send_rpc(format!("{signal:?} {:?}", guest.signal_report_path()))
+                .await;
+        }
         let outcome = match signal {
             // The positive control.
             Signal::SIGUSR1 => guest.deliver_signal(delivery_of(raw)).await,
@@ -312,6 +323,9 @@ impl Tool for DeliverTool {
             && write.fd() == PROBE_FD
             && write.len() == 0
         {
+            guest
+                .send_rpc(format!("syscall {:?}", guest.signal_report_path()))
+                .await;
             let outcome = guest.deliver_signal(delivery_of(libc::SIGUSR1)).await;
             guest.send_rpc(format!("syscall {outcome:?}")).await;
             return Ok(0);
@@ -442,7 +456,7 @@ fn an_approved_delivery_runs_its_handler_under_the_approved_mask() {
         );
     });
     assert_eq!(status, ExitStatus::Exited(0));
-    assert_eq!(outcomes, ["SIGUSR1 Accepted"]);
+    assert_eq!(outcomes, ["SIGUSR1 Some(Direct)", "SIGUSR1 Accepted"]);
 }
 
 #[test]
@@ -496,8 +510,12 @@ fn a_held_signal_is_approved_at_its_report() {
     assert_eq!(status, ExitStatus::Exited(0));
     assert_eq!(
         outcomes,
-        ["getpid Err(ERESTARTSYS)", "SIGPROF Accepted"],
-        "the held signal is approved at its report"
+        [
+            "getpid Err(ERESTARTSYS)",
+            "SIGPROF Some(Held)",
+            "SIGPROF Accepted"
+        ],
+        "the held signal is reported as held and approved at its report"
     );
 }
 
@@ -713,7 +731,10 @@ fn a_syscall_stop_is_not_a_delivery_point() {
         assert_eq!(ret, 0);
     });
     assert_eq!(status, ExitStatus::Exited(0));
-    assert_eq!(outcomes, ["syscall Unavailable(NotInSignalCallback)"]);
+    assert_eq!(
+        outcomes,
+        ["syscall None", "syscall Unavailable(NotInSignalCallback)"]
+    );
 }
 
 /// `BrokenSignalApproval`'s reason for an approval voided by an injection or

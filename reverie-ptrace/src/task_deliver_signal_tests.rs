@@ -275,6 +275,8 @@ fn run_cell(seccomp: bool) {
         current_mask: mask,
         handler_mask: action.handler_mask(mask, libc::SIGUSR1),
         unchecked_mask: 0,
+        unchecked_frame_mask: 0,
+        unchecked_current_mask: 0,
         interruption: Interruption::Return {
             syscall: libc::SYS_tgkill,
             result: regs.rax as i64,
@@ -345,17 +347,26 @@ fn run_cell(seccomp: bool) {
     traced.latest_injection_stop = None;
     assert!(traced.signal_approval.is_none(), "nothing was approved");
 
-    // The delivery leaves its own signal unchecked.
-    assert_eq!(
-        deliver(
-            &mut traced,
-            SignalDelivery {
-                unchecked_mask: signal_set_bit(libc::SIGUSR1),
-                ..good
-            }
-        ),
-        unavailable(SignalDeliveryUnavailable::UncheckedSignal)
-    );
+    // The delivery leaves its own signal unchecked, in every mask or in one.
+    for unchecked in [
+        SignalDelivery {
+            unchecked_mask: signal_set_bit(libc::SIGUSR1),
+            ..good
+        },
+        SignalDelivery {
+            unchecked_frame_mask: signal_set_bit(libc::SIGUSR1),
+            ..good
+        },
+        SignalDelivery {
+            unchecked_current_mask: signal_set_bit(libc::SIGUSR1),
+            ..good
+        },
+    ] {
+        assert_eq!(
+            deliver(&mut traced, unchecked),
+            unavailable(SignalDeliveryUnavailable::UncheckedSignal)
+        );
+    }
 
     // The kernel's current mask blocks the reported signal (SIGINT, which
     // the child blocks): resuming with it would requeue it.

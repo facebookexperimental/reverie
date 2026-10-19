@@ -150,6 +150,9 @@ enum Report {
     Filtered(i32, i32),
     /// A `Guest::set_signal_info` result, as 0 or the errno.
     SetInfo(i32),
+    /// A signal recorded by `Tool::note_unreported_signal`: its number, the
+    /// name of its `UnreportedSignalReason`, and whether the filter kept it.
+    Noted(i32, String, bool),
     /// Whether `Guest::signal_info` returned a siginfo outside a signal hook.
     InfoOutside(bool),
 }
@@ -160,6 +163,7 @@ struct Log {
     signals: Mutex<Vec<i32>>,
     regs: Mutex<Vec<(i64, i64)>>,
     filtered: Mutex<Vec<(i32, i32)>>,
+    noted: Mutex<Vec<(i32, String, bool)>>,
     set_info: Mutex<Vec<i32>>,
     info_outside: Mutex<Vec<bool>>,
     timers: AtomicUsize,
@@ -187,6 +191,9 @@ impl GlobalTool for Log {
                 self.filtered.lock().unwrap().push((signal, si_code))
             }
             Report::SetInfo(result) => self.set_info.lock().unwrap().push(result),
+            Report::Noted(signal, reason, kept) => {
+                self.noted.lock().unwrap().push((signal, reason, kept))
+            }
             Report::InfoOutside(present) => self.info_outside.lock().unwrap().push(present),
         }
     }
@@ -8901,15 +8908,25 @@ static SIGSYS_SET: u64 = 1 << (libc::SIGSYS - 1);
 /// reports, SIGUSR1 (`SIGUSR1_SET`) or SIGSYS (`SIGSYS_SET`); and drops every
 /// SIGUSR1 and SIGSYS that the backend would pass to the guest unreported
 /// (`Tool::filter_unreported_signal`), recording each signal shown to that
-/// hook.
+/// hook. Each signal `Tool::note_unreported_signal` records is reported
+/// when its thread exits (`Report::Noted`).
 #[derive(Clone, Copy, Debug, Default)]
 struct BlockInFirstSignalHookDropUnreported;
+
+/// `BlockInFirstSignalHookDropUnreported`'s thread state.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct HookedAndNoted {
+    /// Whether a signal hook has run on this thread.
+    hooked: bool,
+    /// The signals `Tool::note_unreported_signal` recorded, as
+    /// `Report::Noted` carries them.
+    noted: Vec<(i32, String, bool)>,
+}
 
 #[reverie::tool]
 impl Tool for BlockInFirstSignalHookDropUnreported {
     type GlobalState = Log;
-    /// Whether a signal hook has run on this thread.
-    type ThreadState = bool;
+    type ThreadState = HookedAndNoted;
 
     fn subscriptions(_config: &()) -> Subscription {
         let mut subscription = Subscription::none();
@@ -8931,7 +8948,7 @@ impl Tool for BlockInFirstSignalHookDropUnreported {
         signal: Signal,
     ) -> Result<Option<Signal>, Errno> {
         guest.send_rpc(Report::Signal(signal as i32)).await;
-        if !std::mem::replace(guest.thread_state_mut(), true) {
+        if !std::mem::replace(&mut guest.thread_state_mut().hooked, true) {
             let set = if signal == Signal::SIGSYS {
                 &SIGSYS_SET
             } else {
@@ -8966,6 +8983,32 @@ impl Tool for BlockInFirstSignalHookDropUnreported {
         rpc.send_rpc(Report::Filtered(unreported.number(), si_code))
             .await;
         !matches!(signal, Some(Signal::SIGUSR1 | Signal::SIGSYS))
+    }
+
+    fn note_unreported_signal(
+        &self,
+        thread_state: &mut HookedAndNoted,
+        signal: &reverie::UnreportedSignal,
+        kept: bool,
+    ) {
+        thread_state
+            .noted
+            .push((signal.number(), signal.reason().name().to_string(), kept));
+    }
+
+    async fn on_exit_thread<G: reverie::GlobalRPC<Self::GlobalState>>(
+        &self,
+        _tid: reverie::Tid,
+        global_state: &G,
+        thread_state: HookedAndNoted,
+        _exit_status: ExitStatus,
+    ) -> Result<(), Error> {
+        for (signal, reason, kept) in thread_state.noted {
+            global_state
+                .send_rpc(Report::Noted(signal, reason, kept))
+                .await;
+        }
+        Ok(())
     }
 }
 
@@ -9049,6 +9092,11 @@ fn a_dropped_held_signal_does_not_hide_a_later_one() {
         *log.filtered.lock().unwrap(),
         vec![(libc::SIGUSR1, libc::SI_QUEUE)],
         "only the recaptured instance is passed on unreported, and dropped"
+    );
+    assert_eq!(
+        *log.noted.lock().unwrap(),
+        vec![(libc::SIGUSR1, "held, blocked".to_string(), false)],
+        "the thread records the dropped instance, held while its mask blocks it"
     );
     let restart = Err(Errno::ERESTARTSYS.into_raw());
     assert_eq!(
@@ -9143,6 +9191,11 @@ fn a_signal_dropped_while_a_skipped_syscall_steps_does_not_hide_a_later_one() {
         *log.filtered.lock().unwrap(),
         vec![(libc::SIGSYS, 1)],
         "only the requeued instance is passed on unreported, at the skip's step, and dropped"
+    );
+    assert_eq!(
+        *log.noted.lock().unwrap(),
+        vec![(libc::SIGSYS, "during a syscall skip".to_string(), false)],
+        "the thread records the dropped instance, taken while a skipped syscall steps"
     );
     let injected = log.injected.lock().unwrap();
     assert!(
