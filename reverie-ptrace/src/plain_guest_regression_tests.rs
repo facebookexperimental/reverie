@@ -3587,6 +3587,59 @@ async fn a_process_sharing_the_signal_actions_never_reads_a_reset_sigtrap_action
     }
 }
 
+/// A thread named by bytes that are not UTF-8 keeps its blocked, caught
+/// SIGTRAP through every handler shape. procfs reports the name as set, and
+/// Reverie's reads of the thread's status once failed to decode it, which
+/// they reported as a thread that is gone (ESRCH), ending the run.
+#[tokio::test(flavor = "current_thread")]
+async fn a_thread_with_a_raw_byte_name_keeps_its_sigtrap_state() {
+    let runs = run_both_configurations("sigtrap_raw_name").await;
+    let expected: Vec<String> = (0..7)
+        .map(|shape| {
+            format!(
+                "raw-name shape={shape} sigtrap=trap_handler flags=0x50000000 usr2-in-mask=1 blocked=1"
+            )
+        })
+        .collect();
+    for run in &runs {
+        let lines: Vec<&str> = run
+            .report
+            .lines()
+            .filter(|line| line.starts_with("raw-name "))
+            .collect();
+        assert_eq!(lines, expected, "{}", run.report);
+    }
+}
+
+/// Reverie remembers whether SIGTRAP is ignored (`TracedTask::sigtrap_ignored`)
+/// across the syscall skips of calls the Tool emulates. Each flip of the
+/// action between `SIG_DFL` and `SIG_IGN` must reach what it remembers: a
+/// stale "not ignored" lets a skip's trap reset `SIG_IGN` unrepaired, and a
+/// stale "ignored" writes `SIG_IGN` over the guest's `SIG_DFL`.
+#[tokio::test(flavor = "current_thread")]
+async fn each_flip_of_sigtrap_reaches_the_remembered_disposition() {
+    let runs = run_both_configurations("sigtrap_cache_flip").await;
+    let expected: Vec<String> = [
+        ("dfl", "dfl"),
+        ("ign", "ign"),
+        ("dfl-again", "dfl"),
+        ("ign-again", "ign"),
+    ]
+    .iter()
+    .map(|(flip, action)| {
+        format!("flip {flip} sigtrap={action} flags=0x50000000 usr2-in-mask=1 blocked=0")
+    })
+    .collect();
+    for run in &runs {
+        let lines: Vec<&str> = run
+            .report
+            .lines()
+            .filter(|line| line.starts_with("flip "))
+            .collect();
+        assert_eq!(lines, expected, "{}", run.report);
+    }
+}
+
 /// A caught, unblocked SIGTRAP needs no repair: no step can reset it, so a run
 /// through every handler shape makes no unstepped injection
 /// (`UNSTEPPED_INJECTIONS_FOR_TEST`) and keeps the handler.

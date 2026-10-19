@@ -618,6 +618,58 @@ static void mode_sigtrap_states(void) {
   }
 }
 
+/* SIGTRAP blocked through each handler shape, with the thread named by raw
+ * bytes that are not UTF-8: procfs reports the name as set, and Reverie's
+ * reads of the thread's status must still parse. */
+static void mode_sigtrap_raw_name(void) {
+  static const char raw[] = {'r', (char)0xff, (char)0xfe, 'n', 0};
+  if (prctl(PR_SET_NAME, raw, 0, 0, 0) != 0)
+    die("prctl PR_SET_NAME");
+  for (int i = 0; i < 3; i++)
+    SITE(SYS_getppid, 0, 0, 0, 0, 0);
+  static const long shapes[] = {
+      SHAPE_INJECT,
+      SHAPE_TAIL,
+      SHAPE_EMULATE,
+      SHAPE_PRIVATE,
+      SHAPE_TWO_INJECTS,
+      SHAPE_TWO_PRIVATE,
+      SHAPE_BLOCK_ALL,
+  };
+  for (unsigned j = 0; j < sizeof shapes / sizeof shapes[0]; j++) {
+    sigtrap_set(trap_handler, 1);
+    SITEM(SYS_getppid, 0, 0, 0, 0, 0, shapes[j]);
+    char tag[32];
+    snprintf(tag, sizeof tag, "raw-name shape=%u", j);
+    sigtrap_full_state(tag);
+  }
+}
+
+/* SIGTRAP flipped between SIG_DFL and SIG_IGN, each time followed by calls
+ * the Tool emulates, whose syscall skips single-step and consult Reverie's
+ * remembered disposition: each flip must reach it. */
+static void mode_sigtrap_cache_flip(void) {
+  for (int i = 0; i < 3; i++)
+    SITE(SYS_getppid, 0, 0, 0, 0, 0);
+  static const struct {
+    const char* name;
+    void (*action)(int);
+  } flips[] = {
+      {"dfl", SIG_DFL},
+      {"ign", SIG_IGN},
+      {"dfl-again", SIG_DFL},
+      {"ign-again", SIG_IGN},
+  };
+  for (unsigned i = 0; i < sizeof flips / sizeof flips[0]; i++) {
+    sigtrap_set(flips[i].action, 0);
+    for (int k = 0; k < 3; k++)
+      SITEM(SYS_getppid, 0, 0, 0, 0, 0, SHAPE_EMULATE);
+    char tag[32];
+    snprintf(tag, sizeof tag, "flip %s", flips[i].name);
+    sigtrap_full_state(tag);
+  }
+}
+
 /* What a sleep's remaining time says, without its host-dependent digits.
  * rem is zeroed before each call, so "unwritten" means the kernel never
  * copied a remaining time out (the sleep was not interrupted). The tracer
@@ -4169,6 +4221,10 @@ int main(int argc, char** argv) {
     mode_sigtrap_profile();
   else if (!strcmp(m, "sigtrap_states"))
     mode_sigtrap_states();
+  else if (!strcmp(m, "sigtrap_raw_name"))
+    mode_sigtrap_raw_name();
+  else if (!strcmp(m, "sigtrap_cache_flip"))
+    mode_sigtrap_cache_flip();
   else if (!strcmp(m, "sigtrap_timer"))
     mode_sigtrap_timer();
   else if (!strcmp(m, "sigtrap_interrupted_waits"))

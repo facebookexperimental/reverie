@@ -2516,7 +2516,8 @@ fn io_errno(error: std::io::Error) -> Errno {
 }
 
 fn process_start_time(tid: Pid) -> std::io::Result<u64> {
-    let stat = crate::launch_window::read_to_string(format!("/proc/{tid}/stat"))?;
+    let stat = crate::launch_window::read(format!("/proc/{tid}/stat"))
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())?;
     let fields = stat
         .rsplit_once(") ")
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed stat"))?
@@ -2545,7 +2546,8 @@ fn status_pid(status: &str, name: &str) -> std::io::Result<Pid> {
 
 fn tracee_snapshot(tid: Pid) -> std::io::Result<TraceeSnapshot> {
     let start_time = process_start_time(tid)?;
-    let status = crate::launch_window::read_to_string(format!("/proc/{tid}/status"))?;
+    let status = crate::launch_window::read(format!("/proc/{tid}/status"))
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())?;
     let snapshot = TraceeSnapshot {
         tgid: status_pid(&status, "Tgid:")?,
         ppid: status_pid(&status, "PPid:")?,
@@ -2570,7 +2572,8 @@ fn tracee_snapshot(tid: Pid) -> std::io::Result<TraceeSnapshot> {
 /// parent, which `CLONE_PARENT` makes the creator's parent rather than the
 /// creator.
 pub(crate) fn newborn_own_process_parent(child: Pid) -> std::io::Result<Option<Pid>> {
-    let status = crate::launch_window::read_to_string(format!("/proc/{child}/status"))?;
+    let status = crate::launch_window::read(format!("/proc/{child}/status"))
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())?;
     if status_pid(&status, "Tgid:")? != child {
         return Ok(None);
     }

@@ -693,6 +693,22 @@ impl StoredSiginfo {
     }
 }
 
+/// A procfs text file (`status`, `maps`), read as bytes and decoded lossily:
+/// `status`'s `Name:` line holds the thread's name as the thread set it,
+/// which need not be UTF-8 (`prctl(PR_SET_NAME)` takes any bytes), and a
+/// `maps` path is any file name; a strict decode would fail with no errno,
+/// which the callers would read as a thread that is gone. Every field Reverie
+/// reads from them is ASCII.
+fn read_status<P: AsRef<std::path::Path>>(path: P) -> std::io::Result<String> {
+    crate::launch_window::read(path).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Whether syscall `nr` with `args` is an `rt_sigaction` that may set
+/// SIGTRAP's action: the kernel takes the signal from the low 32 bits.
+fn sets_sigtrap_action(nr: Sysno, args: &SyscallArgs) -> bool {
+    nr == Sysno::rt_sigaction && args.arg0 as i32 == libc::SIGTRAP && args.arg1 != 0
+}
+
 /// The signal mask the kernel dequeues under for the stopped thread `tid`
 /// (`task->blocked`, procfs `SigBlk`).
 ///
@@ -700,7 +716,7 @@ impl StoredSiginfo {
 /// syscall's restore is pending (`TIF_RESTORE_SIGMASK`), so it cannot tell
 /// whether that syscall's temporary mask blocks a signal.
 fn blocked_signal_mask(tid: Pid) -> Result<u64, TraceError> {
-    let status = crate::launch_window::read_to_string(format!("/proc/{tid}/status"))
+    let status = read_status(format!("/proc/{tid}/status"))
         .map_err(|err| Errno::new(err.raw_os_error().unwrap_or(libc::EIO)))?;
     status
         .lines()
@@ -718,14 +734,6 @@ fn sigmask(task: &Stopped) -> Result<u64, TraceError> {
 /// `PTRACE_SETSIGMASK`, with errors passed through `dead_or` as in `sigmask`.
 fn set_sigmask(task: &Stopped, mask: u64) -> Result<(), TraceError> {
     task.setsigmask(mask).map_err(|error| dead_or(task, error))
-}
-
-/// Whether this tracer thread can keep the guest's SIGTRAP state across
-/// Reverie's own steps (`sigtrap_state`), for a Tool that asks for it
-/// (`GlobalState::keeps_sigtrap_state`). Not under a tracer filter, which may
-/// refuse the requests main does not make (`thread_may_be_seccomp_filtered`).
-fn tracer_can_keep_sigtrap_state() -> bool {
-    !thread_may_be_seccomp_filtered()
 }
 
 /// The signal masks procfs reports for a stopped thread, read once
@@ -750,14 +758,13 @@ impl ProcSignalState {
     /// `dead_or`, so that the paths that handle a killed tracee take it.
     fn read(task: &Stopped) -> Result<Self, TraceError> {
         let tid = task.pid();
-        let status =
-            crate::launch_window::read_to_string(format!("/proc/{tid}/status")).map_err(|err| {
-                let errno = match err.raw_os_error() {
-                    Some(libc::ENOENT) | None => Errno::ESRCH,
-                    Some(raw) => Errno::new(raw),
-                };
-                dead_or(task, errno.into())
-            })?;
+        let status = read_status(format!("/proc/{tid}/status")).map_err(|err| {
+            let errno = match err.raw_os_error() {
+                Some(libc::ENOENT) | None => Errno::ESRCH,
+                Some(raw) => Errno::new(raw),
+            };
+            dead_or(task, errno.into())
+        })?;
         let field = |name: &str| {
             status
                 .lines()
@@ -794,7 +801,11 @@ enum StepShield {
 /// Unblocks SIGTRAP for one Reverie single-step (`sigtrap_state`'s shield).
 /// procfs is read only when SIGTRAP is blocked.
 fn unblock_sigtrap_for_step(task: &Stopped) -> Result<StepShield, TraceError> {
-    let mask = sigmask(task)?;
+    unblock_sigtrap_for_step_with(task, sigmask(task)?)
+}
+
+/// `unblock_sigtrap_for_step`, with the mask `PTRACE_GETSIGMASK` reported.
+fn unblock_sigtrap_for_step_with(task: &Stopped, mask: u64) -> Result<StepShield, TraceError> {
     if mask & SIGTRAP_BIT == 0 {
         return Ok(StepShield::None);
     }
@@ -824,8 +835,8 @@ fn reblock_sigtrap_after_step(wait: &Wait) -> Result<(), TraceError> {
 /// (`sigtrap_state`), shared by `drive_timer`'s step and observe closures.
 #[derive(Default)]
 struct TimerStepShield {
-    /// Whether SIGTRAP is ignored for this sequence (procfs, read once at its
-    /// start).
+    /// Whether SIGTRAP is ignored for this sequence, read once at its start
+    /// (`TracedTask::sigtrap_ignored`).
     ignored: bool,
     /// Whether any step of the sequence ran.
     stepped: bool,
@@ -853,7 +864,8 @@ impl TimerStepShield {
         // takes SIGTRAP's default action; neither the shield nor a repair may
         // undo that. With SIGTRAP neither blocked nor ignored, its trap resets
         // nothing, so the instruction is decoded only otherwise.
-        let sensitive = self.ignored || sigmask(task)? & SIGTRAP_BIT != 0;
+        let mask = sigmask(task)?;
+        let sensitive = self.ignored || mask & SIGTRAP_BIT != 0;
         if sensitive && instruction_at_raises_sigtrap(task, regs.ip()) {
             self.stepped = true;
             self.native_trap = true;
@@ -875,7 +887,7 @@ impl TimerStepShield {
             self.stepped = true;
             return Ok(());
         }
-        match unblock_sigtrap_for_step(task)? {
+        match unblock_sigtrap_for_step_with(task, mask)? {
             StepShield::None => {}
             StepShield::Unblocked => self.reblock = true,
             StepShield::PendingTrap => {
@@ -990,6 +1002,13 @@ struct SigtrapTables {
     repairs: HashMap<u64, SigtrapRepair>,
     /// The live thread groups that use each table.
     users: HashMap<u64, HashSet<Pid>>,
+    /// Whether SIGTRAP is ignored in each table, where it is known
+    /// (`TracedTask::sigtrap_ignored`).
+    ignored: HashMap<u64, bool>,
+    /// The tables an `rt_sigaction` of SIGTRAP may be changing, each with the
+    /// threads that made one, until each such thread's next seccomp stop or
+    /// its exit. While a table has any, its disposition is read afresh.
+    changing: HashMap<u64, HashSet<Pid>>,
 }
 
 impl SigtrapTables {
@@ -999,6 +1018,9 @@ impl SigtrapTables {
         let table = self.last;
         if let Some(repair) = from.and_then(|from| self.repairs.get(&from).copied()) {
             self.repairs.insert(table, repair);
+        }
+        if let Some(ignored) = from.and_then(|from| self.ignored.get(&from).copied()) {
+            self.ignored.insert(table, ignored);
         }
         self.users.entry(table).or_default().insert(group);
         table
@@ -1018,6 +1040,8 @@ impl SigtrapTables {
             if users.is_empty() {
                 self.users.remove(&table);
                 self.repairs.remove(&table);
+                self.ignored.remove(&table);
+                self.changing.remove(&table);
             }
         }
     }
@@ -1059,7 +1083,7 @@ mod sigtrap_tables_tests {
 /// so such a mapping can only be the kernel's sealed copy of it; `maps` tells
 /// that without the page-table walk `smaps` makes. Unreadable is false.
 fn repair_page_sealed_in(pid: Pid) -> bool {
-    let Ok(maps) = crate::launch_window::read_to_string(format!("/proc/{pid}/maps")) else {
+    let Ok(maps) = read_status(format!("/proc/{pid}/maps")) else {
         return false;
     };
     maps.lines().any(|line| {
@@ -1164,7 +1188,7 @@ fn read_sigaction_forced(task: &Stopped, address: usize) -> Option<KernelSigacti
 /// The signals pending in the kernel for the stopped thread `tid`: its own
 /// and its thread group's (procfs `SigPnd` and `ShdPnd`).
 fn pending_signal_mask(tid: Pid) -> Result<u64, TraceError> {
-    let status = crate::launch_window::read_to_string(format!("/proc/{tid}/status"))
+    let status = read_status(format!("/proc/{tid}/status"))
         .map_err(|err| Errno::new(err.raw_os_error().unwrap_or(libc::EIO)))?;
     let field = |name: &str| {
         status
@@ -1193,7 +1217,7 @@ fn pending_signal_mask(tid: Pid) -> Result<u64, TraceError> {
 /// disclosed gap (https://github.com/rrnewton/reverie/issues/845,
 /// https://github.com/rrnewton/reverie/issues/912).
 fn thread_may_be_seccomp_filtered() -> bool {
-    crate::launch_window::read_to_string("/proc/thread-self/status")
+    read_status("/proc/thread-self/status")
         .ok()
         .is_none_or(|status| !status_unfiltered(&status))
 }
@@ -1273,7 +1297,7 @@ fn is_private_step_trap(task: &Stopped, after_syscall: u64) -> Result<bool, Trac
 /// The number of seccomp filters on thread `tid` (procfs `Seccomp_filters`),
 /// or `None` if it cannot be read.
 fn guest_seccomp_filters(tid: Pid) -> Option<u64> {
-    let status = crate::launch_window::read_to_string(format!("/proc/{tid}/status")).ok()?;
+    let status = read_status(format!("/proc/{tid}/status")).ok()?;
     status
         .lines()
         .find_map(|line| line.strip_prefix("Seccomp_filters:"))
@@ -1735,7 +1759,8 @@ const PF_SIGNALED: u64 = 0x400;
 
 /// The kernel's `task_struct::flags` for `tid`, field 9 of `/proc/<tid>/stat`.
 fn kernel_task_flags(tid: Pid) -> std::io::Result<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{tid}/stat"))?;
+    // The name field may hold any bytes the thread named itself with.
+    let stat = String::from_utf8_lossy(&std::fs::read(format!("/proc/{tid}/stat"))?).into_owned();
     let invalid = |what| std::io::Error::new(std::io::ErrorKind::InvalidData, what);
     stat.rsplit_once(") ")
         .ok_or_else(|| invalid("malformed stat"))?
@@ -2779,6 +2804,12 @@ struct GlobalState<G: GlobalTool> {
     /// SIGTRAP is left as at base.
     keeps_sigtrap_state: bool,
 
+    /// Whether Reverie may remember SIGTRAP's disposition between procfs reads
+    /// (`TracedTask::sigtrap_ignored`): the Tool subscribes to
+    /// `rt_sigaction`, so that every guest change of it stops at a seccomp
+    /// stop Reverie sees.
+    caches_sigtrap_disposition: bool,
+
     /// guests are sequentialized already (by detcore for example), gdbserver
     /// should avoid sequentialize threads.
     sequentialized_guest: Arc<bool>,
@@ -3008,6 +3039,7 @@ impl<G: GlobalTool> Clone for GlobalState<G> {
             subscriptions: self.subscriptions.clone(),
             reports_sigreturns: self.reports_sigreturns,
             keeps_sigtrap_state: self.keeps_sigtrap_state,
+            caches_sigtrap_disposition: self.caches_sigtrap_disposition,
             sequentialized_guest: self.sequentialized_guest.clone(),
             injected_syscall_trap: self.injected_syscall_trap.clone(),
             fatal_session: self.fatal_session.clone(),
@@ -3155,6 +3187,10 @@ pub struct TracedTask<L: Tool> {
     /// step's siginfo is discarded instead of being read as a later step's
     /// completion or reported as an unexpected trap.
     stale_private_step_trap: bool,
+    /// Whether the OS thread named here, the one that made this traced
+    /// thread's ptrace requests when it was read, had no seccomp filter
+    /// (`keeps_sigtrap_state`). Set only from a successful read.
+    tracer_unfiltered: StdMutex<Option<(std::thread::ThreadId, bool)>>,
     /// Set at an exec stop when SIGTRAP is neither ignored nor blocked and no
     /// repair is owed: then no step through pre-init and the new image's
     /// first instruction can reset it, and those steps skip the SIGTRAP work
@@ -3422,12 +3458,17 @@ impl<L: Tool> TracedTask<L> {
             cfg!(target_arch = "x86_64") && L::observes_sigreturns(&cfg) && gdbserver.is_none();
         let keeps_sigtrap_state =
             cfg!(target_arch = "x86_64") && L::enforces_serialized_execution(&cfg);
+        let caches_sigtrap_disposition = options
+            .events
+            .iter_syscalls()
+            .any(|sysno| sysno == Sysno::rt_sigaction);
         let global_state = GlobalState {
             gs_ref,
             cfg,
             subscriptions: Arc::new(options.events.clone()),
             reports_sigreturns,
             keeps_sigtrap_state,
+            caches_sigtrap_disposition,
             sequentialized_guest: Arc::new(
                 gdbserver
                     .as_ref()
@@ -3438,17 +3479,15 @@ impl<L: Tool> TracedTask<L> {
             fatal_session,
             sigtrap_tables: Arc::new(StdMutex::new(SigtrapTables::default())),
             sigtrap_scratch_lock: Arc::new(Mutex::new(())),
-            seccomp_filter_baseline: crate::launch_window::read_to_string(
-                "/proc/thread-self/status",
-            )
-            .ok()
-            .and_then(|status| {
-                status
-                    .lines()
-                    .find_map(|line| line.strip_prefix("Seccomp_filters:"))
-                    .and_then(|count| count.trim().parse::<u64>().ok())
-            })
-            .map(|own| own + 1),
+            seccomp_filter_baseline: read_status("/proc/thread-self/status")
+                .ok()
+                .and_then(|status| {
+                    status
+                        .lines()
+                        .find_map(|line| line.strip_prefix("Seccomp_filters:"))
+                        .and_then(|count| count.trim().parse::<u64>().ok())
+                })
+                .map(|own| own + 1),
             backend_stats: options.backend_stats,
             #[cfg(test)]
             final_resume_signal_for_test: options.final_resume_signal_for_test,
@@ -3497,6 +3536,7 @@ impl<L: Tool> TracedTask<L> {
             signal_delivery_mismatched: false,
             stale_private_step_trap: false,
             exec_sigtrap_quiet: false,
+            tracer_unfiltered: StdMutex::new(None),
             sigtrap_table,
             sigtrap_scratch_state: Arc::new(AtomicU8::new(SCRATCH_PENDING)),
             ptracer_waits: Arc::new(PtracerWaitOwner::default()),
@@ -3582,6 +3622,7 @@ impl<L: Tool> TracedTask<L> {
             signal_delivery_mismatched: false,
             stale_private_step_trap: false,
             exec_sigtrap_quiet: false,
+            tracer_unfiltered: StdMutex::new(None),
             sigtrap_table: self.sigtrap_table,
             sigtrap_scratch_state: self.sigtrap_scratch_state.clone(),
             ptracer_waits,
@@ -3689,6 +3730,7 @@ impl<L: Tool> TracedTask<L> {
             signal_delivery_mismatched: false,
             stale_private_step_trap: false,
             exec_sigtrap_quiet: false,
+            tracer_unfiltered: StdMutex::new(None),
             sigtrap_table,
             sigtrap_scratch_state,
             ptracer_waits,
@@ -4855,7 +4897,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         // filter, which may refuse the requests
         // (`thread_may_be_seccomp_filtered`).
         let filtered = !self.keeps_sigtrap_state();
-        let sigtrap_ignored = !filtered && sigtrap_disposition(&task)?.0;
+        let sigtrap_ignored = !filtered && self.sigtrap_ignored(&task)?;
         let shield = Arc::new(StdMutex::new(TimerStepShield {
             ignored: sigtrap_ignored,
             ..TimerStepShield::default()
@@ -4921,6 +4963,10 @@ impl<L: Tool + 'static> TracedTask<L> {
                 std::mem::take(&mut shield.pending_trap),
             )
         };
+        // A guest instruction's own trap may have reset SIGTRAP natively.
+        if native_trap {
+            self.forget_sigtrap_ignored();
+        }
         if pending_trap {
             return Err(self.fail_pending_sigtrap(self.tid(), "precise timer"));
         }
@@ -4998,6 +5044,7 @@ impl<L: Tool + 'static> TracedTask<L> {
     ///  * guest thread may or may not be stopped, depending on value of GuestNext
     async fn handle_stop_event(&mut self, stopped: Stopped, event: Event) -> Result<Wait, Error> {
         self.latest_injection_stop = None;
+
         let unreported_stop_signal = self.unreported_stop_signal.take();
         self.timer.observe_event(&event);
         // The guest can remove a timer notification between two stops without
@@ -5251,6 +5298,10 @@ impl<L: Tool + 'static> TracedTask<L> {
     }
 
     async fn handle_sigtrap(&mut self, task: Stopped) -> Result<HandleSignalResult, TraceError> {
+        // A SIGTRAP that reaches here may be a guest's own trap, whose forced
+        // delivery reset an ignored SIGTRAP natively, or a delivery whose
+        // `SA_RESETHAND` reset a caught one.
+        self.forget_sigtrap_ignored();
         let resumed_by_gdb_step = self
             .resumed_by_gdb
             .is_some_and(|action| matches!(action, ResumeAction::Step(_)));
@@ -6262,14 +6313,13 @@ impl<L: Tool + 'static> TracedTask<L> {
         // unblocked for it, and an ignored one is put back once the private
         // page exists (`tracee_preinit`). Not under a tracer filter, which may
         // refuse the requests (`thread_may_be_seccomp_filtered`).
-        let exec_sigtrap_shielded = if !self.keeps_sigtrap_state() {
-            false
-        } else {
-            // The new image has no repair page until pre-init seals one
-            // (`seal_sigtrap_scratch`); a repair owed meanwhile waits for it.
-            self.sigtrap_scratch_state = Arc::new(AtomicU8::new(SCRATCH_PENDING));
-            // Exec gives the group a table of its own, a copy of the one it
-            // used, which another group may go on using.
+        // The table bookkeeping follows the kernel whatever this tracer
+        // thread's filter state: siblings sharing the table may keep SIGTRAP.
+        // Exec gives the group a table of its own, a copy of the one it used,
+        // which another group may go on using, and a change this thread
+        // marked on its old table ends here.
+        if self.global_state.keeps_sigtrap_state {
+            self.end_sigtrap_changing();
             {
                 let pid = self.pid();
                 let mut tables = self.global_state.sigtrap_tables.lock().unwrap();
@@ -6277,15 +6327,29 @@ impl<L: Tool + 'static> TracedTask<L> {
                 tables.leave(pid, self.sigtrap_table);
                 self.sigtrap_table = table;
             }
+            // The new image has no repair page until pre-init seals one
+            // (`seal_sigtrap_scratch`); a repair owed meanwhile waits for it.
+            self.sigtrap_scratch_state = Arc::new(AtomicU8::new(SCRATCH_PENDING));
             // Exec resets a caught handler to `SIG_DFL` and keeps `SIG_IGN`, so
             // only an ignored action can still be owed a repair.
             if matches!(self.sigtrap_repair(), Some(SigtrapRepair::Action(_))) {
                 self.set_sigtrap_repair(None);
             }
+        }
+        let exec_sigtrap_shielded = if !self.keeps_sigtrap_state() {
+            false
+        } else {
             // One procfs read decides for the whole exec: with SIGTRAP
             // neither ignored nor blocked, and no repair owed, no step through
             // the first instruction can reset it.
             let state = ProcSignalState::read(&task)?;
+            {
+                let mut tables = self.global_state.sigtrap_tables.lock().unwrap();
+                tables.changing.remove(&self.sigtrap_table);
+                tables
+                    .ignored
+                    .insert(self.sigtrap_table, state.sigtrap_ignored);
+            }
             self.exec_sigtrap_quiet = !state.sigtrap_ignored
                 && state.blocked & SIGTRAP_BIT == 0
                 && self.sigtrap_repair().is_none();
@@ -6499,6 +6563,11 @@ impl<L: Tool + 'static> TracedTask<L> {
             .get_syscall(&task)
             .tracee_context(tid, "read registers at seccomp stop")?;
         let (nr, args) = syscall.into_parts();
+        // Whatever this thread's own tracer filter state: a sibling sharing
+        // the table may keep SIGTRAP.
+        if self.global_state.keeps_sigtrap_state {
+            self.note_sigtrap_action_syscall(nr, &args);
+        }
         let tool_subscribed = self
             .global_state
             .subscriptions
@@ -7087,7 +7156,10 @@ impl<L: Tool + 'static> TracedTask<L> {
             let (shielded, ignored) = if filtered {
                 (false, false)
             } else {
-                let ignored = sigtrap_disposition(&parent)?.0;
+                // The step can run into a guest `int3` or `int1`, whose own trap
+                // resets SIGTRAP natively, so what it leaves is read afresh.
+                let ignored = self.sigtrap_ignored(&parent)?;
+                self.forget_sigtrap_ignored();
                 (
                     self.shield_sigtrap_for_step(&parent, "clone parent")?,
                     ignored,
@@ -8051,6 +8123,10 @@ impl<L: Tool + 'static> TracedTask<L> {
     /// session fails and the replaced leader's state gets no hook. This task
     /// otherwise releases only its own timer and thread accounting.
     async fn retire_lost_former(mut self, leader: Pid, replaced: crate::tracer::EntryExitStop) {
+        // A change of SIGTRAP's action this thread marked ends with it.
+        if self.global_state.keeps_sigtrap_state {
+            self.end_sigtrap_changing();
+        }
         let session = self.fatal_session();
         let former = self.tid();
         let pid = self.pid();
@@ -8119,6 +8195,10 @@ impl<L: Tool + 'static> TracedTask<L> {
     }
 
     async fn retire_replaced_leader(mut self, leader: Pid, status: ExitStatus) {
+        // A change of SIGTRAP's action this thread marked ends with it.
+        if self.global_state.keeps_sigtrap_state {
+            self.end_sigtrap_changing();
+        }
         let session = self.fatal_session();
         let former = self.tid();
         let pid = self.pid();
@@ -8384,6 +8464,10 @@ impl<L: Tool + 'static> TracedTask<L> {
             StopReason::ThreadExited(tid, pid, status)
         };
         let _ = self.notify_gdb_stop(reason).await;
+        // A change of SIGTRAP's action this thread marked ends with it.
+        if self.global_state.keeps_sigtrap_state {
+            self.end_sigtrap_changing();
+        }
         let wrapped = WrappedFrom(tid, &self.global_state);
         if let Err(error) = self
             .process_state
@@ -8513,7 +8597,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         let (shielded, ignored) = if !self.keeps_sigtrap_state() {
             (false, false)
         } else {
-            let ignored = sigtrap_disposition(&task)?.0;
+            let ignored = self.sigtrap_ignored(&task)?;
             (
                 self.shield_sigtrap_for_step(&task, "syscall skip")?,
                 ignored,
@@ -9252,10 +9336,36 @@ impl<L: Tool + 'static> TracedTask<L> {
 
     /// Whether Reverie keeps the guest's SIGTRAP state across its own steps:
     /// the Tool enforces serialized execution (`GlobalState::keeps_sigtrap_state`)
-    /// and this tracer thread can make the requests
-    /// (`tracer_can_keep_sigtrap_state`).
+    /// and the tracer thread has no seccomp filter, which may refuse the
+    /// requests main does not make (`thread_may_be_seccomp_filtered`). The
+    /// filter state is read once per traced thread and OS thread
+    /// (`tracer_unfiltered`), not at each decision: each read is a procfs
+    /// read, a syscall the Tool emulates made five of them, and a guest making
+    /// 160,000 such syscalls ran 2.2 times as long. A filter is never removed,
+    /// so a filtered answer stays right; an unfiltered one rests on the
+    /// contract's promise that the tracer installs no filter on its own
+    /// threads once the trace has started (`Tool::enforces_serialized_execution`).
     fn keeps_sigtrap_state(&self) -> bool {
-        self.global_state.keeps_sigtrap_state && tracer_can_keep_sigtrap_state()
+        if !self.global_state.keeps_sigtrap_state {
+            return false;
+        }
+        let thread = std::thread::current().id();
+        let mut cached = self.tracer_unfiltered.lock().unwrap();
+        if let Some((read_on, unfiltered)) = *cached
+            && read_on == thread
+        {
+            return unfiltered;
+        }
+        // An unreadable status counts as filtered, as before, and is read
+        // again at the next decision.
+        match read_status("/proc/thread-self/status") {
+            Ok(status) => {
+                let unfiltered = status_unfiltered(&status);
+                *cached = Some((thread, unfiltered));
+                unfiltered
+            }
+            Err(_) => false,
+        }
     }
 
     /// Waits for the session's SIGTRAP repair lock (`sigtrap_scratch_lock`).
@@ -9502,6 +9612,91 @@ impl<L: Tool + 'static> TracedTask<L> {
         }
     }
 
+    /// Whether SIGTRAP is ignored in this thread's signal-action table. procfs
+    /// is read only when the table's answer is not known, or while a guest
+    /// `rt_sigaction` of SIGTRAP may be changing it, which is read again each
+    /// time. A Reverie trap's reset leaves the remembered answer as it was:
+    /// the reset is repaired back to it (`sigtrap_repair`), and a repair
+    /// checks what it finds before it writes.
+    fn sigtrap_ignored(&self, task: &Stopped) -> Result<bool, TraceError> {
+        // Not while a repair of Reverie's own is owed either: until it is
+        // written, procfs reads the reset (`SIG_DFL`), not the guest's action.
+        let cacheable = self.global_state.caches_sigtrap_disposition && {
+            let tables = self.global_state.sigtrap_tables.lock().unwrap();
+            !tables
+                .changing
+                .get(&self.sigtrap_table)
+                .is_some_and(|threads| !threads.is_empty())
+                && !tables.repairs.contains_key(&self.sigtrap_table)
+        };
+        if cacheable
+            && let Some(ignored) = self
+                .global_state
+                .sigtrap_tables
+                .lock()
+                .unwrap()
+                .ignored
+                .get(&self.sigtrap_table)
+        {
+            return Ok(*ignored);
+        }
+        let ignored = sigtrap_disposition(task)?.0;
+        if cacheable {
+            self.global_state
+                .sigtrap_tables
+                .lock()
+                .unwrap()
+                .ignored
+                .insert(self.sigtrap_table, ignored);
+        }
+        Ok(ignored)
+    }
+
+    /// Forgets whether SIGTRAP is ignored in this thread's table, after an
+    /// event that may have changed it.
+    fn forget_sigtrap_ignored(&self) {
+        self.global_state
+            .sigtrap_tables
+            .lock()
+            .unwrap()
+            .ignored
+            .remove(&self.sigtrap_table);
+    }
+
+    /// At a seccomp stop of syscall `nr` with `args`: this thread's next
+    /// seccomp stop ends a change it marked before (`mark_sigtrap_changing`),
+    /// and a guest `rt_sigaction` of SIGTRAP marks one.
+    fn note_sigtrap_action_syscall(&self, nr: Sysno, args: &SyscallArgs) {
+        self.end_sigtrap_changing();
+        if sets_sigtrap_action(nr, args) {
+            self.mark_sigtrap_changing();
+        }
+    }
+
+    /// Marks this thread's table as changing, for an `rt_sigaction` of SIGTRAP
+    /// that has run or may run before this thread's next seccomp stop, and
+    /// forgets the disposition.
+    fn mark_sigtrap_changing(&self) {
+        let mut tables = self.global_state.sigtrap_tables.lock().unwrap();
+        let table = self.sigtrap_table;
+        tables.changing.entry(table).or_default().insert(self.tid());
+        tables.ignored.remove(&table);
+    }
+
+    /// Ends a change this thread marked, at its next seccomp stop or its exit.
+    fn end_sigtrap_changing(&self) {
+        let mut tables = self.global_state.sigtrap_tables.lock().unwrap();
+        let table = self.sigtrap_table;
+        if let Some(threads) = tables.changing.get_mut(&table)
+            && threads.remove(&self.tid())
+        {
+            if threads.is_empty() {
+                tables.changing.remove(&table);
+            }
+            tables.ignored.remove(&table);
+        }
+    }
+
     /// Records a SIGTRAP repair owed for a Reverie trap, for the signal-action
     /// table this thread uses (`GlobalState::sigtrap_tables`).
     /// An earlier one still owed is kept: until it is written, the action
@@ -9530,6 +9725,8 @@ impl<L: Tool + 'static> TracedTask<L> {
     }
 
     /// Replaces the SIGTRAP repair owed for this thread's signal-action table.
+    /// Clearing one, written or dropped, also forgets the disposition: a
+    /// dropped repair leaves the reset `SIG_DFL` in force (`sigtrap_ignored`).
     fn set_sigtrap_repair(&mut self, repair: Option<SigtrapRepair>) {
         let mut tables = self.global_state.sigtrap_tables.lock().unwrap();
         match repair {
@@ -9538,6 +9735,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             }
             None => {
                 tables.repairs.remove(&self.sigtrap_table);
+                tables.ignored.remove(&self.sigtrap_table);
             }
         }
     }
@@ -9728,6 +9926,9 @@ impl<L: Tool + 'static> TracedTask<L> {
         scratch: usize,
         action: KernelSigaction,
     ) -> Result<Stopped, TraceError> {
+        // What the write leaves is read again when next needed
+        // (`sigtrap_ignored`).
+        self.forget_sigtrap_ignored();
         #[cfg(test)]
         UNSTEPPED_INJECTIONS_FOR_TEST.fetch_add(1, Ordering::SeqCst);
         let written = AddrMut::from_raw(scratch)
@@ -9841,9 +10042,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         let read_u64 = |address: usize| {
             Addr::<u64>::from_raw(address).and_then(|address| task.read_value(address).ok())
         };
-        let sets_action = (nr == Sysno::rt_sigaction
-            && args.arg0 == libc::SIGTRAP as usize
-            && args.arg1 != 0
+        let sets_action = (sets_sigtrap_action(nr, args)
             && args.arg3 == std::mem::size_of::<u64>())
         .then(|| read_sigaction_forced(&task, args.arg1))
         .flatten()
@@ -10546,6 +10745,20 @@ impl<L: Tool + 'static> TracedTask<L> {
         nr: Sysno,
         args: SyscallArgs,
     ) -> Result<Result<i64, Errno>, TraceError> {
+        // A Tool's own `rt_sigaction` of SIGTRAP may change whether it is
+        // ignored (`sigtrap_ignored`), here or, run in place, on the resume.
+        if self.global_state.keeps_sigtrap_state && sets_sigtrap_action(nr, &args) {
+            self.mark_sigtrap_changing();
+        }
+        self.inner_inject_unobserved(nr, args).await
+    }
+
+    /// `inner_inject`, without forgetting SIGTRAP's disposition.
+    async fn inner_inject_unobserved(
+        &mut self,
+        nr: Sysno,
+        args: SyscallArgs,
+    ) -> Result<Result<i64, Errno>, TraceError> {
         let task = self.assume_stopped();
 
         tracing::debug!(
@@ -10616,6 +10829,10 @@ impl<L: Tool + 'static> TracedTask<L> {
         args: SyscallArgs,
     ) -> Result<Result<i64, Errno>, TraceError> {
         let tid = self.tid();
+        // As for `inner_inject`: whichever path runs it, and whenever.
+        if self.global_state.keeps_sigtrap_state && sets_sigtrap_action(nr, &args) {
+            self.mark_sigtrap_changing();
+        }
 
         tracing::info!(
             "[tool] (tid {}) beginning tail_inject of syscall: {}",
