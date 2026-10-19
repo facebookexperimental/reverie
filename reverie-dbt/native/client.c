@@ -223,6 +223,10 @@ typedef struct {
   // Set only after the real Tool's successful thread-start hook. A fork copy
   // retains the parent's PID, which cannot acknowledge the child's admission.
   capture_owner_t capture_owner;
+  // The application PC supplied by first-block instrumentation, only while
+  // admission calls the Tool. Clean-call dr_get_mcontext does not supply it.
+  // This is client-only state, outside the shared Rust scratch prefix.
+  app_pc admission_pc;
 } prototype_counters_t;
 
 #define TASK_STATE_FD 197
@@ -2832,7 +2836,9 @@ static void try_start_pending_thread(void) {
   /* The clone parent overwrites the host mapping before decrementing the
    * shared count. While any thread clone is pending, a retained entry can
    * still describe an earlier thread that used the same host TID. */
-  pending_thread_clones = atomic_load_explicit(
+  bool image_main = dr_get_thread_id(drcontext) == dr_get_process_id() &&
+      !has_copied_runtime();
+  pending_thread_clones = image_main ? 0 : atomic_load_explicit(
       pending_thread_clones_for(counters->kernel_pid), memory_order_acquire);
   if (test_thread_clone_process_exit &&
       counters->kernel_pid == task_state->root_pid && pending_thread_clones == 1 &&
@@ -2897,6 +2903,15 @@ static void try_start_pending_thread(void) {
   int32_t init_result = 0;
   if (!has_copied_runtime() ||
       (runtime_uses_external_global() && !is_copied_vfork_process())) {
+    // A fresh image enters here before any application instruction. The
+    // background helper cannot be started from DynamoRIO's thread-init event.
+    if (!has_copied_runtime())
+      ensure_runtime_background();
+    if (!reverie_dbt_runtime_ready(
+            atomic_load_explicit(&image_generation, memory_order_acquire))) {
+      set_pending_thread_start(counters, 2);
+      return;
+    }
     bind_capture_owner(counters);
     evidence_callback_enter();
     init_result = reverie_dbt_runtime_thread_init(
@@ -2933,7 +2948,7 @@ static void try_start_pending_thread(void) {
   set_pending_thread_start(counters, 0);
 }
 
-static void start_pending_thread(void) {
+static void admit_pending_thread(void) {
   prototype_counters_t* counters = (prototype_counters_t*)drmgr_get_tls_field(
       dr_get_current_drcontext(), thread_state_index);
   struct timespec started;
@@ -2989,6 +3004,17 @@ static void start_pending_thread(void) {
     }
     dr_sleep(1);
   }
+}
+
+static void start_pending_thread(app_pc pc) {
+  prototype_counters_t* counters = (prototype_counters_t*)drmgr_get_tls_field(
+      dr_get_current_drcontext(), thread_state_index);
+  if (counters == NULL || counters->pending_thread_start == 0)
+    return;
+  app_pc previous = counters->admission_pc;
+  counters->admission_pc = pc;
+  admit_pending_thread();
+  counters->admission_pc = previous;
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -3073,7 +3099,8 @@ static void insert_thread_admission(
         instruction,
         (void*)start_pending_thread,
         context_flags,
-        0);
+        1,
+        OPND_CREATE_INTPTR(instr_get_app_pc(instruction)));
     return;
   }
   DR_ASSERT(drreg_restore_all(drcontext, bb, instruction) == DRREG_SUCCESS);
@@ -3084,7 +3111,8 @@ static void insert_thread_admission(
         instruction,
         (void*)start_pending_thread,
         context_flags,
-        0);
+        1,
+        OPND_CREATE_INTPTR(instr_get_app_pc(instruction)));
     return;
   }
 
@@ -3119,7 +3147,8 @@ static void insert_thread_admission(
       instruction,
       (void*)start_pending_thread,
       context_flags,
-      0);
+      1,
+      OPND_CREATE_INTPTR(instr_get_app_pc(instruction)));
   dr_save_reg(drcontext, bb, instruction, DR_REG_XCX, SPILL_SLOT_1);
   instrlist_meta_preinsert(bb, instruction, restore);
   dr_restore_reg(drcontext, bb, instruction, DR_REG_XCX, SPILL_SLOT_1);
@@ -4399,7 +4428,10 @@ static int32_t read_registers(uintptr_t context, struct user_regs_struct* out) {
   out->rsi = registers.xsi;
   out->rdi = registers.xdi;
   out->orig_rax = registers.xax;
-  out->rip = (uint64_t)registers.xip;
+  out->rip = (uint64_t)(counters != NULL && counters->signal_token == 0 &&
+                               counters->admission_pc != NULL
+                           ? counters->admission_pc
+                           : registers.xip);
   out->eflags = registers.xflags;
   out->rsp = registers.xsp;
   return 1;
@@ -5752,7 +5784,7 @@ static bool pre_syscall(void* drcontext, int sysnum) {
    * register it. */
   // TODO-HUMAN-REVIEW(PR-134): Confirm the syscall entry fallback.
   if (counters->pending_thread_start != 0) {
-    start_pending_thread();
+    start_pending_thread(NULL);
   }
 
   for (i = 0; i != 6; ++i)
@@ -6415,6 +6447,11 @@ static void thread_init(void* drcontext) {
   counters->kernel_tid = pending_thread_start ? 0 : host_tid;
   if (pending_child == 0 && !pending_thread_start)
     ensure_task_membership(host_tid);
+  // Fresh-image leaders use the same first-block gate as ordinary threads.
+  // Copied process leaders retain their existing pre-syscall rebase boundary;
+  // neither a fork nor vfork is a new-image/post-exec admission.
+  bool pending_image_start =
+      host_tid == dr_get_process_id() && !has_copied_runtime();
   counters->pending_birth_token = 0;
   counters->pending_clone_flags = pending_child != 0 ? clone_flags : 0;
 
@@ -6450,7 +6487,8 @@ static void thread_init(void* drcontext) {
     release_clone_identity_handoff(pending_child);
   }
 
-  set_pending_thread_start(counters, (uint64_t)pending_thread_start);
+  set_pending_thread_start(
+      counters, (uint64_t)(pending_thread_start || pending_image_start));
 }
 
 /* The exchange itself: one lock cmpxchg on a word the caller has already
